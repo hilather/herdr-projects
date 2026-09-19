@@ -9,11 +9,12 @@ pub struct Retry {
     pub attempts: u32,
     pub next_attempt: String,
     pub last_error: String,
+    pub blocked: bool,
 }
 
 impl Retry {
     pub fn due(&self, now: jiff::Timestamp) -> bool {
-        self.next_attempt.parse::<jiff::Timestamp>().map_or(true, |next| now >= next)
+        !self.blocked && self.next_attempt.parse::<jiff::Timestamp>().map_or(true, |next| now >= next)
     }
 
     pub fn reserve(&mut self, now: jiff::Timestamp, key: &str) {
@@ -81,6 +82,14 @@ pub(super) fn flush_events(project: &Project, state: &mut State, now: jiff::Time
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_capability_stays_blocked_after_restart() {
+        let retry = Retry { blocked: true, ..Retry::default() };
+        let restored: Retry = serde_json::from_str(&serde_json::to_string(&retry).unwrap()).unwrap();
+        assert!(!restored.due(now() + jiff::SignedDuration::from_hours(24)));
+        assert!(serde_json::from_str::<Retry>("{}").unwrap().due(now()));
+    }
 
     fn now() -> jiff::Timestamp { "2026-09-19T12:00:00Z".parse().unwrap() }
 
@@ -239,6 +248,9 @@ pub(super) fn retry_finalizations(ctx: &Ctx, project: &Project, state: &mut Stat
             save_state(project, state)?;
             let copied = threads::copy_for_finalization(ctx, project, &record);
             if let CopyOutcome::Failed(error) = &copied.outcome {
+                if error.contains("[transport-unsupported]") {
+                    if let Some(saved) = state.finalizations.get_mut(&id) { saved.retry.blocked = true; }
+                }
                 bail!("{id}: not resolved ({}) because the final copy failed: {error}", pending.reason);
             }
             if let CopyOutcome::Partial(notes) = &copied.outcome {

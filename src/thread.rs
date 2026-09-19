@@ -82,6 +82,7 @@ pub struct Thread {
     pub last_finalization: String,
     /// Content-addressed local preservation receipt; empty for legacy/live copies.
     pub artifact_snapshot: String,
+    pub removal: Option<crate::cleanup::Removal>,
 }
 
 impl Thread {

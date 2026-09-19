@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 use crate::coordinator::{self, OpenOptions};
@@ -41,7 +41,25 @@ impl From<SessionArgs> for SessionFlags {
 }
 
 #[derive(Subcommand)]
+enum RepairCommand {
+    /// Print machine-readable diagnostics without changing records
+    Inspect,
+    /// Restore a record after checking its inspected SHA-256; ticker must be stopped
+    Restore {
+        path: PathBuf,
+        #[arg(long)] from: PathBuf,
+        #[arg(long)] expected_hash: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum Command {
+    /// Inspect damaged records or restore a validated replacement with a backup
+    Repair {
+        slug: String,
+        #[command(subcommand)]
+        command: RepairCommand,
+    },
     /// Create a project folder with its skeleton files
     New {
         name: String,
@@ -142,6 +160,14 @@ enum Command {
     /// Run inside a plugin popup pane
     #[command(hide = true)]
     Pane { id: String },
+    /// Versioned binary artifact transport for remote preservation.
+    #[command(hide = true)]
+    ArtifactStream {
+        #[arg(long, conflicts_with = "path")]
+        probe: bool,
+        #[arg(long, required_unless_present = "probe")]
+        path: Option<PathBuf>,
+    },
     /// Safety settings
     Safety {
         #[command(subcommand)]
@@ -226,9 +252,12 @@ enum ThreadCommand {
         id: String,
         #[arg(long, conflicts_with_all = ["remove_worktree", "skip_copy", "discard_uncopied"])]
         reopen: bool,
-        /// Request cleanup (currently refused until writer shutdown can be verified)
+        /// Remove an exclusively owned local worktree after verified preservation
         #[arg(long)]
         remove_worktree: bool,
+        /// Confirm all known artifact writers have stopped; Linux process checks still apply
+        #[arg(long, requires = "remove_worktree")]
+        writers_stopped: bool,
         /// Resolve even though the final copy cannot be made
         #[arg(long)]
         skip_copy: bool,
@@ -278,6 +307,10 @@ enum TickerCommand {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    if let Command::ArtifactStream { probe, path } = &cli.command {
+        if *probe { crate::artifacts::probe(); return Ok(()); }
+        return crate::artifacts::export(path.as_ref().context("artifact source path is required")?, &mut std::io::stdout().lock());
+    }
     let env = Env::from_process()?;
     let config_dir = env.config_dir();
     let root = paths::resolve_root(cli.root.as_deref(), &env, &config_dir)?;
@@ -291,6 +324,18 @@ pub fn run() -> Result<()> {
     };
 
     match cli.command {
+        Command::Repair { slug, command } => {
+            let project = Project::load(&ctx.root, &slug)?;
+            match command {
+                RepairCommand::Inspect => println!("{}", serde_json::to_string_pretty(&crate::repair::inspect(&project)?)?),
+                RepairCommand::Restore { path, from, expected_hash } => {
+                    let backup = crate::repair::restore(&ctx.root, &project, &path, &from, &expected_hash)?;
+                    println!("Restored {}. Original saved at {backup}", path.display());
+                }
+            }
+            Ok(())
+        }
+        Command::ArtifactStream { .. } => unreachable!("artifact transport handled before environment resolution"),
         Command::New { name, goal, repos } => {
             let repos = repos.iter().map(|arg| project::parse_repo_arg(arg)).collect();
             let project = project::create(&ctx.root, &name, &goal, repos)?;
@@ -362,8 +407,8 @@ pub fn run() -> Result<()> {
             ThreadCommand::List { slug } => threads::print_list(&ctx, &slug),
             ThreadCommand::Show { slug, id } => threads::print_show(&ctx, &slug, &id),
             ThreadCommand::Ack { slug, id } => threads::ack(&ctx, &slug, &id),
-            ThreadCommand::Resolve { slug, id, reopen, remove_worktree, skip_copy, discard_uncopied } => {
-                threads::resolve(&ctx, &slug, &id, &ResolveArgs { reopen, remove_worktree, skip_copy, discard_uncopied })
+            ThreadCommand::Resolve { slug, id, reopen, remove_worktree, writers_stopped, skip_copy, discard_uncopied } => {
+                threads::resolve(&ctx, &slug, &id, &ResolveArgs { reopen, remove_worktree, writers_stopped, skip_copy, discard_uncopied })
             }
         },
         Command::Routine { command } => match command {

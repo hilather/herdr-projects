@@ -468,13 +468,14 @@ fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::T
 fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
     thread::list(project)
         .into_iter()
-        .filter(|t| t.is_remote() == remote && matches!(t.status, thread::Status::Open | thread::Status::Starting))
+        .filter(|t| t.removal.is_none() && t.is_remote() == remote && matches!(t.status, thread::Status::Open | thread::Status::Starting))
         .collect()
 }
 
 /// Returns `Ok(None)` when the project's session cannot be reached: then no
 /// state is read, so nothing is ever reported as gone.
 fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
+    let _lease = crate::cleanup::lease(&ctx.root)?;
     let Some(record) = project.coordinator() else {
         return Ok(None);
     };
@@ -586,6 +587,7 @@ fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threa
 /// Copies and launches, remote machines, then inbox items, pull requests,
 /// routines, auto-resolve and housekeeping.
 fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> Vec<anyhow::Error> {
+    let _lease = match crate::cleanup::lease(&ctx.root) { Ok(lease) => lease, Err(error) => return vec![error] };
     let mut errors = Vec::new();
     let mut state = match steps::try_load_state(project) {
         Ok(state) => state,

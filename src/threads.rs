@@ -89,6 +89,7 @@ pub struct StartArgs {
 /// Creates the workspace or tab, the thread directory and the brief, then
 /// returns. The agent is launched by the ticker, so there is one delivery path.
 pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
+    let _lease = crate::cleanup::lease(&ctx.root)?;
     let project = Project::load(&ctx.root, slug)?;
     let status = project.status();
     if status != project::Status::Active {
@@ -331,6 +332,7 @@ pub enum RestartPlan {
     ReusePane,
     /// (e) open the existing worktree, or a new tab in `threads/<id>/`.
     Reopen,
+    RestoreRemoved,
 }
 
 /// What `thread restart` does, from what the record shows was reached.
@@ -351,6 +353,10 @@ pub fn restart_plan(thread: &Thread, live: &Live, branch_exists: bool, now: jiff
     }
     if live.pane_exists && thread.prompt_pending && thread.launch_attempts < thread::MAX_LAUNCH_ATTEMPTS && thread.status == Status::Open {
         bail!("{} is being launched by the ticker (attempt {} of {})", thread.id, thread.launch_attempts, thread::MAX_LAUNCH_ATTEMPTS);
+    }
+    if thread.kind == Kind::Worktree && thread.removal.is_some() {
+        if live.pane_exists { bail!("removal checkpoint has a live pane; reconcile before restarting"); }
+        return Ok(RestartPlan::RestoreRemoved);
     }
     if thread.kind == Kind::Worktree && thread.worktree_path.is_empty() {
         if branch_exists {
@@ -383,6 +389,7 @@ fn lists_for(view: &SessionView, record: &Thread) -> Result<(Vec<Agent>, Vec<Pan
 }
 
 pub fn restart(ctx: &Ctx, slug: &str, id: &str) -> Result<Thread> {
+    let _lease = crate::cleanup::lease(&ctx.root)?;
     let project = Project::load(&ctx.root, slug)?;
     if project.status() != project::Status::Active {
         bail!("`{slug}` is {}; restart is refused until the project is active again", project.status());
@@ -418,9 +425,15 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str) -> Result<Thread> {
     };
 
     let plan = restart_plan(&record, &live, branch_exists, now)?;
+    let plan = if plan == RestartPlan::RestoreRemoved {
+        crate::cleanup::restore(ctx, &project, &record)?;
+        RestartPlan::Reopen
+    } else { plan };
+    let record = thread::load(&project, id)?;
     ticker::start(ctx)?;
     thread::update_checked(&project, id, thread::invalidate_finalization)?;
     match plan {
+        RestartPlan::RestoreRemoved => unreachable!("restored before placement"),
         RestartPlan::Create => return place_and_brief(ctx, &project, &view, id, true),
         RestartPlan::ReusePane => {}
         RestartPlan::Reopen => match record.kind {
@@ -447,11 +460,13 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str) -> Result<Thread> {
 /// Sends a follow-up. The one sender that does not use the ready-for-a-prompt
 /// predicate: agents queue a message that arrives while they work.
 pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
+    let _lease = crate::cleanup::lease(&ctx.root)?;
     let project = Project::load(&ctx.root, slug)?;
     if project.status() != project::Status::Active {
         bail!("`{slug}` is {}; prompting is refused until the project is active again", project.status());
     }
     let record = thread::load(&project, id)?;
+    if record.removal.is_some() { bail!("thread has an unresolved removal checkpoint; restart or repair it before prompting"); }
     if text.trim().is_empty() {
         bail!("the text is empty");
     }
@@ -499,11 +514,13 @@ pub fn ack(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
 pub struct ResolveArgs {
     pub reopen: bool,
     pub remove_worktree: bool,
+    pub writers_stopped: bool,
     pub skip_copy: bool,
     pub discard_uncopied: bool,
 }
 
 pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()> {
+    let _lease = crate::cleanup::lease(&ctx.root)?;
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
     if args.reopen {
@@ -547,9 +564,8 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
     }
 
     if args.remove_worktree {
-        remove_worktree(ctx, &project, &record)?;
-        // The record says what exists: `delete` lists leftovers from it.
-        thread::update(&project, id, |t| t.worktree_path.clear())?;
+        remove_worktree(ctx, &project, &record, args.writers_stopped)?;
+
     }
     let resolved = thread::update_checked(&project, id, |t| {
         if thread::execution_fingerprint(t) != thread::execution_fingerprint(&record) || t.status != record.status {
@@ -558,6 +574,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
         thread::invalidate_finalization(t)?;
         t.status = Status::Resolved;
         t.resolved_reason = "manual".into();
+        if args.remove_worktree { t.worktree_path.clear(); t.cwd.clear(); }
         t.prompt_pending = false;
         Ok(())
     })?;
@@ -604,7 +621,24 @@ pub fn final_copy(ctx: &Ctx, project: &Project, record: &Thread) -> thread::Copi
 pub fn copy_for_finalization(ctx: &Ctx, project: &Project, record: &Thread) -> thread::Copied {
     if record.is_remote() {
         match remote::ssh_target(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, &record.machine) {
-            Ok(target) => thread::copy_home_remote(project, record, true, ctx.runner, &target),
+            Ok(target) => {
+                match crate::artifacts::capture_remote(ctx, project, record, &target) {
+                    Ok(snapshot) => {
+                        // Final projections come from bounded, independently verified
+                        // local bytes, not a second mutable remote transfer.
+                        let source = project.state_dir().join("artifacts").join(&record.id).join(&snapshot.id);
+                        let local = Thread { thread_dir: source.to_string_lossy().into_owned(), machine: String::new(), ..record.clone() };
+                        let mut copied = thread::copy_home_local(project, &local, true, ctx.runner);
+                        if matches!(copied.outcome, CopyOutcome::Complete) && snapshot.manifest.report_hash() == copied.report_hash.as_deref() {
+                            copied.artifact_snapshot = Some(snapshot.id);
+                        } else if matches!(copied.outcome, CopyOutcome::Complete) {
+                            copied.outcome = CopyOutcome::Failed("retained report changed while projecting snapshot".into());
+                        }
+                        copied
+                    }
+                    Err(error) => thread::Copied { artifact_snapshot: None, outcome: CopyOutcome::Failed(format!("{error:#}")), report_hash: None },
+                }
+            },
             Err(error) => thread::Copied { artifact_snapshot: None, outcome: CopyOutcome::Failed(format!("{error:#}")), report_hash: None },
         }
     } else {
@@ -628,9 +662,9 @@ pub fn copy_for_finalization(ctx: &Ctx, project: &Project, record: &Thread) -> t
     }
 }
 
-/// Validate preservation and ownership, then refuse until writer exclusion is
-/// implemented. No force-removal fallback exists.
-fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
+/// Validate preservation and exclusive ownership before the writer checkpoint.
+/// No force-removal fallback exists.
+fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread, writers_stopped: bool) -> Result<()> {
     if record.worktree_path.is_empty() {
         bail!("{} has no recorded worktree", record.id);
     }
@@ -641,7 +675,7 @@ fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> 
         bail!("thread identity changed before cleanup; keeping the worktree");
     }
     if current.is_remote() {
-        bail!("remote worktree cleanup requires verified remote preservation and writer quiescence, which are not available yet; resolve without --remove-worktree");
+        bail!("remote writer quiescence cannot be established; resolve without --remove-worktree");
     }
     let worktree = std::fs::canonicalize(&current.worktree_path)?;
     if !std::fs::symlink_metadata(&current.worktree_path)?.is_dir() || worktree == std::fs::canonicalize(&current.repo)? {
@@ -677,10 +711,7 @@ fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> 
     let manifest = crate::artifacts::load(project, &current, &current.artifact_snapshot)
         .context("cleanup requires a verified preservation snapshot")?;
     crate::artifacts::verify_source(&current, &manifest)?;
-    // Snapshot equality is a point-in-time observation, not writer exclusion.
-    // Until the lifecycle checkpoint protocol owns launch/prompt exclusion and
-    // confirms all artifact writers have stopped, preserve the source.
-    bail!("preservation snapshot verified, but writer quiescence cannot yet be established; keeping the worktree. Resolve without --remove-worktree")
+    crate::cleanup::remove(ctx, project, &current, writers_stopped)
 }
 
 /// A thread with its live state and group, for `thread list`, `thread show`

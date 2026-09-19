@@ -89,12 +89,16 @@ fn check_target(target: &str) -> Result<()> {
 /// Runs `script` on the machine with `sh -c`. The script is one argument; every
 /// value inside it must already have gone through `quote`.
 pub fn ssh(runner: &dyn Runner, target: &str, script: &str, stdin: Option<&str>, timeout: Duration) -> Result<Output> {
-    check_target(target)?;
-    let mut cmd = Cmd::new("ssh", timeout).args(SSH_OPTIONS).args(["--", target, &format!("sh -c {}", quote(script))]);
+    let mut cmd = ssh_command(target, script, timeout)?;
     if let Some(text) = stdin {
         cmd = cmd.stdin(text);
     }
     runner.run(&cmd)
+}
+
+pub fn ssh_command(target: &str, script: &str, timeout: Duration) -> Result<Cmd> {
+    check_target(target)?;
+    Ok(Cmd::new("ssh", timeout).args(SSH_OPTIONS).args(["--", target, &format!("sh -c {}", quote(script))]))
 }
 
 /// Origin URL and base ref of a repository on the machine, after a fetch whose
@@ -239,23 +243,23 @@ fn pr_safe(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).take(200).collect()
 }
 
-/// Copies one remote file to a local path with `scp`. A path scp cannot carry
-/// unchanged in every mode (spaces, quotes, globs) is fetched with `ssh cat`
-/// through the quoting helper instead.
+/// Copies a remote file through a bounded quoted SSH stream and atomic staging.
 pub fn fetch_file(runner: &dyn Runner, target: &str, remote_path: &str, local_path: &Path) -> Result<()> {
     check_target(target)?;
-    if is_plain(remote_path) {
-        let out = runner.run(&Cmd::new("scp", COPY_TIMEOUT).args(SSH_OPTIONS).args(["-q", "--", &format!("{target}:{remote_path}"), &local_path.to_string_lossy()]))?;
-        if !out.success() {
-            bail!("scp from {target}: {}", out.error_text());
-        }
-        return Ok(());
-    }
-    let out = ssh(runner, target, &format!("cat -- {}", quote(remote_path)), None, COPY_TIMEOUT)?;
-    if !out.success() {
-        bail!("ssh {target} cat: {}", out.error_text());
-    }
-    std::fs::write(local_path, &out.stdout_bytes)?;
+    let parent = local_path.parent().context("file destination has no parent")?;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let staged = parent.join(format!(".fetch-{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    if staged.try_exists()? { bail!("stale transfer staging file {}; inspect it before retrying", staged.display()); }
+    let mut cmd = ssh_command(target, &format!("test -f {0} && test ! -L {0} && cat -- {0}", quote(remote_path)), COPY_TIMEOUT)?;
+    cmd.stdout_file = Some((staged.clone(), 50 * 1024 * 1024));
+    let result = (|| {
+        let output = runner.run(&cmd)?;
+        if !output.success() { bail!("ssh {target} file stream: {}", output.error_text()); }
+        std::fs::rename(&staged, local_path)?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&staged);
+    result?;
     Ok(())
 }
 
@@ -268,7 +272,7 @@ pub fn fetch_dir(runner: &dyn Runner, target: &str, remote_dir: &str, local_dir:
         (target.to_string(), ssh(runner, target, "rsync --help", None, SSH_TIMEOUT)?),
     ] {
         if !output.success() || !(output.stdout.contains("--secluded-args") || output.stdout.contains("--protect-args")) {
-            bail!("rsync on {place} does not confirm protected-argument support; install rsync 3.0 or later on both hosts before retrying");
+            bail!("[transport-unsupported] rsync on {place} does not confirm protected-argument support; install rsync 3.0 or later on both hosts before retrying");
         }
     }
     // -s still expands wildcard source arguments. Change directory through a
@@ -443,7 +447,7 @@ mod tests {
         assert_eq!(runner.count("scp"), 0);
         assert_eq!(std::fs::read_to_string(dir.path().join("r")).unwrap(), "file body");
         fetch_file(&runner, "box", "/wt/repo/report.md", &dir.path().join("r2")).unwrap();
-        assert_eq!(runner.count("scp"), 1);
+        assert_eq!(runner.count("scp"), 0);
         assert!(fetch_dir(&runner, "box", "/wt/my repo/library", dir.path()).is_err());
         assert!(!runner.calls.borrow().iter().any(|c| c.program == "rsync" && c.args.iter().any(|a| a == "-rt")));
     }
@@ -456,7 +460,9 @@ mod tests {
             fn socket_request(&self, _: &Path, _: &str, _: Duration) -> Result<String> { bail!("unexpected socket request in transport fixture") }
             fn run(&self, cmd: &Cmd) -> Result<Output> {
                 if cmd.program == "ssh" {
-                    return RealRunner.run(&Cmd::new("sh", cmd.timeout).args(["-c", cmd.args.last().unwrap()]).cwd(&self.root));
+                    let mut local = Cmd::new("sh", cmd.timeout).args(["-c", cmd.args.last().unwrap()]).cwd(&self.root);
+                    local.stdout_file = cmd.stdout_file.clone();
+                    return RealRunner.run(&local);
                 }
                 let mut cmd = cmd.clone();
                 if cmd.program == "rsync" && let Some(index) = cmd.args.iter().position(|a| a == "-e") {

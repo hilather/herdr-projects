@@ -241,3 +241,32 @@ fn legacy_records_default_new_retry_and_generation_fields() {
     assert_eq!(t.lifecycle_generation, 0);
     assert!(t.suppressed_merged_pr.is_empty());
 }
+
+#[test]
+fn unsupported_remote_helper_blocks_until_explicit_finalization_retry() {
+    let (world, project) = copy_fixture();
+    let record = thread::update(&project, "t-0001", |t| t.machine = "box".into()).unwrap();
+    let installed = Rc::new(RefCell::new(false));
+    let available = installed.clone();
+    world.runner.on("machine list --json", ok(r#"[{"label":"box","target":"fixture"}]"#));
+    world.runner.on_fn(|cmd| cmd.display().contains("artifact-stream --probe"), move |_| {
+        Ok(if *available.borrow() { ok(r#"{"schema":1}"#) } else { fail(127, "helper missing") })
+    });
+    let source = record.thread_dir.clone();
+    world.runner.on_fn(|cmd| cmd.display().contains("artifact-stream --path"), move |_| {
+        let mut output = ok("");
+        crate::artifacts::export(Path::new(&source), &mut output.stdout_bytes)?;
+        Ok(output)
+    });
+    world.runner.on("rsync", ok(""));
+    assert_eq!(poll(&world, &project, now()).len(), 1);
+    assert!(steps::load_state(&project).finalizations["t-0001"].retry.blocked);
+    assert!(poll(&world, &project, later(now(), 86_400)).is_empty());
+    assert_eq!(world.runner.count("artifact-stream --probe"), 1);
+    *installed.borrow_mut() = true;
+    threads::resolve(&world.ctx(), "demo", "t-0001", &ResolveArgs::default()).unwrap();
+    assert_eq!(thread::load(&project, "t-0001").unwrap().status, Status::Resolved);
+    assert!(!thread::load(&project, "t-0001").unwrap().artifact_snapshot.is_empty());
+    assert!(poll(&world, &project, later(now(), 86_401)).is_empty());
+    assert!(steps::load_state(&project).finalizations.is_empty());
+}

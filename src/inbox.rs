@@ -25,7 +25,7 @@ fn inbox_dir(project: &Project) -> PathBuf {
     project.dir().join("inbox")
 }
 
-fn parse(text: &str) -> Option<Item> {
+pub(crate) fn parse(text: &str) -> Option<Item> {
     let rest = text.strip_prefix("+++\n")?;
     let (front, body) = rest.split_once("\n+++\n").or_else(|| Some((rest.strip_suffix("\n+++")?, "")))?;
     let mut item: Item = toml::from_str(front).ok()?;

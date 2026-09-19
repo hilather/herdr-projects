@@ -164,3 +164,45 @@ fn context_includes_current_instructions_and_broken_record_diagnostics() {
     assert_eq!(std::fs::read_to_string(project.dir().join("inbox/broken.md")).unwrap(), "broken inbox");
     assert_eq!(std::fs::read_to_string(project.dir().join("threads/t-0002.toml")).unwrap(), "broken = [");
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn resolve_remove_reopen_restart_uses_the_retained_git_branch() {
+    use crate::runner::{RealRunner, Runner};
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let repo = world.home.path().join("repo");
+    let work = world.home.path().join("work");
+    std::fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let output = RealRunner.run(&Cmd::new("git", std::time::Duration::from_secs(5)).args(["-C", repo.to_str().unwrap()]).args(args.iter().copied())).unwrap();
+        assert!(output.success(), "{}", output.error_text());
+        output.stdout
+    };
+    git(&["init", "--quiet"]);
+    git(&["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "--allow-empty", "-m", "base"]);
+    git(&["worktree", "add", "-b", "retained", work.to_str().unwrap()]);
+    std::fs::write(repo.join(".git/info/exclude"), ".herdr-project/\n").unwrap();
+    let record = world.thread(&project, &work, |t| { t.repo = repo.to_str().unwrap().into(); t.branch = "retained".into(); });
+    std::fs::create_dir_all(&record.thread_dir).unwrap();
+    std::fs::write(Path::new(&record.thread_dir).join("report.md"), b"final report").unwrap();
+    world.runner.on_fn(|cmd| ["git", "du", "rsync"].contains(&cmd.program.as_str()), |cmd| RealRunner.run(cmd));
+    world.runner.on("worktree open", ok(&format!(r#"{{"result":{{"root_pane":{{"workspace_id":"w3","tab_id":"w3:t1","pane_id":"w3:p1","cwd":"{}"}},"worktree":{{"path":"{}"}}}}}}"#, work.display(), work.display())));
+    let args = ResolveArgs { remove_worktree: true, writers_stopped: true, ..Default::default() };
+    threads::resolve(&world.ctx(), "demo", &record.id, &args).unwrap();
+    let removed = thread::load(&project, &record.id).unwrap();
+    assert_eq!(removed.status, Status::Resolved);
+    assert!(removed.worktree_path.is_empty());
+    assert!(!work.exists());
+    let snapshot = project.state_dir().join("artifacts").join(&record.id).join(&removed.artifact_snapshot);
+    assert_eq!(std::fs::read(snapshot.join("report.md")).unwrap(), b"final report");
+    threads::resolve(&world.ctx(), "demo", &record.id, &ResolveArgs { reopen: true, ..Default::default() }).unwrap();
+    assert!(!work.exists(), "logical reopen starts nothing");
+    let restarted = threads::restart(&world.ctx(), "demo", &record.id).unwrap();
+    assert!(work.exists());
+    assert_eq!(restarted.branch, "retained");
+    assert!(restarted.removal.is_none());
+    assert!(restarted.prompt_pending);
+    assert_eq!(world.runner.count("worktree create"), 0);
+    assert_eq!(world.runner.count("agent start"), 0);
+}

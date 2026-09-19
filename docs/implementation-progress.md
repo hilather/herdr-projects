@@ -23,117 +23,88 @@ The F02, F03, F04 and both F05 baseline reproductions pass in the W01 commit.
 The initial W02 changes also enable and pass F01; all baseline regressions now run.
 
 See [ADR 0001](adr/0001-phase-a-boundaries.md) for the runtime contract, compatibility
-boundaries and dependency decision. T00.2's full Phase B typed/store contracts
-remain open before any migration implementation. No complete-wave acceptance or
+boundaries and dependency decision. ADR 0002 now supplies the Phase B interface
+contract and dependency selection before any migration implementation. No complete-wave acceptance or
 independent review is claimed by these local changes.
 
-## In progress: W02 preservation, diagnostics and context
+## Latest five-item batch: T02.1–T02.4 and T00.2
 
-Local and remote library transfers now request content checksums, fixing F01
-without relying on size/mtime equality. Local report receipts consume the copy
-result; neither local nor remote ticker receipts fall back to an earlier hash
-observation when no report was copied. Full-ticker scenarios cover a remote source
-disappearing after observation and a transfer returning different bytes from the
-observation. The quoted SSH file fallback writes raw bytes and refuses truncated
-output before touching its destination.
+Base/head before this uncommitted batch: `30185f8` on
+`hp-plan/w00/t00-1-baseline`. No live user sessions or production project roots
+were modified. Native Rust tests and disposable Git/filesystem/process fixtures
+supply the evidence below.
 
-Local complete final copies now publish verified snapshots under
-`.state/artifacts/<thread>/<manifest-hash>/`. Staging uses exclusive files and
-bounded streaming hashes (50 MiB total, 10,000 entries, depth 64); manifests record
-relative paths, types, byte counts and SHA-256. Independent staged-byte verification
-and a source rescan precede publication. Empty directories are preserved. Symlinks,
-hard links, unsupported types and non-UTF-8 names are refused. Existing snapshots
-are verified before reuse and never overwritten. Live-copy library roots and thread destinations reject symlink substitution.
-Failed receipt writes now fail finalization; receipts and resolution reject changed execution identity. Missing
-sources with a prior snapshot cannot be silently acknowledged as empty.
+- **T02.1:** Versioned native remote artifact export/receive with 50 MiB payload,
+  4 MiB manifest, 10,000 entries and depth limits. Source recheck, independent
+  staged hashes, literal UTF-8 paths, binary payloads and immutable receipt reuse.
+  Local Linux cleanup excludes supported managed operations, requires explicit
+  known-writer shutdown confirmation, inspects same-user process cwd/descriptors/
+  mappings, rechecks source/Git identity and uses non-force removal. Shared/adopted
+  references, managed panes, ambiguity and failed verification preserve the source.
+- **T02.2:** Runner file sinks stream without filling memory and terminate on the
+  byte limit. All remote report paths use bounded staging and atomic publication.
+  Remote final projections derive from verified snapshot bytes. Missing/incompatible
+  helpers durably block merged finalization with installation/manual-retry guidance.
+  Connection errors retain bounded retry. Live rsync projections retain preflight
+  size checks but are not hard bounds against a growing source.
+- **T02.3:** Removal intent records operation/repository/path/branch/head/snapshot
+  before Git removal; a lost acknowledgement is recoverable. Pending removal
+  excludes ticker launch and prompting. Logical reopen starts nothing; restart
+  validates the retained branch and reattaches it without reset, force or branch
+  deletion. Missing legacy creation evidence remains a human-inspection case.
+- **T02.4:** `repair PROJECT inspect` emits structured JSON. Explicit restore checks
+  the inspected hash and replacement identity/schema, excludes active writers,
+  backs up original bytes and atomically replaces the record. Ticker lock prevents
+  overwriting pending obligations from its in-memory state. No automatic repair.
+  Earlier popup concurrency/replay/root/session/expiry tests remain enabled.
+- **T00.2:** [ADR 0002](adr/0002-phase-b-contracts.md) and compiled illustrative
+  domain/store interfaces define state, revision, event, approval, ambiguity and
+  result/gate boundaries. Rust 1.89 rejects rusqlite 0.40.1; 0.37.0 with system
+  SQLite 3.53.4 passes the standalone native transaction fixture. Its old bundled
+  SQLite 3.50.2 was tested but rejected for engine maintenance. No application
+  database dependency or migration was added.
 
-**Behavior change:** `--remove-worktree` currently refuses removal. Local preflight
-checks active status, execution identity, shared/adopted references, managed panes
-and agents, and retained snapshot/source equality. These checks cannot establish
-writer exclusion, so even a verified snapshot does not authorize deletion. Remote
-cleanup also refuses until verified transport and writer control exist. Plain
-resolve and reopen remain available. `--discard-uncopied` cannot bypass these gates.
-This deliberately leaves T02.1/T02.3 cleanup completion open rather than treating
-an idle pane or two matching manifests as proof that no writer can continue.
+Real Git tests exercise ignored artifact preservation, dirty/untracked refusal,
+retained branch reopen, lost removal acknowledgement, and the entire resolve →
+remove → reopen → restart path (Herdr responses mocked). Native CLI tests use a
+scrubbed environment for multi-megabyte binary export and explicit repair. Process
+fixtures cover sink overflow/exclusive creation, descriptor-based cleanup refusal,
+and lifecycle lease exclusion. Stream fixtures reject path traversal, duplicates,
+corrupt/truncated/oversize payloads and source changes during export.
 
-T02.4 groundwork: ticker JSON parse/read failures now preserve the file and stop
-that project's tick; healthy projects continue. Readable thread records remain
-available alongside explicit malformed-record diagnostics in doctor and context.
-Inbox records now have the same explicit diagnostics. Automatic quarantine/repair
-remains pending; no malformed record is deleted automatically.
+## Validation and limits
 
-Popup handoffs now have random per-invocation IDs, a schema and entrypoint binding,
-a ten-minute lifetime, and root/session binding. Herdr's `plugin pane open --env`
-passes the ID to its consumer. An atomic claim prevents replay, including two
-concurrent consumers. Wrong action/schema/session/root and expired contexts fail
-closed. Separate popup actions can no longer overwrite one shared `handoff.json`.
-The installed Herdr 0.9.1 help confirms `--env`; interactive popup behavior has not
-been certified in a live session.
-
-T02.2 transport: library transfers probe local and remote rsync for protected-argument
-support, use `-s`, and enter the source directory through a quoted `--rsync-path`
-command. The protocol receives literal `./`, avoiding rsync wildcard expansion in
-source paths. Real rsync 3.5.0 through a local SSH substitute tests spaces, Unicode,
-quotes, dollar signs, backticks, wildcards, leading hyphens, newlines, binary bytes,
-empty directories and skipped symlinks. Remote layout size errors now refuse copy;
-filenames cannot inject layout fields through the symlink listing. See the
-[transport compatibility notes](remote-transport.md) for requirements and limits.
-
-T02.3 launch guards: paused/archived projects refuse restart, follow-up prompts,
-coordinator open and adoption before launch side effects. Restart checks competing
-pane ownership in the same recorded session and machine before changing execution
-identity. Intentional-removal tombstones and retained-branch reopen remain pending
-because verified writer shutdown/removal is not yet available.
-
-T02.5 context: startup already directs the coordinator to `context`, which now
-includes the full current PROJECT.md body, a revision hash and character count.
-Each later context refresh repeats current instructions and flags oversized text.
-Coordinator guidance distinguishes standing instructions from execution approval,
-and documents advisory capacity, shared worker arguments and static worker briefs.
-Tests verify changing instructions appear in both coordinator context and worker
-briefs while malformed thread records remain visible.
-
-Remote snapshots, writer checkpoints, Git identity
-and tombstone recovery, snapshot retention/garbage collection, and the remaining
-lifecycle fixes are not complete. Legacy never-created sources can still be treated
-as empty when no prior snapshot exists. Live report/library paths remain mutable
-compatibility copies; retained snapshot paths are the verified evidence.
-
-## Validation
-
-Rust 1.89 on Linux, using the temporary toolchain described in the
-[historical baseline](review-baseline.md):
+Commands use Rust 1.89 with locked dependencies:
 
 ```sh
 cargo test --locked --offline
 cargo test --release --locked --offline
 cargo build --release --locked --offline
-git diff --check
+CARGO_TARGET_DIR=/tmp/herdr-sqlite-smoke-target cargo run --locked --offline --manifest-path contracts/sqlite-smoke/Cargo.toml
 ```
 
-Debug and release suites each passed **202 unit/scenario tests plus four CLI
-tests (206 total)**, with no ignored tests. The locked
-release build and `git diff --check` also passed. The new `libc` dependency uses
-the version already present in the lockfile; no package version was upgraded.
+**Results: 222 tests pass in both debug and release** (214 unit/scenario, six
+CLI integration and two interface-contract tests), zero ignored. The locked release
+build passes without warnings, `git diff --check` is clean, and the standalone
+SQLite probe passes against system SQLite 3.53.4 on Rust 1.89. Tests use Linux, Git,
+rsync 3.5.0, native subprocesses and disposable roots; Herdr lifecycle calls use
+scripted fixtures. Real double-shell remote-path fixtures run locally.
 
-Herdr version compatibility is confirmed locally. Live Herdr sessions, SSH,
-GitHub, mixed-agent execution and macOS were not exercised. Fairness/launch/copy
-scenarios use FakeRunner and disposable project directories; process and parser
-tests exercise real local behavior. No default sessions, production projects,
-remote repositories or user worktrees were modified.
+Local command logs: `/tmp/herdr-five-debug.log`, `/tmp/herdr-five-release.log`,
+`/tmp/herdr-five-build.log`, `/tmp/herdr-five-sqlite.log`. These temporary logs are
+not release artifacts; the commands and fixture sources above are reproducible.
+
+Remote and non-Linux destructive cleanup remain explicitly unsupported. The
+checkpoint assumes cooperative same-user agents and stopped known writers; it
+cannot contain hostile same-privilege processes or see managed state in other
+roots. Live SSH, interactive popup delivery, macOS and independent review remain
+Phase A acceptance requirements. Snapshot/repair-backup retention is manual.
+Plain resolution retains the worktree unless cleanup is explicitly requested.
+No force fallback, automatic merge/push or production data migration is introduced.
 
 ## Next work
 
-The [41-card task ledger](task-status.md) tracks **7 implemented locally, 5 partial
-and 29 not started: 34 cards still open**. These are implementation counts, not
-formal release acceptance.
-
-1. Complete the W01 acceptance evidence that requires independent review and
-   external environments (including macOS and live Herdr/SSH/GitHub).
-2. Finish W02 remote preservation, writer exclusion and lifecycle
-   cleanup/restart, and record repair. Removal stays
-   unavailable until those preservation and lifecycle gates are implemented.
-3. Finish Phase B contracts before any database or memory-authority migration.
-
-The current changes preserve legacy state formats. Reverting them restores the
-old behavior and its known defects; there is no data migration to reverse.
+[Task ledger](task-status.md): twelve locally implemented cards, 29 not started.
+Complete the outstanding Phase A acceptance evidence before the W03 store/migration
+wave. Proposed memory change: record native transport v1, cooperative checkpoint,
+repair workflow and ADR 0002 decisions; no shared-memory promotion was performed.

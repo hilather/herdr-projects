@@ -30,7 +30,7 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
 ~/.config/herdr-projects/approved-routines.json  written only by `routine approve`
 ```
 
-Every thread works from `<its working directory>/.herdr-project/<project>-<id>/`: `brief.md` (written by the binary), `report.md` and `library/` (written by the agent). In a git repository that folder is added to `info/exclude`, so nothing in it is committed. **Git therefore treats it as clean: removing a worktree deletes it**, so a copy alone is insufficient to justify removal. `--remove-worktree` currently refuses: verified preservation and writer shutdown must both be established. Plain resolve keeps the worktree and branch. `--discard-uncopied` cannot bypass writer or ownership checks.
+Every thread works from `<its working directory>/.herdr-project/<project>-<id>/`: `brief.md` (written by the binary), `report.md` and `library/` (written by the agent). In a git repository that folder is added to `info/exclude`, so nothing in it is committed. **Git therefore treats it as clean: removing a worktree deletes it**, so a copy alone is insufficient to justify removal. `--remove-worktree --writers-stopped` can remove an exclusively owned local Linux worktree after verified preservation, managed-operation exclusion and process checks. Stop all known artifact writers before asserting `--writers-stopped`; idle alone is insufficient. Remote and unsupported-platform cleanup refuse. Plain resolve keeps the worktree and branch. `--discard-uncopied` cannot bypass writer or ownership checks.
 
 `PROJECT.md` settings: `name`, `goal`, `repos` (`path`, optional `machine`), `coordinator_agent`, `thread_agent` (default `claude`), `max_parallel_threads` (3), `auto_resolve_days` (7), `nudge` (`false`).
 
@@ -129,15 +129,14 @@ copying. Finalization never removes the worktree.
 Existing partial-copy policy remains: skipped symlinks or an oversized library
 may resolve the thread, with a durable `copy` warning in the inbox. Failed copies
 do not resolve it. Content checksums prevent stale equal-size/equal-mtime library transfers.
-Complete local final copies also retain content-addressed snapshots in
+Complete local and supported remote final copies also retain content-addressed snapshots in
 `.state/artifacts/<thread>/<manifest-hash>/`, with a verified `manifest.json`.
 Snapshots contain the report and library, including empty directories; the combined
 limit is 50 MiB, 10,000 entries and 64 directory levels. Symlinks, hard links,
 special files and non-UTF-8 names are refused. Staging failures and changed sources
 leave previous snapshots intact. Snapshot retention is currently manual: no
 background process removes them. Live `threads/<id>.md` and `library/<id>/` remain
-compatibility copies, separate from these retained snapshots. Remote snapshots and
-writer-exclusion checkpoints are still pending; cleanup remains unavailable.
+compatibility copies, separate from these retained snapshots. Remote finalization requires the native helper described in [remote transport](remote-transport.md). Local Linux cleanup also checks Git registration/branch/commit, cross-project references, managed panes and process descriptors/cwd/mappings. Any uncertainty keeps the worktree. These checks assume cooperative same-user agents; they are not hostile-process containment.
 
 GitHub outage streaks are tracked per project and PR URL, and machine streaks per
 project/session/machine. Healthy resources do not clear another resource's
@@ -218,5 +217,33 @@ Remote directory transfers support literal spaces, Unicode and shell characters
 when both hosts support rsync protected arguments. Capability checks run before
 transfer and give an installation diagnostic when support is missing. See
 [remote transport](remote-transport.md) for the tested boundary. Invalid or missing
-remote library-size observations refuse transfer. Remote snapshots and writer
-shutdown verification remain unfinished; worktree removal stays unavailable.
+remote library-size observations refuse transfer. Verified remote snapshots use the bounded native stream; remote removal still lacks a writer checkpoint adapter and is refused.
+
+
+## Removal recovery and explicit repair
+
+Removal writes its operation ID, canonical repository/path, retained branch/head,
+generation and snapshot before calling non-force Git removal. Untracked/dirty
+content remains protected by Git. Managed launches/prompts/ticks share an operation
+lease; pending removal records are excluded from automatic launches. Removal never
+deletes the branch. `thread resolve PROJECT ID --reopen` changes logical status;
+`thread restart PROJECT ID` verifies the receipt and retained branch, then reattaches
+it at the recorded path. Branch changes, conflicting registrations or replaced
+paths require inspection. A legacy half-created branch without a removal record
+is still refused. After a crash between removal and acknowledgement, restart uses
+the persisted intent and Git evidence; it never resets or overwrites a branch.
+
+`repair PROJECT inspect` prints structured JSON diagnostics and SHA-256 hashes for
+malformed thread, ticker and inbox records. It does not modify them. Prepare a
+valid replacement, stop the ticker, then use:
+
+```sh
+herdr-projects repair PROJECT restore threads/t-0001.toml --from /path/to/replacement.toml --expected-hash HASH_FROM_INSPECTION
+```
+
+Restore validates the replacement and filename identity, holds ticker/lifecycle/
+project locks, rechecks the original hash, and saves the exact original bytes under
+`.state/repair-backups/` before atomic replacement. Changed records, unsafe paths,
+links and invalid replacements are refused. This is an explicit restore tool;
+it cannot reconstruct missing obligations or certify the semantics of a supplied
+replacement. Keep backups and review the restored record before resuming work.

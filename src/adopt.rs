@@ -45,6 +45,7 @@ pub fn adoptable_agent(ctx: &Ctx, herdr: &Herdr, socket: &str, pane: &str) -> Re
 }
 
 pub fn adopt(ctx: &Ctx, slug: &str, pane: &str, title: &str, task: Option<String>) -> Result<Thread> {
+    let _lease = crate::cleanup::lease(&ctx.root)?;
     let project = Project::load(&ctx.root, slug)?;
     if project.status() != project::Status::Active {
         bail!("`{slug}` is {}; adopting is refused until it is active again", project.status());

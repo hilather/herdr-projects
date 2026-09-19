@@ -103,3 +103,10 @@ state or a report does not prove task correctness. Existing project capacity is
 still advisory. New memory snapshots, promotion, acknowledgments, verification
 gates and schema migration remain later work. Passing local tests does not certify
 live SSH/GitHub, mixed agents, or authorize publishing or destructive cleanup.
+
+
+Update 2026-09-19: [ADR 0002](0002-phase-b-contracts.md) adds the Phase B contract
+and dependency selection. Remote native snapshots and a cooperative local Linux
+cleanup checkpoint now exist; see [implementation progress](../implementation-progress.md)
+for current behavior and the remaining acceptance limits. Earlier pending-work
+statements above describe the initial Phase A slice.

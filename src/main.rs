@@ -2,6 +2,7 @@ mod actions;
 mod artifacts;
 mod adopt;
 mod cli;
+mod cleanup;
 mod coordinator;
 mod doctor;
 mod herdr;
@@ -12,6 +13,7 @@ mod paths;
 mod pr;
 mod project;
 mod remote;
+mod repair;
 mod routine;
 mod runner;
 #[cfg(test)]

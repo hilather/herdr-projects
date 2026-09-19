@@ -1,2 +1,4 @@
 /target/
 /.dev-root/
+
+/contracts/sqlite-smoke/target/

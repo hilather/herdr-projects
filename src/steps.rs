@@ -400,7 +400,7 @@ pub fn auto_resolve(ctx: &Ctx, project: &Project, settings: &Settings, memory: &
         return errors;
     }
     for t in thread::list(project) {
-        if t.status != Status::Open || t.last_group != Group::Idle.token() || state.finalizations.contains_key(&t.id) {
+        if t.removal.is_some() || t.status != Status::Open || t.last_group != Group::Idle.token() || state.finalizations.contains_key(&t.id) {
             continue;
         }
         // The later of the three reference times is the smallest elapsed time.

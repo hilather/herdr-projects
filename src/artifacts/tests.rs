@@ -1,7 +1,7 @@
 use super::*;
 use crate::project;
 
-fn fixture() -> (tempfile::TempDir, Project, Thread) {
+pub(super) fn fixture() -> (tempfile::TempDir, Project, Thread) {
     let root = tempfile::tempdir().unwrap();
     let project = project::create(root.path(), "demo", "", vec![]).unwrap();
     let source = root.path().join("source");

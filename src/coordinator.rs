@@ -75,6 +75,7 @@ pub struct OpenOptions {
 }
 
 pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
+    let _lease = crate::cleanup::lease(&ctx.root)?;
     let project = Project::load(&ctx.root, slug)?;
     if project.status() != Status::Active {
         bail!("`{slug}` is {}; resume or unarchive it before opening its coordinator", project.status());

@@ -50,7 +50,9 @@ fn shared_remote_projects_launch_prompt_copy_and_recover_independently() {
         world.runner.on_fn(
             move |cmd| cmd.program == "ssh" && cmd.args.last().is_some_and(|s| s.contains(&source)),
             move |cmd| {
-                if cmd.args.last().unwrap().contains("echo dir_ok") {
+                if cmd.stdout_file.is_some() {
+                    Ok(ok(&report))
+                } else if cmd.args.last().unwrap().contains("echo dir_ok") {
                     Ok(ok(if *stage.borrow() == 3 { "absent\n" } else { "dir_ok\nreport_ok\n" }))
                 } else if *stage.borrow() < 2 {
                     Ok(ok("t-0001 -\n"))
@@ -62,13 +64,7 @@ fn shared_remote_projects_launch_prompt_copy_and_recover_independently() {
                 }
             },
         );
-        world.runner.on_fn(
-            move |cmd| cmd.program == "scp" && cmd.display().contains(&dir),
-            move |cmd| {
-                std::fs::write(cmd.args.last().unwrap(), &report)?;
-                Ok(ok(""))
-            },
-        );
+
     }
     world.runner.on("agent start", ok(r#"{"result":{"agent":{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1"}}}"#));
     world.runner.on("agent prompt", ok(r#"{"result":{}}"#));

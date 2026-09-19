@@ -32,6 +32,8 @@ pub struct Manifest {
     thread: String,
     generation: u64,
     source: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    machine: String,
     entries: Vec<Entry>,
 }
 
@@ -138,6 +140,21 @@ fn capture(project: &Project, record: &Thread, before_verify: impl FnOnce() -> R
     let source = Path::new(&record.thread_dir);
     real_dir(source)?;
     let identity = fs::canonicalize(source)?;
+    let staging = staging(project, record)?;
+    let manifest = Manifest {
+        schema: 1, thread: record.id.clone(), generation: record.lifecycle_generation,
+        machine: String::new(),
+        source: identity.to_str().context("artifact source path must be UTF-8")?.into(),
+        entries: scan(source, Some(&staging.0))?,
+    };
+    before_verify()?;
+    ensure!(manifest.entries == scan(&staging.0, None)?, "staged artifact verification failed");
+    verify_source(record, &manifest)?;
+    publish(project, record, staging, manifest)
+}
+
+fn staging(project: &Project, record: &Thread) -> Result<Staging> {
+    thread::validate_id(&record.id)?;
     let parent = project.state_dir().join("artifacts").join(&record.id);
     {
         let _lock = project.lock()?;
@@ -150,14 +167,12 @@ fn capture(project: &Project, record: &Thread, before_verify: impl FnOnce() -> R
     let stage_path = parent.join(format!(".stage-{}-{}", std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed)));
     fs::create_dir(&stage_path)?;
     let staging = Staging(stage_path);
-    let manifest = Manifest {
-        schema: 1, thread: record.id.clone(), generation: record.lifecycle_generation,
-        source: identity.to_str().context("artifact source path must be UTF-8")?.into(),
-        entries: scan(source, Some(&staging.0))?,
-    };
-    before_verify()?;
-    ensure!(manifest.entries == scan(&staging.0, None)?, "staged artifact verification failed");
-    verify_source(record, &manifest)?;
+    Ok(staging)
+}
+
+fn publish(project: &Project, record: &Thread, staging: Staging, manifest: Manifest) -> Result<Snapshot> {
+    ensure!(scan(&staging.0, None)? == manifest.entries, "snapshot verification failed");
+    let parent = staging.0.parent().context("missing snapshot parent")?;
     let bytes = serde_json::to_vec(&manifest)?;
     ensure!(bytes.len() <= MANIFEST_LIMIT, "artifact manifest is too large");
     let id = thread::sha256_hex(&bytes);
@@ -180,6 +195,7 @@ fn capture(project: &Project, record: &Thread, before_verify: impl FnOnce() -> R
 }
 
 pub fn verify_source(record: &Thread, manifest: &Manifest) -> Result<()> {
+    ensure!(manifest.machine.is_empty() && !record.is_remote(), "remote source verification requires its helper");
     ensure!(manifest.schema == 1 && manifest.thread == record.id && manifest.generation == record.lifecycle_generation,
         "artifact snapshot belongs to a different thread execution");
     ensure!(fs::canonicalize(&record.thread_dir)? == Path::new(&manifest.source), "artifact source identity changed");
@@ -204,3 +220,6 @@ pub fn load(project: &Project, record: &Thread, id: &str) -> Result<Manifest> {
 
 #[cfg(test)]
 mod tests;
+
+mod wire;
+pub use wire::{capture_remote, export, probe};

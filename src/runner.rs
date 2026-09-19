@@ -37,6 +37,9 @@ pub struct Cmd {
     /// Spawn in its own process group and kill the whole group on timeout.
     pub own_group: bool,
     pub capture_limit: usize,
+    /// Exclusive regular-file sink for bounded binary transport; no stdout
+    /// text/byte buffer is retained when present. Caller owns partial cleanup.
+    pub stdout_file: Option<(PathBuf, usize)>,
     pub cancellation: Option<Cancellation>,
 }
 
@@ -54,6 +57,7 @@ impl Cmd {
             // spawn path with redirected descriptors (see ticker::start).
             own_group: true,
             capture_limit: CAPTURE_LIMIT,
+            stdout_file: None,
             cancellation: None,
         }
     }
@@ -242,7 +246,7 @@ fn nonblocking(pipe: &impl AsRawFd) -> io::Result<()> {
 }
 
 #[derive(Default)]
-struct Capture { bytes: Vec<u8>, truncated: bool, total: u64 }
+struct Capture { bytes: Vec<u8>, truncated: bool, total: u64, stored: usize, sink: Option<std::fs::File> }
 
 impl Capture {
     fn drain(&mut self, pipe: &mut Option<impl Read>, limit: usize) -> io::Result<()> {
@@ -255,8 +259,10 @@ impl Capture {
                 Ok(0) => { *pipe = None; break; }
                 Ok(n) => {
                     self.total = self.total.saturating_add(n as u64);
-                    let keep = n.min(limit.saturating_sub(self.bytes.len()));
-                    self.bytes.extend_from_slice(&buf[..keep]);
+                    let keep = n.min(limit.saturating_sub(self.stored));
+                    if let Some(file) = &mut self.sink { file.write_all(&buf[..keep])?; }
+                    else { self.bytes.extend_from_slice(&buf[..keep]); }
+                    self.stored += keep;
                     self.truncated |= keep < n;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -278,6 +284,11 @@ fn collect(child: &mut std::process::Child, cmd: &Cmd, started: Instant) -> Resu
     let bytes = cmd.stdin.as_deref().unwrap_or("").as_bytes();
     let mut written = 0;
     let (mut out, mut err) = (Capture::default(), Capture::default());
+    let out_limit = if let Some((path, limit)) = &cmd.stdout_file {
+        use std::os::unix::fs::OpenOptionsExt;
+        out.sink = Some(std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(path)?);
+        *limit
+    } else { cmd.capture_limit };
     let mut status = None;
     let mut result = Output::default();
     loop {
@@ -288,7 +299,7 @@ fn collect(child: &mut std::process::Child, cmd: &Cmd, started: Instant) -> Resu
             terminate(child, cmd.own_group);
             // One final bounded drain; detached/unowned descendants may still
             // have descriptors open. Dropping the pipes never waits for them.
-            let _ = out.drain(&mut stdout, cmd.capture_limit);
+            let _ = out.drain(&mut stdout, out_limit);
             let _ = err.drain(&mut stderr, cmd.capture_limit);
             break;
         }
@@ -303,8 +314,13 @@ fn collect(child: &mut std::process::Child, cmd: &Cmd, started: Instant) -> Resu
                 Err(e) => return Err(e.into()),
             }
         }
-        out.drain(&mut stdout, cmd.capture_limit)?;
+        out.drain(&mut stdout, out_limit)?;
         err.drain(&mut stderr, cmd.capture_limit)?;
+        if out.sink.is_some() && out.truncated {
+            drop(input.take());
+            terminate(child, cmd.own_group);
+            break;
+        }
         if status.is_none() { status = child.try_wait()?; }
         if status.is_some() && input.is_none() && stdout.is_none() && stderr.is_none() {
             result.code = status.and_then(|s| s.code());
@@ -327,6 +343,7 @@ fn collect(child: &mut std::process::Child, cmd: &Cmd, started: Instant) -> Resu
             if e.kind() != io::ErrorKind::Interrupted { return Err(e.into()); }
         }
     }
+    if let Some(file) = &out.sink { file.sync_all()?; }
     result.stdout = String::from_utf8_lossy(&out.bytes).into_owned();
     result.stderr = String::from_utf8_lossy(&err.bytes).into_owned();
     result.stdout_bytes = out.bytes;
@@ -437,7 +454,16 @@ pub mod fake {
             self.calls.borrow_mut().push(cmd.clone());
             for (matcher, answer) in self.rules.borrow().iter() {
                 if matcher(cmd) {
-                    return answer(cmd);
+                    let mut output = answer(cmd)?;
+                    if let Some((path, limit)) = &cmd.stdout_file {
+                        use std::io::Write;
+                        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+                        file.write_all(&output.stdout_bytes[..output.stdout_bytes.len().min(*limit)])?;
+                        output.stdout_truncated |= output.stdout_bytes.len() > *limit;
+                        output.stdout.clear();
+                        output.stdout_bytes.clear();
+                    }
+                    return Ok(output);
                 }
             }
             anyhow::bail!("FakeRunner: no rule for `{}`", cmd.display())
@@ -623,5 +649,33 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(2));
         std::thread::sleep(Duration::from_millis(2300));
         assert!(!marker.exists(), "grandchild outlived the group kill");
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    #[test]
+    fn file_sink_streams_beyond_capture_limit_and_caps_producers() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let bytes = vec![255u8; 2 * 1024 * 1024];
+        std::fs::write(&source, &bytes).unwrap();
+        let mut cmd = Cmd::new("cat", Duration::from_secs(5)).arg(source.to_str().unwrap());
+        let target = dir.path().join("target");
+        cmd.stdout_file = Some((target.clone(), bytes.len()));
+        let output = RealRunner.run(&cmd).unwrap();
+        assert!(output.success());
+        assert!(output.stdout_bytes.is_empty());
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+        assert!(RealRunner.run(&cmd).is_err()); // exclusive sink; never overwrite
+        let capped = dir.path().join("capped");
+        let mut cmd = Cmd::new("sh", Duration::from_secs(5)).args(["-c", "while :; do printf 0123456789; done"]);
+        cmd.stdout_file = Some((capped.clone(), 100));
+        let output = RealRunner.run(&cmd).unwrap();
+        assert!(!output.success());
+        assert!(output.stdout_truncated);
+        assert!(!output.timed_out);
+        assert_eq!(std::fs::metadata(capped).unwrap().len(), 100);
     }
 }
