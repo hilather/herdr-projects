@@ -2,8 +2,8 @@
 
 Implemented 2026-09-19 as a dependency of T03.2's pending-obligation conversion.
 The independent reviewer approved the claim/outcome foundation after verifying
-entity fencing and crash fixtures. T03.3 remains partial: no external dispatcher or production ticker cutover is
-enabled. The canonical inbox has an explicit internal drain adapter.
+entity fencing and crash fixtures. T03.3 remains partial: explicit notification and local finalization adapters exist,
+but automatic controller dispatch and production ticker cutover remain. The canonical inbox has an explicit internal drain adapter.
 
 ## Persistence and protocol
 
@@ -183,3 +183,33 @@ unsent intent prevents authorizing that identical set again; no key bypass is
 provided. A retryable no-effect result can retry only while its original config,
 control and routing authorization still match. Explicit reauthorization of safely
 superseded intents and automatic controller notifications remain future work.
+
+## Canonical artifact finalization
+
+`operations PROJECT finalize BINDING --reason TEXT --expected-head H` queues a
+local artifact finalization for a task binding. It pins the canonical recorded
+source, current report hash, task/binding/control revisions and config reference.
+The operator may request preservation while paused; archived projects, active
+execution and all retained attempts refuse. The source must already be recorded
+in the runtime binding. Remote finalization remains unimplemented here.
+
+`operations PROJECT deliver-finalization ID --expected-revision R` captures a
+bounded immutable snapshot under `.state/canonical-artifacts`, using the existing
+manifest/copy verification rules. It rechecks source identity and report hash,
+keeps the root execution lease, and publishes a receipt with create-if-absent
+semantics under `.state/finalization-receipts`. Legacy mutation guards remain
+intact, and legacy files/projection paths are not dual-written.
+
+The confirmed delivery receipt and task revision/state change commit together.
+The resulting state is `awaiting_review`: preserved bytes are not verified task
+success, writer quiescence, PR approval or permission to release resources.
+No attempt reservation, source directory, pane, worktree or branch is removed.
+
+After claim expiry, `operations PROJECT observe-finalization ID
+--expected-revision R --expected-head H` verifies the operation-bound receipt and
+all retained artifact bytes, including manifest execution identity. It can finish
+an ambiguous operation without reading or recopying a now-missing source. Missing,
+corrupt or stale evidence leaves the operation unresolved. A crash before receipt
+publication remains ambiguous; it does not trigger blind copying. This explicit
+adapter does not yet automatically replay imported `legacy.finalize` obligations,
+perform remote transfers or bind completion to merged-PR evidence.

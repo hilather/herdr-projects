@@ -394,3 +394,28 @@ Validation: 322 all-feature debug/release tests pass after fixture isolation rep
 (71 library, 227 binary, 22 CLI, 2 contracts). Default tests and locked release build
 pass. Logs: `/tmp/herdr-notify-final-debug.log`, `/tmp/herdr-notify-final-release.log`,
 `/tmp/herdr-notify-legacy.log`, `/tmp/herdr-notify-build.log`.
+
+## Local canonical finalization and receipt recovery
+
+Explicit finalization queues a recorded local source with report hash, revisions,
+config and operator disposition. Bounded manifest-verified copies use a separate
+canonical-artifact namespace while legacy mutation guards stay intact. Durable
+create-if-absent receipts bind the immutable operation and exact manifest execution.
+A confirmed outcome atomically increments the task revision and moves it to
+AwaitingReview; it never certifies success or releases attempt/resource capacity.
+The receipt observer can recover after process death with the original source gone.
+Missing/corrupt evidence stays ambiguous. Remote transfers, merged-PR evidence and
+automatic imported-obligation dispatch remain open W03 work.
+
+Independent review caught source-ancestor replacement and verified its repair:
+canonical source identity is checked before copying and in the captured manifest
+before receipt publication. It also verified atomic receipt publication and indexed
+operation reads. Seven native adapter tests (including child-process kill points,
+SQL-trigger rollback, corruption, stale-state and retained-attempt refusal) plus a
+CLI fixture pass. No real project/resource was changed.
+
+Validation: 330 all-feature debug/release tests (71 library, 234 binary, 23 CLI,
+2 contracts), default-feature tests and locked release build pass; three live
+fixtures remain opt-in. Logs: `/tmp/herdr-finalize-debug.log`,
+`/tmp/herdr-finalize-release.log`, `/tmp/herdr-finalize-legacy.log`,
+`/tmp/herdr-finalize-build.log`.

@@ -234,9 +234,12 @@ fn read_attempts(db: &Connection) -> Result<Vec<Attempt>> {
     let rows = stmt.query_map([], |r| Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"task":r.get::<_,String>(1)?,"revision":r.get::<_,u64>(2)?,"state":r.get::<_,String>(3)?,"snapshot":r.get::<_,Option<String>>(4)?,"reservation":r.get::<_,String>(5)?,"termination_observed":r.get::<_,bool>(6)?})))?;
     rows.map(|r| decode(r?)).collect()
 }
-fn read_operations(db: &Connection) -> Result<Vec<Operation>> {
-    let mut stmt = db.prepare("SELECT id,task_id,kind,target,payload_version,payload,expected_revision,due_unix_ms,idempotency_key,payload_hash FROM operations ORDER BY id")?;
-    let rows = stmt.query_map([], |r| Ok((serde_json::json!({"id":r.get::<_,String>(0)?,"task":r.get::<_,String>(1)?,"kind":r.get::<_,String>(2)?,"target":r.get::<_,String>(3)?,"payload_version":r.get::<_,u32>(4)?,"expected_revision":r.get::<_,u64>(6)?,"due_unix_ms":r.get::<_,i64>(7)?,"idempotency_key":r.get::<_,String>(8)?}), r.get::<_,String>(5)?, r.get::<_,String>(9)?)))?;
+fn read_operations(db: &Connection) -> Result<Vec<Operation>> {read_operations_matching(db,None)}
+fn read_operation(db:&Connection,id:&OperationId)->Result<Operation> {read_operations_matching(db,Some(id))?.into_iter().next().ok_or(StoreError::Conflict)}
+fn read_operations_matching(db:&Connection,id:Option<&OperationId>)->Result<Vec<Operation>> {
+    let query=if id.is_some(){"SELECT id,task_id,kind,target,payload_version,payload,expected_revision,due_unix_ms,idempotency_key,payload_hash FROM operations WHERE id=?1"}else{"SELECT id,task_id,kind,target,payload_version,payload,expected_revision,due_unix_ms,idempotency_key,payload_hash FROM operations WHERE ?1 IS NULL ORDER BY id"};
+    let mut stmt = db.prepare(query)?;
+    let rows = stmt.query_map([id.map(OperationId::as_str)], |r| Ok((serde_json::json!({"id":r.get::<_,String>(0)?,"task":r.get::<_,String>(1)?,"kind":r.get::<_,String>(2)?,"target":r.get::<_,String>(3)?,"payload_version":r.get::<_,u32>(4)?,"expected_revision":r.get::<_,u64>(6)?,"due_unix_ms":r.get::<_,i64>(7)?,"idempotency_key":r.get::<_,String>(8)?}), r.get::<_,String>(5)?, r.get::<_,String>(9)?)))?;
     rows.map(|row| {
         let (mut value, payload, hash) = row?;
         if format!("{:x}", Sha256::digest(payload.as_bytes())) != hash { return Err(StoreError::Corrupt("operation payload hash mismatch".into())); }
@@ -268,3 +271,5 @@ mod runtime;
 mod observations;
 
 mod control;
+
+mod finalization;

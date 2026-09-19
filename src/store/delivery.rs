@@ -26,6 +26,7 @@ fn log(tx:&Connection,id:&OperationId,revision:u64,kind:&str,payload:serde_json:
 fn increment(n:u64)->Result<u64>{n.checked_add(1).filter(|n|*n<=i64::MAX as u64).ok_or_else(||StoreError::Invalid("delivery counter exhausted".into()))}
 pub(super) fn update_outcome(tx:&Connection,old:&Delivery,outcome:&Outcome,now:i64,actor:&str)->Result<Delivery> {
     text(outcome.evidence())?;
+    if let Outcome::Confirmed{observed_identity}=outcome {super::finalization::apply_receipt(tx,&old.operation,observed_identity)?;}
     let mut state=match outcome { Outcome::Confirmed{..}=>"confirmed",Outcome::Retryable{..}=>"pending",Outcome::Ambiguous{..}=>"ambiguous",Outcome::PermanentFailure{..}=>"permanent_failure" };
     let mut outcome=outcome.clone();
     if state=="pending" && old.attempts>=32 { state="permanent_failure";outcome=Outcome::PermanentFailure{diagnostic:format!("retry budget exhausted after confirmed no effect: {}",outcome.evidence())}; }

@@ -359,6 +359,11 @@ enum TaskCommand {
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
 enum OperationsCommand { Inspect,
+    /// Queue preservation of a recorded local artifact source; completion awaits review
+    Finalize { binding:String, #[arg(long)] reason:String, #[arg(long)] expected_head:u64 },
+    DeliverFinalization { id:String, #[arg(long)] expected_revision:u64 },
+    /// Verify a durable snapshot receipt after interrupted delivery, without recopying
+    ObserveFinalization { id:String, #[arg(long)] expected_revision:u64, #[arg(long)] expected_head:u64 },
     /// Explicitly authorize a session notification for the current unseen inbox set
     Notify { task:String, #[arg(long)] expected_head:u64 },
     /// Deliver one authorized session notification; uncertain outcomes are not replayed
@@ -459,6 +464,15 @@ pub fn run() -> Result<()> {
             project::validate_slug(&slug)?;
             let dir=ctx.root.join(&slug);
             match command {
+                OperationsCommand::Finalize{binding,reason,expected_head}=>println!("{}",serde_json::to_string_pretty(&crate::finalization_delivery::enqueue(&ctx,&dir,&binding,expected_head,reason)?)?),
+                OperationsCommand::DeliverFinalization{id,expected_revision}=>{
+                    let id=herdr_projects::domain::OperationId::new(id).map_err(anyhow::Error::msg)?;
+                    match crate::finalization_delivery::deliver(&ctx,&dir,&id,expected_revision)? {
+                        herdr_projects::operations::dispatch::DispatchResult::Recorded(delivery)=>println!("{}",serde_json::to_string_pretty(&delivery)?),
+                        herdr_projects::operations::dispatch::DispatchResult::Unrecorded{claim,..}=>anyhow::bail!("finalization outcome was not recorded; operation {} claim epoch {} requires receipt observation",claim.operation.as_str(),claim.epoch),
+                    }
+                },
+                OperationsCommand::ObserveFinalization{id,expected_revision,expected_head}=>println!("{}",serde_json::to_string_pretty(&crate::finalization_delivery::observe(&ctx,&dir,&herdr_projects::domain::OperationId::new(id).map_err(anyhow::Error::msg)?,expected_revision,expected_head)?)?),
                 OperationsCommand::Notify{task,expected_head}=>{
                     let task=herdr_projects::domain::TaskId::new(task).map_err(anyhow::Error::msg)?;
                     println!("{}",serde_json::to_string_pretty(&crate::notification_delivery::enqueue(&ctx,&dir,&task,expected_head)?)?);

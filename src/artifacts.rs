@@ -3,7 +3,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt,DirBuilderExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -38,6 +38,10 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    #[cfg(feature="state-store")]
+    pub fn matches_canonical_execution(&self,record:&Thread)->bool {
+        self.schema==1&&self.thread==record.id&&self.generation==record.lifecycle_generation&&self.machine.is_empty()&&self.source==record.thread_dir
+    }
     pub fn report_hash(&self) -> Option<&str> {
         self.entries.iter().find(|e| e.path == "report.md" && !e.directory).map(|e| e.sha256.as_str())
     }
@@ -54,7 +58,7 @@ fn real_dir(path: &Path) -> Result<()> {
 }
 
 fn make_dir(path: &Path) -> Result<()> {
-    match fs::create_dir(path) {
+    match fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => {},
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {},
         Err(e) => return Err(e.into()),
@@ -135,12 +139,16 @@ pub fn capture_local(project: &Project, record: &Thread) -> Result<Snapshot> {
 }
 
 fn capture(project: &Project, record: &Thread, before_verify: impl FnOnce() -> Result<()>) -> Result<Snapshot> {
+    capture_mode(project,record,before_verify,false)
+}
+
+fn capture_mode(project:&Project,record:&Thread,before_verify:impl FnOnce()->Result<()>,canonical:bool)->Result<Snapshot> {
     ensure!(!record.is_remote() && !record.thread_dir.is_empty(), "local artifact source is required");
-    thread::validate_id(&record.id)?;
+    artifact_id(&record.id,canonical)?;
     let source = Path::new(&record.thread_dir);
     real_dir(source)?;
     let identity = fs::canonicalize(source)?;
-    let staging = staging(project, record)?;
+    let staging = staging_mode(project, record,canonical)?;
     let manifest = Manifest {
         schema: 1, thread: record.id.clone(), generation: record.lifecycle_generation,
         machine: String::new(),
@@ -150,14 +158,15 @@ fn capture(project: &Project, record: &Thread, before_verify: impl FnOnce() -> R
     before_verify()?;
     ensure!(manifest.entries == scan(&staging.0, None)?, "staged artifact verification failed");
     verify_source(record, &manifest)?;
-    publish(project, record, staging, manifest)
+    publish_mode(project, record, staging, manifest,canonical)
 }
 
-fn staging(project: &Project, record: &Thread) -> Result<Staging> {
-    thread::validate_id(&record.id)?;
-    let parent = project.state_dir().join("artifacts").join(&record.id);
+fn staging(project: &Project, record: &Thread) -> Result<Staging> {staging_mode(project,record,false)}
+fn staging_mode(project:&Project,record:&Thread,canonical:bool)->Result<Staging> {
+    artifact_id(&record.id,canonical)?;
+    let parent = project.state_dir().join(artifact_directory(canonical)).join(&record.id);
     {
-        let _lock = project.lock()?;
+        let _lock = artifact_lock(project,canonical)?;
         real_dir(&project.state_dir())?;
         make_dir(parent.parent().unwrap())?;
         make_dir(&parent)?;
@@ -165,27 +174,28 @@ fn staging(project: &Project, record: &Thread) -> Result<Staging> {
         File::open(project.state_dir())?.sync_all()?;
     }
     let stage_path = parent.join(format!(".stage-{}-{}", std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed)));
-    fs::create_dir(&stage_path)?;
+    fs::DirBuilder::new().mode(0o700).create(&stage_path)?;
     let staging = Staging(stage_path);
     Ok(staging)
 }
 
-fn publish(project: &Project, record: &Thread, staging: Staging, manifest: Manifest) -> Result<Snapshot> {
+fn publish(project:&Project,record:&Thread,staging:Staging,manifest:Manifest)->Result<Snapshot> {publish_mode(project,record,staging,manifest,false)}
+fn publish_mode(project: &Project, record: &Thread, staging: Staging, manifest: Manifest,canonical:bool) -> Result<Snapshot> {
     ensure!(scan(&staging.0, None)? == manifest.entries, "snapshot verification failed");
     let parent = staging.0.parent().context("missing snapshot parent")?;
     let bytes = serde_json::to_vec(&manifest)?;
     ensure!(bytes.len() <= MANIFEST_LIMIT, "artifact manifest is too large");
     let id = thread::sha256_hex(&bytes);
-    let mut file = OpenOptions::new().write(true).create_new(true).open(staging.0.join("manifest.json"))?;
+    let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(staging.0.join("manifest.json"))?;
     file.write_all(&bytes)?;
     file.sync_all()?;
     File::open(&staging.0)?.sync_all()?;
     let target = parent.join(&id);
-    let _lock = project.lock()?;
+    let _lock = artifact_lock(project,canonical)?;
     real_dir(&parent)?;
     if target.try_exists()? {
         // Never overwrite a previous snapshot, including damaged evidence.
-        let existing = load(project, record, &id)?;
+        let existing = load_mode(project, record, &id,canonical)?;
         ensure!(existing == manifest, "existing artifact snapshot differs");
     } else {
         fs::rename(&staging.0, &target)?;
@@ -203,10 +213,11 @@ pub fn verify_source(record: &Thread, manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
-pub fn load(project: &Project, record: &Thread, id: &str) -> Result<Manifest> {
+pub fn load(project:&Project,record:&Thread,id:&str)->Result<Manifest> {load_mode(project,record,id,false)}
+fn load_mode(project: &Project, record: &Thread, id: &str,canonical:bool) -> Result<Manifest> {
     ensure!(id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()), "invalid artifact snapshot id");
-    thread::validate_id(&record.id)?;
-    let parent = project.state_dir().join("artifacts");
+    artifact_id(&record.id,canonical)?;
+    let parent = project.state_dir().join(artifact_directory(canonical));
     for dir in [&parent, &parent.join(&record.id), &parent.join(&record.id).join(id)] { real_dir(dir)?; }
     let dir = parent.join(&record.id).join(id);
     let mut bytes = Vec::new();
@@ -223,3 +234,29 @@ mod tests;
 
 mod wire;
 pub use wire::{capture_remote, export, probe};
+
+fn artifact_directory(canonical:bool)->&'static str {if canonical {"canonical-artifacts"}else{"artifacts"}}
+fn artifact_id(id:&str,canonical:bool)->Result<()> {
+    if canonical {ensure!(id.strip_prefix("runtime-").is_some_and(|s|s.len()==64&&s.bytes().all(|b|b.is_ascii_hexdigit())),"invalid canonical artifact identity");Ok(())}
+    else {thread::validate_id(id)}
+}
+enum ArtifactLock { Legacy{_lock:crate::project::ProjectLock}, #[cfg(feature="state-store")] Canonical{_file:File} }
+fn artifact_lock(project:&Project,canonical:bool)->Result<ArtifactLock> {
+    if !canonical {return Ok(ArtifactLock::Legacy{_lock:project.lock()?});}
+    #[cfg(feature="state-store")]
+    {
+        // Separate entry point: legacy mutation guards are never disabled.
+        // The caller retains the root execution lease across the complete copy.
+        herdr_projects::migration::open_active(&project.dir())?;
+        real_dir(&project.state_dir())?;
+        let file=OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(project.state_dir().join("lock"))?;
+        file.try_lock().context("project metadata is busy")?;
+        Ok(ArtifactLock::Canonical{_file:file})
+    }
+    #[cfg(not(feature="state-store"))]
+    anyhow::bail!("canonical artifact capture requires state-store")
+}
+#[cfg(feature="state-store")]
+pub fn capture_canonical(project:&Project,record:&Thread)->Result<Snapshot> {capture_mode(project,record,||Ok(()),true)}
+#[cfg(feature="state-store")]
+pub fn load_canonical(project:&Project,record:&Thread,id:&str)->Result<Manifest> {load_mode(project,record,id,true)}

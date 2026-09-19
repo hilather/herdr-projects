@@ -110,3 +110,11 @@ pub fn enqueue_notification(project:&Path,task:&TaskId,expected_head:u64,config:
     db.commit(Commit{expected_head,mutations:vec![Mutation::Enqueue(operation.clone())]})?;
     Ok(operation)
 }
+
+pub fn enqueue_finalization(project:&Path,expected_head:u64,operation:crate::domain::Operation)->Result<crate::domain::Operation> {
+    let _maintenance=migration::maintenance(project)?;let mut db=migration::open_active(project)?;
+    let payload=crate::operations::finalization::Finalization::decode(&operation)?;
+    let config=migration::config_reference(Path::new(&payload.config.path))?;
+    payload.validate(&operation,&db.read_snapshot(Some(expected_head))?,&config)?;
+    db.commit(Commit{expected_head,mutations:vec![Mutation::Enqueue(operation.clone())]})?;Ok(operation)
+}

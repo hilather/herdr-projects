@@ -4,7 +4,7 @@ use anyhow::{Context,Result,ensure};
 use crate::{cleanup,herdr::{self,Herdr},paths::Ctx,project};
 use herdr_projects::{domain::{Operation,OperationId,TaskId},migration::{self,ConfigReference},operations::{Claim,Outcome,dispatch::{self,DeliveryAdapter,PreparedDelivery,DispatchRequest,DispatchResult},notification::Notification},runtime};
 
-fn config(ctx:&Ctx,project:&Path)->Result<ConfigReference> {
+pub(crate) fn config(ctx:&Ctx,project:&Path)->Result<ConfigReference> {
     let path=std::path::absolute(ctx.config_dir.join("config.toml"))?;
     let reference=migration::config_reference(&path)?;
     let text=if let Some(digest)=&reference.digest {

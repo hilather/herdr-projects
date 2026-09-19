@@ -47,3 +47,4 @@ pub(crate) fn legacy_id(kind:&str,key:&str)->String {
     format!("legacy-{:x}",Sha256::digest(format!("{kind}:{key}").as_bytes()))
 }
 pub mod notification;
+pub mod finalization;

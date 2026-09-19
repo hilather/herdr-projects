@@ -57,7 +57,9 @@ ownership integration remain.
 ambiguity, retry handling, an atomic inbox drain, a guarded common dispatch service
 and explicit claim expiry. Exact imported notification/finalization receipts now
 have a preview/apply observation adapter. An explicit count-only canonical session
-notification adapter now uses guarded durable delivery. Finalization copying,
+notification adapter and local artifact finalization now use guarded durable
+delivery. Verified finalization receipts recover after process death and commit
+the task review disposition atomically. Remote/merged-PR finalization integration,
 terminal-input authorization and automatic controller dispatch remain.
 **T03.4** now has [bounded runtime observations](reconciliation.md), durable
 evidence, and stale-state fences. Ownership acquisition, repair/adoption, termination
