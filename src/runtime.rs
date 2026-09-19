@@ -49,3 +49,10 @@ pub fn expire_operations(project:&Path)->Result<usize> {
     let _maintenance=migration::maintenance(project)?;
     Ok(migration::open_active(project)?.expire_claims(jiff::Timestamp::now().as_millisecond())?)
 }
+
+pub fn observe_imported_receipts(project:&Path,expected_head:Option<u64>)->Result<crate::operations::receipts::ReceiptReport> {
+    let _maintenance=migration::maintenance(project)?;
+    let mut db=migration::open_active(project)?;
+    let head=match expected_head {Some(head)=>head,None=>db.read_snapshot(None)?.head};
+    Ok(db.observe_imported_receipts(head,jiff::Timestamp::now().as_millisecond(),expected_head.is_some())?)
+}

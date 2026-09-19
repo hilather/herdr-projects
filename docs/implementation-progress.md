@@ -242,3 +242,25 @@ release build and `git diff --check` pass. Validation logs are
 `/tmp/herdr-dispatch-{debug,debug-serial,release,release-serial,legacy,build}.log`.
 Use `-- --test-threads=1` to reproduce the complete successful feature suites.
 macOS and production external adapter integration remain untested.
+
+## Imported receipt observation
+
+Committed and pushed the reviewed migration/inbox/dispatch foundation as `ec273e2`
+to the fork before this batch. New receipt-plan and observe-imported commands
+compare durable notification/finalization receipts against hash-checked database
+provenance. Exact receipt matches can confirm ambiguous imported operations in one
+head-checked transaction. Task state, legacy files and external resources remain
+unchanged. Claimed, stale and unsupported records remain blocked.
+
+Independent review caught a historical-receipt reuse risk for newly enqueued
+lookalike operations. The observer now requires the shared deterministic import ID,
+original task revision and idempotency key. Regression fixtures cover lookalikes
+with both unchanged and advanced task revisions. The observer parses the ticker
+once and indexes source paths to keep large batches from repeatedly parsing it.
+T03.2/T03.3 remain partial; general live reconciliation has not been enabled.
+
+Re-review approved the identity fix with no remaining blockers. All 291 tests pass
+serially in debug and release (54 library, 219 binary, 16 CLI, two contracts);
+227 default-feature tests and the locked all-feature release build pass.
+`git diff --check` is clean. Three live fixtures remain opt-in; macOS remains
+untested. Logs: `/tmp/herdr-receipts-{debug,release,legacy,build}.log`.

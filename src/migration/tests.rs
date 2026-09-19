@@ -340,3 +340,65 @@ fn external_config_absence_path_and_unsafe_files_are_bound() {
     apply(&project,&plan,true).unwrap();
     assert_eq!(open_active(&project).unwrap().import_receipt().unwrap().0,plan.digest);
 }
+
+fn receipt_fixture(matching:bool)->(TempDir,std::path::PathBuf) {
+    let(temp,project)=fixture();
+    let thread="id='t-0001'\nstatus='resolved'\npr='https://example.invalid/pr/1'\nresolved_reason='merged'\nlast_finalization='final-1'\n";
+    fs::write(project.join("threads/t-0001.toml"),thread).unwrap();
+    let fingerprint=crate::operations::receipts::legacy_execution_fingerprint(&toml::from_str(thread).unwrap()).unwrap();
+    fs::write(project.join(".state/ticker.json"),serde_json::to_vec(&serde_json::json!({
+        "nudged":if matching{"notification-hash"}else{"other-hash"},
+        "notification_retry":{"hash":"notification-hash"},
+        "finalizations":{"t-0001":{"operation_id":"final-1","fingerprint":if matching{fingerprint}else{"old-identity".into()},"pr":"https://example.invalid/pr/1","reason":"merged"}}
+    })).unwrap()).unwrap();
+    let plan=inspect(&project).unwrap();assert!(plan.blockers.is_empty());apply(&project,&plan,true).unwrap();(temp,project)
+}
+#[test]
+fn imported_receipts_confirm_atomically_without_live_effects_or_task_promotion() {
+    let(_temp,project)=receipt_fixture(true);let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();
+    let preview=db.observe_imported_receipts(before.head,100,false).unwrap();assert_eq!(preview.confirmed,0);assert_eq!(preview.head,before.head);assert!(preview.observations.iter().all(|o|o.receipt.is_some()));assert_eq!(db.read_snapshot(None).unwrap(),before);
+    // Only DB provenance counts; later edits to legacy files cannot forge evidence.
+    fs::write(project.join(".state/ticker.json"),"{}").unwrap();fs::write(project.join("threads/t-0001.toml"),"status='open'").unwrap();
+    let report=db.observe_imported_receipts(before.head,100,true).unwrap();assert_eq!(report.confirmed,2);assert_eq!(report.head,before.head+2);
+    let after=db.read_snapshot(None).unwrap();assert_eq!(after.tasks,before.tasks);assert_eq!(after.operations,before.operations);assert!(after.deliveries.iter().all(|d|d.state==crate::operations::DeliveryState::Confirmed));
+    assert!(db.observe_imported_receipts(before.head,101,true).is_err());assert_eq!(db.observe_imported_receipts(after.head,101,true).unwrap().confirmed,0);
+    drop(db);assert_eq!(recover(&project,true).unwrap().phase,Phase::Active);
+}
+#[test]
+fn missing_receipts_and_changed_task_or_claim_never_authorize_confirmation() {
+    let(_temp,project)=receipt_fixture(false);let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();
+    assert_eq!(db.observe_imported_receipts(before.head,100,true).unwrap().confirmed,0);assert_eq!(db.read_snapshot(None).unwrap(),before);drop(db);
+    let(_temp,project)=receipt_fixture(true);let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();
+    let mut task=before.tasks.iter().find(|t|t.id.as_str()=="legacy-t-0001").unwrap().clone();task.revision+=1;
+    db.commit(crate::domain::Commit{expected_head:before.head,mutations:vec![crate::domain::Mutation::Task{expected:Some(1),next:task}]}).unwrap();
+    let notify=before.operations.iter().find(|o|o.kind=="legacy.notify").unwrap();
+    let pending=db.observe_operation(&notify.id,1,"fixture",crate::operations::Outcome::Retryable{no_effect_evidence:"test fixture".into()},0).unwrap();
+    db.claim_operation(&notify.id,pending.revision,"fixture",pending.next_due_ms,1000).unwrap();
+    let before=db.read_snapshot(None).unwrap();assert_eq!(db.observe_imported_receipts(before.head,100,true).unwrap().confirmed,0);assert_eq!(db.read_snapshot(None).unwrap(),before);
+}
+#[test]
+fn corrupt_receipt_provenance_rolls_back_all_confirmations() {
+    let(_temp,project)=receipt_fixture(true);let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();
+    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute("UPDATE legacy_sources SET bytes=x'00' WHERE path='threads/t-0001.toml'",[]).unwrap();
+    assert!(db.observe_imported_receipts(before.head,100,true).is_err());assert_eq!(db.read_snapshot(None).unwrap(),before);
+}
+
+#[test]
+fn imported_receipts_cannot_confirm_new_lookalike_operations() {
+    use crate::domain::{Commit,Mutation,OperationId};
+    for advance in [false,true] {
+        let(_temp,project)=receipt_fixture(true);let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();
+        let mut lookalike=before.operations.iter().find(|o|o.kind=="legacy.notify").unwrap().clone();
+        lookalike.id=OperationId::new("new-lookalike").unwrap();lookalike.idempotency_key="different-intent".into();
+        let mut mutations=Vec::new();
+        if advance {
+            let mut task=before.tasks.iter().find(|t|t.id==lookalike.task).unwrap().clone();task.revision+=1;lookalike.expected_revision=task.revision;
+            mutations.push(Mutation::Task{expected:Some(1),next:task});
+        }
+        mutations.push(Mutation::Enqueue(lookalike.clone()));db.commit(Commit{expected_head:before.head,mutations}).unwrap();
+        db.claim_operation(&lookalike.id,1,"test-worker",100,1).unwrap();db.expire_claims(101).unwrap();
+        let head=db.read_snapshot(None).unwrap().head;let report=db.observe_imported_receipts(head,102,true).unwrap();
+        let entry=report.observations.iter().find(|o|o.operation==lookalike.id).unwrap();assert!(entry.receipt.is_none());assert!(entry.blocked.is_some());
+        assert_eq!(db.deliveries().unwrap().iter().find(|d|d.operation==lookalike.id).unwrap().state,crate::operations::DeliveryState::Ambiguous);
+    }
+}

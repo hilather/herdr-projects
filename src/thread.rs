@@ -1088,3 +1088,13 @@ mod tests {
         assert!(matches!(copy_home_local(&project, &t, true, &runner).outcome, CopyOutcome::Failed(_)));
     }
 }
+
+#[test]
+#[cfg(feature="state-store")]
+fn imported_receipt_fingerprint_matches_legacy_execution_identity() {
+    for kind in [Kind::Worktree,Kind::Tab,Kind::Adopted] {
+        let thread=Thread{id:"t-1".into(),kind,created:"created".into(),lifecycle_generation:42,repo:"repo".into(),origin:"origin".into(),branch:"branch".into(),machine:"remote".into(),worktree_path:"worktree".into(),thread_dir:"thread".into(),workspace_id:"workspace".into(),tab_id:"tab".into(),pane_id:"pane".into(),agent:"agent".into(),agent_name:"name".into(),cwd:"cwd".into(),pr:"pr".into(),..Default::default()};
+        let value=toml::Value::try_from(&thread).unwrap();
+        assert_eq!(herdr_projects::operations::receipts::legacy_execution_fingerprint(&value).unwrap(),execution_fingerprint(&thread));
+    }
+}

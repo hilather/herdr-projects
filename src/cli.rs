@@ -351,6 +351,10 @@ enum TaskCommand {
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
 enum OperationsCommand { Inspect,
+    /// Preview exact legacy receipts; missing evidence never authorizes retry
+    ReceiptPlan,
+    /// Confirm only imported operations with matching durable legacy receipts
+    ObserveImported { #[arg(long)] expected_head:u64 },
     /// Mark expired claims ambiguous; never replay external effects
     Expire,
     /// Deliver only internal inbox obligations atomically; no terminal/network effects
@@ -398,6 +402,8 @@ pub fn run() -> Result<()> {
             let dir=ctx.root.join(&slug);
             match command {
                 OperationsCommand::Inspect=>println!("{}",serde_json::to_string_pretty(&herdr_projects::migration::open_active(&dir)?.deliveries()?)?),
+                OperationsCommand::ReceiptPlan=>println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::observe_imported_receipts(&dir,None)?)?),
+                OperationsCommand::ObserveImported{expected_head}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::observe_imported_receipts(&dir,Some(expected_head))?)?),
                 OperationsCommand::Expire=>println!("{} expired claim(s) require observation",herdr_projects::runtime::expire_operations(&dir)?),
                 OperationsCommand::DrainInbox{expected_head}=>println!("{} inbox obligation(s) delivered",herdr_projects::runtime::drain_inbox(&dir,expected_head)?),
             }

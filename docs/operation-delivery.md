@@ -133,3 +133,27 @@ Service fixtures cover policy denial/revocation, stale task binding, lease expir
 before effects, delivery outside transactions, timeout ambiguity, and receipt loss.
 Native child fixtures die before effect, after a disposable file effect and after
 receipt commit. Reopening never blindly replays any of those operations.
+
+## Imported completion receipts
+
+`operations PROJECT receipt-plan` previews receipt evidence without changing store
+state. `operations PROJECT observe-imported --expected-head N` atomically confirms
+only ambiguous imported operations whose original task revision still matches.
+Both use hash-checked database provenance, never subsequently edited legacy files.
+The observer requires the deterministic imported operation ID, original revision
+and idempotency key; a newly enqueued lookalike cannot reuse historical evidence.
+
+A notification requires its exact imported retry payload and matching `nudged`
+hash in the preserved ticker record. A finalization requires its exact pending
+payload, matching thread identity/fingerprint, resolved status, completion operation
+ID, PR and reason. The event records the source fingerprints. This confirms the
+legacy delivery/bookkeeping receipt, not verified task success or present-day
+artifact health. Task state is unchanged. Missing, mismatched, claimed or stale
+records remain blocked; the observer never infers no effect or makes an external
+call. Repeating observation does not duplicate confirmations.
+
+Whole-batch hash verification and receipt writes share one transaction. Fixtures
+cover stale heads, task revisions, active claims, mismatches, corrupted provenance,
+fingerprint compatibility and newly enqueued lookalikes. This completes a narrow
+observation adapter; production sending/copying and general live reconciliation
+remain outside its scope.

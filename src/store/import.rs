@@ -65,10 +65,9 @@ impl SqliteStore {
     }
     pub fn imported_sources(&self) -> Result<Vec<ImportedSource>> {
         check_schema(&self.connection)?;
-        let mut stmt = self.connection.prepare("SELECT path,kind,digest,bytes FROM legacy_sources ORDER BY path")?;
-        let rows = stmt.query_map([],|r|Ok(ImportedSource { path:r.get(0)?,kind:r.get(1)?,digest:r.get(2)?,bytes:r.get(3)? }))?;
-        rows.map(|row| { let row = row?; if hash_bytes(&row.bytes) != row.digest { return Err(StoreError::Corrupt(format!("imported source hash mismatch: {}",row.path))); } Ok(row) }).collect()
+        read_sources(&self.connection)
     }
+
     pub fn has_import(&self) -> Result<bool> {
         check_schema(&self.connection)?;
         Ok(self.connection.query_row("SELECT EXISTS(SELECT 1 FROM migration_receipt)",[],|r|r.get(0))?)
@@ -88,4 +87,10 @@ impl SqliteStore {
 fn hash_bytes(bytes:&[u8])->String { format!("{:x}",Sha256::digest(bytes)) }
 fn safe_relative(path:&str)->bool {
     !path.is_empty() && !path.contains('\\') && std::path::Path::new(path).components().all(|p|matches!(p,std::path::Component::Normal(_)))
+}
+
+pub(super) fn read_sources(db:&Connection)->Result<Vec<ImportedSource>> {
+        let mut stmt = db.prepare("SELECT path,kind,digest,bytes FROM legacy_sources ORDER BY path")?;
+        let rows = stmt.query_map([],|r|Ok(ImportedSource { path:r.get(0)?,kind:r.get(1)?,digest:r.get(2)?,bytes:r.get(3)? }))?;
+        rows.map(|row| { let row = row?; if hash_bytes(&row.bytes) != row.digest { return Err(StoreError::Corrupt(format!("imported source hash mismatch: {}",row.path))); } Ok(row) }).collect()
 }

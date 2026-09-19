@@ -51,7 +51,8 @@ adapters now exist. Version-2 plans bind external config presence/path/hash thro
 cutover; runtime execution, profile resolution and live ownership integration remain.
 **T03.3** now has [durable claims/outcomes](operation-delivery.md), fencing,
 ambiguity, retry handling, an atomic inbox drain, a guarded common dispatch service
-and explicit claim expiry. Concrete external delivery adapters remain.
+and explicit claim expiry. Exact imported notification/finalization receipts now
+have a preview/apply observation adapter. External sending/copying adapters remain.
 Complete these integrations before **T03.4** reconciliation.
 W04–W09 account for the other 25 not-started cards. Task count is not a time estimate.
 Phase A was accepted with its [documented gaps](phase-a-acceptance.md); macOS remains

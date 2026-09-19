@@ -22,7 +22,7 @@ fn operation(kind:&str,key:&str,task:TaskId,payload:Value,retry:&Retry)->Result<
     ensure!(!key.trim().is_empty(),"empty legacy intent identity");
     // These fields remain inside payload as provenance as well as delivery state.
     let _ = (&retry.last_error,retry.blocked);
-    Ok(Operation{id:OperationId::new(format!("legacy-{}",hash(format!("{kind}:{key}").as_bytes()))).map_err(anyhow::Error::msg)?,task,kind:kind.into(),target:key.into(),payload_version:1,payload,expected_revision:1,due_unix_ms:due(retry)?,idempotency_key:format!("{kind}:{key}")})
+    Ok(Operation{id:OperationId::new(crate::operations::legacy_id(kind,key)).map_err(anyhow::Error::msg)?,task,kind:kind.into(),target:key.into(),payload_version:1,payload,expected_revision:1,due_unix_ms:due(retry)?,idempotency_key:format!("{kind}:{key}")})
 }
 pub(super) fn convert(project:&Path,tasks:&mut Vec<Task>)->Result<Vec<Operation>> {
     let path=project.join(".state/ticker.json");if !exists(&path){return Ok(Vec::new());}

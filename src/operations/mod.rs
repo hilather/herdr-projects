@@ -39,3 +39,10 @@ pub struct Claim {
 }
 
 pub mod dispatch;
+pub mod receipts;
+
+/// Stable identity of an accepted legacy obligation, shared by import and observation.
+pub(crate) fn legacy_id(kind:&str,key:&str)->String {
+    use sha2::{Digest,Sha256};
+    format!("legacy-{:x}",Sha256::digest(format!("{kind}:{key}").as_bytes()))
+}
