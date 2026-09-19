@@ -54,6 +54,18 @@ enum RepairCommand {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect or edit migrated task records without starting execution
+    #[cfg(feature="state-store")]
+    Task { slug:String, #[command(subcommand)] command:TaskCommand },
+    /// Inspect durable delivery state (no external effects)
+    #[cfg(feature="state-store")]
+    Operations { slug:String, #[command(subcommand)] command:OperationsCommand },
+    /// Inspect or explicitly migrate a paused project into the opt-in store
+    #[cfg(feature = "state-store")]
+    Migration {
+        slug: String,
+        #[command(subcommand)] command: MigrationCommand,
+    },
     /// Inspect damaged records or restore a validated replacement with a backup
     Repair {
         slug: String,
@@ -189,6 +201,9 @@ enum Command {
 
 #[derive(Subcommand)]
 enum InboxCommand {
+    #[cfg(feature="state-store")]
+    /// Inspect canonical inbox records for a migrated project
+    List { slug:String },
     /// Move handled items to inbox/done/
     Done {
         slug: String,
@@ -305,6 +320,43 @@ enum TickerCommand {
     Status,
 }
 
+#[cfg(feature = "state-store")]
+#[derive(Subcommand)]
+enum MigrationCommand {
+    Inspect,
+    /// Read-only storage, config and recorded live identity diagnostics
+    Preflight,
+    /// Explicitly upgrade a supported migrated store schema
+    UpgradeStore,
+    /// Produce a deterministic dry-run plan; output must be outside the project
+    Plan { #[arg(long)] output: PathBuf },
+    Apply { #[arg(long)] plan: PathBuf, #[arg(long)] writers_stopped: bool },
+    Recover { #[arg(long)] writers_stopped: bool },
+    Status,
+    /// Cancel before cutover, preserving all staged data and backups
+    Abort,
+    Export,
+    /// Restore verified legacy bytes into a new, separate recovery directory
+    Restore { #[arg(long)] destination: PathBuf },
+}
+
+#[cfg(feature="state-store")]
+#[derive(Subcommand)]
+enum TaskCommand {
+    List,
+    Show { id:String },
+    Add { id:String, #[arg(long)] title:String, #[arg(long)] expected_head:u64 },
+    Rename { id:String, #[arg(long)] title:String, #[arg(long)] expected_revision:u64, #[arg(long)] expected_head:u64 },
+}
+#[cfg(feature="state-store")]
+#[derive(Subcommand)]
+enum OperationsCommand { Inspect,
+    /// Mark expired claims ambiguous; never replay external effects
+    Expire,
+    /// Deliver only internal inbox obligations atomically; no terminal/network effects
+    DrainInbox { #[arg(long)] expected_head:u64 },
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     if let Command::ArtifactStream { probe, path } = &cli.command {
@@ -324,6 +376,76 @@ pub fn run() -> Result<()> {
     };
 
     match cli.command {
+        #[cfg(feature="state-store")]
+        Command::Task { slug,command } => {
+            use herdr_projects::{domain::TaskId,runtime};
+            project::validate_slug(&slug)?; let dir=ctx.root.join(&slug);
+            match command {
+                TaskCommand::List=>println!("{}",serde_json::to_string_pretty(&runtime::snapshot(&dir)?)?),
+                TaskCommand::Show{id}=>{
+                    let id=TaskId::new(id).map_err(anyhow::Error::msg)?;
+                    let task=runtime::snapshot(&dir)?.tasks.into_iter().find(|t|t.id==id).context("task not found")?;
+                    println!("{}",serde_json::to_string_pretty(&task)?);
+                },
+                TaskCommand::Add{id,title,expected_head}=>println!("Committed task at event head {}. Use migration export to generate the new view.",runtime::add_task(&dir,TaskId::new(id).map_err(anyhow::Error::msg)?,title,expected_head)?),
+                TaskCommand::Rename{id,title,expected_revision,expected_head}=>println!("Committed task at event head {}. Use migration export to generate the new view.",runtime::rename_task(&dir,&TaskId::new(id).map_err(anyhow::Error::msg)?,title,expected_revision,expected_head)?),
+            }
+            Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Operations {slug,command}=>{
+            project::validate_slug(&slug)?;
+            let dir=ctx.root.join(&slug);
+            match command {
+                OperationsCommand::Inspect=>println!("{}",serde_json::to_string_pretty(&herdr_projects::migration::open_active(&dir)?.deliveries()?)?),
+                OperationsCommand::Expire=>println!("{} expired claim(s) require observation",herdr_projects::runtime::expire_operations(&dir)?),
+                OperationsCommand::DrainInbox{expected_head}=>println!("{} inbox obligation(s) delivered",herdr_projects::runtime::drain_inbox(&dir,expected_head)?),
+            }
+            Ok(())
+        },
+        #[cfg(feature = "state-store")]
+        Command::Migration { slug, command } => {
+            use herdr_projects::{migration, projections};
+            project::validate_slug(&slug)?;
+            let dir = ctx.root.join(&slug);
+            match command {
+                MigrationCommand::UpgradeStore => { migration::upgrade_active(&dir)?; println!("Store schema upgraded; dispatch remains blocked pending reconciliation."); },
+                MigrationCommand::Preflight=>println!("{}",serde_json::to_string_pretty(&crate::migration_preflight::inspect(&ctx,&dir)?)?),
+                MigrationCommand::Inspect => println!("{}", serde_json::to_string_pretty(&crate::migration_preflight::plan(&ctx,&dir)?)?),
+                MigrationCommand::Plan { output } => {
+                    let parent = output.parent().filter(|p|!p.as_os_str().is_empty()).unwrap_or(std::path::Path::new(".")).canonicalize()?;
+                    anyhow::ensure!(!parent.starts_with(dir.canonicalize()?), "write the plan outside the source project");
+                    let plan = crate::migration_preflight::plan(&ctx,&dir)?;
+                    use std::io::Write;
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(output)?;
+                    file.write_all(&serde_json::to_vec_pretty(&plan)?)?; file.sync_all()?;
+                    println!("Plan written: {} blockers; source digest {}", plan.blockers.len(), plan.digest);
+                },
+                MigrationCommand::Apply { plan, writers_stopped } => {
+                    let input = migration::read_plan_file(&plan)?;
+                    anyhow::ensure!(input.len() <= 16*1024*1024,"plan exceeds 16 MiB");
+                    let plan:migration::Plan=serde_json::from_slice(&input)?;
+                    migration::require_config_path(&plan,&std::path::absolute(ctx.config_dir.join("config.toml"))?)?;
+                    println!("{}",serde_json::to_string_pretty(&migration::apply(&dir,&plan,writers_stopped)?)?);
+                },
+                MigrationCommand::Recover { writers_stopped } => {
+                    let journal=migration::status(&dir)?;
+                    if journal.plan.version==2 && journal.phase!=migration::Phase::Active {
+                        migration::require_config_path(&journal.plan,&std::path::absolute(ctx.config_dir.join("config.toml"))?)?;
+                    }
+                    println!("{}",serde_json::to_string_pretty(&migration::recover(&dir,writers_stopped)?)?);
+                },
+                MigrationCommand::Abort => println!("Preserved aborted migration at {}",migration::abort(&dir)?.display()),
+                MigrationCommand::Status => println!("{}",serde_json::to_string_pretty(&migration::status(&dir)?)?),
+                MigrationCommand::Export => {
+                    let path = projections::export(&dir,&mut migration::open_active(&dir)?)?;
+                    println!("{}",path.display());
+                },
+                MigrationCommand::Restore { destination } => { migration::restore_backup(&dir,&destination)?; println!("Restored verified backup to {}. Reconcile before running workers.",destination.display()); },
+            }
+            Ok(())
+        },
         Command::Repair { slug, command } => {
             let project = Project::load(&ctx.root, &slug)?;
             match command {
@@ -345,6 +467,10 @@ pub fn run() -> Result<()> {
         }
         Command::List { all } => {
             for slug in project::list_slugs(&ctx.root) {
+                if let Err(error) = project::ensure_legacy(&ctx.root.join(&slug)) {
+                    println!("{slug}\tstore/maintenance\t{error}");
+                    continue;
+                }
                 let project = Project::load(&ctx.root, &slug)?;
                 let status = project.status();
                 if status == Status::Archived && !all {
@@ -368,12 +494,40 @@ pub fn run() -> Result<()> {
                 rebind,
             },
         ),
-        Command::Context { slug, peek } => coordinator::context(&ctx, &slug, peek),
+        Command::Context { slug, peek } => {
+            #[cfg(feature="state-store")]
+            {
+                project::validate_slug(&slug)?;
+                if project::ensure_legacy(&ctx.root.join(&slug)).is_err() {
+                    let dir=ctx.root.join(&slug);
+                    let (text,head,ids)=herdr_projects::runtime::context_snapshot(&dir).context("legacy runtime is disabled; migrated context could not be read")?;
+                    println!("{text}");
+                    if !peek&&!ids.is_empty(){herdr_projects::runtime::update_inbox(&dir,head,&ids,false)?;}
+                    return Ok(());
+                }
+            }
+            coordinator::context(&ctx,&slug,peek)
+        },
         Command::Overview { slug, wait } => overview::run(&ctx, slug.as_deref(), wait),
         Command::Focus { slug } => overview::focus(&ctx, slug.as_deref()),
         Command::Unfocus { session } => overview::unfocus(&ctx, &session.into()),
         Command::Inbox { command } => match command {
+            #[cfg(feature="state-store")]
+            InboxCommand::List{slug}=>{
+                project::validate_slug(&slug)?;
+                println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::snapshot(&ctx.root.join(&slug))?.inbox)?);Ok(())
+            },
             InboxCommand::Done { slug, ids, all } => {
+                #[cfg(feature="state-store")]
+                {
+                    project::validate_slug(&slug)?;let dir=ctx.root.join(&slug);
+                    if project::ensure_legacy(&dir).is_err() {
+                        let snapshot=herdr_projects::runtime::snapshot(&dir)?;
+                        let ids=if all {snapshot.inbox.iter().filter(|i|!i.done).map(|i|i.content.id.clone()).collect()}else{ids};
+                        println!("{} inbox item(s) marked done",herdr_projects::runtime::update_inbox(&dir,snapshot.head,&ids,true)?);
+                        return Ok(());
+                    }
+                }
                 let project = Project::load(&ctx.root, &slug)?;
                 let moved = inbox::done(&project, &ids, all)?;
                 println!("{moved} item(s) moved to inbox/done");

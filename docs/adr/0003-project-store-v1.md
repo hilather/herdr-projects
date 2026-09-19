@@ -114,3 +114,21 @@ Temporary logs: `/tmp/herdr-w03-debug.log`, `/tmp/herdr-w03-store.log`,
 temporary logs are not release artifacts. Proposed project knowledge: use the
 feature-gated repository and its schema ownership boundary for T03.2/T03.3;
 no shared-memory promotion was performed.
+
+
+## T03.2 schema extension
+
+The subsequent [offline migration foundation](../migration-workflow.md) adds v2
+legacy source provenance and an import receipt. At that stage fresh stores used v2; v1 opens
+without implicit upgrade and has an explicit transactional upgrade API. The
+original v1 transaction contract remains intact. All legacy commands now guard
+against a migration journal/format marker, including builds without the feature.
+
+The subsequent [delivery foundation](../operation-delivery.md) adds schema v3.
+Explicit upgrades support published v2 projects and preserve their import identity.
+The runtime ownership protocol marker remains independent of schema numbering.
+
+Schema v4 adds canonical inbox records and preserves their seen/done state.
+Explicit upgrades populate them from immutable database provenance. Fresh stores
+now use v4. Snapshots include schema identity, and exports use schema-qualified
+revision directories to preserve earlier schema exports at the same event head.

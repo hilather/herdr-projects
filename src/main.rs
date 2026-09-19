@@ -12,6 +12,8 @@ mod overview;
 mod paths;
 mod pr;
 mod project;
+#[cfg(feature="state-store")]
+mod migration_preflight;
 mod remote;
 mod repair;
 mod routine;

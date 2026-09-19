@@ -79,10 +79,13 @@ pub struct Event {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
+    pub schema_version:u32,
     pub head: u64,
     pub tasks: Vec<Task>,
     pub attempts: Vec<Attempt>,
     pub operations: Vec<Operation>,
+    pub deliveries: Vec<crate::operations::Delivery>,
+    pub inbox: Vec<InboxItem>,
     pub events: Vec<Event>,
 }
 pub enum Mutation {
@@ -94,3 +97,6 @@ pub struct Commit {
     pub expected_head: u64,
     pub mutations: Vec<Mutation>,
 }
+
+mod inbox;
+pub use inbox::{InboxContent,InboxItem};

@@ -92,14 +92,30 @@ pub fn resolve_root(flag: Option<&Path>, env: &Env, config_dir: &Path) -> Result
         return absolute(&env.expand_tilde(var));
     }
     let config_file = config_dir.join("config.toml");
-    if let Ok(text) = std::fs::read_to_string(&config_file) {
+    if let Some(text) = read_root_config(&config_file)? {
         let config: RootConfig = toml::from_str(&text)
-            .with_context(|| format!("{} does not parse", config_file.display()))?;
+            .map_err(|_| anyhow::anyhow!("{} does not parse (contents withheld)", config_file.display()))?;
         if let Some(root) = config.root.filter(|r| !r.is_empty()) {
             return absolute(&env.expand_tilde(&root));
         }
     }
     Ok(env.home.join(".herdr-projects"))
+}
+
+// Root resolution runs before migration's own reader. Bound this read as well,
+// including a FIFO supplied where a config file should have been.
+fn read_root_config(path: &Path) -> Result<Option<String>> {
+    use std::{io::Read, os::unix::fs::OpenOptionsExt};
+    let file = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("cannot read root config"),
+    };
+    anyhow::ensure!(file.metadata()?.is_file(), "root config is not a regular file");
+    let mut bytes = Vec::new();
+    file.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() <= 16 * 1024 * 1024, "root config exceeds 16 MiB");
+    Ok(Some(String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("root config is not UTF-8 (contents withheld)"))?))
 }
 
 fn absolute(path: &Path) -> Result<PathBuf> {

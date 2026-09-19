@@ -230,6 +230,7 @@ impl Project {
         if !project.project_md().is_file() {
             bail!("no project `{slug}` in {}", root.display());
         }
+        ensure_legacy(&project.dir())?;
         Ok(project)
     }
 
@@ -266,6 +267,7 @@ impl Project {
         if !self.project_md().is_file() {
             bail!("project `{}` is gone", self.slug);
         }
+        ensure_legacy(&self.dir())?;
         Ok(ProjectLock { _file: file })
     }
 
@@ -278,6 +280,7 @@ impl Project {
     pub fn status(&self) -> Status { self.try_status().unwrap_or(Status::Invalid) }
 
     pub fn try_status(&self) -> Result<Status> {
+        ensure_legacy(&self.dir())?;
         use std::io::Read;
         use std::os::unix::fs::OpenOptionsExt;
         let path = self.state_dir().join("project.json");
@@ -335,25 +338,27 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 /// The effective safety settings: `[safety."<canonical project path>"]` in
 /// `<config_dir>/config.toml`, with defaults for an absent table or key.
 pub fn load_safety(config_dir: &Path, canonical_project_dir: &Path) -> Result<Safety> {
+    let file=config_dir.join("config.toml");
+    let Ok(text)=std::fs::read_to_string(&file) else {return Ok(Safety::default());};
+    parse_safety(&text,canonical_project_dir).with_context(||format!("invalid safety settings in {}",file.display()))
+}
+
+/// Parse an already bounded config snapshot without reopening its path.
+pub fn parse_safety(text:&str,canonical_project_dir:&Path)->Result<Safety> {
     #[derive(Deserialize, Default)]
     struct Config {
         #[serde(default)]
         safety: std::collections::BTreeMap<String, Safety>,
     }
-    let file = config_dir.join("config.toml");
-    let Ok(text) = std::fs::read_to_string(&file) else {
-        return Ok(Safety::default());
-    };
     let mut config: Config =
-        toml::from_str(&text).with_context(|| format!("{} does not parse", file.display()))?;
+        toml::from_str(text).context("safety configuration does not parse")?;
     let safety = config
         .safety
         .remove(&*canonical_project_dir.to_string_lossy())
         .unwrap_or_default();
     if !matches!(safety.start_threads.as_str(), "propose" | "auto") {
         bail!(
-            "{}: start_threads must be \"propose\" or \"auto\", not {:?}",
-            file.display(),
+            "start_threads must be \"propose\" or \"auto\", not {:?}",
             safety.start_threads
         );
     }
@@ -621,4 +626,17 @@ mod tests {
             .flatten()
             .all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")));
     }
+}
+
+/// Always compiled, including legacy-only binaries. Never treat an unreadable,
+/// newer, or interrupted ownership marker as permission to use legacy records.
+pub fn ensure_legacy(dir: &Path) -> Result<()> {
+    for relative in [".state/format.json", ".state/migration/journal.json"] {
+        match std::fs::symlink_metadata(dir.join(relative)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => return Err(e).with_context(|| format!("cannot inspect ownership marker {relative}")),
+            Ok(_) => bail!("project uses migration/store maintenance; legacy runtime is disabled; use `migration status`, `recover` or `export` with the state-store build; reconciliation is required"),
+        }
+    }
+    Ok(())
 }

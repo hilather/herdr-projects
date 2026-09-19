@@ -105,7 +105,7 @@ No force fallback, automatic merge/push or production data migration is introduc
 
 ## Next work
 
-[Task ledger](task-status.md): thirteen locally implemented cards, 28 not started.
+[Task ledger](task-status.md): thirteen locally implemented cards, two partial, 26 not started.
 The user accepted Phase A with its documented testing gaps and authorized W03. Proposed memory change: record native transport v1, cooperative checkpoint,
 repair workflow and ADR 0002 decisions; no shared-memory promotion was performed.
 
@@ -127,3 +127,118 @@ heads, then write all records/events/intents atomically. Legacy CLI behavior and
 memory authority remain unchanged. No migration or operation dispatcher is wired.
 See [ADR 0003](adr/0003-project-store-v1.md) for schema ownership, failure evidence,
 limits and reproduction commands. T03.2 migration is the next card.
+
+
+## T03.2 offline migration foundation
+
+Committed/pushed the reviewed Phase A and T03.1 changes as `52884bf` before this
+work. The new [migration workflow](migration-workflow.md) adds explicit planning,
+verified backups/import, journaled cutover/recovery, revisioned projections and
+separate-root restore. Always-compiled ownership guards prevent legacy execution
+or mutation after preparation. Memory remains file-authoritative. Independent
+review approved this conservative subset; T03.2 remains partial pending runtime
+adapters, live preflight and pending-operation conversion. No real user project
+was migrated and the W03 gate is not claimed complete.
+
+
+## Store-backed task commands and durable operations
+
+The [delivery foundation](operation-delivery.md) adds schema v3, transactional
+claims/outcomes, lease fencing, ambiguity and bounded retry. Migration converts
+supported legacy pending inbox/finalization/notification obligations without losing
+retry provenance or automatically replaying uncertain effects. Migrated task
+commands and context read/write the store; recovery preserves post-cutover edits.
+Snapshots and operation projections bind delivery state to the same event head.
+Independent review approved the foundation after correcting finish-time task
+fencing. T03.2/T03.3 remain partial; external execution adapters and live preflight
+are not yet complete. No actual user project was migrated or dispatched.
+
+The combined debug and release suites pass 265 tests (37 library, 216 binary,
+10 CLI and two contracts), with three opt-in live fixtures ignored by default.
+The default-feature suite passes 226 tests. The locked all-feature release build
+and `git diff --check` pass. Final independent review found no further issues.
+Validation logs: `/tmp/herdr-operations-debug.log`, `/tmp/herdr-operations-release.log`,
+`/tmp/herdr-operations-build.log`, `/tmp/herdr-operations-legacy.log`.
+
+
+## Canonical inbox and migration preflight
+
+Schema v4 adds canonical inbox state, an atomic internal delivery/receipt adapter,
+and migrated inbox/context commands. Explicit upgrades use preserved database
+sources; schema-qualified projection directories preserve exports across upgrades.
+Read-only preflight reports bounded external config fingerprints, destination
+filesystem/space estimates, recorded Herdr identities and local worktree matches.
+Apply enforces destination storage checks. Preflight observations retain migration
+blockers and do not enable execution. External configuration binding, complete
+execution adapters and reconciliation remain open; T03.2/T03.3 are still partial.
+No user project or live session was changed. macOS remains untested.
+
+Review identified and prompted fixes for an unbounded config reread, the storage
+probe destination, significant inbox indentation, and projection identity across
+schema upgrades. Regression coverage includes FIFO/oversized config refusal,
+claimed-intent protection, conflict rollback, provenance-based upgrade and CLI
+seen/done behavior.
+
+Validation: 274 tests pass in debug and release (42 library, 218 binary, 12 CLI
+and two contracts); 226 default-feature tests pass. Three live fixtures remain
+opt-in. Logs: `/tmp/herdr-adapters-{debug,release,legacy,build}.log`.
+The all-feature release build and `git diff --check` pass. Independent re-review
+confirmed the four fixes with no remaining production blocker. Its parallel
+library run encountered one transient maintenance-lock refusal; the isolated
+rerun passed. The full debug and release runs above passed without that refusal.
+The reviewer also passed all 42 library tests serially and the focused bounded
+config CLI fixture, and approved this scoped inbox/preflight implementation.
+The transient parallel contention's cause remains unconfirmed. Review approval
+does not close T03.2/T03.3 or the W03 acceptance gate.
+
+
+## External configuration bound through cutover
+
+Version-2 CLI migration plans bind the resolved config path and content fingerprint
+(or absence) into migration identity. Apply refuses old unbound plans; existing
+version-1 prepared journals retain their original recovery contract. Config edits,
+appearance or removal block unpublished cutover, including recovery. Active store
+recovery remains independent of subsequent config edits. Config values are never
+included in plans or copied into project backups. Safety parsing is validated
+against the fingerprint used for planning. Initial root resolution now rejects
+special/oversized config files promptly without requiring an explicit root.
+
+Regression fixtures cover all unpublished journal phases, absent-to-present config,
+symlinks, malformed content, stale CLI plans, active recovery and no-root FIFO/size
+bounds. T03.2/T03.3 remain partial. External execution requires the remaining
+ownership/reconciliation integration; no scheduler or live effect was enabled.
+
+Independent review approved this scoped change and independently passed the new
+migration and CLI regressions. Validation: 278 tests pass in debug and release
+(44 library, 218 binary, 14 CLI, two contracts); 227 default-feature tests pass.
+The all-feature release build and `git diff --check` pass. Three live fixtures stay
+opt-in; macOS remains untested. Logs: `/tmp/herdr-config-{debug,release,legacy,build}.log`.
+
+
+## Common dispatch service and operator claim expiry
+
+The new generic dispatch service prepares an adapter-owned resource guard,
+commits a claim, rechecks policy and store fences, calls the effect outside SQLite,
+and records its outcome while retaining the guard. Bare adapter errors become
+ambiguous. Receipt persistence failures return an explicit unrecorded claim and
+never trigger retry. `operations PROJECT expire` exposes safe, idempotent claim
+expiry during the execution freeze. It does not authorize replay.
+
+Independent review approved the service contract and initial focused tests.
+Fixtures now also cover lease expiry before effect, CLI expiry, and native process
+death before effect, after effect and after receipt. Notification/finalization
+production adapters still require ownership/reconciliation integration; T03.3 and
+W03 acceptance remain open. No real user project or live resource was changed.
+
+Final independent review approved the service, expiry wrapper/CLI and native crash
+fixtures, and independently passed all six service tests plus the expiry CLI test.
+The parallel debug run encountered the previously observed cleanup process-identity
+inspection race; parallel release encountered transient migration maintenance-lock
+contention. Production refusal guards remain intact. The complete serial debug
+suite passes 285 tests (50 library, 218 binary, 15 CLI, two contracts), and the
+default-feature suite passes 227. Three live fixtures remain opt-in.
+The complete serial release suite also passes all 285 tests. The locked all-feature
+release build and `git diff --check` pass. Validation logs are
+`/tmp/herdr-dispatch-{debug,debug-serial,release,release-serial,legacy,build}.log`.
+Use `-- --test-threads=1` to reproduce the complete successful feature suites.
+macOS and production external adapter integration remain untested.

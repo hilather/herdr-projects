@@ -3,7 +3,7 @@
 Updated 2026-09-19. Counts describe implementation progress, not release acceptance.
 Local tests do not replace the plan's independent review, macOS or live-system gates.
 
-**28 cards have not started. Thirteen cards now have local implementations and
+**26 cards have not started; T03.2 and T03.3 are partial. Thirteen cards have local implementations and
 regression evidence.** Phase A was explicitly accepted by the user with documented
 testing gaps. W03 has begun with T03.1; full W03 acceptance remains open.
 
@@ -12,14 +12,14 @@ testing gaps. W03 has begun with T03.1; full W03 acceptance remains open.
 | W00 | Baseline and architecture contracts | 2 | 0 | 0 |
 | W01 | Process, schedule, polling and recovery reliability | 5 | 0 | 0 |
 | W02 | Preservation, transport, lifecycle, diagnostics and context | 5 | 0 | 0 |
-| W03 | Transactional store, migration, outbox and reconciliation | 1 | 0 | 3 |
+| W03 | Transactional store, migration, outbox and reconciliation | 1 | 2 | 1 |
 | W04 | Scheduling, capacity, execution pools, profiles and authority | 0 | 0 | 5 |
 | W05 | Versioned memory, snapshots, import and coordinator checkpoints | 0 | 0 | 4 |
 | W06 | Memory proposals, promotion, updates, invalidation and barriers | 0 | 0 | 5 |
 | W07 | Revision-bound results, integration and review gates | 0 | 0 | 4 |
 | W08 | CI, live compatibility, failure testing and performance | 0 | 0 | 4 |
 | W09 | Pilot, packaging and release acceptance | 0 | 0 | 3 |
-| **Total** | | **13** | **0** | **28** |
+| **Total** | | **13** | **2** | **26** |
 
 Implemented locally: **T00.1–T00.2, T01.1–T01.5, T02.1–T02.5, T03.1**. See
 [implementation progress](implementation-progress.md) and
@@ -44,8 +44,15 @@ file-backed; no projects have been migrated. Full W03/platform acceptance is ope
 
 ## Next work
 
-**T03.2** explicit legacy migration and projections comes next, then **T03.3**
-durable operation claims/outbox delivery, then **T03.4** reconciliation.
+**T03.2** now has a reviewed [offline migration workflow](migration-workflow.md),
+verified backup/restore, task commands, supported pending-operation conversion
+and generated projections. Read-only live preflight and canonical inbox/context
+adapters now exist. Version-2 plans bind external config presence/path/hash through
+cutover; runtime execution, profile resolution and live ownership integration remain.
+**T03.3** now has [durable claims/outcomes](operation-delivery.md), fencing,
+ambiguity, retry handling, an atomic inbox drain, a guarded common dispatch service
+and explicit claim expiry. Concrete external delivery adapters remain.
+Complete these integrations before **T03.4** reconciliation.
 W04–W09 account for the other 25 not-started cards. Task count is not a time estimate.
 Phase A was accepted with its [documented gaps](phase-a-acceptance.md); macOS remains
 untested and unsupported cleanup must continue to refuse.
