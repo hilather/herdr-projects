@@ -130,5 +130,11 @@ The runtime ownership protocol marker remains independent of schema numbering.
 
 Schema v4 adds canonical inbox records and preserves their seen/done state.
 Explicit upgrades populate them from immutable database provenance. Fresh stores
-now use v4. Snapshots include schema identity, and exports use schema-qualified
+used v4 at that stage. Snapshots include schema identity, and exports use schema-qualified
 revision directories to preserve earlier schema exports at the same event head.
+
+
+Schema v5 adds typed runtime bindings with task/source references, payload hashes,
+and unverified ownership. Fresh stores now use v5. Backfill uses DB provenance in
+the explicit upgrade transaction and preserves the event head; schema-qualified
+exports distinguish the new derived records. Runtime mutation is not yet exposed.

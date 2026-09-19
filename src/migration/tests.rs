@@ -197,7 +197,7 @@ fn task_edits_and_projection_recovery_preserve_new_state_and_originals() {
     assert_eq!(current.tasks.iter().find(|t|t.id==id).unwrap().title,"Changed title");
     assert_eq!(read(&project.join("TASKS.md")).unwrap(),original);
     let context=crate::runtime::context(&project).unwrap();assert!(context.contains("Runtime owner: SQLite")&&context.contains("Changed title")&&context.contains("Unverified memory"));
-    assert!(project.join(format!(".state/projections/schema-4-revision-{head}/TASKS.md")).is_file());
+    assert!(project.join(format!(".state/projections/schema-5-revision-{head}/TASKS.md")).is_file());
 }
 #[test]
 fn corrupt_retry_identity_types_and_dates_block_import() {
@@ -212,10 +212,10 @@ fn published_v2_store_upgrades_explicitly_without_losing_migration_identity() {
     // Reproduce the previous released schema: no operation delivery table or
     // receipt count existed. It retains the same published ownership protocol.
     let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();
-    raw.execute_batch("DROP TABLE inbox_items; DROP TRIGGER operation_delivery_insert; DROP TABLE operation_delivery; ALTER TABLE migration_receipt DROP COLUMN operation_count; UPDATE store_meta SET schema_version=2; PRAGMA user_version=2;").unwrap();drop(raw);
+    raw.execute_batch("DROP TABLE runtime_bindings; DROP TABLE inbox_items; DROP TRIGGER operation_delivery_insert; DROP TABLE operation_delivery; ALTER TABLE migration_receipt DROP COLUMN operation_count; UPDATE store_meta SET schema_version=2; PRAGMA user_version=2;").unwrap();drop(raw);
     let before=crate::runtime::snapshot(&project).unwrap();
     upgrade_active(&project).unwrap();let mut db=open_active(&project).unwrap();
-    let after=db.read_snapshot(None).unwrap();assert_eq!(after.tasks,before.tasks);assert_eq!(after.head,before.head);assert_eq!(after.schema_version,4);assert!(db.deliveries().unwrap().is_empty());assert_eq!(db.import_operation_count().unwrap(),0);
+    let after=db.read_snapshot(None).unwrap();assert_eq!(after.tasks,before.tasks);assert_eq!(after.head,before.head);assert_eq!(after.schema_version,5);assert!(db.deliveries().unwrap().is_empty());assert_eq!(db.import_operation_count().unwrap(),0);
     drop(db);recover(&project,true).unwrap();
 }
 #[test]
@@ -267,14 +267,14 @@ fn inbox_indentation_conflicts_roll_back_deliveries_and_preserve_bytes() {
 fn schema3_inbox_upgrade_reads_provenance_not_changed_legacy_files() {
     let (_temp,project)=fixture();inbox_source(&project,"one","original",false);
     let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();
-    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE inbox_items; UPDATE store_meta SET schema_version=3; PRAGMA user_version=3;").unwrap();drop(raw);
+    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE runtime_bindings; DROP TABLE inbox_items; UPDATE store_meta SET schema_version=3; PRAGMA user_version=3;").unwrap();drop(raw);
     inbox_source(&project,"one","edited legacy file",false);upgrade_active(&project).unwrap();
     assert_eq!(crate::runtime::snapshot(&project).unwrap().inbox[0].content.body,"original");
 }
 #[test]
 fn old_schema_projection_does_not_conflict_after_inbox_upgrade() {
     let (_temp,project)=fixture();inbox_source(&project,"one","canonical content",false);let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();
-    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE inbox_items; UPDATE store_meta SET schema_version=3; PRAGMA user_version=3;").unwrap();drop(raw);
+    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE runtime_bindings; DROP TABLE inbox_items; UPDATE store_meta SET schema_version=3; PRAGMA user_version=3;").unwrap();drop(raw);
     let old=crate::projections::export(&project,&mut open_active(&project).unwrap()).unwrap();
     let old_view=read(&old.join("inbox.json")).unwrap();upgrade_active(&project).unwrap();let new=crate::projections::export(&project,&mut open_active(&project).unwrap()).unwrap();
     assert_ne!(old,new);assert_eq!(read(&old.join("inbox.json")).unwrap(),old_view);assert!(String::from_utf8(read(&new.join("inbox.json")).unwrap()).unwrap().contains("canonical content"));
@@ -380,7 +380,9 @@ fn missing_receipts_and_changed_task_or_claim_never_authorize_confirmation() {
 fn corrupt_receipt_provenance_rolls_back_all_confirmations() {
     let(_temp,project)=receipt_fixture(true);let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();
     let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute("UPDATE legacy_sources SET bytes=x'00' WHERE path='threads/t-0001.toml'",[]).unwrap();
-    assert!(db.observe_imported_receipts(before.head,100,true).is_err());assert_eq!(db.read_snapshot(None).unwrap(),before);
+    assert!(db.observe_imported_receipts(before.head,100,true).is_err());assert!(db.read_snapshot(None).is_err());
+    raw.execute("UPDATE legacy_sources SET bytes=?1 WHERE path='threads/t-0001.toml'",[read(&project.join("threads/t-0001.toml")).unwrap()]).unwrap();
+    assert_eq!(db.read_snapshot(None).unwrap(),before);
 }
 
 #[test]
@@ -401,4 +403,67 @@ fn imported_receipts_cannot_confirm_new_lookalike_operations() {
         let entry=report.observations.iter().find(|o|o.operation==lookalike.id).unwrap();assert!(entry.receipt.is_none());assert!(entry.blocked.is_some());
         assert_eq!(db.deliveries().unwrap().iter().find(|d|d.operation==lookalike.id).unwrap().state,crate::operations::DeliveryState::Ambiguous);
     }
+}
+
+#[test]
+fn runtime_bindings_preserve_recorded_identity_without_granting_ownership() {
+    let(_temp,project)=fixture();
+    fs::write(project.join(".state/coordinator.json"),br#"{"socket":"/recorded/session.sock","workspace_id":"w-1","cwd":"/coordinator","repo":42,"status":7}"#).unwrap();
+    fs::write(project.join("threads/t-0001.toml"),"id='t-0001'\nstatus='resolved'\nrepo='/repo'\nbranch='topic'\nworktree_path='/worktree'\nagent='agent'\ncwd='/worktree'\nfuture_key='preserved'\nsocket=42\n").unwrap();
+    let plan=inspect(&project).unwrap();assert!(plan.blockers.is_empty());apply(&project,&plan,true).unwrap();
+    let snapshot=crate::runtime::snapshot(&project).unwrap();assert_eq!(snapshot.runtime_bindings.len(),2);
+    let binding=snapshot.runtime_bindings.iter().find(|b|b.id=="thread:t-0001").unwrap();
+    assert_eq!(binding.task.as_ref().unwrap().as_str(),"legacy-t-0001");assert_eq!(binding.identity.socket,"/recorded/session.sock");assert_eq!(binding.identity.worktree_path,"/worktree");assert_eq!(binding.identity.branch,"topic");assert!(binding.identity.execution_fingerprint.is_some());assert!(binding.session_source_digest.is_some());
+    assert!(snapshot.runtime_bindings.iter().all(|b|b.verification==crate::domain::RuntimeVerification::Unverified));
+    fs::write(project.join("threads/t-0001.toml"),"id='changed'\n").unwrap();fs::write(project.join(".state/coordinator.json"),br#"{"socket":"/wrong.sock"}"#).unwrap();
+    assert_eq!(crate::runtime::snapshot(&project).unwrap().runtime_bindings,snapshot.runtime_bindings);
+    let export=crate::projections::export(&project,&mut open_active(&project).unwrap()).unwrap();let view:serde_json::Value=serde_json::from_slice(&read(&export.join("runtime.json")).unwrap()).unwrap();assert_eq!(view["bindings"].as_array().unwrap().len(),2);
+    assert!(String::from_utf8(open_active(&project).unwrap().imported_sources().unwrap().into_iter().find(|s|s.kind=="thread").unwrap().bytes).unwrap().contains("future_key"));
+}
+#[test]
+fn runtime_upgrade_uses_provenance_preserves_edits_and_previous_exports() {
+    let(_temp,project)=fixture();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();
+    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE runtime_bindings; UPDATE store_meta SET schema_version=4; PRAGMA user_version=4;").unwrap();drop(raw);
+    let before=crate::runtime::snapshot(&project).unwrap();assert!(before.runtime_bindings.is_empty());
+    let old=crate::projections::export(&project,&mut open_active(&project).unwrap()).unwrap();let old_bytes=read(&old.join("runtime.json")).unwrap();
+    crate::runtime::rename_task(&project,&TaskId::new("legacy-t-0001").unwrap(),"new title".into(),1,before.head).unwrap();
+    fs::write(project.join("threads/t-0001.toml"),"bad legacy bytes").unwrap();let before=crate::runtime::snapshot(&project).unwrap();
+    upgrade_active(&project).unwrap();let after=crate::runtime::snapshot(&project).unwrap();assert_eq!(after.head,before.head);assert_eq!(after.tasks,before.tasks);assert_eq!(after.runtime_bindings.len(),1);assert_eq!(after.runtime_bindings[0].task.as_ref().unwrap().as_str(),"legacy-t-0001");assert!(after.runtime_bindings[0].identity.socket.is_empty());
+    upgrade_active(&project).unwrap();assert_eq!(crate::runtime::snapshot(&project).unwrap(),after);
+    let new=crate::projections::export(&project,&mut open_active(&project).unwrap()).unwrap();assert_ne!(old,new);assert_eq!(read(&old.join("runtime.json")).unwrap(),old_bytes);
+    recover(&project,true).unwrap();
+}
+#[test]
+fn corrupt_or_missing_runtime_binding_is_visible() {
+    for missing in [false,true] {
+        let(_temp,project)=fixture();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();
+        let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();
+        if missing {raw.execute("DELETE FROM runtime_bindings",[]).unwrap();}else{raw.execute("UPDATE runtime_bindings SET payload='{}'",[]).unwrap();}
+        assert!(crate::runtime::snapshot(&project).is_err());
+    }
+}
+
+#[test]
+fn runtime_snapshot_checks_source_bytes_and_missing_links_on_open_connection() {
+    for damage in ["thread-bytes","session-bytes","missing-source"] {
+        let(_temp,project)=fixture();fs::write(project.join(".state/coordinator.json"),br#"{"socket":"/recorded.sock"}"#).unwrap();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();
+        let mut db=open_active(&project).unwrap();let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        match damage {
+            "thread-bytes"=>{raw.execute("UPDATE legacy_sources SET bytes=x'00' WHERE kind='thread'",[]).unwrap();},
+            "session-bytes"=>{raw.execute("UPDATE legacy_sources SET bytes=x'00' WHERE path='.state/coordinator.json'",[]).unwrap();},
+            _=>{raw.execute("DELETE FROM legacy_sources WHERE kind='thread'",[]).unwrap();},
+        }
+        assert!(db.read_snapshot(None).is_err(),"{damage}");
+    }
+}
+
+#[test]
+fn runtime_upgrade_failure_rolls_back_schema_and_can_be_retried() {
+    let(_temp,project)=fixture();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();
+    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE runtime_bindings; UPDATE store_meta SET schema_version=4; PRAGMA user_version=4; UPDATE legacy_sources SET bytes=x'00' WHERE kind='thread';").unwrap();
+    assert!(upgrade_active(&project).is_err());
+    assert_eq!(raw.query_row("PRAGMA user_version",[],|r|r.get::<_,u32>(0)).unwrap(),4);
+    assert_eq!(raw.query_row("SELECT count(*) FROM sqlite_master WHERE name='runtime_bindings'",[],|r|r.get::<_,u32>(0)).unwrap(),0);
+    raw.execute("UPDATE legacy_sources SET bytes=?1 WHERE path='threads/t-0001.toml'",[read(&project.join("threads/t-0001.toml")).unwrap()]).unwrap();
+    upgrade_active(&project).unwrap();assert_eq!(crate::runtime::snapshot(&project).unwrap().runtime_bindings.len(),1);
 }

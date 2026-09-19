@@ -264,3 +264,31 @@ serially in debug and release (54 library, 219 binary, 16 CLI, two contracts);
 227 default-feature tests and the locked all-feature release build pass.
 `git diff --check` is clean. Three live fixtures remain opt-in; macOS remains
 untested. Logs: `/tmp/herdr-receipts-{debug,release,legacy,build}.log`.
+
+
+## Typed runtime identities
+
+Pushed the reviewed receipt observer as `fc42188` before this batch. Schema v5 now
+stores typed thread/coordinator identities with task/source references, binding
+revisions and hashes. Recorded sockets retain coordinator provenance; absent
+sockets remain absent. `migration PROJECT bindings` and runtime exports expose
+these records as unverified, without granting ownership or enabling execution.
+
+Explicit upgrades backfill from database provenance, preserve task edits and event
+head, and retain prior exports. Reads detect corrupt payloads, corrupt source or
+session bytes, missing sources and incomplete inventories. Unknown fields remain
+in their original source bytes. Independent review approved the foundation and
+subsequent read-integrity hardening. The earlier receipt-corruption test now
+expects snapshot refusal until the corrupt source bytes are restored, then checks
+that no receipt/task/event changes were committed. Upgrade failure also has a
+schema-rollback/retry fixture. T03.2/T03.3 remain partial; no live resources changed.
+
+Validation: 297 tests pass serially in debug and release (59 library, 219 binary,
+17 CLI, two contracts); 227 default-feature tests and the all-feature release build
+pass. An overlapping default-feature build replaced the debug CLI binary during an
+earlier feature-suite run; rerunning the feature suite after that build completed
+passed. Run feature variants sequentially or with separate target directories.
+Successful logs: `/tmp/herdr-bindings-debug-isolated.log`,
+`/tmp/herdr-bindings-final-release.log`, `/tmp/herdr-bindings-legacy.log`, and
+`/tmp/herdr-bindings-build.log`. `git diff --check` passes. Three live fixtures stay
+opt-in; macOS remains untested.

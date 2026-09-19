@@ -4,7 +4,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{fmt, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 
-const SCHEMA: u32 = 4;
+const SCHEMA: u32 = 5;
 const APPLICATION: u32 = 1_213_222_994;
 const MIN_SQLITE: i32 = 3_053_004;
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
@@ -53,6 +53,7 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../migrations/0002_legacy_import.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0003_operation_delivery.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0004_canonical_inbox.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0005_runtime_bindings.sql"))?;
             tx.commit()?;
         }
         // Persist the initial directory entry as well as SQLite's own commit.
@@ -93,8 +94,9 @@ impl SqliteStore {
         let schema:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
         let deliveries=if schema>=3 {delivery::read_all(&tx)?}else{Vec::new()};
         let inbox=if schema>=4 {inbox::read_all(&tx)?}else{Vec::new()};
+        let runtime_bindings=if schema>=5 {runtime::read_all(&tx)?}else{Vec::new()};
         tx.commit()?;
-        Ok(Snapshot { schema_version:schema, head, tasks, attempts, operations, deliveries, inbox, events })
+        Ok(Snapshot { schema_version:schema, head, tasks, attempts, operations, deliveries, inbox, runtime_bindings, events })
     }
     /// All mutations, generated audit events and durable intents commit together.
     /// Revisions start at one and advance by exactly one. A stale head or record
@@ -255,3 +257,5 @@ mod delivery;
 
 mod inbox;
 mod receipts;
+
+mod runtime;

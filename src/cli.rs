@@ -323,6 +323,8 @@ enum TickerCommand {
 #[cfg(feature = "state-store")]
 #[derive(Subcommand)]
 enum MigrationCommand {
+    /// Inspect imported execution identities; none imply verified resource ownership
+    Bindings,
     Inspect,
     /// Read-only storage, config and recorded live identity diagnostics
     Preflight,
@@ -415,6 +417,11 @@ pub fn run() -> Result<()> {
             project::validate_slug(&slug)?;
             let dir = ctx.root.join(&slug);
             match command {
+                MigrationCommand::Bindings=>{
+                    let snapshot=herdr_projects::runtime::snapshot(&dir)?;
+                    anyhow::ensure!(snapshot.schema_version>=5,"upgrade-store is required for runtime bindings");
+                    println!("{}",serde_json::to_string_pretty(&serde_json::json!({"head":snapshot.head,"bindings":snapshot.runtime_bindings}))?);
+                },
                 MigrationCommand::UpgradeStore => { migration::upgrade_active(&dir)?; println!("Store schema upgraded; dispatch remains blocked pending reconciliation."); },
                 MigrationCommand::Preflight=>println!("{}",serde_json::to_string_pretty(&crate::migration_preflight::inspect(&ctx,&dir)?)?),
                 MigrationCommand::Inspect => println!("{}", serde_json::to_string_pretty(&crate::migration_preflight::plan(&ctx,&dir)?)?),

@@ -20,6 +20,10 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../migrations/0004_canonical_inbox.sql"))?;
             super::inbox::import_sources(&tx)?;
         }
+        if version<=4 {
+            tx.execute_batch(include_str!("../../migrations/0005_runtime_bindings.sql"))?;
+            super::runtime::import_sources(&tx)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -33,7 +37,7 @@ impl SqliteStore {
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         check_schema(&tx)?;
         let version: u32 = tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
-        if version != 4 { return Err(StoreError::UnsupportedSchema(version)); }
+        if version != 5 { return Err(StoreError::UnsupportedSchema(version)); }
         let occupied: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM tasks UNION ALL SELECT 1 FROM events UNION ALL SELECT 1 FROM migration_receipt UNION ALL SELECT 1 FROM legacy_sources)",[],|r|r.get(0))?;
         if occupied { return Err(StoreError::Conflict); }
         for source in sources {
@@ -50,6 +54,7 @@ impl SqliteStore {
             tx.execute("INSERT INTO tasks VALUES(?1,1,?2,?3,NULL)", params![task.id.as_str(),task.state.as_str(),task.title])?;
             tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('task.imported',?1,1,1,?2)",params![task.id.as_str(),serde_json::to_string(task).map_err(|e|StoreError::Invalid(e.to_string()))?])?;
         }
+        super::runtime::import_sources(&tx)?;
         for op in operations {
             if op.expected_revision!=1 || op.payload_version!=1 || !matches!(op.kind.as_str(),"legacy.inbox"|"legacy.notify"|"legacy.finalize") { return Err(StoreError::Invalid("invalid imported operation".into())); }
             let payload=serde_json::to_string(&op.payload).map_err(|e|StoreError::Invalid(e.to_string()))?;

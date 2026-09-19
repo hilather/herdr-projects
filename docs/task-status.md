@@ -48,7 +48,9 @@ file-backed; no projects have been migrated. Full W03/platform acceptance is ope
 verified backup/restore, task commands, supported pending-operation conversion
 and generated projections. Read-only live preflight and canonical inbox/context
 adapters now exist. Version-2 plans bind external config presence/path/hash through
-cutover; runtime execution, profile resolution and live ownership integration remain.
+cutover. Schema v5 adds typed, hash-checked, unverified runtime bindings and a
+read-only inspection command. Runtime execution, profile resolution and live
+ownership integration remain.
 **T03.3** now has [durable claims/outcomes](operation-delivery.md), fencing,
 ambiguity, retry handling, an atomic inbox drain, a guarded common dispatch service
 and explicit claim expiry. Exact imported notification/finalization receipts now

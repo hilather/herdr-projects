@@ -86,6 +86,7 @@ pub struct Snapshot {
     pub operations: Vec<Operation>,
     pub deliveries: Vec<crate::operations::Delivery>,
     pub inbox: Vec<InboxItem>,
+    pub runtime_bindings:Vec<RuntimeBinding>,
     pub events: Vec<Event>,
 }
 pub enum Mutation {
@@ -100,3 +101,5 @@ pub struct Commit {
 
 mod inbox;
 pub use inbox::{InboxContent,InboxItem};
+mod runtime;
+pub use runtime::{RuntimeBinding,RuntimeIdentity,RuntimeVerification};

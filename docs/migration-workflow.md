@@ -41,8 +41,9 @@ thread/settings fields are preserved in the original bytes.
 ## Ownership and recovery
 
 Schema v2 added source provenance and an import receipt; v3 adds durable delivery
-state and the imported-operation count; v4 adds canonical inbox records. Opening an older supported schema does
-not upgrade it. Use `upgrade-store` explicitly. Fresh stores use v4; the runtime
+state and the imported-operation count; v4 adds canonical inbox records and v5
+adds typed, unverified runtime identities. Opening an older supported schema does
+not upgrade it. Use `upgrade-store` explicitly. Fresh stores use v5; the runtime
 ownership marker remains `sqlite-v2`. Newer unknown schemas refuse writes.
 Import stores task mappings, raw runtime/thread/inbox/task bytes, hashes, supported
 operation intents and audit events in one transaction. It verifies exact bytes, identities, counts, task states,
@@ -168,3 +169,21 @@ version-1 journals remain recoverable under their original project-only contract
 After the journal reaches active, config edits do not prevent store reads or
 forward recovery. Root resolution also bounds config reads to 16 MiB and rejects
 special files without blocking, even when no explicit root is supplied.
+
+
+## Runtime identity records (schema v5)
+
+`migration PROJECT bindings` reads typed thread/coordinator identities from the
+store with their source fingerprints and binding revisions. Thread sockets come
+only from the preserved coordinator record; its separate fingerprint is retained.
+An absent socket stays empty and never falls back to an ambient Herdr session.
+All bindings are explicitly unverified. These records grant no ownership, do not
+release reservations, and do not enable external effects.
+
+Explicit upgrades populate bindings from hash-checked database provenance in one
+transaction, preserving current tasks and event head. Unknown legacy fields remain
+in the original source bytes. Reads check payload hashes, referenced source bytes,
+session provenance and inventory completeness, including on an already-open store.
+Corruption is reported rather than producing an empty identity list. Schema-v5
+runtime exports include typed bindings; older schema exports remain unchanged.
+Full runtime mutation, resource adoption and live reconciliation remain unfinished.
