@@ -88,6 +88,7 @@ pub struct Snapshot {
     pub inbox: Vec<InboxItem>,
     pub runtime_bindings:Vec<RuntimeBinding>,
     pub observations:Vec<crate::reconcile::RuntimeObservation>,
+    pub control:Option<ProjectControl>,
     pub events: Vec<Event>,
 }
 pub enum Mutation {
@@ -104,3 +105,5 @@ mod inbox;
 pub use inbox::{InboxContent,InboxItem};
 mod runtime;
 pub use runtime::{RuntimeBinding,RuntimeIdentity,RuntimeVerification,RuntimeRoute,RouteChange};
+mod control;
+pub use control::{ProjectState,ProjectControl,AdmissionReport,ControlChange};

@@ -49,7 +49,8 @@ verified backup/restore, task commands, supported pending-operation conversion
 and generated projections. Read-only live preflight and canonical inbox/context
 adapters now exist. Version-2 plans bind external config presence/path/hash through
 cutover. Schema v5 adds typed, hash-checked, unverified runtime bindings and a
-read-only inspection command. Runtime execution, profile resolution and live
+read-only inspection command. Schema v7 adds guarded canonical lifecycle control,
+epoch fencing and crash-recoverable marker publication. Runtime execution, profile resolution and live
 ownership integration remain.
 **T03.3** now has [durable claims/outcomes](operation-delivery.md), fencing,
 ambiguity, retry handling, an atomic inbox drain, a guarded common dispatch service

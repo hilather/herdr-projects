@@ -106,3 +106,17 @@ impl SqliteStore {
 
 #[cfg(test)]
 mod tests;
+
+impl SqliteStore {
+    /// Retire accepted intent without claiming its external effect is absent.
+    /// Claimed work must first expire; retirement never releases resources.
+    pub fn retire_operation(&mut self,id:&OperationId,expected_revision:u64,expected_head:u64,reason:&str,now:i64)->Result<Delivery> {
+        now_check(now)?;text(reason)?;
+        let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;check_schema(&tx)?;
+        if head(&tx)?!=expected_head{return Err(StoreError::Conflict);}
+        let old=delivery(&tx,id)?;
+        if old.revision!=expected_revision || !matches!(old.state,DeliveryState::Pending|DeliveryState::Ambiguous) {return Err(StoreError::Conflict);}
+        let outcome=Outcome::PermanentFailure{diagnostic:format!("Operator retired intent; any prior effect remains possible. Reason: {reason}")};
+        let result=update_outcome(&tx,&old,&outcome,now,"operator-retirement")?;tx.commit()?;Ok(result)
+    }
+}

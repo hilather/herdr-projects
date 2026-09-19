@@ -334,3 +334,21 @@ Validation: 306 tests pass serially in debug and release (63 library, 222 binary
 pass. Three live fixtures remain opt-in. Logs: `/tmp/herdr-rebind-final-debug.log`,
 `/tmp/herdr-rebind-release.log`, `/tmp/herdr-rebind-legacy.log`,
 `/tmp/herdr-rebind-build.log`. `git diff --check` passes.
+
+## Canonical lifecycle and recoverable control publication
+
+Schema v7 imports paused/archived lifecycle into canonical control and adds explicit
+admission, state changes and epochs. Resume currently admits only projects without
+existing resources needing adoption and with fresh matching observations, no retained
+attempts and no unfinished intents. Pause/archive remain usable with malformed
+external config. Rebind invalidates admission. Ordinary opens refuse an interrupted
+control/format publication; migration recovery republishes from the committed DB.
+Intent retirement stops pending/ambiguous retries without asserting effect absence
+or releasing capacity. Legacy status and source bytes remain unchanged.
+
+Separate review approved this controller scope. External adapters must still enforce
+typed safety, scoped authority and ownership; W03 remains partial. Debug and release
+all-feature suites pass 312 tests (68 library, 222 binary, 20 CLI, 2 contracts), with
+three live fixtures opt-in. Default-feature tests and release build also pass.
+Logs: `/tmp/herdr-control-final-debug.log`, `/tmp/herdr-control-release.log`,
+`/tmp/herdr-control-legacy.log`, `/tmp/herdr-control-build.log`.

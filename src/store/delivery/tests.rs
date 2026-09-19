@@ -109,3 +109,10 @@ fn retry_budget_and_input_bounds_preserve_delivery_invariants() {
     assert_eq!(record.state,DeliveryState::PermanentFailure);
     assert!(db.claim_operation(&id,record.revision,"owner",record.next_due_ms,1000).is_err());
 }
+
+#[test]
+fn retirement_refuses_an_owned_claim_until_expiry_without_erasing_intent() {
+    let(_temp,mut db,id)=fixture();db.claim_operation(&id,1,"owner",100,1000).unwrap();let before=db.read_snapshot(None).unwrap();let revision=before.deliveries[0].revision;
+    assert!(db.retire_operation(&id,revision,before.head,"stop attempts",101).is_err());assert_eq!(db.read_snapshot(None).unwrap(),before);
+    db.expire_claims(1100).unwrap();let expired=db.read_snapshot(None).unwrap();let retired=db.retire_operation(&id,expired.deliveries[0].revision,expired.head,"no longer needed",1101).unwrap();assert_eq!(retired.state,DeliveryState::PermanentFailure);assert_eq!(db.read_snapshot(None).unwrap().operations,before.operations);
+}

@@ -69,10 +69,11 @@ replacing original records. After publication, recover forward or restore into a
 new directory. Do not remove the marker and run an older binary against the root.
 
 The format marker declares runtime owner `sqlite-v2`, memory owner
-`legacy-markdown`, and `reconciliation_required=true`. Legacy commands in both
+`legacy-markdown`, and initially `reconciliation_required=true`. Schema v7 derives
+the latter from canonical lifecycle control; see [admission and recovery](reconciliation.md). Legacy commands in both
 feature-enabled and default builds refuse mutation/execution after preparation;
-list displays store/maintenance status. Migrated execution remains frozen until the
-remaining adapters and reconciliation exist. Store-backed `task PROJECT
+list displays store/maintenance status. External execution remains unavailable until the
+remaining adapters and ownership reconciliation exist. Store-backed `task PROJECT
 list/show/add/rename`, `operations PROJECT inspect` and `context PROJECT` are now
 available; task mutations require expected revisions/event heads. `active` means ownership was
 published, not that the scheduler is enabled.
@@ -82,7 +83,7 @@ include their original bytes; no DB memory authority or memory projections are
 created. Worktrees, branches and external agent resources are never altered.
 Generated views live under `.state/projections/schema-<schema>-revision-<event-head>`;
 legacy files are retained as pre-cutover originals rather than dual-written views.
-Coordinator execution is unavailable while frozen. Store-backed context prints
+Coordinator execution adapters remain unavailable. Store-backed context prints
 current task revisions and the ownership/dispatch restrictions alongside user-owned
 project and memory text. Recovery after publication preserves new task edits.
 

@@ -318,10 +318,11 @@ fn advance(project:&Path,journal:&mut Journal)->Result<()> {
     }
     ensure!(journal.phase==Phase::Active,"unknown recovery state");
     let marker:Format=serde_json::from_slice(&read(&project.join(".state/format.json"))?)?;
-    ensure!(marker==Format{version:1,runtime:"sqlite-v2".into(),memory:"legacy-markdown".into(),migration:journal.plan.digest.clone(),reconciliation_required:true},"active ownership marker mismatch");
+    ensure!(marker==Format{version:1,runtime:"sqlite-v2".into(),memory:"legacy-markdown".into(),migration:journal.plan.digest.clone(),reconciliation_required:marker.reconciliation_required},"active ownership marker mismatch");
     // After ownership publication, tasks/events may legitimately have advanced.
-    let mut db=open_active(project)?;
+    let mut db=open_published(project,false)?;
     ensure!(db.imported_sources()?==expected_import(project,&journal.plan)?,"imported provenance changed");
+    publish_control_marker(project,&db)?;
     crate::projections::export(project,&mut db)?;
     Ok(())
 }
@@ -413,16 +414,18 @@ pub(crate) fn maintenance(project:&Path)->Result<Maintenance> {
 }
 /// Validates published authority without requiring tasks to remain at import
 /// revisions. Accepted post-cutover edits must never trigger a legacy rollback.
-pub fn open_active(project:&Path)->Result<SqliteStore> {
+pub fn open_active(project:&Path)->Result<SqliteStore> {open_published(project,true)}
+fn open_published(project:&Path,enforce_control:bool)->Result<SqliteStore> {
     let project=checked_project(project)?;
     let journal=load(&project)?;
     ensure!(journal.phase==Phase::Active,"migration has not completed; recover before using the store");
     let marker:Format=serde_json::from_slice(&read(&project.join(".state/format.json"))?)?;
-    ensure!(marker==Format{version:1,runtime:"sqlite-v2".into(),memory:"legacy-markdown".into(),migration:journal.plan.digest.clone(),reconciliation_required:true},"active ownership marker mismatch");
+    ensure!(marker==Format{version:1,runtime:"sqlite-v2".into(),memory:"legacy-markdown".into(),migration:journal.plan.digest.clone(),reconciliation_required:marker.reconciliation_required},"active ownership marker mismatch");
     let db=SqliteStore::open(&project.join(".state/state.db"))?;
     ensure!(db.import_operation_count()?==journal.plan.operations.len() as u64,"store imported operation count mismatch");
     let receipt=db.import_receipt()?;
     ensure!(receipt==(journal.plan.digest,journal.plan.sources.iter().filter(|s|s.kind!="backup").count() as u64,journal.plan.tasks.len() as u64),"store import identity mismatch");
+    if enforce_control {ensure!(marker.reconciliation_required==db.project_control()?.map(|c|c.reconciliation_required).unwrap_or(true),"control/format publication interrupted; run migration recover before runtime commands");}
     Ok(db)
 }
 
@@ -437,3 +440,16 @@ pub mod storage;
 
 mod references;
 pub use references::{ConfigReference, config_reference, inspect_with_config, require_config_path};
+
+/// The DB commit is authoritative. A crash between commit and marker publication
+/// blocks ordinary opens; active-journal recovery republishes this derived marker.
+pub(crate) fn publish_control_marker(project:&Path,db:&SqliteStore)->Result<()> {
+    let journal=load(project)?;
+    let expected=Format{version:1,runtime:"sqlite-v2".into(),memory:"legacy-markdown".into(),migration:journal.plan.digest,reconciliation_required:db.project_control()?.map(|c|c.reconciliation_required).unwrap_or(true)};
+    let path=project.join(".state/format.json");
+    if serde_json::from_slice::<Format>(&read(&path)?)?==expected{return Ok(());}
+    let temporary=project.join(".state/migration/control-format.next");
+    if exists(&temporary){ensure!(fs::symlink_metadata(&temporary)?.is_file(),"invalid control marker temporary");fs::remove_file(&temporary)?;}
+    write_new(&temporary,&serde_json::to_vec_pretty(&expected)?)?;
+    fs::rename(temporary,path)?;sync_dir(&project.join(".state"))?;sync_dir(&project.join(".state/migration"))?;Ok(())
+}

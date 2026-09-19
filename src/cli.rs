@@ -359,6 +359,8 @@ enum TaskCommand {
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
 enum OperationsCommand { Inspect,
+    /// Stop future delivery without claiming an earlier effect is absent
+    Retire { id:String, #[arg(long)] reason:String, #[arg(long)] expected_revision:u64, #[arg(long)] expected_head:u64 },
     /// Preview exact legacy receipts; missing evidence never authorizes retry
     ReceiptPlan,
     /// Confirm only imported operations with matching durable legacy receipts
@@ -373,6 +375,9 @@ enum OperationsCommand { Inspect,
 #[derive(Subcommand)]
 enum RuntimeCommand {
     Inspect,
+    Admission,
+    /// Set canonical lifecycle state; resume requires current reconciliation evidence
+    State { #[arg(value_parser=["paused","active","archived"])] state:String, #[arg(long)] expected_revision:u64, #[arg(long)] expected_head:u64 },
     /// Read replacement routing JSON; require the exact binding revision and event head
     Rebind { id:String, #[arg(long)] route:PathBuf, #[arg(long)] expected_revision:u64, #[arg(long)] expected_head:u64 },
 }
@@ -400,7 +405,13 @@ pub fn run() -> Result<()> {
         Command::Runtime{slug,command}=>{
             project::validate_slug(&slug)?;let dir=ctx.root.join(slug);
             match command {
-                RuntimeCommand::Inspect=>{let snapshot=herdr_projects::runtime::snapshot(&dir)?;anyhow::ensure!(snapshot.schema_version>=5,"upgrade-store is required for runtime bindings");println!("{}",serde_json::to_string_pretty(&serde_json::json!({"head":snapshot.head,"bindings":snapshot.runtime_bindings,"observations":snapshot.observations}))?);},
+                RuntimeCommand::Inspect=>{let snapshot=herdr_projects::runtime::snapshot(&dir)?;anyhow::ensure!(snapshot.schema_version>=5,"upgrade-store is required for runtime bindings");println!("{}",serde_json::to_string_pretty(&serde_json::json!({"head":snapshot.head,"bindings":snapshot.runtime_bindings,"observations":snapshot.observations,"control":snapshot.control}))?);},
+                RuntimeCommand::Admission=>println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::admission(&dir,&std::path::absolute(ctx.config_dir.join("config.toml"))?)?)?),
+                RuntimeCommand::State{state,expected_revision,expected_head}=>{
+                    use herdr_projects::domain::ProjectState;
+                    let state=match state.as_str(){"active"=>ProjectState::Active,"archived"=>ProjectState::Archived,_=>ProjectState::Paused};
+                    println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::set_state(&dir,expected_head,expected_revision,state,&std::path::absolute(ctx.config_dir.join("config.toml"))?)?)?);
+                },
                 RuntimeCommand::Rebind{id,route,expected_revision,expected_head}=>{
                     let bytes=herdr_projects::migration::read_plan_file(&route)?;
                     let route=serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid runtime route JSON (contents withheld)"))?;
@@ -436,6 +447,7 @@ pub fn run() -> Result<()> {
             project::validate_slug(&slug)?;
             let dir=ctx.root.join(&slug);
             match command {
+                OperationsCommand::Retire{id,reason,expected_revision,expected_head}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::retire_operation(&dir,&herdr_projects::domain::OperationId::new(id).map_err(anyhow::Error::msg)?,expected_revision,expected_head,&reason)?)?),
                 OperationsCommand::Inspect=>println!("{}",serde_json::to_string_pretty(&herdr_projects::migration::open_active(&dir)?.deliveries()?)?),
                 OperationsCommand::ReceiptPlan=>println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::observe_imported_receipts(&dir,None)?)?),
                 OperationsCommand::ObserveImported{expected_head}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::observe_imported_receipts(&dir,Some(expected_head))?)?),

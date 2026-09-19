@@ -197,7 +197,7 @@ fn task_edits_and_projection_recovery_preserve_new_state_and_originals() {
     assert_eq!(current.tasks.iter().find(|t|t.id==id).unwrap().title,"Changed title");
     assert_eq!(read(&project.join("TASKS.md")).unwrap(),original);
     let context=crate::runtime::context(&project).unwrap();assert!(context.contains("Runtime owner: SQLite")&&context.contains("Changed title")&&context.contains("Unverified memory"));
-    assert!(project.join(format!(".state/projections/schema-6-revision-{head}/TASKS.md")).is_file());
+    assert!(project.join(format!(".state/projections/schema-7-revision-{head}/TASKS.md")).is_file());
 }
 #[test]
 fn corrupt_retry_identity_types_and_dates_block_import() {
@@ -212,10 +212,10 @@ fn published_v2_store_upgrades_explicitly_without_losing_migration_identity() {
     // Reproduce the previous released schema: no operation delivery table or
     // receipt count existed. It retains the same published ownership protocol.
     let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();
-    raw.execute_batch("DROP TABLE runtime_observations; DROP TABLE runtime_bindings; DROP TABLE inbox_items; DROP TRIGGER operation_delivery_insert; DROP TABLE operation_delivery; ALTER TABLE migration_receipt DROP COLUMN operation_count; UPDATE store_meta SET schema_version=2; PRAGMA user_version=2;").unwrap();drop(raw);
+    raw.execute_batch("DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; DROP TABLE inbox_items; DROP TRIGGER operation_delivery_insert; DROP TABLE operation_delivery; ALTER TABLE migration_receipt DROP COLUMN operation_count; UPDATE store_meta SET schema_version=2; PRAGMA user_version=2;").unwrap();drop(raw);
     let before=crate::runtime::snapshot(&project).unwrap();
     upgrade_active(&project).unwrap();let mut db=open_active(&project).unwrap();
-    let after=db.read_snapshot(None).unwrap();assert_eq!(after.tasks,before.tasks);assert_eq!(after.head,before.head);assert_eq!(after.schema_version,6);assert!(db.deliveries().unwrap().is_empty());assert_eq!(db.import_operation_count().unwrap(),0);
+    let after=db.read_snapshot(None).unwrap();assert_eq!(after.tasks,before.tasks);assert_eq!(after.head,before.head);assert_eq!(after.schema_version,7);assert!(db.deliveries().unwrap().is_empty());assert_eq!(db.import_operation_count().unwrap(),0);
     drop(db);recover(&project,true).unwrap();
 }
 #[test]
@@ -267,14 +267,14 @@ fn inbox_indentation_conflicts_roll_back_deliveries_and_preserve_bytes() {
 fn schema3_inbox_upgrade_reads_provenance_not_changed_legacy_files() {
     let (_temp,project)=fixture();inbox_source(&project,"one","original",false);
     let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();
-    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE runtime_observations; DROP TABLE runtime_bindings; DROP TABLE inbox_items; UPDATE store_meta SET schema_version=3; PRAGMA user_version=3;").unwrap();drop(raw);
+    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; DROP TABLE inbox_items; UPDATE store_meta SET schema_version=3; PRAGMA user_version=3;").unwrap();drop(raw);
     inbox_source(&project,"one","edited legacy file",false);upgrade_active(&project).unwrap();
     assert_eq!(crate::runtime::snapshot(&project).unwrap().inbox[0].content.body,"original");
 }
 #[test]
 fn old_schema_projection_does_not_conflict_after_inbox_upgrade() {
     let (_temp,project)=fixture();inbox_source(&project,"one","canonical content",false);let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();
-    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE runtime_observations; DROP TABLE runtime_bindings; DROP TABLE inbox_items; UPDATE store_meta SET schema_version=3; PRAGMA user_version=3;").unwrap();drop(raw);
+    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; DROP TABLE inbox_items; UPDATE store_meta SET schema_version=3; PRAGMA user_version=3;").unwrap();drop(raw);
     let old=crate::projections::export(&project,&mut open_active(&project).unwrap()).unwrap();
     let old_view=read(&old.join("inbox.json")).unwrap();upgrade_active(&project).unwrap();let new=crate::projections::export(&project,&mut open_active(&project).unwrap()).unwrap();
     assert_ne!(old,new);assert_eq!(read(&old.join("inbox.json")).unwrap(),old_view);assert!(String::from_utf8(read(&new.join("inbox.json")).unwrap()).unwrap().contains("canonical content"));
@@ -423,7 +423,7 @@ fn runtime_bindings_preserve_recorded_identity_without_granting_ownership() {
 #[test]
 fn runtime_upgrade_uses_provenance_preserves_edits_and_previous_exports() {
     let(_temp,project)=fixture();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();
-    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE runtime_observations; DROP TABLE runtime_bindings; UPDATE store_meta SET schema_version=4; PRAGMA user_version=4;").unwrap();drop(raw);
+    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; UPDATE store_meta SET schema_version=4; PRAGMA user_version=4;").unwrap();drop(raw);
     let before=crate::runtime::snapshot(&project).unwrap();assert!(before.runtime_bindings.is_empty());
     let old=crate::projections::export(&project,&mut open_active(&project).unwrap()).unwrap();let old_bytes=read(&old.join("runtime.json")).unwrap();
     crate::runtime::rename_task(&project,&TaskId::new("legacy-t-0001").unwrap(),"new title".into(),1,before.head).unwrap();
@@ -460,7 +460,7 @@ fn runtime_snapshot_checks_source_bytes_and_missing_links_on_open_connection() {
 #[test]
 fn runtime_upgrade_failure_rolls_back_schema_and_can_be_retried() {
     let(_temp,project)=fixture();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();
-    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE runtime_observations; DROP TABLE runtime_bindings; UPDATE store_meta SET schema_version=4; PRAGMA user_version=4; UPDATE legacy_sources SET bytes=x'00' WHERE kind='thread';").unwrap();
+    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; UPDATE store_meta SET schema_version=4; PRAGMA user_version=4; UPDATE legacy_sources SET bytes=x'00' WHERE kind='thread';").unwrap();
     assert!(upgrade_active(&project).is_err());
     assert_eq!(raw.query_row("PRAGMA user_version",[],|r|r.get::<_,u32>(0)).unwrap(),4);
     assert_eq!(raw.query_row("SELECT count(*) FROM sqlite_master WHERE name='runtime_bindings'",[],|r|r.get::<_,u32>(0)).unwrap(),0);
@@ -521,4 +521,40 @@ fn runtime_rebind_refuses_unselected_lost_attempt_that_retains_capacity() {
     let attempt=Attempt{id:AttemptId::new("unselected-lost").unwrap(),task:task.id.clone(),revision:1,state:AttemptState::Lost,snapshot:None,reservation:"retained".into(),termination_observed:false};
     let head=db.commit(Commit{expected_head:before.head,mutations:vec![Mutation::Attempt{expected:None,next:attempt}]}).unwrap();let before=db.read_snapshot(None).unwrap();
     assert!(db.rebind_runtime("thread:t-0001",1,head,&new_route()).is_err());assert_eq!(db.read_snapshot(None).unwrap(),before);
+}
+
+fn unrecorded_observations(snapshot:&crate::domain::Snapshot,now:i64)->Vec<crate::reconcile::RuntimeObservation> {
+    snapshot.runtime_bindings.iter().map(|b|crate::reconcile::RuntimeObservation{binding:b.id.clone(),binding_revision:b.revision,task_revision:b.task.as_ref().and_then(|id|snapshot.tasks.iter().find(|t|&t.id==id).map(|t|t.revision)),observed_unix_ms:now,pane:crate::reconcile::ResourceState::Unrecorded,worktree:crate::reconcile::ResourceState::Unrecorded,agent_present:false,collector:"herdr-git-v1".into(),config_digest:None,diagnostic:"fixture recorded no resources".into()}).collect()
+}
+#[test]
+fn controller_resume_requires_fresh_evidence_and_pause_fences_epoch() {
+    use crate::domain::ProjectState;
+    let(_temp,project)=fixture();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();assert_eq!(before.control.as_ref().unwrap().state,ProjectState::Paused);
+    assert!(db.set_project_state(before.head,1,ProjectState::Active,100,None).is_err());
+    let head=db.record_observations(before.head,&unrecorded_observations(&before,100)).unwrap();
+    assert!(db.set_project_state(head,1,ProjectState::Active,30_101,None).is_err());
+    assert!(db.set_project_state(head,1,ProjectState::Active,101,Some(&"a".repeat(64))).is_err());
+    let active=db.set_project_state(head,1,ProjectState::Active,101,None).unwrap();assert!(!active.control.reconciliation_required);db.validate_control_epoch(active.control.epoch,None).unwrap();assert!(db.validate_control_epoch(active.control.epoch,Some(&"b".repeat(64))).is_err());
+    publish_control_marker(&project,&db).unwrap();let marker:Format=serde_json::from_slice(&read(&project.join(".state/format.json")).unwrap()).unwrap();assert!(!marker.reconciliation_required);
+    let paused=db.set_project_state(active.head,active.control.revision,ProjectState::Paused,102,None).unwrap();assert!(paused.control.epoch>active.control.epoch);assert!(db.validate_control_epoch(active.control.epoch,None).is_err());publish_control_marker(&project,&db).unwrap();
+    assert_eq!(read(&project.join(".state/project.json")).unwrap(),br#"{"status":"paused"}"#);
+}
+#[test]
+fn interrupted_controller_marker_publication_recovers_forward() {
+    use crate::domain::ProjectState;
+    let(_temp,project)=fixture();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();let head=db.record_observations(before.head,&unrecorded_observations(&before,100)).unwrap();let active=db.set_project_state(head,1,ProjectState::Active,101,None).unwrap();drop(db);
+    // Simulates process death after DB commit and before derived marker rename.
+    assert!(open_active(&project).is_err());recover(&project,true).unwrap();let mut db=open_active(&project).unwrap();assert_eq!(db.read_snapshot(None).unwrap().control,Some(active.control.clone()));
+    let route=new_route();let rebound=db.rebind_runtime("thread:t-0001",1,active.head,&route).unwrap();assert!(open_active(&project).is_err());drop(db);recover(&project,true).unwrap();let after=crate::runtime::snapshot(&project).unwrap();assert_eq!(after.head,rebound.head);assert_eq!(after.control.unwrap().state,ProjectState::Paused);
+}
+#[test]
+fn controller_preserves_archived_state_and_retained_attempts_block_admission() {
+    use crate::domain::{ProjectState,Attempt,AttemptId,AttemptState,Commit,Mutation};
+    let(_temp,project)=fixture();fs::write(project.join(".state/project.json"),br#"{"status":"archived"}"#).unwrap();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();assert_eq!(before.control.as_ref().unwrap().state,ProjectState::Archived);assert!(db.set_project_state(before.head,1,ProjectState::Active,100,None).is_err());
+    let paused=db.set_project_state(before.head,1,ProjectState::Paused,100,None).unwrap();let attempt=Attempt{id:AttemptId::new("lost-unselected").unwrap(),task:TaskId::new("legacy-t-0001").unwrap(),revision:1,state:AttemptState::Lost,snapshot:None,reservation:"held".into(),termination_observed:false};let head=db.commit(Commit{expected_head:paused.head,mutations:vec![Mutation::Attempt{expected:None,next:attempt}]}).unwrap();let snapshot=db.read_snapshot(None).unwrap();let head=db.record_observations(head,&unrecorded_observations(&snapshot,100)).unwrap();assert!(db.set_project_state(head,paused.control.revision,ProjectState::Active,101,None).is_err());assert!(db.read_snapshot(None).unwrap().attempts[0].retains_capacity());
+}
+#[test]
+fn retiring_an_ambiguous_intent_does_not_claim_absence_or_release_resources() {
+    let(_temp,project)=receipt_fixture(false);let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();let op=&before.operations[0];
+    let result=db.retire_operation(&op.id,1,before.head,"superseded by operator",100).unwrap();assert_eq!(result.state,crate::operations::DeliveryState::PermanentFailure);assert!(serde_json::to_string(&result.last_outcome).unwrap().contains("effect remains possible"));assert!(db.retire_operation(&op.id,1,before.head,"stale",101).is_err());let after=db.read_snapshot(None).unwrap();assert_eq!(after.tasks,before.tasks);assert_eq!(after.attempts,before.attempts);assert_eq!(after.operations,before.operations);
 }

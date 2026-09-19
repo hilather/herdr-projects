@@ -1,6 +1,6 @@
 # Runtime observation and reconciliation (partial T03.4)
 
-`reconcile PROJECT` collects a read-only observation batch from schema-v6 runtime
+`reconcile PROJECT` collects a read-only observation batch from schema-v6-or-newer runtime
 bindings. `reconcile PROJECT --record` persists that batch and audit events against
 the exact event head, binding revisions and task revisions observed. Neither form
 launches, prompts, copies, removes, releases capacity or changes lifecycle state.
@@ -28,10 +28,9 @@ observations are not automatically current authorization after state/config chan
 Raw external command output is not stored in the evidence table.
 
 Schema v6 adds hash-checked observation rows and includes them in schema-qualified
-runtime exports. The migration marker stays reconciliation-required and execution
-remains frozen. This increment interleaves the observation dependency of the
+runtime exports. Schema v7 adds the guarded lifecycle control described below. This increment interleaves the observation dependency of the
 remaining W03 adapters; it does not close T03.2, T03.3 or T03.4. Remaining work includes
-resource ownership acquisition, session rebind, attempt termination evidence,
+resource ownership acquisition, attempt termination evidence,
 repair actions, safe adoption/reuse and integrated restart testing.
 
 ## Explicit session rebinding
@@ -59,3 +58,28 @@ the replacement. Original source/session hashes describe import history, not pro
 of ownership of the replacement. Cross-project ownership, adoption and dispatch
 remain separate requirements. A coordinator rebind changes its binding revision;
 future coordinator adapters must fence that revision explicitly.
+
+## Canonical lifecycle control (schema v7)
+
+`runtime PROJECT admission` reports blockers. `runtime PROJECT state
+paused|active|archived --expected-head H --expected-revision R` changes canonical
+control without dual-writing legacy status. Inspect provides the control revision
+and epoch. Restore an archived project to paused before requesting active.
+
+Admission currently requires no existing pane, worktree or remote resource needing
+adoption, no retained attempts or running tasks, no unfinished delivery, and fresh
+matching observations for every binding. Observations must be at most 30 seconds
+old and match the current config fingerprint. Active control pins that fingerprint;
+future effect adapters must additionally check typed safety, scoped authority,
+binding/task revisions and resource ownership. This is not an automatic scheduler.
+
+Pause/archive increment the fence epoch and require reconciliation; they remain
+available if external configuration is malformed. Rebinding also invalidates
+admission. The format marker reflects committed control. A crash between the DB
+commit and marker publication blocks ordinary opens; `migration PROJECT recover`
+republishes the marker from canonical state without discarding committed edits.
+
+`operations PROJECT retire ID --reason TEXT --expected-revision R
+--expected-head H` stops retries of pending or ambiguous intents with an audited
+permanent outcome. An owned claim must expire first. Retirement does not prove
+an earlier effect absent and does not release attempt capacity or resources.
