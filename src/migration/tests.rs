@@ -197,7 +197,7 @@ fn task_edits_and_projection_recovery_preserve_new_state_and_originals() {
     assert_eq!(current.tasks.iter().find(|t|t.id==id).unwrap().title,"Changed title");
     assert_eq!(read(&project.join("TASKS.md")).unwrap(),original);
     let context=crate::runtime::context(&project).unwrap();assert!(context.contains("Runtime owner: SQLite")&&context.contains("Changed title")&&context.contains("Unverified memory"));
-    assert!(project.join(format!(".state/projections/schema-7-revision-{head}/TASKS.md")).is_file());
+    assert!(project.join(format!(".state/projections/schema-8-revision-{head}/TASKS.md")).is_file());
 }
 #[test]
 fn corrupt_retry_identity_types_and_dates_block_import() {
@@ -215,7 +215,7 @@ fn published_v2_store_upgrades_explicitly_without_losing_migration_identity() {
     raw.execute_batch("DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; DROP TABLE inbox_items; DROP TRIGGER operation_delivery_insert; DROP TABLE operation_delivery; ALTER TABLE migration_receipt DROP COLUMN operation_count; UPDATE store_meta SET schema_version=2; PRAGMA user_version=2;").unwrap();drop(raw);
     let before=crate::runtime::snapshot(&project).unwrap();
     upgrade_active(&project).unwrap();let mut db=open_active(&project).unwrap();
-    let after=db.read_snapshot(None).unwrap();assert_eq!(after.tasks,before.tasks);assert_eq!(after.head,before.head);assert_eq!(after.schema_version,7);assert!(db.deliveries().unwrap().is_empty());assert_eq!(db.import_operation_count().unwrap(),0);
+    let after=db.read_snapshot(None).unwrap();assert_eq!(after.tasks,before.tasks);assert_eq!(after.head,before.head);assert_eq!(after.schema_version,8);assert!(db.deliveries().unwrap().is_empty());assert_eq!(db.import_operation_count().unwrap(),0);
     drop(db);recover(&project,true).unwrap();
 }
 #[test]
@@ -557,4 +557,40 @@ fn controller_preserves_archived_state_and_retained_attempts_block_admission() {
 fn retiring_an_ambiguous_intent_does_not_claim_absence_or_release_resources() {
     let(_temp,project)=receipt_fixture(false);let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();let op=&before.operations[0];
     let result=db.retire_operation(&op.id,1,before.head,"superseded by operator",100).unwrap();assert_eq!(result.state,crate::operations::DeliveryState::PermanentFailure);assert!(serde_json::to_string(&result.last_outcome).unwrap().contains("effect remains possible"));assert!(db.retire_operation(&op.id,1,before.head,"stale",101).is_err());let after=db.read_snapshot(None).unwrap();assert_eq!(after.tasks,before.tasks);assert_eq!(after.attempts,before.attempts);assert_eq!(after.operations,before.operations);
+}
+
+#[test]
+fn canonical_runtime_creation_preserves_provenance_and_fences_task_and_control() {
+    use crate::domain::{ProjectState,TaskId};
+    let(_temp,project)=fixture();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();let task=TaskId::new("new-task").unwrap();
+    let before=crate::runtime::snapshot(&project).unwrap();crate::runtime::add_task(&project,task.clone(),"new task".into(),before.head).unwrap();
+    let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();let sources=db.imported_sources().unwrap();
+    let head=db.record_observations(before.head,&unrecorded_observations(&before,100)).unwrap();let active=db.set_project_state(head,1,ProjectState::Active,101,None).unwrap();publish_control_marker(&project,&db).unwrap();
+    assert!(db.create_runtime(Some(&task),Some(2),active.head,&Default::default()).is_err());
+    let created=crate::runtime::create_binding(&project,Some(&task),Some(1),active.head,&new_route()).unwrap();assert_eq!(created.binding.id,"task:new-task");assert!(created.binding.source_path.is_none());assert!(created.binding.source_digest.is_none());assert_eq!(created.task_revision,Some(2));
+    let after=crate::runtime::snapshot(&project).unwrap();assert_eq!(after.control.as_ref().unwrap().state,ProjectState::Paused);assert!(after.control.as_ref().unwrap().epoch>active.control.epoch);assert_eq!(db.imported_sources().unwrap(),sources);assert_eq!(after.runtime_bindings.iter().find(|b|b.source_path.is_some()).unwrap(),&before.runtime_bindings[0]);
+    assert!(db.validate_control_epoch(active.control.epoch,None).is_err());assert!(db.create_runtime(Some(&task),Some(2),after.head,&Default::default()).is_err());assert_eq!(db.read_snapshot(None).unwrap(),after);
+    assert!(db.create_runtime(None,None,after.head,&new_route()).is_err());
+    let coordinator=crate::runtime::create_binding(&project,None,None,after.head,&Default::default()).unwrap();assert_eq!(coordinator.binding.id,"coordinator");
+    drop(db);recover(&project,true).unwrap();assert_eq!(crate::runtime::snapshot(&project).unwrap().runtime_bindings.len(),3);assert!(!project.join("threads/new-task.toml").exists());assert!(!project.join(".state/coordinator.json").exists());
+}
+
+#[test]
+fn canonical_runtime_creation_refuses_unselected_retained_attempts() {
+    use crate::domain::{TaskId,Attempt,AttemptId,AttemptState,Commit,Mutation};
+    let(_temp,project)=fixture();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();let task=TaskId::new("new-task").unwrap();
+    let before=crate::runtime::snapshot(&project).unwrap();let head=crate::runtime::add_task(&project,task.clone(),"new".into(),before.head).unwrap();let mut db=open_active(&project).unwrap();
+    let attempt=Attempt{id:AttemptId::new("lost").unwrap(),task:task.clone(),revision:1,state:AttemptState::Lost,snapshot:None,reservation:"held".into(),termination_observed:false};let head=db.commit(Commit{expected_head:head,mutations:vec![Mutation::Attempt{expected:None,next:attempt}]}).unwrap();let before=db.read_snapshot(None).unwrap();
+    assert!(db.create_runtime(Some(&task),Some(1),head,&Default::default()).is_err());assert_eq!(db.read_snapshot(None).unwrap(),before);
+    assert!(db.create_runtime(None,Some(1),head,&Default::default()).is_err());assert!(db.create_runtime(Some(&task),None,head,&Default::default()).is_err());
+}
+
+#[test]
+fn schema8_upgrade_preserves_observation_foreign_keys_and_import_hashes() {
+    let(_temp,project)=fixture();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();db.record_observations(before.head,&unrecorded_observations(&before,100)).unwrap();let before=db.read_snapshot(None).unwrap();drop(db);
+    // Reconstruct schema7's NOT NULL parent with its live observation child.
+    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("PRAGMA foreign_keys=OFF; BEGIN; CREATE TABLE old_bindings (id TEXT PRIMARY KEY NOT NULL,task_id TEXT REFERENCES tasks(id),revision INTEGER NOT NULL CHECK(revision>0),source_path TEXT NOT NULL UNIQUE REFERENCES legacy_sources(path),payload TEXT NOT NULL CHECK(json_valid(payload)),payload_hash TEXT NOT NULL CHECK(length(payload_hash)=64)) STRICT; INSERT INTO old_bindings SELECT * FROM runtime_bindings; DROP TABLE runtime_bindings; ALTER TABLE old_bindings RENAME TO runtime_bindings; UPDATE store_meta SET schema_version=7; PRAGMA user_version=7; COMMIT;").unwrap();drop(raw);
+    let mut db=open_active(&project).unwrap();let mut expected=before.clone();expected.schema_version=7;assert_eq!(db.read_snapshot(None).unwrap(),expected);assert!(db.create_runtime(None,None,before.head,&Default::default()).is_err());drop(db);
+    upgrade_active(&project).unwrap();let mut db=open_active(&project).unwrap();assert_eq!(db.read_snapshot(None).unwrap(),before);db.integrity_check().unwrap();db.upgrade_v1().unwrap();assert_eq!(db.read_snapshot(None).unwrap(),before);
+    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("PRAGMA foreign_keys=ON;").unwrap();assert!(raw.execute("DELETE FROM runtime_bindings",[]).is_err());
 }

@@ -352,3 +352,22 @@ all-feature suites pass 312 tests (68 library, 222 binary, 20 CLI, 2 contracts),
 three live fixtures opt-in. Default-feature tests and release build also pass.
 Logs: `/tmp/herdr-control-final-debug.log`, `/tmp/herdr-control-release.log`,
 `/tmp/herdr-control-legacy.log`, `/tmp/herdr-control-build.log`.
+
+## Canonical runtime creation without legacy files
+
+Schema v8 permits null import provenance for newly registered coordinator/task
+bindings. Imported payloads retain their original serialization and source hashes;
+the transactional upgrade preserves observations and foreign keys. `runtime create`
+uses expected head/task revision, refuses retained attempts and duplicate references,
+increments the linked task revision and invalidates control. No external resource
+is launched or adopted. Existing imported bindings use rebind instead.
+
+Independent review approved the change after the fresh-import schema check was
+updated to the shared current version. Four added migration/CLI regressions cover
+provenance, task/control fencing, retained attempts and schema-v7 observation
+preservation. All-feature debug/release suites pass 316 tests (71 library, 222 binary,
+21 CLI, 2 contracts); three live fixtures remain opt-in. Default tests and release
+build pass. Logs: `/tmp/herdr-canonical-runtime-debug.log`,
+`/tmp/herdr-canonical-runtime-release.log`, `/tmp/herdr-canonical-runtime-legacy.log`,
+`/tmp/herdr-canonical-runtime-build.log`. W03 remains partial: actual notification/
+finalization adapters, resource ownership and integrated restart acceptance remain.

@@ -31,8 +31,9 @@ pub struct RuntimeBinding {
     pub task:Option<TaskId>,
     /// Revision of this runtime record, not the task or legacy lifecycle generation.
     pub revision:u64,
-    pub source_path:String,
-    pub source_digest:String,
+    /// None for records created canonically after cutover.
+    pub source_path:Option<String>,
+    pub source_digest:Option<String>,
     /// Original imported session provenance; later route edits are audited separately.
     pub session_source_digest:Option<String>,
     pub verification:RuntimeVerification,

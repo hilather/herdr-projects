@@ -375,6 +375,8 @@ enum OperationsCommand { Inspect,
 #[derive(Subcommand)]
 enum RuntimeCommand {
     Inspect,
+    /// Register a new coordinator (no task) or task binding; does not adopt resources
+    Create { #[arg(long,requires="task_revision")] task:Option<String>, #[arg(long,requires="task")] task_revision:Option<u64>, #[arg(long)] route:PathBuf, #[arg(long)] expected_head:u64 },
     Admission,
     /// Set canonical lifecycle state; resume requires current reconciliation evidence
     State { #[arg(value_parser=["paused","active","archived"])] state:String, #[arg(long)] expected_revision:u64, #[arg(long)] expected_head:u64 },
@@ -406,6 +408,12 @@ pub fn run() -> Result<()> {
             project::validate_slug(&slug)?;let dir=ctx.root.join(slug);
             match command {
                 RuntimeCommand::Inspect=>{let snapshot=herdr_projects::runtime::snapshot(&dir)?;anyhow::ensure!(snapshot.schema_version>=5,"upgrade-store is required for runtime bindings");println!("{}",serde_json::to_string_pretty(&serde_json::json!({"head":snapshot.head,"bindings":snapshot.runtime_bindings,"observations":snapshot.observations,"control":snapshot.control}))?);},
+                RuntimeCommand::Create{task,task_revision,route,expected_head}=>{
+                    let task=task.map(herdr_projects::domain::TaskId::new).transpose().map_err(anyhow::Error::msg)?;
+                    let bytes=herdr_projects::migration::read_plan_file(&route)?;
+                    let route=serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid runtime route JSON (contents withheld)"))?;
+                    println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::create_binding(&dir,task.as_ref(),task_revision,expected_head,&route)?)?);
+                },
                 RuntimeCommand::Admission=>println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::admission(&dir,&std::path::absolute(ctx.config_dir.join("config.toml"))?)?)?),
                 RuntimeCommand::State{state,expected_revision,expected_head}=>{
                     use herdr_projects::domain::ProjectState;

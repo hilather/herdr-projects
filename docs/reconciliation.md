@@ -83,3 +83,17 @@ republishes the marker from canonical state without discarding committed edits.
 --expected-head H` stops retries of pending or ambiguous intents with an audited
 permanent outcome. An owned claim must expire first. Retirement does not prove
 an earlier effect absent and does not release attempt capacity or resources.
+
+## New canonical runtime records (schema v8)
+
+`runtime PROJECT create --route route.json --expected-head H` creates a coordinator
+record. Add `--task TASK --task-revision R` to create a task binding. Use `{}` for a
+route with no resources; route fields follow the rebind rules above. This command
+registers an unverified record only: it does not launch or adopt a pane/worktree.
+Existing imported bindings must be rebound instead of duplicated.
+
+Creation fences the head and task revision, refuses retained attempts or duplicate
+pane references, increments the linked task revision, and invalidates admission.
+New bindings have null import provenance. Imported bindings retain their original
+source hashes; legacy files are neither invented nor dual-written. The explicit
+schema-v8 upgrade preserves existing binding bytes, observations and foreign keys.

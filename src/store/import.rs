@@ -26,6 +26,7 @@ impl SqliteStore {
         }
         if version<=5 {tx.execute_batch(include_str!("../../migrations/0006_runtime_observations.sql"))?;}
         if version<=6 {tx.execute_batch(include_str!("../../migrations/0007_project_control.sql"))?;super::control::import_status(&tx)?;}
+        if version<=7 {tx.execute_batch(include_str!("../../migrations/0008_canonical_runtime.sql"))?;}
         tx.commit()?;
         Ok(())
     }
@@ -39,7 +40,7 @@ impl SqliteStore {
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         check_schema(&tx)?;
         let version: u32 = tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
-        if version != 7 { return Err(StoreError::UnsupportedSchema(version)); }
+        if version != SCHEMA { return Err(StoreError::UnsupportedSchema(version)); }
         let occupied: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM tasks UNION ALL SELECT 1 FROM events UNION ALL SELECT 1 FROM migration_receipt UNION ALL SELECT 1 FROM legacy_sources)",[],|r|r.get(0))?;
         if occupied { return Err(StoreError::Conflict); }
         for source in sources {

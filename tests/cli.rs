@@ -365,3 +365,14 @@ fn canonical_lifecycle_cli_does_not_dual_write_legacy_status() {
     }
     assert_eq!(std::fs::read(project.join(".state/project.json")).unwrap(),legacy);assert!(hp(home.path(),&["--root",root_arg,"migration","demo","recover","--writers-stopped"]).status.success());
 }
+
+#[test]
+#[cfg(feature="state-store")]
+fn canonical_runtime_create_cli_requires_task_fences_and_does_not_forge_legacy_files() {
+    let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
+    for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
+    let project=root.join("demo");let plan=herdr_projects::migration::inspect(&project).unwrap();herdr_projects::migration::apply(&project,&plan,true).unwrap();let task=herdr_projects::domain::TaskId::new("created").unwrap();let before=herdr_projects::runtime::snapshot(&project).unwrap();let head=herdr_projects::runtime::add_task(&project,task,"created task".into(),before.head).unwrap().to_string();
+    let route=home.path().join("route.json");std::fs::write(&route,b"{}").unwrap();
+    let args=["--root",root_arg,"runtime","demo","create","--task","created","--task-revision","1","--expected-head",&head,"--route",route.to_str().unwrap()];let out=hp(home.path(),&args);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));let result:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();assert_eq!(result["binding"]["id"],"task:created");assert!(result["binding"]["source_path"].is_null());assert_eq!(result["task_revision"],2);assert!(!hp(home.path(),&args).status.success());assert!(!project.join("threads/created.toml").exists());
+    let head=result["head"].to_string();let out=hp(home.path(),&["--root",root_arg,"runtime","demo","create","--expected-head",&head,"--route",route.to_str().unwrap()]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));assert_eq!(serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["binding"]["id"],"coordinator");assert!(!project.join(".state/coordinator.json").exists());
+}

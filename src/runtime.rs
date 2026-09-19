@@ -90,3 +90,11 @@ pub fn retire_operation(project:&Path,id:&crate::domain::OperationId,revision:u6
     let _maintenance=migration::maintenance(project)?;
     Ok(migration::open_active(project)?.retire_operation(id,revision,head,reason,jiff::Timestamp::now().as_millisecond())?)
 }
+
+pub fn create_binding(project:&Path,task:Option<&TaskId>,task_revision:Option<u64>,expected_head:u64,route:&crate::domain::RuntimeRoute)->Result<crate::domain::RouteChange> {
+    let _maintenance=migration::maintenance(project)?;
+    let mut db=migration::open_active(project)?;
+    let change=db.create_runtime(task,task_revision,expected_head,route)?;
+    migration::publish_control_marker(project,&db)?;
+    Ok(change)
+}
