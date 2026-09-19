@@ -33,3 +33,29 @@ remains frozen. This increment interleaves the observation dependency of the
 remaining W03 adapters; it does not close T03.2, T03.3 or T03.4. Remaining work includes
 resource ownership acquisition, session rebind, attempt termination evidence,
 repair actions, safe adoption/reuse and integrated restart testing.
+
+## Explicit session rebinding
+
+`runtime PROJECT inspect` shows current bindings and observations. To replace an
+imported session route, write a JSON object containing `machine`, `socket`,
+`workspace_id`, `tab_id`, `pane_id` and `cwd`, then run:
+
+```sh
+herdr-projects runtime demo rebind thread:t-0001 --route route.json \
+  --expected-revision 1 --expected-head 42
+```
+
+Omitted route fields are empty, so supply the complete intended replacement.
+A nonempty pane requires an absolute socket/cwd plus workspace and tab identities.
+The update requires the current head and binding revision, rejects duplicate pane
+references within the project, clears prior observations, and increments a linked
+task's revision so old claims/results cannot commit against the changed routing.
+It refuses every retained attempt for the task, including lost attempts that are
+not selected by `active_attempt`. No attempt or reservation is removed.
+
+Rebinding retains immutable import provenance and legacy files. Its new routing
+is unverified, the old execution fingerprint is cleared, and the event records
+the replacement. Original source/session hashes describe import history, not proof
+of ownership of the replacement. Cross-project ownership, adoption and dispatch
+remain separate requirements. A coordinator rebind changes its binding revision;
+future coordinator adapters must fence that revision explicitly.

@@ -103,4 +103,4 @@ pub struct Commit {
 mod inbox;
 pub use inbox::{InboxContent,InboxItem};
 mod runtime;
-pub use runtime::{RuntimeBinding,RuntimeIdentity,RuntimeVerification};
+pub use runtime::{RuntimeBinding,RuntimeIdentity,RuntimeVerification,RuntimeRoute,RouteChange};

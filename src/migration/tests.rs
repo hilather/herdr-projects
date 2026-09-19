@@ -484,3 +484,41 @@ fn reconciliation_observations_are_atomic_fenced_and_never_release_capacity() {
     let changed=db.commit(crate::domain::Commit{expected_head:head,mutations:vec![crate::domain::Mutation::Task{expected:Some(1),next:task}]}).unwrap();
     assert!(db.record_observations(changed,&[observation]).is_err());
 }
+
+fn new_route()->crate::domain::RuntimeRoute {
+    crate::domain::RuntimeRoute{socket:"/new/session.sock".into(),workspace_id:"w".into(),tab_id:"t".into(),pane_id:"p".into(),cwd:"/worktree".into(),..Default::default()}
+}
+#[test]
+fn runtime_rebind_invalidates_observations_claims_and_original_task_revision() {
+    use crate::{operations::Outcome,reconcile::{RuntimeObservation,ResourceState}};
+    let(_temp,project)=receipt_fixture(true);let original=read(&project.join("threads/t-0001.toml")).unwrap();let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();
+    let op=before.operations.iter().find(|o|o.kind=="legacy.finalize").unwrap();
+    let pending=db.observe_operation(&op.id,1,"test",Outcome::Retryable{no_effect_evidence:"test fixture".into()},0).unwrap();let claim=db.claim_operation(&op.id,pending.revision,"test",pending.next_due_ms,1000).unwrap();
+    let head=db.read_snapshot(None).unwrap().head;
+    let observation=RuntimeObservation{binding:"thread:t-0001".into(),binding_revision:1,task_revision:Some(1),observed_unix_ms:100,pane:ResourceState::Unrecorded,worktree:ResourceState::Unrecorded,agent_present:false,collector:"herdr-git-v1".into(),config_digest:None,diagnostic:"fixture".into()};
+    let head=db.record_observations(head,&[observation.clone()]).unwrap();
+    let change=db.rebind_runtime("thread:t-0001",1,head,&new_route()).unwrap();assert_eq!(change.binding.revision,2);assert_eq!(change.task_revision,Some(2));assert!(change.binding.identity.execution_fingerprint.is_none());assert_eq!(change.binding.verification,crate::domain::RuntimeVerification::Unverified);
+    let snapshot=db.read_snapshot(None).unwrap();assert!(snapshot.observations.is_empty());assert_eq!(snapshot.operations,before.operations);
+    assert!(db.finish_operation(&claim,Outcome::Confirmed{observed_identity:"stale".into()},pending.next_due_ms+1).is_err());assert!(db.record_observations(change.head,&[observation]).is_err());
+    assert!(db.rebind_runtime("thread:t-0001",1,head,&new_route()).is_err());assert_eq!(db.rebind_runtime("thread:t-0001",2,change.head,&new_route()).unwrap().head,change.head);
+    drop(db);recover(&project,true).unwrap();assert_eq!(crate::runtime::snapshot(&project).unwrap().runtime_bindings[0],change.binding);assert_eq!(read(&project.join("threads/t-0001.toml")).unwrap(),original);
+}
+#[test]
+fn runtime_rebind_refuses_active_attempt_and_duplicate_pane_without_partial_mutation() {
+    use crate::domain::{Commit,Mutation,Attempt,AttemptId,AttemptState};
+    let(_temp,project)=fixture();fs::write(project.join("threads/t-2.toml"),"id='t-2'\nstatus='resolved'\n").unwrap();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();
+    let changed=db.rebind_runtime("thread:t-2",1,before.head,&new_route()).unwrap();let before=db.read_snapshot(None).unwrap();assert!(db.rebind_runtime("thread:t-0001",1,changed.head,&new_route()).is_err());assert_eq!(db.read_snapshot(None).unwrap(),before);
+    let mut task=before.tasks.iter().find(|t|t.id.as_str()=="legacy-t-0001").unwrap().clone();let attempt=Attempt{id:AttemptId::new("lost").unwrap(),task:task.id.clone(),revision:1,state:AttemptState::Lost,snapshot:None,reservation:"must-retain".into(),termination_observed:false};task.revision+=1;task.active_attempt=Some(attempt.id.clone());
+    let head=db.commit(Commit{expected_head:before.head,mutations:vec![Mutation::Task{expected:Some(1),next:task},Mutation::Attempt{expected:None,next:attempt}]}).unwrap();let before=db.read_snapshot(None).unwrap();
+    assert!(db.rebind_runtime("thread:t-0001",1,head,&Default::default()).is_err());assert_eq!(db.read_snapshot(None).unwrap(),before);assert!(before.attempts[0].retains_capacity());
+}
+
+#[test]
+fn runtime_rebind_refuses_unselected_lost_attempt_that_retains_capacity() {
+    use crate::domain::{Commit,Mutation,Attempt,AttemptId,AttemptState};
+    let(_temp,project)=fixture();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();
+    let task=before.tasks.iter().find(|t|t.id.as_str()=="legacy-t-0001").unwrap();assert!(task.active_attempt.is_none());
+    let attempt=Attempt{id:AttemptId::new("unselected-lost").unwrap(),task:task.id.clone(),revision:1,state:AttemptState::Lost,snapshot:None,reservation:"retained".into(),termination_observed:false};
+    let head=db.commit(Commit{expected_head:before.head,mutations:vec![Mutation::Attempt{expected:None,next:attempt}]}).unwrap();let before=db.read_snapshot(None).unwrap();
+    assert!(db.rebind_runtime("thread:t-0001",1,head,&new_route()).is_err());assert_eq!(db.read_snapshot(None).unwrap(),before);
+}

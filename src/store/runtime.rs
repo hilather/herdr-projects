@@ -62,3 +62,45 @@ pub(super) fn read_all(db:&Connection)->Result<Vec<RuntimeBinding>> {
     if bindings.len() as u64!=expected {return Err(StoreError::Corrupt("runtime binding inventory mismatch".into()));}
     Ok(bindings)
 }
+
+impl SqliteStore {
+    /// Rebinding is an explicit operator mutation. It clears observations and
+    /// invalidates task-bound intents but never terminates or adopts a resource.
+    pub fn rebind_runtime(&mut self,id:&str,expected_revision:u64,expected_head:u64,route:&RuntimeRoute)->Result<RouteChange> {
+        route.validate().map_err(StoreError::Invalid)?;
+        let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;check_schema(&tx)?;
+        let schema:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
+        if schema<6{return Err(StoreError::UnsupportedSchema(schema));}
+        if head(&tx)?!=expected_head {return Err(StoreError::Conflict);}
+        let bindings=read_all(&tx)?;
+        let mut binding=bindings.iter().find(|b|b.id==id).cloned().ok_or(StoreError::Conflict)?;
+        if binding.revision!=expected_revision{return Err(StoreError::Conflict);}
+        let task=binding.task.as_ref().map(|id|read_tasks(&tx)?.into_iter().find(|t|&t.id==id).ok_or(StoreError::Conflict)).transpose()?;
+        if task.as_ref().is_some_and(|t|t.active_attempt.is_some()||t.state==TaskState::Running) {return Err(StoreError::Invalid("reconcile active attempts before rebinding".into()));}
+        if let Some(task)=&task {
+            let unresolved:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE task_id=?1 AND termination_observed=0)",[task.id.as_str()],|r|r.get(0))?;
+            if unresolved{return Err(StoreError::Invalid("reconcile every retained attempt before rebinding".into()));}
+        }
+        if RuntimeRoute::from_identity(&binding.identity)==*route {
+            return Ok(RouteChange{head:expected_head,binding,task_revision:task.map(|t|t.revision)});
+        }
+        if !route.pane_id.is_empty() && bindings.iter().any(|other|other.id!=id && other.identity.socket==route.socket && other.identity.machine==route.machine && other.identity.pane_id==route.pane_id) {
+            return Err(StoreError::Invalid("pane already referenced by another binding in this project".into()));
+        }
+        binding.revision=binding.revision.checked_add(1).ok_or_else(||StoreError::Invalid("binding revision exhausted".into()))?;
+        binding.verification=RuntimeVerification::Unverified;
+        let identity=&mut binding.identity;
+        identity.machine=route.machine.clone();identity.socket=route.socket.clone();identity.workspace_id=route.workspace_id.clone();identity.tab_id=route.tab_id.clone();identity.pane_id=route.pane_id.clone();identity.cwd=route.cwd.clone();identity.execution_fingerprint=None;
+        let payload=serde_json::to_string(&binding).map_err(|e|StoreError::Invalid(e.to_string()))?;
+        tx.execute("UPDATE runtime_bindings SET revision=?2,payload=?3,payload_hash=?4 WHERE id=?1",params![id,integer(binding.revision)?,payload,format!("{:x}",Sha256::digest(payload.as_bytes()))])?;
+        tx.execute("DELETE FROM runtime_observations WHERE binding_id=?1",[id])?;
+        tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.rebound',?1,?2,1,?3)",params![id,integer(binding.revision)?,payload])?;
+        let task_revision=if let Some(mut task)=task {
+            task.revision=task.revision.checked_add(1).ok_or_else(||StoreError::Invalid("task revision exhausted".into()))?;
+            tx.execute("UPDATE tasks SET revision=?2 WHERE id=?1",params![task.id.as_str(),integer(task.revision)?])?;
+            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('task.changed',?1,?2,1,?3)",params![task.id.as_str(),integer(task.revision)?,serde_json::to_string(&task).map_err(|e|StoreError::Invalid(e.to_string()))?])?;
+            Some(task.revision)
+        }else{None};
+        let result=RouteChange{head:head(&tx)?,binding,task_revision};tx.commit()?;Ok(result)
+    }
+}

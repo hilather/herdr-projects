@@ -316,3 +316,21 @@ release build pass. Three live fixtures remain opt-in. Logs:
 `/tmp/herdr-reconcile-final-debug.log`, `/tmp/herdr-reconcile-release.log`,
 `/tmp/herdr-reconcile-legacy.log`, `/tmp/herdr-reconcile-build.log`.
 `git diff --check` passes. macOS and live ownership acquisition remain untested.
+
+## Explicit runtime session rebinding
+
+The `runtime inspect/rebind` commands add controlled routing replacement under
+maintenance, event-head and binding-revision checks. Rebind clears stale
+observations, bumps the linked task revision, invalidates the old execution
+fingerprint and leaves ownership unverified. It does not modify legacy files or
+release reservations. Independent review found an unselected lost-attempt case;
+the guard now checks every task attempt with unobserved termination, not just the
+active pointer. Re-review approved that fix. Fixtures cover stale claims, recovery,
+legacy-byte preservation, duplicate pane references, selected/unselected retained
+attempts and the CLI workflow.
+
+Validation: 306 tests pass serially in debug and release (63 library, 222 binary,
+19 CLI, two contracts); 227 default-feature tests and the all-feature release build
+pass. Three live fixtures remain opt-in. Logs: `/tmp/herdr-rebind-final-debug.log`,
+`/tmp/herdr-rebind-release.log`, `/tmp/herdr-rebind-legacy.log`,
+`/tmp/herdr-rebind-build.log`. `git diff --check` passes.

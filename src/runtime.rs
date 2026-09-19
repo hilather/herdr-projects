@@ -62,3 +62,8 @@ pub fn record_observations(project:&Path,batch:&crate::reconcile::ObservationBat
     let _maintenance=migration::maintenance(project)?;
     Ok(migration::open_active(project)?.record_observations(batch.expected_head,&batch.observations)?)
 }
+
+pub fn rebind(project:&Path,id:&str,expected_revision:u64,expected_head:u64,route:&crate::domain::RuntimeRoute)->Result<crate::domain::RouteChange> {
+    let _maintenance=migration::maintenance(project)?;
+    Ok(migration::open_active(project)?.rebind_runtime(id,expected_revision,expected_head,route)?)
+}

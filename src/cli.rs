@@ -54,6 +54,9 @@ enum RepairCommand {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect or explicitly rebind migrated runtime routing without granting ownership
+    #[cfg(feature="state-store")]
+    Runtime { slug:String, #[command(subcommand)] command:RuntimeCommand },
     /// Observe recorded runtime identities; --record persists evidence without dispatch
     #[cfg(feature="state-store")]
     Reconcile { slug:String, #[arg(long)] record:bool },
@@ -366,6 +369,14 @@ enum OperationsCommand { Inspect,
     DrainInbox { #[arg(long)] expected_head:u64 },
 }
 
+#[cfg(feature="state-store")]
+#[derive(Subcommand)]
+enum RuntimeCommand {
+    Inspect,
+    /// Read replacement routing JSON; require the exact binding revision and event head
+    Rebind { id:String, #[arg(long)] route:PathBuf, #[arg(long)] expected_revision:u64, #[arg(long)] expected_head:u64 },
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     if let Command::ArtifactStream { probe, path } = &cli.command {
@@ -385,6 +396,19 @@ pub fn run() -> Result<()> {
     };
 
     match cli.command {
+        #[cfg(feature="state-store")]
+        Command::Runtime{slug,command}=>{
+            project::validate_slug(&slug)?;let dir=ctx.root.join(slug);
+            match command {
+                RuntimeCommand::Inspect=>{let snapshot=herdr_projects::runtime::snapshot(&dir)?;anyhow::ensure!(snapshot.schema_version>=5,"upgrade-store is required for runtime bindings");println!("{}",serde_json::to_string_pretty(&serde_json::json!({"head":snapshot.head,"bindings":snapshot.runtime_bindings,"observations":snapshot.observations}))?);},
+                RuntimeCommand::Rebind{id,route,expected_revision,expected_head}=>{
+                    let bytes=herdr_projects::migration::read_plan_file(&route)?;
+                    let route=serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid runtime route JSON (contents withheld)"))?;
+                    println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::rebind(&dir,&id,expected_revision,expected_head,&route)?)?);
+                },
+            }
+            Ok(())
+        },
         #[cfg(feature="state-store")]
         Command::Reconcile{slug,record}=>{
             project::validate_slug(&slug)?;
