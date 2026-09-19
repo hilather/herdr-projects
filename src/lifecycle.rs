@@ -33,8 +33,9 @@ fn alive_panes(project: &Project, view: &SessionView) -> Vec<(String, String, St
 pub fn set_status(ctx: &Ctx, slug: &str, status: Status) -> Result<()> {
     let _lease = crate::cleanup::lease(&ctx.root)?;
     let project = Project::load(&ctx.root, slug)?;
-    let current = project.status();
+    let current = project.try_status()?;
     match (current, status) {
+        (Status::Invalid, _) | (_, Status::Invalid) => bail!("repair the project lifecycle record before changing status"),
         (Status::Archived, Status::Paused) => bail!("`{slug}` is archived; `unarchive` it first"),
         (Status::Archived, Status::Active) | (_, Status::Archived) | (_, Status::Paused) | (Status::Paused, Status::Active) | (Status::Active, Status::Active) => {}
     }
@@ -59,7 +60,8 @@ pub fn set_status(ctx: &Ctx, slug: &str, status: Status) -> Result<()> {
                 }
             }
         }
-        Status::Active => {}
+        Status::Active => {},
+        Status::Invalid => unreachable!("invalid lifecycle state refused above"),
     }
     Ok(())
 }

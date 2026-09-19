@@ -145,6 +145,7 @@ fn report(
             continue;
         };
         let label = format!("project {slug}");
+        if let Err(error) = project.try_status() { check(&mut out, Some(false), &label, format!("lifecycle record: {error:#}")); }
         for diagnostic in crate::thread::list_with_diagnostics(&project).1 {
             check(&mut out, Some(false), &label, format!("thread record: {diagnostic}; preserve and repair the file"));
         }

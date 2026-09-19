@@ -126,3 +126,26 @@ fn native_artifact_helper_needs_no_configuration_and_preserves_large_binary_payl
     std::os::unix::fs::symlink("report.md", path.join("library")).unwrap();
     assert!(!Command::new(BIN).env_clear().args(["artifact-stream", "--path", path.to_str().unwrap()]).output().unwrap().status.success());
 }
+
+#[test]
+fn corrupted_project_lifecycle_is_visible_and_cannot_authorize_execution() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let r = root.to_str().unwrap();
+    assert!(hp(home.path(), &["--root", r, "new", "demo"]).status.success());
+    let target = root.join("demo/.state/project.json");
+    for broken in ["{corrupt", "{}", r#"{"status":"future-state"}"#] {
+        std::fs::write(&target, broken).unwrap();
+        let listed = hp(home.path(), &["--root", r, "list"]);
+        assert!(String::from_utf8_lossy(&listed.stdout).contains("invalid"));
+        assert!(!hp(home.path(), &["--root", r, "open", "demo"]).status.success());
+        assert!(!hp(home.path(), &["--root", r, "resume", "demo"]).status.success());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), broken);
+        let diagnostics: serde_json::Value = serde_json::from_slice(&hp(home.path(), &["--root", r, "repair", "demo", "inspect"]).stdout).unwrap();
+        assert_eq!(diagnostics[0]["path"], ".state/project.json");
+        let replacement = home.path().join("replacement.json");
+        std::fs::write(&replacement, r#"{"status":"paused"}"#).unwrap();
+        assert!(hp(home.path(), &["--root", r, "repair", "demo", "restore", ".state/project.json", "--from", replacement.to_str().unwrap(), "--expected-hash", diagnostics[0]["sha256"].as_str().unwrap()]).status.success());
+        assert!(String::from_utf8_lossy(&hp(home.path(), &["--root", r, "list"]).stdout).contains("paused"));
+    }
+}

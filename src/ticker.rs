@@ -476,6 +476,7 @@ fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
 /// state is read, so nothing is ever reported as gone.
 fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
     let _lease = crate::cleanup::lease(&ctx.root)?;
+    if project.try_status()? != Status::Active { return Ok(None); }
     let Some(record) = project.coordinator() else {
         return Ok(None);
     };
@@ -588,6 +589,7 @@ fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threa
 /// routines, auto-resolve and housekeeping.
 fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> Vec<anyhow::Error> {
     let _lease = match crate::cleanup::lease(&ctx.root) { Ok(lease) => lease, Err(error) => return vec![error] };
+    match project.try_status() { Ok(Status::Active) => {}, Ok(_) => return Vec::new(), Err(error) => return vec![error] }
     let mut errors = Vec::new();
     let mut state = match steps::try_load_state(project) {
         Ok(state) => state,
@@ -798,6 +800,32 @@ mod tests {
 
     fn with_cwd(json: &str, fixture: &Fixture) -> String {
         json.replace("CWD", &fixture.project.dir().to_string_lossy())
+    }
+
+    #[test]
+    fn inactive_status_is_rechecked_inside_each_pass_lease() {
+        for status in [Status::Paused, Status::Archived] {
+            let f = fixture(true);
+            let runner = FakeRunner::new();
+            runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
+            runner.on("pane list", ok(&with_cwd(PANE, &f)));
+            runner.on("report-metadata", ok("{}"));
+            runner.on("agent start", ok(r#"{"result":{}}"#));
+            let ctx = Ctx { env: &f.env, root: f.root.clone(), config_dir: f.root.join("cfg"), runner: &runner, detached_ticker: false };
+            f.project.set_status(status).unwrap();
+            assert!(tick_cheap(&ctx, &f.project).unwrap().is_none());
+            assert!(runner.calls.borrow().is_empty());
+            f.project.set_status(Status::Active).unwrap();
+            let seen = tick_cheap(&ctx, &f.project).unwrap().unwrap();
+            let calls = runner.calls.borrow().len();
+            // A user pause/archive completes after cheap observations but before
+            // the slow pass obtains its lease and could start the coordinator.
+            f.project.set_status(status).unwrap();
+            assert!(tick_slow(&ctx, &f.project, &seen, &mut Memory::new(&ctx)).is_empty());
+            assert_eq!(runner.calls.borrow().len(), calls);
+            assert_eq!(runner.count("agent start"), 0);
+            assert!(f.project.coordinator().unwrap().prime_pending);
+        }
     }
 
     #[test]

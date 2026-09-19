@@ -149,6 +149,9 @@ pub enum Status {
     Active,
     Paused,
     Archived,
+    /// Unreadable or malformed persisted lifecycle state; never permits launch.
+    #[serde(skip)]
+    Invalid,
 }
 
 impl std::fmt::Display for Status {
@@ -157,13 +160,13 @@ impl std::fmt::Display for Status {
             Status::Active => "active",
             Status::Paused => "paused",
             Status::Archived => "archived",
+            Status::Invalid => "invalid (repair .state/project.json)",
         })
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(default)]
-struct ProjectState {
+pub(crate) struct ProjectState {
     status: Status,
 }
 
@@ -272,14 +275,29 @@ impl Project {
         parse_project_md(&text)
     }
 
-    pub fn status(&self) -> Status {
-        read_json::<ProjectState>(&self.state_dir().join("project.json"))
-            .unwrap_or_default()
-            .status
+    pub fn status(&self) -> Status { self.try_status().unwrap_or(Status::Invalid) }
+
+    pub fn try_status(&self) -> Result<Status> {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = self.state_dir().join("project.json");
+        let file = match File::options().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Status::Active), // legacy default
+            Err(error) => return Err(error).with_context(|| format!("cannot read {}; preserve and repair it", path.display())),
+        };
+        anyhow::ensure!(file.metadata()?.is_file(), "{} is not a regular lifecycle record", path.display());
+        let mut bytes = Vec::new();
+        file.take(65_537).read_to_end(&mut bytes)?;
+        anyhow::ensure!(bytes.len() <= 65_536, "{} exceeds lifecycle record limit", path.display());
+        let record: ProjectState = serde_json::from_slice(&bytes).with_context(|| format!("{} is invalid; preserve and repair it before resuming", path.display()))?;
+        Ok(record.status)
     }
 
     pub fn set_status(&self, status: Status) -> Result<()> {
         let _lock = self.lock()?;
+        self.try_status()?; // ordinary lifecycle commands must not erase corruption
+        anyhow::ensure!(status != Status::Invalid, "invalid is a diagnostic, not a writable status");
         write_json(&self.state_dir().join("project.json"), &ProjectState { status })
     }
 

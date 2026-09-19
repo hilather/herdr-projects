@@ -97,14 +97,33 @@ not release artifacts; the commands and fixture sources above are reproducible.
 Remote and non-Linux destructive cleanup remain explicitly unsupported. The
 checkpoint assumes cooperative same-user agents and stopped known writers; it
 cannot contain hostile same-privilege processes or see managed state in other
-roots. Live SSH, interactive popup delivery, macOS and independent review remain
-Phase A acceptance requirements. Snapshot/repair-backup retention is manual.
+roots. The subsequent [Phase A acceptance evidence](phase-a-acceptance.md) records
+live Linux SSH, popup, lifecycle and independent-review results. macOS and the
+remaining supported platform/agent matrix are still untested. Snapshot/repair-backup retention is manual.
 Plain resolution retains the worktree unless cleanup is explicitly requested.
 No force fallback, automatic merge/push or production data migration is introduced.
 
 ## Next work
 
-[Task ledger](task-status.md): twelve locally implemented cards, 29 not started.
-Complete the outstanding Phase A acceptance evidence before the W03 store/migration
-wave. Proposed memory change: record native transport v1, cooperative checkpoint,
+[Task ledger](task-status.md): thirteen locally implemented cards, 28 not started.
+The user accepted Phase A with its documented testing gaps and authorized W03. Proposed memory change: record native transport v1, cooperative checkpoint,
 repair workflow and ADR 0002 decisions; no shared-memory promotion was performed.
+
+## Phase A review follow-up
+
+Independent review identified and verified fixes for a pause/lease race, invalid
+lifecycle state defaulting to active, and missing legacy sources being finalized
+as preserved. Three opt-in live Linux fixtures now cover Herdr/Git lifecycle,
+loopback SSH streaming and PTY popup input. Positive cleanup also passes in an
+isolated PID namespace. See [acceptance evidence](phase-a-acceptance.md).
+The user subsequently accepted Phase A with these gaps; W03 may now proceed.
+
+
+## W03: T03.1 transactional store
+
+The opt-in `state-store` library adds schema v1 for tasks, attempts, immutable
+operation intents and events. Commit batches compare entity revisions and event
+heads, then write all records/events/intents atomically. Legacy CLI behavior and
+memory authority remain unchanged. No migration or operation dispatcher is wired.
+See [ADR 0003](adr/0003-project-store-v1.md) for schema ownership, failure evidence,
+limits and reproduction commands. T03.2 migration is the next card.

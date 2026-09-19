@@ -73,16 +73,16 @@ pub fn no_process_references(path: &Path) -> Result<()> {
         let meta = match fs::metadata(&proc) { Ok(m) => m, Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue, Err(e) => return Err(e.into()) };
         if meta.uid() != uid { continue; }
         let check = || -> Result<()> {
-            let cwd = fs::read_link(proc.join("cwd"))?;
+            let cwd = fs::read_link(proc.join("cwd")).with_context(|| format!("cannot inspect {}", proc.join("cwd").display()))?;
             ensure!(!cwd.starts_with(path), "process {} still has its cwd in the worktree", process.file_name().to_string_lossy());
-            for fd in fs::read_dir(proc.join("fd"))? {
+            for fd in fs::read_dir(proc.join("fd")).with_context(|| format!("cannot inspect {}", proc.join("fd").display()))? {
                 match fs::read_link(fd?.path()) {
                     Ok(target) => ensure!(!target.starts_with(path), "process {} still holds a worktree descriptor", process.file_name().to_string_lossy()),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
                     Err(e) => return Err(e.into()),
                 }
             }
-            let maps = fs::read_to_string(proc.join("maps"))?;
+            let maps = fs::read_to_string(proc.join("maps")).with_context(|| format!("cannot inspect {}", proc.join("maps").display()))?;
             ensure!(!maps.lines().any(|line| line.find('/').is_some_and(|start| mapped_path(&line[start..]).starts_with(path))), "process still maps worktree content");
             Ok(())
         };

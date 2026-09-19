@@ -642,6 +642,9 @@ fn pull_requests_are_checked_at_most_every_two_minutes() {
 #[test]
 fn a_merged_pull_request_resolves_its_thread_after_the_final_copy() {
     let (world, project) = pr_world(r#"{"state":"MERGED","reviewDecision":"APPROVED","headRefName":"hp/demo/t-0001-task","headRepository":{"name":"app"},"headRepositoryOwner":{"login":"owner"}}"#);
+    let source = thread::load(&project, "t-0001").unwrap().thread_dir;
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::copy(thread::home_report_path(&project, "t-0001"), Path::new(&source).join("report.md")).unwrap();
     ticker::tick_project(&world.ctx(), &project).unwrap();
     let t = thread::load(&project, "t-0001").unwrap();
     assert_eq!((t.status, t.resolved_reason.as_str()), (Status::Resolved, "merged"));
@@ -837,6 +840,7 @@ fn a_unicode_schedule_is_diagnosed_while_healthy_routines_continue() {
 #[test]
 fn auto_resolve_waits_for_the_later_of_state_report_and_ticker_start() {
     let (world, project, t) = finished_world("idle");
+    std::fs::create_dir_all(&t.thread_dir).unwrap();
     thread::update(&project, &t.id, |t| {
         t.last_group = "idle".into();
         t.last_state = "idle".into();

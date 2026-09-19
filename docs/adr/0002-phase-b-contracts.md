@@ -1,7 +1,8 @@
 # ADR 0002: Phase B domain/store contract and SQLite selection
 
 Status: implementation contract, 2026-09-19; independent wave review remains open.
-Task T00.2. No application storage migration or new application dependency.
+Task T00.2. The subsequent [T03.1 implementation](0003-project-store-v1.md) adds
+the selected dependency behind an opt-in feature; no authority migration has run.
 
 ## Ownership and transaction boundary
 

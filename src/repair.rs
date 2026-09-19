@@ -31,13 +31,14 @@ fn validate(path: &Path, bytes: &[u8]) -> Result<()> {
             let record: thread::Thread = toml::from_str(std::str::from_utf8(bytes)?)?;
             ensure!(record.id == id, "thread identity does not match its filename");
         }
+        [".state", "project.json"] => { serde_json::from_slice::<project::ProjectState>(bytes)?; }
         [".state", "ticker.json"] => { serde_json::from_slice::<steps::State>(bytes)?; }
         ["inbox", file] | ["inbox", "done", file] if file.ends_with(".md") => {
             let item = inbox::parse(std::str::from_utf8(bytes)?).context("invalid inbox frontmatter")?;
             ensure!(!item.id.is_empty() && item.id == file.trim_end_matches(".md"), "inbox identity does not match its filename");
             ensure!(!item.kind.is_empty(), "inbox kind is missing");
         }
-        _ => anyhow::bail!("repair supports thread TOML, ticker JSON and inbox Markdown records only"),
+        _ => anyhow::bail!("repair supports thread TOML, project/ticker JSON and inbox Markdown records only"),
     }
     Ok(())
 }
@@ -52,7 +53,7 @@ fn parents(project: &Project, relative: &Path) -> Result<()> {
 }
 pub fn inspect(project: &Project) -> Result<Vec<Diagnostic>> {
     let mut result = Vec::new();
-    let mut paths = vec![std::path::PathBuf::from(".state/ticker.json")];
+    let mut paths = vec![std::path::PathBuf::from(".state/ticker.json"), std::path::PathBuf::from(".state/project.json")];
     for dir in ["threads", "inbox", "inbox/done"] {
         let relative = Path::new(dir).join("placeholder");
         if !project.dir().join(dir).exists() { continue; }

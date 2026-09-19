@@ -206,3 +206,21 @@ fn resolve_remove_reopen_restart_uses_the_retained_git_branch() {
     assert_eq!(world.runner.count("worktree create"), 0);
     assert_eq!(world.runner.count("agent start"), 0);
 }
+
+#[test]
+fn missing_legacy_source_cannot_be_resolved_as_preserved() {
+    let (world, project, _work, record) = fixture();
+    thread::update(&project, &record.id, |t| {
+        t.report_hash = thread::sha256_hex(b"old report");
+        t.last_report_change = project::now();
+    }).unwrap();
+    std::fs::write(thread::home_report_path(&project, &record.id), b"old report").unwrap();
+    std::fs::remove_dir_all(&record.thread_dir).unwrap();
+    let error = threads::resolve(&world.ctx(), "demo", &record.id, &ResolveArgs::default()).unwrap_err();
+    assert!(error.to_string().contains("source is missing"), "{error:#}");
+    let saved = thread::load(&project, &record.id).unwrap();
+    assert_eq!(saved.status, Status::Open);
+    assert!(saved.artifact_snapshot.is_empty());
+    assert_eq!(std::fs::read(thread::home_report_path(&project, &record.id)).unwrap(), b"old report");
+    threads::resolve(&world.ctx(), "demo", &record.id, &ResolveArgs { skip_copy: true, ..Default::default() }).unwrap();
+}

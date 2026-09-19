@@ -646,8 +646,7 @@ pub fn copy_for_finalization(ctx: &Ctx, project: &Project, record: &Thread) -> t
         if matches!(copied.outcome, CopyOutcome::Complete) {
             let snapshot = (|| -> Result<Option<String>> {
                 if record.thread_dir.is_empty() || !Path::new(&record.thread_dir).try_exists()? {
-                    if !record.artifact_snapshot.is_empty() { bail!("previously preserved artifact source is missing"); }
-                    return Ok(None);
+                    bail!("artifact source is missing; restore it before finalization, or explicitly resolve with --skip-copy");
                 }
                 let snapshot = crate::artifacts::capture_local(project, record)?;
                 if snapshot.manifest.report_hash() != copied.report_hash.as_deref() { bail!("report changed between live copy and preservation snapshot"); }
