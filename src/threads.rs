@@ -384,10 +384,27 @@ fn lists_for(view: &SessionView, record: &Thread) -> Result<(Vec<Agent>, Vec<Pan
 
 pub fn restart(ctx: &Ctx, slug: &str, id: &str) -> Result<Thread> {
     let project = Project::load(&ctx.root, slug)?;
+    if project.status() != project::Status::Active {
+        bail!("`{slug}` is {}; restart is refused until the project is active again", project.status());
+    }
     let record = thread::load(&project, id)?;
-    ticker::start(ctx)?;
     let view = require_session(ctx, &project)?;
     let (agents, panes) = lists_for(&view, &record)?;
+    if panes.iter().any(|pane| pane.pane_id == record.pane_id) {
+        let socket = project.coordinator().context("project coordinator is missing")?.socket;
+        for slug in project::list_slugs(&ctx.root) {
+            let other = Project::load(&ctx.root, &slug)?;
+            if other.coordinator().is_none_or(|c| c.socket != socket) { continue; }
+            let (records, diagnostics) = thread::list_with_diagnostics(&other);
+            if !diagnostics.is_empty() { bail!("cannot establish exclusive pane ownership: {}", diagnostics.join("; ")); }
+            for owned in records {
+                if other.canonical_dir() == project.canonical_dir() && owned.id == record.id { continue; }
+                if owned.status != Status::Resolved && owned.machine == record.machine && owned.pane_id == record.pane_id {
+                    bail!("pane {} is also claimed by {} in {}; repair the conflicting ownership before restarting", record.pane_id, owned.id, slug);
+                }
+            }
+        }
+    }
     let now = jiff::Timestamp::now();
     let live = thread::live_state(&record, &agents, &panes, now);
     let branch_exists = record.kind == Kind::Worktree && record.worktree_path.is_empty() && {
@@ -401,6 +418,7 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str) -> Result<Thread> {
     };
 
     let plan = restart_plan(&record, &live, branch_exists, now)?;
+    ticker::start(ctx)?;
     thread::update_checked(&project, id, thread::invalidate_finalization)?;
     match plan {
         RestartPlan::Create => return place_and_brief(ctx, &project, &view, id, true),
@@ -430,6 +448,9 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str) -> Result<Thread> {
 /// predicate: agents queue a message that arrives while they work.
 pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
     let project = Project::load(&ctx.root, slug)?;
+    if project.status() != project::Status::Active {
+        bail!("`{slug}` is {}; prompting is refused until the project is active again", project.status());
+    }
     let record = thread::load(&project, id)?;
     if text.trim().is_empty() {
         bail!("the text is empty");

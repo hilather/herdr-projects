@@ -16,6 +16,7 @@ use crate::project::{self, Status};
 use crate::{doctor, lifecycle, overview};
 
 const PLUGIN_ID: &str = "herdr-projects";
+mod handoff;
 
 /// What an action hands to the popup it opens.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -46,28 +47,17 @@ fn action_context(ctx: &Ctx) -> ActionContext {
     ctx.env.var("HERDR_PLUGIN_CONTEXT_JSON").and_then(|json| serde_json::from_str(json).ok()).unwrap_or_default()
 }
 
-fn state_file(ctx: &Ctx) -> Result<PathBuf> {
-    let dir = ctx.env.var("HERDR_PLUGIN_STATE_DIR").context("HERDR_PLUGIN_STATE_DIR is not set: this command is meant to be run by herdr as a plugin action or pane")?;
-    Ok(PathBuf::from(dir).join("handoff.json"))
-}
-
 fn socket(ctx: &Ctx) -> Result<String> {
     ctx.env.var("HERDR_SOCKET_PATH").map(str::to_string).context("HERDR_SOCKET_PATH is not set: this command is meant to be run by herdr")
 }
 
 fn open_pane(ctx: &Ctx, entrypoint: &str, handoff: &Handoff) -> Result<()> {
-    let file = state_file(ctx)?;
-    if let Some(dir) = file.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    project::write_json(&file, handoff)?;
+    let id = handoff::create(ctx, entrypoint, handoff)?;
+    let binding = format!("{}={id}", handoff::ENV);
+    let root_binding = format!("HERDR_PROJECTS_ROOT={}", std::path::absolute(&ctx.root)?.display());
     let herdr = Herdr::new(ctx.env.herdr_bin(), socket(ctx)?, ctx.runner);
-    herdr.call(&["plugin", "pane", "open", "--plugin", PLUGIN_ID, "--entrypoint", entrypoint], CALL_TIMEOUT).map_err(|e| anyhow::anyhow!("{e}"))?;
+    herdr.call(&["plugin", "pane", "open", "--plugin", PLUGIN_ID, "--entrypoint", entrypoint, "--env", &binding, "--env", &root_binding], CALL_TIMEOUT).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
-}
-
-fn read_handoff(ctx: &Ctx) -> Handoff {
-    state_file(ctx).ok().and_then(|file| project::read_json(&file)).unwrap_or_default()
 }
 
 /// The project of the workspace the action was invoked from, if any.
@@ -142,7 +132,10 @@ fn hold_open() {
 /// A popup's body. Errors are printed and the popup is held open, so the user
 /// can read them before it closes.
 pub fn run_pane(ctx: &Ctx, id: &str) -> Result<()> {
-    let handoff = read_handoff(ctx);
+    let handoff = match handoff::consume(ctx, id) {
+        Ok(handoff) => handoff,
+        Err(error) => { println!("error: {error:#}"); hold_open(); return Err(error); }
+    };
     let result = match id {
         "overview" => return overview::run(ctx, Some(handoff.slug.as_str()).filter(|s| !s.is_empty()), true),
         "new" => (|| {
@@ -197,6 +190,16 @@ mod tests {
         Env::for_test(world.home.path(), &refs)
     }
 
+    fn consume_opened(world: &World, entrypoint: &str) -> Handoff {
+        let calls = world.runner.calls.borrow();
+        let call = calls.iter().rev().find(|c| c.display().contains("plugin pane open")).unwrap();
+        let binding = call.args.windows(2).find(|args| args[0] == "--env").unwrap()[1].clone();
+        drop(calls);
+        let id = binding.strip_prefix(&format!("{}=", handoff::ENV)).unwrap();
+        let env = plugin_env(world, &[(handoff::ENV, id)]);
+        handoff::consume(&Ctx { env: &env, ..world.ctx() }, entrypoint).unwrap()
+    }
+
     #[test]
     fn an_action_without_a_project_opens_the_picker_with_the_requested_command() {
         let world = World::new();
@@ -208,8 +211,9 @@ mod tests {
         let calls = world.runner.calls.borrow();
         let opened = calls.iter().find(|c| c.display().contains("plugin pane open")).unwrap();
         assert!(opened.display().contains("--plugin herdr-projects --entrypoint pick"));
+        assert!(opened.args.iter().any(|a| a == &format!("HERDR_PROJECTS_ROOT={}", world.root.display())));
         drop(calls);
-        assert_eq!(read_handoff(&ctx).command, "pause");
+        assert_eq!(consume_opened(&world, "pick").command, "pause");
     }
 
     #[test]
@@ -238,7 +242,7 @@ mod tests {
 
         *world.agents.borrow_mut() = format!("[{}]", crate::scenarios::agent_json("w5", "w5:t1", "w5:p1", "/work", "", "idle"));
         run_action(&ctx, "adopt-workspace").unwrap();
-        let handoff = read_handoff(&ctx);
+        let handoff = consume_opened(&world, "adopt");
         assert_eq!((handoff.pane_id.as_str(), handoff.workspace_label.as_str(), handoff.workspace_cwd.as_str()), ("w5:p1", "My Repo", "/work"));
     }
 }

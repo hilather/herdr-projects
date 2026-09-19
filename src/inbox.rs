@@ -118,17 +118,31 @@ pub fn prune_done(project: &Project, days: u64) {
 
 /// Unhandled items, oldest first (ids start with a UTC timestamp).
 pub fn unhandled(project: &Project) -> Vec<Item> {
-    let Ok(entries) = std::fs::read_dir(inbox_dir(project)) else {
-        return Vec::new();
+    unhandled_with_diagnostics(project).0
+}
+
+pub fn unhandled_with_diagnostics(project: &Project) -> (Vec<Item>, Vec<String>) {
+    let mut items = Vec::new();
+    let mut diagnostics = Vec::new();
+    let entries = match std::fs::read_dir(inbox_dir(project)) {
+        Ok(entries) => entries,
+        Err(error) => return (items, vec![format!("{}: {error}", inbox_dir(project).display())]),
     };
-    let mut items: Vec<Item> = entries
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".md"))
-        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
-        .filter_map(|text| parse(&text))
-        .collect();
+    for entry in entries {
+        let entry = match entry { Ok(entry) => entry, Err(error) => { diagnostics.push(error.to_string()); continue; } };
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "md") { continue; }
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match parse(&text) {
+                Some(item) if path.file_stem().and_then(|s| s.to_str()) == Some(item.id.as_str()) && validate_id(&item.id).is_ok() => items.push(item),
+                _ => diagnostics.push(format!("{}: invalid inbox item or mismatched id", path.display())),
+            },
+            Err(error) => diagnostics.push(format!("{}: {error}", path.display())),
+        }
+    }
     items.sort_by(|a, b| a.id.cmp(&b.id));
-    items
+    diagnostics.sort();
+    (items, diagnostics)
 }
 
 pub fn seen(project: &Project) -> BTreeSet<String> {

@@ -13,6 +13,32 @@ fn fixture() -> (World, Project, tempfile::TempDir, Thread) {
 }
 
 #[test]
+fn inactive_projects_cannot_restart_open_or_adopt_execution() {
+    for status in [project::Status::Paused, project::Status::Archived] {
+        let (world, project, _work, record) = fixture();
+        project.set_status(status).unwrap();
+        assert!(threads::restart(&world.ctx(), "demo", &record.id).is_err());
+        assert!(threads::prompt(&world.ctx(), "demo", &record.id, "start more work").is_err());
+        assert!(coordinator::open(&world.ctx(), "demo", &coordinator::OpenOptions { session: Default::default(), reprime: false, rebind: false }).is_err());
+        assert!(crate::adopt::adopt(&world.ctx(), "demo", "w2:p1", "adopt", None).is_err());
+        assert!(world.runner.calls.borrow().is_empty(), "refusal precedes ticker start or Herdr side effects");
+        assert_eq!(thread::load(&project, &record.id).unwrap(), record);
+    }
+}
+
+#[test]
+fn restart_refuses_a_pane_claimed_by_another_project_in_the_same_session() {
+    let (world, project, work, record) = fixture();
+    let other = world.project("other", "a.sock");
+    world.thread(&other, work.path(), |_| {});
+    *world.panes.borrow_mut() = format!("[{}]", pane_json("w2", "w2:t1", "w2:p1", work.path().to_str().unwrap()));
+    let error = threads::restart(&world.ctx(), "demo", &record.id).unwrap_err();
+    assert!(error.to_string().contains("also claimed"), "{error:#}");
+    assert_eq!(thread::load(&project, &record.id).unwrap(), record);
+    assert_eq!(world.runner.count("agent start") + world.runner.count("agent prompt") + world.runner.count("worktree open"), 0);
+}
+
+#[test]
 fn resolve_records_a_verified_snapshot_but_cleanup_waits_for_writer_exclusion() {
     let (world, project, work, record) = fixture();
     let error = threads::resolve(&world.ctx(), "demo", &record.id, &ResolveArgs { remove_worktree: true, ..Default::default() }).unwrap_err();
@@ -115,6 +141,8 @@ fn context_includes_current_instructions_and_broken_record_diagnostics() {
     let project = world.project("demo", "a.sock");
     let record = world.thread(&project, world.home.path(), |_| {});
     std::fs::write(project.dir().join("threads/t-0002.toml"), "broken = [").unwrap();
+    std::fs::write(project.dir().join("inbox/broken.md"), "broken inbox").unwrap();
+    inbox::write(&project, "routine", "healthy", "still visible", "").unwrap();
     let (settings, _) = project.read_project_md().unwrap();
     let mut revisions = Vec::new();
     for instruction in ["Always use the purple test fixture.", "Now use the orange fixture."] {
@@ -123,6 +151,7 @@ fn context_includes_current_instructions_and_broken_record_diagnostics() {
         assert!(digest.contains(instruction));
         assert!(thread::brief_for(&project, &record, "test task", false).unwrap().contains(instruction));
         assert!(digest.contains("t-0002.toml") && digest.contains("preserve and repair"));
+        assert!(digest.contains("inbox/broken.md") && digest.contains("still visible"));
         assert!(digest.contains(&record.id));
         assert!(digest.contains("max_parallel_threads is advisory"));
         revisions.push(digest.lines().find(|line| line.starts_with("## Project instructions")).unwrap().to_string());
@@ -130,5 +159,8 @@ fn context_includes_current_instructions_and_broken_record_diagnostics() {
     assert_ne!(revisions[0], revisions[1]);
     assert_eq!(thread::list_with_diagnostics(&project).0.len(), 1);
     assert_eq!(thread::list_with_diagnostics(&project).1.len(), 1);
+    assert_eq!(inbox::unhandled_with_diagnostics(&project).0.len(), 1);
+    assert_eq!(inbox::unhandled_with_diagnostics(&project).1.len(), 1);
+    assert_eq!(std::fs::read_to_string(project.dir().join("inbox/broken.md")).unwrap(), "broken inbox");
     assert_eq!(std::fs::read_to_string(project.dir().join("threads/t-0002.toml")).unwrap(), "broken = [");
 }

@@ -80,7 +80,7 @@ fn configured_target(config_dir: &Path, machine: &str) -> Option<String> {
 
 fn check_target(target: &str) -> Result<()> {
     // A target is `user@host` or a host alias; it must never look like an option.
-    if target.is_empty() || target.starts_with('-') || target.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    if target.is_empty() || target.starts_with('-') || !target.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '-' | ':' | '[' | ']')) {
         bail!("`{target}` is not a usable SSH target");
     }
     Ok(())
@@ -197,7 +197,13 @@ pub fn layout(runner: &dyn Runner, target: &str, thread_dir: &str) -> Result<Rem
          if [ ! -e \"$d\" ]; then echo absent; exit 0; fi\n\
          if [ -d \"$d\" ] && [ ! -L \"$d\" ]; then echo dir_ok; else exit 0; fi\n\
          if [ -f \"$d/report.md\" ] && [ ! -L \"$d/report.md\" ]; then echo report_ok; elif [ -e \"$d/report.md\" ] || [ -L \"$d/report.md\" ]; then echo report_other; fi\n\
-         if [ -L \"$d/library\" ]; then echo library_link; elif [ -d \"$d/library\" ]; then echo library_ok; echo \"kb $(du -sk \"$d/library\" | cut -f1)\"; find \"$d/library\" -type l | head -20 | sed 's/^/link /'; fi",
+         if [ -L \"$d/library\" ]; then echo library_link; elif [ -d \"$d/library\" ]; then\n\
+           size=$(du -sk \"$d/library\") || exit 4\n\
+           size=${{size%%[!0-9]*}}\n\
+           [ -n \"$size\" ] || exit 4\n\
+           echo library_ok; printf 'kb %s\\n' \"$size\"\n\
+           find \"$d/library\" -type l -exec printf 'link symbolic-link-in-library\\n' \\; | head -20\n\
+         fi",
         dir = quote(thread_dir),
     );
     let out = ssh(runner, target, &script, None, SSH_TIMEOUT)?;
@@ -205,6 +211,7 @@ pub fn layout(runner: &dyn Runner, target: &str, thread_dir: &str) -> Result<Rem
         bail!("ssh {target}: {}", out.error_text());
     }
     let mut found = RemoteLayout::default();
+    let mut size_seen = false;
     for line in out.stdout.lines() {
         match line {
             "absent" => found.absent = true,
@@ -215,13 +222,15 @@ pub fn layout(runner: &dyn Runner, target: &str, thread_dir: &str) -> Result<Rem
             "library_link" => found.library_is_link = true,
             other => {
                 if let Some(kb) = other.strip_prefix("kb ") {
-                    found.library_kb = kb.trim().parse().unwrap_or(0);
+                    found.library_kb = kb.trim().parse().context("remote library size is not a valid integer")?;
+                    size_seen = true;
                 } else if let Some(link) = other.strip_prefix("link ") {
                     found.symlinks.push(pr_safe(link));
                 }
             }
         }
     }
+    if found.library_ok && !size_seen { bail!("remote library size is missing; refusing to copy"); }
     Ok(found)
 }
 
@@ -253,16 +262,28 @@ pub fn fetch_file(runner: &dyn Runner, target: &str, remote_path: &str, local_pa
 /// Checksum-based `rsync -rt` over ssh, without `-l`, so symbolic links are skipped.
 pub fn fetch_dir(runner: &dyn Runner, target: &str, remote_dir: &str, local_dir: &Path) -> Result<()> {
     check_target(target)?;
-    if !is_plain(remote_dir) {
-        bail!("the library path on {target} has characters rsync cannot carry safely; it was not copied");
+    if remote_dir.is_empty() || remote_dir.contains('\0') { bail!("remote library path is empty or contains NUL"); }
+    for (place, output) in [
+        ("local host".to_string(), runner.run(&Cmd::new("rsync", SSH_TIMEOUT).arg("--help"))?),
+        (target.to_string(), ssh(runner, target, "rsync --help", None, SSH_TIMEOUT)?),
+    ] {
+        if !output.success() || !(output.stdout.contains("--secluded-args") || output.stdout.contains("--protect-args")) {
+            bail!("rsync on {place} does not confirm protected-argument support; install rsync 3.0 or later on both hosts before retrying");
+        }
     }
+    // -s still expands wildcard source arguments. Change directory through a
+    // quoted shell value instead, and transfer literal ./ through the protocol.
+    let directory = if remote_dir.starts_with('/') { remote_dir.to_string() } else { format!("./{remote_dir}") };
+    let server = format!("cd {} && rsync", quote(&directory));
     let out = runner.run(&Cmd::new("rsync", COPY_TIMEOUT).args([
         "-rt".to_string(),
+        "-s".to_string(),
         "--checksum".to_string(),
+        format!("--rsync-path={server}"),
         "-e".to_string(),
         format!("ssh {}", SSH_OPTIONS.join(" ")),
         "--".to_string(),
-        format!("{target}:{remote_dir}/"),
+        format!("{target}:./"),
         format!("{}/", local_dir.to_string_lossy()),
     ]))?;
     if !out.success() {
@@ -401,18 +422,19 @@ mod tests {
     #[test]
     fn remote_library_transfer_compares_content_without_following_links() {
         let runner = FakeRunner::new();
+        runner.on("--help", ok("--protect-args"));
         runner.on("rsync", ok(""));
         let root = tempfile::tempdir().unwrap();
         fetch_dir(&runner, "box", "/repo/library", root.path()).unwrap();
         let calls = runner.calls.borrow();
-        let args = &calls[0].args;
+        let args = &calls.last().unwrap().args;
         assert!(args.iter().any(|arg| arg == "--checksum"));
         assert!(args.iter().any(|arg| arg == "-rt"));
         assert!(!args.iter().any(|arg| ["--links", "--copy-links", "-l", "-L"].contains(&arg.as_str())));
     }
 
     #[test]
-    fn unsafe_remote_paths_never_reach_scp_or_rsync() {
+    fn quoted_file_paths_use_ssh_and_unconfirmed_rsync_never_transfers() {
         let runner = FakeRunner::new();
         runner.on("ssh", ok("file body"));
         runner.on("scp", ok(""));
@@ -423,6 +445,63 @@ mod tests {
         fetch_file(&runner, "box", "/wt/repo/report.md", &dir.path().join("r2")).unwrap();
         assert_eq!(runner.count("scp"), 1);
         assert!(fetch_dir(&runner, "box", "/wt/my repo/library", dir.path()).is_err());
-        assert_eq!(runner.count("rsync"), 0);
+        assert!(!runner.calls.borrow().iter().any(|c| c.program == "rsync" && c.args.iter().any(|a| a == "-rt")));
+    }
+
+    #[test]
+    fn protected_transfers_preserve_literal_hostile_paths_through_a_real_shell() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Loopback { root: std::path::PathBuf, shell: String }
+        impl Runner for Loopback {
+            fn socket_request(&self, _: &Path, _: &str, _: Duration) -> Result<String> { bail!("unexpected socket request in transport fixture") }
+            fn run(&self, cmd: &Cmd) -> Result<Output> {
+                if cmd.program == "ssh" {
+                    return RealRunner.run(&Cmd::new("sh", cmd.timeout).args(["-c", cmd.args.last().unwrap()]).cwd(&self.root));
+                }
+                let mut cmd = cmd.clone();
+                if cmd.program == "rsync" && let Some(index) = cmd.args.iter().position(|a| a == "-e") {
+                    cmd.args[index + 1] = self.shell.clone();
+                }
+                cmd.cwd = Some(self.root.clone());
+                RealRunner.run(&cmd)
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let shell = root.path().join("loopback-ssh");
+        std::fs::write(&shell, "#!/bin/sh\n[ \"$1\" = fixture ] || exit 99\nshift\nexec sh -c \"$*\"\n").unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let runner = Loopback { root: root.path().into(), shell: shell.to_str().unwrap().into() };
+        for (index, name) in ["space dir", "unicode λ", "quote's", "$(touch PWNED)", "`touch PWNED`", "wild*[x]?", "-leading", "line\nbreak"].into_iter().enumerate() {
+            let source = root.path().join(name);
+            std::fs::create_dir_all(source.join("empty")).unwrap();
+            std::fs::write(source.join("report.md"), [0, 255, 254, b'X']).unwrap();
+            std::os::unix::fs::symlink("/etc/passwd", source.join("link")).unwrap();
+            let destination = root.path().join(format!("result-{index}"));
+            std::fs::create_dir(&destination).unwrap();
+            fetch_dir(&runner, "fixture", name, &destination).unwrap();
+            assert_eq!(std::fs::read(destination.join("report.md")).unwrap(), [0, 255, 254, b'X']);
+            assert!(destination.join("empty").is_dir());
+            assert!(!destination.join("link").exists());
+            let fetched = root.path().join(format!("file-{index}"));
+            fetch_file(&runner, "fixture", &format!("{name}/report.md"), &fetched).unwrap();
+            assert_eq!(std::fs::read(fetched).unwrap(), [0, 255, 254, b'X']);
+        }
+        assert!(!root.path().join("PWNED").exists());
+        let deceptive = root.path().join("deceptive\nreport_ok");
+        std::fs::create_dir_all(deceptive.join("library")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", deceptive.join("library/link\nreport_ok\nkb 0")).unwrap();
+        let found = layout(&runner, "fixture", deceptive.to_str().unwrap()).unwrap();
+        assert!(found.dir_ok && found.library_ok);
+        assert!(!found.report_ok, "filenames must not inject layout protocol fields");
+        assert_eq!(found.symlinks.len(), 1);
+    }
+
+    #[test]
+    fn unknown_or_invalid_remote_library_size_refuses_copy() {
+        for reply in ["dir_ok\nlibrary_ok\n", "dir_ok\nlibrary_ok\nkb nonsense\n", "dir_ok\nlibrary_ok\nkb 18446744073709551616\n"] {
+            let runner = FakeRunner::new();
+            runner.on("ssh", ok(reply));
+            assert!(layout(&runner, "box", "/repo/library").is_err());
+        }
     }
 }

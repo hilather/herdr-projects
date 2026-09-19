@@ -3,7 +3,9 @@
 Updated 2026-09-19. Base: `6e2bd7607d7bc64cf6155beceb299b44566d7f3b`.
 The W01 reliability changes and initial regression fixtures were committed as
 `af65de4` and pushed to the `hilather/herdr-projects` fork on
-`hp-plan/w00/t00-1-baseline`. W02 work below is the next local implementation slice.
+`hp-plan/w00/t00-1-baseline`. The local-preservation/diagnostics/context batch was
+committed as `325caa7` and pushed to the same fork branch. The subsequent transport,
+popup and lifecycle changes are recorded below and in the accompanying commit.
 The user upgraded Herdr and requested that
 implementation proceed; `herdr --version` now reports **0.9.1**.
 
@@ -57,7 +59,31 @@ an idle pane or two matching manifests as proof that no writer can continue.
 T02.4 groundwork: ticker JSON parse/read failures now preserve the file and stop
 that project's tick; healthy projects continue. Readable thread records remain
 available alongside explicit malformed-record diagnostics in doctor and context.
-Automatic quarantine/repair and unique popup handoffs are still pending.
+Inbox records now have the same explicit diagnostics. Automatic quarantine/repair
+remains pending; no malformed record is deleted automatically.
+
+Popup handoffs now have random per-invocation IDs, a schema and entrypoint binding,
+a ten-minute lifetime, and root/session binding. Herdr's `plugin pane open --env`
+passes the ID to its consumer. An atomic claim prevents replay, including two
+concurrent consumers. Wrong action/schema/session/root and expired contexts fail
+closed. Separate popup actions can no longer overwrite one shared `handoff.json`.
+The installed Herdr 0.9.1 help confirms `--env`; interactive popup behavior has not
+been certified in a live session.
+
+T02.2 transport: library transfers probe local and remote rsync for protected-argument
+support, use `-s`, and enter the source directory through a quoted `--rsync-path`
+command. The protocol receives literal `./`, avoiding rsync wildcard expansion in
+source paths. Real rsync 3.5.0 through a local SSH substitute tests spaces, Unicode,
+quotes, dollar signs, backticks, wildcards, leading hyphens, newlines, binary bytes,
+empty directories and skipped symlinks. Remote layout size errors now refuse copy;
+filenames cannot inject layout fields through the symlink listing. See the
+[transport compatibility notes](remote-transport.md) for requirements and limits.
+
+T02.3 launch guards: paused/archived projects refuse restart, follow-up prompts,
+coordinator open and adoption before launch side effects. Restart checks competing
+pane ownership in the same recorded session and machine before changing execution
+identity. Intentional-removal tombstones and retained-branch reopen remain pending
+because verified writer shutdown/removal is not yet available.
 
 T02.5 context: startup already directs the coordinator to `context`, which now
 includes the full current PROJECT.md body, a revision hash and character count.
@@ -67,7 +93,7 @@ and documents advisory capacity, shared worker arguments and static worker brief
 Tests verify changing instructions appear in both coordinator context and worker
 briefs while malformed thread records remain visible.
 
-Remote snapshots, robust directory-path transport, writer checkpoints, Git identity
+Remote snapshots, writer checkpoints, Git identity
 and tombstone recovery, snapshot retention/garbage collection, and the remaining
 lifecycle fixes are not complete. Legacy never-created sources can still be treated
 as empty when no prior snapshot exists. Live report/library paths remain mutable
@@ -85,8 +111,8 @@ cargo build --release --locked --offline
 git diff --check
 ```
 
-Debug and release suites each passed **195 unit/scenario tests plus four CLI
-tests (199 total)**, with no ignored tests. The locked
+Debug and release suites each passed **202 unit/scenario tests plus four CLI
+tests (206 total)**, with no ignored tests. The locked
 release build and `git diff --check` also passed. The new `libc` dependency uses
 the version already present in the lockfile; no package version was upgraded.
 
@@ -98,10 +124,14 @@ remote repositories or user worktrees were modified.
 
 ## Next work
 
+The [41-card task ledger](task-status.md) tracks **7 implemented locally, 5 partial
+and 29 not started: 34 cards still open**. These are implementation counts, not
+formal release acceptance.
+
 1. Complete the W01 acceptance evidence that requires independent review and
    external environments (including macOS and live Herdr/SSH/GitHub).
-2. Finish W02 remote preservation/path transport, writer exclusion and lifecycle
-   cleanup/restart, record repair and concurrent popup handoffs. Removal stays
+2. Finish W02 remote preservation, writer exclusion and lifecycle
+   cleanup/restart, and record repair. Removal stays
    unavailable until those preservation and lifecycle gates are implemented.
 3. Finish Phase B contracts before any database or memory-authority migration.
 

@@ -201,3 +201,22 @@ Coordinator startup reads `context`, which now includes the full current
 context picks up edits. Worker briefs receive instructions and memory at start or
 restart; existing workers do not automatically receive edits. The capacity limit
 is advisory and worker arguments are shared, not isolated by agent kind.
+
+## Popup context and inactive projects
+
+Each action popup receives its own single-use context ID, valid for ten minutes.
+A popup with expired, mismatched or already consumed context asks you to reopen the
+action. It never falls back to another action's most recent context. The old shared
+`handoff.json` is no longer read. Expired recognized handoffs are pruned as new
+handoffs are created; corrupt handoff files are left for inspection.
+
+Paused and archived projects refuse coordinator open, thread restart, follow-up
+prompts and adoption. Resume or unarchive the project first. Restart also refuses
+conflicting pane ownership instead of reusing another thread's pane.
+
+Remote directory transfers support literal spaces, Unicode and shell characters
+when both hosts support rsync protected arguments. Capability checks run before
+transfer and give an installation diagnostic when support is missing. See
+[remote transport](remote-transport.md) for the tested boundary. Invalid or missing
+remote library-size observations refuse transfer. Remote snapshots and writer
+shutdown verification remain unfinished; worktree removal stays unavailable.
