@@ -197,6 +197,12 @@ impl<'a> Herdr<'a> {
                 message: format!("`herdr {}` timed out", args.join(" ")),
             });
         }
+        if out.cancelled || out.stdout_truncated || out.stderr_truncated {
+            return Err(HerdrError {
+                code: if out.cancelled { "cancelled" } else { "output_limit" }.into(),
+                message: out.error_text(),
+            });
+        }
         // herdr prints one JSON object; on failure it carries `error`, and
         // which stream it lands on is not something to depend on.
         let reply = [&out.stdout, &out.stderr]
@@ -354,7 +360,11 @@ impl<'a> Herdr<'a> {
     }
 
     pub fn notification_show(&self, title: &str, body: &str) -> Result<(), HerdrError> {
-        self.call(&["notification", "show", title, "--body", body], CALL_TIMEOUT).map(|_| ())
+        let result = self.call(&["notification", "show", title, "--body", body], CALL_TIMEOUT)?;
+        if result["shown"].as_bool() != Some(true) {
+            return Err(HerdrError { code: "notification_not_shown".into(), message: "notification display was not confirmed".into() });
+        }
+        Ok(())
     }
 
     /// Display tokens on a pane row, always with a TTL so they fade if the
@@ -424,6 +434,21 @@ impl<'a> Herdr<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_output_is_rejected_even_when_its_prefix_is_valid_json() {
+        use crate::runner::fake::{FakeRunner, ok};
+        for cancelled in [false, true] {
+            let runner = FakeRunner::new();
+            let mut out = ok(r#"{"result":{"agents":[]}}"#);
+            out.cancelled = cancelled;
+            out.stdout_truncated = !cancelled;
+            runner.on("agent list", out);
+            let herdr = Herdr::new("herdr", "/fixture.sock", &runner);
+            let error = herdr.agent_list().unwrap_err();
+            assert_eq!(error.code, if cancelled { "cancelled" } else { "output_limit" });
+        }
+    }
 
     #[test]
     fn parses_versions() {

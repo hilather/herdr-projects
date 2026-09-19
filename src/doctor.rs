@@ -145,6 +145,35 @@ fn report(
             continue;
         };
         let label = format!("project {slug}");
+        let retry_path = project.state_dir().join("ticker.json");
+        match std::fs::read(&retry_path) {
+            Ok(bytes) => match serde_json::from_slice::<crate::steps::State>(&bytes) {
+                Ok(state) => {
+                    let count = state.finalizations.len() + state.pending_events.len();
+                    if count > 0 || !state.notification_retry.hash.is_empty() {
+                        check(&mut out, None, &label, format!(
+                            "{} pending finalization(s), {} pending inbox event(s), notification retry {}; state: {}",
+                            state.finalizations.len(), state.pending_events.len(),
+                            if state.notification_retry.hash.is_empty() { "none" } else { "pending" }, retry_path.display()));
+                    }
+                    for (id, pending) in &state.finalizations {
+                        check(&mut out, None, &format!("{label} thread {id}"), format!(
+                            "final copy attempt {}; next {}; {}", pending.retry.attempts,
+                            pending.retry.next_attempt, crate::pr::sanitize(&pending.retry.last_error)));
+                    }
+                    if !state.notification_retry.retry.last_error.is_empty() {
+                        check(&mut out, None, &label, format!("notification: {}; next {}",
+                            crate::pr::sanitize(&state.notification_retry.retry.last_error), state.notification_retry.retry.next_attempt));
+                    }
+                    if !state.gh_outages.is_empty() || !state.machine_outages.is_empty() {
+                        check(&mut out, None, &label, format!("{} GitHub resource outage(s), {} machine outage(s)", state.gh_outages.len(), state.machine_outages.len()));
+                    }
+                }
+                Err(error) => check(&mut out, Some(false), &label, format!("invalid retry state {}: {error}", retry_path.display())),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => check(&mut out, Some(false), &label, format!("cannot read retry state {}: {error}", retry_path.display())),
+        }
         let Some(record) = project.coordinator() else {
             check(&mut out, Some(true), &label, format!("{}; never opened", project.status()));
             continue;
@@ -213,6 +242,26 @@ mod tests {
         runner.on("gh --version", ok("gh version 2\n"));
         runner.on("gh auth status", fail(1, "not logged in"));
         runner
+    }
+
+    #[test]
+    fn retry_diagnostics_include_unopened_projects_and_corrupt_state() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "test", vec![]).unwrap();
+        let mut state = crate::steps::State::default();
+        state.notification_retry.hash = "undelivered".into();
+        state.notification_retry.retry.last_error = "delivery failed".into();
+        crate::steps::save_state(&project, &state).unwrap();
+        let (text, _) = report(&env, &root, &home.path().join("cfg"), &SessionFlags::default(), &runner);
+        assert!(text.contains("notification retry pending"), "{text}");
+        assert!(text.contains("delivery failed"), "{text}");
+        std::fs::write(project.state_dir().join("ticker.json"), "{broken").unwrap();
+        let (text, healthy) = report(&env, &root, &home.path().join("cfg"), &SessionFlags::default(), &runner);
+        assert!(!healthy);
+        assert!(text.contains("invalid retry state"), "{text}");
     }
 
     #[test]

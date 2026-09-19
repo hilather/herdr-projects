@@ -1,6 +1,10 @@
 //! Multi-step behaviour checked against the scripted fake runner: what the
 //! CLI and the ticker do together, without herdr, git or an agent.
 
+mod review_regressions;
+mod reliability;
+mod recovery;
+
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -299,6 +303,7 @@ fn starting_for_more_than_five_minutes_becomes_failed() {
 #[test]
 fn the_ticker_copies_a_changed_report_home_once() {
     let world = World::new();
+    world.runner.on("notification show", ok(r#"{"result":{"shown":true}}"#));
     let project = world.project("demo", "a.sock");
     let t = world.thread(&project, world.home.path(), |_| {});
     std::fs::create_dir_all(Path::new(&t.thread_dir)).unwrap();
@@ -543,6 +548,7 @@ fn a_blocked_nudge_is_retried_and_a_busy_coordinator_is_not_prompted() {
 #[test]
 fn a_restarted_session_gives_one_session_item_not_one_per_thread() {
     let world = World::new();
+    world.runner.on("notification show", ok(r#"{"result":{"shown":true}}"#));
     let project = world.project("demo", "a.sock");
     world.thread(&project, world.home.path(), |t| t.last_group = "working".into());
     // The list call succeeds and every recorded pane (coordinator + thread) is gone.
@@ -815,6 +821,19 @@ fn one_config_error_item_per_file_hash() {
 }
 
 #[test]
+fn a_unicode_schedule_is_diagnosed_while_healthy_routines_continue() {
+    let (world, project, _) = finished_world("idle");
+    settle(&project);
+    write_routine(&project, "broken", "+++\nschedule = \"every 1日\"\n+++\n");
+    write_routine(&project, "healthy", "+++\nschedule = \"every 1h\"\n+++\nContinue working.\n");
+    make_due(&project, "healthy");
+    for _ in 0..2 { ticker::tick_project(&world.ctx(), &project).unwrap(); }
+    assert_eq!(items_of(&project, "config-error").len(), 1);
+    assert_eq!(items_of(&project, "routine").len(), 1);
+    assert_eq!(items_of(&project, "routine")[0].body, "Continue working.");
+}
+
+#[test]
 fn auto_resolve_waits_for_the_later_of_state_report_and_ticker_start() {
     let (world, project, t) = finished_world("idle");
     thread::update(&project, &t.id, |t| {
@@ -829,18 +848,18 @@ fn auto_resolve_waits_for_the_later_of_state_report_and_ticker_start() {
 
     // The ticker only just started: a week-old idle thread is not resolved.
     let fresh = Memory::new(&ctx);
-    assert!(crate::steps::auto_resolve(&ctx, &project, &settings, &fresh, now).is_empty());
+    assert!(crate::steps::auto_resolve(&ctx, &project, &settings, &fresh, &crate::steps::State::default(), now).is_empty());
     assert_eq!(thread::load(&project, "t-0001").unwrap().status, Status::Open);
 
     // A recent report change also holds it back.
     let mut old = Memory::new(&ctx);
     old.started = "2026-01-01T00:00:00Z".parse().unwrap();
     thread::update(&project, &t.id, |t| t.last_report_change = now.to_string()).unwrap();
-    crate::steps::auto_resolve(&ctx, &project, &settings, &old, now);
+    crate::steps::auto_resolve(&ctx, &project, &settings, &old, &crate::steps::State::default(), now);
     assert_eq!(thread::load(&project, "t-0001").unwrap().status, Status::Open);
 
     thread::update(&project, &t.id, |t| t.last_report_change = "2026-01-02T00:00:00Z".into()).unwrap();
-    crate::steps::auto_resolve(&ctx, &project, &settings, &old, now);
+    crate::steps::auto_resolve(&ctx, &project, &settings, &old, &crate::steps::State::default(), now);
     let resolved = thread::load(&project, "t-0001").unwrap();
     assert_eq!((resolved.status, resolved.resolved_reason.as_str()), (Status::Resolved, "auto"));
     assert_eq!(items_of(&project, "thread-state").len(), 1);
@@ -861,7 +880,7 @@ fn a_failed_final_copy_blocks_auto_resolve() {
     let mut old = Memory::new(&ctx);
     old.started = "2026-01-01T00:00:00Z".parse().unwrap();
     let (settings, _) = project.read_project_md().unwrap();
-    let errors = crate::steps::auto_resolve(&ctx, &project, &settings, &old, jiff::Timestamp::now());
+    let errors = crate::steps::auto_resolve(&ctx, &project, &settings, &old, &crate::steps::State::default(), jiff::Timestamp::now());
     assert_eq!(errors.len(), 1);
     assert_eq!(thread::load(&project, "t-0001").unwrap().status, Status::Open);
     assert!(inbox::unhandled(&project).is_empty());

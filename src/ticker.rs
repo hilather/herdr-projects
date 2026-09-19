@@ -300,6 +300,10 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
             Err(error) => log.line(&format!("{slug}: {error:#}")),
         }
     }
+    if !reachable.is_empty() {
+        let first = (memory.tick.saturating_sub(1) % reachable.len() as u64) as usize;
+        reachable.rotate_left(first);
+    }
     for (project, seen) in &reachable {
         for error in tick_slow(ctx, project, seen, memory) {
             log.line(&format!("{}: {error:#}", project.slug));
@@ -316,6 +320,7 @@ pub fn tick_for_test(ctx: &Ctx, memory: &mut Memory) -> bool {
 
 /// What the cheap pass saw, handed to the slow pass so herdr is asked once.
 pub struct Seen {
+    notification_error: Option<String>,
     socket: String,
     agents: Vec<Agent>,
     panes: Vec<Pane>,
@@ -509,14 +514,15 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
     let missing_panes = pass.missing_panes + coordinator_missing;
 
     // Nudge (or notify) about inbox items `context` has not shown yet.
+    let mut notification_error = None;
     if let Ok((settings, _)) = project.read_project_md() {
         let mut state = steps::load_state(project);
-        let before = state.nudged.clone();
+        let before = state.clone();
         let ready_pane = agent.filter(|a| a.ready()).map(|_| record.pane_id.as_str());
         if let Err(error) = steps::nudge(project, &mut state, &settings, &herdr, ready_pane) {
-            first_error = first_error.or(Some(error.context("nudge")));
+            notification_error = Some(format!("nudge: {error:#}"));
         }
-        if state.nudged != before {
+        if state != before {
             steps::save_state(project, &state)?;
         }
     }
@@ -524,6 +530,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
     match first_error {
         Some(error) => Err(error),
         None => Ok(Some(Seen {
+            notification_error,
             socket: record.socket,
             agents,
             panes,
@@ -575,6 +582,7 @@ fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threa
 /// routines, auto-resolve and housekeeping.
 fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> Vec<anyhow::Error> {
     let mut errors = Vec::new();
+    if let Some(error) = &seen.notification_error { errors.push(anyhow::anyhow!("{error}")); }
     let mut copy_notes: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     let herdr = Herdr::new(ctx.env.herdr_bin(), &seen.socket, ctx.runner);
     let now = jiff::Timestamp::now();
@@ -629,17 +637,23 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     machines.sort();
     machines.dedup();
     for machine in machines {
-        if !memory.machine_is_due(&machine) {
+        let key = steps::MachineKey {
+            project: project.canonical_dir(),
+            socket: seen.socket.clone(),
+            machine: machine.clone(),
+        };
+        if !memory.machine_is_due(&key) {
             continue;
         }
         let threads: Vec<thread::Thread> = remote_threads.iter().filter(|t| t.machine == machine).cloned().collect();
         let outcome = remote_pass(ctx, project, &herdr, &machine, &threads, &mut may_start, &mut copy_notes, &mut errors);
-        let event = memory.record_machine(&machine, outcome.as_ref().err().map(String::as_str), now);
+        let outage_error = outcome.as_ref().err().map(String::as_str);
+        memory.record_machine(&key, outage_error);
+        errors.extend(steps::write_machine_outage(project, &mut state, &key, outage_error, now, memory.outage_secs).err());
         match outcome {
             Ok(found) => transitions.extend(found),
             Err(error) => errors.push(anyhow::anyhow!("{machine}: unreachable this tick: {error}")),
         }
-        errors.extend(steps::write_machine_outage(project, &machine, event, memory).err());
     }
 
     errors.extend(steps::write_thread_items(project, &mut state, &transitions, seen.session_lost, &copy_notes).err());
@@ -649,7 +663,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
         Ok((settings, _)) => {
             let commands = project.safety(&ctx.config_dir).map(|s| s.routine_commands).unwrap_or(false);
             errors.extend(steps::routines(ctx, project, &mut state, commands, None, &zoned));
-            errors.extend(steps::auto_resolve(ctx, project, &settings, memory, now));
+            errors.extend(steps::auto_resolve(ctx, project, &settings, memory, &state, now));
         }
         Err(error) => {
             let text = std::fs::read(project.project_md()).unwrap_or_default();

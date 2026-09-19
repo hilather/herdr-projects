@@ -109,16 +109,56 @@ For other agents the principle is the same: allow reading and steering, keep any
 
 `nudge = false` is the default, because on Herdr 0.9.1 a prompt that arrives while you are typing in the coordinator **is merged with, and submits, your half-typed text**. With it off, the ticker shows one Herdr notification per set of new inbox items ("3 new inbox items") and the coordinator picks them up at its next turn. Set `nudge = true` in `PROJECT.md` to have the ticker prompt the coordinator when it is idle; the message always begins `[herdr-projects ticker: automated, not the user, approves nothing]` and never carries outside text.
 
+Failed delivery remains pending across ticker restarts. Notifications count as
+delivered only when Herdr confirms `shown: true`; disabled/headless notifications
+remain pending. Retries start after 15–19 seconds and increase to a five-minute
+maximum, running on the next eligible tick. Failed nudges use the same backoff.
+Other project work continues while delivery is failing. A crash after delivery
+but before recording confirmation can cause a repeated notification or nudge.
+
+## Merged pull request recovery
+
+The ticker saves final-copy intent before copying a merged thread's report and
+library. Failed copies leave the thread open and retry with the same bounded
+backoff, independently of GitHub polling and across restarts. A paused project
+waits until resumed. Reopening or restarting a thread invalidates the old intent
+and prevents the same merged PR from immediately closing it again; a new PR can
+be followed normally. Changed execution identity is checked before and after
+copying. Finalization never removes the worktree.
+
+Existing partial-copy policy remains: skipped symlinks or an oversized library
+may resolve the thread, with a durable `copy` warning in the inbox. Failed copies
+do not resolve it. Artifact staging and preservation improvements remain pending.
+
+GitHub outage streaks are tracked per project and PR URL, and machine streaks per
+project/session/machine. Healthy resources do not clear another resource's
+outage. Streaks and pending outage/PR inbox events survive ticker restarts;
+replaying an event already in the inbox or handled folder does not duplicate it.
+`doctor` reports pending finalizations, notification retries, outage counts and
+unreadable or malformed ticker state in `.state/ticker.json`.
+
 ## Routines
 
 A file `routines/<name>.md`: TOML front matter with `schedule` (`every <N>m|h|d` or `daily HH:MM`, local time), optional `command`, `enabled`; the body is the prompt the coordinator receives as an inbox item when it is due. A routine with a `command` runs (`sh -c`, in the project folder, 60 second timeout) only when `routine_commands = true` **and** you have run `herdr-projects routine approve <project> <name>` in a terminal; its output reaches the coordinator capped at 4,000 characters inside a fence labelled as untrusted. Edit the command and it stops until approved again.
+
+Intervals require positive ASCII digits; the converted seconds must fit a signed
+64-bit integer (at most 9,223,372,036,854,775,807 seconds). Invalid Unicode suffixes
+and oversized intervals produce a routine configuration diagnostic. Other routines
+continue running. Daily schedules use the ticker machine's local timezone: a time
+in a daylight-saving gap shifts forward by the gap, and a repeated time runs only
+at its first occurrence. Missed daily occurrences coalesce into one run on return.
+
+The command deadline includes input delivery and output draining after its parent
+exits. Timeout cleanup allows a 200 ms TERM grace period before KILL. Each output
+stream is captured up to 1 MiB, with excess drained and discarded; routine reports
+label capture truncation. The inbox display limit remains 4,000 characters.
 
 ## Threads on other machines
 
 Save the machine with `herdr machine add --label <label> <ssh target>` (both machines need Herdr 0.9.1), then list a repo as `--repo /path/on/machine@<label>` or pass `thread start --machine <label>`. The home machine owns the project; only outbound SSH from home is needed, in batch mode, so set up key-based login first.
 
 - The worktree, the brief and the report live on the remote machine. The home ticker polls it once a minute and copies a changed report with `scp` and the thread's `library/` with `rsync -rt` (symbolic links are never followed or copied; a library over 50 MB is not copied and the inbox item says so).
-- A machine that doesn't answer is left alone: no state is read, threads keep their last group, and it is skipped for about two minutes. After ten minutes you get one `outage` inbox item, and one more when it is back.
+- A machine that doesn't answer is left alone: no state is read, threads keep their last group, and that project's session is skipped for about two minutes. After ten minutes you get one `outage` inbox item, and one more when it is back. Polling and backoff are tracked separately for each project/session, so projects sharing a machine label all receive poll opportunities. The first project in the slow pass rotates each tick.
 - A blocked remote thread needs you in its pane on that machine: select the machine in Herdr's sidebar, or run `herdr --remote <ssh target>`.
 - `focus` does not cover remote threads: their sidebar tokens are set on the remote Herdr server. They appear in `overview`, `thread list` and inbox items.
 - Tasks with no repository always run locally, as tabs.

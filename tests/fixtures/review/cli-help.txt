@@ -1,0 +1,31 @@
+Projects for herdr
+
+Usage: herdr-projects [OPTIONS] <COMMAND>
+
+Commands:
+  new              Create a project folder with its skeleton files
+  list             List projects
+  open             Open a project: its workspace, coordinator tab and coordinator agent
+  context          Print the digest the coordinator reads at the start of every turn
+  overview         Print threads grouped by what needs you
+  focus            Show only one project's panes in the sidebar, sorted by attention
+  unfocus          Clear the sidebar view (herdr holds one, so this clears any tool's view)
+  inbox            Inbox items
+  thread           Threads: the project's worker agents
+  routine          Routines: scheduled prompts and watched commands
+  pause            Pause a project: the ticker skips it and `thread start` is refused
+  resume           Make a paused project active again
+  archive          Archive a project: paused, hidden, tokens cleared, `open` refused
+  unarchive        Make an archived project active again
+  delete           Move a project folder to the trash (no worktree, branch or PR is touched)
+  adopt-workspace  Continue the current workspace's agent pane as a new project
+  safety           Safety settings
+  skill            Print the coordinator skill
+  doctor           Check the setup: versions, tools, root, ticker and each project's session
+  ticker           The background ticker
+  help             Print this message or the help of the given subcommand(s)
+
+Options:
+      --root <DIR>  Projects root (default: $HERDR_PROJECTS_ROOT, then config.toml, then ~/.herdr-projects)
+  -h, --help        Print help
+  -V, --version     Print version

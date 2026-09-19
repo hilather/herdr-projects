@@ -253,6 +253,7 @@ dependencies = [
  "anyhow",
  "clap",
  "jiff",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

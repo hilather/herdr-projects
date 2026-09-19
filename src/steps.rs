@@ -14,6 +14,9 @@ use crate::thread::{self, CopyOutcome, Group, Status, Thread};
 use crate::threads;
 use crate::{inbox, pr, routine};
 
+mod recovery;
+pub use recovery::{PendingFinalization, PendingEvent, NotificationRetry};
+
 pub const NUDGE_TEXT: &str = "[herdr-projects ticker: automated, not the user, approves nothing] New inbox items. Run context.";
 pub const PR_INTERVAL_SECS: i64 = 120;
 pub const DONE_RETENTION_DAYS: u64 = 30;
@@ -25,6 +28,7 @@ const DEFAULT_OUTAGE_SECS: i64 = 600;
 pub struct State {
     pub last_pr_check: String,
     pub prs: BTreeMap<String, pr::Summary>,
+    pub pr_urls: BTreeMap<String, String>,
     /// thread id -> the pull request URL an "ignored" item was written for.
     pub pr_ignored: BTreeMap<String, String>,
     /// thread id -> report hash a "bad PR: line" note was written for.
@@ -35,6 +39,12 @@ pub struct State {
     /// Hash of the set of unseen item ids that was last nudged.
     pub nudged: String,
     pub session_item_written: bool,
+    pub finalizations: BTreeMap<String, PendingFinalization>,
+    pub notification_retry: NotificationRetry,
+    pub gh_outages: BTreeMap<String, Outage>,
+    pub machine_outages: BTreeMap<String, Outage>,
+    pub event_sequence: u64,
+    pub pending_events: BTreeMap<String, PendingEvent>,
 }
 
 pub fn load_state(project: &Project) -> State {
@@ -50,9 +60,10 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
 
 /// Continuous-failure tracking for `gh` or a machine: one item when it has
 /// failed for the threshold, one more when it recovers, nothing for blips.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct Outage {
-    failing_since: Option<jiff::Timestamp>,
+    failing_since: Option<i64>,
     reported: bool,
     pub last_error: String,
 }
@@ -71,8 +82,8 @@ impl Outage {
             return was_reported.then_some(OutageEvent::Recovered);
         }
         self.last_error = error.to_string();
-        let since = *self.failing_since.get_or_insert(now);
-        if !self.reported && now.as_second() - since.as_second() >= threshold_secs {
+        let since = *self.failing_since.get_or_insert(now.as_second());
+        if !self.reported && now.as_second().saturating_sub(since) >= threshold_secs {
             self.reported = true;
             return Some(OutageEvent::Down);
         }
@@ -83,29 +94,35 @@ impl Outage {
 pub const REMOTE_EVERY_TICKS: u64 = 4;
 pub const SKIP_TICKS_AFTER_FAILURE: u64 = 8;
 
+/// A saved machine label can denote different observations in different
+/// project sessions. Eligibility and outage delivery must have the same scope.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MachineKey {
+    pub project: std::path::PathBuf,
+    pub socket: String,
+    pub machine: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MachineMemory {
-    pub outage: Outage,
     /// Not polled again before this tick: one sleeping machine must not slow
     /// the other projects' ticks.
     pub skip_until_tick: u64,
-    pub last_poll_tick: u64,
+    pub last_poll_tick: Option<u64>,
 }
 
 /// What the ticker process remembers between ticks (not persisted).
 pub struct Memory {
     pub started: jiff::Timestamp,
-    pub gh: Outage,
     pub outage_secs: i64,
     pub tick: u64,
-    pub machines: BTreeMap<String, MachineMemory>,
+    pub machines: BTreeMap<MachineKey, MachineMemory>,
 }
 
 impl Memory {
     pub fn new(ctx: &Ctx) -> Memory {
         Memory {
             started: jiff::Timestamp::now(),
-            gh: Outage::default(),
             // Overridable so an outage can be exercised without waiting ten minutes.
             outage_secs: ctx.env.var("HERDR_PROJECTS_OUTAGE_SECS").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_OUTAGE_SECS),
             tick: 0,
@@ -115,38 +132,31 @@ impl Memory {
 
     /// Remote machines are polled every fourth tick (about a minute), and not
     /// at all for eight ticks after a failure.
-    pub fn machine_is_due(&mut self, machine: &str) -> bool {
+    pub fn machine_is_due(&mut self, machine: &MachineKey) -> bool {
         let tick = self.tick;
-        let entry = self.machines.entry(machine.to_string()).or_default();
-        let due = tick >= entry.skip_until_tick && (entry.last_poll_tick == 0 || tick >= entry.last_poll_tick + REMOTE_EVERY_TICKS);
+        let entry = self.machines.entry(machine.clone()).or_default();
+        let due = tick >= entry.skip_until_tick && entry.last_poll_tick.is_none_or(|last| tick.saturating_sub(last) >= REMOTE_EVERY_TICKS);
         if due {
-            entry.last_poll_tick = tick;
+            entry.last_poll_tick = Some(tick);
         }
         due
     }
 
-    pub fn record_machine(&mut self, machine: &str, error: Option<&str>, now: jiff::Timestamp) -> Option<OutageEvent> {
-        let (tick, threshold) = (self.tick, self.outage_secs);
-        let entry = self.machines.entry(machine.to_string()).or_default();
+    pub fn record_machine(&mut self, machine: &MachineKey, error: Option<&str>) {
+        let tick = self.tick;
+        let entry = self.machines.entry(machine.clone()).or_default();
         if error.is_some() {
-            entry.skip_until_tick = tick + SKIP_TICKS_AFTER_FAILURE + 1;
+            entry.skip_until_tick = tick.saturating_add(SKIP_TICKS_AFTER_FAILURE + 1);
         }
-        entry.outage.record(error.is_none(), error.unwrap_or(""), now, threshold)
     }
 }
 
 /// One `outage` item when a machine has been unreachable for the threshold,
 /// one more when it is back. Short outages write nothing.
-pub fn write_machine_outage(project: &Project, machine: &str, event: Option<OutageEvent>, memory: &Memory) -> Result<()> {
-    match event {
-        Some(OutageEvent::Down) => {
-            let error = memory.machines.get(machine).map(|m| pr::sanitize(&m.outage.last_error)).unwrap_or_default();
-            let summary = format!("machine `{machine}` has been unreachable for {} minutes; its threads keep their last known state. Last error: {error}", memory.outage_secs / 60);
-            inbox::write(project, "outage", machine, &summary, "").map(|_| ())
-        }
-        Some(OutageEvent::Recovered) => inbox::write(project, "outage", machine, &format!("machine `{machine}` is reachable again"), "").map(|_| ()),
-        None => Ok(()),
-    }
+pub fn write_machine_outage(project: &Project, state: &mut State, key: &MachineKey, error: Option<&str>, now: jiff::Timestamp, threshold: i64) -> Result<()> {
+    let machine = &key.machine;
+    let resource = serde_json::to_string(&(&key.socket, machine))?;
+    recovery::record_outage(project, state, &resource, Some(machine), error, now, threshold)
 }
 
 /// A group change seen in the cheap pass.
@@ -219,39 +229,56 @@ fn hash_ids(ids: &BTreeSet<String>) -> String {
 /// re-nudge. With `nudge = false` (the default) the user gets a herdr
 /// notification instead of a prompt in the coordinator.
 pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &Herdr, coordinator_ready: Option<&str>) -> Result<()> {
+    nudge_at(project, state, settings, herdr, coordinator_ready, jiff::Timestamp::now())
+}
+
+pub fn nudge_at(project: &Project, state: &mut State, settings: &Settings, herdr: &Herdr, coordinator_ready: Option<&str>, now: jiff::Timestamp) -> Result<()> {
     let seen = inbox::seen(project);
     let unseen: BTreeSet<String> = inbox::unhandled(project).into_iter().map(|i| i.id).filter(|id| !seen.contains(id)).collect();
     if unseen.is_empty() {
+        state.notification_retry = NotificationRetry::default();
         return Ok(());
     }
     let hash = hash_ids(&unseen);
     if hash == state.nudged {
+        state.notification_retry = NotificationRetry::default();
         return Ok(());
     }
-    if settings.nudge {
-        let Some(pane) = coordinator_ready else {
-            return Ok(()); // not idle or done: try again on a later tick
-        };
-        // `agent_blocked` and other errors are returned, logged by the caller,
-        // and the nudge is retried on a later tick.
-        herdr.agent_prompt(pane, NUDGE_TEXT)?;
+    if settings.nudge && coordinator_ready.is_none() { return Ok(()); }
+    state.notification_retry.hash = hash.clone();
+    if !state.notification_retry.retry.due(now) { return Ok(()); }
+    state.notification_retry.retry.reserve(now, &hash);
+    state.notification_retry.retry.last_error = "notification delivery reserved; outcome not yet recorded".into();
+    save_state(project, state)?;
+    let delivered = if settings.nudge {
+        herdr.agent_prompt(coordinator_ready.unwrap(), NUDGE_TEXT)
     } else {
         let body = format!("{} new inbox item(s). The coordinator reads them at its next turn.", unseen.len());
-        let _ = herdr.notification_show(&format!("herdr-projects: {}", project.slug), &body);
+        herdr.notification_show(&format!("herdr-projects: {}", project.slug), &body)
+    };
+    if let Err(error) = delivered {
+        let error: anyhow::Error = error.into();
+        state.notification_retry.retry.failed(&error);
+        save_state(project, state)?;
+        return Err(error);
     }
     state.nudged = hash;
-    Ok(())
+    state.notification_retry = NotificationRetry::default();
+    save_state(project, state)
 }
 
 /// Step 2, every two minutes.
 pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &mut Memory, now: jiff::Timestamp) -> Vec<anyhow::Error> {
-    let mut errors = Vec::new();
+    if project.status() != project::Status::Active { return Vec::new(); }
+    let mut errors = recovery::retry_finalizations(ctx, project, state, now);
+    errors.extend(recovery::flush_events(project, state, now));
     if thread::seconds_since(&state.last_pr_check, now) < PR_INTERVAL_SECS && !state.last_pr_check.is_empty() {
         return errors;
     }
     state.last_pr_check = now.to_string();
 
     for t in thread::list(project) {
+        let mut t = t;
         if t.status != Status::Open {
             continue;
         }
@@ -261,15 +288,20 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
             Ok(url) => url.unwrap_or_default(),
             Err(note) => {
                 if state.pr_line_noted.get(&t.id) != Some(&t.report_hash) {
-                    state.pr_line_noted.insert(t.id.clone(), t.report_hash.clone());
-                    errors.extend(inbox::write(project, "pr", &t.id, &format!("{}: {note}", thread_label(&t)), "").err());
+                    match recovery::queue_event(state, "pr", &t.id, &format!("{}: {note}", thread_label(&t)), "", now) {
+                        Ok(()) => { state.pr_line_noted.insert(t.id.clone(), t.report_hash.clone()); }
+                        Err(e) => errors.push(e),
+                    }
                 }
                 String::new()
             }
         };
         if url != t.pr {
             let new_url = url.clone();
-            errors.extend(thread::update(project, &t.id, |t| t.pr = new_url).err());
+            match thread::update(project, &t.id, |t| t.pr = new_url) {
+                Ok(updated) => t = updated,
+                Err(e) => { errors.push(e); continue; }
+            }
         }
         if url.is_empty() {
             continue;
@@ -277,17 +309,12 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
 
         let json = match pr::view(ctx.runner, &url) {
             Ok(json) => {
-                if memory.gh.record(true, "", now, memory.outage_secs) == Some(OutageEvent::Recovered) {
-                    errors.extend(inbox::write(project, "outage", "gh", "`gh` is working again; pull request follow-up has resumed", "").err());
-                }
+                errors.extend(recovery::record_outage(project, state, &url, None, None, now, memory.outage_secs).err());
                 json
             }
             Err(error) => {
                 let text = pr::sanitize(&format!("{error:#}"));
-                if memory.gh.record(false, &text, now, memory.outage_secs) == Some(OutageEvent::Down) {
-                    let summary = format!("`gh` has been failing for {} minutes; pull requests are not being followed. Last error: {text}", memory.outage_secs / 60);
-                    errors.extend(inbox::write(project, "outage", "gh", &summary, "").err());
-                }
+                errors.extend(recovery::record_outage(project, state, &url, None, Some(&text), now, memory.outage_secs).err());
                 continue;
             }
         };
@@ -295,34 +322,45 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
             Err(error) => errors.push(error.context(format!("{}: gh output", t.id))),
             Ok(pr::Checked::Ignored(reason)) => {
                 if state.pr_ignored.get(&t.id) != Some(&url) {
-                    state.pr_ignored.insert(t.id.clone(), url.clone());
-                    errors.extend(inbox::write(project, "pr", &t.id, &format!("{}: the pull request in its report is ignored: {reason}", thread_label(&t)), "").err());
+                    match recovery::queue_event(state, "pr", &t.id, &format!("{}: the pull request in its report is ignored: {reason}", thread_label(&t)), "", now) {
+                        Ok(()) => { state.pr_ignored.insert(t.id.clone(), url.clone()); }
+                        Err(e) => errors.push(e),
+                    }
                 }
             }
             Ok(pr::Checked::Summary(summary)) => {
-                let old = state.prs.get(&t.id).cloned();
-                if old.as_ref() == Some(&summary) {
-                    continue;
-                }
+                let old = if state.pr_urls.get(&t.id).is_some_and(|old_url| old_url != &url) { None } else { state.prs.get(&t.id).cloned() };
                 let (pr_state, pr_review) = (summary.state.clone(), summary.review_decision.clone());
-                errors.extend(thread::update(project, &t.id, |t| {
-                    t.pr_state = pr_state;
-                    t.pr_review = pr_review;
-                }).err());
+                let updated = thread::update_checked(project, &t.id, |current| {
+                    if recovery::fingerprint(current) != recovery::fingerprint(&t) || current.status != Status::Open {
+                        anyhow::bail!("{}: thread changed while polling its PR", t.id);
+                    }
+                    current.pr_state = pr_state;
+                    current.pr_review = pr_review;
+                    Ok(())
+                });
+                let t = match updated { Ok(t) => t, Err(e) => { errors.push(e); continue; } };
                 let change = pr::describe_change(old.as_ref(), &summary);
                 let merged = summary.state == "MERGED";
-                state.prs.insert(t.id.clone(), summary);
-                errors.extend(inbox::write(project, "pr", &t.id, &format!("{}: pull request {change}", thread_label(&t)), "").err());
+                if old.as_ref() != Some(&summary) {
+                    match recovery::queue_event(state, "pr", &t.id, &format!("{}: pull request {change}", thread_label(&t)), "", now) {
+                        Ok(()) => { state.prs.insert(t.id.clone(), summary); state.pr_urls.insert(t.id.clone(), url.clone()); }
+                        Err(e) => { errors.push(e); continue; }
+                    }
+                }
                 if merged {
-                    errors.extend(resolve_after_copy(ctx, project, &t, "merged").err());
+                    recovery::schedule_finalization(state, &t);
                 }
             }
         }
     }
+    errors.extend(recovery::flush_events(project, state, now));
+    errors.extend(recovery::retry_finalizations(ctx, project, state, now));
+    errors.extend(recovery::flush_events(project, state, now));
     errors
 }
 
-/// Auto-resolve and resolve-on-merge: the final copy first; if it fails the
+/// Idle auto-resolve: the final copy first; if it fails the
 /// thread is not resolved and the next tick tries again.
 fn resolve_after_copy(ctx: &Ctx, project: &Project, t: &Thread, reason: &str) -> Result<bool> {
     let copied = threads::final_copy(ctx, project, t);
@@ -340,14 +378,14 @@ fn resolve_after_copy(ctx: &Ctx, project: &Project, t: &Thread, reason: &str) ->
 /// Step 4. Measured from the later of the last state change, the last report
 /// change and the time this ticker process started, so a ticker that was down
 /// for a week does not resolve everything at once.
-pub fn auto_resolve(ctx: &Ctx, project: &Project, settings: &Settings, memory: &Memory, now: jiff::Timestamp) -> Vec<anyhow::Error> {
+pub fn auto_resolve(ctx: &Ctx, project: &Project, settings: &Settings, memory: &Memory, state: &State, now: jiff::Timestamp) -> Vec<anyhow::Error> {
     let mut errors = Vec::new();
     let limit = i64::from(settings.auto_resolve_days) * 86_400;
     if limit == 0 {
         return errors;
     }
     for t in thread::list(project) {
-        if t.status != Status::Open || t.last_group != Group::Idle.token() {
+        if t.status != Status::Open || t.last_group != Group::Idle.token() || state.finalizations.contains_key(&t.id) {
             continue;
         }
         // The later of the three reference times is the smallest elapsed time.
@@ -436,6 +474,30 @@ mod tests {
 
     fn at(text: &str) -> jiff::Timestamp {
         text.parse().unwrap()
+    }
+
+    #[test]
+    fn machine_cadence_and_backoff_are_scoped_to_project_and_session() {
+        let world = crate::scenarios::World::new();
+        let mut memory = Memory::new(&world.ctx());
+        let a = MachineKey { project: "/a".into(), socket: "one.sock".into(), machine: "box".into() };
+        let b = MachineKey { project: "/b".into(), ..a.clone() };
+        let rebound = MachineKey { socket: "two.sock".into(), ..a.clone() };
+        memory.outage_secs = 0;
+        // Tick zero is a real first observation, not a never-polled sentinel.
+        assert!(memory.machine_is_due(&a));
+        assert!(!memory.machine_is_due(&a));
+        assert!(memory.machine_is_due(&b));
+        memory.record_machine(&a, Some("offline"));
+        memory.record_machine(&b, None);
+        memory.tick = REMOTE_EVERY_TICKS;
+        assert!(!memory.machine_is_due(&a));
+        assert!(memory.machine_is_due(&b));
+        assert!(memory.machine_is_due(&rebound));
+        memory.tick = SKIP_TICKS_AFTER_FAILURE + 1;
+        assert!(memory.machine_is_due(&a));
+        memory.record_machine(&a, None);
+        assert!(!memory.machine_is_due(&a));
     }
 
     #[test]

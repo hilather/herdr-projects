@@ -75,6 +75,11 @@ pub struct Thread {
     pub pr_state: String,
     pub pr_review: String,
     pub resolved_reason: String,
+    /// Changes when a user restarts/resolves/reopens this execution.
+    pub lifecycle_generation: u64,
+    /// A manual reopen/restart must not immediately re-resolve the old PR.
+    pub suppressed_merged_pr: String,
+    pub last_finalization: String,
 }
 
 impl Thread {
@@ -143,12 +148,23 @@ fn write_record(project: &Project, thread: &Thread) -> Result<()> {
 /// Read-modify-write under the project lock: re-reads the record, lets `change`
 /// touch only the fields its step owns, writes.
 pub fn update(project: &Project, id: &str, change: impl FnOnce(&mut Thread)) -> Result<Thread> {
+    update_checked(project, id, |t| { change(t); Ok(()) })
+}
+
+/// Validate and mutate under the same lock, without committing a failed check.
+pub fn update_checked(project: &Project, id: &str, change: impl FnOnce(&mut Thread) -> Result<()>) -> Result<Thread> {
     let _lock = project.lock()?;
     let mut thread = load(project, id)?;
-    change(&mut thread);
+    change(&mut thread)?;
     thread.updated = project::now();
     write_record(project, &thread)?;
     Ok(thread)
+}
+
+pub fn invalidate_finalization(t: &mut Thread) -> Result<()> {
+    t.lifecycle_generation = t.lifecycle_generation.checked_add(1).context("thread lifecycle generation exhausted")?;
+    t.suppressed_merged_pr = t.pr.clone();
+    Ok(())
 }
 
 /// Allocates the next id under the project lock and writes the first record.
@@ -640,6 +656,9 @@ pub fn copy_home_remote(project: &Project, thread: &Thread, with_library: bool, 
 
 fn copy_library_local(project: &Project, thread: &Thread, library: &Path, runner: &dyn Runner) -> Result<Vec<String>> {
     let du = runner.run(&Cmd::new("du", Duration::from_secs(10)).args(["-sk", &library.to_string_lossy()]))?;
+    if !du.success() {
+        bail!("could not measure the library folder: {}", du.error_text());
+    }
     let kb: u64 = du
         .stdout
         .split_whitespace()
@@ -950,6 +969,25 @@ mod tests {
         let copied = copy_home_local(&project, &t, true, &RealRunner);
         assert!(matches!(copied.outcome, CopyOutcome::Partial(_)));
         assert!(!project.dir().join("library/t-0001/link").exists());
+    }
+
+    #[test]
+    fn failed_size_measurement_cannot_authorize_an_artifact_copy() {
+        use crate::runner::fake::{FakeRunner, ok};
+        let root = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let t = local_thread(&project, work.path());
+        for truncated in [false, true] {
+            let runner = FakeRunner::new();
+            let mut out = ok("4\t/library\n");
+            out.stdout_truncated = truncated;
+            if !truncated { out.code = Some(1); }
+            runner.on("du -sk", out);
+            let copied = copy_home_local(&project, &t, true, &runner);
+            assert!(matches!(copied.outcome, CopyOutcome::Failed(_)));
+            assert_eq!(runner.count("rsync"), 0);
+        }
     }
 
     #[test]

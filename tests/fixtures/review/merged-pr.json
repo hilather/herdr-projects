@@ -1,0 +1,7 @@
+{
+  "state": "MERGED",
+  "reviewDecision": "APPROVED",
+  "headRefName": "hp/demo/t-0001-task",
+  "headRepository": { "name": "app" },
+  "headRepositoryOwner": { "login": "owner" }
+}

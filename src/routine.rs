@@ -28,15 +28,17 @@ pub fn parse_schedule(text: &str) -> Result<Schedule> {
     let text = text.trim();
     if let Some(rest) = text.strip_prefix("every ") {
         let rest = rest.trim();
-        let (digits, unit) = rest.split_at(rest.len().saturating_sub(1));
+        let (digits, seconds) = [('m', 60_i64), ('h', 3600), ('d', 86_400)]
+            .into_iter()
+            .find_map(|(unit, seconds)| rest.strip_suffix(unit).map(|digits| (digits, seconds)))
+            .with_context(|| format!("bad schedule `{text}`: use `every <N>m`, `<N>h` or `<N>d`"))?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            bail!("bad schedule `{text}`: the interval must be positive ASCII decimal digits");
+        }
         let n: i64 = digits.parse().ok().filter(|n| *n > 0).with_context(|| format!("bad schedule `{text}`"))?;
-        let seconds = match unit {
-            "m" => 60,
-            "h" => 3600,
-            "d" => 86_400,
-            _ => bail!("bad schedule `{text}`: use `every <N>m`, `<N>h` or `<N>d`"),
-        };
-        return Ok(Schedule::Every(n * seconds));
+        let interval = n.checked_mul(seconds)
+            .with_context(|| format!("bad schedule `{text}`: interval exceeds {} seconds", i64::MAX))?;
+        return Ok(Schedule::Every(interval));
     }
     if let Some(rest) = text.strip_prefix("daily ") {
         let (h, m) = rest.trim().split_once(':').with_context(|| format!("bad schedule `{text}`"))?;
@@ -56,16 +58,22 @@ pub fn is_due(schedule: &Schedule, last_run: jiff::Timestamp, now: &jiff::Zoned)
     match schedule {
         Schedule::Every(seconds) => now.timestamp().as_second() - last_run.as_second() >= *seconds,
         Schedule::Daily(hour, minute) => {
-            let Ok(today) = now.with().hour(*hour).minute(*minute).second(0).subsec_nanosecond(0).build() else {
+            // Resolve the civil time independently of `now`'s UTC offset.
+            // Compatible disambiguation shifts gaps forward and chooses the
+            // first occurrence of a repeated time, yielding one daily instant.
+            let at = |date: jiff::civil::Date| now.time_zone()
+                .to_ambiguous_zoned(date.at(*hour, *minute, 0, 0))
+                .compatible();
+            let Ok(today) = at(now.date()) else {
                 return false;
             };
             // The most recent occurrence of HH:MM at or before now.
             let latest = if today.timestamp() <= now.timestamp() {
                 today
             } else {
-                match today.yesterday() {
-                    Ok(yesterday) => yesterday,
-                    Err(_) => return false,
+                match now.date().yesterday().ok().and_then(|date| at(date).ok()) {
+                    Some(yesterday) => yesterday,
+                    None => return false,
                 }
             };
             last_run < latest.timestamp()
@@ -271,11 +279,15 @@ pub fn run_command(runner: &dyn Runner, project: &Project, routine: &Routine) ->
     if !out.stderr.trim().is_empty() {
         text.push_str(&out.stderr);
     }
-    let exit = match (out.timed_out, out.code) {
+    let mut exit = match (out.timed_out, out.code) {
         (true, _) => "timed out after 60 seconds".to_string(),
         (_, Some(code)) => format!("exit code {code}"),
         _ => "killed".to_string(),
     };
+    if out.cancelled { exit = "cancelled".into(); }
+    if out.stdout_truncated || out.stderr_truncated {
+        exit.push_str("; command output capture truncated");
+    }
     let capped: String = text.chars().take(OUTPUT_CAP_CHARS).collect();
     let cut = if capped.len() < text.len() { "\n(output cut at 4,000 characters)" } else { "" };
     let fence = fence_for(&capped);
@@ -323,6 +335,43 @@ mod tests {
         let schedule = Schedule::Every(3600);
         assert!(!is_due(&schedule, "2026-09-17T09:30:00Z".parse().unwrap(), &now));
         assert!(is_due(&schedule, "2026-09-17T09:00:00Z".parse().unwrap(), &now));
+    }
+
+    #[test]
+    fn schedule_interval_boundaries_and_malformed_utf8_text() {
+        for (unit, scale) in [('m', 60), ('h', 3600), ('d', 86_400)] {
+            let max = i64::MAX / scale;
+            assert_eq!(parse_schedule(&format!("every {max}{unit}")).unwrap(), Schedule::Every(max * scale));
+            assert!(parse_schedule(&format!("every {}{unit}", max + 1)).is_err());
+        }
+        for bad in ["every ", "every +1m", "every １m", "every 1 m", "every 0d", "every 9999999999999999999999999m"] {
+            assert!(parse_schedule(bad).is_err(), "{bad}");
+        }
+        // A deterministic spread of Unicode scalar values, including 1–4 byte
+        // encodings. Parsing must be total, regardless of prefix or suffix.
+        for scalar in (0..=0x10ffff).step_by(997) {
+            if let Some(ch) = char::from_u32(scalar) {
+                let _ = parse_schedule(&format!("every 1{ch}"));
+                let _ = parse_schedule(&format!("every {ch}m"));
+                let _ = parse_schedule(&format!("daily {ch}:30"));
+            }
+        }
+    }
+
+    #[test]
+    fn daily_gap_shifts_forward_and_overlap_runs_only_once() {
+        let schedule = Schedule::Daily(2, 30);
+        let yesterday = "2026-03-28T01:30:00Z".parse().unwrap();
+        assert!(!is_due(&schedule, yesterday, &zoned("2026-03-29T03:00:00+02:00[Europe/Stockholm]")));
+        assert!(is_due(&schedule, yesterday, &zoned("2026-03-29T03:30:00+02:00[Europe/Stockholm]")));
+        let shifted = "2026-03-29T01:30:00Z".parse().unwrap();
+        assert!(!is_due(&schedule, shifted, &zoned("2026-03-30T02:00:00+02:00[Europe/Stockholm]")));
+        let yesterday = "2026-10-24T00:30:00Z".parse().unwrap();
+        assert!(is_due(&schedule, yesterday, &zoned("2026-10-25T02:30:00+02:00[Europe/Stockholm]")));
+        let first = "2026-10-25T00:30:00Z".parse().unwrap();
+        for now in ["2026-10-25T02:15:00+01:00[Europe/Stockholm]", "2026-10-25T02:45:00+01:00[Europe/Stockholm]"] {
+            assert!(!is_due(&schedule, first, &zoned(now)), "duplicate on {now}");
+        }
     }
 
     #[test]

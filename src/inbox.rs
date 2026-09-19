@@ -73,6 +73,30 @@ pub fn write(project: &Project, kind: &str, subject: &str, summary: &str, body: 
     Ok(id)
 }
 
+/// Idempotent delivery for a persisted ticker event, including already handled
+/// items. A crash between this write and its receipt cannot duplicate the item.
+pub fn write_once(project: &Project, id: &str, kind: &str, subject: &str, summary: &str, body: &str) -> Result<()> {
+    validate_id(id)?;
+    let _lock = project.lock()?;
+    let summary: String = summary.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    for dir in [inbox_dir(project), inbox_dir(project).join("done")] {
+        match std::fs::read_to_string(dir.join(format!("{id}.md"))) {
+            Ok(text) => {
+                if let Some(item) = parse(&text)
+                    && item.id == id && item.kind == kind && item.subject == subject
+                    && item.summary == summary && item.body.trim_end() == body.trim_matches('\n').trim_end()
+                { return Ok(()); }
+                bail!("inbox event `{id}` already exists with different or invalid content");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let item = Item { id: id.into(), kind: kind.into(), subject: subject.into(), created: project::now(), summary, body: String::new() };
+    let text = format!("+++\n{}+++\n\n{}\n", toml::to_string(&item)?, body.trim_end());
+    project::write_atomic(&inbox_dir(project).join(format!("{id}.md")), text.as_bytes())
+}
+
 /// Deletes handled items older than `days`.
 pub fn prune_done(project: &Project, days: u64) {
     let Ok(entries) = std::fs::read_dir(inbox_dir(project).join("done")) else {

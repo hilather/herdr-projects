@@ -400,7 +400,9 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str) -> Result<Thread> {
         }
     };
 
-    match restart_plan(&record, &live, branch_exists, now)? {
+    let plan = restart_plan(&record, &live, branch_exists, now)?;
+    thread::update_checked(&project, id, thread::invalidate_finalization)?;
+    match plan {
         RestartPlan::Create => return place_and_brief(ctx, &project, &view, id, true),
         RestartPlan::ReusePane => {}
         RestartPlan::Reopen => match record.kind {
@@ -487,9 +489,11 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
         if record.status != Status::Resolved {
             bail!("{id} is not resolved");
         }
-        thread::update(&project, id, |t| {
+        thread::update_checked(&project, id, |t| {
+            thread::invalidate_finalization(t)?;
             t.status = Status::Open;
             t.resolved_reason.clear();
+            Ok(())
         })?;
         println!("{id} is open again. Nothing was started; `thread restart {slug} {id}` brings its agent back.");
         return Ok(());
@@ -526,10 +530,12 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
         // The record says what exists: `delete` lists leftovers from it.
         thread::update(&project, id, |t| t.worktree_path.clear())?;
     }
-    let resolved = thread::update(&project, id, |t| {
+    let resolved = thread::update_checked(&project, id, |t| {
+        thread::invalidate_finalization(t)?;
         t.status = Status::Resolved;
         t.resolved_reason = "manual".into();
         t.prompt_pending = false;
+        Ok(())
     })?;
     if let Some(view) = session_view(ctx, &project) {
         clear_thread_tokens(&view.herdr, &resolved);
@@ -552,14 +558,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
 
 /// The final report and library copy, storing the new report hash.
 pub fn final_copy(ctx: &Ctx, project: &Project, record: &Thread) -> thread::Copied {
-    let copied = if record.is_remote() {
-        match remote::ssh_target(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, &record.machine) {
-            Ok(target) => thread::copy_home_remote(project, record, true, ctx.runner, &target),
-            Err(error) => thread::Copied { outcome: CopyOutcome::Failed(format!("{error:#}")), report_hash: None },
-        }
-    } else {
-        thread::copy_home_local(project, record, true, ctx.runner)
-    };
+    let copied = copy_for_finalization(ctx, project, record);
     if let Some(hash) = &copied.report_hash
         && *hash != record.report_hash
     {
@@ -569,6 +568,18 @@ pub fn final_copy(ctx: &Ctx, project: &Project, record: &Thread) -> thread::Copi
         });
     }
     copied
+}
+
+/// Copy only; the durable finalizer commits the receipt with its identity check.
+pub fn copy_for_finalization(ctx: &Ctx, project: &Project, record: &Thread) -> thread::Copied {
+    if record.is_remote() {
+        match remote::ssh_target(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, &record.machine) {
+            Ok(target) => thread::copy_home_remote(project, record, true, ctx.runner, &target),
+            Err(error) => thread::Copied { outcome: CopyOutcome::Failed(format!("{error:#}")), report_hash: None },
+        }
+    } else {
+        thread::copy_home_local(project, record, true, ctx.runner)
+    }
 }
 
 /// Never forces. herdr's or git's refusal (for example uncommitted changes) is
