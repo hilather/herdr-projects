@@ -43,7 +43,7 @@ thread/settings fields are preserved in the original bytes.
 Schema v2 added source provenance and an import receipt; v3 adds durable delivery
 state and the imported-operation count; v4 adds canonical inbox records and v5
 adds typed, unverified runtime identities. Opening an older supported schema does
-not upgrade it. Use `upgrade-store` explicitly. Fresh stores use v5; the runtime
+not upgrade it. Use `upgrade-store` explicitly. Fresh stores use v6; the runtime
 ownership marker remains `sqlite-v2`. Newer unknown schemas refuse writes.
 Import stores task mappings, raw runtime/thread/inbox/task bytes, hashes, supported
 operation intents and audit events in one transaction. It verifies exact bytes, identities, counts, task states,
@@ -187,3 +187,6 @@ session provenance and inventory completeness, including on an already-open stor
 Corruption is reported rather than producing an empty identity list. Schema-v5
 runtime exports include typed bindings; older schema exports remain unchanged.
 Full runtime mutation, resource adoption and live reconciliation remain unfinished.
+
+Schema v6 adds durable runtime observations. See [reconciliation](reconciliation.md)
+for the read-only collector, recording protocol and remaining execution boundary.

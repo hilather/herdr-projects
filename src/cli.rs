@@ -54,6 +54,9 @@ enum RepairCommand {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Observe recorded runtime identities; --record persists evidence without dispatch
+    #[cfg(feature="state-store")]
+    Reconcile { slug:String, #[arg(long)] record:bool },
     /// Inspect or edit migrated task records without starting execution
     #[cfg(feature="state-store")]
     Task { slug:String, #[command(subcommand)] command:TaskCommand },
@@ -382,6 +385,12 @@ pub fn run() -> Result<()> {
     };
 
     match cli.command {
+        #[cfg(feature="state-store")]
+        Command::Reconcile{slug,record}=>{
+            project::validate_slug(&slug)?;
+            println!("{}",serde_json::to_string_pretty(&crate::reconcile_live::run(&ctx,&ctx.root.join(slug),record)?)?);
+            Ok(())
+        },
         #[cfg(feature="state-store")]
         Command::Task { slug,command } => {
             use herdr_projects::{domain::TaskId,runtime};

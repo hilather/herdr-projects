@@ -154,8 +154,8 @@ fn changed_schema_is_rechecked_before_commit_and_bad_payload_is_visible() {
     let raw = Connection::open(temp.path().join("state.db")).unwrap();
     raw.execute("UPDATE operations SET payload='{}'",[]).unwrap();
     assert!(matches!(db.read_snapshot(None),Err(StoreError::Corrupt(_))));
-    raw.pragma_update(None,"user_version",6).unwrap();
-    assert!(matches!(db.commit(Commit { expected_head:2, mutations:vec![put(task("t-1",2),Some(1))] }),Err(StoreError::UnsupportedSchema(6))));
+    raw.pragma_update(None,"user_version",7).unwrap();
+    assert!(matches!(db.commit(Commit { expected_head:2, mutations:vec![put(task("t-1",2),Some(1))] }),Err(StoreError::UnsupportedSchema(7))));
 }
 
 #[test]

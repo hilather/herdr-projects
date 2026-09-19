@@ -60,3 +60,5 @@ fn main() {
         std::process::exit(1);
     }
 }
+#[cfg(feature="state-store")]
+mod reconcile_live;

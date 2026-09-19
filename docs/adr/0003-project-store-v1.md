@@ -135,6 +135,9 @@ revision directories to preserve earlier schema exports at the same event head.
 
 
 Schema v5 adds typed runtime bindings with task/source references, payload hashes,
-and unverified ownership. Fresh stores now use v5. Backfill uses DB provenance in
+and unverified ownership. Fresh stores used v5 at that stage. Backfill uses DB provenance in
 the explicit upgrade transaction and preserves the event head; schema-qualified
 exports distinguish the new derived records. Runtime mutation is not yet exposed.
+
+Schema v6 adds runtime observations, hashed payloads and binding foreign keys.
+Fresh stores use v6; explicit upgrades retain prior exports and canonical task state.

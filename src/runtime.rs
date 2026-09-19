@@ -56,3 +56,9 @@ pub fn observe_imported_receipts(project:&Path,expected_head:Option<u64>)->Resul
     let head=match expected_head {Some(head)=>head,None=>db.read_snapshot(None)?.head};
     Ok(db.observe_imported_receipts(head,jiff::Timestamp::now().as_millisecond(),expected_head.is_some())?)
 }
+
+pub fn record_observations(project:&Path,batch:&crate::reconcile::ObservationBatch)->Result<u64> {
+    ensure!(!batch.dispatch_allowed,"observations cannot authorize dispatch");
+    let _maintenance=migration::maintenance(project)?;
+    Ok(migration::open_active(project)?.record_observations(batch.expected_head,&batch.observations)?)
+}

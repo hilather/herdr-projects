@@ -87,6 +87,7 @@ pub struct Snapshot {
     pub deliveries: Vec<crate::operations::Delivery>,
     pub inbox: Vec<InboxItem>,
     pub runtime_bindings:Vec<RuntimeBinding>,
+    pub observations:Vec<crate::reconcile::RuntimeObservation>,
     pub events: Vec<Event>,
 }
 pub enum Mutation {

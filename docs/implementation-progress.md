@@ -292,3 +292,27 @@ Successful logs: `/tmp/herdr-bindings-debug-isolated.log`,
 `/tmp/herdr-bindings-final-release.log`, `/tmp/herdr-bindings-legacy.log`, and
 `/tmp/herdr-bindings-build.log`. `git diff --check` passes. Three live fixtures stay
 opt-in; macOS remains untested.
+
+
+## Durable runtime observation
+
+Committed schema-v5 runtime identities as `420d8a2`. Schema v6 and `reconcile
+PROJECT [--record]` add a bounded Herdr/Git observation collector over those records,
+complete-batch recording with event-head/binding/task revision fences, source/config
+rechecks, observation timestamps and hash-checked persistence. No external effects,
+capacity release, lifecycle changes or ownership grants occur.
+
+Independent review approved the observation-only scope. Its suggested fixes now
+reject contradictory Git branch/detached records and enforce complete binding
+coverage in the store API. Tests cover absent/unreachable/mismatched/duplicate pane
+identities, inconsistent agents, truncated Git output, stale state and old timestamps,
+idempotent recording, preserved task state and the CLI preview/record path.
+T03.4 is now partial: 13 implemented locally, three partial, 25 not started. The
+remaining W03 adapters require this observation layer before ownership integration.
+
+Validation: 302 tests pass serially in debug and release (60 library, 222 binary,
+18 CLI, two contracts); 227 default-feature tests and the locked all-feature
+release build pass. Three live fixtures remain opt-in. Logs:
+`/tmp/herdr-reconcile-final-debug.log`, `/tmp/herdr-reconcile-release.log`,
+`/tmp/herdr-reconcile-legacy.log`, `/tmp/herdr-reconcile-build.log`.
+`git diff --check` passes. macOS and live ownership acquisition remain untested.

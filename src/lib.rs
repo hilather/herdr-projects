@@ -13,3 +13,5 @@ pub mod projections;
 pub mod operations;
 #[cfg(feature = "state-store")]
 pub mod runtime;
+#[cfg(feature="state-store")]
+pub mod reconcile;

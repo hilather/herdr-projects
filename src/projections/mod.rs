@@ -19,6 +19,7 @@ pub fn export(project:&Path,db:&mut SqliteStore)->Result<PathBuf> {
     for task in &snapshot.tasks { text.push_str(&format!("- {} (revision {}, {:?}): {}\n",task.id.as_str(),task.revision,task.state,task.title.replace(['\n','\r']," "))); }
     let mut runtime=serde_json::json!({"owner":"sqlite-v2","event_head":snapshot.head,"reconciliation_required":true,"sources":sources.iter().filter(|s|s.kind=="runtime"||s.kind=="thread"||s.kind=="inbox").map(|s|serde_json::json!({"path":s.path,"kind":s.kind,"digest":s.digest,"content":String::from_utf8_lossy(&s.bytes)})).collect::<Vec<_>>()});
     if snapshot.schema_version>=5 {runtime["bindings"]=serde_json::to_value(&snapshot.runtime_bindings)?;}
+    if snapshot.schema_version>=6 {runtime["observations"]=serde_json::to_value(&snapshot.observations)?;}
     let operations=serde_json::json!({"owner":"sqlite-v2","event_head":snapshot.head,"intents":snapshot.operations,"deliveries":snapshot.deliveries});
     let inbox=serde_json::json!({"owner":"sqlite-v2","event_head":snapshot.head,"items":snapshot.inbox});
     for (name,bytes) in [("TASKS.md",text.into_bytes()),("runtime.json",serde_json::to_vec_pretty(&runtime)?),("operations.json",serde_json::to_vec_pretty(&operations)?),("inbox.json",serde_json::to_vec_pretty(&inbox)?)] {
