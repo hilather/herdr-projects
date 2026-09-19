@@ -531,6 +531,9 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
         thread::update(&project, id, |t| t.worktree_path.clear())?;
     }
     let resolved = thread::update_checked(&project, id, |t| {
+        if thread::execution_fingerprint(t) != thread::execution_fingerprint(&record) || t.status != record.status {
+            bail!("thread changed during resolve; keeping its current state");
+        }
         thread::invalidate_finalization(t)?;
         t.status = Status::Resolved;
         t.resolved_reason = "manual".into();
@@ -545,7 +548,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
         match resolved.kind {
             Kind::Worktree if resolved.worktree_path.is_empty() => println!("No worktree was recorded for it, so there is nothing to close or remove."),
             Kind::Worktree => println!(
-                "Its pane, workspace, worktree ({}) and branch ({}) were left alone. Close the workspace in herdr, or run `thread resolve {slug} {id} --remove-worktree`.",
+                "Its pane, workspace, worktree ({}) and branch ({}) were left alone. Automatic cleanup is unavailable until writer shutdown can be verified.",
                 resolved.worktree_path, resolved.branch
             ),
             _ => println!("Its pane and tab were left alone; close them in herdr."),
@@ -558,14 +561,20 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
 
 /// The final report and library copy, storing the new report hash.
 pub fn final_copy(ctx: &Ctx, project: &Project, record: &Thread) -> thread::Copied {
-    let copied = copy_for_finalization(ctx, project, record);
-    if let Some(hash) = &copied.report_hash
-        && *hash != record.report_hash
-    {
-        let _ = thread::update(project, &record.id, |t| {
-            t.report_hash = hash.clone();
-            t.last_report_change = project::now();
+    let mut copied = copy_for_finalization(ctx, project, record);
+    if !matches!(copied.outcome, CopyOutcome::Failed(_)) {
+        let saved = thread::update_checked(project, &record.id, |t| {
+            if thread::execution_fingerprint(t) != thread::execution_fingerprint(record) || t.status != record.status {
+                bail!("thread identity changed during final copy");
+            }
+            if let Some(hash) = &copied.report_hash {
+                if *hash != t.report_hash { t.last_report_change = project::now(); }
+                t.report_hash = hash.clone();
+            }
+            if let Some(snapshot) = &copied.artifact_snapshot { t.artifact_snapshot = snapshot.clone(); }
+            Ok(())
         });
+        if let Err(error) = saved { copied.outcome = CopyOutcome::Failed(format!("could not commit final-copy receipt: {error:#}")); }
     }
     copied
 }
@@ -575,35 +584,82 @@ pub fn copy_for_finalization(ctx: &Ctx, project: &Project, record: &Thread) -> t
     if record.is_remote() {
         match remote::ssh_target(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, &record.machine) {
             Ok(target) => thread::copy_home_remote(project, record, true, ctx.runner, &target),
-            Err(error) => thread::Copied { outcome: CopyOutcome::Failed(format!("{error:#}")), report_hash: None },
+            Err(error) => thread::Copied { artifact_snapshot: None, outcome: CopyOutcome::Failed(format!("{error:#}")), report_hash: None },
         }
     } else {
-        thread::copy_home_local(project, record, true, ctx.runner)
+        let mut copied = thread::copy_home_local(project, record, true, ctx.runner);
+        if matches!(copied.outcome, CopyOutcome::Complete) {
+            let snapshot = (|| -> Result<Option<String>> {
+                if record.thread_dir.is_empty() || !Path::new(&record.thread_dir).try_exists()? {
+                    if !record.artifact_snapshot.is_empty() { bail!("previously preserved artifact source is missing"); }
+                    return Ok(None);
+                }
+                let snapshot = crate::artifacts::capture_local(project, record)?;
+                if snapshot.manifest.report_hash() != copied.report_hash.as_deref() { bail!("report changed between live copy and preservation snapshot"); }
+                Ok(Some(snapshot.id))
+            })();
+            match snapshot {
+                Ok(id) => copied.artifact_snapshot = id,
+                Err(error) => copied.outcome = CopyOutcome::Failed(format!("artifact preservation failed: {error:#}")),
+            }
+        }
+        copied
     }
 }
 
-/// Never forces. herdr's or git's refusal (for example uncommitted changes) is
-/// reported unchanged.
+/// Validate preservation and ownership, then refuse until writer exclusion is
+/// implemented. No force-removal fallback exists.
 fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
     if record.worktree_path.is_empty() {
         bail!("{} has no recorded worktree", record.id);
     }
-    let view = require_session(ctx, project)?;
-    let (_, panes) = lists_for(&view, record)?;
-    let workspace_open = panes.iter().any(|p| p.workspace_id == record.workspace_id && Path::new(&p.cwd).starts_with(&record.worktree_path));
-    if workspace_open {
-        return view.herdr.on_machine(&record.machine).worktree_remove(&record.workspace_id).map_err(|error| anyhow::anyhow!("{error}"));
+    if project.status() != project::Status::Active { bail!("worktree cleanup requires an active project"); }
+    let current = thread::load(project, &record.id)?;
+    if current.lifecycle_generation != record.lifecycle_generation || current.worktree_path != record.worktree_path
+        || current.thread_dir != record.thread_dir || current.machine != record.machine || current.kind != Kind::Worktree {
+        bail!("thread identity changed before cleanup; keeping the worktree");
     }
-    if record.is_remote() {
-        let target = remote::ssh_target(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, &record.machine)?;
-        let script = format!("cd {} && git worktree remove {}", remote::quote(&record.repo), remote::quote(&record.worktree_path));
-        let out = remote::ssh(ctx.runner, &target, &script, None, Duration::from_secs(20))?;
-        if !out.success() {
-            bail!("{}", out.error_text());
+    if current.is_remote() {
+        bail!("remote worktree cleanup requires verified remote preservation and writer quiescence, which are not available yet; resolve without --remove-worktree");
+    }
+    let worktree = std::fs::canonicalize(&current.worktree_path)?;
+    if !std::fs::symlink_metadata(&current.worktree_path)?.is_dir() || worktree == std::fs::canonicalize(&current.repo)? {
+        bail!("cleanup target is not a distinct, real worktree directory");
+    }
+    // Read every record explicitly: malformed references cannot be treated as
+    // evidence that ownership is exclusive.
+    for slug in project::list_slugs(&ctx.root) {
+        let owner = Project::load(&ctx.root, &slug)?;
+        for entry in std::fs::read_dir(owner.dir().join("threads"))? {
+            let path = entry?.path();
+            if path.extension().is_none_or(|e| e != "toml") { continue; }
+            let text = std::fs::read_to_string(&path)?;
+            let other: Thread = toml::from_str(&text).with_context(|| format!("cannot establish cleanup ownership: {} is invalid", path.display()))?;
+            if owner.canonical_dir() == project.canonical_dir() && other.id == current.id { continue; }
+            if other.is_remote() { continue; }
+            for location in [&other.worktree_path, &other.cwd] {
+                if location.is_empty() { continue; }
+                let resolved = std::fs::canonicalize(location).with_context(|| format!("cannot verify workspace reference for {} in {slug}", other.id))?;
+                if resolved.starts_with(&worktree) || worktree.starts_with(&resolved) {
+                    bail!("worktree is also referenced by {} in {slug}; keeping shared/adopted workspace", other.id);
+                }
+            }
         }
-        return Ok(());
     }
-    git(ctx.runner, &record.repo, &["worktree", "remove", &record.worktree_path], Duration::from_secs(20)).map(|_| ())
+    let view = require_session(ctx, project)?;
+    let (agents, panes) = lists_for(&view, &current)?;
+    let inside = |cwd: &str| !cwd.is_empty() && std::fs::canonicalize(cwd).is_ok_and(|p| p.starts_with(&worktree));
+    if panes.iter().any(|p| p.workspace_id == current.workspace_id || inside(&p.cwd))
+        || agents.iter().any(|a| a.workspace_id == current.workspace_id || inside(&a.cwd)) {
+        bail!("worktree still has a managed pane or agent; idle is not proof of writer quiescence");
+    }
+    let manifest = crate::artifacts::load(project, &current, &current.artifact_snapshot)
+        .context("cleanup requires a verified preservation snapshot")?;
+    crate::artifacts::verify_source(&current, &manifest)?;
+    // Snapshot equality is a point-in-time observation, not writer exclusion.
+    // Until the lifecycle checkpoint protocol owns launch/prompt exclusion and
+    // confirms all artifact writers have stopped, preserve the source.
+    bail!("preservation snapshot verified, but writer quiescence cannot yet be established; keeping the worktree. Resolve without --remove-worktree")
 }
 
 /// A thread with its live state and group, for `thread list`, `thread show`

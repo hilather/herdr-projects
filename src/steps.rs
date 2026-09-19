@@ -47,8 +47,19 @@ pub struct State {
     pub pending_events: BTreeMap<String, PendingEvent>,
 }
 
+pub fn try_load_state(project: &Project) -> Result<State> {
+    use anyhow::Context;
+    let path = project.state_dir().join("ticker.json");
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("{} is invalid; preserve this file and repair or restore it before resuming the ticker", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
+        Err(e) => Err(e).with_context(|| format!("cannot read {}; refusing to replace retry state", path.display())),
+    }
+}
+
+#[cfg(test)]
 pub fn load_state(project: &Project) -> State {
-    project::read_json(&project.state_dir().join("ticker.json")).unwrap_or_default()
+    try_load_state(project).expect("valid fixture ticker state")
 }
 
 /// Only the ticker writes this file, so its own read-modify-write is safe; the
@@ -367,10 +378,14 @@ fn resolve_after_copy(ctx: &Ctx, project: &Project, t: &Thread, reason: &str) ->
     if let CopyOutcome::Failed(error) = copied.outcome {
         anyhow::bail!("{}: not resolved ({reason}) because the final copy failed: {error}", t.id);
     }
-    thread::update(project, &t.id, |t| {
-        t.status = Status::Resolved;
-        t.resolved_reason = reason.to_string();
-        t.prompt_pending = false;
+    thread::update_checked(project, &t.id, |current| {
+        if thread::execution_fingerprint(current) != thread::execution_fingerprint(t) || current.status != Status::Open {
+            anyhow::bail!("thread changed during idle finalization");
+        }
+        current.status = Status::Resolved;
+        current.resolved_reason = reason.to_string();
+        current.prompt_pending = false;
+        Ok(())
     })?;
     Ok(true)
 }

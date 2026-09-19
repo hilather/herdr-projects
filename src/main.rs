@@ -1,4 +1,5 @@
 mod actions;
+mod artifacts;
 mod adopt;
 mod cli;
 mod coordinator;

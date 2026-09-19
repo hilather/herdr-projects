@@ -190,14 +190,7 @@ pub struct PendingFinalization {
 }
 
 pub(super) fn fingerprint(t: &Thread) -> String {
-    // Ticker observations/report hashes change while copying; they are not
-    // execution identity. Explicit lifecycle actions increment the generation.
-    let value = serde_json::json!([
-        t.id, t.created, t.lifecycle_generation, t.kind, t.repo, t.origin,
-        t.branch, t.machine, t.worktree_path, t.thread_dir, t.workspace_id,
-        t.tab_id, t.pane_id, t.agent, t.agent_name, t.cwd, t.pr
-    ]);
-    thread::sha256_hex(value.to_string().as_bytes())
+    thread::execution_fingerprint(t)
 }
 
 pub(super) fn schedule_finalization(state: &mut State, t: &Thread) {
@@ -268,6 +261,7 @@ pub(super) fn retry_finalizations(ctx: &Ctx, project: &Project, state: &mut Stat
                 t.resolved_reason = pending.reason.clone();
                 t.prompt_pending = false;
                 t.last_finalization = pending.operation_id.clone();
+                if let Some(snapshot) = copied.artifact_snapshot { t.artifact_snapshot = snapshot; }
                 Ok(())
             })?;
             state.finalizations.remove(&id);

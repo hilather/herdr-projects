@@ -145,6 +145,9 @@ fn report(
             continue;
         };
         let label = format!("project {slug}");
+        for diagnostic in crate::thread::list_with_diagnostics(&project).1 {
+            check(&mut out, Some(false), &label, format!("thread record: {diagnostic}; preserve and repair the file"));
+        }
         let retry_path = project.state_dir().join("ticker.json");
         match std::fs::read(&retry_path) {
             Ok(bytes) => match serde_json::from_slice::<crate::steps::State>(&bytes) {

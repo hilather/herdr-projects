@@ -226,13 +226,13 @@ enum ThreadCommand {
         id: String,
         #[arg(long, conflicts_with_all = ["remove_worktree", "skip_copy", "discard_uncopied"])]
         reopen: bool,
-        /// Also remove the worktree (never forced; the branch is kept)
+        /// Request cleanup (currently refused until writer shutdown can be verified)
         #[arg(long)]
         remove_worktree: bool,
         /// Resolve even though the final copy cannot be made
         #[arg(long)]
         skip_copy: bool,
-        /// With --remove-worktree: accept losing what could not be copied
+        /// Accept uncopied artifacts; does not bypass writer or ownership checks
         #[arg(long, requires = "remove_worktree")]
         discard_uncopied: bool,
     },

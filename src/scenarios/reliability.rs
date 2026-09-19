@@ -51,9 +51,12 @@ fn shared_remote_projects_launch_prompt_copy_and_recover_independently() {
             move |cmd| cmd.program == "ssh" && cmd.args.last().is_some_and(|s| s.contains(&source)),
             move |cmd| {
                 if cmd.args.last().unwrap().contains("echo dir_ok") {
-                    Ok(ok("dir_ok\nreport_ok\n"))
+                    Ok(ok(if *stage.borrow() == 3 { "absent\n" } else { "dir_ok\nreport_ok\n" }))
                 } else if *stage.borrow() < 2 {
                     Ok(ok("t-0001 -\n"))
+                } else if *stage.borrow() >= 3 {
+                    // Observation differs from the bytes ultimately fetched.
+                    Ok(ok(&format!("t-0001 {}\n", "a".repeat(64))))
                 } else {
                     Ok(ok(&format!("t-0001 {hash}\n")))
                 }
@@ -105,4 +108,16 @@ fn shared_remote_projects_launch_prompt_copy_and_recover_independently() {
     assert_eq!(items_of(&projects[2], "outage").len(), 2);
     assert!(items_of(&projects[2], "outage")[1].summary.contains("reachable again"));
     assert!(thread::home_report_path(&projects[2], "t-0001").exists());
+
+    // Disappearance after observation must not acknowledge uncopied bytes.
+    // A later successful transfer must acknowledge the actual destination.
+    for stage in [3, 4] {
+        *phase.borrow_mut() = stage;
+        for _ in 0..4 { assert!(ticker::tick_for_test(&ctx, &mut memory)); }
+        for project in &projects {
+            let report = std::fs::read(thread::home_report_path(project, "t-0001")).unwrap();
+            assert_eq!(thread::load(project, "t-0001").unwrap().report_hash, thread::sha256_hex(&report),
+                "{}: receipt must describe the copied bytes at stage {stage}", project.slug);
+        }
+    }
 }

@@ -237,7 +237,7 @@ pub fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
     let _ = writeln!(out, "Folder: {}", project.dir().display());
 
     match project.read_project_md() {
-        Ok((settings, _)) => {
+        Ok((settings, body)) => {
             let _ = writeln!(out, "Name: {}", settings.name);
             let _ = writeln!(out, "Goal: {}", if settings.goal.is_empty() { "(none set)" } else { &settings.goal });
             let _ = writeln!(
@@ -254,6 +254,13 @@ pub fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
                     None => { let _ = writeln!(out, "Repo: {}", repo.path); }
                 }
             }
+            let revision = crate::thread::sha256_hex(body.as_bytes());
+            let _ = writeln!(out, "\n## Project instructions (PROJECT.md; revision {revision}; {} characters)", body.chars().count());
+            let _ = writeln!(out, "{}", if body.trim().is_empty() { "(none)" } else { body.trim() });
+            if body.chars().count() > crate::project::BODY_WARN_CHARS {
+                let _ = writeln!(out, "Instruction size warning: exceeds {} characters; the full text is included.", crate::project::BODY_WARN_CHARS);
+            }
+            let _ = writeln!(out, "\nCapacity note: max_parallel_threads is advisory; worker arguments are shared across worker kinds.");
         }
         Err(error) => {
             let _ = writeln!(out, "config-error: PROJECT.md: {error:#}");
@@ -281,6 +288,9 @@ pub fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
     let _ = writeln!(out, "{}", if tasks.trim().is_empty() { "(none)" } else { tasks.trim() });
 
     let rows = crate::threads::rows(ctx, project);
+    for diagnostic in crate::thread::list_with_diagnostics(project).1 {
+        let _ = writeln!(out, "Thread record error: {diagnostic}; preserve and repair the file.");
+    }
     let open: Vec<_> = rows.iter().filter(|r| r.group != crate::thread::Group::Resolved).collect();
     let _ = writeln!(out, "\n## Open threads ({})", open.len());
     for row in open {

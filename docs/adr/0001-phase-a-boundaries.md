@@ -92,10 +92,11 @@ waits for an eligible ticker pass. Lost delivery responses remain ambiguous, so
 external notifications and prompts provide at-least-once retry behavior.
 
 These records rely on the existing single-ticker writer and atomic file writes;
-they are not a cross-file database transaction. Corruption recovery, artifact
-staging and retention-aware delivery tombstones remain later work. Doctor now
-surfaces unreadable/malformed ticker state, but the legacy ticker load fallback
-has not yet been replaced. No stronger crash or power-loss guarantee is claimed.
+they are not a cross-file database transaction. Automatic corruption repair and retention-aware delivery tombstones remain later
+work. Doctor surfaces unreadable/malformed ticker state, and ticker loading now
+refuses to replace such state. Local final copies publish bounded verified
+snapshots; remote snapshots and writer-exclusion checkpoints remain unfinished.
+Worktree removal refuses until those preservation and writer gates can be met. No stronger crash or power-loss guarantee is claimed.
 
 Tests prove the implemented subprocess, parser and polling invariants. Agent idle
 state or a report does not prove task correctness. Existing project capacity is

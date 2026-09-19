@@ -30,7 +30,7 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
 ~/.config/herdr-projects/approved-routines.json  written only by `routine approve`
 ```
 
-Every thread works from `<its working directory>/.herdr-project/<project>-<id>/`: `brief.md` (written by the binary), `report.md` and `library/` (written by the agent). In a git repository that folder is added to `info/exclude`, so nothing in it is committed. **Git therefore treats it as clean: removing a worktree deletes it**, which is why `--remove-worktree` insists on a complete copy home first.
+Every thread works from `<its working directory>/.herdr-project/<project>-<id>/`: `brief.md` (written by the binary), `report.md` and `library/` (written by the agent). In a git repository that folder is added to `info/exclude`, so nothing in it is committed. **Git therefore treats it as clean: removing a worktree deletes it**, so a copy alone is insufficient to justify removal. `--remove-worktree` currently refuses: verified preservation and writer shutdown must both be established. Plain resolve keeps the worktree and branch. `--discard-uncopied` cannot bypass writer or ownership checks.
 
 `PROJECT.md` settings: `name`, `goal`, `repos` (`path`, optional `machine`), `coordinator_agent`, `thread_agent` (default `claude`), `max_parallel_threads` (3), `auto_resolve_days` (7), `nudge` (`false`).
 
@@ -128,7 +128,16 @@ copying. Finalization never removes the worktree.
 
 Existing partial-copy policy remains: skipped symlinks or an oversized library
 may resolve the thread, with a durable `copy` warning in the inbox. Failed copies
-do not resolve it. Artifact staging and preservation improvements remain pending.
+do not resolve it. Content checksums prevent stale equal-size/equal-mtime library transfers.
+Complete local final copies also retain content-addressed snapshots in
+`.state/artifacts/<thread>/<manifest-hash>/`, with a verified `manifest.json`.
+Snapshots contain the report and library, including empty directories; the combined
+limit is 50 MiB, 10,000 entries and 64 directory levels. Symlinks, hard links,
+special files and non-UTF-8 names are refused. Staging failures and changed sources
+leave previous snapshots intact. Snapshot retention is currently manual: no
+background process removes them. Live `threads/<id>.md` and `library/<id>/` remain
+compatibility copies, separate from these retained snapshots. Remote snapshots and
+writer-exclusion checkpoints are still pending; cleanup remains unavailable.
 
 GitHub outage streaks are tracked per project and PR URL, and machine streaks per
 project/session/machine. Healthy resources do not clear another resource's
@@ -157,7 +166,7 @@ label capture truncation. The inbox display limit remains 4,000 characters.
 
 Save the machine with `herdr machine add --label <label> <ssh target>` (both machines need Herdr 0.9.1), then list a repo as `--repo /path/on/machine@<label>` or pass `thread start --machine <label>`. The home machine owns the project; only outbound SSH from home is needed, in batch mode, so set up key-based login first.
 
-- The worktree, the brief and the report live on the remote machine. The home ticker polls it once a minute and copies a changed report with `scp` and the thread's `library/` with `rsync -rt` (symbolic links are never followed or copied; a library over 50 MB is not copied and the inbox item says so).
+- The worktree, the brief and the report live on the remote machine. The home ticker polls it once a minute and copies a changed report with `scp` and the thread's `library/` with `rsync -rt --checksum` (symbolic links are never followed or copied; a library over 50 MB is not copied and the inbox item says so).
 - A machine that doesn't answer is left alone: no state is read, threads keep their last group, and that project's session is skipped for about two minutes. After ten minutes you get one `outage` inbox item, and one more when it is back. Polling and backoff are tracked separately for each project/session, so projects sharing a machine label all receive poll opportunities. The first project in the slow pass rotates each tick.
 - A blocked remote thread needs you in its pane on that machine: select the machine in Herdr's sidebar, or run `herdr --remote <ssh target>`.
 - `focus` does not cover remote threads: their sidebar tokens are set on the remote Herdr server. They appear in `overview`, `thread list` and inbox items.
@@ -177,3 +186,18 @@ scripts/dev-herdr <args>         # herdr against that session
 ```
 
 Never develop against your default session or `~/.herdr-projects`. [`herdr-notes.md`](herdr-notes.md) records what was verified about Herdr stage by stage, and [`manual-test.md`](manual-test.md) lists the acceptance checks, including the visual ones only a person can confirm. [`going-public.md`](going-public.md) is the checklist for the public release.
+
+## Repair diagnostics and standing instructions
+
+Unreadable or malformed `.state/ticker.json` stops that project's ticker work
+without replacing its saved retry obligations. Other projects continue. Preserve
+the original file and inspect `doctor` before restoring a valid backup or repairing
+it. The binary does not automatically delete or quarantine malformed state.
+Malformed thread records are named in `doctor` and `context`; readable threads
+remain visible.
+
+Coordinator startup reads `context`, which now includes the full current
+`PROJECT.md` instructions with a content revision and character count. Refreshing
+context picks up edits. Worker briefs receive instructions and memory at start or
+restart; existing workers do not automatically receive edits. The capacity limit
+is advisory and worker arguments are shared, not isolated by agent kind.

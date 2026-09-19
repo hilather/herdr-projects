@@ -246,11 +246,11 @@ pub fn fetch_file(runner: &dyn Runner, target: &str, remote_path: &str, local_pa
     if !out.success() {
         bail!("ssh {target} cat: {}", out.error_text());
     }
-    std::fs::write(local_path, out.stdout.as_bytes())?;
+    std::fs::write(local_path, &out.stdout_bytes)?;
     Ok(())
 }
 
-/// `rsync -rt` over ssh, without `-l`, so symbolic links are skipped.
+/// Checksum-based `rsync -rt` over ssh, without `-l`, so symbolic links are skipped.
 pub fn fetch_dir(runner: &dyn Runner, target: &str, remote_dir: &str, local_dir: &Path) -> Result<()> {
     check_target(target)?;
     if !is_plain(remote_dir) {
@@ -258,6 +258,7 @@ pub fn fetch_dir(runner: &dyn Runner, target: &str, remote_dir: &str, local_dir:
     }
     let out = runner.run(&Cmd::new("rsync", COPY_TIMEOUT).args([
         "-rt".to_string(),
+        "--checksum".to_string(),
         "-e".to_string(),
         format!("ssh {}", SSH_OPTIONS.join(" ")),
         "--".to_string(),
@@ -372,6 +373,42 @@ mod tests {
         let broken = FakeRunner::new();
         broken.on("machine list --json", fail(1, "no"));
         assert_eq!(ssh_target(&broken, "herdr", config.path(), "box").unwrap(), "me@box.local");
+    }
+
+    #[test]
+    fn quoted_file_transport_preserves_binary_bytes_and_rejects_truncation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("report");
+        for truncated in [false, true] {
+            let runner = FakeRunner::new();
+            let bytes = vec![0, 255, 254, b'\n'];
+            let mut output = ok(&String::from_utf8_lossy(&bytes));
+            output.stdout_bytes = bytes.clone();
+            output.stdout_truncated = truncated;
+            runner.on("ssh", output);
+            std::fs::write(&path, b"last good report").unwrap();
+            let result = fetch_file(&runner, "box", "/repo with spaces/report.md", &path);
+            if truncated {
+                assert!(result.is_err());
+                assert_eq!(std::fs::read(&path).unwrap(), b"last good report");
+            } else {
+                result.unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn remote_library_transfer_compares_content_without_following_links() {
+        let runner = FakeRunner::new();
+        runner.on("rsync", ok(""));
+        let root = tempfile::tempdir().unwrap();
+        fetch_dir(&runner, "box", "/repo/library", root.path()).unwrap();
+        let calls = runner.calls.borrow();
+        let args = &calls[0].args;
+        assert!(args.iter().any(|arg| arg == "--checksum"));
+        assert!(args.iter().any(|arg| arg == "-rt"));
+        assert!(!args.iter().any(|arg| ["--links", "--copy-links", "-l", "-L"].contains(&arg.as_str())));
     }
 
     #[test]

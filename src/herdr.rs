@@ -319,12 +319,6 @@ impl<'a> Herdr<'a> {
         Ok((created, path, cwd))
     }
 
-    /// Never passes `--force`: herdr refuses a dirty worktree and that refusal
-    /// is reported unchanged.
-    pub fn worktree_remove(&self, workspace: &str) -> Result<(), HerdrError> {
-        self.call(&["worktree", "remove", "--workspace", workspace], Duration::from_secs(20)).map(|_| ())
-    }
-
     /// The working directory herdr reports for a new tab's pane.
     pub fn pane_cwd(&self, pane: &str) -> Result<String, HerdrError> {
         let result = self.call(&["pane", "get", pane], CALL_TIMEOUT)?;

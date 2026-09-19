@@ -489,6 +489,9 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
         return Ok(None);
     };
     let slug = &project.slug;
+    // Do not perform delivery or overwrite durable obligations when state is
+    // unreadable. Other projects still receive their own tick.
+    let mut state = steps::try_load_state(project)?;
     let mut first_error = None;
 
     // The coordinator: deliver a pending priming prompt, refresh its tokens.
@@ -516,7 +519,6 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
     // Nudge (or notify) about inbox items `context` has not shown yet.
     let mut notification_error = None;
     if let Ok((settings, _)) = project.read_project_md() {
-        let mut state = steps::load_state(project);
         let before = state.clone();
         let ready_pane = agent.filter(|a| a.ready()).map(|_| record.pane_id.as_str());
         if let Err(error) = steps::nudge(project, &mut state, &settings, &herdr, ready_pane) {
@@ -556,7 +558,7 @@ fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threa
     errors.extend(pass.error);
 
     for t in threads {
-        let Some(hash) = hashes.get(&t.id).filter(|h| **h != t.report_hash) else {
+        let Some(_) = hashes.get(&t.id).filter(|h| **h != t.report_hash) else {
             continue;
         };
         let copied = thread::copy_home_remote(project, t, true, ctx.runner, &target);
@@ -566,7 +568,10 @@ fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threa
                 if let thread::CopyOutcome::Partial(notes) = outcome {
                     copy_notes.insert(t.id.clone(), notes);
                 }
-                let hash = copied.report_hash.unwrap_or_else(|| hash.clone());
+                let Some(hash) = copied.report_hash else {
+                    errors.push(anyhow::anyhow!("{}: observed report was not copied; retaining its previous hash", t.id));
+                    continue;
+                };
                 errors.extend(thread::update(project, &t.id, |t| {
                     t.report_hash = hash;
                     t.last_report_change = project::now();
@@ -582,6 +587,11 @@ fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threa
 /// routines, auto-resolve and housekeeping.
 fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> Vec<anyhow::Error> {
     let mut errors = Vec::new();
+    let mut state = match steps::try_load_state(project) {
+        Ok(state) => state,
+        Err(error) => return vec![error],
+    };
+    let before = state.clone();
     if let Some(error) = &seen.notification_error { errors.push(anyhow::anyhow!("{error}")); }
     let mut copy_notes: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     let herdr = Herdr::new(ctx.env.herdr_bin(), &seen.socket, ctx.runner);
@@ -618,8 +628,12 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
                     if let thread::CopyOutcome::Partial(notes) = outcome {
                         copy_notes.insert(t.id.clone(), notes);
                     }
+                    let Some(copied_hash) = copied.report_hash else {
+                        errors.push(anyhow::anyhow!("{}: observed report was not copied; retaining its previous hash", t.id));
+                        continue;
+                    };
                     let updated = thread::update(project, &t.id, |t| {
-                        t.report_hash = hash.clone();
+                        t.report_hash = copied_hash;
                         t.last_report_change = project::now();
                     });
                     errors.extend(updated.err());
@@ -630,8 +644,6 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     launch_pass(ctx, project, &herdr, &local, &seen.agents, &seen.panes, &mut may_start, &mut errors);
 
     // Remote threads, one machine at a time, every fourth tick.
-    let mut state = steps::load_state(project);
-    let before = state.clone();
     let remote_threads = open_threads(project, true);
     let mut machines: Vec<String> = remote_threads.iter().map(|t| t.machine.clone()).collect();
     machines.sort();

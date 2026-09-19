@@ -1,8 +1,8 @@
 //! T00.1: executable counterexamples from the architecture review.
 //!
-//! These assert the desired behavior, not the known defect. Run explicitly
-//! with `cargo test --locked review_regressions -- --ignored --nocapture`.
-//! Remove each ignore when its assigned repair lands; see docs/review-baseline.md.
+//! These assert the repaired behavior and run in the normal suite. Run alone
+//! with `cargo test --locked review_regressions -- --nocapture`.
+//! Historical counterexamples are recorded in docs/review-baseline.md.
 
 use super::*;
 use crate::runner::{RealRunner, Runner};
@@ -11,7 +11,6 @@ use std::fs::{File, FileTimes};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 #[test]
-#[ignore = "F01 / T02.1: rsync quick check retains stale equal-size/equal-mtime bytes"]
 fn f01_artifact_copy_preserves_changed_bytes_with_identical_metadata() {
     let world = World::new();
     let project = world.project("demo", "a.sock");

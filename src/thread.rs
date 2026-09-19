@@ -80,6 +80,8 @@ pub struct Thread {
     /// A manual reopen/restart must not immediately re-resolve the old PR.
     pub suppressed_merged_pr: String,
     pub last_finalization: String,
+    /// Content-addressed local preservation receipt; empty for legacy/live copies.
+    pub artifact_snapshot: String,
 }
 
 impl Thread {
@@ -128,17 +130,34 @@ pub fn load(project: &Project, id: &str) -> Result<Thread> {
 }
 
 pub fn list(project: &Project) -> Vec<Thread> {
-    let Ok(entries) = std::fs::read_dir(threads_dir(project)) else {
-        return Vec::new();
+    list_with_diagnostics(project).0
+}
+
+/// Preserve readable work while making malformed records visible to operators.
+pub fn list_with_diagnostics(project: &Project) -> (Vec<Thread>, Vec<String>) {
+    let mut threads = Vec::new();
+    let mut diagnostics = Vec::new();
+    let entries = match std::fs::read_dir(threads_dir(project)) {
+        Ok(entries) => entries,
+        Err(error) => return (threads, vec![format!("{}: {error}", threads_dir(project).display())]),
     };
-    let mut threads: Vec<Thread> = entries
-        .flatten()
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter_map(|name| name.strip_suffix(".toml").map(str::to_string))
-        .filter_map(|id| load(project, &id).ok())
-        .collect();
+    for entry in entries {
+        let entry = match entry { Ok(entry) => entry, Err(error) => { diagnostics.push(error.to_string()); continue; } };
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "toml") { continue; }
+        let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+            diagnostics.push(format!("{}: thread filename is not UTF-8", path.display()));
+            continue;
+        };
+        match load(project, id) {
+            Ok(record) if record.id == id => threads.push(record),
+            Ok(_) => diagnostics.push(format!("{}: record id does not match its filename", path.display())),
+            Err(error) => diagnostics.push(format!("{}: {error:#}", path.display())),
+        }
+    }
     threads.sort_by(|a, b| a.id.cmp(&b.id));
-    threads
+    diagnostics.sort();
+    (threads, diagnostics)
 }
 
 fn write_record(project: &Project, thread: &Thread) -> Result<()> {
@@ -165,6 +184,17 @@ pub fn invalidate_finalization(t: &mut Thread) -> Result<()> {
     t.lifecycle_generation = t.lifecycle_generation.checked_add(1).context("thread lifecycle generation exhausted")?;
     t.suppressed_merged_pr = t.pr.clone();
     Ok(())
+}
+
+/// Execution identity excludes observations and copy receipts that the ticker
+/// legitimately updates during an external operation.
+pub fn execution_fingerprint(t: &Thread) -> String {
+    let value = serde_json::json!([
+        t.id, t.created, t.lifecycle_generation, t.kind, t.repo, t.origin,
+        t.branch, t.machine, t.worktree_path, t.thread_dir, t.workspace_id,
+        t.tab_id, t.pane_id, t.agent, t.agent_name, t.cwd, t.pr
+    ]);
+    sha256_hex(value.to_string().as_bytes())
 }
 
 /// Allocates the next id under the project lock and writes the first record.
@@ -527,6 +557,7 @@ pub fn local_report_hash(thread: &Thread) -> Option<String> {
 }
 
 pub struct Copied {
+    pub artifact_snapshot: Option<String>,
     pub outcome: CopyOutcome,
     /// The report's hash, when a regular report file exists.
     pub report_hash: Option<String>,
@@ -540,10 +571,11 @@ pub fn copy_home_local(project: &Project, thread: &Thread, with_library: bool, r
     let mut notes = Vec::new();
     if thread.thread_dir.is_empty() || !dir.exists() {
         // Nothing was ever written, so nothing can be lost.
-        return Copied { outcome: CopyOutcome::Complete, report_hash: None };
+        return Copied { artifact_snapshot: None, outcome: CopyOutcome::Complete, report_hash: None };
     }
     if !is_real_dir(dir) {
         return Copied {
+            artifact_snapshot: None,
             outcome: CopyOutcome::Partial(vec![format!("{} is a symbolic link; nothing was copied", dir.display())]),
             report_hash: None,
         };
@@ -561,13 +593,13 @@ pub fn copy_home_local(project: &Project, thread: &Thread, with_library: bool, r
                         .lock()
                         .and_then(|_lock| write_atomic(&home_report_path(project, &thread.id), &bytes));
                     if let Err(error) = written {
-                        return Copied { outcome: CopyOutcome::Failed(format!("{error:#}")), report_hash: None };
+                        return Copied { artifact_snapshot: None, outcome: CopyOutcome::Failed(format!("{error:#}")), report_hash: None };
                     }
                 }
                 report_hash = Some(hash);
             }
             Err(error) => {
-                return Copied { outcome: CopyOutcome::Failed(format!("could not read {}: {error}", report.display())), report_hash: None };
+                return Copied { artifact_snapshot: None, outcome: CopyOutcome::Failed(format!("could not read {}: {error}", report.display())), report_hash: None };
             }
         },
         Ok(_) => notes.push(format!("{} is not a regular file; it was not copied", report.display())),
@@ -580,13 +612,13 @@ pub fn copy_home_local(project: &Project, thread: &Thread, with_library: bool, r
         } else if is_real_dir(&library) {
             match copy_library_local(project, thread, &library, runner) {
                 Ok(mut skipped) => notes.append(&mut skipped),
-                Err(error) => return Copied { outcome: CopyOutcome::Failed(format!("{error:#}")), report_hash },
+                Err(error) => return Copied { artifact_snapshot: None, outcome: CopyOutcome::Failed(format!("{error:#}")), report_hash },
             }
         }
     }
 
     let outcome = if notes.is_empty() { CopyOutcome::Complete } else { CopyOutcome::Partial(notes) };
-    Copied { outcome, report_hash }
+    Copied { artifact_snapshot: None, outcome, report_hash }
 }
 
 /// The same copy for a thread on a saved machine: the report with `scp`, the
@@ -594,19 +626,19 @@ pub fn copy_home_local(project: &Project, thread: &Thread, with_library: bool, r
 /// following links) what is a real directory and a regular file.
 pub fn copy_home_remote(project: &Project, thread: &Thread, with_library: bool, runner: &dyn Runner, target: &str) -> Copied {
     use crate::remote;
-    let failed = |error: String| Copied { outcome: CopyOutcome::Failed(error), report_hash: None };
+    let failed = |error: String| Copied { artifact_snapshot: None, outcome: CopyOutcome::Failed(error), report_hash: None };
     if thread.thread_dir.is_empty() {
-        return Copied { outcome: CopyOutcome::Complete, report_hash: None };
+        return Copied { artifact_snapshot: None, outcome: CopyOutcome::Complete, report_hash: None };
     }
     let found = match remote::layout(runner, target, &thread.thread_dir) {
         Ok(found) => found,
         Err(error) => return failed(format!("{error:#}")),
     };
     if found.absent {
-        return Copied { outcome: CopyOutcome::Complete, report_hash: None };
+        return Copied { artifact_snapshot: None, outcome: CopyOutcome::Complete, report_hash: None };
     }
     if !found.dir_ok {
-        return Copied { outcome: CopyOutcome::Partial(vec![format!("{} on {target} is a symbolic link; nothing was copied", thread.thread_dir)]), report_hash: None };
+        return Copied { artifact_snapshot: None, outcome: CopyOutcome::Partial(vec![format!("{} on {target} is a symbolic link; nothing was copied", thread.thread_dir)]), report_hash: None };
     }
     let mut notes = Vec::new();
     let mut report_hash = None;
@@ -635,23 +667,32 @@ pub fn copy_home_remote(project: &Project, thread: &Thread, with_library: bool, 
             notes.push(format!("the library is {} MB, over the {} MB cap; nothing from it was copied", found.library_kb / 1024, LIBRARY_CAP_KB / 1024));
         } else if found.library_ok {
             notes.extend(found.symlinks.iter().map(|p| format!("{p} is a symbolic link; it was not copied")));
-            let target_dir = project.dir().join("library").join(&thread.id);
-            let made = project.lock().and_then(|_lock| {
-                if !target_dir.is_dir() {
-                    std::fs::create_dir(&target_dir)?;
-                }
-                Ok(())
-            });
-            if let Err(error) = made {
-                return Copied { outcome: CopyOutcome::Failed(format!("{error:#}")), report_hash };
-            }
+            let target_dir = match library_target(project, &thread.id) {
+                Ok(path) => path,
+                Err(error) => return Copied { artifact_snapshot: None, outcome: CopyOutcome::Failed(format!("{error:#}")), report_hash },
+            };
             if let Err(error) = remote::fetch_dir(runner, target, &thread.library_path(), &target_dir) {
-                return Copied { outcome: CopyOutcome::Failed(format!("{error:#}")), report_hash };
+                return Copied { artifact_snapshot: None, outcome: CopyOutcome::Failed(format!("{error:#}")), report_hash };
             }
         }
     }
     let outcome = if notes.is_empty() { CopyOutcome::Complete } else { CopyOutcome::Partial(notes) };
-    Copied { outcome, report_hash }
+    Copied { artifact_snapshot: None, outcome, report_hash }
+}
+
+fn library_target(project: &Project, id: &str) -> Result<PathBuf> {
+    validate_id(id)?;
+    let _lock = project.lock()?;
+    let parent = project.dir().join("library");
+    if !is_real_dir(&parent) { bail!("library destination {} is not a real directory", parent.display()); }
+    let target = parent.join(id);
+    match std::fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.is_dir() => {},
+        Ok(_) => bail!("library destination {} is not a real directory", target.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(&target)?,
+        Err(e) => return Err(e.into()),
+    }
+    Ok(target)
 }
 
 fn copy_library_local(project: &Project, thread: &Thread, library: &Path, runner: &dyn Runner) -> Result<Vec<String>> {
@@ -676,18 +717,13 @@ fn copy_library_local(project: &Project, thread: &Thread, library: &Path, runner
     symlinks_under(library, &mut notes);
     let notes: Vec<String> = notes.into_iter().map(|p| format!("{p} is a symbolic link; it was not copied")).collect();
 
-    let target = project.dir().join("library").join(&thread.id);
-    {
-        let _lock = project.lock()?;
-        if !target.is_dir() {
-            // `create_dir`, not `create_dir_all`: never recreate a deleted project.
-            std::fs::create_dir(&target).with_context(|| format!("could not create {}", target.display()))?;
-        }
-    }
-    // `-rt` without `-l`: symbolic links are skipped, never followed.
+    let target = library_target(project, &thread.id)?;
+    // Compare content: equal size/mtime does not mean equal artifact bytes.
+    // Without `-l`, symbolic links are skipped, never followed.
     let out = runner.run(
         &Cmd::new("rsync", Duration::from_secs(60)).args([
             "-rt".to_string(),
+            "--checksum".to_string(),
             format!("{}/", library.to_string_lossy()),
             format!("{}/", target.to_string_lossy()),
         ]),
