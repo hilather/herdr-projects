@@ -157,3 +157,29 @@ cover stale heads, task revisions, active claims, mismatches, corrupted provenan
 fingerprint compatibility and newly enqueued lookalikes. This completes a narrow
 observation adapter; production sending/copying and general live reconciliation
 remain outside its scope.
+
+## Explicit canonical session notifications
+
+`operations PROJECT notify TASK --expected-head H` authorizes and queues one
+count-only notification for the current unseen canonical inbox set. It requires
+active, reconciled control, a task at that head, valid typed safety configuration,
+and a coordinator binding with an explicit local socket. `runtime create` can
+register a notification-only route with a socket and no pane. This does not adopt
+or prompt a coordinator. Notification content is a fixed title/count; inbox text
+is not sent and seen/done state is unchanged.
+
+`operations PROJECT deliver-notification ID --expected-revision R` uses the common
+claim/effect/receipt service. The adapter holds the root execution lease through
+receipt persistence, validates the exact config bytes it parses, and fences task,
+binding, inbox-set and control revisions. Herdr must meet the supported minimum;
+its bounded call must fit within the remaining lease. Only `shown=true` confirms
+success. Errors and unconfirmed responses become ambiguous; a missing durable
+receipt requires observation, never blind replay. These commands do not send
+terminal input or automatically retry imported `legacy.notify` obligations.
+
+The inbox-set key remains unique across control epochs. Repeating a confirmed or
+ambiguous request cannot send it again. Current limitation: retiring even an
+unsent intent prevents authorizing that identical set again; no key bypass is
+provided. A retryable no-effect result can retry only while its original config,
+control and routing authorization still match. Explicit reauthorization of safely
+superseded intents and automatic controller notifications remain future work.

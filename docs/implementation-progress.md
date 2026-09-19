@@ -371,3 +371,26 @@ build pass. Logs: `/tmp/herdr-canonical-runtime-debug.log`,
 `/tmp/herdr-canonical-runtime-release.log`, `/tmp/herdr-canonical-runtime-legacy.log`,
 `/tmp/herdr-canonical-runtime-build.log`. W03 remains partial: actual notification/
 finalization adapters, resource ownership and integrated restart acceptance remain.
+
+## Concrete canonical notification delivery
+
+Explicit `operations notify` creates a fixed count-only session notification from
+canonical unseen inbox IDs, under an expected head. `deliver-notification` uses
+the shared durable dispatch service with the execution lease held through receipt
+persistence. It checks active control, task/binding/inbox/config fences, typed
+safety parsed from hash-matching bytes, explicit local socket, supported Herdr and
+a remaining timeout budget. Only `shown=true` confirms delivery; uncertainty never
+automatically replays. Inbox content/seen/done state remains untouched.
+
+Independent review caught and resolved config snapshot integrity and CLI fake
+selection issues. Five adapter regressions and a subprocess CLI fixture cover
+receipt/dedup behavior, ambiguity after restart, withdrawn policy, revision fences,
+typed safety and lock coverage. No real notification was sent. This does not yet
+port terminal nudges or automatic ticker dispatch; imported notifications remain
+conservatively blocked without matching receipts. Permanent inbox-set dedup also
+prevents reauthorizing a retired unsent set; that liveness limitation is explicit.
+
+Validation: 322 all-feature debug/release tests pass after fixture isolation repair
+(71 library, 227 binary, 22 CLI, 2 contracts). Default tests and locked release build
+pass. Logs: `/tmp/herdr-notify-final-debug.log`, `/tmp/herdr-notify-final-release.log`,
+`/tmp/herdr-notify-legacy.log`, `/tmp/herdr-notify-build.log`.

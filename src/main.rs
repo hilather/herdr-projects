@@ -62,3 +62,6 @@ fn main() {
 }
 #[cfg(feature="state-store")]
 mod reconcile_live;
+
+#[cfg(feature="state-store")]
+mod notification_delivery;

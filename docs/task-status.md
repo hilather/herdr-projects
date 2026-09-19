@@ -56,7 +56,9 @@ ownership integration remain.
 **T03.3** now has [durable claims/outcomes](operation-delivery.md), fencing,
 ambiguity, retry handling, an atomic inbox drain, a guarded common dispatch service
 and explicit claim expiry. Exact imported notification/finalization receipts now
-have a preview/apply observation adapter. External sending/copying adapters remain.
+have a preview/apply observation adapter. An explicit count-only canonical session
+notification adapter now uses guarded durable delivery. Finalization copying,
+terminal-input authorization and automatic controller dispatch remain.
 **T03.4** now has [bounded runtime observations](reconciliation.md), durable
 evidence, and stale-state fences. Ownership acquisition, repair/adoption, termination
 evidence and integrated recovery remain. Observation work is interleaved because

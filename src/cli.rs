@@ -359,6 +359,10 @@ enum TaskCommand {
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
 enum OperationsCommand { Inspect,
+    /// Explicitly authorize a session notification for the current unseen inbox set
+    Notify { task:String, #[arg(long)] expected_head:u64 },
+    /// Deliver one authorized session notification; uncertain outcomes are not replayed
+    DeliverNotification { id:String, #[arg(long)] expected_revision:u64 },
     /// Stop future delivery without claiming an earlier effect is absent
     Retire { id:String, #[arg(long)] reason:String, #[arg(long)] expected_revision:u64, #[arg(long)] expected_head:u64 },
     /// Preview exact legacy receipts; missing evidence never authorizes retry
@@ -455,6 +459,17 @@ pub fn run() -> Result<()> {
             project::validate_slug(&slug)?;
             let dir=ctx.root.join(&slug);
             match command {
+                OperationsCommand::Notify{task,expected_head}=>{
+                    let task=herdr_projects::domain::TaskId::new(task).map_err(anyhow::Error::msg)?;
+                    println!("{}",serde_json::to_string_pretty(&crate::notification_delivery::enqueue(&ctx,&dir,&task,expected_head)?)?);
+                },
+                OperationsCommand::DeliverNotification{id,expected_revision}=>{
+                    let id=herdr_projects::domain::OperationId::new(id).map_err(anyhow::Error::msg)?;
+                    match crate::notification_delivery::deliver(&ctx,&dir,&id,expected_revision)? {
+                        herdr_projects::operations::dispatch::DispatchResult::Recorded(delivery)=>println!("{}",serde_json::to_string_pretty(&delivery)?),
+                        herdr_projects::operations::dispatch::DispatchResult::Unrecorded{claim,..}=>anyhow::bail!("notification outcome was not recorded; operation {} claim epoch {} requires observation; do not retry",claim.operation.as_str(),claim.epoch),
+                    }
+                },
                 OperationsCommand::Retire{id,reason,expected_revision,expected_head}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::retire_operation(&dir,&herdr_projects::domain::OperationId::new(id).map_err(anyhow::Error::msg)?,expected_revision,expected_head,&reason)?)?),
                 OperationsCommand::Inspect=>println!("{}",serde_json::to_string_pretty(&herdr_projects::migration::open_active(&dir)?.deliveries()?)?),
                 OperationsCommand::ReceiptPlan=>println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::observe_imported_receipts(&dir,None)?)?),

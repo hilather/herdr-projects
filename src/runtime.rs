@@ -98,3 +98,15 @@ pub fn create_binding(project:&Path,task:Option<&TaskId>,task_revision:Option<u6
     migration::publish_control_marker(project,&db)?;
     Ok(change)
 }
+
+/// Explicit operator notification request; no external effect during enqueue.
+pub fn enqueue_notification(project:&Path,task:&TaskId,expected_head:u64,config:&migration::ConfigReference)->Result<crate::domain::Operation> {
+    let _maintenance=migration::maintenance(project)?;
+    ensure!(migration::config_reference(Path::new(&config.path))?==*config,"config changed before notification enqueue");
+    let mut db=migration::open_active(project)?;
+    let snapshot=db.read_snapshot(Some(expected_head))?;
+    let slug=project.file_name().and_then(|s|s.to_str()).context("invalid project slug")?;
+    let operation=crate::operations::notification::build(&snapshot,task,slug,config.clone(),jiff::Timestamp::now().as_millisecond())?;
+    db.commit(Commit{expected_head,mutations:vec![Mutation::Enqueue(operation.clone())]})?;
+    Ok(operation)
+}
