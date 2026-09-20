@@ -21,6 +21,7 @@ impl crate::runner::Runner for ProbeBudget<'_> {
 }
 pub fn poll(ctx:&Ctx,path:&Path,turn:u64)->Result<PollResult> {
     let path=path.canonicalize()?;
+    let ownership=herdr_projects::execution_guard::ProjectGuard::acquire(&path)?;
     let snapshot=runtime::snapshot(&path)?;
     ensure!(snapshot.schema_version>=9,"upgrade-store is required before canonical controller polling");
     // Collect without a SQLite transaction. Commit and expiry are serialized with
@@ -30,7 +31,8 @@ pub fn poll(ctx:&Ctx,path:&Path,turn:u64)->Result<PollResult> {
     let batch=crate::reconcile_live::collect(&probe_ctx,&path)?;
     ensure!(std::time::Instant::now()<budget.deadline,"automatic observation budget exhausted; use explicit reconciliation to investigate");
     let reachable=batch.observations.iter().any(|o|o.pane==ResourceState::Present||o.worktree==ResourceState::Present);
-    runtime::record_controller_observations(&path,&batch)?;
+    runtime::record_controller_observations_guarded(&path,&batch,&ownership)?;
+    drop(ownership);
     // A scheduling failure must not suppress unrelated notification/finalization
     // work. Each scheduling turn handles one routine; subsequent turns rotate.
     let scheduled=herdr_projects::routines::schedule_turn(&path,turn);

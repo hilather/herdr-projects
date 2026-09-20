@@ -629,6 +629,73 @@ fn failed_record_lock_releases_project_and_root_ownership() {
 }
 
 #[test]
+fn guarded_controller_commit_fences_identity_head_and_record_lock() {
+    use crate::{execution_guard::ProjectGuard,runtime,reconcile::ObservationBatch};
+    let(temp,project)=fixture();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();
+    let other=temp.path().join("other");fs::create_dir_all(other.join(".state")).unwrap();
+    let before=runtime::snapshot(&project).unwrap();
+    let batch=ObservationBatch{expected_head:before.head,observations:unrecorded_observations(&before,100),dispatch_allowed:false,recorded_head:None};
+    let wrong=ProjectGuard::acquire(&other).unwrap();
+    assert!(runtime::record_controller_observations_guarded(&project,&batch,&wrong).is_err());
+    assert_eq!(runtime::snapshot(&project).unwrap(),before);drop(wrong);
+    let guard=ProjectGuard::acquire(&project).unwrap();
+    let record=fs::OpenOptions::new().write(true).open(project.join(".state/lock")).unwrap();record.try_lock().unwrap();
+    assert!(runtime::record_controller_observations_guarded(&project,&batch,&guard).is_err());
+    assert_eq!(runtime::snapshot(&project).unwrap(),before);drop(record);
+    assert!(runtime::add_task(&project,crate::domain::TaskId::new("blocked").unwrap(),"blocked".into(),before.head).is_err());
+    assert!(ProjectGuard::acquire(&other).is_ok());
+    runtime::record_controller_observations_guarded(&project,&batch,&guard).unwrap();
+    let after=runtime::snapshot(&project).unwrap();assert!(after.head>before.head);
+    assert_eq!(after.tasks,before.tasks);assert_eq!(after.attempts,before.attempts);
+    assert!(runtime::record_controller_observations_guarded(&project,&batch,&guard).is_err());
+    assert_eq!(runtime::snapshot(&project).unwrap(),after);
+    assert!(ProjectGuard::acquire(&project).is_err());drop(guard);
+    assert!(ProjectGuard::acquire(&project).is_ok());
+}
+
+#[test]
+fn guarded_controller_commit_expires_claim_without_replay() {
+    use crate::{execution_guard::ProjectGuard,runtime,reconcile::ObservationBatch,operations::{Outcome,DeliveryState}};
+    let(_temp,project)=receipt_fixture(true);let mut db=open_active(&project).unwrap();
+    let before=db.read_snapshot(None).unwrap();let op=before.operations.iter().find(|o|o.kind=="legacy.finalize").unwrap();
+    let pending=db.observe_operation(&op.id,1,"fixture",Outcome::Retryable{no_effect_evidence:"fixture".into()},0).unwrap();
+    db.claim_operation(&op.id,pending.revision,"fixture",pending.next_due_ms,1000).unwrap();drop(db);
+    let guard=ProjectGuard::acquire(&project).unwrap();let before=runtime::snapshot(&project).unwrap();
+    let batch=ObservationBatch{expected_head:before.head,observations:unrecorded_observations(&before,100),dispatch_allowed:false,recorded_head:None};
+    runtime::record_controller_observations_guarded(&project,&batch,&guard).unwrap();
+    let after=runtime::snapshot(&project).unwrap();let delivery=after.deliveries.iter().find(|d|d.operation==op.id).unwrap();
+    assert_eq!(delivery.state,DeliveryState::Ambiguous);assert_eq!(delivery.attempts,1);
+    assert_eq!(after.operations,before.operations);assert_eq!(after.tasks,before.tasks);assert_eq!(after.attempts,before.attempts);
+    assert!(ProjectGuard::acquire(&project).is_err());
+}
+
+#[test]
+fn guarded_controller_publication_failure_requires_forward_recovery() {
+    use crate::{execution_guard::ProjectGuard,runtime,reconcile::{ObservationBatch,ResourceState},domain::{ProjectState,ResourceIdentity,AgentIdentity}};
+    let(_temp,project)=fixture();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();
+    let mut db=open_active(&project).unwrap();let head=db.read_snapshot(None).unwrap().head;
+    let created=db.create_runtime(None,None,head,&new_route()).unwrap();
+    let snapshot=db.read_snapshot(None).unwrap();let mut observations=unrecorded_observations(&snapshot,100);
+    let observed=observations.iter_mut().find(|o|o.binding==created.binding.id).unwrap();
+    observed.collector="herdr-git-v2".into();observed.pane=ResourceState::Present;observed.agent_present=true;
+    observed.session_identity=Some(ResourceIdentity{device:1,inode:2,born_secs:0,born_nanos:0});observed.agent_identity=Some(AgentIdentity{kind:"test".into(),name:"fixture".into()});
+    let head=db.record_observations(snapshot.head,&observations).unwrap();
+    let adopted=db.adopt_runtime(&created.binding.id,created.binding.revision,head,101,None).unwrap();
+    let snapshot=db.read_snapshot(None).unwrap();let head=db.record_observations(adopted.head,&observations).unwrap();
+    db.set_project_state(head,snapshot.control.unwrap().revision,ProjectState::Active,102,None).unwrap();publish_control_marker(&project,&db).unwrap();drop(db);
+    let guard=ProjectGuard::acquire(&project).unwrap();let before=runtime::snapshot(&project).unwrap();
+    let mut observations=unrecorded_observations(&before,103);let absent=observations.iter_mut().find(|o|o.binding==created.binding.id).unwrap();absent.pane=ResourceState::Absent;
+    // A hostile temporary path forces failure after the authoritative commit.
+    let temporary=project.join(".state/migration/control-format.next");fs::create_dir(&temporary).unwrap();
+    let batch=ObservationBatch{expected_head:before.head,observations,dispatch_allowed:false,recorded_head:None};
+    assert!(runtime::record_controller_observations_guarded(&project,&batch,&guard).is_err());
+    assert!(runtime::snapshot(&project).is_err());assert!(ProjectGuard::acquire(&project).is_err());drop(guard);
+    fs::remove_dir(&temporary).unwrap();recover(&project,true).unwrap();
+    let after=runtime::snapshot(&project).unwrap();assert!(after.head>before.head);assert!(after.control.unwrap().reconciliation_required);
+    assert_eq!(after.tasks,before.tasks);assert_eq!(after.attempts,before.attempts);assert_eq!(after.ownership,before.ownership);
+}
+
+#[test]
 fn pending_copy_warning_imports_without_ticker_and_invalid_receipt_blocks() {
     let (_temp,project)=fixture();let path=project.join("threads/t-0001.toml");
     let mut value:toml::Value=toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();

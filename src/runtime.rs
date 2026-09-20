@@ -66,7 +66,15 @@ pub fn record_observations(project:&Path,batch:&crate::reconcile::ObservationBat
 /// Controller observation publication and lease expiry retain project ownership
 /// together. Root-exclusive effect adapters remain excluded by the shared barrier.
 pub fn record_controller_observations(project:&Path,batch:&crate::reconcile::ObservationBatch)->Result<()> {
-    let _guard=migration::runtime_mutation(project)?;
+    let guard=crate::execution_guard::ProjectGuard::acquire(project)?;
+    record_controller_observations_guarded(project,batch,&guard)
+}
+/// Commit a controller collection while retaining the same project ownership
+/// acquired before its snapshot. No record lock or SQLite transaction is held
+/// during probes; publication and claim expiry finish before ownership returns.
+pub fn record_controller_observations_guarded(project:&Path,batch:&crate::reconcile::ObservationBatch,guard:&crate::execution_guard::ProjectGuard)->Result<()> {
+    guard.check_project(project)?;
+    let _record=crate::execution_guard::exclusive_file(&project.join(".state/lock"))?;
     record_observations_held(project,batch)?;
     migration::open_active(project)?.expire_claims(jiff::Timestamp::now().as_millisecond())?;
     Ok(())

@@ -2273,3 +2273,19 @@ Default features pass all 460 tests (30 library, 406 binary, 22 CLI, two contrac
 Three optional live tests remain ignored. Logs: `/tmp/herdr-local-observation-`
 `{debug,release,debug-recheck,release-recheck,release-contracts,default}.log`.
 Independent review approved the scoped source changes; `git diff --check` passes.
+
+## W04 canonical observation ownership prerequisite
+
+The canonical controller now acquires ProjectGuard before its first snapshot and
+keeps it through collection, observation commit, derived-marker publication and
+claim expiry. The new guarded commit entrypoint verifies the guard's project
+identity and takes the short record lock only for publication; it does not
+recursively acquire project ownership. Scheduling and terminal adapters run after
+the guard is released. This prerequisite alone does not queue canonical probes.
+
+Independent review approved the implementation and three new tests covering wrong
+project/stale head rejection, busy record-lock refusal without releasing ownership,
+exclusion of same-project mutations while other projects remain available, expired
+claims becoming ambiguous without replay, and interrupted publication requiring
+forward recovery. Six library controller tests and seven binary controller tests
+pass in release (`/tmp/herdr-canonical-guard-release.log`).
