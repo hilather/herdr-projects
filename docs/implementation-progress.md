@@ -2638,3 +2638,31 @@ planning still executes a signed occurrence once across restart. The surrounding
 maintenance job still has uncontrolled initial/observation/final reads and
 observation publication/expiry paths; carrying the original control through those
 is next, before claiming whole-job SQL bounds.
+
+### W04 original SQL control through canonical maintenance
+
+The maintenance worker now uses controlled snapshots before planning and at both
+ends of observation collection. Its final control and bounded-head reads retain
+the same deadline/token. Guarded observation commit and claim expiry use explicit
+ControlledStore mutation wrappers under retained project/record ownership.
+Publication reads are bounded and check cancellation before temporary-file write
+and rename. Once rename succeeds, directory fsync completes without falsely
+reporting that publication never happened. Project identity is rechecked before
+recording, publication and expiry.
+
+Failures after a successful observation transaction identify that commit; failures
+after marker publication identify that boundary separately. A cancelled derived
+marker update can leave normal opens blocked until explicit migration recovery
+republishes DB control. Independent review approved the integration. New tests
+cover cancelled entry, retained ownership, cancellation after observation commit
+with marker repair, expiry SQL interruption without undoing observations, and
+expensive SQL in the initial and post-probe snapshots sharing the original job
+deadline. Aggregate decoded allocation remains the next boundary; other effect
+workers still need controlled API conversion. Card counts and unavailable
+platform acceptance remain unchanged.
+
+Validation passed all 712 unit tests (209 library, 503 binary) and nine canonical
+CLI regressions in both debug and release profiles. The focused set includes the
+three new recovery/library tests and 26 canonical controller tests, including two
+new original-deadline SQL fixtures. Default-feature `cargo check` and
+`git diff --check` passed. Independent review approved the final integration.

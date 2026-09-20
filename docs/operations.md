@@ -698,3 +698,15 @@ sidecars and rechecks the database inode after opening. Existing foreground APIs
 keep their current behavior. This is SQL execution and encoded-row bounding, not
 a total-memory guarantee: aggregate decoded snapshot allocation and other
 workers' uncontrolled opens/transaction-local readers remain unfinished.
+
+Canonical maintenance now carries its original SQL control through the initial
+snapshot, both observation snapshots, observation recording, marker publication,
+claim expiry and final liveness reads. No phase renews that deadline. A cancelled
+or expired later phase does not erase an earlier committed observation: errors
+identify whether observation commit or marker publication already completed.
+If cancellation interrupts DB-first marker publication, normal opens refuse the
+mismatch until explicit migration recovery republishes the authoritative control.
+Before rename, publication checks cancellation; after rename it completes directory
+fsync rather than claiming the marker was never published. Filesystem durability
+remains cooperative. Aggregate decoded allocations and other effect workers still
+need separate limits and controlled API integration.

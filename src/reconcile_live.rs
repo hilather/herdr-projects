@@ -21,8 +21,12 @@ fn pane_state(identity:&herdr_projects::domain::RuntimeIdentity,state:&Result<(V
     (State::Present,agents.len()==1)
 }
 
-pub fn collect(ctx:&Ctx,project:&Path)->Result<ObservationBatch> {
-    let snapshot=runtime::snapshot(project)?;
+pub fn collect(ctx:&Ctx,project:&Path)->Result<ObservationBatch> {collect_with_snapshot(ctx,||runtime::snapshot(project))}
+pub fn collect_controlled(ctx:&Ctx,project:&Path,control:&herdr_projects::store::controlled::ReadControl)->Result<ObservationBatch> {
+    collect_with_snapshot(ctx,||runtime::snapshot_controlled(project,control))
+}
+fn collect_with_snapshot(ctx:&Ctx,read:impl Fn()->Result<herdr_projects::domain::Snapshot>)->Result<ObservationBatch> {
+    let snapshot=read()?;
     ensure!(snapshot.schema_version>=6,"upgrade-store is required for reconciliation observations");
     ensure!(snapshot.runtime_bindings.len()<=128,"more than 128 runtime bindings; collector refuses an incomplete batch");
     let config=std::path::absolute(ctx.config_dir.join("config.toml"))?;
@@ -83,7 +87,7 @@ pub fn collect(ctx:&Ctx,project:&Path)->Result<ObservationBatch> {
         observations.push(RuntimeObservation{binding:binding.id.clone(),binding_revision:binding.revision,task_revision:binding.task.as_ref().and_then(|id|snapshot.tasks.iter().find(|t|&t.id==id).map(|t|t.revision)),observed_unix_ms:started,pane,worktree,agent_present,collector:"herdr-git-v2".into(),config_digest:config.digest.clone(),diagnostic:"Observation only: pane absence/idle is not termination, worktree identity is not preservation, and remote worktrees remain unverified. No ownership, capacity release or dispatch authorized.".into(),session_identity,worktree_identity,agent_identity});
     }
     ensure!(migration::config_reference(Path::new(&config.path))?==config,"config changed during observation; retry");
-    ensure!(runtime::snapshot(project)?.head==snapshot.head,"project changed during observation; retry");
+    ensure!(read()?.head==snapshot.head,"project changed during observation; retry");
     Ok(ObservationBatch{expected_head:snapshot.head,observations,dispatch_allowed:false,recorded_head:None})
 }
 

@@ -26,6 +26,25 @@ pub fn open_active_controlled(project:&Path,control:crate::store::controlled::Re
     ensure!(db.project_control()?.map(|c|c.reconciliation_required).unwrap_or(true)==expected.reconciliation_required,"control/format publication interrupted; run migration recover before runtime commands");
     control.check()?;Ok(db)
 }
+/// DB-first publication under the caller's retained project and record locks.
+/// Cancellation can leave the DB committed and marker unpublished; recovery
+/// reads the authoritative DB rather than interpreting this as rollback.
+pub(crate) fn publish_control_marker_controlled(project:&Path,db:&crate::store::controlled::ControlledStore,control:&crate::store::controlled::ReadControl)->Result<()> {
+    control.check()?;
+    let mut budget=Budget::new(50*1024*1024,0,control.deadline(),control.cancellation())?;
+    let(project,old)=publication(project,&mut budget)?;
+    let required=db.project_control()?.map(|c|c.reconciliation_required).unwrap_or(true);
+    if required==old.reconciliation_required {control.check()?;return Ok(());}
+    let marker=Format{version:1,runtime:"sqlite-v2".into(),memory:"legacy-markdown".into(),migration:old.digest,reconciliation_required:required};
+    let temporary=project.join(".state/migration/control-format.next");
+    control.check()?;
+    if exists(&temporary){ensure!(fs::symlink_metadata(&temporary)?.is_file(),"invalid control marker temporary");fs::remove_file(&temporary)?;}
+    control.check()?;write_new(&temporary,&serde_json::to_vec_pretty(&marker)?)?;
+    control.check()?;fs::rename(temporary,project.join(".state/format.json"))?;
+    // Once renamed, finish the existing durability boundary. Do not claim the
+    // marker was unpublished if cancellation arrives during these fsync calls.
+    sync_dir(&project.join(".state"))?;sync_dir(&project.join(".state/migration"))?;Ok(())
+}
 pub fn read_identity_inventory(project:&Path,budget:&mut Budget)->Result<Vec<RuntimeBinding>> {
     let(project,publication)=publication(project,budget)?;
     crate::store::identity_inventory::read(&project.join(".state/state.db"),&publication,budget)

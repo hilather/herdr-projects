@@ -2,8 +2,14 @@
 use anyhow::{Context,Result,ensure};
 use std::path::Path;
 use crate::{domain::{Commit,Mutation,Snapshot,Task,TaskId,TaskState},migration};
+#[cfg(test)]
+#[path="runtime_controlled_tests.rs"]
+mod controlled_tests;
 
 pub fn snapshot(project:&Path)->Result<Snapshot> { migration::open_active(project)?.read_snapshot(None).map_err(Into::into) }
+pub fn snapshot_controlled(project:&Path,control:&crate::store::controlled::ReadControl)->Result<Snapshot> {
+    migration::open_active_controlled(project,control.clone())?.read_snapshot(None).map_err(Into::into)
+}
 pub fn add_task(project:&Path,id:TaskId,title:String,expected_head:u64)->Result<u64> {
     ensure!(!title.trim().is_empty() && title.len()<=16_000,"title must contain 1–16000 bytes");
     let _maintenance=migration::runtime_mutation(project)?;
@@ -77,6 +83,25 @@ pub fn record_controller_observations_guarded(project:&Path,batch:&crate::reconc
     let _record=crate::execution_guard::exclusive_file(&project.join(".state/lock"))?;
     record_observations_held(project,batch)?;
     migration::open_active(project)?.expire_claims(jiff::Timestamp::now().as_millisecond())?;
+    Ok(())
+}
+/// Retain original SQL cancellation through observation commit, derived marker
+/// publication and claim expiry. A later error does not undo an earlier commit.
+pub fn record_controller_observations_controlled(project:&Path,batch:&crate::reconcile::ObservationBatch,guard:&crate::execution_guard::ProjectGuard,control:&crate::store::controlled::ReadControl)->Result<()> {
+    record_controller_controlled(project,batch,guard,control,||{})
+}
+fn record_controller_controlled(project:&Path,batch:&crate::reconcile::ObservationBatch,guard:&crate::execution_guard::ProjectGuard,control:&crate::store::controlled::ReadControl,after_record:impl FnOnce())->Result<()> {
+    control.check()?;guard.check_project(project)?;
+    ensure!(!batch.dispatch_allowed,"observations cannot authorize dispatch");
+    let _record=crate::execution_guard::exclusive_file(&project.join(".state/lock"))?;
+    let mut db=migration::open_active_controlled(project,control.clone())?;
+    guard.check_project(project)?;
+    db.record_observations(batch.expected_head,&batch.observations)?;
+    after_record();
+    guard.check_project(project).context("observations committed; project identity changed before publication")?;
+    migration::publish_control_marker_controlled(project,&db,control).context("observations committed; control publication incomplete")?;
+    guard.check_project(project).context("observations published; project identity changed before expiry")?;
+    db.expire_claims(jiff::Timestamp::now().as_millisecond()).context("observations published; claim expiry incomplete")?;
     Ok(())
 }
 /// Caller retains exclusive root ownership, or project ownership with the shared

@@ -498,4 +498,5 @@ pub(crate) fn publish_control_marker(project:&Path,db:&SqliteStore)->Result<()> 
 }
 
 mod identity_inventory;
+pub(crate) use identity_inventory::publish_control_marker_controlled;
 pub use identity_inventory::{open_active_controlled,read_identity_inventory,read_observation_head,read_controller_effect_hint,read_routine_execution_hint};

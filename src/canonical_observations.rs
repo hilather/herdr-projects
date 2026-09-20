@@ -9,6 +9,7 @@ const JOB:&str="\0herdr-projects-canonical-observation";
 const BUDGET:Duration=Duration::from_secs(15);
 const LIMIT:usize=1024*1024;
 
+fn sql_control(control:&Control)->herdr_projects::store::controlled::ReadControl {herdr_projects::store::controlled::ReadControl::new(control.deadline,control.cancellation.clone())}
 fn observation_head(path:&Path)->Result<u64> {
     let mut budget=herdr_projects::store::identity_inventory::Budget::new(2*1024*1024,0,Instant::now()+Duration::from_millis(100),Default::default())?;
     migration::read_observation_head(path,&mut budget)
@@ -59,12 +60,12 @@ fn collect_with(input:&Input,control:&Control,observe:impl FnOnce(&Input,&Contro
     input.current(control)?;
     let guard=ProjectGuard::acquire(&input.project)?;
     input.current(control)?;
-    ensure!(runtime::snapshot(&input.project)?.schema_version>=9,"upgrade-store is required before canonical controller polling");
+    ensure!(runtime::snapshot_controlled(&input.project,&sql_control(control))?.schema_version>=9,"upgrade-store is required before canonical controller polling");
     control.check()?;
     let mut errors=Vec::new();
     // Planning precedes probes so an offline endpoint cannot monopolize service.
-    // Cooperative checks preserve the remaining budget for observations; full
-    // SQLite materialization still needs its own interruption bounds.
+    // SQL checks preserve the original deadline through later observations;
+    // aggregate decoded materialization still needs independent allocation caps.
     let planned=herdr_projects::routines::schedule_next_guarded(&input.project,input.last_selected.as_deref(),&guard,&control.cancellation,control.deadline.min(Instant::now()+Duration::from_secs(5)));
     let (mut scheduled_work,selected_name)=match planned {
         Ok(report)=>{if let Some(error)=report.diagnostic{errors.push(format!("routine planning: {error}"));}(Some(report.active),report.selected_name)},
@@ -74,10 +75,11 @@ fn collect_with(input:&Input,control:&Control,observe:impl FnOnce(&Input,&Contro
     let reachable=match observed {Ok(value)=>Some(value),Err(error)=>{errors.push(format!("canonical observation: {error:#}"));None}};
     let head=(||->Result<(u64,bool)>{
         input.current(control)?;guard.check_project(&input.project)?;
-        let db=migration::open_active(&input.project)?;control.check()?;
+        let db=migration::open_active_controlled(&input.project,sql_control(control))?;control.check()?;
         let state=db.project_control()?.context("canonical control missing")?;
         let active=state.state==herdr_projects::domain::ProjectState::Active&&!state.reconciliation_required;
-        let head=observation_head(&input.project)?;input.current(control)?;Ok((head,active))
+        let mut budget=herdr_projects::store::identity_inventory::Budget::new(2*1024*1024,0,control.deadline.min(Instant::now()+Duration::from_millis(100)),control.cancellation.clone())?;
+        let head=migration::read_observation_head(&input.project,&mut budget)?;input.current(control)?;Ok((head,active))
     })();
     let head=match head {Ok((head,active))=>{if scheduled_work==Some(true)&&!active{scheduled_work=Some(false);}Some(head)},Err(error)=>{errors.push(format!("maintenance result: {error:#}"));None}};
     // Even an expired probe cannot erase the planner's completed selection.
@@ -89,11 +91,11 @@ fn observe(input:&Input,control:&Control,guard:&ProjectGuard)->Result<bool> {
     input.current(control)?;
     let env=Env::for_observation(&input.home,&input.bin);let probes=Probes{control};
     let ctx=Ctx{env:&env,root:input.project.parent().context("canonical project has no root")?.to_path_buf(),config_dir:input.config.clone(),runner:&probes,detached_ticker:false};
-    let batch=crate::reconcile_live::collect(&ctx,&input.project)?;
+    let batch=crate::reconcile_live::collect_controlled(&ctx,&input.project,&sql_control(control))?;
     input.current(control)?;guard.check_project(&input.project)?;
     let reachable=batch.observations.iter().any(|o|o.pane==ResourceState::Present||o.worktree==ResourceState::Present);
     control.check()?;
-    runtime::record_controller_observations_guarded(&input.project,&batch,guard)?;Ok(reachable)
+    runtime::record_controller_observations_controlled(&input.project,&batch,guard,&sql_control(control))?;Ok(reachable)
 }
 
 pub struct ProbeRunner {pub inner:Arc<dyn Runner+Send+Sync>}

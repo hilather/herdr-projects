@@ -65,6 +65,10 @@ impl ControlledStore {
     pub(crate) fn schedule_routine(&mut self,prepared:&PreparedRoutineTick,head:u64)->Result<Option<RoutineOccurrence>> {
         self.mutation(|store|store.schedule_routine(prepared,head))
     }
+    pub(crate) fn record_observations(&mut self,head:u64,observations:&[crate::reconcile::RuntimeObservation])->Result<u64> {
+        self.mutation(|store|store.record_observations(head,observations))
+    }
+    pub(crate) fn expire_claims(&mut self,now:i64)->Result<usize> {self.mutation(|store|store.expire_claims(now))}
     fn mutation<T>(&mut self,write:impl FnOnce(&mut SqliteStore)->Result<T>)->Result<T> {
         self.control.check()?;
         // A successful commit remains success even if cancellation arrives
