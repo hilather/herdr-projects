@@ -203,6 +203,37 @@ unreadable or malformed ticker state in `.state/ticker.json`.
 
 A file `routines/<name>.md`: TOML front matter with `schedule` (`every <N>m|h|d` or `daily HH:MM`, local time), optional `command`, `enabled`; the body is the prompt the coordinator receives as an inbox item when it is due. A routine with a `command` runs (`sh -c`, in the project folder, 60 second timeout) only when `routine_commands = true` **and** you have run `herdr-projects routine approve <project> <name>` in a terminal; its output reaches the coordinator capped at 4,000 characters inside a fence labelled as untrusted. Edit the command and it stops until approved again.
 
+On Linux, approved legacy commands run through the shared background executor,
+sharing its 128-offer inventory and project/operation rotation with live copies.
+Only one legacy copy/command or canonical routine ticket is admitted per root,
+after a full project pass. Commands retain a 60-second execution limit within a
+95-second queue/execution budget. Namespace supervision and inherited ownership
+keep a surviving command from overlapping replacement project effects.
+
+The worker rechecks the project identity, active state, exact routine definition,
+current enablement/approval and schedule cursor. It durably advances the cursor
+and saves a claim before running. After interruption, a claim without a saved
+result produces an unknown-outcome inbox item; that occurrence is never rerun.
+Completed output is saved before inbox delivery, which retries with the same ID
+even if the item was already handled. Later scheduled occurrences may still run.
+This does not roll back command effects or extend command-text approval to scripts
+and files referenced by the command. Legacy scheduling still requires a reachable
+project session; other platforms retain the prior synchronous path and are untested.
+
+**Environment compatibility:** supervised commands receive only bounded `HOME`,
+`USER`, `LOGNAME`, `PATH`, locale variables, `TZ`, `TMPDIR`, SSH agent variables and
+XDG config/cache/data/runtime paths. Arbitrary inherited variables, including
+provider credentials, are no longer passed automatically. Existing commands that
+rely on them need an explicitly configured environment in their approved script.
+Nonzero exits are reported as supervisor status 200, not the original exit code.
+
+Routine discovery accepts at most 4,096 directory entries and 128 KiB per definition.
+Approval records are limited to 1 MiB and ticker state to 16 MiB. Private control
+files must be regular, single-link files; FIFOs and symlinks refuse promptly.
+These local filesystem reads are bounded but do not promise deadlines for a stalled
+filesystem. Unreadable approval records cannot authorize commands or be overwritten
+by a new approval.
+
 Intervals require positive ASCII digits; the converted seconds must fit a signed
 64-bit integer (at most 9,223,372,036,854,775,807 seconds). Invalid Unicode suffixes
 and oversized intervals produce a routine configuration diagnostic. Other routines

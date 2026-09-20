@@ -118,6 +118,23 @@ pub(crate) fn read_root_config(path: &Path) -> Result<Option<String>> {
     Ok(Some(String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("root config is not UTF-8 (contents withheld)"))?))
 }
 
+/// Private control records must never block on FIFOs or allocate from an
+/// unbounded file. Missing is distinct from malformed or unsupported content.
+pub(crate) fn read_control_text(path:&Path,limit:usize)->Result<Option<String>> {
+    use std::{io::Read,os::unix::fs::{OpenOptionsExt,MetadataExt}};
+    let mut file=match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK|libc::O_NOFOLLOW).open(path) {
+        Ok(file)=>file,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),
+        Err(error)=>return Err(error).with_context(||format!("cannot read {}",path.display())),
+    };
+    let before=file.metadata()?;
+    anyhow::ensure!(before.is_file()&&before.nlink()==1,"{} is not a regular single-link control file",path.display());
+    anyhow::ensure!(before.len()<=limit as u64,"{} exceeds its {limit}-byte limit",path.display());
+    let mut bytes=Vec::new();(&mut file).take(limit as u64+1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len()<=limit,"{} exceeds its {limit}-byte limit",path.display());
+    crate::source_tree::unchanged(&file,&before)?;
+    Ok(Some(String::from_utf8(bytes).with_context(||format!("{} is not UTF-8 (contents withheld)",path.display()))?))
+}
+
 fn absolute(path: &Path) -> Result<PathBuf> {
     std::path::absolute(path).with_context(|| format!("bad path {}", path.display()))
 }

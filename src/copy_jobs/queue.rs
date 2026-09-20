@@ -30,6 +30,9 @@ impl Queue {
     pub fn offer(&mut self,ctx:&Ctx<'_>,project:&Project,t:&Thread,target:Option<&str>)->Result<()> {
         self.offer_request(request(ctx,project,t,target)?)
     }
+    pub fn offer_routine(&mut self,ctx:&Ctx,project:&Project,routine:&crate::routine::Routine,previous:&str,occurrence:&str)->Result<()> {
+        self.offer_request(crate::legacy_routine_jobs::request(ctx,project,routine,previous,occurrence)?)
+    }
     fn offer_request(&mut self,work:Request)->Result<()> {
         self.prune();let key=(work.identity.project.clone(),work.identity.operation.clone());
         if self.pending.as_ref().is_some_and(|p|p.key==key){return Ok(());}
@@ -50,14 +53,14 @@ impl Queue {
         let result=match pending.ticket.try_recv() {
             Ok(None)=>return Vec::new(),
             Ok(Some(completion))=>{
-                if completion.identity!=pending.identity {Err(anyhow::anyhow!("live-copy completion identity mismatch"))}
-                else {completion.result.and_then(|o|{ensure!(o.success(),"live-copy worker failed");Ok(())})}
+                if completion.identity!=pending.identity {Err(anyhow::anyhow!("background completion identity mismatch"))}
+                else {completion.result.and_then(|o|{ensure!(o.success(),"background worker failed");Ok(())})}
             },
             Err(error)=>Err(error),
         };
         let pending=self.pending.take().unwrap();let now=Instant::now();
         if let Some(entry)=self.entries.get_mut(&pending.key) {entry.not_before=now+if result.is_err(){Duration::from_secs(30)}else{Duration::ZERO};entry.touched=now;entry.needed=result.is_err();}
-        result.err().map(|e|format!("{} {}: live-copy queue: {e:#}",pending.key.0,pending.key.1)).into_iter().collect()
+        result.err().map(|e|format!("{} {}: background queue: {e:#}",pending.key.0,pending.key.1)).into_iter().collect()
     }
     pub fn admit(&mut self)->Vec<String> {
         self.prune();let mut errors=Vec::new();if self.pending(){return errors;}
@@ -69,7 +72,7 @@ impl Queue {
                     self.sequence=next;entry.last=next;self.cursor.accepted(&key);
                     self.pending=Some(Pending{key,identity,ticket});break;
                 },
-                Err(error)=>{entry.not_before=Instant::now()+Duration::from_secs(30);errors.push(format!("{} {}: copy admission: {error:#}",key.0,key.1));},
+                Err(error)=>{entry.not_before=Instant::now()+Duration::from_secs(30);errors.push(format!("{} {}: background admission: {error:#}",key.0,key.1));},
             }
         }
         errors

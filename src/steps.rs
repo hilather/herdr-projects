@@ -51,10 +51,9 @@ pub struct State {
 pub fn try_load_state(project: &Project) -> Result<State> {
     use anyhow::Context;
     let path = project.state_dir().join("ticker.json");
-    match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("{} is invalid; preserve this file and repair or restore it before resuming the ticker", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
-        Err(e) => Err(e).with_context(|| format!("cannot read {}; refusing to replace retry state", path.display())),
+    match crate::paths::read_control_text(&path,16*1024*1024)? {
+        Some(text) => serde_json::from_str(&text).with_context(|| format!("{} is invalid; preserve this file and repair or restore it before resuming the ticker", path.display())),
+        None => Ok(State::default()),
     }
 }
 
@@ -63,11 +62,13 @@ pub fn load_state(project: &Project) -> State {
     try_load_state(project).expect("valid fixture ticker state")
 }
 
-/// Only the ticker writes this file, so its own read-modify-write is safe; the
-/// write still happens under the project lock, like every `.state/` write.
+/// Ticker mutations hold the root lease; trusted legacy routine workers hold
+/// project effect ownership. These exclude one another before this short lock.
 pub fn save_state(project: &Project, state: &State) -> Result<()> {
     let _lock = project.lock()?;
-    project::write_json(&project.state_dir().join("ticker.json"), state)
+    let mut bytes=serde_json::to_vec_pretty(state)?;bytes.push(b'\n');
+    anyhow::ensure!(bytes.len()<=16*1024*1024,"ticker state exceeds 16 MiB; existing retry state is preserved");
+    project::write_atomic(&project.state_dir().join("ticker.json"),&bytes)
 }
 
 /// Continuous-failure tracking for `gh` or a machine: one item when it has
@@ -448,7 +449,7 @@ pub fn auto_resolve(ctx: &Ctx, project: &Project, settings: &Settings, memory: &
 }
 
 /// Step 3, plus `config-error` items for files that do not parse.
-pub fn routines(ctx: &Ctx, project: &Project, state: &mut State, routine_commands: bool, project_md_error: Option<(String, String)>, now: &jiff::Zoned) -> Vec<anyhow::Error> {
+pub fn routines_queued(ctx: &Ctx, project: &Project, state: &mut State, routine_commands: bool, project_md_error: Option<(String, String)>, now: &jiff::Zoned,mut queue:Option<&mut crate::copy_jobs::Queue>) -> Vec<anyhow::Error> {
     let mut errors = Vec::new();
     let (routines, broken) = routine::load_all(project);
 
@@ -467,6 +468,7 @@ pub fn routines(ctx: &Ctx, project: &Project, state: &mut State, routine_command
     let prefix = crate::coordinator::current_prefix(&ctx.root).unwrap_or_default();
     for r in routines.iter().filter(|r| r.enabled) {
         let entry = state.routines.entry(r.name.clone()).or_default();
+        if entry.dispatch.is_some() {continue;}
         let Ok(last_run) = entry.last_run.parse::<jiff::Timestamp>() else {
             // First seen counts as the last run: nothing fires the moment a
             // routine file appears.
@@ -475,6 +477,10 @@ pub fn routines(ctx: &Ctx, project: &Project, state: &mut State, routine_command
         };
         if !routine::is_due(&r.schedule, last_run, now) {
             continue;
+        }
+        if let Some(queue)=queue.as_deref_mut()&& !r.command.is_empty()&&routine_commands&&routine::is_approved(&ctx.config_dir,project,r) {
+            errors.extend(queue.offer_routine(ctx,project,r,&entry.last_run,&now.timestamp().to_string()).err());
+            continue; // Only trusted worker claim may advance this occurrence.
         }
         entry.last_run = now.timestamp().to_string();
 

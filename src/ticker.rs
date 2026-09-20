@@ -262,6 +262,7 @@ pub fn run(ctx: &Ctx) -> Result<()> {
     #[cfg(feature="state-store")]
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::routine_jobs::JobRunner{inner:runner});
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::copy_jobs::JobRunner{inner:runner});
+    let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::legacy_routine_jobs::JobRunner{inner:runner});
     let executor=std::sync::Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),runner)?);
     #[cfg(feature="state-store")]
     {memory.routine_jobs=Some(crate::routine_jobs::Queue::new(executor.clone()));}
@@ -715,6 +716,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
         Err(error) => return vec![error],
     };
     let before = state.clone();
+    errors.extend(crate::legacy_routine_jobs::deliver(project,&mut state).err());
     if let Some(error) = &seen.notification_error { errors.push(anyhow::anyhow!("{error}")); }
     let herdr = Herdr::new(ctx.env.herdr_bin(), &seen.socket, ctx.runner);
     let now = jiff::Timestamp::now();
@@ -808,13 +810,13 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     match project.read_project_md() {
         Ok((settings, _)) => {
             let commands = project.safety(&ctx.config_dir).map(|s| s.routine_commands).unwrap_or(false);
-            errors.extend(steps::routines(ctx, project, &mut state, commands, None, &zoned));
+            errors.extend(steps::routines_queued(ctx, project, &mut state, commands, None, &zoned,memory.copy_jobs.as_mut()));
             errors.extend(steps::auto_resolve(ctx, project, &settings, memory, &state, now));
         }
         Err(error) => {
             let text = std::fs::read(project.project_md()).unwrap_or_default();
             let problem = Some((thread::sha256_hex(&text), format!("{error:#}")));
-            errors.extend(steps::routines(ctx, project, &mut state, false, problem, &zoned));
+            errors.extend(steps::routines_queued(ctx, project, &mut state, false, problem, &zoned,memory.copy_jobs.as_mut()));
         }
     }
     inbox::prune_done(project, steps::DONE_RETENTION_DAYS);

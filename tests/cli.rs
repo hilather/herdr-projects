@@ -641,3 +641,38 @@ fn native_report_hash_is_bounded_binary_and_configuration_independent() {
     fs::remove_file(source.join("report.md")).unwrap();std::os::unix::fs::symlink("/etc/passwd",source.join("report.md")).unwrap();assert!(!run().status.success());
     let name=std::ffi::CString::new(source.join("report.md").as_os_str().as_encoded_bytes()).unwrap();fs::remove_file(source.join("report.md")).unwrap();assert_eq!(unsafe{libc::mkfifo(name.as_ptr(),0o600)},0);assert!(!run().status.success());
 }
+
+#[cfg(target_os="linux")]
+#[test]
+fn native_ticker_claims_legacy_routine_and_restart_delivers_without_rerun() {
+    use std::{fs,time::{Duration,Instant},process::Stdio,os::unix::fs::PermissionsExt};
+    use sha2::{Digest,Sha256};
+    let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
+    assert!(hp(home.path(),&["--root",r,"new","demo"]).status.success());let project=root.join("demo");
+    let socket=home.path().join("session.sock");fs::write(&socket,b"").unwrap();
+    fs::write(project.join(".state/coordinator.json"),serde_json::to_vec(&serde_json::json!({"socket":socket,"workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p1","agent_name":"coordinator","cwd":project})).unwrap()).unwrap();
+    let command="printf run >> executions; printf routine-result";
+    fs::write(project.join("routines/check.md"),format!("+++\nschedule = \"every 24h\"\ncommand = {}\n+++\nInspect output.\n",serde_json::to_string(command).unwrap())).unwrap();
+    let cfg=home.path().join(".config/herdr-projects");fs::create_dir_all(&cfg).unwrap();
+    fs::write(cfg.join("config.toml"),format!("[safety.\"{}\"]\nroutine_commands = true\n",project.display())).unwrap();
+    fs::write(cfg.join("approved-routines.json"),serde_json::to_vec(&serde_json::json!([{"project":project,"routine":"check","command_sha256":format!("{:x}",Sha256::digest(command.as_bytes())),"approved":"fixture"}])).unwrap()).unwrap();
+    let state=project.join(".state/ticker.json");fs::write(&state,b"{\"routines\":{\"check\":{\"last_run\":\"2026-01-01T00:00:00Z\"}}}").unwrap();
+    let fake=home.path().join("herdr");fs::write(&fake,b"#!/bin/sh\ncase \"$1 $2\" in\n'agent list') echo '{\"result\":{\"agents\":[]}}';;\n'pane list') echo '{\"result\":{\"panes\":[]}}';;\n*) echo '{\"result\":{\"shown\":true}}';;\nesac\n").unwrap();fs::set_permissions(&fake,fs::Permissions::from_mode(0o700)).unwrap();
+    struct Child(std::process::Child);
+    impl Drop for Child {fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+    let spawn=||Child(Command::new(BIN).env_clear().env("HOME",home.path()).env("PATH","/usr/bin:/bin").env("HERDR_BIN_PATH",&fake).args(["--root",r,"ticker","run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let read=||->serde_json::Value {serde_json::from_slice(&fs::read(&state).unwrap()).unwrap()};
+    let wait=|child:&mut Child,predicate:&dyn Fn()->bool| {
+        let deadline=Instant::now()+Duration::from_secs(10);
+        while !predicate(){assert!(child.0.try_wait().unwrap().is_none(),"ticker exited");assert!(Instant::now()<deadline,"ticker log: {}",fs::read_to_string(root.join(".ticker.log")).unwrap_or_default());std::thread::sleep(Duration::from_millis(10));}
+    };
+    let stop=|child:&mut Child| {
+        fs::write(root.join(".ticker.stop"),b"").unwrap();let end=Instant::now()+Duration::from_secs(8);
+        while child.0.try_wait().unwrap().is_none(){assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(10));}
+        fs::remove_file(root.join(".ticker.stop")).unwrap();
+    };
+    let mut child=spawn();wait(&mut child,&||read()["routines"]["check"]["dispatch"]["result"].is_object());stop(&mut child);
+    let mut child=spawn();wait(&mut child,&||read()["routines"]["check"]["dispatch"].is_null());stop(&mut child);
+    assert_eq!(fs::read(project.join("executions")).unwrap(),b"run");
+    let items=fs::read_dir(project.join("inbox")).unwrap().filter_map(Result::ok).filter_map(|entry|fs::read_to_string(entry.path()).ok()).filter(|text|text.contains("routine-result")).count();assert_eq!(items,1);
+}

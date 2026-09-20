@@ -1474,3 +1474,40 @@ All 531 tests pass in debug and release (165 library, 332 binary, 32 CLI, two
 contracts). Default-feature tests pass (29 library, 283 binary, 13 CLI, two
 contracts); three optional live checks remain ignored. Logs:
 `/tmp/herdr-local-reports-{debug,release,default}.log`.
+
+
+## W04 supervised legacy routine commands
+
+Linux legacy command routines now use the shared bounded executor and the existing
+128-entry copy/legacy offer inventory. Stable routine keys receive project/operation
+rotation and share the one pending background ticket; canonical routine admission
+continues alternating with that inventory after full project effect passes. Failed
+or evicted offers leave the durable schedule cursor unchanged for later admission.
+
+The trusted worker freezes project inode, configuration path, full routine fingerprint,
+previous cursor and occurrence time. Under project and inherited transfer ownership
+it rechecks current enablement, approval, definition, due time and cursor. An atomic,
+fsynced ticker-state claim advances the cursor before concrete namespace supervision.
+A lost claim is never replayed: recovery reports uncertainty. Saved results deliver
+idempotently, including handled inbox items; equal output keeps existing deduplication.
+Completion output from an injectable Runner performs no durable certification.
+
+Independent review found unbounded approval/state reads; both now use nonblocking
+regular-file reads with byte limits and metadata stability checks. Routine discovery
+and definitions are bounded too. Writers refuse to exceed their reader limits.
+Review approved the fixes and independently passed all six worker fixtures covering
+stale authority/cursors, cancellation, concurrent unrelated status, FIFO/oversize
+refusal, uncertain claims, and delivery across restart. A built-binary ticker fixture
+also proves one execution followed by persisted result delivery after restart.
+
+Supervision filters inherited environment variables and normalizes nonzero exits;
+these compatibility changes are documented in operations. Same-user script edits
+remain outside command-text approval, legacy commands still require a reachable
+session, and non-Linux execution remains untested. Idle final-copy/auto-resolution,
+remaining terminal effects and canonical launch/profile/budget/authority work remain.
+Counts stay 16 locally implemented, five partial and 20 not started.
+
+All 538 tests pass in debug and release (165 library, 338 binary, 33 CLI, two
+contracts). Default-feature tests pass (29 library, 289 binary, 14 CLI, two
+contracts); three optional live checks remain ignored. Logs:
+`/tmp/herdr-legacy-routines-{debug,release,default}.log`.
