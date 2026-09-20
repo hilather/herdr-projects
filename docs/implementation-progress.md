@@ -931,3 +931,44 @@ optional live checks remain ignored. Logs: `/tmp/herdr-routines-final-{debug,rel
 No user store was upgraded or script executed. Ticker scheduling/dispatch, typed
 completion and termination receipts, overlap release and output inbox delivery remain
 next. Counts stay 16 implemented, five partial and 20 not started; macOS is unavailable.
+
+## W04 explicit routine execution and verified cleanup
+
+The signed routine path now supports explicit Linux execution. It retains mutation
+ownership across claim, pre-effect validation, bounded execution and receipt commit,
+and feeds the exact verified script bytes over stdin. The fixed namespace supervisor
+clears inherited environment before exec and maps command results to reserved exit
+statuses. Only normally reaped supervisor exits certify descendant cleanup; bootstrap
+errors, outer timeout, cancellation and I/O failures remain uncertain. Ordinary script
+failure and deadline expiry both report failed execution without inventing an exact
+exit classification. Detached process groups cannot survive verified namespace exit.
+
+Typed, digest-bound completion events use the existing schema-16 event log. Output
+inbox delivery, operation outcome and receipt commit atomically. Snapshots validate
+receipt identity, approved revision, claim and output bounds. Overlap releases only
+for a matching verified cleanup receipt; generic confirmation/retirement cannot do so.
+Any prior claim prevents replay, including after generic no-effect retry advice.
+Missing/expired/uncommitted receipts continue to block overlap. Output is observation,
+never task authority. Existing projection heads without receipts retain their bytes.
+
+Independent review approved the cleanup contract and implementation. Review also
+identified quadratic receipt lookups; indexed occurrence/revision/cleanup maps now
+avoid nested history scans. Full-suite namespace isolation exposed mapped host-root
+UID handling; fixed helper paths compare with the mapped system owner as a sanity
+check under the trusted-OS assumption. This does not independently attest host-root
+ownership when UIDs share an overflow mapping.
+
+Eight new tests cover real detached-child teardown, timeout, cancellation, bootstrap
+failure, environment/output bounds, atomic receipt rollback, reopen, stale/misbound
+completion and withheld cleanup. The real-key CLI fixture now schedules without
+effects, refuses edited script bytes, explicitly executes once, persists output and
+cleanup, and refuses replay after reopening. All 444 tests pass in debug and release
+(151 library, 261 binary, 30 CLI, 2 contracts); three optional live checks remain
+ignored. The default-feature suite also passes. Logs:
+`/tmp/herdr-routine-execution-final-{debug,release}.log` and
+`/tmp/herdr-routine-execution-default.log`.
+
+No user store or script was used. Explicit execution holds root/project mutation
+ownership synchronously; automatic ticker scheduling/dispatch and asynchronous
+ownership remain next. T04.4 still includes usage/estimates/running budget/telemetry
+work. Counts remain 16 implemented, five partial and 20 not started; macOS is unavailable.

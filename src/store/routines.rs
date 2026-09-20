@@ -70,7 +70,70 @@ pub(super) fn check(db:&Connection,id:&OperationId)->Result<()> {
     if control.config_digest!=definition.config.digest {return Err(invalid("routine configuration is not acknowledged"));}
     Ok(())
 }
+
+fn validate_receipt(r:&RoutineReceipt,d:&RoutineDefinition,o:&RoutineOccurrence)->Result<()> {
+    let c=&r.claim;let cap=d.output_cap_bytes as usize;
+    if o.operation.as_ref()!=Some(&r.operation)||r.routine!=o.routine||c.operation!=r.operation
+        ||c.epoch!=1||c.revision!=2||c.owner!="routine-linux-namespace-v1"
+        ||r.finished_unix_ms<o.observed_unix_ms||r.finished_unix_ms>=c.lease_until_ms
+        ||r.succeeded&&!r.cleanup_verified||r.stdout.len()>cap||r.stderr.len()>cap
+        ||r.stdout_total_bytes<r.stdout.len() as u64||r.stderr_total_bytes<r.stderr.len() as u64
+        ||r.stdout_truncated!=(r.stdout_total_bytes>r.stdout.len() as u64)
+        ||r.stderr_truncated!=(r.stderr_total_bytes>r.stderr.len() as u64)
+        ||r.elapsed_ms>d.deadline_ms+30_000 {return Err(corrupt("routine completion binding or bounds mismatch"));}
+    Ok(())
+}
+
+/// Completion events use the existing atomic event log, with a digest and
+/// typed occurrence/claim binding. Generic operation outcomes never create one.
+pub(super) fn read_receipts(db:&Connection,definitions:&[RoutineDefinition],occurrences:&[RoutineOccurrence])->Result<Vec<RoutineReceipt>> {
+    let mut result=Vec::new();let mut seen=std::collections::BTreeSet::new();
+    let occurrences:BTreeMap<_,_>=occurrences.iter().filter_map(|o|o.operation.as_ref().map(|id|(id,o))).collect();
+    let mut revisions=BTreeMap::new();
+    for d in definitions {let reference=d.reference().map_err(StoreError::Corrupt)?;revisions.insert((reference.id.clone(),reference.revision),(reference,d));}
+    let mut stmt=db.prepare("SELECT entity,revision,payload_version,payload FROM events WHERE kind='routine.completed' ORDER BY sequence")?;
+    for row in stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,u32>(2)?,r.get::<_,String>(3)?)))? {
+        let(entity,revision,version,payload)=row?;
+        if result.len()>=100_000||payload.len()>MAX_RECORD_BYTES {return Err(corrupt("routine completion bound exceeded"));}
+        let (r,hash):(RoutineReceipt,String)=serde_json::from_str(&payload).map_err(|_|corrupt("invalid routine completion"))?;
+        if version!=1||entity!=r.operation.as_str()||revision!=r.claim.revision||!seen.insert(r.operation.clone())
+            ||encoded(&r)?.1!=hash {return Err(corrupt("routine completion identity mismatch"));}
+        let o=occurrences.get(&r.operation).ok_or_else(||corrupt("orphan routine completion"))?;
+        let (reference,d)=revisions.get(&(r.routine.id.clone(),r.routine.revision)).ok_or_else(||corrupt("routine completion revision missing"))?;
+        if reference!=&r.routine {return Err(corrupt("routine completion revision digest mismatch"));}
+        validate_receipt(&r,d,o)?;result.push(r);
+    }
+    Ok(result)
+}
 impl SqliteStore {
+    pub(crate) fn complete_routine(&mut self,completed:&crate::routines::CompletedRoutine)->Result<()> {
+        use crate::operations::Outcome;
+        let r=&completed.receipt;super::delivery::now_check(r.finished_unix_ms)?;
+        let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
+        let(definitions,occurrences)=read_all(&tx)?;
+        if read_receipts(&tx,&definitions,&occurrences)?.iter().any(|old|old.operation==r.operation) {return Err(StoreError::Conflict);}
+        let o=occurrences.iter().find(|o|o.operation.as_ref()==Some(&r.operation)).ok_or_else(||invalid("routine occurrence missing"))?;
+        let d=definitions.iter().find(|d|d.reference().ok().as_ref()==Some(&r.routine)).ok_or_else(||invalid("routine revision missing"))?;
+        project_matches(&tx,d)?;validate_receipt(r,d,o)?;
+        let old=super::delivery::delivery(&tx,&r.operation)?;let c=&r.claim;
+        if old.state!=DeliveryState::Claimed||old.revision!=c.revision||old.epoch!=c.epoch||old.attempts!=1
+            ||old.owner.as_deref()!=Some(&c.owner)||old.lease_until_ms!=Some(c.lease_until_ms) {return Err(StoreError::Conflict);}
+        // Cleanup remains useful after permission/control withdrawal. This
+        // records the completed owned effect; it does not admit another effect.
+        let outcome=if !r.cleanup_verified {Outcome::Ambiguous{observation_required:"routine cleanup unverified; no replay or overlap release".into()}}
+            else if r.succeeded {Outcome::Confirmed{observed_identity:format!("routine-completion:{}",r.operation.as_str())}}
+            else {Outcome::PermanentFailure{diagnostic:"routine command failed; namespace cleanup verified".into()}};
+        super::delivery::update_outcome(&tx,&old,&outcome,r.finished_unix_ms,&c.owner)?;
+        let summary=if !r.cleanup_verified {"Cleanup unverified; overlap blocked"}else if r.succeeded {"Completed; cleanup verified"}else{"Failed; cleanup verified"};
+        let content=InboxContent{id:format!("{}-result",r.operation.as_str()),kind:"routine-result".into(),subject:d.name.clone(),
+            created:jiff::Timestamp::from_millisecond(r.finished_unix_ms).map_err(|_|invalid("invalid completion time"))?.to_string(),summary:summary.into(),
+            // JSON escapes terminal controls and marks script output as data.
+            body:serde_json::json!({"untrusted_script_output":true,"stdout":String::from_utf8_lossy(&r.stdout),"stderr":String::from_utf8_lossy(&r.stderr),"stdout_truncated":r.stdout_truncated,"stderr_truncated":r.stderr_truncated}).to_string()};
+        super::inbox::insert(&tx,&InboxItem{revision:1,content:content.clone(),seen:false,done:false})?;
+        log(&tx,"inbox.delivered",&content.id,1,&content)?;
+        log(&tx,"routine.completed",r.operation.as_str(),c.revision,&(r,encoded(r)?.1))?;
+        tx.commit()?;Ok(())
+    }
     pub fn install_routine(&mut self,prepared:&PreparedRoutine,expected_head:u64)->Result<VersionedReference> {
         let d=&prepared.definition;let reference=d.reference().map_err(|s|invalid(&s))?;
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
@@ -113,9 +176,13 @@ impl SqliteStore {
         if occurrences.len()>=100_000 {return Err(invalid("routine occurrence bound reached"));}
         let reference=d.reference().map_err(|s|invalid(&s))?;
         let mut overlap=false;
+        let receipts=read_receipts(&tx,&definitions,&occurrences)?;
+        let cleaned:BTreeMap<_,_>=receipts.iter().filter(|r|r.cleanup_verified).map(|r|(&r.operation,r.claim.epoch)).collect();
         for o in occurrences.iter().filter(|o|o.routine.id==reference.id) {if let Some(id)=&o.operation {
             let delivery=super::delivery::delivery(&tx,id)?;
-            if delivery.attempts>0||matches!(delivery.state,DeliveryState::Pending|DeliveryState::Claimed|DeliveryState::Ambiguous) {overlap=true;}
+            let cleaned=cleaned.get(id)==Some(&delivery.epoch)
+                &&delivery.attempts==1&&matches!(delivery.state,DeliveryState::Confirmed|DeliveryState::PermanentFailure);
+            if !cleaned&&(delivery.attempts>0||matches!(delivery.state,DeliveryState::Pending|DeliveryState::Claimed|DeliveryState::Ambiguous)) {overlap=true;}
         }}
         let disposition=if due.slots>1&&d.missed==MissedRunPolicy::Skip {RoutineDisposition::SkippedMissed}else if overlap {RoutineDisposition::SkippedOverlap}else{RoutineDisposition::Enqueued};
         let id=RoutineOccurrence::identity(d,due.last_unix_ms).map_err(|s|invalid(&s))?;

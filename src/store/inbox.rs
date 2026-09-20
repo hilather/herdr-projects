@@ -12,7 +12,7 @@ pub(super) fn read_all(db:&Connection)->Result<Vec<InboxItem>> {
         content.validate().map_err(StoreError::Corrupt)?;Ok(InboxItem{revision,content,seen,done})
     }).collect()
 }
-fn insert(db:&Connection,item:&InboxItem)->Result<()> {
+pub(super) fn insert(db:&Connection,item:&InboxItem)->Result<()> {
     item.content.validate().map_err(StoreError::Invalid)?;
     let payload=serde_json::to_string(&item.content).map_err(|e|StoreError::Invalid(e.to_string()))?;
     if payload.len()>16*MAX_RECORD_BYTES{return Err(StoreError::Invalid("inbox record too large".into()));}

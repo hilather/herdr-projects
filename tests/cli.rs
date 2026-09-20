@@ -7,7 +7,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
 
 #[cfg(feature="state-store")]
 #[test]
-fn signed_routine_cli_records_one_occurrence_without_executing_the_script() {
+fn signed_routine_cli_records_then_explicitly_executes_once_with_durable_cleanup() {
     use herdr_projects::{domain::*,authority,migration,runtime};
     use sha2::{Digest,Sha256};
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
@@ -18,7 +18,7 @@ fn signed_routine_cli_records_one_occurrence_without_executing_the_script() {
     std::fs::write(&config,format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[safety.{:?}]\nroutine_commands=true\n",project.display().to_string())).unwrap();
     let plan=migration::inspect_with_config(&project,&config).unwrap();migration::apply(&project,&plan,true).unwrap();
     let s=runtime::snapshot(&project).unwrap();runtime::set_state(&project,s.head,s.control.unwrap().revision,ProjectState::Active,&config).unwrap();
-    let script=project.join("check.sh");let bytes=b"touch ROUTINE_SHOULD_NOT_RUN\n";std::fs::write(&script,bytes).unwrap();
+    let script=project.join("check.sh");let bytes=b"printf once >> ROUTINE_MARKER\nprintf 'result\\033[31m'\n";std::fs::write(&script,bytes).unwrap();
     let definition=RoutineDefinition{version:1,name:"check".into(),revision:1,project_store:project.join(".state/state.db").canonicalize().unwrap().display().to_string(),
         authority:authority::policy_reference(&project).unwrap(),config:migration::config_reference(&config).unwrap(),enabled:true,schedule:"every 1m".into(),timezone:"UTC".into(),start_unix_ms:0,
         missed:MissedRunPolicy::CoalesceLatest,overlap:OverlapPolicy::Skip,script:script.display().to_string(),script_sha256:format!("{:x}",Sha256::digest(bytes)),cwd:project.display().to_string(),deadline_ms:1000,output_cap_bytes:4000};
@@ -31,7 +31,25 @@ fn signed_routine_cli_records_one_occurrence_without_executing_the_script() {
     let output=hp(home.path(),&args);assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
     let after=runtime::snapshot(&project).unwrap();assert_eq!(after.routine_occurrences.len(),1);assert_eq!(after.operations.len(),1);assert!(after.operations[0].task.is_none());
     assert!(!hp(home.path(),&args).status.success());assert_eq!(runtime::snapshot(&project).unwrap(),after);
-    assert!(!project.join("ROUTINE_SHOULD_NOT_RUN").exists());
+    assert!(!project.join("ROUTINE_MARKER").exists());
+    #[cfg(target_os="linux")]
+    {
+        let operation=after.operations[0].id.as_str();let head=after.head.to_string();
+        let args=["--root",root_arg,"routine-store","demo","execute",operation,"--expected-head",&head];
+        std::fs::write(&script,b"touch WRONG_SCRIPT").unwrap();
+        assert!(!hp(home.path(),&args).status.success());assert_eq!(runtime::snapshot(&project).unwrap(),after);
+        assert!(!project.join("WRONG_SCRIPT").exists());std::fs::write(&script,bytes).unwrap();
+        let output=hp(home.path(),&args);assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+        let receipt:RoutineReceipt=serde_json::from_slice(&output.stdout).unwrap();assert!(receipt.cleanup_verified && receipt.succeeded,"{receipt:?}");
+        assert_eq!(receipt.stdout,b"result\x1b[31m");
+        let completed=runtime::snapshot(&project).unwrap();assert_eq!(completed.routine_receipts,vec![receipt]);
+        assert_eq!(completed.deliveries[0].state,herdr_projects::operations::DeliveryState::Confirmed);
+        let result=completed.inbox.iter().find(|i|i.content.kind=="routine-result").unwrap();assert!(!result.content.body.contains('\x1b'));
+        let current=completed.head.to_string();
+        assert!(!hp(home.path(),&["--root",root_arg,"routine-store","demo","execute",operation,"--expected-head",&current]).status.success());
+        assert_eq!(runtime::snapshot(&project).unwrap(),completed);
+        assert_eq!(std::fs::read(project.join("ROUTINE_MARKER")).unwrap(),b"once");
+    }
 }
 
 #[cfg(feature="state-store")]
@@ -65,7 +83,7 @@ fn approval_cli_uses_pinned_policy_and_refuses_unsigned_import() {
     let output=hp(caller.path(), &["--root",root_arg,"routine-store","demo","inspect"]);
     assert!(output.status.success());
     let report:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["execution_enabled"],false);assert_eq!(report["occurrences"],serde_json::json!([]));
+    assert_eq!(report["execution_enabled"],cfg!(target_os="linux"));assert_eq!(report["automatic_dispatch"],false);assert_eq!(report["occurrences"],serde_json::json!([]));
     let output=hp(caller.path(), &["--root",root_arg,"routine-store","demo","schedule","unknown","--expected-head",&before.head.to_string()]);
     assert!(!output.status.success());assert_eq!(runtime::snapshot(&project).unwrap(),before);
     let document=home.path().join("grant.json");

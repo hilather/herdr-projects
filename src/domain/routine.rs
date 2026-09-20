@@ -81,3 +81,23 @@ impl RoutineOccurrence {
         Ok(format!("routine-{:x}",Sha256::digest(serde_json::to_vec(&(&definition.project_store,&definition.name,definition.revision,scheduled)).map_err(|_|"occurrence encoding failed")?)))
     }
 }
+
+/// Observational output, never task-completion or permission authority. Only
+/// the trusted execution service can persist a completion event.
+#[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineReceipt {
+    pub operation:OperationId,
+    pub routine:VersionedReference,
+    pub claim:crate::operations::Claim,
+    pub finished_unix_ms:i64,
+    pub cleanup_verified:bool,
+    pub succeeded:bool,
+    pub stdout:Vec<u8>,
+    pub stderr:Vec<u8>,
+    pub stdout_truncated:bool,
+    pub stderr_truncated:bool,
+    pub stdout_total_bytes:u64,
+    pub stderr_total_bytes:u64,
+    pub elapsed_ms:u64,
+}

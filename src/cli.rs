@@ -85,6 +85,7 @@ enum RoutineStoreCommand {
     Inspect,
     Import { document:PathBuf, signature:PathBuf, #[arg(long)] expected_head:u64 },
     Schedule { name:String, #[arg(long)] expected_head:u64 },
+    Execute { operation:String, #[arg(long)] expected_head:u64 },
 }
 
 #[derive(Subcommand)]
@@ -487,9 +488,10 @@ pub fn run() -> Result<()> {
         Command::RoutineStore{slug,command}=>{
             project::validate_slug(&slug)?;let dir=ctx.root.join(slug);
             let value=match command {
-                RoutineStoreCommand::Inspect=>{let s=herdr_projects::runtime::snapshot(&dir)?;serde_json::json!({"head":s.head,"revisions":s.routine_revisions,"occurrences":s.routine_occurrences,"execution_enabled":false})},
+                RoutineStoreCommand::Inspect=>{let s=herdr_projects::runtime::snapshot(&dir)?;serde_json::json!({"head":s.head,"revisions":s.routine_revisions,"occurrences":s.routine_occurrences,"receipts":s.routine_receipts,"execution_enabled":cfg!(target_os="linux"),"automatic_dispatch":false})},
                 RoutineStoreCommand::Import{document,signature,expected_head}=>serde_json::to_value(herdr_projects::authority::import_routine(&dir,&document,&signature,expected_head)?)?,
                 RoutineStoreCommand::Schedule{name,expected_head}=>serde_json::to_value(herdr_projects::routines::schedule(&dir,&name,expected_head)?)?,
+                RoutineStoreCommand::Execute{operation,expected_head}=>serde_json::to_value(herdr_projects::routines::execute(&dir,&herdr_projects::domain::OperationId::new(operation).map_err(anyhow::Error::msg)?,expected_head)?)?,
             };println!("{}",serde_json::to_string_pretty(&value)?);Ok(())
         },
         #[cfg(feature="state-store")]

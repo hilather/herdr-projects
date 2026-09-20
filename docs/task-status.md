@@ -56,8 +56,9 @@ launch arguments by explicit agent kind and provides redacted [named profile ins
 explicit local version probes for Claude/Codex are available. Launch selection,
 production profile resolution and verified capability evidence remain. Version-2
 reservation inputs now retain and validate frozen profile evidence; historical
-version-1 records remain readable. Async routine commands first need durable
-occurrence and authority contracts, so that path remains synchronous. Next are bounded command execution, kind-bound worker profiles
+version-1 records remain readable. Explicit routine execution now has durable
+occurrence, authority and cleanup contracts; asynchronous ownership/ticker integration
+remains. Next are bounded command execution, kind-bound worker profiles
 (T04.3), budgets/routines/telemetry (T04.4) and operation-scoped authority (T04.5).
 T04.5 now has an [approval scope contract](authority.md) binding exact launch inputs
 without circular hashes, durable grants/revocations and atomic one-time launch-claim
@@ -65,15 +66,16 @@ consumption. Owner-signature import now uses the migration-pinned public-key con
 policy-change ingress, denial audit and other command-path coverage remain.
 T04.4 now provides [signed durable admission budgets](budgets.md): lifetime attempt
 limits, explicit unknown-provider-usage policy and reservation/claim/pre-effect
-checks. Native usage, estimates, running limits, routine execution and wider telemetry
+checks. Native usage, estimates, running limits, automatic routine dispatch and wider telemetry
 remain. Budget changes are the first signed policy-change ingress; other policy
 classes remain incomplete.
 The outbox now supports project-scoped routine records fenced by control revision,
 and the shared schedule module computes bounded due windows with explicit DST and
 skipped-date handling. Schema 16 adds [signed routine revisions and durable occurrence
 recording](routines.md), with atomic cursor/outbox writes and missed/overlap decisions.
-Automatic ticker integration, execution, typed completion receipts and verified
-overlap release remain unavailable.
+Explicit Linux execution now records typed cleanup receipts and output inbox items
+atomically, releasing overlap only after verified namespace cleanup. Automatic ticker
+integration and asynchronous command ownership remain unavailable.
 The [scheduler/executor/profile interfaces](adr/0004-w04-scheduling-contract.md) are frozen. Existing retained/adopted attempts
 must count toward the cap; no uncertain worker may be replaced to free a slot.
 

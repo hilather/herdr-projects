@@ -115,8 +115,9 @@ impl SqliteStore {
         let approvals=if schema>=13 {approvals::read_all(&tx)?}else{Vec::new()};
         let budget_policies=if schema>=14 {budget::read_all(&tx)?}else{Vec::new()};
         let (routine_revisions,routine_occurrences)=if schema>=16 {routines::read_all(&tx)?}else{(Vec::new(),Vec::new())};
+        let routine_receipts=if schema>=16 {routines::read_receipts(&tx,&routine_revisions,&routine_occurrences)?}else{Vec::new()};
         tx.commit()?;
-        Ok(Snapshot { schema_version:schema, head, tasks, attempts, operations, deliveries, inbox, runtime_bindings, observations, ownership, control, scheduler, attempt_inputs, cancellations, approvals, budget_policies, routine_revisions, routine_occurrences, events })
+        Ok(Snapshot { schema_version:schema, head, tasks, attempts, operations, deliveries, inbox, runtime_bindings, observations, ownership, control, scheduler, attempt_inputs, cancellations, approvals, budget_policies, routine_revisions, routine_occurrences, routine_receipts, events })
     }
     /// All mutations, generated audit events and durable intents commit together.
     /// Revisions start at one and advance by exactly one. A stale head or record

@@ -77,3 +77,52 @@ fn schema15_upgrade_preserves_existing_outbox_without_inventing_routine_authorit
     assert_eq!(db.read_snapshot(None).unwrap(),before);assert!(before.routine_revisions.is_empty());assert!(before.routine_occurrences.is_empty());
     db.integrity_check().unwrap();
 }
+
+fn claimed_receipt(db:&mut SqliteStore,d:&RoutineDefinition,cleanup:bool,success:bool)->RoutineReceipt {
+    let o=tick(db,d,1000).unwrap().unwrap();let id=o.operation.unwrap();
+    db.connection.execute("UPDATE operation_delivery SET revision=2,attempts=1,epoch=1,state='claimed',owner='routine-linux-namespace-v1',lease_until_ms=31000 WHERE operation_id=?1",[id.as_str()]).unwrap();
+    RoutineReceipt{operation:id.clone(),routine:o.routine,claim:crate::operations::Claim{operation:id,revision:2,epoch:1,owner:"routine-linux-namespace-v1".into(),lease_until_ms:31000},finished_unix_ms:1001,cleanup_verified:cleanup,succeeded:success,
+        stdout:b"result".to_vec(),stderr:vec![],stdout_truncated:false,stderr_truncated:false,stdout_total_bytes:6,stderr_total_bytes:0,elapsed_ms:1}
+}
+#[test]
+fn completion_inbox_outcome_and_overlap_release_are_atomic_and_survive_reopen() {
+    for success in [true,false] {
+        let(temp,mut db,d)=fixture(MissedRunPolicy::CoalesceLatest);let r=claimed_receipt(&mut db,&d,true,success);
+        let before=db.read_snapshot(None).unwrap();
+        db.connection.execute_batch("CREATE TRIGGER fail_completion BEFORE INSERT ON events WHEN NEW.kind='routine.completed' BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+        assert!(db.complete_routine(&crate::routines::CompletedRoutine{receipt:r.clone()}).is_err());assert_eq!(db.read_snapshot(None).unwrap(),before);
+        db.connection.execute_batch("DROP TRIGGER fail_completion;").unwrap();
+        db.complete_routine(&crate::routines::CompletedRoutine{receipt:r.clone()}).unwrap();
+        let after=db.read_snapshot(None).unwrap();assert_eq!(after.routine_receipts,vec![r.clone()]);assert_eq!(after.inbox.len(),1);
+        assert_eq!(after.deliveries[0].state,if success {DeliveryState::Confirmed}else{DeliveryState::PermanentFailure});
+        assert!(db.complete_routine(&crate::routines::CompletedRoutine{receipt:r.clone()}).is_err());assert_eq!(db.read_snapshot(None).unwrap(),after);
+        drop(db);let mut db=SqliteStore::open(&temp.path().join("state.db")).unwrap();assert_eq!(db.read_snapshot(None).unwrap(),after);
+        assert_eq!(tick(&mut db,&d,61_000).unwrap().unwrap().disposition,RoutineDisposition::Enqueued);
+        db.connection.execute("UPDATE events SET payload='[]' WHERE kind='routine.completed'",[]).unwrap();
+        assert!(db.read_snapshot(None).is_err());assert!(tick(&mut db,&d,121_000).is_err());
+    }
+}
+#[test]
+fn unknown_cleanup_generic_confirmation_and_no_effect_retry_never_release_overlap() {
+    use crate::operations::Outcome;
+    let(_temp,mut db,d)=fixture(MissedRunPolicy::CoalesceLatest);let r=claimed_receipt(&mut db,&d,false,false);
+    db.complete_routine(&crate::routines::CompletedRoutine{receipt:r.clone()}).unwrap();
+    assert_eq!(tick(&mut db,&d,61_000).unwrap().unwrap().disposition,RoutineDisposition::SkippedOverlap);
+    let delivery=db.deliveries().unwrap().remove(0);
+    db.observe_operation(&r.operation,delivery.revision,"fixture",Outcome::Retryable{no_effect_evidence:"generic evidence cannot replay scripts".into()},61_001).unwrap();
+    let delivery=db.deliveries().unwrap().remove(0);
+    assert!(db.claim_operation(&r.operation,delivery.revision,"fixture",62_002,1000).is_err());
+    assert_eq!(tick(&mut db,&d,121_000).unwrap().unwrap().disposition,RoutineDisposition::SkippedOverlap);
+    db.connection.execute("UPDATE operation_delivery SET state='confirmed'",[]).unwrap();
+    assert_eq!(tick(&mut db,&d,181_000).unwrap().unwrap().disposition,RoutineDisposition::SkippedOverlap);
+}
+#[test]
+fn stale_or_misbound_completion_cannot_release_a_claim() {
+    let(_temp,mut db,d)=fixture(MissedRunPolicy::CoalesceLatest);let r=claimed_receipt(&mut db,&d,true,true);let before=db.read_snapshot(None).unwrap();
+    for case in 0..5 {let mut bad=r.clone();match case {0=>bad.claim.epoch+=1,1=>bad.routine.revision+=1,2=>bad.finished_unix_ms=bad.claim.lease_until_ms,3=>bad.stdout_total_bytes=0,_=>bad.cleanup_verified=false};
+        assert!(db.complete_routine(&crate::routines::CompletedRoutine{receipt:bad}).is_err());assert_eq!(db.read_snapshot(None).unwrap(),before);
+    }
+    db.expire_claims(31_001).unwrap();let expired=db.read_snapshot(None).unwrap();
+    assert!(db.complete_routine(&crate::routines::CompletedRoutine{receipt:r}).is_err());assert_eq!(db.read_snapshot(None).unwrap(),expired);
+    assert_eq!(tick(&mut db,&d,61_000).unwrap().unwrap().disposition,RoutineDisposition::SkippedOverlap);
+}

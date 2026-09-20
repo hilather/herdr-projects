@@ -30,6 +30,9 @@ pub struct Cmd {
     pub program: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// Trusted helpers can start with an explicit environment, including before
+    /// the dynamic loader runs. Defaults to inheriting the caller environment.
+    pub env_clear: bool,
     pub env_remove: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub stdin: Option<String>,
@@ -49,6 +52,7 @@ impl Cmd {
             program: program.into(),
             args: Vec::new(),
             env: Vec::new(),
+            env_clear: false,
             env_remove: Vec::new(),
             cwd: None,
             stdin: None,
@@ -181,6 +185,7 @@ impl Runner for RealRunner {
         }
         let mut command = Command::new(&cmd.program);
         command.args(&cmd.args);
+        if cmd.env_clear { command.env_clear(); }
         for key in &cmd.env_remove {
             command.env_remove(key);
         }

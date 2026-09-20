@@ -28,6 +28,8 @@ pub fn export(project:&Path,db:&mut SqliteStore)->Result<PathBuf> {
     if snapshot.schema_version>=13 {runtime["approvals"]=serde_json::to_value(&snapshot.approvals)?;}
     if snapshot.schema_version>=14 {runtime["budget_policies"]=serde_json::to_value(&snapshot.budget_policies)?;}
     if snapshot.schema_version>=16 {runtime["routine_revisions"]=serde_json::to_value(&snapshot.routine_revisions)?;runtime["routine_occurrences"]=serde_json::to_value(&snapshot.routine_occurrences)?;}
+    // Preserve already-exported schema-16 heads that predate execution support.
+    if !snapshot.routine_receipts.is_empty() {runtime["routine_receipts"]=serde_json::to_value(&snapshot.routine_receipts)?;}
     let operations=serde_json::json!({"owner":"sqlite-v2","event_head":snapshot.head,"intents":snapshot.operations,"deliveries":snapshot.deliveries});
     let inbox=serde_json::json!({"owner":"sqlite-v2","event_head":snapshot.head,"items":snapshot.inbox});
     for (name,bytes) in [("TASKS.md",text.into_bytes()),("runtime.json",serde_json::to_vec_pretty(&runtime)?),("operations.json",serde_json::to_vec_pretty(&operations)?),("inbox.json",serde_json::to_vec_pretty(&inbox)?)] {

@@ -73,7 +73,12 @@ impl SqliteStore {
         let revision=increment(old.revision)?;let epoch=increment(old.epoch)?;let until=now+lease_ms;
         let kind:String=tx.query_row("SELECT kind FROM operations WHERE id=?1",[id.as_str()],|r|r.get(0))?;
         if kind=="runtime.launch" {super::approvals::consume(&tx,id,revision,epoch,now)?;}
-        if kind=="routine.run" {super::routines::check(&tx,id)?;}
+        if kind=="routine.run" {
+            // No automatic or generic reconciliation retry can replay a script
+            // after any prior claim, even if someone reports "no effect".
+            if old.attempts!=0 {return Err(StoreError::Conflict);}
+            super::routines::check(&tx,id)?;
+        }
         tx.execute("UPDATE operation_delivery SET revision=?2,state='claimed',epoch=?3,attempts=attempts+1,owner=?4,lease_until_ms=?5 WHERE operation_id=?1",params![id.as_str(),integer(revision)?,integer(epoch)?,owner,until])?;
         log(&tx,id,revision,"operation.claimed",serde_json::json!({"owner":owner,"epoch":epoch,"lease_until_ms":until}))?;
         tx.commit()?;Ok(Claim{operation:id.clone(),revision,owner:owner.into(),epoch,lease_until_ms:until})

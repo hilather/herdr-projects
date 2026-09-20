@@ -106,6 +106,7 @@ pub struct Snapshot {
     pub budget_policies:Vec<BudgetPolicy>,
     pub routine_revisions:Vec<RoutineDefinition>,
     pub routine_occurrences:Vec<RoutineOccurrence>,
+    pub routine_receipts:Vec<RoutineReceipt>,
     pub cancellations:Vec<CancellationRequest>,
     pub events: Vec<Event>,
 }
