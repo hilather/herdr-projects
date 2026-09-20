@@ -15,3 +15,8 @@ pub mod operations;
 pub mod runtime;
 #[cfg(feature="state-store")]
 pub mod reconcile;
+
+/// Bounded external command execution shared by the CLI and trusted library ingress.
+pub mod runner;
+#[cfg(feature = "state-store")]
+pub mod authority;

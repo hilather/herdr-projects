@@ -1,9 +1,10 @@
 # Operation-scoped authority (partial T04.5)
 
 Schema 13 stores immutable grants, revocations and one-time uses. Grant installation
-requires a sealed internal capability; there is no issuance/import CLI or raw-JSON
-approval route. Trusted control ingress and policy resolution are still required.
-Canonical launch dispatch remains disabled.
+requires a sealed internal capability produced by owner-signature verification.
+`approval PROJECT policy/inspect/import/revoke` provides the owner-control route.
+Unsigned JSON and caller-supplied roles grant nothing. Production profile preparation
+and canonical launch dispatch remain disabled.
 
 A launch approval scope binds the exact project store, task and post-reservation
 task revision, runtime target and a digest of the intended action. The action digest
@@ -21,8 +22,8 @@ grants or substituted references fail matching. Error messages withhold action d
 
 There is no deserializable actor credential. Unknown fields such as `actor=human`
 and unsupported operation classes are rejected. An approval JSON document remains
-untrusted data even if structurally valid. The future ingress must authenticate its
-control route and evaluate policy; workers cannot supply their own trusted role.
+untrusted data even if structurally valid. Signed import verifies exact document bytes
+against the pinned owner key; workers cannot supply their own trusted role or key.
 
 Launch claims consume a grant exactly once in the claim transaction. The pre-effect
 fence rechecks the matching consumption, expiry, revocation, control/config/scheduler
@@ -40,5 +41,49 @@ Upgrade from schema 12 preserves existing input, delivery and event records. It
 does not invent grants for pending or already-claimed launches: those claims and
 pre-effect checks refuse while their attempts retain capacity. No actual user store
 is upgraded automatically. The same-OS-user shell bypass remains outside
-application-level authority. Trusted issuance, policy-change ingress, denial audit
-and command-path coverage beyond launches remain outstanding T04.5 work.
+application-level authority. Policy-change ingress, denial audit and command-path
+coverage beyond launches remain outstanding T04.5 work.
+
+## Signed owner-control import
+
+The owner config path recorded at migration supplies this policy:
+
+```toml
+[authority]
+version = 1
+revision = 1
+approval_public_key = "ssh-ed25519 BASE64_PUBLIC_KEY"
+```
+
+The key must be one Ed25519 public key without comments or options. Configuration
+must be outside the project, owned by the current OS user and not group/world
+writable. Symlink files refuse. Legacy migrations without a pinned config path cannot
+use this route. Caller `HOME`, grant fields and CLI arguments cannot replace that
+pinned key source. Project control must acknowledge the current config fingerprint;
+edits withdraw old launch authority immediately, even before control is updated.
+
+`approval PROJECT policy` prints the policy reference a grant must name. The grant
+contains the exact reviewed action scope and validity interval described above;
+automatic grant drafting awaits production profile preparation. Sign its exact bytes
+using an owner key held outside worker execution:
+
+```sh
+ssh-keygen -Y sign -f /path/to/owner-key -n approval@herdr-projects grant.json
+herdr-projects approval demo import grant.json grant.json.sig --expected-head H
+herdr-projects approval demo inspect
+herdr-projects approval demo revoke APPROVAL_ID --expected-head H --reason "withdrawn"
+```
+
+Import uses `/usr/bin/ssh-keygen` with the fixed `owner` principal and
+`approval@herdr-projects` namespace. The existing bounded command runner enforces a
+five-second timeout, process-group cleanup and 4 KiB capture limits. Verification
+files are copied into a private temporary directory and removed afterward; raw
+verifier errors are withheld. Document/signature bounds are 64 KiB/8 KiB. Wrong keys,
+namespaces, changed bytes and invalid signatures cannot install grants. The app
+never opens private keys or invokes signing. Tests use disposable keys only.
+
+This route authenticates possession of the configured signing key; it does not
+certify agent capabilities or create a launch preparation. Keep that private key
+outside worker access. A hostile process sharing the owner's OS identity may bypass
+application controls by changing files or using accessible keys; this is not an OS
+isolation guarantee.

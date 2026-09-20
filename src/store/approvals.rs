@@ -53,6 +53,9 @@ fn check_launch(db: &Connection, operation: &OperationId, now: i64) -> Result<St
     schema(db)?;
     let record = super::reservations::read_inputs(db)?.into_iter().find(|r| &r.operation == operation).ok_or_else(|| invalid("launch input record missing"))?;
     let inputs = &record.inputs;
+    if crate::migration::config_reference(Path::new(&inputs.config.path)).map_err(|_|invalid("launch configuration is unreadable"))?!=inputs.config {
+        return Err(invalid("launch configuration changed since approval"));
+    }
     let attempts=read_attempts(db)?;
     let attempt=attempts.iter().find(|a|a.id==record.attempt).ok_or(StoreError::Conflict)?;
     let tasks=read_tasks(db)?;

@@ -20,6 +20,7 @@ mod migration_preflight;
 mod remote;
 mod repair;
 mod routine;
+#[path = "binary_runner.rs"]
 mod runner;
 #[allow(dead_code)] // Transfer callers and operational metrics follow PR read integration.
 mod executor;

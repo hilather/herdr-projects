@@ -16,6 +16,19 @@ fn fixture()->(tempfile::TempDir,SqliteStore,Vec<PreparedLaunch>) {
 }
 fn reserve(db:&mut SqliteStore,p:&[PreparedLaunch])->Reservation {let h=db.read_snapshot(None).unwrap().head;db.reserve_prepared(p,h,1000).unwrap()}
 #[test]
+fn disk_config_change_withdraws_launch_authority_before_claim_or_effect() {
+    for claimed in [false,true] {
+        let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);
+        let claim=claimed.then(||db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap());
+        std::fs::write(&p[0].inputs.config.path,"# owner edited config\n").unwrap();
+        let before=db.read_snapshot(None).unwrap();
+        if let Some(claim)=claim {assert!(db.validate_claim(&claim,1001).is_err());}
+        else {assert!(db.claim_operation(&r.record.operation,1,"worker",1001,1000).is_err());}
+        assert_eq!(db.read_snapshot(None).unwrap(),before);
+        assert!(before.attempts[0].retains_capacity());
+    }
+}
+#[test]
 fn changed_attempt_state_refuses_claim_and_pre_effect_without_consuming_new_authority() {
     for claimed in [false,true] { for terminated in [false,true] {
         let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);

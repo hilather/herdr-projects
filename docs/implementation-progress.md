@@ -809,3 +809,28 @@ A separately calculated fixed grant digest also passes its focused regression.
 Logs: `/tmp/herdr-grants-{lib,debug,release,golden}.log`. Three optional live checks
 remain ignored. Historical-schema test fixtures now remove approval tables when
 emulating an older store; production upgrades do not remove or rewrite authority.
+
+## W04 signed owner-control ingress
+
+The approval CLI now verifies exact grant documents using Ed25519 SSH signatures
+in the `approval@herdr-projects` namespace. The trusted public key comes from the
+migration-pinned owner configuration, outside the project, owned by the current
+user and not group/world writable. Caller HOME, actor strings and document fields
+cannot select another trust key. The verifier uses the shared bounded production
+runner, a five-second deadline, private temporary files and capped output. The
+application never reads the signing private key.
+
+Imports fence the canonical head and acknowledged config and install only sealed,
+verified grants. Disk config edits now withdraw launch authority at claim and
+pre-effect validation, even before the control epoch changes. CLI policy/inspect
+are read-only; import and revocation use the guarded canonical mutation path.
+Canonical launch dispatch remains disabled pending profile preparation and the
+carried crash gate. Same-OS-user filesystem bypass remains outside the guarantee.
+
+Independent review approved this increment. Real-signature fixtures cover exact
+bytes, key and namespace, policy location/permissions, malformed input and config
+withdrawal. A CLI fixture confirms the pinned policy ignores caller HOME and
+unsigned import preserves state. All 417 tests pass in debug and release (125
+library, 261 binary, 29 CLI, 2 contracts); three optional live tests remain ignored.
+Logs: `/tmp/herdr-signed-{debug,release}.log`. No user project was migrated or
+launched. Policy-change ingress, denial audit and other command rights remain.

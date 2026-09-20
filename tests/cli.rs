@@ -5,6 +5,40 @@ use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
 
+#[cfg(feature="state-store")]
+#[test]
+fn approval_cli_uses_pinned_policy_and_refuses_unsigned_import() {
+    use herdr_projects::{authority, migration, runtime};
+    let home=tempfile::tempdir().unwrap();
+    let caller=tempfile::tempdir().unwrap();
+    let root=home.path().join("root");
+    let root_arg=root.to_str().unwrap();
+    for command in ["new","pause"] {
+        assert!(hp(home.path(), &["--root",root_arg,command,"demo"]).status.success());
+    }
+    let config=home.path().join("owner.toml");
+    std::fs::write(&config, "[authority]\nversion=1\nrevision=7\napproval_public_key='ssh-ed25519 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'\n").unwrap();
+    let project=root.join("demo");
+    let plan=migration::inspect_with_config(&project,&config).unwrap();
+    migration::apply(&project,&plan,true).unwrap();
+    let before=runtime::snapshot(&project).unwrap();
+    let output=hp(caller.path(), &["--root",root_arg,"approval","demo","policy"]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::to_value(authority::policy_reference(&project).unwrap()).unwrap());
+    let output=hp(caller.path(), &["--root",root_arg,"approval","demo","inspect"]);
+    assert!(output.status.success());
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),serde_json::json!([]));
+    let document=home.path().join("grant.json");
+    let signature=home.path().join("grant.sig");
+    std::fs::write(&document,"{}").unwrap();
+    std::fs::write(&signature,"unsigned").unwrap();
+    let output=hp(caller.path(), &["--root",root_arg,"approval","demo","import",document.to_str().unwrap(),signature.to_str().unwrap(),"--expected-head",&before.head.to_string()]);
+    assert!(!output.status.success());
+    assert_eq!(runtime::snapshot(&project).unwrap(),before);
+    assert!(!caller.path().join(".config").exists());
+}
+
 #[test]
 fn profile_probe_binds_explicit_binaries_without_launching_profile_arguments() {
     use std::os::unix::fs::PermissionsExt;

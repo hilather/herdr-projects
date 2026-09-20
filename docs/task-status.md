@@ -61,7 +61,8 @@ occurrence and authority contracts, so that path remains synchronous. Next are b
 (T04.3), budgets/routines/telemetry (T04.4) and operation-scoped authority (T04.5).
 T04.5 now has an [approval scope contract](authority.md) binding exact launch inputs
 without circular hashes, durable grants/revocations and atomic one-time launch-claim
-consumption. Trusted issuance, policy ingress and other command-path coverage remain.
+consumption. Owner-signature import now uses the migration-pinned public-key config;
+policy-change ingress, denial audit and other command-path coverage remain.
 The [scheduler/executor/profile interfaces](adr/0004-w04-scheduling-contract.md) are frozen. Existing retained/adopted attempts
 must count toward the cap; no uncertain worker may be replaced to free a slot.
 

@@ -64,8 +64,20 @@ enum ProfileCommand {
     },
 }
 
+#[cfg(feature="state-store")]
+#[derive(Subcommand)]
+enum ApprovalCommand {
+    Policy,
+    Inspect,
+    Import { document:PathBuf, signature:PathBuf, #[arg(long)] expected_head:u64 },
+    Revoke { id:String, #[arg(long)] expected_head:u64, #[arg(long)] reason:String },
+}
+
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect owner signing policy and manage signed launch approvals
+    #[cfg(feature="state-store")]
+    Approval { slug:String, #[command(subcommand)] command:ApprovalCommand },
     /// Inspect user-owned profile configuration and unresolved capability requirements
     Profile { #[command(subcommand)] command: ProfileCommand },
     /// Inspect dependency queue and configure per-project scheduling limits
@@ -452,6 +464,19 @@ pub fn run() -> Result<()> {
     };
 
     match cli.command {
+        #[cfg(feature="state-store")]
+        Command::Approval { slug, command } => {
+            project::validate_slug(&slug)?;
+            let dir=ctx.root.join(slug);
+            let value=match command {
+                ApprovalCommand::Policy=>serde_json::to_value(herdr_projects::authority::policy_reference(&dir)?)?,
+                ApprovalCommand::Inspect=>serde_json::to_value(herdr_projects::runtime::snapshot(&dir)?.approvals)?,
+                ApprovalCommand::Import { document,signature,expected_head }=>serde_json::to_value(herdr_projects::authority::import_signed(&dir,&document,&signature,expected_head)?)?,
+                ApprovalCommand::Revoke { id,expected_head,reason }=>serde_json::json!({"head":herdr_projects::authority::revoke(&dir,&id,expected_head,&reason)?}),
+            };
+            println!("{}",serde_json::to_string_pretty(&value)?);
+            Ok(())
+        },
         Command::Profile { .. } => unreachable!("profile inspection handled before project resolution"),
         #[cfg(feature="state-store")]
         Command::Runtime{slug,command}=>{
