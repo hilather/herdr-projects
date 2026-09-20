@@ -53,7 +53,15 @@ enum RepairCommand {
 }
 
 #[derive(Subcommand)]
+enum ProfileCommand {
+    /// Validate one named profile and print redacted JSON; does not launch an agent
+    Inspect { name: String },
+}
+
+#[derive(Subcommand)]
 enum Command {
+    /// Inspect user-owned profile configuration and unresolved capability requirements
+    Profile { #[command(subcommand)] command: ProfileCommand },
     /// Inspect dependency queue and configure per-project scheduling limits
     #[cfg(feature="state-store")]
     Scheduler { slug:String, #[command(subcommand)] command:SchedulerCommand },
@@ -417,6 +425,11 @@ pub fn run() -> Result<()> {
     }
     let env = Env::from_process()?;
     let config_dir = env.config_dir();
+    if let Command::Profile { command: ProfileCommand::Inspect { name } } = &cli.command {
+        let report = crate::agents::profiles::inspect(&config_dir.join("config.toml"), name)?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
     let root = paths::resolve_root(cli.root.as_deref(), &env, &config_dir)?;
     let runner = RealRunner;
     let ctx = Ctx {
@@ -428,6 +441,7 @@ pub fn run() -> Result<()> {
     };
 
     match cli.command {
+        Command::Profile { .. } => unreachable!("profile inspection handled before project resolution"),
         #[cfg(feature="state-store")]
         Command::Runtime{slug,command}=>{
             project::validate_slug(&slug)?;let dir=ctx.root.join(slug);

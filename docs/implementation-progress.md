@@ -688,3 +688,27 @@ Validation passes 391 all-feature tests in both debug and release (92 library,
 271 binary, 26 CLI, 2 contracts), and 248 default-feature tests. Logs:
 `/tmp/herdr-kind-{debug,release,legacy,focused}.log`. Three optional live checks
 remain ignored; macOS remains unavailable.
+
+## W04 named profile inspection
+
+`profile inspect NAME` now validates user-owned named profiles and emits redacted
+JSON without reading environment values, invoking agents or creating project state.
+Definitions bind kind and literal argument arrays, environment-name references,
+permission policy references, optional model/effort intent and requested budgets.
+Unknown fields, invalid names, duplicate environment entries, value assignments and
+invalid limits fail explicitly. Parse errors withhold source text. Exact config and
+normalized profile digests distinguish changes without printing argument values.
+
+Launch, readiness, prompt, stop, checkpoint acknowledgment, usage and resume remain
+separately unknown without adapter evidence. Launchable/protocol/certified results
+remain false; model, environment, permission and budget requests expose unresolved
+requirements. No profile inspection grants permission or silently generates flags.
+The compatibility matrix records Herdr 0.9.1's advertised kinds separately from
+unprobed agent versions and uncertified workflows. Named profile launch selection,
+version probes and immutable attempt resolution remain T04.3 work.
+
+Independent review approved this read-only increment. Two focused default-feature
+unit tests and the redaction/no-write CLI fixture pass; the full all-feature suite
+passes 394 tests (92 library, 273 binary, 27 CLI, 2 contracts). Logs:
+`/tmp/herdr-profiles-{focused,cli,debug}.log`. Three optional live checks remain
+ignored and macOS remains unavailable. Card counts remain unchanged.

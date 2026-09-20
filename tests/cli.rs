@@ -5,6 +5,31 @@ use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
 
+#[test]
+fn profile_inspection_is_redacted_read_only_and_refuses_malformed_config() {
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join(".config/herdr-projects");
+    std::fs::create_dir_all(&config).unwrap();
+    let path = config.join("config.toml");
+    let text = "[profiles.worker]\nkind='codex'\npermission_policy='interactive'\nextra_args=['SECRET_VALUE']\nenvironment=['SECRET_VARIABLE']\n";
+    std::fs::write(&path, text).unwrap();
+    let output = hp(home.path(), &["profile", "inspect", "worker"]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["kind"], "codex");
+    assert_eq!(value["launchable"], false);
+    assert_eq!(value["capabilities"]["resume"], "unknown");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("SECRET"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    assert!(!home.path().join(".herdr-projects").exists());
+    for bad in ["SECRET = [", "[profiles.worker]\nkind='codex'\npermission_policy='interactive'\ncredential='SECRET'"] {
+        std::fs::write(&path, bad).unwrap();
+        let output = hp(home.path(), &["profile", "inspect", "worker"]);
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("SECRET"));
+    }
+}
+
 fn hp(home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(BIN)
         .env_clear()

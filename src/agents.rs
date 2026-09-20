@@ -1,6 +1,7 @@
 //! Kind isolation for legacy launch arguments. These checks bind user-supplied
 //! argv to one CLI kind; they do not certify vendor flags or protocol support.
 use anyhow::{Result,ensure};
+pub mod profiles;
 pub fn arguments<'a>(kind:&str,bound_kind:Option<&str>,args:&'a [String],setting:&str)->Result<&'a [String]> {
     valid_kind(kind)?;
     if let Some(bound)=bound_kind {valid_kind(bound)?;}

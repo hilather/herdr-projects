@@ -52,8 +52,8 @@ has an audited CLI. Production launch preparation/dispatch and termination remai
 unavailable. T04.2 now uses monotonic remote poll/retry deadlines and pass-start
 scheduling plus a shared bounded executor for asynchronous PR and remote observations;
 routine/artifact work and guarded effects still need isolation. T04.3 now fences legacy
-launch arguments by explicit agent kind; named profiles, immutable profile resolution
-and capability/version evidence remain. Async routine commands first need durable
+launch arguments by explicit agent kind and provides redacted [named profile inspection](profiles.md);
+launch selection, immutable profile resolution and capability/version evidence remain. Async routine commands first need durable
 occurrence and authority contracts, so that path remains synchronous. Next are bounded command execution, kind-bound worker profiles
 (T04.3), budgets/routines/telemetry (T04.4) and operation-scoped authority (T04.5).
 The [scheduler/executor/profile interfaces](adr/0004-w04-scheduling-contract.md) are frozen. Existing retained/adopted attempts
