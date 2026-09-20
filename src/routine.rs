@@ -16,70 +16,7 @@ use crate::thread::sha256_hex;
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 pub const OUTPUT_CAP_CHARS: usize = 4_000;
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Schedule {
-    /// `every <N>m|h|d`, in seconds.
-    Every(i64),
-    /// `daily HH:MM`, local time.
-    Daily(i8, i8),
-}
-
-pub fn parse_schedule(text: &str) -> Result<Schedule> {
-    let text = text.trim();
-    if let Some(rest) = text.strip_prefix("every ") {
-        let rest = rest.trim();
-        let (digits, seconds) = [('m', 60_i64), ('h', 3600), ('d', 86_400)]
-            .into_iter()
-            .find_map(|(unit, seconds)| rest.strip_suffix(unit).map(|digits| (digits, seconds)))
-            .with_context(|| format!("bad schedule `{text}`: use `every <N>m`, `<N>h` or `<N>d`"))?;
-        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-            bail!("bad schedule `{text}`: the interval must be positive ASCII decimal digits");
-        }
-        let n: i64 = digits.parse().ok().filter(|n| *n > 0).with_context(|| format!("bad schedule `{text}`"))?;
-        let interval = n.checked_mul(seconds)
-            .with_context(|| format!("bad schedule `{text}`: interval exceeds {} seconds", i64::MAX))?;
-        return Ok(Schedule::Every(interval));
-    }
-    if let Some(rest) = text.strip_prefix("daily ") {
-        let (h, m) = rest.trim().split_once(':').with_context(|| format!("bad schedule `{text}`"))?;
-        let (h, m): (i8, i8) = (h.parse().ok().context("bad hour")?, m.parse().ok().context("bad minute")?);
-        if !(0..24).contains(&h) || !(0..60).contains(&m) {
-            bail!("bad schedule `{text}`: the time must be 00:00 to 23:59");
-        }
-        return Ok(Schedule::Daily(h, m));
-    }
-    bail!("bad schedule `{text}`: use `every <N>m|h|d` or `daily HH:MM`")
-}
-
-/// Whether a routine is due, comparing with its stored last run. The time zone
-/// is read on each use, so `daily HH:MM` stays right across a daylight-saving
-/// change in a long-running ticker.
-pub fn is_due(schedule: &Schedule, last_run: jiff::Timestamp, now: &jiff::Zoned) -> bool {
-    match schedule {
-        Schedule::Every(seconds) => now.timestamp().as_second() - last_run.as_second() >= *seconds,
-        Schedule::Daily(hour, minute) => {
-            // Resolve the civil time independently of `now`'s UTC offset.
-            // Compatible disambiguation shifts gaps forward and chooses the
-            // first occurrence of a repeated time, yielding one daily instant.
-            let at = |date: jiff::civil::Date| now.time_zone()
-                .to_ambiguous_zoned(date.at(*hour, *minute, 0, 0))
-                .compatible();
-            let Ok(today) = at(now.date()) else {
-                return false;
-            };
-            // The most recent occurrence of HH:MM at or before now.
-            let latest = if today.timestamp() <= now.timestamp() {
-                today
-            } else {
-                match now.date().yesterday().ok().and_then(|date| at(date).ok()) {
-                    Some(yesterday) => yesterday,
-                    None => return false,
-                }
-            };
-            last_run < latest.timestamp()
-        }
-    }
-}
+pub use herdr_projects::schedule::{Schedule, parse_schedule, is_due};
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]

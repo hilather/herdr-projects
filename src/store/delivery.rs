@@ -24,6 +24,23 @@ fn log(tx:&Connection,id:&OperationId,revision:u64,kind:&str,payload:serde_json:
     tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?1,?2,?3,1,?4)",params![kind,id.as_str(),integer(revision)?,payload.to_string()])?;Ok(())
 }
 fn increment(n:u64)->Result<u64>{n.checked_add(1).filter(|n|*n<=i64::MAX as u64).ok_or_else(||StoreError::Invalid("delivery counter exhausted".into()))}
+/// Project-scoped operations cannot borrow an unrelated task's revision fence.
+fn binding_current(db:&Connection,id:&OperationId,admission:bool)->Result<bool> {
+    let (task,kind,expected):(Option<String>,String,u64)=db.query_row("SELECT task_id,kind,expected_revision FROM operations WHERE id=?1",[id.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    if let Some(task)=task {
+        let actual:u64=db.query_row("SELECT revision FROM tasks WHERE id=?1",[task],|r|r.get(0))?;
+        return Ok(actual==expected);
+    }
+    let version:u32=db.query_row("PRAGMA user_version",[],|r|r.get(0))?;
+    if version<15||kind!="routine.run" {return Err(StoreError::Invalid("unsupported project operation".into()));}
+    let control=super::control::read(db)?;
+    Ok(control.revision==expected && (!admission || (control.state==ProjectState::Active&&!control.reconciliation_required)))
+}
+fn payload_valid(db:&Connection,id:&OperationId)->Result<()> {
+    let (payload,hash):(String,String)=db.query_row("SELECT payload,payload_hash FROM operations WHERE id=?1",[id.as_str()],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    if format!("{:x}",Sha256::digest(payload.as_bytes()))!=hash {return Err(StoreError::Corrupt("operation payload hash mismatch".into()));}
+    Ok(())
+}
 pub(super) fn update_outcome(tx:&Connection,old:&Delivery,outcome:&Outcome,now:i64,actor:&str)->Result<Delivery> {
     text(outcome.evidence())?;
     if let Outcome::Confirmed{observed_identity}=outcome {super::finalization::apply_receipt(tx,&old.operation,observed_identity)?;}
@@ -51,9 +68,8 @@ impl SqliteStore {
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;check_schema(&tx)?;
         let old=delivery(&tx,id)?;
         if old.revision!=expected || old.state!=DeliveryState::Pending || old.next_due_ms>now || old.attempts>=32 { return Err(StoreError::Conflict); }
-        let (payload,hash,expected_revision,actual_revision):(String,String,i64,i64)=tx.query_row("SELECT o.payload,o.payload_hash,o.expected_revision,t.revision FROM operations o JOIN tasks t ON t.id=o.task_id WHERE o.id=?1",[id.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-        if format!("{:x}",Sha256::digest(payload.as_bytes()))!=hash {return Err(StoreError::Corrupt("operation payload hash mismatch".into()));}
-        if expected_revision!=actual_revision {return Err(StoreError::Conflict);}
+        payload_valid(&tx,id)?;
+        if !binding_current(&tx,id,true)? {return Err(StoreError::Conflict);}
         let revision=increment(old.revision)?;let epoch=increment(old.epoch)?;let until=now+lease_ms;
         let kind:String=tx.query_row("SELECT kind FROM operations WHERE id=?1",[id.as_str()],|r|r.get(0))?;
         if kind=="runtime.launch" {super::approvals::consume(&tx,id,revision,epoch,now)?;}
@@ -68,9 +84,8 @@ impl SqliteStore {
         let tx=self.connection.transaction()?;check_schema(&tx)?;
         let old=delivery(&tx,&claim.operation)?;
         if old.state!=DeliveryState::Claimed || old.revision!=claim.revision || old.epoch!=claim.epoch || old.owner.as_deref()!=Some(&claim.owner) || old.lease_until_ms!=Some(claim.lease_until_ms) || now>=claim.lease_until_ms {return Err(StoreError::Conflict);}
-        let (payload,hash,expected,actual):(String,String,i64,i64)=tx.query_row("SELECT o.payload,o.payload_hash,o.expected_revision,t.revision FROM operations o JOIN tasks t ON t.id=o.task_id WHERE o.id=?1",[claim.operation.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-        if format!("{:x}",Sha256::digest(payload.as_bytes()))!=hash {return Err(StoreError::Corrupt("operation payload hash mismatch".into()));}
-        if expected!=actual {return Err(StoreError::Conflict);}
+        payload_valid(&tx,&claim.operation)?;
+        if !binding_current(&tx,&claim.operation,true)? {return Err(StoreError::Conflict);}
         let kind:String=tx.query_row("SELECT kind FROM operations WHERE id=?1",[claim.operation.as_str()],|r|r.get(0))?;
         if kind=="runtime.launch" {super::approvals::validate_use(&tx,claim,now)?;}
         tx.commit()?;Ok(())
@@ -81,8 +96,7 @@ impl SqliteStore {
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;check_schema(&tx)?;
         let old=delivery(&tx,&claim.operation)?;
         if old.state!=DeliveryState::Claimed || old.revision!=claim.revision || old.epoch!=claim.epoch || old.owner.as_deref()!=Some(&claim.owner) || old.lease_until_ms!=Some(claim.lease_until_ms) || now>=claim.lease_until_ms {return Err(StoreError::Conflict);}
-        let binding_current:bool=tx.query_row("SELECT o.expected_revision=t.revision FROM operations o JOIN tasks t ON t.id=o.task_id WHERE o.id=?1",[claim.operation.as_str()],|r|r.get(0))?;
-        if !binding_current {return Err(StoreError::Conflict);}
+        if !binding_current(&tx,&claim.operation,false)? {return Err(StoreError::Conflict);}
         let result=update_outcome(&tx,&old,&outcome,now,&claim.owner)?;tx.commit()?;Ok(result)
     }
     pub fn expire_claims(&mut self,now:i64)->Result<usize> {

@@ -20,3 +20,6 @@ pub mod reconcile;
 pub mod runner;
 #[cfg(feature = "state-store")]
 pub mod authority;
+
+/// Schedule semantics shared by legacy and durable routines.
+pub mod schedule;

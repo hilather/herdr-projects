@@ -48,7 +48,7 @@ Failed/cancelled predecessors block explicitly. Narrative succeeded state cannot
 satisfy an evidence-bound edge. Verified-result producers arrive in W07; profile,
 authority and production launch preparation remain W04 work. See the [frozen W04 interfaces](adr/0004-w04-scheduling-contract.md).
 
-## Reservations and cancellation (schema v14; older history retained)
+## Reservations and cancellation (schema v15; older history retained)
 
 A reservation transaction counts every unterminated attempt, checks task, binding,
 control and policy revisions, selects among sealed ready preparations using aged
@@ -83,6 +83,28 @@ Schema upgrades preserve previous exports and claim history. Unsupported preexis
 `runtime.launch` intents without sealed inputs block upgrade before commit; they
 cannot be promoted into launch authority. Reservation crash/rollback tests cover DB
 boundaries only. External launch crash certification remains a separate gate.
+
+## Project operations and routine scheduling prerequisites
+
+Schema 15 permits a project-scoped `routine.run` outbox record without a synthetic
+task. Its expected revision binds project control. Claim/pre-effect checks require
+the same active, reconciled control revision; finish requires the same revision.
+Task-scoped operations retain their task revision checks and historical JSON shape.
+Generic enqueue and legacy import cannot create routine operations. The sealed
+routine producer and execution adapter are still pending, so this schema does not
+enable scheduled commands or change approval requirements.
+
+The shared schedule module now computes a bounded due-window summary: earliest and
+latest due instants plus the number of calendar/interval slots. Intervals anchor to
+an explicit start instead of drifting with completion time. Daily routines use an
+explicit timezone, shift gaps forward and choose the first repeated time. Endpoint
+searches handle skipped calendar dates; no reported due instant is in the future.
+Long downtime uses arithmetic, not a loop over missed occurrences. The same skipped-
+date fix applies to legacy daily routines.
+
+Persisting these windows, occurrence keys, overlap/missed-run decisions, approved
+routine revisions and atomic outbox inserts remains the next T04.4 step. The helper
+itself is pure and cannot authorize or execute a command.
 
 ## Elapsed-time polling (partial T04.2)
 

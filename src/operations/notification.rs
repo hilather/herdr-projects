@@ -26,7 +26,7 @@ pub fn build(snapshot:&Snapshot,task:&TaskId,project_slug:&str,config:ConfigRefe
     let inbox_ids=unseen(snapshot);ensure!(!inbox_ids.is_empty(),"no unseen inbox items");ensure!(inbox_ids.len()<=1000,"notification batch exceeds 1000 inbox items");
     let id=identity(&inbox_ids);
     let notification=Notification{authority:"operator.session_notification".into(),binding_revision:binding.revision,control_epoch:snapshot.control.as_ref().context("upgrade-store required")?.epoch,config,inbox_ids,title:format!("herdr-projects: {project_slug}"),body:format!("{} new inbox item(s). The coordinator reads them at its next turn.",unseen(snapshot).len())};
-    let op=Operation{id:OperationId::new(id.clone()).map_err(anyhow::Error::msg)?,task:task.id.clone(),kind:"runtime.notification".into(),target:"coordinator".into(),payload_version:1,payload:serde_json::to_value(&notification)?,expected_revision:task.revision,due_unix_ms:now,idempotency_key:id};
+    let op=Operation{id:OperationId::new(id.clone()).map_err(anyhow::Error::msg)?,task:Some(task.id.clone()),kind:"runtime.notification".into(),target:"coordinator".into(),payload_version:1,payload:serde_json::to_value(&notification)?,expected_revision:task.revision,due_unix_ms:now,idempotency_key:id};
     notification.validate(&op,snapshot,&notification.config)?;Ok(op)
 }
 impl Notification {
@@ -43,7 +43,7 @@ impl Notification {
         let id=identity(&self.inbox_ids);ensure!(operation.id.as_str()==id&&operation.idempotency_key==id,"notification identity mismatch");
         let control=snapshot.control.as_ref().context("upgrade-store required")?;
         ensure!(control.state==ProjectState::Active&&!control.reconciliation_required&&control.epoch==self.control_epoch&&control.config_digest==config.digest,"notification lifecycle admission changed");
-        ensure!(snapshot.tasks.iter().any(|t|t.id==operation.task&&t.revision==operation.expected_revision),"notification task changed");
+        ensure!(snapshot.tasks.iter().any(|t|Some(&t.id)==operation.task.as_ref()&&t.revision==operation.expected_revision),"notification task changed");
         let binding=snapshot.runtime_bindings.iter().find(|b|b.id=="coordinator"&&b.revision==self.binding_revision&&b.task.is_none()).context("notification route changed")?;
         RuntimeRoute::from_identity(&binding.identity).validate().map_err(anyhow::Error::msg)?;
         ensure!(binding.identity.machine.is_empty()&&std::path::Path::new(&binding.identity.socket).is_absolute(),"notification requires an explicit local session socket");

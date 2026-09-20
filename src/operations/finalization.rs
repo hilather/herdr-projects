@@ -41,10 +41,10 @@ impl Finalization {
     pub fn validate_state<'a>(&self,op:&Operation,control:&crate::domain::ProjectControl,tasks:&[crate::domain::Task],attempts:&[crate::domain::Attempt],bindings:&'a [RuntimeBinding])->Result<&'a RuntimeBinding> {
         ensure!(self.authority=="operator.artifact_finalization"&&hash(&self.report_hash)&&!self.reason.trim().is_empty()&&self.reason.len()<=4096,"invalid finalization scope or evidence");
         ensure!(control.state!=ProjectState::Archived&&control.epoch==self.control_epoch,"finalization lifecycle changed");
-        let task=tasks.iter().find(|t|t.id==op.task&&t.revision==op.expected_revision).context("finalization task changed")?;
+        let task=tasks.iter().find(|t|Some(&t.id)==op.task.as_ref()&&t.revision==op.expected_revision).context("finalization task changed")?;
         ensure!(task.active_attempt.is_none()&&!matches!(task.state,TaskState::Running|TaskState::Succeeded|TaskState::Cancelled),"finalization task is active or terminal");
         ensure!(!attempts.iter().any(|a|a.task==task.id&&a.retains_capacity()),"attempt termination must be reconciled before finalization");
-        let binding=bindings.iter().find(|b|b.id==self.binding&&b.revision==self.binding_revision&&b.task.as_ref()==Some(&op.task)).context("finalization binding changed")?;
+        let binding=bindings.iter().find(|b|b.id==self.binding&&b.revision==self.binding_revision&&b.task==op.task).context("finalization binding changed")?;
         ensure!(op.target==binding.id&&binding.identity.machine.is_empty()&&binding.identity.thread_dir==self.source&&std::path::Path::new(&self.source).is_absolute(),"finalization requires the recorded local artifact source");
         let id=self.operation_id(op.expected_revision)?;ensure!(op.id==id&&op.idempotency_key==id.as_str(),"finalization identity mismatch");Ok(binding)
     }
@@ -54,7 +54,7 @@ impl Finalization {
         let task=binding.task.as_ref().context("coordinator cannot be finalized as a task")?;
         let task=snapshot.tasks.iter().find(|t|&t.id==task).context("task not found")?;
         let id=self.operation_id(task.revision)?;
-        let op=Operation{id:id.clone(),task:task.id.clone(),kind:"runtime.finalization".into(),target:self.binding.clone(),payload_version:1,payload:serde_json::to_value(&self)?,expected_revision:task.revision,due_unix_ms:now,idempotency_key:id.as_str().into()};self.validate(&op,snapshot,&self.config)?;Ok(op)
+        let op=Operation{id:id.clone(),task:Some(task.id.clone()),kind:"runtime.finalization".into(),target:self.binding.clone(),payload_version:1,payload:serde_json::to_value(&self)?,expected_revision:task.revision,due_unix_ms:now,idempotency_key:id.as_str().into()};self.validate(&op,snapshot,&self.config)?;Ok(op)
     }
 }
 impl FinalizationReceipt {

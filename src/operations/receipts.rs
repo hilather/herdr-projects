@@ -55,14 +55,14 @@ fn receipt(&self,op:&Operation)->Option<String> {
     let ticker=self.sources.get(".state/ticker.json")?;
     let value=self.ticker.as_ref()?;
     if op.kind=="legacy.notify" {
-        if op.task.as_str()!="legacy-project-obligations" || op.target.is_empty()
+        if op.task.as_ref()?.as_str()!="legacy-project-obligations" || op.target.is_empty()
             || value.get("notification_retry")?!=&op.payload
             || op.payload.get("hash")?.as_str()?!=op.target
             || value.get("nudged")?.as_str()?!=op.target {return None;}
         return Some(format!("legacy-notification:{}:source:{}",op.target,ticker.digest));
     }
     if op.kind!="legacy.finalize" {return None;}
-    let id=op.task.as_str().strip_prefix("legacy-")?;
+    let id=op.task.as_ref()?.as_str().strip_prefix("legacy-")?;
     if value.get("finalizations")?.get(id)?!=&op.payload || op.target.is_empty()
         || op.payload.get("operation_id")?.as_str()?!=op.target {return None;}
     let source=self.sources.get(format!("threads/{id}.toml").as_str()).filter(|s|s.kind=="thread")?;

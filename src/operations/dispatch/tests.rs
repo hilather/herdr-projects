@@ -5,7 +5,7 @@ fn fixture()->(tempfile::TempDir,SqliteStore,OperationId) {
     let temp=tempfile::tempdir().unwrap();let mut db=SqliteStore::create(&temp.path().join("state.db")).unwrap();
     let task=Task{id:TaskId::new("task").unwrap(),revision:1,state:TaskState::Ready,title:"fixture".into(),active_attempt:None};
     let id=OperationId::new("dispatch").unwrap();
-    let op=Operation{id:id.clone(),task:task.id.clone(),kind:"fixture".into(),target:"local".into(),payload_version:1,payload:serde_json::json!({}),expected_revision:1,due_unix_ms:0,idempotency_key:"dispatch-fixture".into()};
+    let op=Operation{id:id.clone(),task:Some(task.id.clone()),kind:"fixture".into(),target:"local".into(),payload_version:1,payload:serde_json::json!({}),expected_revision:1,due_unix_ms:0,idempotency_key:"dispatch-fixture".into()};
     db.commit(Commit{expected_head:0,mutations:vec![Mutation::Task{expected:None,next:task},Mutation::Enqueue(op)]}).unwrap();
     (temp,db,id)
 }

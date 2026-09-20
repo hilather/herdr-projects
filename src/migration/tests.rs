@@ -197,7 +197,7 @@ fn task_edits_and_projection_recovery_preserve_new_state_and_originals() {
     assert_eq!(current.tasks.iter().find(|t|t.id==id).unwrap().title,"Changed title");
     assert_eq!(read(&project.join("TASKS.md")).unwrap(),original);
     let context=crate::runtime::context(&project).unwrap();assert!(context.contains("Runtime owner: SQLite")&&context.contains("Changed title")&&context.contains("Unverified memory"));
-    assert!(project.join(format!(".state/projections/schema-14-revision-{head}/TASKS.md")).is_file());
+    assert!(project.join(format!(".state/projections/schema-15-revision-{head}/TASKS.md")).is_file());
 }
 #[test]
 fn corrupt_retry_identity_types_and_dates_block_import() {
@@ -215,7 +215,7 @@ fn published_v2_store_upgrades_explicitly_without_losing_migration_identity() {
     raw.execute_batch("DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; DROP TABLE runtime_ownership; DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; DROP TABLE inbox_items; DROP TRIGGER operation_delivery_insert; DROP TABLE operation_delivery; ALTER TABLE migration_receipt DROP COLUMN operation_count; UPDATE store_meta SET schema_version=2; PRAGMA user_version=2;").unwrap();drop(raw);
     let before=crate::runtime::snapshot(&project).unwrap();
     upgrade_active(&project).unwrap();let mut db=open_active(&project).unwrap();
-    let after=db.read_snapshot(None).unwrap();assert_eq!(after.tasks,before.tasks);assert_eq!(after.head,before.head);assert_eq!(after.schema_version,14);assert!(db.deliveries().unwrap().is_empty());assert_eq!(db.import_operation_count().unwrap(),0);
+    let after=db.read_snapshot(None).unwrap();assert_eq!(after.tasks,before.tasks);assert_eq!(after.head,before.head);assert_eq!(after.schema_version,15);assert!(db.deliveries().unwrap().is_empty());assert_eq!(db.import_operation_count().unwrap(),0);
     drop(db);recover(&project,true).unwrap();
 }
 #[test]
@@ -394,7 +394,7 @@ fn imported_receipts_cannot_confirm_new_lookalike_operations() {
         lookalike.id=OperationId::new("new-lookalike").unwrap();lookalike.idempotency_key="different-intent".into();
         let mut mutations=Vec::new();
         if advance {
-            let mut task=before.tasks.iter().find(|t|t.id==lookalike.task).unwrap().clone();task.revision+=1;lookalike.expected_revision=task.revision;
+            let mut task=before.tasks.iter().find(|t|Some(&t.id)==lookalike.task.as_ref()).unwrap().clone();task.revision+=1;lookalike.expected_revision=task.revision;
             mutations.push(Mutation::Task{expected:Some(1),next:task});
         }
         mutations.push(Mutation::Enqueue(lookalike.clone()));db.commit(Commit{expected_head:before.head,mutations}).unwrap();

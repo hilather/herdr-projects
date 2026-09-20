@@ -19,7 +19,7 @@ impl SqliteStore {
             let mut observation=evidence.observe(op);
             if old.state!=DeliveryState::Ambiguous {
                 observation.receipt=None;observation.blocked=Some("delivery is not ambiguous; no observation applied".into());
-            } else if tasks.get(&op.task)!=Some(&op.expected_revision) {
+            } else if op.task.as_ref().and_then(|task|tasks.get(task))!=Some(&op.expected_revision) {
                 observation.receipt=None;observation.blocked=Some("task revision changed; imported receipt cannot confirm current binding".into());
             }
             if apply {

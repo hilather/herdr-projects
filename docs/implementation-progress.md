@@ -865,3 +865,39 @@ T04.4 is now partial: native usage, versioned estimates, wall-time actions, dura
 routine occurrences and wider telemetry remain. Overall status is 16 implemented,
 five partial and 20 not started. Canonical launch still awaits production preparation
 and carried crash certification. macOS remains unavailable.
+
+## W04 project outbox and bounded routine schedule windows (schema 15)
+
+Project-scoped outbox records now bind project-control revision, while task-scoped
+records retain their original revision checks and JSON representation. Only the
+routine operation kind can omit a task. Generic enqueue and legacy import cannot
+produce routine work; a sealed producer remains pending. Claims require active,
+reconciled control and exact revision. A control change after claim prevents effects
+and leaves uncertain delivery for reconciliation without creating a synthetic task.
+
+The migration preserves dependent delivery, attempt-input and approval-use tables
+while replacing the outbox parent with foreign keys enabled. A populated fixture
+starts from the exact schema-14 migrations with historical v1 inputs, a v2 claimed
+launch and consumed approval. Full snapshots, head, payloads and claim counters
+survive upgrade/reopen; immutable and monotonic triggers still reject edits. Failures
+injected after dependent-table removal, parent removal and metadata update roll back
+to the original usable store. No user store was upgraded.
+
+The schedule parser and daily resolution are shared between the binary and library.
+A pure due-window helper uses anchored interval arithmetic and bounded calendar
+endpoint searches with explicit timezone semantics. Independent review caught an
+Apia skipped-date case returning a future endpoint; both the new helper and legacy
+daily checker now search backward until the instant is due. Fixtures compare with
+enumerated calendar slots across five zones, exercise repeated/gapped times and
+centuries of downtime, and prove cursor replay/backward-clock behavior.
+
+Durable routine revisions, occurrence/cursor transactions, overlap/missed-run records
+and the bounded execution adapter remain next. Counts stay 16 implemented, five
+partial and 20 not started; this increment does not complete T04.4 or enable launches.
+
+Independent review approved the corrected schedule and populated migration fixture.
+All 428 tests pass in final debug and release runs (136 library, 261 binary, 29 CLI,
+2 contracts); three optional live checks remain ignored. Logs:
+`/tmp/herdr-project-ops-final-{debug,release}.log`. The default-feature suite also
+passed before the final skipped-date correction; final all-feature runs include the
+legacy routine regressions. macOS remains unavailable.

@@ -4,7 +4,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{fmt, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 
-const SCHEMA: u32 = 14;
+const SCHEMA: u32 = 15;
 const APPLICATION: u32 = 1_213_222_994;
 const MIN_SQLITE: i32 = 3_053_004;
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
@@ -63,6 +63,7 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../migrations/0012_effective_profiles.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0013_scoped_approvals.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0014_admission_budgets.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0015_project_operations.sql"))?;
             tx.commit()?;
         }
         // Persist the initial directory entry as well as SQLite's own commit.
@@ -135,7 +136,7 @@ impl SqliteStore {
                 Mutation::Task { expected, next } => { revision(*expected, next.revision)?; serde_json::to_value(next) },
                 Mutation::Attempt { expected, next } => { revision(*expected, next.revision)?; serde_json::to_value(next) },
                 Mutation::Enqueue(next) => {
-                    if next.kind=="runtime.launch" {return Err(StoreError::Invalid("launch intents require atomic scheduler reservation".into()));}
+                    if next.kind=="runtime.launch" || next.task.is_none() || next.kind=="routine.run" {return Err(StoreError::Invalid("launch and project routine intents require their sealed service".into()));}
                     integer(next.expected_revision)?;
                     if next.expected_revision == 0 || next.payload_version == 0 { return Err(StoreError::Invalid("zero operation revision/version".into())); }
                     serde_json::to_value(next)
@@ -172,11 +173,12 @@ impl SqliteStore {
                     ("attempt.changed", id, next.revision)
                 },
                 Mutation::Enqueue(next) => {
-                    let current: Option<i64> = tx.query_row("SELECT revision FROM tasks WHERE id=?1", [next.task.as_str()], |r| r.get(0)).optional()?;
+                    let task=next.task.as_ref().ok_or_else(||StoreError::Invalid("project operation requires sealed service".into()))?;
+                    let current: Option<i64> = tx.query_row("SELECT revision FROM tasks WHERE id=?1", [task.as_str()], |r| r.get(0)).optional()?;
                     if current != Some(integer(next.expected_revision)?) { return Err(StoreError::Conflict); }
                     let payload = serde_json::to_string(&next.payload).map_err(|e| StoreError::Invalid(e.to_string()))?;
                     let hash = format!("{:x}", Sha256::digest(payload.as_bytes()));
-                    tx.execute("INSERT INTO operations(id,task_id,kind,target,payload_version,payload,payload_hash,expected_revision,due_unix_ms,idempotency_key) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![next.id.as_str(), next.task.as_str(), next.kind, next.target, next.payload_version, payload, hash, integer(next.expected_revision)?, next.due_unix_ms, next.idempotency_key])?;
+                    tx.execute("INSERT INTO operations(id,task_id,kind,target,payload_version,payload,payload_hash,expected_revision,due_unix_ms,idempotency_key) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![next.id.as_str(), task.as_str(), next.kind, next.target, next.payload_version, payload, hash, integer(next.expected_revision)?, next.due_unix_ms, next.idempotency_key])?;
                     ("operation.enqueued", next.id.as_str(), next.expected_revision)
                 },
             };
@@ -185,7 +187,8 @@ impl SqliteStore {
         // A later mutation in the same batch must not stale an earlier intent.
         for mutation in &commit.mutations {
             if let Mutation::Enqueue(next) = mutation {
-                let current: i64 = tx.query_row("SELECT revision FROM tasks WHERE id=?1", [next.task.as_str()], |r| r.get(0))?;
+                let task=next.task.as_ref().ok_or(StoreError::Conflict)?;
+                let current: i64 = tx.query_row("SELECT revision FROM tasks WHERE id=?1", [task.as_str()], |r| r.get(0))?;
                 if current != integer(next.expected_revision)? { return Err(StoreError::Conflict); }
             }
         }
@@ -244,7 +247,7 @@ fn read_tasks(db: &Connection) -> Result<Vec<Task>> {
 }
 fn read_attempts(db: &Connection) -> Result<Vec<Attempt>> {
     let mut stmt = db.prepare("SELECT id,task_id,revision,state,snapshot,reservation,termination_observed FROM attempts ORDER BY id")?;
-    let rows = stmt.query_map([], |r| Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"task":r.get::<_,String>(1)?,"revision":r.get::<_,u64>(2)?,"state":r.get::<_,String>(3)?,"snapshot":r.get::<_,Option<String>>(4)?,"reservation":r.get::<_,String>(5)?,"termination_observed":r.get::<_,bool>(6)?})))?;
+    let rows = stmt.query_map([], |r| Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"task":r.get::<_,Option<String>>(1)?,"revision":r.get::<_,u64>(2)?,"state":r.get::<_,String>(3)?,"snapshot":r.get::<_,Option<String>>(4)?,"reservation":r.get::<_,String>(5)?,"termination_observed":r.get::<_,bool>(6)?})))?;
     rows.map(|r| decode(r?)).collect()
 }
 fn read_operations(db: &Connection) -> Result<Vec<Operation>> {read_operations_matching(db,None)}
@@ -252,7 +255,7 @@ fn read_operation(db:&Connection,id:&OperationId)->Result<Operation> {read_opera
 fn read_operations_matching(db:&Connection,id:Option<&OperationId>)->Result<Vec<Operation>> {
     let query=if id.is_some(){"SELECT id,task_id,kind,target,payload_version,payload,expected_revision,due_unix_ms,idempotency_key,payload_hash FROM operations WHERE id=?1"}else{"SELECT id,task_id,kind,target,payload_version,payload,expected_revision,due_unix_ms,idempotency_key,payload_hash FROM operations WHERE ?1 IS NULL ORDER BY id"};
     let mut stmt = db.prepare(query)?;
-    let rows = stmt.query_map([id.map(OperationId::as_str)], |r| Ok((serde_json::json!({"id":r.get::<_,String>(0)?,"task":r.get::<_,String>(1)?,"kind":r.get::<_,String>(2)?,"target":r.get::<_,String>(3)?,"payload_version":r.get::<_,u32>(4)?,"expected_revision":r.get::<_,u64>(6)?,"due_unix_ms":r.get::<_,i64>(7)?,"idempotency_key":r.get::<_,String>(8)?}), r.get::<_,String>(5)?, r.get::<_,String>(9)?)))?;
+    let rows = stmt.query_map([id.map(OperationId::as_str)], |r| Ok((serde_json::json!({"id":r.get::<_,String>(0)?,"task":r.get::<_,Option<String>>(1)?,"kind":r.get::<_,String>(2)?,"target":r.get::<_,String>(3)?,"payload_version":r.get::<_,u32>(4)?,"expected_revision":r.get::<_,u64>(6)?,"due_unix_ms":r.get::<_,i64>(7)?,"idempotency_key":r.get::<_,String>(8)?}), r.get::<_,String>(5)?, r.get::<_,String>(9)?)))?;
     rows.map(|row| {
         let (mut value, payload, hash) = row?;
         if format!("{:x}", Sha256::digest(payload.as_bytes())) != hash { return Err(StoreError::Corrupt("operation payload hash mismatch".into())); }

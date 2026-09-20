@@ -40,6 +40,7 @@ impl SqliteStore {
         }
         if version<=12 {tx.execute_batch(include_str!("../../migrations/0013_scoped_approvals.sql"))?;}
         if version<=13 {tx.execute_batch(include_str!("../../migrations/0014_admission_budgets.sql"))?;}
+        if version<=14 {tx.execute_batch(include_str!("../../migrations/0015_project_operations.sql"))?;}
         tx.commit()?;
         Ok(())
     }
@@ -75,7 +76,7 @@ impl SqliteStore {
         for op in operations {
             if op.expected_revision!=1 || op.payload_version!=1 || !matches!(op.kind.as_str(),"legacy.inbox"|"legacy.notify"|"legacy.finalize") { return Err(StoreError::Invalid("invalid imported operation".into())); }
             let payload=serde_json::to_string(&op.payload).map_err(|e|StoreError::Invalid(e.to_string()))?;
-            tx.execute("INSERT INTO operations VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![op.id.as_str(),op.task.as_str(),op.kind,op.target,op.payload_version,payload,hash_bytes(payload.as_bytes()),integer(op.expected_revision)?,op.due_unix_ms,op.idempotency_key])?;
+            tx.execute("INSERT INTO operations VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![op.id.as_str(),op.task.as_ref().ok_or(StoreError::Conflict)?.as_str(),op.kind,op.target,op.payload_version,payload,hash_bytes(payload.as_bytes()),integer(op.expected_revision)?,op.due_unix_ms,op.idempotency_key])?;
             let attempts=op.payload.get("retry").and_then(|r|r.get("attempts")).map(|v|v.as_u64().filter(|n|*n<=u32::MAX as u64).ok_or_else(||StoreError::Invalid("invalid imported retry count".into()))).transpose()?.unwrap_or(0);
             let outcome=serde_json::json!({"kind":"ambiguous","observation_required":"legacy import; observe prior delivery before retry"});
             tx.execute("UPDATE operation_delivery SET state='ambiguous',attempts=?2,last_outcome=?3 WHERE operation_id=?1",params![op.id.as_str(),integer(attempts)?,outcome.to_string()])?;

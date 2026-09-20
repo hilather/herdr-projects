@@ -72,7 +72,8 @@ pub fn build(snapshot:&Snapshot,batch:&ObservationBatch,now:i64,config:Option<&s
                 DeliveryState::Ambiguous=>(C::RequiresReconciliation,A::InspectReceipt,"Effect may already have occurred, even if the task changed; inspect exact receipts and never blindly replay."),
                 DeliveryState::Claimed if d.lease_until_ms.is_some_and(|until|until>now)=>(C::Waiting,A::Wait,"A delivery claim is still live; do not steal it."),
                 DeliveryState::Claimed=>(C::RequiresReconciliation,A::ExpireClaim,"Claim expired or lacks lease evidence; expiry records ambiguity, not permission to replay."),
-                DeliveryState::Pending if !snapshot.tasks.iter().any(|t|t.id==operation.task&&t.revision==operation.expected_revision)=>(C::CancelledOrStale,A::RetireStaleIntent,"Task revision changed; inspect and explicitly retire this stale intent."),
+                DeliveryState::Pending if operation.task.is_some()&&!snapshot.tasks.iter().any(|t|Some(&t.id)==operation.task.as_ref()&&t.revision==operation.expected_revision)=>(C::CancelledOrStale,A::RetireStaleIntent,"Task revision changed; inspect and explicitly retire this stale intent."),
+                DeliveryState::Pending if operation.task.is_none()&&!snapshot.control.as_ref().is_some_and(|c|c.revision==operation.expected_revision)=>(C::CancelledOrStale,A::RetireStaleIntent,"Project control revision changed; inspect and explicitly retire this stale intent."),
                 DeliveryState::Pending if d.next_due_ms>now=>(C::Waiting,A::Wait,"Retry is not due yet."),
                 DeliveryState::Pending if matches!(operation.kind.as_str(),"runtime.notification"|"runtime.finalization")=>(C::RetryCandidate,A::DeliverAfterValidation,"Explicit adapter must revalidate typed policy, control, revisions and resources before claiming or delivering."),
                 DeliveryState::Pending=>(C::RequiresReconciliation,A::InspectUnsupportedAdapter,"No automatic adapter is available; inspect imported receipts or retire explicitly."),
@@ -91,7 +92,7 @@ mod tests {
     fn fixture()->(tempfile::TempDir,SqliteStore,Snapshot,ObservationBatch) {
         let temp=tempfile::tempdir().unwrap();let mut db=SqliteStore::create(&temp.path().join("state.db")).unwrap();let task=Task{id:TaskId::new("t").unwrap(),revision:1,state:TaskState::Blocked,title:"fixture".into(),active_attempt:None};
         let attempt=Attempt{id:AttemptId::new("lost").unwrap(),task:task.id.clone(),revision:1,state:AttemptState::Lost,snapshot:None,reservation:"slot".into(),termination_observed:false};
-        let op=Operation{id:OperationId::new("op").unwrap(),task:task.id.clone(),kind:"runtime.notification".into(),target:"coordinator".into(),payload_version:1,payload:serde_json::json!({}),expected_revision:1,due_unix_ms:0,idempotency_key:"op".into()};
+        let op=Operation{id:OperationId::new("op").unwrap(),task:Some(task.id.clone()),kind:"runtime.notification".into(),target:"coordinator".into(),payload_version:1,payload:serde_json::json!({}),expected_revision:1,due_unix_ms:0,idempotency_key:"op".into()};
         db.commit(Commit{expected_head:0,mutations:vec![Mutation::Task{expected:None,next:task},Mutation::Attempt{expected:None,next:attempt},Mutation::Enqueue(op)]}).unwrap();let snapshot=db.read_snapshot(None).unwrap();let batch=ObservationBatch{expected_head:snapshot.head,observations:vec![],dispatch_allowed:false,recorded_head:None};(temp,db,snapshot,batch)
     }
     #[test]

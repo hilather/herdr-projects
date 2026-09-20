@@ -53,7 +53,7 @@ impl SqliteStore {
             // Explicit internal reconciliation can inspect ambiguous records now;
             // ordinary pending records still respect their backoff.
             if old.state==DeliveryState::Pending && old.next_due_ms>now {continue;}
-            let revision:i64=tx.query_row("SELECT revision FROM tasks WHERE id=?1",[op.task.as_str()],|r|r.get(0))?;
+            let revision:i64=tx.query_row("SELECT revision FROM tasks WHERE id=?1",[op.task.as_ref().ok_or(StoreError::Conflict)?.as_str()],|r|r.get(0))?;
             if integer(op.expected_revision)?!=revision{return Err(StoreError::Conflict);}
             if op.payload_version!=1{return Err(StoreError::Invalid("unsupported inbox intent version".into()));}
             if ["id","kind","subject","summary","body"].iter().any(|key|op.payload.get(key).is_none_or(|v|!v.is_string())) {return Err(StoreError::Corrupt("inbox intent requires all content fields".into()));}

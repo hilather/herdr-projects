@@ -65,7 +65,9 @@ impl Attempt {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Operation {
     pub id: OperationId,
-    pub task: TaskId,
+    /// None denotes project scope, fenced by project-control revision.
+    /// Legacy task-scoped JSON retains the same string representation.
+    pub task: Option<TaskId>,
     pub kind: String,
     pub target: String,
     pub payload_version: u32,

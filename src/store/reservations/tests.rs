@@ -1,7 +1,24 @@
 use super::*;
 use crate::reconcile::RuntimeObservation;
 fn fixture()->(tempfile::TempDir,SqliteStore,Vec<PreparedLaunch>) {
-    let temp=tempfile::tempdir().unwrap();let path=temp.path().join("state.db");let mut db=SqliteStore::create(&path).unwrap();
+    fixture_at(15)
+}
+fn fixture_at(version:u32)->(tempfile::TempDir,SqliteStore,Vec<PreparedLaunch>) {
+    let temp=tempfile::tempdir().unwrap();let path=temp.path().join("state.db");
+    let mut db=if version==14 {
+        std::fs::write(&path,[]).unwrap();let mut connection=connect(&path).unwrap();
+        let tx=connection.transaction().unwrap();
+        for sql in [
+            include_str!("../../../migrations/0001_project_store.sql"),include_str!("../../../migrations/0002_legacy_import.sql"),
+            include_str!("../../../migrations/0003_operation_delivery.sql"),include_str!("../../../migrations/0004_canonical_inbox.sql"),
+            include_str!("../../../migrations/0005_runtime_bindings.sql"),include_str!("../../../migrations/0006_runtime_observations.sql"),
+            include_str!("../../../migrations/0007_project_control.sql"),include_str!("../../../migrations/0008_canonical_runtime.sql"),
+            include_str!("../../../migrations/0009_runtime_ownership.sql"),include_str!("../../../migrations/0010_scheduler_queue.sql"),
+            include_str!("../../../migrations/0011_attempt_inputs.sql"),include_str!("../../../migrations/0012_effective_profiles.sql"),
+            include_str!("../../../migrations/0013_scoped_approvals.sql"),include_str!("../../../migrations/0014_admission_budgets.sql")
+        ] {tx.execute_batch(sql).unwrap();}
+        tx.commit().unwrap();drop(connection);SqliteStore::open(&path).unwrap()
+    } else {SqliteStore::create(&path).unwrap()};
     db.commit(Commit{expected_head:0,mutations:["a","b"].into_iter().map(|id|Mutation::Task{expected:None,next:Task{id:TaskId::new(id).unwrap(),revision:1,state:TaskState::Draft,title:id.into(),active_attempt:None}}).collect()}).unwrap();
     for id in ["a","b"] {let id=TaskId::new(id).unwrap();let h=db.read_snapshot(None).unwrap().head;db.create_runtime(Some(&id),Some(1),h,&RuntimeRoute::default()).unwrap();let h=db.read_snapshot(None).unwrap().head;db.queue_task(&id,2,h,&QueueRequest{priority:0,dependencies:vec![]},0).unwrap();}
     let s=db.read_snapshot(None).unwrap();db.set_scheduler_policy(s.head,1,1,3).unwrap();let s=db.read_snapshot(None).unwrap();
@@ -15,6 +32,44 @@ fn fixture()->(tempfile::TempDir,SqliteStore,Vec<PreparedLaunch>) {
     (temp,db,prepared)
 }
 fn reserve(db:&mut SqliteStore,p:&[PreparedLaunch])->Reservation {let h=db.read_snapshot(None).unwrap().head;db.reserve_prepared(p,h,1000).unwrap()}
+
+#[test]
+fn project_outbox_upgrade_preserves_claims_inputs_and_consumed_approvals() {
+    let(temp,mut db,p)=fixture_at(14);let r=reserve(&mut db,&p);
+    let claim=db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap();
+    // A preserved v1 record coexists with the live v2 claim. The old JSON format
+    // is literal historical data, not produced by the current serializer.
+    let old_json=include_str!("../../../tests/fixtures/launch-inputs-v1.json").trim()
+        .replace("\"task\":\"a\"","\"task\":\"b\"").replace("task:a","task:b");
+    let inputs:LaunchInputs=serde_json::from_str(&old_json).unwrap();
+    assert_eq!(serde_json::to_string(&inputs).unwrap(),old_json);
+    let(attempt,operation)=record_ids(&inputs).unwrap();
+    let old=AttemptInputRecord{attempt:attempt.clone(),operation:operation.clone(),inputs};
+    let payload=serde_json::to_string(&old).unwrap();let digest=format!("{:x}",Sha256::digest(payload.as_bytes()));
+    db.connection.execute_batch("DROP TRIGGER attempt_inputs_effective_profile;").unwrap();
+    db.connection.execute("INSERT INTO attempts VALUES(?1,'b',1,'reserved',NULL,?2,0)",params![attempt.as_str(),format!("worker:{}",attempt.as_str())]).unwrap();
+    db.connection.execute("UPDATE tasks SET revision=4,state='running',active_attempt=?1 WHERE id='b'",[attempt.as_str()]).unwrap();
+    db.connection.execute("INSERT INTO operations VALUES(?1,'b','runtime.launch','task:b',1,?2,?3,4,1000,?1)",params![operation.as_str(),payload,digest]).unwrap();
+    db.connection.execute("INSERT INTO attempt_inputs VALUES(?1,?2,?3,?4)",params![attempt.as_str(),operation.as_str(),payload,digest]).unwrap();
+    db.connection.execute_batch("CREATE TRIGGER attempt_inputs_effective_profile BEFORE INSERT ON attempt_inputs WHEN COALESCE(json_extract(NEW.payload,'$.inputs.version'),0)<>2 OR COALESCE(json_type(NEW.payload,'$.inputs.effective_profile'),'missing')<>'object' BEGIN SELECT RAISE(ABORT,'effective profile evidence is required'); END;").unwrap();
+    let mut before=db.read_snapshot(None).unwrap();
+    let sql=include_str!("../../../migrations/0015_project_operations.sql");
+    for checkpoint in ["DROP TABLE operation_delivery;","DROP TABLE operations;","UPDATE store_meta SET schema_version=15;"] {
+        let failing=sql.replace(checkpoint,&format!("{checkpoint}\nSELECT nonexistent_migration_fixture();"));
+        {let tx=db.connection.transaction().unwrap();assert!(tx.execute_batch(&failing).is_err());}
+        assert_eq!(db.read_snapshot(None).unwrap(),before);db.integrity_check().unwrap();
+        assert!(db.connection.execute("UPDATE operation_delivery SET attempts=0 WHERE attempts>0",[]).is_err());
+        assert!(db.connection.execute("DELETE FROM approval_uses",[]).is_err());
+        assert!(db.connection.execute("DELETE FROM attempt_inputs",[]).is_err());
+    }
+    db.upgrade_v1().unwrap();before.schema_version=15;
+    assert_eq!(db.read_snapshot(None).unwrap(),before);db.integrity_check().unwrap();
+    drop(db);let mut db=SqliteStore::open(&temp.path().join("state.db")).unwrap();
+    db.validate_claim(&claim,1001).unwrap();assert_eq!(db.read_snapshot(None).unwrap(),before);
+    assert!(db.connection.execute("UPDATE operation_delivery SET attempts=0",[]).is_err());
+    assert!(db.connection.execute("DELETE FROM approval_uses",[]).is_err());
+    assert!(db.connection.execute("DELETE FROM attempt_inputs",[]).is_err());
+}
 
 fn budget(db:&mut SqliteStore,p:&mut [PreparedLaunch],limits:BudgetLimits) {
     let snapshot=db.read_snapshot(None).unwrap();
@@ -87,7 +142,7 @@ fn budget_upgrade_preserves_pending_operations_without_inventing_policy() {
     let(_temp,mut db,p)=fixture();reserve(&mut db,&p);
     db.connection.execute_batch("DROP TABLE budget_policies; UPDATE store_meta SET schema_version=13; PRAGMA user_version=13;").unwrap();
     let before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();
-    let after=db.read_snapshot(None).unwrap();assert_eq!(after.schema_version,14);
+    let after=db.read_snapshot(None).unwrap();assert_eq!(after.schema_version,15);
     assert_eq!(after.events,before.events);assert_eq!(after.attempt_inputs,before.attempt_inputs);
     assert_eq!(after.deliveries,before.deliveries);assert!(after.budget_policies.is_empty());
 }
@@ -235,7 +290,7 @@ fn schema11_upgrade_retains_records_and_blocks_old_format_insertions() {
     let before=db.read_snapshot(None).unwrap();
     assert!(matches!(db.reserve_prepared(&p,before.head,1000),Err(StoreError::UnsupportedSchema(11))));
     db.upgrade_v1().unwrap();let after=db.read_snapshot(None).unwrap();
-    assert_eq!(after.schema_version,14);assert_eq!(after.attempt_inputs,before.attempt_inputs);assert_eq!(after.events,before.events);
+    assert_eq!(after.schema_version,15);assert_eq!(after.attempt_inputs,before.attempt_inputs);assert_eq!(after.events,before.events);
     assert_eq!(after.head,before.head);
     assert!(db.connection.execute("INSERT INTO attempt_inputs VALUES('old','old','{\"inputs\":{\"version\":1}}',?1)",params!["a".repeat(64)]).is_err());
     assert_eq!(after.attempt_inputs[0],record);

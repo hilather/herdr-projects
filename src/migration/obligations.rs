@@ -22,7 +22,7 @@ fn operation(kind:&str,key:&str,task:TaskId,payload:Value,retry:&Retry)->Result<
     ensure!(!key.trim().is_empty(),"empty legacy intent identity");
     // These fields remain inside payload as provenance as well as delivery state.
     let _ = (&retry.last_error,retry.blocked);
-    Ok(Operation{id:OperationId::new(crate::operations::legacy_id(kind,key)).map_err(anyhow::Error::msg)?,task,kind:kind.into(),target:key.into(),payload_version:1,payload,expected_revision:1,due_unix_ms:due(retry)?,idempotency_key:format!("{kind}:{key}")})
+    Ok(Operation{id:OperationId::new(crate::operations::legacy_id(kind,key)).map_err(anyhow::Error::msg)?,task:Some(task),kind:kind.into(),target:key.into(),payload_version:1,payload,expected_revision:1,due_unix_ms:due(retry)?,idempotency_key:format!("{kind}:{key}")})
 }
 pub(super) fn convert(project:&Path,tasks:&mut Vec<Task>)->Result<Vec<Operation>> {
     let path=project.join(".state/ticker.json");if !exists(&path){return Ok(Vec::new());}
@@ -52,7 +52,7 @@ pub(super) fn convert(project:&Path,tasks:&mut Vec<Task>)->Result<Vec<Operation>
             operations.push(operation("legacy.notify",&notification.hash,TaskId::new(PROJECT_TASK).unwrap(),value.clone(),&notification.retry)?);
         } else {ensure!(notification.retry.attempts==0&&notification.retry.next_attempt.is_empty()&&notification.retry.last_error.is_empty()&&!notification.retry.blocked,"notification retry has no hash");}
     }
-    if operations.iter().any(|o|o.task.as_str()==PROJECT_TASK) {
+    if operations.iter().any(|o|o.task.as_ref().map(TaskId::as_str)==Some(PROJECT_TASK)) {
         tasks.push(Task{id:TaskId::new(PROJECT_TASK).unwrap(),revision:1,state:TaskState::Blocked,title:"Imported project delivery obligations; reconciliation required".into(),active_attempt:None});
     }
     let mut ids=BTreeSet::new();for op in &operations {ensure!(ids.insert(op.id.clone()),"duplicate imported operation identity");}

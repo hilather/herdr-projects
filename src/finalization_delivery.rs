@@ -93,7 +93,7 @@ pub(crate) mod tests {
     #[test]
     fn finalization_commits_verified_receipt_and_review_disposition_without_legacy_mutation() {
         let(world,path,op)=fixture();let original=fs::read(path.join("threads/t-0001.toml")).unwrap();let before=runtime::snapshot(&path).unwrap();
-        let result=deliver(&world.ctx(),&path,&op.id,1).unwrap();assert!(matches!(result,DispatchResult::Recorded(d) if d.state==DeliveryState::Confirmed));let after=runtime::snapshot(&path).unwrap();let task=after.tasks.iter().find(|t|t.id==op.task).unwrap();assert_eq!(task.state,TaskState::AwaitingReview);assert_eq!(task.revision,op.expected_revision+1);assert_eq!(after.attempts,before.attempts);assert_eq!(after.runtime_bindings,before.runtime_bindings);
+        let result=deliver(&world.ctx(),&path,&op.id,1).unwrap();assert!(matches!(result,DispatchResult::Recorded(d) if d.state==DeliveryState::Confirmed));let after=runtime::snapshot(&path).unwrap();let task=after.tasks.iter().find(|t|Some(&t.id)==op.task.as_ref()).unwrap();assert_eq!(task.state,TaskState::AwaitingReview);assert_eq!(task.revision,op.expected_revision+1);assert_eq!(after.attempts,before.attempts);assert_eq!(after.runtime_bindings,before.runtime_bindings);
         let payload=Finalization::decode(&op).unwrap();let receipt=load_receipt(&project(&path).unwrap(),&op,&payload).unwrap().unwrap();assert_eq!(fs::read(path.join(".state/canonical-artifacts").join(receipt.artifact_key).join(receipt.snapshot).join("library/artifact")).unwrap(),b"preserved bytes");assert_eq!(fs::read(path.join("threads/t-0001.toml")).unwrap(),original);assert!(!path.join(".state/artifacts").exists());assert!(deliver(&world.ctx(),&path,&op.id,1).is_err());
     }
     #[test]
@@ -101,9 +101,9 @@ pub(crate) mod tests {
         for change in ["task","config","attempt"] {
             let(world,path,op)=fixture();let snapshot=runtime::snapshot(&path).unwrap();
             match change {
-                "task"=>{runtime::rename_task(&path,&op.task,"changed".into(),op.expected_revision,snapshot.head).unwrap();},
+                "task"=>{runtime::rename_task(&path,op.task.as_ref().unwrap(),"changed".into(),op.expected_revision,snapshot.head).unwrap();},
                 "config"=>{fs::create_dir_all(&world.ctx().config_dir).unwrap();fs::write(world.ctx().config_dir.join("config.toml"),"# changed").unwrap();},
-                _=>{let attempt=Attempt{id:AttemptId::new("lost").unwrap(),task:op.task.clone(),revision:1,state:AttemptState::Lost,snapshot:None,reservation:"retained".into(),termination_observed:false};migration::open_active(&path).unwrap().commit(Commit{expected_head:snapshot.head,mutations:vec![Mutation::Attempt{expected:None,next:attempt}]}).unwrap();},
+                _=>{let attempt=Attempt{id:AttemptId::new("lost").unwrap(),task:op.task.clone().unwrap(),revision:1,state:AttemptState::Lost,snapshot:None,reservation:"retained".into(),termination_observed:false};migration::open_active(&path).unwrap().commit(Commit{expected_head:snapshot.head,mutations:vec![Mutation::Attempt{expected:None,next:attempt}]}).unwrap();},
             }
             let before=runtime::snapshot(&path).unwrap();assert!(deliver(&world.ctx(),&path,&op.id,1).is_err());assert_eq!(runtime::snapshot(&path).unwrap(),before);assert!(!path.join(".state/canonical-artifacts").exists());
         }
@@ -119,7 +119,7 @@ pub(crate) mod tests {
         let(world,path,op)=fixture();let ctx=world.ctx();let mut adapter=Adapter{ctx:&ctx,path:path.clone()};let mut prepared=adapter.prepare(&op).unwrap();let mut db=migration::open_active(&path).unwrap();let claim=db.claim_operation(&op.id,1,"rollback-fixture",jiff::Timestamp::now().as_millisecond(),300_000).unwrap();let outcome=prepared.deliver(&op,&claim).unwrap();let before=db.read_snapshot(None).unwrap();
         let raw=rusqlite::Connection::open(path.join(".state/state.db")).unwrap();raw.execute_batch("CREATE TRIGGER reject_outcome BEFORE UPDATE ON operation_delivery WHEN NEW.state='confirmed' BEGIN SELECT RAISE(ABORT,'fixture outcome write failure'); END;").unwrap();assert!(db.finish_operation(&claim,outcome.clone(),jiff::Timestamp::now().as_millisecond()).is_err());assert_eq!(db.read_snapshot(None).unwrap(),before);raw.execute_batch("DROP TRIGGER reject_outcome;").unwrap();
         let mut wrong:FinalizationReceipt=match &outcome {Outcome::Confirmed{observed_identity}=>serde_json::from_str(observed_identity).unwrap(),_=>unreachable!()};wrong.report_hash="0".repeat(64);assert!(db.finish_operation(&claim,Outcome::Confirmed{observed_identity:serde_json::to_string(&wrong).unwrap()},jiff::Timestamp::now().as_millisecond()).is_err());assert_eq!(db.read_snapshot(None).unwrap(),before);
-        assert_eq!(db.finish_operation(&claim,outcome,jiff::Timestamp::now().as_millisecond()).unwrap().state,DeliveryState::Confirmed);assert_eq!(db.read_snapshot(None).unwrap().tasks.iter().find(|t|t.id==op.task).unwrap().revision,op.expected_revision+1);
+        assert_eq!(db.finish_operation(&claim,outcome,jiff::Timestamp::now().as_millisecond()).unwrap().state,DeliveryState::Confirmed);assert_eq!(db.read_snapshot(None).unwrap().tasks.iter().find(|t|Some(&t.id)==op.task.as_ref()).unwrap().revision,op.expected_revision+1);
     }
     #[test]
     fn finalization_refuses_replaced_source_ancestor_and_preserves_existing_receipts() {
@@ -142,11 +142,11 @@ pub(crate) mod tests {
             let(world,path,op)=fixture();let mut child=Command::new(std::env::current_exe().unwrap()).args(["--exact","finalization_delivery::tests::finalization_crash_child","--nocapture"]).env("HP_FINALIZE_CRASH_HOME",world.home.path()).env("HP_FINALIZE_CRASH_PHASE",phase).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn().unwrap();let deadline=Instant::now()+Duration::from_secs(10);
             while !world.home.path().join("finalization-ready").exists(){if child.try_wait().unwrap().is_some(){panic!("crash fixture exited before ready");}if Instant::now()>deadline{let _=child.kill();let _=child.wait();panic!("crash fixture readiness timeout");}std::thread::sleep(Duration::from_millis(10));}
             child.kill().unwrap();child.wait().unwrap();migration::recover(&path,true).unwrap();let mut db=migration::open_active(&path).unwrap();let delivery=db.deliveries().unwrap().into_iter().find(|d|d.operation==op.id).unwrap();
-            if phase=="committed" {assert_eq!(delivery.state,DeliveryState::Confirmed);assert_eq!(db.read_snapshot(None).unwrap().tasks.iter().find(|t|t.id==op.task).unwrap().revision,op.expected_revision+1);continue;}
-            assert_eq!(delivery.state,DeliveryState::Claimed);db.expire_claims(delivery.lease_until_ms.unwrap()+1).unwrap();let before=db.read_snapshot(None).unwrap();let pending=db.deliveries().unwrap().into_iter().find(|d|d.operation==op.id).unwrap();assert_eq!(pending.state,DeliveryState::Ambiguous);assert_eq!(before.tasks.iter().find(|t|t.id==op.task).unwrap().revision,op.expected_revision);
+            if phase=="committed" {assert_eq!(delivery.state,DeliveryState::Confirmed);assert_eq!(db.read_snapshot(None).unwrap().tasks.iter().find(|t|Some(&t.id)==op.task.as_ref()).unwrap().revision,op.expected_revision+1);continue;}
+            assert_eq!(delivery.state,DeliveryState::Claimed);db.expire_claims(delivery.lease_until_ms.unwrap()+1).unwrap();let before=db.read_snapshot(None).unwrap();let pending=db.deliveries().unwrap().into_iter().find(|d|d.operation==op.id).unwrap();assert_eq!(pending.state,DeliveryState::Ambiguous);assert_eq!(before.tasks.iter().find(|t|Some(&t.id)==op.task.as_ref()).unwrap().revision,op.expected_revision);
             if phase=="before" {assert!(observe(&world.ctx(),&path,&op.id,pending.revision,before.head).is_err());assert_eq!(runtime::snapshot(&path).unwrap(),before);}else{
                 // Receipt recovery uses retained bytes, not a second source copy.
-                fs::remove_dir_all(world.home.path().join("artifact-root/source")).unwrap();assert_eq!(observe(&world.ctx(),&path,&op.id,pending.revision,before.head).unwrap().state,DeliveryState::Confirmed);assert_eq!(runtime::snapshot(&path).unwrap().tasks.iter().find(|t|t.id==op.task).unwrap().revision,op.expected_revision+1);
+                fs::remove_dir_all(world.home.path().join("artifact-root/source")).unwrap();assert_eq!(observe(&world.ctx(),&path,&op.id,pending.revision,before.head).unwrap().state,DeliveryState::Confirmed);assert_eq!(runtime::snapshot(&path).unwrap().tasks.iter().find(|t|Some(&t.id)==op.task.as_ref()).unwrap().revision,op.expected_revision+1);
             }
         }
     }

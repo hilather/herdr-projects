@@ -7,7 +7,7 @@ fn task(id: &str, revision: u64) -> Task {
 }
 fn put(next: Task, expected: Option<u64>) -> Mutation { Mutation::Task { expected, next } }
 fn intent(id: &str) -> Operation {
-    Operation { id: OperationId::new(id).unwrap(), task: TaskId::new("t-1").unwrap(), kind: "launch".into(), target: "fixture-session".into(), payload_version: 1, payload: serde_json::json!({"argv":["fixture"]}), expected_revision: 1, due_unix_ms: 0, idempotency_key: id.into() }
+    Operation { id: OperationId::new(id).unwrap(), task: Some(TaskId::new("t-1").unwrap()), kind: "launch".into(), target: "fixture-session".into(), payload_version: 1, payload: serde_json::json!({"argv":["fixture"]}), expected_revision: 1, due_unix_ms: 0, idempotency_key: id.into() }
 }
 fn lab() -> (TempDir, SqliteStore) {
     let temp = TempDir::new().unwrap();
