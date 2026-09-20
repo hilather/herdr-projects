@@ -129,6 +129,8 @@ pub struct Memory {
     pub machines: BTreeMap<MachineKey, MachineMemory>,
     pub pr_reads: Option<crate::pr_polling::Reads>,
     pub remote_reads:Option<crate::remote_polling::Reads>,
+    pub copy_jobs:Option<crate::copy_jobs::Queue>,
+    pub prefer_copy:bool,
     #[cfg(feature="state-store")]
     pub routine_jobs:Option<crate::routine_jobs::Queue>,
     #[cfg(test)]
@@ -145,6 +147,8 @@ impl Memory {
             machines: BTreeMap::new(),
             pr_reads: None,
             remote_reads: None,
+            copy_jobs: None,
+            prefer_copy:true,
             #[cfg(feature="state-store")]
             routine_jobs: None,
             #[cfg(test)]
@@ -203,7 +207,11 @@ fn thread_label(t: &Thread) -> String {
 
 /// Step 1's inbox items, written after the copies so a Ready for review item
 /// always points at a home copy that exists.
+#[cfg(test)]
 pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[Transition], session_lost: bool) -> Result<()> {
+    write_thread_items_ready(project,state,transitions,session_lost,|_|true)
+}
+pub fn write_thread_items_ready(project: &Project, state: &mut State, transitions: &[Transition], session_lost: bool,review_ready:impl Fn(&thread::Thread)->bool) -> Result<()> {
     if session_lost {
         if !state.session_item_written {
             let open = thread::list(project).iter().filter(|t| t.status == Status::Open && !t.is_remote()).count();
@@ -232,7 +240,7 @@ pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[T
     }
 
     // Persist immutable intent before delivery, with receipt-specific acknowledgement.
-    for t in thread::list(project) { thread::review_delivery::prepare(project, &t)?; }
+    for t in thread::list(project) { if review_ready(&t) {thread::review_delivery::prepare(project, &t)?;} }
     thread::review_delivery::deliver(project)?;
     Ok(())
 }

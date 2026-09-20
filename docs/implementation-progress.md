@@ -1394,3 +1394,52 @@ All 515 tests pass in debug and release (165 library, 318 binary, 30 CLI, two
 contracts). Default-feature tests also pass (29 library, 271 binary, 11 CLI, two
 contracts); three optional live checks remain ignored. Logs:
 `/tmp/herdr-copy-worker-{debug,release,default}.log`.
+
+
+## W04 automatic copy admission and shared background fairness
+
+Production Linux tickers now wrap the shared executor with the trusted copy worker.
+Local and remote observations offer copy requests; native transport and additive
+publication execute after the full legacy/canonical project pass. A copy and a routine
+cannot both hold a background ticket. Successful admission alternates the preferred
+kind; completion is drained only at tick entry, so even a mid-pass completion cannot
+skip the next full opportunity for guarded project effects. Stop drains the same
+shared pool. Other platforms retain their existing path and remain untested.
+
+Copy offers/recent metadata are bounded to 128 entries, failures back off for 30
+seconds, and idle offers expire after 180 seconds. Normal selection rotates projects
+and their threads, advancing only on accepted submission. The inventory retains the
+nearest candidates to the admission cursor when saturated; refreshed failing offers
+cannot permanently exclude new projects. After the bounded 128-project cursor history
+fills, selection switches for that process to one cyclic project/thread cursor. This
+preserves eventual service for every continuously offered pair in a finite backlog
+with bounded history; overflow does not promise equal per-project turn frequency.
+Pending tickets are never evicted, and volatile offer eviction never deletes a durable
+recovery intent.
+
+Pending projections are offered before checking session availability. Remote recovery
+may omit an observed target: the worker resolves current routing under supervision,
+then requires the complete authority digest to match the retained intent. It does not
+probe or fetch from the source host. New review notices wait while a newer copy is due
+or outstanding; remote notice preparation also requires a fresh observation. Already
+persisted notices continue to replay independently.
+
+Independent review found and verified fixes for stale-review ordering and two queue
+saturation starvation cases. Five queue fixtures cover rotation, bounded eviction,
+backoff, pending-ticket retention and overflow thread fairness. Ticker fixtures cover
+copy/routine alternation, canonical effect opportunity, old unannounced reports and
+source/session-independent recovery. A built-binary subprocess fixture exercises
+actual current-executable transport, binary library/report publication, durable receipt,
+announcement after restart and no recopy on another unchanged-report restart.
+Independent review approved the final integration and reran the queue and native
+subprocess fixtures.
+
+Local report hashing and other remaining slow effects still need isolation, and
+canonical launch/profile/budget/authority work remains open. Counts remain 16 locally
+implemented, five partial and 20 not started; actual remote-host and macOS acceptance
+remain untested.
+
+All 525 tests pass in debug and release (165 library, 327 binary, 31 CLI, two
+contracts). Default-feature tests pass (29 library, 278 binary, 12 CLI, two contracts).
+Three optional live checks remain ignored. Logs:
+`/tmp/herdr-copy-admission-{debug,release,default}.log`.

@@ -1,5 +1,4 @@
 //! Trusted live-copy ingress. Queue completions never certify publication.
-#![allow(dead_code)] // Automatic admission follows verified worker integration.
 use std::{path::{Path,PathBuf},os::unix::fs::MetadataExt,sync::Arc,time::{Duration,Instant}};
 use anyhow::{Result,Context,ensure};
 use serde::{Serialize,Deserialize};
@@ -24,7 +23,7 @@ impl Input {
     fn validate(&self)->Result<()> {
         ensure!(self.project.is_absolute()&&self.config.is_absolute(),"copy paths must be absolute");
         thread::validate_id(&self.id)?;
-        ensure!(!self.herdr.is_empty()&&!self.helper.is_empty()&&self.machine.is_empty()==self.target.is_none(),"invalid live-copy route");
+        ensure!(!self.herdr.is_empty()&&!self.helper.is_empty()&&(if self.machine.is_empty(){self.target.is_none()}else{self.target.is_some()||self.pending.is_some()}),"invalid live-copy route");
         ensure!(self.execution.len()==64&&self.execution.bytes().all(|b|b.is_ascii_hexdigit()),"invalid live-copy execution");
         if let Some(receipt)=&self.previous_receipt {receipt.validate()?;}
         if let Some(intent)=&self.pending {intent.validate()?;}
@@ -47,19 +46,25 @@ impl Input {
         ensure!(current.pending_copy_notice.is_none()&&current.pending_review_notice.is_none(),"pending notice blocks live copy");
         Ok(current)
     }
+    fn configuration(&self)->Result<Option<String>> {
+        let (bytes,digest)=config(&self.config)?;ensure!(digest==self.config_digest,"live-copy configuration changed");Ok(bytes)
+    }
+    fn resolve_target(&self,control:&Control,locks:&[InheritedLock])->Result<String> {
+        control.check()?;let bytes=self.configuration()?;
+        let listed=run(Cmd::new(&self.herdr,remote::SSH_TIMEOUT).args(["machine","list","--json"]),control,locks).ok();
+        // Cancellation/deadline never become permission to use fallback routing.
+        control.check()?;
+        let target=remote::target_from_listing(listed,||bytes.as_ref().and_then(|s|remote::configured_target_bytes(s.as_bytes(),&self.machine)),&self.machine)?;
+        self.configuration()?;control.check()?;Ok(target)
+    }
     fn authorize(&self,control:&Control,locks:&[InheritedLock])->Result<()> {
-        control.check()?;let (bytes,digest)=config(&self.config)?;
-        ensure!(digest==self.config_digest,"live-copy configuration changed");
-        if let Some(expected)=&self.target {
-            let listed=run(Cmd::new(&self.herdr,remote::SSH_TIMEOUT).args(["machine","list","--json"]),control,locks).ok();
-            // Cancellation/deadline never become permission to use fallback routing.
-            control.check()?;
-            let resolved=remote::target_from_listing(listed,||bytes.as_ref().and_then(|s|remote::configured_target_bytes(s.as_bytes(),&self.machine)),&self.machine)?;
-            ensure!(&resolved==expected,"live-copy machine route changed");
+        control.check()?;self.configuration()?;
+        if !self.machine.is_empty() {
+            ensure!(self.target.as_ref()==Some(&self.resolve_target(control,locks)?),"live-copy machine route changed");
         }
-        ensure!(config(&self.config)?.1==self.config_digest,"live-copy configuration changed during routing");
         control.check()
     }
+
 }
 fn run(command:Cmd,control:&Control,locks:&[InheritedLock])->Result<Output> {
     control.check()?;
@@ -83,6 +88,11 @@ fn execute(input:&Input,control:&Control,helpers:&Helpers)->Result<()> {
     let guard=ProjectGuard::acquire(&input.project)?;let locks=guard.inherit_transfer()?;
     let project=Project::load(input.project.parent().context("copy project root missing")?,input.project.file_name().and_then(|s|s.to_str()).context("invalid copy project name")?)?;
     let expected=input.current(&project,&guard,control)?;
+    let resolved;
+    let input=if !input.machine.is_empty()&&input.target.is_none() {
+        ensure!(input.pending.is_some(),"unobserved route requires retained recovery intent");
+        resolved={let mut value=input.clone();value.target=Some(input.resolve_target(control,&locks)?);value};&resolved
+    }else{input};
     let authority=input.authority()?;input.authorize(control,&locks)?;
     if let Some(intent)=&input.pending {
         ensure!(intent.authority==authority,"retained live-copy authority changed");
@@ -133,6 +143,9 @@ pub fn request(ctx:&Ctx<'_>,project:&Project,expected:&Thread,target:Option<&str
     let deadline=Instant::now()+BUDGET;let mut command=Cmd::new(JOB,BUDGET).stdin(text);command.deadline=Some(deadline);
     Ok(Request{identity,lane:Lane::Transfer,deadline,command})
 }
+
+mod queue;
+pub use queue::Queue;
 
 #[cfg(all(test,target_os="linux"))]
 mod tests {
@@ -231,6 +244,23 @@ mod tests {
         assert!(runner.run(&command).is_err());assert_eq!(inner.0.load(std::sync::atomic::Ordering::Relaxed),0);
         assert_eq!(thread::load(&project,&t.id).unwrap(),t);
         command.deadline=Some(Instant::now());assert!(runner.run(&command).is_err());assert_eq!(inner.0.load(std::sync::atomic::Ordering::Relaxed),0);
+    }
+    #[test]
+    fn ticker_recovers_retained_remote_copy_without_reachable_session_or_source_host() {
+        let (root,project,t,mut input,helpers)=fixture();remote(root.path(),&project,&t,&mut input,&helpers,"{\"live_versions\":[1]}");
+        let current=thread::load(&project,&t.id).unwrap();let authority=input.authority().unwrap();
+        let guard=ProjectGuard::acquire(&project.dir()).unwrap();let staged=live::receive(&project,&root.path().join("archive")).unwrap();let mut calls=0;
+        assert!(staged.publish(&project,&guard,&current,&authority,||{calls+=1;if calls==3 {anyhow::bail!("interrupted");}Ok(())}).is_err());drop(guard);
+        fs::remove_dir_all(&current.thread_dir).unwrap();fs::remove_file(&helpers.ssh).unwrap();
+        let env=paths::Env::for_test(root.path(),&[("HERDR_BIN_PATH",&input.herdr)]);let runner=crate::runner::RealRunner;
+        let ctx=Ctx{env:&env,root:root.path().into(),config_dir:root.path().join("cfg"),runner:&runner,detached_ticker:false};
+        let pool=Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),Arc::new(JobRunner{inner:Arc::new(crate::runner::RealRunner)})).unwrap());
+        let mut memory=crate::steps::Memory::new(&ctx);memory.copy_jobs=Some(Queue::new(pool.clone()));
+        assert!(crate::ticker::tick_for_test(&ctx,&mut memory));assert!(memory.copy_jobs.as_ref().unwrap().pending());
+        let deadline=Instant::now()+Duration::from_secs(3);
+        while thread::load(&project,&t.id).unwrap().pending_live_copy.is_some(){assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(5));}
+        assert_eq!(fs::read(thread::home_report_path(&project,&t.id)).unwrap(),b"new\0\xff");
+        assert!(pool.stop(Duration::from_secs(1)));assert!(memory.copy_jobs.as_mut().unwrap().drain().is_empty());
     }
     fn remote(root:&Path,project:&Project,t:&Thread,input:&mut Input,helpers:&Helpers,probe:&str) {
         thread::update(project,&t.id,|t|t.machine="box".into()).unwrap();let current=thread::load(project,&t.id).unwrap();input.execution=thread::execution_fingerprint(&current);input.machine="box".into();input.target=Some("user@box".into());

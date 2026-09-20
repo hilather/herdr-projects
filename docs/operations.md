@@ -139,6 +139,23 @@ copying. Finalization never removes the worktree.
 Existing partial-copy policy remains: skipped symlinks or an oversized library
 may resolve the thread, with a durable `copy` warning in the inbox. Failed copies
 do not resolve it. Content checksums prevent stale equal-size/equal-mtime library transfers.
+On Linux, background live copies use the shared bounded executor and a surviving
+process supervisor. Local copies invoke this binary's native artifact sender. Remote
+copies require a compatible `herdr-projects artifact-stream --probe` response containing
+`live_versions: [1]`; install the matching helper remotely or select its executable
+with `HERDR_PROJECTS_REMOTE_BIN`. Unsupported helpers refuse instead of falling back
+to a different transfer method. Local namespace supervision is required; it does not
+claim termination of a remote helper after an SSH connection is lost.
+
+Copies recheck execution, configuration and routing before publishing. The exact
+staged bytes and recovery intent survive interruption in `.state/live-copies`; the
+next active ticker resumes them without downloading again. Configuration or routing
+withdrawal blocks that recovery while preserving the intent. At most 16 stage/spool
+entries are retained per project; a full inventory refuses new downloads but still
+permits recovery. New review announcements wait for pending copies. Copies remain
+additive and per-file atomic, so an interrupted projection may expose some new library
+files before its report and receipt are committed.
+
 Live ticker copies also save a receipt and any partial-copy warning together with
 the copied report hash. Warnings deliver independently of review readiness and retry
 after restart with the same inbox identity, including when the item is already in
@@ -195,7 +212,7 @@ label capture truncation. The inbox display limit remains 4,000 characters.
 
 Save the machine with `herdr machine add --label <label> <ssh target>` (both machines need Herdr 0.9.1), then list a repo as `--repo /path/on/machine@<label>` or pass `thread start --machine <label>`. The home machine owns the project; only outbound SSH from home is needed, in batch mode, so set up key-based login first.
 
-- The worktree, the brief and the report live on the remote machine. The home ticker polls it once a minute and copies a changed report with `scp` and the thread's `library/` with `rsync -rt --checksum` (symbolic links are never followed or copied; a library over 50 MB is not copied and the inbox item says so).
+- The worktree, the brief and the report live on the remote machine. The home ticker polls it once a minute. On Linux, changed reports and libraries use the supervised native live-copy stream described below. Other platform paths retain the existing `scp`/`rsync` behavior. Symbolic links are never followed or copied; a library over 50 MiB is omitted with a durable copy warning.
 - A machine that doesn't answer is left alone: no state is read, threads keep their last group, and that project's session is skipped for about two minutes. After ten minutes you get one `outage` inbox item, and one more when it is back. Polling and backoff are tracked separately for each project/session, so projects sharing a machine label all receive poll opportunities. The first project in the slow pass rotates each tick.
 - A blocked remote thread needs you in its pane on that machine: select the machine in Herdr's sidebar, or run `herdr --remote <ssh target>`.
 - `focus` does not cover remote threads: their sidebar tokens are set on the remote Herdr server. They appear in `overview`, `thread list` and inbox items.

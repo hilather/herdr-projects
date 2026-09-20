@@ -261,9 +261,11 @@ pub fn run(ctx: &Ctx) -> Result<()> {
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::remote_polling::ProbeRunner{inner:std::sync::Arc::new(crate::runner::RealRunner)});
     #[cfg(feature="state-store")]
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::routine_jobs::JobRunner{inner:runner});
+    let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::copy_jobs::JobRunner{inner:runner});
     let executor=std::sync::Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),runner)?);
     #[cfg(feature="state-store")]
     {memory.routine_jobs=Some(crate::routine_jobs::Queue::new(executor.clone()));}
+    if cfg!(target_os="linux") {memory.copy_jobs=Some(crate::copy_jobs::Queue::new(executor.clone()));}
     memory.pr_reads=Some(crate::pr_polling::Reads::with_executor(executor.clone()));
     memory.remote_reads=Some(crate::remote_polling::Reads::new(executor));
     loop {
@@ -295,6 +297,7 @@ pub fn run(ctx: &Ctx) -> Result<()> {
 /// others.
 pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     memory.tick += 1;
+    if let Some(queue)=memory.copy_jobs.as_mut() {for error in queue.drain(){log.line(&error);}}
     #[cfg(feature="state-store")]
     if let Some(queue)=memory.routine_jobs.as_mut() {for error in queue.drain(){log.line(&error);}}
     let mut reachable = Vec::new();
@@ -310,6 +313,15 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         };
         if project.status() != Status::Active {
             continue;
+        }
+        if let Some(queue)=memory.copy_jobs.as_mut() {
+            // Recovery is independent of source/session reachability. The worker
+            // re-resolves remote routing and checks retained authority itself.
+            let (threads,diagnostics)=thread::list_with_diagnostics(&project);
+            for error in diagnostics {log.line(&format!("{slug}: {error}"));}
+            for t in threads.iter().filter(|t|t.pending_live_copy.is_some()) {
+                if let Err(error)=queue.offer(ctx,&project,t,None){log.line(&format!("{slug}: copy recovery: {error:#}"));}
+            }
         }
         match tick_cheap(ctx, &project) {
             Ok(Some(seen)) => reachable.push((project, seen)),
@@ -337,17 +349,34 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
                 Err(error)=>log.line(&format!("{slug}: canonical controller: {error:#}")),
             }
         }
-        // Only after every project had an effect opportunity. Completion is
-        // drained at tick entry, so a mid-pass finish cannot chain another job.
-        if let Some(queue)=memory.routine_jobs.as_mut() {
-            for error in queue.admit_projects(canonical.into_iter().map(|slug|ctx.root.join(slug))) {log.line(&error);}
-        }
+        admit_background(ctx,log,memory,canonical.into_iter().map(|slug|ctx.root.join(slug)).collect());
         any_reachable|=memory.routine_jobs.as_ref().is_some_and(|q|q.pending());
+        any_reachable|=memory.copy_jobs.as_ref().is_some_and(|q|q.pending()||q.offered());
         return any_reachable;
     }
     #[cfg(not(feature="state-store"))]
-    any_reachable
+    {
+        admit_background(ctx,log,memory,Vec::new());
+        any_reachable||memory.copy_jobs.as_ref().is_some_and(|q|q.pending()||q.offered())
+    }
+
 }
+/// Drain happens only at tick entry. Even a completed ticket holds its turn until
+/// then, preserving a full project effect pass before another background job.
+fn admit_background(_ctx:&Ctx,log:&Log,memory:&mut Memory,canonical:Vec<PathBuf>) {
+    if memory.copy_jobs.as_ref().is_some_and(|q|q.pending()){return;}
+    #[cfg(feature="state-store")]
+    if memory.routine_jobs.as_ref().is_some_and(|q|q.pending()){return;}
+    if memory.prefer_copy {
+        if let Some(queue)=memory.copy_jobs.as_mut(){for error in queue.admit(){log.line(&error);}if queue.pending(){memory.prefer_copy=false;return;}}
+    }
+    #[cfg(feature="state-store")]
+    if let Some(queue)=memory.routine_jobs.as_mut(){for error in queue.admit_projects(canonical){log.line(&error);}if queue.pending(){memory.prefer_copy=true;return;}}
+    #[cfg(not(feature="state-store"))]
+    let _=canonical;
+    if let Some(queue)=memory.copy_jobs.as_mut(){for error in queue.admit(){log.line(&error);}if queue.pending(){memory.prefer_copy=false;}}
+}
+
 
 #[cfg(test)]
 pub fn tick_for_test(ctx: &Ctx, memory: &mut Memory) -> bool {
@@ -606,7 +635,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
 /// `herdr --machine`, one ssh call for every report hash, then the same thread
 /// pass, copies and launches as for local threads. If the machine cannot be
 /// reached nothing is read: no state, no group change, no copy, no inbox item.
-fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threads: &[thread::Thread], may_start: &mut bool, errors: &mut Vec<anyhow::Error>) -> Result<Vec<Transition>, String> {
+fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threads: &[thread::Thread], may_start: &mut bool, errors: &mut Vec<anyhow::Error>,copies:Option<&mut crate::copy_jobs::Queue>,deferred:&mut std::collections::BTreeSet<String>,observed:&mut std::collections::BTreeSet<String>) -> Result<Vec<Transition>, String> {
     let remote = herdr.on_machine(machine);
     let agents = remote.agent_list().map_err(|e| e.to_string())?;
     let panes = remote.pane_list().map_err(|e| e.to_string())?;
@@ -614,14 +643,14 @@ fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threa
     let dirs: Vec<(String, String)> = threads.iter().filter(|t| !t.thread_dir.is_empty()).map(|t| (t.id.clone(), t.thread_dir.clone())).collect();
     let hashes = crate::remote::report_hashes(ctx.runner, &target, &dirs).map_err(|e| format!("{e:#}"))?;
 
-    apply_remote(ctx,project,herdr,machine,threads,crate::remote_polling::Observation{agents,panes,target,hashes},false,may_start,errors)
+    apply_remote(ctx,project,herdr,machine,threads,crate::remote_polling::Observation{agents,panes,target,hashes},false,may_start,errors,copies,deferred,observed)
 }
-fn apply_remote(ctx:&Ctx,project:&Project,herdr:&Herdr,machine:&str,threads:&[thread::Thread],observation:crate::remote_polling::Observation,asynchronous:bool,may_start:&mut bool,errors:&mut Vec<anyhow::Error>)->Result<Vec<Transition>,String> {
+fn apply_remote(ctx:&Ctx,project:&Project,herdr:&Herdr,machine:&str,threads:&[thread::Thread],observation:crate::remote_polling::Observation,asynchronous:bool,may_start:&mut bool,errors:&mut Vec<anyhow::Error>,mut copies:Option<&mut crate::copy_jobs::Queue>,deferred:&mut std::collections::BTreeSet<String>,observed:&mut std::collections::BTreeSet<String>)->Result<Vec<Transition>,String> {
     let remote=herdr.on_machine(machine);
     let crate::remote_polling::Observation{mut agents,mut panes,target,hashes}=observation;
     // A delayed observation alone cannot authorize a terminal launch/prompt.
     // Keep the current guarded synchronous preflight for pending execution.
-    if asynchronous&&threads.iter().any(|t|t.prompt_pending||hashes.get(&t.id).is_some_and(|hash|hash!=&t.report_hash)) {
+    if asynchronous&&threads.iter().any(|t|t.prompt_pending||(copies.is_none()&&hashes.get(&t.id).is_some_and(|hash|hash!=&t.report_hash))) {
         let current=crate::remote::ssh_target(ctx.runner,&ctx.env.herdr_bin(),&ctx.config_dir,machine).map_err(|e|format!("{e:#}"))?;
         if current!=target {return Err("remote route changed after observation; retry before effects".into());}
     }
@@ -633,9 +662,17 @@ fn apply_remote(ctx:&Ctx,project:&Project,herdr:&Herdr,machine:&str,threads:&[th
     errors.extend(pass.error);
 
     for t in threads.iter().filter(|t| t.status == thread::Status::Open) {
-        let Some(_) = hashes.get(&t.id).filter(|h| **h != t.report_hash) else {
+        observed.insert(t.id.clone());
+        let changed=hashes.get(&t.id).is_some_and(|h|*h!=t.report_hash);
+        if let Some(queue)=copies.as_deref_mut() {
+            if changed||t.pending_live_copy.is_some() {
+                deferred.insert(t.id.clone());
+                if t.pending_live_copy.is_none() {if let Err(error)=thread::copy_delivery::ready(t){errors.push(error);continue;}}
+                errors.extend(queue.offer(ctx,project,t,Some(&target)).err());
+            }else {queue.clear(project,&t.id);}
             continue;
-        };
+        }
+        if !changed {continue;}
         if let Err(error) = thread::copy_delivery::ready(t) { errors.push(error); continue; }
         let copied = thread::copy_home_remote(project, t, true, ctx.runner, &target);
         errors.extend(thread::copy_delivery::record(project, t, &copied).map_err(|e|e.context(format!("{}: copy receipt", t.id))).err());
@@ -660,6 +697,8 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     let now = jiff::Timestamp::now();
     let mut may_start = true;
     let mut transitions = seen.transitions.clone();
+    let mut deferred=std::collections::BTreeSet::new();
+    let mut observed=std::collections::BTreeSet::new();
 
     if let Some(record) = project.coordinator().filter(|c| c.prime_pending) {
         let pane_alive = seen.panes.iter().any(|p| coordinator::pane_matches(&record, p));
@@ -681,7 +720,18 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     // Local threads: copy home when the report changed, then launches.
     let local = open_threads(project, false);
     for t in local.iter().filter(|t| t.status == thread::Status::Open) {
-        let hash=match thread::try_local_report_hash(t){Ok(hash)=>hash,Err(error)=>{errors.push(error.context(format!("{}: report source",t.id)));continue;}};
+        if t.pending_live_copy.is_some()&&let Some(queue)=memory.copy_jobs.as_mut() {
+            deferred.insert(t.id.clone());errors.extend(queue.offer(ctx,project,t,None).err());continue;
+        }
+        let hash=match thread::try_local_report_hash(t){Ok(hash)=>hash,Err(error)=>{deferred.insert(t.id.clone());errors.push(error.context(format!("{}: report source",t.id)));continue;}};
+        if let Some(queue)=memory.copy_jobs.as_mut() {
+            if hash.as_ref().is_some_and(|hash|hash!=&t.report_hash) {
+                deferred.insert(t.id.clone());
+                if let Err(error)=thread::copy_delivery::ready(t){errors.push(error);continue;}
+                errors.extend(queue.offer(ctx,project,t,None).err());
+            }else {queue.clear(project,&t.id);}
+            continue;
+        }
         if let Some(hash) = hash
             && hash != t.report_hash
         {
@@ -709,11 +759,11 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
         let outcome=if let Some(reads)=memory.remote_reads.as_mut() {
             match reads.poll(&key,&ctx.env.herdr_bin(),&ctx.config_dir.join("config.toml"),&threads) {
                 Ok(crate::remote_polling::Poll::Pending)=>continue,
-                Ok(crate::remote_polling::Poll::Ready(Ok(observation)))=>apply_remote(ctx,project,&herdr,&machine,&threads,observation,true,&mut may_start,&mut errors),
+                Ok(crate::remote_polling::Poll::Ready(Ok(observation)))=>apply_remote(ctx,project,&herdr,&machine,&threads,observation,true,&mut may_start,&mut errors,memory.copy_jobs.as_mut(),&mut deferred,&mut observed),
                 Ok(crate::remote_polling::Poll::Ready(Err(error)))=>Err(format!("{error:#}")),
                 Err(error)=>{memory.machines.remove(&key);errors.push(error.context("remote observation admission"));continue;},
             }
-        }else{remote_pass(ctx, project, &herdr, &machine, &threads, &mut may_start, &mut errors)};
+        }else{remote_pass(ctx, project, &herdr, &machine, &threads, &mut may_start, &mut errors,memory.copy_jobs.as_mut(),&mut deferred,&mut observed)};
         let outage_error = outcome.as_ref().err().map(String::as_str);
         memory.record_machine(&key, outage_error);
         errors.extend(steps::write_machine_outage(project, &mut state, &key, outage_error, now, memory.outage_secs).err());
@@ -724,7 +774,9 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     }
 
     errors.extend(thread::copy_delivery::deliver(project).err());
-    errors.extend(steps::write_thread_items(project, &mut state, &transitions, seen.session_lost).err());
+    errors.extend(steps::write_thread_items_ready(project, &mut state, &transitions, seen.session_lost,|t| {
+        memory.copy_jobs.as_ref().is_none_or(|q|!deferred.contains(&t.id)&&!q.outstanding(project,&t.id)&&(!t.is_remote()||observed.contains(&t.id)))
+    }).err());
     errors.extend(steps::pull_requests(ctx, project, &mut state, memory, now));
     let zoned = jiff::Zoned::now();
     match project.read_project_md() {
@@ -745,6 +797,9 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     }
     errors
 }
+
+#[cfg(test)]
+mod copy_admission;
 
 #[cfg(test)]
 mod tests {

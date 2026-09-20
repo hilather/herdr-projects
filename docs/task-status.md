@@ -1,6 +1,6 @@
 # Task status against the 41-card implementation plan
 
-Updated 2026-09-19. Counts describe implementation progress, not release acceptance.
+Updated 2026-09-20. Counts describe implementation progress, not release acceptance.
 Local tests do not replace the plan's independent review, macOS or live-system gates.
 
 **16 cards have local implementations; T04.1–T04.5 are partial and 20 have not started.** W03 has a bounded
@@ -56,7 +56,10 @@ effects still need isolation. Live transfers now have bounded private staging,
 recoverable guarded publication, cancellation/deadline checks through receipt commit,
 and pre-transport spool reservation. The supervised copy worker now rechecks
 execution/configuration/routing, requires successful native transport, and resumes
-retained stages without fetching. Shared routine/copy admission fairness is next. T04.3 now fences legacy
+retained stages without fetching. Production Linux copy admission now shares
+routine fairness after full project passes, with bounded overflow rotation and
+review notices deferred until copies finish. Local source hashing and remaining
+slow effects still need isolation. T04.3 now fences legacy
 launch arguments by explicit agent kind and provides redacted [named profile inspection](profiles.md);
 explicit local version probes for Claude/Codex are available. Launch selection,
 production profile resolution and verified capability evidence remain. Version-2

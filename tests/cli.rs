@@ -588,3 +588,43 @@ fn cancellation_cli_audits_request_without_releasing_an_unproven_worker() {
     let project=root.join("demo");let plan=migration::inspect(&project).unwrap();migration::apply(&project,&plan,true).unwrap();let head=runtime::snapshot(&project).unwrap().head;runtime::add_task(&project,TaskId::new("a").unwrap(),"task".into(),head).unwrap();let head=runtime::snapshot(&project).unwrap().head;let mut db=migration::open_active(&project).unwrap();db.commit(Commit{expected_head:head,mutations:vec![Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("adopted").unwrap(),task:TaskId::new("a").unwrap(),revision:1,state:AttemptState::Lost,snapshot:None,reservation:"fixture".into(),termination_observed:false}}]}).unwrap();drop(db);
     let before=runtime::snapshot(&project).unwrap();let args=["--root",root_arg,"task","demo","cancel-attempt","adopted","--expected-revision","1","--expected-head",&before.head.to_string(),"--reason","operator stop request"];let output=hp(home.path(),&args);assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));let result:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();assert_eq!(result["released"],false);let after=runtime::snapshot(&project).unwrap();assert!(after.attempts[0].retains_capacity());assert_eq!(after.cancellations.len(),1);assert!(!hp(home.path(),&args).status.success());assert_eq!(runtime::snapshot(&project).unwrap(),after);
 }
+
+#[cfg(target_os="linux")]
+#[test]
+fn ticker_native_copy_publishes_announces_and_does_not_recopy_after_restart() {
+    use std::{fs,time::{Duration,Instant},process::Stdio,os::unix::fs::PermissionsExt};
+    use sha2::{Digest,Sha256};
+    let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
+    assert!(hp(home.path(),&["--root",r,"new","demo"]).status.success());let project=root.join("demo");
+    let source=home.path().join("source '$λ");fs::create_dir_all(source.join("library/empty")).unwrap();
+    fs::write(source.join("report.md"),b"new report\0\xff").unwrap();fs::write(source.join("library/item"),b"binary\0\xff").unwrap();
+    let hash=format!("{:x}",Sha256::digest(b"new report\0\xff"));
+    let socket=home.path().join("session.sock");fs::write(&socket,b"").unwrap();
+    fs::write(project.join(".state/coordinator.json"),serde_json::to_vec(&serde_json::json!({"socket":socket,"workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p1","agent_name":"coordinator","cwd":project})).unwrap()).unwrap();
+    let record=project.join("threads/t-0001.toml");
+    fs::write(&record,toml::to_string(&serde_json::json!({"id":"t-0001","status":"open","kind":"adopted","thread_dir":source,"cwd":source,"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1","agent":"claude","agent_name":"worker","title":"Fixture","created":jiff::Timestamp::now().to_string()})).unwrap()).unwrap();
+    fs::write(home.path().join("agents.json"),serde_json::to_vec(&serde_json::json!({"result":{"agents":[{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1","cwd":source,"name":"worker","agent":"claude","agent_status":"idle"}]}})).unwrap()).unwrap();
+    fs::write(home.path().join("panes.json"),serde_json::to_vec(&serde_json::json!({"result":{"panes":[{"workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p1","cwd":project},{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1","cwd":source}]}})).unwrap()).unwrap();
+    let fake=home.path().join("herdr");fs::write(&fake,b"#!/bin/sh\ncase \"$1 $2\" in\n'agent list') /bin/cat \"$HOME/agents.json\";;\n'pane list') echo poll >> \"$HOME/polls\"; /bin/cat \"$HOME/panes.json\";;\n*) echo '{\"result\":{\"shown\":true}}';;\nesac\n").unwrap();fs::set_permissions(&fake,fs::Permissions::from_mode(0o700)).unwrap();
+    struct Child(std::process::Child);
+    impl Drop for Child {fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+    let spawn=||Child(Command::new(BIN).env_clear().env("HOME",home.path()).env("PATH","/usr/bin:/bin").env("HERDR_BIN_PATH",&fake).args(["--root",r,"ticker","run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let read=||->toml::Value {toml::from_str(&fs::read_to_string(&record).unwrap()).unwrap()};
+    let wait=|child:&mut Child,predicate:&dyn Fn()->bool| {
+        let deadline=Instant::now()+Duration::from_secs(10);
+        while !predicate(){assert!(child.0.try_wait().unwrap().is_none(),"ticker exited");assert!(Instant::now()<deadline,"ticker log: {}",fs::read_to_string(root.join(".ticker.log")).unwrap_or_default());std::thread::sleep(Duration::from_millis(10));}
+    };
+    let stop=|child:&mut Child| {
+        fs::write(root.join(".ticker.stop"),b"").unwrap();let deadline=Instant::now()+Duration::from_secs(5);
+        loop {if let Some(status)=child.0.try_wait().unwrap(){assert!(status.success());break;}assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(10));}
+        fs::remove_file(root.join(".ticker.stop")).unwrap();
+    };
+    let mut child=spawn();wait(&mut child,&||read().get("copy_receipt").is_some());stop(&mut child);
+    assert_eq!(read()["report_hash"].as_str(),Some(hash.as_str()));assert_eq!(read()["copy_receipt"]["sequence"].as_integer(),Some(1));
+    assert_eq!(fs::read(project.join("threads/t-0001.md")).unwrap(),b"new report\0\xff");let item=project.join("library/t-0001/item");assert_eq!(fs::read(&item).unwrap(),b"binary\0\xff");assert!(project.join("library/t-0001/empty").is_dir());
+    let mut child=spawn();wait(&mut child,&||read().get("last_review_item_hash").and_then(|v|v.as_str())==Some(hash.as_str()));stop(&mut child);
+    let notices=fs::read_dir(project.join("inbox")).unwrap().filter_map(|e|e.ok()).filter(|e|e.file_name().to_string_lossy().starts_with("review-")).count();assert_eq!(notices,1);
+    fs::write(&item,b"retained after unchanged report").unwrap();let polls=fs::read(home.path().join("polls")).unwrap().len();
+    let mut child=spawn();wait(&mut child,&||fs::read(home.path().join("polls")).unwrap().len()>polls);stop(&mut child);
+    assert_eq!(read()["copy_receipt"]["sequence"].as_integer(),Some(1));assert_eq!(read()["live_copy_sequence"].as_integer(),Some(1));assert_eq!(fs::read(item).unwrap(),b"retained after unchanged report");
+}
