@@ -38,6 +38,7 @@ impl SqliteStore {
             super::reservations::read_inputs(&tx)?;
             tx.execute_batch(include_str!("../../migrations/0012_effective_profiles.sql"))?;
         }
+        if version<=12 {tx.execute_batch(include_str!("../../migrations/0013_scoped_approvals.sql"))?;}
         tx.commit()?;
         Ok(())
     }

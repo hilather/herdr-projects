@@ -778,3 +778,34 @@ Logs: `/tmp/herdr-approval-{lib,release,golden-debug,golden-release}.log`.
 Trusted issuance, durable grant storage/revocation and atomic one-time consumption
 with operation claims remain required. Canonical dispatch remains disabled. T04.5 is
 now partial: 16 cards implemented, four partial, 21 not started (25 unfinished).
+
+## W04 durable scoped approvals (schema 13)
+
+Immutable grant, revocation and consumption records now support exact-action launch
+claims. Grant installation accepts only a sealed internal capability; trusted
+production issuance is still unavailable. Consumption and claim updates commit
+atomically. Expired, revoked, missing, corrupt or already-used grants refuse; a
+confirmed no-effect retry cannot silently reuse its consumed grant. Pre-effect
+validation checks the same consumption and current control/config/policy/binding.
+Snapshots and runtime projections expose validated grant/use/revocation history.
+
+Independent review found that attempt-only mutations could invalidate capacity
+without changing the task revision. Claim and pre-effect checks now require the exact
+Running task's active Reserved attempt at its original revision, retained capacity,
+expected reservation identity and no conflicting worker ownership. Regression tests
+mutate attempts through supported Commit before and after claim. Other fixtures cover
+rollback after failed claim writes, reopen, revocation, expiry and damaged grants.
+Schema-12 pending/claimed launches upgrade without invented authority or released
+capacity, preserving existing input/delivery/event records and remaining blocked.
+
+Trusted control-route issuance, policy-change ingress, denial auditing and authority
+coverage beyond launches remain T04.5 work. Canonical dispatch remains disabled; no
+user store was upgraded. Overall counts remain 16 implemented, four partial and
+21 not started. macOS remains unavailable.
+
+Final independent review approved the fixes and nine focused approval regressions.
+All 412 tests pass in debug and release (105 library, 277 binary, 28 CLI, 2 contracts).
+A separately calculated fixed grant digest also passes its focused regression.
+Logs: `/tmp/herdr-grants-{lib,debug,release,golden}.log`. Three optional live checks
+remain ignored. Historical-schema test fixtures now remove approval tables when
+emulating an older store; production upgrades do not remove or rewrite authority.

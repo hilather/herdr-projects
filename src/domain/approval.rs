@@ -31,6 +31,28 @@ pub struct ApprovalGrant {
     pub expires_unix_ms: i64,
 }
 
+/// Trusted ingress capability, not deserializable and not constructible by callers.
+/// Production issuance remains unavailable until control-route authentication exists.
+#[derive(Debug, Clone)]
+pub struct PreparedApproval { pub(crate) grant: ApprovalGrant }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalUse {
+    pub operation: super::OperationId,
+    pub claim_revision: u64,
+    pub claim_epoch: u64,
+    pub consumed_unix_ms: i64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRevocation { pub revoked_unix_ms: i64, pub reason: String }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRecord {
+    pub grant: ApprovalGrant,
+    pub reference: VersionedReference,
+    pub revoked: Option<ApprovalRevocation>,
+    pub consumed: Option<ApprovalUse>,
+}
+
 fn hash(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
@@ -148,6 +170,7 @@ mod tests {
         let original = ApprovalScope::for_launch(&inputs).unwrap();
         assert_eq!(original.action_digest, "51e0e442c8e2930fc699289ba82aa7832f3610e75b892d02e8ad42d42c64888f");
         let grant = grant(&mut inputs);
+        assert_eq!(grant.reference().unwrap().digest, "003b41ced67b6aaf84d11fcc47f18e9f62132b081d9c3037aeb90acaee2d9967");
         assert_eq!(original, ApprovalScope::for_launch(&inputs).unwrap());
         grant.matches_launch(&inputs, &inputs.project_store, 100).unwrap();
         inputs.approval.digest = "e".repeat(64);

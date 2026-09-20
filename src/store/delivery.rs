@@ -55,6 +55,8 @@ impl SqliteStore {
         if format!("{:x}",Sha256::digest(payload.as_bytes()))!=hash {return Err(StoreError::Corrupt("operation payload hash mismatch".into()));}
         if expected_revision!=actual_revision {return Err(StoreError::Conflict);}
         let revision=increment(old.revision)?;let epoch=increment(old.epoch)?;let until=now+lease_ms;
+        let kind:String=tx.query_row("SELECT kind FROM operations WHERE id=?1",[id.as_str()],|r|r.get(0))?;
+        if kind=="runtime.launch" {super::approvals::consume(&tx,id,revision,epoch,now)?;}
         tx.execute("UPDATE operation_delivery SET revision=?2,state='claimed',epoch=?3,attempts=attempts+1,owner=?4,lease_until_ms=?5 WHERE operation_id=?1",params![id.as_str(),integer(revision)?,integer(epoch)?,owner,until])?;
         log(&tx,id,revision,"operation.claimed",serde_json::json!({"owner":owner,"epoch":epoch,"lease_until_ms":until}))?;
         tx.commit()?;Ok(Claim{operation:id.clone(),revision,owner:owner.into(),epoch,lease_until_ms:until})
@@ -69,6 +71,8 @@ impl SqliteStore {
         let (payload,hash,expected,actual):(String,String,i64,i64)=tx.query_row("SELECT o.payload,o.payload_hash,o.expected_revision,t.revision FROM operations o JOIN tasks t ON t.id=o.task_id WHERE o.id=?1",[claim.operation.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
         if format!("{:x}",Sha256::digest(payload.as_bytes()))!=hash {return Err(StoreError::Corrupt("operation payload hash mismatch".into()));}
         if expected!=actual {return Err(StoreError::Conflict);}
+        let kind:String=tx.query_row("SELECT kind FROM operations WHERE id=?1",[claim.operation.as_str()],|r|r.get(0))?;
+        if kind=="runtime.launch" {super::approvals::validate_use(&tx,claim,now)?;}
         tx.commit()?;Ok(())
     }
     /// Rechecks owner, epoch, revision and lease in the outcome transaction.

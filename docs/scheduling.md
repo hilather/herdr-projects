@@ -5,6 +5,8 @@ project capacity policy. Schema v11 adds atomic reservations behind an internal
 preparation capability and audited cancellation. Worker launches remain disabled.
 Schema v12 requires new reservations to retain validated [frozen profile evidence](profiles.md)
 in version-2 inputs, while preserving historical version-1 records byte-for-byte.
+Schema v13 adds [durable scoped approvals](authority.md) and consumes one grant with
+each launch claim; neither a reservation nor a parsed approval is permission to run.
 Use `migration PROJECT upgrade-store` for an older published store. Old exports
 remain unchanged. Fresh/updated policy starts at zero workers until explicitly set;
 legacy advisory limits are not silently promoted into execution authority.
@@ -46,7 +48,7 @@ Failed/cancelled predecessors block explicitly. Narrative succeeded state cannot
 satisfy an evidence-bound edge. Verified-result producers arrive in W07; profile,
 authority and production launch preparation remain W04 work. See the [frozen W04 interfaces](adr/0004-w04-scheduling-contract.md).
 
-## Reservations and cancellation (schema v12; v11 history retained)
+## Reservations and cancellation (schema v13; older history retained)
 
 A reservation transaction counts every unterminated attempt, checks task, binding,
 control and policy revisions, selects among sealed ready preparations using aged

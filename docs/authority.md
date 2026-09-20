@@ -1,9 +1,9 @@
 # Operation-scoped authority (partial T04.5)
 
-The initial approval contract defines inert grant records. It does not yet expose
-issuance, import or approval CLI commands, and matching a grant is not authorization.
-Trusted control ingress, durable storage, revocation and atomic claim-time consumption
-are still required. Canonical launch dispatch remains disabled.
+Schema 13 stores immutable grants, revocations and one-time uses. Grant installation
+requires a sealed internal capability; there is no issuance/import CLI or raw-JSON
+approval route. Trusted control ingress and policy resolution are still required.
+Canonical launch dispatch remains disabled.
 
 A launch approval scope binds the exact project store, task and post-reservation
 task revision, runtime target and a digest of the intended action. The action digest
@@ -24,8 +24,21 @@ and unsupported operation classes are rejected. An approval JSON document remain
 untrusted data even if structurally valid. The future ingress must authenticate its
 control route and evaluate policy; workers cannot supply their own trusted role.
 
-Grant use must be consumed exactly once in the same transaction as claiming the
-operation, after checking current policy and revocation. A no-effect retry needs an
-explicit reuse policy; a pending or ambiguous operation is not proof of unused
-approval. These are outstanding requirements, not guarantees of this initial data
-contract. The same-OS-user shell bypass remains outside application-level authority.
+Launch claims consume a grant exactly once in the claim transaction. The pre-effect
+fence rechecks the matching consumption, expiry, revocation, control/config/scheduler
+revisions, runtime binding and the exact still-reserved attempt with retained capacity.
+Revocation does not claim to stop an effect already in progress, and does not release
+capacity. An outcome may still record what happened after revocation.
+
+A no-effect retry cannot reuse the consumed grant; the operation remains blocked
+pending an explicit recovery policy. Pending or ambiguous state is not proof of
+unused approval. Other operation kinds retain their existing delivery contracts.
+Grant records and use history appear in canonical snapshots and schema-13 runtime
+projections. Corrupt/mismatched approval history refuses inspection or launch use.
+
+Upgrade from schema 12 preserves existing input, delivery and event records. It
+does not invent grants for pending or already-claimed launches: those claims and
+pre-effect checks refuse while their attempts retain capacity. No actual user store
+is upgraded automatically. The same-OS-user shell bypass remains outside
+application-level authority. Trusted issuance, policy-change ingress, denial audit
+and command-path coverage beyond launches remain outstanding T04.5 work.

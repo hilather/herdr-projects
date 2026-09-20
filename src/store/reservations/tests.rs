@@ -7,9 +7,96 @@ fn fixture()->(tempfile::TempDir,SqliteStore,Vec<PreparedLaunch>) {
     let s=db.read_snapshot(None).unwrap();db.set_scheduler_policy(s.head,1,1,3).unwrap();let s=db.read_snapshot(None).unwrap();
     let observations=s.runtime_bindings.iter().map(|b|RuntimeObservation{binding:b.id.clone(),binding_revision:b.revision,task_revision:Some(3),observed_unix_ms:1000,collector:"herdr-git-v1".into(),..RuntimeObservation::default()}).collect::<Vec<_>>();
     db.record_observations(s.head,&observations).unwrap();let s=db.read_snapshot(None).unwrap();db.set_project_state(s.head,s.control.unwrap().revision,ProjectState::Active,1000,None).unwrap();
-    let s=db.read_snapshot(None).unwrap();let prepared=s.runtime_bindings.iter().map(|b|PreparedLaunch{inputs:LaunchInputs{version:2,project_store:std::fs::canonicalize(&path).unwrap().display().to_string(),task:b.task.clone().unwrap(),task_revision:3,scheduler_revision:s.scheduler.as_ref().unwrap().policy.revision,control_epoch:s.control.as_ref().unwrap().epoch,binding:b.id.clone(),binding_revision:b.revision,binding_digest:super::super::ownership::identity_digest(b).unwrap(),profile:crate::domain::profile::fixture(crate::migration::ConfigReference{path:temp.path().join("config.toml").display().to_string(),digest:None}).reference().unwrap(),effective_profile:Some(crate::domain::profile::fixture(crate::migration::ConfigReference{path:temp.path().join("config.toml").display().to_string(),digest:None})),approval:VersionedReference{id:"fixture-approval".into(),revision:1,digest:"b".repeat(64)},config:crate::migration::ConfigReference{path:temp.path().join("config.toml").display().to_string(),digest:None},repositories:vec![],dependencies:vec![],memory:None,budget:None}}).collect();(temp,db,prepared)
+    let s=db.read_snapshot(None).unwrap();let mut prepared:Vec<PreparedLaunch>=s.runtime_bindings.iter().map(|b|PreparedLaunch{inputs:LaunchInputs{version:2,project_store:std::fs::canonicalize(&path).unwrap().display().to_string(),task:b.task.clone().unwrap(),task_revision:3,scheduler_revision:s.scheduler.as_ref().unwrap().policy.revision,control_epoch:s.control.as_ref().unwrap().epoch,binding:b.id.clone(),binding_revision:b.revision,binding_digest:super::super::ownership::identity_digest(b).unwrap(),profile:crate::domain::profile::fixture(crate::migration::ConfigReference{path:temp.path().join("config.toml").display().to_string(),digest:None}).reference().unwrap(),effective_profile:Some(crate::domain::profile::fixture(crate::migration::ConfigReference{path:temp.path().join("config.toml").display().to_string(),digest:None})),approval:VersionedReference{id:"fixture-approval".into(),revision:1,digest:"b".repeat(64)},config:crate::migration::ConfigReference{path:temp.path().join("config.toml").display().to_string(),digest:None},repositories:vec![],dependencies:vec![],memory:None,budget:None}}).collect();
+    for p in &mut prepared {
+        let grant=ApprovalGrant{version:1,scope:ApprovalScope::for_launch(&p.inputs).unwrap(),policy:p.inputs.effective_profile.as_ref().unwrap().permission_policy.clone(),issued_unix_ms:0,expires_unix_ms:100_000};
+        let head=db.read_snapshot(None).unwrap().head;p.inputs.approval=db.install_approval(&PreparedApproval{grant},head,1000).unwrap();
+    }
+    (temp,db,prepared)
 }
 fn reserve(db:&mut SqliteStore,p:&[PreparedLaunch])->Reservation {let h=db.read_snapshot(None).unwrap().head;db.reserve_prepared(p,h,1000).unwrap()}
+#[test]
+fn changed_attempt_state_refuses_claim_and_pre_effect_without_consuming_new_authority() {
+    for claimed in [false,true] { for terminated in [false,true] {
+        let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);
+        let claim=claimed.then(||db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap());
+        let snapshot=db.read_snapshot(None).unwrap();let mut attempt=snapshot.attempts[0].clone();
+        attempt.revision+=1;attempt.state=if terminated {AttemptState::Cancelled}else{AttemptState::Lost};attempt.termination_observed=terminated;
+        db.commit(Commit{expected_head:snapshot.head,mutations:vec![Mutation::Attempt{expected:Some(1),next:attempt}]}).unwrap();
+        let before=db.read_snapshot(None).unwrap();
+        if let Some(claim)=claim {assert!(db.validate_claim(&claim,1001).is_err());}
+        else {assert!(db.claim_operation(&r.record.operation,1,"worker",1001,1000).is_err());}
+        assert_eq!(db.read_snapshot(None).unwrap(),before);
+        let uses:u64=db.connection.query_row("SELECT count(*) FROM approval_uses",[],|r|r.get(0)).unwrap();assert_eq!(uses,u64::from(claimed));
+    }}
+}
+
+#[test]
+fn schema12_launches_upgrade_without_fabricating_grants_or_releasing_capacity() {
+    for claimed in [false,true] {
+        let(temp,mut db,p)=fixture();let r=reserve(&mut db,&p);
+        let claim=claimed.then(||db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap());
+        db.connection.execute_batch("DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; UPDATE store_meta SET schema_version=12; PRAGMA user_version=12;").unwrap();
+        let before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();let after=db.read_snapshot(None).unwrap();
+        assert_eq!(after.head,before.head);assert_eq!(after.events,before.events);assert_eq!(after.attempt_inputs,before.attempt_inputs);assert_eq!(after.deliveries,before.deliveries);assert!(after.approvals.is_empty());
+        drop(db);let mut db=SqliteStore::open(&temp.path().join("state.db")).unwrap();
+        if let Some(claim)=claim {assert!(db.validate_claim(&claim,1001).is_err());}
+        else {assert!(db.claim_operation(&r.record.operation,1,"worker",1001,1000).is_err());}
+        assert!(db.read_snapshot(None).unwrap().attempts[0].retains_capacity());
+    }
+}
+#[test]
+fn launch_approval_use_survives_restart_and_cannot_be_reused_after_no_effect_retry() {
+    let(temp,mut db,p)=fixture();let r=reserve(&mut db,&p);
+    let claim=db.claim_operation(&r.record.operation,1,"worker",1000,10_000).unwrap();
+    db.validate_claim(&claim,1001).unwrap();drop(db);
+    let mut db=SqliteStore::open(&temp.path().join("state.db")).unwrap();db.validate_claim(&claim,1002).unwrap();
+    db.finish_operation(&claim,Outcome::Retryable{no_effect_evidence:"fixture proves no effect".into()},1003).unwrap();
+    let before=db.read_snapshot(None).unwrap();let revision=db.deliveries().unwrap()[0].revision;
+    assert!(db.claim_operation(&r.record.operation,revision,"worker",3000,1000).is_err());
+    assert_eq!(db.read_snapshot(None).unwrap(),before);
+    assert_eq!(db.connection.query_row("SELECT count(*) FROM approval_uses",[],|r|r.get::<_,u64>(0)).unwrap(),1);
+    assert!(db.connection.execute("DELETE FROM approval_uses",[]).is_err());
+}
+
+#[test]
+fn approval_consumption_rolls_back_if_claim_write_fails() {
+    let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);let before=db.read_snapshot(None).unwrap();
+    db.connection.execute_batch("CREATE TRIGGER fail_claim BEFORE UPDATE ON operation_delivery BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+    assert!(db.claim_operation(&r.record.operation,1,"worker",1000,1000).is_err());
+    assert_eq!(db.read_snapshot(None).unwrap(),before);
+    assert_eq!(db.connection.query_row("SELECT count(*) FROM approval_uses",[],|r|r.get::<_,u64>(0)).unwrap(),0);
+    db.connection.execute_batch("DROP TRIGGER fail_claim;").unwrap();
+    db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap();
+}
+
+#[test]
+fn revoked_or_expired_approval_never_authorizes_launch_or_releases_capacity() {
+    for already_claimed in [false,true] {
+        let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);
+        let claim=already_claimed.then(||db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap());
+        let h=db.read_snapshot(None).unwrap().head;db.revoke_approval(&p[0].inputs.approval.id,h,1001,"operator withdrew permission").unwrap();
+        if let Some(claim)=claim {assert!(db.validate_claim(&claim,1002).is_err());}
+        else {assert!(db.claim_operation(&r.record.operation,1,"worker",1002,1000).is_err());}
+        assert!(db.read_snapshot(None).unwrap().attempts[0].retains_capacity());
+        assert!(db.connection.execute("DELETE FROM approval_revocations",[]).is_err());
+    }
+    let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);let before=db.read_snapshot(None).unwrap();
+    assert!(db.claim_operation(&r.record.operation,1,"worker",100_000,1000).is_err());assert_eq!(db.read_snapshot(None).unwrap(),before);
+}
+
+#[test]
+fn missing_or_corrupt_approval_blocks_claim_without_consuming_it() {
+    for corrupt in [false,true] {
+        let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);
+        db.connection.execute_batch("DROP TRIGGER approval_grants_no_delete; DROP TRIGGER approval_grants_no_update;").unwrap();
+        if corrupt {db.connection.execute("UPDATE approval_grants SET payload='{}' WHERE id=?1",[&p[0].inputs.approval.id]).unwrap();}
+        else {db.connection.execute("DELETE FROM approval_grants WHERE id=?1",[&p[0].inputs.approval.id]).unwrap();}
+        assert!(db.claim_operation(&r.record.operation,1,"worker",1000,1000).is_err());
+        assert_eq!(db.deliveries().unwrap()[0].state,DeliveryState::Pending);
+        assert_eq!(db.connection.query_row("SELECT count(*) FROM approval_uses",[],|r|r.get::<_,u64>(0)).unwrap(),0);
+    }
+}
 #[test]
 fn incomplete_or_changed_profile_evidence_cannot_reserve_capacity() {
     let(_temp,mut db,p)=fixture();let before=db.read_snapshot(None).unwrap();
@@ -39,7 +126,7 @@ fn version_one_input_serialization_preserves_historical_identity() {
 #[test]
 fn schema11_upgrade_retains_records_and_blocks_old_format_insertions() {
     let(temp,mut db,p)=fixture();
-    db.connection.execute_batch("DROP TRIGGER attempt_inputs_effective_profile; UPDATE store_meta SET schema_version=11; PRAGMA user_version=11;").unwrap();
+    db.connection.execute_batch("DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER attempt_inputs_effective_profile; UPDATE store_meta SET schema_version=11; PRAGMA user_version=11;").unwrap();
     // Reproduce a schema-11/v1 historical reservation, before v2's producer existed.
     let old_json=include_str!("../../../tests/fixtures/launch-inputs-v1.json").trim().replace(&"a".repeat(64),&p[0].inputs.binding_digest);
     let inputs:LaunchInputs=serde_json::from_str(&old_json).unwrap();
@@ -59,7 +146,7 @@ fn schema11_upgrade_retains_records_and_blocks_old_format_insertions() {
     let before=db.read_snapshot(None).unwrap();
     assert!(matches!(db.reserve_prepared(&p,before.head,1000),Err(StoreError::UnsupportedSchema(11))));
     db.upgrade_v1().unwrap();let after=db.read_snapshot(None).unwrap();
-    assert_eq!(after.schema_version,12);assert_eq!(after.attempt_inputs,before.attempt_inputs);assert_eq!(after.events,before.events);
+    assert_eq!(after.schema_version,13);assert_eq!(after.attempt_inputs,before.attempt_inputs);assert_eq!(after.events,before.events);
     assert_eq!(after.head,before.head);
     assert!(db.connection.execute("INSERT INTO attempt_inputs VALUES('old','old','{\"inputs\":{\"version\":1}}',?1)",params!["a".repeat(64)]).is_err());
     assert_eq!(after.attempt_inputs[0],record);
@@ -98,7 +185,7 @@ fn claim_and_cancellation_race_never_releases_a_claimed_worker() {
 }
 #[test]
 fn orphan_launches_refuse_reads_and_upgrade_rolls_back() {
-    let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);db.connection.execute_batch("DROP TRIGGER attempt_inputs_no_delete; DELETE FROM attempt_inputs;").unwrap();assert!(db.read_snapshot(None).is_err());db.connection.execute_batch("DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_inputs; DROP TABLE attempt_cancellations; UPDATE store_meta SET schema_version=10; PRAGMA user_version=10;").unwrap();assert!(db.upgrade_v1().is_err());let version:u32=db.connection.query_row("PRAGMA user_version",[],|r|r.get(0)).unwrap();assert_eq!(version,10);assert_eq!(db.read_snapshot(None).unwrap().operations[0].id,r.record.operation);
+    let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);db.connection.execute_batch("DROP TRIGGER attempt_inputs_no_delete; DELETE FROM attempt_inputs;").unwrap();assert!(db.read_snapshot(None).is_err());db.connection.execute_batch("DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_inputs; DROP TABLE attempt_cancellations; UPDATE store_meta SET schema_version=10; PRAGMA user_version=10;").unwrap();assert!(db.upgrade_v1().is_err());let version:u32=db.connection.query_row("PRAGMA user_version",[],|r|r.get(0)).unwrap();assert_eq!(version,10);assert_eq!(db.read_snapshot(None).unwrap().operations[0].id,r.record.operation);
 }
 #[test]
 fn cancellation_without_launch_proof_retains_the_attempt() {
@@ -106,7 +193,7 @@ fn cancellation_without_launch_proof_retains_the_attempt() {
 }
 #[test]
 fn schema10_upgrade_preserves_nonzero_claim_history() {
-    let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap();db.connection.execute_batch("DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_inputs; DROP TABLE attempt_cancellations; UPDATE operations SET kind='fixture'; UPDATE store_meta SET schema_version=10; PRAGMA user_version=10;").unwrap();let before=db.deliveries().unwrap();db.upgrade_v1().unwrap();assert_eq!(db.deliveries().unwrap(),before);assert!(db.read_snapshot(None).unwrap().attempt_inputs.is_empty());assert!(db.connection.execute("UPDATE operation_delivery SET attempts=0",[]).is_err());
+    let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap();db.connection.execute_batch("DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_inputs; DROP TABLE attempt_cancellations; UPDATE operations SET kind='fixture'; UPDATE store_meta SET schema_version=10; PRAGMA user_version=10;").unwrap();let before=db.deliveries().unwrap();db.upgrade_v1().unwrap();assert_eq!(db.deliveries().unwrap(),before);assert!(db.read_snapshot(None).unwrap().attempt_inputs.is_empty());assert!(db.connection.execute("UPDATE operation_delivery SET attempts=0",[]).is_err());
 }
 #[test]
 fn missing_parent_is_not_hidden_from_an_open_store() {

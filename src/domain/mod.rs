@@ -96,6 +96,7 @@ pub struct Snapshot {
     pub control:Option<ProjectControl>,
     pub scheduler:Option<SchedulerSnapshot>,
     pub attempt_inputs:Vec<AttemptInputRecord>,
+    pub approvals:Vec<ApprovalRecord>,
     pub cancellations:Vec<CancellationRequest>,
     pub events: Vec<Event>,
 }

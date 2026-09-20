@@ -25,6 +25,7 @@ pub fn export(project:&Path,db:&mut SqliteStore)->Result<PathBuf> {
     if snapshot.schema_version>=9 {runtime["ownership"]=serde_json::to_value(&snapshot.ownership)?;}
     if snapshot.schema_version>=10 {runtime["scheduler"]=serde_json::to_value(&snapshot.scheduler)?;}
     if snapshot.schema_version>=11 {runtime["attempt_inputs"]=serde_json::to_value(&snapshot.attempt_inputs)?;runtime["cancellations"]=serde_json::to_value(&snapshot.cancellations)?;}
+    if snapshot.schema_version>=13 {runtime["approvals"]=serde_json::to_value(&snapshot.approvals)?;}
     let operations=serde_json::json!({"owner":"sqlite-v2","event_head":snapshot.head,"intents":snapshot.operations,"deliveries":snapshot.deliveries});
     let inbox=serde_json::json!({"owner":"sqlite-v2","event_head":snapshot.head,"items":snapshot.inbox});
     for (name,bytes) in [("TASKS.md",text.into_bytes()),("runtime.json",serde_json::to_vec_pretty(&runtime)?),("operations.json",serde_json::to_vec_pretty(&operations)?),("inbox.json",serde_json::to_vec_pretty(&inbox)?)] {

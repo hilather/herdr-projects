@@ -45,7 +45,7 @@ file-backed; no projects have been migrated. See the bounded W03 handoff; platfo
 
 ## Next work
 
-W04 T04.1 now has a [schema-v12 scheduling foundation](scheduling.md): DAG
+W04 T04.1 now has a [schema-v13 scheduling foundation](scheduling.md): DAG
 validation, aged priority, retained-attempt capacity reporting and fenced CLI edits.
 Atomic reservations and immutable inputs now have a sealed internal API, and cancellation
 has an audited CLI. Production launch preparation/dispatch and termination remain
@@ -60,8 +60,8 @@ version-1 records remain readable. Async routine commands first need durable
 occurrence and authority contracts, so that path remains synchronous. Next are bounded command execution, kind-bound worker profiles
 (T04.3), budgets/routines/telemetry (T04.4) and operation-scoped authority (T04.5).
 T04.5 now has an [approval scope contract](authority.md) binding exact launch inputs
-without circular hashes; trusted issuance, persistence, revocation and claim-time
-consumption remain unimplemented.
+without circular hashes, durable grants/revocations and atomic one-time launch-claim
+consumption. Trusted issuance, policy ingress and other command-path coverage remain.
 The [scheduler/executor/profile interfaces](adr/0004-w04-scheduling-contract.md) are frozen. Existing retained/adopted attempts
 must count toward the cap; no uncertain worker may be replaced to free a slot.
 
