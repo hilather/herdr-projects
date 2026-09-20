@@ -1063,3 +1063,28 @@ Automatic routine dispatch still awaits separation of legacy observational statu
 from prompt/token-metadata effects. Project ownership alone does not authorize
 concurrent effects on aliased terminals. Counts remain 16 implemented, five partial
 and 20 not started; macOS remains unavailable.
+
+## W04 legacy observation under project ownership
+
+When the exclusive root barrier is occupied by another project, the cheap legacy
+pass can acquire shared root/project ownership and update local observations. It
+sends no prompts, writes no terminal metadata, and makes no fresh report-copy claims.
+Whole-session loss remains separately deduplicated by the exclusive slow pass.
+
+Status changes and rendered notices commit atomically in the thread record with a
+monotonic sequence and execution fingerprint. Inbox replay uses the stored identity
+and content, including already-handled items; clearing the intent is conditional.
+A replacement execution retains its own status while the historical notice drains.
+Pending ticker events, retries and copy receipts remain untouched. Migration converts
+these notices to legacy inbox obligations even without a ticker state file, and
+refuses inconsistent identities/sequences.
+
+Fixtures exercise blocked inbox delivery, crash after delivery, execution replacement,
+unchanged copied-report markers, retained retry state, same-project/root exclusion,
+and migration preservation. Automatic queue admission remains the next step.
+Counts remain 16 implemented, five partial and 20 not started; macOS is unavailable.
+
+Independent review approved this increment. All 458 tests pass in debug and release
+(156 library, 270 binary, 30 CLI, two contracts), and the default-feature suite passes.
+Three optional live checks remain ignored. Logs:
+`/tmp/herdr-status-observation-{debug,release,default}.log`.

@@ -139,6 +139,10 @@ The original absolute deadline reaches the concrete runner without being restart
 at adapter entry. Running cancellation retains an uncertain cleanup receipt; a lost
 receipt remains claimed and cannot be replayed after executor restart. Pool output
 does not grant cleanup authority: the trusted service commits its own sealed result.
-Project ownership now permits unrelated canonical status updates. Legacy ticker passes
-still combine observations with terminal effects under the exclusive root barrier;
-those paths must be separated before automatic dispatch is enabled.
+Project ownership permits unrelated canonical status updates. Legacy cheap passes
+now fall back to project-local observation when another project holds shared root
+ownership. This fallback sends no prompts or terminal metadata and uses only existing
+copy receipts. Transition notices are committed with the observed group and replayed
+idempotently, including after execution replacement; migration preserves pending
+notices. Session-wide loss and terminal effects remain in the exclusive pass.
+Automatic queue admission is the next integration step.

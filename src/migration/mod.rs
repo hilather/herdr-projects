@@ -160,9 +160,9 @@ pub fn inspect(project: &Path) -> Result<Plan> {
         if source.kind!="backup" && analyze(&project,source,&mut tasks,&mut blockers,&mut warnings,&mut ids).is_err() { blockers.push(format!("{}: invalid or unsupported record; repair before migration",source.path)); }
     }
     if tasks.len()>10_000 { blockers.push("more than 10,000 imported tasks".into()); }
-    let operations=match obligations::convert(&project,&mut tasks) {
+    let operations=match obligations::convert(&project,&sources,&mut tasks) {
         Ok(operations)=>operations,
-        Err(_)=>{blockers.push(".state/ticker.json: invalid delivery obligations; repair before migration".into());Vec::new()},
+        Err(_)=>{blockers.push("legacy records: invalid delivery obligations; repair before migration".into());Vec::new()},
     };
     let digest=hash(&serde_json::to_vec(&sources)?);
     Ok(Plan{version:1,config:None,project:project.to_str().context("non-UTF-8 project path")?.into(),digest,sources,tasks,operations,blockers,warnings})
@@ -361,7 +361,7 @@ mod tests;
 fn validate_thread(value:&toml::Value)->Result<()> {
     for field in ["id", "title", "error", "repo", "origin", "branch", "base", "machine", "worktree_path", "thread_dir", "workspace_id", "tab_id", "pane_id", "agent", "agent_name", "cwd", "created", "updated", "last_state", "last_state_change", "last_group", "report_hash", "last_report_change", "last_review_item_hash", "acked_report_hash", "pr", "pr_state", "pr_review", "resolved_reason", "suppressed_merged_pr", "last_finalization", "artifact_snapshot"] { if let Some(v)=value.get(field) { ensure!(v.is_str(),"invalid thread string field"); } }
     for field in ["prompt_pending"] { if let Some(v)=value.get(field) { ensure!(v.is_bool(),"invalid thread boolean field"); } }
-    for field in ["launch_attempts", "lifecycle_generation"] { if let Some(v)=value.get(field) { ensure!(v.as_integer().is_some_and(|n|n>=0),"invalid thread integer field"); } }
+    for field in ["launch_attempts", "lifecycle_generation", "status_notice_sequence"] { if let Some(v)=value.get(field) { ensure!(v.as_integer().is_some_and(|n|n>=0),"invalid thread integer field"); } }
     if let Some(kind)=value.get("kind") { ensure!(matches!(kind.as_str(),Some("worktree"|"tab"|"adopted")),"invalid thread kind"); }
     if value.get("removal").is_some() { anyhow::bail!("pending/historical removal requires reconciliation before migration"); }
     Ok(())

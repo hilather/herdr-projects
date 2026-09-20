@@ -24,10 +24,25 @@ fn operation(kind:&str,key:&str,task:TaskId,payload:Value,retry:&Retry)->Result<
     let _ = (&retry.last_error,retry.blocked);
     Ok(Operation{id:OperationId::new(crate::operations::legacy_id(kind,key)).map_err(anyhow::Error::msg)?,task:Some(task),kind:kind.into(),target:key.into(),payload_version:1,payload,expected_revision:1,due_unix_ms:due(retry)?,idempotency_key:format!("{kind}:{key}")})
 }
-pub(super) fn convert(project:&Path,tasks:&mut Vec<Task>)->Result<Vec<Operation>> {
-    let path=project.join(".state/ticker.json");if !exists(&path){return Ok(Vec::new());}
-    let value:Value=serde_json::from_slice(&read(&path)?)?;
+pub(super) fn convert(project:&Path,sources:&[Source],tasks:&mut Vec<Task>)->Result<Vec<Operation>> {
+    let path=project.join(".state/ticker.json");
+    let value:Value=if exists(&path) {serde_json::from_slice(&read(&path)?)?} else {serde_json::json!({})};
     let mut operations=Vec::new();
+    for source in sources.iter().filter(|s|s.kind=="thread") {
+        let bytes=read(&project.join(&source.path))?;
+        ensure!(hash(&bytes)==source.digest,"thread changed during obligation conversion");
+        let value:toml::Value=toml::from_str(std::str::from_utf8(&bytes)?)?;
+        if let Some(pending)=value.get("pending_status_notice") {
+            let notice:crate::status_notice::StatusNotice=pending.clone().try_into()?;
+            let id=value.get("id").and_then(|v|v.as_str()).context("missing status notice thread")?;
+            let sequence=value.get("status_notice_sequence").and_then(|v|v.as_integer()).context("missing status notice sequence")?;
+            ensure!(sequence>=0,"negative status notice sequence");
+            notice.validate(id,sequence as u64)?;
+            let task=TaskId::new(format!("legacy-{id}")).map_err(anyhow::Error::msg)?;
+            ensure!(tasks.iter().any(|t|t.id==task),"status notice refers to unknown thread");
+            operations.push(operation("legacy.inbox",&notice.id,task,serde_json::to_value(&notice)?,&Retry::default())?);
+        }
+    }
     if let Some(events)=value.get("pending_events") {
         for (key,value) in events.as_object().context("pending_events must be an object")? {
             let event:PendingEvent=serde_json::from_value(value.clone())?;

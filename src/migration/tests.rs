@@ -186,6 +186,23 @@ fn pending_obligations_import_atomically_as_ambiguous_without_losing_retry_state
     drop(db);assert_eq!(recover(&project,true).unwrap().phase,Phase::Active);
 }
 #[test]
+fn pending_thread_status_notice_imports_without_ticker_state_and_rejects_corruption() {
+    let (_temp,project)=fixture();let path=project.join("threads/t-0001.toml");
+    let mut value:toml::Value=toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let execution="a".repeat(64);
+    let notice=crate::status_notice::StatusNotice{id:format!("status-t-0001-{execution}-1"),kind:"thread-state".into(),subject:"t-0001".into(),summary:"historical idle".into(),body:"original execution".into(),execution,sequence:1,previous_group:"working".into(),next_group:"idle".into()};
+    value.as_table_mut().unwrap().insert("status_notice_sequence".into(),toml::Value::Integer(1));value.as_table_mut().unwrap().insert("pending_status_notice".into(),toml::Value::try_from(&notice).unwrap());
+    fs::write(&path,toml::to_string(&value).unwrap()).unwrap();
+    let plan=inspect(&project).unwrap();assert!(plan.blockers.is_empty(),"{:?}",plan.blockers);assert_eq!(plan.operations.len(),1);
+    assert_eq!(plan.operations[0].payload,serde_json::to_value(&notice).unwrap());
+    value["status_notice_sequence"]=toml::Value::Integer(2);fs::write(&path,toml::to_string(&value).unwrap()).unwrap();
+    assert!(!inspect(&project).unwrap().blockers.is_empty());
+    value["status_notice_sequence"]=toml::Value::Integer(1);fs::write(&path,toml::to_string(&value).unwrap()).unwrap();
+    apply(&project,&plan,true).unwrap();let mut db=open_active(&project).unwrap();
+    assert_eq!(db.read_snapshot(None).unwrap().operations,plan.operations);
+    assert_eq!(db.deliveries().unwrap()[0].state,crate::operations::DeliveryState::Ambiguous);
+}
+#[test]
 fn task_edits_and_projection_recovery_preserve_new_state_and_originals() {
     let (_temp,project)=fixture();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();
     let original=read(&project.join("TASKS.md")).unwrap();let before=crate::runtime::snapshot(&project).unwrap();

@@ -500,9 +500,15 @@ fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
 
 /// Returns `Ok(None)` when the project's session cannot be reached: then no
 /// state is read, so nothing is ever reported as gone.
+mod status_observation;
+
 fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
-    let _lease = crate::cleanup::lease(&ctx.root)?;
+    let lease = crate::cleanup::lease(&ctx.root);
+    let _project_guard = if lease.is_err() {
+        Some(herdr_projects::execution_guard::ProjectGuard::acquire(&project.dir())?)
+    } else {None};
     if project.try_status()? != Status::Active { return Ok(None); }
+    status_observation::deliver(project)?;
     let Some(record) = project.coordinator() else {
         return Ok(None);
     };
@@ -516,6 +522,17 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
     let Ok(panes) = herdr.pane_list() else {
         return Ok(None);
     };
+    if lease.is_err() {
+        let threads=open_threads(project,false);
+        let recorded=threads.iter().filter(|t|!t.pane_id.is_empty()).count()+usize::from(!record.pane_id.is_empty());
+        let missing=threads.iter().filter(|t|!t.pane_id.is_empty() && !thread::live_state(t,&agents,&panes,jiff::Timestamp::now()).pane_exists).count()
+            +usize::from(!record.pane_id.is_empty() && !agents.iter().any(|a|coordinator::agent_matches(&record,a)) && !panes.iter().any(|p|coordinator::pane_matches(&record,p)));
+        let session_lost=recorded>=2 && missing==recorded;
+        // Session-loss notification remains separately deduplicated by the
+        // exclusive slow pass. Avoid manufacturing per-thread idle notices.
+        if !session_lost {status_observation::observe(project,&agents,&panes)?;}
+        return Ok(Some(Seen{notification_error:None,socket:record.socket,agents,panes,transitions:Vec::new(),session_lost}));
+    }
     let slug = &project.slug;
     // Do not perform delivery or overwrite durable obligations when state is
     // unreadable. Other projects still receive their own tick.
@@ -848,6 +865,32 @@ mod tests {
 
     fn with_cwd(json: &str, fixture: &Fixture) -> String {
         json.replace("CWD", &fixture.project.dir().to_string_lossy())
+    }
+
+    #[test]
+    fn shared_root_fallback_observes_without_prompts_metadata_or_copy_receipts() {
+        let f=fixture(true);let other=project::create(&f.root,"other","",vec![]).unwrap();
+        let t=thread::allocate(&f.project,|t| {
+            t.status=thread::Status::Open;t.last_group="working".into();t.last_state="working".into();
+            t.workspace_id="w1".into();t.tab_id="w1:t1".into();t.pane_id="w1:p1".into();t.agent_name="hp-demo-coordinator".into();t.cwd=f.project.dir().to_string_lossy().into_owned();
+            t.thread_dir=f.project.dir().join("worker").to_string_lossy().into_owned();
+        }).unwrap();
+        std::fs::create_dir(&t.thread_dir).unwrap();std::fs::write(t.report_path(),"new uncollected report").unwrap();
+        let pending=thread::allocate(&f.project,|t| {t.status=thread::Status::Open;t.prompt_pending=true;t.pane_id="w1:p1".into();}).unwrap();
+        let state=br#"{"event_sequence":7,"pending_events":{"saved":{"id":"saved","kind":"test","subject":"saved","summary":"keep","body":"keep","retry":{"attempts":2,"blocked":true}}},"session_item_written":true}"#;
+        std::fs::write(f.project.dir().join(".state/ticker.json"),state).unwrap();
+        let runner=FakeRunner::new();runner.on("agent list",ok(&with_cwd(AGENT_READY,&f)));runner.on("pane list",ok(&with_cwd(PANE,&f)));
+        let ctx=Ctx{env:&f.env,root:f.root.clone(),config_dir:f.root.join("cfg"),runner:&runner,detached_ticker:false};
+        let guard=herdr_projects::execution_guard::ProjectGuard::acquire(&other.dir()).unwrap();
+        assert!(tick_cheap(&ctx,&f.project).unwrap().is_some());
+        let current=thread::load(&f.project,&t.id).unwrap();assert_eq!(current.last_state,"idle");assert_eq!(current.last_group,"idle");assert_eq!(current.status_notice_sequence,1);assert!(current.pending_status_notice.is_none());
+        assert!(current.report_hash.is_empty() && current.last_review_item_hash.is_empty());
+        assert!(thread::load(&f.project,&pending.id).unwrap().prompt_pending);assert!(f.project.coordinator().unwrap().prime_pending);
+        assert_eq!(runner.calls.borrow().len(),2);assert_eq!(std::fs::read(f.project.dir().join(".state/ticker.json")).unwrap(),state);
+        assert!(tick_cheap(&ctx,&f.project).unwrap().is_some());assert_eq!(thread::load(&f.project,&t.id).unwrap().status_notice_sequence,1);
+        // Same-project ownership and exclusive root maintenance still refuse.
+        let own=herdr_projects::execution_guard::ProjectGuard::acquire(&f.project.dir()).unwrap();assert!(tick_cheap(&ctx,&f.project).is_err());drop(own);drop(guard);
+        let root=crate::cleanup::lease(&f.root).unwrap();assert!(tick_cheap(&ctx,&f.project).is_err());drop(root);
     }
 
     #[test]

@@ -67,6 +67,8 @@ pub struct Thread {
     pub last_state: String,
     pub last_state_change: String,
     pub last_group: String,
+    pub status_notice_sequence: u64,
+    pub pending_status_notice: Option<herdr_projects::status_notice::StatusNotice>,
     pub report_hash: String,
     pub last_report_change: String,
     pub last_review_item_hash: String,
