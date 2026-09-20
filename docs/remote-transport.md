@@ -51,3 +51,32 @@ endpoints and macOS still require separate acceptance.
 
 Streaming sinks assume responsive local storage; regular-file writes and fsync
 are synchronous OS I/O and are not preempted by the subprocess deadline.
+
+## Bounded live-copy staging protocol
+
+`artifact-stream --probe` retains its existing `schema: 1` preservation capability
+and additionally advertises `live_versions: [1]`. `artifact-stream --live --path PATH`
+emits the separate `HPLV` version-1 format: eight-byte magic, a big-endian u32 JSON
+length, a manifest, then concatenated included-file bytes. The manifest is capped at
+4 MiB. Report and library each have a separate 50 MiB cap; the wire cap is 104 MiB
+plus 12 bytes. Library traversal is bounded to 10,000 entries and 64 directory levels.
+
+Live manifests distinguish included bytes from omissions. Links, hard links and
+special files are omitted. If the library exceeds byte, entry, depth, omission or
+path-representation limits, the entire library is omitted; a valid report still
+transfers. Omissions are limited to 128 paths and 16 KiB of path text, with at most
+3,000 bytes per omission path. Notes state that old home content may be retained;
+the eventual projection is additive. Permission failures, changing sources and
+read deadlines are errors, not evidence that an artifact is absent.
+
+The receiver validates schema, paths, sizes, hashes, complete payload framing and
+absence of trailing bytes. Private staging lives under `.state/live-copies`, is
+removed on failure/drop, and cannot be used as a preservation snapshot. Cooperative
+filesystem deadlines do not interrupt blocked native syscalls. Source reads retain
+the physical-path/ancestor-symlink restriction documented in operations.
+
+This protocol and receiver are prerequisites: the ticker does not yet use them.
+The upcoming transfer adapter must require successful supervised sender completion,
+revalidate execution/config/routing before publication, and commit the copy receipt
+only after successful projection. Receiving a valid stream alone grants no such
+authority. Unsupported live helpers must refuse without an unbounded transfer fallback.

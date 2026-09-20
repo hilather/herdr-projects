@@ -78,7 +78,7 @@ fn digest(mut source:File, budget:&mut crate::source_tree::Budget, copy:Option<&
     let mut target=copy.map(|p|OpenOptions::new().write(true).create_new(true).mode(0o600).open(p)).transpose()?;
     let mut bytes=0u64;let mut hash=Sha256::new();let mut buffer=[0u8;64*1024];
     loop {
-        let n=budget.read(&mut source,&mut buffer)?;if n==0{break;}
+        let n=match budget.read(&mut source,&mut buffer) {Ok(n)=>n,Err(error)=>{crate::source_tree::unchanged(&source,&before)?;return Err(error);}};if n==0{break;}
         bytes+=n as u64;hash.update(&buffer[..n]);
         if let Some(target)=&mut target{target.write_all(&buffer[..n])?;}
     }
@@ -228,6 +228,7 @@ fn load_mode(project: &Project, record: &Thread, id: &str,canonical:bool) -> Res
 mod tests;
 
 mod wire;
+pub mod live;
 pub use wire::{capture_remote, export, probe};
 
 fn artifact_directory(canonical:bool)->&'static str {if canonical {"canonical-artifacts"}else{"artifacts"}}

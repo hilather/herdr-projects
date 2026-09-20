@@ -1,11 +1,21 @@
 //! Descriptor-relative, bounded reads of worker-owned artifact sources.
 use std::{ffi::{CStr,CString,OsStr,OsString},fs::{File,OpenOptions,Metadata},io::{self,Read},os::{fd::{AsRawFd,FromRawFd,IntoRawFd},unix::{ffi::{OsStrExt,OsStringExt},fs::{OpenOptionsExt,MetadataExt}}},path::{Path,Component},time::{Duration,Instant}};
-use anyhow::{Result,Context,ensure};
+use anyhow::{Result,ensure};
 use crate::runner::Cancellation;
 
 pub const BYTE_LIMIT:u64=50*1024*1024;
 pub const ENTRY_LIMIT:usize=10_000;
 pub const DEPTH_LIMIT:usize=64;
+#[derive(Debug)]
+pub enum Limit { Bytes, Entries, Depth }
+impl std::fmt::Display for Limit {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+        f.write_str(match self {Self::Bytes=>"artifact source exceeds 50 MiB",Self::Entries=>"artifact source exceeds 10000 entries",Self::Depth=>"artifact directory nesting exceeds 64 levels"})
+    }
+}
+impl std::error::Error for Limit {}
+#[derive(Debug,PartialEq)]
+pub enum NodeKind { File, Directory, Link, Other }
 pub struct Budget {remaining:u64,entries:usize,pub deadline:Instant,pub cancellation:Cancellation}
 impl Budget {
     pub fn new()->Self {Self{remaining:BYTE_LIMIT,entries:ENTRY_LIMIT,deadline:Instant::now()+Duration::from_secs(10),cancellation:Cancellation::default()}}
@@ -14,20 +24,20 @@ impl Budget {
         ensure!(Instant::now()<self.deadline,"artifact source read deadline elapsed");Ok(())
     }
     pub fn entry(&mut self,depth:usize)->Result<()> {
-        self.check()?;ensure!(depth<=DEPTH_LIMIT,"artifact directory nesting exceeds 64 levels");
-        self.entries=self.entries.checked_sub(1).context("artifact source exceeds 10000 entries")?;Ok(())
+        self.check()?;if depth>DEPTH_LIMIT {return Err(Limit::Depth.into());}
+        self.entries=self.entries.checked_sub(1).ok_or(Limit::Entries)?;Ok(())
     }
     pub fn read(&mut self,file:&mut File,buffer:&mut [u8])->Result<usize> {
         self.check()?;
         let limit=buffer.len().min(self.remaining.saturating_add(1) as usize);
         let n=file.read(&mut buffer[..limit])?;
-        self.remaining=self.remaining.checked_sub(n as u64).context("artifact source exceeds 50 MiB")?;
+        self.remaining=self.remaining.checked_sub(n as u64).ok_or(Limit::Bytes)?;
         self.check()?;Ok(n)
     }
     pub fn size(&self,file:&File)->Result<()> {
         self.check()?;let metadata=file.metadata()?;
         ensure!(metadata.is_file()&&metadata.nlink()==1,"artifact source is not a regular file with one link");
-        ensure!(metadata.len()<=self.remaining,"artifact source exceeds 50 MiB");Ok(())
+        if metadata.len()>self.remaining {return Err(Limit::Bytes.into());}Ok(())
     }
 }
 
@@ -47,6 +57,13 @@ impl Directory {
         ensure!(before.dev()==after.dev()&&before.ino()==after.ino(),"artifact source directory identity changed");Ok(())
     }
     pub fn from_file(file:File)->Result<Self> {ensure!(file.metadata()?.is_dir(),"artifact source is not a directory");Ok(Self(file))}
+    pub fn metadata(&self)->Result<Metadata> {Ok(self.0.metadata()?)}
+    pub fn unchanged(&self,before:&Metadata)->Result<()> {
+        let after=self.0.metadata()?;
+        ensure!(before.dev()==after.dev()&&before.ino()==after.ino()&&before.nlink()==after.nlink()
+            &&before.mtime()==after.mtime()&&before.mtime_nsec()==after.mtime_nsec()
+            &&before.ctime()==after.ctime()&&before.ctime_nsec()==after.ctime_nsec(),"artifact source directory changed during scan");Ok(())
+    }
     pub fn child(&self,name:&OsStr)->Result<File> {
         ensure!(Path::new(name).components().count()==1&&matches!(Path::new(name).components().next(),Some(Component::Normal(_))),"invalid artifact path component");
         let name=CString::new(name.as_bytes())?;
@@ -55,6 +72,23 @@ impl Directory {
         // SAFETY: successful openat returned a new, exclusively owned descriptor.
         let file=unsafe{File::from_raw_fd(fd)};
         let metadata=file.metadata()?;ensure!(metadata.is_dir()||metadata.is_file(),"unsupported artifact entry type");Ok(file)
+    }
+    pub fn kind(&self,name:&OsStr)->Result<Option<NodeKind>> {
+        ensure!(Path::new(name).components().count()==1&&matches!(Path::new(name).components().next(),Some(Component::Normal(_))),"invalid artifact path component");
+        let name=CString::new(name.as_bytes())?;
+        let mut stat=std::mem::MaybeUninit::<libc::stat>::uninit();
+        // fstatat does not follow the final link and writes stat only on success.
+        if unsafe{libc::fstatat(self.0.as_raw_fd(),name.as_ptr(),stat.as_mut_ptr(),libc::AT_SYMLINK_NOFOLLOW)}<0 {
+            let error=io::Error::last_os_error();
+            return if error.kind()==io::ErrorKind::NotFound {Ok(None)} else {Err(error.into())};
+        }
+        let stat=unsafe{stat.assume_init()};
+        Ok(Some(match stat.st_mode&libc::S_IFMT {
+            libc::S_IFREG if stat.st_nlink==1=>NodeKind::File,
+            libc::S_IFDIR=>NodeKind::Directory,
+            libc::S_IFLNK=>NodeKind::Link,
+            _=>NodeKind::Other,
+        }))
     }
     pub fn optional(&self,name:&OsStr)->Result<Option<File>> {
         match self.child(name) {Ok(file)=>Ok(Some(file)),Err(e) if e.downcast_ref::<io::Error>().is_some_and(|e|e.kind()==io::ErrorKind::NotFound)=>Ok(None),Err(e)=>Err(e)}
@@ -91,7 +125,7 @@ impl Directory {
             if entry.is_null(){let code=unsafe{*errno()};if code!=0{return Err(io::Error::from_raw_os_error(code).into());}break;}
             let name=unsafe{CStr::from_ptr((*entry).d_name.as_ptr())}.to_bytes();
             if name==b"."||name==b".."{continue;}
-            ensure!(names.len()<budget.entries,"artifact source exceeds 10000 entries");
+            if names.len()>=budget.entries {return Err(Limit::Entries.into());}
             names.push(OsString::from_vec(name.to_vec()));
         }
         names.sort();Ok(names)

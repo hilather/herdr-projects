@@ -265,6 +265,7 @@ fn native_artifact_helper_needs_no_configuration_and_preserves_large_binary_payl
     let output = Command::new(BIN).env_clear().args(["artifact-stream", "--probe"]).output().unwrap();
     assert!(output.status.success());
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["schema"], 1);
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["live_versions"], serde_json::json!([1]));
     let output = Command::new(BIN).env_clear().args(["artifact-stream", "--path", path.to_str().unwrap()]).output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(&output.stdout[..8], b"HPAR\x01\0\0\0");
@@ -272,6 +273,13 @@ fn native_artifact_helper_needs_no_configuration_and_preserves_large_binary_payl
     assert_eq!(&output.stdout[12 + size..], bytes);
     std::os::unix::fs::symlink("report.md", path.join("library")).unwrap();
     assert!(!Command::new(BIN).env_clear().args(["artifact-stream", "--path", path.to_str().unwrap()]).output().unwrap().status.success());
+    let live=Command::new(BIN).env_clear().args(["artifact-stream","--live","--path",path.to_str().unwrap()]).output().unwrap();
+    assert!(live.status.success(),"{}",String::from_utf8_lossy(&live.stderr));
+    assert_eq!(&live.stdout[..8],b"HPLV\x01\0\0\0");
+    let size=u32::from_be_bytes(live.stdout[8..12].try_into().unwrap()) as usize;
+    let manifest:serde_json::Value=serde_json::from_slice(&live.stdout[12..12+size]).unwrap();
+    assert_eq!(manifest["omissions"][0]["reason"],"symbolic-link");
+    assert_eq!(&live.stdout[12+size..],bytes);
 }
 
 #[test]

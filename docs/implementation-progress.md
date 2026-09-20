@@ -1262,3 +1262,36 @@ and library retain independent caps; an oversized library must not block a valid
 report. Bounded omissions must describe additive projection accurately, and partial
 live staging must never authorize destructive cleanup. Unsupported remote helpers
 must refuse without falling back to unbounded shell/rsync transfers.
+
+## W04 bounded live-copy protocol and private staging
+
+A separate live-copy protocol now exports bounded partial projections without
+weakening strict schema-1 preservation. The native helper advertises live version 1
+and accepts `--live`. Report/library byte budgets remain independent. Included files
+are streamed with actual-byte hashing and a final anchored source recheck; links and
+unsupported entries become bounded structured omissions. Library limits discard the
+whole library inventory instead of sending an arbitrary traversal prefix, preserving
+valid report progress. Typed source-limit errors distinguish omission policy from
+I/O/deadline/source-change failures; directory scans now detect observed mutations.
+
+The receiver verifies manifest paths, sizes, hashes, framing and no trailing data,
+then returns a private stage under `.state/live-copies`. It cannot produce a cleanup
+snapshot. Staging is removed on failure/drop. Six regressions cover binary/hostile
+names/empty directories, links, each library limit, independent byte caps, source
+mutation, corrupt/truncated/trailing/wrong-protocol data, and malformed manifests.
+The existing CLI fixture now checks backward-compatible probe fields and live
+partial export while strict preservation still refuses the same linked source.
+
+Independent review approved the protocol/staging increment and reran focused tests.
+The receiver does not certify sender success or execution authority: transfer-pool
+integration must gate on supervised sender completion and current task/config/route
+before publication. Projection and executor admission remain outstanding. Counts
+remain 16 implemented, five partial and 20 not started; macOS remains untested.
+
+Full validation exposed a section-deadline bug under concurrent build load: the
+library timer began before report streaming. Each section now starts its budget on
+first use, with checks after file flushes and between directory flushes. Independent
+review approved the correction. All 495 tests pass in debug and release (164 library,
+299 binary, 30 CLI, two contracts), and the default-feature suite passes. Three
+optional live checks remain ignored. Logs:
+`/tmp/herdr-live-stage-{debug,release,default}.log`.

@@ -14,7 +14,7 @@ struct Source {
 }
 
 pub fn probe() {
-    println!("{}", serde_json::json!({"schema": 1, "byte_limit": BYTE_LIMIT, "entry_limit": ENTRY_LIMIT}));
+    println!("{}", serde_json::json!({"schema": 1, "byte_limit": BYTE_LIMIT, "entry_limit": ENTRY_LIMIT, "live_versions": [1]}));
 }
 
 pub fn export(path: &Path, writer: &mut impl Write) -> Result<()> {

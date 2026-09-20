@@ -230,6 +230,8 @@ enum Command {
     /// Versioned binary artifact transport for remote preservation.
     #[command(hide = true)]
     ArtifactStream {
+        #[arg(long)]
+        live: bool,
         #[arg(long, conflicts_with = "path")]
         probe: bool,
         #[arg(long, required_unless_present = "probe")]
@@ -457,8 +459,9 @@ enum RuntimeCommand {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    if let Command::ArtifactStream { probe, path } = &cli.command {
+    if let Command::ArtifactStream { probe, path, live } = &cli.command {
         if *probe { crate::artifacts::probe(); return Ok(()); }
+        if *live {return crate::artifacts::live::export(path.as_ref().context("artifact source path is required")?, &mut std::io::stdout().lock());}
         return crate::artifacts::export(path.as_ref().context("artifact source path is required")?, &mut std::io::stdout().lock());
     }
     let env = Env::from_process()?;
