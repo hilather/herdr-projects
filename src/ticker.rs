@@ -263,6 +263,7 @@ pub fn run(ctx: &Ctx) -> Result<()> {
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::routine_jobs::JobRunner{inner:runner});
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::copy_jobs::JobRunner{inner:runner});
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::legacy_routine_jobs::JobRunner{inner:runner});
+    let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::brief_jobs::JobRunner{inner:runner});
     let executor=std::sync::Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),runner)?);
     #[cfg(feature="state-store")]
     {memory.routine_jobs=Some(crate::routine_jobs::Queue::new(executor.clone()));}
@@ -335,7 +336,7 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
                 if let Err(error)=queue.offer(ctx,&project,t,None){log.line(&format!("{slug}: copy recovery: {error:#}"));}
             }
         }
-        match tick_cheap_reports(ctx, &project,memory.local_reports.as_mut()) {
+        match tick_cheap_reports(ctx, &project,memory.local_reports.as_mut(),memory.copy_jobs.as_mut()) {
             Ok(Some(seen)) => reachable.push((project, seen)),
             Ok(None) => {}
             Err(error) => log.line(&format!("{slug}: {error:#}")),
@@ -423,7 +424,7 @@ pub fn tick_project(ctx: &Ctx, project: &Project) -> Result<bool> {
 #[cfg(test)]
 pub fn tick_project_with(ctx: &Ctx, project: &Project, memory: &mut Memory) -> Result<bool> {
     if let Some(reads)=memory.local_reports.as_mut(){reads.begin_pass();}
-    match tick_cheap_reports(ctx, project,memory.local_reports.as_mut())? {
+    match tick_cheap_reports(ctx, project,memory.local_reports.as_mut(),memory.copy_jobs.as_mut())? {
         Some(seen) => match tick_slow(ctx, project, &seen, memory).into_iter().next() {
             Some(error) => Err(error),
             None => Ok(true),
@@ -441,7 +442,7 @@ struct Pass {
     error: Option<anyhow::Error>,
 }
 
-fn thread_pass(project: &Project, herdr: &Herdr, threads: &[thread::Thread], agents: &[Agent], panes: &[Pane], hashes: Option<&std::collections::BTreeMap<String, String>>) -> Result<Pass> {
+fn thread_pass(project: &Project, herdr: &Herdr, threads: &[thread::Thread], agents: &[Agent], panes: &[Pane], hashes: Option<&std::collections::BTreeMap<String, String>>,defer_briefs:bool) -> Result<Pass> {
     let slug = &project.slug;
     let now = jiff::Timestamp::now();
     let mut pass = Pass { transitions: Vec::new(), recorded_panes: 0, missing_panes: 0, error: None };
@@ -471,7 +472,7 @@ fn thread_pass(project: &Project, herdr: &Herdr, threads: &[thread::Thread], age
         }
 
         let mut delivered = false;
-        if thread::prompt_delivery::ready(t).is_ok() && live.agent_state.as_deref().is_some_and(crate::herdr::ready_state) {
+        if !defer_briefs && thread::prompt_delivery::ready(t).is_ok() && live.agent_state.as_deref().is_some_and(crate::herdr::ready_state) {
             match herdr.agent_prompt(&t.pane_id, &thread::launch_prompt(slug, &t.id)) {
                 Ok(()) => delivered = true,
                 Err(error) => pass.error = pass.error.or(Some(anyhow::anyhow!("{}: brief prompt: {error}", t.id))),
@@ -563,8 +564,8 @@ fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
 mod status_observation;
 
 #[cfg(test)]
-fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {tick_cheap_reports(ctx,project,None)}
-fn tick_cheap_reports(ctx: &Ctx, project: &Project,mut reads:Option<&mut crate::local_reports::Reads>) -> Result<Option<Seen>> {
+fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {tick_cheap_reports(ctx,project,None,None)}
+fn tick_cheap_reports(ctx: &Ctx, project: &Project,mut reads:Option<&mut crate::local_reports::Reads>,mut copies:Option<&mut crate::copy_jobs::Queue>) -> Result<Option<Seen>> {
     let lease = crate::cleanup::lease(&ctx.root);
     let _project_guard = if lease.is_err() {
         Some(herdr_projects::execution_guard::ProjectGuard::acquire(&project.dir())?)
@@ -630,7 +631,14 @@ fn tick_cheap_reports(ctx: &Ctx, project: &Project,mut reads:Option<&mut crate::
         }
     }
     let hashes=reports.iter().filter_map(|(id,s)|s.hash.as_ref().map(|hash|(id.clone(),hash.clone()))).collect();
-    let pass = thread_pass(project, &herdr, &local, &agents, &panes, reads.as_ref().map(|_|&hashes))?;
+    if let Some(queue)=copies.as_deref_mut() {
+        for t in local.iter().filter(|t|thread::prompt_delivery::ready(t).is_ok()) {
+            if agents.iter().any(|a|thread::agent_matches(t,a)&&a.ready()) {
+                report_errors.extend(queue.offer_brief(ctx,project,t).err().map(|e|format!("{}: brief admission: {e:#}",t.id)));
+            }
+        }
+    }
+    let pass = thread_pass(project, &herdr, &local, &agents, &panes, reads.as_ref().map(|_|&hashes),copies.is_some())?;
     first_error = first_error.or(pass.error);
     let coordinator_recorded = usize::from(!record.pane_id.is_empty());
     let coordinator_missing = usize::from(coordinator_recorded == 1 && agent.is_none() && !panes.iter().any(|p| coordinator::pane_matches(&record, p)));
@@ -692,7 +700,7 @@ fn apply_remote(ctx:&Ctx,project:&Project,herdr:&Herdr,machine:&str,threads:&[th
         agents=remote.agent_list().map_err(|e|e.to_string())?;
         panes=remote.pane_list().map_err(|e|e.to_string())?;
     }
-    let pass = thread_pass(project, &remote, threads, &agents, &panes, Some(&hashes)).map_err(|e| format!("{e:#}"))?;
+    let pass = thread_pass(project, &remote, threads, &agents, &panes, Some(&hashes),false).map_err(|e| format!("{e:#}"))?;
     errors.extend(pass.error);
 
     for t in threads.iter().filter(|t| t.status == thread::Status::Open) {

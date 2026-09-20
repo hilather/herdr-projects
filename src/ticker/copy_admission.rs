@@ -106,7 +106,7 @@ fn retained_merged_projection_blocks_brief_prompts_and_agent_starts() {
     let ctx=world.ctx();let herdr=Herdr::new(ctx.env.herdr_bin(),"session.sock",ctx.runner);let current=thread::load(&project,&t.id).unwrap();
     let agent=Agent{pane_id:t.pane_id.clone(),workspace_id:t.workspace_id.clone(),tab_id:t.tab_id.clone(),cwd:t.cwd.clone(),name:t.agent_name.clone(),agent_status:"idle".into(),..Default::default()};
     let pane=Pane{pane_id:t.pane_id.clone(),workspace_id:t.workspace_id.clone(),tab_id:t.tab_id.clone(),cwd:t.cwd.clone()};
-    thread_pass(&project,&herdr,&[current],&[agent],&[pane.clone()],Some(&std::collections::BTreeMap::new())).unwrap();
+    thread_pass(&project,&herdr,&[current],&[agent],&[pane.clone()],Some(&std::collections::BTreeMap::new()),false).unwrap();
     let current=thread::load(&project,&t.id).unwrap();let mut errors=Vec::new();let mut may_start=true;
     launch_pass(&ctx,&project,&herdr,&[current],&[],&[pane],&mut may_start,&mut errors);
     assert!(errors.is_empty());assert_eq!(world.runner.count("agent prompt"),0);assert_eq!(world.runner.count("agent start"),0);

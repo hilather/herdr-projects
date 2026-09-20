@@ -35,6 +35,9 @@ impl Queue {
     pub fn offer_final(&mut self,ctx:&Ctx,project:&Project,t:&Thread,target:Option<&str>,purpose:Purpose,operation:String)->Result<()> {
         self.offer_request(request_final(ctx,project,t,target,purpose,operation)?)
     }
+    pub fn offer_brief(&mut self,ctx:&Ctx,project:&Project,t:&Thread)->Result<()> {
+        self.offer_request(crate::brief_jobs::request(ctx,project,t)?)
+    }
     pub fn offer_routine(&mut self,ctx:&Ctx,project:&Project,routine:&crate::routine::Routine,previous:&str,occurrence:&str)->Result<()> {
         self.offer_request(crate::legacy_routine_jobs::request(ctx,project,routine,previous,occurrence)?)
     }

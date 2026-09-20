@@ -128,8 +128,18 @@ but before recording confirmation can cause a repeated notification or nudge.
 
 ## Interrupted brief delivery
 
-Durable brief claims are available for supervised worker integration. Automatic
-claim production and the supervised sender are not yet enabled. A pending claim
+On Linux, local thread briefs use the shared bounded queue and a concrete
+supervised sender. It validates the recorded socket identity, configuration,
+execution and fresh unambiguous agent/pane observations before claiming delivery.
+Only a typed acknowledgement naming the same agent confirms delivery. Remote
+briefs, coordinator prompts and agent starts still use their existing paths.
+
+The local sender checks other project and coordinator references, including
+resolved threads and socket aliases. Corrupt or oversized inventories refuse.
+Canonical or migrating neighboring projects also refuse until a bounded canonical
+identity reader is integrated; this applies even to state-store builds.
+
+A pending claim
 recovered after its owning worker exits becomes uncertain: the prompt may already
 have reached the agent. Recovery marks the matching open execution failed and
 writes one replay-safe inbox notice before session checks. Inspect the agent,

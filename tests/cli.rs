@@ -721,3 +721,34 @@ fn ticker_native_merged_finalization_resolves_and_replays_notice_after_restart()
     assert_eq!(read()["final_copy_sequence"].as_integer(),Some(1));
     assert_eq!(fs::read_dir(project.join("inbox")).unwrap().filter_map(|e|e.ok()).filter(|e|e.file_name().to_string_lossy().starts_with("final-")).count(),1);
 }
+
+#[cfg(target_os="linux")]
+#[test]
+fn ticker_native_briefs_confirm_or_recover_uncertainty_without_replay() {
+    use std::{fs,time::{Duration,Instant},process::Stdio,os::unix::{fs::PermissionsExt,net::UnixListener}};
+    for outcome in ["confirmed","lost"] {
+        let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
+        assert!(hp(home.path(),&["--root",r,"new","demo"]).status.success());let project=root.join("demo");
+        let socket=home.path().join("session.sock");let _listener=UnixListener::bind(&socket).unwrap();
+        fs::write(project.join(".state/coordinator.json"),serde_json::json!({"socket":socket}).to_string()).unwrap();
+        let source=home.path().join("source");fs::create_dir(&source).unwrap();
+        let agent=serde_json::json!({"workspace_id":"w","tab_id":"tab","pane_id":"p","cwd":source,"name":"worker","agent":"claude","agent_status":"idle"});
+        let record=project.join("threads/t-0001.toml");fs::write(&record,toml::to_string(&serde_json::json!({"id":"t-0001","status":"open","kind":"adopted","prompt_pending":true,"thread_dir":source,"cwd":source,"workspace_id":"w","tab_id":"tab","pane_id":"p","agent":"claude","agent_name":"worker","created":jiff::Timestamp::now().to_string()})).unwrap()).unwrap();
+        fs::write(home.path().join("agents.json"),serde_json::json!({"result":{"agents":[agent.clone()]}}).to_string()).unwrap();
+        fs::write(home.path().join("panes.json"),serde_json::json!({"result":{"panes":[{"workspace_id":"w","tab_id":"tab","pane_id":"p","cwd":source}]}}).to_string()).unwrap();
+        fs::write(home.path().join("ack.json"),serde_json::json!({"result":{"type":"agent_prompted","agent":agent}}).to_string()).unwrap();
+        let response=if outcome=="lost" {"exit 1"}else{"/bin/cat \"$HOME/ack.json\""};
+        let fake=home.path().join("herdr");fs::write(&fake,format!("#!/bin/sh\ncase \"$1 $2\" in\n'agent list') /bin/cat \"$HOME/agents.json\";;\n'pane list') echo poll >> \"$HOME/polls\"; /bin/cat \"$HOME/panes.json\";;\n'agent prompt') printf send >> \"$HOME/sent\"; {response};;\n*) echo '{{\"result\":{{\"shown\":true}}}}';;\nesac\n")).unwrap();fs::set_permissions(&fake,fs::Permissions::from_mode(0o700)).unwrap();
+        struct Child(std::process::Child);impl Drop for Child {fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+        let spawn=||Child(Command::new(BIN).env_clear().env("HOME",home.path()).env("PATH","/usr/bin:/bin").env("HERDR_BIN_PATH",&fake).args(["--root",r,"ticker","run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+        let read=||->toml::Value {toml::from_str(&fs::read_to_string(&record).unwrap()).unwrap()};
+        let wait=|child:&mut Child,predicate:&dyn Fn()->bool| {let end=Instant::now()+Duration::from_secs(45);while !predicate(){assert!(child.0.try_wait().unwrap().is_none());assert!(Instant::now()<end,"{}",fs::read_to_string(root.join(".ticker.log")).unwrap_or_default());std::thread::sleep(Duration::from_millis(10));}};
+        let stop=|child:&mut Child| {fs::write(root.join(".ticker.stop"),b"").unwrap();let end=Instant::now()+Duration::from_secs(8);while child.0.try_wait().unwrap().is_none(){assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(10));}fs::remove_file(root.join(".ticker.stop")).unwrap();};
+        let mut child=spawn();wait(&mut child,&||fs::read(home.path().join("sent")).is_ok_and(|b|b==b"send")&&read().get("prompt_claim").is_some_and(|c|c.get("phase").and_then(|p|p.as_str())==Some(if outcome=="confirmed"{"confirmed"}else{"pending"})));stop(&mut child);
+        let polls=fs::read(home.path().join("polls")).unwrap().len();let mut child=spawn();
+        wait(&mut child,&||fs::read(home.path().join("polls")).unwrap().len()>polls&&read()["prompt_claim"]["notified"].as_bool()==Some(true));stop(&mut child);
+        assert_eq!(fs::read(home.path().join("sent")).unwrap(),b"send");assert_eq!(read()["prompt_sequence"].as_integer(),Some(1));
+        if outcome=="confirmed" {assert_eq!(read()["prompt_pending"].as_bool(),Some(false));}
+        else {assert_eq!(read()["status"].as_str(),Some("failed"));assert_eq!(read()["prompt_claim"]["phase"].as_str(),Some("uncertain"));let notices=fs::read_dir(project.join("inbox")).unwrap().filter_map(Result::ok).filter(|e|e.file_name().to_string_lossy().starts_with("brief-")).count();assert_eq!(notices,1);}
+    }
+}

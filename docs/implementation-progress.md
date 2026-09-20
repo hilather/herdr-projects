@@ -1759,3 +1759,48 @@ All 580 tests pass in debug and release (168 library, 376 binary, 34 CLI, two
 contracts). Default-feature tests pass (30 library, 327 binary, 15 CLI, two
 contracts); three optional live checks remain ignored. Logs:
 `/tmp/herdr-brief-claims-{debug,release,default}.log`.
+
+
+## W04 supervised local brief delivery
+
+Linux local thread briefs now enter the shared bounded queue during the cheap
+pass and run outside its root-exclusive lease. The concrete worker owns a project
+guard and surviving supervisor locks. It freezes project/socket identity,
+configuration and execution sequence, checks fresh unambiguous matching idle
+agent/pane observations, durably claims, and requires a typed matching
+`agent_prompted` acknowledgement before confirmation. Generic queue completions
+cannot write delivery authority. A 45-second original deadline includes queue
+wait and preflight; each command retains the existing 10-second API timeout.
+
+A conservative terminal-reference inventory checks legacy coordinators and all
+threads, including resolved references and socket aliases. It refuses corrupt or
+oversized inventories before claiming. Bounds are 1024 root entries/references,
+256 entries per thread directory, 16 MiB per file, 50 MiB aggregate and a cooperative
+10-second scan budget bounded by the worker deadline. Canonical/migrating neighbors
+are conservatively refused in both feature modes until a bounded canonical
+identity reader exists; loading an entire canonical snapshot is not an acceptable
+way to satisfy these bounds. The shared root barrier excludes legacy rebinding
+and canonical adoption, but does not freeze unverified canonical route edits.
+
+Disposable fixtures cover exact confirmation, lost/malformed/foreign replies,
+busy/ambiguous/stale targets, socket replacement, cancellation after claim,
+neighbor/coordinator/alias/corrupt/canonical refusal, ticker admission/restart,
+and an actual blocked sender while another project's observation progresses.
+The built ticker also executes exactly once across confirmed and lost-response
+restart scenarios. These tests invoke only disposable helper executables and
+sockets, never user panes.
+
+Remote briefs, coordinator prompts/notifications, starts and token effects still
+need worker integration. Canonical identity inventory, launch/profile integration,
+usage/telemetry and broader authority coverage remain open. Counts remain
+16 locally implemented, five partial and 20 not started; macOS and actual remote
+host acceptance remain untested.
+
+Independent review approved the final bounded local sender after the canonical
+refusal and inventory-before-observation safeguards. Full regression suites passed
+588 tests in debug and release (168 library, 383 binary, 35 CLI, two contracts).
+After the final two safeguards, all 15 brief-related checks passed again in both
+modes, including the built ticker fixture. The full final default-feature suite
+passed 382 tests (30 library, 334 binary, 16 CLI, two contracts). Three optional
+live checks remain ignored. Logs: `/tmp/herdr-brief-worker-{debug,release,default}.log`
+and `/tmp/herdr-brief-worker-{debug,release}-final.log`.
