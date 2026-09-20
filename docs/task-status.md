@@ -45,7 +45,7 @@ file-backed; no projects have been migrated. See the bounded W03 handoff; platfo
 
 ## Next work
 
-W04 T04.1 now has a [schema-v11 scheduling foundation](scheduling.md): DAG
+W04 T04.1 now has a [schema-v12 scheduling foundation](scheduling.md): DAG
 validation, aged priority, retained-attempt capacity reporting and fenced CLI edits.
 Atomic reservations and immutable inputs now have a sealed internal API, and cancellation
 has an audited CLI. Production launch preparation/dispatch and termination remain
@@ -54,7 +54,9 @@ scheduling plus a shared bounded executor for asynchronous PR and remote observa
 routine/artifact work and guarded effects still need isolation. T04.3 now fences legacy
 launch arguments by explicit agent kind and provides redacted [named profile inspection](profiles.md);
 explicit local version probes for Claude/Codex are available. Launch selection,
-immutable profile resolution and verified capability evidence remain. Async routine commands first need durable
+production profile resolution and verified capability evidence remain. Version-2
+reservation inputs now retain and validate frozen profile evidence; historical
+version-1 records remain readable. Async routine commands first need durable
 occurrence and authority contracts, so that path remains synchronous. Next are bounded command execution, kind-bound worker profiles
 (T04.3), budgets/routines/telemetry (T04.4) and operation-scoped authority (T04.5).
 The [scheduler/executor/profile interfaces](adr/0004-w04-scheduling-contract.md) are frozen. Existing retained/adopted attempts

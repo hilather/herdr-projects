@@ -7,9 +7,67 @@ fn fixture()->(tempfile::TempDir,SqliteStore,Vec<PreparedLaunch>) {
     let s=db.read_snapshot(None).unwrap();db.set_scheduler_policy(s.head,1,1,3).unwrap();let s=db.read_snapshot(None).unwrap();
     let observations=s.runtime_bindings.iter().map(|b|RuntimeObservation{binding:b.id.clone(),binding_revision:b.revision,task_revision:Some(3),observed_unix_ms:1000,collector:"herdr-git-v1".into(),..RuntimeObservation::default()}).collect::<Vec<_>>();
     db.record_observations(s.head,&observations).unwrap();let s=db.read_snapshot(None).unwrap();db.set_project_state(s.head,s.control.unwrap().revision,ProjectState::Active,1000,None).unwrap();
-    let s=db.read_snapshot(None).unwrap();let prepared=s.runtime_bindings.iter().map(|b|PreparedLaunch{inputs:LaunchInputs{version:1,project_store:std::fs::canonicalize(&path).unwrap().display().to_string(),task:b.task.clone().unwrap(),task_revision:3,scheduler_revision:s.scheduler.as_ref().unwrap().policy.revision,control_epoch:s.control.as_ref().unwrap().epoch,binding:b.id.clone(),binding_revision:b.revision,binding_digest:super::super::ownership::identity_digest(b).unwrap(),profile:VersionedReference{id:"fixture-profile".into(),revision:1,digest:"a".repeat(64)},approval:VersionedReference{id:"fixture-approval".into(),revision:1,digest:"b".repeat(64)},config:crate::migration::ConfigReference{path:temp.path().join("config.toml").display().to_string(),digest:None},repositories:vec![],dependencies:vec![],memory:None,budget:None}}).collect();(temp,db,prepared)
+    let s=db.read_snapshot(None).unwrap();let prepared=s.runtime_bindings.iter().map(|b|PreparedLaunch{inputs:LaunchInputs{version:2,project_store:std::fs::canonicalize(&path).unwrap().display().to_string(),task:b.task.clone().unwrap(),task_revision:3,scheduler_revision:s.scheduler.as_ref().unwrap().policy.revision,control_epoch:s.control.as_ref().unwrap().epoch,binding:b.id.clone(),binding_revision:b.revision,binding_digest:super::super::ownership::identity_digest(b).unwrap(),profile:crate::domain::profile::fixture(crate::migration::ConfigReference{path:temp.path().join("config.toml").display().to_string(),digest:None}).reference().unwrap(),effective_profile:Some(crate::domain::profile::fixture(crate::migration::ConfigReference{path:temp.path().join("config.toml").display().to_string(),digest:None})),approval:VersionedReference{id:"fixture-approval".into(),revision:1,digest:"b".repeat(64)},config:crate::migration::ConfigReference{path:temp.path().join("config.toml").display().to_string(),digest:None},repositories:vec![],dependencies:vec![],memory:None,budget:None}}).collect();(temp,db,prepared)
 }
 fn reserve(db:&mut SqliteStore,p:&[PreparedLaunch])->Reservation {let h=db.read_snapshot(None).unwrap().head;db.reserve_prepared(p,h,1000).unwrap()}
+#[test]
+fn incomplete_or_changed_profile_evidence_cannot_reserve_capacity() {
+    let(_temp,mut db,p)=fixture();let before=db.read_snapshot(None).unwrap();
+    for field in 0..5 {
+        let mut bad=p[0].clone();
+        match field {
+            0=>{bad.inputs.version=1;bad.inputs.effective_profile=None;},
+            1=>bad.inputs.effective_profile=None,
+            2=>bad.inputs.effective_profile.as_mut().unwrap().agent.version="9.9.9".into(),
+            3=>bad.inputs.effective_profile.as_mut().unwrap().config.digest=Some("f".repeat(64)),
+            _=>{let profile=bad.inputs.effective_profile.as_mut().unwrap();profile.capabilities.stop=CapabilityEvidence::Unknown;bad.inputs.profile=profile.reference().unwrap();},
+        }
+        assert!(db.reserve_prepared(&[bad],before.head,1000).is_err());
+        assert_eq!(db.read_snapshot(None).unwrap(),before);
+    }
+}
+
+#[test]
+fn version_one_input_serialization_preserves_historical_identity() {
+    let(_temp,_db,p)=fixture();let mut old=p[0].inputs.clone();old.version=1;old.effective_profile=None;
+    let bytes=serde_json::to_vec(&old).unwrap();assert!(!String::from_utf8_lossy(&bytes).contains("effective_profile"));
+    let record:LaunchInputs=serde_json::from_slice(&bytes).unwrap();validate_inputs(&record).unwrap();
+    assert_eq!(record_ids(&old).unwrap(),record_ids(&record).unwrap());
+    assert_eq!(serde_json::to_vec(&record).unwrap(),bytes);
+}
+
+#[test]
+fn schema11_upgrade_retains_records_and_blocks_old_format_insertions() {
+    let(temp,mut db,p)=fixture();
+    db.connection.execute_batch("DROP TRIGGER attempt_inputs_effective_profile; UPDATE store_meta SET schema_version=11; PRAGMA user_version=11;").unwrap();
+    // Reproduce a schema-11/v1 historical reservation, before v2's producer existed.
+    let old_json=include_str!("../../../tests/fixtures/launch-inputs-v1.json").trim().replace(&"a".repeat(64),&p[0].inputs.binding_digest);
+    let inputs:LaunchInputs=serde_json::from_str(&old_json).unwrap();
+    assert_eq!(serde_json::to_string(&inputs).unwrap(),old_json);
+    let (attempt,operation)=record_ids(&inputs).unwrap();
+    let record=AttemptInputRecord{attempt:attempt.clone(),operation:operation.clone(),inputs};
+    let payload=serde_json::to_string(&record).unwrap();let digest=format!("{:x}",Sha256::digest(payload.as_bytes()));
+    let tx=db.connection.transaction().unwrap();
+    tx.execute("INSERT INTO attempts VALUES(?1,'a',1,'reserved',NULL,?2,0)",params![attempt.as_str(),format!("worker:{}",attempt.as_str())]).unwrap();
+    tx.execute("UPDATE tasks SET revision=4,state='running',active_attempt=?1 WHERE id='a'",params![attempt.as_str()]).unwrap();
+    tx.execute("INSERT INTO operations VALUES(?1,'a','runtime.launch',?2,1,?3,?4,4,1000,?1)",params![operation.as_str(),record.inputs.binding,payload,digest]).unwrap();
+    tx.execute("INSERT INTO attempt_inputs VALUES(?1,?2,?3,?4)",params![attempt.as_str(),operation.as_str(),payload,digest]).unwrap();
+    event(&tx,"attempt.reserved",attempt.as_str(),1,&record).unwrap();
+    let task=read_tasks(&tx).unwrap().into_iter().find(|t|t.id.as_str()=="a").unwrap();
+    event(&tx,"task.changed","a",4,&task).unwrap();event(&tx,"operation.enqueued",operation.as_str(),4,&record).unwrap();
+    tx.commit().unwrap();
+    let before=db.read_snapshot(None).unwrap();
+    assert!(matches!(db.reserve_prepared(&p,before.head,1000),Err(StoreError::UnsupportedSchema(11))));
+    db.upgrade_v1().unwrap();let after=db.read_snapshot(None).unwrap();
+    assert_eq!(after.schema_version,12);assert_eq!(after.attempt_inputs,before.attempt_inputs);assert_eq!(after.events,before.events);
+    assert_eq!(after.head,before.head);
+    assert!(db.connection.execute("INSERT INTO attempt_inputs VALUES('old','old','{\"inputs\":{\"version\":1}}',?1)",params!["a".repeat(64)]).is_err());
+    assert_eq!(after.attempt_inputs[0],record);
+    assert_eq!(serde_json::to_string(&after.attempt_inputs[0]).unwrap(),payload);
+    drop(db);let mut db=SqliteStore::open(&temp.path().join("state.db")).unwrap();
+    assert_eq!(db.read_snapshot(None).unwrap().attempt_inputs,after.attempt_inputs);
+    assert!(db.cancel_attempt(&attempt,1,after.head,"cancel historical reservation",1001).unwrap().released);
+}
 #[test]
 fn reservation_and_never_claimed_cancellation_survive_restart() {
     let(temp,mut db,p)=fixture();let r=reserve(&mut db,&p);assert_eq!(r.record.inputs.task.as_str(),"a");let s=db.read_snapshot(None).unwrap();assert_eq!(s.attempt_inputs,vec![r.record.clone()]);assert_eq!(s.attempts.len(),1);assert!(s.attempts[0].retains_capacity());assert_eq!(db.queue_report(1000).unwrap().available_slots,0);

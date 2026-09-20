@@ -7,7 +7,15 @@ fn schema(db:&Connection)->Result<()> {check_schema(db)?;let n:u32=db.query_row(
 fn hash(s:&str)->bool {s.len()==64&&s.bytes().all(|c|c.is_ascii_hexdigit())}
 fn reference(r:&VersionedReference)->bool {!r.id.is_empty()&&r.id.len()<=512&&!r.id.chars().any(char::is_control)&&r.revision>0&&hash(&r.digest)}
 fn validate_inputs(i:&LaunchInputs)->Result<()> {
-    if i.version!=1||!Path::new(&i.project_store).is_absolute()||i.task_revision==0||i.scheduler_revision==0||i.control_epoch==0||i.binding.is_empty()||i.binding.len()>512||i.binding_revision==0||!hash(&i.binding_digest)||!reference(&i.profile)||!reference(&i.approval)||!Path::new(&i.config.path).is_absolute()||i.config.digest.as_ref().is_some_and(|d|!hash(d)) {return Err(invalid("invalid sealed launch inputs"));}
+    if !matches!(i.version,1|2)||!Path::new(&i.project_store).is_absolute()||i.task_revision==0||i.scheduler_revision==0||i.control_epoch==0||i.binding.is_empty()||i.binding.len()>512||i.binding_revision==0||!hash(&i.binding_digest)||!reference(&i.profile)||!reference(&i.approval)||!Path::new(&i.config.path).is_absolute()||i.config.digest.as_ref().is_some_and(|d|!hash(d)) {return Err(invalid("invalid sealed launch inputs"));}
+    match (i.version,&i.effective_profile) {
+        (1,None)=>{},
+        (2,Some(profile))=>{
+            profile.validate_for_launch().map_err(|s|invalid(&s))?;
+            if profile.config!=i.config||profile.reference().map_err(|s|invalid(&s))?!=i.profile {return Err(invalid("effective profile binding mismatch"));}
+        },
+        _=>return Err(invalid("launch input version/profile mismatch")),
+    }
     if i.dependencies.len()>256||i.repositories.len()>64||i.memory.as_ref().is_some_and(|r|!reference(r))||i.budget.as_ref().is_some_and(|r|!reference(r)){return Err(invalid("invalid input references"));}
     let mut repos=BTreeSet::new();for r in &i.repositories {if !Path::new(&r.repository).is_absolute()||!repos.insert(&r.repository)||![&r.commit,&r.tree].iter().all(|s|matches!(s.len(),40|64)&&s.bytes().all(|c|c.is_ascii_hexdigit())) {return Err(invalid("invalid repository input vector"));}}
     let mut tasks=BTreeSet::new();for d in &i.dependencies {if d.task==i.task||d.task_revision==0||!reference(&d.evidence)||!tasks.insert(&d.task){return Err(invalid("invalid dependency input vector"));}}
@@ -39,8 +47,10 @@ impl SqliteStore {
     pub fn reserve_prepared(&mut self,prepared:&[PreparedLaunch],expected_head:u64,now:i64)->Result<Reservation> {
         super::delivery::now_check(now)?;if prepared.is_empty()||prepared.len()>128{return Err(invalid("reservation requires 1–128 ready preparations"));}
         let path=std::fs::canonicalize(self.connection.path().ok_or_else(||invalid("store path missing"))?).map_err(|e|StoreError::Io(e.to_string()))?;
-        let mut seen=BTreeSet::new();for p in prepared {validate_inputs(&p.inputs)?;if Path::new(&p.inputs.project_store)!=path||!seen.insert(&p.inputs.task){return Err(invalid("preparation belongs to another store or duplicates a task"));}}
-        let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;if head(&tx)?!=expected_head{return Err(StoreError::Conflict);}
+        let mut seen=BTreeSet::new();for p in prepared {validate_inputs(&p.inputs)?;if p.inputs.version!=2 {return Err(invalid("new reservations require effective profile evidence"));}if Path::new(&p.inputs.project_store)!=path||!seen.insert(&p.inputs.task){return Err(invalid("preparation belongs to another store or duplicates a task"));}}
+        let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
+        let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;if version<12{return Err(StoreError::UnsupportedSchema(version));}
+        if head(&tx)?!=expected_head{return Err(StoreError::Conflict);}
         let scheduler=super::scheduler::read(&tx)?;let control=super::control::read(&tx)?;
         if control.state!=ProjectState::Active||control.reconciliation_required{return Err(invalid("project is not admitted"));}
         let tasks=read_tasks(&tx)?;let attempts=read_attempts(&tx)?;let bindings=super::runtime::read_all(&tx)?;let ownership=super::ownership::read_all(&tx)?;
@@ -54,6 +64,7 @@ impl SqliteStore {
             if attempts.iter().filter(|a|a.task==task.id).count()>=scheduler.policy.max_attempts_per_task as usize{return Err(invalid("task attempt limit reached"));}
             let binding=bindings.iter().find(|b|b.id==i.binding&&b.revision==i.binding_revision&&b.task.as_ref()==Some(&task.id)).ok_or(StoreError::Conflict)?;
             if super::ownership::identity_digest(binding)?!=i.binding_digest{return Err(StoreError::Conflict);}
+            if !binding.identity.agent.is_empty()&&i.effective_profile.as_ref().map(|p|p.kind.as_str())!=Some(binding.identity.agent.as_str()) {return Err(invalid("profile kind differs from runtime binding"));}
             // Existing worker identities cannot be turned into a new launch.
             if !binding.identity.pane_id.is_empty()||ownership.iter().any(|o|o.binding==binding.id&&(o.attempt.is_some()||o.session.is_some()||o.agent.is_some())) {return Err(invalid("existing worker identity requires reconciliation"));}
             if !binding.identity.repo.is_empty()&&!i.repositories.iter().any(|r|r.repository==binding.identity.repo){return Err(invalid("recorded repository lacks a pinned input"));}

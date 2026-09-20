@@ -1,5 +1,7 @@
 //! Persisted Phase B records; scheduling and execution policy belong to later waves.
 use serde::{Deserialize, Serialize};
+pub(crate) mod profile;
+pub use profile::*;
 
 macro_rules! identifier {
     ($($name:ident),+) => { $(

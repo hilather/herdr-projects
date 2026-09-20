@@ -24,6 +24,10 @@ pub struct LaunchInputs {
     pub binding_revision:u64,
     pub binding_digest:String,
     pub profile:VersionedReference,
+    /// Version 2 inputs retain effective profile evidence, not just an opaque ID.
+    /// Omit on serialization for byte-stable version 1 historical identities.
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub effective_profile:Option<super::FrozenProfile>,
     pub approval:VersionedReference,
     pub config:crate::migration::ConfigReference,
     pub repositories:Vec<RepositoryInput>,

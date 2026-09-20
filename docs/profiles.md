@@ -92,3 +92,24 @@ observations, not authenticated executable attestations or durable launch author
 They do not contact Herdr sessions or start agent conversations. Inspection's
 capabilities and launch admission remain unknown/blocked until verified adapter
 and immutable attempt-resolution paths consume suitable evidence.
+
+## Canonical attempt evidence (schema 12)
+
+New sealed reservations now require version-2 launch inputs with an embedded frozen
+profile. Its content-addressed reference covers kind, definition/config identity,
+argument digest, environment names, versioned permission/adapter references, exact
+agent/Herdr executable identities and seven separate capability evidence states.
+Raw argv and environment values stay outside this record. A dispatcher must recover
+arguments only from matching user-owned config; changed config must not substitute
+new flags for an existing attempt.
+
+Launch, readiness, prompt and stop evidence must be supported. Missing checkpoint,
+usage or resume evidence remains explicitly unknown and does not fabricate support.
+A workflow certificate is a separate optional reference. Evidence references must
+come from the trusted adapter/policy producer; deserializing these records grants
+no authority. That production producer and canonical dispatch remain unavailable.
+
+The store checks the frozen profile digest, config identity and any recorded runtime
+agent kind in the reservation transaction. Existing schema-11 version-1 records
+remain readable with unchanged content IDs, while schema 12 refuses new reservations
+in that old format. Upgrade is explicit and does not rewrite historical payloads.

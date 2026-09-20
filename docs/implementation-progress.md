@@ -738,3 +738,26 @@ a mise shim attempting tool installation and was interrupted; no tools installed
 The probe interface requires explicit executable paths to let operators select the
 actual installation. Three optional live workflow checks remain ignored; no live
 agent session or real user project was started. W04 and the full goal remain active.
+
+## W04 frozen effective profile inputs (schema 12)
+
+Version-2 launch inputs now retain the effective profile definition/config identity,
+argument digest, environment names, exact executable/version identities, permission
+and adapter references, and separate capability evidence. The profile's
+content-addressed reference must match this record. Reservations require supported
+launch/readiness/prompt/stop evidence and matching config/runtime kind; absent usage,
+checkpoint or resume support remains explicit. No credentials or argv values are
+added to attempt records, projections or events.
+
+Schema 12 prevents old clients from writing new-format records and rejects new
+old-format reservations. Existing version-1 inputs preserve serialization and
+content IDs. Independent review required a literal historical v1 fixture; that
+fixture now verifies unchanged payloads, IDs, events and head across upgrade and
+reopen, plus safe never-claimed cancellation. The review approved the increment.
+The sealed preparation still has no production adapter/policy producer, and launch
+dispatch remains disabled. Version probes do not fabricate capability evidence.
+
+Validation passes all 403 tests in debug and release (96 library, 277 binary,
+28 CLI, 2 contracts). Logs: `/tmp/herdr-frozen-profile-{debug,release,lib,upgrade}.log`.
+Three optional live checks remain ignored; macOS remains unavailable. No user store
+was upgraded. Overall card counts remain 16 implemented, three partial, 22 not started.

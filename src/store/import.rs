@@ -34,6 +34,10 @@ impl SqliteStore {
             if unsupported {return Err(StoreError::Invalid("upgrade refused: preexisting runtime.launch intents lack sealed attempt inputs; reconcile unsupported intents before upgrading".into()));}
             tx.execute_batch(include_str!("../../migrations/0011_attempt_inputs.sql"))?;
         }
+        if version<=11 {
+            super::reservations::read_inputs(&tx)?;
+            tx.execute_batch(include_str!("../../migrations/0012_effective_profiles.sql"))?;
+        }
         tx.commit()?;
         Ok(())
     }
