@@ -47,6 +47,7 @@ impl SqliteStore {
         if version<=18 {tx.execute_batch(include_str!("../../migrations/0019_memory_snapshots.sql"))?;}
         if version<=19 {tx.execute_batch(include_str!("../../migrations/0020_coordinator_checkpoints.sql"))?;}
         if version<=20 {tx.execute_batch(include_str!("../../migrations/0021_memory_proposals.sql"))?;}
+        if version<=21 {tx.execute_batch(include_str!("../../migrations/0022_memory_reviews.sql"))?;}
         tx.commit()?;
         Ok(())
     }

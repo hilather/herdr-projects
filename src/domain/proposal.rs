@@ -89,3 +89,33 @@ pub struct StoredProposal {
     pub review_state: String,
     pub created_unix_ms: i64,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewDocument {
+    pub schema_version: u32,
+    pub proposal_id: String,
+    pub decision: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewDecision {
+    pub id: String,
+    pub proposal_id: String,
+    pub payload_digest: String,
+    pub decision: String,
+    pub classification: String,
+    pub reviewed_heads: String,
+    pub reason: String,
+    pub created_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromotionReceipt {
+    pub proposal_id: String,
+    pub decision_id: String,
+    pub sequence: u64,
+    pub change_ids: Vec<String>,
+    pub reused: bool,
+}

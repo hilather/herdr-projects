@@ -68,50 +68,52 @@ fn hops_from_pins(db:&Connection,pins:&[String])->Result<std::collections::BTree
 fn entry_bytes(fact:&crate::domain::ActiveFact,role:&str)->u64 {
     serde_json::json!({"id":fact.record.id.as_str(),"key":fact.record.record_key,"revision":fact.revision.revision,"kind":fact.record.kind.as_str(),"body":fact.revision.body_hash.as_str(),"role":role}).to_string().len() as u64
 }
+pub(crate) fn apply_memory_revision_in_tx(tx:&rusqlite::Transaction,next:&crate::domain::NewRevision)->Result<(MemoryHead,u64)> {
+    next.applicability.validate().map_err(|s|invalid(&s))?;
+    if next.record_key.is_empty()||next.record_key.len()>512||next.record_key.chars().any(char::is_control) {return Err(invalid("invalid memory record_key"));}
+    if next.scope_id.is_empty()||next.scope_id.len()>128 {return Err(invalid("invalid memory scope"));}
+    objects::require_available(tx,next.body_hash.as_str()).map_err(|_|invalid("missing object"))?;
+    objects::require_available(tx,next.provenance_hash.as_str()).map_err(|_|invalid("missing object"))?;
+    objects::cancel_pending(tx,next.body_hash.as_str())?;objects::cancel_pending(tx,next.provenance_hash.as_str())?;
+    let existing=record(tx,next.id.as_str())?;
+    if let Some(old)=&existing {
+        if old.record_key!=next.record_key||old.scope_id!=next.scope_id||old.kind!=next.kind {return Err(invalid("memory record identity mismatch"));}
+    } else {
+        tx.execute("INSERT INTO memory_records VALUES(?1,?2,?3,?4,0)",params![next.id.as_str(),next.record_key,next.scope_id,next.kind.as_str()])?;
+    }
+    let current:Option<(u64,String,u64)>=tx.query_row("SELECT revision,status,row_revision FROM memory_heads WHERE record_id=?1",[next.id.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    match (next.expected, current.as_ref()) {
+        (None, None)=>{},
+        (Some(rev), Some((head,status,_))) if *head==rev && status=="active"=>{},
+        _=>return Err(StoreError::Conflict),
+    }
+    let revision=current.as_ref().map(|(h,_,_)|*h).unwrap_or(0).checked_add(1).ok_or_else(||invalid("memory revision exhausted"))?;
+    let applicability=serde_json::to_string(&next.applicability).map_err(|_|invalid("applicability encoding failed"))?;
+    let payload=serde_json::to_string(&serde_json::json!({"id":next.id.as_str(),"revision":revision,"body":next.body_hash.as_str(),"provenance":next.provenance_hash.as_str()})).map_err(|_|invalid("memory event encoding failed"))?;
+    let seq=insert_event(tx,"memory.revision_inserted",next.id.as_str(),revision,&payload)?;
+    tx.execute("INSERT INTO memory_revisions VALUES(?1,?2,?3,?4,?5,?6)",params![next.id.as_str(),integer(revision)?,next.body_hash.as_str(),next.provenance_hash.as_str(),integer(seq)?,applicability])?;
+    let state=if next.validity_state.is_empty(){"valid"}else{next.validity_state.as_str()};
+    let reason=if next.validity_reason.is_empty(){"control_insert"}else{next.validity_reason.as_str()};
+    if !matches!(state,"valid"|"stale"|"blocked") {return Err(invalid("invalid validity state"));}
+    if reason.is_empty()||reason.len()>64||reason.chars().any(char::is_control) {return Err(invalid("invalid validity reason"));}
+    tx.execute("INSERT INTO memory_validity VALUES(?1,?2,?3,?4,?5,?6)",params![next.id.as_str(),integer(revision)?,state,reason,next.expiry_unix_ms,integer(seq)?])?;
+    for (source,source_rev,kind) in &next.dependencies {
+        if kind.is_empty()||kind.len()>64 {return Err(invalid("invalid memory dependency kind"));}
+        tx.execute("INSERT INTO memory_dependencies VALUES(?1,?2,?3,?4,?5)",params![next.id.as_str(),integer(revision)?,source.as_str(),integer(*source_rev)?,kind])?;
+    }
+    let row_revision=current.as_ref().map(|(_,_,r)|*r).unwrap_or(0).checked_add(1).ok_or_else(||invalid("memory head row exhausted"))?;
+    if current.is_some() {
+        tx.execute("UPDATE memory_heads SET revision=?2,status='active',row_revision=?3 WHERE record_id=?1",params![next.id.as_str(),integer(revision)?,integer(row_revision)?])?;
+    } else {
+        tx.execute("INSERT INTO memory_heads VALUES(?1,?2,'active',?3)",params![next.id.as_str(),integer(revision)?,integer(row_revision)?])?;
+    }
+    Ok((MemoryHead{record_id:next.id.clone(),revision,status:"active".into(),row_revision},seq))
+}
 impl SqliteStore {
     pub fn insert_memory_revision(&mut self,next:&crate::domain::NewRevision)->Result<(MemoryHead,u64)> {
-        next.applicability.validate().map_err(|s|invalid(&s))?;
-        if next.record_key.is_empty()||next.record_key.len()>512||next.record_key.chars().any(char::is_control) {return Err(invalid("invalid memory record_key"));}
-        if next.scope_id.is_empty()||next.scope_id.len()>128 {return Err(invalid("invalid memory scope"));}
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
-        objects::require_available(&tx,next.body_hash.as_str()).map_err(|_|invalid("missing object"))?;
-        objects::require_available(&tx,next.provenance_hash.as_str()).map_err(|_|invalid("missing object"))?;
-        objects::cancel_pending(&tx,next.body_hash.as_str())?;objects::cancel_pending(&tx,next.provenance_hash.as_str())?;
-        let existing=record(&tx,next.id.as_str())?;
-        if let Some(old)=&existing {
-            if old.record_key!=next.record_key||old.scope_id!=next.scope_id||old.kind!=next.kind {return Err(invalid("memory record identity mismatch"));}
-        } else {
-            tx.execute("INSERT INTO memory_records VALUES(?1,?2,?3,?4,0)",params![next.id.as_str(),next.record_key,next.scope_id,next.kind.as_str()])?;
-        }
-        let current:Option<(u64,String,u64)>=tx.query_row("SELECT revision,status,row_revision FROM memory_heads WHERE record_id=?1",[next.id.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-        let expected=next.expected;
-        match (expected, current.as_ref()) {
-            (None, None)=>{},
-            (Some(rev), Some((head,status,_))) if *head==rev && status=="active"=>{},
-            _=>return Err(StoreError::Conflict),
-        }
-        let revision=current.as_ref().map(|(h,_,_)|*h).unwrap_or(0).checked_add(1).ok_or_else(||invalid("memory revision exhausted"))?;
-        let applicability=serde_json::to_string(&next.applicability).map_err(|_|invalid("applicability encoding failed"))?;
-        let payload=serde_json::to_string(&serde_json::json!({"id":next.id.as_str(),"revision":revision,"body":next.body_hash.as_str(),"provenance":next.provenance_hash.as_str()})).map_err(|_|invalid("memory event encoding failed"))?;
-        let seq=insert_event(&tx,"memory.revision_inserted",next.id.as_str(),revision,&payload)?;
-        tx.execute("INSERT INTO memory_revisions VALUES(?1,?2,?3,?4,?5,?6)",params![next.id.as_str(),integer(revision)?,next.body_hash.as_str(),next.provenance_hash.as_str(),integer(seq)?,applicability])?;
-        let state=if next.validity_state.is_empty(){"valid"}else{next.validity_state.as_str()};
-        let reason=if next.validity_reason.is_empty(){"control_insert"}else{next.validity_reason.as_str()};
-        if !matches!(state,"valid"|"stale"|"blocked") {return Err(invalid("invalid validity state"));}
-        if reason.is_empty()||reason.len()>64||reason.chars().any(char::is_control) {return Err(invalid("invalid validity reason"));}
-        tx.execute("INSERT INTO memory_validity VALUES(?1,?2,?3,?4,?5,?6)",params![next.id.as_str(),integer(revision)?,state,reason,next.expiry_unix_ms,integer(seq)?])?;
-        for (source,source_rev,kind) in &next.dependencies {
-            if kind.is_empty()||kind.len()>64 {return Err(invalid("invalid memory dependency kind"));}
-            tx.execute("INSERT INTO memory_dependencies VALUES(?1,?2,?3,?4,?5)",params![next.id.as_str(),integer(revision)?,source.as_str(),integer(*source_rev)?,kind])?;
-        }
-        let row_revision=current.as_ref().map(|(_,_,r)|*r).unwrap_or(0).checked_add(1).ok_or_else(||invalid("memory head row exhausted"))?;
-        if current.is_some() {
-            tx.execute("UPDATE memory_heads SET revision=?2,status='active',row_revision=?3 WHERE record_id=?1",params![next.id.as_str(),integer(revision)?,integer(row_revision)?])?;
-        } else {
-            tx.execute("INSERT INTO memory_heads VALUES(?1,?2,'active',?3)",params![next.id.as_str(),integer(revision)?,integer(row_revision)?])?;
-        }
-        tx.commit()?;
-        Ok((MemoryHead{record_id:next.id.clone(),revision,status:"active".into(),row_revision},seq))
+        let result=apply_memory_revision_in_tx(&tx,next)?;
+        tx.commit()?;Ok(result)
     }
     pub fn cas_memory_head(&mut self,id:&MemoryRecordId,expected:Option<u64>,next:u64)->Result<()> {
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
@@ -357,8 +359,8 @@ mod tests {
     fn schema17_upgrade_adds_empty_memory_tables() {
         let temp=tempfile::tempdir().unwrap();let path=temp.path().join("state.db");
         let mut db=SqliteStore::create(&path).unwrap();
-        db.connection.execute_batch("DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; UPDATE store_meta SET schema_version=17; PRAGMA user_version=17;").unwrap();
-        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=21;
+        db.connection.execute_batch("DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; UPDATE store_meta SET schema_version=17; PRAGMA user_version=17;").unwrap();
+        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=22;
         assert_eq!(db.read_snapshot(None).unwrap(),before);
         assert!(db.memory_records().unwrap().is_empty());
         db.integrity_check().unwrap();

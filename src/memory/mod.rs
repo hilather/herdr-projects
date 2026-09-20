@@ -39,6 +39,7 @@ mod snapshot;
 mod import;
 mod checkpoint;
 mod proposals;
+mod review;
 pub use retrieval::*;
 pub use import::*;
 pub use checkpoint::*;

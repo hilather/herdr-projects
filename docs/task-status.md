@@ -3,7 +3,7 @@
 Updated 2026-09-20. Counts describe implementation progress, not release acceptance.
 Local tests do not replace the plan's independent review, macOS or live-system gates.
 
-**23 cards have local implementations; T04.1, T04.3 and T04.4 are partial and 15 have not started.** W03 has a bounded
+**24 cards have local implementations; T04.1, T04.3 and T04.4 are partial and 14 have not started.** W03 has a bounded
 [reviewed handoff](w03-acceptance.md). Canonical launch crash certification remains
 an explicit W04 prerequisite before enabling launches; it is not claimed as passed.
 Phase A was accepted by the user with documented testing gaps.
@@ -16,13 +16,13 @@ Phase A was accepted by the user with documented testing gaps.
 | W03 | Transactional store, migration, outbox and reconciliation | 4 | 0 | 0 |
 | W04 | Scheduling, capacity, execution pools, profiles and authority | 2 | 3 | 0 |
 | W05 | Versioned memory, snapshots, import and coordinator checkpoints | 4 | 0 | 0 |
-| W06 | Memory proposals, promotion, updates, invalidation and barriers | 1 | 0 | 4 |
+| W06 | Memory proposals, promotion, updates, invalidation and barriers | 2 | 0 | 3 |
 | W07 | Revision-bound results, integration and review gates | 0 | 0 | 4 |
 | W08 | CI, live compatibility, failure testing and performance | 0 | 0 | 4 |
 | W09 | Pilot, packaging and release acceptance | 0 | 0 | 3 |
-| **Total** | | **23** | **3** | **15** |
+| **Total** | | **24** | **3** | **14** |
 
-Implemented locally: **T00.1–T00.2, T01.1–T01.5, T02.1–T02.5, T03.1–T03.4, T04.2, T04.5, T05.1–T05.4, T06.1**. See
+Implemented locally: **T00.1–T00.2, T01.1–T01.5, T02.1–T02.5, T03.1–T03.4, T04.2, T04.5, T05.1–T05.4, T06.1, T06.2**. See
 [implementation progress](implementation-progress.md) and
 [Phase B contract ADR](adr/0002-phase-b-contracts.md) for evidence and limits.
 
@@ -142,7 +142,7 @@ live validation, packaging and release. The 25-card count is not a time estimate
 macOS remains untested; unsupported cleanup continues to refuse.
 
 
-## Current stopping point: T06.2 promotion after T06.1 close (W05/W06 wave gates not claimed)
+## Current stopping point: T06.3 delivery/ack after T06.2 close (W05/W06 wave gates not claimed)
 
 Original SQL cancellation/deadlines now cover canonical maintenance through
 observation commit, marker publication and claim expiry. Controlled snapshots
@@ -164,11 +164,13 @@ T05.3 is closed on local Linux evidence: a separate memory journal, reviewed
 import, projection rendering, `memory cutover` to `sqlite-v1`, and post-cutover
 `brief_for` (snapshot if present, otherwise projections). Markdown remains
 memory authority until that cutover. Production launches stay disabled. Counts
-are 23 locally implemented, three partial and 15 unstarted. T05.4 is closed on
+are 24 locally implemented, three partial and 14 unstarted. T05.4 is closed on
 local Linux evidence: schema 20 sessions/checkpoints, planner-or-`--profile`
 context, ack-gated deltas, fail-closed reads that do not consume the cursor, and
 doctor size printing. T06.1 is closed on local Linux evidence: idempotent
 `memory propose`, deterministic validation, and rejection of stale bases, missing
 evidence, malformed/oversized payloads and permission elevation. Proposals are
-not authoritative and are not promoted. The W05 and W06 wave gates are not
-claimed. Production launches stay disabled. Next: T06.2 review/promotion.
+not authoritative and are not promoted. T06.2 is closed on local Linux evidence: immutable review
+decisions, atomic promote of heads plus invalidation/intent, competing CAS, and
+stale-review rejection. The W05 and W06 wave gates are not claimed. Production
+launches stay disabled. Next: T06.3 selective delivery and acknowledgment.

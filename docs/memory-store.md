@@ -97,3 +97,15 @@ as `is_hard`, informational impact on a hard record) are rejected with repairabl
 diagnostics. Semantic review and promotion remain T06.2. Remember-section findings
 enter this route rather than canonical Markdown or store writes. This is local
 Linux card acceptance, not the W06 wave gate. Production launches stay disabled.
+
+## Review and promotion (T06.2)
+
+`herdr-projects memory review PROJECT --proposal ID --decision-file review.json`
+classifies each change as disjoint, compatible, or contradictory against current
+heads and records an immutable decision. It does not write memory heads.
+`memory promote PROJECT --proposal ID --decision ID` rechecks the reviewed event
+head and record revisions, then commits new revisions, invalidation rows and a
+promotion receipt in one transaction. Replay of the same proposal is idempotent.
+A competing promote of the same record cannot silently overwrite; a review whose
+heads moved must be repeated. Worker `--role` is not accepted. Semantic review
+does not auto-rebase. Delivery/ack remains T06.3.

@@ -91,8 +91,8 @@ mod tests {
     fn schema19_upgrade_adds_empty_checkpoint_tables() {
         let temp=tempfile::tempdir().unwrap();let path=temp.path().join("state.db");
         let mut db=SqliteStore::create(&path).unwrap();
-        db.connection.execute_batch("DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; UPDATE store_meta SET schema_version=19; PRAGMA user_version=19;").unwrap();
-        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=21;
+        db.connection.execute_batch("DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; UPDATE store_meta SET schema_version=19; PRAGMA user_version=19;").unwrap();
+        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=22;
         assert_eq!(db.read_snapshot(None).unwrap(),before);
         assert!(db.last_checkpoint_sizes().unwrap().is_none());
         db.integrity_check().unwrap();
@@ -101,8 +101,8 @@ mod tests {
     fn schema16_upgrade_reaches_schema20_without_inventing_checkpoints() {
         let temp=tempfile::tempdir().unwrap();let path=temp.path().join("state.db");
         let mut db=SqliteStore::create(&path).unwrap();
-        db.connection.execute_batch("DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; UPDATE store_meta SET schema_version=16; PRAGMA user_version=16;").unwrap();
-        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=21;
+        db.connection.execute_batch("DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; UPDATE store_meta SET schema_version=16; PRAGMA user_version=16;").unwrap();
+        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=22;
         assert_eq!(db.read_snapshot(None).unwrap(),before);
         assert!(db.last_checkpoint_sizes().unwrap().is_none());
         db.integrity_check().unwrap();

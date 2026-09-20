@@ -4,7 +4,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{fmt, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 
-const SCHEMA: u32 = 21;
+const SCHEMA: u32 = 22;
 const APPLICATION: u32 = 1_213_222_994;
 const MIN_SQLITE: i32 = 3_053_004;
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
@@ -76,6 +76,7 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../migrations/0019_memory_snapshots.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0020_coordinator_checkpoints.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0021_memory_proposals.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0022_memory_reviews.sql"))?;
             tx.commit()?;
         }
         // Persist the initial directory entry as well as SQLite's own commit.
@@ -346,6 +347,7 @@ mod objects;
 mod memory;
 mod checkpoints;
 mod proposals;
+mod reviews;
 mod routines;
 
 pub mod identity_inventory;

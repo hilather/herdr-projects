@@ -2745,3 +2745,11 @@ the prior result; a reused ID with different bytes conflicts. Stale bases,
 missing objects, malformed JSON, oversized payloads and permission elevation
 are rejected. This does not promote memory or claim the W06 wave gate. Next:
 T06.2.
+
+### T06.2 review and atomic promotion (local Linux)
+
+Control CLI `memory review` / `memory promote` records an immutable decision
+outside the promotion transaction, then commits revisions, invalidations and a
+promotion receipt together. Competing promotes of the same head conflict; a
+review whose event head moved must be repeated. Workers still cannot supply
+`--role`. Delivery/ack is T06.3. The W06 wave gate is not claimed.

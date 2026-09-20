@@ -108,6 +108,8 @@ enum MemoryCommand {
     },
     Snapshot { #[arg(long)] task:String, #[arg(long)] profile:String, #[arg(long)] input_file:PathBuf },
     Propose { #[arg(long)] input:PathBuf },
+    Review { #[arg(long)] proposal:String, #[arg(long)] decision_file:PathBuf },
+    Promote { #[arg(long)] proposal:String, #[arg(long)] decision:String },
 }
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
@@ -605,6 +607,17 @@ pub fn run() -> Result<()> {
                     let bytes=herdr_projects::migration::read_plan_file(&input)?;
                     let mut memory=herdr_projects::memory::MemoryStore::from_sqlite(herdr_projects::migration::open_active(&dir)?,dir.join(".state/objects"));
                     serde_json::to_value(memory.propose(&bytes,jiff::Timestamp::now().as_millisecond())?)?
+                },
+                MemoryCommand::Review{proposal,decision_file}=>{
+                    let bytes=herdr_projects::migration::read_plan_file(&decision_file)?;
+                    let mut memory=herdr_projects::memory::MemoryStore::from_sqlite(herdr_projects::migration::open_active(&dir)?,dir.join(".state/objects"));
+                    let decision=memory.review(&bytes,jiff::Timestamp::now().as_millisecond())?;
+                    anyhow::ensure!(decision.proposal_id==proposal,"decision-file proposal_id must match --proposal");
+                    serde_json::to_value(decision)?
+                },
+                MemoryCommand::Promote{proposal,decision}=>{
+                    let mut memory=herdr_projects::memory::MemoryStore::from_sqlite(herdr_projects::migration::open_active(&dir)?,dir.join(".state/objects"));
+                    serde_json::to_value(memory.promote(&proposal,&decision,jiff::Timestamp::now().as_millisecond())?)?
                 },
             };println!("{}",serde_json::to_string_pretty(&value)?);Ok(())
         },

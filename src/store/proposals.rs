@@ -54,6 +54,13 @@ impl SqliteStore {
             [id],|r|Ok(StoredProposal{id:r.get(0)?,payload_digest:r.get(1)?,task_id:r.get(2)?,attempt_id:r.get(3)?,snapshot_id:r.get(4)?,review_state:r.get(5)?,created_unix_ms:r.get(6)?})
         ).optional()?)
     }
+    pub fn memory_proposal_payload(&mut self,id:&str)->Result<Option<(StoredProposal,String)>> {
+        let tx=self.connection.transaction()?;schema(&tx)?;
+        Ok(tx.query_row(
+            "SELECT id,payload_digest,task_id,attempt_id,snapshot_id,review_state,created_unix_ms,payload FROM memory_proposals WHERE id=?1",
+            [id],|r|Ok((StoredProposal{id:r.get(0)?,payload_digest:r.get(1)?,task_id:r.get(2)?,attempt_id:r.get(3)?,snapshot_id:r.get(4)?,review_state:r.get(5)?,created_unix_ms:r.get(6)?},r.get(7)?))
+        ).optional()?)
+    }
 }
 
 #[cfg(test)]
@@ -63,8 +70,8 @@ mod tests {
     fn schema20_upgrade_adds_empty_proposal_tables() {
         let temp=tempfile::tempdir().unwrap();let path=temp.path().join("state.db");
         let mut db=SqliteStore::create(&path).unwrap();
-        db.connection.execute_batch("DROP TABLE proposal_validations; DROP TABLE memory_proposals; UPDATE store_meta SET schema_version=20; PRAGMA user_version=20;").unwrap();
-        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=21;
+        db.connection.execute_batch("DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; UPDATE store_meta SET schema_version=20; PRAGMA user_version=20;").unwrap();
+        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=22;
         assert_eq!(db.read_snapshot(None).unwrap(),before);
         assert!(db.memory_proposal("mp-x").unwrap().is_none());
         db.integrity_check().unwrap();
