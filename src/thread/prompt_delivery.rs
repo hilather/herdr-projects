@@ -4,12 +4,14 @@ use herdr_projects::execution_guard::ProjectGuard;
 use crate::source_tree::Control;
 pub use herdr_projects::prompt_claim::{Claim,Phase};
 pub fn validate(t:&Thread)->Result<()> {
+    super::launch_delivery::validate(t)?;
     anyhow::ensure!(t.prompt_sequence<=i64::MAX as u64,"brief sequence exhausted");
     if let Some(claim)=&t.prompt_claim {claim.validate(t.prompt_sequence)?;if claim.phase==Phase::Pending {anyhow::ensure!(t.pending_live_copy.is_none()&&t.pending_final_copy.is_none(),"pending brief conflicts with copy projection");}}
     Ok(())
 }
 pub fn ready(t:&Thread)->Result<()> {
     validate(t)?;
+    anyhow::ensure!(t.launch_claim.as_ref().is_none_or(|c|c.phase!=Phase::Pending&&(c.phase!=Phase::Uncertain||c.generation!=t.lifecycle_generation)),"recover pending or uncertain agent start first");
     anyhow::ensure!(t.status==Status::Open&&t.prompt_pending&&t.removal.is_none()&&t.pending_live_copy.is_none()&&t.pending_final_copy.is_none(),"thread is not eligible for a brief prompt");
     if let Some(claim)=&t.prompt_claim {
         anyhow::ensure!(claim.phase!=Phase::Pending&&claim.notified&&claim.execution!=execution_fingerprint(t),"brief delivery already claimed; reconcile before retrying");

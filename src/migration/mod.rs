@@ -362,6 +362,11 @@ pub fn status(project:&Path)->Result<Journal> { let project=checked_project(proj
 mod tests;
 
 fn validate_thread(value:&toml::Value)->Result<()> {
+    if let Some(claim)=value.get("launch_claim") {
+        let claim:crate::launch_claim::Claim=claim.clone().try_into()?;
+        let sequence=value.get("launch_sequence").and_then(|v|v.as_integer()).filter(|n|*n>=0).context("launch sequence missing")? as u64;claim.validate(sequence)?;
+        ensure!(claim.phase==crate::launch_claim::Phase::Confirmed||(claim.phase==crate::launch_claim::Phase::Uncertain&&claim.notified&&value.get("status").and_then(|v|v.as_str())==Some("resolved")),"uncertain or pending agent start requires reconciliation before migration");
+    }
     if let Some(claim)=value.get("prompt_claim") {
         let claim:crate::prompt_claim::Claim=claim.clone().try_into()?;
         let sequence=value.get("prompt_sequence").and_then(|v|v.as_integer()).filter(|n|*n>=0).context("brief sequence missing")? as u64;claim.validate(sequence)?;
@@ -371,7 +376,7 @@ fn validate_thread(value:&toml::Value)->Result<()> {
     ensure!(value.get("pending_live_copy").is_none(),"pending live projection requires recovery before migration");
     for field in ["id", "title", "error", "repo", "origin", "branch", "base", "machine", "worktree_path", "thread_dir", "workspace_id", "tab_id", "pane_id", "agent", "agent_name", "cwd", "created", "updated", "last_state", "last_state_change", "last_group", "report_hash", "last_report_change", "last_review_item_hash", "last_review_execution", "acked_report_hash", "pr", "pr_state", "pr_review", "resolved_reason", "suppressed_merged_pr", "last_finalization", "artifact_snapshot"] { if let Some(v)=value.get(field) { ensure!(v.is_str(),"invalid thread string field"); } }
     for field in ["prompt_pending"] { if let Some(v)=value.get(field) { ensure!(v.is_bool(),"invalid thread boolean field"); } }
-    for field in ["launch_attempts", "lifecycle_generation", "status_notice_sequence", "review_notice_sequence", "last_review_copy_sequence", "live_copy_sequence", "final_copy_sequence", "prompt_sequence"] { if let Some(v)=value.get(field) { ensure!(v.as_integer().is_some_and(|n|n>=0),"invalid thread integer field"); } }
+    for field in ["launch_attempts", "lifecycle_generation", "status_notice_sequence", "review_notice_sequence", "last_review_copy_sequence", "live_copy_sequence", "final_copy_sequence", "prompt_sequence", "launch_sequence"] { if let Some(v)=value.get(field) { ensure!(v.as_integer().is_some_and(|n|n>=0),"invalid thread integer field"); } }
     if let Some(kind)=value.get("kind") { ensure!(matches!(kind.as_str(),Some("worktree"|"tab"|"adopted")),"invalid thread kind"); }
     if value.get("removal").is_some() { anyhow::bail!("pending/historical removal requires reconciliation before migration"); }
     Ok(())

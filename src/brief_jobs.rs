@@ -6,13 +6,15 @@ use crate::{executor::{Identity,Lane,Request},paths::{self,Ctx},project::{self,P
 use herdr_projects::execution_guard::ProjectGuard;
 #[path="brief_jobs_ownership.rs"]
 mod ownership;
+#[path="launch_jobs.rs"]
+mod launch;
 const JOB:&str="\0herdr-projects-brief";
 const BUDGET:Duration=Duration::from_secs(45);
 const INPUT_LIMIT:usize=64*1024;
 #[derive(Clone,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Input {
-    project:PathBuf,identity:(u64,u64),id:String,execution:String,sequence:u64,
+    project:PathBuf,identity:(u64,u64),id:String,execution:String,sequence:u64,#[serde(default)]launch:bool,
     socket:PathBuf,socket_identity:(u64,u64),herdr:String,remote:Option<Remote>,config:PathBuf,config_digest:Option<String>,
 }
 #[derive(Clone,Serialize,Deserialize)]
@@ -40,7 +42,7 @@ impl Input {
         ensure!(socket(project)?==self.socket&&socket_identity(&self.socket)?==self.socket_identity,"brief session changed");
         ensure!(digest(&self.config)?==self.config_digest,"brief configuration changed");
         let t=thread::load(project,&self.id)?;
-        ensure!(self.remote.as_ref().map_or(t.machine.is_empty(),|r|r.selector==t.machine)&&thread::execution_fingerprint(&t)==self.execution&&t.prompt_sequence==self.sequence,"brief execution changed");thread::prompt_delivery::ready(&t)?;control.check()?;Ok(t)
+        ensure!(self.remote.as_ref().map_or(t.machine.is_empty(),|r|r.selector==t.machine)&&thread::execution_fingerprint(&t)==self.execution&&(if self.launch{t.launch_sequence}else{t.prompt_sequence})==self.sequence,"terminal execution changed");if self.launch{thread::launch_delivery::ready(&t)?;}else{thread::prompt_delivery::ready(&t)?;}control.check()?;Ok(t)
     }
 }
 fn run(mut cmd:Cmd,control:&Control,locks:&[InheritedLock])->Result<serde_json::Value> {
@@ -66,7 +68,7 @@ fn call(input:&Input,herdr:&crate::herdr::Herdr,method:&str,prompt:Option<(&str,
     let cmd=herdr.cmd(crate::herdr::CALL_TIMEOUT);
     run(match prompt {Some((pane,text))=>cmd.args(["agent","prompt",pane,text]),None=>cmd.args(if method=="agent.list"{["agent","list"]}else{["pane","list"]})},control,locks)
 }
-fn execute(input:&Input,control:&Control)->Result<()> {execute_with(input,control,||Ok(()))}
+fn execute(input:&Input,control:&Control)->Result<()> {if input.launch{launch::execute(input,control)}else{execute_with(input,control,||Ok(()))}}
 fn execute_with(input:&Input,control:&Control,after_claim:impl FnOnce()->Result<()>)->Result<()> {
     input.validate()?;control.check()?;let guard=ProjectGuard::acquire(&input.project)?;let locks=guard.inherit_transfer()?;
     let project=Project::load(input.project.parent().context("brief project root missing")?,input.project.file_name().and_then(|s|s.to_str()).context("invalid brief project name")?)?;
@@ -108,18 +110,22 @@ impl Runner for JobRunner {
     fn socket_request(&self,socket:&Path,line:&str,timeout:Duration)->Result<String>{self.inner.socket_request(socket,line,timeout)}
 }
 pub fn request(ctx:&Ctx,project:&Project,t:&Thread)->Result<Request> {
-    request_with_route(ctx,project,t,None)
+    request_with_route(ctx,project,t,None,false)
 }
 pub fn request_remote(ctx:&Ctx,project:&Project,t:&Thread,route:&crate::remote_api::Route)->Result<Request> {
     ensure!(t.is_remote(),"remote brief requires a remote thread");
-    request_with_route(ctx,project,t,Some(Remote{route:route.clone(),selector:t.machine.clone(),binary:ctx.env.var("HERDR_PROJECTS_REMOTE_HERDR_BIN").unwrap_or("herdr").into()}))
+    request_with_route(ctx,project,t,Some(Remote{route:route.clone(),selector:t.machine.clone(),binary:ctx.env.var("HERDR_PROJECTS_REMOTE_HERDR_BIN").unwrap_or("herdr").into()}),false)
 }
-fn request_with_route(ctx:&Ctx,project:&Project,t:&Thread,remote:Option<Remote>)->Result<Request> {
-    thread::prompt_delivery::ready(t)?;ensure!(t.is_remote()==remote.is_some(),"brief route kind mismatch");
+pub fn request_launch(ctx:&Ctx,project:&Project,t:&Thread,route:Option<&crate::remote_api::Route>)->Result<Request> {
+    let remote=route.map(|route|Remote{route:route.clone(),selector:t.machine.clone(),binary:ctx.env.var("HERDR_PROJECTS_REMOTE_HERDR_BIN").unwrap_or("herdr").into()});
+    request_with_route(ctx,project,t,remote,true)
+}
+fn request_with_route(ctx:&Ctx,project:&Project,t:&Thread,remote:Option<Remote>,launch:bool)->Result<Request> {
+    if launch{thread::launch_delivery::ready(t)?;}else{thread::prompt_delivery::ready(t)?;}ensure!(t.is_remote()==remote.is_some(),"brief route kind mismatch");
     let path=project.dir().canonicalize()?;let m=std::fs::metadata(&path)?;let socket=socket(project)?;let config=std::path::absolute(&ctx.config_dir)?;
-    let input=Input{project:path.clone(),identity:(m.dev(),m.ino()),id:t.id.clone(),execution:thread::execution_fingerprint(t),sequence:t.prompt_sequence,socket_identity:socket_identity(&socket)?,socket,herdr:ctx.env.herdr_bin(),remote,config_digest:digest(&config)?,config};input.validate()?;
+    let input=Input{project:path.clone(),identity:(m.dev(),m.ino()),id:t.id.clone(),execution:thread::execution_fingerprint(t),sequence:if launch{t.launch_sequence}else{t.prompt_sequence},launch,socket_identity:socket_identity(&socket)?,socket,herdr:ctx.env.herdr_bin(),remote,config_digest:digest(&config)?,config};input.validate()?;
     let text=serde_json::to_string(&input)?;ensure!(text.len()<=INPUT_LIMIT,"brief input exceeds bounds");
-    let identity=Identity{operation:format!("brief:{}",t.id),revision:1,project:path.to_str().context("brief project is not UTF-8")?.into(),machine:format!("brief-root:{}",path.parent().unwrap().display()),terminal:Some(t.pane_id.clone())};
+    let identity=Identity{operation:format!("{}:{}",if launch{"launch"}else{"brief"},t.id),revision:1,project:path.to_str().context("brief project is not UTF-8")?.into(),machine:format!("brief-root:{}",path.parent().unwrap().display()),terminal:Some(t.pane_id.clone())};
     let deadline=Instant::now()+BUDGET;let mut command=Cmd::new(JOB,BUDGET).stdin(text);command.deadline=Some(deadline);Ok(Request{identity,lane:Lane::Control,deadline,command})
 }
 

@@ -118,4 +118,7 @@ cross-project identity inventory, durable claims and typed agent acknowledgement
 Any duplicate pane reference involving a remote endpoint refuses, including
 different SSH aliases or sessions. Labels alone cannot establish distinct servers.
 The remote executable defaults to `herdr`; use `HERDR_PROJECTS_REMOTE_HERDR_BIN`
-for an installed path. Other terminal effects still need worker integration.
+for an installed path. Thread agent starts also use this bridge with durable generation-bound claims and
+exact terminal identity in their typed acknowledgement. Submission acknowledgement
+is separate from interactive readiness; uncertain starts are never replayed.
+Coordinator effects and token reporting still need worker integration.

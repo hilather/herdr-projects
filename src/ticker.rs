@@ -323,6 +323,10 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
             // re-resolves remote routing and checks retained authority itself.
             let (threads,diagnostics)=thread::list_with_diagnostics(&project);
             for error in diagnostics {log.line(&format!("{slug}: {error}"));}
+            if threads.iter().any(|t|t.launch_claim.as_ref().is_some_and(|claim|claim.phase==thread::launch_delivery::Phase::Pending||!claim.notified)) {
+                let recovered=(||->Result<()> {let guard=herdr_projects::execution_guard::ProjectGuard::acquire(&project.dir())?;thread::launch_delivery::recover(&project,&guard)})();
+                if let Err(error)=recovered {log.line(&format!("{slug}: launch recovery: {error:#}"));continue;}
+            }
             if threads.iter().any(|t|t.prompt_claim.as_ref().is_some_and(|claim|claim.phase==thread::prompt_delivery::Phase::Pending||!claim.notified)) {
                 let recovered=(||->Result<()> {let guard=herdr_projects::execution_guard::ProjectGuard::acquire(&project.dir())?;thread::prompt_delivery::recover(&project,&guard)})();
                 if let Err(error)=recovered {log.line(&format!("{slug}: brief recovery: {error:#}"));continue;}
@@ -518,6 +522,15 @@ fn thread_pass(project: &Project, herdr: &Herdr, threads: &[thread::Thread], age
 /// `agent start` per project per tick (`may_start`), and never a start and a
 /// prompt for the same pane in one tick: prompts only go to agents that were
 /// already listed before any start.
+fn offer_launches(ctx:&Ctx,project:&Project,threads:&[thread::Thread],agents:&[Agent],panes:&[Pane],queue:&mut crate::copy_jobs::Queue,route:Option<&crate::remote_api::Route>,errors:&mut Vec<anyhow::Error>) {
+    for t in threads.iter().filter(|t|thread::prompt_delivery::ready(t).is_ok()) {
+        if !agents.iter().any(|a|a.pane_id==t.pane_id)&&panes.iter().any(|p|thread::pane_matches(t,p)) {
+            if t.launch_attempts>=thread::MAX_LAUNCH_ATTEMPTS&&t.launch_claim.as_ref().is_none_or(|c|c.generation!=t.lifecycle_generation) {
+                errors.extend(thread::update(project,&t.id,|t|{t.status=thread::Status::Failed;t.error=format!("no `{}` agent appeared in the pane after {} launch attempts",t.agent,thread::MAX_LAUNCH_ATTEMPTS);}).err());
+            }else if thread::launch_delivery::ready(t).is_ok(){errors.extend(queue.offer_launch(ctx,project,t,route).err());}
+        }
+    }
+}
 fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::Thread], agents: &[Agent], panes: &[Pane], may_start: &mut bool, errors: &mut Vec<anyhow::Error>) {
     let now = jiff::Timestamp::now();
     for t in threads {
@@ -529,7 +542,7 @@ fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::T
         if live.agent_state.is_some() || !live.pane_exists {
             continue;
         }
-        if t.launch_attempts >= thread::MAX_LAUNCH_ATTEMPTS {
+        if t.launch_attempts >= thread::MAX_LAUNCH_ATTEMPTS&&t.launch_claim.as_ref().is_none_or(|c|c.generation!=t.lifecycle_generation) {
             let failed = thread::update(project, &t.id, |t| {
                 t.status = thread::Status::Failed;
                 t.error = format!("no `{}` agent appeared in the pane after {} launch attempts", t.agent, thread::MAX_LAUNCH_ATTEMPTS);
@@ -537,7 +550,7 @@ fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::T
             errors.extend(failed.err());
             continue;
         }
-        if !*may_start {
+        if thread::launch_delivery::ready(t).is_err()||!*may_start {
             continue;
         }
         let launched = (|| -> Result<()> {
@@ -690,14 +703,13 @@ fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threa
 fn apply_remote(ctx:&Ctx,project:&Project,herdr:&Herdr,machine:&str,threads:&[thread::Thread],observation:crate::remote_polling::Observation,asynchronous:bool,may_start:&mut bool,errors:&mut Vec<anyhow::Error>,mut copies:Option<&mut crate::copy_jobs::Queue>,deferred:&mut std::collections::BTreeSet<String>,observed:&mut std::collections::BTreeSet<String>)->Result<Vec<Transition>,String> {
     let remote=herdr.on_machine(machine);
     let crate::remote_polling::Observation{mut agents,mut panes,target,route,hashes}=observation;
-    // Briefs refresh inside their worker. Remaining synchronous starts still
-    // require the guarded live preflight when a delayed sample shows a shell.
-    let synchronous_launch=threads.iter().any(|t|thread::prompt_delivery::ready(t).is_ok()&&panes.iter().any(|p|thread::pane_matches(t,p))&&!agents.iter().any(|a|thread::agent_matches(t,a)));
-    if asynchronous&&(copies.is_none()||synchronous_launch)&&threads.iter().any(|t|t.prompt_pending||hashes.get(&t.id).is_some_and(|hash|hash!=&t.report_hash)) {
+    // Queue observations cannot authorize starts or prompts. Concrete workers
+    // perform their own fresh target checks under inherited ownership.
+    if asynchronous&&copies.is_none()&&threads.iter().any(|t|t.prompt_pending||hashes.get(&t.id).is_some_and(|hash|hash!=&t.report_hash)) {
         let current=crate::remote::ssh_target(ctx.runner,&ctx.env.herdr_bin(),&ctx.config_dir,machine).map_err(|e|format!("{e:#}"))?;
         if current!=target {return Err("remote route changed after observation; retry before effects".into());}
     }
-    if asynchronous&&(copies.is_none()||synchronous_launch)&&threads.iter().any(|t|t.prompt_pending) {
+    if asynchronous&&copies.is_none()&&threads.iter().any(|t|t.prompt_pending) {
         agents=remote.agent_list().map_err(|e|e.to_string())?;
         panes=remote.pane_list().map_err(|e|e.to_string())?;
     }
@@ -728,7 +740,7 @@ fn apply_remote(ctx:&Ctx,project:&Project,herdr:&Herdr,machine:&str,threads:&[th
         let copied = thread::copy_home_remote(project, t, true, ctx.runner, &target);
         errors.extend(thread::copy_delivery::record(project, t, &copied).map_err(|e|e.context(format!("{}: copy receipt", t.id))).err());
     }
-    launch_pass(ctx, project, herdr, threads, &agents, &panes, may_start, errors);
+    if let Some(queue)=copies.as_deref_mut(){offer_launches(ctx,project,threads,&agents,&panes,queue,route.as_ref(),errors);}else{launch_pass(ctx, project, herdr, threads, &agents, &panes, may_start, errors);}
     Ok(pass.transitions)
 }
 
@@ -796,7 +808,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
             errors.extend(thread::copy_delivery::record(project, t, &copied).map_err(|e|e.context(format!("{}: copy receipt", t.id))).err());
         }
     }
-    launch_pass(ctx, project, &herdr, &local, &seen.agents, &seen.panes, &mut may_start, &mut errors);
+    if let Some(queue)=memory.copy_jobs.as_mut(){offer_launches(ctx,project,&local,&seen.agents,&seen.panes,queue,None,&mut errors);}else{launch_pass(ctx, project, &herdr, &local, &seen.agents, &seen.panes, &mut may_start, &mut errors);}
 
     // Remote threads, one machine at a time, on elapsed-time deadlines.
     let remote_threads = open_threads(project, true);

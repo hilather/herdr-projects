@@ -20,6 +20,7 @@ pub const MAX_LAUNCH_ATTEMPTS: u32 = 3;
 pub mod copy_delivery;
 pub mod review_delivery;
 pub mod prompt_delivery;
+pub mod launch_delivery;
 #[allow(dead_code)] // Automatic final-copy admission follows recovery review.
 pub mod final_copy;
 
@@ -55,6 +56,8 @@ pub struct Thread {
     pub prompt_sequence: u64,
     pub prompt_claim: Option<prompt_delivery::Claim>,
     pub launch_attempts: u32,
+    pub launch_sequence:u64,
+    pub launch_claim:Option<launch_delivery::Claim>,
     pub kind: Kind,
     pub repo: String,
     pub origin: String,
@@ -472,7 +475,7 @@ pub fn group(thread: &Thread, live: &Live, now: jiff::Timestamp) -> Group {
         && live.state_secs >= NOT_READY_SECS;
     let pane_gone_without_report = !live.pane_exists && !has_report;
     let blocked_long = state == Some("blocked") && live.state_secs >= BLOCKED_DEBOUNCE_SECS;
-    if thread.status == Status::Failed || stuck_launch || pane_gone_without_report || blocked_long {
+    if thread.status == Status::Failed || stuck_launch || pane_gone_without_report || blocked_long || launch_delivery::needs_reconciliation(thread,live) {
         return Group::WaitingOnYou;
     }
     // 4

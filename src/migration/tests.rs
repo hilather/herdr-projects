@@ -694,3 +694,12 @@ fn pending_brief_claims_refuse_migration_but_confirmed_history_is_validated() {
     let confirmed=crate::prompt_claim::Claim{phase:crate::prompt_claim::Phase::Confirmed,notified:true,..claim};value["prompt_claim"]=toml::Value::try_from(&confirmed).unwrap();validate_thread(&value).unwrap();
     value["prompt_claim"]["execution"]=toml::Value::String("invalid".into());assert!(validate_thread(&value).is_err());
 }
+
+#[test]
+fn pending_or_unresolved_launch_claim_requires_reconciliation_before_import() {
+    let mut value:toml::Value=toml::from_str("id='t-0001'\nstatus='open'\nlaunch_sequence=1\n").unwrap();
+    let mut claim=crate::launch_claim::Claim{sequence:1,generation:0,execution:"a".repeat(64),arguments_digest:"b".repeat(64),route_digest:"c".repeat(64),terminal:"terminal".into(),phase:crate::launch_claim::Phase::Pending,error:String::new(),notified:false};
+    value.as_table_mut().unwrap().insert("launch_claim".into(),toml::Value::try_from(&claim).unwrap());assert!(validate_thread(&value).is_err());
+    claim.phase=crate::launch_claim::Phase::Confirmed;claim.notified=true;value["launch_claim"]=toml::Value::try_from(&claim).unwrap();assert!(validate_thread(&value).is_ok());
+    claim.phase=crate::launch_claim::Phase::Uncertain;claim.error="lost acknowledgement".into();value["launch_claim"]=toml::Value::try_from(&claim).unwrap();assert!(validate_thread(&value).is_err());value["status"]="resolved".into();assert!(validate_thread(&value).is_ok());
+}

@@ -818,3 +818,76 @@ sys.exit(subprocess.call(sys.argv[-1],shell=True))
         else {assert_eq!(read()["status"].as_str(),Some("failed"));assert_eq!(read()["prompt_claim"]["phase"].as_str(),Some("uncertain"));let notices=fs::read_dir(project.join("inbox")).unwrap().filter_map(Result::ok).filter(|e|e.file_name().to_string_lossy().starts_with("brief-")).count();assert_eq!(notices,1);}
     }
 }
+
+#[cfg(target_os="linux")]
+#[test]
+fn ticker_local_and_remote_launches_acknowledge_once_and_recover_lost_replies() {
+    use std::{fs,time::{Duration,Instant},process::Stdio,os::unix::{fs::PermissionsExt,net::UnixListener}};
+    for is_remote in [false,true] {
+    for outcome in ["confirmed","lost"] {
+        let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
+        assert!(hp(home.path(),&["--root",r,"new","demo"]).status.success());let project=root.join("demo");
+        let socket=home.path().join("session.sock");let _listener=UnixListener::bind(&socket).unwrap();
+        fs::write(project.join(".state/coordinator.json"),serde_json::json!({"socket":socket}).to_string()).unwrap();
+        let source=home.path().join("source");fs::create_dir(&source).unwrap();
+        let agent=serde_json::json!({"workspace_id":"w","tab_id":"tab","pane_id":"p","cwd":source,"name":"worker","agent":"claude","agent_status":"blocked","terminal_id":"terminal","launch_pending":true});
+        let record=project.join("threads/t-0001.toml");fs::write(&record,toml::to_string(&serde_json::json!({"id":"t-0001","status":"open","kind":"adopted","prompt_pending":true,"machine":if is_remote{"saved"}else{""},"thread_dir":source,"cwd":source,"workspace_id":"w","tab_id":"tab","pane_id":"p","agent":"claude","agent_name":"worker","created":jiff::Timestamp::now().to_string()})).unwrap()).unwrap();
+        fs::write(home.path().join("agents.json"),serde_json::json!({"result":{"agents":[agent.clone()]}}).to_string()).unwrap();
+        fs::write(home.path().join("panes.json"),serde_json::json!({"result":{"panes":[{"workspace_id":"w","tab_id":"tab","pane_id":"p","terminal_id":"terminal","cwd":source}]}}).to_string()).unwrap();
+        fs::write(home.path().join("ack.json"),serde_json::json!({"result":{"type":"agent_started","agent":agent,"argv":["claude"]}}).to_string()).unwrap();
+        let route=serde_json::json!([{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","label":"saved","target":"fixture.invalid","session":"named-session","enabled":true,"selected":false}]);
+        fs::write(home.path().join("routes.json"),route.to_string()).unwrap();fs::write(home.path().join("outcome"),outcome).unwrap();fs::write(home.path().join("remote-mode"),if is_remote{"yes"}else{"no"}).unwrap();
+        let fake=home.path().join("herdr");fs::write(&fake,r#"#!/usr/bin/python3
+import os,json,sys,pathlib
+root=pathlib.Path(os.environ['HOME']);args=sys.argv[1:];remote=args[:2]==['--machine','saved']
+if remote:args=args[2:]
+remote_mode=(root/'remote-mode').read_text()=='yes'
+if args[:1]==['remote-api-bridge']:os.execv(str(root/'remote herdr'),[str(root/'remote herdr'),*args])
+if args==['machine','list','--json']:print((root/'routes.json').read_text())
+elif args==['agent','list']:print((root/'agents.json').read_text() if (remote or not remote_mode) and (root/'started').exists() else '{"result":{"agents":[]}}')
+elif args==['pane','list']:
+ with open(root/'polls','a') as f:f.write('poll')
+ print((root/'panes.json').read_text() if remote or not remote_mode else '{"result":{"panes":[]}}')
+elif args[:2] in [['agent','prompt'],['agent','start']]:
+ (root/'WRONG_SYNC_EFFECT').touch();sys.exit(2)
+else:print('{"result":{"shown":true}}')
+"#).unwrap();fs::set_permissions(&fake,fs::Permissions::from_mode(0o700)).unwrap();
+        let bridge=home.path().join("remote herdr");fs::write(&bridge,r#"#!/usr/bin/python3
+import os,json,sys,pathlib
+root=pathlib.Path(os.environ['HOME'])
+args=sys.argv[1:]
+if args[:2]==['--session','named-session']:args=args[2:]
+assert args[0]=='remote-api-bridge'
+if args[1:]==['--check']:print('herdr-api-bridge-v1');sys.exit(0)
+r=json.loads(sys.stdin.readline())
+if r['method']=='agent.list':result=json.loads((root/'agents.json').read_text())['result'] if (root/'started').exists() else {'agents':[]}
+elif r['method']=='pane.list':result=json.loads((root/'panes.json').read_text())['result']
+elif r['method']=='agent.start':
+ assert r['params']=={'name':'worker','kind':'claude','pane_id':'p','args':[],'timeout_ms':20000}
+ with open(root/'started','a') as f:f.write('start')
+ if (root/'outcome').read_text()=='lost':sys.exit(1)
+ result=json.loads((root/'ack.json').read_text())['result'];del result['agent']['agent'];result['agent']['agent_status']='unknown'
+else:sys.exit(3)
+print(json.dumps({'id':r['id'],'result':result}))
+"#).unwrap();fs::set_permissions(&bridge,fs::Permissions::from_mode(0o700)).unwrap();
+        let ssh=home.path().join("ssh");fs::write(&ssh,r#"#!/usr/bin/python3
+import sys,subprocess
+assert sys.argv[-2]=='fixture.invalid'
+if 'remote-api-bridge' in sys.argv[-1]:assert sys.argv[1:4]==['-T','-o','StrictHostKeyChecking=yes']
+sys.exit(subprocess.call(sys.argv[-1],shell=True))
+"#).unwrap();fs::set_permissions(&ssh,fs::Permissions::from_mode(0o700)).unwrap();
+        struct Child(std::process::Child);impl Drop for Child {fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+        let spawn=||Child(Command::new(BIN).env_clear().env("HOME",home.path()).env("PATH",format!("{}:/usr/bin:/bin",home.path().display())).env("HERDR_BIN_PATH",&fake).env("HERDR_PROJECTS_REMOTE_HERDR_BIN",&bridge).args(["--root",r,"ticker","run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+        let read=||->toml::Value {toml::from_str(&fs::read_to_string(&record).unwrap()).unwrap()};
+        let wait=|child:&mut Child,predicate:&dyn Fn()->bool| {let end=Instant::now()+Duration::from_secs(45);while !predicate(){assert!(child.0.try_wait().unwrap().is_none());assert!(Instant::now()<end,"{}",fs::read_to_string(root.join(".ticker.log")).unwrap_or_default());std::thread::sleep(Duration::from_millis(10));}};
+        let stop=|child:&mut Child| {fs::write(root.join(".ticker.stop"),b"").unwrap();let end=Instant::now()+Duration::from_secs(8);while child.0.try_wait().unwrap().is_none(){assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(10));}fs::remove_file(root.join(".ticker.stop")).unwrap();};
+        let mut child=spawn();wait(&mut child,&||fs::read(home.path().join("started")).is_ok_and(|b|b==b"start")&&read().get("launch_claim").is_some_and(|c|c.get("phase").and_then(|p|p.as_str())==Some(if outcome=="confirmed"{"confirmed"}else{"pending"})));stop(&mut child);
+        let polls=fs::read(home.path().join("polls")).unwrap().len();let mut child=spawn();
+        wait(&mut child,&||fs::read(home.path().join("polls")).unwrap().len()>polls&&read()["launch_claim"]["notified"].as_bool()==Some(true));stop(&mut child);
+        assert!(!home.path().join("WRONG_SYNC_EFFECT").exists());assert_eq!(fs::read(home.path().join("started")).unwrap(),b"start");assert_eq!(read()["launch_sequence"].as_integer(),Some(1));
+        if outcome=="confirmed" {assert_eq!(read()["prompt_pending"].as_bool(),Some(true));assert_eq!(read()["launch_claim"]["phase"].as_str(),Some("confirmed"));}
+        else {assert_eq!(read()["status"].as_str(),Some("failed"));assert_eq!(read()["launch_claim"]["phase"].as_str(),Some("uncertain"));let notices=fs::read_dir(project.join("inbox")).unwrap().filter_map(Result::ok).filter(|e|e.file_name().to_string_lossy().starts_with("launch-")).count();assert_eq!(notices,1);}
+    }
+}
+
+}

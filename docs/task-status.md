@@ -87,7 +87,11 @@ A bounded canonical identity reader now permits nonconflicting migrated neighbor
 in state-store builds; interrupted migrations and default builds still refuse.
 Remote workers revalidate profile/target/session and use the non-bootstrapping
 JSON bridge; incomplete contracts and ambiguous ownership refuse.
-Remaining terminal effects still need isolation. T04.3 now fences legacy
+Linux legacy thread starts now share the supervised queue for local and saved
+machines, with durable generation-bound claims, exact configuration bytes, typed
+submission acknowledgement and uncertainty recovery. Confirmed starts without an
+observed agent show waiting/reconciliation guidance; metadata edits cannot grant
+a second start. Coordinator effects and token reporting still need isolation. T04.3 now fences legacy
 launch arguments by explicit agent kind and provides redacted [named profile inspection](profiles.md);
 explicit local version probes for Claude/Codex are available. Launch selection,
 production profile resolution and verified capability evidence remain. Version-2

@@ -1930,3 +1930,71 @@ Logs: `/tmp/herdr-remote-brief-{debug,release,default}.log`; focused evidence is
 `/tmp/herdr-remote-brief-focused.log` and `/tmp/herdr-remote-brief-remote-tests.log`.
 The final default-feature suite passed 392 tests (30 library, 343 binary, 17 CLI,
 two contracts). Three optional live checks remain ignored in every build mode.
+
+## W04 supervised legacy thread launches
+
+Linux thread starts now share the bounded terminal queue with briefs, for local
+and saved-machine sessions. Admission only offers work. Concrete worker ingress
+owns root/project locks, freezes execution/configuration/routing, validates bounded
+cross-project ownership, requires no agent of any name in the target pane and
+checks exact pane plus native terminal identity. The same configuration bytes are
+hashed against admission and parsed for kind-bound arguments, preventing an
+A→B→A configuration swap from authorizing different arguments.
+
+A durable launch claim records sequence, lifecycle generation, execution digest,
+argument and route digests and terminal ID before any start request. Confirmation
+requires a successful bounded process and matching request ID, `agent_started`
+type and exact terminal/agent identity. Both local and remote starts use the raw
+JSON bridge; the CLI start/wait wrapper would confuse a subsequent trust dialog
+with failed submission. The native implementation was checked at upstream commit
+`d59d0603d53bb88c5320ea508a4fb9858b61af68`, `src/app/api/agents.rs` and
+`src/app/agents.rs`, against the installed protocol-22 schema. An acknowledgement
+records submission, not readiness; later fresh observations govern the brief.
+
+Pending starts exclude briefs, new copies and restart. Missing acknowledgement
+recovers to uncertainty and one inbox notice, failing only the claimed generation.
+No same-generation retry occurs, including after PR metadata changes. Explicit
+restart advances generation and is still refused while an agent is observed.
+Historical recovery cannot fail the replacement. Migration refuses pending or
+unresolved launch claims and accepts confirmed/resolved acknowledged history.
+Confirmed starts with no observed agent show Waiting on you and inspection/restart
+guidance; this is observation status, not termination evidence. Exhausted legacy
+launches retain their prior visible failure transition in both queue modes.
+
+Fixtures cover claim/exclusion/recovery, historical generation handling, argument
+redaction, configuration ABA, unsupported bridge, missing terminal ID, foreign/busy
+agents, ambiguous panes, wrong terminal/request/type acknowledgements, lost replies,
+post-claim cancellation/config changes and cancellation of blocked subprocesses.
+The built ticker tests local/remote × confirmed/lost starts across restart, retaining
+one start even when the acknowledged agent is launch-pending/blocked. Existing
+remote shell observations can no longer bypass queue ingress with direct starts.
+Independent review found and guided the configuration-byte binding and legacy/status
+fixes, and independently passed four claim and six worker fixtures.
+
+The complete plan remains active. Coordinator starts/prompts/notifications, token
+reporting, canonical launch/profile integration, budgets/telemetry and wider
+authority coverage remain, followed by W05–W09. Counts remain 16 locally implemented,
+five partial and 20 not started. No real SSH-host or macOS acceptance is claimed.
+
+A disposable network-isolated native Herdr 0.9.1 named session confirmed the raw
+startup contract using only a fake `claude` executable. Its immediate reply had
+`launch_pending=true`, status `unknown`, matching terminal/name/cwd and `argv`, but
+omitted detected kind. The final validator permits missing/null kind only during
+pending startup, requires any explicit kind to match, and validates the returned
+argument tail. Briefs still require later exact kind/readiness observations.
+Captured evidence: `/tmp/herdr-launch-contract-abnzidbc/reply.json`; the fixture
+server and descendants were stopped. No user session or actual agent was used.
+Worker and built-ticker fixtures now cover that real response shape plus foreign
+kind/argument refusal. Configuration and command-vector parse errors withhold
+contents. The confirmed-at-legacy-cap regression also prevents stale observations
+from converting a durable current-generation launch into a failure.
+
+Full suites passed 617 tests in debug and release (174 library, 404 binary, 37 CLI,
+two contracts) before the final native-response and confirmed-at-cap corrections.
+After those corrections, all 31 launch-related checks passed again in both debug
+and release (seven library, 21 binary, three CLI), including complete local/remote
+restart scenarios. The final default-feature suite below also includes the final
+error-redaction regression. Logs: `/tmp/herdr-launch-{debug,release,default}.log`,
+`/tmp/herdr-launch-{debug,release}-final.log`, and `/tmp/herdr-launch-focused.log`.
+The final default-feature suite passed 405 tests (30 library, 355 binary, 18 CLI,
+two contracts). Three optional live checks remain ignored in every build mode.

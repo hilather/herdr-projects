@@ -126,6 +126,40 @@ maximum, running on the next eligible tick. Failed nudges use the same backoff.
 Other project work continues while delivery is failing. A crash after delivery
 but before recording confirmation can cause a repeated notification or nudge.
 
+## Interrupted agent starts
+
+On Linux, legacy thread agent starts now share the bounded terminal worker queue
+for local and saved-machine sessions. The worker checks exclusive recorded pane
+ownership, fresh agent absence and exact pane/terminal identity before recording
+a launch claim. It parses launch arguments from the same bounded configuration
+bytes whose digest matches admission; kind-bound argument rules still apply.
+Claims retain argument and route digests, terminal identity and lifecycle generation,
+without copying launch arguments into the record.
+
+Both transports use the JSON API bridge and require a typed `agent_started`
+acknowledgement naming the same terminal and agent name, with the expected command
+arguments. Native pending-start replies may omit detected kind; an explicit kind
+must match, and briefs still require a fresh exact kind. This confirms submission,
+not interactive readiness. A trust dialog or startup delay can leave the agent
+blocked while the brief remains pending; fresh readiness observations still govern
+brief delivery. A confirmed launch is never repeated for the same lifecycle
+generation, including after PR metadata changes. If no agent is observed after a
+confirmed start, status shows **Waiting on you** and asks for inspection before
+explicit restart. Observation alone does not certify termination.
+
+If the owning worker exits without confirmation, recovery marks the start
+uncertain, fails the current generation and emits one inbox notice. Inspect the
+pane before explicitly restarting; an existing live agent prevents restart.
+Pending claims block briefs, new copies and restart. Migration refuses pending or
+unresolved uncertainty; resolved acknowledged history is retained. The root/project
+locks survive ticker death until supervised local descendants are cleaned up;
+remote agent effects are not rolled back by local process cleanup.
+
+The built ticker is tested through local and remote confirmed/lost restart cases.
+macOS and real SSH-host acceptance remain untested. Coordinator starts/prompts,
+notifications and token reporting still need worker integration; canonical launch
+certification and profile preparation remain separate prerequisites.
+
 ## Interrupted brief delivery
 
 On Linux, local and saved-machine thread briefs use the shared bounded queue
@@ -138,8 +172,8 @@ after acknowledgement. Incomplete saved-session contracts refuse automatic brief
 The remote executable defaults to `herdr`; `HERDR_PROJECTS_REMOTE_HERDR_BIN` may
 name its installed path. It must support `remote-api-bridge` and an existing server
 in the saved session. No install, startup or automatic retry occurs. Coordinator
-prompts and agent starts still use their existing paths. Delayed shell observations
-retain fresh guarded preflight before remaining synchronous remote starts.
+prompts and coordinator agent starts still use their existing paths. Delayed shell
+observations queue thread launches; workers revalidate before dispatch.
 
 The sender checks other project and coordinator references, including resolved
 threads and socket aliases. If either reference is remote, a duplicate pane ID

@@ -21,6 +21,7 @@ pub fn ready(t: &Thread) -> Result<()> {
 }
 fn ready_for(t:&Thread,intent:Option<&herdr_projects::live_copy_intent::LiveCopyIntent>)->Result<()> {
     validate(t)?;
+    anyhow::ensure!(t.launch_claim.as_ref().is_none_or(|c|c.phase!=super::launch_delivery::Phase::Pending),"recover pending agent start first");
     anyhow::ensure!(t.prompt_claim.as_ref().is_none_or(|claim|claim.phase!=super::prompt_delivery::Phase::Pending),"recover pending brief delivery first");
     super::review_delivery::validate(t)?;
     anyhow::ensure!(t.pending_copy_notice.is_none(), "prior copy warning still pending");

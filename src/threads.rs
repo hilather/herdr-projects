@@ -338,6 +338,8 @@ pub enum RestartPlan {
 
 /// What `thread restart` does, from what the record shows was reached.
 pub fn restart_plan(thread: &Thread, live: &Live, branch_exists: bool, now: jiff::Timestamp) -> Result<RestartPlan> {
+    thread::launch_delivery::validate(thread)?;
+    anyhow::ensure!(thread.launch_claim.as_ref().is_none_or(|c|c.phase!=thread::launch_delivery::Phase::Pending),"recover pending agent start before restarting");
     anyhow::ensure!((thread.pending_live_copy.is_none()&&thread.pending_final_copy.is_none()),"recover the pending live projection before restarting");
     match thread.kind {
         Kind::Adopted => bail!("an adopted thread cannot be restarted; adopt a new pane instead"),
@@ -353,7 +355,7 @@ pub fn restart_plan(thread: &Thread, live: &Live, branch_exists: bool, now: jiff
     if live.agent_state.is_some() {
         bail!("{} is running: its pane has an agent in it", thread.id);
     }
-    if live.pane_exists && thread.prompt_pending && thread.launch_attempts < thread::MAX_LAUNCH_ATTEMPTS && thread.status == Status::Open {
+    if live.pane_exists && thread.prompt_pending && thread.launch_attempts < thread::MAX_LAUNCH_ATTEMPTS && thread.status == Status::Open && thread.launch_claim.is_none() {
         bail!("{} is being launched by the ticker (attempt {} of {})", thread.id, thread.launch_attempts, thread::MAX_LAUNCH_ATTEMPTS);
     }
     if thread.kind == Kind::Worktree && thread.removal.is_some() {
@@ -747,7 +749,7 @@ fn row(t: &Thread, view: Option<&SessionView>, now: jiff::Timestamp) -> Row {
     };
     if t.is_remote() {
         // Remote state is what the ticker last polled; the CLI makes no ssh call.
-        let state = if t.last_state.is_empty() { "not polled yet" } else { &t.last_state };
+        let state = if thread::launch_delivery::needs_reconciliation(t,&Live{agent_state:(!t.last_state.is_empty()).then(||t.last_state.clone()),..Default::default()}) {thread::launch_delivery::RECONCILIATION_NOTE} else if t.last_state.is_empty() { "not polled yet" } else { &t.last_state };
         return Row { thread: t.clone(), group: recorded, note: format!("{state}, on {}", t.machine) };
     }
     let live = thread::live_state(t, &view.agents, &view.panes, now);
@@ -756,6 +758,8 @@ fn row(t: &Thread, view: Option<&SessionView>, now: jiff::Timestamp) -> Row {
     let group = thread::group(&fresh, &live, now);
     let note = if t.status == Status::Failed {
         format!("failed: {}", t.error)
+    } else if thread::launch_delivery::needs_reconciliation(t,&live) {
+        thread::launch_delivery::RECONCILIATION_NOTE.into()
     } else if !live.pane_exists {
         "pane closed".to_string()
     } else {
