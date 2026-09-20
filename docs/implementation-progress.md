@@ -1542,3 +1542,32 @@ All 541 tests pass in debug and release (165 library, 341 binary, 33 CLI, two
 contracts). Default-feature tests pass (29 library, 292 binary, 14 CLI, two
 contracts); three optional live checks remain ignored. Logs:
 `/tmp/herdr-preservation-control-{debug,release,default}.log`.
+
+
+## W04 complete live-stage preservation for final-copy workers
+
+A received native live stage can now retain its complete bytes as an immutable
+artifact snapshot without fetching the mutable source again. The bridge keeps the
+original live stage owned by its projection caller, copies through anchored reads,
+compares the copied inventory with the received manifest, and uses controlled
+publication with a final authority check. Omitted entries return no preservation
+receipt. The existing combined 50 MiB and 10,000-entry preservation limits remain
+stricter than independent live report/library limits.
+
+The snapshot records the caller-bound thread, generation, source and machine; the
+caller must first establish successful sender completion and execution/source
+identity. This does not itself change a thread or authorize resolution. Complete
+stages without a report may be preserved. Automatic finalization therefore needs
+an explicit report-optional intent; the existing report-required live-copy intent
+cannot represent all legacy final-copy outcomes.
+
+All 11 focused live-artifact tests pass, including four new cases for source loss,
+binary and empty-directory retention, partial versus report-absent copies, changed
+staged bytes, wrong-project use, cancellation/authority withdrawal, and an actual
+51 MiB live stage that exceeds preservation's combined limit. Independent review
+approved the bridge and reran its authority/cancellation fault regression. Log:
+`/tmp/herdr-live-preservation-focused.log`. The full suites passed at the preceding
+controlled-receiver commit; they were not rerun for this not-yet-admitted worker API.
+Automatic finalizer integration remains open; counts remain 16 locally implemented,
+five partial and 20 not started. macOS and actual remote-host acceptance remain
+untested.

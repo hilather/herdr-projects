@@ -131,6 +131,33 @@ impl LiveCopy {
     pub fn notes(&self)->Vec<String> {
         render_notes(&self.source)
     }
+    /// Preserve complete received bytes without fetching the mutable source a
+    /// second time. Partial projections deliberately produce no preservation
+    /// evidence. The trusted caller must have established sender success and
+    /// bound the source/execution before invoking this method.
+    pub fn preserve_controlled(&self,project:&Project,record:&Thread,control:&Control,authorize:impl FnOnce()->Result<()>)->Result<Option<Snapshot>> {
+        control.check()?;validate(&self.source)?;
+        ensure!(self.staging.0.parent()==Some(project.state_dir().join("live-copies").as_path()),"live stage belongs to a different project");
+        artifact_id(&record.id,false)?;
+        ensure!(!record.thread_dir.is_empty()&&Path::new(&record.thread_dir).is_absolute(),"preservation source must be an absolute recorded path");
+        if !self.source.omissions.is_empty() {return Ok(None);}
+        let expected=entries(&self.source).cloned().collect::<Vec<_>>();
+        // Preservation has a combined 50 MiB limit, unlike live copying's
+        // independent report/library limits. Never relabel a larger projection.
+        let total=expected.iter().try_fold(0u64,|total,entry|total.checked_add(entry.bytes).context("preservation size overflow"))?;
+        ensure!(total<=BYTE_LIMIT&&expected.len()<=ENTRY_LIMIT,"complete live stage exceeds preservation limits");
+        let opened=Directory::open(&self.staging.0)?;
+        let target=staging(project,record)?;
+        let copied=scan_open_controlled(&opened,Some(&target.0),control)?;
+        ensure!(copied==expected,"received live bytes changed before preservation");
+        opened.matches_path(&self.staging.0)?;
+        let manifest=Manifest{schema:1,thread:record.id.clone(),generation:record.lifecycle_generation,
+            machine:record.machine.clone(),source:record.thread_dir.clone(),entries:copied};
+        let snapshot=publish_mode_controlled(project,record,target,manifest,false,control,||{
+            opened.matches_path(&self.staging.0)?;authorize()
+        })?;
+        Ok(Some(snapshot))
+    }
 }
 fn render_notes(source:&Source)->Vec<String> {
         source.omissions.iter().map(|n| {
@@ -207,6 +234,53 @@ mod tests {
     fn roundtrip(project:&Project,path:&Path,archive:&Path)->LiveCopy {
         let mut bytes=Vec::new();export(path,&mut bytes).unwrap();fs::write(archive,bytes).unwrap();receive(project,archive).unwrap()
     }
+    #[test]
+    fn complete_live_stage_preserves_exact_received_bytes_after_source_loss() {
+        let(root,project,mut record)=super::super::tests::fixture();
+        let received=roundtrip(&project,Path::new(&record.thread_dir),&root.path().join("wire"));
+        fs::remove_dir_all(&record.thread_dir).unwrap();record.machine="remote-fixture".into();record.lifecycle_generation=7;
+        let saved=received.preserve_controlled(&project,&record,&Control::default(),||Ok(())).unwrap().unwrap();
+        assert_eq!(saved.manifest.machine,record.machine);assert_eq!(saved.manifest.source,record.thread_dir);assert_eq!(saved.manifest.generation,7);
+        assert_eq!(super::super::load(&project,&record,&saved.id).unwrap(),saved.manifest);
+        let path=project.state_dir().join("artifacts/t-0001").join(&saved.id);
+        assert_eq!(fs::read(path.join("report.md")).unwrap(),b"report\0\xff");assert!(path.join("library/empty").is_dir());
+        assert_eq!(received.preserve_controlled(&project,&record,&Control::default(),||Ok(())).unwrap().unwrap().id,saved.id);
+        assert!(received.staging.0.is_dir(),"preservation must leave projection ownership intact");
+        assert!(!project.dir().join("threads/t-0001.toml").exists(),"retention never certifies finalization");
+    }
+    #[test]
+    fn omitted_entries_never_become_preservation_receipts_but_empty_reports_can_be_retained() {
+        let(root,project,record)=super::super::tests::fixture();
+        std::os::unix::fs::symlink("artifact",Path::new(&record.thread_dir).join("library/link")).unwrap();
+        let partial=roundtrip(&project,Path::new(&record.thread_dir),&root.path().join("partial"));
+        assert!(!partial.notes().is_empty());assert!(partial.preserve_controlled(&project,&record,&Control::default(),||Ok(())).unwrap().is_none());
+        assert!(!project.state_dir().join("artifacts").exists());
+        fs::remove_file(Path::new(&record.thread_dir).join("library/link")).unwrap();fs::remove_file(Path::new(&record.thread_dir).join("report.md")).unwrap();
+        let complete=roundtrip(&project,Path::new(&record.thread_dir),&root.path().join("empty-report"));
+        let saved=complete.preserve_controlled(&project,&record,&Control::default(),||Ok(())).unwrap().unwrap();assert!(saved.manifest.report_hash().is_none());
+        assert!(super::super::load(&project,&record,&saved.id).is_ok());
+    }
+    #[test]
+    fn preservation_refuses_changed_staged_bytes_wrong_project_and_lost_authority() {
+        for fault in ["changed","project","cancelled","expired","authority","late-cancel"] {
+            let(root,project,record)=super::super::tests::fixture();let received=roundtrip(&project,Path::new(&record.thread_dir),&root.path().join("wire"));
+            let other=crate::project::create(root.path(),"other","",vec![]).unwrap();let target=if fault=="project"{&other}else{&project};
+            let mut control=Control::default();
+            match fault {"changed"=>fs::write(received.staging.0.join("library/artifact"),b"tampered").unwrap(),"cancelled"=>control.cancellation.cancel(),"expired"=>control.deadline=std::time::Instant::now(),_=>{}}
+            assert!(received.preserve_controlled(target,&record,&control,||{if fault=="late-cancel"{control.cancellation.cancel();}ensure!(fault!="authority","authority revoked");Ok(())}).is_err(),"{fault}");
+            let parent=target.state_dir().join("artifacts/t-0001");assert_eq!(fs::read_dir(&parent).into_iter().flatten().count(),0,"{fault}");assert!(received.staging.0.is_dir());
+        }
+    }
+    #[test]
+    fn live_section_limits_do_not_expand_the_combined_preservation_limit() {
+        let(root,project,record)=super::super::tests::fixture();
+        File::options().write(true).open(Path::new(&record.thread_dir).join("report.md")).unwrap().set_len(25*1024*1024).unwrap();
+        File::options().write(true).open(Path::new(&record.thread_dir).join("library/artifact")).unwrap().set_len(26*1024*1024).unwrap();
+        let received=roundtrip(&project,Path::new(&record.thread_dir),&root.path().join("wire"));assert!(received.notes().is_empty());
+        let error=received.preserve_controlled(&project,&record,&Control::default(),||Ok(())).err().unwrap();assert!(error.to_string().contains("preservation limits"));
+        assert!(!project.state_dir().join("artifacts").exists());assert!(received.staging.0.is_dir());
+    }
+
     #[test]
     fn download_reservation_counts_orphans_and_leaves_receive_capacity() {
         let (root,project,record)=super::super::tests::fixture();let control=Control::default();
