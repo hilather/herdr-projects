@@ -33,7 +33,18 @@ pub fn check(project:&Project,t:&Thread,socket:&Path,control:&Control)->Result<(
         ensure!(marker||!recognized,"recognizable neighbor lacks PROJECT.md");if !marker{continue;}
         crate::project::validate_slug(name)?;ensure!(kind.is_dir()&&fs::symlink_metadata(dir.join("PROJECT.md"))?.is_file()&&fs::symlink_metadata(dir.join(".state"))?.is_dir(),"terminal neighbor contains aliases");
         let dir=dir.canonicalize()?;
-        ensure!(!canonical,"canonical or migrating neighbor requires bounded terminal identity inventory; brief refused");
+        if canonical {
+            #[cfg(not(feature="state-store"))]
+            anyhow::bail!("canonical neighbor requires a state-store build for terminal identity inventory");
+            #[cfg(feature="state-store")]
+            {
+                let mut budget=herdr_projects::store::identity_inventory::Budget::new(50*1024*1024-scan.bytes,1024-scan.records,control.deadline,control.cancellation.clone())?;
+                let bindings=herdr_projects::migration::read_identity_inventory(&dir,&mut budget)?;
+                scan.bytes+=budget.used();
+                for binding in bindings {scan.check(&binding.identity.machine,&binding.identity.socket,&binding.identity.pane_id)?;}
+                continue;
+            }
+        }
         let coordinator=scan.read(&dir.join(".state/coordinator.json"))?.map(|text|serde_json::from_str::<Coordinator>(&text)).transpose()?;
         let socket=coordinator.as_ref().map(|c|c.socket.as_str()).unwrap_or("");
         if let Some(c)=&coordinator {scan.check("",socket,&c.pane_id)?;}

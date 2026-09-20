@@ -471,3 +471,6 @@ pub(crate) fn publish_control_marker(project:&Path,db:&SqliteStore)->Result<()> 
     write_new(&temporary,&serde_json::to_vec_pretty(&expected)?)?;
     fs::rename(temporary,path)?;sync_dir(&project.join(".state"))?;sync_dir(&project.join(".state/migration"))?;Ok(())
 }
+
+mod identity_inventory;
+pub use identity_inventory::read_identity_inventory;

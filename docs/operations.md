@@ -136,8 +136,10 @@ briefs, coordinator prompts and agent starts still use their existing paths.
 
 The local sender checks other project and coordinator references, including
 resolved threads and socket aliases. Corrupt or oversized inventories refuse.
-Canonical or migrating neighboring projects also refuse until a bounded canonical
-identity reader is integrated; this applies even to state-store builds.
+State-store builds inspect active canonical neighbors through a bounded read-only
+identity reader. Interrupted migrations, corrupt publication/provenance, dangling
+resource references and oversized inventories refuse. Default builds still refuse
+canonical neighbors because they cannot inspect their SQLite authority.
 
 A pending claim
 recovered after its owning worker exits becomes uncertain: the prompt may already

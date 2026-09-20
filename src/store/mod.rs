@@ -302,3 +302,5 @@ mod reservations;
 mod approvals;
 mod budget;
 mod routines;
+
+pub mod identity_inventory;

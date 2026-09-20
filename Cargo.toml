@@ -11,7 +11,7 @@ default = []
 state-store = ["dep:rusqlite"]
 
 [dependencies]
-rusqlite = { version = "=0.37.0", optional = true }
+rusqlite = { version = "=0.37.0", optional = true, features = ["hooks", "limits"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 jiff = "0.2"

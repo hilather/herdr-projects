@@ -202,4 +202,12 @@ mod tests {
         ticket.cancel();assert!(pool.stop(Duration::from_secs(5)));f.recover();assert_eq!(thread::load(&f.project,&f.t.id).unwrap().status,thread::Status::Failed);assert_eq!(fs::read(f.root.path().join("sent")).unwrap(),b"send");
     }
 
+    #[cfg(feature="state-store")]
+    #[test]
+    fn nonconflicting_canonical_neighbor_allows_supervised_brief() {
+        let f=Fixture::new();let other=project::create(f.root.path(),"canonical","",vec![]).unwrap();other.set_status(project::Status::Paused).unwrap();
+        project::write_json(&other.state_dir().join("coordinator.json"),&project::Coordinator::default()).unwrap();let plan=herdr_projects::migration::inspect(&other.dir()).unwrap();herdr_projects::migration::apply(&other.dir(),&plan,true).unwrap();
+        execute(&f.input,&Control::default()).unwrap();assert!(f.sent());assert!(!thread::load(&f.project,&f.t.id).unwrap().prompt_pending);
+    }
+
 }

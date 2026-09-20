@@ -76,8 +76,9 @@ project ownership, preserving recovery references and unknown entries.
 Durable brief claims fence replay after a lost response and recover before
 session checks. Linux local briefs now enter the shared bounded queue and use a
 concrete supervised sender with fresh target checks and typed confirmation.
-Canonical/migrating neighbors conservatively block this legacy sender until a
-bounded canonical identity reader is integrated; remote briefs remain open.
+A bounded canonical identity reader now permits nonconflicting migrated neighbors
+in state-store builds; interrupted migrations and default builds still refuse.
+Remote briefs remain open.
 Remaining terminal effects still need isolation. T04.3 now fences legacy
 launch arguments by explicit agent kind and provides redacted [named profile inspection](profiles.md);
 explicit local version probes for Claude/Codex are available. Launch selection,

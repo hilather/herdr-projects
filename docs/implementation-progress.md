@@ -1804,3 +1804,41 @@ modes, including the built ticker fixture. The full final default-feature suite
 passed 382 tests (30 library, 334 binary, 16 CLI, two contracts). Three optional
 live checks remain ignored. Logs: `/tmp/herdr-brief-worker-{debug,release,default}.log`
 and `/tmp/herdr-brief-worker-{debug,release}-final.log`.
+
+
+## W04 bounded canonical terminal identity inventory
+
+State-store builds now permit local brief admission beside nonconflicting active
+canonical projects. The dedicated reader validates the active migration journal,
+format marker, import receipt and control publication, then reads only runtime
+bindings and their provenance in one read-only SQLite transaction. It does not
+open the full store or materialize unrelated task/event/delivery history. Dangling
+ownership or observation references refuse rather than hiding retained resources.
+Default builds and incomplete migrations still refuse canonical neighbors.
+
+Identity and publication data share the caller's 50 MiB byte and 1024-reference
+budget. Individual files/fields are capped at 16 MiB. SQLite `octet_length` measures
+text bytes without first loading the text; a 32 MiB connection limit additionally
+bounds string/encoded-row allocation. The existing SQLite 3.53.4 minimum supports
+that operation. A progress handler checks cancellation and the original deadline
+inside running SQL, with a maximum 10-second inventory budget and 10 ms busy wait.
+Main database and existing sidecars must be regular single-link files. These are
+cooperative filesystem/process guarantees, not interruption of stalled kernel I/O
+or hostile same-user containment.
+
+Focused fixtures cover compatible mixed-root sending, retained canonical
+conflicts, byte/reference/field limits, malformed provenance/publication,
+cancellation, a long SQL query interrupted before its first row, and deleted
+canonical bindings with retained ownership/observation references. A large
+unrelated event remains outside the identity materialization budget.
+
+The full plan remains active: remote briefs and other terminal paths, canonical
+launch/profile integration, usage/telemetry and broader authority coverage remain.
+Counts remain 16 locally implemented, five partial and 20 not started. macOS and
+actual remote-host acceptance remain untested.
+
+Independent review approved the bounded reader and independently passed all five
+inventory fixtures. Full suites pass: 594 debug and release tests (173 library,
+384 binary, 35 CLI, two contracts), and 382 default-feature tests (30 library,
+334 binary, 16 CLI, two contracts). Three optional live checks remain ignored.
+Logs: `/tmp/herdr-identity-{debug,release,default}.log`.
