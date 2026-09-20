@@ -147,6 +147,13 @@ mod tests {
         let change=adopt(&world.ctx(),&path,"coordinator",1,after.head).unwrap();assert_eq!(change.ownership.revision,2);let head=runtime::snapshot(&path).unwrap().head;runtime::relinquish(&path,"coordinator",2,head,"release for rebind").unwrap();let head=runtime::snapshot(&path).unwrap().head;runtime::rebind(&path,"coordinator",1,head,&RuntimeRoute::default()).unwrap();
     }
     #[test]
+    fn recovery_plan_is_read_only_and_keeps_live_or_changed_workers_reserved() {
+        use herdr_projects::reconcile::plan::RepairAction;
+        let(world,path,_listener)=fixture();let before=runtime::snapshot(&path).unwrap();let report=crate::reconcile_live::plan(&world.ctx(),&path).unwrap();assert!(report.items.iter().any(|i|i.entity=="thread:t-0001"&&i.action==RepairAction::AdoptResources));assert_eq!(runtime::snapshot(&path).unwrap(),before);
+        adopt(&world.ctx(),&path,"thread:t-0001",2,before.head).unwrap();let before=runtime::snapshot(&path).unwrap();let report=crate::reconcile_live::plan(&world.ctx(),&path).unwrap();assert_eq!(report.retained_attempts,1);assert!(report.items.iter().any(|i|i.entity_kind=="attempt"&&i.action==RepairAction::None));assert_eq!(runtime::snapshot(&path).unwrap(),before);
+        *world.agents.borrow_mut()="[]".into();let report=crate::reconcile_live::plan(&world.ctx(),&path).unwrap();assert_eq!(report.retained_attempts,1);assert!(!report.dispatch_allowed);assert!(report.items.iter().any(|i|i.entity_kind=="attempt"&&i.action==RepairAction::InspectTerminationEvidence));assert_eq!(runtime::snapshot(&path).unwrap(),before);assert_eq!(world.runner.count("agent prompt"),0);
+    }
+    #[test]
     fn legacy_adoption_cannot_steal_a_canonical_reference() {
         let(world,path,_listener)=fixture();let binding=runtime::snapshot(&path).unwrap().runtime_bindings.remove(0);let herdr=crate::herdr::Herdr::new(world.env.herdr_bin(),&binding.identity.socket,&world.runner);assert!(crate::adopt::adoptable_agent(&world.ctx(),&herdr,&binding.identity.socket,"p").is_err());
     }

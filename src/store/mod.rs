@@ -276,5 +276,5 @@ mod control;
 
 mod finalization;
 
-mod ownership;
+pub(crate) mod ownership;
 pub use ownership::OwnershipChange;

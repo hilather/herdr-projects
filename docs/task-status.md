@@ -64,7 +64,8 @@ terminal-input authorization and automatic controller dispatch remain.
 **T03.4** now has [bounded runtime observations](reconciliation.md), durable
 evidence, stale-state fences and explicit local ownership adoption. Live adopted
 workers retain attempt capacity; changed ownership pauses active control. Termination
-evidence, automatic repair and integrated recovery remain. Audited relinquishment
+evidence, automatic repair and integrated recovery remain. Read-only recovery plans
+now classify resources, retained workers and durable operations. Audited relinquishment
 is available when no retained task attempt remains. Observation work is interleaved because
 the remaining external adapters depend on it.
 W04–W09 account for the other 25 not-started cards. Task count is not a time estimate.

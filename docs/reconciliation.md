@@ -139,3 +139,23 @@ that is no longer selected as active. Active task pointers/running tasks must be
 reconciled first. Successful task relinquishment advances the task revision. A later
 explicit rebind may change the unowned route. Re-adoption uses a new monotonically
 increasing claim generation; prior immutable audit events remain intact.
+
+## Read-only recovery plan
+
+`reconcile PROJECT --plan` returns deterministic, structured advice against an
+expected event head and exact entity revisions. It cannot be combined with
+`--record` and does not persist observations or perform repairs. Each item includes
+a classification, proposed action and reason; the report always declares
+`dispatch_allowed: false` and counts every retained attempt.
+
+Runtime advice distinguishes unreachable/incomplete evidence, absent resources,
+identity conflicts, matching ownership and adoption candidates. Adoption candidates
+still require root conflict checks. Live matching workers remain counted; lost,
+unselected and uncertain workers require termination evidence before release.
+
+Confirmed deliveries remain completed even when task revisions advance. Ambiguous
+effects require exact receipt inspection even when their intent is stale. Expired
+claims require explicit expiry into ambiguity. Pending stale intents may be
+explicitly retired; pending supported adapters are only retry candidates and must
+still pass their complete policy/revision/resource checks. Imported or unsupported
+operations require inspection. No repair action is automatically executed.

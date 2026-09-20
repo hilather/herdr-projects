@@ -457,3 +457,20 @@ debug/release tests pass 339 tests; default tests pass. Process namespace isolat
 continues to keep cleanup checks strict. Logs: `/tmp/herdr-relinquish-{debug,release,legacy}.log`.
 No new termination proof is claimed; automatic repair and controller integration
 remain open W03 work.
+
+## Structured read-only recovery planning
+
+`reconcile --plan` now classifies runtime resources, every retained attempt and
+durable delivery intents against a complete fresh observation batch and fenced
+head/revisions. Reports include proposed actions but always deny dispatch authority.
+Ambiguous effects remain receipt-inspection work even after task changes; expired
+claims require expiry rather than replay; supported pending adapters are only retry
+candidates subject to their full validation. Planning never persists observations,
+releases capacity or executes repairs.
+
+Independent review approved. Two new library regressions, a read-only ownership
+fixture and the extended CLI fixture cover uncertainty precedence, expired claims,
+repeatability, stale inputs and unchanged canonical state. All-feature debug and
+release suites pass 342 tests (73 library, 243 binary, 24 CLI, 2 contracts); three
+live fixtures remain opt-in. Default-feature tests pass. Logs:
+`/tmp/herdr-recovery-{debug,release,legacy}.log`.

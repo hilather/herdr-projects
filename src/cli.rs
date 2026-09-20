@@ -59,7 +59,7 @@ enum Command {
     Runtime { slug:String, #[command(subcommand)] command:RuntimeCommand },
     /// Observe recorded runtime identities; --record persists evidence without dispatch
     #[cfg(feature="state-store")]
-    Reconcile { slug:String, #[arg(long)] record:bool },
+    Reconcile { slug:String, #[arg(long,conflicts_with="plan")] record:bool, #[arg(long)] plan:bool },
     /// Inspect or edit migrated task records without starting execution
     #[cfg(feature="state-store")]
     Task { slug:String, #[command(subcommand)] command:TaskCommand },
@@ -444,9 +444,9 @@ pub fn run() -> Result<()> {
             Ok(())
         },
         #[cfg(feature="state-store")]
-        Command::Reconcile{slug,record}=>{
+        Command::Reconcile{slug,record,plan}=>{
             project::validate_slug(&slug)?;
-            println!("{}",serde_json::to_string_pretty(&crate::reconcile_live::run(&ctx,&ctx.root.join(slug),record)?)?);
+            if plan {println!("{}",serde_json::to_string_pretty(&crate::reconcile_live::plan(&ctx,&ctx.root.join(slug))?)?);}else{println!("{}",serde_json::to_string_pretty(&crate::reconcile_live::run(&ctx,&ctx.root.join(slug),record)?)?);}
             Ok(())
         },
         #[cfg(feature="state-store")]

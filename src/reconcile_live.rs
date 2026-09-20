@@ -171,3 +171,12 @@ fn git_common(ctx:&Ctx,path:&str)->Option<std::path::PathBuf> {
     let value=out.stdout.trim_end_matches('\n');if value.is_empty(){return None;}
     let common=Path::new(value);std::fs::canonicalize(if common.is_absolute(){common.to_path_buf()}else{Path::new(path).join(common)}).ok()
 }
+
+/// Read-only plan: no evidence or repair is applied to canonical state.
+pub fn plan(ctx:&Ctx,project:&Path)->Result<herdr_projects::reconcile::plan::RecoveryPlan> {
+    let config=std::path::absolute(ctx.config_dir.join("config.toml"))?;
+    let config=migration::config_reference(&config)?;
+    let batch=collect(ctx,project)?;let snapshot=runtime::snapshot(project)?;
+    ensure!(migration::config_reference(Path::new(&config.path))?==config,"config changed during recovery planning");
+    herdr_projects::reconcile::plan::build(&snapshot,&batch,jiff::Timestamp::now().as_millisecond(),config.digest.as_deref())
+}
