@@ -727,6 +727,8 @@ pub fn run() -> Result<()> {
                 println!("  start_threads = {:?}", safety.start_threads);
                 println!("  coordinator_agent_args = {:?}", safety.coordinator_agent_args);
                 println!("  thread_agent_args = {:?}", safety.thread_agent_args);
+                println!("  coordinator_agent_args_kind = {:?}", safety.coordinator_agent_args_kind);
+                println!("  thread_agent_args_kind = {:?}", safety.thread_agent_args_kind);
                 println!("  routine_commands = {}", safety.routine_commands);
                 println!();
                 println!("To change one, edit {} by hand and add:", ctx.config_dir.join("config.toml").display());

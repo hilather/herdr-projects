@@ -7,6 +7,7 @@ mod recovery;
 mod preservation;
 mod async_pr;
 mod async_remote;
+mod agent_kinds;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};

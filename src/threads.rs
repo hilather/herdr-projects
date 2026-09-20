@@ -102,6 +102,8 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         bail!("the task is empty");
     }
     let (settings, _) = project.read_project_md()?;
+    let agent_kind = args.agent.clone().unwrap_or_else(|| settings.thread_agent.clone());
+    project.safety(&ctx.config_dir)?.worker_arguments(&agent_kind)?;
     // Without a running ticker nothing launches.
     ticker::start(ctx)?;
     let view = require_session(ctx, &project)?;
@@ -136,7 +138,6 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         );
     }
 
-    let agent_kind = args.agent.clone().unwrap_or_else(|| settings.thread_agent.clone());
     let record = thread::allocate(&project, |t| {
         t.title = args.title.trim().to_string();
         t.kind = if repo.is_empty() { Kind::Tab } else { Kind::Worktree };
@@ -395,6 +396,7 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str) -> Result<Thread> {
         bail!("`{slug}` is {}; restart is refused until the project is active again", project.status());
     }
     let record = thread::load(&project, id)?;
+    project.safety(&ctx.config_dir)?.worker_arguments(&record.agent)?;
     let view = require_session(ctx, &project)?;
     let (agents, panes) = lists_for(&view, &record)?;
     if panes.iter().any(|pane| pane.pane_id == record.pane_id) {

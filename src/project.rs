@@ -192,8 +192,15 @@ pub struct Coordinator {
 pub struct Safety {
     pub start_threads: String,
     pub coordinator_agent_args: Vec<String>,
+    pub coordinator_agent_args_kind: Option<String>,
     pub thread_agent_args: Vec<String>,
+    pub thread_agent_args_kind: Option<String>,
     pub routine_commands: bool,
+}
+
+impl Safety {
+    pub fn worker_arguments(&self,kind:&str)->Result<&[String]> {crate::agents::arguments(kind,self.thread_agent_args_kind.as_deref(),&self.thread_agent_args,"thread_agent_args")}
+    pub fn coordinator_arguments(&self,kind:&str)->Result<&[String]> {crate::agents::arguments(kind,self.coordinator_agent_args_kind.as_deref(),&self.coordinator_agent_args,"coordinator_agent_args")}
 }
 
 impl Default for Safety {
@@ -201,7 +208,9 @@ impl Default for Safety {
         Safety {
             start_threads: "propose".into(),
             coordinator_agent_args: Vec::new(),
+            coordinator_agent_args_kind: None,
             thread_agent_args: Vec::new(),
+            thread_agent_args_kind: None,
             routine_commands: false,
         }
     }
@@ -339,7 +348,7 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 /// `<config_dir>/config.toml`, with defaults for an absent table or key.
 pub fn load_safety(config_dir: &Path, canonical_project_dir: &Path) -> Result<Safety> {
     let file=config_dir.join("config.toml");
-    let Ok(text)=std::fs::read_to_string(&file) else {return Ok(Safety::default());};
+    let Some(text)=crate::paths::read_root_config(&file).with_context(||format!("cannot load safety settings from {}",file.display()))? else {return Ok(Safety::default());};
     parse_safety(&text,canonical_project_dir).with_context(||format!("invalid safety settings in {}",file.display()))
 }
 

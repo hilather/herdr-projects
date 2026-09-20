@@ -661,3 +661,30 @@ remote execution is still blocked; this integration moves legacy observation wor
 not external launch authority or termination certification.
 The default suite passes all 243 tests, including the new outage scenario. Cross-project
 observation sharing and remaining effect/transfer isolation still require work.
+
+## W04 kind-bound launch arguments
+
+Legacy worker and coordinator arguments now require an explicit agent-kind binding
+when nonempty. New thread creation, restart and coordinator open validate before
+resource creation; ticker retries validate before consuming a launch attempt or
+the pass's launch slot. A mismatched worker cannot starve a compatible worker.
+Empty argument defaults continue to support mixed kinds. Existing nonempty arrays
+need the corresponding `thread_agent_args_kind` or `coordinator_agent_args_kind`
+setting, naming the kind for which those flags were written. No flags are inferred,
+translated or silently dropped.
+
+Independent review found that safety config read failures previously fell back to
+defaults. Loading now uses the bounded nonblocking regular-file reader and defaults
+only when config is absent. Regression fixtures cover cross-kind refusal before
+resources, retry counters/fairness, coordinator refusal, invalid UTF-8, directories
+and FIFOs. Independent review approved the fixes.
+
+T04.3 is partial: this is argument isolation, not capability certification. Named
+profiles, installed-version evidence and immutable per-attempt profile resolution
+remain. Routine execution also remains synchronous pending durable occurrence and
+authority contracts. Canonical launch dispatch remains disabled.
+
+Validation passes 391 all-feature tests in both debug and release (92 library,
+271 binary, 26 CLI, 2 contracts), and 248 default-feature tests. Logs:
+`/tmp/herdr-kind-{debug,release,legacy,focused}.log`. Three optional live checks
+remain ignored; macOS remains unavailable.

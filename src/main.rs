@@ -1,6 +1,7 @@
 #[cfg(feature="state-store")]
 mod canonical_controller;
 mod actions;
+mod agents;
 mod artifacts;
 mod adopt;
 mod cli;

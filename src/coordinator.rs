@@ -88,6 +88,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         );
     }
     let safety = project.safety(&ctx.config_dir)?;
+    let agent_args=safety.coordinator_arguments(&settings.coordinator_agent)?;
     let session = paths::resolve_session(&options.session, ctx.env, ctx.runner)?;
     let socket = session.socket.to_string_lossy().into_owned();
 
@@ -185,7 +186,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         }
     })?;
 
-    match herdr.agent_start(&name, &settings.coordinator_agent, &record.pane_id, &safety.coordinator_agent_args) {
+    match herdr.agent_start(&name, &settings.coordinator_agent, &record.pane_id, agent_args) {
         Ok(agent) => deliver_or_defer(&project, &herdr, &agent, &prompt)?,
         Err(error) => println!(
             "the coordinator agent is not ready yet ({error}). If it shows a dialog, answer it in pane {}; the ticker sends the priming prompt once it is ready.",

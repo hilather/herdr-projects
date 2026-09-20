@@ -3,7 +3,7 @@
 Updated 2026-09-19. Counts describe implementation progress, not release acceptance.
 Local tests do not replace the plan's independent review, macOS or live-system gates.
 
-**16 cards have local implementations; T04.1–T04.2 are partial and 23 have not started.** W03 has a bounded
+**16 cards have local implementations; T04.1–T04.3 are partial and 22 have not started.** W03 has a bounded
 [reviewed handoff](w03-acceptance.md). Canonical launch crash certification remains
 an explicit W04 prerequisite before enabling launches; it is not claimed as passed.
 Phase A was accepted by the user with documented testing gaps.
@@ -14,13 +14,13 @@ Phase A was accepted by the user with documented testing gaps.
 | W01 | Process, schedule, polling and recovery reliability | 5 | 0 | 0 |
 | W02 | Preservation, transport, lifecycle, diagnostics and context | 5 | 0 | 0 |
 | W03 | Transactional store, migration, outbox and reconciliation | 4 | 0 | 0 |
-| W04 | Scheduling, capacity, execution pools, profiles and authority | 0 | 2 | 3 |
+| W04 | Scheduling, capacity, execution pools, profiles and authority | 0 | 3 | 2 |
 | W05 | Versioned memory, snapshots, import and coordinator checkpoints | 0 | 0 | 4 |
 | W06 | Memory proposals, promotion, updates, invalidation and barriers | 0 | 0 | 5 |
 | W07 | Revision-bound results, integration and review gates | 0 | 0 | 4 |
 | W08 | CI, live compatibility, failure testing and performance | 0 | 0 | 4 |
 | W09 | Pilot, packaging and release acceptance | 0 | 0 | 3 |
-| **Total** | | **16** | **2** | **23** |
+| **Total** | | **16** | **3** | **22** |
 
 Implemented locally: **T00.1–T00.2, T01.1–T01.5, T02.1–T02.5, T03.1–T03.4**. See
 [implementation progress](implementation-progress.md) and
@@ -51,7 +51,10 @@ Atomic reservations and immutable inputs now have a sealed internal API, and can
 has an audited CLI. Production launch preparation/dispatch and termination remain
 unavailable. T04.2 now uses monotonic remote poll/retry deadlines and pass-start
 scheduling plus a shared bounded executor for asynchronous PR and remote observations;
-routine/artifact work and guarded effects still need isolation. Next are bounded command execution, kind-bound worker profiles
+routine/artifact work and guarded effects still need isolation. T04.3 now fences legacy
+launch arguments by explicit agent kind; named profiles, immutable profile resolution
+and capability/version evidence remain. Async routine commands first need durable
+occurrence and authority contracts, so that path remains synchronous. Next are bounded command execution, kind-bound worker profiles
 (T04.3), budgets/routines/telemetry (T04.4) and operation-scoped authority (T04.5).
 The [scheduler/executor/profile interfaces](adr/0004-w04-scheduling-contract.md) are frozen. Existing retained/adopted attempts
 must count toward the cap; no uncertain worker may be replaced to free a slot.

@@ -478,11 +478,12 @@ fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::T
         if !*may_start {
             continue;
         }
-        *may_start = false;
         let launched = (|| -> Result<()> {
-            thread::update(project, &t.id, |t| t.launch_attempts += 1)?;
             let safety = project.safety(&ctx.config_dir)?;
-            herdr.on_machine(&t.machine).agent_start(&t.agent_name, &t.agent, &t.pane_id, &safety.thread_agent_args)?;
+            let agent_args=safety.worker_arguments(&t.agent)?;
+            *may_start=false;
+            thread::update(project, &t.id, |t| t.launch_attempts += 1)?;
+            herdr.on_machine(&t.machine).agent_start(&t.agent_name, &t.agent, &t.pane_id, agent_args)?;
             Ok(())
         })();
         errors.extend(launched.err().map(|e| e.context(format!("{}: launch", t.id))));
@@ -646,12 +647,13 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
         let pane_alive = seen.panes.iter().any(|p| coordinator::pane_matches(&record, p));
         let pane_has_agent = seen.agents.iter().any(|a| a.pane_id == record.pane_id);
         if pane_alive && !pane_has_agent && record.launch_attempts < MAX_LAUNCH_ATTEMPTS {
-            may_start = false;
             let started = (|| -> Result<()> {
-                project.update_coordinator(|c| c.launch_attempts += 1)?;
                 let (settings, _) = project.read_project_md()?;
                 let safety = project.safety(&ctx.config_dir)?;
-                herdr.agent_start(&record.agent_name, &settings.coordinator_agent, &record.pane_id, &safety.coordinator_agent_args)?;
+                let agent_args=safety.coordinator_arguments(&settings.coordinator_agent)?;
+                may_start=false;
+                project.update_coordinator(|c| c.launch_attempts += 1)?;
+                herdr.agent_start(&record.agent_name, &settings.coordinator_agent, &record.pane_id, agent_args)?;
                 Ok(())
             })();
             errors.extend(started.err());

@@ -61,10 +61,20 @@ Set per project in `~/.config/herdr-projects/config.toml`; `safety show <project
 ```toml
 [safety."/Users/you/.herdr-projects/billing"]
 start_threads = "propose"          # or "auto": the coordinator starts threads without asking
-coordinator_agent_args = []        # extra arguments for the coordinator's agent CLI
-thread_agent_args = []             # extra arguments for every thread's agent CLI
+coordinator_agent_args = []        # arguments for the bound coordinator kind
+coordinator_agent_args_kind = "claude" # required when the array is nonempty
+thread_agent_args = []             # arguments for the bound worker kind
+thread_agent_args_kind = "claude"   # required when the array is nonempty
 routine_commands = false           # true lets approved routines run shell commands
 ```
+
+Nonempty argument arrays now require their matching `*_agent_args_kind` field.
+When upgrading an existing config, set that field to the kind the existing flags
+were originally written for. Do not infer it from a newly changed default agent.
+Unbound or mismatched arrays refuse launch; no flags are automatically translated
+or discarded. Empty arrays remain usable across kinds. Unreadable, non-regular,
+oversized or invalid config refuses safety-dependent launch instead of substituting
+defaults. `safety show PROJECT` displays the current bindings.
 
 The table is keyed by the project folder's canonical path. It stays when you delete the project and applies to a new project at the same path.
 
