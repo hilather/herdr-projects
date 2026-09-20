@@ -164,8 +164,14 @@ Copies recheck execution, configuration and routing before publishing. The exact
 staged bytes and recovery intent survive interruption in `.state/live-copies`; the
 next active ticker resumes them without downloading again. Configuration or routing
 withdrawal blocks that recovery while preserving the intent. At most 16 stage/spool
-entries are retained per project; a full inventory refuses new downloads but still
-permits recovery. New review announcements wait for pending copies. Copies remain
+entries are retained per project. Before a new download, a worker holding project
+ownership can reclaim recognized unreferenced staging directories from a full
+inventory. It first reads every thread record within bounded limits; corrupt or
+unknown records retain staging. Referenced live/final projections and unknown
+directory names are preserved. Cleanup never follows links or crosses devices.
+Cancellation can leave part of an unreferenced temporary directory for a later
+attempt. Recovery bypasses this cleanup, including when unrelated records or the
+inventory prevent new downloads. New review announcements wait for pending copies. Copies remain
 additive and per-file atomic, so an interrupted projection may expose some new library
 files before its report and receipt are committed.
 

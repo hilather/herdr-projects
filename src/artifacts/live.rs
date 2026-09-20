@@ -4,6 +4,7 @@ use crate::source_tree::{Budget,Control,Directory,Limit,NodeKind};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 pub mod projection;
+pub mod reclamation;
 #[allow(dead_code)] // Trusted final-copy worker admission follows recovery validation.
 pub mod finalization;
 

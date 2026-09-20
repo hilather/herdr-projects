@@ -1687,3 +1687,41 @@ All 566 tests pass in debug and release (167 library, 363 binary, 34 CLI, two
 contracts). Default-feature tests pass (30 library, 314 binary, 15 CLI, two
 contracts); three optional live checks remain ignored. Logs:
 `/tmp/herdr-final-admission-{debug,release,default}.log`.
+
+
+## W04 guarded reclamation of abandoned copy staging
+
+New copy-worker ingress can now reclaim recognized unreferenced directories when
+the 16-entry live staging inventory cannot admit another spool and extraction.
+The worker first owns the project and inherited transfer locks, then holds the
+record lock while scanning all thread TOMLs. The scan bounds total bytes, per-file
+size and inventory entries, checks record identity, rejects corrupt or unknown
+fields, and retains every live/final projection reference before any deletion.
+Unknown names and non-directory entries remain untouched; immutable preservation
+snapshots are outside this cleanup namespace. Retained recovery bypasses cleanup.
+
+Deletion uses anchored directory descriptors, refuses links, special/hardlinked
+entries and device crossings, checks identity before unlink, and syncs parent
+directories. Cancellation and deadlines can leave only a partially removed
+unreferenced staging tree. Cleanup budgets account for the private stage root,
+report and manifest in addition to the existing maximum library; source read
+entry/depth limits remain unchanged. Each tree has a cooperative 10-second budget
+bounded by the original worker deadline. This does not promise interruption of
+a stalled filesystem or hostile same-user containment.
+
+Independent review approved the implementation and independently passed all four
+reclamation fixtures plus the corrected maximum-depth fixture. Tests retain both
+pending intent types and unknown names, refuse corruption/future fields, preserve
+external symlink targets, resume after cancellation following a durable unlink,
+delete an actual maximum-entry/depth layout, and recover a worker from full orphan
+inventory only after project ownership becomes available.
+
+Remaining W04 work includes terminal-effect isolation, canonical launch/profile
+integration, usage/telemetry and broader authority coverage. Counts remain
+16 locally implemented, five partial and 20 not started. macOS and actual remote
+host acceptance remain untested.
+
+All 574 tests pass in debug and release (167 library, 371 binary, 34 CLI, two
+contracts). Default-feature tests pass (30 library, 322 binary, 15 CLI, two
+contracts); three optional live checks remain ignored. Logs:
+`/tmp/herdr-reclamation-{debug,release,default}.log`.

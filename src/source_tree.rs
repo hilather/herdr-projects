@@ -30,6 +30,12 @@ impl Control {
         let mut budget=Budget::new();budget.deadline=budget.deadline.min(self.deadline);
         budget.cancellation=self.cancellation.clone();budget
     }
+    /// Live staging adds its root, optional report and manifest to a library
+    /// inventory already bounded at ENTRY_LIMIT. Never use this for source reads.
+    pub fn staging_cleanup_budget(&self)->Budget {
+        let mut budget=self.budget();budget.entries=ENTRY_LIMIT+4;budget
+    }
+
 }
 pub struct Budget {remaining:u64,entries:usize,pub deadline:Instant,pub cancellation:Cancellation}
 impl Budget {
@@ -155,6 +161,31 @@ impl Directory {
         }
         anyhow::bail!("empty artifact relative path")
     }
+    /// Remove a private owned tree without following links. Callers must exclude
+    /// managed writers; cancellation may leave a partly removed temporary tree.
+    pub fn remove_owned_tree(&self,name:&OsStr,budget:&mut Budget)->Result<()> {
+        self.remove_owned_node(name,budget,0,self.metadata()?.dev(),&mut ||{})
+    }
+    fn remove_owned_node(&self,name:&OsStr,budget:&mut Budget,depth:usize,device:u64,after_unlink:&mut impl FnMut())->Result<()> {
+        // The private staging root is outside the source content depth; a
+        // library's depth-zero root is one level below it.
+        budget.entry(depth.saturating_sub(1))?;
+        let kind=self.kind(name)?.ok_or_else(||anyhow::anyhow!("staging entry disappeared"))?;
+        ensure!(matches!(kind,NodeKind::File|NodeKind::Directory),"unsupported staging entry; cleanup refused");
+        let file=self.child(name)?;let before=file.metadata()?;
+        ensure!(before.dev()==device&&(before.is_dir()||before.nlink()==1),"staging ownership boundary changed");
+        let directory=before.is_dir();
+        if directory {
+            let child=Self::from_file(file)?;
+            for entry in child.names(budget)? {child.remove_owned_node(&entry,budget,depth+1,device,after_unlink)?;}
+        }
+        budget.check()?;
+        let current=self.child(name)?.metadata()?;
+        ensure!(current.dev()==before.dev()&&current.ino()==before.ino()&&current.is_dir()==directory,"staging entry identity changed");
+        let name=CString::new(name.as_bytes())?;
+        if unsafe{libc::unlinkat(self.0.as_raw_fd(),name.as_ptr(),if directory{libc::AT_REMOVEDIR}else{0})}<0 {return Err(io::Error::last_os_error().into());}
+        self.0.sync_all()?;after_unlink();Ok(())
+    }
     pub fn names(&self,budget:&Budget)->Result<Vec<OsString>> {
         budget.check()?;
         // Opening '.' obtains an independent directory offset; dup would share
@@ -217,6 +248,30 @@ mod tests {
     use super::*;
     use std::{fs,io::Write,os::unix::fs::symlink};
 
+    #[test]
+    fn cancelled_owned_cleanup_can_resume_after_a_durable_unlink() {
+        let root=tempfile::tempdir().unwrap();let path=root.path().join("orphan");std::fs::create_dir(&path).unwrap();
+        for name in ["a","b"] {std::fs::write(path.join(name),b"temporary").unwrap();}
+        let directory=Directory::open(root.path()).unwrap();let control=Control::default();let mut budget=control.staging_cleanup_budget();
+        assert!(directory.remove_owned_node(OsStr::new("orphan"),&mut budget,0,directory.metadata().unwrap().dev(),&mut ||control.cancellation.cancel()).is_err());
+        assert!(!path.join("a").exists());assert!(path.join("b").exists());
+        directory.remove_owned_tree(OsStr::new("orphan"),&mut Control::default().staging_cleanup_budget()).unwrap();assert!(!path.exists());
+    }
+    #[test]
+    fn owned_cleanup_accepts_maximum_source_depth_without_relaxing_source_limits() {
+        let root=tempfile::tempdir().unwrap();let path=root.path().join("orphan");let mut deepest=path.join("library");
+        for _ in 0..DEPTH_LIMIT-1 {deepest=deepest.join("d");}
+        std::fs::create_dir_all(&deepest).unwrap();std::fs::write(deepest.join("leaf"),b"temporary").unwrap();
+        assert!(Budget::new().entry(DEPTH_LIMIT+1).is_err());
+        Directory::open(root.path()).unwrap().remove_owned_tree(OsStr::new("orphan"),&mut Control::default().staging_cleanup_budget()).unwrap();assert!(!path.exists());
+    }
+    #[test]
+    fn cleanup_budget_accepts_a_maximum_live_library_plus_stage_metadata() {
+        let root=tempfile::tempdir().unwrap();let path=root.path().join("orphan");std::fs::create_dir_all(path.join("library")).unwrap();
+        for n in 0..ENTRY_LIMIT-1 {std::fs::write(path.join("library").join(n.to_string()),b"").unwrap();}
+        for name in ["report.md","manifest.json"] {std::fs::write(path.join(name),b"stage metadata").unwrap();}
+        Directory::open(root.path()).unwrap().remove_owned_tree(OsStr::new("orphan"),&mut Control::default().staging_cleanup_budget()).unwrap();assert!(!path.exists());
+    }
     #[test]
     fn atomic_destination_is_never_its_own_temporary_and_collisions_are_preserved() {
         let root=tempfile::tempdir().unwrap();let dir=Directory::open(root.path()).unwrap();

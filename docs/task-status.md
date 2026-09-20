@@ -71,6 +71,8 @@ against its PR header. The supervised worker can execute and recover final copie
 idle resolution also requires fresh session-bound agent/pane observations.
 Automatic Linux idle/merged-PR admission now shares the bounded background
 queue, with retained recovery before session checks and durable notice replay.
+Full staging inventories can reclaim unreferenced managed directories under
+project ownership, preserving recovery references and unknown entries.
 Remaining terminal effects still need isolation. T04.3 now fences legacy
 launch arguments by explicit agent kind and provides redacted [named profile inspection](profiles.md);
 explicit local version probes for Claude/Codex are available. Launch selection,

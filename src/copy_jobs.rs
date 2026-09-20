@@ -170,6 +170,7 @@ fn execute(input:&Input,control:&Control,helpers:&Helpers)->Result<()> {
     }
     thread::copy_delivery::ready(&expected)?;
     ensure!(!expected.thread_dir.is_empty()&&Path::new(&expected.thread_dir).is_absolute(),"copy source path must be absolute");
+    live::reclamation::make_room(&project,&guard,control)?;
     let spool=live::Spool::reserve(&project,control)?;
     let mut command=if let Some(target)=&input.target {
         let probe=helpers.ssh(target,&format!("{} artifact-stream --probe",remote::quote(&input.helper)),remote::SSH_TIMEOUT)?;
@@ -361,6 +362,14 @@ mod tests {
             let current=thread::load(&project,&t.id).unwrap();assert!(current.pending_final_copy.is_none());
             assert_eq!(current.status,if matches!(variant,"idle"|"maximum"){thread::Status::Resolved}else{thread::Status::Open},"{variant}");
         }
+    }
+    #[test]
+    fn worker_reclaims_full_orphan_inventory_only_after_acquiring_project_ownership() {
+        let(_root,project,t,input,helpers)=fixture();let parent=project.state_dir().join("live-copies");fs::create_dir_all(&parent).unwrap();
+        for n in 0..15 {let stage=parent.join(format!(".download-123-{n}"));fs::create_dir(&stage).unwrap();fs::write(stage.join("stream"),b"abandoned").unwrap();}
+        let guard=ProjectGuard::acquire(&project.dir()).unwrap();assert!(execute(&input,&Control::default(),&helpers).is_err());
+        assert_eq!(fs::read_dir(&parent).unwrap().count(),15);assert_eq!(thread::load(&project,&t.id).unwrap(),t);drop(guard);
+        execute(&input,&Control::default(),&helpers).unwrap();assert!(thread::load(&project,&t.id).unwrap().copy_receipt.is_some());assert_eq!(fs::read_dir(parent).unwrap().count(),0);
     }
     #[test]
     fn supervised_local_success_publishes_and_preserves_literal_source_argument() {
