@@ -78,3 +78,15 @@ Schema upgrades preserve previous exports and claim history. Unsupported preexis
 `runtime.launch` intents without sealed inputs block upgrade before commit; they
 cannot be promoted into launch authority. Reservation crash/rollback tests cover DB
 boundaries only. External launch crash certification remains a separate gate.
+
+## Elapsed-time polling (partial T04.2)
+
+Remote polling uses a monotonic 60-second deadline scoped to project, socket and
+machine. Failed commands start a 120-second retry deadline when they finish.
+Fast ticks cannot retry early, and delayed ticks do not require additional ticks
+to become due. An overdue resource receives one poll, without a catch-up burst.
+The ticker's 15-second interval starts before each pass, so command duration does
+not add another full interval. Wall-clock changes do not affect these deadlines.
+
+Slow commands are still synchronous. Bounded queues, separate control/transfer
+lanes, cancellation/drain and their load/fault metrics remain T04.2 work.

@@ -924,7 +924,7 @@ fn is_machine_call(cmd: &Cmd) -> bool {
 }
 
 #[test]
-fn a_failed_machine_call_changes_nothing_and_the_machine_is_skipped_for_eight_ticks() {
+fn a_failed_machine_call_changes_nothing_until_the_elapsed_retry_deadline() {
     let (world, project) = remote_world();
     let failing = World { runner: FakeRunner::new(), ..world };
     failing.runner.on_fn(is_machine_call, |_| Ok(crate::runner::fake::timeout()));
@@ -936,13 +936,13 @@ fn a_failed_machine_call_changes_nothing_and_the_machine_is_skipped_for_eight_ti
     let mut memory = Memory::new(&ctx);
 
     let machine_calls = |w: &World| w.runner.calls.borrow().iter().filter(|c| is_machine_call(c)).count();
-    for tick in 1..=9 {
-        memory.tick = tick;
+    memory.advance_clock(std::time::Duration::ZERO);
+    for _ in 0..8 {
         let _ = ticker::tick_project_with(&ctx, &project, &mut memory);
+        memory.advance_clock(ticker::TICK);
     }
-    // Polled once at tick 1, then skipped for the next eight ticks.
+    // No poll before the two-minute retry deadline, regardless of tick count.
     assert_eq!(machine_calls(&failing), 1);
-    memory.tick = 10;
     let _ = ticker::tick_project_with(&ctx, &project, &mut memory);
     assert_eq!(machine_calls(&failing), 2);
 
@@ -976,16 +976,16 @@ fn a_long_machine_outage_gives_one_item_and_one_recovery_item() {
     let mut memory = Memory::new(&ctx);
     memory.outage_secs = 0;
 
-    for tick in [1, 10, 19] {
-        memory.tick = tick;
+    for _ in 0..3 {
+        memory.advance_clock(crate::steps::REMOTE_RETRY_DELAY);
         let _ = ticker::tick_project_with(&ctx, &project, &mut memory);
     }
     assert_eq!(items_of(&project, "outage").len(), 1);
     assert!(items_of(&project, "outage")[0].summary.contains("`box` has been unreachable"));
 
     *down.borrow_mut() = false;
-    for tick in [28, 32, 36] {
-        memory.tick = tick;
+    for _ in 0..3 {
+        memory.advance_clock(crate::steps::REMOTE_RETRY_DELAY);
         ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
     }
     let outages = items_of(&project, "outage");

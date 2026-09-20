@@ -85,7 +85,7 @@ fn f02_shared_machine_serves_both_project_sessions() {
     let mut poll_counts = [0; 2];
     for tick in 1..=12 {
         assert!(ticker::tick_for_test(&ctx, &mut memory));
-        if tick % crate::steps::REMOTE_EVERY_TICKS == 0 {
+        if tick % 4 == 0 {
             for (index, project) in projects.iter().enumerate() {
                 let socket = project.coordinator().unwrap().socket;
                 let count = world.runner.calls.borrow().iter().filter(|cmd| {

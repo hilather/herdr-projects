@@ -564,3 +564,20 @@ exist. No worker launch was enabled and no external launch crash gate is claimed
 Next is T04.2 bounded execution and elapsed-time scheduling, then kind-bound profiles
 and authority producers. The overall 41-card counts remain 16 implemented locally,
 one partial and 24 not started.
+
+## W04 elapsed-time polling (partial T04.2)
+
+Remote cadence/backoff now use monotonic deadlines per project/session/machine,
+with 60-second normal polling and a 120-second retry delay measured from failed
+command completion. Ticker sleep uses the remainder of its pass-start interval.
+Fast passes cannot trigger early retries; slow passes do not stretch intervals by
+requiring additional ticks, and overdue work does not generate catch-up bursts.
+
+Independent review approved this increment. Deterministic clock fixtures cover
+exact boundaries, long commands, rapid ticks, session isolation and outage recovery.
+The full all-feature debug suite passes 371 tests (92 library, 251 binary, 26 CLI,
+2 contracts). Slow commands remain synchronous: bounded pools, separate execution
+lanes and cancellation/drain load tests are the next T04.2 work. Overall counts are
+16 cards implemented locally, two partial and 23 not started.
+Default-feature validation also passes all 228 tests; the three focused scheduler
+checks pass in release mode. Logs: `/tmp/herdr-deadlines-{debug,release,legacy}.log`.

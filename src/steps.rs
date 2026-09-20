@@ -3,6 +3,7 @@
 //! write an inbox item when it changed".
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -102,8 +103,8 @@ impl Outage {
     }
 }
 
-pub const REMOTE_EVERY_TICKS: u64 = 4;
-pub const SKIP_TICKS_AFTER_FAILURE: u64 = 8;
+pub const REMOTE_INTERVAL: Duration = Duration::from_secs(60);
+pub const REMOTE_RETRY_DELAY: Duration = Duration::from_secs(120);
 
 /// A saved machine label can denote different observations in different
 /// project sessions. Eligibility and outage delivery must have the same scope.
@@ -116,10 +117,8 @@ pub struct MachineKey {
 
 #[derive(Debug, Clone, Default)]
 pub struct MachineMemory {
-    /// Not polled again before this tick: one sleeping machine must not slow
-    /// the other projects' ticks.
-    pub skip_until_tick: u64,
-    pub last_poll_tick: Option<u64>,
+    /// Monotonic elapsed deadline; controller tick duration does not affect cadence.
+    pub next_poll: Option<Instant>,
 }
 
 /// What the ticker process remembers between ticks (not persisted).
@@ -128,6 +127,8 @@ pub struct Memory {
     pub outage_secs: i64,
     pub tick: u64,
     pub machines: BTreeMap<MachineKey, MachineMemory>,
+    #[cfg(test)]
+    clock: Option<Instant>,
 }
 
 impl Memory {
@@ -138,26 +139,36 @@ impl Memory {
             outage_secs: ctx.env.var("HERDR_PROJECTS_OUTAGE_SECS").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_OUTAGE_SECS),
             tick: 0,
             machines: BTreeMap::new(),
+            #[cfg(test)]
+            clock: None,
         }
     }
 
-    /// Remote machines are polled every fourth tick (about a minute), and not
-    /// at all for eight ticks after a failure.
+    fn monotonic_now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now)=self.clock {return now;}
+        Instant::now()
+    }
+
+    #[cfg(test)]
+    pub fn advance_clock(&mut self, elapsed:Duration) {
+        self.clock=Some(self.monotonic_now()+elapsed);
+    }
+
+    /// Check a monotonic deadline, independent of successful or delayed ticks.
     pub fn machine_is_due(&mut self, machine: &MachineKey) -> bool {
-        let tick = self.tick;
-        let entry = self.machines.entry(machine.clone()).or_default();
-        let due = tick >= entry.skip_until_tick && entry.last_poll_tick.is_none_or(|last| tick.saturating_sub(last) >= REMOTE_EVERY_TICKS);
-        if due {
-            entry.last_poll_tick = Some(tick);
-        }
-        due
+        let now=self.monotonic_now();
+        let entry=self.machines.entry(machine.clone()).or_default();
+        if entry.next_poll.is_some_and(|deadline|now<deadline) {return false;}
+        entry.next_poll=Some(now+REMOTE_INTERVAL);
+        true
     }
 
     pub fn record_machine(&mut self, machine: &MachineKey, error: Option<&str>) {
-        let tick = self.tick;
-        let entry = self.machines.entry(machine.clone()).or_default();
+        let now=self.monotonic_now();
+        // Backoff begins when the failed command finishes, not when its tick began.
         if error.is_some() {
-            entry.skip_until_tick = tick.saturating_add(SKIP_TICKS_AFTER_FAILURE + 1);
+            self.machines.entry(machine.clone()).or_default().next_poll=Some(now+REMOTE_RETRY_DELAY);
         }
     }
 }
@@ -499,20 +510,43 @@ mod tests {
         let b = MachineKey { project: "/b".into(), ..a.clone() };
         let rebound = MachineKey { socket: "two.sock".into(), ..a.clone() };
         memory.outage_secs = 0;
-        // Tick zero is a real first observation, not a never-polled sentinel.
+        // Freeze monotonic time to exercise exact deadline boundaries.
+        memory.advance_clock(Duration::ZERO);
         assert!(memory.machine_is_due(&a));
         assert!(!memory.machine_is_due(&a));
         assert!(memory.machine_is_due(&b));
         memory.record_machine(&a, Some("offline"));
         memory.record_machine(&b, None);
-        memory.tick = REMOTE_EVERY_TICKS;
+        memory.advance_clock(REMOTE_INTERVAL);
         assert!(!memory.machine_is_due(&a));
         assert!(memory.machine_is_due(&b));
         assert!(memory.machine_is_due(&rebound));
-        memory.tick = SKIP_TICKS_AFTER_FAILURE + 1;
+        memory.advance_clock(REMOTE_RETRY_DELAY-REMOTE_INTERVAL);
         assert!(memory.machine_is_due(&a));
         memory.record_machine(&a, None);
         assert!(!memory.machine_is_due(&a));
+    }
+
+    #[test]
+    fn remote_deadlines_ignore_tick_counts_and_backoff_starts_after_failure() {
+        let world=crate::scenarios::World::new();let mut memory=Memory::new(&world.ctx());
+        memory.advance_clock(Duration::ZERO);
+        let key=MachineKey{project:"/project".into(),socket:"session".into(),machine:"slow".into()};
+        assert!(memory.machine_is_due(&key));
+        // Thousands of fast control passes cannot cause early retry.
+        memory.tick=10_000;assert!(!memory.machine_is_due(&key));
+        memory.advance_clock(REMOTE_INTERVAL-Duration::from_millis(1));
+        assert!(!memory.machine_is_due(&key));
+        memory.advance_clock(Duration::from_millis(1));assert!(memory.machine_is_due(&key));
+        // A long operation consumes time without any additional ticker iteration.
+        memory.advance_clock(Duration::from_secs(180));
+        memory.record_machine(&key,Some("timed out"));
+        memory.advance_clock(REMOTE_RETRY_DELAY-Duration::from_millis(1));
+        assert!(!memory.machine_is_due(&key));
+        memory.advance_clock(Duration::from_millis(1));assert!(memory.machine_is_due(&key));
+        // Missed deadlines produce one poll, never a burst of catch-up commands.
+        memory.advance_clock(Duration::from_secs(3600));assert!(memory.machine_is_due(&key));
+        assert!(!memory.machine_is_due(&key));
     }
 
     #[test]

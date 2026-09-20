@@ -262,6 +262,7 @@ pub fn run(ctx: &Ctx) -> Result<()> {
             log.line("stop file found; exiting");
             return Ok(());
         }
+        let wake = Instant::now() + TICK;
         if tick(ctx, &log, &mut memory) {
             last_reachable = Instant::now();
         } else if last_reachable.elapsed() > IDLE_EXIT {
@@ -269,7 +270,6 @@ pub fn run(ctx: &Ctx) -> Result<()> {
             return Ok(());
         }
         // Sleep in short slices so a stop request is honoured promptly.
-        let wake = Instant::now() + TICK;
         while Instant::now() < wake {
             if stop_path(root).exists() {
                 break;
@@ -334,6 +334,7 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
 
 #[cfg(test)]
 pub fn tick_for_test(ctx: &Ctx, memory: &mut Memory) -> bool {
+    memory.advance_clock(TICK);
     let dir = std::env::temp_dir().join(format!("hp-test-log-{}", std::process::id()));
     tick(ctx, &Log { path: dir }, memory)
 }
@@ -667,7 +668,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     }
     launch_pass(ctx, project, &herdr, &local, &seen.agents, &seen.panes, &mut may_start, &mut errors);
 
-    // Remote threads, one machine at a time, every fourth tick.
+    // Remote threads, one machine at a time, on elapsed-time deadlines.
     let remote_threads = open_threads(project, true);
     let mut machines: Vec<String> = remote_threads.iter().map(|t| t.machine.clone()).collect();
     machines.sort();
