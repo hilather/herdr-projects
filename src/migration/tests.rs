@@ -674,3 +674,14 @@ fn pending_live_projection_refuses_migration_until_exact_stage_recovery() {
     assert!(validate_thread(&value).unwrap_err().to_string().contains("pending live projection"));
     let plan=inspect(&project).unwrap();assert!(plan.blockers.iter().any(|b|b.starts_with("threads/t-0001.toml:")),"{:?}",plan.blockers);
 }
+
+
+#[test]
+fn final_copy_obligations_and_invalid_counters_block_migration() {
+    let (_temp,project)=fixture();let path=project.join("threads/t-0001.toml");
+    let original:toml::Value=toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    for (field,value) in [("pending_final_copy",toml::Value::Table(Default::default())),("pending_final_notice",toml::Value::Table(Default::default())),("final_copy_sequence",toml::Value::Integer(-1))] {
+        let mut changed=original.clone();changed.as_table_mut().unwrap().insert(field.into(),value);fs::write(&path,toml::to_string(&changed).unwrap()).unwrap();
+        assert!(validate_thread(&changed).is_err());assert!(inspect(&project).unwrap().blockers.iter().any(|b|b.starts_with("threads/t-0001.toml:")));
+    }
+}

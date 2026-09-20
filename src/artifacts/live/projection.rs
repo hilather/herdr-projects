@@ -10,7 +10,7 @@ fn eligible(project:&Project,guard:&ProjectGuard,t:&Thread)->Result<()> {
     ensure!(t.status==thread::Status::Open&&t.removal.is_none(),"thread is not eligible for live projection");
     thread::copy_delivery::validate(t)?;Ok(())
 }
-fn verify(path:&Path,source:&Source,control:&Control)->Result<()> {
+pub(super) fn verify(path:&Path,source:&Source,control:&Control)->Result<()> {
     control.check()?;validate(source)?;let root=Directory::open(path)?;
     let mut report=control.budget();let mut library=None;
     for entry in entries(source) {
@@ -80,7 +80,7 @@ fn check(project:&Project,guard:&ProjectGuard,id:&str,intent:&LiveCopyIntent,aut
         &&t.report_hash==intent.previous_hash&&t.copy_receipt==intent.previous_receipt&&authority==intent.authority,"live projection authority or execution changed; recovery refused");
     ensure!(t.pending_copy_notice.is_none()&&t.pending_review_notice.is_none(),"pending notice blocks live projection");Ok(t)
 }
-fn parent(root:&Directory,path:&Path,control:&Control)->Result<Directory> {
+pub(super) fn parent(root:&Directory,path:&Path,control:&Control)->Result<Directory> {
     let mut current=root.directory(Path::new("."))?;
     for part in path.components() {
         let std::path::Component::Normal(name)=part else {anyhow::bail!("invalid projection path");};
@@ -130,7 +130,7 @@ fn resume_with_control(project:&Project,guard:&ProjectGuard,id:&str,authority:&s
     File::open(project.dir().join("threads"))?.sync_all()?;
     fs::remove_dir_all(&stage_path)?;File::open(stage_path.parent().unwrap())?.sync_all()?;Ok(())
 }
-fn verify_home(root:&Directory,id:&str,source:&Source,control:&Control)->Result<()> {
+pub(super) fn verify_home(root:&Directory,id:&str,source:&Source,control:&Control)->Result<()> {
     let mut report=control.budget();let mut library=None;
     for entry in entries(source) {
         let (path,budget)=if entry.path=="report.md" {(PathBuf::from(format!("threads/{id}.md")),&mut report)}
@@ -142,7 +142,7 @@ fn verify_home(root:&Directory,id:&str,source:&Source,control:&Control)->Result<
     }
     Ok(())
 }
-fn copy_entry(stage:&Directory,destination:&Directory,name:&OsStr,entry:&Entry,budget:&mut Budget)->Result<()> {
+pub(super) fn copy_entry(stage:&Directory,destination:&Directory,name:&OsStr,entry:&Entry,budget:&mut Budget)->Result<()> {
     let mut source=stage.file(Path::new(&entry.path))?;budget.size(&source)?;let before=source.metadata()?;
     destination.write_atomic(name,|target| {
         let mut hash=Sha256::new();let mut bytes=0u64;let mut buffer=[0;64*1024];

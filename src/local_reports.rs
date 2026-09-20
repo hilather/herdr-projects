@@ -15,7 +15,7 @@ pub struct Sample {fingerprint:String,deadline:Instant,pub hash:Option<String>}
 impl Sample {pub fn matches(&self,t:&Thread)->bool {Instant::now()<self.deadline&&self.fingerprint==fingerprint(t)}}
 pub enum Poll {Pending,Ready(Sample),Failed(String)}
 fn fingerprint(t:&Thread)->String {
-    thread::sha256_hex(serde_json::json!([thread::execution_fingerprint(t),t.report_hash,t.copy_receipt,t.pending_live_copy]).to_string().as_bytes())
+    thread::sha256_hex(serde_json::json!([thread::execution_fingerprint(t),t.report_hash,t.copy_receipt,t.pending_live_copy,t.pending_final_copy]).to_string().as_bytes())
 }
 fn key(project:&Project,t:&Thread)->Key {(project.dir().display().to_string(),t.id.clone())}
 struct Candidate {fingerprint:String,request:Request}

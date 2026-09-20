@@ -3,6 +3,9 @@ use super::*;
 use herdr_projects::copy_receipt::{CopyNotice, CopyReceipt};
 
 pub fn validate(t: &Thread) -> Result<()> {
+    anyhow::ensure!(t.final_copy_sequence<=i64::MAX as u64,"final-copy sequence exhausted");
+    if let Some(intent)=&t.pending_final_copy {intent.validate()?;anyhow::ensure!(intent.sequence==t.final_copy_sequence&&t.pending_live_copy.is_none(),"invalid pending final copy");}
+    if let Some(notice)=&t.pending_final_notice {notice.validate(&t.id,t.final_copy_sequence)?;}
     anyhow::ensure!(t.live_copy_sequence<=i64::MAX as u64,"invalid live-copy sequence");
     if let Some(intent)=&t.pending_live_copy {intent.validate()?;anyhow::ensure!(intent.sequence==t.live_copy_sequence,"live-copy intent sequence mismatch");}
     if let Some(receipt) = &t.copy_receipt { receipt.validate()?; }
@@ -20,6 +23,7 @@ fn ready_for(t:&Thread,intent:Option<&herdr_projects::live_copy_intent::LiveCopy
     super::review_delivery::validate(t)?;
     anyhow::ensure!(t.pending_copy_notice.is_none(), "prior copy warning still pending");
     anyhow::ensure!(t.pending_review_notice.is_none(), "prior review notice still pending");
+    anyhow::ensure!(t.pending_final_copy.is_none()&&t.pending_final_notice.is_none(),"recover or deliver the pending final copy first");
     anyhow::ensure!(t.pending_live_copy.as_ref()==intent,"recover the pending live projection first");
     Ok(())
 }
@@ -72,6 +76,7 @@ pub fn deliver(project: &Project) -> Result<()> {
     anyhow::ensure!(diagnostics.is_empty(), "unreadable thread records: {}", diagnostics.join("; "));
     for t in threads {
         validate(&t)?;
+        final_copy::deliver(project,&t)?;
         let Some(notice) = t.pending_copy_notice else { continue; };
         crate::inbox::write_once(project, &notice.id, &notice.kind, &notice.subject, &notice.summary, &notice.body)?;
         update_checked(project, &t.id, |current| {

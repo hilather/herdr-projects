@@ -228,7 +228,8 @@ rely on them need an explicitly configured environment in their approved script.
 Nonzero exits are reported as supervisor status 200, not the original exit code.
 
 Routine discovery accepts at most 4,096 directory entries and 128 KiB per definition.
-Approval records are limited to 1 MiB and ticker state to 16 MiB. Private control
+Approval records are limited to 1 MiB; ticker state and individual thread records
+are limited to 16 MiB. Private control
 files must be regular, single-link files; FIFOs and symlinks refuse promptly.
 These local filesystem reads are bounded but do not promise deadlines for a stalled
 filesystem. Unreadable approval records cannot authorize commands or be overwritten

@@ -338,7 +338,7 @@ pub enum RestartPlan {
 
 /// What `thread restart` does, from what the record shows was reached.
 pub fn restart_plan(thread: &Thread, live: &Live, branch_exists: bool, now: jiff::Timestamp) -> Result<RestartPlan> {
-    anyhow::ensure!(thread.pending_live_copy.is_none(),"recover the pending live projection before restarting");
+    anyhow::ensure!((thread.pending_live_copy.is_none()&&thread.pending_final_copy.is_none()),"recover the pending live projection before restarting");
     match thread.kind {
         Kind::Adopted => bail!("an adopted thread cannot be restarted; adopt a new pane instead"),
         Kind::Worktree | Kind::Tab => {}
@@ -526,7 +526,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
     let _lease = crate::cleanup::lease(&ctx.root)?;
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
-    anyhow::ensure!(record.pending_live_copy.is_none(),"recover the pending live projection before resolving");
+    anyhow::ensure!((record.pending_live_copy.is_none()&&record.pending_final_copy.is_none()),"recover the pending live projection before resolving");
     if args.reopen {
         if record.status != Status::Resolved {
             bail!("{id} is not resolved");
@@ -603,7 +603,7 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<()
 
 /// The final report and library copy, storing the new report hash.
 pub fn final_copy(ctx: &Ctx, project: &Project, record: &Thread) -> thread::Copied {
-    if record.pending_live_copy.is_some(){return thread::Copied{artifact_snapshot:None,outcome:thread::CopyOutcome::Failed("recover the pending live projection first".into()),report_hash:None};}
+    if record.pending_live_copy.is_some()||record.pending_final_copy.is_some(){return thread::Copied{artifact_snapshot:None,outcome:thread::CopyOutcome::Failed("recover the pending live projection first".into()),report_hash:None};}
     let mut copied = copy_for_finalization(ctx, project, record);
     if !matches!(copied.outcome, CopyOutcome::Failed(_)) {
         let saved = thread::update_checked(project, &record.id, |t| {

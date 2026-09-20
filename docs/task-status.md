@@ -64,7 +64,11 @@ now share background admission, with durable pre-effect claims and restart-safe
 output delivery. Immutable preservation receive now propagates cancellation and
 original deadlines through extraction, verification and publication. Complete
 received live stages can become immutable snapshots without fetching again; partial
-stages cannot become preservation evidence. Automatic idle/merged-PR final-copy jobs and remaining terminal effects still need isolation. T04.3 now fences legacy
+stages cannot become preservation evidence. Report-optional final-copy intents now
+retain stages and atomically commit copy/resolution decisions with replayable notices.
+Idle eligibility is checked against the copied report, and merged eligibility
+against its PR header. Automatic idle/merged-PR worker admission and remaining
+terminal effects still need isolation. T04.3 now fences legacy
 launch arguments by explicit agent kind and provides redacted [named profile inspection](profiles.md);
 explicit local version probes for Claude/Codex are available. Launch selection,
 production profile resolution and verified capability evidence remain. Version-2

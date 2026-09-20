@@ -1571,3 +1571,37 @@ controlled-receiver commit; they were not rerun for this not-yet-admitted worker
 Automatic finalizer integration remains open; counts remain 16 locally implemented,
 five partial and 20 not started. macOS and actual remote-host acceptance remain
 untested.
+
+
+## W04 durable report-optional final-copy projection
+
+Final-copy projection now has its own durable intent, retained stage and historical
+notice. It accepts missing reports, preserving the prior home report and receipt,
+and distinguishes partial copies from complete immutable snapshots. Recovery
+verifies the retained manifest, staged bytes, preservation identity and current
+authority before additive library-first/report-last publication. Lifecycle changes
+and migration refuse pending final projection; thread record reads and writes are
+bounded at 16 MiB.
+
+Copy completion and the resolution decision commit together. Idle finalization
+rechecks settings and observed timestamps, and a changed incoming report resets
+the idle clock instead of resolving. Merged finalization requires the published
+report's first-line PR URL to retain the expected merged PR. Lost eligibility
+finishes the copy and leaves the thread open. Notices persist before delivery,
+reuse the same inbox identity after crashes, and do not mutate a replacement
+execution.
+
+Independent review approved all eight focused finalization fixtures after finding
+and fixing the idle changed-report race. Coverage includes interruption/recovery,
+missing and partial reports, stale eligibility, merged report identity, authority
+and cancellation failures, corrupt preservation evidence, lifecycle exclusion and
+historical notice replay. Automatic worker ingress and admission are still absent;
+these APIs do not yet replace the ticker's synchronous finalizer. Counts remain
+16 locally implemented, five partial and 20 not started. macOS and actual remote
+host acceptance remain untested.
+
+All 554 tests pass in debug and release (166 library, 353 binary, 33 CLI, two
+contracts). Default-feature tests pass (29 library, 304 binary, 14 CLI, two
+contracts); three optional live checks remain ignored. Logs:
+`/tmp/herdr-final-intent-{debug,release}-corrected.log` and
+`/tmp/herdr-final-intent-default.log`.

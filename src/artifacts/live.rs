@@ -4,6 +4,8 @@ use crate::source_tree::{Budget,Control,Directory,Limit,NodeKind};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 pub mod projection;
+#[allow(dead_code)] // Trusted final-copy worker admission follows recovery validation.
+pub mod finalization;
 
 const MAGIC:&[u8;8]=b"HPLV\x01\0\0\0";
 pub const STREAM_LIMIT:usize=2*BYTE_LIMIT as usize+MANIFEST_LIMIT+12;

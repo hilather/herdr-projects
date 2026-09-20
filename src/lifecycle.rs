@@ -73,7 +73,7 @@ pub fn delete(ctx: &Ctx, slug: &str, force: bool) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     let (threads,diagnostics)=thread::list_with_diagnostics(&project);
     anyhow::ensure!(diagnostics.is_empty(),"cannot inspect pending projections: {}",diagnostics.join("; "));
-    anyhow::ensure!(threads.iter().all(|t|t.pending_live_copy.is_none()),"recover pending live projections before deleting the project");
+    anyhow::ensure!(threads.iter().all(|t|t.pending_live_copy.is_none()&&t.pending_final_copy.is_none()),"recover pending live projections before deleting the project");
     if !force {
         if let Some(view) = threads::session_view(ctx, &project) {
             let alive = alive_panes(&project, &view);

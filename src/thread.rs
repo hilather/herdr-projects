@@ -19,6 +19,8 @@ pub const LIBRARY_CAP_KB: u64 = 50 * 1024;
 pub const MAX_LAUNCH_ATTEMPTS: u32 = 3;
 pub mod copy_delivery;
 pub mod review_delivery;
+#[allow(dead_code)] // Automatic final-copy admission follows recovery review.
+pub mod final_copy;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -79,6 +81,9 @@ pub struct Thread {
     pub last_review_copy_sequence: u64,
     pub live_copy_sequence: u64,
     pub pending_live_copy: Option<herdr_projects::live_copy_intent::LiveCopyIntent>,
+    pub final_copy_sequence: u64,
+    pub pending_final_copy: Option<herdr_projects::final_copy_intent::FinalCopyIntent>,
+    pub pending_final_notice: Option<herdr_projects::final_copy_intent::Notice>,
     pub report_hash: String,
     pub last_report_change: String,
     pub last_review_item_hash: String,
@@ -138,7 +143,7 @@ pub fn home_report_path(project: &Project, id: &str) -> PathBuf {
 pub fn load(project: &Project, id: &str) -> Result<Thread> {
     validate_id(id)?;
     let path = record_path(project, id);
-    let text = std::fs::read_to_string(&path).with_context(|| format!("no thread `{id}` in `{}`", project.slug))?;
+    let text = crate::paths::read_control_text(&path,16*1024*1024)?.with_context(|| format!("no thread `{id}` in `{}`", project.slug))?;
     toml::from_str(&text).with_context(|| format!("{} does not parse", path.display()))
 }
 
@@ -174,7 +179,8 @@ pub fn list_with_diagnostics(project: &Project) -> (Vec<Thread>, Vec<String>) {
 }
 
 fn write_record(project: &Project, thread: &Thread) -> Result<()> {
-    write_atomic(&record_path(project, &thread.id), toml::to_string(thread)?.as_bytes())
+    let text=toml::to_string(thread)?;anyhow::ensure!(text.len()<=16*1024*1024,"thread record exceeds 16 MiB; previous record is preserved");
+    write_atomic(&record_path(project, &thread.id), text.as_bytes())
 }
 
 /// Read-modify-write under the project lock: re-reads the record, lets `change`
@@ -187,7 +193,7 @@ pub fn update(project: &Project, id: &str, change: impl FnOnce(&mut Thread)) -> 
 pub fn update_checked(project: &Project, id: &str, change: impl FnOnce(&mut Thread) -> Result<()>) -> Result<Thread> {
     let _lock = project.lock()?;
     let mut thread = load(project, id)?;
-    let pending_execution=thread.pending_live_copy.as_ref().map(|_|(execution_fingerprint(&thread),thread.status));
+    let pending_execution=(thread.pending_live_copy.is_some()||thread.pending_final_copy.is_some()).then(||(execution_fingerprint(&thread),thread.status));
     change(&mut thread)?;
     if let Some((execution,status))=pending_execution {
         anyhow::ensure!(execution_fingerprint(&thread)==execution&&thread.status==status,"recover the pending live projection before changing execution or lifecycle");
@@ -582,7 +588,7 @@ pub struct Copied {
 /// Nothing that is a symbolic link is followed or copied. The caller must not
 /// hold the project lock: this runs `du` and `rsync`.
 pub fn copy_home_local(project: &Project, thread: &Thread, with_library: bool, runner: &dyn Runner) -> Copied {
-    if thread.pending_live_copy.is_some(){return Copied{artifact_snapshot:None,outcome:CopyOutcome::Failed("recover the pending live projection first".into()),report_hash:None};}
+    if thread.pending_live_copy.is_some()||thread.pending_final_copy.is_some(){return Copied{artifact_snapshot:None,outcome:CopyOutcome::Failed("recover the pending live projection first".into()),report_hash:None};}
     let dir = Path::new(&thread.thread_dir);
     let mut notes = Vec::new();
     if thread.thread_dir.is_empty() {
@@ -647,7 +653,7 @@ pub fn copy_home_local(project: &Project, thread: &Thread, with_library: bool, r
 /// library with rsync over ssh, after checking on the machine (without
 /// following links) what is a real directory and a regular file.
 pub fn copy_home_remote(project: &Project, thread: &Thread, with_library: bool, runner: &dyn Runner, target: &str) -> Copied {
-    if thread.pending_live_copy.is_some(){return Copied{artifact_snapshot:None,outcome:CopyOutcome::Failed("recover the pending live projection first".into()),report_hash:None};}
+    if thread.pending_live_copy.is_some()||thread.pending_final_copy.is_some(){return Copied{artifact_snapshot:None,outcome:CopyOutcome::Failed("recover the pending live projection first".into()),report_hash:None};}
     use crate::remote;
     let failed = |error: String| Copied { artifact_snapshot: None, outcome: CopyOutcome::Failed(error), report_hash: None };
     if thread.thread_dir.is_empty() {
