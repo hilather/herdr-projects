@@ -116,9 +116,6 @@ fn scan_open_controlled(root:&crate::source_tree::Directory,destination:Option<&
     }
     control.check()?;Ok(entries)
 }
-fn scan(root:&Path,destination:Option<&Path>)->Result<Vec<Entry>> {
-    scan_controlled(root,destination,&Control::default())
-}
 fn scan_controlled(root:&Path,destination:Option<&Path>,control:&Control)->Result<Vec<Entry>> {
     control.check()?;let opened=crate::source_tree::Directory::open(root)?;
     let entries=scan_open_controlled(&opened,destination,control)?;opened.matches_path(root)?;control.check()?;Ok(entries)
@@ -138,25 +135,30 @@ fn capture(project: &Project, record: &Thread, before_verify: impl FnOnce() -> R
 }
 
 fn capture_mode(project:&Project,record:&Thread,before_verify:impl FnOnce()->Result<()>,canonical:bool)->Result<Snapshot> {
+    capture_mode_controlled(project,record,before_verify,canonical,&Control::default())
+}
+fn capture_mode_controlled(project:&Project,record:&Thread,before_verify:impl FnOnce()->Result<()>,canonical:bool,control:&Control)->Result<Snapshot> {
+    control.check()?;
     ensure!(!record.is_remote() && !record.thread_dir.is_empty(), "local artifact source is required");
     artifact_id(&record.id,canonical)?;
     let source = Path::new(&record.thread_dir);
     real_dir(source)?;
     let opened=crate::source_tree::Directory::open(source)?;
     let identity = fs::canonicalize(source)?;
+    control.check()?;
     let staging = staging_mode(project, record,canonical)?;
     let manifest = Manifest {
         schema: 1, thread: record.id.clone(), generation: record.lifecycle_generation,
         machine: String::new(),
         source: identity.to_str().context("artifact source path must be UTF-8")?.into(),
-        entries: scan_open(&opened, Some(&staging.0))?,
+        entries: scan_open_controlled(&opened, Some(&staging.0),control)?,
     };
     before_verify()?;
+    control.check()?;opened.matches_path(source)?;
+    ensure!(manifest.entries == scan_controlled(&staging.0, None,control)?, "staged artifact verification failed");
+    verify_source_controlled(record, &manifest,control)?;
     opened.matches_path(source)?;
-    ensure!(manifest.entries == scan(&staging.0, None)?, "staged artifact verification failed");
-    verify_source(record, &manifest)?;
-    opened.matches_path(source)?;
-    publish_mode(project, record, staging, manifest,canonical,||opened.matches_path(source))
+    publish_mode_controlled(project, record, staging, manifest,canonical,control,||opened.matches_path(source))
 }
 
 fn staging(project: &Project, record: &Thread) -> Result<Staging> {staging_mode(project,record,false)}
@@ -177,9 +179,6 @@ fn staging_mode(project:&Project,record:&Thread,canonical:bool)->Result<Staging>
     Ok(staging)
 }
 
-fn publish_mode(project: &Project, record: &Thread, staging: Staging, manifest: Manifest,canonical:bool,before_publish:impl FnOnce()->Result<()>) -> Result<Snapshot> {
-    publish_mode_controlled(project,record,staging,manifest,canonical,&Control::default(),before_publish)
-}
 fn publish_mode_controlled(project:&Project,record:&Thread,staging:Staging,manifest:Manifest,canonical:bool,control:&Control,before_publish:impl FnOnce()->Result<()>)->Result<Snapshot> {
     control.check()?;
     ensure!(scan_controlled(&staging.0, None,control)? == manifest.entries, "snapshot verification failed");
@@ -209,12 +208,16 @@ fn publish_mode_controlled(project:&Project,record:&Thread,staging:Staging,manif
 }
 
 pub fn verify_source(record: &Thread, manifest: &Manifest) -> Result<()> {
+    verify_source_controlled(record,manifest,&Control::default())
+}
+fn verify_source_controlled(record:&Thread,manifest:&Manifest,control:&Control)->Result<()> {
+    control.check()?;
     ensure!(manifest.machine.is_empty() && !record.is_remote(), "remote source verification requires its helper");
     ensure!(manifest.schema == 1 && manifest.thread == record.id && manifest.generation == record.lifecycle_generation,
         "artifact snapshot belongs to a different thread execution");
     ensure!(fs::canonicalize(&record.thread_dir)? == Path::new(&manifest.source), "artifact source identity changed");
-    ensure!(scan(Path::new(&record.thread_dir), None)? == manifest.entries, "artifact source changed during preservation");
-    Ok(())
+    ensure!(scan_controlled(Path::new(&record.thread_dir), None,control)? == manifest.entries, "artifact source changed during preservation");
+    control.check()
 }
 
 pub fn load(project:&Project,record:&Thread,id:&str)->Result<Manifest> {load_mode(project,record,id,false)}
@@ -268,6 +271,6 @@ fn artifact_lock(project:&Project,canonical:bool)->Result<ArtifactLock> {
     anyhow::bail!("canonical artifact capture requires state-store")
 }
 #[cfg(feature="state-store")]
-pub fn capture_canonical(project:&Project,record:&Thread)->Result<Snapshot> {capture_mode(project,record,||Ok(()),true)}
+pub fn capture_canonical_controlled(project:&Project,record:&Thread,control:&Control)->Result<Snapshot> {capture_mode_controlled(project,record,||Ok(()),true,control)}
 #[cfg(feature="state-store")]
-pub fn load_canonical(project:&Project,record:&Thread,id:&str)->Result<Manifest> {load_mode(project,record,id,true)}
+pub fn load_canonical_controlled(project:&Project,record:&Thread,id:&str,control:&Control)->Result<Manifest> {load_mode_controlled(project,record,id,true,control)}

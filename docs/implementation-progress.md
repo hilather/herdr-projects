@@ -2397,3 +2397,26 @@ seven release canonical CLI regressions including notification owner death, and
 six default-feature shared-queue regressions. The earlier integrated debug pass
 also passed four library, 31 binary and seven CLI checks. All process checks used
 disposable Linux namespaces; no macOS or real SSH-host evidence was added.
+
+### W04 finalization prerequisite: one preservation deadline
+
+Artifact capture now carries one cancellation/deadline through source capture,
+staging verification, source re-verification, retained snapshot verification and
+publication. Canonical foreground finalization shares that control with receipt
+load/publication, revalidates task/configuration authority before writing the
+receipt and returning confirmation, and revalidates receipt observation before
+the atomic store transition. Normal receipt errors remove only their newly
+created temporary file. Receipt-first recovery still works after source deletion.
+
+Independent source review approved this prerequisite. New tests interrupt capture
+between phases and immediately before publication, refuse already cancelled or
+expired reads, and verify cancelled receipt work leaves the claim unresolved.
+This is not the queued finalization worker: descriptor-bound admission identity,
+publication authorization callbacks, bounded orphan inventory and controlled
+staging cleanup remain next. Filesystem deadlines are cooperative; existing
+staging Drop cleanup still uses recursive deletion outside the control.
+
+Validation passed 23 finalization regressions and 11 artifact tests in both debug
+and release with all features, plus the same 11 artifact tests with default
+features. Finalization checks include process death before/after receipt
+publication, transactional failure and recovery after source deletion.

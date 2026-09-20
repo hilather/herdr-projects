@@ -132,3 +132,47 @@ fn historical_schema_one_root_entry_types_remain_readable() {
     assert!(snapshot.manifest.entries.iter().any(|entry|entry.path=="report.md"&&entry.directory));
     assert!(snapshot.manifest.entries.iter().any(|entry|entry.path=="library"&&!entry.directory));
 }
+
+#[test]
+fn capture_keeps_original_cancellation_and_deadline_between_phases() {
+    for expired in [false,true] {
+        let (_root,project,record)=fixture();
+        let good=capture_local(&project,&record).unwrap();
+        fs::write(Path::new(&record.thread_dir).join("report.md"),b"new report").unwrap();
+        let control=Control{deadline:std::time::Instant::now()+std::time::Duration::from_millis(100),cancellation:Default::default()};
+        let result=capture_mode_controlled(&project,&record,|| {
+            if expired {std::thread::sleep(control.deadline.saturating_duration_since(std::time::Instant::now()));}
+            else {control.cancellation.cancel();}
+            Ok(())
+        },false,&control);
+        let error=result.err().unwrap();
+        assert!(error.to_string().contains(if expired {"deadline"}else{"cancelled"}),"{error:#}");
+        assert_eq!(fs::read_dir(project.state_dir().join("artifacts/t-0001")).unwrap().count(),1);
+        assert_eq!(load(&project,&record,&good.id).unwrap(),good.manifest);
+    }
+}
+
+#[test]
+fn cancellation_at_publication_retains_old_snapshot_without_publishing_new_bytes() {
+    let (_root,project,record)=fixture();let good=capture_local(&project,&record).unwrap();
+    fs::write(Path::new(&record.thread_dir).join("report.md"),b"new report").unwrap();
+    let control=Control::default();let stage=staging(&project,&record).unwrap();
+    let opened=crate::source_tree::Directory::open(Path::new(&record.thread_dir)).unwrap();
+    let mut manifest=good.manifest.clone();manifest.entries=scan_open_controlled(&opened,Some(&stage.0),&control).unwrap();
+    let result=publish_mode_controlled(&project,&record,stage,manifest,false,&control,||{control.cancellation.cancel();Ok(())});
+    assert!(result.is_err());assert_eq!(fs::read_dir(project.state_dir().join("artifacts/t-0001")).unwrap().count(),1);
+    assert_eq!(load(&project,&record,&good.id).unwrap(),good.manifest);
+}
+
+#[test]
+fn expired_or_cancelled_capture_and_retained_load_do_not_start_new_work() {
+    let (_root,project,record)=fixture();let good=capture_local(&project,&record).unwrap();
+    for expired in [false,true] {
+        let mut control=Control::default();
+        if expired {control.deadline=std::time::Instant::now();}else{control.cancellation.cancel();}
+        assert!(capture_mode_controlled(&project,&record,||panic!("capture must not reach verification"),false,&control).is_err());
+        assert!(load_mode_controlled(&project,&record,&good.id,false,&control).is_err());
+        assert!(verify_source_controlled(&record,&good.manifest,&control).is_err());
+        assert_eq!(fs::read_dir(project.state_dir().join("artifacts/t-0001")).unwrap().count(),1);
+    }
+}
