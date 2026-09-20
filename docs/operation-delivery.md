@@ -1,9 +1,21 @@
-# Durable operation delivery foundation (partial T03.3)
+# Durable operation delivery (T03.3)
 
 Implemented 2026-09-19 as a dependency of T03.2's pending-obligation conversion.
 The independent reviewer approved the claim/outcome foundation after verifying
-entity fencing and crash fixtures. T03.3 remains partial: explicit notification and local finalization adapters exist,
-but automatic controller dispatch and production ticker cutover remain. The canonical inbox has an explicit internal drain adapter.
+entity fencing and crash fixtures. Canonical notification and local finalization
+adapters now run through the ticker. The canonical inbox has an explicit internal
+drain adapter. See [W03 acceptance](w03-acceptance.md) for supported scope and limits.
+
+## Delivery semantics
+
+Durable operations use **at-least-once processing and eligible delivery retries**.
+An accepted intent survives restart; attempts may recur and external effects may
+be duplicated when a transport cannot establish an exact outcome. This is not an
+exactly-once effect guarantee. Ambiguity stops automatic replay until explicit
+matching evidence resolves it. Backoff, policy withdrawal, exhausted retries and
+unavailable evidence can leave work blocked or terminally failed; at-least-once
+does not promise unconditional eventual delivery. Terminal input is never blindly
+retyped to satisfy a delivery claim.
 
 ## Persistence and protocol
 
@@ -182,7 +194,8 @@ ambiguous request cannot send it again. Current limitation: retiring even an
 unsent intent prevents authorizing that identical set again; no key bypass is
 provided. A retryable no-effect result can retry only while its original config,
 control and routing authorization still match. Explicit reauthorization of safely
-superseded intents and automatic controller notifications remain future work.
+superseded intents and automatic creation of notification intents remain future
+work; the ticker delivers existing explicitly accepted canonical intents.
 
 ## Canonical artifact finalization
 

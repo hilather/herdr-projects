@@ -1,4 +1,4 @@
-# Runtime observation and reconciliation (partial T03.4)
+# Runtime observation and reconciliation (T03.4)
 
 `reconcile PROJECT` collects a read-only observation batch from schema-v6-or-newer runtime
 bindings. `reconcile PROJECT --record` persists that batch and audit events against
@@ -30,11 +30,11 @@ Each observation retains its collection time and config fingerprint. Historical
 observations are not automatically current authorization after state/config changes.
 Raw external command output is not stored in the evidence table.
 
-Schema v6 adds hash-checked observation rows and includes them in schema-qualified
-runtime exports. Schema v7 adds the guarded lifecycle control described below. This increment interleaves the observation dependency of the
-remaining W03 adapters; it does not close T03.2, T03.3 or T03.4. Remaining work includes
-attempt termination evidence, repair actions, automatic runtime
-execution and integrated restart testing.
+Schema v6 adds hash-checked observations and schema-qualified exports. Schemas v7–v9
+add lifecycle control, canonical bindings and explicit ownership. The supported
+recovery paths have a [bounded W03 handoff](w03-acceptance.md). Worker launching and
+its crash-boundary tests carry into W04; missing termination evidence continues to
+block capacity release. Broader live/platform certification remains in W08.
 
 ## Explicit session rebinding
 

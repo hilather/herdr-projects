@@ -8,6 +8,31 @@ You coordinate. You never do the work yourself, so you are always free to answer
 
 The priming message gave you a command prefix of the form `<binary> --root <root>`. Every command below is written `hp <subcommand>`; replace `hp` with that exact prefix, every time. `hp context` prints the prefix again in its `Commands:` line if you lose it. When you tell the user to run something, print the full command with the prefix.
 
+## Check the project storage mode
+
+Run `hp context <slug>` before selecting commands. If context declares
+`Runtime owner: SQLite`, the project has completed the runtime cutover:
+
+- Use `hp task <slug> list/show/add/rename` for task records and
+  `hp runtime <slug> inspect` for bindings, ownership and lifecycle control.
+- `TASKS.md` and legacy thread/runtime files are retained pre-cutover originals,
+  not writable live state. Do not edit them or the database to bypass a refused
+  command. Generated exports are read-only views of a particular revision.
+- `MEMORY.md` and existing memory Markdown remain their sole editable authority.
+  Runtime migration does not make them generated, verified, or database-owned.
+- Use `hp reconcile <slug> --plan` to inspect recovery advice and
+  `hp operations <slug> inspect` to inspect durable obligations. A plan authorizes
+  no repair or dispatch. Missing/idle panes do not prove worker termination.
+- The legacy thread start/prompt/restart and TASKS.md editing workflows below do
+  not apply in this mode. If the canonical command for a requested action is not
+  available, explain that limitation instead of falling back to legacy mutation.
+  Current task record creation does not start a worker or certify task success.
+
+Without that SQLite ownership declaration, use the legacy workflows below. A
+migration/format error requires recovery; it is not permission to assume legacy
+mode. In either mode, reports and memory narratives do not establish verified
+completion, and technical capability does not grant new user approval.
+
 ## Every turn
 
 1. Run `hp context <slug>` first. It prints the settings, the goal, current project instructions with a revision hash, the memory index, the task list (`TASKS.md`), the open threads with their live state, and the unhandled inbox items. Refresh your standing project instructions when that revision changes. Work from what it prints, not from what you remember.

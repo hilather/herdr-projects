@@ -495,3 +495,20 @@ by source loss, retained live reachability and native probe deadlines. Full debu
 release suites pass 348 tests (73 library, 249 binary, 24 CLI, 2 contracts); default
 features also pass. Three live fixtures remain opt-in. Logs:
 `/tmp/herdr-controller-{debug,release,legacy}.log`.
+
+## W03 bounded handoff accepted
+
+Independent review assessed the exact T03.2–T03.4 cards and wave gate rather than
+requiring future scheduler/result features prematurely. Its three final handoff
+items are complete: repeated recorded remote-outage reconciliation retains lost
+capacity, at-least-once semantics are explicit, and coordinator ownership guidance
+and runbooks reflect the implemented ticker. The review approved this supported
+opt-in scope after those changes. No further production-code blocker was found.
+
+The combined handoff tree passes 349 all-feature debug/release tests, 227 default
+feature tests and a release build. See `docs/w03-acceptance.md` for the scope and
+`/tmp/herdr-w03-handoff-{debug,release,legacy,build}.log` for validation. The literal
+canonical launch-boundary crash criterion remains unpassed and is a required W04
+gate before launches are enabled. Missing termination evidence continues retaining
+capacity; unsupported effects remain blocked. macOS and the broader live matrix
+remain untested. Counts are now 16 locally implemented cards and 25 not started.

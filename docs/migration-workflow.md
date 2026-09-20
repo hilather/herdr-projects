@@ -43,7 +43,8 @@ thread/settings fields are preserved in the original bytes.
 Schema v2 added source provenance and an import receipt; v3 adds durable delivery
 state and the imported-operation count; v4 adds canonical inbox records and v5
 adds typed, unverified runtime identities. Opening an older supported schema does
-not upgrade it. Use `upgrade-store` explicitly. Fresh stores use v6; the runtime
+not upgrade it. Use `upgrade-store` explicitly. Fresh stores use v9 (observations,
+lifecycle control, canonical bindings and adopted ownership); the runtime
 ownership marker remains `sqlite-v2`. Newer unknown schemas refuse writes.
 Import stores task mappings, raw runtime/thread/inbox/task bytes, hashes, supported
 operation intents and audit events in one transaction. It verifies exact bytes, identities, counts, task states,
@@ -72,8 +73,10 @@ The format marker declares runtime owner `sqlite-v2`, memory owner
 `legacy-markdown`, and initially `reconciliation_required=true`. Schema v7 derives
 the latter from canonical lifecycle control; see [admission and recovery](reconciliation.md). Legacy commands in both
 feature-enabled and default builds refuse mutation/execution after preparation;
-list displays store/maintenance status. External execution remains unavailable until the
-remaining adapters and ownership reconciliation exist. Store-backed `task PROJECT
+list displays store/maintenance status. The ticker can deliver accepted canonical
+notifications/local finalizations through guarded adapters. Worker launching and
+unsupported imported/remote effects remain blocked; see the
+[W03 handoff](w03-acceptance.md). Store-backed `task PROJECT
 list/show/add/rename`, `operations PROJECT inspect` and `context PROJECT` are now
 available; task mutations require expected revisions/event heads. `active` means ownership was
 published, not that the scheduler is enabled.

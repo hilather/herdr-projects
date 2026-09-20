@@ -154,6 +154,18 @@ pub(crate) mod tests {
         *world.agents.borrow_mut()="[]".into();let report=crate::reconcile_live::plan(&world.ctx(),&path).unwrap();assert_eq!(report.retained_attempts,1);assert!(!report.dispatch_allowed);assert!(report.items.iter().any(|i|i.entity_kind=="attempt"&&i.action==RepairAction::InspectTerminationEvidence));assert_eq!(runtime::snapshot(&path).unwrap(),before);assert_eq!(world.runner.count("agent prompt"),0);
     }
     #[test]
+    fn remote_outage_remains_unknown_and_retains_lost_capacity_across_repeated_polling() {
+        use herdr_projects::domain::{Attempt,AttemptId,AttemptState,Commit,Mutation};
+        let(world,path,_socket)=fixture();let before=runtime::snapshot(&path).unwrap();let mut route=RuntimeRoute::from_identity(&before.runtime_bindings[0].identity);route.machine="offline-host".into();runtime::rebind(&path,"thread:t-0001",2,before.head,&route).unwrap();let before=runtime::snapshot(&path).unwrap();let task=before.runtime_bindings[0].task.clone().unwrap();
+        let attempt=Attempt{id:AttemptId::new("remote-lost").unwrap(),task,revision:1,state:AttemptState::Lost,snapshot:None,reservation:"remote-slot".into(),termination_observed:false};migration::open_active(&path).unwrap().commit(Commit{expected_head:before.head,mutations:vec![Mutation::Attempt{expected:None,next:attempt}]}).unwrap();
+        let remote_runner=crate::runner::fake::FakeRunner::new();remote_runner.on("--version",ok("herdr 0.9.1"));remote_runner.on("--machine offline-host",crate::runner::fake::fail(255,"fixture remote unavailable"));let ctx=Ctx{runner:&remote_runner,..world.ctx()};
+        let before=runtime::snapshot(&path).unwrap();for _ in 0..2 {
+            let batch=crate::reconcile_live::collect(&ctx,&path).unwrap();assert_eq!(batch.observations[0].pane,herdr_projects::reconcile::ResourceState::Unknown);assert!(!batch.observations[0].agent_present);assert!(batch.observations[0].session_identity.is_none());assert!(!crate::canonical_controller::poll(&ctx,&path,0).unwrap().reachable);
+            let after=runtime::snapshot(&path).unwrap();assert_eq!(after.attempts,before.attempts);assert_eq!(after.runtime_bindings,before.runtime_bindings);assert_eq!(after.tasks,before.tasks);assert!(after.ownership.is_empty());let plan=crate::reconcile_live::plan(&ctx,&path).unwrap();assert_eq!(plan.retained_attempts,1);assert!(!plan.dispatch_allowed);
+        }
+        assert!(remote_runner.calls.borrow().iter().any(|c|c.args.windows(2).any(|a|a==["--machine","offline-host"])));assert_eq!(remote_runner.count("agent prompt"),0);assert_eq!(remote_runner.count("agent start"),0);
+    }
+    #[test]
     fn legacy_adoption_cannot_steal_a_canonical_reference() {
         let(world,path,_listener)=fixture();let binding=runtime::snapshot(&path).unwrap().runtime_bindings.remove(0);let herdr=crate::herdr::Herdr::new(world.env.herdr_bin(),&binding.identity.socket,&world.runner);assert!(crate::adopt::adoptable_agent(&world.ctx(),&herdr,&binding.identity.socket,"p").is_err());
     }
