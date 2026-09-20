@@ -128,6 +128,7 @@ pub struct Memory {
     pub tick: u64,
     pub machines: BTreeMap<MachineKey, MachineMemory>,
     pub pr_reads: Option<crate::pr_polling::Reads>,
+    pub remote_reads:Option<crate::remote_polling::Reads>,
     #[cfg(test)]
     clock: Option<Instant>,
 }
@@ -141,6 +142,7 @@ impl Memory {
             tick: 0,
             machines: BTreeMap::new(),
             pr_reads: None,
+            remote_reads: None,
             #[cfg(test)]
             clock: None,
         }

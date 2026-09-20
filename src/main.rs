@@ -23,6 +23,7 @@ mod runner;
 #[allow(dead_code)] // Transfer callers and operational metrics follow PR read integration.
 mod executor;
 mod pr_polling;
+mod remote_polling;
 #[cfg(test)]
 mod scenarios;
 mod steps;

@@ -104,7 +104,7 @@ pub fn resolve_root(flag: Option<&Path>, env: &Env, config_dir: &Path) -> Result
 
 // Root resolution runs before migration's own reader. Bound this read as well,
 // including a FIFO supplied where a config file should have been.
-fn read_root_config(path: &Path) -> Result<Option<String>> {
+pub(crate) fn read_root_config(path: &Path) -> Result<Option<String>> {
     use std::{io::Read, os::unix::fs::OpenOptionsExt};
     let file = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path) {
         Ok(file) => file,

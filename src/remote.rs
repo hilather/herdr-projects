@@ -47,9 +47,11 @@ struct SavedMachine {
 /// The SSH target of a saved machine: from `herdr machine list --json`, else
 /// `[machines.<label>] ssh` in `config.toml`.
 pub fn ssh_target(runner: &dyn Runner, herdr_bin: &str, config_dir: &Path, machine: &str) -> Result<String> {
-    let listed = runner
-        .run(&Cmd::new(herdr_bin, SSH_TIMEOUT).args(["machine", "list", "--json"]))
-        .ok()
+    let output=runner.run(&Cmd::new(herdr_bin, SSH_TIMEOUT).args(["machine", "list", "--json"])).ok();
+    target_from_listing(output,||configured_target(config_dir,machine),machine)
+}
+pub(crate) fn target_from_listing(output:Option<Output>,fallback:impl FnOnce()->Option<String>,machine:&str)->Result<String> {
+    let listed = output
         .filter(Output::success)
         .and_then(|out| serde_json::from_str::<Vec<SavedMachine>>(&out.stdout).ok())
         .unwrap_or_default();
@@ -58,11 +60,14 @@ pub fn ssh_target(runner: &dyn Runner, herdr_bin: &str, config_dir: &Path, machi
     {
         return Ok(found.target.clone());
     }
-    configured_target(config_dir, machine)
+    fallback()
         .with_context(|| format!("machine `{machine}` has no SSH target: it is not in `herdr machine list`, and config.toml has no [machines.{machine}] ssh"))
 }
 
 fn configured_target(config_dir: &Path, machine: &str) -> Option<String> {
+    configured_target_bytes(crate::paths::read_root_config(&config_dir.join("config.toml")).ok()??.as_bytes(),machine)
+}
+pub(crate) fn configured_target_bytes(bytes:&[u8],machine:&str)->Option<String> {
     #[derive(Deserialize, Default)]
     struct Entry {
         #[serde(default)]
@@ -73,8 +78,8 @@ fn configured_target(config_dir: &Path, machine: &str) -> Option<String> {
         #[serde(default)]
         machines: std::collections::BTreeMap<String, Entry>,
     }
-    let text = std::fs::read_to_string(config_dir.join("config.toml")).ok()?;
-    let mut config: Config = toml::from_str(&text).ok()?;
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut config: Config = toml::from_str(text).ok()?;
     config.machines.remove(machine).map(|e| e.ssh).filter(|s| !s.is_empty())
 }
 

@@ -35,17 +35,17 @@ struct State {
     admitted:[usize;2],metrics:Metrics,last_project:[Option<String>;2],stopping:bool,
 }
 struct Shared {state:Mutex<State>,wake:Condvar,limits:Limits}
-pub struct Executor {shared:Arc<Shared>,threads:Vec<JoinHandle<()>>}
+pub struct Executor {shared:Arc<Shared>,threads:Mutex<Vec<JoinHandle<()>>>}
 impl Executor {
     pub fn new(limits:Limits,runner:Arc<dyn Runner+Send+Sync>)->Result<Self> {
         ensure!(limits.workers.iter().all(|n| (1..=16).contains(n))&&limits.outstanding.iter().all(|n|(1..=1024).contains(n))&&limits.per_project>0&&limits.per_machine>0,"invalid executor bounds");
         ensure!((0..2).all(|i|limits.workers[i]<=limits.outstanding[i]),"worker count exceeds outstanding limit");
         let shared=Arc::new(Shared{state:Mutex::new(State{queue:[VecDeque::new(),VecDeque::new()],running:BTreeMap::new(),admitted:[0,0],metrics:Metrics::default(),last_project:[None,None],stopping:false}),wake:Condvar::new(),limits});
-        let mut pool=Self{shared,threads:vec![]};
+        let pool=Self{shared,threads:Mutex::new(vec![])};
         for lane in 0..2 {for index in 0..pool.shared.limits.workers[lane] {
             let shared=pool.shared.clone();let runner=runner.clone();
             // If spawning fails, Drop cancels and drains the already-created workers.
-            pool.threads.push(std::thread::Builder::new().name(format!("hp-executor-{lane}-{index}")).spawn(move||worker(shared,runner,lane))?);
+            pool.threads.lock().unwrap().push(std::thread::Builder::new().name(format!("hp-executor-{lane}-{index}")).spawn(move||worker(shared,runner,lane))?);
         }}Ok(pool)
     }
     pub fn submit(&self,mut request:Request)->Result<Ticket> {
@@ -69,12 +69,13 @@ impl Executor {
     }
     /// Stop admission and cancel queued/running work. Returns false if a runner
     /// has not finished cleanup by the deadline; its threads remain owned here.
-    pub fn stop(&mut self,timeout:Duration)->bool {
+    pub fn stop(&self,timeout:Duration)->bool {
         {let mut state=self.shared.state.lock().unwrap();state.stopping=true;for job in state.queue.iter().flatten(){job.token.cancel();}for (_,token,_) in state.running.values(){token.cancel();}self.shared.wake.notify_all();}
+        let mut threads=self.threads.lock().unwrap();
         let deadline=Instant::now()+timeout.min(Duration::from_secs(86400));
-        while self.threads.iter().any(|t|!t.is_finished())&&Instant::now()<deadline {std::thread::sleep(Duration::from_millis(5));}
-        if self.threads.iter().any(|t|!t.is_finished()){return false;}
-        for thread in self.threads.drain(..){let _=thread.join();}!self.shared.state.lock().unwrap().metrics.uncertain
+        while threads.iter().any(|t|!t.is_finished())&&Instant::now()<deadline {std::thread::sleep(Duration::from_millis(5));}
+        if threads.iter().any(|t|!t.is_finished()){return false;}
+        for thread in threads.drain(..){let _=thread.join();}!self.shared.state.lock().unwrap().metrics.uncertain
     }
 }
 impl Drop for Executor {
@@ -82,7 +83,7 @@ impl Drop for Executor {
         self.stop(Duration::ZERO);
         // Never detach a worker that could still issue commands after ownership
         // guards are dropped. Production Runner must honour its cancellation.
-        for thread in self.threads.drain(..){let _=thread.join();}
+        for thread in self.threads.get_mut().unwrap().drain(..){let _=thread.join();}
     }
 }
 fn select(state:&State,limits:&Limits,lane:usize)->Option<usize> {

@@ -633,3 +633,31 @@ held, eventual application, report-change cancellation and shutdown. Logs:
 `/tmp/herdr-async-pr-{debug,focused,release,legacy}.log`. Three optional live checks
 remain ignored. T04.2 is still partial: remote observations, routines and artifact
 work need asynchronous integration; canonical PR evidence remains W07 work.
+
+## W04 asynchronous remote observation batches
+
+Remote status collection now runs in the bounded executor: agent/pane inventory,
+saved-machine target selection and SSH report hashes form one read-only batch with
+a shared cancellation token and deadline. PR and remote reads share one root pool,
+so thread/concurrency limits do not multiply per service. Results are applied under
+the original execution lease only when full thread records, route and config still
+match. Copies and pending terminal actions revalidate routing; pending launch/prompt
+work refreshes inventory before effects. Copies, metadata publication, routines and
+terminal effects remain synchronous and keep T04.2 partial.
+
+Independent review caught a synchronous FIFO config-read hazard and an eager fallback
+regression. Both now use the established bounded nonblocking regular-file reader;
+resolved machine targets skip fallback config entirely. Observation fingerprints
+preserve absent versus empty config. New tests cover FIFO/oversize no-admission,
+lazy fallback, delayed remote work alongside persisted local status, complete batch
+application, changed thread/config cancellation and unavailable transport without
+false pane closure.
+
+Full all-feature debug and release suites pass 385 tests (92 library, 265 binary,
+26 CLI, 2 contracts). Default-feature validation also covers the subsequently added
+transport-outage scenario. Logs: `/tmp/herdr-async-remote-{debug,release,legacy,focused}.log`.
+Three optional live checks remain ignored and macOS remains unavailable. Canonical
+remote execution is still blocked; this integration moves legacy observation work,
+not external launch authority or termination certification.
+The default suite passes all 243 tests, including the new outage scenario. Cross-project
+observation sharing and remaining effect/transfer isolation still require work.

@@ -257,18 +257,20 @@ pub fn run(ctx: &Ctx) -> Result<()> {
     log.line(&format!("ticker {} started (pid {})", info.version, info.pid));
     let mut last_reachable = Instant::now();
     let mut memory = Memory::new(ctx);
-    memory.pr_reads=Some(crate::pr_polling::Reads::new(std::sync::Arc::new(crate::runner::RealRunner))?);
+    let executor=std::sync::Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),std::sync::Arc::new(crate::remote_polling::ProbeRunner{inner:std::sync::Arc::new(crate::runner::RealRunner)}))?);
+    memory.pr_reads=Some(crate::pr_polling::Reads::with_executor(executor.clone()));
+    memory.remote_reads=Some(crate::remote_polling::Reads::new(executor));
     loop {
         if stop_path(root).exists() {
-            log.line("stop file found; draining PR reads");
-            return memory.pr_reads.as_mut().expect("ticker PR executor").stop();
+            log.line("stop file found; draining observation reads");
+            return memory.pr_reads.as_mut().expect("ticker shared executor").stop();
         }
         let wake = Instant::now() + TICK;
         if tick(ctx, &log, &mut memory) {
             last_reachable = Instant::now();
         } else if last_reachable.elapsed() > IDLE_EXIT {
-            log.line("no project has had a reachable session for five minutes; draining PR reads");
-            return memory.pr_reads.as_mut().expect("ticker PR executor").stop();
+            log.line("no project has had a reachable session for five minutes; draining observation reads");
+            return memory.pr_reads.as_mut().expect("ticker shared executor").stop();
         }
         // Sleep in short slices so a stop request is honoured promptly.
         while Instant::now() < wake {
@@ -578,6 +580,21 @@ fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threa
     let dirs: Vec<(String, String)> = threads.iter().filter(|t| !t.thread_dir.is_empty()).map(|t| (t.id.clone(), t.thread_dir.clone())).collect();
     let hashes = crate::remote::report_hashes(ctx.runner, &target, &dirs).map_err(|e| format!("{e:#}"))?;
 
+    apply_remote(ctx,project,herdr,machine,threads,crate::remote_polling::Observation{agents,panes,target,hashes},false,may_start,copy_notes,errors)
+}
+fn apply_remote(ctx:&Ctx,project:&Project,herdr:&Herdr,machine:&str,threads:&[thread::Thread],observation:crate::remote_polling::Observation,asynchronous:bool,may_start:&mut bool,copy_notes:&mut std::collections::BTreeMap<String,Vec<String>>,errors:&mut Vec<anyhow::Error>)->Result<Vec<Transition>,String> {
+    let remote=herdr.on_machine(machine);
+    let crate::remote_polling::Observation{mut agents,mut panes,target,hashes}=observation;
+    // A delayed observation alone cannot authorize a terminal launch/prompt.
+    // Keep the current guarded synchronous preflight for pending execution.
+    if asynchronous&&threads.iter().any(|t|t.prompt_pending||hashes.get(&t.id).is_some_and(|hash|hash!=&t.report_hash)) {
+        let current=crate::remote::ssh_target(ctx.runner,&ctx.env.herdr_bin(),&ctx.config_dir,machine).map_err(|e|format!("{e:#}"))?;
+        if current!=target {return Err("remote route changed after observation; retry before effects".into());}
+    }
+    if asynchronous&&threads.iter().any(|t|t.prompt_pending) {
+        agents=remote.agent_list().map_err(|e|e.to_string())?;
+        panes=remote.pane_list().map_err(|e|e.to_string())?;
+    }
     let pass = thread_pass(project, &remote, threads, &agents, &panes, Some(&hashes)).map_err(|e| format!("{e:#}"))?;
     errors.extend(pass.error);
 
@@ -680,11 +697,17 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
             socket: seen.socket.clone(),
             machine: machine.clone(),
         };
-        if !memory.machine_is_due(&key) {
-            continue;
-        }
+        let pending=memory.remote_reads.as_ref().is_some_and(|reads|reads.pending(&key));
+        if !pending&&!memory.machine_is_due(&key) {continue;}
         let threads: Vec<thread::Thread> = remote_threads.iter().filter(|t| t.machine == machine).cloned().collect();
-        let outcome = remote_pass(ctx, project, &herdr, &machine, &threads, &mut may_start, &mut copy_notes, &mut errors);
+        let outcome=if let Some(reads)=memory.remote_reads.as_mut() {
+            match reads.poll(&key,&ctx.env.herdr_bin(),&ctx.config_dir.join("config.toml"),&threads) {
+                Ok(crate::remote_polling::Poll::Pending)=>continue,
+                Ok(crate::remote_polling::Poll::Ready(Ok(observation)))=>apply_remote(ctx,project,&herdr,&machine,&threads,observation,true,&mut may_start,&mut copy_notes,&mut errors),
+                Ok(crate::remote_polling::Poll::Ready(Err(error)))=>Err(format!("{error:#}")),
+                Err(error)=>{memory.machines.remove(&key);errors.push(error.context("remote observation admission"));continue;},
+            }
+        }else{remote_pass(ctx, project, &herdr, &machine, &threads, &mut may_start, &mut copy_notes, &mut errors)};
         let outage_error = outcome.as_ref().err().map(String::as_str);
         memory.record_machine(&key, outage_error);
         errors.extend(steps::write_machine_outage(project, &mut state, &key, outage_error, now, memory.outage_secs).err());

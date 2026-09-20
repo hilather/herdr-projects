@@ -2,15 +2,19 @@
 //! ticker pass; thread/report changes discard pending observations before use.
 use std::{collections::BTreeMap,path::{Path,PathBuf},sync::Arc,time::{Duration,Instant}};
 use anyhow::{Result,ensure};
-use crate::{executor::{Executor,Limits,Request,Identity,Lane,Ticket},runner::Runner,pr};
+use crate::{executor::{Executor,Request,Identity,Lane,Ticket},pr};
+#[cfg(test)]
+use crate::{executor::Limits,runner::Runner};
 const RETAIN:Duration=Duration::from_secs(120);
 const MAX_ENTRIES:usize=128;
 pub enum Poll {Pending,NotDue,Ready(Result<String>)}
 struct Entry {fingerprint:String,url:String,touched:Instant,state:ReadState}
 enum ReadState {Pending{ticket:Ticket,identity:Identity},Consumed{until:Instant}}
-pub struct Reads {executor:Executor,entries:BTreeMap<(PathBuf,String),Entry>,sequence:u64}
+pub struct Reads {executor:Arc<Executor>,entries:BTreeMap<(PathBuf,String),Entry>,sequence:u64}
 impl Reads {
-    pub fn new(runner:Arc<dyn Runner+Send+Sync>)->Result<Self> {Ok(Self{executor:Executor::new(Limits::default(),runner)?,entries:BTreeMap::new(),sequence:0})}
+    #[cfg(test)]
+    pub fn new(runner:Arc<dyn Runner+Send+Sync>)->Result<Self> {Ok(Self::with_executor(Arc::new(Executor::new(Limits::default(),runner)?)))}
+    pub fn with_executor(executor:Arc<Executor>)->Self {Self{executor,entries:BTreeMap::new(),sequence:0}}
     pub fn poll(&mut self,project:&Path,thread:&str,fingerprint:&str,url:&str)->Result<Poll> {
         let now=Instant::now();self.prune(now);
         let key=(project.to_path_buf(),thread.to_string());
@@ -37,7 +41,7 @@ impl Reads {
         let ticket=self.executor.submit(Request{identity:identity.clone(),lane:Lane::Control,deadline:now+Duration::from_secs(30),command})?;
         self.entries.insert(key,Entry{fingerprint:fingerprint.into(),url:url.into(),touched:now,state:ReadState::Pending{ticket,identity}});Ok(Poll::Pending)
     }
-    pub fn stop(&mut self)->Result<()> {ensure!(self.executor.stop(Duration::from_secs(2)),"PR executor cleanup remains uncertain; inspect before restart");Ok(())}
+    pub fn stop(&mut self)->Result<()> {ensure!(self.executor.stop(Duration::from_secs(2)),"observation executor cleanup remains uncertain; inspect before restart");Ok(())}
     fn remove(&mut self,key:&(PathBuf,String)) {if let Some(Entry{state:ReadState::Pending{ticket,..},..})=self.entries.remove(key){ticket.cancel();}}
     fn prune(&mut self,now:Instant) {let stale=self.entries.iter().filter(|(_,e)|now.duration_since(e.touched)>=RETAIN).map(|(k,_)|k.clone()).collect::<Vec<_>>();for key in stale {self.remove(&key);}}
 }

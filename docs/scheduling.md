@@ -146,3 +146,31 @@ Full-ticker fixtures show that a delayed PR read leaves unrelated session checks
 running, preserves outage state, applies a later response, discards a changed report
 and drains cancellation. Remaining slow paths are still synchronous. This is not
 yet acceptance of the complete T04.2 isolation requirement.
+
+## Asynchronous remote observations
+
+Remote agent/pane lists, saved-machine routing and report hashes now run as one
+read-only executor batch. Production PR and remote services share the same root
+pool; adding a service does not multiply worker limits. Every subprocess receives
+the batch cancellation token and remaining deadline. The internal typed job marker
+is interpreted by the native runner and never spawned as an executable.
+
+The ticker continues local work while a batch is pending. Only a complete batch is
+applied under the existing execution lease. Full thread records, session/machine
+identity and a bounded config snapshot fence the response; input changes discard
+and cancel earlier work. Missing config and an empty file are distinct. The cache
+holds at most 128 batches with 256 threads each, cancels batches older than 60 seconds
+when next polled, and uses a 30-second queue-inclusive command deadline. Pending or
+locally expired batches do not establish a remote outage or pane absence.
+
+Copy or pending terminal work rechecks current routing; pending launch/prompt work
+also refreshes agents/panes under the guard. Copies, token publication and terminal
+effects still run synchronously. These checks preserve authority while transfer
+and effect integration remains open. Config reads reuse the nonblocking regular-file
+reader, enforce a one-MiB observation snapshot cap, and refuse FIFOs before enqueue.
+Fallback SSH config is read only when machine listing did not resolve the target.
+
+Fixtures cover a held remote probe alongside a persisted local status update,
+complete-batch application, changed thread/config cancellation, unavailable transport
+without false pane closure, and FIFO/oversize refusal. T04.2 remains partial until
+routines, transfers and remaining guarded effects have equivalent isolation.

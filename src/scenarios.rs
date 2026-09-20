@@ -6,6 +6,7 @@ mod reliability;
 mod recovery;
 mod preservation;
 mod async_pr;
+mod async_remote;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};

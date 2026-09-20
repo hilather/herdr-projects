@@ -50,8 +50,8 @@ validation, aged priority, retained-attempt capacity reporting and fenced CLI ed
 Atomic reservations and immutable inputs now have a sealed internal API, and cancellation
 has an audited CLI. Production launch preparation/dispatch and termination remain
 unavailable. T04.2 now uses monotonic remote poll/retry deadlines and pass-start
-scheduling plus bounded command queues and asynchronous PR reads; routine/SSH/artifact
-isolation remains. Next are bounded command execution, kind-bound worker profiles
+scheduling plus a shared bounded executor for asynchronous PR and remote observations;
+routine/artifact work and guarded effects still need isolation. Next are bounded command execution, kind-bound worker profiles
 (T04.3), budgets/routines/telemetry (T04.4) and operation-scoped authority (T04.5).
 The [scheduler/executor/profile interfaces](adr/0004-w04-scheduling-contract.md) are frozen. Existing retained/adopted attempts
 must count toward the cap; no uncertain worker may be replaced to free a slot.

@@ -141,7 +141,7 @@ impl std::error::Error for HerdrError {}
 
 pub const AGENT_START_TIMEOUT: Duration = Duration::from_secs(20);
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, serde::Serialize, Deserialize, PartialEq, Default)]
 pub struct Pane {
     pub pane_id: String,
     pub tab_id: String,
@@ -150,7 +150,7 @@ pub struct Pane {
     pub cwd: String,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, serde::Serialize, Deserialize, PartialEq, Default)]
 pub struct Agent {
     pub pane_id: String,
     pub tab_id: String,
