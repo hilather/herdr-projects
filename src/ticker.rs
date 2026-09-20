@@ -220,7 +220,8 @@ impl Log {
 }
 
 /// The loop. Exits when another ticker holds the lock, when the stop file
-/// appears, or when no project has had a reachable session for five minutes.
+/// appears, or when no project has had a reachable session or enabled canonical
+/// routine for five minutes.
 pub fn run(ctx: &Ctx) -> Result<()> {
     let root = &ctx.root;
     if project::list_slugs(root).is_empty() {
@@ -269,7 +270,7 @@ pub fn run(ctx: &Ctx) -> Result<()> {
         if tick(ctx, &log, &mut memory) {
             last_reachable = Instant::now();
         } else if last_reachable.elapsed() > IDLE_EXIT {
-            log.line("no project has had a reachable session for five minutes; draining observation reads");
+            log.line("no reachable session or enabled canonical routine for five minutes; draining observation reads");
             return memory.pr_reads.as_mut().expect("ticker shared executor").stop();
         }
         // Sleep in short slices so a stop request is honoured promptly.
@@ -285,7 +286,7 @@ pub fn run(ctx: &Ctx) -> Result<()> {
 /// One pass over every active project. Cheap work (state, prompts, tokens)
 /// comes first for every project, then slow work (copies, launches), so one
 /// slow project does not delay the others' sidebar. Returns whether any
-/// project's session was reachable. A failure in one project never stops the
+/// project's session was reachable or canonical scheduled work remains. A failure in one project never stops the
 /// others.
 pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     memory.tick += 1;
@@ -325,7 +326,7 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         if !canonical.is_empty() {let first=(memory.tick.saturating_sub(1)%canonical.len() as u64) as usize;canonical.rotate_left(first);}
         for slug in canonical {
             match crate::canonical_controller::poll(ctx,&ctx.root.join(&slug),memory.tick.saturating_sub(1)) {
-                Ok(result)=>{any_reachable|=result.reachable;if let Some(error)=result.operation_error {log.line(&format!("{slug}: canonical operation: {error}"));}},
+                Ok(result)=>{any_reachable|=result.reachable||result.scheduled_work;if let Some(error)=result.operation_error {log.line(&format!("{slug}: canonical operation: {error}"));}},
                 Err(error)=>log.line(&format!("{slug}: canonical controller: {error:#}")),
             }
         }

@@ -972,3 +972,29 @@ No user store or script was used. Explicit execution holds root/project mutation
 ownership synchronously; automatic ticker scheduling/dispatch and asynchronous
 ownership remain next. T04.4 still includes usage/estimates/running budget/telemetry
 work. Counts remain 16 implemented, five partial and 20 not started; macOS is unavailable.
+
+## W04 automatic routine occurrence scheduling
+
+Each canonical controller pass now schedules one latest enabled routine in rotating
+name order. Scheduling retains the existing mutation guard, revalidates signed
+authority/script inputs and uses the durable occurrence transaction. Paused,
+unreconciled and pre-schema-16 projects do not schedule. This stage records intent;
+automatic command dispatch remains pending asynchronous ownership integration.
+
+Enabled routine work now separately contributes to ticker lifetime, including future
+due instants and diagnostic turns. It does not assert observed session reachability.
+Keeping the ticker alive on an invalid selected script prevents a long prefix of
+invalid routines from exhausting the idle grace before a healthy sibling's turn.
+Scheduling diagnostics stay visible while independent notification/finalization
+processing continues in the same pass.
+
+Independent review approved this increment. A real-key ticker fixture covers an edited
+routine next to a healthy signed routine, zero script execution, a single durable
+occurrence across controller restart, future-work liveness, pause, and notification
+delivery despite the routine diagnostic. All 445 tests pass in debug and release
+(151 library, 262 binary, 30 CLI, 2 contracts); three optional live checks remain
+ignored. Logs: `/tmp/herdr-routine-ticker-{debug,release}.log`.
+
+Next is asynchronous command dispatch and ownership, followed by the remaining W04
+profile, budget, telemetry and authority integration. Counts remain 16 implemented,
+five partial and 20 not started; macOS remains unavailable.

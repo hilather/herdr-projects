@@ -57,7 +57,7 @@ explicit local version probes for Claude/Codex are available. Launch selection,
 production profile resolution and verified capability evidence remain. Version-2
 reservation inputs now retain and validate frozen profile evidence; historical
 version-1 records remain readable. Explicit routine execution now has durable
-occurrence, authority and cleanup contracts; asynchronous ownership/ticker integration
+occurrence, authority and cleanup contracts; asynchronous ownership/ticker dispatch
 remains. Next are bounded command execution, kind-bound worker profiles
 (T04.3), budgets/routines/telemetry (T04.4) and operation-scoped authority (T04.5).
 T04.5 now has an [approval scope contract](authority.md) binding exact launch inputs
@@ -74,8 +74,10 @@ and the shared schedule module computes bounded due windows with explicit DST an
 skipped-date handling. Schema 16 adds [signed routine revisions and durable occurrence
 recording](routines.md), with atomic cursor/outbox writes and missed/overlap decisions.
 Explicit Linux execution now records typed cleanup receipts and output inbox items
-atomically, releasing overlap only after verified namespace cleanup. Automatic ticker
-integration and asynchronous command ownership remain unavailable.
+atomically, releasing overlap only after verified namespace cleanup. The ticker now
+records due occurrences in rotating bounded turns, preserving routine-only liveness
+and isolating invalid scripts. Automatic dispatch and asynchronous command ownership
+remain unavailable.
 The [scheduler/executor/profile interfaces](adr/0004-w04-scheduling-contract.md) are frozen. Existing retained/adopted attempts
 must count toward the cap; no uncertain worker may be replaced to free a slot.
 

@@ -5,7 +5,7 @@ use anyhow::{Context,Result,ensure};
 use crate::paths::Ctx;
 use herdr_projects::{migration,runtime,operations::{DeliveryState,dispatch::DispatchResult},reconcile::ResourceState};
 
-pub struct PollResult {pub reachable:bool,pub operation_error:Option<String>}
+pub struct PollResult {pub reachable:bool,pub scheduled_work:bool,pub operation_error:Option<String>}
 struct ProbeBudget<'a> {runner:&'a dyn crate::runner::Runner,deadline:std::time::Instant}
 impl crate::runner::Runner for ProbeBudget<'_> {
     fn run(&self,cmd:&crate::runner::Cmd)->Result<crate::runner::Output> {
@@ -33,8 +33,14 @@ pub fn poll(ctx:&Ctx,path:&Path,turn:u64)->Result<PollResult> {
         runtime::record_observations_held(&path,&batch)?;
         migration::open_active(&path)?.expire_claims(jiff::Timestamp::now().as_millisecond())?;
     }
+    // A scheduling failure must not suppress unrelated notification/finalization
+    // work. Each scheduling turn handles one routine; subsequent turns rotate.
+    let scheduled=herdr_projects::routines::schedule_turn(&path,turn);
     let result=process_next(ctx,&path,turn);
-    Ok(match result {Ok(progress)=>PollResult{reachable:reachable||progress,operation_error:None},Err(error)=>PollResult{reachable,operation_error:Some(format!("{error:#}"))}})
+    let mut errors=Vec::new();
+    let routine_work=match scheduled {Ok(report)=>{if let Some(error)=report.diagnostic {errors.push(format!("routine scheduling: {error}"));}report.active},Err(error)=>{errors.push(format!("routine scheduling: {error:#}"));false}};
+    let progress=match result {Ok(progress)=>progress,Err(error)=>{errors.push(format!("{error:#}"));false}};
+    Ok(PollResult{reachable:reachable||progress,scheduled_work:routine_work,operation_error:(!errors.is_empty()).then(||errors.join("; "))})
 }
 fn process_next(ctx:&Ctx,path:&Path,turn:u64)->Result<bool> {
     let snapshot=runtime::snapshot(path)?;
@@ -72,6 +78,57 @@ mod tests {
     use super::*;
     use crate::{runner::fake::ok,notification_delivery,finalization_delivery};
     use herdr_projects::{domain::ProjectState,operations::DeliveryState};
+    #[test]
+    fn ticker_rotates_signed_routines_records_once_and_keeps_future_work_alive() {
+        use crate::{scenarios::World,project,runner::{RealRunner,Runner,Cmd}};
+        use herdr_projects::{authority,domain::*};
+        use std::{fs,time::Duration};use sha2::{Digest,Sha256};
+        let world=World::new();let project=project::create(&world.root,"routines","",vec![]).unwrap();project.set_status(project::Status::Paused).unwrap();
+        crate::inbox::write(&project,"test","fixture","notification survives routine error","").unwrap();
+        let path=project.dir().canonicalize().unwrap();let config=world.ctx().config_dir.join("config.toml");fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let key=world.home.path().join("routine-owner");
+        assert!(RealRunner.run(&Cmd::new("/usr/bin/ssh-keygen",Duration::from_secs(5)).args(["-q","-t","ed25519","-N","","-f"]).arg(key.to_str().unwrap())).unwrap().success());
+        let public=fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+        fs::write(&config,format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[safety.{:?}]\nroutine_commands=true\n",path.display().to_string())).unwrap();
+        let plan=migration::inspect_with_config(&path,&config).unwrap();migration::apply(&path,&plan,true).unwrap();
+        let s=runtime::snapshot(&path).unwrap();runtime::set_state(&path,s.head,s.control.unwrap().revision,ProjectState::Active,&config).unwrap();
+        for name in ["a-broken","b-healthy"] {
+            let script=path.join(format!("{name}.sh"));let bytes=b"touch MUST_NOT_EXECUTE\n";fs::write(&script,bytes).unwrap();
+            let d=RoutineDefinition{version:1,name:name.into(),revision:1,project_store:path.join(".state/state.db").display().to_string(),authority:authority::policy_reference(&path).unwrap(),config:migration::config_reference(&config).unwrap(),enabled:true,
+                schedule:"every 1h".into(),timezone:"UTC".into(),start_unix_ms:jiff::Timestamp::now().as_millisecond()-1000,missed:MissedRunPolicy::CoalesceLatest,overlap:OverlapPolicy::Skip,
+                script:script.display().to_string(),script_sha256:format!("{:x}",Sha256::digest(bytes)),cwd:path.display().to_string(),deadline_ms:1000,output_cap_bytes:4000};
+            let document=world.home.path().join(format!("{name}.json"));let signature=document.with_extension("sig");let bytes=serde_json::to_vec(&d).unwrap();fs::write(&document,&bytes).unwrap();
+            let signed=RealRunner.run(&Cmd::new("/usr/bin/ssh-keygen",Duration::from_secs(5)).args(["-Y","sign","-f"]).arg(key.to_str().unwrap()).args(["-n",authority::ROUTINE_SIGNATURE_NAMESPACE]).stdin(std::str::from_utf8(&bytes).unwrap())).unwrap();assert!(signed.success());fs::write(&signature,signed.stdout_bytes).unwrap();
+            authority::import_routine(&path,&document,&signature,runtime::snapshot(&path).unwrap().head).unwrap();
+        }
+        fs::write(path.join("a-broken.sh"),"edited after approval").unwrap();
+        let leader=fs::File::create(world.root.join(".ticker.lock")).unwrap();leader.try_lock().unwrap();
+        let mut memory=crate::steps::Memory::new(&world.ctx());
+        assert!(crate::ticker::tick_for_test(&world.ctx(),&mut memory));
+        assert!(runtime::snapshot(&path).unwrap().routine_occurrences.is_empty());
+        assert!(crate::ticker::tick_for_test(&world.ctx(),&mut memory));
+        let s=runtime::snapshot(&path).unwrap();assert_eq!(s.routine_occurrences.len(),1);assert_eq!(s.routine_occurrences[0].routine.id,"routine-b-healthy");
+        assert_eq!(s.deliveries[0].state,DeliveryState::Pending);assert_eq!(s.deliveries[0].attempts,0);assert!(!path.join("MUST_NOT_EXECUTE").exists());
+        // A fresh controller must not duplicate the due instant, and a routine
+        // with only future work keeps the controller alive without a session.
+        let mut restarted=crate::steps::Memory::new(&world.ctx());crate::ticker::tick_for_test(&world.ctx(),&mut restarted);
+        assert!(crate::ticker::tick_for_test(&world.ctx(),&mut restarted));assert_eq!(runtime::snapshot(&path).unwrap().routine_occurrences.len(),1);
+        let s=runtime::snapshot(&path).unwrap();runtime::set_state(&path,s.head,s.control.unwrap().revision,ProjectState::Paused,&config).unwrap();
+        assert!(!crate::ticker::tick_for_test(&world.ctx(),&mut restarted));assert_eq!(runtime::snapshot(&path).unwrap().routine_occurrences.len(),1);
+        let s=runtime::snapshot(&path).unwrap();let pending=&s.deliveries[0];
+        runtime::retire_operation(&path,&pending.operation,pending.revision,s.head,"fixture: retire the unclaimed occurrence before resuming").unwrap();
+        let task=TaskId::new("notify").unwrap();let head=runtime::snapshot(&path).unwrap().head;
+        let head=runtime::add_task(&path,task.clone(),"notification".into(),head).unwrap();
+        runtime::create_binding(&path,None,None,head,&RuntimeRoute{socket:"/explicit/routine-notification.sock".into(),..Default::default()}).unwrap();
+        crate::reconcile_live::run(&world.ctx(),&path,true).unwrap();let s=runtime::snapshot(&path).unwrap();
+        runtime::set_state(&path,s.head,s.control.unwrap().revision,ProjectState::Active,&config).unwrap();
+        world.runner.on("--version",ok("herdr 0.9.1")).on("notification show",ok(r#"{"result":{"shown":true}}"#));
+        let op=notification_delivery::enqueue(&world.ctx(),&path,&task,runtime::snapshot(&path).unwrap().head).unwrap();
+        let result=poll(&world.ctx(),&path,0).unwrap();assert!(result.operation_error.unwrap().contains("a-broken"));
+        assert_eq!(world.runner.count("notification show"),1);
+        assert_eq!(runtime::snapshot(&path).unwrap().deliveries.iter().find(|d|d.operation==op.id).unwrap().state,DeliveryState::Confirmed);
+    }
+
     #[test]
     fn ticker_delivers_accepted_notification_under_leadership_and_restart_does_not_replay() {
         let(world,path,task)=notification_delivery::tests::fixture();world.runner.on("--version",ok("herdr 0.9.1"));world.runner.on("notification show",ok(r#"{"result":{"shown":true}}"#));let leader=std::fs::File::create(world.root.join(".ticker.lock")).unwrap();leader.try_lock().unwrap();

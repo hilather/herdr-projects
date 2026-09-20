@@ -115,5 +115,12 @@ Restart never replays that script. Process cleanup does not undo filesystem, net
 or other external effects; this is not a security sandbox against a hostile same-user
 script or host service. Non-Linux execution refuses before claiming.
 
-Automatic ticker scheduling/dispatch and asynchronous ownership remain integration
-work. The same-OS-user bypass limitation still applies.
+The running ticker automatically schedules one latest enabled routine per project
+per pass, rotating in name order. A changed or invalid script reports a diagnostic
+without suppressing another routine's later turn or independent notification work.
+Enabled routines keep the ticker alive between due instants even without a herdr
+session. Paused or unreconciled projects do not schedule. Restart retains the durable
+cursor and cannot duplicate the same occurrence.
+
+Automatic command dispatch and asynchronous ownership remain integration work.
+The same-OS-user bypass limitation still applies.
