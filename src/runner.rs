@@ -20,7 +20,7 @@ impl PartialEq for Cancellation {
 impl Cancellation {
     #[allow(dead_code)] // Used by future executor queues as well as real-process tests.
     pub fn cancel(&self) { self.0.store(true, Ordering::Release); }
-    fn is_cancelled(&self) -> bool { self.0.load(Ordering::Acquire) }
+    pub(crate) fn is_cancelled(&self) -> bool { self.0.load(Ordering::Acquire) }
 }
 
 pub const CAPTURE_LIMIT: usize = 1024 * 1024;

@@ -20,6 +20,9 @@ mod remote;
 mod repair;
 mod routine;
 mod runner;
+// T04.2 queue engine; ticker integration follows without relaxing execution leases.
+#[allow(dead_code)]
+mod executor;
 #[cfg(test)]
 mod scenarios;
 mod steps;

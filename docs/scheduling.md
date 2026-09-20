@@ -90,3 +90,35 @@ not add another full interval. Wall-clock changes do not affect these deadlines.
 
 Slow commands are still synchronous. Bounded queues, separate control/transfer
 lanes, cancellation/drain and their load/fault metrics remain T04.2 work.
+
+## Bounded command executor (T04.2 integration in progress)
+
+The native executor has fixed control/transfer worker counts and bounded outstanding
+queues. Defaults are two workers per lane, 64 control/32 transfer outstanding
+commands, at most two commands per project per lane and one per machine per lane.
+Machine/project limits are separate by lane so transfers cannot consume the
+capacity reserved for control. Terminal keys serialize commands across both lanes.
+Operation deduplication is scoped to the canonical project identity supplied by the
+caller. Oldest eligible work from another project gets the next turn; FIFO age
+breaks ties. These bounds cover this root's commands, not machine-wide agents.
+
+Requests carry operation identity and expected revision. Replies retain those
+values for a fenced commit; they do not themselves acknowledge durable operations.
+Queue time consumes the deadline. Expired/cancelled queued requests never spawn;
+running requests use the existing owned-process cancellation/cleanup path. Inputs
+and captured output have admission caps. Metrics expose queue/running counts,
+admission high-water marks, completed counts and maximum observed queue delay.
+
+Stop rejects new work and cancels admitted work. A cleanup deadline miss returns
+false while retaining thread ownership. Drop joins workers instead of detaching
+commands that could outlive caller guards. A runner panic quarantines the executor,
+cancels other work and reports uncertain cleanup even after threads exit. Neither
+outcome authorizes worker replacement or capacity release.
+
+The engine is not yet connected to the ticker. Current cheap and slow passes both
+hold the root execution lease; simply moving the slow pass to a thread would still
+block status application. Integration must split observation from guarded effects,
+retain exact record/operation revision checks, and preserve one terminal owner
+before replacing these guards. Routine/SSH/PR/artifact migration and end-to-end
+drain/latency acceptance remain open. Standalone queue tests do not establish ticker
+responsiveness.

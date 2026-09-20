@@ -581,3 +581,30 @@ lanes and cancellation/drain load tests are the next T04.2 work. Overall counts 
 16 cards implemented locally, two partial and 23 not started.
 Default-feature validation also passes all 228 tests; the three focused scheduler
 checks pass in release mode. Logs: `/tmp/herdr-deadlines-{debug,release,legacy}.log`.
+
+## W04 bounded executor engine (T04.2 continues)
+
+Added a fixed-thread native command executor with separately bounded control and
+transfer queues, per-lane project/machine limits, cross-lane terminal exclusion,
+project-scoped operation identity, queue-inclusive deadlines and cancellation.
+Replies retain expected revision for caller-side fenced commits. Admission bounds
+include running commands and cap argv/environment/stdin/captured output. Metrics
+record queue/active counts, admission high-water marks and maximum queue delay.
+
+Independent review found and resolved project-scope deduplication and panic cleanup
+issues. A panicking runner now quarantines the executor; uncertain cleanup never
+permits successor work. Stop retains worker ownership on timeout; Drop joins rather
+than detaching effects. Focused tests exercise slow-transfer/control isolation,
+machine exclusion, queue bounds, expired/cancelled no-spawn behavior, project
+rotation, terminal serialization, duplicate IDs across projects, dropped receivers,
+input caps, panic quarantine and a 32-command bounded load fixture.
+
+Ticker integration remains required: both current pass types hold a root execution
+lease, so moving the slow pass to a thread alone would not make status responsive.
+The next change must split observation and effects with record/operation fences and
+preserve terminal ownership. T04.2 remains partial and overall card counts unchanged.
+Validation: 378 all-feature debug tests (92 library, 258 binary, 26 CLI, 2 contracts),
+235 default-feature tests, and all seven focused executor tests in release mode pass.
+The final owned-process-group admission check also passes the focused debug suite.
+Logs: `/tmp/herdr-executor-{debug,focused,release,legacy}.log`. Three optional live
+checks remain ignored; no macOS or end-to-end ticker responsiveness claim is made.
