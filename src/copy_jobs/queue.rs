@@ -35,6 +35,9 @@ impl Queue {
     pub fn offer_final(&mut self,ctx:&Ctx,project:&Project,t:&Thread,target:Option<&str>,purpose:Purpose,operation:String)->Result<()> {
         self.offer_request(request_final(ctx,project,t,target,purpose,operation)?)
     }
+    pub fn offer_coordinator_start(&mut self,ctx:&Ctx,project:&Project,c:&crate::project::Coordinator)->Result<()> {
+        self.offer_request(crate::coordinator_jobs::request_start(ctx,project,c)?)
+    }
     pub fn offer_coordinator_prime(&mut self,ctx:&Ctx,project:&Project,c:&crate::project::Coordinator)->Result<()> {
         self.offer_request(crate::coordinator_jobs::request(ctx,project,c)?)
     }

@@ -140,6 +140,13 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         return Ok(());
     }
 
+    if !options.reprime && history.as_ref().is_some_and(|c|
+        c.launch_claim.as_ref().is_some_and(|claim|claim.generation==c.prime_request||claim.phase==herdr_projects::launch_claim::Phase::Pending)
+        ||c.prime_claim.as_ref().is_some_and(|claim|claim.request==c.prime_request||claim.delivery.phase==herdr_projects::prompt_claim::Phase::Pending)) {
+        bail!("coordinator delivery was already claimed; inspect the pane before explicitly running open --reprime");
+    }
+    let prime_request=history.as_ref().map_or(0,|c|c.prime_request).checked_add(1).filter(|n|*n<=i64::MAX as u64).context("prime requests exhausted")?;
+
     // Reuse the recorded pane when it is still there at a shell prompt, else
     // add a tab to the project's workspace, else make the workspace.
     let panes = herdr.pane_list()?;
@@ -175,7 +182,6 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     // Ids are recorded before the agent is started, so a command killed midway
     // still leaves a record the ticker and a later `open` can act on.
     let name = agent_name(slug);
-    let prime_request=history.as_ref().map_or(0,|c|c.prime_request).checked_add(1).filter(|n|*n<=i64::MAX as u64).context("prime requests exhausted")?;
     let record = project.update_coordinator(|c| {
         *c = Coordinator {
             socket: socket.clone(),
@@ -187,21 +193,25 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             cwd: cwd.clone(),
             prime_pending: true,
             prime_request,prime_sequence:history.as_ref().map_or(0,|c|c.prime_sequence),prime_claim:history.as_ref().and_then(|c|c.prime_claim.clone()),
-            launch_attempts: 1,
+            launch_sequence:history.as_ref().map_or(0,|c|c.launch_sequence),
+            launch_claim:history.as_ref().and_then(|c|c.launch_claim.clone()),
+            launch_attempts: if cfg!(target_os="linux"){0}else{1},
             updated: String::new(),
         }
     })?;
 
-    match herdr.agent_start(&name, &settings.coordinator_agent, &record.pane_id, agent_args) {
-        Ok(agent) => {if !cfg!(target_os="linux"){deliver_or_defer(&project, &herdr, &agent, &prompt)?;}},
+    if !cfg!(target_os="linux") {match herdr.agent_start(&name, &settings.coordinator_agent, &record.pane_id, agent_args) {
+        Ok(agent) => deliver_or_defer(&project, &herdr, &agent, &prompt)?,
         Err(error) => println!(
             "the coordinator agent is not ready yet ({error}). If it shows a dialog, answer it in pane {}; the ticker sends the priming prompt once it is ready.",
             record.pane_id
         ),
     }
+    }
     report_tokens(&herdr, slug, &record.pane_id);
     ticker::start(ctx)?;
     println!("opened `{slug}` in workspace {} (pane {})", record.workspace_id, record.pane_id);
+    if cfg!(target_os="linux") {println!("coordinator startup is pending; the ticker will start it and send its priming prompt when ready");}
     println!("Commands: {prefix}");
     Ok(())
 }

@@ -396,6 +396,12 @@ fn validate_runtime(path:&str,value:&serde_json::Value)->Result<()> {
                 let claim:crate::coordinator_prime::Claim=serde_json::from_value(claim.clone())?;claim.validate(sequence,request)?;
                 ensure!(claim.delivery.phase==crate::prompt_claim::Phase::Confirmed,"uncertain or pending coordinator prime requires reconciliation before migration");
             }
+            let launch_sequence=value.get("launch_sequence").map(|v|v.as_u64().context("invalid coordinator launch sequence")).transpose()?.unwrap_or(0);
+            ensure!(launch_sequence<=i64::MAX as u64,"coordinator launch sequence exhausted");
+            if let Some(claim)=value.get("launch_claim").filter(|v|!v.is_null()) {
+                let claim:crate::launch_claim::Claim=serde_json::from_value(claim.clone())?;claim.validate(launch_sequence)?;
+                ensure!(claim.generation<=request&&claim.phase==crate::launch_claim::Phase::Confirmed,"pending or uncertain coordinator start requires reconciliation before migration");
+            }
             for field in ["socket","session","workspace_id","tab_id","pane_id","agent_name","cwd","updated"] { if let Some(v)=value.get(field) { ensure!(v.is_string(),"invalid coordinator string field"); } }
             if let Some(v)=value.get("prime_pending") { ensure!(v.is_boolean(),"invalid prime_pending"); }
             if let Some(v)=value.get("launch_attempts") { ensure!(v.as_u64().is_some_and(|n|n<=u32::MAX as u64),"invalid launch_attempts"); }

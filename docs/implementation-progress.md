@@ -1,6 +1,6 @@
 # Implementation progress
 
-Updated 2026-09-19. Base: `6e2bd7607d7bc64cf6155beceb299b44566d7f3b`.
+Updated 2026-09-20. Base: `6e2bd7607d7bc64cf6155beceb299b44566d7f3b`.
 The W01 reliability changes and initial regression fixtures were committed as
 `af65de4` and pushed to the `hilather/herdr-projects` fork on
 `hp-plan/w00/t00-1-baseline`. The local-preservation/diagnostics/context batch was
@@ -2043,3 +2043,51 @@ Logs: `/tmp/herdr-coordinator-debug.log` and
 The default-feature suite passed 416 tests (30 library, 365 binary, 19 CLI,
 two contracts), with the same three live checks ignored. Log:
 `/tmp/herdr-coordinator-default.log`.
+
+## W04 supervised coordinator starts
+
+Linux `open` now records coordinator placement and the logical request, then queues
+startup for the ticker. The start worker shares priming's frozen project/socket/
+settings/configuration authority and bounded ownership inventory. It refuses any
+agent already in the pane, requires unique matching pane and terminal identity,
+and parses kind-bound arguments from the exact bounded configuration bytes whose
+digest was admitted. Before sending, it persists a launch claim and increments the
+legacy attempt counter; claims record argument/route hashes without raw arguments.
+
+The concrete JSON API bridge must return the matching request, `agent_started`,
+terminal, name, workspace/tab/pane/cwd and command argument tail. Detected kind may
+be absent/null only during native launch-pending startup. Confirmation leaves
+priming pending; later ready observations require the configured kind. A pending
+or uncertain start blocks priming and further automatic starts. Recovery emits one
+notice without inferring that the external effect did not happen. Migration rejects
+pending/uncertain coordinator starts, including historical uncertainty.
+
+Independent review found that plain `open` could increment the request after a
+missing-agent observation of a previously claimed start. The corrected ingress
+requires explicit `open --reprime` before allocating a replacement request when
+current-request start/prime claims or any pending claim exist. A live coordinator
+can still be focused without changing its request. Tests assert byte-equivalent
+record preservation and continued worker denial for pending, confirmed and
+uncertain starts; explicit reprime retains history and queues the replacement.
+
+New fixtures cover native pending/null-kind acknowledgements, once-only starts,
+busy/foreign/ambiguous/unsupported targets, missing terminal IDs, wrong response
+identity/type/kind/arguments, lost replies, post-claim cancellation/config/request
+changes, argument-byte binding and error redaction, conflicting owned panes,
+blocked-child cancellation, and actual open ingress. The built CLI ticker exercises
+start-to-prime confirmation and lost-start recovery across restarts without a
+second start or synchronous fallback. The full plan remains active: inbox
+nudges/notifications and token workers are next, followed by canonical launch/
+profile integration, budget/telemetry/authority completion and W05–W09. Counts stay
+16 locally implemented, five partial and 20 unstarted; macOS and real SSH-host
+acceptance remain unavailable.
+
+The separate review agent approved the corrected coordinator-start increment.
+All-feature debug and release suites each passed 641 tests (176 library,
+424 binary, 39 CLI and two contracts); three optional live checks remain ignored.
+Logs: `/tmp/herdr-coordinator-start-{debug,release}.log`. The focused coordinator
+run passed 30 checks (two library, 25 binary and three CLI), including the plain
+open replay regression and start-to-prime restart cases.
+The final default-feature suite passed 426 tests (30 library, 374 binary, 20 CLI,
+two contracts), with the same three optional live checks ignored. Log:
+`/tmp/herdr-coordinator-start-default.log`.

@@ -715,3 +715,12 @@ fn coordinator_prime_import_requires_confirmed_delivery_and_valid_counters() {
     claim.delivery.phase=crate::prompt_claim::Phase::Confirmed;claim.delivery.error.clear();value["prime_claim"]=serde_json::to_value(&claim).unwrap();assert!(validate_runtime(".state/coordinator.json",&value).is_ok());
     value["prime_request"]=0.into();assert!(validate_runtime(".state/coordinator.json",&value).is_err());
 }
+#[test]
+fn coordinator_start_import_requires_confirmed_delivery_and_retains_uncertain_history() {
+    let mut value=serde_json::json!({"prime_request":1,"launch_sequence":1,"launch_claim":null});assert!(validate_runtime(".state/coordinator.json",&value).is_ok());
+    let mut claim=crate::launch_claim::Claim{sequence:1,generation:1,execution:"a".repeat(64),arguments_digest:"b".repeat(64),route_digest:"c".repeat(64),terminal:"terminal".into(),phase:crate::launch_claim::Phase::Pending,error:String::new(),notified:false};
+    value["launch_claim"]=serde_json::to_value(&claim).unwrap();assert!(validate_runtime(".state/coordinator.json",&value).is_err());
+    claim.phase=crate::launch_claim::Phase::Confirmed;claim.notified=true;value["launch_claim"]=serde_json::to_value(&claim).unwrap();assert!(validate_runtime(".state/coordinator.json",&value).is_ok());
+    claim.phase=crate::launch_claim::Phase::Uncertain;claim.error="lost reply".into();value["launch_claim"]=serde_json::to_value(&claim).unwrap();assert!(validate_runtime(".state/coordinator.json",&value).is_err());
+    value["prime_request"]=2.into();assert!(validate_runtime(".state/coordinator.json",&value).is_err());
+}

@@ -5,16 +5,25 @@ use serde::{Serialize,Deserialize};
 use crate::{project::{self,Project,Coordinator},paths::{self,Ctx},runner::{Cmd,Output,Runner,InheritedLock},source_tree::Control,thread};
 use herdr_projects::{execution_guard::ProjectGuard,coordinator_prime::Claim,prompt_claim::Phase};
 const JOB:&str="\0herdr-projects-coordinator-prime";
+#[path="coordinator_start_jobs.rs"]
+mod start;
 const BUDGET:Duration=Duration::from_secs(45);
 #[derive(Clone,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Input {project:PathBuf,identity:(u64,u64),execution:String,request:u64,sequence:u64,socket:PathBuf,socket_identity:(u64,u64),herdr:String,config:PathBuf,config_digest:Option<String>,settings_digest:String,prompt:String}
+struct Input {#[serde(default)] start:bool,project:PathBuf,identity:(u64,u64),execution:String,request:u64,sequence:u64,socket:PathBuf,socket_identity:(u64,u64),herdr:String,config:PathBuf,config_digest:Option<String>,settings_digest:String,prompt:String}
 fn digest(text:Option<&str>)->Option<String>{text.map(|s|thread::sha256_hex(s.as_bytes()))}
 fn socket_identity(path:&Path)->Result<(u64,u64)>{use std::os::unix::fs::FileTypeExt;let m=std::fs::symlink_metadata(path)?;ensure!(m.file_type().is_socket(),"coordinator endpoint is not a socket");Ok((m.dev(),m.ino()))}
 fn execution(c:&Coordinator)->String{thread::sha256_hex(&serde_json::to_vec(&(&c.socket,&c.session,&c.workspace_id,&c.tab_id,&c.pane_id,&c.agent_name,&c.cwd,c.prime_request)).unwrap())}
-pub fn validate(c:&Coordinator)->Result<()> {ensure!(c.prime_request<=i64::MAX as u64&&c.prime_sequence<=i64::MAX as u64,"coordinator prime counters exhausted");if let Some(claim)=&c.prime_claim{claim.validate(c.prime_sequence,c.prime_request)?;}Ok(())}
+pub fn validate(c:&Coordinator)->Result<()> {ensure!(c.prime_request<=i64::MAX as u64&&c.prime_sequence<=i64::MAX as u64,"coordinator prime counters exhausted");if let Some(claim)=&c.prime_claim{claim.validate(c.prime_sequence,c.prime_request)?;}
+    ensure!(c.launch_sequence<=i64::MAX as u64,"coordinator launch sequence exhausted");
+    if let Some(claim)=&c.launch_claim {
+        claim.validate(c.launch_sequence)?;ensure!(claim.generation<=c.prime_request,"coordinator launch request is in the future");
+        ensure!(claim.phase!=herdr_projects::launch_claim::Phase::Pending||c.prime_claim.as_ref().is_none_or(|c|c.delivery.phase!=Phase::Pending),"coordinator has conflicting pending effects");
+    }Ok(())}
 pub fn ready(c:&Coordinator)->Result<()> {
-    validate(c)?;ensure!(c.prime_pending&&!c.pane_id.is_empty(),"coordinator has no pending prime");
+    validate(c)?;
+    if let Some(claim)=&c.launch_claim {ensure!(claim.phase!=herdr_projects::launch_claim::Phase::Pending&&claim.notified&&(claim.phase!=herdr_projects::launch_claim::Phase::Uncertain||claim.generation!=c.prime_request),"coordinator launch requires reconciliation before priming");}
+    ensure!(c.prime_pending&&!c.pane_id.is_empty(),"coordinator has no pending prime");
     if let Some(claim)=&c.prime_claim{ensure!(claim.delivery.phase!=Phase::Pending&&claim.delivery.notified&&claim.request!=c.prime_request,"coordinator priming already claimed; inspect the pane before open --reprime");}Ok(())
 }
 fn current(input:&Input,p:&Project,guard:&ProjectGuard,control:&Control)->Result<(Coordinator,String)> {
@@ -45,22 +54,26 @@ fn execute_with(input:&Input,control:&Control,after_claim:impl FnOnce()->Result<
     let(stored,_)=current(input,&p,&guard,control)?;ensure!(stored.prime_claim.as_ref()==Some(&claim)&&stored.prime_pending,"coordinator claim changed after send");
     p.update_coordinator_checked(|stored|{control.check()?;ensure!(stored.prime_claim.as_ref()==Some(&claim)&&execution(stored)==input.execution&&stored.prime_pending,"coordinator confirmation authority changed");let mut confirmed=claim.clone();confirmed.delivery.phase=Phase::Confirmed;confirmed.delivery.notified=true;stored.prime_claim=Some(confirmed);stored.prime_pending=false;Ok(())})?;Ok(())
 }
+pub fn ready_start(c:&Coordinator)->Result<()> {start::ready(c)}
 pub fn recover(p:&Project,guard:&ProjectGuard)->Result<()> {
+    start::recover(p,guard)?;
     guard.check_project(&p.dir())?;let Some(c)=p.try_coordinator()? else{return Ok(());};validate(&c)?;let Some(mut claim)=c.prime_claim else{return Ok(());};
     if claim.delivery.phase==Phase::Pending{let pending=claim.clone();claim.delivery.phase=Phase::Uncertain;claim.delivery.error="Coordinator priming was interrupted and may already have been submitted. Inspect the pane before explicitly running open --reprime.".into();p.update_coordinator_checked(|c|{ensure!(c.prime_claim.as_ref()==Some(&pending),"coordinator claim changed during recovery");c.prime_claim=Some(claim.clone());Ok(())})?;}
     if claim.delivery.phase==Phase::Uncertain&&!claim.delivery.notified{let id=format!("coordinator-prime-{}-{}",claim.request,claim.delivery.sequence);crate::inbox::write_once(p,&id,"coordinator-state","coordinator","coordinator priming needs reconciliation",&claim.delivery.error)?;std::fs::File::open(p.dir().join("inbox"))?.sync_all()?;p.update_coordinator_checked(|c|{ensure!(c.prime_claim.as_ref()==Some(&claim),"coordinator claim changed before notice acknowledgement");c.prime_claim.as_mut().unwrap().delivery.notified=true;Ok(())})?;}Ok(())
 }
 pub struct JobRunner{pub inner:Arc<dyn Runner+Send+Sync>}
 impl Runner for JobRunner {
-    fn run(&self,cmd:&Cmd)->Result<Output>{if cmd.program!=JOB{return self.inner.run(cmd);}let entered=Instant::now();ensure!(!cmd.timeout.is_zero()&&cmd.timeout<=BUDGET,"invalid coordinator worker budget");let control=Control{deadline:cmd.deadline.context("coordinator deadline missing")?.min(entered+cmd.timeout),cancellation:cmd.cancellation.clone().context("coordinator cancellation missing")?};let text=cmd.stdin.as_deref().context("coordinator input missing")?;ensure!(text.len()<=64*1024,"coordinator input exceeds bounds");execute(&serde_json::from_str(text)?,&control)?;Ok(Output{code:Some(0),elapsed:entered.elapsed(),..Default::default()})}
+    fn run(&self,cmd:&Cmd)->Result<Output>{if cmd.program!=JOB{return self.inner.run(cmd);}let entered=Instant::now();ensure!(!cmd.timeout.is_zero()&&cmd.timeout<=BUDGET,"invalid coordinator worker budget");let control=Control{deadline:cmd.deadline.context("coordinator deadline missing")?.min(entered+cmd.timeout),cancellation:cmd.cancellation.clone().context("coordinator cancellation missing")?};let text=cmd.stdin.as_deref().context("coordinator input missing")?;ensure!(text.len()<=64*1024,"coordinator input exceeds bounds");let input:Input=serde_json::from_str(text)?;if input.start {start::execute(&input,&control)?;}else{execute(&input,&control)?;}Ok(Output{code:Some(0),elapsed:entered.elapsed(),..Default::default()})}
     fn socket_request(&self,path:&Path,line:&str,timeout:Duration)->Result<String>{self.inner.socket_request(path,line,timeout)}
 }
-pub fn request(ctx:&Ctx,p:&Project,c:&Coordinator)->Result<crate::executor::Request>{
-    ready(c)?;let project=p.dir().canonicalize()?;let m=std::fs::metadata(&project)?;let config=std::path::absolute(&ctx.config_dir)?;let socket=PathBuf::from(&c.socket);ensure!(socket.is_absolute(),"coordinator session must be absolute");
+pub fn request(ctx:&Ctx,p:&Project,c:&Coordinator)->Result<crate::executor::Request>{request_mode(ctx,p,c,false)}
+pub fn request_start(ctx:&Ctx,p:&Project,c:&Coordinator)->Result<crate::executor::Request>{request_mode(ctx,p,c,true)}
+fn request_mode(ctx:&Ctx,p:&Project,c:&Coordinator,start:bool)->Result<crate::executor::Request>{
+    if start {ready_start(c)?;}else{ready(c)?;}let project=p.dir().canonicalize()?;let m=std::fs::metadata(&project)?;let config=std::path::absolute(&ctx.config_dir)?;let socket=PathBuf::from(&c.socket);ensure!(socket.is_absolute(),"coordinator session must be absolute");
     let cfg=paths::read_control_text(&config.join("config.toml"),1024*1024)?;let md=paths::read_control_text(&p.project_md(),1024*1024)?.context("project settings missing")?;
-    let input=Input{project:project.clone(),identity:(m.dev(),m.ino()),execution:execution(c),request:c.prime_request,sequence:c.prime_sequence,socket_identity:socket_identity(&socket)?,socket,herdr:ctx.env.herdr_bin(),config,config_digest:digest(cfg.as_deref()),settings_digest:thread::sha256_hex(md.as_bytes()),prompt:crate::coordinator::priming_prompt(&crate::coordinator::current_prefix(&p.root)?,&p.slug)};
+    let input=Input{start,project:project.clone(),identity:(m.dev(),m.ino()),execution:execution(c),request:c.prime_request,sequence:if start{c.launch_sequence}else{c.prime_sequence},socket_identity:socket_identity(&socket)?,socket,herdr:ctx.env.herdr_bin(),config,config_digest:digest(cfg.as_deref()),settings_digest:thread::sha256_hex(md.as_bytes()),prompt:crate::coordinator::priming_prompt(&crate::coordinator::current_prefix(&p.root)?,&p.slug)};
     let text=serde_json::to_string(&input)?;ensure!(text.len()<=64*1024,"coordinator input exceeds bounds");let deadline=Instant::now()+BUDGET;let mut command=Cmd::new(JOB,BUDGET).stdin(text);command.deadline=Some(deadline);
-    Ok(crate::executor::Request{identity:crate::executor::Identity{operation:"coordinator-prime".into(),revision:1,project:project.display().to_string(),machine:format!("brief-root:{}",project.parent().unwrap().display()),terminal:Some(c.pane_id.clone())},lane:crate::executor::Lane::Control,deadline,command})
+    Ok(crate::executor::Request{identity:crate::executor::Identity{operation:if start{"coordinator-start"}else{"coordinator-prime"}.into(),revision:1,project:project.display().to_string(),machine:format!("brief-root:{}",project.parent().unwrap().display()),terminal:Some(c.pane_id.clone())},lane:crate::executor::Lane::Control,deadline,command})
 }
 #[cfg(test)]
 #[path="coordinator_jobs_tests.rs"]

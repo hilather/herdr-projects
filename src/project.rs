@@ -186,6 +186,8 @@ pub struct Coordinator {
     pub prime_request:u64,
     pub prime_sequence:u64,
     pub prime_claim:Option<herdr_projects::coordinator_prime::Claim>,
+    pub launch_sequence:u64,
+    pub launch_claim:Option<herdr_projects::launch_claim::Claim>,
     pub launch_attempts: u32,
     pub updated: String,
 }

@@ -156,9 +156,21 @@ locks survive ticker death until supervised local descendants are cleaned up;
 remote agent effects are not rolled back by local process cleanup.
 
 The built ticker is tested through local and remote confirmed/lost restart cases.
-macOS and real SSH-host acceptance remain untested. Coordinator starts, inbox nudges,
+macOS and real SSH-host acceptance remain untested. Inbox nudges,
 notifications and token reporting still need worker integration; canonical launch
 certification and profile preparation remain separate prerequisites.
+
+On Linux, coordinator starts also use the supervised queue. `open` records the
+request and pane before returning; the ticker checks fresh agent absence, exact
+pane/terminal identity, root ownership and kind-bound configuration before claiming
+and submitting startup. A native launch-pending acknowledgement confirms only the
+start submission. Priming waits for a later exact-kind readiness observation.
+
+An interrupted coordinator start becomes uncertain and emits one inbox notice.
+It blocks both automatic startup and priming for that request. Plain `open` cannot
+turn a missing-agent observation into another launch after a durable claim; inspect
+the pane and use `open --reprime` to explicitly request new work. Migration refuses
+pending or uncertain coordinator starts, including historical uncertainty.
 
 ## Interrupted coordinator priming
 
@@ -178,7 +190,7 @@ pending or uncertain prime claims. Corrupt or oversized coordinator records are
 preserved and require repair; ordinary updates cannot silently reset them.
 
 Priming and restart recovery are tested with disposable Linux subprocesses and the
-built ticker. Coordinator start, nudge/notification and token worker integration
+built ticker. Nudge/notification and token worker integration
 remain separate work; macOS acceptance remains untested.
 
 ## Interrupted brief delivery
@@ -193,7 +205,7 @@ after acknowledgement. Incomplete saved-session contracts refuse automatic brief
 The remote executable defaults to `herdr`; `HERDR_PROJECTS_REMOTE_HERDR_BIN` may
 name its installed path. It must support `remote-api-bridge` and an existing server
 in the saved session. No install, startup or automatic retry occurs. Coordinator
-agent starts and inbox nudges still use their existing paths. Delayed shell
+inbox nudges still use their existing path. Delayed shell
 observations queue thread launches; workers revalidate before dispatch.
 
 The sender checks other project and coordinator references, including resolved

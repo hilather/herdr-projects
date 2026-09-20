@@ -323,7 +323,8 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
             // Recovery is independent of source/session reachability. The worker
             // re-resolves remote routing and checks retained authority itself.
             let recovered=(||->Result<()> {
-                if project.try_coordinator()?.is_some_and(|c|c.prime_claim.as_ref().is_some_and(|claim|claim.delivery.phase==herdr_projects::prompt_claim::Phase::Pending||!claim.delivery.notified)) {
+                if project.try_coordinator()?.is_some_and(|c|c.prime_claim.as_ref().is_some_and(|claim|claim.delivery.phase==herdr_projects::prompt_claim::Phase::Pending||!claim.delivery.notified)
+                    ||c.launch_claim.as_ref().is_some_and(|claim|claim.phase==herdr_projects::launch_claim::Phase::Pending||!claim.notified)) {
                     let guard=herdr_projects::execution_guard::ProjectGuard::acquire(&project.dir())?;
                     crate::coordinator_jobs::recover(&project,&guard)?;
                 }
@@ -778,10 +779,13 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     let mut deferred=std::collections::BTreeSet::new();
     let mut observed=std::collections::BTreeSet::new();
 
-    if let Some(record) = project.coordinator().filter(|c| crate::coordinator_jobs::ready(c).is_ok()) {
+    if let Some(record) = project.coordinator().filter(|c| crate::coordinator_jobs::ready_start(c).is_ok()) {
         let pane_alive = seen.panes.iter().any(|p| coordinator::pane_matches(&record, p));
         let pane_has_agent = seen.agents.iter().any(|a| a.pane_id == record.pane_id);
         if pane_alive && !pane_has_agent && record.launch_attempts < MAX_LAUNCH_ATTEMPTS {
+            if let Some(queue)=memory.copy_jobs.as_mut() {
+                errors.extend(queue.offer_coordinator_start(ctx,project,&record).err());
+            } else {
             let started = (|| -> Result<()> {
                 let (settings, _) = project.read_project_md()?;
                 let safety = project.safety(&ctx.config_dir)?;
@@ -792,6 +796,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
                 Ok(())
             })();
             errors.extend(started.err());
+            }
         }
     }
 
