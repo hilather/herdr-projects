@@ -322,6 +322,10 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
             // re-resolves remote routing and checks retained authority itself.
             let (threads,diagnostics)=thread::list_with_diagnostics(&project);
             for error in diagnostics {log.line(&format!("{slug}: {error}"));}
+            if threads.iter().any(|t|t.prompt_claim.as_ref().is_some_and(|claim|claim.phase==thread::prompt_delivery::Phase::Pending||!claim.notified)) {
+                let recovered=(||->Result<()> {let guard=herdr_projects::execution_guard::ProjectGuard::acquire(&project.dir())?;thread::prompt_delivery::recover(&project,&guard)})();
+                if let Err(error)=recovered {log.line(&format!("{slug}: brief recovery: {error:#}"));continue;}
+            }
             for t in &threads {
                 if let Some(intent)=&t.pending_final_copy {
                     if let Err(error)=queue.offer_final(ctx,&project,t,None,intent.purpose.clone(),intent.operation.clone()){log.line(&format!("{slug}: final-copy recovery: {error:#}"));}
@@ -467,7 +471,7 @@ fn thread_pass(project: &Project, herdr: &Herdr, threads: &[thread::Thread], age
         }
 
         let mut delivered = false;
-        if t.pending_live_copy.is_none()&&t.pending_final_copy.is_none()&&t.prompt_pending && live.agent_state.as_deref().is_some_and(crate::herdr::ready_state) {
+        if thread::prompt_delivery::ready(t).is_ok() && live.agent_state.as_deref().is_some_and(crate::herdr::ready_state) {
             match herdr.agent_prompt(&t.pane_id, &thread::launch_prompt(slug, &t.id)) {
                 Ok(()) => delivered = true,
                 Err(error) => pass.error = pass.error.or(Some(anyhow::anyhow!("{}: brief prompt: {error}", t.id))),
@@ -516,7 +520,7 @@ fn thread_pass(project: &Project, herdr: &Herdr, threads: &[thread::Thread], age
 fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::Thread], agents: &[Agent], panes: &[Pane], may_start: &mut bool, errors: &mut Vec<anyhow::Error>) {
     let now = jiff::Timestamp::now();
     for t in threads {
-        if t.pending_live_copy.is_some()||t.pending_final_copy.is_some(){continue;}
+        if thread::prompt_delivery::ready(t).is_err(){continue;}
         if t.status != thread::Status::Open || !t.prompt_pending {
             continue;
         }

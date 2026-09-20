@@ -19,6 +19,7 @@ pub const LIBRARY_CAP_KB: u64 = 50 * 1024;
 pub const MAX_LAUNCH_ATTEMPTS: u32 = 3;
 pub mod copy_delivery;
 pub mod review_delivery;
+pub mod prompt_delivery;
 #[allow(dead_code)] // Automatic final-copy admission follows recovery review.
 pub mod final_copy;
 
@@ -51,6 +52,8 @@ pub struct Thread {
     pub status: Status,
     pub error: String,
     pub prompt_pending: bool,
+    pub prompt_sequence: u64,
+    pub prompt_claim: Option<prompt_delivery::Claim>,
     pub launch_attempts: u32,
     pub kind: Kind,
     pub repo: String,

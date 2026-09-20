@@ -3,6 +3,7 @@ use super::*;
 use herdr_projects::copy_receipt::{CopyNotice, CopyReceipt};
 
 pub fn validate(t: &Thread) -> Result<()> {
+    super::prompt_delivery::validate(t)?;
     anyhow::ensure!(t.final_copy_sequence<=i64::MAX as u64,"final-copy sequence exhausted");
     if let Some(intent)=&t.pending_final_copy {intent.validate()?;anyhow::ensure!(intent.sequence==t.final_copy_sequence&&t.pending_live_copy.is_none(),"invalid pending final copy");}
     if let Some(notice)=&t.pending_final_notice {notice.validate(&t.id,t.final_copy_sequence)?;}
@@ -20,6 +21,7 @@ pub fn ready(t: &Thread) -> Result<()> {
 }
 fn ready_for(t:&Thread,intent:Option<&herdr_projects::live_copy_intent::LiveCopyIntent>)->Result<()> {
     validate(t)?;
+    anyhow::ensure!(t.prompt_claim.as_ref().is_none_or(|claim|claim.phase!=super::prompt_delivery::Phase::Pending),"recover pending brief delivery first");
     super::review_delivery::validate(t)?;
     anyhow::ensure!(t.pending_copy_notice.is_none(), "prior copy warning still pending");
     anyhow::ensure!(t.pending_review_notice.is_none(), "prior review notice still pending");

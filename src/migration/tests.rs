@@ -685,3 +685,12 @@ fn final_copy_obligations_and_invalid_counters_block_migration() {
         assert!(validate_thread(&changed).is_err());assert!(inspect(&project).unwrap().blockers.iter().any(|b|b.starts_with("threads/t-0001.toml:")));
     }
 }
+
+#[test]
+fn pending_brief_claims_refuse_migration_but_confirmed_history_is_validated() {
+    let mut value:toml::Value=toml::from_str("id = 't-0001'\nstatus = 'open'\nprompt_sequence = 1\n").unwrap();
+    let claim=crate::prompt_claim::Claim{sequence:1,execution:"a".repeat(64),prompt:"brief".into(),phase:crate::prompt_claim::Phase::Pending,error:String::new(),notified:false};
+    value.as_table_mut().unwrap().insert("prompt_claim".into(),toml::Value::try_from(&claim).unwrap());assert!(validate_thread(&value).is_err());
+    let confirmed=crate::prompt_claim::Claim{phase:crate::prompt_claim::Phase::Confirmed,notified:true,..claim};value["prompt_claim"]=toml::Value::try_from(&confirmed).unwrap();validate_thread(&value).unwrap();
+    value["prompt_claim"]["execution"]=toml::Value::String("invalid".into());assert!(validate_thread(&value).is_err());
+}

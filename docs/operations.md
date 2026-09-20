@@ -126,6 +126,19 @@ maximum, running on the next eligible tick. Failed nudges use the same backoff.
 Other project work continues while delivery is failing. A crash after delivery
 but before recording confirmation can cause a repeated notification or nudge.
 
+## Interrupted brief delivery
+
+Durable brief claims are available for supervised worker integration. Automatic
+claim production and the supervised sender are not yet enabled. A pending claim
+recovered after its owning worker exits becomes uncertain: the prompt may already
+have reached the agent. Recovery marks the matching open execution failed and
+writes one replay-safe inbox notice before session checks. Inspect the agent,
+then explicitly restart or resolve the thread; recovery never resends the prompt.
+Historical uncertainty does not fail a replacement execution. Pending claims block
+new copy projections, and retained projections block new brief claims. Migration
+refuses unresolved claims; confirmed history or notified uncertainty on an
+explicitly resolved thread can pass validation.
+
 ## Merged pull request recovery
 
 The ticker saves final-copy intent before copying a merged thread's report and

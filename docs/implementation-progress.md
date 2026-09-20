@@ -1725,3 +1725,37 @@ All 574 tests pass in debug and release (167 library, 371 binary, 34 CLI, two
 contracts). Default-feature tests pass (30 library, 322 binary, 15 CLI, two
 contracts); three optional live checks remain ignored. Logs:
 `/tmp/herdr-reclamation-{debug,release,default}.log`.
+
+
+## W04 durable brief-delivery claims
+
+Thread records now retain a bounded prompt, execution fingerprint and monotonic
+claim sequence before a future supervised prompt effect. Exact confirmation
+atomically clears `prompt_pending`; stale or cancelled acknowledgements leave the
+claim recoverable. Pending claims and retained copy projections are mutually
+exclusive. No automatic claim producer or concrete terminal sender is enabled by
+this increment.
+
+Recovery owns the project guard, refuses thread-inventory diagnostics, and runs
+before session checks. A lost response becomes uncertainty, fails only the same
+open execution, and delivers an idempotent notice that recognizes handled inbox
+items. A replacement execution remains open and may claim after historical notice
+delivery. Same-execution replay remains forbidden. Migration rejects unresolved
+claims and validates completed claim history.
+
+Read-only inspection of the installed Herdr 0.9.1 bundled schema (protocol 22)
+found no prompt idempotency or revision-precondition parameter. This recovery
+policy therefore does not infer that a missing response means a prompt was not
+submitted. Independent review approved the claim/recovery substrate and final
+copy-exclusion and inventory safeguards; concrete sending and admission remain
+outside that approval.
+
+Counts remain 16 locally implemented, five partial and 20 not started. Remaining
+W04 work includes supervised terminal effects, canonical launch/profile
+integration, usage/telemetry and broader authority coverage. macOS and actual
+remote-host acceptance remain untested.
+
+All 580 tests pass in debug and release (168 library, 376 binary, 34 CLI, two
+contracts). Default-feature tests pass (30 library, 327 binary, 15 CLI, two
+contracts); three optional live checks remain ignored. Logs:
+`/tmp/herdr-brief-claims-{debug,release,default}.log`.

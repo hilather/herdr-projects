@@ -32,3 +32,5 @@ pub mod routines;
 
 /// Schedule semantics shared by legacy and durable routines.
 pub mod schedule;
+
+pub mod prompt_claim;
