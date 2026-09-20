@@ -59,10 +59,36 @@ agent readiness, task delivery, stop, resume, usage or checkpoint acknowledgment
 | Kind | Advertised by Herdr 0.9.1 | Agent version | Workflow certified |
 | --- | --- | --- | --- |
 | claude | Yes | Not probed | No |
-| codex | Yes | Not probed | No |
+| codex | Yes | 0.154.0 (explicit local version probe) | No |
 | devin | Yes | Not probed | No |
 | muse | Yes | Not probed | No |
 | grok | Yes | Not probed | No |
 
 The inspection command does not import this manual observation as runtime evidence.
 Version-bound adapter probes and W08 workflow tests must supply that evidence.
+
+## Explicit local version probes
+
+`profile probe NAME --herdr-executable /absolute/herdr --agent-executable /absolute/agent`
+runs the supported installation-version probes. Choose the installed executable,
+not a version-manager shim that might install or update tools. The command hashes
+regular executable files (up to 512 MiB), runs fixed `--version` commands with a
+five-second deadline and 4 KiB output limits, and rejects changes to executable
+identity or config during observation. Raw command output and errors are withheld;
+the report contains parsed versions, output hashes, binary hashes and an aggregate
+evidence digest. Prerelease version suffixes are preserved.
+
+Version parsing currently supports Herdr, Claude Code and Codex CLI. Other kinds
+report `no_verified_version_adapter` and their executable is not invoked. The
+Claude flag is documented in [installation verification](https://code.claude.com/docs/en/setup);
+the Codex CLI declares its version option in its [CLI parser](https://github.com/openai/codex/blob/main/codex-rs/cli/src/main.rs).
+No vendor model, permission or resume flags are generated.
+
+Probe commands inherit the caller's existing environment but do not apply profile
+arguments or environment references. They execute external code: the explicit path
+must identify a program you trust. File hashes cover the named executable, not
+its interpreter, dependencies or remote servers. Reports are local installation
+observations, not authenticated executable attestations or durable launch authority.
+They do not contact Herdr sessions or start agent conversations. Inspection's
+capabilities and launch admission remain unknown/blocked until verified adapter
+and immutable attempt-resolution paths consume suitable evidence.

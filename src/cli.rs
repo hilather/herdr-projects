@@ -56,6 +56,12 @@ enum RepairCommand {
 enum ProfileCommand {
     /// Validate one named profile and print redacted JSON; does not launch an agent
     Inspect { name: String },
+    /// Run bounded version probes against explicit local executables; no agent session
+    Probe {
+        name: String,
+        #[arg(long)] herdr_executable: PathBuf,
+        #[arg(long)] agent_executable: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -425,9 +431,14 @@ pub fn run() -> Result<()> {
     }
     let env = Env::from_process()?;
     let config_dir = env.config_dir();
-    if let Command::Profile { command: ProfileCommand::Inspect { name } } = &cli.command {
-        let report = crate::agents::profiles::inspect(&config_dir.join("config.toml"), name)?;
-        println!("{}", serde_json::to_string_pretty(&report)?);
+    if let Command::Profile { command } = &cli.command {
+        let path = config_dir.join("config.toml");
+        let value = match command {
+            ProfileCommand::Inspect { name } => serde_json::to_value(crate::agents::profiles::inspect(&path, name)?)?,
+            ProfileCommand::Probe { name, herdr_executable, agent_executable } =>
+                serde_json::to_value(crate::agents::probe::probe(&path, name, herdr_executable, agent_executable, &RealRunner)?)?,
+        };
+        println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
     let root = paths::resolve_root(cli.root.as_deref(), &env, &config_dir)?;

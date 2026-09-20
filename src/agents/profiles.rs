@@ -52,8 +52,8 @@ struct Capabilities {
 pub struct Inspection {
     schema_version: u32,
     name: String,
-    kind: String,
-    config_digest: String,
+    pub(super) kind: String,
+    pub(super) config_digest: String,
     profile_digest: String,
     extra_argument_count: usize,
     environment_reference_count: usize,
@@ -61,8 +61,8 @@ pub struct Inspection {
     reasoning_effort_requested: bool,
     budget_requested: bool,
     capabilities: Capabilities,
-    agent_version: Option<String>,
-    herdr_version: Option<String>,
+    pub(super) agent_version: Option<String>,
+    pub(super) herdr_version: Option<String>,
     launchable: bool,
     protocol_capable: bool,
     certified: bool,
@@ -117,7 +117,7 @@ fn inspect_text(text: &str, name: &str) -> Result<Inspection> {
     let profile: Profile = value.clone().try_into()
         .map_err(|_| anyhow::anyhow!("invalid profile fields (source redacted); check the documented schema"))?;
     validate(&profile)?;
-    let mut blockers = vec!["installed agent and Herdr versions have not been probed", "no verified launch adapter evidence", "permission policy has not been resolved", "profile is not bound to an immutable attempt"];
+    let mut blockers = vec!["installed-version compatibility has not been verified", "no verified launch adapter evidence", "permission policy has not been resolved", "profile is not bound to an immutable attempt"];
     if profile.model.is_some() { blockers.push("model request requires a verified adapter mapping"); }
     if profile.reasoning_effort.is_some() { blockers.push("reasoning effort requires a verified adapter mapping"); }
     if !profile.environment.is_empty() { blockers.push("environment references require an approved execution environment"); }

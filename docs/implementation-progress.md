@@ -712,3 +712,29 @@ unit tests and the redaction/no-write CLI fixture pass; the full all-feature sui
 passes 394 tests (92 library, 273 binary, 27 CLI, 2 contracts). Logs:
 `/tmp/herdr-profiles-{focused,cli,debug}.log`. Three optional live checks remain
 ignored and macOS remains unavailable. Card counts remain unchanged.
+
+## W04 explicit installation-version probes
+
+`profile probe` accepts explicit absolute local executable paths and gathers bounded
+Herdr/Claude/Codex version observations. It never applies profile arguments or
+environment references. Unknown kinds have no executable probe adapter. Each command
+has an owned process group, a five-second timeout and 4 KiB capture limits; malformed,
+failed, cancelled, truncated and timed-out output cannot supply a version. Raw output
+and runner errors are withheld. Binary/config changes reject the observation;
+reports bind normalized versions (including prerelease suffixes), exact output
+hashes, executable hashes and profile/config identities.
+
+This remains local installation evidence: interpreter/dependency identity, running
+server compatibility, verified capabilities, immutable attempt binding and launch
+authority are not implied. Independent review corrected inconsistent nested version
+fields and approved the increment. All 399 all-feature tests pass (92 library,
+277 binary, 28 CLI, 2 contracts), including failure/change/redaction regressions and
+a real-runner CLI fixture. Focused default-feature tests also pass. Logs:
+`/tmp/herdr-profile-probe-{focused,cli,debug}.log`.
+
+A disposable-home live probe observed Herdr 0.9.1 and Codex 0.154.0; its
+report is `/tmp/herdr-profile-probe-live.json`. An earlier PATH-based help query hit
+a mise shim attempting tool installation and was interrupted; no tools installed.
+The probe interface requires explicit executable paths to let operators select the
+actual installation. Three optional live workflow checks remain ignored; no live
+agent session or real user project was started. W04 and the full goal remain active.

@@ -6,6 +6,33 @@ use std::process::Command;
 const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
 
 #[test]
+fn profile_probe_binds_explicit_binaries_without_launching_profile_arguments() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join(".config/herdr-projects");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("config.toml"), "[profiles.worker]\nkind='codex'\npermission_policy='interactive'\nextra_args=['SECRET']\n").unwrap();
+    let herdr = home.path().join("herdr-bin");
+    let agent = home.path().join("agent-bin");
+    for (path, version) in [(&herdr, "herdr 0.9.1"), (&agent, "codex-cli 0.99.0-preview.3")] {
+        std::fs::write(path, format!("#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 2\nprintf '%s\\n' '{version}'\n")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let output = hp(home.path(), &["profile", "probe", "worker", "--herdr-executable", herdr.to_str().unwrap(), "--agent-executable", agent.to_str().unwrap()]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["scope"], "local_installation_only");
+    assert_eq!(report["agent"]["version"], "0.99.0-preview.3");
+    assert_eq!(report["herdr"]["version"], "0.9.1");
+    assert_eq!(report["profile"]["agent_version"], report["agent"]["version"]);
+    assert_eq!(report["profile"]["herdr_version"], report["herdr"]["version"]);
+    assert_eq!(report["profile"]["launchable"], false);
+    assert_eq!(report["profile"]["capabilities"]["checkpoint_acknowledgment"], "unknown");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("SECRET"));
+    assert!(!home.path().join(".herdr-projects").exists());
+}
+
+#[test]
 fn profile_inspection_is_redacted_read_only_and_refuses_malformed_config() {
     let home = tempfile::tempdir().unwrap();
     let config = home.path().join(".config/herdr-projects");
