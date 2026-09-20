@@ -52,9 +52,9 @@ pub fn request(project:&Path,operation:&OperationId,revision:u64)->Result<Reques
 enum Entry {Pending{identity:Identity,operation:OperationId,ticket:crate::executor::Ticket},Cooldown{until:Instant,last:OperationId}}
 /// Volatile tickets only: durable eligibility and all claim/effect decisions
 /// remain in the store service. Restart never infers success from a lost ticket.
-pub struct Queue {executor:Arc<crate::executor::Executor>,entries:BTreeMap<PathBuf,Entry>,last_project:Option<PathBuf>}
+pub struct Queue {executor:Arc<crate::executor::Executor>,entries:BTreeMap<PathBuf,Entry>,last_project:Option<PathBuf>,unknown:bool}
 impl Queue {
-    pub fn new(executor:Arc<crate::executor::Executor>)->Self {Self{executor,entries:BTreeMap::new(),last_project:None}}
+    pub fn new(executor:Arc<crate::executor::Executor>)->Self {Self{executor,entries:BTreeMap::new(),last_project:None,unknown:false}}
     pub fn drain(&mut self)->Vec<String> {
         let mut errors=Vec::new();let now=Instant::now();
         self.entries.retain(|path,entry| {
@@ -79,6 +79,7 @@ impl Queue {
             *entry=Entry::Cooldown{until:now+if retry {Duration::from_secs(30)} else {Duration::ZERO},last};true
         });errors
     }
+    pub fn unknown(&self)->bool {self.unknown}
     pub fn pending(&self)->bool {self.entries.values().any(|e|matches!(e,Entry::Pending{..}))}
     pub fn pending_project(&self,project:&str)->bool {self.entries.get(Path::new(project)).is_some_and(|e|matches!(e,Entry::Pending{..}))}
     #[cfg(test)]
@@ -86,7 +87,7 @@ impl Queue {
         self.admit_projects_where(projects,|_|true)
     }
     pub fn admit_projects_where(&mut self,projects:impl IntoIterator<Item=PathBuf>,allowed:impl Fn(&Path)->bool)->Vec<String> {
-        let mut errors=Vec::new();if self.pending(){return errors;}
+        self.unknown=false;let mut errors=Vec::new();if self.pending(){return errors;}
         let mut paths=Vec::new();
         for project in projects {match project.canonicalize(){Ok(path)=>paths.push(path),Err(error)=>errors.push(format!("{}: routine admission: {error}",project.display()))}}
         paths.sort();paths.dedup();
@@ -98,7 +99,7 @@ impl Queue {
             if let Err(error)=self.admit(&path){errors.push(format!("{}: routine admission: {error:#}",path.display()));}
             if self.pending(){break;}
         }
-        errors
+        self.unknown=!errors.is_empty();errors
     }
     fn admit(&mut self,project:&Path)->Result<()> {
         if !cfg!(target_os="linux") {return Ok(());}
@@ -112,18 +113,12 @@ impl Queue {
             Some(Entry::Cooldown{last,..})=>Some(last.clone()),None=>None,
         };
         ensure!(self.entries.contains_key(&path)||self.entries.len()<128,"routine admission inventory is full");
-        let snapshot=herdr_projects::runtime::snapshot(&path)?;
-        if snapshot.schema_version<16 || snapshot.control.as_ref().is_none_or(|c|c.state!=herdr_projects::domain::ProjectState::Active||c.reconciliation_required) {return Ok(());}
-        let operations=snapshot.operations.iter().map(|o|(&o.id,o)).collect::<BTreeMap<_,_>>();
-        let now=jiff::Timestamp::now().as_millisecond();
-        let mut candidates=snapshot.deliveries.iter().filter(|d|d.state==herdr_projects::operations::DeliveryState::Pending && d.attempts==0 && d.next_due_ms<=now && operations.get(&d.operation).is_some_and(|o|o.kind=="routine.run")).collect::<Vec<_>>();
-        candidates.sort_by(|a,b|a.operation.cmp(&b.operation));
-        if candidates.is_empty(){return Ok(());}
-        let delivery=last.as_ref().and_then(|last|candidates.iter().copied().find(|d|d.operation>*last)).unwrap_or(candidates[0]);
-        let work=request(&path,&delivery.operation,delivery.revision)?;let identity=work.identity.clone();
+        let mut budget=herdr_projects::store::identity_inventory::Budget::new(2*1024*1024,1024,Instant::now()+Duration::from_millis(100),Default::default())?;
+        let Some(hint)=herdr_projects::migration::read_routine_execution_hint(&path,&mut budget,last.as_ref(),jiff::Timestamp::now().as_millisecond())? else{return Ok(());};
+        let work=request(&path,&hint.operation,hint.delivery_revision)?;let identity=work.identity.clone();
         let ticket=self.executor.submit(work)?;
         self.last_project=Some(path.clone());
-        self.entries.insert(path,Entry::Pending{identity,operation:delivery.operation.clone(),ticket});Ok(())
+        self.entries.insert(path,Entry::Pending{identity,operation:hint.operation,ticket});Ok(())
     }
 }
 impl Drop for Queue {
@@ -382,4 +377,22 @@ mod tests {
         assert!(completion.runner_entered&&completion.result.is_err());
         assert!(!dir.path().join(".state/state.db").exists());assert!(pool.stop(Duration::from_secs(2)));
     }
+    #[test]
+    fn routine_hint_admission_does_not_bypass_worker_payload_validation() {
+        let(_world,path,operation)=fixture(b"printf should-not-run",2000);let db=rusqlite::Connection::open(path.join(".state/state.db")).unwrap();
+        db.execute("UPDATE operations SET payload_hash=?1 WHERE id=?2",rusqlite::params!["0".repeat(64),operation.as_str()]).unwrap();assert!(runtime::snapshot(&path).is_err());
+        let pool=Arc::new(Executor::new(Limits::default(),Arc::new(JobRunner{inner:Arc::new(crate::runner::RealRunner)})).unwrap());let mut queue=Queue::new(pool.clone());
+        assert!(queue.admit_projects([path.clone()]).is_empty());assert!(queue.pending());let deadline=Instant::now()+Duration::from_secs(5);let mut errors=Vec::new();
+        while queue.pending(){errors.extend(queue.drain());assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(5));}
+        assert_eq!(errors.len(),1);let state:(String,u64)=db.query_row("SELECT state,attempts FROM operation_delivery WHERE operation_id=?1",[operation.as_str()],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();assert_eq!(state,("pending".into(),0));assert!(pool.stop(Duration::from_secs(2)));
+    }
+    #[test]
+    fn routine_hint_errors_veto_idle_until_next_known_admission_pass() {
+        let(world,path,_operation)=fixture(b"printf unused",2000);let db=rusqlite::Connection::open(path.join(".state/state.db")).unwrap();let original:Option<String>=db.query_row("SELECT config_digest FROM project_control",[],|r|r.get(0)).unwrap();
+        db.execute_batch("PRAGMA ignore_check_constraints=ON;").unwrap();db.execute("UPDATE project_control SET config_digest=?1",["x".repeat(65)]).unwrap();
+        let pool=Arc::new(Executor::new(Limits::default(),Arc::new(crate::runner::RealRunner)).unwrap());let mut queue=Queue::new(pool.clone());assert_eq!(queue.admit_projects([path.clone()]).len(),1);assert!(queue.unknown());assert!(!queue.pending());
+        let mut memory=crate::steps::Memory::new(&world.ctx());memory.routine_jobs=Some(queue);assert!(memory.observations_unknown());
+        db.execute("UPDATE project_control SET state='paused',config_digest=?1",[original]).unwrap();assert!(memory.routine_jobs.as_mut().unwrap().admit_projects([path]).is_empty());assert!(!memory.observations_unknown());assert!(pool.stop(Duration::from_secs(2)));
+    }
+
 }

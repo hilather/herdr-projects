@@ -1236,3 +1236,29 @@ fn ticker_canonical_finalization_preserves_once_and_recovers_receipt_after_resta
         assert_eq!(fs::read_dir(project.join(".state/canonical-artifacts").join(&receipt.artifact_key)).unwrap().count(),1);
     }
 }
+
+#[cfg(all(feature="state-store",target_os="linux"))]
+#[test]
+fn ticker_canonical_routine_admits_from_hint_and_restart_keeps_one_execution() {
+    use std::{fs,process::Stdio,time::{Duration,Instant}};
+    use herdr_projects::{domain::*,authority,migration,runtime,operations::DeliveryState};
+    use sha2::{Digest,Sha256};
+    let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();for action in ["new","pause"]{assert!(hp(home.path(),&["--root",r,action,"demo"]).status.success());}
+    let key=home.path().join("owner");assert!(Command::new("/usr/bin/ssh-keygen").args(["-q","-t","ed25519","-N","","-f"]).arg(&key).output().unwrap().status.success());
+    let public=fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");let project=root.join("demo");let config=home.path().join(".config/herdr-projects/config.toml");fs::create_dir_all(config.parent().unwrap()).unwrap();fs::write(&config,format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[safety.{:?}]\nroutine_commands=true\n",project.display().to_string())).unwrap();
+    let plan=migration::inspect_with_config(&project,&config).unwrap();migration::apply(&project,&plan,true).unwrap();let s=runtime::snapshot(&project).unwrap();runtime::set_state(&project,s.head,s.control.unwrap().revision,ProjectState::Active,&config).unwrap();
+    let script=project.join("check.sh");let bytes=b"printf once >> ROUTINE_MARKER\n";fs::write(&script,bytes).unwrap();
+    let definition=RoutineDefinition{version:1,name:"check".into(),revision:1,project_store:project.join(".state/state.db").canonicalize().unwrap().display().to_string(),authority:authority::policy_reference(&project).unwrap(),config:migration::config_reference(&config).unwrap(),enabled:true,schedule:"every 1h".into(),timezone:"UTC".into(),start_unix_ms:jiff::Timestamp::now().as_millisecond()-1000,missed:MissedRunPolicy::CoalesceLatest,overlap:OverlapPolicy::Skip,script:script.display().to_string(),script_sha256:format!("{:x}",Sha256::digest(bytes)),cwd:project.display().to_string(),deadline_ms:1000,output_cap_bytes:4000};
+    let document=home.path().join("routine.json");fs::write(&document,serde_json::to_vec(&definition).unwrap()).unwrap();assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&key).args(["-n",authority::ROUTINE_SIGNATURE_NAMESPACE]).arg(&document).output().unwrap().status.success());
+    let signature=home.path().join("routine.json.sig");let out=hp(home.path(),&["--root",r,"routine-store","demo","import",document.to_str().unwrap(),signature.to_str().unwrap(),"--expected-head",&runtime::snapshot(&project).unwrap().head.to_string()]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    struct Child(std::process::Child);impl Drop for Child{fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+    let spawn=||Child(Command::new(BIN).env_clear().env("HOME",home.path()).env("PATH","/usr/bin:/bin").env("HERDR_BIN_PATH","/bin/false").args(["--root",r,"ticker","run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let wait=|child:&mut Child,predicate:&dyn Fn()->bool|{let deadline=Instant::now()+Duration::from_secs(35);while !predicate(){assert!(child.0.try_wait().unwrap().is_none());assert!(Instant::now()<deadline,"{}",fs::read_to_string(root.join(".ticker.log")).unwrap_or_default());std::thread::sleep(Duration::from_millis(10));}};
+    let stop=|child:&mut Child|{fs::write(root.join(".ticker.stop"),b"").unwrap();let deadline=Instant::now()+Duration::from_secs(8);while child.0.try_wait().unwrap().is_none(){assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(10));}fs::remove_file(root.join(".ticker.stop")).unwrap();};
+    let mut child=spawn();wait(&mut child,&||runtime::snapshot(&project).unwrap().routine_receipts.len()==1);stop(&mut child);
+    let before=runtime::snapshot(&project).unwrap();assert_eq!(before.deliveries.len(),1);assert_eq!(before.deliveries[0].state,DeliveryState::Confirmed);assert_eq!(before.deliveries[0].attempts,1);assert!(before.routine_receipts[0].cleanup_verified&&before.routine_receipts[0].succeeded);
+    // No bindings or due occurrence means a successful restart need not append
+    // an event. Keep it alive across the initial pass and the next 15-second tick.
+    let restarted=Instant::now();let mut child=spawn();wait(&mut child,&||restarted.elapsed()>=Duration::from_secs(16));stop(&mut child);
+    let after=runtime::snapshot(&project).unwrap();assert_eq!(after.routine_receipts,before.routine_receipts);assert_eq!(after.deliveries,before.deliveries);assert_eq!(fs::read(project.join("ROUTINE_MARKER")).unwrap(),b"once");
+}

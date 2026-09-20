@@ -87,3 +87,36 @@ fn effect_hint_duplicate_id_view_is_refused_without_collecting_payload_copies() 
     db.execute_batch("ALTER TABLE operations RENAME TO original_operations; CREATE VIEW operations AS WITH RECURSIVE copies(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM copies WHERE n<128) SELECT o.* FROM original_operations o CROSS JOIN copies;").unwrap();
     let mut budget=budget();let error=read_controller_effect_hint(&path,&mut budget,0,100).unwrap_err().to_string();assert!(error.contains("duplicate selected"),"{error}");assert!(budget.used()<512*1024);
 }
+
+fn routine_fixture(count:usize)->(tempfile::TempDir,std::path::PathBuf) {
+    let(root,path)=fixture(count);let db=rusqlite::Connection::open(path.join(".state/state.db")).unwrap();
+    db.execute("UPDATE operations SET kind='routine.run'",[]).unwrap();db.execute("UPDATE project_control SET state='active',reconciliation_required=0",[]).unwrap();
+    let marker=path.join(".state/format.json");let mut value:serde_json::Value=serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();value["reconciliation_required"]=false.into();fs::write(marker,serde_json::to_vec(&value).unwrap()).unwrap();(root,path)
+}
+#[test]
+fn routine_hints_skip_payloads_and_rotate_after_last_actual_admission() {
+    use crate::domain::OperationId;
+    let(_root,path)=routine_fixture(4);let db=rusqlite::Connection::open(path.join(".state/state.db")).unwrap();
+    let large=serde_json::to_string(&"x".repeat(20*1024*1024)).unwrap();db.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('history','x',1,1,?1)",[&large]).unwrap();db.execute("UPDATE operations SET payload=?1,payload_hash=?2 WHERE id='effect-0000'",rusqlite::params![large,"0".repeat(64)]).unwrap();
+    let mut last=None;
+    for n in 0..8 {let mut budget=budget();let hint=read_routine_execution_hint(&path,&mut budget,last.as_ref(),100).unwrap().unwrap();assert_eq!(hint.operation.as_str(),format!("effect-{:04}",n%4));assert_eq!(hint.delivery_revision,1);assert!(budget.used()<100_000);last=Some(hint.operation);}
+    db.execute("UPDATE operation_delivery SET attempts=1 WHERE operation_id='effect-0001'",[]).unwrap();db.execute("UPDATE operation_delivery SET state='ambiguous' WHERE operation_id='effect-0002'",[]).unwrap();db.execute("UPDATE operation_delivery SET next_due_ms=1000 WHERE operation_id='effect-0003'",[]).unwrap();
+    assert_eq!(read_routine_execution_hint(&path,&mut budget(),Some(&OperationId::new("effect-0000").unwrap()),100).unwrap().unwrap().operation.as_str(),"effect-0000");
+    db.execute("UPDATE project_control SET state='paused'",[]).unwrap();assert!(read_routine_execution_hint(&path,&mut budget(),None,100).unwrap().is_none());
+}
+#[test]
+fn routine_hints_refuse_overflow_duplicate_and_dangling_candidates() {
+    use crate::domain::OperationId;
+    let(_root,path)=routine_fixture(1024);let hint=read_routine_execution_hint(&path,&mut budget(),Some(&OperationId::new("effect-1022").unwrap()),100).unwrap().unwrap();assert_eq!(hint.operation.as_str(),"effect-1023");
+    let mut small=Budget::new(2*1024*1024,10,Instant::now()+Duration::from_secs(2),Default::default()).unwrap();assert!(read_routine_execution_hint(&path,&mut small,None,100).unwrap_err().to_string().contains("candidate budget"));
+    let(_root,path)=routine_fixture(1);let db=rusqlite::Connection::open(path.join(".state/state.db")).unwrap();db.execute_batch("ALTER TABLE operations RENAME TO original_operations; CREATE VIEW operations AS SELECT * FROM original_operations UNION ALL SELECT * FROM original_operations;").unwrap();assert!(read_routine_execution_hint(&path,&mut budget(),None,100).unwrap_err().to_string().contains("duplicate"));
+    let(_root,path)=routine_fixture(1);let db=rusqlite::Connection::open(path.join(".state/state.db")).unwrap();db.execute_batch("PRAGMA foreign_keys=OFF; DELETE FROM operations;").unwrap();assert!(read_routine_execution_hint(&path,&mut budget(),None,100).unwrap_err().to_string().contains("dangling"));
+}
+#[test]
+fn routine_hints_bound_control_rows_and_interrupt_sql() {
+    let(_root,path)=routine_fixture(1);let db=rusqlite::Connection::open(path.join(".state/state.db")).unwrap();
+    db.execute_batch("PRAGMA ignore_check_constraints=ON;").unwrap();db.execute("UPDATE project_control SET config_digest=?1",["x".repeat(65)]).unwrap();assert!(read_routine_execution_hint(&path,&mut budget(),None,100).unwrap_err().to_string().contains("field exceeds bounds"));db.execute("UPDATE project_control SET config_digest=NULL",[]).unwrap();
+    let mut cancelled=budget();cancelled.cancellation.cancel();assert!(read_routine_execution_hint(&path,&mut cancelled,None,100).is_err());
+    db.execute_batch("ALTER TABLE operations RENAME TO original_operations; CREATE VIEW operations AS SELECT * FROM original_operations WHERE (WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n)>0;").unwrap();
+    let mut limited=Budget::new(2*1024*1024,1024,Instant::now()+Duration::from_millis(100),Default::default()).unwrap();let start=Instant::now();assert!(read_routine_execution_hint(&path,&mut limited,None,100).is_err());assert!(start.elapsed()<Duration::from_secs(2));
+}

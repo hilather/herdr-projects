@@ -176,7 +176,7 @@ impl Memory {
     pub fn observations_unknown(&self)->bool {
         let unknown=self.local_observations.as_ref().is_some_and(|reads|reads.unknown());
         #[cfg(feature="state-store")]
-        {return unknown||self.canonical_effects_unknown||self.canonical_observations.as_ref().is_some_and(|reads|reads.unknown());}
+        {return unknown||self.canonical_effects_unknown||self.routine_jobs.as_ref().is_some_and(|queue|queue.unknown())||self.canonical_observations.as_ref().is_some_and(|reads|reads.unknown());}
         #[cfg(not(feature="state-store"))]
         unknown
     }

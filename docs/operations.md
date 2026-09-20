@@ -303,7 +303,7 @@ They do not run database-wide integrity checks or materialize event payloads.
 Filesystem latency itself is not hard-bounded.
 
 Canonical observation workers and synchronous routine scheduling still read full
-snapshots. Effect selection uses bounded hints as described below; full worker
+snapshots. Routine execution admission uses the bounded metadata reader below. Effect selection uses bounded hints as described below; full worker
 materialization bounds and other authority/profile work remain unfinished W04 work. macOS and real
 SSH-host acceptance remain untested.
 
@@ -649,3 +649,15 @@ duplicate IDs, overflow, cancellation or timeout produce an error and veto idle
 exit without resetting reachability. Each ticker pass recomputes that veto.
 Synchronous routine planning and worker full-snapshot materialization remain
 separate unfinished work.
+
+
+Routine execution admission also uses a bounded metadata-only hint with the same
+2 MiB input budget, 100 ms deadline and 1,024-candidate cap. It checks current
+control metadata and selects only due, never-claimed routine deliveries. Complete
+candidate enumeration and last-admitted-ID rotation preserve fairness; duplicate
+or dangling candidates refuse admission. No routine script, operation payload,
+receipt or event history is loaded by this query. The concrete worker still
+validates all signed inputs and authority before claiming or running a command.
+Admission errors veto idle exit until a later successful admission scan; they do
+not reset reachability. Routine planning remains synchronous and is the next
+integration task.

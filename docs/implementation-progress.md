@@ -2504,3 +2504,38 @@ Validation passed all 683 unit tests (189 library, 494 binary) and eight canonic
 CLI regressions in both debug and release profiles. Default-feature `cargo check`
 and `git diff --check` also passed. The final focused set included seven library
 hint tests and three worker/controller authority and idle-veto regressions.
+
+
+### W04 bounded canonical routine execution selection
+
+Routine executor admission no longer materializes a full canonical snapshot. A
+publication-checked read-only RoutineExecutionHint validates bounded control
+metadata and enumerates the complete eligible set of due, pending, never-claimed
+routine operations. It reads only IDs/revisions, with a 1,024-candidate cap and
+2 MiB/100 ms admission budget. Candidate strings are measured as SQLite-owned
+values before allocation. Duplicate/dangling candidates and malformed control
+rows refuse admission. Rotation starts strictly after the last accepted ticket's
+operation; overflow never falls back to a truncated prefix.
+
+Existing concrete routine ingress still validates full provenance, signed inputs,
+lifecycle and exact delivery revision before claiming/executing. Admission errors
+set an independent idle-exit veto which clears after a successful admission pass,
+without resetting reachability. Independent review approved the source. New tests
+cover oversized unread history/payloads, late-candidate rotation, retry exclusion,
+paused lifecycle, overflow, duplicate views, dangling deliveries, bounded control
+fields, cancellation and SQL interruption. Worker tests confirm corrupt payloads
+can be hinted but cannot be claimed, and unknown admission state clears correctly.
+
+Synchronous routine planning remains next. Its asynchronous design must rotate by
+actual planning service, coordinate admission with observations to avoid starving
+either, and avoid negative caches invalidating each other through observation
+events. Full worker materialization bounds and other W04 work remain unfinished.
+Card counts and unavailable platform acceptance are unchanged.
+
+Independent review approved the final source and tests. Validation passed all 688
+unit tests (192 library, 496 binary) and nine canonical CLI regressions in both
+debug and release profiles, plus default-feature `cargo check` and
+`git diff --check`. The new built-ticker fixture executes a signed routine once,
+then stays alive across two restart passes with unchanged receipts/deliveries and
+one script marker write. The task ledger now reflects the already completed
+worker isolation work without changing card counts.

@@ -72,3 +72,34 @@ pub(crate) fn read(path:&Path,publication:&Publication,budget:&mut Budget,turn:u
         budget.charge(8)?;Ok(Some(ControllerEffectHint{head:super::head(tx)?,operation,delivery_revision:*revision,mode:*mode,notification_socket:socket}))
     })
 }
+
+/// Execution admission only. Signed definition, payload, provenance and claim
+/// validation remain the routine worker's responsibility.
+#[derive(Debug)]
+pub struct RoutineExecutionHint {pub operation:OperationId,pub delivery_revision:u64}
+pub(crate) fn read_routine(path:&Path,publication:&Publication,budget:&mut Budget,last:Option<&OperationId>,now:i64)->Result<Option<RoutineExecutionHint>> {
+    super::delivery::now_check(now)?;
+    super::identity_inventory::read_published(path,publication,budget,|tx,budget|{
+        let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;if version<16{return Ok(None);}
+        let mut control=tx.prepare("SELECT revision,epoch,state,reconciliation_required,config_digest FROM project_control WHERE singleton=1 LIMIT 2")?;
+        let mut rows=control.query([])?;let row=rows.next()?.context("routine control hint missing")?;measure(row,&[2,4],64,budget)?;
+        let revision:u64=row.get(0)?;let epoch:u64=row.get(1)?;let state:String=row.get(2)?;let required:bool=row.get(3)?;let digest:Option<String>=row.get(4)?;
+        ensure!(revision>0&&epoch>0&&matches!(state.as_str(),"active"|"paused"|"archived")&&digest.as_ref().is_none_or(|d|d.len()==64&&d.bytes().all(|b|b.is_ascii_hexdigit())),"invalid routine control hint");
+        ensure!(rows.next()?.is_none(),"duplicate routine control hint");drop(rows);drop(control);
+        if state!="active"||required {return Ok(None);}
+        let dangling:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operation_delivery d LEFT JOIN operations o ON o.id=d.operation_id WHERE d.state='pending' AND d.attempts=0 AND o.id IS NULL)",[],|r|r.get(0))?;
+        ensure!(!dangling,"routine hint has a pending dangling delivery");
+        let mut stmt=tx.prepare("SELECT o.id,d.revision FROM operation_delivery d JOIN operations o ON o.id=d.operation_id WHERE d.state='pending' AND d.attempts=0 AND d.next_due_ms<=?1 AND o.kind='routine.run'")?;
+        let mut rows=stmt.query([now])?;let mut candidates=Vec::new();
+        while let Some(row)=rows.next()? {
+            budget.record()?;measure(row,&[0],512,budget)?;budget.charge(16)?;
+            let operation=OperationId::new(row.get::<_,String>(0)?).map_err(anyhow::Error::msg)?;let revision:u64=row.get(1)?;ensure!(revision>0,"invalid routine delivery hint revision");
+            candidates.push((operation,revision));
+        }
+        drop(rows);drop(stmt);budget.check()?;candidates.sort_by(|a,b|a.0.cmp(&b.0));
+        ensure!(candidates.windows(2).all(|pair|pair[0].0!=pair[1].0),"duplicate routine candidate hint");
+        if candidates.is_empty(){return Ok(None);}
+        let selected=last.and_then(|last|candidates.iter().find(|(id,_)|id>last)).unwrap_or(&candidates[0]);
+        Ok(Some(RoutineExecutionHint{operation:selected.0.clone(),delivery_revision:selected.1}))
+    })
+}
