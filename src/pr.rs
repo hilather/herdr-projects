@@ -183,18 +183,24 @@ pub fn reduce(json: &str, branch: &str, origin: &str) -> Result<Checked> {
     }))
 }
 
-pub fn view(runner: &dyn Runner, url: &str) -> Result<String> {
+pub fn view_command(url: &str) -> Result<Cmd> {
     if !valid_pr_url(url) {
         bail!("not a pull request URL");
     }
-    let out = runner.run(&Cmd::new("gh", GH_TIMEOUT).args([
+    Ok(Cmd::new("gh", GH_TIMEOUT).args([
         "pr",
         "view",
         "--json",
         "state,reviewDecision,statusCheckRollup,comments,headRefName,headRepository,headRepositoryOwner",
         "--",
         url,
-    ]))?;
+    ]))
+}
+
+pub fn view(runner: &dyn Runner, url: &str) -> Result<String> {
+    view_output(runner.run(&view_command(url)?)?)
+}
+pub fn view_output(out:crate::runner::Output)->Result<String> {
     if !out.success() {
         bail!("gh pr view: {}", out.error_text());
     }

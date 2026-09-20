@@ -18,7 +18,7 @@ fn queue_bounds_machine_isolation_expiry_and_cancellation_prevent_spawns() {
     let hold=pool.submit(fake_request("hold","a","bad-host","hold")).unwrap();assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(),"hold");
     let mut expiring=fake_request("expires","b","bad-host","must-not-run");expiring.deadline=Instant::now()+Duration::from_millis(40);let expired=pool.submit(expiring).unwrap();
     let cancel=pool.submit(fake_request("cancel","c","bad-host","must-not-run")).unwrap();cancel.cancel();
-    let live=pool.submit(fake_request("healthy","d","good-host","healthy")).unwrap();assert!(live.recv_timeout(Duration::from_secs(1)).unwrap().result.unwrap().success());assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(),"healthy");assert!(expired.recv_timeout(Duration::from_secs(1)).unwrap().result.unwrap().timed_out);assert!(cancel.recv_timeout(Duration::from_secs(1)).unwrap().result.unwrap().cancelled);
+    let live=pool.submit(fake_request("healthy","d","good-host","healthy")).unwrap();assert!(live.recv_timeout(Duration::from_secs(1)).unwrap().result.unwrap().success());assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(),"healthy");let expired=expired.recv_timeout(Duration::from_secs(1)).unwrap();assert!(!expired.runner_entered);assert!(expired.result.unwrap().timed_out);assert!(cancel.recv_timeout(Duration::from_secs(1)).unwrap().result.unwrap().cancelled);
     assert!(pool.submit(fake_request("hold","a","bad-host","duplicate")).is_err());release.send(()).unwrap();assert!(hold.recv_timeout(Duration::from_secs(1)).unwrap().result.unwrap().success());assert!(rx.try_recv().is_err());assert!(pool.stop(Duration::from_secs(1)));
 }
 #[test]

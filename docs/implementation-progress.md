@@ -608,3 +608,28 @@ Validation: 378 all-feature debug tests (92 library, 258 binary, 26 CLI, 2 contr
 The final owned-process-group admission check also passes the focused debug suite.
 Logs: `/tmp/herdr-executor-{debug,focused,release,legacy}.log`. Three optional live
 checks remain ignored; no macOS or end-to-end ticker responsiveness claim is made.
+
+## W04 asynchronous PR-read integration
+
+The production ticker now submits read-only `gh pr view` commands to the bounded
+executor. It continues guarded work while a query is pending and consumes responses
+on a later pass. Pending work does not become an outage or advance the completed
+PR-check timestamp. Results bind canonical project/thread identity, execution and
+report fingerprints, and URL; changed input cancels/discards the prior query.
+Existing branch/repository checks and finalization writes remain inside the guarded
+pass. No terminal commands or finalization effects moved to background workers.
+
+Consumed replies have a cooldown, and the bounded ephemeral cache expires inactive
+entries. A queue-inclusive 30-second deadline preserves the ten-second gh timeout.
+The executor now reports whether it entered the runner, so queued expiry is local
+backpressure, never evidence of a GitHub outage. Stop/idle exit drains reads while
+retaining ticker ownership and reports unresolved cleanup on failure.
+
+Independent review approved the integration and queue-expiry distinction. Full debug
+validation passes 380 tests; the subsequently added queue-expiry fixture is included
+in the full release suite's 381 passing tests and the default suite's 238 passing
+tests. Full-ticker fixtures exercise unrelated status progress while a PR query is
+held, eventual application, report-change cancellation and shutdown. Logs:
+`/tmp/herdr-async-pr-{debug,focused,release,legacy}.log`. Three optional live checks
+remain ignored. T04.2 is still partial: remote observations, routines and artifact
+work need asynchronous integration; canonical PR evidence remains W07 work.

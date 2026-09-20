@@ -127,6 +127,7 @@ pub struct Memory {
     pub outage_secs: i64,
     pub tick: u64,
     pub machines: BTreeMap<MachineKey, MachineMemory>,
+    pub pr_reads: Option<crate::pr_polling::Reads>,
     #[cfg(test)]
     clock: Option<Instant>,
 }
@@ -139,6 +140,7 @@ impl Memory {
             outage_secs: ctx.env.var("HERDR_PROJECTS_OUTAGE_SECS").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_OUTAGE_SECS),
             tick: 0,
             machines: BTreeMap::new(),
+            pr_reads: None,
             #[cfg(test)]
             clock: None,
         }
@@ -297,6 +299,8 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
     if thread::seconds_since(&state.last_pr_check, now) < PR_INTERVAL_SECS && !state.last_pr_check.is_empty() {
         return errors;
     }
+    let previous_check=state.last_pr_check.clone();
+    let mut pending_read=false;
     state.last_pr_check = now.to_string();
 
     for t in thread::list(project) {
@@ -329,7 +333,15 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
             continue;
         }
 
-        let json = match pr::view(ctx.runner, &url) {
+        let read=if let Some(reads)=memory.pr_reads.as_mut() {
+            match reads.poll(&project.canonical_dir(),&t.id,&thread::sha256_hex(serde_json::json!([recovery::fingerprint(&t),t.report_hash,thread::sha256_hex(report.as_bytes())]).to_string().as_bytes()),&url) {
+                Ok(crate::pr_polling::Poll::Pending)=>{pending_read=true;continue;},
+                Ok(crate::pr_polling::Poll::NotDue)=>continue,
+                Ok(crate::pr_polling::Poll::Ready(result))=>result,
+                Err(error)=>{pending_read=true;errors.push(error.context("PR executor admission"));continue;},
+            }
+        }else{pr::view(ctx.runner,&url)};
+        let json = match read {
             Ok(json) => {
                 errors.extend(recovery::record_outage(project, state, &url, None, None, now, memory.outage_secs).err());
                 json
@@ -376,6 +388,7 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
             }
         }
     }
+    if pending_read {state.last_pr_check=previous_check;}
     errors.extend(recovery::flush_events(project, state, now));
     errors.extend(recovery::retry_finalizations(ctx, project, state, now));
     errors.extend(recovery::flush_events(project, state, now));

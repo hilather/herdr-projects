@@ -22,7 +22,7 @@ pub struct Identity {pub operation:String,pub revision:u64,pub project:String,pu
 pub struct Metrics {pub queued:[usize;2],pub running:[usize;2],pub high_water:[usize;2],pub completed:[u64;2],pub max_queue_delay:Duration,pub uncertain:bool}
 pub struct Request {pub identity:Identity,pub lane:Lane,pub deadline:Instant,pub command:Cmd}
 #[derive(Debug)]
-pub struct Completion {pub identity:Identity,pub queue_delay:Duration,pub elapsed:Duration,pub result:Result<Output>}
+pub struct Completion {pub identity:Identity,pub queue_delay:Duration,pub elapsed:Duration,pub runner_entered:bool,pub result:Result<Output>}
 pub struct Ticket {receiver:mpsc::Receiver<Completion>,cancellation:Cancellation}
 impl Ticket {
     pub fn cancel(&self) {self.cancellation.cancel();}
@@ -102,9 +102,11 @@ fn worker(shared:Arc<Shared>,runner:Arc<dyn Runner+Send+Sync>,lane:usize) {
             state=shared.wake.wait_timeout(state,Duration::from_millis(20)).unwrap().0;
         }};
         let started=Instant::now();let mut command=job.request.command;
+        let mut runner_entered=false;
         let result=if job.token.is_cancelled(){Ok(Output{cancelled:true,..Output::default()})}
         else if let Some(remaining)=job.request.deadline.checked_duration_since(started) {
             command.timeout=command.timeout.min(remaining);
+            runner_entered=true;
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(||runner.run(&command))) {
                 Ok(result)=>result,
                 Err(_)=>{
@@ -118,7 +120,7 @@ fn worker(shared:Arc<Shared>,runner:Arc<dyn Runner+Send+Sync>,lane:usize) {
                 }
             }
         }else{Ok(Output{timed_out:true,..Output::default()})};
-        let identity=job.request.identity;let completion=Completion{identity:identity.clone(),queue_delay:started.duration_since(job.queued),elapsed:started.elapsed(),result};
+        let identity=job.request.identity;let completion=Completion{identity:identity.clone(),queue_delay:started.duration_since(job.queued),elapsed:started.elapsed(),runner_entered,result};
         {let mut state=shared.state.lock().unwrap();state.running.remove(&(identity.project.clone(),identity.operation.clone()));state.admitted[lane]-=1;state.metrics.completed[lane]=state.metrics.completed[lane].saturating_add(1);state.metrics.max_queue_delay=state.metrics.max_queue_delay.max(completion.queue_delay);shared.wake.notify_all();}
         let _=job.reply.send(completion);
     }

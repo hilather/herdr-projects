@@ -20,9 +20,9 @@ mod remote;
 mod repair;
 mod routine;
 mod runner;
-// T04.2 queue engine; ticker integration follows without relaxing execution leases.
-#[allow(dead_code)]
+#[allow(dead_code)] // Transfer callers and operational metrics follow PR read integration.
 mod executor;
+mod pr_polling;
 #[cfg(test)]
 mod scenarios;
 mod steps;

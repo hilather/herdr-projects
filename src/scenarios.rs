@@ -5,6 +5,7 @@ mod review_regressions;
 mod reliability;
 mod recovery;
 mod preservation;
+mod async_pr;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};

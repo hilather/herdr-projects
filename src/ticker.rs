@@ -257,17 +257,18 @@ pub fn run(ctx: &Ctx) -> Result<()> {
     log.line(&format!("ticker {} started (pid {})", info.version, info.pid));
     let mut last_reachable = Instant::now();
     let mut memory = Memory::new(ctx);
+    memory.pr_reads=Some(crate::pr_polling::Reads::new(std::sync::Arc::new(crate::runner::RealRunner))?);
     loop {
         if stop_path(root).exists() {
-            log.line("stop file found; exiting");
-            return Ok(());
+            log.line("stop file found; draining PR reads");
+            return memory.pr_reads.as_mut().expect("ticker PR executor").stop();
         }
         let wake = Instant::now() + TICK;
         if tick(ctx, &log, &mut memory) {
             last_reachable = Instant::now();
         } else if last_reachable.elapsed() > IDLE_EXIT {
-            log.line("no project has had a reachable session for five minutes; exiting");
-            return Ok(());
+            log.line("no project has had a reachable session for five minutes; draining PR reads");
+            return memory.pr_reads.as_mut().expect("ticker PR executor").stop();
         }
         // Sleep in short slices so a stop request is honoured promptly.
         while Instant::now() < wake {

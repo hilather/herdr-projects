@@ -115,10 +115,34 @@ commands that could outlive caller guards. A runner panic quarantines the execut
 cancels other work and reports uncertain cleanup even after threads exit. Neither
 outcome authorizes worker replacement or capacity release.
 
-The engine is not yet connected to the ticker. Current cheap and slow passes both
+The PR-read path is connected to the engine (below). Current cheap and slow passes both
 hold the root execution lease; simply moving the slow pass to a thread would still
 block status application. Integration must split observation from guarded effects,
 retain exact record/operation revision checks, and preserve one terminal owner
-before replacing these guards. Routine/SSH/PR/artifact migration and end-to-end
+before replacing these guards. Routine/SSH/artifact migration and end-to-end
 drain/latency acceptance remain open. Standalone queue tests do not establish ticker
 responsiveness.
+
+## Asynchronous PR observations
+
+The production ticker submits validated `gh pr view` reads to the control queue and
+continues its guarded pass without waiting. A pending read does not change outage
+state or advance the project's completed PR-check time. Replies are consumed on a
+later pass, with the existing repository/branch reduction and guarded result/event/
+finalization writes. Thread execution identity, recorded and actual report hashes,
+and URL bind each request; a changed identity cancels/discards its predecessor.
+No terminal command or finalization effect runs in the PR executor.
+
+Each read has a 30-second queue-inclusive deadline and the existing ten-second
+command timeout. Expiry before runner entry is local backpressure, not a GitHub
+outage. Consumed observations have a 120-second cooldown so one pending project
+query does not repeatedly enqueue its already-completed peers. The cache holds at
+most 128 thread entries and cancels entries unused for 120 seconds when polling
+next runs. Cache state is ephemeral; restart safely reissues only read-only queries.
+Ticker stop/idle exit cancels and drains reads with a two-second deadline while
+retaining ticker ownership. Failure to drain reports unresolved cleanup.
+
+Full-ticker fixtures show that a delayed PR read leaves unrelated session checks
+running, preserves outage state, applies a later response, discards a changed report
+and drains cancellation. Remaining slow paths are still synchronous. This is not
+yet acceptance of the complete T04.2 isolation requirement.
