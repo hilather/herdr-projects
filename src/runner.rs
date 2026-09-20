@@ -37,6 +37,9 @@ pub struct Cmd {
     pub cwd: Option<PathBuf>,
     pub stdin: Option<String>,
     pub timeout: Duration,
+    /// Absolute queue/execution deadline; never restart this budget when a
+    /// worker or nested adapter begins running.
+    pub deadline: Option<Instant>,
     /// Spawn in its own process group and kill the whole group on timeout.
     pub own_group: bool,
     pub capture_limit: usize,
@@ -57,6 +60,7 @@ impl Cmd {
             cwd: None,
             stdin: None,
             timeout,
+            deadline: None,
             // Runner commands are finite. Detached services use a separate
             // spawn path with redirected descriptors (see ticker::start).
             own_group: true,
@@ -183,6 +187,9 @@ impl Runner for RealRunner {
         if cmd.cancellation.as_ref().is_some_and(Cancellation::is_cancelled) {
             return Ok(Output { cancelled: true, ..Output::default() });
         }
+        if cmd.deadline.is_some_and(|deadline|started>=deadline) {
+            return Ok(Output { timed_out: true, ..Output::default() });
+        }
         let mut command = Command::new(&cmd.program);
         command.args(&cmd.args);
         if cmd.env_clear { command.env_clear(); }
@@ -298,7 +305,8 @@ fn collect(child: &mut std::process::Child, cmd: &Cmd, started: Instant) -> Resu
     let mut result = Output::default();
     loop {
         result.cancelled = cmd.cancellation.as_ref().is_some_and(Cancellation::is_cancelled);
-        result.timed_out = !result.cancelled && started.elapsed() >= cmd.timeout;
+        result.timed_out = !result.cancelled && (started.elapsed() >= cmd.timeout
+            || cmd.deadline.is_some_and(|deadline|Instant::now()>=deadline));
         if result.cancelled || result.timed_out {
             drop(input.take());
             terminate(child, cmd.own_group);
@@ -558,6 +566,13 @@ mod tests {
 #[cfg(test)]
 mod streaming_tests {
     use super::*;
+    #[test]
+    fn absolute_deadline_caps_a_longer_relative_process_timeout() {
+        let mut cmd=Cmd::new("/bin/sh",Duration::from_secs(10)).args(["-c","sleep 10"]);
+        cmd.deadline=Some(Instant::now()+Duration::from_millis(50));
+        let started=Instant::now();let output=RealRunner.run(&cmd).unwrap();
+        assert!(output.timed_out);assert!(started.elapsed()<Duration::from_secs(2));
+    }
     #[test]
     fn file_sink_streams_beyond_capture_limit_and_caps_producers() {
         let dir = tempfile::tempdir().unwrap();

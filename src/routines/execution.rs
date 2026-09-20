@@ -22,12 +22,22 @@ pub(super) struct Completion {
 /// No injected Runner or public constructor may mint a cleanup result.
 /// The caller retains ownership, validates the durable claim immediately before
 /// entry, and commits the result bound to that claim before releasing overlap.
-pub(super) fn run(script: &[u8], cwd: &Path, deadline_ms: u64, cap: u32,
+#[cfg(test)]
+fn run(script: &[u8], cwd: &Path, deadline_ms: u64, cap: u32,
     cancellation: Cancellation) -> Result<Completion>
+{
+    run_until(script,cwd,deadline_ms,cap,cancellation,None)
+}
+
+pub(super) fn run_until(script:&[u8],cwd:&Path,deadline_ms:u64,cap:u32,cancellation:Cancellation,
+    deadline:Option<std::time::Instant>)->Result<Completion>
 {
     preflight(script,deadline_ms,cap)?;
     let script=std::str::from_utf8(script).map_err(|_|anyhow::anyhow!("routine script must be UTF-8"))?;
-    run_command(&command(script,cwd,deadline_ms,cap,cancellation))
+    let mut command=command(script,cwd,deadline_ms,cap,cancellation);
+    command.deadline=deadline;
+    if let Some(end)=deadline {command.timeout=command.timeout.min(end.saturating_duration_since(std::time::Instant::now()));}
+    run_command(&command)
 }
 
 fn command(script:&str,cwd:&Path,deadline_ms:u64,cap:u32,cancellation:Cancellation)->Cmd {

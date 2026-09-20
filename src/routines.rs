@@ -13,20 +13,40 @@ pub(crate) struct CompletedRoutine {pub(crate) receipt:crate::domain::RoutineRec
 /// command and receipt commit. Ticker dispatch must use an owned asynchronous
 /// job rather than calling this while holding its scan loop.
 pub fn execute(project:&Path,operation:&crate::domain::OperationId,expected_head:u64)->Result<crate::domain::RoutineReceipt> {
-    use crate::{operations::DeliveryState,runner::Cancellation};
+    execute_owned(project,operation,Some(expected_head),None,crate::runner::Cancellation::default(),None)
+}
+
+/// Executor ingress carries an operation revision, not a queue-time event head.
+/// All current policy, inputs and ownership are revalidated when the job starts.
+/// A cancelled/expired queue entry cannot claim work or consume execution rights.
+pub fn execute_queued(project:&Path,operation:&crate::domain::OperationId,expected_revision:u64,
+    cancellation:crate::runner::Cancellation,deadline:std::time::Instant)->Result<crate::domain::RoutineReceipt>
+{
+    execute_owned(project,operation,None,Some(expected_revision),cancellation,Some(deadline))
+}
+
+fn execute_owned(project:&Path,operation:&crate::domain::OperationId,expected_head:Option<u64>,expected_revision:Option<u64>,
+    cancellation:crate::runner::Cancellation,deadline:Option<std::time::Instant>)->Result<crate::domain::RoutineReceipt>
+{
+    use crate::operations::DeliveryState;
+    ensure!(!cancellation.is_cancelled(),"routine cancelled before claim");
+    ensure!(deadline.is_none_or(|end|end>std::time::Instant::now()),"routine queue deadline elapsed");
     let _guard=migration::runtime_mutation(project)?;
     let mut db=migration::open_active(project)?;
-    let snapshot=db.read_snapshot(Some(expected_head))?;
+    let snapshot=db.read_snapshot(expected_head)?;
     let occurrence=snapshot.routine_occurrences.iter().find(|o|o.operation.as_ref()==Some(operation)).context("routine occurrence not found")?;
     let definition=snapshot.routine_revisions.iter().find(|d|d.reference().ok().as_ref()==Some(&occurrence.routine)).context("routine definition not found")?;
     let delivery=snapshot.deliveries.iter().find(|d|&d.operation==operation).context("routine delivery not found")?;
     ensure!(delivery.state==DeliveryState::Pending && delivery.attempts==0,"routine already claimed; execution cannot be replayed");
+    ensure!(expected_revision.is_none_or(|revision|delivery.revision==revision),"routine delivery revision changed in queue");
     let script=load_current(definition)?.context("routine is disabled")?;
     execution::preflight(&script,definition.deadline_ms,definition.output_cap_bytes)?;
+    ensure!(!cancellation.is_cancelled(),"routine cancelled before claim");
+    ensure!(deadline.is_none_or(|end|end.saturating_duration_since(std::time::Instant::now())>=std::time::Duration::from_millis(definition.deadline_ms+7_000)),"insufficient routine execution and cleanup budget after queueing");
     let now=jiff::Timestamp::now().as_millisecond();
     let claim=db.claim_operation(operation,delivery.revision,"routine-linux-namespace-v1",now,definition.deadline_ms as i64+30_000)?;
     db.validate_claim(&claim,jiff::Timestamp::now().as_millisecond())?;
-    let completion=execution::run(&script,Path::new(&definition.cwd),definition.deadline_ms,definition.output_cap_bytes,Cancellation::default());
+    let completion=execution::run_until(&script,Path::new(&definition.cwd),definition.deadline_ms,definition.output_cap_bytes,cancellation,deadline);
     let (output,cleanup_verified,succeeded)=match completion {
         Ok(c)=>(c.output,c.cleanup_verified,c.succeeded),
         // An I/O error after spawn cannot certify cleanup. Diagnostics never

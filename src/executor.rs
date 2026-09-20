@@ -53,6 +53,7 @@ impl Executor {
         ensure!(cmd.own_group,"executor commands require an owned process group for cancellation");
         let bytes=cmd.program.len().saturating_add(cmd.args.iter().chain(cmd.env_remove.iter()).map(String::len).fold(0usize,usize::saturating_add)).saturating_add(cmd.env.iter().map(|(k,v)|k.len().saturating_add(v.len())).fold(0usize,usize::saturating_add)).saturating_add(cmd.stdin.as_ref().map_or(0,String::len));
         ensure!(bytes<=1024*1024&&cmd.args.len()<=4096&&cmd.env.len()<=4096&&cmd.env_remove.len()<=4096&&cmd.capture_limit<=crate::runner::CAPTURE_LIMIT,"command exceeds executor input/output bounds");
+        if let Some(deadline)=request.command.deadline {request.deadline=request.deadline.min(deadline);}
         let id=&request.identity;
         ensure!(id.revision>0&&[&id.operation,&id.project,&id.machine].iter().all(|s|!s.is_empty()&&s.len()<=4096&&!s.chars().any(char::is_control))&&id.terminal.as_ref().is_none_or(|s|!s.is_empty()&&s.len()<=4096&&!s.chars().any(char::is_control)),"invalid command identity");
         ensure!(request.deadline>Instant::now()&&!request.command.timeout.is_zero(),"command deadline elapsed");
@@ -107,6 +108,7 @@ fn worker(shared:Arc<Shared>,runner:Arc<dyn Runner+Send+Sync>,lane:usize) {
         let result=if job.token.is_cancelled(){Ok(Output{cancelled:true,..Output::default()})}
         else if let Some(remaining)=job.request.deadline.checked_duration_since(started) {
             command.timeout=command.timeout.min(remaining);
+            command.deadline=Some(job.request.deadline);
             runner_entered=true;
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(||runner.run(&command))) {
                 Ok(result)=>result,

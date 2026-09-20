@@ -124,3 +124,18 @@ cursor and cannot duplicate the same occurrence.
 
 Automatic command dispatch and asynchronous ownership remain integration work.
 The same-OS-user bypass limitation still applies.
+
+The executor bridge is implemented and tested, but is not yet admitted by the
+ticker. Jobs use the shared transfer lane with one routine per root. They carry
+operation/delivery identity and an absolute 95-second queue/execution budget.
+The service revalidates authority at worker entry and requires the signed duration
+plus seven seconds of execution/cleanup/commit allowance before claiming. Unrelated
+event-head changes do not invalidate an otherwise current operation. Cancelled,
+expired, withdrawn or stale entries cannot acquire a fresh claim.
+
+The original absolute deadline reaches the concrete runner without being restarted
+at adapter entry. Running cancellation retains an uncertain cleanup receipt; a lost
+receipt remains claimed and cannot be replayed after executor restart. Pool output
+does not grant cleanup authority: the trusted service commits its own sealed result.
+The retained root-wide mutation guard still blocks guarded work in other projects,
+so project ownership refinement is required before automatic dispatch is enabled.

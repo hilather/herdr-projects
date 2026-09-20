@@ -998,3 +998,38 @@ ignored. Logs: `/tmp/herdr-routine-ticker-{debug,release}.log`.
 Next is asynchronous command dispatch and ownership, followed by the remaining W04
 profile, budget, telemetry and authority integration. Counts remain 16 implemented,
 five partial and 20 not started; macOS remains unavailable.
+
+## W04 cancellation-aware routine queue bridge
+
+The bounded executor can now carry routine jobs through a trusted adapter. Queued
+identity binds operation and delivery revision rather than a stale global event head.
+Worker entry revalidates current authority and exact script bytes before claiming;
+cancellation, stale revisions and insufficient execution/cleanup allowance refuse
+without a claim. The trusted service still uses concrete process containment and
+persists its sealed receipt itself; injected observation runners and pool output
+cannot manufacture cleanup authority. Transfer-lane jobs serialize per root under
+the retained execution guard.
+
+Independent review found that reconstructing the remaining deadline at adapter entry
+could extend the original queue budget. Commands now carry an absolute monotonic
+deadline from admission through worker entry, trusted ingress and concrete collection.
+The runner refuses spawn after expiry and applies the earlier of relative timeout and
+absolute deadline while collecting. A delayed-adapter regression proves the deadline
+cannot be restarted at process entry.
+
+Real-key queue fixtures cover script withdrawal while actually queued, unrelated
+head changes, stale delivery revisions, insufficient/expired budgets, cancelled jobs,
+control-lane progress during a running routine, cancellation/drain and receipt-commit
+failure across executor restart. Claimed work is never replayed; cancellation retains
+uncertain cleanup. A shared signed fixture also preserves the ticker regressions.
+
+Independent review approved the implementation and deadline correction. All 452 tests
+pass in debug and release (152 library, 268 binary, 30 CLI, 2 contracts); three optional
+live checks remain ignored. The default-feature suite also passes. Logs:
+`/tmp/herdr-routine-queue-{debug,release,default}.log`.
+
+The ticker does not yet admit these jobs. Root-wide mutation ownership still obstructs
+unrelated guarded status updates despite free control workers; project/resource
+ownership refinement is the next prerequisite for automatic dispatch. No user scripts
+or stores were used. Counts remain 16 implemented, five partial and 20 not started;
+macOS remains unavailable.

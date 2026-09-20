@@ -56,3 +56,23 @@ fn bounded_burst_reports_observed_concurrency_and_queue_delay() {
     }
     let runner=Arc::new(Load{active:AtomicUsize::new(0),peak:AtomicUsize::new(0)});let mut bounds=limits();bounds.workers=[4,1];bounds.outstanding=[32,1];let pool=Executor::new(bounds,runner.clone()).unwrap();let tickets=(0..32).map(|i|pool.submit(fake_request(&format!("op-{i}"),&format!("project-{}",i%8),&format!("host-{}",i%8),"load")).unwrap()).collect::<Vec<_>>();for ticket in tickets {assert!(ticket.recv_timeout(Duration::from_secs(2)).unwrap().result.unwrap().success());}assert!(pool.stop(Duration::from_secs(1)));let metrics=pool.metrics();assert_eq!(metrics.completed,[32,0]);assert!(metrics.high_water[0]<=32);assert!(metrics.max_queue_delay>Duration::ZERO);assert!((1..=4).contains(&runner.peak.load(Ordering::SeqCst)));assert_eq!(runner.active.load(Ordering::SeqCst),0);
 }
+
+#[test]
+fn absolute_deadline_survives_delay_between_worker_and_process_entry() {
+    struct Delayed {expected:Instant}
+    impl Runner for Delayed {
+        fn run(&self,cmd:&Cmd)->Result<Output> {
+            assert_eq!(cmd.deadline,Some(self.expected));
+            std::thread::sleep(Duration::from_millis(250));
+            RealRunner.run(cmd)
+        }
+        fn socket_request(&self,_:&std::path::Path,_:&str,_:Duration)->Result<String>{unreachable!()}
+    }
+    let dir=tempfile::tempdir().unwrap();let end=Instant::now()+Duration::from_millis(150);
+    let pool=Executor::new(limits(),Arc::new(Delayed{expected:end})).unwrap();
+    let mut work=request("absolute","project","local",Lane::Control,"touch marker");
+    work.command.cwd=Some(dir.path().to_path_buf());work.command.deadline=Some(end);
+    let completion=pool.submit(work).unwrap().recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(completion.runner_entered);assert!(completion.result.unwrap().timed_out);
+    assert!(!dir.path().join("marker").exists());assert!(pool.stop(Duration::from_secs(1)));
+}

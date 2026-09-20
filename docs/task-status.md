@@ -77,7 +77,10 @@ Explicit Linux execution now records typed cleanup receipts and output inbox ite
 atomically, releasing overlap only after verified namespace cleanup. The ticker now
 records due occurrences in rotating bounded turns, preserving routine-only liveness
 and isolating invalid scripts. Automatic dispatch and asynchronous command ownership
-remain unavailable.
+remain unavailable. The routine queue bridge now validates operation revisions,
+absolute deadlines and cancellation at worker entry and commits through the trusted
+execution service. Root-wide ownership must be refined before ticker admission;
+available control workers alone do not prove unrelated guarded status can progress.
 The [scheduler/executor/profile interfaces](adr/0004-w04-scheduling-contract.md) are frozen. Existing retained/adopted attempts
 must count toward the cap; no uncertain worker may be replaced to free a slot.
 
