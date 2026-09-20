@@ -297,7 +297,7 @@ pub fn nudge_at(project: &Project, state: &mut State, settings: &Settings, herdr
 /// Step 2, every two minutes.
 pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &mut Memory, now: jiff::Timestamp) -> Vec<anyhow::Error> {
     if project.status() != project::Status::Active { return Vec::new(); }
-    let mut errors = recovery::retry_finalizations(ctx, project, state, now);
+    let mut errors = recovery::retry_finalizations_queued(ctx, project, state, now,memory.copy_jobs.as_mut());
     errors.extend(recovery::flush_events(project, state, now));
     if thread::seconds_since(&state.last_pr_check, now) < PR_INTERVAL_SECS && !state.last_pr_check.is_empty() {
         return errors;
@@ -393,7 +393,7 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
     }
     if pending_read {state.last_pr_check=previous_check;}
     errors.extend(recovery::flush_events(project, state, now));
-    errors.extend(recovery::retry_finalizations(ctx, project, state, now));
+    errors.extend(recovery::retry_finalizations_queued(ctx, project, state, now,memory.copy_jobs.as_mut()));
     errors.extend(recovery::flush_events(project, state, now));
     errors
 }
@@ -420,7 +420,11 @@ fn resolve_after_copy(ctx: &Ctx, project: &Project, t: &Thread, reason: &str) ->
 /// Step 4. Measured from the later of the last state change, the last report
 /// change and the time this ticker process started, so a ticker that was down
 /// for a week does not resolve everything at once.
+#[cfg(test)]
 pub fn auto_resolve(ctx: &Ctx, project: &Project, settings: &Settings, memory: &Memory, state: &State, now: jiff::Timestamp) -> Vec<anyhow::Error> {
+    auto_resolve_queued(ctx,project,settings,memory.started,state,now,None)
+}
+pub fn auto_resolve_queued(ctx:&Ctx,project:&Project,settings:&Settings,started:jiff::Timestamp,state:&State,now:jiff::Timestamp,mut copies:Option<&mut crate::copy_jobs::Queue>)->Vec<anyhow::Error> {
     let mut errors = Vec::new();
     let limit = i64::from(settings.auto_resolve_days) * 86_400;
     if limit == 0 {
@@ -433,11 +437,18 @@ pub fn auto_resolve(ctx: &Ctx, project: &Project, settings: &Settings, memory: &
         // The later of the three reference times is the smallest elapsed time.
         // A thread with neither timestamp has no clock to measure from.
         let elapsed = |stamp: &str| stamp.parse::<jiff::Timestamp>().ok().map(|then| now.as_second() - then.as_second());
-        let since_ticker_start = now.as_second() - memory.started.as_second();
+        let since_ticker_start = now.as_second() - started.as_second();
         let Some(since_thread) = [elapsed(&t.last_state_change), elapsed(&t.last_report_change)].into_iter().flatten().min() else {
             continue;
         };
         if since_thread.min(since_ticker_start) < limit {
+            continue;
+        }
+        if let Some(queue)=copies.as_deref_mut() {
+            if thread::copy_delivery::ready(&t).is_ok() {
+                let purpose=herdr_projects::final_copy_intent::Purpose::Idle{days:settings.auto_resolve_days,started:started.to_string(),last_state_change:t.last_state_change.clone(),last_report_change:t.last_report_change.clone()};
+                errors.extend(queue.offer_final(ctx,project,&t,None,purpose,format!("idle-{}-{}",thread::execution_fingerprint(&t),t.final_copy_sequence)).err());
+            }
             continue;
         }
         match resolve_after_copy(ctx, project, &t, "auto") {

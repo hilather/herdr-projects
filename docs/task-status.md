@@ -69,8 +69,9 @@ retain stages and atomically commit copy/resolution decisions with replayable no
 Idle eligibility is checked against the copied report, and merged eligibility
 against its PR header. The supervised worker can execute and recover final copies;
 idle resolution also requires fresh session-bound agent/pane observations.
-Automatic idle/merged-PR worker admission and remaining
-terminal effects still need isolation. T04.3 now fences legacy
+Automatic Linux idle/merged-PR admission now shares the bounded background
+queue, with retained recovery before session checks and durable notice replay.
+Remaining terminal effects still need isolation. T04.3 now fences legacy
 launch arguments by explicit agent kind and provides redacted [named profile inspection](profiles.md);
 explicit local version probes for Claude/Codex are available. Launch selection,
 production profile resolution and verified capability evidence remain. Version-2

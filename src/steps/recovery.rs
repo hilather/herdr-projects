@@ -216,9 +216,33 @@ fn current(t: &Thread, pending: &PendingFinalization) -> bool {
 }
 
 fn report_matches(project: &Project, id: &str, url: &str) -> Result<bool> {
-    let report = std::fs::read_to_string(thread::home_report_path(project, id))?;
+    let report = crate::paths::read_control_text(&thread::home_report_path(project,id),50*1024*1024)?.context("home report missing")?;
     let found = pr::pr_line(&report).map_err(anyhow::Error::msg)?;
     Ok(found.as_deref() == Some(url))
+}
+
+pub(super) fn retry_finalizations_queued(ctx:&Ctx,project:&Project,state:&mut State,now:jiff::Timestamp,copies:Option<&mut crate::copy_jobs::Queue>)->Vec<anyhow::Error> {
+    let Some(queue)=copies else {return retry_finalizations(ctx,project,state,now);};
+    if project.status()!=project::Status::Active{return Vec::new();}
+    let mut errors=Vec::new();
+    for (id,mut pending) in state.finalizations.clone() {
+        let result=(||->Result<()> {
+            let record=thread::load(project,&id)?;
+            if let Some(intent)=&record.pending_final_copy {
+                return queue.offer_final(ctx,project,&record,None,intent.purpose.clone(),intent.operation.clone());
+            }
+            if !current(&record,&pending)||!report_matches(project,&id,&pending.pr)? {
+                if record.status==Status::Open&&record.pr==pending.pr {thread::update_checked(project,&id,|t|{if t.pr==pending.pr {t.suppressed_merged_pr=pending.pr.clone();}Ok(())})?;}
+                state.finalizations.remove(&id);save_state(project,state)?;return Ok(());
+            }
+            if !pending.retry.due(now)||thread::copy_delivery::ready(&record).is_err(){return Ok(());}
+            pending.retry.reserve(now,&pending.operation_id);pending.retry.last_error="final copy offered; outcome not yet recorded".into();
+            state.finalizations.insert(id.clone(),pending.clone());save_state(project,state)?;
+            queue.offer_final(ctx,project,&record,None,herdr_projects::final_copy_intent::Purpose::Merged{pr:pending.pr.clone()},pending.operation_id.clone())
+        })();
+        if let Err(error)=result {if let Some(pending)=state.finalizations.get_mut(&id){pending.retry.failed(&error);}errors.push(error);errors.extend(save_state(project,state).err());}
+    }
+    errors
 }
 
 pub(super) fn retry_finalizations(ctx: &Ctx, project: &Project, state: &mut State, now: jiff::Timestamp) -> Vec<anyhow::Error> {

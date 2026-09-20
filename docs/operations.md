@@ -129,15 +129,21 @@ but before recording confirmation can cause a repeated notification or nudge.
 ## Merged pull request recovery
 
 The ticker saves final-copy intent before copying a merged thread's report and
-library. Failed copies leave the thread open and retry with the same bounded
-backoff, independently of GitHub polling and across restarts. A paused project
-waits until resumed. Reopening or restarting a thread invalidates the old intent
+library. On Linux, idle and merged final copies use the shared bounded background
+queue. Retained projections are offered before session checks; automatic brief
+prompts and agent starts wait until pending projections finish. Idle resolution
+also requires fresh, unambiguous observations from the recorded session. Missing
+or changed eligibility can finish the copy while leaving the thread open. Failed
+copies leave the thread open and retry with bounded backoff, independently of GitHub polling and across restarts. A paused project
+waits until resumed. A retained projection must finish before reopen or restart.
+Outside a pending projection, reopening or restarting invalidates the old retry
 and prevents the same merged PR from immediately closing it again; a new PR can
 be followed normally. Changed execution identity is checked before and after
 copying. Finalization never removes the worktree.
 
 Existing partial-copy policy remains: skipped symlinks or an oversized library
-may resolve the thread, with a durable `copy` warning in the inbox. Failed copies
+may resolve the thread, with a durable inbox warning (included in the finalization
+notice for background copies). Failed copies
 do not resolve it. Content checksums prevent stale equal-size/equal-mtime library transfers.
 On Linux, background live copies use the shared bounded executor and a surviving
 process supervisor. Local copies invoke this binary's native artifact sender. Remote

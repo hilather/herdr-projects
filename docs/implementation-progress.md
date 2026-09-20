@@ -1648,3 +1648,42 @@ contracts). Default-feature tests pass (30 library, 310 binary, 14 CLI, two
 contracts); three optional live checks remain ignored. Logs:
 `/tmp/herdr-final-worker-{debug,release}-final.log` and
 `/tmp/herdr-final-worker-default.log`.
+
+
+## W04 automatic final-copy admission
+
+Production Linux ticker passes now offer idle and merged-PR final copies to the
+existing bounded background queue. Final copies share project/thread rotation,
+capacity, cooldowns and canonical-routine alternation with live copies and legacy
+routines. Queue completions remain bookkeeping only; the supervised worker owns
+copy receipts, preservation evidence, resolution and its durable notice. Fresh
+remote final requests resolve routing inside supervised ingress and freeze that
+authority before publication.
+
+Merged retry records remain durable until a later ticker pass observes completion
+or invalidation. Retained final projections are discovered before session checks
+and can recover without the original source/helper; notice delivery also precedes
+session reachability checks. New review readiness includes outstanding final-copy
+offers, and pending final projection prevents competing source-copy work.
+Independent review caught automatic prompts/starts running before recovery; both
+now skip pending live or final projections while status observation continues.
+
+The built-binary CLI fixture passed: actual ticker admission and native transport
+produce a merged resolution, immutable snapshot and copy receipt, then restart
+drains the retry record and delivers one final notice without another sequence.
+Focused tests also cover idle offer-only behavior, forged queue success, durable
+merged retry reconciliation, source/session-independent retained recovery, and
+retained merged intent excluding brief prompts and agent starts. Independent review
+approved the integration and independently passed recovery and terminal-exclusion
+fixtures.
+
+Remaining terminal-effect isolation, abandoned staging inventory cleanup, canonical
+launch/profile integration, telemetry/usage and broader authority coverage remain
+open in W04. This does not close T04.2 or external platform acceptance. Counts
+remain 16 locally implemented, five partial and 20 not started; macOS and actual
+remote-host acceptance remain untested.
+
+All 566 tests pass in debug and release (167 library, 363 binary, 34 CLI, two
+contracts). Default-feature tests pass (30 library, 314 binary, 15 CLI, two
+contracts); three optional live checks remain ignored. Logs:
+`/tmp/herdr-final-admission-{debug,release,default}.log`.

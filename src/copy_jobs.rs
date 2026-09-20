@@ -29,7 +29,7 @@ impl Input {
     fn validate(&self)->Result<()> {
         ensure!(self.project.is_absolute()&&self.config.is_absolute(),"copy paths must be absolute");
         thread::validate_id(&self.id)?;
-        ensure!(!self.herdr.is_empty()&&!self.helper.is_empty()&&(if self.machine.is_empty(){self.target.is_none()}else{self.target.is_some()||self.pending.is_some()||self.finalization.as_ref().is_some_and(|f|f.pending.is_some())}),"invalid live-copy route");
+        ensure!(!self.herdr.is_empty()&&!self.helper.is_empty()&&(if self.machine.is_empty(){self.target.is_none()}else{self.target.is_some()||self.pending.is_some()||self.finalization.is_some()}),"invalid live-copy route");
         ensure!(self.execution.len()==64&&self.execution.bytes().all(|b|b.is_ascii_hexdigit()),"invalid live-copy execution");
         if let Some(receipt)=&self.previous_receipt {receipt.validate()?;}
         if let Some(intent)=&self.pending {intent.validate()?;}
@@ -152,7 +152,7 @@ fn execute(input:&Input,control:&Control,helpers:&Helpers)->Result<()> {
     let expected=input.current(&project,&guard,control)?;
     let resolved;
     let input=if !input.machine.is_empty()&&input.target.is_none() {
-        ensure!(input.pending.is_some()||input.finalization.as_ref().is_some_and(|f|f.pending.is_some()),"unobserved route requires retained recovery intent");
+        ensure!(input.pending.is_some()||input.finalization.is_some(),"unobserved route requires final-copy work or retained recovery intent");
         resolved={let mut value=input.clone();value.target=Some(input.resolve_target(control,&locks)?);value};&resolved
     }else{input};
     let authority=input.authority()?;input.authorize(control,&locks)?;
@@ -207,7 +207,6 @@ impl Runner for JobRunner {
 pub fn request(ctx:&Ctx<'_>,project:&Project,expected:&Thread,target:Option<&str>)->Result<Request> {
     request_inner(ctx,project,expected,target,None)
 }
-#[allow(dead_code)] // Ticker admission follows worker review.
 pub fn request_final(ctx:&Ctx<'_>,project:&Project,expected:&Thread,target:Option<&str>,purpose:Purpose,operation:String)->Result<Request> {
     let socket=if matches!(purpose,Purpose::Idle{..}) {Some(session(project)?)}else{None};
     request_inner(ctx,project,expected,target,Some(Finalization{sequence:expected.final_copy_sequence,pending:expected.pending_final_copy.clone(),purpose,operation,socket}))
@@ -457,6 +456,24 @@ mod tests {
         while thread::load(&project,&t.id).unwrap().pending_live_copy.is_some(){assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(5));}
         assert_eq!(fs::read(thread::home_report_path(&project,&t.id)).unwrap(),b"new\0\xff");
         assert!(pool.stop(Duration::from_secs(1)));assert!(memory.copy_jobs.as_mut().unwrap().drain().is_empty());
+    }
+    #[test]
+    fn ticker_admits_final_recovery_without_source_or_reachable_session() {
+        let(root,project,t,input,helpers)=final_fixture();let authority=input.authority().unwrap();
+        let guard=ProjectGuard::acquire(&project.dir()).unwrap();let staged=live::receive(&project,&root.path().join("archive")).unwrap();let f=input.finalization.as_ref().unwrap();
+        staged.begin_final_controlled(&project,&guard,&t,&authority,&f.operation,f.purpose.clone(),&Control::default(),||Ok(true)).unwrap();drop(guard);
+        fs::remove_dir_all(&t.thread_dir).unwrap();fs::remove_file(&helpers.local).unwrap();
+        let env=paths::Env::for_test(root.path(),&[("HERDR_BIN_PATH",&input.herdr)]);let runner=crate::runner::RealRunner;
+        let ctx=Ctx{env:&env,root:root.path().into(),config_dir:root.path().join("cfg"),runner:&runner,detached_ticker:false};
+        let pool=Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),Arc::new(JobRunner{inner:Arc::new(crate::runner::RealRunner)})).unwrap());
+        let mut memory=crate::steps::Memory::new(&ctx);memory.copy_jobs=Some(Queue::new(pool.clone()));
+        assert!(crate::ticker::tick_for_test(&ctx,&mut memory));assert!(memory.copy_jobs.as_ref().unwrap().pending());
+        let deadline=Instant::now()+Duration::from_secs(5);
+        while thread::load(&project,&t.id).unwrap().pending_final_copy.is_some(){assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(5));}
+        assert_eq!(thread::load(&project,&t.id).unwrap().status,thread::Status::Resolved);
+        assert!(pool.stop(Duration::from_secs(1)));assert!(memory.copy_jobs.as_mut().unwrap().drain().is_empty());
+        crate::ticker::tick_for_test(&ctx,&mut memory);
+        assert!(thread::load(&project,&t.id).unwrap().pending_final_notice.is_none());
     }
     fn remote(root:&Path,project:&Project,t:&Thread,input:&mut Input,helpers:&Helpers,probe:&str) {
         thread::update(project,&t.id,|t|t.machine="box".into()).unwrap();let current=thread::load(project,&t.id).unwrap();input.execution=thread::execution_fingerprint(&current);input.machine="box".into();input.target=Some("user@box".into());

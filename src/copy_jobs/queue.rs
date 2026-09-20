@@ -11,8 +11,10 @@ impl Queue {
     pub fn new(executor:Arc<crate::executor::Executor>)->Self {Self{executor,entries:BTreeMap::new(),pending:None,sequence:0,cursor:crate::fair_admission::Cursor::default()}}
     pub fn pending(&self)->bool {self.pending.is_some()}
     pub fn outstanding(&self,project:&Project,id:&str)->bool {
-        let key=(project.canonical_dir().display().to_string(),format!("live-copy:{id}"));
-        self.pending.as_ref().is_some_and(|p|p.key==key)||self.entries.get(&key).is_some_and(|e|e.needed)
+        ["live-copy","final-copy"].iter().any(|kind|{
+            let key=(project.canonical_dir().display().to_string(),format!("{kind}:{id}"));
+            self.pending.as_ref().is_some_and(|p|p.key==key)||self.entries.get(&key).is_some_and(|e|e.needed)
+        })
     }
     pub fn clear(&mut self,project:&Project,id:&str) {
         let key=(project.canonical_dir().display().to_string(),format!("live-copy:{id}"));
@@ -29,6 +31,9 @@ impl Queue {
     }
     pub fn offer(&mut self,ctx:&Ctx<'_>,project:&Project,t:&Thread,target:Option<&str>)->Result<()> {
         self.offer_request(request(ctx,project,t,target)?)
+    }
+    pub fn offer_final(&mut self,ctx:&Ctx,project:&Project,t:&Thread,target:Option<&str>,purpose:Purpose,operation:String)->Result<()> {
+        self.offer_request(request_final(ctx,project,t,target,purpose,operation)?)
     }
     pub fn offer_routine(&mut self,ctx:&Ctx,project:&Project,routine:&crate::routine::Routine,previous:&str,occurrence:&str)->Result<()> {
         self.offer_request(crate::legacy_routine_jobs::request(ctx,project,routine,previous,occurrence)?)

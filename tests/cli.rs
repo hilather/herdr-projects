@@ -676,3 +676,48 @@ fn native_ticker_claims_legacy_routine_and_restart_delivers_without_rerun() {
     assert_eq!(fs::read(project.join("executions")).unwrap(),b"run");
     let items=fs::read_dir(project.join("inbox")).unwrap().filter_map(Result::ok).filter_map(|entry|fs::read_to_string(entry.path()).ok()).filter(|text|text.contains("routine-result")).count();assert_eq!(items,1);
 }
+
+#[cfg(target_os="linux")]
+#[test]
+fn ticker_native_merged_finalization_resolves_and_replays_notice_after_restart() {
+    use std::{fs,time::{Duration,Instant},process::Stdio,os::unix::fs::PermissionsExt};
+    use sha2::{Digest,Sha256};
+    let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
+    assert!(hp(home.path(),&["--root",r,"new","demo"]).status.success());let project=root.join("demo");
+    let source=home.path().join("source '$λ");fs::create_dir_all(source.join("library/empty")).unwrap();
+    fs::write(source.join("report.md"),b"PR: https://github.com/example/repo/pull/1\ncomplete\n").unwrap();fs::write(source.join("library/item"),b"binary\0\xff").unwrap();
+    let hash=format!("{:x}",Sha256::digest(b"PR: https://github.com/example/repo/pull/1\ncomplete\n"));
+    let socket=home.path().join("session.sock");fs::write(&socket,b"").unwrap();
+    fs::write(project.join(".state/coordinator.json"),serde_json::to_vec(&serde_json::json!({"socket":socket,"workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p1","agent_name":"coordinator","cwd":project})).unwrap()).unwrap();
+    let record=project.join("threads/t-0001.toml");
+    fs::write(&record,toml::to_string(&serde_json::json!({"id":"t-0001","status":"open","kind":"adopted","thread_dir":source,"cwd":source,"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1","agent":"claude","agent_name":"worker","title":"Fixture","created":jiff::Timestamp::now().to_string()})).unwrap()).unwrap();
+    fs::write(home.path().join("agents.json"),serde_json::to_vec(&serde_json::json!({"result":{"agents":[{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1","cwd":source,"name":"worker","agent":"claude","agent_status":"idle"}]}})).unwrap()).unwrap();
+    fs::write(home.path().join("panes.json"),serde_json::to_vec(&serde_json::json!({"result":{"panes":[{"workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p1","cwd":project},{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1","cwd":source}]}})).unwrap()).unwrap();
+    let fake=home.path().join("herdr");fs::write(&fake,b"#!/bin/sh\ncase \"$1 $2\" in\n'agent list') /bin/cat \"$HOME/agents.json\";;\n'pane list') echo poll >> \"$HOME/polls\"; /bin/cat \"$HOME/panes.json\";;\n*) echo '{\"result\":{\"shown\":true}}';;\nesac\n").unwrap();fs::set_permissions(&fake,fs::Permissions::from_mode(0o700)).unwrap();
+    struct Child(std::process::Child);
+    impl Drop for Child {fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+    let spawn=||Child(Command::new(BIN).env_clear().env("HOME",home.path()).env("PATH","/usr/bin:/bin").env("HERDR_BIN_PATH",&fake).args(["--root",r,"ticker","run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let read=||->toml::Value {toml::from_str(&fs::read_to_string(&record).unwrap()).unwrap()};
+    let wait=|child:&mut Child,predicate:&dyn Fn()->bool| {
+        let deadline=Instant::now()+Duration::from_secs(45);
+        while !predicate(){assert!(child.0.try_wait().unwrap().is_none(),"ticker exited");assert!(Instant::now()<deadline,"ticker log: {}",fs::read_to_string(root.join(".ticker.log")).unwrap_or_default());std::thread::sleep(Duration::from_millis(10));}
+    };
+    let stop=|child:&mut Child| {
+        fs::write(root.join(".ticker.stop"),b"").unwrap();let deadline=Instant::now()+Duration::from_secs(5);
+        loop {if let Some(status)=child.0.try_wait().unwrap(){assert!(status.success());break;}assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(10));}
+        fs::remove_file(root.join(".ticker.stop")).unwrap();
+    };
+    let url="https://github.com/example/repo/pull/1";
+    let mut saved=read();let table=saved.as_table_mut().unwrap();
+    for (key,value) in [("pr",url),("pr_state","MERGED"),("report_hash",hash.as_str()),("acked_report_hash",hash.as_str()),("last_review_item_hash",hash.as_str()),("last_state","idle"),("last_group","idle")] {table.insert(key.into(),toml::Value::String(value.into()));}
+    fs::write(&record,toml::to_string(&saved).unwrap()).unwrap();fs::write(project.join("threads/t-0001.md"),fs::read(source.join("report.md")).unwrap()).unwrap();
+    let fingerprint=format!("{:x}",Sha256::digest(serde_json::json!(["t-0001",saved["created"].as_str().unwrap(),0,"adopted","","","","","",source,"w2","w2:t1","w2:p1","claude","worker",source,url]).to_string().as_bytes()));
+    fs::write(project.join(".state/ticker.json"),serde_json::to_vec(&serde_json::json!({"last_pr_check":jiff::Timestamp::now().to_string(),"finalizations":{"t-0001":{"operation_id":format!("merged-{fingerprint}"),"fingerprint":fingerprint,"pr":url,"reason":"merged"}}})).unwrap()).unwrap();
+    let mut child=spawn();wait(&mut child,&||read()["status"].as_str()==Some("resolved"));stop(&mut child);
+    assert_eq!(read()["resolved_reason"].as_str(),Some("merged"));assert_eq!(read()["final_copy_sequence"].as_integer(),Some(1));assert!(read().get("pending_final_copy").is_none());
+    assert!(!read()["artifact_snapshot"].as_str().unwrap().is_empty());assert_eq!(read()["copy_receipt"]["sequence"].as_integer(),Some(1));
+    assert_eq!(fs::read(project.join("library/t-0001/item")).unwrap(),b"binary\0\xff");
+    let mut child=spawn();wait(&mut child,&||read().get("pending_final_notice").is_none()&&serde_json::from_slice::<serde_json::Value>(&fs::read(project.join(".state/ticker.json")).unwrap()).unwrap()["finalizations"].as_object().is_some_and(|v|v.is_empty()));stop(&mut child);
+    assert_eq!(read()["final_copy_sequence"].as_integer(),Some(1));
+    assert_eq!(fs::read_dir(project.join("inbox")).unwrap().filter_map(|e|e.ok()).filter(|e|e.file_name().to_string_lossy().starts_with("final-")).count(),1);
+}

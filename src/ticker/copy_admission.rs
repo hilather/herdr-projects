@@ -79,3 +79,36 @@ fn canonical_effects_get_their_turn_before_copy_admission() {
     assert_eq!(runtime::snapshot(&path).unwrap().deliveries.iter().find(|d|d.operation==operation.id).unwrap().state,DeliveryState::Confirmed);
     assert!(memory.copy_jobs.as_ref().unwrap().pending());assert!(pool.stop(Duration::from_secs(1)));
 }
+
+#[test]
+fn idle_finalization_is_offered_without_synchronous_copy_or_forged_resolution() {
+    let world=crate::scenarios::World::new();let project=world.project("demo","session.sock");
+    let t=world.thread(&project,world.home.path(),|t|{t.last_group=thread::Group::Idle.token().into();t.last_state_change="2020-01-01T00:00:00Z".into();t.last_report_change=t.last_state_change.clone();});
+    let pool=Arc::new(Executor::new(Limits::default(),Arc::new(Immediate)).unwrap());let ctx=world.ctx();let mut memory=Memory::new(&ctx);memory.copy_jobs=Some(crate::copy_jobs::Queue::new(pool.clone()));
+    let settings=project.read_project_md().unwrap().0;let started="2020-01-01T00:00:00Z".parse().unwrap();
+    assert!(steps::auto_resolve_queued(&ctx,&project,&settings,started,&steps::State::default(),jiff::Timestamp::now(),memory.copy_jobs.as_mut()).is_empty());
+    assert!(memory.copy_jobs.as_ref().unwrap().outstanding(&project,&t.id));assert_eq!(pool.metrics().high_water[1],0);
+    assert_eq!(thread::load(&project,&t.id).unwrap(),t);
+    memory.copy_jobs.as_mut().unwrap().admit();drain(&mut memory);
+    assert_eq!(thread::load(&project,&t.id).unwrap(),t,"queue success cannot resolve or certify copy");
+    assert_eq!(world.runner.count("rsync"),0);assert!(pool.stop(Duration::from_secs(1)));
+}
+
+#[test]
+fn retained_merged_projection_blocks_brief_prompts_and_agent_starts() {
+    let world=crate::scenarios::World::new();let project=world.project("demo","session.sock");let url="https://github.com/example/repo/pull/1";
+    let t=world.thread(&project,world.home.path(),|t|{t.prompt_pending=true;t.pr=url.into();t.pr_state="MERGED".into();});
+    std::fs::create_dir_all(&t.thread_dir).unwrap();let report=format!("PR: {url}\ncomplete\n");
+    std::fs::write(Path::new(&t.thread_dir).join("report.md"),&report).unwrap();std::fs::write(thread::home_report_path(&project,&t.id),&report).unwrap();
+    let archive=world.home.path().join("final-stream");let mut bytes=Vec::new();crate::artifacts::live::export(Path::new(&t.thread_dir),&mut bytes).unwrap();std::fs::write(&archive,bytes).unwrap();
+    let guard=herdr_projects::execution_guard::ProjectGuard::acquire(&project.dir()).unwrap();
+    crate::artifacts::live::receive(&project,&archive).unwrap().begin_final_controlled(&project,&guard,&t,&"a".repeat(64),"merged-fixture",herdr_projects::final_copy_intent::Purpose::Merged{pr:url.into()},&crate::source_tree::Control::default(),||Ok(true)).unwrap();drop(guard);
+    let ctx=world.ctx();let herdr=Herdr::new(ctx.env.herdr_bin(),"session.sock",ctx.runner);let current=thread::load(&project,&t.id).unwrap();
+    let agent=Agent{pane_id:t.pane_id.clone(),workspace_id:t.workspace_id.clone(),tab_id:t.tab_id.clone(),cwd:t.cwd.clone(),name:t.agent_name.clone(),agent_status:"idle".into(),..Default::default()};
+    let pane=Pane{pane_id:t.pane_id.clone(),workspace_id:t.workspace_id.clone(),tab_id:t.tab_id.clone(),cwd:t.cwd.clone()};
+    thread_pass(&project,&herdr,&[current],&[agent],&[pane.clone()],Some(&std::collections::BTreeMap::new())).unwrap();
+    let current=thread::load(&project,&t.id).unwrap();let mut errors=Vec::new();let mut may_start=true;
+    launch_pass(&ctx,&project,&herdr,&[current],&[],&[pane],&mut may_start,&mut errors);
+    assert!(errors.is_empty());assert_eq!(world.runner.count("agent prompt"),0);assert_eq!(world.runner.count("agent start"),0);
+    let current=thread::load(&project,&t.id).unwrap();assert!(current.prompt_pending);assert!(current.pending_final_copy.is_some());assert_eq!(current.launch_attempts,t.launch_attempts);
+}

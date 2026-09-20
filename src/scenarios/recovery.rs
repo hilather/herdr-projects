@@ -270,3 +270,22 @@ fn unsupported_remote_helper_blocks_until_explicit_finalization_retry() {
     assert!(poll(&world, &project, later(now(), 86_401)).is_empty());
     assert!(steps::load_state(&project).finalizations.is_empty());
 }
+
+#[test]
+fn merged_finalization_queue_keeps_durable_retry_until_worker_commits() {
+    use std::sync::Arc;
+    let(world,project)=copy_fixture();let ctx=world.ctx();
+    let pool=Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),Arc::new(crate::runner::RealRunner)).unwrap());
+    let mut memory=Memory::new(&ctx);memory.copy_jobs=Some(crate::copy_jobs::Queue::new(pool.clone()));
+    let mut state=State::default();
+    assert!(steps::pull_requests(&ctx,&project,&mut state,&mut memory,now()).is_empty());
+    assert_eq!(world.runner.count("rsync"),0);assert_eq!(thread::load(&project,"t-0001").unwrap().status,Status::Open);
+    let pending=steps::load_state(&project).finalizations["t-0001"].clone();assert_eq!(pending.retry.attempts,1);
+    assert!(memory.copy_jobs.as_ref().unwrap().outstanding(&project,"t-0001"));assert_eq!(pool.metrics().high_water[1],0);
+    // Simulate the worker's durable commit before a ticker restart.
+    thread::update(&project,"t-0001",|t|{t.status=Status::Resolved;t.last_finalization=pending.operation_id;}).unwrap();
+    let mut restarted=steps::load_state(&project);
+    assert!(steps::pull_requests(&ctx,&project,&mut restarted,&mut memory,later(now(),1)).is_empty());
+    assert!(steps::load_state(&project).finalizations.is_empty());assert_eq!(world.runner.count("rsync"),0);
+    assert!(pool.stop(std::time::Duration::from_secs(1)));
+}

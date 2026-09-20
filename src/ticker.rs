@@ -322,6 +322,11 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
             // re-resolves remote routing and checks retained authority itself.
             let (threads,diagnostics)=thread::list_with_diagnostics(&project);
             for error in diagnostics {log.line(&format!("{slug}: {error}"));}
+            for t in &threads {
+                if let Some(intent)=&t.pending_final_copy {
+                    if let Err(error)=queue.offer_final(ctx,&project,t,None,intent.purpose.clone(),intent.operation.clone()){log.line(&format!("{slug}: final-copy recovery: {error:#}"));}
+                }
+            }
             for t in threads.iter().filter(|t|t.pending_live_copy.is_some()) {
                 if let Err(error)=queue.offer(ctx,&project,t,None){log.line(&format!("{slug}: copy recovery: {error:#}"));}
             }
@@ -462,7 +467,7 @@ fn thread_pass(project: &Project, herdr: &Herdr, threads: &[thread::Thread], age
         }
 
         let mut delivered = false;
-        if t.prompt_pending && live.agent_state.as_deref().is_some_and(crate::herdr::ready_state) {
+        if t.pending_live_copy.is_none()&&t.pending_final_copy.is_none()&&t.prompt_pending && live.agent_state.as_deref().is_some_and(crate::herdr::ready_state) {
             match herdr.agent_prompt(&t.pane_id, &thread::launch_prompt(slug, &t.id)) {
                 Ok(()) => delivered = true,
                 Err(error) => pass.error = pass.error.or(Some(anyhow::anyhow!("{}: brief prompt: {error}", t.id))),
@@ -511,6 +516,7 @@ fn thread_pass(project: &Project, herdr: &Herdr, threads: &[thread::Thread], age
 fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::Thread], agents: &[Agent], panes: &[Pane], may_start: &mut bool, errors: &mut Vec<anyhow::Error>) {
     let now = jiff::Timestamp::now();
     for t in threads {
+        if t.pending_live_copy.is_some()||t.pending_final_copy.is_some(){continue;}
         if t.status != thread::Status::Open || !t.prompt_pending {
             continue;
         }
@@ -610,7 +616,7 @@ fn tick_cheap_reports(ctx: &Ctx, project: &Project,mut reads:Option<&mut crate::
 
     let local=open_threads(project,false);let mut reports=std::collections::BTreeMap::new();let mut report_errors=Vec::new();
     if let Some(reads)=reads.as_mut() {
-        for t in local.iter().filter(|t|t.status==thread::Status::Open&&t.pending_live_copy.is_none()) {
+        for t in local.iter().filter(|t|t.status==thread::Status::Open&&t.pending_live_copy.is_none()&&t.pending_final_copy.is_none()) {
             match reads.poll(project,t) {
                 Ok(crate::local_reports::Poll::Ready(sample))=>{reports.insert(t.id.clone(),sample);},
                 Ok(crate::local_reports::Poll::Pending)=>{},
@@ -687,6 +693,7 @@ fn apply_remote(ctx:&Ctx,project:&Project,herdr:&Herdr,machine:&str,threads:&[th
 
     for t in threads.iter().filter(|t| t.status == thread::Status::Open) {
         observed.insert(t.id.clone());
+        if t.pending_final_copy.is_some() {deferred.insert(t.id.clone());continue;}
         let changed=hashes.get(&t.id).is_some_and(|h|*h!=t.report_hash);
         if let Some(queue)=copies.as_deref_mut() {
             if changed||t.pending_live_copy.is_some() {
@@ -745,6 +752,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     // Local threads: copy home when the report changed, then launches.
     let local = open_threads(project, false);
     for t in local.iter().filter(|t| t.status == thread::Status::Open) {
+        if t.pending_final_copy.is_some() {deferred.insert(t.id.clone());continue;}
         if t.pending_live_copy.is_some()&&let Some(queue)=memory.copy_jobs.as_mut() {
             deferred.insert(t.id.clone());errors.extend(queue.offer(ctx,project,t,None).err());continue;
         }
@@ -811,7 +819,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
         Ok((settings, _)) => {
             let commands = project.safety(&ctx.config_dir).map(|s| s.routine_commands).unwrap_or(false);
             errors.extend(steps::routines_queued(ctx, project, &mut state, commands, None, &zoned,memory.copy_jobs.as_mut()));
-            errors.extend(steps::auto_resolve(ctx, project, &settings, memory, &state, now));
+            errors.extend(steps::auto_resolve_queued(ctx, project, &settings, memory.started, &state, now,memory.copy_jobs.as_mut()));
         }
         Err(error) => {
             let text = std::fs::read(project.project_md()).unwrap_or_default();
