@@ -761,3 +761,20 @@ Validation passes all 403 tests in debug and release (96 library, 277 binary,
 28 CLI, 2 contracts). Logs: `/tmp/herdr-frozen-profile-{debug,release,lib,upgrade}.log`.
 Three optional live checks remain ignored; macOS remains unavailable. No user store
 was upgraded. Overall card counts remain 16 implemented, three partial, 22 not started.
+
+## W04 operation-scoped approval contract
+
+The new inert approval data contract binds exact version-2 launch inputs without
+circular references: the action digest excludes only the grant reference, while
+matching checks that final reference separately. Project identity comes from the
+store caller. Config/profile/binary/resource/revision changes, another project and
+expired/not-yet-valid grants fail matching. Object keys sort explicitly and a fixed
+digest fixture protects the encoding contract. Unknown actor fields and unsupported
+operation classes are refused; a parsed grant is never an authenticated credential.
+
+Independent review approved this contract. All 99 library tests pass in debug and
+release; focused approval tests additionally cover the golden digest in both modes.
+Logs: `/tmp/herdr-approval-{lib,release,golden-debug,golden-release}.log`.
+Trusted issuance, durable grant storage/revocation and atomic one-time consumption
+with operation claims remain required. Canonical dispatch remains disabled. T04.5 is
+now partial: 16 cards implemented, four partial, 21 not started (25 unfinished).

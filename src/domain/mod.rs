@@ -2,6 +2,8 @@
 use serde::{Deserialize, Serialize};
 pub(crate) mod profile;
 pub use profile::*;
+mod approval;
+pub use approval::*;
 
 macro_rules! identifier {
     ($($name:ident),+) => { $(
