@@ -1161,3 +1161,33 @@ Counts remain 16 implemented, five partial and 20 not started; macOS is unavaila
 All 471 tests pass in debug and release (162 library, 277 binary, 30 CLI, two
 contracts), and the default-feature suite passes. Three optional live checks remain
 ignored. Logs: `/tmp/herdr-transfer-supervision-{debug,release,default}.log`.
+
+## W04 bounded artifact source reads
+
+Local preservation and native stream export now traverse source directories through
+opened descriptors, refusing symlink ancestors and entries. Enumeration uses a fresh
+directory stream on every scan, checks errors separately from EOF, and bounds entry
+collection, nesting and aggregate bytes while reading. File metadata is checked before
+and after reads; exports hash the bytes actually streamed. Opened source-root identity
+is checked after verification and immediately before publication or snapshot reuse.
+The schema-1 manifest format and historical local root entry types remain compatible.
+
+Local live-report hashing and copying use the same bounded reader. Oversized or unsafe
+reports fail without replacing the last home report or advancing its copy receipt;
+slow ticker passes expose source errors instead of treating them as absent reports.
+The ten-second per-scan deadline is cooperative between filesystem calls, not a hard
+interrupt for blocked native I/O. All source ancestors must have physical path spellings;
+macOS alias handling is documented and macOS execution remains untested.
+
+Eight new regressions cover repeated enumeration, ancestor replacement, missing versus
+unsafe sources, growth during reading, limits/deadlines/cancellation, root replacement
+before publication, excessive nesting, oversized-report retry, and historical schema
+compatibility. Independent review approved after correcting historical root-shape
+compatibility and moving the final root check after all publication verification.
+
+Artifact pool integration and durable partial-copy delivery are still outstanding.
+Counts remain 16 implemented, five partial and 20 not started.
+
+All 479 tests pass in debug and release (162 library, 285 binary, 30 CLI, two
+contracts); the default-feature suite also passes. Three optional live checks remain
+ignored. Logs: `/tmp/herdr-source-tree-{debug,release,default}.log`.

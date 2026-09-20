@@ -5,6 +5,7 @@ mod routine_jobs;
 mod actions;
 mod agents;
 mod artifacts;
+mod source_tree;
 mod adopt;
 mod cli;
 mod cleanup;

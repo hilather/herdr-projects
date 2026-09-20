@@ -73,60 +73,49 @@ fn regular(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn digest(path: &Path, remaining: &mut u64, copy: Option<&Path>) -> Result<(u64, String)> {
-    let mut source = regular(path)?;
-    let mut target = copy.map(|p| OpenOptions::new().write(true).create_new(true).mode(0o600).open(p)).transpose()?;
-    let mut bytes = 0u64;
-    let mut hash = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
+fn digest(mut source:File, budget:&mut crate::source_tree::Budget, copy:Option<&Path>)->Result<(u64,String)> {
+    budget.size(&source)?;let before=source.metadata()?;
+    let mut target=copy.map(|p|OpenOptions::new().write(true).create_new(true).mode(0o600).open(p)).transpose()?;
+    let mut bytes=0u64;let mut hash=Sha256::new();let mut buffer=[0u8;64*1024];
     loop {
-        let n = source.read(&mut buffer)?;
-        if n == 0 { break; }
-        *remaining = remaining.checked_sub(n as u64).context("artifact snapshot exceeds the 50 MiB byte limit")?;
-        bytes += n as u64;
-        hash.update(&buffer[..n]);
-        if let Some(target) = &mut target { target.write_all(&buffer[..n])?; }
+        let n=budget.read(&mut source,&mut buffer)?;if n==0{break;}
+        bytes+=n as u64;hash.update(&buffer[..n]);
+        if let Some(target)=&mut target{target.write_all(&buffer[..n])?;}
     }
-    if let Some(target) = target { target.sync_all()?; }
-    Ok((bytes, hash.finalize().iter().map(|b| format!("{b:02x}")).collect()))
+    crate::source_tree::unchanged(&source,&before)?;
+    if let Some(target)=target{target.sync_all()?;}budget.check()?;
+    Ok((bytes,hash.finalize().iter().map(|b|format!("{b:02x}")).collect()))
 }
 
-fn visit(root: &Path, relative: &Path, destination: Option<&Path>, entries: &mut Vec<Entry>, remaining: &mut u64, depth: usize) -> Result<()> {
-    ensure!(depth <= 64, "artifact directory nesting exceeds 64 levels");
-    ensure!(entries.len() < ENTRY_LIMIT, "artifact snapshot exceeds {ENTRY_LIMIT} entries");
-    let path = relative.to_str().context("artifact filenames must be UTF-8")?.to_string();
-    ensure!(relative.components().all(|c| matches!(c, std::path::Component::Normal(_))), "invalid artifact path");
-    let source = root.join(relative);
-    let metadata = fs::symlink_metadata(&source)?;
-    if metadata.is_dir() {
-        if let Some(destination) = destination { fs::create_dir(destination.join(relative))?; }
-        entries.push(Entry { path, directory: true, bytes: 0, sha256: String::new() });
-        let mut children = fs::read_dir(&source)?.take(ENTRY_LIMIT + 1).collect::<std::io::Result<Vec<_>>>()?;
-        ensure!(children.len() <= ENTRY_LIMIT, "artifact directory exceeds {ENTRY_LIMIT} entries");
-        children.sort_by_key(|e| e.file_name());
-        for child in children { visit(root, &relative.join(child.file_name()), destination, entries, remaining, depth + 1)?; }
-        if let Some(destination) = destination { File::open(destination.join(relative))?.sync_all()?; }
-    } else {
-        ensure!(metadata.is_file(), "{} has an unsupported entry type", source.display());
-        let target = destination.map(|d| d.join(relative));
-        let (bytes, sha256) = digest(&source, remaining, target.as_deref())?;
-        entries.push(Entry { path, directory: false, bytes, sha256 });
+fn visit(source:File,relative:&Path,destination:Option<&Path>,entries:&mut Vec<Entry>,budget:&mut crate::source_tree::Budget,depth:usize)->Result<()> {
+    budget.entry(depth)?;
+    let path=relative.to_str().context("artifact filenames must be UTF-8")?.to_string();
+    if source.metadata()?.is_dir() {
+        let directory=crate::source_tree::Directory::from_file(source)?;
+        if let Some(destination)=destination{fs::create_dir(destination.join(relative))?;}
+        entries.push(Entry{path,directory:true,bytes:0,sha256:String::new()});
+        for name in directory.names(budget)? {visit(directory.child(&name)?,&relative.join(name),destination,entries,budget,depth+1)?;}
+        if let Some(destination)=destination{File::open(destination.join(relative))?.sync_all()?;}
+        budget.check()?;
+    }else{
+        let target=destination.map(|d|d.join(relative));
+        let(bytes,sha256)=digest(source,budget,target.as_deref())?;
+        entries.push(Entry{path,directory:false,bytes,sha256});
     }
     Ok(())
 }
-
-fn scan(root: &Path, destination: Option<&Path>) -> Result<Vec<Entry>> {
-    real_dir(root)?;
-    let mut entries = Vec::new();
-    let mut remaining = BYTE_LIMIT;
-    for name in ["report.md", "library"] {
-        match fs::symlink_metadata(root.join(name)) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e.into()),
-            Ok(_) => visit(root, Path::new(name), destination, &mut entries, &mut remaining, 0)?,
+fn scan_open(root:&crate::source_tree::Directory,destination:Option<&Path>)->Result<Vec<Entry>> {
+    let mut budget=crate::source_tree::Budget::new();let mut entries=Vec::new();
+    for name in ["report.md","library"] {
+        if let Some(source)=root.optional(std::ffi::OsStr::new(name))?{
+            visit(source,Path::new(name),destination,&mut entries,&mut budget,0)?;
         }
     }
     Ok(entries)
+}
+fn scan(root:&Path,destination:Option<&Path>)->Result<Vec<Entry>> {
+    let opened=crate::source_tree::Directory::open(root)?;
+    let entries=scan_open(&opened,destination)?;opened.matches_path(root)?;Ok(entries)
 }
 
 struct Staging(PathBuf);
@@ -147,18 +136,21 @@ fn capture_mode(project:&Project,record:&Thread,before_verify:impl FnOnce()->Res
     artifact_id(&record.id,canonical)?;
     let source = Path::new(&record.thread_dir);
     real_dir(source)?;
+    let opened=crate::source_tree::Directory::open(source)?;
     let identity = fs::canonicalize(source)?;
     let staging = staging_mode(project, record,canonical)?;
     let manifest = Manifest {
         schema: 1, thread: record.id.clone(), generation: record.lifecycle_generation,
         machine: String::new(),
         source: identity.to_str().context("artifact source path must be UTF-8")?.into(),
-        entries: scan(source, Some(&staging.0))?,
+        entries: scan_open(&opened, Some(&staging.0))?,
     };
     before_verify()?;
+    opened.matches_path(source)?;
     ensure!(manifest.entries == scan(&staging.0, None)?, "staged artifact verification failed");
     verify_source(record, &manifest)?;
-    publish_mode(project, record, staging, manifest,canonical)
+    opened.matches_path(source)?;
+    publish_mode(project, record, staging, manifest,canonical,||opened.matches_path(source))
 }
 
 fn staging(project: &Project, record: &Thread) -> Result<Staging> {staging_mode(project,record,false)}
@@ -179,8 +171,8 @@ fn staging_mode(project:&Project,record:&Thread,canonical:bool)->Result<Staging>
     Ok(staging)
 }
 
-fn publish(project:&Project,record:&Thread,staging:Staging,manifest:Manifest)->Result<Snapshot> {publish_mode(project,record,staging,manifest,false)}
-fn publish_mode(project: &Project, record: &Thread, staging: Staging, manifest: Manifest,canonical:bool) -> Result<Snapshot> {
+fn publish(project:&Project,record:&Thread,staging:Staging,manifest:Manifest)->Result<Snapshot> {publish_mode(project,record,staging,manifest,false,||Ok(()))}
+fn publish_mode(project: &Project, record: &Thread, staging: Staging, manifest: Manifest,canonical:bool,before_publish:impl FnOnce()->Result<()>) -> Result<Snapshot> {
     ensure!(scan(&staging.0, None)? == manifest.entries, "snapshot verification failed");
     let parent = staging.0.parent().context("missing snapshot parent")?;
     let bytes = serde_json::to_vec(&manifest)?;
@@ -193,11 +185,14 @@ fn publish_mode(project: &Project, record: &Thread, staging: Staging, manifest: 
     let target = parent.join(&id);
     let _lock = artifact_lock(project,canonical)?;
     real_dir(&parent)?;
-    if target.try_exists()? {
+    let exists=target.try_exists()?;
+    if exists {
         // Never overwrite a previous snapshot, including damaged evidence.
         let existing = load_mode(project, record, &id,canonical)?;
         ensure!(existing == manifest, "existing artifact snapshot differs");
-    } else {
+    }
+    before_publish()?;
+    if !exists {
         fs::rename(&staging.0, &target)?;
         File::open(&parent)?.sync_all()?;
     }

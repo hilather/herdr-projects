@@ -18,20 +18,26 @@ pub fn probe() {
 }
 
 pub fn export(path: &Path, writer: &mut impl Write) -> Result<()> {
-    real_dir(path)?;
-    let source = Source { schema: 1, source: fs::canonicalize(path)?.to_str().context("source path is not UTF-8")?.into(), entries: scan(path, None)? };
+    let root=crate::source_tree::Directory::open(path)?;
+    let source = Source { schema: 1, source: fs::canonicalize(path)?.to_str().context("source path is not UTF-8")?.into(), entries: scan_open(&root, None)? };
     validate(&source)?;
     let json = serde_json::to_vec(&source)?;
     ensure!(json.len() <= MANIFEST_LIMIT, "artifact manifest exceeds limit");
     writer.write_all(MAGIC)?;
     writer.write_all(&(json.len() as u32).to_be_bytes())?;
     writer.write_all(&json)?;
+    let mut budget=crate::source_tree::Budget::new();
     for entry in &source.entries {
-        if entry.directory { continue; }
-        let mut file = regular(&path.join(&entry.path))?.take(entry.bytes);
-        ensure!(std::io::copy(&mut file, writer)? == entry.bytes, "source file disappeared or shrank");
+        if entry.directory {continue;}
+        let mut file=root.file(Path::new(&entry.path))?;budget.size(&file)?;let before=file.metadata()?;
+        let mut copied=0u64;let mut hash=Sha256::new();let mut buffer=[0;64*1024];
+        loop {let n=budget.read(&mut file,&mut buffer)?;if n==0{break;}copied+=n as u64;ensure!(copied<=entry.bytes,"source file grew while streaming");hash.update(&buffer[..n]);writer.write_all(&buffer[..n])?;}
+        crate::source_tree::unchanged(&file,&before)?;
+        ensure!(copied==entry.bytes&&format!("{:x}",hash.finalize())==entry.sha256,"source file changed while streaming");
     }
-    ensure!(fs::canonicalize(path)? == Path::new(&source.source) && scan(path, None)? == source.entries, "artifact source changed while streaming");
+    root.matches_path(path)?;
+    ensure!(scan_open(&root,None)?==source.entries,"artifact source changed while streaming");
+    root.matches_path(path)?;
     writer.flush()?;
     Ok(())
 }

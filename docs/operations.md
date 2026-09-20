@@ -145,7 +145,13 @@ Snapshots contain the report and library, including empty directories; the combi
 limit is 50 MiB, 10,000 entries and 64 directory levels. Symlinks, hard links,
 special files and non-UTF-8 names are refused. Staging failures and changed sources
 leave previous snapshots intact. Snapshot retention is currently manual: no
-background process removes them. Live `threads/<id>.md` and `library/<id>/` remain
+background process removes them. Source reads traverse opened directory descriptors
+and refuse symlinks in every source-path component, including ancestor aliases
+(for example, macOS `/var` paths must use their physical `/private/var` spelling).
+Reads enforce byte and entry limits as they proceed, with a cooperative ten-second
+deadline per scan; this does not interrupt a blocked filesystem syscall. Local
+live-report reads also enforce the 50 MiB limit and preserve the last home copy on
+failure. Live `threads/<id>.md` and `library/<id>/` remain
 compatibility copies, separate from these retained snapshots. Remote finalization requires the native helper described in [remote transport](remote-transport.md). Local Linux cleanup also checks Git registration/branch/commit, cross-project references, managed panes and process descriptors/cwd/mappings. Any uncertainty keeps the worktree. These checks assume cooperative same-user agents; they are not hostile-process containment.
 
 GitHub outage streaks are tracked per project and PR URL, and machine streaks per

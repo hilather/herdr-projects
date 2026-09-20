@@ -550,13 +550,11 @@ fn symlinks_under(dir: &Path, found: &mut Vec<String>) {
 /// The hash of a local thread's report when it is a regular file inside a real
 /// thread directory. Cheap enough to run every tick.
 pub fn local_report_hash(thread: &Thread) -> Option<String> {
-    let dir = Path::new(&thread.thread_dir);
-    if thread.thread_dir.is_empty() || !is_real_dir(dir) {
-        return None;
-    }
-    let report = dir.join("report.md");
-    let regular = std::fs::symlink_metadata(&report).is_ok_and(|m| m.is_file());
-    regular.then(|| std::fs::read(&report).ok()).flatten().map(|bytes| sha256_hex(&bytes))
+    try_local_report_hash(thread).ok().flatten()
+}
+pub fn try_local_report_hash(thread:&Thread)->Result<Option<String>> {
+    if thread.thread_dir.is_empty(){return Ok(None);}
+    Ok(crate::source_tree::report(Path::new(&thread.thread_dir))?.map(|bytes|sha256_hex(&bytes)))
 }
 
 pub struct Copied {
@@ -572,9 +570,14 @@ pub struct Copied {
 pub fn copy_home_local(project: &Project, thread: &Thread, with_library: bool, runner: &dyn Runner) -> Copied {
     let dir = Path::new(&thread.thread_dir);
     let mut notes = Vec::new();
-    if thread.thread_dir.is_empty() || !dir.exists() {
+    if thread.thread_dir.is_empty() {
         // Nothing was ever written, so nothing can be lost.
         return Copied { artifact_snapshot: None, outcome: CopyOutcome::Complete, report_hash: None };
+    }
+    match std::fs::symlink_metadata(dir) {
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Copied{artifact_snapshot:None,outcome:CopyOutcome::Complete,report_hash:None},
+        Err(error)=>return Copied{artifact_snapshot:None,outcome:CopyOutcome::Failed(format!("{error}")),report_hash:None},
+        Ok(_)=>{},
     }
     if !is_real_dir(dir) {
         return Copied {
@@ -587,8 +590,9 @@ pub fn copy_home_local(project: &Project, thread: &Thread, with_library: bool, r
     let report = dir.join("report.md");
     let mut report_hash = None;
     match std::fs::symlink_metadata(&report) {
-        Err(_) => {}
-        Ok(meta) if meta.is_file() => match std::fs::read(&report) {
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound => {}
+        Err(error)=>return Copied{artifact_snapshot:None,outcome:CopyOutcome::Failed(format!("could not inspect report: {error}")),report_hash:None},
+        Ok(meta) if meta.is_file() => match crate::source_tree::report(dir).and_then(|bytes|bytes.context("report disappeared during copy")) {
             Ok(bytes) => {
                 let hash = sha256_hex(&bytes);
                 if hash != thread.report_hash || !home_report_path(project, &thread.id).is_file() {
@@ -986,6 +990,25 @@ mod tests {
         let t = allocate(project, |t| t.thread_dir = dir.to_string_lossy().into_owned()).unwrap();
         std::fs::create_dir_all(dir.join("library")).unwrap();
         t
+    }
+
+    #[test]
+    fn oversized_report_preserves_home_copy_and_remains_retryable() {
+        let root = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let t = local_thread(&project, work.path());
+        std::fs::write(work.path().join("report.md"), b"good").unwrap();
+        assert_eq!(copy_home_local(&project, &t, false, &RealRunner).outcome, CopyOutcome::Complete);
+        std::fs::File::create(work.path().join("report.md")).unwrap().set_len(crate::source_tree::BYTE_LIMIT + 1).unwrap();
+        assert!(try_local_report_hash(&t).is_err());
+        let copied = copy_home_local(&project, &t, false, &RealRunner);
+        assert!(matches!(copied.outcome, CopyOutcome::Failed(_)));
+        assert!(copied.report_hash.is_none());
+        assert_eq!(std::fs::read(home_report_path(&project, &t.id)).unwrap(), b"good");
+        std::fs::write(work.path().join("report.md"), b"retry").unwrap();
+        assert_eq!(copy_home_local(&project, &t, false, &RealRunner).outcome, CopyOutcome::Complete);
+        assert_eq!(std::fs::read(home_report_path(&project, &t.id)).unwrap(), b"retry");
     }
 
     #[test]

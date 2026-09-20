@@ -694,7 +694,8 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     // Local threads: copy home when the report changed, then launches.
     let local = open_threads(project, false);
     for t in local.iter().filter(|t| t.status == thread::Status::Open) {
-        if let Some(hash) = thread::local_report_hash(t)
+        let hash=match thread::try_local_report_hash(t){Ok(hash)=>hash,Err(error)=>{errors.push(error.context(format!("{}: report source",t.id)));continue;}};
+        if let Some(hash) = hash
             && hash != t.report_hash
         {
             let copied = thread::copy_home_local(project, t, true, ctx.runner);

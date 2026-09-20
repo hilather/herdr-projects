@@ -94,3 +94,41 @@ fn entry_limit_is_enforced_without_unbounded_directory_collection() {
     let error = capture_local(&project, &record).err().unwrap();
     assert!(error.to_string().contains("entries"), "{error:#}");
 }
+
+#[test]
+fn identical_replacement_directory_cannot_publish_under_original_identity() {
+    let (root,project,record)=fixture();let good=capture_local(&project,&record).unwrap();
+    let result=capture(&project,&record,|| {
+        fs::rename(&record.thread_dir,root.path().join("old-source"))?;
+        fs::create_dir_all(Path::new(&record.thread_dir).join("library/empty"))?;
+        fs::write(Path::new(&record.thread_dir).join("report.md"),b"report\0\xff")?;
+        fs::write(Path::new(&record.thread_dir).join("library/artifact"),b"version A")?;
+        Ok(())
+    });
+    assert!(result.is_err());load(&project,&record,&good.id).unwrap();
+    assert_eq!(fs::read_dir(project.state_dir().join("artifacts/t-0001")).unwrap().count(),1);
+}
+
+#[test]
+fn excessive_source_depth_does_not_leave_a_snapshot() {
+    let (_root,project,record)=fixture();let mut path=Path::new(&record.thread_dir).join("library");
+    for _ in 0..=crate::source_tree::DEPTH_LIMIT {path=path.join("d");fs::create_dir(&path).unwrap();}
+    let error=capture_local(&project,&record).err().unwrap();assert!(error.to_string().contains("nesting"),"{error:#}");
+    assert_eq!(fs::read_dir(project.state_dir().join("artifacts/t-0001")).unwrap().count(),0);
+}
+
+#[test]
+fn historical_schema_one_root_entry_types_remain_readable() {
+    let (_root,project,record)=fixture();
+    let source=Path::new(&record.thread_dir);
+    fs::remove_file(source.join("report.md")).unwrap();
+    fs::create_dir(source.join("report.md")).unwrap();
+    fs::write(source.join("report.md/old"),b"old report").unwrap();
+    fs::remove_dir_all(source.join("library")).unwrap();
+    fs::write(source.join("library"),b"old library").unwrap();
+    let snapshot=capture_local(&project,&record).unwrap();
+    assert_eq!(load(&project,&record,&snapshot.id).unwrap(),snapshot.manifest);
+    verify_source(&record,&snapshot.manifest).unwrap();
+    assert!(snapshot.manifest.entries.iter().any(|entry|entry.path=="report.md"&&entry.directory));
+    assert!(snapshot.manifest.entries.iter().any(|entry|entry.path=="library"&&!entry.directory));
+}
