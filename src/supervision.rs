@@ -57,7 +57,9 @@ fn safe_environment(target:&Cmd)->Result<Vec<(String,String)>> {
         }
     }
     for (key,value) in &target.env {
-        ensure!(ENVIRONMENT.contains(&key.as_str()),"unsupported transfer environment variable (name/value withheld)");
+        // Session routing is allowed only when explicitly bound by the caller;
+        // it is never inherited from the ambient supervisor environment.
+        ensure!(ENVIRONMENT.contains(&key.as_str())||key=="HERDR_SOCKET_PATH","unsupported transfer environment variable (name/value withheld)");
         values.insert(key.clone(),value.clone());
     }
     ensure!(values.values().all(|v|v.len()<=8192&&!v.contains('\0'))&&values.values().map(String::len).sum::<usize>()<=65536,"transfer environment exceeds bounds");
@@ -86,6 +88,14 @@ mod tests {
     fn fixture()->(tempfile::TempDir,std::path::PathBuf,ProjectGuard) {
         let root=tempfile::tempdir().unwrap();let project=root.path().join("project");std::fs::create_dir_all(project.join(".state")).unwrap();
         let guard=ProjectGuard::acquire(&project).unwrap();(root,project,guard)
+    }
+    #[test]
+    fn explicit_session_routing_is_bounded_and_never_an_inherited_setting() {
+        assert!(!ENVIRONMENT.contains(&"HERDR_SOCKET_PATH"));
+        let command=Cmd::new("herdr",Duration::from_secs(1)).env("HERDR_SOCKET_PATH","/tmp/recorded.sock");
+        assert!(safe_environment(&command).unwrap().contains(&("HERDR_SOCKET_PATH".into(),"/tmp/recorded.sock".into())));
+        assert!(safe_environment(&command.clone().env("HERDR_SESSION","ambient")).is_err());
+        assert!(safe_environment(&Cmd::new("herdr",Duration::from_secs(1)).env("HERDR_SOCKET_PATH","x".repeat(8193))).is_err());
     }
     #[test]
     fn literal_arguments_stdin_environment_and_binary_sink_survive_supervision() {

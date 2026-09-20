@@ -67,7 +67,9 @@ received live stages can become immutable snapshots without fetching again; part
 stages cannot become preservation evidence. Report-optional final-copy intents now
 retain stages and atomically commit copy/resolution decisions with replayable notices.
 Idle eligibility is checked against the copied report, and merged eligibility
-against its PR header. Automatic idle/merged-PR worker admission and remaining
+against its PR header. The supervised worker can execute and recover final copies;
+idle resolution also requires fresh session-bound agent/pane observations.
+Automatic idle/merged-PR worker admission and remaining
 terminal effects still need isolation. T04.3 now fences legacy
 launch arguments by explicit agent kind and provides redacted [named profile inspection](profiles.md);
 explicit local version probes for Claude/Codex are available. Launch selection,

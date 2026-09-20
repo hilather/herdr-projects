@@ -1605,3 +1605,46 @@ contracts). Default-feature tests pass (29 library, 304 binary, 14 CLI, two
 contracts); three optional live checks remain ignored. Logs:
 `/tmp/herdr-final-intent-{debug,release}-corrected.log` and
 `/tmp/herdr-final-intent-default.log`.
+
+
+## W04 supervised final-copy worker ingress
+
+The trusted copy worker now accepts final-copy requests with a frozen purpose,
+operation, counter and optional retained intent. New work requires successful
+native sender completion, then preserves complete staged bytes, records intent,
+and performs recoverable projection/resolution. Recovery checks exact authority
+and retained identity before publication and does not start a sender. Complete,
+report-absent and partial outcomes retain the previously reviewed semantics.
+The request and completion envelope cannot substitute for a durable receipt.
+
+Independent review found that project ownership freezes ticker observations but
+cannot prevent an agent independently resuming work. Idle requests now bind the
+recorded session into their authority and use supervised Herdr agent/pane reads
+before resolution. Foreign or duplicate pane/agent identities and unknown agent
+states also refuse idle resolution; true absence retains the legacy policy only
+when it matches the recorded state. A changed live state or failed observation prevents resolution;
+retained copy recovery can finish while leaving the thread open. Configuration,
+routing, session or cancellation failure still withdraws effect permission.
+Supervision accepts an explicitly supplied HERDR_SOCKET_PATH, but never inherits
+it or HERDR_SESSION from the ambient environment. Reads remain bounded by the
+original worker deadline and command limits. This is a fresh observation check,
+not a claim that an external agent is locked against subsequent activity.
+
+The reviewer also identified maximum-counter recovery: an existing intent at
+i64::MAX now remains recoverable, while creation beyond the limit refuses.
+Fixtures cover these boundaries, live state changing during transport without
+record changes, source/helper loss after intent, configuration withdrawal, failed
+senders, cancellation, stale counters, partial/missing reports and merged PR
+identity through supervised remote-helper fixtures. Actual remote-host and macOS
+acceptance remain untested. Automatic ticker admission is still to be wired; card
+counts remain 16 locally implemented, five partial and 20 not started.
+
+Independent review approved the final worker increment and independently passed
+the foreign/ambiguous observation regression. This approval covers worker ingress
+and recovery, not automatic admission or unavailable live-platform acceptance.
+
+All 561 tests pass in debug and release (167 library, 359 binary, 33 CLI, two
+contracts). Default-feature tests pass (30 library, 310 binary, 14 CLI, two
+contracts); three optional live checks remain ignored. Logs:
+`/tmp/herdr-final-worker-{debug,release}-final.log` and
+`/tmp/herdr-final-worker-default.log`.
