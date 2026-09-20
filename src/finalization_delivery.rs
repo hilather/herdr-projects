@@ -80,11 +80,11 @@ pub fn observe(ctx:&Ctx,path:&Path,id:&OperationId,revision:u64,head:u64)->Resul
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::scenarios::World;
     use herdr_projects::{domain::{TaskState,Attempt,AttemptId,AttemptState,Commit,Mutation},operations::DeliveryState};
-    fn fixture()->(World,PathBuf,Operation) {
+    pub(crate) fn fixture()->(World,PathBuf,Operation) {
         let world=World::new();let project=crate::project::create(&world.root,"finalize","",vec![]).unwrap();project.set_status(crate::project::Status::Paused).unwrap();
         let source=world.home.path().join("artifact-root/source");fs::create_dir_all(source.join("library")).unwrap();fs::write(source.join("report.md"),"report for review\n").unwrap();fs::write(source.join("library/artifact"),b"preserved bytes").unwrap();
         let thread=Thread{id:"t-0001".into(),status:crate::thread::Status::Resolved,thread_dir:source.to_str().unwrap().into(),..Default::default()};fs::write(project.dir().join("threads/t-0001.toml"),toml::to_string(&thread).unwrap()).unwrap();

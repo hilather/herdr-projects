@@ -61,11 +61,11 @@ pub fn deliver(ctx:&Ctx,project:&Path,id:&OperationId,revision:u64)->Result<Disp
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{scenarios::World,runner::fake::{ok,fail}};
     use herdr_projects::{domain::{ProjectState,RuntimeRoute},operations::DeliveryState};
-    fn fixture()->(World,PathBuf,TaskId) {
+    pub(crate) fn fixture()->(World,PathBuf,TaskId) {
         let world=World::new();let project=project::create(&world.root,"notify","",vec![]).unwrap();project.set_status(project::Status::Paused).unwrap();
         crate::inbox::write(&project,"test","fixture","private inbox contents are not sent","").unwrap();
         let dir=project.dir().canonicalize().unwrap();let plan=migration::inspect(&dir).unwrap();migration::apply(&dir,&plan,true).unwrap();

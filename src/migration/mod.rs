@@ -203,6 +203,14 @@ fn load(project:&Path)->Result<Journal> {
 }
 pub(crate) struct Maintenance { _locks:Vec<File> }
 impl Maintenance {
+    fn runtime(project:&Path)->Result<Self> {
+        let root=project.parent().context("project has no root")?;let mut locks=Vec::new();
+        for path in [root.join(".execution.lock"),project.join(".state/lock")] {
+            let file=OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path)?;
+            file.try_lock().context("another runtime mutation or external operation is active; retry")?;locks.push(file);
+        }
+        Ok(Self{_locks:locks})
+    }
     fn acquire(project:&Path)->Result<Self> {
         let root=project.parent().context("project has no root")?;
         let mut locks=Vec::new();
@@ -411,6 +419,11 @@ pub(crate) mod obligations;
 
 pub(crate) fn maintenance(project:&Path)->Result<Maintenance> {
     let project=checked_project(project)?; Maintenance::acquire(&project)
+}
+/// Published runtime mutations serialize with effects, without stopping the ticker.
+/// Migration/restore/upgrade still require the stronger maintenance barrier.
+pub(crate) fn runtime_mutation(project:&Path)->Result<Maintenance> {
+    let project=checked_project(project)?;Maintenance::runtime(&project)
 }
 /// Validates published authority without requiring tasks to remain at import
 /// revisions. Accepted post-cutover edits must never trigger a legacy rollback.

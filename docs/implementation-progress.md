@@ -474,3 +474,24 @@ repeatability, stale inputs and unchanged canonical state. All-feature debug and
 release suites pass 342 tests (73 library, 243 binary, 24 CLI, 2 contracts); three
 live fixtures remain opt-in. Default-feature tests pass. Logs:
 `/tmp/herdr-recovery-{debug,release,legacy}.log`.
+
+## Canonical controller polling
+
+The ticker now routes migrated schema-v9 projects to canonical polling. Each pass
+records complete observations, expires old claims and processes at most one accepted
+canonical notification/finalization or ambiguous finalization receipt. Project and
+operation selection rotates. Existing adapters retain their execution guard through
+claim, effect and receipt; no new intents, launches or terminal input are inferred.
+
+Independent review caught two integration defects and approved their fixes:
+canonical runtime edits now use execution/project locks without the ticker leadership
+barrier (migration/restore/upgrade retain it), and blocked operation diagnostics no
+longer discard observed reachability. Automatic subprocess/socket observation probes
+share a 15-second deadline; exhausted collections are discarded before persistence.
+
+Six new controller fixtures cover leader-held operator edits, restart deduplication,
+expired claims without replay, paused/lease refusal, failed receipt commit followed
+by source loss, retained live reachability and native probe deadlines. Full debug and
+release suites pass 348 tests (73 library, 249 binary, 24 CLI, 2 contracts); default
+features also pass. Three live fixtures remain opt-in. Logs:
+`/tmp/herdr-controller-{debug,release,legacy}.log`.

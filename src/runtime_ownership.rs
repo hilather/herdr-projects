@@ -75,12 +75,12 @@ pub fn adopt(ctx:&Ctx,path:&Path,id:&str,revision:u64,head:u64)->Result<herdr_pr
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
     use crate::{scenarios::World,runner::fake::ok};
     use herdr_projects::domain::{ProjectState,RuntimeRoute};
-    fn fixture()->(World,PathBuf,UnixListener) {
+    pub(crate) fn fixture()->(World,PathBuf,UnixListener) {
         let world=World::new();let project=project::create(&world.root,"owned","",vec![]).unwrap();project.set_status(project::Status::Paused).unwrap();fs::write(project.dir().join("threads/t-0001.toml"),"id='t-0001'\nstatus='resolved'\n").unwrap();let path=project.dir().canonicalize().unwrap();let plan=migration::inspect(&path).unwrap();migration::apply(&path,&plan,true).unwrap();
         let socket=world.home.path().join("session.sock");let listener=UnixListener::bind(&socket).unwrap();let cwd=world.home.path().join("work");fs::create_dir(&cwd).unwrap();let snapshot=runtime::snapshot(&path).unwrap();runtime::rebind(&path,"thread:t-0001",1,snapshot.head,&RuntimeRoute{socket:socket.to_str().unwrap().into(),workspace_id:"w".into(),tab_id:"t".into(),pane_id:"p".into(),cwd:cwd.to_str().unwrap().into(),..Default::default()}).unwrap();
         *world.panes.borrow_mut()=serde_json::json!([{"pane_id":"p","workspace_id":"w","tab_id":"t","cwd":cwd}]).to_string();*world.agents.borrow_mut()=serde_json::json!([{"pane_id":"p","workspace_id":"w","tab_id":"t","cwd":cwd,"agent":"claude","name":"fixture-agent","agent_status":"working"}]).to_string();world.runner.on("--version",ok("herdr 0.9.1"));(world,path,listener)

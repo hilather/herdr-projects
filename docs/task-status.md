@@ -60,7 +60,9 @@ have a preview/apply observation adapter. An explicit count-only canonical sessi
 notification adapter and local artifact finalization now use guarded durable
 delivery. Verified finalization receipts recover after process death and commit
 the task review disposition atomically. Remote/merged-PR finalization integration,
-terminal-input authorization and automatic controller dispatch remain.
+terminal-input authorization and imported-obligation controller integration remain.
+The ticker now processes existing canonical notification/finalization intents through
+their guarded adapters and can recover verified finalization receipts.
 **T03.4** now has [bounded runtime observations](reconciliation.md), durable
 evidence, stale-state fences and explicit local ownership adoption. Live adopted
 workers retain attempt capacity; changed ownership pauses active control. Termination

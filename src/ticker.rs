@@ -287,7 +287,13 @@ pub fn run(ctx: &Ctx) -> Result<()> {
 pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     memory.tick += 1;
     let mut reachable = Vec::new();
+    #[cfg(feature="state-store")]
+    let mut canonical = Vec::new();
     for slug in project::list_slugs(&ctx.root) {
+        #[cfg(feature="state-store")]
+        if project::ensure_legacy(&ctx.root.join(&slug)).is_err() {
+            canonical.push(slug);continue;
+        }
         let Ok(project) = Project::load(&ctx.root, &slug) else {
             continue;
         };
@@ -309,7 +315,21 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
             log.line(&format!("{}: {error:#}", project.slug));
         }
     }
-    !reachable.is_empty()
+    let any_reachable = !reachable.is_empty();
+    #[cfg(feature="state-store")]
+    {
+        let mut any_reachable=any_reachable;
+        if !canonical.is_empty() {let first=(memory.tick.saturating_sub(1)%canonical.len() as u64) as usize;canonical.rotate_left(first);}
+        for slug in canonical {
+            match crate::canonical_controller::poll(ctx,&ctx.root.join(&slug),memory.tick.saturating_sub(1)) {
+                Ok(result)=>{any_reachable|=result.reachable;if let Some(error)=result.operation_error {log.line(&format!("{slug}: canonical operation: {error}"));}},
+                Err(error)=>log.line(&format!("{slug}: canonical controller: {error:#}")),
+            }
+        }
+        return any_reachable;
+    }
+    #[cfg(not(feature="state-store"))]
+    any_reachable
 }
 
 #[cfg(test)]

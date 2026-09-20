@@ -159,3 +159,26 @@ claims require explicit expiry into ambiguity. Pending stale intents may be
 explicitly retired; pending supported adapters are only retry candidates and must
 still pass their complete policy/revision/resource checks. Imported or unsupported
 operations require inspection. No repair action is automatically executed.
+
+## Canonical ticker polling
+
+With `state-store` enabled, the existing ticker routes migrated schema-v9 projects
+to the canonical controller instead of legacy state. Each pass collects complete
+observations, records them and expires delivery claims under the root execution
+lease. Ticker leadership remains held separately. Control/marker inconsistencies,
+unfinished migration and unsupported older schemas refuse polling until repaired.
+
+The controller rotates projects and candidate operations, processing at most one
+accepted canonical notification/finalization per project per pass. Existing adapters
+recheck policy, lifecycle, config and revisions under their execution guard. Pending
+notifications require active control. Artifact preservation may run while paused
+when its original authorization remains valid. Ambiguous finalizations may recover
+only from an exact verified receipt; ambiguous notifications are never replayed.
+
+Polling creates no new intents, launches, prompts, adoption or termination evidence.
+Imported obligations still require explicit receipt inspection or retirement.
+Canonical task/lifecycle/inbox/intent edits take the execution and project locks,
+so pause/archive and new work remain available while ticker leadership is held.
+Stop the ticker before migration, restore or upgrade maintenance. Automatic external
+observation probes share a 15-second deadline; exhausted collections are not
+persisted. Adapter failures are logged separately from observed reachability.
