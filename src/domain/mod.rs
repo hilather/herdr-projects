@@ -88,6 +88,7 @@ pub struct Snapshot {
     pub inbox: Vec<InboxItem>,
     pub runtime_bindings:Vec<RuntimeBinding>,
     pub observations:Vec<crate::reconcile::RuntimeObservation>,
+    pub ownership:Vec<RuntimeOwnership>,
     pub control:Option<ProjectControl>,
     pub events: Vec<Event>,
 }
@@ -107,3 +108,6 @@ mod runtime;
 pub use runtime::{RuntimeBinding,RuntimeIdentity,RuntimeVerification,RuntimeRoute,RouteChange};
 mod control;
 pub use control::{ProjectState,ProjectControl,AdmissionReport,ControlChange};
+
+mod ownership;
+pub use ownership::{RuntimeOwnership,ResourceIdentity,AgentIdentity};

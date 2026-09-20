@@ -419,3 +419,24 @@ Validation: 330 all-feature debug/release tests (71 library, 234 binary, 23 CLI,
 fixtures remain opt-in. Logs: `/tmp/herdr-finalize-debug.log`,
 `/tmp/herdr-finalize-release.log`, `/tmp/herdr-finalize-legacy.log`,
 `/tmp/herdr-finalize-build.log`.
+
+## Local resource ownership and adoption
+
+Schema v9 adds audited ownership claims bound to runtime/config revisions, local
+socket/worktree incarnation and exact detected agent identity. Explicit adoption
+runs bounded conflict inspection under the root execution lease, including retained
+legacy references, canonical neighbors and corrupt/missing project inventory.
+A live adopted task worker creates a retained running attempt; fresh post-adoption
+evidence is required for admission. Changed resource evidence pauses active control
+without releasing capacity. Owned routes cannot be rebound. Adopted resources gain
+no destructive cleanup authority; termination and relinquishment remain next work.
+
+Independent review approved after regressions repaired older-store inventory,
+prunable/replaced worktrees, owned coordinator rebinding and missing project markers.
+Six ownership fixtures (including native Git) and a subprocess CLI fixture cover the
+new behavior. No real project or session was modified. Full all-feature debug and
+release suites pass 337 tests (71 library, 240 binary, 24 CLI, 2 contracts); default
+features and release build pass. Three live fixtures remain opt-in. Full suites used
+disposable process namespaces because the host systemd user process denies /proc
+inspection, correctly causing strict cleanup checks to refuse outside isolation.
+Logs: `/tmp/herdr-ownership-{debug,release,legacy,build}.log`.

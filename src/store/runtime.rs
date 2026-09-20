@@ -92,6 +92,7 @@ impl SqliteStore {
         if RuntimeRoute::from_identity(&binding.identity)==*route {
             return Ok(RouteChange{head:expected_head,binding,task_revision:task.map(|t|t.revision)});
         }
+        if schema>=9&&tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_ownership WHERE binding_id=?1)",[id],|r|r.get::<_,bool>(0))? {return Err(StoreError::Invalid("relinquish owned resources before rebinding; existing references are retained".into()));}
         if !route.pane_id.is_empty() && bindings.iter().any(|other|other.id!=id && other.identity.socket==route.socket && other.identity.machine==route.machine && other.identity.pane_id==route.pane_id) {
             return Err(StoreError::Invalid("pane already referenced by another binding in this project".into()));
         }

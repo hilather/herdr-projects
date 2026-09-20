@@ -52,7 +52,7 @@ cutover. Schema v5 adds typed, hash-checked, unverified runtime bindings and a
 read-only inspection command. Schema v7 adds guarded canonical lifecycle control,
 epoch fencing and crash-recoverable marker publication. Schema v8 adds canonical
 coordinator/task record creation without fabricated legacy provenance. Runtime execution, profile resolution and live
-ownership integration remain.
+automatic ownership integration remain.
 **T03.3** now has [durable claims/outcomes](operation-delivery.md), fencing,
 ambiguity, retry handling, an atomic inbox drain, a guarded common dispatch service
 and explicit claim expiry. Exact imported notification/finalization receipts now
@@ -62,8 +62,9 @@ delivery. Verified finalization receipts recover after process death and commit
 the task review disposition atomically. Remote/merged-PR finalization integration,
 terminal-input authorization and automatic controller dispatch remain.
 **T03.4** now has [bounded runtime observations](reconciliation.md), durable
-evidence, and stale-state fences. Ownership acquisition, repair/adoption, termination
-evidence and integrated recovery remain. Observation work is interleaved because
+evidence, stale-state fences and explicit local ownership adoption. Live adopted
+workers retain attempt capacity; changed ownership pauses active control. Termination
+evidence, relinquishment, automatic repair and integrated recovery remain. Observation work is interleaved because
 the remaining external adapters depend on it.
 W04–W09 account for the other 25 not-started cards. Task count is not a time estimate.
 Phase A was accepted with its [documented gaps](phase-a-acceptance.md); macOS remains

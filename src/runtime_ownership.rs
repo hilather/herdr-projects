@@ -1,0 +1,137 @@
+//! Root-scoped resource conflict checks. Cross-root capacity is deliberately not promised.
+use std::{fs,path::{Path,PathBuf}};
+use anyhow::{Context,Result,ensure};
+use crate::{paths::Ctx,project::{self,Coordinator},thread::Thread};
+use herdr_projects::{domain::RuntimeIdentity,migration,runtime};
+
+fn exists(path:&Path)->Result<bool> {match fs::symlink_metadata(path){Ok(_)=>Ok(true),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>Ok(false),Err(e)=>Err(e.into())}}
+fn optional_json<T:serde::de::DeserializeOwned>(path:&Path)->Result<Option<T>> {if !exists(path)?{return Ok(None);}Ok(Some(serde_json::from_slice(&migration::read_plan_file(path)?)?))}
+fn location(path:&str)->Result<PathBuf> {
+    let path=Path::new(path);ensure!(path.is_absolute(),"recorded resource path must be absolute");
+    match fs::canonicalize(path) {Ok(p)=>Ok(p),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{ensure!(path.components().all(|c|matches!(c,std::path::Component::RootDir|std::path::Component::Normal(_))),"unresolved resource path contains aliases");Ok(path.into())},Err(e)=>Err(e.into())}
+}
+fn conflict(a:&RuntimeIdentity,b:&RuntimeIdentity)->Result<bool> {
+    if !a.machine.is_empty()||!b.machine.is_empty(){return Ok(false);}
+    if !a.pane_id.is_empty()&&a.pane_id==b.pane_id {
+        ensure!(!b.socket.is_empty(),"another pane reference lacks a recorded session socket");
+        if location(&a.socket)?==location(&b.socket)? {return Ok(true);}
+    }
+    if !a.worktree_path.is_empty()&&!b.worktree_path.is_empty() {
+        let a=location(&a.worktree_path)?;let b=location(&b.worktree_path)?;
+        if a.starts_with(&b)||b.starts_with(&a){return Ok(true);}
+    }
+    Ok(false)
+}
+
+/// The caller holds the execution lease. Corrupt, migrating or over-limit roots
+/// refuse instead of silently skipping records. References are conservative,
+/// including resources left attached to resolved legacy threads.
+pub(crate) fn check_conflicts(ctx:&Ctx,current:&Path,skip:Option<&str>,candidate:&RuntimeIdentity)->Result<()> {
+    if !exists(&ctx.root)? { return Ok(()); }
+    let current=current.canonicalize()?;let mut projects=0;let mut records=0;
+    for entry in fs::read_dir(&ctx.root)?.take(1025) {
+        let entry=entry?;projects+=1;ensure!(projects<=1024,"root enumeration exceeds 1024 entries");
+        let kind=entry.file_type()?;if !kind.is_dir()&&!kind.is_symlink(){continue;}
+        let name=entry.file_name();let name=name.to_str().context("non-UTF-8 root entry")?;
+        if name.starts_with('.') {continue;}
+        let dir=entry.path();let marker=exists(&dir.join("PROJECT.md"))?;
+        let recognized=exists(&dir.join(".state/format.json"))?||exists(&dir.join(".state/migration"))?||exists(&dir.join(".state/project.json"))?||exists(&dir.join(".state/coordinator.json"))?;
+        ensure!(marker||!recognized,"recognizable project {name} is missing PROJECT.md; repair it before adoption");
+        if !marker{continue;}
+        project::validate_slug(name)?;ensure!(kind.is_dir(),"project root contains a symlink or non-directory");
+        ensure!(fs::symlink_metadata(dir.join("PROJECT.md"))?.is_file(),"PROJECT.md must be a regular file");
+        ensure!(fs::symlink_metadata(dir.join(".state"))?.is_dir(),"project state directory must be real");
+        let dir=dir.canonicalize()?;
+        let bindings:Vec<(String,RuntimeIdentity)>=if exists(&dir.join(".state/format.json"))?||exists(&dir.join(".state/migration"))? {
+            let snapshot=runtime::snapshot(&dir)?;ensure!(snapshot.schema_version>=5,"upgrade neighboring project {name} before establishing resource ownership");
+            snapshot.runtime_bindings.into_iter().map(|b|(b.id,b.identity)).collect()
+        }else{
+            let coordinator:Option<Coordinator>=optional_json(&dir.join(".state/coordinator.json"))?;
+            let socket=coordinator.as_ref().map(|c|c.socket.clone()).unwrap_or_default();
+            let mut result=Vec::new();if let Some(c)=coordinator {result.push(("coordinator".into(),RuntimeIdentity{socket:c.socket,workspace_id:c.workspace_id,tab_id:c.tab_id,pane_id:c.pane_id,cwd:c.cwd,agent_name:c.agent_name,..Default::default()}));}
+            ensure!(fs::symlink_metadata(dir.join("threads"))?.is_dir(),"thread directory must be real");
+            for (n,file) in fs::read_dir(dir.join("threads"))?.enumerate() {
+                ensure!(n<256,"thread inventory exceeds 256 entries");let file=file?;let path=file.path();if path.extension().is_none_or(|s|s!="toml"){continue;}
+                let thread:Thread=toml::from_str(std::str::from_utf8(&migration::read_plan_file(&path)?)?)?;crate::thread::validate_id(&thread.id)?;ensure!(path.file_stem().and_then(|s|s.to_str())==Some(thread.id.as_str()),"thread filename identity mismatch");
+                result.push((format!("thread:{}",thread.id),RuntimeIdentity{machine:thread.machine,socket:socket.clone(),workspace_id:thread.workspace_id,tab_id:thread.tab_id,pane_id:thread.pane_id,cwd:thread.cwd,worktree_path:thread.worktree_path,..Default::default()}));
+            }
+            result
+        };
+        for (id,identity) in bindings {records+=1;ensure!(records<=1024,"resource inventory exceeds 1024 bindings");if dir==current&&skip==Some(id.as_str()){continue;}ensure!(!conflict(candidate,&identity)?,"resource is already referenced by {name}/{id}");}
+    }
+    Ok(())
+}
+
+pub fn adopt(ctx:&Ctx,path:&Path,id:&str,revision:u64,head:u64)->Result<herdr_projects::store::OwnershipChange> {
+    let path=path.canonicalize()?;let _lease=crate::cleanup::lease(path.parent().context("project has no root")?)?;
+    let snapshot=runtime::snapshot(&path)?;ensure!(snapshot.head==head,"project head changed");
+    let binding=snapshot.runtime_bindings.iter().find(|b|b.id==id&&b.revision==revision).context("binding revision changed")?;
+    let config=crate::notification_delivery::config(ctx,&path)?;
+    check_conflicts(ctx,&path,Some(id),&binding.identity)?;
+    let batch=crate::reconcile_live::collect(ctx,&path)?;ensure!(batch.expected_head==head,"project changed during adoption");
+    ensure!(migration::config_reference(Path::new(&config.path))?==config,"config changed during adoption");
+    let head=runtime::record_observations_held(&path,&batch)?;
+    runtime::adopt_observed(&path,id,revision,head,&config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+    use crate::{scenarios::World,runner::fake::ok};
+    use herdr_projects::domain::{ProjectState,RuntimeRoute};
+    fn fixture()->(World,PathBuf,UnixListener) {
+        let world=World::new();let project=project::create(&world.root,"owned","",vec![]).unwrap();project.set_status(project::Status::Paused).unwrap();fs::write(project.dir().join("threads/t-0001.toml"),"id='t-0001'\nstatus='resolved'\n").unwrap();let path=project.dir().canonicalize().unwrap();let plan=migration::inspect(&path).unwrap();migration::apply(&path,&plan,true).unwrap();
+        let socket=world.home.path().join("session.sock");let listener=UnixListener::bind(&socket).unwrap();let cwd=world.home.path().join("work");fs::create_dir(&cwd).unwrap();let snapshot=runtime::snapshot(&path).unwrap();runtime::rebind(&path,"thread:t-0001",1,snapshot.head,&RuntimeRoute{socket:socket.to_str().unwrap().into(),workspace_id:"w".into(),tab_id:"t".into(),pane_id:"p".into(),cwd:cwd.to_str().unwrap().into(),..Default::default()}).unwrap();
+        *world.panes.borrow_mut()=serde_json::json!([{"pane_id":"p","workspace_id":"w","tab_id":"t","cwd":cwd}]).to_string();*world.agents.borrow_mut()=serde_json::json!([{"pane_id":"p","workspace_id":"w","tab_id":"t","cwd":cwd,"agent":"claude","name":"fixture-agent","agent_status":"working"}]).to_string();world.runner.on("--version",ok("herdr 0.9.1"));(world,path,listener)
+    }
+    #[test]
+    fn adoption_counts_live_worker_and_resume_requires_fresh_post_adoption_evidence() {
+        let(world,path,_listener)=fixture();let head=runtime::snapshot(&path).unwrap().head;let change=adopt(&world.ctx(),&path,"thread:t-0001",2,head).unwrap();assert_eq!(change.ownership.origin,"adopted");assert!(change.ownership.session.is_some());assert!(change.ownership.attempt.is_some());let after=runtime::snapshot(&path).unwrap();assert_eq!(after.attempts.len(),1);assert!(after.attempts[0].retains_capacity());assert_eq!(after.tasks.iter().find(|t|t.id==after.attempts[0].task).unwrap().active_attempt.as_ref(),Some(&after.attempts[0].id));
+        let config=world.ctx().config_dir.join("config.toml");assert!(runtime::set_state(&path,after.head,after.control.unwrap().revision,ProjectState::Active,&config).is_err());crate::reconcile_live::run(&world.ctx(),&path,true).unwrap();let before=runtime::snapshot(&path).unwrap();assert!(runtime::admission(&path,&config).unwrap().blockers.is_empty());let active=runtime::set_state(&path,before.head,before.control.unwrap().revision,ProjectState::Active,&config).unwrap();assert_eq!(active.control.state,ProjectState::Active);
+        let head=runtime::snapshot(&path).unwrap().head;let again=adopt(&world.ctx(),&path,"thread:t-0001",2,head).unwrap();assert_eq!(again.ownership,change.ownership);assert_eq!(runtime::snapshot(&path).unwrap().attempts.len(),1);assert_eq!(world.runner.count("agent prompt"),0);
+    }
+    #[test]
+    fn replaced_session_and_changed_agent_pause_without_releasing_capacity() {
+        for change in ["session","agent"] {
+            let(world,path,listener)=fixture();let head=runtime::snapshot(&path).unwrap().head;adopt(&world.ctx(),&path,"thread:t-0001",2,head).unwrap();crate::reconcile_live::run(&world.ctx(),&path,true).unwrap();let before=runtime::snapshot(&path).unwrap();let active=runtime::set_state(&path,before.head,before.control.unwrap().revision,ProjectState::Active,&world.ctx().config_dir.join("config.toml")).unwrap();
+            let _replacement=if change=="session" {drop(listener);fs::remove_file(world.home.path().join("session.sock")).unwrap();Some(UnixListener::bind(world.home.path().join("session.sock")).unwrap())}else{let changed=world.agents.borrow().replace("fixture-agent","replacement-agent");*world.agents.borrow_mut()=changed;None};
+            crate::reconcile_live::run(&world.ctx(),&path,true).unwrap();let after=runtime::snapshot(&path).unwrap();assert_eq!(after.control.as_ref().unwrap().state,ProjectState::Paused);assert!(after.control.as_ref().unwrap().epoch>active.control.epoch);assert!(after.attempts[0].retains_capacity());assert!(!runtime::admission(&path,&world.ctx().config_dir.join("config.toml")).unwrap().blockers.is_empty());assert!(runtime::rebind(&path,"thread:t-0001",2,after.head,&RuntimeRoute::default()).is_err());
+        }
+    }
+    #[test]
+    fn adoption_blocks_canonical_legacy_corrupt_and_alias_conflicts() {
+        for other in ["canonical","legacy","corrupt","alias","missing-marker"] {
+            let(world,path,_listener)=fixture();let p=project::create(&world.root,"other","",vec![]).unwrap();p.set_status(project::Status::Paused).unwrap();let socket=world.home.path().join("session.sock");let route=if other=="alias" {let alias=world.home.path().join("alias.sock");std::os::unix::fs::symlink(&socket,&alias).unwrap();alias}else{socket};
+            fs::write(p.dir().join(".state/coordinator.json"),serde_json::json!({"socket":route,"pane_id":"p","workspace_id":"w","tab_id":"t","cwd":world.home.path().join("work")}).to_string()).unwrap();
+            if other=="corrupt" {fs::write(p.dir().join("threads/t-0001.toml"),"bad [").unwrap();}
+            if matches!(other,"canonical"|"missing-marker") {
+                fs::write(p.dir().join(".state/coordinator.json"),"{}").unwrap();let plan=migration::inspect(&p.dir()).unwrap();migration::apply(&p.dir(),&plan,true).unwrap();let snapshot=runtime::snapshot(&p.dir()).unwrap();let binding=runtime::snapshot(&path).unwrap().runtime_bindings.remove(0);runtime::rebind(&p.dir(),"coordinator",1,snapshot.head,&RuntimeRoute::from_identity(&binding.identity)).unwrap();
+            }
+            if other=="missing-marker" {fs::remove_file(p.project_md()).unwrap();}
+            let before=runtime::snapshot(&path).unwrap();assert!(adopt(&world.ctx(),&path,"thread:t-0001",2,before.head).is_err(),"{other}");assert_eq!(runtime::snapshot(&path).unwrap(),before);
+        }
+    }
+    #[test]
+    fn ownership_refuses_older_schema_neighbor_and_owned_coordinator_rebind() {
+        let(world,path,_listener)=fixture();let neighbor=project::create(&world.root,"old","",vec![]).unwrap();neighbor.set_status(project::Status::Paused).unwrap();let plan=migration::inspect(&neighbor.dir()).unwrap();migration::apply(&neighbor.dir(),&plan,true).unwrap();let raw=rusqlite::Connection::open(neighbor.state_dir().join("state.db")).unwrap();raw.execute_batch("DROP TABLE runtime_ownership; DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; UPDATE store_meta SET schema_version=4; PRAGMA user_version=4;").unwrap();let before=runtime::snapshot(&path).unwrap();assert!(adopt(&world.ctx(),&path,"thread:t-0001",2,before.head).is_err());assert_eq!(runtime::snapshot(&path).unwrap(),before);migration::upgrade_active(&neighbor.dir()).unwrap();
+        let route=RuntimeRoute::from_identity(&before.runtime_bindings[0].identity);runtime::rebind(&path,"thread:t-0001",2,before.head,&RuntimeRoute::default()).unwrap();let head=runtime::snapshot(&path).unwrap().head;runtime::create_binding(&path,None,None,head,&route).unwrap();let head=runtime::snapshot(&path).unwrap().head;adopt(&world.ctx(),&path,"coordinator",1,head).unwrap();let before=runtime::snapshot(&path).unwrap();assert!(runtime::rebind(&path,"coordinator",1,before.head,&RuntimeRoute::default()).is_err());assert_eq!(runtime::snapshot(&path).unwrap(),before);
+    }
+    #[test]
+    fn ownership_verifies_native_worktree_association_and_replacement() {
+        use crate::runner::{Runner,RealRunner,Cmd};use std::time::Duration;
+        for mode in ["valid","prunable","replace"] {
+            let world=World::new();let repo=world.home.path().join("repo");let tree=world.home.path().join("tree");fs::create_dir(&repo).unwrap();
+            for args in [vec!["init","--quiet"],vec!["-c","user.name=Fixture","-c","user.email=fixture@example.invalid","commit","--quiet","--allow-empty","-m","base"],vec!["worktree","add","--quiet","-b","topic",tree.to_str().unwrap()]] {assert!(RealRunner.run(&Cmd::new("git",Duration::from_secs(10)).args(["-C",repo.to_str().unwrap()]).args(args)).unwrap().success());}
+            let project=project::create(&world.root,"tree-owner","",vec![]).unwrap();project.set_status(project::Status::Paused).unwrap();let thread=Thread{id:"t-0001".into(),status:crate::thread::Status::Resolved,repo:repo.to_str().unwrap().into(),branch:"topic".into(),worktree_path:tree.to_str().unwrap().into(),..Default::default()};fs::write(project.dir().join("threads/t-0001.toml"),toml::to_string(&thread).unwrap()).unwrap();let path=project.dir().canonicalize().unwrap();let plan=migration::inspect(&path).unwrap();migration::apply(&path,&plan,true).unwrap();
+            if mode=="prunable" {fs::remove_file(tree.join(".git")).unwrap();}
+            let replace=mode=="replace";let tree_for_hook=tree.clone();let once=std::cell::Cell::new(false);world.runner.on_fn(|c|c.program=="git",move |c|{let output=RealRunner.run(c)?;if replace&&!once.get()&&c.args.iter().any(|a|a=="worktree")&&c.args.iter().any(|a|a=="list") {once.set(true);let gitfile=fs::read(tree_for_hook.join(".git"))?;fs::rename(&tree_for_hook,tree_for_hook.with_file_name("previous-tree"))?;fs::create_dir(&tree_for_hook)?;fs::write(tree_for_hook.join(".git"),gitfile)?;}Ok(output)});
+            let before=runtime::snapshot(&path).unwrap();let result=adopt(&world.ctx(),&path,"thread:t-0001",1,before.head);let after=runtime::snapshot(&path).unwrap();
+            if mode=="valid" {assert!(result.is_ok(),"{result:?}");assert!(after.ownership[0].worktree.is_some());assert!(after.attempts.is_empty());}else{assert!(result.is_err(),"{mode}");assert!(after.ownership.is_empty());assert_eq!(after.tasks,before.tasks);}
+        }
+    }
+    #[test]
+    fn legacy_adoption_cannot_steal_a_canonical_reference() {
+        let(world,path,_listener)=fixture();let binding=runtime::snapshot(&path).unwrap().runtime_bindings.remove(0);let herdr=crate::herdr::Herdr::new(world.env.herdr_bin(),&binding.identity.socket,&world.runner);assert!(crate::adopt::adoptable_agent(&world.ctx(),&herdr,&binding.identity.socket,"p").is_err());
+    }
+}

@@ -29,19 +29,34 @@ fn blockers(db:&Connection,now:i64,config:Option<&str>)->Result<Vec<String>> {
     if config.is_some_and(|d|d.len()!=64||!d.bytes().all(|b|b.is_ascii_hexdigit())) {return Err(StoreError::Invalid("invalid config fingerprint".into()));}
     let mut reasons=Vec::new();
     if read(db)?.state==ProjectState::Archived {reasons.push("restore archived project to paused before resuming".into());}
-    let tasks=read_tasks(db)?;
-    if tasks.iter().any(|t|t.active_attempt.is_some()||t.state==TaskState::Running) {reasons.push("task has active or unresolved execution".into());}
-    if read_attempts(db)?.iter().any(|a|a.retains_capacity()) {reasons.push("attempt termination remains unobserved; capacity retained".into());}
+    let tasks=read_tasks(db)?;let attempts=read_attempts(db)?;
     if super::delivery::read_all(db)?.iter().any(|d|!matches!(d.state,DeliveryState::Confirmed|DeliveryState::PermanentFailure)) {reasons.push("unfinished delivery intents require drain, observation or explicit retirement".into());}
     let observations=super::observations::read_all(db)?;
+    let schema:u32=db.query_row("PRAGMA user_version",[],|r|r.get(0))?;
+    let ownership=if schema>=9{super::ownership::read_all(db)?}else{Vec::new()};
+    let mut reconciled=std::collections::BTreeSet::new();
     for binding in super::runtime::read_all(db)? {
+        let task=binding.task.as_ref().and_then(|id|tasks.iter().find(|t|&t.id==id));
+        let task_revision=task.map(|t|t.revision);
         if !binding.identity.pane_id.is_empty()||!binding.identity.worktree_path.is_empty()||!binding.identity.machine.is_empty() {
-            reasons.push(format!("{}: live resource ownership/adoption is not established",binding.id));continue;
+            let observed=observations.iter().find(|o|super::ownership::observed(&binding,task_revision,o,now,config));
+            let owned=ownership.iter().find(|owned|owned.binding==binding.id);
+            match (owned,observed) {
+                (Some(owned),Some(observation)) if super::ownership::matches(owned,&binding,observation)?=>{
+                    if let Some(id)=&owned.attempt {
+                        if attempts.iter().any(|a|&a.id==id&&binding.task.as_ref()==Some(&a.task)&&a.retains_capacity()&&matches!(a.state,AttemptState::Running|AttemptState::AwaitingInput))&&task.is_some_and(|t|t.active_attempt.as_ref()==Some(id)&&t.state==TaskState::Running)&&observation.agent_present {reconciled.insert(id.clone());}
+                        else {reasons.push(format!("{}: adopted attempt is not reconciled",binding.id));}
+                    } else if binding.task.is_some()&&observation.agent_present {reasons.push(format!("{}: live worker lacks a retained attempt",binding.id));}
+                },
+                _=>reasons.push(format!("{}: current ownership and fresh resource identity evidence required",binding.id)),
+            }
+            continue;
         }
-        let task_revision=binding.task.as_ref().and_then(|id|tasks.iter().find(|t|&t.id==id).map(|t|t.revision));
         let valid=observations.iter().any(|o|o.binding==binding.id&&o.binding_revision==binding.revision&&o.task_revision==task_revision&&o.observed_unix_ms<=now&&now-o.observed_unix_ms<=30_000&&o.config_digest.as_deref()==config&&o.pane==ResourceState::Unrecorded&&o.worktree==ResourceState::Unrecorded&&!o.agent_present);
         if !valid {reasons.push(format!("{}: fresh matching observation required",binding.id));}
     }
+    if tasks.iter().any(|t|(t.active_attempt.is_some()||t.state==TaskState::Running)&&!t.active_attempt.as_ref().is_some_and(|id|reconciled.contains(id))) {reasons.push("task has active or unresolved execution".into());}
+    if attempts.iter().any(|a|a.retains_capacity()&&!reconciled.contains(&a.id)) {reasons.push("attempt termination remains unobserved; capacity retained".into());}
     Ok(reasons)
 }
 impl SqliteStore {
@@ -54,7 +69,7 @@ impl SqliteStore {
         let tx=self.connection.transaction()?;schema(&tx)?;let report=AdmissionReport{head:head(&tx)?,blockers:blockers(&tx,now,config)?};tx.commit()?;Ok(report)
     }
     /// Lifecycle changes are atomic with their audit and fence epoch. Resume is
-    /// currently supported only when no existing resources need adoption.
+    /// supported only with fresh evidence for every existing resource/attempt.
     pub fn set_project_state(&mut self,expected_head:u64,expected_revision:u64,state:ProjectState,now:i64,config:Option<&str>)->Result<ControlChange> {
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
         if head(&tx)?!=expected_head{return Err(StoreError::Conflict);}

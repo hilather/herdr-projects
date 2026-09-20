@@ -3,7 +3,8 @@
 `reconcile PROJECT` collects a read-only observation batch from schema-v6-or-newer runtime
 bindings. `reconcile PROJECT --record` persists that batch and audit events against
 the exact event head, binding revisions and task revisions observed. Neither form
-launches, prompts, copies, removes, releases capacity or changes lifecycle state.
+launches, prompts, copies, removes or releases capacity. Recording evidence that
+invalidates an active ownership claim pauses control and requires reconciliation.
 Use `migration PROJECT upgrade-store` explicitly for older published stores.
 
 Pane queries use the recorded socket/machine, never an ambient session. Herdr
@@ -15,7 +16,9 @@ or idle agent is not a writer-quiescence proof.
 
 Local worktree observations compare recorded repository, path and branch against
 bounded Git porcelain output. Truncated/contradictory output is unknown; remote
-worktrees remain unknown. These checks identify a registration, not preservation
+worktrees remain unknown. Local presence additionally requires matching Git common-directory and top-level
+paths and a stable directory incarnation; prunable registrations remain unknown.
+These checks identify a registration, not preservation
 or a tested commit. At most 128 bindings, 16 session endpoints and 16 repositories
 are queried per batch. Excess binding counts refuse an incomplete collection;
 excess endpoint/repository queries produce explicit unknown observations.
@@ -30,8 +33,8 @@ Raw external command output is not stored in the evidence table.
 Schema v6 adds hash-checked observation rows and includes them in schema-qualified
 runtime exports. Schema v7 adds the guarded lifecycle control described below. This increment interleaves the observation dependency of the
 remaining W03 adapters; it does not close T03.2, T03.3 or T03.4. Remaining work includes
-resource ownership acquisition, attempt termination evidence,
-repair actions, safe adoption/reuse and integrated restart testing.
+attempt termination evidence, relinquishment, repair actions, automatic runtime
+execution and integrated restart testing.
 
 ## Explicit session rebinding
 
@@ -50,7 +53,8 @@ The update requires the current head and binding revision, rejects duplicate pan
 references within the project, clears prior observations, and increments a linked
 task's revision so old claims/results cannot commit against the changed routing.
 It refuses every retained attempt for the task, including lost attempts that are
-not selected by `active_attempt`. No attempt or reservation is removed.
+not selected by `active_attempt`. Schema v9 also refuses changing a binding with
+an ownership claim, including coordinator claims. No attempt or reservation is removed.
 
 Rebinding retains immutable import provenance and legacy files. Its new routing
 is unverified, the old execution fingerprint is cleared, and the event records
@@ -66,9 +70,10 @@ paused|active|archived --expected-head H --expected-revision R` changes canonica
 control without dual-writing legacy status. Inspect provides the control revision
 and epoch. Restore an archived project to paused before requesting active.
 
-Admission currently requires no existing pane, worktree or remote resource needing
-adoption, no retained attempts or running tasks, no unfinished delivery, and fresh
-matching observations for every binding. Observations must be at most 30 seconds
+Admission requires ownership of recorded local resources, no unfinished delivery,
+and fresh matching observations for every binding. Retained attempts and running
+tasks block admission unless they exactly match a live adopted ownership claim.
+Unowned resources and remote resources continue to block admission. Observations must be at most 30 seconds
 old and match the current config fingerprint. Active control pins that fingerprint;
 future effect adapters must additionally check typed safety, scoped authority,
 binding/task revisions and resource ownership. This is not an automatic scheduler.
@@ -97,3 +102,26 @@ pane references, increments the linked task revision, and invalidates admission.
 New bindings have null import provenance. Imported bindings retain their original
 source hashes; legacy files are neither invented nor dual-written. The explicit
 schema-v8 upgrade preserves existing binding bytes, observations and foreign keys.
+
+## Explicit local adoption (schema v9)
+
+`runtime PROJECT adopt BINDING --expected-revision R --expected-head H` checks
+known projects under the root execution lease, collects fresh resource evidence,
+and records an adopted ownership claim. It does not prompt or launch an agent.
+The scanner refuses conflicting canonical or legacy references, corrupt inventory,
+older canonical stores lacking runtime bindings, and recognizable projects missing
+their project marker. Resolved legacy references still count. Inventory is bounded
+to 1,024 root entries/bindings and 256 entries per legacy thread directory.
+
+Claims bind the complete runtime identity, config, local socket/worktree device,
+inode and birth time, and detected agent kind/name. Unsupported incarnation evidence
+refuses adoption. Remote adoption is not supported. A live task agent creates a
+retained running attempt and advances its task revision; coordinator or worktree-only
+adoption creates no worker attempt. Collect fresh observations after adoption before
+requesting active control. Matching repeated adoption is idempotent.
+
+Recorded evidence of replacement or lost ownership pauses active control without
+releasing capacity. Pane absence or idle status is never termination evidence.
+Adopted resources do not grant destructive cleanup authority. Explicit termination
+and relinquishment remain to be implemented; rebinding owned resources refuses
+until that path exists. Conflict protection covers projects in this root only.

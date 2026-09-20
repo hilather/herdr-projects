@@ -68,3 +68,6 @@ mod notification_delivery;
 
 #[cfg(feature="state-store")]
 mod finalization_delivery;
+
+#[cfg(feature="state-store")]
+mod runtime_ownership;

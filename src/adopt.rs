@@ -41,6 +41,14 @@ pub fn adoptable_agent(ctx: &Ctx, herdr: &Herdr, socket: &str, pane: &str) -> Re
             bail!("pane {pane} is already thread {} of `{slug}`", t.id);
         }
     }
+    #[cfg(feature="state-store")]
+    crate::runtime_ownership::check_conflicts(ctx,&ctx.root,None,&herdr_projects::domain::RuntimeIdentity{socket:socket.into(),pane_id:pane.into(),..Default::default()})?;
+    #[cfg(not(feature="state-store"))]
+    for slug in project::list_slugs(&ctx.root) {
+        if ctx.root.join(&slug).join(".state/format.json").exists()||ctx.root.join(&slug).join(".state/migration").exists() {
+            bail!("a migrated project exists in this root; use a state-store build to check adoption ownership");
+        }
+    }
     Ok(agent)
 }
 

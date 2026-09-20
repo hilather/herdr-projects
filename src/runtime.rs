@@ -61,7 +61,14 @@ pub fn observe_imported_receipts(project:&Path,expected_head:Option<u64>)->Resul
 pub fn record_observations(project:&Path,batch:&crate::reconcile::ObservationBatch)->Result<u64> {
     ensure!(!batch.dispatch_allowed,"observations cannot authorize dispatch");
     let _maintenance=migration::maintenance(project)?;
-    Ok(migration::open_active(project)?.record_observations(batch.expected_head,&batch.observations)?)
+    record_observations_held(project,batch)
+}
+/// Caller retains the root execution lease while committing live evidence.
+pub fn record_observations_held(project:&Path,batch:&crate::reconcile::ObservationBatch)->Result<u64> {
+    ensure!(!batch.dispatch_allowed,"observations cannot authorize dispatch");
+    let mut db=migration::open_active(project)?;
+    let head=db.record_observations(batch.expected_head,&batch.observations)?;
+    migration::publish_control_marker(project,&db)?;Ok(head)
 }
 
 pub fn rebind(project:&Path,id:&str,expected_revision:u64,expected_head:u64,route:&crate::domain::RuntimeRoute)->Result<crate::domain::RouteChange> {
@@ -117,4 +124,12 @@ pub fn enqueue_finalization(project:&Path,expected_head:u64,operation:crate::dom
     let config=migration::config_reference(Path::new(&payload.config.path))?;
     payload.validate(&operation,&db.read_snapshot(Some(expected_head))?,&config)?;
     db.commit(Commit{expected_head,mutations:vec![Mutation::Enqueue(operation.clone())]})?;Ok(operation)
+}
+
+/// Caller retains the root execution lease after live/conflict inspection.
+pub fn adopt_observed(project:&Path,id:&str,revision:u64,head:u64,config:&migration::ConfigReference)->Result<crate::store::OwnershipChange> {
+    ensure!(migration::config_reference(Path::new(&config.path))?==*config,"config changed before adoption commit");
+    let mut db=migration::open_active(project)?;
+    let change=db.adopt_runtime(id,revision,head,jiff::Timestamp::now().as_millisecond(),config.digest.as_deref())?;
+    migration::publish_control_marker(project,&db)?;Ok(change)
 }

@@ -36,6 +36,17 @@ impl SqliteStore {
             tx.execute("INSERT INTO runtime_observations VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(binding_id) DO UPDATE SET binding_revision=excluded.binding_revision,task_revision=excluded.task_revision,observed_unix_ms=excluded.observed_unix_ms,payload=excluded.payload,payload_hash=excluded.payload_hash",params![binding.id,integer(binding.revision)?,observation.task_revision.map(integer).transpose()?,observation.observed_unix_ms,payload,format!("{:x}",Sha256::digest(payload.as_bytes()))])?;
             tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.observed',?1,?2,1,?3)",params![binding.id,integer(binding.revision)?,payload])?;
         }
+        let schema:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
+        if schema>=9&&super::control::read(&tx)?.state==ProjectState::Active {
+            let mut changed=false;
+            for owned in super::ownership::read_all(&tx)? {
+                if let Some(binding)=bindings.iter().find(|b|b.id==owned.binding&&b.revision==owned.binding_revision) {
+                    let valid=match observations.iter().find(|o|o.binding==binding.id) {Some(o)=>super::ownership::observed(binding,binding.task.as_ref().and_then(|id|tasks.get(id).copied()),o,o.observed_unix_ms,o.config_digest.as_deref())&&super::ownership::matches(&owned,binding,o)?,None=>false};
+                    if !valid{changed=true;}
+                }
+            }
+            if changed {super::control::invalidate(&tx)?;}
+        }
         let result=head(&tx)?;tx.commit()?;Ok(result)
     }
 }
