@@ -1357,3 +1357,40 @@ All 507 tests pass in debug and release (165 library, 310 binary, 30 CLI, two
 contracts). The default-feature suite passes (29 library, 263 binary, 11 CLI, two
 contracts). Three optional live checks remain ignored. Logs:
 `/tmp/herdr-live-control-{debug,release,default}.log`.
+
+
+## W04 trusted supervised copy worker
+
+The bounded transfer lane now has a live-copy request/worker adapter. Requests freeze
+canonical project path and filesystem identity, execution fingerprint, prior hash and
+receipt, pending projection/sequence, configuration path and digest (including absent
+versus empty), helper selection and machine target. Worker entry acquires project and
+inherited transfer ownership and revalidates those inputs before effects.
+
+The service uses concrete surviving process supervision for machine discovery, remote
+capability probing and streaming. Remote helpers must advertise live protocol 1;
+unsupported helpers never fall back to shell/rsync copy. Sender success is mandatory
+before parsing or publication, and current configuration/routing is checked again
+before publication. Original queue deadline and cancellation carry through transport,
+receive, verification and receipt persistence. Temporary spools are reserved before
+transport and removed separately from intent-owned recovery stages.
+
+Pending projections resume exact retained bytes with current matching authority;
+recovery does not probe or fetch the source. A changed configuration blocks recovery
+while preserving its intent. Transfer ownership spans publication and durable receipt
+commit. Completion output performs no durable certification. Automatic ticker
+admission is still disabled pending shared routine/copy fairness integration.
+
+Independent review approved the service and independently passed eight real-process
+fixtures covering binary/literal local transfer, valid bytes from a failed sender,
+stale execution/receipt/configuration/project, expired/cancelled requests, exact
+source-loss recovery, remote capability/route changes, mid-stream cancellation and
+ownership release, and refusal to trust an injected observation Runner. Remote tests
+use disposable local SSH/helper fixtures; actual remote-host interoperability is not
+claimed. Card counts remain 16 locally implemented, five partial and 20 not started;
+macOS remains untested.
+
+All 515 tests pass in debug and release (165 library, 318 binary, 30 CLI, two
+contracts). Default-feature tests also pass (29 library, 271 binary, 11 CLI, two
+contracts); three optional live checks remain ignored. Logs:
+`/tmp/herdr-copy-worker-{debug,release,default}.log`.

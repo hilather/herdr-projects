@@ -6,6 +6,7 @@ mod actions;
 mod agents;
 mod artifacts;
 mod source_tree;
+mod copy_jobs;
 mod adopt;
 mod cli;
 mod cleanup;
