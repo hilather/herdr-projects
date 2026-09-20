@@ -724,3 +724,12 @@ fn coordinator_start_import_requires_confirmed_delivery_and_retains_uncertain_hi
     claim.phase=crate::launch_claim::Phase::Uncertain;claim.error="lost reply".into();value["launch_claim"]=serde_json::to_value(&claim).unwrap();assert!(validate_runtime(".state/coordinator.json",&value).is_err());
     value["prime_request"]=2.into();assert!(validate_runtime(".state/coordinator.json",&value).is_err());
 }
+#[test]
+fn notification_claims_and_suppression_require_reconciliation_before_import() {
+    use crate::notification_claim::{Batch,Claim,Mode,Phase};
+    let mut claim=Claim{sequence:1,batch:Some(Batch::new(vec!["item-a".into()]).unwrap()),mode:Mode::Toast,authority:"a".repeat(64),payload:"fixture".into(),phase:Phase::Pending,retry_of:None,error:String::new()};
+    let mut value=serde_json::json!({"notification_sequence":1,"notification_claim":claim,"notification_suppressed":[]});assert!(validate_runtime(".state/ticker.json",&value).is_err());
+    claim.phase=Phase::Confirmed;value["notification_claim"]=serde_json::to_value(&claim).unwrap();assert!(validate_runtime(".state/ticker.json",&value).is_ok());
+    for phase in [Phase::Uncertain,Phase::NotShown] {claim.phase=phase;claim.error="pending delivery".into();value["notification_claim"]=serde_json::to_value(&claim).unwrap();assert!(validate_runtime(".state/ticker.json",&value).is_err());}
+    claim.phase=Phase::Suppressed;value["notification_claim"]=serde_json::to_value(&claim).unwrap();assert!(validate_runtime(".state/ticker.json",&value).is_ok());value["notification_suppressed"]=serde_json::json!(["item-a"]);assert!(validate_runtime(".state/ticker.json",&value).is_err());
+}

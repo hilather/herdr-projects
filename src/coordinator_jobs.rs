@@ -7,10 +7,12 @@ use herdr_projects::{execution_guard::ProjectGuard,coordinator_prime::Claim,prom
 const JOB:&str="\0herdr-projects-coordinator-prime";
 #[path="coordinator_start_jobs.rs"]
 mod start;
+#[path="notification_jobs.rs"]
+mod notification;
 const BUDGET:Duration=Duration::from_secs(45);
 #[derive(Clone,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Input {#[serde(default)] start:bool,project:PathBuf,identity:(u64,u64),execution:String,request:u64,sequence:u64,socket:PathBuf,socket_identity:(u64,u64),herdr:String,config:PathBuf,config_digest:Option<String>,settings_digest:String,prompt:String}
+struct Input {#[serde(default)] start:bool,#[serde(default)] notification:bool,project:PathBuf,identity:(u64,u64),execution:String,request:u64,sequence:u64,socket:PathBuf,socket_identity:(u64,u64),herdr:String,config:PathBuf,config_digest:Option<String>,settings_digest:String,prompt:String}
 fn digest(text:Option<&str>)->Option<String>{text.map(|s|thread::sha256_hex(s.as_bytes()))}
 fn socket_identity(path:&Path)->Result<(u64,u64)>{use std::os::unix::fs::FileTypeExt;let m=std::fs::symlink_metadata(path)?;ensure!(m.file_type().is_socket(),"coordinator endpoint is not a socket");Ok((m.dev(),m.ino()))}
 fn execution(c:&Coordinator)->String{thread::sha256_hex(&serde_json::to_vec(&(&c.socket,&c.session,&c.workspace_id,&c.tab_id,&c.pane_id,&c.agent_name,&c.cwd,c.prime_request)).unwrap())}
@@ -63,17 +65,30 @@ pub fn recover(p:&Project,guard:&ProjectGuard)->Result<()> {
 }
 pub struct JobRunner{pub inner:Arc<dyn Runner+Send+Sync>}
 impl Runner for JobRunner {
-    fn run(&self,cmd:&Cmd)->Result<Output>{if cmd.program!=JOB{return self.inner.run(cmd);}let entered=Instant::now();ensure!(!cmd.timeout.is_zero()&&cmd.timeout<=BUDGET,"invalid coordinator worker budget");let control=Control{deadline:cmd.deadline.context("coordinator deadline missing")?.min(entered+cmd.timeout),cancellation:cmd.cancellation.clone().context("coordinator cancellation missing")?};let text=cmd.stdin.as_deref().context("coordinator input missing")?;ensure!(text.len()<=64*1024,"coordinator input exceeds bounds");let input:Input=serde_json::from_str(text)?;if input.start {start::execute(&input,&control)?;}else{execute(&input,&control)?;}Ok(Output{code:Some(0),elapsed:entered.elapsed(),..Default::default()})}
+    fn run(&self,cmd:&Cmd)->Result<Output>{if cmd.program!=JOB{return self.inner.run(cmd);}let entered=Instant::now();ensure!(!cmd.timeout.is_zero()&&cmd.timeout<=BUDGET,"invalid coordinator worker budget");let control=Control{deadline:cmd.deadline.context("coordinator deadline missing")?.min(entered+cmd.timeout),cancellation:cmd.cancellation.clone().context("coordinator cancellation missing")?};let text=cmd.stdin.as_deref().context("coordinator input missing")?;ensure!(text.len()<=64*1024,"coordinator input exceeds bounds");let input:Input=serde_json::from_str(text)?;ensure!(!(input.start&&input.notification),"conflicting coordinator job modes");if input.notification{notification::execute(&input,&control)?;}else if input.start {start::execute(&input,&control)?;}else{execute(&input,&control)?;}Ok(Output{code:Some(0),elapsed:entered.elapsed(),..Default::default()})}
     fn socket_request(&self,path:&Path,line:&str,timeout:Duration)->Result<String>{self.inner.socket_request(path,line,timeout)}
 }
-pub fn request(ctx:&Ctx,p:&Project,c:&Coordinator)->Result<crate::executor::Request>{request_mode(ctx,p,c,false)}
-pub fn request_start(ctx:&Ctx,p:&Project,c:&Coordinator)->Result<crate::executor::Request>{request_mode(ctx,p,c,true)}
-fn request_mode(ctx:&Ctx,p:&Project,c:&Coordinator,start:bool)->Result<crate::executor::Request>{
-    if start {ready_start(c)?;}else{ready(c)?;}let project=p.dir().canonicalize()?;let m=std::fs::metadata(&project)?;let config=std::path::absolute(&ctx.config_dir)?;let socket=PathBuf::from(&c.socket);ensure!(socket.is_absolute(),"coordinator session must be absolute");
+pub fn request(ctx:&Ctx,p:&Project,c:&Coordinator)->Result<crate::executor::Request>{request_mode(ctx,p,c,false,false)}
+pub fn request_start(ctx:&Ctx,p:&Project,c:&Coordinator)->Result<crate::executor::Request>{request_mode(ctx,p,c,true,false)}
+/// Cheap eligibility only. A worker re-reads and validates the entire inventory.
+pub fn notification_needed(p:&Project,state:&crate::steps::State)->bool {
+    use herdr_projects::notification_claim::Phase;
+    if !state.notification_suppressed.is_empty()||!state.notification_retry.hash.is_empty()
+        ||state.notification_claim.as_ref().is_some_and(|c|matches!(c.phase,Phase::Ready|Phase::Pending|Phase::Uncertain|Phase::NotShown)){return true;}
+    let Ok(entries)=std::fs::read_dir(p.dir().join("inbox")) else{return true;};
+    for (n,entry) in entries.enumerate(){if n>=32{return true;}let Ok(entry)=entry else{return true;};if entry.path().extension().is_some_and(|s|s=="md"){return true;}}
+    false
+}
+pub fn request_notification(ctx:&Ctx,p:&Project,c:&Coordinator)->Result<crate::executor::Request>{request_mode(ctx,p,c,false,true)}
+pub fn recover_notification(p:&Project,guard:&ProjectGuard)->Result<()> {notification::recover(p,guard)}
+pub fn inspect_notification(p:&Project)->Result<serde_json::Value>{notification::inspect(p)}
+pub fn reconcile_notification(ctx:&Ctx,p:&Project,sequence:u64,retry:bool)->Result<()> {notification::reconcile(ctx,p,sequence,retry)}
+fn request_mode(ctx:&Ctx,p:&Project,c:&Coordinator,start:bool,notification:bool)->Result<crate::executor::Request>{
+    if notification{validate(c)?;}else if start {ready_start(c)?;}else{ready(c)?;}let project=p.dir().canonicalize()?;let m=std::fs::metadata(&project)?;let config=std::path::absolute(&ctx.config_dir)?;let socket=PathBuf::from(&c.socket);ensure!(socket.is_absolute(),"coordinator session must be absolute");
     let cfg=paths::read_control_text(&config.join("config.toml"),1024*1024)?;let md=paths::read_control_text(&p.project_md(),1024*1024)?.context("project settings missing")?;
-    let input=Input{start,project:project.clone(),identity:(m.dev(),m.ino()),execution:execution(c),request:c.prime_request,sequence:if start{c.launch_sequence}else{c.prime_sequence},socket_identity:socket_identity(&socket)?,socket,herdr:ctx.env.herdr_bin(),config,config_digest:digest(cfg.as_deref()),settings_digest:thread::sha256_hex(md.as_bytes()),prompt:crate::coordinator::priming_prompt(&crate::coordinator::current_prefix(&p.root)?,&p.slug)};
+    let input=Input{start,notification,project:project.clone(),identity:(m.dev(),m.ino()),execution:execution(c),request:c.prime_request,sequence:if start{c.launch_sequence}else{c.prime_sequence},socket_identity:socket_identity(&socket)?,socket,herdr:ctx.env.herdr_bin(),config,config_digest:digest(cfg.as_deref()),settings_digest:thread::sha256_hex(md.as_bytes()),prompt:crate::coordinator::priming_prompt(&crate::coordinator::current_prefix(&p.root)?,&p.slug)};
     let text=serde_json::to_string(&input)?;ensure!(text.len()<=64*1024,"coordinator input exceeds bounds");let deadline=Instant::now()+BUDGET;let mut command=Cmd::new(JOB,BUDGET).stdin(text);command.deadline=Some(deadline);
-    Ok(crate::executor::Request{identity:crate::executor::Identity{operation:if start{"coordinator-start"}else{"coordinator-prime"}.into(),revision:1,project:project.display().to_string(),machine:format!("brief-root:{}",project.parent().unwrap().display()),terminal:Some(c.pane_id.clone())},lane:crate::executor::Lane::Control,deadline,command})
+    Ok(crate::executor::Request{identity:crate::executor::Identity{operation:if notification{"notification"}else if start{"coordinator-start"}else{"coordinator-prime"}.into(),revision:1,project:project.display().to_string(),machine:format!("brief-root:{}",project.parent().unwrap().display()),terminal:Some(c.pane_id.clone())},lane:crate::executor::Lane::Control,deadline,command})
 }
 #[cfg(test)]
 #[path="coordinator_jobs_tests.rs"]

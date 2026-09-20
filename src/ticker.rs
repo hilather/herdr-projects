@@ -331,6 +331,15 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
                 Ok(())
             })();
             if let Err(error)=recovered {log.line(&format!("{slug}: coordinator prime recovery: {error:#}"));continue;}
+            let recovered=(||->Result<()> {
+                let state=steps::try_load_state(&project)?;
+                if state.notification_claim.as_ref().is_some_and(|c|c.phase==herdr_projects::notification_claim::Phase::Pending)
+                    ||(state.notification_claim.is_none()&&!state.notification_retry.hash.is_empty()&&state.notification_retry.retry.attempts>0) {
+                    let guard=herdr_projects::execution_guard::ProjectGuard::acquire(&project.dir())?;
+                    crate::coordinator_jobs::recover_notification(&project,&guard)?;
+                }Ok(())
+            })();
+            if let Err(error)=recovered{log.line(&format!("{slug}: notification recovery: {error:#}"));continue;}
             let (threads,diagnostics)=thread::list_with_diagnostics(&project);
             for error in diagnostics {log.line(&format!("{slug}: {error}"));}
             if threads.iter().any(|t|t.launch_claim.as_ref().is_some_and(|claim|claim.phase==thread::launch_delivery::Phase::Pending||!claim.notified)) {
@@ -674,7 +683,9 @@ fn tick_cheap_reports(ctx: &Ctx, project: &Project,mut reads:Option<&mut crate::
 
     // Nudge (or notify) about inbox items `context` has not shown yet.
     let mut notification_error = None;
-    if let Ok((settings, _)) = project.read_project_md() {
+    if let Some(queue)=copies.as_deref_mut() {
+        if crate::coordinator_jobs::notification_needed(project,&state)&&let Err(error)=queue.offer_notification(ctx,project,&record){notification_error=Some(format!("notification admission: {error:#}"));}
+    } else if let Ok((settings, _)) = project.read_project_md() {
         let before = state.clone();
         let primed=project.try_coordinator()?.is_some_and(|c|!c.prime_pending);
         let ready_pane = agent.filter(|a| a.ready()&&primed).map(|_| record.pane_id.as_str());

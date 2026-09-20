@@ -35,6 +35,9 @@ impl Queue {
     pub fn offer_final(&mut self,ctx:&Ctx,project:&Project,t:&Thread,target:Option<&str>,purpose:Purpose,operation:String)->Result<()> {
         self.offer_request(request_final(ctx,project,t,target,purpose,operation)?)
     }
+    pub fn offer_notification(&mut self,ctx:&Ctx,project:&Project,c:&crate::project::Coordinator)->Result<()> {
+        self.offer_request(crate::coordinator_jobs::request_notification(ctx,project,c)?)
+    }
     pub fn offer_coordinator_start(&mut self,ctx:&Ctx,project:&Project,c:&crate::project::Coordinator)->Result<()> {
         self.offer_request(crate::coordinator_jobs::request_start(ctx,project,c)?)
     }
@@ -79,7 +82,7 @@ impl Queue {
             Err(error)=>Err(error),
         };
         let pending=self.pending.take().unwrap();let now=Instant::now();
-        if let Some(entry)=self.entries.get_mut(&pending.key) {entry.not_before=now+if result.is_err(){Duration::from_secs(30)}else{Duration::ZERO};entry.touched=now;entry.needed=result.is_err();}
+        if let Some(entry)=self.entries.get_mut(&pending.key) {entry.not_before=now+if result.is_err()||pending.identity.operation=="notification"{Duration::from_secs(30)}else{Duration::ZERO};entry.touched=now;entry.needed=result.is_err();}
         result.err().map(|e|format!("{} {}: background queue: {e:#}",pending.key.0,pending.key.1)).into_iter().collect()
     }
     pub fn admit(&mut self)->Vec<String> {

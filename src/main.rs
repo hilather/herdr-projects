@@ -15,6 +15,7 @@ mod cli;
 mod cleanup;
 mod coordinator;
 mod coordinator_jobs;
+mod notification_inventory;
 mod doctor;
 mod herdr;
 mod inbox;

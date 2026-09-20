@@ -89,7 +89,18 @@ enum RoutineStoreCommand {
 }
 
 #[derive(Subcommand)]
+enum NotificationCommand {
+    Inspect,
+    /// Suppress another delivery after inspecting the existing outcome
+    Acknowledge {#[arg(long)] sequence:u64},
+    /// Explicitly authorize a retry that may duplicate the previous delivery
+    Retry {#[arg(long)] sequence:u64,#[arg(long)] accept_possible_duplicate:bool},
+}
+
+#[derive(Subcommand)]
 enum Command {
+    /// Inspect or explicitly reconcile uncertain legacy inbox delivery
+    Notification {slug:String,#[command(subcommand)] command:NotificationCommand},
     /// Inspect owner signing policy and manage signed launch approvals
     #[cfg(feature="state-store")]
     Approval { slug:String, #[command(subcommand)] command:ApprovalCommand },
@@ -493,6 +504,14 @@ pub fn run() -> Result<()> {
     };
 
     match cli.command {
+        Command::Notification{slug,command}=>{
+            let p=project::Project::load(&ctx.root,&slug)?;
+            match command {
+                NotificationCommand::Inspect=>println!("{}",serde_json::to_string_pretty(&crate::coordinator_jobs::inspect_notification(&p)?)?),
+                NotificationCommand::Acknowledge{sequence}=>{crate::coordinator_jobs::reconcile_notification(&ctx,&p,sequence,false)?;println!("Notification {sequence} acknowledged without another delivery.");},
+                NotificationCommand::Retry{sequence,accept_possible_duplicate}=>{anyhow::ensure!(accept_possible_duplicate,"retry may duplicate delivery; pass --accept-possible-duplicate after inspecting the outcome");crate::coordinator_jobs::reconcile_notification(&ctx,&p,sequence,true)?;crate::ticker::start(&ctx)?;println!("Explicit notification retry queued.");},
+            }Ok(())
+        },
         #[cfg(feature="state-store")]
         Command::RoutineStore{slug,command}=>{
             project::validate_slug(&slug)?;let dir=ctx.root.join(slug);

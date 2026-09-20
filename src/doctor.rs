@@ -172,6 +172,10 @@ fn report(
                         check(&mut out, None, &label, format!("notification: {}; next {}",
                             crate::pr::sanitize(&state.notification_retry.retry.last_error), state.notification_retry.retry.next_attempt));
                     }
+                    if let Some(claim)=&state.notification_claim {
+                        let count=claim.batch.as_ref().map_or_else(||"unknown legacy batch".to_string(),|b|format!("{} item(s)",b.ids.len()));
+                        check(&mut out,None,&label,format!("notification sequence {}: {:?}, {}; inspect with `notification {} inspect`; reconcile with `notification {} acknowledge --sequence {}` or `notification {} retry --sequence {} --accept-possible-duplicate`",claim.sequence,claim.phase,count,project.slug,project.slug,claim.sequence,project.slug,claim.sequence));
+                    }
                     if !state.gh_outages.is_empty() || !state.machine_outages.is_empty() {
                         check(&mut out, None, &label, format!("{} GitHub resource outage(s), {} machine outage(s)", state.gh_outages.len(), state.machine_outages.len()));
                     }

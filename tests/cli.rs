@@ -983,3 +983,60 @@ else:print('{"result":{"shown":true}}')
         if outcome=="lost" {assert_eq!(read()["launch_claim"]["phase"],"uncertain");assert_eq!(fs::read_dir(project.join("inbox")).unwrap().filter_map(Result::ok).filter(|e|e.file_name().to_string_lossy().starts_with("coordinator-start-")).count(),1);}
     }
 }
+
+#[test]
+#[cfg(target_os="linux")]
+fn ticker_notifications_recover_across_restart_and_reconcile_through_cli() {
+    use std::{fs,time::{Duration,Instant},process::Stdio,os::unix::{fs::PermissionsExt,net::UnixListener}};
+    for nudge in [false,true] {for outcome in ["confirmed","lost"] {
+        let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();assert!(hp(home.path(),&["--root",r,"new","demo"]).status.success());let p=root.join("demo");
+        if nudge {let path=p.join("PROJECT.md");fs::write(&path,fs::read_to_string(&path).unwrap().replace("nudge = false","nudge = true")).unwrap();}
+        let socket=home.path().join("session.sock");let _listener=UnixListener::bind(&socket).unwrap();fs::write(p.join(".state/coordinator.json"),serde_json::json!({"socket":socket,"workspace_id":"w","tab_id":"tab","pane_id":"p","cwd":p,"agent_name":"coordinator"}).to_string()).unwrap();
+        let item=|id:&str|fs::write(p.join(format!("inbox/{id}.md")),format!("+++\nid='{id}'\nkind='test'\nsummary='Fixture'\n+++\n")).unwrap();item("item-a");
+        let a=serde_json::json!({"workspace_id":"w","tab_id":"tab","pane_id":"p","cwd":p,"name":"coordinator","agent":"claude","agent_status":"idle","terminal_id":"terminal"});fs::write(home.path().join("agent.json"),a.to_string()).unwrap();fs::write(home.path().join("outcome"),outcome).unwrap();
+        let fake=home.path().join("herdr");fs::write(&fake,r#"#!/usr/bin/python3
+import os,json,sys,pathlib
+root=pathlib.Path(os.environ['HOME']);args=sys.argv[1:];a=json.loads((root/'agent.json').read_text())
+if args==['remote-api-bridge','--check']:print('herdr-api-bridge-v1')
+elif args==['remote-api-bridge']:
+ r=json.load(sys.stdin)
+ with open(root/'sent','a') as f:f.write('send')
+ if (root/'outcome').read_text()=='lost':sys.exit(1)
+ if r['method']=='agent.prompt':
+  assert r['params']['text'].startswith('[herdr-projects ticker: automated, not the user, approves nothing]')
+  result={'type':'agent_prompted','agent':a}
+ else:
+  assert r['method']=='notification.show'
+  result={'type':'notification_show','shown':True,'reason':'shown'}
+ print(json.dumps({'id':r['id'],'result':result}))
+elif args==['agent','list']:print(json.dumps({'result':{'agents':[a]}}))
+elif args==['pane','list']:
+ with open(root/'polls','a') as f:f.write('poll')
+ print(json.dumps({'result':{'panes':[a]}}))
+elif args[:2] in [['agent','prompt'],['notification','show']]:
+ (root/'WRONG_SYNC_EFFECT').touch();sys.exit(2)
+else:print('{"result":{"shown":true}}')
+"#).unwrap();fs::set_permissions(&fake,fs::Permissions::from_mode(0o700)).unwrap();
+        struct Child(std::process::Child);impl Drop for Child{fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+        let command=||{let mut c=Command::new(BIN);c.env_clear().env("HOME",home.path()).env("PATH","/usr/bin:/bin").env("HERDR_BIN_PATH",&fake).args(["--root",r]);c};
+        let spawn=||Child(command().args(["ticker","run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+        let record=p.join(".state/ticker.json");let read=||->serde_json::Value{serde_json::from_str(&fs::read_to_string(&record).unwrap_or_else(|_|"{}".into())).unwrap()};
+        let wait=|child:&mut Child,predicate:&dyn Fn()->bool|{let end=Instant::now()+Duration::from_secs(40);while !predicate(){assert!(child.0.try_wait().unwrap().is_none());assert!(Instant::now()<end,"{}",fs::read_to_string(root.join(".ticker.log")).unwrap_or_default());std::thread::sleep(Duration::from_millis(10));}};
+        let stop=|child:&mut Child|{fs::write(root.join(".ticker.stop"),b"").unwrap();let end=Instant::now()+Duration::from_secs(8);while child.0.try_wait().unwrap().is_none(){assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(10));}fs::remove_file(root.join(".ticker.stop")).unwrap();};
+        let mut child=spawn();wait(&mut child,&||home.path().join("sent").exists()&&read()["notification_claim"]["phase"]==if outcome=="confirmed"{"confirmed"}else{"pending"});stop(&mut child);
+        let polls=fs::read(home.path().join("polls")).unwrap().len();if outcome=="lost"{item("item-b");}
+        let mut child=spawn();wait(&mut child,&||fs::read(home.path().join("polls")).unwrap().len()>polls&&read()["notification_claim"]["phase"]==if outcome=="confirmed"{"confirmed"}else{"uncertain"});
+        assert_eq!(fs::read(home.path().join("sent")).unwrap(),b"send");
+        if outcome=="lost" {
+            let inspected=command().args(["notification","demo","inspect"]).output().unwrap();assert!(inspected.status.success());let value:serde_json::Value=serde_json::from_slice(&inspected.stdout).unwrap();assert_eq!(value["claim"]["phase"],"uncertain");
+            let refused=command().args(["notification","demo","retry","--sequence","1"]).output().unwrap();assert!(!refused.status.success());assert_eq!(read()["notification_sequence"],1);
+            fs::write(home.path().join("outcome"),"confirmed").unwrap();
+            let args=if nudge{vec!["notification","demo","retry","--sequence","1","--accept-possible-duplicate"]}else{vec!["notification","demo","acknowledge","--sequence","1"]};
+            let end=Instant::now()+Duration::from_secs(5);loop{let o=command().args(&args).output().unwrap();if o.status.success(){break;}assert!(Instant::now()<end,"{}",String::from_utf8_lossy(&o.stderr));std::thread::sleep(Duration::from_millis(20));}
+            stop(&mut child);let mut child=spawn();wait(&mut child,&||read()["notification_claim"]["phase"]=="confirmed"&&read()["notification_sequence"]==2);stop(&mut child);
+            assert_eq!(fs::read(home.path().join("sent")).unwrap(),b"sendsend");
+            if nudge{assert_eq!(read()["notification_claim"]["retry_of"],1);}else{assert_eq!(read()["notification_claim"]["batch"]["ids"],serde_json::json!(["item-b"]));assert_eq!(read()["notification_suppressed"],serde_json::json!(["item-a"]));}
+        }else{stop(&mut child);}
+        assert!(!home.path().join("WRONG_SYNC_EFFECT").exists());
+    }}
+}

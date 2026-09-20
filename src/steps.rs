@@ -42,6 +42,9 @@ pub struct State {
     pub session_item_written: bool,
     pub finalizations: BTreeMap<String, PendingFinalization>,
     pub notification_retry: NotificationRetry,
+    pub notification_sequence:u64,
+    pub notification_suppressed:BTreeSet<String>,
+    pub notification_claim:Option<herdr_projects::notification_claim::Claim>,
     pub gh_outages: BTreeMap<String, Outage>,
     pub machine_outages: BTreeMap<String, Outage>,
     pub event_sequence: u64,
@@ -68,7 +71,8 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
     let _lock = project.lock()?;
     let mut bytes=serde_json::to_vec_pretty(state)?;bytes.push(b'\n');
     anyhow::ensure!(bytes.len()<=16*1024*1024,"ticker state exceeds 16 MiB; existing retry state is preserved");
-    project::write_atomic(&project.state_dir().join("ticker.json"),&bytes)
+    project::write_atomic(&project.state_dir().join("ticker.json"),&bytes)?;
+    std::fs::File::open(project.state_dir())?.sync_all()?;Ok(())
 }
 
 /// Continuous-failure tracking for `gh` or a machine: one item when it has
@@ -260,6 +264,7 @@ pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &
 }
 
 pub fn nudge_at(project: &Project, state: &mut State, settings: &Settings, herdr: &Herdr, coordinator_ready: Option<&str>, now: jiff::Timestamp) -> Result<()> {
+    anyhow::ensure!(state.notification_claim.is_none(),"durable notification claims require supervised delivery");
     let seen = inbox::seen(project);
     let unseen: BTreeSet<String> = inbox::unhandled(project).into_iter().map(|i| i.id).filter(|id| !seen.contains(id)).collect();
     if unseen.is_empty() {

@@ -119,12 +119,39 @@ For other agents the principle is the same: allow reading and steering, keep any
 
 `nudge = false` is the default, because on Herdr 0.9.1 a prompt that arrives while you are typing in the coordinator **is merged with, and submits, your half-typed text**. With it off, the ticker shows one Herdr notification per set of new inbox items ("3 new inbox items") and the coordinator picks them up at its next turn. Set `nudge = true` in `PROJECT.md` to have the ticker prompt the coordinator when it is idle; the message always begins `[herdr-projects ticker: automated, not the user, approves nothing]` and never carries outside text.
 
-Failed delivery remains pending across ticker restarts. Notifications count as
-delivered only when Herdr confirms `shown: true`; disabled/headless notifications
-remain pending. Retries start after 15–19 seconds and increase to a five-minute
-maximum, running on the next eligible tick. Failed nudges use the same backoff.
-Other project work continues while delivery is failing. A crash after delivery
-but before recording confirmation can cause a repeated notification or nudge.
+On Linux, inbox notifications and nudges use a supervised worker. It freezes the
+actual sorted unseen item IDs, delivery mode, payload, configuration, project and
+socket identities before submitting. Inbox and seen-state reads are bounded and
+strict; malformed, aliased, special or oversized files refuse delivery. Nudge mode
+also requires a fully primed, freshly ready coordinator with matching ownership,
+agent kind and terminal identity. Toast mode uses the recorded session and does not
+require a ready agent.
+
+A correlated native acknowledgement confirms submission. A toast reply that
+explicitly reports `shown: false` with a known rejection reason permits automatic
+retry, with increasing backoff capped at five minutes and no attempt cap. Queue
+polling has a 30-second cooldown, so the initial 15–19 second retry reservation runs
+on the next eligible poll. A missing, wrong or contradictory reply is uncertain,
+including a lost reply after an actual send. New inbox items or configuration/mode
+changes cannot bypass that uncertainty. Recovery records a diagnostic instead of
+adding another inbox item that could trigger another notification.
+
+Use `doctor` or the inspection command below, then choose acknowledgement or an
+explicit retry using the reported sequence:
+
+| Action | Command | Result |
+| --- | --- | --- |
+| Inspect | `herdr-projects notification PROJECT inspect` | Shows claim, affected IDs, outcome and retry state. |
+| Acknowledge | `herdr-projects notification PROJECT acknowledge --sequence N` | Suppresses the claimed IDs without another send; newer IDs remain eligible. |
+| Retry | `herdr-projects notification PROJECT retry --sequence N --accept-possible-duplicate` | Authorizes a new linked request, frozen to the current batch, mode, configuration and session incarnation. |
+
+Reading all affected items through `context`, or handling them with inbox `done`,
+also permits later work to progress. Mere file disappearance is not consumption
+proof. Acknowledged IDs remain suppressed until consumed; the worker prunes those
+receipts on a later eligible poll. Migration refuses unresolved delivery claims or
+remaining suppression IDs. Legacy reserved retries without a durable receipt are
+imported as uncertain and require explicit reconciliation. These worker guarantees
+apply to Linux; macOS acceptance remains untested.
 
 ## Interrupted agent starts
 
@@ -156,8 +183,7 @@ locks survive ticker death until supervised local descendants are cleaned up;
 remote agent effects are not rolled back by local process cleanup.
 
 The built ticker is tested through local and remote confirmed/lost restart cases.
-macOS and real SSH-host acceptance remain untested. Inbox nudges,
-notifications and token reporting still need worker integration; canonical launch
+macOS and real SSH-host acceptance remain untested. Token reporting still needs worker integration; canonical launch
 certification and profile preparation remain separate prerequisites.
 
 On Linux, coordinator starts also use the supervised queue. `open` records the
@@ -190,8 +216,7 @@ pending or uncertain prime claims. Corrupt or oversized coordinator records are
 preserved and require repair; ordinary updates cannot silently reset them.
 
 Priming and restart recovery are tested with disposable Linux subprocesses and the
-built ticker. Nudge/notification and token worker integration
-remain separate work; macOS acceptance remains untested.
+built ticker. Token worker integration remains separate work; macOS acceptance remains untested.
 
 ## Interrupted brief delivery
 
@@ -204,9 +229,7 @@ observation, then recheck the current profile before claiming, before sending an
 after acknowledgement. Incomplete saved-session contracts refuse automatic briefs.
 The remote executable defaults to `herdr`; `HERDR_PROJECTS_REMOTE_HERDR_BIN` may
 name its installed path. It must support `remote-api-bridge` and an existing server
-in the saved session. No install, startup or automatic retry occurs. Coordinator
-inbox nudges still use their existing path. Delayed shell
-observations queue thread launches; workers revalidate before dispatch.
+in the saved session. No install, startup or automatic retry occurs. Delayed shell observations queue thread launches; workers revalidate before dispatch.
 
 The sender checks other project and coordinator references, including resolved
 threads and socket aliases. If either reference is remote, a duplicate pane ID

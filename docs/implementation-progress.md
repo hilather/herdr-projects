@@ -2091,3 +2091,72 @@ open replay regression and start-to-prime restart cases.
 The final default-feature suite passed 426 tests (30 library, 374 binary, 20 CLI,
 two contracts), with the same three optional live checks ignored. Log:
 `/tmp/herdr-coordinator-start-default.log`.
+
+## W04 supervised inbox notifications and nudges
+
+Linux ticker inbox delivery now uses the shared supervised Control queue. A cheap
+bounded directory-name hint avoids empty inbox work, and notification admission has
+a 30-second cooldown after completion. Authoritative capture stays in the worker:
+strict regular-file reads, 50 MiB scan budget, 16 MiB item/1 MiB seen-file limits,
+1024 IDs/48 KiB identity budget, finite directory bounds and cancellation checks.
+The worker freezes actual IDs, mode, payload and project/socket/configuration
+identity under project ownership before durably claiming submission. Nudge mode
+requires a fully primed, uniquely owned ready coordinator of the configured kind;
+toast mode uses the recorded session. No queue completion is a delivery receipt.
+
+Correlated native acknowledgements confirm submission. A typed toast rejection
+(`notification_show`, `shown=false`, known reason) retains automatic exponential
+backoff, capped at five minutes with no attempt cap. Missing, mismatched or
+contradictory acknowledgements remain uncertain. Uncertain A blocks A+B and mode/
+route/settings changes. Recovery writes only the existing diagnostic state, avoiding
+a self-triggering uncertainty inbox item. Legacy reserved retry records with no
+receipt become uncertain without an automatic send.
+
+The CLI adds `notification PROJECT inspect`, `acknowledge --sequence N`, and
+`retry --sequence N --accept-possible-duplicate`. Acknowledgement suppresses only
+claimed IDs in a bounded ledger, allowing newer items without replaying old IDs.
+Retry writes a new linked Ready claim bound to the exact current inputs; changed
+inputs require another reconciliation. Context seen receipts or valid handled items
+prove consumption; mere disappearance does not. Worker receipts reload and retain
+unrelated ticker state, and state publication now fsyncs its parent directory.
+Migration refuses unresolved claims and remaining suppression IDs. Doctor reports
+claim sequence, outcome, count and reconciliation commands.
+
+Independent review found that retry authority initially omitted socket incarnation.
+The corrected digest binds canonical project path/dev/inode, socket path/dev/inode,
+Herdr/config paths, config/settings digests, coordinator execution, executable
+prompt prefix and payload. A replacement-socket regression preserves Ready without
+sending. The separate reviewer approved the corrected source and suppression logic.
+
+Focused tests cover confirmation/no replay, unrelated state preservation, lost and
+mismatched replies, A+B/mode/route changes, acknowledgement versus frozen retry,
+consumption versus disappearance, native rejection backoff, preflight and post-claim
+changes/cancellation, receipt publication failure, legacy uncertainty, blocked-child
+cancellation, strict inventory limits and socket replacement. The built CLI ticker
+covers toast/nudge × confirmed/lost across restart, rejects retry without the
+explicit duplicate acknowledgement, and exercises CLI acknowledgement/new-item
+progress and explicit linked retry. The migration fixture checks all unresolved
+outcomes and suppression retention.
+
+Pinned native source at Herdr commit d59d0603d53bb88c5320ea508a4fb9858b61af68
+confirms GUI busy/disabled/rate-limited/no-client branches return before publishing
+the toast; the headless path returns negative results before dispatch or when no
+client accepts it. This corroborates the installed schema's typed negative receipt.
+Read-only evidence is in `/tmp/herdr-native-app-api.rs` and
+`/tmp/herdr-native-headless-notifications.rs`, with its channel-success predicate
+in `/tmp/herdr-native-headless.rs`; no real notification was sent.
+
+The overall plan remains active. Token reporting and local observation worker
+integration, canonical launch/profile preparation, budgets/telemetry and wider
+authority coverage remain before W05–W09. Counts remain 16 locally implemented,
+five partial and 20 unstarted. macOS and real SSH-host acceptance remain unavailable.
+
+All-feature debug and release suites each passed 657 tests (177 library, 438 binary,
+40 CLI, two contracts), with three optional live checks ignored. The focused
+notification run passed 28 checks (one library, 25 binary, two CLI). Logs:
+`/tmp/herdr-notification-{debug,release,focused}.log`.
+
+The default-feature suite also passed all 441 tests (30 library, 388 binary,
+21 CLI, two contracts), with the same three optional live checks ignored. Log:
+`/tmp/herdr-notification-default.log`. Independent review approved the corrected
+notification authority binding and reconciliation behavior.

@@ -408,11 +408,18 @@ fn validate_runtime(path:&str,value:&serde_json::Value)->Result<()> {
         },
         ".state/ticker.json"=>{
             ensure!(value.is_object(),"invalid ticker record");
+            let sequence=value.get("notification_sequence").map(|v|v.as_u64().context("invalid notification sequence")).transpose()?.unwrap_or(0);ensure!(sequence<=i64::MAX as u64,"notification sequence exhausted");
+            if let Some(claim)=value.get("notification_claim").filter(|v|!v.is_null()) {
+                let claim:crate::notification_claim::Claim=serde_json::from_value(claim.clone())?;claim.validate(sequence)?;
+                ensure!(matches!(claim.phase,crate::notification_claim::Phase::Confirmed|crate::notification_claim::Phase::Suppressed),"notification delivery requires reconciliation before migration");
+            }
             for (key,v) in value.as_object().unwrap() {
                 match key.as_str() {
                     "last_pr_check"|"nudged"=>ensure!(v.is_string(),"invalid ticker string field"),
                     "session_item_written"=>ensure!(v.is_boolean(),"invalid ticker flag"),
-                    "event_sequence"=>ensure!(v.is_u64(),"invalid ticker sequence"),
+                    "notification_suppressed"=>ensure!(v.as_array().is_some_and(|a|a.is_empty()),"suppressed notification items require consumption before migration"),
+                    "notification_claim"=>{},
+                    "notification_sequence"|"event_sequence"=>ensure!(v.is_u64(),"invalid ticker sequence"),
                     "config_errors"=>ensure!(v.as_array().is_some_and(|a|a.iter().all(|v|v.is_string())),"invalid diagnostic hashes"),
                     "prs"|"pr_urls"|"pr_ignored"|"pr_line_noted"|"routines"|"gh_outages"|"machine_outages"=>ensure!(v.as_object().is_some_and(|o|o.is_empty()),"nonempty or invalid ticker obligations require T03.3 conversion"),
                     "pending_events"|"finalizations"|"notification_retry"=>ensure!(v.is_object(),"delivery obligations must be objects"),
