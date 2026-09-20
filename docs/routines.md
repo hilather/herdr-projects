@@ -80,9 +80,11 @@ files are not an exhaustively pinned dependency bundle.
 
 ## Explicit execution and cleanup
 
-Execution retains root/project mutation ownership from claim through receipt commit.
-This synchronous command can therefore hold up other guarded mutations for its bounded
-duration; it is not called from the ticker scan. It runs the exact verified script
+Execution retains a shared root barrier plus exclusive project effect/record ownership
+from claim through receipt commit. Another canonical project's guarded status refresh
+and task edits can proceed, while this project's mutations and root-exclusive
+maintenance/effect adapters remain excluded. It is not called from the ticker scan.
+It runs the exact verified script
 bytes through stdin, without reopening the script pathname after checking its hash.
 Configuration, routine revision, project control and the claim are rechecked before
 entry. A routine can be claimed only once, including after generic retry advice.
@@ -137,5 +139,6 @@ The original absolute deadline reaches the concrete runner without being restart
 at adapter entry. Running cancellation retains an uncertain cleanup receipt; a lost
 receipt remains claimed and cannot be replayed after executor restart. Pool output
 does not grant cleanup authority: the trusted service commits its own sealed result.
-The retained root-wide mutation guard still blocks guarded work in other projects,
-so project ownership refinement is required before automatic dispatch is enabled.
+Project ownership now permits unrelated canonical status updates. Legacy ticker passes
+still combine observations with terminal effects under the exclusive root barrier;
+those paths must be separated before automatic dispatch is enabled.

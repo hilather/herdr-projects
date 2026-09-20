@@ -87,12 +87,23 @@ mod tests {
     #[cfg(target_os="linux")]
     #[test]
     fn running_job_preserves_control_lane_and_cancellation_drains_without_certifying_cleanup() {
-        let(_world,path,id)=fixture(b"touch started; setsid /bin/sh -c 'sleep 0.8; touch escaped' >/dev/null 2>&1 & sleep 10",10_000);
+        let(world,path,id)=fixture(b"touch started; setsid /bin/sh -c 'sleep 0.8; touch escaped' >/dev/null 2>&1 & sleep 10",10_000);
+        let other=crate::project::create(&world.root,"other","",vec![]).unwrap();other.set_status(crate::project::Status::Paused).unwrap();
+        let other=other.dir().canonicalize().unwrap();let config=world.ctx().config_dir.join("config.toml");
+        let plan=herdr_projects::migration::inspect_with_config(&other,&config).unwrap();herdr_projects::migration::apply(&other,&plan,true).unwrap();
+        let s=runtime::snapshot(&other).unwrap();runtime::create_binding(&other,None,None,s.head,&herdr_projects::domain::RuntimeRoute{socket:"/explicit/other.sock".into(),..Default::default()}).unwrap();
+        crate::reconcile_live::run(&world.ctx(),&other,true).unwrap();let s=runtime::snapshot(&other).unwrap();
+        runtime::set_state(&other,s.head,s.control.unwrap().revision,herdr_projects::domain::ProjectState::Active,&config).unwrap();
         let pool=Executor::new(Limits::default(),Arc::new(JobRunner{inner:Arc::new(crate::runner::RealRunner)})).unwrap();
         let ticket=pool.submit(request(&path,&id,1).unwrap()).unwrap();let deadline=Instant::now()+Duration::from_secs(3);
         while !path.join("started").exists() {assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(5));}
         let before=runtime::snapshot(&path).unwrap();assert_eq!(before.deliveries[0].state,DeliveryState::Claimed);
         assert!(runtime::add_task(&path,TaskId::new("blocked").unwrap(),"mutation remains fenced".into(),before.head).is_err());
+        let before_other=runtime::snapshot(&other).unwrap();
+        runtime::add_task(&other,TaskId::new("independent").unwrap(),"other project progresses".into(),before_other.head).unwrap();
+        assert!(crate::canonical_controller::poll(&world.ctx(),&other,0).is_ok());
+        let refreshed=runtime::snapshot(&other).unwrap();assert!(refreshed.head>before_other.head);assert_eq!(refreshed.observations.len(),1);
+        assert!(crate::cleanup::lease(&world.root).is_err());assert!(herdr_projects::migration::upgrade_active(&other).is_err());
         let control=Request{identity:Identity{operation:"independent-read".into(),revision:1,project:"other-project".into(),machine:"local".into(),terminal:None},lane:Lane::Control,deadline:Instant::now()+Duration::from_secs(1),command:Cmd::new("/bin/true",Duration::from_secs(1))};
         assert!(pool.submit(control).unwrap().recv_timeout(Duration::from_secs(1)).unwrap().result.unwrap().success());
         assert!(pool.stop(Duration::from_secs(2)));assert!(ticket.recv_timeout(Duration::from_secs(1)).unwrap().result.is_ok());

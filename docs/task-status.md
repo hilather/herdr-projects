@@ -79,8 +79,10 @@ records due occurrences in rotating bounded turns, preserving routine-only liven
 and isolating invalid scripts. Automatic dispatch and asynchronous command ownership
 remain unavailable. The routine queue bridge now validates operation revisions,
 absolute deadlines and cancellation at worker entry and commits through the trusted
-execution service. Root-wide ownership must be refined before ticker admission;
-available control workers alone do not prove unrelated guarded status can progress.
+execution service. Shared root/project ownership now permits unrelated canonical status
+and task mutations while excluding same-project work and root-exclusive maintenance.
+Legacy status/effect separation remains before ticker admission; available control
+workers alone do not prove all unrelated guarded status can progress.
 The [scheduler/executor/profile interfaces](adr/0004-w04-scheduling-contract.md) are frozen. Existing retained/adopted attempts
 must count toward the cap; no uncertain worker may be replaced to free a slot.
 

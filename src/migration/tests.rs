@@ -600,3 +600,13 @@ fn schema9_queue_upgrade_preserves_old_exports_and_starts_with_closed_capacity()
     let(_temp,project)=fixture();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; UPDATE store_meta SET schema_version=9; PRAGMA user_version=9;").unwrap();drop(raw);let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();assert!(before.scheduler.is_none());let old=crate::projections::export(&project,&mut db).unwrap();let bytes=fs::read(old.join("runtime.json")).unwrap();drop(db);
     upgrade_active(&project).unwrap();let mut db=open_active(&project).unwrap();let after=db.read_snapshot(None).unwrap();assert_eq!(after.tasks,before.tasks);assert_eq!(after.attempts,before.attempts);assert_eq!(after.head,before.head);assert_eq!(after.scheduler.unwrap().policy.max_active_workers,0);crate::projections::export(&project,&mut db).unwrap();assert_eq!(fs::read(old.join("runtime.json")).unwrap(),bytes);
 }
+
+#[test]
+fn failed_record_lock_releases_project_and_root_ownership() {
+    let(_temp,project)=fixture();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();
+    let record=fs::OpenOptions::new().write(true).open(project.join(".state/lock")).unwrap();record.try_lock().unwrap();
+    assert!(runtime_mutation(&project).is_err());
+    assert!(crate::execution_guard::ProjectGuard::acquire(&project).is_ok());
+    assert!(crate::execution_guard::RootGuard::exclusive(project.parent().unwrap()).is_ok());
+    drop(record);assert!(runtime_mutation(&project).is_ok());
+}

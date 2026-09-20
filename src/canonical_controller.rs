@@ -1,9 +1,11 @@
-//! One bounded canonical controller pass. The ticker owns leadership; adapters
-//! retain the root execution lease through claim, external effect and receipt.
+//! One bounded canonical controller pass. Observations retain project ownership;
+//! terminal-effect adapters still retain the exclusive root execution lease.
 use std::path::Path;
 use anyhow::{Context,Result,ensure};
 use crate::paths::Ctx;
-use herdr_projects::{migration,runtime,operations::{DeliveryState,dispatch::DispatchResult},reconcile::ResourceState};
+use herdr_projects::{runtime,operations::{DeliveryState,dispatch::DispatchResult},reconcile::ResourceState};
+#[cfg(test)]
+use herdr_projects::migration;
 
 pub struct PollResult {pub reachable:bool,pub scheduled_work:bool,pub operation_error:Option<String>}
 struct ProbeBudget<'a> {runner:&'a dyn crate::runner::Runner,deadline:std::time::Instant}
@@ -28,11 +30,7 @@ pub fn poll(ctx:&Ctx,path:&Path,turn:u64)->Result<PollResult> {
     let batch=crate::reconcile_live::collect(&probe_ctx,&path)?;
     ensure!(std::time::Instant::now()<budget.deadline,"automatic observation budget exhausted; use explicit reconciliation to investigate");
     let reachable=batch.observations.iter().any(|o|o.pane==ResourceState::Present||o.worktree==ResourceState::Present);
-    {
-        let _lease=crate::cleanup::lease(path.parent().context("project has no root")?)?;
-        runtime::record_observations_held(&path,&batch)?;
-        migration::open_active(&path)?.expire_claims(jiff::Timestamp::now().as_millisecond())?;
-    }
+    runtime::record_controller_observations(&path,&batch)?;
     // A scheduling failure must not suppress unrelated notification/finalization
     // work. Each scheduling turn handles one routine; subsequent turns rotate.
     let scheduled=herdr_projects::routines::schedule_turn(&path,turn);

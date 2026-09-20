@@ -36,6 +36,21 @@ separate bounds and project/machine fairness. These are root-local command bound
 not machine-wide agent quotas. Existing execution guards remain until replaced by
 an equally strong explicit resource-serialization contract.
 
+Canonical mutations and routine execution now retain a shared root barrier on the
+existing `.execution.lock` inode, exclusive project `.state/effect.lock` ownership,
+then the short `.state/lock` record lock. Locks are regular no-follow files and never
+upgraded in place. The shared lock implementation also supplies root-exclusive
+cleanup/maintenance ownership. A failed acquisition drops all earlier ownership.
+Canonical observation commit, control-marker publication and claim expiry retain
+project ownership together. Different canonical projects can refresh status and edit
+tasks concurrently; the same project remains excluded during a routine.
+
+Root-wide adoption/conflict scanning, migration, legacy ticker passes and existing
+external-effect adapters remain exclusive. Legacy ticker status still includes prompt
+and token-metadata effects, so it must be separated before routine automatic dispatch.
+Concurrent terminal effects additionally require cross-project endpoint/pane exclusion;
+project guards alone do not authorize aliased terminal access.
+
 Profiles bind executable kind, verified capabilities, explicit argv/environment
 references, config identity and installed versions. They do not inherit another
 kind's vendor flags. Unknown capabilities remain unavailable. Secrets are not copied

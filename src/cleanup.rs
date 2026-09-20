@@ -1,18 +1,14 @@
 //! Cooperative local cleanup checkpoint. No force removal and no process killing.
-use std::{fs::{self, File, OpenOptions}, os::unix::fs::OpenOptionsExt, path::Path};
+use std::{fs::{self, File}, path::Path};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use crate::{paths::Ctx, project::Project, runner::Cmd, thread::{self, Thread}};
 
 /// Excludes supported launch/prompt/adopt/ticker operations within this root.
 /// It is deliberately separate from the short project-record transaction lock.
-pub struct Lease(File);
-impl Drop for Lease { fn drop(&mut self) { let _ = self.0.unlock(); } }
+pub struct Lease { _guard:herdr_projects::execution_guard::RootGuard }
 pub fn lease(root: &Path) -> Result<Lease> {
-    let file = OpenOptions::new().write(true).create(true).truncate(false).mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW).open(root.join(".execution.lock"))?;
-    file.try_lock().context("another lifecycle or ticker operation is active; retry after it finishes")?;
-    Ok(Lease(file))
+    Ok(Lease{_guard:herdr_projects::execution_guard::RootGuard::exclusive(root)?})
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Removal {

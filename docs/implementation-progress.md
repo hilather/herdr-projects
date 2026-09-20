@@ -1033,3 +1033,33 @@ unrelated guarded status updates despite free control workers; project/resource
 ownership refinement is the next prerequisite for automatic dispatch. No user scripts
 or stores were used. Counts remain 16 implemented, five partial and 20 not started;
 macOS remains unavailable.
+
+## W04 project-scoped execution ownership
+
+Canonical runtime mutations and routine execution now retain a shared root barrier
+on the existing `.execution.lock` inode, exclusive `.state/effect.lock` ownership for
+their project, and the record lock. The shared implementation rejects symlinks and
+special lock files without blocking; failed acquisitions release earlier guards.
+Effect locks are excluded from migration source inventory. Migration, cleanup,
+adoption/conflict scanning, existing external adapters and legacy ticker passes retain
+the root-exclusive barrier. No lock is upgraded in place.
+
+The canonical controller now calls a guarded library service covering observation
+commit, control-marker publication and claim expiry, rather than retaining an exclusive
+root lease around those writes. The guard is not recursively reacquired by helpers.
+This permits another canonical project's status refresh and task mutation while a
+routine runs, while preserving same-project and root-wide maintenance exclusion.
+
+Independent review approved the protocol and call paths. Lock fixtures cover separate
+projects, exclusive barriers, symlink/FIFO refusal and release after record-lock failure.
+The real running-routine fixture now creates a second project in the same root and
+proves its guarded observations/task writes advance while mutation of the running
+project, cleanup and schema upgrade refuse. All 455 tests pass in debug and release
+(155 library, 268 binary, 30 CLI, 2 contracts); three optional live tests remain ignored.
+The default-feature suite also passes. Logs:
+`/tmp/herdr-project-ownership-{debug,release,default}.log`.
+
+Automatic routine dispatch still awaits separation of legacy observational status
+from prompt/token-metadata effects. Project ownership alone does not authorize
+concurrent effects on aliased terminals. Counts remain 16 implemented, five partial
+and 20 not started; macOS remains unavailable.

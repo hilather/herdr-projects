@@ -63,7 +63,16 @@ pub fn record_observations(project:&Path,batch:&crate::reconcile::ObservationBat
     let _maintenance=migration::runtime_mutation(project)?;
     record_observations_held(project,batch)
 }
-/// Caller retains the root execution lease while committing live evidence.
+/// Controller observation publication and lease expiry retain project ownership
+/// together. Root-exclusive effect adapters remain excluded by the shared barrier.
+pub fn record_controller_observations(project:&Path,batch:&crate::reconcile::ObservationBatch)->Result<()> {
+    let _guard=migration::runtime_mutation(project)?;
+    record_observations_held(project,batch)?;
+    migration::open_active(project)?.expire_claims(jiff::Timestamp::now().as_millisecond())?;
+    Ok(())
+}
+/// Caller retains exclusive root ownership, or project ownership with the shared
+/// root barrier and record lock, while committing live evidence.
 pub fn record_observations_held(project:&Path,batch:&crate::reconcile::ObservationBatch)->Result<u64> {
     ensure!(!batch.dispatch_allowed,"observations cannot authorize dispatch");
     let mut db=migration::open_active(project)?;

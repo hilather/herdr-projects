@@ -83,7 +83,7 @@ fn inventory(project: &Path, relative: &Path, sources: &mut Vec<Source>, total: 
         let name = rel.to_str().context("non-UTF-8 source path cannot be migrated")?;
         ensure!(safe_relative(name),"unsupported source path");
         if name.starts_with(".state/migration-aborted-") { continue; }
-        if matches!(name,".state/migration"|".state/projections"|".state/lock"|".state/format.json"|".state/state.db"|".state/state.db-wal"|".state/state.db-shm") { continue; }
+        if matches!(name,".state/migration"|".state/projections"|".state/lock"|".state/effect.lock"|".state/format.json"|".state/state.db"|".state/state.db-wal"|".state/state.db-shm") { continue; }
         let meta = entry.file_type()?;
         ensure!(!meta.is_symlink(),"symlink source blocks migration: {name}");
         if meta.is_dir() { inventory(project,&rel,sources,total)?; }
@@ -201,24 +201,19 @@ fn load(project:&Path)->Result<Journal> {
     ensure!(journal.plan.sources.iter().all(|s|safe_relative(&s.path)),"unsafe journal path");
     Ok(journal)
 }
-pub(crate) struct Maintenance { _locks:Vec<File> }
+pub(crate) struct Maintenance { _locks:Vec<File>,_project:Option<crate::execution_guard::ProjectGuard>,_root:Option<crate::execution_guard::RootGuard> }
 impl Maintenance {
     fn runtime(project:&Path)->Result<Self> {
-        let root=project.parent().context("project has no root")?;let mut locks=Vec::new();
-        for path in [root.join(".execution.lock"),project.join(".state/lock")] {
-            let file=OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path)?;
-            file.try_lock().context("another runtime mutation or external operation is active; retry")?;locks.push(file);
-        }
-        Ok(Self{_locks:locks})
+        let guard=crate::execution_guard::ProjectGuard::acquire(project)?;
+        let record=crate::execution_guard::exclusive_file(&project.join(".state/lock"))?;
+        Ok(Self{_locks:vec![record],_project:Some(guard),_root:None})
     }
     fn acquire(project:&Path)->Result<Self> {
         let root=project.parent().context("project has no root")?;
-        let mut locks=Vec::new();
-        for path in [root.join(".ticker.lock"),root.join(".execution.lock"),project.join(".state/lock")] {
-            let file=OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path)?;
-            file.try_lock().context("stop ticker and finish pending project operations before migration")?; locks.push(file);
-        }
-        Ok(Self{_locks:locks})
+        let ticker=crate::execution_guard::exclusive_file(&root.join(".ticker.lock"))?;
+        let barrier=crate::execution_guard::RootGuard::exclusive(root)?;
+        let record=crate::execution_guard::exclusive_file(&project.join(".state/lock"))?;
+        Ok(Self{_locks:vec![record,ticker],_project:None,_root:Some(barrier)})
     }
 }
 fn backup(project:&Path,plan:&Plan)->Result<()> {
