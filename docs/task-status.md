@@ -45,7 +45,7 @@ file-backed; no projects have been migrated. See the bounded W03 handoff; platfo
 
 ## Next work
 
-W04 T04.1 now has a [schema-v15 scheduling foundation](scheduling.md): DAG
+W04 T04.1 now has a [schema-v16 scheduling foundation](scheduling.md): DAG
 validation, aged priority, retained-attempt capacity reporting and fenced CLI edits.
 Atomic reservations and immutable inputs now have a sealed internal API, and cancellation
 has an audited CLI. Production launch preparation/dispatch and termination remain
@@ -65,13 +65,15 @@ consumption. Owner-signature import now uses the migration-pinned public-key con
 policy-change ingress, denial audit and other command-path coverage remain.
 T04.4 now provides [signed durable admission budgets](budgets.md): lifetime attempt
 limits, explicit unknown-provider-usage policy and reservation/claim/pre-effect
-checks. Native usage, estimates, running limits, durable routines and wider telemetry
+checks. Native usage, estimates, running limits, routine execution and wider telemetry
 remain. Budget changes are the first signed policy-change ingress; other policy
 classes remain incomplete.
 The outbox now supports project-scoped routine records fenced by control revision,
 and the shared schedule module computes bounded due windows with explicit DST and
-skipped-date handling. Durable occurrence production and command execution remain
-unavailable until approved routine revisions and cursor/outbox transactions exist.
+skipped-date handling. Schema 16 adds [signed routine revisions and durable occurrence
+recording](routines.md), with atomic cursor/outbox writes and missed/overlap decisions.
+Automatic ticker integration, execution, typed completion receipts and verified
+overlap release remain unavailable.
 The [scheduler/executor/profile interfaces](adr/0004-w04-scheduling-contract.md) are frozen. Existing retained/adopted attempts
 must count toward the cap; no uncertain worker may be replaced to free a slot.
 

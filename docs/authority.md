@@ -92,3 +92,9 @@ Budget policies now use the same pinned owner key with a separate
 `budget@herdr-projects` namespace and sequential project-bound revisions. See
 [admission budgets](budgets.md). This is the first signed policy-change route;
 denial audit and authority coverage for other policy classes remain incomplete.
+
+Routine revisions now use `routine@herdr-projects` signatures with explicit config,
+script-byte and project bindings. See [durable routine scheduling](routines.md).
+Permission lookup hashes the exact parsed config bytes, closing replacement races
+between surrounding path fingerprint checks. This authorizes durable scheduling;
+script execution and typed completion/termination receipts remain unavailable.

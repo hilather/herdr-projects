@@ -79,6 +79,13 @@ enum BudgetCommand {
     Inspect,
     Import { document:PathBuf, signature:PathBuf, #[arg(long)] expected_head:u64 },
 }
+#[cfg(feature="state-store")]
+#[derive(Subcommand)]
+enum RoutineStoreCommand {
+    Inspect,
+    Import { document:PathBuf, signature:PathBuf, #[arg(long)] expected_head:u64 },
+    Schedule { name:String, #[arg(long)] expected_head:u64 },
+}
 
 #[derive(Subcommand)]
 enum Command {
@@ -87,6 +94,9 @@ enum Command {
     Approval { slug:String, #[command(subcommand)] command:ApprovalCommand },
     #[cfg(feature="state-store")]
     Budget { slug:String, #[command(subcommand)] command:BudgetCommand },
+    /// Signed durable routine control (does not execute scripts)
+    #[cfg(feature="state-store")]
+    RoutineStore { slug:String, #[command(subcommand)] command:RoutineStoreCommand },
     /// Inspect user-owned profile configuration and unresolved capability requirements
     Profile { #[command(subcommand)] command: ProfileCommand },
     /// Inspect dependency queue and configure per-project scheduling limits
@@ -473,6 +483,15 @@ pub fn run() -> Result<()> {
     };
 
     match cli.command {
+        #[cfg(feature="state-store")]
+        Command::RoutineStore{slug,command}=>{
+            project::validate_slug(&slug)?;let dir=ctx.root.join(slug);
+            let value=match command {
+                RoutineStoreCommand::Inspect=>{let s=herdr_projects::runtime::snapshot(&dir)?;serde_json::json!({"head":s.head,"revisions":s.routine_revisions,"occurrences":s.routine_occurrences,"execution_enabled":false})},
+                RoutineStoreCommand::Import{document,signature,expected_head}=>serde_json::to_value(herdr_projects::authority::import_routine(&dir,&document,&signature,expected_head)?)?,
+                RoutineStoreCommand::Schedule{name,expected_head}=>serde_json::to_value(herdr_projects::routines::schedule(&dir,&name,expected_head)?)?,
+            };println!("{}",serde_json::to_string_pretty(&value)?);Ok(())
+        },
         #[cfg(feature="state-store")]
         Command::Approval { slug, command } => {
             project::validate_slug(&slug)?;

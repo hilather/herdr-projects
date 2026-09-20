@@ -7,6 +7,7 @@ use crate::{domain::{ApprovalGrant,PreparedApproval,VersionedReference}, migrati
 
 pub const SIGNATURE_NAMESPACE: &str = "approval@herdr-projects";
 pub const BUDGET_SIGNATURE_NAMESPACE: &str = "budget@herdr-projects";
+pub const ROUTINE_SIGNATURE_NAMESPACE: &str = "routine@herdr-projects";
 
 #[derive(Deserialize,Serialize)]
 #[serde(deny_unknown_fields)]
@@ -97,6 +98,9 @@ fn policy_at(project:&Path,original:&migration::ConfigReference)->Result<(Policy
 
 /// Report the pinned owner policy identity for signing; never grants approval.
 pub fn policy_reference(project:&Path)->Result<VersionedReference> {policy(project)?.0.reference()}
+pub(crate) fn routine_policy(project:&Path)->Result<(VersionedReference,migration::ConfigReference)> {
+    let (policy,config)=policy(project)?;Ok((policy.reference()?,config))
+}
 
 /// Verify an owner signature against pinned configuration and install the grant.
 /// No caller-supplied actor, key, config path, verifier or clock can authorize it.
@@ -138,6 +142,23 @@ pub fn import_budget(project:&Path,document:&Path,signature:&Path,expected_head:
     Ok(db.install_budget(&crate::domain::PreparedBudget{policy},expected_head)?)
 }
 
+pub fn import_routine(project:&Path,document:&Path,signature:&Path,expected_head:u64)->Result<VersionedReference> {
+    let _guard=migration::runtime_mutation(project)?;
+    let mut db=migration::open_active(project)?;
+    let snapshot=db.read_snapshot(Some(expected_head))?;
+    let(owner,config)=policy(project)?;
+    ensure!(snapshot.control.context("control schema upgrade required")?.config_digest==config.digest,"owner configuration is not acknowledged by project control");
+    let bytes=migration::read_plan_file(document)?;ensure!(bytes.len()<=65_536,"routine document exceeds bounds");
+    let definition:crate::domain::RoutineDefinition=serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid routine document (contents withheld)"))?;
+    definition.validate().map_err(anyhow::Error::msg)?;
+    ensure!(definition.project_store==project.join(".state/state.db").canonicalize()?.to_string_lossy(),"routine belongs to another project");
+    ensure!(definition.authority==owner.reference()?&&definition.config==config,"routine names another owner policy or configuration");
+    let signature=migration::read_plan_file(signature)?;
+    verify_signature(&owner,&bytes,&signature,ROUTINE_SIGNATURE_NAMESPACE,&RealRunner)?;
+    crate::routines::validate_current(&definition)?;
+    Ok(db.install_routine(&crate::domain::PreparedRoutine{definition},expected_head)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +179,56 @@ mod tests {
     fn grant(policy:&Policy)->ApprovalGrant {
         let now=jiff::Timestamp::now().as_millisecond();
         ApprovalGrant{version:1,scope:ApprovalScope{version:1,class:ApprovalClass::RuntimeLaunch,project_store:"/fixture/state.db".into(),task:TaskId::new("task").unwrap(),task_revision:2,target:"task:task".into(),action_digest:"a".repeat(64)},policy:policy.reference().unwrap(),issued_unix_ms:now-1000,expires_unix_ms:now+60_000}
+    }
+    #[test]
+    fn signed_routines_require_enabled_config_and_recheck_script_before_effect() {
+        use crate::domain::*;
+        for enabled in [false,true] {
+            let dir=tempfile::tempdir().unwrap();let(key,owner)=key(dir.path(),"owner");
+            let project=dir.path().join("project");fs::create_dir(&project).unwrap();
+            for child in [".state","threads","inbox"] {fs::create_dir(project.join(child)).unwrap();}
+            fs::write(project.join("PROJECT.md"),"+++\nname='Project'\n+++\n").unwrap();
+            fs::write(project.join("TASKS.md"),"").unwrap();fs::write(project.join("MEMORY.md"),"").unwrap();
+            fs::write(project.join(".state/project.json"),r#"{"status":"paused"}"#).unwrap();
+            let config=dir.path().join("owner.toml");
+            let config_text=format!("[authority]\nversion=1\nrevision=1\napproval_public_key={:?}\n[safety.{:?}]\nroutine_commands={enabled}\n",owner.approval_public_key,project.display().to_string());
+            fs::write(&config,&config_text).unwrap();
+            let plan=migration::inspect_with_config(&project,&config).unwrap();migration::apply(&project,&plan,true).unwrap();
+            let before=crate::runtime::snapshot(&project).unwrap();
+            crate::runtime::set_state(&project,before.head,before.control.unwrap().revision,ProjectState::Active,&config).unwrap();
+            let script=project.join("check.sh");let script_bytes=b"echo never executed\n";fs::write(&script,script_bytes).unwrap();
+            let mut definition=RoutineDefinition{version:1,name:"check".into(),revision:1,project_store:project.join(".state/state.db").canonicalize().unwrap().display().to_string(),
+                authority:owner.reference().unwrap(),config:migration::config_reference(&config).unwrap(),enabled:true,schedule:"every 1m".into(),timezone:"UTC".into(),start_unix_ms:0,
+                missed:MissedRunPolicy::CoalesceLatest,overlap:OverlapPolicy::Skip,script:script.display().to_string(),script_sha256:format!("{:x}",Sha256::digest(script_bytes)),cwd:project.display().to_string(),deadline_ms:1000,output_cap_bytes:4000};
+            let bytes=serde_json::to_vec(&definition).unwrap();let document=dir.path().join("routine.json");let sig=dir.path().join("routine.sig");fs::write(&document,&bytes).unwrap();
+            let before=crate::runtime::snapshot(&project).unwrap();
+            fs::write(&sig,sign(&key,&bytes,BUDGET_SIGNATURE_NAMESPACE)).unwrap();
+            assert!(import_routine(&project,&document,&sig,before.head).is_err());assert_eq!(crate::runtime::snapshot(&project).unwrap(),before);
+            fs::write(&sig,sign(&key,&bytes,ROUTINE_SIGNATURE_NAMESPACE)).unwrap();
+            if !enabled {assert!(import_routine(&project,&document,&sig,before.head).is_err());assert_eq!(crate::runtime::snapshot(&project).unwrap(),before);continue;}
+            let mut other=definition.clone();other.project_store=dir.path().join("other/.state/state.db").display().to_string();
+            let other_bytes=serde_json::to_vec(&other).unwrap();fs::write(&document,&other_bytes).unwrap();fs::write(&sig,sign(&key,&other_bytes,ROUTINE_SIGNATURE_NAMESPACE)).unwrap();
+            assert!(import_routine(&project,&document,&sig,before.head).is_err());assert_eq!(crate::runtime::snapshot(&project).unwrap(),before);
+            fs::write(&document,&bytes).unwrap();fs::write(&sig,sign(&key,&bytes,ROUTINE_SIGNATURE_NAMESPACE)).unwrap();
+            import_routine(&project,&document,&sig,before.head).unwrap();
+            let before=crate::runtime::snapshot(&project).unwrap();assert!(import_routine(&project,&document,&sig,before.head).is_err());assert_eq!(crate::runtime::snapshot(&project).unwrap(),before);
+            let occurrence=crate::routines::schedule(&project,"check",before.head).unwrap().unwrap();assert!(occurrence.slots>1);
+            let mut db=migration::open_active(&project).unwrap();let now=jiff::Timestamp::now().as_millisecond();
+            let claim=db.claim_operation(occurrence.operation.as_ref().unwrap(),1,"fixture",now,30_000).unwrap();
+            db.validate_claim(&claim,now+1).unwrap();
+            fs::write(&script,"changed script\n").unwrap();let before=db.read_snapshot(None).unwrap();
+            assert!(db.validate_claim(&claim,now+2).is_err());assert_eq!(db.read_snapshot(None).unwrap(),before);
+            fs::write(&script,script_bytes).unwrap();fs::write(&config,format!("{config_text}\n# changed\n")).unwrap();
+            assert!(db.validate_claim(&claim,now+3).is_err());assert_eq!(db.read_snapshot(None).unwrap(),before);
+            fs::write(&config,&config_text).unwrap();db.validate_claim(&claim,now+4).unwrap();
+            definition.revision+=1;definition.enabled=false;let bytes=serde_json::to_vec(&definition).unwrap();
+            fs::write(&document,&bytes).unwrap();fs::write(&sig,sign(&key,&bytes,ROUTINE_SIGNATURE_NAMESPACE)).unwrap();drop(db);
+            import_routine(&project,&document,&sig,before.head).unwrap();
+            let mut db=migration::open_active(&project).unwrap();assert!(db.validate_claim(&claim,now+5).is_err());
+            assert_eq!(db.deliveries().unwrap()[0].state,crate::operations::DeliveryState::Claimed);
+            let snapshot=db.read_snapshot(None).unwrap();assert!(crate::routines::schedule(&project,"check",snapshot.head).unwrap().is_none());
+            assert_eq!(db.read_snapshot(None).unwrap(),snapshot);
+        }
     }
     #[test]
     fn owner_policy_refuses_project_local_writable_and_symlink_files() {

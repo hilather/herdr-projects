@@ -7,6 +7,35 @@ const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
 
 #[cfg(feature="state-store")]
 #[test]
+fn signed_routine_cli_records_one_occurrence_without_executing_the_script() {
+    use herdr_projects::{domain::*,authority,migration,runtime};
+    use sha2::{Digest,Sha256};
+    let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
+    for action in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,action,"demo"]).status.success());}
+    let key=home.path().join("owner");let output=Command::new("/usr/bin/ssh-keygen").args(["-q","-t","ed25519","-N","","-f"]).arg(&key).output().unwrap();assert!(output.status.success());
+    let public=std::fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+    let project=root.join("demo");let config=home.path().join("owner.toml");
+    std::fs::write(&config,format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[safety.{:?}]\nroutine_commands=true\n",project.display().to_string())).unwrap();
+    let plan=migration::inspect_with_config(&project,&config).unwrap();migration::apply(&project,&plan,true).unwrap();
+    let s=runtime::snapshot(&project).unwrap();runtime::set_state(&project,s.head,s.control.unwrap().revision,ProjectState::Active,&config).unwrap();
+    let script=project.join("check.sh");let bytes=b"touch ROUTINE_SHOULD_NOT_RUN\n";std::fs::write(&script,bytes).unwrap();
+    let definition=RoutineDefinition{version:1,name:"check".into(),revision:1,project_store:project.join(".state/state.db").canonicalize().unwrap().display().to_string(),
+        authority:authority::policy_reference(&project).unwrap(),config:migration::config_reference(&config).unwrap(),enabled:true,schedule:"every 1m".into(),timezone:"UTC".into(),start_unix_ms:0,
+        missed:MissedRunPolicy::CoalesceLatest,overlap:OverlapPolicy::Skip,script:script.display().to_string(),script_sha256:format!("{:x}",Sha256::digest(bytes)),cwd:project.display().to_string(),deadline_ms:1000,output_cap_bytes:4000};
+    let document=home.path().join("routine.json");std::fs::write(&document,serde_json::to_vec(&definition).unwrap()).unwrap();
+    let output=Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&key).args(["-n",authority::ROUTINE_SIGNATURE_NAMESPACE]).arg(&document).output().unwrap();assert!(output.status.success());
+    let signature=home.path().join("routine.json.sig");let head=runtime::snapshot(&project).unwrap().head.to_string();
+    let output=hp(home.path(),&["--root",root_arg,"routine-store","demo","import",document.to_str().unwrap(),signature.to_str().unwrap(),"--expected-head",&head]);
+    assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    let head=runtime::snapshot(&project).unwrap().head.to_string();let args=["--root",root_arg,"routine-store","demo","schedule","check","--expected-head",&head];
+    let output=hp(home.path(),&args);assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    let after=runtime::snapshot(&project).unwrap();assert_eq!(after.routine_occurrences.len(),1);assert_eq!(after.operations.len(),1);assert!(after.operations[0].task.is_none());
+    assert!(!hp(home.path(),&args).status.success());assert_eq!(runtime::snapshot(&project).unwrap(),after);
+    assert!(!project.join("ROUTINE_SHOULD_NOT_RUN").exists());
+}
+
+#[cfg(feature="state-store")]
+#[test]
 fn approval_cli_uses_pinned_policy_and_refuses_unsigned_import() {
     use herdr_projects::{authority, migration, runtime};
     let home=tempfile::tempdir().unwrap();
@@ -33,6 +62,12 @@ fn approval_cli_uses_pinned_policy_and_refuses_unsigned_import() {
     assert!(output.status.success());
     let report:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["provider_tokens"],"unknown");assert!(report["policy"].is_null());
+    let output=hp(caller.path(), &["--root",root_arg,"routine-store","demo","inspect"]);
+    assert!(output.status.success());
+    let report:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["execution_enabled"],false);assert_eq!(report["occurrences"],serde_json::json!([]));
+    let output=hp(caller.path(), &["--root",root_arg,"routine-store","demo","schedule","unknown","--expected-head",&before.head.to_string()]);
+    assert!(!output.status.success());assert_eq!(runtime::snapshot(&project).unwrap(),before);
     let document=home.path().join("grant.json");
     let signature=home.path().join("grant.sig");
     std::fs::write(&document,"{}").unwrap();
@@ -41,6 +76,8 @@ fn approval_cli_uses_pinned_policy_and_refuses_unsigned_import() {
     assert!(!output.status.success());
     assert_eq!(runtime::snapshot(&project).unwrap(),before);
     let output=hp(caller.path(), &["--root",root_arg,"budget","demo","import",document.to_str().unwrap(),signature.to_str().unwrap(),"--expected-head",&before.head.to_string()]);
+    assert!(!output.status.success());assert_eq!(runtime::snapshot(&project).unwrap(),before);
+    let output=hp(caller.path(), &["--root",root_arg,"routine-store","demo","import",document.to_str().unwrap(),signature.to_str().unwrap(),"--expected-head",&before.head.to_string()]);
     assert!(!output.status.success());assert_eq!(runtime::snapshot(&project).unwrap(),before);
     assert!(!caller.path().join(".config").exists());
 }
@@ -411,7 +448,7 @@ fn migrated_runtime_bindings_require_explicit_upgrade_and_are_unverified() {
     for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
     let project=root.join("demo");std::fs::write(project.join("threads/t-0001.toml"),"id='t-0001'\nstatus='resolved'\nrepo='/repo'\n").unwrap();
     let plan=herdr_projects::migration::inspect(&project).unwrap();herdr_projects::migration::apply(&project,&plan,true).unwrap();
-    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; DROP TABLE runtime_ownership; DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; UPDATE store_meta SET schema_version=4; PRAGMA user_version=4;").unwrap();drop(raw);
+    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; DROP TABLE runtime_ownership; DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; UPDATE store_meta SET schema_version=4; PRAGMA user_version=4;").unwrap();drop(raw);
     let args=["--root",root_arg,"migration","demo","bindings"];
     let out=hp(home.path(),&args);assert!(!out.status.success());assert!(String::from_utf8_lossy(&out.stderr).contains("upgrade-store"));
     assert!(hp(home.path(),&["--root",root_arg,"migration","demo","upgrade-store"]).status.success());

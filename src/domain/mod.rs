@@ -6,6 +6,8 @@ mod approval;
 pub use approval::*;
 mod budget;
 pub use budget::*;
+mod routine;
+pub use routine::*;
 
 macro_rules! identifier {
     ($($name:ident),+) => { $(
@@ -102,6 +104,8 @@ pub struct Snapshot {
     pub attempt_inputs:Vec<AttemptInputRecord>,
     pub approvals:Vec<ApprovalRecord>,
     pub budget_policies:Vec<BudgetPolicy>,
+    pub routine_revisions:Vec<RoutineDefinition>,
+    pub routine_occurrences:Vec<RoutineOccurrence>,
     pub cancellations:Vec<CancellationRequest>,
     pub events: Vec<Event>,
 }

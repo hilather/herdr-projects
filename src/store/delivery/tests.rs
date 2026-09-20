@@ -13,14 +13,11 @@ fn project_scope_uses_control_revision_without_inventing_a_task() {
     assert!(snapshot.operations[0].task.is_none());
     assert!(db.commit(Commit{expected_head:snapshot.head,mutations:vec![Mutation::Enqueue(snapshot.operations[0].clone())]}).is_err());
     assert_eq!(db.read_snapshot(None).unwrap(),snapshot);
-    let claim=db.claim_operation(&id,1,"routine-worker",1000,1000).unwrap();db.validate_claim(&claim,1001).unwrap();
-    let snapshot=db.read_snapshot(None).unwrap();
+    assert!(binding_current(&db.connection,&id,true).unwrap());
+    assert!(db.claim_operation(&id,1,"routine-worker",1000,1000).is_err());
+    assert_eq!(db.read_snapshot(None).unwrap(),snapshot);
     db.set_project_state(snapshot.head,revision,ProjectState::Paused,1001,None).unwrap();
-    let before=db.read_snapshot(None).unwrap();assert!(db.validate_claim(&claim,1002).is_err());
-    assert!(db.finish_operation(&claim,Outcome::Confirmed{observed_identity:"fixture receipt".into()},1002).is_err());
-    assert_eq!(db.read_snapshot(None).unwrap(),before);
-    db.expire_claims(2000).unwrap();
-    assert_eq!(db.deliveries().unwrap()[0].state,DeliveryState::Ambiguous);
+    assert!(!binding_current(&db.connection,&id,true).unwrap());
     assert!(db.read_snapshot(None).unwrap().tasks.is_empty());
 }
 fn fixture()->(tempfile::TempDir,SqliteStore,OperationId) {

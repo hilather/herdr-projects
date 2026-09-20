@@ -73,6 +73,7 @@ impl SqliteStore {
         let revision=increment(old.revision)?;let epoch=increment(old.epoch)?;let until=now+lease_ms;
         let kind:String=tx.query_row("SELECT kind FROM operations WHERE id=?1",[id.as_str()],|r|r.get(0))?;
         if kind=="runtime.launch" {super::approvals::consume(&tx,id,revision,epoch,now)?;}
+        if kind=="routine.run" {super::routines::check(&tx,id)?;}
         tx.execute("UPDATE operation_delivery SET revision=?2,state='claimed',epoch=?3,attempts=attempts+1,owner=?4,lease_until_ms=?5 WHERE operation_id=?1",params![id.as_str(),integer(revision)?,integer(epoch)?,owner,until])?;
         log(&tx,id,revision,"operation.claimed",serde_json::json!({"owner":owner,"epoch":epoch,"lease_until_ms":until}))?;
         tx.commit()?;Ok(Claim{operation:id.clone(),revision,owner:owner.into(),epoch,lease_until_ms:until})
@@ -88,6 +89,7 @@ impl SqliteStore {
         if !binding_current(&tx,&claim.operation,true)? {return Err(StoreError::Conflict);}
         let kind:String=tx.query_row("SELECT kind FROM operations WHERE id=?1",[claim.operation.as_str()],|r|r.get(0))?;
         if kind=="runtime.launch" {super::approvals::validate_use(&tx,claim,now)?;}
+        if kind=="routine.run" {super::routines::check(&tx,&claim.operation)?;}
         tx.commit()?;Ok(())
     }
     /// Rechecks owner, epoch, revision and lease in the outcome transaction.

@@ -901,3 +901,33 @@ All 428 tests pass in final debug and release runs (136 library, 261 binary, 29 
 `/tmp/herdr-project-ops-final-{debug,release}.log`. The default-feature suite also
 passed before the final skipped-date correction; final all-feature runs include the
 legacy routine regressions. macOS remains unavailable.
+
+## W04 signed durable routine occurrences (schema 16)
+
+Owner-signed definitions now bind routine revision, project/config/authority,
+timezone/schedule/start, missed/overlap policy and bounded script execution inputs.
+Enabled routines require the explicit owner `routine_commands` setting. Imports use
+a separate SSH signature namespace and reject replay, cross-project and stale config.
+Independent review found an A→B→A config replacement race; permission parsing now
+hashes the exact bytes against the signed identity before reading the enable flag.
+
+An immediate transaction records the immutable occurrence, cursor, event and
+project-scoped operation. Restart/duplicate scans cannot enqueue the same scheduled
+instant twice. Skip/coalesce decisions are visible, with bounded catch-up arithmetic.
+Historical instants remain authoritative across timezone-data updates. Replacing a
+revision retires only Pending zero-claim intents; ever-claimed history conservatively
+blocks overlap even after generic confirmation/retirement, pending typed cleanup
+receipts. Claim/pre-effect checks revalidate current revision, owner config and script.
+
+The `routine-store` CLI imports, inspects and records due occurrences without running
+scripts. A real-key CLI fixture signs/imports/schedules successfully, rejects stale
+heads, and proves the script marker was not created. Other fixtures cover config and
+script withdrawal, disabled permissions, rollback, reopen, concurrent scans, missed
+runs, overlap and schema-15 preservation without invented routine authority.
+
+Independent review approved the fix and seven focused routine tests. All 436 tests
+pass in final debug and release (143 library, 261 binary, 30 CLI, 2 contracts); three
+optional live checks remain ignored. Logs: `/tmp/herdr-routines-final-{debug,release}.log`.
+No user store was upgraded or script executed. Ticker scheduling/dispatch, typed
+completion and termination receipts, overlap release and output inbox delivery remain
+next. Counts stay 16 implemented, five partial and 20 not started; macOS is unavailable.

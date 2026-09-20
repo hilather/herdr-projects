@@ -62,7 +62,7 @@ fn project_outbox_upgrade_preserves_claims_inputs_and_consumed_approvals() {
         assert!(db.connection.execute("DELETE FROM approval_uses",[]).is_err());
         assert!(db.connection.execute("DELETE FROM attempt_inputs",[]).is_err());
     }
-    db.upgrade_v1().unwrap();before.schema_version=15;
+    db.upgrade_v1().unwrap();before.schema_version=16;
     assert_eq!(db.read_snapshot(None).unwrap(),before);db.integrity_check().unwrap();
     drop(db);let mut db=SqliteStore::open(&temp.path().join("state.db")).unwrap();
     db.validate_claim(&claim,1001).unwrap();assert_eq!(db.read_snapshot(None).unwrap(),before);
@@ -140,9 +140,9 @@ fn unknown_provider_usage_is_explicit_and_never_an_implicit_zero() {
 #[test]
 fn budget_upgrade_preserves_pending_operations_without_inventing_policy() {
     let(_temp,mut db,p)=fixture();reserve(&mut db,&p);
-    db.connection.execute_batch("DROP TABLE budget_policies; UPDATE store_meta SET schema_version=13; PRAGMA user_version=13;").unwrap();
+    db.connection.execute_batch("DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; UPDATE store_meta SET schema_version=13; PRAGMA user_version=13;").unwrap();
     let before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();
-    let after=db.read_snapshot(None).unwrap();assert_eq!(after.schema_version,15);
+    let after=db.read_snapshot(None).unwrap();assert_eq!(after.schema_version,16);
     assert_eq!(after.events,before.events);assert_eq!(after.attempt_inputs,before.attempt_inputs);
     assert_eq!(after.deliveries,before.deliveries);assert!(after.budget_policies.is_empty());
 }
@@ -180,7 +180,7 @@ fn schema12_launches_upgrade_without_fabricating_grants_or_releasing_capacity() 
     for claimed in [false,true] {
         let(temp,mut db,p)=fixture();let r=reserve(&mut db,&p);
         let claim=claimed.then(||db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap());
-        db.connection.execute_batch("DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; UPDATE store_meta SET schema_version=12; PRAGMA user_version=12;").unwrap();
+        db.connection.execute_batch("DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; UPDATE store_meta SET schema_version=12; PRAGMA user_version=12;").unwrap();
         let before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();let after=db.read_snapshot(None).unwrap();
         assert_eq!(after.head,before.head);assert_eq!(after.events,before.events);assert_eq!(after.attempt_inputs,before.attempt_inputs);assert_eq!(after.deliveries,before.deliveries);assert!(after.approvals.is_empty());
         drop(db);let mut db=SqliteStore::open(&temp.path().join("state.db")).unwrap();
@@ -270,7 +270,7 @@ fn version_one_input_serialization_preserves_historical_identity() {
 #[test]
 fn schema11_upgrade_retains_records_and_blocks_old_format_insertions() {
     let(temp,mut db,p)=fixture();
-    db.connection.execute_batch("DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER attempt_inputs_effective_profile; UPDATE store_meta SET schema_version=11; PRAGMA user_version=11;").unwrap();
+    db.connection.execute_batch("DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER attempt_inputs_effective_profile; UPDATE store_meta SET schema_version=11; PRAGMA user_version=11;").unwrap();
     // Reproduce a schema-11/v1 historical reservation, before v2's producer existed.
     let old_json=include_str!("../../../tests/fixtures/launch-inputs-v1.json").trim().replace(&"a".repeat(64),&p[0].inputs.binding_digest);
     let inputs:LaunchInputs=serde_json::from_str(&old_json).unwrap();
@@ -290,7 +290,7 @@ fn schema11_upgrade_retains_records_and_blocks_old_format_insertions() {
     let before=db.read_snapshot(None).unwrap();
     assert!(matches!(db.reserve_prepared(&p,before.head,1000),Err(StoreError::UnsupportedSchema(11))));
     db.upgrade_v1().unwrap();let after=db.read_snapshot(None).unwrap();
-    assert_eq!(after.schema_version,15);assert_eq!(after.attempt_inputs,before.attempt_inputs);assert_eq!(after.events,before.events);
+    assert_eq!(after.schema_version,16);assert_eq!(after.attempt_inputs,before.attempt_inputs);assert_eq!(after.events,before.events);
     assert_eq!(after.head,before.head);
     assert!(db.connection.execute("INSERT INTO attempt_inputs VALUES('old','old','{\"inputs\":{\"version\":1}}',?1)",params!["a".repeat(64)]).is_err());
     assert_eq!(after.attempt_inputs[0],record);
@@ -329,7 +329,7 @@ fn claim_and_cancellation_race_never_releases_a_claimed_worker() {
 }
 #[test]
 fn orphan_launches_refuse_reads_and_upgrade_rolls_back() {
-    let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);db.connection.execute_batch("DROP TRIGGER attempt_inputs_no_delete; DELETE FROM attempt_inputs;").unwrap();assert!(db.read_snapshot(None).is_err());db.connection.execute_batch("DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_inputs; DROP TABLE attempt_cancellations; UPDATE store_meta SET schema_version=10; PRAGMA user_version=10;").unwrap();assert!(db.upgrade_v1().is_err());let version:u32=db.connection.query_row("PRAGMA user_version",[],|r|r.get(0)).unwrap();assert_eq!(version,10);assert_eq!(db.read_snapshot(None).unwrap().operations[0].id,r.record.operation);
+    let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);db.connection.execute_batch("DROP TRIGGER attempt_inputs_no_delete; DELETE FROM attempt_inputs;").unwrap();assert!(db.read_snapshot(None).is_err());db.connection.execute_batch("DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_inputs; DROP TABLE attempt_cancellations; UPDATE store_meta SET schema_version=10; PRAGMA user_version=10;").unwrap();assert!(db.upgrade_v1().is_err());let version:u32=db.connection.query_row("PRAGMA user_version",[],|r|r.get(0)).unwrap();assert_eq!(version,10);assert_eq!(db.read_snapshot(None).unwrap().operations[0].id,r.record.operation);
 }
 #[test]
 fn cancellation_without_launch_proof_retains_the_attempt() {
@@ -337,7 +337,7 @@ fn cancellation_without_launch_proof_retains_the_attempt() {
 }
 #[test]
 fn schema10_upgrade_preserves_nonzero_claim_history() {
-    let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap();db.connection.execute_batch("DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_inputs; DROP TABLE attempt_cancellations; UPDATE operations SET kind='fixture'; UPDATE store_meta SET schema_version=10; PRAGMA user_version=10;").unwrap();let before=db.deliveries().unwrap();db.upgrade_v1().unwrap();assert_eq!(db.deliveries().unwrap(),before);assert!(db.read_snapshot(None).unwrap().attempt_inputs.is_empty());assert!(db.connection.execute("UPDATE operation_delivery SET attempts=0",[]).is_err());
+    let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap();db.connection.execute_batch("DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_inputs; DROP TABLE attempt_cancellations; UPDATE operations SET kind='fixture'; UPDATE store_meta SET schema_version=10; PRAGMA user_version=10;").unwrap();let before=db.deliveries().unwrap();db.upgrade_v1().unwrap();assert_eq!(db.deliveries().unwrap(),before);assert!(db.read_snapshot(None).unwrap().attempt_inputs.is_empty());assert!(db.connection.execute("UPDATE operation_delivery SET attempts=0",[]).is_err());
 }
 #[test]
 fn missing_parent_is_not_hidden_from_an_open_store() {

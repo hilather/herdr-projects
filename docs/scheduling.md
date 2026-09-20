@@ -48,7 +48,7 @@ Failed/cancelled predecessors block explicitly. Narrative succeeded state cannot
 satisfy an evidence-bound edge. Verified-result producers arrive in W07; profile,
 authority and production launch preparation remain W04 work. See the [frozen W04 interfaces](adr/0004-w04-scheduling-contract.md).
 
-## Reservations and cancellation (schema v15; older history retained)
+## Reservations and cancellation (schema v16; older history retained)
 
 A reservation transaction counts every unterminated attempt, checks task, binding,
 control and policy revisions, selects among sealed ready preparations using aged
@@ -90,9 +90,8 @@ Schema 15 permits a project-scoped `routine.run` outbox record without a synthet
 task. Its expected revision binds project control. Claim/pre-effect checks require
 the same active, reconciled control revision; finish requires the same revision.
 Task-scoped operations retain their task revision checks and historical JSON shape.
-Generic enqueue and legacy import cannot create routine operations. The sealed
-routine producer and execution adapter are still pending, so this schema does not
-enable scheduled commands or change approval requirements.
+Generic enqueue and legacy import cannot create routine operations. Schema 16 adds
+a [signed routine producer](routines.md); command execution remains pending.
 
 The shared schedule module now computes a bounded due-window summary: earliest and
 latest due instants plus the number of calendar/interval slots. Intervals anchor to
@@ -102,9 +101,10 @@ searches handle skipped calendar dates; no reported due instant is in the future
 Long downtime uses arithmetic, not a loop over missed occurrences. The same skipped-
 date fix applies to legacy daily routines.
 
-Persisting these windows, occurrence keys, overlap/missed-run decisions, approved
-routine revisions and atomic outbox inserts remains the next T04.4 step. The helper
-itself is pure and cannot authorize or execute a command.
+Schema 16 persists windows, occurrence keys, overlap/missed-run decisions, approved
+routine revisions and atomic outbox inserts. The schedule helper itself remains
+pure and cannot authorize or execute a command. Ticker execution and typed cleanup
+receipts remain the next integration step.
 
 ## Elapsed-time polling (partial T04.2)
 
