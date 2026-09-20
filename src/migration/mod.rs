@@ -498,4 +498,4 @@ pub(crate) fn publish_control_marker(project:&Path,db:&SqliteStore)->Result<()> 
 }
 
 mod identity_inventory;
-pub use identity_inventory::{read_identity_inventory,read_observation_head};
+pub use identity_inventory::{read_identity_inventory,read_observation_head,read_controller_effect_hint};

@@ -12,6 +12,7 @@ impl Budget {
     }
     pub fn check(&self)->Result<()> {ensure!(!self.cancellation.is_cancelled()&&Instant::now()<self.deadline,"identity inventory cancelled or expired");Ok(())}
     pub fn used(&self)->usize {self.used}
+    pub(crate) fn record(&mut self)->Result<()> {self.check()?;ensure!(self.records>0,"controller hint exceeds candidate budget");self.records-=1;Ok(())}
     pub(crate) fn charge(&mut self,n:usize)->Result<()> {self.check()?;ensure!(n<=self.remaining,"identity inventory exceeds byte budget");self.remaining-=n;self.used+=n;Ok(())}
     pub(crate) fn read(&mut self,path:&Path)->Result<Vec<u8>> {
         use std::{io::Read,os::unix::fs::MetadataExt};
@@ -26,7 +27,7 @@ impl Budget {
 }
 pub(crate) struct Publication {pub digest:String,pub sources:u64,pub tasks:u64,pub operations:u64,pub reconciliation_required:bool}
 /// Caller has validated and budgeted the active journal and format marker.
-fn read_published<T>(path:&Path,publication:&Publication,budget:&mut Budget,read:impl FnOnce(&rusqlite::Transaction<'_>,&mut Budget)->Result<T>)->Result<T> {
+pub(super) fn read_published<T>(path:&Path,publication:&Publication,budget:&mut Budget,read:impl FnOnce(&rusqlite::Transaction<'_>,&mut Budget)->Result<T>)->Result<T> {
     use std::os::unix::fs::MetadataExt;
     budget.check()?;engine_check()?;
     for suffix in ["-wal","-shm","-journal"] {

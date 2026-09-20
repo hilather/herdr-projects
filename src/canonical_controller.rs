@@ -9,7 +9,7 @@ use herdr_projects::{runtime,operations::{DeliveryState,dispatch::DispatchResult
 #[cfg(test)]
 use herdr_projects::migration;
 
-pub struct PollResult {pub reachable:bool,pub scheduled_work:bool,pub operation_error:Option<String>}
+pub struct PollResult {pub reachable:bool,pub scheduled_work:bool,pub unknown_effects:bool,pub operation_error:Option<String>}
 struct ProbeBudget<'a> {runner:&'a dyn crate::runner::Runner,deadline:std::time::Instant}
 impl crate::runner::Runner for ProbeBudget<'_> {
     fn run(&self,cmd:&crate::runner::Cmd)->Result<crate::runner::Output> {
@@ -56,13 +56,15 @@ fn finish_poll(ctx:&Ctx,path:&Path,turn:u64,reachable:bool,observation_error:Opt
     // A scheduling failure must not suppress unrelated notification/finalization
     // work. Each scheduling turn handles one routine; subsequent turns rotate.
     let scheduled=herdr_projects::routines::schedule_turn(&path,turn);
+    let queued=effects.is_some();
     let result=process_next(ctx,&path,turn,effects);
     let mut errors=observation_error.into_iter().collect::<Vec<_>>();
     let routine_work=match scheduled {Ok(report)=>{if let Some(error)=report.diagnostic {errors.push(format!("routine scheduling: {error}"));}report.active},Err(error)=>{errors.push(format!("routine scheduling: {error:#}"));false}};
-    let progress=match result {Ok(progress)=>progress,Err(error)=>{errors.push(format!("{error:#}"));false}};
-    Ok(PollResult{reachable:reachable||progress,scheduled_work:routine_work,operation_error:(!errors.is_empty()).then(||errors.join("; "))})
+    let (progress,unknown_effects)=match result {Ok(progress)=>(progress,false),Err(error)=>{errors.push(format!("{error:#}"));(false,queued)}};
+    Ok(PollResult{reachable:reachable||progress,scheduled_work:routine_work,unknown_effects,operation_error:(!errors.is_empty()).then(||errors.join("; "))})
 }
 fn process_next(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::copy_jobs::Queue>)->Result<bool> {
+    if let Some(effects)=effects{return offer_next(ctx,path,turn,effects);}
     let snapshot=runtime::snapshot(path)?;
     // Lifecycle/policy validation stays in each adapter. No imported obligation,
     // new launch or terminal input is inferred from legacy files or inbox content.
@@ -78,19 +80,6 @@ fn process_next(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::copy_job
     if candidates.is_empty(){return Ok(false);}
     candidates.sort_by(|(a,_),(b,_)|a.id.cmp(&b.id));
     let(operation,delivery)=candidates[(turn%candidates.len() as u64) as usize];
-    if let Some(effects)=effects {
-        let reference=crate::notification_delivery::config(ctx,path)?;
-        if operation.kind=="runtime.notification" {
-            let notice=herdr_projects::operations::notification::Notification::decode(operation)?;
-            let binding=notice.validate(operation,&snapshot,&reference)?;
-            effects.offer_canonical_notification(ctx,path,operation,delivery.revision,&binding.identity.socket)?;
-        }else{
-            herdr_projects::operations::finalization::Finalization::decode(operation)?.validate(operation,&snapshot,&reference)?;
-            let mode=if delivery.state==DeliveryState::Ambiguous {crate::canonical_finalization_jobs::Mode::Observe}else{crate::canonical_finalization_jobs::Mode::Deliver};
-            effects.offer_canonical_finalization(ctx,path,operation,delivery.revision,mode)?;
-        }
-        return Ok(false);
-    }
     if delivery.state==DeliveryState::Ambiguous {
         crate::finalization_delivery::observe(ctx,&path,&operation.id,delivery.revision,snapshot.head)?;
         return Ok(true);
@@ -104,6 +93,20 @@ fn process_next(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::copy_job
         DispatchResult::Recorded(_)=>Ok(true),
         DispatchResult::Unrecorded{..}=>anyhow::bail!("external operation outcome was not committed; retain claim until expiry and inspect receipts"),
     }
+}
+
+// A hint selects work only. Concrete workers retain full validation before
+// claiming or acting; a route hint does not certify provenance or authority.
+fn offer_next(ctx:&Ctx,path:&Path,turn:u64,effects:&mut crate::copy_jobs::Queue)->Result<bool> {
+    use herdr_projects::store::{identity_inventory::Budget,controller_hint::EffectMode};
+    let mut budget=Budget::new(2*1024*1024,1024,std::time::Instant::now()+std::time::Duration::from_millis(100),Default::default())?;
+    let Some(hint)=herdr_projects::migration::read_controller_effect_hint(path,&mut budget,turn,jiff::Timestamp::now().as_millisecond())? else{return Ok(false);};
+    match hint.operation.kind.as_str() {
+        "runtime.notification"=>effects.offer_canonical_notification(ctx,path,&hint.operation,hint.delivery_revision,hint.notification_socket.as_deref().context("notification route hint missing")?)?,
+        "runtime.finalization"=>effects.offer_canonical_finalization(ctx,path,&hint.operation,hint.delivery_revision,match hint.mode {EffectMode::Deliver=>crate::canonical_finalization_jobs::Mode::Deliver,EffectMode::Observe=>crate::canonical_finalization_jobs::Mode::Observe})?,
+        _=>anyhow::bail!("unsupported controller effect hint"),
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -201,4 +204,22 @@ pub(crate) mod tests {
         let(world,path,op)=finalization_delivery::tests::fixture();let raw=rusqlite::Connection::open(path.join(".state/state.db")).unwrap();raw.execute_batch("CREATE TRIGGER reject_confirmation BEFORE UPDATE ON operation_delivery WHEN NEW.state='confirmed' BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();assert!(poll(&world.ctx(),&path,0).unwrap().operation_error.is_some());let snapshot=runtime::snapshot(&path).unwrap();assert_eq!(snapshot.deliveries[0].state,DeliveryState::Claimed);raw.execute_batch("DROP TRIGGER reject_confirmation").unwrap();
         let source=snapshot.runtime_bindings.iter().find(|b|b.task==op.task).unwrap().identity.thread_dir.clone();std::fs::remove_dir_all(source).unwrap();migration::open_active(&path).unwrap().expire_claims(jiff::Timestamp::now().as_millisecond()+300_001).unwrap();poll(&world.ctx(),&path,0).unwrap();let after=runtime::snapshot(&path).unwrap();assert_eq!(after.deliveries[0].state,DeliveryState::Confirmed);assert_eq!(after.tasks.iter().find(|t|Some(&t.id)==op.task.as_ref()).unwrap().state,herdr_projects::domain::TaskState::AwaitingReview);let revision=after.tasks.iter().find(|t|Some(&t.id)==op.task.as_ref()).unwrap().revision;poll(&world.ctx(),&path,0).unwrap();assert_eq!(runtime::snapshot(&path).unwrap().tasks.iter().find(|t|Some(&t.id)==op.task.as_ref()).unwrap().revision,revision);
     }
+    #[test]
+    fn effect_hint_does_not_bypass_worker_provenance_checks() {
+        use std::{sync::Arc,time::{Duration,Instant}};
+        let(world,path,_op)=finalization_delivery::tests::fixture();let raw=rusqlite::Connection::open(path.join(".state/state.db")).unwrap();
+        raw.execute("UPDATE runtime_bindings SET payload_hash=?1",["0".repeat(64)]).unwrap();assert!(runtime::snapshot(&path).is_err());
+        let pool=Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),Arc::new(crate::canonical_finalization_jobs::JobRunner{inner:Arc::new(crate::runner::RealRunner)})).unwrap());let mut queue=crate::copy_jobs::Queue::new(pool.clone());
+        assert!(!process_next(&world.ctx(),&path,0,Some(&mut queue)).unwrap());assert!(queue.offered());assert!(queue.admit().is_empty());let end=Instant::now()+Duration::from_secs(3);let mut errors=Vec::new();
+        while queue.pending(){errors.extend(queue.drain());assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(5));}
+        assert_eq!(errors.len(),1);let state:(String,u64)=raw.query_row("SELECT state,attempts FROM operation_delivery WHERE operation_id LIKE 'finalize-%'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();assert_eq!(state,("pending".into(),0));assert!(!path.join(".state/canonical-artifacts").exists());assert!(pool.stop(Duration::from_secs(2)));
+    }
+    #[test]
+    fn unreadable_effect_hints_veto_idle_exit_instead_of_reporting_no_work() {
+        use std::sync::Arc;
+        let(world,path,_op)=finalization_delivery::tests::fixture();let raw=rusqlite::Connection::open(path.join(".state/state.db")).unwrap();raw.execute("UPDATE operations SET payload_hash=?1",["0".repeat(64)]).unwrap();
+        let pool=Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),Arc::new(crate::runner::RealRunner)).unwrap());let mut queue=crate::copy_jobs::Queue::new(pool.clone());
+        let result=finish_poll(&world.ctx(),&path,0,false,None,Some(&mut queue)).unwrap();assert!(!result.reachable);assert!(!result.scheduled_work);assert!(result.unknown_effects);assert!(result.operation_error.unwrap().contains("hash mismatch"));assert!(!queue.offered());assert!(pool.stop(std::time::Duration::from_secs(2)));
+    }
+
 }

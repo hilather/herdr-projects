@@ -17,6 +17,10 @@ pub fn read_identity_inventory(project:&Path,budget:&mut Budget)->Result<Vec<Run
     let(project,publication)=publication(project,budget)?;
     crate::store::identity_inventory::read(&project.join(".state/state.db"),&publication,budget)
 }
+pub fn read_controller_effect_hint(project:&Path,budget:&mut Budget,turn:u64,now:i64)->Result<Option<crate::store::controller_hint::ControllerEffectHint>> {
+    let(project,publication)=publication(project,budget)?;
+    crate::store::controller_hint::read(&project.join(".state/state.db"),&publication,budget,turn,now)
+}
 pub fn read_observation_head(project:&Path,budget:&mut Budget)->Result<u64> {
     let(project,publication)=publication(project,budget)?;
     crate::store::identity_inventory::read_head(&project.join(".state/state.db"),&publication,budget)
@@ -26,7 +30,7 @@ pub fn read_observation_head(project:&Path,budget:&mut Budget)->Result<u64> {
 mod tests {
     use super::*;
     use std::time::{Duration,Instant};
-    fn fixture()->(tempfile::TempDir,std::path::PathBuf) {
+    pub(super) fn fixture()->(tempfile::TempDir,std::path::PathBuf) {
         let root=tempfile::tempdir().unwrap();let p=root.path().join("project");fs::create_dir_all(p.join(".state")).unwrap();fs::create_dir_all(p.join("threads")).unwrap();
         fs::write(p.join("PROJECT.md"),"+++\nname = 'Fixture'\n+++\n").unwrap();fs::write(p.join(".state/project.json"),"{\"status\":\"paused\"}").unwrap();fs::write(p.join(".state/coordinator.json"),"{}").unwrap();
         let plan=inspect(&p).unwrap();assert!(plan.blockers.is_empty(),"{:?}",plan.blockers);apply(&p,&plan,true).unwrap();(root,p)
@@ -98,3 +102,7 @@ mod tests {
     }
 
 }
+
+#[cfg(test)]
+#[path="controller_hint_tests.rs"]
+mod controller_hint_tests;

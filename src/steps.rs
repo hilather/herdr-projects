@@ -142,6 +142,8 @@ pub struct Memory {
     pub routine_jobs:Option<crate::routine_jobs::Queue>,
     #[cfg(feature="state-store")]
     pub canonical_observations:Option<crate::canonical_controller::observations::Reads>,
+    #[cfg(feature="state-store")]
+    pub canonical_effects_unknown:bool,
     #[cfg(test)]
     clock: Option<Instant>,
 }
@@ -164,6 +166,8 @@ impl Memory {
             routine_jobs: None,
             #[cfg(feature="state-store")]
             canonical_observations:None,
+            #[cfg(feature="state-store")]
+            canonical_effects_unknown:false,
             #[cfg(test)]
             clock: None,
         }
@@ -172,7 +176,7 @@ impl Memory {
     pub fn observations_unknown(&self)->bool {
         let unknown=self.local_observations.as_ref().is_some_and(|reads|reads.unknown());
         #[cfg(feature="state-store")]
-        {return unknown||self.canonical_observations.as_ref().is_some_and(|reads|reads.unknown());}
+        {return unknown||self.canonical_effects_unknown||self.canonical_observations.as_ref().is_some_and(|reads|reads.unknown());}
         #[cfg(not(feature="state-store"))]
         unknown
     }

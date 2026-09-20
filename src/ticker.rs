@@ -315,7 +315,7 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     if let Some(reads)=memory.local_reports.as_mut(){reads.begin_pass();}
     if let Some(reads)=memory.local_observations.as_mut(){reads.begin_pass();}
     #[cfg(feature="state-store")]
-    if let Some(reads)=memory.canonical_observations.as_mut(){reads.begin_pass();}
+    {memory.canonical_effects_unknown=false;if let Some(reads)=memory.canonical_observations.as_mut(){reads.begin_pass();}}
     if let Some(queue)=memory.copy_jobs.as_mut() {for error in queue.drain(){log.line(&error);}}
     #[cfg(feature="state-store")]
     if let Some(queue)=memory.routine_jobs.as_mut() {for error in queue.drain(){log.line(&error);}}
@@ -396,8 +396,8 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         for slug in &canonical {
             let result=if let Some(reads)=memory.canonical_observations.as_mut(){crate::canonical_controller::poll_queued_effects(ctx,&ctx.root.join(slug),memory.tick.saturating_sub(1),reads,memory.copy_jobs.as_mut())}else{crate::canonical_controller::poll(ctx,&ctx.root.join(slug),memory.tick.saturating_sub(1))};
             match result {
-                Ok(result)=>{any_reachable|=result.reachable||result.scheduled_work;if let Some(error)=result.operation_error {log.line(&format!("{slug}: canonical operation: {error}"));}},
-                Err(error)=>log.line(&format!("{slug}: canonical controller: {error:#}")),
+                Ok(result)=>{memory.canonical_effects_unknown|=result.unknown_effects;any_reachable|=result.reachable||result.scheduled_work;if let Some(error)=result.operation_error {log.line(&format!("{slug}: canonical operation: {error}"));}},
+                Err(error)=>{memory.canonical_effects_unknown=true;log.line(&format!("{slug}: canonical controller: {error:#}"));},
             }
         }
         admit_background(ctx,log,memory,canonical.into_iter().map(|slug|ctx.root.join(slug)).collect());

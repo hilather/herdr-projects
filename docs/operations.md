@@ -302,9 +302,9 @@ checks use a read-only publication-checked query, with a 2 MiB publication budge
 They do not run database-wide integrity checks or materialize event payloads.
 Filesystem latency itself is not hard-bounded.
 
-Collection and canonical effect selection still read full snapshots; bounded
-historical-state materialization and other authority/profile work remain
-unfinished W04 work. macOS and real
+Canonical observation workers and synchronous routine scheduling still read full
+snapshots. Effect selection uses bounded hints as described below; full worker
+materialization bounds and other authority/profile work remain unfinished W04 work. macOS and real
 SSH-host acceptance remain untested.
 
 
@@ -624,3 +624,28 @@ leave a counted stage. At capacity, stop managed work and inspect abandoned
 files. Preserve hash-named snapshots and final `.json` receipts. No automatic
 reclamation is performed. Existing valid receipt recovery bypasses these admission
 limits. Filesystem latency remains cooperative, not a hard shutdown guarantee.
+
+
+## Bounded canonical effect selection
+
+The Linux ticker selects notification/finalization work through a read-only,
+publication-checked scheduling hint. It examines the complete eligible set up to
+1,024 candidates, sorts that bounded set and rotates by ticker turn. Overflow is
+an error rather than selection from a fixed prefix. Only the selected operation
+and, for a notification, its coordinator route are materialized. Event history,
+unrelated payloads and imported source bytes are not loaded by this reader.
+
+Selection has a 100 ms cooperative deadline and a 2 MiB serialized-input accounting
+budget, including publication metadata. Selected operation fields are limited to
+1 MiB and route fields to 64 KiB; SQLite separately limits encoded rows to 32 MiB,
+uses a progress interrupt and waits at most 10 ms for locks. These are accounting
+and execution bounds, not a 2 MiB peak-memory promise: decoding and SQLite have
+additional bounded overhead, and filesystem latency is cooperative.
+
+Hints grant no effect authority. Existing workers still validate full provenance,
+lifecycle, configuration, claim and current state before acting; notification
+admission still freezes the socket inode. Missing/corrupt relevant records,
+duplicate IDs, overflow, cancellation or timeout produce an error and veto idle
+exit without resetting reachability. Each ticker pass recomputes that veto.
+Synchronous routine planning and worker full-snapshot materialization remain
+separate unfinished work.

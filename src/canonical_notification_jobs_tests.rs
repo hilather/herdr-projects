@@ -172,3 +172,12 @@ fn canonical_notification_queue_completion_cannot_certify_delivery() {
     while queue.pending(){assert!(queue.drain().is_empty());assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(5));}
     assert_eq!(runtime::snapshot(&f.path).unwrap(),before);assert!(!f.world.home.path().join("sent").exists());assert!(pool.stop(Duration::from_secs(3)));
 }
+
+#[test]
+fn canonical_notification_hint_cannot_authorize_a_paused_delivery() {
+    let f=Fixture::new("ok");let before=runtime::snapshot(&f.path).unwrap();runtime::set_state(&f.path,before.head,before.control.unwrap().revision,ProjectState::Paused,&f.ctx().config_dir.join("config.toml")).unwrap();let before=runtime::snapshot(&f.path).unwrap();
+    let pool=Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),Arc::new(JobRunner{inner:Arc::new(crate::runner::RealRunner)})).unwrap());let mut queue=crate::copy_jobs::Queue::new(pool.clone());let mut reads=crate::canonical_controller::observations::Reads::new(pool.clone());
+    let result=crate::canonical_controller::poll_queued_effects(&f.ctx(),&f.path,0,&mut reads,Some(&mut queue)).unwrap();assert!(result.operation_error.is_none(),"{:?}",result.operation_error);assert!(queue.offered());
+    assert!(queue.admit().is_empty());let end=Instant::now()+Duration::from_secs(3);let mut errors=Vec::new();while queue.pending(){errors.extend(queue.drain());assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(5));}
+    assert_eq!(errors.len(),1);assert_eq!(runtime::snapshot(&f.path).unwrap(),before);assert!(!f.world.home.path().join("sent").exists());assert!(pool.stop(Duration::from_secs(2)));
+}

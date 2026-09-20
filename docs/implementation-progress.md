@@ -2464,3 +2464,43 @@ and release profiles, both finalization CLI regressions in both profiles, and 50
 default-feature artifact regressions. Process checks used disposable Linux
 namespaces. Independent review approved the source and production ticker fixture;
 `git diff --check` passed.
+
+
+### W04 bounded canonical effect hints
+
+The queued controller selects accepted effects using a distinct non-authoritative
+ControllerEffectHint API. It reuses publication-checked read-only SQLite setup,
+progress cancellation, short busy timeout and database identity checks. A complete
+eligible inventory is capped at 1,024 candidates and sorted in bounded Rust memory
+before turn rotation; no fixed prefix can starve later candidates. Only one
+selected operation and an optional coordinator route payload are copied/decoded.
+The main-pass selection budget is 100 ms and 2 MiB of serialized input, with 1 MiB
+operation-field and 64 KiB route-field caps. This is not a peak-memory claim.
+
+SQLite-owned ValueRef lengths are checked before Rust allocation. Selected-row
+queries use LIMIT 2 and refuse duplicates. Independent review found the initial
+shared operation loader could collect unmeasured duplicate rows from a corrupt
+view; the bounded decoder replaces it, with a 128-copy regression. Unresolved
+dangling deliveries are errors, not absence. Candidates, selected payload, route
+and event head are read in one transaction. Hash/indexed-identity checks preserve
+routing integrity; full imported provenance and effect authority remain worker
+responsibilities. Socket-inode admission fencing remains intact. Snapshot itself
+is unchanged.
+
+Unknown/error effects now use a per-pass idle-exit veto without claiming
+reachability or resetting its clock. Review approved this behavior and the final
+source. Tests cover large unrelated history, oversized selected fields, late
+candidates and overflow, route hash/identity, duplicate views, dangling records,
+publication mismatch, cancellation, SQL interruption and lock contention. Worker
+tests prove a hint cannot authorize paused notification delivery or bypass full
+provenance validation.
+
+Synchronous routine scheduling and full worker materialization remain next, along
+with the other W04 launch/profile, telemetry/budget and authority work. Card counts
+remain 16 locally implemented, five partial, 20 unstarted. Unavailable macOS and
+real SSH-host acceptance remain untested.
+
+Validation passed all 683 unit tests (189 library, 494 binary) and eight canonical
+CLI regressions in both debug and release profiles. Default-feature `cargo check`
+and `git diff --check` also passed. The final focused set included seven library
+hint tests and three worker/controller authority and idle-veto regressions.

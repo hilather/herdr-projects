@@ -304,3 +304,4 @@ mod budget;
 mod routines;
 
 pub mod identity_inventory;
+pub mod controller_hint;
