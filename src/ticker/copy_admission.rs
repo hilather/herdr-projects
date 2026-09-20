@@ -112,3 +112,40 @@ fn retained_merged_projection_blocks_brief_prompts_and_agent_starts() {
     assert!(errors.is_empty());assert_eq!(world.runner.count("agent prompt"),0);assert_eq!(world.runner.count("agent start"),0);
     let current=thread::load(&project,&t.id).unwrap();assert!(current.prompt_pending);assert!(current.pending_final_copy.is_some());assert_eq!(current.launch_attempts,t.launch_attempts);
 }
+
+#[cfg(target_os="linux")]
+#[test]
+fn remote_briefs_queue_without_synchronous_effects_and_require_saved_session_contract() {
+    use std::os::unix::net::UnixListener;
+    for supported in [true,false] {
+        let world=crate::scenarios::World::new();let project=world.project("remote","session.sock");
+        let socket=world.home.path().join("session.sock");std::fs::remove_file(&socket).unwrap();let _listener=UnixListener::bind(&socket).unwrap();
+        let t=world.thread(&project,world.home.path(),|t|{t.machine="saved".into();t.prompt_pending=true;});
+        let agents=vec![serde_json::from_str(&crate::scenarios::agent_json("w2","w2:t1","w2:p1",&t.cwd,&t.agent_name,"idle")).unwrap()];
+        let panes=vec![serde_json::from_str(&crate::scenarios::pane_json("w2","w2:t1","w2:p1",&t.cwd)).unwrap()];
+        let route=supported.then(||crate::remote_api::Route{id:"a".repeat(32),label:"saved".into(),target:"fixture.invalid".into(),session:"named".into(),enabled:true,selected:false});
+        let observation=crate::remote_polling::Observation{agents,panes,route,target:"fixture.invalid".into(),hashes:Default::default()};
+        let ctx=world.ctx();let herdr=Herdr::new(ctx.env.herdr_bin(),&socket,ctx.runner);let pool=Arc::new(Executor::new(Limits::default(),Arc::new(Immediate)).unwrap());let mut queue=crate::copy_jobs::Queue::new(pool.clone());let mut errors=Vec::new();
+        apply_remote(&ctx,&project,&herdr,"saved",&[t.clone()],observation,true,&mut false,&mut errors,Some(&mut queue),&mut Default::default(),&mut Default::default()).unwrap();
+        assert_eq!(queue.offered(),supported);assert_eq!(errors.is_empty(),supported,"{errors:?}");
+        assert!(!world.runner.calls.borrow().iter().any(|c|["agent list","pane list","agent prompt","agent start","machine list"].iter().any(|text|c.display().contains(text))),"admission performed a synchronous terminal preflight/effect");
+        assert!(thread::load(&project,&t.id).unwrap().prompt_pending);assert!(thread::load(&project,&t.id).unwrap().prompt_claim.is_none());
+        if supported {assert!(queue.admit().is_empty());let end=Instant::now()+Duration::from_secs(3);while queue.pending(){assert!(Instant::now()<end);assert!(queue.drain().is_empty());std::thread::sleep(Duration::from_millis(2));}assert!(thread::load(&project,&t.id).unwrap().prompt_pending);}
+        assert!(pool.stop(Duration::from_secs(1)));
+    }
+}
+
+#[test]
+fn delayed_remote_shell_still_refreshes_before_remaining_synchronous_starts() {
+    for changed_route in [false,true] {
+        let world=crate::scenarios::World::new();let project=world.project("remote","session.sock");let t=world.thread(&project,world.home.path(),|t|{t.machine="saved".into();t.prompt_pending=true;});
+        *world.agents.borrow_mut()=format!("[{}]",crate::scenarios::agent_json("w2","w2:t1","w2:p1",&t.cwd,&t.agent_name,"working"));
+        let pane=crate::scenarios::pane_json("w2","w2:t1","w2:p1",&t.cwd);*world.panes.borrow_mut()=format!("[{pane}]");
+        world.runner.on("machine list",crate::runner::fake::ok(&serde_json::json!([{"label":"saved","target":if changed_route{"changed.invalid"}else{"fixture.invalid"}}]).to_string()));
+        let observation=crate::remote_polling::Observation{agents:vec![],panes:vec![serde_json::from_str(&pane).unwrap()],route:None,target:"fixture.invalid".into(),hashes:Default::default()};
+        let ctx=world.ctx();let herdr=Herdr::new(ctx.env.herdr_bin(),world.home.path().join("session.sock"),ctx.runner);let pool=Arc::new(Executor::new(Limits::default(),Arc::new(Immediate)).unwrap());let mut queue=crate::copy_jobs::Queue::new(pool.clone());
+        let result=apply_remote(&ctx,&project,&herdr,"saved",&[t.clone()],observation,true,&mut true,&mut Vec::new(),Some(&mut queue),&mut Default::default(),&mut Default::default());
+        assert_eq!(result.is_err(),changed_route);assert_eq!(thread::load(&project,&t.id).unwrap().launch_attempts,0);assert_eq!(world.runner.count("agent start"),0);
+        assert_eq!(world.runner.count("machine list"),1);assert_eq!(world.runner.count("agent list"),usize::from(!changed_route));assert!(pool.stop(Duration::from_secs(1)));
+    }
+}

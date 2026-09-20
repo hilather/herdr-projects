@@ -128,14 +128,24 @@ but before recording confirmation can cause a repeated notification or nudge.
 
 ## Interrupted brief delivery
 
-On Linux, local thread briefs use the shared bounded queue and a concrete
-supervised sender. It validates the recorded socket identity, configuration,
+On Linux, local and saved-machine thread briefs use the shared bounded queue
+and a concrete supervised sender. It validates the recorded socket identity, configuration,
 execution and fresh unambiguous agent/pane observations before claiming delivery.
 Only a typed acknowledgement naming the same agent confirms delivery. Remote
-briefs, coordinator prompts and agent starts still use their existing paths.
+workers freeze the saved profile ID, literal SSH target and session from the
+observation, then recheck the current profile before claiming, before sending and
+after acknowledgement. Incomplete saved-session contracts refuse automatic briefs.
+The remote executable defaults to `herdr`; `HERDR_PROJECTS_REMOTE_HERDR_BIN` may
+name its installed path. It must support `remote-api-bridge` and an existing server
+in the saved session. No install, startup or automatic retry occurs. Coordinator
+prompts and agent starts still use their existing paths. Delayed shell observations
+retain fresh guarded preflight before remaining synchronous remote starts.
 
-The local sender checks other project and coordinator references, including
-resolved threads and socket aliases. Corrupt or oversized inventories refuse.
+The sender checks other project and coordinator references, including resolved
+threads and socket aliases. If either reference is remote, a duplicate pane ID
+refuses even across different machine labels or sessions: SSH aliases and loopback
+connections do not prove distinct terminal servers. This can conservatively block
+unrelated servers with colliding pane IDs. Corrupt or oversized inventories refuse.
 State-store builds inspect active canonical neighbors through a bounded read-only
 identity reader. Interrupted migrations, corrupt publication/provenance, dangling
 resource references and oversized inventories refuse. Default builds still refuse

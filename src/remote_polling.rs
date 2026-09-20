@@ -1,5 +1,6 @@
 //! Bounded read-only remote observation batches. The internal job marker is never
-//! executed as a program; terminal and copy effects stay in the guarded ticker.
+//! executed as a program. Results are observations; effect workers must recheck
+//! their own authority before claiming and dispatching.
 use std::{collections::BTreeMap,path::Path,sync::Arc,time::{Duration,Instant}};
 use anyhow::{Context,Result,ensure};
 use serde::{Deserialize,Serialize};
@@ -10,7 +11,7 @@ const JOB:&str="\0herdr-projects-remote-observation";
 struct Probe {bin:String,socket:String,machine:String,fallback:Option<String>,directories:Vec<(String,String)>}
 #[derive(Debug,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Observation {pub agents:Vec<Agent>,pub panes:Vec<Pane>,pub target:String,pub hashes:BTreeMap<String,String>}
+pub struct Observation {pub agents:Vec<Agent>,pub panes:Vec<Pane>,pub target:String,#[serde(default)]pub route:Option<crate::remote_api::Route>,pub hashes:BTreeMap<String,String>}
 pub struct ProbeRunner {pub inner:Arc<dyn Runner+Send+Sync>}
 struct Budget<'a> {runner:&'a dyn Runner,deadline:Instant,cancellation:Cancellation}
 impl Runner for Budget<'_> {
@@ -26,9 +27,10 @@ impl Runner for ProbeRunner {
         let herdr=Herdr::new(&probe.bin,&probe.socket,&budget);let machine=herdr.on_machine(&probe.machine);
         let agents=machine.agent_list()?;let panes=machine.pane_list()?;
         let listed=budget.run(&Cmd::new(&probe.bin,remote::SSH_TIMEOUT).args(["machine","list","--json"])).ok();
+        let route=listed.as_ref().and_then(|out|crate::remote_api::resolve(out,&probe.machine).ok());
         let target=remote::target_from_listing(listed,||probe.fallback,&probe.machine)?;
         let hashes=remote::report_hashes(&budget,&target,&probe.directories)?;
-        let stdout=serde_json::to_string(&Observation{agents,panes,target,hashes})?;ensure!(stdout.len()<=crate::runner::CAPTURE_LIMIT,"remote observation exceeds capture limit");
+        let stdout=serde_json::to_string(&Observation{agents,panes,target,route,hashes})?;ensure!(stdout.len()<=crate::runner::CAPTURE_LIMIT,"remote observation exceeds capture limit");
         Ok(Output{code:Some(0),stdout,..Output::default()})
     }
     fn socket_request(&self,socket:&Path,line:&str,timeout:Duration)->Result<String>{self.inner.socket_request(socket,line,timeout)}

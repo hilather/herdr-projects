@@ -1878,3 +1878,55 @@ Logs: `/tmp/herdr-route-{debug,release,default}.log`.
 The final default-feature suite passed 388 tests (30 library, 340 binary, 16 CLI,
 two contracts), including all six routing/transport fixtures. Three optional live
 checks remain ignored in every feature/build mode.
+
+## W04 supervised saved-machine briefs
+
+Linux remote observation batches now carry the complete saved route when its
+contract is valid. Ready briefs enter the shared bounded queue with that frozen
+route and execution/configuration/session identity. Incomplete contracts refuse
+without falling back to synchronous prompting. The concrete worker holds the
+root/project execution locks, checks bounded ownership inventory, revalidates the
+saved selector, probes the installed JSON bridge and reads fresh exact agent/pane
+identity before claiming. It rechecks routing before sending and after the typed
+acknowledgement. Queue success alone remains insufficient to confirm delivery.
+
+The existing durable claim/recovery path handles remote lost replies as uncertain
+and never resends them automatically. SSH payload stays on stdin, with strict
+host verification, no TTY, original deadline and cancellation. The remote binary
+defaults to `herdr`; `HERDR_PROJECTS_REMOTE_HERDR_BIN` selects an installed path.
+It must connect an existing server in the frozen saved session; no bootstrap is
+performed. The shared root barrier and inherited locks retain exclusion while the
+supervised SSH process lives.
+
+Ownership conservatively refuses a matching pane ID in another record whenever
+either side is remote, including local/loopback, distinct aliases, resolved threads
+and canonical bindings. Different SSH names or sessions cannot prove different
+servers. Unrelated servers with colliding pane IDs can therefore be refused.
+Local-only references retain canonical socket comparison. Inventory bounds and
+canonical-reader/default-feature limitations are unchanged.
+
+The worker subprocess fixture covers exact/lost/foreign replies, unsupported
+bridge, wrong request ID, busy/ambiguous targets, route changes before/after claim,
+post-claim cancellation, retained conflicts and cancellation of a blocked SSH
+process while a neighboring project can acquire its guard. Ticker fixtures prove
+queued admission grants no delivery receipt and missing contracts refuse. A
+separate regression retains fresh route/agent/pane preflight for delayed shell
+observations that could still trigger synchronous starts. The built ticker uses
+complete saved-route discovery, remote binary override, serialized worker ingress
+and concrete SSH bridge for confirmed/lost restart scenarios, with exactly one
+send and no synchronous prompt/start in either scenario.
+
+Independent source review approved after the remaining-start preflight fix and
+independently passed the remote worker variant fixture. The final focused remote
+suite passed 36 binary tests plus the built ticker restart test. Full regression
+results follow. No real remote host or macOS acceptance is claimed. Coordinator
+prompts/notifications, starts, token effects, canonical launch/profile integration,
+usage/telemetry and wider authority coverage remain. Counts stay 16 locally
+implemented, five partial and 20 not started; the complete plan remains active.
+
+Full debug and release suites passed 604 tests each (173 library, 393 binary,
+36 CLI, two contracts), including the complete remote ticker restart fixture.
+Logs: `/tmp/herdr-remote-brief-{debug,release,default}.log`; focused evidence is in
+`/tmp/herdr-remote-brief-focused.log` and `/tmp/herdr-remote-brief-remote-tests.log`.
+The final default-feature suite passed 392 tests (30 library, 343 binary, 17 CLI,
+two contracts). Three optional live checks remain ignored in every build mode.

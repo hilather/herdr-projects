@@ -100,7 +100,7 @@ Pending projections block conflicting copies, review preparation, execution/life
 replacement, deletion and migration. This is still an internal publication/recovery
 API: the ticker's supervised sender and executor admission are not wired yet.
 
-## Saved-machine JSON bridge prerequisite
+## Saved-machine JSON bridge and brief workers
 
 `remote_api` freezes a validated saved profile ID, literal SSH target and session.
 The supervised `remote-api-bridge` transport uses strict host verification and no
@@ -113,4 +113,9 @@ The contract follows [Herdr's saved-machine CLI](https://github.com/herdrdev/her
 and [remote bridge implementation](https://github.com/herdrdev/herdr/blob/d59d0603d53bb88c5320ea508a4fb9858b61af68/src/remote.rs).
 Installed 0.9.1 was verified with a disposable named-session JSON ping. Real SSH
 acceptance remains untested. This transport alone grants no sending authority:
-remote brief admission and ownership/claim integration are still pending.
+Linux remote brief workers now pair it with frozen route admission, bounded
+cross-project identity inventory, durable claims and typed agent acknowledgement.
+Any duplicate pane reference involving a remote endpoint refuses, including
+different SSH aliases or sessions. Labels alone cannot establish distinct servers.
+The remote executable defaults to `herdr`; use `HERDR_PROJECTS_REMOTE_HERDR_BIN`
+for an installed path. Other terminal effects still need worker integration.

@@ -47,8 +47,9 @@ file-backed; no projects have been migrated. See the bounded W03 handoff; platfo
 
 Saved-machine JSON transport now freezes profile/target/session and supervises
 bounded requests with strict host verification. Independent review approved the
-transport prerequisite; remote brief admission and cross-project ownership remain
-next. A disposable local named-session bridge ping passed; real SSH acceptance
+transport and its remote brief worker integration. Remote admission freezes routes,
+uses durable claims and conservatively refuses duplicate pane references across
+SSH aliases. A disposable local named-session bridge ping passed; real SSH acceptance
 remains untested. See [transport details](remote-transport.md).
 
 W04 T04.1 now has a [schema-v16 scheduling foundation](scheduling.md): DAG
@@ -80,11 +81,12 @@ queue, with retained recovery before session checks and durable notice replay.
 Full staging inventories can reclaim unreferenced managed directories under
 project ownership, preserving recovery references and unknown entries.
 Durable brief claims fence replay after a lost response and recover before
-session checks. Linux local briefs now enter the shared bounded queue and use a
+session checks. Linux local and saved-machine briefs now enter the shared bounded queue and use a
 concrete supervised sender with fresh target checks and typed confirmation.
 A bounded canonical identity reader now permits nonconflicting migrated neighbors
 in state-store builds; interrupted migrations and default builds still refuse.
-Remote briefs remain open.
+Remote workers revalidate profile/target/session and use the non-bootstrapping
+JSON bridge; incomplete contracts and ambiguous ownership refuse.
 Remaining terminal effects still need isolation. T04.3 now fences legacy
 launch arguments by explicit agent kind and provides redacted [named profile inspection](profiles.md);
 explicit local version probes for Claude/Codex are available. Launch selection,

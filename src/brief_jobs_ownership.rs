@@ -9,7 +9,7 @@ fn location(value:&str)->Result<PathBuf> {
     let path=Path::new(value);ensure!(path.is_absolute(),"terminal reference lacks absolute session");
     match path.canonicalize(){Ok(p)=>Ok(p),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{ensure!(path.components().all(|c|matches!(c,std::path::Component::RootDir|std::path::Component::Normal(_))),"unresolved session alias");Ok(path.into())},Err(e)=>Err(e.into())}
 }
-struct Inventory<'a>{control:&'a Control,bytes:usize,records:usize,socket:PathBuf,pane:&'a str}
+struct Inventory<'a>{control:&'a Control,bytes:usize,records:usize,socket:PathBuf,pane:&'a str,remote:bool}
 impl Inventory<'_> {
     fn read(&mut self,path:&Path)->Result<Option<String>> {
         self.control.check()?;let text=paths::read_control_text(path,16*1024*1024)?;
@@ -17,12 +17,18 @@ impl Inventory<'_> {
     }
     fn check(&mut self,machine:&str,socket:&str,pane:&str)->Result<()> {
         self.control.check()?;self.records+=1;ensure!(self.records<=1024,"terminal inventory exceeds 1024 references");
-        if machine.is_empty()&&!pane.is_empty()&&pane==self.pane {ensure!(location(socket)?!=self.socket,"brief terminal is referenced by another record");}Ok(())
+        if !pane.is_empty()&&pane==self.pane {
+            // SSH aliases (including loopback) cannot prove distinct terminal
+            // servers. A matching pane anywhere is therefore a conflict when
+            // either side is remote, even across different profile IDs.
+            ensure!(!self.remote&&machine.is_empty(),"brief pane has another reference with unverified remote identity");
+            ensure!(location(socket)?!=self.socket,"brief terminal is referenced by another record");
+        }Ok(())
     }
 }
 pub fn check(project:&Project,t:&Thread,socket:&Path,control:&Control)->Result<()> {
     let bounded=Control{deadline:control.deadline.min(std::time::Instant::now()+std::time::Duration::from_secs(10)),cancellation:control.cancellation.clone()};let control=&bounded;
-    let mut scan=Inventory{control,bytes:0,records:0,socket:socket.canonicalize()?,pane:&t.pane_id};
+    let mut scan=Inventory{control,bytes:0,records:0,socket:socket.canonicalize()?,pane:&t.pane_id,remote:t.is_remote()};
     let current=project.dir().canonicalize()?;
     for (n,entry) in fs::read_dir(&project.root)?.enumerate() {
         control.check()?;ensure!(n<1024,"terminal root inventory exceeds 1024 entries");let entry=entry?;let kind=entry.file_type()?;if !kind.is_dir()&&!kind.is_symlink(){continue;}

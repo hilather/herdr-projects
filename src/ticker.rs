@@ -685,22 +685,30 @@ fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threa
     let dirs: Vec<(String, String)> = threads.iter().filter(|t| !t.thread_dir.is_empty()).map(|t| (t.id.clone(), t.thread_dir.clone())).collect();
     let hashes = crate::remote::report_hashes(ctx.runner, &target, &dirs).map_err(|e| format!("{e:#}"))?;
 
-    apply_remote(ctx,project,herdr,machine,threads,crate::remote_polling::Observation{agents,panes,target,hashes},false,may_start,errors,copies,deferred,observed)
+    apply_remote(ctx,project,herdr,machine,threads,crate::remote_polling::Observation{agents,panes,target,route:None,hashes},false,may_start,errors,copies,deferred,observed)
 }
 fn apply_remote(ctx:&Ctx,project:&Project,herdr:&Herdr,machine:&str,threads:&[thread::Thread],observation:crate::remote_polling::Observation,asynchronous:bool,may_start:&mut bool,errors:&mut Vec<anyhow::Error>,mut copies:Option<&mut crate::copy_jobs::Queue>,deferred:&mut std::collections::BTreeSet<String>,observed:&mut std::collections::BTreeSet<String>)->Result<Vec<Transition>,String> {
     let remote=herdr.on_machine(machine);
-    let crate::remote_polling::Observation{mut agents,mut panes,target,hashes}=observation;
-    // A delayed observation alone cannot authorize a terminal launch/prompt.
-    // Keep the current guarded synchronous preflight for pending execution.
-    if asynchronous&&threads.iter().any(|t|t.prompt_pending||(copies.is_none()&&hashes.get(&t.id).is_some_and(|hash|hash!=&t.report_hash))) {
+    let crate::remote_polling::Observation{mut agents,mut panes,target,route,hashes}=observation;
+    // Briefs refresh inside their worker. Remaining synchronous starts still
+    // require the guarded live preflight when a delayed sample shows a shell.
+    let synchronous_launch=threads.iter().any(|t|thread::prompt_delivery::ready(t).is_ok()&&panes.iter().any(|p|thread::pane_matches(t,p))&&!agents.iter().any(|a|thread::agent_matches(t,a)));
+    if asynchronous&&(copies.is_none()||synchronous_launch)&&threads.iter().any(|t|t.prompt_pending||hashes.get(&t.id).is_some_and(|hash|hash!=&t.report_hash)) {
         let current=crate::remote::ssh_target(ctx.runner,&ctx.env.herdr_bin(),&ctx.config_dir,machine).map_err(|e|format!("{e:#}"))?;
         if current!=target {return Err("remote route changed after observation; retry before effects".into());}
     }
-    if asynchronous&&threads.iter().any(|t|t.prompt_pending) {
+    if asynchronous&&(copies.is_none()||synchronous_launch)&&threads.iter().any(|t|t.prompt_pending) {
         agents=remote.agent_list().map_err(|e|e.to_string())?;
         panes=remote.pane_list().map_err(|e|e.to_string())?;
     }
-    let pass = thread_pass(project, &remote, threads, &agents, &panes, Some(&hashes),false).map_err(|e| format!("{e:#}"))?;
+    if let Some(queue)=copies.as_deref_mut() {
+        for t in threads.iter().filter(|t|thread::prompt_delivery::ready(t).is_ok()) {
+            if agents.iter().any(|a|thread::agent_matches(t,a)&&a.ready()) {
+                errors.extend(match route.as_ref() {Some(route)=>queue.offer_remote_brief(ctx,project,t,route),None=>Err(anyhow::anyhow!("{}: saved remote session contract unavailable for brief",t.id))}.err());
+            }
+        }
+    }
+    let pass = thread_pass(project, &remote, threads, &agents, &panes, Some(&hashes),copies.is_some()).map_err(|e| format!("{e:#}"))?;
     errors.extend(pass.error);
 
     for t in threads.iter().filter(|t| t.status == thread::Status::Open) {

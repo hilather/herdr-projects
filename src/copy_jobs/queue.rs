@@ -38,6 +38,9 @@ impl Queue {
     pub fn offer_brief(&mut self,ctx:&Ctx,project:&Project,t:&Thread)->Result<()> {
         self.offer_request(crate::brief_jobs::request(ctx,project,t)?)
     }
+    pub fn offer_remote_brief(&mut self,ctx:&Ctx,project:&Project,t:&Thread,route:&crate::remote_api::Route)->Result<()> {
+        self.offer_request(crate::brief_jobs::request_remote(ctx,project,t,route)?)
+    }
     pub fn offer_routine(&mut self,ctx:&Ctx,project:&Project,routine:&crate::routine::Routine,previous:&str,occurrence:&str)->Result<()> {
         self.offer_request(crate::legacy_routine_jobs::request(ctx,project,routine,previous,occurrence)?)
     }
