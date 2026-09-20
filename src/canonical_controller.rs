@@ -35,27 +35,27 @@ pub fn poll(ctx:&Ctx,path:&Path,turn:u64)->Result<PollResult> {
     let reachable=batch.observations.iter().any(|o|o.pane==ResourceState::Present||o.worktree==ResourceState::Present);
     runtime::record_controller_observations_guarded(&path,&batch,&ownership)?;
     drop(ownership);
-    finish_poll(ctx,&path,turn,reachable,None,None)
+    finish_poll(ctx,&path,turn,reachable,None,None,None)
 }
-/// Background observation results affect liveness only. Scheduling still gets
-/// its main-pass opportunity before any next observation job is admitted.
+/// Background maintenance commits planning/observations itself. Replies carry
+/// liveness only; effects get their main-pass opportunity before replenishment.
 #[cfg(test)]
 pub fn poll_queued(ctx:&Ctx,path:&Path,turn:u64,reads:&mut observations::Reads)->Result<PollResult> {
     poll_queued_effects(ctx,path,turn,reads,None)
 }
 pub fn poll_queued_effects(ctx:&Ctx,path:&Path,turn:u64,reads:&mut observations::Reads,effects:Option<&mut crate::copy_jobs::Queue>)->Result<PollResult> {
-    let (reachable,error)=match reads.poll(ctx,path) {
-        Ok(observations::Poll::Ready(reachable))=>(reachable,None),
-        Ok(observations::Poll::Pending)=>(false,None),
-        Ok(observations::Poll::Failed(error))=>(false,Some(format!("canonical observation: {error}"))),
-        Err(error)=>(false,Some(format!("canonical observation: {error:#}"))),
+    let (reachable,scheduled,error)=match reads.poll(ctx,path) {
+        Ok(observations::Poll::Ready(sample))=>(sample.reachable.unwrap_or(false),sample.scheduled_work.unwrap_or(false),sample.diagnostic),
+        Ok(observations::Poll::Pending)=>(false,false,None),
+        Ok(observations::Poll::Failed(error))=>(false,false,Some(error)),
+        Err(error)=>(false,false,Some(format!("canonical maintenance: {error:#}"))),
     };
-    finish_poll(ctx,path,turn,reachable,error,effects)
+    finish_poll(ctx,path,turn,reachable,error,effects,Some(scheduled))
 }
-fn finish_poll(ctx:&Ctx,path:&Path,turn:u64,reachable:bool,observation_error:Option<String>,effects:Option<&mut crate::copy_jobs::Queue>)->Result<PollResult> {
-    // A scheduling failure must not suppress unrelated notification/finalization
-    // work. Each scheduling turn handles one routine; subsequent turns rotate.
-    let scheduled=herdr_projects::routines::schedule_turn(&path,turn);
+fn finish_poll(ctx:&Ctx,path:&Path,turn:u64,reachable:bool,observation_error:Option<String>,effects:Option<&mut crate::copy_jobs::Queue>,background_plan:Option<bool>)->Result<PollResult> {
+    // Background maintenance owns planning. Foreground callers retain their
+    // explicit synchronous service; either path still offers independent effects.
+    let scheduled=match background_plan {Some(active)=>Ok(herdr_projects::routines::ScheduleTurn{active,diagnostic:None}),None=>herdr_projects::routines::schedule_turn(path,turn)};
     let queued=effects.is_some();
     let result=process_next(ctx,&path,turn,effects);
     let mut errors=observation_error.into_iter().collect::<Vec<_>>();
@@ -219,7 +219,7 @@ pub(crate) mod tests {
         use std::sync::Arc;
         let(world,path,_op)=finalization_delivery::tests::fixture();let raw=rusqlite::Connection::open(path.join(".state/state.db")).unwrap();raw.execute("UPDATE operations SET payload_hash=?1",["0".repeat(64)]).unwrap();
         let pool=Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),Arc::new(crate::runner::RealRunner)).unwrap());let mut queue=crate::copy_jobs::Queue::new(pool.clone());
-        let result=finish_poll(&world.ctx(),&path,0,false,None,Some(&mut queue)).unwrap();assert!(!result.reachable);assert!(!result.scheduled_work);assert!(result.unknown_effects);assert!(result.operation_error.unwrap().contains("hash mismatch"));assert!(!queue.offered());assert!(pool.stop(std::time::Duration::from_secs(2)));
+        let result=finish_poll(&world.ctx(),&path,0,false,None,Some(&mut queue),Some(false)).unwrap();assert!(!result.reachable);assert!(!result.scheduled_work);assert!(result.unknown_effects);assert!(result.operation_error.unwrap().contains("hash mismatch"));assert!(!queue.offered());assert!(pool.stop(std::time::Duration::from_secs(2)));
     }
 
 }

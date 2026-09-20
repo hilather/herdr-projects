@@ -647,8 +647,7 @@ lifecycle, configuration, claim and current state before acting; notification
 admission still freezes the socket inode. Missing/corrupt relevant records,
 duplicate IDs, overflow, cancellation or timeout produce an error and veto idle
 exit without resetting reachability. Each ticker pass recomputes that veto.
-Synchronous routine planning and worker full-snapshot materialization remain
-separate unfinished work.
+Worker full-snapshot materialization still needs separate bounds.
 
 
 Routine execution admission also uses a bounded metadata-only hint with the same
@@ -659,5 +658,26 @@ or dangling candidates refuse admission. No routine script, operation payload,
 receipt or event history is loaded by this query. The concrete worker still
 validates all signed inputs and authority before claiming or running a command.
 Admission errors veto idle exit until a later successful admission scan; they do
-not reset reachability. Routine planning remains synchronous and is the next
-integration task.
+not reset reachability. Linux routine planning now shares the canonical
+observation worker described below.
+
+
+Linux canonical maintenance now plans one routine before collecting observations,
+under the same retained ProjectGuard. Planning checks a five-second deadline
+capped by the original 15-second job deadline; observations use the remainder.
+These remain cooperative bounds until full SQLite reads/transactions are also
+interruptible. Planning records intent only; execution takes a later queue turn.
+Planning and observation outcomes are independent. Only a matching final event
+head can establish liveness, and unknown outcomes veto idle exit. A failed probe
+retains the planner's selected name, including a withdrawn-script selection, so
+the next actual service can rotate to another routine. Queue replies cannot
+create observations, occurrences or execution receipts.
+
+Routine rotation is independent of ticker counters, liveness-cache invalidation
+and the 128-offer/16-pending admission windows. Up to 1,024 distinct project paths
+retain cursors for a ticker's lifetime. Configuration changes preserve the cursor;
+a replaced project inode resets it. The current discovery API cannot certify
+absence after a read failure, so entries are not automatically pruned. A full
+registry visibly refuses new project paths and vetoes idle exit; reduce the
+inventory and restart the ticker to reset the registry. No eviction silently
+restarts existing projects at their first routine.

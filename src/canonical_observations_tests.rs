@@ -32,7 +32,8 @@ print(json.dumps({{'result':r}}))
     fn input(&self)->Input{Input::new(&self.ctx(),&self.path).unwrap()}
     fn pool(&self)->Arc<Executor>{Arc::new(Executor::new(crate::executor::Limits::default(),Arc::new(ProbeRunner{inner:Arc::new(crate::runner::RealRunner)})).unwrap())}
 }
-fn finish(reads:&mut Reads){let end=Instant::now()+Duration::from_secs(5);while !reads.pending.is_empty(){reads.begin_pass();if reads.pending.is_empty(){break;}assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(5));}}
+fn finish(reads:&mut Reads){let end=Instant::now()+Duration::from_secs(5);let mut ready=BTreeMap::new();while !reads.pending.is_empty(){reads.begin_pass();ready.append(&mut reads.ready);if reads.pending.is_empty(){break;}assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(5));}reads.ready=ready;}
+
 
 #[test]
 fn canonical_worker_commits_fresh_evidence_without_trusting_queue_consumption() {
@@ -40,7 +41,7 @@ fn canonical_worker_commits_fresh_evidence_without_trusting_queue_consumption() 
     assert!(matches!(reads.poll(&f.ctx(),&f.path).unwrap(),Poll::Pending));assert!(reads.admit().is_empty());finish(&mut reads);
     // Drop the completion without consuming it. The DB, not this reply, is truth.
     drop(reads);let after=runtime::snapshot(&f.path).unwrap();assert!(after.head>before.head);assert!(after.observations.iter().any(|o|o.pane==ResourceState::Present));assert_eq!(after.tasks,before.tasks);assert_eq!(after.attempts,before.attempts);
-    let mut restarted=Reads::new(pool.clone());assert!(matches!(restarted.poll(&f.ctx(),&f.path).unwrap(),Poll::Pending));assert!(restarted.admit().is_empty());finish(&mut restarted);assert!(matches!(restarted.poll(&f.ctx(),&f.path).unwrap(),Poll::Ready(true)));assert!(pool.stop(Duration::from_secs(3)));
+    let mut restarted=Reads::new(pool.clone());assert!(matches!(restarted.poll(&f.ctx(),&f.path).unwrap(),Poll::Pending));assert!(restarted.admit().is_empty());finish(&mut restarted);assert!(matches!(restarted.poll(&f.ctx(),&f.path).unwrap(),Poll::Ready(Sample{reachable:Some(true),..})));assert!(pool.stop(Duration::from_secs(3)));
 }
 
 #[test]
@@ -58,7 +59,7 @@ fn canonical_worker_refuses_expiry_and_changed_configuration_without_committing(
     for mode in ["ok","config-change"] {
         let f=Fixture::new(mode);let before=runtime::snapshot(&f.path).unwrap();let mut control=Control{deadline:Instant::now()+BUDGET,cancellation:Default::default()};
         if mode=="ok"{control.deadline=Instant::now();}
-        assert!(collect(&f.input(),&control).is_err());assert_eq!(runtime::snapshot(&f.path).unwrap(),before);
+        let result=collect(&f.input(),&control);assert!(result.is_err()||result.is_ok_and(|sample|sample.head.is_none()&&sample.reachable.is_none()));assert_eq!(runtime::snapshot(&f.path).unwrap(),before);
         if mode=="ok"{assert!(!f.world.home.path().join("entered").exists());}
     }
 }
@@ -66,9 +67,9 @@ fn canonical_worker_refuses_expiry_and_changed_configuration_without_committing(
 #[test]
 fn canonical_worker_queue_rotates_beyond_its_inventory_limit() {
     use std::sync::Mutex;
-    struct Count {seen:Arc<Mutex<std::collections::BTreeSet<PathBuf>>>}
+    struct Count {seen:Arc<Mutex<std::collections::BTreeSet<(PathBuf,String)>>>}
     impl Runner for Count {
-        fn run(&self,command:&Cmd)->Result<Output>{let input:Input=serde_json::from_str(command.stdin.as_deref().unwrap())?;self.seen.lock().unwrap().insert(input.project.clone());Ok(Output{code:Some(0),stdout:serde_json::to_string(&Sample{reachable:false,head:observation_head(&input.project)?})?,..Output::default()})}
+        fn run(&self,command:&Cmd)->Result<Output>{let input:Input=serde_json::from_str(command.stdin.as_deref().unwrap())?;let selected=if input.last_selected.as_deref()==Some("first"){"second"}else{"first"};self.seen.lock().unwrap().insert((input.project.clone(),selected.into()));Ok(Output{code:Some(0),stdout:serde_json::to_string(&Sample{reachable:Some(false),scheduled_work:Some(false),head:Some(observation_head(&input.project)?),selected_name:Some(selected.into()),diagnostic:None})?,..Output::default()})}
         fn socket_request(&self,_:&Path,_:&str,_:Duration)->Result<String>{unreachable!()}
     }
     let root=tempfile::tempdir().unwrap();let env=Env::for_test(root.path(),&[]);let ctx=Ctx{env:&env,root:root.path().into(),config_dir:root.path().join("cfg"),runner:&crate::runner::RealRunner,detached_ticker:false};
@@ -79,13 +80,13 @@ fn canonical_worker_queue_rotates_beyond_its_inventory_limit() {
         assert!(reads.offers.len()<=OFFER_LIMIT);assert!(reads.classified.len()<=OFFER_LIMIT);assert!(reads.unknown());
         assert!(reads.admit().is_empty());assert!(reads.pending.len()<=PENDING_LIMIT);finish(&mut reads);
     }
-    assert_eq!(seen.lock().unwrap().len(),129);assert!(pool.stop(Duration::from_secs(3)));
+    assert_eq!(seen.lock().unwrap().len(),258,"all 129 projects must retain both planning turns beyond the offer window");assert!(pool.stop(Duration::from_secs(3)));
 }
 
 #[test]
 fn canonical_worker_negative_liveness_is_invalidated_by_rebinding() {
     let f=Fixture::new("failed");let pool=f.pool();let mut reads=Reads::new(pool.clone());reads.poll(&f.ctx(),&f.path).unwrap();reads.admit();finish(&mut reads);
-    assert!(matches!(reads.poll(&f.ctx(),&f.path).unwrap(),Poll::Ready(false)));
+    assert!(matches!(reads.poll(&f.ctx(),&f.path).unwrap(),Poll::Ready(Sample{reachable:Some(false),..})));
     reads.begin_pass();assert!(matches!(reads.poll(&f.ctx(),&f.path).unwrap(),Poll::Pending));assert!(!reads.unknown());
     let before=runtime::snapshot(&f.path).unwrap();let binding=before.runtime_bindings.iter().find(|b|!b.identity.pane_id.is_empty()).unwrap();
     let mut route=herdr_projects::domain::RuntimeRoute::from_identity(&binding.identity);route.pane_id="new-pane".into();
@@ -100,7 +101,7 @@ fn canonical_worker_repeated_negative_completions_clear_exit_veto() {
     let f=Fixture::new("failed");let pool=f.pool();let mut reads=Reads::new(pool.clone());reads.poll(&f.ctx(),&f.path).unwrap();
     for _ in 0..4 {
         assert!(reads.admit().is_empty());finish(&mut reads);
-        assert!(matches!(reads.poll(&f.ctx(),&f.path).unwrap(),Poll::Ready(false)));
+        assert!(matches!(reads.poll(&f.ctx(),&f.path).unwrap(),Poll::Ready(Sample{reachable:Some(false),..})));
         assert!(!reads.unknown(),"a fresh negative completion supersedes the previous head");
     }
     assert!(pool.stop(Duration::from_secs(3)));
@@ -126,7 +127,7 @@ fn canonical_worker_leaves_a_scheduling_turn_between_probes() {
     let(world,path)=crate::canonical_controller::tests::routine_fixture(&[("a-first",b"touch MUST_NOT_EXECUTE\n",1000),("b-second",b"touch MUST_NOT_EXECUTE\n",1000)]);
     let pool=Arc::new(Executor::new(crate::executor::Limits::default(),Arc::new(ProbeRunner{inner:Arc::new(crate::runner::RealRunner)})).unwrap());let mut reads=Reads::new(pool.clone());
     for turn in 0..2 {
-        let result=crate::canonical_controller::poll_queued(&world.ctx(),&path,turn,&mut reads).unwrap();assert!(result.scheduled_work,"{:?}",result.operation_error);
+        let result=crate::canonical_controller::poll_queued(&world.ctx(),&path,turn,&mut reads).unwrap();assert_eq!(result.scheduled_work,turn>0,"{:?}",result.operation_error);
         assert!(reads.admit().is_empty());finish(&mut reads);
     }
     assert_eq!(runtime::snapshot(&path).unwrap().routine_occurrences.len(),2);assert!(!path.join("MUST_NOT_EXECUTE").exists());assert!(pool.stop(Duration::from_secs(3)));
@@ -179,11 +180,79 @@ fn canonical_worker_and_routine_admission_take_separate_project_turns() {
     let held=Arc::new(AtomicBool::new(true));let runner=Arc::new(Gate{held:held.clone(),inner:Arc::new(crate::routine_jobs::JobRunner{inner:Arc::new(ProbeRunner{inner:Arc::new(crate::runner::RealRunner)})})});let pool=Arc::new(Executor::new(crate::executor::Limits::default(),runner).unwrap());
     let mut reads=Reads::new(pool.clone());reads.poll(&world.ctx(),&path).unwrap();reads.admit();let mut memory=crate::steps::Memory::new(&world.ctx());memory.canonical_observations=Some(reads);memory.routine_jobs=Some(crate::routine_jobs::Queue::new(pool.clone()));
     crate::ticker::tick_for_test(&world.ctx(),&mut memory);assert!(!memory.routine_jobs.as_ref().unwrap().pending());assert!(!path.join("STARTED").exists());
-    let snapshot=runtime::snapshot(&path).unwrap();assert_eq!(snapshot.routine_occurrences.len(),1);assert_eq!(snapshot.deliveries[0].attempts,0);
+    let snapshot=runtime::snapshot(&path).unwrap();assert!(snapshot.routine_occurrences.is_empty(),"held worker must not fall back to synchronous planning");
     held.store(false,Ordering::SeqCst);let end=Instant::now()+Duration::from_secs(5);while pool.metrics().running[0]+pool.metrics().queued[0]>0{assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(5));}
     crate::ticker::tick_for_test(&world.ctx(),&mut memory);assert!(memory.routine_jobs.as_ref().unwrap().pending_project(path.to_str().unwrap()));assert!(!memory.canonical_observations.as_ref().unwrap().pending_project(path.to_str().unwrap()));
     while !path.join("STARTED").exists(){assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(5));}
     crate::ticker::tick_for_test(&world.ctx(),&mut memory);assert!(!memory.canonical_observations.as_ref().unwrap().pending_project(path.to_str().unwrap()));
     while runtime::snapshot(&path).unwrap().deliveries[0].state!=herdr_projects::operations::DeliveryState::Confirmed{assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(10));}
     assert!(path.join("COMPLETED").exists());assert!(pool.stop(Duration::from_secs(3)));
+}
+
+#[test]
+fn canonical_planning_progress_survives_failed_observation_and_rotates_with_constant_tick() {
+    struct FailingObservation {expire:bool}
+    impl Runner for FailingObservation {
+        fn run(&self,command:&Cmd)->Result<Output>{
+            let input:Input=serde_json::from_str(command.stdin.as_deref().unwrap())?;
+            let control=Control{deadline:command.deadline.unwrap(),cancellation:command.cancellation.clone().unwrap()};
+            let sample=collect_with(&input,&control,|_,_,_|{if self.expire{control.cancellation.cancel();}anyhow::bail!("injected probe failure")})?;
+            Ok(Output{code:Some(0),stdout:serde_json::to_string(&sample)?,..Output::default()})
+        }
+        fn socket_request(&self,_:&Path,_:&str,_:Duration)->Result<String>{unreachable!()}
+    }
+    for expire in [false,true] {
+    let(world,path)=crate::canonical_controller::tests::routine_fixture(&[("a-first",b"touch MUST_NOT_EXECUTE\n",1000),("b-second",b"touch MUST_NOT_EXECUTE\n",1000)]);
+    fs::write(path.join("a-first.sh"),"withdrawn script").unwrap();
+    let pool=Arc::new(Executor::new(crate::executor::Limits::default(),Arc::new(FailingObservation{expire})).unwrap());let mut reads=Reads::new(pool.clone());
+    crate::canonical_controller::poll_queued(&world.ctx(),&path,0,&mut reads).unwrap();
+    for expected in ["a-first","b-second","a-first","b-second"] {
+        assert!(reads.admit().is_empty());finish(&mut reads);
+        let result=crate::canonical_controller::poll_queued(&world.ctx(),&path,0,&mut reads).unwrap();
+        assert_eq!(result.scheduled_work,!expire);assert!(result.operation_error.unwrap().contains("injected probe failure"));assert!(reads.unknown());
+        assert_eq!(reads.rotation.values().next().unwrap().last.as_deref(),Some(expected));
+    }
+    let snapshot=runtime::snapshot(&path).unwrap();assert_eq!(snapshot.routine_occurrences.len(),1);assert_eq!(snapshot.deliveries[0].attempts,0);assert!(!path.join("MUST_NOT_EXECUTE").exists());assert!(pool.stop(Duration::from_secs(3)));
+    }
+}
+
+#[test]
+fn canonical_planning_precedes_slow_probes_and_retains_selection_after_expiry() {
+    let(world,path)=crate::canonical_controller::tests::routine_fixture(&[("first",b"touch MUST_NOT_EXECUTE\n",1000)]);
+    let input=Input::new(&world.ctx(),&path).unwrap();let control=Control{deadline:Instant::now()+Duration::from_secs(5),cancellation:Default::default()};
+    let sample=collect_with(&input,&control,|_,_,_|{
+        assert_eq!(runtime::snapshot(&path)?.routine_occurrences.len(),1);
+        control.cancellation.cancel();anyhow::bail!("probe cancelled")
+    }).unwrap();
+    assert_eq!(sample.selected_name.as_deref(),Some("first"));assert_eq!(sample.scheduled_work,Some(true));assert!(sample.reachable.is_none());assert!(sample.head.is_none());assert!(sample.diagnostic.unwrap().contains("probe cancelled"));assert!(!path.join("MUST_NOT_EXECUTE").exists());
+}
+
+#[test]
+fn canonical_withdrawn_routine_does_not_discard_valid_observations() {
+    let(world,path)=crate::canonical_controller::tests::routine_fixture(&[("first",b"touch MUST_NOT_EXECUTE\n",1000)]);
+    fs::write(path.join("first.sh"),"withdrawn script").unwrap();let input=Input::new(&world.ctx(),&path).unwrap();
+    let sample=collect(&input,&Control{deadline:Instant::now()+BUDGET,cancellation:Default::default()}).unwrap();
+    assert_eq!(sample.reachable,Some(false));assert_eq!(sample.scheduled_work,Some(true));assert!(sample.head.is_some());assert!(sample.diagnostic.unwrap().contains("script changed"));assert!(runtime::snapshot(&path).unwrap().routine_occurrences.is_empty());
+}
+
+#[test]
+fn canonical_rotation_registry_refuses_overflow_without_forgetting_present_projects() {
+    let f=Fixture::new("failed");let pool=f.pool();let mut reads=Reads::new(pool.clone());
+    for n in 0..ROTATION_LIMIT {reads.rotation.insert((format!("/fixture/{n}"),"canonical-observation".into()),Rotation{identity:(1,n as u64),last:Some("second".into())});}
+    assert!(reads.poll(&f.ctx(),&f.path).err().unwrap().to_string().contains("1024"));assert!(reads.unknown());assert!(reads.offers.is_empty());assert_eq!(reads.rotation.len(),ROTATION_LIMIT);assert!(reads.rotation.values().all(|r|r.last.as_deref()==Some("second")));assert!(pool.stop(Duration::from_secs(3)));
+}
+
+#[test]
+fn canonical_observation_pause_replaces_pre_observation_planning_liveness() {
+    let(world,path)=crate::canonical_controller::tests::routine_fixture(&[("first",b"touch MUST_NOT_EXECUTE\n",1000)]);
+    let input=Input::new(&world.ctx(),&path).unwrap();let control=Control{deadline:Instant::now()+BUDGET,cancellation:Default::default()};
+    let sample=collect_with(&input,&control,|_,_,_|{
+        // Model observation-driven control invalidation inside the retained
+        // ownership interval. Runtime wrappers must not reacquire that guard.
+        let mut db=migration::open_active(&path)?;let snapshot=db.read_snapshot(None)?;
+        db.set_project_state(snapshot.head,snapshot.control.unwrap().revision,herdr_projects::domain::ProjectState::Paused,jiff::Timestamp::now().as_millisecond(),None)?;
+        let marker=path.join(".state/format.json");let mut value:serde_json::Value=serde_json::from_slice(&fs::read(&marker)?)?;value["reconciliation_required"]=true.into();fs::write(marker,serde_json::to_vec(&value)?)?;Ok(false)
+    }).unwrap();
+    assert_eq!(sample.scheduled_work,Some(false));assert_eq!(sample.reachable,Some(false));assert!(sample.head.is_some());assert_eq!(sample.selected_name.as_deref(),Some("first"));
+    let snapshot=runtime::snapshot(&path).unwrap();assert_eq!(snapshot.routine_occurrences.len(),1);assert_eq!(snapshot.deliveries[0].attempts,0);assert!(!path.join("MUST_NOT_EXECUTE").exists());
 }

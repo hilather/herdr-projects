@@ -2563,3 +2563,45 @@ name rotation, withdrawn scripts, wrong ownership, cancellation/expiry, short-lo
 contention, validation outside the record lock, stale-head rejection, and known
 paused state. `git diff --check` passes. No production path has switched planners
 yet, and card counts remain unchanged.
+
+### W04 background routine planning integrated with canonical observations
+
+Linux canonical maintenance now runs the held-guard planner before read-only
+probes in the existing shared executor. Queued controller polling always consumes
+that background outcome and never falls back to synchronous scheduling. The
+foreground controller keeps its explicit synchronous service. One ProjectGuard
+spans planning and observations; each half reports independently, and a final
+matching event head binds liveness. Failed/expired observations preserve the
+planner's selected name. Neither queue replies nor cursor history authorize an
+effect or create durable occurrences.
+
+Rotation advances by actual selected routine name, independently of ticker count,
+head/config cache invalidation and the 128-offer/16-pending queue windows. A
+separate 1,024-project-path lifetime registry retains service history. Overflow
+refuses new paths with a visible error and idle-exit veto. Entries are deliberately
+not pruned from discovery's failure-collapsing list API; operators must reduce
+inventory and restart to reset the registry. Project inode replacement resets its
+cursor, while configuration changes preserve it.
+
+Independent source review approved the integration. Tests cover independent
+planning/probe progress, expired observations retaining selection, constant-tick
+rotation after withdrawn scripts, 129 projects each receiving both planning
+turns, registry overflow, unknown/negative liveness, exclusion and no synchronous
+fallback while a maintenance job is held. Original deadline checks remain
+cooperative; full worker SQLite/materialization bounds are the next unfinished
+T04.2 work. Card counts and unavailable platform acceptance remain unchanged.
+
+A final liveness check accounts for observation-driven control invalidation:
+a planning result that was active before probes is masked to inactive if the
+published final control is paused or requires reconciliation. The recorded intent
+remains unclaimed. A regression drives a real control transition and matching
+publication during the observation half and verifies the returned final state.
+
+Validation: the broad 697-unit suite (197 library, 500 binary) and nine canonical
+CLI regressions passed in both debug and release profiles. After the final
+control-state correction and its additional regression, all 24 affected canonical
+controller tests and all nine canonical CLI tests passed again in both profiles.
+Default-feature `cargo check` and `git diff --check` also passed. The built signed
+routine fixture now exercises background intent planning, later-turn execution,
+and restart without a duplicate receipt or script write. Independent review
+approved the final correction; unavailable macOS/real SSH checks remain untested.

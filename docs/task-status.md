@@ -60,8 +60,7 @@ unavailable. T04.2 now uses monotonic remote poll/retry deadlines and pass-start
 scheduling plus a shared bounded executor for asynchronous PR and remote observations;
 automatic routines now share that executor. Linux artifact transfers, launch/brief/coordinator effects, token updates and
 notifications now share supervised or guarded executor jobs. Canonical observation,
-notification and finalization workers also use the pool; routine planning still
-needs to leave the synchronous ticker pass. Live transfers now have bounded private staging,
+notification and finalization workers also use the pool; routine planning now shares the canonical observation worker. Live transfers now have bounded private staging,
 recoverable guarded publication, cancellation/deadline checks through receipt commit,
 and pre-transport spool reservation. The supervised copy worker now rechecks
 execution/configuration/routing, requires successful native transport, and resumes
@@ -100,8 +99,7 @@ production profile resolution and verified capability evidence remain. Version-2
 reservation inputs now retain and validate frozen profile evidence; historical
 version-1 records remain readable. Explicit routine execution now has durable
 occurrence, authority and cleanup contracts; automatic ticker dispatch now uses
-the shared bounded executor with project ownership and an effect opportunity between runs. Remaining work includes controlled full-store materialization, asynchronous routine
-planning, production worker profiles (T04.3), budgets/telemetry (T04.4), and
+the shared bounded executor with project ownership and an effect opportunity between runs. Remaining work includes controlled full-store materialization, production worker profiles (T04.3), budgets/telemetry (T04.4), and
 operation-scoped authority (T04.5).
 T04.5 now has an [approval scope contract](authority.md) binding exact launch inputs
 without circular hashes, durable grants/revocations and atomic one-time launch-claim
@@ -132,7 +130,7 @@ bounded metadata hints instead of full snapshots in the ticker. Workers still
 validate authoritative inputs before claiming or acting. Unreadable or oversized
 admission state vetoes idle exit. Canonical finalization recovers from retained
 receipts without recopying; bounded staging refuses overflow. These changes do not
-complete W04: full worker reads, asynchronous planning and the production
+complete W04: full worker reads and the production
 launch/profile, termination, telemetry and authority work remain.
 The [scheduler/executor/profile interfaces](adr/0004-w04-scheduling-contract.md) are frozen. Existing retained/adopted attempts
 must count toward the cap; no uncertain worker may be replaced to free a slot.
