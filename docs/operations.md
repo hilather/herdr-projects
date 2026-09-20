@@ -681,3 +681,20 @@ absence after a read failure, so entries are not automatically pruned. A full
 registry visibly refuses new project paths and vetoes idle exit; reduce the
 inventory and restart the ticker to reset the registry. No eviction silently
 restarts existing projects at their first routine.
+
+Background routine planning now opens its store through an explicit
+`ControlledStore`. Original cancellation/deadline controls are installed before
+SQLite schema, WAL and integrity queries. A progress callback interrupts SQL,
+encoded values/rows are capped at 32 MiB, and lock waits are capped at 10 ms.
+A commit hook vetoes an expired or cancelled scheduling transaction; its actual
+veto reason is retained separately from ordinary constraint failures. Successful
+commits remain successful if cancellation arrives during final durability work.
+Callbacks inspect only time/cancellation and never reenter SQLite.
+
+Controlled opening reads at most 50 MiB of publication input (16 MiB per file),
+then checks the migration receipt, operation count and published control on the
+same controlled database handle. It refuses linked/nonregular database files and
+sidecars and rechecks the database inode after opening. Existing foreground APIs
+keep their current behavior. This is SQL execution and encoded-row bounding, not
+a total-memory guarantee: aggregate decoded snapshot allocation and other
+workers' uncontrolled opens/transaction-local readers remain unfinished.

@@ -14,8 +14,8 @@ pub struct PlannedRoutine {
 /// Select strictly after the last serviced routine, wrapping by name. The caller
 /// retains its ProjectGuard across planning and any subsequent observations.
 /// Cancellation is checked before commit; a successful commit is not relabelled
-/// as a no-write cancellation if cancellation arrives afterward. Store reads and
-/// the transaction still require separate SQLite/materialization bounds.
+/// as a no-write cancellation if cancellation arrives afterward. SQL shares the
+/// original control; aggregate decoded materialization still needs bounds.
 pub fn schedule_next_guarded(project:&Path,last:Option<&str>,guard:&ProjectGuard,cancellation:&Cancellation,deadline:Instant)->Result<PlannedRoutine> {
     plan(project,last,guard,cancellation,deadline,super::validate_current)
 }
@@ -27,7 +27,7 @@ fn check(cancellation:&Cancellation,deadline:Instant)->Result<()> {
 
 fn plan(project:&Path,last:Option<&str>,guard:&ProjectGuard,cancellation:&Cancellation,deadline:Instant,validate:impl FnOnce(&RoutineDefinition)->Result<()>)->Result<PlannedRoutine> {
     check(cancellation,deadline)?;guard.check_project(project)?;
-    let mut db=migration::open_active(project)?;
+    let mut db=migration::open_active_controlled(project,crate::store::controlled::ReadControl::new(deadline,cancellation.clone()))?;
     check(cancellation,deadline)?;
     let snapshot=db.read_snapshot(None)?;
     check(cancellation,deadline)?;

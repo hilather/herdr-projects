@@ -13,6 +13,19 @@ fn publication(project:&Path,budget:&mut Budget)->Result<(std::path::PathBuf,Pub
     let publication=Publication{digest:journal.plan.digest,sources:journal.plan.sources.iter().filter(|s|s.kind!="backup").count() as u64,tasks:journal.plan.tasks.len() as u64,operations:journal.plan.operations.len() as u64,reconciliation_required:marker.reconciliation_required};
     Ok((project,publication))
 }
+/// Parse bounded publication expectations, then validate them on the exact
+/// controlled writable handle returned to the caller. No intervening readonly
+/// connection can certify a subsequently reopened database.
+pub fn open_active_controlled(project:&Path,control:crate::store::controlled::ReadControl)->Result<crate::store::controlled::ControlledStore> {
+    control.check()?;
+    let mut budget=Budget::new(50*1024*1024,0,control.deadline(),control.cancellation())?;
+    let(project,expected)=publication(project,&mut budget)?;control.check()?;
+    let db=crate::store::controlled::ControlledStore::open(&project.join(".state/state.db"),control.clone())?;
+    ensure!(db.import_operation_count()?==expected.operations,"store imported operation count mismatch");
+    ensure!(db.import_receipt()?==(expected.digest,expected.sources,expected.tasks),"store import identity mismatch");
+    ensure!(db.project_control()?.map(|c|c.reconciliation_required).unwrap_or(true)==expected.reconciliation_required,"control/format publication interrupted; run migration recover before runtime commands");
+    control.check()?;Ok(db)
+}
 pub fn read_identity_inventory(project:&Path,budget:&mut Budget)->Result<Vec<RuntimeBinding>> {
     let(project,publication)=publication(project,budget)?;
     crate::store::identity_inventory::read(&project.join(".state/state.db"),&publication,budget)
@@ -40,6 +53,23 @@ mod tests {
         let plan=inspect(&p).unwrap();assert!(plan.blockers.is_empty(),"{:?}",plan.blockers);apply(&p,&plan,true).unwrap();(root,p)
     }
     fn budget()->Budget {Budget::new(50*1024*1024,1024,Instant::now()+Duration::from_secs(10),Default::default()).unwrap()}
+    #[test]
+    fn controlled_open_matches_snapshot_and_rejects_bad_publication() {
+        use crate::store::controlled::ReadControl;
+        let(_root,p)=fixture();let expected=crate::runtime::snapshot(&p).unwrap();let control=||ReadControl::new(Instant::now()+Duration::from_secs(5),Default::default());
+        assert_eq!(open_active_controlled(&p,control()).unwrap().read_snapshot(None).unwrap(),expected);
+        let marker=p.join(".state/format.json");let original=fs::read(&marker).unwrap();let mut value:serde_json::Value=serde_json::from_slice(&original).unwrap();value["reconciliation_required"]=false.into();fs::write(&marker,serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(open_active_controlled(&p,control()).is_err());fs::write(marker,original).unwrap();
+        let raw=rusqlite::Connection::open(p.join(".state/state.db")).unwrap();raw.execute("UPDATE migration_receipt SET source_digest=?1",["0".repeat(64)]).unwrap();
+        assert!(open_active_controlled(&p,control()).is_err());
+    }
+    #[test]
+    fn controlled_open_keeps_cancellation_and_publication_byte_limits() {
+        use crate::store::{controlled::ReadControl,StoreError};
+        let(_root,p)=fixture();let cancellation=crate::runner::Cancellation::default();cancellation.cancel();
+        let error=open_active_controlled(&p,ReadControl::new(Instant::now()+Duration::from_secs(5),cancellation)).err().unwrap();assert!(matches!(error.downcast_ref::<StoreError>(),Some(StoreError::Cancelled)));
+        fs::write(journal_path(&p),vec![b' ';16*1024*1024+1]).unwrap();let error=open_active_controlled(&p,ReadControl::new(Instant::now()+Duration::from_secs(5),Default::default())).err().unwrap();assert!(error.to_string().contains("budget"));
+    }
     #[test]
     fn observation_head_reads_no_historical_payload_and_fences_publication() {
         let(_root,p)=fixture();let db=rusqlite::Connection::open(p.join(".state/state.db")).unwrap();

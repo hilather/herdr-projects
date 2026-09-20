@@ -2605,3 +2605,36 @@ Default-feature `cargo check` and `git diff --check` also passed. The built sign
 routine fixture now exercises background intent planning, later-turn execution,
 and restart without a duplicate receipt or script write. Independent review
 approved the final correction; unavailable macOS/real SSH checks remain untested.
+
+### W04 explicit SQLite controls for background routine planning
+
+A `ControlledStore` wrapper now installs original cancellation/deadline progress
+and commit hooks, a 32 MiB encoded-row limit and a 10 ms busy cap before any
+schema/WAL/integrity SQL. It exposes explicit read/planning methods without a raw
+connection or Deref escape. Actual callback interruption/veto reasons are latched;
+Cancelled/Deadline/Limit errors are distinct from corruption and ordinary
+conflicts. Read results check their original control after completion. Successful
+mutation results are never relabelled as no-write cancellation after commit.
+
+`migration::open_active_controlled` reuses bounded publication parsing and checks
+its immutable expectations against the exact returned controlled handle. Routine
+planning now uses that service under its retained ProjectGuard. Single-link file
+and sidecar checks plus an after-open database inode check preserve opening
+boundaries. Independent review approved this first slice. Tests exercise schema
+query interruption, in-query cancellation, encoded-row overflow, busy waits,
+actual commit-hook veto/reopen equality, post-commit cancellation, unrelated error
+identity, publication parity/mismatch and publication bounds.
+
+Aggregate materialization still requires checks in actual row decoders/collectors;
+a preflight scan alone cannot bound later computed-view or join amplification.
+Other worker opens and transaction-local readers remain to be converted. Card
+counts and unavailable macOS/real SSH acceptance are unchanged.
+
+Validation passed all 707 unit tests (206 library, 501 binary) and nine canonical
+CLI regressions in both debug and release profiles, plus default-feature
+`cargo check` and `git diff --check`. Seven new store tests and two publication
+tests cover the new API. The built ticker fixture confirms controlled routine
+planning still executes a signed occurrence once across restart. The surrounding
+maintenance job still has uncontrolled initial/observation/final reads and
+observation publication/expiry paths; carrying the original control through those
+is next, before claiming whole-job SQL bounds.
