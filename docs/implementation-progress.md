@@ -1443,3 +1443,34 @@ All 525 tests pass in debug and release (165 library, 327 binary, 31 CLI, two
 contracts). Default-feature tests pass (29 library, 278 binary, 12 CLI, two contracts).
 Three optional live checks remain ignored. Logs:
 `/tmp/herdr-copy-admission-{debug,release,default}.log`.
+
+
+## W04 asynchronous local report observations
+
+Production tickers now offer local report hashing to the shared transfer executor
+after guarded background admission. The configuration-independent native helper
+streams at most 50 MiB through descriptor-relative regular-file reads, with a
+10-second execution timeout and bounded JSON output. Sixteen pending reads and
+128 candidate offers bound inventory; reads hold no project effect lease.
+
+Completed observations are collected only at pass entry and fenced by execution,
+prior report hash, copy receipt and pending projection. Their original 30-second
+queue deadline also bounds freshness. Missing or expired observations defer new
+copy/review decisions while ordinary status updates continue. Existing persisted
+notices and retained projection recovery do not require a fresh source read.
+Observations never certify copied bytes or durable receipts.
+
+Copy and read admission share a bounded cyclic cursor implementation. Read
+selection advances its persistent cursor only for actual Runner entry, ordered
+by recorded start time; expired queue tails retain their service opportunity.
+Independent review identified and verified fixes for expired results and queue-tail
+starvation, then approved the final changes and reran all five focused fixtures.
+The built ticker fixture passes asynchronous hashing, native copy, announcement
+and unchanged-report restart. Other slow effects and canonical launch/profile/
+budget/authority work remain open; card counts stay 16 implemented, five partial
+and 20 not started. macOS and actual remote-host acceptance remain untested.
+
+All 531 tests pass in debug and release (165 library, 332 binary, 32 CLI, two
+contracts). Default-feature tests pass (29 library, 283 binary, 13 CLI, two
+contracts); three optional live checks remain ignored. Logs:
+`/tmp/herdr-local-reports-{debug,release,default}.log`.

@@ -58,8 +58,9 @@ and pre-transport spool reservation. The supervised copy worker now rechecks
 execution/configuration/routing, requires successful native transport, and resumes
 retained stages without fetching. Production Linux copy admission now shares
 routine fairness after full project passes, with bounded overflow rotation and
-review notices deferred until copies finish. Local source hashing and remaining
-slow effects still need isolation. T04.3 now fences legacy
+review notices deferred until copies finish. Local source hashing now runs in bounded read-only helper jobs with fresh,
+execution-bound observations and service-based fairness; remaining slow effects
+still need isolation. T04.3 now fences legacy
 launch arguments by explicit agent kind and provides redacted [named profile inspection](profiles.md);
 explicit local version probes for Claude/Codex are available. Launch selection,
 production profile resolution and verified capability evidence remain. Version-2

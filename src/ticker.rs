@@ -266,6 +266,7 @@ pub fn run(ctx: &Ctx) -> Result<()> {
     #[cfg(feature="state-store")]
     {memory.routine_jobs=Some(crate::routine_jobs::Queue::new(executor.clone()));}
     if cfg!(target_os="linux") {memory.copy_jobs=Some(crate::copy_jobs::Queue::new(executor.clone()));}
+    memory.local_reports=Some(crate::local_reports::Reads::new(executor.clone()));
     memory.pr_reads=Some(crate::pr_polling::Reads::with_executor(executor.clone()));
     memory.remote_reads=Some(crate::remote_polling::Reads::new(executor));
     loop {
@@ -297,6 +298,7 @@ pub fn run(ctx: &Ctx) -> Result<()> {
 /// others.
 pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     memory.tick += 1;
+    if let Some(reads)=memory.local_reports.as_mut(){reads.begin_pass();}
     if let Some(queue)=memory.copy_jobs.as_mut() {for error in queue.drain(){log.line(&error);}}
     #[cfg(feature="state-store")]
     if let Some(queue)=memory.routine_jobs.as_mut() {for error in queue.drain(){log.line(&error);}}
@@ -323,7 +325,7 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
                 if let Err(error)=queue.offer(ctx,&project,t,None){log.line(&format!("{slug}: copy recovery: {error:#}"));}
             }
         }
-        match tick_cheap(ctx, &project) {
+        match tick_cheap_reports(ctx, &project,memory.local_reports.as_mut()) {
             Ok(Some(seen)) => reachable.push((project, seen)),
             Ok(None) => {}
             Err(error) => log.line(&format!("{slug}: {error:#}")),
@@ -350,6 +352,7 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
             }
         }
         admit_background(ctx,log,memory,canonical.into_iter().map(|slug|ctx.root.join(slug)).collect());
+        if let Some(reads)=memory.local_reports.as_mut(){for error in reads.admit(){log.line(&error);}}
         any_reachable|=memory.routine_jobs.as_ref().is_some_and(|q|q.pending());
         any_reachable|=memory.copy_jobs.as_ref().is_some_and(|q|q.pending()||q.offered());
         return any_reachable;
@@ -357,6 +360,7 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     #[cfg(not(feature="state-store"))]
     {
         admit_background(ctx,log,memory,Vec::new());
+        if let Some(reads)=memory.local_reports.as_mut(){for error in reads.admit(){log.line(&error);}}
         any_reachable||memory.copy_jobs.as_ref().is_some_and(|q|q.pending()||q.offered())
     }
 
@@ -388,6 +392,8 @@ pub fn tick_for_test(ctx: &Ctx, memory: &mut Memory) -> bool {
 /// What the cheap pass saw, handed to the slow pass so herdr is asked once.
 pub struct Seen {
     notification_error: Option<String>,
+    local_reports:Option<std::collections::BTreeMap<String,crate::local_reports::Sample>>,
+    report_errors:Vec<String>,
     socket: String,
     agents: Vec<Agent>,
     panes: Vec<Pane>,
@@ -406,7 +412,8 @@ pub fn tick_project(ctx: &Ctx, project: &Project) -> Result<bool> {
 
 #[cfg(test)]
 pub fn tick_project_with(ctx: &Ctx, project: &Project, memory: &mut Memory) -> Result<bool> {
-    match tick_cheap(ctx, project)? {
+    if let Some(reads)=memory.local_reports.as_mut(){reads.begin_pass();}
+    match tick_cheap_reports(ctx, project,memory.local_reports.as_mut())? {
         Some(seen) => match tick_slow(ctx, project, &seen, memory).into_iter().next() {
             Some(error) => Err(error),
             None => Ok(true),
@@ -544,7 +551,9 @@ fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
 /// state is read, so nothing is ever reported as gone.
 mod status_observation;
 
-fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
+#[cfg(test)]
+fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {tick_cheap_reports(ctx,project,None)}
+fn tick_cheap_reports(ctx: &Ctx, project: &Project,mut reads:Option<&mut crate::local_reports::Reads>) -> Result<Option<Seen>> {
     let lease = crate::cleanup::lease(&ctx.root);
     let _project_guard = if lease.is_err() {
         Some(herdr_projects::execution_guard::ProjectGuard::acquire(&project.dir())?)
@@ -575,7 +584,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
         // Session-loss notification remains separately deduplicated by the
         // exclusive slow pass. Avoid manufacturing per-thread idle notices.
         if !session_lost {status_observation::observe(project,&agents,&panes)?;}
-        return Ok(Some(Seen{notification_error:None,socket:record.socket,agents,panes,transitions:Vec::new(),session_lost}));
+        return Ok(Some(Seen{notification_error:None,local_reports:reads.as_ref().map(|_|Default::default()),report_errors:Vec::new(),socket:record.socket,agents,panes,transitions:Vec::new(),session_lost}));
     }
     let slug = &project.slug;
     // Do not perform delivery or overwrite durable obligations when state is
@@ -598,7 +607,19 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
         coordinator::report_tokens(&herdr, slug, &record.pane_id);
     }
 
-    let pass = thread_pass(project, &herdr, &open_threads(project, false), &agents, &panes, None)?;
+    let local=open_threads(project,false);let mut reports=std::collections::BTreeMap::new();let mut report_errors=Vec::new();
+    if let Some(reads)=reads.as_mut() {
+        for t in local.iter().filter(|t|t.status==thread::Status::Open&&t.pending_live_copy.is_none()) {
+            match reads.poll(project,t) {
+                Ok(crate::local_reports::Poll::Ready(sample))=>{reports.insert(t.id.clone(),sample);},
+                Ok(crate::local_reports::Poll::Pending)=>{},
+                Ok(crate::local_reports::Poll::Failed(error))=>report_errors.push(format!("{}: report source: {error}",t.id)),
+                Err(error)=>report_errors.push(format!("{}: report observation: {error:#}",t.id)),
+            }
+        }
+    }
+    let hashes=reports.iter().filter_map(|(id,s)|s.hash.as_ref().map(|hash|(id.clone(),hash.clone()))).collect();
+    let pass = thread_pass(project, &herdr, &local, &agents, &panes, reads.as_ref().map(|_|&hashes))?;
     first_error = first_error.or(pass.error);
     let coordinator_recorded = usize::from(!record.pane_id.is_empty());
     let coordinator_missing = usize::from(coordinator_recorded == 1 && agent.is_none() && !panes.iter().any(|p| coordinator::pane_matches(&record, p)));
@@ -622,6 +643,8 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
         Some(error) => Err(error),
         None => Ok(Some(Seen {
             notification_error,
+            local_reports:reads.as_ref().map(|_|reports),
+            report_errors,
             socket: record.socket,
             agents,
             panes,
@@ -686,7 +709,7 @@ fn apply_remote(ctx:&Ctx,project:&Project,herdr:&Herdr,machine:&str,threads:&[th
 fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> Vec<anyhow::Error> {
     let _lease = match crate::cleanup::lease(&ctx.root) { Ok(lease) => lease, Err(error) => return vec![error] };
     match project.try_status() { Ok(Status::Active) => {}, Ok(_) => return Vec::new(), Err(error) => return vec![error] }
-    let mut errors = Vec::new();
+    let mut errors = seen.report_errors.iter().map(|e|anyhow::anyhow!("{e}")).collect::<Vec<_>>();
     let mut state = match steps::try_load_state(project) {
         Ok(state) => state,
         Err(error) => return vec![error],
@@ -723,7 +746,10 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
         if t.pending_live_copy.is_some()&&let Some(queue)=memory.copy_jobs.as_mut() {
             deferred.insert(t.id.clone());errors.extend(queue.offer(ctx,project,t,None).err());continue;
         }
-        let hash=match thread::try_local_report_hash(t){Ok(hash)=>hash,Err(error)=>{deferred.insert(t.id.clone());errors.push(error.context(format!("{}: report source",t.id)));continue;}};
+        let hash=if let Some(reports)=&seen.local_reports {
+            let Some(sample)=reports.get(&t.id).filter(|sample|sample.matches(t)) else {deferred.insert(t.id.clone());continue;};
+            sample.hash.clone()
+        }else {match thread::try_local_report_hash(t){Ok(hash)=>hash,Err(error)=>{deferred.insert(t.id.clone());errors.push(error.context(format!("{}: report source",t.id)));continue;}}};
         if let Some(queue)=memory.copy_jobs.as_mut() {
             if hash.as_ref().is_some_and(|hash|hash!=&t.report_hash) {
                 deferred.insert(t.id.clone());
@@ -775,7 +801,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
 
     errors.extend(thread::copy_delivery::deliver(project).err());
     errors.extend(steps::write_thread_items_ready(project, &mut state, &transitions, seen.session_lost,|t| {
-        memory.copy_jobs.as_ref().is_none_or(|q|!deferred.contains(&t.id)&&!q.outstanding(project,&t.id)&&(!t.is_remote()||observed.contains(&t.id)))
+        !deferred.contains(&t.id)&&(t.is_remote()||seen.local_reports.as_ref().is_none_or(|reports|reports.get(&t.id).is_some_and(|sample|sample.matches(t))))&&memory.copy_jobs.as_ref().is_none_or(|q|!q.outstanding(project,&t.id)&&(!t.is_remote()||observed.contains(&t.id)))
     }).err());
     errors.extend(steps::pull_requests(ctx, project, &mut state, memory, now));
     let zoned = jiff::Zoned::now();

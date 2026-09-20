@@ -227,6 +227,9 @@ enum Command {
     /// Run inside a plugin popup pane
     #[command(hide = true)]
     Pane { id: String },
+    /// Read-only bounded report observation, before environment resolution.
+    #[command(hide = true)]
+    ReportHash { #[arg(long)] path:PathBuf },
     /// Versioned binary artifact transport for remote preservation.
     #[command(hide = true)]
     ArtifactStream {
@@ -459,6 +462,9 @@ enum RuntimeCommand {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    if let Command::ReportHash {path}=&cli.command {
+        println!("{}",serde_json::to_string(&crate::local_reports::Observation{hash:crate::source_tree::report_hash(path)?})?);return Ok(());
+    }
     if let Command::ArtifactStream { probe, path, live } = &cli.command {
         if *probe { crate::artifacts::probe(); return Ok(()); }
         if *live {return crate::artifacts::live::export(path.as_ref().context("artifact source path is required")?, &mut std::io::stdout().lock());}
@@ -678,7 +684,7 @@ pub fn run() -> Result<()> {
             println!("{}",serde_json::to_string_pretty(&value)?);
             Ok(())
         }
-        Command::ArtifactStream { .. } => unreachable!("artifact transport handled before environment resolution"),
+        Command::ReportHash {..}|Command::ArtifactStream { .. } => unreachable!("artifact transport handled before environment resolution"),
         Command::New { name, goal, repos } => {
             let repos = repos.iter().map(|arg| project::parse_repo_arg(arg)).collect();
             let project = project::create(&ctx.root, &name, &goal, repos)?;

@@ -6,9 +6,9 @@ const LIMIT:usize=128;
 const RETENTION:Duration=Duration::from_secs(180);
 struct Entry {work:Option<Request>,not_before:Instant,touched:Instant,last:u64,needed:bool}
 struct Pending {key:Key,identity:Identity,ticket:crate::executor::Ticket}
-pub struct Queue {executor:Arc<crate::executor::Executor>,entries:BTreeMap<Key,Entry>,pending:Option<Pending>,sequence:u64,last_project:Option<String>,cursors:BTreeMap<String,(String,u64)>,overflow:bool,last_pair:Option<Key>}
+pub struct Queue {executor:Arc<crate::executor::Executor>,entries:BTreeMap<Key,Entry>,pending:Option<Pending>,sequence:u64,cursor:crate::fair_admission::Cursor}
 impl Queue {
-    pub fn new(executor:Arc<crate::executor::Executor>)->Self {Self{executor,entries:BTreeMap::new(),pending:None,sequence:0,last_project:None,cursors:BTreeMap::new(),overflow:false,last_pair:None}}
+    pub fn new(executor:Arc<crate::executor::Executor>)->Self {Self{executor,entries:BTreeMap::new(),pending:None,sequence:0,cursor:crate::fair_admission::Cursor::default()}}
     pub fn pending(&self)->bool {self.pending.is_some()}
     pub fn outstanding(&self,project:&Project,id:&str)->bool {
         let key=(project.canonical_dir().display().to_string(),format!("live-copy:{id}"));
@@ -66,15 +66,7 @@ impl Queue {
             let entry=self.entries.get_mut(&key).unwrap();let work=entry.work.take().unwrap();let identity=work.identity.clone();
             match self.executor.submit(work) {
                 Ok(ticket)=>{
-                    self.sequence=next;entry.last=next;self.last_project=Some(key.0.clone());
-                    if !self.overflow&&!self.cursors.contains_key(&key.0)&&self.cursors.len()>=LIMIT {
-                        // Forgetting one project's thread cursor could always
-                        // choose its first thread. Pair rotation needs constant
-                        // history and preserves eventual service under overflow.
-                        self.overflow=true;self.cursors.clear();
-                    }
-                    if !self.overflow {self.cursors.insert(key.0.clone(),(key.1.clone(),next));}
-                    self.last_pair=Some(key.clone());
+                    self.sequence=next;entry.last=next;self.cursor.accepted(&key);
                     self.pending=Some(Pending{key,identity,ticket});break;
                 },
                 Err(error)=>{entry.not_before=Instant::now()+Duration::from_secs(30);errors.push(format!("{} {}: copy admission: {error:#}",key.0,key.1));},
@@ -82,14 +74,7 @@ impl Queue {
         }
         errors
     }
-    fn compare(&self,a:&Key,b:&Key)->std::cmp::Ordering {
-        if self.overflow {
-            return (self.last_pair.as_ref().is_some_and(|last|a<=last),a).cmp(&(self.last_pair.as_ref().is_some_and(|last|b<=last),b));
-        }
-        let rank=|key:&Key| (self.last_project.as_ref().is_some_and(|last|&key.0<=last),self.cursors.get(&key.0).is_some_and(|(last,_)|&key.1<=last));
-        let ar=rank(a);let br=rank(b);
-        (ar.0,&a.0,ar.1,&a.1).cmp(&(br.0,&b.0,br.1,&b.1))
-    }
+    fn compare(&self,a:&Key,b:&Key)->std::cmp::Ordering {self.cursor.compare(a,b)}
     fn next(&self)->Option<Key> {
         let now=Instant::now();
         self.entries.iter().filter(|(_,e)|e.work.is_some()&&now>=e.not_before)
@@ -148,7 +133,7 @@ mod tests {
             // continuously offered; none can become eligible through expiry.
             for offset in 0..=LIMIT {let n=if turn<LIMIT+1 {offset}else{(turn+offset)%(LIMIT+1)};queue.offer_request(work(&format!("p{n:04}"),"1")).unwrap();}
             queue.admit();seen.insert(queue.pending.as_ref().unwrap().key.0.clone());assert!(drain(&mut queue).is_empty());
-            assert!(queue.entries.len()<=LIMIT);assert!(queue.cursors.len()<=LIMIT);
+            assert!(queue.entries.len()<=LIMIT);assert!(queue.cursor.history_len()<=LIMIT);
         }
         assert_eq!(seen.len(),LIMIT+1);assert!(pool.stop(Duration::from_secs(1)));
     }
@@ -159,9 +144,9 @@ mod tests {
         for _ in 0..(LIMIT+1)*4 {
             for n in 0..=LIMIT {for id in ["1","2"] {queue.offer_request(work(&format!("p{n:04}"),id)).unwrap();}}
             queue.admit();seen.insert(queue.pending.as_ref().unwrap().key.clone());assert!(drain(&mut queue).is_empty());
-            assert!(queue.entries.len()<=LIMIT);assert!(queue.cursors.len()<=LIMIT);
+            assert!(queue.entries.len()<=LIMIT);assert!(queue.cursor.history_len()<=LIMIT);
         }
-        assert!(queue.overflow);assert_eq!(seen.len(),(LIMIT+1)*2);assert!(pool.stop(Duration::from_secs(1)));
+        assert!(queue.cursor.overflow());assert_eq!(seen.len(),(LIMIT+1)*2);assert!(pool.stop(Duration::from_secs(1)));
     }
     #[test]
     fn errors_back_off_without_resetting_history_and_failed_submission_does_not_advance() {

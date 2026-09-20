@@ -7,6 +7,8 @@ mod agents;
 mod artifacts;
 mod source_tree;
 mod copy_jobs;
+mod fair_admission;
+mod local_reports;
 mod adopt;
 mod cli;
 mod cleanup;

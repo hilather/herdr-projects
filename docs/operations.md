@@ -147,6 +147,13 @@ with `HERDR_PROJECTS_REMOTE_BIN`. Unsupported helpers refuse instead of falling 
 to a different transfer method. Local namespace supervision is required; it does not
 claim termination of a remote helper after an SSH connection is lost.
 
+Local report hashes run in read-only helper jobs after each full project pass.
+Reads have a 10-second execution limit, a 30-second total queue lifetime, and a
+50 MiB report limit. At most 16 reads are outstanding; late or changed-execution
+results cannot trigger copies or new review announcements. Hash completion is
+observed on a subsequent ticker pass, so copy/announcement discovery may take
+an additional pass. These observations never certify a copy receipt.
+
 Copies recheck execution, configuration and routing before publishing. The exact
 staged bytes and recovery intent survive interruption in `.state/live-copies`; the
 next active ticker resumes them without downloading again. Configuration or routing

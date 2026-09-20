@@ -611,7 +611,7 @@ fn ticker_native_copy_publishes_announces_and_does_not_recopy_after_restart() {
     let spawn=||Child(Command::new(BIN).env_clear().env("HOME",home.path()).env("PATH","/usr/bin:/bin").env("HERDR_BIN_PATH",&fake).args(["--root",r,"ticker","run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
     let read=||->toml::Value {toml::from_str(&fs::read_to_string(&record).unwrap()).unwrap()};
     let wait=|child:&mut Child,predicate:&dyn Fn()->bool| {
-        let deadline=Instant::now()+Duration::from_secs(10);
+        let deadline=Instant::now()+Duration::from_secs(45);
         while !predicate(){assert!(child.0.try_wait().unwrap().is_none(),"ticker exited");assert!(Instant::now()<deadline,"ticker log: {}",fs::read_to_string(root.join(".ticker.log")).unwrap_or_default());std::thread::sleep(Duration::from_millis(10));}
     };
     let stop=|child:&mut Child| {
@@ -625,6 +625,19 @@ fn ticker_native_copy_publishes_announces_and_does_not_recopy_after_restart() {
     let mut child=spawn();wait(&mut child,&||read().get("last_review_item_hash").and_then(|v|v.as_str())==Some(hash.as_str()));stop(&mut child);
     let notices=fs::read_dir(project.join("inbox")).unwrap().filter_map(|e|e.ok()).filter(|e|e.file_name().to_string_lossy().starts_with("review-")).count();assert_eq!(notices,1);
     fs::write(&item,b"retained after unchanged report").unwrap();let polls=fs::read(home.path().join("polls")).unwrap().len();
-    let mut child=spawn();wait(&mut child,&||fs::read(home.path().join("polls")).unwrap().len()>polls);stop(&mut child);
+    let mut child=spawn();wait(&mut child,&||fs::read(home.path().join("polls")).unwrap().len()>=polls+10);stop(&mut child);
     assert_eq!(read()["copy_receipt"]["sequence"].as_integer(),Some(1));assert_eq!(read()["live_copy_sequence"].as_integer(),Some(1));assert_eq!(fs::read(item).unwrap(),b"retained after unchanged report");
+}
+
+#[test]
+fn native_report_hash_is_bounded_binary_and_configuration_independent() {
+    use std::fs;use sha2::{Digest,Sha256};
+    let home=tempfile::tempdir().unwrap();let source=home.path().join("source '$λ");fs::create_dir(&source).unwrap();
+    let run=||Command::new(BIN).env_clear().args(["report-hash","--path"]).arg(&source).output().unwrap();
+    let missing=run();assert!(missing.status.success());assert_eq!(serde_json::from_slice::<serde_json::Value>(&missing.stdout).unwrap(),serde_json::json!({"hash":null}));
+    fs::write(source.join("report.md"),b"binary\0\xff").unwrap();let output=run();assert!(output.status.success());
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["hash"],format!("{:x}",Sha256::digest(b"binary\0\xff")));
+    fs::File::create(source.join("report.md")).unwrap().set_len(50*1024*1024+1).unwrap();assert!(!run().status.success());
+    fs::remove_file(source.join("report.md")).unwrap();std::os::unix::fs::symlink("/etc/passwd",source.join("report.md")).unwrap();assert!(!run().status.success());
+    let name=std::ffi::CString::new(source.join("report.md").as_os_str().as_encoded_bytes()).unwrap();fs::remove_file(source.join("report.md")).unwrap();assert_eq!(unsafe{libc::mkfifo(name.as_ptr(),0o600)},0);assert!(!run().status.success());
 }

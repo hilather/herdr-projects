@@ -188,6 +188,16 @@ unsafe fn errno()->*mut libc::c_int {unsafe{libc::__errno_location()}}
 #[cfg(any(target_os="macos",target_os="ios",target_os="freebsd"))]
 unsafe fn errno()->*mut libc::c_int {unsafe{libc::__error()}}
 
+/// Streaming observation: the hash is never a copy or preservation receipt.
+pub fn report_hash(path:&Path)->Result<Option<String>> {
+    use sha2::{Digest,Sha256};
+    let directory=match Directory::open(path){Ok(dir)=>dir,Err(error) if error.downcast_ref::<io::Error>().is_some_and(|e|e.kind()==io::ErrorKind::NotFound)=>return Ok(None),Err(error)=>return Err(error)};
+    let Some(mut file)=directory.optional(OsStr::new("report.md"))? else{return Ok(None);};
+    let mut budget=Budget::new();budget.size(&file)?;let before=file.metadata()?;let mut hash=Sha256::new();let mut buffer=[0;64*1024];
+    loop {let n=budget.read(&mut file,&mut buffer)?;if n==0 {break;}hash.update(&buffer[..n]);}
+    unchanged(&file,&before)?;directory.matches_path(path)?;budget.check()?;Ok(Some(format!("{:x}",hash.finalize())))
+}
+
 pub fn report(path:&Path)->Result<Option<Vec<u8>>> {
     let directory=match Directory::open(path){Ok(dir)=>dir,Err(error) if error.downcast_ref::<io::Error>().is_some_and(|e|e.kind()==io::ErrorKind::NotFound)=>return Ok(None),Err(error)=>return Err(error)};
     let Some(mut file)=directory.optional(OsStr::new("report.md"))? else{return Ok(None);};
