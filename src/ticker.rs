@@ -265,6 +265,7 @@ pub fn run(ctx: &Ctx) -> Result<()> {
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::legacy_routine_jobs::JobRunner{inner:runner});
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::brief_jobs::JobRunner{inner:runner});
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::coordinator_jobs::JobRunner{inner:runner});
+    let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::token_jobs::JobRunner{inner:runner});
     let executor=std::sync::Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),runner)?);
     #[cfg(feature="state-store")]
     {memory.routine_jobs=Some(crate::routine_jobs::Queue::new(executor.clone()));}
@@ -530,7 +531,7 @@ fn thread_pass(project: &Project, herdr: &Herdr, threads: &[thread::Thread], age
                 t.last_group = group.token().to_string();
             })?;
         }
-        if live.pane_exists {
+        if live.pane_exists && !defer_briefs {
             threads::report_thread_tokens(herdr, t, slug, group);
         }
     }
@@ -652,7 +653,8 @@ fn tick_cheap_reports(ctx: &Ctx, project: &Project,mut reads:Option<&mut crate::
             }
         }
         }
-        coordinator::report_tokens(&herdr, slug, &record.pane_id);
+        if let Some(queue)=copies.as_deref_mut() {first_error=first_error.or(queue.offer_tokens(ctx,project,None,None).err());}
+        else {coordinator::report_tokens(&herdr, slug, &record.pane_id);}
     }
 
     let local=open_threads(project,false);let mut reports=std::collections::BTreeMap::new();let mut report_errors=Vec::new();
@@ -675,6 +677,11 @@ fn tick_cheap_reports(ctx: &Ctx, project: &Project,mut reads:Option<&mut crate::
         }
     }
     let pass = thread_pass(project, &herdr, &local, &agents, &panes, reads.as_ref().map(|_|&hashes),copies.is_some())?;
+    if let Some(queue)=copies.as_deref_mut() {
+        for t in local.iter().filter(|t|matches!(t.status,thread::Status::Open|thread::Status::Failed)&&t.removal.is_none()&&t.pending_live_copy.is_none()&&t.pending_final_copy.is_none()&&thread::live_state(t,&agents,&panes,jiff::Timestamp::now()).pane_exists) {
+            report_errors.extend(queue.offer_tokens(ctx,project,Some(t),None).err().map(|e|format!("{}: token admission: {e:#}",t.id)));
+        }
+    }
     first_error = first_error.or(pass.error);
     let coordinator_recorded = usize::from(!record.pane_id.is_empty());
     let coordinator_missing = usize::from(coordinator_recorded == 1 && agent.is_none() && !panes.iter().any(|p| coordinator::pane_matches(&record, p)));
@@ -748,6 +755,11 @@ fn apply_remote(ctx:&Ctx,project:&Project,herdr:&Herdr,machine:&str,threads:&[th
     }
     let pass = thread_pass(project, &remote, threads, &agents, &panes, Some(&hashes),copies.is_some()).map_err(|e| format!("{e:#}"))?;
     errors.extend(pass.error);
+    if let Some(queue)=copies.as_deref_mut() {
+        for t in threads.iter().filter(|t|matches!(t.status,thread::Status::Open|thread::Status::Failed)&&t.removal.is_none()&&t.pending_live_copy.is_none()&&t.pending_final_copy.is_none()&&thread::live_state(t,&agents,&panes,jiff::Timestamp::now()).pane_exists) {
+            errors.extend(match route.as_ref(){Some(route)=>queue.offer_tokens(ctx,project,Some(t),Some(route)),None=>Err(anyhow::anyhow!("{}: saved remote session contract unavailable for tokens",t.id))}.err());
+        }
+    }
 
     for t in threads.iter().filter(|t| t.status == thread::Status::Open) {
         observed.insert(t.id.clone());

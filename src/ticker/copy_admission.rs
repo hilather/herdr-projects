@@ -22,6 +22,7 @@ fn drain(memory:&mut Memory) {
 #[test]
 fn newly_ready_thread_does_not_announce_old_unannounced_receipt_while_copy_is_offered() {
     let world=crate::scenarios::World::new();let project=world.project("demo","session.sock");
+    let socket=project.try_coordinator().unwrap().unwrap().socket;std::fs::remove_file(&socket).unwrap();let _listener=std::os::unix::net::UnixListener::bind(&socket).unwrap();
     let t=world.thread(&project,world.home.path(),|t|t.last_group=thread::Group::Idle.token().into());
     std::fs::create_dir_all(&t.thread_dir).unwrap();std::fs::write(Path::new(&t.thread_dir).join("report.md"),b"new").unwrap();
     std::fs::write(thread::home_report_path(&project,&t.id),b"old").unwrap();

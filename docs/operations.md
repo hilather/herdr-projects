@@ -216,7 +216,30 @@ pending or uncertain prime claims. Corrupt or oversized coordinator records are
 preserved and require repair; ordinary updates cannot silently reset them.
 
 Priming and restart recovery are tested with disposable Linux subprocesses and the
-built ticker. Token worker integration remains separate work; macOS acceptance remains untested.
+built ticker; macOS acceptance remains untested.
+
+## Sidebar metadata refreshes
+
+On Linux, the ticker queues token refreshes for open local and saved-machine
+threads and the local coordinator. Workers use bounded, cancellable subprocesses
+under inherited project ownership, validate the recorded project/socket incarnation
+and configuration, and check fresh pane and agent inventories. Remote workers use
+the frozen saved profile ID, SSH target and named session, with no mutable machine
+fallback. Conflicting references or changed targets refuse the refresh.
+
+The worker recomputes the thread group from fresh agent observations and persisted
+report state. It sends only the fixed project/thread/review/rank tokens (project,
+thread and rank for coordinators), source and five-minute expiration. Native `ok`
+can acknowledge an ignored update; it does not prove metadata application, agent
+activity or delivery. Before/after observations check the terminal identity.
+Refresh failures create no execution claim or inbox notice. Repeating an attempt,
+including after ticker restart, is safe for this expiring display metadata.
+
+Refreshes share bounded queue admission and have a 30-second cooldown after each
+attempt. Under saturation, tokens may expire before their next refresh; the ticker
+does not guarantee refresh within five minutes for every pane. Interactive
+foreground commands retain their immediate metadata updates. Local session
+observations still need worker integration; this change does not complete W04.
 
 ## Interrupted brief delivery
 

@@ -1000,6 +1000,9 @@ root=pathlib.Path(os.environ['HOME']);args=sys.argv[1:];a=json.loads((root/'agen
 if args==['remote-api-bridge','--check']:print('herdr-api-bridge-v1')
 elif args==['remote-api-bridge']:
  r=json.load(sys.stdin)
+ if r['method'] in ['agent.list','pane.list','pane.report_metadata']:
+  result={'agents':[a]} if r['method']=='agent.list' else {'panes':[a]} if r['method']=='pane.list' else {'type':'ok'}
+  print(json.dumps({'id':r['id'],'result':result}));sys.exit(0)
  with open(root/'sent','a') as f:f.write('send')
  if (root/'outcome').read_text()=='lost':sys.exit(1)
  if r['method']=='agent.prompt':
@@ -1039,4 +1042,56 @@ else:print('{"result":{"shown":true}}')
         }else{stop(&mut child);}
         assert!(!home.path().join("WRONG_SYNC_EFFECT").exists());
     }}
+}
+
+#[cfg(target_os="linux")]
+#[test]
+fn ticker_tokens_use_supervised_local_remote_and_coordinator_refreshes_after_restart() {
+    use std::{fs,time::{Duration,Instant},process::Stdio,os::unix::{fs::PermissionsExt,net::UnixListener}};
+    for mode in ["local","remote","coordinator"] {
+        let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();assert!(hp(home.path(),&["--root",r,"new","demo"]).status.success());let p=root.join("demo");
+        let socket=home.path().join("session.sock");let _listener=UnixListener::bind(&socket).unwrap();let source=home.path().join("source");fs::create_dir(&source).unwrap();
+        let a=serde_json::json!({"workspace_id":"w","tab_id":"tab","pane_id":"p","terminal_id":"terminal","cwd":source,"name":"worker","agent":"claude","agent_status":"working"});fs::write(home.path().join("agent.json"),a.to_string()).unwrap();fs::write(home.path().join("mode"),mode).unwrap();
+        let mut c=serde_json::json!({"socket":socket});
+        if mode=="coordinator" {for key in ["workspace_id","tab_id","pane_id","cwd"]{c[key]=a[key].clone();}c["agent_name"]="worker".into();}
+        else{fs::write(p.join("threads/t-0001.toml"),toml::to_string(&serde_json::json!({"id":"t-0001","status":"open","kind":"adopted","machine":if mode=="remote"{"saved"}else{""},"thread_dir":source,"cwd":source,"workspace_id":"w","tab_id":"tab","pane_id":"p","agent":"claude","agent_name":"worker","created":jiff::Timestamp::now().to_string()})).unwrap()).unwrap();}
+        fs::write(p.join(".state/coordinator.json"),c.to_string()).unwrap();
+        fs::write(home.path().join("routes.json"),serde_json::json!([{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","label":"saved","target":"fixture.invalid","session":"named-session","enabled":true}]).to_string()).unwrap();
+        let fake=home.path().join("herdr");fs::write(&fake,r#"#!/usr/bin/python3
+import os,sys,json,pathlib
+root=pathlib.Path(os.environ['HOME']);args=sys.argv[1:];a=json.loads((root/'agent.json').read_text());mode=(root/'mode').read_text()
+remote=args[:2]==['--machine','saved']
+if remote:args=args[2:]
+if args[:2]==['--session','named-session']:args=args[2:];remote=True
+if args==['machine','list','--json']:print((root/'routes.json').read_text())
+elif args==['remote-api-bridge','--check']:print('herdr-api-bridge-v1')
+elif args==['remote-api-bridge']:
+ assert (mode=='remote')==remote
+ r=json.load(sys.stdin)
+ if r['method']=='agent.list':result={'agents':[a]}
+ elif r['method']=='pane.list':result={'panes':[a]}
+ elif r['method']=='pane.report_metadata':
+  assert set(r['params'])=={'pane_id','source','ttl_ms','tokens'}
+  assert r['params']['ttl_ms']==300000 and r['params']['source']=='herdr-projects'
+  with open(root/'tokens','a') as f:f.write(json.dumps(r['params'])+'\n')
+  result={'type':'ok'}
+ else:sys.exit(3)
+ print(json.dumps({'id':r['id'],'result':result}))
+elif args==['agent','list']:print(json.dumps({'result':{'agents':[a] if remote or mode!='remote' else []}}))
+elif args==['pane','list']:print(json.dumps({'result':{'panes':[a] if remote or mode!='remote' else []}}))
+elif args[:2] in [['pane','report-metadata'],['agent','prompt'],['agent','start'],['notification','show']]:
+ (root/'WRONG_SYNC_EFFECT').touch();sys.exit(2)
+else:print('{"result":{"shown":true}}')
+"#).unwrap();fs::set_permissions(&fake,fs::Permissions::from_mode(0o700)).unwrap();
+        let ssh=home.path().join("ssh");fs::write(&ssh,"#!/usr/bin/python3\nimport sys,subprocess\nassert sys.argv[-2]=='fixture.invalid'\nif 'remote-api-bridge' in sys.argv[-1]:assert sys.argv[1:4]==['-T','-o','StrictHostKeyChecking=yes']\nsys.exit(subprocess.call(sys.argv[-1],shell=True))\n").unwrap();fs::set_permissions(&ssh,fs::Permissions::from_mode(0o700)).unwrap();
+        struct Child(std::process::Child);impl Drop for Child{fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+        let read=||fs::read_to_string(home.path().join("tokens")).unwrap_or_default().lines().map(|s|serde_json::from_str::<serde_json::Value>(s).unwrap()).collect::<Vec<_>>();
+        for expected in 1..=2 {
+            let mut child=Child(Command::new(BIN).env_clear().env("HOME",home.path()).env("PATH",format!("{}:/usr/bin:/bin",home.path().display())).env("HERDR_BIN_PATH",&fake).env("HERDR_PROJECTS_REMOTE_HERDR_BIN",&fake).args(["--root",r,"ticker","run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+            let end=Instant::now()+Duration::from_secs(45);while read().len()<expected {assert!(child.0.try_wait().unwrap().is_none());assert!(Instant::now()<end,"{mode}: {}",fs::read_to_string(root.join(".ticker.log")).unwrap_or_default());std::thread::sleep(Duration::from_millis(10));}
+            fs::write(root.join(".ticker.stop"),b"").unwrap();let end=Instant::now()+Duration::from_secs(8);while child.0.try_wait().unwrap().is_none(){assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(10));}fs::remove_file(root.join(".ticker.stop")).unwrap();
+        }
+        let values=read();assert_eq!(values.len(),2);assert_eq!(values[0],values[1]);assert_eq!(values[0]["tokens"]["thread"],if mode=="coordinator"{"coordinator"}else{"t-0001"});if mode!="coordinator"{assert_eq!(values[0]["tokens"]["review"],"working");}
+        assert!(!home.path().join("WRONG_SYNC_EFFECT").exists());
+    }
 }

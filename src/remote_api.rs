@@ -48,11 +48,11 @@ pub fn probe(route:&Route,binary:&str,control:&Control,locks:&[InheritedLock])->
     let output=execute(route.command(binary,true)?,control,locks)?;
     ensure!(output.stdout.trim()=="herdr-api-bridge-v1","remote binary lacks JSON API bridge v1");Ok(())
 }
-/// The caller must own and durably claim any effect before choosing its method.
+/// The caller must own effects and durably claim non-idempotent submissions.
 /// This transport performs one request and never retries or changes destination.
 pub fn request(route:&Route,binary:&str,id:&str,method:&str,params:serde_json::Value,control:&Control,locks:&[InheritedLock])->Result<serde_json::Value> {
     ensure!(!id.is_empty()&&id.len()<=256&&!id.chars().any(char::is_control),"invalid remote API request identity");
-    ensure!(matches!(method,"ping"|"agent.list"|"pane.list"|"agent.prompt"|"agent.start"),"unsupported remote worker method");
+    ensure!(matches!(method,"ping"|"agent.list"|"pane.list"|"agent.prompt"|"agent.start"|"pane.report_metadata"),"unsupported remote worker method");
     let mut payload=serde_json::to_string(&serde_json::json!({"id":id,"method":method,"params":params}))?;ensure!(payload.len()<=64*1024,"remote API input exceeds bounds");payload.push('\n');
     send(route.command(binary,false)?.stdin(payload),id,control,locks)
 }

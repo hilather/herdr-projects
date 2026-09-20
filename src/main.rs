@@ -8,6 +8,7 @@ mod artifacts;
 mod source_tree;
 mod copy_jobs;
 mod brief_jobs;
+mod token_jobs;
 mod fair_admission;
 mod local_reports;
 mod adopt;

@@ -2160,3 +2160,61 @@ The default-feature suite also passed all 441 tests (30 library, 388 binary,
 21 CLI, two contracts), with the same three optional live checks ignored. Log:
 `/tmp/herdr-notification-default.log`. Independent review approved the corrected
 notification authority binding and reconciliation behavior.
+
+
+## W04 supervised sidebar metadata refreshes
+
+Added a concrete token worker for open local/saved-machine threads and the local
+coordinator. The Linux ticker offers refreshes to the shared bounded queue and
+suppresses its former synchronous token commands. Foreground lifecycle commands
+retain their existing immediate updates. Each queued attempt has a shared
+45-second deadline, bounded input/output and inventory sizes, and inherited
+root/project/routine ownership through descendant cleanup.
+
+The worker freezes project and socket device/inode, execution identity, root
+configuration and project settings. Remote work freezes the saved profile ID,
+literal target, named session and binary, rechecks the saved route around dispatch,
+and requires the JSON API bridge without install/startup or mutable machine
+fallback. Fresh observations refuse missing/duplicate panes, foreign/duplicate
+occupants, differing agent/pane terminal IDs and conflicting root references.
+Thread groups are recomputed from fresh observations and reloaded persisted state.
+
+Only fixed token fields, source and numeric 300000 ms TTL are submitted. Pinned
+native source `d59d0603d53bb88c5320ea508a4fb9858b61af68`, read into
+`/tmp/herdr-native-panes.rs`, confirms `pane.report_metadata` returns `ok` without
+terminal identity, including ignored-update paths. Consequently correlated `ok`
+certifies no execution or applied metadata; before/after inventories check terminal
+identity, and no durable execution state or inbox item is written. Repeat attempts
+and restart are safe for expiring display metadata. Successful attempts have the
+same 30-second cooldown as failures; fair bounded admission remains best-effort
+and does not promise refresh of every pane within its five-minute TTL.
+
+Independent source review found no blockers. The worker can also validate Failed
+records when explicitly offered, but automatic discovery currently covers Open
+threads, preserving ticker discovery behavior. macOS and a real SSH host remain
+untested. Local observation worker integration, canonical launch/profile
+preparation, budget/telemetry and broader authority work still precede W05–W09;
+counts remain 16 locally implemented, five partial and 20 unstarted.
+
+All-feature validation passed 665 tests (177 library, 445 binary, 41 CLI and two
+contracts) in debug and optimized builds. The complete debug log is
+`/tmp/herdr-token-debug.log`. Optimized library results are in
+`/tmp/herdr-token-release.log`; after correcting an existing recording fixture's
+regular-file endpoint to a real Unix socket, optimized binary/CLI/contracts passed
+in `/tmp/herdr-token-release-final.log`. The correction preserves strict production
+socket validation. Three optional live checks remain ignored in the full debug run.
+
+Six concrete worker test matrices cover repeatable native `ok`, no durable state
+writes, current-group recomputation, busy/empty owned panes, malformed/wrong/lost
+acknowledgements, preflight and post-response identity changes, cancellation and
+frozen remote routing. The blocked-worker fixture verifies another project's
+actual status update while project/root exclusion remains held. A queue fixture
+checks cooldown without delaying unrelated eligible work. The built ticker fixture
+covers local/remote/coordinator metadata, repeated restart, and absence of the old
+synchronous metadata/effect calls. The initial focused log is
+`/tmp/herdr-token-focused.log`; the strengthened fixtures are included in full runs.
+
+Default-feature validation also passed all 449 tests (30 library, 395 binary,
+22 CLI and two contracts), with three optional live checks ignored. Log:
+`/tmp/herdr-token-default.log`. Independent source review and its production
+integration validation condition are satisfied.

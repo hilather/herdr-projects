@@ -35,6 +35,9 @@ impl Queue {
     pub fn offer_final(&mut self,ctx:&Ctx,project:&Project,t:&Thread,target:Option<&str>,purpose:Purpose,operation:String)->Result<()> {
         self.offer_request(request_final(ctx,project,t,target,purpose,operation)?)
     }
+    pub fn offer_tokens(&mut self,ctx:&Ctx,project:&Project,t:Option<&Thread>,route:Option<&crate::remote_api::Route>)->Result<()> {
+        self.offer_request(crate::token_jobs::request(ctx,project,t,route)?)
+    }
     pub fn offer_notification(&mut self,ctx:&Ctx,project:&Project,c:&crate::project::Coordinator)->Result<()> {
         self.offer_request(crate::coordinator_jobs::request_notification(ctx,project,c)?)
     }
@@ -82,7 +85,7 @@ impl Queue {
             Err(error)=>Err(error),
         };
         let pending=self.pending.take().unwrap();let now=Instant::now();
-        if let Some(entry)=self.entries.get_mut(&pending.key) {entry.not_before=now+if result.is_err()||pending.identity.operation=="notification"{Duration::from_secs(30)}else{Duration::ZERO};entry.touched=now;entry.needed=result.is_err();}
+        if let Some(entry)=self.entries.get_mut(&pending.key) {entry.not_before=now+if result.is_err()||pending.identity.operation=="notification"||pending.identity.operation.starts_with("tokens:"){Duration::from_secs(30)}else{Duration::ZERO};entry.touched=now;entry.needed=result.is_err();}
         result.err().map(|e|format!("{} {}: background queue: {e:#}",pending.key.0,pending.key.1)).into_iter().collect()
     }
     pub fn admit(&mut self)->Vec<String> {
@@ -125,6 +128,15 @@ mod tests {
     fn drain(queue:&mut Queue)->Vec<String> {
         let deadline=Instant::now()+Duration::from_secs(3);let mut errors=Vec::new();
         while queue.pending(){errors.extend(queue.drain());assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(2));}errors
+    }
+    #[test]
+    fn token_refreshes_cool_down_without_blocking_other_work() {
+        let pool=Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),Arc::new(Immediate)).unwrap());let mut queue=Queue::new(pool.clone());
+        queue.offer_request(work("a","tokens:1")).unwrap();queue.admit();assert!(drain(&mut queue).is_empty());
+        let key=("a".into(),"tokens:1".into());assert!(queue.entries[&key].not_before>Instant::now()+Duration::from_secs(29));
+        queue.offer_request(work("a","tokens:1")).unwrap();queue.admit();assert!(!queue.pending());
+        queue.offer_request(work("b","brief:1")).unwrap();queue.admit();assert_eq!(queue.pending.as_ref().unwrap().key,("b".into(),"brief:1".into()));assert!(drain(&mut queue).is_empty());
+        assert!(pool.stop(Duration::from_secs(1)));
     }
     #[test]
     fn projects_and_threads_rotate_only_on_admission_and_completed_tickets_hold_turn() {
