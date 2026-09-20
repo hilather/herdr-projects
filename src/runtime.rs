@@ -133,3 +133,11 @@ pub fn adopt_observed(project:&Path,id:&str,revision:u64,head:u64,config:&migrat
     let change=db.adopt_runtime(id,revision,head,jiff::Timestamp::now().as_millisecond(),config.digest.as_deref())?;
     migration::publish_control_marker(project,&db)?;Ok(change)
 }
+
+/// Explicitly withdraw an adopted claim, retaining the binding and audit history.
+pub fn relinquish(project:&Path,id:&str,expected_revision:u64,expected_head:u64,reason:&str)->Result<u64> {
+    let _maintenance=migration::maintenance(project)?;
+    let mut db=migration::open_active(project)?;
+    let head=db.relinquish_runtime(id,expected_revision,expected_head,reason)?;
+    migration::publish_control_marker(project,&db)?;Ok(head)
+}

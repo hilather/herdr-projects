@@ -33,7 +33,7 @@ Raw external command output is not stored in the evidence table.
 Schema v6 adds hash-checked observation rows and includes them in schema-qualified
 runtime exports. Schema v7 adds the guarded lifecycle control described below. This increment interleaves the observation dependency of the
 remaining W03 adapters; it does not close T03.2, T03.3 or T03.4. Remaining work includes
-attempt termination evidence, relinquishment, repair actions, automatic runtime
+attempt termination evidence, repair actions, automatic runtime
 execution and integrated restart testing.
 
 ## Explicit session rebinding
@@ -122,6 +122,20 @@ requesting active control. Matching repeated adoption is idempotent.
 
 Recorded evidence of replacement or lost ownership pauses active control without
 releasing capacity. Pane absence or idle status is never termination evidence.
-Adopted resources do not grant destructive cleanup authority. Explicit termination
-and relinquishment remain to be implemented; rebinding owned resources refuses
-until that path exists. Conflict protection covers projects in this root only.
+Adopted resources do not grant destructive cleanup authority. Termination evidence remains to be implemented; retained worker attempts block
+relinquishment and rebinding. Conflict protection covers projects in this root only.
+
+## Audited relinquishment
+
+Pause the project, then use `runtime PROJECT relinquish BINDING --reason TEXT
+--expected-revision R --expected-head H`, where R is the ownership claim revision
+shown by inspect. Archived projects may also relinquish. The command withdraws the
+claim and its observation, retains the binding/resource references, audits the entire
+claim and reason, and invalidates control in one transaction. It makes no external
+calls and does not delete files, close panes or release attempt capacity.
+
+Every retained attempt for a linked task blocks relinquishment, even a lost attempt
+that is no longer selected as active. Active task pointers/running tasks must be
+reconciled first. Successful task relinquishment advances the task revision. A later
+explicit rebind may change the unowned route. Re-adoption uses a new monotonically
+increasing claim generation; prior immutable audit events remain intact.

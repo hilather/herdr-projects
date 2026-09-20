@@ -383,6 +383,8 @@ enum OperationsCommand { Inspect,
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
 enum RuntimeCommand {
+    /// Withdraw an ownership claim without stopping or deleting any resource
+    Relinquish { id:String, #[arg(long)] expected_revision:u64, #[arg(long)] expected_head:u64, #[arg(long)] reason:String },
     Inspect,
     /// Adopt exactly observed local resources; no prompt, launch or destructive cleanup
     Adopt { id:String, #[arg(long)] expected_revision:u64, #[arg(long)] expected_head:u64 },
@@ -419,6 +421,7 @@ pub fn run() -> Result<()> {
             project::validate_slug(&slug)?;let dir=ctx.root.join(slug);
             match command {
                 RuntimeCommand::Inspect=>{let snapshot=herdr_projects::runtime::snapshot(&dir)?;anyhow::ensure!(snapshot.schema_version>=5,"upgrade-store is required for runtime bindings");println!("{}",serde_json::to_string_pretty(&serde_json::json!({"head":snapshot.head,"bindings":snapshot.runtime_bindings,"observations":snapshot.observations,"ownership":snapshot.ownership,"control":snapshot.control}))?);},
+                RuntimeCommand::Relinquish{id,expected_revision,expected_head,reason}=>println!("{}",herdr_projects::runtime::relinquish(&dir,&id,expected_revision,expected_head,&reason)?),
                 RuntimeCommand::Adopt{id,expected_revision,expected_head}=>println!("{}",serde_json::to_string_pretty(&crate::runtime_ownership::adopt(&ctx,&dir,&id,expected_revision,expected_head)?)?),
                 RuntimeCommand::Create{task,task_revision,route,expected_head}=>{
                     let task=task.map(herdr_projects::domain::TaskId::new).transpose().map_err(anyhow::Error::msg)?;

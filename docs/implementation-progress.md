@@ -440,3 +440,20 @@ features and release build pass. Three live fixtures remain opt-in. Full suites 
 disposable process namespaces because the host systemd user process denies /proc
 inspection, correctly causing strict cleanup checks to refuse outside isolation.
 Logs: `/tmp/herdr-ownership-{debug,release,legacy,build}.log`.
+
+## Audited ownership relinquishment
+
+Explicit relinquishment requires paused/archived control and the current head and
+ownership revision. It atomically withdraws the active claim/observation, records
+the complete prior claim and reason, advances a linked task revision and invalidates
+control. Bindings and external resources remain intact. Live or lost retained
+attempts and active task pointers refuse release. Adoption generations now derive
+from immutable events so withdrawal/re-adoption cannot reuse an attempt identity.
+
+Independent review approved; two new regressions cover atomic rollback, stale
+inputs, retained live/lost workers and monotonic re-adoption. Native Git and CLI
+fixtures also verify resource preservation and active-control refusal. All-feature
+debug/release tests pass 339 tests; default tests pass. Process namespace isolation
+continues to keep cleanup checks strict. Logs: `/tmp/herdr-relinquish-{debug,release,legacy}.log`.
+No new termination proof is claimed; automatic repair and controller integration
+remain open W03 work.

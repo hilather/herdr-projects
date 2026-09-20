@@ -40,7 +40,10 @@ impl SqliteStore {
         if let Some(task)=&task {
             if task.active_attempt.is_some()||matches!(task.state,TaskState::Running|TaskState::Succeeded|TaskState::Cancelled)||read_attempts(&tx)?.iter().any(|a|a.task==task.id&&a.retains_capacity()) {return Err(StoreError::Invalid("reconcile retained execution before adopting task resources".into()));}
         }
-        let revision=old.as_ref().map(|o|o.revision).unwrap_or(0).checked_add(1).ok_or_else(||StoreError::Invalid("ownership revision exhausted".into()))?;
+        // Claims may be explicitly relinquished; immutable adoption events keep
+        // their generations from being reused after the active row is removed.
+        let previous:u64=tx.query_row("SELECT COALESCE(MAX(revision),0) FROM events WHERE kind='runtime.adopted' AND entity=?1",[id],|r|r.get(0))?;
+        let revision=previous.max(old.as_ref().map(|o|o.revision).unwrap_or(0)).checked_add(1).ok_or_else(||StoreError::Invalid("ownership revision exhausted".into()))?;
         let attempt=if observation.agent_present&&task.is_some() {Some(AttemptId::new(format!("adopt-{:x}",Sha256::digest(format!("{id}:{revision}").as_bytes()))).map_err(StoreError::Invalid)?)}else{None};
         if let (Some(task),Some(attempt))=(&task,&attempt) {
             let reservation=format!("pane:{:x}",Sha256::digest(serde_json::to_vec(&(&binding.identity.socket,&binding.identity.pane_id,&observation.session_identity)).map_err(|e|StoreError::Invalid(e.to_string()))?));
@@ -60,5 +63,37 @@ impl SqliteStore {
         tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.adopted',?1,?2,1,?3)",params![id,integer(revision)?,payload])?;
         super::control::invalidate(&tx)?;
         let result=OwnershipChange{head:head(&tx)?,ownership:owned,task_revision:task.map(|t|t.revision)};tx.commit()?;Ok(result)
+    }
+}
+
+impl SqliteStore {
+    /// Relinquishment withdraws authority only. It neither stops a process nor
+    /// removes a resource, and never releases uncertain attempt capacity.
+    pub fn relinquish_runtime(&mut self,id:&str,expected_revision:u64,expected_head:u64,reason:&str)->Result<u64> {
+        if reason.trim().is_empty()||reason.len()>4000||reason.chars().any(char::is_control) {return Err(StoreError::Invalid("reason must contain 1–4000 bytes without control characters".into()));}
+        let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;check_schema(&tx)?;
+        let schema:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;if schema<9{return Err(StoreError::UnsupportedSchema(schema));}
+        if head(&tx)?!=expected_head{return Err(StoreError::Conflict);}
+        if super::control::read(&tx)?.state==ProjectState::Active {return Err(StoreError::Invalid("pause the project before relinquishing ownership".into()));}
+        let owned=read_all(&tx)?.into_iter().find(|o|o.binding==id&&o.revision==expected_revision).ok_or(StoreError::Conflict)?;
+        let binding=super::runtime::read_all(&tx)?.into_iter().find(|b|b.id==id&&b.revision==owned.binding_revision).ok_or(StoreError::Conflict)?;
+        if owned.identity_digest!=identity_digest(&binding)? {return Err(StoreError::Conflict);}
+        let attempts=read_attempts(&tx)?;
+        if let Some(attempt)=&owned.attempt {
+            let attempt=attempts.iter().find(|a|&a.id==attempt&&binding.task.as_ref()==Some(&a.task)).ok_or(StoreError::Conflict)?;
+            if attempt.retains_capacity() {return Err(StoreError::Invalid("attempt termination remains unobserved; ownership retained".into()));}
+        }
+        if let Some(id)=&binding.task {
+            let mut task=read_tasks(&tx)?.into_iter().find(|t|&t.id==id).ok_or(StoreError::Conflict)?;
+            if task.active_attempt.is_some()||task.state==TaskState::Running||attempts.iter().any(|a|&a.task==id&&a.retains_capacity()) {return Err(StoreError::Invalid("reconcile every retained task attempt before relinquishing ownership".into()));}
+            task.revision=task.revision.checked_add(1).ok_or_else(||StoreError::Invalid("task revision exhausted".into()))?;
+            tx.execute("UPDATE tasks SET revision=?2 WHERE id=?1",params![id.as_str(),integer(task.revision)?])?;
+            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('task.changed',?1,?2,1,?3)",params![id.as_str(),integer(task.revision)?,serde_json::to_string(&task).map_err(|e|StoreError::Invalid(e.to_string()))?])?;
+        }
+        tx.execute("DELETE FROM runtime_ownership WHERE binding_id=?1",[id])?;
+        tx.execute("DELETE FROM runtime_observations WHERE binding_id=?1",[id])?;
+        let payload=serde_json::json!({"ownership":owned,"reason":reason,"resources_removed":false});
+        tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.relinquished',?1,?2,1,?3)",params![id,integer(expected_revision)?,payload.to_string()])?;
+        super::control::invalidate(&tx)?;let head=head(&tx)?;tx.commit()?;Ok(head)
     }
 }

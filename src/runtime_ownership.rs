@@ -127,8 +127,24 @@ mod tests {
             if mode=="prunable" {fs::remove_file(tree.join(".git")).unwrap();}
             let replace=mode=="replace";let tree_for_hook=tree.clone();let once=std::cell::Cell::new(false);world.runner.on_fn(|c|c.program=="git",move |c|{let output=RealRunner.run(c)?;if replace&&!once.get()&&c.args.iter().any(|a|a=="worktree")&&c.args.iter().any(|a|a=="list") {once.set(true);let gitfile=fs::read(tree_for_hook.join(".git"))?;fs::rename(&tree_for_hook,tree_for_hook.with_file_name("previous-tree"))?;fs::create_dir(&tree_for_hook)?;fs::write(tree_for_hook.join(".git"),gitfile)?;}Ok(output)});
             let before=runtime::snapshot(&path).unwrap();let result=adopt(&world.ctx(),&path,"thread:t-0001",1,before.head);let after=runtime::snapshot(&path).unwrap();
-            if mode=="valid" {assert!(result.is_ok(),"{result:?}");assert!(after.ownership[0].worktree.is_some());assert!(after.attempts.is_empty());}else{assert!(result.is_err(),"{mode}");assert!(after.ownership.is_empty());assert_eq!(after.tasks,before.tasks);}
+            if mode=="valid" {assert!(result.is_ok(),"{result:?}");assert!(after.ownership[0].worktree.is_some());assert!(after.attempts.is_empty());let revision=after.tasks[0].revision;runtime::relinquish(&path,"thread:t-0001",1,after.head,"return adopted tree").unwrap();let released=runtime::snapshot(&path).unwrap();assert_eq!(released.tasks[0].revision,revision+1);assert!(released.ownership.is_empty());assert!(tree.join(".git").exists());}else{assert!(result.is_err(),"{mode}");assert!(after.ownership.is_empty());assert_eq!(after.tasks,before.tasks);}
         }
+    }
+    #[test]
+    fn relinquishment_retains_worker_and_uncertain_attempt_capacity() {
+        let(world,path,_listener)=fixture();let head=runtime::snapshot(&path).unwrap().head;adopt(&world.ctx(),&path,"thread:t-0001",2,head).unwrap();
+        let before=runtime::snapshot(&path).unwrap();assert!(runtime::relinquish(&path,"thread:t-0001",1,before.head,"hand back resources").is_err());assert_eq!(runtime::snapshot(&path).unwrap(),before);
+        let mut db=migration::open_active(&path).unwrap();let mut attempt=before.attempts[0].clone();attempt.state=herdr_projects::domain::AttemptState::Lost;attempt.revision+=1;let mut task=before.tasks.iter().find(|t|t.id==attempt.task).unwrap().clone();let rev=task.revision;task.revision+=1;task.state=herdr_projects::domain::TaskState::Blocked;task.active_attempt=None;
+        db.commit(herdr_projects::domain::Commit{expected_head:before.head,mutations:vec![herdr_projects::domain::Mutation::Attempt{expected:Some(1),next:attempt},herdr_projects::domain::Mutation::Task{expected:Some(rev),next:task}]}).unwrap();
+        let before=runtime::snapshot(&path).unwrap();assert!(runtime::relinquish(&path,"thread:t-0001",1,before.head,"uncertain worker").is_err());assert_eq!(runtime::snapshot(&path).unwrap(),before);
+    }
+    #[test]
+    fn relinquishment_is_atomic_fenced_and_never_reuses_claim_generation() {
+        let(world,path,_listener)=fixture();let before=runtime::snapshot(&path).unwrap();let route=RuntimeRoute::from_identity(&before.runtime_bindings[0].identity);runtime::rebind(&path,"thread:t-0001",2,before.head,&RuntimeRoute::default()).unwrap();let head=runtime::snapshot(&path).unwrap().head;runtime::create_binding(&path,None,None,head,&route).unwrap();let head=runtime::snapshot(&path).unwrap().head;adopt(&world.ctx(),&path,"coordinator",1,head).unwrap();
+        let before=runtime::snapshot(&path).unwrap();for (rev,head,reason) in [(2,before.head,"reason"),(1,before.head-1,"reason"),(1,before.head,"")] {assert!(runtime::relinquish(&path,"coordinator",rev,head,reason).is_err());assert_eq!(runtime::snapshot(&path).unwrap(),before);}
+        let raw=rusqlite::Connection::open(path.join(".state/state.db")).unwrap();raw.execute_batch("CREATE TRIGGER reject_release BEFORE INSERT ON events WHEN NEW.kind='runtime.relinquished' BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();assert!(runtime::relinquish(&path,"coordinator",1,before.head,"hand back").is_err());assert_eq!(runtime::snapshot(&path).unwrap(),before);raw.execute_batch("DROP TRIGGER reject_release").unwrap();
+        runtime::relinquish(&path,"coordinator",1,before.head,"hand back").unwrap();let after=runtime::snapshot(&path).unwrap();assert!(after.ownership.is_empty());assert!(after.observations.iter().all(|o|o.binding!="coordinator"));assert_eq!(after.runtime_bindings,before.runtime_bindings);assert!(Path::new(&route.socket).exists());assert!(after.events.iter().any(|e|e.kind=="runtime.relinquished"&&e.payload["reason"]=="hand back"));assert!(after.control.as_ref().unwrap().epoch>before.control.as_ref().unwrap().epoch);
+        let change=adopt(&world.ctx(),&path,"coordinator",1,after.head).unwrap();assert_eq!(change.ownership.revision,2);let head=runtime::snapshot(&path).unwrap().head;runtime::relinquish(&path,"coordinator",2,head,"release for rebind").unwrap();let head=runtime::snapshot(&path).unwrap().head;runtime::rebind(&path,"coordinator",1,head,&RuntimeRoute::default()).unwrap();
     }
     #[test]
     fn legacy_adoption_cannot_steal_a_canonical_reference() {
