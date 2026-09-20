@@ -1842,3 +1842,39 @@ inventory fixtures. Full suites pass: 594 debug and release tests (173 library,
 384 binary, 35 CLI, two contracts), and 382 default-feature tests (30 library,
 334 binary, 16 CLI, two contracts). Three optional live checks remain ignored.
 Logs: `/tmp/herdr-identity-{debug,release,default}.log`.
+
+## W04 frozen saved-machine JSON transport
+
+The remote worker prerequisite now resolves the current saved-machine listing
+with exact ID precedence, unique labels, enabled-profile checks and globally
+unique IDs. It freezes the literal SSH target and named/default session separately
+from label and UI selection. Legacy artifact routing also rejects ambiguous,
+disabled and duplicate-ID matches instead of silently falling back.
+
+The concrete supervised bridge sends bounded JSON on stdin, validates matching
+response IDs and successful process completion, and shares the original deadline,
+cancellation and inherited execution locks. It explicitly disables TTY allocation
+and requires strict host-key verification. SSH URI targets remain a single argv
+value; passwords, paths and invalid ports refuse. The bridge does not install or
+start a remote server and never retries a request.
+
+The contract was checked against Herdr upstream commit
+`d59d0603d53bb88c5320ea508a4fb9858b61af68` and installed Herdr 0.9.1/protocol 22.
+A disposable, network-isolated named-session server answered a native JSON bridge
+ping successfully. This is local protocol evidence, not real SSH-host acceptance.
+No user panes or saved profiles were modified.
+
+This increment does not enable remote brief workers. Frozen route admission,
+cross-project remote ownership and durable-claim integration remain next, followed
+by other terminal effects and the remaining W04–W09 cards. Counts remain 16 locally
+implemented, five partial and 20 not started. macOS and real remote-host acceptance
+remain untested.
+
+Independent review approved the final prerequisite after duplicate-ID, strict
+host-key/non-TTY and rsync URI safeguards. Full debug and release suites passed
+600 tests each (173 library, 390 binary, 35 CLI, two contracts) before the final
+narrow rsync refusal; the default-feature suite below includes that refusal.
+Logs: `/tmp/herdr-route-{debug,release,default}.log`.
+The final default-feature suite passed 388 tests (30 library, 340 binary, 16 CLI,
+two contracts), including all six routing/transport fixtures. Three optional live
+checks remain ignored in every feature/build mode.

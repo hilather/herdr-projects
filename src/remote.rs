@@ -42,7 +42,11 @@ struct SavedMachine {
     label: String,
     #[serde(default)]
     target: String,
+    #[serde(default = "enabled_by_default")]
+    enabled: bool,
 }
+
+fn enabled_by_default()->bool {true}
 
 /// The SSH target of a saved machine: from `herdr machine list --json`, else
 /// `[machines.<label>] ssh` in `config.toml`.
@@ -55,9 +59,19 @@ pub(crate) fn target_from_listing(output:Option<Output>,fallback:impl FnOnce()->
         .filter(Output::success)
         .and_then(|out| serde_json::from_str::<Vec<SavedMachine>>(&out.stdout).ok())
         .unwrap_or_default();
-    if let Some(found) = listed.iter().find(|m| m.label == machine || m.id == machine)
-        && !found.target.is_empty()
-    {
+    let mut ids=std::collections::BTreeSet::new();
+    anyhow::ensure!(listed.iter().filter(|m|!m.id.is_empty()).all(|m|ids.insert(&m.id)),"duplicate saved machine ID");
+    // Match Herdr's selector: an opaque ID takes precedence over labels.
+    // Ambiguous labels or disabled profiles must never become fallback authority.
+    let by_id:Vec<_>=listed.iter().filter(|m|!m.id.is_empty()&&m.id==machine).collect();
+    anyhow::ensure!(by_id.len()<=1,"duplicate saved machine ID");
+    let found=if let Some(found)=by_id.first(){Some(*found)}else{
+        let labels:Vec<_>=listed.iter().filter(|m|m.label==machine).collect();
+        anyhow::ensure!(labels.len()<=1,"ambiguous machine label; use its profile ID");labels.first().copied()
+    };
+    if let Some(found)=found {
+        anyhow::ensure!(found.enabled,"saved machine is disabled");
+        anyhow::ensure!(!found.target.is_empty(),"saved machine has no SSH target");
         return Ok(found.target.clone());
     }
     fallback()
@@ -84,6 +98,20 @@ pub(crate) fn configured_target_bytes(bytes:&[u8],machine:&str)->Option<String> 
 }
 
 fn check_target(target: &str) -> Result<()> {
+    if let Some(authority)=target.strip_prefix("ssh://") {
+        let host=if let Some((user,host))=authority.rsplit_once('@') {
+            anyhow::ensure!(!user.is_empty()&&user.bytes().all(|b|b.is_ascii_alphanumeric()||matches!(b,b'.'|b'_'|b'-')),"invalid SSH URI user");host
+        }else{authority};
+        let port=if let Some(rest)=host.strip_prefix('[') {
+            let (ip,suffix)=rest.split_once(']').context("invalid SSH URI IPv6 host")?;ip.parse::<std::net::Ipv6Addr>().context("invalid SSH URI IPv6 host")?;
+            if suffix.is_empty(){None}else{Some(suffix.strip_prefix(':').context("invalid SSH URI port")?)}
+        }else{
+            let (name,port)=host.split_once(':').map_or((host,None),|(name,port)|(name,Some(port)));
+            anyhow::ensure!(!name.is_empty()&&!name.starts_with('-')&&name.bytes().all(|b|b.is_ascii_alphanumeric()||matches!(b,b'.'|b'_'|b'-')),"invalid SSH URI host");port
+        };
+        if let Some(port)=port {anyhow::ensure!(!port.is_empty()&&port.bytes().all(|b|b.is_ascii_digit())&&port.parse::<u16>().is_ok_and(|p|p>0),"invalid SSH URI port");}
+        return Ok(());
+    }
     // A target is `user@host` or a host alias; it must never look like an option.
     if target.is_empty() || target.starts_with('-') || !target.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '-' | ':' | '[' | ']')) {
         bail!("`{target}` is not a usable SSH target");
@@ -271,6 +299,7 @@ pub fn fetch_file(runner: &dyn Runner, target: &str, remote_path: &str, local_pa
 /// Checksum-based `rsync -rt` over ssh, without `-l`, so symbolic links are skipped.
 pub fn fetch_dir(runner: &dyn Runner, target: &str, remote_dir: &str, local_dir: &Path) -> Result<()> {
     check_target(target)?;
+    anyhow::ensure!(!target.starts_with("ssh://"),"[transport-unsupported] legacy rsync cannot represent SSH URI targets");
     if remote_dir.is_empty() || remote_dir.contains('\0') { bail!("remote library path is empty or contains NUL"); }
     for (place, output) in [
         ("local host".to_string(), runner.run(&Cmd::new("rsync", SSH_TIMEOUT).arg("--help"))?),
@@ -515,4 +544,23 @@ mod tests {
             assert!(layout(&runner, "box", "/repo/library").is_err());
         }
     }
+    #[test]
+    fn saved_route_selection_matches_id_precedence_and_refuses_ambiguous_or_disabled_profiles() {
+        use crate::runner::fake::ok;
+        let listed=ok(r#"[{"id":"chosen","label":"first","target":"correct"},{"id":"other","label":"chosen","target":"wrong"}]"#);
+        assert_eq!(target_from_listing(Some(listed),||None,"chosen").unwrap(),"correct");
+        for text in [r#"[{"id":"a","label":"same","target":"a"},{"id":"b","label":"same","target":"b"}]"#,r#"[{"id":"a","label":"same","target":"a","enabled":false}]"#,r#"[{"id":"a","label":"same","target":"a"},{"id":"a","label":"different","target":"b"}]"#] {
+            assert!(target_from_listing(Some(ok(text)),||panic!("must not fall back"),"same").is_err());
+        }
+    }
+
+    #[test]
+    fn ssh_uri_targets_remain_one_argument_and_refuse_passwords_paths_or_options() {
+        let runner=FakeRunner::new();
+        assert!(fetch_dir(&runner,"ssh://user@host:2222","/library",Path::new("/tmp/unused")).is_err());
+        assert!(runner.calls.borrow().is_empty());
+        for target in ["ssh://host", "ssh://user@host:2222", "ssh://[::1]:2222"] {let cmd=ssh_command(target,"true",SSH_TIMEOUT).unwrap();assert_eq!(cmd.args[5],target);}
+        for target in ["ssh://", "ssh://-host", "ssh://user:password@host", "ssh://host/path", "ssh://host:0", "ssh://host:65536", "ssh://[bad]:22", "ssh://host?command", "ssh://host:22:23"] {assert!(ssh_command(target,"true",SSH_TIMEOUT).is_err(),"{target}");}
+    }
+
 }

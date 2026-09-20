@@ -45,6 +45,12 @@ file-backed; no projects have been migrated. See the bounded W03 handoff; platfo
 
 ## Next work
 
+Saved-machine JSON transport now freezes profile/target/session and supervises
+bounded requests with strict host verification. Independent review approved the
+transport prerequisite; remote brief admission and cross-project ownership remain
+next. A disposable local named-session bridge ping passed; real SSH acceptance
+remains untested. See [transport details](remote-transport.md).
+
 W04 T04.1 now has a [schema-v16 scheduling foundation](scheduling.md): DAG
 validation, aged priority, retained-attempt capacity reporting and fenced CLI edits.
 Atomic reservations and immutable inputs now have a sealed internal API, and cancellation

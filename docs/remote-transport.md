@@ -99,3 +99,18 @@ per project; existing-intent recovery remains possible at that limit.
 Pending projections block conflicting copies, review preparation, execution/lifecycle
 replacement, deletion and migration. This is still an internal publication/recovery
 API: the ticker's supervised sender and executor admission are not wired yet.
+
+## Saved-machine JSON bridge prerequisite
+
+`remote_api` freezes a validated saved profile ID, literal SSH target and session.
+The supervised `remote-api-bridge` transport uses strict host verification and no
+TTY, bounded stdin JSON and output, exact response IDs, cancellation and the
+caller's original deadline. It connects an existing server only; it neither
+bootstraps nor retries. Labels and selected-profile UI state are not destination
+authority. Matching disabled or ambiguous profiles refuse.
+
+The contract follows [Herdr's saved-machine CLI](https://github.com/herdrdev/herdr/blob/d59d0603d53bb88c5320ea508a4fb9858b61af68/src/cli/machine.rs)
+and [remote bridge implementation](https://github.com/herdrdev/herdr/blob/d59d0603d53bb88c5320ea508a4fb9858b61af68/src/remote.rs).
+Installed 0.9.1 was verified with a disposable named-session JSON ping. Real SSH
+acceptance remains untested. This transport alone grants no sending authority:
+remote brief admission and ownership/claim integration are still pending.

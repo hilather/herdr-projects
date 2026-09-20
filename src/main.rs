@@ -25,6 +25,8 @@ mod project;
 #[cfg(feature="state-store")]
 mod migration_preflight;
 mod remote;
+#[allow(dead_code)] // Remote brief worker integration follows the verified transport.
+mod remote_api;
 mod repair;
 mod routine;
 mod legacy_routine_jobs;
