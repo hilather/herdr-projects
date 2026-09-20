@@ -15,6 +15,82 @@ fn fixture()->(tempfile::TempDir,SqliteStore,Vec<PreparedLaunch>) {
     (temp,db,prepared)
 }
 fn reserve(db:&mut SqliteStore,p:&[PreparedLaunch])->Reservation {let h=db.read_snapshot(None).unwrap().head;db.reserve_prepared(p,h,1000).unwrap()}
+
+fn budget(db:&mut SqliteStore,p:&mut [PreparedLaunch],limits:BudgetLimits) {
+    let snapshot=db.read_snapshot(None).unwrap();
+    let policy=BudgetPolicy{version:1,project_store:p[0].inputs.project_store.clone(),revision:snapshot.budget_policies.len() as u64+1,
+        authority:p[0].inputs.effective_profile.as_ref().unwrap().permission_policy.clone(),limits};
+    let reference=db.install_budget(&PreparedBudget{policy},snapshot.head).unwrap();
+    for p in p {
+        p.inputs.budget=Some(reference.clone());
+        let grant=ApprovalGrant{version:1,scope:ApprovalScope::for_launch(&p.inputs).unwrap(),policy:p.inputs.effective_profile.as_ref().unwrap().permission_policy.clone(),issued_unix_ms:0,expires_unix_ms:100_000};
+        let head=db.read_snapshot(None).unwrap().head;
+        p.inputs.approval=db.install_approval(&PreparedApproval{grant},head,1000).unwrap();
+    }
+}
+#[test]
+fn budget_exhaustion_survives_reopen_and_cancel_does_not_refund_admissions() {
+    let(temp,mut db,mut p)=fixture();
+    budget(&mut db,&mut p,BudgetLimits{max_attempts:Some(1),max_provider_tokens:None,unknown_usage:UnknownUsagePolicy::Refuse});
+    let r=reserve(&mut db,&p);
+    let head=db.read_snapshot(None).unwrap().head;
+    db.cancel_attempt(&r.record.attempt,1,head,"cancel without effect",1001).unwrap();
+    drop(db);let mut db=SqliteStore::open(&temp.path().join("state.db")).unwrap();
+    let report=db.budget_report().unwrap();assert_eq!(report.admitted_attempts,1);
+    assert_eq!(report.provider_tokens,UsageAvailability::Unknown);
+    assert!(report.blockers.contains(&"attempt_budget_exhausted".into()));
+    assert!(db.queue_report(1002).unwrap().entries.iter().all(|entry|entry.blockers.contains(&"attempt_budget_exhausted".into())));
+    let before=db.read_snapshot(None).unwrap();
+    let other=p.into_iter().filter(|p|p.inputs.task!=r.record.inputs.task).collect::<Vec<_>>();
+    assert!(db.reserve_prepared(&other,before.head,1002).is_err());
+    assert_eq!(db.read_snapshot(None).unwrap(),before);
+}
+#[test]
+fn budget_revision_change_blocks_claim_and_pre_effect_without_releasing_capacity() {
+    for claimed in [false,true] {
+        let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);
+        let claim=claimed.then(||db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap());
+        let before=db.read_snapshot(None).unwrap();
+        let policy=BudgetPolicy{version:1,project_store:p[0].inputs.project_store.clone(),revision:1,
+            authority:p[0].inputs.effective_profile.as_ref().unwrap().permission_policy.clone(),
+            limits:BudgetLimits{max_attempts:Some(0),max_provider_tokens:None,unknown_usage:UnknownUsagePolicy::Refuse}};
+        db.install_budget(&PreparedBudget{policy},before.head).unwrap();
+        let before=db.read_snapshot(None).unwrap();
+        if let Some(claim)=claim {assert!(db.validate_claim(&claim,1001).is_err());}
+        else {assert!(db.claim_operation(&r.record.operation,1,"worker",1001,1000).is_err());}
+        assert_eq!(db.read_snapshot(None).unwrap(),before);
+        assert!(before.attempts[0].retains_capacity());
+    }
+}
+#[test]
+fn unknown_provider_usage_is_explicit_and_never_an_implicit_zero() {
+    for (unknown_usage,tokens,admitted) in [(UnknownUsagePolicy::Refuse,10,false),(UnknownUsagePolicy::AllowIncomplete,10,true),(UnknownUsagePolicy::AllowIncomplete,0,false)] {
+        let(_temp,mut db,mut p)=fixture();
+        budget(&mut db,&mut p,BudgetLimits{max_attempts:Some(1),max_provider_tokens:Some(tokens),unknown_usage});
+        let report=db.budget_report().unwrap();assert_eq!(report.provider_tokens,UsageAvailability::Unknown);
+        let before=db.read_snapshot(None).unwrap();
+        if !admitted {
+            assert!(!report.blockers.is_empty());assert!(db.reserve_prepared(&p,before.head,1000).is_err());
+            assert_eq!(db.read_snapshot(None).unwrap(),before);
+        } else {
+            assert!(report.incomplete);assert!(report.blockers.is_empty());
+            let r=reserve(&mut db,&p);
+            // Reaching the count limit after reserving must not reject its own launch.
+            let claim=db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap();
+            db.validate_claim(&claim,1001).unwrap();
+            assert!(db.budget_report().unwrap().blockers.contains(&"attempt_budget_exhausted".into()));
+        }
+    }
+}
+#[test]
+fn budget_upgrade_preserves_pending_operations_without_inventing_policy() {
+    let(_temp,mut db,p)=fixture();reserve(&mut db,&p);
+    db.connection.execute_batch("DROP TABLE budget_policies; UPDATE store_meta SET schema_version=13; PRAGMA user_version=13;").unwrap();
+    let before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();
+    let after=db.read_snapshot(None).unwrap();assert_eq!(after.schema_version,14);
+    assert_eq!(after.events,before.events);assert_eq!(after.attempt_inputs,before.attempt_inputs);
+    assert_eq!(after.deliveries,before.deliveries);assert!(after.budget_policies.is_empty());
+}
 #[test]
 fn disk_config_change_withdraws_launch_authority_before_claim_or_effect() {
     for claimed in [false,true] {
@@ -49,7 +125,7 @@ fn schema12_launches_upgrade_without_fabricating_grants_or_releasing_capacity() 
     for claimed in [false,true] {
         let(temp,mut db,p)=fixture();let r=reserve(&mut db,&p);
         let claim=claimed.then(||db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap());
-        db.connection.execute_batch("DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; UPDATE store_meta SET schema_version=12; PRAGMA user_version=12;").unwrap();
+        db.connection.execute_batch("DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; UPDATE store_meta SET schema_version=12; PRAGMA user_version=12;").unwrap();
         let before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();let after=db.read_snapshot(None).unwrap();
         assert_eq!(after.head,before.head);assert_eq!(after.events,before.events);assert_eq!(after.attempt_inputs,before.attempt_inputs);assert_eq!(after.deliveries,before.deliveries);assert!(after.approvals.is_empty());
         drop(db);let mut db=SqliteStore::open(&temp.path().join("state.db")).unwrap();
@@ -139,7 +215,7 @@ fn version_one_input_serialization_preserves_historical_identity() {
 #[test]
 fn schema11_upgrade_retains_records_and_blocks_old_format_insertions() {
     let(temp,mut db,p)=fixture();
-    db.connection.execute_batch("DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER attempt_inputs_effective_profile; UPDATE store_meta SET schema_version=11; PRAGMA user_version=11;").unwrap();
+    db.connection.execute_batch("DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER attempt_inputs_effective_profile; UPDATE store_meta SET schema_version=11; PRAGMA user_version=11;").unwrap();
     // Reproduce a schema-11/v1 historical reservation, before v2's producer existed.
     let old_json=include_str!("../../../tests/fixtures/launch-inputs-v1.json").trim().replace(&"a".repeat(64),&p[0].inputs.binding_digest);
     let inputs:LaunchInputs=serde_json::from_str(&old_json).unwrap();
@@ -159,7 +235,7 @@ fn schema11_upgrade_retains_records_and_blocks_old_format_insertions() {
     let before=db.read_snapshot(None).unwrap();
     assert!(matches!(db.reserve_prepared(&p,before.head,1000),Err(StoreError::UnsupportedSchema(11))));
     db.upgrade_v1().unwrap();let after=db.read_snapshot(None).unwrap();
-    assert_eq!(after.schema_version,13);assert_eq!(after.attempt_inputs,before.attempt_inputs);assert_eq!(after.events,before.events);
+    assert_eq!(after.schema_version,14);assert_eq!(after.attempt_inputs,before.attempt_inputs);assert_eq!(after.events,before.events);
     assert_eq!(after.head,before.head);
     assert!(db.connection.execute("INSERT INTO attempt_inputs VALUES('old','old','{\"inputs\":{\"version\":1}}',?1)",params!["a".repeat(64)]).is_err());
     assert_eq!(after.attempt_inputs[0],record);
@@ -198,7 +274,7 @@ fn claim_and_cancellation_race_never_releases_a_claimed_worker() {
 }
 #[test]
 fn orphan_launches_refuse_reads_and_upgrade_rolls_back() {
-    let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);db.connection.execute_batch("DROP TRIGGER attempt_inputs_no_delete; DELETE FROM attempt_inputs;").unwrap();assert!(db.read_snapshot(None).is_err());db.connection.execute_batch("DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_inputs; DROP TABLE attempt_cancellations; UPDATE store_meta SET schema_version=10; PRAGMA user_version=10;").unwrap();assert!(db.upgrade_v1().is_err());let version:u32=db.connection.query_row("PRAGMA user_version",[],|r|r.get(0)).unwrap();assert_eq!(version,10);assert_eq!(db.read_snapshot(None).unwrap().operations[0].id,r.record.operation);
+    let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);db.connection.execute_batch("DROP TRIGGER attempt_inputs_no_delete; DELETE FROM attempt_inputs;").unwrap();assert!(db.read_snapshot(None).is_err());db.connection.execute_batch("DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_inputs; DROP TABLE attempt_cancellations; UPDATE store_meta SET schema_version=10; PRAGMA user_version=10;").unwrap();assert!(db.upgrade_v1().is_err());let version:u32=db.connection.query_row("PRAGMA user_version",[],|r|r.get(0)).unwrap();assert_eq!(version,10);assert_eq!(db.read_snapshot(None).unwrap().operations[0].id,r.record.operation);
 }
 #[test]
 fn cancellation_without_launch_proof_retains_the_attempt() {
@@ -206,7 +282,7 @@ fn cancellation_without_launch_proof_retains_the_attempt() {
 }
 #[test]
 fn schema10_upgrade_preserves_nonzero_claim_history() {
-    let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap();db.connection.execute_batch("DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_inputs; DROP TABLE attempt_cancellations; UPDATE operations SET kind='fixture'; UPDATE store_meta SET schema_version=10; PRAGMA user_version=10;").unwrap();let before=db.deliveries().unwrap();db.upgrade_v1().unwrap();assert_eq!(db.deliveries().unwrap(),before);assert!(db.read_snapshot(None).unwrap().attempt_inputs.is_empty());assert!(db.connection.execute("UPDATE operation_delivery SET attempts=0",[]).is_err());
+    let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap();db.connection.execute_batch("DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_inputs; DROP TABLE attempt_cancellations; UPDATE operations SET kind='fixture'; UPDATE store_meta SET schema_version=10; PRAGMA user_version=10;").unwrap();let before=db.deliveries().unwrap();db.upgrade_v1().unwrap();assert_eq!(db.deliveries().unwrap(),before);assert!(db.read_snapshot(None).unwrap().attempt_inputs.is_empty());assert!(db.connection.execute("UPDATE operation_delivery SET attempts=0",[]).is_err());
 }
 #[test]
 fn missing_parent_is_not_hidden_from_an_open_store() {

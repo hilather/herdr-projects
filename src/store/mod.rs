@@ -4,7 +4,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{fmt, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 
-const SCHEMA: u32 = 13;
+const SCHEMA: u32 = 14;
 const APPLICATION: u32 = 1_213_222_994;
 const MIN_SQLITE: i32 = 3_053_004;
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
@@ -62,6 +62,7 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../migrations/0011_attempt_inputs.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0012_effective_profiles.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0013_scoped_approvals.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0014_admission_budgets.sql"))?;
             tx.commit()?;
         }
         // Persist the initial directory entry as well as SQLite's own commit.
@@ -110,8 +111,9 @@ impl SqliteStore {
         let attempt_inputs=if schema>=11 {reservations::read_inputs(&tx)?}else{Vec::new()};
         let cancellations=if schema>=11 {reservations::read_cancellations(&tx)?}else{Vec::new()};
         let approvals=if schema>=13 {approvals::read_all(&tx)?}else{Vec::new()};
+        let budget_policies=if schema>=14 {budget::read_all(&tx)?}else{Vec::new()};
         tx.commit()?;
-        Ok(Snapshot { schema_version:schema, head, tasks, attempts, operations, deliveries, inbox, runtime_bindings, observations, ownership, control, scheduler, attempt_inputs, cancellations, approvals, events })
+        Ok(Snapshot { schema_version:schema, head, tasks, attempts, operations, deliveries, inbox, runtime_bindings, observations, ownership, control, scheduler, attempt_inputs, cancellations, approvals, budget_policies, events })
     }
     /// All mutations, generated audit events and durable intents commit together.
     /// Revisions start at one and advance by exactly one. A stale head or record
@@ -292,3 +294,4 @@ mod scheduler;
 
 mod reservations;
 mod approvals;
+mod budget;

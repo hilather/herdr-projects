@@ -73,11 +73,20 @@ enum ApprovalCommand {
     Revoke { id:String, #[arg(long)] expected_head:u64, #[arg(long)] reason:String },
 }
 
+#[cfg(feature="state-store")]
+#[derive(Subcommand)]
+enum BudgetCommand {
+    Inspect,
+    Import { document:PathBuf, signature:PathBuf, #[arg(long)] expected_head:u64 },
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Inspect owner signing policy and manage signed launch approvals
     #[cfg(feature="state-store")]
     Approval { slug:String, #[command(subcommand)] command:ApprovalCommand },
+    #[cfg(feature="state-store")]
+    Budget { slug:String, #[command(subcommand)] command:BudgetCommand },
     /// Inspect user-owned profile configuration and unresolved capability requirements
     Profile { #[command(subcommand)] command: ProfileCommand },
     /// Inspect dependency queue and configure per-project scheduling limits
@@ -632,6 +641,17 @@ pub fn run() -> Result<()> {
                     println!("Restored {}. Original saved at {backup}", path.display());
                 }
             }
+            Ok(())
+        }
+        #[cfg(feature="state-store")]
+        Command::Budget { slug,command }=>{
+            project::validate_slug(&slug)?;
+            let dir=ctx.root.join(&slug);
+            let value=match command {
+                BudgetCommand::Inspect=>serde_json::to_value(herdr_projects::migration::open_active(&dir)?.budget_report()?)?,
+                BudgetCommand::Import{document,signature,expected_head}=>serde_json::to_value(herdr_projects::authority::import_budget(&dir,&document,&signature,expected_head)?)?,
+            };
+            println!("{}",serde_json::to_string_pretty(&value)?);
             Ok(())
         }
         Command::ArtifactStream { .. } => unreachable!("artifact transport handled before environment resolution"),

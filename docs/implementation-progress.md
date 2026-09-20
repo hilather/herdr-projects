@@ -834,3 +834,34 @@ unsigned import preserves state. All 417 tests pass in debug and release (125
 library, 261 binary, 29 CLI, 2 contracts); three optional live tests remain ignored.
 Logs: `/tmp/herdr-signed-{debug,release}.log`. No user project was migrated or
 launched. Policy-change ingress, denial audit and other command rights remain.
+
+## W04 durable admission budgets (schema 14)
+
+Owner-signed budget documents now install sequential, immutable policy revisions
+through a separate `budget@herdr-projects` signature namespace. Documents bind the
+canonical project store and pinned owner authority. Imports check the current head
+and acknowledged config; stale/replayed revisions, wrong namespace and cross-project
+documents preserve history and head. CLI inspection exposes policy and blockers.
+
+Lifetime attempt limits count imported, cancelled, completed and retained attempts.
+Reservation checks are atomic with creation; cancellation does not refund an
+admission. Claim/pre-effect checks allow an already-reserved attempt at the count
+limit but reject changed policy. No denial releases uncertain worker capacity.
+Provider tokens remain explicitly unknown. Positive thresholds either refuse or
+mark admission incomplete according to signed policy; zero blocks in either mode.
+These are admission controls, not provider billing caps or running-worker stops.
+
+Schema-13 upgrade fixtures preserve pending inputs, deliveries and events without
+inventing policy. Historical-schema fixtures omit the new table, and projections
+include budget history only in schema 14. No user store has been upgraded.
+All 422 tests pass in debug and release (130 library, 261 binary, 29 CLI, 2 contracts);
+three optional live tests remain ignored. Logs: `/tmp/herdr-budget-{debug,release}.log`.
+Final queue-report optimization computes project budget blockers once per report.
+Five focused tests pass again in debug and release after that optimization
+(`/tmp/herdr-budget-final{,-release}.log`). Independent review approved the budget
+increment, including exact-limit, zero-token, signature and policy-change fixtures.
+
+T04.4 is now partial: native usage, versioned estimates, wall-time actions, durable
+routine occurrences and wider telemetry remain. Overall status is 16 implemented,
+five partial and 20 not started. Canonical launch still awaits production preparation
+and carried crash certification. macOS remains unavailable.

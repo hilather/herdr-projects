@@ -29,6 +29,10 @@ fn approval_cli_uses_pinned_policy_and_refuses_unsigned_import() {
     let output=hp(caller.path(), &["--root",root_arg,"approval","demo","inspect"]);
     assert!(output.status.success());
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),serde_json::json!([]));
+    let output=hp(caller.path(), &["--root",root_arg,"budget","demo","inspect"]);
+    assert!(output.status.success());
+    let report:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["provider_tokens"],"unknown");assert!(report["policy"].is_null());
     let document=home.path().join("grant.json");
     let signature=home.path().join("grant.sig");
     std::fs::write(&document,"{}").unwrap();
@@ -36,6 +40,8 @@ fn approval_cli_uses_pinned_policy_and_refuses_unsigned_import() {
     let output=hp(caller.path(), &["--root",root_arg,"approval","demo","import",document.to_str().unwrap(),signature.to_str().unwrap(),"--expected-head",&before.head.to_string()]);
     assert!(!output.status.success());
     assert_eq!(runtime::snapshot(&project).unwrap(),before);
+    let output=hp(caller.path(), &["--root",root_arg,"budget","demo","import",document.to_str().unwrap(),signature.to_str().unwrap(),"--expected-head",&before.head.to_string()]);
+    assert!(!output.status.success());assert_eq!(runtime::snapshot(&project).unwrap(),before);
     assert!(!caller.path().join(".config").exists());
 }
 
@@ -405,7 +411,7 @@ fn migrated_runtime_bindings_require_explicit_upgrade_and_are_unverified() {
     for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
     let project=root.join("demo");std::fs::write(project.join("threads/t-0001.toml"),"id='t-0001'\nstatus='resolved'\nrepo='/repo'\n").unwrap();
     let plan=herdr_projects::migration::inspect(&project).unwrap();herdr_projects::migration::apply(&project,&plan,true).unwrap();
-    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; DROP TABLE runtime_ownership; DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; UPDATE store_meta SET schema_version=4; PRAGMA user_version=4;").unwrap();drop(raw);
+    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; DROP TABLE runtime_ownership; DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; UPDATE store_meta SET schema_version=4; PRAGMA user_version=4;").unwrap();drop(raw);
     let args=["--root",root_arg,"migration","demo","bindings"];
     let out=hp(home.path(),&args);assert!(!out.status.success());assert!(String::from_utf8_lossy(&out.stderr).contains("upgrade-store"));
     assert!(hp(home.path(),&["--root",root_arg,"migration","demo","upgrade-store"]).status.success());

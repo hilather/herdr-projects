@@ -58,7 +58,8 @@ impl SqliteStore {
         let queued:BTreeMap<_,_>=scheduler.queue.iter().map(|q|(&q.task,q)).collect();let mut ranked=Vec::new();
         for preparation in prepared {
             let i=&preparation.inputs;if i.scheduler_revision!=scheduler.policy.revision||i.control_epoch!=control.epoch||i.config.digest!=control.config_digest{return Err(StoreError::Conflict);}
-            if i.memory.is_some()||i.budget.is_some()||!i.dependencies.is_empty(){return Err(invalid("memory, budget and dependency evidence producers are not available"));}
+            if i.memory.is_some()||!i.dependencies.is_empty(){return Err(invalid("memory and dependency evidence producers are not available"));}
+            super::budget::check(&tx,i.budget.as_ref(),false)?;
             let task=tasks.iter().find(|t|t.id==i.task&&t.revision==i.task_revision).ok_or(StoreError::Conflict)?;let queue=queued.get(&task.id).ok_or(StoreError::Conflict)?;
             if task.state!=TaskState::Queued||task.active_attempt.is_some()||!queue.dependencies.is_empty()||queue.enqueued_unix_ms>now||attempts.iter().any(|a|a.task==task.id&&a.retains_capacity()) {return Err(invalid("task is not ready for reservation"));}
             if attempts.iter().filter(|a|a.task==task.id).count()>=scheduler.policy.max_attempts_per_task as usize{return Err(invalid("task attempt limit reached"));}

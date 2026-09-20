@@ -4,6 +4,8 @@ pub(crate) mod profile;
 pub use profile::*;
 mod approval;
 pub use approval::*;
+mod budget;
+pub use budget::*;
 
 macro_rules! identifier {
     ($($name:ident),+) => { $(
@@ -97,6 +99,7 @@ pub struct Snapshot {
     pub scheduler:Option<SchedulerSnapshot>,
     pub attempt_inputs:Vec<AttemptInputRecord>,
     pub approvals:Vec<ApprovalRecord>,
+    pub budget_policies:Vec<BudgetPolicy>,
     pub cancellations:Vec<CancellationRequest>,
     pub events: Vec<Event>,
 }

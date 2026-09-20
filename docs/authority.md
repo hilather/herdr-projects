@@ -87,3 +87,8 @@ certify agent capabilities or create a launch preparation. Keep that private key
 outside worker access. A hostile process sharing the owner's OS identity may bypass
 application controls by changing files or using accessible keys; this is not an OS
 isolation guarantee.
+
+Budget policies now use the same pinned owner key with a separate
+`budget@herdr-projects` namespace and sequential project-bound revisions. See
+[admission budgets](budgets.md). This is the first signed policy-change route;
+denial audit and authority coverage for other policy classes remain incomplete.

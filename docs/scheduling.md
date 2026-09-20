@@ -48,14 +48,15 @@ Failed/cancelled predecessors block explicitly. Narrative succeeded state cannot
 satisfy an evidence-bound edge. Verified-result producers arrive in W07; profile,
 authority and production launch preparation remain W04 work. See the [frozen W04 interfaces](adr/0004-w04-scheduling-contract.md).
 
-## Reservations and cancellation (schema v13; older history retained)
+## Reservations and cancellation (schema v14; older history retained)
 
 A reservation transaction counts every unterminated attempt, checks task, binding,
 control and policy revisions, selects among sealed ready preparations using aged
 priority, then commits the attempt, immutable inputs, task pointer and launch intent
 together. Inputs pin this store, configuration, profile, approval and repository
-identities. Dependency/memory/budget evidence producers are not available yet;
-preparations requiring them refuse. There is no CLI constructor or production
+identities. [Signed admission budgets](budgets.md) are checked in the reservation
+transaction and rechecked at claim/pre-effect boundaries. Dependency/memory evidence
+producers are not available yet; preparations requiring them refuse. There is no CLI constructor or production
 producer for the sealed preparation capability. Generic intent enqueue cannot
 create `runtime.launch` operations; the controller does not dispatch launches.
 

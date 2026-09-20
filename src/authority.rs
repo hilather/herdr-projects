@@ -6,6 +6,7 @@ use sha2::{Digest,Sha256};
 use crate::{domain::{ApprovalGrant,PreparedApproval,VersionedReference}, migration, runner::{Cmd,Runner,RealRunner}};
 
 pub const SIGNATURE_NAMESPACE: &str = "approval@herdr-projects";
+pub const BUDGET_SIGNATURE_NAMESPACE: &str = "budget@herdr-projects";
 
 #[derive(Deserialize,Serialize)]
 #[serde(deny_unknown_fields)]
@@ -51,17 +52,24 @@ fn verify(policy:&Policy,payload:&[u8],signature:&[u8],runner:&dyn Runner)->Resu
     let grant:ApprovalGrant=serde_json::from_slice(payload).map_err(|_|anyhow::anyhow!("invalid approval document (contents withheld)"))?;
     grant.validate().map_err(|_|anyhow::anyhow!("invalid approval grant"))?;
     ensure!(grant.policy==reference,"approval names a different authority policy");
+    verify_signature(policy,payload,signature,SIGNATURE_NAMESPACE,runner)?;
+    Ok(PreparedApproval{grant})
+}
+
+fn verify_signature(policy:&Policy,payload:&[u8],signature:&[u8],namespace:&str,runner:&dyn Runner)->Result<()> {
+    policy.reference()?;
+    ensure!(payload.len()<=65_536 && signature.len()<=8192,"signed document or signature exceeds bounds");
     let files=VerificationFiles::new()?;
     let allowed=files.write("allowed_signers",format!("owner {}\n",policy.approval_public_key).as_bytes())?;
     let sig=files.write("signature",signature)?;
     let mut command=Cmd::new("/usr/bin/ssh-keygen",Duration::from_secs(5))
         .args(["-Y","verify","-f"]).arg(allowed.to_str().context("invalid verification path")?)
-        .args(["-I","owner","-n",SIGNATURE_NAMESPACE,"-s"]).arg(sig.to_str().context("invalid verification path")?)
+        .args(["-I","owner","-n",namespace,"-s"]).arg(sig.to_str().context("invalid verification path")?)
         .stdin(std::str::from_utf8(payload).map_err(|_|anyhow::anyhow!("approval must be UTF-8"))?);
     command.capture_limit=4096;
     let result=runner.run(&command).map_err(|_|anyhow::anyhow!("approval signature verification failed"))?;
     ensure!(result.success()&&!result.stdout_truncated&&!result.stderr_truncated,"approval signature verification failed");
-    Ok(PreparedApproval{grant})
+    Ok(())
 }
 
 fn policy(project:&Path)->Result<(Policy,migration::ConfigReference)> {
@@ -109,6 +117,25 @@ pub fn import_signed(project:&Path,document:&Path,signature:&Path,expected_head:
 pub fn revoke(project:&Path,id:&str,head:u64,reason:&str)->Result<u64> {
     let _guard=migration::runtime_mutation(project)?;
     Ok(migration::open_active(project)?.revoke_approval(id,head,jiff::Timestamp::now().as_millisecond(),reason)?)
+}
+
+/// Change admission policy only through an exact owner-signed, revision-bound document.
+pub fn import_budget(project:&Path,document:&Path,signature:&Path,expected_head:u64)->Result<VersionedReference> {
+    let _guard=migration::runtime_mutation(project)?;
+    let mut db=migration::open_active(project)?;
+    let snapshot=db.read_snapshot(Some(expected_head))?;
+    let (owner,config)=policy(project)?;
+    ensure!(snapshot.control.context("control schema upgrade required")?.config_digest==config.digest,
+        "owner configuration is not acknowledged by project control");
+    let bytes=migration::read_plan_file(document)?;
+    ensure!(bytes.len()<=65_536,"budget document exceeds bounds");
+    let policy:crate::domain::BudgetPolicy=serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid budget document (contents withheld)"))?;
+    policy.validate().map_err(anyhow::Error::msg)?;
+    ensure!(policy.authority==owner.reference()?,"budget names a different authority policy");
+    let signature=migration::read_plan_file(signature)?;
+    verify_signature(&owner,&bytes,&signature,BUDGET_SIGNATURE_NAMESPACE,&RealRunner)?;
+    ensure!(migration::config_reference(Path::new(&config.path))?==config,"owner configuration changed during verification");
+    Ok(db.install_budget(&crate::domain::PreparedBudget{policy},expected_head)?)
 }
 
 #[cfg(test)]
@@ -184,7 +211,26 @@ mod tests {
         fs::write(&sig,sign(&key,&payload,SIGNATURE_NAMESPACE)).unwrap();
         let reference=import_signed(&project,&document,&sig,snapshot.head).unwrap();assert_eq!(reference,grant.reference().unwrap());
         let installed=crate::runtime::snapshot(&project).unwrap();assert_eq!(installed.approvals.len(),1);
+        let budget=crate::domain::BudgetPolicy{version:1,revision:1,project_store:grant.scope.project_store.clone(),authority:policy.reference().unwrap(),
+            limits:crate::domain::BudgetLimits{max_attempts:Some(5),max_provider_tokens:Some(100),unknown_usage:crate::domain::UnknownUsagePolicy::Refuse}};
+        let bytes=serde_json::to_vec(&budget).unwrap();
+        fs::write(&document,&bytes).unwrap();fs::write(&sig,sign(&key,&bytes,SIGNATURE_NAMESPACE)).unwrap();
+        assert!(import_budget(&project,&document,&sig,installed.head).is_err());
+        assert_eq!(crate::runtime::snapshot(&project).unwrap(),installed);
+        fs::write(&sig,sign(&key,&bytes,BUDGET_SIGNATURE_NAMESPACE)).unwrap();
+        assert_eq!(import_budget(&project,&document,&sig,installed.head).unwrap(),budget.reference().unwrap());
+        let installed=crate::runtime::snapshot(&project).unwrap();
+        assert_eq!(installed.budget_policies,vec![budget.clone()]);
+        assert!(import_budget(&project,&document,&sig,installed.head).is_err());
+        assert_eq!(crate::runtime::snapshot(&project).unwrap(),installed);
+        let mut other=budget.clone();other.revision=2;other.project_store=dir.path().join("other/state.db").display().to_string();
+        let bytes=serde_json::to_vec(&other).unwrap();fs::write(&document,&bytes).unwrap();fs::write(&sig,sign(&key,&bytes,BUDGET_SIGNATURE_NAMESPACE)).unwrap();
+        assert!(import_budget(&project,&document,&sig,installed.head).is_err());
+        assert_eq!(crate::runtime::snapshot(&project).unwrap(),installed);
+        other.project_store=budget.project_store;
+        let bytes=serde_json::to_vec(&other).unwrap();fs::write(&document,&bytes).unwrap();fs::write(&sig,sign(&key,&bytes,BUDGET_SIGNATURE_NAMESPACE)).unwrap();
         fs::write(&config,format!("[authority]\nversion=1\nrevision=2\napproval_public_key={:?}\n",policy.approval_public_key)).unwrap();
+        assert!(import_budget(&project,&document,&sig,installed.head).is_err());
         assert!(import_signed(&project,&document,&sig,installed.head).is_err());assert_eq!(crate::runtime::snapshot(&project).unwrap(),installed);
     }
 }

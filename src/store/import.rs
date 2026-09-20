@@ -39,6 +39,7 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../migrations/0012_effective_profiles.sql"))?;
         }
         if version<=12 {tx.execute_batch(include_str!("../../migrations/0013_scoped_approvals.sql"))?;}
+        if version<=13 {tx.execute_batch(include_str!("../../migrations/0014_admission_budgets.sql"))?;}
         tx.commit()?;
         Ok(())
     }
