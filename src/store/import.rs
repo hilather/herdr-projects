@@ -28,6 +28,7 @@ impl SqliteStore {
         if version<=6 {tx.execute_batch(include_str!("../../migrations/0007_project_control.sql"))?;super::control::import_status(&tx)?;}
         if version<=7 {tx.execute_batch(include_str!("../../migrations/0008_canonical_runtime.sql"))?;}
         if version<=8 {tx.execute_batch(include_str!("../../migrations/0009_runtime_ownership.sql"))?;}
+        if version<=9 {tx.execute_batch(include_str!("../../migrations/0010_scheduler_queue.sql"))?;}
         tx.commit()?;
         Ok(())
     }

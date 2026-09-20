@@ -512,3 +512,27 @@ canonical launch-boundary crash criterion remains unpassed and is a required W04
 gate before launches are enabled. Missing termination evidence continues retaining
 capacity; unsupported effects remain blocked. macOS and the broader live matrix
 remain untested. Counts are now 16 locally implemented cards and 25 not started.
+
+## W04 queue and capacity-policy foundation
+
+The independently reviewed W04 scheduler/executor/profile contract is frozen in
+ADR 0004. Schema v10 adds revisioned per-project capacity/attempt limits, canonical
+queue age/priority and typed dependency edges. Policy defaults to zero workers until
+explicit configuration. Queue edits atomically fence task/head, validate the DAG,
+preserve enqueue age and append audit events. Age eventually outweighs bounded
+priority; every unterminated attempt counts in capacity reporting. No predecessor
+narrative success fabricates verified result/candidate/landed evidence.
+
+Review caught and resolved a compatibility issue where unrelated task inventory
+could make upgraded snapshots unreadable. Graph bounds now apply to queued work,
+and dependency loading uses an index. The new 10,001-task commit/read/upgrade
+regression passes. Six scheduler tests, an old-export upgrade fixture and a CLI
+fixture cover rollback, graph rejection, policy races, aging, retained capacity,
+verified-dependency blocking and unchanged legacy files. Full all-feature debug and
+release suites pass 357 tests (80 library, 250 binary, 25 CLI, 2 contracts).
+Default-feature tests and the release build also pass. Logs:
+`/tmp/herdr-scheduler-{debug,release,legacy,build}.log`.
+
+T04.1 remains partial: immutable prepared inputs, atomic reservation/launch intent
+creation and cancellation still need implementation. Queueing does not reserve or
+launch; profile/authority and the carried launch crash gate remain prerequisites.

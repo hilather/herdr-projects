@@ -4,7 +4,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{fmt, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 
-const SCHEMA: u32 = 9;
+const SCHEMA: u32 = 10;
 const APPLICATION: u32 = 1_213_222_994;
 const MIN_SQLITE: i32 = 3_053_004;
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
@@ -58,6 +58,7 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../migrations/0007_project_control.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0008_canonical_runtime.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0009_runtime_ownership.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0010_scheduler_queue.sql"))?;
             tx.commit()?;
         }
         // Persist the initial directory entry as well as SQLite's own commit.
@@ -102,8 +103,9 @@ impl SqliteStore {
         let observations=if schema>=6 {observations::read_all(&tx)?}else{Vec::new()};
         let ownership=if schema>=9 {ownership::read_all(&tx)?}else{Vec::new()};
         let control=if schema>=7 {Some(control::read(&tx)?)}else{None};
+        let scheduler=if schema>=10 {Some(scheduler::read(&tx)?)}else{None};
         tx.commit()?;
-        Ok(Snapshot { schema_version:schema, head, tasks, attempts, operations, deliveries, inbox, runtime_bindings, observations, ownership, control, events })
+        Ok(Snapshot { schema_version:schema, head, tasks, attempts, operations, deliveries, inbox, runtime_bindings, observations, ownership, control, scheduler, events })
     }
     /// All mutations, generated audit events and durable intents commit together.
     /// Revisions start at one and advance by exactly one. A stale head or record
@@ -278,3 +280,5 @@ mod finalization;
 
 pub(crate) mod ownership;
 pub use ownership::OwnershipChange;
+
+mod scheduler;

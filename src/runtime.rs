@@ -141,3 +141,15 @@ pub fn relinquish(project:&Path,id:&str,expected_revision:u64,expected_head:u64,
     let head=db.relinquish_runtime(id,expected_revision,expected_head,reason)?;
     migration::publish_control_marker(project,&db)?;Ok(head)
 }
+
+pub fn queue_task(project:&Path,id:&TaskId,revision:u64,head:u64,request:&crate::domain::QueueRequest)->Result<u64> {
+    let _guard=migration::runtime_mutation(project)?;
+    Ok(migration::open_active(project)?.queue_task(id,revision,head,request,jiff::Timestamp::now().as_millisecond())?)
+}
+pub fn scheduler_policy(project:&Path,head:u64,revision:u64,max_workers:u32,max_attempts:u32)->Result<u64> {
+    let _guard=migration::runtime_mutation(project)?;
+    Ok(migration::open_active(project)?.set_scheduler_policy(head,revision,max_workers,max_attempts)?)
+}
+pub fn queue_report(project:&Path)->Result<crate::domain::QueueReport> {
+    Ok(migration::open_active(project)?.queue_report(jiff::Timestamp::now().as_millisecond())?)
+}

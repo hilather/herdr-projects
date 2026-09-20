@@ -23,6 +23,7 @@ pub fn export(project:&Path,db:&mut SqliteStore)->Result<PathBuf> {
     if snapshot.schema_version>=6 {runtime["observations"]=serde_json::to_value(&snapshot.observations)?;}
     if snapshot.schema_version>=7 {runtime["control"]=serde_json::to_value(&snapshot.control)?;runtime["reconciliation_required"]=serde_json::json!(snapshot.control.as_ref().map(|c|c.reconciliation_required).unwrap_or(true));}
     if snapshot.schema_version>=9 {runtime["ownership"]=serde_json::to_value(&snapshot.ownership)?;}
+    if snapshot.schema_version>=10 {runtime["scheduler"]=serde_json::to_value(&snapshot.scheduler)?;}
     let operations=serde_json::json!({"owner":"sqlite-v2","event_head":snapshot.head,"intents":snapshot.operations,"deliveries":snapshot.deliveries});
     let inbox=serde_json::json!({"owner":"sqlite-v2","event_head":snapshot.head,"items":snapshot.inbox});
     for (name,bytes) in [("TASKS.md",text.into_bytes()),("runtime.json",serde_json::to_vec_pretty(&runtime)?),("operations.json",serde_json::to_vec_pretty(&operations)?),("inbox.json",serde_json::to_vec_pretty(&inbox)?)] {

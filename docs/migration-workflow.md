@@ -43,8 +43,8 @@ thread/settings fields are preserved in the original bytes.
 Schema v2 added source provenance and an import receipt; v3 adds durable delivery
 state and the imported-operation count; v4 adds canonical inbox records and v5
 adds typed, unverified runtime identities. Opening an older supported schema does
-not upgrade it. Use `upgrade-store` explicitly. Fresh stores use v9 (observations,
-lifecycle control, canonical bindings and adopted ownership); the runtime
+not upgrade it. Use `upgrade-store` explicitly. Fresh stores use v10 (observations,
+lifecycle control, canonical bindings, adopted ownership and scheduler queue/policy); the runtime
 ownership marker remains `sqlite-v2`. Newer unknown schemas refuse writes.
 Import stores task mappings, raw runtime/thread/inbox/task bytes, hashes, supported
 operation intents and audit events in one transaction. It verifies exact bytes, identities, counts, task states,

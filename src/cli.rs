@@ -54,6 +54,9 @@ enum RepairCommand {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect dependency queue and configure per-project scheduling limits
+    #[cfg(feature="state-store")]
+    Scheduler { slug:String, #[command(subcommand)] command:SchedulerCommand },
     /// Inspect or explicitly rebind migrated runtime routing without granting ownership
     #[cfg(feature="state-store")]
     Runtime { slug:String, #[command(subcommand)] command:RuntimeCommand },
@@ -351,10 +354,17 @@ enum MigrationCommand {
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
 enum TaskCommand {
+    Queue { id:String, #[arg(long)] input_file:PathBuf, #[arg(long)] expected_revision:u64, #[arg(long)] expected_head:u64 },
     List,
     Show { id:String },
     Add { id:String, #[arg(long)] title:String, #[arg(long)] expected_head:u64 },
     Rename { id:String, #[arg(long)] title:String, #[arg(long)] expected_revision:u64, #[arg(long)] expected_head:u64 },
+}
+#[cfg(feature="state-store")]
+#[derive(Subcommand)]
+enum SchedulerCommand {
+    Inspect,
+    Policy { #[arg(long)] max_active_workers:u32, #[arg(long)] max_attempts_per_task:u32, #[arg(long)] expected_revision:u64, #[arg(long)] expected_head:u64 },
 }
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
@@ -450,10 +460,23 @@ pub fn run() -> Result<()> {
             Ok(())
         },
         #[cfg(feature="state-store")]
+        Command::Scheduler{slug,command}=>{
+            project::validate_slug(&slug)?;let dir=ctx.root.join(&slug);
+            match command {
+                SchedulerCommand::Inspect=>println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::queue_report(&dir)?)?),
+                SchedulerCommand::Policy{max_active_workers,max_attempts_per_task,expected_revision,expected_head}=>println!("{}",herdr_projects::runtime::scheduler_policy(&dir,expected_head,expected_revision,max_active_workers,max_attempts_per_task)?),
+            }Ok(())
+        },
+        #[cfg(feature="state-store")]
         Command::Task { slug,command } => {
             use herdr_projects::{domain::TaskId,runtime};
             project::validate_slug(&slug)?; let dir=ctx.root.join(&slug);
             match command {
+                TaskCommand::Queue{id,input_file,expected_revision,expected_head}=>{
+                    let bytes=herdr_projects::migration::read_plan_file(&input_file)?;
+                    let request=serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid queue request JSON"))?;
+                    println!("{}",runtime::queue_task(&dir,&TaskId::new(id).map_err(anyhow::Error::msg)?,expected_revision,expected_head,&request)?);
+                },
                 TaskCommand::List=>println!("{}",serde_json::to_string_pretty(&runtime::snapshot(&dir)?)?),
                 TaskCommand::Show{id}=>{
                     let id=TaskId::new(id).map_err(anyhow::Error::msg)?;
