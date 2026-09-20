@@ -8,18 +8,29 @@ fn text(value:&str)->Result<()> {
 pub(super) fn now_check(now:i64)->Result<()> {
     if now<0 || now>i64::MAX-600_000 { return Err(StoreError::Invalid("clock outside supported range".into())); } Ok(())
 }
-pub(super) fn delivery(db:&Connection,id:&OperationId)->Result<Delivery> {
-    let value=db.query_row("SELECT revision,state,epoch,attempts,owner,lease_until_ms,next_due_ms,last_outcome FROM operation_delivery WHERE operation_id=?1",[id.as_str()],|r|{
-        Ok(serde_json::json!({"operation":id,"revision":r.get::<_,u64>(0)?,"state":r.get::<_,String>(1)?,"epoch":r.get::<_,u64>(2)?,"attempts":r.get::<_,u32>(3)?,"owner":r.get::<_,Option<String>>(4)?,"lease_until_ms":r.get::<_,Option<i64>>(5)?,"next_due_ms":r.get::<_,i64>(6)?,"last_outcome":r.get::<_,Option<String>>(7)?}))
-    })?;
-    let mut value=value;
+pub(super) fn delivery(db:&Connection,id:&OperationId)->Result<Delivery> {delivery_with_budget(db,id,None)}
+pub(super) fn delivery_with_budget(db:&Connection,id:&OperationId,budget:Option<&read_budget::ReadBudget>)->Result<Delivery> {
+    let mut stmt=db.prepare("SELECT revision,state,epoch,attempts,owner,lease_until_ms,next_due_ms,last_outcome FROM operation_delivery WHERE operation_id=?1")?;
+    let mut rows=stmt.query([id.as_str()])?;
+    let r=rows.next()?.ok_or_else(||StoreError::from(rusqlite::Error::QueryReturnedNoRows))?;
+    if let Some(budget)=budget {budget.row(r,&[(7,2)])?;}
+    let mut value=serde_json::json!({"operation":id,"revision":r.get::<_,u64>(0)?,"state":r.get::<_,String>(1)?,"epoch":r.get::<_,u64>(2)?,"attempts":r.get::<_,u32>(3)?,"owner":r.get::<_,Option<String>>(4)?,"lease_until_ms":r.get::<_,Option<i64>>(5)?,"next_due_ms":r.get::<_,i64>(6)?,"last_outcome":r.get::<_,Option<String>>(7)?});
     if let Some(raw)=value["last_outcome"].as_str() { value["last_outcome"]=serde_json::from_str(raw).map_err(|e|StoreError::Corrupt(e.to_string()))?; }
     decode(value)
 }
-pub(super) fn read_all(db:&Connection)->Result<Vec<Delivery>> {
-    let ids={let mut stmt=db.prepare("SELECT operation_id FROM operation_delivery ORDER BY operation_id")?;stmt.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?};
-    ids.into_iter().map(|s|delivery(db,&OperationId::new(s).map_err(StoreError::Corrupt)?)).collect()
+pub(super) fn read_all(db:&Connection)->Result<Vec<Delivery>> {read_all_with_budget(db,None)}
+pub(super) fn read_all_with_budget(db:&Connection,budget:Option<&read_budget::ReadBudget>)->Result<Vec<Delivery>> {
+    let mut stmt=db.prepare("SELECT operation_id FROM operation_delivery ORDER BY operation_id")?;
+    let mut rows=stmt.query([])?;
+    let mut result=Vec::new();
+    while let Some(row)=rows.next()? {
+        if let Some(budget)=budget {budget.row(row,&[])?;}
+        let id=OperationId::new(row.get::<_,String>(0)?).map_err(StoreError::Corrupt)?;
+        result.push(delivery_with_budget(db,&id,budget)?);
+    }
+    Ok(result)
 }
+
 fn log(tx:&Connection,id:&OperationId,revision:u64,kind:&str,payload:serde_json::Value)->Result<()> {
     tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?1,?2,?3,1,?4)",params![kind,id.as_str(),integer(revision)?,payload.to_string()])?;Ok(())
 }

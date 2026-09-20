@@ -1,8 +1,13 @@
 use super::*;
 use crate::{operations::DeliveryState,reconcile::ResourceState};
 
-pub(super) fn read(db:&Connection)->Result<ProjectControl> {
-    let (revision,epoch,state,required,config_digest):(u64,u64,String,bool,Option<String>)=db.query_row("SELECT revision,epoch,state,reconciliation_required,config_digest FROM project_control WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+pub(super) fn read(db:&Connection)->Result<ProjectControl> {read_with_budget(db,None)}
+pub(super) fn read_with_budget(db:&Connection,budget:Option<&read_budget::ReadBudget>)->Result<ProjectControl> {
+    let mut stmt=db.prepare("SELECT revision,epoch,state,reconciliation_required,config_digest FROM project_control WHERE singleton=1")?;
+    let mut rows=stmt.query([])?;
+    let r=rows.next()?.ok_or_else(||StoreError::from(rusqlite::Error::QueryReturnedNoRows))?;
+    if let Some(budget)=budget {budget.row(r,&[])?;}
+    let (revision,epoch,state,required,config_digest):(u64,u64,String,bool,Option<String>)=(r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?);
     if config_digest.as_ref().is_some_and(|d|d.len()!=64||!d.bytes().all(|b|b.is_ascii_hexdigit())) {return Err(StoreError::Corrupt("invalid control config fingerprint".into()));}
     Ok(ProjectControl{revision,epoch,state:match state.as_str(){"paused"=>ProjectState::Paused,"active"=>ProjectState::Active,"archived"=>ProjectState::Archived,_=>return Err(StoreError::Corrupt("invalid project control state".into()))},reconciliation_required:required,config_digest})
 }

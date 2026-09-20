@@ -718,3 +718,9 @@ application copies and JSON decoding. JSON structure uses conservative lexical
 weights, not an exact heap estimate. A limit rejects the whole snapshot. Other
 projections, nested readers and mutation-local reads are not yet covered; this is
 not a full snapshot memory bound.
+
+The same accounting now includes deliveries (IDs and nested lookups), inbox,
+runtime bindings and joined/coordinator provenance, observations, ownership and
+project control. Scheduler, input/cancellation records, approvals, budgets and
+routine readers remain outside this accounting. Runtime route validation reserves
+an additional payload-copy allowance before cloning identity strings.

@@ -2,15 +2,21 @@ use super::*;
 use crate::operations::{DeliveryState,Outcome};
 use std::collections::BTreeSet;
 
-pub(super) fn read_all(db:&Connection)->Result<Vec<InboxItem>> {
+pub(super) fn read_all(db:&Connection)->Result<Vec<InboxItem>> {read_all_with_budget(db,None)}
+pub(super) fn read_all_with_budget(db:&Connection,budget:Option<&read_budget::ReadBudget>)->Result<Vec<InboxItem>> {
     let mut stmt=db.prepare("SELECT revision,payload,payload_hash,seen,done,id FROM inbox_items ORDER BY id")?;
-    let rows=stmt.query_map([],|r|Ok((r.get::<_,u64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,bool>(3)?,r.get::<_,bool>(4)?,r.get::<_,String>(5)?)))?;
-    rows.map(|row|{let(revision,payload,hash,seen,done,id)=row?;
+    let mut rows=stmt.query([])?;
+    let mut result=Vec::new();
+    while let Some(r)=rows.next()? {
+        if let Some(budget)=budget {budget.row(r,&[(1,1)])?;}
+        let values=(r.get::<_,u64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,bool>(3)?,r.get::<_,bool>(4)?,r.get::<_,String>(5)?);
+        let(revision,payload,hash,seen,done,id)=values;
         if format!("{:x}",Sha256::digest(payload.as_bytes()))!=hash{return Err(StoreError::Corrupt("inbox payload hash mismatch".into()));}
         let content:InboxContent=serde_json::from_str(&payload).map_err(|e|StoreError::Corrupt(e.to_string()))?;
         if content.id!=id{return Err(StoreError::Corrupt("inbox row identity mismatch".into()));}
-        content.validate().map_err(StoreError::Corrupt)?;Ok(InboxItem{revision,content,seen,done})
-    }).collect()
+        content.validate().map_err(StoreError::Corrupt)?;result.push(InboxItem{revision,content,seen,done});
+    }
+    Ok(result)
 }
 pub(super) fn insert(db:&Connection,item:&InboxItem)->Result<()> {
     item.content.validate().map_err(StoreError::Invalid)?;

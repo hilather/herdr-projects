@@ -141,3 +141,16 @@ adapters remain visibly blocked, rather than becoming implicit launch authority.
 W05–W09 then cover memory snapshots and promotion, verified results/integration,
 live validation, packaging and release. The 25-card count is not a time estimate.
 macOS remains untested; unsupported cleanup continues to refuse.
+
+
+## Current stopping point: snapshot reader accounting
+
+Original SQL cancellation/deadlines now cover canonical maintenance through
+observation commit, marker publication and claim expiry. Controlled snapshots
+account for core records plus deliveries, inbox, runtime/provenance, observations,
+ownership and project control before application copies/decoding. This is partial
+input/JSON-structure accounting, not a full heap bound. Next: propagate the same
+budget through scheduler, input/cancellation, approval, budget-policy and routine
+readers, including their nested queries and validation copies. Then continue the
+remaining W04 worker control, launch/termination, profile, telemetry and authority
+work above. Counts remain 16 locally implemented, five partial and 20 unstarted.

@@ -2,13 +2,19 @@ use super::*;
 use crate::reconcile::{RuntimeObservation,ResourceState};
 
 pub(crate) fn identity_digest(binding:&RuntimeBinding)->Result<String> {Ok(format!("{:x}",Sha256::digest(serde_json::to_vec(&binding.identity).map_err(|e|StoreError::Invalid(e.to_string()))?)))}
-pub(super) fn read_all(db:&Connection)->Result<Vec<RuntimeOwnership>> {
+pub(super) fn read_all(db:&Connection)->Result<Vec<RuntimeOwnership>> {read_all_with_budget(db,None)}
+pub(super) fn read_all_with_budget(db:&Connection,budget:Option<&read_budget::ReadBudget>)->Result<Vec<RuntimeOwnership>> {
     let mut stmt=db.prepare("SELECT binding_id,revision,binding_revision,attempt_id,payload,payload_hash FROM runtime_ownership ORDER BY binding_id")?;
-    let rows=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,u64>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?)))?;
-    rows.map(|row|{let(id,revision,binding_revision,attempt,payload,hash)=row?;if format!("{:x}",Sha256::digest(payload.as_bytes()))!=hash{return Err(StoreError::Corrupt("ownership payload hash mismatch".into()));}
+    let mut rows=stmt.query([])?;
+    let mut result=Vec::new();
+    while let Some(r)=rows.next()? {
+        if let Some(budget)=budget {budget.row(r,&[(4,1)])?;}
+        let values=(r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,u64>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?);
+        let(id,revision,binding_revision,attempt,payload,hash)=values;if format!("{:x}",Sha256::digest(payload.as_bytes()))!=hash{return Err(StoreError::Corrupt("ownership payload hash mismatch".into()));}
         let owned:RuntimeOwnership=serde_json::from_str(&payload).map_err(|_|StoreError::Corrupt("invalid ownership payload".into()))?;
-        if owned.binding!=id||owned.revision!=revision||owned.binding_revision!=binding_revision||owned.attempt.as_ref().map(AttemptId::as_str)!=attempt.as_deref()||owned.origin!="adopted"||!crate::operations::finalization::hash(&owned.identity_digest)||owned.observed_unix_ms<0 {return Err(StoreError::Corrupt("ownership row identity mismatch".into()));}Ok(owned)
-    }).collect()
+        if owned.binding!=id||owned.revision!=revision||owned.binding_revision!=binding_revision||owned.attempt.as_ref().map(AttemptId::as_str)!=attempt.as_deref()||owned.origin!="adopted"||!crate::operations::finalization::hash(&owned.identity_digest)||owned.observed_unix_ms<0 {return Err(StoreError::Corrupt("ownership row identity mismatch".into()));}result.push(owned);
+    }
+    Ok(result)
 }
 pub(crate) fn observed(binding:&RuntimeBinding,task_revision:Option<u64>,observation:&RuntimeObservation,now:i64,config:Option<&str>)->bool {
     let has_pane=!binding.identity.pane_id.is_empty();let has_tree=!binding.identity.worktree_path.is_empty();

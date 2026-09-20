@@ -106,3 +106,49 @@ fn core_snapshot_accounting_rejects_valid_dense_payload_and_view_amplification()
     // The returned view rows, not the single small base-table row, are charged.
     assert!(matches!(db.read_snapshot(None),Err(StoreError::Limit(_))));
 }
+
+#[test]
+fn projection_materializers_charge_actual_values_before_copy_or_validation() {
+    let cases=[
+        ("runtime_bindings", "SELECT CAST(zeroblob(16777217) AS TEXT) AS id,NULL AS task_id,1 AS revision,NULL AS source_path,'{}' AS payload,'' AS payload_hash"),
+        ("legacy_sources", "SELECT '.state/coordinator.json' AS path,'runtime' AS kind,'' AS digest,zeroblob(16777217) AS bytes"),
+        ("operation_delivery", "SELECT 'operation' AS operation_id,1 AS revision,'pending' AS state,0 AS epoch,0 AS attempts,CAST(zeroblob(16777217) AS TEXT) AS owner,NULL AS lease_until_ms,0 AS next_due_ms,NULL AS last_outcome"),
+        ("inbox_items", "SELECT 1 AS revision,'{}' AS payload,'' AS payload_hash,0 AS seen,0 AS done,CAST(zeroblob(16777217) AS TEXT) AS id"),
+        ("runtime_observations", "SELECT CAST(zeroblob(16777217) AS TEXT) AS binding_id,1 AS binding_revision,NULL AS task_revision,0 AS observed_unix_ms,'{}' AS payload,'' AS payload_hash"),
+        ("runtime_ownership", "SELECT CAST(zeroblob(16777217) AS TEXT) AS binding_id,1 AS revision,1 AS binding_revision,NULL AS attempt_id,'{}' AS payload,'' AS payload_hash"),
+        ("project_control", "SELECT 1 AS singleton,1 AS revision,1 AS epoch,CAST(zeroblob(16777217) AS TEXT) AS state,0 AS reconciliation_required,NULL AS config_digest"),
+    ];
+    for (table,query) in cases {
+        let(_root,path)=fixture();let mut db=ControlledStore::open(&path,control()).unwrap();
+        let raw=Connection::open(&path).unwrap();
+        raw.execute_batch(&format!("ALTER TABLE {table} RENAME TO original_{table}; CREATE VIEW {table} AS {query};")).unwrap();
+        let result=db.read_snapshot(None);
+        assert!(matches!(result,Err(StoreError::Limit(_))),"{table}: {result:?}");
+    }
+}
+#[test]
+fn nested_delivery_json_uses_shared_structure_budget_before_decode() {
+    let(_root,path)=fixture();let mut db=ControlledStore::open(&path,control()).unwrap();let raw=Connection::open(&path).unwrap();
+    raw.execute_batch("ALTER TABLE operation_delivery RENAME TO original_delivery; CREATE TABLE operation_delivery(operation_id,revision,state,epoch,attempts,owner,lease_until_ms,next_due_ms,last_outcome);").unwrap();
+    // Two passes exceed the allowance; one pass would reach typed decoding and
+    // reject this shape as Corrupt instead. No matching operation is needed to
+    // reach this projection's ID + singleton query sequence.
+    let payload=format!("[{}0]","0,".repeat(110_000));
+    raw.execute("INSERT INTO operation_delivery VALUES('operation',1,'pending',0,0,NULL,NULL,0,?1)",[payload]).unwrap();
+    assert!(matches!(db.read_snapshot(None),Err(StoreError::Limit(_))));
+}
+#[test]
+fn runtime_provenance_join_amplification_consumes_one_snapshot_budget() {
+    let(_root,path)=fixture();let raw=Connection::open(&path).unwrap();
+    let bytes=vec![0u8;10*1024*1024];let digest=format!("{:x}",Sha256::digest(&bytes));
+    let binding=RuntimeBinding{id:"coordinator".into(),task:None,revision:1,source_path:Some(".state/coordinator.json".into()),source_digest:Some(digest.clone()),session_source_digest:None,verification:RuntimeVerification::Unverified,identity:RuntimeIdentity::default()};
+    let payload=serde_json::to_string(&binding).unwrap();
+    raw.execute("INSERT INTO legacy_sources VALUES('.state/coordinator.json','runtime',?1,?2)",params![digest,bytes]).unwrap();
+    raw.execute("INSERT INTO runtime_bindings VALUES('coordinator',NULL,1,'.state/coordinator.json',?1,?2)",params![payload,format!("{:x}",Sha256::digest(payload.as_bytes()))]).unwrap();
+    let mut db=ControlledStore::open(&path,control()).unwrap();
+    assert_eq!(db.read_snapshot(None).unwrap(),SqliteStore::open(&path).unwrap().read_snapshot(None).unwrap());
+    raw.execute_batch("ALTER TABLE runtime_bindings RENAME TO original_bindings; CREATE VIEW runtime_bindings AS SELECT original_bindings.* FROM original_bindings CROSS JOIN (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5);").unwrap();
+    // Singleton source plus five returned join rows would copy 60 MiB from one
+    // 10 MiB source. Reject before the final inventory mismatch/partial return.
+    assert!(matches!(db.read_snapshot(None),Err(StoreError::Limit(_))));
+}

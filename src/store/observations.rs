@@ -1,17 +1,22 @@
 use super::*;
 use crate::reconcile::RuntimeObservation;
 
-pub(super) fn read_all(db:&Connection)->Result<Vec<RuntimeObservation>> {
+pub(super) fn read_all(db:&Connection)->Result<Vec<RuntimeObservation>> {read_all_with_budget(db,None)}
+pub(super) fn read_all_with_budget(db:&Connection,budget:Option<&read_budget::ReadBudget>)->Result<Vec<RuntimeObservation>> {
     let mut stmt=db.prepare("SELECT binding_id,binding_revision,task_revision,observed_unix_ms,payload,payload_hash FROM runtime_observations ORDER BY binding_id")?;
-    let rows=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,Option<u64>>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?)))?;
-    rows.map(|row| {
-        let(id,revision,task_revision,time,payload,hash)=row?;
+    let mut rows=stmt.query([])?;
+    let mut result=Vec::new();
+    while let Some(r)=rows.next()? {
+        if let Some(budget)=budget {budget.row(r,&[(4,1)])?;}
+        let values=(r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,Option<u64>>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?);
+        let(id,revision,task_revision,time,payload,hash)=values;
         if format!("{:x}",Sha256::digest(payload.as_bytes()))!=hash {return Err(StoreError::Corrupt("observation payload hash mismatch".into()));}
         let observation:RuntimeObservation=serde_json::from_str(&payload).map_err(|_|StoreError::Corrupt("invalid observation payload".into()))?;
         observation.validate().map_err(StoreError::Corrupt)?;
         if observation.binding!=id||observation.binding_revision!=revision||observation.task_revision!=task_revision||observation.observed_unix_ms!=time {return Err(StoreError::Corrupt("observation identity mismatch".into()));}
-        Ok(observation)
-    }).collect()
+        result.push(observation);
+    }
+    Ok(result)
 }
 impl SqliteStore {
     /// Commit a complete collector batch against the exact state it observed.

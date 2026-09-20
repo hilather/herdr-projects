@@ -112,12 +112,12 @@ impl SqliteStore {
         let operations = read_operations_matching_with_budget(&tx, None, budget)?;
         let events = read_events_with_budget(&tx, budget)?;
         let schema:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
-        let deliveries=if schema>=3 {delivery::read_all(&tx)?}else{Vec::new()};
-        let inbox=if schema>=4 {inbox::read_all(&tx)?}else{Vec::new()};
-        let runtime_bindings=if schema>=5 {runtime::read_all(&tx)?}else{Vec::new()};
-        let observations=if schema>=6 {observations::read_all(&tx)?}else{Vec::new()};
-        let ownership=if schema>=9 {ownership::read_all(&tx)?}else{Vec::new()};
-        let control=if schema>=7 {Some(control::read(&tx)?)}else{None};
+        let deliveries=if schema>=3 {delivery::read_all_with_budget(&tx,budget)?}else{Vec::new()};
+        let inbox=if schema>=4 {inbox::read_all_with_budget(&tx,budget)?}else{Vec::new()};
+        let runtime_bindings=if schema>=5 {runtime::read_all_with_budget(&tx,budget)?}else{Vec::new()};
+        let observations=if schema>=6 {observations::read_all_with_budget(&tx,budget)?}else{Vec::new()};
+        let ownership=if schema>=9 {ownership::read_all_with_budget(&tx,budget)?}else{Vec::new()};
+        let control=if schema>=7 {Some(control::read_with_budget(&tx,budget)?)}else{None};
         let scheduler=if schema>=10 {Some(scheduler::read(&tx)?)}else{None};
         let attempt_inputs=if schema>=11 {reservations::read_inputs(&tx)?}else{Vec::new()};
         let cancellations=if schema>=11 {reservations::read_cancellations(&tx)?}else{Vec::new()};

@@ -41,14 +41,24 @@ pub(super) fn import_sources(db:&Connection)->Result<()> {
     Ok(())
 }
 
-pub(super) fn read_all(db:&Connection)->Result<Vec<RuntimeBinding>> {
+pub(super) fn read_all(db:&Connection)->Result<Vec<RuntimeBinding>> {read_all_with_budget(db,None)}
+pub(super) fn read_all_with_budget(db:&Connection,budget:Option<&read_budget::ReadBudget>)->Result<Vec<RuntimeBinding>> {
     let mut stmt=db.prepare("SELECT b.id,b.task_id,b.revision,b.source_path,b.payload,b.payload_hash,s.digest,s.bytes FROM runtime_bindings b LEFT JOIN legacy_sources s ON s.path=b.source_path ORDER BY b.id")?;
-    let rows=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,u64>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,Option<Vec<u8>>>(7)?)))?;
-    let session:Option<(String,Vec<u8>)>=db.query_row("SELECT digest,bytes FROM legacy_sources WHERE path='.state/coordinator.json' AND kind='runtime'",[],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let session={
+        let mut statement=db.prepare("SELECT digest,bytes FROM legacy_sources WHERE path='.state/coordinator.json' AND kind='runtime'")?;
+        let mut rows=statement.query([])?;
+        if let Some(row)=rows.next()? {
+            if let Some(budget)=budget {budget.row(row,&[])?;}
+            Some((row.get::<_,String>(0)?,row.get::<_,Vec<u8>>(1)?))
+        }else{None}
+    };
     if let Some((digest,bytes))=&session {if format!("{:x}",Sha256::digest(bytes))!=*digest {return Err(StoreError::Corrupt("runtime session source hash mismatch".into()));}}
     let session_digest=session.map(|s|s.0);
-    let bindings=rows.map(|row|{
-        let(id,task,revision,source,payload,hash,digest,bytes)=row?;
+    let mut rows=stmt.query([])?;
+    let mut bindings=Vec::new();
+    while let Some(r)=rows.next()? {
+        if let Some(budget)=budget {budget.row(r,&[(4,2)])?;}
+        let(id,task,revision,source,payload,hash,digest,bytes)=(r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,u64>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,Option<Vec<u8>>>(7)?);
         if source.is_some() {
             let digest=digest.as_ref().ok_or_else(||StoreError::Corrupt("runtime source missing".into()))?;
             let bytes=bytes.as_ref().ok_or_else(||StoreError::Corrupt("runtime source bytes missing".into()))?;
@@ -64,8 +74,8 @@ pub(super) fn read_all(db:&Connection)->Result<Vec<RuntimeBinding>> {
             if binding.id!=expected_id {return Err(StoreError::Corrupt("canonical runtime identity mismatch".into()));}
             RuntimeRoute::from_identity(&binding.identity).validate().map_err(StoreError::Corrupt)?;
         }
-        Ok(binding)
-    }).collect::<Result<Vec<_>>>()?;
+        bindings.push(binding);
+    }
     let expected:u64=db.query_row("SELECT count(*) FROM legacy_sources WHERE kind='thread' OR (path='.state/coordinator.json' AND kind='runtime')",[],|r|r.get(0))?;
     if bindings.iter().filter(|b|b.source_path.is_some()).count() as u64!=expected {return Err(StoreError::Corrupt("runtime binding inventory mismatch".into()));}
     Ok(bindings)

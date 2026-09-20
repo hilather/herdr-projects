@@ -105,7 +105,7 @@ No force fallback, automatic merge/push or production data migration is introduc
 
 ## Next work
 
-[Task ledger](task-status.md): thirteen locally implemented cards, two partial, 26 not started.
+[Task ledger](task-status.md): 16 locally implemented cards, five partial, 20 not started.
 The user accepted Phase A with its documented testing gaps and authorized W03. Proposed memory change: record native transport v1, cooperative checkpoint,
 repair workflow and ADR 0002 decisions; no shared-memory promotion was performed.
 
@@ -2689,3 +2689,27 @@ passed in debug and release, including eight new accounting/helper and controlle
 snapshot regressions. Default-feature `cargo check` and `git diff --check` passed.
 Operation payload accounting charges both JSON tree construction passes; events
 charge one. Projection/nested-reader integration is the next step.
+
+
+### W04 snapshot projection accounting (partial)
+
+The controlled snapshot budget now also covers delivery ID enumeration and nested
+single-record lookup, inbox items, runtime bindings and joined provenance,
+coordinator provenance singleton lookup, observations, ownership, and project
+control. Actual returned values are charged before copying or decoding. Runtime
+payloads reserve two passes to cover route-validation string clones; delivery
+outcomes reserve two for JSON and typed decoding. Legacy APIs retain explicit
+unbudgeted wrappers. Scheduler, attempt inputs/cancellations, approvals, budget
+policies, routines and their nested reads still need accounting; full snapshot
+allocation coverage is not claimed.
+
+New controlled snapshot fixtures exercise oversized values returned through each
+projection, including separate coordinator and nested delivery lookups, and dense
+delivery JSON that exceeds the shared two-pass allowance before decoding.
+
+Independent review approved the six-reader increment. All 219 library tests passed
+in debug and release before the final joined-provenance fixture was added; the
+final focused 13 controlled-store tests passed in both profiles, including that
+fixture. Default-feature `cargo check` and `git diff --check` passed. Work stops at
+this reviewed checkpoint at the user's request; the next reader group is not
+started. The task ledger records the resumption point and unchanged card counts.
