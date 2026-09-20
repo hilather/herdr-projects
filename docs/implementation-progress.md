@@ -1998,3 +1998,48 @@ error-redaction regression. Logs: `/tmp/herdr-launch-{debug,release,default}.log
 `/tmp/herdr-launch-{debug,release}-final.log`, and `/tmp/herdr-launch-focused.log`.
 The final default-feature suite passed 405 tests (30 library, 355 binary, 18 CLI,
 two contracts). Three optional live checks remain ignored in every build mode.
+
+## W04 supervised coordinator priming
+
+Linux coordinator priming now enters the shared Control queue from the ticker.
+`open` and `open --reprime` leave the prompt pending for a concrete supervised
+worker instead of sending synchronously. Admission freezes the project inode,
+socket inode, coordinator execution/request, configuration and PROJECT.md digests,
+and exact prompt. The worker rechecks that authority, active lifecycle, bounded
+root ownership (including same-project threads and canonical neighbors), unique
+ready agent/kind, and pane/terminal identity before recording a durable claim.
+The JSON bridge must return a correlated typed acknowledgement naming the exact
+terminal and agent before confirmation clears the pending flag.
+
+Priming request numbers prevent mutable route/settings edits from authorizing
+another send. Lost acknowledgements recover to uncertainty and one durable inbox
+notice; explicit `open --reprime` advances the request and preserves old history
+until a replacement claim is durable. Pending priming defers inbox nudges and
+claimed priming cannot authorize automatic coordinator starts. Migration refuses
+unresolved prime claims. Strict coordinator reads and bounded writes preserve
+corrupt or oversized records rather than replacing them with defaults. Independent
+review found the read/write size mismatch; the corrected writer rejects growth
+past 16 MiB before replacing the old bytes, with a near-limit regression.
+
+Ten new worker/ingress fixtures cover confirmed once-only delivery, explicit
+reprime, lost/foreign/wrong-kind/wrong-terminal/wrong-request acknowledgements,
+busy/duplicate/unsupported observations, settings/config/socket changes,
+post-claim cancellation and request changes, reference conflicts, blocked worker
+cancellation with neighbor progress, forged queue success, and corrupt/oversized
+record preservation. A migration regression distinguishes null/confirmed history
+from pending/uncertain claims. The built CLI ticker runs confirmed/lost cases
+across restart, checking one send, durable recovery and no synchronous fallback.
+The separate review agent approved this scoped increment after the storage fix.
+
+The complete plan remains active: coordinator starts, inbox nudges/notifications,
+token workers, canonical launch/profile preparation, budgets/telemetry and wider
+authority tests remain before W05–W09. Counts stay 16 locally implemented, five
+partial and 20 not started. No macOS or real SSH-host acceptance is claimed.
+
+Full all-feature debug and release suites each passed 630 tests (175 library,
+415 binary, 38 CLI and two contracts), with three optional live checks ignored.
+Logs: `/tmp/herdr-coordinator-debug.log` and
+`/tmp/herdr-coordinator-release.log`.
+The default-feature suite passed 416 tests (30 library, 365 binary, 19 CLI,
+two contracts), with the same three live checks ignored. Log:
+`/tmp/herdr-coordinator-default.log`.

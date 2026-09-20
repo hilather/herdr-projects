@@ -183,6 +183,9 @@ pub struct Coordinator {
     pub agent_name: String,
     pub cwd: String,
     pub prime_pending: bool,
+    pub prime_request:u64,
+    pub prime_sequence:u64,
+    pub prime_claim:Option<herdr_projects::coordinator_prime::Claim>,
     pub launch_attempts: u32,
     pub updated: String,
 }
@@ -320,12 +323,18 @@ impl Project {
     /// Read-modify-write of `coordinator.json` under the lock: re-reads the
     /// file, lets `change` touch only the fields its step owns, writes.
     pub fn update_coordinator(&self, change: impl FnOnce(&mut Coordinator)) -> Result<Coordinator> {
-        let _lock = self.lock()?;
-        let mut record = self.coordinator().unwrap_or_default();
-        change(&mut record);
-        record.updated = now();
-        write_json(&self.state_dir().join("coordinator.json"), &record)?;
-        Ok(record)
+        self.update_coordinator_checked(|record|{change(record);Ok(())})
+    }
+    pub fn try_coordinator(&self)->Result<Option<Coordinator>> {
+        let text=crate::paths::read_control_text(&self.state_dir().join("coordinator.json"),16*1024*1024)?;
+        text.map(|text|serde_json::from_str(&text).context("invalid coordinator record")).transpose()
+    }
+    pub fn update_coordinator_checked(&self,change:impl FnOnce(&mut Coordinator)->Result<()>)->Result<Coordinator> {
+        let _lock=self.lock()?;let mut record=self.try_coordinator()?.unwrap_or_default();change(&mut record)?;
+        record.updated=now();let text=serde_json::to_string_pretty(&record)?+"\n";
+        anyhow::ensure!(text.len()<=16*1024*1024,"coordinator update exceeds record limit");
+        write_atomic(&self.state_dir().join("coordinator.json"),text.as_bytes())?;
+        std::fs::File::open(self.state_dir())?.sync_all()?;Ok(record)
     }
 
     pub fn safety(&self, config_dir: &Path) -> Result<Safety> {

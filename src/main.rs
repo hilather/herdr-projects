@@ -14,6 +14,7 @@ mod adopt;
 mod cli;
 mod cleanup;
 mod coordinator;
+mod coordinator_jobs;
 mod doctor;
 mod herdr;
 mod inbox;

@@ -93,7 +93,9 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     let socket = session.socket.to_string_lossy().into_owned();
 
     // A project belongs to the session it was opened in.
-    let mut previous = project.coordinator();
+    let history=project.try_coordinator()?;
+    if let Some(c)=&history {crate::coordinator_jobs::validate(c)?;}
+    let mut previous = history.clone();
     if let Some(record) = &previous
         && !record.socket.is_empty()
         && record.socket != socket
@@ -128,7 +130,9 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         let _ = herdr.agent_focus(&record.pane_id);
         report_tokens(&herdr, slug, &record.pane_id);
         if options.reprime {
-            deliver_or_defer(&project, &herdr, agent, &prompt)?;
+            if cfg!(target_os="linux") {
+                project.update_coordinator_checked(|c|{c.prime_request=c.prime_request.checked_add(1).filter(|n|*n<=i64::MAX as u64).context("prime requests exhausted")?;c.prime_pending=true;Ok(())})?;
+            }else{deliver_or_defer(&project, &herdr, agent, &prompt)?;}
         }
         ticker::start(ctx)?;
         println!("coordinator is running in pane {}", record.pane_id);
@@ -171,6 +175,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     // Ids are recorded before the agent is started, so a command killed midway
     // still leaves a record the ticker and a later `open` can act on.
     let name = agent_name(slug);
+    let prime_request=history.as_ref().map_or(0,|c|c.prime_request).checked_add(1).filter(|n|*n<=i64::MAX as u64).context("prime requests exhausted")?;
     let record = project.update_coordinator(|c| {
         *c = Coordinator {
             socket: socket.clone(),
@@ -181,13 +186,14 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             agent_name: name.clone(),
             cwd: cwd.clone(),
             prime_pending: true,
+            prime_request,prime_sequence:history.as_ref().map_or(0,|c|c.prime_sequence),prime_claim:history.as_ref().and_then(|c|c.prime_claim.clone()),
             launch_attempts: 1,
             updated: String::new(),
         }
     })?;
 
     match herdr.agent_start(&name, &settings.coordinator_agent, &record.pane_id, agent_args) {
-        Ok(agent) => deliver_or_defer(&project, &herdr, &agent, &prompt)?,
+        Ok(agent) => {if !cfg!(target_os="linux"){deliver_or_defer(&project, &herdr, &agent, &prompt)?;}},
         Err(error) => println!(
             "the coordinator agent is not ready yet ({error}). If it shows a dialog, answer it in pane {}; the ticker sends the priming prompt once it is ready.",
             record.pane_id

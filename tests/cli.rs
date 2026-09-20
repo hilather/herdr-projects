@@ -891,3 +891,44 @@ sys.exit(subprocess.call(sys.argv[-1],shell=True))
 }
 
 }
+
+#[test]
+#[cfg(target_os="linux")]
+fn ticker_coordinator_prime_confirms_or_recovers_once_across_restart() {
+    use std::{fs,time::{Duration,Instant},process::Stdio,os::unix::{fs::PermissionsExt,net::UnixListener}};
+    for outcome in ["confirmed","lost"] {
+        let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
+        assert!(hp(home.path(),&["--root",r,"new","demo"]).status.success());let project=root.join("demo");
+        let socket=home.path().join("session.sock");let _listener=UnixListener::bind(&socket).unwrap();
+        let record=project.join(".state/coordinator.json");
+        fs::write(&record,serde_json::json!({"socket":socket,"workspace_id":"w","tab_id":"tab","pane_id":"p","cwd":project,"agent_name":"coordinator","prime_pending":true,"prime_request":1}).to_string()).unwrap();
+        let a=serde_json::json!({"workspace_id":"w","tab_id":"tab","pane_id":"p","cwd":project,"name":"coordinator","agent":"claude","agent_status":"idle","terminal_id":"terminal"});
+        fs::write(home.path().join("agent.json"),a.to_string()).unwrap();fs::write(home.path().join("outcome"),outcome).unwrap();
+        let fake=home.path().join("herdr");fs::write(&fake,r#"#!/usr/bin/python3
+import os,json,sys,pathlib
+root=pathlib.Path(os.environ['HOME']);args=sys.argv[1:];a=json.loads((root/'agent.json').read_text())
+if args==['remote-api-bridge','--check']:print('herdr-api-bridge-v1')
+elif args==['remote-api-bridge']:
+ r=json.load(sys.stdin);assert r['method']=='agent.prompt';assert r['params']['target']=='p';assert ' context demo' in r['params']['text']
+ with open(root/'sent','a') as f:f.write('send')
+ if (root/'outcome').read_text()=='lost':sys.exit(1)
+ print(json.dumps({'id':r['id'],'result':{'type':'agent_prompted','agent':a}}))
+elif args==['agent','list']:print(json.dumps({'result':{'agents':[a]}}))
+elif args==['pane','list']:
+ with open(root/'polls','a') as f:f.write('poll')
+ print(json.dumps({'result':{'panes':[a]}}))
+elif args[:2] in [['agent','prompt'],['agent','start']]:
+ (root/'WRONG_SYNC_EFFECT').touch();sys.exit(2)
+else:print('{"result":{"shown":true}}')
+"#).unwrap();fs::set_permissions(&fake,fs::Permissions::from_mode(0o700)).unwrap();
+        struct Child(std::process::Child);impl Drop for Child {fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+        let spawn=||Child(Command::new(BIN).env_clear().env("HOME",home.path()).env("PATH","/usr/bin:/bin").env("HERDR_BIN_PATH",&fake).args(["--root",r,"ticker","run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+        let read=||->serde_json::Value{serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap()};
+        let wait=|child:&mut Child,predicate:&dyn Fn()->bool|{let end=Instant::now()+Duration::from_secs(30);while !predicate(){assert!(child.0.try_wait().unwrap().is_none());assert!(Instant::now()<end,"{}",fs::read_to_string(root.join(".ticker.log")).unwrap_or_default());std::thread::sleep(Duration::from_millis(10));}};
+        let stop=|child:&mut Child|{fs::write(root.join(".ticker.stop"),b"").unwrap();let end=Instant::now()+Duration::from_secs(8);while child.0.try_wait().unwrap().is_none(){assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(10));}fs::remove_file(root.join(".ticker.stop")).unwrap();};
+        let mut child=spawn();wait(&mut child,&||home.path().join("sent").exists()&&read()["prime_claim"]["delivery"]["phase"].as_str()==Some(if outcome=="confirmed"{"confirmed"}else{"pending"}));stop(&mut child);
+        let polls=fs::read(home.path().join("polls")).unwrap().len();let mut child=spawn();wait(&mut child,&||fs::read(home.path().join("polls")).unwrap().len()>polls&&read()["prime_claim"]["delivery"]["notified"].as_bool()==Some(true));stop(&mut child);
+        assert!(!home.path().join("WRONG_SYNC_EFFECT").exists());assert_eq!(fs::read(home.path().join("sent")).unwrap(),b"send");assert_eq!(read()["prime_sequence"],1);assert_eq!(read()["prime_pending"],outcome=="lost");
+        if outcome=="lost" {assert_eq!(read()["prime_claim"]["delivery"]["phase"],"uncertain");assert_eq!(fs::read_dir(project.join("inbox")).unwrap().filter_map(Result::ok).filter(|e|e.file_name().to_string_lossy().starts_with("coordinator-prime-")).count(),1);}
+    }
+}

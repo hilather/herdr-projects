@@ -35,3 +35,4 @@ pub mod schedule;
 
 pub mod prompt_claim;
 pub mod launch_claim;
+pub mod coordinator_prime;

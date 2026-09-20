@@ -5,7 +5,7 @@ use serde::{Serialize,Deserialize};
 use crate::{executor::{Identity,Lane,Request},paths::{self,Ctx},project::{self,Project},runner::{Cmd,Output,Runner,InheritedLock},source_tree::Control,thread::{self,Thread}};
 use herdr_projects::execution_guard::ProjectGuard;
 #[path="brief_jobs_ownership.rs"]
-mod ownership;
+pub(crate) mod ownership;
 #[path="launch_jobs.rs"]
 mod launch;
 const JOB:&str="\0herdr-projects-brief";

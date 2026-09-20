@@ -264,6 +264,7 @@ pub fn run(ctx: &Ctx) -> Result<()> {
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::copy_jobs::JobRunner{inner:runner});
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::legacy_routine_jobs::JobRunner{inner:runner});
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::brief_jobs::JobRunner{inner:runner});
+    let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::coordinator_jobs::JobRunner{inner:runner});
     let executor=std::sync::Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),runner)?);
     #[cfg(feature="state-store")]
     {memory.routine_jobs=Some(crate::routine_jobs::Queue::new(executor.clone()));}
@@ -321,6 +322,14 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         if let Some(queue)=memory.copy_jobs.as_mut() {
             // Recovery is independent of source/session reachability. The worker
             // re-resolves remote routing and checks retained authority itself.
+            let recovered=(||->Result<()> {
+                if project.try_coordinator()?.is_some_and(|c|c.prime_claim.as_ref().is_some_and(|claim|claim.delivery.phase==herdr_projects::prompt_claim::Phase::Pending||!claim.delivery.notified)) {
+                    let guard=herdr_projects::execution_guard::ProjectGuard::acquire(&project.dir())?;
+                    crate::coordinator_jobs::recover(&project,&guard)?;
+                }
+                Ok(())
+            })();
+            if let Err(error)=recovered {log.line(&format!("{slug}: coordinator prime recovery: {error:#}"));continue;}
             let (threads,diagnostics)=thread::list_with_diagnostics(&project);
             for error in diagnostics {log.line(&format!("{slug}: {error}"));}
             if threads.iter().any(|t|t.launch_claim.as_ref().is_some_and(|claim|claim.phase==thread::launch_delivery::Phase::Pending||!claim.notified)) {
@@ -587,7 +596,7 @@ fn tick_cheap_reports(ctx: &Ctx, project: &Project,mut reads:Option<&mut crate::
     status_observation::deliver(project)?;
     thread::copy_delivery::deliver(project)?;
     thread::review_delivery::deliver(project)?;
-    let Some(record) = project.coordinator() else {
+    let Some(record) = project.try_coordinator()? else {
         return Ok(None);
     };
     if record.socket.is_empty() || !Path::new(&record.socket).exists() {
@@ -620,7 +629,10 @@ fn tick_cheap_reports(ctx: &Ctx, project: &Project,mut reads:Option<&mut crate::
     // The coordinator: deliver a pending priming prompt, refresh its tokens.
     let agent = agents.iter().find(|a| coordinator::agent_matches(&record, a));
     if let Some(agent) = agent {
-        if record.prime_pending && agent.ready() {
+        if crate::coordinator_jobs::ready(&record).is_ok() && agent.ready() {
+            if let Some(queue)=copies.as_deref_mut() {
+                first_error=queue.offer_coordinator_prime(ctx,project,&record).err();
+            } else {
             let prefix = coordinator::current_prefix(&ctx.root)?;
             match herdr.agent_prompt(&record.pane_id, &coordinator::priming_prompt(&prefix, slug)) {
                 Ok(()) => {
@@ -628,6 +640,7 @@ fn tick_cheap_reports(ctx: &Ctx, project: &Project,mut reads:Option<&mut crate::
                 }
                 Err(error) => first_error = Some(anyhow::anyhow!("priming prompt: {error}")),
             }
+        }
         }
         coordinator::report_tokens(&herdr, slug, &record.pane_id);
     }
@@ -662,7 +675,8 @@ fn tick_cheap_reports(ctx: &Ctx, project: &Project,mut reads:Option<&mut crate::
     let mut notification_error = None;
     if let Ok((settings, _)) = project.read_project_md() {
         let before = state.clone();
-        let ready_pane = agent.filter(|a| a.ready()).map(|_| record.pane_id.as_str());
+        let primed=project.try_coordinator()?.is_some_and(|c|!c.prime_pending);
+        let ready_pane = agent.filter(|a| a.ready()&&primed).map(|_| record.pane_id.as_str());
         if let Err(error) = steps::nudge(project, &mut state, &settings, &herdr, ready_pane) {
             notification_error = Some(format!("nudge: {error:#}"));
         }
@@ -764,7 +778,7 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     let mut deferred=std::collections::BTreeSet::new();
     let mut observed=std::collections::BTreeSet::new();
 
-    if let Some(record) = project.coordinator().filter(|c| c.prime_pending) {
+    if let Some(record) = project.coordinator().filter(|c| crate::coordinator_jobs::ready(c).is_ok()) {
         let pane_alive = seen.panes.iter().any(|p| coordinator::pane_matches(&record, p));
         let pane_has_agent = seen.agents.iter().any(|a| a.pane_id == record.pane_id);
         if pane_alive && !pane_has_agent && record.launch_attempts < MAX_LAUNCH_ATTEMPTS {

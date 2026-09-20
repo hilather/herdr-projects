@@ -389,6 +389,13 @@ fn validate_runtime(path:&str,value:&serde_json::Value)->Result<()> {
         ".state/project.json"=>ensure!(value.is_object(),"invalid lifecycle record"),
         ".state/coordinator.json"=>{
             ensure!(value.is_object(),"invalid coordinator");
+            let request=value.get("prime_request").map(|v|v.as_u64().context("invalid coordinator prime request")).transpose()?.unwrap_or(0);
+            let sequence=value.get("prime_sequence").map(|v|v.as_u64().context("invalid coordinator prime sequence")).transpose()?.unwrap_or(0);
+            ensure!(request<=i64::MAX as u64&&sequence<=i64::MAX as u64,"coordinator prime counter exhausted");
+            if let Some(claim)=value.get("prime_claim").filter(|v|!v.is_null()) {
+                let claim:crate::coordinator_prime::Claim=serde_json::from_value(claim.clone())?;claim.validate(sequence,request)?;
+                ensure!(claim.delivery.phase==crate::prompt_claim::Phase::Confirmed,"uncertain or pending coordinator prime requires reconciliation before migration");
+            }
             for field in ["socket","session","workspace_id","tab_id","pane_id","agent_name","cwd","updated"] { if let Some(v)=value.get(field) { ensure!(v.is_string(),"invalid coordinator string field"); } }
             if let Some(v)=value.get("prime_pending") { ensure!(v.is_boolean(),"invalid prime_pending"); }
             if let Some(v)=value.get("launch_attempts") { ensure!(v.as_u64().is_some_and(|n|n<=u32::MAX as u64),"invalid launch_attempts"); }

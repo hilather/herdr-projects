@@ -26,7 +26,11 @@ impl Inventory<'_> {
         }Ok(())
     }
 }
-pub fn check(project:&Project,t:&Thread,socket:&Path,control:&Control)->Result<()> {
+pub fn check_coordinator(project:&Project,pane:&str,socket:&Path,control:&Control)->Result<()> {
+    inventory(project,&Thread{pane_id:pane.into(),..Default::default()},socket,control,true)
+}
+pub fn check(project:&Project,t:&Thread,socket:&Path,control:&Control)->Result<()> {inventory(project,t,socket,control,false)}
+fn inventory(project:&Project,t:&Thread,socket:&Path,control:&Control,coordinator_target:bool)->Result<()> {
     let bounded=Control{deadline:control.deadline.min(std::time::Instant::now()+std::time::Duration::from_secs(10)),cancellation:control.cancellation.clone()};let control=&bounded;
     let mut scan=Inventory{control,bytes:0,records:0,socket:socket.canonicalize()?,pane:&t.pane_id,remote:t.is_remote()};
     let current=project.dir().canonicalize()?;
@@ -53,13 +57,13 @@ pub fn check(project:&Project,t:&Thread,socket:&Path,control:&Control)->Result<(
         }
         let coordinator=scan.read(&dir.join(".state/coordinator.json"))?.map(|text|serde_json::from_str::<Coordinator>(&text)).transpose()?;
         let socket=coordinator.as_ref().map(|c|c.socket.as_str()).unwrap_or("");
-        if let Some(c)=&coordinator {scan.check("",socket,&c.pane_id)?;}
+        if let Some(c)=&coordinator {if !coordinator_target||dir!=current {scan.check("",socket,&c.pane_id)?;}}
         ensure!(fs::symlink_metadata(dir.join("threads"))?.is_dir(),"terminal thread inventory is aliased");
         for (n,entry) in fs::read_dir(dir.join("threads"))?.enumerate() {
             control.check()?;ensure!(n<256,"terminal thread inventory exceeds 256 entries");let path=entry?.path();if path.extension().is_none_or(|s|s!="toml"){continue;}
             let text=scan.read(&path)?.context("terminal reference disappeared")?;let record:Thread=toml::from_str(&text)?;thread::validate_id(&record.id)?;
             ensure!(path.file_stem().and_then(|s|s.to_str())==Some(&record.id),"terminal reference filename mismatch");
-            if dir==current&&record.id==t.id {continue;}
+            if !coordinator_target&&dir==current&&record.id==t.id {continue;}
             scan.check(&record.machine,socket,&record.pane_id)?;
         }
     }
