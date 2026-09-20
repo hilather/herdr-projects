@@ -31,7 +31,6 @@ pub const CAPTURE_LIMIT: usize = 1024 * 1024;
 pub struct InheritedLock(Arc<std::fs::File>);
 impl PartialEq for InheritedLock {fn eq(&self,other:&Self)->bool {Arc::ptr_eq(&self.0,&other.0)}}
 impl InheritedLock {
-    #[cfg(feature="state-store")]
     pub(crate) fn new(file:std::fs::File)->Self {Self(Arc::new(file))}
 }
 

@@ -202,3 +202,32 @@ complete-batch application, changed thread/config cancellation, unavailable tran
 without false pane closure, and FIFO/oversize refusal. T04.2 remains partial until
 transfers and remaining guarded effects have equivalent isolation. Signed routines
 now use the same pool with guarded admission and supervision described in [routines](routines.md).
+
+## Transfer supervision prerequisite
+
+A shared Linux execution service now provides surviving supervision for the fixed
+commands used by future asynchronous copies. It preserves literal argv/stdin and
+bounded binary output sinks, and retains the root/project lock descriptions plus the
+historical `.routine-execution.lock` through a fixed unshare/PID1/timeout supervisor.
+Target programs may close their own inherited descriptors without releasing the
+supervisor's ownership. An abruptly killed caller therefore cannot release exclusion
+while a local transfer descendant remains alive.
+
+The service constructs timeouts only at worker execution ingress. The living collector
+honors the original absolute queue deadline and cancellation. The surviving helper
+has a relative timeout from its own startup; this does not claim an absolute orphan
+deadline across arbitrary OS scheduling/bootstrap delays. Five seconds of the remaining
+budget are reserved for cleanup. Nonzero command exits normalize to 200, so callers
+must not depend on vendor-specific exit codes or treat output as a durable receipt.
+
+Bootstrap always clears the environment, restoring only bounded HOME/USER/LOGNAME,
+PATH, locale/TZ/TMPDIR, SSH_AUTH_SOCK/SSH_AGENT_PID and XDG directory settings. Unknown
+inherited variables are omitted; unsupported explicit settings refuse before effects,
+without exposing their names or values. Loader/shell-startup overrides are excluded.
+Environment values stay in the environment, not command arguments or task briefs.
+The installed OS helpers and cooperative same-user boundary remain trusted.
+
+This service is tested but not yet connected to ticker copy publication. Integration
+still needs bounded source traversal, stale execution/route fencing, durable partial
+copy notes, retry preservation after library failure, and root admission fairness
+between copy and routine jobs. Existing copy paths remain synchronous in this increment.

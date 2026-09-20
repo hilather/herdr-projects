@@ -70,22 +70,7 @@ pub(super) fn preflight(script:&[u8],deadline_ms:u64,cap:u32)->Result<()> {
     // Fixed system helpers, not PATH resolution or project-provided wrappers.
     // The OS installation is trusted; pinning every linked library is outside
     // the signed script-byte contract.
-    for path in ["/usr/bin/unshare", "/usr/bin/timeout", "/bin/sh"] { trusted_helper(Path::new(path))?; }
-    Ok(())
-}
-
-fn trusted_helper(path:&Path)->Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata=std::fs::metadata(path)?;
-    // In an outer user namespace the host root uid may be unmapped. Compare
-    // with the trusted system root's mapped owner, not namespace uid zero
-    // (which can represent the unprivileged caller).
-    // Unmapped owners can share an overflow uid: this is a sanity check on
-    // fixed trusted system paths, not an independent host-root attestation.
-    let system_owner=std::fs::metadata("/")?.uid();
-    ensure!(metadata.is_file() && metadata.uid()==system_owner && metadata.mode()&0o022==0
-        && metadata.mode()&0o111!=0,"routine helper must have trusted system ownership and executable file mode");
-    Ok(())
+    crate::supervision::trusted_helpers()
 }
 
 #[cfg(all(test,target_os="linux"))]

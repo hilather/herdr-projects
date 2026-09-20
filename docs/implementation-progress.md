@@ -1131,3 +1131,33 @@ Independent review approved the fairness and crash corrections. All 465 tests pa
 debug and release (156 library, 277 binary, 30 CLI, two contracts); the default-feature
 suite also passes. Three optional live checks remain ignored. Logs:
 `/tmp/herdr-routine-admission-{debug,release,default}.log`.
+
+## W04 surviving transfer supervision
+
+Independent design review identified that inherited locks alone were insufficient for
+copies: arbitrary SSH/rsync tools may close those descriptors, and a killed caller can
+no longer enforce RealRunner's deadline. The new supervision service retains ownership
+in fixed trusted namespace/timeout processes outside the target executable. The shared
+ProjectGuard API supplies root, project and root-transfer lock descriptions; routine
+execution reuses that API without changing its signed-script environment or receipts.
+
+The immediate execution API preserves literal argv/stdin and binary output sinks,
+uses the earlier absolute deadline while the caller lives, and gives surviving helpers
+a bounded relative timeout. It reserves five seconds for cleanup and normalizes failed
+commands to exit 200. Review also required a clean restricted bootstrap environment;
+loader and shell-startup settings never reach supervision, unsupported explicit
+settings fail without name/value diagnostics, and allowed values have byte limits.
+
+Six focused fixtures cover literal metacharacters, binary output, environment policy,
+normal failures/capture caps, deadlines/cancellation, and real owner SIGKILL while a
+target closes all non-stdio descriptors and starts a detached child. The latter proves
+root/project/transfer exclusion persists until bounded cleanup and delayed descendant
+effects do not occur. Independent review approved the corrected prerequisite.
+
+Copy publication is not wired to the service yet. Bounded source handling, durable
+partial-copy obligations and shared copy/routine admission remain the next work.
+Counts remain 16 implemented, five partial and 20 not started; macOS is unavailable.
+
+All 471 tests pass in debug and release (162 library, 277 binary, 30 CLI, two
+contracts), and the default-feature suite passes. Three optional live checks remain
+ignored. Logs: `/tmp/herdr-transfer-supervision-{debug,release,default}.log`.

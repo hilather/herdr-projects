@@ -31,18 +31,23 @@ impl RootGuard {
 
 /// Excludes effects within one project while preserving the root-wide barrier.
 /// Never acquire an exclusive root guard while retaining this shared guard.
-pub struct ProjectGuard {_project:File,_root:RootGuard}
+pub struct ProjectGuard {_project:File,_root:RootGuard,root:std::path::PathBuf}
 impl ProjectGuard {
-    #[cfg(feature="state-store")]
-    pub(crate) fn inherit(&self)->Result<Vec<crate::runner::InheritedLock>> {
-        Ok(vec![crate::runner::InheritedLock::new(self._root._file.try_clone()?),crate::runner::InheritedLock::new(self._project.try_clone()?)])
+    /// A trusted transfer supervisor keeps these descriptions open until its
+    /// descendants finish, even if the caller dies. Retain the returned handles
+    /// in the caller through publication. The historical lock name also fences
+    /// routine jobs, including those surviving a previous ticker instance.
+    pub fn inherit_transfer(&self)->Result<Vec<crate::runner::InheritedLock>> {
+        Ok(vec![crate::runner::InheritedLock::new(self._root._file.try_clone()?),crate::runner::InheritedLock::new(self._project.try_clone()?),
+            crate::runner::InheritedLock::new(exclusive_file(&self.root.join(".routine-execution.lock"))?)])
     }
     pub fn acquire(project:&Path)->Result<Self> {
         let project=project.canonicalize()?;
-        let root=RootGuard::shared(project.parent().context("project has no root")?)?;
+        let root_path=project.parent().context("project has no root")?.to_path_buf();
+        let root=RootGuard::shared(&root_path)?;
         ensure!(std::fs::symlink_metadata(project.join(".state"))?.is_dir(),"project state must be a real directory");
         let file=exclusive_file(&project.join(".state/effect.lock"))?;
-        Ok(Self{_project:file,_root:root})
+        Ok(Self{_project:file,_root:root,root:root_path})
     }
 }
 
