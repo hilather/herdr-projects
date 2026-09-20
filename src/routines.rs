@@ -43,10 +43,11 @@ fn execute_owned(project:&Path,operation:&crate::domain::OperationId,expected_he
     execution::preflight(&script,definition.deadline_ms,definition.output_cap_bytes)?;
     ensure!(!cancellation.is_cancelled(),"routine cancelled before claim");
     ensure!(deadline.is_none_or(|end|end.saturating_duration_since(std::time::Instant::now())>=std::time::Duration::from_millis(definition.deadline_ms+7_000)),"insufficient routine execution and cleanup budget after queueing");
+    let inherited_locks=_guard.inherit_routine_execution(project)?;
     let now=jiff::Timestamp::now().as_millisecond();
     let claim=db.claim_operation(operation,delivery.revision,"routine-linux-namespace-v1",now,definition.deadline_ms as i64+30_000)?;
     db.validate_claim(&claim,jiff::Timestamp::now().as_millisecond())?;
-    let completion=execution::run_until(&script,Path::new(&definition.cwd),definition.deadline_ms,definition.output_cap_bytes,cancellation,deadline);
+    let completion=execution::run_until(&script,Path::new(&definition.cwd),definition.deadline_ms,definition.output_cap_bytes,cancellation,deadline,inherited_locks.clone());
     let (output,cleanup_verified,succeeded)=match completion {
         Ok(c)=>(c.output,c.cleanup_verified,c.succeeded),
         // An I/O error after spawn cannot certify cleanup. Diagnostics never

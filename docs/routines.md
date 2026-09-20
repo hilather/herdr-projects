@@ -2,8 +2,8 @@
 
 Schema 16 adds signed routine revisions and durable scheduling decisions. The
 `routine-store` commands require the `state-store` feature and a migrated project.
-Explicit `execute` dispatch is available on Linux; automatic ticker dispatch is
-pending. Legacy `routine` commands retain their behavior; their
+Explicit `execute` and automatic ticker dispatch are available on Linux.
+Legacy `routine` commands retain their behavior; their
 approvals and last-run state are not automatically migrated.
 
 The owner signs a complete definition using the migration-pinned key described in
@@ -83,8 +83,8 @@ files are not an exhaustively pinned dependency bundle.
 Execution retains a shared root barrier plus exclusive project effect/record ownership
 from claim through receipt commit. Another canonical project's guarded status refresh
 and task edits can proceed, while this project's mutations and root-exclusive
-maintenance/effect adapters remain excluded. It is not called from the ticker scan.
-It runs the exact verified script
+maintenance/effect adapters remain excluded. The ticker runs this service in a
+transfer worker. It runs the exact verified script
 bytes through stdin, without reopening the script pathname after checking its hash.
 Configuration, routine revision, project control and the claim are rechecked before
 entry. A routine can be claimed only once, including after generic retry advice.
@@ -105,6 +105,17 @@ execution; it does not distinguish deadline expiry from an ordinary script error
 These contracts follow [util-linux's wait behavior](https://raw.githubusercontent.com/util-linux/util-linux/v2.42.3/sys-utils/unshare.c)
 and [Linux PID namespace teardown](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html).
 
+The trusted supervisor inherits the shared root barrier, exclusive project lock and
+exclusive root routine lock. Descriptors stay close-on-exec in the parent; only the
+routine child receives inheritable duplicates. These [open-file-description locks](https://man7.org/linux/man-pages/man2/flock.2.html)
+remain owned if the ticker or explicit CLI process is killed, until the surviving
+supervisor and namespace processes close them during cleanup. A restarted pool cannot
+run another routine, and root-exclusive effects remain excluded during that interval.
+The original caller also retains ownership through receipt commit. Abrupt owner death
+still cannot produce a cleanup receipt: that occurrence remains non-replayable even
+after physical exclusion ends. The same-user bypass limitation includes deliberately
+unlocking inherited descriptors or tampering with trusted supervision.
+
 The receipt, delivery outcome and an output inbox item commit in one transaction.
 Schema 16's existing event log stores a digest-bound `routine.completed` event; no
 schema migration is necessary. Inspection exposes typed receipts, including capped
@@ -124,11 +135,13 @@ Enabled routines keep the ticker alive between due instants even without a herdr
 session. Paused or unreconciled projects do not schedule. Restart retains the durable
 cursor and cannot duplicate the same occurrence.
 
-Automatic command dispatch and asynchronous ownership remain integration work.
 The same-OS-user bypass limitation still applies.
 
-The executor bridge is implemented and tested, but is not yet admitted by the
-ticker. Jobs use the shared transfer lane with one routine per root. They carry
+The ticker admits jobs through the shared transfer lane, with at most one outstanding
+automatic routine per root. Admission follows the full legacy/canonical project pass,
+so exclusive notification, finalization and legacy effects receive an opportunity
+between routines. A ticket completing mid-pass remains retained until the next pass.
+Jobs carry
 operation/delivery identity and an absolute 95-second queue/execution budget.
 The service revalidates authority at worker entry and requires the signed duration
 plus seven seconds of execution/cleanup/commit allowance before claiming. Unrelated
@@ -145,4 +158,10 @@ ownership. This fallback sends no prompts or terminal metadata and uses only exi
 copy receipts. Transition notices are committed with the observed group and replayed
 idempotently, including after execution replacement; migration preserves pending
 notices. Session-wide loss and terminal effects remain in the exclusive pass.
-Automatic queue admission is the next integration step.
+Admission retains at most 128 project tickets/cursors. Project rotation advances only
+when a ticket is accepted, independently of ticker cadence. Failures delay another admission
+for that project by 30 seconds, then rotate to the next eligible operation independently
+of ticker cadence. Paused/unreconciled projects cannot admit; only pending, never-claimed
+operations qualify. Store ingress rechecks current authority before claiming. Stopping
+the ticker cancels and drains the same executor used for observations. Restart rebuilds
+eligibility from durable state; lost tickets never authorize replay.

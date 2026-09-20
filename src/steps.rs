@@ -129,6 +129,8 @@ pub struct Memory {
     pub machines: BTreeMap<MachineKey, MachineMemory>,
     pub pr_reads: Option<crate::pr_polling::Reads>,
     pub remote_reads:Option<crate::remote_polling::Reads>,
+    #[cfg(feature="state-store")]
+    pub routine_jobs:Option<crate::routine_jobs::Queue>,
     #[cfg(test)]
     clock: Option<Instant>,
 }
@@ -143,6 +145,8 @@ impl Memory {
             machines: BTreeMap::new(),
             pr_reads: None,
             remote_reads: None,
+            #[cfg(feature="state-store")]
+            routine_jobs: None,
             #[cfg(test)]
             clock: None,
         }

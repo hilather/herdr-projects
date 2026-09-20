@@ -203,6 +203,13 @@ fn load(project:&Path)->Result<Journal> {
 }
 pub(crate) struct Maintenance { _locks:Vec<File>,_project:Option<crate::execution_guard::ProjectGuard>,_root:Option<crate::execution_guard::RootGuard> }
 impl Maintenance {
+    pub(crate) fn inherit_routine_execution(&self,project:&Path)->Result<Vec<crate::runner::InheritedLock>> {
+        let mut locks=self._project.as_ref().context("runtime project ownership required")?.inherit()?;
+        let project=project.canonicalize()?;
+        let root=project.parent().context("routine project has no root")?;
+        locks.push(crate::runner::InheritedLock::new(crate::execution_guard::exclusive_file(&root.join(".routine-execution.lock"))?));
+        Ok(locks)
+    }
     fn runtime(project:&Path)->Result<Self> {
         let guard=crate::execution_guard::ProjectGuard::acquire(project)?;
         let record=crate::execution_guard::exclusive_file(&project.join(".state/lock"))?;

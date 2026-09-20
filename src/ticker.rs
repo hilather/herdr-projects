@@ -258,19 +258,24 @@ pub fn run(ctx: &Ctx) -> Result<()> {
     log.line(&format!("ticker {} started (pid {})", info.version, info.pid));
     let mut last_reachable = Instant::now();
     let mut memory = Memory::new(ctx);
-    let executor=std::sync::Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),std::sync::Arc::new(crate::remote_polling::ProbeRunner{inner:std::sync::Arc::new(crate::runner::RealRunner)}))?);
+    let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::remote_polling::ProbeRunner{inner:std::sync::Arc::new(crate::runner::RealRunner)});
+    #[cfg(feature="state-store")]
+    let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::routine_jobs::JobRunner{inner:runner});
+    let executor=std::sync::Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),runner)?);
+    #[cfg(feature="state-store")]
+    {memory.routine_jobs=Some(crate::routine_jobs::Queue::new(executor.clone()));}
     memory.pr_reads=Some(crate::pr_polling::Reads::with_executor(executor.clone()));
     memory.remote_reads=Some(crate::remote_polling::Reads::new(executor));
     loop {
         if stop_path(root).exists() {
-            log.line("stop file found; draining observation reads");
+            log.line("stop file found; cancelling and draining shared executor");
             return memory.pr_reads.as_mut().expect("ticker shared executor").stop();
         }
         let wake = Instant::now() + TICK;
         if tick(ctx, &log, &mut memory) {
             last_reachable = Instant::now();
         } else if last_reachable.elapsed() > IDLE_EXIT {
-            log.line("no reachable session or enabled canonical routine for five minutes; draining observation reads");
+            log.line("no reachable session or enabled canonical routine for five minutes; draining shared executor");
             return memory.pr_reads.as_mut().expect("ticker shared executor").stop();
         }
         // Sleep in short slices so a stop request is honoured promptly.
@@ -290,6 +295,8 @@ pub fn run(ctx: &Ctx) -> Result<()> {
 /// others.
 pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     memory.tick += 1;
+    #[cfg(feature="state-store")]
+    if let Some(queue)=memory.routine_jobs.as_mut() {for error in queue.drain(){log.line(&error);}}
     let mut reachable = Vec::new();
     #[cfg(feature="state-store")]
     let mut canonical = Vec::new();
@@ -324,12 +331,18 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     {
         let mut any_reachable=any_reachable;
         if !canonical.is_empty() {let first=(memory.tick.saturating_sub(1)%canonical.len() as u64) as usize;canonical.rotate_left(first);}
-        for slug in canonical {
+        for slug in &canonical {
             match crate::canonical_controller::poll(ctx,&ctx.root.join(&slug),memory.tick.saturating_sub(1)) {
                 Ok(result)=>{any_reachable|=result.reachable||result.scheduled_work;if let Some(error)=result.operation_error {log.line(&format!("{slug}: canonical operation: {error}"));}},
                 Err(error)=>log.line(&format!("{slug}: canonical controller: {error:#}")),
             }
         }
+        // Only after every project had an effect opportunity. Completion is
+        // drained at tick entry, so a mid-pass finish cannot chain another job.
+        if let Some(queue)=memory.routine_jobs.as_mut() {
+            for error in queue.admit_projects(canonical.into_iter().map(|slug|ctx.root.join(slug))) {log.line(&error);}
+        }
+        any_reachable|=memory.routine_jobs.as_ref().is_some_and(|q|q.pending());
         return any_reachable;
     }
     #[cfg(not(feature="state-store"))]

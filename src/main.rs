@@ -1,7 +1,6 @@
 #[cfg(feature="state-store")]
 mod canonical_controller;
 #[cfg(feature="state-store")]
-#[allow(dead_code)] // Ticker ownership/dispatch integration follows the queue bridge.
 mod routine_jobs;
 mod actions;
 mod agents;

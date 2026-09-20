@@ -51,14 +51,15 @@ Atomic reservations and immutable inputs now have a sealed internal API, and can
 has an audited CLI. Production launch preparation/dispatch and termination remain
 unavailable. T04.2 now uses monotonic remote poll/retry deadlines and pass-start
 scheduling plus a shared bounded executor for asynchronous PR and remote observations;
-routine/artifact work and guarded effects still need isolation. T04.3 now fences legacy
+automatic routines now share that executor. Artifact work and remaining guarded
+effects still need isolation. T04.3 now fences legacy
 launch arguments by explicit agent kind and provides redacted [named profile inspection](profiles.md);
 explicit local version probes for Claude/Codex are available. Launch selection,
 production profile resolution and verified capability evidence remain. Version-2
 reservation inputs now retain and validate frozen profile evidence; historical
 version-1 records remain readable. Explicit routine execution now has durable
-occurrence, authority and cleanup contracts; asynchronous ownership/ticker dispatch
-remains. Next are bounded command execution, kind-bound worker profiles
+occurrence, authority and cleanup contracts; automatic ticker dispatch now uses
+the shared bounded executor with project ownership and an effect opportunity between runs. Next are bounded command execution, kind-bound worker profiles
 (T04.3), budgets/routines/telemetry (T04.4) and operation-scoped authority (T04.5).
 T04.5 now has an [approval scope contract](authority.md) binding exact launch inputs
 without circular hashes, durable grants/revocations and atomic one-time launch-claim
@@ -66,7 +67,7 @@ consumption. Owner-signature import now uses the migration-pinned public-key con
 policy-change ingress, denial audit and other command-path coverage remain.
 T04.4 now provides [signed durable admission budgets](budgets.md): lifetime attempt
 limits, explicit unknown-provider-usage policy and reservation/claim/pre-effect
-checks. Native usage, estimates, running limits, automatic routine dispatch and wider telemetry
+checks. Native usage, estimates, running limits and wider telemetry
 remain. Budget changes are the first signed policy-change ingress; other policy
 classes remain incomplete.
 The outbox now supports project-scoped routine records fenced by control revision,
@@ -76,13 +77,14 @@ recording](routines.md), with atomic cursor/outbox writes and missed/overlap dec
 Explicit Linux execution now records typed cleanup receipts and output inbox items
 atomically, releasing overlap only after verified namespace cleanup. The ticker now
 records due occurrences in rotating bounded turns, preserving routine-only liveness
-and isolating invalid scripts. Automatic dispatch and asynchronous command ownership
-remain unavailable. The routine queue bridge now validates operation revisions,
+and isolating invalid scripts. Automatic Linux dispatch now validates operation revisions,
 absolute deadlines and cancellation at worker entry and commits through the trusted
 execution service. Shared root/project ownership now permits unrelated canonical status
 and task mutations while excluding same-project work and root-exclusive maintenance.
-Legacy status/effect separation remains before ticker admission; available control
-workers alone do not prove all unrelated guarded status can progress.
+Legacy status has an observation-only fallback with durable transition notices.
+Routine supervision inherits execution locks so abrupt ticker death cannot release
+exclusion before namespace cleanup. Admission advances project fairness independently
+of ticker cadence and gives exclusive effects a full pass between routine jobs.
 The [scheduler/executor/profile interfaces](adr/0004-w04-scheduling-contract.md) are frozen. Existing retained/adopted attempts
 must count toward the cap; no uncertain worker may be replaced to free a slot.
 

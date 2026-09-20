@@ -200,4 +200,5 @@ Fallback SSH config is read only when machine listing did not resolve the target
 Fixtures cover a held remote probe alongside a persisted local status update,
 complete-batch application, changed thread/config cancellation, unavailable transport
 without false pane closure, and FIFO/oversize refusal. T04.2 remains partial until
-routines, transfers and remaining guarded effects have equivalent isolation.
+transfers and remaining guarded effects have equivalent isolation. Signed routines
+now use the same pool with guarded admission and supervision described in [routines](routines.md).

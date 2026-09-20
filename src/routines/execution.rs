@@ -26,16 +26,17 @@ pub(super) struct Completion {
 fn run(script: &[u8], cwd: &Path, deadline_ms: u64, cap: u32,
     cancellation: Cancellation) -> Result<Completion>
 {
-    run_until(script,cwd,deadline_ms,cap,cancellation,None)
+    run_until(script,cwd,deadline_ms,cap,cancellation,None,Vec::new())
 }
 
 pub(super) fn run_until(script:&[u8],cwd:&Path,deadline_ms:u64,cap:u32,cancellation:Cancellation,
-    deadline:Option<std::time::Instant>)->Result<Completion>
+    deadline:Option<std::time::Instant>,inherited_locks:Vec<crate::runner::InheritedLock>)->Result<Completion>
 {
     preflight(script,deadline_ms,cap)?;
     let script=std::str::from_utf8(script).map_err(|_|anyhow::anyhow!("routine script must be UTF-8"))?;
     let mut command=command(script,cwd,deadline_ms,cap,cancellation);
     command.deadline=deadline;
+    command.inherited_locks=inherited_locks;
     if let Some(end)=deadline {command.timeout=command.timeout.min(end.saturating_duration_since(std::time::Instant::now()));}
     run_command(&command)
 }

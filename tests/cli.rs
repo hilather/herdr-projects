@@ -83,7 +83,7 @@ fn approval_cli_uses_pinned_policy_and_refuses_unsigned_import() {
     let output=hp(caller.path(), &["--root",root_arg,"routine-store","demo","inspect"]);
     assert!(output.status.success());
     let report:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["execution_enabled"],cfg!(target_os="linux"));assert_eq!(report["automatic_dispatch"],false);assert_eq!(report["occurrences"],serde_json::json!([]));
+    assert_eq!(report["execution_enabled"],cfg!(target_os="linux"));assert_eq!(report["automatic_dispatch"],cfg!(target_os="linux"));assert_eq!(report["occurrences"],serde_json::json!([]));
     let output=hp(caller.path(), &["--root",root_arg,"routine-store","demo","schedule","unknown","--expected-head",&before.head.to_string()]);
     assert!(!output.status.success());assert_eq!(runtime::snapshot(&project).unwrap(),before);
     let document=home.path().join("grant.json");

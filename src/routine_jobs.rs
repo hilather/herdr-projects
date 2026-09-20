@@ -1,6 +1,6 @@
 //! Routine jobs share the bounded command pool. The marker is never an OS
 //! executable, and pool output is never accepted as durable cleanup authority.
-use std::{path::Path,sync::Arc,time::{Duration,Instant}};
+use std::{collections::BTreeMap,path::{Path,PathBuf},sync::Arc,time::{Duration,Instant}};
 use anyhow::{Result,Context,ensure};
 use serde::{Deserialize,Serialize};
 use crate::{executor::{Identity,Lane,Request},runner::{Cmd,Output,Runner}};
@@ -40,13 +40,88 @@ pub fn request(project:&Path,operation:&OperationId,revision:u64)->Result<Reques
     let root=project.parent().context("routine project has no root")?;
     let identity=Identity{operation:format!("routine-execute:{}",operation.as_str()),revision,
         project:project.to_str().context("routine project is not UTF-8")?.into(),
-        // Retained root execution ownership permits only one routine per root.
-        // Project-scoped ownership is required before relaxing this constraint.
+        // Conservatively admit one running routine per root while terminal
+        // effects still use the exclusive root compatibility barrier.
         machine:format!("routine-root:{}",root.display()),terminal:None};
     let input=Input{project:identity.project.clone(),operation:operation.clone(),revision};
     let deadline=Instant::now()+BUDGET;
     let mut command=Cmd::new(JOB,BUDGET).stdin(serde_json::to_string(&input)?);command.deadline=Some(deadline);
     Ok(Request{identity,lane:Lane::Transfer,deadline,command})
+}
+
+enum Entry {Pending{identity:Identity,operation:OperationId,ticket:crate::executor::Ticket},Cooldown{until:Instant,last:OperationId}}
+/// Volatile tickets only: durable eligibility and all claim/effect decisions
+/// remain in the store service. Restart never infers success from a lost ticket.
+pub struct Queue {executor:Arc<crate::executor::Executor>,entries:BTreeMap<PathBuf,Entry>,last_project:Option<PathBuf>}
+impl Queue {
+    pub fn new(executor:Arc<crate::executor::Executor>)->Self {Self{executor,entries:BTreeMap::new(),last_project:None}}
+    pub fn drain(&mut self)->Vec<String> {
+        let mut errors=Vec::new();let now=Instant::now();
+        self.entries.retain(|path,entry| {
+            let result=match entry {
+                Entry::Cooldown{until,..}=>return now<*until+Duration::from_secs(120),
+                Entry::Pending{identity,ticket,..}=>match ticket.try_recv() {
+                    Ok(None)=>return true,
+                    Ok(Some(completion))=>{
+                        if completion.identity!=*identity {Err(anyhow::anyhow!("routine completion identity mismatch"))}
+                        else {completion.result.and_then(|output| {ensure!(output.success(),"routine adapter failed");Ok(())})}
+                    },
+                    Err(error)=>Err(error),
+                },
+            };
+            // The trusted ingress committed its own receipt. This completion
+            // only controls local admission and diagnostics, never durable state.
+            let last=match entry {Entry::Pending{operation,..}=>operation.clone(),_=>unreachable!()};
+            let retry=result.is_err();
+            if let Err(error)=result {
+                errors.push(format!("{}: routine queue: {error:#}",path.display()));
+            }
+            *entry=Entry::Cooldown{until:now+if retry {Duration::from_secs(30)} else {Duration::ZERO},last};true
+        });errors
+    }
+    pub fn pending(&self)->bool {self.entries.values().any(|e|matches!(e,Entry::Pending{..}))}
+    pub fn admit_projects(&mut self,projects:impl IntoIterator<Item=PathBuf>)->Vec<String> {
+        let mut errors=Vec::new();if self.pending(){return errors;}
+        let mut paths=Vec::new();
+        for project in projects {match project.canonicalize(){Ok(path)=>paths.push(path),Err(error)=>errors.push(format!("{}: routine admission: {error}",project.display()))}}
+        paths.sort();paths.dedup();
+        if let Some(last)=&self.last_project {
+            let first=paths.iter().position(|path|path>last).unwrap_or(0);paths.rotate_left(first);
+        }
+        for path in paths {
+            if let Err(error)=self.admit(&path){errors.push(format!("{}: routine admission: {error:#}",path.display()));}
+            if self.pending(){break;}
+        }
+        errors
+    }
+    fn admit(&mut self,project:&Path)->Result<()> {
+        if !cfg!(target_os="linux") {return Ok(());}
+        // A ticker owns one root. Never prequeue its next routine: the full
+        // project pass must offer exclusive effects a turn between routines.
+        if self.pending() {return Ok(());}
+        let path=project.canonicalize()?;
+        let last=match self.entries.get(&path) {
+            Some(Entry::Pending{..})=>return Ok(()),
+            Some(Entry::Cooldown{until,..}) if Instant::now()<*until=>return Ok(()),
+            Some(Entry::Cooldown{last,..})=>Some(last.clone()),None=>None,
+        };
+        ensure!(self.entries.contains_key(&path)||self.entries.len()<128,"routine admission inventory is full");
+        let snapshot=herdr_projects::runtime::snapshot(&path)?;
+        if snapshot.schema_version<16 || snapshot.control.as_ref().is_none_or(|c|c.state!=herdr_projects::domain::ProjectState::Active||c.reconciliation_required) {return Ok(());}
+        let operations=snapshot.operations.iter().map(|o|(&o.id,o)).collect::<BTreeMap<_,_>>();
+        let now=jiff::Timestamp::now().as_millisecond();
+        let mut candidates=snapshot.deliveries.iter().filter(|d|d.state==herdr_projects::operations::DeliveryState::Pending && d.attempts==0 && d.next_due_ms<=now && operations.get(&d.operation).is_some_and(|o|o.kind=="routine.run")).collect::<Vec<_>>();
+        candidates.sort_by(|a,b|a.operation.cmp(&b.operation));
+        if candidates.is_empty(){return Ok(());}
+        let delivery=last.as_ref().and_then(|last|candidates.iter().copied().find(|d|d.operation>*last)).unwrap_or(candidates[0]);
+        let work=request(&path,&delivery.operation,delivery.revision)?;let identity=work.identity.clone();
+        let ticket=self.executor.submit(work)?;
+        self.last_project=Some(path.clone());
+        self.entries.insert(path,Entry::Pending{identity,operation:delivery.operation.clone(),ticket});Ok(())
+    }
+}
+impl Drop for Queue {
+    fn drop(&mut self) {for entry in self.entries.values(){if let Entry::Pending{ticket,..}=entry {ticket.cancel();}}}
 }
 
 #[cfg(test)]
@@ -58,6 +133,147 @@ mod tests {
         let(world,path)=crate::canonical_controller::tests::routine_fixture(&[("check",script,deadline)]);
         let occurrence=routines::schedule(&path,"check",runtime::snapshot(&path).unwrap().head).unwrap().unwrap();
         (world,path,occurrence.operation.unwrap())
+    }
+    #[cfg(target_os="linux")]
+    #[test]
+    fn owner_death_helper() {
+        let Some(path)=std::env::var_os("HP_ROUTINE_OWNER_DEATH_PROJECT") else {return;};
+        let path=std::path::PathBuf::from(path);let operation=OperationId::new(std::env::var("HP_ROUTINE_OWNER_DEATH_OPERATION").unwrap()).unwrap();
+        routines::execute(&path,&operation,runtime::snapshot(&path).unwrap().head).unwrap();
+    }
+    #[cfg(target_os="linux")]
+    #[test]
+    fn supervisor_retains_execution_locks_after_owner_sigkill_until_namespace_cleanup() {
+        let(world,path)=crate::canonical_controller::tests::routine_fixture(&[("first",b"touch started; setsid /bin/sh -c 'sleep 2; touch escaped' >/dev/null 2>&1 & sleep 10",1000),("second",b"touch second",1000)]);
+        let first=routines::schedule(&path,"first",runtime::snapshot(&path).unwrap().head).unwrap().unwrap().operation.unwrap();
+        let second=routines::schedule(&path,"second",runtime::snapshot(&path).unwrap().head).unwrap().unwrap().operation.unwrap();
+        let mut owner=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","routine_jobs::tests::owner_death_helper","--nocapture"])
+            .env("HP_ROUTINE_OWNER_DEATH_PROJECT",&path).env("HP_ROUTINE_OWNER_DEATH_OPERATION",first.as_str())
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let deadline=Instant::now()+Duration::from_secs(5);
+        while !path.join("started").exists() {
+            if owner.try_wait().unwrap().is_some(){panic!("routine owner exited before script started");}
+            if Instant::now()>=deadline{let _=owner.kill();let _=owner.wait();panic!("routine start deadline");}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        owner.kill().unwrap();owner.wait().unwrap();
+        assert!(crate::cleanup::lease(&world.root).is_err(),"root effects must remain excluded after owner death");
+        let root_routines=std::fs::File::options().read(true).write(true).open(world.root.join(".routine-execution.lock")).unwrap();
+        assert!(root_routines.try_lock().is_err(),"a restarted pool must not run a different project's routine");
+        assert!(routines::execute(&path,&second,runtime::snapshot(&path).unwrap().head).is_err(),"another routine must remain excluded");
+        assert!(!path.join("second").exists());
+        let deadline=Instant::now()+Duration::from_secs(4);
+        loop {if let Ok(guard)=crate::cleanup::lease(&world.root){drop(guard);break;}assert!(Instant::now()<deadline,"supervisor did not release ownership after cleanup");std::thread::sleep(Duration::from_millis(10));}
+        root_routines.try_lock().unwrap();root_routines.unlock().unwrap();
+        std::thread::sleep(Duration::from_millis(1300));assert!(!path.join("escaped").exists());
+        let snapshot=runtime::snapshot(&path).unwrap();let first_delivery=snapshot.deliveries.iter().find(|d|d.operation==first).unwrap();
+        assert_eq!(first_delivery.state,DeliveryState::Claimed);assert_eq!(first_delivery.attempts,1);assert!(snapshot.routine_receipts.is_empty());
+        assert!(routines::execute(&path,&first,snapshot.head).is_err(),"owner death must never authorize replay");
+        assert!(routines::execute(&path,&second,runtime::snapshot(&path).unwrap().head).unwrap().cleanup_verified);
+    }
+    #[cfg(target_os="linux")]
+    #[test]
+    fn ticker_admits_signed_work_once_and_restart_does_not_replay() {
+        let(world,path)=crate::canonical_controller::tests::routine_fixture(&[("check",b"printf once >> marker",1000)]);
+        let pool=Arc::new(Executor::new(Limits::default(),Arc::new(JobRunner{inner:Arc::new(Forbidden)})).unwrap());
+        let mut memory=crate::steps::Memory::new(&world.ctx());memory.routine_jobs=Some(Queue::new(pool.clone()));
+        let deadline=Instant::now()+Duration::from_secs(5);
+        loop {
+            assert!(crate::ticker::tick_for_test(&world.ctx(),&mut memory));
+            let s=runtime::snapshot(&path).unwrap();
+            if !s.routine_receipts.is_empty() {assert!(s.routine_receipts[0].cleanup_verified);assert_eq!(s.deliveries[0].state,DeliveryState::Confirmed);break;}
+            assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(10));
+        }
+        // Lose all in-memory admission history, as on a ticker restart.
+        assert!(pool.stop(Duration::from_secs(2)));drop(memory);drop(pool);
+        let pool=Arc::new(Executor::new(Limits::default(),Arc::new(JobRunner{inner:Arc::new(Forbidden)})).unwrap());
+        let mut memory=crate::steps::Memory::new(&world.ctx());memory.routine_jobs=Some(Queue::new(pool.clone()));
+        for _ in 0..3 {assert!(crate::ticker::tick_for_test(&world.ctx(),&mut memory));}
+        assert!(!memory.routine_jobs.as_ref().unwrap().pending());
+        let s=runtime::snapshot(&path).unwrap();assert_eq!(s.routine_occurrences.len(),1);assert_eq!(s.routine_receipts.len(),1);assert_eq!(s.deliveries[0].attempts,1);
+        assert_eq!(std::fs::read(path.join("marker")).unwrap(),b"once");assert!(pool.stop(Duration::from_secs(2)));
+    }
+    #[cfg(target_os="linux")]
+    #[test]
+    fn completed_ticket_must_be_drained_before_any_other_project_can_queue() {
+        let(_first,path)=crate::canonical_controller::tests::routine_fixture(&[("check",b"touch marker",1000)]);
+        let(_second,other)=crate::canonical_controller::tests::routine_fixture(&[("check",b"touch marker",1000)]);
+        for path in [&path,&other] {routines::schedule(path,"check",runtime::snapshot(path).unwrap().head).unwrap();}
+        let pool=Arc::new(Executor::new(Limits::default(),Arc::new(JobRunner{inner:Arc::new(Forbidden)})).unwrap());let mut queue=Queue::new(pool.clone());
+        queue.admit(&path).unwrap();queue.admit(&other).unwrap();assert_eq!(queue.entries.len(),1);
+        let deadline=Instant::now()+Duration::from_secs(3);while runtime::snapshot(&path).unwrap().routine_receipts.is_empty(){assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(5));}
+        // Even after the worker completes, no admission may race the next pass.
+        queue.admit(&other).unwrap();assert_eq!(queue.entries.len(),1);assert!(!other.join("marker").exists());
+        assert!(queue.drain().is_empty());queue.admit(&other).unwrap();assert!(queue.entries.contains_key(&other));
+        assert!(pool.stop(Duration::from_secs(2)));
+    }
+    #[cfg(target_os="linux")]
+    #[test]
+    fn project_fairness_advances_on_admission_not_ticker_cadence() {
+        let(_first,path)=crate::canonical_controller::tests::routine_fixture(&[("a",b"true",1000),("b",b"true",1000)]);
+        let(_second,other)=crate::canonical_controller::tests::routine_fixture(&[("a",b"true",1000),("b",b"true",1000)]);
+        for path in [&path,&other] {for name in ["a","b"] {routines::schedule(path,name,runtime::snapshot(path).unwrap().head).unwrap();}}
+        let pool=Arc::new(Executor::new(Limits::default(),Arc::new(JobRunner{inner:Arc::new(Forbidden)})).unwrap());let mut queue=Queue::new(pool.clone());
+        let mut admitted=Vec::new();
+        for _ in 0..2 {
+            // Same scan order at every opportunity; both still have backlog.
+            assert!(queue.admit_projects([path.clone(),other.clone()]).is_empty());
+            admitted.push(queue.last_project.clone().unwrap());
+            let deadline=Instant::now()+Duration::from_secs(3);while queue.pending(){assert!(queue.drain().is_empty());assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(5));}
+        }
+        assert_ne!(admitted[0],admitted[1]);
+        for path in [&path,&other] {assert_eq!(runtime::snapshot(path).unwrap().routine_receipts.len(),1);}
+        assert!(pool.stop(Duration::from_secs(2)));
+    }
+    #[cfg(target_os="linux")]
+    #[test]
+    fn all_projects_get_exclusive_effect_opportunity_before_routine_admission() {
+        use herdr_projects::domain::{ProjectState,RuntimeRoute};
+        use crate::runner::fake::ok;
+        let(world,path)=crate::canonical_controller::tests::routine_fixture(&[("check",b"touch marker",1000)]);
+        let config=world.ctx().config_dir.join("config.toml");
+        let other=crate::project::create(&world.root,"z-notify","",vec![]).unwrap();other.set_status(crate::project::Status::Paused).unwrap();
+        crate::inbox::write(&other,"test","fixture","pending notice","").unwrap();let other=other.dir();
+        let plan=herdr_projects::migration::inspect_with_config(&other,&config).unwrap();herdr_projects::migration::apply(&other,&plan,true).unwrap();
+        let task=TaskId::new("notify").unwrap();let head=runtime::add_task(&other,task.clone(),"notify".into(),runtime::snapshot(&other).unwrap().head).unwrap();
+        runtime::create_binding(&other,None,None,head,&RuntimeRoute{socket:"/explicit/fairness.sock".into(),..Default::default()}).unwrap();
+        crate::reconcile_live::run(&world.ctx(),&other,true).unwrap();let s=runtime::snapshot(&other).unwrap();runtime::set_state(&other,s.head,s.control.unwrap().revision,ProjectState::Active,&config).unwrap();
+        world.runner.on("--version",ok("herdr 0.9.1")).on("notification show",ok(r#"{"result":{"shown":true}}"#));
+        let operation=crate::notification_delivery::enqueue(&world.ctx(),&other,&task,runtime::snapshot(&other).unwrap().head).unwrap();
+        let pool=Arc::new(Executor::new(Limits::default(),Arc::new(JobRunner{inner:Arc::new(Forbidden)})).unwrap());
+        struct Check<'a>{inner:&'a dyn Runner,pool:Arc<Executor>}
+        impl Runner for Check<'_> {
+            fn run(&self,cmd:&Cmd)->Result<Output>{
+                if cmd.args.windows(2).any(|a|a==["notification","show"]){assert_eq!(self.pool.metrics().high_water[1],0,"routine admitted before another project's effect opportunity");}
+                self.inner.run(cmd)
+            }
+            fn socket_request(&self,path:&Path,line:&str,timeout:Duration)->Result<String>{self.inner.socket_request(path,line,timeout)}
+        }
+        let check=Check{inner:&world.runner,pool:pool.clone()};let original=world.ctx();
+        let ctx=crate::paths::Ctx{runner:&check,..original};let mut memory=crate::steps::Memory::new(&ctx);memory.routine_jobs=Some(Queue::new(pool.clone()));
+        assert!(crate::ticker::tick_for_test(&ctx,&mut memory));assert_eq!(world.runner.count("notification show"),1);
+        assert_eq!(runtime::snapshot(&other).unwrap().deliveries.iter().find(|d|d.operation==operation.id).unwrap().state,DeliveryState::Confirmed);
+        assert!(memory.routine_jobs.as_ref().unwrap().pending());assert_eq!(runtime::snapshot(&path).unwrap().routine_occurrences.len(),1);
+        assert!(pool.stop(Duration::from_secs(2)));
+    }
+    #[cfg(target_os="linux")]
+    #[test]
+    fn failed_admission_backs_off_rotates_and_pause_prevents_new_tickets() {
+        let(world,path)=crate::canonical_controller::tests::routine_fixture(&[("a",b"touch a-marker",1000),("b",b"touch b-marker",1000)]);
+        for name in ["a","b"] {routines::schedule(&path,name,runtime::snapshot(&path).unwrap().head).unwrap();}
+        // Both queued operations remain pending when exact script authority is withdrawn.
+        for name in ["a","b"] {std::fs::write(path.join(format!("{name}.sh")),"changed").unwrap();}
+        let pool=Arc::new(Executor::new(Limits::default(),Arc::new(JobRunner{inner:Arc::new(Forbidden)})).unwrap());let mut queue=Queue::new(pool.clone());
+        queue.admit(&path).unwrap();let first=match &queue.entries[&path] {Entry::Pending{operation,..}=>operation.clone(),_=>panic!()};
+        let deadline=Instant::now()+Duration::from_secs(3);let errors=loop {let errors=queue.drain();if !queue.pending(){break errors;}assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(5));};assert_eq!(errors.len(),1);
+        queue.admit(&path).unwrap();assert!(!queue.pending());
+        if let Entry::Cooldown{until,..}=queue.entries.get_mut(&path).unwrap(){*until=Instant::now();}
+        queue.admit(&path).unwrap();let second=match &queue.entries[&path] {Entry::Pending{operation,..}=>operation.clone(),_=>panic!()};assert_ne!(first,second);
+        let deadline=Instant::now()+Duration::from_secs(3);while queue.pending(){queue.drain();assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(5));}
+        let s=runtime::snapshot(&path).unwrap();assert!(s.deliveries.iter().all(|d|d.attempts==0&&d.state==DeliveryState::Pending));
+        runtime::set_state(&path,s.head,s.control.unwrap().revision,herdr_projects::domain::ProjectState::Paused,&world.ctx().config_dir.join("config.toml")).unwrap();
+        queue.entries.clear();queue.admit(&path).unwrap();assert!(!queue.pending());assert!(!path.join("a-marker").exists()&&!path.join("b-marker").exists());assert!(pool.stop(Duration::from_secs(2)));
     }
     #[cfg(target_os="linux")]
     #[test]

@@ -1088,3 +1088,46 @@ Independent review approved this increment. All 458 tests pass in debug and rele
 (156 library, 270 binary, 30 CLI, two contracts), and the default-feature suite passes.
 Three optional live checks remain ignored. Logs:
 `/tmp/herdr-status-observation-{debug,release,default}.log`.
+
+## W04 automatic routine queue admission
+
+The production ticker now wraps the shared executor with trusted routine ingress and
+admits due, pending, never-claimed routine operations on Linux. It drains volatile
+tickets at tick entry and keeps the ticker alive while a ticket is outstanding.
+Completion output changes no durable delivery state; the trusted service persists
+its own receipt. Restart reconstructs eligibility from the store and never replays a
+claimed occurrence. Shutdown cancels/drains the same pool used for observation jobs.
+
+Independent review identified two starvation risks before enabling dispatch. Only one
+automatic routine ticket may be outstanding per root, and admission occurs after all
+legacy/canonical project effects have received a turn. A mid-pass completion stays
+retained until the next pass. Project selection uses a separate last-admitted cursor,
+advancing only on accepted tickets, rather than coupling fairness to ticker cadence.
+Failed entries back off for 30 seconds and then rotate among pending operations.
+Project admission inventory remains bounded at 128 entries.
+
+Real signed fixtures exercise automatic execution and ticker restart without replay,
+script withdrawal/backoff/rotation, pause refusal, retained completed tickets,
+cross-project notification delivery before admission, and repeated identical project
+scan orders with backlog. Existing queued authority/deadline, lost-receipt and
+cancellation/descendant-cleanup fixtures remain in place. CLI inspection now advertises
+automatic dispatch only on Linux. No user scripts or projects were used.
+
+Counts remain 16 implemented, five partial and 20 not started. W04 still needs artifact
+pool integration, production profile/capability resolution, usage/running-limit
+telemetry and broader command-path authority; macOS remains unavailable.
+
+Crash-boundary review also found that process-local guards alone released too early
+if the ticker/explicit CLI was killed. Routine supervision now inherits the root and
+project lock descriptions plus a root routine-serialization lock; parent descriptors
+remain CLOEXEC and only the forked child's duplicates become inheritable. The caller
+retains its copies through receipt commit. A surviving supervisor preserves exclusion
+until namespace cleanup even after owner SIGKILL. The real owner-death fixture proves
+immediate competing root effects, same-project routines and root routine ownership
+refuse, delayed detached effects are killed, and the lost receipt never permits replay.
+This fixes explicit execution as well as the new automatic path.
+
+Independent review approved the fairness and crash corrections. All 465 tests pass in
+debug and release (156 library, 277 binary, 30 CLI, two contracts); the default-feature
+suite also passes. Three optional live checks remain ignored. Logs:
+`/tmp/herdr-routine-admission-{debug,release,default}.log`.

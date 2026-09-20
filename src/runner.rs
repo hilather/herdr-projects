@@ -25,6 +25,16 @@ impl Cancellation {
 
 pub const CAPTURE_LIMIT: usize = 1024 * 1024;
 
+/// Sealed ownership handle. Only trusted library ingress can arrange an
+/// inherited lock; ordinary command descriptions cannot name arbitrary FDs.
+#[derive(Debug,Clone)]
+pub struct InheritedLock(Arc<std::fs::File>);
+impl PartialEq for InheritedLock {fn eq(&self,other:&Self)->bool {Arc::ptr_eq(&self.0,&other.0)}}
+impl InheritedLock {
+    #[cfg(feature="state-store")]
+    pub(crate) fn new(file:std::fs::File)->Self {Self(Arc::new(file))}
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cmd {
     pub program: String,
@@ -47,6 +57,7 @@ pub struct Cmd {
     /// text/byte buffer is retained when present. Caller owns partial cleanup.
     pub stdout_file: Option<(PathBuf, usize)>,
     pub cancellation: Option<Cancellation>,
+    pub inherited_locks: Vec<InheritedLock>,
 }
 
 impl Cmd {
@@ -67,6 +78,7 @@ impl Cmd {
             capture_limit: CAPTURE_LIMIT,
             stdout_file: None,
             cancellation: None,
+            inherited_locks: Vec::new(),
         }
     }
 
@@ -214,6 +226,29 @@ impl Runner for RealRunner {
         if cmd.own_group {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
+        }
+
+        // Duplicate above stdio, leaving every parent descriptor CLOEXEC.
+        // Clearing it only in this child's pre_exec avoids leaking ownership
+        // through a concurrent spawn in another executor worker.
+        anyhow::ensure!(cmd.inherited_locks.len()<=16,"too many inherited execution locks");
+        let inherited=cmd.inherited_locks.iter().map(|lock|->io::Result<std::fs::File>{
+            use std::os::fd::FromRawFd;
+            let fd=unsafe{libc::fcntl(lock.0.as_raw_fd(),libc::F_DUPFD_CLOEXEC,3)};
+            if fd<0 {return Err(io::Error::last_os_error());}
+            Ok(unsafe{std::fs::File::from_raw_fd(fd)})
+        }).collect::<io::Result<Vec<_>>>()?;
+        if !inherited.is_empty() {
+            use std::os::unix::process::CommandExt;
+            let descriptors=inherited.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>();
+            // SAFETY: only fcntl syscalls and errno reads after fork; descriptors
+            // are owned above and no allocation or Rust locks occur here.
+            unsafe{command.pre_exec(move || {
+                for &fd in &descriptors {
+                    if libc::fcntl(fd,libc::F_SETFD,0)<0 {return Err(io::Error::last_os_error());}
+                }
+                Ok(())
+            });}
         }
 
         let mut child = command

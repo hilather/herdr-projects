@@ -33,6 +33,10 @@ impl RootGuard {
 /// Never acquire an exclusive root guard while retaining this shared guard.
 pub struct ProjectGuard {_project:File,_root:RootGuard}
 impl ProjectGuard {
+    #[cfg(feature="state-store")]
+    pub(crate) fn inherit(&self)->Result<Vec<crate::runner::InheritedLock>> {
+        Ok(vec![crate::runner::InheritedLock::new(self._root._file.try_clone()?),crate::runner::InheritedLock::new(self._project.try_clone()?)])
+    }
     pub fn acquire(project:&Path)->Result<Self> {
         let project=project.canonicalize()?;
         let root=RootGuard::shared(project.parent().context("project has no root")?)?;
