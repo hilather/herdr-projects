@@ -5,6 +5,41 @@ use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
 
+#[cfg(all(feature="state-store",target_os="linux"))]
+#[test]
+fn ticker_canonical_observations_commit_cancel_and_restart_in_the_shared_pool() {
+    use std::{fs,os::unix::{fs::PermissionsExt,net::UnixListener},process::Stdio,time::{Duration,Instant}};
+    use herdr_projects::{migration,runtime,domain::RuntimeRoute,reconcile::ResourceState};
+    let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
+    for action in ["new","pause"]{assert!(hp(home.path(),&["--root",r,action,"demo"]).status.success());}
+    let project=root.join("demo");let plan=migration::inspect(&project).unwrap();migration::apply(&project,&plan,true).unwrap();
+    let socket=home.path().join("canonical.sock");let _listener=UnixListener::bind(&socket).unwrap();
+    runtime::create_binding(&project,None,None,runtime::snapshot(&project).unwrap().head,&RuntimeRoute{socket:socket.display().to_string(),workspace_id:"w".into(),tab_id:"t".into(),pane_id:"p".into(),cwd:"/fixture".into(),..Default::default()}).unwrap();
+    let helper=home.path().join("herdr");fs::write(home.path().join("mode"),"ok").unwrap();
+    fs::write(&helper,format!(r#"#!/usr/bin/python3
+import json,pathlib,sys,time
+root=pathlib.Path({home:?})
+if sys.argv[1:]==['--version']:print('herdr 0.9.1');sys.exit(0)
+(root/'entered').write_text('yes')
+if (root/'mode').read_text()=='blocked':time.sleep(60)
+p={{'pane_id':'p','workspace_id':'w','tab_id':'t','cwd':'/fixture','agent':'claude','name':'fixture','agent_status':'idle'}}
+if sys.argv[1:]==['pane','list']:r={{'panes':[p]}}
+elif sys.argv[1:]==['agent','list']:r={{'agents':[p]}}
+else:sys.exit(3)
+print(json.dumps({{'result':r}}))
+"#,home=home.path().display().to_string())).unwrap();fs::set_permissions(&helper,fs::Permissions::from_mode(0o700)).unwrap();
+    struct Child(std::process::Child);impl Drop for Child {fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+    let spawn=||Child(Command::new(BIN).env_clear().env("HOME",home.path()).env("PATH","/usr/bin:/bin").env("HERDR_BIN_PATH",&helper).args(["--root",r,"ticker","run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let wait=|child:&mut Child,predicate:&dyn Fn()->bool|{let end=Instant::now()+Duration::from_secs(8);while !predicate(){assert!(child.0.try_wait().unwrap().is_none());assert!(Instant::now()<end,"{}",fs::read_to_string(root.join(".ticker.log")).unwrap_or_default());std::thread::sleep(Duration::from_millis(10));}};
+    let stop=|child:&mut Child|{fs::write(root.join(".ticker.stop"),b"").unwrap();let end=Instant::now()+Duration::from_secs(8);while child.0.try_wait().unwrap().is_none(){assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(10));}fs::remove_file(root.join(".ticker.stop")).unwrap();};
+    let mut child=spawn();wait(&mut child,&||runtime::snapshot(&project).unwrap().observations.iter().any(|o|o.pane==ResourceState::Present));stop(&mut child);
+    let before=runtime::snapshot(&project).unwrap();fs::remove_file(home.path().join("entered")).unwrap();fs::write(home.path().join("mode"),"blocked").unwrap();
+    let mut child=spawn();wait(&mut child,&||home.path().join("entered").exists());
+    assert!(herdr_projects::execution_guard::ProjectGuard::acquire(&project).is_err());stop(&mut child);assert_eq!(runtime::snapshot(&project).unwrap(),before);
+    fs::write(home.path().join("mode"),"ok").unwrap();let mut child=spawn();wait(&mut child,&||runtime::snapshot(&project).unwrap().head>before.head);stop(&mut child);
+    assert!(herdr_projects::execution_guard::ProjectGuard::acquire(&project).is_ok());
+}
+
 #[cfg(feature="state-store")]
 #[test]
 fn signed_routine_cli_records_then_explicitly_executes_once_with_durable_cleanup() {

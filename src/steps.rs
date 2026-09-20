@@ -140,6 +140,8 @@ pub struct Memory {
     pub prefer_copy:bool,
     #[cfg(feature="state-store")]
     pub routine_jobs:Option<crate::routine_jobs::Queue>,
+    #[cfg(feature="state-store")]
+    pub canonical_observations:Option<crate::canonical_controller::observations::Reads>,
     #[cfg(test)]
     clock: Option<Instant>,
 }
@@ -160,9 +162,19 @@ impl Memory {
             prefer_copy:true,
             #[cfg(feature="state-store")]
             routine_jobs: None,
+            #[cfg(feature="state-store")]
+            canonical_observations:None,
             #[cfg(test)]
             clock: None,
         }
+    }
+
+    pub fn observations_unknown(&self)->bool {
+        let unknown=self.local_observations.as_ref().is_some_and(|reads|reads.unknown());
+        #[cfg(feature="state-store")]
+        {return unknown||self.canonical_observations.as_ref().is_some_and(|reads|reads.unknown());}
+        #[cfg(not(feature="state-store"))]
+        unknown
     }
 
     fn monotonic_now(&self) -> Instant {

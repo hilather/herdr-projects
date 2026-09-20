@@ -261,6 +261,8 @@ pub fn run(ctx: &Ctx) -> Result<()> {
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::remote_polling::ProbeRunner{inner:std::sync::Arc::new(crate::runner::RealRunner)});
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::local_observations::ProbeRunner{inner:runner});
     #[cfg(feature="state-store")]
+    let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::canonical_controller::observations::ProbeRunner{inner:runner});
+    #[cfg(feature="state-store")]
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::routine_jobs::JobRunner{inner:runner});
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::copy_jobs::JobRunner{inner:runner});
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::legacy_routine_jobs::JobRunner{inner:runner});
@@ -270,6 +272,8 @@ pub fn run(ctx: &Ctx) -> Result<()> {
     let executor=std::sync::Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),runner)?);
     #[cfg(feature="state-store")]
     {memory.routine_jobs=Some(crate::routine_jobs::Queue::new(executor.clone()));}
+    #[cfg(feature="state-store")]
+    if cfg!(target_os="linux"){memory.canonical_observations=Some(crate::canonical_controller::observations::Reads::new(executor.clone()));}
     if cfg!(target_os="linux") {memory.copy_jobs=Some(crate::copy_jobs::Queue::new(executor.clone()));}
     memory.local_reports=Some(crate::local_reports::Reads::new(executor.clone()));
     if cfg!(target_os="linux"){memory.local_observations=Some(crate::local_observations::Reads::new(executor.clone()));}
@@ -283,7 +287,7 @@ pub fn run(ctx: &Ctx) -> Result<()> {
         let wake = Instant::now() + TICK;
         if tick(ctx, &log, &mut memory) {
             last_reachable = Instant::now();
-        } else if last_reachable.elapsed() > IDLE_EXIT && !memory.local_observations.as_ref().is_some_and(|reads|reads.unknown()) {
+        } else if last_reachable.elapsed() > IDLE_EXIT && !memory.observations_unknown() {
             log.line("no reachable session or enabled canonical routine for five minutes; draining shared executor");
             return memory.pr_reads.as_mut().expect("ticker shared executor").stop();
         }
@@ -306,6 +310,8 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     memory.tick += 1;
     if let Some(reads)=memory.local_reports.as_mut(){reads.begin_pass();}
     if let Some(reads)=memory.local_observations.as_mut(){reads.begin_pass();}
+    #[cfg(feature="state-store")]
+    if let Some(reads)=memory.canonical_observations.as_mut(){reads.begin_pass();}
     if let Some(queue)=memory.copy_jobs.as_mut() {for error in queue.drain(){log.line(&error);}}
     #[cfg(feature="state-store")]
     if let Some(queue)=memory.routine_jobs.as_mut() {for error in queue.drain(){log.line(&error);}}
@@ -384,7 +390,8 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         let mut any_reachable=any_reachable;
         if !canonical.is_empty() {let first=(memory.tick.saturating_sub(1)%canonical.len() as u64) as usize;canonical.rotate_left(first);}
         for slug in &canonical {
-            match crate::canonical_controller::poll(ctx,&ctx.root.join(&slug),memory.tick.saturating_sub(1)) {
+            let result=if let Some(reads)=memory.canonical_observations.as_mut(){crate::canonical_controller::poll_queued(ctx,&ctx.root.join(slug),memory.tick.saturating_sub(1),reads)}else{crate::canonical_controller::poll(ctx,&ctx.root.join(slug),memory.tick.saturating_sub(1))};
+            match result {
                 Ok(result)=>{any_reachable|=result.reachable||result.scheduled_work;if let Some(error)=result.operation_error {log.line(&format!("{slug}: canonical operation: {error}"));}},
                 Err(error)=>log.line(&format!("{slug}: canonical controller: {error:#}")),
             }
@@ -392,6 +399,7 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         admit_background(ctx,log,memory,canonical.into_iter().map(|slug|ctx.root.join(slug)).collect());
         if let Some(reads)=memory.local_reports.as_mut(){for error in reads.admit(){log.line(&error);}}
         if let Some(reads)=memory.local_observations.as_mut(){for error in reads.admit(){log.line(&error);}}
+        if let Some(reads)=memory.canonical_observations.as_mut(){for error in reads.admit(){log.line(&error);}}
         any_reachable|=memory.routine_jobs.as_ref().is_some_and(|q|q.pending());
         any_reachable|=memory.copy_jobs.as_ref().is_some_and(|q|q.pending()||q.offered());
         return any_reachable;

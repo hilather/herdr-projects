@@ -1,5 +1,7 @@
 //! One bounded canonical controller pass. Observations retain project ownership;
 //! terminal-effect adapters still retain the exclusive root execution lease.
+#[path="canonical_observations.rs"]
+pub mod observations;
 use std::path::Path;
 use anyhow::{Context,Result,ensure};
 use crate::paths::Ctx;
@@ -33,11 +35,25 @@ pub fn poll(ctx:&Ctx,path:&Path,turn:u64)->Result<PollResult> {
     let reachable=batch.observations.iter().any(|o|o.pane==ResourceState::Present||o.worktree==ResourceState::Present);
     runtime::record_controller_observations_guarded(&path,&batch,&ownership)?;
     drop(ownership);
+    finish_poll(ctx,&path,turn,reachable,None)
+}
+/// Background observation results affect liveness only. Scheduling still gets
+/// its main-pass opportunity before any next observation job is admitted.
+pub fn poll_queued(ctx:&Ctx,path:&Path,turn:u64,reads:&mut observations::Reads)->Result<PollResult> {
+    let (reachable,error)=match reads.poll(ctx,path) {
+        Ok(observations::Poll::Ready(reachable))=>(reachable,None),
+        Ok(observations::Poll::Pending)=>(false,None),
+        Ok(observations::Poll::Failed(error))=>(false,Some(format!("canonical observation: {error}"))),
+        Err(error)=>(false,Some(format!("canonical observation: {error:#}"))),
+    };
+    finish_poll(ctx,path,turn,reachable,error)
+}
+fn finish_poll(ctx:&Ctx,path:&Path,turn:u64,reachable:bool,observation_error:Option<String>)->Result<PollResult> {
     // A scheduling failure must not suppress unrelated notification/finalization
     // work. Each scheduling turn handles one routine; subsequent turns rotate.
     let scheduled=herdr_projects::routines::schedule_turn(&path,turn);
     let result=process_next(ctx,&path,turn);
-    let mut errors=Vec::new();
+    let mut errors=observation_error.into_iter().collect::<Vec<_>>();
     let routine_work=match scheduled {Ok(report)=>{if let Some(error)=report.diagnostic {errors.push(format!("routine scheduling: {error}"));}report.active},Err(error)=>{errors.push(format!("routine scheduling: {error:#}"));false}};
     let progress=match result {Ok(progress)=>progress,Err(error)=>{errors.push(format!("{error:#}"));false}};
     Ok(PollResult{reachable:reachable||progress,scheduled_work:routine_work,operation_error:(!errors.is_empty()).then(||errors.join("; "))})

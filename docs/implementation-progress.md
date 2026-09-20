@@ -2289,3 +2289,57 @@ exclusion of same-project mutations while other projects remain available, expir
 claims becoming ambiguous without replay, and interrupted publication requiring
 forward recovery. Six library controller tests and seven binary controller tests
 pass in release (`/tmp/herdr-canonical-guard-release.log`).
+
+## W04 queued canonical observations
+
+Linux state-store tickers now run canonical reconciliation in the shared control
+pool. A concrete worker freezes project identity, configuration and Herdr selection,
+acquires ProjectGuard before snapshots, collects with one original 15-second
+queue/command deadline and cancellation, then records observations, publishes the
+control marker and expires claims under the same ownership. No SQLite transaction
+spans external probes. Queue replies report reachability and the post-commit event
+revision only; dropping a reply cannot undo the database commit or authorize effects.
+Scheduling and already-accepted terminal operations get their pass before admission.
+
+Admission is fair over at most 128 offers with 16 pending jobs. Review identified
+that overlapping probe generations could keep the shared root barrier occupied
+and starve existing root-exclusive effects. Admission now waits for the whole
+canonical batch to drain before replenishing it. A three-round regression uses
+real notification adapters and distinct inbox batches to check that blocked effects
+confirm after drainage and before a new generation is admitted.
+
+Review also identified stale negative liveness after canonical rebinding and an
+initial correction that performed full integrity checks on the ticker thread.
+Negative liveness now requires the matching current canonical event revision and
+fixed admission-based 60-second expiry. Revision lookup shares the bounded read-only
+publication validator with identity inventory: 2 MiB publication budget, 100 ms
+cooperative deadline, 10 ms SQLite busy timeout and a progress handler. It checks
+publication/receipt/control consistency, regular single-link files and database
+incarnation without full-store integrity checks or historical payload reads.
+Classification is evaluated after accepting fresh completions, so repeated complete
+negative probes can clear the idle-exit veto. Unknown/stale/untracked work cannot.
+
+The shared identity reader retains its existing provenance and dangling-reference
+checks. Added tests cover large unrelated event payloads, recursive SQL interruption,
+publication mismatch, cancellation, fair rotation past 128 projects, lost completion,
+changed bindings, repeated negative results, scheduling between probes, and an actual
+slow canonical session alongside a progressing legacy session. A built-binary test
+covers worker commit, cancellation with project ownership retained, and restart.
+
+This increment does not claim bounded full-snapshot materialization or hard
+filesystem latency. Canonical notification/finalization adapters remain synchronous;
+those workers, canonical launch/profile preparation, budgets/telemetry and broader
+authority work remain before W05–W09. Counts remain 16 locally implemented, five
+partial and 20 unstarted. macOS and real SSH-host acceptance remain unavailable.
+
+Validation: all 182 library and 464 binary tests passed in debug and release before
+the final batch-drain correction. After that correction, both profiles pass four
+selected library tests, 22 selected binary tests (including all nine canonical
+worker tests) and six CLI tests, including the new production ticker regression.
+The initial three-round notification fixture reused an inbox batch and correctly
+hit durable deduplication; it now consumes one of three initial items per round.
+Seven shared identity/head reader tests pass, and the default-feature build checks
+successfully. Logs: `/tmp/herdr-canonical-observation-{debug-units,release-units,`
+`corrected-debug,corrected-release,head,default-check}.log`. Independent review
+approved the worker, bounded head reader, integration and batch-drain boundary.
+`git diff --check` passes. No new external/platform acceptance is claimed.

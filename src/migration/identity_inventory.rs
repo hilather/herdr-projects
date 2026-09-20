@@ -1,7 +1,7 @@
 //! Active publication validation for a bounded, read-only identity inventory.
 use super::*;
 use crate::{domain::RuntimeBinding,store::identity_inventory::{Budget,Publication}};
-pub fn read_identity_inventory(project:&Path,budget:&mut Budget)->Result<Vec<RuntimeBinding>> {
+fn publication(project:&Path,budget:&mut Budget)->Result<(std::path::PathBuf,Publication)> {
     budget.check()?;let project=checked_project(project)?;
     ensure!(fs::symlink_metadata(project.join(".state/migration"))?.is_dir(),"migration directory must be real");
     let journal:Journal=serde_json::from_slice(&budget.read(&journal_path(&project))?)?;
@@ -11,7 +11,15 @@ pub fn read_identity_inventory(project:&Path,budget:&mut Budget)->Result<Vec<Run
     let marker:Format=serde_json::from_slice(&budget.read(&project.join(".state/format.json"))?)?;
     ensure!(marker==Format{version:1,runtime:"sqlite-v2".into(),memory:"legacy-markdown".into(),migration:journal.plan.digest.clone(),reconciliation_required:marker.reconciliation_required},"identity ownership marker mismatch");
     let publication=Publication{digest:journal.plan.digest,sources:journal.plan.sources.iter().filter(|s|s.kind!="backup").count() as u64,tasks:journal.plan.tasks.len() as u64,operations:journal.plan.operations.len() as u64,reconciliation_required:marker.reconciliation_required};
+    Ok((project,publication))
+}
+pub fn read_identity_inventory(project:&Path,budget:&mut Budget)->Result<Vec<RuntimeBinding>> {
+    let(project,publication)=publication(project,budget)?;
     crate::store::identity_inventory::read(&project.join(".state/state.db"),&publication,budget)
+}
+pub fn read_observation_head(project:&Path,budget:&mut Budget)->Result<u64> {
+    let(project,publication)=publication(project,budget)?;
+    crate::store::identity_inventory::read_head(&project.join(".state/state.db"),&publication,budget)
 }
 
 #[cfg(test)]
@@ -24,6 +32,24 @@ mod tests {
         let plan=inspect(&p).unwrap();assert!(plan.blockers.is_empty(),"{:?}",plan.blockers);apply(&p,&plan,true).unwrap();(root,p)
     }
     fn budget()->Budget {Budget::new(50*1024*1024,1024,Instant::now()+Duration::from_secs(10),Default::default()).unwrap()}
+    #[test]
+    fn observation_head_reads_no_historical_payload_and_fences_publication() {
+        let(_root,p)=fixture();let db=rusqlite::Connection::open(p.join(".state/state.db")).unwrap();
+        db.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('unrelated','x',1,1,?1)",[serde_json::to_string(&"x".repeat(20*1024*1024)).unwrap()]).unwrap();
+        let expected=db.query_row("SELECT max(sequence) FROM events",[],|r|r.get::<_,u64>(0)).unwrap();
+        let mut limits=Budget::new(2*1024*1024,0,Instant::now()+Duration::from_millis(100),Default::default()).unwrap();
+        assert_eq!(read_observation_head(&p,&mut limits).unwrap(),expected);assert!(limits.used()<100_000);
+        let path=p.join(".state/format.json");let mut marker:Format=serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();marker.reconciliation_required=!marker.reconciliation_required;fs::write(path,serde_json::to_vec(&marker).unwrap()).unwrap();
+        assert!(read_observation_head(&p,&mut budget()).is_err());
+    }
+    #[test]
+    fn observation_head_sqlite_work_is_interrupted_by_its_original_budget() {
+        let(_root,p)=fixture();let db=rusqlite::Connection::open(p.join(".state/state.db")).unwrap();
+        db.execute_batch("ALTER TABLE events RENAME TO original_events; CREATE VIEW events AS SELECT * FROM original_events WHERE (WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n)>0;").unwrap();
+        let mut limits=Budget::new(2*1024*1024,0,Instant::now()+Duration::from_millis(100),Default::default()).unwrap();let started=Instant::now();
+        assert!(read_observation_head(&p,&mut limits).is_err());assert!(started.elapsed()<Duration::from_secs(2));
+        let mut cancelled=budget();cancelled.cancellation.cancel();assert!(read_observation_head(&p,&mut cancelled).is_err());
+    }
     #[test]
     fn identity_inventory_matches_snapshot_without_materializing_unrelated_history() {
         let(_root,p)=fixture();let expected=crate::runtime::snapshot(&p).unwrap().runtime_bindings;

@@ -26,7 +26,7 @@ impl Budget {
 }
 pub(crate) struct Publication {pub digest:String,pub sources:u64,pub tasks:u64,pub operations:u64,pub reconciliation_required:bool}
 /// Caller has validated and budgeted the active journal and format marker.
-pub(crate) fn read(path:&Path,publication:&Publication,budget:&mut Budget)->Result<Vec<RuntimeBinding>> {
+fn read_published<T>(path:&Path,publication:&Publication,budget:&mut Budget,read:impl FnOnce(&rusqlite::Transaction<'_>,&mut Budget)->Result<T>)->Result<T> {
     use std::os::unix::fs::MetadataExt;
     budget.check()?;engine_check()?;
     for suffix in ["-wal","-shm","-journal"] {
@@ -51,6 +51,19 @@ pub(crate) fn read(path:&Path,publication:&Publication,budget:&mut Budget)->Resu
     ensure!(receipt==(publication.digest.clone(),publication.sources,publication.tasks,publication.operations),"identity migration receipt mismatch");
     let required=if version>=7 {tx.query_row("SELECT reconciliation_required FROM project_control WHERE singleton=1",[],|r|r.get::<_,bool>(0))?}else{true};
     ensure!(required==publication.reconciliation_required,"identity control publication interrupted");
+    let value=read(&tx,budget)?;budget.check()?;
+    let after=std::fs::symlink_metadata(path)?;ensure!(before.dev()==after.dev()&&before.ino()==after.ino()&&after.is_file()&&after.nlink()==1,"identity database replaced");
+    Ok(value)
+}
+
+/// Bounded publication-checked revision; no integrity scan or payload inventory.
+pub(crate) fn read_head(path:&Path,publication:&Publication,budget:&mut Budget)->Result<u64> {
+    read_published(path,publication,budget,|tx,budget|{budget.charge(8)?;Ok(super::head(tx)?)})
+}
+
+pub(crate) fn read(path:&Path,publication:&Publication,budget:&mut Budget)->Result<Vec<RuntimeBinding>> {
+    read_published(path,publication,budget,|tx,budget|{
+    let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
     for (minimum,table) in [(6,"runtime_observations"),(9,"runtime_ownership")] {
         if version>=minimum {
             let dangling:bool=tx.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table} r LEFT JOIN runtime_bindings b ON b.id=r.binding_id WHERE b.id IS NULL)"),[],|r|r.get(0))?;
@@ -70,7 +83,7 @@ pub(crate) fn read(path:&Path,publication:&Publication,budget:&mut Budget)->Resu
     let mut rows=statement.query([])?;
     if let Some(row)=rows.next()? {for column in 0..2 {let n:usize=row.get(column)?;ensure!(n<=16*1024*1024,"identity session provenance exceeds 16 MiB");budget.charge(n)?;}}
     drop(rows);drop(statement);budget.check()?;
-    let bindings=super::runtime::read_all(&tx)?;ensure!(bindings.len()==count,"identity inventory changed");budget.check()?;
-    let after=std::fs::symlink_metadata(path)?;ensure!(before.dev()==after.dev()&&before.ino()==after.ino()&&after.is_file()&&after.nlink()==1,"identity database replaced");
+    let bindings=super::runtime::read_all(tx)?;ensure!(bindings.len()==count,"identity inventory changed");budget.check()?;
     budget.records-=count;Ok(bindings)
+    })
 }

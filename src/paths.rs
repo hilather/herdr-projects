@@ -19,6 +19,12 @@ pub struct Env {
 }
 
 impl Env {
+    /// A worker needs only its frozen home and Herdr selection, not ambient
+    /// credentials or unrelated process-environment values.
+    #[cfg(feature="state-store")]
+    pub(crate) fn for_observation(home:&Path,bin:&str)->Self {
+        Self{home:home.to_path_buf(),vars:BTreeMap::from([("HERDR_BIN_PATH".into(),bin.into())])}
+    }
     pub fn from_process() -> Result<Self> {
         let vars: BTreeMap<String, String> = std::env::vars().collect();
         let home = vars

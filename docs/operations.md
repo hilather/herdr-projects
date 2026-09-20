@@ -183,7 +183,7 @@ locks survive ticker death until supervised local descendants are cleaned up;
 remote agent effects are not rolled back by local process cleanup.
 
 The built ticker is tested through local and remote confirmed/lost restart cases.
-macOS and real SSH-host acceptance remain untested. Token reporting still needs worker integration; canonical launch
+macOS and real SSH-host acceptance remain untested. Canonical launch
 certification and profile preparation remain separate prerequisites.
 
 On Linux, coordinator starts also use the supervised queue. `open` records the
@@ -239,7 +239,7 @@ Refreshes share bounded queue admission and have a 30-second cooldown after each
 attempt. Under saturation, tokens may expire before their next refresh; the ticker
 does not guarantee refresh within five minutes for every pane. Interactive
 foreground commands retain their immediate metadata updates. These changes do
-not complete W04; canonical controller workers and other planned work remain.
+not complete W04; canonical terminal-effect workers and other planned work remain.
 
 ## Local session observations
 
@@ -274,8 +274,38 @@ keeps the ticker alive. Never-opened projects are ineligible. The classification
 cache is bounded at 128; untracked eligible identities conservatively veto idle
 exit, so saturation may require an explicit ticker stop. Binding/configuration
 inventory reads remain synchronous and bounded by entry/byte limits with deadline
-checks; filesystem latency itself is not hard-bounded. Canonical controller
-observations and effects still require separate queue integration.
+checks; filesystem latency itself is not hard-bounded. Canonical observations use
+the separate path below; their terminal-effect adapters still need queue integration.
+
+
+## Canonical session observations
+
+With `state-store` on Linux, automatic canonical reconciliation uses the shared
+control pool with a 15-second admission-to-collection deadline. The worker retains
+project ownership from its initial snapshot through observation commit, marker
+publication and claim expiry. Probes hold no SQLite transaction. Cancellation or
+an elapsed deadline before commit discards the collection; a lost completion reply
+does not undo a successful database commit. Other projects remain available, while
+mutations of the project being observed defer until collection finishes.
+
+The queue admits at most 16 jobs from 128 fair offers. Every observation batch must
+drain before the next is admitted, so existing effects that require exclusive root
+ownership get a full ticker pass between batches. Scheduling also runs before
+admission. Queue replies carry only reachability and the committed event revision;
+they cannot authorize effects, release capacity or certify completion.
+
+Negative liveness results expire 60 seconds after admission and must match the
+current project, configuration and canonical event revision. A changed revision,
+failed probe or untracked identity vetoes idle exit until classified. Revision
+checks use a read-only publication-checked query, with a 2 MiB publication budget,
+100 ms cooperative deadline, SQLite progress cancellation and 10 ms busy timeout.
+They do not run database-wide integrity checks or materialize event payloads.
+Filesystem latency itself is not hard-bounded.
+
+Canonical notification/finalization adapters remain synchronous. Collection and
+those adapters still read full snapshots; bounded historical-state materialization
+and the remaining effect workers are separate unfinished W04 work. macOS and real
+SSH-host acceptance remain untested.
 
 ## Interrupted brief delivery
 
