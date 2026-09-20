@@ -523,6 +523,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
     if project.try_status()? != Status::Active { return Ok(None); }
     status_observation::deliver(project)?;
     thread::copy_delivery::deliver(project)?;
+    thread::review_delivery::deliver(project)?;
     let Some(record) = project.coordinator() else {
         return Ok(None);
     };

@@ -42,6 +42,15 @@ pub(super) fn convert(project:&Path,sources:&[Source],tasks:&mut Vec<Task>)->Res
             ensure!(tasks.iter().any(|t|t.id==task),"copy notice refers to unknown thread");
             operations.push(operation("legacy.inbox",&notice.id,task,serde_json::to_value(&notice)?,&Retry::default())?);
         }
+        if let Some(pending)=value.get("pending_review_notice") {
+            let notice:crate::review_notice::ReviewNotice=pending.clone().try_into()?;
+            let id=value.get("id").and_then(|v|v.as_str()).context("missing review notice thread")?;
+            let sequence=value.get("review_notice_sequence").and_then(|v|v.as_integer()).context("missing review notice sequence")?;
+            ensure!(sequence>=0,"negative review notice sequence");notice.validate(id,sequence as u64)?;
+            let task=TaskId::new(format!("legacy-{id}")).map_err(anyhow::Error::msg)?;
+            ensure!(tasks.iter().any(|t|t.id==task),"review notice refers to unknown thread");
+            operations.push(operation("legacy.inbox",&notice.id,task,serde_json::to_value(&notice)?,&Retry::default())?);
+        }
         if let Some(pending)=value.get("pending_status_notice") {
             let notice:crate::status_notice::StatusNotice=pending.clone().try_into()?;
             let id=value.get("id").and_then(|v|v.as_str()).context("missing status notice thread")?;

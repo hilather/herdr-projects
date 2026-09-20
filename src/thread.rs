@@ -18,6 +18,7 @@ pub const MEMORY_CAP_CHARS: usize = 32_000;
 pub const LIBRARY_CAP_KB: u64 = 50 * 1024;
 pub const MAX_LAUNCH_ATTEMPTS: u32 = 3;
 pub mod copy_delivery;
+pub mod review_delivery;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -72,6 +73,10 @@ pub struct Thread {
     pub pending_status_notice: Option<herdr_projects::status_notice::StatusNotice>,
     pub copy_receipt: Option<herdr_projects::copy_receipt::CopyReceipt>,
     pub pending_copy_notice: Option<herdr_projects::copy_receipt::CopyNotice>,
+    pub review_notice_sequence: u64,
+    pub pending_review_notice: Option<herdr_projects::review_notice::ReviewNotice>,
+    pub last_review_execution: String,
+    pub last_review_copy_sequence: u64,
     pub report_hash: String,
     pub last_report_change: String,
     pub last_review_item_hash: String,

@@ -645,3 +645,22 @@ fn pending_copy_warning_imports_without_ticker_and_invalid_receipt_blocks() {
     apply(&project,&plan,true).unwrap();let mut db=open_active(&project).unwrap();
     assert_eq!(db.read_snapshot(None).unwrap().operations,plan.operations);
 }
+
+#[test]
+fn pending_review_notice_imports_without_ticker_and_rejects_identity_corruption() {
+    let (_temp,project)=fixture();let path=project.join("threads/t-0001.toml");
+    let mut value:toml::Value=toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let execution="a".repeat(64);
+    let mut notice=crate::review_notice::ReviewNotice{id:format!("review-t-0001-{execution}-1"),kind:"thread-state".into(),subject:"t-0001".into(),summary:"historical report".into(),body:String::new(),execution,report_hash:"b".repeat(64),sequence:1,copy_receipt:None};
+    notice.body=notice.expected_body();
+    value.as_table_mut().unwrap().insert("review_notice_sequence".into(),toml::Value::Integer(1));
+    value.as_table_mut().unwrap().insert("pending_review_notice".into(),toml::Value::try_from(&notice).unwrap());
+    fs::write(&path,toml::to_string(&value).unwrap()).unwrap();
+    let plan=inspect(&project).unwrap();assert!(plan.blockers.is_empty(),"{:?}",plan.blockers);assert_eq!(plan.operations.len(),1);
+    assert_eq!(plan.operations[0].payload,serde_json::to_value(&notice).unwrap());
+    value["review_notice_sequence"]=toml::Value::Integer(2);fs::write(&path,toml::to_string(&value).unwrap()).unwrap();
+    assert!(!inspect(&project).unwrap().blockers.is_empty());
+    value["review_notice_sequence"]=toml::Value::Integer(1);fs::write(&path,toml::to_string(&value).unwrap()).unwrap();
+    apply(&project,&plan,true).unwrap();let mut db=open_active(&project).unwrap();
+    assert_eq!(db.read_snapshot(None).unwrap().operations,plan.operations);
+}

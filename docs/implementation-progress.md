@@ -1222,3 +1222,43 @@ warning replay, retained readiness notes and migration without ticker state.
 All 484 tests pass in debug and release (163 library, 289 binary, 30 CLI, two
 contracts), and the default-feature suite passes. Three optional live checks remain
 ignored. Logs: `/tmp/herdr-copy-delivery-{debug,release,default}.log`.
+
+## W04 durable review announcements
+
+Ready/Landing announcements now prepare immutable notices under the short record
+lock before calling inbox `write_once`. Thread records retain a monotonic notice
+sequence, the pending payload and execution/copy-specific acknowledgement fields.
+Identical typed receipts do not reannounce; A/B/A content or changed copy notes get
+distinct receipt-bound notices. Legacy reports without matching typed receipts retain
+their opaque hash compatibility and already-acknowledged state; malformed receipts
+still refuse. Historical receipts are not treated as evidence for a replacement.
+
+Pending announcements prevent another live copy at both admission and receipt
+commit. Prepared notices drain independently of current readiness or session access.
+Only the exact delivered pending payload is cleared. Acknowledgement updates require
+the original execution, hash and matching receipt, so historical delivery cannot
+acknowledge a replacement. Notice bodies identify the historical hash/execution and
+explain that the home report path can change. Migration validates the notices and
+converts them to inbox operations even without ticker state.
+
+Four delivery regressions cover failed delivery, success-before-ack crash replay,
+inbox/done replay, readiness changes, identical-report execution replacement, A/B/A,
+changed copy notes, legacy acknowledgements and stale preparation. A migration
+regression verifies conversion and identity corruption refusal. Independent review
+approved the implementation and independently reran the focused tests.
+
+Transfer-pool admission and remaining W04 work are still outstanding. Counts remain
+16 implemented, five partial and 20 not started. macOS remains untested.
+
+All 489 tests pass in debug and release (164 library, 293 binary, 30 CLI, two
+contracts), and the default-feature suite passes. The existing finishing-thread
+scenario now checks the provenance body while retaining its one-notice/one-nudge
+assertions. Three optional live checks remain ignored. Logs:
+`/tmp/herdr-review-delivery-{debug,release,default}.log`.
+
+Design review for the next transfer step calls for a separate bounded live-copy
+protocol and verified staging type, preserving schema-1 strict finalization. Report
+and library retain independent caps; an oversized library must not block a valid
+report. Bounded omissions must describe additive projection accurately, and partial
+live staging must never authorize destructive cleanup. Unsupported remote helpers
+must refuse without falling back to unbounded shell/rsync transfers.

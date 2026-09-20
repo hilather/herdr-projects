@@ -12,7 +12,9 @@ pub fn validate(t: &Thread) -> Result<()> {
 
 pub fn ready(t: &Thread) -> Result<()> {
     validate(t)?;
+    super::review_delivery::validate(t)?;
     anyhow::ensure!(t.pending_copy_notice.is_none(), "prior copy warning still pending");
+    anyhow::ensure!(t.pending_review_notice.is_none(), "prior review notice still pending");
     Ok(())
 }
 

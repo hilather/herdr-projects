@@ -490,7 +490,8 @@ fn a_finishing_thread_gives_one_item_and_one_nudge_until_a_new_item_arrives() {
     let items = items_of(&project, "thread-state");
     assert_eq!(items.len(), 1, "{items:?}");
     assert!(items[0].summary.contains("threads/t-0001.md"));
-    assert!(items[0].body.is_empty());
+    assert!(items[0].body.contains("Review report `"));
+    assert!(items[0].body.contains("is mutable and may now contain a later report"));
     let nudges = |w: &World| w.runner.calls.borrow().iter().filter(|c| c.args.last().is_some_and(|a| a == crate::steps::NUDGE_TEXT)).count();
     assert_eq!(nudges(&world), 1);
     // The nudge went to the coordinator's pane and carries no outside text.

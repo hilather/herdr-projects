@@ -146,6 +146,13 @@ after restart with the same inbox identity, including when the item is already i
 receipt. Historical warnings identify their original execution and report; delivering
 one does not change a replacement execution. Saved notes remain available for the
 later review announcement. A library failure does not advance the copied report hash.
+Review announcements now save their full payload before inbox delivery. Retries reuse
+the same ID and acknowledge only the matching execution and copy receipt. A pending
+announcement prevents another live copy from replacing its report; historical notices
+still deliver after execution replacement without acknowledging the replacement.
+The notice body records the original report hash because `threads/<id>.md` can later
+change. Legacy reports without typed receipts retain their existing hash-based
+deduplication. Already-prepared notices can drain even when the session is unavailable.
 Complete local and supported remote final copies also retain content-addressed snapshots in
 `.state/artifacts/<thread>/<manifest-hash>/`, with a verified `manifest.json`.
 Snapshots contain the report and library, including empty directories; the combined

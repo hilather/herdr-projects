@@ -231,24 +231,9 @@ pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[T
         inbox::write(project, "thread-state", &t.id, &summary, "")?;
     }
 
-    // Ready for review: once per report hash, so an agent that goes back and
-    // forth between working and idle on an unchanged report produces nothing.
-    for t in thread::list(project) {
-        if t.status != Status::Open || t.report_hash.is_empty() || t.report_hash == t.last_review_item_hash {
-            continue;
-        }
-        if t.last_group != Group::ReadyForReview.token() && t.last_group != Group::Landing.token() {
-            continue;
-        }
-        let mut summary = format!("{} has a new report: threads/{}.md", thread_label(&t), t.id);
-        thread::copy_delivery::validate(&t)?;
-        if let Some(notes) = thread::copy_delivery::notes(&t).filter(|notes| !notes.is_empty()) {
-            summary.push_str(&format!("; not everything was copied: {}", notes.join("; ")));
-        }
-        inbox::write(project, "thread-state", &t.id, &summary, "")?;
-        let hash = t.report_hash.clone();
-        thread::update(project, &t.id, |t| t.last_review_item_hash = hash)?;
-    }
+    // Persist immutable intent before delivery, with receipt-specific acknowledgement.
+    for t in thread::list(project) { thread::review_delivery::prepare(project, &t)?; }
+    thread::review_delivery::deliver(project)?;
     Ok(())
 }
 
