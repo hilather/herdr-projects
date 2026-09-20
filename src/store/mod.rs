@@ -4,7 +4,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{fmt, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 
-const SCHEMA: u32 = 10;
+const SCHEMA: u32 = 11;
 const APPLICATION: u32 = 1_213_222_994;
 const MIN_SQLITE: i32 = 3_053_004;
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
@@ -59,6 +59,7 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../migrations/0008_canonical_runtime.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0009_runtime_ownership.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0010_scheduler_queue.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0011_attempt_inputs.sql"))?;
             tx.commit()?;
         }
         // Persist the initial directory entry as well as SQLite's own commit.
@@ -104,8 +105,10 @@ impl SqliteStore {
         let ownership=if schema>=9 {ownership::read_all(&tx)?}else{Vec::new()};
         let control=if schema>=7 {Some(control::read(&tx)?)}else{None};
         let scheduler=if schema>=10 {Some(scheduler::read(&tx)?)}else{None};
+        let attempt_inputs=if schema>=11 {reservations::read_inputs(&tx)?}else{Vec::new()};
+        let cancellations=if schema>=11 {reservations::read_cancellations(&tx)?}else{Vec::new()};
         tx.commit()?;
-        Ok(Snapshot { schema_version:schema, head, tasks, attempts, operations, deliveries, inbox, runtime_bindings, observations, ownership, control, scheduler, events })
+        Ok(Snapshot { schema_version:schema, head, tasks, attempts, operations, deliveries, inbox, runtime_bindings, observations, ownership, control, scheduler, attempt_inputs, cancellations, events })
     }
     /// All mutations, generated audit events and durable intents commit together.
     /// Revisions start at one and advance by exactly one. A stale head or record
@@ -127,6 +130,7 @@ impl SqliteStore {
                 Mutation::Task { expected, next } => { revision(*expected, next.revision)?; serde_json::to_value(next) },
                 Mutation::Attempt { expected, next } => { revision(*expected, next.revision)?; serde_json::to_value(next) },
                 Mutation::Enqueue(next) => {
+                    if next.kind=="runtime.launch" {return Err(StoreError::Invalid("launch intents require atomic scheduler reservation".into()));}
                     integer(next.expected_revision)?;
                     if next.expected_revision == 0 || next.payload_version == 0 { return Err(StoreError::Invalid("zero operation revision/version".into())); }
                     serde_json::to_value(next)
@@ -282,3 +286,5 @@ pub(crate) mod ownership;
 pub use ownership::OwnershipChange;
 
 mod scheduler;
+
+mod reservations;

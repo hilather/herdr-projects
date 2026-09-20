@@ -536,3 +536,31 @@ Default-feature tests and the release build also pass. Logs:
 T04.1 remains partial: immutable prepared inputs, atomic reservation/launch intent
 creation and cancellation still need implementation. Queueing does not reserve or
 launch; profile/authority and the carried launch crash gate remain prerequisites.
+
+## W04 atomic reservation and cancellation foundation
+
+Schema v11 commits retained capacity, immutable attempt inputs, the task pointer and
+launch intent atomically. Preparations are sealed internal capabilities scoped to
+the exact store and task/control/policy/binding revisions; production profile and
+authority producers remain unavailable. Generic enqueue refuses launch intents.
+The new cancellation CLI audits requests. It releases capacity only for an exact
+never-claimed reservation while atomically retiring its launch; retried, claimed,
+lost and adopted workers retain capacity. SQL prevents claim counters from being
+reset, and immutable input/request records survive restart and export.
+
+Independent review approved the bounded foundation after orphan-input/read checks
+and transactional refusal of unsupported older launch intents were added. Twelve
+focused tests cover reservation contention, rollback, claim/cancel races, immutable
+inputs, retained uncertainty, restart, upgrade and process death before/after commit.
+A CLI regression confirms cancellation of an unproven worker records a request
+without release. The full debug suite passes 368 tests, with both subsequently added
+crash tests also passing in debug; the full release suite passes all 370 tests
+(92 library, 250 binary, 26 CLI, 2 contracts). Default-feature validation passes 227.
+Three opt-in live tests remain ignored; macOS remains unavailable. Logs:
+`/tmp/herdr-reserve-{debug,focused,release,legacy,build}.log`.
+
+T04.1 remains partial until production preparation/launch and termination paths
+exist. No worker launch was enabled and no external launch crash gate is claimed.
+Next is T04.2 bounded execution and elapsed-time scheduling, then kind-bound profiles
+and authority producers. The overall 41-card counts remain 16 implemented locally,
+one partial and 24 not started.

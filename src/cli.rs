@@ -354,6 +354,8 @@ enum MigrationCommand {
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
 enum TaskCommand {
+    /// Record cancellation; release capacity only with proof launch was never claimed
+    CancelAttempt { attempt:String, #[arg(long)] expected_revision:u64, #[arg(long)] expected_head:u64, #[arg(long)] reason:String },
     Queue { id:String, #[arg(long)] input_file:PathBuf, #[arg(long)] expected_revision:u64, #[arg(long)] expected_head:u64 },
     List,
     Show { id:String },
@@ -477,6 +479,7 @@ pub fn run() -> Result<()> {
                     let request=serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid queue request JSON"))?;
                     println!("{}",runtime::queue_task(&dir,&TaskId::new(id).map_err(anyhow::Error::msg)?,expected_revision,expected_head,&request)?);
                 },
+                TaskCommand::CancelAttempt{attempt,expected_revision,expected_head,reason}=>println!("{}",serde_json::to_string_pretty(&runtime::cancel_attempt(&dir,&herdr_projects::domain::AttemptId::new(attempt).map_err(anyhow::Error::msg)?,expected_revision,expected_head,&reason)?)?),
                 TaskCommand::List=>println!("{}",serde_json::to_string_pretty(&runtime::snapshot(&dir)?)?),
                 TaskCommand::Show{id}=>{
                     let id=TaskId::new(id).map_err(anyhow::Error::msg)?;

@@ -91,6 +91,8 @@ pub struct Snapshot {
     pub ownership:Vec<RuntimeOwnership>,
     pub control:Option<ProjectControl>,
     pub scheduler:Option<SchedulerSnapshot>,
+    pub attempt_inputs:Vec<AttemptInputRecord>,
+    pub cancellations:Vec<CancellationRequest>,
     pub events: Vec<Event>,
 }
 pub enum Mutation {
@@ -115,3 +117,6 @@ pub use ownership::{RuntimeOwnership,ResourceIdentity,AgentIdentity};
 
 mod scheduler;
 pub use scheduler::*;
+
+mod attempt_inputs;
+pub use attempt_inputs::*;

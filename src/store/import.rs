@@ -29,6 +29,11 @@ impl SqliteStore {
         if version<=7 {tx.execute_batch(include_str!("../../migrations/0008_canonical_runtime.sql"))?;}
         if version<=8 {tx.execute_batch(include_str!("../../migrations/0009_runtime_ownership.sql"))?;}
         if version<=9 {tx.execute_batch(include_str!("../../migrations/0010_scheduler_queue.sql"))?;}
+        if version<=10 {
+            let unsupported:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE kind='runtime.launch')",[],|r|r.get(0))?;
+            if unsupported {return Err(StoreError::Invalid("upgrade refused: preexisting runtime.launch intents lack sealed attempt inputs; reconcile unsupported intents before upgrading".into()));}
+            tx.execute_batch(include_str!("../../migrations/0011_attempt_inputs.sql"))?;
+        }
         tx.commit()?;
         Ok(())
     }

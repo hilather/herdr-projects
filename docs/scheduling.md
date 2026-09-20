@@ -1,7 +1,8 @@
 # Scheduling foundation (partial T04.1)
 
 Schema v10 adds canonical queue records, typed dependency edges and a revisioned
-project capacity policy. It does not yet reserve attempts or enable worker launches.
+project capacity policy. Schema v11 adds atomic reservations behind an internal
+preparation capability and audited cancellation. Worker launches remain disabled.
 Use `migration PROJECT upgrade-store` for an older published store. Old exports
 remain unchanged. Fresh/updated policy starts at zero workers until explicitly set;
 legacy advisory limits are not silently promoted into execution authority.
@@ -41,5 +42,39 @@ task); unrelated unqueued tasks do not make a store unreadable.
 
 Failed/cancelled predecessors block explicitly. Narrative succeeded state cannot
 satisfy an evidence-bound edge. Verified-result producers arrive in W07; profile,
-authority, immutable reservation inputs and atomic capacity reservation remain W04
-work. See the [frozen W04 interfaces](adr/0004-w04-scheduling-contract.md).
+authority and production launch preparation remain W04 work. See the [frozen W04 interfaces](adr/0004-w04-scheduling-contract.md).
+
+## Reservations and cancellation (schema v11)
+
+A reservation transaction counts every unterminated attempt, checks task, binding,
+control and policy revisions, selects among sealed ready preparations using aged
+priority, then commits the attempt, immutable inputs, task pointer and launch intent
+together. Inputs pin this store, configuration, profile, approval and repository
+identities. Dependency/memory/budget evidence producers are not available yet;
+preparations requiring them refuse. There is no CLI constructor or production
+producer for the sealed preparation capability. Generic intent enqueue cannot
+create `runtime.launch` operations; the controller does not dispatch launches.
+
+```sh
+herdr-projects task demo cancel-attempt ATTEMPT \
+  --expected-revision R --expected-head H --reason "operator requested stop"
+```
+
+Cancellation records desired state and an immutable audit. `released: true` requires
+an exact reserved attempt/input/intent binding, no associated worker or other retained
+attempt, unchanged task/binding, and a pending intent with zero lifetime claims.
+Claim counters cannot move backwards. The transaction retires that intent and marks
+the attempt/task cancelled before freeing capacity. Pending after a retry does not
+qualify. Other cancellations retain the worker and capacity; this command does not
+send a stop signal. There is no termination adapter yet.
+
+| Before | Cancellation result | Capacity |
+| --- | --- | --- |
+| Reserved, proven never claimed | Attempt/task cancelled; intent permanently retired | Released |
+| Claimed, retried, ambiguous or lost | Request audited; task revision fences old launch/result | Retained |
+| Adopted attempt without sealed inputs | Request audited | Retained |
+
+Schema upgrades preserve previous exports and claim history. Unsupported preexisting
+`runtime.launch` intents without sealed inputs block upgrade before commit; they
+cannot be promoted into launch authority. Reservation crash/rollback tests cover DB
+boundaries only. External launch crash certification remains a separate gate.

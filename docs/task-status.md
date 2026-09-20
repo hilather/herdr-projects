@@ -45,9 +45,11 @@ file-backed; no projects have been migrated. See the bounded W03 handoff; platfo
 
 ## Next work
 
-W04 T04.1 now has a [schema-v10 queue/policy foundation](scheduling.md): DAG
+W04 T04.1 now has a [schema-v11 scheduling foundation](scheduling.md): DAG
 validation, aged priority, retained-attempt capacity reporting and fenced CLI edits.
-Atomic reservation, immutable attempt inputs and cancellation remain, followed by bounded command execution (T04.2), kind-bound worker profiles
+Atomic reservations and immutable inputs now have a sealed internal API, and cancellation
+has an audited CLI. Production launch preparation/dispatch and termination remain
+unavailable. Next are bounded command execution (T04.2), kind-bound worker profiles
 (T04.3), budgets/routines/telemetry (T04.4) and operation-scoped authority (T04.5).
 The [scheduler/executor/profile interfaces](adr/0004-w04-scheduling-contract.md) are frozen. Existing retained/adopted attempts
 must count toward the cap; no uncertain worker may be replaced to free a slot.
