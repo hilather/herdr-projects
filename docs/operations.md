@@ -239,7 +239,7 @@ Refreshes share bounded queue admission and have a 30-second cooldown after each
 attempt. Under saturation, tokens may expire before their next refresh; the ticker
 does not guarantee refresh within five minutes for every pane. Interactive
 foreground commands retain their immediate metadata updates. These changes do
-not complete W04; canonical finalization workers and other planned work remain.
+not complete W04; bounded canonical materialization and other planned work remain.
 
 ## Local session observations
 
@@ -275,7 +275,7 @@ cache is bounded at 128; untracked eligible identities conservatively veto idle
 exit, so saturation may require an explicit ticker stop. Binding/configuration
 inventory reads remain synchronous and bounded by entry/byte limits with deadline
 checks; filesystem latency itself is not hard-bounded. Canonical observations use
-the separate path below; canonical finalization still needs queue integration.
+the separate path below.
 
 
 ## Canonical session observations
@@ -302,9 +302,9 @@ checks use a read-only publication-checked query, with a 2 MiB publication budge
 They do not run database-wide integrity checks or materialize event payloads.
 Filesystem latency itself is not hard-bounded.
 
-Canonical finalization remains synchronous. Collection and canonical effect
-selection still read full snapshots; bounded historical-state materialization
-and the remaining effect workers are separate unfinished W04 work. macOS and real
+Collection and canonical effect selection still read full snapshots; bounded
+historical-state materialization and other authority/profile work remain
+unfinished W04 work. macOS and real
 SSH-host acceptance remain untested.
 
 
@@ -590,3 +590,37 @@ project locks, rechecks the original hash, and saves the exact original bytes un
 links and invalid replacements are refused. This is an explicit restore tool;
 it cannot reconstruct missing obligations or certify the semantics of a supplied
 replacement. Keep backups and review the restored record before resuming work.
+
+
+## Canonical finalization workers
+
+With `state-store` on Linux, the ticker queues accepted finalization intents and
+receipt observations in the shared transfer pool. One 180-second cooperative
+deadline covers capture, verification and receipt recovery. The worker retains
+project ownership and excludes managed routines through the database outcome.
+All writes happen in-process; process death stops the writer without leaving an
+effect-capable child. Same-project observations defer while the effect is pending.
+
+Before a new copy, the worker freezes the opened source directory identity and
+compares it with the capture descriptor. It checks current configuration, task,
+control state and claim before snapshot publication, receipt publication and
+confirmation. The source path is checked after publication authorization. Verified
+bytes move the task to awaiting review; they do not certify task success. Queue
+completion has no durable authority.
+
+An ambiguous operation only loads and verifies its retained receipt and snapshot.
+It never copies the source again and can recover after the source directory has
+been removed. Missing/corrupt evidence leaves the operation unresolved. Recovery
+uses a fresh event revision under project ownership rather than an admission-time
+revision. Published receipts and snapshots are never overwritten or pruned here.
+
+A project may retain at most 16 temporary canonical stages and 16 temporary
+receipt files before new capture/publication refuses. Inventory traversal is
+entry- and deadline-bounded. Canonical stage cleanup uses the original cancellation
+and deadline, anchored directory descriptors and inode checks; cancellation may
+leave a counted stage. At capacity, stop managed work and inspect abandoned
+`.state/canonical-artifacts/runtime-*/.stage-*` or
+`.state/finalization-receipts/.*.next` entries before manually removing temporary
+files. Preserve hash-named snapshots and final `.json` receipts. No automatic
+reclamation is performed. Existing valid receipt recovery bypasses these admission
+limits. Filesystem latency remains cooperative, not a hard shutdown guarantee.

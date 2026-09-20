@@ -47,6 +47,10 @@ impl Queue {
     pub fn offer_canonical_notification(&mut self,ctx:&Ctx,path:&Path,operation:&herdr_projects::domain::Operation,revision:u64,socket:&str)->Result<()> {
         self.offer_request(crate::canonical_notification_jobs::request(ctx,path,operation,revision,socket)?)
     }
+    #[cfg(feature="state-store")]
+    pub fn offer_canonical_finalization(&mut self,ctx:&Ctx,path:&Path,operation:&herdr_projects::domain::Operation,revision:u64,mode:crate::canonical_finalization_jobs::Mode)->Result<()> {
+        self.offer_request(crate::canonical_finalization_jobs::request(ctx,path,operation,revision,mode)?)
+    }
     pub fn offer_coordinator_start(&mut self,ctx:&Ctx,project:&Project,c:&crate::project::Coordinator)->Result<()> {
         self.offer_request(crate::coordinator_jobs::request_start(ctx,project,c)?)
     }

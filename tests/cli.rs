@@ -1203,3 +1203,36 @@ else:print('{"result":{"shown":true}}')
         assert!(!home.path().join("WRONG_SYNC_EFFECT").exists());
     }
 }
+
+#[cfg(feature="state-store")]
+#[test]
+fn ticker_canonical_finalization_preserves_once_and_recovers_receipt_after_restart() {
+    use std::{fs,process::Stdio,time::{Duration,Instant}};
+    use herdr_projects::{migration,runtime,operations::DeliveryState,domain::TaskState};
+    for interrupted in [false,true] {
+        let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
+        for action in ["new","pause"] {assert!(hp(home.path(),&["--root",r,action,"demo"]).status.success());}
+        let project=root.join("demo");let source=home.path().join("source");fs::create_dir_all(source.join("library")).unwrap();fs::write(source.join("report.md"),"report for review\n").unwrap();fs::write(source.join("library/result"),b"preserved bytes").unwrap();
+        let original=format!("id='t-0001'\nstatus='resolved'\nthread_dir={}\n",serde_json::to_string(source.to_str().unwrap()).unwrap());fs::write(project.join("threads/t-0001.toml"),&original).unwrap();let plan=migration::inspect(&project).unwrap();migration::apply(&project,&plan,true).unwrap();
+        let head=runtime::snapshot(&project).unwrap().head.to_string();let out=hp(home.path(),&["--root",r,"operations","demo","finalize","thread:t-0001","--reason","review","--expected-head",&head]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));let op:herdr_projects::domain::Operation=serde_json::from_slice(&out.stdout).unwrap();
+        let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();
+        if interrupted {raw.execute_batch("CREATE TRIGGER reject_confirmation BEFORE UPDATE ON operation_delivery WHEN NEW.state='confirmed' BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();}
+        struct Child(std::process::Child);impl Drop for Child {fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+        let spawn=||Child(Command::new(BIN).env_clear().env("HOME",home.path()).env("PATH","/usr/bin:/bin").env("HERDR_BIN_PATH","/bin/false").args(["--root",r,"ticker","run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+        let read=||runtime::snapshot(&project).unwrap().deliveries.into_iter().find(|d|d.operation==op.id).unwrap();
+        let wait=|child:&mut Child,predicate:&dyn Fn()->bool|{let deadline=Instant::now()+Duration::from_secs(10);while !predicate(){assert!(child.0.try_wait().unwrap().is_none());assert!(Instant::now()<deadline,"{}",fs::read_to_string(root.join(".ticker.log")).unwrap_or_default());std::thread::sleep(Duration::from_millis(10));}};
+        let stop=|child:&mut Child|{fs::write(root.join(".ticker.stop"),b"").unwrap();let deadline=Instant::now()+Duration::from_secs(8);while child.0.try_wait().unwrap().is_none(){assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(10));}fs::remove_file(root.join(".ticker.stop")).unwrap();};
+        let receipt_path=project.join(".state/finalization-receipts").join(format!("{}.json",op.id.as_str()));let mut child=spawn();
+        if interrupted {
+            wait(&mut child,&||receipt_path.is_file());child.0.kill().unwrap();child.0.wait().unwrap();
+            assert_eq!(read().state,DeliveryState::Claimed);raw.execute_batch("DROP TRIGGER reject_confirmation;").unwrap();
+            migration::open_active(&project).unwrap().expire_claims(read().lease_until_ms.unwrap()+1).unwrap();fs::remove_dir_all(&source).unwrap();
+            let mut child=spawn();wait(&mut child,&||read().state==DeliveryState::Confirmed);stop(&mut child);
+        }else{wait(&mut child,&||read().state==DeliveryState::Confirmed);stop(&mut child);fs::remove_dir_all(&source).unwrap();}
+        let receipt:herdr_projects::operations::finalization::FinalizationReceipt=serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+        assert_eq!(fs::read(project.join(".state/canonical-artifacts").join(&receipt.artifact_key).join(&receipt.snapshot).join("library/result")).unwrap(),b"preserved bytes");
+        let before=runtime::snapshot(&project).unwrap();let mut child=spawn();wait(&mut child,&||runtime::snapshot(&project).unwrap().head>before.head);stop(&mut child);
+        let after=runtime::snapshot(&project).unwrap();assert_eq!(read().attempts,1);assert_eq!(read().state,DeliveryState::Confirmed);assert_eq!(after.tasks.iter().find(|t|Some(&t.id)==op.task.as_ref()).unwrap().state,TaskState::AwaitingReview);assert_eq!(fs::read_to_string(project.join("threads/t-0001.toml")).unwrap(),original);
+        assert_eq!(fs::read_dir(project.join(".state/canonical-artifacts").join(&receipt.artifact_key)).unwrap().count(),1);
+    }
+}

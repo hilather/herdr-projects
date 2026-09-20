@@ -265,6 +265,8 @@ pub fn run(ctx: &Ctx) -> Result<()> {
     #[cfg(feature="state-store")]
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::canonical_notification_jobs::JobRunner{inner:runner});
     #[cfg(feature="state-store")]
+    let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::canonical_finalization_jobs::JobRunner{inner:runner});
+    #[cfg(feature="state-store")]
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::routine_jobs::JobRunner{inner:runner});
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::copy_jobs::JobRunner{inner:runner});
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::legacy_routine_jobs::JobRunner{inner:runner});

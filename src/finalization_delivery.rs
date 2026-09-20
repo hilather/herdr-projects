@@ -4,12 +4,12 @@ use anyhow::{Context,Result,ensure};
 use crate::{artifacts,cleanup,paths::Ctx,project::Project,thread::Thread,source_tree::Control};
 use herdr_projects::{domain::{Operation,OperationId},migration,operations::{Claim,Outcome,Delivery,dispatch::{self,DeliveryAdapter,PreparedDelivery,DispatchRequest,DispatchResult},finalization::{Finalization,FinalizationReceipt,digest}},runtime};
 
-fn record(payload:&Finalization)->Thread {Thread{id:payload.artifact_key(),thread_dir:payload.source.clone(),lifecycle_generation:payload.binding_revision,..Default::default()}}
-fn project(path:&Path)->Result<Project> {Ok(Project{root:path.parent().context("project has no root")?.into(),slug:path.file_name().and_then(|s|s.to_str()).context("invalid project slug")?.into()})}
+pub(crate) fn record(payload:&Finalization)->Thread {Thread{id:payload.artifact_key(),thread_dir:payload.source.clone(),lifecycle_generation:payload.binding_revision,..Default::default()}}
+pub(crate) fn project(path:&Path)->Result<Project> {Ok(Project{root:path.parent().context("project has no root")?.into(),slug:path.file_name().and_then(|s|s.to_str()).context("invalid project slug")?.into()})}
 fn receipt_path(project:&Project,op:&Operation)->PathBuf {project.state_dir().join("finalization-receipts").join(format!("{}.json",op.id.as_str()))}
 #[cfg(test)]
 fn load_receipt(project:&Project,op:&Operation,payload:&Finalization)->Result<Option<FinalizationReceipt>> {load_receipt_controlled(project,op,payload,&Control::default())}
-fn load_receipt_controlled(project:&Project,op:&Operation,payload:&Finalization,control:&Control)->Result<Option<FinalizationReceipt>> {
+pub(crate) fn load_receipt_controlled(project:&Project,op:&Operation,payload:&Finalization,control:&Control)->Result<Option<FinalizationReceipt>> {
     control.check()?;
     let path=receipt_path(project,op);
     match fs::symlink_metadata(path.parent().unwrap()) {Ok(m)=>ensure!(m.is_dir(),"receipt parent must be a real directory"),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(None),Err(e)=>return Err(e.into())}
@@ -23,7 +23,9 @@ fn load_receipt_controlled(project:&Project,op:&Operation,payload:&Finalization,
 }
 #[cfg(test)]
 fn save_receipt(project:&Project,op:&Operation,receipt:&FinalizationReceipt)->Result<()> {save_receipt_controlled(project,op,receipt,&Control::default())}
-fn save_receipt_controlled(project:&Project,op:&Operation,receipt:&FinalizationReceipt,control:&Control)->Result<()> {
+#[cfg(test)]
+fn save_receipt_controlled(project:&Project,op:&Operation,receipt:&FinalizationReceipt,control:&Control)->Result<()> {save_receipt_authorized(project,op,receipt,control,||Ok(()))}
+pub(crate) fn save_receipt_authorized(project:&Project,op:&Operation,receipt:&FinalizationReceipt,control:&Control,authorize:impl FnOnce()->Result<()>)->Result<()> {
     control.check()?;
     let path=receipt_path(project,op);let parent=path.parent().unwrap();
     match fs::DirBuilder::new().mode(0o700).create(parent) {Ok(())=>{},Err(e) if e.kind()==std::io::ErrorKind::AlreadyExists=>{},Err(e)=>return Err(e.into())}
@@ -31,6 +33,7 @@ fn save_receipt_controlled(project:&Project,op:&Operation,receipt:&FinalizationR
     // The root execution lease excludes other supported publishers. Never replace
     // any existing receipt; malformed evidence is preserved for operator repair.
     ensure!(matches!(fs::symlink_metadata(&path),Err(e) if e.kind()==std::io::ErrorKind::NotFound),"finalization receipt already exists or is unreadable");
+    artifacts::canonical_staging::receipt_room(parent,control)?;control.check()?;
     let temp=parent.join(format!(".{}-{}.next",op.id.as_str(),std::process::id()));
     let mut file=OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&temp)?;
     // Ordinary cancellation/errors remove only the temporary file created here.
@@ -39,7 +42,7 @@ fn save_receipt_controlled(project:&Project,op:&Operation,receipt:&FinalizationR
     impl Drop for Temporary {fn drop(&mut self){let _=fs::remove_file(&self.0);}}
     let _temporary=Temporary(temp.clone());
     file.write_all(&serde_json::to_vec(receipt)?)?;file.sync_all()?;
-    control.check()?;
+    authorize()?;control.check()?;
     fs::hard_link(&temp,&path)?;fs::remove_file(&temp)?;File::open(parent)?.sync_all()?;File::open(project.state_dir())?.sync_all()?;control.check()
 }
 
@@ -64,18 +67,22 @@ impl<'a,'b> DeliveryAdapter for Adapter<'a,'b> {
         Ok(Prepared{ctx:self.ctx,path:self.path.clone(),project:project(&self.path)?,payload,control,_lease:lease})
     }
 }
+impl Prepared<'_,'_> {
+    fn validate_current(&self,op:&Operation)->Result<()> {self.control.check()?;self.payload.validate(op,&runtime::snapshot(&self.path)?,&crate::notification_delivery::config(self.ctx,&self.path)?)?;self.control.check()}
+}
 impl PreparedDelivery for Prepared<'_,'_> {
-    fn revalidate(&mut self,op:&Operation)->Result<()> {self.control.check()?;self.payload.validate(op,&runtime::snapshot(&self.path)?,&crate::notification_delivery::config(self.ctx,&self.path)?)?;self.control.check()}
-    fn deliver(&mut self,op:&Operation,_claim:&Claim)->Result<Outcome> {
-        self.control.check()?;let receipt=if let Some(receipt)=load_receipt_controlled(&self.project,op,&self.payload,&self.control)? {receipt}else{
+    fn revalidate(&mut self,op:&Operation)->Result<()> {self.validate_current(op)}
+    fn deliver(&mut self,op:&Operation,claim:&Claim)->Result<Outcome> {
+        let authorize=||{ensure!(claim.lease_until_ms>jiff::Timestamp::now().as_millisecond(),"finalization claim lease elapsed");self.validate_current(op)};
+        authorize()?;let receipt=if let Some(receipt)=load_receipt_controlled(&self.project,op,&self.payload,&self.control)? {receipt}else{
             ensure!(fs::canonicalize(&self.payload.source)?==Path::new(&self.payload.source),"artifact source identity changed before capture");
-            let snapshot=artifacts::capture_canonical_controlled(&self.project,&record(&self.payload),&self.control)?;
+            let snapshot=artifacts::capture_canonical_controlled(&self.project,&record(&self.payload),&self.control,None,authorize)?;
             ensure!(snapshot.manifest.matches_canonical_execution(&record(&self.payload)),"captured manifest execution identity mismatch");
             ensure!(snapshot.manifest.report_hash()==Some(self.payload.report_hash.as_str()),"report changed after finalization was requested; snapshot retained but no completion receipt written");
             let receipt=FinalizationReceipt{operation_hash:digest(&serde_json::to_vec(op)?),artifact_key:self.payload.artifact_key(),snapshot:snapshot.id,report_hash:self.payload.report_hash.clone(),binding_revision:self.payload.binding_revision};
-            self.revalidate(op)?;save_receipt_controlled(&self.project,op,&receipt,&self.control)?;receipt
+            save_receipt_authorized(&self.project,op,&receipt,&self.control,authorize)?;receipt
         };
-        self.revalidate(op)?;Ok(Outcome::Confirmed{observed_identity:serde_json::to_string(&receipt)?})
+        authorize()?;Ok(Outcome::Confirmed{observed_identity:serde_json::to_string(&receipt)?})
     }
 }
 pub fn deliver(ctx:&Ctx,path:&Path,id:&OperationId,revision:u64)->Result<DispatchResult> {
@@ -102,6 +109,30 @@ pub(crate) mod tests {
         let source=world.home.path().join("artifact-root/source");fs::create_dir_all(source.join("library")).unwrap();fs::write(source.join("report.md"),"report for review\n").unwrap();fs::write(source.join("library/artifact"),b"preserved bytes").unwrap();
         let thread=Thread{id:"t-0001".into(),status:crate::thread::Status::Resolved,thread_dir:source.to_str().unwrap().into(),..Default::default()};fs::write(project.dir().join("threads/t-0001.toml"),toml::to_string(&thread).unwrap()).unwrap();
         let path=project.dir().canonicalize().unwrap();let plan=migration::inspect(&path).unwrap();migration::apply(&path,&plan,true).unwrap();let head=runtime::snapshot(&path).unwrap().head;let op=enqueue(&world.ctx(),&path,"thread:t-0001",head,"operator requests artifact review".into()).unwrap();(world,path,op)
+    }
+    #[test]
+    fn full_temporary_inventories_refuse_new_work_but_allow_source_free_receipt_recovery() {
+        let(world,path,op)=fixture();let ctx=world.ctx();let mut adapter=Adapter{ctx:&ctx,path:path.clone()};
+        let mut prepared=adapter.prepare(&op).unwrap();let mut db=migration::open_active(&path).unwrap();
+        let claim=db.claim_operation(&op.id,1,"inventory-fixture",jiff::Timestamp::now().as_millisecond(),300_000).unwrap();
+        prepared.deliver(&op,&claim).unwrap();drop(prepared);
+        let payload=Finalization::decode(&op).unwrap();let p=project(&path).unwrap();let receipt=load_receipt(&p,&op,&payload).unwrap().unwrap();
+        let parent=p.state_dir().join("finalization-receipts");
+        let stages=p.state_dir().join("canonical-artifacts").join(payload.artifact_key());
+        for n in 0..16 {fs::write(parent.join(format!(".orphan-{n}.next")),b"retained").unwrap();fs::create_dir(stages.join(format!(".stage-999-{n}"))).unwrap();}
+        assert!(artifacts::canonical_staging::receipt_room(&parent,&Control::default()).is_err());
+        assert!(artifacts::capture_canonical_controlled(&p,&record(&payload),&Control::default(),None,||Ok(())).is_err());
+        fs::remove_dir_all(&payload.source).unwrap();db.expire_claims(claim.lease_until_ms+1).unwrap();let before=db.read_snapshot(None).unwrap();
+        assert_eq!(observe(&ctx,&path,&op.id,3,before.head).unwrap().state,DeliveryState::Confirmed);
+        assert_eq!(load_receipt(&p,&op,&payload).unwrap().unwrap(),receipt);
+        assert_eq!(fs::read_dir(parent).unwrap().count(),17);assert_eq!(fs::read_dir(stages).unwrap().count(),17);
+    }
+    #[test]
+    fn receipt_publication_authority_refusal_removes_only_its_temporary_file() {
+        let(_world,path,op)=fixture();let p=project(&path).unwrap();let payload=Finalization::decode(&op).unwrap();
+        let receipt=FinalizationReceipt{operation_hash:digest(&serde_json::to_vec(&op).unwrap()),artifact_key:payload.artifact_key(),snapshot:"a".repeat(64),report_hash:payload.report_hash,binding_revision:payload.binding_revision};
+        assert!(save_receipt_authorized(&p,&op,&receipt,&Control::default(),||anyhow::bail!("authority withdrawn")).is_err());
+        assert!(!receipt_path(&p,&op).exists());assert_eq!(fs::read_dir(p.state_dir().join("finalization-receipts")).unwrap().count(),0);
     }
     #[test]
     fn cancelled_finalization_and_receipt_io_preserve_unresolved_intent() {

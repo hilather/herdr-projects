@@ -2420,3 +2420,47 @@ Validation passed 23 finalization regressions and 11 artifact tests in both debu
 and release with all features, plus the same 11 artifact tests with default
 features. Finalization checks include process death before/after receipt
 publication, transactional failure and recovery after source deletion.
+
+
+### W04 queued canonical finalization and bounded staging
+
+Canonical finalization delivery and ambiguous receipt observation now use the
+shared transfer queue with one 180-second deadline. Concrete workers retain
+ProjectGuard and global routine exclusion through receipt/DB persistence; no
+subprocess performs filesystem effects. Input freezes project/configuration and
+immutable operation identity. Receipt-first preparation freezes a source inode
+only when a new copy is needed, and capture compares the opened descriptor.
+Publication callbacks revalidate claim and authority before snapshot and receipt
+publication; final confirmation re-verifies retained evidence. Observe mode uses
+a fresh guarded snapshot and never reads or recopies the source. Queue completion
+cannot certify artifacts. Production ticker selection has no synchronous fallback
+when the queue is configured.
+
+Canonical temporary stages are capped at 16 across artifact keys; temporary
+receipt files have a separate limit of 16. Inventory traversal is bounded. Stage
+cleanup is descriptor-relative and shares the original cancellation/deadline; it
+refuses replacement inodes and leaves cancelled stages counted. Full inventory
+refuses new capture/publication, preserving evidence for operator inspection.
+Valid receipt recovery bypasses both caps and still works after source deletion.
+Legacy staging semantics are unchanged.
+
+Independent review caught source identity being checked before the publication
+authorization callback. The check now follows authorization, with a regression
+that replaces the source in that callback. Independent source review approved ownership, bounded accounting, receipt-only
+recovery and the final built-ticker fixture; broad validation follows below.
+New tests cover cancelled stages across keys, replacement-stage protection, full
+inventory recovery, queue/controller delivery, stale input refusal, source
+replacement after preparation, forged completion and worker process death before
+receipt/after receipt/after DB commit. The built ticker fixture exercises queued
+confirmation, SIGKILL after receipt with failed DB confirmation, source-free
+recovery and restart without replay.
+
+Full-snapshot/materialization bounds and other W04 launch/profile, budget/telemetry
+and authority work remain. Counts remain 16 locally implemented, five partial and
+20 unstarted. No unavailable macOS or real SSH-host check is claimed.
+
+Final validation passed all 673 unit tests (182 library, 491 binary) in both debug
+and release profiles, both finalization CLI regressions in both profiles, and 50
+default-feature artifact regressions. Process checks used disposable Linux
+namespaces. Independent review approved the source and production ticker fixture;
+`git diff --check` passed.

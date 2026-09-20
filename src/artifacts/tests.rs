@@ -176,3 +176,72 @@ fn expired_or_cancelled_capture_and_retained_load_do_not_start_new_work() {
         assert_eq!(fs::read_dir(project.state_dir().join("artifacts/t-0001")).unwrap().count(),1);
     }
 }
+
+#[cfg(feature="state-store")]
+fn canonical_fixture()->(crate::scenarios::World,Project,Thread) {
+    let(world,path,op)=crate::finalization_delivery::tests::fixture();
+    let payload=herdr_projects::operations::finalization::Finalization::decode(&op).unwrap();
+    let project=Project{root:path.parent().unwrap().into(),slug:path.file_name().unwrap().to_str().unwrap().into()};
+    let record=Thread{id:payload.artifact_key(),thread_dir:payload.source,lifecycle_generation:payload.binding_revision,..Default::default()};
+    (world,project,record)
+}
+
+#[cfg(feature="state-store")]
+#[test]
+fn canonical_capture_fences_open_source_identity_and_publication_authority() {
+    let(world,project,record)=canonical_fixture();let _lease=crate::cleanup::lease(&world.root).unwrap();
+    let metadata=fs::metadata(&record.thread_dir).unwrap();let expected=(metadata.dev(),metadata.ino());
+    let old=world.home.path().join("old-source");fs::rename(&record.thread_dir,&old).unwrap();
+    fs::create_dir_all(Path::new(&record.thread_dir).join("library")).unwrap();
+    for name in ["report.md","library/artifact"] {fs::copy(old.join(name),Path::new(&record.thread_dir).join(name)).unwrap();}
+    assert!(capture_canonical_controlled(&project,&record,&Control::default(),Some(expected),||Ok(())).is_err());
+    assert!(!project.state_dir().join("canonical-artifacts").exists());
+    let authorized=std::cell::Cell::new(true);let calls=std::cell::Cell::new(0);
+    let result=capture_authorized(&project,&record,||{authorized.set(false);Ok(())},true,&Control::default(),None,||{
+        calls.set(calls.get()+1);ensure!(authorized.get(),"authority withdrawn");Ok(())
+    });
+    assert!(result.is_err());assert_eq!(calls.get(),2);
+    assert_eq!(fs::read_dir(project.state_dir().join("canonical-artifacts").join(&record.id)).unwrap().count(),0);
+}
+
+#[cfg(feature="state-store")]
+#[test]
+fn canonical_cancelled_stages_are_counted_across_keys_without_deleting_snapshots() {
+    let(world,project,record)=canonical_fixture();let _lease=crate::cleanup::lease(&world.root).unwrap();
+    let good=capture_canonical_controlled(&project,&record,&Control::default(),None,||Ok(())).unwrap();
+    for n in 0..16 {
+        let control=Control::default();let mut next=record.clone();next.id=format!("runtime-{:064x}",n);
+        assert!(capture_authorized(&project,&next,||{control.cancellation.cancel();Ok(())},true,&control,None,||Ok(())).is_err());
+        assert_eq!(fs::read_dir(project.state_dir().join("canonical-artifacts").join(&next.id)).unwrap().count(),1);
+    }
+    let error=capture_canonical_controlled(&project,&record,&Control::default(),None,||Ok(())).err().unwrap();
+    assert!(error.to_string().contains("staging inventory is full"),"{error:#}");
+    assert_eq!(load_canonical_controlled(&project,&record,&good.id,&Control::default()).unwrap(),good.manifest);
+}
+
+#[cfg(feature="state-store")]
+#[test]
+fn canonical_cleanup_never_removes_a_replacement_stage() {
+    let(world,project,record)=canonical_fixture();let _lease=crate::cleanup::lease(&world.root).unwrap();
+    let stage=staging_mode_controlled(&project,&record,true,&Control::default()).unwrap();
+    let path=stage.0.clone();fs::rename(&path,path.with_extension("retained")).unwrap();
+    fs::create_dir(&path).unwrap();fs::write(path.join("keep"),b"replacement").unwrap();drop(stage);
+    assert_eq!(fs::read(path.join("keep")).unwrap(),b"replacement");
+}
+
+#[cfg(feature="state-store")]
+#[test]
+fn canonical_publication_rechecks_source_after_authorization() {
+    let(world,project,record)=canonical_fixture();let _lease=crate::cleanup::lease(&world.root).unwrap();
+    let mut calls=0;
+    let result=capture_canonical_controlled(&project,&record,&Control::default(),None,|| {
+        calls+=1;
+        if calls==2 {
+            fs::rename(&record.thread_dir,world.home.path().join("old-source"))?;
+            fs::create_dir(&record.thread_dir)?;
+        }
+        Ok(())
+    });
+    assert!(result.is_err());assert_eq!(calls,2);
+    assert_eq!(fs::read_dir(project.state_dir().join("canonical-artifacts").join(&record.id)).unwrap().count(),0);
+}

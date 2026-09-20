@@ -121,9 +121,10 @@ fn scan_controlled(root:&Path,destination:Option<&Path>,control:&Control)->Resul
     let entries=scan_open_controlled(&opened,destination,control)?;opened.matches_path(root)?;control.check()?;Ok(entries)
 }
 
-struct Staging(PathBuf);
+pub(crate) mod canonical_staging;
+struct Staging(PathBuf,Option<canonical_staging::Cleanup>);
 impl Drop for Staging {
-    fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    fn drop(&mut self) {if let Some(cleanup)=&self.1 {let _=cleanup.remove();}else{let _=fs::remove_dir_all(&self.0);}}
 }
 
 pub fn capture_local(project: &Project, record: &Thread) -> Result<Snapshot> {
@@ -138,15 +139,20 @@ fn capture_mode(project:&Project,record:&Thread,before_verify:impl FnOnce()->Res
     capture_mode_controlled(project,record,before_verify,canonical,&Control::default())
 }
 fn capture_mode_controlled(project:&Project,record:&Thread,before_verify:impl FnOnce()->Result<()>,canonical:bool,control:&Control)->Result<Snapshot> {
+    capture_authorized(project,record,before_verify,canonical,control,None,||Ok(()))
+}
+fn capture_authorized(project:&Project,record:&Thread,before_verify:impl FnOnce()->Result<()>,canonical:bool,control:&Control,expected_source:Option<(u64,u64)>,mut authorize:impl FnMut()->Result<()>)->Result<Snapshot> {
     control.check()?;
     ensure!(!record.is_remote() && !record.thread_dir.is_empty(), "local artifact source is required");
     artifact_id(&record.id,canonical)?;
     let source = Path::new(&record.thread_dir);
     real_dir(source)?;
     let opened=crate::source_tree::Directory::open(source)?;
+    if let Some(expected)=expected_source {let metadata=opened.metadata()?;ensure!((metadata.dev(),metadata.ino())==expected,"artifact source descriptor identity changed");}
     let identity = fs::canonicalize(source)?;
     control.check()?;
-    let staging = staging_mode(project, record,canonical)?;
+    authorize()?;opened.matches_path(source)?;control.check()?;
+    let staging = staging_mode_controlled(project, record,canonical,control)?;
     let manifest = Manifest {
         schema: 1, thread: record.id.clone(), generation: record.lifecycle_generation,
         machine: String::new(),
@@ -158,24 +164,26 @@ fn capture_mode_controlled(project:&Project,record:&Thread,before_verify:impl Fn
     ensure!(manifest.entries == scan_controlled(&staging.0, None,control)?, "staged artifact verification failed");
     verify_source_controlled(record, &manifest,control)?;
     opened.matches_path(source)?;
-    publish_mode_controlled(project, record, staging, manifest,canonical,control,||opened.matches_path(source))
+    publish_mode_controlled(project, record, staging, manifest,canonical,control,||{authorize()?;opened.matches_path(source)})
 }
 
-fn staging(project: &Project, record: &Thread) -> Result<Staging> {staging_mode(project,record,false)}
-fn staging_mode(project:&Project,record:&Thread,canonical:bool)->Result<Staging> {
+fn staging(project: &Project, record: &Thread) -> Result<Staging> {staging_mode_controlled(project,record,false,&Control::default())}
+fn staging_mode_controlled(project:&Project,record:&Thread,canonical:bool,control:&Control)->Result<Staging> {
     artifact_id(&record.id,canonical)?;
     let parent = project.state_dir().join(artifact_directory(canonical)).join(&record.id);
     {
         let _lock = artifact_lock(project,canonical)?;
         real_dir(&project.state_dir())?;
+        if canonical {canonical_staging::room(project,control)?;}
         make_dir(parent.parent().unwrap())?;
         make_dir(&parent)?;
         File::open(parent.parent().unwrap())?.sync_all()?;
         File::open(project.state_dir())?.sync_all()?;
     }
     let stage_path = parent.join(format!(".stage-{}-{}", std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed)));
-    fs::DirBuilder::new().mode(0o700).create(&stage_path)?;
-    let staging = Staging(stage_path);
+    control.check()?;fs::DirBuilder::new().mode(0o700).create(&stage_path)?;
+    let cleanup=if canonical {Some(canonical_staging::Cleanup::new(&stage_path,control)?)}else{None};
+    let staging = Staging(stage_path,cleanup);
     Ok(staging)
 }
 
@@ -271,6 +279,6 @@ fn artifact_lock(project:&Project,canonical:bool)->Result<ArtifactLock> {
     anyhow::bail!("canonical artifact capture requires state-store")
 }
 #[cfg(feature="state-store")]
-pub fn capture_canonical_controlled(project:&Project,record:&Thread,control:&Control)->Result<Snapshot> {capture_mode_controlled(project,record,||Ok(()),true,control)}
+pub fn capture_canonical_controlled(project:&Project,record:&Thread,control:&Control,expected_source:Option<(u64,u64)>,authorize:impl FnMut()->Result<()>)->Result<Snapshot> {capture_authorized(project,record,||Ok(()),true,control,expected_source,authorize)}
 #[cfg(feature="state-store")]
 pub fn load_canonical_controlled(project:&Project,record:&Thread,id:&str,control:&Control)->Result<Manifest> {load_mode_controlled(project,record,id,true,control)}

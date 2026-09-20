@@ -78,11 +78,17 @@ fn process_next(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::copy_job
     if candidates.is_empty(){return Ok(false);}
     candidates.sort_by(|(a,_),(b,_)|a.id.cmp(&b.id));
     let(operation,delivery)=candidates[(turn%candidates.len() as u64) as usize];
-    if operation.kind=="runtime.notification"&&let Some(effects)=effects {
-        let notice=herdr_projects::operations::notification::Notification::decode(operation)?;
+    if let Some(effects)=effects {
         let reference=crate::notification_delivery::config(ctx,path)?;
-        let binding=notice.validate(operation,&snapshot,&reference)?;
-        effects.offer_canonical_notification(ctx,path,operation,delivery.revision,&binding.identity.socket)?;
+        if operation.kind=="runtime.notification" {
+            let notice=herdr_projects::operations::notification::Notification::decode(operation)?;
+            let binding=notice.validate(operation,&snapshot,&reference)?;
+            effects.offer_canonical_notification(ctx,path,operation,delivery.revision,&binding.identity.socket)?;
+        }else{
+            herdr_projects::operations::finalization::Finalization::decode(operation)?.validate(operation,&snapshot,&reference)?;
+            let mode=if delivery.state==DeliveryState::Ambiguous {crate::canonical_finalization_jobs::Mode::Observe}else{crate::canonical_finalization_jobs::Mode::Deliver};
+            effects.offer_canonical_finalization(ctx,path,operation,delivery.revision,mode)?;
+        }
         return Ok(false);
     }
     if delivery.state==DeliveryState::Ambiguous {

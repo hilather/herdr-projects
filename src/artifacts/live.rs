@@ -176,7 +176,7 @@ fn reserve(project:&Project,kind:&str,headroom:usize,control:&Control)->Result<S
     for _ in 0..128 {
         let path=parent.join(format!(".{kind}-{}-{}",std::process::id(),SEQUENCE.fetch_add(1,Ordering::Relaxed)));
         match fs::DirBuilder::new().mode(0o700).create(&path) {
-            Ok(())=>return Ok(Staging(path)),
+            Ok(())=>return Ok(Staging(path,None)),
             Err(error) if error.kind()==std::io::ErrorKind::AlreadyExists=>continue,
             Err(error)=>return Err(error.into()),
         }

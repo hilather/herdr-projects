@@ -3,6 +3,8 @@ mod canonical_controller;
 #[cfg(feature="state-store")]
 mod canonical_notification_jobs;
 #[cfg(feature="state-store")]
+mod canonical_finalization_jobs;
+#[cfg(feature="state-store")]
 mod routine_jobs;
 mod actions;
 mod agents;
