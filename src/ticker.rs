@@ -259,6 +259,7 @@ pub fn run(ctx: &Ctx) -> Result<()> {
     let mut last_reachable = Instant::now();
     let mut memory = Memory::new(ctx);
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::remote_polling::ProbeRunner{inner:std::sync::Arc::new(crate::runner::RealRunner)});
+    let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::local_observations::ProbeRunner{inner:runner});
     #[cfg(feature="state-store")]
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::routine_jobs::JobRunner{inner:runner});
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::copy_jobs::JobRunner{inner:runner});
@@ -271,6 +272,7 @@ pub fn run(ctx: &Ctx) -> Result<()> {
     {memory.routine_jobs=Some(crate::routine_jobs::Queue::new(executor.clone()));}
     if cfg!(target_os="linux") {memory.copy_jobs=Some(crate::copy_jobs::Queue::new(executor.clone()));}
     memory.local_reports=Some(crate::local_reports::Reads::new(executor.clone()));
+    if cfg!(target_os="linux"){memory.local_observations=Some(crate::local_observations::Reads::new(executor.clone()));}
     memory.pr_reads=Some(crate::pr_polling::Reads::with_executor(executor.clone()));
     memory.remote_reads=Some(crate::remote_polling::Reads::new(executor));
     loop {
@@ -281,7 +283,7 @@ pub fn run(ctx: &Ctx) -> Result<()> {
         let wake = Instant::now() + TICK;
         if tick(ctx, &log, &mut memory) {
             last_reachable = Instant::now();
-        } else if last_reachable.elapsed() > IDLE_EXIT {
+        } else if last_reachable.elapsed() > IDLE_EXIT && !memory.local_observations.as_ref().is_some_and(|reads|reads.unknown()) {
             log.line("no reachable session or enabled canonical routine for five minutes; draining shared executor");
             return memory.pr_reads.as_mut().expect("ticker shared executor").stop();
         }
@@ -303,6 +305,7 @@ pub fn run(ctx: &Ctx) -> Result<()> {
 pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     memory.tick += 1;
     if let Some(reads)=memory.local_reports.as_mut(){reads.begin_pass();}
+    if let Some(reads)=memory.local_observations.as_mut(){reads.begin_pass();}
     if let Some(queue)=memory.copy_jobs.as_mut() {for error in queue.drain(){log.line(&error);}}
     #[cfg(feature="state-store")]
     if let Some(queue)=memory.routine_jobs.as_mut() {for error in queue.drain(){log.line(&error);}}
@@ -360,7 +363,7 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
                 if let Err(error)=queue.offer(ctx,&project,t,None){log.line(&format!("{slug}: copy recovery: {error:#}"));}
             }
         }
-        match tick_cheap_reports(ctx, &project,memory.local_reports.as_mut(),memory.copy_jobs.as_mut()) {
+        match tick_cheap_reports(ctx, &project,memory.local_reports.as_mut(),memory.copy_jobs.as_mut(),memory.local_observations.as_mut()) {
             Ok(Some(seen)) => reachable.push((project, seen)),
             Ok(None) => {}
             Err(error) => log.line(&format!("{slug}: {error:#}")),
@@ -388,6 +391,7 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         }
         admit_background(ctx,log,memory,canonical.into_iter().map(|slug|ctx.root.join(slug)).collect());
         if let Some(reads)=memory.local_reports.as_mut(){for error in reads.admit(){log.line(&error);}}
+        if let Some(reads)=memory.local_observations.as_mut(){for error in reads.admit(){log.line(&error);}}
         any_reachable|=memory.routine_jobs.as_ref().is_some_and(|q|q.pending());
         any_reachable|=memory.copy_jobs.as_ref().is_some_and(|q|q.pending()||q.offered());
         return any_reachable;
@@ -396,6 +400,7 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     {
         admit_background(ctx,log,memory,Vec::new());
         if let Some(reads)=memory.local_reports.as_mut(){for error in reads.admit(){log.line(&error);}}
+        if let Some(reads)=memory.local_observations.as_mut(){for error in reads.admit(){log.line(&error);}}
         any_reachable||memory.copy_jobs.as_ref().is_some_and(|q|q.pending()||q.offered())
     }
 
@@ -448,7 +453,8 @@ pub fn tick_project(ctx: &Ctx, project: &Project) -> Result<bool> {
 #[cfg(test)]
 pub fn tick_project_with(ctx: &Ctx, project: &Project, memory: &mut Memory) -> Result<bool> {
     if let Some(reads)=memory.local_reports.as_mut(){reads.begin_pass();}
-    match tick_cheap_reports(ctx, project,memory.local_reports.as_mut(),memory.copy_jobs.as_mut())? {
+    if let Some(reads)=memory.local_observations.as_mut(){reads.begin_pass();}
+    match tick_cheap_reports(ctx, project,memory.local_reports.as_mut(),memory.copy_jobs.as_mut(),memory.local_observations.as_mut())? {
         Some(seen) => match tick_slow(ctx, project, &seen, memory).into_iter().next() {
             Some(error) => Err(error),
             None => Ok(true),
@@ -597,8 +603,8 @@ fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
 mod status_observation;
 
 #[cfg(test)]
-fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {tick_cheap_reports(ctx,project,None,None)}
-fn tick_cheap_reports(ctx: &Ctx, project: &Project,mut reads:Option<&mut crate::local_reports::Reads>,mut copies:Option<&mut crate::copy_jobs::Queue>) -> Result<Option<Seen>> {
+fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {tick_cheap_reports(ctx,project,None,None,None)}
+fn tick_cheap_reports(ctx: &Ctx, project: &Project,mut reads:Option<&mut crate::local_reports::Reads>,mut copies:Option<&mut crate::copy_jobs::Queue>,observations:Option<&mut crate::local_observations::Reads>) -> Result<Option<Seen>> {
     let lease = crate::cleanup::lease(&ctx.root);
     let _project_guard = if lease.is_err() {
         Some(herdr_projects::execution_guard::ProjectGuard::acquire(&project.dir())?)
@@ -610,15 +616,21 @@ fn tick_cheap_reports(ctx: &Ctx, project: &Project,mut reads:Option<&mut crate::
     let Some(record) = project.try_coordinator()? else {
         return Ok(None);
     };
-    if record.socket.is_empty() || !Path::new(&record.socket).exists() {
-        return Ok(None);
-    }
+    if record.socket.is_empty() {return Ok(None);}
     let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
-    let Ok(agents) = herdr.agent_list() else {
-        return Ok(None);
-    };
-    let Ok(panes) = herdr.pane_list() else {
-        return Ok(None);
+    let (agents,panes)=if let Some(reads)=observations {
+        let sample=match reads.poll(ctx,project)? {
+            crate::local_observations::Poll::Pending|crate::local_observations::Poll::Unavailable=>return Ok(None),
+            crate::local_observations::Poll::Failed(error)=>anyhow::bail!("local observation: {error}"),
+            crate::local_observations::Poll::Ready(sample)=>sample,
+        };
+        sample.current(ctx,project)?;
+        (sample.agents,sample.panes)
+    } else {
+        if !Path::new(&record.socket).exists(){return Ok(None);}
+        let Ok(agents)=herdr.agent_list()else{return Ok(None);};
+        let Ok(panes)=herdr.pane_list()else{return Ok(None);};
+        (agents,panes)
     };
     if lease.is_err() {
         let threads=open_threads(project,false);

@@ -2218,3 +2218,58 @@ Default-feature validation also passed all 449 tests (30 library, 395 binary,
 22 CLI and two contracts), with three optional live checks ignored. Log:
 `/tmp/herdr-token-default.log`. Independent source review and its production
 integration validation condition are satisfied.
+
+
+## W04 queued local session observations
+
+Added a Linux read-only local observation adapter to the shared control pool.
+Production legacy ticker paths queue combined agent/pane reads, including the
+fallback status path while another project owns effect locks. Pending results
+produce no status reduction or synchronous Herdr fallback. Observations freeze
+canonical project identity, socket path/device/inode, Herdr selection, root config
+and bounded local execution-binding inventory. Collection and guarded application
+recheck authority; reducers reload current records. The worker uses the existing
+read-only owned-process-group runner with cancellation and one 30-second deadline,
+not the transfer supervisor that requires inherited effect locks.
+
+Inventories must be bounded, complete, unique and mutually consistent. Verified
+absence of the currently recorded endpoint or a clean failed initial probe is an
+explicit negative result. Partial, malformed, truncated, timed-out, cancelled or
+stale results remain unclassified and never establish missing panes. Never-opened
+projects remain outside observation eligibility. Admission caps 128 offers and 16
+pending reads; the fairness cursor advances only on actual runner entry. A bounded
+classification cache preserves prior failures during retries and prunes ineligible
+identities. Unknown/untracked eligible work vetoes idle exit without resetting its
+reachability clock; cache saturation conservatively keeps the ticker running.
+
+Independent review identified a cadence issue before acceptance: a successful
+16–20 second collection could be discarded at the next 30-second boundary.
+Collection remains bounded at 30 seconds; sample age is now separately fixed at
+admission plus 60 seconds, never renewed at retrieval. A real 15+15 second fixture
+checks successful late collection and later expiry. Ready observations immediately
+offer the next read at the existing end-of-pass admission boundary.
+
+Asynchronous observations also exposed a report-hash handoff hazard: completion
+on a pending-session pass could be discarded repeatedly. Successful unused hashes
+now survive those passes up to the same fixed 60-second age, with a 128-entry
+retention cap. Consumed hashes leave on the following pass, preserving ordinary
+refresh behavior; execution/copy-receipt fingerprints remain required. Queue or
+command expiry/cancellation cannot become a valid retained hash. These remain
+observations; concrete copies independently validate and publish durable receipts.
+
+Synchronous bounded binding/config reads remain in admission/application, so this
+increment does not claim hard filesystem-latency bounds. Canonical controller
+collection (currently a synchronous 15-second budget) and notification/finalization
+adapters remain to be queued. Other W04 launch/profile, budget/telemetry and broader
+authority work still precedes W05–W09. Counts remain 16 locally implemented, five
+partial and 20 unstarted; macOS and real SSH-host acceptance remain unavailable.
+
+Validation: all-feature debug library/binary/CLI checks pass (177 + 456 + 41),
+and release adds both contract tests (676 total). Both original full runs used
+a stale 10-second legacy-routine CLI wait; each had 40/41 CLI successes, then
+the corrected 35-second fixture passed independently in both profiles. The
+delayed-observation copy/review/restart regression passed in both full runs.
+Default features pass all 460 tests (30 library, 406 binary, 22 CLI, two contracts).
+Three optional live tests remain ignored. Logs: `/tmp/herdr-local-observation-`
+`{debug,release,debug-recheck,release-recheck,release-contracts,default}.log`.
+Independent review approved the scoped source changes; `git diff --check` passes.

@@ -599,19 +599,40 @@ fn ticker_native_copy_publishes_announces_and_does_not_recopy_after_restart() {
     let source=home.path().join("source '$λ");fs::create_dir_all(source.join("library/empty")).unwrap();
     fs::write(source.join("report.md"),b"new report\0\xff").unwrap();fs::write(source.join("library/item"),b"binary\0\xff").unwrap();
     let hash=format!("{:x}",Sha256::digest(b"new report\0\xff"));
-    let socket=home.path().join("session.sock");fs::write(&socket,b"").unwrap();
+    let socket=home.path().join("session.sock");let _listener=std::os::unix::net::UnixListener::bind(&socket).unwrap();
     fs::write(project.join(".state/coordinator.json"),serde_json::to_vec(&serde_json::json!({"socket":socket,"workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p1","agent_name":"coordinator","cwd":project})).unwrap()).unwrap();
     let record=project.join("threads/t-0001.toml");
     fs::write(&record,toml::to_string(&serde_json::json!({"id":"t-0001","status":"open","kind":"adopted","thread_dir":source,"cwd":source,"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1","agent":"claude","agent_name":"worker","title":"Fixture","created":jiff::Timestamp::now().to_string()})).unwrap()).unwrap();
     fs::write(home.path().join("agents.json"),serde_json::to_vec(&serde_json::json!({"result":{"agents":[{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1","cwd":source,"name":"worker","agent":"claude","agent_status":"idle"}]}})).unwrap()).unwrap();
     fs::write(home.path().join("panes.json"),serde_json::to_vec(&serde_json::json!({"result":{"panes":[{"workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p1","cwd":project},{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1","cwd":source}]}})).unwrap()).unwrap();
-    let fake=home.path().join("herdr");fs::write(&fake,b"#!/bin/sh\ncase \"$1 $2\" in\n'agent list') /bin/cat \"$HOME/agents.json\";;\n'pane list') echo poll >> \"$HOME/polls\"; /bin/cat \"$HOME/panes.json\";;\n*) echo '{\"result\":{\"shown\":true}}';;\nesac\n").unwrap();fs::set_permissions(&fake,fs::Permissions::from_mode(0o700)).unwrap();
+    let fake=home.path().join("herdr");fs::write(&fake,r#"#!/usr/bin/python3
+import os,sys,json,pathlib,time,fcntl
+root=pathlib.Path(os.environ['HOME']);args=sys.argv[1:]
+if args in [['agent','list'],['pane','list']]:
+ with open(root/'root/.execution.lock','a') as lock:
+  end=time.monotonic()+1
+  while True:
+   try:fcntl.flock(lock,fcntl.LOCK_SH|fcntl.LOCK_NB);break
+   except BlockingIOError:
+    if time.monotonic()>end:(root/'WRONG_SYNC_OBSERVATION').touch();sys.exit(2)
+    time.sleep(.01)
+ if args==['agent','list']:
+  count=int((root/'agent-polls').read_text())+1 if (root/'agent-polls').exists() else 1
+  (root/'agent-polls').write_text(str(count))
+ else:count=int((root/'agent-polls').read_text())
+ if count==2:
+  (root/'slow-observation').touch();time.sleep(8)
+ if args==['pane','list']:
+  with open(root/'polls','a') as f:f.write('poll\n')
+ print((root/('agents.json' if args==['agent','list'] else 'panes.json')).read_text())
+else:print('{"result":{"shown":true}}')
+"#).unwrap();fs::set_permissions(&fake,fs::Permissions::from_mode(0o700)).unwrap();
     struct Child(std::process::Child);
     impl Drop for Child {fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
     let spawn=||Child(Command::new(BIN).env_clear().env("HOME",home.path()).env("PATH","/usr/bin:/bin").env("HERDR_BIN_PATH",&fake).args(["--root",r,"ticker","run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
     let read=||->toml::Value {toml::from_str(&fs::read_to_string(&record).unwrap()).unwrap()};
     let wait=|child:&mut Child,predicate:&dyn Fn()->bool| {
-        let deadline=Instant::now()+Duration::from_secs(45);
+        let deadline=Instant::now()+Duration::from_secs(75);
         while !predicate(){assert!(child.0.try_wait().unwrap().is_none(),"ticker exited");assert!(Instant::now()<deadline,"ticker log: {}",fs::read_to_string(root.join(".ticker.log")).unwrap_or_default());std::thread::sleep(Duration::from_millis(10));}
     };
     let stop=|child:&mut Child| {
@@ -620,6 +641,7 @@ fn ticker_native_copy_publishes_announces_and_does_not_recopy_after_restart() {
         fs::remove_file(root.join(".ticker.stop")).unwrap();
     };
     let mut child=spawn();wait(&mut child,&||read().get("copy_receipt").is_some());stop(&mut child);
+    assert!(home.path().join("slow-observation").exists());assert!(!home.path().join("WRONG_SYNC_OBSERVATION").exists());
     assert_eq!(read()["report_hash"].as_str(),Some(hash.as_str()));assert_eq!(read()["copy_receipt"]["sequence"].as_integer(),Some(1));
     assert_eq!(fs::read(project.join("threads/t-0001.md")).unwrap(),b"new report\0\xff");let item=project.join("library/t-0001/item");assert_eq!(fs::read(&item).unwrap(),b"binary\0\xff");assert!(project.join("library/t-0001/empty").is_dir());
     let mut child=spawn();wait(&mut child,&||read().get("last_review_item_hash").and_then(|v|v.as_str())==Some(hash.as_str()));stop(&mut child);
@@ -649,7 +671,7 @@ fn native_ticker_claims_legacy_routine_and_restart_delivers_without_rerun() {
     use sha2::{Digest,Sha256};
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
     assert!(hp(home.path(),&["--root",r,"new","demo"]).status.success());let project=root.join("demo");
-    let socket=home.path().join("session.sock");fs::write(&socket,b"").unwrap();
+    let socket=home.path().join("session.sock");let _listener=std::os::unix::net::UnixListener::bind(&socket).unwrap();
     fs::write(project.join(".state/coordinator.json"),serde_json::to_vec(&serde_json::json!({"socket":socket,"workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p1","agent_name":"coordinator","cwd":project})).unwrap()).unwrap();
     let command="printf run >> executions; printf routine-result";
     fs::write(project.join("routines/check.md"),format!("+++\nschedule = \"every 24h\"\ncommand = {}\n+++\nInspect output.\n",serde_json::to_string(command).unwrap())).unwrap();
@@ -663,7 +685,8 @@ fn native_ticker_claims_legacy_routine_and_restart_delivers_without_rerun() {
     let spawn=||Child(Command::new(BIN).env_clear().env("HOME",home.path()).env("PATH","/usr/bin:/bin").env("HERDR_BIN_PATH",&fake).args(["--root",r,"ticker","run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
     let read=||->serde_json::Value {serde_json::from_slice(&fs::read(&state).unwrap()).unwrap()};
     let wait=|child:&mut Child,predicate:&dyn Fn()->bool| {
-        let deadline=Instant::now()+Duration::from_secs(10);
+        // The first asynchronous session result is applied on the next 15 s pass.
+        let deadline=Instant::now()+Duration::from_secs(35);
         while !predicate(){assert!(child.0.try_wait().unwrap().is_none(),"ticker exited");assert!(Instant::now()<deadline,"ticker log: {}",fs::read_to_string(root.join(".ticker.log")).unwrap_or_default());std::thread::sleep(Duration::from_millis(10));}
     };
     let stop=|child:&mut Child| {
@@ -687,7 +710,7 @@ fn ticker_native_merged_finalization_resolves_and_replays_notice_after_restart()
     let source=home.path().join("source '$λ");fs::create_dir_all(source.join("library/empty")).unwrap();
     fs::write(source.join("report.md"),b"PR: https://github.com/example/repo/pull/1\ncomplete\n").unwrap();fs::write(source.join("library/item"),b"binary\0\xff").unwrap();
     let hash=format!("{:x}",Sha256::digest(b"PR: https://github.com/example/repo/pull/1\ncomplete\n"));
-    let socket=home.path().join("session.sock");fs::write(&socket,b"").unwrap();
+    let socket=home.path().join("session.sock");let _listener=std::os::unix::net::UnixListener::bind(&socket).unwrap();
     fs::write(project.join(".state/coordinator.json"),serde_json::to_vec(&serde_json::json!({"socket":socket,"workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p1","agent_name":"coordinator","cwd":project})).unwrap()).unwrap();
     let record=project.join("threads/t-0001.toml");
     fs::write(&record,toml::to_string(&serde_json::json!({"id":"t-0001","status":"open","kind":"adopted","thread_dir":source,"cwd":source,"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1","agent":"claude","agent_name":"worker","title":"Fixture","created":jiff::Timestamp::now().to_string()})).unwrap()).unwrap();

@@ -238,8 +238,44 @@ including after ticker restart, is safe for this expiring display metadata.
 Refreshes share bounded queue admission and have a 30-second cooldown after each
 attempt. Under saturation, tokens may expire before their next refresh; the ticker
 does not guarantee refresh within five minutes for every pane. Interactive
-foreground commands retain their immediate metadata updates. Local session
-observations still need worker integration; this change does not complete W04.
+foreground commands retain their immediate metadata updates. These changes do
+not complete W04; canonical controller workers and other planned work remain.
+
+## Local session observations
+
+The Linux ticker collects local agent and pane inventories through the shared
+bounded control pool. One queued collection has a 30-second deadline; both lists
+must succeed and agree before any status update. Initial status and dependent
+work wait for the next 15-second ticker pass. Missing recorded sockets are
+explicitly unavailable. Partial, malformed, truncated, cancelled or timed-out
+collections produce no disappearance, idle or session-loss transitions.
+
+Observations bind the project/socket incarnation, executable selection,
+configuration and local thread/coordinator execution inventory. Application
+rechecks those identities under the existing project/root guards, then uses current
+records. Changed bindings discard old samples. Concrete effect workers still
+perform their own checks before starting agents, sending input or updating metadata.
+Read-only subprocesses use owned process groups and cancellation; they hold no
+project effect lock while waiting for Herdr.
+
+A sample expires 60 seconds after admission, independently of its shorter command
+deadline. This allows a collection finishing after the first 15-second tick to be
+consumed on the next pass without extending its age. Unused successful report-hash
+samples have the same fixed lifetime while awaiting a session sample; consuming
+them clears them on the next pass. The retained hash cache is capped at 128, and
+changed execution/copy receipts invalidate its entries. A retained hash is an
+observation, never proof of copied bytes. Source changes during retention may take
+up to that lifetime to be detected.
+
+Pending/unclassified observations veto automatic idle exit without resetting the
+reachability clock. Retrying a known failure retains its classification; verified
+negative observations permit ordinary five-minute idle exit when no other work
+keeps the ticker alive. Never-opened projects are ineligible. The classification
+cache is bounded at 128; untracked eligible identities conservatively veto idle
+exit, so saturation may require an explicit ticker stop. Binding/configuration
+inventory reads remain synchronous and bounded by entry/byte limits with deadline
+checks; filesystem latency itself is not hard-bounded. Canonical controller
+observations and effects still require separate queue integration.
 
 ## Interrupted brief delivery
 

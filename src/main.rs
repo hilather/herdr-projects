@@ -11,6 +11,7 @@ mod brief_jobs;
 mod token_jobs;
 mod fair_admission;
 mod local_reports;
+mod local_observations;
 mod adopt;
 mod cli;
 mod cleanup;

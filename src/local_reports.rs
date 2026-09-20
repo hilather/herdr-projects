@@ -1,12 +1,13 @@
 //! Read-only report hashes in the shared transfer pool. Observations may prompt
 //! a trusted copy request; they never certify copied bytes or a durable receipt.
-use std::{collections::BTreeMap,sync::Arc,time::{Duration,Instant}};
+use std::{collections::{BTreeMap,BTreeSet},sync::Arc,time::{Duration,Instant}};
 use anyhow::{Result,Context,ensure};
 use serde::{Serialize,Deserialize};
 use crate::{executor::{Executor,Request,Identity,Lane,Ticket},fair_admission::{Cursor,Key},project::Project,runner::Cmd,thread::{self,Thread}};
 const PENDING_LIMIT:usize=16; // Leaves transfer admission room for guarded effects.
 const OFFER_LIMIT:usize=128;
 const QUEUE_BUDGET:Duration=Duration::from_secs(30);
+const SAMPLE_AGE:Duration=Duration::from_secs(60);
 #[derive(Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Observation {pub hash:Option<String>}
@@ -20,19 +21,20 @@ fn fingerprint(t:&Thread)->String {
 fn key(project:&Project,t:&Thread)->Key {(project.dir().display().to_string(),t.id.clone())}
 struct Candidate {fingerprint:String,request:Request}
 struct Pending {fingerprint:String,identity:Identity,ticket:Ticket,deadline:Instant}
-pub struct Reads {executor:Arc<Executor>,pending:BTreeMap<Key,Pending>,ready:BTreeMap<Key,(String,Instant,std::result::Result<Option<String>,String>)>,offers:BTreeMap<Key,Candidate>,cursor:Cursor}
+pub struct Reads {executor:Arc<Executor>,pending:BTreeMap<Key,Pending>,ready:BTreeMap<Key,(String,Instant,std::result::Result<Option<String>,String>)>,offers:BTreeMap<Key,Candidate>,used:BTreeSet<Key>,cursor:Cursor}
 impl Reads {
-    pub fn new(executor:Arc<Executor>)->Self {Self{executor,pending:BTreeMap::new(),ready:BTreeMap::new(),offers:BTreeMap::new(),cursor:Cursor::default()}}
-    /// Snapshot completions once before the project pass. Ready values survive
-    /// both cheap and slow work, then expire; missed values cannot authorize work.
+    pub fn new(executor:Arc<Executor>)->Self {Self{executor,pending:BTreeMap::new(),ready:BTreeMap::new(),offers:BTreeMap::new(),used:BTreeSet::new(),cursor:Cursor::default()}}
+    /// Preserve unused successful samples while session observation is pending.
+    /// Consumption lasts through cheap/slow work in one pass, never renewing age.
     pub fn begin_pass(&mut self) {
-        self.ready.clear();self.offers.clear();
+        let now=Instant::now();self.ready.retain(|key,(_,deadline,result)|now<*deadline&&result.is_ok()&&!self.used.contains(key));self.used.clear();self.offers.clear();
         let completed=self.pending.iter().filter_map(|(key,p)|match p.ticket.try_recv(){Ok(None)=>None,result=>Some((key.clone(),result))}).collect::<Vec<_>>();
         let mut serviced=Vec::new();
         for (key,result) in completed {
             let pending=self.pending.remove(&key).unwrap();
             if let Ok(Some(completion))=&result&&completion.runner_entered {serviced.push((completion.started_at,key.clone()));}
             if Instant::now()>=pending.deadline {continue;}
+            if let Ok(Some(completion))=&result && (!completion.runner_entered||completion.result.as_ref().is_ok_and(|o|o.timed_out||o.cancelled)){continue;}
 
             let result=(||->Result<Option<String>> {
                 let completion=result?.context("local report completion missing")?;
@@ -42,6 +44,9 @@ impl Reads {
                 let observation:Observation=serde_json::from_str(&output.stdout)?;
                 ensure!(observation.hash.as_ref().is_none_or(|hash|hash.len()==64&&hash.bytes().all(|b|b.is_ascii_hexdigit())),"invalid local report hash");Ok(observation.hash)
             })().map_err(|e|format!("{e:#}"));
+            if !self.ready.contains_key(&key)&&self.ready.len()>=OFFER_LIMIT {
+                let oldest=self.ready.iter().min_by_key(|(_,(_,deadline,_))|*deadline).map(|(key,_)|key.clone()).unwrap();self.ready.remove(&oldest);
+            }
             self.ready.insert(key,(pending.fingerprint,pending.deadline,result));
         }
         // Admission that expires before entering Runner did not receive service.
@@ -53,6 +58,7 @@ impl Reads {
         let key=key(project,t);let fingerprint=fingerprint(t);
         if t.thread_dir.is_empty() {return Ok(Poll::Ready(Sample{fingerprint,deadline:Instant::now()+QUEUE_BUDGET,hash:None}));}
         if let Some((expected,deadline,result))=self.ready.get(&key)&&expected==&fingerprint&&Instant::now()<*deadline {
+            self.used.insert(key.clone());
             return Ok(match result {Ok(hash)=>Poll::Ready(Sample{fingerprint,deadline:*deadline,hash:hash.clone()}),Err(error)=>Poll::Failed(error.clone())});
         }
         if let Some(pending)=self.pending.get(&key) {
@@ -77,7 +83,7 @@ impl Reads {
         let mut errors=Vec::new();let mut admission=self.cursor.clone();
         while self.pending.len()<PENDING_LIMIT {
             let Some(key)=self.offers.keys().min_by(|a,b|admission.compare(a,b)).cloned() else {break;};
-            let candidate=self.offers.remove(&key).unwrap();let identity=candidate.request.identity.clone();let deadline=candidate.request.deadline;
+            let candidate=self.offers.remove(&key).unwrap();let identity=candidate.request.identity.clone();let deadline=candidate.request.deadline+(SAMPLE_AGE-QUEUE_BUDGET);
             match self.executor.submit(candidate.request) {
                 Ok(ticket)=>{admission.accepted(&key);self.pending.insert(key,Pending{fingerprint:candidate.fingerprint,identity,ticket,deadline});},
                 Err(error)=>errors.push(format!("{} {}: report observation admission: {error:#}",key.0,key.1)),
@@ -121,6 +127,23 @@ mod tests {
         reads.begin_pass();let Poll::Ready(sample)=reads.poll(&project,&t).unwrap() else {panic!("hash not ready");};assert!(sample.matches(&t));assert_eq!(sample.hash,Some(thread::sha256_hex(b"new")));
         assert!(thread::load(&project,&t.id).unwrap().copy_receipt.is_none());assert_eq!(reads.executor.metrics().high_water[1],1);
         reads.begin_pass();assert!(matches!(reads.poll(&project,&t).unwrap(),Poll::Pending),"consumed snapshots must expire");assert!(reads.executor.stop(Duration::from_secs(1)));
+    }
+    #[test]
+    fn unused_hash_survives_pending_session_passes_without_renewing_expiry() {
+        let (_world,project,t,mut reads,release,entered)=fixture();reads.poll(&project,&t).unwrap();reads.admit();wait(||entered.load(Ordering::SeqCst));release.store(true,Ordering::SeqCst);wait(||reads.executor.metrics().completed[1]==1);reads.begin_pass();
+        let key=key(&project,&t);let expiry=reads.ready[&key].1;
+        reads.begin_pass();reads.begin_pass();assert_eq!(reads.ready[&key].1,expiry,"waiting for session observations must not renew hash age");
+        let Poll::Ready(sample)=reads.poll(&project,&t).unwrap()else{panic!()};assert_eq!(sample.deadline,expiry);assert!(sample.matches(&t));let mut changed=t.clone();changed.report_hash="receipt-changed".into();assert!(!sample.matches(&changed));changed=t.clone();changed.lifecycle_generation+=1;assert!(!sample.matches(&changed));
+        reads.begin_pass();assert!(!reads.ready.contains_key(&key),"consumed sample leaves at the following pass");assert!(reads.executor.stop(Duration::from_secs(1)));
+    }
+    #[test]
+    fn retained_unconsumed_hashes_have_a_global_cache_bound() {
+        let (_world,project,t,mut reads,release,_)=fixture();release.store(true,Ordering::SeqCst);
+        for batch in 0..10 {
+            for index in 0..PENDING_LIMIT {let mut t=t.clone();t.id=format!("t-{:04}",1+batch*PENDING_LIMIT+index);assert!(matches!(reads.poll(&project,&t).unwrap(),Poll::Pending));}
+            let completed=reads.executor.metrics().completed[1]+PENDING_LIMIT as u64;assert!(reads.admit().is_empty());wait(||reads.executor.metrics().completed[1]>=completed);reads.begin_pass();assert!(reads.ready.len()<=OFFER_LIMIT);
+        }
+        assert_eq!(reads.ready.len(),OFFER_LIMIT);assert!(reads.used.is_empty());assert!(reads.executor.stop(Duration::from_secs(1)));
     }
     #[test]
     fn execution_and_receipt_changes_invalidate_ready_and_running_observations() {

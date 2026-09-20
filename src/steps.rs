@@ -136,6 +136,7 @@ pub struct Memory {
     pub remote_reads:Option<crate::remote_polling::Reads>,
     pub copy_jobs:Option<crate::copy_jobs::Queue>,
     pub local_reports:Option<crate::local_reports::Reads>,
+    pub local_observations:Option<crate::local_observations::Reads>,
     pub prefer_copy:bool,
     #[cfg(feature="state-store")]
     pub routine_jobs:Option<crate::routine_jobs::Queue>,
@@ -155,6 +156,7 @@ impl Memory {
             remote_reads: None,
             copy_jobs: None,
             local_reports:None,
+            local_observations:None,
             prefer_copy:true,
             #[cfg(feature="state-store")]
             routine_jobs: None,
