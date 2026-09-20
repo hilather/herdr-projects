@@ -1191,3 +1191,34 @@ Counts remain 16 implemented, five partial and 20 not started.
 All 479 tests pass in debug and release (162 library, 285 binary, 30 CLI, two
 contracts); the default-feature suite also passes. Three optional live checks remain
 ignored. Logs: `/tmp/herdr-source-tree-{debug,release,default}.log`.
+
+## W04 durable live-copy warnings
+
+Live local and remote ticker copies now commit a typed receipt with actual copied
+report hash, execution fingerprint, monotonic sequence and bounded partial notes.
+Partial receipts atomically prepare an immutable warning payload. Delivery uses
+`write_once` and clears only the exact successfully delivered intent; a pending
+warning prevents receipt replacement. Delivery does not wait for Ready/Landing or
+an available Herdr session, and historical warnings survive execution replacement
+without changing replacement state. Receipt notes remain available to later review
+announcements; the transient ticker notes map has been removed.
+
+Identical current receipts reuse their sequence; changed copies (including A/B/A
+and changed notes for identical report bytes) get new sequences. Receipt updates
+fence execution, prior hash and prior receipt and require an open thread without
+removal intent. Failed libraries, including failure after report publication, never
+advance the successful copy hash. Migration validates receipts and converts pending
+warnings to legacy inbox operations even without a ticker-state file.
+
+Regression fixtures cover restart before review readiness, failed delivery, a crash
+after delivery but before acknowledgement, inbox/done replay, execution replacement,
+stale copy completion, repeated hashes, changed notes, partial-library retry and
+migration corruption. This does not yet make review announcements themselves
+crash-idempotent; that and transfer-pool admission remain upcoming work.
+Counts remain 16 implemented, five partial and 20 not started; macOS is untested.
+
+Independent review approved this bounded increment after checking receipt fences,
+warning replay, retained readiness notes and migration without ticker state.
+All 484 tests pass in debug and release (163 library, 289 binary, 30 CLI, two
+contracts), and the default-feature suite passes. Three optional live checks remain
+ignored. Logs: `/tmp/herdr-copy-delivery-{debug,release,default}.log`.

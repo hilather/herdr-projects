@@ -203,7 +203,7 @@ fn thread_label(t: &Thread) -> String {
 
 /// Step 1's inbox items, written after the copies so a Ready for review item
 /// always points at a home copy that exists.
-pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[Transition], session_lost: bool, copy_notes: &BTreeMap<String, Vec<String>>) -> Result<()> {
+pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[Transition], session_lost: bool) -> Result<()> {
     if session_lost {
         if !state.session_item_written {
             let open = thread::list(project).iter().filter(|t| t.status == Status::Open && !t.is_remote()).count();
@@ -241,7 +241,8 @@ pub fn write_thread_items(project: &Project, state: &mut State, transitions: &[T
             continue;
         }
         let mut summary = format!("{} has a new report: threads/{}.md", thread_label(&t), t.id);
-        if let Some(notes) = copy_notes.get(&t.id) {
+        thread::copy_delivery::validate(&t)?;
+        if let Some(notes) = thread::copy_delivery::notes(&t).filter(|notes| !notes.is_empty()) {
             summary.push_str(&format!("; not everything was copied: {}", notes.join("; ")));
         }
         inbox::write(project, "thread-state", &t.id, &summary, "")?;

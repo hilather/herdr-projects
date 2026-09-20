@@ -32,6 +32,16 @@ pub(super) fn convert(project:&Path,sources:&[Source],tasks:&mut Vec<Task>)->Res
         let bytes=read(&project.join(&source.path))?;
         ensure!(hash(&bytes)==source.digest,"thread changed during obligation conversion");
         let value:toml::Value=toml::from_str(std::str::from_utf8(&bytes)?)?;
+        let receipt=value.get("copy_receipt").map(|v|v.clone().try_into::<crate::copy_receipt::CopyReceipt>()).transpose()?;
+        if let Some(receipt)=&receipt { receipt.validate()?; }
+        if let Some(pending)=value.get("pending_copy_notice") {
+            let notice:crate::copy_receipt::CopyNotice=pending.clone().try_into()?;
+            let id=value.get("id").and_then(|v|v.as_str()).context("missing copy notice thread")?;
+            notice.validate(id,receipt.as_ref().context("copy notice has no receipt")?)?;
+            let task=TaskId::new(format!("legacy-{id}")).map_err(anyhow::Error::msg)?;
+            ensure!(tasks.iter().any(|t|t.id==task),"copy notice refers to unknown thread");
+            operations.push(operation("legacy.inbox",&notice.id,task,serde_json::to_value(&notice)?,&Retry::default())?);
+        }
         if let Some(pending)=value.get("pending_status_notice") {
             let notice:crate::status_notice::StatusNotice=pending.clone().try_into()?;
             let id=value.get("id").and_then(|v|v.as_str()).context("missing status notice thread")?;

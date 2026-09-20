@@ -522,6 +522,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
     } else {None};
     if project.try_status()? != Status::Active { return Ok(None); }
     status_observation::deliver(project)?;
+    thread::copy_delivery::deliver(project)?;
     let Some(record) = project.coordinator() else {
         return Ok(None);
     };
@@ -604,7 +605,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {
 /// `herdr --machine`, one ssh call for every report hash, then the same thread
 /// pass, copies and launches as for local threads. If the machine cannot be
 /// reached nothing is read: no state, no group change, no copy, no inbox item.
-fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threads: &[thread::Thread], may_start: &mut bool, copy_notes: &mut std::collections::BTreeMap<String, Vec<String>>, errors: &mut Vec<anyhow::Error>) -> Result<Vec<Transition>, String> {
+fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threads: &[thread::Thread], may_start: &mut bool, errors: &mut Vec<anyhow::Error>) -> Result<Vec<Transition>, String> {
     let remote = herdr.on_machine(machine);
     let agents = remote.agent_list().map_err(|e| e.to_string())?;
     let panes = remote.pane_list().map_err(|e| e.to_string())?;
@@ -612,9 +613,9 @@ fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threa
     let dirs: Vec<(String, String)> = threads.iter().filter(|t| !t.thread_dir.is_empty()).map(|t| (t.id.clone(), t.thread_dir.clone())).collect();
     let hashes = crate::remote::report_hashes(ctx.runner, &target, &dirs).map_err(|e| format!("{e:#}"))?;
 
-    apply_remote(ctx,project,herdr,machine,threads,crate::remote_polling::Observation{agents,panes,target,hashes},false,may_start,copy_notes,errors)
+    apply_remote(ctx,project,herdr,machine,threads,crate::remote_polling::Observation{agents,panes,target,hashes},false,may_start,errors)
 }
-fn apply_remote(ctx:&Ctx,project:&Project,herdr:&Herdr,machine:&str,threads:&[thread::Thread],observation:crate::remote_polling::Observation,asynchronous:bool,may_start:&mut bool,copy_notes:&mut std::collections::BTreeMap<String,Vec<String>>,errors:&mut Vec<anyhow::Error>)->Result<Vec<Transition>,String> {
+fn apply_remote(ctx:&Ctx,project:&Project,herdr:&Herdr,machine:&str,threads:&[thread::Thread],observation:crate::remote_polling::Observation,asynchronous:bool,may_start:&mut bool,errors:&mut Vec<anyhow::Error>)->Result<Vec<Transition>,String> {
     let remote=herdr.on_machine(machine);
     let crate::remote_polling::Observation{mut agents,mut panes,target,hashes}=observation;
     // A delayed observation alone cannot authorize a terminal launch/prompt.
@@ -630,27 +631,13 @@ fn apply_remote(ctx:&Ctx,project:&Project,herdr:&Herdr,machine:&str,threads:&[th
     let pass = thread_pass(project, &remote, threads, &agents, &panes, Some(&hashes)).map_err(|e| format!("{e:#}"))?;
     errors.extend(pass.error);
 
-    for t in threads {
+    for t in threads.iter().filter(|t| t.status == thread::Status::Open) {
         let Some(_) = hashes.get(&t.id).filter(|h| **h != t.report_hash) else {
             continue;
         };
+        if let Err(error) = thread::copy_delivery::ready(t) { errors.push(error); continue; }
         let copied = thread::copy_home_remote(project, t, true, ctx.runner, &target);
-        match copied.outcome {
-            thread::CopyOutcome::Failed(error) => errors.push(anyhow::anyhow!("{}: copy from {machine} failed: {error}", t.id)),
-            outcome => {
-                if let thread::CopyOutcome::Partial(notes) = outcome {
-                    copy_notes.insert(t.id.clone(), notes);
-                }
-                let Some(hash) = copied.report_hash else {
-                    errors.push(anyhow::anyhow!("{}: observed report was not copied; retaining its previous hash", t.id));
-                    continue;
-                };
-                errors.extend(thread::update(project, &t.id, |t| {
-                    t.report_hash = hash;
-                    t.last_report_change = project::now();
-                }).err());
-            }
-        }
+        errors.extend(thread::copy_delivery::record(project, t, &copied).map_err(|e|e.context(format!("{}: copy receipt", t.id))).err());
     }
     launch_pass(ctx, project, herdr, threads, &agents, &panes, may_start, errors);
     Ok(pass.transitions)
@@ -668,7 +655,6 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     };
     let before = state.clone();
     if let Some(error) = &seen.notification_error { errors.push(anyhow::anyhow!("{error}")); }
-    let mut copy_notes: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     let herdr = Herdr::new(ctx.env.herdr_bin(), &seen.socket, ctx.runner);
     let now = jiff::Timestamp::now();
     let mut may_start = true;
@@ -698,24 +684,9 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
         if let Some(hash) = hash
             && hash != t.report_hash
         {
+            if let Err(error) = thread::copy_delivery::ready(t) { errors.push(error); continue; }
             let copied = thread::copy_home_local(project, t, true, ctx.runner);
-            match copied.outcome {
-                thread::CopyOutcome::Failed(error) => errors.push(anyhow::anyhow!("{}: copy failed: {error}", t.id)),
-                outcome => {
-                    if let thread::CopyOutcome::Partial(notes) = outcome {
-                        copy_notes.insert(t.id.clone(), notes);
-                    }
-                    let Some(copied_hash) = copied.report_hash else {
-                        errors.push(anyhow::anyhow!("{}: observed report was not copied; retaining its previous hash", t.id));
-                        continue;
-                    };
-                    let updated = thread::update(project, &t.id, |t| {
-                        t.report_hash = copied_hash;
-                        t.last_report_change = project::now();
-                    });
-                    errors.extend(updated.err());
-                }
-            }
+            errors.extend(thread::copy_delivery::record(project, t, &copied).map_err(|e|e.context(format!("{}: copy receipt", t.id))).err());
         }
     }
     launch_pass(ctx, project, &herdr, &local, &seen.agents, &seen.panes, &mut may_start, &mut errors);
@@ -737,11 +708,11 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
         let outcome=if let Some(reads)=memory.remote_reads.as_mut() {
             match reads.poll(&key,&ctx.env.herdr_bin(),&ctx.config_dir.join("config.toml"),&threads) {
                 Ok(crate::remote_polling::Poll::Pending)=>continue,
-                Ok(crate::remote_polling::Poll::Ready(Ok(observation)))=>apply_remote(ctx,project,&herdr,&machine,&threads,observation,true,&mut may_start,&mut copy_notes,&mut errors),
+                Ok(crate::remote_polling::Poll::Ready(Ok(observation)))=>apply_remote(ctx,project,&herdr,&machine,&threads,observation,true,&mut may_start,&mut errors),
                 Ok(crate::remote_polling::Poll::Ready(Err(error)))=>Err(format!("{error:#}")),
                 Err(error)=>{memory.machines.remove(&key);errors.push(error.context("remote observation admission"));continue;},
             }
-        }else{remote_pass(ctx, project, &herdr, &machine, &threads, &mut may_start, &mut copy_notes, &mut errors)};
+        }else{remote_pass(ctx, project, &herdr, &machine, &threads, &mut may_start, &mut errors)};
         let outage_error = outcome.as_ref().err().map(String::as_str);
         memory.record_machine(&key, outage_error);
         errors.extend(steps::write_machine_outage(project, &mut state, &key, outage_error, now, memory.outage_secs).err());
@@ -751,7 +722,8 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
         }
     }
 
-    errors.extend(steps::write_thread_items(project, &mut state, &transitions, seen.session_lost, &copy_notes).err());
+    errors.extend(thread::copy_delivery::deliver(project).err());
+    errors.extend(steps::write_thread_items(project, &mut state, &transitions, seen.session_lost).err());
     errors.extend(steps::pull_requests(ctx, project, &mut state, memory, now));
     let zoned = jiff::Zoned::now();
     match project.read_project_md() {

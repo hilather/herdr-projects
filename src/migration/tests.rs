@@ -627,3 +627,21 @@ fn failed_record_lock_releases_project_and_root_ownership() {
     assert!(crate::execution_guard::RootGuard::exclusive(project.parent().unwrap()).is_ok());
     drop(record);assert!(runtime_mutation(&project).is_ok());
 }
+
+#[test]
+fn pending_copy_warning_imports_without_ticker_and_invalid_receipt_blocks() {
+    let (_temp,project)=fixture();let path=project.join("threads/t-0001.toml");
+    let mut value:toml::Value=toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let receipt=crate::copy_receipt::CopyReceipt{sequence:1,execution:"a".repeat(64),report_hash:"b".repeat(64),notes:vec!["library skipped".into()]};
+    let notice=crate::copy_receipt::CopyNotice::new("t-0001",receipt.clone()).unwrap();
+    value.as_table_mut().unwrap().insert("copy_receipt".into(),toml::Value::try_from(&receipt).unwrap());
+    value.as_table_mut().unwrap().insert("pending_copy_notice".into(),toml::Value::try_from(&notice).unwrap());
+    fs::write(&path,toml::to_string(&value).unwrap()).unwrap();
+    let plan=inspect(&project).unwrap();assert!(plan.blockers.is_empty(),"{:?}",plan.blockers);assert_eq!(plan.operations.len(),1);
+    assert_eq!(plan.operations[0].payload,serde_json::to_value(&notice).unwrap());
+    value["copy_receipt"]["sequence"]=toml::Value::Integer(2);fs::write(&path,toml::to_string(&value).unwrap()).unwrap();
+    assert!(!inspect(&project).unwrap().blockers.is_empty());
+    value["copy_receipt"]["sequence"]=toml::Value::Integer(1);fs::write(&path,toml::to_string(&value).unwrap()).unwrap();
+    apply(&project,&plan,true).unwrap();let mut db=open_active(&project).unwrap();
+    assert_eq!(db.read_snapshot(None).unwrap().operations,plan.operations);
+}

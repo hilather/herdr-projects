@@ -139,6 +139,13 @@ copying. Finalization never removes the worktree.
 Existing partial-copy policy remains: skipped symlinks or an oversized library
 may resolve the thread, with a durable `copy` warning in the inbox. Failed copies
 do not resolve it. Content checksums prevent stale equal-size/equal-mtime library transfers.
+Live ticker copies also save a receipt and any partial-copy warning together with
+the copied report hash. Warnings deliver independently of review readiness and retry
+after restart with the same inbox identity, including when the item is already in
+`inbox/done`. An undelivered warning prevents another live copy from replacing its
+receipt. Historical warnings identify their original execution and report; delivering
+one does not change a replacement execution. Saved notes remain available for the
+later review announcement. A library failure does not advance the copied report hash.
 Complete local and supported remote final copies also retain content-addressed snapshots in
 `.state/artifacts/<thread>/<manifest-hash>/`, with a verified `manifest.json`.
 Snapshots contain the report and library, including empty directories; the combined

@@ -21,6 +21,7 @@ pub mod runner;
 pub mod execution_guard;
 pub mod supervision;
 pub mod status_notice;
+pub mod copy_receipt;
 #[cfg(feature = "state-store")]
 pub mod authority;
 #[cfg(feature = "state-store")]
