@@ -4,7 +4,7 @@ use super::*;
 use crate::{paths::Ctx, remote};
 
 const MAGIC: &[u8; 8] = b"HPAR\x01\0\0\0";
-const STREAM_LIMIT: usize = BYTE_LIMIT as usize + MANIFEST_LIMIT + 12;
+pub(super) const STREAM_LIMIT: usize = BYTE_LIMIT as usize + MANIFEST_LIMIT + 12;
 
 #[derive(Serialize, Deserialize)]
 struct Source {
@@ -67,30 +67,46 @@ fn validate(source: &Source) -> Result<()> {
 }
 
 fn receive(project: &Project, record: &Thread, staging: Staging, archive: &Path) -> Result<Snapshot> {
-    let mut stream = File::open(archive)?;
-    let mut magic = [0; 8];
-    stream.read_exact(&mut magic)?;
+    receive_into(project,record,staging,archive,&Control::default(),true,||Ok(()),||Ok(()))
+}
+
+/// Caller must establish successful supervised sender completion before ingress.
+/// This verifies and retains exact preservation bytes, never resolves a thread.
+#[allow(dead_code)]
+pub fn receive_controlled(project:&Project,record:&Thread,archive:&Path,control:&Control,authorize:impl FnOnce()->Result<()>)->Result<Snapshot> {
+    control.check()?;
+    let stage=staging(project,record)?;
+    receive_into(project,record,stage,archive,control,false,authorize,||Ok(()))
+}
+fn receive_into(project:&Project,record:&Thread,staging:Staging,archive:&Path,control:&Control,remove_archive:bool,authorize:impl FnOnce()->Result<()>,mut after_file:impl FnMut()->Result<()>)->Result<Snapshot> {
+    control.check()?;let mut stream=regular(archive)?;let before=stream.metadata()?;
+    ensure!(before.len()<=STREAM_LIMIT as u64,"artifact stream exceeds bounds");
+    let mut magic = [0; 8];stream.read_exact(&mut magic)?;
     ensure!(&magic == MAGIC, "invalid artifact stream magic");
-    let mut size = [0; 4];
-    stream.read_exact(&mut size)?;
+    let mut size = [0; 4];stream.read_exact(&mut size)?;
     let size = u32::from_be_bytes(size) as usize;
     ensure!(size <= MANIFEST_LIMIT, "artifact manifest exceeds limit");
-    let mut json = vec![0; size];
-    stream.read_exact(&mut json)?;
-    let source: Source = serde_json::from_slice(&json)?;
-    validate(&source)?;
+    let mut json = vec![0; size];stream.read_exact(&mut json)?;
+    let source: Source = serde_json::from_slice(&json)?;validate(&source)?;
+    control.check()?;let mut budget=control.budget();
     for entry in &source.entries {
+        budget.entry(entry.path.matches('/').count())?;
         let path = staging.0.join(&entry.path);
         if entry.directory { fs::create_dir(path)?; continue; }
         let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
-        ensure!(std::io::copy(&mut (&mut stream).take(entry.bytes), &mut file)? == entry.bytes, "truncated artifact payload");
-        file.sync_all()?;
+        let mut remaining=entry.bytes;let mut hash=Sha256::new();let mut buffer=[0;64*1024];
+        while remaining>0 {
+            let size=(remaining as usize).min(buffer.len());let n=budget.read(&mut stream,&mut buffer[..size])?;
+            ensure!(n>0,"truncated artifact payload");file.write_all(&buffer[..n])?;hash.update(&buffer[..n]);remaining-=n as u64;
+        }
+        ensure!(format!("{:x}",hash.finalize())==entry.sha256,"artifact payload digest mismatch");file.sync_all()?;after_file()?;budget.check()?;
     }
-    ensure!(stream.read(&mut [0])? == 0, "trailing artifact data");
-    for entry in source.entries.iter().rev().filter(|e| e.directory) { File::open(staging.0.join(&entry.path))?.sync_all()?; }
-    fs::remove_file(archive)?;
+    ensure!(stream.read(&mut [0])? == 0, "trailing artifact data");crate::source_tree::unchanged(&stream,&before)?;
+    for entry in source.entries.iter().rev().filter(|e| e.directory) {budget.check()?;File::open(staging.0.join(&entry.path))?.sync_all()?;}
+    if remove_archive {fs::remove_file(archive)?;}
     let manifest = Manifest { schema: 1, thread: record.id.clone(), generation: record.lifecycle_generation, source: source.source, machine: record.machine.clone(), entries: source.entries };
-    publish(project, record, staging, manifest)
+    budget.check()?;
+    publish_mode_controlled(project,record,staging,manifest,false,control,authorize)
 }
 
 pub fn capture_remote(ctx: &Ctx, project: &Project, record: &Thread, target: &str) -> Result<Snapshot> {
@@ -116,6 +132,61 @@ pub fn capture_remote(ctx: &Ctx, project: &Project, record: &Thread, target: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn archive(root:&Path,record:&Thread)->PathBuf {
+        let mut bytes=Vec::new();export(Path::new(&record.thread_dir),&mut bytes).unwrap();
+        let archive=root.join("stream");fs::write(&archive,bytes).unwrap();archive
+    }
+    fn stages(project:&Project)->Vec<String> {
+        fs::read_dir(project.state_dir().join("artifacts/t-0001")).into_iter().flatten().map(|e|e.unwrap().file_name().into_string().unwrap()).collect()
+    }
+    #[test]
+    fn controlled_receive_retains_verified_bytes_and_leaves_input_owned_by_caller() {
+        let (root,project,record)=super::super::tests::fixture();let archive=archive(root.path(),&record);
+        let saved=receive_controlled(&project,&record,&archive,&Control::default(),||Ok(())).unwrap();
+        assert!(archive.is_file());assert_eq!(load(&project,&record,&saved.id).unwrap(),saved.manifest);
+        assert_eq!(fs::read(project.state_dir().join("artifacts/t-0001").join(&saved.id).join("report.md")).unwrap(),b"report\0\xff");
+        assert!(!project.dir().join("threads/t-0001.toml").exists(),"preservation alone cannot resolve or certify a thread");
+        assert_eq!(receive_controlled(&project,&record,&archive,&Control::default(),||Ok(())).unwrap().id,saved.id);
+        assert_eq!(stages(&project),vec![saved.id]);
+    }
+    #[test]
+    fn cancellation_and_authority_withdrawal_never_publish_a_new_snapshot() {
+        for fault in ["cancelled","expired","during-extraction","before-publish","authority"] {
+            let(root,project,record)=super::super::tests::fixture();let archive=archive(root.path(),&record);let mut control=Control::default();
+            match fault {"cancelled"=>control.cancellation.cancel(),"expired"=>control.deadline=std::time::Instant::now(),_=>{}}
+            let result=if fault=="during-extraction" {
+                let stage=staging(&project,&record).unwrap();
+                receive_into(&project,&record,stage,&archive,&control,false,||Ok(()),||{control.cancellation.cancel();Ok(())})
+            }else {
+                receive_controlled(&project,&record,&archive,&control,||{
+                    if fault=="before-publish" {control.cancellation.cancel();}
+                    ensure!(fault!="authority","authority withdrawn");Ok(())
+                })
+            };
+            assert!(result.is_err(),"{fault}");assert!(stages(&project).is_empty(),"{fault}");assert!(archive.is_file());
+            assert!(!project.dir().join("threads/t-0001.toml").exists());
+        }
+    }
+    #[test]
+    fn controlled_receive_refuses_special_archives_and_preserves_existing_evidence() {
+        use std::os::unix::{ffi::OsStrExt,fs::symlink};
+        let(root,project,record)=super::super::tests::fixture();let archive=archive(root.path(),&record);
+        let saved=receive_controlled(&project,&record,&archive,&Control::default(),||Ok(())).unwrap();
+        for kind in ["fifo","symlink","oversized","corrupt"] {
+            let bad=root.path().join(kind);
+            match kind {
+                "fifo"=>{let c=std::ffi::CString::new(bad.as_os_str().as_bytes()).unwrap();assert_eq!(unsafe{libc::mkfifo(c.as_ptr(),0o600)},0);},
+                "symlink"=>symlink(&archive,&bad).unwrap(),
+                "oversized"=>File::create(&bad).unwrap().set_len(STREAM_LIMIT as u64+1).unwrap(),
+                _=>{let mut bytes=fs::read(&archive).unwrap();*bytes.last_mut().unwrap()^=255;fs::write(&bad,bytes).unwrap();},
+            }
+            let before=std::time::Instant::now();assert!(receive_controlled(&project,&record,&bad,&Control::default(),||Ok(())).is_err());assert!(before.elapsed()<std::time::Duration::from_secs(2));
+            assert_eq!(stages(&project),vec![saved.id.clone()]);assert_eq!(load(&project,&record,&saved.id).unwrap(),saved.manifest);
+        }
+        let control=Control::default();assert!(receive_controlled(&project,&record,&archive,&control,||{control.cancellation.cancel();Ok(())}).is_err());
+        assert_eq!(stages(&project),vec![saved.id.clone()]);assert_eq!(load(&project,&record,&saved.id).unwrap(),saved.manifest);
+    }
 
     #[test]
     fn roundtrip_preserves_binary_empty_directories_and_hostile_names() {

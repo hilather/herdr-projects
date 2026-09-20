@@ -11,7 +11,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{project::Project, thread::{self, Thread}};
+use crate::{project::Project, thread::{self, Thread},source_tree::Control};
 
 const BYTE_LIMIT: u64 = 50 * 1024 * 1024;
 const ENTRY_LIMIT: usize = 10_000;
@@ -105,17 +105,23 @@ fn visit(source:File,relative:&Path,destination:Option<&Path>,entries:&mut Vec<E
     Ok(())
 }
 fn scan_open(root:&crate::source_tree::Directory,destination:Option<&Path>)->Result<Vec<Entry>> {
-    let mut budget=crate::source_tree::Budget::new();let mut entries=Vec::new();
+    scan_open_controlled(root,destination,&Control::default())
+}
+fn scan_open_controlled(root:&crate::source_tree::Directory,destination:Option<&Path>,control:&Control)->Result<Vec<Entry>> {
+    control.check()?;let mut budget=control.budget();let mut entries=Vec::new();
     for name in ["report.md","library"] {
         if let Some(source)=root.optional(std::ffi::OsStr::new(name))?{
             visit(source,Path::new(name),destination,&mut entries,&mut budget,0)?;
         }
     }
-    Ok(entries)
+    control.check()?;Ok(entries)
 }
 fn scan(root:&Path,destination:Option<&Path>)->Result<Vec<Entry>> {
-    let opened=crate::source_tree::Directory::open(root)?;
-    let entries=scan_open(&opened,destination)?;opened.matches_path(root)?;Ok(entries)
+    scan_controlled(root,destination,&Control::default())
+}
+fn scan_controlled(root:&Path,destination:Option<&Path>,control:&Control)->Result<Vec<Entry>> {
+    control.check()?;let opened=crate::source_tree::Directory::open(root)?;
+    let entries=scan_open_controlled(&opened,destination,control)?;opened.matches_path(root)?;control.check()?;Ok(entries)
 }
 
 struct Staging(PathBuf);
@@ -171,9 +177,12 @@ fn staging_mode(project:&Project,record:&Thread,canonical:bool)->Result<Staging>
     Ok(staging)
 }
 
-fn publish(project:&Project,record:&Thread,staging:Staging,manifest:Manifest)->Result<Snapshot> {publish_mode(project,record,staging,manifest,false,||Ok(()))}
 fn publish_mode(project: &Project, record: &Thread, staging: Staging, manifest: Manifest,canonical:bool,before_publish:impl FnOnce()->Result<()>) -> Result<Snapshot> {
-    ensure!(scan(&staging.0, None)? == manifest.entries, "snapshot verification failed");
+    publish_mode_controlled(project,record,staging,manifest,canonical,&Control::default(),before_publish)
+}
+fn publish_mode_controlled(project:&Project,record:&Thread,staging:Staging,manifest:Manifest,canonical:bool,control:&Control,before_publish:impl FnOnce()->Result<()>)->Result<Snapshot> {
+    control.check()?;
+    ensure!(scan_controlled(&staging.0, None,control)? == manifest.entries, "snapshot verification failed");
     let parent = staging.0.parent().context("missing snapshot parent")?;
     let bytes = serde_json::to_vec(&manifest)?;
     ensure!(bytes.len() <= MANIFEST_LIMIT, "artifact manifest is too large");
@@ -184,19 +193,19 @@ fn publish_mode(project: &Project, record: &Thread, staging: Staging, manifest: 
     File::open(&staging.0)?.sync_all()?;
     let target = parent.join(&id);
     let _lock = artifact_lock(project,canonical)?;
-    real_dir(&parent)?;
+    control.check()?;real_dir(&parent)?;
     let exists=target.try_exists()?;
     if exists {
         // Never overwrite a previous snapshot, including damaged evidence.
-        let existing = load_mode(project, record, &id,canonical)?;
+        let existing = load_mode_controlled(project, record, &id,canonical,control)?;
         ensure!(existing == manifest, "existing artifact snapshot differs");
     }
-    before_publish()?;
+    before_publish()?;control.check()?;
     if !exists {
         fs::rename(&staging.0, &target)?;
         File::open(&parent)?.sync_all()?;
     }
-    Ok(Snapshot { id, manifest })
+    control.check()?;Ok(Snapshot { id, manifest })
 }
 
 pub fn verify_source(record: &Thread, manifest: &Manifest) -> Result<()> {
@@ -210,6 +219,10 @@ pub fn verify_source(record: &Thread, manifest: &Manifest) -> Result<()> {
 
 pub fn load(project:&Project,record:&Thread,id:&str)->Result<Manifest> {load_mode(project,record,id,false)}
 fn load_mode(project: &Project, record: &Thread, id: &str,canonical:bool) -> Result<Manifest> {
+    load_mode_controlled(project,record,id,canonical,&Control::default())
+}
+fn load_mode_controlled(project:&Project,record:&Thread,id:&str,canonical:bool,control:&Control)->Result<Manifest> {
+    control.check()?;
     ensure!(id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()), "invalid artifact snapshot id");
     artifact_id(&record.id,canonical)?;
     let parent = project.state_dir().join(artifact_directory(canonical));
@@ -220,7 +233,7 @@ fn load_mode(project: &Project, record: &Thread, id: &str,canonical:bool) -> Res
     ensure!(bytes.len() <= MANIFEST_LIMIT && thread::sha256_hex(&bytes) == id, "artifact manifest is corrupt");
     let manifest: Manifest = serde_json::from_slice(&bytes)?;
     ensure!(manifest.schema == 1 && manifest.thread == record.id, "unsupported artifact manifest identity");
-    ensure!(scan(&dir, None)? == manifest.entries, "retained artifact bytes do not match their manifest");
+    control.check()?;ensure!(scan_controlled(&dir, None,control)? == manifest.entries, "retained artifact bytes do not match their manifest");
     Ok(manifest)
 }
 
@@ -230,6 +243,8 @@ mod tests;
 mod wire;
 pub mod live;
 pub use wire::{capture_remote, export, probe};
+#[allow(unused_imports)] // Native automatic final-copy ingress follows controlled preservation.
+pub use wire::receive_controlled;
 
 fn artifact_directory(canonical:bool)->&'static str {if canonical {"canonical-artifacts"}else{"artifacts"}}
 fn artifact_id(id:&str,canonical:bool)->Result<()> {

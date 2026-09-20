@@ -1511,3 +1511,34 @@ All 538 tests pass in debug and release (165 library, 338 binary, 33 CLI, two
 contracts). Default-feature tests pass (29 library, 289 binary, 14 CLI, two
 contracts); three optional live checks remain ignored. Logs:
 `/tmp/herdr-legacy-routines-{debug,release,default}.log`.
+
+
+## W04 controlled preservation ingress for final-copy jobs
+
+The immutable artifact receiver now has a controlled ingress for queued final-copy
+workers. The original monotonic deadline and cancellation token carry through
+payload extraction, hashing, staged verification, existing-snapshot verification,
+final authorization and publication. Archive files must be regular, single-link
+files with bounded size; payload reads count actual bytes and verify each digest.
+Legacy remote receive uses the same hardened extraction path. Existing public
+capture/load interfaces retain their compatibility wrappers.
+
+Caller-owned spool files remain untouched by the new ingress. Cancellation or
+withdrawn authority before publication removes the temporary stage and preserves
+existing evidence. A cancellation observed after the atomic publication can leave
+immutable unreferenced evidence; it does not certify a thread result or resolution.
+The future worker still must establish supervised sender success, bind execution
+and manifest identity, and revalidate before committing finalization.
+
+Independent review approved the receiver and independently passed all seven wire
+fixtures, including three new cases for caller ownership, cancellation at extraction
+and publication boundaries, authority withdrawal, special/oversized/corrupt archives
+and retained-evidence integrity. Automatic idle/merged-PR finalization remains to be
+moved into the queue; this prerequisite does not complete T04.2. Card counts remain
+16 locally implemented, five partial and 20 not started. External remote-host and
+macOS acceptance remain untested.
+
+All 541 tests pass in debug and release (165 library, 341 binary, 33 CLI, two
+contracts). Default-feature tests pass (29 library, 292 binary, 14 CLI, two
+contracts); three optional live checks remain ignored. Logs:
+`/tmp/herdr-preservation-control-{debug,release,default}.log`.
