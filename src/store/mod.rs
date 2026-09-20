@@ -24,6 +24,7 @@ pub enum StoreError {
     Io(String),
 }
 pub mod controlled;
+mod read_budget;
 impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "state store: {self:?}") }
 }
@@ -99,14 +100,17 @@ impl SqliteStore {
     /// Current consistent snapshot. Earlier heads fail explicitly: history
     /// reconstruction is not implemented by schema v1.
     pub fn read_snapshot(&mut self, at: Option<u64>) -> Result<Snapshot> {
+        self.read_snapshot_with_budget(at, None)
+    }
+    fn read_snapshot_with_budget(&mut self, at: Option<u64>, budget: Option<&read_budget::ReadBudget>) -> Result<Snapshot> {
         let tx = self.connection.transaction()?;
         check_schema(&tx)?;
         let head = head(&tx)?;
         if let Some(at) = at { if at != head { return Err(StoreError::HistoryUnavailable(at)); } }
-        let tasks = read_tasks(&tx)?;
-        let attempts = read_attempts(&tx)?;
-        let operations = read_operations(&tx)?;
-        let events = read_events(&tx)?;
+        let tasks = read_tasks_with_budget(&tx, budget)?;
+        let attempts = read_attempts_with_budget(&tx, budget)?;
+        let operations = read_operations_matching_with_budget(&tx, None, budget)?;
+        let events = read_events_with_budget(&tx, budget)?;
         let schema:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
         let deliveries=if schema>=3 {delivery::read_all(&tx)?}else{Vec::new()};
         let inbox=if schema>=4 {inbox::read_all(&tx)?}else{Vec::new()};
@@ -248,35 +252,57 @@ fn head(db: &Connection) -> Result<u64> { Ok(db.query_row("SELECT coalesce(max(s
 fn decode<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Result<T> {
     serde_json::from_value(value).map_err(|e| StoreError::Corrupt(e.to_string()))
 }
-fn read_tasks(db: &Connection) -> Result<Vec<Task>> {
+fn read_tasks(db: &Connection) -> Result<Vec<Task>> { read_tasks_with_budget(db, None) }
+fn read_tasks_with_budget(db: &Connection, budget: Option<&read_budget::ReadBudget>) -> Result<Vec<Task>> {
     let mut stmt = db.prepare("SELECT id,revision,state,title,active_attempt FROM tasks ORDER BY id")?;
-    let rows = stmt.query_map([], |r| Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"revision":r.get::<_,u64>(1)?,"state":r.get::<_,String>(2)?,"title":r.get::<_,String>(3)?,"active_attempt":r.get::<_,Option<String>>(4)?})))?;
-    rows.map(|r| decode(r?)).collect()
+    let mut rows = stmt.query([])?;
+    let mut result = Vec::new();
+    while let Some(r) = rows.next()? {
+        if let Some(budget) = budget { budget.row(r, &[])?; }
+        let value = serde_json::json!({"id":r.get::<_,String>(0)?,"revision":r.get::<_,u64>(1)?,"state":r.get::<_,String>(2)?,"title":r.get::<_,String>(3)?,"active_attempt":r.get::<_,Option<String>>(4)?});
+        result.push(decode(value)?);
+    }
+    Ok(result)
 }
-fn read_attempts(db: &Connection) -> Result<Vec<Attempt>> {
+fn read_attempts(db: &Connection) -> Result<Vec<Attempt>> { read_attempts_with_budget(db, None) }
+fn read_attempts_with_budget(db: &Connection, budget: Option<&read_budget::ReadBudget>) -> Result<Vec<Attempt>> {
     let mut stmt = db.prepare("SELECT id,task_id,revision,state,snapshot,reservation,termination_observed FROM attempts ORDER BY id")?;
-    let rows = stmt.query_map([], |r| Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"task":r.get::<_,Option<String>>(1)?,"revision":r.get::<_,u64>(2)?,"state":r.get::<_,String>(3)?,"snapshot":r.get::<_,Option<String>>(4)?,"reservation":r.get::<_,String>(5)?,"termination_observed":r.get::<_,bool>(6)?})))?;
-    rows.map(|r| decode(r?)).collect()
+    let mut rows = stmt.query([])?;
+    let mut result = Vec::new();
+    while let Some(r) = rows.next()? {
+        if let Some(budget) = budget { budget.row(r, &[])?; }
+        let value = serde_json::json!({"id":r.get::<_,String>(0)?,"task":r.get::<_,Option<String>>(1)?,"revision":r.get::<_,u64>(2)?,"state":r.get::<_,String>(3)?,"snapshot":r.get::<_,Option<String>>(4)?,"reservation":r.get::<_,String>(5)?,"termination_observed":r.get::<_,bool>(6)?});
+        result.push(decode(value)?);
+    }
+    Ok(result)
 }
 fn read_operations(db: &Connection) -> Result<Vec<Operation>> {read_operations_matching(db,None)}
 fn read_operation(db:&Connection,id:&OperationId)->Result<Operation> {read_operations_matching(db,Some(id))?.into_iter().next().ok_or(StoreError::Conflict)}
-fn read_operations_matching(db:&Connection,id:Option<&OperationId>)->Result<Vec<Operation>> {
+fn read_operations_matching(db:&Connection,id:Option<&OperationId>)->Result<Vec<Operation>> {read_operations_matching_with_budget(db,id,None)}
+fn read_operations_matching_with_budget(db:&Connection,id:Option<&OperationId>,budget:Option<&read_budget::ReadBudget>)->Result<Vec<Operation>> {
     let query=if id.is_some(){"SELECT id,task_id,kind,target,payload_version,payload,expected_revision,due_unix_ms,idempotency_key,payload_hash FROM operations WHERE id=?1"}else{"SELECT id,task_id,kind,target,payload_version,payload,expected_revision,due_unix_ms,idempotency_key,payload_hash FROM operations WHERE ?1 IS NULL ORDER BY id"};
     let mut stmt = db.prepare(query)?;
-    let rows = stmt.query_map([id.map(OperationId::as_str)], |r| Ok((serde_json::json!({"id":r.get::<_,String>(0)?,"task":r.get::<_,Option<String>>(1)?,"kind":r.get::<_,String>(2)?,"target":r.get::<_,String>(3)?,"payload_version":r.get::<_,u32>(4)?,"expected_revision":r.get::<_,u64>(6)?,"due_unix_ms":r.get::<_,i64>(7)?,"idempotency_key":r.get::<_,String>(8)?}), r.get::<_,String>(5)?, r.get::<_,String>(9)?)))?;
-    rows.map(|row| {
-        let (mut value, payload, hash) = row?;
+    let mut rows = stmt.query([id.map(OperationId::as_str)])?;
+    let mut result = Vec::new();
+    while let Some(r) = rows.next()? {
+        if let Some(budget) = budget { budget.row(r, &[(5, 2)])?; }
+        let (mut value, payload, hash) = (serde_json::json!({"id":r.get::<_,String>(0)?,"task":r.get::<_,Option<String>>(1)?,"kind":r.get::<_,String>(2)?,"target":r.get::<_,String>(3)?,"payload_version":r.get::<_,u32>(4)?,"expected_revision":r.get::<_,u64>(6)?,"due_unix_ms":r.get::<_,i64>(7)?,"idempotency_key":r.get::<_,String>(8)?}), r.get::<_,String>(5)?, r.get::<_,String>(9)?);
         if format!("{:x}", Sha256::digest(payload.as_bytes())) != hash { return Err(StoreError::Corrupt("operation payload hash mismatch".into())); }
         value["payload"] = serde_json::from_str(&payload).map_err(|e| StoreError::Corrupt(e.to_string()))?;
-        decode(value)
-    }).collect()
+        result.push(decode(value)?);
+    }
+    Ok(result)
 }
-fn read_events(db: &Connection) -> Result<Vec<Event>> {
+fn read_events_with_budget(db: &Connection, budget: Option<&read_budget::ReadBudget>) -> Result<Vec<Event>> {
     let mut stmt = db.prepare("SELECT sequence,kind,entity,revision,payload_version,payload FROM events ORDER BY sequence")?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_,u64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,u64>(3)?,r.get::<_,u32>(4)?,r.get::<_,String>(5)?)))?;
-    rows.map(|row| { let (sequence,kind,entity,revision,payload_version,payload) = row?;
-        Ok(Event { sequence,kind,entity,revision,payload_version,payload:serde_json::from_str(&payload).map_err(|e| StoreError::Corrupt(e.to_string()))? })
-    }).collect()
+    let mut rows = stmt.query([])?;
+    let mut result = Vec::new();
+    while let Some(r) = rows.next()? {
+        if let Some(budget) = budget { budget.row(r, &[(5, 1)])?; }
+        let (sequence,kind,entity,revision,payload_version,payload) = (r.get::<_,u64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,u64>(3)?,r.get::<_,u32>(4)?,r.get::<_,String>(5)?);
+        result.push(Event { sequence,kind,entity,revision,payload_version,payload:serde_json::from_str(&payload).map_err(|e| StoreError::Corrupt(e.to_string()))? });
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

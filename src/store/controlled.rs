@@ -1,4 +1,5 @@
-//! Explicit SQL execution controls. Aggregate decoded allocation is not yet bounded.
+//! Explicit SQL execution controls with partial snapshot input accounting.
+//! Projection and nested-reader aggregate allocation is not yet bounded.
 use super::*;
 use std::{os::unix::fs::MetadataExt,sync::{Arc,atomic::{AtomicU8,Ordering}},time::Instant};
 use crate::runner::Cancellation;
@@ -60,7 +61,10 @@ impl ControlledStore {
     pub fn import_operation_count(&self)->Result<u64> {self.read(SqliteStore::import_operation_count)}
     pub fn import_receipt(&self)->Result<(String,u64,u64)> {self.read(SqliteStore::import_receipt)}
     pub fn read_snapshot(&mut self,at:Option<u64>)->Result<Snapshot> {
-        self.control.check()?;let value=self.store.read_snapshot(at).map_err(|e|self.error(e))?;self.control.check()?;Ok(value)
+        self.control.check()?;
+        let budget=read_budget::ReadBudget::new(self.control.clone());
+        let value=self.store.read_snapshot_with_budget(at,Some(&budget)).map_err(|e|self.error(e))?;
+        self.control.check()?;Ok(value)
     }
     pub(crate) fn schedule_routine(&mut self,prepared:&PreparedRoutineTick,head:u64)->Result<Option<RoutineOccurrence>> {
         self.mutation(|store|store.schedule_routine(prepared,head))

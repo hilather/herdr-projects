@@ -710,3 +710,11 @@ Before rename, publication checks cancellation; after rename it completes direct
 fsync rather than claiming the marker was never published. Filesystem durability
 remains cooperative. Aggregate decoded allocations and other effect workers still
 need separate limits and controlled API integration.
+
+Controlled snapshot core readers (tasks, attempts, operations and events) now share
+50 MiB of input/structure accounting per snapshot, with 100000 returned rows,
+16 MiB per field and 64 columns. Accounting occurs on SQLite-owned values before
+application copies and JSON decoding. JSON structure uses conservative lexical
+weights, not an exact heap estimate. A limit rejects the whole snapshot. Other
+projections, nested readers and mutation-local reads are not yet covered; this is
+not a full snapshot memory bound.

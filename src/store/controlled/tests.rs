@@ -66,3 +66,43 @@ fn controlled_open_preserves_integrity_and_schema_refusal() {
         let result=ControlledStore::open(&path,control());assert!(matches!(result,Err(StoreError::UnsupportedSchema(99))|Err(StoreError::Corrupt(_))));
     }
 }
+
+#[test]
+fn core_snapshot_accounting_refuses_dense_json_before_decode() {
+    let(_root,path)=fixture();
+    let mut db=ControlledStore::open(&path,control()).unwrap();
+    let mut legacy=SqliteStore::open(&path).unwrap();
+    let raw=Connection::open(&path).unwrap();
+    // Inject corruption after integrity-checked opening. Accounting must reject
+    // before serde sees this invalid payload, below the encoded-row limit.
+    raw.execute_batch("PRAGMA ignore_check_constraints=ON").unwrap();
+    let payload="[".repeat(500_000);
+    raw.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('dense','x',1,1,?1)",[payload]).unwrap();drop(raw);
+    assert!(matches!(db.read_snapshot(None),Err(StoreError::Limit(_))));
+    assert!(matches!(legacy.read_snapshot(None),Err(StoreError::Corrupt(_))));
+}
+#[test]
+fn core_snapshot_accounting_is_shared_across_tables_and_resets_per_snapshot() {
+    let(_root,path)=fixture();let mut legacy=SqliteStore::open(&path).unwrap();insert(&mut legacy).unwrap();
+    let expected=legacy.read_snapshot(None).unwrap();let mut db=ControlledStore::open(&path,control()).unwrap();
+    assert_eq!(db.read_snapshot(None).unwrap(),expected);assert_eq!(db.read_snapshot(None).unwrap(),expected);
+    let raw=Connection::open(&path).unwrap();
+    // Four 10 MiB task titles plus a 13 MiB JSON string event. Each table fits
+    // separately; the same returned-row budget must cover both.
+    raw.execute_batch("DELETE FROM tasks; DELETE FROM events;").unwrap();
+    for id in 0..4 {raw.execute("INSERT INTO tasks(id,revision,state,title) VALUES(?1,1,'draft',?2)",params![format!("t{id}"),"x".repeat(10*1024*1024)]).unwrap();}
+    raw.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('large','x',1,1,?1)",[serde_json::to_string(&"x".repeat(13*1024*1024)).unwrap()]).unwrap();
+    assert!(matches!(db.read_snapshot(None),Err(StoreError::Limit(_))));
+}
+#[test]
+fn core_snapshot_accounting_rejects_valid_dense_payload_and_view_amplification() {
+    let(_root,path)=fixture();let raw=Connection::open(&path).unwrap();
+    let payload=format!("[{}0]","0,".repeat(210_000));
+    raw.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('dense','x',1,1,?1)",[payload]).unwrap();
+    let mut db=ControlledStore::open(&path,control()).unwrap();
+    assert!(matches!(db.read_snapshot(None),Err(StoreError::Limit(_))));
+    assert_eq!(SqliteStore::open(&path).unwrap().read_snapshot(None).unwrap().events.len(),1);
+    raw.execute_batch("DELETE FROM events; INSERT INTO tasks(id,revision,state,title) VALUES('task',1,'draft',''); ALTER TABLE tasks RENAME TO original_tasks; CREATE VIEW tasks AS SELECT original_tasks.id,revision,state,CAST(zeroblob(10000000) AS TEXT) AS title,active_attempt FROM original_tasks CROSS JOIN (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6);").unwrap();
+    // The returned view rows, not the single small base-table row, are charged.
+    assert!(matches!(db.read_snapshot(None),Err(StoreError::Limit(_))));
+}

@@ -2666,3 +2666,26 @@ CLI regressions in both debug and release profiles. The focused set includes the
 three new recovery/library tests and 26 canonical controller tests, including two
 new original-deadline SQL fixtures. Default-feature `cargo check` and
 `git diff --check` passed. Independent review approved the final integration.
+
+### W04 core snapshot input accounting (partial)
+
+Controlled snapshots now share a read budget across task, attempt, operation and
+event materializers. Actual SQLite-owned fields are measured before application
+copies: 50 MiB of accounting units, 100000 returned rows, 16 MiB per field and 64
+columns. Rows and columns each cost 128 units, plus raw bytes. JSON payloads are
+scanned without allocation before parsing; opening quotes and every nonwhitespace
+byte outside strings cost 128 units each. This conservatively bounds admitted JSON
+structure, not exact heap consumption. Original cancellation/deadline checks run
+per row and every 4 KiB of JSON, including long quoted strings. Snapshots remain
+all-or-error; no history is omitted. Each snapshot starts a new budget.
+
+This is deliberately partial: other projection materializers, nested operation
+reads and mutation-local readers still need the same explicit budget. Legacy
+read_snapshot behavior is unchanged. Full snapshot allocation bounding remains
+unfinished; card counts and platform acceptance are unchanged.
+
+Independent review approved this partial core-reader slice. All 217 library tests
+passed in debug and release, including eight new accounting/helper and controlled
+snapshot regressions. Default-feature `cargo check` and `git diff --check` passed.
+Operation payload accounting charges both JSON tree construction passes; events
+charge one. Projection/nested-reader integration is the next step.
