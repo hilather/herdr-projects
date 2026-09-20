@@ -27,5 +27,13 @@ fn pending_pr_does_not_block_other_project_status_or_become_an_outage() {
 #[test]
 fn changed_report_discards_pending_observation_and_shutdown_drains_it() {
     let(world,project)=pr_world(JSON);let ctx=world.ctx();let mut memory=Memory::new(&ctx);let(pool,started,_release)=reads();memory.pr_reads=Some(pool);ticker::tick_for_test(&ctx,&mut memory);started.recv_timeout(Duration::from_secs(1)).unwrap();
-    std::fs::write(thread::home_report_path(&project,"t-0001"),format!("PR: {PR_URL}\nChanged report while query pending\n")).unwrap();ticker::tick_for_test(&ctx,&mut memory);started.recv_timeout(Duration::from_secs(1)).unwrap();assert!(thread::load(&project,"t-0001").unwrap().pr_state.is_empty());let start=Instant::now();memory.pr_reads.as_mut().unwrap().stop().unwrap();assert!(start.elapsed()<Duration::from_secs(2));assert!(items_of(&project,"outage").is_empty());
+    std::fs::write(thread::home_report_path(&project,"t-0001"),format!("PR: {PR_URL}\nChanged report while query pending\n")).unwrap();ticker::tick_for_test(&ctx,&mut memory);started.recv_timeout(Duration::from_secs(1)).unwrap();assert!(thread::load(&project,"t-0001").unwrap().pr_state.is_empty());
+    match ticker::metrics_state(&ctx.root) {
+        ticker::MetricsFile::Present(metrics) => {
+            assert!(!metrics.uncertain);
+            assert!(metrics.control.queued+metrics.control.running>=1||metrics.control.completed>=1);
+        }
+        other => panic!("expected persisted executor metrics, got {other:?}"),
+    }
+    let start=Instant::now();memory.pr_reads.as_mut().unwrap().stop().unwrap();assert!(start.elapsed()<Duration::from_secs(2));assert!(items_of(&project,"outage").is_empty());
 }

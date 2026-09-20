@@ -1,5 +1,5 @@
-//! Explicit SQL execution controls with partial snapshot input accounting.
-//! Projection and nested-reader aggregate allocation is not yet bounded.
+//! Explicit SQL execution controls with snapshot input/JSON-structure accounting.
+//! This is not a peak-heap bound: decoding and SQLite still allocate independently.
 use super::*;
 use std::{os::unix::fs::MetadataExt,sync::{Arc,atomic::{AtomicU8,Ordering}},time::Instant};
 use crate::runner::Cancellation;

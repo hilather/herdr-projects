@@ -1,4 +1,4 @@
-# Operation-scoped authority (partial T04.5)
+# Operation-scoped authority (T04.5 local close)
 
 Schema 13 stores immutable grants, revocations and one-time uses. Grant installation
 requires a sealed internal capability produced by owner-signature verification.
@@ -41,8 +41,8 @@ Upgrade from schema 12 preserves existing input, delivery and event records. It
 does not invent grants for pending or already-claimed launches: those claims and
 pre-effect checks refuse while their attempts retain capacity. No actual user store
 is upgraded automatically. The same-OS-user shell bypass remains outside
-application-level authority. Policy-change ingress, denial audit and command-path
-coverage beyond launches remain outstanding T04.5 work.
+application-level authority. Isolated-service OS boundary remains documented;
+this is not an OS isolation guarantee.
 
 ## Signed owner-control import
 
@@ -90,11 +90,21 @@ isolation guarantee.
 
 Budget policies now use the same pinned owner key with a separate
 `budget@herdr-projects` namespace and sequential project-bound revisions. See
-[admission budgets](budgets.md). This is the first signed policy-change route;
-denial audit and authority coverage for other policy classes remain incomplete.
+[admission budgets](budgets.md).
 
 Routine revisions now use `routine@herdr-projects` signatures with explicit config,
 script-byte and project bindings. See [durable routine scheduling](routines.md).
 Permission lookup hashes the exact parsed config bytes, closing replacement races
-between surrounding path fingerprint checks. This authorizes durable scheduling;
-script execution and typed completion/termination receipts remain unavailable.
+between surrounding path fingerprint checks.
+
+Memory policy revisions use `memory@herdr-projects` and schema 17 `memory_policies`.
+`memory PROJECT import document sig --expected-head H` authenticates and stores
+sequential documents (`hard_rule`, `import_ack`, `revoke_head`, `cutover`). This
+slice does **not** apply those ops to memory rows or `format.memory`; that is
+T05.1/T05.3. Snapshot creation does not consume a memory policy or an
+`ApprovalGrant`. `ApprovalClass` remains launch-only.
+
+Refused mutating `approval` / `budget` / `routine-store` / `memory` commands write
+`authority_denials` with `actor_channel` `cli-owner` (or `unknown-rejected`). Request
+bodies are never stored. `approval PROJECT denials` lists them. An unopened store
+cannot record a row. Production launch dispatch remains disabled.

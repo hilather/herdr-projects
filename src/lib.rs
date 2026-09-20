@@ -29,6 +29,8 @@ pub mod final_copy_intent;
 pub mod authority;
 #[cfg(feature = "state-store")]
 pub mod routines;
+#[cfg(feature = "state-store")]
+pub mod memory;
 
 /// Schedule semantics shared by legacy and durable routines.
 pub mod schedule;

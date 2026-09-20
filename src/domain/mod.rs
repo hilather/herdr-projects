@@ -8,6 +8,14 @@ mod budget;
 pub use budget::*;
 mod routine;
 pub use routine::*;
+mod memory_policy;
+pub use memory_policy::*;
+mod memory;
+pub use memory::*;
+mod checkpoint;
+pub use checkpoint::*;
+mod proposal;
+pub use proposal::*;
 
 macro_rules! identifier {
     ($($name:ident),+) => { $(
@@ -28,7 +36,7 @@ macro_rules! identifier {
         impl From<$name> for String { fn from(id: $name) -> String { id.0 } }
     )+ };
 }
-identifier!(TaskId, AttemptId, OperationId);
+identifier!(TaskId, AttemptId, OperationId, MemoryRecordId, SnapshotId, ProposalId);
 
 macro_rules! states {
     ($name:ident { $($variant:ident => $value:literal),+ }) => {
@@ -104,6 +112,7 @@ pub struct Snapshot {
     pub attempt_inputs:Vec<AttemptInputRecord>,
     pub approvals:Vec<ApprovalRecord>,
     pub budget_policies:Vec<BudgetPolicy>,
+    pub memory_policies:Vec<MemoryPolicy>,
     pub routine_revisions:Vec<RoutineDefinition>,
     pub routine_occurrences:Vec<RoutineOccurrence>,
     pub routine_receipts:Vec<RoutineReceipt>,

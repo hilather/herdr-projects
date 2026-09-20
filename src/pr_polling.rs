@@ -41,6 +41,7 @@ impl Reads {
         let ticket=self.executor.submit(Request{identity:identity.clone(),lane:Lane::Control,deadline:now+Duration::from_secs(30),command})?;
         self.entries.insert(key,Entry{fingerprint:fingerprint.into(),url:url.into(),touched:now,state:ReadState::Pending{ticket,identity}});Ok(Poll::Pending)
     }
+    pub fn metrics(&self)->crate::executor::Metrics {self.executor.metrics()}
     pub fn stop(&mut self)->Result<()> {ensure!(self.executor.stop(Duration::from_secs(2)),"observation executor cleanup remains uncertain; inspect before restart");Ok(())}
     fn remove(&mut self,key:&(PathBuf,String)) {if let Some(Entry{state:ReadState::Pending{ticket,..},..})=self.entries.remove(key){ticket.cancel();}}
     fn prune(&mut self,now:Instant) {let stale=self.entries.iter().filter(|(_,e)|now.duration_since(e.touched)>=RETAIN).map(|(k,_)|k.clone()).collect::<Vec<_>>();for key in stale {self.remove(&key);}}

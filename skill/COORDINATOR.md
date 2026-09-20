@@ -18,8 +18,13 @@ Run `hp context <slug>` before selecting commands. If context declares
 - `TASKS.md` and legacy thread/runtime files are retained pre-cutover originals,
   not writable live state. Do not edit them or the database to bypass a refused
   command. Generated exports are read-only views of a particular revision.
-- `MEMORY.md` and existing memory Markdown remain their sole editable authority.
-  Runtime migration does not make them generated, verified, or database-owned.
+- If context declares `Memory owner: SQLite`, `MEMORY.md` and `memory/*.md` are
+  generated projections. Do not edit them. Use `hp memory <slug> import --file`,
+  `hp memory <slug> preview --file`, and signed `memory@` review
+  (`import_ack` / `hard_rule`). `hp memory <slug> inspect` shows live heads.
+- Otherwise `MEMORY.md` and existing memory Markdown remain their sole editable
+  authority. Runtime migration does not make them generated, verified, or
+  database-owned.
 - Use `hp reconcile <slug> --plan` to inspect recovery advice and
   `hp operations <slug> inspect` to inspect durable obligations. A plan authorizes
   no repair or dispatch. Missing/idle panes do not prove worker termination.
@@ -35,7 +40,7 @@ completion, and technical capability does not grant new user approval.
 
 ## Every turn
 
-1. Run `hp context <slug>` first. It prints the settings, the goal, current project instructions with a revision hash, the memory index, the task list (`TASKS.md`), the open threads with their live state, and the unhandled inbox items. Refresh your standing project instructions when that revision changes. Work from what it prints, not from what you remember.
+1. Run `hp context <slug>` first. It prints the settings, the goal, current project instructions with a revision hash, the memory index, the task list (`TASKS.md`), the open threads with their live state, and the unhandled inbox items. Refresh your standing project instructions when that revision changes. Work from what it prints, not from what you remember. Migrated projects require `profiles.planner` or `hp context <slug> --profile NAME`. If context prints a checkpoint id, acknowledge it with `hp context <slug> --ack CHECKPOINT` before relying on a later delta.
 2. Handle the inbox items. Then run `hp inbox done <slug> <item-id>...` for the ones you handled.
 3. Answer the user.
 
@@ -108,7 +113,7 @@ Keep the file short: it is printed every turn and costs tokens.
 ## Memory
 
 - When the user says to remember or forget something, edit the files in `memory/` and keep `MEMORY.md` as an index with one line per memory file.
-- When a report has a `## Remember` section, write your own short summary of what is worth keeping. Do not paste it.
+- When a report has a `## Remember` section, write your own short summary of what is worth keeping. Do not paste it. Do not edit `MEMORY.md` / `memory/*.md` as live state. File durable findings with `hp memory <slug> propose --input proposal.json` so they stay untrusted candidates until user/control review. Never promote, mark hard, or switch memory authority from a worker report.
 - Memory is inlined into every future thread's brief, so keep it short and factual.
 
 ## What is whose

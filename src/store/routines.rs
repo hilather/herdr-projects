@@ -22,11 +22,15 @@ fn decoded<T:serde::de::DeserializeOwned>(payload:&str,hash:&str)->Result<T> {
 fn log(db:&Connection,kind:&str,entity:&str,revision:u64,value:&impl serde::Serialize)->Result<()> {
     db.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?1,?2,?3,1,?4)",params![kind,entity,integer(revision)?,encoded(value)?.0])?;Ok(())
 }
-pub(super) fn read_all(db:&Connection)->Result<(Vec<RoutineDefinition>,Vec<RoutineOccurrence>)> {
+pub(super) fn read_all(db:&Connection)->Result<(Vec<RoutineDefinition>,Vec<RoutineOccurrence>)> {read_all_with_budget(db,None)}
+pub(super) fn read_all_with_budget(db:&Connection,budget:Option<&read_budget::ReadBudget>)->Result<(Vec<RoutineDefinition>,Vec<RoutineOccurrence>)> {
     let mut definitions=Vec::new();let mut last=BTreeMap::new();
     let mut stmt=db.prepare("SELECT name,revision,payload,payload_hash FROM routine_revisions ORDER BY name,revision")?;
-    for row in stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))? {
-        let(name,revision,payload,hash)=row?;let d:RoutineDefinition=decoded(&payload,&hash)?;
+    let mut rows=stmt.query([])?;
+    while let Some(r)=rows.next()? {
+        if let Some(budget)=budget {budget.row(r,&[(2,1)])?;}
+        let(name,revision,payload,hash):(String,u64,String,String)=(r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?);
+        let d:RoutineDefinition=decoded(&payload,&hash)?;
         if definitions.len()>=10_000||d.name!=name||d.revision!=revision||revision!=last.get(&name).copied().unwrap_or(0)+1
             ||d.reference().map_err(StoreError::Corrupt)?.digest!=hash {return Err(corrupt("routine history mismatch or bound exceeded"));}
         last.insert(name,revision);definitions.push(d);
@@ -34,12 +38,19 @@ pub(super) fn read_all(db:&Connection)->Result<(Vec<RoutineDefinition>,Vec<Routi
     if last.len()>128 {return Err(corrupt("routine identity bound exceeded"));}
     let mut cursors=BTreeMap::new();
     let mut stmt=db.prepare("SELECT name,revision,after_unix_ms FROM routine_cursors")?;
-    for row in stmt.query_map([],|r|Ok(((r.get::<_,String>(0)?,r.get::<_,u64>(1)?),r.get::<_,i64>(2)?)))? {let(k,v)=row?;cursors.insert(k,v);}
+    let mut rows=stmt.query([])?;
+    while let Some(r)=rows.next()? {
+        if let Some(budget)=budget {budget.row(r,&[])?;}
+        cursors.insert((r.get::<_,String>(0)?,r.get::<_,u64>(1)?),r.get::<_,i64>(2)?);
+    }
     let mut expected:BTreeMap<_,_>=definitions.iter().map(|d|((d.name.clone(),d.revision),d.start_unix_ms-1)).collect();
     let index:BTreeMap<_,_>=definitions.iter().map(|d|((d.name.clone(),d.revision),d)).collect();
     let mut occurrences=Vec::new();let mut stmt=db.prepare("SELECT id,name,revision,scheduled_unix_ms,payload,payload_hash,operation_id FROM routine_occurrences ORDER BY name,revision,scheduled_unix_ms")?;
-    for row in stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u64>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,Option<String>>(6)?)))? {
-        let(id,name,revision,instant,payload,hash,operation)=row?;let o:RoutineOccurrence=decoded(&payload,&hash)?;
+    let mut rows=stmt.query([])?;
+    while let Some(r)=rows.next()? {
+        if let Some(budget)=budget {budget.row(r,&[(4,1)])?;}
+        let(id,name,revision,instant,payload,hash,operation):(String,String,u64,i64,String,String,Option<String>)=(r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?);
+        let o:RoutineOccurrence=decoded(&payload,&hash)?;
         let key=(name,revision);let d=index.get(&key).ok_or_else(||corrupt("orphan routine occurrence"))?;
         let cursor=expected.get_mut(&key).ok_or_else(||corrupt("missing routine cursor"))?;
         // Historical instants remain authoritative across timezone database updates.
@@ -49,7 +60,7 @@ pub(super) fn read_all(db:&Connection)->Result<(Vec<RoutineDefinition>,Vec<Routi
             ||o.operation.as_ref().map(|id|id.as_str())!=operation.as_deref()
             ||(o.disposition==RoutineDisposition::Enqueued)!=o.operation.is_some() {return Err(corrupt("routine occurrence binding mismatch"));}
         if let Some(op)=&o.operation {
-            let operation=read_operation(db,op)?;
+            let operation=read_operation_with_budget(db,op,budget)?;
             if op.as_str()!=id||operation.task.is_some()||operation.kind!="routine.run"||operation.target!=format!("routine:{}",d.name)
                 ||operation.expected_revision!=o.control_revision||operation.payload_version!=1||operation.payload!=serde_json::to_value(&o).map_err(|_|corrupt("invalid occurrence"))?
                 ||operation.due_unix_ms!=o.observed_unix_ms||operation.idempotency_key!=id {return Err(corrupt("routine outbox binding mismatch"));}
@@ -87,13 +98,18 @@ fn validate_receipt(r:&RoutineReceipt,d:&RoutineDefinition,o:&RoutineOccurrence)
 /// Completion events use the existing atomic event log, with a digest and
 /// typed occurrence/claim binding. Generic operation outcomes never create one.
 pub(super) fn read_receipts(db:&Connection,definitions:&[RoutineDefinition],occurrences:&[RoutineOccurrence])->Result<Vec<RoutineReceipt>> {
+    read_receipts_with_budget(db,definitions,occurrences,None)
+}
+pub(super) fn read_receipts_with_budget(db:&Connection,definitions:&[RoutineDefinition],occurrences:&[RoutineOccurrence],budget:Option<&read_budget::ReadBudget>)->Result<Vec<RoutineReceipt>> {
     let mut result=Vec::new();let mut seen=std::collections::BTreeSet::new();
     let occurrences:BTreeMap<_,_>=occurrences.iter().filter_map(|o|o.operation.as_ref().map(|id|(id,o))).collect();
     let mut revisions=BTreeMap::new();
     for d in definitions {let reference=d.reference().map_err(StoreError::Corrupt)?;revisions.insert((reference.id.clone(),reference.revision),(reference,d));}
     let mut stmt=db.prepare("SELECT entity,revision,payload_version,payload FROM events WHERE kind='routine.completed' ORDER BY sequence")?;
-    for row in stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,u32>(2)?,r.get::<_,String>(3)?)))? {
-        let(entity,revision,version,payload)=row?;
+    let mut rows=stmt.query([])?;
+    while let Some(r)=rows.next()? {
+        if let Some(budget)=budget {budget.row(r,&[(3,1)])?;}
+        let(entity,revision,version,payload):(String,u64,u32,String)=(r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?);
         if result.len()>=100_000||payload.len()>MAX_RECORD_BYTES {return Err(corrupt("routine completion bound exceeded"));}
         let (r,hash):(RoutineReceipt,String)=serde_json::from_str(&payload).map_err(|_|corrupt("invalid routine completion"))?;
         if version!=1||entity!=r.operation.as_str()||revision!=r.claim.revision||!seen.insert(r.operation.clone())

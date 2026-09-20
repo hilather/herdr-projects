@@ -56,6 +56,12 @@ enum RepairCommand {
 enum ProfileCommand {
     /// Validate one named profile and print redacted JSON; does not launch an agent
     Inspect { name: String },
+    /// Resolve a named profile or unique kind into a budget envelope; does not launch
+    Resolve {
+        name: Option<String>,
+        /// Unique named profile whose kind field equals KIND; never profiles.<kind>
+        #[arg(long)] agent: Option<String>,
+    },
     /// Run bounded version probes against explicit local executables; no agent session
     Probe {
         name: String,
@@ -71,6 +77,7 @@ enum ApprovalCommand {
     Inspect,
     Import { document:PathBuf, signature:PathBuf, #[arg(long)] expected_head:u64 },
     Revoke { id:String, #[arg(long)] expected_head:u64, #[arg(long)] reason:String },
+    Denials,
 }
 
 #[cfg(feature="state-store")]
@@ -78,6 +85,29 @@ enum ApprovalCommand {
 enum BudgetCommand {
     Inspect,
     Import { document:PathBuf, signature:PathBuf, #[arg(long)] expected_head:u64 },
+}
+#[cfg(feature="state-store")]
+#[derive(Subcommand)]
+enum MemoryCommand {
+    Inspect,
+    Import {
+        document:Option<PathBuf>,
+        signature:Option<PathBuf>,
+        #[arg(long)] expected_head:Option<u64>,
+        #[arg(long)] file:Option<PathBuf>,
+        #[arg(long)] expected_revision:Option<u64>,
+    },
+    Preview { #[arg(long)] file:PathBuf },
+    Plan { #[arg(long)] output:PathBuf },
+    Cutover {
+        #[arg(long)] plan:PathBuf,
+        document:PathBuf,
+        signature:PathBuf,
+        #[arg(long)] expected_head:u64,
+        #[arg(long)] writers_stopped:bool,
+    },
+    Snapshot { #[arg(long)] task:String, #[arg(long)] profile:String, #[arg(long)] input_file:PathBuf },
+    Propose { #[arg(long)] input:PathBuf },
 }
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
@@ -106,6 +136,9 @@ enum Command {
     Approval { slug:String, #[command(subcommand)] command:ApprovalCommand },
     #[cfg(feature="state-store")]
     Budget { slug:String, #[command(subcommand)] command:BudgetCommand },
+    /// Memory inspect, signed policy, markdown import, snapshot and cutover
+    #[cfg(feature="state-store")]
+    Memory { slug:String, #[command(subcommand)] command:MemoryCommand },
     /// Signed durable routine control (does not execute scripts)
     #[cfg(feature="state-store")]
     RoutineStore { slug:String, #[command(subcommand)] command:RoutineStoreCommand },
@@ -171,6 +204,12 @@ enum Command {
         /// Print without recording the inbox items as seen
         #[arg(long)]
         peek: bool,
+        /// Named profile; defaults to profiles.planner. Never kind-default.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Acknowledge a checkpoint id from a previous context
+        #[arg(long, conflicts_with="peek")]
+        ack: Option<String>,
     },
     /// Print threads grouped by what needs you
     Overview {
@@ -487,6 +526,14 @@ pub fn run() -> Result<()> {
         let path = config_dir.join("config.toml");
         let value = match command {
             ProfileCommand::Inspect { name } => serde_json::to_value(crate::agents::profiles::inspect(&path, name)?)?,
+            ProfileCommand::Resolve { name, agent } => {
+                let resolved = match (name.as_deref(), agent.as_deref()) {
+                    (Some(name), None) => crate::agents::resolve::resolve(name, &path, None)?,
+                    (None, Some(kind)) => crate::agents::resolve::resolve_agent_kind(kind, &path, None)?,
+                    _ => bail!("profile resolve requires NAME or --agent KIND"),
+                };
+                serde_json::to_value(resolved)?
+            }
             ProfileCommand::Probe { name, herdr_executable, agent_executable } =>
                 serde_json::to_value(crate::agents::probe::probe(&path, name, herdr_executable, agent_executable, &RealRunner)?)?,
         };
@@ -513,6 +560,55 @@ pub fn run() -> Result<()> {
             }Ok(())
         },
         #[cfg(feature="state-store")]
+        Command::Memory{slug,command}=>{
+            project::validate_slug(&slug)?;let dir=ctx.root.join(slug);
+            let value=match command {
+                MemoryCommand::Inspect=>{
+                    let s=herdr_projects::runtime::snapshot(&dir)?;
+                    let mut db=herdr_projects::migration::open_active(&dir)?;
+                    let records=db.memory_records().unwrap_or_default();
+                    let facts=db.active_facts(jiff::Timestamp::now().as_millisecond()).unwrap_or_default();
+                    let authority=herdr_projects::migration::read_format(&dir).map(|f|f.memory).unwrap_or_else(|_| "legacy-markdown".into());
+                    serde_json::json!({"head":s.head,"authority":authority,"policies":s.memory_policies,"records":records,"active_facts":facts})
+                },
+                MemoryCommand::Import{document,signature,expected_head,file,expected_revision}=>{
+                    if let Some(file)=file {
+                        serde_json::to_value(herdr_projects::memory::import_file(&dir,&file,expected_revision)?)?
+                    } else if document.is_none() && signature.is_none() {
+                        let plan=herdr_projects::memory::plan(&dir)?;
+                        serde_json::to_value(herdr_projects::memory::import_plan(&dir,&plan)?)?
+                    } else {
+                        let document=document.context("memory import requires a signed document, --file, or no arguments to import the current inventory")?;
+                        let signature=signature.context("memory import requires a signature or --file")?;
+                        let expected_head=expected_head.context("signed memory import requires --expected-head")?;
+                        serde_json::to_value(herdr_projects::authority::import_memory(&dir,&document,&signature,expected_head)?)?
+                    }
+                },
+                MemoryCommand::Preview{file}=>serde_json::to_value(herdr_projects::memory::preview(&dir,&file)?)?,
+                MemoryCommand::Plan{output}=>{
+                    let plan=herdr_projects::memory::plan(&dir)?;
+                    std::fs::write(&output,serde_json::to_vec_pretty(&plan)?)?;
+                    serde_json::to_value(plan)?
+                },
+                MemoryCommand::Cutover{plan,document,signature,expected_head,writers_stopped}=>
+                    serde_json::to_value(herdr_projects::authority::cutover_memory(&dir,&plan,&document,&signature,expected_head,writers_stopped)?)?,
+                MemoryCommand::Snapshot{task,profile,input_file}=>{
+                    anyhow::ensure!(task!="coordinator","--task coordinator is reserved for the coordinator constructor");
+                    let resolved=crate::agents::resolve::resolve(&profile,&ctx.config_dir.join("config.toml"),None)?;
+                    let request:herdr_projects::domain::SnapshotRequest=serde_json::from_slice(&herdr_projects::migration::read_plan_file(&input_file)?).map_err(|_|anyhow::anyhow!("invalid snapshot scope JSON (contents withheld)"))?;
+                    anyhow::ensure!(request.task_id==task,"scope task_id must match --task");
+                    let instructions=std::fs::read_to_string(dir.join("PROJECT.md")).unwrap_or_default();
+                    let mut memory=herdr_projects::memory::MemoryStore::from_sqlite(herdr_projects::migration::open_active(&dir)?,dir.join(".state/objects"));
+                    serde_json::to_value(memory.create_task_snapshot(request,&resolved.name,&resolved.definition_digest,Some(&resolved.config_digest),resolved.budget.soft_input_chars,&instructions,jiff::Timestamp::now().as_millisecond(),None)?)?
+                },
+                MemoryCommand::Propose{input}=>{
+                    let bytes=herdr_projects::migration::read_plan_file(&input)?;
+                    let mut memory=herdr_projects::memory::MemoryStore::from_sqlite(herdr_projects::migration::open_active(&dir)?,dir.join(".state/objects"));
+                    serde_json::to_value(memory.propose(&bytes,jiff::Timestamp::now().as_millisecond())?)?
+                },
+            };println!("{}",serde_json::to_string_pretty(&value)?);Ok(())
+        },
+        #[cfg(feature="state-store")]
         Command::RoutineStore{slug,command}=>{
             project::validate_slug(&slug)?;let dir=ctx.root.join(slug);
             let value=match command {
@@ -531,6 +627,7 @@ pub fn run() -> Result<()> {
                 ApprovalCommand::Inspect=>serde_json::to_value(herdr_projects::runtime::snapshot(&dir)?.approvals)?,
                 ApprovalCommand::Import { document,signature,expected_head }=>serde_json::to_value(herdr_projects::authority::import_signed(&dir,&document,&signature,expected_head)?)?,
                 ApprovalCommand::Revoke { id,expected_head,reason }=>serde_json::json!({"head":herdr_projects::authority::revoke(&dir,&id,expected_head,&reason)?}),
+                ApprovalCommand::Denials=>serde_json::to_value(herdr_projects::authority::denials(&dir)?)?,
             };
             println!("{}",serde_json::to_string_pretty(&value)?);
             Ok(())
@@ -740,18 +837,42 @@ pub fn run() -> Result<()> {
                 rebind,
             },
         ),
-        Command::Context { slug, peek } => {
+        Command::Context { slug, peek, profile, ack } => {
             #[cfg(feature="state-store")]
             {
                 project::validate_slug(&slug)?;
                 if project::ensure_legacy(&ctx.root.join(&slug)).is_err() {
                     let dir=ctx.root.join(&slug);
-                    let (text,head,ids)=herdr_projects::runtime::context_snapshot(&dir).context("legacy runtime is disabled; migrated context could not be read")?;
-                    println!("{text}");
-                    if !peek&&!ids.is_empty(){herdr_projects::runtime::update_inbox(&dir,head,&ids,false)?;}
+                    if let Some(checkpoint)=ack {
+                        let acked=herdr_projects::runtime::ack_checkpoint(&dir,&checkpoint)?;
+                        println!("Checkpoint {} acknowledged (cursor_seq={}).",acked.id,acked.through_seq);
+                        return Ok(());
+                    }
+                    let config=ctx.config_dir.join("config.toml");
+                    let resolved=match profile.as_deref() {
+                        Some(name)=>crate::agents::resolve::resolve(name,&config,None)
+                            .with_context(||format!("context --profile {name} is not a named profile"))?,
+                        None=>crate::agents::resolve::resolve("planner",&config,None)
+                            .context("context requires profiles.planner or --profile NAME")?,
+                    };
+                    let herdr_session=project::Project::load(&ctx.root,&slug).ok()
+                        .and_then(|p|p.coordinator())
+                        .map(|c|c.session)
+                        .filter(|s|!s.is_empty())
+                        .unwrap_or_else(||"default".into());
+                    let instructions=std::fs::read_to_string(dir.join("PROJECT.md")).unwrap_or_default();
+                    let profile=herdr_projects::domain::CheckpointProfile{
+                        name:resolved.name,digest:resolved.definition_digest,config_digest:Some(resolved.config_digest),
+                        budget_chars:resolved.budget.soft_input_chars,
+                    };
+                    let result=herdr_projects::runtime::coordinator_context(&dir,&herdr_session,&profile,&instructions)
+                        .context("legacy runtime is disabled; migrated context could not be read")?;
+                    println!("{}",result.text);
+                    if !peek&&!result.unseen.is_empty(){herdr_projects::runtime::update_inbox(&dir,result.head,&result.unseen,false)?;}
                     return Ok(());
                 }
             }
+            let _=(profile,ack);
             coordinator::context(&ctx,&slug,peek)
         },
         Command::Overview { slug, wait } => overview::run(&ctx, slug.as_deref(), wait),

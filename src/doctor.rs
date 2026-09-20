@@ -139,6 +139,28 @@ fn report(
             ),
         ),
     }
+    match crate::ticker::metrics_state(root) {
+        crate::ticker::MetricsFile::Present(metrics) => {
+            let running = matches!(crate::ticker::lock_state(root), crate::ticker::LockState::Held(_));
+            check(
+                &mut out,
+                if running { Some(true) } else { None },
+                "executor",
+                format!(
+                    "control q={} r={} hw={} done={}; transfer q={} r={} hw={} done={}; delay_ms={}; uncertain={}",
+                    metrics.control.queued, metrics.control.running, metrics.control.high_water, metrics.control.completed,
+                    metrics.transfer.queued, metrics.transfer.running, metrics.transfer.high_water, metrics.transfer.completed,
+                    metrics.max_queue_delay_ms, metrics.uncertain
+                ),
+            );
+        }
+        crate::ticker::MetricsFile::Absent => {
+            if matches!(crate::ticker::lock_state(root), crate::ticker::LockState::Held(_)) {
+                check(&mut out, None, "executor", "metrics unavailable".into());
+            }
+        }
+        crate::ticker::MetricsFile::Invalid => check(&mut out, None, "executor", "metrics unreadable".into()),
+    }
 
     for slug in project::list_slugs(root) {
         let Ok(project) = project::Project::load(root, &slug) else {
@@ -151,6 +173,17 @@ fn report(
         }
         for diagnostic in crate::inbox::unhandled_with_diagnostics(&project).1 {
             check(&mut out, Some(false), &label, format!("inbox record: {diagnostic}; preserve and repair the file"));
+        }
+        #[cfg(feature="state-store")]
+        if project::ensure_legacy(&project.dir()).is_err() {
+            match herdr_projects::runtime::checkpoint_sizes(&project.dir()) {
+                Ok(Some(sizes)) => check(&mut out, Some(true), &label, format!(
+                    "coordinator checkpoint {} full_chars={} delta_chars={} created_unix_ms={}",
+                    sizes.checkpoint_id, sizes.full_chars, sizes.delta_chars, sizes.created_unix_ms
+                )),
+                Ok(None) => {},
+                Err(_) => {},
+            }
         }
         let retry_path = project.state_dir().join("ticker.json");
         match std::fs::read(&retry_path) {
@@ -310,5 +343,30 @@ mod tests {
         assert!(text.contains("[warn] root"));
         assert!(text.contains(&format!("root:       {}", root.display())));
         assert!(!root.exists(), "doctor must not create the root");
+        assert!(!text.contains("[FAIL] executor"), "{text}");
+        assert!(!text.contains("[ok  ] executor"), "{text}");
+    }
+
+    #[test]
+    fn executor_metrics_are_advisory_and_never_fail_doctor() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let root = home.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let metrics = crate::ticker::ExecutorMetrics {
+            control: crate::ticker::LaneMetrics { queued: 0, running: 1, high_water: 2, completed: 3 },
+            transfer: crate::ticker::LaneMetrics { queued: 0, running: 0, high_water: 0, completed: 0 },
+            max_queue_delay_ms: 40,
+            uncertain: false,
+        };
+        std::fs::write(root.join(".ticker-metrics.json"), serde_json::to_vec(&metrics).unwrap()).unwrap();
+        let (text, healthy) = report(&env, &root, &home.path().join("cfg"), &SessionFlags::default(), &runner);
+        assert!(healthy, "{text}");
+        assert!(text.contains("[warn] executor: control q=0 r=1 hw=2 done=3"), "{text}");
+        std::fs::write(root.join(".ticker-metrics.json"), "{broken").unwrap();
+        let (text, healthy) = report(&env, &root, &home.path().join("cfg"), &SessionFlags::default(), &runner);
+        assert!(healthy, "{text}");
+        assert!(text.contains("[warn] executor: metrics unreadable"), "{text}");
     }
 }

@@ -105,6 +105,10 @@ pub fn probe(config: &Path, name: &str, herdr: &Path, agent: &Path, runner: &dyn
     Ok(Probe { schema_version: 1, scope: "local_installation_only", profile, herdr, agent, evidence_digest })
 }
 
+impl Probe {
+    pub fn profile(&self) -> &Inspection { &self.profile }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

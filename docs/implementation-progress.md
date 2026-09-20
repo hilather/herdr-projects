@@ -2713,3 +2713,35 @@ final focused 13 controlled-store tests passed in both profiles, including that
 fixture. Default-feature `cargo check` and `git diff --check` passed. Work stops at
 this reviewed checkpoint at the user's request; the next reader group is not
 started. The task ledger records the resumption point and unchanged card counts.
+
+### T05.3 memory import and cutover (local Linux)
+
+Memory authority now has a separate `.state/migration/memory-journal.json` and
+`memory PROJECT cutover`. W03 `journal.json` is unchanged. `open_active` and
+`publish_control_marker` accept `legacy-markdown` or `sqlite-v1` and preserve the
+memory owner. Import inventories `MEMORY.md` / `memory/*.md` (64 KiB/file, 1 MiB
+total, nofollow, no symlinks/NULs/hidden files). Imported rows are
+`stale`/`unverified_import`; signed `import_ack` / `hard_rule` apply in the same
+transaction as policy install. After cutover, Markdown files are projections and
+`brief_for` uses a snapshot when one exists for the thread profile, otherwise
+generated projections. Production launches stay disabled. Next: T05.4.
+
+### T05.4 coordinator checkpoints (local Linux, not W05 gate)
+
+Schema 20 stores coordinator sessions and checkpoints keyed to a reserved
+coordinator snapshot (`task_id='coordinator'`). `context PROJECT` requires
+`profiles.planner` or `--profile NAME`. Full checkpoints cover new/unacked
+sessions; `--ack` advances `cursor_seq` so the next context may be a delta that
+still lists constraints and blockers. Failed reads do not consume the cursor.
+`doctor` prints last checkpoint sizes. Worker briefs are unchanged. The W05 wave
+gate is not claimed. Production launches stay disabled.
+
+### T06.1 worker memory proposals (local Linux)
+
+Schema 21 persists untrusted proposals and their validation receipts.
+`memory propose --input` accepts idempotent JSON with task/attempt/snapshot,
+expected base, scope, evidence and suggested change. Duplicate ID+digest reuses
+the prior result; a reused ID with different bytes conflicts. Stale bases,
+missing objects, malformed JSON, oversized payloads and permission elevation
+are rejected. This does not promote memory or claim the W06 wave gate. Next:
+T06.2.

@@ -8,6 +8,7 @@ use crate::{domain::{ApprovalGrant,PreparedApproval,VersionedReference}, migrati
 pub const SIGNATURE_NAMESPACE: &str = "approval@herdr-projects";
 pub const BUDGET_SIGNATURE_NAMESPACE: &str = "budget@herdr-projects";
 pub const ROUTINE_SIGNATURE_NAMESPACE: &str = "routine@herdr-projects";
+pub const MEMORY_SIGNATURE_NAMESPACE: &str = "memory@herdr-projects";
 
 #[derive(Deserialize,Serialize)]
 #[serde(deny_unknown_fields)]
@@ -105,58 +106,142 @@ pub(crate) fn routine_policy(project:&Path)->Result<(VersionedReference,migratio
 /// Verify an owner signature against pinned configuration and install the grant.
 /// No caller-supplied actor, key, config path, verifier or clock can authorize it.
 pub fn import_signed(project:&Path,document:&Path,signature:&Path,expected_head:u64)->Result<VersionedReference> {
-    let _guard=migration::runtime_mutation(project)?;
-    let mut db=migration::open_active(project)?;
-    let snapshot=db.read_snapshot(Some(expected_head))?;
-    let (policy,config)=policy(project)?;
-    let control=snapshot.control.context("control schema upgrade required")?;
-    ensure!(control.config_digest==config.digest,"owner configuration must be acknowledged by project control first");
-    let payload=migration::read_plan_file(document).map_err(|_|anyhow::anyhow!("approval document unreadable"))?;
-    let signature=migration::read_plan_file(signature).map_err(|_|anyhow::anyhow!("approval signature unreadable"))?;
-    let prepared=verify(&policy,&payload,&signature,&RealRunner)?;
-    ensure!(migration::config_reference(Path::new(&config.path))?==config,"owner configuration changed during verification");
-    Ok(db.install_approval(&prepared,expected_head,jiff::Timestamp::now().as_millisecond())?)
+    let result=(||{
+        let _guard=migration::runtime_mutation(project)?;
+        let mut db=migration::open_active(project)?;
+        let snapshot=db.read_snapshot(Some(expected_head))?;
+        let (policy,config)=policy(project)?;
+        let control=snapshot.control.context("control schema upgrade required")?;
+        ensure!(control.config_digest==config.digest,"owner configuration must be acknowledged by project control first");
+        let payload=migration::read_plan_file(document).map_err(|_|anyhow::anyhow!("approval document unreadable"))?;
+        let signature=migration::read_plan_file(signature).map_err(|_|anyhow::anyhow!("approval signature unreadable"))?;
+        let prepared=verify(&policy,&payload,&signature,&RealRunner)?;
+        ensure!(migration::config_reference(Path::new(&config.path))?==config,"owner configuration changed during verification");
+        Ok(db.install_approval(&prepared,expected_head,jiff::Timestamp::now().as_millisecond())?)
+    })();
+    if let Err(error)=&result {record_cli_denial(project,"approval","import",Some(expected_head),error);}
+    result
+}
+
+fn reason_code(error:&anyhow::Error)->&'static str {
+    let text=format!("{error:#}").to_ascii_lowercase();
+    if text.contains("signature") {"signature_failed"}
+    else if text.contains("different project")||text.contains("another project")||text.contains("belongs to a different") {"cross_project"}
+    else if text.contains("conflict")||text.contains("expected_head") {"stale_head"}
+    else if text.contains("invalid") {"invalid_document"}
+    else {"refused"}
+}
+
+fn record_cli_denial(project:&Path,class:&str,command:&str,expected_head:Option<u64>,error:&anyhow::Error) {
+    let Ok(mut db)=migration::open_active(project) else {return};
+    let actual=db.read_snapshot(None).ok().map(|s|s.head);
+    let policy_digest=policy(project).ok().and_then(|(p,_)|p.reference().ok()).map(|r|r.digest).unwrap_or_else(||"0".repeat(64));
+    let unix_ms=jiff::Timestamp::now().as_millisecond();
+    let reason=reason_code(error);
+    static NEXT:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);
+    let n=NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+    let id=format!("{:x}",Sha256::digest(format!("{unix_ms}\0{class}\0{command}\0{reason}\0{expected_head:?}\0{actual:?}\0{n}").as_bytes()));
+    let _=db.insert_denial(&crate::domain::AuthorityDenial{
+        id,unix_ms,class:class.into(),command:command.into(),actor_channel:"cli-owner".into(),
+        reason_code:reason.into(),policy_digest,expected_head,actual_head:actual,
+    });
+}
+
+pub fn denials(project:&Path)->Result<Vec<crate::domain::AuthorityDenial>> {
+    Ok(migration::open_active(project)?.authority_denials()?)
 }
 
 pub fn revoke(project:&Path,id:&str,head:u64,reason:&str)->Result<u64> {
-    let _guard=migration::runtime_mutation(project)?;
-    Ok(migration::open_active(project)?.revoke_approval(id,head,jiff::Timestamp::now().as_millisecond(),reason)?)
+    let result=(||{
+        let _guard=migration::runtime_mutation(project)?;
+        Ok(migration::open_active(project)?.revoke_approval(id,head,jiff::Timestamp::now().as_millisecond(),reason)?)
+    })();
+    if let Err(error)=&result {record_cli_denial(project,"approval","revoke",Some(head),error);}
+    result
 }
 
 /// Change admission policy only through an exact owner-signed, revision-bound document.
 pub fn import_budget(project:&Path,document:&Path,signature:&Path,expected_head:u64)->Result<VersionedReference> {
-    let _guard=migration::runtime_mutation(project)?;
-    let mut db=migration::open_active(project)?;
-    let snapshot=db.read_snapshot(Some(expected_head))?;
-    let (owner,config)=policy(project)?;
-    ensure!(snapshot.control.context("control schema upgrade required")?.config_digest==config.digest,
-        "owner configuration is not acknowledged by project control");
-    let bytes=migration::read_plan_file(document)?;
-    ensure!(bytes.len()<=65_536,"budget document exceeds bounds");
-    let policy:crate::domain::BudgetPolicy=serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid budget document (contents withheld)"))?;
-    policy.validate().map_err(anyhow::Error::msg)?;
-    ensure!(policy.authority==owner.reference()?,"budget names a different authority policy");
-    let signature=migration::read_plan_file(signature)?;
-    verify_signature(&owner,&bytes,&signature,BUDGET_SIGNATURE_NAMESPACE,&RealRunner)?;
-    ensure!(migration::config_reference(Path::new(&config.path))?==config,"owner configuration changed during verification");
-    Ok(db.install_budget(&crate::domain::PreparedBudget{policy},expected_head)?)
+    let result=(||{
+        let _guard=migration::runtime_mutation(project)?;
+        let mut db=migration::open_active(project)?;
+        let snapshot=db.read_snapshot(Some(expected_head))?;
+        let (owner,config)=policy(project)?;
+        ensure!(snapshot.control.context("control schema upgrade required")?.config_digest==config.digest,
+            "owner configuration is not acknowledged by project control");
+        let bytes=migration::read_plan_file(document)?;
+        ensure!(bytes.len()<=65_536,"budget document exceeds bounds");
+        let policy:crate::domain::BudgetPolicy=serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid budget document (contents withheld)"))?;
+        policy.validate().map_err(anyhow::Error::msg)?;
+        ensure!(policy.authority==owner.reference()?,"budget names a different authority policy");
+        let signature=migration::read_plan_file(signature)?;
+        verify_signature(&owner,&bytes,&signature,BUDGET_SIGNATURE_NAMESPACE,&RealRunner)?;
+        ensure!(migration::config_reference(Path::new(&config.path))?==config,"owner configuration changed during verification");
+        Ok(db.install_budget(&crate::domain::PreparedBudget{policy},expected_head)?)
+    })();
+    if let Err(error)=&result {record_cli_denial(project,"budget","import",Some(expected_head),error);}
+    result
 }
 
 pub fn import_routine(project:&Path,document:&Path,signature:&Path,expected_head:u64)->Result<VersionedReference> {
-    let _guard=migration::runtime_mutation(project)?;
+    let result=(||{
+        let _guard=migration::runtime_mutation(project)?;
+        let mut db=migration::open_active(project)?;
+        let snapshot=db.read_snapshot(Some(expected_head))?;
+        let(owner,config)=policy(project)?;
+        ensure!(snapshot.control.context("control schema upgrade required")?.config_digest==config.digest,"owner configuration is not acknowledged by project control");
+        let bytes=migration::read_plan_file(document)?;ensure!(bytes.len()<=65_536,"routine document exceeds bounds");
+        let definition:crate::domain::RoutineDefinition=serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid routine document (contents withheld)"))?;
+        definition.validate().map_err(anyhow::Error::msg)?;
+        ensure!(definition.project_store==project.join(".state/state.db").canonicalize()?.to_string_lossy(),"routine belongs to another project");
+        ensure!(definition.authority==owner.reference()?&&definition.config==config,"routine names another owner policy or configuration");
+        let signature=migration::read_plan_file(signature)?;
+        verify_signature(&owner,&bytes,&signature,ROUTINE_SIGNATURE_NAMESPACE,&RealRunner)?;
+        crate::routines::validate_current(&definition)?;
+        Ok(db.install_routine(&crate::domain::PreparedRoutine{definition},expected_head)?)
+    })();
+    if let Err(error)=&result {record_cli_denial(project,"routine-store","import",Some(expected_head),error);}
+    result
+}
+
+fn prepare_memory_policy(project:&Path,document:&Path,signature:&Path,expected_head:u64)->Result<crate::domain::PreparedMemoryPolicy> {
     let mut db=migration::open_active(project)?;
     let snapshot=db.read_snapshot(Some(expected_head))?;
     let(owner,config)=policy(project)?;
     ensure!(snapshot.control.context("control schema upgrade required")?.config_digest==config.digest,"owner configuration is not acknowledged by project control");
-    let bytes=migration::read_plan_file(document)?;ensure!(bytes.len()<=65_536,"routine document exceeds bounds");
-    let definition:crate::domain::RoutineDefinition=serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid routine document (contents withheld)"))?;
-    definition.validate().map_err(anyhow::Error::msg)?;
-    ensure!(definition.project_store==project.join(".state/state.db").canonicalize()?.to_string_lossy(),"routine belongs to another project");
-    ensure!(definition.authority==owner.reference()?&&definition.config==config,"routine names another owner policy or configuration");
+    let bytes=migration::read_plan_file(document)?;ensure!(bytes.len()<=65_536,"memory policy document exceeds bounds");
+    let policy:crate::domain::MemoryPolicy=serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid memory policy document (contents withheld)"))?;
+    policy.validate().map_err(anyhow::Error::msg)?;
+    ensure!(policy.authority==owner.reference()?,"memory policy names a different authority policy");
+    let store=project.join(".state/state.db").canonicalize()?.to_string_lossy().into_owned();
+    ensure!(policy.project_store==store,"memory policy belongs to another project");
+    ensure!(policy.expected_head==expected_head,"memory policy expected_head does not match command head");
     let signature=migration::read_plan_file(signature)?;
-    verify_signature(&owner,&bytes,&signature,ROUTINE_SIGNATURE_NAMESPACE,&RealRunner)?;
-    crate::routines::validate_current(&definition)?;
-    Ok(db.install_routine(&crate::domain::PreparedRoutine{definition},expected_head)?)
+    verify_signature(&owner,&bytes,&signature,MEMORY_SIGNATURE_NAMESPACE,&RealRunner)?;
+    ensure!(migration::config_reference(Path::new(&config.path))?==config,"owner configuration changed during verification");
+    Ok(crate::domain::PreparedMemoryPolicy{policy})
+}
+
+pub fn import_memory(project:&Path,document:&Path,signature:&Path,expected_head:u64)->Result<VersionedReference> {
+    let result=(||{
+        let _guard=migration::runtime_mutation(project)?;
+        let prepared=prepare_memory_policy(project,document,signature,expected_head)?;
+        let mut db=migration::open_active(project)?;
+        Ok(db.install_memory_policy(&prepared,expected_head)?)
+    })();
+    if let Err(error)=&result {record_cli_denial(project,"memory","import",Some(expected_head),error);}
+    result
+}
+
+pub fn cutover_memory(project:&Path,plan_file:&Path,document:&Path,signature:&Path,expected_head:u64,writers_stopped:bool)->Result<crate::memory::MemoryJournal> {
+    let result=(||{
+        let bytes=migration::read_plan_file(plan_file)?;
+        let plan:crate::memory::MemoryPlan=serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid memory plan (contents withheld)"))?;
+        let prepared=prepare_memory_policy(project,document,signature,expected_head)?;
+        crate::memory::cutover(project,&plan,&prepared,writers_stopped)
+    })();
+    if let Err(error)=&result {record_cli_denial(project,"memory","cutover",Some(expected_head),error);}
+    result
 }
 
 #[cfg(test)]
@@ -303,5 +388,47 @@ mod tests {
         fs::write(&config,format!("[authority]\nversion=1\nrevision=2\napproval_public_key={:?}\n",policy.approval_public_key)).unwrap();
         assert!(import_budget(&project,&document,&sig,installed.head).is_err());
         assert!(import_signed(&project,&document,&sig,installed.head).is_err());assert_eq!(crate::runtime::snapshot(&project).unwrap(),installed);
+    }
+    #[test]
+    fn signed_memory_policy_requires_namespace_and_records_denials() {
+        use crate::domain::{Applicability,ControlContext,MemoryKind,MemoryPolicy,MemoryPolicyOp,MemoryRecordId,NewRevision};
+        let dir=tempfile::tempdir().unwrap();let (key,owner)=key(dir.path(),"owner");
+        let project=dir.path().join("project");fs::create_dir(&project).unwrap();
+        for child in [".state","threads","inbox"] {fs::create_dir(project.join(child)).unwrap();}
+        fs::write(project.join("PROJECT.md"),"+++\nname='Project'\n+++\n").unwrap();
+        fs::write(project.join("TASKS.md"),"").unwrap();fs::write(project.join("MEMORY.md"),"").unwrap();
+        fs::write(project.join(".state/project.json"),r#"{"status":"paused"}"#).unwrap();
+        let config=dir.path().join("owner.toml");
+        fs::write(&config,format!("[authority]\nversion=1\nrevision=1\napproval_public_key={:?}\n",owner.approval_public_key)).unwrap();
+        let plan=migration::inspect_with_config(&project,&config).unwrap();migration::apply(&project,&plan,true).unwrap();
+        let before=crate::runtime::snapshot(&project).unwrap();
+        crate::runtime::set_state(&project,before.head,before.control.unwrap().revision,ProjectState::Active,&config).unwrap();
+        let mut memory=crate::memory::MemoryStore::from_sqlite(migration::open_active(&project).unwrap(),project.join(".state/objects"));
+        let body=memory.ingest_object(&b"api"[..]).unwrap();let prov=memory.ingest_object(&b"prov"[..]).unwrap();
+        memory.insert_revision(&ControlContext{now_unix_ms:1},NewRevision{
+            id:MemoryRecordId::new("api").unwrap(),record_key:"memory/api.md".into(),scope_id:"project".into(),kind:MemoryKind::Observation,
+            body_hash:body,provenance_hash:prov,applicability:Applicability{domains:vec![],paths:vec!["memory/api.md".into()]},
+            dependencies:vec![],expected:None,expiry_unix_ms:None,validity_state:"stale".into(),validity_reason:"unverified_import".into(),
+        }).unwrap();
+        let store=project.join(".state/state.db").canonicalize().unwrap().display().to_string();
+        let head=crate::runtime::snapshot(&project).unwrap().head;
+        let policy=MemoryPolicy{version:1,revision:1,project_store:store.clone(),authority:owner.reference().unwrap(),expected_head:head,op:MemoryPolicyOp::HardRule,record_key:Some("memory/api.md".into()),memory_plan_digest:None,expected_memory_owner:None};
+        let bytes=serde_json::to_vec(&policy).unwrap();let document=dir.path().join("memory.json");let sig=dir.path().join("memory.sig");
+        fs::write(&document,&bytes).unwrap();fs::write(&sig,sign(&key,&bytes,BUDGET_SIGNATURE_NAMESPACE)).unwrap();
+        let before=crate::runtime::snapshot(&project).unwrap();
+        assert!(import_memory(&project,&document,&sig,before.head).is_err());
+        assert_eq!(crate::runtime::snapshot(&project).unwrap(),before);
+        let denied=denials(&project).unwrap();assert!(denied.iter().any(|d|d.class=="memory"&&d.command=="import"&&d.actor_channel=="cli-owner"&&d.reason_code=="signature_failed"));
+        fs::write(&sig,sign(&key,&bytes,MEMORY_SIGNATURE_NAMESPACE)).unwrap();
+        assert_eq!(import_memory(&project,&document,&sig,before.head).unwrap(),policy.reference().unwrap());
+        let installed=crate::runtime::snapshot(&project).unwrap();
+        assert_eq!(installed.memory_policies,vec![policy.clone()]);
+        let facts=migration::open_active(&project).unwrap().active_facts(1_000).unwrap();
+        assert!(facts.iter().any(|f| f.record.record_key=="memory/api.md" && f.record.is_hard && f.validity.state=="valid"));
+        assert!(import_memory(&project,&document,&sig,installed.head).is_err());
+        assert_eq!(crate::runtime::snapshot(&project).unwrap(),installed);
+        let missing=dir.path().join("missing");
+        assert!(import_memory(&missing,&document,&sig,0).is_err());
+        assert!(denials(&missing).is_err());
     }
 }

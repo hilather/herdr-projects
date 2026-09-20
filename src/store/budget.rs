@@ -2,11 +2,13 @@
 use super::*;
 
 fn invalid(s:&str)->StoreError {StoreError::Invalid(s.into())}
-pub(super) fn read_all(db:&Connection)->Result<Vec<BudgetPolicy>> {
+pub(super) fn read_all(db:&Connection)->Result<Vec<BudgetPolicy>> {read_all_with_budget(db,None)}
+pub(super) fn read_all_with_budget(db:&Connection,budget:Option<&read_budget::ReadBudget>)->Result<Vec<BudgetPolicy>> {
     let mut statement=db.prepare("SELECT revision,payload,payload_hash FROM budget_policies ORDER BY revision")?;
     let mut rows=statement.query([])?;
     let mut policies=Vec::new();
     while let Some(row)=rows.next()? {
+        if let Some(budget)=budget {budget.row(row,&[(1,1)])?;}
         let revision:u64=row.get(0)?;
         let payload:String=row.get(1)?;
         let digest:String=row.get(2)?;

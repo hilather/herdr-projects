@@ -332,6 +332,19 @@ pub fn compose_brief(input: &BriefInput) -> String {
 /// Reads the project's instructions and memory and composes the brief.
 pub fn brief_for(project: &Project, thread: &Thread, task: &str, restart: bool) -> Result<String> {
     let (_, instructions) = project.read_project_md()?;
+    let (memory_index, memory_files) = brief_memory(project, thread)?;
+    Ok(compose_brief(&BriefInput {
+        instructions: &instructions,
+        memory_index: &memory_index,
+        memory_files: &memory_files,
+        task,
+        restart,
+        report_path: &thread.report_path(),
+        library_path: &thread.library_path(),
+    }))
+}
+
+fn brief_memory_files(project: &Project) -> (String, Vec<(String, String)>) {
     let memory_index = std::fs::read_to_string(project.dir().join("MEMORY.md")).unwrap_or_default();
     let mut names: Vec<String> = std::fs::read_dir(project.dir().join("memory"))
         .map(|entries| {
@@ -343,7 +356,7 @@ pub fn brief_for(project: &Project, thread: &Thread, task: &str, restart: bool) 
         })
         .unwrap_or_default();
     names.sort();
-    let memory_files: Vec<(String, String)> = names
+    let memory_files = names
         .into_iter()
         .filter_map(|name| {
             let path = project.dir().join("memory").join(&name);
@@ -352,15 +365,24 @@ pub fn brief_for(project: &Project, thread: &Thread, task: &str, restart: bool) 
             regular.then(|| std::fs::read_to_string(&path).ok()).flatten().map(|text| (name, text))
         })
         .collect();
-    Ok(compose_brief(&BriefInput {
-        instructions: &instructions,
-        memory_index: &memory_index,
-        memory_files: &memory_files,
-        task,
-        restart,
-        report_path: &thread.report_path(),
-        library_path: &thread.library_path(),
-    }))
+    (memory_index, memory_files)
+}
+
+fn brief_memory(project: &Project, thread: &Thread) -> Result<(String, Vec<(String, String)>)> {
+    #[cfg(feature = "state-store")]
+    {
+        let marker = project.dir().join(".state/format.json");
+        if std::fs::symlink_metadata(&marker).is_ok_and(|m| m.is_file()) {
+            if let Ok(fmt) = herdr_projects::migration::read_format(&project.dir()) {
+                if fmt.memory == "sqlite-v1" {
+                    return herdr_projects::memory::load_brief_memory(&project.dir(), &thread.agent_name, MEMORY_CAP_CHARS as u64)
+                        .map_err(anyhow::Error::from);
+                }
+            }
+        }
+    }
+    let _ = thread;
+    Ok(brief_memory_files(project))
 }
 
 // ---------------------------------------------------------------- groups

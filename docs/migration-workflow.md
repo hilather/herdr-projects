@@ -70,7 +70,7 @@ replacing original records. After publication, recover forward or restore into a
 new directory. Do not remove the marker and run an older binary against the root.
 
 The format marker declares runtime owner `sqlite-v2`, memory owner
-`legacy-markdown`, and initially `reconciliation_required=true`. Schema v7 derives
+`legacy-markdown` until T05.3 `memory cutover` (then `sqlite-v1`), and initially `reconciliation_required=true`. Schema v7 derives
 the latter from canonical lifecycle control; see [admission and recovery](reconciliation.md). Legacy commands in both
 feature-enabled and default builds refuse mutation/execution after preparation;
 list displays store/maintenance status. The ticker can deliver accepted canonical
@@ -81,9 +81,12 @@ list/show/add/rename`, `operations PROJECT inspect` and `context PROJECT` are no
 available; task mutations require expected revisions/event heads. `active` means ownership was
 published, not that the scheduler is enabled.
 
-`MEMORY.md`, project instructions and other source files remain untouched. Backups
-include their original bytes; no DB memory authority or memory projections are
-created. Worktrees, branches and external agent resources are never altered.
+`MEMORY.md`, project instructions and other source files remain untouched by the
+W03 runtime journal. Memory authority uses a separate
+`.state/migration/memory-journal.json` and `memory PROJECT cutover`; W03 apply
+never writes `sqlite-v1`. After memory cutover, `MEMORY.md` / `memory/*.md` are
+projections and `publish_control_marker` preserves `format.memory`. Worktrees,
+branches and external agent resources are never altered.
 Generated views live under `.state/projections/schema-<schema>-revision-<event-head>`;
 legacy files are retained as pre-cutover originals rather than dual-written views.
 Coordinator execution adapters remain unavailable. Store-backed context prints

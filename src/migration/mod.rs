@@ -40,12 +40,30 @@ pub struct Format {
     pub migration: String,
     pub reconciliation_required: bool,
 }
+pub const MEMORY_LEGACY: &str = "legacy-markdown";
+pub const MEMORY_SQLITE: &str = "sqlite-v1";
+pub(crate) fn memory_owner_ok(memory: &str) -> bool {
+    memory == MEMORY_LEGACY || memory == MEMORY_SQLITE
+}
+pub(crate) fn published_format_matches(marker: &Format, journal: &Journal) -> bool {
+    marker.version == 1
+        && marker.runtime == "sqlite-v2"
+        && memory_owner_ok(&marker.memory)
+        && marker.migration == journal.plan.digest
+}
+pub fn read_format(project: &Path) -> Result<Format> {
+    let project = checked_project(project)?;
+    Ok(serde_json::from_slice(&read(&project.join(".state/format.json"))?)?)
+}
+pub(crate) fn memory_journal_path(project: &Path) -> std::path::PathBuf {
+    project.join(".state/migration/memory-journal.json")
+}
 
 pub(crate) fn hash(bytes: &[u8]) -> String { format!("{:x}",Sha256::digest(bytes)) }
 pub(crate) fn safe_relative(path: &str) -> bool {
     !path.is_empty() && Path::new(path).components().all(|p|matches!(p,Component::Normal(_))) && !path.contains('\\')
 }
-fn checked_project(project: &Path) -> Result<std::path::PathBuf> {
+pub(crate) fn checked_project(project: &Path) -> Result<std::path::PathBuf> {
     ensure!(!fs::symlink_metadata(project)?.file_type().is_symlink(),"project path must not be a symlink");
     let project = project.canonicalize()?;
     ensure!(fs::symlink_metadata(project.join(".state"))?.is_dir(),".state must be a real directory");
@@ -59,7 +77,7 @@ pub(crate) fn read(path: &Path) -> Result<Vec<u8>> {
     ensure!(bytes.len() as u64 <= LIMIT,"{} exceeds 16 MiB",path.display());
     Ok(bytes)
 }
-fn safe_join(root:&Path,relative:&str)->Result<std::path::PathBuf> {
+pub(crate) fn safe_join(root:&Path,relative:&str)->Result<std::path::PathBuf> {
     ensure!(safe_relative(relative),"unsafe relative path");
     ensure!(fs::symlink_metadata(root)?.is_dir(),"controlled root is not a real directory");
     let mut path=root.to_path_buf();
@@ -73,7 +91,7 @@ fn safe_join(root:&Path,relative:&str)->Result<std::path::PathBuf> {
     }
     Ok(path)
 }
-fn exists(path: &Path) -> bool { fs::symlink_metadata(path).is_ok() }
+pub(crate) fn exists(path: &Path) -> bool { fs::symlink_metadata(path).is_ok() }
 fn inventory(project: &Path, relative: &Path, sources: &mut Vec<Source>, total: &mut u64) -> Result<()> {
     ensure!(relative.components().count()<=64,"source tree exceeds depth 64");
     let mut entries = fs::read_dir(project.join(relative))?.collect::<std::io::Result<Vec<_>>>()?;
@@ -324,7 +342,7 @@ fn advance(project:&Path,journal:&mut Journal)->Result<()> {
     }
     ensure!(journal.phase==Phase::Active,"unknown recovery state");
     let marker:Format=serde_json::from_slice(&read(&project.join(".state/format.json"))?)?;
-    ensure!(marker==Format{version:1,runtime:"sqlite-v2".into(),memory:"legacy-markdown".into(),migration:journal.plan.digest.clone(),reconciliation_required:marker.reconciliation_required},"active ownership marker mismatch");
+    ensure!(published_format_matches(&marker,&journal),"active ownership marker mismatch");
     // After ownership publication, tasks/events may legitimately have advanced.
     let mut db=open_published(project,false)?;
     ensure!(db.imported_sources()?==expected_import(project,&journal.plan)?,"imported provenance changed");
@@ -463,7 +481,7 @@ fn open_published(project:&Path,enforce_control:bool)->Result<SqliteStore> {
     let journal=load(&project)?;
     ensure!(journal.phase==Phase::Active,"migration has not completed; recover before using the store");
     let marker:Format=serde_json::from_slice(&read(&project.join(".state/format.json"))?)?;
-    ensure!(marker==Format{version:1,runtime:"sqlite-v2".into(),memory:"legacy-markdown".into(),migration:journal.plan.digest.clone(),reconciliation_required:marker.reconciliation_required},"active ownership marker mismatch");
+    ensure!(published_format_matches(&marker,&journal),"active ownership marker mismatch");
     let db=SqliteStore::open(&project.join(".state/state.db"))?;
     ensure!(db.import_operation_count()?==journal.plan.operations.len() as u64,"store imported operation count mismatch");
     let receipt=db.import_receipt()?;
@@ -488,9 +506,11 @@ pub use references::{ConfigReference, config_reference, inspect_with_config, req
 /// blocks ordinary opens; active-journal recovery republishes this derived marker.
 pub(crate) fn publish_control_marker(project:&Path,db:&SqliteStore)->Result<()> {
     let journal=load(project)?;
-    let expected=Format{version:1,runtime:"sqlite-v2".into(),memory:"legacy-markdown".into(),migration:journal.plan.digest,reconciliation_required:db.project_control()?.map(|c|c.reconciliation_required).unwrap_or(true)};
     let path=project.join(".state/format.json");
-    if serde_json::from_slice::<Format>(&read(&path)?)?==expected{return Ok(());}
+    let current:Format=serde_json::from_slice(&read(&path)?)?;
+    ensure!(published_format_matches(&current,&journal),"active ownership marker mismatch");
+    let expected=Format{version:1,runtime:"sqlite-v2".into(),memory:current.memory.clone(),migration:journal.plan.digest,reconciliation_required:db.project_control()?.map(|c|c.reconciliation_required).unwrap_or(true)};
+    if current==expected{return Ok(());}
     let temporary=project.join(".state/migration/control-format.next");
     if exists(&temporary){ensure!(fs::symlink_metadata(&temporary)?.is_file(),"invalid control marker temporary");fs::remove_file(&temporary)?;}
     write_new(&temporary,&serde_json::to_vec_pretty(&expected)?)?;

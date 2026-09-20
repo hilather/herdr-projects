@@ -43,11 +43,26 @@ Agent and Herdr versions are `null`. `launchable`, `protocol_capable` and `certi
 are all false until the respective evidence paths exist. These are conservative
 admission results, not claims that an installed agent lacks support.
 
+`herdr-projects profile resolve NAME` prints a redacted budget envelope together
+with inspection. It does not launch, write the store, or emit argv/environment
+values. `soft_input_chars` is `soft_input_tokens * 4` when that field is set,
+otherwise 32 000 (the worker brief cap). The estimator is `char-count-v1`.
+`frozen` is always null: a sealed per-attempt `FrozenProfile` producer remains
+T04.3 remaining-acceptance. Live `profile probe` still leaves `launchable`,
+`protocol_capable` and `certified` false; distinguishing those flags is a mock
+path only. W08 supplies live workflow certification.
+
+`--agent KIND` selects the **unique** named profile whose `kind` field equals
+KIND (`profiles.implementation` for `codex` and `profiles.planner` for `claude`
+in the example above). Zero or multiple matches are errors. Resolution never
+looks up `profiles.<kind>` and never copies another kind's `extra_args`. This
+selector is documentation and the `profile resolve` CLI only; it is not wired
+into ticker launch or coordinator checkpoints.
+
 Named profiles are not yet selected by legacy thread/coordinator launches. Those
 paths retain the explicit kind bindings described in [operations](operations.md).
-Remaining T04.3 work includes version probes, capability evidence, kind-default
-selection and immutable per-attempt profile resolution. W08 supplies live workflow
-certification; no listed agent kind is automatically certified.
+Remaining T04.3 work is the sealed per-attempt producer (still undispatched) and
+live W08 certification. No listed agent kind is automatically certified.
 
 ## Observed compatibility baseline
 

@@ -42,6 +42,11 @@ impl SqliteStore {
         if version<=13 {tx.execute_batch(include_str!("../../migrations/0014_admission_budgets.sql"))?;}
         if version<=14 {tx.execute_batch(include_str!("../../migrations/0015_project_operations.sql"))?;}
         if version<=15 {tx.execute_batch(include_str!("../../migrations/0016_durable_routines.sql"))?;}
+        if version<=16 {tx.execute_batch(include_str!("../../migrations/0017_command_authority.sql"))?;}
+        if version<=17 {tx.execute_batch(include_str!("../../migrations/0018_memory_revisions.sql"))?;}
+        if version<=18 {tx.execute_batch(include_str!("../../migrations/0019_memory_snapshots.sql"))?;}
+        if version<=19 {tx.execute_batch(include_str!("../../migrations/0020_coordinator_checkpoints.sql"))?;}
+        if version<=20 {tx.execute_batch(include_str!("../../migrations/0021_memory_proposals.sql"))?;}
         tx.commit()?;
         Ok(())
     }

@@ -9,7 +9,7 @@ fn publication(project:&Path,budget:&mut Budget)->Result<(std::path::PathBuf,Pub
     ensure!(Path::new(&journal.plan.project)==project,"identity journal project mismatch");
     ensure!(references::plan_digest(&journal.plan)?==journal.plan.digest&&journal.plan.sources.iter().all(|s|safe_relative(&s.path)),"identity journal inventory mismatch");budget.check()?;
     let marker:Format=serde_json::from_slice(&budget.read(&project.join(".state/format.json"))?)?;
-    ensure!(marker==Format{version:1,runtime:"sqlite-v2".into(),memory:"legacy-markdown".into(),migration:journal.plan.digest.clone(),reconciliation_required:marker.reconciliation_required},"identity ownership marker mismatch");
+    ensure!(published_format_matches(&marker,&journal),"identity ownership marker mismatch");
     let publication=Publication{digest:journal.plan.digest,sources:journal.plan.sources.iter().filter(|s|s.kind!="backup").count() as u64,tasks:journal.plan.tasks.len() as u64,operations:journal.plan.operations.len() as u64,reconciliation_required:marker.reconciliation_required};
     Ok((project,publication))
 }
@@ -35,7 +35,9 @@ pub(crate) fn publish_control_marker_controlled(project:&Path,db:&crate::store::
     let(project,old)=publication(project,&mut budget)?;
     let required=db.project_control()?.map(|c|c.reconciliation_required).unwrap_or(true);
     if required==old.reconciliation_required {control.check()?;return Ok(());}
-    let marker=Format{version:1,runtime:"sqlite-v2".into(),memory:"legacy-markdown".into(),migration:old.digest,reconciliation_required:required};
+    let current:Format=serde_json::from_slice(&budget.read(&project.join(".state/format.json"))?)?;
+    ensure!(memory_owner_ok(&current.memory)&&current.version==1&&current.runtime=="sqlite-v2"&&current.migration==old.digest,"identity ownership marker mismatch");
+    let marker=Format{version:1,runtime:"sqlite-v2".into(),memory:current.memory,migration:old.digest,reconciliation_required:required};
     let temporary=project.join(".state/migration/control-format.next");
     control.check()?;
     if exists(&temporary){ensure!(fs::symlink_metadata(&temporary)?.is_file(),"invalid control marker temporary");fs::remove_file(&temporary)?;}

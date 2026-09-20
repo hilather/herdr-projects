@@ -117,6 +117,10 @@ fn projection_materializers_charge_actual_values_before_copy_or_validation() {
         ("runtime_observations", "SELECT CAST(zeroblob(16777217) AS TEXT) AS binding_id,1 AS binding_revision,NULL AS task_revision,0 AS observed_unix_ms,'{}' AS payload,'' AS payload_hash"),
         ("runtime_ownership", "SELECT CAST(zeroblob(16777217) AS TEXT) AS binding_id,1 AS revision,1 AS binding_revision,NULL AS attempt_id,'{}' AS payload,'' AS payload_hash"),
         ("project_control", "SELECT 1 AS singleton,1 AS revision,1 AS epoch,CAST(zeroblob(16777217) AS TEXT) AS state,0 AS reconciliation_required,NULL AS config_digest"),
+        ("task_queue", "SELECT CAST(zeroblob(16777217) AS TEXT) AS task_id,0 AS priority,0 AS enqueued_unix_ms,1 AS enqueue_sequence"),
+        ("approval_grants", "SELECT 'grant' AS id,CAST(zeroblob(16777217) AS TEXT) AS payload,'' AS payload_hash"),
+        ("budget_policies", "SELECT 1 AS revision,CAST(zeroblob(16777217) AS TEXT) AS payload,'' AS payload_hash"),
+        ("routine_revisions", "SELECT 'r' AS name,1 AS revision,CAST(zeroblob(16777217) AS TEXT) AS payload,'' AS payload_hash"),
     ];
     for (table,query) in cases {
         let(_root,path)=fixture();let mut db=ControlledStore::open(&path,control()).unwrap();
@@ -145,10 +149,70 @@ fn runtime_provenance_join_amplification_consumes_one_snapshot_budget() {
     let payload=serde_json::to_string(&binding).unwrap();
     raw.execute("INSERT INTO legacy_sources VALUES('.state/coordinator.json','runtime',?1,?2)",params![digest,bytes]).unwrap();
     raw.execute("INSERT INTO runtime_bindings VALUES('coordinator',NULL,1,'.state/coordinator.json',?1,?2)",params![payload,format!("{:x}",Sha256::digest(payload.as_bytes()))]).unwrap();
-    let mut db=ControlledStore::open(&path,control()).unwrap();
+    let mut db=ControlledStore::open(&path,ReadControl::new(Instant::now()+Duration::from_secs(30),Cancellation::default())).unwrap();
     assert_eq!(db.read_snapshot(None).unwrap(),SqliteStore::open(&path).unwrap().read_snapshot(None).unwrap());
     raw.execute_batch("ALTER TABLE runtime_bindings RENAME TO original_bindings; CREATE VIEW runtime_bindings AS SELECT original_bindings.* FROM original_bindings CROSS JOIN (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5);").unwrap();
     // Singleton source plus five returned join rows would copy 60 MiB from one
     // 10 MiB source. Reject before the final inventory mismatch/partial return.
-    assert!(matches!(db.read_snapshot(None),Err(StoreError::Limit(_))));
+    let amplified=db.read_snapshot(None);
+    assert!(matches!(amplified,Err(StoreError::Limit(_))),"{amplified:?}");
+}
+
+fn launch_neighbors(raw:&Connection) {
+    let hash=format!("{:x}",Sha256::digest(b"{}"));
+    raw.execute_batch("INSERT INTO tasks(id,revision,state,title) VALUES('a',1,'draft',''); INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) VALUES('attempt-a','a',1,'reserved',NULL,'slot',0);").unwrap();
+    raw.execute("INSERT INTO operations(id,task_id,kind,target,payload_version,payload,payload_hash,expected_revision,due_unix_ms,idempotency_key) VALUES('launch-a','a','runtime.launch','task:a',1,'{}',?1,4,0,'launch-a')",[&hash]).unwrap();
+}
+
+#[test]
+fn remaining_snapshot_readers_charge_join_and_nested_json_before_copy() {
+    // Not a heap bound: this only accounts admitted input/JSON structure.
+    let(_root,path)=fixture();let mut db=ControlledStore::open(&path,control()).unwrap();
+    let raw=Connection::open(&path).unwrap();
+    launch_neighbors(&raw);
+    raw.execute_batch("ALTER TABLE attempt_inputs RENAME TO original_attempt_inputs; CREATE VIEW attempt_inputs AS SELECT 'attempt-a' AS attempt_id,'launch-a' AS operation_id,CAST(zeroblob(16777217) AS TEXT) AS payload,'' AS payload_hash;").unwrap();
+    let result=db.read_snapshot(None);
+    assert!(matches!(result,Err(StoreError::Limit(_))),"attempt_inputs: {result:?}");
+
+    for (table,ddl) in [
+        ("attempt_inputs", "ALTER TABLE attempt_inputs RENAME TO original_attempt_inputs; CREATE TABLE attempt_inputs(attempt_id,operation_id,payload,payload_hash);"),
+        ("approval_grants", "ALTER TABLE approval_grants RENAME TO original_approval_grants; CREATE TABLE approval_grants(id,payload,payload_hash);"),
+    ] {
+        let(_root,path)=fixture();let mut db=ControlledStore::open(&path,control()).unwrap();
+        let raw=Connection::open(&path).unwrap();
+        raw.execute_batch(ddl).unwrap();
+        let payload=format!("[{}0]","0,".repeat(110_000));
+        if table=="attempt_inputs" {
+            launch_neighbors(&raw);
+            raw.execute("INSERT INTO attempt_inputs VALUES('attempt-a','launch-a',?1,'')",[&payload]).unwrap();
+        } else {
+            raw.execute("INSERT INTO approval_grants VALUES('grant',?1,'')",[&payload]).unwrap();
+        }
+        assert!(matches!(db.read_snapshot(None),Err(StoreError::Limit(_))),"{table} dense json");
+        assert!(matches!(SqliteStore::open(&path).unwrap().read_snapshot(None),Err(StoreError::Corrupt(_))),"{table} unbounded decode");
+    }
+}
+
+#[test]
+fn approval_read_does_not_double_count_already_budgeted_inputs() {
+    // Not a heap bound. One 7 MiB payload join must remain readable; re-scanning
+    // those inputs from approvals would exceed 50 MiB.
+    let(_root,path)=fixture();
+    let mut inputs:LaunchInputs=serde_json::from_str(include_str!("../../../tests/fixtures/launch-inputs-v1.json")).unwrap();
+    let profile=crate::domain::profile::fixture(inputs.config.clone());
+    inputs.version=2;inputs.project_store=format!("/{}", "x".repeat(7*1024*1024));
+    inputs.effective_profile=Some(profile.clone());inputs.profile=profile.reference().unwrap();
+    let digest=format!("{:x}",Sha256::digest(serde_json::to_vec(&inputs).unwrap()));
+    let attempt=format!("attempt-{digest}");let operation=format!("launch-{digest}");
+    let record=AttemptInputRecord{attempt:AttemptId::new(attempt.clone()).unwrap(),operation:OperationId::new(operation.clone()).unwrap(),inputs:inputs.clone()};
+    let payload=serde_json::to_string(&record).unwrap();let hash=format!("{:x}",Sha256::digest(payload.as_bytes()));
+    let raw=Connection::open(&path).unwrap();
+    raw.execute("INSERT INTO tasks(id,revision,state,title) VALUES('a',1,'draft','')",[]).unwrap();
+    raw.execute("INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) VALUES(?1,'a',1,'reserved',NULL,'slot',0)",[&attempt]).unwrap();
+    raw.execute("INSERT INTO operations(id,task_id,kind,target,payload_version,payload,payload_hash,expected_revision,due_unix_ms,idempotency_key) VALUES(?1,'a','runtime.launch','task:a',1,?2,?3,4,0,?1)",params![&operation,&payload,&hash]).unwrap();
+    raw.execute("INSERT INTO attempt_inputs VALUES(?1,?2,?3,?4)",params![&attempt,&operation,&payload,&hash]).unwrap();
+    drop(raw);
+    let expected=SqliteStore::open(&path).unwrap().read_snapshot(None).unwrap();
+    let mut db=ControlledStore::open(&path,control()).unwrap();
+    assert_eq!(db.read_snapshot(None).unwrap(),expected);
 }

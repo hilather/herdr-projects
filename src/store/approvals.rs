@@ -3,14 +3,23 @@ use super::*;
 use crate::operations::Claim;
 use rusqlite::OptionalExtension;
 
+#[allow(dead_code)]
 pub(super) fn read_all(db: &Connection) -> Result<Vec<ApprovalRecord>> {
+    read_all_with(db, &super::reservations::read_inputs(db)?, None)
+}
+pub(super) fn read_all_with(db: &Connection, inputs: &[AttemptInputRecord], budget: Option<&read_budget::ReadBudget>) -> Result<Vec<ApprovalRecord>> {
     let orphan:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM approval_uses u LEFT JOIN approval_grants g ON g.id=u.approval_id LEFT JOIN operations o ON o.id=u.operation_id WHERE g.id IS NULL OR o.id IS NULL) OR EXISTS(SELECT 1 FROM approval_revocations r LEFT JOIN approval_grants g ON g.id=r.approval_id WHERE g.id IS NULL)",[],|r|r.get(0))?;
     if orphan { return Err(StoreError::Corrupt("orphan approval record".into())); }
-    let ids={let mut stmt=db.prepare("SELECT id FROM approval_grants ORDER BY id")?;stmt.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?};
-    let inputs=super::reservations::read_inputs(db)?;
+    let mut stmt=db.prepare("SELECT id FROM approval_grants ORDER BY id")?;
+    let mut rows=stmt.query([])?;
+    let mut ids=Vec::new();
+    while let Some(r)=rows.next()? {
+        if let Some(budget)=budget {budget.row(r,&[])?;}
+        ids.push(r.get::<_,String>(0)?);
+    }
     let mut records=Vec::new();
     for id in ids {
-        let grant=grant(db,&id)?;
+        let grant=grant(db,&id,budget)?;
         let revoked=db.query_row("SELECT revoked_unix_ms,reason FROM approval_revocations WHERE approval_id=?1",[&id],|r|Ok(ApprovalRevocation{revoked_unix_ms:r.get(0)?,reason:r.get(1)?})).optional()?;
         let consumed=db.query_row("SELECT operation_id,claim_revision,claim_epoch,consumed_unix_ms FROM approval_uses WHERE approval_id=?1",[&id],|r|Ok((r.get::<_,String>(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?
             .map(|(id,claim_revision,claim_epoch,consumed_unix_ms)|Ok::<ApprovalUse,StoreError>(ApprovalUse{operation:OperationId::new(id).map_err(StoreError::Corrupt)?,claim_revision,claim_epoch,consumed_unix_ms})).transpose()?;
@@ -36,8 +45,12 @@ fn project_path(db: &Connection) -> Result<String> {
     let path = db.path().ok_or_else(|| invalid("approval requires a file-backed store"))?;
     std::fs::canonicalize(path).map(|p| p.to_string_lossy().into_owned()).map_err(|_| invalid("approval store path unavailable"))
 }
-fn grant(db: &Connection, id: &str) -> Result<ApprovalGrant> {
-    let (payload, digest): (String, String) = db.query_row("SELECT payload,payload_hash FROM approval_grants WHERE id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+fn grant(db: &Connection, id: &str, budget: Option<&read_budget::ReadBudget>) -> Result<ApprovalGrant> {
+    let mut stmt = db.prepare("SELECT payload,payload_hash FROM approval_grants WHERE id=?1")?;
+    let mut rows = stmt.query([id])?;
+    let r = rows.next()?.ok_or_else(|| StoreError::from(rusqlite::Error::QueryReturnedNoRows))?;
+    if let Some(budget) = budget { budget.row(r, &[(0, 2)])?; }
+    let (payload, digest): (String, String) = (r.get(0)?, r.get(1)?);
     if payload.len() > MAX_RECORD_BYTES || format!("{:x}", Sha256::digest(payload.as_bytes())) != digest { return Err(StoreError::Corrupt("approval payload identity mismatch".into())); }
     let grant: ApprovalGrant = serde_json::from_str(&payload).map_err(|_| StoreError::Corrupt("invalid approval record".into()))?;
     let reference = grant.reference().map_err(|_| StoreError::Corrupt("invalid approval record".into()))?;
@@ -68,7 +81,7 @@ fn check_launch(db: &Connection, operation: &OperationId, now: i64) -> Result<St
         return Err(invalid("launch no longer owns an eligible retained reservation"));
     }
     let profile = inputs.effective_profile.as_ref().ok_or_else(|| invalid("historical launch lacks current approval evidence"))?;
-    let approval = grant(db, &inputs.approval.id)?;
+    let approval = grant(db, &inputs.approval.id, None)?;
     approval.matches_launch(inputs, &project_path(db)?, now).map_err(|_| invalid("launch approval is stale or mismatched"))?;
     if approval.policy != profile.permission_policy { return Err(invalid("approval policy differs from effective profile")); }
     let revoked: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM approval_revocations WHERE approval_id=?1)", [&inputs.approval.id], |r| r.get(0))?;
@@ -131,7 +144,7 @@ impl SqliteStore {
         if reason.trim().is_empty() || reason.len() > 4000 || reason.chars().any(char::is_control) { return Err(invalid("invalid approval revocation reason")); }
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         schema(&tx)?;if head(&tx)? != expected_head { return Err(StoreError::Conflict); }
-        grant(&tx, id)?;
+        grant(&tx, id, None)?;
         tx.execute("INSERT INTO approval_revocations VALUES(?1,?2,?3)", params![id,now,reason])?;
         log(&tx, "approval.revoked", id, &serde_json::json!({"revoked_unix_ms":now,"reason":reason}))?;
         let head = head(&tx)?;tx.commit()?;Ok(head)

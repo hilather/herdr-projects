@@ -25,19 +25,38 @@ fn record_ids(i:&LaunchInputs)->Result<(AttemptId,OperationId)> {
     let digest=format!("{:x}",Sha256::digest(serde_json::to_vec(i).map_err(|e|invalid(&e.to_string()))?));
     Ok((AttemptId::new(format!("attempt-{digest}")).map_err(StoreError::Invalid)?,OperationId::new(format!("launch-{digest}")).map_err(StoreError::Invalid)?))
 }
-pub(super) fn read_inputs(db:&Connection)->Result<Vec<AttemptInputRecord>> {
+pub(super) fn read_inputs(db:&Connection)->Result<Vec<AttemptInputRecord>> {read_inputs_with_budget(db,None)}
+pub(super) fn read_inputs_with_budget(db:&Connection,budget:Option<&read_budget::ReadBudget>)->Result<Vec<AttemptInputRecord>> {
     let broken:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM attempt_inputs i LEFT JOIN attempts a ON a.id=i.attempt_id LEFT JOIN operations o ON o.id=i.operation_id WHERE a.id IS NULL OR o.id IS NULL) OR EXISTS(SELECT 1 FROM operations o LEFT JOIN attempt_inputs i ON i.operation_id=o.id WHERE o.kind='runtime.launch' AND (i.attempt_id IS NULL OR o.payload_version<>1 OR o.idempotency_key<>o.id))",[],|r|r.get(0))?;
     if broken {return Err(StoreError::Corrupt("launch input inventory mismatch".into()));}
     let mut stmt=db.prepare("SELECT i.attempt_id,i.operation_id,i.payload,i.payload_hash,a.task_id,o.task_id,o.kind,o.target,o.expected_revision,o.payload,o.payload_hash FROM attempt_inputs i JOIN attempts a ON a.id=i.attempt_id JOIN operations o ON o.id=i.operation_id ORDER BY i.attempt_id")?;
-    let rows=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,u64>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?)))?;
-    rows.map(|row|{let(a,o,payload,digest,task,op_task,kind,target,revision,op_payload,op_digest)=row?;let record:AttemptInputRecord=serde_json::from_str(&payload).map_err(|_|StoreError::Corrupt("invalid attempt input payload".into()))?;validate_inputs(&record.inputs)?;
+    let mut rows=stmt.query([])?;
+    let mut result=Vec::new();
+    while let Some(r)=rows.next()? {
+        if let Some(budget)=budget {
+            use rusqlite::types::ValueRef;
+            let payload_ref=match r.get_ref(2)? {ValueRef::Text(b)|ValueRef::Blob(b)=>b,_=>&[]};
+            let op_ref=match r.get_ref(9)? {ValueRef::Text(b)|ValueRef::Blob(b)=>b,_=>&[]};
+            if payload_ref==op_ref {budget.row(r,&[(2,2)])?;} else {budget.row(r,&[(2,2),(9,2)])?;}
+        }
+        let(a,o,payload,digest,task,op_task,kind,target,revision,op_payload,op_digest)=(r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,u64>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?);
+        let record:AttemptInputRecord=serde_json::from_str(&payload).map_err(|_|StoreError::Corrupt("invalid attempt input payload".into()))?;validate_inputs(&record.inputs)?;
         let(expected_attempt,expected_op)=record_ids(&record.inputs)?;
-        if record.attempt.as_str()!=a||record.operation.as_str()!=o||record.attempt!=expected_attempt||record.operation!=expected_op||record.inputs.task.as_str()!=task||task!=op_task||kind!="runtime.launch"||target!=record.inputs.binding||Some(revision)!=record.inputs.task_revision.checked_add(1)||payload!=op_payload||digest!=op_digest||format!("{:x}",Sha256::digest(payload.as_bytes()))!=digest {return Err(StoreError::Corrupt("attempt/launch input binding mismatch".into()));}Ok(record)
-    }).collect()
+        if record.attempt.as_str()!=a||record.operation.as_str()!=o||record.attempt!=expected_attempt||record.operation!=expected_op||record.inputs.task.as_str()!=task||task!=op_task||kind!="runtime.launch"||target!=record.inputs.binding||Some(revision)!=record.inputs.task_revision.checked_add(1)||payload!=op_payload||digest!=op_digest||format!("{:x}",Sha256::digest(payload.as_bytes()))!=digest {return Err(StoreError::Corrupt("attempt/launch input binding mismatch".into()));}
+        result.push(record);
+    }
+    Ok(result)
 }
-pub(super) fn read_cancellations(db:&Connection)->Result<Vec<CancellationRequest>> {
+pub(super) fn read_cancellations(db:&Connection)->Result<Vec<CancellationRequest>> {read_cancellations_with_budget(db,None)}
+pub(super) fn read_cancellations_with_budget(db:&Connection,budget:Option<&read_budget::ReadBudget>)->Result<Vec<CancellationRequest>> {
     let mut stmt=db.prepare("SELECT attempt_id,requested_unix_ms,reason FROM attempt_cancellations ORDER BY attempt_id")?;
-    let result=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?)))?.map(|row|{let(id,requested_unix_ms,reason)=row?;Ok(CancellationRequest{attempt:AttemptId::new(id).map_err(StoreError::Corrupt)?,requested_unix_ms,reason})}).collect();result
+    let mut rows=stmt.query([])?;
+    let mut result=Vec::new();
+    while let Some(r)=rows.next()? {
+        if let Some(budget)=budget {budget.row(r,&[])?;}
+        result.push(CancellationRequest{attempt:AttemptId::new(r.get::<_,String>(0)?).map_err(StoreError::Corrupt)?,requested_unix_ms:r.get(1)?,reason:r.get(2)?});
+    }
+    Ok(result)
 }
 fn event(db:&Connection,kind:&str,id:&str,revision:u64,payload:&impl serde::Serialize)->Result<()> {db.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?1,?2,?3,1,?4)",params![kind,id,integer(revision)?,serde_json::to_string(payload).map_err(|e|invalid(&e.to_string()))?])?;Ok(())}
 

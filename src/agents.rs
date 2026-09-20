@@ -3,6 +3,7 @@
 use anyhow::{Result,ensure};
 pub mod profiles;
 pub mod probe;
+pub mod resolve;
 pub fn arguments<'a>(kind:&str,bound_kind:Option<&str>,args:&'a [String],setting:&str)->Result<&'a [String]> {
     valid_kind(kind)?;
     if let Some(bound)=bound_kind {valid_kind(bound)?;}

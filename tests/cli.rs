@@ -187,6 +187,34 @@ fn profile_inspection_is_redacted_read_only_and_refuses_malformed_config() {
     }
 }
 
+#[test]
+fn profile_resolve_prints_envelope_without_argv_and_selects_unique_kind() {
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join(".config/herdr-projects");
+    std::fs::create_dir_all(&config).unwrap();
+    let path = config.join("config.toml");
+    std::fs::write(&path, "[profiles.implementation]\nkind='codex'\npermission_policy='interactive'\nextra_args=['SECRET_ARG']\n[profiles.implementation.budget]\nsoft_input_tokens=80\nunknown_usage='allow_with_warning'\n[profiles.planner]\nkind='claude'\npermission_policy='interactive'\n").unwrap();
+    let output = hp(home.path(), &["profile", "resolve", "implementation"]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["kind"], "codex");
+    assert_eq!(value["budget"]["soft_input_chars"], 320);
+    assert_eq!(value["budget"]["estimator"], "char-count-v1");
+    assert!(value["frozen"].is_null());
+    assert_eq!(value["inspection"]["launchable"], false);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("SECRET"));
+    let by_kind = hp(home.path(), &["profile", "resolve", "--agent", "claude"]);
+    assert!(by_kind.status.success(), "{}", String::from_utf8_lossy(&by_kind.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&by_kind.stdout).unwrap();
+    assert_eq!(value["name"], "planner");
+    assert_eq!(value["budget"]["soft_input_chars"], 32000);
+    std::fs::write(&path, "[profiles.a]\nkind='codex'\npermission_policy='interactive'\n[profiles.b]\nkind='codex'\npermission_policy='interactive'\n").unwrap();
+    let output = hp(home.path(), &["profile", "resolve", "--agent", "codex"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("multiple named profiles"));
+    assert!(!home.path().join(".herdr-projects").exists());
+}
+
 fn hp(home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(BIN)
         .env_clear()
@@ -509,7 +537,7 @@ fn migrated_runtime_bindings_require_explicit_upgrade_and_are_unverified() {
     for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
     let project=root.join("demo");std::fs::write(project.join("threads/t-0001.toml"),"id='t-0001'\nstatus='resolved'\nrepo='/repo'\n").unwrap();
     let plan=herdr_projects::migration::inspect(&project).unwrap();herdr_projects::migration::apply(&project,&plan,true).unwrap();
-    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; DROP TABLE runtime_ownership; DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; UPDATE store_meta SET schema_version=4; PRAGMA user_version=4;").unwrap();drop(raw);
+    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; DROP TABLE runtime_ownership; DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; UPDATE store_meta SET schema_version=4; PRAGMA user_version=4;").unwrap();drop(raw);
     let args=["--root",root_arg,"migration","demo","bindings"];
     let out=hp(home.path(),&args);assert!(!out.status.success());assert!(String::from_utf8_lossy(&out.stderr).contains("upgrade-store"));
     assert!(hp(home.path(),&["--root",root_arg,"migration","demo","upgrade-store"]).status.success());

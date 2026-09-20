@@ -20,17 +20,30 @@ fn graph(tasks:&[Task],queue:&[QueueRecord])->Result<()> {
     while let Some(id)=ready.pop_front(){visited+=1;if let Some(next)=followers.get(&id){for id in next {let n=degree.get_mut(id).unwrap();*n-=1;if *n==0{ready.push_back(id.clone());}}}}
     if visited!=degree.len(){return Err(invalid("dependency cycle"));}Ok(())
 }
-pub(super) fn read(db:&Connection)->Result<SchedulerSnapshot> {
-    let policy=db.query_row("SELECT revision,max_active_workers,max_attempts_per_task FROM scheduler_policy WHERE singleton=1",[],|r|Ok(SchedulerPolicy{revision:r.get(0)?,max_active_workers:r.get(1)?,max_attempts_per_task:r.get(2)?}))?;
+pub(super) fn read(db:&Connection)->Result<SchedulerSnapshot> {read_with_tasks(db,&read_tasks(db)?,None)}
+pub(super) fn read_with_tasks(db:&Connection,tasks:&[Task],budget:Option<&read_budget::ReadBudget>)->Result<SchedulerSnapshot> {
+    let mut stmt=db.prepare("SELECT revision,max_active_workers,max_attempts_per_task FROM scheduler_policy WHERE singleton=1")?;
+    let mut rows=stmt.query([])?;
+    let r=rows.next()?.ok_or_else(||StoreError::from(rusqlite::Error::QueryReturnedNoRows))?;
+    if let Some(budget)=budget {budget.row(r,&[])?;}
+    let policy=SchedulerPolicy{revision:r.get(0)?,max_active_workers:r.get(1)?,max_attempts_per_task:r.get(2)?};
     let mut stmt=db.prepare("SELECT task_id,priority,enqueued_unix_ms,enqueue_sequence FROM task_queue ORDER BY enqueue_sequence,task_id")?;
-    let mut queue=stmt.query_map([],|r|Ok(QueueRecord{task:TaskId::new(r.get::<_,String>(0)?).map_err(|_|rusqlite::Error::InvalidQuery)?,priority:r.get(1)?,enqueued_unix_ms:r.get(2)?,enqueue_sequence:r.get(3)?,dependencies:Vec::new()}))?.collect::<std::result::Result<Vec<_>,_>>()?;
+    let mut rows=stmt.query([])?;
+    let mut queue=Vec::new();
+    while let Some(r)=rows.next()? {
+        if let Some(budget)=budget {budget.row(r,&[])?;}
+        queue.push(QueueRecord{task:TaskId::new(r.get::<_,String>(0)?).map_err(StoreError::Corrupt)?,priority:r.get(1)?,enqueued_unix_ms:r.get(2)?,enqueue_sequence:r.get(3)?,dependencies:Vec::new()});
+    }
     let index:BTreeMap<_,_>=queue.iter().enumerate().map(|(i,q)|(q.task.as_str().to_string(),i)).collect();
     let mut stmt=db.prepare("SELECT task_id,predecessor_id,requirement FROM task_dependencies ORDER BY task_id,predecessor_id")?;
-    for row in stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))? {
-        let(task,predecessor,requirement)=row?;let requirement=match requirement.as_str(){"verified_result"=>DependencyRequirement::VerifiedResult,"integration_candidate"=>DependencyRequirement::IntegrationCandidate,"landed_commit"=>DependencyRequirement::LandedCommit,_=>return Err(StoreError::Corrupt("unknown dependency requirement".into()))};
+    let mut rows=stmt.query([])?;
+    while let Some(r)=rows.next()? {
+        if let Some(budget)=budget {budget.row(r,&[])?;}
+        let task:String=r.get(0)?;let predecessor:String=r.get(1)?;let requirement:String=r.get(2)?;
+        let requirement=match requirement.as_str(){"verified_result"=>DependencyRequirement::VerifiedResult,"integration_candidate"=>DependencyRequirement::IntegrationCandidate,"landed_commit"=>DependencyRequirement::LandedCommit,_=>return Err(StoreError::Corrupt("unknown dependency requirement".into()))};
         queue[*index.get(&task).ok_or_else(||StoreError::Corrupt("dependency has no queue record".into()))?].dependencies.push(Dependency{predecessor:TaskId::new(predecessor).map_err(StoreError::Corrupt)?,requirement});
     }
-    graph(&read_tasks(db)?,&queue)?;Ok(SchedulerSnapshot{policy,queue})
+    graph(tasks,&queue)?;Ok(SchedulerSnapshot{policy,queue})
 }
 impl SqliteStore {
     pub fn set_scheduler_policy(&mut self,head_expected:u64,revision:u64,max_active_workers:u32,max_attempts_per_task:u32)->Result<u64> {
@@ -129,5 +142,5 @@ fn unrelated_task_count_never_makes_a_committed_store_unreadable() {
         let count=if chunk==10 {1}else{1000};let head=db.read_snapshot(None).unwrap().head;let mutations=(0..count).map(|i|{let id=TaskId::new(format!("task-{}",chunk*1000+i)).unwrap();Mutation::Task{expected:None,next:Task{id,revision:1,state:TaskState::Draft,title:"unqueued".into(),active_attempt:None}}}).collect();db.commit(Commit{expected_head:head,mutations}).unwrap();
     }
     let before=db.read_snapshot(None).unwrap();assert_eq!(before.tasks.len(),10_001);assert!(db.queue_report(0).unwrap().entries.is_empty());drop(db);
-    let raw=Connection::open(&path).unwrap();raw.execute_batch("DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; UPDATE store_meta SET schema_version=9; PRAGMA user_version=9;").unwrap();drop(raw);let mut db=SqliteStore::open(&path).unwrap();db.upgrade_v1().unwrap();assert_eq!(db.read_snapshot(None).unwrap().tasks,before.tasks);let head=db.read_snapshot(None).unwrap().head;db.queue_task(&TaskId::new("task-0").unwrap(),1,head,&QueueRequest{priority:0,dependencies:vec![]},0).unwrap();assert_eq!(db.queue_report(0).unwrap().entries.len(),1);
+    let raw=Connection::open(&path).unwrap();raw.execute_batch("DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; UPDATE store_meta SET schema_version=9; PRAGMA user_version=9;").unwrap();drop(raw);let mut db=SqliteStore::open(&path).unwrap();db.upgrade_v1().unwrap();assert_eq!(db.read_snapshot(None).unwrap().tasks,before.tasks);let head=db.read_snapshot(None).unwrap().head;db.queue_task(&TaskId::new("task-0").unwrap(),1,head,&QueueRequest{priority:0,dependencies:vec![]},0).unwrap();assert_eq!(db.queue_report(0).unwrap().entries.len(),1);
 }

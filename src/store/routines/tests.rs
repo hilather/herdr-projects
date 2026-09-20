@@ -72,8 +72,8 @@ fn schema15_upgrade_preserves_existing_outbox_without_inventing_routine_authorit
     let operation=Operation{id:OperationId::new("old-operation").unwrap(),task:Some(task.id.clone()),kind:"fixture".into(),target:"fixture".into(),payload_version:1,payload:serde_json::json!({}),expected_revision:1,due_unix_ms:0,idempotency_key:"old-operation".into()};
     db.commit(Commit{expected_head:0,mutations:vec![Mutation::Task{expected:None,next:task},Mutation::Enqueue(operation.clone())]}).unwrap();
     db.claim_operation(&operation.id,1,"old-worker",1000,1000).unwrap();
-    db.connection.execute_batch("DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; UPDATE store_meta SET schema_version=15; PRAGMA user_version=15;").unwrap();
-    let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=16;
+    db.connection.execute_batch("DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; UPDATE store_meta SET schema_version=15; PRAGMA user_version=15;").unwrap();
+    let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=21;
     assert_eq!(db.read_snapshot(None).unwrap(),before);assert!(before.routine_revisions.is_empty());assert!(before.routine_occurrences.is_empty());
     db.integrity_check().unwrap();
 }

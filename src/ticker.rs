@@ -3,13 +3,14 @@
 //! Everything it does is "check on an interval, compare with last time, act".
 //! It exits on request through a stop file, never through signals.
 
-use std::fs::File;
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::coordinator::{self, MAX_LAUNCH_ATTEMPTS};
@@ -34,6 +35,109 @@ fn stop_path(root: &Path) -> PathBuf {
 
 fn log_path(root: &Path) -> PathBuf {
     root.join(".ticker.log")
+}
+
+fn metrics_path(root: &Path) -> PathBuf {
+    root.join(".ticker-metrics.json")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LaneMetrics {
+    pub queued: usize,
+    pub running: usize,
+    pub high_water: usize,
+    pub completed: u64,
+}
+
+/// Redacted root-wide executor counters. No argv, secrets, payloads or project names.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecutorMetrics {
+    pub control: LaneMetrics,
+    pub transfer: LaneMetrics,
+    pub max_queue_delay_ms: u64,
+    pub uncertain: bool,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum MetricsFile {
+    Absent,
+    Invalid,
+    Present(ExecutorMetrics),
+}
+
+fn lane_metrics(metrics: &crate::executor::Metrics, lane: usize) -> LaneMetrics {
+    LaneMetrics {
+        queued: metrics.queued[lane],
+        running: metrics.running[lane],
+        high_water: metrics.high_water[lane],
+        completed: metrics.completed[lane],
+    }
+}
+
+fn snapshot_metrics(metrics: &crate::executor::Metrics) -> ExecutorMetrics {
+    ExecutorMetrics {
+        control: lane_metrics(metrics, 0),
+        transfer: lane_metrics(metrics, 1),
+        max_queue_delay_ms: u64::try_from(metrics.max_queue_delay.as_millis()).unwrap_or(u64::MAX),
+        uncertain: metrics.uncertain,
+    }
+}
+
+fn publish_executor_metrics(root: &Path, log: &Log, memory: &Memory) {
+    let Some(reads) = memory.pr_reads.as_ref() else { return };
+    if let Err(error) = write_metrics_file(root, &snapshot_metrics(&reads.metrics())) {
+        log.line(&format!("executor metrics: {error:#}"));
+    }
+}
+
+fn write_metrics_file(root: &Path, metrics: &ExecutorMetrics) -> Result<()> {
+    let path = metrics_path(root);
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_file() && meta.nlink() == 1 => {}
+        Ok(_) => bail!("executor metrics path is not a single-link regular file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let tmp = root.join(format!(".ticker-metrics.json.{}.tmp", std::process::id()));
+    if let Ok(meta) = fs::symlink_metadata(&tmp) {
+        ensure!(meta.file_type().is_file(), "executor metrics temporary path is not a regular file");
+        fs::remove_file(&tmp)?;
+    }
+    let bytes = serde_json::to_vec_pretty(metrics)?;
+    let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
+    let result = (|| -> Result<()> {
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&tmp, &path)?;
+        File::open(root)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Reads `$root/.ticker-metrics.json` without following a symlink. Absence is
+/// not an error: doctor warns, it does not fail the ticker-stopped case.
+pub fn metrics_state(root: &Path) -> MetricsFile {
+    let path = metrics_path(root);
+    let Ok(meta) = fs::symlink_metadata(&path) else { return MetricsFile::Absent };
+    if !meta.file_type().is_file() || meta.nlink() != 1 || meta.len() > 65_536 {
+        return MetricsFile::Invalid;
+    }
+    let mut file = match OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&path) {
+        Ok(file) => file,
+        Err(_) => return MetricsFile::Invalid,
+    };
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() || bytes.len() > 65_536 {
+        return MetricsFile::Invalid;
+    }
+    match serde_json::from_slice::<ExecutorMetrics>(&bytes) {
+        Ok(metrics) => MetricsFile::Present(metrics),
+        Err(_) => MetricsFile::Invalid,
+    }
 }
 
 /// What the lock holder writes into the lock file, for `ticker status` and
@@ -286,14 +390,14 @@ pub fn run(ctx: &Ctx) -> Result<()> {
     loop {
         if stop_path(root).exists() {
             log.line("stop file found; cancelling and draining shared executor");
-            return memory.pr_reads.as_mut().expect("ticker shared executor").stop();
+            return drain_executor(root, &log, &mut memory);
         }
         let wake = Instant::now() + TICK;
         if tick(ctx, &log, &mut memory) {
             last_reachable = Instant::now();
         } else if last_reachable.elapsed() > IDLE_EXIT && !memory.observations_unknown() {
             log.line("no reachable session or enabled canonical routine for five minutes; draining shared executor");
-            return memory.pr_reads.as_mut().expect("ticker shared executor").stop();
+            return drain_executor(root, &log, &mut memory);
         }
         // Sleep in short slices so a stop request is honoured promptly.
         while Instant::now() < wake {
@@ -406,6 +510,7 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         if let Some(reads)=memory.canonical_observations.as_mut(){for error in reads.admit_where(|project|!memory.copy_jobs.as_ref().is_some_and(|q|q.pending_project(project))&&!memory.routine_jobs.as_ref().is_some_and(|q|q.pending_project(project))){log.line(&error);}}
         any_reachable|=memory.routine_jobs.as_ref().is_some_and(|q|q.pending());
         any_reachable|=memory.copy_jobs.as_ref().is_some_and(|q|q.pending()||q.offered());
+        publish_executor_metrics(&ctx.root,log,memory);
         return any_reachable;
     }
     #[cfg(not(feature="state-store"))]
@@ -413,9 +518,16 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         admit_background(ctx,log,memory,Vec::new());
         if let Some(reads)=memory.local_reports.as_mut(){for error in reads.admit(){log.line(&error);}}
         if let Some(reads)=memory.local_observations.as_mut(){for error in reads.admit(){log.line(&error);}}
-        any_reachable||memory.copy_jobs.as_ref().is_some_and(|q|q.pending()||q.offered())
+        let reachable=any_reachable||memory.copy_jobs.as_ref().is_some_and(|q|q.pending()||q.offered());
+        publish_executor_metrics(&ctx.root,log,memory);
+        reachable
     }
 
+}
+fn drain_executor(root:&Path,log:&Log,memory:&mut Memory)->Result<()> {
+    let result=memory.pr_reads.as_mut().expect("ticker shared executor").stop();
+    publish_executor_metrics(root,log,memory);
+    result
 }
 /// Drain happens only at tick entry. Even a completed ticket holds its turn until
 /// then, preserving a full project effect pass before another background job.
@@ -1003,6 +1115,31 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(lock_state(root.path()), LockState::Free);
+    }
+
+    #[test]
+    fn executor_metrics_file_is_redacted_regular_and_refuses_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let metrics = ExecutorMetrics {
+            control: LaneMetrics { queued: 1, running: 2, high_water: 3, completed: 4 },
+            transfer: LaneMetrics { queued: 0, running: 0, high_water: 1, completed: 9 },
+            max_queue_delay_ms: 15,
+            uncertain: false,
+        };
+        write_metrics_file(root.path(), &metrics).unwrap();
+        let path = metrics_path(root.path());
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.file_type().is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metrics_state(root.path()), MetricsFile::Present(metrics.clone()));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("project"));
+        assert!(!text.contains("argv"));
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("/tmp/hp-metrics-target", &path).unwrap();
+        assert!(write_metrics_file(root.path(), &metrics).is_err());
+        assert_eq!(metrics_state(root.path()), MetricsFile::Invalid);
     }
 
     #[test]

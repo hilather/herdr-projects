@@ -4,7 +4,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{fmt, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 
-const SCHEMA: u32 = 16;
+const SCHEMA: u32 = 21;
 const APPLICATION: u32 = 1_213_222_994;
 const MIN_SQLITE: i32 = 3_053_004;
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
@@ -71,6 +71,11 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../migrations/0014_admission_budgets.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0015_project_operations.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0016_durable_routines.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0017_command_authority.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0018_memory_revisions.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0019_memory_snapshots.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0020_coordinator_checkpoints.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0021_memory_proposals.sql"))?;
             tx.commit()?;
         }
         // Persist the initial directory entry as well as SQLite's own commit.
@@ -118,15 +123,16 @@ impl SqliteStore {
         let observations=if schema>=6 {observations::read_all_with_budget(&tx,budget)?}else{Vec::new()};
         let ownership=if schema>=9 {ownership::read_all_with_budget(&tx,budget)?}else{Vec::new()};
         let control=if schema>=7 {Some(control::read_with_budget(&tx,budget)?)}else{None};
-        let scheduler=if schema>=10 {Some(scheduler::read(&tx)?)}else{None};
-        let attempt_inputs=if schema>=11 {reservations::read_inputs(&tx)?}else{Vec::new()};
-        let cancellations=if schema>=11 {reservations::read_cancellations(&tx)?}else{Vec::new()};
-        let approvals=if schema>=13 {approvals::read_all(&tx)?}else{Vec::new()};
-        let budget_policies=if schema>=14 {budget::read_all(&tx)?}else{Vec::new()};
-        let (routine_revisions,routine_occurrences)=if schema>=16 {routines::read_all(&tx)?}else{(Vec::new(),Vec::new())};
-        let routine_receipts=if schema>=16 {routines::read_receipts(&tx,&routine_revisions,&routine_occurrences)?}else{Vec::new()};
+        let scheduler=if schema>=10 {Some(scheduler::read_with_tasks(&tx,&tasks,budget)?)}else{None};
+        let attempt_inputs=if schema>=11 {reservations::read_inputs_with_budget(&tx,budget)?}else{Vec::new()};
+        let cancellations=if schema>=11 {reservations::read_cancellations_with_budget(&tx,budget)?}else{Vec::new()};
+        let approvals=if schema>=13 {approvals::read_all_with(&tx,&attempt_inputs,budget)?}else{Vec::new()};
+        let budget_policies=if schema>=14 {budget::read_all_with_budget(&tx,budget)?}else{Vec::new()};
+        let memory_policies=if schema>=17 {memory_policy::read_all_with_budget(&tx,budget)?}else{Vec::new()};
+        let (routine_revisions,routine_occurrences)=if schema>=16 {routines::read_all_with_budget(&tx,budget)?}else{(Vec::new(),Vec::new())};
+        let routine_receipts=if schema>=16 {routines::read_receipts_with_budget(&tx,&routine_revisions,&routine_occurrences,budget)?}else{Vec::new()};
         tx.commit()?;
-        Ok(Snapshot { schema_version:schema, head, tasks, attempts, operations, deliveries, inbox, runtime_bindings, observations, ownership, control, scheduler, attempt_inputs, cancellations, approvals, budget_policies, routine_revisions, routine_occurrences, routine_receipts, events })
+        Ok(Snapshot { schema_version:schema, head, tasks, attempts, operations, deliveries, inbox, runtime_bindings, observations, ownership, control, scheduler, attempt_inputs, cancellations, approvals, budget_policies, memory_policies, routine_revisions, routine_occurrences, routine_receipts, events })
     }
     /// All mutations, generated audit events and durable intents commit together.
     /// Revisions start at one and advance by exactly one. A stale head or record
@@ -277,7 +283,10 @@ fn read_attempts_with_budget(db: &Connection, budget: Option<&read_budget::ReadB
     Ok(result)
 }
 fn read_operations(db: &Connection) -> Result<Vec<Operation>> {read_operations_matching(db,None)}
-fn read_operation(db:&Connection,id:&OperationId)->Result<Operation> {read_operations_matching(db,Some(id))?.into_iter().next().ok_or(StoreError::Conflict)}
+fn read_operation(db:&Connection,id:&OperationId)->Result<Operation> {read_operation_with_budget(db,id,None)}
+fn read_operation_with_budget(db:&Connection,id:&OperationId,budget:Option<&read_budget::ReadBudget>)->Result<Operation> {
+    read_operations_matching_with_budget(db,Some(id),budget)?.into_iter().next().ok_or(StoreError::Conflict)
+}
 fn read_operations_matching(db:&Connection,id:Option<&OperationId>)->Result<Vec<Operation>> {read_operations_matching_with_budget(db,id,None)}
 fn read_operations_matching_with_budget(db:&Connection,id:Option<&OperationId>,budget:Option<&read_budget::ReadBudget>)->Result<Vec<Operation>> {
     let query=if id.is_some(){"SELECT id,task_id,kind,target,payload_version,payload,expected_revision,due_unix_ms,idempotency_key,payload_hash FROM operations WHERE id=?1"}else{"SELECT id,task_id,kind,target,payload_version,payload,expected_revision,due_unix_ms,idempotency_key,payload_hash FROM operations WHERE ?1 IS NULL ORDER BY id"};
@@ -332,6 +341,11 @@ mod scheduler;
 mod reservations;
 mod approvals;
 mod budget;
+mod memory_policy;
+mod objects;
+mod memory;
+mod checkpoints;
+mod proposals;
 mod routines;
 
 pub mod identity_inventory;

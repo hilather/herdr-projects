@@ -21,23 +21,23 @@ struct Profile {
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Budget {
-    max_wall_seconds: Option<u64>,
-    soft_input_tokens: Option<u64>,
-    soft_output_tokens: Option<u64>,
-    unknown_usage: UnknownUsage,
+pub(super) struct Budget {
+    pub max_wall_seconds: Option<u64>,
+    pub soft_input_tokens: Option<u64>,
+    pub soft_output_tokens: Option<u64>,
+    pub unknown_usage: UnknownUsage,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum UnknownUsage { AllowWithWarning, Block }
+pub enum UnknownUsage { AllowWithWarning, Block }
 
 /// Absence of adapter evidence is distinct from tested lack of support.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Capability { Unknown }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct Capabilities {
     launch: Capability,
     readiness_observation: Capability,
@@ -48,13 +48,13 @@ struct Capabilities {
     resume: Capability,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct Inspection {
     schema_version: u32,
-    name: String,
+    pub(super) name: String,
     pub(super) kind: String,
     pub(super) config_digest: String,
-    profile_digest: String,
+    pub(super) profile_digest: String,
     extra_argument_count: usize,
     environment_reference_count: usize,
     model_requested: bool,
@@ -63,10 +63,36 @@ pub struct Inspection {
     capabilities: Capabilities,
     pub(super) agent_version: Option<String>,
     pub(super) herdr_version: Option<String>,
-    launchable: bool,
-    protocol_capable: bool,
-    certified: bool,
+    pub(super) launchable: bool,
+    pub(super) protocol_capable: bool,
+    pub(super) certified: bool,
     blockers: Vec<&'static str>,
+}
+
+#[cfg(test)]
+impl Inspection {
+    pub fn mock_workflow(name: &'static str, launchable: bool, protocol_capable: bool, certified: bool) -> Self {
+        Self {
+            schema_version: 1,
+            name: name.into(),
+            kind: "claude".into(),
+            config_digest: "a".repeat(64),
+            profile_digest: "b".repeat(64),
+            extra_argument_count: 0,
+            environment_reference_count: 0,
+            model_requested: false,
+            reasoning_effort_requested: false,
+            budget_requested: false,
+            capabilities: Capabilities {
+                launch: Capability::Unknown, readiness_observation: Capability::Unknown,
+                prompt_submission: Capability::Unknown, stop: Capability::Unknown,
+                checkpoint_acknowledgment: Capability::Unknown, structured_usage: Capability::Unknown,
+                resume: Capability::Unknown,
+            },
+            agent_version: None, herdr_version: None,
+            launchable, protocol_capable, certified, blockers: vec![],
+        }
+    }
 }
 
 fn identifier(value: &str) -> bool {
@@ -100,13 +126,44 @@ fn validate(profile: &Profile) -> Result<()> {
 }
 
 pub fn inspect(path: &Path, name: &str) -> Result<Inspection> {
+    Ok(load(path, name)?.0)
+}
+
+pub(super) fn load(path: &Path, name: &str) -> Result<(Inspection, Option<Budget>)> {
     ensure!(identifier(name), "invalid profile name");
     let text = crate::paths::read_root_config(path)?;
     let text = text.as_deref().ok_or_else(|| anyhow::anyhow!("no profile configuration exists"))?;
-    inspect_text(text, name)
+    load_text(text, name)
 }
 
-fn inspect_text(text: &str, name: &str) -> Result<Inspection> {
+/// Unique named profile whose `kind` field equals `kind`. Never looks up `profiles.<kind>`.
+pub fn unique_name_for_kind(path: &Path, kind: &str) -> Result<String> {
+    ensure!(identifier(kind), "invalid agent kind identifier");
+    let text = crate::paths::read_root_config(path)?;
+    let text = text.as_deref().ok_or_else(|| anyhow::anyhow!("no profile configuration exists"))?;
+    ensure!(text.len() <= 1_048_576, "profile configuration exceeds one MiB");
+    let config: toml::Value = toml::from_str(text).map_err(|_| anyhow::anyhow!("invalid profile configuration TOML (source redacted)"))?;
+    let profiles = config.get("profiles").and_then(toml::Value::as_table)
+        .ok_or_else(|| anyhow::anyhow!("configuration has no profiles table"))?;
+    ensure!(profiles.len() <= 128, "too many profiles");
+    let mut matches = Vec::new();
+    for (name, value) in profiles {
+        let profile: Profile = value.clone().try_into()
+            .map_err(|_| anyhow::anyhow!("invalid profile fields (source redacted); check the documented schema"))?;
+        validate(&profile)?;
+        if profile.kind == kind { matches.push(name.clone()); }
+    }
+    match matches.as_slice() {
+        [name] => Ok(name.clone()),
+        [] => bail!("no named profile has kind `{kind}`"),
+        names => bail!("multiple named profiles have kind `{kind}`: {}", names.join(", ")),
+    }
+}
+
+#[cfg(test)]
+fn inspect_text(text: &str, name: &str) -> Result<Inspection> { Ok(load_text(text, name)?.0) }
+
+fn load_text(text: &str, name: &str) -> Result<(Inspection, Option<Budget>)> {
     ensure!(text.len() <= 1_048_576, "profile configuration exceeds one MiB");
     // TOML errors may include credential-bearing source lines. Never propagate them.
     let config: toml::Value = toml::from_str(text).map_err(|_| anyhow::anyhow!("invalid profile configuration TOML (source redacted)"))?;
@@ -122,7 +179,7 @@ fn inspect_text(text: &str, name: &str) -> Result<Inspection> {
     if profile.reasoning_effort.is_some() { blockers.push("reasoning effort requires a verified adapter mapping"); }
     if !profile.environment.is_empty() { blockers.push("environment references require an approved execution environment"); }
     if profile.budget.is_some() { blockers.push("budget request requires admission and usage policy resolution"); }
-    Ok(Inspection {
+    let inspection = Inspection {
         schema_version: 1,
         name: name.to_owned(),
         kind: profile.kind.clone(),
@@ -141,7 +198,8 @@ fn inspect_text(text: &str, name: &str) -> Result<Inspection> {
         },
         agent_version: None, herdr_version: None,
         launchable: false, protocol_capable: false, certified: false, blockers,
-    })
+    };
+    Ok((inspection, profile.budget))
 }
 
 #[cfg(test)]

@@ -651,7 +651,7 @@ mod tests {
 /// Always compiled, including legacy-only binaries. Never treat an unreadable,
 /// newer, or interrupted ownership marker as permission to use legacy records.
 pub fn ensure_legacy(dir: &Path) -> Result<()> {
-    for relative in [".state/format.json", ".state/migration/journal.json"] {
+    for relative in [".state/format.json", ".state/migration/journal.json", ".state/migration/memory-journal.json"] {
         match std::fs::symlink_metadata(dir.join(relative)) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
             Err(e) => return Err(e).with_context(|| format!("cannot inspect ownership marker {relative}")),

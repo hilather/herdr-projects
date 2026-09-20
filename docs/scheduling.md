@@ -106,7 +106,7 @@ routine revisions and atomic outbox inserts. The schedule helper itself remains
 pure and cannot authorize or execute a command. Ticker execution and typed cleanup
 receipts remain the next integration step.
 
-## Elapsed-time polling (partial T04.2)
+## Elapsed-time polling
 
 Remote polling uses a monotonic 60-second deadline scoped to project, socket and
 machine. Failed commands start a 120-second retry deadline when they finish.
@@ -115,10 +115,11 @@ to become due. An overdue resource receives one poll, without a catch-up burst.
 The ticker's 15-second interval starts before each pass, so command duration does
 not add another full interval. Wall-clock changes do not affect these deadlines.
 
-Slow commands are still synchronous. Bounded queues, separate control/transfer
-lanes, cancellation/drain and their load/fault metrics remain T04.2 work.
+Linux slow work (PR/remote observations, routines, artifact copies, briefs,
+coordinator/token/notification jobs) shares that pool. macOS executor coverage
+and live multi-project SSH remain W08.
 
-## Bounded command executor (T04.2 integration in progress)
+## Bounded command executor (T04.2 local Linux close)
 
 The native executor has fixed control/transfer worker counts and bounded outstanding
 queues. Defaults are two workers per lane, 64 control/32 transfer outstanding
@@ -133,8 +134,12 @@ Requests carry operation identity and expected revision. Replies retain those
 values for a fenced commit; they do not themselves acknowledge durable operations.
 Queue time consumes the deadline. Expired/cancelled queued requests never spawn;
 running requests use the existing owned-process cancellation/cleanup path. Inputs
-and captured output have admission caps. Metrics expose queue/running counts,
-admission high-water marks, completed counts and maximum observed queue delay.
+and captured output have admission caps. In-process metrics expose queue/running
+counts, admission high-water marks, completed counts and maximum observed queue
+delay. The ticker atomically replaces `$root/.ticker-metrics.json` (mode 0600,
+nofollow, no project names or payloads) on each pass and after drain.
+`herdr-projects doctor` prints those counters next to ticker lock state. A missing
+file is a warning, not a doctor failure.
 
 Stop rejects new work and cancels admitted work. A cleanup deadline miss returns
 false while retaining thread ownership. Drop joins workers instead of detaching
@@ -171,8 +176,8 @@ retaining ticker ownership. Failure to drain reports unresolved cleanup.
 
 Full-ticker fixtures show that a delayed PR read leaves unrelated session checks
 running, preserves outage state, applies a later response, discards a changed report
-and drains cancellation. Remaining slow paths are still synchronous. This is not
-yet acceptance of the complete T04.2 isolation requirement.
+and drains cancellation within two seconds. Persisted lane metrics are visible to
+doctor. Live multi-project SSH and macOS remain W08 remaining-acceptance.
 
 ## Asynchronous remote observations
 
@@ -199,9 +204,10 @@ Fallback SSH config is read only when machine listing did not resolve the target
 
 Fixtures cover a held remote probe alongside a persisted local status update,
 complete-batch application, changed thread/config cancellation, unavailable transport
-without false pane closure, and FIFO/oversize refusal. T04.2 remains partial until
-transfers and remaining guarded effects have equivalent isolation. Signed routines
-now use the same pool with guarded admission and supervision described in [routines](routines.md).
+without false pane closure, and FIFO/oversize refusal. Linux transfers and remaining
+guarded effects already share the same pool; T04.2 closes on that local evidence plus
+persisted load/fault metrics. macOS and live SSH stay W08. Signed routines
+use the same pool with guarded admission and supervision described in [routines](routines.md).
 
 ## Transfer supervision prerequisite
 
