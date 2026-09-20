@@ -1,6 +1,6 @@
 //! Cooperative ownership shared by the CLI and canonical library services.
 //! Order: root barrier, project effect ownership, then any short record lock.
-use std::{fs::{File,OpenOptions},os::unix::fs::OpenOptionsExt,path::Path};
+use std::{fs::{File,OpenOptions},os::unix::fs::{OpenOptionsExt,MetadataExt},path::Path};
 use anyhow::{Result,Context,ensure};
 
 fn lock_file(path:&Path)->Result<File> {
@@ -31,8 +31,12 @@ impl RootGuard {
 
 /// Excludes effects within one project while preserving the root-wide barrier.
 /// Never acquire an exclusive root guard while retaining this shared guard.
-pub struct ProjectGuard {_project:File,_root:RootGuard,root:std::path::PathBuf}
+pub struct ProjectGuard {_project:File,_root:RootGuard,root:std::path::PathBuf,project:std::path::PathBuf,identity:(u64,u64)}
 impl ProjectGuard {
+    pub fn check_project(&self,project:&Path)->Result<()> {
+        let metadata=std::fs::metadata(project)?;
+        ensure!(project.canonicalize()?==self.project&&(metadata.dev(),metadata.ino())==self.identity,"execution guard belongs to a different project");Ok(())
+    }
     /// A trusted transfer supervisor keeps these descriptions open until its
     /// descendants finish, even if the caller dies. Retain the returned handles
     /// in the caller through publication. The historical lock name also fences
@@ -47,7 +51,8 @@ impl ProjectGuard {
         let root=RootGuard::shared(&root_path)?;
         ensure!(std::fs::symlink_metadata(project.join(".state"))?.is_dir(),"project state must be a real directory");
         let file=exclusive_file(&project.join(".state/effect.lock"))?;
-        Ok(Self{_project:file,_root:root,root:root_path})
+        let metadata=std::fs::metadata(&project)?;
+        Ok(Self{_project:file,_root:root,root:root_path,project,identity:(metadata.dev(),metadata.ino())})
     }
 }
 

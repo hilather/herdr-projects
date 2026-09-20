@@ -23,6 +23,7 @@ pub mod supervision;
 pub mod status_notice;
 pub mod copy_receipt;
 pub mod review_notice;
+pub mod live_copy_intent;
 #[cfg(feature = "state-store")]
 pub mod authority;
 #[cfg(feature = "state-store")]

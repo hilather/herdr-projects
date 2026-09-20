@@ -71,6 +71,9 @@ pub fn set_status(ctx: &Ctx, slug: &str, status: Status) -> Result<()> {
 pub fn delete(ctx: &Ctx, slug: &str, force: bool) -> Result<()> {
     let _lease = crate::cleanup::lease(&ctx.root)?;
     let project = Project::load(&ctx.root, slug)?;
+    let (threads,diagnostics)=thread::list_with_diagnostics(&project);
+    anyhow::ensure!(diagnostics.is_empty(),"cannot inspect pending projections: {}",diagnostics.join("; "));
+    anyhow::ensure!(threads.iter().all(|t|t.pending_live_copy.is_none()),"recover pending live projections before deleting the project");
     if !force {
         if let Some(view) = threads::session_view(ctx, &project) {
             let alive = alive_panes(&project, &view);
@@ -80,7 +83,6 @@ pub fn delete(ctx: &Ctx, slug: &str, force: bool) -> Result<()> {
             }
         }
     }
-    let threads = thread::list(&project);
     let canonical = project.canonical_dir();
 
     let trash = ctx.root.join(".trash");

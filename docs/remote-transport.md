@@ -80,3 +80,22 @@ The upcoming transfer adapter must require successful supervised sender completi
 revalidate execution/config/routing before publication, and commit the copy receipt
 only after successful projection. Receiving a valid stream alone grants no such
 authority. Unsupported live helpers must refuse without an unbounded transfer fallback.
+
+The private publication API now retains the exact verified stage and a manifest
+before saving a per-thread projection intent. Stage and ancestor directories are
+flushed first. Publication writes included library files atomically, then the report,
+verifies the home bytes, and commits the copy receipt while clearing the intent.
+The whole library/report update is not atomic; the intent makes interruptions
+recoverable from the same staged bytes, even if the source disappears or changes.
+Missing/corrupt staging or changed execution/config/routing authority refuses recovery.
+
+Omitted and unrelated home files remain untouched. Destination traversal uses open
+directory descriptors; symlink/special destinations refuse. Temporary files have
+exclusive creation and names distinct from the destination. Retained staging is
+retired only after the receipt commit is durable. A crash before retirement can leave
+identifiable orphan staging. Admission caps temporary/retained stage entries at 16
+per project; existing-intent recovery remains possible at that limit.
+
+Pending projections block conflicting copies, review preparation, execution/lifecycle
+replacement, deletion and migration. This is still an internal publication/recovery
+API: the ticker's supervised sender and executor admission are not wired yet.

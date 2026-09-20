@@ -43,6 +43,43 @@ impl Budget {
 
 pub struct Directory(File);
 impl Directory {
+    pub fn directory(&self,path:&Path)->Result<Self> {
+        let mut current=Self(self.0.try_clone()?);
+        for part in path.components() {match part {Component::Normal(name)=>current=Self::from_file(current.child(name)?)?,Component::CurDir=>{},_=>anyhow::bail!("invalid relative directory path")}}
+        Ok(current)
+    }
+    pub fn create_dir(&self,name:&OsStr)->Result<Self> {
+        self.kind(name)?; // validates a single component
+        let name_c=CString::new(name.as_bytes())?;
+        if unsafe{libc::mkdirat(self.0.as_raw_fd(),name_c.as_ptr(),0o700)}<0 {
+            let error=io::Error::last_os_error();if error.kind()!=io::ErrorKind::AlreadyExists {return Err(error.into());}
+        }
+        let directory=Self::from_file(self.child(name)?)?;self.0.sync_all()?;Ok(directory)
+    }
+    pub fn write_atomic(&self,name:&OsStr,write:impl FnOnce(&mut File)->Result<()>)->Result<()> {
+        static NEXT:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);
+        self.write_atomic_using(name,||format!(".live-{}-{}.tmp",std::process::id(),NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed)),write)
+    }
+    fn write_atomic_using(&self,name:&OsStr,mut next:impl FnMut()->String,write:impl FnOnce(&mut File)->Result<()>)->Result<()> {
+        ensure!(matches!(self.kind(name)?,None|Some(NodeKind::File)),"live destination is not a regular single-link file");
+        let name=CString::new(name.as_bytes())?;
+        let mut selected=None;
+        for _ in 0..128 {
+            let temporary=CString::new(next())?;if temporary==name {continue;}
+            let fd=unsafe{libc::openat(self.0.as_raw_fd(),temporary.as_ptr(),libc::O_WRONLY|libc::O_CREAT|libc::O_EXCL|libc::O_CLOEXEC|libc::O_NOFOLLOW,0o600)};
+            if fd>=0 {selected=Some((temporary,fd));break;}
+            let error=io::Error::last_os_error();if error.kind()!=io::ErrorKind::AlreadyExists {return Err(error.into());}
+        }
+        let (temporary,fd)=selected.ok_or_else(||anyhow::anyhow!("no free live-copy temporary name"))?;
+        let mut file=unsafe{File::from_raw_fd(fd)};
+        let result=(|| {
+            write(&mut file)?;file.sync_all()?;
+            if unsafe{libc::renameat(self.0.as_raw_fd(),temporary.as_ptr(),self.0.as_raw_fd(),name.as_ptr())}<0 {return Err(io::Error::last_os_error().into());}
+            self.0.sync_all()?;Ok(())
+        })();
+        if result.is_err(){unsafe{libc::unlinkat(self.0.as_raw_fd(),temporary.as_ptr(),0);}}
+        result
+    }
     pub fn open(path:&Path)->Result<Self> {
         let path=std::path::absolute(path)?;
         ensure!(path.as_os_str().len()<=4096&&path.components().count()<=256,"artifact source path exceeds bounds");
@@ -154,6 +191,19 @@ pub fn unchanged(file:&File,before:&Metadata)->Result<()> {
 mod tests {
     use super::*;
     use std::{fs,io::Write,os::unix::fs::symlink};
+
+    #[test]
+    fn atomic_destination_is_never_its_own_temporary_and_collisions_are_preserved() {
+        let root=tempfile::tempdir().unwrap();let dir=Directory::open(root.path()).unwrap();
+        fs::write(root.path().join("occupied"),b"keep").unwrap();
+        let mut names=["destination","occupied","temporary"].into_iter();
+        dir.write_atomic_using(OsStr::new("destination"),||names.next().unwrap().into(),|file| {
+            assert!(!root.path().join("destination").exists());file.write_all(b"complete")?;
+            assert!(!root.path().join("destination").exists());Ok(())
+        }).unwrap();
+        assert_eq!(fs::read(root.path().join("destination")).unwrap(),b"complete");
+        assert_eq!(fs::read(root.path().join("occupied")).unwrap(),b"keep");assert!(!root.path().join("temporary").exists());
+    }
 
     #[test]
     fn enumeration_restarts_and_open_handles_survive_ancestor_replacement() {

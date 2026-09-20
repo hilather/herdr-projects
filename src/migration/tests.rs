@@ -664,3 +664,13 @@ fn pending_review_notice_imports_without_ticker_and_rejects_identity_corruption(
     apply(&project,&plan,true).unwrap();let mut db=open_active(&project).unwrap();
     assert_eq!(db.read_snapshot(None).unwrap().operations,plan.operations);
 }
+
+#[test]
+fn pending_live_projection_refuses_migration_until_exact_stage_recovery() {
+    let (_temp,project)=fixture();let path=project.join("threads/t-0001.toml");
+    let mut value:toml::Value=toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    value.as_table_mut().unwrap().insert("pending_live_copy".into(),toml::Value::Table(Default::default()));
+    fs::write(&path,toml::to_string(&value).unwrap()).unwrap();
+    assert!(validate_thread(&value).unwrap_err().to_string().contains("pending live projection"));
+    let plan=inspect(&project).unwrap();assert!(plan.blockers.iter().any(|b|b.starts_with("threads/t-0001.toml:")),"{:?}",plan.blockers);
+}

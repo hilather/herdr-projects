@@ -3,12 +3,14 @@ use super::*;
 use crate::source_tree::{Budget,Directory,Limit,NodeKind};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
+pub mod projection;
 
 const MAGIC:&[u8;8]=b"HPLV\x01\0\0\0";
 pub const STREAM_LIMIT:usize=2*BYTE_LIMIT as usize+MANIFEST_LIMIT+12;
 const OMISSION_LIMIT:usize=128;
 const OMISSION_BYTES:usize=16*1024;
 const OMISSION_PATH:usize=3000;
+const STAGE_LIMIT:usize=16;
 #[derive(Debug,Clone,Serialize,Deserialize,PartialEq)]
 #[serde(rename_all="kebab-case")]
 enum Reason { SymbolicLink, UnsupportedEntry, LibraryLimit }
@@ -127,11 +129,14 @@ pub struct LiveCopy { staging:Staging,source:Source }
 impl LiveCopy {
     pub fn report_hash(&self)->Option<&str> {self.source.report.as_ref().map(|e|e.sha256.as_str())}
     pub fn notes(&self)->Vec<String> {
-        self.source.omissions.iter().map(|n| {
+        render_notes(&self.source)
+    }
+}
+fn render_notes(source:&Source)->Vec<String> {
+        source.omissions.iter().map(|n| {
             let reason=match n.reason {Reason::SymbolicLink=>"symbolic link",Reason::UnsupportedEntry=>"unsupported entry",Reason::LibraryLimit=>"library limit or unsupported path"};
             format!("{} was omitted ({reason}); existing home content, if any, is retained",n.path)
         }).collect()
-    }
 }
 #[allow(dead_code)]
 /// The trusted adapter must establish successful supervised sender completion
@@ -146,9 +151,13 @@ pub fn receive(project:&Project,archive:&Path)->Result<LiveCopy> {
     let source:Source=serde_json::from_slice(&json)?;validate(&source)?;
     header_budget.check()?;
     let parent=project.state_dir().join("live-copies");
-    {let _lock=project.lock()?;real_dir(&project.state_dir())?;make_dir(&parent)?;}
     let path=parent.join(format!(".stage-{}-{}",std::process::id(),SEQUENCE.fetch_add(1,Ordering::Relaxed)));
-    fs::DirBuilder::new().mode(0o700).create(&path)?;let staging=Staging(path);
+    {let _lock=project.lock()?;real_dir(&project.state_dir())?;make_dir(&parent)?;
+        let inventory=fs::read_dir(&parent)?.take(STAGE_LIMIT).collect::<std::io::Result<Vec<_>>>()?;
+        ensure!(inventory.len()<STAGE_LIMIT,"live staging inventory is full; recover retained stages before receiving another copy");
+        fs::DirBuilder::new().mode(0o700).create(&path)?;
+    }
+    let staging=Staging(path);
     for entry in entries(&source) {
         let budget=if entry.path=="report.md" {&mut report_budget}else{&mut library_budget}.get_or_insert_with(Budget::new);budget.check()?;
         let path=staging.0.join(&entry.path);

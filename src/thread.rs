@@ -77,6 +77,8 @@ pub struct Thread {
     pub pending_review_notice: Option<herdr_projects::review_notice::ReviewNotice>,
     pub last_review_execution: String,
     pub last_review_copy_sequence: u64,
+    pub live_copy_sequence: u64,
+    pub pending_live_copy: Option<herdr_projects::live_copy_intent::LiveCopyIntent>,
     pub report_hash: String,
     pub last_report_change: String,
     pub last_review_item_hash: String,
@@ -185,7 +187,11 @@ pub fn update(project: &Project, id: &str, change: impl FnOnce(&mut Thread)) -> 
 pub fn update_checked(project: &Project, id: &str, change: impl FnOnce(&mut Thread) -> Result<()>) -> Result<Thread> {
     let _lock = project.lock()?;
     let mut thread = load(project, id)?;
+    let pending_execution=thread.pending_live_copy.as_ref().map(|_|(execution_fingerprint(&thread),thread.status));
     change(&mut thread)?;
+    if let Some((execution,status))=pending_execution {
+        anyhow::ensure!(execution_fingerprint(&thread)==execution&&thread.status==status,"recover the pending live projection before changing execution or lifecycle");
+    }
     thread.updated = project::now();
     write_record(project, &thread)?;
     Ok(thread)
@@ -576,6 +582,7 @@ pub struct Copied {
 /// Nothing that is a symbolic link is followed or copied. The caller must not
 /// hold the project lock: this runs `du` and `rsync`.
 pub fn copy_home_local(project: &Project, thread: &Thread, with_library: bool, runner: &dyn Runner) -> Copied {
+    if thread.pending_live_copy.is_some(){return Copied{artifact_snapshot:None,outcome:CopyOutcome::Failed("recover the pending live projection first".into()),report_hash:None};}
     let dir = Path::new(&thread.thread_dir);
     let mut notes = Vec::new();
     if thread.thread_dir.is_empty() {
@@ -640,6 +647,7 @@ pub fn copy_home_local(project: &Project, thread: &Thread, with_library: bool, r
 /// library with rsync over ssh, after checking on the machine (without
 /// following links) what is a real directory and a regular file.
 pub fn copy_home_remote(project: &Project, thread: &Thread, with_library: bool, runner: &dyn Runner, target: &str) -> Copied {
+    if thread.pending_live_copy.is_some(){return Copied{artifact_snapshot:None,outcome:CopyOutcome::Failed("recover the pending live projection first".into()),report_hash:None};}
     use crate::remote;
     let failed = |error: String| Copied { artifact_snapshot: None, outcome: CopyOutcome::Failed(error), report_hash: None };
     if thread.thread_dir.is_empty() {

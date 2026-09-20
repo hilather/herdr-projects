@@ -11,7 +11,7 @@ fn receipt(t: &Thread) -> Option<&herdr_projects::copy_receipt::CopyReceipt> {
     t.copy_receipt.as_ref().filter(|r|r.execution == execution_fingerprint(t) && r.report_hash == t.report_hash)
 }
 fn due(t: &Thread) -> bool {
-    if t.status != Status::Open || t.removal.is_some() || t.report_hash.is_empty()
+    if t.status != Status::Open || t.removal.is_some() || t.pending_live_copy.is_some() || t.report_hash.is_empty()
         || ![Group::ReadyForReview.token(),Group::Landing.token()].contains(&t.last_group.as_str()) { return false; }
     let execution=execution_fingerprint(t);
     if let Some(receipt)=receipt(t) {

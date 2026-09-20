@@ -3,6 +3,8 @@ use super::*;
 use herdr_projects::copy_receipt::{CopyNotice, CopyReceipt};
 
 pub fn validate(t: &Thread) -> Result<()> {
+    anyhow::ensure!(t.live_copy_sequence<=i64::MAX as u64,"invalid live-copy sequence");
+    if let Some(intent)=&t.pending_live_copy {intent.validate()?;anyhow::ensure!(intent.sequence==t.live_copy_sequence,"live-copy intent sequence mismatch");}
     if let Some(receipt) = &t.copy_receipt { receipt.validate()?; }
     if let Some(notice) = &t.pending_copy_notice {
         notice.validate(&t.id, t.copy_receipt.as_ref().context("copy notice has no receipt")?)?;
@@ -11,15 +13,25 @@ pub fn validate(t: &Thread) -> Result<()> {
 }
 
 pub fn ready(t: &Thread) -> Result<()> {
+    ready_for(t,None)
+}
+fn ready_for(t:&Thread,intent:Option<&herdr_projects::live_copy_intent::LiveCopyIntent>)->Result<()> {
     validate(t)?;
     super::review_delivery::validate(t)?;
     anyhow::ensure!(t.pending_copy_notice.is_none(), "prior copy warning still pending");
     anyhow::ensure!(t.pending_review_notice.is_none(), "prior review notice still pending");
+    anyhow::ensure!(t.pending_live_copy.as_ref()==intent,"recover the pending live projection first");
     Ok(())
 }
 
 pub fn record(project: &Project, expected: &Thread, copied: &Copied) -> Result<()> {
-    ready(expected)?;
+    record_inner(project,expected,copied,None)
+}
+pub(crate) fn record_projection(project:&Project,expected:&Thread,copied:&Copied,intent:&herdr_projects::live_copy_intent::LiveCopyIntent)->Result<()> {
+    record_inner(project,expected,copied,Some(intent))
+}
+fn record_inner(project:&Project,expected:&Thread,copied:&Copied,intent:Option<&herdr_projects::live_copy_intent::LiveCopyIntent>)->Result<()> {
+    ready_for(expected,intent)?;
     anyhow::ensure!(expected.status == Status::Open && expected.removal.is_none(), "thread is not eligible for a live copy receipt");
     let notes = match &copied.outcome {
         CopyOutcome::Complete => Vec::new(),
@@ -28,12 +40,17 @@ pub fn record(project: &Project, expected: &Thread, copied: &Copied) -> Result<(
     };
     let hash = copied.report_hash.as_ref().context("observed report was not copied; retaining its previous hash")?;
     let execution = execution_fingerprint(expected);
+    if let Some(intent)=intent {
+        anyhow::ensure!(intent.execution==execution&&intent.previous_hash==expected.report_hash
+            &&intent.previous_receipt==expected.copy_receipt&&&intent.report_hash==hash,"live projection receipt does not match its intent");
+    }
     update_checked(project, &expected.id, |current| {
-        ready(current)?;
+        ready_for(current,intent)?;
         anyhow::ensure!(current.status == Status::Open && current.removal.is_none()
             && execution_fingerprint(current) == execution && current.report_hash == expected.report_hash
             && current.copy_receipt == expected.copy_receipt, "thread changed during copy");
         if &current.report_hash == hash && current.copy_receipt.as_ref().is_some_and(|r| r.execution == execution && &r.report_hash == hash && r.notes == notes) {
+            current.pending_live_copy=None;
             return Ok(());
         }
         let sequence = current.copy_receipt.as_ref().map_or(0, |r| r.sequence).checked_add(1).context("copy sequence exhausted")?;
@@ -43,6 +60,7 @@ pub fn record(project: &Project, expected: &Thread, copied: &Copied) -> Result<(
         current.copy_receipt = Some(receipt);
         current.report_hash = hash.clone();
         current.last_report_change = project::now();
+        current.pending_live_copy=None;
         Ok(())
     })?;
     Ok(())

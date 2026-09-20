@@ -100,6 +100,7 @@ pub fn no_process_references(_: &Path) -> Result<()> { anyhow::bail!("writer qui
 
 /// Caller holds the lifecycle lease and has checked all project/pane ownership.
 pub fn remove(ctx: &Ctx, project: &Project, record: &Thread, writers_stopped: bool) -> Result<()> {
+    anyhow::ensure!(record.pending_live_copy.is_none(),"recover the pending live projection before cleanup");
     if let crate::ticker::LockState::Held(info) = crate::ticker::lock_state(&ctx.root) {
         ensure!(info.version == crate::VERSION, "running ticker uses a different checkpoint protocol build; stop or restart it before cleanup");
     }

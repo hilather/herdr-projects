@@ -1295,3 +1295,37 @@ review approved the correction. All 495 tests pass in debug and release (164 lib
 299 binary, 30 CLI, two contracts), and the default-feature suite passes. Three
 optional live checks remain ignored. Logs:
 `/tmp/herdr-live-stage-{debug,release,default}.log`.
+
+## W04 recoverable live-copy publication
+
+The guarded publication API now retains and fsyncs the exact verified stage and
+manifest before committing a typed per-thread intent. That intent binds execution,
+prior report hash/receipt, authority digest, sequence and staged report/manifest
+hashes. Recovery revalidates those fences and resumes the same stage; it never
+silently substitutes a newer source. Missing/corrupt retained bytes refuse.
+
+Destination traversal is descriptor-relative. Included files use exclusive temporary
+files, fsynced bytes, atomic rename and directory flush; unrelated/omitted files remain
+untouched. Library publication precedes report publication. Home bytes are verified
+before atomically committing the copy receipt and clearing intent. Stage retirement
+follows durable receipt commit. Whole-projection atomicity is not claimed: pending
+intent explicitly represents intermediate state. Staging admission is capped at 16
+entries per project without preventing recovery of an existing intent.
+
+Pending projection blocks unrelated copy completion, review preparation, execution
+or lifecycle replacement, finalization/removal, project deletion and migration.
+The publication API is still private groundwork for the supervised sender/executor;
+no production copy dispatcher uses it yet. Counts remain 16 implemented, five partial
+and 20 not started; macOS remains untested.
+
+Independent review found and verified fixes for a missing ancestor-directory fsync
+and a possible temporary-name/destination collision. Six projection fixtures cover
+additive publication, source-loss recovery, report-written-before-receipt interruption,
+missing/corrupt retained stages, wrong ownership, destination links and recovery at
+the staging admission cap. A deterministic
+atomic-write fixture verifies collision handling and hidden partial writes; a migration
+fixture verifies refusal, respecting redacted inspector diagnostics.
+
+All 503 tests pass in debug and release (165 library, 306 binary, 30 CLI, two
+contracts), and the default-feature suite passes. Three optional live checks remain
+ignored. Logs: `/tmp/herdr-live-projection-{debug,release,default}.log`.
