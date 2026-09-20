@@ -239,7 +239,7 @@ Refreshes share bounded queue admission and have a 30-second cooldown after each
 attempt. Under saturation, tokens may expire before their next refresh; the ticker
 does not guarantee refresh within five minutes for every pane. Interactive
 foreground commands retain their immediate metadata updates. These changes do
-not complete W04; canonical terminal-effect workers and other planned work remain.
+not complete W04; canonical finalization workers and other planned work remain.
 
 ## Local session observations
 
@@ -275,7 +275,7 @@ cache is bounded at 128; untracked eligible identities conservatively veto idle
 exit, so saturation may require an explicit ticker stop. Binding/configuration
 inventory reads remain synchronous and bounded by entry/byte limits with deadline
 checks; filesystem latency itself is not hard-bounded. Canonical observations use
-the separate path below; their terminal-effect adapters still need queue integration.
+the separate path below; canonical finalization still needs queue integration.
 
 
 ## Canonical session observations
@@ -302,10 +302,41 @@ checks use a read-only publication-checked query, with a 2 MiB publication budge
 They do not run database-wide integrity checks or materialize event payloads.
 Filesystem latency itself is not hard-bounded.
 
-Canonical notification/finalization adapters remain synchronous. Collection and
-those adapters still read full snapshots; bounded historical-state materialization
+Canonical finalization remains synchronous. Collection and canonical effect
+selection still read full snapshots; bounded historical-state materialization
 and the remaining effect workers are separate unfinished W04 work. macOS and real
 SSH-host acceptance remain untested.
+
+
+## Canonical notification delivery
+
+On Linux with `state-store`, the ticker queues previously accepted
+`runtime.notification` operations through the shared effect queue. It does not
+create notification authority from an inbox observation. The concrete worker checks
+the frozen project, configuration, operation, delivery revision and local socket
+identity, then retains project and inherited execution locks through a durable
+claim, supervised send and outcome commit. A raw native JSON acknowledgement must
+match the request ID, result type and shown/reason fields.
+
+A verified native `disabled`, `rate_limited`, `no_foreground_client` or `busy`
+response records proven no effect and uses the canonical operation's existing
+retry budget/backoff. Lost, malformed, foreign or contradictory acknowledgements
+remain ambiguous. Confirmed delivery is not repeated after restart. If the ticker
+dies, supervision keeps the execution locks until its bounded local descendants
+are gone; this does not undo a notification that may already have been shown.
+Claim expiry records ambiguity and does not resend.
+
+A new batch cannot overlap another claimed or ambiguous canonical notification,
+even after changing its task, route or configuration. Consume the older inbox
+items to permit a disjoint batch, or inspect the possible effect and explicitly
+retire its operation. Retirement retains the historical possible-effect outcome.
+Malformed unresolved notification history refuses delivery. Foreground notification
+commands use the same overlap rule and retain their synchronous adapter.
+
+Effects, canonical routines and canonical observations defer same-project queue
+admission while another of those jobs is pending. Other projects can continue
+status observation. Queue completions only clear volatile bookkeeping; only the
+concrete worker can publish a canonical notification outcome.
 
 ## Interrupted brief delivery
 

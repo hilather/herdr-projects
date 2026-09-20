@@ -166,3 +166,24 @@ fn canonical_worker_batches_leave_root_exclusive_notifications_a_turn() {
     }
     assert!(pool.stop(Duration::from_secs(3)));
 }
+
+#[test]
+fn canonical_worker_and_routine_admission_take_separate_project_turns() {
+    use std::sync::atomic::{AtomicBool,Ordering};
+    struct Gate {held:Arc<AtomicBool>,inner:Arc<dyn Runner+Send+Sync>}
+    impl Runner for Gate {
+        fn run(&self,command:&Cmd)->Result<Output>{if command.program==JOB{while self.held.load(Ordering::SeqCst){ensure!(!command.cancellation.as_ref().unwrap().is_cancelled()&&Instant::now()<command.deadline.unwrap(),"fixture cancelled");std::thread::sleep(Duration::from_millis(5));}}self.inner.run(command)}
+        fn socket_request(&self,p:&Path,s:&str,t:Duration)->Result<String>{self.inner.socket_request(p,s,t)}
+    }
+    let(world,path)=crate::canonical_controller::tests::routine_fixture(&[("turns",b"touch STARTED\nsleep 1\ntouch COMPLETED\n",5000)]);
+    let held=Arc::new(AtomicBool::new(true));let runner=Arc::new(Gate{held:held.clone(),inner:Arc::new(crate::routine_jobs::JobRunner{inner:Arc::new(ProbeRunner{inner:Arc::new(crate::runner::RealRunner)})})});let pool=Arc::new(Executor::new(crate::executor::Limits::default(),runner).unwrap());
+    let mut reads=Reads::new(pool.clone());reads.poll(&world.ctx(),&path).unwrap();reads.admit();let mut memory=crate::steps::Memory::new(&world.ctx());memory.canonical_observations=Some(reads);memory.routine_jobs=Some(crate::routine_jobs::Queue::new(pool.clone()));
+    crate::ticker::tick_for_test(&world.ctx(),&mut memory);assert!(!memory.routine_jobs.as_ref().unwrap().pending());assert!(!path.join("STARTED").exists());
+    let snapshot=runtime::snapshot(&path).unwrap();assert_eq!(snapshot.routine_occurrences.len(),1);assert_eq!(snapshot.deliveries[0].attempts,0);
+    held.store(false,Ordering::SeqCst);let end=Instant::now()+Duration::from_secs(5);while pool.metrics().running[0]+pool.metrics().queued[0]>0{assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(5));}
+    crate::ticker::tick_for_test(&world.ctx(),&mut memory);assert!(memory.routine_jobs.as_ref().unwrap().pending_project(path.to_str().unwrap()));assert!(!memory.canonical_observations.as_ref().unwrap().pending_project(path.to_str().unwrap()));
+    while !path.join("STARTED").exists(){assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(5));}
+    crate::ticker::tick_for_test(&world.ctx(),&mut memory);assert!(!memory.canonical_observations.as_ref().unwrap().pending_project(path.to_str().unwrap()));
+    while runtime::snapshot(&path).unwrap().deliveries[0].state!=herdr_projects::operations::DeliveryState::Confirmed{assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(10));}
+    assert!(path.join("COMPLETED").exists());assert!(pool.stop(Duration::from_secs(3)));
+}

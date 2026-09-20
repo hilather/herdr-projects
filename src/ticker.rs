@@ -263,6 +263,8 @@ pub fn run(ctx: &Ctx) -> Result<()> {
     #[cfg(feature="state-store")]
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::canonical_controller::observations::ProbeRunner{inner:runner});
     #[cfg(feature="state-store")]
+    let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::canonical_notification_jobs::JobRunner{inner:runner});
+    #[cfg(feature="state-store")]
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::routine_jobs::JobRunner{inner:runner});
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::copy_jobs::JobRunner{inner:runner});
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::legacy_routine_jobs::JobRunner{inner:runner});
@@ -390,7 +392,7 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         let mut any_reachable=any_reachable;
         if !canonical.is_empty() {let first=(memory.tick.saturating_sub(1)%canonical.len() as u64) as usize;canonical.rotate_left(first);}
         for slug in &canonical {
-            let result=if let Some(reads)=memory.canonical_observations.as_mut(){crate::canonical_controller::poll_queued(ctx,&ctx.root.join(slug),memory.tick.saturating_sub(1),reads)}else{crate::canonical_controller::poll(ctx,&ctx.root.join(slug),memory.tick.saturating_sub(1))};
+            let result=if let Some(reads)=memory.canonical_observations.as_mut(){crate::canonical_controller::poll_queued_effects(ctx,&ctx.root.join(slug),memory.tick.saturating_sub(1),reads,memory.copy_jobs.as_mut())}else{crate::canonical_controller::poll(ctx,&ctx.root.join(slug),memory.tick.saturating_sub(1))};
             match result {
                 Ok(result)=>{any_reachable|=result.reachable||result.scheduled_work;if let Some(error)=result.operation_error {log.line(&format!("{slug}: canonical operation: {error}"));}},
                 Err(error)=>log.line(&format!("{slug}: canonical controller: {error:#}")),
@@ -399,7 +401,7 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         admit_background(ctx,log,memory,canonical.into_iter().map(|slug|ctx.root.join(slug)).collect());
         if let Some(reads)=memory.local_reports.as_mut(){for error in reads.admit(){log.line(&error);}}
         if let Some(reads)=memory.local_observations.as_mut(){for error in reads.admit(){log.line(&error);}}
-        if let Some(reads)=memory.canonical_observations.as_mut(){for error in reads.admit(){log.line(&error);}}
+        if let Some(reads)=memory.canonical_observations.as_mut(){for error in reads.admit_where(|project|!memory.copy_jobs.as_ref().is_some_and(|q|q.pending_project(project))&&!memory.routine_jobs.as_ref().is_some_and(|q|q.pending_project(project))){log.line(&error);}}
         any_reachable|=memory.routine_jobs.as_ref().is_some_and(|q|q.pending());
         any_reachable|=memory.copy_jobs.as_ref().is_some_and(|q|q.pending()||q.offered());
         return any_reachable;
@@ -420,13 +422,21 @@ fn admit_background(_ctx:&Ctx,log:&Log,memory:&mut Memory,canonical:Vec<PathBuf>
     #[cfg(feature="state-store")]
     if memory.routine_jobs.as_ref().is_some_and(|q|q.pending()){return;}
     if memory.prefer_copy {
-        if let Some(queue)=memory.copy_jobs.as_mut(){for error in queue.admit(){log.line(&error);}if queue.pending(){memory.prefer_copy=false;return;}}
+        if admit_effects(log,memory){memory.prefer_copy=false;return;}
     }
     #[cfg(feature="state-store")]
-    if let Some(queue)=memory.routine_jobs.as_mut(){for error in queue.admit_projects(canonical){log.line(&error);}if queue.pending(){memory.prefer_copy=true;return;}}
+    if let Some(queue)=memory.routine_jobs.as_mut(){for error in queue.admit_projects_where(canonical,|project|!memory.canonical_observations.as_ref().is_some_and(|reads|reads.pending_project(&project.display().to_string()))){log.line(&error);}if queue.pending(){memory.prefer_copy=true;return;}}
     #[cfg(not(feature="state-store"))]
     let _=canonical;
-    if let Some(queue)=memory.copy_jobs.as_mut(){for error in queue.admit(){log.line(&error);}if queue.pending(){memory.prefer_copy=false;}}
+    if admit_effects(log,memory){memory.prefer_copy=false;}
+}
+fn admit_effects(log:&Log,memory:&mut Memory)->bool {
+    let Some(queue)=memory.copy_jobs.as_mut()else{return false;};
+    #[cfg(feature="state-store")]
+    let errors=queue.admit_where(|project|!memory.canonical_observations.as_ref().is_some_and(|reads|reads.pending_project(project)));
+    #[cfg(not(feature="state-store"))]
+    let errors=queue.admit();
+    for error in errors{log.line(&error);}queue.pending()
 }
 
 

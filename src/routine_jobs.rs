@@ -80,7 +80,12 @@ impl Queue {
         });errors
     }
     pub fn pending(&self)->bool {self.entries.values().any(|e|matches!(e,Entry::Pending{..}))}
+    pub fn pending_project(&self,project:&str)->bool {self.entries.get(Path::new(project)).is_some_and(|e|matches!(e,Entry::Pending{..}))}
+    #[cfg(test)]
     pub fn admit_projects(&mut self,projects:impl IntoIterator<Item=PathBuf>)->Vec<String> {
+        self.admit_projects_where(projects,|_|true)
+    }
+    pub fn admit_projects_where(&mut self,projects:impl IntoIterator<Item=PathBuf>,allowed:impl Fn(&Path)->bool)->Vec<String> {
         let mut errors=Vec::new();if self.pending(){return errors;}
         let mut paths=Vec::new();
         for project in projects {match project.canonicalize(){Ok(path)=>paths.push(path),Err(error)=>errors.push(format!("{}: routine admission: {error}",project.display()))}}
@@ -89,6 +94,7 @@ impl Queue {
             let first=paths.iter().position(|path|path>last).unwrap_or(0);paths.rotate_left(first);
         }
         for path in paths {
+            if !allowed(&path){continue;}
             if let Err(error)=self.admit(&path){errors.push(format!("{}: routine admission: {error:#}",path.display()));}
             if self.pending(){break;}
         }

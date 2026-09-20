@@ -10,6 +10,8 @@ pub struct Queue {executor:Arc<crate::executor::Executor>,entries:BTreeMap<Key,E
 impl Queue {
     pub fn new(executor:Arc<crate::executor::Executor>)->Self {Self{executor,entries:BTreeMap::new(),pending:None,sequence:0,cursor:crate::fair_admission::Cursor::default()}}
     pub fn pending(&self)->bool {self.pending.is_some()}
+    #[cfg(feature="state-store")]
+    pub fn pending_project(&self,project:&str)->bool {self.pending.as_ref().is_some_and(|p|p.key.0==project)}
     pub fn outstanding(&self,project:&Project,id:&str)->bool {
         ["live-copy","final-copy"].iter().any(|kind|{
             let key=(project.canonical_dir().display().to_string(),format!("{kind}:{id}"));
@@ -40,6 +42,10 @@ impl Queue {
     }
     pub fn offer_notification(&mut self,ctx:&Ctx,project:&Project,c:&crate::project::Coordinator)->Result<()> {
         self.offer_request(crate::coordinator_jobs::request_notification(ctx,project,c)?)
+    }
+    #[cfg(feature="state-store")]
+    pub fn offer_canonical_notification(&mut self,ctx:&Ctx,path:&Path,operation:&herdr_projects::domain::Operation,revision:u64,socket:&str)->Result<()> {
+        self.offer_request(crate::canonical_notification_jobs::request(ctx,path,operation,revision,socket)?)
     }
     pub fn offer_coordinator_start(&mut self,ctx:&Ctx,project:&Project,c:&crate::project::Coordinator)->Result<()> {
         self.offer_request(crate::coordinator_jobs::request_start(ctx,project,c)?)
@@ -88,9 +94,13 @@ impl Queue {
         if let Some(entry)=self.entries.get_mut(&pending.key) {entry.not_before=now+if result.is_err()||pending.identity.operation=="notification"||pending.identity.operation.starts_with("tokens:"){Duration::from_secs(30)}else{Duration::ZERO};entry.touched=now;entry.needed=result.is_err();}
         result.err().map(|e|format!("{} {}: background queue: {e:#}",pending.key.0,pending.key.1)).into_iter().collect()
     }
+    #[cfg(any(test,not(feature="state-store")))]
     pub fn admit(&mut self)->Vec<String> {
+        self.admit_where(|_|true)
+    }
+    pub fn admit_where(&mut self,allowed:impl Fn(&str)->bool)->Vec<String> {
         self.prune();let mut errors=Vec::new();if self.pending(){return errors;}
-        while let Some(key)=self.next() {
+        while let Some(key)=self.next_where(&allowed) {
             let next=match self.sequence.checked_add(1){Some(n)=>n,None=>{errors.push("copy admission sequence exhausted".into());break;}};
             let entry=self.entries.get_mut(&key).unwrap();let work=entry.work.take().unwrap();let identity=work.identity.clone();
             match self.executor.submit(work) {
@@ -104,9 +114,9 @@ impl Queue {
         errors
     }
     fn compare(&self,a:&Key,b:&Key)->std::cmp::Ordering {self.cursor.compare(a,b)}
-    fn next(&self)->Option<Key> {
+    fn next_where(&self,allowed:&impl Fn(&str)->bool)->Option<Key> {
         let now=Instant::now();
-        self.entries.iter().filter(|(_,e)|e.work.is_some()&&now>=e.not_before)
+        self.entries.iter().filter(|(key,e)|e.work.is_some()&&now>=e.not_before&&allowed(&key.0))
             .min_by(|(a,_),(b,_)|self.compare(a,b)).map(|(key,_)|key.clone())
     }
 

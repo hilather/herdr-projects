@@ -582,6 +582,56 @@ fn canonical_notification_cli_delivers_once_to_recorded_socket() {
     let args=["--root",root_arg,"operations","demo","deliver-notification",id,"--expected-revision","1"];let out=deliver(&args);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));assert_eq!(serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["state"],"confirmed");assert!(!deliver(&args).status.success());assert_eq!(std::fs::read_to_string(home.path().join("effects")).unwrap(),"effect\n");let snapshot=runtime::snapshot(&project).unwrap();assert!(!snapshot.inbox[0].seen&&!snapshot.inbox[0].done);
 }
 
+#[cfg(all(feature="state-store",target_os="linux"))]
+#[test]
+fn ticker_canonical_notification_confirms_or_retains_ambiguity_after_owner_death() {
+    use std::{fs,os::unix::{fs::PermissionsExt,net::UnixListener},process::Stdio,time::{Duration,Instant}};
+    use herdr_projects::{migration,runtime,domain::{TaskId,RuntimeRoute,ProjectState},operations::DeliveryState,execution_guard::{ProjectGuard,RootGuard}};
+    for mode in ["ok","lost","death"] {
+        let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();for action in ["new","pause"]{assert!(hp(home.path(),&["--root",r,action,"demo"]).status.success());}
+        let project=root.join("demo");fs::write(project.join("inbox/message.md"),"+++\nid='message'\nsummary='private text'\n+++\n").unwrap();let plan=migration::inspect(&project).unwrap();migration::apply(&project,&plan,true).unwrap();
+        let task=TaskId::new("notification").unwrap();let head=runtime::add_task(&project,task.clone(),"notification".into(),runtime::snapshot(&project).unwrap().head).unwrap();let socket=home.path().join("notification.sock");let _listener=UnixListener::bind(&socket).unwrap();runtime::create_binding(&project,None,None,head,&RuntimeRoute{socket:socket.display().to_string(),..Default::default()}).unwrap();
+        assert!(hp(home.path(),&["--root",r,"reconcile","demo","--record"]).status.success());let snapshot=runtime::snapshot(&project).unwrap();let config=home.path().join(".config/herdr-projects/config.toml");runtime::set_state(&project,snapshot.head,snapshot.control.unwrap().revision,ProjectState::Active,&config).unwrap();
+        let op=runtime::enqueue_notification(&project,&task,runtime::snapshot(&project).unwrap().head,&migration::config_reference(&config).unwrap()).unwrap();
+        let helper=home.path().join("herdr");fs::write(&helper,format!(r#"#!/usr/bin/python3
+import sys,json,pathlib,os,time,fcntl,sqlite3
+root=pathlib.Path({home:?});project=pathlib.Path({project:?});mode={mode:?}
+if sys.argv[1:]==['remote-api-bridge','--check']:print('herdr-api-bridge-v1');sys.exit(0)
+assert sys.argv[1:]==['remote-api-bridge']
+request=json.loads(sys.stdin.readline());assert request['method']=='notification.show'
+for lock in [project.parent/'.execution.lock',project/'.state'/'effect.lock',project.parent/'.routine-execution.lock']:
+ with open(lock,'r+') as f:
+  try:fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+  except BlockingIOError:pass
+  else:(root/'WRONG_LOCK').write_text(str(lock));sys.exit(5)
+db=sqlite3.connect(project/'.state'/'state.db');assert db.execute("select count(*) from operation_delivery where state='claimed'").fetchone()[0]==1
+if mode=='death' and os.fork()==0:
+ os.setsid();os.closerange(3,1024);time.sleep(15);(root/'escaped').write_text('bad');os._exit(0)
+with open(root/'sent','a') as f:f.write('send\n')
+if mode=='death':time.sleep(60)
+if mode=='lost':sys.exit(0)
+print(json.dumps({{'id':request['id'],'result':{{'type':'notification_show','shown':True,'reason':'shown'}}}}))
+"#,home=home.path().display().to_string(),project=project.display().to_string())).unwrap();fs::set_permissions(&helper,fs::Permissions::from_mode(0o700)).unwrap();
+        struct Child(std::process::Child);impl Drop for Child{fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+        let spawn=||Child(Command::new(BIN).env_clear().env("HOME",home.path()).env("PATH","/usr/bin:/bin").env("HERDR_BIN_PATH",&helper).args(["--root",r,"ticker","run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+        let read=||runtime::snapshot(&project).unwrap().deliveries.into_iter().find(|d|d.operation==op.id).unwrap();
+        let wait=|child:&mut Child,predicate:&dyn Fn()->bool|{let end=Instant::now()+Duration::from_secs(8);while !predicate(){assert!(child.0.try_wait().unwrap().is_none());assert!(Instant::now()<end,"{}",fs::read_to_string(root.join(".ticker.log")).unwrap_or_default());std::thread::sleep(Duration::from_millis(10));}};
+        let stop=|child:&mut Child|{fs::write(root.join(".ticker.stop"),b"").unwrap();let end=Instant::now()+Duration::from_secs(8);while child.0.try_wait().unwrap().is_none(){assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(10));}fs::remove_file(root.join(".ticker.stop")).unwrap();};
+        let mut child=spawn();wait(&mut child,&||home.path().join("sent").exists());
+        if mode=="death" {
+            child.0.kill().unwrap();child.0.wait().unwrap();assert!(RootGuard::exclusive(&root).is_err());assert!(ProjectGuard::acquire(&project).is_err());
+            let routine=fs::OpenOptions::new().write(true).open(root.join(".routine-execution.lock")).unwrap();assert!(routine.try_lock().is_err());
+            let end=Instant::now()+Duration::from_secs(14);loop{if let Ok(guard)=RootGuard::exclusive(&root){drop(guard);break;}assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(10));}
+            routine.try_lock().unwrap();routine.unlock().unwrap();assert!(ProjectGuard::acquire(&project).is_ok());assert_eq!(read().state,DeliveryState::Claimed);
+            let until=read().lease_until_ms.unwrap();assert_eq!(migration::open_active(&project).unwrap().expire_claims(until).unwrap(),1);assert_eq!(read().state,DeliveryState::Ambiguous);
+            std::thread::sleep(Duration::from_secs(6));assert!(!home.path().join("escaped").exists());
+        }else{wait(&mut child,&||read().state==if mode=="ok"{DeliveryState::Confirmed}else{DeliveryState::Ambiguous});stop(&mut child);}
+        assert!(!home.path().join("WRONG_LOCK").exists());let head=runtime::snapshot(&project).unwrap().head;
+        let mut child=spawn();wait(&mut child,&||runtime::snapshot(&project).unwrap().head>head);stop(&mut child);
+        assert_eq!(fs::read_to_string(home.path().join("sent")).unwrap(),"send\n");assert_eq!(read().attempts,1);
+    }
+}
+
 #[test]
 #[cfg(feature="state-store")]
 fn canonical_finalization_cli_preserves_artifacts_and_awaits_review() {

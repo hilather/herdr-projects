@@ -2343,3 +2343,57 @@ successfully. Logs: `/tmp/herdr-canonical-observation-{debug-units,release-units
 `corrected-debug,corrected-release,head,default-check}.log`. Independent review
 approved the worker, bounded head reader, integration and batch-drain boundary.
 `git diff --check` passes. No new external/platform acceptance is claimed.
+
+## W04 supervised canonical notifications
+
+Previously accepted canonical notification operations now use the shared effect
+queue on Linux. The concrete worker binds canonical project/device/inode, local
+socket/device/inode, executable/configuration, immutable operation fingerprint and
+delivery revision. It retains ProjectGuard and inherited root/project/global-routine
+ownership through existing dispatch_one claim/revalidation, native correlated JSON
+send and durable outcome. Queue replies cannot certify delivery. No synchronous
+notification fallback runs when the production queue is configured.
+
+Native shown/reason acknowledgement must agree with the exact request ID and result
+type. Verified before-effect negative reasons use the canonical store's existing
+retry budget/backoff. Lost, malformed, foreign, oversized, contradictory or stale
+post-send acknowledgements become ambiguous. Insufficient remaining lease/worker
+time is recorded as proven no effect before calling the sender. A confirmed result
+blocks replay; owner death retains supervisor locks through descendant cleanup and
+claim expiry records ambiguity without resend.
+
+Shared notification validation now refuses overlap with any other claimed or
+ambiguous runtime.notification, independently of task/route/configuration changes.
+It excludes the current claim and validates older payload identities/authority
+references rather than treating malformed history as disjoint. Consuming older
+items permits a disjoint new batch; explicit retirement retains possible-effect
+history while removing the blocker. Foreground and queued delivery use this rule.
+Tests also exercise overlapping pending workers racing for the same project.
+
+Admission excludes same-project effects/routines while canonical observations are
+pending and excludes observations while an effect or routine ticket is pending.
+Review caught the initially omitted routine direction; a signed-routine fixture
+now verifies both directions and actual progress after the observation drains.
+This prevents avoidable lock races and cooldowns without serializing other-project
+status reads. Root-wide effect/routine alternation and canonical observation batch
+drainage remain in place.
+
+Disposable tests check durable claim before send, all inherited locks, exact once
+confirmation, native negative responses, stale input refusal, overlap across restart
+and changed authority, consumption/retirement, malformed disjoint history, forged
+queue success, healthy legacy status during a blocked notification, and production
+CLI restart/owner-SIGKILL behavior. The crash fixture verifies escaped descendants
+cannot outlive supervision and explicitly advances claim-expiry time before
+checking ambiguity and restart without replay. No user notification is sent.
+
+Canonical finalization and receipt-observation workers remain next, followed by
+full-snapshot/materialization bounds and other W04 launch/profile, budget/telemetry
+and authority work. Counts remain 16 locally implemented, five partial and 20
+unstarted; unavailable macOS and real SSH-host acceptance remain documented.
+
+Independent source review approved this increment. Final validation passed all
+657 unit tests (182 library, 475 binary) in both debug and release profiles,
+seven release canonical CLI regressions including notification owner death, and
+six default-feature shared-queue regressions. The earlier integrated debug pass
+also passed four library, 31 binary and seven CLI checks. All process checks used
+disposable Linux namespaces; no macOS or real SSH-host evidence was added.

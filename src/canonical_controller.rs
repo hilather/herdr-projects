@@ -35,30 +35,34 @@ pub fn poll(ctx:&Ctx,path:&Path,turn:u64)->Result<PollResult> {
     let reachable=batch.observations.iter().any(|o|o.pane==ResourceState::Present||o.worktree==ResourceState::Present);
     runtime::record_controller_observations_guarded(&path,&batch,&ownership)?;
     drop(ownership);
-    finish_poll(ctx,&path,turn,reachable,None)
+    finish_poll(ctx,&path,turn,reachable,None,None)
 }
 /// Background observation results affect liveness only. Scheduling still gets
 /// its main-pass opportunity before any next observation job is admitted.
+#[cfg(test)]
 pub fn poll_queued(ctx:&Ctx,path:&Path,turn:u64,reads:&mut observations::Reads)->Result<PollResult> {
+    poll_queued_effects(ctx,path,turn,reads,None)
+}
+pub fn poll_queued_effects(ctx:&Ctx,path:&Path,turn:u64,reads:&mut observations::Reads,effects:Option<&mut crate::copy_jobs::Queue>)->Result<PollResult> {
     let (reachable,error)=match reads.poll(ctx,path) {
         Ok(observations::Poll::Ready(reachable))=>(reachable,None),
         Ok(observations::Poll::Pending)=>(false,None),
         Ok(observations::Poll::Failed(error))=>(false,Some(format!("canonical observation: {error}"))),
         Err(error)=>(false,Some(format!("canonical observation: {error:#}"))),
     };
-    finish_poll(ctx,path,turn,reachable,error)
+    finish_poll(ctx,path,turn,reachable,error,effects)
 }
-fn finish_poll(ctx:&Ctx,path:&Path,turn:u64,reachable:bool,observation_error:Option<String>)->Result<PollResult> {
+fn finish_poll(ctx:&Ctx,path:&Path,turn:u64,reachable:bool,observation_error:Option<String>,effects:Option<&mut crate::copy_jobs::Queue>)->Result<PollResult> {
     // A scheduling failure must not suppress unrelated notification/finalization
     // work. Each scheduling turn handles one routine; subsequent turns rotate.
     let scheduled=herdr_projects::routines::schedule_turn(&path,turn);
-    let result=process_next(ctx,&path,turn);
+    let result=process_next(ctx,&path,turn,effects);
     let mut errors=observation_error.into_iter().collect::<Vec<_>>();
     let routine_work=match scheduled {Ok(report)=>{if let Some(error)=report.diagnostic {errors.push(format!("routine scheduling: {error}"));}report.active},Err(error)=>{errors.push(format!("routine scheduling: {error:#}"));false}};
     let progress=match result {Ok(progress)=>progress,Err(error)=>{errors.push(format!("{error:#}"));false}};
     Ok(PollResult{reachable:reachable||progress,scheduled_work:routine_work,operation_error:(!errors.is_empty()).then(||errors.join("; "))})
 }
-fn process_next(ctx:&Ctx,path:&Path,turn:u64)->Result<bool> {
+fn process_next(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::copy_jobs::Queue>)->Result<bool> {
     let snapshot=runtime::snapshot(path)?;
     // Lifecycle/policy validation stays in each adapter. No imported obligation,
     // new launch or terminal input is inferred from legacy files or inbox content.
@@ -74,6 +78,13 @@ fn process_next(ctx:&Ctx,path:&Path,turn:u64)->Result<bool> {
     if candidates.is_empty(){return Ok(false);}
     candidates.sort_by(|(a,_),(b,_)|a.id.cmp(&b.id));
     let(operation,delivery)=candidates[(turn%candidates.len() as u64) as usize];
+    if operation.kind=="runtime.notification"&&let Some(effects)=effects {
+        let notice=herdr_projects::operations::notification::Notification::decode(operation)?;
+        let reference=crate::notification_delivery::config(ctx,path)?;
+        let binding=notice.validate(operation,&snapshot,&reference)?;
+        effects.offer_canonical_notification(ctx,path,operation,delivery.revision,&binding.identity.socket)?;
+        return Ok(false);
+    }
     if delivery.state==DeliveryState::Ambiguous {
         crate::finalization_delivery::observe(ctx,&path,&operation.id,delivery.revision,snapshot.head)?;
         return Ok(true);

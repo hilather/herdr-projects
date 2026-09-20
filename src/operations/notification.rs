@@ -34,13 +34,29 @@ impl Notification {
         ensure!(operation.kind=="runtime.notification"&&operation.payload_version==1&&operation.target=="coordinator","unsupported notification operation");
         serde_json::from_value(operation.payload.clone()).context("invalid notification payload")
     }
-    pub fn validate<'a>(&self,operation:&Operation,snapshot:&'a Snapshot,config:&ConfigReference)->Result<&'a RuntimeBinding> {
+    fn validate_payload(&self,operation:&Operation)->Result<()> {
         ensure!(self.authority=="operator.session_notification","notification lacks explicit operator scope");
-        ensure!(&self.config==config,"notification config reference changed");
         ensure!(self.title.starts_with("herdr-projects: ")&&self.title.len()<=256&&!self.title.chars().any(char::is_control),"invalid notification title");
-        ensure!(!self.inbox_ids.is_empty()&&self.inbox_ids.len()<=1000&&self.inbox_ids==unseen(snapshot),"notification inbox set changed");
+        ensure!(!self.inbox_ids.is_empty()&&self.inbox_ids.len()<=1000&&self.inbox_ids.iter().all(|id|!id.is_empty())&&self.inbox_ids.windows(2).all(|ids|ids[0]<ids[1]),"invalid notification inbox set");
+        for id in &self.inbox_ids{crate::domain::InboxContent{id:id.clone(),..Default::default()}.validate().map_err(anyhow::Error::msg)?;}
+        ensure!(self.binding_revision>0&&self.control_epoch>0&&std::path::Path::new(&self.config.path).is_absolute()&&self.config.digest.as_ref().is_none_or(|digest|super::finalization::hash(digest)),"invalid notification authority reference");
         ensure!(self.body==format!("{} new inbox item(s). The coordinator reads them at its next turn.",self.inbox_ids.len()),"invalid notification body");
         let id=identity(&self.inbox_ids);ensure!(operation.id.as_str()==id&&operation.idempotency_key==id,"notification identity mismatch");
+        Ok(())
+    }
+    pub fn validate<'a>(&self,operation:&Operation,snapshot:&'a Snapshot,config:&ConfigReference)->Result<&'a RuntimeBinding> {
+        self.validate_payload(operation)?;
+        ensure!(&self.config==config,"notification config reference changed");
+        ensure!(self.inbox_ids==unseen(snapshot),"notification inbox set changed");
+        // An altered route, task or configuration cannot launder a possible
+        // prior effect into a new overlapping notification batch.
+        for delivery in &snapshot.deliveries {
+            if delivery.operation==operation.id||!matches!(delivery.state,super::DeliveryState::Claimed|super::DeliveryState::Ambiguous){continue;}
+            let previous=snapshot.operations.iter().find(|op|op.id==delivery.operation).context("notification overlap history is incomplete")?;
+            if previous.kind!="runtime.notification"{continue;}
+            let previous_notice=Self::decode(previous)?;previous_notice.validate_payload(previous)?;
+            ensure!(!previous_notice.inbox_ids.iter().any(|id|self.inbox_ids.binary_search(id).is_ok()),"notification overlaps an unresolved possible effect; consume the older inbox items or explicitly retire its operation before enqueueing another batch");
+        }
         let control=snapshot.control.as_ref().context("upgrade-store required")?;
         ensure!(control.state==ProjectState::Active&&!control.reconciliation_required&&control.epoch==self.control_epoch&&control.config_digest==config.digest,"notification lifecycle admission changed");
         ensure!(snapshot.tasks.iter().any(|t|Some(&t.id)==operation.task.as_ref()&&t.revision==operation.expected_revision),"notification task changed");

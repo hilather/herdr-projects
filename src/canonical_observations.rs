@@ -91,6 +91,7 @@ pub struct Reads {
 impl Reads {
     pub fn new(executor:Arc<Executor>)->Self {Self{executor,pending:BTreeMap::new(),offers:BTreeMap::new(),ready:BTreeMap::new(),classified:BTreeMap::new(),cursor:Cursor::default(),unknown:false}}
     pub fn unknown(&self)->bool {self.unknown}
+    pub fn pending_project(&self,project:&str)->bool {self.pending.keys().any(|key|key.0==project)}
     pub fn begin_pass(&mut self) {
         self.ready.clear();self.offers.clear();self.unknown=false;for (_,_,_,_,touched) in self.classified.values_mut(){*touched=false;}
         let completed=self.pending.iter().filter_map(|(key,p)|match p.ticket.try_recv(){Ok(None)=>None,result=>Some((key.clone(),result))}).collect::<Vec<_>>();let mut serviced=Vec::new();
@@ -130,14 +131,18 @@ impl Reads {
         }
         self.offers.insert(key,Candidate{fingerprint,request:Request{identity,lane:Lane::Control,deadline,command}});Ok(result)
     }
+    #[cfg(test)]
     pub fn admit(&mut self)->Vec<String> {
+        self.admit_where(|_|true)
+    }
+    pub fn admit_where(&mut self,allowed:impl Fn(&str)->bool)->Vec<String> {
         self.classified.retain(|_,(_,_,_,deadline,touched)|*touched&&Instant::now()<*deadline);let mut errors=Vec::new();let mut cursor=self.cursor.clone();
         // Drain the whole observation batch before replenishing it. Every job
         // holds the shared root barrier; overlapping generations could otherwise
         // starve the existing root-exclusive effect adapters indefinitely.
         if !self.pending.is_empty(){return errors;}
         while self.pending.len()<PENDING_LIMIT {
-            let Some(key)=self.offers.keys().min_by(|a,b|cursor.compare(a,b)).cloned()else{break;};let candidate=self.offers.remove(&key).unwrap();let identity=candidate.request.identity.clone();let deadline=candidate.request.deadline+(SAMPLE_AGE-BUDGET);
+            let Some(key)=self.offers.keys().filter(|key|allowed(&key.0)).min_by(|a,b|cursor.compare(a,b)).cloned()else{break;};let candidate=self.offers.remove(&key).unwrap();let identity=candidate.request.identity.clone();let deadline=candidate.request.deadline+(SAMPLE_AGE-BUDGET);
             match self.executor.submit(candidate.request) {
                 Ok(ticket)=>{cursor.accepted(&key);self.pending.insert(key,Pending{fingerprint:candidate.fingerprint,identity,ticket,deadline});},
                 Err(error)=>{self.unknown=true;errors.push(format!("{}: canonical observation admission: {error:#}",key.0));},
