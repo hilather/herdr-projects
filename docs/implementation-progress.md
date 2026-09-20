@@ -2539,3 +2539,27 @@ debug and release profiles, plus default-feature `cargo check` and
 then stays alive across two restart passes with unchanged receipts/deliveries and
 one script marker write. The task ledger now reflects the already completed
 worker isolation work without changing card counts.
+
+### W04 held-ownership routine planning foundation
+
+A new `routines::schedule_next_guarded` service plans one routine while retaining
+an existing ProjectGuard. It selects the first enabled latest revision after the
+last serviced name, wrapping by name; a withdrawn script returns that selected
+name and positive routine liveness so it cannot monopolize future turns. Current
+input validation occurs outside the record lock. The short record lock and
+scheduling transaction retain the original snapshot head; a stale preparation is
+never silently rebased. Cancellation/deadline and project identity are checked
+before commit. A committed intent is not relabelled as a no-write cancellation.
+
+This is the service foundation only: the production ticker still calls its
+existing synchronous planner. Next, combine planning with the owned observation
+job, retaining independent outcomes, cursor progress and one final event head.
+Full SQLite open/snapshot/transaction bounds remain separate unfinished work.
+
+Independent review approved the foundation after adding a cancellation/deadline
+check between store opening and snapshot materialization. All 19 routine
+library/store regressions pass in debug and release, including five new tests for
+name rotation, withdrawn scripts, wrong ownership, cancellation/expiry, short-lock
+contention, validation outside the record lock, stale-head rejection, and known
+paused state. `git diff --check` passes. No production path has switched planners
+yet, and card counts remain unchanged.

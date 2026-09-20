@@ -5,6 +5,8 @@ use sha2::{Digest,Sha256};
 use crate::{domain::{RoutineDefinition,RoutineOccurrence,PreparedRoutineTick},migration};
 
 mod execution;
+mod planning;
+pub use planning::{PlannedRoutine, schedule_next_guarded};
 
 /// Sealed in-process result. Serialized output cannot be submitted as proof.
 pub(crate) struct CompletedRoutine {pub(crate) receipt:crate::domain::RoutineReceipt}
