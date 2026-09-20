@@ -1,6 +1,6 @@
 //! Live-copy protocol v1. Partial projections are never preservation receipts.
 use super::*;
-use crate::source_tree::{Budget,Directory,Limit,NodeKind};
+use crate::source_tree::{Budget,Control,Directory,Limit,NodeKind};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 pub mod projection;
@@ -138,11 +138,41 @@ fn render_notes(source:&Source)->Vec<String> {
             format!("{} was omitted ({reason}); existing home content, if any, is retained",n.path)
         }).collect()
 }
+fn reserve(project:&Project,kind:&str,headroom:usize,control:&Control)->Result<Staging> {
+    let parent=project.state_dir().join("live-copies");
+    let _lock=project.lock()?;control.check()?;real_dir(&project.state_dir())?;make_dir(&parent)?;
+    let inventory=fs::read_dir(&parent)?.take(STAGE_LIMIT).collect::<std::io::Result<Vec<_>>>()?;
+    ensure!(inventory.len()<STAGE_LIMIT-headroom,"live staging inventory is full; recover retained stages before receiving another copy");
+    for _ in 0..128 {
+        let path=parent.join(format!(".{kind}-{}-{}",std::process::id(),SEQUENCE.fetch_add(1,Ordering::Relaxed)));
+        match fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(())=>return Ok(Staging(path)),
+            Err(error) if error.kind()==std::io::ErrorKind::AlreadyExists=>continue,
+            Err(error)=>return Err(error.into()),
+        }
+    }
+    anyhow::bail!("no free live-copy staging name")
+}
+/// Temporary transport ownership is separate from durable projection intent.
+/// Abandoned spools count against the same inventory as retained stages.
+#[allow(dead_code)]
+pub struct Spool(Staging);
+#[allow(dead_code)]
+impl Spool {
+    pub fn reserve(project:&Project,control:&Control)->Result<Self> {
+        control.check()?;Ok(Self(reserve(project,"download",1,control)?))
+    }
+    pub fn path(&self)->PathBuf {self.0.0.join("stream")}
+}
 #[allow(dead_code)]
 /// The trusted adapter must establish successful supervised sender completion
 /// before calling this. Stream integrity alone is not execution authority.
 pub fn receive(project:&Project,archive:&Path)->Result<LiveCopy> {
-    let header_budget=Budget::new();
+    receive_controlled(project,archive,&Control::default())
+}
+#[allow(dead_code)]
+pub fn receive_controlled(project:&Project,archive:&Path,control:&Control)->Result<LiveCopy> {
+    control.check()?;let header_budget=control.budget();
     let mut stream=regular(archive)?;ensure!(stream.metadata()?.len()<=STREAM_LIMIT as u64,"live-copy stream exceeds bounds");
     let before=stream.metadata()?;let mut report_budget=None;let mut library_budget=None;
     let mut magic=[0;8];stream.read_exact(&mut magic)?;ensure!(&magic==MAGIC,"invalid live-copy stream magic");
@@ -150,16 +180,9 @@ pub fn receive(project:&Project,archive:&Path)->Result<LiveCopy> {
     ensure!(size<=MANIFEST_LIMIT,"live-copy manifest exceeds bounds");let mut json=vec![0;size];stream.read_exact(&mut json)?;
     let source:Source=serde_json::from_slice(&json)?;validate(&source)?;
     header_budget.check()?;
-    let parent=project.state_dir().join("live-copies");
-    let path=parent.join(format!(".stage-{}-{}",std::process::id(),SEQUENCE.fetch_add(1,Ordering::Relaxed)));
-    {let _lock=project.lock()?;real_dir(&project.state_dir())?;make_dir(&parent)?;
-        let inventory=fs::read_dir(&parent)?.take(STAGE_LIMIT).collect::<std::io::Result<Vec<_>>>()?;
-        ensure!(inventory.len()<STAGE_LIMIT,"live staging inventory is full; recover retained stages before receiving another copy");
-        fs::DirBuilder::new().mode(0o700).create(&path)?;
-    }
-    let staging=Staging(path);
+    let staging=reserve(project,"stage",0,control)?;
     for entry in entries(&source) {
-        let budget=if entry.path=="report.md" {&mut report_budget}else{&mut library_budget}.get_or_insert_with(Budget::new);budget.check()?;
+        let budget=if entry.path=="report.md" {&mut report_budget}else{&mut library_budget}.get_or_insert_with(||control.budget());budget.check()?;
         let path=staging.0.join(&entry.path);
         if entry.directory {fs::create_dir(&path)?;continue;}
         let mut file=OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
@@ -175,7 +198,7 @@ pub fn receive(project:&Project,archive:&Path)->Result<LiveCopy> {
     }
     File::open(&staging.0)?.sync_all()?;
     if let Some(budget)=library_budget.or(report_budget) {budget.check()?;}
-    Ok(LiveCopy{staging,source})
+    control.check()?;Ok(LiveCopy{staging,source})
 }
 
 #[cfg(test)]
@@ -183,6 +206,22 @@ mod tests {
     use super::*;
     fn roundtrip(project:&Project,path:&Path,archive:&Path)->LiveCopy {
         let mut bytes=Vec::new();export(path,&mut bytes).unwrap();fs::write(archive,bytes).unwrap();receive(project,archive).unwrap()
+    }
+    #[test]
+    fn download_reservation_counts_orphans_and_leaves_receive_capacity() {
+        let (root,project,record)=super::super::tests::fixture();let control=Control::default();
+        let parent=project.state_dir().join("live-copies");fs::create_dir(&parent).unwrap();
+        for n in 0..STAGE_LIMIT-2 {fs::create_dir(parent.join(format!("orphan-{n}"))).unwrap();}
+        let spool=Spool::reserve(&project,&control).unwrap();
+        assert!(Spool::reserve(&project,&control).is_err());
+        let mut bytes=Vec::new();export(Path::new(&record.thread_dir),&mut bytes).unwrap();fs::write(spool.path(),bytes).unwrap();
+        let staged=receive_controlled(&project,&spool.path(),&control).unwrap();
+        assert_eq!(fs::read_dir(&parent).unwrap().count(),STAGE_LIMIT);
+        let path=spool.path();drop(spool);assert!(!path.exists());
+        assert!(staged.staging.0.exists());drop(staged);
+        assert_eq!(fs::read_dir(&parent).unwrap().count(),STAGE_LIMIT-2);
+        control.cancellation.cancel();assert!(Spool::reserve(&project,&control).is_err());
+        assert!(root.path().exists());
     }
     #[test]
     fn live_partial_stream_preserves_binary_empty_directories_and_skips_links() {

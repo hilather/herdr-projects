@@ -10,54 +10,63 @@ fn eligible(project:&Project,guard:&ProjectGuard,t:&Thread)->Result<()> {
     ensure!(t.status==thread::Status::Open&&t.removal.is_none(),"thread is not eligible for live projection");
     thread::copy_delivery::validate(t)?;Ok(())
 }
-fn verify(path:&Path,source:&Source)->Result<()> {
-    validate(source)?;let root=Directory::open(path)?;
-    let mut report=Budget::new();let mut library=None;
+fn verify(path:&Path,source:&Source,control:&Control)->Result<()> {
+    control.check()?;validate(source)?;let root=Directory::open(path)?;
+    let mut report=control.budget();let mut library=None;
     for entry in entries(source) {
-        let budget=if entry.path=="report.md" {&mut report}else{library.get_or_insert_with(Budget::new)};
+        let budget=if entry.path=="report.md" {&mut report}else{library.get_or_insert_with(||control.budget())};
         budget.entry(entry.path.matches('/').count())?;
         if entry.directory {root.directory(Path::new(&entry.path))?;continue;}
         let (bytes,hash)=digest(root.file(Path::new(&entry.path))?,budget,None)?;
         ensure!(bytes==entry.bytes&&hash==entry.sha256,"retained live stage is corrupt");
     }
-    root.matches_path(path)?;Ok(())
+    root.matches_path(path)?;control.check()?;Ok(())
 }
-fn load_stage(project:&Project,id:&str,intent:&LiveCopyIntent)->Result<(PathBuf,Source)> {
-    thread::validate_id(id)?;intent.validate()?;
+fn load_stage(project:&Project,id:&str,intent:&LiveCopyIntent,control:&Control)->Result<(PathBuf,Source)> {
+    control.check()?;thread::validate_id(id)?;intent.validate()?;
     let path=project.state_dir().join("live-copies").join(intent.stage_name(id));
     let root=Directory::open(&path)?;let mut bytes=Vec::new();
     root.file(Path::new("manifest.json"))?.take(MANIFEST_LIMIT as u64+1).read_to_end(&mut bytes)?;
     ensure!(bytes.len()<=MANIFEST_LIMIT&&thread::sha256_hex(&bytes)==intent.stage_digest,"retained live manifest is missing or corrupt");
     let source:Source=serde_json::from_slice(&bytes)?;
     ensure!(source.report.as_ref().map(|e|e.sha256.as_str())==Some(intent.report_hash.as_str()),"live stage report mismatch");
-    verify(&path,&source)?;Ok((path,source))
+    verify(&path,&source,control)?;Ok((path,source))
 }
 
 impl LiveCopy {
     /// Caller has verified supervised sender success and supplies the frozen
     /// authority digest plus a current configuration/routing validation closure.
     #[allow(dead_code)]
-    pub fn publish(self,project:&Project,guard:&ProjectGuard,expected:&Thread,authority:&str,mut authorize:impl FnMut()->Result<()>)->Result<()> {
-        self.begin(project,guard,expected,authority,&mut authorize)?;
-        resume(project,guard,&expected.id,authority,authorize)
+    pub fn publish(self,project:&Project,guard:&ProjectGuard,expected:&Thread,authority:&str,authorize:impl FnMut()->Result<()>)->Result<()> {
+        self.publish_controlled(project,guard,expected,authority,&Control::default(),authorize)
     }
+    #[allow(dead_code)]
+    pub fn publish_controlled(self,project:&Project,guard:&ProjectGuard,expected:&Thread,authority:&str,control:&Control,mut authorize:impl FnMut()->Result<()>)->Result<()> {
+        self.begin_controlled(project,guard,expected,authority,control,&mut authorize)?;
+        resume_controlled(project,guard,&expected.id,authority,control,authorize)
+    }
+    #[cfg(test)]
     fn begin(self,project:&Project,guard:&ProjectGuard,expected:&Thread,authority:&str,authorize:&mut impl FnMut()->Result<()>)->Result<()> {
+        self.begin_controlled(project,guard,expected,authority,&Control::default(),authorize)
+    }
+    fn begin_controlled(self,project:&Project,guard:&ProjectGuard,expected:&Thread,authority:&str,control:&Control,authorize:&mut impl FnMut()->Result<()>)->Result<()> {
+        control.check()?;
         eligible(project,guard,expected)?;thread::copy_delivery::ready(expected)?;authorize()?;
         ensure!(self.staging.0.parent()==Some(project.state_dir().join("live-copies").as_path()),"live stage belongs to a different project");
-        verify(&self.staging.0,&self.source)?;
+        verify(&self.staging.0,&self.source,control)?;authorize()?;control.check()?;
         let bytes=serde_json::to_vec(&self.source)?;let digest=thread::sha256_hex(&bytes);
         let sequence=expected.live_copy_sequence.checked_add(1).context("live-copy sequence exhausted")?;
         let intent=LiveCopyIntent{sequence,execution:thread::execution_fingerprint(expected),authority:authority.into(),previous_hash:expected.report_hash.clone(),previous_receipt:expected.copy_receipt.clone(),report_hash:self.report_hash().context("live stage has no copied report")?.into(),stage_digest:digest};intent.validate()?;
         let mut manifest=OpenOptions::new().write(true).create_new(true).mode(0o600).open(self.staging.0.join("manifest.json"))?;
         manifest.write_all(&bytes)?;manifest.sync_all()?;File::open(&self.staging.0)?.sync_all()?;
         let parent=self.staging.0.parent().unwrap();let retained=parent.join(intent.stage_name(&expected.id));
-        if retained.try_exists()? {load_stage(project,&expected.id,&intent)?;}else {fs::rename(&self.staging.0,&retained)?;}
+        if retained.try_exists()? {load_stage(project,&expected.id,&intent,control)?;}else {fs::rename(&self.staging.0,&retained)?;}
         File::open(parent)?.sync_all()?;
         File::open(project.state_dir())?.sync_all()?;
         // Drop only removes the old temporary path. The retained stage is now
         // owned by the durable intent (or harmless orphan if this commit fails).
         thread::update_checked(project,&expected.id,|current| {
-            thread::copy_delivery::ready(current)?;eligible(project,guard,current)?;
+            control.check()?;thread::copy_delivery::ready(current)?;eligible(project,guard,current)?;
             ensure!(thread::execution_fingerprint(current)==intent.execution&&current.report_hash==intent.previous_hash
                 &&current.copy_receipt==intent.previous_receipt&&current.live_copy_sequence==expected.live_copy_sequence,"thread changed before live projection intent");
             current.live_copy_sequence=sequence;current.pending_live_copy=Some(intent.clone());Ok(())
@@ -71,52 +80,61 @@ fn check(project:&Project,guard:&ProjectGuard,id:&str,intent:&LiveCopyIntent,aut
         &&t.report_hash==intent.previous_hash&&t.copy_receipt==intent.previous_receipt&&authority==intent.authority,"live projection authority or execution changed; recovery refused");
     ensure!(t.pending_copy_notice.is_none()&&t.pending_review_notice.is_none(),"pending notice blocks live projection");Ok(t)
 }
-fn parent(root:&Directory,path:&Path)->Result<Directory> {
+fn parent(root:&Directory,path:&Path,control:&Control)->Result<Directory> {
     let mut current=root.directory(Path::new("."))?;
     for part in path.components() {
         let std::path::Component::Normal(name)=part else {anyhow::bail!("invalid projection path");};
-        current=current.create_dir(name)?;
+        control.check()?;current=current.create_dir(name)?;
     }
     Ok(current)
 }
 #[allow(dead_code)]
-pub fn resume(project:&Project,guard:&ProjectGuard,id:&str,authority:&str,mut authorize:impl FnMut()->Result<()>)->Result<()> {
-    resume_with(project,guard,id,authority,&mut authorize,||Ok(()))
+pub fn resume(project:&Project,guard:&ProjectGuard,id:&str,authority:&str,authorize:impl FnMut()->Result<()>)->Result<()> {
+    resume_controlled(project,guard,id,authority,&Control::default(),authorize)
 }
-fn resume_with(project:&Project,guard:&ProjectGuard,id:&str,authority:&str,authorize:&mut impl FnMut()->Result<()>,mut after_file:impl FnMut()->Result<()>)->Result<()> {
+#[allow(dead_code)]
+pub fn resume_controlled(project:&Project,guard:&ProjectGuard,id:&str,authority:&str,control:&Control,mut authorize:impl FnMut()->Result<()>)->Result<()> {
+    resume_with_control(project,guard,id,authority,control,&mut authorize,||Ok(()))
+}
+#[cfg(test)]
+fn resume_with(project:&Project,guard:&ProjectGuard,id:&str,authority:&str,authorize:&mut impl FnMut()->Result<()>,after_file:impl FnMut()->Result<()>)->Result<()> {
+    resume_with_control(project,guard,id,authority,&Control::default(),authorize,after_file)
+}
+fn resume_with_control(project:&Project,guard:&ProjectGuard,id:&str,authority:&str,control:&Control,authorize:&mut impl FnMut()->Result<()>,mut after_file:impl FnMut()->Result<()>)->Result<()> {
+    control.check()?;
     let t=thread::load(project,id)?;let intent=t.pending_live_copy.clone().context("no pending live projection")?;
     check(project,guard,id,&intent,authority)?;authorize()?;
-    let (stage_path,source)=load_stage(project,id,&intent)?;let stage=Directory::open(&stage_path)?;
+    let (stage_path,source)=load_stage(project,id,&intent,control)?;let stage=Directory::open(&stage_path)?;
     authorize()?;check(project,guard,id,&intent,authority)?;
     let project_root=Directory::open(&project.dir())?;
     // Library first, report last. A crash may expose a partial additive library,
     // but the durable intent remains until every included byte is published.
-    let mut library_budget=Budget::new();
+    let mut library_budget=control.budget();
     for entry in &source.library {
         library_budget.check()?;
         let relative=Path::new(&entry.path).strip_prefix("library")?;
         let base=project_root.create_dir(OsStr::new("library"))?.create_dir(OsStr::new(id))?;
-        if entry.directory {parent(&base,relative)?;continue;}
-        let destination=parent(&base,relative.parent().context("missing projection parent")?)?;
+        if entry.directory {parent(&base,relative,control)?;continue;}
+        let destination=parent(&base,relative.parent().context("missing projection parent")?,control)?;
         copy_entry(&stage,&destination,relative.file_name().unwrap(),entry,&mut library_budget)?;after_file()?;
     }
     let report=source.report.as_ref().context("live stage has no report")?;
     let reports=project_root.create_dir(OsStr::new("threads"))?;
-    copy_entry(&stage,&reports,OsStr::new(&format!("{id}.md")),report,&mut Budget::new())?;after_file()?;
-    verify_home(&project_root,id,&source)?;
+    copy_entry(&stage,&reports,OsStr::new(&format!("{id}.md")),report,&mut control.budget())?;after_file()?;
+    verify_home(&project_root,id,&source,control)?;
     project_root.matches_path(&project.dir())?;authorize()?;
     let current=check(project,guard,id,&intent,authority)?;
     let notes=render_notes(&source);
     let copied=thread::Copied{artifact_snapshot:None,outcome:if notes.is_empty(){thread::CopyOutcome::Complete}else{thread::CopyOutcome::Partial(notes)},report_hash:Some(intent.report_hash.clone())};
-    thread::copy_delivery::record_projection(project,&current,&copied,&intent)?;
+    control.check()?;thread::copy_delivery::record_projection(project,&current,&copied,&intent,control)?;
     File::open(project.dir().join("threads"))?.sync_all()?;
     fs::remove_dir_all(&stage_path)?;File::open(stage_path.parent().unwrap())?.sync_all()?;Ok(())
 }
-fn verify_home(root:&Directory,id:&str,source:&Source)->Result<()> {
-    let mut report=Budget::new();let mut library=None;
+fn verify_home(root:&Directory,id:&str,source:&Source,control:&Control)->Result<()> {
+    let mut report=control.budget();let mut library=None;
     for entry in entries(source) {
         let (path,budget)=if entry.path=="report.md" {(PathBuf::from(format!("threads/{id}.md")),&mut report)}
-            else {(Path::new("library").join(id).join(Path::new(&entry.path).strip_prefix("library")?),library.get_or_insert_with(Budget::new))};
+            else {(Path::new("library").join(id).join(Path::new(&entry.path).strip_prefix("library")?),library.get_or_insert_with(||control.budget()))};
         budget.check()?;
         if entry.directory {root.directory(&path)?;continue;}
         let (bytes,hash)=digest(root.file(&path)?,budget,None)?;
@@ -130,7 +148,7 @@ fn copy_entry(stage:&Directory,destination:&Directory,name:&OsStr,entry:&Entry,b
         let mut hash=Sha256::new();let mut bytes=0u64;let mut buffer=[0;64*1024];
         loop {let n=budget.read(&mut source,&mut buffer)?;if n==0{break;}bytes+=n as u64;hash.update(&buffer[..n]);target.write_all(&buffer[..n])?;}
         crate::source_tree::unchanged(&source,&before)?;
-        ensure!(bytes==entry.bytes&&format!("{:x}",hash.finalize())==entry.sha256,"live stage changed during publication");Ok(())
+        ensure!(bytes==entry.bytes&&format!("{:x}",hash.finalize())==entry.sha256,"live stage changed during publication");budget.check()?;Ok(())
     })?;budget.check()?;Ok(())
 }
 
@@ -144,6 +162,41 @@ mod tests {
         fs::write(thread::home_report_path(&project,&t.id),b"old").unwrap();
         let mut bytes=Vec::new();export(Path::new(&t.thread_dir),&mut bytes).unwrap();let archive=root.path().join("archive");fs::write(&archive,bytes).unwrap();let staged=receive(&project,&archive).unwrap();
         (root,project,t,staged)
+    }
+    #[test]
+    fn cancelled_or_expired_copy_cannot_create_intent_or_receive() {
+        for expired in [false,true] {
+            let (root,project,t,staged)=fixture();let guard=ProjectGuard::acquire(&project.dir()).unwrap();
+            let mut control=Control::default();
+            if expired {control.deadline=std::time::Instant::now();}else{control.cancellation.cancel();}
+            assert!(receive_controlled(&project,&root.path().join("archive"),&control).is_err());
+            assert!(staged.publish_controlled(&project,&guard,&t,AUTHORITY,&control,||Ok(())).is_err());
+            assert_eq!(thread::load(&project,&t.id).unwrap(),t);
+            assert_eq!(fs::read(thread::home_report_path(&project,&t.id)).unwrap(),b"old");
+        }
+    }
+    #[test]
+    fn cancellation_during_publication_preserves_exact_recovery_stage() {
+        let (_root,project,t,staged)=fixture();let guard=ProjectGuard::acquire(&project.dir()).unwrap();
+        staged.begin(&project,&guard,&t,AUTHORITY,&mut ||Ok(())).unwrap();
+        let control=Control::default();
+        assert!(resume_with_control(&project,&guard,&t.id,AUTHORITY,&control,&mut ||Ok(()),||{control.cancellation.cancel();Ok(())}).is_err());
+        let pending=thread::load(&project,&t.id).unwrap();assert!(pending.pending_live_copy.is_some());assert_eq!(pending.report_hash,t.report_hash);
+        assert_eq!(fs::read(thread::home_report_path(&project,&t.id)).unwrap(),b"old");
+        fs::remove_dir_all(&t.thread_dir).unwrap();
+        resume(&project,&guard,&t.id,AUTHORITY,||Ok(())).unwrap();
+        assert!(thread::load(&project,&t.id).unwrap().pending_live_copy.is_none());
+    }
+    #[test]
+    fn cancellation_at_final_authorization_prevents_receipt_commit() {
+        let (_root,project,t,staged)=fixture();let guard=ProjectGuard::acquire(&project.dir()).unwrap();
+        staged.begin(&project,&guard,&t,AUTHORITY,&mut ||Ok(())).unwrap();
+        let control=Control::default();let mut calls=0;
+        assert!(resume_controlled(&project,&guard,&t.id,AUTHORITY,&control,||{calls+=1;if calls==3 {control.cancellation.cancel();}Ok(())}).is_err());
+        assert_eq!(fs::read(thread::home_report_path(&project,&t.id)).unwrap(),b"report\0\xff");
+        let pending=thread::load(&project,&t.id).unwrap();assert!(pending.pending_live_copy.is_some());assert_eq!(pending.report_hash,t.report_hash);
+        resume(&project,&guard,&t.id,AUTHORITY,||Ok(())).unwrap();
+        assert!(thread::load(&project,&t.id).unwrap().pending_live_copy.is_none());
     }
     #[test]
     fn additive_projection_is_durable_and_never_becomes_cleanup_evidence() {

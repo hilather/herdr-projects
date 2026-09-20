@@ -16,6 +16,21 @@ impl std::fmt::Display for Limit {
 impl std::error::Error for Limit {}
 #[derive(Debug,PartialEq)]
 pub enum NodeKind { File, Directory, Link, Other }
+/// Original admission deadline and cancellation shared by every copy phase.
+pub struct Control {pub deadline:Instant,pub cancellation:Cancellation}
+impl Default for Control {
+    fn default()->Self {Self{deadline:Instant::now()+Duration::from_secs(180),cancellation:Cancellation::default()}}
+}
+impl Control {
+    pub fn check(&self)->Result<()> {
+        ensure!(!self.cancellation.is_cancelled(),"live copy cancelled");
+        ensure!(Instant::now()<self.deadline,"live copy deadline elapsed");Ok(())
+    }
+    pub fn budget(&self)->Budget {
+        let mut budget=Budget::new();budget.deadline=budget.deadline.min(self.deadline);
+        budget.cancellation=self.cancellation.clone();budget
+    }
+}
 pub struct Budget {remaining:u64,entries:usize,pub deadline:Instant,pub cancellation:Cancellation}
 impl Budget {
     pub fn new()->Self {Self{remaining:BYTE_LIMIT,entries:ENTRY_LIMIT,deadline:Instant::now()+Duration::from_secs(10),cancellation:Cancellation::default()}}

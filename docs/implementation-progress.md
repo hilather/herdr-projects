@@ -1329,3 +1329,31 @@ fixture verifies refusal, respecting redacted inspector diagnostics.
 All 503 tests pass in debug and release (165 library, 306 binary, 30 CLI, two
 contracts), and the default-feature suite passes. Three optional live checks remain
 ignored. Logs: `/tmp/herdr-live-projection-{debug,release,default}.log`.
+
+
+## W04 live-copy cancellation and transport reservation
+
+Live receive and guarded publication now accept one control object carrying the
+original admission deadline and cancellation token. Each section's read budget is
+capped by that deadline; verification, destination publication, intent creation and
+receipt persistence check cancellation. The receipt check also runs under the short
+record lock. A cancelled partial publication retains its exact intent and bytes for
+recovery. These are cooperative filesystem checks, not interruption of blocked
+filesystem syscalls.
+
+A temporary download spool now reserves space in the same bounded 16-entry inventory
+before transport, leaving one slot for extraction. Abandoned downloads therefore
+count alongside retained stages. Dropping a spool removes only its own temporary
+path; it cannot remove an intent-owned recovery stage. This API is groundwork for
+the supervised worker; automatic copy dispatch remains disabled.
+
+Independent review approved the increment and independently passed all 16 live-copy
+fixtures. Four new fixtures cover pre-effect cancellation/expiry, cancellation during
+publication and immediately before receipt commit, exact-stage recovery, and shared
+spool/stage capacity with temporary ownership cleanup. Card counts remain 16 locally
+implemented, five partial and 20 not started; macOS remains untested.
+
+All 507 tests pass in debug and release (165 library, 310 binary, 30 CLI, two
+contracts). The default-feature suite passes (29 library, 263 binary, 11 CLI, two
+contracts). Three optional live checks remain ignored. Logs:
+`/tmp/herdr-live-control-{debug,release,default}.log`.

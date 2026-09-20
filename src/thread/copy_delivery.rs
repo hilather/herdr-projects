@@ -25,12 +25,12 @@ fn ready_for(t:&Thread,intent:Option<&herdr_projects::live_copy_intent::LiveCopy
 }
 
 pub fn record(project: &Project, expected: &Thread, copied: &Copied) -> Result<()> {
-    record_inner(project,expected,copied,None)
+    record_inner(project,expected,copied,None,None)
 }
-pub(crate) fn record_projection(project:&Project,expected:&Thread,copied:&Copied,intent:&herdr_projects::live_copy_intent::LiveCopyIntent)->Result<()> {
-    record_inner(project,expected,copied,Some(intent))
+pub(crate) fn record_projection(project:&Project,expected:&Thread,copied:&Copied,intent:&herdr_projects::live_copy_intent::LiveCopyIntent,control:&crate::source_tree::Control)->Result<()> {
+    record_inner(project,expected,copied,Some(intent),Some(control))
 }
-fn record_inner(project:&Project,expected:&Thread,copied:&Copied,intent:Option<&herdr_projects::live_copy_intent::LiveCopyIntent>)->Result<()> {
+fn record_inner(project:&Project,expected:&Thread,copied:&Copied,intent:Option<&herdr_projects::live_copy_intent::LiveCopyIntent>,control:Option<&crate::source_tree::Control>)->Result<()> {
     ready_for(expected,intent)?;
     anyhow::ensure!(expected.status == Status::Open && expected.removal.is_none(), "thread is not eligible for a live copy receipt");
     let notes = match &copied.outcome {
@@ -45,6 +45,7 @@ fn record_inner(project:&Project,expected:&Thread,copied:&Copied,intent:Option<&
             &&intent.previous_receipt==expected.copy_receipt&&&intent.report_hash==hash,"live projection receipt does not match its intent");
     }
     update_checked(project, &expected.id, |current| {
+        if let Some(control)=control {control.check()?;}
         ready_for(current,intent)?;
         anyhow::ensure!(current.status == Status::Open && current.removal.is_none()
             && execution_fingerprint(current) == execution && current.report_hash == expected.report_hash

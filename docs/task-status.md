@@ -52,7 +52,10 @@ has an audited CLI. Production launch preparation/dispatch and termination remai
 unavailable. T04.2 now uses monotonic remote poll/retry deadlines and pass-start
 scheduling plus a shared bounded executor for asynchronous PR and remote observations;
 automatic routines now share that executor. Artifact work and remaining guarded
-effects still need isolation. T04.3 now fences legacy
+effects still need isolation. Live transfers now have bounded private staging,
+recoverable guarded publication, cancellation/deadline checks through receipt commit,
+and pre-transport spool reservation. The supervised copy worker and automatic
+admission remain next. T04.3 now fences legacy
 launch arguments by explicit agent kind and provides redacted [named profile inspection](profiles.md);
 explicit local version probes for Claude/Codex are available. Launch selection,
 production profile resolution and verified capability evidence remain. Version-2
