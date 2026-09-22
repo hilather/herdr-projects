@@ -36,8 +36,13 @@ pub struct LaunchInputs {
     pub budget:Option<VersionedReference>,
 }
 /// Only trusted in-crate preparation producers can construct this capability.
-/// There is deliberately no deserializer or CLI constructor. W04.3/W04.5 supply
-/// the production producer; until then only transaction fixtures construct it.
+/// The launch preparation service derives these inputs from a live profile proof
+/// and canonical task, knowledge, repository and approval state. Raw JSON cannot
+/// supply this capability.
+/// ```compile_fail
+/// use herdr_projects::domain::PreparedLaunch;
+/// let _: PreparedLaunch = serde_json::from_str("{}").unwrap();
+/// ```
 #[derive(Debug,Clone)]
 pub struct PreparedLaunch {pub(crate) inputs:LaunchInputs}
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]

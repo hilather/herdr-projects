@@ -689,6 +689,9 @@ fn remove_worktree(ctx: &Ctx, project: &Project, record: &Thread, writers_stoppe
     }
     // Read every record explicitly: malformed references cannot be treated as
     // evidence that ownership is exclusive.
+    #[cfg(feature="state-store")]
+    crate::runtime_ownership::check_worktree_references(ctx,&project.dir(),&current.id,&worktree)?;
+    #[cfg(not(feature="state-store"))]
     for slug in project::list_slugs(&ctx.root) {
         let owner = Project::load(&ctx.root, &slug)?;
         for entry in std::fs::read_dir(owner.dir().join("threads"))? {

@@ -3,6 +3,30 @@ use super::{MemoryError, MemoryStore};
 use crate::domain::*;
 
 impl MemoryStore {
+    /// Select knowledge inside the final worker prompt envelope, reserving room
+    /// for the versioned protocol and attempt/snapshot identity framing.
+    pub fn create_worker_snapshot(
+        &mut self,
+        request: SnapshotRequest,
+        profile_name: &str,
+        profile_digest: &str,
+        config_digest: Option<&str>,
+        budget_chars: u64,
+        instructions: &str,
+        now_unix_ms: i64,
+        expected_heads_digest: Option<&str>,
+    ) -> Result<MemorySnapshot, MemoryError> {
+        if request.task_id == "coordinator" {
+            return Err(MemoryError::Invalid("task_id coordinator is reserved".into()));
+        }
+        self.store.create_memory_snapshot(SnapshotPlan {
+            coordinator: false, session_id: None, request, profile_name: profile_name.into(),
+            profile_digest: profile_digest.into(), config_digest: config_digest.map(str::to_owned),
+            budget_chars, estimator: super::WORKER_BRIEF_ESTIMATOR.into(), instructions: instructions.into(),
+            now_unix_ms, expected_heads_digest: expected_heads_digest.map(str::to_owned),
+        }).map_err(map_snapshot_err)
+    }
+
     pub fn create_task_snapshot(
         &mut self,
         request: SnapshotRequest,
@@ -95,6 +119,21 @@ mod tests {
         SnapshotRequest{schema_version:1,task_id:"task-ui".into(),profile:"implementation".into(),
             domains:domains.iter().map(|d|d.to_string()).collect(),paths:vec![],
             pinned_keys:pins.iter().map(|p|p.to_string()).collect(),sensitivity:"default".into()}
+    }
+    #[test]
+    fn worker_selection_reserves_framing_before_optional_memory() {
+        let (_root,mut memory)=fixture();
+        put(&mut memory,"ui-note",MemoryKind::Observation,&["ui"],b"optional context");
+        let plain=memory.create_task_snapshot(request(&["ui"],&[]),"implementation",&digest(),None,32000,"Required instructions",1000,None).unwrap();
+        let worker=memory.create_worker_snapshot(request(&["ui"],&[]),"implementation",&digest(),None,32000,"Required instructions",1000,None).unwrap();
+        assert_ne!(plain.id,worker.id);
+        assert_eq!(worker.required_bytes,plain.required_bytes+crate::memory::worker_brief_framing_chars(_root.path().join("state.db").to_str().unwrap()).unwrap());
+        assert_eq!(worker.estimator,crate::memory::WORKER_BRIEF_ESTIMATOR);
+        assert!(memory.create_worker_snapshot(request(&["ui"],&[]),"implementation",&digest(),None,worker.required_bytes-1,"Required instructions",1000,None).is_err());
+        let exact=memory.create_worker_snapshot(request(&["ui"],&[]),"implementation",&digest(),None,worker.required_bytes,"Required instructions",1000,None).unwrap();
+        assert_eq!(exact.optional_bytes,0);
+        assert_eq!(exact.omitted_optional_count,1);
+        assert_eq!(exact.budget_bytes,worker.required_bytes);
     }
     #[test]
     fn same_inputs_reuse_manifest_and_unrelated_domain_is_excluded() {

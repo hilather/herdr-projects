@@ -66,10 +66,20 @@ fn idle_managed_panes_and_adopted_references_block_cleanup() {
             *world.panes.borrow_mut() = format!("[{pane}]");
         }
         let error = threads::resolve(&world.ctx(), "demo", &record.id, &ResolveArgs { remove_worktree: true, ..Default::default() }).unwrap_err();
-        assert!(error.to_string().contains(if shared { "shared/adopted" } else { "managed pane" }), "{error:#}");
+        let expected = if !shared {
+            "managed pane"
+        } else if cfg!(feature = "state-store") {
+            "resource is already referenced by other/thread:t-0001"
+        } else {
+            "shared/adopted"
+        };
+        assert!(error.to_string().contains(expected), "{error:#}");
         assert_eq!(world.runner.count("worktree remove"), 0);
         assert!(work.path().exists());
-        assert_eq!(thread::load(&project, &record.id).unwrap().status, Status::Open);
+        let current = thread::load(&project, &record.id).unwrap();
+        assert_eq!(current.status, Status::Open);
+        assert_eq!(std::fs::read(Path::new(&record.thread_dir).join("report.md")).unwrap(), b"preserve this report");
+        crate::artifacts::load(&project, &current, &current.artifact_snapshot).unwrap();
     }
 }
 

@@ -7,6 +7,8 @@ Schema v12 requires new reservations to retain validated [frozen profile evidenc
 in version-2 inputs, while preserving historical version-1 records byte-for-byte.
 Schema v13 adds [durable scoped approvals](authority.md) and consumes one grant with
 each launch claim; neither a reservation nor a parsed approval is permission to run.
+The [canonical worker launch checklist](canonical-worker-launch.md) separates
+implemented safeguards from the remaining production adapter and lifecycle work.
 Use `migration PROJECT upgrade-store` for an older published store. Old exports
 remain unchanged. Fresh/updated policy starts at zero workers until explicitly set;
 legacy advisory limits are not silently promoted into execution authority.
@@ -237,3 +239,21 @@ This service is tested but not yet connected to ticker copy publication. Integra
 still needs bounded source traversal, stale execution/route fencing, durable partial
 copy notes, retry preservation after library failure, and root admission fairness
 between copy and routine jobs. Existing copy paths remain synchronous in this increment.
+
+
+### Canonical worker root admission (2026-09-22)
+
+Canonical launch and worker effects require exclusive root ownership. Ticker now
+waits for the entire canonical observation batch to drain before admitting one,
+then gives maintenance a batch after that effect finishes. New observations are
+not admitted while an exclusive effect is pending. This avoids cross-project
+shared-lock contention without weakening the worker's ownership checks.
+
+Queued/admitted canonical work receives a 250 ms ticker interval so staged launch
+transitions do not spend their original 30-second claim waiting on 15-second idle
+polls. Launch retry backoff remains one second. Successful termination and observation-only resource recovery checks
+cool down for 15 seconds; cooled-down checks alone do not trigger fast polling.
+Resource recovery has a distinct volatile queue key from launch advancement, so
+its cooldown cannot delay advancement under an original live claim.
+Idle and legacy-only polling retain the normal 15-second interval. All queues and
+cooldowns remain volatile hints, reconstructed from durable state after restart.

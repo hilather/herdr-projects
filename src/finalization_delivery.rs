@@ -46,15 +46,34 @@ pub(crate) fn save_receipt_authorized(project:&Project,op:&Operation,receipt:&Fi
     fs::hard_link(&temp,&path)?;fs::remove_file(&temp)?;File::open(parent)?.sync_all()?;File::open(project.state_dir())?.sync_all()?;control.check()
 }
 
+#[cfg(target_os="linux")]
+pub(crate) fn preserved_outputs(path:&Path,binding:&str,control:&Control)->Result<Option<herdr_projects::worktree_preservation::VerifiedOutputs>> {
+    control.check()?;let state=runtime::snapshot(path)?;
+    let binding=state.runtime_bindings.iter().find(|b|b.id==binding).context("output binding missing")?;
+    herdr_projects::worktree_preservation::load_binding_outputs(path,&state,binding,&herdr_projects::source_tree::Control{deadline:control.deadline,cancellation:control.cancellation.clone()})
+}
+
 pub fn enqueue(ctx:&Ctx,path:&Path,binding:&str,head:u64,reason:String)->Result<Operation> {
     let path=path.canonicalize()?;let snapshot=runtime::snapshot(&path)?;ensure!(snapshot.head==head,"project head changed");
     let binding=snapshot.runtime_bindings.iter().find(|b|b.id==binding).context("runtime binding not found")?;
     ensure!(binding.identity.machine.is_empty()&&Path::new(&binding.identity.thread_dir).is_absolute(),"finalization requires a recorded local source");
-    ensure!(fs::canonicalize(&binding.identity.thread_dir)?==Path::new(&binding.identity.thread_dir),"artifact source must be its canonical recorded path");
-    let bytes=migration::read_plan_file(&Path::new(&binding.identity.thread_dir).join("report.md"))?;
-    let payload=Finalization{authority:"operator.artifact_finalization".into(),binding:binding.id.clone(),binding_revision:binding.revision,control_epoch:snapshot.control.as_ref().context("upgrade-store required")?.epoch,config:crate::notification_delivery::config(ctx,&path)?,source:binding.identity.thread_dir.clone(),report_hash:digest(&bytes),reason};
+    #[cfg(target_os="linux")]
+    let retained=preserved_outputs(&path,&binding.id,&Control::default())?;
+    #[cfg(target_os="linux")]
+    let report_hash=if let Some(outputs)=retained {outputs.report_hash().context("preserved output has no report")?.to_owned()}else{source_report_hash(binding)?};
+    #[cfg(not(target_os="linux"))]
+    let report_hash=source_report_hash(binding)?;
+    let payload=Finalization{authority:"operator.artifact_finalization".into(),binding:binding.id.clone(),binding_revision:binding.revision,control_epoch:snapshot.control.as_ref().context("upgrade-store required")?.epoch,config:crate::notification_delivery::config(ctx,&path)?,source:binding.identity.thread_dir.clone(),report_hash,reason};
     let op=payload.operation(&snapshot,jiff::Timestamp::now().as_millisecond())?;
     runtime::enqueue_finalization(&path,head,op)
+}
+fn source_report_hash(binding:&herdr_projects::domain::RuntimeBinding)->Result<String> {
+    ensure!(fs::canonicalize(&binding.identity.thread_dir)?==Path::new(&binding.identity.thread_dir),"artifact source must be its canonical recorded path");
+    Ok(digest(&migration::read_plan_file(&Path::new(&binding.identity.thread_dir).join("report.md"))?))
+}
+fn capture_original(project:&Project,payload:&Finalization,control:&Control,authorize:impl FnMut()->Result<()>)->Result<artifacts::Snapshot> {
+    ensure!(fs::canonicalize(&payload.source)?==Path::new(&payload.source),"artifact source identity changed before capture");
+    artifacts::capture_canonical_controlled(project,&record(payload),control,None,authorize)
 }
 struct Adapter<'a,'b> {ctx:&'a Ctx<'b>,path:PathBuf}
 struct Prepared<'a,'b> {ctx:&'a Ctx<'b>,path:PathBuf,project:Project,payload:Finalization,control:Control,_lease:cleanup::Lease}
@@ -75,8 +94,14 @@ impl PreparedDelivery for Prepared<'_,'_> {
     fn deliver(&mut self,op:&Operation,claim:&Claim)->Result<Outcome> {
         let authorize=||{ensure!(claim.lease_until_ms>jiff::Timestamp::now().as_millisecond(),"finalization claim lease elapsed");self.validate_current(op)};
         authorize()?;let receipt=if let Some(receipt)=load_receipt_controlled(&self.project,op,&self.payload,&self.control)? {receipt}else{
-            ensure!(fs::canonicalize(&self.payload.source)?==Path::new(&self.payload.source),"artifact source identity changed before capture");
-            let snapshot=artifacts::capture_canonical_controlled(&self.project,&record(&self.payload),&self.control,None,authorize)?;
+            #[cfg(target_os="linux")]
+            let outputs=preserved_outputs(&self.path,&self.payload.binding,&self.control)?;
+            #[cfg(target_os="linux")]
+            let snapshot=if let Some(outputs)=outputs {
+                artifacts::capture_preserved_outputs(&self.project,&record(&self.payload),&outputs,&self.control,authorize)?
+            }else{capture_original(&self.project,&self.payload,&self.control,authorize)?};
+            #[cfg(not(target_os="linux"))]
+            let snapshot=capture_original(&self.project,&self.payload,&self.control,authorize)?;
             ensure!(snapshot.manifest.matches_canonical_execution(&record(&self.payload)),"captured manifest execution identity mismatch");
             ensure!(snapshot.manifest.report_hash()==Some(self.payload.report_hash.as_str()),"report changed after finalization was requested; snapshot retained but no completion receipt written");
             let receipt=FinalizationReceipt{operation_hash:digest(&serde_json::to_vec(op)?),artifact_key:self.payload.artifact_key(),snapshot:snapshot.id,report_hash:self.payload.report_hash.clone(),binding_revision:self.payload.binding_revision};
@@ -208,4 +233,23 @@ pub(crate) mod tests {
             }
         }
     }
+    #[test]
+    fn cancelled_task_artifacts_are_preserved_without_reviving_the_task() {
+        let(world,path,old)=fixture();let mut db=migration::open_active(&path).unwrap();
+        let state=db.read_snapshot(None).unwrap();let mut task=state.tasks.iter().find(|t|Some(&t.id)==old.task.as_ref()).unwrap().clone();
+        let revision=task.revision;task.revision+=1;task.state=TaskState::Cancelled;
+        db.commit(Commit{expected_head:state.head,mutations:vec![Mutation::Task{expected:Some(revision),next:task.clone()}]}).unwrap();
+        let before=db.read_snapshot(None).unwrap();
+        let op=enqueue(&world.ctx(),&path,&old.target,before.head,"retain aborted report".into()).unwrap();
+        let result=deliver(&world.ctx(),&path,&op.id,1).unwrap();
+        assert!(matches!(result,DispatchResult::Recorded(ref d) if d.state==DeliveryState::Confirmed));
+        let after=db.read_snapshot(None).unwrap();assert_eq!(after.tasks.iter().find(|t|t.id==task.id).unwrap(),&task);
+        let payload=Finalization::decode(&op).unwrap();
+        let receipt=load_receipt(&project(&path).unwrap(),&op,&payload).unwrap().unwrap();
+        let root=path.join(".state/canonical-artifacts").join(payload.artifact_key()).join(receipt.snapshot);
+        assert_eq!(fs::read(root.join("report.md")).unwrap(),b"report for review\n");
+        assert_eq!(fs::read(root.join("library/artifact")).unwrap(),b"preserved bytes");
+        assert!(after.events.iter().any(|e|e.kind=="runtime.artifacts_finalized"&&e.entity==old.target));
+    }
+
 }

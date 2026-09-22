@@ -1,0 +1,347 @@
+diff --git i/src/api/mod.rs w/src/api/mod.rs
+index d28a82a..e909aae 100644
+--- i/src/api/mod.rs
++++ w/src/api/mod.rs
+@@ -29,6 +29,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
+             | Method::ReleaseNotesDismiss(_)
+             | Method::CommandInvoke(_)
+             | Method::WorkspaceCreate(_)
++            | Method::WorkspaceCreateCommand(_)
+             | Method::WorkspaceFocus(_)
+             | Method::WorkspaceRename(_)
+             | Method::WorkspaceMove(_)
+diff --git i/src/api/schema.rs w/src/api/schema.rs
+index 7c58fb6..1cd35de 100644
+--- i/src/api/schema.rs
++++ w/src/api/schema.rs
+@@ -75,6 +75,8 @@ pub enum Method {
+     SessionSnapshot(EmptyParams),
+     #[serde(rename = "workspace.create")]
+     WorkspaceCreate(WorkspaceCreateParams),
++    #[serde(rename = "workspace.create_command")]
++    WorkspaceCreateCommand(WorkspaceCreateCommandParams),
+     #[serde(rename = "workspace.list")]
+     WorkspaceList(EmptyParams),
+     #[serde(rename = "workspace.get")]
+diff --git i/src/api/schema/server.rs w/src/api/schema/server.rs
+index b274bc9..e20f980 100644
+--- i/src/api/schema/server.rs
++++ w/src/api/schema/server.rs
+@@ -15,6 +15,9 @@ pub struct ServerLiveHandoffParams {
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+ pub struct ServerCapabilities {
++    /// Supports literal first-pane execution through workspace.create_command.
++    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
++    pub workspace_create_command: bool,
+     pub live_handoff: bool,
+     #[serde(default)]
+     pub detached_server_daemon: bool,
+diff --git i/src/api/schema/tests.rs w/src/api/schema/tests.rs
+index d51c565..7661866 100644
+--- i/src/api/schema/tests.rs
++++ w/src/api/schema/tests.rs
+@@ -721,6 +721,7 @@ fn success_response_round_trips() {
+             version: "0.1.2".into(),
+             protocol: 6,
+             capabilities: Some(ServerCapabilities {
++                workspace_create_command: false,
+                 live_handoff: true,
+                 detached_server_daemon: true,
+                 endpoint_protocol_generation: Some(1),
+@@ -1456,3 +1457,25 @@ fn pane_link_resolve_round_trips() {
+         result
+     );
+ }
++
++#[test]
++fn workspace_create_command_is_a_distinct_literal_method() {
++    let json = serde_json::json!({"id":"create-command", "method":"workspace.create_command",
++        "params":{"cwd":"/tmp", "command":["/usr/bin/sleep", "1"], "focus":false}});
++    let request: Request = serde_json::from_value(json.clone()).unwrap();
++    assert!(matches!(request.method, Method::WorkspaceCreateCommand(_)));
++    assert_eq!(serde_json::to_value(&request).unwrap(), json);
++    let mut invalid = json;
++    invalid["params"].as_object_mut().unwrap().remove("command");
++    assert!(serde_json::from_value::<Request>(invalid).is_err());
++}
++
++#[test]
++fn workspace_command_capability_is_optional_and_explicit() {
++    let old=serde_json::json!({"live_handoff":false});
++    let mut caps:ServerCapabilities=serde_json::from_value(old).unwrap();
++    assert!(!caps.workspace_create_command);
++    assert!(serde_json::to_value(&caps).unwrap().get("workspace_create_command").is_none());
++    caps.workspace_create_command=true;
++    assert_eq!(serde_json::to_value(caps).unwrap()["workspace_create_command"],true);
++}
+diff --git i/src/api/schema/workspaces.rs w/src/api/schema/workspaces.rs
+index 1b7132c..bd6a723 100644
+--- i/src/api/schema/workspaces.rs
++++ w/src/api/schema/workspaces.rs
+@@ -19,6 +19,21 @@ pub struct WorkspaceCreateParams {
+     pub env: HashMap<String, String>,
+ }
+ 
++/// Literal first-pane execution. A distinct method prevents older servers from
++/// silently dropping the command and starting their configured shell instead.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
++#[serde(deny_unknown_fields)]
++pub struct WorkspaceCreateCommandParams {
++    pub cwd: String,
++    pub command: Vec<String>,
++    #[serde(default)]
++    pub focus: bool,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub label: Option<String>,
++    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
++    pub env: HashMap<String, String>,
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+ pub struct WorkspaceCloseParams {
+     pub workspace_id: String,
+diff --git i/src/api/server.rs w/src/api/server.rs
+index ea7597e..4901878 100644
+--- i/src/api/server.rs
++++ w/src/api/server.rs
+@@ -66,6 +66,7 @@ pub(crate) fn start_server_with_stop_control(
+ 
+ fn default_capabilities() -> Option<ServerCapabilities> {
+     Some(ServerCapabilities {
++        workspace_create_command: true,
+         live_handoff: crate::platform::capabilities().live_handoff,
+         detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
+         endpoint_protocol_generation: Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION),
+@@ -399,6 +400,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
+         Method::ClientShellSurfaceSet(_) => "client_shell.surface.set",
+         Method::SessionSnapshot(_) => "session.snapshot",
+         Method::WorkspaceCreate(_) => "workspace.create",
++        Method::WorkspaceCreateCommand(_) => "workspace.create_command",
+         Method::WorkspaceList(_) => "workspace.list",
+         Method::WorkspaceGet(_) => "workspace.get",
+         Method::WorkspaceFocus(_) => "workspace.focus",
+@@ -1143,6 +1145,7 @@ mod tests {
+             },
+             &tx,
+             Some(ServerCapabilities {
++                workspace_create_command: false,
+                 live_handoff: true,
+                 detached_server_daemon: true,
+                 endpoint_protocol_generation: Some(
+diff --git i/src/app/api.rs w/src/app/api.rs
+index 1270fef..fb3295c 100644
+--- i/src/app/api.rs
++++ w/src/app/api.rs
+@@ -1007,6 +1007,9 @@ impl App {
+             Method::SessionSnapshot(_) => return self.handle_session_snapshot(request.id),
+             Method::WorkspaceList(_) => return self.handle_workspace_list(request.id),
+             Method::WorkspaceGet(target) => return self.handle_workspace_get(request.id, target),
++            Method::WorkspaceCreateCommand(params) => {
++                return self.handle_workspace_create_command(request.id, params);
++            }
+             Method::WorkspaceCreate(params) => {
+                 return self.handle_workspace_create(request.id, params);
+             }
+diff --git i/src/app/api/workspaces.rs w/src/app/api/workspaces.rs
+index 9b125e5..63a4e59 100644
+--- i/src/app/api/workspaces.rs
++++ w/src/app/api/workspaces.rs
+@@ -84,6 +84,45 @@ impl App {
+         }
+     }
+ 
++    pub(super) fn handle_workspace_create_command(
++        &mut self,
++        id: String,
++        params: crate::api::schema::WorkspaceCreateCommandParams,
++    ) -> String {
++        if let Err(message) = validate_workspace_command(&params) {
++            return encode_error(id, "invalid_workspace_command", message);
++        }
++        let extra_env = match super::env::normalize_launch_env(params.env) {
++            Ok(env) => env,
++            Err((code, message)) => return encode_error(id, &code, message),
++        };
++        match self.create_workspace_with_command(
++            PathBuf::from(params.cwd),
++            params.focus,
++            extra_env,
++            Some(&params.command),
++        ) {
++            Ok(index) => {
++                if let Some(label) = params.label {
++                    if let Some(workspace) = self.state.workspaces.get_mut(index) {
++                        workspace.set_custom_name(label);
++                        crate::logging::workspace_renamed(&workspace.id);
++                    }
++                }
++                self.emit_workspace_open_events(index);
++                match self.workspace_created_result(index) {
++                    Some(result) => encode_success(id, result),
++                    None => encode_error(
++                        id,
++                        "workspace_create_failed",
++                        "created workspace unavailable",
++                    ),
++                }
++            }
++            Err(error) => encode_error(id, "workspace_create_failed", error.to_string()),
++        }
++    }
++
+     pub(super) fn handle_workspace_focus(&mut self, id: String, target: WorkspaceTarget) -> String {
+         let Some(index) = self.parse_workspace_id(&target.workspace_id) else {
+             return workspace_not_found(id, &target.workspace_id);
+@@ -987,3 +1026,57 @@ mod tests {
+         assert!(event_hub.events_after(0).is_empty());
+     }
+ }
++
++fn validate_workspace_command(
++    params: &crate::api::schema::WorkspaceCreateCommandParams,
++) -> Result<(), &'static str> {
++    if !std::path::Path::new(&params.cwd).is_absolute()
++        || params.cwd.len() > 4096
++        || params.cwd.contains('\0')
++    {
++        return Err("workspace command requires an absolute bounded working directory");
++    }
++    if params.command.is_empty()
++        || params.command.len() > 160
++        || !std::path::Path::new(&params.command[0]).is_absolute()
++        || params.command.iter().any(|arg| arg.contains('\0'))
++        || params.command.iter().map(String::len).sum::<usize>() > 65536
++    {
++        return Err(
++            "workspace command requires bounded literal arguments and an absolute executable",
++        );
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod workspace_command_tests {
++    use super::*;
++    #[test]
++    fn workspace_command_requires_explicit_execution_and_never_falls_back_to_shell() {
++        let mut params = crate::api::schema::WorkspaceCreateCommandParams {
++            cwd: std::env::temp_dir().display().to_string(),
++            command: vec![
++                std::env::current_exe().unwrap().display().to_string(),
++                "literal ' $(not-a-command)".into(),
++            ],
++            focus: false,
++            label: None,
++            env: Default::default(),
++        };
++        assert!(validate_workspace_command(&params).is_ok());
++        let args = params.command.clone();
++        for invalid in [
++            vec![],
++            vec!["relative".into()],
++            vec![args[0].clone(), "bad\0argument".into()],
++            vec![args[0].clone(); 161],
++        ] {
++            params.command = invalid;
++            assert!(validate_workspace_command(&params).is_err());
++        }
++        params.command = args;
++        params.cwd = "relative".into();
++        assert!(validate_workspace_command(&params).is_err());
++    }
++}
+diff --git i/src/app/creation.rs w/src/app/creation.rs
+index af34e54..03576f8 100644
+--- i/src/app/creation.rs
++++ w/src/app/creation.rs
+@@ -128,9 +128,19 @@ impl App {
+         initial_cwd: PathBuf,
+         focus: bool,
+         extra_env: Vec<(String, String)>,
++    ) -> std::io::Result<usize> {
++        self.create_workspace_with_command(initial_cwd, focus, extra_env, None)
++    }
++
++    pub(crate) fn create_workspace_with_command(
++        &mut self,
++        initial_cwd: PathBuf,
++        focus: bool,
++        extra_env: Vec<(String, String)>,
++        command: Option<&[String]>,
+     ) -> std::io::Result<usize> {
+         let (rows, cols) = self.state.estimate_pane_size();
+-        let (ws, terminal, runtime) = Workspace::new_with_extra_env(
++        let (ws, terminal, runtime) = Workspace::new_with_tab(
+             initial_cwd,
+             rows,
+             cols,
+@@ -141,6 +151,7 @@ impl App {
+             self.event_tx.clone(),
+             self.render_notify.clone(),
+             self.render_dirty.clone(),
++            command,
+             extra_env,
+         )?;
+         self.terminal_runtimes.insert(terminal.id.clone(), runtime);
+diff --git i/src/cli/status.rs w/src/cli/status.rs
+index d9c0be7..df7fbeb 100644
+--- i/src/cli/status.rs
++++ w/src/cli/status.rs
+@@ -417,6 +417,7 @@ mod tests {
+             version: version.map(str::to_owned),
+             protocol: Some(crate::protocol::PROTOCOL_VERSION),
+             capabilities: Some(crate::api::schema::ServerCapabilities {
++                workspace_create_command: false,
+                 live_handoff: true,
+                 detached_server_daemon: true,
+                 endpoint_protocol_generation: endpoint_generation,
+diff --git i/src/update.rs w/src/update.rs
+index 4c128c5..8fd3eee 100644
+--- i/src/update.rs
++++ w/src/update.rs
+@@ -2846,6 +2846,7 @@ mod tests {
+             version: Some("0.5.5".to_string()),
+             protocol: Some(2),
+             capabilities: Some(crate::api::schema::ServerCapabilities {
++                workspace_create_command: false,
+                 live_handoff: true,
+                 detached_server_daemon: true,
+                 endpoint_protocol_generation: Some(
+@@ -2861,6 +2862,7 @@ mod tests {
+         };
+         let incompatible_generation = crate::api::RuntimeStatus {
+             capabilities: Some(crate::api::schema::ServerCapabilities {
++                workspace_create_command: false,
+                 endpoint_protocol_generation: Some(
+                     crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION + 1,
+                 ),
+@@ -2920,6 +2922,7 @@ mod tests {
+                 version: Some("0.6.2".to_string()),
+                 protocol: Some(76),
+                 capabilities: Some(crate::api::schema::ServerCapabilities {
++                workspace_create_command: false,
+                     live_handoff: true,
+                     detached_server_daemon: true,
+                     endpoint_protocol_generation: Some(
+@@ -3178,6 +3181,7 @@ mod tests {
+                 version: Some("9.8.6".to_string()),
+                 protocol: Some(76),
+                 capabilities: Some(crate::api::schema::ServerCapabilities {
++                workspace_create_command: false,
+                     live_handoff: true,
+                     detached_server_daemon: true,
+                     endpoint_protocol_generation: Some(
+diff --git i/src/workspace.rs w/src/workspace.rs
+index 8944b88..c19d461 100644
+--- i/src/workspace.rs
++++ w/src/workspace.rs
+@@ -345,7 +345,7 @@ impl Workspace {
+     }
+ 
+     #[allow(clippy::too_many_arguments)]
+-    fn new_with_tab(
++    pub(crate) fn new_with_tab(
+         initial_cwd: PathBuf,
+         rows: u16,
+         cols: u16,

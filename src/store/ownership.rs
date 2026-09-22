@@ -12,7 +12,7 @@ pub(super) fn read_all_with_budget(db:&Connection,budget:Option<&read_budget::Re
         let values=(r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,u64>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?);
         let(id,revision,binding_revision,attempt,payload,hash)=values;if format!("{:x}",Sha256::digest(payload.as_bytes()))!=hash{return Err(StoreError::Corrupt("ownership payload hash mismatch".into()));}
         let owned:RuntimeOwnership=serde_json::from_str(&payload).map_err(|_|StoreError::Corrupt("invalid ownership payload".into()))?;
-        if owned.binding!=id||owned.revision!=revision||owned.binding_revision!=binding_revision||owned.attempt.as_ref().map(AttemptId::as_str)!=attempt.as_deref()||owned.origin!="adopted"||!crate::operations::finalization::hash(&owned.identity_digest)||owned.observed_unix_ms<0 {return Err(StoreError::Corrupt("ownership row identity mismatch".into()));}result.push(owned);
+        if owned.binding!=id||owned.revision!=revision||owned.binding_revision!=binding_revision||owned.attempt.as_ref().map(AttemptId::as_str)!=attempt.as_deref()||!matches!(owned.origin.as_str(),"adopted"|"launched")||!crate::operations::finalization::hash(&owned.identity_digest)||owned.observed_unix_ms<0 {return Err(StoreError::Corrupt("ownership row identity mismatch".into()));}result.push(owned);
     }
     Ok(result)
 }
@@ -48,7 +48,7 @@ impl SqliteStore {
         }
         // Claims may be explicitly relinquished; immutable adoption events keep
         // their generations from being reused after the active row is removed.
-        let previous:u64=tx.query_row("SELECT COALESCE(MAX(revision),0) FROM events WHERE kind='runtime.adopted' AND entity=?1",[id],|r|r.get(0))?;
+        let previous:u64=tx.query_row("SELECT COALESCE(MAX(revision),0) FROM events WHERE kind IN ('runtime.adopted','runtime.launched') AND entity=?1",[id],|r|r.get(0))?;
         let revision=previous.max(old.as_ref().map(|o|o.revision).unwrap_or(0)).checked_add(1).ok_or_else(||StoreError::Invalid("ownership revision exhausted".into()))?;
         let attempt=if observation.agent_present&&task.is_some() {Some(AttemptId::new(format!("adopt-{:x}",Sha256::digest(format!("{id}:{revision}").as_bytes()))).map_err(StoreError::Invalid)?)}else{None};
         if let (Some(task),Some(attempt))=(&task,&attempt) {

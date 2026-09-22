@@ -5,9 +5,16 @@ pub mod observations;
 use std::path::Path;
 use anyhow::{Context,Result,ensure};
 use crate::paths::Ctx;
-use herdr_projects::{runtime,operations::{DeliveryState,dispatch::DispatchResult},reconcile::ResourceState};
+use herdr_projects::{runtime,operations::dispatch::DispatchResult,reconcile::ResourceState};
 #[cfg(test)]
 use herdr_projects::migration;
+
+// Verified prepared launches participate in ordinary controller polling. Native
+// capabilities, current inputs, signed approval and capacity remain enforced at
+// ingress; enabling dispatch does not certify optional worker protocols.
+const PREPARED_LAUNCH_DISPATCH_ENABLED: bool = true;
+fn launch_dispatch_enabled()->bool { PREPARED_LAUNCH_DISPATCH_ENABLED }
+
 
 pub struct PollResult {pub reachable:bool,pub scheduled_work:bool,pub unknown_effects:bool,pub operation_error:Option<String>}
 struct ProbeBudget<'a> {runner:&'a dyn crate::runner::Runner,deadline:std::time::Instant}
@@ -64,30 +71,43 @@ fn finish_poll(ctx:&Ctx,path:&Path,turn:u64,reachable:bool,observation_error:Opt
     Ok(PollResult{reachable:reachable||progress,scheduled_work:routine_work,unknown_effects,operation_error:(!errors.is_empty()).then(||errors.join("; "))})
 }
 fn process_next(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::copy_jobs::Queue>)->Result<bool> {
-    if let Some(effects)=effects{return offer_next(ctx,path,turn,effects);}
-    let snapshot=runtime::snapshot(path)?;
-    // Lifecycle/policy validation stays in each adapter. No imported obligation,
-    // new launch or terminal input is inferred from legacy files or inbox content.
-    let now=jiff::Timestamp::now().as_millisecond();
-    let mut candidates=Vec::new();
-    for delivery in &snapshot.deliveries {
-        let Some(operation)=snapshot.operations.iter().find(|o|o.id==delivery.operation) else{continue;};
-        if (delivery.state==DeliveryState::Pending&&delivery.next_due_ms<=now&&matches!(operation.kind.as_str(),"runtime.notification"|"runtime.finalization"))
-            || (delivery.state==DeliveryState::Ambiguous&&operation.kind=="runtime.finalization") {
-            candidates.push((operation,delivery));
-        }
+    process_next_with_launches(ctx,path,turn,effects,launch_dispatch_enabled())
+}
+fn process_next_with_launches(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::copy_jobs::Queue>,include_launches:bool)->Result<bool> {
+    if let Some(effects)=effects{return offer_next(ctx,path,turn,effects,include_launches);}
+    use herdr_projects::store::{identity_inventory::Budget,controller_hint::EffectMode};
+    let mut budget=Budget::new(2*1024*1024,1024,std::time::Instant::now()+std::time::Duration::from_millis(100),Default::default())?;
+    let Some(hint)=herdr_projects::migration::read_controller_dispatch_hint(path,&mut budget,turn,jiff::Timestamp::now().as_millisecond(),include_launches)? else{return Ok(false);};
+    let operation=&hint.operation;
+    if operation.kind=="runtime.launch" {
+        #[cfg(target_os="linux")]
+        return match hint.mode {
+            EffectMode::Deliver=>Ok(herdr_projects::canonical_worker::advance_launch(path,&operation.id,hint.delivery_revision,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default())?.is_some()),
+            EffectMode::Observe=>Ok(herdr_projects::canonical_worker::reconcile_launch(path,&operation.id,hint.delivery_revision,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default())?),
+        };
+        #[cfg(not(target_os="linux"))]
+        anyhow::bail!("canonical resource recovery requires Linux pidfs");
     }
-    if candidates.is_empty(){return Ok(false);}
-    candidates.sort_by(|(a,_),(b,_)|a.id.cmp(&b.id));
-    let(operation,delivery)=candidates[(turn%candidates.len() as u64) as usize];
-    if delivery.state==DeliveryState::Ambiguous {
-        crate::finalization_delivery::observe(ctx,&path,&operation.id,delivery.revision,snapshot.head)?;
+    if operation.kind=="runtime.worker_brief_prepare" {
+        herdr_projects::canonical_worker::prepare_brief(path,&herdr_projects::domain::AttemptId::new(operation.target.clone()).map_err(anyhow::Error::msg)?,hint.delivery_revision,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default())?;
+        return Ok(true);
+    }
+    if operation.kind=="runtime.worker_termination" {
+        #[cfg(target_os="linux")]
+        return Ok(herdr_projects::canonical_worker::reconcile_termination(path,&herdr_projects::domain::AttemptId::new(operation.target.clone()).map_err(anyhow::Error::msg)?,hint.delivery_revision,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default())?.is_some());
+        #[cfg(not(target_os="linux"))]
+        anyhow::bail!("canonical termination requires Linux pidfs");
+    }
+    if hint.mode==EffectMode::Observe {
+        ensure!(operation.kind=="runtime.finalization","unsupported observation hint");
+        crate::finalization_delivery::observe(ctx,path,&operation.id,hint.delivery_revision,hint.head)?;
         return Ok(true);
     }
     let result=match operation.kind.as_str() {
-        "runtime.notification"=>crate::notification_delivery::deliver(ctx,&path,&operation.id,delivery.revision)?,
-        "runtime.finalization"=>crate::finalization_delivery::deliver(ctx,&path,&operation.id,delivery.revision)?,
-        _=>unreachable!("candidate kinds checked above"),
+        "runtime.notification"=>crate::notification_delivery::deliver(ctx,path,&operation.id,hint.delivery_revision)?,
+        "runtime.finalization"=>crate::finalization_delivery::deliver(ctx,path,&operation.id,hint.delivery_revision)?,
+        "runtime.worker_brief"=>DispatchResult::Recorded(herdr_projects::canonical_worker::deliver_brief(path,&operation.id,hint.delivery_revision,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default())?),
+        _=>anyhow::bail!("unsupported controller effect hint"),
     };
     match result {
         DispatchResult::Recorded(_)=>Ok(true),
@@ -97,13 +117,15 @@ fn process_next(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::copy_job
 
 // A hint selects work only. Concrete workers retain full validation before
 // claiming or acting; a route hint does not certify provenance or authority.
-fn offer_next(ctx:&Ctx,path:&Path,turn:u64,effects:&mut crate::copy_jobs::Queue)->Result<bool> {
+fn offer_next(ctx:&Ctx,path:&Path,turn:u64,effects:&mut crate::copy_jobs::Queue,include_launches:bool)->Result<bool> {
     use herdr_projects::store::{identity_inventory::Budget,controller_hint::EffectMode};
     let mut budget=Budget::new(2*1024*1024,1024,std::time::Instant::now()+std::time::Duration::from_millis(100),Default::default())?;
-    let Some(hint)=herdr_projects::migration::read_controller_effect_hint(path,&mut budget,turn,jiff::Timestamp::now().as_millisecond())? else{return Ok(false);};
+    let Some(hint)=herdr_projects::migration::read_controller_dispatch_hint(path,&mut budget,turn,jiff::Timestamp::now().as_millisecond(),include_launches)? else{return Ok(false);};
     match hint.operation.kind.as_str() {
         "runtime.notification"=>effects.offer_canonical_notification(ctx,path,&hint.operation,hint.delivery_revision,hint.notification_socket.as_deref().context("notification route hint missing")?)?,
         "runtime.finalization"=>effects.offer_canonical_finalization(ctx,path,&hint.operation,hint.delivery_revision,match hint.mode {EffectMode::Deliver=>crate::canonical_finalization_jobs::Mode::Deliver,EffectMode::Observe=>crate::canonical_finalization_jobs::Mode::Observe})?,
+        "runtime.launch" if hint.mode==EffectMode::Deliver=>effects.offer_canonical_launch(path,&hint.operation,hint.delivery_revision)?,
+        "runtime.worker_brief"|"runtime.worker_termination"|"runtime.worker_brief_prepare"|"runtime.launch"=>effects.offer_canonical_brief(path,&hint.operation,hint.delivery_revision)?,
         _=>anyhow::bail!("unsupported controller effect hint"),
     }
     Ok(false)
@@ -223,3 +245,7 @@ pub(crate) mod tests {
     }
 
 }
+
+#[cfg(all(test,target_os="linux"))]
+#[path="canonical_controller_launch_tests.rs"]
+mod launch_tests;

@@ -28,7 +28,8 @@ pub fn request(ctx:&Ctx,path:&Path,operation:&Operation,revision:u64,mode:Mode)-
     Ok(crate::executor::Request{identity:crate::executor::Identity{operation:format!("canonical-finalization-{}:{}",if mode==Mode::Deliver{"deliver"}else{"observe"},operation.id.as_str()),revision,project:input.project.display().to_string(),machine:"local-artifacts".into(),terminal:None},lane:crate::executor::Lane::Transfer,deadline,command})
 }
 struct Adapter<'a,'b> {input:&'a Input,ctx:&'a Ctx<'b>,control:&'a Control,guard:&'a ProjectGuard}
-struct Prepared<'a,'b> {adapter:Adapter<'a,'b>,payload:Finalization,source:Option<(u64,u64)>}
+struct Prepared<'a,'b> {adapter:Adapter<'a,'b>,payload:Finalization,source:Source}
+enum Source {Receipt,Original((u64,u64)),#[cfg(target_os="linux")] Preserved}
 impl Adapter<'_,'_> {
     fn validate(&self,operation:&Operation,payload:&Finalization)->Result<Snapshot> {
         self.input.current(self.ctx,self.guard,self.control)?;
@@ -47,9 +48,14 @@ impl<'a,'b> DeliveryAdapter for Adapter<'a,'b> {
         let project=receipt::project(&self.input.project)?;
         // Freeze source identity only when a new capture is needed. A retained
         // receipt must recover even after the entire source has disappeared.
-        let source=if receipt::load_receipt_controlled(&project,operation,&payload,self.control)?.is_some(){None}else{
+        let source=if receipt::load_receipt_controlled(&project,operation,&payload,self.control)?.is_some(){Source::Receipt}else{
+            #[cfg(target_os="linux")]
+            if receipt::preserved_outputs(&self.input.project,&payload.binding,self.control)?.is_some() {
+                self.validate(operation,&payload)?;
+                return Ok(Prepared{adapter:Adapter{input:self.input,ctx:self.ctx,control:self.control,guard:self.guard},payload,source:Source::Preserved});
+            }
             ensure!(std::fs::canonicalize(&payload.source)?==Path::new(&payload.source),"artifact source path changed");
-            let directory=Directory::open(Path::new(&payload.source))?;directory.matches_path(Path::new(&payload.source))?;let metadata=directory.metadata()?;Some((metadata.dev(),metadata.ino()))
+            let directory=Directory::open(Path::new(&payload.source))?;directory.matches_path(Path::new(&payload.source))?;let metadata=directory.metadata()?;Source::Original((metadata.dev(),metadata.ino()))
         };
         self.validate(operation,&payload)?;
         Ok(Prepared{adapter:Adapter{input:self.input,ctx:self.ctx,control:self.control,guard:self.guard},payload,source})
@@ -60,8 +66,15 @@ impl PreparedDelivery for Prepared<'_,'_> {
     fn deliver(&mut self,operation:&Operation,claim:&Claim)->Result<Outcome> {
         let a=&self.adapter;let project=receipt::project(&a.input.project)?;let authorize=||a.claim(operation,&self.payload,claim);authorize()?;
         let result=if let Some(retained)=receipt::load_receipt_controlled(&project,operation,&self.payload,a.control)? {retained}else{
-            let source=self.source.context("retained receipt disappeared; refusing a second source copy")?;
-            let snapshot=crate::artifacts::capture_canonical_controlled(&project,&receipt::record(&self.payload),a.control,Some(source),authorize)?;
+            let snapshot=match self.source {
+                Source::Receipt=>anyhow::bail!("retained receipt disappeared; refusing a second source copy"),
+                Source::Original(source)=>crate::artifacts::capture_canonical_controlled(&project,&receipt::record(&self.payload),a.control,Some(source),authorize)?,
+                #[cfg(target_os="linux")]
+                Source::Preserved=>{
+                    let outputs=receipt::preserved_outputs(&a.input.project,&self.payload.binding,a.control)?.context("preserved output evidence disappeared")?;
+                    crate::artifacts::capture_preserved_outputs(&project,&receipt::record(&self.payload),&outputs,a.control,authorize)?
+                }
+            };
             ensure!(snapshot.manifest.matches_canonical_execution(&receipt::record(&self.payload))&&snapshot.manifest.report_hash()==Some(self.payload.report_hash.as_str()),"captured artifact does not match accepted finalization");
             let result=FinalizationReceipt{operation_hash:digest(&serde_json::to_vec(operation)?),artifact_key:self.payload.artifact_key(),snapshot:snapshot.id,report_hash:self.payload.report_hash.clone(),binding_revision:self.payload.binding_revision};
             receipt::save_receipt_authorized(&project,operation,&result,a.control,authorize)?;result

@@ -131,7 +131,7 @@ pub fn metrics_state(root: &Path) -> MetricsFile {
         Err(_) => return MetricsFile::Invalid,
     };
     let mut bytes = Vec::new();
-    if file.read_to_end(&mut bytes).is_err() || bytes.len() > 65_536 {
+    if (&mut file).take(65_537).read_to_end(&mut bytes).is_err() || bytes.len() > 65_536 {
         return MetricsFile::Invalid;
     }
     match serde_json::from_slice::<ExecutorMetrics>(&bytes) {
@@ -361,6 +361,42 @@ pub fn run(ctx: &Ctx) -> Result<()> {
     let log = Log { path: log_path(root) };
     log.line(&format!("ticker {} started (pid {})", info.version, info.pid));
     let mut last_reachable = Instant::now();
+    let mut memory = background_memory(ctx)?;
+    loop {
+        if stop_path(root).exists() {
+            log.line("stop file found; cancelling and draining shared executor");
+            return drain_executor(root, &log, &mut memory);
+        }
+        let entered = Instant::now();
+        if tick(ctx, &log, &mut memory) {
+            last_reachable = Instant::now();
+        } else if last_reachable.elapsed() > IDLE_EXIT && !memory.observations_unknown() {
+            log.line("no reachable session or enabled canonical routine for five minutes; draining shared executor");
+            return drain_executor(root, &log, &mut memory);
+        }
+        let wake=entered+next_tick_delay(&memory);
+        // Sleep in short slices so a stop request is honoured promptly.
+        while Instant::now() < wake {
+            if stop_path(root).exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500).min(wake.saturating_duration_since(Instant::now())));
+        }
+    }
+}
+
+/// Service admitted/queued canonical worker transitions within their original
+/// launch lease. Ordinary idle and legacy polling keeps the normal cadence.
+pub(crate) fn next_tick_delay(memory:&Memory)->Duration {
+    #[cfg(feature="state-store")]
+    if memory.copy_jobs.as_ref().is_some_and(|q|q.canonical_work_pending()){return Duration::from_millis(250);}
+    #[cfg(not(feature="state-store"))]
+    let _=memory;
+    TICK
+}
+
+/// Shared production executor and services, also exercised by ticker acceptance.
+pub(crate) fn background_memory(ctx:&Ctx)->Result<Memory> {
     let mut memory = Memory::new(ctx);
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::remote_polling::ProbeRunner{inner:std::sync::Arc::new(crate::runner::RealRunner)});
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::local_observations::ProbeRunner{inner:runner});
@@ -370,6 +406,8 @@ pub fn run(ctx: &Ctx) -> Result<()> {
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::canonical_notification_jobs::JobRunner{inner:runner});
     #[cfg(feature="state-store")]
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::canonical_finalization_jobs::JobRunner{inner:runner});
+    #[cfg(feature="state-store")]
+    let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::canonical_brief_jobs::JobRunner{inner:runner});
     #[cfg(feature="state-store")]
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::routine_jobs::JobRunner{inner:runner});
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::copy_jobs::JobRunner{inner:runner});
@@ -387,26 +425,7 @@ pub fn run(ctx: &Ctx) -> Result<()> {
     if cfg!(target_os="linux"){memory.local_observations=Some(crate::local_observations::Reads::new(executor.clone()));}
     memory.pr_reads=Some(crate::pr_polling::Reads::with_executor(executor.clone()));
     memory.remote_reads=Some(crate::remote_polling::Reads::new(executor));
-    loop {
-        if stop_path(root).exists() {
-            log.line("stop file found; cancelling and draining shared executor");
-            return drain_executor(root, &log, &mut memory);
-        }
-        let wake = Instant::now() + TICK;
-        if tick(ctx, &log, &mut memory) {
-            last_reachable = Instant::now();
-        } else if last_reachable.elapsed() > IDLE_EXIT && !memory.observations_unknown() {
-            log.line("no reachable session or enabled canonical routine for five minutes; draining shared executor");
-            return drain_executor(root, &log, &mut memory);
-        }
-        // Sleep in short slices so a stop request is honoured promptly.
-        while Instant::now() < wake {
-            if stop_path(root).exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        }
-    }
+    Ok(memory)
 }
 
 /// One pass over every active project. Cheap work (state, prompts, tokens)
@@ -420,7 +439,13 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     if let Some(reads)=memory.local_observations.as_mut(){reads.begin_pass();}
     #[cfg(feature="state-store")]
     {memory.canonical_effects_unknown=false;if let Some(reads)=memory.canonical_observations.as_mut(){reads.begin_pass();}}
-    if let Some(queue)=memory.copy_jobs.as_mut() {for error in queue.drain(){log.line(&error);}}
+    if let Some(queue)=memory.copy_jobs.as_mut() {
+        #[cfg(feature="state-store")]
+        let exclusive=queue.pending_exclusive_root();
+        for error in queue.drain(){log.line(&error);}
+        #[cfg(feature="state-store")]
+        if exclusive&&!queue.pending(){memory.canonical_maintenance_turn=true;}
+    }
     #[cfg(feature="state-store")]
     if let Some(queue)=memory.routine_jobs.as_mut() {for error in queue.drain(){log.line(&error);}}
     let mut reachable = Vec::new();
@@ -507,7 +532,14 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         admit_background(ctx,log,memory,canonical.into_iter().map(|slug|ctx.root.join(slug)).collect());
         if let Some(reads)=memory.local_reports.as_mut(){for error in reads.admit(){log.line(&error);}}
         if let Some(reads)=memory.local_observations.as_mut(){for error in reads.admit(){log.line(&error);}}
-        if let Some(reads)=memory.canonical_observations.as_mut(){for error in reads.admit_where(|project|!memory.copy_jobs.as_ref().is_some_and(|q|q.pending_project(project))&&!memory.routine_jobs.as_ref().is_some_and(|q|q.pending_project(project))){log.line(&error);}}
+        if let Some(reads)=memory.canonical_observations.as_mut(){
+            // These probes hold shared root ownership. Drain their batch before
+            // an exclusive worker effect, and do not replenish under that effect.
+            // A completed exclusive effect gives maintenance the next batch.
+            let blocked=memory.copy_jobs.as_ref().is_some_and(|q|q.pending_exclusive_root()||(!memory.canonical_maintenance_turn&&q.offered_exclusive_root()));
+            for error in reads.admit_where(|project|!blocked&&!memory.copy_jobs.as_ref().is_some_and(|q|q.pending_project(project))&&!memory.routine_jobs.as_ref().is_some_and(|q|q.pending_project(project))){log.line(&error);}
+        }
+        memory.canonical_maintenance_turn=false;
         any_reachable|=memory.routine_jobs.as_ref().is_some_and(|q|q.pending());
         any_reachable|=memory.copy_jobs.as_ref().is_some_and(|q|q.pending()||q.offered());
         publish_executor_metrics(&ctx.root,log,memory);
@@ -547,7 +579,11 @@ fn admit_background(_ctx:&Ctx,log:&Log,memory:&mut Memory,canonical:Vec<PathBuf>
 fn admit_effects(log:&Log,memory:&mut Memory)->bool {
     let Some(queue)=memory.copy_jobs.as_mut()else{return false;};
     #[cfg(feature="state-store")]
-    let errors=queue.admit_where(|project|!memory.canonical_observations.as_ref().is_some_and(|reads|reads.pending_project(project)));
+    let errors=queue.admit_matching(|identity|{
+        if crate::copy_jobs::exclusive_root(identity) {
+            !memory.canonical_maintenance_turn&&!memory.canonical_observations.as_ref().is_some_and(|reads|reads.pending())
+        }else{!memory.canonical_observations.as_ref().is_some_and(|reads|reads.pending_project(&identity.project))}
+    });
     #[cfg(not(feature="state-store"))]
     let errors=queue.admit();
     for error in errors{log.line(&error);}queue.pending()

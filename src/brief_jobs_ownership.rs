@@ -50,8 +50,10 @@ fn inventory(project:&Project,t:&Thread,socket:&Path,control:&Control,coordinato
             {
                 let mut budget=herdr_projects::store::identity_inventory::Budget::new(50*1024*1024-scan.bytes,1024-scan.records,control.deadline,control.cancellation.clone())?;
                 let bindings=herdr_projects::migration::read_identity_inventory(&dir,&mut budget)?;
+                let targets=herdr_projects::migration::read_launch_target_inventory(&dir,&mut budget)?;
                 scan.bytes+=budget.used();
                 for binding in bindings {scan.check(&binding.identity.machine,&binding.identity.socket,&binding.identity.pane_id)?;}
+                for (_,target) in targets {scan.check(&target.route.machine,&target.route.socket,&target.route.pane_id)?;}
                 continue;
             }
         }

@@ -54,6 +54,12 @@ enum RepairCommand {
 
 #[derive(Subcommand)]
 enum ProfileCommand {
+    /// Read a retained native verification report; does not grant launch authority
+    #[cfg(all(feature="state-store", target_os="linux"))]
+    Retained { slug: String, digest: String },
+    /// Revalidate retained native evidence against the current installation
+    #[cfg(all(feature="state-store", target_os="linux"))]
+    Revalidate { slug: String, digest: String },
     /// Validate one named profile and print redacted JSON; does not launch an agent
     Inspect { name: String },
     /// Resolve a named profile or unique kind into a budget envelope; does not launch
@@ -61,6 +67,37 @@ enum ProfileCommand {
         name: Option<String>,
         /// Unique named profile whose kind field equals KIND; never profiles.<kind>
         #[arg(long)] agent: Option<String>,
+    },
+    /// Freeze project-bound installation inputs; capability evidence remains unresolved
+    #[cfg(feature="state-store")]
+    Prepare {
+        slug: String,
+        name: String,
+        #[arg(long)] herdr_executable: PathBuf,
+        #[arg(long)] agent_executable: PathBuf,
+        #[arg(long)] execution_home: PathBuf,
+    },
+    /// Start and stop the exact agent in a disposable server; no task prompt
+    #[cfg(all(feature="state-store", target_os="linux"))]
+    VerifyNative {
+        slug: String,
+        name: String,
+        #[arg(long)] herdr_executable: PathBuf,
+        #[arg(long)] agent_executable: PathBuf,
+        #[arg(long)] execution_home: PathBuf,
+        /// Retain immutable verifier evidence in the project store
+        #[arg(long)] retain: bool,
+    },
+    /// Verify readiness and send one fixed diagnostic prompt in a disposable server
+    #[cfg(all(feature="state-store", target_os="linux"))]
+    VerifyInteraction {
+        slug: String,
+        name: String,
+        #[arg(long)] herdr_executable: PathBuf,
+        #[arg(long)] agent_executable: PathBuf,
+        #[arg(long)] execution_home: PathBuf,
+        /// Retain immutable verifier evidence in the project store
+        #[arg(long)] retain: bool,
     },
     /// Run bounded version probes against explicit local executables; no agent session
     Probe {
@@ -78,6 +115,23 @@ enum ApprovalCommand {
     Import { document:PathBuf, signature:PathBuf, #[arg(long)] expected_head:u64 },
     Revoke { id:String, #[arg(long)] expected_head:u64, #[arg(long)] reason:String },
     Denials,
+}
+
+#[cfg(all(feature="state-store", target_os="linux"))]
+#[derive(Subcommand)]
+enum LaunchCommand {
+    /// Produce an unsigned approval and exact brief from current retained inputs
+    Draft {
+        #[arg(long)] selection: PathBuf,
+        #[arg(long)] expected_head: u64,
+        #[arg(long, default_value_t=900)] validity_seconds: u64,
+    },
+    /// Reserve against an installed owner-signed approval; sends no agent input
+    Reserve {
+        #[arg(long)] selection: PathBuf,
+        #[arg(long)] approval_digest: String,
+        #[arg(long)] expected_head: u64,
+    },
 }
 
 #[cfg(feature="state-store")]
@@ -98,6 +152,19 @@ enum MemoryCommand {
         #[arg(long)] expected_revision:Option<u64>,
     },
     Preview { #[arg(long)] file:PathBuf },
+    Candidate { #[arg(long)] id:String },
+    ReviewImport { document:PathBuf, signature:PathBuf, #[arg(long)] expected_head:u64 },
+    SnapshotInput { #[arg(long)] id:String },
+    AttemptInput { #[arg(long)] attempt:String },
+    /// Render the complete budgeted canonical worker prompt without sending it
+    AttemptBrief { #[arg(long)] attempt:String },
+    Deliveries,
+    Readiness { #[arg(long)] task:String },
+    Invalidations { #[arg(long)] task:String },
+    Reconcile { document:PathBuf, signature:PathBuf, #[arg(long)] expected_head:u64 },
+    Update { #[arg(long)] delivery:String, #[arg(long)] attempt:String },
+    Ack { #[arg(long)] input:PathBuf },
+    Receipts { #[arg(long)] attempt:String },
     Plan { #[arg(long)] output:PathBuf },
     Cutover {
         #[arg(long)] plan:PathBuf,
@@ -106,9 +173,10 @@ enum MemoryCommand {
         #[arg(long)] expected_head:u64,
         #[arg(long)] writers_stopped:bool,
     },
-    Snapshot { #[arg(long)] task:String, #[arg(long)] profile:String, #[arg(long)] input_file:PathBuf },
+    AbortCutover { #[arg(long)] plan:PathBuf, #[arg(long)] writers_stopped:bool },
+    Snapshot { #[arg(long)] task:String, #[arg(long)] profile:String, #[arg(long)] input_file:PathBuf, #[arg(long)] worker:bool },
     Propose { #[arg(long)] input:PathBuf },
-    Review { #[arg(long)] proposal:String, #[arg(long)] decision_file:PathBuf },
+    Review { #[arg(long)] proposal:String, #[arg(long)] decision_file:PathBuf, #[arg(long)] signature:PathBuf, #[arg(long)] expected_head:u64 },
     Promote { #[arg(long)] proposal:String, #[arg(long)] decision:String },
 }
 #[cfg(feature="state-store")]
@@ -146,6 +214,9 @@ enum Command {
     RoutineStore { slug:String, #[command(subcommand)] command:RoutineStoreCommand },
     /// Inspect user-owned profile configuration and unresolved capability requirements
     Profile { #[command(subcommand)] command: ProfileCommand },
+    /// Prepare exact launch approval inputs or reserve an approved attempt
+    #[cfg(all(feature="state-store", target_os="linux"))]
+    Launch { slug:String, #[command(subcommand)] command:LaunchCommand },
     /// Inspect dependency queue and configure per-project scheduling limits
     #[cfg(feature="state-store")]
     Scheduler { slug:String, #[command(subcommand)] command:SchedulerCommand },
@@ -209,8 +280,11 @@ enum Command {
         /// Named profile; defaults to profiles.planner. Never kind-default.
         #[arg(long)]
         profile: Option<String>,
+        /// Continue an explicitly retained coordinator context session. Omit after restart/compaction.
+        #[arg(long)]
+        session: Option<String>,
         /// Acknowledge a checkpoint id from a previous context
-        #[arg(long, conflicts_with="peek")]
+        #[arg(long, conflicts_with="peek", requires="session")]
         ack: Option<String>,
     },
     /// Print threads grouped by what needs you
@@ -474,7 +548,7 @@ enum SchedulerCommand {
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
 enum OperationsCommand { Inspect,
-    /// Queue preservation of a recorded local artifact source; completion awaits review
+    /// Preserve a recorded local artifact source; cancelled tasks remain cancelled
     Finalize { binding:String, #[arg(long)] reason:String, #[arg(long)] expected_head:u64 },
     DeliverFinalization { id:String, #[arg(long)] expected_revision:u64 },
     /// Verify a durable snapshot receipt after interrupted delivery, without recopying
@@ -527,6 +601,27 @@ pub fn run() -> Result<()> {
     if let Command::Profile { command } = &cli.command {
         let path = config_dir.join("config.toml");
         let value = match command {
+            #[cfg(all(feature="state-store", target_os="linux"))]
+            ProfileCommand::Revalidate { slug, digest } => {
+                let root = paths::resolve_root(cli.root.as_deref(), &env, &config_dir)?;
+                project::validate_slug(slug)?;
+                let reference = herdr_projects::domain::VersionedReference {
+                    id: format!("profile-{digest}"), revision: 1, digest: digest.clone(),
+                };
+                serde_json::to_value(herdr_projects::profile_preparation::revalidate(
+                    &root.join(slug), &reference,
+                    std::time::Instant::now()+std::time::Duration::from_secs(20), Default::default())?)?
+            }
+            #[cfg(all(feature="state-store", target_os="linux"))]
+            ProfileCommand::Retained { slug, digest } => {
+                let root = paths::resolve_root(cli.root.as_deref(), &env, &config_dir)?;
+                project::validate_slug(slug)?;
+                let reference = herdr_projects::domain::VersionedReference {
+                    id: format!("profile-{digest}"), revision: 1, digest: digest.clone(),
+                };
+                herdr_projects::store::SqliteStore::open(&root.join(slug).join(".state/state.db"))?
+                    .native_profile_report(&reference)?.context("retained native profile not found")?
+            }
             ProfileCommand::Inspect { name } => serde_json::to_value(crate::agents::profiles::inspect(&path, name)?)?,
             ProfileCommand::Resolve { name, agent } => {
                 let resolved = match (name.as_deref(), agent.as_deref()) {
@@ -535,6 +630,44 @@ pub fn run() -> Result<()> {
                     _ => bail!("profile resolve requires NAME or --agent KIND"),
                 };
                 serde_json::to_value(resolved)?
+            }
+            #[cfg(feature="state-store")]
+            ProfileCommand::Prepare { slug, name, herdr_executable, agent_executable, execution_home } => {
+                let root = paths::resolve_root(cli.root.as_deref(), &env, &config_dir)?;
+                project::validate_slug(slug)?;
+                serde_json::to_value(herdr_projects::profile_preparation::prepare(
+                    &root.join(slug), name, herdr_executable, agent_executable, execution_home,
+                    std::time::Instant::now()+std::time::Duration::from_secs(20), Default::default())?)?
+            }
+            #[cfg(all(feature="state-store", target_os="linux"))]
+            ProfileCommand::VerifyNative { slug, name, herdr_executable, agent_executable, execution_home, retain } => {
+                let root = paths::resolve_root(cli.root.as_deref(), &env, &config_dir)?;
+                project::validate_slug(slug)?;
+                let project = root.join(slug);
+                if *retain {
+                    herdr_projects::store::SqliteStore::open(&project.join(".state/state.db"))?
+                        .check_native_profile_retention()?;
+                }
+                let verified = herdr_projects::profile_preparation::verify_native(
+                    &project, name, herdr_executable, agent_executable, execution_home,
+                    std::time::Instant::now()+std::time::Duration::from_secs(120), Default::default())?;
+                if *retain { verified.retain(&project)?; }
+                serde_json::to_value(verified)?
+            }
+            #[cfg(all(feature="state-store", target_os="linux"))]
+            ProfileCommand::VerifyInteraction { slug, name, herdr_executable, agent_executable, execution_home, retain } => {
+                let root = paths::resolve_root(cli.root.as_deref(), &env, &config_dir)?;
+                project::validate_slug(slug)?;
+                let project = root.join(slug);
+                if *retain {
+                    herdr_projects::store::SqliteStore::open(&project.join(".state/state.db"))?
+                        .check_native_profile_retention()?;
+                }
+                let verified = herdr_projects::profile_preparation::verify_interaction(
+                    &project, name, herdr_executable, agent_executable, execution_home,
+                    std::time::Instant::now()+std::time::Duration::from_secs(120), Default::default())?;
+                if *retain { verified.retain(&project)?; }
+                serde_json::to_value(verified)?
             }
             ProfileCommand::Probe { name, herdr_executable, agent_executable } =>
                 serde_json::to_value(crate::agents::probe::probe(&path, name, herdr_executable, agent_executable, &RealRunner)?)?,
@@ -586,6 +719,22 @@ pub fn run() -> Result<()> {
                         serde_json::to_value(herdr_projects::authority::import_memory(&dir,&document,&signature,expected_head)?)?
                     }
                 },
+                MemoryCommand::Update{delivery,attempt}=>herdr_projects::memory::read_memory_update(&dir,&delivery,&attempt)?,
+                MemoryCommand::Ack{input}=>{
+                    let ack:herdr_projects::domain::MemoryUpdateAck=serde_json::from_slice(&herdr_projects::migration::read_plan_file(&input)?)
+                        .map_err(|_|anyhow::anyhow!("invalid memory acknowledgment JSON (contents withheld)"))?;
+                    serde_json::to_value(herdr_projects::memory::acknowledge_memory_update(&dir,&ack)?)?
+                },
+                MemoryCommand::Receipts{attempt}=>serde_json::to_value(herdr_projects::migration::open_active(&dir)?.memory_update_receipts(&attempt)?)?,
+                MemoryCommand::Invalidations{task}=>serde_json::to_value(herdr_projects::migration::open_active(&dir)?.memory_invalidations(&task)?)?,
+                MemoryCommand::Reconcile{document,signature,expected_head}=>serde_json::to_value(herdr_projects::authority::reconcile_memory(&dir,&document,&signature,expected_head)?)?,
+                MemoryCommand::Readiness{task}=>serde_json::to_value(herdr_projects::migration::open_active(&dir)?.memory_readiness(&task,jiff::Timestamp::now().as_millisecond())?)?,
+                MemoryCommand::Deliveries=>serde_json::to_value(herdr_projects::migration::open_active(&dir)?.memory_delivery_intents()?)?,
+                MemoryCommand::Candidate{id}=>herdr_projects::memory::import_candidate_preview(&dir,&id)?,
+                MemoryCommand::ReviewImport{document,signature,expected_head}=>serde_json::to_value(herdr_projects::authority::review_memory_import(&dir,&document,&signature,expected_head)?)?,
+                MemoryCommand::AttemptInput{attempt}=>herdr_projects::memory::render_attempt_knowledge(&dir,&attempt)?,
+                MemoryCommand::AttemptBrief{attempt}=>serde_json::to_value(herdr_projects::memory::render_attempt_brief(&dir,&attempt)?)?,
+                MemoryCommand::SnapshotInput{id}=>herdr_projects::memory::render_knowledge_snapshot(&dir,&id)?,
                 MemoryCommand::Preview{file}=>serde_json::to_value(herdr_projects::memory::preview(&dir,&file)?)?,
                 MemoryCommand::Plan{output}=>{
                     let plan=herdr_projects::memory::plan(&dir)?;
@@ -594,31 +743,37 @@ pub fn run() -> Result<()> {
                 },
                 MemoryCommand::Cutover{plan,document,signature,expected_head,writers_stopped}=>
                     serde_json::to_value(herdr_projects::authority::cutover_memory(&dir,&plan,&document,&signature,expected_head,writers_stopped)?)?,
-                MemoryCommand::Snapshot{task,profile,input_file}=>{
+                MemoryCommand::AbortCutover{plan,writers_stopped}=>{
+                    let plan:herdr_projects::memory::MemoryPlan=serde_json::from_slice(&herdr_projects::migration::read_plan_file(&plan)?)?;
+                    serde_json::to_value(herdr_projects::memory::abort_cutover(&dir,&plan,writers_stopped)?)?
+                },
+                MemoryCommand::Snapshot{task,profile,input_file,worker}=>{
+                    let _guard=herdr_projects::memory::mutation_guard(&dir)?;
                     anyhow::ensure!(task!="coordinator","--task coordinator is reserved for the coordinator constructor");
                     let resolved=crate::agents::resolve::resolve(&profile,&ctx.config_dir.join("config.toml"),None)?;
                     let request:herdr_projects::domain::SnapshotRequest=serde_json::from_slice(&herdr_projects::migration::read_plan_file(&input_file)?).map_err(|_|anyhow::anyhow!("invalid snapshot scope JSON (contents withheld)"))?;
                     anyhow::ensure!(request.task_id==task,"scope task_id must match --task");
-                    let instructions=std::fs::read_to_string(dir.join("PROJECT.md")).unwrap_or_default();
+                    let instructions=String::from_utf8(herdr_projects::migration::read_plan_file(&dir.join("PROJECT.md"))?)
+                        .map_err(|_|anyhow::anyhow!("project instructions are not UTF-8"))?;
                     let mut memory=herdr_projects::memory::MemoryStore::from_sqlite(herdr_projects::migration::open_active(&dir)?,dir.join(".state/objects"));
-                    serde_json::to_value(memory.create_task_snapshot(request,&resolved.name,&resolved.definition_digest,Some(&resolved.config_digest),resolved.budget.soft_input_chars,&instructions,jiff::Timestamp::now().as_millisecond(),None)?)?
+                    let now=jiff::Timestamp::now().as_millisecond();
+                    let snapshot=if worker {
+                        memory.create_worker_snapshot(request,&resolved.name,&resolved.definition_digest,Some(&resolved.config_digest),resolved.budget.soft_input_chars,&instructions,now,None)?
+                    } else {
+                        memory.create_task_snapshot(request,&resolved.name,&resolved.definition_digest,Some(&resolved.config_digest),resolved.budget.soft_input_chars,&instructions,now,None)?
+                    };
+                    serde_json::to_value(snapshot)?
                 },
                 MemoryCommand::Propose{input}=>{
+                    let _guard=herdr_projects::memory::mutation_guard(&dir)?;
                     let bytes=herdr_projects::migration::read_plan_file(&input)?;
                     let mut memory=herdr_projects::memory::MemoryStore::from_sqlite(herdr_projects::migration::open_active(&dir)?,dir.join(".state/objects"));
                     serde_json::to_value(memory.propose(&bytes,jiff::Timestamp::now().as_millisecond())?)?
                 },
-                MemoryCommand::Review{proposal,decision_file}=>{
-                    let bytes=herdr_projects::migration::read_plan_file(&decision_file)?;
-                    let mut memory=herdr_projects::memory::MemoryStore::from_sqlite(herdr_projects::migration::open_active(&dir)?,dir.join(".state/objects"));
-                    let decision=memory.review(&bytes,jiff::Timestamp::now().as_millisecond())?;
-                    anyhow::ensure!(decision.proposal_id==proposal,"decision-file proposal_id must match --proposal");
-                    serde_json::to_value(decision)?
-                },
-                MemoryCommand::Promote{proposal,decision}=>{
-                    let mut memory=herdr_projects::memory::MemoryStore::from_sqlite(herdr_projects::migration::open_active(&dir)?,dir.join(".state/objects"));
-                    serde_json::to_value(memory.promote(&proposal,&decision,jiff::Timestamp::now().as_millisecond())?)?
-                },
+                MemoryCommand::Review{proposal,decision_file,signature,expected_head}=>
+                    serde_json::to_value(herdr_projects::authority::review_memory_proposal(&dir,&proposal,&decision_file,&signature,expected_head)?)?,
+                MemoryCommand::Promote{proposal,decision}=>
+                    serde_json::to_value(herdr_projects::authority::promote_memory_proposal(&dir,&proposal,&decision)?)?,
             };println!("{}",serde_json::to_string_pretty(&value)?);Ok(())
         },
         #[cfg(feature="state-store")]
@@ -646,6 +801,27 @@ pub fn run() -> Result<()> {
             Ok(())
         },
         Command::Profile { .. } => unreachable!("profile inspection handled before project resolution"),
+        #[cfg(all(feature="state-store", target_os="linux"))]
+        Command::Launch { slug, command } => {
+            project::validate_slug(&slug)?;
+            let project=ctx.root.join(slug);
+            let load=|path:&std::path::Path|->Result<herdr_projects::launch_preparation::LaunchSelection> {
+                let bytes=herdr_projects::migration::read_plan_file(path)?;
+                anyhow::ensure!(bytes.len()<=1024*1024,"launch selection exceeds bounds");
+                serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid launch selection (contents withheld)"))
+            };
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(20);
+            let value=match command {
+                LaunchCommand::Draft { selection, expected_head, validity_seconds } =>
+                    serde_json::to_value(herdr_projects::launch_preparation::draft(&project,&load(&selection)?,expected_head,std::time::Duration::from_secs(validity_seconds),deadline,Default::default())?)?,
+                LaunchCommand::Reserve { selection, approval_digest, expected_head } => {
+                    let approval=herdr_projects::domain::VersionedReference{id:format!("approval-{approval_digest}"),revision:1,digest:approval_digest};
+                    serde_json::to_value(herdr_projects::launch_preparation::reserve(&project,&load(&selection)?,&approval,expected_head,deadline,Default::default())?)?
+                }
+            };
+            println!("{}",serde_json::to_string_pretty(&value)?);
+            Ok(())
+        },
         #[cfg(feature="state-store")]
         Command::Runtime{slug,command}=>{
             project::validate_slug(&slug)?;let dir=ctx.root.join(slug);
@@ -850,14 +1026,16 @@ pub fn run() -> Result<()> {
                 rebind,
             },
         ),
-        Command::Context { slug, peek, profile, ack } => {
+        Command::Context { slug, peek, profile, ack, session } => {
             #[cfg(feature="state-store")]
             {
                 project::validate_slug(&slug)?;
                 if project::ensure_legacy(&ctx.root.join(&slug)).is_err() {
                     let dir=ctx.root.join(&slug);
+                    herdr_projects::migration::open_active(&dir)
+                        .context("legacy runtime is disabled; migrated context could not be read")?;
                     if let Some(checkpoint)=ack {
-                        let acked=herdr_projects::runtime::ack_checkpoint(&dir,&checkpoint)?;
+                        let acked=herdr_projects::runtime::ack_checkpoint(&dir,&checkpoint,session.as_deref().ok_or_else(||anyhow::anyhow!("--ack requires --session"))?)?;
                         println!("Checkpoint {} acknowledged (cursor_seq={}).",acked.id,acked.through_seq);
                         return Ok(());
                     }
@@ -868,11 +1046,10 @@ pub fn run() -> Result<()> {
                         None=>crate::agents::resolve::resolve("planner",&config,None)
                             .context("context requires profiles.planner or --profile NAME")?,
                     };
-                    let herdr_session=project::Project::load(&ctx.root,&slug).ok()
-                        .and_then(|p|p.coordinator())
-                        .map(|c|c.session)
-                        .filter(|s|!s.is_empty())
-                        .unwrap_or_else(||"default".into());
+                    let herdr_session=match session {
+                        Some(token)=>token,
+                        None=>herdr_projects::memory::new_coordinator_session()?,
+                    };
                     let instructions=std::fs::read_to_string(dir.join("PROJECT.md")).unwrap_or_default();
                     let profile=herdr_projects::domain::CheckpointProfile{
                         name:resolved.name,digest:resolved.definition_digest,config_digest:Some(resolved.config_digest),
@@ -885,7 +1062,8 @@ pub fn run() -> Result<()> {
                     return Ok(());
                 }
             }
-            let _=(profile,ack);
+            anyhow::ensure!(ack.is_none() && session.is_none(), "checkpoint sessions require a migrated SQLite project and state-store support");
+            let _=profile;
             coordinator::context(&ctx,&slug,peek)
         },
         Command::Overview { slug, wait } => overview::run(&ctx, slug.as_deref(), wait),

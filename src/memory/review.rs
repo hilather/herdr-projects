@@ -4,15 +4,20 @@ use crate::domain::*;
 use sha2::{Digest, Sha256};
 
 fn record_id_for(key: &str) -> Result<MemoryRecordId, MemoryError> {
-    MemoryRecordId::new(key.replace('/', ".")).map_err(MemoryError::Invalid)
+    MemoryRecordId::new(format!("mem-{:x}", Sha256::digest(key.as_bytes()))).map_err(MemoryError::Invalid)
 }
 
 impl MemoryStore {
-    pub fn review(&mut self, bytes: &[u8], now_unix_ms: i64) -> Result<ReviewDecision, MemoryError> {
+    #[cfg(test)]
+    pub(crate) fn review(&mut self, bytes: &[u8], now_unix_ms: i64) -> Result<ReviewDecision, MemoryError> {
+        self.review_checked(bytes, now_unix_ms, None)
+    }
+    pub(crate) fn review_checked(&mut self, bytes: &[u8], now_unix_ms: i64, authorization: Option<&PreparedMemoryReview>) -> Result<ReviewDecision, MemoryError> {
+        if authorization.is_none() && !cfg!(test) {return Err(MemoryError::AuthorityDenied);}
         if bytes.len() > PROPOSAL_LIMIT { return Err(MemoryError::Invalid("review document exceeds 64 KiB".into())); }
         let doc: ReviewDocument = serde_json::from_slice(bytes).map_err(|_| MemoryError::Invalid("malformed review JSON (contents withheld)".into()))?;
         if doc.schema_version != 1 { return Err(MemoryError::Invalid("unsupported review schema_version".into())); }
-        if !matches!(doc.decision.as_str(),"approve"|"reject"|"narrow") { return Err(MemoryError::Invalid("invalid review decision".into())); }
+        if !matches!(doc.decision.as_str(),"approve"|"reject") { return Err(MemoryError::Invalid("invalid review decision".into())); }
         if doc.reason.is_empty()||doc.reason.len()>4096||doc.reason.chars().any(char::is_control) {
             return Err(MemoryError::Invalid("invalid review reason".into()));
         }
@@ -22,6 +27,14 @@ impl MemoryStore {
         if stored.id != doc.proposal_id { return Err(MemoryError::Invalid("proposal identity mismatch".into())); }
         let proposal: ProposalDocument = serde_json::from_str(&payload).map_err(|_| MemoryError::Invalid("stored proposal is unreadable".into()))?;
         let snapshot = self.store.read_snapshot(None).map_err(MemoryError::from)?;
+        if let Some(auth)=authorization {
+            let mut keys:Vec<_>=proposal.changes.iter().map(|c|c.record_key.clone()).collect();keys.sort();keys.dedup();
+            let mut granted=auth.document.record_keys.clone();granted.sort();granted.dedup();
+            if auth.document.review!=doc || auth.document.proposal_digest!=stored.payload_digest || keys!=granted
+                || auth.document.expected_head!=snapshot.head || now_unix_ms>=auth.document.expires_unix_ms {
+                return Err(MemoryError::AuthorityDenied);
+            }
+        }
         let mut classes = Vec::new();
         let mut heads = serde_json::Map::new();
         for change in &proposal.changes {
@@ -33,23 +46,28 @@ impl MemoryStore {
                     if let Some(head)=&head { heads.insert(rec.id.as_str().into(), serde_json::json!(head.revision)); }
                     let body = change.body_object.strip_prefix("sha256:").unwrap_or(&change.body_object);
                     let rev = head.as_ref().and_then(|h| self.store.memory_revision(rec.id.as_str(), h.revision).ok().flatten());
-                    if rev.as_ref().is_some_and(|r| r.body_hash.as_str()==body) { "compatible" } else { "contradictory" }
+                    if rev.as_ref().is_some_and(|r| r.body_hash.as_str()==body && r.applicability==change.scope) && change.based_on.is_empty() { "compatible" } else { "contradictory" }
                 }
             };
             classes.push(serde_json::json!({"record_key":change.record_key,"class":class}));
         }
-        let reviewed_heads = serde_json::json!({"event_head":snapshot.head,"records":heads}).to_string();
+        let reviewed_heads = serde_json::json!({"event_head":snapshot.head,"records":heads,"authorization":authorization.map(|a|&a.document),"config_digest":authorization.and_then(|a|a.config_digest.as_ref())}).to_string();
         let classification = serde_json::to_string(&classes).map_err(|e| MemoryError::Invalid(e.to_string()))?;
         let id = format!("rev-{:x}", Sha256::digest(format!("{}:{}:{}:{}", stored.id, stored.payload_digest, doc.decision, now_unix_ms).as_bytes()));
         let row = ReviewDecision {
             id: id.clone(), proposal_id: stored.id, payload_digest: stored.payload_digest,
             decision: doc.decision, classification, reviewed_heads, reason: doc.reason, created_unix_ms: now_unix_ms,
         };
-        self.store.insert_review_decision(&row).map_err(MemoryError::from)?;
+        self.store.insert_review_decision(&row, authorization).map_err(MemoryError::from)?;
         Ok(row)
     }
 
-    pub fn promote(&mut self, proposal_id: &str, decision_id: &str, now_unix_ms: i64) -> Result<PromotionReceipt, MemoryError> {
+    #[cfg(test)]
+    pub(crate) fn promote(&mut self, proposal_id: &str, decision_id: &str, now_unix_ms: i64) -> Result<PromotionReceipt, MemoryError> {
+        self.promote_checked(proposal_id,decision_id,now_unix_ms,None)
+    }
+    pub(crate) fn promote_checked(&mut self, proposal_id: &str, decision_id: &str, now_unix_ms: i64, authorization: Option<&PreparedMemoryReview>) -> Result<PromotionReceipt, MemoryError> {
+        if authorization.is_none() && !cfg!(test) {return Err(MemoryError::AuthorityDenied);}
         if let Some(existing)=self.store.memory_promotion(proposal_id).map_err(MemoryError::from)? {
             if existing.decision_id==decision_id { return Ok(existing); }
             return Err(MemoryError::Invalid("proposal already promoted under a different decision".into()));
@@ -73,6 +91,7 @@ impl MemoryStore {
             if !self.store.object_available(body.as_str()).map_err(MemoryError::from)? {
                 return Err(MemoryError::EvidenceUnavailable { object: body });
             }
+            super::read_object(&self.objects, &body)?;
             let existing = self.store.memory_record_by_key(&change.record_key).map_err(MemoryError::from)?;
             if let Some(rec)=&existing {
                 let head = self.store.memory_head(rec.id.as_str()).map_err(MemoryError::from)?
@@ -84,8 +103,6 @@ impl MemoryStore {
                         return Err(MemoryError::RevisionConflict { current: vec![(rec.id.clone(), head.revision)] });
                     }
                 }
-                let current = self.store.memory_revision(rec.id.as_str(), head.revision).map_err(MemoryError::from)?;
-                if current.as_ref().is_some_and(|r| r.body_hash.as_str()==body.as_str()) { continue; }
             } else if change.expected.is_some() {
                 return Err(MemoryError::Invalid("expected base record is missing".into()));
             }
@@ -99,15 +116,16 @@ impl MemoryStore {
             for dep in &change.based_on {
                 dependencies.push((MemoryRecordId::new(dep.record_id.clone()).map_err(MemoryError::Invalid)?, dep.revision, "based_on".into()));
             }
+            let record_id = id.as_str().to_owned();
             revisions.push(NewRevision {
                 id, record_key: change.record_key.clone(), scope_id: "project".into(), kind,
                 body_hash: body, provenance_hash: prov.clone(), applicability: change.scope.clone(),
                 dependencies, expected, expiry_unix_ms: None, validity_state: "valid".into(), validity_reason: "promoted".into(),
             });
-            let inv_id = format!("inv-{:x}", Sha256::digest(format!("{}:{}:{}", proposal_id, change.record_key, now_unix_ms).as_bytes()));
-            invalidations.push((inv_id, stored.task_id.clone(), change.record_key.clone(), change.impact.clone()));
+            let inv_id = format!("inv-{:x}", Sha256::digest(format!("{}:{}", proposal_id, record_id).as_bytes()));
+            invalidations.push((inv_id, stored.task_id.clone(), record_id, change.impact.clone()));
         }
-        self.store.promote_reviewed_proposal(proposal_id, &decision, &revisions, &invalidations, now_unix_ms).map_err(MemoryError::from)
+        self.store.promote_reviewed_proposal(proposal_id, &decision, &revisions, &invalidations, now_unix_ms, authorization).map_err(MemoryError::from)
     }
 }
 
@@ -128,6 +146,9 @@ mod tests {
         let body = memory.ingest_object(&b"claim-body"[..]).unwrap();
         let req = SnapshotRequest { schema_version: 1, task_id: "task-api".into(), profile: "implementation".into(), domains: vec![], paths: vec![], pinned_keys: vec![], sensitivity: "default".into() };
         let snap = memory.create_task_snapshot(req, "implementation", &"a".repeat(64), None, 32_000, "instructions", 1_000, None).unwrap();
+        let state=memory.store.read_snapshot(None).unwrap();
+        let mut attempt=state.attempts[0].clone();attempt.revision+=1;attempt.snapshot=Some(snap.id.as_str().into());
+        memory.store.commit(Commit{expected_head:state.head,mutations:vec![Mutation::Attempt{expected:Some(1),next:attempt}]}).unwrap();
         let doc = ProposalDocument {
             schema_version: 1, proposal_id: "mp-api-errors-01".into(),
             producer: ProposalProducer { task_id: "task-api".into(), attempt_id: "att-api-2".into() },

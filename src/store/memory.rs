@@ -25,6 +25,7 @@ fn load_active_facts(db:&Connection,now:i64)->Result<Vec<crate::domain::ActiveFa
     while let Some(row)=rows.next()? {
         let expiry:Option<i64>=row.get(12)?;
         if expiry.is_some_and(|e|now>=e) {continue;}
+        if !super::memory_invalidation::dependencies_current(db,&row.get::<_,String>(0)?,row.get(5)?,now)? {continue;}
         facts.push(crate::domain::ActiveFact{
             record:MemoryRecord{id:MemoryRecordId::new(row.get::<_,String>(0)?).map_err(StoreError::Corrupt)?,record_key:row.get(1)?,scope_id:row.get(2)?,kind:parse_kind(&row.get::<_,String>(3)?).map_err(StoreError::Corrupt)?,is_hard:row.get::<_,i64>(4)?==1},
             revision:MemoryRevision{record_id:MemoryRecordId::new(row.get::<_,String>(0)?).map_err(StoreError::Corrupt)?,revision:row.get(5)?,body_hash:ObjectId::from_hex(row.get::<_,String>(6)?).map_err(StoreError::Corrupt)?,provenance_hash:ObjectId::from_hex(row.get::<_,String>(7)?).map_err(StoreError::Corrupt)?,promoted_seq:row.get(8)?,applicability:decode_applicability(&row.get::<_,String>(9)?)?},
@@ -44,12 +45,11 @@ fn heads_digest(db:&Connection)->Result<String> {
 }
 fn hops_from_pins(db:&Connection,pins:&[String])->Result<std::collections::BTreeMap<String,u32>> {
     let mut edges:std::collections::BTreeMap<String,Vec<String>>=std::collections::BTreeMap::new();
-    let mut stmt=db.prepare("SELECT derived_record,source_record FROM memory_dependencies")?;
+    let mut stmt=db.prepare("SELECT d.derived_record,d.source_record FROM memory_dependencies d JOIN memory_heads a ON a.record_id=d.derived_record AND a.revision=d.derived_revision AND a.status='active' JOIN memory_heads b ON b.record_id=d.source_record AND b.revision=d.source_revision AND b.status='active'")?;
     let mut rows=stmt.query([])?;
     while let Some(row)=rows.next()? {
         let a:String=row.get(0)?;let b:String=row.get(1)?;
-        edges.entry(a.clone()).or_default().push(b.clone());
-        edges.entry(b).or_default().push(a);
+        edges.entry(a).or_default().push(b);
     }
     let mut dist=std::collections::BTreeMap::new();
     let mut queue=std::collections::VecDeque::new();
@@ -65,8 +65,11 @@ fn hops_from_pins(db:&Connection,pins:&[String])->Result<std::collections::BTree
     }
     Ok(dist)
 }
-fn entry_bytes(fact:&crate::domain::ActiveFact,role:&str)->u64 {
-    serde_json::json!({"id":fact.record.id.as_str(),"key":fact.record.record_key,"revision":fact.revision.revision,"kind":fact.record.kind.as_str(),"body":fact.revision.body_hash.as_str(),"role":role}).to_string().len() as u64
+fn entry_bytes(db:&Connection,fact:&crate::domain::ActiveFact,role:&str)->Result<u64> {
+    let size:u64=db.query_row("SELECT size FROM objects WHERE hash=?1",[fact.revision.body_hash.as_str()],|r|r.get(0))?;
+    // UTF-8 byte size is a conservative upper bound for character budgets.
+    Ok(size +
+    serde_json::json!({"id":fact.record.id.as_str(),"key":fact.record.record_key,"revision":fact.revision.revision,"kind":fact.record.kind.as_str(),"body":fact.revision.body_hash.as_str(),"role":role}).to_string().len() as u64)
 }
 pub(crate) fn apply_memory_revision_in_tx(tx:&rusqlite::Transaction,next:&crate::domain::NewRevision)->Result<(MemoryHead,u64)> {
     next.applicability.validate().map_err(|s|invalid(&s))?;
@@ -107,30 +110,19 @@ pub(crate) fn apply_memory_revision_in_tx(tx:&rusqlite::Transaction,next:&crate:
     } else {
         tx.execute("INSERT INTO memory_heads VALUES(?1,?2,'active',?3)",params![next.id.as_str(),integer(revision)?,integer(row_revision)?])?;
     }
+    if let Some((previous,_,_))=&current {
+        super::memory_invalidation::dependents(tx,next.id.as_str(),*previous,seq)?;
+    }
     Ok((MemoryHead{record_id:next.id.clone(),revision,status:"active".into(),row_revision},seq))
 }
 impl SqliteStore {
-    pub fn insert_memory_revision(&mut self,next:&crate::domain::NewRevision)->Result<(MemoryHead,u64)> {
+    pub(crate) fn insert_memory_revision(&mut self,next:&crate::domain::NewRevision)->Result<(MemoryHead,u64)> {
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
         let result=apply_memory_revision_in_tx(&tx,next)?;
         tx.commit()?;Ok(result)
     }
-    pub fn cas_memory_head(&mut self,id:&MemoryRecordId,expected:Option<u64>,next:u64)->Result<()> {
-        let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
-        let current:Option<(u64,String,u64)>=tx.query_row("SELECT revision,status,row_revision FROM memory_heads WHERE record_id=?1",[id.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-        match (expected, current.as_ref()) {
-            (None, None)=>return Err(StoreError::Conflict),
-            (Some(rev), Some((head,status,_))) if *head==rev && status=="active"=>{},
-            _=>return Err(StoreError::Conflict),
-        }
-        let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM memory_revisions WHERE record_id=?1 AND revision=?2)",params![id.as_str(),integer(next)?],|r|r.get(0))?;
-        if !exists {return Err(invalid("memory revision missing"));}
-        let row=current.map(|(_,_,r)|r).unwrap_or(0).checked_add(1).ok_or_else(||invalid("memory head row exhausted"))?;
-        tx.execute("UPDATE memory_heads SET revision=?2,row_revision=?3 WHERE record_id=?1",params![id.as_str(),integer(next)?,integer(row)?])?;
-        insert_event(&tx,"memory.head_changed",id.as_str(),next,"{}")?;
-        tx.commit()?;Ok(())
-    }
-    pub fn revoke_memory(&mut self,id:&MemoryRecordId,expected:u64,now:i64)->Result<()> {
+    #[cfg(test)]
+    pub(crate) fn revoke_memory(&mut self,id:&MemoryRecordId,expected:u64,now:i64)->Result<()> {
         let _=now;
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
         let current:(u64,String,u64)=tx.query_row("SELECT revision,status,row_revision FROM memory_heads WHERE record_id=?1",[id.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?.ok_or(StoreError::Conflict)?;
@@ -138,13 +130,16 @@ impl SqliteStore {
         let row=current.2.checked_add(1).ok_or_else(||invalid("memory head row exhausted"))?;
         tx.execute("UPDATE memory_heads SET status='revoked',row_revision=?2 WHERE record_id=?1",params![id.as_str(),integer(row)?])?;
         tx.execute("UPDATE memory_validity SET state='blocked',reason='revoked' WHERE record_id=?1 AND revision=?2",params![id.as_str(),integer(expected)?])?;
-        insert_event(&tx,"memory.revoked",id.as_str(),expected,"{}")?;
+        let seq=insert_event(&tx,"memory.revoked",id.as_str(),expected,"{}")?;
+        super::memory_invalidation::changed(&tx,id.as_str(),expected,seq,"revoke")?;
         tx.commit()?;Ok(())
     }
-    pub fn apply_memory_op(&mut self,op:MemoryPolicyOp,record_key:&str,expected_head:u64)->Result<()> {
+    #[cfg(test)]
+    pub(crate) fn apply_memory_op(&mut self,op:MemoryPolicyOp,record_key:&str,expected_head:u64)->Result<()> {
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
         if head(&tx)?!=expected_head {return Err(StoreError::Conflict);}
         apply_memory_op_in_tx(&tx,op,record_key)?;
+        insert_event(&tx,"memory.policy_applied",record_key,1,&serde_json::to_string(&op).map_err(|_|invalid("invalid memory policy"))?)?;
         tx.commit()?;Ok(())
     }
     pub fn active_facts(&mut self,now:i64)->Result<Vec<crate::domain::ActiveFact>> {
@@ -156,7 +151,8 @@ impl SqliteStore {
         if plan.profile_digest.len()!=64 {return Err(invalid("invalid profile digest"));}
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
-        if version<19 {return Err(StoreError::UnsupportedSchema(version));}
+        if version<23 {return Err(StoreError::UnsupportedSchema(version));}
+        if plan.instructions.len()>MAX_RECORD_BYTES {return Err(invalid("snapshot instructions exceed 1 MiB"));}
         let sequence=head(&tx)?;
         if sequence==0 {return Err(invalid("memory snapshot requires a committed event head"));}
         let control=super::control::read(&tx)?;
@@ -170,24 +166,43 @@ impl SqliteStore {
         let digest=heads_digest(&tx)?;
         if plan.expected_heads_digest.as_ref().is_some_and(|expected| expected!=&digest) {return Err(StoreError::Conflict);}
         let facts=load_active_facts(&tx,plan.now_unix_ms)?;
+        let required_ids={
+            let mut stmt=tx.prepare("SELECT r.id FROM memory_records r JOIN memory_heads h ON h.record_id=r.id WHERE h.status='active' AND (r.is_hard=1 OR r.kind IN ('constraint','hard_memory')) ORDER BY r.id LIMIT 10001")?;
+            stmt.query_map([],|r|r.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?
+        };
+        if required_ids.len()>10000 {return Err(StoreError::Limit("mandatory memory inventory exceeds 10000".into()));}
+        for id in required_ids {
+            if !facts.iter().any(|f|f.record.id.as_str()==id) {return Err(invalid("mandatory memory is invalid, expired, unavailable or has a stale dependency"));}
+        }
         let by_key:std::collections::BTreeMap<_,_>=facts.iter().map(|f|(&f.record.record_key,f)).collect();
         for key in &plan.request.pinned_keys {
             let Some(fact)=by_key.get(key) else {return Err(invalid("required pinned memory is missing or not an active fact"));};
             if fact.validity.reason=="unverified_import" {return Err(invalid("required pinned memory is unverified_import"));}
+            if fact.record.kind == crate::domain::MemoryKind::TaskLocal && fact.record.scope_id != format!("task:{}", plan.request.task_id) {
+                return Err(invalid("pinned task-local memory belongs to another task"));
+            }
         }
         let mut mandatory=Vec::new();
         let mut seen=std::collections::BTreeSet::new();
         for fact in &facts {
             let pinned=plan.request.pinned_keys.iter().any(|k|k==&fact.record.record_key);
-            if fact.record.kind==crate::domain::MemoryKind::Constraint || fact.record.is_hard || (!plan.coordinator && pinned) {
+            if matches!(fact.record.kind,crate::domain::MemoryKind::Constraint|crate::domain::MemoryKind::HardMemory) || fact.record.is_hard || (!plan.coordinator && pinned) {
                 if seen.insert(fact.record.id.as_str().to_string()) { mandatory.push(fact); }
             }
         }
+        let task_text:String=if plan.coordinator {"Coordinate the project using this checkpoint.".into()} else {
+            tx.query_row("SELECT title FROM tasks WHERE id=?1",[task_id.as_str()],|r|r.get(0))?
+        };
+        let task_hash=format!("{:x}",Sha256::digest(task_text.as_bytes()));
         let request_json=serde_json::to_string(&plan.request).map_err(|e|invalid(&e.to_string()))?;
-        let mut required=plan.instructions.chars().count() as u64 + request_json.chars().count() as u64;
+        let mut required=plan.instructions.chars().count() as u64 + request_json.chars().count() as u64 + task_text.chars().count() as u64 + 128;
+        if plan.estimator == crate::memory::WORKER_BRIEF_ESTIMATOR {
+            if plan.coordinator {return Err(invalid("worker brief estimator cannot select coordinator knowledge"));}
+            required=required.saturating_add(crate::memory::worker_brief_framing_chars(tx.path().ok_or_else(||invalid("worker snapshot store path missing"))?).map_err(|_|invalid("worker brief framing unavailable"))?);
+        }
         let mut entries=Vec::new();
         for fact in &mandatory {
-            required=required.saturating_add(entry_bytes(fact,"mandatory"));
+            required=required.saturating_add(entry_bytes(&tx,fact,"mandatory")?);
             entries.push(((*fact).clone(),"mandatory", if fact.record.is_hard {"hard"} else if fact.record.kind==crate::domain::MemoryKind::Constraint {"constraint"} else {"pinned"}));
         }
         if required>plan.budget_chars {
@@ -200,10 +215,8 @@ impl SqliteStore {
             let mut optional:Vec<_>=facts.iter().filter(|f| {
                 if seen.contains(f.record.id.as_str()) || matches!(f.record.kind,crate::domain::MemoryKind::Constraint|crate::domain::MemoryKind::HardMemory) {return false;}
                 let hops=dist.get(f.record.id.as_str()).copied();
-                let score=selection_score(&plan.request,f,hops);
-                if !plan.request.domains.is_empty() && !plan.request.paths.is_empty() { score>0 } else if !plan.request.domains.is_empty() {
-                    plan.request.domains.iter().any(|d| f.revision.applicability.domains.iter().any(|x| x==d)) || hops.is_some()
-                } else { true }
+                if f.record.kind == crate::domain::MemoryKind::TaskLocal && f.record.scope_id != format!("task:{}", plan.request.task_id) { return false; }
+                hops.is_some() || crate::domain::scope_matches(&plan.request, &f.revision.applicability)
             }).cloned().collect();
             optional.sort_by(|a,b|{
                 let sa=selection_score(&plan.request,a,dist.get(a.record.id.as_str()).copied());
@@ -212,7 +225,7 @@ impl SqliteStore {
             });
             let mut remaining=plan.budget_chars.saturating_sub(required);
             for fact in optional {
-                let size=entry_bytes(&fact,"optional");
+                let size=entry_bytes(&tx,&fact,"optional")?;
                 if size>remaining { omitted+=1; continue; }
                 remaining-=size; optional_bytes+=size;
                 entries.push((fact,"optional","ranked"));
@@ -231,7 +244,7 @@ impl SqliteStore {
         let manifest=entries.iter().map(|(f,role,reason)| serde_json::json!([f.record.id.as_str(),f.revision.revision,role,reason])).collect::<Vec<_>>();
         let manifest_hash=format!("{:x}",Sha256::digest(serde_json::to_vec(&manifest).map_err(|e|invalid(&e.to_string()))?));
         let instruction_digest=format!("{:x}",Sha256::digest(plan.instructions.as_bytes()));
-        let cache=serde_json::json!([task_id,task_revision,plan.config_digest,digest,SELECTION_POLICY_VERSION,plan.profile_digest,scope_digest,instruction_digest]);
+        let cache=serde_json::json!(["retained-inputs-v1",task_id,task_revision,plan.config_digest,digest,SELECTION_POLICY_VERSION,plan.profile_digest,scope_digest,instruction_digest,manifest_hash,plan.budget_chars,plan.estimator,subscriber,sequence]);
         let id=SnapshotId::new(format!("snap-{:x}",Sha256::digest(serde_json::to_vec(&cache).map_err(|e|invalid(&e.to_string()))?))).map_err(|s|invalid(&s))?;
         if tx.query_row("SELECT EXISTS(SELECT 1 FROM memory_snapshots WHERE id=?1)",[id.as_str()],|r|r.get::<_,bool>(0))? {
             let existing=id.as_str().to_string();
@@ -243,6 +256,7 @@ impl SqliteStore {
             SELECTION_POLICY_VERSION as i64,plan.estimator,integer(sequence)?,integer(required)?,integer(optional_bytes)?,
             integer(plan.budget_chars)?,integer(omitted)?,manifest_hash,scope_digest
         ])?;
+        tx.execute("INSERT INTO memory_snapshot_inputs VALUES(?1,?2,?3,?4,?5,?6,?7)",params![id.as_str(),plan.instructions,instruction_digest,task_text,task_hash,request_json,scope_digest])?;
         for (i,(fact,role,reason)) in entries.iter().enumerate() {
             tx.execute("INSERT INTO snapshot_entries VALUES(?1,?2,?3,?4,?5,?6)",params![id.as_str(),integer((i as u64)+1)?,fact.record.id.as_str(),integer(fact.revision.revision)?,role,reason])?;
         }
@@ -286,12 +300,8 @@ impl SqliteStore {
         let tx=self.connection.transaction()?;schema(&tx)?;
         let digest=heads_digest(&tx)?;tx.commit()?;Ok(digest)
     }
-    pub fn set_memory_validity(&mut self,id:&str,revision:u64,state:&str,reason:&str)->Result<()> {
-        if !matches!(state,"valid"|"stale"|"blocked") {return Err(invalid("invalid validity state"));}
-        let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
-        let n=tx.execute("UPDATE memory_validity SET state=?3,reason=?4 WHERE record_id=?1 AND revision=?2",params![id,integer(revision)?,state,reason])?;
-        if n!=1 {return Err(invalid("memory validity row missing"));}
-        tx.commit()?;Ok(())
+    pub(crate) fn shadow_import_replaceable(&mut self,id:&str)->Result<bool> {
+        Ok(self.connection.query_row("SELECT EXISTS(SELECT 1 FROM memory_records r JOIN memory_heads h ON h.record_id=r.id JOIN memory_validity v ON v.record_id=h.record_id AND v.revision=h.revision WHERE r.id=?1 AND r.is_hard=0 AND h.status='active' AND v.state='stale' AND v.reason='unverified_import')",[id],|r|r.get(0))?)
     }
     pub fn memory_record(&mut self,id:&str)->Result<Option<MemoryRecord>> {
         let tx=self.connection.transaction()?;schema(&tx)?;
@@ -326,12 +336,7 @@ impl SqliteStore {
             None=>None,
         })
     }
-    pub fn latest_memory_snapshot(&mut self,profile:&str)->Result<Option<crate::domain::MemorySnapshot>> {
-        let tx=self.connection.transaction()?;
-        let id:Option<String>=tx.query_row("SELECT id FROM memory_snapshots WHERE profile_name=?1 AND task_id<>'coordinator' ORDER BY sequence DESC LIMIT 1",[profile],|r|r.get(0)).optional()?;
-        drop(tx);
-        match id { Some(id)=>Ok(Some(self.read_memory_snapshot(&id)?)), None=>Ok(None) }
-    }
+
 }
 pub(crate) fn apply_memory_op_in_tx(tx:&rusqlite::Transaction,op:MemoryPolicyOp,record_key:&str)->Result<()> {
     let id:String=tx.query_row("SELECT id FROM memory_records WHERE record_key=?1",[record_key],|r|r.get(0)).optional()?.ok_or_else(||invalid("memory record missing"))?;
@@ -348,6 +353,9 @@ pub(crate) fn apply_memory_op_in_tx(tx:&rusqlite::Transaction,op:MemoryPolicyOp,
         }
         MemoryPolicyOp::Cutover=>return Err(invalid("cutover is not applied in the memory store")),
     }
+    let seq=insert_event(tx,"memory.record_policy_changed",&id,revision,&serde_json::to_string(&op).map_err(|_|invalid("invalid policy"))?)?;
+    if matches!(op,MemoryPolicyOp::RevokeHead) {super::memory_invalidation::changed(tx,&id,revision,seq,"policy")?;}
+    else {super::memory_delivery::record_change(tx,&format!("policy:{seq}"),&id,revision,"stop_at_checkpoint",seq)?;}
     Ok(())
 }
 use rusqlite::OptionalExtension;
@@ -359,8 +367,8 @@ mod tests {
     fn schema17_upgrade_adds_empty_memory_tables() {
         let temp=tempfile::tempdir().unwrap();let path=temp.path().join("state.db");
         let mut db=SqliteStore::create(&path).unwrap();
-        db.connection.execute_batch("DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; UPDATE store_meta SET schema_version=17; PRAGMA user_version=17;").unwrap();
-        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=22;
+        db.connection.execute_batch("DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; UPDATE store_meta SET schema_version=17; PRAGMA user_version=17;").unwrap();
+        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=25;
         assert_eq!(db.read_snapshot(None).unwrap(),before);
         assert!(db.memory_records().unwrap().is_empty());
         db.integrity_check().unwrap();

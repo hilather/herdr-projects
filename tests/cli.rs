@@ -7,6 +7,30 @@ const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
 
 #[cfg(all(feature="state-store",target_os="linux"))]
 #[test]
+fn launch_worker_snapshot_cli_retains_instructions_and_refuses_missing_source() {
+    use herdr_projects::{domain::TaskId,migration,runtime};
+    let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
+    for action in ["new","pause"] {assert!(hp(home.path(),&["--root",r,action,"demo"]).status.success());}
+    let config=home.path().join(".config/herdr-projects");std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("config.toml"),"[profiles.worker]\nkind='codex'\npermission_policy='interactive'\n").unwrap();
+    let project=root.join("demo");let plan=migration::inspect(&project).unwrap();migration::apply(&project,&plan,true).unwrap();
+    runtime::add_task(&project,TaskId::new("task").unwrap(),"Assigned work".into(),runtime::snapshot(&project).unwrap().head).unwrap();
+    let scope=home.path().join("scope.json");std::fs::write(&scope,r#"{"schema_version":1,"task_id":"task","profile":"worker","domains":[],"paths":[],"pinned_keys":[],"sensitivity":"default"}"#).unwrap();
+    std::fs::write(project.join("PROJECT.md"),"Retained instructions 🔥").unwrap();
+    let args=["--root",r,"memory","demo","snapshot","--task","task","--profile","worker","--input-file",scope.to_str().unwrap(),"--worker"];
+    let out=hp(home.path(),&args);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let snapshot:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();assert_eq!(snapshot["estimator"],"char-count-worker-brief-v2");
+    std::fs::remove_file(project.join("PROJECT.md")).unwrap();
+    let retained=herdr_projects::memory::render_knowledge_snapshot(&project,snapshot["id"].as_str().unwrap()).unwrap();
+    assert!(retained["text"].as_str().unwrap().contains("Retained instructions 🔥"));
+    let before=runtime::snapshot(&project).unwrap();let out=hp(home.path(),&args);assert!(!out.status.success());assert_eq!(runtime::snapshot(&project).unwrap(),before);
+    std::fs::write(project.join("PROJECT.md"),[0xff]).unwrap();let out=hp(home.path(),&args);assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("project instructions are not UTF-8"));assert_eq!(runtime::snapshot(&project).unwrap(),before);
+    for command in ["draft","reserve"] {let out=hp(home.path(),&["launch","demo",command,"--help"]);assert!(out.status.success());assert!(String::from_utf8_lossy(&out.stdout).contains("--selection"));}
+}
+
+#[cfg(all(feature="state-store",target_os="linux"))]
+#[test]
 fn ticker_canonical_observations_commit_cancel_and_restart_in_the_shared_pool() {
     use std::{fs,os::unix::{fs::PermissionsExt,net::UnixListener},process::Stdio,time::{Duration,Instant}};
     use herdr_projects::{migration,runtime,domain::RuntimeRoute,reconcile::ResourceState};
@@ -402,6 +426,13 @@ fn migration_cli_round_trip_keeps_memory_and_blocks_legacy_mutation() {
     let out=hp(home.path(),&["--root",root_arg,"migration","demo","restore","--destination",restore.to_str().unwrap()]);
     assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));assert!(restore.join("PROJECT.md").is_file());
 }
+#[cfg(feature="state-store")]
+fn configure_checkpoint_profile(home: &std::path::Path) {
+    let config = home.join(".config/herdr-projects");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("config.toml"), "[profiles.planner]\nkind='claude'\npermission_policy='interactive'\n").unwrap();
+}
+
 #[test]
 #[cfg(feature="state-store")]
 fn migrated_task_commands_use_revisions_and_do_not_touch_legacy_task_file() {
@@ -416,7 +447,23 @@ fn migrated_task_commands_use_revisions_and_do_not_touch_legacy_task_file() {
     let snapshot:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();let head=snapshot["head"].as_u64().unwrap().to_string();
     let args=["--root",root_arg,"task","demo","add","operator-task","--title","Keep original","--expected-head",&head];
     let out=hp(home.path(),&args);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));assert!(!hp(home.path(),&args).status.success());
+    let missing = hp(home.path(), &["--root",root_arg,"context","demo","--peek"]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("context requires profiles.planner or --profile NAME"));
+    configure_checkpoint_profile(home.path());
     let out=hp(home.path(),&["--root",root_arg,"context","demo","--peek"]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));assert!(String::from_utf8_lossy(&out.stdout).contains("Runtime owner: SQLite"));
+    let named=hp(home.path(),&["--root",root_arg,"context","demo","--peek","--session","test-context"]);
+    assert!(named.status.success(),"{}",String::from_utf8_lossy(&named.stderr));
+    let rendered=String::from_utf8(named.stdout).unwrap();assert!(rendered.contains("kind=full"));
+    let checkpoint=rendered.split_whitespace().nth(1).unwrap();
+    assert!(!hp(home.path(),&["--root",root_arg,"context","demo","--ack",checkpoint]).status.success());
+    assert!(!hp(home.path(),&["--root",root_arg,"context","demo","--session","other-context","--ack",checkpoint]).status.success());
+    assert!(hp(home.path(),&["--root",root_arg,"context","demo","--session","test-context","--ack",checkpoint]).status.success());
+    let continued=hp(home.path(),&["--root",root_arg,"context","demo","--peek","--session","test-context"]);
+    assert!(continued.status.success(),"{}",String::from_utf8_lossy(&continued.stderr));
+    assert!(String::from_utf8_lossy(&continued.stdout).contains("kind=delta"));
+    let restarted=hp(home.path(),&["--root",root_arg,"context","demo","--peek"]);
+    assert!(restarted.status.success());assert!(String::from_utf8_lossy(&restarted.stdout).contains("kind=full"));
     let out=hp(home.path(),&["--root",root_arg,"migration","demo","recover","--writers-stopped"]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
     assert_eq!(std::fs::read(root.join("demo/TASKS.md")).unwrap(),original);
     let out=hp(home.path(),&["--root",root_arg,"operations","demo","inspect"]);assert!(out.status.success());assert_eq!(serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap(),serde_json::json!([]));
@@ -431,6 +478,7 @@ fn migrated_inbox_cli_drains_once_marks_seen_and_keeps_legacy_files_untouched() 
     let plan=home.path().join("plan.json");for args in [vec!["plan","--output",plan.to_str().unwrap()],vec!["apply","--plan",plan.to_str().unwrap(),"--writers-stopped"]] {let mut full=vec!["--root",root_arg,"migration","demo"];full.extend(args);let out=hp(home.path(),&full);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));}
     let out=hp(home.path(),&["--root",root_arg,"task","demo","list"]);let snapshot:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();let head=snapshot["head"].as_u64().unwrap().to_string();
     let out=hp(home.path(),&["--root",root_arg,"operations","demo","drain-inbox","--expected-head",&head]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    configure_checkpoint_profile(home.path());
     let out=hp(home.path(),&["--root",root_arg,"context","demo","--peek"]);assert!(out.status.success());assert!(String::from_utf8_lossy(&out.stdout).contains("  body"));
     let out=hp(home.path(),&["--root",root_arg,"inbox","list","demo"]);let items:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();assert_eq!(items[0]["seen"],false);
     assert!(hp(home.path(),&["--root",root_arg,"context","demo"]).status.success());
@@ -537,7 +585,7 @@ fn migrated_runtime_bindings_require_explicit_upgrade_and_are_unverified() {
     for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
     let project=root.join("demo");std::fs::write(project.join("threads/t-0001.toml"),"id='t-0001'\nstatus='resolved'\nrepo='/repo'\n").unwrap();
     let plan=herdr_projects::migration::inspect(&project).unwrap();herdr_projects::migration::apply(&project,&plan,true).unwrap();
-    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; DROP TABLE runtime_ownership; DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; UPDATE store_meta SET schema_version=4; PRAGMA user_version=4;").unwrap();drop(raw);
+    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE memory_delivery_intents; DROP TABLE memory_import_decisions; DROP TABLE memory_import_candidates; DROP TABLE memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; DROP TABLE runtime_ownership; DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; UPDATE store_meta SET schema_version=4; PRAGMA user_version=4;").unwrap();drop(raw);
     let args=["--root",root_arg,"migration","demo","bindings"];
     let out=hp(home.path(),&args);assert!(!out.status.success());assert!(String::from_utf8_lossy(&out.stderr).contains("upgrade-store"));
     assert!(hp(home.path(),&["--root",root_arg,"migration","demo","upgrade-store"]).status.success());
@@ -1289,4 +1337,43 @@ fn ticker_canonical_routine_admits_from_hint_and_restart_keeps_one_execution() {
     // an event. Keep it alive across the initial pass and the next 15-second tick.
     let restarted=Instant::now();let mut child=spawn();wait(&mut child,&||restarted.elapsed()>=Duration::from_secs(16));stop(&mut child);
     let after=runtime::snapshot(&project).unwrap();assert_eq!(after.routine_receipts,before.routine_receipts);assert_eq!(after.deliveries,before.deliveries);assert_eq!(fs::read(project.join("ROUTINE_MARKER")).unwrap(),b"once");
+}
+
+#[cfg(feature="state-store")]
+#[test]
+fn profile_prepare_uses_pinned_owner_config_and_keeps_unknown_capabilities() {
+    use std::{fs, os::unix::fs::PermissionsExt};
+    use herdr_projects::{migration,runtime};
+    let home=tempfile::tempdir().unwrap();
+    let caller=tempfile::tempdir().unwrap();
+    let root=home.path().join("root");
+    for action in ["new","pause"] {
+        let result=hp(home.path(), &["--root",root.to_str().unwrap(),action,"demo"]);
+        assert!(result.status.success(),"{}",String::from_utf8_lossy(&result.stderr));
+    }
+    let config=home.path().join("owner.toml");
+    fs::write(&config,"[authority]\nversion=1\nrevision=7\napproval_public_key='ssh-ed25519 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'\n[profiles.worker]\nkind='claude'\npermission_policy='interactive'\nextra_args=['PRIVATE_ARG']\n[profiles.worker.budget]\nmax_wall_seconds=60\nunknown_usage='allow_with_warning'\n").unwrap();
+    let project=root.join("demo");
+    let plan=migration::inspect_with_config(&project,&config).unwrap();
+    migration::apply(&project,&plan,true).unwrap();
+    let herdr=home.path().join("herdr-bin");
+    let agent=home.path().join("agent-bin");
+    for (path,version) in [(&herdr,"herdr 0.9.1"),(&agent,"2.1.0 (Claude Code)")] {
+        fs::write(path,format!("#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 2\nprintf '%s\\n' '{version}'\n")).unwrap();
+        fs::set_permissions(path,fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let before=runtime::snapshot(&project).unwrap();
+    let output=hp(caller.path(),&["--root",root.to_str().unwrap(),"profile","prepare","demo","worker",
+        "--herdr-executable",herdr.to_str().unwrap(),"--agent-executable",agent.to_str().unwrap(),
+        "--execution-home",home.path().to_str().unwrap()]);
+    assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    let result:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["profile"]["permission_policy"]["revision"],7);
+    assert_eq!(result["profile"]["config"]["path"],config.to_str().unwrap());
+    assert_eq!(result["profile"]["capabilities"]["launch"]["status"],"unknown");
+    assert_eq!(result["launchable"],false);
+    assert_eq!(result["certified"],false);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("PRIVATE_ARG"));
+    assert_eq!(runtime::snapshot(&project).unwrap(),before);
+    assert!(!caller.path().join(".config").exists());
 }

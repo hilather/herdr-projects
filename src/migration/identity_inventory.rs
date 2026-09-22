@@ -51,6 +51,16 @@ pub fn read_identity_inventory(project:&Path,budget:&mut Budget)->Result<Vec<Run
     let(project,publication)=publication(project,budget)?;
     crate::store::identity_inventory::read(&project.join(".state/state.db"),&publication,budget)
 }
+pub fn read_launch_target_inventory(project:&Path,budget:&mut Budget)->Result<Vec<(String,crate::domain::LaunchTarget)>> {
+    let(project,publication)=publication(project,budget)?;
+    crate::store::identity_inventory::read_launch_targets(&project.join(".state/state.db"),&publication,budget)
+}
+/// Historical worktree paths remain references even when receipt publication
+/// failed or the attempt stopped. Filesystem absence is not a release receipt.
+pub fn read_worktree_inventory(project:&Path,budget:&mut Budget)->Result<Vec<(String,crate::domain::WorktreePlan)>> {
+    let(project,publication)=publication(project,budget)?;
+    crate::store::identity_inventory::read_worktrees(&project.join(".state/state.db"),&publication,budget)
+}
 pub fn read_routine_execution_hint(project:&Path,budget:&mut Budget,last:Option<&crate::domain::OperationId>,now:i64)->Result<Option<crate::store::controller_hint::RoutineExecutionHint>> {
     let(project,publication)=publication(project,budget)?;
     crate::store::controller_hint::read_routine(&project.join(".state/state.db"),&publication,budget,last,now)
@@ -58,6 +68,12 @@ pub fn read_routine_execution_hint(project:&Path,budget:&mut Budget,last:Option<
 pub fn read_controller_effect_hint(project:&Path,budget:&mut Budget,turn:u64,now:i64)->Result<Option<crate::store::controller_hint::ControllerEffectHint>> {
     let(project,publication)=publication(project,budget)?;
     crate::store::controller_hint::read(&project.join(".state/state.db"),&publication,budget,turn,now)
+}
+/// Include already-reserved launch advancement in the bounded controller rotation.
+/// This read-only selection grants no authority to create or resume resources.
+pub fn read_controller_dispatch_hint(project:&Path,budget:&mut Budget,turn:u64,now:i64,include_launches:bool)->Result<Option<crate::store::controller_hint::ControllerEffectHint>> {
+    let(project,publication)=publication(project,budget)?;
+    crate::store::controller_hint::read_with_launches(&project.join(".state/state.db"),&publication,budget,turn,now,include_launches)
 }
 pub fn read_observation_head(project:&Path,budget:&mut Budget)->Result<u64> {
     let(project,publication)=publication(project,budget)?;

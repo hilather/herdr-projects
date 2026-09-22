@@ -18,6 +18,10 @@ pub(crate) fn exclusive_file(path:&Path)->Result<File> {
 /// Exclusive compatibility barrier for migration, cleanup and terminal effects.
 pub struct RootGuard {_file:File}
 impl RootGuard {
+    #[cfg(feature="state-store")]
+    pub(crate) fn inherit(&self)->Result<Vec<crate::runner::InheritedLock>> {
+        Ok(vec![crate::runner::InheritedLock::new(self._file.try_clone()?)])
+    }
     pub fn exclusive(root:&Path)->Result<Self> {
         let file=exclusive_file(&root.join(".execution.lock"))?;
         Ok(Self{_file:file})

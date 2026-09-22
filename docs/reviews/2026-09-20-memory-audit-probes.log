@@ -1,0 +1,148 @@
+mise WARN  Failed to resolve tool version list for claude: [~/.config/mise/config.toml] claude@latest: no versions found for claude matching date filter
+mise WARN  Failed to resolve tool version list for gemini: [~/.config/mise/config.toml] gemini@latest: no versions found for gemini matching date filter
+   Compiling herdr-projects v0.1.0 (/home/brewerm/git/herdr-projects)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.50s
+     Running tests/review_memory_audit.rs (target/debug/deps/review_memory_audit-5236e1f215ebef65)
+
+running 17 tests
+test abandoned_gc_claim_must_be_recoverable_after_reopen ... FAILED
+test accepted_proposal_must_protect_its_body_from_gc ... FAILED
+test coordinator_must_refuse_missing_mandatory_bytes ... FAILED
+test coordinator_output_must_fit_profile_budget ... FAILED
+test coordinator_snapshots_need_session_specific_subscriptions ... FAILED
+test corrupt_object_bytes_must_not_be_rendered_as_verified_memory ... FAILED
+test cutover_must_verify_object_bytes_before_publishing_authority ... FAILED
+test delta_must_include_changed_project_instructions ... FAILED
+test import_plan_must_bind_the_supplied_inventory_to_its_digest ... FAILED
+test mandatory_body_must_count_towards_snapshot_budget ... FAILED
+test newly_hard_rule_must_not_reuse_optional_snapshot ... FAILED
+test promote_must_recheck_hard_rule_changes_since_review ... FAILED
+test promotion_replay_must_return_same_sequence ... FAILED
+test reingesting_collected_bytes_must_restore_availability ... FAILED
+test snapshot_cache_must_not_reintroduce_expired_facts ... FAILED
+test supported_object_body_must_not_be_silently_truncated_on_render ... FAILED
+test unrelated_domain_and_path_must_not_match_only_because_of_kind_weight ... FAILED
+
+failures:
+
+---- abandoned_gc_claim_must_be_recoverable_after_reopen stdout ----
+
+thread 'abandoned_gc_claim_must_be_recoverable_after_reopen' (657) panicked at tests/review_memory_audit.rs:176:5:
+assertion `left == right` failed: stranded gc_deleting object never reconciled
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- accepted_proposal_must_protect_its_body_from_gc stdout ----
+
+thread 'accepted_proposal_must_protect_its_body_from_gc' (658) panicked at tests/review_memory_audit.rs:95:5:
+GC removed the body of an accepted proposal
+
+---- coordinator_must_refuse_missing_mandatory_bytes stdout ----
+
+thread 'coordinator_must_refuse_missing_mandatory_bytes' (659) panicked at tests/review_memory_audit.rs:140:5:
+context succeeded with missing mandatory rule bytes
+
+---- coordinator_output_must_fit_profile_budget stdout ----
+
+thread 'coordinator_output_must_fit_profile_budget' (660) panicked at tests/review_memory_audit.rs:161:24:
+oversized context: 9007 chars
+
+---- coordinator_snapshots_need_session_specific_subscriptions stdout ----
+
+thread 'coordinator_snapshots_need_session_specific_subscriptions' (661) panicked at tests/review_memory_audit.rs:79:5:
+assertion `left == right` failed
+  left: "coordinator:session-a"
+ right: "coordinator:session-b"
+
+---- corrupt_object_bytes_must_not_be_rendered_as_verified_memory stdout ----
+
+thread 'corrupt_object_bytes_must_not_be_rendered_as_verified_memory' (662) panicked at tests/review_memory_audit.rs:150:5:
+context accepted corrupted bytes under the original hash
+
+---- cutover_must_verify_object_bytes_before_publishing_authority stdout ----
+
+thread 'cutover_must_verify_object_bytes_before_publishing_authority' (663) panicked at tests/review_memory_audit.rs:240:5:
+assertion `left == right` failed: failed cutover published SQLite authority before verifying imported objects: Err(EvidenceUnavailable { object: ObjectId("35379d9c009e290d702b72abf3f5f9bdbaa7e00a63fc37b5174fc3825c8095e3") })
+  left: "sqlite-v1"
+ right: "legacy-markdown"
+
+---- delta_must_include_changed_project_instructions stdout ----
+
+thread 'delta_must_include_changed_project_instructions' (667) panicked at tests/review_memory_audit.rs:252:5:
+delta omitted changed standing project instructions
+
+---- import_plan_must_bind_the_supplied_inventory_to_its_digest stdout ----
+
+thread 'import_plan_must_bind_the_supplied_inventory_to_its_digest' (668) panicked at tests/review_memory_audit.rs:277:5:
+altered empty inventory accepted under the original nonempty plan digest
+
+---- mandatory_body_must_count_towards_snapshot_budget stdout ----
+
+thread 'mandatory_body_must_count_towards_snapshot_budget' (669) panicked at tests/review_memory_audit.rs:63:5:
+8,000-character mandatory body was admitted under a 1,000-character cap
+
+---- newly_hard_rule_must_not_reuse_optional_snapshot stdout ----
+
+thread 'newly_hard_rule_must_not_reuse_optional_snapshot' (670) panicked at tests/review_memory_audit.rs:187:5:
+assertion `left == right` failed
+  left: "optional"
+ right: "mandatory"
+
+---- promote_must_recheck_hard_rule_changes_since_review stdout ----
+
+thread 'promote_must_recheck_hard_rule_changes_since_review' (671) panicked at tests/review_memory_audit.rs:107:5:
+a stale informational proposal rewrote a now-hard record
+
+---- promotion_replay_must_return_same_sequence stdout ----
+
+thread 'promotion_replay_must_return_same_sequence' (672) panicked at tests/review_memory_audit.rs:117:5:
+assertion `left == right` failed: replayed receipt changed event sequence
+  left: 6
+ right: 5
+
+---- reingesting_collected_bytes_must_restore_availability stdout ----
+
+thread 'reingesting_collected_bytes_must_restore_availability' (673) panicked at tests/review_memory_audit.rs:87:5:
+ingest returned success but object remains purged
+
+---- snapshot_cache_must_not_reintroduce_expired_facts stdout ----
+
+thread 'snapshot_cache_must_not_reintroduce_expired_facts' (674) panicked at tests/review_memory_audit.rs:71:5:
+cached expired fact returned
+
+---- supported_object_body_must_not_be_silently_truncated_on_render stdout ----
+
+thread 'supported_object_body_must_not_be_silently_truncated_on_render' (675) panicked at tests/review_memory_audit.rs:267:9:
+assertion `left == right` failed: render returned success with a truncated object body
+  left: 65537
+ right: 100000
+
+---- unrelated_domain_and_path_must_not_match_only_because_of_kind_weight stdout ----
+
+thread 'unrelated_domain_and_path_must_not_match_only_because_of_kind_weight' (676) panicked at tests/review_memory_audit.rs:203:5:
+unrelated infra record selected for UI-only scope
+
+
+failures:
+    abandoned_gc_claim_must_be_recoverable_after_reopen
+    accepted_proposal_must_protect_its_body_from_gc
+    coordinator_must_refuse_missing_mandatory_bytes
+    coordinator_output_must_fit_profile_budget
+    coordinator_snapshots_need_session_specific_subscriptions
+    corrupt_object_bytes_must_not_be_rendered_as_verified_memory
+    cutover_must_verify_object_bytes_before_publishing_authority
+    delta_must_include_changed_project_instructions
+    import_plan_must_bind_the_supplied_inventory_to_its_digest
+    mandatory_body_must_count_towards_snapshot_budget
+    newly_hard_rule_must_not_reuse_optional_snapshot
+    promote_must_recheck_hard_rule_changes_since_review
+    promotion_replay_must_return_same_sequence
+    reingesting_collected_bytes_must_restore_availability
+    snapshot_cache_must_not_reintroduce_expired_facts
+    supported_object_body_must_not_be_silently_truncated_on_render
+    unrelated_domain_and_path_must_not_match_only_because_of_kind_weight
+
+test result: FAILED. 0 passed; 17 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+
+error: test failed, to rerun pass `--test review_memory_audit`

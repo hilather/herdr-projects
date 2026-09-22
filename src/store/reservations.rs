@@ -6,7 +6,7 @@ fn invalid(s:&str)->StoreError {StoreError::Invalid(s.into())}
 fn schema(db:&Connection)->Result<()> {check_schema(db)?;let n:u32=db.query_row("PRAGMA user_version",[],|r|r.get(0))?;if n<11{return Err(StoreError::UnsupportedSchema(n));}Ok(())}
 fn hash(s:&str)->bool {s.len()==64&&s.bytes().all(|c|c.is_ascii_hexdigit())}
 fn reference(r:&VersionedReference)->bool {!r.id.is_empty()&&r.id.len()<=512&&!r.id.chars().any(char::is_control)&&r.revision>0&&hash(&r.digest)}
-fn validate_inputs(i:&LaunchInputs)->Result<()> {
+pub(super) fn validate_inputs(i:&LaunchInputs)->Result<()> {
     if !matches!(i.version,1|2)||!Path::new(&i.project_store).is_absolute()||i.task_revision==0||i.scheduler_revision==0||i.control_epoch==0||i.binding.is_empty()||i.binding.len()>512||i.binding_revision==0||!hash(&i.binding_digest)||!reference(&i.profile)||!reference(&i.approval)||!Path::new(&i.config.path).is_absolute()||i.config.digest.as_ref().is_some_and(|d|!hash(d)) {return Err(invalid("invalid sealed launch inputs"));}
     match (i.version,&i.effective_profile) {
         (1,None)=>{},
@@ -21,7 +21,7 @@ fn validate_inputs(i:&LaunchInputs)->Result<()> {
     let mut tasks=BTreeSet::new();for d in &i.dependencies {if d.task==i.task||d.task_revision==0||!reference(&d.evidence)||!tasks.insert(&d.task){return Err(invalid("invalid dependency input vector"));}}
     Ok(())
 }
-fn record_ids(i:&LaunchInputs)->Result<(AttemptId,OperationId)> {
+pub(crate) fn record_ids(i:&LaunchInputs)->Result<(AttemptId,OperationId)> {
     let digest=format!("{:x}",Sha256::digest(serde_json::to_vec(i).map_err(|e|invalid(&e.to_string()))?));
     Ok((AttemptId::new(format!("attempt-{digest}")).map_err(StoreError::Invalid)?,OperationId::new(format!("launch-{digest}")).map_err(StoreError::Invalid)?))
 }
@@ -61,14 +61,26 @@ pub(super) fn read_cancellations_with_budget(db:&Connection,budget:Option<&read_
 fn event(db:&Connection,kind:&str,id:&str,revision:u64,payload:&impl serde::Serialize)->Result<()> {db.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?1,?2,?3,1,?4)",params![kind,id,integer(revision)?,serde_json::to_string(payload).map_err(|e|invalid(&e.to_string()))?])?;Ok(())}
 
 impl SqliteStore {
-    /// Select the oldest/aged highest-priority ready preparation supplied by the
-    /// trusted profile/authority producer. No public/CLI producer exists yet.
+    /// Select the oldest/aged highest-priority trusted preparation. Approval,
+    /// capacity and all mutable input checks stay inside the transaction.
     pub fn reserve_prepared(&mut self,prepared:&[PreparedLaunch],expected_head:u64,now:i64)->Result<Reservation> {
+        self.admit_prepared(prepared,expected_head,now,false)?.ok_or_else(||invalid("reservation missing"))
+    }
+
+    /// A draft checks the same admission conditions without requiring an approval
+    /// that cannot be signed until the exact action has been constructed.
+    /// This path returns before any task, attempt, event or operation is written.
+    pub(crate) fn validate_launch_draft(&mut self,inputs:&LaunchInputs,expected_head:u64,now:i64)->Result<()> {
+        self.admit_prepared(&[PreparedLaunch{inputs:inputs.clone()}],expected_head,now,true)?;
+        Ok(())
+    }
+
+    fn admit_prepared(&mut self,prepared:&[PreparedLaunch],expected_head:u64,now:i64,draft:bool)->Result<Option<Reservation>> {
         super::delivery::now_check(now)?;if prepared.is_empty()||prepared.len()>128{return Err(invalid("reservation requires 1–128 ready preparations"));}
         let path=std::fs::canonicalize(self.connection.path().ok_or_else(||invalid("store path missing"))?).map_err(|e|StoreError::Io(e.to_string()))?;
         let mut seen=BTreeSet::new();for p in prepared {validate_inputs(&p.inputs)?;if p.inputs.version!=2 {return Err(invalid("new reservations require effective profile evidence"));}if Path::new(&p.inputs.project_store)!=path||!seen.insert(&p.inputs.task){return Err(invalid("preparation belongs to another store or duplicates a task"));}}
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
-        let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;if version<12{return Err(StoreError::UnsupportedSchema(version));}
+        let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;if version<13{return Err(StoreError::UnsupportedSchema(version));}
         if head(&tx)?!=expected_head{return Err(StoreError::Conflict);}
         let scheduler=super::scheduler::read(&tx)?;let control=super::control::read(&tx)?;
         if control.state!=ProjectState::Active||control.reconciliation_required{return Err(invalid("project is not admitted"));}
@@ -77,8 +89,10 @@ impl SqliteStore {
         let queued:BTreeMap<_,_>=scheduler.queue.iter().map(|q|(&q.task,q)).collect();let mut ranked=Vec::new();
         for preparation in prepared {
             let i=&preparation.inputs;if i.scheduler_revision!=scheduler.policy.revision||i.control_epoch!=control.epoch||i.config.digest!=control.config_digest{return Err(StoreError::Conflict);}
-            if i.memory.is_some()||!i.dependencies.is_empty(){return Err(invalid("memory and dependency evidence producers are not available"));}
+            if !i.dependencies.is_empty(){return Err(invalid("dependency evidence producers are not available"));}
+            super::worker_knowledge::validate(&tx,i,now)?;
             super::budget::check(&tx,i.budget.as_ref(),false)?;
+            if !draft {super::approvals::validate_preparation(&tx,i,now)?;}
             let task=tasks.iter().find(|t|t.id==i.task&&t.revision==i.task_revision).ok_or(StoreError::Conflict)?;let queue=queued.get(&task.id).ok_or(StoreError::Conflict)?;
             if task.state!=TaskState::Queued||task.active_attempt.is_some()||!queue.dependencies.is_empty()||queue.enqueued_unix_ms>now||attempts.iter().any(|a|a.task==task.id&&a.retains_capacity()) {return Err(invalid("task is not ready for reservation"));}
             if attempts.iter().filter(|a|a.task==task.id).count()>=scheduler.policy.max_attempts_per_task as usize{return Err(invalid("task attempt limit reached"));}
@@ -90,18 +104,22 @@ impl SqliteStore {
             if !binding.identity.repo.is_empty()&&!i.repositories.iter().any(|r|r.repository==binding.identity.repo){return Err(invalid("recorded repository lacks a pinned input"));}
             let score=(now-queue.enqueued_unix_ms)/60_000+queue.priority as i64;ranked.push((score,queue.enqueue_sequence,&preparation.inputs));
         }
+        if draft {return Ok(None);}
         ranked.sort_by(|a,b|b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.task.cmp(&b.2.task)));let inputs=ranked[0].2.clone();let(attempt_id,operation_id)=record_ids(&inputs)?;
         let task_revision=inputs.task_revision.checked_add(1).ok_or_else(||invalid("task revision exhausted"))?;
         let mut task=tasks.iter().find(|t|t.id==inputs.task).cloned().ok_or(StoreError::Conflict)?;task.revision=task_revision;task.state=TaskState::Running;task.active_attempt=Some(attempt_id.clone());
         let record=AttemptInputRecord{attempt:attempt_id.clone(),operation:operation_id.clone(),inputs};let payload=serde_json::to_string(&record).map_err(|e|invalid(&e.to_string()))?;if payload.len()>MAX_RECORD_BYTES{return Err(invalid("attempt inputs exceed 1 MiB"));}
-        let digest=format!("{:x}",Sha256::digest(payload.as_bytes()));let attempt=Attempt{id:attempt_id.clone(),task:record.inputs.task.clone(),revision:1,state:AttemptState::Reserved,snapshot:None,reservation:format!("worker:{}",attempt_id.as_str()),termination_observed:false};
-        tx.execute("INSERT INTO attempts VALUES(?1,?2,1,'reserved',NULL,?3,0)",params![attempt_id.as_str(),attempt.task.as_str(),attempt.reservation])?;
+        let digest=format!("{:x}",Sha256::digest(payload.as_bytes()));let attempt=Attempt{id:attempt_id.clone(),task:record.inputs.task.clone(),revision:1,state:AttemptState::Reserved,snapshot:record.inputs.memory.as_ref().map(|r|r.id.clone()),reservation:format!("worker:{}",attempt_id.as_str()),termination_observed:false};
+        tx.execute("INSERT INTO attempts VALUES(?1,?2,1,'reserved',?4,?3,0)",params![attempt_id.as_str(),attempt.task.as_str(),attempt.reservation,attempt.snapshot])?;
         tx.execute("UPDATE tasks SET revision=?2,state='running',active_attempt=?3 WHERE id=?1",params![attempt.task.as_str(),integer(task_revision)?,attempt_id.as_str()])?;
         tx.execute("INSERT INTO operations VALUES(?1,?2,'runtime.launch',?3,1,?4,?5,?6,?7,?1)",params![operation_id.as_str(),attempt.task.as_str(),record.inputs.binding,payload,digest,integer(task_revision)?,now])?;
         tx.execute("INSERT INTO attempt_inputs VALUES(?1,?2,?3,?4)",params![attempt_id.as_str(),operation_id.as_str(),payload,digest])?;
         event(&tx,"attempt.reserved",attempt_id.as_str(),1,&record)?;event(&tx,"task.changed",attempt.task.as_str(),task_revision,&task)?;
         event(&tx,"operation.enqueued",operation_id.as_str(),task_revision,&record)?;
-        let result=Reservation{head:head(&tx)?,record,task_revision};tx.commit()?;Ok(result)
+        let result=Reservation{head:head(&tx)?,record,task_revision};
+        #[cfg(test)]
+        tests::crash_boundary("before_reservation_commit");
+        tx.commit()?;Ok(Some(result))
     }
 
     pub fn cancel_attempt(&mut self,id:&AttemptId,expected_revision:u64,expected_head:u64,reason:&str,now:i64)->Result<CancellationChange> {
@@ -139,4 +157,4 @@ impl SqliteStore {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

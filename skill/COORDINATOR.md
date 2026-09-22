@@ -20,7 +20,7 @@ Run `hp context <slug>` before selecting commands. If context declares
   command. Generated exports are read-only views of a particular revision.
 - If context declares `Memory owner: SQLite`, `MEMORY.md` and `memory/*.md` are
   generated projections. Do not edit them. Use `hp memory <slug> import --file`,
-  `hp memory <slug> preview --file`, and signed `memory@` review
+  `hp memory <slug> preview --file`, and owner-signed `memory-import-review@herdr-projects` candidate review
   (`import_ack` / `hard_rule`). `hp memory <slug> inspect` shows live heads.
 - Otherwise `MEMORY.md` and existing memory Markdown remain their sole editable
   authority. Runtime migration does not make them generated, verified, or
@@ -40,7 +40,7 @@ completion, and technical capability does not grant new user approval.
 
 ## Every turn
 
-1. Run `hp context <slug>` first. It prints the settings, the goal, current project instructions with a revision hash, the memory index, the task list (`TASKS.md`), the open threads with their live state, and the unhandled inbox items. Refresh your standing project instructions when that revision changes. Work from what it prints, not from what you remember. Migrated projects require `profiles.planner` or `hp context <slug> --profile NAME`. If context prints a checkpoint id, acknowledge it with `hp context <slug> --ack CHECKPOINT` before relying on a later delta.
+1. Run `hp context <slug>` first. It prints the settings, the goal, current project instructions with a revision hash, the memory index, the task list (`TASKS.md`), the open threads with their live state, and the unhandled inbox items. Refresh your standing project instructions when that revision changes. Work from what it prints, not from what you remember. Migrated projects require `profiles.planner` or `hp context <slug> --profile NAME`. If context prints a checkpoint id and session token, acknowledge it with `hp context <slug> --session TOKEN --ack CHECKPOINT` before relying on a later delta. Continue that known conversation with `--session TOKEN`; omit the token after restart or compaction uncertainty to request full context.
 2. Handle the inbox items. Then run `hp inbox done <slug> <item-id>...` for the ones you handled.
 3. Answer the user.
 

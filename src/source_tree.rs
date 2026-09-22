@@ -148,6 +148,26 @@ impl Directory {
             _=>NodeKind::Other,
         }))
     }
+    /// Preserve a link's literal target through an O_PATH descriptor. Never open
+    /// the target, including absolute, dangling or outside-directory targets.
+    #[cfg(target_os="linux")]
+    #[allow(dead_code)] // Repository capture uses the library copy of this shared module.
+    pub fn link_bytes(&self,name:&OsStr,budget:&mut Budget)->Result<Vec<u8>> {
+        budget.check()?;ensure!(self.kind(name)?==Some(NodeKind::Link),"entry is not a symbolic link");
+        let name=CString::new(name.as_bytes())?;
+        let fd=unsafe{libc::openat(self.0.as_raw_fd(),name.as_ptr(),libc::O_PATH|libc::O_NOFOLLOW|libc::O_CLOEXEC)};
+        if fd<0{return Err(io::Error::last_os_error().into());}
+        let file=unsafe{File::from_raw_fd(fd)};let before=file.metadata()?;
+        ensure!(before.file_type().is_symlink()&&before.nlink()==1&&before.len()<=4096,"unsupported symbolic link metadata");
+        let mut bytes=vec![0;4097];
+        let n=unsafe{libc::readlinkat(file.as_raw_fd(),c"".as_ptr(),bytes.as_mut_ptr().cast(),bytes.len())};
+        if n<0{return Err(io::Error::last_os_error().into());}
+        ensure!(n as usize<=4096&&n as u64==before.len(),"symbolic link target changed or exceeds bounds");
+        bytes.truncate(n as usize);budget.remaining=budget.remaining.checked_sub(n as u64).ok_or(Limit::Bytes)?;
+        let after=file.metadata()?;
+        ensure!(after.file_type().is_symlink()&&after.nlink()==1&&before.len()==after.len()&&before.ctime()==after.ctime()&&before.ctime_nsec()==after.ctime_nsec(),"symbolic link changed during read");
+        budget.check()?;Ok(bytes)
+    }
     pub fn optional(&self,name:&OsStr)->Result<Option<File>> {
         match self.child(name) {Ok(file)=>Ok(Some(file)),Err(e) if e.downcast_ref::<io::Error>().is_some_and(|e|e.kind()==io::ErrorKind::NotFound)=>Ok(None),Err(e)=>Err(e)}
     }
@@ -247,6 +267,21 @@ pub fn unchanged(file:&File,before:&Metadata)->Result<()> {
 mod tests {
     use super::*;
     use std::{fs,io::Write,os::unix::fs::symlink};
+
+    #[cfg(target_os="linux")]
+    #[test]
+    fn link_targets_are_literal_bounded_bytes_and_never_dereferenced() {
+        let root=tempfile::tempdir().unwrap();let directory=Directory::open(root.path()).unwrap();let name=OsStr::new("link");
+        for target in [b"/outside/does-not-exist".as_slice(),b"../relative",&[b'x',255,b'y']] {
+            symlink(OsStr::from_bytes(target),root.path().join(name)).unwrap();
+            assert_eq!(directory.link_bytes(name,&mut Budget::new()).unwrap(),target);
+            let mut small=Budget::new();small.remaining=1;assert!(directory.link_bytes(name,&mut small).is_err());
+            let mut cancelled=Budget::new();cancelled.cancellation.cancel();assert!(directory.link_bytes(name,&mut cancelled).is_err());
+            let mut expired=Budget::new();expired.deadline=Instant::now();assert!(directory.link_bytes(name,&mut expired).is_err());
+            fs::remove_file(root.path().join(name)).unwrap();
+        }
+        fs::write(root.path().join(name),b"regular").unwrap();assert!(directory.link_bytes(name,&mut Budget::new()).is_err());
+    }
 
     #[test]
     fn cancelled_owned_cleanup_can_resume_after_a_durable_unlink() {

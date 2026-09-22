@@ -1,4 +1,4 @@
-//! Artifact finalization receipts mean preserved bytes awaiting review, never success.
+//! Artifact finalization receipts mean preserved bytes, never verified success.
 use anyhow::{Context,Result,ensure};
 use serde::{Deserialize,Serialize};
 use sha2::{Digest,Sha256};
@@ -42,7 +42,7 @@ impl Finalization {
         ensure!(self.authority=="operator.artifact_finalization"&&hash(&self.report_hash)&&!self.reason.trim().is_empty()&&self.reason.len()<=4096,"invalid finalization scope or evidence");
         ensure!(control.state!=ProjectState::Archived&&control.epoch==self.control_epoch,"finalization lifecycle changed");
         let task=tasks.iter().find(|t|Some(&t.id)==op.task.as_ref()&&t.revision==op.expected_revision).context("finalization task changed")?;
-        ensure!(task.active_attempt.is_none()&&!matches!(task.state,TaskState::Running|TaskState::Succeeded|TaskState::Cancelled),"finalization task is active or terminal");
+        ensure!(task.active_attempt.is_none()&&!matches!(task.state,TaskState::Running|TaskState::Succeeded),"finalization task is active or already succeeded");
         ensure!(!attempts.iter().any(|a|a.task==task.id&&a.retains_capacity()),"attempt termination must be reconciled before finalization");
         let binding=bindings.iter().find(|b|b.id==self.binding&&b.revision==self.binding_revision&&b.task==op.task).context("finalization binding changed")?;
         ensure!(op.target==binding.id&&binding.identity.machine.is_empty()&&binding.identity.thread_dir==self.source&&std::path::Path::new(&self.source).is_absolute(),"finalization requires the recorded local artifact source");

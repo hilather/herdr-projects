@@ -76,3 +76,53 @@ fn canonical_finalization_owner_death_recovers_only_verified_receipts_without_so
         if phase=="before"{assert!(result.is_err());assert_eq!(runtime::snapshot(&path).unwrap(),before);}else{result.unwrap();let after=runtime::snapshot(&path).unwrap();assert_eq!(after.deliveries[0].state,DeliveryState::Confirmed);assert_eq!(after.deliveries[0].attempts,1);assert_eq!(after.tasks.iter().find(|t|Some(&t.id)==op.task.as_ref()).unwrap().state,TaskState::AwaitingReview);}
     }
 }
+
+#[cfg(target_os="linux")]
+#[test]
+fn stop_snapshot_finalizes_without_source_in_foreground_and_queued_paths() {
+    use herdr_projects::domain::*;
+    // Seed historical canonical evidence directly. Native creation/stop provenance
+    // is covered by canonical_worker tests; this fixture tests both consumers.
+    for mode in ["foreground","queued","corrupt","absent"] {
+        let(world,path,old)=fixture();let mut state=runtime::snapshot(&path).unwrap();
+        let binding=state.runtime_bindings.iter_mut().find(|b|b.id==old.target).unwrap();
+        let mut inputs:LaunchInputs=serde_json::from_str(include_str!("../tests/fixtures/launch-inputs-v1.json")).unwrap();
+        inputs.project_store=path.join(".state/state.db").to_str().unwrap().into();inputs.task=old.task.clone().unwrap();inputs.binding=binding.id.clone();inputs.binding_revision=binding.revision;
+        let id=digest(&serde_json::to_vec(&inputs).unwrap());let attempt=AttemptId::new(format!("attempt-{id}")).unwrap();let launch=OperationId::new(format!("launch-{id}")).unwrap();
+        let source=worker_output_path(&inputs,&attempt).unwrap();binding.identity.thread_dir=source.clone();
+        let record=AttemptInputRecord{attempt:attempt.clone(),operation:launch.clone(),inputs};let body=serde_json::to_string(&record).unwrap();
+        let raw=rusqlite::Connection::open(path.join(".state/state.db")).unwrap();
+        // The v2 ingress trigger excludes new v1 reservations; retain that rule
+        // while installing this read-compatibility fixture as historical data.
+        let trigger:String=raw.query_row("SELECT sql FROM sqlite_master WHERE name='attempt_inputs_effective_profile'",[],|r|r.get(0)).unwrap();
+        raw.execute_batch("DROP TRIGGER attempt_inputs_effective_profile;").unwrap();
+        raw.execute("INSERT INTO attempts VALUES(?1,?2,1,'cancelled',NULL,?1,1)",rusqlite::params![attempt.as_str(),old.task.as_ref().unwrap().as_str()]).unwrap();
+        raw.execute("INSERT INTO operations VALUES(?1,?2,'runtime.launch',?3,1,?4,?5,?6,0,?1)",rusqlite::params![launch.as_str(),old.task.as_ref().unwrap().as_str(),old.target,body,digest(body.as_bytes()),record.inputs.task_revision+1]).unwrap();
+        raw.execute("INSERT INTO attempt_inputs VALUES(?1,?2,?3,?4)",rusqlite::params![attempt.as_str(),launch.as_str(),body,digest(body.as_bytes())]).unwrap();raw.execute_batch(&trigger).unwrap();
+        let payload=serde_json::to_string(binding).unwrap();raw.execute("UPDATE runtime_bindings SET payload=?2,payload_hash=?3 WHERE id=?1",rusqlite::params![binding.id,payload,digest(payload.as_bytes())]).unwrap();
+        let report=digest(b"preserved report");let artifact=digest(&[0,255,3]);
+        let manifest=herdr_projects::worktree_preservation::OutputManifest{version:1,attempt:attempt.clone(),source:source.clone(),entries:vec![
+            herdr_projects::worktree_preservation::Entry{symlink:false,path:"library".into(),directory:true,executable:false,bytes:0,sha256:String::new()},
+            herdr_projects::worktree_preservation::Entry{symlink:false,path:"library/binary".into(),directory:false,executable:true,bytes:3,sha256:artifact.clone()},
+            herdr_projects::worktree_preservation::Entry{symlink:false,path:"report.md".into(),directory:false,executable:false,bytes:16,sha256:report.clone()},
+        ]};
+        let bytes=serde_json::to_vec(&manifest).unwrap();let manifest_hash=digest(&bytes);let directory=path.join(".state/worker-output-snapshots").join(attempt.as_str()).join(&manifest_hash);
+        fs::create_dir_all(&directory).unwrap();fs::write(directory.join("manifest.json"),bytes).unwrap();fs::write(directory.join(&report),b"preserved report").unwrap();fs::write(directory.join(&artifact),[0,255,3]).unwrap();
+        let process=herdr_projects::worker_supervision::ProcessIncarnation{pid:1,device:1,inode:1};
+        let stop=WorkerTerminationReceipt{version:1,attempt:attempt.clone(),launch,binding:binding.id.clone(),binding_revision:binding.revision,ownership_revision:1,
+            supervisor:herdr_projects::worker_supervision::SupervisorIdentity{version:1,boot_id:"00000000-0000-0000-0000-000000000001".into(),host_id:None,observer_namespace:(1,1),worker_namespace:(1,2),outer:process.clone(),init:process},
+            host_reboot:None,repository_snapshots:vec![],output_snapshot:Some(AttemptOutputReference{source:source.clone(),digest:if mode=="absent"{None}else{Some(manifest_hash)}}),retained_resources:binding.identity.clone(),cause:WorkerTerminationCause::Cancellation,observed_unix_ms:0};
+        raw.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.worker_terminated',?1,1,1,?2)",rusqlite::params![attempt.as_str(),serde_json::to_string(&stop).unwrap()]).unwrap();
+        if mode=="queued" {raw.execute("UPDATE tasks SET state='cancelled' WHERE id=?1",[old.task.as_ref().unwrap().as_str()]).unwrap();}
+        let state=runtime::snapshot(&path).unwrap();assert!(!Path::new(&source).exists());
+        if mode=="absent" {assert!(receipt::enqueue(&world.ctx(),&path,&old.target,state.head,"recover".into()).is_err());assert_eq!(runtime::snapshot(&path).unwrap(),state);continue;}
+        let op=receipt::enqueue(&world.ctx(),&path,&old.target,state.head,"recover preserved outputs".into()).unwrap();
+        if mode=="corrupt" {fs::create_dir_all(&source).unwrap();fs::write(Path::new(&source).join("report.md"),b"preserved report").unwrap();fs::write(directory.join(&artifact),b"bad").unwrap();let before=runtime::snapshot(&path).unwrap();let request=input(&world.ctx(),&path,&op,1,Mode::Deliver);assert!(execute(&request,&control()).is_err());assert_eq!(runtime::snapshot(&path).unwrap(),before);continue;}
+        if mode=="foreground" {receipt::deliver(&world.ctx(),&path,&op.id,1).unwrap();}else{let request=input(&world.ctx(),&path,&op,1,Mode::Deliver);execute(&request,&control()).unwrap();}
+        let after=runtime::snapshot(&path).unwrap();assert!(after.deliveries.iter().any(|d|d.operation==op.id&&d.state==DeliveryState::Confirmed));
+        if mode=="queued" {assert_eq!(after.tasks,state.tasks);}
+        let payload=Finalization::decode(&op).unwrap();let published=receipt::load_receipt_controlled(&receipt::project(&path).unwrap(),&op,&payload,&control()).unwrap().unwrap();
+        let captured=path.join(".state/canonical-artifacts").join(published.artifact_key).join(published.snapshot);
+        assert_eq!(fs::read(captured.join("library/binary")).unwrap(),[0,255,3]);assert_eq!(fs::read(captured.join("report.md")).unwrap(),b"preserved report");assert!(!Path::new(&source).exists());
+    }
+}

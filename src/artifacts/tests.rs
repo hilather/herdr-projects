@@ -245,3 +245,29 @@ fn canonical_publication_rechecks_source_after_authorization() {
     assert!(result.is_err());assert_eq!(calls,2);
     assert_eq!(fs::read_dir(project.state_dir().join("canonical-artifacts").join(&record.id)).unwrap().count(),0);
 }
+
+#[cfg(all(feature="state-store",target_os="linux"))]
+#[test]
+fn preserved_outputs_publish_artifacts_without_original_source_and_recheck_authority() {
+    use herdr_projects::{domain::{AttemptId,AttemptOutputReference},worktree_preservation::{Entry as OutputEntry,OutputManifest,load_outputs}};
+    let(world,project,record)=canonical_fixture();let _lease=crate::cleanup::lease(&world.root).unwrap();
+    let original=capture_canonical_controlled(&project,&record,&Control::default(),None,||Ok(())).unwrap();
+    let attempt=AttemptId::new(format!("attempt-{}","c".repeat(64))).unwrap();
+    let mut entries=Vec::new();let mut blobs=Vec::new();
+    for (name,bytes) in [("library",None),("library/artifact",Some(b"preserved bytes".as_slice())),("report.md",Some(b"report for review\n".as_slice())),("extra",Some(b"not an artifact".as_slice()))] {
+        let digest=bytes.map(crate::thread::sha256_hex).unwrap_or_default();
+        entries.push(OutputEntry{symlink:false,path:name.into(),directory:bytes.is_none(),executable:false,bytes:bytes.map_or(0,|b|b.len() as u64),sha256:digest.clone()});
+        if let Some(bytes)=bytes{blobs.push((digest,bytes));}
+    }
+    let manifest=OutputManifest{version:1,attempt:attempt.clone(),source:record.thread_dir.clone(),entries};let bytes=serde_json::to_vec(&manifest).unwrap();let digest=crate::thread::sha256_hex(&bytes);
+    let root=project.state_dir().join("worker-output-snapshots").join(attempt.as_str()).join(&digest);fs::create_dir_all(&root).unwrap();fs::write(root.join("manifest.json"),bytes).unwrap();for (id,bytes) in blobs{fs::write(root.join(id),bytes).unwrap();}
+    fs::remove_dir_all(&record.thread_dir).unwrap();
+    let outputs=load_outputs(&project.dir(),&attempt,&AttemptOutputReference{source:record.thread_dir.clone(),digest:Some(digest)},&herdr_projects::source_tree::Control::default()).unwrap();
+    let loaded=capture_preserved_outputs(&project,&record,&outputs,&Control::default(),||Ok(())).unwrap();assert_eq!(loaded.id,original.id);assert_eq!(loaded.manifest,original.manifest);
+    assert!(!Path::new(&record.thread_dir).exists());
+    let target=project.state_dir().join("canonical-artifacts").join(&record.id).join(&loaded.id);
+    assert_eq!(fs::read(target.join("library/artifact")).unwrap(),b"preserved bytes");assert!(!target.join("extra").exists());
+    let calls=std::cell::Cell::new(0);
+    assert!(capture_preserved_outputs(&project,&record,&outputs,&Control::default(),||{calls.set(calls.get()+1);ensure!(calls.get()<2,"revoked");Ok(())}).is_err());
+    assert_eq!(calls.get(),2);assert_eq!(load_canonical_controlled(&project,&record,&loaded.id,&Control::default()).unwrap(),original.manifest);
+}

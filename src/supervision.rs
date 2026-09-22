@@ -59,7 +59,13 @@ fn safe_environment(target:&Cmd)->Result<Vec<(String,String)>> {
     for (key,value) in &target.env {
         // Session routing is allowed only when explicitly bound by the caller;
         // it is never inherited from the ambient supervisor environment.
-        ensure!(ENVIRONMENT.contains(&key.as_str())||key=="HERDR_SOCKET_PATH","unsupported transfer environment variable (name/value withheld)");
+        // Only fixed restrictive Git settings are admitted, explicitly, for the
+        // system Git executable in an otherwise clean environment. They never
+        // become ambient inheritance or a general GIT_* escape.
+        let fixed_git=target.program=="/usr/bin/git" && target.env_clear && matches!((key.as_str(),value.as_str()),
+            ("GIT_CONFIG_NOSYSTEM","1") | ("GIT_CONFIG_GLOBAL","/dev/null") |
+            ("GIT_TERMINAL_PROMPT","0") | ("GIT_NO_LAZY_FETCH","1") | ("GIT_NO_REPLACE_OBJECTS","1"));
+        ensure!(ENVIRONMENT.contains(&key.as_str())||key=="HERDR_SOCKET_PATH"||fixed_git,"unsupported transfer environment variable (name/value withheld)");
         values.insert(key.clone(),value.clone());
     }
     ensure!(values.values().all(|v|v.len()<=8192&&!v.contains('\0'))&&values.values().map(String::len).sum::<usize>()<=65536,"transfer environment exceeds bounds");
@@ -151,6 +157,18 @@ mod tests {
             .env("BASH_ENV",&startup).env("ENV",&startup).current_dir(&project)
             .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap();
         assert!(status.success());assert!(!project.join("STARTUP_MUST_NOT_RUN").exists());
+    }
+    #[test]
+    fn restrictive_git_settings_require_exact_values_clean_environment_and_system_git() {
+        let allowed=Cmd::new("/usr/bin/git",Duration::from_secs(1)).env("GIT_CONFIG_GLOBAL","/dev/null");
+        let mut allowed=allowed;allowed.env_clear=true;
+        assert!(safe_environment(&allowed).unwrap().contains(&("GIT_CONFIG_GLOBAL".into(),"/dev/null".into())));
+        let mut inherited=allowed.clone();inherited.env_clear=false;assert!(safe_environment(&inherited).is_err());
+        let mut foreign=allowed.clone();foreign.program="/tmp/git".into();assert!(safe_environment(&foreign).is_err());
+        for (key,value) in [("GIT_CONFIG_GLOBAL","/tmp/private"),("GIT_NO_REPLACE_OBJECTS","0"),("GIT_SSH_COMMAND","private-command")] {
+            let mut altered=allowed.clone();altered.env=vec![(key.into(),value.into())];
+            let error=safe_environment(&altered).unwrap_err().to_string();assert!(!error.contains(value));
+        }
     }
     #[test]
     fn owner_death_helper() {

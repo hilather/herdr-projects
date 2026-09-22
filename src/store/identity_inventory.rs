@@ -62,6 +62,57 @@ pub(crate) fn read_head(path:&Path,publication:&Publication,budget:&mut Budget)-
     read_published(path,publication,budget,|tx,budget|{budget.charge(8)?;Ok(super::head(tx)?)})
 }
 
+/// Selected but not yet acknowledged launch resources remain conflict evidence.
+/// Do not hide them merely because the runtime binding still has an empty pane.
+pub(crate) fn read_launch_targets(path:&Path,publication:&Publication,budget:&mut Budget)->Result<Vec<(String,LaunchTarget)>> {
+    read_published(path,publication,budget,|tx,budget|{
+        let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
+        if version<11{return Ok(Vec::new());}
+        let mut stmt=tx.prepare("SELECT e.entity,e.payload,i.payload,i.payload_hash,a.id,a.task_id,
+                o.task_id,o.kind,o.target,o.expected_revision,o.payload,o.payload_hash,o.payload_version,o.idempotency_key,e.kind FROM events e
+            LEFT JOIN attempt_inputs i ON i.operation_id=e.entity
+            LEFT JOIN attempts a ON a.id=i.attempt_id
+            LEFT JOIN operations o ON o.id=i.operation_id
+            WHERE e.kind='runtime.launch_workspace' OR (e.kind='runtime.launch_target' AND (a.id IS NULL OR a.termination_observed=0 OR NOT EXISTS(SELECT 1 FROM events started WHERE started.kind='runtime.launch_started' AND started.entity=e.entity)))")?;
+        let mut rows=stmt.query([])?;let mut targets=Vec::new();let mut seen=std::collections::BTreeSet::new();
+        while let Some(row)=rows.next()? {
+            budget.record()?;
+            for column in [0,1,2,3,4,5,6,7,8,10,11,13,14] {
+                let bytes=match row.get_ref(column)? {rusqlite::types::ValueRef::Text(b)=>b.len(),_=>anyhow::bail!("launch target lacks input provenance")};
+                ensure!(bytes<=MAX_RECORD_BYTES,"launch target field exceeds bounds");budget.charge(bytes)?;
+            }
+            let entity:String=row.get(0)?;let payload:String=row.get(1)?;let inputs:String=row.get(2)?;let hash:String=row.get(3)?;
+            let kind:String=row.get(14)?;
+            ensure!(seen.insert((entity.clone(),kind.clone())),"duplicate retained launch target");
+            ensure!(format!("{:x}",Sha256::digest(inputs.as_bytes()))==hash,"launch target input hash mismatch");
+            let target:LaunchTarget=serde_json::from_str(&payload)?;let record:AttemptInputRecord=serde_json::from_str(&inputs)?;
+            super::reservations::validate_inputs(&record.inputs)?;
+            let (attempt_id,operation_id)=super::reservations::record_ids(&record.inputs)?;
+            ensure!(record.attempt==attempt_id && record.operation==operation_id,
+                "launch target content-addressed input identity mismatch");
+            ensure!(row.get::<_,String>(5)?==record.inputs.task.as_str()
+                && row.get::<_,String>(6)?==record.inputs.task.as_str()
+                && row.get::<_,String>(7)?=="runtime.launch"
+                && row.get::<_,String>(8)?==record.inputs.binding
+                && Some(row.get::<_,u64>(9)?)==record.inputs.task_revision.checked_add(1)
+                && row.get::<_,String>(10)?==inputs && row.get::<_,String>(11)?==hash
+                && row.get::<_,u32>(12)?==1 && row.get::<_,String>(13)?==record.operation.as_str(),
+                "launch target operation provenance mismatch");
+            budget.check()?;
+            target.route.validate().map_err(anyhow::Error::msg)?;
+            ensure!(matches!((target.version,target.supervisor.is_some()),(1,false)|(2,true)) && target.operation.as_str()==entity && target.operation==record.operation && target.attempt==record.attempt && record.attempt.as_str()==row.get::<_,String>(4)?
+                && !target.route.pane_id.is_empty() && target.route.machine.is_empty() && !target.terminal.is_empty()
+                && target.session.born_nanos<1_000_000_000,"invalid retained launch target");
+            if kind=="runtime.launch_workspace" {
+                ensure!(matches!(target.version,1|2) && !target.route.workspace_id.is_empty() && !target.route.tab_id.is_empty(), "invalid owned workspace receipt");
+            }
+            if let Some(identity)=&target.supervisor {identity.validate()?;}
+            targets.push((record.inputs.binding,target));
+        }
+        Ok(targets)
+    })
+}
+
 pub(crate) fn read(path:&Path,publication:&Publication,budget:&mut Budget)->Result<Vec<RuntimeBinding>> {
     read_published(path,publication,budget,|tx,budget|{
     let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
@@ -88,3 +139,6 @@ pub(crate) fn read(path:&Path,publication:&Publication,budget:&mut Budget)->Resu
     budget.records-=count;Ok(bindings)
     })
 }
+
+mod worktrees;
+pub(crate) use worktrees::read as read_worktrees;

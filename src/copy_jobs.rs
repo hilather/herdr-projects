@@ -226,6 +226,8 @@ fn request_inner(ctx:&Ctx<'_>,project:&Project,expected:&Thread,target:Option<&s
 }
 
 mod queue;
+#[cfg(feature="state-store")]
+pub(crate) use queue::exclusive_root;
 pub use queue::Queue;
 
 #[cfg(all(test,target_os="linux"))]

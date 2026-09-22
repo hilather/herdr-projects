@@ -16,6 +16,10 @@ mod checkpoint;
 pub use checkpoint::*;
 mod proposal;
 pub use proposal::*;
+mod launch;
+pub use launch::*;
+mod worktrees;
+pub use worktrees::*;
 
 macro_rules! identifier {
     ($($name:ident),+) => { $(

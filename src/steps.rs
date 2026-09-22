@@ -144,6 +144,8 @@ pub struct Memory {
     pub canonical_observations:Option<crate::canonical_controller::observations::Reads>,
     #[cfg(feature="state-store")]
     pub canonical_effects_unknown:bool,
+    #[cfg(feature="state-store")]
+    pub canonical_maintenance_turn:bool,
     #[cfg(test)]
     clock: Option<Instant>,
 }
@@ -168,6 +170,8 @@ impl Memory {
             canonical_observations:None,
             #[cfg(feature="state-store")]
             canonical_effects_unknown:false,
+            #[cfg(feature="state-store")]
+            canonical_maintenance_turn:false,
             #[cfg(test)]
             clock: None,
         }

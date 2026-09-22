@@ -228,6 +228,19 @@ pub fn glob_match(pattern: &str, path: &str) -> bool {
     false
 }
 
+/// Match declared directory scopes and the supported terminal wildcard forms.
+/// An undeclared scope is broad; a path prefix must end at a component boundary.
+pub fn scope_matches(request: &SnapshotRequest, scope: &Applicability) -> bool {
+    (scope.domains.is_empty() && scope.paths.is_empty())
+        || (request.domains.is_empty() && request.paths.is_empty())
+        || request.domains.iter().any(|d| scope.domains.contains(d))
+        || request.paths.iter().any(|p| scope.paths.iter().any(|s| {
+            let p = p.strip_suffix("/**").or_else(|| p.strip_suffix("/*")).unwrap_or(p);
+            let s = s.strip_suffix("/**").or_else(|| s.strip_suffix("/*")).unwrap_or(s);
+            p == s || p.starts_with(&format!("{s}/")) || s.starts_with(&format!("{p}/"))
+        }))
+}
+
 fn tokens(text: &str) -> std::collections::BTreeSet<String> {
     let mut set = std::collections::BTreeSet::new();
     let mut cur = String::new();
@@ -256,4 +269,131 @@ pub fn selection_score(request: &SnapshotRequest, fact: &ActiveFact, hops: Optio
     (if domains { WEIGHTS.domain_match } else { 0 })
         + (if paths { WEIGHTS.path_overlap } else { 0 })
         + WEIGHTS.symbol_overlap + distance + kind + shared.min(WEIGHTS.lexical_cap)
+}
+
+/// The retained inputs are separate from the manifest so pre-v23 snapshots remain
+/// readable without inventing instructions which were never captured.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySnapshotInputs {
+    pub snapshot_id: SnapshotId,
+    pub task_text: String,
+    pub instructions: String,
+    pub instruction_hash: String,
+    pub request: SnapshotRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryImportCandidate {
+    pub id: String,
+    pub record_id: MemoryRecordId,
+    pub record_key: String,
+    pub expected_revision: Option<u64>,
+    pub body_hash: ObjectId,
+    pub provenance_hash: ObjectId,
+    pub created_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryImportDecision {
+    pub version: u32,
+    pub project_store: String,
+    pub authority: super::VersionedReference,
+    pub expected_head: u64,
+    pub candidate_id: String,
+    pub body_hash: ObjectId,
+    pub expected_revision: Option<u64>,
+    pub decision: String,
+}
+
+/// Constructed only by pinned owner signature verification.
+pub struct PreparedMemoryImportDecision {
+    pub(crate) document: MemoryImportDecision,
+    pub(crate) config_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryImportReceipt {
+    pub candidate_id: String,
+    pub decision: String,
+    pub sequence: u64,
+    pub resulting_revision: Option<u64>,
+    pub reused: bool,
+}
+
+/// Immutable single-change package; digest includes the receiving attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryUpdate {
+    pub delivery_id: String,
+    pub attempt_id: String,
+    pub input_snapshot_id: String,
+    pub record_id: String,
+    pub revision: u64,
+    pub body_hash: ObjectId,
+    pub triggering_seq: u64,
+    pub severity: String,
+    pub manifest_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryUpdateAck {
+    pub schema_version: u32,
+    pub delivery_id: String,
+    pub attempt_id: String,
+    pub manifest_hash: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryUpdateReceipt {
+    pub delivery_id: String,
+    pub attempt_id: String,
+    pub state: String,
+    pub manifest_hash: String,
+    pub sequence: u64,
+}
+
+/// Diagnostic only: an empty memory blocker list is not verified result evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryReadiness {
+    pub task_id: String,
+    pub attempt_id: Option<String>,
+    pub head: u64,
+    pub blockers: Vec<MemoryBlocker>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryBlocker {
+    pub kind: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryReconciliation {
+    pub version: u32,
+    pub id: String,
+    pub project_store: String,
+    pub authority: super::VersionedReference,
+    pub expected_head: u64,
+    pub expires_unix_ms: i64,
+    pub reason: String,
+    pub invalidations: Vec<MemoryInvalidationReference>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryInvalidationReference {
+    pub id: String,
+    pub task_id: String,
+    pub triggering_seq: u64,
+}
+pub(crate) struct PreparedMemoryReconciliation {
+    pub document: MemoryReconciliation,
+    pub config_digest: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryReconciliationReceipt {
+    pub id: String,
+    pub sequence: u64,
+    pub resolved: Vec<String>,
 }

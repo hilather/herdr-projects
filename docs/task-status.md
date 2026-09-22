@@ -1,11 +1,23 @@
 # Task status against the 41-card implementation plan
 
-Updated 2026-09-20. Counts describe implementation progress, not release acceptance.
+Updated 2026-09-22. Counts describe implementation progress, not release acceptance.
 Local tests do not replace the plan's independent review, macOS or live-system gates.
 
-**24 cards have local implementations; T04.1, T04.3 and T04.4 are partial and 14 have not started.** W03 has a bounded
-[reviewed handoff](w03-acceptance.md). Canonical launch crash certification remains
-an explicit W04 prerequisite before enabling launches; it is not claimed as passed.
+**17 cards have local implementations; 12 are partial and 12 have not started.**
+The independent memory review reopened T04.5, T05.1–T05.4 and T06.1–T06.2.
+See [repair progress](memory-repair-progress.md); passing regression probes does not close these cards. W03 has a bounded
+[reviewed handoff](w03-acceptance.md). Canonical launch crash/recovery evidence and the authorized live controller
+workflow are recorded in the dispatch audit; broader protocol certification is
+not claimed.
+Concrete canonical brief delivery and confirmed-worker termination/recovery now
+exist, with controller admission and persistent Linux supervisor identities. Trusted
+profile revalidation and signed draft/reservation ingress now exist. Worktree
+creation and new-launch controller admission now have implementations and fixture
+acceptance, with prepared-launch dispatch enabled after live controller validation.
+Complete vendor protocol certification remains open; see the current
+[dispatch completion audit](dispatch-enablement.md) and
+[canonical launch checklist](canonical-worker-launch.md). These additions do not
+close a card or change the counts below.
 Phase A was accepted by the user with documented testing gaps.
 
 | Wave | Scope | Implemented locally | Partial | Not started |
@@ -14,15 +26,15 @@ Phase A was accepted by the user with documented testing gaps.
 | W01 | Process, schedule, polling and recovery reliability | 5 | 0 | 0 |
 | W02 | Preservation, transport, lifecycle, diagnostics and context | 5 | 0 | 0 |
 | W03 | Transactional store, migration, outbox and reconciliation | 4 | 0 | 0 |
-| W04 | Scheduling, capacity, execution pools, profiles and authority | 2 | 3 | 0 |
-| W05 | Versioned memory, snapshots, import and coordinator checkpoints | 4 | 0 | 0 |
-| W06 | Memory proposals, promotion, updates, invalidation and barriers | 2 | 0 | 3 |
+| W04 | Scheduling, capacity, execution pools, profiles and authority | 1 | 4 | 0 |
+| W05 | Versioned memory, snapshots, import and coordinator checkpoints | 0 | 4 | 0 |
+| W06 | Memory proposals, promotion, updates, invalidation and barriers | 0 | 4 | 1 |
 | W07 | Revision-bound results, integration and review gates | 0 | 0 | 4 |
 | W08 | CI, live compatibility, failure testing and performance | 0 | 0 | 4 |
 | W09 | Pilot, packaging and release acceptance | 0 | 0 | 3 |
-| **Total** | | **24** | **3** | **14** |
+| **Total** | | **17** | **12** | **12** |
 
-Implemented locally: **T00.1–T00.2, T01.1–T01.5, T02.1–T02.5, T03.1–T03.4, T04.2, T04.5, T05.1–T05.4, T06.1, T06.2**. See
+Implemented locally: **T00.1–T00.2, T01.1–T01.5, T02.1–T02.5, T03.1–T03.4, T04.2**. See
 [implementation progress](implementation-progress.md) and
 [Phase B contract ADR](adr/0002-phase-b-contracts.md) for evidence and limits.
 
@@ -55,8 +67,9 @@ remains untested. See [transport details](remote-transport.md).
 W04 T04.1 now has a [schema-v16 scheduling foundation](scheduling.md): DAG
 validation, aged priority, retained-attempt capacity reporting and fenced CLI edits.
 Atomic reservations and immutable inputs now have a sealed internal API, and cancellation
-has an audited CLI. Production launch preparation/dispatch and termination remain
-unavailable. T04.2 now uses monotonic remote poll/retry deadlines and pass-start
+has an audited CLI. Trusted launch drafts and signed reservations now have CLI
+ingress; confirmed-worker termination/recovery exists. New-launch dispatch and
+complete resource lifecycle acceptance remain open. T04.2 now uses monotonic remote poll/retry deadlines and pass-start
 scheduling plus a shared bounded executor for asynchronous PR and remote observations;
 automatic routines now share that executor. Linux artifact transfers, launch/brief/coordinator effects, token updates and
 notifications now share supervised or guarded executor jobs. Canonical observation,
@@ -99,7 +112,7 @@ production profile resolution and verified capability evidence remain. Version-2
 reservation inputs now retain and validate frozen profile evidence; historical
 version-1 records remain readable. Explicit routine execution now has durable
 occurrence, authority and cleanup contracts; automatic ticker dispatch now uses
-the shared bounded executor with project ownership and an effect opportunity between runs. Remaining W04 work is production worker profiles (T04.3, still partial) and budgets/telemetry (T04.4). T04.2 and T04.5 are closed on Linux local evidence.
+the shared bounded executor with project ownership and an effect opportunity between runs. Remaining W04 work is production worker profiles (T04.3, still partial) and budgets/telemetry (T04.4). T04.2 has local Linux evidence; T04.5 is reopened for scoped reviewer authorization.
 T04.5 now has an [approval scope contract](authority.md) binding exact launch inputs
 without circular hashes, durable grants/revocations and atomic one-time launch-claim
 consumption. Owner-signature import now uses the migration-pinned public-key config;
@@ -138,39 +151,35 @@ The W03 handoff explicitly carries canonical launch crash tests into W04 before
 launching is enabled. Missing termination evidence and unsupported imported/remote
 adapters remain visibly blocked, rather than becoming implicit launch authority.
 W05–W09 then cover memory snapshots and promotion, verified results/integration,
-live validation, packaging and release. The 25-card count is not a time estimate.
+live validation, packaging and release. Remaining card counts are not time estimates.
 macOS remains untested; unsupported cleanup continues to refuse.
 
 
-## Current stopping point: T06.3 delivery/ack after T06.2 close (W05/W06 wave gates not claimed)
+## Current work: memory review repairs
 
-Original SQL cancellation/deadlines now cover canonical maintenance through
-observation commit, marker publication and claim expiry. Controlled snapshots
-account for core records, deliveries, inbox, runtime/provenance, observations,
-ownership, project control, scheduler, attempt inputs/cancellations, approvals,
-budget policies and routines before application copies/decoding. This is still
-input/JSON-structure accounting, not a full heap bound. T04.2 is closed on Linux
-local evidence: Control/Transfer executor, landed queues, two-second drain, and
-persisted `$root/.ticker-metrics.json` read by `herdr-projects doctor`. macOS and
-live multi-project SSH remain W08. T04.3 gained named-profile budget envelopes and
-`profile resolve` (`--agent KIND` is unique `kind` match, never `profiles.<kind>`);
-the card stays partial until a sealed per-attempt producer exists. T04.5 is closed
-on local Linux evidence: signed sequential `memory@` documents, `authority_denials`
-with `actor_channel`, and `approval PROJECT denials`. T05.1 is closed on local
-Linux evidence: immutable revisions, 64-hex objects, fenced GC, and active-facts.
-T05.2 is closed on local Linux evidence: in-transaction selection, integer
-ranking, mandatory overflow fail-closed, and a reserved coordinator constructor.
-T05.3 is closed on local Linux evidence: a separate memory journal, reviewed
-import, projection rendering, `memory cutover` to `sqlite-v1`, and post-cutover
-`brief_for` (snapshot if present, otherwise projections). Markdown remains
-memory authority until that cutover. Production launches stay disabled. Counts
-are 24 locally implemented, three partial and 14 unstarted. T05.4 is closed on
-local Linux evidence: schema 20 sessions/checkpoints, planner-or-`--profile`
-context, ack-gated deltas, fail-closed reads that do not consume the cursor, and
-doctor size printing. T06.1 is closed on local Linux evidence: idempotent
-`memory propose`, deterministic validation, and rejection of stale bases, missing
-evidence, malformed/oversized payloads and permission elevation. Proposals are
-not authoritative and are not promoted. T06.2 is closed on local Linux evidence: immutable review
-decisions, atomic promote of heads plus invalidation/intent, competing CAS, and
-stale-review rejection. The W05 and W06 wave gates are not claimed. Production
-launches stay disabled. Next: T06.3 selective delivery and acknowledgment.
+The 2026-09-20 independent review invalidated the previous local closure claims for
+T04.5 and T05.1–T06.2. Existing revision storage, policy signatures, snapshot,
+checkpoint and proposal APIs are foundations, not completed acceptance evidence.
+
+Repair batches address reproduced integrity, collection, stale-review, cache,
+budget, projection-consumption and cutover-verification failures. Schema 23 adds
+retained inputs, staged signed imports, authorized proposal review, resumable
+cutover and atomic routing obligations. Follow-up repairs add scope/dependency
+selection and consistent checkpoint publication. Schema 24 adds explicit,
+attempt-bound seen/applied receipts and pull-only update reads. Task-success
+mutations now enforce memory readiness transactionally; full wave barriers remain
+unstarted. The
+[repair tracker](memory-repair-progress.md) records exact limits and remaining work.
+Coordinator checkpoints now require explicit continuation tokens bound to canonical
+runtime route, project epoch and configuration; fresh context is the default.
+W05/W06 wave gates remain open; T06.3–T06.4 are partial; T06.5 remains unstarted. Production launches
+remain disabled. W04 profile production, complete bounded reads, macOS and live
+multi-project SSH certification retain their previous limits.
+
+Priority repairs now propagate source changes through historical dependency edges,
+exclude expired-source facts, and provide owner-signed exact invalidation
+reconciliation. Sealed reservations bind task/profile/config/manifest snapshots;
+claim and pre-effect checks reject stale knowledge. Attempt-input rendering uses
+retained text and verifies consumed/dependency bytes. Raw unsigned memory mutation
+APIs are internal/test-only. These changes do not supply a certified production
+profile/launch producer or the T06.5 wave freeze/release service.

@@ -66,6 +66,13 @@ impl ControlledStore {
         let value=self.store.read_snapshot_with_budget(at,Some(&budget)).map_err(|e|self.error(e))?;
         self.control.check()?;Ok(value)
     }
+    #[cfg(target_os="linux")]
+    pub fn native_profile_report(&mut self, reference:&VersionedReference)->Result<Option<serde_json::Value>> {
+        self.control.check()?;
+        let value=self.store.native_profile_report(reference).map_err(|e|self.error(e))?;
+        self.control.check()?;
+        Ok(value)
+    }
     pub(crate) fn schedule_routine(&mut self,prepared:&PreparedRoutineTick,head:u64)->Result<Option<RoutineOccurrence>> {
         self.mutation(|store|store.schedule_routine(prepared,head))
     }
@@ -73,6 +80,29 @@ impl ControlledStore {
         self.mutation(|store|store.record_observations(head,observations))
     }
     pub(crate) fn expire_claims(&mut self,now:i64)->Result<usize> {self.mutation(|store|store.expire_claims(now))}
+    pub(crate) fn validate_launch_draft(&mut self,inputs:&LaunchInputs,head:u64,now:i64)->Result<()> {
+        self.control.check()?;
+        self.store.validate_launch_draft(inputs,head,now).map_err(|e|self.error(e))?;
+        self.control.check()
+    }
+    pub(crate) fn reserve_prepared(&mut self,prepared:&[PreparedLaunch],head:u64,now:i64)->Result<Reservation> {
+        self.mutation(|store|store.reserve_prepared(prepared,head,now))
+    }
+    pub(crate) fn render_launch_knowledge(&mut self,project:&Path,id:&str)->anyhow::Result<serde_json::Value> {
+        self.control.check()?;
+        anyhow::ensure!(project.join(".state/state.db").canonicalize()?.to_str()==self.store.connection.path(), "knowledge store belongs to another project");
+        let result=crate::memory::render_knowledge_snapshot_held(project,id,&mut self.store)?;
+        let task=result["snapshot"]["task_id"].as_str().ok_or_else(||anyhow::anyhow!("knowledge task missing"))?;
+        let mut used=0usize;
+        for object in self.store.memory_consumed_objects(task).map_err(|e|self.error(e))? {
+            self.control.check()?;
+            let bytes=crate::memory::read_object_with_budget(&project.join(".state/objects"),&object,(64*1024*1024-used) as u64)?;
+            used=used.checked_add(bytes.len()).ok_or_else(||anyhow::anyhow!("knowledge evidence size overflow"))?;
+            anyhow::ensure!(used<=64*1024*1024,"knowledge evidence exceeds read budget");
+        }
+        self.control.check()?;
+        Ok(result)
+    }
     fn mutation<T>(&mut self,write:impl FnOnce(&mut SqliteStore)->Result<T>)->Result<T> {
         self.control.check()?;
         // A successful commit remains success even if cancellation arrives

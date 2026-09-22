@@ -13,10 +13,13 @@ pub(super) fn apply_receipt(db:&Connection,id:&OperationId,identity:&str)->Resul
     let control=super::control::read(db)?;let mut tasks=read_tasks(db)?;
     payload.validate_state(&operation,&control,&tasks,&read_attempts(db)?,&super::runtime::read_all(db)?).map_err(|_|StoreError::Conflict)?;
     let task=tasks.iter_mut().find(|t|Some(&t.id)==operation.task.as_ref()).ok_or(StoreError::Conflict)?;
+    // Capturing cancelled output preserves evidence without reviving the task.
+    if task.state!=TaskState::Cancelled {
     task.revision=task.revision.checked_add(1).ok_or_else(||StoreError::Invalid("task revision exhausted".into()))?;
     task.state=TaskState::AwaitingReview;
     db.execute("UPDATE tasks SET revision=?2,state='awaiting_review' WHERE id=?1",params![task.id.as_str(),integer(task.revision)?])?;
     db.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('task.changed',?1,?2,1,?3)",params![task.id.as_str(),integer(task.revision)?,serde_json::to_string(task).map_err(|e|StoreError::Invalid(e.to_string()))?])?;
+    }
     db.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.artifacts_finalized',?1,?2,1,?3)",params![payload.binding,integer(payload.binding_revision)?,identity])?;
     Ok(())
 }

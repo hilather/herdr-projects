@@ -49,6 +49,10 @@ fn notification_socket(db:&Connection,operation:&Operation,budget:&mut Budget)->
     ensure!(binding.identity.machine.is_empty()&&Path::new(&binding.identity.socket).is_absolute(),"notification route hint must name a local socket");budget.check()?;Ok(binding.identity.socket)
 }
 pub(crate) fn read(path:&Path,publication:&Publication,budget:&mut Budget,turn:u64,now:i64)->Result<Option<ControllerEffectHint>> {
+    read_with_launches(path,publication,budget,turn,now,false)
+}
+/// Selection only: concrete launch ingress must validate all current authority.
+pub(crate) fn read_with_launches(path:&Path,publication:&Publication,budget:&mut Budget,turn:u64,now:i64,include_launches:bool)->Result<Option<ControllerEffectHint>> {
     super::delivery::now_check(now)?;
     super::identity_inventory::read_published(path,publication,budget,|tx,budget|{
         let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;ensure!(version>=9,"upgrade-store required for controller effects");
@@ -56,18 +60,84 @@ pub(crate) fn read(path:&Path,publication:&Publication,budget:&mut Budget,turn:u
         // dangling delivery as unknown rather than filtering it out via JOIN.
         let dangling:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operation_delivery d LEFT JOIN operations o ON o.id=d.operation_id WHERE d.state IN ('pending','ambiguous') AND o.id IS NULL)",[],|r|r.get(0))?;
         ensure!(!dangling,"controller hint has an unresolved dangling delivery");
-        let mut stmt=tx.prepare("SELECT o.id,o.kind,d.revision,d.state FROM operation_delivery d JOIN operations o ON o.id=d.operation_id WHERE (d.state='pending' AND d.next_due_ms<=?1 AND o.kind IN ('runtime.notification','runtime.finalization')) OR (d.state='ambiguous' AND o.kind='runtime.finalization')")?;
+        let mut stmt=tx.prepare("SELECT o.id,o.kind,d.revision,d.state FROM operation_delivery d JOIN operations o ON o.id=d.operation_id WHERE (d.state='pending' AND d.next_due_ms<=?1 AND o.kind IN ('runtime.notification','runtime.finalization','runtime.worker_brief')) OR (d.state='ambiguous' AND o.kind='runtime.finalization')")?;
         let mut rows=stmt.query([now])?;let mut candidates=Vec::new();
         while let Some(row)=rows.next()? {
             budget.record()?;measure(row,&[0,1,3],512,budget)?;budget.charge(32)?;
             let id=OperationId::new(row.get::<_,String>(0)?).map_err(anyhow::Error::msg)?;let kind:String=row.get(1)?;let revision:u64=row.get(2)?;ensure!(revision>0,"invalid controller hint delivery revision");let state:String=row.get(3)?;
-            candidates.push((id,kind,revision,if state=="ambiguous"{EffectMode::Observe}else{EffectMode::Deliver}));
+            candidates.push((id,kind,revision,if state=="ambiguous"{EffectMode::Observe}else{EffectMode::Deliver},None));
         }
         drop(rows);drop(stmt);budget.check()?;
+        if version>=11 {
+            let mut stmt=tx.prepare("SELECT a.id,a.revision,
+                (a.state='launching' AND NOT EXISTS(SELECT 1 FROM attempt_cancellations c WHERE c.attempt_id=a.id)
+                 AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.kind='runtime.worker_brief' AND json_extract(o.payload,'$.attempt')=a.id))
+                FROM attempts a JOIN attempt_inputs i ON i.attempt_id=a.id
+                WHERE a.termination_observed=0 AND (EXISTS(SELECT 1 FROM events e WHERE e.kind IN ('runtime.launch_started','runtime.launch_target') AND e.entity=i.operation_id AND json_extract(e.payload,'$.version')=2)
+                    OR (a.state='reserved' AND EXISTS(SELECT 1 FROM events e WHERE e.kind='runtime.worktrees_creation' AND e.entity=i.operation_id)
+                        AND NOT EXISTS(SELECT 1 FROM events e WHERE e.kind GLOB 'runtime.launch_*' AND e.entity=i.operation_id)
+                        AND (EXISTS(SELECT 1 FROM attempt_cancellations c WHERE c.attempt_id=a.id)
+                            OR EXISTS(SELECT 1 FROM operation_delivery d WHERE d.operation_id=i.operation_id AND (d.lease_until_ms<=?1 OR d.state IN ('ambiguous','permanent_failure'))))))")?;
+            let mut rows=stmt.query([now])?;
+            while let Some(row)=rows.next()? {
+                budget.record()?;measure(row,&[0],512,budget)?;budget.charge(32)?;
+                let attempt=AttemptId::new(row.get::<_,String>(0)?).map_err(anyhow::Error::msg)?;let revision:u64=row.get(1)?;
+                let id=OperationId::new(format!("terminate-{}",attempt.as_str())).map_err(anyhow::Error::msg)?;
+                if row.get::<_,bool>(2)? {
+                    budget.record()?;budget.charge(1024)?;
+                    let prepare=OperationId::new(format!("prepare-brief-{}",attempt.as_str())).map_err(anyhow::Error::msg)?;
+                    candidates.push((prepare,"runtime.worker_brief_prepare".into(),revision,EffectMode::Deliver,Some(attempt.clone())));
+                }
+                candidates.push((id,"runtime.worker_termination".into(),revision,EffectMode::Observe,Some(attempt)));
+            }
+        }
+        if version>=11 {
+            let mut stmt=tx.prepare("SELECT o.id,d.revision FROM operations o JOIN operation_delivery d ON d.operation_id=o.id
+                JOIN attempt_inputs i ON i.operation_id=o.id JOIN attempts a ON a.id=i.attempt_id
+                WHERE o.kind='runtime.launch' AND d.attempts=1 AND d.state<>'confirmed' AND a.state='reserved' AND a.termination_observed=0
+                AND EXISTS(SELECT 1 FROM events e WHERE e.kind='runtime.launch_creation' AND e.entity=o.id)
+                AND (NOT EXISTS(SELECT 1 FROM events e WHERE e.kind='runtime.launch_target' AND e.entity=o.id)
+                    OR (EXISTS(SELECT 1 FROM events e WHERE e.kind='runtime.launch_release' AND e.entity=o.id)
+                        AND NOT EXISTS(SELECT 1 FROM events e WHERE e.kind='runtime.launch_started' AND e.entity=o.id)))")?;
+            let mut rows=stmt.query([])?;
+            while let Some(row)=rows.next()? {
+                budget.record()?;measure(row,&[0],512,budget)?;budget.charge(16)?;
+                let id=OperationId::new(row.get::<_,String>(0)?).map_err(anyhow::Error::msg)?;
+                let revision:u64=row.get(1)?;ensure!(revision>0,"invalid resource recovery revision");
+                candidates.push((id,"runtime.launch".into(),revision,EffectMode::Observe,None));
+            }
+        }
+        if include_launches && version>=13 {
+            let mut stmt=tx.prepare("SELECT o.id,d.revision FROM operations o
+                JOIN operation_delivery d ON d.operation_id=o.id
+                JOIN attempt_inputs i ON i.operation_id=o.id
+                JOIN attempts a ON a.id=i.attempt_id
+                JOIN tasks t ON t.id=a.task_id
+                WHERE o.kind='runtime.launch' AND a.state='reserved' AND a.termination_observed=0
+                AND t.active_attempt=a.id
+                AND EXISTS(SELECT 1 FROM project_control c WHERE c.singleton=1 AND c.state='active' AND c.reconciliation_required=0)
+                AND NOT EXISTS(SELECT 1 FROM attempt_cancellations c WHERE c.attempt_id=a.id)
+                AND ((d.state='pending' AND d.attempts=0 AND d.epoch=0 AND d.next_due_ms<=?1)
+                    OR (d.state='claimed' AND d.attempts=1 AND d.lease_until_ms>?1))")?;
+            let mut rows=stmt.query([now])?;
+            while let Some(row)=rows.next()? {
+                budget.record()?;measure(row,&[0],512,budget)?;budget.charge(16)?;
+                let id=OperationId::new(row.get::<_,String>(0)?).map_err(anyhow::Error::msg)?;
+                let revision:u64=row.get(1)?;ensure!(revision>0,"invalid launch scheduling revision");
+                // A live original claim may both have an observation hint and be
+                // eligible to advance. Offer it once, preserving rotation fairness.
+                candidates.retain(|(old,_,_,_,_)|old!=&id);
+                candidates.push((id,"runtime.launch".into(),revision,EffectMode::Deliver,None));
+            }
+        }
         if candidates.is_empty(){return Ok(None);}
         candidates.sort_by(|a,b|a.0.cmp(&b.0));
-        let(id,kind,revision,mode)=&candidates[(turn%candidates.len() as u64) as usize];
-        let operation=operation(tx,id,budget)?;ensure!(operation.kind==*kind,"controller operation kind changed");
+        let(id,kind,revision,mode,attempt)=&candidates[(turn%candidates.len() as u64) as usize];
+        // Preparation and termination are identity-bound maintenance hints, not
+        // outbox entries or authority to send a prompt or signal a PID.
+        let operation=if let Some(attempt)=attempt {Operation{id:id.clone(),task:None,kind:kind.clone(),target:attempt.as_str().into(),payload_version:1,
+            payload:serde_json::json!({"attempt":attempt}),expected_revision:*revision,due_unix_ms:now,idempotency_key:id.as_str().into()}}
+            else {operation(tx,id,budget)?};ensure!(operation.kind==*kind,"controller operation kind changed");
         let socket=if kind=="runtime.notification"{Some(notification_socket(tx,&operation,budget)?)}else{None};
         budget.charge(8)?;Ok(Some(ControllerEffectHint{head:super::head(tx)?,operation,delivery_revision:*revision,mode:*mode,notification_socket:socket}))
     })

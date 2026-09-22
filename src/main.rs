@@ -5,6 +5,8 @@ mod canonical_notification_jobs;
 #[cfg(feature="state-store")]
 mod canonical_finalization_jobs;
 #[cfg(feature="state-store")]
+mod canonical_brief_jobs;
+#[cfg(feature="state-store")]
 mod routine_jobs;
 mod actions;
 mod agents;

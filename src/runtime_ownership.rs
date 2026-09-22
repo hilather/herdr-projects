@@ -27,8 +27,51 @@ fn conflict(a:&RuntimeIdentity,b:&RuntimeIdentity)->Result<bool> {
 /// refuse instead of silently skipping records. References are conservative,
 /// including resources left attached to resolved legacy threads.
 pub(crate) fn check_conflicts(ctx:&Ctx,current:&Path,skip:Option<&str>,candidate:&RuntimeIdentity)->Result<()> {
+    check_references(ctx,current,skip,|identity|conflict(candidate,identity))
+}
+
+// Resolve existing ancestors too: a missing child below a symlink still
+// references its real parent. Dangling aliases cannot establish non-overlap.
+fn removal_location(value:&str)->Result<PathBuf> {
+    let path=Path::new(value);
+    ensure!(path.is_absolute()&&path.components().all(|c|matches!(c,std::path::Component::RootDir|std::path::Component::Normal(_))),"cleanup reference contains unresolved aliases");
+    let mut prefix=path;let mut suffix=Vec::new();
+    loop {
+        match prefix.canonicalize() {
+            Ok(mut resolved)=>{for part in suffix.iter().rev(){resolved.push(part);}return Ok(resolved);}
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{
+                match fs::symlink_metadata(prefix) {
+                    Err(missing) if missing.kind()==std::io::ErrorKind::NotFound=>{},
+                    Ok(_)=>anyhow::bail!("cleanup reference contains a dangling alias"),
+                    Err(error)=>return Err(error.into()),
+                }
+                suffix.push(prefix.file_name().context("cleanup reference has no resolvable ancestor")?);
+                prefix=prefix.parent().context("cleanup reference has no parent")?;
+            }
+            Err(error)=>return Err(error.into()),
+        }
+    }
+}
+
+/// Cleanup and reopen include cwd/output references, not just worktree claims.
+/// Retained canonical plans still protect files after their attempt stops.
+pub(crate) fn check_worktree_references(ctx:&Ctx,current:&Path,id:&str,path:&Path)->Result<()> {
+    let path=removal_location(path.to_str().context("worktree path is not UTF-8")?)?;
+    check_references(ctx,current,Some(&format!("thread:{id}")),|identity| {
+        if !identity.machine.is_empty(){return Ok(false);}
+        for reference in [&identity.worktree_path,&identity.cwd,&identity.thread_dir] {
+            if reference.is_empty(){continue;}
+            let other=removal_location(reference)?;
+            if path.starts_with(&other)||other.starts_with(&path){return Ok(true);}
+        }
+        Ok(false)
+    })
+}
+
+fn check_references(ctx:&Ctx,current:&Path,skip:Option<&str>,conflicts:impl Fn(&RuntimeIdentity)->Result<bool>)->Result<()> {
     if !exists(&ctx.root)? { return Ok(()); }
     let current=current.canonicalize()?;let mut projects=0;let mut records=0;
+    let mut target_budget=herdr_projects::store::identity_inventory::Budget::new(50*1024*1024,1024,std::time::Instant::now()+std::time::Duration::from_secs(10),Default::default())?;
     for entry in fs::read_dir(&ctx.root)?.take(1025) {
         let entry=entry?;projects+=1;ensure!(projects<=1024,"root enumeration exceeds 1024 entries");
         let kind=entry.file_type()?;if !kind.is_dir()&&!kind.is_symlink(){continue;}
@@ -43,8 +86,14 @@ pub(crate) fn check_conflicts(ctx:&Ctx,current:&Path,skip:Option<&str>,candidate
         ensure!(fs::symlink_metadata(dir.join(".state"))?.is_dir(),"project state directory must be real");
         let dir=dir.canonicalize()?;
         let bindings:Vec<(String,RuntimeIdentity)>=if exists(&dir.join(".state/format.json"))?||exists(&dir.join(".state/migration"))? {
-            let snapshot=runtime::snapshot(&dir)?;ensure!(snapshot.schema_version>=5,"upgrade neighboring project {name} before establishing resource ownership");
-            snapshot.runtime_bindings.into_iter().map(|b|(b.id,b.identity)).collect()
+            let mut identities:Vec<_>=migration::read_identity_inventory(&dir,&mut target_budget)?.into_iter().map(|b|(b.id,b.identity)).collect();
+            for (owner,target) in migration::read_launch_target_inventory(&dir,&mut target_budget)? {
+                identities.push((owner,RuntimeIdentity{machine:target.route.machine,socket:target.route.socket,workspace_id:target.route.workspace_id,tab_id:target.route.tab_id,pane_id:target.route.pane_id,cwd:target.route.cwd,..Default::default()}));
+            }
+            for (owner,plan) in migration::read_worktree_inventory(&dir,&mut target_budget)? {
+                identities.push((owner,RuntimeIdentity{repo:plan.source.repository,branch:plan.branch,worktree_path:plan.path,..Default::default()}));
+            }
+            identities
         }else{
             let coordinator:Option<Coordinator>=optional_json(&dir.join(".state/coordinator.json"))?;
             let socket=coordinator.as_ref().map(|c|c.socket.clone()).unwrap_or_default();
@@ -53,11 +102,11 @@ pub(crate) fn check_conflicts(ctx:&Ctx,current:&Path,skip:Option<&str>,candidate
             for (n,file) in fs::read_dir(dir.join("threads"))?.enumerate() {
                 ensure!(n<256,"thread inventory exceeds 256 entries");let file=file?;let path=file.path();if path.extension().is_none_or(|s|s!="toml"){continue;}
                 let thread:Thread=toml::from_str(std::str::from_utf8(&migration::read_plan_file(&path)?)?)?;crate::thread::validate_id(&thread.id)?;ensure!(path.file_stem().and_then(|s|s.to_str())==Some(thread.id.as_str()),"thread filename identity mismatch");
-                result.push((format!("thread:{}",thread.id),RuntimeIdentity{machine:thread.machine,socket:socket.clone(),workspace_id:thread.workspace_id,tab_id:thread.tab_id,pane_id:thread.pane_id,cwd:thread.cwd,worktree_path:thread.worktree_path,..Default::default()}));
+                result.push((format!("thread:{}",thread.id),RuntimeIdentity{machine:thread.machine,socket:socket.clone(),workspace_id:thread.workspace_id,tab_id:thread.tab_id,pane_id:thread.pane_id,cwd:thread.cwd,worktree_path:thread.worktree_path,thread_dir:thread.thread_dir,..Default::default()}));
             }
             result
         };
-        for (id,identity) in bindings {records+=1;ensure!(records<=1024,"resource inventory exceeds 1024 bindings");if dir==current&&skip==Some(id.as_str()){continue;}ensure!(!conflict(candidate,&identity)?,"resource is already referenced by {name}/{id}");}
+        for (id,identity) in bindings {records+=1;ensure!(records<=1024,"resource inventory exceeds 1024 bindings");if dir==current&&skip==Some(id.as_str()){continue;}ensure!(!conflicts(&identity)?,"resource is already referenced by {name}/{id}");}
     }
     Ok(())
 }
@@ -114,7 +163,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn ownership_refuses_older_schema_neighbor_and_owned_coordinator_rebind() {
-        let(world,path,_listener)=fixture();let neighbor=project::create(&world.root,"old","",vec![]).unwrap();neighbor.set_status(project::Status::Paused).unwrap();let plan=migration::inspect(&neighbor.dir()).unwrap();migration::apply(&neighbor.dir(),&plan,true).unwrap();let raw=rusqlite::Connection::open(neighbor.state_dir().join("state.db")).unwrap();raw.execute_batch("DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; DROP TABLE runtime_ownership; DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; UPDATE store_meta SET schema_version=4; PRAGMA user_version=4;").unwrap();let before=runtime::snapshot(&path).unwrap();assert!(adopt(&world.ctx(),&path,"thread:t-0001",2,before.head).is_err());assert_eq!(runtime::snapshot(&path).unwrap(),before);migration::upgrade_active(&neighbor.dir()).unwrap();
+        let(world,path,_listener)=fixture();let neighbor=project::create(&world.root,"old","",vec![]).unwrap();neighbor.set_status(project::Status::Paused).unwrap();let plan=migration::inspect(&neighbor.dir()).unwrap();migration::apply(&neighbor.dir(),&plan,true).unwrap();let raw=rusqlite::Connection::open(neighbor.state_dir().join("state.db")).unwrap();raw.execute_batch("DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; DROP TABLE runtime_ownership; DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; UPDATE store_meta SET schema_version=4; PRAGMA user_version=4;").unwrap();let before=runtime::snapshot(&path).unwrap();assert!(adopt(&world.ctx(),&path,"thread:t-0001",2,before.head).is_err());assert_eq!(runtime::snapshot(&path).unwrap(),before);migration::upgrade_active(&neighbor.dir()).unwrap();
         let route=RuntimeRoute::from_identity(&before.runtime_bindings[0].identity);runtime::rebind(&path,"thread:t-0001",2,before.head,&RuntimeRoute::default()).unwrap();let head=runtime::snapshot(&path).unwrap().head;runtime::create_binding(&path,None,None,head,&route).unwrap();let head=runtime::snapshot(&path).unwrap().head;adopt(&world.ctx(),&path,"coordinator",1,head).unwrap();let before=runtime::snapshot(&path).unwrap();assert!(runtime::rebind(&path,"coordinator",1,before.head,&RuntimeRoute::default()).is_err());assert_eq!(runtime::snapshot(&path).unwrap(),before);
     }
     #[test]

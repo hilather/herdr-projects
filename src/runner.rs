@@ -267,18 +267,11 @@ impl Runner for RealRunner {
 }
 
 fn socket_round_trip(socket: &Path, line: &str, timeout: Duration) -> Result<String> {
-    use std::io::{BufRead, BufReader};
-    use std::os::unix::net::UnixStream;
-    let mut stream = UnixStream::connect(socket)
-        .with_context(|| format!("could not connect to {}", socket.display()))?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    stream.write_all(line.as_bytes())?;
-    stream.write_all(b"\n")?;
-    let mut reply = String::new();
-    BufReader::new(stream).read_line(&mut reply)?;
-    Ok(reply)
+    socket::round_trip(socket, line, timeout)
 }
+
+#[path = "runner/socket.rs"]
+mod socket;
 
 fn nonblocking(pipe: &impl AsRawFd) -> io::Result<()> {
     let fd = pipe.as_raw_fd();

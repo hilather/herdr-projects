@@ -471,7 +471,14 @@ pub(crate) fn maintenance(project:&Path)->Result<Maintenance> {
 /// Published runtime mutations serialize with effects, without stopping the ticker.
 /// Migration/restore/upgrade still require the stronger maintenance barrier.
 pub(crate) fn runtime_mutation(project:&Path)->Result<Maintenance> {
-    let project=checked_project(project)?;Maintenance::runtime(&project)
+    let project=checked_project(project)?;
+    let guard=Maintenance::runtime(&project)?;
+    let journal=memory_journal_path(&project);
+    if exists(&journal) {
+        let memory:crate::memory::MemoryJournal=serde_json::from_slice(&read(&journal)?)?;
+        ensure!(memory.phase!=Phase::CutoverPending,"memory cutover is pending; repeat the signed memory cutover command to recover before mutations");
+    }
+    Ok(guard)
 }
 /// Validates published authority without requiring tasks to remain at import
 /// revisions. Accepted post-cutover edits must never trigger a legacy rollback.
@@ -519,4 +526,4 @@ pub(crate) fn publish_control_marker(project:&Path,db:&SqliteStore)->Result<()> 
 
 mod identity_inventory;
 pub(crate) use identity_inventory::publish_control_marker_controlled;
-pub use identity_inventory::{open_active_controlled,read_identity_inventory,read_observation_head,read_controller_effect_hint,read_routine_execution_hint};
+pub use identity_inventory::{open_active_controlled,read_identity_inventory,read_launch_target_inventory,read_worktree_inventory,read_observation_head,read_controller_effect_hint,read_controller_dispatch_hint,read_routine_execution_hint};

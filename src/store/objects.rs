@@ -21,11 +21,11 @@ pub(super) fn require_available(db:&Connection,hash:&str)->Result<()> {
     }
 }
 pub(super) fn upsert_available(db:&Connection,hash:&str,size:i64)->Result<()> {
-    if let Some((old_size,availability,collection,pins,token))=get(db,hash)? {
+    if let Some((old_size,_,_,_,_))=get(db,hash)? {
         if old_size!=size {return Err(invalid("object size mismatch"));}
-        if collection=="gc_deleting" {return Err(invalid("object is being deleted"));}
-        db.execute("UPDATE objects SET availability='available',collection='unclaimed' WHERE hash=?1 AND collection='gc_pending'",[hash])?;
-        let _=(availability,pins,token);return Ok(());
+        // Caller publishes verified bytes under the object I/O lock before this update.
+        db.execute("UPDATE objects SET availability='available',collection='unclaimed',fencing_token=fencing_token+1 WHERE hash=?1",[hash])?;
+        return Ok(());
     }
     db.execute("INSERT INTO objects VALUES(?1,?2,'available','unclaimed',0,0)",params![hash,size])?;
     Ok(())
@@ -35,17 +35,32 @@ pub(super) fn pin(db:&Connection,hash:&str)->Result<()> {
     db.execute("UPDATE objects SET pin_count=pin_count+1,collection='unclaimed' WHERE hash=?1",[hash])?;
     Ok(())
 }
+// Proposal JSON is immutable. Retain all accepted body/evidence references even
+// after review or promotion, including proposals created before retention was fixed.
+fn proposal_reference_sql(db: &Connection, hash: &str) -> Result<String> {
+    let version: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version < 21 { return Ok("0".into()); }
+    let candidates = if version>=23 {format!(" OR EXISTS(SELECT 1 FROM memory_import_candidates WHERE body_hash={hash} OR provenance_hash={hash})")} else {String::new()};
+    Ok(format!("EXISTS (SELECT 1 FROM memory_proposals p, json_each(p.payload,'$.changes') c \
+        WHERE p.review_state='validated' AND (\
+        json_extract(c.value,'$.body_object') IN ({hash}, 'sha256:' || {hash}) OR \
+        EXISTS (SELECT 1 FROM json_each(c.value,'$.evidence') e WHERE \
+        json_extract(e.value,'$.object') IN ({hash}, 'sha256:' || {hash})))) {candidates}"))
+}
 pub(super) fn referenced(db:&Connection,hash:&str)->Result<bool> {
-    let n:i64=db.query_row("SELECT EXISTS(SELECT 1 FROM memory_revisions WHERE body_hash=?1 OR provenance_hash=?1)",[hash],|r|r.get(0))?;
-    Ok(n!=0)
+    let proposal = proposal_reference_sql(db, "?1")?;
+    Ok(db.query_row(&format!("SELECT EXISTS(SELECT 1 FROM memory_revisions WHERE body_hash=?1 OR provenance_hash=?1) OR {proposal}"),[hash],|r|r.get(0))?)
 }
 pub(super) fn claim_unreferenced(db:&Connection,limit:usize)->Result<Vec<(String,i64)>> {
-    let mut stmt=db.prepare("SELECT hash,fencing_token FROM objects WHERE collection='unclaimed' AND pin_count=0 AND availability='available' AND NOT EXISTS (SELECT 1 FROM memory_revisions WHERE body_hash=objects.hash OR provenance_hash=objects.hash) LIMIT ?1")?;
-    let mut rows=stmt.query([limit as i64])?;
+    let proposal = proposal_reference_sql(db, "objects.hash")?;
+    let mut stmt=db.prepare(&format!("SELECT hash,fencing_token FROM objects WHERE pin_count=0 AND availability='available' AND NOT EXISTS (SELECT 1 FROM memory_revisions WHERE body_hash=objects.hash OR provenance_hash=objects.hash) AND NOT ({proposal}) ORDER BY hash LIMIT ?1"))?;
+    let candidates = stmt.query_map([limit as i64], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut claimed=Vec::new();
-    while let Some(row)=rows.next()? {
-        let hash:String=row.get(0)?;let token:i64=row.get(1)?;
-        db.execute("UPDATE objects SET collection='gc_pending',fencing_token=fencing_token+1 WHERE hash=?1 AND collection='unclaimed' AND pin_count=0",[hash.as_str()])?;
+    for (hash, token) in candidates {
+        // Reclaim interrupted pending/deleting states with a fresh fence. The
+        // service holds the I/O lock, so no previous collector can still unlink.
+        db.execute("UPDATE objects SET collection='gc_pending',fencing_token=fencing_token+1 WHERE hash=?1 AND fencing_token=?2 AND pin_count=0",params![hash,token])?;
         if db.changes()==1 {claimed.push((hash,token+1));}
     }
     Ok(claimed)

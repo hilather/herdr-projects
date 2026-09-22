@@ -130,6 +130,7 @@ pub struct Reads {
 impl Reads {
     pub fn new(executor:Arc<Executor>)->Self {Self{executor,pending:BTreeMap::new(),offers:BTreeMap::new(),ready:BTreeMap::new(),classified:BTreeMap::new(),rotation:BTreeMap::new(),cursor:Cursor::default(),unknown:false}}
     pub fn unknown(&self)->bool {self.unknown}
+    pub fn pending(&self)->bool {!self.pending.is_empty()}
     pub fn pending_project(&self,project:&str)->bool {self.pending.keys().any(|key|key.0==project)}
     pub fn begin_pass(&mut self) {
         self.ready.clear();self.offers.clear();self.unknown=false;for entry in self.classified.values_mut(){entry.touched=false;}

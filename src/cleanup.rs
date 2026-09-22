@@ -109,6 +109,8 @@ pub fn remove(ctx: &Ctx, project: &Project, record: &Thread, writers_stopped: bo
     let repo = fs::canonicalize(&record.repo)?.to_str().context("non-UTF-8 repository")?.to_string();
     let path = fs::canonicalize(&record.worktree_path)?.to_str().context("non-UTF-8 worktree")?.to_string();
     ensure!(path != repo && !record.branch.is_empty(), "invalid worktree identity");
+    #[cfg(feature="state-store")]
+    crate::runtime_ownership::check_worktree_references(ctx,&project.dir(),&record.id,Path::new(&path))?;
     let head = git(ctx, &repo, &["rev-parse", "--verify", &format!("refs/heads/{}", record.branch)])?;
     ensure!(registered(ctx, record, &path, &head)?, "worktree is not registered to this repository");
     ensure!(git(ctx, &path, &["rev-parse", "--show-toplevel"])? == path, "worktree root changed");
@@ -144,6 +146,9 @@ pub fn restore(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
     ensure!(fs::canonicalize(&record.repo)? == Path::new(&removal.repo), "repository identity changed");
     ensure!(git(ctx, &record.repo, &["rev-parse", "--verify", &format!("refs/heads/{}", removal.branch)])? == removal.head, "retained branch advanced; inspect before reopening");
     crate::artifacts::load(project, record, &removal.snapshot)?;
+    #[cfg(feature="state-store")]
+    crate::runtime_ownership::check_worktree_references(ctx,&project.dir(),&record.id,Path::new(&removal.path))?;
+    #[cfg(not(feature="state-store"))]
     for slug in crate::project::list_slugs(&ctx.root) {
         let owner = Project::load(&ctx.root, &slug)?;
         let (records, diagnostics) = thread::list_with_diagnostics(&owner);
@@ -210,6 +215,75 @@ mod tests {
         let record = thread::update(&project, &record.id, |t| t.artifact_snapshot = snapshot.id).unwrap();
         (root, project, env, record)
     }
+    #[cfg(all(feature="state-store",target_os="linux"))]
+    #[test]
+    fn canonical_references_block_cleanup_but_unrelated_projects_do_not() {
+        use herdr_projects::{migration,runtime,domain::RuntimeRoute};
+        for mode in ["same","missing-child","parent","alias-child","dangling-alias","unrelated","corrupt"] {
+            let (root,project,env,record)=fixture();
+            let neighbor=project::create(root.path(),"canonical","",vec![]).unwrap();
+            neighbor.set_status(project::Status::Paused).unwrap();
+            let plan=migration::inspect(&neighbor.dir()).unwrap();migration::apply(&neighbor.dir(),&plan,true).unwrap();
+            let work=Path::new(&record.worktree_path);
+            let reference=match mode {
+                "missing-child"=>work.join("not-created"),
+                "parent"=>root.path().into(),
+                "alias-child"=>{let alias=root.path().join("work-alias");std::os::unix::fs::symlink(work,&alias).unwrap();alias.join("not-created")},
+                "dangling-alias"=>{let alias=root.path().join("work-alias");std::os::unix::fs::symlink(work.join("not-created"),&alias).unwrap();alias},
+                "unrelated"|"corrupt"=>root.path().join("elsewhere"),
+                _=>work.into(),
+            };
+            let head=runtime::snapshot(&neighbor.dir()).unwrap().head;
+            runtime::create_binding(&neighbor.dir(),None,None,head,&RuntimeRoute{cwd:reference.display().to_string(),..Default::default()}).unwrap();
+            if mode=="corrupt" {fs::write(neighbor.dir().join(".state/format.json"),b"invalid").unwrap();}
+            let ctx=Ctx{root:root.path().into(),config_dir:root.path().join("cfg"),env:&env,runner:&RealRunner,detached_ticker:false};
+            let _lease=lease(root.path()).unwrap();
+            let result=remove(&ctx,&project,&record,true);
+            if mode=="unrelated" {result.unwrap();assert!(!work.exists());}
+            else {
+                let error=format!("{:#}",result.unwrap_err());
+                if mode=="dangling-alias" {assert!(error.contains("dangling alias"),"{error}");}
+                else if mode!="corrupt" {assert!(error.contains("resource is already referenced"),"{mode}: {error}");}
+                assert!(work.exists());
+                assert_eq!(fs::read(Path::new(&record.thread_dir).join("report.md")).unwrap(),b"retained report");
+                assert!(thread::load(&project,&record.id).unwrap().removal.is_none());
+            }
+        }
+    }
+
+    #[cfg(all(feature="state-store",target_os="linux"))]
+    #[test]
+    fn reopen_checks_new_canonical_references_to_the_absent_path() {
+        use herdr_projects::{migration,runtime,domain::RuntimeRoute};
+        for mode in ["same","missing-child","alias","unrelated","corrupt"] {
+            let (root,project,env,record)=fixture();
+            let ctx=Ctx{root:root.path().into(),config_dir:root.path().join("cfg"),env:&env,runner:&RealRunner,detached_ticker:false};
+            {let _lease=lease(root.path()).unwrap();remove(&ctx,&project,&record,true).unwrap();}
+            let removed=thread::load(&project,&record.id).unwrap();
+            let neighbor=project::create(root.path(),"canonical","",vec![]).unwrap();neighbor.set_status(project::Status::Paused).unwrap();
+            let plan=migration::inspect(&neighbor.dir()).unwrap();migration::apply(&neighbor.dir(),&plan,true).unwrap();
+            let work=Path::new(&record.worktree_path);
+            let reference=match mode {
+                "missing-child"=>work.join("not-created"),
+                "alias"=>{let alias=root.path().join("parent-alias");std::os::unix::fs::symlink(root.path(),&alias).unwrap();alias.join(work.file_name().unwrap())},
+                "unrelated"|"corrupt"=>root.path().join("elsewhere"),
+                _=>work.into(),
+            };
+            let head=runtime::snapshot(&neighbor.dir()).unwrap().head;
+            runtime::create_binding(&neighbor.dir(),None,None,head,&RuntimeRoute{cwd:reference.display().to_string(),..Default::default()}).unwrap();
+            if mode=="corrupt" {fs::write(neighbor.dir().join(".state/format.json"),b"invalid").unwrap();}
+            let _lease=lease(root.path()).unwrap();let result=restore(&ctx,&project,&removed);
+            if mode=="unrelated" {result.unwrap();assert!(work.is_dir());assert!(thread::load(&project,&record.id).unwrap().removal.is_none());}
+            else {
+                let error=format!("{:#}",result.unwrap_err());
+                if mode!="corrupt" {assert!(error.contains("resource is already referenced"),"{mode}: {error}");}
+                assert!(!work.exists());assert_eq!(thread::load(&project,&record.id).unwrap().removal,removed.removal);
+                assert!(!registered(&ctx,&removed,&record.worktree_path,&removed.removal.as_ref().unwrap().head).unwrap());
+            }
+            crate::artifacts::load(&project,&removed,&removed.artifact_snapshot).unwrap();
+        }
+    }
+
     #[test]
     fn lease_excludes_concurrent_lifecycle_and_releases_explicitly() {
         let root = tempfile::tempdir().unwrap();

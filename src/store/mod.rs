@@ -4,7 +4,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{fmt, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 
-const SCHEMA: u32 = 22;
+const SCHEMA: u32 = 25;
 const APPLICATION: u32 = 1_213_222_994;
 const MIN_SQLITE: i32 = 3_053_004;
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
@@ -77,6 +77,9 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../migrations/0020_coordinator_checkpoints.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0021_memory_proposals.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0022_memory_reviews.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0023_memory_inputs_and_candidates.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0024_memory_receipts.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0025_native_profiles.sql"))?;
             tx.commit()?;
         }
         // Persist the initial directory entry as well as SQLite's own commit.
@@ -155,7 +158,7 @@ impl SqliteStore {
                 Mutation::Task { expected, next } => { revision(*expected, next.revision)?; serde_json::to_value(next) },
                 Mutation::Attempt { expected, next } => { revision(*expected, next.revision)?; serde_json::to_value(next) },
                 Mutation::Enqueue(next) => {
-                    if next.kind=="runtime.launch" || next.task.is_none() || next.kind=="routine.run" {return Err(StoreError::Invalid("launch and project routine intents require their sealed service".into()));}
+                    if matches!(next.kind.as_str(),"runtime.launch"|"runtime.worker_brief") || next.task.is_none() || next.kind=="routine.run" {return Err(StoreError::Invalid("worker lifecycle and project routine intents require their sealed service".into()));}
                     integer(next.expected_revision)?;
                     if next.expected_revision == 0 || next.payload_version == 0 { return Err(StoreError::Invalid("zero operation revision/version".into())); }
                     serde_json::to_value(next)
@@ -170,6 +173,14 @@ impl SqliteStore {
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         check_schema(&tx)?;
         if head(&tx)? != commit.expected_head { return Err(StoreError::Conflict); }
+        let now = jiff::Timestamp::now().as_millisecond();
+        // Check before and after the whole batch: clearing/replacing an attempt
+        // in the same commit must not erase its outstanding memory obligations.
+        for mutation in &commit.mutations {
+            if let Mutation::Task { expected: Some(_), next } = mutation {
+                if next.state == TaskState::Succeeded { memory_barrier::enforce(&tx,next.id.as_str(),now)?; }
+            }
+        }
         for (mutation, encoded) in commit.mutations.iter().zip(encoded.iter()) {
             let (kind, entity, rev) = match mutation {
                 Mutation::Task { expected, next } => {
@@ -184,6 +195,10 @@ impl SqliteStore {
                 },
                 Mutation::Attempt { expected, next } => {
                     let id = next.id.as_str();
+                    let schema:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
+                    if schema>=11 && tx.query_row("SELECT EXISTS(SELECT 1 FROM attempt_inputs WHERE attempt_id=?1)",[id],|r|r.get::<_,bool>(0))? {
+                        return Err(StoreError::Invalid("sealed launch attempts require the lifecycle service".into()));
+                    }
                     let count = match expected {
                         None => tx.execute("INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![id, next.task.as_str(), integer(next.revision)?, next.state.as_str(), next.snapshot, next.reservation, next.termination_observed])?,
                         Some(rev) => tx.execute("UPDATE attempts SET revision=?3,state=?4,snapshot=?5,reservation=?6,termination_observed=?7 WHERE id=?1 AND task_id=?2 AND revision=?8", params![id, next.task.as_str(), integer(next.revision)?, next.state.as_str(), next.snapshot, next.reservation, next.termination_observed, integer(*rev)?])?,
@@ -209,6 +224,11 @@ impl SqliteStore {
                 let task=next.task.as_ref().ok_or(StoreError::Conflict)?;
                 let current: i64 = tx.query_row("SELECT revision FROM tasks WHERE id=?1", [task.as_str()], |r| r.get(0))?;
                 if current != integer(next.expected_revision)? { return Err(StoreError::Conflict); }
+            }
+        }
+        for mutation in &commit.mutations {
+            if let Mutation::Task { next, .. } = mutation {
+                if next.state == TaskState::Succeeded { memory_barrier::enforce(&tx,next.id.as_str(),now)?; }
             }
         }
         let head = head(&tx)?;
@@ -339,7 +359,11 @@ pub use ownership::OwnershipChange;
 
 mod scheduler;
 
-mod reservations;
+pub(crate) mod reservations;
+mod launch;
+mod worktrees;
+mod worker_brief;
+mod worker_termination;
 mod approvals;
 mod budget;
 mod memory_policy;
@@ -352,3 +376,15 @@ mod routines;
 
 pub mod identity_inventory;
 pub mod controller_hint;
+
+mod memory_candidates;
+
+mod memory_delivery;
+mod memory_receipts;
+mod memory_barrier;
+mod memory_invalidation;
+mod memory_reconciliation;
+mod worker_knowledge;
+
+#[cfg(target_os = "linux")]
+mod native_profiles;

@@ -119,3 +119,22 @@ pub struct PromotionReceipt {
     pub change_ids: Vec<String>,
     pub reused: bool,
 }
+
+/// A one-proposal owner authorization. The signature binds exact changes and keys,
+/// not a caller-supplied role. Delegated reviewer identities remain separate work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryReviewAuthorization {
+    pub version: u32,
+    pub project_store: String,
+    pub authority: super::VersionedReference,
+    pub expected_head: u64,
+    pub expires_unix_ms: i64,
+    pub proposal_digest: String,
+    pub record_keys: Vec<String>,
+    pub review: ReviewDocument,
+}
+pub(crate) struct PreparedMemoryReview {
+    pub document: MemoryReviewAuthorization,
+    pub config_digest: Option<String>,
+}

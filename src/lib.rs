@@ -39,3 +39,21 @@ pub mod prompt_claim;
 pub mod launch_claim;
 pub mod coordinator_prime;
 pub mod notification_claim;
+pub mod worker_supervision;
+#[cfg(all(feature="state-store",target_os="linux"))]
+pub mod source_tree;
+#[cfg(all(feature="state-store",target_os="linux"))]
+pub mod worktree_preservation;
+#[cfg(feature = "state-store")]
+pub mod canonical_worker;
+
+pub mod profile_config;
+
+#[cfg(feature = "state-store")]
+pub mod profile_preparation;
+
+#[cfg(all(feature = "state-store", target_os = "linux"))]
+pub mod launch_preparation;
+
+#[cfg(all(feature = "state-store", target_os = "linux"))]
+pub mod worktree_preparation;

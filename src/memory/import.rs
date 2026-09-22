@@ -172,14 +172,7 @@ fn load_journal(project: &Path) -> Result<MemoryJournal> {
 
 fn objects_dir(project: &Path) -> std::path::PathBuf { project.join(".state/objects") }
 
-fn read_object(objects: &Path, id: &ObjectId) -> Result<Vec<u8>, MemoryError> {
-    let path = objects.join("sha256").join(&id.as_str()[..2]).join(id.as_str());
-    let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&path)
-        .map_err(|_| MemoryError::EvidenceUnavailable { object: id.clone() })?;
-    let mut bytes = Vec::new();
-    file.take(FILE_LIMIT + 1).read_to_end(&mut bytes).map_err(|e| MemoryError::Invalid(e.to_string()))?;
-    Ok(bytes)
-}
+use super::read_object;
 
 fn import_bytes(memory: &mut MemoryStore, rel: &str, bytes: &[u8], migration_id: &str, expected: Option<u64>) -> Result<ImportResult, MemoryError> {
     if rel != "MEMORY.md" && !rel.starts_with("memory/") {
@@ -187,6 +180,17 @@ fn import_bytes(memory: &mut MemoryStore, rel: &str, bytes: &[u8], migration_id:
     }
     if !safe_relative(rel) { return Err(MemoryError::Invalid("unsafe import path".into())); }
     let digest = hash(bytes);
+    if let Some(existing)=memory.store.memory_record_by_key(rel)? {
+        let head=memory.store.memory_head(existing.id.as_str())?.ok_or_else(||MemoryError::Invalid("import head missing".into()))?;
+        if expected.is_some_and(|e|e!=head.revision) {return Err(MemoryError::RevisionConflict{current:vec![(existing.id,head.revision)]});}
+        let revision=memory.store.memory_revision(existing.id.as_str(),head.revision)?.ok_or_else(||MemoryError::Invalid("import revision missing".into()))?;
+        if !memory.store.shadow_import_replaceable(existing.id.as_str())? {
+            if revision.body_hash.as_str()==digest {
+                return Ok(ImportResult{record_id:existing.id.as_str().into(),record_key:rel.into(),revision:head.revision,body_hash:digest,reused:true});
+            }
+            return Err(MemoryError::Invalid("approved memory requires a staged import and signed review".into()));
+        }
+    }
     let provenance = serde_json::json!({"path": rel, "digest": digest, "span": [0, bytes.len()], "memory_migration_id": migration_id});
     let body = memory.ingest_object(bytes)?;
     let prov = memory.ingest_object(provenance.to_string().as_bytes())?;
@@ -240,23 +244,43 @@ fn contained_relative(project: &Path, file: &Path) -> Result<String> {
     Ok(rel.into())
 }
 
-pub fn import_file(project: &Path, file: &Path, expected_revision: Option<u64>) -> Result<ImportResult> {
+pub fn import_file(project: &Path, file: &Path, expected_revision: Option<u64>) -> Result<MemoryImportCandidate> {
     let project = checked_project(project)?;
     let _guard = migration::runtime_mutation(&project)?;
     let rel = contained_relative(&project, file)?;
-    refuse_special(&project.join(&rel), &rel)?;
     let bytes = read_memory_file(&project.join(&rel))?;
-    let migration_id = if exists(&memory_journal_path(&project)) {
-        load_journal(&project).map(|j| j.plan.digest).unwrap_or_else(|_| hash(bytes.as_slice()))
-    } else { hash(bytes.as_slice()) };
     let mut memory = MemoryStore::from_sqlite(migration::open_active(&project)?, objects_dir(&project));
-    Ok(import_bytes(&mut memory, &rel, &bytes, &migration_id, expected_revision)?)
+    let existing = memory.store.memory_record_by_key(&rel)?;
+    if existing.is_some() { ensure!(expected_revision.is_some(), "manual edit requires --expected-revision from memory preview"); }
+    let id = match existing { Some(r)=>r.id, None=>record_id_for(&rel)? };
+    let body = memory.ingest_object(bytes.as_slice())?;
+    let provenance = memory.ingest_object(serde_json::json!({"path":rel,"body":body,"expected_revision":expected_revision,"source":"manual_import_candidate"}).to_string().as_bytes())?;
+    let candidate = MemoryImportCandidate {
+        id:format!("candidate-{}",hash(serde_json::json!([id,expected_revision,body,provenance]).to_string().as_bytes())),
+        record_id:id, record_key:rel, expected_revision, body_hash:body, provenance_hash:provenance,
+        created_unix_ms:jiff::Timestamp::now().as_millisecond(),
+    };
+    Ok(memory.store.stage_memory_import(&candidate)?)
+}
+
+/// Preview retained bytes, independent of later edits to the source file.
+pub fn import_candidate_preview(project: &Path, id: &str) -> Result<serde_json::Value> {
+    let mut db = migration::open_active(project)?;
+    let candidate = db.memory_import_candidate(id)?.context("import candidate missing")?;
+    let proposed = String::from_utf8(read_object(&objects_dir(project),&candidate.body_hash)?)?;
+    let original = match candidate.expected_revision {
+        Some(revision) => {
+            let old=db.memory_revision(candidate.record_id.as_str(),revision)?.context("candidate base missing")?;
+            Some(String::from_utf8(read_object(&objects_dir(project),&old.body_hash)?)?)
+        }, None=>None,
+    };
+    Ok(serde_json::json!({"candidate":candidate,"original":original,"proposed":proposed}))
 }
 
 fn import_plan_held(project: &Path, plan: &MemoryPlan) -> Result<Vec<ImportResult>> {
     ensure!(Path::new(&plan.project) == project, "memory plan project mismatch");
     let current = crate::memory::plan(project)?;
-    ensure!(current.digest == plan.digest, "memory sources changed; regenerate the plan");
+    ensure!(serde_json::to_value(&current)? == serde_json::to_value(plan)?, "memory plan does not match the current inventory; regenerate the plan");
     let mut journal = MemoryJournal { version: 1, phase: Phase::Prepared, plan: plan.clone() };
     save_journal(project, &journal)?;
     let mut memory = MemoryStore::from_sqlite(migration::open_active(project)?, objects_dir(project));
@@ -379,19 +403,47 @@ pub fn cutover(project: &Path, plan: &MemoryPlan, policy: &PreparedMemoryPolicy,
     ensure!(policy.policy.memory_plan_digest.as_deref() == Some(plan.digest.as_str()), "cutover memory_plan_digest does not match the plan");
     ensure!(policy.policy.expected_memory_owner.as_deref() == Some(MEMORY_LEGACY), "cutover expected_memory_owner must be legacy-markdown");
     let marker = migration::read_format(&project)?;
-    ensure!(marker.memory == MEMORY_LEGACY, "memory cutover requires format.memory=legacy-markdown");
     ensure!(marker.migration == plan.runtime_migration, "W03 migration digest changed; regenerate the memory plan");
-    let current = crate::memory::plan(&project)?;
-    ensure!(current.digest == plan.digest, "memory sources changed; regenerate the plan");
-    backup_memory(&project, plan)?;
+    ensure!(exists(&memory_journal_path(&project)), "import memory before cutover");
+    let mut journal = load_journal(&project)?;
+    ensure!(journal.plan == *plan, "memory journal plan mismatch");
+    let snapshot=migration::open_active(&project)?.read_snapshot(None)?;
+    let installed=snapshot.memory_policies.iter().find(|p|p.revision==policy.policy.revision);
+    if let Some(installed)=installed {ensure!(installed==&policy.policy,"cutover authorization does not match committed policy");}
+    if journal.phase==Phase::Active {
+        ensure!(installed.is_some() && marker.memory==MEMORY_SQLITE,"active cutover receipt or owner missing");
+        return Ok(journal);
+    }
+    ensure!(matches!(journal.phase, Phase::Imported | Phase::Verified | Phase::CutoverPending), "memory journal is not ready for cutover");
+    if installed.is_none() {
+        ensure!(marker.memory == MEMORY_LEGACY, "memory authority changed without the signed cutover receipt");
+        let current = crate::memory::plan(&project)?;
+        ensure!(current == *plan, "memory plan does not match current inventory; regenerate the plan");
+        backup_memory(&project, plan)?;
+    } else {
+        ensure!(journal.phase==Phase::CutoverPending,"committed cutover has no pending recovery journal");
+    }
     for source in &plan.sources {
         let bytes = read(&safe_join(&project.join(".state/migration/memory-backup"), &source.path)?)?;
         ensure!(hash(&bytes) == source.digest, "memory backup changed: {}", source.path);
     }
-    ensure!(exists(&memory_journal_path(&project)), "import memory before cutover");
-    let mut journal = load_journal(&project)?;
-    ensure!(journal.plan.digest == plan.digest, "memory journal plan mismatch");
-    ensure!(matches!(journal.phase, Phase::Imported | Phase::Verified | Phase::CutoverPending), "memory journal is not ready for cutover");
+    // Verify the complete imported inventory before changing either policy or owner.
+    let mut verification = migration::open_active(&project)?;
+    for source in &plan.sources {
+        let record = verification.memory_record_by_key(&source.path)?.context("imported record missing")?;
+        let head = verification.memory_head(record.id.as_str())?.context("imported head missing")?;
+        ensure!(head.status == "active", "imported head is not active");
+        let revision = verification.memory_revision(record.id.as_str(), head.revision)?.context("imported revision missing")?;
+        let body = read_object(&objects_dir(&project), &revision.body_hash)?;
+        ensure!(hash(&body) == source.digest, "imported body differs from planned source");
+        std::str::from_utf8(&body).context("imported body is not UTF-8")?;
+        let provenance = read_object(&objects_dir(&project), &revision.provenance_hash)?;
+        let provenance: serde_json::Value = serde_json::from_slice(&provenance)?;
+        ensure!(provenance["path"].as_str() == Some(source.path.as_str())
+            && provenance["digest"].as_str() == Some(source.digest.as_str())
+            && provenance["memory_migration_id"].as_str() == Some(plan.digest.as_str()), "imported provenance does not match plan");
+    }
+    drop(verification);
     if journal.phase == Phase::Imported {
         journal.phase = Phase::Verified;
         save_journal(&project, &journal)?;
@@ -403,74 +455,161 @@ pub fn cutover(project: &Path, plan: &MemoryPlan, policy: &PreparedMemoryPolicy,
     let mut db = migration::open_active(&project)?;
     let snapshot = db.read_snapshot(None)?;
     ensure!(snapshot.schema_version >= 18, "memory cutover requires schema 18 or newer");
-    db.install_memory_policy(policy, snapshot.head)?;
-    set_memory_owner(&project, MEMORY_SQLITE)?;
+    if installed.is_none() {db.install_memory_policy(policy, snapshot.head)?;}
+    if migration::read_format(&project)?.memory==MEMORY_LEGACY {set_memory_owner(&project, MEMORY_SQLITE)?;}
     let marker = migration::read_format(&project)?;
     ensure!(marker.memory == MEMORY_SQLITE && marker.runtime == "sqlite-v2" && marker.migration == plan.runtime_migration, "memory owner publication interrupted");
-    journal.phase = Phase::Active;
-    save_journal(&project, &journal)?;
-    let sequence = migration::open_active(&project)?.read_snapshot(None)?.head;
+    // The policy event is the stable publication identity across every retry.
+    let sequence = policy.policy.expected_head.checked_add(1).context("cutover sequence exhausted")?;
     render_projections(&project, plan, sequence)?;
     let db = migration::open_active(&project)?;
     migration::publish_control_marker(&project, &db)?;
     ensure!(migration::read_format(&project)?.memory == MEMORY_SQLITE, "publish_control_marker reverted memory owner");
     let _ = db;
+    journal.phase=Phase::Active;
+    save_journal(&project,&journal)?;
     Ok(journal)
 }
 
-/// Files for `compose_brief` after sqlite-v1. Snapshot render fails closed on overflow.
-pub fn load_brief_memory(project: &Path, profile: &str, budget_chars: u64) -> Result<(String, Vec<(String, String)>), MemoryError> {
-    let mut db = migration::open_active(project).map_err(|e| MemoryError::Invalid(e.to_string()))?;
-    if !profile.is_empty() {
-        if let Some(snap) = db.latest_memory_snapshot(profile).map_err(MemoryError::from)? {
-            return render_snapshot(project, &mut db, &snap, budget_chars);
-        }
-    }
-    Ok(read_projection_files(project))
+/// Abort only before the signed policy transaction changes authority. Imported
+/// objects and backups remain available; nothing is silently restored over edits.
+pub fn abort_cutover(project: &Path, plan: &MemoryPlan, writers_stopped: bool) -> Result<MemoryJournal> {
+    ensure!(writers_stopped,"confirm known writers are stopped with --writers-stopped");
+    let project=checked_project(project)?;
+    let _guard=migration::maintenance(&project)?;
+    let mut journal=load_journal(&project)?;
+    ensure!(journal.plan==*plan,"memory journal plan mismatch");
+    ensure!(migration::read_format(&project)?.memory==MEMORY_LEGACY,"memory authority already changed; forward recovery is required");
+    let snapshot=migration::open_active(&project)?.read_snapshot(None)?;
+    ensure!(!snapshot.memory_policies.iter().any(|p|p.op==MemoryPolicyOp::Cutover && p.memory_plan_digest.as_deref()==Some(plan.digest.as_str())),"signed cutover policy already committed; forward recovery is required");
+    ensure!(matches!(journal.phase,Phase::Imported|Phase::Verified|Phase::CutoverPending),"memory cutover cannot be aborted in this phase");
+    journal.phase=Phase::Imported;
+    save_journal(&project,&journal)?;
+    Ok(journal)
 }
 
-fn read_projection_files(project: &Path) -> (String, Vec<(String, String)>) {
-    let index = fs::read_to_string(project.join("MEMORY.md")).unwrap_or_default();
-    let mut names: Vec<String> = fs::read_dir(project.join("memory")).map(|entries| {
-        entries.flatten().filter_map(|e| e.file_name().into_string().ok())
-            .filter(|n| n.ends_with(".md") && !n.starts_with('.')).collect()
-    }).unwrap_or_default();
-    names.sort();
-    let files = names.into_iter().filter_map(|name| {
-        let path = project.join("memory").join(&name);
-        let regular = fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
-        regular.then(|| fs::read_to_string(&path).ok()).flatten().map(|text| (name, text))
-    }).collect();
-    (index, files)
+/// Conservative fallback for callers without a sealed task/attempt binding.
+/// Always read canonical SQLite facts, never another task's snapshot or projections.
+pub fn load_brief_memory(project: &Path, _profile: &str, budget_chars: u64) -> Result<(String, Vec<(String, String)>), MemoryError> {
+    let mut db = migration::open_active(project).map_err(|e| MemoryError::Invalid(e.to_string()))?;
+    let mut facts = db.active_facts(jiff::Timestamp::now().as_millisecond())?;
+    facts.retain(|f| f.record.scope_id == "project" && f.record.kind != MemoryKind::TaskLocal);
+    facts.sort_by_key(|f| (!(f.record.is_hard || matches!(f.record.kind, MemoryKind::Constraint | MemoryKind::HardMemory)), f.record.id.as_str().to_string()));
+    let mut rendered = String::new();
+    for fact in facts {
+        let mandatory = fact.record.is_hard || matches!(fact.record.kind, MemoryKind::Constraint | MemoryKind::HardMemory);
+        // Without task scope, only optional project-global knowledge is eligible.
+        if !mandatory && (!fact.revision.applicability.domains.is_empty() || !fact.revision.applicability.paths.is_empty()) { continue; }
+        let bytes = read_object(&objects_dir(project), &fact.revision.body_hash)?;
+        let body = std::str::from_utf8(&bytes).map_err(|_| MemoryError::Invalid("memory body is not UTF-8".into()))?;
+        let block = format!("\n## {}\n\n{body}\n", fact.record.record_key);
+        let required = rendered.chars().count() as u64 + block.chars().count() as u64;
+        if required > budget_chars {
+            if mandatory { return Err(MemoryError::RequiredContentTooLarge { required_bytes: required, budget_bytes: budget_chars }); }
+            continue;
+        }
+        rendered.push_str(&block);
+    }
+    // A single pre-budgeted block keeps compose_brief from discarding mandatory
+    // files after first packing an optional MEMORY.md index.
+    Ok((rendered, Vec::new()))
+}
+
+/// Reconstruct the recorded knowledge input without reading current project files.
+pub fn render_knowledge_snapshot(project: &Path, id: &str) -> Result<serde_json::Value> {
+    let mut db=migration::open_active(project)?;
+    render_knowledge_snapshot_held(project,id,&mut db)
+}
+
+/// Caller supplies the canonical store and holds execution ownership. Controlled
+/// callers retain their SQL interruption hooks through the complete rendering.
+pub(crate) fn render_knowledge_snapshot_held(project: &Path, id: &str, db: &mut crate::store::SqliteStore) -> Result<serde_json::Value> {
+    let snapshot=db.read_memory_snapshot(id)?;
+    let inputs=db.memory_snapshot_inputs(id)?;
+    let (memory,_)=render_snapshot(project,db,&snapshot,snapshot.budget_bytes)?;
+    let text=format!("# Project instructions\n\n{}\n\n# Task\n\n{}\n\n# Memory\n{}",inputs.instructions,inputs.task_text,memory);
+    ensure!(text.chars().count() as u64<=snapshot.budget_bytes,"retained knowledge input exceeds snapshot budget");
+    Ok(serde_json::json!({"snapshot":snapshot,"inputs":inputs,"text":text}))
+}
+
+/// Render launch knowledge solely from sealed attempt inputs and retained bytes.
+/// This does not launch a worker or turn profile probes into execution authority.
+pub fn render_attempt_knowledge(project:&Path,attempt:&str)->Result<serde_json::Value> {
+    let _guard=super::mutation_guard(project)?;
+    let mut db=migration::open_active(project)?;
+    render_attempt_knowledge_held(project,attempt,&mut db)
+}
+/// Caller retains project or root execution ownership across rendering and use.
+pub(crate) fn render_attempt_knowledge_held(project:&Path,attempt:&str,db:&mut crate::store::SqliteStore)->Result<serde_json::Value> {
+    let snapshot=db.attempt_knowledge_snapshot(attempt,jiff::Timestamp::now().as_millisecond())?;
+    let state=db.read_snapshot(None)?;
+    let sealed=state.attempt_inputs.iter().find(|r|r.attempt.as_str()==attempt).context("sealed attempt inputs missing")?;
+    ensure!(migration::config_reference(Path::new(&sealed.inputs.config.path))?==sealed.inputs.config,"worker configuration changed since approval");
+    let mut evidence_bytes=0usize;
+    for object in db.memory_consumed_objects(sealed.inputs.task.as_str())? {
+        evidence_bytes=evidence_bytes.checked_add(super::read_object_with_budget(&objects_dir(project),&object,(64*1024*1024-evidence_bytes) as u64)?.len()).context("worker evidence byte count overflow")?;
+        ensure!(evidence_bytes<=64*1024*1024,"worker evidence exceeds 64 MiB read budget");
+    }
+    let rendered=render_knowledge_snapshot(project,snapshot.id.as_str())?;
+    // Object reads occur outside SQL. Fence authoritative state again before
+    // returning a launchable input; a concurrent revocation must not pass through.
+    let current=db.attempt_knowledge_snapshot(attempt,jiff::Timestamp::now().as_millisecond())?;
+    ensure!(current==snapshot,"attempt knowledge changed while rendering");
+    let worktrees=if sealed.inputs.repositories.is_empty() {vec![]} else {crate::domain::worktree_plans(&sealed.inputs,&sealed.attempt).map_err(anyhow::Error::msg)?};
+    Ok(serde_json::json!({"estimator":snapshot.estimator,"output_directory":crate::domain::worker_output_path(&sealed.inputs,&sealed.attempt).map_err(anyhow::Error::msg)?,"worktrees":worktrees,"attempt_id":attempt,"snapshot_id":snapshot.id,"profile":snapshot.profile_name,"profile_digest":snapshot.profile_digest,"config_digest":snapshot.config_digest,"budget_chars":snapshot.budget_bytes,"text":rendered["text"]}))
+}
+
+/// Read only the immutable snapshot actually bound to this attempt.
+pub fn load_attempt_memory(project: &Path, task_id: &str, attempt_id: &str, profile: &str, profile_digest: &str, budget_chars: u64) -> Result<(String, Vec<(String, String)>), MemoryError> {
+    let mut db = migration::open_active(project).map_err(|e| MemoryError::Invalid(e.to_string()))?;
+    let state = db.read_snapshot(None)?;
+    let attempt = state.attempts.iter().find(|a| a.id.as_str() == attempt_id && a.task.as_str() == task_id)
+        .ok_or_else(|| MemoryError::Invalid("attempt/task binding missing".into()))?;
+    let id = attempt.snapshot.as_ref().ok_or_else(|| MemoryError::Invalid("attempt snapshot binding missing".into()))?;
+    let snap = db.read_memory_snapshot(id.as_str())?;
+    if snap.task_id != task_id || snap.profile_name != profile || snap.profile_digest != profile_digest {
+        return Err(MemoryError::Invalid("attempt snapshot profile/task mismatch".into()));
+    }
+    render_snapshot(project, &mut db, &snap, budget_chars)
 }
 
 fn render_snapshot(project: &Path, db: &mut crate::store::SqliteStore, snap: &MemorySnapshot, budget_chars: u64) -> Result<(String, Vec<(String, String)>), MemoryError> {
     let objects = objects_dir(project);
-    let mut mandatory = 0u64;
-    let mut index = String::new();
-    let mut files = Vec::new();
+    let mut rendered = String::new();
+    let mut used_chars = 0u64;
     for entry in &snap.entries {
-        let rev = db.memory_revision(entry.record_id.as_str(), entry.revision).map_err(MemoryError::from)?
+        let rev = db.memory_revision(entry.record_id.as_str(), entry.revision)?
             .ok_or_else(|| MemoryError::Invalid("snapshot revision missing".into()))?;
-        let rec = db.memory_record(entry.record_id.as_str()).map_err(MemoryError::from)?
+        let rec = db.memory_record(entry.record_id.as_str())?
             .ok_or_else(|| MemoryError::Invalid("snapshot record missing".into()))?;
-        let body = read_object(&objects, &rev.body_hash)?;
-        let text = String::from_utf8(body).map_err(|e| MemoryError::Invalid(e.to_string()))?;
-        let chars = text.chars().count() as u64;
-        if entry.role == "mandatory" {
-            mandatory = mandatory.saturating_add(chars);
-            if mandatory > budget_chars {
-                return Err(MemoryError::RequiredContentTooLarge { required_bytes: mandatory, budget_bytes: budget_chars });
-            }
+        let header = format!("\n## {}\n\n", rec.record_key);
+        let overhead = header.chars().count() as u64 + 1;
+        let remaining = budget_chars.saturating_sub(used_chars);
+        if overhead > remaining {
+            return Err(MemoryError::RequiredContentTooLarge { required_bytes: used_chars.saturating_add(overhead), budget_bytes: budget_chars });
         }
-        if rec.record_key == "MEMORY.md" {
-            index = text;
-        } else {
-            let name = rec.record_key.strip_prefix("memory/").unwrap_or(&rec.record_key).to_string();
-            files.push((name, text));
+        if rendered.len() as u64 + header.len() as u64 + 1 > 64 * 1024 * 1024 {
+            return Err(MemoryError::RequiredContentTooLarge { required_bytes: rendered.len() as u64 + header.len() as u64 + 1, budget_bytes: 64 * 1024 * 1024 });
         }
+        let remaining_bytes = (64 * 1024 * 1024u64).saturating_sub(rendered.len() as u64)
+            .saturating_sub(header.len() as u64 + 1)
+            .min((remaining - overhead).saturating_mul(4));
+        let body = super::read_object_with_budget(&objects, &rev.body_hash, remaining_bytes)?;
+        let text = String::from_utf8(body).map_err(|_| MemoryError::Invalid("memory body is not UTF-8".into()))?;
+        let required = used_chars.saturating_add(overhead).saturating_add(text.chars().count() as u64);
+        if required > budget_chars {
+            return Err(MemoryError::RequiredContentTooLarge { required_bytes: required, budget_bytes: budget_chars });
+        }
+        rendered.push_str(&header);
+        rendered.push_str(&text);
+        rendered.push('\n');
+        used_chars = required;
     }
-    Ok((index, files))
+    let required = rendered.chars().count() as u64;
+    if required > budget_chars {
+        return Err(MemoryError::RequiredContentTooLarge { required_bytes: required, budget_bytes: budget_chars });
+    }
+    Ok((rendered, Vec::new()))
 }
 
 #[cfg(test)]
@@ -533,6 +672,31 @@ mod tests {
         assert_eq!(db.active_facts(1_000).unwrap().len(), 0);
     }
     #[test]
+    fn snapshot_render_bounds_object_reads_before_hashing_and_preserves_unicode_budget() {
+        let (_temp,project)=fixture();
+        let mut db=SqliteStore::open(&project.join(".state/state.db")).unwrap();
+        let task=db.read_snapshot(None).unwrap().tasks[0].id.clone();
+        let mut memory=MemoryStore::from_sqlite(db,objects_dir(&project));
+        let text="🔥".repeat(4096);
+        let body=memory.ingest_object(text.as_bytes()).unwrap();
+        memory.insert_revision(&ControlContext{now_unix_ms:1000},NewRevision {
+            id:MemoryRecordId::new("bounded-fact").unwrap(),record_key:"bounded-fact".into(),scope_id:"project".into(),kind:MemoryKind::Observation,
+            body_hash:body.clone(),provenance_hash:body.clone(),applicability:Applicability{domains:vec![],paths:vec![]},dependencies:vec![],
+            expected:None,expiry_unix_ms:None,validity_state:"valid".into(),validity_reason:"fixture".into(),
+        }).unwrap();
+        let snapshot=memory.create_task_snapshot(SnapshotRequest {
+            schema_version:1,task_id:task.as_str().into(),profile:"worker".into(),domains:vec![],paths:vec![],pinned_keys:vec![],sensitivity:"default".into(),
+        },"worker",&"a".repeat(64),None,100000,"",1000,None).unwrap();
+        assert_eq!(snapshot.entries.len(),1);
+        let path=objects_dir(&project).join("sha256").join(&body.as_str()[..2]).join(body.as_str());
+        fs::write(&path,vec![b'x';200000]).unwrap();
+        assert!(matches!(render_snapshot(&project,&mut memory.store,&snapshot,20),Err(MemoryError::RequiredContentTooLarge{..})));
+        fs::write(&path,text.as_bytes()).unwrap();
+        let (rendered,_)=render_snapshot(&project,&mut memory.store,&snapshot,5000).unwrap();
+        assert!(rendered.contains(&text));
+        assert!(rendered.chars().count()<=5000 && rendered.len()>5000);
+    }
+    #[test]
     fn traversal_symlink_oversize_and_nul_are_refused() {
         let (_temp, project) = fixture();
         assert!(contained_relative(&project, &project.join("PROJECT.md")).is_err());
@@ -570,7 +734,8 @@ mod tests {
         assert!(render_projections(&project, &plan, 1).is_err());
         assert_eq!(fs::read_to_string(project.join("MEMORY.md")).unwrap(), "manual edit");
         let (index, files) = load_brief_memory(&project, "", 32_000).unwrap();
-        assert!(index.contains("manual edit") || files.iter().any(|(_, t)| t.contains("observation") || t.contains("API")));
+        assert!(!index.contains("manual edit"));
+        assert!(files.iter().all(|(_, text)| !text.contains("manual edit")));
         let _ = db;
     }
     #[test]
@@ -625,5 +790,44 @@ mod tests {
         fs::write(project.join(".state/format.json"), serde_json::to_vec(&marker).unwrap()).unwrap();
         assert!(migration::open_active(&project).is_err());
     }
-}
+    #[test]
+    fn sealed_worker_knowledge_uses_retained_inputs_and_refuses_corrupt_bytes() {
+        let (_temp,project)=fixture();let now=jiff::Timestamp::now().as_millisecond();
+        let mut db=migration::open_active(&project).unwrap();let state=db.read_snapshot(None).unwrap();
+        let task=TaskId::new("worker").unwrap();
+        db.commit(Commit {expected_head:state.head,mutations:vec![Mutation::Task {expected:None,next:Task {id:task.clone(),revision:1,state:TaskState::Draft,title:"Captured task".into(),active_attempt:None}}]}).unwrap();
+        let state=db.read_snapshot(None).unwrap();db.create_runtime(Some(&task),Some(1),state.head,&RuntimeRoute::default()).unwrap();
+        let state=db.read_snapshot(None).unwrap();db.queue_task(&task,2,state.head,&QueueRequest {priority:0,dependencies:vec![]},now).unwrap();
+        let state=db.read_snapshot(None).unwrap();db.set_scheduler_policy(state.head,state.scheduler.unwrap().policy.revision,1,3).unwrap();
+        let state=db.read_snapshot(None).unwrap();let binding=state.runtime_bindings.iter().find(|b|b.task.as_ref()==Some(&task)).unwrap().clone();
+        db.record_observations(state.head,&[crate::reconcile::RuntimeObservation {binding:binding.id.clone(),binding_revision:binding.revision,task_revision:Some(3),observed_unix_ms:now,collector:"herdr-git-v1".into(),..Default::default()}]).unwrap();
+        let state=db.read_snapshot(None).unwrap();crate::runtime::set_state(&project,state.head,state.control.unwrap().revision,ProjectState::Active,&project.join("fixture-config.toml")).unwrap();
+        let config=migration::ConfigReference {path:project.join("fixture-config.toml").display().to_string(),digest:None};
+        let profile=crate::domain::profile::fixture(config.clone());
+        let mut memory=MemoryStore::from_sqlite(migration::open_active(&project).unwrap(),objects_dir(&project));
+        let body=memory.ingest_object(&b"Captured memory"[..]).unwrap();
+        memory.insert_revision(&ControlContext {now_unix_ms:now},NewRevision {id:MemoryRecordId::new("worker-fact").unwrap(),record_key:"worker-fact".into(),scope_id:"project".into(),kind:MemoryKind::Observation,body_hash:body.clone(),provenance_hash:body.clone(),applicability:Applicability {domains:vec![],paths:vec![]},dependencies:vec![],expected:None,expiry_unix_ms:None,validity_state:"valid".into(),validity_reason:"fixture".into()}).unwrap();
+        let snapshot=memory.create_worker_snapshot(SnapshotRequest {schema_version:1,task_id:"worker".into(),profile:profile.name.clone(),domains:vec![],paths:vec![],pinned_keys:vec![],sensitivity:"default".into()},&profile.name,&profile.definition_digest,None,32000,"Captured instructions",now,None).unwrap();
+        let state=db.read_snapshot(None).unwrap();
+        let mut inputs=LaunchInputs {version:2,project_store:project.join(".state/state.db").canonicalize().unwrap().display().to_string(),task:task.clone(),task_revision:3,scheduler_revision:state.scheduler.unwrap().policy.revision,control_epoch:state.control.unwrap().epoch,binding:binding.id.clone(),binding_revision:binding.revision,binding_digest:crate::store::ownership::identity_digest(&binding).unwrap(),profile:profile.reference().unwrap(),effective_profile:Some(profile.clone()),approval:VersionedReference {id:"placeholder".into(),revision:1,digest:"a".repeat(64)},config,repositories:vec![],dependencies:vec![],memory:Some(VersionedReference {id:snapshot.id.as_str().into(),revision:1,digest:snapshot.manifest_hash}),budget:None};
+        let grant=ApprovalGrant {version:1,scope:ApprovalScope::for_launch(&inputs).unwrap(),policy:profile.permission_policy,issued_unix_ms:now,expires_unix_ms:now+60000};
+        inputs.approval=db.install_approval(&PreparedApproval {grant},state.head,now).unwrap();
+        let head=db.read_snapshot(None).unwrap().head;let reserved=db.reserve_prepared(&[PreparedLaunch {inputs}],head,now).unwrap();
+        fs::write(project.join("PROJECT.md"),"Edited after reservation").unwrap();
+        let rendered=render_attempt_knowledge(&project,reserved.record.attempt.as_str()).unwrap();
+        let text=rendered["text"].as_str().unwrap();
+        for value in ["Captured instructions","Captured task","Captured memory"] {assert!(text.contains(value));}
+        assert!(!text.contains("Edited after reservation"));assert!(text.chars().count()<=32000);
+        let brief=super::super::render_attempt_brief(&project,reserved.record.attempt.as_str()).unwrap();
+        assert!(brief.text.contains(text));
+        assert_eq!(brief.output_directory,rendered["output_directory"].as_str().unwrap());
+        assert!(brief.prompt_chars<=brief.budget_chars);
+        assert_eq!(brief.attempt_id,reserved.record.attempt.as_str());
+        assert_eq!(brief.snapshot_id,snapshot.id.as_str());
+        assert!(!brief.text.contains("Edited after reservation"));
+        fs::write(objects_dir(&project).join("sha256").join(&body.as_str()[..2]).join(body.as_str()),"corrupt").unwrap();
+        assert!(render_attempt_knowledge(&project,reserved.record.attempt.as_str()).is_err());
+        assert!(super::super::render_attempt_brief(&project,reserved.record.attempt.as_str()).is_err());
+    }
 
+}

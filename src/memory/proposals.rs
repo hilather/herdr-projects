@@ -76,6 +76,13 @@ impl MemoryStore {
         if attempt.task != task.id { return Err(MemoryError::Invalid("producer attempt does not belong to task".into())); }
         let snap = self.store.read_memory_snapshot(&doc.input_snapshot_id).map_err(|_| MemoryError::Invalid("input snapshot is missing".into()))?;
         if snap.task_id != doc.producer.task_id { return Err(MemoryError::Invalid("input snapshot does not belong to producer task".into())); }
+        if attempt.snapshot.as_deref()!=Some(doc.input_snapshot_id.as_str()) {return Err(MemoryError::Invalid("proposal snapshot was not consumed by this attempt".into()));}
+        if doc.repository.is_some() {return Err(MemoryError::Invalid("repository claims require verified repository evidence; unsupported until revision-bound validation is available".into()));}
+        for observed in doc.observed_revisions.iter().chain(doc.changes.iter().flat_map(|c|c.based_on.iter())) {
+            if !snap.entries.iter().any(|e|e.record_id.as_str()==observed.record_id && e.revision==observed.revision) {
+                return Err(MemoryError::Invalid("observed/dependency revision is absent from attempt snapshot".into()));
+            }
+        }
         for observed in &doc.observed_revisions {
             let rec = self.store.memory_record(&observed.record_id).map_err(MemoryError::from)?
                 .ok_or_else(|| MemoryError::Invalid("observed revision record is missing".into()))?;
@@ -89,12 +96,15 @@ impl MemoryStore {
             if !self.store.object_available(body.as_str()).map_err(MemoryError::from)? {
                 return Err(MemoryError::EvidenceUnavailable { object: body });
             }
+            super::read_object(&self.objects, &body)?;
             for ev in &change.evidence {
+                if ev.validation_id.is_some() {return Err(MemoryError::Invalid("typed validation evidence is not available; unverified validation IDs are refused".into()));}
                 if let Some(object)=&ev.object {
                     let id = parse_object(object)?;
                     if !self.store.object_available(id.as_str()).map_err(MemoryError::from)? {
                         return Err(MemoryError::EvidenceUnavailable { object: id });
                     }
+                    super::read_object(&self.objects, &id)?;
                 }
             }
             for dep in &change.based_on {
@@ -139,6 +149,9 @@ mod tests {
         let body = memory.ingest_object(&b"claim-body"[..]).unwrap();
         let req = SnapshotRequest { schema_version: 1, task_id: "task-api".into(), profile: "implementation".into(), domains: vec![], paths: vec![], pinned_keys: vec![], sensitivity: "default".into() };
         let snap = memory.create_task_snapshot(req, "implementation", &"a".repeat(64), None, 32_000, "instructions", 1_000, None).unwrap();
+        let state=memory.store.read_snapshot(None).unwrap();
+        let mut attempt=state.attempts[0].clone();attempt.revision+=1;attempt.snapshot=Some(snap.id.as_str().into());
+        memory.store.commit(Commit{expected_head:state.head,mutations:vec![Mutation::Attempt{expected:Some(1),next:attempt}]}).unwrap();
         (root, memory, body, snap.id.as_str().to_string())
     }
     fn doc(snap: &str, body: &str, attempt: &str, expected: Option<ObservedRevision>) -> ProposalDocument {

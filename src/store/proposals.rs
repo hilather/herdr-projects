@@ -32,6 +32,22 @@ impl SqliteStore {
             tx.commit()?;
             return Ok(ProposalReceipt{proposal_id:id.into(),payload_digest:digest.into(),review_state:state,validation,reason:stored_reason,reused:true});
         }
+        if review_state == "validated" {
+            let document: crate::domain::ProposalDocument = serde_json::from_str(payload)
+                .map_err(|_| invalid("invalid proposal payload"))?;
+            let bound:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM attempts a JOIN memory_snapshots s ON s.id=a.snapshot WHERE a.id=?1 AND a.task_id=?2 AND a.snapshot=?3 AND s.task_id=a.task_id)",params![document.producer.attempt_id,document.producer.task_id,document.input_snapshot_id],|r|r.get(0))?;
+            if !bound {return Err(invalid("attempt snapshot binding changed before proposal acceptance"));}
+            for change in &document.changes {
+                for raw in std::iter::once(change.body_object.as_str())
+                    .chain(change.evidence.iter().filter_map(|e| e.object.as_deref())) {
+                    let id = crate::domain::ObjectId::parse(raw).map_err(|s| invalid(&s))?;
+                    // Atomically fence acceptance against collection. Retention is
+                    // owned by immutable proposal references, not leaking pin counts.
+                    super::objects::require_available(&tx, id.as_str())?;
+                    super::objects::cancel_pending(&tx, id.as_str())?;
+                }
+            }
+        }
         let seq=head(&tx)?;
         tx.execute(
             "INSERT INTO memory_proposals VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -70,8 +86,8 @@ mod tests {
     fn schema20_upgrade_adds_empty_proposal_tables() {
         let temp=tempfile::tempdir().unwrap();let path=temp.path().join("state.db");
         let mut db=SqliteStore::create(&path).unwrap();
-        db.connection.execute_batch("DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; UPDATE store_meta SET schema_version=20; PRAGMA user_version=20;").unwrap();
-        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=22;
+        db.connection.execute_batch("DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; UPDATE store_meta SET schema_version=20; PRAGMA user_version=20;").unwrap();
+        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=25;
         assert_eq!(db.read_snapshot(None).unwrap(),before);
         assert!(db.memory_proposal("mp-x").unwrap().is_none());
         db.integrity_check().unwrap();

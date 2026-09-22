@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Explicitly authorized disposable Codex/controller workflow acceptance."""
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--herdr', type=Path, required=True)
+parser.add_argument('--agent', type=Path, required=True)
+parser.add_argument('--auth-file', type=Path, required=True)
+parser.add_argument('--allow-authenticated-workflow', action='store_true',
+                    help='Authorize temporary login use, two fixed prompts and writes only in the disposable project; may consume account usage.')
+args = parser.parse_args()
+if not args.allow_authenticated_workflow:
+    parser.error('Explicit --allow-authenticated-workflow is required.')
+if sys.platform != 'linux':
+    parser.error('This acceptance test requires Linux pidfs and namespaces.')
+root = Path(__file__).resolve().parent.parent
+paths = {name: getattr(args, name).absolute() for name in ('herdr', 'agent', 'auth_file')}
+for name, path in paths.items():
+    if path.is_symlink() or not path.is_file():
+        parser.error(f'{name} must name a regular non-symlink file.')
+    if name != 'auth_file' and not os.access(path, os.X_OK):
+        parser.error(f'{name} must be executable.')
+# Never display or parse credential contents.
+metadata = paths['auth_file'].stat()
+if metadata.st_mode & 0o077 or metadata.st_size > 256 * 1024:
+    parser.error('Authentication file must be private and at most 256 KiB.')
+build = subprocess.run(
+    ['cargo', 'test', '--release', '--locked', '--offline', '--features', 'state-store',
+     '--lib', '--bin', 'herdr-projects', '--no-run', '--message-format=json'],
+    cwd=root, stdout=subprocess.PIPE, text=True,
+)
+executables = {}
+for line in build.stdout.splitlines():
+    message = json.loads(line)
+    if message.get('reason') == 'compiler-message':
+        rendered = message.get('message', {}).get('rendered')
+        if rendered:
+            print(rendered, file=sys.stderr, end='')
+    if message.get('reason') != 'compiler-artifact' or not message.get('executable'):
+        continue
+    if not message.get('profile', {}).get('test'):
+        continue
+    for kind, source in [('library', root / 'src/lib.rs'), ('driver', root / 'src/main.rs')]:
+        if Path(message['target']['src_path']).resolve() == source:
+            executables[kind] = message['executable']
+if build.returncode:
+    raise SystemExit(build.returncode)
+if set(executables) != {'library', 'driver'}:
+    raise SystemExit('Cargo did not provide both test executables.')
+environment = os.environ.copy()
+environment.update(HP_LIVE_HERDR=str(paths['herdr']), HP_LIVE_AGENT=str(paths['agent']),
+                   HP_LIVE_AUTH_FILE=str(paths['auth_file']),
+                   HP_CONTROLLER_TEST_BINARY=executables['driver'])
+result = subprocess.run(
+    [executables['library'], '--exact', 'canonical_worker::tests::live_authenticated_controller_workflow',
+     '--ignored', '--nocapture', '--test-threads=1'], cwd=root, env=environment,
+)
+raise SystemExit(result.returncode)

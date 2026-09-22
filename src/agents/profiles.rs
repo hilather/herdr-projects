@@ -1,36 +1,13 @@
 //! User-owned profile configuration. Inspection never grants launch authority.
-use std::{collections::BTreeSet, path::Path};
+use std::path::Path;
 
 use anyhow::{Result, bail, ensure};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct Profile {
-    kind: String,
-    #[serde(default)]
-    extra_args: Vec<String>,
-    #[serde(default)]
-    environment: Vec<String>,
-    permission_policy: String,
-    model: Option<String>,
-    reasoning_effort: Option<String>,
-    budget: Option<Budget>,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct Budget {
-    pub max_wall_seconds: Option<u64>,
-    pub soft_input_tokens: Option<u64>,
-    pub soft_output_tokens: Option<u64>,
-    pub unknown_usage: UnknownUsage,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UnknownUsage { AllowWithWarning, Block }
+use herdr_projects::profile_config::ProfileDefinition as Profile;
+pub(super) use herdr_projects::profile_config::Budget;
+pub use herdr_projects::profile_config::UnknownUsage;
 
 /// Absence of adapter evidence is distinct from tested lack of support.
 #[derive(Debug, Serialize)]
@@ -101,29 +78,7 @@ fn identifier(value: &str) -> bool {
         && value.bytes().all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
 }
 
-fn bounded_intent(value: &Option<String>) -> bool {
-    value.as_ref().is_none_or(|s| !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_control))
-}
-
-fn validate(profile: &Profile) -> Result<()> {
-    super::arguments(&profile.kind, Some(&profile.kind), &profile.extra_args, "profile extra_args")?;
-    ensure!(identifier(&profile.permission_policy), "invalid profile permission policy reference");
-    ensure!(bounded_intent(&profile.model) && bounded_intent(&profile.reasoning_effort), "invalid profile model or reasoning intent");
-    ensure!(profile.environment.len() <= 128, "too many profile environment references");
-    let mut names = BTreeSet::new();
-    for name in &profile.environment {
-        ensure!(!name.is_empty() && name.len() <= 128
-            && (name.as_bytes()[0].is_ascii_alphabetic() || name.starts_with('_'))
-            && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'),
-            "profile environment must contain variable names, never values");
-        ensure!(names.insert(name), "duplicate profile environment reference");
-    }
-    if let Some(budget) = &profile.budget {
-        ensure!([budget.max_wall_seconds, budget.soft_input_tokens, budget.soft_output_tokens]
-            .iter().flatten().all(|n| *n > 0 && *n <= i64::MAX as u64), "profile budget limits must be positive bounded integers");
-    }
-    Ok(())
-}
+fn validate(profile: &Profile) -> Result<()> { profile.validate() }
 
 pub fn inspect(path: &Path, name: &str) -> Result<Inspection> {
     Ok(load(path, name)?.0)

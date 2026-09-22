@@ -282,3 +282,28 @@ fn artifact_lock(project:&Project,canonical:bool)->Result<ArtifactLock> {
 pub fn capture_canonical_controlled(project:&Project,record:&Thread,control:&Control,expected_source:Option<(u64,u64)>,authorize:impl FnMut()->Result<()>)->Result<Snapshot> {capture_authorized(project,record,||Ok(()),true,control,expected_source,authorize)}
 #[cfg(feature="state-store")]
 pub fn load_canonical_controlled(project:&Project,record:&Thread,id:&str,control:&Control)->Result<Manifest> {load_mode_controlled(project,record,id,true,control)}
+
+/// Convert verified stop evidence into the established artifact receipt format.
+/// The immutable source identity is retained; no worker directory is recreated.
+#[cfg(all(feature="state-store",target_os="linux"))]
+pub fn capture_preserved_outputs(project:&Project,record:&Thread,outputs:&herdr_projects::worktree_preservation::VerifiedOutputs,control:&Control,mut authorize:impl FnMut()->Result<()>)->Result<Snapshot> {
+    control.check()?;authorize()?;
+    ensure!(!record.is_remote()&&outputs.manifest().source==record.thread_dir,"preserved output source mismatch");
+    let staging=staging_mode_controlled(project,record,true,control)?;
+    let mut entries=Vec::new();
+    // Match the existing report-then-library traversal order and scope.
+    for name in ["report.md","library"] {
+        for entry in outputs.manifest().entries.iter().filter(|e|e.path==name||e.path.starts_with(&format!("{name}/"))) {
+            control.check()?;let path=staging.0.join(&entry.path);
+            if entry.directory {fs::create_dir(&path)?;}else{
+                let bytes=outputs.bytes(entry).context("verified output bytes missing")?;
+                let mut file=OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
+                file.write_all(bytes)?;file.sync_all()?;
+            }
+            entries.push(Entry{path:entry.path.clone(),directory:entry.directory,bytes:entry.bytes,sha256:entry.sha256.clone()});
+        }
+    }
+    for entry in entries.iter().rev().filter(|e|e.directory) {File::open(staging.0.join(&entry.path))?.sync_all()?;}
+    let manifest=Manifest{schema:1,thread:record.id.clone(),generation:record.lifecycle_generation,source:record.thread_dir.clone(),machine:String::new(),entries};
+    publish_mode_controlled(project,record,staging,manifest,true,control,authorize)
+}

@@ -62,14 +62,34 @@ fn log(db: &Connection, kind: &str, id: &str, payload: &impl serde::Serialize) -
     Ok(())
 }
 
+// Validation is shared by admission and claim. Only consume() records use.
+fn check_inputs(db: &Connection, inputs: &LaunchInputs, now: i64) -> Result<()> {
+    schema(db)?;
+    if crate::migration::config_reference(Path::new(&inputs.config.path)).map_err(|_|invalid("launch configuration is unreadable"))? != inputs.config {
+        return Err(invalid("launch configuration changed since approval"));
+    }
+    let profile = inputs.effective_profile.as_ref().ok_or_else(|| invalid("historical launch lacks current approval evidence"))?;
+    let approval = grant(db, &inputs.approval.id, None)?;
+    approval.matches_launch(inputs, &project_path(db)?, now).map_err(|_| invalid("launch approval is stale or mismatched"))?;
+    if approval.policy != profile.permission_policy { return Err(invalid("approval policy differs from effective profile")); }
+    let revoked: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM approval_revocations WHERE approval_id=?1)", [&inputs.approval.id], |r| r.get(0))?;
+    if revoked { return Err(invalid("launch approval is revoked")); }
+    Ok(())
+}
+
+pub(super) fn validate_preparation(db: &Connection, inputs: &LaunchInputs, now: i64) -> Result<()> {
+    check_inputs(db, inputs, now)?;
+    let consumed: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM approval_uses WHERE approval_id=?1)", [&inputs.approval.id], |r|r.get(0))?;
+    if consumed { return Err(invalid("launch approval has already been consumed")); }
+    Ok(())
+}
+
 fn check_launch(db: &Connection, operation: &OperationId, now: i64) -> Result<String> {
     schema(db)?;
     let record = super::reservations::read_inputs(db)?.into_iter().find(|r| &r.operation == operation).ok_or_else(|| invalid("launch input record missing"))?;
     let inputs = &record.inputs;
+    super::worker_knowledge::validate(db,inputs,now)?;
     super::budget::check(db,inputs.budget.as_ref(),true)?;
-    if crate::migration::config_reference(Path::new(&inputs.config.path)).map_err(|_|invalid("launch configuration is unreadable"))?!=inputs.config {
-        return Err(invalid("launch configuration changed since approval"));
-    }
     let attempts=read_attempts(db)?;
     let attempt=attempts.iter().find(|a|a.id==record.attempt).ok_or(StoreError::Conflict)?;
     let tasks=read_tasks(db)?;
@@ -80,12 +100,10 @@ fn check_launch(db: &Connection, operation: &OperationId, now: i64) -> Result<St
         || Some(task.revision)!=inputs.task_revision.checked_add(1) {
         return Err(invalid("launch no longer owns an eligible retained reservation"));
     }
-    let profile = inputs.effective_profile.as_ref().ok_or_else(|| invalid("historical launch lacks current approval evidence"))?;
-    let approval = grant(db, &inputs.approval.id, None)?;
-    approval.matches_launch(inputs, &project_path(db)?, now).map_err(|_| invalid("launch approval is stale or mismatched"))?;
-    if approval.policy != profile.permission_policy { return Err(invalid("approval policy differs from effective profile")); }
-    let revoked: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM approval_revocations WHERE approval_id=?1)", [&inputs.approval.id], |r| r.get(0))?;
-    if revoked { return Err(invalid("launch approval is revoked")); }
+    if attempt.snapshot.as_deref()!=inputs.memory.as_ref().map(|r|r.id.as_str()) {
+        return Err(invalid("attempt snapshot differs from approved launch knowledge"));
+    }
+    check_inputs(db, inputs, now)?;
     let control = super::control::read(db)?;
     let scheduler = super::scheduler::read(db)?;
     if control.state != ProjectState::Active || control.reconciliation_required || control.epoch != inputs.control_epoch

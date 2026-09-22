@@ -31,14 +31,17 @@ pub fn context(project:&Path)->Result<String> { Ok(context_snapshot(project)?.0)
 pub fn coordinator_context(project:&Path,herdr_session:&str,profile:&crate::domain::CheckpointProfile,instructions:&str)->Result<crate::memory::CoordinatorContext> {
     crate::memory::coordinator_context(project,herdr_session,profile,instructions)
 }
-pub fn ack_checkpoint(project:&Path,checkpoint_id:&str)->Result<crate::domain::CoordinatorCheckpoint> {
-    crate::memory::ack_checkpoint(project,checkpoint_id)
+pub fn ack_checkpoint(project:&Path,checkpoint_id:&str,session_token:&str)->Result<crate::domain::CoordinatorCheckpoint> {
+    crate::memory::ack_checkpoint(project,checkpoint_id,session_token)
 }
 pub fn checkpoint_sizes(project:&Path)->Result<Option<crate::domain::CheckpointSizes>> {
     crate::memory::last_checkpoint_sizes(project)
 }
 pub fn context_snapshot(project:&Path)->Result<(String,u64,Vec<String>)> {
     let snapshot=snapshot(project)?;
+    context_from_snapshot(project, &snapshot)
+}
+pub(crate) fn context_from_snapshot(project:&Path,snapshot:&crate::domain::Snapshot)->Result<(String,u64,Vec<String>)> {
     let control=snapshot.control.as_ref().map(|c|format!("{:?}; epoch {}; reconciliation required: {}",c.state,c.epoch,c.reconciliation_required)).unwrap_or_else(||"schema upgrade required".into());
     let memory_owner=migration::read_format(project).ok().map(|f|f.memory).unwrap_or_else(||"legacy-markdown".into());
     let memory_line=if memory_owner=="sqlite-v1" {
@@ -49,8 +52,9 @@ pub fn context_snapshot(project:&Path)->Result<(String,u64,Vec<String>)> {
     let mut text=format!("Runtime owner: SQLite; event head {}. Control: {}. Existing resources require separate ownership authorization.\nUse `task PROJECT list/show/add/rename` for task state; inspect `operations PROJECT inspect` for durable obligations.\nTASKS.md and thread/runtime legacy records are pre-cutover originals: do not edit them as live state.\n{memory_line}\n\n",snapshot.head,control);
     let unseen=snapshot.inbox.iter().filter(|i|!i.done&&!i.seen).map(|i|i.content.id.clone()).collect();
     for item in snapshot.inbox.iter().filter(|i|!i.done) {text.push_str(&format!("Inbox {}: {}\n{}\n",item.content.id,item.content.summary,item.content.body));}
-    for task in snapshot.tasks {text.push_str(&format!("{} revision {} {:?}: {}\n",task.id.as_str(),task.revision,task.state,task.title.replace(['\n','\r']," ")));}
+    for task in &snapshot.tasks {text.push_str(&format!("{} revision {} {:?}: {}\n",task.id.as_str(),task.revision,task.state,task.title.replace(['\n','\r']," ")));}
     for name in ["PROJECT.md","MEMORY.md"] {
+        if name == "MEMORY.md" && memory_owner == "sqlite-v1" { continue; }
         let bytes=migration::read_plan_file(&project.join(name))?;
         text.push_str(&format!("\n--- {name} (user-owned legacy text) ---\n{}\n",String::from_utf8(bytes)?));
     }

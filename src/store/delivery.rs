@@ -1,6 +1,8 @@
 use super::*;
 use crate::operations::{Claim,Delivery,DeliveryState,Outcome};
 
+pub(super) enum LaunchPreparation<'a> { Native(&'a PreparedLaunchCreation), Worktrees(&'a PreparedWorktreeCreation) }
+
 fn text(value:&str)->Result<()> {
     if value.trim().is_empty() || value.len()>8192 { return Err(StoreError::Invalid("nonempty evidence/owner of at most 8192 bytes required".into())); }
     Ok(())
@@ -54,6 +56,18 @@ fn payload_valid(db:&Connection,id:&OperationId)->Result<()> {
 }
 pub(super) fn update_outcome(tx:&Connection,old:&Delivery,outcome:&Outcome,now:i64,actor:&str)->Result<Delivery> {
     text(outcome.evidence())?;
+    // A caller-written string is not a worker identity or a termination receipt.
+    // Keep launch success behind the sealed typed lifecycle ingress. This
+    // applies equally to normal completion and post-crash observation.
+    if matches!(outcome,Outcome::Confirmed{..}) {
+        let kind:String=tx.query_row("SELECT kind FROM operations WHERE id=?1",[old.operation.as_str()],|r|r.get(0))?;
+        if kind=="runtime.launch" && !super::launch::has_started_receipt(tx,&old.operation,outcome.evidence())? {
+            return Err(StoreError::Invalid("launch confirmation requires a typed lifecycle receipt".into()));
+        }
+        if kind=="runtime.worker_brief" && !super::worker_brief::has_receipt(tx,&old.operation,outcome.evidence())? {
+            return Err(StoreError::Invalid("worker brief confirmation requires a typed lifecycle receipt".into()));
+        }
+    }
     if let Outcome::Confirmed{observed_identity}=outcome {super::finalization::apply_receipt(tx,&old.operation,observed_identity)?;}
     let mut state=match outcome { Outcome::Confirmed{..}=>"confirmed",Outcome::Retryable{..}=>"pending",Outcome::Ambiguous{..}=>"ambiguous",Outcome::PermanentFailure{..}=>"permanent_failure" };
     let mut outcome=outcome.clone();
@@ -74,6 +88,9 @@ impl SqliteStore {
     /// Claim commits before external work. Expired claims are NEVER automatically
     /// retried: expire_claims first marks them ambiguous for explicit observation.
     pub fn claim_operation(&mut self,id:&OperationId,expected:u64,owner:&str,now:i64,lease_ms:i64)->Result<Claim> {
+        self.claim_with_creation(id,expected,owner,now,lease_ms,None)
+    }
+    pub(super) fn claim_with_creation(&mut self,id:&OperationId,expected:u64,owner:&str,now:i64,lease_ms:i64,creation:Option<LaunchPreparation<'_>>)->Result<Claim> {
         text(owner)?;now_check(now)?;
         if !(1..=300_000).contains(&lease_ms) { return Err(StoreError::Invalid("lease must be 1..300000 ms".into())); }
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;check_schema(&tx)?;
@@ -83,7 +100,16 @@ impl SqliteStore {
         if !binding_current(&tx,id,true)? {return Err(StoreError::Conflict);}
         let revision=increment(old.revision)?;let epoch=increment(old.epoch)?;let until=now+lease_ms;
         let kind:String=tx.query_row("SELECT kind FROM operations WHERE id=?1",[id.as_str()],|r|r.get(0))?;
-        if kind=="runtime.launch" {super::approvals::consume(&tx,id,revision,epoch,now)?;}
+        if kind=="runtime.launch" {
+            // Claim history itself forbids replay, independently of approval
+            // uniqueness or a later caller's assertion that nothing happened.
+            if old.attempts!=0 || old.epoch!=0 {return Err(StoreError::Conflict);}
+            super::approvals::consume(&tx,id,revision,epoch,now)?;
+        }
+        if kind=="runtime.worker_brief" {
+            if old.attempts!=0 || old.epoch!=0 {return Err(StoreError::Conflict);}
+            super::worker_brief::check(&tx,id,now)?;
+        }
         if kind=="routine.run" {
             // No automatic or generic reconciliation retry can replay a script
             // after any prior claim, even if someone reports "no effect".
@@ -92,7 +118,24 @@ impl SqliteStore {
         }
         tx.execute("UPDATE operation_delivery SET revision=?2,state='claimed',epoch=?3,attempts=attempts+1,owner=?4,lease_until_ms=?5 WHERE operation_id=?1",params![id.as_str(),integer(revision)?,integer(epoch)?,owner,until])?;
         log(&tx,id,revision,"operation.claimed",serde_json::json!({"owner":owner,"epoch":epoch,"lease_until_ms":until}))?;
-        tx.commit()?;Ok(Claim{operation:id.clone(),revision,owner:owner.into(),epoch,lease_until_ms:until})
+        let claim=Claim{operation:id.clone(),revision,owner:owner.into(),epoch,lease_until_ms:until};
+        #[cfg(test)]
+        let has_creation=creation.is_some();
+        if let Some(prepared)=creation {
+            if kind!="runtime.launch" {return Err(StoreError::Conflict);}
+            #[cfg(test)]
+            super::reservations::tests::crash_boundary("creation_before_intent");
+            match prepared {
+                LaunchPreparation::Native(p)=>{super::launch::record_creation(&tx,&claim,p,now)?;}
+                LaunchPreparation::Worktrees(p)=>{super::worktrees::record_creation(&tx,&claim,p,now)?;}
+            }
+            #[cfg(test)]
+            super::reservations::tests::crash_boundary("creation_before_commit");
+        }
+        tx.commit()?;
+        #[cfg(test)]
+        if has_creation {super::reservations::tests::crash_boundary("creation_after_commit");}
+        Ok(claim)
     }
     /// Last pre-effect fence; callers must separately retain exclusive external
     /// ownership. SQLite fencing cannot retract an effect after this check.
@@ -105,6 +148,7 @@ impl SqliteStore {
         if !binding_current(&tx,&claim.operation,true)? {return Err(StoreError::Conflict);}
         let kind:String=tx.query_row("SELECT kind FROM operations WHERE id=?1",[claim.operation.as_str()],|r|r.get(0))?;
         if kind=="runtime.launch" {super::approvals::validate_use(&tx,claim,now)?;}
+        if kind=="runtime.worker_brief" {super::worker_brief::check(&tx,&claim.operation,now)?;}
         if kind=="routine.run" {super::routines::check(&tx,&claim.operation)?;}
         tx.commit()?;Ok(())
     }
