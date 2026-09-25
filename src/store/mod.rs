@@ -4,7 +4,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{fmt, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 
-pub const SCHEMA: u32 = 27;
+pub const SCHEMA: u32 = 28;
 const APPLICATION: u32 = 1_213_222_994;
 const MIN_SQLITE: i32 = 3_053_004;
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
@@ -82,6 +82,7 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../migrations/0025_native_profiles.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0026_factory_results.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0027_verification_runs.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0028_integration.sql"))?;
             tx.commit()?;
         }
         // Persist the initial directory entry as well as SQLite's own commit.
@@ -396,3 +397,5 @@ pub use results::{show_results, submit_untrusted_result};
 
 #[cfg(target_os = "linux")]
 pub(crate) mod verification;
+#[cfg(target_os = "linux")]
+pub(crate) mod integration;
