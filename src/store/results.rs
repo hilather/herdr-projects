@@ -319,14 +319,14 @@ fn read_gitdir(gitfile: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-fn common_directory(gitdir: &Path) -> Result<PathBuf> {
+fn common_directory(gitdir: &Path, gitfile: &Path) -> Result<PathBuf> {
     let bytes = read_nofollow(&gitdir.join("commondir"), 4_096)?;
     let text = one_line(&bytes)?;
-    let mut cursor = if Path::new(text).is_absolute() {
-        PathBuf::new()
-    } else {
-        gitdir.to_path_buf()
-    };
+    // Only a relative walk from <common>/worktrees/<id> is a linked worktree.
+    if Path::new(text).is_absolute() {
+        return Err(invalid("commondir target is absolute"));
+    }
+    let mut cursor = gitdir.to_path_buf();
     for component in Path::new(text).components() {
         match component {
             Component::CurDir => {}
@@ -345,13 +345,27 @@ fn common_directory(gitdir: &Path) -> Result<PathBuf> {
                     Err(_) => return Err(invalid("commondir is unavailable")),
                 }
             }
-            Component::RootDir => cursor.push(component),
-            Component::Prefix(_) => return Err(invalid("commondir is unavailable")),
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(invalid("commondir target is absolute"));
+            }
         }
     }
     let meta = fs::symlink_metadata(&cursor).map_err(|_| invalid("commondir is unavailable"))?;
     if !meta.is_dir() || meta.file_type().is_symlink() {
         return Err(invalid("commondir is unavailable"));
+    }
+    if gitdir.parent() != Some(cursor.join("worktrees").as_path()) {
+        return Err(invalid(
+            "commondir is not this worktree's common git directory",
+        ));
+    }
+    let back_bytes = read_nofollow(&gitdir.join("gitdir"), 4_096)?;
+    let back = one_line(&back_bytes)?;
+    let gitfile = gitfile
+        .to_str()
+        .ok_or_else(|| invalid("repository .git path is not utf-8"))?;
+    if back != gitfile {
+        return Err(invalid("gitdir does not point back at this repository"));
     }
     Ok(cursor)
 }
@@ -367,7 +381,7 @@ fn git_objects(repository: &Path) -> Result<PathBuf> {
     let objects = if meta.is_dir() {
         git.join("objects")
     } else if meta.is_file() {
-        common_directory(&read_gitdir(&git)?)?.join("objects")
+        common_directory(&read_gitdir(&git)?, &git)?.join("objects")
     } else {
         return Err(invalid("repository is not a git directory"));
     };
@@ -1290,6 +1304,11 @@ mod tests {
         let dirty = b"uncommitted worktree bytes";
         fs::write(worktree.join("dirty.txt"), dirty).unwrap();
         let worktree = worktree.canonicalize().unwrap();
+        fs::write(
+            gitdir.join("gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
         let mut db = SqliteStore::open(&fixture.db_path).unwrap();
         let mut contract = serde_json::from_slice::<serde_json::Value>(&contract_bytes(
             &fixture,
@@ -1346,6 +1365,58 @@ mod tests {
         assert!(matches!(
             super::git_objects(&relative),
             Err(StoreError::Invalid(message)) if message.contains("not absolute")
+        ));
+        let absolute_wt = fixture._root.path().join("abs-wt");
+        fs::create_dir_all(&absolute_wt).unwrap();
+        let absolute_gitdir = fixture.repo.join(".git/worktrees/abs");
+        fs::create_dir_all(&absolute_gitdir).unwrap();
+        let absolute_gitdir = absolute_gitdir.canonicalize().unwrap();
+        let absolute_wt = absolute_wt.canonicalize().unwrap();
+        fs::write(
+            absolute_gitdir.join("commondir"),
+            format!(
+                "{}\n",
+                fixture.repo.join(".git").canonicalize().unwrap().display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            absolute_wt.join(".git"),
+            format!("gitdir: {}\n", absolute_gitdir.display()),
+        )
+        .unwrap();
+        fs::write(
+            absolute_gitdir.join("gitdir"),
+            format!("{}\n", absolute_wt.join(".git").display()),
+        )
+        .unwrap();
+        assert!(matches!(
+            super::git_objects(&absolute_wt),
+            Err(StoreError::Invalid(message)) if message.contains("absolute")
+        ));
+        let other = fixture._root.path().join("other-repo");
+        fs::create_dir_all(other.join(".git/objects")).unwrap();
+        fs::write(other.join(".git/objects/stolen"), b"from-another-repo").unwrap();
+        let foreign_gitdir = other.join("nested/wt");
+        fs::create_dir_all(&foreign_gitdir).unwrap();
+        fs::write(foreign_gitdir.join("commondir"), "../..\n").unwrap();
+        let foreign_gitdir = foreign_gitdir.canonicalize().unwrap();
+        let foreign_wt = fixture._root.path().join("foreign-wt");
+        fs::create_dir_all(&foreign_wt).unwrap();
+        let foreign_wt = foreign_wt.canonicalize().unwrap();
+        fs::write(
+            foreign_wt.join(".git"),
+            format!("gitdir: {}\n", foreign_gitdir.display()),
+        )
+        .unwrap();
+        fs::write(
+            foreign_gitdir.join("gitdir"),
+            format!("{}\n", foreign_wt.join(".git").display()),
+        )
+        .unwrap();
+        assert!(matches!(
+            super::git_objects(&foreign_wt),
+            Err(StoreError::Invalid(message)) if message.contains("common git directory")
         ));
     }
 }
