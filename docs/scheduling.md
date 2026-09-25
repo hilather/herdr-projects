@@ -29,12 +29,17 @@ admission is unavailable. `capability.dependency_producers` is false and
 `capability.integration` is `unavailable`. Inspect does not reserve or launch.
 
 The operator path is draft, then sign, then `launch reserve`, then the
-controller. The scheduler does not perform those stages. Each queued task and
-the capability report list `launch_draft_not_scheduled`,
-`owner_signature_not_scheduled`, `launch_reserve_not_scheduled`, and
-`controller_requires_reserved_attempt`. Those blockers name stages. They do not
-claim a verifier, integrator, or satisfaction producer exists. Satisfaction rows
-do not exist yet, so every dependency edge still reports
+controller. Automatic admission does not itself draft, sign, or reserve. The
+capability report says that with
+`automatic_admission_does_not_draft_sign_or_reserve`. That blocker does not
+claim the operator step is absent. A queued task reports
+`owner_signature_not_scheduled` only when no unconsumed launch grant for that
+task is stored, and `launch_reserve_not_scheduled` plus
+`controller_requires_reserved_attempt` only when that task has no retained
+reserved or running attempt. It never reports `launch_draft_not_scheduled`,
+because a draft writes no row. Those blockers do not claim a verifier,
+integrator, or satisfaction producer exists. Satisfaction rows do not exist
+yet, so every dependency edge still reports
 `verified_dependency_evidence_unavailable` unless the predecessor is failed or
 cancelled (`predecessor_failed`). Do not invent a replacement blocker for that
 string.

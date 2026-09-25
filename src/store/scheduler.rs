@@ -78,7 +78,8 @@ impl SqliteStore {
         super::delivery::now_check(now)?;let tx=self.connection.transaction()?;schema(&tx)?;let snapshot=read(&tx)?;let tasks=read_tasks(&tx)?;let attempts=read_attempts(&tx)?;let control=super::control::read(&tx)?;
         let retained_attempts=attempts.iter().filter(|a|a.retains_capacity()).count();let available_slots=(snapshot.policy.max_active_workers as usize).saturating_sub(retained_attempts);let mut entries=Vec::new();
         let budget_blockers=super::budget::report(&tx,false)?.blockers;
-        let stage_blockers=["launch_draft_not_scheduled","owner_signature_not_scheduled","launch_reserve_not_scheduled","controller_requires_reserved_attempt"];
+        let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
+        let approvals=if version>=13 {super::approvals::read_all(&tx)?}else{Vec::new()};
         for record in &snapshot.queue {
             let task=tasks.iter().find(|t|t.id==record.task).ok_or(StoreError::Conflict)?;let mut blockers=Vec::new();
             if task.state!=TaskState::Queued {blockers.push(format!("task_state:{:?}",task.state));}
@@ -92,12 +93,15 @@ impl SqliteStore {
                 let reason=if matches!(predecessor.state,TaskState::Failed|TaskState::Cancelled){"predecessor_failed"}else{"verified_dependency_evidence_unavailable"};blockers.push(format!("{reason}:{}:{}",edge.predecessor.as_str(),edge.requirement.as_str()));
             }
             blockers.extend(budget_blockers.iter().cloned());
-            blockers.extend(stage_blockers.iter().map(|stage|(*stage).to_string()));
+            let signed=approvals.iter().any(|record|record.consumed.is_none()&&record.grant.scope.class==ApprovalClass::RuntimeLaunch&&record.grant.scope.task==task.id);
+            let retained_launch=attempts.iter().any(|attempt|attempt.task==task.id&&attempt.retains_capacity()&&matches!(attempt.state,AttemptState::Reserved|AttemptState::Running));
+            if !signed {blockers.push("owner_signature_not_scheduled".into());}
+            if !retained_launch {blockers.push("launch_reserve_not_scheduled".into());blockers.push("controller_requires_reserved_attempt".into());}
             let age=now.saturating_sub(record.enqueued_unix_ms).max(0)/60_000;let score=age+record.priority as i64;
             entries.push((record.enqueue_sequence,QueueEntry{task:task.id.clone(),task_revision:task.revision,effective_priority:score,blockers}));
         }
         entries.sort_by(|a,b|b.1.effective_priority.cmp(&a.1.effective_priority).then(a.0.cmp(&b.0)).then(a.1.task.cmp(&b.1.task)));
-        let capability=CapabilityReport{prepared_dispatch:true,automatic_admission:false,dependency_producers:false,integration:"unavailable",blockers:stage_blockers.iter().map(|stage|(*stage).to_string()).collect()};
+        let capability=CapabilityReport{prepared_dispatch:true,automatic_admission:false,dependency_producers:false,integration:"unavailable",blockers:vec!["automatic_admission_does_not_draft_sign_or_reserve".into()]};
         let report=QueueReport{head:head(&tx)?,policy:snapshot.policy,retained_attempts,available_slots,launch_enabled:false,capability,entries:entries.into_iter().map(|(_,e)|e).collect()};tx.commit()?;Ok(report)
     }
 }
@@ -133,12 +137,33 @@ mod tests {
     fn prepared_dispatch_stays_true_while_dependency_evidence_stays_blocked() {
         let(_temp,mut db)=fixture();queue(&mut db,"a",&request(0,&["b"]),0).unwrap();let report=db.queue_report(0).unwrap();
         assert!(!report.launch_enabled);assert!(report.capability.prepared_dispatch);assert!(!report.capability.automatic_admission);assert!(!report.capability.dependency_producers);assert_eq!(report.capability.integration,"unavailable");
+        assert_eq!(report.capability.blockers,vec!["automatic_admission_does_not_draft_sign_or_reserve".to_string()]);
         assert!(report.entries[0].blockers.iter().any(|b|b=="verified_dependency_evidence_unavailable:b:verified_result"));
-        let stages=["launch_draft_not_scheduled","owner_signature_not_scheduled","launch_reserve_not_scheduled","controller_requires_reserved_attempt"];
-        assert_eq!(report.capability.blockers,stages.iter().map(|s|(*s).to_string()).collect::<Vec<_>>());
-        assert!(stages.iter().all(|stage|report.entries[0].blockers.iter().any(|b|b==stage)));
+        for stage in ["owner_signature_not_scheduled","launch_reserve_not_scheduled","controller_requires_reserved_attempt"] {assert!(report.entries[0].blockers.iter().any(|b|b==stage));}
+        assert!(report.entries.iter().flat_map(|entry|&entry.blockers).chain(report.capability.blockers.iter()).all(|b|b!="launch_draft_not_scheduled"));
         let claims_producer=|blocker:&str|blocker.contains("launch_preparation_unavailable")||blocker.contains("verifier")||blocker.contains("integrator")||blocker.contains("producer")||blocker.contains("satisfaction");
         assert!(report.capability.blockers.iter().chain(report.entries.iter().flat_map(|entry|&entry.blockers)).all(|blocker|!claims_producer(blocker)));
+    }
+    #[test]
+    fn retained_reserved_attempt_omits_reserve_blocker_and_grant_omits_signature_blocker() {
+        let(temp,mut db)=fixture();queue(&mut db,"a",&request(0,&[]),0).unwrap();queue(&mut db,"b",&request(0,&[]),0).unwrap();queue(&mut db,"c",&request(0,&[]),0).unwrap();
+        let s=db.read_snapshot(None).unwrap();let attempt=AttemptId::new("reserved-a").unwrap();
+        db.commit(Commit{expected_head:s.head,mutations:vec![Mutation::Attempt{expected:None,next:Attempt{id:attempt,task:TaskId::new("a").unwrap(),revision:1,state:AttemptState::Reserved,snapshot:None,reservation:"worker:reserved-a".into(),termination_observed:false}},Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("lost-b").unwrap(),task:TaskId::new("b").unwrap(),revision:1,state:AttemptState::Lost,snapshot:None,reservation:"slot".into(),termination_observed:false}}]}).unwrap();
+        let s=db.read_snapshot(None).unwrap();let task=s.tasks.iter().find(|t|t.id.as_str()=="c").unwrap();
+        let store_path=std::fs::canonicalize(temp.path().join("state.db")).unwrap().display().to_string();
+        let profile=crate::domain::profile::fixture(crate::migration::ConfigReference{path:store_path.clone(),digest:None});
+        let inputs=LaunchInputs{version:2,project_store:store_path.clone(),task:task.id.clone(),task_revision:task.revision,scheduler_revision:1,control_epoch:0,binding:"local".into(),binding_revision:1,binding_digest:"a".repeat(64),profile:profile.reference().unwrap(),effective_profile:Some(profile.clone()),approval:VersionedReference{id:"pending".into(),revision:1,digest:"0".repeat(64)},config:crate::migration::ConfigReference{path:store_path,digest:None},repositories:vec![],dependencies:vec![],memory:None,budget:None};
+        let grant=ApprovalGrant{version:1,scope:ApprovalScope::for_launch(&inputs).unwrap(),policy:profile.permission_policy,issued_unix_ms:0,expires_unix_ms:100_000};
+        db.install_approval(&PreparedApproval{grant},s.head,1_000).unwrap();
+        let report=db.queue_report(1_000).unwrap();assert!(!report.launch_enabled);
+        let entry=|id:&str|&report.entries.iter().find(|entry|entry.task.as_str()==id).unwrap().blockers;
+        assert!(entry("a").iter().all(|b|b!="launch_reserve_not_scheduled"&&b!="controller_requires_reserved_attempt"));
+        assert!(entry("a").iter().any(|b|b=="owner_signature_not_scheduled"));
+        assert!(entry("b").iter().any(|b|b=="launch_reserve_not_scheduled")&&entry("b").iter().any(|b|b=="controller_requires_reserved_attempt"));
+        assert!(entry("c").iter().all(|b|b!="owner_signature_not_scheduled"));
+        assert!(entry("c").iter().any(|b|b=="launch_reserve_not_scheduled"));
+        assert!(report.entries.iter().flat_map(|entry|&entry.blockers).all(|b|b!="launch_draft_not_scheduled"));
+        assert_eq!(report.capability.blockers,vec!["automatic_admission_does_not_draft_sign_or_reserve".to_string()]);
     }
     #[test]
     fn competing_policy_writers_cannot_both_win_the_same_revision() {
