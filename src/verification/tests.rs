@@ -350,6 +350,63 @@ fn parent_source_does_not_call_mount_or_pivot_root() {
 }
 
 #[test]
+fn unread_namespace_does_not_allow_mount() {
+    assert!(!setup::namespace_is_new(None, "mnt:[1]"));
+    assert!(!setup::namespace_is_new(Some("mnt:[1]"), "mnt:[1]"));
+    assert!(setup::namespace_is_new(Some("mnt:[2]"), "mnt:[1]"));
+}
+
+#[test]
+fn materialize_refuses_to_delete_a_nested_store() {
+    let root = tempfile::tempdir().unwrap();
+    let work = root.path().join("work");
+    fs::create_dir_all(work.join("checkout")).unwrap();
+    let store = work.join("checkout").join("state.db");
+    fs::write(&store, b"database").unwrap();
+    let Err(error) = checkout::materialize(&work, &store, &[], "abcdef") else {
+        panic!("materialize deleted a nested store");
+    };
+    assert!(
+        error.to_string().contains("outside the project store"),
+        "{error}"
+    );
+    assert_eq!(fs::read(&store).unwrap(), b"database");
+
+    let store_dir = root.path().join("state");
+    fs::create_dir_all(&store_dir).unwrap();
+    let nested = store_dir.join("state.db");
+    fs::write(&nested, b"kept").unwrap();
+    let inside = store_dir.join("work");
+    fs::create_dir_all(&inside).unwrap();
+    assert!(checkout::materialize(&inside, &nested, &[], "abcdef").is_err());
+    assert_eq!(fs::read(&nested).unwrap(), b"kept");
+}
+
+#[test]
+fn staged_and_untracked_changes_reject_without_a_result() {
+    if !require_unshare() {
+        return;
+    }
+    let diff_for = |world: &World| git_diff_policy(&world.work.join("checkout"));
+    {
+        let world = world(false);
+        let body = diff_for(&world);
+        let (outcome, db) = run_verify(&world, &body, Duration::from_secs(30), Fault::StageChange);
+        assert_eq!(outcome.reason.as_deref(), Some("tampered_tree"));
+        assert!(outcome.receipt.is_none());
+        assert_eq!(db.verified_result_count().unwrap(), 0);
+    }
+    {
+        let world = world(false);
+        let body = diff_for(&world);
+        let (outcome, db) = run_verify(&world, &body, Duration::from_secs(30), Fault::Untracked);
+        assert_eq!(outcome.reason.as_deref(), Some("tampered_tree"));
+        assert!(outcome.receipt.is_none());
+        assert_eq!(db.verified_result_count().unwrap(), 0);
+    }
+}
+
+#[test]
 fn recorded_argv_contains_a_program_after_dash() {
     let launch = supervise::launch(&supervise::Spec {
         unshare_program: PathBuf::from("/usr/bin/unshare"),

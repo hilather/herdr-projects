@@ -124,6 +124,10 @@ pub(crate) enum Fault {
     DirtyTree,
     DropPolicy,
     #[cfg(test)]
+    StageChange,
+    #[cfg(test)]
+    Untracked,
+    #[cfg(test)]
     BumpFence,
 }
 
@@ -276,6 +280,32 @@ pub fn verify(store: &mut SqliteStore, request: &VerifyRequest) -> Result<Verify
     if request.fault == Fault::DirtyTree {
         fs::write(checkout.path.join("src/file.txt"), b"tampered\n")
             .context("could not dirty the checkout")?;
+    }
+    #[cfg(test)]
+    if request.fault == Fault::StageChange {
+        fs::write(checkout.path.join("src/file.txt"), b"staged\n")
+            .context("could not stage the checkout")?;
+        let status = std::process::Command::new("/usr/bin/git")
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "add",
+                "--",
+                "src/file.txt",
+            ])
+            .current_dir(&checkout.path)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .context("git add")?;
+        if !status.success() {
+            bail!("could not stage the checkout change");
+        }
+    }
+    #[cfg(test)]
+    if request.fault == Fault::Untracked {
+        fs::write(checkout.path.join("untracked.txt"), b"extra\n")
+            .context("could not add an untracked file")?;
     }
     if request.fault == Fault::DropPolicy {
         fs::remove_file(&request.policy_path).context("could not remove the policy file")?;

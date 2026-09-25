@@ -12,6 +12,28 @@ use crate::{
     store::verification::RetainedObject,
 };
 
+fn overlaps(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+/// Delete only a canonical checkout that does not contain the open database.
+fn reset_checkout(checkout: &Path, store_file: &Path, store_dir: &Path) -> Result<()> {
+    let meta = match fs::symlink_metadata(checkout) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("checkout path"),
+    };
+    if meta.file_type().is_symlink() {
+        bail!("verification checkout must stay outside the project store");
+    }
+    let canonical = checkout.canonicalize().context("checkout path")?;
+    if overlaps(&canonical, store_file) || overlaps(&canonical, store_dir) {
+        bail!("verification checkout must stay outside the project store");
+    }
+    fs::remove_dir_all(&canonical).context("reset checkout")?;
+    Ok(())
+}
+
 pub struct Checkout {
     pub path: PathBuf,
     pub commit: String,
@@ -25,20 +47,23 @@ pub fn materialize(
     oid: &str,
 ) -> Result<Checkout> {
     let work = work.canonicalize().context("verification work directory")?;
+    let store_file = store_file.canonicalize().context("project store")?;
     let store_dir = store_file
         .parent()
         .context("project store directory")?
         .canonicalize()
         .context("project store directory")?;
-    if work.starts_with(&store_dir) {
+    // Either nesting can make a later delete or a bind include the open database.
+    if overlaps(&work, &store_file) || overlaps(&work, &store_dir) {
         bail!("verification checkout must stay outside the project store");
     }
     let path = work.join("checkout");
+    if overlaps(&path, &store_file) || overlaps(&path, &store_dir) {
+        bail!("verification checkout must stay outside the project store");
+    }
+    reset_checkout(&path, &store_file, &store_dir)?;
     let template = work.join("template");
     fs::create_dir_all(&template).context("git template")?;
-    if path.exists() {
-        fs::remove_dir_all(&path).context("reset checkout")?;
-    }
     git(
         &work,
         &[

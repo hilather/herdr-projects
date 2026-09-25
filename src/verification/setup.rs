@@ -26,14 +26,21 @@ pub fn setup_from_args(args: &[String]) -> i32 {
     let Some(parsed) = parse_args(args) else {
         return fail("args", 0);
     };
-    let current = fs::read_link("/proc/self/ns/mnt").ok();
-    let current = current.as_ref().and_then(|path| path.to_str());
-    // The caller is not inside the new mount namespace. Do not mount.
-    if current == Some(parsed.host_mnt.as_str()) {
+    // Mount only after a successful read proves this is a different mount namespace.
+    let current = match fs::read_link("/proc/self/ns/mnt") {
+        Ok(path) => path.into_os_string().into_string().ok(),
+        Err(_) => None,
+    };
+    if !namespace_is_new(current.as_deref(), &parsed.host_mnt) {
         eprintln!("hp-verify same-namespace");
         return EXIT_SAME_NS;
     }
     enter(&parsed)
+}
+
+/// `None` is a failed read or a non-UTF-8 id. That must not mount.
+pub(super) fn namespace_is_new(current: Option<&str>, host_mnt: &str) -> bool {
+    matches!(current, Some(current) if current != host_mnt)
 }
 
 struct Args {
@@ -129,10 +136,11 @@ fn enter(parsed: &Args) -> i32 {
     if seen_commit != commit || seen_tree != tree {
         return EXIT_TAMPER;
     }
-    match git_status(&parsed.git, &parsed.checkout) {
-        Some(0) => {}
-        Some(1) => return EXIT_TAMPER,
-        _ => return fail("diff", 0),
+    // HEAD, not the index: staged edits and untracked files are still a different tree.
+    match clean_tree(&parsed.git, &parsed.checkout) {
+        Some(true) => {}
+        Some(false) => return EXIT_TAMPER,
+        None => return fail("diff", 0),
     }
     let output = match Command::new(&checks[0]).args(&checks[1..]).output() {
         Ok(output) => output,
@@ -172,14 +180,30 @@ fn git_line(git: &Path, checkout: &Path, args: &[&str]) -> Option<String> {
     Some(text.to_string())
 }
 
-fn git_status(git: &Path, checkout: &Path) -> Option<i32> {
-    Command::new(git)
+fn clean_tree(git: &Path, checkout: &Path) -> Option<bool> {
+    let diff = Command::new(git)
         .args(["-c", "core.hooksPath=/dev/null", "-C"])
         .arg(checkout)
-        .args(["diff", "--quiet"])
+        .args(["diff", "--quiet", "HEAD"])
         .status()
         .ok()?
-        .code()
+        .code()?;
+    if diff == 1 {
+        return Some(false);
+    }
+    if diff != 0 {
+        return None;
+    }
+    let untracked = Command::new(git)
+        .args(["-c", "core.hooksPath=/dev/null", "-C"])
+        .arg(checkout)
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .output()
+        .ok()?;
+    if !untracked.status.success() {
+        return None;
+    }
+    Some(untracked.stdout.is_empty())
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -221,12 +245,13 @@ fn switch_root(scratch: &Path, parsed: &Args, libraries: &[PathBuf]) -> Result<(
     )?;
     device(scratch, "null", 1, 3, "/dev/null")?;
     device(scratch, "urandom", 1, 9, "/dev/urandom")?;
-    bind_ro(scratch, &parsed.git, false)?;
+    bind_ro(scratch, &parsed.git)?;
     for library in libraries {
-        bind_ro(scratch, library, false)?;
+        bind_ro(scratch, library)?;
     }
-    bind_ro(scratch, &parsed.policy, false)?;
-    bind_ro(scratch, &parsed.checkout, true)?;
+    bind_ro(scratch, &parsed.policy)?;
+    // A private copy, not a bind of the live host directory. Host writes cannot land after the check.
+    copy_checkout(scratch, &parsed.checkout)?;
     let put_old = scratch.join("old");
     pivot(
         &scratch.display().to_string(),
@@ -250,26 +275,60 @@ fn device(root: &Path, name: &str, major: u32, minor: u32, source: &str) -> Resu
     if created == 0 {
         return Ok(());
     }
-    bind_ro(root, Path::new(source), false)
+    bind_ro(root, Path::new(source))
 }
 
-fn bind_ro(root: &Path, source: &Path, directory: bool) -> Result<(), i32> {
+fn copy_checkout(scratch: &Path, checkout: &Path) -> Result<(), i32> {
+    let relative = checkout.strip_prefix("/").map_err(|_| 1)?;
+    let dest = scratch.join(relative);
+    if dest.starts_with(checkout) || checkout.starts_with(&dest) {
+        return Err(1);
+    }
+    copy_snapshot(checkout, &dest)
+}
+
+fn copy_snapshot(source: &Path, dest: &Path) -> Result<(), i32> {
+    let meta = fs::symlink_metadata(source).map_err(|error| error.raw_os_error().unwrap_or(1))?;
+    if meta.file_type().is_symlink() {
+        let target = fs::read_link(source).map_err(|error| error.raw_os_error().unwrap_or(1))?;
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.raw_os_error().unwrap_or(1))?;
+        }
+        std::os::unix::fs::symlink(&target, dest)
+            .map_err(|error| error.raw_os_error().unwrap_or(1))?;
+        return Ok(());
+    }
+    if meta.is_dir() {
+        fs::create_dir_all(dest).map_err(|error| error.raw_os_error().unwrap_or(1))?;
+        for entry in fs::read_dir(source).map_err(|error| error.raw_os_error().unwrap_or(1))? {
+            let entry = entry.map_err(|error| error.raw_os_error().unwrap_or(1))?;
+            copy_snapshot(&entry.path(), &dest.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+    if meta.is_file() {
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.raw_os_error().unwrap_or(1))?;
+        }
+        fs::copy(source, dest).map_err(|error| error.raw_os_error().unwrap_or(1))?;
+        return Ok(());
+    }
+    Err(1)
+}
+
+fn bind_ro(root: &Path, source: &Path) -> Result<(), i32> {
     let relative = source.strip_prefix("/").map_err(|_| 1)?;
     let dest = root.join(relative);
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|error| error.raw_os_error().unwrap_or(1))?;
     }
-    if directory {
-        fs::create_dir_all(&dest).map_err(|error| error.raw_os_error().unwrap_or(1))?;
-    } else {
-        fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o644)
-            .open(&dest)
-            .map_err(|error| error.raw_os_error().unwrap_or(1))?;
-    }
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o644)
+        .open(&dest)
+        .map_err(|error| error.raw_os_error().unwrap_or(1))?;
     let source_text = source.display().to_string();
     let dest_text = dest.display().to_string();
     mount_path(Some(&source_text), &dest_text, None, libc::MS_BIND, None)?;
