@@ -1,8 +1,12 @@
 # Memory review repair progress
 
-Updated 2026-09-20. This tracks repairs against the
+The sections below are the record. This tracks repairs against the
 [independent review](reviews/2026-09-20-memory-audit.md), not a new certification.
-T04.5 and T05.1–T06.2 remain partial; T06.3–T06.5 remain unstarted.
+T04.5 and T05.1–T06.2 remain partial. Later sections record T06.3 as partial,
+move T06.4 from unstarted to partial, and do not complete T06.5.
+The closing subsection, "Authorized live controller acceptance and dispatch
+enablement," enables `PREPARED_LAUNCH_DISPATCH_ENABLED`. Earlier notes that
+dispatch remains disabled describe the tree when they were written.
 
 ## Implemented in the first repair batch
 

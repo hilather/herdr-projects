@@ -2,7 +2,12 @@
 
 The implementation is under repair against the [independent review](reviews/2026-09-20-memory-audit.md).
 See [repair progress](memory-repair-progress.md) for acceptance limits. T04.5 and
-T05.1–T06.4 remain partial; production worker launches remain disabled.
+T05.1–T06.4 remain partial. Prepared-launch dispatch is on
+(`PREPARED_LAUNCH_DISPATCH_ENABLED = true`) and automatic admission is off, so
+production worker launches remain disabled as scheduler preparation:
+`SqliteStore::queue_report` still sets `launch_enabled: false` and appends
+`launch_preparation_unavailable`. The controller can still start an already
+prepared launch. See the [factory baseline](factory/baseline.md).
 
 Existing projects need an explicit `herdr-projects migration PROJECT upgrade-store`
 to use schema 25. Opening a project never implicitly upgrades it. Schema 23 adds
@@ -277,6 +282,7 @@ The renderer returns retained instructions, task text and memory within the
 captured budget. It verifies consumed source bytes under a bounded aggregate read
 budget and checks current execution/configuration again before returning. It does
 not read current `PROJECT.md` as a replacement for approved input. Trusted
-profile/launch preparation and complete prompt framing now exist; automatic
-new-launch dispatch and live workflow acceptance remain outstanding. This command
-does not start a worker.
+profile/launch preparation and complete prompt framing now exist. Prepared-launch
+dispatch of an already reserved attempt is on; automatic admission of a queued
+task is not. Live workflow certification beyond the dispatch audit remains
+outstanding. This command does not start a worker.

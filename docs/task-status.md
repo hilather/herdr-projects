@@ -14,6 +14,7 @@ exist, with controller admission and persistent Linux supervisor identities. Tru
 profile revalidation and signed draft/reservation ingress now exist. Worktree
 creation and new-launch controller admission now have implementations and fixture
 acceptance, with prepared-launch dispatch enabled after live controller validation.
+Automatic admission of queued tasks stays off; see the [factory baseline](factory/baseline.md).
 Complete vendor protocol certification remains open; see the current
 [dispatch completion audit](dispatch-enablement.md) and
 [canonical launch checklist](canonical-worker-launch.md). These additions do not
@@ -68,8 +69,9 @@ W04 T04.1 now has a [schema-v16 scheduling foundation](scheduling.md): DAG
 validation, aged priority, retained-attempt capacity reporting and fenced CLI edits.
 Atomic reservations and immutable inputs now have a sealed internal API, and cancellation
 has an audited CLI. Trusted launch drafts and signed reservations now have CLI
-ingress; confirmed-worker termination/recovery exists. New-launch dispatch and
-complete resource lifecycle acceptance remain open. T04.2 now uses monotonic remote poll/retry deadlines and pass-start
+ingress; confirmed-worker termination/recovery exists. Prepared-launch dispatch
+of an already reserved attempt is on; automatic admission of queued tasks is not.
+Complete resource lifecycle acceptance remains open. T04.2 now uses monotonic remote poll/retry deadlines and pass-start
 scheduling plus a shared bounded executor for asynchronous PR and remote observations;
 automatic routines now share that executor. Linux artifact transfers, launch/brief/coordinator effects, token updates and
 notifications now share supervised or guarded executor jobs. Canonical observation,
@@ -172,9 +174,11 @@ unstarted. The
 [repair tracker](memory-repair-progress.md) records exact limits and remaining work.
 Coordinator checkpoints now require explicit continuation tokens bound to canonical
 runtime route, project epoch and configuration; fresh context is the default.
-W05/W06 wave gates remain open; T06.3–T06.4 are partial; T06.5 remains unstarted. Production launches
-remain disabled. W04 profile production, complete bounded reads, macOS and live
-multi-project SSH certification retain their previous limits.
+W05/W06 wave gates remain open; T06.3–T06.4 are partial; T06.5 remains unstarted.
+Prepared-launch dispatch is on and automatic admission is off, so production launches remain disabled
+only as scheduler preparation (`queue_report` sets `launch_enabled: false`), not as a
+refusal to start an already prepared launch. W04 profile production, complete
+bounded reads, macOS and live multi-project SSH certification retain their previous limits.
 
 Priority repairs now propagate source changes through historical dependency edges,
 exclude expired-source facts, and provide owner-signed exact invalidation

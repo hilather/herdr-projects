@@ -2,8 +2,11 @@
 
 Schema v10 adds canonical queue records, typed dependency edges and a revisioned
 project capacity policy. Schema v11 adds atomic reservations behind an internal
-preparation capability and audited cancellation. Worker launches remain disabled.
-Schema v12 requires new reservations to retain validated [frozen profile evidence](profiles.md)
+preparation capability and audited cancellation. Prepared-launch dispatch is on
+(`PREPARED_LAUNCH_DISPATCH_ENABLED = true`); automatic admission is off, so the
+scheduler does not prepare an arbitrary queued task. See the
+[factory baseline](factory/baseline.md). Schema v12 requires new reservations to
+retain validated [frozen profile evidence](profiles.md)
 in version-2 inputs, while preserving historical version-1 records byte-for-byte.
 Schema v13 adds [durable scoped approvals](authority.md) and consumes one grant with
 each launch claim; neither a reservation nor a parsed approval is permission to run.
@@ -17,7 +20,9 @@ legacy advisory limits are not silently promoted into execution authority.
 priority order and blocking reasons. Every attempt without recorded termination
 counts, including lost, awaiting-input and completed attempts. Lowering the limit
 never cancels or releases those attempts. `available_slots` is arithmetic capacity,
-not permission to launch; `launch_enabled` remains false in this increment.
+not permission to launch. Prepared-launch dispatch is on; automatic admission is
+off, so `launch_enabled` remains false: `queue_report` sets `launch_enabled: false`
+and appends `launch_preparation_unavailable` for every queued task.
 
 ```sh
 herdr-projects scheduler demo policy --max-active-workers 3 \
@@ -58,9 +63,13 @@ priority, then commits the attempt, immutable inputs, task pointer and launch in
 together. Inputs pin this store, configuration, profile, approval and repository
 identities. [Signed admission budgets](budgets.md) are checked in the reservation
 transaction and rechecked at claim/pre-effect boundaries. Dependency/memory evidence
-producers are not available yet; preparations requiring them refuse. There is no CLI constructor or production
-producer for the sealed preparation capability. Generic intent enqueue cannot
-create `runtime.launch` operations; the controller does not dispatch launches.
+producers are not available yet; preparations requiring them refuse. On Linux
+with the `state-store` feature, `launch draft` and `launch reserve` build a
+sealed preparation for an unused local binding and an installed owner-signed
+grant. Generic intent enqueue cannot create `runtime.launch` operations.
+Prepared-launch dispatch is on (`PREPARED_LAUNCH_DISPATCH_ENABLED = true`);
+automatic admission is off, so the controller can start an already prepared
+launch and does not prepare an arbitrary queued task.
 
 ```sh
 herdr-projects task demo cancel-attempt ATTEMPT \
