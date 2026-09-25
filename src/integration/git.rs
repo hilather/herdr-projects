@@ -270,6 +270,7 @@ impl GitRepo {
             ],
         )?;
         let oid = oid_line(&commit, len).context("commit-tree")?;
+        self.import_source_objects(&isolated.join(".git/objects"))?;
         let checkout = run_git(
             &isolated,
             &["checkout".into(), "--detach".into(), oid.clone()],
@@ -277,6 +278,8 @@ impl GitRepo {
         if !checkout.success() {
             bail!("git checkout of the candidate failed: {}", checkout.stderr.trim());
         }
+        // The verifier copies this directory into a tmpfs. Alternates would point outside that copy.
+        let _ = fs::remove_file(isolated.join(".git/objects/info/alternates"));
         Ok(BuiltCommit::Ready {
             oid,
             tree,
@@ -284,43 +287,76 @@ impl GitRepo {
         })
     }
 
-    pub fn copy_objects_from(&self, checkout: &Path) -> Result<()> {
-        let source = checkout.join(".git/objects");
-        let dest = self.git_dir.join("objects");
-        for prefix in fs::read_dir(&source).context("isolated objects")? {
-            let prefix = prefix.context("isolated objects")?;
-            let name = prefix.file_name();
-            let name = name.to_string_lossy();
-            if name.len() != 2 || !name.chars().all(|c| c.is_ascii_hexdigit()) {
-                continue;
-            }
-            let dest_dir = dest.join(name.as_ref());
-            fs::create_dir_all(&dest_dir).context("repository objects")?;
-            for file in fs::read_dir(prefix.path()).context("isolated object")? {
-                let file = file.context("isolated object")?;
-                let target = dest_dir.join(file.file_name());
-                if let Ok(meta) = fs::symlink_metadata(&target) {
-                    if meta.file_type().is_symlink() || !meta.is_file() {
-                        bail!("repository object is not a regular file");
-                    }
-                    continue;
-                }
-                let bytes = fs::read(file.path()).context("read candidate object")?;
-                let mut out = fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o444)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(&target)
-                    .context("write candidate object")?;
-                out.write_all(&bytes).context("write candidate object")?;
-                out.sync_all().context("sync candidate object")?;
-            }
-            fs::File::open(&dest_dir)
-                .and_then(|dir| dir.sync_all())
-                .context("sync object directory")?;
+    /// Reuse or recreate a detached checkout of a commit already recorded for this generation.
+    pub fn checkout_candidate(&self, work: &Path, oid: &str) -> Result<PathBuf> {
+        let work = work.canonicalize().context("integration work directory")?;
+        if overlaps(&work, &self.path) {
+            bail!("integration work directory must stay outside the repository");
         }
-        Ok(())
+        let isolated = work.join("isolated");
+        let head = if isolated.join(".git").is_dir() {
+            run_git(&isolated, &["rev-parse".into(), "HEAD".into()])?
+        } else {
+            self.prepare_isolated(&work)?;
+            Output::default()
+        };
+        if head.stdout.trim() != oid {
+            self.import_source_objects(&isolated.join(".git/objects"))?;
+            let checkout = run_git(
+                &isolated,
+                &["checkout".into(), "--detach".into(), oid.into()],
+            )?;
+            if !checkout.success() {
+                bail!(
+                    "candidate checkout is unavailable: {}",
+                    checkout.stderr.trim()
+                );
+            }
+        } else {
+            self.import_source_objects(&isolated.join(".git/objects"))?;
+        }
+        let _ = fs::remove_file(isolated.join(".git/objects/info/alternates"));
+        Ok(isolated)
+    }
+
+    fn prepare_isolated(&self, work: &Path) -> Result<PathBuf> {
+        let isolated = work.join("isolated");
+        if isolated.exists() {
+            fs::remove_dir_all(&isolated).context("reset isolated git dir")?;
+        }
+        let template = work.join("template");
+        fs::create_dir_all(&template).context("git template")?;
+        let init = run_git(
+            work,
+            &[
+                "init".into(),
+                "--template".into(),
+                template.display().to_string(),
+                isolated.display().to_string(),
+            ],
+        )?;
+        if !init.success() {
+            bail!("git init failed: {}", init.stderr.trim());
+        }
+        let alternates = isolated.join(".git/objects/info");
+        fs::create_dir_all(&alternates).context("git alternates")?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o644)
+            .open(alternates.join("alternates"))
+            .context("git alternates")?;
+        writeln!(file, "{}", self.git_dir.join("objects").display()).context("git alternates")?;
+        Ok(isolated)
+    }
+
+    fn import_source_objects(&self, dest: &Path) -> Result<()> {
+        copy_loose(&self.git_dir.join("objects"), dest)
+    }
+
+    pub fn copy_objects_from(&self, checkout: &Path) -> Result<()> {
+        copy_loose(&checkout.join(".git/objects"), &self.git_dir.join("objects"))
     }
 
     pub fn commit_matches(
@@ -420,6 +456,46 @@ impl GitRepo {
         }
         Ok(oid)
     }
+}
+
+fn copy_loose(source: &Path, dest: &Path) -> Result<()> {
+    if !source.is_dir() {
+        return Ok(());
+    }
+    for prefix in fs::read_dir(source).context("git objects")? {
+        let prefix = prefix.context("git objects")?;
+        let name = prefix.file_name();
+        let name = name.to_string_lossy();
+        if name.len() != 2 || !name.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        let dest_dir = dest.join(name.as_ref());
+        fs::create_dir_all(&dest_dir).context("repository objects")?;
+        for file in fs::read_dir(prefix.path()).context("git object")? {
+            let file = file.context("git object")?;
+            let target = dest_dir.join(file.file_name());
+            if let Ok(meta) = fs::symlink_metadata(&target) {
+                if meta.file_type().is_symlink() || !meta.is_file() {
+                    bail!("repository object is not a regular file");
+                }
+                continue;
+            }
+            let bytes = fs::read(file.path()).context("read candidate object")?;
+            let mut out = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o444)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&target)
+                .context("write candidate object")?;
+            out.write_all(&bytes).context("write candidate object")?;
+            out.sync_all().context("sync candidate object")?;
+        }
+        fs::File::open(&dest_dir)
+            .and_then(|dir| dir.sync_all())
+            .context("sync object directory")?;
+    }
+    Ok(())
 }
 
 pub enum BuiltCommit {

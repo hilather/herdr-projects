@@ -263,6 +263,97 @@ fn stale_base_does_not_publish() {
 }
 
 #[test]
+fn retry_integrate_confirms_candidate_already_at_ref() {
+    let fixture = fixture();
+    let mut db = open(&fixture);
+    let outcome = integrate(
+        &mut db,
+        &request(&fixture, "integrate-retry", Fault::CrashAfterRefUpdate),
+    )
+    .unwrap();
+    let new_oid = outcome.commit_oid.expect("candidate oid");
+    assert_eq!(git_text(&fixture.repo, &["rev-parse", TARGET]), new_oid);
+    assert!(db.testing_integrated_oids().unwrap().is_empty());
+    let confirmed = integrate(&mut db, &request(&fixture, "integrate-retry", Fault::None)).unwrap();
+    assert_eq!(confirmed.state, "integrated");
+    assert_eq!(confirmed.commit_oid.as_deref(), Some(new_oid.as_str()));
+    assert_eq!(db.testing_integrated_oids().unwrap(), vec![new_oid.clone()]);
+    assert_eq!(git_text(&fixture.repo, &["rev-parse", TARGET]), new_oid);
+    assert_local(&fixture);
+}
+
+#[test]
+fn update_ref_failure_at_old_oid_stays_retryable() {
+    let fixture = fixture();
+    let mut db = open(&fixture);
+    let outcome = integrate(
+        &mut db,
+        &request(&fixture, "integrate-reject", Fault::UpdateRefRejected),
+    )
+    .unwrap();
+    assert_eq!(outcome.state, "validating");
+    assert_eq!(git_text(&fixture.repo, &["rev-parse", TARGET]), fixture.base);
+    assert!(db.testing_integrated_oids().unwrap().is_empty());
+    let confirmed = integrate(&mut db, &request(&fixture, "integrate-reject", Fault::None)).unwrap();
+    assert_eq!(confirmed.state, "integrated");
+    assert_ne!(confirmed.commit_oid.as_deref(), Some(fixture.base.as_str()));
+    assert_eq!(
+        git_text(&fixture.repo, &["rev-parse", TARGET]),
+        confirmed.commit_oid.unwrap()
+    );
+    assert_local(&fixture);
+}
+
+#[test]
+fn expired_claim_confirms_exact_oid_without_claimed_state() {
+    let fixture = fixture();
+    let mut db = open(&fixture);
+    let outcome = integrate(
+        &mut db,
+        &request(&fixture, "integrate-expired", Fault::CrashAfterRefUpdate),
+    )
+    .unwrap();
+    let new_oid = outcome.commit_oid.expect("candidate oid");
+    db.testing_expire_lease(&outcome.operation_id).unwrap();
+    assert_eq!(db.expire_claims(1).unwrap(), 1);
+    let confirmed = integrate(&mut db, &request(&fixture, "integrate-expired", Fault::None)).unwrap();
+    assert_eq!(confirmed.state, "integrated");
+    assert_eq!(confirmed.commit_oid.as_deref(), Some(new_oid.as_str()));
+    assert_eq!(git_text(&fixture.repo, &["rev-parse", TARGET]), new_oid);
+    assert_local(&fixture);
+}
+
+#[test]
+fn crash_before_checks_resumes_or_discards_instead_of_staying_pending() {
+    let fixture = fixture();
+    let mut db = open(&fixture);
+    let pending = integrate(
+        &mut db,
+        &request(&fixture, "integrate-pending", Fault::CrashBeforeBuild),
+    )
+    .unwrap();
+    assert_eq!(pending.state, "effect_pending");
+    let resumed = integrate(&mut db, &request(&fixture, "integrate-pending", Fault::None)).unwrap();
+    assert_ne!(resumed.state, "effect_pending");
+    assert_ne!(resumed.state, "candidate_prepared");
+    assert_eq!(resumed.state, "integrated");
+
+    let prepared = integrate(
+        &mut db,
+        &request(&fixture, "integrate-prepared", Fault::CrashBeforeChecks),
+    )
+    .unwrap();
+    assert_eq!(prepared.state, "candidate_prepared");
+    db.testing_expire_lease(&prepared.operation_id).unwrap();
+    db.expire_claims(1).unwrap();
+    let again = integrate(&mut db, &request(&fixture, "integrate-prepared", Fault::None)).unwrap();
+    assert_ne!(again.state, "effect_pending");
+    assert_ne!(again.state, "candidate_prepared");
+    assert_eq!(again.state, "integrated");
+    assert_local(&fixture);
+}
+
+#[test]
 fn crash_after_ref_update_confirms_only_exact_new_oid() {
     let fixture = fixture();
     let mut db = open(&fixture);

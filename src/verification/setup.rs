@@ -142,7 +142,12 @@ fn enter(parsed: &Args) -> i32 {
         Some(false) => return EXIT_TAMPER,
         None => return fail("diff", 0),
     }
-    let output = match Command::new(&checks[0]).args(&checks[1..]).output() {
+    // The copied checkout is the check cwd. Signed argv cannot name that path.
+    let output = match Command::new(&checks[0])
+        .args(&checks[1..])
+        .current_dir(&parsed.checkout)
+        .output()
+    {
         Ok(output) => output,
         Err(error) => return fail("exec", error.raw_os_error().unwrap_or(0)),
     };

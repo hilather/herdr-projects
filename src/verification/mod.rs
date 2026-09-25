@@ -6,7 +6,7 @@
 mod checkout;
 mod manifest;
 mod setup;
-mod supervise;
+pub(crate) mod supervise;
 
 use std::{
     fs,
@@ -583,7 +583,11 @@ fn protocol(stderr: &str) -> Protocol {
     parsed
 }
 
-fn unshare_ready(path: &Path) -> bool {
+pub(crate) fn isolated_check_ok(output: &Output, commit: &str, tree: &str) -> bool {
+    classify(output, commit, tree).success
+}
+
+pub(crate) fn unshare_ready(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     let Ok(meta) = fs::metadata(path) else {
         return false;

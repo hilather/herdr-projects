@@ -11,14 +11,14 @@ use sha2::{Digest, Sha256};
 use crate::{
     domain::OperationId,
     operations::Claim,
-    runner::{Cmd, RealRunner, Runner},
+    runner::{RealRunner, Runner},
     store::{
         SqliteStore,
         integration::{
             IntegrationBegin, IntegrationFinish, IntegrationView, LEASE_OWNER, VerifiedIntegration,
         },
     },
-    verification::{parse_checks, program_allowed},
+    verification::{self, parse_checks, supervise},
 };
 
 use git::{BuiltCommit, GitRepo};
@@ -30,6 +30,12 @@ pub enum Fault {
     StaleBase,
     #[cfg(test)]
     CrashAfterRefUpdate,
+    #[cfg(test)]
+    CrashBeforeBuild,
+    #[cfg(test)]
+    CrashBeforeChecks,
+    #[cfg(test)]
+    UpdateRefRejected,
 }
 
 impl Default for Fault {
@@ -86,9 +92,6 @@ pub fn integrate(store: &mut SqliteStore, request: &IntegrateRequest) -> Result<
     let Some(reference) = store.integration_ref(&repo.identity)? else {
         bail!("integration ref is not configured");
     };
-    if repo.is_checked_out(&reference)? {
-        bail!("integration ref is checked out");
-    }
     let verified = store.load_verified_for_integration(&request.result_id)?;
     if verified.repository != repo.identity {
         bail!("verified result belongs to another repository");
@@ -106,7 +109,12 @@ pub fn integrate(store: &mut SqliteStore, request: &IntegrateRequest) -> Result<
         if existing.payload_digest != digest || existing.verified_result_id != request.result_id {
             bail!("integration idempotency conflict");
         }
-        return resume(store, &repo, request, existing, true);
+        // An existing generation is classified from the ref. Do not discard a candidate
+        // that is already the ref tip.
+        return resume(store, &repo, request, existing);
+    }
+    if repo.is_checked_out(&reference)? {
+        bail!("integration ref is checked out");
     }
     let Some(base) = repo.ref_oid(&reference)? else {
         bail!("integration ref is missing");
@@ -122,7 +130,7 @@ pub fn integrate(store: &mut SqliteStore, request: &IntegrateRequest) -> Result<
         idempotency_key: request.idempotency_key.clone(),
         payload_digest: digest,
     })?;
-    let now = jiff::Timestamp::now().as_millisecond();
+    let now = now_ms();
     let operation = OperationId::new(operation_id.clone()).map_err(anyhow::Error::msg)?;
     let claim = match store.claim_operation(&operation, 1, LEASE_OWNER, now, 60_000) {
         Ok(claim) => claim,
@@ -151,7 +159,7 @@ pub fn reconcile_integration(
         fault: Fault::None,
     };
     // Reconcile never builds another merge. It only classifies the ref we already named.
-    resume(store, &repo, &request, view, false)
+    resume(store, &repo, &request, view)
 }
 
 fn resume(
@@ -159,7 +167,6 @@ fn resume(
     repo: &GitRepo,
     request: &IntegrateRequest,
     view: IntegrationView,
-    first_attempt: bool,
 ) -> Result<IntegrateOutcome> {
     if matches!(
         view.state.as_str(),
@@ -168,15 +175,13 @@ fn resume(
         return Ok(outcome_of(&view));
     }
     if !view.checks_passed {
-        return Ok(outcome_of(&view));
+        return resume_incomplete(store, repo, request, &view);
     }
-    let now = jiff::Timestamp::now().as_millisecond();
-    let claim = store.held_claim(&view.operation_id, now)?;
-    if first_attempt {
-        publish(store, repo, request, &view, claim)
-    } else {
-        observe(store, repo, &view, claim)
-    }
+    settle(store, repo, request, &view, true)
+}
+
+fn now_ms() -> i64 {
+    jiff::Timestamp::now().as_millisecond()
 }
 
 fn drive_new(
@@ -187,6 +192,11 @@ fn drive_new(
     base: &str,
     claim: Claim,
 ) -> Result<IntegrateOutcome> {
+    #[cfg(test)]
+    if request.fault == Fault::CrashBeforeBuild {
+        let view = store.load_integration_operation(claim.operation.as_str())?;
+        return Ok(outcome_of(&view));
+    }
     let built = repo.build_merge(&request.work_dir, base, &verified.commit_oid)?;
     let BuiltCommit::Ready {
         oid,
@@ -196,19 +206,26 @@ fn drive_new(
     else {
         return finish(
             store,
-            &claim,
+            claim.operation.as_str(),
+            Some(&claim),
             IntegrationFinish::Blocked {
                 reason: "merge_conflict",
             },
         );
     };
-    let now = jiff::Timestamp::now().as_millisecond();
+    let now = now_ms();
     // Persist M before update-ref so crash recovery can confirm only this oid.
     store.record_candidate(&claim, &oid, &tree, &verified.commit_oid, now)?;
-    if !checks_pass(&checkout, &verified.policy_body, &oid)? {
+    #[cfg(test)]
+    if request.fault == Fault::CrashBeforeChecks {
+        let view = store.load_integration_operation(claim.operation.as_str())?;
+        return Ok(outcome_of(&view));
+    }
+    if !checks_pass(&request.work_dir, &checkout, verified, &oid, &tree)? {
         return finish(
             store,
-            &claim,
+            claim.operation.as_str(),
+            Some(&claim),
             IntegrationFinish::Blocked {
                 reason: "checks_failed",
             },
@@ -220,72 +237,101 @@ fn drive_new(
         bail!("candidate objects are not in the repository");
     }
     let view = store.load_integration_operation(claim.operation.as_str())?;
-    publish(store, repo, request, &view, claim)
+    settle(store, repo, request, &view, true)
 }
 
-fn publish(
+fn resume_incomplete(
     store: &mut SqliteStore,
     repo: &GitRepo,
     request: &IntegrateRequest,
     view: &IntegrationView,
-    claim: Claim,
 ) -> Result<IntegrateOutcome> {
-    #[cfg(test)]
-    if request.fault == Fault::StaleBase {
-        repo.advance_ref(&view.ref_name, &view.expected_old_oid)?;
-    }
-    #[cfg(not(test))]
-    let _ = request;
     let Some(current) = repo.ref_oid(&view.ref_name)? else {
         bail!("integration ref is missing");
     };
-    if current != view.expected_old_oid {
+    let candidate = view.commit_oid.clone();
+    if current != view.expected_old_oid && candidate.as_deref() != Some(current.as_str()) {
+        let claim = fresh_claim(store, &view.operation_id)?;
         return finish(
             store,
-            &claim,
+            &view.operation_id,
+            Some(&claim),
             IntegrationFinish::Discarded { reason: "stale_base" },
         );
     }
-    if repo.is_checked_out(&view.ref_name)? {
-        bail!("integration ref is checked out");
+    let claim = fresh_claim(store, &view.operation_id)?;
+    if view.state == "effect_pending" {
+        let verified = store.load_verified_for_integration(&view.verified_result_id)?;
+        return drive_new(
+            store,
+            repo,
+            request,
+            &verified,
+            &view.expected_old_oid,
+            claim,
+        );
     }
-    let commit = view
+    let oid = view
         .commit_oid
         .clone()
         .context("integration candidate is missing")?;
-    let published = repo.cas_ref(&view.ref_name, &commit, &view.expected_old_oid)?;
-    #[cfg(test)]
-    if request.fault == Fault::CrashAfterRefUpdate && published {
-        let view = store.load_integration_operation(claim.operation.as_str())?;
-        return Ok(outcome_of(&view));
-    }
-    if !published {
-        return observe(store, repo, view, claim);
-    }
-    observe(store, repo, view, claim)
-}
-
-/// Lost-reply classification. Confirms only the recorded candidate oid.
-fn observe(
-    store: &mut SqliteStore,
-    repo: &GitRepo,
-    view: &IntegrationView,
-    claim: Claim,
-) -> Result<IntegrateOutcome> {
-    if view.generation <= 0 || view.parent_base.as_deref() != Some(view.expected_old_oid.as_str()) {
+    let tree = view
+        .tree_oid
+        .clone()
+        .context("integration candidate is missing")?;
+    let verified = store.load_verified_for_integration(&view.verified_result_id)?;
+    let checkout = repo.checkout_candidate(&request.work_dir, &oid)?;
+    if !checks_pass(&request.work_dir, &checkout, &verified, &oid, &tree)? {
         return finish(
             store,
-            &claim,
+            claim.operation.as_str(),
+            Some(&claim),
+            IntegrationFinish::Blocked {
+                reason: "checks_failed",
+            },
+        );
+    }
+    store.mark_checks_passed(&claim, now_ms())?;
+    repo.copy_objects_from(&checkout)?;
+    if !repo.commit_matches(&oid, &tree, &view.expected_old_oid, &verified.commit_oid)? {
+        bail!("candidate objects are not in the repository");
+    }
+    let view = store.load_integration_operation(&view.operation_id)?;
+    settle(store, repo, request, &view, true)
+}
+
+/// Classify the ref, then publish only under a fresh claim. The update-ref status is not the decision.
+fn settle(
+    store: &mut SqliteStore,
+    repo: &GitRepo,
+    request: &IntegrateRequest,
+    view: &IntegrationView,
+    may_publish: bool,
+) -> Result<IntegrateOutcome> {
+    #[cfg(not(test))]
+    let _ = request;
+    if view.generation <= 0 || view.parent_base.as_deref() != Some(view.expected_old_oid.as_str()) {
+        return finish_flexible(
+            store,
+            view,
+            None,
             IntegrationFinish::Reconciliation {
                 reason: "ambiguous_ref",
             },
         );
     }
+    #[cfg(test)]
+    if request.fault == Fault::StaleBase && may_publish {
+        repo.advance_ref(&view.ref_name, &view.expected_old_oid)?;
+    }
     let commit = view
         .commit_oid
         .clone()
         .context("integration candidate is missing")?;
-    let tree = view.tree_oid.clone().context("integration candidate is missing")?;
+    let tree = view
+        .tree_oid
+        .clone()
+        .context("integration candidate is missing")?;
     let parent = view
         .parent_verified
         .clone()
@@ -293,88 +339,173 @@ fn observe(
     let Some(current) = repo.ref_oid(&view.ref_name)? else {
         bail!("integration ref is missing");
     };
-    if current == commit && repo.commit_matches(&commit, &tree, &view.expected_old_oid, &parent)? {
-        return finish(store, &claim, IntegrationFinish::Confirm);
+    if repo.commit_matches(&commit, &tree, &view.expected_old_oid, &parent)? && current == commit {
+        return finish_flexible(store, view, None, IntegrationFinish::Confirm);
     }
-    let other = store.other_integration_generation(&view.repository, &view.ref_name, &view.operation_id)?;
-    if current == view.expected_old_oid && !other {
+    if current == view.expected_old_oid {
+        if !may_publish {
+            let loaded = store.load_integration_operation(&view.operation_id)?;
+            return Ok(outcome_of(&loaded));
+        }
+        let other = store.other_integration_generation(
+            &view.repository,
+            &view.ref_name,
+            &view.operation_id,
+        )?;
+        if other {
+            let loaded = store.load_integration_operation(&view.operation_id)?;
+            return Ok(outcome_of(&loaded));
+        }
         if repo.is_checked_out(&view.ref_name)? {
             bail!("integration ref is checked out");
         }
-        let updated = repo.cas_ref(&view.ref_name, &commit, &view.expected_old_oid)?;
-        let Some(after) = repo.ref_oid(&view.ref_name)? else {
-            bail!("integration ref is missing");
-        };
-        if updated && after == commit && repo.commit_matches(&commit, &tree, &view.expected_old_oid, &parent)?
-        {
-            return finish(store, &claim, IntegrationFinish::Confirm);
+        let claim = fresh_claim(store, &view.operation_id)?;
+        store.mark_publish_attempted(&claim, now_ms())?;
+        #[cfg(test)]
+        if request.fault == Fault::UpdateRefRejected {
+            let loaded = store.load_integration_operation(&view.operation_id)?;
+            return Ok(outcome_of(&loaded));
         }
+        // A non-zero exit is not the classification. The following read-back is.
+        let _ = repo.cas_ref(&view.ref_name, &commit, &view.expected_old_oid)?;
+        #[cfg(test)]
+        if request.fault == Fault::CrashAfterRefUpdate {
+            let after = repo.ref_oid(&view.ref_name)?;
+            if after.as_deref() == Some(commit.as_str()) {
+                let loaded = store.load_integration_operation(&view.operation_id)?;
+                return Ok(outcome_of(&loaded));
+            }
+        }
+        return classify_readback(store, repo, view, &commit, &tree, &parent);
     }
-    finish(
+    if view.reason.as_deref() == Some("publish_attempted") || current == commit {
+        return finish_flexible(
+            store,
+            view,
+            None,
+            IntegrationFinish::Reconciliation {
+                reason: "ambiguous_ref",
+            },
+        );
+    }
+    let claim = fresh_claim(store, &view.operation_id).ok();
+    finish_flexible(
         store,
-        &claim,
+        view,
+        claim.as_ref(),
+        IntegrationFinish::Discarded { reason: "stale_base" },
+    )
+}
+
+fn classify_readback(
+    store: &mut SqliteStore,
+    repo: &GitRepo,
+    view: &IntegrationView,
+    commit: &str,
+    tree: &str,
+    parent: &str,
+) -> Result<IntegrateOutcome> {
+    let Some(after) = repo.ref_oid(&view.ref_name)? else {
+        bail!("integration ref is missing");
+    };
+    if after == commit && repo.commit_matches(commit, tree, &view.expected_old_oid, parent)? {
+        return finish_flexible(store, view, None, IntegrationFinish::Confirm);
+    }
+    if after == view.expected_old_oid {
+        // The ref did not move. A later claim may retry update-ref.
+        let loaded = store.load_integration_operation(&view.operation_id)?;
+        return Ok(outcome_of(&loaded));
+    }
+    finish_flexible(
+        store,
+        view,
+        None,
         IntegrationFinish::Reconciliation {
             reason: "ambiguous_ref",
         },
     )
 }
 
-fn finish(store: &mut SqliteStore, claim: &Claim, kind: IntegrationFinish) -> Result<IntegrateOutcome> {
-    let now = jiff::Timestamp::now().as_millisecond();
-    store.finish_integration(claim, kind, now)?;
-    let view = store.load_integration_operation(claim.operation.as_str())?;
-    Ok(outcome_of(&view))
+fn fresh_claim(store: &mut SqliteStore, operation_id: &str) -> Result<Claim> {
+    let now = now_ms();
+    if let Ok(claim) = store.held_claim(operation_id, now) {
+        store.validate_claim(&claim, now)?;
+        return Ok(claim);
+    }
+    let revision = store.requeue_expired_lease(operation_id, now)?;
+    let id = OperationId::new(operation_id.to_string()).map_err(anyhow::Error::msg)?;
+    let claim = store.claim_operation(&id, revision, LEASE_OWNER, now, 60_000)?;
+    store.validate_claim(&claim, now)?;
+    Ok(claim)
 }
 
-fn checks_pass(checkout: &std::path::Path, policy_body: &str, commit: &str) -> Result<bool> {
-    let checks = match parse_checks(policy_body.as_bytes()) {
+fn finish_flexible(
+    store: &mut SqliteStore,
+    view: &IntegrationView,
+    claim: Option<&Claim>,
+    kind: IntegrationFinish,
+) -> Result<IntegrateOutcome> {
+    let now = now_ms();
+    if let Some(claim) = claim {
+        if store.held_claim(claim.operation.as_str(), now).is_ok() {
+            store.finish_integration(claim, kind, now)?;
+            let loaded = store.load_integration_operation(&view.operation_id)?;
+            return Ok(outcome_of(&loaded));
+        }
+    }
+    store.finish_integration_observed(&view.operation_id, kind, now)?;
+    let loaded = store.load_integration_operation(&view.operation_id)?;
+    Ok(outcome_of(&loaded))
+}
+
+fn finish(
+    store: &mut SqliteStore,
+    operation_id: &str,
+    claim: Option<&Claim>,
+    kind: IntegrationFinish,
+) -> Result<IntegrateOutcome> {
+    let view = store.load_integration_operation(operation_id)?;
+    finish_flexible(store, &view, claim, kind)
+}
+
+fn checks_pass(
+    work: &std::path::Path,
+    checkout: &std::path::Path,
+    verified: &VerifiedIntegration,
+    commit: &str,
+    tree: &str,
+) -> Result<bool> {
+    let checks = match parse_checks(verified.policy_body.as_bytes()) {
         Ok(checks) => checks,
         Err(_) => return Ok(false),
     };
-    if !program_allowed(&checks[0], checkout) {
+    let unshare = std::path::PathBuf::from("/usr/bin/unshare");
+    if !verification::unshare_ready(&unshare) {
         return Ok(false);
     }
-    let head = run_check(
-        checkout,
-        &["/usr/bin/git".into(), "rev-parse".into(), "HEAD".into()],
-    )?;
-    if head.as_deref() != Some(commit) {
+    let policy_path = work.join("integration-policy.json");
+    std::fs::write(&policy_path, verified.policy_body.as_bytes()).context("policy file")?;
+    let policy_digest = format!("{:x}", Sha256::digest(verified.policy_body.as_bytes()));
+    // The child copies the candidate checkout into its tmpfs. Do not point it at the host branch.
+    let launch = supervise::launch(&supervise::Spec {
+        unshare_program: unshare,
+        timeout: Duration::from_secs(30),
+        checkout: checkout.to_path_buf(),
+        policy: policy_path,
+        scratch: work.join("ns-root"),
+        checks,
+        commit: commit.to_string(),
+        tree: tree.to_string(),
+        policy_digest,
+    });
+    let Ok(launch) = launch else {
         return Ok(false);
-    }
-    let args = checks.iter().map(|part| part.to_string()).collect::<Vec<_>>();
-    Ok(run_check(checkout, &args)?.is_some())
-}
-
-fn run_check(checkout: &std::path::Path, args: &[String]) -> Result<Option<String>> {
-    if args.is_empty() {
-        return Ok(None);
-    }
-    let mut command = Cmd::new(args[0].clone(), Duration::from_secs(30));
-    command.args = args[1..].to_vec();
-    command.cwd = Some(checkout.to_path_buf());
-    command.env_clear = true;
-    command.env = vec![
-        ("PATH".into(), "/usr/bin:/bin".into()),
-        ("HOME".into(), "/".into()),
-        ("LANG".into(), "C".into()),
-        ("LC_ALL".into(), "C".into()),
-        ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
-        ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
-        ("GIT_CONFIG_COUNT".into(), "2".into()),
-        ("GIT_CONFIG_KEY_0".into(), "core.hooksPath".into()),
-        ("GIT_CONFIG_VALUE_0".into(), "/dev/null".into()),
-        ("GIT_CONFIG_KEY_1".into(), "safe.directory".into()),
-        ("GIT_CONFIG_VALUE_1".into(), "*".into()),
-        ("GIT_TERMINAL_PROMPT".into(), "0".into()),
-        ("GIT_NO_LAZY_FETCH".into(), "1".into()),
-        ("GIT_NO_REPLACE_OBJECTS".into(), "1".into()),
-        ("GIT_ALLOW_PROTOCOL".into(), "".into()),
-    ];
-    let output = RealRunner.run(&command).context("integration check")?;
-    if !output.success() {
-        return Ok(None);
-    }
-    Ok(Some(output.stdout.trim().to_string()))
+    };
+    let output = match RealRunner.run(&launch.cmd) {
+        Ok(output) => output,
+        Err(_) => return Ok(false),
+    };
+    Ok(verification::isolated_check_ok(&output, commit, tree))
 }
 
 fn oid_len(format: &str) -> Result<usize> {

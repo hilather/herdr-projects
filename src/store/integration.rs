@@ -492,6 +492,62 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub(crate) fn mark_publish_attempted(&mut self, claim: &Claim, now: i64) -> Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        schema28(&tx)?;
+        claim_held(&tx, claim, now)?;
+        // Remember that update-ref was attempted so a later third OID is not a stale base.
+        let updated = tx.execute(
+            "UPDATE integration_operations SET reason='publish_attempted' WHERE operation_id=?1 AND state='validating'",
+            [claim.operation.as_str()],
+        )?;
+        if updated != 1 {
+            return Err(StoreError::Conflict);
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The ref is still the expected old OID, so the expired lease had no publish to protect.
+    /// Generic retry backoff would delay the fresh claim that fences the next update-ref.
+    pub(crate) fn requeue_expired_lease(&mut self, operation_id: &str, now: i64) -> Result<u64> {
+        let id = crate::domain::OperationId::new(operation_id.to_string())
+            .map_err(|error| invalid(&error))?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        schema28(&tx)?;
+        let old = super::delivery::delivery(&tx, &id)?;
+        if old.state == DeliveryState::Pending {
+            let revision = old.revision;
+            tx.commit()?;
+            return Ok(revision);
+        }
+        let expired = old.state == DeliveryState::Claimed
+            && old.owner.as_deref() == Some(LEASE_OWNER)
+            && old.lease_until_ms.map(|until| now >= until).unwrap_or(false);
+        if old.state != DeliveryState::Ambiguous && !expired {
+            return Err(StoreError::Conflict);
+        }
+        let updated = super::delivery::update_outcome(
+            &tx,
+            &old,
+            &Outcome::Retryable {
+                no_effect_evidence: "integration lease expired before the ref moved".into(),
+            },
+            now,
+            LEASE_OWNER,
+        )?;
+        tx.execute(
+            "UPDATE operation_delivery SET next_due_ms=?2 WHERE operation_id=?1 AND state='pending'",
+            params![id.as_str(), now],
+        )?;
+        tx.commit()?;
+        Ok(updated.revision)
+    }
+
     /// Receipt, wake, and lease release commit together. The wake is not satisfaction.
     pub(crate) fn finish_integration(
         &mut self,
@@ -504,10 +560,52 @@ impl SqliteStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         schema28(&tx)?;
         claim_held(&tx, claim, now)?;
-        let view = tx
+        apply_finish(&tx, claim.operation.as_str(), &finish, now)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Confirm or reconcile after the lease expired. A new update-ref still needs a live claim.
+    pub(crate) fn finish_integration_observed(
+        &mut self,
+        operation_id: &str,
+        finish: IntegrationFinish,
+        now: i64,
+    ) -> Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        schema28(&tx)?;
+        apply_finish(&tx, operation_id, &finish, now)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_expire_lease(&mut self, operation_id: &str) -> Result<()> {
+        schema28(&self.connection)?;
+        let updated = self.connection.execute(
+            "UPDATE operation_delivery SET lease_until_ms=0 WHERE operation_id=?1 AND state='claimed'",
+            [operation_id],
+        )?;
+        if updated != 1 {
+            return Err(StoreError::Conflict);
+        }
+        Ok(())
+    }
+}
+
+fn apply_finish(
+    tx: &Connection,
+    operation_id: &str,
+    finish: &IntegrationFinish,
+    now: i64,
+) -> Result<()> {
+    let id = crate::domain::OperationId::new(operation_id.to_string()).map_err(|error| invalid(&error))?;
+    let view = tx
             .query_row(
                 &format!("{VIEW_SQL} WHERE o.operation_id=?1"),
-                [claim.operation.as_str()],
+                [operation_id],
                 view_from_row,
             )
             .optional()?
@@ -557,7 +655,7 @@ impl SqliteStore {
                     .clone()
                     .ok_or_else(|| invalid("integration candidate is missing"))?;
                 let integrated_id = sha256_hex(
-                    format!("{}\0{candidate_id}\0{commit_oid}", claim.operation.as_str()).as_bytes(),
+                    format!("{operation_id}\0{candidate_id}\0{commit_oid}").as_bytes(),
                 );
                 let created = jiff::Timestamp::now().as_millisecond();
                 tx.execute(
@@ -569,7 +667,7 @@ impl SqliteStore {
                     params![
                         integrated_id,
                         candidate_id,
-                        claim.operation.as_str(),
+                        operation_id,
                         view.repository,
                         view.ref_name,
                         commit_oid,
@@ -604,22 +702,28 @@ impl SqliteStore {
         if !matches!(finish, IntegrationFinish::Confirm) {
             tx.execute(
                 "UPDATE integration_candidates SET state='discarded' WHERE operation_id=?1 AND state='prepared'",
-                [claim.operation.as_str()],
+                [operation_id],
             )?;
         }
         let updated = tx.execute(
             "UPDATE integration_operations SET state=?2, reason=?3 WHERE operation_id=?1 AND state=?4",
-            params![claim.operation.as_str(), state, reason, view.state],
+            params![operation_id, state, reason, view.state],
         )?;
         if updated != 1 {
             return Err(StoreError::Conflict);
         }
-        let old = super::delivery::delivery(&tx, &claim.operation)?;
-        super::delivery::update_outcome(&tx, &old, &outcome, now, LEASE_OWNER)?;
-        tx.commit()?;
+        // An expired or ambiguous lease can still record the observation. A live claim is not required.
+        let old = super::delivery::delivery(&tx, &id)?;
+        if matches!(
+            old.state,
+            DeliveryState::Claimed | DeliveryState::Ambiguous | DeliveryState::Pending
+        ) {
+            super::delivery::update_outcome(&tx, &old, &outcome, now, LEASE_OWNER)?;
+        }
         Ok(())
-    }
+}
 
+impl SqliteStore {
     pub(crate) fn other_integration_generation(
         &mut self,
         repository: &str,
