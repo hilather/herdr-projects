@@ -1221,20 +1221,28 @@ pub fn run() -> Result<()> {
                     Ok(())
                 }
                 MemoryReviewCommand::Remind => {
-                    // Legacy projects emit stable inbox items; migrated projects
-                    // record stable reminders durably (same cap/cooldown) and
-                    // print them, since the DB inbox is separate. Either way the
-                    // output states what was recorded; obligations stay visible
-                    // in context.
+                    // Legacy projects emit stable inbox file items; migrated
+                    // projects insert stable rows into the SQLite inbox. Either
+                    // way the output states what was delivered; obligations
+                    // stay visible in context.
                     if project::ensure_legacy(&dir).is_ok() {
                         let project = Project::load(&ctx.root, &slug)?;
                         let emitted = crate::memory_review::emit_due_legacy(&project)?;
                         println!("{emitted} reminder(s) emitted to the legacy inbox");
                     } else {
-                        let recorded = crate::memory_review::remind_migrated(&dir, &slug)?;
-                        println!("{} reminder(s) recorded (migrated project: also visible in context)", recorded.len());
-                        for (item, summary) in recorded {
-                            println!("- {item}: {summary}");
+                        #[cfg(feature = "state-store")]
+                        {
+                            let delivered = crate::memory_review::deliver_migrated(&dir, &slug)?;
+                            println!("{} reminder(s) delivered to the SQLite inbox (also visible in context)", delivered.len());
+                            for (item, summary) in delivered {
+                                println!("- {item}: {summary}");
+                            }
+                        }
+                        #[cfg(not(feature = "state-store"))]
+                        {
+                            let due = crate::memory_review::due_notifications(&dir, jiff::Timestamp::now(), 5);
+                            println!("{}", serde_json::to_string_pretty(&due)?);
+                            println!("recorded nothing: SQLite reminder delivery requires the state-store build");
                         }
                     }
                     Ok(())

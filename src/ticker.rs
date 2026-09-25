@@ -528,10 +528,20 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
                 Ok(result)=>{memory.canonical_effects_unknown|=result.unknown_effects;any_reachable|=result.reachable||result.scheduled_work;if let Some(error)=result.operation_error {log.line(&format!("{slug}: canonical operation: {error}"));}},
                 Err(error)=>{memory.canonical_effects_unknown=true;log.line(&format!("{slug}: canonical controller: {error:#}"));},
             }
-            // Migrated projects surface Remember obligations in context; the DB
-            // inbox is separate, so ingest only (no legacy inbox files).
+            // Migrated projects ingest Remember obligations and deliver due
+            // reminders as stable rows into the SQLite inbox (never legacy
+            // inbox files). Failures log and retry next tick; a failed
+            // delivery never consumes the reminder cap.
             if let Err(error) = crate::memory_review::ingest_all(&ctx.root.join(slug)) {
                 log.line(&format!("{slug}: memory-review ingest: {error:#}"));
+            }
+            match crate::memory_review::deliver_migrated(&ctx.root.join(slug), slug) {
+                Ok(delivered) => {
+                    for (item, _) in delivered {
+                        log.line(&format!("{slug}: memory-review reminder delivered: {item}"));
+                    }
+                }
+                Err(error) => log.line(&format!("{slug}: memory-review remind: {error:#}")),
             }
         }
         admit_background(ctx,log,memory,canonical.into_iter().map(|slug|ctx.root.join(slug)).collect());

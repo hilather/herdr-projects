@@ -125,7 +125,7 @@ Remember review (durable across inbox archive and restarts):
 - Rescan (idempotent): `hp memory-review <slug> ingest --all`. The same report hash never duplicates; a revised hash adds its own obligation and retains the prior disposition.
 - Propose (save a candidate and link it): `hp memory-review <slug> propose <obligation-id> --file /tmp/summary.md --title "..." --source worker` (use `--source coordinator` for your own inference). Legacy saves under `memory/candidates/`; SQLite-memory saves under `.state/memory-review-candidates/` and still requires signed `memory import` review to become authoritative. Or link an already saved candidate: `hp memory-review <slug> propose <id> --candidate <cand-id>`. A missing or mismatched candidate fails; never use an arbitrary id. Never call `memory propose` for a coordinator summary: it is a state-store-only worker intake requiring genuine task, attempt, and consumed snapshot ids.
 - Reject or defer with a reason: `hp memory-review <slug> reject <id> --reason "..."`, `hp memory-review <slug> defer <id> --reason "..."`. Proposed and rejected stop reminders and stay recorded; deferred stays visible with bounded reminders (at most 3 total, daily cooldown).
-- Reminders: the ticker emits stable `memory-review-*` inbox items (legacy only). Archiving one with `inbox done` never clears the obligation; dispose it explicitly.
+- Reminders: the ticker delivers stable `memory-review-*` reminders (legacy file inbox, or SQLite inbox rows on migrated projects). Archiving one with `inbox done` never clears the obligation; dispose it explicitly.
 
 Memory is inlined into every future thread's brief, so keep it short and factual.
 

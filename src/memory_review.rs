@@ -490,6 +490,10 @@ pub fn get(project_dir: &Path, id: &str) -> Result<Obligation> {
         .into_iter()
         .find(|o| o.id == id)
         .with_context(|| format!("no memory-review obligation `{id}`"))?;
+    // Retained evidence must verify against the pinned digest on every read:
+    // the home report is mutable, so only the content-addressed copy proves
+    // what the excerpt was taken from.
+    read_evidence(project_dir, &obligation.remember_hash)?;
     // A `proposed` link names exact bytes: reject the read when the file is
     // missing, moved, or changed after the link instead of showing a stale id.
     if obligation.status == Status::Proposed {
@@ -672,29 +676,14 @@ pub fn propose_with_body(
     source: &str,
 ) -> Result<Obligation> {
     validate_obligation_id(obligation_id)?;
-    check_source(source)?;
-    let title = check_title(title)?;
-    let body = read_candidate_body(body_file)?;
-    let dir = candidate_dir(project_dir)?;
-    std::fs::create_dir_all(&dir)?;
-
     let _lock = lock_state(project_dir)?;
+    let id = create_candidate(project_dir, obligation_id, title, body_file, source)?;
     let mut state = load_locked(project_dir)?;
     let position = state.obligations.iter().position(|o| o.id == obligation_id).with_context(|| format!("no memory-review obligation `{obligation_id}`"))?;
     let obligation = state.obligations[position].clone();
     ensure!(matches!(obligation.status, Status::Pending | Status::Deferred), "obligation `{obligation_id}` is already {}", obligation.status);
-    let id = candidate_id_for(&obligation, &title, &body);
-    validate_candidate_id(&id)?;
-    let front = CandidateFront {
-        id: id.clone(),
-        obligation: obligation_id.to_string(),
-        thread: obligation.thread_id.clone(),
-        report_hash: obligation.report_hash.clone(),
-        source: source.to_string(),
-        title,
-        created: crate::project::now(),
-    };
-    let path = write_candidate_file(&dir, &front, &body, &obligation, source)?;
+    let dir = candidate_dir(project_dir)?;
+    let path = dir.join(format!("{id}.md"));
     let digest = verify_candidate_file(&path, &id, &obligation)?;
     state.obligations[position].status = Status::Proposed;
     state.obligations[position].candidate = Some(id);
@@ -888,22 +877,69 @@ pub fn emit_due_legacy(project: &crate::project::Project) -> Result<usize> {
     Ok(emitted)
 }
 
-/// Record due reminders on a migrated project and return their stable ids and
-/// summaries for the caller to display. The DB inbox is separate from legacy
-/// files, so delivery here is the durable `notified` advancement plus the
-/// returned record; obligations stay visible in context either way. Same cap
-/// and cooldown as legacy, so repeats do not re-emit the same set.
-pub fn remind_migrated(project_dir: &Path, project_slug: &str) -> Result<Vec<(String, String)>> {
+/// Deliver due reminders to the canonical SQLite inbox (at most 5 per call)
+/// and return their stable ids and summaries. `notified` advances only after
+/// a committed delivery row, so a crash between the insert commit and the
+/// counter update retries the same stable id and the store reports
+/// `AlreadyDelivered`: exactly one advancement per row, never a duplicate,
+/// never a skipped count. Failed or rejected delivery advances nothing, so
+/// the cap is never consumed without delivery. Per-obligation isolated: every
+/// due obligation is attempted and failures are all reported.
+#[cfg(feature = "state-store")]
+pub fn deliver_migrated(project_dir: &Path, project_slug: &str) -> Result<Vec<(String, String)>> {
     let now = jiff::Timestamp::now();
     let due = due_notifications(project_dir, now, 5);
     let mut out = Vec::new();
+    let mut failures = Vec::new();
     for obligation in due {
         let item = notification_id(&obligation);
         let summary = notification_summary(project_slug, &obligation);
-        mark_notified(project_dir, &obligation.id, &now.to_string())?;
-        out.push((item, summary));
+        let delivered = deliver_one_migrated(project_dir, &item, &obligation.thread_id, &summary)
+            .and_then(|()| mark_notified(project_dir, &obligation.id, &now.to_string()).map(|_| ()));
+        match delivered {
+            Ok(()) => out.push((item, summary)),
+            Err(error) => failures.push(format!("{}: {error:#}", obligation.id)),
+        }
     }
+    ensure!(failures.is_empty(), "migrated reminders failed: {}", failures.join("; "));
     Ok(out)
+}
+
+/// Insert one reminder row with a bounded head-conflict retry. Peeks first so
+/// an already-committed row resolves without a write and divergent bytes fail
+/// fast instead of retrying; the store's same-content check stays the atomic
+/// backstop for a concurrent insert between the peek and the transaction.
+#[cfg(feature = "state-store")]
+fn deliver_one_migrated(project_dir: &Path, item: &str, thread_id: &str, summary: &str) -> Result<()> {
+    use herdr_projects::domain::InboxContent;
+    let content = InboxContent {
+        id: item.into(),
+        kind: "memory-review".into(),
+        subject: thread_id.into(),
+        created: String::new(),
+        summary: summary.into(),
+        body: String::new(),
+    };
+    for _ in 0..3 {
+        let snapshot = herdr_projects::runtime::snapshot(project_dir)?;
+        if let Some(existing) = snapshot.inbox.iter().find(|i| i.content.id == item) {
+            let current = &existing.content;
+            ensure!(
+                current.kind == "memory-review" && current.subject == thread_id && current.summary == summary && current.body.is_empty(),
+                "inbox row {item} holds divergent bytes; preserve and repair the store"
+            );
+            return Ok(());
+        }
+        let mut db = herdr_projects::migration::open_active(project_dir)?;
+        let now_ms = jiff::Timestamp::now().as_millisecond();
+        match db.deliver_memory_review_reminder(snapshot.head, &content, now_ms) {
+            // Both outcomes mean a committed row with this stable id.
+            Ok(_) => return Ok(()),
+            Err(herdr_projects::store::StoreError::Conflict) => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(anyhow::anyhow!("store head moved on every attempt; retry"))
 }
 
 pub fn mark_notified(project_dir: &Path, obligation_id: &str, now: &str) -> Result<Obligation> {
@@ -1193,20 +1229,109 @@ mod tests {
     }
 
     #[test]
-    fn reminder_names_the_project_slug_and_migrated_reminders_are_bounded() {
+    fn reminder_names_the_project_slug() {
         let (_root, dir) = fixture();
         let o = ingest_report(&dir, "t-0016", &"a0".repeat(32), REPORT, None).unwrap().unwrap();
         let summary = notification_summary("demo", &o);
         assert!(summary.contains("`memory-review demo show"), "{summary}");
         assert!(!summary.contains("memory-review t-0016 show"), "{summary}");
-        // Migrated delivery records durably: the first call emits, an immediate
-        // repeat emits nothing (same cap/cooldown as legacy).
-        let first = remind_migrated(&dir, "demo").unwrap();
-        assert_eq!(first.len(), 1);
-        assert!(first[0].0.starts_with("memory-review-"), "{}", first[0].0);
-        assert!(first[0].1.contains("memory-review demo show"), "{}", first[0].1);
-        assert!(remind_migrated(&dir, "demo").unwrap().is_empty());
+    }
+
+    /// Migrated delivery inserts a stable row into the SQLite inbox and
+    /// advances `notified` only after the commit: the snapshot contains the
+    /// item, an immediate repeat delivers nothing new, and the counter moved
+    /// exactly once.
+    #[cfg(feature = "state-store")]
+    #[test]
+    fn migrated_delivery_inserts_stable_row_and_advances_once() {
+        let (_world, dir, _task) = crate::notification_delivery::tests::fixture_with_items(0);
+        std::fs::write(dir.join("threads/t-0016.md"), REPORT).unwrap();
+        let o = ingest_thread(&dir, "t-0016").unwrap().unwrap();
+        let delivered = deliver_migrated(&dir, "notify").unwrap();
+        assert_eq!(delivered.len(), 1);
+        let (item, summary) = &delivered[0];
+        assert!(item.starts_with("memory-review-"), "{item}");
+        assert!(summary.contains("`memory-review notify show"), "{summary}");
+        let snapshot = herdr_projects::runtime::snapshot(&dir).unwrap();
+        let row = snapshot.inbox.iter().find(|i| &i.content.id == item).expect("snapshot.inbox contains the reminder");
+        assert_eq!(row.content.kind, "memory-review");
+        assert_eq!(row.content.subject, "t-0016");
+        assert!(row.content.body.is_empty());
+        assert!(!row.seen && !row.done);
         assert_eq!(get(&dir, &o.id).unwrap().notified, 1);
+        // Restart tolerance: fresh opens reuse the row; nothing new is due.
+        assert!(deliver_migrated(&dir, "notify").unwrap().is_empty());
+        let again = herdr_projects::runtime::snapshot(&dir).unwrap();
+        assert_eq!(again.inbox.iter().filter(|i| &i.content.id == item).count(), 1);
+        assert_eq!(get(&dir, &o.id).unwrap().notified, 1);
+    }
+
+    /// A crash between the row commit and the counter update retries the same
+    /// stable id: the store reports the existing row, the counter advances
+    /// exactly once, and no duplicate row or skipped count results.
+    #[cfg(feature = "state-store")]
+    #[test]
+    fn migrated_crash_retry_reuses_row_without_double_spend() {
+        let (_world, dir, _task) = crate::notification_delivery::tests::fixture_with_items(0);
+        std::fs::write(dir.join("threads/t-0017.md"), REPORT).unwrap();
+        let o = ingest_thread(&dir, "t-0017").unwrap().unwrap();
+        // Simulate the committed row of a crashed first attempt: insert the
+        // exact next stable row directly, leaving `notified` at 0.
+        let item = notification_id(&o);
+        let summary = notification_summary("notify", &o);
+        let content = herdr_projects::domain::InboxContent {
+            id: item.clone(),
+            kind: "memory-review".into(),
+            subject: "t-0017".into(),
+            created: String::new(),
+            summary: summary.clone(),
+            body: String::new(),
+        };
+        let head = herdr_projects::runtime::snapshot(&dir).unwrap().head;
+        let mut db = herdr_projects::migration::open_active(&dir).unwrap();
+        let now_ms = jiff::Timestamp::now().as_millisecond();
+        assert_eq!(
+            db.deliver_memory_review_reminder(head, &content, now_ms).unwrap(),
+            herdr_projects::domain::ReminderOutcome::Delivered
+        );
+        // The retry resolves against the committed row and advances once.
+        let delivered = deliver_migrated(&dir, "notify").unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(&delivered[0].0, &item);
+        assert_eq!(get(&dir, &o.id).unwrap().notified, 1);
+        let snapshot = herdr_projects::runtime::snapshot(&dir).unwrap();
+        assert_eq!(snapshot.inbox.iter().filter(|i| &i.content.id == &item).count(), 1);
+        assert!(deliver_migrated(&dir, "notify").unwrap().is_empty());
+    }
+
+    /// Rejected delivery (divergent bytes under the stable id) fails loudly
+    /// and consumes no cap: `notified` stays 0 and the existing row is
+    /// untouched.
+    #[cfg(feature = "state-store")]
+    #[test]
+    fn migrated_rejected_delivery_consumes_no_cap() {
+        let (_world, dir, _task) = crate::notification_delivery::tests::fixture_with_items(0);
+        std::fs::write(dir.join("threads/t-0018.md"), REPORT).unwrap();
+        let o = ingest_thread(&dir, "t-0018").unwrap().unwrap();
+        let item = notification_id(&o);
+        let content = herdr_projects::domain::InboxContent {
+            id: item.clone(),
+            kind: "memory-review".into(),
+            subject: "t-0018".into(),
+            created: String::new(),
+            summary: "divergent bytes planted under the stable id".into(),
+            body: String::new(),
+        };
+        let head = herdr_projects::runtime::snapshot(&dir).unwrap().head;
+        let mut db = herdr_projects::migration::open_active(&dir).unwrap();
+        db.deliver_memory_review_reminder(head, &content, jiff::Timestamp::now().as_millisecond()).unwrap();
+        let before = herdr_projects::runtime::snapshot(&dir).unwrap();
+        let err = deliver_migrated(&dir, "notify").unwrap_err();
+        assert!(err.to_string().contains("divergent"), "{err:#}");
+        assert_eq!(get(&dir, &o.id).unwrap().notified, 0);
+        let after = herdr_projects::runtime::snapshot(&dir).unwrap();
+        assert_eq!(after.inbox.len(), before.inbox.len());
+        assert_eq!(after.head, before.head);
     }
 
     #[test]
