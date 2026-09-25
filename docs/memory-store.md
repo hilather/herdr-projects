@@ -5,9 +5,11 @@ See [repair progress](memory-repair-progress.md) for acceptance limits. T04.5 an
 T05.1–T06.4 remain partial. Prepared-launch dispatch is on
 (`PREPARED_LAUNCH_DISPATCH_ENABLED = true`) and automatic admission is off, so
 production worker launches remain disabled as scheduler preparation:
-`SqliteStore::queue_report` still sets `launch_enabled: false` and appends
-`launch_preparation_unavailable`. The controller can still start an already
-prepared launch. See the [factory baseline](factory/baseline.md).
+`SqliteStore::queue_report` still sets `launch_enabled: false`. The capability
+report names the draft, sign, reserve, and controller stages the scheduler does
+not perform, and it does not append `launch_preparation_unavailable`. The
+controller can still start an already prepared launch. See the
+[factory baseline](factory/baseline.md).
 
 Existing projects need an explicit `herdr-projects migration PROJECT upgrade-store`
 to use schema 25. Opening a project never implicitly upgrades it. Schema 23 adds

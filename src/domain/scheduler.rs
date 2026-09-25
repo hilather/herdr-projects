@@ -20,4 +20,6 @@ pub struct SchedulerSnapshot {pub policy:SchedulerPolicy,pub queue:Vec<QueueReco
 #[derive(Debug,Serialize)]
 pub struct QueueEntry {pub task:TaskId,pub task_revision:u64,pub effective_priority:i64,pub blockers:Vec<String>}
 #[derive(Debug,Serialize)]
-pub struct QueueReport {pub head:u64,pub policy:SchedulerPolicy,pub retained_attempts:usize,pub available_slots:usize,pub launch_enabled:bool,pub entries:Vec<QueueEntry>}
+pub struct CapabilityReport {pub prepared_dispatch:bool,pub automatic_admission:bool,pub dependency_producers:bool,pub integration:&'static str,pub blockers:Vec<String>}
+#[derive(Debug,Serialize)]
+pub struct QueueReport {pub head:u64,pub policy:SchedulerPolicy,pub retained_attempts:usize,pub available_slots:usize,pub launch_enabled:bool,pub capability:CapabilityReport,pub entries:Vec<QueueEntry>}

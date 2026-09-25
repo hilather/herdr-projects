@@ -38,6 +38,28 @@ migration/format error requires recovery; it is not permission to assume legacy
 mode. In either mode, reports and memory narratives do not establish verified
 completion, and technical capability does not grant new user approval.
 
+## Canonical launch ingress
+
+`hp scheduler <slug> inspect` is not a launch. It reports `prepared_dispatch`
+separately from `launch_enabled`. Prepared dispatch starts only an attempt that
+was already reserved. Automatic admission is off, so `launch_enabled` stays
+false. Inspect does not reserve or launch.
+
+When the user asks for a canonical launch on a SQLite project, the path is
+draft, then sign, then `launch reserve`, then the controller. Tell the user
+that path. Do not run it:
+
+1. `hp launch <slug> draft` returns an unsigned approval and writes no reservation.
+2. The user signs that approval and imports the grant.
+3. `hp launch <slug> reserve` commits the sealed preparation only after that grant is installed.
+4. The controller may start that reserved attempt. It does not prepare an arbitrary queued task.
+
+Do not tell a worker to write canonical memory, promote memory, or edit the
+store. A worker report is not dependency evidence. Satisfaction rows do not
+exist yet, so a dependency stays `verified_dependency_evidence_unavailable`.
+Narrative success does not clear it. Do not satisfy an edge by describing the
+predecessor as done.
+
 ## Every turn
 
 1. Run `hp context <slug>` first. It prints the settings, the goal, current project instructions with a revision hash, the memory index, the task list (`TASKS.md`), the open threads with their live state, and the unhandled inbox items. Refresh your standing project instructions when that revision changes. Work from what it prints, not from what you remember. Migrated projects require `profiles.planner` or `hp context <slug> --profile NAME`. If context prints a checkpoint id and session token, acknowledge it with `hp context <slug> --session TOKEN --ack CHECKPOINT` before relying on a later delta. Continue that known conversation with `--session TOKEN`; omit the token after restart or compaction uncertainty to request full context.

@@ -78,6 +78,7 @@ impl SqliteStore {
         super::delivery::now_check(now)?;let tx=self.connection.transaction()?;schema(&tx)?;let snapshot=read(&tx)?;let tasks=read_tasks(&tx)?;let attempts=read_attempts(&tx)?;let control=super::control::read(&tx)?;
         let retained_attempts=attempts.iter().filter(|a|a.retains_capacity()).count();let available_slots=(snapshot.policy.max_active_workers as usize).saturating_sub(retained_attempts);let mut entries=Vec::new();
         let budget_blockers=super::budget::report(&tx,false)?.blockers;
+        let stage_blockers=["launch_draft_not_scheduled","owner_signature_not_scheduled","launch_reserve_not_scheduled","controller_requires_reserved_attempt"];
         for record in &snapshot.queue {
             let task=tasks.iter().find(|t|t.id==record.task).ok_or(StoreError::Conflict)?;let mut blockers=Vec::new();
             if task.state!=TaskState::Queued {blockers.push(format!("task_state:{:?}",task.state));}
@@ -87,17 +88,17 @@ impl SqliteStore {
             if attempts.iter().filter(|a|a.task==task.id).count()>=snapshot.policy.max_attempts_per_task as usize {blockers.push("attempt_limit".into());}
             for edge in &record.dependencies {
                 let predecessor=tasks.iter().find(|t|t.id==edge.predecessor).ok_or(StoreError::Conflict)?;
+                // Satisfaction rows do not exist yet, so this string stays; a replacement would invent a row that is not stored.
                 let reason=if matches!(predecessor.state,TaskState::Failed|TaskState::Cancelled){"predecessor_failed"}else{"verified_dependency_evidence_unavailable"};blockers.push(format!("{reason}:{}:{}",edge.predecessor.as_str(),edge.requirement.as_str()));
             }
-            // Profile/authority and verified-result producers are later W04/W07
-            // work. Queue eligibility must not manufacture their evidence.
             blockers.extend(budget_blockers.iter().cloned());
-            blockers.push("launch_preparation_unavailable".into());
+            blockers.extend(stage_blockers.iter().map(|stage|(*stage).to_string()));
             let age=now.saturating_sub(record.enqueued_unix_ms).max(0)/60_000;let score=age+record.priority as i64;
             entries.push((record.enqueue_sequence,QueueEntry{task:task.id.clone(),task_revision:task.revision,effective_priority:score,blockers}));
         }
         entries.sort_by(|a,b|b.1.effective_priority.cmp(&a.1.effective_priority).then(a.0.cmp(&b.0)).then(a.1.task.cmp(&b.1.task)));
-        let report=QueueReport{head:head(&tx)?,policy:snapshot.policy,retained_attempts,available_slots,launch_enabled:false,entries:entries.into_iter().map(|(_,e)|e).collect()};tx.commit()?;Ok(report)
+        let capability=CapabilityReport{prepared_dispatch:true,automatic_admission:false,dependency_producers:false,integration:"unavailable",blockers:stage_blockers.iter().map(|stage|(*stage).to_string()).collect()};
+        let report=QueueReport{head:head(&tx)?,policy:snapshot.policy,retained_attempts,available_slots,launch_enabled:false,capability,entries:entries.into_iter().map(|(_,e)|e).collect()};tx.commit()?;Ok(report)
     }
 }
 
@@ -127,6 +128,17 @@ mod tests {
     #[test]
     fn narrative_success_never_satisfies_verified_dependencies() {
         let(_temp,mut db)=fixture();queue(&mut db,"a",&request(0,&["b"]),0).unwrap();let s=db.read_snapshot(None).unwrap();let mut task=s.tasks.iter().find(|t|t.id.as_str()=="b").unwrap().clone();task.revision=2;task.state=TaskState::Succeeded;db.commit(Commit{expected_head:s.head,mutations:vec![Mutation::Task{expected:Some(1),next:task}]}).unwrap();let report=db.queue_report(0).unwrap();assert!(report.entries[0].blockers.iter().any(|b|b.starts_with("verified_dependency_evidence_unavailable:b")));assert!(db.read_snapshot(None).unwrap().attempts.is_empty());
+    }
+    #[test]
+    fn prepared_dispatch_stays_true_while_dependency_evidence_stays_blocked() {
+        let(_temp,mut db)=fixture();queue(&mut db,"a",&request(0,&["b"]),0).unwrap();let report=db.queue_report(0).unwrap();
+        assert!(!report.launch_enabled);assert!(report.capability.prepared_dispatch);assert!(!report.capability.automatic_admission);assert!(!report.capability.dependency_producers);assert_eq!(report.capability.integration,"unavailable");
+        assert!(report.entries[0].blockers.iter().any(|b|b=="verified_dependency_evidence_unavailable:b:verified_result"));
+        let stages=["launch_draft_not_scheduled","owner_signature_not_scheduled","launch_reserve_not_scheduled","controller_requires_reserved_attempt"];
+        assert_eq!(report.capability.blockers,stages.iter().map(|s|(*s).to_string()).collect::<Vec<_>>());
+        assert!(stages.iter().all(|stage|report.entries[0].blockers.iter().any(|b|b==stage)));
+        let claims_producer=|blocker:&str|blocker.contains("launch_preparation_unavailable")||blocker.contains("verifier")||blocker.contains("integrator")||blocker.contains("producer")||blocker.contains("satisfaction");
+        assert!(report.capability.blockers.iter().chain(report.entries.iter().flat_map(|entry|&entry.blockers)).all(|blocker|!claims_producer(blocker)));
     }
     #[test]
     fn competing_policy_writers_cannot_both_win_the_same_revision() {
