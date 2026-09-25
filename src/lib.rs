@@ -57,3 +57,6 @@ pub mod launch_preparation;
 
 #[cfg(all(feature = "state-store", target_os = "linux"))]
 pub mod worktree_preparation;
+
+#[cfg(all(feature = "state-store", target_os = "linux"))]
+pub mod verification;

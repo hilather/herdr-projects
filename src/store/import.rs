@@ -52,6 +52,7 @@ impl SqliteStore {
         if version<=23 {tx.execute_batch(include_str!("../../migrations/0024_memory_receipts.sql"))?;}
         if version<=24 {tx.execute_batch(include_str!("../../migrations/0025_native_profiles.sql"))?;}
         if version<=25 {tx.execute_batch(include_str!("../../migrations/0026_factory_results.sql"))?;}
+        if version<=26 {tx.execute_batch(include_str!("../../migrations/0027_verification_runs.sql"))?;}
         tx.commit()?;
         Ok(())
     }

@@ -81,6 +81,19 @@ fn extend_path() {
 }
 
 fn main() {
+    // The unshare child enters here. It must not extend PATH or open the store.
+    if std::env::args().nth(1).as_deref() == Some("verification-setup") {
+        #[cfg(all(feature = "state-store", target_os = "linux"))]
+        {
+            let code = herdr_projects::verification::setup_main();
+            std::process::exit(code);
+        }
+        #[cfg(not(all(feature = "state-store", target_os = "linux")))]
+        {
+            eprintln!("herdr-projects: verification-setup requires Linux state-store");
+            std::process::exit(72);
+        }
+    }
     extend_path();
     if let Err(error) = cli::run() {
         eprintln!("herdr-projects: {error:#}");
