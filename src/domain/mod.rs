@@ -20,6 +20,8 @@ mod launch;
 pub use launch::*;
 mod worktrees;
 pub use worktrees::*;
+mod factory;
+pub use factory::*;
 
 macro_rules! identifier {
     ($($name:ident),+) => { $(

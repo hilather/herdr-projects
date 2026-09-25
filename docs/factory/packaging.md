@@ -14,7 +14,7 @@ cargo build --release --locked --features state-store
 that binary can write, the linked SQLite version, and `prepared_dispatch`.
 Those values are the compiled constants, not a project the command opened:
 
-- `pub const SCHEMA: u32 = 25` in `src/store/mod.rs`
+- `pub const SCHEMA: u32 = 26` in `src/store/mod.rs`
 - `rusqlite::version()` of the SQLite library linked into that binary
 - `const PREPARED_LAUNCH_DISPATCH_ENABLED: bool = true` in
   `src/canonical_controller.rs`, printed as `prepared_dispatch`

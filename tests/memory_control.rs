@@ -284,14 +284,14 @@ fn schema22_upgrade_does_not_invent_historical_inputs() {
     let (_tmp, project, _) = fixture();
     let path = project.join(".state/state.db");
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute_batch("DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE memory_delivery_intents; DROP TABLE memory_import_decisions; DROP TABLE memory_import_candidates; DROP TABLE memory_snapshot_inputs; UPDATE store_meta SET schema_version=22; PRAGMA user_version=22;").unwrap();
+    db.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE memory_delivery_intents; DROP TABLE memory_import_decisions; DROP TABLE memory_import_candidates; DROP TABLE memory_snapshot_inputs; UPDATE store_meta SET schema_version=22; PRAGMA user_version=22;").unwrap();
     drop(db);
     let mut db = herdr_projects::store::SqliteStore::open(&path).unwrap();
     let before = db.read_snapshot(None).unwrap();
     db.upgrade_v1().unwrap();
     let after = db.read_snapshot(None).unwrap();
     assert_eq!(before.events, after.events);
-    assert_eq!(after.schema_version, 25);
+    assert_eq!(after.schema_version, 26);
     assert!(db.memory_snapshot_inputs("missing").is_err());
     db.integrity_check().unwrap();
 }
@@ -1291,7 +1291,7 @@ fn schema23_upgrade_adds_empty_receipts_without_inventing_consumption() {
     let (_tmp, project, _) = fixture();
     let path = project.join(".state/state.db");
     let raw = rusqlite::Connection::open(&path).unwrap();
-    raw.execute_batch("DROP TABLE IF EXISTS native_profiles; DROP TABLE memory_update_receipts; UPDATE store_meta SET schema_version=23; PRAGMA user_version=23;").unwrap();
+    raw.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE memory_update_receipts; UPDATE store_meta SET schema_version=23; PRAGMA user_version=23;").unwrap();
     let mut db = herdr_projects::store::SqliteStore::open(&path).unwrap();
     let before = db.read_snapshot(None).unwrap();
     assert!(db.memory_update_receipts("attempt").is_err());
@@ -1300,6 +1300,6 @@ fn schema23_upgrade_adds_empty_receipts_without_inventing_consumption() {
     let after = db.read_snapshot(None).unwrap();
     assert_eq!(after.events, before.events);
     assert_eq!(after.tasks, before.tasks);
-    assert_eq!(after.schema_version, 25);
+    assert_eq!(after.schema_version, 26);
     db.integrity_check().unwrap();
 }

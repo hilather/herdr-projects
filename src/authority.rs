@@ -3,12 +3,13 @@ use std::{fs::{self, OpenOptions}, io::Write, os::unix::fs::{DirBuilderExt, Meta
 use anyhow::{Result, Context, ensure};
 use serde::{Deserialize,Serialize};
 use sha2::{Digest,Sha256};
-use crate::{domain::{ApprovalGrant,PreparedApproval,VersionedReference}, migration, runner::{Cmd,Runner,RealRunner}};
+use crate::{domain::{ApprovalGrant,ContractInstall,PreparedApproval,PreparedContract,VersionedReference}, migration, runner::{Cmd,Runner,RealRunner}};
 
 pub const SIGNATURE_NAMESPACE: &str = "approval@herdr-projects";
 pub const BUDGET_SIGNATURE_NAMESPACE: &str = "budget@herdr-projects";
 pub const ROUTINE_SIGNATURE_NAMESPACE: &str = "routine@herdr-projects";
 pub const MEMORY_SIGNATURE_NAMESPACE: &str = "memory@herdr-projects";
+pub const CONTRACT_SIGNATURE_NAMESPACE: &str = "contract@herdr-projects";
 
 #[derive(Deserialize,Serialize)]
 #[serde(deny_unknown_fields)]
@@ -72,6 +73,32 @@ fn verify_signature(policy:&Policy,payload:&[u8],signature:&[u8],namespace:&str,
     let result=runner.run(&command).map_err(|_|anyhow::anyhow!("approval signature verification failed"))?;
     ensure!(result.success()&&!result.stdout_truncated&&!result.stderr_truncated,"approval signature verification failed");
     Ok(())
+}
+
+/// Verify the original file bytes. Parsing happens only after the signature check.
+fn prepare_contract(policy:&Policy,payload:&[u8],signature:&[u8],runner:&dyn Runner)->Result<PreparedContract> {
+    verify_signature(policy,payload,signature,CONTRACT_SIGNATURE_NAMESPACE,runner)?;
+    let prepared=PreparedContract::parse_verified(payload).map_err(|_|anyhow::anyhow!("invalid contract document (contents withheld)"))?;
+    ensure!(prepared.authority==policy.reference()?,"contract names a different authority policy");
+    Ok(prepared)
+}
+
+/// Install one task contract from raw signed bytes. Does not launch or reserve.
+pub fn import_contract(project:&Path,document:&Path,signature:&Path)->Result<ContractInstall> {
+    let result=(||{
+        let _guard=migration::runtime_mutation(project)?;
+        let mut db=migration::open_active(project)?;
+        let snapshot=db.read_snapshot(None)?;
+        let (owner,config)=policy(project)?;
+        ensure!(snapshot.control.context("control schema upgrade required")?.config_digest==config.digest,"owner configuration is not acknowledged by project control");
+        let payload=migration::read_plan_file(document).map_err(|_|anyhow::anyhow!("contract document unreadable"))?;
+        let signature=migration::read_plan_file(signature).map_err(|_|anyhow::anyhow!("contract signature unreadable"))?;
+        let prepared=prepare_contract(&owner,&payload,&signature,&RealRunner)?;
+        ensure!(migration::config_reference(Path::new(&config.path))?==config,"owner configuration changed during verification");
+        Ok(db.install_contract(&prepared)?)
+    })();
+    if let Err(error)=&result {record_cli_denial(project,"contract","put",None,error);}
+    result
 }
 
 fn policy(project:&Path)->Result<(Policy,migration::ConfigReference)> {
@@ -493,6 +520,32 @@ mod tests {
         let missing=dir.path().join("missing");
         assert!(import_memory(&missing,&document,&sig,0).is_err());
         assert!(denials(&missing).is_err());
+    }
+    fn contract_document(policy:&Policy)->Vec<u8> {
+        let mut bytes=serde_json::to_vec_pretty(&serde_json::json!({
+            "version":1,"project_store":"/tmp/project/state.db","expected_head":1,"task_id":"task","contract_revision":1,
+            "deliverable":"ship","non_goals":"no launch","acceptance_policies":[{"id":"builds","text":"tests pass"}],
+            "repository":"/tmp/project/repo","base_oid":"ab".repeat(32),"object_format":"sha256","dependencies":[],
+            "capability_flags":[],"profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_only",
+            "authority":policy.reference().unwrap()
+        })).unwrap();
+        bytes.push(b'\n');
+        bytes
+    }
+    #[test]
+    fn contract_verifier_rejects_reserialized_json_and_a_256_kib_file() {
+        let dir=tempfile::tempdir().unwrap();let (key,policy)=key(dir.path(),"owner");
+        let original=contract_document(&policy);
+        let signature=sign(&key,&original,CONTRACT_SIGNATURE_NAMESPACE);
+        let prepared=prepare_contract(&policy,&original,&signature,&RealRunner).unwrap();
+        assert_eq!(prepared.raw,original);
+        let reserialized=serde_json::to_vec(&serde_json::from_slice::<serde_json::Value>(&original).unwrap()).unwrap();
+        assert_ne!(reserialized,original);
+        assert!(prepare_contract(&policy,&reserialized,&signature,&RealRunner).is_err());
+        assert!(prepare_contract(&policy,&original,&sign(&key,&original,SIGNATURE_NAMESPACE),&RealRunner).is_err());
+        let huge=vec![b' ';256*1024];
+        let error=prepare_contract(&policy,&huge,b"not-a-signature",&RealRunner).unwrap_err().to_string();
+        assert!(error.contains("exceeds bounds"),"{error}");
     }
 }
 

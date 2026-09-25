@@ -681,7 +681,7 @@ fn migrated_runtime_bindings_require_explicit_upgrade_and_are_unverified() {
     for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
     let project=root.join("demo");std::fs::write(project.join("threads/t-0001.toml"),"id='t-0001'\nstatus='resolved'\nrepo='/repo'\n").unwrap();
     let plan=herdr_projects::migration::inspect(&project).unwrap();herdr_projects::migration::apply(&project,&plan,true).unwrap();
-    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE memory_delivery_intents; DROP TABLE memory_import_decisions; DROP TABLE memory_import_candidates; DROP TABLE memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; DROP TABLE runtime_ownership; DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; UPDATE store_meta SET schema_version=4; PRAGMA user_version=4;").unwrap();drop(raw);
+    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE memory_delivery_intents; DROP TABLE memory_import_decisions; DROP TABLE memory_import_candidates; DROP TABLE memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; DROP TABLE runtime_ownership; DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; UPDATE store_meta SET schema_version=4; PRAGMA user_version=4;").unwrap();drop(raw);
     let args=["--root",root_arg,"migration","demo","bindings"];
     let out=hp(home.path(),&args);assert!(!out.status.success());assert!(String::from_utf8_lossy(&out.stderr).contains("upgrade-store"));
     assert!(hp(home.path(),&["--root",root_arg,"migration","demo","upgrade-store"]).status.success());
@@ -1472,4 +1472,129 @@ fn profile_prepare_uses_pinned_owner_config_and_keeps_unknown_capabilities() {
     assert!(!String::from_utf8_lossy(&output.stdout).contains("PRIVATE_ARG"));
     assert_eq!(runtime::snapshot(&project).unwrap(),before);
     assert!(!caller.path().join(".config").exists());
+}
+
+#[cfg(all(feature = "state-store", target_os = "linux"))]
+#[test]
+fn task_contract_put_and_result_submit_keep_worker_bytes_untrusted() {
+    use herdr_projects::{authority::CONTRACT_SIGNATURE_NAMESPACE, domain::*, migration, runtime};
+    use sha2::{Digest, Sha256};
+    use std::process::Command;
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    for action in ["new", "pause"] {
+        assert!(hp(home.path(), &["--root", root_arg, action, "demo"]).status.success());
+    }
+    let help = hp(home.path(), &["task", "demo", "contract", "put", "--help"]);
+    assert!(help.status.success(), "{}", String::from_utf8_lossy(&help.stderr));
+    let help_text = String::from_utf8_lossy(&help.stdout);
+    assert!(help_text.contains("--input-file") && help_text.contains("--signature"));
+    let submit_help = hp(home.path(), &["result", "demo", "submit", "--help"]);
+    assert!(submit_help.status.success());
+    assert!(String::from_utf8_lossy(&submit_help.stdout).contains("--input-file"));
+    assert!(hp(home.path(), &["result", "demo", "show", "--help"]).status.success());
+    assert!(!hp(home.path(), &["plan", "propose", "demo"]).status.success());
+    let key = home.path().join("owner");
+    assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).status().unwrap().success());
+    let public = std::fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+    let project = root.join("demo");
+    let config = home.path().join("owner.toml");
+    std::fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n")).unwrap();
+    let plan = migration::inspect_with_config(&project, &config).unwrap();
+    migration::apply(&project, &plan, true).unwrap();
+    let snapshot = runtime::snapshot(&project).unwrap();
+    runtime::set_state(&project, snapshot.head, snapshot.control.unwrap().revision, ProjectState::Active, &config).unwrap();
+    let head = runtime::add_task(&project, TaskId::new("task").unwrap(), "work".into(), runtime::snapshot(&project).unwrap().head).unwrap();
+    let db_path = project.join(".state/state.db");
+    rusqlite::Connection::open(&db_path).unwrap().execute(
+        "INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) VALUES('attempt-1','task',1,'running',NULL,'slot-1',0)",
+        [],
+    ).unwrap();
+    let repo = home.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git/objects")).unwrap();
+    let loose = |bytes: &[u8]| {
+        let oid = format!("{:x}", Sha256::digest(bytes));
+        let path = repo.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+        oid
+    };
+    let base = loose(b"base-object");
+    let candidate = loose(b"candidate-object");
+    let authority = herdr_projects::authority::policy_reference(&project).unwrap();
+    let mut document = serde_json::to_vec_pretty(&serde_json::json!({
+        "version": 1,
+        "project_store": db_path.canonicalize().unwrap().display().to_string(),
+        "expected_head": head,
+        "task_id": "task",
+        "contract_revision": 1,
+        "deliverable": "ship",
+        "non_goals": "no launch",
+        "acceptance_policies": [{"id": "builds", "text": "tests pass"}],
+        "repository": repo.canonicalize().unwrap().display().to_string(),
+        "base_oid": base,
+        "object_format": "sha256",
+        "dependencies": [],
+        "capability_flags": [],
+        "profile_kind": "codex",
+        "retry_class": "none",
+        "result_schema_id": "result-v1",
+        "route": "verify_only",
+        "authority": authority
+    })).unwrap();
+    document.push(b'\n');
+    let doc_path = home.path().join("contract.json");
+    std::fs::write(&doc_path, &document).unwrap();
+    assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y", "sign", "-f"]).arg(&key).args(["-n", CONTRACT_SIGNATURE_NAMESPACE]).arg(&doc_path).status().unwrap().success());
+    let sig_path = home.path().join("contract.json.sig");
+    let before = runtime::snapshot(&project).unwrap();
+    let huge = home.path().join("huge.json");
+    std::fs::write(&huge, vec![b' '; 256 * 1024]).unwrap();
+    let refused = hp(home.path(), &["--root", root_arg, "task", "demo", "contract", "put", "--input-file", huge.to_str().unwrap(), "--signature", sig_path.to_str().unwrap()]);
+    assert!(!refused.status.success());
+    assert_eq!(runtime::snapshot(&project).unwrap().head, before.head);
+    let installed = hp(home.path(), &["--root", root_arg, "task", "demo", "contract", "put", "--input-file", doc_path.to_str().unwrap(), "--signature", sig_path.to_str().unwrap()]);
+    assert!(installed.status.success(), "{}", String::from_utf8_lossy(&installed.stderr));
+    let installed: serde_json::Value = serde_json::from_slice(&installed.stdout).unwrap();
+    assert_eq!(installed["replayed"], false);
+    let reserialized = serde_json::to_vec(&serde_json::from_slice::<serde_json::Value>(&document).unwrap()).unwrap();
+    let rewritten = home.path().join("rewritten.json");
+    std::fs::write(&rewritten, &reserialized).unwrap();
+    let mismatched = hp(home.path(), &["--root", root_arg, "task", "demo", "contract", "put", "--input-file", rewritten.to_str().unwrap(), "--signature", sig_path.to_str().unwrap()]);
+    assert!(!mismatched.status.success());
+    let submission = home.path().join("result.json");
+    std::fs::write(&submission, serde_json::to_vec(&serde_json::json!({
+        "idempotency_key": "cli-key",
+        "task_id": "task",
+        "contract_revision": 1,
+        "contract_digest": installed["digest"],
+        "attempt_id": "attempt-1",
+        "repository": repo.canonicalize().unwrap().display().to_string(),
+        "base_oid": base,
+        "candidate_oid": candidate,
+        "object_format": "sha256",
+        "artifact_manifest": [{"path": "src/lib.rs", "oid": candidate}],
+        "claimed_checks": ["cargo test"],
+        "objects": [
+            {"oid": base, "relative_path": format!("{}/{}", &base[..2], &base[2..])},
+            {"oid": candidate, "relative_path": format!("{}/{}", &candidate[..2], &candidate[2..])}
+        ]
+    })).unwrap()).unwrap();
+    let submitted = hp(home.path(), &["--root", root_arg, "result", "demo", "submit", "--input-file", submission.to_str().unwrap()]);
+    assert!(submitted.status.success(), "{}", String::from_utf8_lossy(&submitted.stderr));
+    let again = hp(home.path(), &["--root", root_arg, "result", "demo", "submit", "--input-file", submission.to_str().unwrap()]);
+    assert!(again.status.success(), "{}", String::from_utf8_lossy(&again.stderr));
+    let first: serde_json::Value = serde_json::from_slice(&submitted.stdout).unwrap();
+    let second: serde_json::Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(first["submission_id"], second["submission_id"]);
+    assert_eq!(second["replayed"], true);
+    let shown = hp(home.path(), &["--root", root_arg, "result", "demo", "show"]);
+    assert!(shown.status.success(), "{}", String::from_utf8_lossy(&shown.stderr));
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(shown.as_array().unwrap().len(), 1);
+    assert!(shown[0].get("verified").is_none());
+    assert_eq!(shown[0]["claimed_checks"], serde_json::json!(["cargo test"]));
+    let tasks: i64 = rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT count(*) FROM tasks", [], |row| row.get(0)).unwrap();
+    assert_eq!(tasks, runtime::snapshot(&project).unwrap().tasks.len() as i64);
 }

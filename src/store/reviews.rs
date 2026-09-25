@@ -129,8 +129,8 @@ mod tests {
     fn schema21_upgrade_adds_empty_review_tables() {
         let temp=tempfile::tempdir().unwrap();let path=temp.path().join("state.db");
         let mut db=SqliteStore::create(&path).unwrap();
-        db.connection.execute_batch("DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; UPDATE store_meta SET schema_version=21; PRAGMA user_version=21;").unwrap();
-        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=25;
+        db.connection.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; UPDATE store_meta SET schema_version=21; PRAGMA user_version=21;").unwrap();
+        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=26;
         assert_eq!(db.read_snapshot(None).unwrap(),before);
         assert!(db.memory_promotion("mp-x").unwrap().is_none());
         db.integrity_check().unwrap();

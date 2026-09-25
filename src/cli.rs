@@ -229,6 +229,9 @@ enum Command {
     /// Inspect or edit migrated task records without starting execution
     #[cfg(feature="state-store")]
     Task { slug:String, #[command(subcommand)] command:TaskCommand },
+    /// Record an untrusted worker result. Does not verify or launch.
+    #[cfg(feature="state-store")]
+    Result { slug:String, #[command(subcommand)] command:ResultCommand },
     /// Inspect durable delivery state (no external effects)
     #[cfg(feature="state-store")]
     Operations { slug:String, #[command(subcommand)] command:OperationsCommand },
@@ -534,11 +537,29 @@ enum MigrationCommand {
     Restore { #[arg(long)] destination: PathBuf },
 }
 
+#[cfg(all(feature="state-store", target_os="linux"))]
+#[derive(Subcommand)]
+enum ContractCommand {
+    /// Verify raw bytes under contract@herdr-projects and install one contract. No launch.
+    Put { #[arg(long)] input_file:PathBuf, #[arg(long)] signature:PathBuf },
+}
+#[cfg(feature="state-store")]
+#[derive(Subcommand)]
+enum ResultCommand {
+    /// Stage git objects and record one untrusted submission. Claimed checks are not evidence.
+    #[cfg(target_os="linux")]
+    Submit { #[arg(long)] input_file:PathBuf },
+    /// Read stored submissions. Claimed checks are not evidence.
+    Show { #[arg(long)] id:Option<String> },
+}
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
 enum TaskCommand {
     /// Record cancellation; release capacity only with proof launch was never claimed
     CancelAttempt { attempt:String, #[arg(long)] expected_revision:u64, #[arg(long)] expected_head:u64, #[arg(long)] reason:String },
+    /// Verify a signed task contract and install it. Does not launch.
+    #[cfg(target_os="linux")]
+    Contract { #[command(subcommand)] command:ContractCommand },
     Queue { id:String, #[arg(long)] input_file:PathBuf, #[arg(long)] expected_revision:u64, #[arg(long)] expected_head:u64 },
     List,
     Show { id:String },
@@ -874,6 +895,10 @@ pub fn run() -> Result<()> {
             use herdr_projects::{domain::TaskId,runtime};
             project::validate_slug(&slug)?; let dir=ctx.root.join(&slug);
             match command {
+                #[cfg(target_os="linux")]
+                TaskCommand::Contract{command}=>match command {
+                    ContractCommand::Put{input_file,signature}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::authority::import_contract(&dir,&input_file,&signature)?)?),
+                },
                 TaskCommand::Queue{id,input_file,expected_revision,expected_head}=>{
                     let bytes=herdr_projects::migration::read_plan_file(&input_file)?;
                     let request=serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid queue request JSON"))?;
@@ -888,6 +913,17 @@ pub fn run() -> Result<()> {
                 },
                 TaskCommand::Add{id,title,expected_head}=>println!("Committed task at event head {}. Use migration export to generate the new view.",runtime::add_task(&dir,TaskId::new(id).map_err(anyhow::Error::msg)?,title,expected_head)?),
                 TaskCommand::Rename{id,title,expected_revision,expected_head}=>println!("Committed task at event head {}. Use migration export to generate the new view.",runtime::rename_task(&dir,&TaskId::new(id).map_err(anyhow::Error::msg)?,title,expected_revision,expected_head)?),
+            }
+            Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Result{slug,command}=>{
+            project::validate_slug(&slug)?;
+            let dir=ctx.root.join(&slug);
+            match command {
+                #[cfg(target_os="linux")]
+                ResultCommand::Submit{input_file}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::submit_untrusted_result(&dir,&input_file)?)?),
+                ResultCommand::Show{id}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::show_results(&dir,id.as_deref())?)?),
             }
             Ok(())
         },

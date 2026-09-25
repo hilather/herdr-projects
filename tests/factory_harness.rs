@@ -35,10 +35,12 @@ const ABSENT_TABLES: &[&str] = &[
     "verification_receipts",
     "integrated_commits",
     "feedback_items",
-    "result_submissions",
-    "task_contracts",
 ];
 const TRUSTED_EMPTY: &[&str] = &[
+    "acceptance_policies",
+    "task_contracts",
+    "result_submissions",
+    "result_objects",
     "memory_update_receipts",
     "review_decisions",
     "memory_promotions",
@@ -506,7 +508,7 @@ fn run(seed: u64) -> (String, serde_json::Value) {
     assert!(snapshot.routine_receipts.is_empty());
     assert!(snapshot.approvals.is_empty());
     assert_eq!(snapshot.head, EVENTS as u64);
-    assert_eq!(snapshot.schema_version, 25);
+    assert_eq!(snapshot.schema_version, 26);
     assert_eq!(report.head, EVENTS as u64);
     assert!(!report.launch_enabled);
     assert_eq!(report.policy.max_active_workers, 0);
@@ -520,7 +522,9 @@ fn run(seed: u64) -> (String, serde_json::Value) {
         vec![
             "project_not_admitted".to_string(),
             "capacity_full".to_string(),
-            "launch_preparation_unavailable".to_string(),
+            "owner_signature_not_scheduled".to_string(),
+            "launch_reserve_not_scheduled".to_string(),
+            "controller_requires_reserved_attempt".to_string(),
         ]
     );
     assert_eq!(
@@ -529,7 +533,9 @@ fn run(seed: u64) -> (String, serde_json::Value) {
             "project_not_admitted".to_string(),
             "capacity_full".to_string(),
             "verified_dependency_evidence_unavailable:t-0000:verified_result".to_string(),
-            "launch_preparation_unavailable".to_string(),
+            "owner_signature_not_scheduled".to_string(),
+            "launch_reserve_not_scheduled".to_string(),
+            "controller_requires_reserved_attempt".to_string(),
         ]
     );
     assert!(
@@ -541,7 +547,7 @@ fn run(seed: u64) -> (String, serde_json::Value) {
 
     let before_counts = row_counts(&db_path);
     let schema = schema_version(&db_path);
-    assert_eq!(schema, 25);
+    assert_eq!(schema, 26);
     let deadline = clock.advance_to_deadline();
     assert_eq!(deadline, clock.origin_ms + LOGICAL_DEADLINE_MS);
     let runner = FakeRunner::new();
@@ -553,7 +559,7 @@ fn run(seed: u64) -> (String, serde_json::Value) {
         after_counts.values().sum::<i64>() - before_counts.values().sum::<i64>();
     assert_eq!(trusted_rows_added, 0);
     assert_unchanged_store(&before_counts, &after_counts);
-    assert_eq!(schema_version(&db_path), 25);
+    assert_eq!(schema_version(&db_path), 26);
     let stored = database_bytes(&db_path);
     assert!(
         !stored
@@ -622,7 +628,7 @@ fn run(seed: u64) -> (String, serde_json::Value) {
     let value = write_manifest(tmp.path(), &manifest);
     assert_eq!(value["decision_log"], log);
     assert_eq!(value["limits"]["latency"], "not frozen");
-    assert_eq!(value["schema_version"], 25);
+    assert_eq!(value["schema_version"], 26);
     (log, value)
 }
 
@@ -676,13 +682,13 @@ fn same_seed_repeats_the_decision_log_without_a_latency_bar() {
     assert!(first_log.contains("trusted_rows_added=0\n"));
     assert!(first_log.contains("satisfaction_table=absent\n"));
     assert!(first_log.contains("verified_results_table=absent\n"));
-    assert!(first_log.contains("schema=25\n"));
+    assert!(first_log.contains("schema=26\n"));
     assert_eq!(first_manifest["limits"]["latency"], "not frozen");
     assert_eq!(
         first_manifest["limits"]["provisional_5s_15s_250ms"],
         "not frozen"
     );
-    assert_eq!(first_manifest["schema_version"], 25);
+    assert_eq!(first_manifest["schema_version"], 26);
     assert_eq!(first_manifest["seed"], SEED);
     assert_appendix_unfrozen();
 }
