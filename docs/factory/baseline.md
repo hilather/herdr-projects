@@ -73,3 +73,48 @@ only under `all(feature = "state-store", target_os = "linux")`.
 `launch_preparation` requires an unused local binding (`route.machine`,
 `tab_id`, and `pane_id` empty, and no worktree path yet) and
 `launch reserve` requires an installed owner-signed grant.
+
+## Measurement appendix
+
+`tests/factory_harness.rs` records one baseline on a schema-25 store with 1000
+events. The store holds 996 tasks. Two `queue_task` calls append four events
+(a task change and a queue event each) and leave one `verified_result` edge.
+The harness uses a seeded logical clock, a fake runner, a disposable git
+repository, and a manifest writer. It does not sleep, open a network, or start
+an agent. It does not change production selection, the scheduler default cap,
+or the schema.
+
+These numbers are measurements. They are **not frozen**. They are not a
+passing bar. The provisional targets — running-worker observation age 5 s p99,
+other active bindings 15 s, and a targeted decision 250 ms p95 — are **not
+frozen**. This appendix does not treat those targets as met. Today's 250 ms is
+`next_tick_delay` in `src/ticker.rs` while canonical root-exclusive work is
+pending. It is a tick, not a decision SLA. When that work is not pending the
+cadence is `TICK` (15 s). That idle tick is existing behavior, not a freshness
+bar, and it is **not frozen** here.
+
+Cost is a row counter on the calls, not wall-clock time. `queue_report` input
+rows are the task rows, attempt rows, queue rows, dependency edges, budget
+policy rows, and the single project-control row visible to that call.
+`read_snapshot` cost is the number of events it decodes, which is the whole
+log. Seed 7 run twice produced the same decision log.
+
+| Call | Counter | Observed |
+| --- | --- | --- |
+| `queue_report` | input rows | 1000 |
+| `queue_report` | entries | 2 |
+| `queue_report` | `launch_enabled` | false |
+| `queue_report` | `max_active_workers` | 0 |
+| `read_snapshot` | events decoded | 1000 |
+| `read_snapshot` | tasks materialized | 996 |
+| store | schema `user_version` | 25 |
+| lost reply | trusted rows added | 0 |
+
+Injecting a lost `git update-ref` reply — the fake runner times out and still
+returns a forged receipt body — added no row. Schema 25 has no satisfaction
+table and no verified-result table. `memory_update_receipts` and the other
+existing receipt and approval tables stayed empty. The forged body was not
+stored. `max_active_workers` stayed at the scheduler default of 0.
+
+No figure in this appendix is a gate. Do not describe this measurement as
+meeting 5 s, 15 s, or 250 ms p95.
