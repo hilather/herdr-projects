@@ -547,6 +547,47 @@ mod tests {
         let error=prepare_contract(&policy,&huge,b"not-a-signature",&RealRunner).unwrap_err().to_string();
         assert!(error.contains("exceeds bounds"),"{error}");
     }
+    #[test]
+    fn contract_put_records_one_denial_for_a_bad_signature_or_oversized_file_and_none_on_success() {
+        let dir=tempfile::tempdir().unwrap();let (key,owner)=key(dir.path(),"owner");
+        let project=dir.path().join("project");fs::create_dir(&project).unwrap();
+        for child in [".state","threads","inbox"] {fs::create_dir(project.join(child)).unwrap();}
+        fs::write(project.join("PROJECT.md"),"+++\nname='Project'\n+++\n").unwrap();
+        fs::write(project.join("TASKS.md"),"").unwrap();fs::write(project.join("MEMORY.md"),"").unwrap();
+        fs::write(project.join(".state/project.json"),r#"{"status":"paused"}"#).unwrap();
+        let config=dir.path().join("owner.toml");
+        fs::write(&config,format!("[authority]\nversion=1\nrevision=1\napproval_public_key={:?}\n",owner.approval_public_key)).unwrap();
+        let plan=migration::inspect_with_config(&project,&config).unwrap();migration::apply(&project,&plan,true).unwrap();
+        let before=crate::runtime::snapshot(&project).unwrap();
+        crate::runtime::set_state(&project,before.head,before.control.unwrap().revision,ProjectState::Active,&config).unwrap();
+        let head=crate::runtime::add_task(&project,TaskId::new("task").unwrap(),"Assigned".into(),crate::runtime::snapshot(&project).unwrap().head).unwrap();
+        let repo=dir.path().join("repo");fs::create_dir_all(repo.join(".git/objects")).unwrap();
+        let store=project.join(".state/state.db").canonicalize().unwrap();
+        let mut document=serde_json::to_vec_pretty(&serde_json::json!({
+            "version":1,"project_store":store.display().to_string(),"expected_head":head,"task_id":"task","contract_revision":1,
+            "deliverable":"ship","non_goals":"no launch","acceptance_policies":[{"id":"builds","text":"tests pass"}],
+            "repository":repo.canonicalize().unwrap().display().to_string(),"base_oid":"ab".repeat(32),"object_format":"sha256",
+            "dependencies":[],"capability_flags":[],"profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1",
+            "route":"verify_only","authority":owner.reference().unwrap()
+        })).unwrap();
+        document.push(b'\n');
+        let path=dir.path().join("contract.json");let sig=dir.path().join("contract.sig");
+        let huge=dir.path().join("huge.json");fs::write(&huge,vec![b' ';256*1024]).unwrap();fs::write(&sig,b"not-a-signature").unwrap();
+        assert!(import_contract(&project,&huge,&sig).is_err());
+        let denied=denials(&project).unwrap().into_iter().filter(|denial|denial.class=="contract").collect::<Vec<_>>();
+        assert_eq!(denied.len(),1);
+        assert_eq!(denied[0].command,"put");
+        assert!(matches!(denied[0].reason_code.as_str(),"signature_failed"|"invalid_document"));
+        fs::write(&path,&document).unwrap();fs::write(&sig,sign(&key,&document,SIGNATURE_NAMESPACE)).unwrap();
+        assert!(import_contract(&project,&path,&sig).is_err());
+        let denied=denials(&project).unwrap().into_iter().filter(|denial|denial.class=="contract").collect::<Vec<_>>();
+        assert_eq!(denied.len(),2);
+        assert!(denied.iter().any(|denial|denial.command=="put"&&denial.reason_code=="signature_failed"));
+        fs::write(&sig,sign(&key,&document,CONTRACT_SIGNATURE_NAMESPACE)).unwrap();
+        assert!(!import_contract(&project,&path,&sig).unwrap().replayed);
+        let denied=denials(&project).unwrap().into_iter().filter(|denial|denial.class=="contract").count();
+        assert_eq!(denied,2);
+    }
 }
 
 pub const MEMORY_REVIEW_NAMESPACE:&str="memory-review@herdr-projects";

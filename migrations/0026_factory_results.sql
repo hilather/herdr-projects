@@ -75,5 +75,26 @@ CREATE TRIGGER result_objects_no_update BEFORE UPDATE ON result_objects
 BEGIN SELECT RAISE(ABORT, 'result object is immutable'); END;
 CREATE TRIGGER result_objects_no_delete BEFORE DELETE ON result_objects
 BEGIN SELECT RAISE(ABORT, 'result object is immutable'); END;
+-- The denial CHECK is part of this unshipped schema. Drop the abort triggers
+-- first so foreign_keys=ON can remove the old table, then copy every row.
+DROP TRIGGER IF EXISTS authority_denials_no_update;
+DROP TRIGGER IF EXISTS authority_denials_no_delete;
+CREATE TABLE authority_denials_v26 (
+    id TEXT PRIMARY KEY NOT NULL,
+    unix_ms INTEGER NOT NULL,
+    class TEXT NOT NULL CHECK (class IN ('approval','budget','routine-store','memory','contract')),
+    command TEXT NOT NULL,
+    actor_channel TEXT NOT NULL CHECK (actor_channel IN ('cli-owner','unknown-rejected')),
+    reason_code TEXT NOT NULL,
+    policy_digest TEXT NOT NULL CHECK (length(policy_digest) = 64),
+    expected_head INTEGER,
+    actual_head INTEGER
+) STRICT;
+INSERT INTO authority_denials_v26(id, unix_ms, class, command, actor_channel, reason_code, policy_digest, expected_head, actual_head)
+SELECT id, unix_ms, class, command, actor_channel, reason_code, policy_digest, expected_head, actual_head FROM authority_denials;
+DROP TABLE authority_denials;
+ALTER TABLE authority_denials_v26 RENAME TO authority_denials;
+CREATE TRIGGER authority_denials_no_update BEFORE UPDATE ON authority_denials BEGIN SELECT RAISE(ABORT,'authority denial is immutable'); END;
+CREATE TRIGGER authority_denials_no_delete BEFORE DELETE ON authority_denials BEGIN SELECT RAISE(ABORT,'authority denial is immutable'); END;
 UPDATE store_meta SET schema_version = 26;
 PRAGMA user_version = 26;

@@ -12,7 +12,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::unix::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 const OBJECT_LIMIT: u64 = 16 * 1024 * 1024;
@@ -250,15 +250,127 @@ fn attempt_matches(db: &Connection, attempt: &str, task: &str) -> Result<()> {
     }
 }
 
+fn read_nofollow(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| StoreError::Io(error.to_string()))?;
+    let meta = file
+        .metadata()
+        .map_err(|error| StoreError::Io(error.to_string()))?;
+    if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > limit {
+        return Err(invalid("invalid git metadata file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| StoreError::Io(error.to_string()))?;
+    if bytes.len() as u64 > limit {
+        return Err(invalid("invalid git metadata file"));
+    }
+    Ok(bytes)
+}
+
+fn one_line(bytes: &[u8]) -> Result<&str> {
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid("invalid git metadata file"))?;
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    if text.is_empty() || text.contains('\n') || text.contains('\0') {
+        return Err(invalid("invalid git metadata file"));
+    }
+    Ok(text)
+}
+
+/// Absolute gitdir targets only. A symlink at any component is refused before canonicalize.
+fn refuse_symlink_path(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        return Err(invalid("gitdir target is not absolute"));
+    }
+    let mut cursor = PathBuf::new();
+    for component in path.components() {
+        cursor.push(component);
+        match fs::symlink_metadata(&cursor) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(invalid("gitdir target is a symlink"));
+            }
+            Ok(_) => {}
+            Err(_) => return Err(invalid("gitdir target is unavailable")),
+        }
+    }
+    Ok(())
+}
+
+fn read_gitdir(gitfile: &Path) -> Result<PathBuf> {
+    let bytes = read_nofollow(gitfile, 4_096)?;
+    let line = one_line(&bytes)?;
+    let target = line
+        .strip_prefix("gitdir: ")
+        .ok_or_else(|| invalid("invalid gitdir file"))?;
+    let target = Path::new(target);
+    refuse_symlink_path(target)?;
+    let canonical = target
+        .canonicalize()
+        .map_err(|_| invalid("gitdir target is unavailable"))?;
+    let meta =
+        fs::symlink_metadata(&canonical).map_err(|_| invalid("gitdir target is unavailable"))?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return Err(invalid("gitdir target is unavailable"));
+    }
+    Ok(canonical)
+}
+
+fn common_directory(gitdir: &Path) -> Result<PathBuf> {
+    let bytes = read_nofollow(&gitdir.join("commondir"), 4_096)?;
+    let text = one_line(&bytes)?;
+    let mut cursor = if Path::new(text).is_absolute() {
+        PathBuf::new()
+    } else {
+        gitdir.to_path_buf()
+    };
+    for component in Path::new(text).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !cursor.pop() {
+                    return Err(invalid("commondir escapes its git directory"));
+                }
+            }
+            Component::Normal(part) => {
+                cursor.push(part);
+                match fs::symlink_metadata(&cursor) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        return Err(invalid("commondir is a symlink"));
+                    }
+                    Ok(_) => {}
+                    Err(_) => return Err(invalid("commondir is unavailable")),
+                }
+            }
+            Component::RootDir => cursor.push(component),
+            Component::Prefix(_) => return Err(invalid("commondir is unavailable")),
+        }
+    }
+    let meta = fs::symlink_metadata(&cursor).map_err(|_| invalid("commondir is unavailable"))?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return Err(invalid("commondir is unavailable"));
+    }
+    Ok(cursor)
+}
+
 fn git_objects(repository: &Path) -> Result<PathBuf> {
     let git = repository.join(".git");
     let meta =
         fs::symlink_metadata(&git).map_err(|_| invalid("repository is not a git directory"))?;
-    // A gitfile points at another worktree. Dirty worktree files are not objects.
-    if !meta.is_dir() || meta.file_type().is_symlink() {
-        return Err(invalid("gitfile worktrees are not an object source"));
+    if meta.file_type().is_symlink() {
+        return Err(invalid("symlink .git is refused"));
     }
-    let objects = git.join("objects");
+    // Linked worktrees keep loose objects under the common git directory, not the checkout.
+    let objects = if meta.is_dir() {
+        git.join("objects")
+    } else if meta.is_file() {
+        common_directory(&read_gitdir(&git)?)?.join("objects")
+    } else {
+        return Err(invalid("repository is not a git directory"));
+    };
     let objects_meta =
         fs::symlink_metadata(&objects).map_err(|_| invalid("missing git object directory"))?;
     if !objects_meta.is_dir() || objects_meta.file_type().is_symlink() {
@@ -1159,5 +1271,81 @@ mod tests {
         assert_eq!(first.submission_id, second.submission_id);
         assert!(second.replayed);
         assert_eq!(submission_count(&db.connection), 1);
+    }
+
+    #[test]
+    fn gitfile_worktree_stages_common_loose_objects_and_skips_dirty_files() {
+        let fixture = fixture();
+        let gitdir = fixture.repo.join(".git/worktrees/wt");
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        let gitdir = gitdir.canonicalize().unwrap();
+        let worktree = fixture._root.path().join("wt");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+        let dirty = b"uncommitted worktree bytes";
+        fs::write(worktree.join("dirty.txt"), dirty).unwrap();
+        let worktree = worktree.canonicalize().unwrap();
+        let mut db = SqliteStore::open(&fixture.db_path).unwrap();
+        let mut contract = serde_json::from_slice::<serde_json::Value>(&contract_bytes(
+            &fixture,
+            "ship the widget",
+        ))
+        .unwrap();
+        contract["repository"] = serde_json::json!(worktree.display().to_string());
+        let mut contract_bytes = serde_json::to_vec_pretty(&contract).unwrap();
+        contract_bytes.push(b'\n');
+        let installed = install(&mut db, &contract_bytes);
+        let mut raw = serde_json::from_slice::<serde_json::Value>(&submission(
+            &fixture,
+            "gitfile",
+            fixture.attempt.as_str(),
+            &installed.digest,
+        ))
+        .unwrap();
+        raw["repository"] = serde_json::json!(worktree.display().to_string());
+        let receipt = db
+            .submit_result(&serde_json::to_vec(&raw).unwrap())
+            .unwrap();
+        let shown = db.show_results(Some(&receipt.submission_id)).unwrap();
+        let loose = fs::read(
+            fixture
+                .repo
+                .join(".git/objects")
+                .join(&fixture.base[..2])
+                .join(&fixture.base[2..]),
+        )
+        .unwrap();
+        assert!(shown[0].objects.iter().any(|object| {
+            object.byte_sha256 == sha256_hex(&loose) && object.size == loose.len() as u64
+        }));
+        let staged = super::staging_dir(
+            &fixture.db_path.parent().unwrap().join("factory-objects"),
+            "gitfile",
+        );
+        for entry in fs::read_dir(&staged).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                assert_ne!(fs::read(&path).unwrap(), dirty);
+            }
+        }
+        let linked = fixture._root.path().join("linked");
+        fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(fixture.repo.join(".git"), linked.join(".git")).unwrap();
+        assert!(matches!(
+            super::git_objects(&linked),
+            Err(StoreError::Invalid(message)) if message.contains("symlink")
+        ));
+        let relative = fixture._root.path().join("relative");
+        fs::create_dir_all(&relative).unwrap();
+        fs::write(relative.join(".git"), "gitdir: ../repo/.git/worktrees/wt\n").unwrap();
+        assert!(matches!(
+            super::git_objects(&relative),
+            Err(StoreError::Invalid(message)) if message.contains("not absolute")
+        ));
     }
 }

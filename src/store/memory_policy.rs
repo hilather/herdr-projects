@@ -70,7 +70,7 @@ impl SqliteStore {
             ||denial.class.len()>32||denial.command.len()>64||denial.policy_digest.len()!=64
             ||!denial.policy_digest.bytes().all(|b|b.is_ascii_hexdigit())
             ||!["cli-owner","unknown-rejected"].contains(&denial.actor_channel.as_str())
-            ||!["approval","budget","routine-store","memory"].contains(&denial.class.as_str()) {
+            ||!["approval","budget","routine-store","memory","contract"].contains(&denial.class.as_str()) {
             return Err(invalid("invalid authority denial"));
         }
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
