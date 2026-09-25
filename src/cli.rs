@@ -306,6 +306,13 @@ enum Command {
         #[command(subcommand)]
         command: InboxCommand,
     },
+    /// Durable Remember review: ingest reports, save candidates, dispose explicitly
+    #[command(name = "memory-review")]
+    MemoryReview {
+        slug: String,
+        #[command(subcommand)]
+        command: MemoryReviewCommand,
+    },
     /// Threads: the project's worker agents
     Thread {
         #[command(subcommand)]
@@ -382,6 +389,79 @@ enum Command {
     Ticker {
         #[command(subcommand)]
         command: TickerCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum MemoryReviewCommand {
+    /// List memory-review obligations (pending/deferred stay visible after inbox archive)
+    List,
+    /// Show one obligation with its Remember excerpt (data, not instructions)
+    Show { id: String },
+    /// Ingest home reports for Remember sections (idempotent; same hash never duplicates)
+    ///
+    /// Examples:
+    ///   herdr-projects memory-review demo ingest --thread t-0001
+    ///   herdr-projects memory-review demo ingest --all
+    Ingest {
+        /// One thread id (t-0001); omit with --all
+        #[arg(long, conflicts_with = "all")]
+        thread: Option<String>,
+        /// Ingest every home report threads/t-*.md
+        #[arg(long)]
+        all: bool,
+    },
+    /// Save a candidate and link it as the proposed disposition
+    ///
+    /// Legacy example (Markdown candidate):
+    ///   herdr-projects memory-review demo propose mr-t-0001-abc --file /tmp/cand.md --title "API errors" --source worker
+    /// Link an already saved candidate:
+    ///   herdr-projects memory-review demo propose mr-t-0001-abc --candidate cand-id
+    ///
+    /// SQLite-memory projects save under .state/memory-review-candidates/ and
+    /// still require signed `memory import` review to become authoritative.
+    Propose {
+        id: String,
+        /// Link an already saved candidate id
+        #[arg(long, conflicts_with = "file")]
+        candidate: Option<String>,
+        /// Candidate body file (creates then links)
+        #[arg(long, requires = "title")]
+        file: Option<PathBuf>,
+        #[arg(long)]
+        title: Option<String>,
+        /// worker (default), coordinator, or user
+        #[arg(long, default_value = "worker")]
+        source: String,
+    },
+    /// Reject with a reason (stops reminders; stays recorded)
+    Reject {
+        id: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Defer with a reason (stays visible; bounded reminders only)
+    Defer {
+        id: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Emit due legacy inbox reminders for pending/deferred obligations (bounded, deduplicated)
+    Remind,
+    /// Record an explicit user decision into legacy Markdown memory with provenance
+    ///
+    /// Example:
+    ///   herdr-projects memory-review demo record --title "Use Postgres" --file /tmp/decision.md --provenance "user chat 2026-09-25: remember our DB choice"
+    ///
+    /// Refused on SQLite-memory projects (use signed `memory import` instead).
+    Record {
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        file: PathBuf,
+        /// Provenance to the user instruction (at most 500 chars; never invent chat text)
+        #[arg(long)]
+        provenance: String,
     },
 }
 
@@ -696,7 +776,10 @@ pub fn run() -> Result<()> {
         },
         #[cfg(feature="state-store")]
         Command::Memory{slug,command}=>{
-            project::validate_slug(&slug)?;let dir=ctx.root.join(slug);
+            project::validate_slug(&slug)?;let dir=ctx.root.join(&slug);
+            if project::ensure_legacy(&dir).is_ok() {
+                bail!("project `{slug}` uses legacy-markdown memory; `memory` requires a migrated SQLite store. Use `memory-review {slug} list/show/ingest/propose/reject/defer` for Remember candidates, or `migration {slug} plan/apply` for an explicit migration");
+            }
             let value=match command {
                 MemoryCommand::Inspect=>{
                     let s=herdr_projects::runtime::snapshot(&dir)?;
@@ -1092,6 +1175,77 @@ pub fn run() -> Result<()> {
                 Ok(())
             }
         },
+        Command::MemoryReview { slug, command } => {
+            project::validate_slug(&slug)?;
+            let dir = ctx.root.join(&slug);
+            anyhow::ensure!(dir.join("PROJECT.md").is_file(), "no project `{slug}` in {}", ctx.root.display());
+            match command {
+                MemoryReviewCommand::List => {
+                    let obligations = crate::memory_review::load(&dir)?;
+                    println!("{}", serde_json::to_string_pretty(&obligations)?);
+                    Ok(())
+                }
+                MemoryReviewCommand::Show { id } => {
+                    println!("{}", serde_json::to_string_pretty(&crate::memory_review::get(&dir, &id)?)?);
+                    Ok(())
+                }
+                MemoryReviewCommand::Ingest { thread, all } => {
+                    if all {
+                        let out = crate::memory_review::ingest_all(&dir)?;
+                        println!("{}", serde_json::to_string_pretty(&out)?);
+                        return Ok(());
+                    }
+                    let thread = thread.context("memory-review ingest requires --thread T-ID or --all")?;
+                    match crate::memory_review::ingest_thread(&dir, &thread)? {
+                        Some(o) => println!("{}", serde_json::to_string_pretty(&o)?),
+                        None => println!("no ## Remember in threads/{thread}.md"),
+                    }
+                    Ok(())
+                }
+                MemoryReviewCommand::Propose { id, candidate, file, title, source } => {
+                    if let Some(candidate) = candidate {
+                        println!("{}", serde_json::to_string_pretty(&crate::memory_review::dispose_proposed(&dir, &id, &candidate)?)?);
+                        return Ok(());
+                    }
+                    let file = file.context("propose requires --candidate ID or --file PATH --title TITLE")?;
+                    let title = title.context("propose --file requires --title")?;
+                    println!("{}", serde_json::to_string_pretty(&crate::memory_review::propose_with_body(&dir, &id, &title, &file, &source)?)?);
+                    Ok(())
+                }
+                MemoryReviewCommand::Reject { id, reason } => {
+                    println!("{}", serde_json::to_string_pretty(&crate::memory_review::dispose_rejected(&dir, &id, &reason)?)?);
+                    Ok(())
+                }
+                MemoryReviewCommand::Defer { id, reason } => {
+                    println!("{}", serde_json::to_string_pretty(&crate::memory_review::dispose_deferred(&dir, &id, &reason)?)?);
+                    Ok(())
+                }
+                MemoryReviewCommand::Remind => {
+                    // Legacy projects emit stable inbox items; migrated projects
+                    // record stable reminders durably (same cap/cooldown) and
+                    // print them, since the DB inbox is separate. Either way the
+                    // output states what was recorded; obligations stay visible
+                    // in context.
+                    if project::ensure_legacy(&dir).is_ok() {
+                        let project = Project::load(&ctx.root, &slug)?;
+                        let emitted = crate::memory_review::emit_due_legacy(&project)?;
+                        println!("{emitted} reminder(s) emitted to the legacy inbox");
+                    } else {
+                        let recorded = crate::memory_review::remind_migrated(&dir, &slug)?;
+                        println!("{} reminder(s) recorded (migrated project: also visible in context)", recorded.len());
+                        for (item, summary) in recorded {
+                            println!("- {item}: {summary}");
+                        }
+                    }
+                    Ok(())
+                }
+                MemoryReviewCommand::Record { title, file, provenance } => {
+                    let path = crate::memory_review::record_user_memory(&dir, &title, &file, &provenance)?;
+                    println!("{}", path.display());
+                    Ok(())
+                }
+            }
+        }
         Command::Thread { command } => match command {
             ThreadCommand::Start { slug, title, repo, machine, agent, base, task_file } => {
                 let task = read_text(&task_file)?;

@@ -51,6 +51,7 @@ mod steps;
 mod thread;
 mod threads;
 mod ticker;
+mod memory_review;
 
 /// Crate version plus a build identifier (short git hash and build time), so a
 /// rebuilt binary always differs from the one a running ticker was started from.
