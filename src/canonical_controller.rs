@@ -13,7 +13,7 @@ use herdr_projects::migration;
 // capabilities, current inputs, signed approval and capacity remain enforced at
 // ingress; enabling dispatch does not certify optional worker protocols.
 const PREPARED_LAUNCH_DISPATCH_ENABLED: bool = true;
-fn launch_dispatch_enabled()->bool { PREPARED_LAUNCH_DISPATCH_ENABLED }
+pub(crate) fn launch_dispatch_enabled()->bool { PREPARED_LAUNCH_DISPATCH_ENABLED }
 
 
 pub struct PollResult {pub reachable:bool,pub scheduled_work:bool,pub unknown_effects:bool,pub operation_error:Option<String>}

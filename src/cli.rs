@@ -373,7 +373,13 @@ enum Command {
     },
     /// Print the coordinator skill
     Skill,
-    /// Check the setup: versions, tools, root, ticker and each project's session
+    /// Check the setup: versions, tools, root, ticker, sessions, and compiled features
+    ///
+    /// Reports whether `state-store` is compiled, the schema this binary can write,
+    /// the linked SQLite version, and `prepared_dispatch`. A build without
+    /// `state-store` says canonical factory commands are absent. Does not migrate.
+    /// The explicit factory binary is `cargo build --release --locked --features state-store`.
+    /// Existing projects upgrade only through `migration PROJECT upgrade-store`.
     Doctor {
         #[command(flatten)]
         session: SessionArgs,

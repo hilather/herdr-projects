@@ -48,6 +48,7 @@ fn report(
     let _ = writeln!(out, "version:    {}", crate::VERSION);
     let _ = writeln!(out, "root:       {}", root.display());
     let _ = writeln!(out, "config dir: {}", config_dir.display());
+    write_compiled_features(&mut out);
     let _ = writeln!(out);
 
     let bin = env.herdr_bin();
@@ -271,6 +272,40 @@ fn report(
     (out, healthy)
 }
 
+/// Identity of this binary only. Opening a project database would be a migration path.
+fn write_compiled_features(out: &mut String) {
+    #[cfg(feature = "state-store")]
+    {
+        let _ = writeln!(out, "state-store: compiled");
+        let _ = writeln!(out, "schema: {}", herdr_projects::store::SCHEMA);
+        let _ = writeln!(out, "sqlite: {}", rusqlite::version());
+        let _ = writeln!(
+            out,
+            "prepared_dispatch: {}",
+            crate::canonical_controller::launch_dispatch_enabled()
+        );
+        let _ = writeln!(
+            out,
+            "factory: explicit factory binary `cargo build --release --locked --features state-store`"
+        );
+    }
+    #[cfg(not(feature = "state-store"))]
+    {
+        let _ = writeln!(out, "state-store: not compiled");
+        let _ = writeln!(out, "schema: absent");
+        let _ = writeln!(out, "sqlite: absent");
+        let _ = writeln!(out, "prepared_dispatch: absent");
+        let _ = writeln!(
+            out,
+            "factory: canonical factory commands are absent; explicit factory binary `cargo build --release --locked --features state-store`"
+        );
+    }
+    let _ = writeln!(
+        out,
+        "upgrade: existing projects upgrade only through `migration PROJECT upgrade-store`"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,5 +403,80 @@ mod tests {
         let (text, healthy) = report(&env, &root, &home.path().join("cfg"), &SessionFlags::default(), &runner);
         assert!(healthy, "{text}");
         assert!(text.contains("[warn] executor: metrics unreadable"), "{text}");
+    }
+
+    #[test]
+    fn compiled_features_leave_a_legacy_project_readable_and_unmigrated() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let root = home.path().join("root");
+        let project = project::create(&root, "demo", "test", vec![]).unwrap();
+        let project_json = std::fs::read(project.dir().join(".state/project.json")).unwrap();
+        let memory = std::fs::read(project.dir().join("MEMORY.md")).unwrap();
+        let (text, healthy) = report(
+            &env,
+            &root,
+            &home.path().join("cfg"),
+            &SessionFlags::default(),
+            &runner,
+        );
+        assert!(healthy, "{text}");
+        assert!(
+            text.contains("[ok  ] project demo: active; never opened"),
+            "{text}"
+        );
+        assert!(
+            text.contains("cargo build --release --locked --features state-store"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "upgrade: existing projects upgrade only through `migration PROJECT upgrade-store`"
+            ),
+            "{text}"
+        );
+        #[cfg(feature = "state-store")]
+        {
+            assert!(text.contains("state-store: compiled\n"), "{text}");
+            assert!(
+                text.contains(&format!("schema: {}\n", herdr_projects::store::SCHEMA)),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!("sqlite: {}\n", rusqlite::version())),
+                "{text}"
+            );
+            assert!(
+                text.contains("prepared_dispatch: true\n"),
+                "quotes PREPARED_LAUNCH_DISPATCH_ENABLED; {text}"
+            );
+            assert!(
+                !text.contains("canonical factory commands are absent"),
+                "{text}"
+            );
+        }
+        #[cfg(not(feature = "state-store"))]
+        {
+            assert!(text.contains("state-store: not compiled\n"), "{text}");
+            assert!(text.contains("schema: absent\n"), "{text}");
+            assert!(text.contains("sqlite: absent\n"), "{text}");
+            assert!(text.contains("prepared_dispatch: absent\n"), "{text}");
+            assert!(
+                text.contains("canonical factory commands are absent"),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(project.dir().join(".state/project.json")).unwrap(),
+            project_json
+        );
+        assert_eq!(
+            std::fs::read(project.dir().join("MEMORY.md")).unwrap(),
+            memory
+        );
+        assert!(!project.dir().join(".state/state.db").exists());
+        assert!(!project.dir().join(".state/format.json").exists());
+        assert!(!project.dir().join(".state/migration").exists());
     }
 }

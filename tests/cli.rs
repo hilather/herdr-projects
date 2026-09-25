@@ -249,6 +249,102 @@ fn hp(home: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn doctor_help_names_the_factory_binary_and_upgrade_command() {
+    let home = tempfile::tempdir().unwrap();
+    let out = hp(home.path(), &["doctor", "--help"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains("cargo build --release --locked --features state-store"),
+        "{text}"
+    );
+    assert!(text.contains("migration PROJECT upgrade-store"), "{text}");
+    assert!(
+        text.contains("canonical factory commands are absent"),
+        "{text}"
+    );
+    assert!(text.contains("Does not migrate"), "{text}");
+}
+
+#[test]
+fn doctor_reports_compiled_features_without_migrating_a_legacy_project() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    assert!(
+        hp(home.path(), &["--root", root_arg, "new", "demo"])
+            .status
+            .success()
+    );
+    let project = root.join("demo");
+    let files = ["PROJECT.md", "MEMORY.md", ".state/project.json"];
+    let before: Vec<_> = files
+        .iter()
+        .map(|rel| std::fs::read(project.join(rel)).unwrap())
+        .collect();
+    let out = hp(home.path(), &["--root", root_arg, "doctor"]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains("[ok  ] project demo: active; never opened"),
+        "{text}"
+    );
+    assert!(
+        text.contains("cargo build --release --locked --features state-store"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "upgrade: existing projects upgrade only through `migration PROJECT upgrade-store`"
+        ),
+        "{text}"
+    );
+    #[cfg(feature = "state-store")]
+    {
+        assert!(text.contains("state-store: compiled\n"), "{text}");
+        assert!(
+            text.contains(&format!("schema: {}\n", herdr_projects::store::SCHEMA)),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("sqlite: {}\n", rusqlite::version())),
+            "{text}"
+        );
+        assert!(
+            text.contains("prepared_dispatch: true\n"),
+            "quotes PREPARED_LAUNCH_DISPATCH_ENABLED; {text}"
+        );
+        assert!(
+            !text.contains("canonical factory commands are absent"),
+            "{text}"
+        );
+    }
+    #[cfg(not(feature = "state-store"))]
+    {
+        assert!(text.contains("state-store: not compiled\n"), "{text}");
+        assert!(text.contains("schema: absent\n"), "{text}");
+        assert!(text.contains("sqlite: absent\n"), "{text}");
+        assert!(text.contains("prepared_dispatch: absent\n"), "{text}");
+        assert!(
+            text.contains("factory: canonical factory commands are absent"),
+            "{text}"
+        );
+    }
+    for (rel, bytes) in files.iter().zip(before) {
+        assert_eq!(std::fs::read(project.join(rel)).unwrap(), bytes, "{rel}");
+    }
+    assert!(!project.join(".state/state.db").exists());
+    assert!(!project.join(".state/format.json").exists());
+    assert!(!project.join(".state/migration").exists());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("upgrade-store"), "{stderr}");
+    assert!(!stderr.contains("Store schema upgraded"), "{stderr}");
+}
+
+#[test]
 fn context_prints_a_usable_prefix_in_a_scrubbed_environment() {
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join("my root");
