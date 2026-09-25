@@ -64,9 +64,11 @@ together. Inputs pin this store, configuration, profile, approval and repository
 identities. [Signed admission budgets](budgets.md) are checked in the reservation
 transaction and rechecked at claim/pre-effect boundaries. Dependency/memory evidence
 producers are not available yet; preparations requiring them refuse. On Linux
-with the `state-store` feature, `launch draft` and `launch reserve` build a
-sealed preparation for an unused local binding and an installed owner-signed
-grant. Generic intent enqueue cannot create `runtime.launch` operations.
+with the `state-store` feature, both `launch draft` and `launch reserve` require
+an unused local binding. `launch draft` returns an unsigned approval and writes
+no reservation. Only `launch reserve` requires an installed owner-signed grant
+and commits the sealed preparation. Generic intent enqueue cannot create
+`runtime.launch` operations.
 Prepared-launch dispatch is on (`PREPARED_LAUNCH_DISPATCH_ENABLED = true`);
 automatic admission is off, so the controller can start an already prepared
 launch and does not prepare an arbitrary queued task.
