@@ -36,7 +36,8 @@ claim the operator step is absent. A queued task reports
 `owner_signature_not_scheduled` only when no unconsumed launch grant for that
 task is stored, and `launch_reserve_not_scheduled` plus
 `controller_requires_reserved_attempt` only when that task has no retained
-reserved or running attempt. It never reports `launch_draft_not_scheduled`,
+reserved, launching, running, or awaiting-input attempt. Lost and other
+non-live states still report them. It never reports `launch_draft_not_scheduled`,
 because a draft writes no row. Those blockers do not claim a verifier,
 integrator, or satisfaction producer exists. Satisfaction rows do not exist
 yet, so every dependency edge still reports

@@ -94,7 +94,7 @@ impl SqliteStore {
             }
             blockers.extend(budget_blockers.iter().cloned());
             let signed=approvals.iter().any(|record|record.consumed.is_none()&&record.grant.scope.class==ApprovalClass::RuntimeLaunch&&record.grant.scope.task==task.id);
-            let retained_launch=attempts.iter().any(|attempt|attempt.task==task.id&&attempt.retains_capacity()&&matches!(attempt.state,AttemptState::Reserved|AttemptState::Running));
+            let retained_launch=attempts.iter().any(|attempt|attempt.task==task.id&&attempt.retains_capacity()&&matches!(attempt.state,AttemptState::Reserved|AttemptState::Launching|AttemptState::Running|AttemptState::AwaitingInput));
             if !signed {blockers.push("owner_signature_not_scheduled".into());}
             if !retained_launch {blockers.push("launch_reserve_not_scheduled".into());blockers.push("controller_requires_reserved_attempt".into());}
             let age=now.saturating_sub(record.enqueued_unix_ms).max(0)/60_000;let score=age+record.priority as i64;
@@ -146,9 +146,9 @@ mod tests {
     }
     #[test]
     fn retained_reserved_attempt_omits_reserve_blocker_and_grant_omits_signature_blocker() {
-        let(temp,mut db)=fixture();queue(&mut db,"a",&request(0,&[]),0).unwrap();queue(&mut db,"b",&request(0,&[]),0).unwrap();queue(&mut db,"c",&request(0,&[]),0).unwrap();
-        let s=db.read_snapshot(None).unwrap();let attempt=AttemptId::new("reserved-a").unwrap();
-        db.commit(Commit{expected_head:s.head,mutations:vec![Mutation::Attempt{expected:None,next:Attempt{id:attempt,task:TaskId::new("a").unwrap(),revision:1,state:AttemptState::Reserved,snapshot:None,reservation:"worker:reserved-a".into(),termination_observed:false}},Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("lost-b").unwrap(),task:TaskId::new("b").unwrap(),revision:1,state:AttemptState::Lost,snapshot:None,reservation:"slot".into(),termination_observed:false}}]}).unwrap();
+        let(temp,mut db)=fixture();let s=db.read_snapshot(None).unwrap();db.commit(Commit{expected_head:s.head,mutations:["d","e"].into_iter().map(|id|Mutation::Task{expected:None,next:Task{id:TaskId::new(id).unwrap(),revision:1,state:TaskState::Draft,title:id.into(),active_attempt:None}}).collect()}).unwrap();for id in ["a","b","c","d","e"]{queue(&mut db,id,&request(0,&[]),0).unwrap();}
+        let s=db.read_snapshot(None).unwrap();
+        db.commit(Commit{expected_head:s.head,mutations:vec![Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("reserved-a").unwrap(),task:TaskId::new("a").unwrap(),revision:1,state:AttemptState::Reserved,snapshot:None,reservation:"worker:reserved-a".into(),termination_observed:false}},Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("lost-b").unwrap(),task:TaskId::new("b").unwrap(),revision:1,state:AttemptState::Lost,snapshot:None,reservation:"slot".into(),termination_observed:false}},Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("launching-d").unwrap(),task:TaskId::new("d").unwrap(),revision:1,state:AttemptState::Launching,snapshot:None,reservation:"worker:launching-d".into(),termination_observed:false}},Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("awaiting-e").unwrap(),task:TaskId::new("e").unwrap(),revision:1,state:AttemptState::AwaitingInput,snapshot:None,reservation:"worker:awaiting-e".into(),termination_observed:false}}]}).unwrap();
         let s=db.read_snapshot(None).unwrap();let task=s.tasks.iter().find(|t|t.id.as_str()=="c").unwrap();
         let store_path=std::fs::canonicalize(temp.path().join("state.db")).unwrap().display().to_string();
         let profile=crate::domain::profile::fixture(crate::migration::ConfigReference{path:store_path.clone(),digest:None});
@@ -158,6 +158,8 @@ mod tests {
         let report=db.queue_report(1_000).unwrap();assert!(!report.launch_enabled);
         let entry=|id:&str|&report.entries.iter().find(|entry|entry.task.as_str()==id).unwrap().blockers;
         assert!(entry("a").iter().all(|b|b!="launch_reserve_not_scheduled"&&b!="controller_requires_reserved_attempt"));
+        assert!(entry("d").iter().all(|b|b!="launch_reserve_not_scheduled"&&b!="controller_requires_reserved_attempt"));
+        assert!(entry("e").iter().all(|b|b!="launch_reserve_not_scheduled"&&b!="controller_requires_reserved_attempt"));
         assert!(entry("a").iter().any(|b|b=="owner_signature_not_scheduled"));
         assert!(entry("b").iter().any(|b|b=="launch_reserve_not_scheduled")&&entry("b").iter().any(|b|b=="controller_requires_reserved_attempt"));
         assert!(entry("c").iter().all(|b|b!="owner_signature_not_scheduled"));
