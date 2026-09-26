@@ -24,54 +24,19 @@ fn satisfaction_id(task: &str, predecessor: &str, requirement: &str, evidence_id
 
 struct VerifiedReceipt {
     task_id: String,
-    attempt_id: String,
 }
 
 fn load_verified(db: &Connection, result_id: &str) -> Result<Option<VerifiedReceipt>> {
     db.query_row(
-        "SELECT r.task_id, r.attempt_id
+        "SELECT r.task_id
          FROM verified_results v
          JOIN verification_runs r ON r.run_id = v.run_id
          WHERE v.result_id=?1 AND r.state='accepted' AND v.memory_fence=r.memory_fence
            AND v.isolation='linux-unshare-user-pid-mount-v1'",
         [result_id],
-        |row| {
-            Ok(VerifiedReceipt {
-                task_id: row.get(0)?,
-                attempt_id: row.get(1)?,
-            })
-        },
+        |row| Ok(VerifiedReceipt { task_id: row.get(0)? }),
     )
     .optional()
-    .map_err(StoreError::from)
-}
-
-fn fence_blocks(db: &Connection, task_id: &str) -> Result<bool> {
-    db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM memory_invalidations WHERE (task_id=?1 OR task_id IS NULL) AND resolved_seq IS NULL AND severity!='informational')",
-        [task_id],
-        |row| row.get(0),
-    )
-    .map_err(StoreError::from)
-}
-
-/// The receipt's attempt is current when it still belongs to the predecessor and
-/// the task has not moved on to a different active attempt. An unresolved memory
-/// invalidation means the fence is no longer valid.
-fn verified_is_current(db: &Connection, receipt: &VerifiedReceipt) -> Result<bool> {
-    if fence_blocks(db, &receipt.task_id)? {
-        return Ok(false);
-    }
-    db.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM attempts a
-            JOIN tasks t ON t.id=a.task_id
-            WHERE a.id=?1 AND a.task_id=?2
-              AND (t.active_attempt IS NULL OR t.active_attempt=?1)
-         )",
-        params![receipt.attempt_id, receipt.task_id],
-        |row| row.get(0),
-    )
     .map_err(StoreError::from)
 }
 
@@ -82,18 +47,23 @@ fn insert_valid(
     requirement: &str,
     evidence_id: &str,
 ) -> Result<()> {
-    let existing: Option<String> = tx
+    let existing: Option<(String, String)> = tx
         .query_row(
-            "SELECT evidence_id FROM dependency_satisfactions WHERE task_id=?1 AND predecessor_task=?2 AND requirement=?3 AND state='valid'",
+            "SELECT satisfaction_id, evidence_id FROM dependency_satisfactions WHERE task_id=?1 AND predecessor_task=?2 AND requirement=?3 AND state='valid'",
             params![task_id, predecessor, requirement],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    if let Some(evidence) = existing {
+    if let Some((satisfaction_id, evidence)) = existing {
         if evidence == evidence_id {
             return Ok(());
         }
-        return Err(StoreError::Conflict);
+        // A newer stored receipt must not roll back the commit that wrote it.
+        // The old row stays for history; only one valid row remains.
+        tx.execute(
+            "UPDATE dependency_satisfactions SET state='invalid' WHERE satisfaction_id=?1 AND state='valid'",
+            [satisfaction_id],
+        )?;
     }
     let now = jiff::Timestamp::now().as_millisecond();
     tx.execute(
@@ -127,9 +97,7 @@ pub(super) fn record_verified_result(tx: &Connection, result_id: &str) -> Result
     let Some(receipt) = load_verified(tx, result_id)? else {
         return Err(invalid("verified receipt is not stored"));
     };
-    if !verified_is_current(tx, &receipt)? {
-        return Ok(());
-    }
+    // An open memory fence still stores the row. The report is what hides it.
     for task_id in consumers(tx, &receipt.task_id, "verified_result")? {
         insert_valid(tx, &task_id, &receipt.task_id, "verified_result", result_id)?;
     }
@@ -159,9 +127,6 @@ pub(super) fn record_integrated_commit(tx: &Connection, integrated_id: &str) -> 
     let Some(predecessor) = integrated_predecessor(tx, integrated_id)? else {
         return Err(invalid("integrated receipt is not stored"));
     };
-    if fence_blocks(tx, &predecessor)? {
-        return Ok(());
-    }
     for task_id in consumers(tx, &predecessor, "integrated_commit")? {
         insert_valid(
             tx,
@@ -266,7 +231,21 @@ fn verified_counts(db: &Connection, task_id: &str, predecessor: &str) -> Result<
             JOIN tasks t ON t.id=a.task_id
             WHERE s.task_id=?1 AND s.predecessor_task=?2 AND s.requirement='verified_result' AND s.state='valid'
               AND r.state='accepted' AND v.memory_fence=r.memory_fence
-              AND (t.active_attempt IS NULL OR t.active_attempt=r.attempt_id)
+              AND (
+                t.active_attempt=r.attempt_id
+                OR (
+                  t.active_attempt IS NULL
+                  AND r.attempt_id=(
+                    SELECT latest.id FROM attempts latest
+                    WHERE latest.task_id=r.task_id
+                    ORDER BY latest.rowid DESC
+                    LIMIT 1
+                  )
+                )
+              )
+              AND r.contract_revision=(
+                SELECT MAX(c.contract_revision) FROM task_contracts c WHERE c.task_id=r.task_id
+              )
               AND NOT EXISTS(
                 SELECT 1 FROM memory_invalidations i
                 WHERE (i.task_id=s.predecessor_task OR i.task_id IS NULL)
@@ -435,30 +414,77 @@ mod tests {
             .cloned()
             .collect()
     }
-    fn store_verified_receipt(db: &SqliteStore, task_id: &str, attempt: &str, result_id: &str) {
-        // The writer binds to receipt tables. Foreign keys stay off only for this
-        // insert so the test does not have to mint a signed contract.
+    fn store_verified_receipt(
+        db: &SqliteStore,
+        task_id: &str,
+        attempt: &str,
+        result_id: &str,
+        contract_revision: i64,
+    ) {
+        let digest = "d".repeat(64);
+        let oid = "a".repeat(40);
+        let have_contract: bool = db
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_contracts WHERE task_id=?1 AND contract_revision=?2)",
+                params![task_id, contract_revision],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if !have_contract {
+            let installed: i64 = db
+                .connection
+                .query_row("SELECT COALESCE(MAX(sequence),1) FROM events", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            db.connection
+                .execute(
+                    "INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq) VALUES(?1,?2,NULL,'/tmp/project',0,'/tmp/repo',?3,'sha1',NULL,'verify_only',?4,?5,?6)",
+                    params![task_id, contract_revision, oid, vec![b'x'], digest.clone(), installed],
+                )
+                .unwrap();
+        }
+        // The run's other parents are not what this writer reads. Foreign keys
+        // stay off only for the receipt insert.
         db.connection
             .execute_batch("PRAGMA foreign_keys=OFF;")
             .unwrap();
-        let run_id = "c".repeat(64);
-        let digest = "d".repeat(64);
-        let oid = "a".repeat(40);
         db.connection
             .execute(
-                "INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,'/tmp/project','idem',?2,?2,?3,1,?2,?4,'policy',?2,?5,?5,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?2,0,0,1)",
-                params![run_id, digest, task_id, attempt, oid],
+                "INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,'/tmp/project',?1,?2,?2,?3,?6,?2,?4,'policy',?2,?5,?5,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?2,0,0,?6)",
+                params![result_id, digest, task_id, attempt, oid, contract_revision],
             )
             .unwrap();
         db.connection
             .execute(
-                "INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?2,?3,?4,?4,'sha1',?3,?3,'linux-unshare-user-pid-mount-v1',0,1)",
-                params![result_id, run_id, digest, oid],
+                "INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?1,?2,?3,?3,'sha1',?2,?2,'linux-unshare-user-pid-mount-v1',0,?4)",
+                params![result_id, digest, oid, contract_revision],
             )
             .unwrap();
         db.connection
             .execute_batch("PRAGMA foreign_keys=ON;")
             .unwrap();
+    }
+    fn insert_integrated_commit(
+        tx: &Connection,
+        integrated_id: &str,
+        verified_result_id: &str,
+        commit_oid: &str,
+    ) {
+        let digest = "d".repeat(64);
+        let old = "c".repeat(40);
+        let candidate = format!("{:x}", Sha256::digest(integrated_id.as_bytes()));
+        tx.execute(
+            "INSERT INTO integration_operations(operation_id,project_store,idempotency_key,payload_digest,repository,ref_name,expected_old_oid,verified_result_id,candidate_id,state,generation,object_format,checks_passed,reason,created_unix_ms) VALUES(?1,'/tmp/project',?1,?2,'/tmp/repo','refs/heads/integration',?3,?4,NULL,'integrated',1,'sha1',1,NULL,1)",
+            params![integrated_id, digest, old, verified_result_id],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO integrated_commits(integrated_id,candidate_id,operation_id,repository,ref_name,commit_oid,tree_oid,expected_old_oid,object_format,created_unix_ms) VALUES(?1,?2,?1,'/tmp/repo','refs/heads/integration',?3,?3,?4,'sha1',1)",
+            params![integrated_id, candidate, commit_oid, old],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -709,7 +735,7 @@ mod tests {
         );
         drop(tx);
         let result_id = "e".repeat(64);
-        store_verified_receipt(&db, "pred", "attempt-1", &result_id);
+        store_verified_receipt(&db, "pred", "attempt-1", &result_id, 1);
         let tx = db.connection.transaction().unwrap();
         record_verified_result(&tx, &result_id).unwrap();
         let kinds: Vec<String> = {
@@ -763,6 +789,242 @@ mod tests {
                 .entries
                 .iter()
                 .all(|entry| !entry.blockers.is_empty())
+        );
+    }
+
+    fn queued_predecessor(db: &mut SqliteStore) {
+        db.commit(Commit {
+            expected_head: 0,
+            mutations: vec![
+                task("pred", TaskState::Draft),
+                task("needs-verified", TaskState::Draft),
+                task("needs-integrated", TaskState::Draft),
+            ],
+        })
+        .unwrap();
+        let head = db.read_snapshot(None).unwrap().head;
+        db.commit(Commit {
+            expected_head: head,
+            mutations: vec![Mutation::Attempt {
+                expected: None,
+                next: Attempt {
+                    id: AttemptId::new("attempt-1").unwrap(),
+                    task: TaskId::new("pred").unwrap(),
+                    revision: 1,
+                    state: AttemptState::Running,
+                    snapshot: None,
+                    reservation: "slot-pred".into(),
+                    termination_observed: false,
+                },
+            }],
+        })
+        .unwrap();
+        queue(
+            db,
+            "needs-verified",
+            "pred",
+            DependencyRequirement::VerifiedResult,
+        );
+        queue(
+            db,
+            "needs-integrated",
+            "pred",
+            DependencyRequirement::IntegratedCommit,
+        );
+    }
+    fn satisfaction_states(db: &Connection, requirement: &str) -> Vec<(String, String)> {
+        let mut stmt = db
+            .prepare(
+                "SELECT evidence_id, state FROM dependency_satisfactions WHERE requirement=?1 ORDER BY state, evidence_id",
+            )
+            .unwrap();
+        stmt.query_map([requirement], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn newer_receipt_replaces_valid_satisfaction_without_rolling_back_the_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
+        queued_predecessor(&mut db);
+        let first = "e".repeat(64);
+        let second = "f".repeat(64);
+        store_verified_receipt(&db, "pred", "attempt-1", &first, 1);
+        store_verified_receipt(&db, "pred", "attempt-1", &second, 1);
+        let tx = db.connection.transaction().unwrap();
+        record_verified_result(&tx, &first).unwrap();
+        record_verified_result(&tx, &second).unwrap();
+        record_verified_result(&tx, &second).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            satisfaction_states(&db.connection, "verified_result"),
+            vec![(first, "invalid".into()), (second.clone(), "valid".into()),]
+        );
+        let integrated_a = "1".repeat(64);
+        let integrated_b = "2".repeat(64);
+        db.connection
+            .execute_batch("PRAGMA foreign_keys=OFF;")
+            .unwrap();
+        let tx = db.connection.transaction().unwrap();
+        insert_integrated_commit(&tx, &integrated_a, &second, &"a".repeat(40));
+        record_integrated_commit(&tx, &integrated_a).unwrap();
+        tx.commit().unwrap();
+        // The second confirm inserts the new integrated commit and then replaces
+        // the satisfaction. A Conflict there would undo cas_ref's commit forever.
+        let tx = db.connection.transaction().unwrap();
+        insert_integrated_commit(&tx, &integrated_b, &second, &"b".repeat(40));
+        record_integrated_commit(&tx, &integrated_b).unwrap();
+        tx.commit().unwrap();
+        db.connection
+            .execute_batch("PRAGMA foreign_keys=ON;")
+            .unwrap();
+        let commits: i64 = db
+            .connection
+            .query_row("SELECT count(*) FROM integrated_commits", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(commits, 2);
+        assert_eq!(
+            satisfaction_states(&db.connection, "integrated_commit"),
+            vec![
+                (integrated_a, "invalid".into()),
+                (integrated_b, "valid".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn superseded_attempt_or_older_contract_stays_unsatisfied() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
+        queued_predecessor(&mut db);
+        let result_id = "e".repeat(64);
+        store_verified_receipt(&db, "pred", "attempt-1", &result_id, 1);
+        let tx = db.connection.transaction().unwrap();
+        record_verified_result(&tx, &result_id).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            dependency_lines(&db.queue_report(0).unwrap(), "needs-verified"),
+            vec!["admission_disabled:verified_result".to_string()]
+        );
+        let head = db.read_snapshot(None).unwrap().head;
+        db.commit(Commit {
+            expected_head: head,
+            mutations: vec![Mutation::Attempt {
+                expected: None,
+                next: Attempt {
+                    id: AttemptId::new("attempt-2").unwrap(),
+                    task: TaskId::new("pred").unwrap(),
+                    revision: 1,
+                    state: AttemptState::Running,
+                    snapshot: None,
+                    reservation: "slot-pred-2".into(),
+                    termination_observed: false,
+                },
+            }],
+        })
+        .unwrap();
+        db.connection
+            .execute_batch(
+                "UPDATE tasks SET active_attempt='attempt-2' WHERE id='pred';
+                 UPDATE attempts SET state='completed', termination_observed=1 WHERE id='attempt-2';
+                 UPDATE tasks SET active_attempt=NULL WHERE id='pred';",
+            )
+            .unwrap();
+        assert_eq!(
+            dependency_lines(&db.queue_report(0).unwrap(), "needs-verified"),
+            vec!["verified_dependency_evidence_unavailable:pred:verified_result".to_string()]
+        );
+        assert_eq!(
+            satisfaction_states(&db.connection, "verified_result"),
+            vec![(result_id, "valid".into())]
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
+        queued_predecessor(&mut db);
+        let result_id = "e".repeat(64);
+        store_verified_receipt(&db, "pred", "attempt-1", &result_id, 1);
+        let tx = db.connection.transaction().unwrap();
+        record_verified_result(&tx, &result_id).unwrap();
+        tx.commit().unwrap();
+        let installed: i64 = db
+            .connection
+            .query_row("SELECT MAX(sequence) FROM events", [], |row| row.get(0))
+            .unwrap();
+        db.connection
+            .execute(
+                "INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq) VALUES('pred',2,NULL,'/tmp/project',0,'/tmp/repo',?1,'sha1',NULL,'verify_only',?2,?3,?4)",
+                params!["b".repeat(40), vec![b'y'], "e".repeat(64), installed],
+            )
+            .unwrap();
+        assert_eq!(
+            dependency_lines(&db.queue_report(0).unwrap(), "needs-verified"),
+            vec!["verified_dependency_evidence_unavailable:pred:verified_result".to_string()]
+        );
+        assert_eq!(
+            satisfaction_states(&db.connection, "verified_result"),
+            vec![(result_id, "valid".into())]
+        );
+    }
+
+    #[test]
+    fn open_memory_fence_hides_a_stored_satisfaction_until_it_resolves() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
+        queued_predecessor(&mut db);
+        db.connection
+            .execute(
+                "INSERT INTO memory_invalidations(id,task_id,proposal_id,record_id,severity,triggering_seq,resolved_seq,reason) VALUES('inv-1','pred','proposal-1',NULL,'stop_at_checkpoint',1,NULL,'fence open')",
+                [],
+            )
+            .unwrap();
+        let result_id = "e".repeat(64);
+        store_verified_receipt(&db, "pred", "attempt-1", &result_id, 1);
+        let tx = db.connection.transaction().unwrap();
+        record_verified_result(&tx, &result_id).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            satisfaction_states(&db.connection, "verified_result"),
+            vec![(result_id.clone(), "valid".into())]
+        );
+        assert_eq!(
+            dependency_lines(&db.queue_report(0).unwrap(), "needs-verified"),
+            vec!["verified_dependency_evidence_unavailable:pred:verified_result".to_string()]
+        );
+        let queued_before: i64 = db
+            .connection
+            .query_row(
+                "SELECT enqueue_sequence FROM task_queue WHERE task_id='needs-verified'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.connection
+            .execute(
+                "UPDATE memory_invalidations SET resolved_seq=1 WHERE id='inv-1'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            dependency_lines(&db.queue_report(0).unwrap(), "needs-verified"),
+            vec!["admission_disabled:verified_result".to_string()]
+        );
+        let queued_after: i64 = db
+            .connection
+            .query_row(
+                "SELECT enqueue_sequence FROM task_queue WHERE task_id='needs-verified'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(queued_before, queued_after);
+        assert_eq!(
+            satisfaction_states(&db.connection, "verified_result"),
+            vec![(result_id.clone(), "valid".into())]
         );
     }
 

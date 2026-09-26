@@ -1,5 +1,6 @@
 //! Schema 27 verification runs. Acceptance is one short transaction.
-//! It does not release a worker slot or satisfy a dependency.
+//! It does not release a worker slot. Acceptance writes a satisfaction row for a
+//! matching `verified_result` edge; that row is the evidence.
 use super::*;
 use crate::verification::{ISOLATION, VerificationReceipt};
 use rusqlite::OptionalExtension;

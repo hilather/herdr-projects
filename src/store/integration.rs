@@ -1,4 +1,5 @@
-//! Schema 28 integration queue. Confirming a commit does not satisfy a dependency.
+//! Schema 28 integration queue. Confirm writes a satisfaction row for a matching
+//! `integrated_commit` edge. The wake event is not that evidence.
 //! `landed_commit` and `integration_candidate` rows are never rewritten here.
 use super::*;
 use crate::operations::{Claim, DeliveryState, Outcome};
@@ -567,7 +568,7 @@ impl SqliteStore {
         Ok(updated.revision)
     }
 
-    /// Receipt, wake, and lease release commit together. The wake is not satisfaction.
+    /// Receipt, satisfaction row, and lease release commit together. The wake event is not the evidence.
     pub(crate) fn finish_integration(
         &mut self,
         claim: &Claim,
