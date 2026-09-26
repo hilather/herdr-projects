@@ -44,17 +44,21 @@ CREATE INDEX barrier_members_by_attempt ON barrier_members(attempt_id);
 CREATE INDEX barrier_members_by_result ON barrier_members(result_id);
 CREATE INDEX barrier_stale_briefs_by_attempt ON barrier_stale_briefs(attempt_id);
 
+-- IS NOT, not !=. A NULL comparison is unknown and would let a flag be cleared or swapped.
 CREATE TRIGGER barrier_revisions_no_membership_update
 BEFORE UPDATE ON barrier_revisions
-WHEN OLD.barrier_id != NEW.barrier_id
-  OR OLD.required_set_generation != NEW.required_set_generation
-  OR OLD.memory_manifest_digest != NEW.memory_manifest_digest
-  OR OLD.release_token != NEW.release_token
-  OR OLD.created_seq != NEW.created_seq
-  OR (OLD.released_seq IS NOT NULL AND OLD.released_seq != NEW.released_seq)
-  OR (OLD.revoked_seq IS NOT NULL AND OLD.revoked_seq != NEW.revoked_seq)
+WHEN OLD.barrier_id IS NOT NEW.barrier_id
+  OR OLD.required_set_generation IS NOT NEW.required_set_generation
+  OR OLD.memory_manifest_digest IS NOT NEW.memory_manifest_digest
+  OR OLD.release_token IS NOT NEW.release_token
+  OR OLD.created_seq IS NOT NEW.created_seq
+  OR (OLD.released_seq IS NOT NULL AND OLD.released_seq IS NOT NEW.released_seq)
+  OR (OLD.revoked_seq IS NOT NULL AND OLD.revoked_seq IS NOT NEW.revoked_seq)
   OR (NEW.released_seq IS NOT NULL AND NEW.revoked_seq IS NOT NULL)
 BEGIN SELECT RAISE(ABORT, 'barrier revision membership is immutable'); END;
+CREATE TRIGGER barrier_revisions_no_delete
+BEFORE DELETE ON barrier_revisions
+BEGIN SELECT RAISE(ABORT, 'barrier revision is immutable'); END;
 
 CREATE TRIGGER barrier_members_no_update
 BEFORE UPDATE ON barrier_members

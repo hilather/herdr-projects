@@ -605,13 +605,8 @@ impl SqliteStore {
         if head(&tx)? != expected_head {
             return Err(StoreError::Conflict);
         }
-        // Dependents lose valid evidence. The attempt row stays so its slot
-        // remains held until termination_observed.
-        tx.execute(
-            "UPDATE dependency_satisfactions SET state='invalid'
-             WHERE state='valid' AND predecessor_task IN (SELECT task_id FROM barrier_members WHERE barrier_id=?1)",
-            [barrier_id],
-        )?;
+        // The attempt row stays so its slot remains held until termination_observed.
+        // Dependents stay blocked by this revoked membership, not by rewriting receipts.
         let sequence = insert_event(&tx, "barrier.revoked", barrier_id, &serde_json::json!({}))?;
         let updated = tx.execute(
             "UPDATE barrier_revisions SET revoked_seq=?2 WHERE barrier_id=?1 AND revoked_seq IS NULL AND released_seq IS NULL",
@@ -1475,5 +1470,120 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    fn valid_satisfactions(db: &Connection, predecessor: &str) -> i64 {
+        db.query_row(
+            "SELECT count(*) FROM dependency_satisfactions WHERE predecessor_task=?1 AND state='valid'",
+            [predecessor],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn revoked_barrier_blocks_reattach_and_later_evidence_until_a_later_release() {
+        let (_dir, mut db) = open_store();
+        let seeded = seed(&db.connection, "alpha", "verify_only");
+        satisfy(&db.connection, "downstream", "alpha", &seeded.result);
+        let head = head_of(&db);
+        let frozen = db
+            .freeze_barrier(&[member_of(&seeded, vec![])], head)
+            .unwrap();
+        let head = head_of(&db);
+        db.revoke_barrier(&frozen.barrier_id, head).unwrap();
+        let valid = valid_satisfactions(&db.connection, "alpha");
+        let same =
+            super::super::satisfaction::record_verified_result(&db.connection, &seeded.result);
+        assert!(
+            matches!(same, Err(StoreError::Invalid(ref message)) if message.contains("dependency blocked")),
+            "{same:?}"
+        );
+        let (later_result, _) = add_result(&db.connection, &seeded, "alpha-later");
+        let later =
+            super::super::satisfaction::record_verified_result(&db.connection, &later_result);
+        assert!(
+            matches!(later, Err(StoreError::Invalid(ref message)) if message.contains("dependency blocked")),
+            "{later:?}"
+        );
+        assert_eq!(valid_satisfactions(&db.connection, "alpha"), valid);
+        let predecessor = Task {
+            id: TaskId::new("alpha").unwrap(),
+            revision: 1,
+            state: TaskState::Running,
+            title: "alpha".into(),
+            active_attempt: Some(AttemptId::new(&seeded.attempt).unwrap()),
+        };
+        assert!(super::super::satisfaction::dependency_blocker(
+            &db.connection,
+            "downstream",
+            &predecessor,
+            DependencyRequirement::VerifiedResult,
+            true
+        )
+        .unwrap()
+        .is_some());
+        let other = seed(&db.connection, "beta", "verify_only");
+        let head = head_of(&db);
+        let released = db
+            .freeze_barrier(
+                &[member_of(&seeded, vec![]), member_of(&other, vec![])],
+                head,
+            )
+            .unwrap();
+        let head = head_of(&db);
+        db.release_barrier(&released.barrier_id, &released.release_token, head, 1)
+            .unwrap();
+        super::super::satisfaction::record_verified_result(&db.connection, &later_result).unwrap();
+        assert!(valid_satisfactions(&db.connection, "alpha") >= valid);
+        assert!(super::super::satisfaction::dependency_blocker(
+            &db.connection,
+            "downstream",
+            &predecessor,
+            DependencyRequirement::VerifiedResult,
+            true
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn cleared_revocation_and_deleted_revision_are_rejected() {
+        let (_dir, mut db) = open_store();
+        let seeded = seed(&db.connection, "alpha", "verify_only");
+        let head = head_of(&db);
+        let frozen = db
+            .freeze_barrier(&[member_of(&seeded, vec![])], head)
+            .unwrap();
+        let head = head_of(&db);
+        db.revoke_barrier(&frozen.barrier_id, head).unwrap();
+        assert!(db
+            .connection
+            .execute(
+                "UPDATE barrier_revisions SET revoked_seq=NULL WHERE barrier_id=?1",
+                [&frozen.barrier_id],
+            )
+            .is_err());
+        assert!(db
+            .connection
+            .execute(
+                "UPDATE barrier_revisions SET released_seq=revoked_seq, revoked_seq=NULL WHERE barrier_id=?1",
+                [&frozen.barrier_id],
+            )
+            .is_err());
+        db.connection
+            .execute_batch("PRAGMA foreign_keys=OFF")
+            .unwrap();
+        assert!(db
+            .connection
+            .execute("DELETE FROM barrier_revisions", [])
+            .is_err());
+        let still: i64 = db
+            .connection
+            .query_row("SELECT count(*) FROM barrier_revisions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(still, 1);
     }
 }

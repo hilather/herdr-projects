@@ -75,6 +75,37 @@ fn verified_result_may_replace(tx: &Connection, result_id: &str) -> Result<bool>
     .map_err(StoreError::from)
 }
 
+fn predecessor_revoked(db: &Connection, predecessor: &str) -> Result<bool> {
+    let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    // Wave barriers are schema 40. Older databases have no such rows.
+    if version < 40 {
+        return Ok(false);
+    }
+    // A revoked membership stays blocking until a later barrier for this task
+    // is released. Checking here, not a one-shot satisfaction update, keeps a
+    // re-record Invalid instead of a primary-key Conflict.
+    db.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM barrier_members m
+            JOIN barrier_revisions b ON b.barrier_id=m.barrier_id
+            WHERE m.task_id=?1
+              AND b.revoked_seq IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM barrier_members later_member
+                  JOIN barrier_revisions later ON later.barrier_id=later_member.barrier_id
+                  WHERE later_member.task_id=m.task_id
+                    AND later.released_seq IS NOT NULL
+                    AND later.created_seq>b.created_seq
+              )
+         )",
+        [predecessor],
+        |row| row.get(0),
+    )
+    .map_err(StoreError::from)
+}
+
 fn insert_valid(
     tx: &Connection,
     task_id: &str,
@@ -83,6 +114,9 @@ fn insert_valid(
     evidence_id: &str,
     replace_existing: bool,
 ) -> Result<()> {
+    if predecessor_revoked(tx, predecessor)? {
+        return Err(invalid("dependency blocked"));
+    }
     let existing: Option<(String, String)> = tx
         .query_row(
             "SELECT satisfaction_id, evidence_id FROM dependency_satisfactions WHERE task_id=?1 AND predecessor_task=?2 AND requirement=?3 AND state='valid'",
@@ -281,6 +315,9 @@ pub(super) fn admission_enabled(db: &Connection) -> Result<bool> {
 }
 
 fn verified_counts(db: &Connection, task_id: &str, predecessor: &str) -> Result<bool> {
+    if predecessor_revoked(db, predecessor)? {
+        return Ok(false);
+    }
     db.query_row(
         "SELECT EXISTS(
             SELECT 1
@@ -319,6 +356,9 @@ fn verified_counts(db: &Connection, task_id: &str, predecessor: &str) -> Result<
 }
 
 fn integrated_counts(db: &Connection, task_id: &str, predecessor: &str) -> Result<bool> {
+    if predecessor_revoked(db, predecessor)? {
+        return Ok(false);
+    }
     db.query_row(
         "SELECT EXISTS(
             SELECT 1
