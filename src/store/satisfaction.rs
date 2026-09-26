@@ -3,6 +3,7 @@
 //! verified_result row is not an integrated_commit row. factory_admission stays
 //! off unless a test setter or a later signed installer changes it.
 use super::*;
+use crate::runner::Runner;
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 
@@ -401,6 +402,7 @@ pub(super) fn require_dependency_evidence(
     inputs: &LaunchInputs,
     dependencies: &[Dependency],
     tasks: &[Task],
+    proof: Option<&IntegratedProof>,
 ) -> Result<()> {
     if inputs.dependencies.len() != dependencies.len() {
         return Err(invalid("task is not ready for reservation"));
@@ -430,38 +432,18 @@ pub(super) fn require_dependency_evidence(
     if matched.len() != inputs.dependencies.len() {
         return Err(invalid("task is not ready for reservation"));
     }
-    require_integrated_base(db, inputs)
+    recheck_integrated_base(db, inputs, proof)
 }
 
-fn ancestor(repo: &std::path::Path, base: &str, commit: &str) -> bool {
-    if base == commit {
-        return true;
-    }
-    let Ok(output) = std::process::Command::new("/usr/bin/git")
-        .args([
-            "--no-pager",
-            "-C",
-            repo.to_str().unwrap_or(""),
-            "-c",
-            "safe.directory=*",
-            "merge-base",
-            "--is-ancestor",
-            commit,
-            base,
-        ])
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-    else {
-        return false;
-    };
-    output.status.success()
+pub(super) struct IntegratedProof {
+    pub(super) task: TaskId,
+    checked: std::collections::BTreeMap<(String, String), (String, Vec<String>)>,
 }
 
-fn require_integrated_base(db: &Connection, inputs: &LaunchInputs) -> Result<()> {
+fn integrated_groups(
+    db: &Connection,
+    task_id: &str,
+) -> Result<std::collections::BTreeMap<(String, String), Vec<String>>> {
     let mut stmt = db.prepare(
         "SELECT i.repository, i.ref_name, i.commit_oid
          FROM dependency_satisfactions s
@@ -471,38 +453,94 @@ fn require_integrated_base(db: &Connection, inputs: &LaunchInputs) -> Result<()>
          ORDER BY i.repository, i.ref_name, s.predecessor_task",
     )?;
     let rows = stmt
-        .query_map([inputs.task.as_str()], |row| {
+        .query_map([task_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut groups: std::collections::BTreeMap<(String, String), Vec<String>> =
-        std::collections::BTreeMap::new();
+    let mut groups = std::collections::BTreeMap::new();
     for (repository, ref_name, commit) in rows {
-        groups.entry((repository, ref_name)).or_default().push(commit);
+        groups
+            .entry((repository, ref_name))
+            .or_insert_with(Vec::new)
+            .push(commit);
     }
-    for ((repository, _), commits) in groups {
+    Ok(groups)
+}
+
+fn contract_base(db: &Connection, task_id: &str, repository: &str) -> Result<Option<String>> {
+    db.query_row(
+        "SELECT base_oid FROM task_contracts WHERE task_id=?1 AND repository=?2 ORDER BY contract_revision DESC LIMIT 1",
+        params![task_id, repository],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+/// Git runs before the reservation write transaction. Timeout, a non-UTF-8 path, or a non-ancestor is `integration_missing`.
+pub(super) fn prove_integrated_base(db: &Connection, inputs: &LaunchInputs) -> Result<IntegratedProof> {
+    let groups = integrated_groups(db, inputs.task.as_str())?;
+    let mut checked = std::collections::BTreeMap::new();
+    for ((repository, ref_name), commits) in groups {
         if commits.len() < 2 {
             continue;
         }
         let Some(pin) = inputs.repositories.iter().find(|repo| repo.repository == repository) else {
             return Err(invalid("integration_missing"));
         };
-        let contract_base: Option<String> = db
-            .query_row(
-                "SELECT base_oid FROM task_contracts WHERE task_id=?1 AND repository=?2 ORDER BY contract_revision DESC LIMIT 1",
-                params![inputs.task.as_str(), repository],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if contract_base.as_ref().is_some_and(|base| base != &pin.commit) {
+        if contract_base(db, inputs.task.as_str(), &repository)?.is_some_and(|base| base != pin.commit) {
             return Err(invalid("integration_missing"));
         }
         let repo = std::path::Path::new(&repository);
-        if commits.iter().any(|commit| !ancestor(repo, &pin.commit, commit)) {
+        for commit in &commits {
+            if commit == &pin.commit {
+                continue;
+            }
+            // Failure here is not ancestry. Replace refs and a hang must not admit.
+            if bounded_git_ok(repo, &["merge-base", "--is-ancestor", commit, &pin.commit]).is_err() {
+                return Err(invalid("integration_missing"));
+            }
+        }
+        checked.insert((repository, ref_name), (pin.commit.clone(), commits));
+    }
+    Ok(IntegratedProof { task: inputs.task.clone(), checked })
+}
+
+fn recheck_integrated_base(db: &Connection, inputs: &LaunchInputs, proof: Option<&IntegratedProof>) -> Result<()> {
+    let groups = integrated_groups(db, inputs.task.as_str())?;
+    for ((repository, ref_name), commits) in &groups {
+        if commits.len() < 2 {
+            continue;
+        }
+        let Some(pin) = inputs.repositories.iter().find(|repo| repo.repository == *repository) else {
             return Err(invalid("integration_missing"));
+        };
+        if contract_base(db, inputs.task.as_str(), repository)?.is_some_and(|base| base != pin.commit) {
+            return Err(invalid("integration_missing"));
+        }
+        let Some(proof) = proof.filter(|proof| proof.task == inputs.task) else {
+            return Err(invalid("integration_missing"));
+        };
+        match proof.checked.get(&(repository.clone(), ref_name.clone())) {
+            Some((proven_pin, proven_commits)) if proven_pin == &pin.commit && proven_commits == commits => {}
+            _ => return Err(invalid("integration_missing")),
+        }
+    }
+    if let Some(proof) = proof.filter(|proof| proof.task == inputs.task) {
+        for key in proof.checked.keys() {
+            if !groups.get(key).is_some_and(|commits| commits.len() >= 2) {
+                return Err(invalid("integration_missing"));
+            }
         }
     }
     Ok(())
+}
+
+fn bounded_git_ok(repo: &std::path::Path, args: &[&str]) -> std::result::Result<(), ()> {
+    let mut command = crate::runner::Cmd::repository_git_command(repo, args).map_err(|_| ())?;
+    command.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+    let output = crate::runner::RealRunner.run(&command).map_err(|_| ())?;
+    if output.success() { Ok(()) } else { Err(()) }
 }
 
 fn retained_profiles(db: &Connection) -> Result<Vec<FrozenProfile>> {
@@ -589,7 +627,8 @@ impl SqliteStore {
         Ok(Some(satisfied))
     }
 
-    pub(crate) fn contract_pins(&self, task_id: &str) -> Result<Vec<RepositoryInput>> {
+    /// `None` when a contract base has no resolvable tree. That candidate is not reserved.
+    pub(crate) fn contract_pins(&self, task_id: &str) -> Result<Option<Vec<RepositoryInput>>> {
         let mut stmt = self.connection.prepare(
             "SELECT repository, base_oid FROM task_contracts WHERE task_id=?1 AND contract_revision=(SELECT MAX(contract_revision) FROM task_contracts c WHERE c.task_id=?1)",
         )?;
@@ -598,37 +637,24 @@ impl SqliteStore {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let mut pins = Vec::new();
         for (repository, base) in rows {
-            let tree = git_tree(&repository, &base).unwrap_or_else(|| base.clone());
+            let Some(tree) = git_tree(&repository, &base) else { return Ok(None); };
             pins.push(RepositoryInput { repository, commit: base, tree });
         }
-        Ok(pins)
+        Ok(Some(pins))
     }
 }
 
 fn git_tree(repository: &str, commit: &str) -> Option<String> {
-    let output = std::process::Command::new("/usr/bin/git")
-        .args([
-            "--no-pager",
-            "-C",
-            repository,
-            "-c",
-            "safe.directory=*",
-            "rev-parse",
-            "--verify",
-            &format!("{commit}^{{tree}}"),
-        ])
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .output()
-        .ok()?;
-    if !output.status.success() {
+    let spec = format!("{commit}^{{tree}}");
+    let mut command = crate::runner::Cmd::repository_git_command(std::path::Path::new(repository), &["rev-parse", "--verify", &spec]).ok()?;
+    command.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+    let output = crate::runner::RealRunner.run(&command).ok()?;
+    if !output.success() {
         return None;
     }
-    let text = String::from_utf8(output.stdout).ok()?;
+    let text = String::from_utf8(output.stdout_bytes).ok()?;
     let tree = text.trim();
-    if matches!(tree.len(), 40 | 64) && tree.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if matches!(tree.len(), 40 | 64) && tree.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         Some(tree.to_string())
     } else {
         None

@@ -33,11 +33,13 @@ fn placeholder_approval() -> VersionedReference {
     VersionedReference { id: "unsigned-launch".into(), revision: 1, digest: "0".repeat(64) }
 }
 
-enum Choice {
-    /// Placeholder approval. The caller substitutes an installed grant before reserving.
-    Ready(LaunchInputs),
-    /// Prerequisites are present, but no retained profile can be sealed.
-    NeedsAuthority { task: Task, head: u64 },
+struct Candidate {
+    task: Task,
+    binding: RuntimeBinding,
+    dependencies: Vec<DependencyInput>,
+    repositories: Vec<RepositoryInput>,
+    score: i64,
+    sequence: u64,
 }
 
 fn unused_binding(state: &Snapshot, task: &TaskId) -> Option<RuntimeBinding> {
@@ -53,19 +55,16 @@ fn unused_binding(state: &Snapshot, task: &TaskId) -> Option<RuntimeBinding> {
     }).cloned()
 }
 
-fn select(db: &mut SqliteStore, project_store: &str, now: i64) -> Result<Option<Choice>> {
-    let state = db.read_snapshot(None)?;
+fn ready_candidates(db: &mut SqliteStore, state: &Snapshot, now: i64) -> Result<Vec<Candidate>> {
     let scheduler = state.scheduler.as_ref().context("scheduler missing")?;
     let control = state.control.as_ref().context("project control missing")?;
     if control.state != ProjectState::Active || control.reconciliation_required {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let retained = state.attempts.iter().filter(|attempt| attempt.retains_capacity()).count();
     if retained >= scheduler.policy.max_active_workers as usize {
-        return Ok(None);
+        return Ok(Vec::new());
     }
-    let profiles = db.admission_profiles()?;
-    let budget = state.budget_policies.last().map(BudgetPolicy::reference).transpose().map_err(anyhow::Error::msg)?;
     let mut ranked = Vec::new();
     for record in &scheduler.queue {
         let Some(task) = state.tasks.iter().find(|task| task.id == record.task && task.state == TaskState::Queued && task.active_attempt.is_none()) else { continue };
@@ -73,27 +72,33 @@ fn select(db: &mut SqliteStore, project_store: &str, now: i64) -> Result<Option<
         if state.attempts.iter().any(|attempt| attempt.task == task.id && attempt.retains_capacity()) { continue }
         if state.attempts.iter().filter(|attempt| attempt.task == task.id).count() >= scheduler.policy.max_attempts_per_task as usize { continue }
         let Some(edges) = db.satisfied_edges(task.id.as_str())? else { continue };
-        let Some(binding) = unused_binding(&state, &task.id) else { continue };
+        let Some(binding) = unused_binding(state, &task.id) else { continue };
+        // A contract whose tree cannot be read is not reserved.
+        let Some(repositories) = db.contract_pins(task.id.as_str())? else { continue };
         let dependencies = edges.into_iter().map(|edge| DependencyInput {
             task: edge.predecessor,
             task_revision: edge.predecessor_revision,
             requirement: edge.requirement,
             evidence: VersionedReference { id: edge.satisfaction_id.clone(), revision: 1, digest: edge.satisfaction_id },
         }).collect::<Vec<_>>();
-        let repositories = db.contract_pins(task.id.as_str())?;
         let score = (now - record.enqueued_unix_ms) / 60_000 + i64::from(record.priority);
-        ranked.push((score, record.enqueue_sequence, task.clone(), binding, dependencies, repositories));
+        ranked.push(Candidate { task: task.clone(), binding, dependencies, repositories, score, sequence: record.enqueue_sequence });
     }
-    ranked.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)).then(left.2.id.cmp(&right.2.id)));
-    let Some((_, _, task, binding, dependencies, repositories)) = ranked.into_iter().next() else { return Ok(None) };
-    let profile = profiles.into_iter().find(|profile| {
+    ranked.sort_by(|left, right| right.score.cmp(&left.score).then(left.sequence.cmp(&right.sequence)).then(left.task.id.cmp(&right.task.id)));
+    Ok(ranked)
+}
+
+fn binding_profiles<'a>(profiles: &'a [FrozenProfile], control: &ProjectControl, binding: &RuntimeBinding) -> Vec<&'a FrozenProfile> {
+    profiles.iter().filter(|profile| {
         profile.config.digest == control.config_digest && (binding.identity.agent.is_empty() || profile.kind == binding.identity.agent)
-    });
-    let Some(profile) = profile else {
-        return Ok(Some(Choice::NeedsAuthority { task, head: state.head }));
-    };
-    let inputs = seal_admission_inputs(project_store, &task, &binding, scheduler.policy.revision, control.epoch, &profile, placeholder_approval(), dependencies, repositories, budget).map_err(anyhow::Error::msg)?;
-    Ok(Some(Choice::Ready(inputs)))
+    }).collect()
+}
+
+fn seal(project_store: &str, state: &Snapshot, candidate: &Candidate, profile: &FrozenProfile, approval: VersionedReference) -> Result<LaunchInputs> {
+    let scheduler = state.scheduler.as_ref().context("scheduler missing")?;
+    let control = state.control.as_ref().context("project control missing")?;
+    let budget = state.budget_policies.last().map(BudgetPolicy::reference).transpose().map_err(anyhow::Error::msg)?;
+    seal_admission_inputs(project_store, &candidate.task, &candidate.binding, scheduler.policy.revision, control.epoch, profile, approval, candidate.dependencies.clone(), candidate.repositories.clone(), budget).map_err(anyhow::Error::msg)
 }
 
 fn record_missing_grant(db: &mut SqliteStore, task: &TaskId, head: u64, now: i64) -> Result<()> {
@@ -116,26 +121,32 @@ fn record_missing_grant(db: &mut SqliteStore, task: &TaskId, head: u64, now: i64
     }
 }
 
-fn matching_grant<'a>(state: &'a Snapshot, inputs: &LaunchInputs, now: i64) -> Option<&'a ApprovalRecord> {
-    state.approvals.iter().find(|approval| {
-        approval.revoked.is_none() && approval.consumed.is_none() && {
-            let mut candidate = inputs.clone();
-            candidate.approval = approval.reference.clone();
-            approval.grant.matches_launch(&candidate, &inputs.project_store, now).is_ok()
+fn accepted_grant(db: &SqliteStore, state: &Snapshot, inputs: &LaunchInputs, now: i64) -> Result<Option<VersionedReference>> {
+    for approval in &state.approvals {
+        if approval.revoked.is_some() || approval.consumed.is_some() { continue; }
+        if now < approval.grant.issued_unix_ms || now >= approval.grant.expires_unix_ms { continue; }
+        let mut candidate = inputs.clone();
+        candidate.approval = approval.reference.clone();
+        if approval.grant.matches_launch(&candidate, &inputs.project_store, now).is_err() { continue; }
+        if db.preparation_grant_accepted(&candidate, now)? {
+            return Ok(Some(approval.reference.clone()));
         }
-    })
+    }
+    Ok(None)
 }
 
-/// Inputs for the next candidate, with a placeholder approval. `None` when nothing is ready.
+/// Inputs for the next candidate, with a placeholder approval. `None` when nothing is ready to sign.
 pub fn prepared_admission_inputs(project: &Path) -> Result<Option<LaunchInputs>> {
     let mut db = open_store(project)?;
     let now = jiff::Timestamp::now().as_millisecond();
     let project_store = store_file(project)?;
     let project_store = project_store.to_str().context("project store is not UTF-8")?;
-    Ok(match select(&mut db, project_store, now)? {
-        Some(Choice::Ready(inputs)) => Some(inputs),
-        _ => None,
-    })
+    let state = db.read_snapshot(None)?;
+    let profiles = db.admission_profiles()?;
+    let control = state.control.as_ref().context("project control missing")?;
+    let Some(candidate) = ready_candidates(&mut db, &state, now)?.into_iter().next() else { return Ok(None) };
+    let Some(profile) = binding_profiles(&profiles, control, &candidate.binding).into_iter().next() else { return Ok(None) };
+    Ok(Some(seal(project_store, &state, &candidate, profile, placeholder_approval())?))
 }
 
 /// Reserve at most one ready attempt through `reserve_prepared`. Does not launch.
@@ -147,21 +158,29 @@ pub fn admit_once(project: &Path) -> Result<()> {
     let now = jiff::Timestamp::now().as_millisecond();
     let project_store = store_file(project)?;
     let project_store = project_store.to_str().context("project store is not UTF-8")?;
-    match select(&mut db, project_store, now)? {
-        None => Ok(()),
-        Some(Choice::NeedsAuthority { task, head }) => record_missing_grant(&mut db, &task.id, head, now),
-        Some(Choice::Ready(mut inputs)) => {
-            let state = db.read_snapshot(None)?;
-            let task = inputs.task.clone();
-            let head = state.head;
-            let Some(reference) = matching_grant(&state, &inputs, now).map(|approval| approval.reference.clone()) else {
-                record_missing_grant(&mut db, &task, head, now)?;
-                return Ok(());
-            };
-            inputs.approval = reference;
-            // The head is the snapshot this grant matched. A later writer conflicts inside reserve_prepared.
-            db.reserve_prepared(&[PreparedLaunch { inputs }], head, now)?;
-            Ok(())
+    let state = db.read_snapshot(None)?;
+    let head = state.head;
+    let profiles = db.admission_profiles()?;
+    let control = state.control.clone().context("project control missing")?;
+    let candidates = ready_candidates(&mut db, &state, now)?;
+    for candidate in &candidates {
+        let mut sealed = None;
+        for profile in binding_profiles(&profiles, &control, &candidate.binding) {
+            let inputs = seal(project_store, &state, candidate, profile, placeholder_approval())?;
+            if let Some(reference) = accepted_grant(&db, &state, &inputs, now)? {
+                let mut inputs = inputs;
+                inputs.approval = reference;
+                sealed = Some(inputs);
+                break;
+            }
         }
+        if let Some(inputs) = sealed {
+            // Head was read before this write. A later mutation conflicts instead of reserving a stale snapshot.
+            db.reserve_prepared(&[PreparedLaunch { inputs }], head, now)?;
+            return Ok(());
+        }
+        // One denial for this task, then the next candidate. A grant for another profile is not this miss.
+        record_missing_grant(&mut db, &candidate.task.id, head, now)?;
     }
+    Ok(())
 }

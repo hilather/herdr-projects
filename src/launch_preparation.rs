@@ -1,5 +1,5 @@
 //! Trusted launch draft/reservation ingress. Selectors are data, never authority.
-use crate::{domain::*, profile_preparation::RevalidatedProfile, runner::{Cancellation, Cmd}, store::controlled::ControlledStore};
+use crate::{domain::*, profile_preparation::RevalidatedProfile, runner::Cancellation, store::controlled::ControlledStore};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, path::{Path, PathBuf}, time::{Duration, Instant}};
@@ -32,17 +32,7 @@ fn pending_approval() -> VersionedReference {
 }
 
 fn git(proof: &RevalidatedProfile, path: &Path, args: &[&str]) -> Result<crate::runner::Output> {
-    let mut command = Cmd::new("/usr/bin/git", Duration::from_secs(5))
-        .args(["--no-pager", "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"])
-        .args(args.iter().copied());
-    command.cwd = Some(path.to_str().context("repository path is not UTF-8")?.into());
-    command.env_clear = true;
-    command.env = [
-        ("PATH", "/usr/bin:/bin"), ("LANG", "C"), ("LC_ALL", "C"),
-        ("GIT_CONFIG_NOSYSTEM", "1"), ("GIT_CONFIG_GLOBAL", "/dev/null"),
-        ("GIT_TERMINAL_PROMPT", "0"), ("GIT_NO_LAZY_FETCH", "1"), ("GIT_NO_REPLACE_OBJECTS", "1"),
-    ].into_iter().map(|(k,v)|(k.into(),v.into())).collect();
-    command.capture_limit = 8192;
+    let command = crate::runner::Cmd::repository_git_command(path, args)?;
     let output = crate::supervision::run(command, proof.deadline(), proof.cancellation(), &proof.inherit()?)?;
     ensure!(!output.stdout_truncated && !output.stderr_truncated, "repository observation exceeded output bounds");
     Ok(output)

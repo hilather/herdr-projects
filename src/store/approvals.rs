@@ -84,6 +84,17 @@ pub(super) fn validate_preparation(db: &Connection, inputs: &LaunchInputs, now: 
     Ok(())
 }
 
+impl SqliteStore {
+    /// `Ok(false)` is a rejected grant. Store corruption still fails the wake.
+    pub(crate) fn preparation_grant_accepted(&self, inputs: &LaunchInputs, now: i64) -> Result<bool> {
+        match validate_preparation(&self.connection, inputs, now) {
+            Ok(()) => Ok(true),
+            Err(StoreError::Invalid(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 fn check_launch(db: &Connection, operation: &OperationId, now: i64) -> Result<String> {
     schema(db)?;
     let record = super::reservations::read_inputs(db)?.into_iter().find(|r| &r.operation == operation).ok_or_else(|| invalid("launch input record missing"))?;

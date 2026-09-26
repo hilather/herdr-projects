@@ -79,6 +79,13 @@ impl SqliteStore {
         super::delivery::now_check(now)?;if prepared.is_empty()||prepared.len()>128{return Err(invalid("reservation requires 1–128 ready preparations"));}
         let path=std::fs::canonicalize(self.connection.path().ok_or_else(||invalid("store path missing"))?).map_err(|e|StoreError::Io(e.to_string()))?;
         let mut seen=BTreeSet::new();for p in prepared {validate_inputs(&p.inputs)?;if p.inputs.version!=2 {return Err(invalid("new reservations require effective profile evidence"));}if Path::new(&p.inputs.project_store)!=path||!seen.insert(&p.inputs.task){return Err(invalid("preparation belongs to another store or duplicates a task"));}}
+        let opened:u32=self.connection.query_row("PRAGMA user_version",[],|r|r.get(0))?;
+        // Ancestry is a process. Prove it before the write transaction so a hang cannot block prepared dispatch.
+        let proofs=if opened>=30 && super::satisfaction::admission_enabled(&self.connection)? {
+            let mut proofs=Vec::with_capacity(prepared.len());
+            for preparation in prepared {proofs.push(super::satisfaction::prove_integrated_base(&self.connection,&preparation.inputs)?);}
+            proofs
+        } else {Vec::new()};
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
         let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;if version<13{return Err(StoreError::UnsupportedSchema(version));}
         // Older stores have no satisfaction rows. The flag stays off until a later signed install.
@@ -95,7 +102,8 @@ impl SqliteStore {
             if !admission_on {
                 if !i.dependencies.is_empty()||!queue.dependencies.is_empty(){return Err(invalid("dependency evidence producers are not available"));}
             } else {
-                super::satisfaction::require_dependency_evidence(&tx,i,&queue.dependencies,&tasks)?;
+                let proof=proofs.iter().find(|proof|proof.task==i.task);
+                super::satisfaction::require_dependency_evidence(&tx,i,&queue.dependencies,&tasks,proof)?;
             }
             super::worker_knowledge::validate(&tx,i,now)?;
             super::budget::check(&tx,i.budget.as_ref(),false)?;
