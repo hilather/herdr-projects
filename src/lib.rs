@@ -142,15 +142,6 @@ mod agents {
             );
         }
 
-        fn write_manifest(dir: &std::path::Path, value: &serde_json::Value) -> serde_json::Value {
-            let path = dir.join("claude-capability-manifest.json");
-            let bytes = serde_json::to_vec_pretty(value).unwrap();
-            std::fs::write(&path, &bytes).unwrap();
-            let read = std::fs::read(&path).unwrap();
-            assert_eq!(read, bytes);
-            serde_json::from_slice(&read).unwrap()
-        }
-
         #[test]
         fn claude_capability_harness_records_unsupported_without_certifying() {
             mappings_refused("claude");
@@ -161,11 +152,6 @@ mod agents {
                 Some("0.99.0-preview.3")
             );
             let temp = tempfile::tempdir().unwrap();
-            #[cfg(feature = "state-store")]
-            let evidence_store = {
-                let db_path = temp.path().join("state.db");
-                crate::store::SqliteStore::create(&db_path).unwrap()
-            };
             let controller = include_str!("canonical_controller.rs");
             assert!(controller.contains("const PREPARED_LAUNCH_DISPATCH_ENABLED: bool = true;"));
             let manifest = if let Some(binary) = discover_claude() {
@@ -201,7 +187,12 @@ mod agents {
             } else {
                 manifest("unsupported", false)
             };
-            let written = write_manifest(temp.path(), &manifest);
+            let manifest_path = temp.path().join("claude-capability-manifest.json");
+            let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+            std::fs::write(&manifest_path, &bytes).unwrap();
+            let read = std::fs::read(&manifest_path).unwrap();
+            assert_eq!(read, bytes);
+            let written: serde_json::Value = serde_json::from_slice(&read).unwrap();
             assert_closed(&written);
             if discover_claude().is_none() {
                 assert_eq!(written["status"], "unsupported");
@@ -210,18 +201,9 @@ mod agents {
                 assert_eq!(written["binary_present"], true);
                 assert_ne!(written["status"], "unsupported");
             }
+            // This check does not open a project database or record capability evidence.
+            assert!(!temp.path().join("state.db").exists());
             mappings_refused("claude");
-            #[cfg(feature = "state-store")]
-            {
-                let rows: i64 = rusqlite::Connection::open(temp.path().join("state.db"))
-                    .unwrap()
-                    .query_row("SELECT count(*) FROM capability_evidence", [], |row| {
-                        row.get(0)
-                    })
-                    .unwrap();
-                assert_eq!(rows, 0);
-                drop(evidence_store);
-            }
         }
     }
 }

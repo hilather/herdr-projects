@@ -11,8 +11,8 @@ live launch. `PREPARED_LAUNCH_DISPATCH_ENABLED` is unchanged.
 The conformance check writes one `claude-capability-manifest.json`. `status`
 `unsupported` and `binary_present` false are written only when no Claude
 executable is on `PATH`. CI without Claude records that manifest. The harness
-opens a project store and leaves `capability_evidence` empty. A missing
-executable is still an error from `probe`, not a certificate.
+does not open a project database and does not call the capability-evidence
+writer. A missing executable is still an error from `probe`, not a certificate.
 
 - `launchable`, `protocol_capable`, `certified`, `workflow_certified`, and `live_launch` false
 - `model_mapping`, `effort_mapping`, and `environment_mapping` `refused`

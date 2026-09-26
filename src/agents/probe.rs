@@ -643,15 +643,6 @@ mod tests {
         assert!(status != "launchable" && status != "workflow-certified" && status != "certified");
     }
 
-    fn write_claude_manifest(dir: &Path, manifest: &serde_json::Value) -> serde_json::Value {
-        let path = dir.join("claude-capability-manifest.json");
-        let text = serde_json::to_vec_pretty(manifest).unwrap();
-        std::fs::write(&path, &text).unwrap();
-        let read = std::fs::read(&path).unwrap();
-        assert_eq!(read, text);
-        serde_json::from_slice(&read).unwrap()
-    }
-
     fn assert_mappings_refused(kind: &str) {
         let profile: herdr_projects::profile_config::ProfileDefinition = toml::from_str(&format!(
             "kind='{kind}'\npermission_policy='interactive'\nmodel='PRIVATE_MODEL'\nreasoning_effort='PRIVATE_EFFORT'\nenvironment=['HOME']\n[budget]\nmax_wall_seconds=10\nunknown_usage='allow_with_warning'\n"
@@ -670,11 +661,6 @@ mod tests {
         // probe result replaces that file; it is not written beside it.
         assert_mappings_refused("claude");
         let temp = tempfile::tempdir().unwrap();
-        #[cfg(feature = "state-store")]
-        let evidence_store = {
-            let db_path = temp.path().join("state.db");
-            herdr_projects::store::SqliteStore::create(&db_path).unwrap()
-        };
         let controller = include_str!("../canonical_controller.rs");
         assert!(controller.contains("const PREPARED_LAUNCH_DISPATCH_ENABLED: bool = true;"));
 
@@ -745,16 +731,18 @@ mod tests {
         } else {
             claude_manifest("unsupported", false)
         };
-        let written = write_claude_manifest(temp.path(), &manifest);
+        let manifest_path = temp.path().join("claude-capability-manifest.json");
+        let text = serde_json::to_vec_pretty(&manifest).unwrap();
+        std::fs::write(&manifest_path, &text).unwrap();
+        let read = std::fs::read(&manifest_path).unwrap();
+        assert_eq!(read, text);
+        let written: serde_json::Value = serde_json::from_slice(&read).unwrap();
         assert_claude_manifest_fail_closed(&written);
         if discover_claude().is_none() {
             assert_eq!(written["status"], "unsupported");
             assert_eq!(written["binary_present"], false);
         } else {
             assert_eq!(written["binary_present"], true);
-            if written["status"] == "unsupported" {
-                assert_eq!(written["binary_present"], true);
-            }
         }
         assert_eq!(
             std::fs::read_dir(temp.path())
@@ -764,19 +752,9 @@ mod tests {
                 .count(),
             1
         );
+        // probe has no store argument and this run does not open a project database.
+        assert!(!temp.path().join("state.db").exists());
         assert_mappings_refused("claude");
-
-        #[cfg(feature = "state-store")]
-        {
-            let rows: i64 = rusqlite::Connection::open(temp.path().join("state.db"))
-                .unwrap()
-                .query_row("SELECT count(*) FROM capability_evidence", [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            assert_eq!(rows, 0);
-            drop(evidence_store);
-        }
     }
 
     #[test]
