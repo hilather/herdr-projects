@@ -50,16 +50,17 @@ impl SqliteStore {
             return Err(invalid("invalid coordinator checkpoint"));
         }
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
-        // Publication must describe one event head. In particular, never let an
-        // acknowledgment skip a concurrent memory promotion absent from this snapshot.
-        if row.acked || row.from_seq > row.through_seq || head(&tx)? != row.through_seq {
+        // A delta page may stop before the head. Its snapshot must still be that
+        // head, so ack cannot pass a promotion the snapshot did not observe.
+        let current=head(&tx)?;
+        if row.acked || row.from_seq > row.through_seq || current < row.through_seq {
             return Err(StoreError::Conflict);
         }
         let valid: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM memory_snapshots m JOIN memory_subscriptions s ON s.snapshot_id=m.id
              WHERE m.id=?1 AND m.task_id='coordinator' AND m.sequence=?2 AND m.manifest_hash=?3
              AND s.subscriber=?4)",
-            params![row.snapshot_id,integer(row.through_seq)?,row.manifest_hash,format!("coordinator:{}",row.session_id)], |r| r.get(0))?;
+            params![row.snapshot_id,integer(current)?,row.manifest_hash,format!("coordinator:{}",row.session_id)], |r| r.get(0))?;
         if !valid { return Err(invalid("checkpoint snapshot does not match session, manifest or event head")); }
         tx.execute(
             "INSERT INTO coordinator_checkpoints VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
@@ -71,11 +72,11 @@ impl SqliteStore {
     pub fn ack_coordinator_checkpoint(&mut self,id:&str,session_key:&str,expected_head:u64)->Result<CoordinatorCheckpoint> {
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
         if head(&tx)? != expected_head { return Err(StoreError::Conflict); }
-        let row:Option<(String,String,u64,i64)>=tx.query_row(
-            "SELECT session_id,kind,through_seq,acked FROM coordinator_checkpoints WHERE id=?1",[id],
+        let row:Option<(String,u64,u64,i64)>=tx.query_row(
+            "SELECT session_id,from_seq,through_seq,acked FROM coordinator_checkpoints WHERE id=?1",[id],
             |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))
         ).optional()?;
-        let Some((session,_,_,acked))=row else {return Err(invalid("checkpoint missing"));};
+        let Some((session,from_seq,through_seq,acked))=row else {return Err(invalid("checkpoint missing"));};
         let bound:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM coordinator_sessions WHERE id=?1 AND herdr_session=?2)",params![session,session_key],|r|r.get(0))?;
         if !bound { return Err(invalid("checkpoint belongs to a different coordinator session or generation")); }
         if acked==1 {
@@ -84,8 +85,8 @@ impl SqliteStore {
             tx.execute("UPDATE coordinator_checkpoints SET acked=1 WHERE id=?1 AND acked=0",[id])?;
             if tx.changes()!=1 {return Err(invalid("checkpoint ack conflict"));}
         }
-        let through:u64=tx.query_row("SELECT through_seq FROM coordinator_checkpoints WHERE id=?1",[id],|r|r.get(0))?;
-        tx.execute("UPDATE coordinator_sessions SET cursor_seq=?3 WHERE id=?1 AND last_checkpoint_id=?2 AND cursor_seq<=?3",params![session,id,integer(through)?])?;
+        // Advance only across this page. A later page must not jump a hole.
+        tx.execute("UPDATE coordinator_sessions SET cursor_seq=?3 WHERE id=?1 AND last_checkpoint_id=?2 AND cursor_seq>=?4 AND cursor_seq<=?3",params![session,id,integer(through_seq)?,integer(from_seq)?])?;
         if tx.changes()!=1 && acked!=1 { return Err(invalid("stale checkpoint acknowledgment")); }
         tx.commit()?;
         self.coordinator_checkpoint(id)?.ok_or_else(||invalid("checkpoint missing after ack"))
