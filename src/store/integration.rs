@@ -696,7 +696,8 @@ fn apply_finish(
                         created
                     ],
                 )?;
-                // Schema 30 is the only satisfaction writer. This event only wakes that later step.
+                // The wake event is not evidence. The satisfaction row is the stored receipt.
+                super::satisfaction::record_integrated_commit(tx, &integrated_id)?;
                 tx.execute(
                     "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('integration.wake',?1,1,1,?2)",
                     params![
@@ -978,7 +979,7 @@ mod tests {
     fn upgrade_v1_from_27_to_28_preserves_historical_dependencies() {
         let fresh = tempfile::tempdir().unwrap();
         let created = SqliteStore::create(&fresh.path().join("state.db")).unwrap();
-        assert_eq!(user_version(&created.connection), 29);
+        assert_eq!(user_version(&created.connection), 30);
         assert!(table_exists(&created.connection, "integration_operations"));
         assert!(table_exists(&created.connection, "integration_candidates"));
         assert!(table_exists(&created.connection, "integrated_commits"));
@@ -1030,7 +1031,7 @@ mod tests {
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
         raw.execute_batch(
-            "DROP TABLE IF EXISTS feedback_claims; DROP TABLE IF EXISTS feedback_items; DROP TABLE IF EXISTS integrated_commits; DROP TABLE IF EXISTS integration_candidates; DROP TABLE IF EXISTS integration_operations; DROP TABLE IF EXISTS integration_target_leases; DROP TABLE IF EXISTS integration_targets; UPDATE store_meta SET schema_version=27; PRAGMA user_version=27;",
+            "DROP TABLE IF EXISTS dependency_satisfactions; DROP TABLE IF EXISTS factory_admission_policies; ALTER TABLE project_control DROP COLUMN factory_admission; DROP TABLE IF EXISTS feedback_claims; DROP TABLE IF EXISTS feedback_items; DROP TABLE IF EXISTS integrated_commits; DROP TABLE IF EXISTS integration_candidates; DROP TABLE IF EXISTS integration_operations; DROP TABLE IF EXISTS integration_target_leases; DROP TABLE IF EXISTS integration_targets; UPDATE store_meta SET schema_version=27; PRAGMA user_version=27;",
         )
         .unwrap();
         drop(raw);
@@ -1056,12 +1057,12 @@ mod tests {
             Err(StoreError::UnsupportedSchema(27))
         ));
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 29);
+        assert_eq!(user_version(&db.connection), 30);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            29
+            30
         );
         assert!(table_exists(&db.connection, "integrated_commits"));
         assert_eq!(db.testing_dependencies().unwrap(), before);
@@ -1075,19 +1076,28 @@ mod tests {
             .unwrap();
         assert!(check_sql.contains("landed_commit"));
         assert!(check_sql.contains("integration_candidate"));
-        assert!(!check_sql.contains("integrated_commit"));
-        let satisfactions: bool = db
+        assert!(check_sql.contains("integrated_commit"));
+        let satisfactions: i64 = db
             .connection
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='dependency_satisfactions')",
+                "SELECT count(*) FROM dependency_satisfactions",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(!satisfactions);
+        assert_eq!(satisfactions, 0);
+        let admission: String = db
+            .connection
+            .query_row(
+                "SELECT factory_admission FROM project_control WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(admission, "off");
         check_schema(&db.connection).unwrap();
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 29);
+        assert_eq!(user_version(&reopened.connection), 30);
     }
 }

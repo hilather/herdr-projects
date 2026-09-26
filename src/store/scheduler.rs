@@ -40,7 +40,7 @@ pub(super) fn read_with_tasks(db:&Connection,tasks:&[Task],budget:Option<&read_b
     while let Some(r)=rows.next()? {
         if let Some(budget)=budget {budget.row(r,&[])?;}
         let task:String=r.get(0)?;let predecessor:String=r.get(1)?;let requirement:String=r.get(2)?;
-        let requirement=match requirement.as_str(){"verified_result"=>DependencyRequirement::VerifiedResult,"integration_candidate"=>DependencyRequirement::IntegrationCandidate,"landed_commit"=>DependencyRequirement::LandedCommit,_=>return Err(StoreError::Corrupt("unknown dependency requirement".into()))};
+        let requirement=match requirement.as_str(){"verified_result"=>DependencyRequirement::VerifiedResult,"integrated_commit"=>DependencyRequirement::IntegratedCommit,"integration_candidate"=>DependencyRequirement::IntegrationCandidate,"landed_commit"=>DependencyRequirement::LandedCommit,_=>return Err(StoreError::Corrupt("unknown dependency requirement".into()))};
         queue[*index.get(&task).ok_or_else(||StoreError::Corrupt("dependency has no queue record".into()))?].dependencies.push(Dependency{predecessor:TaskId::new(predecessor).map_err(StoreError::Corrupt)?,requirement});
     }
     graph(tasks,&queue)?;Ok(SchedulerSnapshot{policy,queue})
@@ -71,11 +71,13 @@ impl SqliteStore {
         tx.execute("INSERT INTO task_queue VALUES(?1,?2,?3,?4) ON CONFLICT(task_id) DO UPDATE SET priority=excluded.priority",params![id.as_str(),record.priority,record.enqueued_unix_ms,integer(record.enqueue_sequence)?])?;
         tx.execute("DELETE FROM task_dependencies WHERE task_id=?1",[id.as_str()])?;
         for edge in &record.dependencies {tx.execute("INSERT INTO task_dependencies VALUES(?1,?2,?3)",params![id.as_str(),edge.predecessor.as_str(),edge.requirement.as_str()])?;}
+        super::satisfaction::attach_stored_receipts(&tx, id.as_str())?;
         tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('scheduler.task_queued',?1,?2,1,?3)",params![id.as_str(),integer(task.revision)?,serde_json::to_string(&record).map_err(|e|invalid(&e.to_string()))?])?;
         let result=head(&tx)?;tx.commit()?;Ok(result)
     }
     pub fn queue_report(&mut self,now:i64)->Result<QueueReport> {
         super::delivery::now_check(now)?;let tx=self.connection.transaction()?;schema(&tx)?;let snapshot=read(&tx)?;let tasks=read_tasks(&tx)?;let attempts=read_attempts(&tx)?;let control=super::control::read(&tx)?;
+        let admission_on=super::satisfaction::admission_enabled(&tx)?;
         let retained_attempts=attempts.iter().filter(|a|a.retains_capacity()).count();let available_slots=(snapshot.policy.max_active_workers as usize).saturating_sub(retained_attempts);let mut entries=Vec::new();
         let budget_blockers=super::budget::report(&tx,false)?.blockers;
         let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
@@ -89,8 +91,8 @@ impl SqliteStore {
             if attempts.iter().filter(|a|a.task==task.id).count()>=snapshot.policy.max_attempts_per_task as usize {blockers.push("attempt_limit".into());}
             for edge in &record.dependencies {
                 let predecessor=tasks.iter().find(|t|t.id==edge.predecessor).ok_or(StoreError::Conflict)?;
-                // Satisfaction rows do not exist yet, so this string stays; a replacement would invent a row that is not stored.
-                let reason=if matches!(predecessor.state,TaskState::Failed|TaskState::Cancelled){"predecessor_failed"}else{"verified_dependency_evidence_unavailable"};blockers.push(format!("{reason}:{}:{}",edge.predecessor.as_str(),edge.requirement.as_str()));
+                // A missing receipt stays unavailable. A valid receipt still does not admit while the flag is off.
+                if let Some(blocker)=super::satisfaction::dependency_blocker(&tx, task.id.as_str(), predecessor, edge.requirement, admission_on)? {blockers.push(blocker);}
             }
             blockers.extend(budget_blockers.iter().cloned());
             let signed=approvals.iter().any(|record|record.consumed.is_none()&&record.grant.scope.class==ApprovalClass::RuntimeLaunch&&record.grant.scope.task==task.id);
@@ -101,9 +103,16 @@ impl SqliteStore {
             entries.push((record.enqueue_sequence,QueueEntry{task:task.id.clone(),task_revision:task.revision,effective_priority:score,blockers}));
         }
         entries.sort_by(|a,b|b.1.effective_priority.cmp(&a.1.effective_priority).then(a.0.cmp(&b.0)).then(a.1.task.cmp(&b.1.task)));
-        let capability=CapabilityReport{prepared_dispatch:true,automatic_admission:false,dependency_producers:false,integration:"unavailable",blockers:vec!["automatic_admission_does_not_draft_sign_or_reserve".into()]};
-        let report=QueueReport{head:head(&tx)?,policy:snapshot.policy,retained_attempts,available_slots,launch_enabled:false,capability,entries:entries.into_iter().map(|(_,e)|e).collect()};tx.commit()?;Ok(report)
+        let reported:Vec<_>=entries.into_iter().map(|(_,entry)|entry).collect();
+        let launch_enabled=automatic_launch_enabled(admission_on,&reported);
+        let capability=CapabilityReport{prepared_dispatch:true,automatic_admission:admission_on,dependency_producers:false,integration:"unavailable",blockers:vec!["automatic_admission_does_not_draft_sign_or_reserve".into()]};
+        let report=QueueReport{head:head(&tx)?,policy:snapshot.policy,retained_attempts,available_slots,launch_enabled,capability,entries:reported};tx.commit()?;Ok(report)
     }
+}
+
+pub(super) fn automatic_launch_enabled(admission_on:bool, entries:&[QueueEntry])->bool {
+    // Grant, capacity, and dependency blockers still keep this false when every entry has one.
+    admission_on && entries.iter().any(|entry| entry.blockers.is_empty())
 }
 
 #[cfg(test)]
@@ -181,5 +190,5 @@ fn unrelated_task_count_never_makes_a_committed_store_unreadable() {
         let count=if chunk==10 {1}else{1000};let head=db.read_snapshot(None).unwrap().head;let mutations=(0..count).map(|i|{let id=TaskId::new(format!("task-{}",chunk*1000+i)).unwrap();Mutation::Task{expected:None,next:Task{id,revision:1,state:TaskState::Draft,title:"unqueued".into(),active_attempt:None}}}).collect();db.commit(Commit{expected_head:head,mutations}).unwrap();
     }
     let before=db.read_snapshot(None).unwrap();assert_eq!(before.tasks.len(),10_001);assert!(db.queue_report(0).unwrap().entries.is_empty());drop(db);
-    let raw=Connection::open(&path).unwrap();raw.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; UPDATE store_meta SET schema_version=9; PRAGMA user_version=9;").unwrap();drop(raw);let mut db=SqliteStore::open(&path).unwrap();db.upgrade_v1().unwrap();assert_eq!(db.read_snapshot(None).unwrap().tasks,before.tasks);let head=db.read_snapshot(None).unwrap().head;db.queue_task(&TaskId::new("task-0").unwrap(),1,head,&QueueRequest{priority:0,dependencies:vec![]},0).unwrap();assert_eq!(db.queue_report(0).unwrap().entries.len(),1);
+    let raw=Connection::open(&path).unwrap();raw.execute_batch("DROP TABLE IF EXISTS dependency_satisfactions; DROP TABLE IF EXISTS factory_admission_policies; ALTER TABLE project_control DROP COLUMN factory_admission; DROP TABLE IF EXISTS feedback_claims; DROP TABLE IF EXISTS feedback_items; DROP TABLE IF EXISTS integrated_commits; DROP TABLE IF EXISTS integration_candidates; DROP TABLE IF EXISTS integration_operations; DROP TABLE IF EXISTS integration_target_leases; DROP TABLE IF EXISTS integration_targets; DROP TABLE IF EXISTS verified_results; DROP TABLE IF EXISTS verification_runs; DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; UPDATE store_meta SET schema_version=9; PRAGMA user_version=9;").unwrap();drop(raw);let mut db=SqliteStore::open(&path).unwrap();db.upgrade_v1().unwrap();assert_eq!(db.read_snapshot(None).unwrap().tasks,before.tasks);let head=db.read_snapshot(None).unwrap().head;db.queue_task(&TaskId::new("task-0").unwrap(),1,head,&QueueRequest{priority:0,dependencies:vec![]},0).unwrap();assert_eq!(db.queue_report(0).unwrap().entries.len(),1);
 }

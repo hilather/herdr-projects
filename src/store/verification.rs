@@ -419,10 +419,11 @@ impl SqliteStore {
         if state == "accepted" {
             let digest = receipt_digest
                 .ok_or_else(|| invalid("accepted verification is missing a receipt"))?;
+            let stored_result = result_id.as_deref().unwrap();
             tx.execute(
                 "INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                 params![
-                    result_id.unwrap(),
+                    stored_result,
                     run_id,
                     target.submission_id,
                     target.candidate_oid,
@@ -435,6 +436,8 @@ impl SqliteStore {
                     now
                 ],
             )?;
+            // Narrative acceptance is not enough; only this stored receipt can satisfy.
+            super::satisfaction::record_verified_result(&tx, stored_result)?;
         }
         if state == "rejected" {
             super::feedback::insert_feedback(
@@ -794,7 +797,7 @@ mod tests {
         let fresh = tempfile::tempdir().unwrap();
         let fresh_path = fresh.path().join("state.db");
         let created = SqliteStore::create(&fresh_path).unwrap();
-        assert_eq!(user_version(&created.connection), 29);
+        assert_eq!(user_version(&created.connection), 30);
         assert!(table_exists(&created.connection, "verification_runs"));
         assert!(table_exists(&created.connection, "verified_results"));
         drop(created);
@@ -806,7 +809,7 @@ mod tests {
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
         raw.execute_batch(
-            "DROP TABLE IF EXISTS feedback_claims; DROP TABLE IF EXISTS feedback_items; DROP TABLE IF EXISTS integrated_commits; DROP TABLE IF EXISTS integration_candidates; DROP TABLE IF EXISTS integration_operations; DROP TABLE IF EXISTS integration_target_leases; DROP TABLE IF EXISTS integration_targets; DROP TABLE IF EXISTS verified_results; DROP TABLE IF EXISTS verification_runs; UPDATE store_meta SET schema_version = 26; PRAGMA user_version = 26;",
+            "DROP TABLE IF EXISTS dependency_satisfactions; DROP TABLE IF EXISTS factory_admission_policies; ALTER TABLE project_control DROP COLUMN factory_admission; DROP TABLE IF EXISTS feedback_claims; DROP TABLE IF EXISTS feedback_items; DROP TABLE IF EXISTS integrated_commits; DROP TABLE IF EXISTS integration_candidates; DROP TABLE IF EXISTS integration_operations; DROP TABLE IF EXISTS integration_target_leases; DROP TABLE IF EXISTS integration_targets; DROP TABLE IF EXISTS verified_results; DROP TABLE IF EXISTS verification_runs; UPDATE store_meta SET schema_version = 26; PRAGMA user_version = 26;",
         )
         .unwrap();
         drop(raw);
@@ -819,20 +822,20 @@ mod tests {
             Err(StoreError::UnsupportedSchema(26))
         ));
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 29);
+        assert_eq!(user_version(&db.connection), 30);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            29
+            30
         );
         assert!(table_exists(&db.connection, "verification_runs"));
         assert!(table_exists(&db.connection, "verified_results"));
         check_schema(&db.connection).unwrap();
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 29);
+        assert_eq!(user_version(&reopened.connection), 30);
         assert!(table_exists(&reopened.connection, "verified_results"));
     }
 

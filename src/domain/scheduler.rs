@@ -5,8 +5,8 @@ use super::TaskId;
 pub struct SchedulerPolicy {pub revision:u64,pub max_active_workers:u32,pub max_attempts_per_task:u32}
 #[derive(Debug,Clone,Copy,PartialEq,Eq,Serialize,Deserialize)]
 #[serde(rename_all="snake_case")]
-pub enum DependencyRequirement {VerifiedResult,IntegrationCandidate,LandedCommit}
-impl DependencyRequirement {pub(crate) fn as_str(self)->&'static str {match self {Self::VerifiedResult=>"verified_result",Self::IntegrationCandidate=>"integration_candidate",Self::LandedCommit=>"landed_commit"}}}
+pub enum DependencyRequirement {VerifiedResult,IntegratedCommit,IntegrationCandidate,LandedCommit}
+impl DependencyRequirement {pub(crate) fn as_str(self)->&'static str {match self {Self::VerifiedResult=>"verified_result",Self::IntegratedCommit=>"integrated_commit",Self::IntegrationCandidate=>"integration_candidate",Self::LandedCommit=>"landed_commit"}}}
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Dependency {pub predecessor:TaskId,pub requirement:DependencyRequirement}

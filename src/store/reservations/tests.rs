@@ -34,6 +34,20 @@ fn fixture_at(version:u32)->(tempfile::TempDir,SqliteStore,Vec<PreparedLaunch>) 
 fn reserve(db:&mut SqliteStore,p:&[PreparedLaunch])->Reservation {let h=db.read_snapshot(None).unwrap().head;db.reserve_prepared(p,h,1000).unwrap()}
 
 #[test]
+fn satisfaction_flag_does_not_reserve_a_dependent_task() {
+    let(_temp,mut db,p)=fixture();
+    db.testing_set_factory_admission(true).unwrap();
+    db.connection.execute(
+        "INSERT INTO task_dependencies(task_id,predecessor_id,requirement) VALUES('a','b','verified_result')",
+        [],
+    ).unwrap();
+    let head=db.read_snapshot(None).unwrap().head;
+    let err=db.reserve_prepared(&p,head,1000).unwrap_err();
+    assert!(matches!(err, StoreError::Invalid(ref message) if message.contains("not ready") || message.contains("dependency")), "{err}");
+    assert!(db.read_snapshot(None).unwrap().attempts.is_empty());
+}
+
+#[test]
 fn project_outbox_upgrade_preserves_claims_inputs_and_consumed_approvals() {
     let(temp,mut db,p)=fixture_at(14);let r=reserve(&mut db,&p);
     let claim=db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap();

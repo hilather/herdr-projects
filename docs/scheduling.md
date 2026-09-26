@@ -24,9 +24,10 @@ attempts. Lowering the limit never cancels or releases those attempts.
 Prepared-launch dispatch is on and automatic admission is off.
 `capability.prepared_dispatch` is that compiled gate and is true;
 `PREPARED_LAUNCH_DISPATCH_ENABLED` is not changed by the report.
-`capability.automatic_admission` is false, so `launch_enabled` stays false while
-admission is unavailable. `capability.dependency_producers` is false and
-`capability.integration` is `unavailable`. Inspect does not reserve or launch.
+`capability.automatic_admission` follows `factory_admission` and is false by
+default, so `launch_enabled` stays false while admission is unavailable.
+`capability.dependency_producers` is false and `capability.integration` is
+`unavailable`. Inspect does not reserve or launch.
 
 The operator path is draft, then sign, then `launch reserve`, then the
 controller. Automatic admission does not itself draft, sign, or reserve. The
@@ -39,11 +40,18 @@ task is stored, and `launch_reserve_not_scheduled` plus
 reserved, launching, running, or awaiting-input attempt. Lost and other
 non-live states still report them. It never reports `launch_draft_not_scheduled`,
 because a draft writes no row. Those blockers do not claim a verifier,
-integrator, or satisfaction producer exists. Satisfaction rows do not exist
-yet, so every dependency edge still reports
-`verified_dependency_evidence_unavailable` unless the predecessor is failed or
-cancelled (`predecessor_failed`). Do not invent a replacement blocker for that
-string.
+integrator, or satisfaction producer exists. Schema 30 stores a satisfaction
+only from a verified result or an integrated commit. No stored satisfaction
+still reports `verified_dependency_evidence_unavailable:<predecessor>:<requirement>`,
+unless the predecessor failed or was cancelled (`predecessor_failed`). A valid
+satisfaction while `factory_admission` is off reports
+`admission_disabled:<requirement>`. A valid satisfaction while that flag is on
+adds no dependency blocker. `verified_result` does not satisfy
+`integrated_commit`. `landed_commit` and `integration_candidate` are never
+valid. Narrative success does not write a row. `launch_enabled` is true only
+when the flag is on and at least one entry has an empty blocker list. The
+column defaults to off. Inspect does not turn it on, and reserving a dependent
+task still fails.
 
 ```sh
 herdr-projects scheduler demo policy --max-active-workers 3 \
@@ -60,7 +68,7 @@ A queue request is a bounded JSON file:
 ]}
 ```
 
-Requirements are `verified_result`, `integration_candidate` or `landed_commit`.
+Requirements are `verified_result`, `integrated_commit`, `integration_candidate`, or `landed_commit`.
 Missing/duplicate/self edges and cycles refuse atomically. Existing live/uncertain
 attempts block queue edits. Task state/revision and queue audit commit together;
 unchanged requests are idempotent. Queueing preserves legacy TASKS.md and creates
@@ -73,9 +81,8 @@ older work. Graph work is bounded to 10,000 queued tasks and 100,000 edges (256 
 task); unrelated unqueued tasks do not make a store unreadable.
 
 Failed/cancelled predecessors block explicitly. Narrative succeeded state cannot
-satisfy an evidence-bound edge. Satisfaction rows do not exist yet, so
-`verified_dependency_evidence_unavailable` stays; a different blocker would
-invent a row that is not stored. See the [frozen W04 interfaces](adr/0004-w04-scheduling-contract.md).
+satisfy an evidence-bound edge. Only a stored verified result or integrated
+commit for that same requirement can. See the [frozen W04 interfaces](adr/0004-w04-scheduling-contract.md).
 
 ## Reservations and cancellation (schema v16; older history retained)
 

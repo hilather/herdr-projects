@@ -55,10 +55,12 @@ that path. Do not run it:
 4. The controller may start that reserved attempt. It does not prepare an arbitrary queued task.
 
 Do not tell a worker to write canonical memory, promote memory, or edit the
-store. A worker report is not dependency evidence. Satisfaction rows do not
-exist yet, so a dependency stays `verified_dependency_evidence_unavailable`.
-Narrative success does not clear it. Do not satisfy an edge by describing the
-predecessor as done.
+store. A worker report is not dependency evidence. Narrative success does not
+clear an edge. A stored verified result satisfies only a `verified_result`
+edge, and an integrated commit satisfies only `integrated_commit`. With
+`factory_admission` off, a satisfied edge still reports `admission_disabled`
+and does not launch. Do not satisfy an edge by describing the predecessor as
+done.
 
 ## Every turn
 
