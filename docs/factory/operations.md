@@ -86,7 +86,7 @@ a separate directory.
 | Incident | Command | Not a substitute |
 | --- | --- | --- |
 | Which target is this binary? | `herdr-projects doctor` | No `doctor --platform`. Read `platform`, `macOS`, `live SSH`, and `factory-path`. Doctor does not migrate or launch. |
-| Counters, admission, schema | `herdr-projects factory PROJECT status` | Does not launch, admit, or print environment values. `unsupported_schema` is `user_version` 0, not the platform label. |
+| Counters, admission, schema | `herdr-projects factory status PROJECT` | Does not launch, admit, or print environment values. `unsupported_schema` is `user_version` 0, not the platform label. |
 | Queue without preparing a launch | `herdr-projects scheduler PROJECT inspect` | Read-only. It does not reserve. |
 | Unsigned grant for this store | `herdr-projects launch PROJECT draft --selection FILE --expected-head N` | Linux and `state-store` only. Does not reserve or start an agent. |
 | Reserve an installed grant | `herdr-projects launch PROJECT reserve --selection FILE --approval-digest DIGEST --expected-head N` | Sends no agent input. A grant for another `project_store` does not match. |
@@ -105,5 +105,6 @@ a separate directory.
 | Ambiguous delivery | `herdr-projects operations PROJECT inspect` | `herdr-projects operations PROJECT expire` records ambiguity and does not replay. |
 
 macOS and live SSH stay on the doctor lines above. Do not point canonical
-launch at either one. `launch` is not compiled for those targets, and a
-non-empty `route.machine` is refused as not an unused local binding.
+launch at either one. On Linux with `state-store`, `launch` is compiled. A
+live SSH route is refused before launch when `route.machine` is non-empty
+(`launch_preparation::inputs`, `new launch requires an unused local binding`).

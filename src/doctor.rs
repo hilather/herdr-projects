@@ -282,14 +282,6 @@ fn factory_platform_label(target_os: &str, live_ssh: bool) -> &'static str {
     }
 }
 
-fn factory_path_detail(label: &str) -> &'static str {
-    if label == "linux" {
-        "linux local only"
-    } else {
-        "unsupported; canonical launch does not run"
-    }
-}
-
 /// Identity of this binary only. Opening a project database would be a migration path.
 fn write_compiled_features(out: &mut String) {
     #[cfg(feature = "state-store")]
@@ -336,7 +328,15 @@ fn write_compiled_features(out: &mut String) {
         "live SSH: {}; canonical launch does not run",
         factory_platform_label(std::env::consts::OS, true)
     );
-    let _ = writeln!(out, "factory-path: {}", factory_path_detail(platform));
+    let _ = writeln!(
+        out,
+        "factory-path: {}",
+        if platform == "linux" {
+            "linux local only"
+        } else {
+            "unsupported; canonical launch does not run"
+        }
+    );
     let _ = writeln!(
         out,
         "upgrade: existing projects upgrade only through `migration PROJECT upgrade-store`"
@@ -544,18 +544,5 @@ mod tests {
         assert_eq!(factory_platform_label("macos", false), "unsupported");
         assert_eq!(factory_platform_label("linux", true), "unsupported");
         assert_eq!(factory_platform_label("macos", true), "unsupported");
-        assert_eq!(
-            factory_path_detail("unsupported"),
-            "unsupported; canonical launch does not run"
-        );
-        assert_eq!(
-            factory_path_detail(factory_platform_label("macos", false)),
-            "unsupported; canonical launch does not run"
-        );
-        assert_eq!(
-            factory_path_detail(factory_platform_label("linux", true)),
-            "unsupported; canonical launch does not run"
-        );
-        assert_eq!(factory_path_detail("linux"), "linux local only");
     }
 }

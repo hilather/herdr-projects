@@ -18,9 +18,14 @@ On any other target the variant is not compiled, so there is no canonical
 launch command. There is no `cfg(target_os = "macos")` factory path.
 
 On a non-Linux build, `dispatch_prepared` in `src/canonical_controller.rs`
-does not run a prepared `runtime.launch` or `runtime.worker_termination`.
-It bails with `canonical resource recovery requires Linux pidfs` or
-`canonical termination requires Linux pidfs`.
+does not bail on every call. With an effect queue it calls `offer_next`,
+which queues the offer (`offer_canonical_launch` for a deliver-mode
+`runtime.launch`, otherwise `offer_canonical_brief`). The queued deliver
+step fails later: `canonical_brief_jobs` bails with `canonical launch
+requires Linux pidfs` when `launch_advance` is set. Without a queue, the
+direct `runtime.launch` arm bails with `canonical resource recovery requires
+Linux pidfs`, and `runtime.worker_termination` bails with `canonical
+termination requires Linux pidfs`.
 
 ## Doctor labels
 
@@ -47,7 +52,7 @@ factory-path: linux local only
 Any other binary prints `platform: unsupported` and
 `factory-path: unsupported; canonical launch does not run`.
 
-`herdr-projects factory PROJECT status` also prints a `platform` field, from
+`herdr-projects factory status PROJECT` also prints a `platform` field, from
 the compile target only (`linux` or `unsupported` in `src/factory_status.rs`).
 That field does not make a live SSH route supported. A `user_version` of 0
 is the error `unsupported_schema`. That is a store version, not this platform
