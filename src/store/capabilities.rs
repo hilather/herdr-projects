@@ -479,17 +479,17 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_v1_from_32_to_33_and_create_end_at_user_version_33() {
+    fn upgrade_v1_from_32_to_34_and_create_end_at_user_version_34() {
         let fresh = tempfile::tempdir().unwrap();
         let created = SqliteStore::create(&fresh.path().join("state.db")).unwrap();
-        assert_eq!(user_version(&created.connection), 33);
+        assert_eq!(user_version(&created.connection), 34);
         assert_eq!(
             created
                 .connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            33
+            34
         );
         assert!(table_exists(&created.connection, "capability_evidence"));
         let open_source = include_str!("mod.rs");
@@ -524,7 +524,7 @@ mod tests {
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
         raw.execute_batch(
-            "DROP TABLE IF EXISTS capability_evidence; UPDATE store_meta SET schema_version=32; PRAGMA user_version=32;",
+            "DROP TABLE IF EXISTS delegation_stop_obligations; DROP TABLE IF EXISTS delegation_revocations; DROP TABLE IF EXISTS delegation_grants; DROP TABLE IF EXISTS capability_evidence; UPDATE store_meta SET schema_version=32; PRAGMA user_version=32;",
         )
         .unwrap();
         drop(raw);
@@ -533,13 +533,13 @@ mod tests {
         assert!(!table_exists(&db.connection, "capability_evidence"));
         assert_eq!(db.read_snapshot(None).unwrap().tasks[0].title, "kept");
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 33);
+        assert_eq!(user_version(&db.connection), 34);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            33
+            34
         );
         assert!(table_exists(&db.connection, "capability_evidence"));
         assert_eq!(
@@ -552,8 +552,8 @@ mod tests {
         check_schema(&db.connection).unwrap();
         drop(db);
         let mut reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 33);
-        assert_eq!(reopened.read_snapshot(None).unwrap().schema_version, 33);
+        assert_eq!(user_version(&reopened.connection), 34);
+        assert_eq!(reopened.read_snapshot(None).unwrap().schema_version, 34);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{fmt, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 
-pub const SCHEMA: u32 = 33;
+pub const SCHEMA: u32 = 34;
 const APPLICATION: u32 = 1_213_222_994;
 const MIN_SQLITE: i32 = 3_053_004;
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
@@ -90,6 +90,7 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../migrations/0031_plan_revisions.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0032_contract_scope.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0033_capability_evidence.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0034_delegation_grants.sql"))?;
             tx.commit()?;
         }
         // Persist the initial directory entry as well as SQLite's own commit.
@@ -412,6 +413,9 @@ mod plans;
 pub use plans::{PlanProposalReceipt, propose_plan};
 
 mod capabilities;
+
+mod delegation;
+pub use delegation::DelegationReserve;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod verification;

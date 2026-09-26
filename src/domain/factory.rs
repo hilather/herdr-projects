@@ -527,3 +527,229 @@ impl UntrustedContractDocument {
         })
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum DelegationAction {
+    ReserveAttempt,
+    ReviewMemory,
+}
+impl DelegationAction {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ReserveAttempt => "reserve_attempt",
+            Self::ReviewMemory => "review_memory",
+        }
+    }
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "reserve_attempt" => Ok(Self::ReserveAttempt),
+            "review_memory" => Ok(Self::ReviewMemory),
+            "runtime_launch" | "launch" => Err("delegation is not a launch approval".into()),
+            _ => Err("invalid delegation action".into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DelegationRepoScope {
+    pub(crate) repository: String,
+    pub(crate) git_ref: String,
+}
+
+/// Trusted ingress capability. JSON cannot construct it. Callers keep the
+/// original signed bytes; this type is not a launch grant.
+/// ```compile_fail
+/// use herdr_projects::domain::PreparedDelegation;
+/// let _: PreparedDelegation = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedDelegation {
+    pub(crate) raw: Vec<u8>,
+    pub(crate) digest: String,
+    pub(crate) issuer: String,
+    pub(crate) subject: String,
+    pub(crate) subject_public_key: String,
+    pub(crate) actions: Vec<DelegationAction>,
+    pub(crate) repositories: Vec<DelegationRepoScope>,
+    pub(crate) profile_kinds: Vec<String>,
+    pub(crate) max_concurrent_attempts: u32,
+    pub(crate) expires_unix_ms: i64,
+    pub(crate) revocation_epoch: u64,
+    pub(crate) child_delegation: String,
+    pub(crate) policy_revision: u64,
+    pub(crate) project_store: String,
+    pub(crate) authority: VersionedReference,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UntrustedDelegationRepo {
+    repository: String,
+    #[serde(rename = "ref")]
+    git_ref: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UntrustedDelegationDocument {
+    version: u32,
+    issuer: String,
+    subject: String,
+    subject_public_key: String,
+    action_classes: Vec<String>,
+    repositories: Vec<UntrustedDelegationRepo>,
+    profile_kinds: Vec<String>,
+    max_concurrent_attempts: u32,
+    expires_unix_ms: i64,
+    revocation_epoch: u64,
+    child_delegation: String,
+    policy_revision: u64,
+    project_store: String,
+    authority: VersionedReference,
+}
+
+fn ssh_ed25519_key(value: &str) -> bool {
+    let mut parts = value.split(' ');
+    let kind = parts.next();
+    let body = parts.next();
+    parts.next().is_none()
+        && kind == Some("ssh-ed25519")
+        && body.is_some_and(|body| {
+            (32..=256).contains(&body.len())
+                && body
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"+/=".contains(&byte))
+        })
+}
+
+impl PreparedDelegation {
+    /// Parse bytes that have already been signature-checked. Does not verify a signature.
+    pub(crate) fn parse_verified(raw: &[u8]) -> Result<Self, String> {
+        if raw.len() > 65_536 {
+            return Err("delegation document exceeds 65536 bytes".into());
+        }
+        let document: UntrustedDelegationDocument =
+            serde_json::from_slice(raw).map_err(|_| "invalid delegation document".to_string())?;
+        document.into_prepared(raw)
+    }
+
+    /// A delegation is not an approval grant and cannot bind a launch.
+    pub(crate) fn matches_launch(&self) -> Result<(), String> {
+        if serde_json::from_slice::<super::ApprovalGrant>(&self.raw).is_ok() {
+            return Err("delegation document must not decode as a launch grant".into());
+        }
+        Err("delegation is not a launch approval".into())
+    }
+}
+
+impl UntrustedDelegationDocument {
+    fn into_prepared(self, raw: &[u8]) -> Result<PreparedDelegation, String> {
+        if self.version != 1 {
+            return Err("invalid delegation version".into());
+        }
+        if self.child_delegation != "forbidden" {
+            return Err("child delegation is forbidden".into());
+        }
+        if !identifier(&self.issuer) || !identifier(&self.subject) {
+            return Err("invalid delegation issuer or subject".into());
+        }
+        // The subject cannot be the issuer. A delegate does not sign its own grant.
+        if self.issuer == self.subject {
+            return Err("delegation self-signature is forbidden".into());
+        }
+        if !ssh_ed25519_key(&self.subject_public_key) {
+            return Err("invalid delegation subject key".into());
+        }
+        if self.action_classes.is_empty() || self.action_classes.len() > 8 {
+            return Err("delegation actions exceed bounds".into());
+        }
+        let mut seen_actions = std::collections::BTreeSet::new();
+        let mut actions = Vec::new();
+        for action in &self.action_classes {
+            let parsed = DelegationAction::parse(action)?;
+            if !seen_actions.insert(parsed) {
+                return Err("invalid delegation action".into());
+            }
+            actions.push(parsed);
+        }
+        if self.repositories.is_empty() || self.repositories.len() > 32 {
+            return Err("delegation repositories exceed bounds".into());
+        }
+        let mut seen_repos = std::collections::BTreeSet::new();
+        let mut repositories = Vec::new();
+        for repo in self.repositories {
+            if !std::path::Path::new(&repo.repository).is_absolute()
+                || !plain(&repo.repository, 4_096)
+                || !repo.git_ref.starts_with("refs/")
+                || !plain(&repo.git_ref, 256)
+                || repo.git_ref.contains(' ')
+                || repo
+                    .git_ref
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == "..")
+            {
+                return Err("delegation repository scope must be absolute with a refs name".into());
+            }
+            if !seen_repos.insert((repo.repository.clone(), repo.git_ref.clone())) {
+                return Err("delegation repository scope is duplicated".into());
+            }
+            repositories.push(DelegationRepoScope {
+                repository: repo.repository,
+                git_ref: repo.git_ref,
+            });
+        }
+        if self.profile_kinds.is_empty() || self.profile_kinds.len() > 8 {
+            return Err("delegation profile kinds exceed bounds".into());
+        }
+        let mut seen_kinds = std::collections::BTreeSet::new();
+        for kind in &self.profile_kinds {
+            if !plain(kind, 64) || !seen_kinds.insert(kind.clone()) {
+                return Err("invalid delegation profile kind".into());
+            }
+        }
+        if !(1..=64).contains(&self.max_concurrent_attempts) {
+            return Err("invalid delegation attempt cap".into());
+        }
+        if self.expires_unix_ms <= 0
+            || self.revocation_epoch == 0
+            || self.revocation_epoch > i64::MAX as u64
+        {
+            return Err("invalid delegation expiry or revocation epoch".into());
+        }
+        if self.policy_revision == 0
+            || self.policy_revision > i64::MAX as u64
+            || self.policy_revision != self.authority.revision
+        {
+            return Err("delegation policy revision does not match its authority".into());
+        }
+        if !std::path::Path::new(&self.project_store).is_absolute()
+            || !plain(&self.project_store, 4_096)
+        {
+            return Err("delegation project_store must be an absolute path".into());
+        }
+        if self.authority.revision == 0
+            || self.authority.revision > i64::MAX as u64
+            || !plain(&self.authority.id, 512)
+            || !hex_oid(&self.authority.digest, ObjectFormat::Sha256)
+        {
+            return Err("invalid delegation authority reference".into());
+        }
+        Ok(PreparedDelegation {
+            digest: format!("{:x}", Sha256::digest(raw)),
+            raw: raw.to_vec(),
+            issuer: self.issuer,
+            subject: self.subject,
+            subject_public_key: self.subject_public_key,
+            actions,
+            repositories,
+            profile_kinds: self.profile_kinds,
+            max_concurrent_attempts: self.max_concurrent_attempts,
+            expires_unix_ms: self.expires_unix_ms,
+            revocation_epoch: self.revocation_epoch,
+            child_delegation: self.child_delegation,
+            policy_revision: self.policy_revision,
+            project_store: self.project_store,
+            authority: self.authority,
+        })
+    }
+}
