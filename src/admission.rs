@@ -40,6 +40,68 @@ struct Candidate {
     repositories: Vec<RepositoryInput>,
     score: i64,
     sequence: u64,
+    blocker: Option<&'static str>,
+}
+
+struct Claim {
+    kind: String,
+    resource: String,
+    access: String,
+    certainty: String,
+}
+
+fn claim_row(row: (String, String, String, String)) -> Claim {
+    Claim { kind: row.0, resource: row.1, access: row.2, certainty: row.3 }
+}
+
+fn split_claim_path(path: &str) -> (bool, Vec<&str>) {
+    let directory = path.ends_with('/');
+    let trimmed = path.trim_end_matches('/');
+    (directory, trimmed.split('/').filter(|part| !part.is_empty()).collect())
+}
+
+fn glob_segment(segment: &str) -> bool {
+    segment.contains('*') || segment.contains('?') || segment.contains('[')
+}
+
+/// Exact files compare literally. A glob or directory prefix overlaps unless a
+/// concrete segment proves the paths are in different directories.
+fn paths_could_overlap(left: &str, right: &str) -> bool {
+    let (left_dir, left_segs) = split_claim_path(left);
+    let (right_dir, right_segs) = split_claim_path(right);
+    if left_segs.is_empty() || right_segs.is_empty() {
+        return true;
+    }
+    let shared = left_segs.len().min(right_segs.len());
+    for index in 0..shared {
+        let (left_part, right_part) = (left_segs[index], right_segs[index]);
+        if left_part.contains("**") || right_part.contains("**") {
+            return true;
+        }
+        if left_part != right_part && !glob_segment(left_part) && !glob_segment(right_part) {
+            return false;
+        }
+    }
+    if left_segs.len() == right_segs.len() {
+        return true;
+    }
+    if left_segs.len() < right_segs.len() { left_dir } else { right_dir }
+}
+
+fn claims_conflict(left: &Claim, right: &Claim) -> bool {
+    if left.kind != right.kind {
+        return false;
+    }
+    if left.kind == "named" {
+        return left.resource == right.resource && (left.access == "write" || right.access == "write");
+    }
+    if left.kind != "path" {
+        return true;
+    }
+    if left.certainty == "exact" && right.certainty == "exact" {
+        return left.resource == right.resource && (left.access == "write" || right.access == "write");
+    }
+    paths_could_overlap(&left.resource, &right.resource)
 }
 
 fn unused_binding(state: &Snapshot, task: &TaskId) -> Option<RuntimeBinding> {
@@ -55,7 +117,17 @@ fn unused_binding(state: &Snapshot, task: &TaskId) -> Option<RuntimeBinding> {
     }).cloned()
 }
 
-fn ready_candidates(db: &mut SqliteStore, state: &Snapshot, now: i64) -> Result<Vec<Candidate>> {
+fn held_claims(db: &SqliteStore, state: &Snapshot) -> Result<Vec<(TaskId, Claim)>> {
+    let mut held = Vec::new();
+    for attempt in state.attempts.iter().filter(|attempt| attempt.retains_capacity()) {
+        for row in db.resource_claims_for(attempt.task.as_str())? {
+            held.push((attempt.task.clone(), claim_row(row)));
+        }
+    }
+    Ok(held)
+}
+
+fn rank_candidates(db: &mut SqliteStore, state: &Snapshot, now: i64) -> Result<Vec<Candidate>> {
     let scheduler = state.scheduler.as_ref().context("scheduler missing")?;
     let control = state.control.as_ref().context("project control missing")?;
     if control.state != ProjectState::Active || control.reconciliation_required {
@@ -65,6 +137,10 @@ fn ready_candidates(db: &mut SqliteStore, state: &Snapshot, now: i64) -> Result<
     if retained >= scheduler.policy.max_active_workers as usize {
         return Ok(Vec::new());
     }
+    // Consult claims only while admission is on. The hold is the attempt, and
+    // it lasts until termination_observed. Cancel does not clear it.
+    let admission_on = db.factory_admission_enabled()?;
+    let held = if admission_on { held_claims(db, state)? } else { Vec::new() };
     let mut ranked = Vec::new();
     for record in &scheduler.queue {
         let Some(task) = state.tasks.iter().find(|task| task.id == record.task && task.state == TaskState::Queued && task.active_attempt.is_none()) else { continue };
@@ -82,10 +158,24 @@ fn ready_candidates(db: &mut SqliteStore, state: &Snapshot, now: i64) -> Result<
             evidence: VersionedReference { id: edge.satisfaction_id.clone(), revision: 1, digest: edge.satisfaction_id },
         }).collect::<Vec<_>>();
         let score = (now - record.enqueued_unix_ms) / 60_000 + i64::from(record.priority);
-        ranked.push(Candidate { task: task.clone(), binding, dependencies, repositories, score, sequence: record.enqueue_sequence });
+        let blocker = if admission_on {
+            let claims = db.resource_claims_for(task.id.as_str())?.into_iter().map(claim_row).collect::<Vec<_>>();
+            if claims.iter().any(|claim| held.iter().any(|(holder, held_claim)| holder != &task.id && claims_conflict(claim, held_claim))) {
+                Some("resource_conflict")
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        ranked.push(Candidate { task: task.clone(), binding, dependencies, repositories, score, sequence: record.enqueue_sequence, blocker });
     }
     ranked.sort_by(|left, right| right.score.cmp(&left.score).then(left.sequence.cmp(&right.sequence)).then(left.task.id.cmp(&right.task.id)));
     Ok(ranked)
+}
+
+fn ready_candidates(db: &mut SqliteStore, state: &Snapshot, now: i64) -> Result<Vec<Candidate>> {
+    Ok(rank_candidates(db, state, now)?.into_iter().filter(|candidate| candidate.blocker.is_none()).collect())
 }
 
 fn binding_profiles<'a>(profiles: &'a [FrozenProfile], control: &ProjectControl, binding: &RuntimeBinding) -> Vec<&'a FrozenProfile> {
@@ -183,4 +273,306 @@ pub fn admit_once(project: &Path) -> Result<()> {
         record_missing_grant(&mut db, &candidate.task.id, head, now)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn readiness_now(project: &Path) -> Result<Vec<Candidate>> {
+    let now = jiff::Timestamp::now().as_millisecond();
+    let mut db = open_store(project)?;
+    let state = db.read_snapshot(None)?;
+    rank_candidates(&mut db, &state, now)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::SqliteStore;
+
+    fn claim(kind: &str, resource: &str, access: &str, certainty: &str) -> Claim {
+        Claim { kind: kind.into(), resource: resource.into(), access: access.into(), certainty: certainty.into() }
+    }
+
+    #[test]
+    fn overlap_rules_block_exclusive_writes_named_resources_and_uncertain_paths() {
+        let read = claim("path", "README.md", "read", "exact");
+        let write = claim("path", "README.md", "write", "exact");
+        assert!(!claims_conflict(&read, &read));
+        assert!(claims_conflict(&write, &read));
+        assert!(!claims_conflict(&claim("path", "src/a.rs", "write", "exact"), &claim("path", "src/b.rs", "write", "exact")));
+        assert!(claims_conflict(&claim("path", "migrations/", "read", "uncertain"), &claim("path", "migrations/0035_resource_claims.sql", "read", "exact")));
+        assert!(claims_conflict(&claim("path", "src/*.rs", "read", "uncertain"), &claim("path", "src/lib.rs", "read", "exact")));
+        assert!(!claims_conflict(&claim("path", "src/*.rs", "read", "uncertain"), &claim("path", "docs/lib.rs", "read", "exact")));
+        assert!(claims_conflict(&claim("named", "schema", "write", "exact"), &claim("named", "schema", "read", "exact")));
+        assert!(!claims_conflict(&claim("named", "schema", "read", "exact"), &claim("named", "schema", "read", "exact")));
+        assert!(!claims_conflict(&claim("named", "schema", "write", "exact"), &claim("named", "lockfile", "write", "exact")));
+        assert!(!claims_conflict(&claim("path", "migrations/", "write", "uncertain"), &claim("named", "schema", "write", "exact")));
+    }
+
+    fn user_version(path: &Path) -> u32 {
+        rusqlite::Connection::open(path).unwrap().query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap()
+    }
+    fn table_exists(path: &Path, name: &str) -> bool {
+        rusqlite::Connection::open(path).unwrap().query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)", [name], |row| row.get(0)).unwrap()
+    }
+
+    #[test]
+    fn upgrade_v1_from_34_to_35_and_create_end_at_user_version_35() {
+        let fresh = tempfile::tempdir().unwrap();
+        let created_path = fresh.path().join("state.db");
+        let created = SqliteStore::create(&created_path).unwrap();
+        drop(created);
+        assert_eq!(user_version(&created_path), 35);
+        assert!(table_exists(&created_path, "resource_claims"));
+        let open_fn = include_str!("store/mod.rs").split("pub fn open").nth(1).unwrap().split("pub fn integrity_check").next().unwrap();
+        assert!(!open_fn.contains("upgrade_v1"));
+        assert!(!open_fn.contains("0035_resource_claims"));
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        let mut db = SqliteStore::create(&path).unwrap();
+        db.commit(Commit { expected_head: 0, mutations: vec![Mutation::Task { expected: None, next: Task { id: TaskId::new("kept").unwrap(), revision: 1, state: TaskState::Draft, title: "kept".into(), active_attempt: None } }] }).unwrap();
+        drop(db);
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        let sequence: i64 = raw.query_row("SELECT MAX(sequence) FROM events", [], |row| row.get(0)).unwrap();
+        raw.execute_batch("DROP TABLE resource_claims; UPDATE store_meta SET schema_version=34; PRAGMA user_version=34;").unwrap();
+        raw.execute(
+            "INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq) VALUES('kept',1,NULL,'/tmp/project',0,'/tmp/repo','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','sha1',NULL,'verify_only',x'61',?1,?2)",
+            rusqlite::params!["ab".repeat(32), sequence],
+        ).unwrap();
+        raw.execute("INSERT INTO contract_scope_paths(task_id,contract_revision,ordinal,path,access,certainty) VALUES('kept',1,0,'migrations/','write','uncertain')", []).unwrap();
+        raw.execute("INSERT INTO contract_scope_paths(task_id,contract_revision,ordinal,path,access,certainty) VALUES('kept',1,1,'src/lib.rs','read','exact')", []).unwrap();
+        raw.execute("INSERT INTO contract_named_resources(task_id,contract_revision,name,access) VALUES('kept',1,'schema','write')", []).unwrap();
+        drop(raw);
+        let mut db = SqliteStore::open(&path).unwrap();
+        assert_eq!(user_version(&path), 34);
+        assert!(!table_exists(&path, "resource_claims"));
+        assert_eq!(db.read_snapshot(None).unwrap().tasks[0].title, "kept");
+        db.upgrade_v1().unwrap();
+        assert_eq!(user_version(&path), 35);
+        let claims: Vec<(i64, String, String, String, String)> = {
+            let raw = rusqlite::Connection::open(&path).unwrap();
+            let mut stmt = raw.prepare("SELECT ordinal, kind, resource, access, certainty FROM resource_claims ORDER BY ordinal").unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))).unwrap().map(|row| row.unwrap()).collect()
+        };
+        assert_eq!(claims, vec![
+            (0, "path".into(), "migrations/".into(), "write".into(), "uncertain".into()),
+            (1, "path".into(), "src/lib.rs".into(), "read".into(), "exact".into()),
+            (64, "named".into(), "schema".into(), "write".into(), "exact".into()),
+        ]);
+        assert!(rusqlite::Connection::open(&path).unwrap().execute("DELETE FROM resource_claims", []).is_err());
+        let mut reopened = SqliteStore::open(&path).unwrap();
+        assert_eq!(user_version(&path), 35);
+        assert_eq!(reopened.read_snapshot(None).unwrap().schema_version, 35);
+    }
+
+    struct Spec {
+        id: &'static str,
+        priority: i32,
+        age_ms: i64,
+        paths: &'static [(&'static str, &'static str)],
+        named: &'static [(&'static str, &'static str)],
+    }
+
+    fn git_commit(repo: &std::path::Path) -> String {
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("/usr/bin/git").arg("-C").arg(repo).args(args).env_clear().env("PATH", "/usr/bin:/bin").env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@example.com").env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@example.com").output().unwrap();
+            assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-b", "main"]);
+        std::fs::write(repo.join("README.md"), "a").unwrap();
+        git(&["add", "README.md"]);
+        git(&["commit", "-m", "a"]);
+        git(&["rev-parse", "HEAD"])
+    }
+
+    fn plant_profile(db_path: &Path) {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::MetadataExt;
+        let canonical = std::fs::canonicalize(db_path).unwrap();
+        let metadata = std::fs::metadata(&canonical).unwrap();
+        let profile = crate::domain::profile::fixture(crate::migration::ConfigReference { path: "/no/such/admission-config.toml".into(), digest: None });
+        let reference = profile.reference().unwrap();
+        let report = serde_json::json!({"preparation":{"profile":profile,"reference":reference,"launchable":true,"protocol_capable":false,"certified":false},"source_store":[canonical, metadata.dev(), metadata.ino()]});
+        let text = serde_json::to_string(&report).unwrap();
+        let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+        let sequence: i64 = rusqlite::Connection::open(db_path).unwrap().query_row("SELECT MAX(sequence) FROM events", [], |row| row.get(0)).unwrap();
+        rusqlite::Connection::open(db_path).unwrap().execute("INSERT INTO native_profiles(profile_digest,report,report_digest,sequence) VALUES(?1,?2,?3,?4)", rusqlite::params![reference.digest, text, digest, sequence]).unwrap();
+    }
+
+    fn admission_on(db_path: &Path) {
+        let column = ["factory", "_admission"].concat();
+        rusqlite::Connection::open(db_path).unwrap().execute(&format!("UPDATE project_control SET {column}=?1 WHERE singleton=1"), ["on"]).unwrap();
+    }
+
+    fn world(cap: u32, specs: &[Spec]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(project.join(".state")).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        let oid = git_commit(&repo);
+        let repo = std::fs::canonicalize(&repo).unwrap();
+        let db_path = project.join(".state/state.db");
+        let mut db = SqliteStore::create(&db_path).unwrap();
+        let now = jiff::Timestamp::now().as_millisecond();
+        db.commit(Commit { expected_head: 0, mutations: specs.iter().map(|spec| Mutation::Task { expected: None, next: Task { id: TaskId::new(spec.id).unwrap(), revision: 1, state: TaskState::Draft, title: spec.id.into(), active_attempt: None } }).collect() }).unwrap();
+        for spec in specs {
+            let id = TaskId::new(spec.id).unwrap();
+            let head = db.read_snapshot(None).unwrap().head;
+            db.create_runtime(Some(&id), Some(1), head, &RuntimeRoute::default()).unwrap();
+            let head = db.read_snapshot(None).unwrap().head;
+            db.queue_task(&id, 2, head, &QueueRequest { priority: spec.priority, dependencies: vec![] }, now - spec.age_ms).unwrap();
+        }
+        let snapshot = db.read_snapshot(None).unwrap();
+        db.set_scheduler_policy(snapshot.head, snapshot.scheduler.unwrap().policy.revision, cap, 3).unwrap();
+        let snapshot = db.read_snapshot(None).unwrap();
+        let observations = snapshot.runtime_bindings.iter().map(|binding| {
+            let revision = binding.task.as_ref().and_then(|id| snapshot.tasks.iter().find(|task| &task.id == id).map(|task| task.revision));
+            crate::reconcile::RuntimeObservation { binding: binding.id.clone(), binding_revision: binding.revision, task_revision: revision, observed_unix_ms: now, collector: "herdr-git-v1".into(), ..crate::reconcile::RuntimeObservation::default() }
+        }).collect::<Vec<_>>();
+        db.record_observations(snapshot.head, &observations).unwrap();
+        let snapshot = db.read_snapshot(None).unwrap();
+        db.set_project_state(snapshot.head, snapshot.control.unwrap().revision, ProjectState::Active, now, None).unwrap();
+        let store = std::fs::canonicalize(&db_path).unwrap().display().to_string();
+        for spec in specs {
+            let head = db.read_snapshot(None).unwrap().head;
+            let mut bytes = serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "project_store": store,
+                "expected_head": head,
+                "task_id": spec.id,
+                "contract_revision": 1,
+                "deliverable": spec.id,
+                "non_goals": "no launch",
+                "acceptance_policies": [{"id": "builds", "text": "tests pass"}],
+                "repository": repo.display().to_string(),
+                "base_oid": oid,
+                "object_format": "sha1",
+                "dependencies": [],
+                "scope": {
+                    "paths": spec.paths.iter().map(|(path, access)| serde_json::json!({"path": path, "access": access})).collect::<Vec<_>>(),
+                    "named_resources": spec.named.iter().map(|(name, access)| serde_json::json!({"name": name, "access": access})).collect::<Vec<_>>()
+                },
+                "capability_flags": [],
+                "profile_kind": "codex",
+                "retry_class": "none",
+                "result_schema_id": "result-v1",
+                "route": "verify_only",
+                "authority": {"id": "owner-approval-policy", "revision": 1, "digest": "ab".repeat(32)}
+            })).unwrap();
+            bytes.push(b'\n');
+            db.install_contract(&PreparedContract::parse_verified(&bytes).unwrap()).unwrap();
+        }
+        drop(db);
+        plant_profile(&db_path);
+        admission_on(&db_path);
+        (root, project)
+    }
+
+    fn blockers(project: &Path) -> Vec<(String, i64, Option<&'static str>)> {
+        readiness_now(project).unwrap().into_iter().map(|candidate| (candidate.task.id.as_str().to_string(), candidate.score, candidate.blocker)).collect()
+    }
+    fn attempt_tasks(project: &Path) -> Vec<String> {
+        let mut db = SqliteStore::open(&project.join(".state/state.db")).unwrap();
+        let mut tasks = db.read_snapshot(None).unwrap().attempts.into_iter().map(|attempt| attempt.task.as_str().to_string()).collect::<Vec<_>>();
+        tasks.sort();
+        tasks
+    }
+    fn grant_and_admit(project: &Path) -> Option<String> {
+        let inputs = prepared_admission_inputs(project).unwrap()?;
+        let task = inputs.task.as_str().to_string();
+        let mut db = SqliteStore::open(&project.join(".state/state.db")).unwrap();
+        let now = jiff::Timestamp::now().as_millisecond();
+        let grant = ApprovalGrant { version: 1, scope: ApprovalScope::for_launch(&inputs).unwrap(), policy: inputs.effective_profile.unwrap().permission_policy, issued_unix_ms: 0, expires_unix_ms: now + 3_600_000 };
+        let head = db.read_snapshot(None).unwrap().head;
+        db.install_approval(&PreparedApproval { grant }, head, now).unwrap();
+        drop(db);
+        admit_once(project).unwrap();
+        Some(task)
+    }
+
+    #[test]
+    fn disjoint_tasks_stay_ready_and_overlapping_paths_do_not_both_reserve() {
+        let (_root, project) = world(2, &[
+            Spec { id: "early", priority: 0, age_ms: 120 * 60_000, paths: &[("migrations/", "write")], named: &[] },
+            Spec { id: "late", priority: 20, age_ms: 0, paths: &[("migrations/0035_resource_claims.sql", "write")], named: &[] },
+            Spec { id: "other", priority: 0, age_ms: 0, paths: &[("src/other.rs", "write")], named: &[] },
+        ]);
+        let ranked = blockers(&project);
+        assert_eq!(ranked.iter().map(|(task, _, _)| task.as_str()).collect::<Vec<_>>(), vec!["early", "late", "other"]);
+        assert!(ranked.iter().all(|(_, _, blocker)| blocker.is_none()));
+        assert!(ranked[0].1 > ranked[1].1, "aged priority still outranks a newer higher priority");
+        assert_eq!(grant_and_admit(&project).as_deref(), Some("early"));
+        let ranked = blockers(&project);
+        assert_eq!(ranked.iter().find(|(task, _, _)| task == "late").unwrap().2, Some("resource_conflict"));
+        assert_eq!(ranked.iter().find(|(task, _, _)| task == "other").unwrap().2, None);
+        assert_eq!(attempt_tasks(&project), vec!["early".to_string()]);
+        assert_eq!(grant_and_admit(&project).as_deref(), Some("other"));
+        assert_eq!(attempt_tasks(&project), vec!["early".to_string(), "other".to_string()]);
+        assert!(grant_and_admit(&project).is_none());
+        assert_eq!(attempt_tasks(&project), vec!["early".to_string(), "other".to_string()]);
+    }
+
+    #[test]
+    fn shared_reads_proceed_and_named_write_blocks_the_later_reader() {
+        let (_root, project) = world(2, &[
+            Spec { id: "read_old", priority: 0, age_ms: 120 * 60_000, paths: &[("README.md", "read")], named: &[("schema", "read")] },
+            Spec { id: "read_new", priority: 20, age_ms: 0, paths: &[("README.md", "read")], named: &[("schema", "read")] },
+        ]);
+        assert!(blockers(&project).iter().all(|(_, _, blocker)| blocker.is_none()));
+        assert_eq!(grant_and_admit(&project).as_deref(), Some("read_old"));
+        assert_eq!(grant_and_admit(&project).as_deref(), Some("read_new"));
+        assert_eq!(attempt_tasks(&project), vec!["read_new".to_string(), "read_old".to_string()]);
+
+        let (_root, project) = world(2, &[
+            Spec { id: "writer", priority: 0, age_ms: 120 * 60_000, paths: &[], named: &[("schema", "write")] },
+            Spec { id: "reader", priority: 20, age_ms: 0, paths: &[], named: &[("schema", "read")] },
+        ]);
+        assert_eq!(grant_and_admit(&project).as_deref(), Some("writer"));
+        assert_eq!(blockers(&project)[0], ("reader".into(), blockers(&project)[0].1, Some("resource_conflict")));
+        assert!(grant_and_admit(&project).is_none());
+        assert_eq!(attempt_tasks(&project), vec!["writer".to_string()]);
+    }
+
+    #[test]
+    fn cancel_does_not_free_a_slot_or_a_claim_before_termination() {
+        let (_root, project) = world(2, &[
+            Spec { id: "early", priority: 0, age_ms: 120 * 60_000, paths: &[("migrations/", "write")], named: &[] },
+            Spec { id: "late", priority: 20, age_ms: 0, paths: &[("migrations/0035_resource_claims.sql", "read")], named: &[] },
+            Spec { id: "other", priority: 0, age_ms: 0, paths: &[("src/other.rs", "write")], named: &[] },
+        ]);
+        assert_eq!(grant_and_admit(&project).as_deref(), Some("early"));
+        let db_path = project.join(".state/state.db");
+        let mut db = SqliteStore::open(&db_path).unwrap();
+        let snapshot = db.read_snapshot(None).unwrap();
+        let attempt = snapshot.attempts.iter().find(|attempt| attempt.task.as_str() == "early").unwrap().clone();
+        let operation = snapshot.attempt_inputs.iter().find(|input| input.attempt == attempt.id).unwrap().operation.clone();
+        let now = jiff::Timestamp::now().as_millisecond();
+        db.claim_operation(&operation, 1, "worker", now, 1_000).unwrap();
+        let snapshot = db.read_snapshot(None).unwrap();
+        let attempt = snapshot.attempts.iter().find(|attempt| attempt.task.as_str() == "early").unwrap().clone();
+        let cancelled = db.cancel_attempt(&attempt.id, attempt.revision, snapshot.head, "stop before termination", now).unwrap();
+        assert!(!cancelled.released);
+        let snapshot = db.read_snapshot(None).unwrap();
+        assert!(snapshot.attempts.iter().any(|attempt| attempt.task.as_str() == "early" && attempt.retains_capacity()));
+        let report = db.queue_report(now).unwrap();
+        assert_eq!(report.retained_attempts, 1);
+        assert_eq!(report.available_slots, 1);
+        drop(db);
+        assert_eq!(blockers(&project).iter().find(|(task, _, _)| task == "late").unwrap().2, Some("resource_conflict"));
+        assert_eq!(grant_and_admit(&project).as_deref(), Some("other"));
+        assert!(snapshot_retains(&project, "early"));
+        assert_eq!(attempt_tasks(&project).len(), 2);
+        rusqlite::Connection::open(&db_path).unwrap().execute("UPDATE attempts SET termination_observed=1 WHERE task_id='early'", []).unwrap();
+        assert!(!snapshot_retains(&project, "early"));
+        assert_eq!(blockers(&project).iter().find(|(task, _, _)| task == "late").unwrap().2, None);
+        assert_eq!(grant_and_admit(&project).as_deref(), Some("late"));
+        assert!(attempt_tasks(&project).contains(&"late".to_string()));
+    }
+
+    fn snapshot_retains(project: &Path, task: &str) -> bool {
+        let mut db = SqliteStore::open(&project.join(".state/state.db")).unwrap();
+        db.read_snapshot(None).unwrap().attempts.iter().any(|attempt| attempt.task.as_str() == task && attempt.retains_capacity())
+    }
 }

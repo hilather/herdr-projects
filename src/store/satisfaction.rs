@@ -642,6 +642,31 @@ impl SqliteStore {
         }
         Ok(Some(pins))
     }
+
+    /// Latest contract revision only. Empty when this store has no claim table.
+    pub(crate) fn resource_claims_for(&self, task_id: &str) -> Result<Vec<(String, String, String, String)>> {
+        let version: u32 = self.connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version < 35 {
+            return Ok(Vec::new());
+        }
+        let revision: Option<i64> = self.connection.query_row(
+            "SELECT MAX(contract_revision) FROM task_contracts WHERE task_id=?1",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        let Some(revision) = revision else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.connection.prepare(
+            "SELECT kind, resource, access, certainty FROM resource_claims WHERE task_id=?1 AND contract_revision=?2 ORDER BY ordinal",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![task_id, revision], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
 }
 
 fn git_tree(repository: &str, commit: &str) -> Option<String> {
@@ -853,7 +878,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state.db");
         let mut db = SqliteStore::create(&path).unwrap();
-        assert_eq!(user_version(&db.connection), 34);
+        assert_eq!(user_version(&db.connection), 35);
         db.commit(Commit {
             expected_head: 0,
             mutations: vec![
@@ -878,7 +903,7 @@ mod tests {
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
         raw.execute_batch(
-            "DROP TABLE IF EXISTS delegation_stop_obligations; DROP TABLE IF EXISTS delegation_revocations; DROP TABLE IF EXISTS delegation_grants; DROP TABLE IF EXISTS capability_evidence; DROP TABLE IF EXISTS contract_named_resources; DROP TABLE IF EXISTS contract_scope_paths; DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; DROP TABLE IF EXISTS dependency_satisfactions; DROP TABLE IF EXISTS factory_admission_policies;
+            "DROP TABLE IF EXISTS resource_claims; DROP TABLE IF EXISTS delegation_stop_obligations; DROP TABLE IF EXISTS delegation_revocations; DROP TABLE IF EXISTS delegation_grants; DROP TABLE IF EXISTS capability_evidence; DROP TABLE IF EXISTS contract_named_resources; DROP TABLE IF EXISTS contract_scope_paths; DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; DROP TABLE IF EXISTS dependency_satisfactions; DROP TABLE IF EXISTS factory_admission_policies;
              CREATE TABLE task_dependencies_v10 (
                 task_id TEXT NOT NULL, predecessor_id TEXT NOT NULL,
                 requirement TEXT NOT NULL CHECK(requirement IN ('verified_result','integration_candidate','landed_commit')),
@@ -917,7 +942,7 @@ mod tests {
         ));
         assert_eq!(user_version(&db.connection), 25);
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 34);
+        assert_eq!(user_version(&db.connection), 35);
         assert_eq!(dependencies(&db.connection), preserved);
         assert!(
             preserved
@@ -962,7 +987,7 @@ mod tests {
         check_schema(&db.connection).unwrap();
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 34);
+        assert_eq!(user_version(&reopened.connection), 35);
     }
 
     #[test]

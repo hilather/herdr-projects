@@ -401,14 +401,14 @@ mod tests {
     fn upgrade_v1_from_33_to_34_preserves_denials_and_create_ends_at_34() {
         let fresh = tempfile::tempdir().unwrap();
         let created = SqliteStore::create(&fresh.path().join("state.db")).unwrap();
-        assert_eq!(user_version(&created.connection), 34);
+        assert_eq!(user_version(&created.connection), 35);
         assert_eq!(
             created
                 .connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            34
+            35
         );
         assert!(table_exists(&created.connection, "delegation_grants"));
         assert!(table_exists(&created.connection, "delegation_revocations"));
@@ -428,10 +428,6 @@ mod tests {
         assert!(!open.contains("0034_delegation_grants"));
         let controller = include_str!("../canonical_controller.rs");
         assert!(controller.contains("const PREPARED_LAUNCH_DISPATCH_ENABLED: bool = true"));
-        assert!(
-            !std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/admission.rs"))
-                .exists()
-        );
         drop(created);
 
         let temp = tempfile::tempdir().unwrap();
@@ -452,7 +448,7 @@ mod tests {
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
         raw.execute_batch(
-            "DROP TABLE IF EXISTS delegation_stop_obligations; DROP TABLE IF EXISTS delegation_revocations; DROP TABLE IF EXISTS delegation_grants;
+            "DROP TABLE IF EXISTS resource_claims; DROP TABLE IF EXISTS delegation_stop_obligations; DROP TABLE IF EXISTS delegation_revocations; DROP TABLE IF EXISTS delegation_grants;
              DROP TRIGGER IF EXISTS authority_denials_no_update; DROP TRIGGER IF EXISTS authority_denials_no_delete;
              CREATE TABLE authority_denials_v26 (
                 id TEXT PRIMARY KEY NOT NULL, unix_ms INTEGER NOT NULL,
@@ -482,13 +478,13 @@ mod tests {
         assert_eq!(user_version(&db.connection), 33);
         assert!(!table_exists(&db.connection, "delegation_grants"));
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 34);
+        assert_eq!(user_version(&db.connection), 35);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            34
+            35
         );
         let kept: i64 = db
             .connection
@@ -514,7 +510,7 @@ mod tests {
         check_schema(&db.connection).unwrap();
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 34);
+        assert_eq!(user_version(&reopened.connection), 35);
         assert_eq!(
             reopened
                 .connection
