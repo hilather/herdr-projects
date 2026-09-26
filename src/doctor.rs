@@ -272,6 +272,24 @@ fn report(
     (out, healthy)
 }
 
+/// OS is an argument so a Linux test can assert the unsupported label.
+/// There is no macOS-only factory path: any other OS, and any live SSH route, refuses launch.
+fn factory_platform_label(target_os: &str, live_ssh: bool) -> &'static str {
+    if target_os == "linux" && !live_ssh {
+        "linux"
+    } else {
+        "unsupported"
+    }
+}
+
+fn factory_path_detail(label: &str) -> &'static str {
+    if label == "linux" {
+        "linux local only"
+    } else {
+        "unsupported; canonical launch does not run"
+    }
+}
+
 /// Identity of this binary only. Opening a project database would be a migration path.
 fn write_compiled_features(out: &mut String) {
     #[cfg(feature = "state-store")]
@@ -305,8 +323,20 @@ fn write_compiled_features(out: &mut String) {
         );
         let _ = writeln!(out, "admission: absent");
     }
-    let platform = if cfg!(target_os = "linux") { "linux" } else { "unsupported" };
+    // This process is not an SSH route. macOS and live SSH stay unsupported labels.
+    let platform = factory_platform_label(std::env::consts::OS, false);
     let _ = writeln!(out, "platform: {platform}");
+    let _ = writeln!(
+        out,
+        "macOS: {}; canonical launch does not run",
+        factory_platform_label("macos", false)
+    );
+    let _ = writeln!(
+        out,
+        "live SSH: {}; canonical launch does not run",
+        factory_platform_label(std::env::consts::OS, true)
+    );
+    let _ = writeln!(out, "factory-path: {}", factory_path_detail(platform));
     let _ = writeln!(
         out,
         "upgrade: existing projects upgrade only through `migration PROJECT upgrade-store`"
@@ -479,10 +509,21 @@ mod tests {
             );
             assert!(text.contains("admission: absent\n"), "{text}");
         }
+        assert!(text.contains("macOS: unsupported; canonical launch does not run\n"), "{text}");
+        assert!(text.contains("live SSH: unsupported; canonical launch does not run\n"), "{text}");
         #[cfg(target_os = "linux")]
-        assert!(text.contains("platform: linux\n"), "{text}");
+        {
+            assert!(text.contains("platform: linux\n"), "{text}");
+            assert!(text.contains("factory-path: linux local only\n"), "{text}");
+        }
         #[cfg(not(target_os = "linux"))]
-        assert!(text.contains("platform: unsupported\n"), "{text}");
+        {
+            assert!(text.contains("platform: unsupported\n"), "{text}");
+            assert!(
+                text.contains("factory-path: unsupported; canonical launch does not run\n"),
+                "{text}"
+            );
+        }
         assert!(!text.contains("launching"), "{text}");
         assert_eq!(
             std::fs::read(project.dir().join(".state/project.json")).unwrap(),
@@ -495,5 +536,26 @@ mod tests {
         assert!(!project.dir().join(".state/state.db").exists());
         assert!(!project.dir().join(".state/format.json").exists());
         assert!(!project.dir().join(".state/migration").exists());
+    }
+
+    #[test]
+    fn unsupported_label_covers_macos_and_live_ssh_without_a_macos_target() {
+        assert_eq!(factory_platform_label("linux", false), "linux");
+        assert_eq!(factory_platform_label("macos", false), "unsupported");
+        assert_eq!(factory_platform_label("linux", true), "unsupported");
+        assert_eq!(factory_platform_label("macos", true), "unsupported");
+        assert_eq!(
+            factory_path_detail("unsupported"),
+            "unsupported; canonical launch does not run"
+        );
+        assert_eq!(
+            factory_path_detail(factory_platform_label("macos", false)),
+            "unsupported; canonical launch does not run"
+        );
+        assert_eq!(
+            factory_path_detail(factory_platform_label("linux", true)),
+            "unsupported; canonical launch does not run"
+        );
+        assert_eq!(factory_path_detail("linux"), "linux local only");
     }
 }
