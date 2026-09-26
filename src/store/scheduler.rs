@@ -76,40 +76,46 @@ impl SqliteStore {
         let result=head(&tx)?;tx.commit()?;Ok(result)
     }
     pub fn queue_report(&mut self,now:i64)->Result<QueueReport> {
-        super::delivery::now_check(now)?;let tx=self.connection.transaction()?;schema(&tx)?;let snapshot=read(&tx)?;let tasks=read_tasks(&tx)?;let attempts=read_attempts(&tx)?;let control=super::control::read(&tx)?;
-        let admission_on=super::satisfaction::admission_enabled(&tx)?;
-        let retained_attempts=attempts.iter().filter(|a|a.retains_capacity()).count();let available_slots=(snapshot.policy.max_active_workers as usize).saturating_sub(retained_attempts);let mut entries=Vec::new();
-        let budget_blockers=super::budget::report(&tx,false)?.blockers;
+        super::delivery::now_check(now)?;let tx=self.connection.transaction()?;schema(&tx)?;let scheduler=read(&tx)?;let tasks=read_tasks(&tx)?;let attempts=read_attempts(&tx)?;let control=super::control::read(&tx)?;
         let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
         let approvals=if version>=13 {super::approvals::read_all(&tx)?}else{Vec::new()};
-        for record in &snapshot.queue {
-            let task=tasks.iter().find(|t|t.id==record.task).ok_or(StoreError::Conflict)?;let mut blockers=Vec::new();
-            if task.state!=TaskState::Queued {blockers.push(format!("task_state:{:?}",task.state));}
-            if control.state!=ProjectState::Active||control.reconciliation_required {blockers.push("project_not_admitted".into());}
-            if available_slots==0{blockers.push("capacity_full".into());}
-            if attempts.iter().any(|a|a.task==task.id&&a.retains_capacity()){blockers.push("task_capacity_retained".into());}
-            if attempts.iter().filter(|a|a.task==task.id).count()>=snapshot.policy.max_attempts_per_task as usize {blockers.push("attempt_limit".into());}
-            for edge in &record.dependencies {
-                let predecessor=tasks.iter().find(|t|t.id==edge.predecessor).ok_or(StoreError::Conflict)?;
-                // A missing receipt stays unavailable. A valid receipt still does not admit while the flag is off.
-                if let Some(blocker)=super::satisfaction::dependency_blocker(&tx, task.id.as_str(), predecessor, edge.requirement, admission_on)? {blockers.push(blocker);}
-            }
-            // A level the selected profile has not shown. This does not certify the profile.
-            if let Some(blocker)=super::capabilities::queue_capability_blocker(&tx, task.id.as_str(), now)? {blockers.push(blocker);}
-            blockers.extend(budget_blockers.iter().cloned());
-            let signed=approvals.iter().any(|record|record.consumed.is_none()&&record.grant.scope.class==ApprovalClass::RuntimeLaunch&&record.grant.scope.task==task.id);
-            let retained_launch=attempts.iter().any(|attempt|attempt.task==task.id&&attempt.retains_capacity()&&matches!(attempt.state,AttemptState::Reserved|AttemptState::Launching|AttemptState::Running|AttemptState::AwaitingInput));
-            if !signed {blockers.push("owner_signature_not_scheduled".into());}
-            if !retained_launch {blockers.push("launch_reserve_not_scheduled".into());blockers.push("controller_requires_reserved_attempt".into());}
-            let age=now.saturating_sub(record.enqueued_unix_ms).max(0)/60_000;let score=age+record.priority as i64;
-            entries.push((record.enqueue_sequence,QueueEntry{task:task.id.clone(),task_revision:task.revision,effective_priority:score,blockers}));
-        }
-        entries.sort_by(|a,b|b.1.effective_priority.cmp(&a.1.effective_priority).then(a.0.cmp(&b.0)).then(a.1.task.cmp(&b.1.task)));
-        let reported:Vec<_>=entries.into_iter().map(|(_,entry)|entry).collect();
+        let reported=queue_blockers(&tx,now,&tasks,&attempts,&scheduler,&control,&approvals)?;
+        let admission_on=super::satisfaction::admission_enabled(&tx)?;
+        let retained_attempts=attempts.iter().filter(|a|a.retains_capacity()).count();let available_slots=(scheduler.policy.max_active_workers as usize).saturating_sub(retained_attempts);
         let launch_enabled=automatic_launch_enabled(admission_on,&reported);
         let capability=CapabilityReport{prepared_dispatch:true,automatic_admission:admission_on,dependency_producers:false,integration:"unavailable",blockers:vec!["automatic_admission_does_not_draft_sign_or_reserve".into()]};
-        let report=QueueReport{head:head(&tx)?,policy:snapshot.policy,retained_attempts,available_slots,launch_enabled,capability,entries:reported};tx.commit()?;Ok(report)
+        let report=QueueReport{head:head(&tx)?,policy:scheduler.policy,retained_attempts,available_slots,launch_enabled,capability,entries:reported};tx.commit()?;Ok(report)
     }
+}
+
+pub(super) fn queue_blockers(db:&Connection,now:i64,tasks:&[Task],attempts:&[Attempt],scheduler:&SchedulerSnapshot,control:&ProjectControl,approvals:&[ApprovalRecord])->Result<Vec<QueueEntry>> {
+    let admission_on=super::satisfaction::admission_enabled(db)?;
+    let retained_attempts=attempts.iter().filter(|a|a.retains_capacity()).count();let available_slots=(scheduler.policy.max_active_workers as usize).saturating_sub(retained_attempts);
+    let budget_blockers=super::budget::report(db,false)?.blockers;let mut entries=Vec::new();
+    for record in &scheduler.queue {
+        let task=tasks.iter().find(|t|t.id==record.task).ok_or(StoreError::Conflict)?;let mut blockers=Vec::new();
+        if task.state!=TaskState::Queued {blockers.push(format!("task_state:{:?}",task.state));}
+        if control.state!=ProjectState::Active||control.reconciliation_required {blockers.push("project_not_admitted".into());}
+        if available_slots==0{blockers.push("capacity_full".into());}
+        if attempts.iter().any(|a|a.task==task.id&&a.retains_capacity()){blockers.push("task_capacity_retained".into());}
+        if attempts.iter().filter(|a|a.task==task.id).count()>=scheduler.policy.max_attempts_per_task as usize {blockers.push("attempt_limit".into());}
+        for edge in &record.dependencies {
+            let predecessor=tasks.iter().find(|t|t.id==edge.predecessor).ok_or(StoreError::Conflict)?;
+            // A missing receipt stays unavailable. A valid receipt still does not admit while the flag is off.
+            if let Some(blocker)=super::satisfaction::dependency_blocker(db, task.id.as_str(), predecessor, edge.requirement, admission_on)? {blockers.push(blocker);}
+        }
+        // A level the selected profile has not shown. This does not certify the profile.
+        if let Some(blocker)=super::capabilities::queue_capability_blocker(db, task.id.as_str(), now)? {blockers.push(blocker);}
+        blockers.extend(budget_blockers.iter().cloned());
+        let signed=approvals.iter().any(|record|record.consumed.is_none()&&record.grant.scope.class==ApprovalClass::RuntimeLaunch&&record.grant.scope.task==task.id);
+        let retained_launch=attempts.iter().any(|attempt|attempt.task==task.id&&attempt.retains_capacity()&&matches!(attempt.state,AttemptState::Reserved|AttemptState::Launching|AttemptState::Running|AttemptState::AwaitingInput));
+        if !signed {blockers.push("owner_signature_not_scheduled".into());}
+        if !retained_launch {blockers.push("launch_reserve_not_scheduled".into());blockers.push("controller_requires_reserved_attempt".into());}
+        let age=now.saturating_sub(record.enqueued_unix_ms).max(0)/60_000;let score=age+record.priority as i64;
+        entries.push((record.enqueue_sequence,QueueEntry{task:task.id.clone(),task_revision:task.revision,effective_priority:score,blockers}));
+    }
+    entries.sort_by(|a,b|b.1.effective_priority.cmp(&a.1.effective_priority).then(a.0.cmp(&b.0)).then(a.1.task.cmp(&b.1.task)));
+    Ok(entries.into_iter().map(|(_,entry)|entry).collect())
 }
 
 pub(super) fn automatic_launch_enabled(admission_on:bool, entries:&[QueueEntry])->bool {

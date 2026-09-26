@@ -31,7 +31,6 @@ impl crate::runner::Runner for ProbeBudget<'_> {
 pub fn poll(ctx:&Ctx,path:&Path,turn:u64)->Result<PollResult> {
     let path=path.canonicalize()?;
     let ownership=herdr_projects::execution_guard::ProjectGuard::acquire(&path)?;
-    // The hot path stays on read_snapshot. Targeted readers only record a mismatch.
     ensure!(herdr_projects::store::hot_path_uses_snapshot(),"hot path reader is read_snapshot");
     let mut db=herdr_projects::migration::open_active(&path)?;
     let snapshot=db.read_snapshot(None)?;
