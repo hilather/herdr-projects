@@ -471,6 +471,8 @@ fn proposal_review_requires_signed_exact_scope_and_promotion_rechecks_authority(
             decision: "approve".into(),
             reason: "Verified evidence".into(),
         },
+        read_set_version: None,
+        read_set: None,
     };
     let path = tmp.path().join("review.json");
     let sig = sign(
@@ -773,6 +775,8 @@ fn promotion_and_all_consumer_obligations_commit_or_roll_back_together() {
             decision: "approve".into(),
             reason: "Reviewed".into(),
         },
+        read_set_version: None,
+        read_set: None,
     };
     let path = tmp.path().join("review.json");
     let sig = sign(

@@ -17,6 +17,10 @@ impl SqliteStore {
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
         if let Some(auth)=authorization {
             if head(&tx)?!=auth.document.expected_head || control::read(&tx)?.config_digest!=auth.config_digest {return Err(StoreError::Conflict);}
+            if auth.document.read_set_version==Some(2) {
+                let signed=auth.document.read_set.as_ref().ok_or_else(||invalid("v2 review requires a read set"))?;
+                super::read_set::require_match(&tx,signed)?;
+            }
         } else if !cfg!(test) {return Err(invalid("verified reviewer authority required"));}
         tx.execute(
             "INSERT INTO review_decisions VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -71,12 +75,17 @@ impl SqliteStore {
             if covered!=auth.document || control::read(&tx)?.config_digest!=auth.config_digest {
                 return Err(invalid("review authority changed"));
             }
+            if auth.document.read_set_version==Some(2) {
+                let signed=auth.document.read_set.as_ref().ok_or_else(||invalid("v2 review requires a read set"))?;
+                super::read_set::require_match(&tx,signed)?;
+            }
         } else if !cfg!(test) {return Err(invalid("verified reviewer authority required"));}
         let expected = reviewed.get("event_head").and_then(|v| v.as_u64())
             .and_then(|v| v.checked_add(1)).ok_or_else(|| invalid("review event fence missing"))?;
-        // Conservative whole-state fence, including policy/validity and all
-        // dependencies. The only intervening event allowed is this review itself.
-        if head(&tx)? != expected { return Err(StoreError::Conflict); }
+        // Documents without read_set_version 2 stay on the whole-state fence.
+        // The only intervening event allowed for those is this review itself.
+        let v2=authorization.is_some_and(|auth| auth.document.read_set_version==Some(2));
+        if !v2 && head(&tx)? != expected { return Err(StoreError::Conflict); }
         let review_event: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM events WHERE sequence=?1 AND kind='memory.review_recorded' AND entity=?2)",
             params![integer(expected)?,decision.id], |r| r.get(0))?;
@@ -132,8 +141,8 @@ mod tests {
     fn schema21_upgrade_adds_empty_review_tables() {
         let temp=tempfile::tempdir().unwrap();let path=temp.path().join("state.db");
         let mut db=SqliteStore::create(&path).unwrap();
-        db.connection.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; UPDATE store_meta SET schema_version=21; PRAGMA user_version=21;").unwrap();
-        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=26;
+        db.connection.execute_batch("DROP TRIGGER IF EXISTS memory_read_set_on_record; DROP TRIGGER IF EXISTS memory_read_set_on_reclassify; DROP TRIGGER IF EXISTS memory_read_set_on_revision; DROP TRIGGER IF EXISTS memory_read_set_on_validity; DROP TRIGGER IF EXISTS memory_read_set_on_head; DROP TABLE IF EXISTS memory_scope_catalog; DROP TABLE IF EXISTS memory_required_generation; DROP TABLE IF EXISTS consumer_binding_undeliverable; DROP TABLE IF EXISTS consumer_binding_obligations; DROP TABLE IF EXISTS consumer_bindings; DROP TABLE IF EXISTS wait_replay_events; DROP TABLE IF EXISTS replan_requests; DROP TABLE IF EXISTS replan_budget_resets; DROP TABLE IF EXISTS attempt_infrastructure_retries; DROP TABLE IF EXISTS wait_conditions; DROP TABLE IF EXISTS resource_claims; DROP TABLE IF EXISTS delegation_stop_obligations; DROP TABLE IF EXISTS delegation_revocations; DROP TABLE IF EXISTS delegation_grants; DROP TABLE IF EXISTS capability_evidence; DROP TABLE IF EXISTS contract_named_resources; DROP TABLE IF EXISTS contract_scope_paths; DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; DROP TABLE IF EXISTS dependency_satisfactions; DROP TABLE IF EXISTS factory_admission_policies; ALTER TABLE project_control DROP COLUMN factory_admission; DROP TABLE IF EXISTS feedback_claims; DROP TABLE IF EXISTS feedback_items; DROP TABLE IF EXISTS integrated_commits; DROP TABLE IF EXISTS integration_candidates; DROP TABLE IF EXISTS integration_operations; DROP TABLE IF EXISTS integration_target_leases; DROP TABLE IF EXISTS integration_targets; DROP TABLE IF EXISTS verified_results; DROP TABLE IF EXISTS verification_runs; DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; UPDATE store_meta SET schema_version=21; PRAGMA user_version=21;").unwrap();
+        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=38;
         assert_eq!(db.read_snapshot(None).unwrap(),before);
         assert!(db.memory_promotion("mp-x").unwrap().is_none());
         db.integrity_check().unwrap();

@@ -66,6 +66,7 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../migrations/0037_consumer_bindings.sql"))?;
             super::consumer_bindings::backfill_from_subscriptions(&tx)?;
         }
+        if version<=37 {tx.execute_batch(include_str!("../../migrations/0038_memory_read_sets.sql"))?;}
         tx.commit()?;
         Ok(())
     }

@@ -133,6 +133,46 @@ pub struct MemoryReviewAuthorization {
     pub proposal_digest: String,
     pub record_keys: Vec<String>,
     pub review: ReviewDocument,
+    /// Absent or any value other than 2 keeps the event_head+1 promotion fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_set_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_set: Option<MemoryReadSet>,
+}
+
+/// Records a v2 signature actually read. Publication compares the whole value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryReadSet {
+    pub record_heads: Vec<ReadSetHead>,
+    pub validity_revisions: Vec<ReadSetValidity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_grant_id: Option<String>,
+    pub revocation_epoch: u64,
+    pub policy_revision: u64,
+    pub required_set_generation: u64,
+    pub scope_catalog_generations: Vec<ScopeCatalogGeneration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadSetHead {
+    pub record_id: String,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadSetValidity {
+    pub record_id: String,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeCatalogGeneration {
+    pub scope_id: String,
+    pub generation: u64,
 }
 pub(crate) struct PreparedMemoryReview {
     pub document: MemoryReviewAuthorization,
