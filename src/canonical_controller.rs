@@ -50,6 +50,29 @@ pub fn poll(ctx:&Ctx,path:&Path,turn:u64)->Result<PollResult> {
 pub fn poll_queued(ctx:&Ctx,path:&Path,turn:u64,reads:&mut observations::Reads)->Result<PollResult> {
     poll_queued_effects(ctx,path,turn,reads,None)
 }
+/// One `poll_queued_effects` wake. Compiled into debug binaries so the factory
+/// harness can exec it. Release builds do not include this entry.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+pub(crate) fn poll_project_once(project: &Path) -> Result<()> {
+    let env = crate::paths::Env::from_process()?;
+    let runner = crate::runner::RealRunner;
+    let ctx = crate::paths::Ctx {
+        env: &env,
+        root: env.home.clone(),
+        config_dir: env.config_dir(),
+        runner: &runner,
+        detached_ticker: false,
+    };
+    let pool = std::sync::Arc::new(crate::executor::Executor::new(
+        crate::executor::Limits::default(),
+        std::sync::Arc::new(crate::runner::RealRunner),
+    )?);
+    let mut reads = observations::Reads::new(pool.clone());
+    poll_queued_effects(&ctx, project, 0, &mut reads, None)?;
+    let _ = pool.stop(std::time::Duration::from_secs(2));
+    Ok(())
+}
+
 pub fn poll_queued_effects(ctx:&Ctx,path:&Path,turn:u64,reads:&mut observations::Reads,effects:Option<&mut crate::copy_jobs::Queue>)->Result<PollResult> {
     let (reachable,scheduled,error)=match reads.poll(ctx,path) {
         Ok(observations::Poll::Ready(sample))=>(sample.reachable.unwrap_or(false),sample.scheduled_work.unwrap_or(false),sample.diagnostic),

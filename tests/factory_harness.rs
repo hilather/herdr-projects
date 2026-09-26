@@ -713,9 +713,9 @@ fn vertical_slice() {
     slice::run();
 }
 
-/// Disposable A/B/C/D slice. `poll_queued_effects` lives in the binary crate, so
-/// the one reservation wake calls the same pair that function calls: `wake_enabled`,
-/// then a single `admit_once`. Fault cases call `admit_once` directly.
+/// Disposable A/B/C/D slice. Success reservations come from one exec'd
+/// `poll_queued_effects` wake. `admit_once` is only the flag-off and
+/// `integration_missing` cases.
 #[cfg(target_os = "linux")]
 mod slice {
     use super::git;
@@ -728,7 +728,10 @@ mod slice {
         verification::{self, VerifyRequest},
     };
     use sha2::{Digest, Sha256};
-    use std::{fs, os::unix::fs::MetadataExt, path::Path, time::Duration};
+    use std::{
+        collections::BTreeMap, fs, os::unix::fs::MetadataExt, path::Path, process::Command,
+        time::Duration,
+    };
 
     const PROSE: &str = "worker prose says the dependency is satisfied";
     const TARGET: &str = "refs/heads/integration";
@@ -1044,12 +1047,39 @@ mod slice {
         inputs.task.as_str().to_string()
     }
 
-    /// Admission performed by one `poll_queued_effects` wake. The flag is already on.
-    fn poll_admission_wake(project: &Path) -> Result<(), String> {
-        if !admission::wake_enabled(project) {
-            return Ok(());
-        }
-        admission::admit_once(project).map_err(|error| format!("{error:#}"))
+    fn attempt_counts(db_path: &Path) -> BTreeMap<String, i64> {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT task_id, count(*) FROM attempts GROUP BY task_id ORDER BY task_id")
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    }
+
+    /// Exec one `poll_queued_effects` wake. Only `task` may gain an attempt.
+    fn poll_reserves_only(project: &Path, db_path: &Path, task: &str) {
+        let before = attempt_counts(db_path);
+        let home = tempfile::tempdir().unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_herdr-projects"))
+            .args(["vertical-slice-poll", project.to_str().unwrap()])
+            .env_clear()
+            .env("HOME", home.path())
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "poll exited {}\n{}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let after = attempt_counts(db_path);
+        let mut expected = before;
+        *expected.entry(task.to_string()).or_insert(0) += 1;
+        assert_eq!(after, expected, "wake did not reserve only {task}");
     }
 
     fn enable_admission(db_path: &Path) {
@@ -1085,11 +1115,6 @@ mod slice {
             doc.contains("live Codex repository-editing cell is not run"),
             "vertical-slice doc must say the live cell is not run"
         );
-        let controller = include_str!("../src/canonical_controller.rs");
-        assert!(controller.contains("const PREPARED_LAUNCH_DISPATCH_ENABLED: bool = true;"));
-        assert!(controller.contains("poll_queued_effects"));
-        assert!(controller.contains("admission::wake_enabled"));
-        assert!(controller.contains("admission::admit_once"));
 
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join("project");
@@ -1412,10 +1437,7 @@ mod slice {
         assert!(admission::wake_enabled(&project));
         assert_eq!(install_grant(&db_path, &project), "c");
         assert_eq!(attempts_for(&db_path, "c"), 0);
-        poll_admission_wake(&project).unwrap();
-        assert_eq!(attempts_for(&db_path, "c"), 1, "the wake alone reserves C");
-        assert_eq!(attempts_for(&db_path, "b"), 0);
-        assert_eq!(attempts_for(&db_path, "d"), 0);
+        poll_reserves_only(&project, &db_path, "c");
 
         rusqlite::Connection::open(&db_path)
             .unwrap()
@@ -1495,8 +1517,7 @@ mod slice {
             satisfaction_text(&db_path).contains("b a integrated_commit valid integrated_commit")
         );
         assert_eq!(install_grant(&db_path, &project), "b");
-        admission::admit_once(&project).unwrap();
-        assert_eq!(attempts_for(&db_path, "b"), 1);
+        poll_reserves_only(&project, &db_path, "b");
 
         let integrated_p = integrate(&db_path, &repo, &work, &result_p, "integrate-p");
         assert_eq!(
@@ -1591,12 +1612,7 @@ mod slice {
         assert!(rows.contains("d a integrated_commit"), "{rows}");
         assert!(rows.contains("d p integrated_commit"), "{rows}");
         assert_eq!(install_grant(&db_path, &project), "d");
-        admission::admit_once(&project).unwrap();
-        assert_eq!(
-            attempts_for(&db_path, "d"),
-            1,
-            "two-parent base did not reserve D"
-        );
+        poll_reserves_only(&project, &db_path, "d");
 
         let mut db = herdr_projects::store::SqliteStore::open(&db_path).unwrap();
         let snapshot = db.read_snapshot(None).unwrap();
