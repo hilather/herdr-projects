@@ -928,14 +928,14 @@ mod tests {
         let fresh = tempfile::tempdir().unwrap();
         let fresh_path = fresh.path().join("state.db");
         let mut created = SqliteStore::create(&fresh_path).unwrap();
-        assert_eq!(user_version(&created.connection), 30);
+        assert_eq!(user_version(&created.connection), 31);
         assert_eq!(
             created
                 .connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            30
+            31
         );
         created.import_legacy(&"ab".repeat(32), &[], &[]).unwrap();
         drop(created);
@@ -961,7 +961,7 @@ mod tests {
         let before = task_row(&db.connection);
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
-        raw.execute_batch("DROP TABLE IF EXISTS dependency_satisfactions; DROP TABLE IF EXISTS factory_admission_policies; ALTER TABLE project_control DROP COLUMN factory_admission; DROP TABLE IF EXISTS feedback_claims; DROP TABLE IF EXISTS feedback_items; DROP TABLE IF EXISTS integrated_commits; DROP TABLE IF EXISTS integration_candidates; DROP TABLE IF EXISTS integration_operations; DROP TABLE IF EXISTS integration_target_leases; DROP TABLE IF EXISTS integration_targets; DROP TABLE IF EXISTS verified_results; DROP TABLE IF EXISTS verification_runs; DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; UPDATE store_meta SET schema_version=25; PRAGMA user_version=25;").unwrap();
+        raw.execute_batch("DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; DROP TABLE IF EXISTS dependency_satisfactions; DROP TABLE IF EXISTS factory_admission_policies; ALTER TABLE project_control DROP COLUMN factory_admission; DROP TABLE IF EXISTS feedback_claims; DROP TABLE IF EXISTS feedback_items; DROP TABLE IF EXISTS integrated_commits; DROP TABLE IF EXISTS integration_candidates; DROP TABLE IF EXISTS integration_operations; DROP TABLE IF EXISTS integration_target_leases; DROP TABLE IF EXISTS integration_targets; DROP TABLE IF EXISTS verified_results; DROP TABLE IF EXISTS verification_runs; DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; UPDATE store_meta SET schema_version=25; PRAGMA user_version=25;").unwrap();
         drop(raw);
         let mut db = SqliteStore::open(&path).unwrap();
         assert_eq!(user_version(&db.connection), 25);
@@ -973,20 +973,20 @@ mod tests {
         ));
         assert_eq!(task_row(&db.connection), before);
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 30);
+        assert_eq!(user_version(&db.connection), 31);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            30
+            31
         );
         assert!(table_exists(&db.connection, "task_contracts"));
         assert!(table_exists(&db.connection, "result_submissions"));
         assert_eq!(task_row(&db.connection), before);
         check_schema(&db.connection).unwrap();
         let snapshot = db.read_snapshot(None).unwrap();
-        assert_eq!(snapshot.schema_version, 30);
+        assert_eq!(snapshot.schema_version, 31);
         assert_eq!(snapshot.tasks.len(), 1);
         assert_eq!(snapshot.tasks[0].title, "do not rewrite");
         drop(db);

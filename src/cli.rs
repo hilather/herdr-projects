@@ -235,6 +235,9 @@ enum Command {
     /// Show or lease local verifier and integrator feedback. Does not reserve or satisfy.
     #[cfg(feature="state-store")]
     Feedback { slug:String, #[command(subcommand)] command:FeedbackCommand },
+    /// Store an untrusted plan revision. Does not verify a signature, install a contract, or reserve.
+    #[cfg(feature="state-store")]
+    Plan { #[command(subcommand)] command:PlanCommand },
     /// Inspect durable delivery state (no external effects)
     #[cfg(feature="state-store")]
     Operations { slug:String, #[command(subcommand)] command:OperationsCommand },
@@ -553,6 +556,17 @@ enum FeedbackCommand {
     Show { #[arg(long)] id: Option<String> },
     /// Lease one feedback item. Does not reserve an attempt or satisfy a dependency.
     Claim { id: String, #[arg(long)] owner: String, #[arg(long)] lease_ms: i64 },
+}
+#[cfg(feature="state-store")]
+#[derive(Subcommand)]
+enum PlanCommand {
+    /// Store one unsigned proposal. Does not launch, verify a signature, or install a task contract.
+    Propose {
+        #[arg(value_name = "PROJECT")] slug: String,
+        #[arg(long)] input_file: PathBuf,
+        #[arg(long)] expected_plan_revision: u64,
+        #[arg(long)] idempotency_key: String,
+    },
 }
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
@@ -945,6 +959,21 @@ pub fn run() -> Result<()> {
             match command {
                 FeedbackCommand::Show{id}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::show_feedback(&dir,id.as_deref())?)?),
                 FeedbackCommand::Claim{id,owner,lease_ms}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::claim_feedback(&dir,&id,&owner,lease_ms)?)?),
+            }
+            Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Plan{command}=>{
+            match command {
+                PlanCommand::Propose{slug,input_file,expected_plan_revision,idempotency_key}=>{
+                    project::validate_slug(&slug)?;
+                    let dir=ctx.root.join(&slug);
+                    match herdr_projects::store::propose_plan(&dir,&input_file,expected_plan_revision,&idempotency_key) {
+                        Ok(receipt)=>println!("{}",serde_json::to_string_pretty(&receipt)?),
+                        Err(herdr_projects::store::StoreError::StalePlanParent(current))=>anyhow::bail!("stale plan parent conflicts with current revision {current}"),
+                        Err(error)=>return Err(error.into()),
+                    }
+                }
             }
             Ok(())
         },

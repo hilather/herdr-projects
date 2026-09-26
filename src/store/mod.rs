@@ -4,7 +4,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{fmt, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 
-pub const SCHEMA: u32 = 30;
+pub const SCHEMA: u32 = 31;
 const APPLICATION: u32 = 1_213_222_994;
 const MIN_SQLITE: i32 = 3_053_004;
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
@@ -15,6 +15,8 @@ pub enum StoreError {
     Deadline,
     Limit(String),
     Conflict,
+    /// Expected plan parent is not the current revision. The value is that revision.
+    StalePlanParent(u64),
     Busy,
     DiskFull,
     UnsupportedSchema(u32),
@@ -85,6 +87,7 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../migrations/0028_integration.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0029_feedback.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0030_dependency_satisfaction.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0031_plan_revisions.sql"))?;
             tx.commit()?;
         }
         // Persist the initial directory entry as well as SQLite's own commit.
@@ -401,6 +404,9 @@ mod feedback;
 pub use feedback::{claim_feedback, show_feedback};
 
 mod satisfaction;
+
+mod plans;
+pub use plans::{PlanProposalReceipt, propose_plan};
 
 #[cfg(target_os = "linux")]
 pub(crate) mod verification;
