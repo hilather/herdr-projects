@@ -47,6 +47,8 @@ pub struct FactoryStatus {
 pub enum ReportError {
     Store(StoreError),
     Io(String),
+    /// `user_version` is 0. The value is the only JSON that may be printed.
+    Unsupported(serde_json::Value),
     /// Newer than this binary. The value is the only JSON that may be printed.
     Newer(serde_json::Value),
 }
@@ -56,6 +58,7 @@ impl std::fmt::Display for ReportError {
         match self {
             Self::Store(error) => write!(f, "{error}"),
             Self::Io(error) => write!(f, "{error}"),
+            Self::Unsupported(_) => write!(f, "unsupported_schema"),
             Self::Newer(_) => write!(f, "store schema is newer than this binary"),
         }
     }
@@ -64,6 +67,17 @@ impl std::error::Error for ReportError {}
 
 fn platform() -> &'static str {
     if cfg!(target_os = "linux") { "linux" } else { "unsupported" }
+}
+
+fn refused_schema(version: u32, prepared_dispatch: bool, error: &'static str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": version,
+        "feature": "state-store",
+        "prepared_dispatch": prepared_dispatch,
+        "sqlite_version": rusqlite::version(),
+        "platform": platform(),
+        "error": error,
+    })
 }
 
 fn user_version(path: &Path) -> Result<u32, ReportError> {
@@ -133,15 +147,15 @@ fn counters_from(numbers: FactoryNumbers) -> Counters {
 pub fn report(project: &Path, prepared_dispatch: bool) -> Result<FactoryStatus, ReportError> {
     let db_path = project.join(".state/state.db");
     let version = user_version(&db_path)?;
-    if version == 0 || version > SCHEMA {
-        return Err(ReportError::Newer(serde_json::json!({
-            "schema": version,
-            "feature": "state-store",
-            "prepared_dispatch": prepared_dispatch,
-            "sqlite_version": rusqlite::version(),
-            "platform": platform(),
-            "error": "unsupported_schema",
-        })));
+    if version == 0 {
+        return Err(ReportError::Unsupported(refused_schema(version, prepared_dispatch, "unsupported_schema")));
+    }
+    if version > SCHEMA {
+        return Err(ReportError::Newer(refused_schema(
+            version,
+            prepared_dispatch,
+            "store schema is newer than this binary",
+        )));
     }
     let mut db = SqliteStore::open(&db_path).map_err(ReportError::Store)?;
     let now = jiff::Timestamp::now().as_millisecond();
@@ -267,9 +281,8 @@ mod tests {
             "rows_decoded {} decoded retired attempts",
             status.counters.rows_decoded
         );
-        let now = jiff::Timestamp::now().as_millisecond();
         let mut db = SqliteStore::open(&project.join(".state/state.db")).unwrap();
-        let rows = db.hot_path_rows_decoded(now).unwrap();
+        let rows = db.hot_path_rows_decoded().unwrap();
         assert_eq!(status.counters.rows_decoded, rows);
         let value = serde_json::to_value(&status).unwrap();
         forbid(&value);
@@ -312,11 +325,28 @@ mod tests {
         connection.execute_batch("PRAGMA user_version = 99").unwrap();
         drop(connection);
         let error = report(&project, false).unwrap_err();
+        assert_eq!(error.to_string(), "store schema is newer than this binary");
         let ReportError::Newer(value) = error else { panic!("expected newer schema") };
         assert_eq!(value["schema"], 99);
-        assert_eq!(value["error"], "unsupported_schema");
+        assert_eq!(value["error"], "store schema is newer than this binary");
         assert_eq!(value["prepared_dispatch"], false);
         assert!(value.get("counters").is_none(), "{value}");
         forbid(&value);
+
+        let zero = tempfile::tempdir().unwrap();
+        let project = zero.path().join("project");
+        std::fs::create_dir_all(project.join(".state")).unwrap();
+        let db = SqliteStore::create(&project.join(".state/state.db")).unwrap();
+        drop(db);
+        rusqlite::Connection::open(project.join(".state/state.db"))
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 0")
+            .unwrap();
+        let error = report(&project, false).unwrap_err();
+        assert_eq!(error.to_string(), "unsupported_schema");
+        let ReportError::Unsupported(value) = error else { panic!("expected unsupported schema") };
+        assert_eq!(value["schema"], 0);
+        assert_eq!(value["error"], "unsupported_schema");
+        assert!(value.get("counters").is_none(), "{value}");
     }
 }

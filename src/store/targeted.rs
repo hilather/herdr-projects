@@ -331,8 +331,7 @@ impl SqliteStore {
     }
 
     /// Status row count. Uses the active-work page, which does not decode retired attempts.
-    pub fn hot_path_rows_decoded(&mut self, now: i64) -> Result<u64> {
-        let _ = now;
+    pub fn hot_path_rows_decoded(&mut self) -> Result<u64> {
         self.hot_path_page_rows()
     }
 

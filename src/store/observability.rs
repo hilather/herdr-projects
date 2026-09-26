@@ -41,7 +41,7 @@ impl SqliteStore {
     /// Counters for one project. `rows_decoded` is the active-work page, not a snapshot of retired rows.
     pub fn factory_counters(&mut self, now: i64) -> Result<FactoryNumbers> {
         let schema: u32 = self.connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        let rows_decoded = match self.hot_path_rows_decoded(now) {
+        let rows_decoded = match self.hot_path_rows_decoded() {
             Ok(rows) => rows,
             Err(StoreError::UnsupportedSchema(_)) => 0,
             Err(error) => return Err(error),

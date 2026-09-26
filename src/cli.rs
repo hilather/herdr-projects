@@ -967,6 +967,10 @@ pub fn run() -> Result<()> {
                         println!("{}",serde_json::to_string_pretty(&value)?);
                         bail!("store schema is newer than this binary");
                     }
+                    Err(herdr_projects::factory_status::ReportError::Unsupported(value))=>{
+                        println!("{}",serde_json::to_string_pretty(&value)?);
+                        bail!("unsupported_schema");
+                    }
                     Err(error)=>return Err(error.into()),
                 }
                 Ok(())

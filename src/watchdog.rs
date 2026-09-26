@@ -4,17 +4,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 const PAUSE_NAME: &str = "admission-paused.json";
 const MAX_PAUSE_BYTES: u64 = 256;
-
-pub use crate::store::BUSY_RETRY_BOUND as BUSY_BOUND;
-
-/// True while the handler should keep waiting. `false` means the retry bound has passed.
-pub fn busy_handler_should_retry(started: Instant, bound: Duration) -> bool {
-    started.elapsed() < bound
-}
 
 pub fn pause_path(project: &Path) -> PathBuf {
     project.join(".state").join(PAUSE_NAME)
@@ -36,11 +28,17 @@ pub fn pause_reason(project: &Path) -> Option<&'static str> {
     if !meta.file_type().is_file() || meta.nlink() != 1 || meta.len() > MAX_PAUSE_BYTES {
         return Some("admission_paused");
     }
-    let file = OpenOptions::new()
+    // The file was a regular in-bounds pause. NotFound means it disappeared.
+    // EACCES, EMFILE, or ELOOP must not resume admission while it is still there.
+    let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&path)
-        .ok()?;
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some("admission_paused"),
+    };
     let mut bytes = Vec::new();
     if file.take(MAX_PAUSE_BYTES + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 > MAX_PAUSE_BYTES {
         return Some("admission_paused");
@@ -129,14 +127,19 @@ mod tests {
     use super::*;
     use crate::domain::*;
     use crate::store::{SqliteStore, StoreError, BUSY_RETRY_BOUND};
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
 
     static BUSY_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     fn give_up_past_bound(_retries: i32) -> bool {
         BUSY_CALLS.fetch_add(1, Ordering::SeqCst);
-        // A zero bound has already passed, so the handler must not keep the lock.
-        busy_handler_should_retry(Instant::now(), Duration::ZERO)
+        // The fixture is already at BUSY_RETRY_BOUND, so the handler gives up inline.
+        match Instant::now().checked_sub(BUSY_RETRY_BOUND) {
+            Some(started) => started.elapsed() < BUSY_RETRY_BOUND,
+            None => false,
+        }
     }
 
     fn project_with_attempt() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -198,11 +201,23 @@ mod tests {
     fn busy_bound_matches_the_connection_handler() {
         let source = include_str!("store/mod.rs");
         assert!(source.contains("busy_timeout(BUSY_RETRY_BOUND)"), "{source}");
-        assert_eq!(BUSY_RETRY_BOUND, Duration::from_millis(250));
-        assert_eq!(BUSY_BOUND, BUSY_RETRY_BOUND);
-        let started = Instant::now();
-        assert!(busy_handler_should_retry(started, BUSY_RETRY_BOUND));
-        assert!(!busy_handler_should_retry(started, Duration::ZERO));
+        assert_eq!(BUSY_RETRY_BOUND, std::time::Duration::from_millis(250));
+    }
+
+    #[test]
+    fn unreadable_pause_file_stays_paused_until_it_is_gone() {
+        let (_temp, project) = project_with_attempt();
+        note(&project, &StoreError::DiskFull).unwrap();
+        let path = pause_path(&project);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(pause_reason(&project), Some("admission_paused"));
+            assert!(is_paused(&project));
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(pause_reason(&project), None);
+        assert!(!is_paused(&project));
     }
 
     #[test]
