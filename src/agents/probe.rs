@@ -285,6 +285,7 @@ mod tests {
     use super::*;
     use crate::runner::Output;
     use std::cell::RefCell;
+    use std::os::unix::fs::PermissionsExt;
 
     struct Fake {
         calls: RefCell<Vec<Cmd>>,
@@ -592,5 +593,215 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let evidence = run_version(&path, "herdr", &crate::runner::RealRunner).unwrap();
         assert_eq!(evidence.version.as_deref(), Some("0.9.1"));
+    }
+
+    fn discover_claude() -> Option<std::path::PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("claude");
+            let Ok(meta) = std::fs::metadata(&candidate) else {
+                continue;
+            };
+            if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    fn claude_manifest(status: &str, binary_present: bool) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "kind": "claude",
+            "status": status,
+            "binary_present": binary_present,
+            "launchable": false,
+            "protocol_capable": false,
+            "certified": false,
+            "workflow_certified": false,
+            "live_launch": false,
+            "model_mapping": "refused",
+            "effort_mapping": "refused",
+            "environment_mapping": "refused",
+            "capability_levels": [],
+        })
+    }
+
+    fn assert_claude_manifest_fail_closed(manifest: &serde_json::Value) {
+        assert_eq!(manifest["schema_version"], 1);
+        assert_eq!(manifest["kind"], "claude");
+        assert_eq!(manifest["launchable"], false);
+        assert_eq!(manifest["protocol_capable"], false);
+        assert_eq!(manifest["certified"], false);
+        assert_eq!(manifest["workflow_certified"], false);
+        assert_eq!(manifest["live_launch"], false);
+        assert_eq!(manifest["model_mapping"], "refused");
+        assert_eq!(manifest["effort_mapping"], "refused");
+        assert_eq!(manifest["environment_mapping"], "refused");
+        assert_eq!(manifest["capability_levels"], serde_json::json!([]));
+        let status = manifest["status"].as_str().unwrap();
+        assert!(status != "launchable" && status != "workflow-certified" && status != "certified");
+    }
+
+    fn write_claude_manifest(dir: &Path, manifest: &serde_json::Value) -> serde_json::Value {
+        let path = dir.join("claude-capability-manifest.json");
+        let text = serde_json::to_vec_pretty(manifest).unwrap();
+        std::fs::write(&path, &text).unwrap();
+        let read = std::fs::read(&path).unwrap();
+        assert_eq!(read, text);
+        serde_json::from_slice(&read).unwrap()
+    }
+
+    fn assert_mappings_refused(kind: &str) {
+        let profile: herdr_projects::profile_config::ProfileDefinition = toml::from_str(&format!(
+            "kind='{kind}'\npermission_policy='interactive'\nmodel='PRIVATE_MODEL'\nreasoning_effort='PRIVATE_EFFORT'\nenvironment=['HOME']\n[budget]\nmax_wall_seconds=10\nunknown_usage='allow_with_warning'\n"
+        ))
+        .unwrap();
+        let text = format!("{:#}", profile.validate_gated_preparation(1).unwrap_err());
+        assert!(text.contains("unsupported model"), "{text}");
+        assert!(!text.contains("PRIVATE_MODEL"));
+        assert!(!text.contains("PRIVATE_EFFORT"));
+        assert!(!text.contains("HOME"));
+    }
+
+    #[test]
+    fn claude_capability_harness_records_unsupported_without_certifying() {
+        // A missing binary is unsupported evidence, not a certificate or a launch.
+        assert_mappings_refused("claude");
+        let temp = tempfile::tempdir().unwrap();
+        let absent = write_claude_manifest(temp.path(), &claude_manifest("unsupported", false));
+        assert_eq!(absent["status"], "unsupported");
+        assert_eq!(absent["binary_present"], false);
+        assert_claude_manifest_fail_closed(&absent);
+        let migration = include_str!("../../migrations/0033_capability_evidence.sql");
+        assert!(migration.contains("adapter_kind IN ('native', 'fake')"));
+        assert!(!migration.contains("'claude'"));
+        assert!(migration.contains("level != 'workflow-certified'"));
+        let controller = include_str!("../canonical_controller.rs");
+        assert!(controller.contains("const PREPARED_LAUNCH_DISPATCH_ENABLED: bool = true;"));
+
+        let path = executable(temp.path());
+        let config = temp.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[profiles.worker]\nkind='claude'\npermission_policy='interactive'\nmodel='PRIVATE_MODEL'\nreasoning_effort='PRIVATE_EFFORT'\nenvironment=['HOME']\n",
+        )
+        .unwrap();
+        let missing = temp.path().join("missing-claude");
+        let fake = Fake {
+            calls: RefCell::new(vec![]),
+            response: "2.1.0 (Claude Code)\n".into(),
+        };
+        assert!(probe(&config, "worker", &path, &missing, &fake).is_err());
+        assert!(fake.calls.borrow().is_empty());
+        let evidence = probe(&config, "worker", &path, &path, &fake).unwrap();
+        assert_eq!(evidence.agent.version.as_deref(), Some("2.1.0"));
+        assert_eq!(evidence.agent.status, "version_observed");
+        assert!(!evidence.profile().launchable);
+        assert!(!evidence.profile().protocol_capable);
+        assert!(!evidence.profile().certified);
+        let json = serde_json::to_string(&evidence).unwrap();
+        assert!(json.contains("\"certified\":false"));
+        assert!(json.contains("\"launchable\":false"));
+        assert!(json.contains("model request requires a verified adapter mapping"));
+        assert!(!json.contains("PRIVATE_MODEL"));
+        assert!(!json.contains("PRIVATE_EFFORT"));
+        assert!(!json.contains("workflow-certified"));
+        assert!(fake.calls.borrow().iter().all(|cmd| {
+            cmd.args == ["--version"] && cmd.env_clear && cmd.stdin.is_none() && cmd.own_group
+        }));
+        let probed_dir = temp.path().join("probed");
+        std::fs::create_dir(&probed_dir).unwrap();
+        let probed =
+            write_claude_manifest(&probed_dir, &claude_manifest(evidence.agent.status, true));
+        assert_ne!(probed["status"], "unsupported");
+        assert_claude_manifest_fail_closed(&probed);
+        assert_mappings_refused("claude");
+
+        struct Recording;
+        impl Runner for Recording {
+            fn socket_request(&self, _: &Path, _: &str, _: Duration) -> Result<String> {
+                panic!("probe must not access sessions")
+            }
+            fn run(&self, cmd: &Cmd) -> Result<Output> {
+                assert_eq!(cmd.args, ["--version"]);
+                assert!(cmd.env_clear && cmd.stdin.is_none());
+                crate::runner::RealRunner.run(cmd)
+            }
+        }
+        if let Some(claude) = discover_claude() {
+            let herdr = temp.path().join("herdr-version");
+            std::fs::write(&herdr, b"#!/bin/sh\nprintf 'herdr 0.9.1\\n'\n").unwrap();
+            std::fs::set_permissions(&herdr, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let live_config = temp.path().join("live.toml");
+            std::fs::write(
+                &live_config,
+                "[profiles.worker]\nkind='claude'\npermission_policy='interactive'\n",
+            )
+            .unwrap();
+            let installed = temp.path().join("installed");
+            std::fs::create_dir(&installed).unwrap();
+            // Hashing the executable is inside the 20s probe budget. A large
+            // install can exhaust it; discarded evidence is not a certificate.
+            let manifest = match probe(&live_config, "worker", &herdr, &claude, &Recording) {
+                Ok(evidence) => {
+                    assert!(!evidence.profile().launchable);
+                    assert!(!evidence.profile().protocol_capable);
+                    assert!(!evidence.profile().certified);
+                    assert_ne!(evidence.agent.status, "no_verified_version_adapter");
+                    write_claude_manifest(&installed, &claude_manifest(evidence.agent.status, true))
+                }
+                Err(error) => {
+                    let text = format!("{error:#}");
+                    assert!(text.contains("evidence discarded"));
+                    assert!(!text.contains("certified"));
+                    write_claude_manifest(&installed, &claude_manifest("unsupported", true))
+                }
+            };
+            assert_claude_manifest_fail_closed(&manifest);
+            assert_mappings_refused("claude");
+        }
+
+        #[cfg(feature = "state-store")]
+        {
+            let db_path = temp.path().join("state.db");
+            drop(herdr_projects::store::SqliteStore::create(&db_path).unwrap());
+            let connection = rusqlite::Connection::open_with_flags(
+                &db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let rows: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM capability_evidence WHERE level IN ('workflow-certified','launchable')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 0);
+        }
+    }
+
+    #[test]
+    fn codex_probe_behavior_is_unchanged_by_the_claude_harness() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = executable(temp.path());
+        let fake = Fake {
+            calls: RefCell::new(vec![]),
+            response: "codex-cli 0.99.0-preview.3\n".into(),
+        };
+        let evidence = run_version(&path, "codex", &fake).unwrap();
+        assert_eq!(evidence.version.as_deref(), Some("0.99.0-preview.3"));
+        assert_eq!(evidence.status, "version_observed");
+        assert_eq!(fake.calls.borrow()[0].args, ["--version"]);
+        let config = temp.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[profiles.p]\nkind='codex'\npermission_policy='interactive'\n",
+        )
+        .unwrap();
+        let missing = temp.path().join("missing-codex");
+        assert!(probe(&config, "p", &path, &missing, &fake).is_err());
+        assert_mappings_refused("codex");
     }
 }
