@@ -1,12 +1,90 @@
 //! Immutable review decisions and atomic promotion. Delivery ack is T06.3.
 use super::*;
-use crate::domain::{PromotionReceipt, ReviewDecision};
+use crate::domain::{DelegationAction, PreparedDelegation, PromotionReceipt, ProposalDocument, ReviewDecision};
 use rusqlite::OptionalExtension;
+use sha2::{Digest, Sha256};
 
 fn invalid(s:&str)->StoreError {StoreError::Invalid(s.into())}
 fn schema(db:&Connection)->Result<()> {
     check_schema(db)?;let n:u32=db.query_row("PRAGMA user_version",[],|r|r.get(0))?;
     if n<22 {return Err(StoreError::UnsupportedSchema(n));}Ok(())
+}
+// A truncated queue would hide a proposal this grant may approve.
+const REVIEWER_QUEUE_LIMIT: usize = 1_000;
+
+fn result_id_ok(id: &str) -> bool {
+    id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+fn load_review_grant(db: &Connection, grant_id: &str, now: i64) -> Result<PreparedDelegation> {
+    super::delivery::now_check(now)?;
+    let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < 34 { return Err(StoreError::UnsupportedSchema(version)); }
+    if !result_id_ok(grant_id) { return Err(invalid("delegation grant is missing")); }
+    let loaded: Option<(Vec<u8>, String)> = db.query_row(
+        "SELECT raw_bytes, raw_digest FROM delegation_grants WHERE id=?1",
+        [grant_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    let Some((raw, digest)) = loaded else { return Err(invalid("delegation grant is missing")); };
+    if digest != grant_id || format!("{:x}", Sha256::digest(&raw)) != digest {
+        return Err(StoreError::Corrupt("delegation grant digest mismatch".into()));
+    }
+    let parsed = PreparedDelegation::parse_verified(&raw).map_err(|error| invalid(&error))?;
+    if parsed.digest != digest { return Err(StoreError::Corrupt("delegation grant digest mismatch".into())); }
+    let path = db.path().ok_or_else(|| invalid("delegation requires a file-backed store"))?;
+    let actual = std::fs::canonicalize(path).map(|path| path.to_string_lossy().into_owned()).map_err(|_| invalid("delegation store path unavailable"))?;
+    if parsed.project_store != actual { return Err(invalid("delegation belongs to another project")); }
+    if now >= parsed.expires_unix_ms { return Err(invalid("delegation grant is expired")); }
+    let revoked: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM delegation_revocations WHERE grant_id=?1)", [grant_id], |row| row.get(0))?;
+    if revoked { return Err(invalid("delegation grant is revoked")); }
+    if !parsed.actions.contains(&DelegationAction::ReviewMemory) {
+        return Err(invalid("delegation does not grant review_memory"));
+    }
+    Ok(parsed)
+}
+fn reviewer_owns_attempt(db: &Connection, attempt_id: &str, task_id: &str, subject: &str) -> Result<bool> {
+    // Reservation is the worker identity stored for that attempt.
+    let reservation: Option<String> = db.query_row(
+        "SELECT reservation FROM attempts WHERE id=?1 AND task_id=?2",
+        params![attempt_id, task_id],
+        |row| row.get(0),
+    ).optional()?;
+    let Some(reservation) = reservation else { return Err(invalid("producer attempt is missing")); };
+    Ok(attempt_id == subject || reservation == subject || reservation == format!("worker:{subject}"))
+}
+fn proposal_targets_hard(db: &Connection, doc: &ProposalDocument) -> Result<bool> {
+    for change in &doc.changes {
+        if matches!(change.kind.as_str(), "constraint" | "hard_memory") { return Ok(true); }
+        let row: Option<(i64, String)> = db.query_row(
+            "SELECT is_hard, kind FROM memory_records WHERE record_key=?1",
+            [change.record_key.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        if row.is_some_and(|(hard, kind)| hard == 1 || matches!(kind.as_str(), "constraint" | "hard_memory")) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+fn deny_reviewer_proposal(db: &Connection, attempt_id: &str, task_id: &str, payload: &str, grant: &PreparedDelegation) -> Result<()> {
+    let doc: ProposalDocument = serde_json::from_str(payload).map_err(|_| invalid("stored proposal is unreadable"))?;
+    if doc.producer.attempt_id != attempt_id || doc.producer.task_id != task_id {
+        return Err(invalid("proposal identity mismatch"));
+    }
+    if reviewer_owns_attempt(db, attempt_id, task_id, &grant.subject)? {
+        return Err(invalid("reviewer cannot approve their own attempt"));
+    }
+    if proposal_targets_hard(db, &doc)? { return Err(invalid("reviewer cannot approve a hard rule")); }
+    if doc.repository.as_ref().is_some_and(|repo| repo.dirty || !grant.repositories.iter().any(|scope| scope.repository == repo.id)) {
+        return Err(invalid("delegation grant is for the wrong repo"));
+    }
+    Ok(())
+}
+// `Grant` is constructed by the controller entry points below. Those have no CLI caller yet.
+#[allow(dead_code)]
+enum PromotionAuthority<'a> {
+    Owner(Option<&'a PreparedMemoryReview>),
+    Grant(&'a str),
 }
 impl SqliteStore {
     pub(crate) fn insert_review_decision(&mut self,row:&ReviewDecision,authorization:Option<&PreparedMemoryReview>)->Result<()> {
@@ -47,7 +125,123 @@ impl SqliteStore {
             }
         ).optional()?)
     }
+    pub(crate) fn verified_result_claim(&self, result_id: &str) -> Result<Option<(String, String, String)>> {
+        if !result_id_ok(result_id) { return Ok(None); }
+        let version: u32 = self.connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version < 27 { return Ok(None); }
+        self.connection.query_row(
+            "SELECT r.commit_oid, r.tree_oid, s.repository
+             FROM verified_results r
+             JOIN verification_runs v ON v.run_id = r.run_id
+             JOIN result_submissions s ON s.submission_id = r.submission_id
+             JOIN task_contracts c ON c.task_id = v.task_id AND c.contract_revision = v.contract_revision
+             WHERE r.result_id=?1 AND s.repository=c.repository AND r.commit_oid=v.commit_oid AND r.tree_oid=v.tree_oid",
+            [result_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional().map_err(StoreError::from)
+    }
+    /// Proposals this review_memory grant may see. Not a promotion write.
+    #[allow(dead_code)] // Controller entry; no CLI in this change.
+    pub(crate) fn reviewer_queue(&mut self, grant_id: &str, now_unix_ms: i64) -> Result<Vec<String>> {
+        let tx = self.connection.transaction()?;
+        schema(&tx)?;
+        let grant = load_review_grant(&tx, grant_id, now_unix_ms)?;
+        let repos = serde_json::to_string(&grant.repositories.iter().map(|repo| repo.repository.as_str()).collect::<Vec<_>>())
+            .map_err(|_| invalid("delegation repository encoding failed"))?;
+        let mut stmt = tx.prepare(
+            "SELECT p.id FROM memory_proposals p
+             WHERE p.review_state='validated' AND json_valid(p.payload)
+               AND EXISTS (SELECT 1 FROM attempts a WHERE a.id=p.attempt_id AND a.task_id=p.task_id)
+               AND p.attempt_id <> ?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM attempts a
+                 WHERE a.id=p.attempt_id AND (a.reservation=?1 OR a.reservation='worker:' || ?1)
+               )
+               AND COALESCE(json_extract(p.payload, '$.repository.dirty'), 0)=0
+               AND (
+                 json_extract(p.payload, '$.repository.id') IS NULL
+                 OR EXISTS (SELECT 1 FROM json_each(?2) repo WHERE repo.value=json_extract(p.payload, '$.repository.id'))
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM json_each(p.payload, '$.changes') c
+                 LEFT JOIN memory_records r ON r.record_key=json_extract(c.value, '$.record_key')
+                 WHERE json_extract(c.value, '$.kind') IN ('constraint', 'hard_memory')
+                    OR r.is_hard=1 OR r.kind IN ('constraint', 'hard_memory')
+               )
+             ORDER BY p.id LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![grant.subject, repos, (REVIEWER_QUEUE_LIMIT as i64) + 1], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        if rows.len() > REVIEWER_QUEUE_LIMIT {
+            return Err(StoreError::Limit("reviewer queue exceeds 1000 proposals".into()));
+        }
+        tx.commit()?;
+        Ok(rows)
+    }
+    /// Records an approve decision. The grant is not the promotion write.
+    #[allow(dead_code)] // Controller entry; no CLI in this change.
+    pub(crate) fn approve_with_reviewer_grant(&mut self, grant_id: &str, proposal_id: &str, reason: &str, now_unix_ms: i64) -> Result<ReviewDecision> {
+        if reason.is_empty() || reason.len() > 4096 || reason.chars().any(char::is_control) {
+            return Err(invalid("invalid review reason"));
+        }
+        let id = format!("rev-{:x}", Sha256::digest(format!("{proposal_id}\0{grant_id}\0{now_unix_ms}\0{reason}").as_bytes()));
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        schema(&tx)?;
+        let grant = load_review_grant(&tx, grant_id, now_unix_ms)?;
+        let row: Option<(String, String, String, String, String)> = tx.query_row(
+            "SELECT payload_digest, attempt_id, task_id, payload, review_state FROM memory_proposals WHERE id=?1",
+            [proposal_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        ).optional()?;
+        let Some((digest, attempt_id, task_id, payload, review_state)) = row else {
+            return Err(invalid("proposal missing"));
+        };
+        if review_state != "validated" { return Err(invalid("proposal is not validated")); }
+        deny_reviewer_proposal(&tx, &attempt_id, &task_id, &payload, &grant)?;
+        if let Some(existing) = tx.query_row(
+            "SELECT id,proposal_id,payload_digest,decision,classification,reviewed_heads,reason,created_unix_ms FROM review_decisions WHERE id=?1",
+            [&id],
+            |r| Ok(ReviewDecision { id: r.get(0)?, proposal_id: r.get(1)?, payload_digest: r.get(2)?, decision: r.get(3)?, classification: r.get(4)?, reviewed_heads: r.get(5)?, reason: r.get(6)?, created_unix_ms: r.get(7)? }),
+        ).optional()? {
+            let bound = serde_json::from_str::<serde_json::Value>(&existing.reviewed_heads).ok()
+                .and_then(|value| value.get("reviewer_grant_id").and_then(|id| id.as_str()).map(str::to_owned));
+            if existing.proposal_id != proposal_id || existing.payload_digest != digest || existing.decision != "approve" || existing.reason != reason || bound.as_deref() != Some(grant_id) {
+                return Err(invalid("review identity mismatch"));
+            }
+            tx.commit()?;
+            return Ok(existing);
+        }
+        let event_head = head(&tx)?;
+        let decision = ReviewDecision {
+            id,
+            proposal_id: proposal_id.into(),
+            payload_digest: digest,
+            decision: "approve".into(),
+            classification: "[]".into(),
+            reviewed_heads: serde_json::json!({"event_head": event_head, "reviewer_grant_id": grant_id}).to_string(),
+            reason: reason.into(),
+            created_unix_ms: now_unix_ms,
+        };
+        tx.execute(
+            "INSERT INTO review_decisions VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![decision.id, decision.proposal_id, decision.payload_digest, decision.decision, decision.classification, decision.reviewed_heads, decision.reason, decision.created_unix_ms],
+        )?;
+        tx.execute(
+            "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('memory.review_recorded',?1,1,1,?2)",
+            params![decision.id, serde_json::json!({"proposal": decision.proposal_id, "decision": decision.decision}).to_string()],
+        )?;
+        tx.commit()?;
+        Ok(decision)
+    }
     pub(crate) fn promote_reviewed_proposal(&mut self,proposal_id:&str,decision:&ReviewDecision,changes:&[crate::domain::NewRevision],invalidations:&[(String,String,String,String)],now_unix_ms:i64,authorization:Option<&PreparedMemoryReview>)->Result<PromotionReceipt> {
+        self.finish_promotion(proposal_id, decision, changes, invalidations, now_unix_ms, PromotionAuthority::Owner(authorization))
+    }
+    #[allow(dead_code)] // Controller entry; no CLI in this change.
+    pub(crate) fn promote_with_reviewer_grant(&mut self, proposal_id: &str, decision: &ReviewDecision, changes: &[crate::domain::NewRevision], invalidations: &[(String, String, String, String)], now_unix_ms: i64, grant_id: &str) -> Result<PromotionReceipt> {
+        self.finish_promotion(proposal_id, decision, changes, invalidations, now_unix_ms, PromotionAuthority::Grant(grant_id))
+    }
+    fn finish_promotion(&mut self,proposal_id:&str,decision:&ReviewDecision,changes:&[crate::domain::NewRevision],invalidations:&[(String,String,String,String)],now_unix_ms:i64,authority:PromotionAuthority<'_>)->Result<PromotionReceipt> {
         if decision.decision!="approve" {return Err(invalid("promotion requires an approve decision"));}
         if decision.proposal_id!=proposal_id {return Err(invalid("decision does not belong to proposal"));}
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
@@ -67,19 +261,43 @@ impl SqliteStore {
         }
         let reviewed: serde_json::Value = serde_json::from_str(&decision.reviewed_heads)
             .map_err(|_| invalid("invalid reviewed state"))?;
-        if let Some(auth)=authorization {
-            let covered:MemoryReviewAuthorization=serde_json::from_value(reviewed["authorization"].clone()).map_err(|_|invalid("review authorization missing"))?;
-            if covered.expires_unix_ms<=now_unix_ms {
-                return Err(invalid("review authorization is expired"));
+        let authorization = match authority {
+            PromotionAuthority::Owner(Some(auth)) => {
+                let covered:MemoryReviewAuthorization=serde_json::from_value(reviewed["authorization"].clone()).map_err(|_|invalid("review authorization missing"))?;
+                if covered.expires_unix_ms<=now_unix_ms {
+                    return Err(invalid("review authorization is expired"));
+                }
+                if covered!=auth.document || control::read(&tx)?.config_digest!=auth.config_digest {
+                    return Err(invalid("review authority changed"));
+                }
+                if auth.document.read_set_version==Some(2) {
+                    let signed=auth.document.read_set.as_ref().ok_or_else(||invalid("v2 review requires a read set"))?;
+                    super::read_set::require_match(&tx,signed)?;
+                }
+                Some(auth)
             }
-            if covered!=auth.document || control::read(&tx)?.config_digest!=auth.config_digest {
-                return Err(invalid("review authority changed"));
+            PromotionAuthority::Owner(None) => {
+                if !cfg!(test) {return Err(invalid("verified reviewer authority required"));}
+                None
             }
-            if auth.document.read_set_version==Some(2) {
-                let signed=auth.document.read_set.as_ref().ok_or_else(||invalid("v2 review requires a read set"))?;
-                super::read_set::require_match(&tx,signed)?;
+            PromotionAuthority::Grant(grant_id) => {
+                if reviewed.get("reviewer_grant_id").and_then(|value| value.as_str()) != Some(grant_id) {
+                    return Err(invalid("reviewer grant is required"));
+                }
+                let grant = load_review_grant(&tx, grant_id, now_unix_ms)?;
+                let (attempt_id, task_id, payload, review_state): (String, String, String, String) = tx.query_row(
+                    "SELECT attempt_id, task_id, payload, review_state FROM memory_proposals WHERE id=?1",
+                    [proposal_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )?;
+                if review_state != "validated" { return Err(invalid("proposal is not validated")); }
+                deny_reviewer_proposal(&tx, &attempt_id, &task_id, &payload, &grant)?;
+                if changes.iter().any(|next| matches!(next.kind, crate::domain::MemoryKind::Constraint | crate::domain::MemoryKind::HardMemory)) {
+                    return Err(invalid("reviewer cannot approve a hard rule"));
+                }
+                None
             }
-        } else if !cfg!(test) {return Err(invalid("verified reviewer authority required"));}
+        };
         let expected = reviewed.get("event_head").and_then(|v| v.as_u64())
             .and_then(|v| v.checked_add(1)).ok_or_else(|| invalid("review event fence missing"))?;
         // Documents without read_set_version 2 stay on the whole-state fence.
@@ -146,5 +364,160 @@ mod tests {
         assert_eq!(db.read_snapshot(None).unwrap(),before);
         assert!(db.memory_promotion("mp-x").unwrap().is_none());
         db.integrity_check().unwrap();
+    }
+
+    use crate::domain::*;
+    use crate::memory::MemoryStore;
+
+    fn setup() -> (tempfile::TempDir, MemoryStore, String) {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("state.db");
+        let mut store = SqliteStore::create(&db).unwrap();
+        let task = Task { id: TaskId::new("task-api").unwrap(), revision: 1, state: TaskState::Draft, title: "api".into(), active_attempt: None };
+        store.commit(Commit { expected_head: 0, mutations: vec![Mutation::Task { expected: None, next: task }] }).unwrap();
+        let attempt = Attempt { id: AttemptId::new("att-api-2").unwrap(), task: TaskId::new("task-api").unwrap(), revision: 1, state: AttemptState::Running, snapshot: None, reservation: "held".into(), termination_observed: false };
+        let head = store.read_snapshot(None).unwrap().head;
+        store.commit(Commit { expected_head: head, mutations: vec![Mutation::Attempt { expected: None, next: attempt }] }).unwrap();
+        let mut memory = MemoryStore::from_sqlite(store, db.parent().unwrap().join("objects"));
+        let body = memory.ingest_object(&b"claim-body"[..]).unwrap();
+        let req = SnapshotRequest { schema_version: 1, task_id: "task-api".into(), profile: "implementation".into(), domains: vec![], paths: vec![], pinned_keys: vec![], sensitivity: "default".into() };
+        let snap = memory.create_task_snapshot(req, "implementation", &"a".repeat(64), None, 32_000, "instructions", 1_000, None).unwrap();
+        let state = memory.store.read_snapshot(None).unwrap();
+        let mut attempt = state.attempts[0].clone();
+        attempt.revision += 1;
+        attempt.snapshot = Some(snap.id.as_str().into());
+        memory.store.commit(Commit { expected_head: state.head, mutations: vec![Mutation::Attempt { expected: Some(1), next: attempt }] }).unwrap();
+        let doc = ProposalDocument {
+            schema_version: 1,
+            proposal_id: "mp-api-errors-01".into(),
+            producer: ProposalProducer { task_id: "task-api".into(), attempt_id: "att-api-2".into() },
+            input_snapshot_id: snap.id.as_str().into(),
+            observed_revisions: vec![],
+            repository: None,
+            changes: vec![ProposalChange {
+                record_key: "api.error-envelope".into(),
+                expected: None,
+                kind: "observation".into(),
+                scope: Applicability { domains: vec!["api".into()], paths: vec!["src/api".into()] },
+                claim: "Validation errors contain code, message, and request_id.".into(),
+                body_object: format!("sha256:{}", body.as_str()),
+                evidence: vec![],
+                based_on: vec![],
+                impact: "reconcile_before_completion".into(),
+            }],
+        };
+        let receipt = memory.propose(&serde_json::to_vec(&doc).unwrap(), 1_000).unwrap();
+        assert_eq!(receipt.validation, "accepted");
+        (root, memory, body.as_str().to_string())
+    }
+    fn install_grant(memory: &mut MemoryStore, actions: &[&str]) -> String {
+        let project = std::fs::canonicalize(memory.store.connection.path().unwrap()).unwrap().display().to_string();
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "issuer": "owner",
+            "subject": "delegate",
+            "subject_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDelegationSubjectKeyExampleValue1234567890",
+            "action_classes": actions,
+            "repositories": [{"repository": "/tmp/repo", "ref": "refs/heads/factory"}],
+            "profile_kinds": ["codex"],
+            "max_concurrent_attempts": 1,
+            "expires_unix_ms": 9_000_000_000_000i64,
+            "revocation_epoch": 1,
+            "child_delegation": "forbidden",
+            "policy_revision": 1,
+            "project_store": project,
+            "authority": {"id": "owner-approval-policy", "revision": 1, "digest": "ab".repeat(32)}
+        })).unwrap();
+        let prepared = PreparedDelegation::parse_verified(&bytes).unwrap();
+        memory.store.install_delegation(&prepared, 1_000).unwrap()
+    }
+    fn revision(body: &str) -> NewRevision {
+        NewRevision {
+            id: MemoryRecordId::new("mem-errors").unwrap(),
+            record_key: "api.error-envelope".into(),
+            scope_id: "project".into(),
+            kind: MemoryKind::Observation,
+            body_hash: ObjectId::from_hex(body).unwrap(),
+            provenance_hash: ObjectId::from_hex(body).unwrap(),
+            applicability: Applicability { domains: vec!["api".into()], paths: vec!["src/api".into()] },
+            dependencies: vec![],
+            expected: None,
+            expiry_unix_ms: None,
+            validity_state: "valid".into(),
+            validity_reason: "promoted".into(),
+        }
+    }
+
+    #[test]
+    fn reviewer_cannot_approve_own_attempt() {
+        let (_root, mut memory, _body) = setup();
+        let grant = install_grant(&mut memory, &["review_memory"]);
+        assert_eq!(memory.store.reviewer_queue(&grant, 1_000).unwrap(), vec!["mp-api-errors-01".to_string()]);
+        memory.store.connection.execute("UPDATE attempts SET reservation='delegate' WHERE id='att-api-2'", []).unwrap();
+        assert!(memory.store.reviewer_queue(&grant, 1_000).unwrap().is_empty());
+        let err = memory.store.approve_with_reviewer_grant(&grant, "mp-api-errors-01", "evidence supports the claim", 1_000).unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(ref message) if message.contains("own attempt")), "{err:?}");
+        assert!(memory.store.memory_promotion("mp-api-errors-01").unwrap().is_none());
+    }
+
+    #[test]
+    fn reviewer_cannot_approve_a_hard_rule() {
+        let (_root, mut memory, body) = setup();
+        let grant = install_grant(&mut memory, &["review_memory"]);
+        assert_eq!(memory.store.reviewer_queue(&grant, 1_000).unwrap(), vec!["mp-api-errors-01".to_string()]);
+        memory.insert_revision(&ControlContext { now_unix_ms: 1_000 }, revision(&body)).unwrap();
+        let head = memory.store.read_snapshot(None).unwrap().head;
+        memory.store.apply_memory_op(MemoryPolicyOp::HardRule, "api.error-envelope", head).unwrap();
+        assert!(memory.store.reviewer_queue(&grant, 1_000).unwrap().is_empty());
+        let err = memory.store.approve_with_reviewer_grant(&grant, "mp-api-errors-01", "evidence supports the claim", 1_000).unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(ref message) if message.contains("hard rule")), "{err:?}");
+        assert!(memory.store.memory_promotion("mp-api-errors-01").unwrap().is_none());
+    }
+
+    #[test]
+    fn unsigned_promotion_is_still_absent() {
+        let (_root, mut memory, _body) = setup();
+        let worker = install_grant(&mut memory, &["reserve_attempt"]);
+        let err = memory.store.approve_with_reviewer_grant(&worker, "mp-api-errors-01", "evidence supports the claim", 1_000).unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(ref message) if message.contains("does not grant review_memory")), "{err:?}");
+        let stored = memory.store.memory_proposal("mp-api-errors-01").unwrap().unwrap();
+        let row = ReviewDecision {
+            id: "rev-unsigned".into(),
+            proposal_id: "mp-api-errors-01".into(),
+            payload_digest: stored.payload_digest,
+            decision: "approve".into(),
+            classification: "[]".into(),
+            reviewed_heads: r#"{"event_head":1}"#.into(),
+            reason: "unsigned".into(),
+            created_unix_ms: 1_000,
+        };
+        memory.store.insert_review_decision(&row, None).unwrap();
+        let grant = install_grant(&mut memory, &["review_memory"]);
+        let err = memory.store.promote_with_reviewer_grant("mp-api-errors-01", &row, &[], &[], 1_000, &grant).unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(ref message) if message.contains("reviewer grant is required")), "{err:?}");
+        assert!(memory.store.memory_promotion("mp-api-errors-01").unwrap().is_none());
+        assert!(memory.store.memory_record_by_key("api.error-envelope").unwrap().is_none());
+    }
+
+    #[test]
+    fn reviewer_grant_does_not_promote_until_the_controller_writes() {
+        let (_root, mut memory, body) = setup();
+        let grant = install_grant(&mut memory, &["review_memory"]);
+        assert_eq!(memory.store.reviewer_queue(&grant, 1_000).unwrap(), vec!["mp-api-errors-01".to_string()]);
+        let decision = memory.store.approve_with_reviewer_grant(&grant, "mp-api-errors-01", "evidence supports the claim", 1_000).unwrap();
+        let replay = memory.store.approve_with_reviewer_grant(&grant, "mp-api-errors-01", "evidence supports the claim", 1_000).unwrap();
+        assert_eq!(replay.id, decision.id);
+        assert!(memory.store.memory_promotion("mp-api-errors-01").unwrap().is_none());
+        assert!(memory.store.memory_record_by_key("api.error-envelope").unwrap().is_none());
+        let invalidations = [("inv-1".into(), "task-api".into(), "mem-errors".into(), "reconcile_before_completion".into())];
+        let first = memory.store.promote_with_reviewer_grant("mp-api-errors-01", &decision, &[revision(&body)], &invalidations, 1_000, &grant).unwrap();
+        assert!(!first.reused);
+        assert_eq!(first.change_ids, vec!["mem-errors:1".to_string()]);
+        let again = memory.store.promote_with_reviewer_grant("mp-api-errors-01", &decision, &[revision(&body)], &invalidations, 1_000, &grant).unwrap();
+        assert!(again.reused);
+        assert_eq!(again.sequence, first.sequence);
+        let record = memory.store.memory_record_by_key("api.error-envelope").unwrap().unwrap();
+        assert_eq!(record.kind, MemoryKind::Observation);
+        assert!(!record.is_hard);
     }
 }
