@@ -401,14 +401,14 @@ mod tests {
     fn upgrade_v1_from_33_to_34_preserves_denials_and_create_ends_at_34() {
         let fresh = tempfile::tempdir().unwrap();
         let created = SqliteStore::create(&fresh.path().join("state.db")).unwrap();
-        assert_eq!(user_version(&created.connection), 39);
+        assert_eq!(user_version(&created.connection), 40);
         assert_eq!(
             created
                 .connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            39
+            40
         );
         assert!(table_exists(&created.connection, "delegation_grants"));
         assert!(table_exists(&created.connection, "delegation_revocations"));
@@ -448,7 +448,7 @@ mod tests {
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
         raw.execute_batch(
-            "DROP TRIGGER IF EXISTS memory_change_receipts_no_update; DROP TRIGGER IF EXISTS memory_change_receipts_no_delete; DROP TRIGGER IF EXISTS update_package_members_no_update; DROP TRIGGER IF EXISTS update_package_members_no_delete; DROP TRIGGER IF EXISTS update_packages_no_update; DROP TRIGGER IF EXISTS update_packages_no_delete; DROP TABLE IF EXISTS memory_change_receipts; DROP TABLE IF EXISTS update_package_members; ALTER TABLE consumer_bindings DROP COLUMN applied_cursor; DROP TABLE IF EXISTS update_packages; DROP TRIGGER IF EXISTS memory_read_set_on_record; DROP TRIGGER IF EXISTS memory_read_set_on_reclassify; DROP TRIGGER IF EXISTS memory_read_set_on_revision; DROP TRIGGER IF EXISTS memory_read_set_on_validity; DROP TRIGGER IF EXISTS memory_read_set_on_head; DROP TABLE IF EXISTS memory_scope_catalog; DROP TABLE IF EXISTS memory_required_generation; DROP TABLE IF EXISTS consumer_binding_undeliverable; DROP TABLE IF EXISTS consumer_binding_obligations; DROP TABLE IF EXISTS consumer_bindings; DROP TABLE IF EXISTS wait_replay_events; DROP TABLE IF EXISTS replan_requests; DROP TABLE IF EXISTS replan_budget_resets; DROP TABLE IF EXISTS attempt_infrastructure_retries; DROP TABLE IF EXISTS wait_conditions; DROP TABLE IF EXISTS resource_claims; DROP TABLE IF EXISTS delegation_stop_obligations; DROP TABLE IF EXISTS delegation_revocations; DROP TABLE IF EXISTS delegation_grants;
+            "DROP TRIGGER IF EXISTS barrier_stale_briefs_no_update; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_delete; DROP TRIGGER IF EXISTS barrier_members_no_update; DROP TRIGGER IF EXISTS barrier_members_no_delete; DROP TRIGGER IF EXISTS barrier_revisions_no_membership_update; DROP TABLE IF EXISTS barrier_stale_briefs; DROP TABLE IF EXISTS barrier_members; DROP TABLE IF EXISTS barrier_revisions; DROP TRIGGER IF EXISTS memory_change_receipts_no_update; DROP TRIGGER IF EXISTS memory_change_receipts_no_delete; DROP TRIGGER IF EXISTS update_package_members_no_update; DROP TRIGGER IF EXISTS update_package_members_no_delete; DROP TRIGGER IF EXISTS update_packages_no_update; DROP TRIGGER IF EXISTS update_packages_no_delete; DROP TABLE IF EXISTS memory_change_receipts; DROP TABLE IF EXISTS update_package_members; ALTER TABLE consumer_bindings DROP COLUMN applied_cursor; DROP TABLE IF EXISTS update_packages; DROP TRIGGER IF EXISTS memory_read_set_on_record; DROP TRIGGER IF EXISTS memory_read_set_on_reclassify; DROP TRIGGER IF EXISTS memory_read_set_on_revision; DROP TRIGGER IF EXISTS memory_read_set_on_validity; DROP TRIGGER IF EXISTS memory_read_set_on_head; DROP TABLE IF EXISTS memory_scope_catalog; DROP TABLE IF EXISTS memory_required_generation; DROP TABLE IF EXISTS consumer_binding_undeliverable; DROP TABLE IF EXISTS consumer_binding_obligations; DROP TABLE IF EXISTS consumer_bindings; DROP TABLE IF EXISTS wait_replay_events; DROP TABLE IF EXISTS replan_requests; DROP TABLE IF EXISTS replan_budget_resets; DROP TABLE IF EXISTS attempt_infrastructure_retries; DROP TABLE IF EXISTS wait_conditions; DROP TABLE IF EXISTS resource_claims; DROP TABLE IF EXISTS delegation_stop_obligations; DROP TABLE IF EXISTS delegation_revocations; DROP TABLE IF EXISTS delegation_grants;
              DROP TRIGGER IF EXISTS authority_denials_no_update; DROP TRIGGER IF EXISTS authority_denials_no_delete;
              CREATE TABLE authority_denials_v26 (
                 id TEXT PRIMARY KEY NOT NULL, unix_ms INTEGER NOT NULL,
@@ -478,13 +478,13 @@ mod tests {
         assert_eq!(user_version(&db.connection), 33);
         assert!(!table_exists(&db.connection, "delegation_grants"));
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 39);
+        assert_eq!(user_version(&db.connection), 40);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            39
+            40
         );
         let kept: i64 = db
             .connection
@@ -510,7 +510,7 @@ mod tests {
         check_schema(&db.connection).unwrap();
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 39);
+        assert_eq!(user_version(&reopened.connection), 40);
         assert_eq!(
             reopened
                 .connection
