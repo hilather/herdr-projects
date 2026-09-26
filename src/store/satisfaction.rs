@@ -40,12 +40,47 @@ fn load_verified(db: &Connection, result_id: &str) -> Result<Option<VerifiedRece
     .map_err(StoreError::from)
 }
 
+/// A verified receipt may replace the current row only when its attempt is the
+/// selected one and its contract is the predecessor's latest revision. An older
+/// run must not strand that row as invalid: revalidation is forbidden.
+fn verified_result_may_replace(tx: &Connection, result_id: &str) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM verified_results v
+            JOIN verification_runs r ON r.run_id=v.run_id
+            JOIN attempts a ON a.id=r.attempt_id AND a.task_id=r.task_id
+            JOIN tasks t ON t.id=a.task_id
+            WHERE v.result_id=?1 AND r.state='accepted'
+              AND (
+                t.active_attempt=r.attempt_id
+                OR (
+                  t.active_attempt IS NULL
+                  AND r.attempt_id=(
+                    SELECT latest.id FROM attempts latest
+                    WHERE latest.task_id=r.task_id
+                    ORDER BY latest.rowid DESC
+                    LIMIT 1
+                  )
+                )
+              )
+              AND r.contract_revision=(
+                SELECT MAX(c.contract_revision) FROM task_contracts c WHERE c.task_id=r.task_id
+              )
+         )",
+        [result_id],
+        |row| row.get(0),
+    )
+    .map_err(StoreError::from)
+}
+
 fn insert_valid(
     tx: &Connection,
     task_id: &str,
     predecessor: &str,
     requirement: &str,
     evidence_id: &str,
+    replace_existing: bool,
 ) -> Result<()> {
     let existing: Option<(String, String)> = tx
         .query_row(
@@ -58,7 +93,10 @@ fn insert_valid(
         if evidence == evidence_id {
             return Ok(());
         }
-        // A newer stored receipt must not roll back the commit that wrote it.
+        if !replace_existing {
+            return Ok(());
+        }
+        // A newer current receipt must not roll back the commit that wrote it.
         // The old row stays for history; only one valid row remains.
         tx.execute(
             "UPDATE dependency_satisfactions SET state='invalid' WHERE satisfaction_id=?1 AND state='valid'",
@@ -98,8 +136,17 @@ pub(super) fn record_verified_result(tx: &Connection, result_id: &str) -> Result
         return Err(invalid("verified receipt is not stored"));
     };
     // An open memory fence still stores the row. The report is what hides it.
+    // A stale attempt or contract does not replace a current valid row.
+    let replace = verified_result_may_replace(tx, result_id)?;
     for task_id in consumers(tx, &receipt.task_id, "verified_result")? {
-        insert_valid(tx, &task_id, &receipt.task_id, "verified_result", result_id)?;
+        insert_valid(
+            tx,
+            &task_id,
+            &receipt.task_id,
+            "verified_result",
+            result_id,
+            replace,
+        )?;
     }
     Ok(())
 }
@@ -134,6 +181,7 @@ pub(super) fn record_integrated_commit(tx: &Connection, integrated_id: &str) -> 
             &predecessor,
             "integrated_commit",
             integrated_id,
+            true,
         )?;
     }
     Ok(())
@@ -893,6 +941,80 @@ mod tests {
                 (integrated_a, "invalid".into()),
                 (integrated_b, "valid".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn older_attempt_run_does_not_invalidate_the_current_satisfaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
+        queued_predecessor(&mut db);
+        let head = db.read_snapshot(None).unwrap().head;
+        db.commit(Commit {
+            expected_head: head,
+            mutations: vec![Mutation::Attempt {
+                expected: None,
+                next: Attempt {
+                    id: AttemptId::new("attempt-2").unwrap(),
+                    task: TaskId::new("pred").unwrap(),
+                    revision: 1,
+                    state: AttemptState::Completed,
+                    snapshot: None,
+                    reservation: "slot-pred-2".into(),
+                    termination_observed: true,
+                },
+            }],
+        })
+        .unwrap();
+        let current = "2".repeat(64);
+        let older = "1".repeat(64);
+        store_verified_receipt(&db, "pred", "attempt-2", &current, 1);
+        let tx = db.connection.transaction().unwrap();
+        record_verified_result(&tx, &current).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            dependency_lines(&db.queue_report(0).unwrap(), "needs-verified"),
+            vec!["admission_disabled:verified_result".to_string()]
+        );
+        // The later run for attempt 1 commits with its receipt. It must not
+        // invalidate attempt 2, whose satisfaction cannot be revalidated.
+        db.connection
+            .execute_batch("PRAGMA foreign_keys=OFF;")
+            .unwrap();
+        let tx = db.connection.transaction().unwrap();
+        let digest = "d".repeat(64);
+        let oid = "a".repeat(40);
+        tx.execute(
+            "INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,'/tmp/project',?1,?2,?2,'pred',1,?2,'attempt-1','policy',?2,?3,?3,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?2,0,0,2)",
+            params![older, digest, oid],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?1,?2,?3,?3,'sha1',?2,?2,'linux-unshare-user-pid-mount-v1',0,2)",
+            params![older, digest, oid],
+        )
+        .unwrap();
+        record_verified_result(&tx, &older).unwrap();
+        tx.commit().unwrap();
+        db.connection
+            .execute_batch("PRAGMA foreign_keys=ON;")
+            .unwrap();
+        let runs: i64 = db
+            .connection
+            .query_row(
+                "SELECT count(*) FROM verification_runs WHERE attempt_id='attempt-1' AND state='accepted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(runs, 1);
+        assert_eq!(
+            satisfaction_states(&db.connection, "verified_result"),
+            vec![(current, "valid".into())]
+        );
+        assert_eq!(
+            dependency_lines(&db.queue_report(0).unwrap(), "needs-verified"),
+            vec!["admission_disabled:verified_result".to_string()]
         );
     }
 
