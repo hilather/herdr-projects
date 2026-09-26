@@ -327,12 +327,30 @@ fn acknowledge(
             Some((stored_package, _)) => elsewhere.push((change_id.clone(), stored_package)),
         }
     }
+    if missing.is_empty() && stored_sequences.is_empty() {
+        return Err(StoreError::Conflict);
+    }
+    if missing.is_empty() && ack.disposition == "seen" {
+        // Rows this ack inserted share the newest sequence on this package.
+        // A later apply retargets older rows here without changing their sequence.
+        let sequence =
+            stored_sequences.iter().copied().max().ok_or_else(|| {
+                invalid("package acknowledgment must list that package's change ids")
+            })?;
+        return Ok(PackageAckReceipt {
+            package_id: package.package_id.clone(),
+            disposition: ack.disposition.clone(),
+            change_ids: package.change_ids.clone(),
+            sequence,
+        });
+    }
     if missing.is_empty() && elsewhere.is_empty() {
-        let Some(sequence) = stored_sequences.iter().copied().min() else {
-            return Err(invalid(
-                "package acknowledgment must list that package's change ids",
+        let sequence = stored_sequences[0];
+        if stored_sequences.iter().any(|stored| *stored != sequence) {
+            return Err(StoreError::Corrupt(
+                "package acknowledgment receipts diverged".into(),
             ));
-        };
+        }
         return Ok(PackageAckReceipt {
             package_id: package.package_id.clone(),
             disposition: ack.disposition.clone(),
@@ -342,9 +360,6 @@ fn acknowledge(
     }
     // A seen ack never moves an existing row onto an older or wider package.
     if ack.disposition == "seen" {
-        if missing.is_empty() {
-            return Err(StoreError::Conflict);
-        }
         if !stored_sequences.is_empty() && elsewhere.is_empty() {
             return Err(StoreError::Corrupt(
                 "package acknowledgment receipts are partial".into(),
@@ -1165,11 +1180,22 @@ mod tests {
             .store
             .acknowledge_update_package(&ack(&first, "seen"), 1)
             .unwrap();
-        memory
+        let seen_wider = memory
             .store
             .acknowledge_update_package(&ack(&wider, "seen"), 1)
             .unwrap();
         let head_after_wider_seen = sequence(&memory, "SELECT max(sequence) FROM events");
+        assert_eq!(
+            memory
+                .store
+                .acknowledge_update_package(&ack(&wider, "seen"), 1)
+                .unwrap(),
+            seen_wider
+        );
+        assert_eq!(
+            sequence(&memory, "SELECT max(sequence) FROM events"),
+            head_after_wider_seen
+        );
         let seen_package: (String, i64) = memory
             .store
             .connection
@@ -1259,6 +1285,18 @@ mod tests {
             .unwrap();
         assert_eq!(moved, wider.package_id);
         let head_after_apply = sequence(&memory, "SELECT max(sequence) FROM events");
+        assert_eq!(
+            memory
+                .store
+                .acknowledge_update_package(&ack(&wider, "seen"), 1)
+                .unwrap()
+                .sequence,
+            seen_wider.sequence
+        );
+        assert_eq!(
+            sequence(&memory, "SELECT max(sequence) FROM events"),
+            head_after_apply
+        );
         assert!(matches!(
             memory
                 .store
