@@ -1850,7 +1850,7 @@ fn planning_gate_ten_logical_workers() {
     let digest = config.digest.clone().unwrap();
 
     let mut db = SqliteStore::create(&db_path).unwrap();
-    assert_eq!(db.read_snapshot(None).unwrap().schema_version, 36);
+    assert_eq!(db.read_snapshot(None).unwrap().schema_version, 37);
     let workers: Vec<String> = (0..10).map(|index| format!("w-{index:02}")).collect();
     db.commit(Commit {
         expected_head: 0,

@@ -262,6 +262,8 @@ impl SqliteStore {
         }
         let sub=format!("sub-{:x}",Sha256::digest(format!("{subscriber}\0{}",id.as_str()).as_bytes()));
         tx.execute("INSERT INTO memory_subscriptions VALUES(?1,?2,?3,?4)",params![sub,subscriber,id.as_str(),integer(sequence)?])?;
+        let binding_task=if plan.coordinator {None} else {Some(task_id.as_str())};
+        super::consumer_bindings::ensure_for_snapshot(&tx,&subscriber,id.as_str(),binding_task)?;
         tx.commit()?;
         self.read_memory_snapshot(id.as_str())
     }
