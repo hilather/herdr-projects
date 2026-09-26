@@ -3164,3 +3164,394 @@ fn memory_barrier_edit_invalidates_the_release_token() {
         .unwrap();
     assert_eq!(flag, "off");
 }
+
+fn scale_count(path: &Path, query: &str) -> i64 {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row(query, [], |row| row.get(0))
+        .unwrap()
+}
+
+fn insert_scale_history(path: &Path, events: usize) {
+    let mut conn = rusqlite::Connection::open(path).unwrap();
+    let tx = conn.transaction().unwrap();
+    let mut remaining = events;
+    while remaining > 0 {
+        let batch = remaining.min(500);
+        tx.execute(
+            "WITH RECURSIVE c(n) AS (
+                SELECT 1
+                UNION ALL
+                SELECT n + 1 FROM c WHERE n < ?1
+            )
+            INSERT INTO events(kind, entity, revision, payload_version, payload)
+            SELECT 'scale.history', 'history', 1, 1, '{}' FROM c",
+            [i64::try_from(batch).unwrap()],
+        )
+        .unwrap();
+        remaining -= batch;
+    }
+    tx.commit().unwrap();
+}
+
+fn assert_scale_gate_text() {
+    let doc = include_str!("../docs/factory/scale-gate.md");
+    let (body, appendix) = doc
+        .split_once("## Simulator appendix")
+        .expect("simulator appendix");
+    let appendix_flat = appendix.split_whitespace().collect::<Vec<_>>().join(" ");
+    let latency = body
+        .split_once("## Latency")
+        .expect("latency section")
+        .1
+        .split_once("### Samples")
+        .expect("samples")
+        .0;
+    assert!(
+        latency.contains("`not frozen`"),
+        "PR 33 latency decision was replaced"
+    );
+    assert!(
+        latency.contains("not a measured bar and not a lowered bar"),
+        "latency section no longer quotes the deferred bar"
+    );
+    assert!(
+        appendix.contains("`not frozen`"),
+        "appendix must quote the PR 33 decision"
+    );
+    assert!(
+        appendix_flat.contains("Latency targets were not claimed."),
+        "appendix must say the latency targets were not claimed"
+    );
+    assert!(
+        appendix.contains("not a live 40-worker certificate"),
+        "appendix must refuse a live 40-worker certificate"
+    );
+    assert!(appendix.contains("32") && appendix.contains("64"));
+    assert!(appendix.contains("1,000") && appendix.contains("100,000"));
+    let lower = doc.to_ascii_lowercase();
+    for phrase in [
+        "targets met",
+        "targets were met",
+        "p95 passed",
+        "latency passed",
+        "lowered to",
+        "within 250",
+        "under 250",
+        "live 40 passed",
+        "40-worker certificate passed",
+    ] {
+        assert!(
+            !lower.contains(phrase),
+            "scale gate claims a pass via {phrase}"
+        );
+    }
+}
+
+/// History is event rows the hot path must not have to snapshot. Workers are the
+/// active set. A satisfaction row without a verified receipt is not evidence.
+fn scale_case(history_events: usize, workers: usize) {
+    assert!(matches!(workers, 32 | 64));
+    assert!(matches!(history_events, 1_000 | 100_000));
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state.db");
+    SqliteStore::create(&path).unwrap();
+    insert_scale_history(&path, history_events);
+    let mut db = SqliteStore::open(&path).unwrap();
+    assert_eq!(db.current_head().unwrap(), history_events as u64);
+    assert_eq!(
+        db.read_targeted_hot_path(0, true).unwrap(),
+        herdr_projects::store::SCHEMA
+    );
+
+    let ids: Vec<TaskId> = (0..workers)
+        .map(|index| TaskId::new(format!("w-{index:04}")).unwrap())
+        .collect();
+    let mutations = ids
+        .iter()
+        .map(|id| Mutation::Task {
+            expected: None,
+            next: Task {
+                id: id.clone(),
+                revision: 1,
+                state: TaskState::Draft,
+                title: format!("logical worker {}", id.as_str()),
+                active_attempt: None,
+            },
+        })
+        .collect();
+    db.commit(Commit {
+        expected_head: db.current_head().unwrap(),
+        mutations,
+    })
+    .unwrap();
+    let mut revision = vec![1u64; workers];
+    for (index, id) in ids.iter().enumerate() {
+        let change = db
+            .create_runtime(
+                Some(id),
+                Some(revision[index]),
+                db.current_head().unwrap(),
+                &RuntimeRoute::default(),
+            )
+            .unwrap();
+        revision[index] = change.task_revision.unwrap();
+    }
+    let now = 1_700_000_000_000;
+    for (index, id) in ids.iter().enumerate() {
+        let dependencies = if index == 0 {
+            Vec::new()
+        } else {
+            vec![Dependency {
+                predecessor: ids[0].clone(),
+                requirement: DependencyRequirement::VerifiedResult,
+            }]
+        };
+        db.queue_task(
+            id,
+            revision[index],
+            db.current_head().unwrap(),
+            &QueueRequest {
+                priority: 0,
+                dependencies,
+            },
+            now,
+        )
+        .unwrap();
+        revision[index] += 1;
+    }
+    let predecessor = ids[0].clone();
+    db.commit(Commit {
+        expected_head: db.current_head().unwrap(),
+        mutations: vec![Mutation::Task {
+            expected: Some(revision[0]),
+            next: Task {
+                id: predecessor.clone(),
+                revision: revision[0] + 1,
+                state: TaskState::Succeeded,
+                title: format!("logical worker {}", predecessor.as_str()),
+                active_attempt: None,
+            },
+        }],
+    })
+    .unwrap();
+    assert_eq!(
+        scale_count(&path, "SELECT count(*) FROM dependency_satisfactions"),
+        0,
+        "narrative success wrote a satisfaction"
+    );
+    assert_eq!(
+        scale_count(&path, "SELECT count(*) FROM verified_results"),
+        0
+    );
+    let before_policy = db.queue_report(now).unwrap();
+    assert_eq!(
+        before_policy.policy.max_active_workers, 0,
+        "max_active_workers default changed"
+    );
+    assert!(!before_policy.launch_enabled);
+    let evidence = format!(
+        "verified_dependency_evidence_unavailable:{}:verified_result",
+        predecessor.as_str()
+    );
+    assert!(before_policy.entries.iter().any(|entry| entry.task != predecessor
+        && entry.blockers.iter().any(|blocker| blocker == &evidence)));
+
+    let head = db
+        .set_scheduler_policy(
+            db.current_head().unwrap(),
+            before_policy.policy.revision,
+            u32::try_from(workers).unwrap(),
+            before_policy.policy.max_attempts_per_task,
+        )
+        .unwrap();
+    assert_eq!(head, db.current_head().unwrap());
+    let open_slots = db.queue_report(now).unwrap();
+    assert_eq!(open_slots.available_slots, workers);
+    assert_eq!(open_slots.retained_attempts, 0);
+
+    let attempts: Vec<Mutation> = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| Mutation::Attempt {
+            expected: None,
+            next: Attempt {
+                id: AttemptId::new(format!("attempt-{index:04}")).unwrap(),
+                task: id.clone(),
+                revision: 1,
+                state: AttemptState::Running,
+                snapshot: None,
+                reservation: format!("slot-{index:04}"),
+                termination_observed: false,
+            },
+        })
+        .collect();
+    db.commit(Commit {
+        expected_head: db.current_head().unwrap(),
+        mutations: attempts,
+    })
+    .unwrap();
+    let held = db.queue_report(now).unwrap();
+    assert_eq!(held.retained_attempts, workers);
+    assert_eq!(held.available_slots, 0);
+    assert!(held
+        .entries
+        .iter()
+        .filter(|entry| entry.task != predecessor)
+        .all(|entry| entry.blockers.iter().any(|blocker| blocker == &evidence)));
+    assert_eq!(
+        scale_count(&path, "SELECT count(*) FROM dependency_satisfactions"),
+        0
+    );
+
+    let admission: String = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT factory_admission FROM project_control WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(admission, "off");
+    // A row with no verified receipt must not clear the blocker.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "INSERT INTO dependency_satisfactions(satisfaction_id,task_id,predecessor_task,requirement,state,evidence_kind,evidence_id,created_unix_ms) VALUES(?1,?2,?3,'verified_result','valid','verified_result',?4,?5)",
+            rusqlite::params!["ab".repeat(32), ids[1].as_str(), predecessor.as_str(), "cd".repeat(32), now],
+        )
+        .unwrap();
+    let forged = db.queue_report(now).unwrap();
+    assert!(forged
+        .entries
+        .iter()
+        .filter(|entry| entry.task != predecessor)
+        .all(|entry| entry.blockers.iter().any(|blocker| blocker == &evidence)));
+    assert_eq!(
+        scale_count(&path, "SELECT count(*) FROM verified_results"),
+        0
+    );
+    assert_eq!(forged.available_slots, 0);
+
+    // One page that does not reach the end is not coverage and cannot release a slot.
+    let stopped = db.reconcile_active_work(Some(1)).unwrap();
+    assert!(!stopped.capacity_release_allowed, "slot released early");
+    if workers >= herdr_projects::store::ACTIVE_WORK_PAGE {
+        assert_eq!(
+            stopped.coverage,
+            herdr_projects::store::ActiveCoverage::Incomplete
+        );
+    }
+    let covered = db.reconcile_active_work(None).unwrap();
+    assert_eq!(
+        covered.coverage,
+        herdr_projects::store::ActiveCoverage::Complete
+    );
+    assert_eq!(covered.items.len(), workers);
+    assert!(covered.items.iter().all(|item| item.retains_capacity));
+    assert!(!covered.capacity_release_allowed, "slot released early");
+    let seen = covered
+        .items
+        .iter()
+        .map(|item| item.binding.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    for id in &ids {
+        assert!(seen.contains(&format!("task:{}", id.as_str())));
+    }
+    assert_eq!(
+        db.read_targeted_hot_path(now, true).unwrap(),
+        herdr_projects::store::SCHEMA
+    );
+
+    let cancelled = db
+        .cancel_attempt(
+            &AttemptId::new("attempt-0001").unwrap(),
+            1,
+            db.current_head().unwrap(),
+            "stop does not release the slot",
+            now,
+        )
+        .unwrap();
+    assert!(!cancelled.released, "slot released early");
+    let after_cancel = db.queue_report(now).unwrap();
+    assert_eq!(after_cancel.retained_attempts, workers);
+    assert_eq!(after_cancel.available_slots, 0);
+    assert!(!db
+        .reconcile_active_work(None)
+        .unwrap()
+        .capacity_release_allowed);
+
+    db.commit(Commit {
+        expected_head: db.current_head().unwrap(),
+        mutations: vec![Mutation::Attempt {
+            expected: Some(cancelled.attempt_revision),
+            next: Attempt {
+                id: cancelled.attempt.clone(),
+                task: ids[1].clone(),
+                revision: cancelled.attempt_revision + 1,
+                state: AttemptState::Cancelled,
+                snapshot: None,
+                reservation: "slot-0001".into(),
+                termination_observed: true,
+            },
+        }],
+    })
+    .unwrap();
+    let released_one = db.queue_report(now).unwrap();
+    assert_eq!(released_one.retained_attempts, workers - 1);
+    assert_eq!(released_one.available_slots, 1);
+    let after = db.reconcile_active_work(None).unwrap();
+    assert_eq!(
+        after.coverage,
+        herdr_projects::store::ActiveCoverage::Complete
+    );
+    assert_eq!(after.items.len(), workers - 1);
+    assert!(!after.capacity_release_allowed, "remaining slots released early");
+    assert!(after
+        .items
+        .iter()
+        .all(|item| item.binding.id != "task:w-0001"));
+    assert!(released_one
+        .entries
+        .iter()
+        .any(|entry| entry.task.as_str() == "w-0002"
+            && entry.blockers.iter().any(|blocker| blocker == &evidence)));
+    assert_eq!(
+        scale_count(
+            &path,
+            "SELECT count(*) FROM attempts WHERE termination_observed=0"
+        ),
+        i64::try_from(workers - 1).unwrap()
+    );
+    assert_eq!(
+        scale_count(
+            &path,
+            "SELECT count(*) FROM events WHERE kind='scale.history'"
+        ),
+        i64::try_from(history_events).unwrap()
+    );
+    assert!(scale_count(&path, "SELECT count(*) FROM events") > i64::try_from(history_events).unwrap());
+}
+
+#[test]
+fn scale_gate_for_32_and_64_workers() {
+    assert_eq!(
+        herdr_projects::store::HOT_PATH_READ,
+        herdr_projects::store::HotPathRead::Targeted
+    );
+    assert!(
+        !herdr_projects::store::hot_path_uses_snapshot(),
+        "hot path is still shadow / Snapshot"
+    );
+    let poll = include_str!("../src/canonical_controller.rs");
+    assert!(
+        poll.contains("const PREPARED_LAUNCH_DISPATCH_ENABLED: bool = true;"),
+        "prepared launch dispatch was edited"
+    );
+    assert_scale_gate_text();
+    for history in [1_000usize, 100_000] {
+        for workers in [32usize, 64] {
+            scale_case(history, workers);
+        }
+    }
+}

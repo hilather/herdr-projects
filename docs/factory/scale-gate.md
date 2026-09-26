@@ -32,3 +32,17 @@ is not a sample of either quantity.
 It is a tick, not a decision SLA and not an observation-age bar. When that
 work is not pending the cadence is `TICK` (15 s). That idle tick is existing
 behavior, not a freshness bar.
+
+## Simulator appendix
+
+The latency section above is `not frozen`. This is not a measured bar and not a
+lowered bar. It is not a pass of the provisional targets. Latency targets were
+not claimed. This appendix does not add a numeric bar.
+
+`tests/factory_harness.rs` runs 32 and 64 logical workers against event
+histories of about 1,000 and about 100,000. It asserts no false satisfaction,
+no slot released early, and complete coverage. The hot path constant must be
+`HotPathRead::Targeted`. Shadow / `HotPathRead::Snapshot` fails the gate. This
+is not a live 40-worker certificate. `max_active_workers` defaults are
+unchanged. `factory_admission` stays `off` in production code. The harness does
+not turn that column on. No live provider. No pull-request poll.
