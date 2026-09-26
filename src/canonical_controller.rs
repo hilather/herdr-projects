@@ -31,16 +31,27 @@ impl crate::runner::Runner for ProbeBudget<'_> {
 pub fn poll(ctx:&Ctx,path:&Path,turn:u64)->Result<PollResult> {
     let path=path.canonicalize()?;
     let ownership=herdr_projects::execution_guard::ProjectGuard::acquire(&path)?;
-    ensure!(herdr_projects::store::hot_path_uses_snapshot(),"hot path reader is read_snapshot");
     let mut db=herdr_projects::migration::open_active(&path)?;
-    let snapshot=db.read_snapshot(None)?;
     let now=jiff::Timestamp::now().as_millisecond();
-    if let Err(error)=db.shadow_against_snapshot(&snapshot,now,launch_dispatch_enabled()) {
-        if matches!(error,herdr_projects::store::StoreError::Cancelled|herdr_projects::store::StoreError::Deadline) {
-            anyhow::bail!("controller read aborted: {error}");
+    match herdr_projects::store::HOT_PATH_READ {
+        herdr_projects::store::HotPathRead::Targeted=>{
+            let schema=match db.read_targeted_hot_path(now,launch_dispatch_enabled()) {
+                Ok(schema)=>schema,
+                Err(error) if matches!(error,herdr_projects::store::StoreError::Cancelled|herdr_projects::store::StoreError::Deadline)=>anyhow::bail!("controller read aborted: {error}"),
+                Err(error)=>return Err(error.into()),
+            };
+            ensure!(schema>=9,"upgrade-store is required before canonical controller polling");
+        }
+        herdr_projects::store::HotPathRead::Snapshot=>{
+            let snapshot=db.read_snapshot(None)?;
+            if let Err(error)=db.shadow_against_snapshot(&snapshot,now,launch_dispatch_enabled()) {
+                if matches!(error,herdr_projects::store::StoreError::Cancelled|herdr_projects::store::StoreError::Deadline) {
+                    anyhow::bail!("controller read aborted: {error}");
+                }
+            }
+            ensure!(snapshot.schema_version>=9,"upgrade-store is required before canonical controller polling");
         }
     }
-    ensure!(snapshot.schema_version>=9,"upgrade-store is required before canonical controller polling");
     // Collect without a SQLite transaction. Commit and expiry are serialized with
     // all supported lifecycle/effect adapters, without reacquiring ticker leadership.
     let budget=ProbeBudget{runner:ctx.runner,deadline:std::time::Instant::now()+std::time::Duration::from_secs(15)};

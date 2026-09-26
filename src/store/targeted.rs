@@ -1,4 +1,4 @@
-//! Shadow readers for the controller hot path. The acted-on result stays `read_snapshot`.
+//! Targeted rows for the controller hot path. `read_snapshot` stays for admin and diagnostics.
 use super::{
     Result, Snapshot, SqliteStore, StoreError, approvals, control, controlled,
     controller_hint::EffectMode, delivery, read_attempts_with_budget, read_budget,
@@ -16,7 +16,7 @@ pub enum HotPathRead {
     Targeted,
 }
 
-pub const HOT_PATH_READ: HotPathRead = HotPathRead::Snapshot;
+pub const HOT_PATH_READ: HotPathRead = HotPathRead::Targeted;
 
 pub fn hot_path_uses_snapshot() -> bool {
     matches!(HOT_PATH_READ, HotPathRead::Snapshot)
@@ -270,7 +270,8 @@ impl SqliteStore {
         self.shadow_against(snapshot, now, include_launches, None)
     }
 
-    /// Read the snapshot the controller acts on, then shadow the targeted readers unless the caller already aborted.
+    /// Read the snapshot and shadow the targeted readers unless the caller already aborted.
+    /// `acted_on` stays the snapshot result; the controller hot path uses `read_targeted_hot_path`.
     pub fn shadow_compare(
         &mut self,
         now: i64,
@@ -308,7 +309,7 @@ impl SqliteStore {
             // Same event decoder as read_snapshot, so a corrupt payload fails both.
             read_events_with_budget(&self.connection, budget).map(|_| ())
         } else {
-            self.targeted_ready(now, include_launches, budget)
+            self.targeted_ready(now, include_launches, budget).map(|_| ())
         };
         if let Err(failure) = &targeted
             && is_abort(failure)
@@ -323,22 +324,49 @@ impl SqliteStore {
         Ok(added)
     }
 
+    /// Schema after the targeted row read the controller acts on.
+    /// Later migration tables are absent on an older published schema.
+    pub fn read_targeted_hot_path(&mut self, now: i64, include_launches: bool) -> Result<u32> {
+        self.targeted_ready(now, include_launches, None)
+    }
+
     fn targeted_ready(
         &mut self,
         now: i64,
         include_launches: bool,
         budget: Option<&read_budget::ReadBudget>,
-    ) -> Result<()> {
+    ) -> Result<u32> {
         check(budget)?;
         let tx = self.connection.transaction()?;
+        let schema: u32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         let tasks = read_tasks_with_budget(&tx, budget)?;
         let attempts = read_attempts_with_budget(&tx, budget)?;
         let operations = read_operations_matching_with_budget(&tx, None, budget)?;
-        let deliveries = delivery::read_all_with_budget(&tx, budget)?;
-        let control = control::read_with_budget(&tx, budget)?;
-        let scheduler_rows = scheduler::read_with_tasks(&tx, &tasks, budget)?;
-        let inputs = reservations::read_inputs_with_budget(&tx, budget)?;
-        let approvals = approvals::read_all_with(&tx, &inputs, budget)?;
+        let deliveries = if schema >= 3 {
+            delivery::read_all_with_budget(&tx, budget)?
+        } else {
+            Vec::new()
+        };
+        let control = if schema >= 7 {
+            Some(control::read_with_budget(&tx, budget)?)
+        } else {
+            None
+        };
+        let scheduler_rows = if schema >= 10 {
+            Some(scheduler::read_with_tasks(&tx, &tasks, budget)?)
+        } else {
+            None
+        };
+        let inputs = if schema >= 11 {
+            reservations::read_inputs_with_budget(&tx, budget)?
+        } else {
+            Vec::new()
+        };
+        let approvals = if schema >= 13 {
+            approvals::read_all_with(&tx, &inputs, budget)?
+        } else {
+            Vec::new()
+        };
         let _ = (
             retained(&attempts),
             due_effects(&operations, &deliveries, now, include_launches),
@@ -348,11 +376,11 @@ impl SqliteStore {
             now,
             &tasks,
             &attempts,
-            Some(&scheduler_rows),
-            Some(&control),
+            scheduler_rows.as_ref(),
+            control.as_ref(),
             &approvals,
         )?;
-        Ok(())
+        Ok(schema)
     }
 
     #[cfg(test)]
@@ -478,6 +506,8 @@ mod tests {
         assert!(compared.acted_on.is_ok());
         assert_eq!(compared.mismatches_added, 0);
         assert_eq!(targeted_mismatch_count(), before);
+        assert_eq!(db.read_targeted_hot_path(now, true).unwrap(), SCHEMA);
+        assert_eq!(targeted_mismatch_count(), before);
 
         let raw = rusqlite::Connection::open(temp.path().join("state.db")).unwrap();
         raw.execute_batch("PRAGMA ignore_check_constraints=ON")
@@ -597,12 +627,14 @@ mod tests {
     }
 
     #[test]
-    fn targeted_hot_path_still_calls_read_snapshot() {
-        assert!(hot_path_uses_snapshot());
-        assert_eq!(HOT_PATH_READ, HotPathRead::Snapshot);
+    fn targeted_hot_path_is_the_production_default() {
+        assert!(
+            !hot_path_uses_snapshot(),
+            "shadow mode must not be the production default"
+        );
+        assert_eq!(HOT_PATH_READ, HotPathRead::Targeted);
         let source = include_str!("../canonical_controller.rs");
         assert!(source.contains("const PREPARED_LAUNCH_DISPATCH_ENABLED: bool = true;"));
-        assert!(!source.contains("HotPathRead::Targeted"));
         let poll = source
             .split("pub fn poll(")
             .nth(1)
@@ -610,8 +642,22 @@ mod tests {
             .split("pub fn poll_queued")
             .next()
             .expect("poll body");
-        assert!(poll.contains("read_snapshot(None)"), "{poll}");
-        assert!(poll.contains("hot_path_uses_snapshot()"), "{poll}");
-        assert!(poll.contains("shadow_against_snapshot"), "{poll}");
+        assert!(!poll.contains("hot_path_uses_snapshot()"), "{poll}");
+        let targeted = poll
+            .split("HotPathRead::Targeted")
+            .nth(1)
+            .expect("targeted arm")
+            .split("HotPathRead::Snapshot")
+            .next()
+            .expect("targeted arm");
+        assert!(targeted.contains("read_targeted_hot_path"), "{targeted}");
+        assert!(!targeted.contains("read_snapshot"), "{targeted}");
+        assert!(targeted.contains("StoreError::Cancelled"), "{targeted}");
+        assert!(targeted.contains("StoreError::Deadline"), "{targeted}");
+        let snapshot_arm = poll
+            .split("HotPathRead::Snapshot")
+            .nth(1)
+            .expect("snapshot arm");
+        assert!(snapshot_arm.contains("read_snapshot(None)"), "{snapshot_arm}");
     }
 }
