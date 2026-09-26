@@ -1627,3 +1627,684 @@ mod slice {
         assert!(read["git_sha"].as_str().unwrap().len() >= 40);
     }
 }
+
+#[cfg(target_os = "linux")]
+fn unix_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+}
+
+#[cfg(target_os = "linux")]
+fn sql_count(path: &Path, query: &str) -> i64 {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row(query, [], |row| row.get(0))
+        .unwrap()
+}
+
+#[cfg(target_os = "linux")]
+fn loose_objects(repo: &Path) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for prefix in fs::read_dir(repo.join(".git/objects")).unwrap() {
+        let prefix = prefix.unwrap();
+        let name = prefix.file_name().into_string().unwrap();
+        if !prefix.file_type().unwrap().is_dir()
+            || name.len() != 2
+            || name == "info"
+            || name == "pack"
+        {
+            continue;
+        }
+        for file in fs::read_dir(prefix.path()).unwrap() {
+            let file = file.unwrap();
+            let rest = file.file_name().into_string().unwrap();
+            found.push((format!("{name}{rest}"), format!("{name}/{rest}")));
+        }
+    }
+    found
+}
+
+#[cfg(target_os = "linux")]
+fn install_fixture_contract(
+    db_path: &Path,
+    task: &str,
+    repository: &str,
+    oid: &str,
+    object_format: &str,
+    path: &str,
+) -> String {
+    let store = fs::canonicalize(db_path).unwrap().display().to_string();
+    let raw = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "task_id": task,
+        "contract_revision": 1,
+        "repository": repository,
+        "base_oid": oid,
+        "object_format": object_format,
+        "scope_path": path,
+        "acceptance_policy": PLANNING_POLICY,
+    }))
+    .unwrap();
+    let digest = format!("{:x}", Sha256::digest(&raw));
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.execute(
+        "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('contract.installed',?1,1,1,?2)",
+        rusqlite::params![task, serde_json::json!({"digest": digest, "route": "verify_only"}).to_string()],
+    )
+    .unwrap();
+    let sequence = conn.last_insert_rowid();
+    let head: i64 = conn
+        .query_row("SELECT MAX(sequence) FROM events", [], |row| row.get(0))
+        .unwrap();
+    conn.execute(
+        "INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq) VALUES(?1,1,NULL,?2,?3,?4,?5,?6,NULL,'verify_only',?7,?8,?9)",
+        rusqlite::params![task, store, head, repository, oid, object_format, raw, digest, sequence],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO acceptance_policies(task_id,contract_revision,policy_id,body) VALUES(?1,1,'builds',?2)",
+        rusqlite::params![task, PLANNING_POLICY],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO contract_scope_paths(task_id,contract_revision,ordinal,path,access,certainty) VALUES(?1,1,0,?2,'write','exact')",
+        rusqlite::params![task, path],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO resource_claims(task_id,contract_revision,ordinal,kind,resource,access,certainty) VALUES(?1,1,0,'path',?2,'write','exact')",
+        rusqlite::params![task, path],
+    )
+    .unwrap();
+    digest
+}
+
+#[cfg(target_os = "linux")]
+fn plant_profile(db_path: &Path, config: &herdr_projects::migration::ConfigReference) {
+    use std::os::unix::fs::MetadataExt;
+    let evidence = VersionedReference {
+        id: "sim-evidence".into(),
+        revision: 1,
+        digest: "a".repeat(64),
+    };
+    let supported = CapabilityEvidence::Supported {
+        evidence: evidence.clone(),
+    };
+    let profile = FrozenProfile {
+        version: 1,
+        name: "sim".into(),
+        kind: "codex".into(),
+        definition_digest: "b".repeat(64),
+        config: config.clone(),
+        arguments_digest: "c".repeat(64),
+        environment_names: Vec::new(),
+        execution_home: None,
+        permission_policy: VersionedReference {
+            id: "sim-policy".into(),
+            revision: 1,
+            digest: "d".repeat(64),
+        },
+        adapter: evidence,
+        agent: ExecutableIdentity {
+            path: "/usr/bin/git".into(),
+            digest: "e".repeat(64),
+            version: "1.0.0".into(),
+        },
+        herdr: ExecutableIdentity {
+            path: "/usr/bin/git".into(),
+            digest: "f".repeat(64),
+            version: "1.0.0".into(),
+        },
+        capabilities: ProfileCapabilities {
+            launch: supported.clone(),
+            readiness_observation: supported.clone(),
+            prompt_submission: supported.clone(),
+            stop: supported,
+            checkpoint_acknowledgment: CapabilityEvidence::Unknown,
+            structured_usage: CapabilityEvidence::Unknown,
+            resume: CapabilityEvidence::Unknown,
+        },
+        workflow_certificate: None,
+    };
+    profile.validate_for_launch().unwrap();
+    let reference = profile.reference().unwrap();
+    let canonical = fs::canonicalize(db_path).unwrap();
+    let metadata = fs::metadata(&canonical).unwrap();
+    let report = serde_json::json!({
+        "preparation": {
+            "profile": profile,
+            "reference": reference,
+            "launchable": true,
+            "protocol_capable": false,
+            "certified": false
+        },
+        "source_store": [canonical, metadata.dev(), metadata.ino()]
+    });
+    let text = serde_json::to_string(&report).unwrap();
+    let report_digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.execute(
+        "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('profile.native_retained',?1,1,1,?2)",
+        rusqlite::params![reference.id, serde_json::to_string(&reference).unwrap()],
+    )
+    .unwrap();
+    let sequence = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO native_profiles(profile_digest,report,report_digest,sequence) VALUES(?1,?2,?3,?4)",
+        rusqlite::params![reference.digest, text, report_digest, sequence],
+    )
+    .unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn insert_grant(db_path: &Path, inputs: &LaunchInputs) {
+    let profile = inputs.effective_profile.as_ref().unwrap();
+    let grant = ApprovalGrant {
+        version: 1,
+        scope: ApprovalScope::for_launch(inputs).unwrap(),
+        policy: profile.permission_policy.clone(),
+        issued_unix_ms: 0,
+        expires_unix_ms: unix_ms() + 3_600_000,
+    };
+    let reference = grant.reference().unwrap();
+    let payload = serde_json::to_vec(&grant).unwrap();
+    assert_eq!(format!("{:x}", Sha256::digest(&payload)), reference.digest);
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.execute(
+        "INSERT INTO approval_grants(id,payload,payload_hash) VALUES(?1,?2,?3)",
+        rusqlite::params![
+            reference.id,
+            String::from_utf8(payload).unwrap(),
+            reference.digest
+        ],
+    )
+    .unwrap();
+}
+
+#[cfg(target_os = "linux")]
+const PLANNING_POLICY: &str = "{\"version\":1,\"checks\":[\"/usr/bin/git\",\"diff\",\"--quiet\"]}";
+
+
+#[cfg(target_os = "linux")]
+#[test]
+fn planning_gate_ten_logical_workers() {
+    let doc = include_str!("../docs/factory/planning-gate.md");
+    assert!(
+        doc.contains("live F2.7 is not run"),
+        "planning gate must say live F2.7 is not run"
+    );
+    let lower = doc.to_ascii_lowercase();
+    for phrase in [
+        "f2.7 passed",
+        "live pilot passed",
+        "pilot passed",
+        "targets met",
+    ] {
+        assert!(
+            !lower.contains(phrase),
+            "planning gate claims a live pass via {phrase}"
+        );
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    fs::create_dir_all(project.join(".state")).unwrap();
+    let db_path = project.join(".state/state.db");
+    let (repo, oid) = build_repo(tmp.path(), SEED);
+    let repo = fs::canonicalize(&repo).unwrap();
+    let repository = repo.display().to_string();
+    let object_format = if oid.len() == 40 { "sha1" } else { "sha256" };
+    assert!(matches!(oid.len(), 40 | 64), "{oid}");
+    let objects = loose_objects(&repo);
+    assert!(
+        objects.iter().any(|(object, _)| object == &oid),
+        "commit object missing"
+    );
+
+    let config_path = tmp.path().join("owner.toml");
+    fs::write(&config_path, "version = 1\n").unwrap();
+    let config = herdr_projects::migration::config_reference(&config_path).unwrap();
+    let digest = config.digest.clone().unwrap();
+
+    let mut db = SqliteStore::create(&db_path).unwrap();
+    assert_eq!(db.read_snapshot(None).unwrap().schema_version, 36);
+    let workers: Vec<String> = (0..10).map(|index| format!("w-{index:02}")).collect();
+    db.commit(Commit {
+        expected_head: 0,
+        mutations: workers
+            .iter()
+            .map(|id| Mutation::Task {
+                expected: None,
+                next: Task {
+                    id: TaskId::new(id).unwrap(),
+                    revision: 1,
+                    state: TaskState::Draft,
+                    title: format!("logical worker {id}"),
+                    active_attempt: None,
+                },
+            })
+            .collect(),
+    })
+    .unwrap();
+    for id in &workers {
+        let snapshot = db.read_snapshot(None).unwrap();
+        let task = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.id.as_str() == id)
+            .unwrap();
+        db.create_runtime(
+            Some(&task.id),
+            Some(task.revision),
+            snapshot.head,
+            &RuntimeRoute::default(),
+        )
+        .unwrap();
+    }
+    let queued_at = unix_ms() - 1_000;
+    for id in &workers {
+        let snapshot = db.read_snapshot(None).unwrap();
+        let task = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.id.as_str() == id)
+            .unwrap();
+        db.queue_task(
+            &task.id,
+            task.revision,
+            snapshot.head,
+            &QueueRequest {
+                priority: 0,
+                dependencies: Vec::new(),
+            },
+            queued_at,
+        )
+        .unwrap();
+    }
+    let snapshot = db.read_snapshot(None).unwrap();
+    let policy = snapshot.scheduler.as_ref().unwrap().policy.clone();
+    db.set_scheduler_policy(
+        snapshot.head,
+        policy.revision,
+        10,
+        policy.max_attempts_per_task,
+    )
+    .unwrap();
+    let now = unix_ms();
+    let snapshot = db.read_snapshot(None).unwrap();
+    let observations = snapshot
+        .runtime_bindings
+        .iter()
+        .map(|binding| {
+            let task_revision = binding.task.as_ref().and_then(|id| {
+                snapshot
+                    .tasks
+                    .iter()
+                    .find(|task| &task.id == id)
+                    .map(|task| task.revision)
+            });
+            herdr_projects::reconcile::RuntimeObservation {
+                binding: binding.id.clone(),
+                binding_revision: binding.revision,
+                task_revision,
+                observed_unix_ms: now,
+                collector: "herdr-git-v1".into(),
+                config_digest: Some(digest.clone()),
+                ..herdr_projects::reconcile::RuntimeObservation::default()
+            }
+        })
+        .collect::<Vec<_>>();
+    db.record_observations(snapshot.head, &observations)
+        .unwrap();
+    let snapshot = db.read_snapshot(None).unwrap();
+    let control = snapshot.control.unwrap();
+    db.set_project_state(
+        snapshot.head,
+        control.revision,
+        ProjectState::Active,
+        now,
+        Some(&digest),
+    )
+    .unwrap();
+    drop(db);
+
+    for (index, id) in workers.iter().enumerate() {
+        let path = if index >= 8 {
+            "shared/gate.rs"
+        } else {
+            match index {
+                0 => "src/w00.rs",
+                1 => "src/w01.rs",
+                2 => "src/w02.rs",
+                3 => "src/w03.rs",
+                4 => "src/w04.rs",
+                5 => "src/w05.rs",
+                6 => "src/w06.rs",
+                _ => "src/w07.rs",
+            }
+        };
+        install_fixture_contract(&db_path, id, &repository, &oid, object_format, path);
+    }
+    plant_profile(&db_path, &config);
+    assert!(!herdr_projects::admission::wake_enabled(&project));
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let flag: String = conn
+            .query_row(
+                "SELECT factory_admission FROM project_control WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(flag, "off");
+        // Fixture only. Production code has no writer for this column.
+        conn.execute(
+            "UPDATE project_control SET factory_admission='on' WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+    }
+    assert!(herdr_projects::admission::wake_enabled(&project));
+
+    let mut reserved = Vec::new();
+    for _ in 0..workers.len() {
+        let Some(inputs) = herdr_projects::admission::prepared_admission_inputs(&project).unwrap()
+        else {
+            break;
+        };
+        let task = inputs.task.as_str().to_string();
+        insert_grant(&db_path, &inputs);
+        let before = sql_count(&db_path, "SELECT count(*) FROM attempts");
+        herdr_projects::admission::admit_once(&project).unwrap();
+        let after = sql_count(&db_path, "SELECT count(*) FROM attempts");
+        assert_eq!(after, before + 1, "admission did not reserve {task}");
+        reserved.push(task);
+    }
+    assert!(
+        herdr_projects::admission::prepared_admission_inputs(&project)
+            .unwrap()
+            .is_none(),
+        "a blocked worker was still ready"
+    );
+    herdr_projects::admission::admit_once(&project).unwrap();
+    assert_eq!(
+        reserved.len(),
+        9,
+        "expected one overlap to leave a single worker unreserved, got {reserved:?}"
+    );
+    assert!(reserved.contains(&"w-08".to_string()), "{reserved:?}");
+    assert!(!reserved.contains(&"w-09".to_string()), "{reserved:?}");
+    assert_eq!(sql_count(&db_path, "SELECT count(*) FROM attempts"), 9);
+    assert_eq!(
+        sql_count(
+            &db_path,
+            "SELECT count(*) FROM (SELECT id FROM attempts GROUP BY id HAVING count(*)>1)"
+        ),
+        0
+    );
+
+    let (attempt, digest): (String, String) = {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let attempt = conn
+            .query_row("SELECT id FROM attempts WHERE task_id='w-00'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let digest = conn
+            .query_row(
+                "SELECT raw_digest FROM task_contracts WHERE task_id='w-00' AND contract_revision=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (attempt, digest)
+    };
+    let work = tmp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let mismatch = work.join("policy.json");
+    fs::write(&mismatch, b"{\"version\":1,\"checks\":[\"/bin/false\"]}").unwrap();
+    let mut db = SqliteStore::open(&db_path).unwrap();
+    for index in 1..=3 {
+        let submission = serde_json::json!({
+            "idempotency_key": format!("submit-{index}"),
+            "task_id": "w-00",
+            "contract_revision": 1,
+            "contract_digest": digest,
+            "attempt_id": attempt,
+            "repository": repository,
+            "base_oid": oid,
+            "candidate_oid": oid,
+            "object_format": object_format,
+            "artifact_manifest": [{"path": "README", "oid": oid}],
+            "claimed_checks": ["worker prose is not evidence"],
+            "objects": objects.iter().map(|(object, relative)| serde_json::json!({"oid": object, "relative_path": relative})).collect::<Vec<_>>()
+        });
+        let receipt = db
+            .submit_result(&serde_json::to_vec(&submission).unwrap())
+            .unwrap();
+        assert!(!receipt.replayed);
+        let request = herdr_projects::verification::VerifyRequest::new(
+            receipt.submission_id,
+            "builds",
+            &mismatch,
+            format!("verify-{index}"),
+            Duration::from_secs(5),
+            &work,
+        );
+        let outcome = herdr_projects::verification::verify(&mut db, &request).unwrap();
+        assert_eq!(outcome.state, "rejected", "{:?}", outcome.reason);
+        assert_eq!(outcome.reason.as_deref(), Some("policy_digest_mismatch"));
+        assert!(outcome.receipt.is_none());
+    }
+    let feedback: Vec<String> = {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT feedback_id FROM feedback_items ORDER BY created_unix_ms, feedback_id")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    };
+    assert_eq!(feedback.len(), 3);
+    assert_eq!(
+        sql_count(
+            &db_path,
+            "SELECT count(DISTINCT task_id) FROM feedback_items"
+        ),
+        1
+    );
+    assert_eq!(
+        sql_count(
+            &db_path,
+            "SELECT count(*) FROM feedback_items WHERE task_id='w-00' AND category='verifier_rejection' AND reason='policy_digest_mismatch'"
+        ),
+        3
+    );
+    assert_eq!(
+        sql_count(&db_path, "SELECT count(*) FROM plan_proposals"),
+        0
+    );
+    let first = db.request_replan(&feedback[0]).unwrap();
+    let replayed = db.request_replan(&feedback[0]).unwrap();
+    assert_eq!(format!("{first:?}"), format!("{replayed:?}"));
+    assert!(
+        format!("{first:?}").contains("automatic_count: 1"),
+        "{first:?}"
+    );
+    let second = db.request_replan(&feedback[1]).unwrap();
+    assert!(
+        format!("{second:?}").contains("automatic_count: 2"),
+        "{second:?}"
+    );
+    let third = db.request_replan(&feedback[2]).unwrap();
+    assert!(format!("{third:?}").contains("Escalated"), "{third:?}");
+    let again = db.request_replan(&feedback[2]).unwrap();
+    assert_eq!(format!("{third:?}"), format!("{again:?}"));
+    assert_eq!(
+        sql_count(
+            &db_path,
+            "SELECT count(*) FROM replan_requests WHERE outcome='automatic'"
+        ),
+        2
+    );
+    assert_eq!(
+        sql_count(
+            &db_path,
+            "SELECT count(*) FROM replan_requests WHERE outcome='escalated'"
+        ),
+        1
+    );
+    assert_eq!(
+        sql_count(&db_path, "SELECT count(*) FROM plan_proposals"),
+        0
+    );
+    assert_eq!(sql_count(&db_path, "SELECT count(*) FROM inbox_items"), 1);
+    let kind: String = rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .query_row(
+            "SELECT json_extract(payload, '$.kind') FROM inbox_items",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(kind, "replan-escalation");
+
+    let waits = [
+        ("w-01", "user_decision"),
+        ("w-02", "resource_availability"),
+        ("w-03", "adapter_recovery"),
+        ("w-09", "validation_completion"),
+    ];
+    let registered = db
+        .register_wait("w-00", Some(&attempt), "dependency_evidence")
+        .unwrap();
+    let duplicate = db
+        .register_wait("w-00", Some(&attempt), "dependency_evidence")
+        .unwrap();
+    assert!(
+        format!("{registered:?}").contains("already_registered: false"),
+        "{registered:?}"
+    );
+    assert!(
+        format!("{duplicate:?}").contains("already_registered: true"),
+        "{duplicate:?}"
+    );
+    for (task, condition) in waits {
+        db.register_wait(task, None, condition).unwrap();
+    }
+    assert_eq!(
+        sql_count(
+            &db_path,
+            "SELECT count(DISTINCT condition) FROM wait_conditions"
+        ),
+        5
+    );
+    let wait_id: String = rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .query_row(
+            "SELECT wait_id FROM wait_conditions WHERE task_id='w-00'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let replay = db.replay_wait(&wait_id).unwrap();
+    assert!(
+        format!("{replay:?}").contains("proved: false"),
+        "{replay:?}"
+    );
+    assert!(
+        format!("{replay:?}").contains("already_replayed: false"),
+        "{replay:?}"
+    );
+    let second_replay = db.replay_wait(&wait_id).unwrap();
+    assert!(
+        format!("{second_replay:?}").contains("already_replayed: true"),
+        "{second_replay:?}"
+    );
+    assert!(
+        format!("{second_replay:?}").contains("proved: false"),
+        "{second_replay:?}"
+    );
+
+    let attempts_before = sql_count(&db_path, "SELECT count(*) FROM attempts");
+    let retry = db.retry_infrastructure("w-00", &attempt).unwrap();
+    assert!(format!("{retry:?}").contains("ordinal: 1"), "{retry:?}");
+    assert_eq!(
+        sql_count(&db_path, "SELECT count(*) FROM attempts"),
+        attempts_before
+    );
+    assert_eq!(
+        sql_count(
+            &db_path,
+            "SELECT count(*) FROM attempt_infrastructure_retries"
+        ),
+        1
+    );
+    drop(db);
+
+    assert_eq!(sql_count(&db_path, "SELECT count(*) FROM attempts"), 9);
+    assert_eq!(
+        sql_count(&db_path, "SELECT count(DISTINCT id) FROM attempts"),
+        sql_count(&db_path, "SELECT count(*) FROM attempts")
+    );
+    assert_eq!(
+        sql_count(
+            &db_path,
+            "SELECT count(*) FROM (SELECT id FROM attempts GROUP BY id HAVING count(*)>1)"
+        ),
+        0
+    );
+    assert_eq!(
+        sql_count(
+            &db_path,
+            "SELECT count(*) FROM attempts WHERE task_id='w-09'"
+        ),
+        0
+    );
+    assert_eq!(
+        sql_count(&db_path, "SELECT count(*) FROM dependency_satisfactions"),
+        0
+    );
+    assert_eq!(
+        sql_count(&db_path, "SELECT count(*) FROM verified_results"),
+        0
+    );
+    assert_eq!(
+        sql_count(
+            &db_path,
+            "SELECT count(*) FROM verification_runs WHERE state='accepted'"
+        ),
+        0
+    );
+    assert_eq!(
+        sql_count(
+            &db_path,
+            "SELECT count(*) FROM verification_runs WHERE state='rejected' AND task_id='w-00'"
+        ),
+        3
+    );
+    assert_eq!(
+        sql_count(
+            &db_path,
+            "SELECT count(*) FROM verification_runs WHERE task_id!='w-00'"
+        ),
+        0
+    );
+    assert_eq!(
+        sql_count(
+            &db_path,
+            "SELECT count(*) FROM result_submissions WHERE claimed_checks LIKE '%not evidence%'"
+        ),
+        3
+    );
+    assert_eq!(
+        sql_count(&db_path, "SELECT count(*) FROM replan_requests"),
+        3
+    );
+}
