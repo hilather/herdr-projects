@@ -1639,7 +1639,6 @@ fn unix_ms() -> i64 {
     .unwrap()
 }
 
-#[cfg(target_os = "linux")]
 fn sql_count(path: &Path, query: &str) -> i64 {
     rusqlite::Connection::open(path)
         .unwrap()
@@ -3165,13 +3164,6 @@ fn memory_barrier_edit_invalidates_the_release_token() {
     assert_eq!(flag, "off");
 }
 
-fn scale_count(path: &Path, query: &str) -> i64 {
-    rusqlite::Connection::open(path)
-        .unwrap()
-        .query_row(query, [], |row| row.get(0))
-        .unwrap()
-}
-
 fn insert_scale_history(path: &Path, events: usize) {
     let mut conn = rusqlite::Connection::open(path).unwrap();
     let tx = conn.transaction().unwrap();
@@ -3336,12 +3328,12 @@ fn scale_case(history_events: usize, workers: usize) {
     })
     .unwrap();
     assert_eq!(
-        scale_count(&path, "SELECT count(*) FROM dependency_satisfactions"),
+        sql_count(&path, "SELECT count(*) FROM dependency_satisfactions"),
         0,
         "narrative success wrote a satisfaction"
     );
     assert_eq!(
-        scale_count(&path, "SELECT count(*) FROM verified_results"),
+        sql_count(&path, "SELECT count(*) FROM verified_results"),
         0
     );
     let before_policy = db.queue_report(now).unwrap();
@@ -3400,7 +3392,7 @@ fn scale_case(history_events: usize, workers: usize) {
         .filter(|entry| entry.task != predecessor)
         .all(|entry| entry.blockers.iter().any(|blocker| blocker == &evidence)));
     assert_eq!(
-        scale_count(&path, "SELECT count(*) FROM dependency_satisfactions"),
+        sql_count(&path, "SELECT count(*) FROM dependency_satisfactions"),
         0
     );
 
@@ -3428,7 +3420,7 @@ fn scale_case(history_events: usize, workers: usize) {
         .filter(|entry| entry.task != predecessor)
         .all(|entry| entry.blockers.iter().any(|blocker| blocker == &evidence)));
     assert_eq!(
-        scale_count(&path, "SELECT count(*) FROM verified_results"),
+        sql_count(&path, "SELECT count(*) FROM verified_results"),
         0
     );
     assert_eq!(forged.available_slots, 0);
@@ -3517,20 +3509,20 @@ fn scale_case(history_events: usize, workers: usize) {
         .any(|entry| entry.task.as_str() == "w-0002"
             && entry.blockers.iter().any(|blocker| blocker == &evidence)));
     assert_eq!(
-        scale_count(
+        sql_count(
             &path,
             "SELECT count(*) FROM attempts WHERE termination_observed=0"
         ),
         i64::try_from(workers - 1).unwrap()
     );
     assert_eq!(
-        scale_count(
+        sql_count(
             &path,
             "SELECT count(*) FROM events WHERE kind='scale.history'"
         ),
         i64::try_from(history_events).unwrap()
     );
-    assert!(scale_count(&path, "SELECT count(*) FROM events") > i64::try_from(history_events).unwrap());
+    assert!(sql_count(&path, "SELECT count(*) FROM events") > i64::try_from(history_events).unwrap());
 }
 
 #[test]
