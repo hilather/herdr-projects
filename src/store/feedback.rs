@@ -76,12 +76,13 @@ pub struct FeedbackClaim {
     pub lease_until_ms: i64,
 }
 
-/// Insert once per `(operation_id, outcome_revision, category)`. Older schemas
-/// have no table; skipping keeps verification and integration usable until upgrade.
+/// Insert once per `(operation_id, outcome_revision, category)`. Below schema 29
+/// the caller must roll the rejection back; a committed run with no row cannot
+/// be repaired by upgrade_v1.
 pub(crate) fn insert_feedback(tx: &Connection, item: &LocalFeedback) -> Result<()> {
     let version: u32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version < SCHEMA_VERSION {
-        return Ok(());
+        return Err(StoreError::UnsupportedSchema(version));
     }
     identifier(&item.operation_id)?;
     identifier(&item.task_id)?;
@@ -347,15 +348,6 @@ impl SqliteStore {
         tx.commit()?;
         Ok(())
     }
-
-    /// External CI and closed-PR polls are not factory evidence. This touches
-    /// no feedback, attempt, or dependency row.
-    pub(crate) fn testing_observe_external_poll(&mut self, poll: &str) -> Result<()> {
-        if poll.len() > 65_536 || !(poll.contains("pull/") || poll.contains("statusCheckRollup")) {
-            return Err(invalid("external poll is not factory evidence"));
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -591,14 +583,12 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_pr_poll_does_not_insert_feedback_or_change_satisfaction() {
+    fn pr_poll_category_does_not_insert_feedback_or_change_satisfaction() {
         let temp = tempfile::tempdir().unwrap();
         let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
         seed_tasks(&mut db);
         let attempts = count(&db.connection, "SELECT count(*) FROM attempts");
         let deps = dependencies(&db.connection);
-        let poll = r#"{"url":"https://github.com/owner/repo/pull/7","state":"CLOSED","statusCheckRollup":[{"name":"ci","conclusion":"FAILURE"}]}"#;
-        db.testing_observe_external_poll(poll).unwrap();
         let rejected = db.testing_record_feedback(LocalFeedback {
             operation_id: "pr-poll-1".into(),
             outcome_revision: 1,
@@ -619,5 +609,29 @@ mod tests {
             )
             .unwrap();
         assert!(!satisfaction);
+    }
+
+    #[test]
+    fn pr_modules_do_not_write_feedback_or_satisfaction() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let markers = [
+            "feedback_items",
+            "feedback_claims",
+            "insert_feedback",
+            "task_dependencies",
+            "dependency_satisfactions",
+            "integrated_commits",
+            "SqliteStore",
+            "satisfaction",
+        ];
+        for name in ["src/pr.rs", "src/pr_polling.rs"] {
+            let source = std::fs::read_to_string(root.join(name)).unwrap();
+            for marker in markers {
+                assert!(
+                    !source.contains(marker),
+                    "{name} must not write feedback or satisfaction via {marker}"
+                );
+            }
+        }
     }
 }
