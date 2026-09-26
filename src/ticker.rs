@@ -564,9 +564,12 @@ fn drain_executor(root:&Path,log:&Log,memory:&mut Memory)->Result<()> {
 /// Drain happens only at tick entry. Even a completed ticket holds its turn until
 /// then, preserving a full project effect pass before another background job.
 fn admit_background(_ctx:&Ctx,log:&Log,memory:&mut Memory,canonical:Vec<PathBuf>) {
-    if memory.copy_jobs.as_ref().is_some_and(|q|q.pending()){return;}
+    // The exclusive slot is still one ticket. Declared transfers may already be
+    // running; top those up without admitting a launch or a routine beside them.
+    if memory.copy_jobs.as_ref().is_some_and(|q|q.single_pending()){return;}
     #[cfg(feature="state-store")]
     if memory.routine_jobs.as_ref().is_some_and(|q|q.pending()){return;}
+    if memory.copy_jobs.as_ref().is_some_and(|q|q.declared_pending()){admit_effects(log,memory);return;}
     if memory.prefer_copy {
         if admit_effects(log,memory){memory.prefer_copy=false;return;}
     }

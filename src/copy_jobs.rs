@@ -3,7 +3,7 @@ use std::{path::{Path,PathBuf},os::unix::fs::MetadataExt,sync::Arc,time::{Durati
 use anyhow::{Result,Context,ensure};
 use serde::{Serialize,Deserialize};
 use crate::{artifacts::live,executor::{Identity,Lane,Request},paths::{self,Ctx},project::{self,Project},remote,runner::{Cmd,Output,Runner,InheritedLock},source_tree::Control,thread::{self,Thread}};
-use herdr_projects::{copy_receipt::CopyReceipt,execution_guard::ProjectGuard,live_copy_intent::LiveCopyIntent,final_copy_intent::{FinalCopyIntent,Purpose}};
+use herdr_projects::{copy_receipt::CopyReceipt,execution_guard::{ProjectEffect,ProjectGuard,ProjectSharedGuard,Resource},live_copy_intent::LiveCopyIntent,final_copy_intent::{FinalCopyIntent,Purpose}};
 const JOB:&str="\0herdr-projects-live-copy";
 const BUDGET:Duration=Duration::from_secs(180);
 const INPUT_LIMIT:usize=64*1024;
@@ -19,7 +19,12 @@ struct Input {
     previous_hash:String,previous_receipt:Option<CopyReceipt>,pending:Option<LiveCopyIntent>,sequence:u64,
     finalization:Option<Finalization>,
     config:PathBuf,config_digest:Option<String>,herdr:String,helper:String,machine:String,target:Option<String>,
+    #[serde(default)]
+    resources:Vec<DeclaredResource>,
 }
+#[derive(Clone,Serialize,Deserialize,PartialEq,Eq)]
+#[serde(deny_unknown_fields)]
+struct DeclaredResource {class:String,identity:String}
 fn config(path:&Path)->Result<(Option<String>,Option<String>)> {
     let text=paths::read_root_config(path)?;
     ensure!(text.as_ref().is_none_or(|s|s.len()<=1024*1024),"copy configuration exceeds bounds");
@@ -43,13 +48,15 @@ impl Input {
                 ensure!(intent.sequence==finalization.sequence&&intent.purpose==finalization.purpose&&intent.operation==finalization.operation&&intent.execution==self.execution,"final-copy request disagrees with retained intent");
             }
         }
+        for resource in &self.resources {Resource::new(&resource.class,&resource.identity)?;}
+        ensure!(self.resources.iter().filter(|resource|resource.class=="git").count()<=1,"a transfer declares one git directory");
         Ok(())
     }
     fn authority(&self)->Result<String> {
         let route=thread::sha256_hex(&serde_json::to_vec(&(&self.project,self.project_identity,&self.config,&self.config_digest,&self.herdr,&self.helper,&self.machine,&self.target))?);
         match &self.finalization {Some(f)=>Ok(thread::sha256_hex(&serde_json::to_vec(&(route,&f.socket))?)),None=>Ok(route)}
     }
-    fn current(&self,project:&Project,guard:&ProjectGuard,control:&Control)->Result<Thread> {
+    fn current(&self,project:&Project,guard:&dyn ProjectEffect,control:&Control)->Result<Thread> {
         control.check()?;guard.check_project(&self.project)?;
         let metadata=std::fs::metadata(&self.project)?;
         ensure!((metadata.dev(),metadata.ino())==self.project_identity,"copy project identity changed");
@@ -147,9 +154,23 @@ impl Helpers {
 fn execute(input:&Input,control:&Control,helpers:&Helpers)->Result<()> {
     input.validate()?;control.check()?;
     ensure!(input.project.canonicalize()?==input.project,"copy project path changed");
-    let guard=ProjectGuard::acquire(&input.project)?;let locks=guard.inherit_transfer()?;
+    if input.resources.is_empty() {
+        let guard=ProjectGuard::acquire(&input.project)?;let locks=guard.inherit_transfer()?;
+        execute_with(input,control,helpers,&guard,&locks)
+    } else {
+        let resources=input.resources.iter().map(|resource|Resource::new(&resource.class,&resource.identity)).collect::<Result<Vec<_>>>()?;
+        let guard=ProjectSharedGuard::acquire(&input.project,&resources)?;let locks=guard.inherit_transfer()?;
+        execute_with(input,control,helpers,&guard,&locks)
+    }
+}
+fn execute_with(input:&Input,control:&Control,helpers:&Helpers,guard:&dyn ProjectEffect,locks:&[InheritedLock])->Result<()> {
     let project=Project::load(input.project.parent().context("copy project root missing")?,input.project.file_name().and_then(|s|s.to_str()).context("invalid copy project name")?)?;
-    let expected=input.current(&project,&guard,control)?;
+    let expected=input.current(&project,guard,control)?;
+    if !input.resources.is_empty() {
+        let fresh=transfer_resources(&input.project,&expected.thread_dir);
+        let declared:Vec<_>=input.resources.iter().map(|resource|DeclaredResource{class:resource.class.clone(),identity:resource.identity.clone()}).collect();
+        ensure!(fresh==declared,"copy resource footprint changed");
+    }
     let resolved;
     let input=if !input.machine.is_empty()&&input.target.is_none() {
         ensure!(input.pending.is_some()||input.finalization.is_some(),"unobserved route requires final-copy work or retained recovery intent");
@@ -159,18 +180,18 @@ fn execute(input:&Input,control:&Control,helpers:&Helpers)->Result<()> {
     if let Some(intent)=&input.pending {
         ensure!(intent.authority==authority,"retained live-copy authority changed");
         // Recovery uses only the retained stage. No capability probe or fetch.
-        return live::projection::resume_controlled(&project,&guard,&input.id,&authority,control,||input.authorize(control,&locks));
+        return live::projection::resume_controlled(&project,guard,&input.id,&authority,control,||input.authorize(control,&locks));
     }
     if let Some(finalization)=&input.finalization {
         if let Some(intent)=&finalization.pending {
             ensure!(intent.authority==authority,"retained final-copy authority changed");
-            return live::finalization::resume_controlled(&project,&guard,&input.id,&authority,control,||input.final_authorize(&project,control,&locks));
+            return live::finalization::resume_controlled(&project,guard,&input.id,&authority,control,||input.final_authorize(&project,control,&locks));
         }
         ensure!(input.final_authorize(&project,control,&locks)?&&thread::final_copy::resolution_eligible(&project,&expected,&finalization.purpose)?,"automatic finalization is no longer eligible");
     }
     thread::copy_delivery::ready(&expected)?;
     ensure!(!expected.thread_dir.is_empty()&&Path::new(&expected.thread_dir).is_absolute(),"copy source path must be absolute");
-    live::reclamation::make_room(&project,&guard,control)?;
+    live::reclamation::make_room(&project,guard,control)?;
     let spool=live::Spool::reserve(&project,control)?;
     let mut command=if let Some(target)=&input.target {
         let probe=helpers.ssh(target,&format!("{} artifact-stream --probe",remote::quote(&input.helper)),remote::SSH_TIMEOUT)?;
@@ -181,15 +202,15 @@ fn execute(input:&Input,control:&Control,helpers:&Helpers)->Result<()> {
         let mut command=Cmd::new(&helpers.local,remote::COPY_TIMEOUT).args(["artifact-stream","--live","--path",&expected.thread_dir]);
         command.env_clear=true;command
     };
-    input.current(&project,&guard,control)?;
+    input.current(&project,guard,control)?;
     command.stdout_file=Some((spool.path(),live::STREAM_LIMIT));
     run(command,control,&locks)?; // Sender success is mandatory, even for valid bytes.
-    input.current(&project,&guard,control)?;input.authorize(control,&locks)?;
+    input.current(&project,guard,control)?;input.authorize(control,&locks)?;
     let staged=live::receive_controlled(&project,&spool.path(),control)?;
     if let Some(finalization)=&input.finalization {
-        staged.begin_final_controlled(&project,&guard,&expected,&authority,&finalization.operation,finalization.purpose.clone(),control,||input.final_authorize(&project,control,&locks))?;
-        live::finalization::resume_controlled(&project,&guard,&input.id,&authority,control,||input.final_authorize(&project,control,&locks))
-    }else {staged.publish_controlled(&project,&guard,&expected,&authority,control,||input.authorize(control,&locks))}
+        staged.begin_final_controlled(&project,guard,&expected,&authority,&finalization.operation,finalization.purpose.clone(),control,||input.final_authorize(&project,control,&locks))?;
+        live::finalization::resume_controlled(&project,guard,&input.id,&authority,control,||input.final_authorize(&project,control,&locks))
+    }else {staged.publish_controlled(&project,guard,&expected,&authority,control,||input.authorize(control,&locks))}
 }
 
 pub struct JobRunner {pub inner:Arc<dyn Runner+Send+Sync>}
@@ -206,23 +227,90 @@ impl Runner for JobRunner {
     fn socket_request(&self,socket:&Path,line:&str,timeout:Duration)->Result<String>{self.inner.socket_request(socket,line,timeout)}
 }
 pub fn request(ctx:&Ctx<'_>,project:&Project,expected:&Thread,target:Option<&str>)->Result<Request> {
-    request_inner(ctx,project,expected,target,None)
+    Ok(request_parts(ctx,project,expected,target,None)?.0)
 }
-pub fn request_final(ctx:&Ctx<'_>,project:&Project,expected:&Thread,target:Option<&str>,purpose:Purpose,operation:String)->Result<Request> {
+fn request_final_parts(ctx:&Ctx<'_>,project:&Project,expected:&Thread,target:Option<&str>,purpose:Purpose,operation:String)->Result<(Request,Vec<Resource>)> {
     let socket=if matches!(purpose,Purpose::Idle{..}) {Some(session(project)?)}else{None};
-    request_inner(ctx,project,expected,target,Some(Finalization{sequence:expected.final_copy_sequence,pending:expected.pending_final_copy.clone(),purpose,operation,socket}))
+    request_parts(ctx,project,expected,target,Some(Finalization{sequence:expected.final_copy_sequence,pending:expected.pending_final_copy.clone(),purpose,operation,socket}))
 }
-fn request_inner(ctx:&Ctx<'_>,project:&Project,expected:&Thread,target:Option<&str>,finalization:Option<Finalization>)->Result<Request> {
+fn request_parts(ctx:&Ctx<'_>,project:&Project,expected:&Thread,target:Option<&str>,finalization:Option<Finalization>)->Result<(Request,Vec<Resource>)> {
     let path=project.dir().canonicalize()?;let metadata=std::fs::metadata(&path)?;
     let config_path=std::path::absolute(ctx.config_dir.join("config.toml"))?;
     let (kind,sequence)=if finalization.is_some(){("final-copy",expected.final_copy_sequence)}else{("live-copy",expected.live_copy_sequence)};
+    let resources=transfer_resources(&path,&expected.thread_dir);
     let input=Input{finalization,project:path.clone(),project_identity:(metadata.dev(),metadata.ino()),id:expected.id.clone(),execution:thread::execution_fingerprint(expected),
         previous_hash:expected.report_hash.clone(),previous_receipt:expected.copy_receipt.clone(),pending:expected.pending_live_copy.clone(),sequence:expected.live_copy_sequence,
-        config_digest:config(&config_path)?.1,config:config_path,herdr:ctx.env.herdr_bin().into(),helper:ctx.env.var("HERDR_PROJECTS_REMOTE_BIN").unwrap_or("herdr-projects").into(),machine:expected.machine.clone(),target:target.map(str::to_owned)};
+        config_digest:config(&config_path)?.1,config:config_path,herdr:ctx.env.herdr_bin().into(),helper:ctx.env.var("HERDR_PROJECTS_REMOTE_BIN").unwrap_or("herdr-projects").into(),machine:expected.machine.clone(),target:target.map(str::to_owned),resources:resources.clone()};
     input.validate()?;let text=serde_json::to_string(&input)?;ensure!(text.len()<=INPUT_LIMIT,"copy input exceeds bounds");
-    let identity=Identity{operation:format!("{kind}:{}",expected.id),revision:sequence.checked_add(1).context("copy sequence exhausted")?,project:path.to_str().context("copy project is not UTF-8")?.into(),machine:format!("routine-root:{}",path.parent().unwrap().display()),terminal:None};
+    let machine=resources.iter().find(|resource|resource.class=="git").map(|resource|format!("git:{}",resource.identity)).unwrap_or_else(||format!("routine-root:{}",path.parent().unwrap().display()));
+    ensure!(machine.len()<=4096&&!machine.chars().any(char::is_control),"copy resource identity exceeds bounds");
+    let identity=Identity{operation:format!("{kind}:{}",expected.id),revision:sequence.checked_add(1).context("copy sequence exhausted")?,project:path.to_str().context("copy project is not UTF-8")?.into(),machine,terminal:None};
     let deadline=Instant::now()+BUDGET;let mut command=Cmd::new(JOB,BUDGET).stdin(text);command.deadline=Some(deadline);
-    Ok(Request{identity,lane:Lane::Transfer,deadline,command})
+    let footprint=resources.iter().map(|resource|Resource::new(&resource.class,&resource.identity)).collect::<Result<Vec<_>>>()?;
+    Ok((Request{identity,lane:Lane::Transfer,deadline,command},footprint))
+}
+fn transfer_resources(project:&Path,thread_dir:&str)->Vec<DeclaredResource> {
+    let Some(git)=git_common_dir(Path::new(thread_dir)) else {return Vec::new();};
+    let Ok(project)=project.canonicalize() else {return Vec::new();};
+    let Some(project)=project.to_str() else {return Vec::new();};
+    let mut resources=vec![DeclaredResource{class:"artifact".into(),identity:project.into()},DeclaredResource{class:"git".into(),identity:git}];
+    resources.sort_by(|a,b|a.class.cmp(&b.class).then(a.identity.cmp(&b.identity)));resources
+}
+fn git_common_dir(thread_dir:&Path)->Option<String> {
+    if !thread_dir.is_absolute()||!real_path(thread_dir) {return None;}
+    let git=thread_dir.join(".git");
+    let meta=std::fs::symlink_metadata(&git).ok()?;
+    if meta.file_type().is_symlink() {return None;}
+    let git_dir=if meta.is_dir() {
+        if !real_path(&git) {return None;}
+        git.canonicalize().ok()?
+    } else if meta.is_file() {
+        let text=std::fs::read_to_string(&git).ok()?;
+        let line=text.strip_suffix('\n').unwrap_or(text.as_str());
+        let target=line.strip_prefix("gitdir: ")?;
+        if target.is_empty()||target.contains('\n')||target.contains('\0') {return None;}
+        let target=Path::new(target);
+        let target=if target.is_absolute() {target.to_path_buf()} else {thread_dir.join(target)};
+        if !real_path(&target) {return None;}
+        target.canonicalize().ok()?
+    } else {return None;};
+    let common=match std::fs::symlink_metadata(git_dir.join("commondir")) {
+        Ok(meta) if meta.is_file()&&!meta.file_type().is_symlink() => resolve_common(&git_dir)?,
+        Ok(_) => return None,
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound => git_dir,
+        Err(_) => return None,
+    };
+    if !real_path(&common) {return None;}
+    common.canonicalize().ok()?.to_str().map(str::to_owned)
+}
+fn resolve_common(git_dir:&Path)->Option<PathBuf> {
+    let text=std::fs::read_to_string(git_dir.join("commondir")).ok()?;
+    let text=text.strip_suffix('\n').unwrap_or(text.as_str());
+    if text.is_empty()||text.contains('\n')||Path::new(text).is_absolute() {return None;}
+    let mut cursor=git_dir.to_path_buf();
+    for component in Path::new(text).components() {
+        match component {
+            std::path::Component::CurDir=>{},
+            std::path::Component::ParentDir=>{if !cursor.pop() {return None;}},
+            std::path::Component::Normal(part)=>cursor.push(part),
+            _=>return None,
+        }
+        if !real_path(&cursor) {return None;}
+    }
+    Some(cursor)
+}
+fn real_path(path:&Path)->bool {
+    if !path.is_absolute() {return false;}
+    let mut cursor=PathBuf::new();
+    for component in path.components() {
+        cursor.push(component);
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(meta) if meta.file_type().is_symlink()=>return false,
+            Ok(_)=>{},
+            Err(_)=>return false,
+        }
+    }
+    true
 }
 
 mod queue;
@@ -485,6 +573,21 @@ mod tests {
         assert!(pool.stop(Duration::from_secs(1)));assert!(memory.copy_jobs.as_mut().unwrap().drain().is_empty());
         crate::ticker::tick_for_test(&ctx,&mut memory);
         assert!(thread::load(&project,&t.id).unwrap().pending_final_notice.is_none());
+    }
+    #[test]
+    fn artifact_transfer_declares_distinct_git_directories_and_one_common_dir() {
+        let root=tempfile::tempdir().unwrap();let plain=root.path().join("plain");fs::create_dir_all(&plain).unwrap();
+        assert!(transfer_resources(&plain,plain.to_str().unwrap()).is_empty(),"a tree without git keeps today's guard");
+        let repo=root.path().join("repo");fs::create_dir_all(repo.join(".git")).unwrap();
+        let git=repo.join(".git").canonicalize().unwrap();
+        let resources=transfer_resources(&repo,repo.to_str().unwrap());
+        assert_eq!(resources.iter().find(|resource|resource.class=="git").unwrap().identity,git.to_str().unwrap());
+        assert!(resources.iter().any(|resource|resource.class=="artifact"));
+        let other=root.path().join("other");fs::create_dir_all(other.join(".git")).unwrap();
+        assert_ne!(transfer_resources(&other,other.to_str().unwrap()).iter().find(|resource|resource.class=="git").unwrap().identity,git.to_str().unwrap());
+        let wt=root.path().join("wt");let gitdir=repo.join(".git/worktrees/wt");fs::create_dir_all(&gitdir).unwrap();fs::create_dir_all(&wt).unwrap();
+        fs::write(wt.join(".git"),format!("gitdir: {}\n",gitdir.display())).unwrap();fs::write(gitdir.join("commondir"),"../..\n").unwrap();
+        assert_eq!(transfer_resources(&wt,wt.to_str().unwrap()).iter().find(|resource|resource.class=="git").unwrap().identity,git.to_str().unwrap());
     }
     fn remote(root:&Path,project:&Project,t:&Thread,input:&mut Input,helpers:&Helpers,probe:&str) {
         thread::update(project,&t.id,|t|t.machine="box".into()).unwrap();let current=thread::load(project,&t.id).unwrap();input.execution=thread::execution_fingerprint(&current);input.machine="box".into();input.target=Some("user@box".into());

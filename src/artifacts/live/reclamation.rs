@@ -1,6 +1,6 @@
 //! Reclaim unreferenced staging only after exclusive managed project ownership.
 use super::*;
-use herdr_projects::execution_guard::ProjectGuard;
+use herdr_projects::execution_guard::{ProjectEffect,ProjectGuard};
 
 fn decimal(text:&str)->bool {text.parse::<u64>().is_ok_and(|n|n.to_string()==text)}
 fn owned_name(name:&str)->bool {
@@ -37,7 +37,7 @@ fn references(project:&Project,control:&Control)->Result<BTreeSet<String>> {
 }
 /// Called at worker ingress before reserving a new spool. Recovery bypasses this
 /// path entirely, including when inventory or unrelated records are corrupt.
-pub fn make_room(project:&Project,guard:&ProjectGuard,control:&Control)->Result<usize> {
+pub fn make_room(project:&Project,guard:&dyn ProjectEffect,control:&Control)->Result<usize> {
     control.check()?;guard.check_project(&project.dir())?;crate::project::ensure_legacy(&project.dir())?;
     let _lock=project.lock()?;ensure!(project.try_status()?==crate::project::Status::Active,"project is not active");
     let state=Directory::open(&project.state_dir())?;

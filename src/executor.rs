@@ -20,6 +20,7 @@ impl Default for Limits {fn default()->Self {Self{workers:[2,2],outstanding:[64,
 pub struct Identity {pub operation:String,pub revision:u64,pub project:String,pub machine:String,pub terminal:Option<String>}
 #[derive(Debug, Clone, Default)]
 pub struct Metrics {pub queued:[usize;2],pub running:[usize;2],pub high_water:[usize;2],pub completed:[u64;2],pub max_queue_delay:Duration,pub uncertain:bool}
+#[derive(Clone)]
 pub struct Request {pub identity:Identity,pub lane:Lane,pub deadline:Instant,pub command:Cmd}
 #[derive(Debug)]
 pub struct Completion {pub identity:Identity,pub started_at:Instant,pub queue_delay:Duration,pub elapsed:Duration,pub runner_entered:bool,pub result:Result<Output>}
