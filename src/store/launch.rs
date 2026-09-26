@@ -966,6 +966,7 @@ impl SqliteStore {
                 format!("{:x}", Sha256::digest(owned_payload.as_bytes()))
             ],
         )?;
+        super::active_work::invalidate(&tx)?;
         let mut attempt = read_attempts(&tx)?
             .into_iter()
             .find(|a| a.id == receipt.attempt)

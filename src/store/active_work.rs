@@ -1104,4 +1104,83 @@ mod tests {
         assert!(!run.items[0].retains_capacity);
         assert!(run.capacity_release_allowed);
     }
+
+    #[test]
+    fn adopt_without_a_new_attempt_puts_a_terminated_binding_back_in_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = SqliteStore::create(&dir.path().join("state.db")).unwrap();
+        insert_task(&db.connection, "tree");
+        insert_attempt(&db.connection, "tree", false);
+        let payload = r#"{"id":"task:tree","task":"tree","revision":1,"source_path":null,"source_digest":null,"session_source_digest":null,"verification":"unverified","identity":{"worktree_path":"/work"}}"#;
+        let hash = format!("{:x}", Sha256::digest(payload.as_bytes()));
+        db.connection
+            .execute(
+                "INSERT INTO runtime_bindings(id,task_id,revision,source_path,payload,payload_hash) VALUES('task:tree','tree',1,NULL,?1,?2)",
+                params![payload, hash],
+            )
+            .unwrap();
+        let absent = db.reconcile_active_work(None).unwrap();
+        assert!(absent.items.is_empty());
+        let worktree = crate::domain::ResourceIdentity {
+            device: 1,
+            inode: 2,
+            born_secs: 3,
+            born_nanos: 4,
+        };
+        let observation = crate::reconcile::RuntimeObservation {
+            binding: "task:tree".into(),
+            binding_revision: 1,
+            task_revision: Some(1),
+            observed_unix_ms: 1_000,
+            pane: crate::reconcile::ResourceState::Unrecorded,
+            worktree: crate::reconcile::ResourceState::Present,
+            agent_present: false,
+            collector: "herdr-git-v2".into(),
+            config_digest: None,
+            diagnostic: "worktree only".into(),
+            session_identity: None,
+            worktree_identity: Some(worktree),
+            agent_identity: None,
+        };
+        let body = serde_json::to_string(&observation).unwrap();
+        let body_hash = format!("{:x}", Sha256::digest(body.as_bytes()));
+        db.connection
+            .execute(
+                "INSERT INTO runtime_observations(binding_id,binding_revision,task_revision,observed_unix_ms,payload,payload_hash) VALUES('task:tree',1,1,1000,?1,?2)",
+                params![body, body_hash],
+            )
+            .unwrap();
+        let adopted = db
+            .adopt_runtime("task:tree", 1, db.current_head().unwrap(), 1_000, None)
+            .unwrap();
+        assert!(adopted.ownership.attempt.is_none());
+        let active = db.reconcile_active_work(None).unwrap();
+        assert_eq!(active.items.len(), 1);
+        assert_eq!(active.items[0].binding.id, "task:tree");
+        let snapshot = db.read_snapshot(None).unwrap();
+        let fresh = crate::reconcile::RuntimeObservation {
+            binding_revision: active.items[0].binding.revision,
+            task_revision: active.items[0].task_revision,
+            observed_unix_ms: snapshot.head as i64,
+            ..observation
+        };
+        let batch = crate::reconcile::ObservationBatch {
+            expected_head: snapshot.head,
+            observations: vec![fresh],
+            dispatch_allowed: false,
+            recorded_head: None,
+        };
+        let plan = crate::reconcile::plan::build(&snapshot, &batch, 1_000, None).unwrap();
+        assert!(!plan.dispatch_allowed);
+        db.relinquish_runtime(
+            "task:tree",
+            adopted.ownership.revision,
+            adopted.head,
+            "operator stop",
+        )
+        .unwrap();
+        let dropped = db.reconcile_active_work(None).unwrap();
+        assert!(dropped.items.is_empty());
+        assert!(dropped.capacity_release_allowed);
+    }
 }
