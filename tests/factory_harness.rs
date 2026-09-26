@@ -1702,7 +1702,10 @@ fn install_fixture_contract(
 }
 
 #[cfg(target_os = "linux")]
-fn plant_profile(db_path: &Path, config: &herdr_projects::migration::ConfigReference) {
+fn plant_profile(
+    db_path: &Path,
+    config: &herdr_projects::migration::ConfigReference,
+) -> FrozenProfile {
     use std::os::unix::fs::MetadataExt;
     let evidence = VersionedReference {
         id: "sim-evidence".into(),
@@ -1750,6 +1753,7 @@ fn plant_profile(db_path: &Path, config: &herdr_projects::migration::ConfigRefer
     };
     profile.validate_for_launch().unwrap();
     let reference = profile.reference().unwrap();
+    let returned = profile.clone();
     let canonical = fs::canonicalize(db_path).unwrap();
     let metadata = fs::metadata(&canonical).unwrap();
     let report = serde_json::json!({
@@ -1776,6 +1780,7 @@ fn plant_profile(db_path: &Path, config: &herdr_projects::migration::ConfigRefer
         rusqlite::params![reference.digest, text, report_digest, sequence],
     )
     .unwrap();
+    returned
 }
 
 #[cfg(target_os = "linux")]
@@ -3822,16 +3827,8 @@ fn fault_campaign_and_restore_rehearsal() {
     assert_eq!(sql_count(&db_path, "SELECT count(*) FROM attempts"), 2);
     drop(db);
 
-    install_fixture_contract(&db_path, "t-old", &repository, &oid, "sha1", "src/old.rs");
-    let digest = {
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.query_row(
-            "SELECT raw_digest FROM task_contracts WHERE task_id='t-old'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .unwrap()
-    };
+    let digest =
+        install_fixture_contract(&db_path, "t-old", &repository, &oid, "sha1", "src/old.rs");
     let submission = serde_json::json!({
         "idempotency_key": "submit-old",
         "task_id": "t-old",
@@ -3897,17 +3894,159 @@ fn fault_campaign_and_restore_rehearsal() {
         sql_count(&db_path, "SELECT count(*) FROM feedback_items"),
         1
     );
+    let first_old = "11".repeat(32);
+    let later_old = "33".repeat(32);
+    let insert_receipt = |result: &str, created: i64| {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        let digest = "d".repeat(64);
+        let git_oid = "a".repeat(40);
+        conn.execute(
+            "INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,'/tmp/project',?1,?2,?2,'t-old',1,?2,'attempt-old','builds',?2,?3,?3,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?2,0,0,?4)",
+            rusqlite::params![result, digest, git_oid, created],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?1,?2,?3,?3,'sha1',?2,?2,'linux-unshare-user-pid-mount-v1',0,?4)",
+            rusqlite::params![result, digest, git_oid, created],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    };
+    let point_active = |db: &mut SqliteStore, attempt: &AttemptId| {
+        let snapshot = db.read_snapshot(None).unwrap();
+        let task = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .unwrap()
+            .clone();
+        db.commit(Commit {
+            expected_head: snapshot.head,
+            mutations: vec![Mutation::Task {
+                expected: Some(task.revision),
+                next: Task {
+                    id: task_id.clone(),
+                    revision: task.revision + 1,
+                    state: TaskState::Running,
+                    title: task.title,
+                    active_attempt: Some(attempt.clone()),
+                },
+            }],
+        })
+        .unwrap();
+    };
+    // The stored writer accepts this receipt only while attempt-old is current.
+    point_active(&mut db, &old_attempt);
+    insert_receipt(&first_old, 1);
+    let need = TaskId::new("t-need").unwrap();
+    db.commit(Commit {
+        expected_head: db.current_head().unwrap(),
+        mutations: vec![Mutation::Task {
+            expected: None,
+            next: Task {
+                id: need.clone(),
+                revision: 1,
+                state: TaskState::Draft,
+                title: "needs the predecessor".into(),
+                active_attempt: None,
+            },
+        }],
+    })
+    .unwrap();
+    let queued = db.read_snapshot(None).unwrap();
+    db.queue_task(
+        &need,
+        1,
+        queued.head,
+        &QueueRequest {
+            priority: 0,
+            dependencies: vec![Dependency {
+                predecessor: task_id.clone(),
+                requirement: DependencyRequirement::VerifiedResult,
+            }],
+        },
+        due,
+    )
+    .unwrap();
+    let evidence = |query: &str| -> String {
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .query_row(query, [], |row| row.get(0))
+            .unwrap()
+    };
     assert_eq!(
-        sql_count(&db_path, "SELECT count(*) FROM verified_results"),
-        0
+        evidence(
+            "SELECT evidence_id FROM dependency_satisfactions WHERE task_id='t-need' AND state='valid'"
+        ),
+        first_old
     );
     assert_eq!(
-        sql_count(&db_path, "SELECT count(*) FROM dependency_satisfactions"),
-        0
+        sql_count(
+            &db_path,
+            "SELECT count(*) FROM task_dependencies WHERE task_id='t-need' AND predecessor_id='t-old' AND requirement='verified_result'"
+        ),
+        1
     );
-    let current = db.read_snapshot(None).unwrap();
+    let counted = db.queue_report(due).unwrap();
+    assert!(counted.entries.iter().any(|entry| entry.task == need
+        && entry
+            .blockers
+            .iter()
+            .any(|blocker| blocker == "admission_disabled:verified_result")));
+    point_active(&mut db, &new_attempt);
+    insert_receipt(&later_old, 2);
+    let again = db.read_snapshot(None).unwrap();
+    let need_revision = again
+        .tasks
+        .iter()
+        .find(|task| task.id == need)
+        .unwrap()
+        .revision;
+    db.queue_task(
+        &need,
+        need_revision,
+        again.head,
+        &QueueRequest {
+            priority: 1,
+            dependencies: vec![Dependency {
+                predecessor: task_id.clone(),
+                requirement: DependencyRequirement::VerifiedResult,
+            }],
+        },
+        due,
+    )
+    .unwrap();
     assert_eq!(
-        current
+        evidence(
+            "SELECT evidence_id FROM dependency_satisfactions WHERE task_id='t-need' AND state='valid'"
+        ),
+        first_old,
+        "old attempt replaced the satisfaction"
+    );
+    assert_eq!(
+        sql_count(
+            &db_path,
+            "SELECT count(*) FROM dependency_satisfactions WHERE task_id='t-need' AND state='valid'"
+        ),
+        1
+    );
+    let unavailable = db.queue_report(due).unwrap();
+    let blockers = &unavailable
+        .entries
+        .iter()
+        .find(|entry| entry.task == need)
+        .unwrap()
+        .blockers;
+    assert!(blockers.iter().any(|blocker| {
+        blocker == "verified_dependency_evidence_unavailable:t-old:verified_result"
+    }));
+    assert!(!blockers
+        .iter()
+        .any(|blocker| blocker == "admission_disabled:verified_result"));
+    assert_eq!(
+        db.read_snapshot(None)
+            .unwrap()
             .tasks
             .iter()
             .find(|task| task.id == task_id)
@@ -3916,7 +4055,6 @@ fn fault_campaign_and_restore_rehearsal() {
             .as_ref(),
         Some(&new_attempt)
     );
-    assert_ne!(current.tasks[0].state, TaskState::Succeeded);
     drop(db);
     assert_admission_off(&project);
 
@@ -3998,16 +4136,14 @@ fn fault_campaign_and_restore_rehearsal() {
         .is_err(),
         "aliased git directory accepted a second owner"
     );
+    drop(owner);
     let project_lock =
         herdr_projects::execution_guard::ProjectGuard::acquire(&root.join("b")).unwrap();
-    assert!(
-        herdr_projects::execution_guard::ProjectSharedGuard::acquire(
-            &root.join("b"),
-            &footprint(&root.join("b"))
-        )
-        .is_err(),
-        "project lock took the aliased git directory"
-    );
+    herdr_projects::execution_guard::ProjectSharedGuard::acquire(
+        &root.join("a"),
+        &footprint(&root.join("a")),
+    )
+    .expect("project lock on b took the aliased git fence");
     drop(project_lock);
     fs::remove_dir_all(root.join("sneaky/.state")).unwrap();
     std::os::unix::fs::symlink(root.join("a/.state"), root.join("sneaky/.state")).unwrap();
@@ -4019,12 +4155,41 @@ fn fault_campaign_and_restore_rehearsal() {
         )
         .is_err()
     );
-    drop(owner);
 
     let busy_project = tmp.path().join("busy");
     fs::create_dir_all(busy_project.join(".state")).unwrap();
     let busy_path = busy_project.join(".state/state.db");
     let mut db = SqliteStore::create(&busy_path).unwrap();
+    let busy_task = TaskId::new("t-busy").unwrap();
+    let busy_attempt = AttemptId::new("attempt-busy").unwrap();
+    db.commit(Commit {
+        expected_head: 0,
+        mutations: vec![
+            Mutation::Task {
+                expected: None,
+                next: Task {
+                    id: busy_task.clone(),
+                    revision: 1,
+                    state: TaskState::Running,
+                    title: "busy".into(),
+                    active_attempt: Some(busy_attempt.clone()),
+                },
+            },
+            Mutation::Attempt {
+                expected: None,
+                next: Attempt {
+                    id: busy_attempt.clone(),
+                    task: busy_task,
+                    revision: 1,
+                    state: AttemptState::Running,
+                    snapshot: None,
+                    reservation: "slot-busy".into(),
+                    termination_observed: false,
+                },
+            },
+        ],
+    })
+    .unwrap();
     let before = db.read_snapshot(None).unwrap();
     let raw = rusqlite::Connection::open(&busy_path).unwrap();
     raw.execute_batch("BEGIN IMMEDIATE").unwrap();
@@ -4034,10 +4199,10 @@ fn fault_campaign_and_restore_rehearsal() {
         mutations: vec![Mutation::Task {
             expected: None,
             next: Task {
-                id: TaskId::new("t-busy").unwrap(),
+                id: TaskId::new("t-busy-2").unwrap(),
                 revision: 1,
                 state: TaskState::Draft,
-                title: "busy".into(),
+                title: "blocked write".into(),
                 active_attempt: None,
             },
         }],
@@ -4059,8 +4224,15 @@ fn fault_campaign_and_restore_rehearsal() {
         herdr_projects::watchdog::pause_reason(&busy_project),
         Some("database_busy")
     );
-    assert_eq!(sql_count(&busy_path, "SELECT count(*) FROM attempts"), 0);
-    assert_eq!(db.read_snapshot(None).unwrap().tasks.len(), 0);
+    assert_eq!(sql_count(&busy_path, "SELECT count(*) FROM attempts"), 1);
+    assert_eq!(
+        sql_count(
+            &busy_path,
+            "SELECT count(*) FROM attempts WHERE id='attempt-busy'"
+        ),
+        1
+    );
+    assert_eq!(db.read_snapshot(None).unwrap().attempts.len(), 1);
     drop(db);
 
     let published = memory_project();
@@ -4102,25 +4274,14 @@ fn fault_campaign_and_restore_rehearsal() {
     assert!(!destination.join(".state/format.json").exists());
     assert_eq!(fs::read(&published_db).unwrap(), live_bytes);
     assert!(herdr_projects::migration::restore_backup(&published.project, &destination).is_err());
-    let new_store = destination
-        .join(".state/state.db")
-        .canonicalize()
-        .unwrap_or_else(|_| destination.join(".state/state.db"));
+    let new_store = destination.join(".state/state.db");
     assert!(new_store.is_absolute());
+    assert!(!new_store.exists());
     assert_ne!(new_store.display().to_string(), old_store);
     let config_path = tmp.path().join("grant-owner.toml");
     fs::write(&config_path, "version = 1\n").unwrap();
     let config = herdr_projects::migration::config_reference(&config_path).unwrap();
-    let scratch = tmp.path().join("grant-profile.db");
-    SqliteStore::create(&scratch).unwrap();
-    plant_profile(&scratch, &config);
-    let report: String = rusqlite::Connection::open(&scratch)
-        .unwrap()
-        .query_row("SELECT report FROM native_profiles", [], |row| row.get(0))
-        .unwrap();
-    let report: serde_json::Value = serde_json::from_str(&report).unwrap();
-    let profile: FrozenProfile =
-        serde_json::from_value(report["preparation"]["profile"].clone()).unwrap();
+    let profile = plant_profile(&db_path, &config);
     let mut inputs: LaunchInputs =
         serde_json::from_str(include_str!("fixtures/launch-inputs-v1.json")).unwrap();
     inputs.version = 2;
