@@ -10,6 +10,7 @@ pub const BUDGET_SIGNATURE_NAMESPACE: &str = "budget@herdr-projects";
 pub const ROUTINE_SIGNATURE_NAMESPACE: &str = "routine@herdr-projects";
 pub const MEMORY_SIGNATURE_NAMESPACE: &str = "memory@herdr-projects";
 pub const CONTRACT_SIGNATURE_NAMESPACE: &str = "contract@herdr-projects";
+pub const ADMISSION_SIGNATURE_NAMESPACE: &str = "admission@herdr-projects";
 
 #[derive(Deserialize,Serialize)]
 #[serde(deny_unknown_fields)]
@@ -98,6 +99,34 @@ pub fn import_contract(project:&Path,document:&Path,signature:&Path)->Result<Con
         Ok(db.install_contract(&prepared)?)
     })();
     if let Err(error)=&result {record_cli_denial(project,"contract","put",None,error);}
+    result
+}
+
+/// Enable or disable factory admission from raw signed bytes. Signature verification
+/// sees the file that was read, not a reserialized document.
+pub fn import_admission(project:&Path, enable:bool, document:&Path, signature:&Path, evidence:Option<&Path>)->Result<crate::domain::AdmissionInstall> {
+    let result=(||{
+        let _guard=migration::runtime_mutation(project)?;
+        let mut db=migration::open_active(project)?;
+        let snapshot=db.read_snapshot(None)?;
+        let (owner,config)=policy(project)?;
+        ensure!(snapshot.control.context("control schema upgrade required")?.config_digest==config.digest,"owner configuration is not acknowledged by project control");
+        let payload=migration::read_plan_file(document).map_err(|_|anyhow::anyhow!("admission document unreadable"))?;
+        let signature=migration::read_plan_file(signature).map_err(|_|anyhow::anyhow!("admission signature unreadable"))?;
+        verify_signature(&owner,&payload,&signature,ADMISSION_SIGNATURE_NAMESPACE,&RealRunner)?;
+        let prepared=crate::domain::PreparedAdmission::parse_verified(&payload).map_err(|_|anyhow::anyhow!("invalid admission document (contents withheld)"))?;
+        ensure!(prepared.authority==owner.reference()?,"admission policy names a different authority policy");
+        ensure!(prepared.enabled==enable,"admission policy action does not match the command");
+        let evidence_bytes=if prepared.enabled {
+            let path=evidence.context("admission evidence is required")?;
+            Some(migration::read_plan_file(path).map_err(|_|anyhow::anyhow!("admission evidence unreadable"))?)
+        } else {
+            None
+        };
+        ensure!(migration::config_reference(Path::new(&config.path))?==config,"owner configuration changed during verification");
+        Ok(db.install_admission_policy(&prepared, evidence_bytes.as_deref())?)
+    })();
+    if let Err(error)=&result {record_cli_denial(project,"admission",if enable {"enable"} else {"disable"},None,error);}
     result
 }
 

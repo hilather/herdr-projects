@@ -1598,3 +1598,230 @@ fn task_contract_put_and_result_submit_keep_worker_bytes_untrusted() {
     let tasks: i64 = rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT count(*) FROM tasks", [], |row| row.get(0)).unwrap();
     assert_eq!(tasks, runtime::snapshot(&project).unwrap().tasks.len() as i64);
 }
+
+#[cfg(all(feature = "state-store", target_os = "linux"))]
+#[test]
+fn signed_factory_admission_command_stores_raw_bytes_or_writes_a_denial() {
+    use herdr_projects::{authority, domain::ProjectState, integration, migration, runtime};
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::process::Command;
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    for action in ["new", "pause"] {
+        assert!(hp(home.path(), &["--root", root_arg, action, "demo"]).status.success());
+    }
+    let help = hp(home.path(), &["factory", "admission", "--help"]);
+    assert!(help.status.success(), "{}", String::from_utf8_lossy(&help.stderr));
+    let help_text = String::from_utf8_lossy(&help.stdout);
+    assert!(help_text.contains("--enable") && help_text.contains("--disable"));
+    assert!(help_text.contains("--policy") && help_text.contains("--signature") && help_text.contains("--evidence"));
+    assert!(!help_text.contains("--sql"));
+    let key = home.path().join("owner");
+    assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).status().unwrap().success());
+    let public = fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+    let project = root.join("demo");
+    let config = home.path().join("owner.toml");
+    fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n")).unwrap();
+    let plan = migration::inspect_with_config(&project, &config).unwrap();
+    migration::apply(&project, &plan, true).unwrap();
+    let snapshot = runtime::snapshot(&project).unwrap();
+    runtime::set_state(&project, snapshot.head, snapshot.control.unwrap().revision, ProjectState::Active, &config).unwrap();
+    let db_path = project.join(".state/state.db");
+    let store = db_path.canonicalize().unwrap().display().to_string();
+    let column = || -> String {
+        rusqlite::Connection::open(&db_path).unwrap().query_row(
+            "SELECT factory_admission FROM project_control WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        ).unwrap()
+    };
+    let policy_rows = || -> i64 {
+        rusqlite::Connection::open(&db_path).unwrap().query_row(
+            "SELECT count(*) FROM factory_admission_policies",
+            [],
+            |row| row.get(0),
+        ).unwrap()
+    };
+    let denials = || authority::denials(&project).unwrap().into_iter().filter(|denial| denial.class == "admission").count();
+    assert_eq!(column(), "off");
+    assert_eq!(policy_rows(), 0);
+    let unsigned = hp(home.path(), &["--root", root_arg, "factory", "admission", "demo", "--enable"]);
+    assert!(!unsigned.status.success());
+    let sql_shaped = hp(home.path(), &["--root", root_arg, "factory", "admission", "demo", "--sql", "UPDATE project_control SET factory_admission='on'"]);
+    assert!(!sql_shaped.status.success());
+    assert_eq!(column(), "off");
+    assert_eq!(denials(), 0);
+    let repo = home.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let status = Command::new("/usr/bin/git").args(args).current_dir(&repo)
+            .env("GIT_AUTHOR_NAME", "integrator").env("GIT_AUTHOR_EMAIL", "integrator@example.com")
+            .env("GIT_COMMITTER_NAME", "integrator").env("GIT_COMMITTER_EMAIL", "integrator@example.com")
+            .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0").env("GIT_NO_LAZY_FETCH", "1")
+            .status().unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "--initial-branch", "main"]);
+    fs::write(repo.join("README"), b"base\n").unwrap();
+    git(&["add", "README"]);
+    git(&["commit", "-m", "base"]);
+    let repo = repo.canonicalize().unwrap();
+    {
+        let mut db = herdr_projects::store::SqliteStore::open(&db_path).unwrap();
+        integration::configure_integration_ref(&mut db, &repo, "refs/heads/integration").unwrap();
+    }
+    let authority_ref = serde_json::to_value(authority::policy_reference(&project).unwrap()).unwrap();
+    let manifest = serde_json::to_vec(&serde_json::json!({"vertical_slice": "pass", "git_sha": "fixture"})).unwrap();
+    let digest = format!("{:x}", Sha256::digest(&manifest));
+    let evidence = home.path().join("manifest.json");
+    fs::write(&evidence, &manifest).unwrap();
+    let sign = |bytes: &[u8], name: &str| {
+        let path = home.path().join(name);
+        fs::write(&path, bytes).unwrap();
+        assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y", "sign", "-f"]).arg(&key)
+            .args(["-n", authority::ADMISSION_SIGNATURE_NAMESPACE]).arg(&path).status().unwrap().success());
+        (path, home.path().join(format!("{name}.sig")))
+    };
+    let document = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "enabled": true,
+        "project_store": store,
+        "evidence_digest": digest,
+        "authority": authority_ref,
+    })).unwrap();
+    let (policy, signature) = sign(&document, "enable.json");
+    let run = |args: &[String]| {
+        let mut cmd = vec!["--root".into(), root_arg.into(), "factory".into(), "admission".into(), "demo".into()];
+        cmd.extend(args.iter().cloned());
+        let borrowed: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        hp(home.path(), &borrowed)
+    };
+    let enable_args = [
+        "--enable".into(),
+        "--policy".into(), policy.display().to_string(),
+        "--signature".into(), signature.display().to_string(),
+        "--evidence".into(), evidence.display().to_string(),
+    ];
+    let missing = run(&enable_args);
+    assert!(!missing.status.success(), "{}", String::from_utf8_lossy(&missing.stdout));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("integration ref is missing"), "{}", String::from_utf8_lossy(&missing.stderr));
+    assert_eq!(column(), "off");
+    assert_eq!(policy_rows(), 0);
+    assert_eq!(denials(), 1);
+    git(&["branch", "integration"]);
+    git(&["checkout", "integration"]);
+    let checked_out = run(&enable_args);
+    assert!(!checked_out.status.success());
+    assert!(String::from_utf8_lossy(&checked_out.stderr).contains("integration ref is checked out"), "{}", String::from_utf8_lossy(&checked_out.stderr));
+    assert_eq!(column(), "off");
+    assert_eq!(denials(), 2);
+    git(&["checkout", "main"]);
+    let wrong_evidence = home.path().join("wrong.json");
+    fs::write(&wrong_evidence, br#"{"vertical_slice":"pass","tampered":true}"#).unwrap();
+    let mut wrong_args = enable_args.clone();
+    *wrong_args.last_mut().unwrap() = wrong_evidence.display().to_string();
+    let wrong = run(&wrong_args);
+    assert!(!wrong.status.success());
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("evidence digest does not match"), "{}", String::from_utf8_lossy(&wrong.stderr));
+    assert_eq!(column(), "off");
+    assert_eq!(denials(), 3);
+    let reserialized = serde_json::to_vec_pretty(&serde_json::from_slice::<serde_json::Value>(&document).unwrap()).unwrap();
+    assert_ne!(reserialized, document);
+    let (rewritten, _) = sign(&reserialized, "rewritten.json");
+    let mut rewritten_args = enable_args.clone();
+    rewritten_args[2] = rewritten.display().to_string();
+    let mismatched = run(&rewritten_args);
+    assert!(!mismatched.status.success());
+    assert!(String::from_utf8_lossy(&mismatched.stderr).to_ascii_lowercase().contains("signature"), "{}", String::from_utf8_lossy(&mismatched.stderr));
+    assert_eq!(column(), "off");
+    assert_eq!(denials(), 4);
+    assert!(authority::denials(&project).unwrap().iter().any(|denial| denial.class == "admission" && denial.command == "enable" && denial.reason_code == "signature_failed"));
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("UPDATE store_meta SET schema_version=29; PRAGMA user_version=29;").unwrap();
+    }
+    let old_schema = run(&enable_args);
+    assert!(!old_schema.status.success(), "{}", String::from_utf8_lossy(&old_schema.stderr));
+    assert_eq!(column(), "off");
+    assert_eq!(policy_rows(), 0);
+    assert_eq!(denials(), 5);
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let version: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+        assert_eq!(version, 29);
+        conn.execute_batch("UPDATE store_meta SET schema_version=30; PRAGMA user_version=30;").unwrap();
+    }
+    let truthy = serde_json::to_vec(&serde_json::json!({"vertical_slice": true})).unwrap();
+    let truthy_path = home.path().join("true.json");
+    fs::write(&truthy_path, &truthy).unwrap();
+    let truthy_doc = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "enabled": true,
+        "project_store": store,
+        "evidence_digest": format!("{:x}", Sha256::digest(&truthy)),
+        "authority": authority_ref,
+    })).unwrap();
+    let (truthy_policy, truthy_sig) = sign(&truthy_doc, "true-policy.json");
+    let truthy_out = run(&[
+        "--enable".into(),
+        "--policy".into(), truthy_policy.display().to_string(),
+        "--signature".into(), truthy_sig.display().to_string(),
+        "--evidence".into(), truthy_path.display().to_string(),
+    ]);
+    assert!(!truthy_out.status.success());
+    assert!(String::from_utf8_lossy(&truthy_out.stderr).contains("vertical slice evidence is not pass"), "{}", String::from_utf8_lossy(&truthy_out.stderr));
+    assert_eq!(column(), "off");
+    assert_eq!(denials(), 6);
+    let enabled = run(&enable_args);
+    assert!(enabled.status.success(), "{}", String::from_utf8_lossy(&enabled.stderr));
+    let enabled: serde_json::Value = serde_json::from_slice(&enabled.stdout).unwrap();
+    assert_eq!(enabled["factory_admission"], "on");
+    assert_eq!(enabled["replayed"], false);
+    assert_eq!(enabled["policy_digest"], format!("{:x}", Sha256::digest(&document)));
+    assert_eq!(column(), "on");
+    assert_eq!(policy_rows(), 1);
+    assert_eq!(denials(), 6);
+    let stored: Vec<u8> = rusqlite::Connection::open(&db_path).unwrap().query_row(
+        "SELECT raw_bytes FROM factory_admission_policies WHERE policy_digest=?1",
+        [enabled["policy_digest"].as_str().unwrap()],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(stored, document);
+    let replay = run(&enable_args);
+    assert!(replay.status.success(), "{}", String::from_utf8_lossy(&replay.stderr));
+    let replay: serde_json::Value = serde_json::from_slice(&replay.stdout).unwrap();
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(policy_rows(), 1);
+    assert_eq!(column(), "on");
+    assert_eq!(denials(), 6);
+    git(&["checkout", "integration"]);
+    let disable_doc = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "enabled": false,
+        "project_store": store,
+        "evidence_digest": digest,
+        "authority": authority_ref,
+    })).unwrap();
+    let (disable_policy, disable_sig) = sign(&disable_doc, "disable.json");
+    let disabled = run(&[
+        "--disable".into(),
+        "--policy".into(), disable_policy.display().to_string(),
+        "--signature".into(), disable_sig.display().to_string(),
+    ]);
+    assert!(disabled.status.success(), "{}", String::from_utf8_lossy(&disabled.stderr));
+    let disabled: serde_json::Value = serde_json::from_slice(&disabled.stdout).unwrap();
+    assert_eq!(disabled["factory_admission"], "off");
+    assert_eq!(disabled["replayed"], false);
+    assert_eq!(column(), "off");
+    assert_eq!(policy_rows(), 2);
+    let stored_disable: Vec<u8> = rusqlite::Connection::open(&db_path).unwrap().query_row(
+        "SELECT raw_bytes FROM factory_admission_policies WHERE policy_digest=?1",
+        [disabled["policy_digest"].as_str().unwrap()],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(stored_disable, disable_doc);
+    assert_eq!(denials(), 6);
+}

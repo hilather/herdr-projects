@@ -137,6 +137,26 @@ pub struct ContractInstall {
     pub replayed: bool,
 }
 
+/// Trusted factory-admission capability. JSON cannot construct it. The store
+/// keeps the original signed bytes and does not reserialize them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedAdmission {
+    pub(crate) raw: Vec<u8>,
+    pub(crate) digest: String,
+    pub(crate) enabled: bool,
+    pub(crate) project_store: String,
+    pub(crate) evidence_digest: String,
+    pub(crate) authority: VersionedReference,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AdmissionInstall {
+    pub enabled: bool,
+    pub factory_admission: String,
+    pub policy_digest: String,
+    pub replayed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResultReceipt {
     pub submission_id: String,
@@ -170,6 +190,53 @@ pub struct ResultView {
     pub artifact_manifest: serde_json::Value,
     pub claimed_checks: serde_json::Value,
     pub objects: Vec<ResultObjectView>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UntrustedAdmissionDocument {
+    version: u32,
+    enabled: bool,
+    project_store: String,
+    evidence_digest: String,
+    authority: VersionedReference,
+}
+
+impl PreparedAdmission {
+    /// Parse bytes that have already been signature-checked. Does not verify a signature.
+    pub(crate) fn parse_verified(raw: &[u8]) -> Result<Self, String> {
+        if raw.is_empty() || raw.len() > 65_536 {
+            return Err("admission document exceeds 65536 bytes".into());
+        }
+        let document: UntrustedAdmissionDocument =
+            serde_json::from_slice(raw).map_err(|_| "invalid admission document".to_string())?;
+        if document.version != 1 {
+            return Err("invalid admission version".into());
+        }
+        if !std::path::Path::new(&document.project_store).is_absolute()
+            || !plain(&document.project_store, 4_096)
+        {
+            return Err("admission project_store must be an absolute path".into());
+        }
+        if !hex_oid(&document.evidence_digest, ObjectFormat::Sha256) {
+            return Err("admission evidence digest must be lowercase sha256".into());
+        }
+        if document.authority.revision == 0
+            || document.authority.revision > i64::MAX as u64
+            || !plain(&document.authority.id, 512)
+            || !hex_oid(&document.authority.digest, ObjectFormat::Sha256)
+        {
+            return Err("invalid admission authority reference".into());
+        }
+        Ok(Self {
+            digest: format!("{:x}", Sha256::digest(raw)),
+            raw: raw.to_vec(),
+            enabled: document.enabled,
+            project_store: document.project_store,
+            evidence_digest: document.evidence_digest,
+            authority: document.authority,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]

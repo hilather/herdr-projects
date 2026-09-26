@@ -405,6 +405,7 @@ mod feedback;
 pub use feedback::{claim_feedback, show_feedback};
 
 mod satisfaction;
+mod admission_policy;
 
 mod plans;
 pub use plans::{PlanProposalReceipt, propose_plan};

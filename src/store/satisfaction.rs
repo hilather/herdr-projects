@@ -994,20 +994,34 @@ mod tests {
         walk(&root, &mut files);
         for path in &files {
             let text = std::fs::read_to_string(path).unwrap();
-            if text.contains("SET factory_admission") {
-                assert!(
-                    path.ends_with("src/store/satisfaction.rs"),
-                    "production writer in {}",
-                    path.display()
-                );
+            if !text.contains("SET factory_admission") {
+                continue;
+            }
+            let name = path.file_name().and_then(|name| name.to_str()).unwrap();
+            match name {
+                // The test setter stays behind cfg(test) and is not a CLI path.
+                "satisfaction.rs" => {
+                    let test_cfg = text.find("#[cfg(test)]").unwrap();
+                    assert!(text.find("SET factory_admission").unwrap() > test_cfg);
+                    assert!(!text[..test_cfg].contains("SET factory_admission"));
+                    assert!(!text[..test_cfg].contains("install_admission_policy"));
+                    assert!(text.contains("pub(super) fn testing_set_factory_admission"));
+                    assert!(!text.lines().any(|line| line.trim_start().starts_with("pub fn testing_set_factory_admission")));
+                }
+                "admission_policy.rs" => {
+                    let update_at = text.find("SET factory_admission").unwrap();
+                    if let Some(test_cfg) = text.find("#[cfg(test)]") {
+                        assert!(update_at < test_cfg);
+                    }
+                    assert!(text.contains("fn install_admission_policy"));
+                    assert!(!text.contains("testing_set_factory_admission"));
+                }
+                other => panic!("unexpected factory_admission writer in {other}"),
             }
         }
-        let source = std::fs::read_to_string(root.join("store/satisfaction.rs")).unwrap();
-        let test_cfg = source.find("#[cfg(test)]").unwrap();
-        let update_at = source.find("SET factory_admission").unwrap();
-        assert!(update_at > test_cfg);
-        assert!(!source[..test_cfg].contains("SET factory_admission"));
-        assert!(!source[..test_cfg].contains("install_admission_policy"));
+        let cli = std::fs::read_to_string(root.join("cli.rs")).unwrap();
+        assert!(!cli.contains("testing_set_factory_admission"));
+        assert!(!cli.contains("SET factory_admission"));
     }
 
     #[test]
