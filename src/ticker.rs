@@ -525,8 +525,20 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         for slug in &canonical {
             let result=if let Some(reads)=memory.canonical_observations.as_mut(){crate::canonical_controller::poll_queued_effects(ctx,&ctx.root.join(slug),memory.tick.saturating_sub(1),reads,memory.copy_jobs.as_mut())}else{crate::canonical_controller::poll(ctx,&ctx.root.join(slug),memory.tick.saturating_sub(1))};
             match result {
-                Ok(result)=>{memory.canonical_effects_unknown|=result.unknown_effects;any_reachable|=result.reachable||result.scheduled_work;if let Some(error)=result.operation_error {log.line(&format!("{slug}: canonical operation: {error}"));}},
-                Err(error)=>{memory.canonical_effects_unknown=true;log.line(&format!("{slug}: canonical controller: {error:#}"));},
+                Ok(result)=>{
+                    memory.canonical_effects_unknown|=result.unknown_effects;any_reachable|=result.reachable||result.scheduled_work;
+                    if let Some(line)=result.admission_log {log.line(&line);}
+                    if let Some(error)=result.operation_error {log.line(&format!("{slug}: canonical operation: {error}"));}
+                }
+                Err(error)=>{
+                    if let Some(store)=error.downcast_ref::<herdr_projects::store::StoreError>() {
+                        let _=herdr_projects::watchdog::note(&ctx.root.join(slug),store);
+                        if let Some(reason)=herdr_projects::watchdog::cause(store) {
+                            log.line(&herdr_projects::watchdog::admission_log_line(reason,None,0));
+                        }
+                    }
+                    memory.canonical_effects_unknown=true;log.line(&format!("{slug}: canonical controller: {error:#}"));
+                }
             }
         }
         admit_background(ctx,log,memory,canonical.into_iter().map(|slug|ctx.root.join(slug)).collect());
@@ -564,9 +576,12 @@ fn drain_executor(root:&Path,log:&Log,memory:&mut Memory)->Result<()> {
 /// Drain happens only at tick entry. Even a completed ticket holds its turn until
 /// then, preserving a full project effect pass before another background job.
 fn admit_background(_ctx:&Ctx,log:&Log,memory:&mut Memory,canonical:Vec<PathBuf>) {
-    if memory.copy_jobs.as_ref().is_some_and(|q|q.pending()){return;}
+    // The exclusive slot is still one ticket. Declared transfers may already be
+    // running; top those up without admitting a launch or a routine beside them.
+    if memory.copy_jobs.as_ref().is_some_and(|q|q.single_pending()){return;}
     #[cfg(feature="state-store")]
     if memory.routine_jobs.as_ref().is_some_and(|q|q.pending()){return;}
+    if memory.copy_jobs.as_ref().is_some_and(|q|q.declared_pending()){admit_effects(log,memory);return;}
     if memory.prefer_copy {
         if admit_effects(log,memory){memory.prefer_copy=false;return;}
     }

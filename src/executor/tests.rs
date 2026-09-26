@@ -76,3 +76,83 @@ fn absolute_deadline_survives_delay_between_worker_and_process_entry() {
     assert!(completion.runner_entered);assert!(completion.result.unwrap().timed_out);
     assert!(!dir.path().join("marker").exists());assert!(pool.stop(Duration::from_secs(1)));
 }
+struct Pause {release:Mutex<mpsc::Receiver<()>>,deadline:Instant,order:Mutex<Vec<String>>,bad:Mutex<Vec<Option<Instant>>>}
+impl Runner for Pause {
+    fn run(&self,cmd:&Cmd)->Result<Output> {
+        self.order.lock().unwrap().push(cmd.program.clone());
+        if cmd.program!="hold"&&cmd.deadline!=Some(self.deadline) {self.bad.lock().unwrap().push(cmd.deadline);}
+        if cmd.program=="hold"||cmd.program=="transfer"||cmd.program=="ordinary-a"||cmd.program=="ordinary-b" {
+            while !cmd.cancellation.as_ref().unwrap().is_cancelled()&&cmd.deadline.is_none_or(|deadline|Instant::now()<deadline) {
+                if self.release.lock().unwrap().recv_timeout(Duration::from_millis(5)).is_ok() {break;}
+            }
+        }
+        Ok(Output{code:Some(0),..Output::default()})
+    }
+    fn socket_request(&self,_:&std::path::Path,_:&str,_:Duration)->Result<String>{unreachable!()}
+}
+#[test]
+fn eight_projects_receive_service_within_two_fairness_rounds() {
+    let (release,gate)=mpsc::channel();let deadline=Instant::now()+Duration::from_secs(30);
+    let probe=Arc::new(Pause{release:Mutex::new(gate),deadline,order:Mutex::new(Vec::new()),bad:Mutex::new(Vec::new())});
+    let bounds=Limits{workers:[1,1],outstanding:[64,8],per_project:8,per_machine:8};
+    let pool=Executor::new(bounds,probe.clone()).unwrap();
+    let mut hold=request("hold","gate","host",Lane::Control,"");hold.command=Cmd::new("hold",Duration::from_secs(30));hold.deadline=deadline;
+    pool.submit(hold).unwrap();
+    let ready=Instant::now()+Duration::from_secs(2);
+    while probe.order.lock().unwrap().is_empty() {assert!(Instant::now()<ready);std::thread::sleep(Duration::from_millis(5));}
+    for project in 0..8 {for n in 0..3 {
+        let mut work=request(&format!("op-{project}-{n}"),&format!("project-{project}"),"host",Lane::Control,"");
+        work.command=Cmd::new(format!("p{project}"),Duration::from_secs(30));work.deadline=deadline;work.command.deadline=Some(deadline);
+        pool.submit(work).unwrap();
+    }}
+    release.send(()).unwrap();
+    let ready=Instant::now()+Duration::from_secs(3);
+    while probe.order.lock().unwrap().len()<17 {assert!(Instant::now()<ready,"start order stalled: {:?}",probe.order.lock().unwrap());std::thread::sleep(Duration::from_millis(2));}
+    let order=probe.order.lock().unwrap().clone();
+    let started:Vec<_>=order.into_iter().filter(|program|program!="hold").take(16).collect();
+    assert_eq!(started.len(),16,"{started:?}");
+    let first:std::collections::BTreeSet<_>=started.iter().take(8).cloned().collect();
+    assert_eq!(first,["p0","p1","p2","p3","p4","p5","p6","p7"].into_iter().map(str::to_string).collect(),"first round: {started:?}");
+    assert!(probe.bad.lock().unwrap().is_empty(),"deadline moved: {:?}",probe.bad.lock().unwrap());
+    assert!(pool.stop(Duration::from_secs(1)));
+}
+#[test]
+fn full_transfer_queue_does_not_block_cancel_selection() {
+    let (release,gate)=mpsc::channel();let deadline=Instant::now()+Duration::from_secs(10);
+    let probe=Arc::new(Pause{release:Mutex::new(gate),deadline,order:Mutex::new(Vec::new()),bad:Mutex::new(Vec::new())});
+    let bounds=Limits{workers:[2,1],outstanding:[8,1],per_project:4,per_machine:4};
+    let pool=Executor::new(bounds,probe.clone()).unwrap();
+    let mut transfer=request("live-copy:1","transfer","transfer-host",Lane::Transfer,"");transfer.command=Cmd::new("transfer",Duration::from_secs(10));transfer.deadline=deadline;
+    pool.submit(transfer).unwrap();
+    let ready=Instant::now()+Duration::from_secs(2);
+    while !probe.order.lock().unwrap().iter().any(|program|program=="transfer") {assert!(Instant::now()<ready);std::thread::sleep(Duration::from_millis(5));}
+    for (operation,project,program) in [("bulk-a","a","ordinary-a"),("bulk-b","b","ordinary-b"),("canonical-cancel:1","c","cancel")] {
+        let mut work=request(operation,project,&format!("host-{project}"),Lane::Control,"");work.command=Cmd::new(program,Duration::from_secs(10));work.deadline=deadline;pool.submit(work).unwrap();
+    }
+    let ready=Instant::now()+Duration::from_secs(2);let mut control=Vec::new();
+    while control.len()<2&&Instant::now()<ready {
+        let seen=probe.order.lock().unwrap().iter().filter(|program|program.starts_with("ordinary")||*program=="cancel").cloned().collect::<Vec<_>>();
+        if seen.len()>=2 {control=seen;break;}
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(control.contains(&"ordinary-a".to_string()),"{control:?}");
+    assert!(control.contains(&"cancel".to_string()),"cancel was not selected while Transfer was full: {control:?}");
+    assert!(!control.contains(&"ordinary-b".to_string()),"ordinary work took the reserved Control slot: {control:?}");
+    release.send(()).unwrap();assert!(pool.stop(Duration::from_secs(1)));
+}
+#[test]
+fn original_deadlines_are_unchanged_across_retries() {
+    let (release,gate)=mpsc::channel();let deadline=Instant::now()+Duration::from_secs(30);
+    let probe=Arc::new(Pause{release:Mutex::new(gate),deadline,order:Mutex::new(Vec::new()),bad:Mutex::new(Vec::new())});
+    let pool=Executor::new(Limits{workers:[1,1],outstanding:[8,8],per_project:4,per_machine:4},probe.clone()).unwrap();
+    let mut hold=request("hold","gate","host",Lane::Control,"");hold.command=Cmd::new("hold",Duration::from_secs(30));hold.deadline=deadline;pool.submit(hold).unwrap();
+    let ready=Instant::now()+Duration::from_secs(2);
+    while probe.order.lock().unwrap().is_empty() {assert!(Instant::now()<ready);std::thread::sleep(Duration::from_millis(5));}
+    let mut retry=request("retry-1","project","host",Lane::Control,"");retry.command=Cmd::new("retry",Duration::from_secs(30));retry.deadline=deadline;retry.command.deadline=Some(deadline);pool.submit(retry).unwrap();
+    std::thread::sleep(Duration::from_millis(80));
+    release.send(()).unwrap();
+    let ready=Instant::now()+Duration::from_secs(2);
+    while !probe.order.lock().unwrap().iter().any(|program|program=="retry") {assert!(Instant::now()<ready);std::thread::sleep(Duration::from_millis(5));}
+    assert!(probe.bad.lock().unwrap().is_empty(),"retry deadline changed: {:?}",probe.bad.lock().unwrap());
+    assert!(pool.stop(Duration::from_secs(1)));
+}

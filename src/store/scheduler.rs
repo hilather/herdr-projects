@@ -3,7 +3,7 @@ use std::collections::{BTreeMap,BTreeSet,VecDeque};
 
 fn schema(db:&Connection)->Result<()> {check_schema(db)?;let version:u32=db.query_row("PRAGMA user_version",[],|r|r.get(0))?;if version<10 {return Err(StoreError::UnsupportedSchema(version));}Ok(())}
 fn invalid(message:&str)->StoreError {StoreError::Invalid(message.into())}
-fn graph(tasks:&[Task],queue:&[QueueRecord])->Result<()> {
+pub(crate) fn graph(tasks:&[Task],queue:&[QueueRecord])->Result<()> {
     if queue.len()>10_000{return Err(invalid("queued task inventory exceeds 10000"));}
     let task_ids:BTreeSet<_>=tasks.iter().map(|t|&t.id).collect();
     let mut degree:BTreeMap<TaskId,usize>=BTreeMap::new();let mut followers:BTreeMap<TaskId,Vec<TaskId>>=BTreeMap::new();let mut edge_count=0;
@@ -40,7 +40,7 @@ pub(super) fn read_with_tasks(db:&Connection,tasks:&[Task],budget:Option<&read_b
     while let Some(r)=rows.next()? {
         if let Some(budget)=budget {budget.row(r,&[])?;}
         let task:String=r.get(0)?;let predecessor:String=r.get(1)?;let requirement:String=r.get(2)?;
-        let requirement=match requirement.as_str(){"verified_result"=>DependencyRequirement::VerifiedResult,"integration_candidate"=>DependencyRequirement::IntegrationCandidate,"landed_commit"=>DependencyRequirement::LandedCommit,_=>return Err(StoreError::Corrupt("unknown dependency requirement".into()))};
+        let requirement=match requirement.as_str(){"verified_result"=>DependencyRequirement::VerifiedResult,"integrated_commit"=>DependencyRequirement::IntegratedCommit,"integration_candidate"=>DependencyRequirement::IntegrationCandidate,"landed_commit"=>DependencyRequirement::LandedCommit,_=>return Err(StoreError::Corrupt("unknown dependency requirement".into()))};
         queue[*index.get(&task).ok_or_else(||StoreError::Corrupt("dependency has no queue record".into()))?].dependencies.push(Dependency{predecessor:TaskId::new(predecessor).map_err(StoreError::Corrupt)?,requirement});
     }
     graph(tasks,&queue)?;Ok(SchedulerSnapshot{policy,queue})
@@ -71,34 +71,56 @@ impl SqliteStore {
         tx.execute("INSERT INTO task_queue VALUES(?1,?2,?3,?4) ON CONFLICT(task_id) DO UPDATE SET priority=excluded.priority",params![id.as_str(),record.priority,record.enqueued_unix_ms,integer(record.enqueue_sequence)?])?;
         tx.execute("DELETE FROM task_dependencies WHERE task_id=?1",[id.as_str()])?;
         for edge in &record.dependencies {tx.execute("INSERT INTO task_dependencies VALUES(?1,?2,?3)",params![id.as_str(),edge.predecessor.as_str(),edge.requirement.as_str()])?;}
+        super::satisfaction::attach_stored_receipts(&tx, id.as_str())?;
         tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('scheduler.task_queued',?1,?2,1,?3)",params![id.as_str(),integer(task.revision)?,serde_json::to_string(&record).map_err(|e|invalid(&e.to_string()))?])?;
         let result=head(&tx)?;tx.commit()?;Ok(result)
     }
     pub fn queue_report(&mut self,now:i64)->Result<QueueReport> {
-        super::delivery::now_check(now)?;let tx=self.connection.transaction()?;schema(&tx)?;let snapshot=read(&tx)?;let tasks=read_tasks(&tx)?;let attempts=read_attempts(&tx)?;let control=super::control::read(&tx)?;
-        let retained_attempts=attempts.iter().filter(|a|a.retains_capacity()).count();let available_slots=(snapshot.policy.max_active_workers as usize).saturating_sub(retained_attempts);let mut entries=Vec::new();
-        let budget_blockers=super::budget::report(&tx,false)?.blockers;
-        for record in &snapshot.queue {
-            let task=tasks.iter().find(|t|t.id==record.task).ok_or(StoreError::Conflict)?;let mut blockers=Vec::new();
-            if task.state!=TaskState::Queued {blockers.push(format!("task_state:{:?}",task.state));}
-            if control.state!=ProjectState::Active||control.reconciliation_required {blockers.push("project_not_admitted".into());}
-            if available_slots==0{blockers.push("capacity_full".into());}
-            if attempts.iter().any(|a|a.task==task.id&&a.retains_capacity()){blockers.push("task_capacity_retained".into());}
-            if attempts.iter().filter(|a|a.task==task.id).count()>=snapshot.policy.max_attempts_per_task as usize {blockers.push("attempt_limit".into());}
-            for edge in &record.dependencies {
-                let predecessor=tasks.iter().find(|t|t.id==edge.predecessor).ok_or(StoreError::Conflict)?;
-                let reason=if matches!(predecessor.state,TaskState::Failed|TaskState::Cancelled){"predecessor_failed"}else{"verified_dependency_evidence_unavailable"};blockers.push(format!("{reason}:{}:{}",edge.predecessor.as_str(),edge.requirement.as_str()));
-            }
-            // Profile/authority and verified-result producers are later W04/W07
-            // work. Queue eligibility must not manufacture their evidence.
-            blockers.extend(budget_blockers.iter().cloned());
-            blockers.push("launch_preparation_unavailable".into());
-            let age=now.saturating_sub(record.enqueued_unix_ms).max(0)/60_000;let score=age+record.priority as i64;
-            entries.push((record.enqueue_sequence,QueueEntry{task:task.id.clone(),task_revision:task.revision,effective_priority:score,blockers}));
-        }
-        entries.sort_by(|a,b|b.1.effective_priority.cmp(&a.1.effective_priority).then(a.0.cmp(&b.0)).then(a.1.task.cmp(&b.1.task)));
-        let report=QueueReport{head:head(&tx)?,policy:snapshot.policy,retained_attempts,available_slots,launch_enabled:false,entries:entries.into_iter().map(|(_,e)|e).collect()};tx.commit()?;Ok(report)
+        super::delivery::now_check(now)?;let tx=self.connection.transaction()?;schema(&tx)?;let scheduler=read(&tx)?;let tasks=read_tasks(&tx)?;let attempts=read_attempts(&tx)?;let control=super::control::read(&tx)?;
+        let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
+        let approvals=if version>=13 {super::approvals::read_all(&tx)?}else{Vec::new()};
+        let reported=queue_blockers(&tx,now,&tasks,&attempts,&scheduler,&control,&approvals)?;
+        let admission_on=super::satisfaction::admission_enabled(&tx)?;
+        let retained_attempts=attempts.iter().filter(|a|a.retains_capacity()).count();let available_slots=(scheduler.policy.max_active_workers as usize).saturating_sub(retained_attempts);
+        let launch_enabled=automatic_launch_enabled(admission_on,&reported);
+        let capability=CapabilityReport{prepared_dispatch:true,automatic_admission:admission_on,dependency_producers:false,integration:"unavailable",blockers:vec!["automatic_admission_does_not_draft_sign_or_reserve".into()]};
+        let report=QueueReport{head:head(&tx)?,policy:scheduler.policy,retained_attempts,available_slots,launch_enabled,capability,entries:reported};tx.commit()?;Ok(report)
     }
+}
+
+pub(super) fn queue_blockers(db:&Connection,now:i64,tasks:&[Task],attempts:&[Attempt],scheduler:&SchedulerSnapshot,control:&ProjectControl,approvals:&[ApprovalRecord])->Result<Vec<QueueEntry>> {
+    let admission_on=super::satisfaction::admission_enabled(db)?;
+    let retained_attempts=attempts.iter().filter(|a|a.retains_capacity()).count();let available_slots=(scheduler.policy.max_active_workers as usize).saturating_sub(retained_attempts);
+    let budget_blockers=super::budget::report(db,false)?.blockers;let mut entries=Vec::new();
+    for record in &scheduler.queue {
+        let task=tasks.iter().find(|t|t.id==record.task).ok_or(StoreError::Conflict)?;let mut blockers=Vec::new();
+        if task.state!=TaskState::Queued {blockers.push(format!("task_state:{:?}",task.state));}
+        if control.state!=ProjectState::Active||control.reconciliation_required {blockers.push("project_not_admitted".into());}
+        if available_slots==0{blockers.push("capacity_full".into());}
+        if attempts.iter().any(|a|a.task==task.id&&a.retains_capacity()){blockers.push("task_capacity_retained".into());}
+        if attempts.iter().filter(|a|a.task==task.id).count()>=scheduler.policy.max_attempts_per_task as usize {blockers.push("attempt_limit".into());}
+        for edge in &record.dependencies {
+            let predecessor=tasks.iter().find(|t|t.id==edge.predecessor).ok_or(StoreError::Conflict)?;
+            // A missing receipt stays unavailable. A valid receipt still does not admit while the flag is off.
+            if let Some(blocker)=super::satisfaction::dependency_blocker(db, task.id.as_str(), predecessor, edge.requirement, admission_on)? {blockers.push(blocker);}
+        }
+        // A level the selected profile has not shown. This does not certify the profile.
+        if let Some(blocker)=super::capabilities::queue_capability_blocker(db, task.id.as_str(), now)? {blockers.push(blocker);}
+        blockers.extend(budget_blockers.iter().cloned());
+        let signed=approvals.iter().any(|record|record.consumed.is_none()&&record.grant.scope.class==ApprovalClass::RuntimeLaunch&&record.grant.scope.task==task.id);
+        let retained_launch=attempts.iter().any(|attempt|attempt.task==task.id&&attempt.retains_capacity()&&matches!(attempt.state,AttemptState::Reserved|AttemptState::Launching|AttemptState::Running|AttemptState::AwaitingInput));
+        if !signed {blockers.push("owner_signature_not_scheduled".into());}
+        if !retained_launch {blockers.push("launch_reserve_not_scheduled".into());blockers.push("controller_requires_reserved_attempt".into());}
+        let age=now.saturating_sub(record.enqueued_unix_ms).max(0)/60_000;let score=age+record.priority as i64;
+        entries.push((record.enqueue_sequence,QueueEntry{task:task.id.clone(),task_revision:task.revision,effective_priority:score,blockers}));
+    }
+    entries.sort_by(|a,b|b.1.effective_priority.cmp(&a.1.effective_priority).then(a.0.cmp(&b.0)).then(a.1.task.cmp(&b.1.task)));
+    Ok(entries.into_iter().map(|(_,entry)|entry).collect())
+}
+
+pub(super) fn automatic_launch_enabled(admission_on:bool, entries:&[QueueEntry])->bool {
+    // Grant, capacity, and dependency blockers still keep this false when every entry has one.
+    admission_on && entries.iter().any(|entry| entry.blockers.is_empty())
 }
 
 #[cfg(test)]
@@ -129,6 +151,40 @@ mod tests {
         let(_temp,mut db)=fixture();queue(&mut db,"a",&request(0,&["b"]),0).unwrap();let s=db.read_snapshot(None).unwrap();let mut task=s.tasks.iter().find(|t|t.id.as_str()=="b").unwrap().clone();task.revision=2;task.state=TaskState::Succeeded;db.commit(Commit{expected_head:s.head,mutations:vec![Mutation::Task{expected:Some(1),next:task}]}).unwrap();let report=db.queue_report(0).unwrap();assert!(report.entries[0].blockers.iter().any(|b|b.starts_with("verified_dependency_evidence_unavailable:b")));assert!(db.read_snapshot(None).unwrap().attempts.is_empty());
     }
     #[test]
+    fn prepared_dispatch_stays_true_while_dependency_evidence_stays_blocked() {
+        let(_temp,mut db)=fixture();queue(&mut db,"a",&request(0,&["b"]),0).unwrap();let report=db.queue_report(0).unwrap();
+        assert!(!report.launch_enabled);assert!(report.capability.prepared_dispatch);assert!(!report.capability.automatic_admission);assert!(!report.capability.dependency_producers);assert_eq!(report.capability.integration,"unavailable");
+        assert_eq!(report.capability.blockers,vec!["automatic_admission_does_not_draft_sign_or_reserve".to_string()]);
+        assert!(report.entries[0].blockers.iter().any(|b|b=="verified_dependency_evidence_unavailable:b:verified_result"));
+        for stage in ["owner_signature_not_scheduled","launch_reserve_not_scheduled","controller_requires_reserved_attempt"] {assert!(report.entries[0].blockers.iter().any(|b|b==stage));}
+        assert!(report.entries.iter().flat_map(|entry|&entry.blockers).chain(report.capability.blockers.iter()).all(|b|b!="launch_draft_not_scheduled"));
+        let claims_producer=|blocker:&str|blocker.contains("launch_preparation_unavailable")||blocker.contains("verifier")||blocker.contains("integrator")||blocker.contains("producer")||blocker.contains("satisfaction");
+        assert!(report.capability.blockers.iter().chain(report.entries.iter().flat_map(|entry|&entry.blockers)).all(|blocker|!claims_producer(blocker)));
+    }
+    #[test]
+    fn retained_reserved_attempt_omits_reserve_blocker_and_grant_omits_signature_blocker() {
+        let(temp,mut db)=fixture();let s=db.read_snapshot(None).unwrap();db.commit(Commit{expected_head:s.head,mutations:["d","e"].into_iter().map(|id|Mutation::Task{expected:None,next:Task{id:TaskId::new(id).unwrap(),revision:1,state:TaskState::Draft,title:id.into(),active_attempt:None}}).collect()}).unwrap();for id in ["a","b","c","d","e"]{queue(&mut db,id,&request(0,&[]),0).unwrap();}
+        let s=db.read_snapshot(None).unwrap();
+        db.commit(Commit{expected_head:s.head,mutations:vec![Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("reserved-a").unwrap(),task:TaskId::new("a").unwrap(),revision:1,state:AttemptState::Reserved,snapshot:None,reservation:"worker:reserved-a".into(),termination_observed:false}},Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("lost-b").unwrap(),task:TaskId::new("b").unwrap(),revision:1,state:AttemptState::Lost,snapshot:None,reservation:"slot".into(),termination_observed:false}},Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("launching-d").unwrap(),task:TaskId::new("d").unwrap(),revision:1,state:AttemptState::Launching,snapshot:None,reservation:"worker:launching-d".into(),termination_observed:false}},Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("awaiting-e").unwrap(),task:TaskId::new("e").unwrap(),revision:1,state:AttemptState::AwaitingInput,snapshot:None,reservation:"worker:awaiting-e".into(),termination_observed:false}}]}).unwrap();
+        let s=db.read_snapshot(None).unwrap();let task=s.tasks.iter().find(|t|t.id.as_str()=="c").unwrap();
+        let store_path=std::fs::canonicalize(temp.path().join("state.db")).unwrap().display().to_string();
+        let profile=crate::domain::profile::fixture(crate::migration::ConfigReference{path:store_path.clone(),digest:None});
+        let inputs=LaunchInputs{version:2,project_store:store_path.clone(),task:task.id.clone(),task_revision:task.revision,scheduler_revision:1,control_epoch:0,binding:"local".into(),binding_revision:1,binding_digest:"a".repeat(64),profile:profile.reference().unwrap(),effective_profile:Some(profile.clone()),approval:VersionedReference{id:"pending".into(),revision:1,digest:"0".repeat(64)},config:crate::migration::ConfigReference{path:store_path,digest:None},repositories:vec![],dependencies:vec![],memory:None,budget:None};
+        let grant=ApprovalGrant{version:1,scope:ApprovalScope::for_launch(&inputs).unwrap(),policy:profile.permission_policy,issued_unix_ms:0,expires_unix_ms:100_000};
+        db.install_approval(&PreparedApproval{grant},s.head,1_000).unwrap();
+        let report=db.queue_report(1_000).unwrap();assert!(!report.launch_enabled);
+        let entry=|id:&str|&report.entries.iter().find(|entry|entry.task.as_str()==id).unwrap().blockers;
+        assert!(entry("a").iter().all(|b|b!="launch_reserve_not_scheduled"&&b!="controller_requires_reserved_attempt"));
+        assert!(entry("d").iter().all(|b|b!="launch_reserve_not_scheduled"&&b!="controller_requires_reserved_attempt"));
+        assert!(entry("e").iter().all(|b|b!="launch_reserve_not_scheduled"&&b!="controller_requires_reserved_attempt"));
+        assert!(entry("a").iter().any(|b|b=="owner_signature_not_scheduled"));
+        assert!(entry("b").iter().any(|b|b=="launch_reserve_not_scheduled")&&entry("b").iter().any(|b|b=="controller_requires_reserved_attempt"));
+        assert!(entry("c").iter().all(|b|b!="owner_signature_not_scheduled"));
+        assert!(entry("c").iter().any(|b|b=="launch_reserve_not_scheduled"));
+        assert!(report.entries.iter().flat_map(|entry|&entry.blockers).all(|b|b!="launch_draft_not_scheduled"));
+        assert_eq!(report.capability.blockers,vec!["automatic_admission_does_not_draft_sign_or_reserve".to_string()]);
+    }
+    #[test]
     fn competing_policy_writers_cannot_both_win_the_same_revision() {
         use std::sync::{Arc,Barrier};let(temp,mut db)=fixture();let head=db.read_snapshot(None).unwrap().head;let barrier=Arc::new(Barrier::new(2));let threads:Vec<_>=[2,3].into_iter().map(|cap|{let path=temp.path().join("state.db");let barrier=barrier.clone();std::thread::spawn(move||{let mut db=SqliteStore::open(&path).unwrap();barrier.wait();db.set_scheduler_policy(head,1,cap,3)})}).collect();let result:Vec<_>=threads.into_iter().map(|t|t.join().unwrap()).collect();assert_eq!(result.iter().filter(|r|r.is_ok()).count(),1);assert_eq!(db.read_snapshot(None).unwrap().scheduler.unwrap().policy.revision,2);
     }
@@ -142,5 +198,5 @@ fn unrelated_task_count_never_makes_a_committed_store_unreadable() {
         let count=if chunk==10 {1}else{1000};let head=db.read_snapshot(None).unwrap().head;let mutations=(0..count).map(|i|{let id=TaskId::new(format!("task-{}",chunk*1000+i)).unwrap();Mutation::Task{expected:None,next:Task{id,revision:1,state:TaskState::Draft,title:"unqueued".into(),active_attempt:None}}}).collect();db.commit(Commit{expected_head:head,mutations}).unwrap();
     }
     let before=db.read_snapshot(None).unwrap();assert_eq!(before.tasks.len(),10_001);assert!(db.queue_report(0).unwrap().entries.is_empty());drop(db);
-    let raw=Connection::open(&path).unwrap();raw.execute_batch("DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; UPDATE store_meta SET schema_version=9; PRAGMA user_version=9;").unwrap();drop(raw);let mut db=SqliteStore::open(&path).unwrap();db.upgrade_v1().unwrap();assert_eq!(db.read_snapshot(None).unwrap().tasks,before.tasks);let head=db.read_snapshot(None).unwrap().head;db.queue_task(&TaskId::new("task-0").unwrap(),1,head,&QueueRequest{priority:0,dependencies:vec![]},0).unwrap();assert_eq!(db.queue_report(0).unwrap().entries.len(),1);
+    let raw=Connection::open(&path).unwrap();raw.execute_batch("DROP INDEX IF EXISTS attempts_retained_by_id; DROP TABLE IF EXISTS active_work_index; DROP TABLE IF EXISTS active_work_meta; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_update; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_delete; DROP TRIGGER IF EXISTS barrier_members_no_update; DROP TRIGGER IF EXISTS barrier_members_no_delete; DROP TRIGGER IF EXISTS barrier_revisions_no_membership_update; DROP TABLE IF EXISTS barrier_stale_briefs; DROP TABLE IF EXISTS barrier_members; DROP TABLE IF EXISTS barrier_revisions; DROP TRIGGER IF EXISTS memory_change_receipts_no_update; DROP TRIGGER IF EXISTS memory_change_receipts_no_delete; DROP TRIGGER IF EXISTS update_package_members_no_update; DROP TRIGGER IF EXISTS update_package_members_no_delete; DROP TRIGGER IF EXISTS update_packages_no_update; DROP TRIGGER IF EXISTS update_packages_no_delete; DROP TABLE IF EXISTS memory_change_receipts; DROP TABLE IF EXISTS update_package_members; ALTER TABLE consumer_bindings DROP COLUMN applied_cursor; DROP TABLE IF EXISTS update_packages; DROP TRIGGER IF EXISTS memory_read_set_on_record; DROP TRIGGER IF EXISTS memory_read_set_on_reclassify; DROP TRIGGER IF EXISTS memory_read_set_on_revision; DROP TRIGGER IF EXISTS memory_read_set_on_validity; DROP TRIGGER IF EXISTS memory_read_set_on_head; DROP TABLE IF EXISTS memory_scope_catalog; DROP TABLE IF EXISTS memory_required_generation; DROP TABLE IF EXISTS consumer_binding_undeliverable; DROP TABLE IF EXISTS consumer_binding_obligations; DROP TABLE IF EXISTS consumer_bindings; DROP TABLE IF EXISTS wait_replay_events; DROP TABLE IF EXISTS replan_requests; DROP TABLE IF EXISTS replan_budget_resets; DROP TABLE IF EXISTS attempt_infrastructure_retries; DROP TABLE IF EXISTS wait_conditions; DROP TABLE IF EXISTS resource_claims; DROP TABLE IF EXISTS delegation_stop_obligations; DROP TABLE IF EXISTS delegation_revocations; DROP TABLE IF EXISTS delegation_grants; DROP TABLE IF EXISTS capability_evidence; DROP TABLE IF EXISTS contract_named_resources; DROP TABLE IF EXISTS contract_scope_paths; DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; DROP TABLE IF EXISTS dependency_satisfactions; DROP TABLE IF EXISTS factory_admission_policies; ALTER TABLE project_control DROP COLUMN factory_admission; DROP TABLE IF EXISTS feedback_claims; DROP TABLE IF EXISTS feedback_items; DROP TABLE IF EXISTS integrated_commits; DROP TABLE IF EXISTS integration_candidates; DROP TABLE IF EXISTS integration_operations; DROP TABLE IF EXISTS integration_target_leases; DROP TABLE IF EXISTS integration_targets; DROP TABLE IF EXISTS verified_results; DROP TABLE IF EXISTS verification_runs; DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; UPDATE store_meta SET schema_version=9; PRAGMA user_version=9;").unwrap();drop(raw);let mut db=SqliteStore::open(&path).unwrap();db.upgrade_v1().unwrap();assert_eq!(db.read_snapshot(None).unwrap().tasks,before.tasks);let head=db.read_snapshot(None).unwrap().head;db.queue_task(&TaskId::new("task-0").unwrap(),1,head,&QueueRequest{priority:0,dependencies:vec![]},0).unwrap();assert_eq!(db.queue_report(0).unwrap().entries.len(),1);
 }

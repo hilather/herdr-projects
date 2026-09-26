@@ -38,6 +38,7 @@ pub(super) fn import_sources(db:&Connection)->Result<()> {
         let payload=serde_json::to_string(&binding).map_err(|e|StoreError::Invalid(e.to_string()))?;
         db.execute("INSERT INTO runtime_bindings VALUES(?1,?2,?3,?4,?5,?6)",params![binding.id,binding.task.as_ref().map(TaskId::as_str),integer(binding.revision)?,binding.source_path,payload,format!("{:x}",Sha256::digest(payload.as_bytes()))])?;
     }
+    super::active_work::invalidate(db)?;
     Ok(())
 }
 
@@ -136,7 +137,6 @@ impl SqliteStore {
         if schema<8{return Err(StoreError::UnsupportedSchema(schema));}
         if head(&tx)?!=expected_head{return Err(StoreError::Conflict);}
         let bindings=read_all(&tx)?;
-        if bindings.len()>=128 {return Err(StoreError::Invalid("runtime binding limit reached".into()));}
         let id=task.map(|t|format!("task:{}",t.as_str())).unwrap_or_else(||"coordinator".into());
         if bindings.iter().any(|b|b.id==id||(task.is_some()&&b.task.as_ref()==task)){return Err(StoreError::Conflict);}
         if !route.pane_id.is_empty()&&bindings.iter().any(|b|b.identity.machine==route.machine&&b.identity.socket==route.socket&&b.identity.pane_id==route.pane_id) {return Err(StoreError::Invalid("pane already referenced by another binding in this project".into()));}
@@ -149,6 +149,7 @@ impl SqliteStore {
         let binding=RuntimeBinding{id,task:task.as_ref().map(|t|t.id.clone()),revision:1,source_path:None,source_digest:None,session_source_digest:None,verification:RuntimeVerification::Unverified,identity:RuntimeIdentity{machine:route.machine.clone(),socket:route.socket.clone(),workspace_id:route.workspace_id.clone(),tab_id:route.tab_id.clone(),pane_id:route.pane_id.clone(),cwd:route.cwd.clone(),..RuntimeIdentity::default()}};
         let payload=serde_json::to_string(&binding).map_err(|e|StoreError::Invalid(e.to_string()))?;
         tx.execute("INSERT INTO runtime_bindings VALUES(?1,?2,1,NULL,?3,?4)",params![binding.id,binding.task.as_ref().map(TaskId::as_str),payload,format!("{:x}",Sha256::digest(payload.as_bytes()))])?;
+        super::active_work::invalidate(&tx)?;
         tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.created',?1,1,1,?2)",params![binding.id,payload])?;
         let task_revision=if let Some(mut task)=task {
             task.revision=task.revision.checked_add(1).ok_or_else(||StoreError::Invalid("task revision exhausted".into()))?;

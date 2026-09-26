@@ -220,6 +220,9 @@ enum Command {
     /// Inspect dependency queue and configure per-project scheduling limits
     #[cfg(feature="state-store")]
     Scheduler { slug:String, #[command(subcommand)] command:SchedulerCommand },
+    /// Read-only factory counters. Does not launch, admit, or print environment values.
+    #[cfg(feature="state-store")]
+    Factory { #[command(subcommand)] command:FactoryCommand },
     /// Inspect or explicitly rebind migrated runtime routing without granting ownership
     #[cfg(feature="state-store")]
     Runtime { slug:String, #[command(subcommand)] command:RuntimeCommand },
@@ -229,6 +232,15 @@ enum Command {
     /// Inspect or edit migrated task records without starting execution
     #[cfg(feature="state-store")]
     Task { slug:String, #[command(subcommand)] command:TaskCommand },
+    /// Record an untrusted worker result. Does not verify or launch.
+    #[cfg(feature="state-store")]
+    Result { slug:String, #[command(subcommand)] command:ResultCommand },
+    /// Show or lease local verifier and integrator feedback. Does not reserve or satisfy.
+    #[cfg(feature="state-store")]
+    Feedback { slug:String, #[command(subcommand)] command:FeedbackCommand },
+    /// Store an untrusted plan revision. Does not verify a signature, install a contract, or reserve.
+    #[cfg(feature="state-store")]
+    Plan { #[command(subcommand)] command:PlanCommand },
     /// Inspect durable delivery state (no external effects)
     #[cfg(feature="state-store")]
     Operations { slug:String, #[command(subcommand)] command:OperationsCommand },
@@ -534,11 +546,48 @@ enum MigrationCommand {
     Restore { #[arg(long)] destination: PathBuf },
 }
 
+#[cfg(all(feature="state-store", target_os="linux"))]
+#[derive(Subcommand)]
+enum ContractCommand {
+    /// Verify raw bytes under contract@herdr-projects and install one contract. No launch.
+    Put { #[arg(long)] input_file:PathBuf, #[arg(long)] signature:PathBuf },
+}
+#[cfg(feature="state-store")]
+#[derive(Subcommand)]
+enum FeedbackCommand {
+    /// Read local verifier and integrator feedback. A pull-request poll is not evidence.
+    Show { #[arg(long)] id: Option<String> },
+    /// Lease one feedback item. Does not reserve an attempt or satisfy a dependency.
+    Claim { id: String, #[arg(long)] owner: String, #[arg(long)] lease_ms: i64 },
+}
+#[cfg(feature="state-store")]
+#[derive(Subcommand)]
+enum PlanCommand {
+    /// Store one unsigned proposal. Does not launch, verify a signature, install a task contract, or write scope.
+    Propose {
+        #[arg(value_name = "PROJECT")] slug: String,
+        #[arg(long)] input_file: PathBuf,
+        #[arg(long)] expected_plan_revision: u64,
+        #[arg(long)] idempotency_key: String,
+    },
+}
+#[cfg(feature="state-store")]
+#[derive(Subcommand)]
+enum ResultCommand {
+    /// Stage git objects and record one untrusted submission. Claimed checks are not evidence.
+    #[cfg(target_os="linux")]
+    Submit { #[arg(long)] input_file:PathBuf },
+    /// Read stored submissions. Claimed checks are not evidence.
+    Show { #[arg(long)] id:Option<String> },
+}
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
 enum TaskCommand {
     /// Record cancellation; release capacity only with proof launch was never claimed
     CancelAttempt { attempt:String, #[arg(long)] expected_revision:u64, #[arg(long)] expected_head:u64, #[arg(long)] reason:String },
+    /// Verify a signed task contract and install it. Does not launch.
+    #[cfg(target_os="linux")]
+    Contract { #[command(subcommand)] command:ContractCommand },
     Queue { id:String, #[arg(long)] input_file:PathBuf, #[arg(long)] expected_revision:u64, #[arg(long)] expected_head:u64 },
     List,
     Show { id:String },
@@ -573,6 +622,29 @@ enum OperationsCommand { Inspect,
     Expire,
     /// Deliver only internal inbox obligations atomically; no terminal/network effects
     DrainInbox { #[arg(long)] expected_head:u64 },
+}
+
+#[cfg(feature="state-store")]
+#[derive(Subcommand)]
+enum FactoryCommand {
+    /// Schema, admission, and bounded counters. No environment, argv, or secrets.
+    Status { slug:String },
+    /// Verify raw bytes under admission@herdr-projects and set factory_admission. Does not launch.
+    #[cfg(target_os = "linux")]
+    Admission {
+        slug: String,
+        #[arg(long, conflicts_with = "disable", required_unless_present = "disable")]
+        enable: bool,
+        #[arg(long, conflicts_with = "enable")]
+        disable: bool,
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        signature: PathBuf,
+        /// Manifest file. Required for --enable. Not read for --disable.
+        #[arg(long, required_unless_present = "disable")]
+        evidence: Option<PathBuf>,
+    },
 }
 
 #[cfg(feature="state-store")]
@@ -870,10 +942,41 @@ pub fn run() -> Result<()> {
             }Ok(())
         },
         #[cfg(feature="state-store")]
+        Command::Factory{command}=>match command {
+            #[cfg(target_os = "linux")]
+            FactoryCommand::Admission { slug, enable, disable: _, policy, signature, evidence } => {
+                project::validate_slug(&slug)?;
+                let dir = ctx.root.join(&slug);
+                println!("{}", serde_json::to_string_pretty(&herdr_projects::authority::import_admission(&dir, enable, &policy, &signature, evidence.as_deref())?)?);
+                Ok(())
+            }
+            FactoryCommand::Status{slug}=>{
+                project::validate_slug(&slug)?;
+                let dir=ctx.root.join(slug);
+                match herdr_projects::factory_status::report(&dir,crate::canonical_controller::launch_dispatch_enabled()) {
+                    Ok(status)=>println!("{}",serde_json::to_string_pretty(&status)?),
+                    Err(herdr_projects::factory_status::ReportError::Newer(value))=>{
+                        println!("{}",serde_json::to_string_pretty(&value)?);
+                        bail!("store schema is newer than this binary");
+                    }
+                    Err(herdr_projects::factory_status::ReportError::Unsupported(value))=>{
+                        println!("{}",serde_json::to_string_pretty(&value)?);
+                        bail!("unsupported_schema");
+                    }
+                    Err(error)=>return Err(error.into()),
+                }
+                Ok(())
+            }
+        },
+        #[cfg(feature="state-store")]
         Command::Task { slug,command } => {
             use herdr_projects::{domain::TaskId,runtime};
             project::validate_slug(&slug)?; let dir=ctx.root.join(&slug);
             match command {
+                #[cfg(target_os="linux")]
+                TaskCommand::Contract{command}=>match command {
+                    ContractCommand::Put{input_file,signature}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::authority::import_contract(&dir,&input_file,&signature)?)?),
+                },
                 TaskCommand::Queue{id,input_file,expected_revision,expected_head}=>{
                     let bytes=herdr_projects::migration::read_plan_file(&input_file)?;
                     let request=serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid queue request JSON"))?;
@@ -888,6 +991,42 @@ pub fn run() -> Result<()> {
                 },
                 TaskCommand::Add{id,title,expected_head}=>println!("Committed task at event head {}. Use migration export to generate the new view.",runtime::add_task(&dir,TaskId::new(id).map_err(anyhow::Error::msg)?,title,expected_head)?),
                 TaskCommand::Rename{id,title,expected_revision,expected_head}=>println!("Committed task at event head {}. Use migration export to generate the new view.",runtime::rename_task(&dir,&TaskId::new(id).map_err(anyhow::Error::msg)?,title,expected_revision,expected_head)?),
+            }
+            Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Result{slug,command}=>{
+            project::validate_slug(&slug)?;
+            let dir=ctx.root.join(&slug);
+            match command {
+                #[cfg(target_os="linux")]
+                ResultCommand::Submit{input_file}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::submit_untrusted_result(&dir,&input_file)?)?),
+                ResultCommand::Show{id}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::show_results(&dir,id.as_deref())?)?),
+            }
+            Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Feedback{slug,command}=>{
+            project::validate_slug(&slug)?;
+            let dir=ctx.root.join(&slug);
+            match command {
+                FeedbackCommand::Show{id}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::show_feedback(&dir,id.as_deref())?)?),
+                FeedbackCommand::Claim{id,owner,lease_ms}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::claim_feedback(&dir,&id,&owner,lease_ms)?)?),
+            }
+            Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Plan{command}=>{
+            match command {
+                PlanCommand::Propose{slug,input_file,expected_plan_revision,idempotency_key}=>{
+                    project::validate_slug(&slug)?;
+                    let dir=ctx.root.join(&slug);
+                    match herdr_projects::store::propose_plan(&dir,&input_file,expected_plan_revision,&idempotency_key) {
+                        Ok(receipt)=>println!("{}",serde_json::to_string_pretty(&receipt)?),
+                        Err(herdr_projects::store::StoreError::StalePlanParent(current))=>anyhow::bail!("stale plan parent conflicts with current revision {current}"),
+                        Err(error)=>return Err(error.into()),
+                    }
+                }
             }
             Ok(())
         },

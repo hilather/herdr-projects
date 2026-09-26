@@ -1,8 +1,8 @@
 //! Recoverable report-optional projection followed by one atomic finalization.
 use super::*;
-use herdr_projects::{execution_guard::ProjectGuard,final_copy_intent::{FinalCopyIntent,Purpose}};
+use herdr_projects::{execution_guard::{ProjectEffect,ProjectGuard},final_copy_intent::{FinalCopyIntent,Purpose}};
 
-fn eligible(project:&Project,guard:&ProjectGuard,t:&Thread)->Result<()> {
+fn eligible(project:&Project,guard:&dyn ProjectEffect,t:&Thread)->Result<()> {
     guard.check_project(&project.dir())?;crate::project::ensure_legacy(&project.dir())?;
     ensure!(project.try_status()?==crate::project::Status::Active&&t.status==thread::Status::Open&&t.removal.is_none(),"thread is not eligible for final-copy publication");
     thread::copy_delivery::validate(t)
@@ -25,14 +25,14 @@ fn load_stage(project:&Project,t:&Thread,intent:&FinalCopyIntent,control:&Contro
     }
     root.matches_path(&path)?;control.check()?;Ok((path,source))
 }
-fn check(project:&Project,guard:&ProjectGuard,id:&str,intent:&FinalCopyIntent,authority:&str)->Result<Thread> {
+fn check(project:&Project,guard:&dyn ProjectEffect,id:&str,intent:&FinalCopyIntent,authority:&str)->Result<Thread> {
     let t=thread::load(project,id)?;eligible(project,guard,&t)?;thread::final_copy::check(&t,intent)?;
     ensure!(intent.authority==authority,"final-copy authority changed");Ok(t)
 }
 impl LiveCopy {
     /// `authorize` errors withdraw effect permission; false means resolution is
     /// no longer eligible. Before intent creation either outcome refuses work.
-    pub fn begin_final_controlled(self,project:&Project,guard:&ProjectGuard,expected:&Thread,authority:&str,operation:&str,purpose:Purpose,control:&Control,mut authorize:impl FnMut()->Result<bool>)->Result<()> {
+    pub fn begin_final_controlled(self,project:&Project,guard:&dyn ProjectEffect,expected:&Thread,authority:&str,operation:&str,purpose:Purpose,control:&Control,mut authorize:impl FnMut()->Result<bool>)->Result<()> {
         control.check()?;eligible(project,guard,expected)?;thread::copy_delivery::ready(expected)?;purpose.validate()?;
         ensure!(authorize()?&&thread::final_copy::resolution_eligible(project,expected,&purpose)?,"automatic finalization is no longer eligible");
         ensure!(self.staging.0.parent()==Some(project.state_dir().join("live-copies").as_path()),"final stage belongs to another project");
@@ -57,10 +57,10 @@ impl LiveCopy {
         File::open(project.dir().join("threads"))?.sync_all()?;Ok(())
     }
 }
-pub fn resume_controlled(project:&Project,guard:&ProjectGuard,id:&str,authority:&str,control:&Control,mut authorize:impl FnMut()->Result<bool>)->Result<()> {
+pub fn resume_controlled(project:&Project,guard:&dyn ProjectEffect,id:&str,authority:&str,control:&Control,mut authorize:impl FnMut()->Result<bool>)->Result<()> {
     resume_with(project,guard,id,authority,control,&mut authorize,||Ok(()))
 }
-fn resume_with(project:&Project,guard:&ProjectGuard,id:&str,authority:&str,control:&Control,authorize:&mut impl FnMut()->Result<bool>,mut after_file:impl FnMut()->Result<()>)->Result<()> {
+fn resume_with(project:&Project,guard:&dyn ProjectEffect,id:&str,authority:&str,control:&Control,authorize:&mut impl FnMut()->Result<bool>,mut after_file:impl FnMut()->Result<()>)->Result<()> {
     control.check()?;let current=thread::load(project,id)?;let intent=current.pending_final_copy.clone().context("no pending final copy")?;
     let current=check(project,guard,id,&intent,authority)?;authorize()?;
     let (path,source)=load_stage(project,&current,&intent,control)?;let stage=Directory::open(&path)?;
@@ -99,7 +99,7 @@ mod tests {
         let mut bytes=Vec::new();export(Path::new(&t.thread_dir),&mut bytes).unwrap();let archive=root.path().join("wire");fs::write(&archive,bytes).unwrap();let stage=receive(&project,&archive).unwrap();
         (root,project,t,stage,purpose)
     }
-    fn begin(project:&Project,guard:&ProjectGuard,t:&Thread,stage:LiveCopy,purpose:Purpose) {
+    fn begin(project:&Project,guard:&dyn ProjectEffect,t:&Thread,stage:LiveCopy,purpose:Purpose) {
         stage.begin_final_controlled(project,guard,t,AUTHORITY,"fixture-finalization",purpose,&Control::default(),||Ok(true)).unwrap();
     }
     #[test]

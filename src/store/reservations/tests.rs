@@ -34,6 +34,20 @@ fn fixture_at(version:u32)->(tempfile::TempDir,SqliteStore,Vec<PreparedLaunch>) 
 fn reserve(db:&mut SqliteStore,p:&[PreparedLaunch])->Reservation {let h=db.read_snapshot(None).unwrap().head;db.reserve_prepared(p,h,1000).unwrap()}
 
 #[test]
+fn satisfaction_flag_does_not_reserve_a_dependent_task() {
+    let(_temp,mut db,p)=fixture();
+    db.testing_set_factory_admission(true).unwrap();
+    db.connection.execute(
+        "INSERT INTO task_dependencies(task_id,predecessor_id,requirement) VALUES('a','b','verified_result')",
+        [],
+    ).unwrap();
+    let head=db.read_snapshot(None).unwrap().head;
+    let err=db.reserve_prepared(&p,head,1000).unwrap_err();
+    assert!(matches!(err, StoreError::Invalid(ref message) if message.contains("not ready") || message.contains("dependency")), "{err}");
+    assert!(db.read_snapshot(None).unwrap().attempts.is_empty());
+}
+
+#[test]
 fn project_outbox_upgrade_preserves_claims_inputs_and_consumed_approvals() {
     let(temp,mut db,p)=fixture_at(14);let r=reserve(&mut db,&p);
     let claim=db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap();
@@ -62,7 +76,7 @@ fn project_outbox_upgrade_preserves_claims_inputs_and_consumed_approvals() {
         assert!(db.connection.execute("DELETE FROM approval_uses",[]).is_err());
         assert!(db.connection.execute("DELETE FROM attempt_inputs",[]).is_err());
     }
-    db.upgrade_v1().unwrap();before.schema_version=25;
+    db.upgrade_v1().unwrap();before.schema_version=26;
     assert_eq!(db.read_snapshot(None).unwrap(),before);db.integrity_check().unwrap();
     drop(db);let mut db=SqliteStore::open(&temp.path().join(".state/state.db")).unwrap();
     db.validate_claim(&claim,1001).unwrap();assert_eq!(db.read_snapshot(None).unwrap(),before);
@@ -140,9 +154,9 @@ fn unknown_provider_usage_is_explicit_and_never_an_implicit_zero() {
 #[test]
 fn budget_upgrade_preserves_pending_operations_without_inventing_policy() {
     let(_temp,mut db,p)=fixture();reserve(&mut db,&p);
-    db.connection.execute_batch("DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; UPDATE store_meta SET schema_version=13; PRAGMA user_version=13;").unwrap();
+    db.connection.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; UPDATE store_meta SET schema_version=13; PRAGMA user_version=13;").unwrap();
     let before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();
-    let after=db.read_snapshot(None).unwrap();assert_eq!(after.schema_version,25);
+    let after=db.read_snapshot(None).unwrap();assert_eq!(after.schema_version,26);
     assert_eq!(after.events,before.events);assert_eq!(after.attempt_inputs,before.attempt_inputs);
     assert_eq!(after.deliveries,before.deliveries);assert!(after.budget_policies.is_empty());
 }
@@ -184,7 +198,7 @@ fn schema12_launches_upgrade_without_fabricating_grants_or_releasing_capacity() 
     for claimed in [false,true] {
         let(temp,mut db,p)=fixture();let r=reserve(&mut db,&p);
         let claim=claimed.then(||db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap());
-        db.connection.execute_batch("DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; UPDATE store_meta SET schema_version=12; PRAGMA user_version=12;").unwrap();
+        db.connection.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; UPDATE store_meta SET schema_version=12; PRAGMA user_version=12;").unwrap();
         let before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();let after=db.read_snapshot(None).unwrap();
         assert_eq!(after.head,before.head);assert_eq!(after.events,before.events);assert_eq!(after.attempt_inputs,before.attempt_inputs);assert_eq!(after.deliveries,before.deliveries);assert!(after.approvals.is_empty());
         drop(db);let mut db=SqliteStore::open(&temp.path().join(".state/state.db")).unwrap();
@@ -274,7 +288,7 @@ fn version_one_input_serialization_preserves_historical_identity() {
 #[test]
 fn schema11_upgrade_retains_records_and_blocks_old_format_insertions() {
     let(temp,mut db,p)=fixture();
-    db.connection.execute_batch("DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER attempt_inputs_effective_profile; UPDATE store_meta SET schema_version=11; PRAGMA user_version=11;").unwrap();
+    db.connection.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER attempt_inputs_effective_profile; UPDATE store_meta SET schema_version=11; PRAGMA user_version=11;").unwrap();
     // Reproduce a schema-11/v1 historical reservation, before v2's producer existed.
     let old_json=include_str!("../../../tests/fixtures/launch-inputs-v1.json").trim().replace(&"a".repeat(64),&p[0].inputs.binding_digest);
     let inputs:LaunchInputs=serde_json::from_str(&old_json).unwrap();
@@ -294,7 +308,7 @@ fn schema11_upgrade_retains_records_and_blocks_old_format_insertions() {
     let before=db.read_snapshot(None).unwrap();
     assert!(matches!(db.reserve_prepared(&p,before.head,1000),Err(StoreError::UnsupportedSchema(11))));
     db.upgrade_v1().unwrap();let after=db.read_snapshot(None).unwrap();
-    assert_eq!(after.schema_version,25);assert_eq!(after.attempt_inputs,before.attempt_inputs);assert_eq!(after.events,before.events);
+    assert_eq!(after.schema_version,26);assert_eq!(after.attempt_inputs,before.attempt_inputs);assert_eq!(after.events,before.events);
     assert_eq!(after.head,before.head);
     assert!(db.connection.execute("INSERT INTO attempt_inputs VALUES('old','old','{\"inputs\":{\"version\":1}}',?1)",params!["a".repeat(64)]).is_err());
     assert_eq!(after.attempt_inputs[0],record);
@@ -333,7 +347,7 @@ fn claim_and_cancellation_race_never_releases_a_claimed_worker() {
 }
 #[test]
 fn orphan_launches_refuse_reads_and_upgrade_rolls_back() {
-    let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);db.connection.execute_batch("DROP TRIGGER attempt_inputs_no_delete; DELETE FROM attempt_inputs;").unwrap();assert!(db.read_snapshot(None).is_err());db.connection.execute_batch("DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_inputs; DROP TABLE attempt_cancellations; UPDATE store_meta SET schema_version=10; PRAGMA user_version=10;").unwrap();assert!(db.upgrade_v1().is_err());let version:u32=db.connection.query_row("PRAGMA user_version",[],|r|r.get(0)).unwrap();assert_eq!(version,10);assert_eq!(db.read_snapshot(None).unwrap().operations[0].id,r.record.operation);
+    let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);db.connection.execute_batch("DROP TRIGGER attempt_inputs_no_delete; DELETE FROM attempt_inputs;").unwrap();assert!(db.read_snapshot(None).is_err());db.connection.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_inputs; DROP TABLE attempt_cancellations; UPDATE store_meta SET schema_version=10; PRAGMA user_version=10;").unwrap();assert!(db.upgrade_v1().is_err());let version:u32=db.connection.query_row("PRAGMA user_version",[],|r|r.get(0)).unwrap();assert_eq!(version,10);assert_eq!(db.read_snapshot(None).unwrap().operations[0].id,r.record.operation);
 }
 #[test]
 fn cancellation_without_launch_proof_retains_the_attempt() {
@@ -341,7 +355,7 @@ fn cancellation_without_launch_proof_retains_the_attempt() {
 }
 #[test]
 fn schema10_upgrade_preserves_nonzero_claim_history() {
-    let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap();db.connection.execute_batch("DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_inputs; DROP TABLE attempt_cancellations; UPDATE operations SET kind='fixture'; UPDATE store_meta SET schema_version=10; PRAGMA user_version=10;").unwrap();let before=db.deliveries().unwrap();db.upgrade_v1().unwrap();assert_eq!(db.deliveries().unwrap(),before);assert!(db.read_snapshot(None).unwrap().attempt_inputs.is_empty());assert!(db.connection.execute("UPDATE operation_delivery SET attempts=0",[]).is_err());
+    let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap();db.connection.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_inputs; DROP TABLE attempt_cancellations; UPDATE operations SET kind='fixture'; UPDATE store_meta SET schema_version=10; PRAGMA user_version=10;").unwrap();let before=db.deliveries().unwrap();db.upgrade_v1().unwrap();assert_eq!(db.deliveries().unwrap(),before);assert!(db.read_snapshot(None).unwrap().attempt_inputs.is_empty());assert!(db.connection.execute("UPDATE operation_delivery SET attempts=0",[]).is_err());
 }
 #[test]
 fn missing_parent_is_not_hidden_from_an_open_store() {
@@ -386,6 +400,214 @@ fn sealed_reservation_binds_knowledge_and_pre_effect_checks_reject_later_changes
     db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('memory.revision_inserted','new-rule',1,1,'{}')",[]).unwrap();
     assert!(db.validate_claim(&claim,1002).is_err());
     assert!(db.attempt_knowledge_snapshot(reservation.record.attempt.as_str(),1002).is_err());
+}
+
+#[test]
+fn reserve_and_termination_refresh_bindings_without_generic_commit() {
+    use crate::domain::{
+        AttemptOutputReference, LaunchTarget, LaunchStoppedReceipt, PreparedLaunchStopped,
+        ResourceIdentity, RuntimeRoute, SnapshotPlan, SnapshotRequest, VersionedReference,
+    };
+    use crate::domain::SELECTION_ESTIMATOR;
+    use crate::worker_supervision::{ProcessIncarnation, SupervisorIdentity};
+    let (_temp, mut db, mut prepared) = fixture();
+    let launch = &mut prepared[0];
+    let profile = launch.inputs.effective_profile.as_ref().unwrap().clone();
+    let task_id = launch.inputs.task.as_str().to_string();
+    let config_digest = launch.inputs.config.digest.clone();
+    let snap = |db: &mut SqliteStore, instructions: &str| {
+        db.create_memory_snapshot(SnapshotPlan {
+            coordinator: false,
+            session_id: None,
+            request: SnapshotRequest {
+                schema_version: 1,
+                task_id: task_id.clone(),
+                profile: profile.name.clone(),
+                domains: vec![],
+                paths: vec![],
+                pinned_keys: vec![],
+                sensitivity: "default".into(),
+            },
+            profile_name: profile.name.clone(),
+            profile_digest: profile.definition_digest.clone(),
+            config_digest: config_digest.clone(),
+            budget_chars: 32_000,
+            estimator: SELECTION_ESTIMATOR.into(),
+            instructions: instructions.into(),
+            now_unix_ms: 1000,
+            expected_heads_digest: None,
+        })
+        .unwrap()
+    };
+    let reserved_snapshot = snap(&mut db, "reserved instructions");
+    let earlier = snap(&mut db, "earlier sibling instructions");
+    launch.inputs.memory = Some(VersionedReference {
+        id: reserved_snapshot.id.as_str().into(),
+        revision: 1,
+        digest: reserved_snapshot.manifest_hash.clone(),
+    });
+    let grant = ApprovalGrant {
+        version: 1,
+        scope: ApprovalScope::for_launch(&launch.inputs).unwrap(),
+        policy: profile.permission_policy.clone(),
+        issued_unix_ms: 0,
+        expires_unix_ms: 100_000,
+    };
+    let head = db.read_snapshot(None).unwrap().head;
+    launch.inputs.approval = db
+        .install_approval(&PreparedApproval { grant }, head, 1000)
+        .unwrap();
+    let head = db.read_snapshot(None).unwrap().head;
+    let reservation = db
+        .reserve_prepared(&[launch.clone()], head, 1000)
+        .unwrap();
+    let reserved_binding = db
+        .consumer_binding_for_snapshot(reserved_snapshot.id.as_str())
+        .unwrap()
+        .unwrap();
+    let earlier_binding = db
+        .consumer_binding_for_snapshot(earlier.id.as_str())
+        .unwrap()
+        .unwrap();
+    assert!(reserved_binding.active);
+    assert_eq!(
+        reserved_binding.attempt_id.as_deref(),
+        Some(reservation.record.attempt.as_str())
+    );
+    assert!(!earlier_binding.active);
+    let successor = snap(&mut db, "successor instructions");
+    let successor_binding = db
+        .consumer_binding_for_snapshot(successor.id.as_str())
+        .unwrap()
+        .unwrap();
+    assert!(!successor_binding.active);
+    let _claim = db
+        .claim_operation(&reservation.record.operation, 1, "worker", 1000, 1000)
+        .unwrap();
+    let supervisor = SupervisorIdentity {
+        version: 2,
+        boot_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+        host_id: Some("a".repeat(64)),
+        observer_namespace: (1, 2),
+        worker_namespace: (1, 3),
+        outer: ProcessIncarnation {
+            pid: 2,
+            device: 1,
+            inode: 1,
+        },
+        init: ProcessIncarnation {
+            pid: 3,
+            device: 1,
+            inode: 2,
+        },
+    };
+    let target = LaunchTarget {
+        version: 2,
+        attempt: reservation.record.attempt.clone(),
+        operation: reservation.record.operation.clone(),
+        route: RuntimeRoute {
+            machine: String::new(),
+            socket: "/tmp/herdr.sock".into(),
+            workspace_id: "ws".into(),
+            tab_id: "tab".into(),
+            pane_id: "pane".into(),
+            cwd: "/tmp/task".into(),
+        },
+        terminal: "term".into(),
+        session: ResourceIdentity {
+            device: 1,
+            inode: 2,
+            born_secs: 3,
+            born_nanos: 0,
+        },
+        supervisor: Some(supervisor),
+        observed_unix_ms: 1500,
+    };
+    db.connection
+        .execute(
+            "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_target',?1,1,1,?2)",
+            params![
+                reservation.record.operation.as_str(),
+                serde_json::to_string(&target).unwrap()
+            ],
+        )
+        .unwrap();
+    let head = db.read_snapshot(None).unwrap().head;
+    db.record_launch_stopped(
+        &PreparedLaunchStopped {
+            receipt: LaunchStoppedReceipt {
+                version: 1,
+                target: target.clone(),
+                host_reboot: None,
+                repository_snapshots: vec![],
+                output_snapshot: Some(AttemptOutputReference {
+                    source: crate::domain::worker_output_path(
+                        &reservation.record.inputs,
+                        &reservation.record.attempt,
+                    )
+                    .unwrap(),
+                    digest: None,
+                }),
+                observed_unix_ms: 1500,
+            },
+        },
+        1,
+        head,
+        1500,
+    )
+    .unwrap();
+    let successor_binding = db
+        .consumer_binding_for_snapshot(successor.id.as_str())
+        .unwrap()
+        .unwrap();
+    assert!(successor_binding.active);
+    let sequence: i64 = db
+        .connection
+        .query_row("SELECT max(sequence) FROM events", [], |row| row.get(0))
+        .unwrap();
+    let hash = "ab".repeat(32);
+    db.connection
+        .execute(
+            "INSERT INTO objects(hash,size,availability,collection,pin_count,fencing_token) VALUES(?1,1,'available','unclaimed',0,0)",
+            [&hash],
+        )
+        .unwrap();
+    db.connection
+        .execute(
+            "INSERT INTO memory_records(id,record_key,scope_id,kind,is_hard) VALUES('fact','fact','project','observation',0)",
+            [],
+        )
+        .unwrap();
+    db.connection
+        .execute(
+            "INSERT INTO memory_revisions(record_id,revision,body_hash,provenance_hash,promoted_seq,applicability) VALUES('fact',1,?1,?1,?2,'{\"domains\":[],\"paths\":[]}')",
+            params![hash, sequence],
+        )
+        .unwrap();
+    db.connection
+        .execute(
+            "INSERT INTO memory_delivery_intents(id,cause_id,subscriber,snapshot_id,task_id,record_id,revision,severity,triggering_seq,state) VALUES('delivery-keep','cause',?1,?2,?3,'fact',1,'informational',?4,'pending')",
+            params![
+                format!("task:{task_id}"),
+                reserved_snapshot.id.as_str(),
+                task_id,
+                sequence
+            ],
+        )
+        .unwrap();
+    db.retire_consumer_binding(
+        &reserved_binding.binding_id,
+        Some(&successor_binding.binding_id),
+    )
+    .unwrap();
+    assert!(db
+        .binding_obligations(&successor_binding.binding_id)
+        .unwrap()
+        .contains(&"delivery-keep".to_string()));
+    assert!(db
+        .binding_undeliverable(&reserved_binding.binding_id)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -878,4 +1100,141 @@ fn reservation_requires_current_exact_unconsumed_approval_without_using_it() {
     assert_eq!(state.approvals.iter().filter(|a|a.consumed.is_some()).count(),1);
     assert!(super::super::approvals::validate_preparation(&db.connection,&reservation.record.inputs,1002).is_err());
     assert_eq!(db.read_snapshot(None).unwrap(),state);
+}
+
+fn plant_verified(db:&SqliteStore,task:&str,attempt:&str,result_id:&str) {
+    let digest="d".repeat(64);let oid="a".repeat(40);
+    let installed:i64=db.connection.query_row("SELECT COALESCE(MAX(sequence),1) FROM events",[],|row|row.get(0)).unwrap();
+    db.connection.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+    db.connection.execute("INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq) VALUES(?1,1,NULL,'/tmp/project',0,'/tmp/repo',?2,'sha1',NULL,'verify_only',?3,?4,?5)",params![task,oid,vec![b'x'],digest,installed]).unwrap();
+    db.connection.execute("INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,'/tmp/project',?1,?2,?2,?3,1,?2,?4,'policy',?2,?5,?5,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?2,0,0,1)",params![result_id,digest,task,attempt,oid]).unwrap();
+    db.connection.execute("INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?1,?2,?3,?3,'sha1',?2,?2,'linux-unshare-user-pid-mount-v1',0,1)",params![result_id,digest,oid]).unwrap();
+    db.connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+}
+fn reseal(db:&mut SqliteStore,task_name:&str,dependencies:Vec<DependencyInput>,repositories:Vec<RepositoryInput>,template:&LaunchInputs)->PreparedLaunch {
+    let snapshot=db.read_snapshot(None).unwrap();
+    let task=snapshot.tasks.iter().find(|task|task.id.as_str()==task_name).unwrap().clone();
+    let binding=snapshot.runtime_bindings.iter().find(|binding|binding.task.as_ref()==Some(&task.id)).unwrap();
+    let profile=template.effective_profile.clone().unwrap();
+    let mut inputs=LaunchInputs{version:2,project_store:template.project_store.clone(),task:task.id.clone(),task_revision:task.revision,scheduler_revision:snapshot.scheduler.as_ref().unwrap().policy.revision,control_epoch:snapshot.control.as_ref().unwrap().epoch,binding:binding.id.clone(),binding_revision:binding.revision,binding_digest:super::super::ownership::identity_digest(binding).unwrap(),profile:profile.reference().unwrap(),effective_profile:Some(profile.clone()),approval:VersionedReference{id:"unsigned-launch".into(),revision:1,digest:"0".repeat(64)},config:template.config.clone(),repositories,dependencies,memory:None,budget:template.budget.clone()};
+    let grant=ApprovalGrant{version:1,scope:ApprovalScope::for_launch(&inputs).unwrap(),policy:profile.permission_policy,issued_unix_ms:0,expires_unix_ms:100_000};
+    inputs.approval=db.install_approval(&PreparedApproval{grant},snapshot.head,1000).unwrap();
+    PreparedLaunch{inputs}
+}
+fn queue_dependency(db:&mut SqliteStore,task_name:&str,predecessor:&str,requirement:DependencyRequirement) {
+    let snapshot=db.read_snapshot(None).unwrap();
+    let task=snapshot.tasks.iter().find(|task|task.id.as_str()==task_name).unwrap().clone();
+    db.queue_task(&task.id,task.revision,snapshot.head,&QueueRequest{priority:0,dependencies:vec![Dependency{predecessor:TaskId::new(predecessor).unwrap(),requirement}]},1000).unwrap();
+}
+fn verified_dependent(db:&mut SqliteStore,template:&LaunchInputs)->PreparedLaunch {
+    let head=db.read_snapshot(None).unwrap().head;
+    db.commit(Commit{expected_head:head,mutations:vec![Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("attempt-b").unwrap(),task:TaskId::new("b").unwrap(),revision:1,state:AttemptState::Completed,snapshot:None,reservation:"slot-b".into(),termination_observed:true}}]}).unwrap();
+    plant_verified(db,"b","attempt-b",&"e".repeat(64));
+    queue_dependency(db,"a","b",DependencyRequirement::VerifiedResult);
+    let satisfaction_id:String=db.connection.query_row("SELECT satisfaction_id FROM dependency_satisfactions WHERE task_id='a' AND predecessor_task='b' AND state='valid'",[],|row|row.get(0)).unwrap();
+    let predecessor_revision=db.read_snapshot(None).unwrap().tasks.iter().find(|task|task.id.as_str()=="b").unwrap().revision;
+    reseal(db,"a",vec![DependencyInput{task:TaskId::new("b").unwrap(),task_revision:predecessor_revision,requirement:DependencyRequirement::VerifiedResult,evidence:VersionedReference{id:satisfaction_id.clone(),revision:1,digest:satisfaction_id}}],vec![],template)
+}
+#[test]
+fn flag_off_dependency_evidence_does_not_reserve_and_flag_on_reserves_one() {
+    let(_temp,mut db,prepared)=fixture();
+    let launch=verified_dependent(&mut db,&prepared[0].inputs);
+    let before=db.read_snapshot(None).unwrap();
+    let err=db.reserve_prepared(&[launch.clone()],before.head,1000).unwrap_err();
+    assert!(matches!(err,StoreError::Invalid(ref message) if message.contains("dependency evidence producers are not available")),"{err}");
+    assert!(db.read_snapshot(None).unwrap().attempts.iter().all(|attempt|attempt.task.as_str()!="a"));
+    db.testing_set_factory_admission(true).unwrap();
+    let stale=db.reserve_prepared(&[launch.clone()],0,1000).unwrap_err();
+    assert!(matches!(stale,StoreError::Conflict),"{stale}");
+    assert!(db.read_snapshot(None).unwrap().attempts.iter().all(|attempt|attempt.task.as_str()!="a"));
+    let head=db.read_snapshot(None).unwrap().head;
+    let reserved=db.reserve_prepared(&[launch],head,1000).unwrap();
+    assert_eq!(reserved.record.inputs.task.as_str(),"a");
+    let attempts=db.read_snapshot(None).unwrap().attempts;
+    assert_eq!(attempts.iter().filter(|attempt|attempt.task.as_str()=="a").count(),1);
+}
+#[test]
+fn lost_attempt_still_fills_the_only_slot() {
+    let(_temp,mut db,prepared)=fixture();
+    let launch=verified_dependent(&mut db,&prepared[0].inputs);
+    db.testing_set_factory_admission(true).unwrap();
+    let snapshot=db.read_snapshot(None).unwrap();
+    db.commit(Commit{expected_head:snapshot.head,mutations:vec![Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("lost-b").unwrap(),task:TaskId::new("b").unwrap(),revision:1,state:AttemptState::Lost,snapshot:None,reservation:"slot-lost".into(),termination_observed:false}}]}).unwrap();
+    let before=db.read_snapshot(None).unwrap();
+    let err=db.reserve_prepared(&[launch],before.head,1000).unwrap_err();
+    assert!(matches!(err,StoreError::Invalid(ref message) if message.contains("capacity")),"{err}");
+    let after=db.read_snapshot(None).unwrap();
+    assert!(after.attempts.iter().any(|attempt|attempt.id.as_str()=="lost-b"&&attempt.retains_capacity()));
+    assert!(after.attempts.iter().all(|attempt|attempt.task.as_str()!="a"));
+    assert_eq!(after.attempts.len(),before.attempts.len());
+}
+fn git_history()->(tempfile::TempDir,String,String) {
+    let dir=tempfile::tempdir().unwrap();let repo=dir.path().join("repo");std::fs::create_dir(&repo).unwrap();
+    let git=|args:&[&str]| {
+        let output=std::process::Command::new("/usr/bin/git").arg("-C").arg(&repo).args(args).env_clear().env("PATH","/usr/bin:/bin").env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL","/dev/null").env("GIT_AUTHOR_NAME","t").env("GIT_AUTHOR_EMAIL","t@example.com").env("GIT_COMMITTER_NAME","t").env("GIT_COMMITTER_EMAIL","t@example.com").output().unwrap();
+        assert!(output.status.success(),"git {args:?}: {}",String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    git(&["init","-b","main"]);std::fs::write(repo.join("a.txt"),"a").unwrap();git(&["add","a.txt"]);git(&["commit","-m","a"]);
+    let first=git(&["rev-parse","HEAD"]);
+    git(&["checkout","-b","side"]);std::fs::write(repo.join("b.txt"),"b").unwrap();git(&["add","b.txt"]);git(&["commit","-m","b"]);
+    let second=git(&["rev-parse","HEAD"]);
+    git(&["checkout","main"]);git(&["merge","--no-ff","-m","m","side"]);
+    let merge=git(&["rev-parse","HEAD"]);
+    assert_ne!(first,second);assert_ne!(merge,first);assert_ne!(merge,second);
+    (dir,std::fs::canonicalize(repo).unwrap().display().to_string(),format!("{first} {second} {merge}"))
+}
+fn plant_integrated(db:&SqliteStore,integrated_id:&str,verified_result_id:&str,repository:&str,commit_oid:&str) {
+    let digest="d".repeat(64);let old="c".repeat(40);let candidate=format!("{:x}",Sha256::digest(integrated_id.as_bytes()));
+    db.connection.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+    db.connection.execute("INSERT INTO integration_operations(operation_id,project_store,idempotency_key,payload_digest,repository,ref_name,expected_old_oid,verified_result_id,candidate_id,state,generation,object_format,checks_passed,reason,created_unix_ms) VALUES(?1,'/tmp/project',?1,?2,?5,'refs/heads/integration',?3,?4,NULL,'integrated',1,'sha1',1,NULL,1)",params![integrated_id,digest,old,verified_result_id,repository]).unwrap();
+    db.connection.execute("INSERT INTO integrated_commits(integrated_id,candidate_id,operation_id,repository,ref_name,commit_oid,tree_oid,expected_old_oid,object_format,created_unix_ms) VALUES(?1,?2,?1,?5,'refs/heads/integration',?3,?3,?4,'sha1',1)",params![integrated_id,candidate,commit_oid,old,repository]).unwrap();
+    db.connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+}
+#[test]
+fn two_integrated_parents_reserve_only_when_the_base_contains_both() {
+    let(_git,repository,oids)=git_history();
+    let mut oid=oids.split_whitespace();let first=oid.next().unwrap().to_string();let second=oid.next().unwrap().to_string();let merge=oid.next().unwrap().to_string();
+    for (pin,reserves) in [(merge,true),(first.clone(),false)] {
+        let(_temp,mut db,prepared)=fixture();
+        let snapshot=db.read_snapshot(None).unwrap();
+        db.commit(Commit{expected_head:snapshot.head,mutations:vec![Mutation::Task{expected:None,next:Task{id:TaskId::new("c").unwrap(),revision:1,state:TaskState::Draft,title:"c".into(),active_attempt:None}}]}).unwrap();
+        let head=db.read_snapshot(None).unwrap().head;
+        db.commit(Commit{expected_head:head,mutations:vec![Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("attempt-b").unwrap(),task:TaskId::new("b").unwrap(),revision:1,state:AttemptState::Completed,snapshot:None,reservation:"slot-b".into(),termination_observed:true}},Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("attempt-c").unwrap(),task:TaskId::new("c").unwrap(),revision:1,state:AttemptState::Completed,snapshot:None,reservation:"slot-c".into(),termination_observed:true}}]}).unwrap();
+        plant_verified(&db,"b","attempt-b",&"e".repeat(64));
+        plant_verified(&db,"c","attempt-c",&"f".repeat(64));
+        plant_integrated(&db,&"1".repeat(64),&"e".repeat(64),&repository,&first);
+        plant_integrated(&db,&"2".repeat(64),&"f".repeat(64),&repository,&second);
+        let snapshot=db.read_snapshot(None).unwrap();
+        let task=snapshot.tasks.iter().find(|task|task.id.as_str()=="a").unwrap().clone();
+        db.queue_task(&task.id,task.revision,snapshot.head,&QueueRequest{priority:0,dependencies:vec![Dependency{predecessor:TaskId::new("b").unwrap(),requirement:DependencyRequirement::IntegratedCommit},Dependency{predecessor:TaskId::new("c").unwrap(),requirement:DependencyRequirement::IntegratedCommit}]},1000).unwrap();
+        let mut satisfaction=|predecessor:&str|->(String,u64){
+            let id:String=db.connection.query_row("SELECT satisfaction_id FROM dependency_satisfactions WHERE task_id='a' AND predecessor_task=?1 AND requirement='integrated_commit' AND state='valid'",[predecessor],|row|row.get(0)).unwrap();
+            let revision=db.read_snapshot(None).unwrap().tasks.iter().find(|task|task.id.as_str()==predecessor).unwrap().revision;
+            (id,revision)
+        };
+        let (left_id,left_revision)=satisfaction("b");let (right_id,right_revision)=satisfaction("c");
+        let launch=reseal(&mut db,"a",vec![DependencyInput{task:TaskId::new("b").unwrap(),task_revision:left_revision,requirement:DependencyRequirement::IntegratedCommit,evidence:VersionedReference{id:left_id.clone(),revision:1,digest:left_id}},DependencyInput{task:TaskId::new("c").unwrap(),task_revision:right_revision,requirement:DependencyRequirement::IntegratedCommit,evidence:VersionedReference{id:right_id.clone(),revision:1,digest:right_id}}],vec![RepositoryInput{repository:repository.clone(),commit:pin.clone(),tree:"a".repeat(40)}],&prepared[0].inputs);
+        db.testing_set_factory_admission(true).unwrap();
+        let head=db.read_snapshot(None).unwrap().head;
+        let result=db.reserve_prepared(&[launch],head,1000);
+        if reserves {
+            let reserved=result.unwrap();
+            assert_eq!(reserved.record.inputs.task.as_str(),"a");
+            assert_eq!(reserved.record.inputs.repositories[0].commit,pin);
+        } else {
+            let err=result.unwrap_err();
+            assert!(matches!(err,StoreError::Invalid(ref message) if message.contains("integration_missing")),"{err}");
+            assert!(db.read_snapshot(None).unwrap().attempts.iter().all(|attempt|attempt.task.as_str()!="a"));
+        }
+    }
+}
+#[cfg(target_os="linux")]
+#[test]
+fn missing_grant_records_authority_missing_and_does_not_reserve() {
+    let(temp,mut db,_prepared)=fixture();
+    db.testing_set_factory_admission(true).unwrap();
+    crate::admission::admit_once(temp.path()).unwrap();
+    assert!(db.read_snapshot(None).unwrap().attempts.is_empty());
+    assert!(db.authority_denials().unwrap().iter().any(|denial|denial.reason_code=="authority_missing"));
 }

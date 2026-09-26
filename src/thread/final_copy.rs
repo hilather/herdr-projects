@@ -1,6 +1,6 @@
 //! Atomic final-copy acknowledgement. Publication callers own project effects.
 use super::*;
-use herdr_projects::{execution_guard::ProjectGuard,final_copy_intent::{FinalCopyIntent,Notice,Purpose}};
+use herdr_projects::{execution_guard::ProjectEffect,final_copy_intent::{FinalCopyIntent,Notice,Purpose}};
 use crate::source_tree::Control;
 
 pub fn check(t:&Thread,intent:&FinalCopyIntent)->Result<()> {
@@ -28,7 +28,7 @@ pub fn resolution_eligible(project:&Project,t:&Thread,purpose:&Purpose)->Result<
 /// Narrow commit path: ordinary mutation cannot change lifecycle while a final
 /// projection is pending. A withdrawn eligibility check completes the copy but
 /// leaves the thread open, avoiding a permanently stranded recovery stage.
-pub fn commit(project:&Project,guard:&ProjectGuard,id:&str,intent:&FinalCopyIntent,notes:Vec<String>,resolve:bool,control:&Control)->Result<()> {
+pub fn commit(project:&Project,guard:&dyn ProjectEffect,id:&str,intent:&FinalCopyIntent,notes:Vec<String>,resolve:bool,control:&Control)->Result<()> {
     let _lock=project.lock()?;control.check()?;guard.check_project(&project.dir())?;
     anyhow::ensure!(project.try_status()?==project::Status::Active,"final-copy project is not active");
     let mut t=load(project,id)?;check(&t,intent)?;

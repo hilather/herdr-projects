@@ -2,15 +2,23 @@
 use super::*;
 use crate::domain::{MemoryBlocker, MemoryReadiness};
 
-const CONSUMED_REVISIONS:&str="WITH RECURSIVE consumed(record_id,revision) AS (
+fn consumed_revisions(version: u32) -> String {
+    // A seen package or change receipt is not consumed knowledge.
+    let applied_package = if version >= 39 {
+        " UNION SELECT d.record_id,d.revision FROM memory_change_receipts c JOIN memory_delivery_intents d ON d.id=c.change_id JOIN consumer_bindings b ON b.binding_id=c.binding_id WHERE c.disposition='applied' AND d.task_id=?1 AND b.attempt_id=?2 AND b.task_id=?1 AND b.snapshot_id=(SELECT snapshot FROM attempts WHERE id=?2 AND task_id=?1)"
+    } else {
+        ""
+    };
+    format!("WITH RECURSIVE consumed(record_id,revision) AS (
         SELECT e.record_id,e.revision FROM attempts a JOIN memory_snapshots s ON s.id=a.snapshot AND s.task_id=a.task_id
         JOIN snapshot_entries e ON e.snapshot_id=s.id WHERE a.id=?2 AND a.task_id=?1
         UNION SELECT d.record_id,d.revision FROM memory_update_receipts x JOIN memory_delivery_intents d ON d.id=x.delivery_id
-            WHERE x.attempt_id=?2 AND d.task_id=?1 AND x.state='applied'
+            WHERE x.attempt_id=?2 AND d.task_id=?1 AND x.state='applied'{applied_package}
         ), used(record_id,revision) AS (
         SELECT record_id,MAX(revision) FROM consumed GROUP BY record_id
         UNION SELECT d.source_record,d.source_revision FROM memory_dependencies d JOIN used u ON d.derived_record=u.record_id AND d.derived_revision=u.revision
-        )";
+        )")
+}
 
 pub(super) fn report(db: &Connection, task: &str, now: i64) -> Result<MemoryReadiness> {
     check_schema(db)?;
@@ -65,22 +73,27 @@ pub(super) fn report(db: &Connection, task: &str, now: i64) -> Result<MemoryRead
     )?;
     // The current attempt may start with a newer snapshot that already contains a
     // required change. Otherwise only its own exact applied receipt can cover it.
-    collect("SELECT 'required_update_unapplied',d.id FROM memory_delivery_intents d
+    let mut required_update = String::from("SELECT 'required_update_unapplied',d.id FROM memory_delivery_intents d
         WHERE d.task_id=?1 AND d.severity!='informational'
         AND NOT EXISTS(SELECT 1 FROM memory_invalidations i WHERE i.task_id=d.task_id AND i.proposal_id=d.cause_id AND i.record_id=d.record_id AND i.triggering_seq=d.triggering_seq AND i.resolved_seq IS NOT NULL)
-        AND NOT EXISTS(SELECT 1 FROM memory_update_receipts r WHERE r.delivery_id=d.id AND r.attempt_id=?2 AND r.state='applied')
-        AND NOT EXISTS(SELECT 1 FROM attempts a JOIN memory_snapshots s ON s.id=a.snapshot AND s.task_id=a.task_id
+        AND NOT EXISTS(SELECT 1 FROM memory_update_receipts r WHERE r.delivery_id=d.id AND r.attempt_id=?2 AND r.state='applied') ");
+    if version >= 39 {
+        required_update.push_str("AND NOT EXISTS(SELECT 1 FROM memory_change_receipts c JOIN consumer_bindings b ON b.binding_id=c.binding_id WHERE c.change_id=d.id AND c.disposition='applied' AND b.attempt_id=?2 AND b.task_id=?1 AND b.snapshot_id=(SELECT snapshot FROM attempts WHERE id=?2 AND task_id=?1)) ");
+    }
+    required_update.push_str("AND NOT EXISTS(SELECT 1 FROM attempts a JOIN memory_snapshots s ON s.id=a.snapshot AND s.task_id=a.task_id
             JOIN snapshot_entries e ON e.snapshot_id=s.id
             JOIN memory_heads h ON h.record_id=e.record_id AND h.revision=e.revision AND h.status='active'
             JOIN memory_validity v ON v.record_id=e.record_id AND v.revision=e.revision
             WHERE a.id=?2 AND a.task_id=?1 AND e.record_id=d.record_id AND e.revision>=d.revision
             AND v.state='valid' AND (v.expiry_unix_ms IS NULL OR v.expiry_unix_ms>?3))
-        ORDER BY d.triggering_seq,d.id LIMIT 10001", &[&task,&attempt,&now])?;
+        ORDER BY d.triggering_seq,d.id LIMIT 10001");
+    collect(&required_update, &[&task, &attempt, &now])?;
     // A record can expire without a new event or routing intent. Recheck the exact
     // consumed revisions (including applied updates) and their transitive sources.
     // A newer applied revision supersedes its starting-snapshot version, but not
     // an older source pinned by another still-consumed derived revision.
-    collect(&format!("{CONSUMED_REVISIONS} SELECT 'invalid_consumed_revision',u.record_id||'@'||u.revision FROM used u
+    let consumed = consumed_revisions(version);
+    collect(&format!("{consumed} SELECT 'invalid_consumed_revision',u.record_id||'@'||u.revision FROM used u
         LEFT JOIN memory_heads h ON h.record_id=u.record_id
         LEFT JOIN memory_validity v ON v.record_id=u.record_id AND v.revision=u.revision
         LEFT JOIN memory_revisions r ON r.record_id=u.record_id AND r.revision=u.revision
@@ -98,7 +111,7 @@ pub(super) fn report(db: &Connection, task: &str, now: i64) -> Result<MemoryRead
     )?;
     // Mandatory changes cannot bypass the barrier just because they originated
     // through a policy/control path that has not yet created a delivery intent.
-    collect("SELECT 'mandatory_revision_missing',h.record_id||'@'||h.revision
+    let mut mandatory = String::from("SELECT 'mandatory_revision_missing',h.record_id||'@'||h.revision
         FROM memory_heads h JOIN memory_records r ON r.id=h.record_id
         JOIN memory_validity v ON v.record_id=h.record_id AND v.revision=h.revision
         WHERE h.status='active' AND (r.is_hard=1 OR r.kind IN ('constraint','hard_memory'))
@@ -106,8 +119,12 @@ pub(super) fn report(db: &Connection, task: &str, now: i64) -> Result<MemoryRead
         AND NOT EXISTS(SELECT 1 FROM attempts a JOIN memory_snapshots s ON s.id=a.snapshot AND s.task_id=a.task_id
             JOIN snapshot_entries e ON e.snapshot_id=s.id WHERE a.id=?2 AND a.task_id=?1 AND e.record_id=h.record_id AND e.revision=h.revision)
         AND NOT EXISTS(SELECT 1 FROM memory_delivery_intents d JOIN memory_update_receipts x ON x.delivery_id=d.id
-            WHERE d.task_id=?1 AND d.record_id=h.record_id AND d.revision=h.revision AND x.attempt_id=?2 AND x.state='applied')
-        ORDER BY h.record_id LIMIT 10001", &[&task,&attempt,&now])?;
+            WHERE d.task_id=?1 AND d.record_id=h.record_id AND d.revision=h.revision AND x.attempt_id=?2 AND x.state='applied') ");
+    if version >= 39 {
+        mandatory.push_str("AND NOT EXISTS(SELECT 1 FROM memory_delivery_intents d JOIN memory_change_receipts c ON c.change_id=d.id AND c.disposition='applied' JOIN consumer_bindings b ON b.binding_id=c.binding_id WHERE d.task_id=?1 AND d.record_id=h.record_id AND d.revision=h.revision AND b.attempt_id=?2 AND b.task_id=?1 AND b.snapshot_id=(SELECT snapshot FROM attempts WHERE id=?2 AND task_id=?1)) ");
+    }
+    mandatory.push_str("ORDER BY h.record_id LIMIT 10001");
+    collect(&mandatory, &[&task, &attempt, &now])?;
     Ok(report)
 }
 
@@ -137,7 +154,8 @@ impl SqliteStore {
             [task],
             |r| r.get(0),
         )?;
-        let mut stmt=tx.prepare(&format!("{CONSUMED_REVISIONS} SELECT DISTINCT r.body_hash FROM used u JOIN memory_revisions r ON r.record_id=u.record_id AND r.revision=u.revision ORDER BY r.body_hash LIMIT 10001"))?;
+        let consumed = consumed_revisions(version);
+        let mut stmt=tx.prepare(&format!("{consumed} SELECT DISTINCT r.body_hash FROM used u JOIN memory_revisions r ON r.record_id=u.record_id AND r.revision=u.revision ORDER BY r.body_hash LIMIT 10001"))?;
         let rows = stmt
             .query_map(params![task, attempt], |r| r.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -479,5 +497,187 @@ mod tests {
             assert!(succeed(&mut db, "b", false).is_err());
             assert_eq!(db.read_snapshot(None).unwrap(), before);
         }
+    }
+
+    fn publish_second_revision(db: &Connection, snapshot: &str) -> i64 {
+        db.execute("INSERT INTO memory_revisions SELECT record_id,2,body_hash,provenance_hash,promoted_seq,applicability FROM memory_revisions WHERE record_id='fact' AND revision=1", []).unwrap();
+        db.execute(
+            "UPDATE memory_heads SET revision=2 WHERE record_id='fact'",
+            [],
+        )
+        .unwrap();
+        db.execute("INSERT INTO memory_validity SELECT record_id,2,state,reason,expiry_unix_ms,evaluated_seq FROM memory_validity WHERE record_id='fact' AND revision=1", []).unwrap();
+        let seq = db
+            .query_row("SELECT coalesce(max(sequence),0) FROM events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        db.execute(
+            "INSERT INTO memory_delivery_intents VALUES('update','fixture','task:a',?1,'a','fact',2,'reconcile_before_completion',?2,'pending')",
+            params![snapshot, seq],
+        )
+        .unwrap();
+        seq
+    }
+
+    #[test]
+    fn snapshot_presence_covers_a_required_update_without_a_receipt() {
+        let (_dir, mut db, snapshot) = fixture();
+        assert!(db.memory_readiness("a", 1).unwrap().blockers.is_empty());
+        publish_second_revision(&db.connection, &snapshot);
+        let ordinal: i64 = db
+            .connection
+            .query_row(
+                "SELECT coalesce(max(ordinal),0)+1 FROM snapshot_entries WHERE snapshot_id=?1",
+                [&snapshot],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.connection
+            .execute(
+                "INSERT INTO snapshot_entries VALUES(?1,?2,'fact',2,'mandatory','fixture')",
+                params![snapshot, ordinal],
+            )
+            .unwrap();
+        assert!(db.memory_readiness("a", 1).unwrap().blockers.is_empty());
+        assert_eq!(
+            db.connection
+                .query_row("SELECT count(*) FROM memory_update_receipts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.connection
+                .query_row("SELECT count(*) FROM memory_change_receipts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        succeed(&mut db, "a", false).unwrap();
+    }
+
+    #[test]
+    fn seen_change_receipt_does_not_satisfy_enforce_but_applied_does() {
+        let (_dir, mut db, snapshot) = fixture();
+        publish_second_revision(&db.connection, &snapshot);
+        assert_eq!(
+            db.memory_readiness("a", 1).unwrap().blockers[0].kind,
+            "required_update_unapplied"
+        );
+        let binding_id: String = db
+            .connection
+            .query_row(
+                "SELECT binding_id FROM consumer_bindings WHERE attempt_id='attempt-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.connection
+            .execute(
+                "INSERT INTO consumer_binding_obligations(binding_id,delivery_id) VALUES(?1,'update')",
+                [&binding_id],
+            )
+            .unwrap();
+        let package = db.materialize_update_package(&binding_id).unwrap();
+        let mut ack = super::super::update_packages::UpdatePackageAck {
+            schema_version: 1,
+            package_id: package.package_id,
+            manifest_hash: package.manifest_hash,
+            change_ids: package.change_ids,
+            disposition: "seen".into(),
+        };
+        db.acknowledge_update_package(&ack, 1).unwrap();
+        assert_eq!(
+            db.memory_readiness("a", 1).unwrap().blockers[0].kind,
+            "required_update_unapplied"
+        );
+        assert!(succeed(&mut db, "a", false).is_err());
+        ack.disposition = "applied".into();
+        db.acknowledge_update_package(&ack, 1).unwrap();
+        assert!(db.memory_readiness("a", 1).unwrap().blockers.is_empty());
+        assert_eq!(
+            db.connection
+                .query_row("SELECT count(*) FROM memory_update_receipts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        succeed(&mut db, "a", false).unwrap();
+    }
+
+    #[test]
+    fn applied_receipt_on_successor_covers_a_copied_obligation() {
+        let (_dir, mut db, snapshot) = fixture();
+        publish_second_revision(&db.connection, &snapshot);
+        db.connection
+            .execute(
+                "INSERT INTO memory_snapshots(id,task_id,task_revision,profile_name,profile_digest,config_digest,selection_policy_version,estimator,sequence,required_bytes,optional_bytes,budget_bytes,omitted_optional_count,manifest_hash,scope_digest)
+                 SELECT 'snap-2',task_id,task_revision,profile_name,profile_digest,config_digest,selection_policy_version,estimator,sequence,required_bytes,optional_bytes,budget_bytes,omitted_optional_count,manifest_hash,scope_digest
+                 FROM memory_snapshots WHERE id=?1",
+                [&snapshot],
+            )
+            .unwrap();
+        db.connection
+            .execute(
+                "INSERT INTO snapshot_entries(snapshot_id,ordinal,record_id,revision,role,reason)
+                 SELECT 'snap-2',ordinal,record_id,revision,role,reason FROM snapshot_entries WHERE snapshot_id=?1",
+                [&snapshot],
+            )
+            .unwrap();
+        let successor = "d".repeat(64);
+        db.connection
+            .execute(
+                "INSERT INTO consumer_bindings(binding_id,consumer_id,generation,snapshot_id,attempt_id,task_id,active,retired,successor_binding_id,created_unix_ms)
+                 VALUES(?1,'task:a',2,'snap-2','attempt-a','a',1,0,NULL,1)",
+                [&successor],
+            )
+            .unwrap();
+        db.connection
+            .execute(
+                "UPDATE attempts SET snapshot='snap-2' WHERE id='attempt-a'",
+                [],
+            )
+            .unwrap();
+        db.connection
+            .execute(
+                "INSERT INTO consumer_binding_obligations(binding_id,delivery_id) VALUES(?1,'update')",
+                [&successor],
+            )
+            .unwrap();
+        let delivery_snapshot: String = db
+            .connection
+            .query_row(
+                "SELECT snapshot_id FROM memory_delivery_intents WHERE id='update'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(delivery_snapshot, "snap-2");
+        let package = db.materialize_update_package(&successor).unwrap();
+        let mut ack = super::super::update_packages::UpdatePackageAck {
+            schema_version: 1,
+            package_id: package.package_id,
+            manifest_hash: package.manifest_hash,
+            change_ids: package.change_ids,
+            disposition: "seen".into(),
+        };
+        db.acknowledge_update_package(&ack, 1).unwrap();
+        assert_eq!(
+            db.memory_readiness("a", 1).unwrap().blockers[0].kind,
+            "required_update_unapplied"
+        );
+        ack.disposition = "applied".into();
+        db.acknowledge_update_package(&ack, 1).unwrap();
+        assert!(db.memory_readiness("a", 1).unwrap().blockers.is_empty());
+        let cursor: Option<String> = db
+            .connection
+            .query_row(
+                "SELECT applied_cursor FROM consumer_bindings WHERE binding_id=?1",
+                [&successor],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(cursor.is_none());
     }
 }

@@ -1,11 +1,11 @@
 # Runtime observation and reconciliation (T03.4)
 
-`reconcile PROJECT` collects a read-only observation batch from schema-v6-or-newer runtime
-bindings. `reconcile PROJECT --record` persists that batch and audit events against
+`reconcile PROJECT` collects a read-only observation batch from the schema 41 active
+inventory. Older stores need an explicit `migration PROJECT upgrade-store` before
+reconcile. `reconcile PROJECT --record` persists that batch and audit events against
 the exact event head, binding revisions and task revisions observed. Neither form
 launches, prompts, copies, removes or releases capacity. Recording evidence that
 invalidates an active ownership claim pauses control and requires reconciliation.
-Use `migration PROJECT upgrade-store` explicitly for older published stores.
 
 Pane queries use the recorded socket/machine, never an ambient session. Herdr
 version, pane and agent responses must be valid. Duplicate or inconsistent
@@ -19,9 +19,10 @@ bounded Git porcelain output. Truncated/contradictory output is unknown; remote
 worktrees remain unknown. Local presence additionally requires matching Git common-directory and top-level
 paths and a stable directory incarnation; prunable registrations remain unknown.
 These checks identify a registration, not preservation
-or a tested commit. At most 128 bindings, 16 session endpoints and 16 repositories
-are queried per batch. Excess binding counts refuse an incomplete collection;
-excess endpoint/repository queries produce explicit unknown observations.
+or a tested commit. Active bindings are read in pages of 64. A page that does not
+reach complete coverage is incomplete and cannot release capacity. At most 16
+session endpoints and 16 repositories are queried per batch; excess endpoint or
+repository queries produce explicit unknown observations.
 
 Config fingerprints and the project head are rechecked after collection. Persistence
 requires complete binding coverage, rejects stale revisions or older timestamps,

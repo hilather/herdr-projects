@@ -4,9 +4,12 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{fmt, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 
-pub const SCHEMA: u32 = 25;
+pub const SCHEMA: u32 = 41;
 const APPLICATION: u32 = 1_213_222_994;
 const MIN_SQLITE: i32 = 3_053_004;
+/// SQLite's busy handler gives up after this. The watchdog treats the resulting
+/// `Busy` as past the retry bound and pauses admission.
+pub const BUSY_RETRY_BOUND: Duration = Duration::from_millis(250);
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug)]
@@ -15,6 +18,8 @@ pub enum StoreError {
     Deadline,
     Limit(String),
     Conflict,
+    /// Expected plan parent is not the current revision. The value is that revision.
+    StalePlanParent(u64),
     Busy,
     DiskFull,
     UnsupportedSchema(u32),
@@ -80,6 +85,22 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../migrations/0023_memory_inputs_and_candidates.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0024_memory_receipts.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0025_native_profiles.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0026_factory_results.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0027_verification_runs.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0028_integration.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0029_feedback.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0030_dependency_satisfaction.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0031_plan_revisions.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0032_contract_scope.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0033_capability_evidence.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0034_delegation_grants.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0035_resource_claims.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0036_waits.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0037_consumer_bindings.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0038_memory_read_sets.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0039_update_packages.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0040_barriers.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0041_active_work.sql"))?;
             tx.commit()?;
         }
         // Persist the initial directory entry as well as SQLite's own commit.
@@ -204,6 +225,9 @@ impl SqliteStore {
                         Some(rev) => tx.execute("UPDATE attempts SET revision=?3,state=?4,snapshot=?5,reservation=?6,termination_observed=?7 WHERE id=?1 AND task_id=?2 AND revision=?8", params![id, next.task.as_str(), integer(next.revision)?, next.state.as_str(), next.snapshot, next.reservation, next.termination_observed, integer(*rev)?])?,
                     };
                     if count != 1 { return Err(StoreError::Conflict); }
+                    // A newly inserted terminated attempt does not change the retained-row
+                    // fingerprint, but it does remove a previously attempt-less binding.
+                    active_work::invalidate(&tx)?;
                     ("attempt.changed", id, next.revision)
                 },
                 Mutation::Enqueue(next) => {
@@ -231,6 +255,7 @@ impl SqliteStore {
                 if next.state == TaskState::Succeeded { memory_barrier::enforce(&tx,next.id.as_str(),now)?; }
             }
         }
+        consumer_bindings::reconcile_active(&tx)?;
         let head = head(&tx)?;
         tx.commit()?;
         Ok(head)
@@ -250,7 +275,7 @@ fn connect(path: &Path) -> Result<Connection> {
     let metadata = std::fs::symlink_metadata(path).map_err(|e| StoreError::Io(e.to_string()))?;
     if !metadata.is_file() { return Err(StoreError::Invalid("database must be a regular local file, not a symlink".into())); }
     let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
-    db.busy_timeout(Duration::from_millis(250))?;
+    db.busy_timeout(BUSY_RETRY_BOUND)?;
     db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF; PRAGMA synchronous=FULL;")?;
     Ok(db)
 }
@@ -372,6 +397,7 @@ mod memory;
 mod checkpoints;
 mod proposals;
 mod reviews;
+mod read_set;
 mod routines;
 
 pub mod identity_inventory;
@@ -380,11 +406,47 @@ pub mod controller_hint;
 mod memory_candidates;
 
 mod memory_delivery;
+mod consumer_bindings;
 mod memory_receipts;
+mod update_packages;
 mod memory_barrier;
+mod barriers;
+mod active_work;
+pub use active_work::{ActiveCoverage, ActiveWorkItem, ActiveWorkPage, ActiveWorkRun, ACTIVE_WORK_PAGE};
+pub use barriers::{BarrierMember, FrozenBarrier, ProposalDisposition};
+pub use consumer_bindings::ConsumerBinding;
+pub use update_packages::{PackageAckReceipt, UpdatePackage, UpdatePackageAck};
 mod memory_invalidation;
 mod memory_reconciliation;
 mod worker_knowledge;
+mod targeted;
+pub use targeted::{hot_path_uses_snapshot, targeted_mismatch_count, HotPathRead, HOT_PATH_READ};
+mod observability;
+pub use observability::FactoryNumbers;
 
 #[cfg(target_os = "linux")]
 mod native_profiles;
+
+mod results;
+pub use results::{show_results, submit_untrusted_result};
+
+mod feedback;
+pub use feedback::{claim_feedback, show_feedback};
+
+mod satisfaction;
+mod admission_policy;
+#[cfg(test)]
+pub(crate) use satisfaction::{claims_conflict, ResourceClaim};
+
+mod plans;
+pub use plans::{PlanProposalReceipt, propose_plan};
+
+mod capabilities;
+
+mod delegation;
+pub use delegation::DelegationReserve;
+
+#[cfg(target_os = "linux")]
+pub(crate) mod verification;
+#[cfg(target_os = "linux")]
+pub(crate) mod integration;

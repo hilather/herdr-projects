@@ -966,6 +966,7 @@ impl SqliteStore {
                 format!("{:x}", Sha256::digest(owned_payload.as_bytes()))
             ],
         )?;
+        super::active_work::invalidate(&tx)?;
         let mut attempt = read_attempts(&tx)?
             .into_iter()
             .find(|a| a.id == receipt.attempt)
@@ -1007,6 +1008,7 @@ impl SqliteStore {
             now,
             claim.map(|c| c.owner.as_str()).unwrap_or("launch-recovery"),
         )?;
+        super::consumer_bindings::reconcile_active(&tx)?;
         #[cfg(test)]
         super::reservations::tests::crash_boundary("before_start_receipt_commit");
         tx.commit()?;

@@ -77,7 +77,11 @@ impl MemoryStore {
         let snap = self.store.read_memory_snapshot(&doc.input_snapshot_id).map_err(|_| MemoryError::Invalid("input snapshot is missing".into()))?;
         if snap.task_id != doc.producer.task_id { return Err(MemoryError::Invalid("input snapshot does not belong to producer task".into())); }
         if attempt.snapshot.as_deref()!=Some(doc.input_snapshot_id.as_str()) {return Err(MemoryError::Invalid("proposal snapshot was not consumed by this attempt".into()));}
-        if doc.repository.is_some() {return Err(MemoryError::Invalid("repository claims require verified repository evidence; unsupported until revision-bound validation is available".into()));}
+        // A dirty tree is not the commit the controller verified.
+        if doc.repository.as_ref().is_some_and(|repo| repo.dirty) {
+            return Err(MemoryError::Invalid("dirty repository is not a verified commit".into()));
+        }
+        let mut verified_binding = false;
         for observed in doc.observed_revisions.iter().chain(doc.changes.iter().flat_map(|c|c.based_on.iter())) {
             if !snap.entries.iter().any(|e|e.record_id.as_str()==observed.record_id && e.revision==observed.revision) {
                 return Err(MemoryError::Invalid("observed/dependency revision is absent from attempt snapshot".into()));
@@ -98,7 +102,19 @@ impl MemoryStore {
             }
             super::read_object(&self.objects, &body)?;
             for ev in &change.evidence {
-                if ev.validation_id.is_some() {return Err(MemoryError::Invalid("typed validation evidence is not available; unverified validation IDs are refused".into()));}
+                if let Some(id)=&ev.validation_id {
+                    let found=self.store.verified_result_claim(id).map_err(MemoryError::from)?;
+                    let Some((commit, tree, repository))=found else {
+                        return Err(MemoryError::Invalid("validation id is not a stored verified result".into()));
+                    };
+                    let Some(repo)=&doc.repository else {
+                        return Err(MemoryError::Invalid("validation id requires a repository claim".into()));
+                    };
+                    if repo.dirty || commit != repo.commit || tree != repo.tree || repository != repo.id {
+                        return Err(MemoryError::Invalid("verified result does not match the repository claim".into()));
+                    }
+                    verified_binding = true;
+                }
                 if let Some(object)=&ev.object {
                     let id = parse_object(object)?;
                     if !self.store.object_available(id.as_str()).map_err(MemoryError::from)? {
@@ -126,6 +142,9 @@ impl MemoryStore {
             } else if self.store.memory_record_by_key(&change.record_key).map_err(MemoryError::from)?.is_some() {
                 return Err(MemoryError::Invalid("existing record requires expected base".into()));
             }
+        }
+        if doc.repository.is_some() && !verified_binding {
+            return Err(MemoryError::Invalid("repository claim requires a verified result".into()));
         }
         let heads = serde_json::to_string(&serde_json::json!({"event_head":snapshot.head,"task":task.revision})).unwrap_or_else(|_| "{}".into());
         Ok(heads)
@@ -229,5 +248,109 @@ mod tests {
         assert!(memory.propose(br#"{"schema_version":1}"#, 1_000).is_err());
         let hostile = br#"{"schema_version":1,"proposal_id":"mp-x","producer":{"task_id":"task-api","attempt_id":"att-api-2"},"input_snapshot_id":"snap-x","changes":[{"record_key":"k","kind":"observation","scope":{"domains":[],"paths":[]},"claim":"c","body_object":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","evidence":[],"based_on":[],"impact":"informational","is_hard":true}]}"#;
         assert!(memory.propose(hostile, 1_000).is_err());
+    }
+    fn seed_verified(db: &std::path::Path, result_id: &str, run_id: &str, commit: &str, tree: &str, repository: &str) {
+        let raw = rusqlite::Connection::open(db).unwrap();
+        raw.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        let seq: i64 = raw.query_row("SELECT COALESCE(MAX(sequence),0) FROM events", [], |r| r.get(0)).unwrap();
+        let digest = "11".repeat(32);
+        raw.execute(
+            "INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq) VALUES('task-api',1,NULL,'/tmp/project',0,?1,?2,'sha1',NULL,'verify_only',?3,?4,?5)",
+            rusqlite::params![repository, "b".repeat(40), b"contract", digest.as_str(), seq],
+        ).unwrap();
+        raw.execute(
+            "INSERT INTO acceptance_policies(task_id,contract_revision,policy_id,body) VALUES('task-api',1,'policy-1','{\"version\":1}')",
+            [],
+        ).unwrap();
+        raw.execute(
+            "INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,memory_snapshot_id,artifact_manifest,claimed_checks,created_unix_ms) VALUES(?1,'/tmp/project','submit-verified',?2,'{}','task-api',1,?2,'att-api-2',?3,?4,?5,'sha1',NULL,'[]','[]',1)",
+            rusqlite::params!["22".repeat(32), digest.as_str(), repository, "b".repeat(40), commit],
+        ).unwrap();
+        raw.execute(
+            "INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,'/tmp/project','verify-1',?2,?3,'task-api',1,?2,'att-api-2','policy-1',?2,?4,?5,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?2,0,0,1)",
+            rusqlite::params![run_id, digest.as_str(), "22".repeat(32), commit, tree],
+        ).unwrap();
+        raw.execute(
+            "INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?2,?3,?4,?5,'sha1',?6,?6,'linux-unshare-user-pid-mount-v1',0,1)",
+            rusqlite::params![result_id, run_id, "22".repeat(32), commit, tree, digest.as_str()],
+        ).unwrap();
+        raw.execute(
+            "INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,'/tmp/project','verify-rejected',?2,?3,'task-api',1,?2,'att-api-2','policy-1',?2,?4,?5,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','rejected','checks_failed',1,NULL,0,0,1)",
+            rusqlite::params!["ff".repeat(32), digest.as_str(), "22".repeat(32), commit, tree],
+        ).unwrap();
+        raw.execute(
+            "INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?2,?3,?4,?5,'sha1',?6,?6,'linux-unshare-user-pid-mount-v1',0,1)",
+            rusqlite::params!["ee".repeat(32), "ff".repeat(32), "22".repeat(32), commit, tree, digest.as_str()],
+        ).unwrap();
+        raw.execute(
+            "INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,memory_snapshot_id,artifact_manifest,claimed_checks,created_unix_ms) VALUES(?1,'/tmp/project','submit-mismatch',?2,'{}','task-api',1,?2,'att-api-2',?3,?4,?5,'sha1',NULL,'[]','[]',1)",
+            rusqlite::params!["33".repeat(32), digest.as_str(), repository, "b".repeat(40), "d".repeat(40)],
+        ).unwrap();
+        raw.execute(
+            "INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,'/tmp/project','verify-mismatch',?2,?3,'task-api',1,?2,'att-api-2','policy-1',?2,?4,?5,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?2,0,0,1)",
+            rusqlite::params!["44".repeat(32), digest.as_str(), "33".repeat(32), commit, tree],
+        ).unwrap();
+        raw.execute(
+            "INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?2,?3,?4,?5,'sha1',?6,?6,'linux-unshare-user-pid-mount-v1',0,1)",
+            rusqlite::params!["55".repeat(32), "44".repeat(32), "33".repeat(32), commit, tree, digest.as_str()],
+        ).unwrap();
+    }
+    fn claim(doc: &mut ProposalDocument, id: &str, validation: Option<&str>) {
+        doc.proposal_id = id.into();
+        doc.repository = Some(ProposalRepository { id: "/tmp/repo".into(), commit: "a".repeat(40), tree: "c".repeat(40), dirty: false });
+        doc.changes[0].evidence = vec![ProposalEvidence { object: None, validation_id: validation.map(str::to_owned) }];
+    }
+    #[test]
+    fn invented_validation_id_is_refused_and_matching_verified_result_is_not_promoted() {
+        let (root, mut memory, body, snap) = fixture();
+        let result = "ab".repeat(32);
+        let run = "cd".repeat(32);
+        let commit = "a".repeat(40);
+        let tree = "c".repeat(40);
+        seed_verified(&root.path().join("state.db"), &result, &run, &commit, &tree, "/tmp/repo");
+        let mut invented = doc(&snap, body.as_str(), "att-api-2", None);
+        claim(&mut invented, "mp-invented", Some("invented-validation"));
+        let rejected = memory.propose(&serde_json::to_vec(&invented).unwrap(), 1_000).unwrap();
+        assert_eq!(rejected.validation, "rejected");
+        assert!(rejected.reason.contains("not a stored verified result"), "{}", rejected.reason);
+        let mut run_only = doc(&snap, body.as_str(), "att-api-2", None);
+        claim(&mut run_only, "mp-run", Some(&run));
+        let rejected = memory.propose(&serde_json::to_vec(&run_only).unwrap(), 1_000).unwrap();
+        assert_eq!(rejected.validation, "rejected");
+        assert!(rejected.reason.contains("not a stored verified result"), "{}", rejected.reason);
+        let mut rejected_run = doc(&snap, body.as_str(), "att-api-2", None);
+        claim(&mut rejected_run, "mp-rejected-run", Some(&"ee".repeat(32)));
+        let rejected = memory.propose(&serde_json::to_vec(&rejected_run).unwrap(), 1_000).unwrap();
+        assert_eq!(rejected.validation, "rejected");
+        assert!(rejected.reason.contains("not a stored verified result"), "{}", rejected.reason);
+        let mut wrong_candidate = doc(&snap, body.as_str(), "att-api-2", None);
+        claim(&mut wrong_candidate, "mp-candidate", Some(&"55".repeat(32)));
+        let rejected = memory.propose(&serde_json::to_vec(&wrong_candidate).unwrap(), 1_000).unwrap();
+        assert_eq!(rejected.validation, "rejected");
+        assert!(rejected.reason.contains("not a stored verified result"), "{}", rejected.reason);
+        let mut other_commit = doc(&snap, body.as_str(), "att-api-2", None);
+        claim(&mut other_commit, "mp-commit", Some(&result));
+        other_commit.repository.as_mut().unwrap().commit = "d".repeat(40);
+        let rejected = memory.propose(&serde_json::to_vec(&other_commit).unwrap(), 1_000).unwrap();
+        assert_eq!(rejected.validation, "rejected");
+        assert!(rejected.reason.contains("does not match"), "{}", rejected.reason);
+        let mut other_repo = doc(&snap, body.as_str(), "att-api-2", None);
+        claim(&mut other_repo, "mp-repo", Some(&result));
+        other_repo.repository.as_mut().unwrap().id = "/tmp/other".into();
+        let rejected = memory.propose(&serde_json::to_vec(&other_repo).unwrap(), 1_000).unwrap();
+        assert_eq!(rejected.validation, "rejected");
+        assert!(rejected.reason.contains("does not match"), "{}", rejected.reason);
+        let mut unbound = doc(&snap, body.as_str(), "att-api-2", None);
+        claim(&mut unbound, "mp-unbound", None);
+        let rejected = memory.propose(&serde_json::to_vec(&unbound).unwrap(), 1_000).unwrap();
+        assert_eq!(rejected.validation, "rejected");
+        assert!(rejected.reason.contains("requires a verified result"), "{}", rejected.reason);
+        let mut matched = doc(&snap, body.as_str(), "att-api-2", None);
+        claim(&mut matched, "mp-verified", Some(&result));
+        let accepted = memory.propose(&serde_json::to_vec(&matched).unwrap(), 1_000).unwrap();
+        assert_eq!(accepted.validation, "accepted");
+        assert_eq!(accepted.review_state, "validated");
+        assert!(memory.store.memory_promotion("mp-verified").unwrap().is_none());
+        assert!(memory.store.memory_record_by_key("api.error-envelope").unwrap().is_none());
     }
 }

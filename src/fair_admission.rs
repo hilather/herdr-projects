@@ -1,5 +1,5 @@
 //! Bounded fairness history, independent of candidate refresh and eviction.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap,BTreeSet};
 pub type Key=(String,String);
 const LIMIT:usize=128;
 #[derive(Default,Clone)]
@@ -19,4 +19,42 @@ impl Cursor {
     pub fn history_len(&self)->usize {self.threads.len()}
     #[cfg(test)]
     pub fn overflow(&self)->bool {self.overflow}
+}
+/// Cancel, reconcile, and observation stay eligible on Control when Transfer is full.
+pub fn reserved_control(operation:&str)->bool {
+    operation.starts_with("canonical-cancel:")||operation.starts_with("reconcile:")||operation.starts_with("canonical-observation")||operation.starts_with("local-observation")
+}
+/// One service per project per round. A project already served waits until every other waiting project has had a turn.
+#[derive(Default)]
+pub struct ProjectRound {served:BTreeSet<String>}
+impl ProjectRound {
+    pub fn select(&mut self,eligible:&[(usize,String)])->Option<usize> {
+        if eligible.is_empty(){return None;}
+        if eligible.iter().all(|(_,project)|self.served.contains(project)){self.served.clear();}
+        let (index,project)=eligible.iter().filter(|(_,project)|!self.served.contains(project)).min_by_key(|(index,_)|*index)?;
+        self.served.insert(project.clone());Some(*index)
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::{ProjectRound,reserved_control};
+    #[test]
+    fn reserved_control_is_cancel_reconcile_and_observation() {
+        assert!(reserved_control("canonical-cancel:1"));assert!(reserved_control("reconcile:receipt"));
+        assert!(reserved_control("canonical-observation"));assert!(reserved_control("local-observation"));
+        assert!(!reserved_control("canonical-launch:1"));assert!(!reserved_control("cancel-transfer"));
+    }
+    #[test]
+    fn eight_projects_each_start_within_two_fairness_rounds() {
+        let mut jobs=Vec::new();
+        for project in 0..8 {for _ in 0..4 {jobs.push(format!("p{project}"));}}
+        let mut round=ProjectRound::default();let mut started=Vec::new();
+        for _ in 0..16 {
+            let eligible:Vec<(usize,String)>=jobs.iter().enumerate().map(|(index,project)|(index,project.clone())).collect();
+            let index=round.select(&eligible).unwrap();started.push(jobs.remove(index));
+        }
+        let mut seen:std::collections::BTreeSet<_>=started.iter().take(8).cloned().collect();
+        assert_eq!(seen.len(),8,"first round missed a project: {started:?}");
+        seen.clear();seen.extend(started.iter().cloned());assert_eq!(seen.len(),8,"two rounds dropped a project: {started:?}");
+    }
 }

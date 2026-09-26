@@ -86,8 +86,8 @@ mod tests {
     fn schema20_upgrade_adds_empty_proposal_tables() {
         let temp=tempfile::tempdir().unwrap();let path=temp.path().join("state.db");
         let mut db=SqliteStore::create(&path).unwrap();
-        db.connection.execute_batch("DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; UPDATE store_meta SET schema_version=20; PRAGMA user_version=20;").unwrap();
-        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=25;
+        db.connection.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; UPDATE store_meta SET schema_version=20; PRAGMA user_version=20;").unwrap();
+        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=26;
         assert_eq!(db.read_snapshot(None).unwrap(),before);
         assert!(db.memory_proposal("mp-x").unwrap().is_none());
         db.integrity_check().unwrap();

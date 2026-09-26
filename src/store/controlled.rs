@@ -60,6 +60,13 @@ impl ControlledStore {
     pub fn project_control(&self)->Result<Option<ProjectControl>> {self.read(SqliteStore::project_control)}
     pub fn import_operation_count(&self)->Result<u64> {self.read(SqliteStore::import_operation_count)}
     pub fn import_receipt(&self)->Result<(String,u64,u64)> {self.read(SqliteStore::import_receipt)}
+    pub fn current_head(&self)->Result<u64> {self.read(SqliteStore::current_head)}
+    pub fn reconcile_active_work(&mut self,max_pages:Option<u32>)->Result<crate::store::active_work::ActiveWorkRun> {
+        self.control.check()?;
+        let value=self.store.reconcile_active_work(max_pages).map_err(|e|self.error(e))?;
+        self.control.check()?;
+        Ok(value)
+    }
     pub fn read_snapshot(&mut self,at:Option<u64>)->Result<Snapshot> {
         self.control.check()?;
         let budget=read_budget::ReadBudget::new(self.control.clone());

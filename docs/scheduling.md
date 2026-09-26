@@ -17,12 +17,41 @@ remain unchanged. Fresh/updated policy starts at zero workers until explicitly s
 legacy advisory limits are not silently promoted into execution authority.
 
 `scheduler PROJECT inspect` reports policy, retained attempts, available slots,
-priority order and blocking reasons. Every attempt without recorded termination
-counts, including lost, awaiting-input and completed attempts. Lowering the limit
-never cancels or releases those attempts. `available_slots` is arithmetic capacity,
-not permission to launch. Prepared-launch dispatch is on; automatic admission is
-off, so `launch_enabled` remains false: `queue_report` sets `launch_enabled: false`
-and appends `launch_preparation_unavailable` for every queued task.
+priority order, blocking reasons, and a capability report. Every attempt without
+recorded termination counts, including lost, awaiting-input and completed
+attempts. Lowering the limit never cancels or releases those attempts.
+`available_slots` is arithmetic capacity, not permission to launch.
+Prepared-launch dispatch is on and automatic admission is off.
+`capability.prepared_dispatch` is that compiled gate and is true;
+`PREPARED_LAUNCH_DISPATCH_ENABLED` is not changed by the report.
+`capability.automatic_admission` follows `factory_admission` and is false by
+default, so `launch_enabled` stays false while admission is unavailable.
+`capability.dependency_producers` is false and `capability.integration` is
+`unavailable`. Inspect does not reserve or launch.
+
+The operator path is draft, then sign, then `launch reserve`, then the
+controller. Automatic admission does not itself draft, sign, or reserve. The
+capability report says that with
+`automatic_admission_does_not_draft_sign_or_reserve`. That blocker does not
+claim the operator step is absent. A queued task reports
+`owner_signature_not_scheduled` only when no unconsumed launch grant for that
+task is stored, and `launch_reserve_not_scheduled` plus
+`controller_requires_reserved_attempt` only when that task has no retained
+reserved, launching, running, or awaiting-input attempt. Lost and other
+non-live states still report them. It never reports `launch_draft_not_scheduled`,
+because a draft writes no row. Those blockers do not claim a verifier,
+integrator, or satisfaction producer exists. Schema 30 stores a satisfaction
+only from a verified result or an integrated commit. No stored satisfaction
+still reports `verified_dependency_evidence_unavailable:<predecessor>:<requirement>`,
+unless the predecessor failed or was cancelled (`predecessor_failed`). A valid
+satisfaction while `factory_admission` is off reports
+`admission_disabled:<requirement>`. A valid satisfaction while that flag is on
+adds no dependency blocker. `verified_result` does not satisfy
+`integrated_commit`. `landed_commit` and `integration_candidate` are never
+valid. Narrative success does not write a row. `launch_enabled` is true only
+when the flag is on and at least one entry has an empty blocker list. The
+column defaults to off. Inspect does not turn it on, and reserving a dependent
+task still fails.
 
 ```sh
 herdr-projects scheduler demo policy --max-active-workers 3 \
@@ -39,7 +68,7 @@ A queue request is a bounded JSON file:
 ]}
 ```
 
-Requirements are `verified_result`, `integration_candidate` or `landed_commit`.
+Requirements are `verified_result`, `integrated_commit`, `integration_candidate`, or `landed_commit`.
 Missing/duplicate/self edges and cycles refuse atomically. Existing live/uncertain
 attempts block queue edits. Task state/revision and queue audit commit together;
 unchanged requests are idempotent. Queueing preserves legacy TASKS.md and creates
@@ -52,8 +81,8 @@ older work. Graph work is bounded to 10,000 queued tasks and 100,000 edges (256 
 task); unrelated unqueued tasks do not make a store unreadable.
 
 Failed/cancelled predecessors block explicitly. Narrative succeeded state cannot
-satisfy an evidence-bound edge. Verified-result producers arrive in W07; profile,
-authority and production launch preparation remain W04 work. See the [frozen W04 interfaces](adr/0004-w04-scheduling-contract.md).
+satisfy an evidence-bound edge. Only a stored verified result or integrated
+commit for that same requirement can. See the [frozen W04 interfaces](adr/0004-w04-scheduling-contract.md).
 
 ## Reservations and cancellation (schema v16; older history retained)
 
@@ -64,14 +93,17 @@ together. Inputs pin this store, configuration, profile, approval and repository
 identities. [Signed admission budgets](budgets.md) are checked in the reservation
 transaction and rechecked at claim/pre-effect boundaries. Dependency/memory evidence
 producers are not available yet; preparations requiring them refuse. On Linux
-with the `state-store` feature, both `launch draft` and `launch reserve` require
-an unused local binding. `launch draft` returns an unsigned approval and writes
-no reservation. Only `launch reserve` requires an installed owner-signed grant
-and commits the sealed preparation. Generic intent enqueue cannot create
-`runtime.launch` operations.
+with the `state-store` feature, the path is draft, then sign, then
+`launch reserve`, then the controller. Both `launch draft` and `launch reserve`
+require an unused local binding. `launch draft` returns an unsigned approval
+and writes no reservation. The owner signs that document and imports the grant.
+Only `launch reserve` requires the installed owner-signed grant and commits the
+sealed preparation. The controller can then start that reserved attempt.
+Generic intent enqueue cannot create `runtime.launch` operations.
 Prepared-launch dispatch is on (`PREPARED_LAUNCH_DISPATCH_ENABLED = true`);
 automatic admission is off, so the controller can start an already prepared
-launch and does not prepare an arbitrary queued task.
+launch and does not prepare an arbitrary queued task. Inspect does not reserve
+or launch.
 
 ```sh
 herdr-projects task demo cancel-attempt ATTEMPT \

@@ -547,7 +547,7 @@ mod tests {
         let verified = retention_fixture(&f);
         let path = f.project.join(".state/state.db");
         let raw = rusqlite::Connection::open(&path).unwrap();
-        raw.execute_batch("DROP TABLE native_profiles; UPDATE store_meta SET schema_version=24; PRAGMA user_version=24;").unwrap();
+        raw.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE native_profiles; UPDATE store_meta SET schema_version=24; PRAGMA user_version=24;").unwrap();
         drop(raw);
         assert!(verified.retain(&f.project).is_err());
         let mut store = crate::store::SqliteStore::open(&path).unwrap();

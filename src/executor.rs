@@ -20,6 +20,7 @@ impl Default for Limits {fn default()->Self {Self{workers:[2,2],outstanding:[64,
 pub struct Identity {pub operation:String,pub revision:u64,pub project:String,pub machine:String,pub terminal:Option<String>}
 #[derive(Debug, Clone, Default)]
 pub struct Metrics {pub queued:[usize;2],pub running:[usize;2],pub high_water:[usize;2],pub completed:[u64;2],pub max_queue_delay:Duration,pub uncertain:bool}
+#[derive(Clone)]
 pub struct Request {pub identity:Identity,pub lane:Lane,pub deadline:Instant,pub command:Cmd}
 #[derive(Debug)]
 pub struct Completion {pub identity:Identity,pub started_at:Instant,pub queue_delay:Duration,pub elapsed:Duration,pub runner_entered:bool,pub result:Result<Output>}
@@ -32,7 +33,7 @@ impl Ticket {
 struct Job {request:Request,queued:Instant,token:Cancellation,reply:mpsc::SyncSender<Completion>}
 struct State {
     queue:[VecDeque<Job>;2],running:BTreeMap<(String,String),(Identity,Cancellation,usize)>,
-    admitted:[usize;2],metrics:Metrics,last_project:[Option<String>;2],stopping:bool,
+    admitted:[usize;2],metrics:Metrics,rounds:[crate::fair_admission::ProjectRound;2],stopping:bool,
 }
 struct Shared {state:Mutex<State>,wake:Condvar,limits:Limits}
 pub struct Executor {shared:Arc<Shared>,threads:Mutex<Vec<JoinHandle<()>>>}
@@ -40,7 +41,7 @@ impl Executor {
     pub fn new(limits:Limits,runner:Arc<dyn Runner+Send+Sync>)->Result<Self> {
         ensure!(limits.workers.iter().all(|n| (1..=16).contains(n))&&limits.outstanding.iter().all(|n|(1..=1024).contains(n))&&limits.per_project>0&&limits.per_machine>0,"invalid executor bounds");
         ensure!((0..2).all(|i|limits.workers[i]<=limits.outstanding[i]),"worker count exceeds outstanding limit");
-        let shared=Arc::new(Shared{state:Mutex::new(State{queue:[VecDeque::new(),VecDeque::new()],running:BTreeMap::new(),admitted:[0,0],metrics:Metrics::default(),last_project:[None,None],stopping:false}),wake:Condvar::new(),limits});
+        let shared=Arc::new(Shared{state:Mutex::new(State{queue:[VecDeque::new(),VecDeque::new()],running:BTreeMap::new(),admitted:[0,0],metrics:Metrics::default(),rounds:[crate::fair_admission::ProjectRound::default(),crate::fair_admission::ProjectRound::default()],stopping:false}),wake:Condvar::new(),limits});
         let pool=Self{shared,threads:Mutex::new(vec![])};
         for lane in 0..2 {for index in 0..pool.shared.limits.workers[lane] {
             let shared=pool.shared.clone();let runner=runner.clone();
@@ -64,6 +65,7 @@ impl Executor {
         let(reply,receiver)=mpsc::sync_channel(1);state.queue[lane].push_back(Job{request,queued:Instant::now(),token:token.clone(),reply});state.admitted[lane]+=1;state.metrics.high_water[lane]=state.metrics.high_water[lane].max(state.admitted[lane]);
         self.shared.wake.notify_all();Ok(Ticket{receiver,cancellation:token})
     }
+    pub fn outstanding(&self,lane:Lane)->usize {self.shared.limits.outstanding[lane.index()]}
     pub fn metrics(&self)->Metrics {
         let state=self.shared.state.lock().unwrap();let mut metrics=state.metrics.clone();
         for lane in 0..2 {metrics.queued[lane]=state.queue[lane].len();metrics.running[lane]=state.running.values().filter(|(_,_,l)|*l==lane).count();}metrics
@@ -87,28 +89,34 @@ impl Drop for Executor {
         for thread in self.threads.get_mut().unwrap().drain(..){let _=thread.join();}
     }
 }
-fn select(state:&State,limits:&Limits,lane:usize)->Option<usize> {
-    let mut projects=BTreeMap::<&str,usize>::new();let mut machines=BTreeMap::<&str,usize>::new();let mut terminals=BTreeSet::new();
-    for (id,_,running_lane) in state.running.values(){if *running_lane==lane {*projects.entry(&id.project).or_default()+=1;*machines.entry(&id.machine).or_default()+=1;}if let Some(terminal)=&id.terminal {terminals.insert(terminal);}}
-    let eligible=|j:&Job|{let id=&j.request.identity;j.token.is_cancelled()||Instant::now()>=j.request.deadline||(projects.get(id.project.as_str()).copied().unwrap_or(0)<limits.per_project&&machines.get(id.machine.as_str()).copied().unwrap_or(0)<limits.per_machine&&id.terminal.as_ref().is_none_or(|t|!terminals.contains(t)))};
-    // Oldest queued project wins, rotating the last served project behind peers.
-    // Among eligible entries, existing queue age wins within each project.
-    let first=state.queue[lane].iter().position(eligible)?;
-    state.queue[lane].iter().enumerate().find(|(_,j)|eligible(j)&&Some(&j.request.identity.project)!=state.last_project[lane].as_ref()).map(|(i,_)|i).or(Some(first))
+fn eligible_indexes(state:&State,limits:&Limits,lane:usize)->Vec<(usize,String)> {
+    let mut projects=BTreeMap::<&str,usize>::new();let mut machines=BTreeMap::<&str,usize>::new();let mut terminals=BTreeSet::new();let mut ordinary=0usize;
+    for (id,_,running_lane) in state.running.values(){if *running_lane==lane {*projects.entry(id.project.as_str()).or_default()+=1;*machines.entry(id.machine.as_str()).or_default()+=1;if !crate::fair_admission::reserved_control(&id.operation){ordinary+=1;}}if let Some(terminal)=&id.terminal {terminals.insert(terminal.as_str());}}
+    // One of the two Control workers stays free for cancel, reconcile, and observation while Transfer cannot take more work.
+    let transfer_full=state.admitted[Lane::Transfer.index()]>=limits.outstanding[Lane::Transfer.index()];
+    let ordinary_cap=if lane==Lane::Control.index()&&limits.workers[lane]>=2&&transfer_full {limits.workers[lane]-1} else {limits.workers[lane]};
+    state.queue[lane].iter().enumerate().filter(|(_,job)|{let id=&job.request.identity;if job.token.is_cancelled()||Instant::now()>=job.request.deadline {return true;}let room=projects.get(id.project.as_str()).copied().unwrap_or(0)<limits.per_project&&machines.get(id.machine.as_str()).copied().unwrap_or(0)<limits.per_machine&&id.terminal.as_ref().is_none_or(|t|!terminals.contains(t.as_str()));room&&(lane==Lane::Control.index()&&crate::fair_admission::reserved_control(&id.operation)||ordinary<ordinary_cap)}).map(|(index,job)|(index,job.request.identity.project.clone())).collect()
+}
+fn select(state:&mut State,limits:&Limits,lane:usize)->Option<usize> {
+    let eligible=eligible_indexes(state,limits,lane);
+    // Queue age still wins inside a project: the round picks the oldest job of the next unserved project.
+    state.rounds[lane].select(&eligible)
 }
 fn worker(shared:Arc<Shared>,runner:Arc<dyn Runner+Send+Sync>,lane:usize) {
     loop {
         let job={let mut state=shared.state.lock().unwrap();loop {
-            if let Some(index)=select(&state,&shared.limits,lane) {let job=state.queue[lane].remove(index).unwrap();state.last_project[lane]=Some(job.request.identity.project.clone());state.running.insert((job.request.identity.project.clone(),job.request.identity.operation.clone()),(job.request.identity.clone(),job.token.clone(),lane));break job;}
+            if let Some(index)=select(&mut state,&shared.limits,lane) {let job=state.queue[lane].remove(index).unwrap();state.running.insert((job.request.identity.project.clone(),job.request.identity.operation.clone()),(job.request.identity.clone(),job.token.clone(),lane));break job;}
             if state.stopping&&state.queue[lane].is_empty(){return;}
             state=shared.wake.wait_timeout(state,Duration::from_millis(20)).unwrap().0;
         }};
         let started=Instant::now();let mut command=job.request.command;
+        // Captured at submit. Later selection passes and the runner entry must not move it.
+        let original_deadline=job.request.deadline;
         let mut runner_entered=false;
         let result=if job.token.is_cancelled(){Ok(Output{cancelled:true,..Output::default()})}
-        else if let Some(remaining)=job.request.deadline.checked_duration_since(started) {
+        else if let Some(remaining)=original_deadline.checked_duration_since(started) {
             command.timeout=command.timeout.min(remaining);
-            command.deadline=Some(job.request.deadline);
+            command.deadline=Some(original_deadline);
             runner_entered=true;
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(||runner.run(&command))) {
                 Ok(result)=>result,

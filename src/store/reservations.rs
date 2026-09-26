@@ -79,8 +79,17 @@ impl SqliteStore {
         super::delivery::now_check(now)?;if prepared.is_empty()||prepared.len()>128{return Err(invalid("reservation requires 1–128 ready preparations"));}
         let path=std::fs::canonicalize(self.connection.path().ok_or_else(||invalid("store path missing"))?).map_err(|e|StoreError::Io(e.to_string()))?;
         let mut seen=BTreeSet::new();for p in prepared {validate_inputs(&p.inputs)?;if p.inputs.version!=2 {return Err(invalid("new reservations require effective profile evidence"));}if Path::new(&p.inputs.project_store)!=path||!seen.insert(&p.inputs.task){return Err(invalid("preparation belongs to another store or duplicates a task"));}}
+        let opened:u32=self.connection.query_row("PRAGMA user_version",[],|r|r.get(0))?;
+        // Ancestry is a process. Prove it before the write transaction so a hang cannot block prepared dispatch.
+        let proofs=if opened>=30 && super::satisfaction::admission_enabled(&self.connection)? {
+            let mut proofs=Vec::with_capacity(prepared.len());
+            for preparation in prepared {proofs.push(super::satisfaction::prove_integrated_base(&self.connection,&preparation.inputs)?);}
+            proofs
+        } else {Vec::new()};
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
         let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;if version<13{return Err(StoreError::UnsupportedSchema(version));}
+        // Older stores have no satisfaction rows. The flag stays off until a later signed install.
+        let admission_on=if version>=30 {super::satisfaction::admission_enabled(&tx)?}else{false};
         if head(&tx)?!=expected_head{return Err(StoreError::Conflict);}
         let scheduler=super::scheduler::read(&tx)?;let control=super::control::read(&tx)?;
         if control.state!=ProjectState::Active||control.reconciliation_required{return Err(invalid("project is not admitted"));}
@@ -89,12 +98,17 @@ impl SqliteStore {
         let queued:BTreeMap<_,_>=scheduler.queue.iter().map(|q|(&q.task,q)).collect();let mut ranked=Vec::new();
         for preparation in prepared {
             let i=&preparation.inputs;if i.scheduler_revision!=scheduler.policy.revision||i.control_epoch!=control.epoch||i.config.digest!=control.config_digest{return Err(StoreError::Conflict);}
-            if !i.dependencies.is_empty(){return Err(invalid("dependency evidence producers are not available"));}
+            let task=tasks.iter().find(|t|t.id==i.task&&t.revision==i.task_revision).cloned().ok_or(StoreError::Conflict)?;let queue=queued.get(&task.id).ok_or(StoreError::Conflict)?;
+            if !admission_on {
+                if !i.dependencies.is_empty()||!queue.dependencies.is_empty(){return Err(invalid("dependency evidence producers are not available"));}
+            } else {
+                let proof=proofs.iter().find(|proof|proof.task==i.task);
+                super::satisfaction::require_dependency_evidence(&tx,i,&queue.dependencies,&tasks,proof)?;
+            }
             super::worker_knowledge::validate(&tx,i,now)?;
             super::budget::check(&tx,i.budget.as_ref(),false)?;
             if !draft {super::approvals::validate_preparation(&tx,i,now)?;}
-            let task=tasks.iter().find(|t|t.id==i.task&&t.revision==i.task_revision).ok_or(StoreError::Conflict)?;let queue=queued.get(&task.id).ok_or(StoreError::Conflict)?;
-            if task.state!=TaskState::Queued||task.active_attempt.is_some()||!queue.dependencies.is_empty()||queue.enqueued_unix_ms>now||attempts.iter().any(|a|a.task==task.id&&a.retains_capacity()) {return Err(invalid("task is not ready for reservation"));}
+            if task.state!=TaskState::Queued||task.active_attempt.is_some()||queue.enqueued_unix_ms>now||attempts.iter().any(|a|a.task==task.id&&a.retains_capacity()) {return Err(invalid("task is not ready for reservation"));}
             if attempts.iter().filter(|a|a.task==task.id).count()>=scheduler.policy.max_attempts_per_task as usize{return Err(invalid("task attempt limit reached"));}
             let binding=bindings.iter().find(|b|b.id==i.binding&&b.revision==i.binding_revision&&b.task.as_ref()==Some(&task.id)).ok_or(StoreError::Conflict)?;
             if super::ownership::identity_digest(binding)?!=i.binding_digest{return Err(StoreError::Conflict);}
@@ -105,7 +119,13 @@ impl SqliteStore {
             let score=(now-queue.enqueued_unix_ms)/60_000+queue.priority as i64;ranked.push((score,queue.enqueue_sequence,&preparation.inputs));
         }
         if draft {return Ok(None);}
-        ranked.sort_by(|a,b|b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.task.cmp(&b.2.task)));let inputs=ranked[0].2.clone();let(attempt_id,operation_id)=record_ids(&inputs)?;
+        ranked.sort_by(|a,b|b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.task.cmp(&b.2.task)));let inputs=ranked[0].2.clone();
+        // Same overlap the ranker uses. A direct reserve cannot skip it, and the
+        // holder stays on the revision current when that attempt was reserved.
+        if admission_on && super::satisfaction::overlap_with_retained(&tx, inputs.task.as_str(), &attempts)? {
+            return Err(invalid("resource_conflict"));
+        }
+        let(attempt_id,operation_id)=record_ids(&inputs)?;
         let task_revision=inputs.task_revision.checked_add(1).ok_or_else(||invalid("task revision exhausted"))?;
         let mut task=tasks.iter().find(|t|t.id==inputs.task).cloned().ok_or(StoreError::Conflict)?;task.revision=task_revision;task.state=TaskState::Running;task.active_attempt=Some(attempt_id.clone());
         let record=AttemptInputRecord{attempt:attempt_id.clone(),operation:operation_id.clone(),inputs};let payload=serde_json::to_string(&record).map_err(|e|invalid(&e.to_string()))?;if payload.len()>MAX_RECORD_BYTES{return Err(invalid("attempt inputs exceed 1 MiB"));}
@@ -117,6 +137,7 @@ impl SqliteStore {
         event(&tx,"attempt.reserved",attempt_id.as_str(),1,&record)?;event(&tx,"task.changed",attempt.task.as_str(),task_revision,&task)?;
         event(&tx,"operation.enqueued",operation_id.as_str(),task_revision,&record)?;
         let result=Reservation{head:head(&tx)?,record,task_revision};
+        super::consumer_bindings::reconcile_active(&tx)?;
         #[cfg(test)]
         tests::crash_boundary("before_reservation_commit");
         tx.commit()?;Ok(Some(result))
@@ -152,6 +173,7 @@ impl SqliteStore {
         if task.active_attempt.as_ref()==Some(id)||released {task.revision=task.revision.checked_add(1).ok_or_else(||invalid("task revision exhausted"))?;tx.execute("UPDATE tasks SET revision=?2,state=?3,active_attempt=?4 WHERE id=?1",params![task.id.as_str(),integer(task.revision)?,task.state.as_str(),task.active_attempt.as_ref().map(AttemptId::as_str)])?;event(&tx,"task.changed",task.id.as_str(),task.revision,&task)?;}
         let request=CancellationRequest{attempt:id.clone(),requested_unix_ms:now,reason:reason.into()};tx.execute("INSERT INTO attempt_cancellations VALUES(?1,?2,?3)",params![id.as_str(),now,reason])?;
         event(&tx,"attempt.cancellation_requested",id.as_str(),attempt.revision,&serde_json::json!({"request":request,"released":released,"attempt":attempt}))?;
+        super::consumer_bindings::reconcile_active(&tx)?;
         let result=CancellationChange{head:head(&tx)?,attempt:id.clone(),released,attempt_revision:attempt.revision,task_revision:task.revision};tx.commit()?;Ok(result)
     }
 }

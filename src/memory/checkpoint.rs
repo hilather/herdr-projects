@@ -51,6 +51,35 @@ fn blockers(snapshot: &crate::domain::Snapshot) -> String {
     out
 }
 
+fn task_change_line(task: &Task) -> String {
+    format!("- task {} revision {} {:?}: {}\n", task.id.as_str(), task.revision, task.state, task.title.replace(['\n', '\r'], " "))
+}
+
+fn delta_counts(snapshot: &Snapshot, from_seq: u64) -> String {
+    let events_since = snapshot.events.iter().filter(|event| event.sequence > from_seq).count();
+    format!("## Counts\ntasks: {}\nevents_since: {events_since}\n", snapshot.tasks.len())
+}
+
+/// Latest `task.changed` sequence above `from_seq`, ordered so a prefix ack
+/// cannot skip an earlier revision.
+fn changed_since(snapshot: &Snapshot, from_seq: u64) -> Vec<(u64, &Task)> {
+    let mut latest = std::collections::BTreeMap::<&str, u64>::new();
+    for event in &snapshot.events {
+        if event.kind == "task.changed" && event.sequence > from_seq {
+            latest.entry(event.entity.as_str()).and_modify(|seq| *seq = (*seq).max(event.sequence)).or_insert(event.sequence);
+        }
+    }
+    let mut changes: Vec<(u64, &Task)> = snapshot.tasks.iter().filter_map(|task| {
+        latest.get(task.id.as_str()).copied().map(|sequence| (sequence, task))
+    }).collect();
+    changes.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.id.as_str().cmp(right.1.id.as_str())));
+    changes
+}
+
+fn checkpoint_header(checkpoint_id: &str, kind: &str, snapshot_id: &str, session: &str, through: u64) -> String {
+    format!("Checkpoint {checkpoint_id} kind={kind} snapshot={snapshot_id} through_seq={through}. Session {session}. Continue with `context PROJECT --session {session}`. Acknowledge with `context PROJECT --session {session} --ack {checkpoint_id}`.\n\n")
+}
+
 fn base_context(project: &Path) -> Result<(String, u64, Vec<String>, crate::domain::Snapshot)> {
     let snapshot = crate::runtime::snapshot(project)?;
     let (text, head, unseen) = crate::runtime::context_from_snapshot(project, &snapshot)?;
@@ -80,7 +109,9 @@ pub(crate) fn coordinator_session_key(project:&Path,token:&str)->Result<String> 
     bound_session(project,&crate::runtime::snapshot(project)?,token)
 }
 
-/// New/restarted/uncertain sessions get a full checkpoint. Deltas only after ack.
+/// New, restarted, or uncertain sessions get a full checkpoint. After ack, a delta
+/// carries mandatory constraints, counts, changed tasks, and blockers, and may
+/// stop before the event head when the whole change set does not fit.
 pub fn coordinator_context(project: &Path, herdr_session: &str, profile: &CheckpointProfile, instructions: &str) -> Result<CoordinatorContext> {
     ensure!(!profile.name.is_empty() && profile.digest.len()==64, "context requires a named profile digest");
     let now = jiff::Timestamp::now().as_millisecond();
@@ -116,42 +147,73 @@ pub fn coordinator_context(project: &Path, herdr_session: &str, profile: &Checkp
     ensure!(snap.sequence == head, "project changed while building checkpoint; retry context");
     let constraints = constraint_lines(project, &mut memory, &snap).map_err(|e| anyhow::anyhow!("{e}"))?;
     let blocker_text = blockers(&snapshot);
-    let mut body = String::new();
-    if kind=="full" {
-        body.push_str(&base);
-        body.push('\n');
-        body.push_str(&constraints);
-        body.push('\n');
-        body.push_str(&blocker_text);
-    } else {
-        body.push_str(&format!("Runtime owner: SQLite; event head {head}. Checkpoint kind=delta from_seq={from_seq}.\n\n"));
-        body.push_str(&base);
-        body.push('\n');
-        body.push_str(&constraints);
-        body.push('\n');
-        body.push_str(&blocker_text);
-        body.push_str("\n## Changes since last ack\n");
-        let mut any=false;
-        for event in snapshot.events.iter().filter(|e| e.sequence > from_seq) {
-            any=true;
-            body.push_str(&format!("- seq {} {} {}\n", event.sequence, event.kind, event.entity));
-        }
-        for task in &snapshot.tasks {
-            any=true;
-            body.push_str(&format!("- task {} revision {} {:?}: {}\n", task.id.as_str(), task.revision, task.state, task.title.replace(['\n','\r']," ")));
-        }
-        if !any { body.push_str("(none)\n"); }
-    }
     let checkpoint_id = format!("chk-{:x}", Sha256::digest(format!("{}:{}:{}:{}:{}", session.id, snap.id.as_str(), head, now, new_coordinator_session()?).as_bytes()));
-    let header = format!("Checkpoint {checkpoint_id} kind={kind} snapshot={} through_seq={head}. Session {herdr_session}. Continue with `context PROJECT --session {herdr_session}`. Acknowledge with `context PROJECT --session {herdr_session} --ack {checkpoint_id}`.\n\n", snap.id.as_str());
+    let (body, through) = if kind=="full" {
+        let mut body = String::new();
+        body.push_str(&base);
+        body.push('\n');
+        body.push_str(&constraints);
+        body.push('\n');
+        body.push_str(&blocker_text);
+        (body, head)
+    } else {
+        // Task changes stay in sequence order. The first prefix that does not fit
+        // ends the scan. A page that fits every change uses `head` unless only the
+        // last included task sequence still fits.
+        let changes = changed_since(&snapshot, from_seq);
+        let counts = delta_counts(&snapshot, from_seq);
+        let render = |included: usize, through: u64| {
+            let mut body = format!("Runtime owner: SQLite; event head {head}. Checkpoint kind=delta from_seq={from_seq} through_seq={through}.\n\n");
+            body.push_str(&constraints);
+            body.push('\n');
+            body.push_str(&counts);
+            body.push('\n');
+            body.push_str(&blocker_text);
+            body.push_str("\n## Changed tasks\n");
+            if included == 0 {
+                body.push_str("(none)\n");
+            } else {
+                for (_, task) in changes.iter().take(included) { body.push_str(&task_change_line(task)); }
+            }
+            body
+        };
+        let page_chars = |included: usize, through: u64| -> u64 {
+            let body = render(included, through);
+            (checkpoint_header(&checkpoint_id, kind, snap.id.as_str(), herdr_session, through).chars().count() + body.chars().count()) as u64
+        };
+        let mut best: Option<(usize, u64)> = None;
+        if changes.is_empty() {
+            if page_chars(0, head) <= profile.budget_chars { best = Some((0, head)); }
+        } else {
+            for included in 1..=changes.len() {
+                let seq = changes[included - 1].0;
+                let through = if included == changes.len() { head } else { seq };
+                if page_chars(included, through) <= profile.budget_chars {
+                    best = Some((included, through));
+                    continue;
+                }
+                if included == changes.len() && seq < head && page_chars(included, seq) <= profile.budget_chars {
+                    best = Some((included, seq));
+                }
+                break;
+            }
+        }
+        let Some((included, through)) = best else {
+            let floor = page_chars(0, head);
+            let needed = if floor > profile.budget_chars || changes.is_empty() { floor } else { page_chars(1, changes[0].0) };
+            return Err(anyhow::anyhow!("required {needed} budget {}", profile.budget_chars));
+        };
+        (render(included, through), through)
+    };
+    let header = checkpoint_header(&checkpoint_id, kind, snap.id.as_str(), herdr_session, through);
     let text = format!("{header}{body}");
     let count = text.chars().count() as u64;
     ensure!(count <= profile.budget_chars, "required {count} budget {}", profile.budget_chars);
-    let full_chars = if kind=="full" { text.chars().count() as u64 } else { 0 };
-    let delta_chars = if kind=="delta" { text.chars().count() as u64 } else { 0 };
+    let full_chars = if kind=="full" { count } else { 0 };
+    let delta_chars = if kind=="delta" { count } else { 0 };
     let row = CoordinatorCheckpoint {
         id: checkpoint_id.clone(), session_id: session.id.clone(), kind: kind.into(),
-        snapshot_id: snap.id.as_str().into(), from_seq, through_seq: head,
+        snapshot_id: snap.id.as_str().into(), from_seq, through_seq: through,
         manifest_hash: snap.manifest_hash.clone(), full_chars, delta_chars, created_unix_ms: now, acked: false,
     };
     memory.store.insert_coordinator_checkpoint(&row).map_err(MemoryError::from).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -332,6 +394,200 @@ mod tests {
         ack_checkpoint(&project,&next.checkpoint_id,"session").unwrap();
         let next=coordinator_context(&project,"session",&changed,"changed instructions").unwrap();
         assert_eq!(next.kind,"full");
+    }
+
+    fn revise_hard(project: &Path, id: &str, body: &[u8]) {
+        let mut memory = MemoryStore::from_sqlite(migration::open_active(project).unwrap(), objects_dir(project));
+        let body_id = memory.ingest_object(body).unwrap();
+        let prov = memory.ingest_object(&b"prov2"[..]).unwrap();
+        let current = memory.store.memory_head(id).unwrap().unwrap();
+        memory.insert_revision(&ControlContext { now_unix_ms: 2_000 }, NewRevision {
+            id: MemoryRecordId::new(id).unwrap(), record_key: format!("memory/{id}.md"), scope_id: "project".into(),
+            kind: MemoryKind::Constraint, body_hash: body_id, provenance_hash: prov,
+            applicability: Applicability { domains: vec![], paths: vec![format!("memory/{id}.md")] },
+            dependencies: vec![], expected: Some(current.revision), expiry_unix_ms: None,
+            validity_state: String::new(), validity_reason: String::new(),
+        }).unwrap();
+    }
+    fn cursor(project: &Path, token: &str) -> u64 {
+        let mut db = migration::open_active(project).unwrap();
+        db.coordinator_session(&coordinator_session_key(project, token).unwrap()).unwrap().unwrap().cursor_seq
+    }
+    fn checkpoint_count(project: &Path) -> i64 {
+        rusqlite::Connection::open(project.join(".state/state.db")).unwrap()
+            .query_row("SELECT COUNT(*) FROM coordinator_checkpoints", [], |row| row.get(0)).unwrap()
+    }
+
+    #[test]
+    fn hundred_task_delta_is_smaller_and_overflow_does_not_move_the_cursor() {
+        let (_temp, project) = fixture();
+        put_hard(&project, "rule", b"must not ship secrets");
+        {
+            let mut db = migration::open_active(&project).unwrap();
+            let head = db.read_snapshot(None).unwrap().head;
+            let mutations = (0..100).map(|i| Mutation::Task {
+                expected: None,
+                next: Task {
+                    id: TaskId::new(format!("t{i:03}")).unwrap(), revision: 1, state: TaskState::Draft,
+                    title: format!("seed task {i}"), active_attempt: None,
+                },
+            }).collect();
+            db.commit(Commit { expected_head: head, mutations }).unwrap();
+        }
+        let first = coordinator_context(&project, "sess", &profile(), "instructions").unwrap();
+        assert_eq!(first.kind, "full");
+        ack_checkpoint(&project, &first.checkpoint_id, "sess").unwrap();
+        {
+            let mut db = migration::open_active(&project).unwrap();
+            let head = db.read_snapshot(None).unwrap().head;
+            db.commit(Commit { expected_head: head, mutations: vec![Mutation::Task {
+                expected: Some(1),
+                next: Task {
+                    id: TaskId::new("t000").unwrap(), revision: 2, state: TaskState::Draft,
+                    title: "revised seed".into(), active_attempt: None,
+                },
+            }] }).unwrap();
+        }
+        revise_hard(&project, "rule", b"CHANGED HARD CONSTRAINT: no secrets ever");
+        let delta = coordinator_context(&project, "sess", &profile(), "instructions").unwrap();
+        assert_eq!(delta.kind, "delta");
+        assert!(delta.text.contains("CHANGED HARD CONSTRAINT: no secrets ever"));
+        assert!(delta.text.contains("revised seed"));
+        assert!(!delta.text.contains("seed task 50"), "delta listed an unchanged task");
+        assert!(!delta.text.contains("--- PROJECT.md"), "delta included the full base");
+        let row = {
+            let mut db = migration::open_active(&project).unwrap();
+            db.coordinator_checkpoint(&delta.checkpoint_id).unwrap().unwrap()
+        };
+        assert_eq!(row.through_seq, delta.head);
+        assert_eq!(row.full_chars, 0);
+        assert_eq!(row.delta_chars, delta.text.chars().count() as u64);
+        let (base, head, _, snapshot) = base_context(&project).unwrap();
+        assert_eq!(head, delta.head);
+        assert!(snapshot.tasks.len() >= 100, "fixture had {} tasks", snapshot.tasks.len());
+        assert!(delta.text.contains(&format!("tasks: {}", snapshot.tasks.len())));
+        let constraints = {
+            let mut db = migration::open_active(&project).unwrap();
+            let snap = db.read_memory_snapshot(&row.snapshot_id).unwrap();
+            let mut memory = MemoryStore::from_sqlite(db, objects_dir(&project));
+            constraint_lines(&project, &mut memory, &snap).unwrap()
+        };
+        let mut old = format!("Runtime owner: SQLite; event head {head}. Checkpoint kind=delta from_seq={}.\n\n", row.from_seq);
+        old.push_str(&base);
+        old.push('\n');
+        old.push_str(&constraints);
+        old.push('\n');
+        old.push_str(&blockers(&snapshot));
+        old.push_str("\n## Changes since last ack\n");
+        let mut any = false;
+        for event in snapshot.events.iter().filter(|event| event.sequence > row.from_seq) {
+            any = true;
+            old.push_str(&format!("- seq {} {} {}\n", event.sequence, event.kind, event.entity));
+        }
+        for task in &snapshot.tasks {
+            any = true;
+            old.push_str(&task_change_line(task));
+        }
+        if !any { old.push_str("(none)\n"); }
+        assert!(delta.text.chars().count() < old.chars().count(), "new {} old {}", delta.text.chars().count(), old.chars().count());
+
+        ack_checkpoint(&project, &delta.checkpoint_id, "sess").unwrap();
+        let saved_cursor = cursor(&project, "sess");
+        let saved_count = checkpoint_count(&project);
+        {
+            let mut db = migration::open_active(&project).unwrap();
+            let head = db.read_snapshot(None).unwrap().head;
+            db.commit(Commit { expected_head: head, mutations: vec![Mutation::Task {
+                expected: None,
+                next: Task {
+                    id: TaskId::new("oversized").unwrap(), revision: 1, state: TaskState::Draft,
+                    title: "q".repeat(50_000), active_attempt: None,
+                },
+            }] }).unwrap();
+        }
+        let overflow = coordinator_context(&project, "sess", &profile(), "instructions").unwrap_err();
+        let message = overflow.to_string();
+        assert!(message.contains("required") && message.contains("budget"), "{message}");
+        assert_eq!(cursor(&project, "sess"), saved_cursor);
+        assert_eq!(checkpoint_count(&project), saved_count);
+        revise_hard(&project, "rule", &vec![b'z'; 40_000]);
+        assert!(coordinator_context(&project, "sess", &profile(), "instructions").is_err());
+        assert_eq!(cursor(&project, "sess"), saved_cursor);
+        assert_eq!(checkpoint_count(&project), saved_count);
+    }
+
+    #[test]
+    fn delta_pages_ack_only_the_rendered_high_water_and_do_not_skip_holes() {
+        let (_temp, project) = fixture();
+        put_hard(&project, "rule", b"must not ship secrets");
+        for token in ["pages", "hole"] {
+            let full = coordinator_context(&project, token, &profile(), "instructions").unwrap();
+            assert_eq!(full.kind, "full");
+            ack_checkpoint(&project, &full.checkpoint_id, token).unwrap();
+        }
+        {
+            let mut db = migration::open_active(&project).unwrap();
+            let head = db.read_snapshot(None).unwrap().head;
+            let mutations = (0..30).map(|i| Mutation::Task {
+                expected: None,
+                next: Task {
+                    id: TaskId::new(format!("p{i:03}")).unwrap(), revision: 1, state: TaskState::Draft,
+                    title: format!("T{i:03}-{}", "x".repeat(1_800)), active_attempt: None,
+                },
+            }).collect();
+            db.commit(Commit { expected_head: head, mutations }).unwrap();
+        }
+        revise_hard(&project, "rule", b"CHANGED HARD CONSTRAINT: keep this on every page");
+        let page = coordinator_context(&project, "pages", &profile(), "instructions").unwrap();
+        assert_eq!(page.kind, "delta");
+        assert!(page.text.contains("CHANGED HARD CONSTRAINT: keep this on every page"));
+        assert!(page.text.contains("T000-"));
+        assert!(!page.text.contains("--- PROJECT.md"));
+        let row = {
+            let mut db = migration::open_active(&project).unwrap();
+            let row = db.coordinator_checkpoint(&page.checkpoint_id).unwrap().unwrap();
+            let snap = db.read_snapshot(None).unwrap();
+            assert!(snap.events.iter().any(|event| event.sequence > row.through_seq && event.kind != "task.changed"));
+            row
+        };
+        assert!(row.through_seq < page.head);
+        assert!(row.from_seq < row.through_seq);
+        ack_checkpoint(&project, &page.checkpoint_id, "pages").unwrap();
+        let mid = cursor(&project, "pages");
+        assert_eq!(mid, row.through_seq);
+        assert!(mid < page.head);
+        let page2 = coordinator_context(&project, "pages", &profile(), "instructions").unwrap();
+        assert_eq!(page2.kind, "delta");
+        assert!(page2.text.contains("CHANGED HARD CONSTRAINT: keep this on every page"));
+        assert!(!page2.text.contains("T000-"));
+        let pending = (0..30).map(|i| format!("T{i:03}-")).find(|title| !page.text.contains(title)).expect("first page listed every change");
+        assert!(page2.text.contains(&pending));
+        let row2 = {
+            let mut db = migration::open_active(&project).unwrap();
+            db.coordinator_checkpoint(&page2.checkpoint_id).unwrap().unwrap()
+        };
+        assert_eq!(row2.from_seq, mid);
+        ack_checkpoint(&project, &page2.checkpoint_id, "pages").unwrap();
+        let done = cursor(&project, "pages");
+        assert_eq!(done, row2.through_seq);
+        assert!(done > mid);
+        assert!(done <= page2.head);
+        if row2.through_seq == page2.head { assert_eq!(done, page2.head); }
+
+        let partial = coordinator_context(&project, "hole", &profile(), "instructions").unwrap();
+        let mut db = migration::open_active(&project).unwrap();
+        let partial_row = db.coordinator_checkpoint(&partial.checkpoint_id).unwrap().unwrap();
+        assert!(partial_row.through_seq < partial.head);
+        let before = cursor(&project, "hole");
+        assert_eq!(before, partial_row.from_seq);
+        let mut later = partial_row.clone();
+        later.id = "later-page".into();
+        later.from_seq = partial_row.through_seq;
+        later.through_seq = partial.head;
+        db.insert_coordinator_checkpoint(&later).unwrap();
+        drop(db);
+        assert!(ack_checkpoint(&project, "later-page", "hole").is_err());
+        assert_eq!(cursor(&project, "hole"), before);
     }
 
 }

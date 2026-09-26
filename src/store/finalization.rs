@@ -21,6 +21,7 @@ pub(super) fn apply_receipt(db:&Connection,id:&OperationId,identity:&str)->Resul
     db.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('task.changed',?1,?2,1,?3)",params![task.id.as_str(),integer(task.revision)?,serde_json::to_string(task).map_err(|e|StoreError::Invalid(e.to_string()))?])?;
     }
     db.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.artifacts_finalized',?1,?2,1,?3)",params![payload.binding,integer(payload.binding_revision)?,identity])?;
+    super::consumer_bindings::reconcile_active(db)?;
     Ok(())
 }
 

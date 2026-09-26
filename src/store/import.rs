@@ -51,6 +51,25 @@ impl SqliteStore {
         if version<=22 {tx.execute_batch(include_str!("../../migrations/0023_memory_inputs_and_candidates.sql"))?;}
         if version<=23 {tx.execute_batch(include_str!("../../migrations/0024_memory_receipts.sql"))?;}
         if version<=24 {tx.execute_batch(include_str!("../../migrations/0025_native_profiles.sql"))?;}
+        if version<=25 {tx.execute_batch(include_str!("../../migrations/0026_factory_results.sql"))?;}
+        if version<=26 {tx.execute_batch(include_str!("../../migrations/0027_verification_runs.sql"))?;}
+        if version<=27 {tx.execute_batch(include_str!("../../migrations/0028_integration.sql"))?;}
+        if version<=28 {tx.execute_batch(include_str!("../../migrations/0029_feedback.sql"))?;}
+        if version<=29 {tx.execute_batch(include_str!("../../migrations/0030_dependency_satisfaction.sql"))?;}
+        if version<=30 {tx.execute_batch(include_str!("../../migrations/0031_plan_revisions.sql"))?;}
+        if version<=31 {tx.execute_batch(include_str!("../../migrations/0032_contract_scope.sql"))?;}
+        if version<=32 {tx.execute_batch(include_str!("../../migrations/0033_capability_evidence.sql"))?;}
+        if version<=33 {tx.execute_batch(include_str!("../../migrations/0034_delegation_grants.sql"))?;}
+        if version<=34 {tx.execute_batch(include_str!("../../migrations/0035_resource_claims.sql"))?;}
+        if version<=35 {tx.execute_batch(include_str!("../../migrations/0036_waits.sql"))?;}
+        if version<=36 {
+            tx.execute_batch(include_str!("../../migrations/0037_consumer_bindings.sql"))?;
+            super::consumer_bindings::backfill_from_subscriptions(&tx)?;
+        }
+        if version<=37 {tx.execute_batch(include_str!("../../migrations/0038_memory_read_sets.sql"))?;}
+        if version<=38 {tx.execute_batch(include_str!("../../migrations/0039_update_packages.sql"))?;}
+        if version<=39 {tx.execute_batch(include_str!("../../migrations/0040_barriers.sql"))?;}
+        if version<=40 {tx.execute_batch(include_str!("../../migrations/0041_active_work.sql"))?;}
         tx.commit()?;
         Ok(())
     }

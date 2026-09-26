@@ -60,6 +60,60 @@ fn affected(
     )
 }
 
+pub(super) struct RoutingRecipient {
+    pub binding_id: Option<String>,
+    pub subscriber: String,
+    pub snapshot_id: String,
+    pub task_id: String,
+}
+
+const RECIPIENT_CAP: usize = 10_000;
+
+fn map_recipients(
+    rows: impl Iterator<Item = rusqlite::Result<RoutingRecipient>>,
+) -> Result<Vec<RoutingRecipient>> {
+    let consumers = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    if consumers.len() > RECIPIENT_CAP {
+        return Err(StoreError::Limit(
+            "memory routing exceeds 10000 recipients; promotion not committed".into(),
+        ));
+    }
+    Ok(consumers)
+}
+
+/// Pre-binding recipient set. Schema 37 does not route through this scan.
+pub(super) fn legacy_subscription_recipients(
+    tx: &rusqlite::Transaction,
+) -> Result<Vec<RoutingRecipient>> {
+    let mut query = tx.prepare("SELECT s.subscriber,s.snapshot_id,m.task_id FROM memory_subscriptions s JOIN memory_snapshots m ON m.id=s.snapshot_id LEFT JOIN tasks t ON t.id=m.task_id WHERE m.task_id='coordinator' OR (t.state NOT IN ('succeeded','failed','cancelled') AND (t.active_attempt IS NULL OR EXISTS(SELECT 1 FROM attempts a WHERE a.id=t.active_attempt AND a.snapshot=m.id AND a.termination_observed=0 AND a.state IN ('reserved','launching','running','awaiting_input')))) ORDER BY s.id LIMIT 10001")?;
+    map_recipients(query.query_map([], |row| {
+        Ok(RoutingRecipient {
+            binding_id: None,
+            subscriber: row.get(0)?,
+            snapshot_id: row.get(1)?,
+            task_id: row.get(2)?,
+        })
+    })?)
+}
+
+pub(super) fn active_binding_recipients(
+    tx: &rusqlite::Transaction,
+) -> Result<Vec<RoutingRecipient>> {
+    let mut query = tx.prepare(
+        "SELECT b.binding_id,b.consumer_id,b.snapshot_id,m.task_id FROM consumer_bindings b
+         JOIN memory_snapshots m ON m.id=b.snapshot_id
+         WHERE b.active=1 ORDER BY b.consumer_id,b.generation LIMIT 10001",
+    )?;
+    map_recipients(query.query_map([], |row| {
+        Ok(RoutingRecipient {
+            binding_id: Some(row.get(0)?),
+            subscriber: row.get(1)?,
+            snapshot_id: row.get(2)?,
+            task_id: row.get(3)?,
+        })
+    })?)
+}
+
 pub(super) fn record_change(
     tx: &rusqlite::Transaction,
     cause: &str,
@@ -72,36 +126,39 @@ pub(super) fn record_change(
     if version < 23 {
         return Err(StoreError::UnsupportedSchema(version));
     }
-    let mut query=tx.prepare("SELECT s.subscriber,s.snapshot_id,m.task_id FROM memory_subscriptions s JOIN memory_snapshots m ON m.id=s.snapshot_id LEFT JOIN tasks t ON t.id=m.task_id WHERE m.task_id='coordinator' OR (t.state NOT IN ('succeeded','failed','cancelled') AND (t.active_attempt IS NULL OR EXISTS(SELECT 1 FROM attempts a WHERE a.id=t.active_attempt AND a.snapshot=m.id AND a.termination_observed=0 AND a.state IN ('reserved','launching','running','awaiting_input')))) ORDER BY s.id LIMIT 10001")?;
-    let consumers = query
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    if consumers.len() > 10_000 {
-        return Err(StoreError::Limit(
-            "memory routing exceeds 10000 subscriptions; promotion not committed".into(),
-        ));
-    }
-    for (subscriber, snapshot, task) in consumers {
-        if !affected(tx, &snapshot, &task, record, revision)? {
+    let consumers = if version < 37 {
+        legacy_subscription_recipients(tx)?
+    } else {
+        super::consumer_bindings::reconcile_active(tx)?;
+        active_binding_recipients(tx)?
+    };
+    for recipient in consumers {
+        if !affected(
+            tx,
+            &recipient.snapshot_id,
+            &recipient.task_id,
+            record,
+            revision,
+        )? {
             continue;
         }
-        let task_id = if task == "coordinator" {
+        let task_id = if recipient.task_id == "coordinator" {
             None
         } else {
-            Some(task)
+            Some(recipient.task_id)
         };
         let id = format!(
             "delivery-{:x}",
             Sha256::digest(
-                serde_json::json!([cause, subscriber, snapshot, record, revision])
-                    .to_string()
-                    .as_bytes()
+                serde_json::json!([
+                    cause,
+                    recipient.subscriber,
+                    recipient.snapshot_id,
+                    record,
+                    revision
+                ])
+                .to_string()
+                .as_bytes()
             )
         );
         tx.execute(
@@ -109,8 +166,8 @@ pub(super) fn record_change(
             params![
                 id,
                 cause,
-                subscriber,
-                snapshot,
+                recipient.subscriber,
+                recipient.snapshot_id,
                 task_id,
                 record,
                 integer(revision)?,
@@ -118,6 +175,12 @@ pub(super) fn record_change(
                 integer(sequence)?
             ],
         )?;
+        if let Some(binding) = &recipient.binding_id {
+            tx.execute(
+                "INSERT INTO consumer_binding_obligations(binding_id,delivery_id) VALUES(?1,?2)",
+                params![binding, id],
+            )?;
+        }
         if let Some(task) = task_id {
             let invalidation = format!(
                 "inv-{:x}",

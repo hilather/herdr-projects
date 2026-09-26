@@ -262,6 +262,8 @@ impl SqliteStore {
         }
         let sub=format!("sub-{:x}",Sha256::digest(format!("{subscriber}\0{}",id.as_str()).as_bytes()));
         tx.execute("INSERT INTO memory_subscriptions VALUES(?1,?2,?3,?4)",params![sub,subscriber,id.as_str(),integer(sequence)?])?;
+        let binding_task=if plan.coordinator {None} else {Some(task_id.as_str())};
+        super::consumer_bindings::ensure_for_snapshot(&tx,&subscriber,id.as_str(),binding_task)?;
         tx.commit()?;
         self.read_memory_snapshot(id.as_str())
     }
@@ -367,8 +369,8 @@ mod tests {
     fn schema17_upgrade_adds_empty_memory_tables() {
         let temp=tempfile::tempdir().unwrap();let path=temp.path().join("state.db");
         let mut db=SqliteStore::create(&path).unwrap();
-        db.connection.execute_batch("DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; UPDATE store_meta SET schema_version=17; PRAGMA user_version=17;").unwrap();
-        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=25;
+        db.connection.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; UPDATE store_meta SET schema_version=17; PRAGMA user_version=17;").unwrap();
+        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=26;
         assert_eq!(db.read_snapshot(None).unwrap(),before);
         assert!(db.memory_records().unwrap().is_empty());
         db.integrity_check().unwrap();

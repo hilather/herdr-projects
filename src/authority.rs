@@ -3,12 +3,15 @@ use std::{fs::{self, OpenOptions}, io::Write, os::unix::fs::{DirBuilderExt, Meta
 use anyhow::{Result, Context, ensure};
 use serde::{Deserialize,Serialize};
 use sha2::{Digest,Sha256};
-use crate::{domain::{ApprovalGrant,PreparedApproval,VersionedReference}, migration, runner::{Cmd,Runner,RealRunner}};
+use crate::{domain::{ApprovalGrant,ContractInstall,PreparedApproval,PreparedContract,PreparedDelegation,VersionedReference}, migration, runner::{Cmd,Runner,RealRunner}};
 
 pub const SIGNATURE_NAMESPACE: &str = "approval@herdr-projects";
 pub const BUDGET_SIGNATURE_NAMESPACE: &str = "budget@herdr-projects";
 pub const ROUTINE_SIGNATURE_NAMESPACE: &str = "routine@herdr-projects";
 pub const MEMORY_SIGNATURE_NAMESPACE: &str = "memory@herdr-projects";
+pub const CONTRACT_SIGNATURE_NAMESPACE: &str = "contract@herdr-projects";
+pub const ADMISSION_SIGNATURE_NAMESPACE: &str = "admission@herdr-projects";
+pub const DELEGATION_SIGNATURE_NAMESPACE: &str = "delegation@herdr-projects";
 
 #[derive(Deserialize,Serialize)]
 #[serde(deny_unknown_fields)]
@@ -74,6 +77,94 @@ fn verify_signature(policy:&Policy,payload:&[u8],signature:&[u8],namespace:&str,
     Ok(())
 }
 
+/// Verify the original file bytes. Parsing happens only after the signature check.
+fn prepare_contract(policy:&Policy,payload:&[u8],signature:&[u8],runner:&dyn Runner)->Result<PreparedContract> {
+    verify_signature(policy,payload,signature,CONTRACT_SIGNATURE_NAMESPACE,runner)?;
+    let prepared=PreparedContract::parse_verified(payload).map_err(|_|anyhow::anyhow!("invalid contract document (contents withheld)"))?;
+    ensure!(prepared.authority==policy.reference()?,"contract names a different authority policy");
+    Ok(prepared)
+}
+
+/// Verify the original file bytes. Parsing happens only after the signature check.
+fn prepare_delegation(policy:&Policy,payload:&[u8],signature:&[u8],runner:&dyn Runner)->Result<PreparedDelegation> {
+    verify_signature(policy,payload,signature,DELEGATION_SIGNATURE_NAMESPACE,runner)?;
+    let prepared=PreparedDelegation::parse_verified(payload).map_err(|error|{
+        if error.contains("self-signature")||error.contains("child delegation")||error.contains("not a launch approval") {
+            anyhow::anyhow!(error)
+        } else {
+            anyhow::anyhow!("invalid delegation document (contents withheld)")
+        }
+    })?;
+    ensure!(prepared.authority==policy.reference()?,"delegation names a different authority policy");
+    ensure!(prepared.subject_public_key!=policy.approval_public_key,"delegation self-signature is forbidden");
+    ensure!(prepared.child_delegation=="forbidden","child delegation is forbidden");
+    Ok(prepared)
+}
+
+/// Install one delegation from raw signed bytes. Does not launch or reserve.
+pub fn import_delegation(project:&Path,document:&Path,signature:&Path)->Result<String> {
+    let result=(||{
+        let _guard=migration::runtime_mutation(project)?;
+        let mut db=migration::open_active(project)?;
+        let snapshot=db.read_snapshot(None)?;
+        let (owner,config)=policy(project)?;
+        ensure!(snapshot.control.context("control schema upgrade required")?.config_digest==config.digest,"owner configuration is not acknowledged by project control");
+        let payload=migration::read_plan_file(document).map_err(|_|anyhow::anyhow!("delegation document unreadable"))?;
+        let signature=migration::read_plan_file(signature).map_err(|_|anyhow::anyhow!("delegation signature unreadable"))?;
+        let prepared=prepare_delegation(&owner,&payload,&signature,&RealRunner)?;
+        ensure!(migration::config_reference(Path::new(&config.path))?==config,"owner configuration changed during verification");
+        Ok(db.install_delegation(&prepared,jiff::Timestamp::now().as_millisecond())?)
+    })();
+    if let Err(error)=&result {record_cli_denial(project,"delegation","import",None,error);}
+    result
+}
+
+/// Install one task contract from raw signed bytes. Does not launch or reserve.
+pub fn import_contract(project:&Path,document:&Path,signature:&Path)->Result<ContractInstall> {
+    let result=(||{
+        let _guard=migration::runtime_mutation(project)?;
+        let mut db=migration::open_active(project)?;
+        let snapshot=db.read_snapshot(None)?;
+        let (owner,config)=policy(project)?;
+        ensure!(snapshot.control.context("control schema upgrade required")?.config_digest==config.digest,"owner configuration is not acknowledged by project control");
+        let payload=migration::read_plan_file(document).map_err(|_|anyhow::anyhow!("contract document unreadable"))?;
+        let signature=migration::read_plan_file(signature).map_err(|_|anyhow::anyhow!("contract signature unreadable"))?;
+        let prepared=prepare_contract(&owner,&payload,&signature,&RealRunner)?;
+        ensure!(migration::config_reference(Path::new(&config.path))?==config,"owner configuration changed during verification");
+        Ok(db.install_contract(&prepared)?)
+    })();
+    if let Err(error)=&result {record_cli_denial(project,"contract","put",None,error);}
+    result
+}
+
+/// Enable or disable factory admission from raw signed bytes. Signature verification
+/// sees the file that was read, not a reserialized document.
+pub fn import_admission(project:&Path, enable:bool, document:&Path, signature:&Path, evidence:Option<&Path>)->Result<crate::domain::AdmissionInstall> {
+    let result=(||{
+        let _guard=migration::runtime_mutation(project)?;
+        let mut db=migration::open_active(project)?;
+        let snapshot=db.read_snapshot(None)?;
+        let (owner,config)=policy(project)?;
+        ensure!(snapshot.control.context("control schema upgrade required")?.config_digest==config.digest,"owner configuration is not acknowledged by project control");
+        let payload=migration::read_plan_file(document).map_err(|_|anyhow::anyhow!("admission document unreadable"))?;
+        let signature=migration::read_plan_file(signature).map_err(|_|anyhow::anyhow!("admission signature unreadable"))?;
+        verify_signature(&owner,&payload,&signature,ADMISSION_SIGNATURE_NAMESPACE,&RealRunner)?;
+        let prepared=crate::domain::PreparedAdmission::parse_verified(&payload).map_err(|_|anyhow::anyhow!("invalid admission document (contents withheld)"))?;
+        ensure!(prepared.authority==owner.reference()?,"admission policy names a different authority policy");
+        ensure!(prepared.enabled==enable,"admission policy action does not match the command");
+        let evidence_bytes=if prepared.enabled {
+            let path=evidence.context("admission evidence is required")?;
+            Some(migration::read_plan_file(path).map_err(|_|anyhow::anyhow!("admission evidence unreadable"))?)
+        } else {
+            None
+        };
+        ensure!(migration::config_reference(Path::new(&config.path))?==config,"owner configuration changed during verification");
+        Ok(db.install_admission_policy(&prepared, evidence_bytes.as_deref())?)
+    })();
+    if let Err(error)=&result {record_cli_denial(project,"admission",if enable {"enable"} else {"disable"},None,error);}
+    result
+}
+
 fn policy(project:&Path)->Result<(Policy,migration::ConfigReference)> {
     let journal=migration::status(project)?;
     let original=journal.plan.config.context("migration has no pinned owner config path")?;
@@ -125,7 +216,12 @@ pub fn import_signed(project:&Path,document:&Path,signature:&Path,expected_head:
 
 fn reason_code(error:&anyhow::Error)->&'static str {
     let text=format!("{error:#}").to_ascii_lowercase();
-    if text.contains("signature") {"signature_failed"}
+    if text.contains("self-signature") {"self_signature"}
+    else if text.contains("signature") {"signature_failed"}
+    else if text.contains("wrong repo") {"wrong_repo"}
+    // Dedicated expiry wording. A message that only mentions expiry next to an
+    // authority mismatch must not be stored as expired.
+    else if text.contains("grant is expired")||text.contains("authorization is expired") {"expired"}
     else if text.contains("different project")||text.contains("another project")||text.contains("belongs to a different") {"cross_project"}
     else if text.contains("conflict")||text.contains("expected_head") {"stale_head"}
     else if text.contains("invalid") {"invalid_document"}
@@ -494,6 +590,189 @@ mod tests {
         assert!(import_memory(&missing,&document,&sig,0).is_err());
         assert!(denials(&missing).is_err());
     }
+    fn contract_document(policy:&Policy)->Vec<u8> {
+        let mut bytes=serde_json::to_vec_pretty(&serde_json::json!({
+            "version":1,"project_store":"/tmp/project/state.db","expected_head":1,"task_id":"task","contract_revision":1,
+            "deliverable":"ship","non_goals":"no launch","acceptance_policies":[{"id":"builds","text":"tests pass"}],
+            "repository":"/tmp/project/repo","base_oid":"ab".repeat(32),"object_format":"sha256","dependencies":[],
+            "scope":{"paths":[{"path":"src/lib.rs","access":"write"}],"named_resources":[{"name":"schema","access":"write"}]},
+            "capability_flags":[],"profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_only",
+            "authority":policy.reference().unwrap()
+        })).unwrap();
+        bytes.push(b'\n');
+        bytes
+    }
+    #[test]
+    fn contract_verifier_rejects_reserialized_json_and_a_256_kib_file() {
+        let dir=tempfile::tempdir().unwrap();let (key,policy)=key(dir.path(),"owner");
+        let original=contract_document(&policy);
+        let signature=sign(&key,&original,CONTRACT_SIGNATURE_NAMESPACE);
+        let prepared=prepare_contract(&policy,&original,&signature,&RealRunner).unwrap();
+        assert_eq!(prepared.raw,original);
+        assert_eq!(prepared.scope_paths.len(),1);
+        assert_eq!(prepared.scope_paths[0].path,"src/lib.rs");
+        assert_eq!(prepared.named_resources.len(),1);
+        assert_eq!(prepared.named_resources[0].name.as_str(),"schema");
+        let reserialized=serde_json::to_vec(&serde_json::from_slice::<serde_json::Value>(&original).unwrap()).unwrap();
+        assert_ne!(reserialized,original);
+        assert!(prepare_contract(&policy,&reserialized,&signature,&RealRunner).is_err());
+        assert!(prepare_contract(&policy,&original,&sign(&key,&original,SIGNATURE_NAMESPACE),&RealRunner).is_err());
+        let huge=vec![b' ';256*1024];
+        let error=prepare_contract(&policy,&huge,b"not-a-signature",&RealRunner).unwrap_err().to_string();
+        assert!(error.contains("exceeds bounds"),"{error}");
+    }
+    #[test]
+    fn contract_put_records_one_denial_for_a_bad_signature_or_oversized_file_and_none_on_success() {
+        let dir=tempfile::tempdir().unwrap();let (key,owner)=key(dir.path(),"owner");
+        let project=dir.path().join("project");fs::create_dir(&project).unwrap();
+        for child in [".state","threads","inbox"] {fs::create_dir(project.join(child)).unwrap();}
+        fs::write(project.join("PROJECT.md"),"+++\nname='Project'\n+++\n").unwrap();
+        fs::write(project.join("TASKS.md"),"").unwrap();fs::write(project.join("MEMORY.md"),"").unwrap();
+        fs::write(project.join(".state/project.json"),r#"{"status":"paused"}"#).unwrap();
+        let config=dir.path().join("owner.toml");
+        fs::write(&config,format!("[authority]\nversion=1\nrevision=1\napproval_public_key={:?}\n",owner.approval_public_key)).unwrap();
+        let plan=migration::inspect_with_config(&project,&config).unwrap();migration::apply(&project,&plan,true).unwrap();
+        let before=crate::runtime::snapshot(&project).unwrap();
+        crate::runtime::set_state(&project,before.head,before.control.unwrap().revision,ProjectState::Active,&config).unwrap();
+        let head=crate::runtime::add_task(&project,TaskId::new("task").unwrap(),"Assigned".into(),crate::runtime::snapshot(&project).unwrap().head).unwrap();
+        let repo=dir.path().join("repo");fs::create_dir_all(repo.join(".git/objects")).unwrap();
+        let store=project.join(".state/state.db").canonicalize().unwrap();
+        let mut document=serde_json::to_vec_pretty(&serde_json::json!({
+            "version":1,"project_store":store.display().to_string(),"expected_head":head,"task_id":"task","contract_revision":1,
+            "deliverable":"ship","non_goals":"no launch","acceptance_policies":[{"id":"builds","text":"tests pass"}],
+            "repository":repo.canonicalize().unwrap().display().to_string(),"base_oid":"ab".repeat(32),"object_format":"sha256",
+            "dependencies":[],"scope":{"paths":[{"path":"src/lib.rs","access":"write"},{"path":"migrations/","access":"read"}],"named_resources":[{"name":"schema","access":"write"},{"name":"generated","access":"read"}]},
+            "capability_flags":[],"profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1",
+            "route":"verify_only","authority":owner.reference().unwrap()
+        })).unwrap();
+        document.push(b'\n');
+        let path=dir.path().join("contract.json");let sig=dir.path().join("contract.sig");
+        let huge=dir.path().join("huge.json");fs::write(&huge,vec![b' ';256*1024]).unwrap();fs::write(&sig,b"not-a-signature").unwrap();
+        assert!(import_contract(&project,&huge,&sig).is_err());
+        let denied=denials(&project).unwrap().into_iter().filter(|denial|denial.class=="contract").collect::<Vec<_>>();
+        assert_eq!(denied.len(),1);
+        assert_eq!(denied[0].command,"put");
+        assert!(matches!(denied[0].reason_code.as_str(),"signature_failed"|"invalid_document"));
+        fs::write(&path,&document).unwrap();fs::write(&sig,sign(&key,&document,SIGNATURE_NAMESPACE)).unwrap();
+        assert!(import_contract(&project,&path,&sig).is_err());
+        let denied=denials(&project).unwrap().into_iter().filter(|denial|denial.class=="contract").collect::<Vec<_>>();
+        assert_eq!(denied.len(),2);
+        assert!(denied.iter().any(|denial|denial.command=="put"&&denial.reason_code=="signature_failed"));
+        fs::write(&sig,sign(&key,&document,CONTRACT_SIGNATURE_NAMESPACE)).unwrap();
+        let installed=import_contract(&project,&path,&sig).unwrap();
+        assert!(!installed.replayed);
+        assert_eq!(installed.contract_revision,1);
+        let raw=rusqlite::Connection::open(&store).unwrap();
+        let revisions:i64=raw.query_row("SELECT count(*) FROM task_contracts",[],|row|row.get(0)).unwrap();
+        assert_eq!(revisions,1);
+        let stored:Vec<u8>=raw.query_row("SELECT raw_bytes FROM task_contracts",[],|row|row.get(0)).unwrap();
+        assert_eq!(stored,document);
+        let mut path_stmt=raw.prepare("SELECT path,access,certainty FROM contract_scope_paths ORDER BY ordinal").unwrap();
+        let paths:Vec<(String,String,String)>=path_stmt.query_map([],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap().collect::<std::result::Result<Vec<_>,_>>().unwrap();
+        assert_eq!(paths,vec![("src/lib.rs".into(),"write".into(),"exact".into()),("migrations/".into(),"read".into(),"uncertain".into())]);
+        drop(path_stmt);
+        let mut named_stmt=raw.prepare("SELECT name,access FROM contract_named_resources ORDER BY name").unwrap();
+        let named:Vec<(String,String)>=named_stmt.query_map([],|row|Ok((row.get(0)?,row.get(1)?))).unwrap().collect::<std::result::Result<Vec<_>,_>>().unwrap();
+        assert_eq!(named,vec![("generated".into(),"read".into()),("schema".into(),"write".into())]);
+        let attempts:i64=raw.query_row("SELECT count(*) FROM attempts",[],|row|row.get(0)).unwrap();
+        assert_eq!(attempts,0);
+        let denied=denials(&project).unwrap().into_iter().filter(|denial|denial.class=="contract").count();
+        assert_eq!(denied,2);
+    }
+
+    fn delegation_bytes(policy:&Policy,store:&str,repository:&str,subject:&str,subject_key:&str)->Vec<u8> {
+        let expires:i64=9_000_000_000_000;
+        let mut bytes=serde_json::to_vec_pretty(&serde_json::json!({
+            "version":1,"issuer":"owner","subject":subject,"subject_public_key":subject_key,
+            "action_classes":["reserve_attempt"],
+            "repositories":[{"repository":repository,"ref":"refs/heads/factory"}],
+            "profile_kinds":["codex"],"max_concurrent_attempts":1,"expires_unix_ms":expires,
+            "revocation_epoch":1,"child_delegation":"forbidden","policy_revision":policy.revision,
+            "project_store":store,"authority":policy.reference().unwrap()
+        })).unwrap();
+        bytes.push(b'\n');
+        bytes
+    }
+
+    #[test]
+    fn delegation_verifier_checks_raw_bytes_and_self_signed_grant_does_not_reserve() {
+        let dir=tempfile::tempdir().unwrap();
+        let (owner_key,owner)=key(dir.path(),"owner");
+        let (subject_key,subject)=key(dir.path(),"subject");
+        let project=dir.path().join("project");
+        fs::create_dir(&project).unwrap();
+        for child in [".state","threads","inbox"] {fs::create_dir(project.join(child)).unwrap();}
+        fs::write(project.join("PROJECT.md"),"+++\nname='Project'\n+++\n").unwrap();
+        fs::write(project.join("TASKS.md"),"").unwrap();fs::write(project.join("MEMORY.md"),"").unwrap();
+        fs::write(project.join(".state/project.json"),r#"{"status":"paused"}"#).unwrap();
+        let config=dir.path().join("owner.toml");
+        fs::write(&config,format!("[authority]\nversion=1\nrevision=1\napproval_public_key={:?}\n",owner.approval_public_key)).unwrap();
+        let plan=migration::inspect_with_config(&project,&config).unwrap();
+        migration::apply(&project,&plan,true).unwrap();
+        let before=crate::runtime::snapshot(&project).unwrap();
+        crate::runtime::set_state(&project,before.head,before.control.unwrap().revision,ProjectState::Active,&config).unwrap();
+        let store=project.join(".state/state.db").canonicalize().unwrap();
+        let repo=dir.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        let repo=repo.canonicalize().unwrap();
+        let original=delegation_bytes(&owner,&store.display().to_string(),&repo.display().to_string(),"delegate",&subject.approval_public_key);
+        let signature=sign(&owner_key,&original,DELEGATION_SIGNATURE_NAMESPACE);
+        let prepared=prepare_delegation(&owner,&original,&signature,&RealRunner).unwrap();
+        assert_eq!(prepared.raw,original);
+        let reserialized=serde_json::to_vec(&serde_json::from_slice::<serde_json::Value>(&original).unwrap()).unwrap();
+        assert_ne!(reserialized,original);
+        assert!(prepare_delegation(&owner,&reserialized,&signature,&RealRunner).is_err());
+        assert!(prepare_delegation(&owner,&original,&sign(&owner_key,&original,CONTRACT_SIGNATURE_NAMESPACE),&RealRunner).is_err());
+
+        let path=dir.path().join("delegation.json");
+        let sig=dir.path().join("delegation.sig");
+        fs::write(&path,&original).unwrap();
+        fs::write(&sig,sign(&subject_key,&original,DELEGATION_SIGNATURE_NAMESPACE)).unwrap();
+        assert!(import_delegation(&project,&path,&sig).is_err());
+        let denied=denials(&project).unwrap().into_iter().filter(|denial|denial.class=="delegation").collect::<Vec<_>>();
+        assert_eq!(denied.len(),1);
+        assert_eq!(denied[0].command,"import");
+        assert_eq!(denied[0].reason_code,"signature_failed");
+
+        // Issuer and subject are the same principal, so the owner signature is still a self-signature.
+        let self_named=delegation_bytes(&owner,&store.display().to_string(),&repo.display().to_string(),"owner",&subject.approval_public_key);
+        fs::write(&path,&self_named).unwrap();
+        fs::write(&sig,sign(&owner_key,&self_named,DELEGATION_SIGNATURE_NAMESPACE)).unwrap();
+        assert!(import_delegation(&project,&path,&sig).is_err());
+        let same_key=delegation_bytes(&owner,&store.display().to_string(),&repo.display().to_string(),"delegate",&owner.approval_public_key);
+        fs::write(&path,&same_key).unwrap();
+        fs::write(&sig,sign(&owner_key,&same_key,DELEGATION_SIGNATURE_NAMESPACE)).unwrap();
+        assert!(import_delegation(&project,&path,&sig).is_err());
+        let denied=denials(&project).unwrap().into_iter().filter(|denial|denial.class=="delegation"&&denial.reason_code=="self_signature").count();
+        assert!(denied>=1,"{denied}");
+        let raw=rusqlite::Connection::open(&store).unwrap();
+        raw.execute("UPDATE project_control SET factory_admission='on' WHERE singleton=1",[]).unwrap();
+        let grants:i64=raw.query_row("SELECT count(*) FROM delegation_grants",[],|row|row.get(0)).unwrap();
+        let attempts:i64=raw.query_row("SELECT count(*) FROM attempts",[],|row|row.get(0)).unwrap();
+        assert_eq!(grants,0);
+        assert_eq!(attempts,0);
+        drop(raw);
+        fs::write(&path,&original).unwrap();
+        fs::write(&sig,&signature).unwrap();
+        let installed=import_delegation(&project,&path,&sig).unwrap();
+        let mut db=migration::open_active(&project).unwrap();
+        let decision=db.reserve_attempt(&installed,&repo.display().to_string(),"refs/heads/factory","codex",1_000).unwrap();
+        assert_eq!(decision.grant_id,installed);
+        assert!(!decision.reserved);
+        assert!(db.read_snapshot(None).unwrap().attempts.is_empty());
+        assert!(db.read_snapshot(None).unwrap().operations.iter().all(|operation| operation.kind!="runtime.launch"));
+    }
+
+    #[test]
+    fn delegation_expiry_reason_does_not_classify_authority_mismatch_as_expired() {
+        assert_eq!(reason_code(&anyhow::anyhow!("delegation grant is expired")),"expired");
+        assert_eq!(reason_code(&anyhow::anyhow!("review authorization is expired")),"expired");
+        assert_ne!(reason_code(&anyhow::anyhow!("review authority mismatch")),"expired");
+        assert_ne!(reason_code(&anyhow::anyhow!("review authority changed")),"expired");
+        assert_ne!(reason_code(&anyhow::anyhow!("review authority mismatch or expired")),"expired");
+        assert_ne!(reason_code(&anyhow::anyhow!("invalid delegation repositories: stored text exceeds 16384")),"stale_head");
+        assert_eq!(reason_code(&anyhow::anyhow!("invalid delegation repositories: stored text exceeds 16384")),"invalid_document");
+    }
 }
 
 pub const MEMORY_REVIEW_NAMESPACE:&str="memory-review@herdr-projects";
@@ -510,7 +789,8 @@ pub fn review_memory_proposal(project:&Path,proposal:&str,document:&Path,signatu
         let doc:crate::domain::MemoryReviewAuthorization=serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid signed memory review"))?;
         let now=jiff::Timestamp::now().as_millisecond();
         ensure!(doc.version==1 && doc.expected_head==expected_head && doc.review.proposal_id==proposal,"review command/document identity mismatch");
-        ensure!(doc.authority==owner.reference()? && doc.expires_unix_ms>now,"review authority mismatch or expired");
+        ensure!(doc.authority==owner.reference()?,"review authority mismatch");
+        ensure!(doc.expires_unix_ms>now,"review authorization is expired");
         ensure!(doc.project_store==project.join(".state/state.db").canonicalize()?.to_string_lossy(),"review belongs to another project");
         let signature=migration::read_plan_file(signature)?;
         verify_signature(&owner,&bytes,&signature,MEMORY_REVIEW_NAMESPACE,&RealRunner)?;
@@ -536,7 +816,8 @@ pub fn promote_memory_proposal(project:&Path,proposal:&str,decision:&str)->Resul
         let doc:crate::domain::MemoryReviewAuthorization=serde_json::from_value(stored["authorization"].clone()).map_err(|_|anyhow::anyhow!("review lacks signed authorization; review again"))?;
         let(owner,config)=policy(project)?;
         let now=jiff::Timestamp::now().as_millisecond();
-        ensure!(doc.authority==owner.reference()? && doc.expires_unix_ms>now,"review authority changed or expired");
+        ensure!(doc.authority==owner.reference()?,"review authority changed");
+        ensure!(doc.expires_unix_ms>now,"review authorization is expired");
         ensure!(doc.review.proposal_id==proposal && doc.proposal_digest==row.payload_digest,"review authorization mismatch");
         ensure!(doc.project_store==project.join(".state/state.db").canonicalize()?.to_string_lossy(),"review belongs to another project");
         ensure!(stored["config_digest"].as_str()==config.digest.as_deref(),"review configuration changed");

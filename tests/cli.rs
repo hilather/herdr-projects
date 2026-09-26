@@ -681,7 +681,7 @@ fn migrated_runtime_bindings_require_explicit_upgrade_and_are_unverified() {
     for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
     let project=root.join("demo");std::fs::write(project.join("threads/t-0001.toml"),"id='t-0001'\nstatus='resolved'\nrepo='/repo'\n").unwrap();
     let plan=herdr_projects::migration::inspect(&project).unwrap();herdr_projects::migration::apply(&project,&plan,true).unwrap();
-    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE memory_delivery_intents; DROP TABLE memory_import_decisions; DROP TABLE memory_import_candidates; DROP TABLE memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; DROP TABLE runtime_ownership; DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; UPDATE store_meta SET schema_version=4; PRAGMA user_version=4;").unwrap();drop(raw);
+    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE memory_delivery_intents; DROP TABLE memory_import_decisions; DROP TABLE memory_import_candidates; DROP TABLE memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; DROP TABLE runtime_ownership; DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; UPDATE store_meta SET schema_version=4; PRAGMA user_version=4;").unwrap();drop(raw);
     let args=["--root",root_arg,"migration","demo","bindings"];
     let out=hp(home.path(),&args);assert!(!out.status.success());assert!(String::from_utf8_lossy(&out.stderr).contains("upgrade-store"));
     assert!(hp(home.path(),&["--root",root_arg,"migration","demo","upgrade-store"]).status.success());
@@ -833,7 +833,7 @@ fn scheduler_cli_queues_dependencies_without_launching_or_rewriting_legacy_tasks
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
     let project=root.join("demo");let original=std::fs::read(project.join("TASKS.md")).unwrap();let plan=migration::inspect(&project).unwrap();migration::apply(&project,&plan,true).unwrap();for id in ["a","b"] {runtime::add_task(&project,TaskId::new(id).unwrap(),id.into(),runtime::snapshot(&project).unwrap().head).unwrap();}
     let request=home.path().join("queue.json");std::fs::write(&request,r#"{"priority":2,"dependencies":[{"predecessor":"b","requirement":"landed_commit"}]}"#).unwrap();let before=runtime::snapshot(&project).unwrap();let out=hp(home.path(),&["--root",root_arg,"task","demo","queue","a","--input-file",request.to_str().unwrap(),"--expected-revision","1","--expected-head",&before.head.to_string()]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
-    let head=runtime::snapshot(&project).unwrap().head;let out=hp(home.path(),&["--root",root_arg,"scheduler","demo","policy","--max-active-workers","2","--max-attempts-per-task","3","--expected-revision","1","--expected-head",&head.to_string()]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));let out=hp(home.path(),&["--root",root_arg,"scheduler","demo","inspect"]);assert!(out.status.success());let report:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();assert_eq!(report["available_slots"],2);assert_eq!(report["launch_enabled"],false);assert!(report["entries"][0]["blockers"].as_array().unwrap().iter().any(|s|s.as_str().unwrap().contains("verified_dependency_evidence_unavailable:b:landed_commit")));
+    let head=runtime::snapshot(&project).unwrap().head;let out=hp(home.path(),&["--root",root_arg,"scheduler","demo","policy","--max-active-workers","2","--max-attempts-per-task","3","--expected-revision","1","--expected-head",&head.to_string()]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));let out=hp(home.path(),&["--root",root_arg,"scheduler","demo","inspect"]);assert!(out.status.success());let report:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();assert_eq!(report["available_slots"],2);assert_eq!(report["launch_enabled"],false);assert_eq!(report["capability"]["prepared_dispatch"],true);assert_eq!(report["capability"]["automatic_admission"],false);assert_eq!(report["capability"]["dependency_producers"],false);assert_eq!(report["capability"]["integration"],"unavailable");assert_eq!(report["capability"]["blockers"],serde_json::json!(["automatic_admission_does_not_draft_sign_or_reserve"]));let blockers=report["entries"][0]["blockers"].as_array().unwrap();for stage in ["owner_signature_not_scheduled","launch_reserve_not_scheduled","controller_requires_reserved_attempt"]{assert!(blockers.iter().any(|s|s==stage));}assert!(blockers.iter().all(|s|s!="launch_draft_not_scheduled"));assert!(blockers.iter().any(|s|s.as_str().unwrap().contains("verified_dependency_evidence_unavailable:b:landed_commit")));assert!(blockers.iter().chain(report["capability"]["blockers"].as_array().unwrap()).all(|s|{let s=s.as_str().unwrap();!s.contains("launch_preparation_unavailable")&&!s.contains("verifier")&&!s.contains("integrator")&&!s.contains("producer")&&!s.contains("satisfaction")}));
     std::fs::write(&request,r#"{"priority":0,"dependencies":[{"predecessor":"a","requirement":"verified_result"}]}"#).unwrap();let before=runtime::snapshot(&project).unwrap();let out=hp(home.path(),&["--root",root_arg,"task","demo","queue","b","--input-file",request.to_str().unwrap(),"--expected-revision","1","--expected-head",&before.head.to_string()]);assert!(!out.status.success());assert_eq!(runtime::snapshot(&project).unwrap(),before);assert!(before.attempts.is_empty());assert!(before.operations.is_empty());assert_eq!(std::fs::read(project.join("TASKS.md")).unwrap(),original);
 }
 
@@ -1472,4 +1472,356 @@ fn profile_prepare_uses_pinned_owner_config_and_keeps_unknown_capabilities() {
     assert!(!String::from_utf8_lossy(&output.stdout).contains("PRIVATE_ARG"));
     assert_eq!(runtime::snapshot(&project).unwrap(),before);
     assert!(!caller.path().join(".config").exists());
+}
+
+#[cfg(all(feature = "state-store", target_os = "linux"))]
+#[test]
+fn task_contract_put_and_result_submit_keep_worker_bytes_untrusted() {
+    use herdr_projects::{authority::CONTRACT_SIGNATURE_NAMESPACE, domain::*, migration, runtime};
+    use sha2::{Digest, Sha256};
+    use std::process::Command;
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    for action in ["new", "pause"] {
+        assert!(hp(home.path(), &["--root", root_arg, action, "demo"]).status.success());
+    }
+    let help = hp(home.path(), &["task", "demo", "contract", "put", "--help"]);
+    assert!(help.status.success(), "{}", String::from_utf8_lossy(&help.stderr));
+    let help_text = String::from_utf8_lossy(&help.stdout);
+    assert!(help_text.contains("--input-file") && help_text.contains("--signature"));
+    let submit_help = hp(home.path(), &["result", "demo", "submit", "--help"]);
+    assert!(submit_help.status.success());
+    assert!(String::from_utf8_lossy(&submit_help.stdout).contains("--input-file"));
+    assert!(hp(home.path(), &["result", "demo", "show", "--help"]).status.success());
+    assert!(!hp(home.path(), &["plan", "propose", "demo"]).status.success());
+    let key = home.path().join("owner");
+    assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).status().unwrap().success());
+    let public = std::fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+    let project = root.join("demo");
+    let config = home.path().join("owner.toml");
+    std::fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n")).unwrap();
+    let plan = migration::inspect_with_config(&project, &config).unwrap();
+    migration::apply(&project, &plan, true).unwrap();
+    let snapshot = runtime::snapshot(&project).unwrap();
+    runtime::set_state(&project, snapshot.head, snapshot.control.unwrap().revision, ProjectState::Active, &config).unwrap();
+    let head = runtime::add_task(&project, TaskId::new("task").unwrap(), "work".into(), runtime::snapshot(&project).unwrap().head).unwrap();
+    let db_path = project.join(".state/state.db");
+    rusqlite::Connection::open(&db_path).unwrap().execute(
+        "INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) VALUES('attempt-1','task',1,'running',NULL,'slot-1',0)",
+        [],
+    ).unwrap();
+    let repo = home.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git/objects")).unwrap();
+    let loose = |bytes: &[u8]| {
+        let oid = format!("{:x}", Sha256::digest(bytes));
+        let path = repo.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+        oid
+    };
+    let base = loose(b"base-object");
+    let candidate = loose(b"candidate-object");
+    let authority = herdr_projects::authority::policy_reference(&project).unwrap();
+    let mut document = serde_json::to_vec_pretty(&serde_json::json!({
+        "version": 1,
+        "project_store": db_path.canonicalize().unwrap().display().to_string(),
+        "expected_head": head,
+        "task_id": "task",
+        "contract_revision": 1,
+        "deliverable": "ship",
+        "non_goals": "no launch",
+        "acceptance_policies": [{"id": "builds", "text": "tests pass"}],
+        "repository": repo.canonicalize().unwrap().display().to_string(),
+        "base_oid": base,
+        "object_format": "sha256",
+        "dependencies": [],
+        "capability_flags": [],
+        "profile_kind": "codex",
+        "retry_class": "none",
+        "result_schema_id": "result-v1",
+        "route": "verify_only",
+        "authority": authority
+    })).unwrap();
+    document.push(b'\n');
+    let doc_path = home.path().join("contract.json");
+    std::fs::write(&doc_path, &document).unwrap();
+    assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y", "sign", "-f"]).arg(&key).args(["-n", CONTRACT_SIGNATURE_NAMESPACE]).arg(&doc_path).status().unwrap().success());
+    let sig_path = home.path().join("contract.json.sig");
+    let before = runtime::snapshot(&project).unwrap();
+    let huge = home.path().join("huge.json");
+    std::fs::write(&huge, vec![b' '; 256 * 1024]).unwrap();
+    let refused = hp(home.path(), &["--root", root_arg, "task", "demo", "contract", "put", "--input-file", huge.to_str().unwrap(), "--signature", sig_path.to_str().unwrap()]);
+    assert!(!refused.status.success());
+    assert_eq!(runtime::snapshot(&project).unwrap().head, before.head);
+    let installed = hp(home.path(), &["--root", root_arg, "task", "demo", "contract", "put", "--input-file", doc_path.to_str().unwrap(), "--signature", sig_path.to_str().unwrap()]);
+    assert!(installed.status.success(), "{}", String::from_utf8_lossy(&installed.stderr));
+    let installed: serde_json::Value = serde_json::from_slice(&installed.stdout).unwrap();
+    assert_eq!(installed["replayed"], false);
+    let reserialized = serde_json::to_vec(&serde_json::from_slice::<serde_json::Value>(&document).unwrap()).unwrap();
+    let rewritten = home.path().join("rewritten.json");
+    std::fs::write(&rewritten, &reserialized).unwrap();
+    let mismatched = hp(home.path(), &["--root", root_arg, "task", "demo", "contract", "put", "--input-file", rewritten.to_str().unwrap(), "--signature", sig_path.to_str().unwrap()]);
+    assert!(!mismatched.status.success());
+    let submission = home.path().join("result.json");
+    std::fs::write(&submission, serde_json::to_vec(&serde_json::json!({
+        "idempotency_key": "cli-key",
+        "task_id": "task",
+        "contract_revision": 1,
+        "contract_digest": installed["digest"],
+        "attempt_id": "attempt-1",
+        "repository": repo.canonicalize().unwrap().display().to_string(),
+        "base_oid": base,
+        "candidate_oid": candidate,
+        "object_format": "sha256",
+        "artifact_manifest": [{"path": "src/lib.rs", "oid": candidate}],
+        "claimed_checks": ["cargo test"],
+        "objects": [
+            {"oid": base, "relative_path": format!("{}/{}", &base[..2], &base[2..])},
+            {"oid": candidate, "relative_path": format!("{}/{}", &candidate[..2], &candidate[2..])}
+        ]
+    })).unwrap()).unwrap();
+    let submitted = hp(home.path(), &["--root", root_arg, "result", "demo", "submit", "--input-file", submission.to_str().unwrap()]);
+    assert!(submitted.status.success(), "{}", String::from_utf8_lossy(&submitted.stderr));
+    let again = hp(home.path(), &["--root", root_arg, "result", "demo", "submit", "--input-file", submission.to_str().unwrap()]);
+    assert!(again.status.success(), "{}", String::from_utf8_lossy(&again.stderr));
+    let first: serde_json::Value = serde_json::from_slice(&submitted.stdout).unwrap();
+    let second: serde_json::Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(first["submission_id"], second["submission_id"]);
+    assert_eq!(second["replayed"], true);
+    let shown = hp(home.path(), &["--root", root_arg, "result", "demo", "show"]);
+    assert!(shown.status.success(), "{}", String::from_utf8_lossy(&shown.stderr));
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(shown.as_array().unwrap().len(), 1);
+    assert!(shown[0].get("verified").is_none());
+    assert_eq!(shown[0]["claimed_checks"], serde_json::json!(["cargo test"]));
+    let tasks: i64 = rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT count(*) FROM tasks", [], |row| row.get(0)).unwrap();
+    assert_eq!(tasks, runtime::snapshot(&project).unwrap().tasks.len() as i64);
+}
+
+#[cfg(all(feature = "state-store", target_os = "linux"))]
+#[test]
+fn signed_factory_admission_command_stores_raw_bytes_or_writes_a_denial() {
+    use herdr_projects::{authority, domain::ProjectState, integration, migration, runtime};
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::process::Command;
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    for action in ["new", "pause"] {
+        assert!(hp(home.path(), &["--root", root_arg, action, "demo"]).status.success());
+    }
+    let help = hp(home.path(), &["factory", "admission", "--help"]);
+    assert!(help.status.success(), "{}", String::from_utf8_lossy(&help.stderr));
+    let help_text = String::from_utf8_lossy(&help.stdout);
+    assert!(help_text.contains("--enable") && help_text.contains("--disable"));
+    assert!(help_text.contains("--policy") && help_text.contains("--signature") && help_text.contains("--evidence"));
+    assert!(!help_text.contains("--sql"));
+    let key = home.path().join("owner");
+    assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).status().unwrap().success());
+    let public = fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+    let project = root.join("demo");
+    let config = home.path().join("owner.toml");
+    fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n")).unwrap();
+    let plan = migration::inspect_with_config(&project, &config).unwrap();
+    migration::apply(&project, &plan, true).unwrap();
+    let snapshot = runtime::snapshot(&project).unwrap();
+    runtime::set_state(&project, snapshot.head, snapshot.control.unwrap().revision, ProjectState::Active, &config).unwrap();
+    let db_path = project.join(".state/state.db");
+    let store = db_path.canonicalize().unwrap().display().to_string();
+    let column = || -> String {
+        rusqlite::Connection::open(&db_path).unwrap().query_row(
+            "SELECT factory_admission FROM project_control WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        ).unwrap()
+    };
+    let policy_rows = || -> i64 {
+        rusqlite::Connection::open(&db_path).unwrap().query_row(
+            "SELECT count(*) FROM factory_admission_policies",
+            [],
+            |row| row.get(0),
+        ).unwrap()
+    };
+    let denials = || authority::denials(&project).unwrap().into_iter().filter(|denial| denial.class == "admission").count();
+    assert_eq!(column(), "off");
+    assert_eq!(policy_rows(), 0);
+    let unsigned = hp(home.path(), &["--root", root_arg, "factory", "admission", "demo", "--enable"]);
+    assert!(!unsigned.status.success());
+    let sql_shaped = hp(home.path(), &["--root", root_arg, "factory", "admission", "demo", "--sql", "UPDATE project_control SET factory_admission='on'"]);
+    assert!(!sql_shaped.status.success());
+    assert_eq!(column(), "off");
+    assert_eq!(denials(), 0);
+    let repo = home.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let status = Command::new("/usr/bin/git").args(args).current_dir(&repo)
+            .env("GIT_AUTHOR_NAME", "integrator").env("GIT_AUTHOR_EMAIL", "integrator@example.com")
+            .env("GIT_COMMITTER_NAME", "integrator").env("GIT_COMMITTER_EMAIL", "integrator@example.com")
+            .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0").env("GIT_NO_LAZY_FETCH", "1")
+            .status().unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "--initial-branch", "main"]);
+    fs::write(repo.join("README"), b"base\n").unwrap();
+    git(&["add", "README"]);
+    git(&["commit", "-m", "base"]);
+    let repo = repo.canonicalize().unwrap();
+    {
+        let mut db = herdr_projects::store::SqliteStore::open(&db_path).unwrap();
+        integration::configure_integration_ref(&mut db, &repo, "refs/heads/integration").unwrap();
+    }
+    let authority_ref = serde_json::to_value(authority::policy_reference(&project).unwrap()).unwrap();
+    let manifest = serde_json::to_vec(&serde_json::json!({"vertical_slice": "pass", "git_sha": "fixture"})).unwrap();
+    let digest = format!("{:x}", Sha256::digest(&manifest));
+    let evidence = home.path().join("manifest.json");
+    fs::write(&evidence, &manifest).unwrap();
+    let sign = |bytes: &[u8], name: &str| {
+        let path = home.path().join(name);
+        fs::write(&path, bytes).unwrap();
+        assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y", "sign", "-f"]).arg(&key)
+            .args(["-n", authority::ADMISSION_SIGNATURE_NAMESPACE]).arg(&path).status().unwrap().success());
+        (path, home.path().join(format!("{name}.sig")))
+    };
+    let document = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "enabled": true,
+        "project_store": store,
+        "evidence_digest": digest,
+        "authority": authority_ref,
+    })).unwrap();
+    let (policy, signature) = sign(&document, "enable.json");
+    let run = |args: &[String]| {
+        let mut cmd = vec!["--root".into(), root_arg.into(), "factory".into(), "admission".into(), "demo".into()];
+        cmd.extend(args.iter().cloned());
+        let borrowed: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        hp(home.path(), &borrowed)
+    };
+    let enable_args = [
+        "--enable".into(),
+        "--policy".into(), policy.display().to_string(),
+        "--signature".into(), signature.display().to_string(),
+        "--evidence".into(), evidence.display().to_string(),
+    ];
+    let missing = run(&enable_args);
+    assert!(!missing.status.success(), "{}", String::from_utf8_lossy(&missing.stdout));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("integration ref is missing"), "{}", String::from_utf8_lossy(&missing.stderr));
+    assert_eq!(column(), "off");
+    assert_eq!(policy_rows(), 0);
+    assert_eq!(denials(), 1);
+    git(&["branch", "integration"]);
+    git(&["checkout", "integration"]);
+    let checked_out = run(&enable_args);
+    assert!(!checked_out.status.success());
+    assert!(String::from_utf8_lossy(&checked_out.stderr).contains("integration ref is checked out"), "{}", String::from_utf8_lossy(&checked_out.stderr));
+    assert_eq!(column(), "off");
+    assert_eq!(denials(), 2);
+    git(&["checkout", "main"]);
+    let wrong_evidence = home.path().join("wrong.json");
+    fs::write(&wrong_evidence, br#"{"vertical_slice":"pass","tampered":true}"#).unwrap();
+    let mut wrong_args = enable_args.clone();
+    *wrong_args.last_mut().unwrap() = wrong_evidence.display().to_string();
+    let wrong = run(&wrong_args);
+    assert!(!wrong.status.success());
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("evidence digest does not match"), "{}", String::from_utf8_lossy(&wrong.stderr));
+    assert_eq!(column(), "off");
+    assert_eq!(denials(), 3);
+    let reserialized = serde_json::to_vec_pretty(&serde_json::from_slice::<serde_json::Value>(&document).unwrap()).unwrap();
+    assert_ne!(reserialized, document);
+    let (rewritten, _) = sign(&reserialized, "rewritten.json");
+    let mut rewritten_args = enable_args.clone();
+    rewritten_args[2] = rewritten.display().to_string();
+    let mismatched = run(&rewritten_args);
+    assert!(!mismatched.status.success());
+    assert!(String::from_utf8_lossy(&mismatched.stderr).to_ascii_lowercase().contains("signature"), "{}", String::from_utf8_lossy(&mismatched.stderr));
+    assert_eq!(column(), "off");
+    assert_eq!(denials(), 4);
+    assert!(authority::denials(&project).unwrap().iter().any(|denial| denial.class == "admission" && denial.command == "enable" && denial.reason_code == "signature_failed"));
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("UPDATE store_meta SET schema_version=29; PRAGMA user_version=29;").unwrap();
+    }
+    let old_schema = run(&enable_args);
+    assert!(!old_schema.status.success(), "{}", String::from_utf8_lossy(&old_schema.stderr));
+    assert_eq!(column(), "off");
+    assert_eq!(policy_rows(), 0);
+    assert_eq!(denials(), 5);
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let version: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+        assert_eq!(version, 29);
+        conn.execute_batch("UPDATE store_meta SET schema_version=30; PRAGMA user_version=30;").unwrap();
+    }
+    let truthy = serde_json::to_vec(&serde_json::json!({"vertical_slice": true})).unwrap();
+    let truthy_path = home.path().join("true.json");
+    fs::write(&truthy_path, &truthy).unwrap();
+    let truthy_doc = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "enabled": true,
+        "project_store": store,
+        "evidence_digest": format!("{:x}", Sha256::digest(&truthy)),
+        "authority": authority_ref,
+    })).unwrap();
+    let (truthy_policy, truthy_sig) = sign(&truthy_doc, "true-policy.json");
+    let truthy_out = run(&[
+        "--enable".into(),
+        "--policy".into(), truthy_policy.display().to_string(),
+        "--signature".into(), truthy_sig.display().to_string(),
+        "--evidence".into(), truthy_path.display().to_string(),
+    ]);
+    assert!(!truthy_out.status.success());
+    assert!(String::from_utf8_lossy(&truthy_out.stderr).contains("vertical slice evidence is not pass"), "{}", String::from_utf8_lossy(&truthy_out.stderr));
+    assert_eq!(column(), "off");
+    assert_eq!(denials(), 6);
+    let enabled = run(&enable_args);
+    assert!(enabled.status.success(), "{}", String::from_utf8_lossy(&enabled.stderr));
+    let enabled: serde_json::Value = serde_json::from_slice(&enabled.stdout).unwrap();
+    assert_eq!(enabled["factory_admission"], "on");
+    assert_eq!(enabled["replayed"], false);
+    assert_eq!(enabled["policy_digest"], format!("{:x}", Sha256::digest(&document)));
+    assert_eq!(column(), "on");
+    assert_eq!(policy_rows(), 1);
+    assert_eq!(denials(), 6);
+    let stored: Vec<u8> = rusqlite::Connection::open(&db_path).unwrap().query_row(
+        "SELECT raw_bytes FROM factory_admission_policies WHERE policy_digest=?1",
+        [enabled["policy_digest"].as_str().unwrap()],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(stored, document);
+    let replay = run(&enable_args);
+    assert!(replay.status.success(), "{}", String::from_utf8_lossy(&replay.stderr));
+    let replay: serde_json::Value = serde_json::from_slice(&replay.stdout).unwrap();
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(policy_rows(), 1);
+    assert_eq!(column(), "on");
+    assert_eq!(denials(), 6);
+    git(&["checkout", "integration"]);
+    let disable_doc = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "enabled": false,
+        "project_store": store,
+        "evidence_digest": digest,
+        "authority": authority_ref,
+    })).unwrap();
+    let (disable_policy, disable_sig) = sign(&disable_doc, "disable.json");
+    let disabled = run(&[
+        "--disable".into(),
+        "--policy".into(), disable_policy.display().to_string(),
+        "--signature".into(), disable_sig.display().to_string(),
+    ]);
+    assert!(disabled.status.success(), "{}", String::from_utf8_lossy(&disabled.stderr));
+    let disabled: serde_json::Value = serde_json::from_slice(&disabled.stdout).unwrap();
+    assert_eq!(disabled["factory_admission"], "off");
+    assert_eq!(disabled["replayed"], false);
+    assert_eq!(column(), "off");
+    assert_eq!(policy_rows(), 2);
+    let stored_disable: Vec<u8> = rusqlite::Connection::open(&db_path).unwrap().query_row(
+        "SELECT raw_bytes FROM factory_admission_policies WHERE policy_digest=?1",
+        [disabled["policy_digest"].as_str().unwrap()],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(stored_disable, disable_doc);
+    assert_eq!(denials(), 6);
 }

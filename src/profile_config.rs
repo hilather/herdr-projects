@@ -179,6 +179,43 @@ mod tests {
             assert!(!format!("{error:#}").contains("PRIVATE"));
         }
     }
+
+    #[test]
+    fn profile_file_with_model_still_errors() {
+        let profile: ProfileDefinition = toml::from_str(
+            "kind='codex'\npermission_policy='interactive'\nmodel='gpt-5.1'\nreasoning_effort='high'\nenvironment=['HOME']\n[budget]\nmax_wall_seconds=10\nunknown_usage='allow_with_warning'\n",
+        )
+        .unwrap();
+        let error = profile.validate_gated_preparation(1).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("unsupported model"));
+        assert!(!text.contains("gpt-5.1"));
+        assert!(!text.contains("high"));
+        assert!(!text.contains("HOME"));
+    }
+
+    #[test]
+    fn unknown_usage_refuses_missing_usage_as_zero() {
+        let blocked: ProfileDefinition = toml::from_str(
+            "kind='codex'\npermission_policy='interactive'\n[budget]\nmax_wall_seconds=10\nunknown_usage='block'\n",
+        )
+        .unwrap();
+        let budget = blocked.budget.as_ref().unwrap();
+        assert!(budget.soft_input_tokens.is_none());
+        assert!(budget.soft_output_tokens.is_none());
+        assert_ne!(blocked.input_budget_chars().unwrap(), 0);
+        assert!(blocked.validate_gated_preparation(1).is_err());
+        assert!(toml::from_str::<ProfileDefinition>(
+            "kind='codex'\npermission_policy='interactive'\n[budget]\nmax_wall_seconds=10\nsoft_input_tokens=5\n"
+        )
+        .is_err());
+        let zero: ProfileDefinition = toml::from_str(
+            "kind='codex'\npermission_policy='interactive'\n[budget]\nmax_wall_seconds=10\nsoft_input_tokens=0\nunknown_usage='allow_with_warning'\n",
+        )
+        .unwrap();
+        assert_eq!(zero.budget.as_ref().unwrap().soft_input_tokens, Some(0));
+        assert!(zero.validate().is_err());
+    }
 }
 
 /// Parse only observed version formats; this does not establish capability support.

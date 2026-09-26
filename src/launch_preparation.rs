@@ -1,5 +1,5 @@
 //! Trusted launch draft/reservation ingress. Selectors are data, never authority.
-use crate::{domain::*, profile_preparation::RevalidatedProfile, runner::{Cancellation, Cmd}, store::controlled::ControlledStore};
+use crate::{domain::*, profile_preparation::RevalidatedProfile, runner::Cancellation, store::controlled::ControlledStore};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, path::{Path, PathBuf}, time::{Duration, Instant}};
@@ -32,17 +32,7 @@ fn pending_approval() -> VersionedReference {
 }
 
 fn git(proof: &RevalidatedProfile, path: &Path, args: &[&str]) -> Result<crate::runner::Output> {
-    let mut command = Cmd::new("/usr/bin/git", Duration::from_secs(5))
-        .args(["--no-pager", "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"])
-        .args(args.iter().copied());
-    command.cwd = Some(path.to_str().context("repository path is not UTF-8")?.into());
-    command.env_clear = true;
-    command.env = [
-        ("PATH", "/usr/bin:/bin"), ("LANG", "C"), ("LC_ALL", "C"),
-        ("GIT_CONFIG_NOSYSTEM", "1"), ("GIT_CONFIG_GLOBAL", "/dev/null"),
-        ("GIT_TERMINAL_PROMPT", "0"), ("GIT_NO_LAZY_FETCH", "1"), ("GIT_NO_REPLACE_OBJECTS", "1"),
-    ].into_iter().map(|(k,v)|(k.into(),v.into())).collect();
-    command.capture_limit = 8192;
+    let command = crate::runner::Cmd::repository_git_command(path, args)?;
     let output = crate::supervision::run(command, proof.deadline(), proof.cancellation(), &proof.inherit()?)?;
     ensure!(!output.stdout_truncated && !output.stderr_truncated, "repository observation exceeded output bounds");
     Ok(output)
@@ -108,6 +98,50 @@ fn inputs(
         profile: proof.reference().clone(), config: profile.config.clone(), effective_profile: Some(profile),
         approval, repositories, dependencies: Vec::new(), memory: Some(selection.knowledge.clone()),
         budget: state.budget_policies.last().map(BudgetPolicy::reference).transpose().map_err(anyhow::Error::msg)?,
+    })
+}
+
+/// Inputs for one automatic reservation. The approval reference is filled by the
+/// caller after an installed grant matches; this does not launch or reserve.
+pub(crate) fn seal_admission_inputs(
+    project_store: &str,
+    task: &Task,
+    binding: &RuntimeBinding,
+    scheduler_revision: u64,
+    control_epoch: u64,
+    profile: &FrozenProfile,
+    approval: VersionedReference,
+    dependencies: Vec<DependencyInput>,
+    repositories: Vec<RepositoryInput>,
+    budget: Option<VersionedReference>,
+) -> Result<LaunchInputs, String> {
+    if !binding.identity.pane_id.is_empty()
+        || !binding.identity.tab_id.is_empty()
+        || !binding.identity.machine.is_empty()
+        || !binding.identity.worktree_path.is_empty()
+        || binding.task.as_ref() != Some(&task.id)
+    {
+        return Err("new launch requires an unused local binding".into());
+    }
+    Ok(LaunchInputs {
+        version: 2,
+        project_store: project_store.into(),
+        task: task.id.clone(),
+        task_revision: task.revision,
+        scheduler_revision,
+        control_epoch,
+        binding: binding.id.clone(),
+        binding_revision: binding.revision,
+        binding_digest: crate::store::ownership::identity_digest(binding).map_err(|e| e.to_string())?,
+        profile: profile.reference()?,
+        config: profile.config.clone(),
+        effective_profile: Some(profile.clone()),
+        approval,
+        repositories,
+        dependencies,
+        // A store that already has memory records stays unreserved; this wake does not mint a snapshot.
+        memory: None,
+        budget,
     })
 }
 

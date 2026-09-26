@@ -1,9 +1,9 @@
 //! Additive per-file publication with an exact durable recovery stage.
 use super::*;
 use crate::{project,thread};
-use herdr_projects::{execution_guard::ProjectGuard,live_copy_intent::LiveCopyIntent};
+use herdr_projects::{execution_guard::{ProjectEffect,ProjectGuard},live_copy_intent::LiveCopyIntent};
 
-fn eligible(project:&Project,guard:&ProjectGuard,t:&Thread)->Result<()> {
+fn eligible(project:&Project,guard:&dyn ProjectEffect,t:&Thread)->Result<()> {
     thread::validate_id(&t.id)?;
     guard.check_project(&project.dir())?;project::ensure_legacy(&project.dir())?;
     ensure!(project.try_status()?==project::Status::Active,"live projection requires an active project");
@@ -37,19 +37,19 @@ impl LiveCopy {
     /// Caller has verified supervised sender success and supplies the frozen
     /// authority digest plus a current configuration/routing validation closure.
     #[allow(dead_code)]
-    pub fn publish(self,project:&Project,guard:&ProjectGuard,expected:&Thread,authority:&str,authorize:impl FnMut()->Result<()>)->Result<()> {
+    pub fn publish(self,project:&Project,guard:&dyn ProjectEffect,expected:&Thread,authority:&str,authorize:impl FnMut()->Result<()>)->Result<()> {
         self.publish_controlled(project,guard,expected,authority,&Control::default(),authorize)
     }
     #[allow(dead_code)]
-    pub fn publish_controlled(self,project:&Project,guard:&ProjectGuard,expected:&Thread,authority:&str,control:&Control,mut authorize:impl FnMut()->Result<()>)->Result<()> {
+    pub fn publish_controlled(self,project:&Project,guard:&dyn ProjectEffect,expected:&Thread,authority:&str,control:&Control,mut authorize:impl FnMut()->Result<()>)->Result<()> {
         self.begin_controlled(project,guard,expected,authority,control,&mut authorize)?;
         resume_controlled(project,guard,&expected.id,authority,control,authorize)
     }
     #[cfg(test)]
-    fn begin(self,project:&Project,guard:&ProjectGuard,expected:&Thread,authority:&str,authorize:&mut impl FnMut()->Result<()>)->Result<()> {
+    fn begin(self,project:&Project,guard:&dyn ProjectEffect,expected:&Thread,authority:&str,authorize:&mut impl FnMut()->Result<()>)->Result<()> {
         self.begin_controlled(project,guard,expected,authority,&Control::default(),authorize)
     }
-    fn begin_controlled(self,project:&Project,guard:&ProjectGuard,expected:&Thread,authority:&str,control:&Control,authorize:&mut impl FnMut()->Result<()>)->Result<()> {
+    fn begin_controlled(self,project:&Project,guard:&dyn ProjectEffect,expected:&Thread,authority:&str,control:&Control,authorize:&mut impl FnMut()->Result<()>)->Result<()> {
         control.check()?;
         eligible(project,guard,expected)?;thread::copy_delivery::ready(expected)?;authorize()?;
         ensure!(self.staging.0.parent()==Some(project.state_dir().join("live-copies").as_path()),"live stage belongs to a different project");
@@ -74,7 +74,7 @@ impl LiveCopy {
         File::open(project.dir().join("threads"))?.sync_all()?;Ok(())
     }
 }
-fn check(project:&Project,guard:&ProjectGuard,id:&str,intent:&LiveCopyIntent,authority:&str)->Result<Thread> {
+fn check(project:&Project,guard:&dyn ProjectEffect,id:&str,intent:&LiveCopyIntent,authority:&str)->Result<Thread> {
     let t=thread::load(project,id)?;eligible(project,guard,&t)?;
     ensure!(t.pending_live_copy.as_ref()==Some(intent)&&thread::execution_fingerprint(&t)==intent.execution
         &&t.report_hash==intent.previous_hash&&t.copy_receipt==intent.previous_receipt&&authority==intent.authority,"live projection authority or execution changed; recovery refused");
@@ -89,18 +89,18 @@ pub(super) fn parent(root:&Directory,path:&Path,control:&Control)->Result<Direct
     Ok(current)
 }
 #[allow(dead_code)]
-pub fn resume(project:&Project,guard:&ProjectGuard,id:&str,authority:&str,authorize:impl FnMut()->Result<()>)->Result<()> {
+pub fn resume(project:&Project,guard:&dyn ProjectEffect,id:&str,authority:&str,authorize:impl FnMut()->Result<()>)->Result<()> {
     resume_controlled(project,guard,id,authority,&Control::default(),authorize)
 }
 #[allow(dead_code)]
-pub fn resume_controlled(project:&Project,guard:&ProjectGuard,id:&str,authority:&str,control:&Control,mut authorize:impl FnMut()->Result<()>)->Result<()> {
+pub fn resume_controlled(project:&Project,guard:&dyn ProjectEffect,id:&str,authority:&str,control:&Control,mut authorize:impl FnMut()->Result<()>)->Result<()> {
     resume_with_control(project,guard,id,authority,control,&mut authorize,||Ok(()))
 }
 #[cfg(test)]
-fn resume_with(project:&Project,guard:&ProjectGuard,id:&str,authority:&str,authorize:&mut impl FnMut()->Result<()>,after_file:impl FnMut()->Result<()>)->Result<()> {
+fn resume_with(project:&Project,guard:&dyn ProjectEffect,id:&str,authority:&str,authorize:&mut impl FnMut()->Result<()>,after_file:impl FnMut()->Result<()>)->Result<()> {
     resume_with_control(project,guard,id,authority,&Control::default(),authorize,after_file)
 }
-fn resume_with_control(project:&Project,guard:&ProjectGuard,id:&str,authority:&str,control:&Control,authorize:&mut impl FnMut()->Result<()>,mut after_file:impl FnMut()->Result<()>)->Result<()> {
+fn resume_with_control(project:&Project,guard:&dyn ProjectEffect,id:&str,authority:&str,control:&Control,authorize:&mut impl FnMut()->Result<()>,mut after_file:impl FnMut()->Result<()>)->Result<()> {
     control.check()?;
     let t=thread::load(project,id)?;let intent=t.pending_live_copy.clone().context("no pending live projection")?;
     check(project,guard,id,&intent,authority)?;authorize()?;
