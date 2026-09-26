@@ -409,6 +409,8 @@ pub use feedback::{claim_feedback, show_feedback};
 
 mod satisfaction;
 mod admission_policy;
+#[cfg(test)]
+pub(crate) use satisfaction::{claims_conflict, ResourceClaim};
 
 mod plans;
 pub use plans::{PlanProposalReceipt, propose_plan};

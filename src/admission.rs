@@ -43,67 +43,6 @@ struct Candidate {
     blocker: Option<&'static str>,
 }
 
-struct Claim {
-    kind: String,
-    resource: String,
-    access: String,
-    certainty: String,
-}
-
-fn claim_row(row: (String, String, String, String)) -> Claim {
-    Claim { kind: row.0, resource: row.1, access: row.2, certainty: row.3 }
-}
-
-fn split_claim_path(path: &str) -> (bool, Vec<&str>) {
-    let directory = path.ends_with('/');
-    let trimmed = path.trim_end_matches('/');
-    (directory, trimmed.split('/').filter(|part| !part.is_empty()).collect())
-}
-
-fn glob_segment(segment: &str) -> bool {
-    segment.contains('*') || segment.contains('?') || segment.contains('[')
-}
-
-/// Exact files compare literally. A glob or directory prefix overlaps unless a
-/// concrete segment proves the paths are in different directories.
-fn paths_could_overlap(left: &str, right: &str) -> bool {
-    let (left_dir, left_segs) = split_claim_path(left);
-    let (right_dir, right_segs) = split_claim_path(right);
-    if left_segs.is_empty() || right_segs.is_empty() {
-        return true;
-    }
-    let shared = left_segs.len().min(right_segs.len());
-    for index in 0..shared {
-        let (left_part, right_part) = (left_segs[index], right_segs[index]);
-        if left_part.contains("**") || right_part.contains("**") {
-            return true;
-        }
-        if left_part != right_part && !glob_segment(left_part) && !glob_segment(right_part) {
-            return false;
-        }
-    }
-    if left_segs.len() == right_segs.len() {
-        return true;
-    }
-    if left_segs.len() < right_segs.len() { left_dir } else { right_dir }
-}
-
-fn claims_conflict(left: &Claim, right: &Claim) -> bool {
-    if left.kind != right.kind {
-        return false;
-    }
-    if left.kind == "named" {
-        return left.resource == right.resource && (left.access == "write" || right.access == "write");
-    }
-    if left.kind != "path" {
-        return true;
-    }
-    if left.certainty == "exact" && right.certainty == "exact" {
-        return left.resource == right.resource && (left.access == "write" || right.access == "write");
-    }
-    paths_could_overlap(&left.resource, &right.resource)
-}
-
 fn unused_binding(state: &Snapshot, task: &TaskId) -> Option<RuntimeBinding> {
     state.runtime_bindings.iter().find(|binding| {
         binding.task.as_ref() == Some(task)
@@ -117,16 +56,6 @@ fn unused_binding(state: &Snapshot, task: &TaskId) -> Option<RuntimeBinding> {
     }).cloned()
 }
 
-fn held_claims(db: &SqliteStore, state: &Snapshot) -> Result<Vec<(TaskId, Claim)>> {
-    let mut held = Vec::new();
-    for attempt in state.attempts.iter().filter(|attempt| attempt.retains_capacity()) {
-        for row in db.resource_claims_for(attempt.task.as_str())? {
-            held.push((attempt.task.clone(), claim_row(row)));
-        }
-    }
-    Ok(held)
-}
-
 fn rank_candidates(db: &mut SqliteStore, state: &Snapshot, now: i64) -> Result<Vec<Candidate>> {
     let scheduler = state.scheduler.as_ref().context("scheduler missing")?;
     let control = state.control.as_ref().context("project control missing")?;
@@ -137,10 +66,9 @@ fn rank_candidates(db: &mut SqliteStore, state: &Snapshot, now: i64) -> Result<V
     if retained >= scheduler.policy.max_active_workers as usize {
         return Ok(Vec::new());
     }
-    // Consult claims only while admission is on. The hold is the attempt, and
-    // it lasts until termination_observed. Cancel does not clear it.
+    // Consult claims only while admission is on. A retaining attempt keeps the
+    // revision from its reservation until termination_observed. Cancel does not clear it.
     let admission_on = db.factory_admission_enabled()?;
-    let held = if admission_on { held_claims(db, state)? } else { Vec::new() };
     let mut ranked = Vec::new();
     for record in &scheduler.queue {
         let Some(task) = state.tasks.iter().find(|task| task.id == record.task && task.state == TaskState::Queued && task.active_attempt.is_none()) else { continue };
@@ -158,13 +86,8 @@ fn rank_candidates(db: &mut SqliteStore, state: &Snapshot, now: i64) -> Result<V
             evidence: VersionedReference { id: edge.satisfaction_id.clone(), revision: 1, digest: edge.satisfaction_id },
         }).collect::<Vec<_>>();
         let score = (now - record.enqueued_unix_ms) / 60_000 + i64::from(record.priority);
-        let blocker = if admission_on {
-            let claims = db.resource_claims_for(task.id.as_str())?.into_iter().map(claim_row).collect::<Vec<_>>();
-            if claims.iter().any(|claim| held.iter().any(|(holder, held_claim)| holder != &task.id && claims_conflict(claim, held_claim))) {
-                Some("resource_conflict")
-            } else {
-                None
-            }
+        let blocker = if admission_on && db.retained_claim_overlap(task.id.as_str())? {
+            Some("resource_conflict")
         } else {
             None
         };
@@ -288,24 +211,24 @@ mod tests {
     use super::*;
     use crate::store::SqliteStore;
 
-    fn claim(kind: &str, resource: &str, access: &str, certainty: &str) -> Claim {
-        Claim { kind: kind.into(), resource: resource.into(), access: access.into(), certainty: certainty.into() }
+    fn claim(kind: &str, resource: &str, access: &str, certainty: &str) -> crate::store::ResourceClaim {
+        crate::store::ResourceClaim { kind: kind.into(), resource: resource.into(), access: access.into(), certainty: certainty.into() }
     }
 
     #[test]
     fn overlap_rules_block_exclusive_writes_named_resources_and_uncertain_paths() {
         let read = claim("path", "README.md", "read", "exact");
         let write = claim("path", "README.md", "write", "exact");
-        assert!(!claims_conflict(&read, &read));
-        assert!(claims_conflict(&write, &read));
-        assert!(!claims_conflict(&claim("path", "src/a.rs", "write", "exact"), &claim("path", "src/b.rs", "write", "exact")));
-        assert!(claims_conflict(&claim("path", "migrations/", "read", "uncertain"), &claim("path", "migrations/0035_resource_claims.sql", "read", "exact")));
-        assert!(claims_conflict(&claim("path", "src/*.rs", "read", "uncertain"), &claim("path", "src/lib.rs", "read", "exact")));
-        assert!(!claims_conflict(&claim("path", "src/*.rs", "read", "uncertain"), &claim("path", "docs/lib.rs", "read", "exact")));
-        assert!(claims_conflict(&claim("named", "schema", "write", "exact"), &claim("named", "schema", "read", "exact")));
-        assert!(!claims_conflict(&claim("named", "schema", "read", "exact"), &claim("named", "schema", "read", "exact")));
-        assert!(!claims_conflict(&claim("named", "schema", "write", "exact"), &claim("named", "lockfile", "write", "exact")));
-        assert!(!claims_conflict(&claim("path", "migrations/", "write", "uncertain"), &claim("named", "schema", "write", "exact")));
+        assert!(!crate::store::claims_conflict(&read, &read));
+        assert!(crate::store::claims_conflict(&write, &read));
+        assert!(!crate::store::claims_conflict(&claim("path", "src/a.rs", "write", "exact"), &claim("path", "src/b.rs", "write", "exact")));
+        assert!(crate::store::claims_conflict(&claim("path", "migrations/", "read", "uncertain"), &claim("path", "migrations/0035_resource_claims.sql", "read", "exact")));
+        assert!(crate::store::claims_conflict(&claim("path", "src/*.rs", "read", "uncertain"), &claim("path", "src/lib.rs", "read", "exact")));
+        assert!(!crate::store::claims_conflict(&claim("path", "src/*.rs", "read", "uncertain"), &claim("path", "docs/lib.rs", "read", "exact")));
+        assert!(crate::store::claims_conflict(&claim("named", "schema", "write", "exact"), &claim("named", "schema", "read", "exact")));
+        assert!(!crate::store::claims_conflict(&claim("named", "schema", "read", "exact"), &claim("named", "schema", "read", "exact")));
+        assert!(!crate::store::claims_conflict(&claim("named", "schema", "write", "exact"), &claim("named", "lockfile", "write", "exact")));
+        assert!(!crate::store::claims_conflict(&claim("path", "migrations/", "write", "uncertain"), &claim("named", "schema", "write", "exact")));
     }
 
     fn user_version(path: &Path) -> u32 {
@@ -512,6 +435,82 @@ mod tests {
         assert_eq!(attempt_tasks(&project), vec!["early".to_string(), "other".to_string()]);
         assert!(grant_and_admit(&project).is_none());
         assert_eq!(attempt_tasks(&project), vec!["early".to_string(), "other".to_string()]);
+    }
+
+    fn install_empty_revision(project: &Path, task: &str) {
+        let db_path = project.join(".state/state.db");
+        let (repository, base): (String, String) = {
+            let raw = rusqlite::Connection::open(&db_path).unwrap();
+            raw.query_row(
+                "SELECT repository, base_oid FROM task_contracts WHERE task_id=?1 AND contract_revision=1",
+                [task],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap()
+        };
+        let mut db = SqliteStore::open(&db_path).unwrap();
+        let head = db.read_snapshot(None).unwrap().head;
+        let store = std::fs::canonicalize(&db_path).unwrap().display().to_string();
+        let mut bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "project_store": store,
+            "expected_head": head,
+            "task_id": task,
+            "contract_revision": 2,
+            "deliverable": "cleared scope",
+            "non_goals": "no launch",
+            "acceptance_policies": [{"id": "builds", "text": "tests pass"}],
+            "repository": repository,
+            "base_oid": base,
+            "object_format": "sha1",
+            "dependencies": [],
+            "capability_flags": [],
+            "profile_kind": "codex",
+            "retry_class": "none",
+            "result_schema_id": "result-v1",
+            "route": "verify_only",
+            "authority": {"id": "owner-approval-policy", "revision": 1, "digest": "ab".repeat(32)}
+        })).unwrap();
+        bytes.push(b'\n');
+        db.install_contract(&PreparedContract::parse_verified(&bytes).unwrap()).unwrap();
+    }
+
+    fn force_reserve(project: &Path, task: &str) -> Result<(), String> {
+        let candidate = readiness_now(project).unwrap().into_iter().find(|candidate| candidate.task.id.as_str() == task).unwrap();
+        let mut db = open_store(project).unwrap();
+        let state = db.read_snapshot(None).unwrap();
+        let profiles = db.admission_profiles().unwrap();
+        let control = state.control.clone().unwrap();
+        let profile = binding_profiles(&profiles, &control, &candidate.binding).into_iter().next().unwrap();
+        let store = store_file(project).unwrap();
+        let store = store.to_str().unwrap().to_string();
+        let mut inputs = seal(&store, &state, &candidate, profile, placeholder_approval()).unwrap();
+        let now = jiff::Timestamp::now().as_millisecond();
+        let grant = ApprovalGrant {
+            version: 1,
+            scope: ApprovalScope::for_launch(&inputs).unwrap(),
+            policy: inputs.effective_profile.clone().unwrap().permission_policy,
+            issued_unix_ms: 0,
+            expires_unix_ms: now + 3_600_000,
+        };
+        let head = db.read_snapshot(None).unwrap().head;
+        inputs.approval = db.install_approval(&PreparedApproval { grant }, head, now).unwrap();
+        let head = db.read_snapshot(None).unwrap().head;
+        db.reserve_prepared(&[PreparedLaunch { inputs }], head, now).map(|_| ()).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn later_empty_contract_does_not_drop_the_reserved_claim() {
+        let (_root, project) = world(2, &[
+            Spec { id: "early", priority: 0, age_ms: 120 * 60_000, paths: &[("migrations/", "write")], named: &[] },
+            Spec { id: "late", priority: 20, age_ms: 0, paths: &[("migrations/0035_resource_claims.sql", "write")], named: &[] },
+        ]);
+        assert_eq!(grant_and_admit(&project).as_deref(), Some("early"));
+        install_empty_revision(&project, "early");
+        let ranked = blockers(&project);
+        assert_eq!(ranked.iter().find(|(task, _, _)| task == "late").unwrap().2, Some("resource_conflict"));
+        let error = force_reserve(&project, "late").unwrap_err();
+        assert!(error.contains("resource_conflict"), "{error}");
+        assert_eq!(attempt_tasks(&project), vec!["early".to_string()]);
     }
 
     #[test]

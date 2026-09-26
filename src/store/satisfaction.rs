@@ -643,30 +643,132 @@ impl SqliteStore {
         Ok(Some(pins))
     }
 
-    /// Latest contract revision only. Empty when this store has no claim table.
-    pub(crate) fn resource_claims_for(&self, task_id: &str) -> Result<Vec<(String, String, String, String)>> {
-        let version: u32 = self.connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version < 35 {
-            return Ok(Vec::new());
-        }
-        let revision: Option<i64> = self.connection.query_row(
-            "SELECT MAX(contract_revision) FROM task_contracts WHERE task_id=?1",
-            [task_id],
-            |row| row.get(0),
-        )?;
-        let Some(revision) = revision else {
-            return Ok(Vec::new());
-        };
-        let mut stmt = self.connection.prepare(
-            "SELECT kind, resource, access, certainty FROM resource_claims WHERE task_id=?1 AND contract_revision=?2 ORDER BY ordinal",
-        )?;
-        let rows = stmt
-            .query_map(rusqlite::params![task_id, revision], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+    /// True when this task's latest contract overlaps a claim still held by
+    /// another attempt. The holder keeps the revision installed at its reservation.
+    pub(crate) fn retained_claim_overlap(&self, task_id: &str) -> Result<bool> {
+        let attempts = super::read_attempts(&self.connection)?;
+        overlap_with_retained(&self.connection, task_id, &attempts)
     }
+}
+
+pub(crate) struct ResourceClaim {
+    pub kind: String,
+    pub resource: String,
+    pub access: String,
+    pub certainty: String,
+}
+
+pub(crate) fn claims_conflict(left: &ResourceClaim, right: &ResourceClaim) -> bool {
+    if left.kind != right.kind {
+        return false;
+    }
+    if left.kind == "named" {
+        return left.resource == right.resource && (left.access == "write" || right.access == "write");
+    }
+    if left.kind != "path" {
+        return true;
+    }
+    if left.certainty == "exact" && right.certainty == "exact" {
+        return left.resource == right.resource && (left.access == "write" || right.access == "write");
+    }
+    paths_could_overlap(&left.resource, &right.resource)
+}
+
+fn paths_could_overlap(left: &str, right: &str) -> bool {
+    let (left_dir, left_segs) = split_claim_path(left);
+    let (right_dir, right_segs) = split_claim_path(right);
+    if left_segs.is_empty() || right_segs.is_empty() {
+        return true;
+    }
+    let shared = left_segs.len().min(right_segs.len());
+    for index in 0..shared {
+        let (left_part, right_part) = (left_segs[index], right_segs[index]);
+        // `**` can cover the rest of either path.
+        if left_part.contains("**") || right_part.contains("**") {
+            return true;
+        }
+        if left_part != right_part && !glob_segment(left_part) && !glob_segment(right_part) {
+            return false;
+        }
+    }
+    if left_segs.len() == right_segs.len() {
+        return true;
+    }
+    if left_segs.len() < right_segs.len() { left_dir } else { right_dir }
+}
+
+fn split_claim_path(path: &str) -> (bool, Vec<&str>) {
+    let directory = path.ends_with('/');
+    let trimmed = path.trim_end_matches('/');
+    (directory, trimmed.split('/').filter(|part| !part.is_empty()).collect())
+}
+
+fn glob_segment(segment: &str) -> bool {
+    segment.contains('*') || segment.contains('?') || segment.contains('[')
+}
+
+fn claim_rows(db: &Connection, task_id: &str, revision: i64) -> Result<Vec<ResourceClaim>> {
+    let mut stmt = db.prepare(
+        "SELECT kind, resource, access, certainty FROM resource_claims WHERE task_id=?1 AND contract_revision=?2 ORDER BY ordinal",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![task_id, revision], |row| {
+            Ok(ResourceClaim { kind: row.get(0)?, resource: row.get(1)?, access: row.get(2)?, certainty: row.get(3)? })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn latest_contract_revision(db: &Connection, task_id: &str) -> Result<Option<i64>> {
+    Ok(db.query_row(
+        "SELECT MAX(contract_revision) FROM task_contracts WHERE task_id=?1",
+        [task_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// Revision already installed when this attempt was reserved. A later put does not move it.
+fn revision_at_reservation(db: &Connection, attempt_id: &str, task_id: &str) -> Result<Option<i64>> {
+    let reserved: Option<i64> = db.query_row(
+        "SELECT MIN(sequence) FROM events WHERE kind='attempt.reserved' AND entity=?1",
+        [attempt_id],
+        |row| row.get(0),
+    )?;
+    let Some(reserved) = reserved else {
+        return Ok(None);
+    };
+    Ok(db.query_row(
+        "SELECT MAX(contract_revision) FROM task_contracts WHERE task_id=?1 AND installed_seq<=?2",
+        rusqlite::params![task_id, reserved],
+        |row| row.get(0),
+    )?)
+}
+
+pub(super) fn overlap_with_retained(db: &Connection, task_id: &str, attempts: &[Attempt]) -> Result<bool> {
+    let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < 35 {
+        return Ok(false);
+    }
+    let Some(revision) = latest_contract_revision(db, task_id)? else {
+        return Ok(false);
+    };
+    let candidate = claim_rows(db, task_id, revision)?;
+    if candidate.is_empty() {
+        return Ok(false);
+    }
+    for attempt in attempts {
+        if !attempt.retains_capacity() || attempt.task.as_str() == task_id {
+            continue;
+        }
+        let Some(held_revision) = revision_at_reservation(db, attempt.id.as_str(), attempt.task.as_str())? else {
+            continue;
+        };
+        let held = claim_rows(db, attempt.task.as_str(), held_revision)?;
+        if candidate.iter().any(|claim| held.iter().any(|other| claims_conflict(claim, other))) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn git_tree(repository: &str, commit: &str) -> Option<String> {

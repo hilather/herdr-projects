@@ -119,7 +119,13 @@ impl SqliteStore {
             let score=(now-queue.enqueued_unix_ms)/60_000+queue.priority as i64;ranked.push((score,queue.enqueue_sequence,&preparation.inputs));
         }
         if draft {return Ok(None);}
-        ranked.sort_by(|a,b|b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.task.cmp(&b.2.task)));let inputs=ranked[0].2.clone();let(attempt_id,operation_id)=record_ids(&inputs)?;
+        ranked.sort_by(|a,b|b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.task.cmp(&b.2.task)));let inputs=ranked[0].2.clone();
+        // Same overlap the ranker uses. A direct reserve cannot skip it, and the
+        // holder stays on the revision current when that attempt was reserved.
+        if admission_on && super::satisfaction::overlap_with_retained(&tx, inputs.task.as_str(), &attempts)? {
+            return Err(invalid("resource_conflict"));
+        }
+        let(attempt_id,operation_id)=record_ids(&inputs)?;
         let task_revision=inputs.task_revision.checked_add(1).ok_or_else(||invalid("task revision exhausted"))?;
         let mut task=tasks.iter().find(|t|t.id==inputs.task).cloned().ok_or(StoreError::Conflict)?;task.revision=task_revision;task.state=TaskState::Running;task.active_attempt=Some(attempt_id.clone());
         let record=AttemptInputRecord{attempt:attempt_id.clone(),operation:operation_id.clone(),inputs};let payload=serde_json::to_string(&record).map_err(|e|invalid(&e.to_string()))?;if payload.len()>MAX_RECORD_BYTES{return Err(invalid("attempt inputs exceed 1 MiB"));}
