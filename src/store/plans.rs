@@ -446,7 +446,10 @@ fn decision_from_row(
     }
 }
 
-/// Claim and ack in this transaction. Ack names the replan proposal and does not reserve.
+const REPLAN_OWNER: &str = "replan-controller";
+
+/// Ack the current lease. An unexpired claim held by someone else conflicts.
+/// An expired lease is marked expired so the next epoch can ack.
 fn ack_replan_proposal(
     tx: &Connection,
     feedback_id: &str,
@@ -469,26 +472,47 @@ fn ack_replan_proposal(
         }
         return Err(StoreError::Conflict);
     }
-    if state != "open" {
+    if state != "open" && state != "claimed" {
         return Err(StoreError::Conflict);
     }
-    let until = now
-        .checked_add(60_000)
-        .ok_or_else(|| invalid("lease exceeds clock range"))?;
-    tx.execute(
-        "INSERT INTO feedback_claims(feedback_id,claim_epoch,owner,lease_until_ms,state,claimed_unix_ms) VALUES(?1,1,'replan-controller',?2,'active',?3)",
-        params![feedback_id, until, now],
-    )?;
-    let claimed = tx.execute(
-        "UPDATE feedback_items SET state='claimed' WHERE feedback_id=?1 AND state='open' AND replan_proposal_id IS NULL",
-        [feedback_id],
-    )?;
-    if claimed != 1 {
-        return Err(StoreError::Conflict);
+    let active: Option<(i64, String, i64)> = tx
+        .query_row(
+            "SELECT claim_epoch, owner, lease_until_ms FROM feedback_claims WHERE feedback_id=?1 AND state='active'",
+            [feedback_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let epoch = if let Some((epoch, held_by, lease_until)) = active {
+        if now < lease_until {
+            if held_by != REPLAN_OWNER {
+                return Err(StoreError::Conflict);
+            }
+            epoch
+        } else {
+            let expired = tx.execute(
+                "UPDATE feedback_claims SET state='expired' WHERE feedback_id=?1 AND claim_epoch=?2 AND state='active'",
+                params![feedback_id, epoch],
+            )?;
+            if expired != 1 {
+                return Err(StoreError::Conflict);
+            }
+            insert_replan_claim(tx, feedback_id, now)?
+        }
+    } else {
+        insert_replan_claim(tx, feedback_id, now)?
+    };
+    if state == "open" {
+        let claimed = tx.execute(
+            "UPDATE feedback_items SET state='claimed' WHERE feedback_id=?1 AND state='open' AND replan_proposal_id IS NULL",
+            [feedback_id],
+        )?;
+        if claimed != 1 {
+            return Err(StoreError::Conflict);
+        }
     }
     let acked_claim = tx.execute(
-        "UPDATE feedback_claims SET state='acked' WHERE feedback_id=?1 AND claim_epoch=1 AND state='active'",
-        [feedback_id],
+        "UPDATE feedback_claims SET state='acked' WHERE feedback_id=?1 AND claim_epoch=?2 AND state='active'",
+        params![feedback_id, epoch],
     )?;
     if acked_claim != 1 {
         return Err(StoreError::Conflict);
@@ -501,6 +525,22 @@ fn ack_replan_proposal(
         return Err(StoreError::Conflict);
     }
     Ok(())
+}
+
+fn insert_replan_claim(tx: &Connection, feedback_id: &str, now: i64) -> Result<i64> {
+    let next: i64 = tx.query_row(
+        "SELECT coalesce(max(claim_epoch), 0) + 1 FROM feedback_claims WHERE feedback_id=?1",
+        [feedback_id],
+        |row| row.get(0),
+    )?;
+    let until = now
+        .checked_add(60_000)
+        .ok_or_else(|| invalid("lease exceeds clock range"))?;
+    tx.execute(
+        "INSERT INTO feedback_claims(feedback_id,claim_epoch,owner,lease_until_ms,state,claimed_unix_ms) VALUES(?1,?2,?3,?4,'active',?5)",
+        params![feedback_id, next, REPLAN_OWNER, until, now],
+    )?;
+    Ok(next)
 }
 
 fn insert_escalation_inbox(
@@ -841,7 +881,9 @@ impl SqliteStore {
         })
     }
 
-    /// Acceptance failure mints a new attempt. A changed contract is a new revision.
+    /// Acceptance failure counts against the attempt cap. The row is already
+    /// terminated, so it does not keep a live reservation without inputs.
+    /// A changed contract must already be installed; this does not write one.
     /// The previous verification run is left as stored.
     pub fn rework_acceptance(
         &mut self,
@@ -861,25 +903,19 @@ impl SqliteStore {
         if feedback.category != "verifier_rejection" {
             return Err(invalid("acceptance rework requires verifier feedback"));
         }
+        let contract_revision = if contract_changed {
+            Some(installed_rework_revision(&tx, &feedback.task_id)?)
+        } else {
+            None
+        };
         let attempt_id = format!("rework-{}", &feedback_id[..32]);
         let existing: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM attempts WHERE id=?1 AND task_id=?2)",
             params![attempt_id, feedback.task_id],
             |row| row.get(0),
         )?;
-        let contract_bytes = format!("rework\0{feedback_id}");
-        let contract_digest = sha256_hex(contract_bytes.as_bytes());
         if existing {
             let (attempts_consumed, _) = attempt_budget(&tx, &feedback.task_id)?;
-            let contract_revision = if contract_changed {
-                Some(contract_revision_for_digest(
-                    &tx,
-                    &feedback.task_id,
-                    &contract_digest,
-                )?)
-            } else {
-                None
-            };
             tx.commit()?;
             return Ok(AcceptanceRework {
                 attempt_id,
@@ -887,41 +923,27 @@ impl SqliteStore {
                 contract_revision,
             });
         }
-        if contract_changed {
-            let has_contract: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM task_contracts WHERE task_id=?1)",
-                [&feedback.task_id],
-                |row| row.get(0),
-            )?;
-            if !has_contract {
-                return Err(invalid("acceptance rework has no contract revision"));
-            }
-        }
         let (consumed, limit) = attempt_budget(&tx, &feedback.task_id)?;
         if consumed >= limit {
             return Err(invalid("task attempt limit reached"));
         }
+        // Terminated on insert: cancel has nothing to release, and the row still counts.
         tx.execute(
-            "INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) VALUES(?1,?2,1,'reserved',NULL,?3,0)",
+            "INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) VALUES(?1,?2,1,'failed',NULL,?3,1)",
             params![attempt_id, feedback.task_id, format!("rework:{attempt_id}")],
         )?;
         tx.execute(
             "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('attempt.rework',?1,1,1,?2)",
             params![
                 attempt_id,
-                serde_json::json!({"task_id": feedback.task_id, "feedback_id": feedback_id}).to_string()
+                serde_json::json!({
+                    "task_id": feedback.task_id,
+                    "feedback_id": feedback_id,
+                    "contract_revision": contract_revision,
+                })
+                .to_string()
             ],
         )?;
-        let contract_revision = if contract_changed {
-            Some(insert_rework_contract(
-                &tx,
-                &feedback.task_id,
-                &contract_bytes,
-                &contract_digest,
-            )?)
-        } else {
-            None
-        };
         let (attempts_consumed, _) = attempt_budget(&tx, &feedback.task_id)?;
         tx.commit()?;
         Ok(AcceptanceRework {
@@ -981,66 +1003,20 @@ fn existing_escalation(
     }))
 }
 
-fn contract_revision_for_digest(tx: &Connection, task_id: &str, digest: &str) -> Result<i64> {
-    tx.query_row(
-        "SELECT contract_revision FROM task_contracts WHERE task_id=?1 AND raw_digest=?2",
-        params![task_id, digest],
-        |row| row.get(0),
-    )
-    .optional()?
-    .ok_or_else(|| StoreError::Corrupt("rework contract is missing".into()))
-}
-
-fn insert_rework_contract(tx: &Connection, task_id: &str, raw: &str, digest: &str) -> Result<i64> {
-    if let Ok(revision) = contract_revision_for_digest(tx, task_id, digest) {
-        return Ok(revision);
-    }
-    let (plan_revision, project_store, expected_head, repository, base_oid, object_format, memory_snapshot_id, route, previous): (Option<i64>, String, i64, String, String, String, Option<String>, String, i64) = tx.query_row(
-        "SELECT plan_revision, project_store, expected_head, repository, base_oid, object_format, memory_snapshot_id, route, contract_revision FROM task_contracts WHERE task_id=?1 ORDER BY contract_revision DESC LIMIT 1",
+/// Newer than the stored verification, and only if a signed install already wrote it.
+fn installed_rework_revision(tx: &Connection, task_id: &str) -> Result<i64> {
+    let verified: Option<i64> = tx.query_row(
+        "SELECT max(contract_revision) FROM verification_runs WHERE task_id=?1",
         [task_id],
-        |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-                row.get(7)?,
-                row.get(8)?,
-            ))
-        },
+        |row| row.get(0),
     )?;
-    let next = previous + 1;
-    tx.execute(
-        "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('contract.rework',?1,?2,1,?3)",
-        params![
-            task_id,
-            next,
-            serde_json::json!({"contract_revision": next, "digest": digest}).to_string()
-        ],
+    let floor = verified.unwrap_or(0);
+    let revision: Option<i64> = tx.query_row(
+        "SELECT max(c.contract_revision) FROM task_contracts c WHERE c.task_id=?1 AND c.contract_revision>?2 AND EXISTS (SELECT 1 FROM events e WHERE e.kind='contract.installed' AND e.entity=c.task_id AND e.revision=c.contract_revision)",
+        params![task_id, floor],
+        |row| row.get(0),
     )?;
-    let installed = tx.last_insert_rowid();
-    tx.execute(
-        "INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-        params![
-            task_id,
-            next,
-            plan_revision,
-            project_store,
-            expected_head,
-            repository,
-            base_oid,
-            object_format,
-            memory_snapshot_id,
-            route,
-            raw.as_bytes(),
-            digest,
-            installed
-        ],
-    )?;
-    Ok(next)
+    revision.ok_or_else(|| invalid("acceptance rework has no contract revision"))
 }
 
 pub fn propose_plan(
@@ -1965,10 +1941,65 @@ mod tests {
             )
             .unwrap();
         let feedback = record_rejection(&mut db, "accept-2", "task");
+        assert!(matches!(
+            db.rework_acceptance(&feedback, true),
+            Err(StoreError::Invalid(message)) if message.contains("no contract revision")
+        ));
+        assert_eq!(count(&db.connection, "SELECT count(*) FROM attempts"), 1);
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM task_contracts"),
+            1
+        );
+        let project_store = std::fs::canonicalize(db.connection.path().unwrap())
+            .unwrap()
+            .display()
+            .to_string();
+        let next_raw = b"contract-v2-installed";
+        let next_digest = sha256_hex(next_raw);
+        db.connection
+            .execute(
+                "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('contract.installed','task',2,1,?1)",
+                [serde_json::json!({"digest": next_digest}).to_string()],
+            )
+            .unwrap();
+        let installed: i64 = db
+            .connection
+            .query_row("SELECT max(sequence) FROM events", [], |row| row.get(0))
+            .unwrap();
+        db.connection
+            .execute(
+                "INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq) VALUES('task',2,NULL,?1,0,'/tmp/repo',?2,'sha1',NULL,'verify_only',?3,?4,?5)",
+                params![project_store, "b".repeat(40), next_raw, next_digest, installed],
+            )
+            .unwrap();
         let rework = db.rework_acceptance(&feedback, true).unwrap();
         assert_eq!(rework.attempts_consumed, 2);
         assert_eq!(rework.contract_revision, Some(2));
         assert_eq!(count(&db.connection, "SELECT count(*) FROM attempts"), 2);
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM task_contracts"),
+            2
+        );
+        let held: (String, i64) = db
+            .connection
+            .query_row(
+                "SELECT state, termination_observed FROM attempts WHERE id=?1",
+                [&rework.attempt_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(held, ("failed".into(), 1));
+        assert_eq!(
+            count(
+                &db.connection,
+                "SELECT count(*) FROM attempts WHERE termination_observed=0"
+            ),
+            1
+        );
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM attempt_inputs"),
+            0
+        );
         assert_eq!(verification_snapshot(&db.connection), before);
         assert_eq!(
             count(&db.connection, "SELECT count(*) FROM verified_results"),
@@ -1983,23 +2014,88 @@ mod tests {
             )
             .unwrap();
         assert_eq!(kept, old_digest);
-        assert_ne!(
-            db.connection
-                .query_row(
-                    "SELECT raw_digest FROM task_contracts WHERE contract_revision=2",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap(),
-            old_digest
-        );
+        let installed_digest: String = db
+            .connection
+            .query_row(
+                "SELECT raw_digest FROM task_contracts WHERE contract_revision=2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(installed_digest, next_digest);
         assert!(db
             .connection
             .execute("UPDATE verification_runs SET reason='rewritten'", [])
             .is_err());
         let again = db.rework_acceptance(&feedback, true).unwrap();
         assert_eq!(again.attempt_id, rework.attempt_id);
+        assert_eq!(again.contract_revision, Some(2));
         assert_eq!(count(&db.connection, "SELECT count(*) FROM attempts"), 2);
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM task_contracts"),
+            2
+        );
         assert_eq!(verification_snapshot(&db.connection), before);
+    }
+
+    #[test]
+    fn expired_feedback_lease_can_ack_and_a_live_other_owner_conflicts() {
+        let (_temp, mut db) = fixture();
+        seed_task(&mut db, "task");
+        let expired_id = record_rejection(&mut db, "lease-expired", "task");
+        db.claim_feedback_item(&expired_id, "other-owner", 1, 1)
+            .unwrap();
+        let decision = db.request_replan(&expired_id).unwrap();
+        assert!(matches!(
+            decision,
+            ReplanDecision::Automatic {
+                automatic_count: 1,
+                ..
+            }
+        ));
+        let claims: Vec<(i64, String)> = {
+            let mut stmt = db
+                .connection
+                .prepare(
+                    "SELECT claim_epoch, state FROM feedback_claims WHERE feedback_id=?1 ORDER BY claim_epoch",
+                )
+                .unwrap();
+            stmt.query_map([&expired_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect()
+        };
+        assert_eq!(claims, vec![(1, "expired".into()), (2, "acked".into())]);
+        let acked: String = db
+            .connection
+            .query_row(
+                "SELECT state FROM feedback_items WHERE feedback_id=?1",
+                [&expired_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(acked, "acked");
+
+        let live_id = record_rejection(&mut db, "lease-live", "task");
+        let now = jiff::Timestamp::now().as_millisecond();
+        db.claim_feedback_item(&live_id, "other-owner", now, 60_000)
+            .unwrap();
+        assert!(matches!(
+            db.request_replan(&live_id),
+            Err(StoreError::Conflict)
+        ));
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM replan_requests"),
+            1
+        );
+        let live: (String, i64, String) = db
+            .connection
+            .query_row(
+                "SELECT i.state, c.claim_epoch, c.state FROM feedback_items i JOIN feedback_claims c ON c.feedback_id=i.feedback_id WHERE i.feedback_id=?1",
+                [&live_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(live, ("claimed".into(), 1, "active".into()));
     }
 }
