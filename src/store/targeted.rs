@@ -84,22 +84,6 @@ fn split_abort<T>(result: Result<T>) -> std::result::Result<Result<T>, StoreErro
     }
 }
 
-/// Events at or after the origin. Sequence 0 is that origin, so the shadow pass uses the same decoder as `read_snapshot`.
-fn events_since(
-    db: &Connection,
-    since: u64,
-    budget: Option<&read_budget::ReadBudget>,
-) -> Result<Vec<Event>> {
-    let events = read_events_with_budget(db, budget)?;
-    if since == 0 {
-        return Ok(events);
-    }
-    Ok(events
-        .into_iter()
-        .filter(|event| event.sequence > since)
-        .collect())
-}
-
 fn retained(attempts: &[Attempt]) -> Vec<Attempt> {
     // Terminated attempts do not retain capacity, so the targeted row set leaves them out.
     attempts
@@ -321,7 +305,8 @@ impl SqliteStore {
             budget.restart();
         }
         let targeted = if matches!(error, StoreError::Corrupt(_)) {
-            events_since(&self.connection, 0, budget).map(|_| ())
+            // Same event decoder as read_snapshot, so a corrupt payload fails both.
+            read_events_with_budget(&self.connection, budget).map(|_| ())
         } else {
             self.targeted_ready(now, include_launches, budget)
         };
