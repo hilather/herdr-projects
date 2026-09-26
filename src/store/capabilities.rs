@@ -2,6 +2,8 @@
 //! A launchable fixture is not workflow-certified, and a fixture row is not live evidence.
 use super::*;
 use rusqlite::OptionalExtension;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 
 const SCHEMA_VERSION: u32 = 33;
 
@@ -114,41 +116,16 @@ fn write_level(db: &Connection, draft: &EvidenceDraft) -> Result<()> {
         return Err(invalid("capability evidence cannot certify a profile"));
     }
     let id = evidence_id(draft);
-    let existing: Option<(String, String, String, String, String, i64, i64, i64)> = db
+    // The same window is a replay. A later window is a new row and must not abort the batch.
+    let existing: Option<i64> = db
         .query_row(
-            "SELECT evidence_id, binary_digest, os_name, profile_kind, test_id, observed_unix_ms, expires_unix_ms, live FROM capability_evidence WHERE adapter_kind=?1 AND profile_digest=?2 AND level=?3",
-            params![draft.adapter_kind, draft.profile_digest, draft.level.as_str()],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                ))
-            },
+            "SELECT 1 FROM capability_evidence WHERE evidence_id=?1",
+            [&id],
+            |_| Ok(1),
         )
         .optional()?;
-    if let Some(existing) = existing {
-        let same = existing
-            == (
-                id,
-                draft.binary_digest.clone(),
-                draft.os_name.to_string(),
-                draft.profile_kind.clone(),
-                draft.test_id.to_string(),
-                draft.observed_unix_ms,
-                draft.expires_unix_ms,
-                draft.live,
-            );
-        return if same {
-            Ok(())
-        } else {
-            Err(StoreError::Conflict)
-        };
+    if existing.is_some() {
+        return Ok(());
     }
     db.execute(
         "INSERT INTO capability_evidence(evidence_id,adapter_kind,binary_digest,os_name,profile_digest,profile_kind,level,test_id,observed_unix_ms,expires_unix_ms,live) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
@@ -200,9 +177,31 @@ fn drafts_for_profile(
         .collect())
 }
 
-fn profile_from_report(report: &str, digest: &str) -> Result<FrozenProfile> {
-    let value: serde_json::Value = serde_json::from_str(report)
-        .map_err(|_| StoreError::Corrupt("invalid native profile report".into()))?;
+fn store_binding(db: &Connection) -> Result<(PathBuf, u64, u64)> {
+    let raw = db.path().ok_or_else(|| invalid("store path missing"))?;
+    let path = Path::new(raw)
+        .canonicalize()
+        .map_err(|error| StoreError::Io(error.to_string()))?;
+    let metadata = std::fs::metadata(&path).map_err(|error| StoreError::Io(error.to_string()))?;
+    Ok((path, metadata.dev(), metadata.ino()))
+}
+
+/// Same path, device, and inode check as `native_profile_report`. A copied file must not count.
+fn report_matches_store(report: &serde_json::Value, path: &Path, dev: u64, ino: u64) -> bool {
+    report.get("source_store") == Some(&serde_json::json!([path, dev, ino]))
+}
+
+fn load_native_report(report: &str, report_digest: &str) -> Result<serde_json::Value> {
+    if sha256_hex(report.as_bytes()) != report_digest {
+        return Err(StoreError::Corrupt(
+            "native profile report digest mismatch".into(),
+        ));
+    }
+    serde_json::from_str(report)
+        .map_err(|_| StoreError::Corrupt("invalid native profile report".into()))
+}
+
+fn profile_from_report(value: &serde_json::Value, digest: &str) -> Result<FrozenProfile> {
     let profile: FrozenProfile = serde_json::from_value(value["preparation"]["profile"].clone())
         .map_err(|_| StoreError::Corrupt("invalid retained profile".into()))?;
     let reference = profile
@@ -239,6 +238,7 @@ impl SqliteStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         schema33(&tx)?;
+        let (path, dev, ino) = store_binding(&tx)?;
         let mut stmt = tx.prepare(
             "SELECT profile_digest, report, report_digest FROM native_profiles ORDER BY sequence",
         )?;
@@ -248,12 +248,11 @@ impl SqliteStore {
             let digest: String = row.get(0)?;
             let report: String = row.get(1)?;
             let report_digest: String = row.get(2)?;
-            if sha256_hex(report.as_bytes()) != report_digest {
-                return Err(StoreError::Corrupt(
-                    "native profile report digest mismatch".into(),
-                ));
+            let value = load_native_report(&report, &report_digest)?;
+            if !report_matches_store(&value, &path, dev, ino) {
+                continue;
             }
-            let profile = profile_from_report(&report, &digest)?;
+            let profile = profile_from_report(&value, &digest)?;
             drafts.extend(drafts_for_profile(
                 &profile,
                 "native",
@@ -339,22 +338,25 @@ fn levels_for(
     digest: &str,
     now: i64,
 ) -> Result<Vec<CapabilityLevel>> {
+    // Latest in-window row per level. A future observation is not shown yet.
     let mut stmt = db.prepare(
-        "SELECT level FROM capability_evidence WHERE adapter_kind=?1 AND profile_digest=?2 AND expires_unix_ms>?3 ORDER BY level",
+        "SELECT level FROM capability_evidence WHERE adapter_kind=?1 AND profile_digest=?2 AND observed_unix_ms<=?3 AND expires_unix_ms>?3 ORDER BY observed_unix_ms DESC, evidence_id DESC",
     )?;
     let mut rows = stmt.query(params![adapter, digest, now])?;
     let mut levels = Vec::new();
     while let Some(row) = rows.next()? {
         let level: String = row.get(0)?;
-        levels.push(
-            CapabilityLevel::parse(&level)
-                .ok_or_else(|| StoreError::Corrupt("unknown capability level".into()))?,
-        );
+        let level = CapabilityLevel::parse(&level)
+            .ok_or_else(|| StoreError::Corrupt("unknown capability level".into()))?;
+        if !levels.contains(&level) {
+            levels.push(level);
+        }
     }
     Ok(levels)
 }
 
 fn selected_native_digest(db: &Connection, kind: &str) -> Result<Option<String>> {
+    let (path, dev, ino) = store_binding(db)?;
     let mut stmt = tx_profiles(db)?;
     let mut rows = stmt.query([])?;
     let mut selected: Option<(i64, String)> = None;
@@ -363,12 +365,11 @@ fn selected_native_digest(db: &Connection, kind: &str) -> Result<Option<String>>
         let report: String = row.get(1)?;
         let report_digest: String = row.get(2)?;
         let sequence: i64 = row.get(3)?;
-        if sha256_hex(report.as_bytes()) != report_digest {
-            return Err(StoreError::Corrupt(
-                "native profile report digest mismatch".into(),
-            ));
+        let value = load_native_report(&report, &report_digest)?;
+        if !report_matches_store(&value, &path, dev, ino) {
+            continue;
         }
-        let profile = profile_from_report(&report, &digest)?;
+        let profile = profile_from_report(&value, &digest)?;
         if profile.kind != kind {
             continue;
         }
@@ -394,8 +395,8 @@ fn selected_levels(db: &Connection, kind: &str, now: i64) -> Result<Vec<Capabili
     }
     let fake: Option<String> = db
         .query_row(
-            "SELECT profile_digest FROM capability_evidence WHERE adapter_kind='fake' AND profile_kind=?1 ORDER BY observed_unix_ms DESC, profile_digest DESC LIMIT 1",
-            [kind],
+            "SELECT profile_digest FROM capability_evidence WHERE adapter_kind='fake' AND profile_kind=?1 AND observed_unix_ms<=?2 AND expires_unix_ms>?2 ORDER BY observed_unix_ms DESC, profile_digest DESC LIMIT 1",
+            params![kind, now],
             |row| row.get(0),
         )
         .optional()?;
@@ -437,6 +438,7 @@ pub(super) fn queue_capability_blocker(
 mod tests {
     use super::*;
     use crate::migration::ConfigReference;
+    use std::os::unix::fs::MetadataExt;
 
     fn user_version(db: &Connection) -> u32 {
         db.query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -795,6 +797,8 @@ mod tests {
         });
         assert!(native.validate_for_launch().is_err());
         let reference = native.reference().unwrap();
+        let path = std::fs::canonicalize(db.connection.path().unwrap()).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
         let report = serde_json::json!({
             "preparation": {
                 "profile": native,
@@ -802,7 +806,8 @@ mod tests {
                 "launchable": true,
                 "protocol_capable": true,
                 "certified": true
-            }
+            },
+            "source_store": [path, meta.dev(), meta.ino()]
         });
         let report = serde_json::to_string(&report).unwrap();
         let report_digest = sha256_hex(report.as_bytes());
@@ -845,5 +850,206 @@ mod tests {
                 .iter()
                 .all(|blocker| !blocker.contains("certified"))
         );
+    }
+
+    fn bind_native(db: &Connection, profile: &FrozenProfile) {
+        let reference = profile.reference().unwrap();
+        let path = std::fs::canonicalize(db.path().unwrap()).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let report = serde_json::json!({
+            "preparation": {
+                "profile": profile,
+                "reference": reference,
+                "launchable": profile.validate_for_launch().is_ok(),
+                "protocol_capable": false,
+                "certified": true
+            },
+            "source_store": [path, meta.dev(), meta.ino()]
+        });
+        let report = serde_json::to_string(&report).unwrap();
+        let report_digest = sha256_hex(report.as_bytes());
+        db.execute(
+            "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('profile.native_retained',?1,1,1,'{}')",
+            [reference.digest.as_str()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO native_profiles(profile_digest,report,report_digest,sequence) VALUES(?1,?2,?3,(SELECT max(sequence) FROM events))",
+            params![reference.digest, report, report_digest],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn later_observation_window_does_not_abort_another_digest() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
+        let first = codex_fixture();
+        let mut second = codex_fixture();
+        second.name = "other".into();
+        second.arguments_digest = "9".repeat(64);
+        let first_digest = first.reference().unwrap().digest;
+        let second_digest = second.reference().unwrap().digest;
+        bind_native(&db.connection, &first);
+        bind_native(&db.connection, &second);
+        db.record_native_capability_evidence(1_000, 2_000).unwrap();
+        db.record_native_capability_evidence(3_000, 8_000).unwrap();
+        let windows = |digest: &str, observed: i64| -> i64 {
+            db.connection
+                .query_row(
+                    "SELECT count(*) FROM capability_evidence WHERE profile_digest=?1 AND observed_unix_ms=?2 AND level='launchable'",
+                    params![digest, observed],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(windows(&first_digest, 1_000), 1);
+        assert_eq!(windows(&first_digest, 3_000), 1);
+        assert_eq!(windows(&second_digest, 3_000), 1);
+        assert!(
+            !selected_levels(&db.connection, "codex", 2_500)
+                .unwrap()
+                .contains(&CapabilityLevel::Launchable)
+        );
+        let shown = selected_levels(&db.connection, "codex", 4_000).unwrap();
+        assert!(shown.contains(&CapabilityLevel::Launchable));
+        assert!(!shown.contains(&CapabilityLevel::WorkflowCertified));
+    }
+
+    #[test]
+    fn queue_report_before_observation_is_capability_unsupported() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let repo = std::fs::canonicalize(repo).unwrap().display().to_string();
+        let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
+        db.commit(Commit {
+            expected_head: 0,
+            mutations: vec![Mutation::Task {
+                expected: None,
+                next: Task {
+                    id: TaskId::new("ask-launch").unwrap(),
+                    revision: 1,
+                    state: TaskState::Draft,
+                    title: "ask-launch".into(),
+                    active_attempt: None,
+                },
+            }],
+        })
+        .unwrap();
+        queue_task(&mut db, "ask-launch");
+        install_contract(&mut db, &repo, "ask-launch", &["launchable"]);
+        let current = codex_fixture();
+        db.record_fake_adapter_evidence(&current, 5_000, 9_000)
+            .unwrap();
+        let early = db.queue_report(2_000).unwrap();
+        assert!(
+            early.entries[0]
+                .blockers
+                .iter()
+                .any(|blocker| blocker == "capability_unsupported")
+        );
+        let during = db.queue_report(6_000).unwrap();
+        assert!(
+            during.entries[0]
+                .blockers
+                .iter()
+                .all(|blocker| blocker != "capability_unsupported")
+        );
+        let mut future = current;
+        future.arguments_digest = "9".repeat(64);
+        future.capabilities.stop = crate::domain::CapabilityEvidence::Unknown;
+        db.record_fake_adapter_evidence(&future, 8_000, 12_000)
+            .unwrap();
+        let still_current = db.queue_report(6_000).unwrap();
+        assert!(
+            still_current.entries[0]
+                .blockers
+                .iter()
+                .all(|blocker| blocker != "capability_unsupported")
+        );
+    }
+
+    #[test]
+    fn copied_native_profile_is_not_launchable() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let repo = std::fs::canonicalize(repo).unwrap().display().to_string();
+        let path = temp.path().join("state.db");
+        let mut db = SqliteStore::create(&path).unwrap();
+        db.commit(Commit {
+            expected_head: 0,
+            mutations: vec![Mutation::Task {
+                expected: None,
+                next: Task {
+                    id: TaskId::new("ask-launch").unwrap(),
+                    revision: 1,
+                    state: TaskState::Draft,
+                    title: "ask-launch".into(),
+                    active_attempt: None,
+                },
+            }],
+        })
+        .unwrap();
+        queue_task(&mut db, "ask-launch");
+        install_contract(&mut db, &repo, "ask-launch", &["launchable"]);
+        bind_native(&db.connection, &codex_fixture());
+        db.record_native_capability_evidence(1_000, 10_000).unwrap();
+        let original = db.queue_report(2_000).unwrap();
+        assert!(
+            original.entries[0]
+                .blockers
+                .iter()
+                .all(|blocker| blocker != "capability_unsupported")
+        );
+        let certified: i64 = db
+            .connection
+            .query_row(
+                "SELECT count(*) FROM capability_evidence WHERE level='workflow-certified'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(certified, 0);
+        db.connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        let copy_path = temp.path().join("copy.db");
+        std::fs::copy(&path, &copy_path).unwrap();
+        let mut copied = SqliteStore::open(&copy_path).unwrap();
+        let before: i64 = copied
+            .connection
+            .query_row("SELECT count(*) FROM capability_evidence", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(before > 0);
+        copied
+            .record_native_capability_evidence(1_000, 10_000)
+            .unwrap();
+        let after: i64 = copied
+            .connection
+            .query_row("SELECT count(*) FROM capability_evidence", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(before, after);
+        let report = copied.queue_report(2_000).unwrap();
+        assert!(
+            report.entries[0]
+                .blockers
+                .iter()
+                .any(|blocker| blocker == "capability_unsupported")
+        );
+        let certified: i64 = copied
+            .connection
+            .query_row(
+                "SELECT count(*) FROM capability_evidence WHERE level='workflow-certified'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(certified, 0);
     }
 }

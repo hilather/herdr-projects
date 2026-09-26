@@ -21,9 +21,9 @@ CREATE TABLE capability_evidence (
     live INTEGER NOT NULL CHECK (live IN (0, 1)),
     -- Certification is a later live decision. Fixtures cannot take that row.
     CHECK (live = 1 OR level != 'workflow-certified'),
-    CHECK (adapter_kind != 'fake' OR (live = 0 AND level IN ('discovered', 'launchable'))),
-    UNIQUE (adapter_kind, profile_digest, level)
+    CHECK (adapter_kind != 'fake' OR (live = 0 AND level IN ('discovered', 'launchable')))
 ) STRICT;
+-- No UNIQUE on (adapter, digest, level): a later observation window is another immutable row.
 CREATE INDEX capability_evidence_by_profile ON capability_evidence(profile_digest, level);
 CREATE INDEX capability_evidence_by_kind ON capability_evidence(profile_kind, adapter_kind, observed_unix_ms);
 CREATE TRIGGER capability_evidence_no_update BEFORE UPDATE ON capability_evidence
