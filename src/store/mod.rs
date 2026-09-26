@@ -7,6 +7,9 @@ use std::{fmt, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, time::
 pub const SCHEMA: u32 = 41;
 const APPLICATION: u32 = 1_213_222_994;
 const MIN_SQLITE: i32 = 3_053_004;
+/// SQLite's busy handler gives up after this. The watchdog treats the resulting
+/// `Busy` as past the retry bound and pauses admission.
+pub const BUSY_RETRY_BOUND: Duration = Duration::from_millis(250);
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug)]
@@ -272,7 +275,7 @@ fn connect(path: &Path) -> Result<Connection> {
     let metadata = std::fs::symlink_metadata(path).map_err(|e| StoreError::Io(e.to_string()))?;
     if !metadata.is_file() { return Err(StoreError::Invalid("database must be a regular local file, not a symlink".into())); }
     let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
-    db.busy_timeout(Duration::from_millis(250))?;
+    db.busy_timeout(BUSY_RETRY_BOUND)?;
     db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF; PRAGMA synchronous=FULL;")?;
     Ok(db)
 }
@@ -418,6 +421,8 @@ mod memory_reconciliation;
 mod worker_knowledge;
 mod targeted;
 pub use targeted::{hot_path_uses_snapshot, targeted_mismatch_count, HotPathRead, HOT_PATH_READ};
+mod observability;
+pub use observability::FactoryNumbers;
 
 #[cfg(target_os = "linux")]
 mod native_profiles;

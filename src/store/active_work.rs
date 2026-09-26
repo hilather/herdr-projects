@@ -600,6 +600,18 @@ impl SqliteStore {
         head(&self.connection)
     }
 
+    /// Rows touched while building one active-work page. Rolls back so a status
+    /// read cannot publish the projection or change attempts.
+    pub(super) fn hot_path_page_rows(&mut self) -> Result<u64> {
+        let tx = self.connection.transaction()?;
+        let mut account = Account { rows: 0, fullscan: 0 };
+        let _meta = ensure(&tx, &mut account)?;
+        let _page = read_page(&tx, None, &mut account)?;
+        let rows = account.rows;
+        drop(tx);
+        Ok(rows)
+    }
+
     pub fn active_work_page(&mut self, cursor: Option<i64>) -> Result<ActiveWorkPage> {
         let tx = self.connection.transaction()?;
         let mut account = Account {

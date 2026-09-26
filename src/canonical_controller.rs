@@ -16,7 +16,7 @@ const PREPARED_LAUNCH_DISPATCH_ENABLED: bool = true;
 pub(crate) fn launch_dispatch_enabled()->bool { PREPARED_LAUNCH_DISPATCH_ENABLED }
 
 
-pub struct PollResult {pub reachable:bool,pub scheduled_work:bool,pub unknown_effects:bool,pub operation_error:Option<String>}
+pub struct PollResult {pub reachable:bool,pub scheduled_work:bool,pub unknown_effects:bool,pub operation_error:Option<String>,pub admission_log:Option<String>}
 struct ProbeBudget<'a> {runner:&'a dyn crate::runner::Runner,deadline:std::time::Instant}
 impl crate::runner::Runner for ProbeBudget<'_> {
     fn run(&self,cmd:&crate::runner::Cmd)->Result<crate::runner::Output> {
@@ -37,8 +37,13 @@ pub fn poll(ctx:&Ctx,path:&Path,turn:u64)->Result<PollResult> {
         herdr_projects::store::HotPathRead::Targeted=>{
             let schema=match db.read_targeted_hot_path(now,launch_dispatch_enabled()) {
                 Ok(schema)=>schema,
-                Err(error) if matches!(error,herdr_projects::store::StoreError::Cancelled|herdr_projects::store::StoreError::Deadline)=>anyhow::bail!("controller read aborted: {error}"),
-                Err(error)=>return Err(error.into()),
+                Err(error)=>{
+                    let _=herdr_projects::watchdog::note(&path,&error);
+                    if matches!(error,herdr_projects::store::StoreError::Cancelled|herdr_projects::store::StoreError::Deadline) {
+                        anyhow::bail!("controller read aborted: {error}");
+                    }
+                    return Err(error.into());
+                }
             };
             ensure!(schema>=9,"upgrade-store is required before canonical controller polling");
         }
@@ -83,7 +88,7 @@ fn finish_poll(ctx:&Ctx,path:&Path,turn:u64,reachable:bool,observation_error:Opt
     // explicit synchronous service; either path still offers independent effects.
     let scheduled=match background_plan {Some(active)=>Ok(herdr_projects::routines::ScheduleTurn{active,diagnostic:None}),None=>herdr_projects::routines::schedule_turn(path,turn)};
     let queued=effects.is_some();
-    let result=process_next_with_launches(ctx,&path,turn,effects,launch_dispatch_enabled());
+    let (admission_log,result)=process_next_with_launches(ctx,&path,turn,effects,launch_dispatch_enabled());
     let mut errors=observation_error.into_iter().collect::<Vec<_>>();
     let routine_work=match scheduled {Ok(report)=>{if let Some(error)=report.diagnostic {errors.push(format!("routine scheduling: {error}"));}report.active},Err(error)=>{errors.push(format!("routine scheduling: {error:#}"));false}};
     // An admission failure is diagnostic only. Already-prepared dispatch still runs.
@@ -91,29 +96,46 @@ fn finish_poll(ctx:&Ctx,path:&Path,turn:u64,reachable:bool,observation_error:Opt
         Ok((progress,admission))=>{if let Some(error)=admission {errors.push(format!("admission: {error}"));}(progress,false)}
         Err(error)=>{errors.push(format!("{error:#}"));(false,queued)}
     };
-    Ok(PollResult{reachable:reachable||progress,scheduled_work:routine_work,unknown_effects,operation_error:(!errors.is_empty()).then(||errors.join("; "))})
+    Ok(PollResult{reachable:reachable||progress,scheduled_work:routine_work,unknown_effects,operation_error:(!errors.is_empty()).then(||errors.join("; ")),admission_log})
 }
 fn process_next(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::copy_jobs::Queue>)->Result<bool> {
-    Ok(process_next_with_launches(ctx,path,turn,effects,launch_dispatch_enabled())?.0)
+    Ok(process_next_with_launches(ctx,path,turn,effects,launch_dispatch_enabled()).1?.0)
 }
 #[cfg(target_os="linux")]
-fn linux_admission(path:&Path)->Option<String> {
-    if !herdr_projects::admission::wake_enabled(path) {return None;}
+fn linux_admission(path:&Path)->(Option<String>,Option<String>) {
+    let started=std::time::Instant::now();
+    if herdr_projects::watchdog::is_paused(path) {
+        let reason=herdr_projects::watchdog::pause_reason(path).unwrap_or("admission_paused");
+        let line=herdr_projects::watchdog::admission_log_line(reason,None,0);
+        return (Some(format!("admission_paused: {reason}")),Some(line));
+    }
+    if !herdr_projects::admission::wake_enabled(path) {return (None,None);}
     // Ok(Some) is backpressure, not success. Prepared dispatch still runs after this note.
-    match herdr_projects::admission::admit_once(path) {
-        Ok(Some(block))=>Some(format!("{}: {}", block.blocker, block.reason)),
-        Ok(None)=>None,
-        Err(error)=>Some(format!("{error:#}")),
+    match herdr_projects::admission::admit_decision(path) {
+        Ok(decision)=>{
+            let line=herdr_projects::watchdog::admission_log_line(decision.reason,decision.task_id.as_deref(),started.elapsed().as_millis());
+            let diagnostic=decision.block.map(|block| format!("{}: {}", block.blocker, block.reason));
+            (diagnostic,Some(line))
+        }
+        Err(error)=>{
+            let reason=error.downcast_ref::<herdr_projects::store::StoreError>().and_then(herdr_projects::watchdog::cause).unwrap_or("error");
+            if let Some(store)=error.downcast_ref::<herdr_projects::store::StoreError>() {
+                let _=herdr_projects::watchdog::note(path,store);
+            }
+            let line=herdr_projects::watchdog::admission_log_line(reason,None,started.elapsed().as_millis());
+            (Some(format!("{error:#}")),Some(line))
+        }
     }
 }
 #[cfg(not(target_os="linux"))]
-fn linux_admission(_path:&Path)->Option<String> {None}
-fn process_next_with_launches(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::copy_jobs::Queue>,include_launches:bool)->Result<(bool,Option<String>)> {
-    let admission=linux_admission(path);
-    match dispatch_prepared(ctx,path,turn,effects,include_launches) {
+fn linux_admission(_path:&Path)->(Option<String>,Option<String>) {(None,None)}
+fn process_next_with_launches(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::copy_jobs::Queue>,include_launches:bool)->(Option<String>,Result<(bool,Option<String>)>) {
+    let (admission,admission_log)=linux_admission(path);
+    let result=match dispatch_prepared(ctx,path,turn,effects,include_launches) {
         Ok(progress)=>Ok((progress,admission)),
-        Err(error)=>Err(match admission {Some(note)=>error.context(format!("admission: {note}")),None=>error}),
-    }
+        Err(error)=>Err(match &admission {Some(note)=>error.context(format!("admission: {note}")),None=>error}),
+    };
+    (admission_log,result)
 }
 fn dispatch_prepared(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::copy_jobs::Queue>,include_launches:bool)->Result<bool> {
     if let Some(effects)=effects{return offer_next(ctx,path,turn,effects,include_launches);}

@@ -19,6 +19,7 @@ fn open_store(project: &Path) -> Result<SqliteStore> {
 /// This probe does not integrity-check: the off flag is the steady state, and a
 /// full `open` on every wake would run before the existing hint path.
 pub fn wake_enabled(project: &Path) -> bool {
+    if crate::watchdog::is_paused(project) { return false; }
     let Ok(path) = store_file(project) else { return false };
     let Ok(connection) = rusqlite::Connection::open_with_flags(
         &path,
@@ -204,12 +205,31 @@ fn backlog_ages(project: &Path) -> Result<(Option<i64>, Option<i64>)> {
     Ok((verification, integration))
 }
 
+/// Why `admit_once` returned. `block` is set only when admission must not reserve.
+pub struct AdmissionDecision {
+    pub block: Option<AdmissionBlock>,
+    pub reason: &'static str,
+    pub task_id: Option<String>,
+}
+
 /// Reserve at most one ready attempt through `reserve_prepared`. Does not launch.
 /// A verify or integrate backlog older than the watermark returns `capacity_full` and does not reserve.
+/// A watchdog pause returns `admission_paused` and does not reserve.
 pub fn admit_once(project: &Path) -> Result<Option<AdmissionBlock>> {
+    Ok(admit_decision(project)?.block)
+}
+
+pub fn admit_decision(project: &Path) -> Result<AdmissionDecision> {
+    if let Some(reason) = crate::watchdog::pause_reason(project) {
+        return Ok(AdmissionDecision {
+            block: Some(AdmissionBlock { blocker: "admission_paused", reason }),
+            reason,
+            task_id: None,
+        });
+    }
     let mut db = open_store(project)?;
     if !db.factory_admission_enabled()? {
-        return Ok(None);
+        return Ok(AdmissionDecision { block: None, reason: "admission_off", task_id: None });
     }
     let now = jiff::Timestamp::now().as_millisecond();
     let project_store = store_file(project)?;
@@ -219,12 +239,13 @@ pub fn admit_once(project: &Path) -> Result<Option<AdmissionBlock>> {
     let watermark = backlog_watermark_ms(revision);
     let (verification_oldest, integration_oldest) = backlog_ages(project)?;
     if let Some(reason) = backlog_reason(verification_oldest.map(|created| now.saturating_sub(created)), integration_oldest.map(|created| now.saturating_sub(created)), watermark) {
-        return Ok(Some(AdmissionBlock { blocker: "capacity_full", reason }));
+        return Ok(AdmissionDecision { block: Some(AdmissionBlock { blocker: "capacity_full", reason }), reason, task_id: None });
     }
     let head = state.head;
     let profiles = db.admission_profiles()?;
     let control = state.control.clone().context("project control missing")?;
     let candidates = ready_candidates(&mut db, &state, now)?;
+    let mut denied = None;
     for candidate in &candidates {
         let mut sealed = None;
         for profile in binding_profiles(&profiles, &control, &candidate.binding) {
@@ -239,12 +260,17 @@ pub fn admit_once(project: &Path) -> Result<Option<AdmissionBlock>> {
         if let Some(inputs) = sealed {
             // Head was read before this write. A later mutation conflicts instead of reserving a stale snapshot.
             db.reserve_prepared(&[PreparedLaunch { inputs }], head, now)?;
-            return Ok(None);
+            return Ok(AdmissionDecision { block: None, reason: "reserved", task_id: Some(candidate.task.id.as_str().to_string()) });
         }
         // One denial for this task, then the next candidate. A grant for another profile is not this miss.
         record_missing_grant(&mut db, &candidate.task.id, head, now)?;
+        denied = Some(candidate.task.id.as_str().to_string());
     }
-    Ok(None)
+    Ok(AdmissionDecision {
+        block: None,
+        reason: if denied.is_some() { "authority_missing" } else { "idle" },
+        task_id: denied,
+    })
 }
 
 #[cfg(test)]

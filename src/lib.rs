@@ -58,6 +58,12 @@ pub mod launch_preparation;
 #[cfg(all(feature = "state-store", target_os = "linux"))]
 pub mod admission;
 
+#[cfg(feature = "state-store")]
+pub mod watchdog;
+
+#[cfg(feature = "state-store")]
+pub mod factory_status;
+
 #[cfg(all(feature = "state-store", target_os = "linux"))]
 pub mod worktree_preparation;
 

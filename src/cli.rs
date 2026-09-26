@@ -220,6 +220,9 @@ enum Command {
     /// Inspect dependency queue and configure per-project scheduling limits
     #[cfg(feature="state-store")]
     Scheduler { slug:String, #[command(subcommand)] command:SchedulerCommand },
+    /// Read-only factory counters. Does not launch, admit, or print environment values.
+    #[cfg(feature="state-store")]
+    Factory { #[command(subcommand)] command:FactoryCommand },
     /// Inspect or explicitly rebind migrated runtime routing without granting ownership
     #[cfg(feature="state-store")]
     Runtime { slug:String, #[command(subcommand)] command:RuntimeCommand },
@@ -645,6 +648,13 @@ enum OperationsCommand { Inspect,
 
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
+enum FactoryCommand {
+    /// Schema, admission, and bounded counters. No environment, argv, or secrets.
+    Status { slug:String },
+}
+
+#[cfg(feature="state-store")]
+#[derive(Subcommand)]
 enum RuntimeCommand {
     /// Withdraw an ownership claim without stopping or deleting any resource
     Relinquish { id:String, #[arg(long)] expected_revision:u64, #[arg(long)] expected_head:u64, #[arg(long)] reason:String },
@@ -943,6 +953,22 @@ pub fn run() -> Result<()> {
                 project::validate_slug(&slug)?;
                 let dir = ctx.root.join(&slug);
                 println!("{}", serde_json::to_string_pretty(&herdr_projects::authority::import_admission(&dir, enable, &policy, &signature, evidence.as_deref())?)?);
+                Ok(())
+            }
+        },
+        #[cfg(feature="state-store")]
+        Command::Factory{command}=>match command {
+            FactoryCommand::Status{slug}=>{
+                project::validate_slug(&slug)?;
+                let dir=ctx.root.join(slug);
+                match herdr_projects::factory_status::report(&dir,crate::canonical_controller::launch_dispatch_enabled()) {
+                    Ok(status)=>println!("{}",serde_json::to_string_pretty(&status)?),
+                    Err(herdr_projects::factory_status::ReportError::Newer(value))=>{
+                        println!("{}",serde_json::to_string_pretty(&value)?);
+                        bail!("store schema is newer than this binary");
+                    }
+                    Err(error)=>return Err(error.into()),
+                }
                 Ok(())
             }
         },

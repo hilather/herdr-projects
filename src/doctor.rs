@@ -288,6 +288,10 @@ fn write_compiled_features(out: &mut String) {
             out,
             "factory: explicit factory binary `cargo build --release --locked --features state-store`"
         );
+        let _ = writeln!(
+            out,
+            "admission: off until a signed policy; doctor does not enable it or launch"
+        );
     }
     #[cfg(not(feature = "state-store"))]
     {
@@ -299,7 +303,10 @@ fn write_compiled_features(out: &mut String) {
             out,
             "factory: canonical factory commands are absent; explicit factory binary `cargo build --release --locked --features state-store`"
         );
+        let _ = writeln!(out, "admission: absent");
     }
+    let platform = if cfg!(target_os = "linux") { "linux" } else { "unsupported" };
+    let _ = writeln!(out, "platform: {platform}");
     let _ = writeln!(
         out,
         "upgrade: existing projects upgrade only through `migration PROJECT upgrade-store`"
@@ -452,6 +459,10 @@ mod tests {
                 "quotes PREPARED_LAUNCH_DISPATCH_ENABLED; {text}"
             );
             assert!(
+                text.contains("admission: off until a signed policy; doctor does not enable it or launch\n"),
+                "{text}"
+            );
+            assert!(
                 !text.contains("canonical factory commands are absent"),
                 "{text}"
             );
@@ -466,7 +477,13 @@ mod tests {
                 text.contains("canonical factory commands are absent"),
                 "{text}"
             );
+            assert!(text.contains("admission: absent\n"), "{text}");
         }
+        #[cfg(target_os = "linux")]
+        assert!(text.contains("platform: linux\n"), "{text}");
+        #[cfg(not(target_os = "linux"))]
+        assert!(text.contains("platform: unsupported\n"), "{text}");
+        assert!(!text.contains("launching"), "{text}");
         assert_eq!(
             std::fs::read(project.dir().join(".state/project.json")).unwrap(),
             project_json
