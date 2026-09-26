@@ -1,5 +1,9 @@
 //! Schema 31 untrusted plan revisions. A proposal file is not a signature and
 //! is not installed as a task contract. Accepting one does not reserve an attempt.
+//! Schema 36 waits commit the cursor in that same transaction and replay it once.
+//! A schema 29 feedback row is the only replan trigger: two automatic replans for
+//! one blocker inside a plan revision, then one inbox escalation. A pull-request
+//! poll is not a trigger. Infrastructure retries stay on the same attempt.
 use super::*;
 use crate::domain::{Dependency, QueueRecord, Task, TaskId, TaskState};
 use rusqlite::OptionalExtension;
@@ -271,6 +275,8 @@ impl SqliteStore {
                 created_unix_ms
             ],
         )?;
+        // A new revision starts its own replan budget. Older rows stay put.
+        record_replan_reset(&tx, next, created_unix_ms)?;
         tx.commit()?;
         Ok(PlanProposalReceipt {
             plan_revision: next,
@@ -279,6 +285,762 @@ impl SqliteStore {
             replayed: false,
         })
     }
+}
+
+const WAITS_SCHEMA: u32 = 36;
+const AUTOMATIC_REPLANS: i64 = 2;
+
+fn schema36(db: &Connection) -> Result<()> {
+    check_schema(db)?;
+    let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < WAITS_SCHEMA {
+        return Err(StoreError::UnsupportedSchema(version));
+    }
+    Ok(())
+}
+fn wait_condition(value: &str) -> bool {
+    matches!(
+        value,
+        "dependency_evidence"
+            | "user_decision"
+            | "resource_availability"
+            | "adapter_recovery"
+            | "validation_completion"
+    )
+}
+fn record_replan_reset(tx: &Connection, plan_revision: u64, now: i64) -> Result<()> {
+    let version: u32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < WAITS_SCHEMA {
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT INTO replan_budget_resets(plan_revision, reset_unix_ms) VALUES(?1,?2)",
+        params![integer(plan_revision)?, now],
+    )?;
+    Ok(())
+}
+fn blocker_fingerprint(task_id: &str, category: &str, reason: &str) -> String {
+    sha256_hex(format!("{task_id}\0{category}\0{reason}").as_bytes())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WaitRegistration {
+    pub wait_id: String,
+    pub cursor_sequence: i64,
+    pub already_registered: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WaitReplay {
+    pub wait_id: String,
+    pub cursor_sequence: i64,
+    pub replayed_through: i64,
+    pub events_applied: i64,
+    pub wake_requested: bool,
+    /// Wake requests another look. It is not evidence the condition holds.
+    pub proved: bool,
+    pub already_replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PullRequestPoll {
+    pub url: String,
+    pub check: String,
+    pub closed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum ReplanDecision {
+    Automatic {
+        replan_id: String,
+        proposal_id: String,
+        automatic_count: i64,
+    },
+    Escalated {
+        replan_id: String,
+        inbox_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InfrastructureRetry {
+    pub attempt_id: String,
+    pub ordinal: i64,
+    pub attempts_consumed: i64,
+    pub max_attempts_per_task: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AcceptanceRework {
+    pub attempt_id: String,
+    pub attempts_consumed: i64,
+    pub contract_revision: Option<i64>,
+}
+
+struct FeedbackRow {
+    category: String,
+    task_id: String,
+    reason: String,
+}
+
+fn load_feedback(tx: &Connection, feedback_id: &str) -> Result<Option<FeedbackRow>> {
+    tx.query_row(
+        "SELECT category, task_id, reason FROM feedback_items WHERE feedback_id=?1",
+        [feedback_id],
+        |row| {
+            Ok(FeedbackRow {
+                category: row.get(0)?,
+                task_id: row.get(1)?,
+                reason: row.get(2)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+fn automatic_count(tx: &Connection, plan_revision: u64, fingerprint: &str) -> Result<i64> {
+    let count: i64 = tx.query_row(
+        "SELECT count(*) FROM replan_requests WHERE plan_revision=?1 AND blocker_fingerprint=?2 AND outcome='automatic' AND created_unix_ms >= coalesce((SELECT reset_unix_ms FROM replan_budget_resets WHERE plan_revision=?1), 0)",
+        params![integer(plan_revision)?, fingerprint],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+fn attempt_budget(tx: &Connection, task_id: &str) -> Result<(i64, i64)> {
+    let consumed: i64 = tx.query_row(
+        "SELECT count(*) FROM attempts WHERE task_id=?1",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    let limit: i64 = tx.query_row(
+        "SELECT max_attempts_per_task FROM scheduler_policy WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok((consumed, limit))
+}
+
+fn decision_from_row(
+    outcome: &str,
+    replan_id: String,
+    proposal_id: Option<String>,
+    inbox_id: Option<String>,
+    automatic_count: i64,
+) -> Result<ReplanDecision> {
+    match outcome {
+        "automatic" => Ok(ReplanDecision::Automatic {
+            replan_id,
+            proposal_id: proposal_id
+                .ok_or_else(|| StoreError::Corrupt("automatic replan lacks a proposal".into()))?,
+            automatic_count,
+        }),
+        "escalated" => Ok(ReplanDecision::Escalated {
+            replan_id,
+            inbox_id: inbox_id.ok_or_else(|| {
+                StoreError::Corrupt("escalated replan lacks an inbox item".into())
+            })?,
+        }),
+        _ => Err(StoreError::Corrupt("replan outcome is invalid".into())),
+    }
+}
+
+/// Claim and ack in this transaction. Ack names the replan proposal and does not reserve.
+fn ack_replan_proposal(
+    tx: &Connection,
+    feedback_id: &str,
+    proposal_id: &str,
+    now: i64,
+) -> Result<()> {
+    let state: String = tx.query_row(
+        "SELECT state FROM feedback_items WHERE feedback_id=?1",
+        [feedback_id],
+        |row| row.get(0),
+    )?;
+    if state == "acked" {
+        let existing: String = tx.query_row(
+            "SELECT replan_proposal_id FROM feedback_items WHERE feedback_id=?1",
+            [feedback_id],
+            |row| row.get(0),
+        )?;
+        if existing == proposal_id {
+            return Ok(());
+        }
+        return Err(StoreError::Conflict);
+    }
+    if state != "open" {
+        return Err(StoreError::Conflict);
+    }
+    let until = now
+        .checked_add(60_000)
+        .ok_or_else(|| invalid("lease exceeds clock range"))?;
+    tx.execute(
+        "INSERT INTO feedback_claims(feedback_id,claim_epoch,owner,lease_until_ms,state,claimed_unix_ms) VALUES(?1,1,'replan-controller',?2,'active',?3)",
+        params![feedback_id, until, now],
+    )?;
+    let claimed = tx.execute(
+        "UPDATE feedback_items SET state='claimed' WHERE feedback_id=?1 AND state='open' AND replan_proposal_id IS NULL",
+        [feedback_id],
+    )?;
+    if claimed != 1 {
+        return Err(StoreError::Conflict);
+    }
+    let acked_claim = tx.execute(
+        "UPDATE feedback_claims SET state='acked' WHERE feedback_id=?1 AND claim_epoch=1 AND state='active'",
+        [feedback_id],
+    )?;
+    if acked_claim != 1 {
+        return Err(StoreError::Conflict);
+    }
+    let acked = tx.execute(
+        "UPDATE feedback_items SET state='acked', replan_proposal_id=?2 WHERE feedback_id=?1 AND state='claimed' AND replan_proposal_id IS NULL",
+        params![feedback_id, proposal_id],
+    )?;
+    if acked != 1 {
+        return Err(StoreError::Conflict);
+    }
+    Ok(())
+}
+
+fn insert_escalation_inbox(
+    tx: &Connection,
+    inbox_id: &str,
+    feedback_id: &str,
+    feedback: &FeedbackRow,
+    plan_revision: u64,
+    now: i64,
+) -> Result<()> {
+    let created =
+        jiff::Timestamp::from_millisecond(now).map_err(|error| invalid(&error.to_string()))?;
+    let content = crate::domain::InboxContent {
+        id: inbox_id.to_string(),
+        kind: "replan-escalation".into(),
+        subject: feedback.task_id.clone(),
+        created: created.to_string(),
+        summary: format!("replan budget exhausted for {}", feedback.task_id),
+        body: format!(
+            "impact: {} blocks {} at plan {plan_revision}. evidence: feedback {feedback_id} ({}). options: approve a new plan revision or stop this blocker.",
+            feedback.reason, feedback.task_id, feedback.category
+        ),
+    };
+    content.validate().map_err(StoreError::Invalid)?;
+    let payload = serde_json::to_string(&content).map_err(|error| invalid(&error.to_string()))?;
+    let hash = format!("{:x}", Sha256::digest(payload.as_bytes()));
+    tx.execute(
+        "INSERT INTO inbox_items VALUES(?1,?2,?3,?4,?5,?6)",
+        params![content.id, integer(1)?, payload, hash, false, false],
+    )?;
+    tx.execute(
+        "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('replan.escalated',?1,1,1,?2)",
+        params![
+            inbox_id,
+            serde_json::json!({
+                "feedback_id": feedback_id,
+                "task_id": feedback.task_id,
+                "plan_revision": plan_revision,
+            })
+            .to_string()
+        ],
+    )?;
+    Ok(())
+}
+
+impl SqliteStore {
+    /// Register the wait and the event cursor together. A repeat returns that cursor.
+    pub fn register_wait(
+        &mut self,
+        task_id: &str,
+        attempt_id: Option<&str>,
+        condition: &str,
+    ) -> Result<WaitRegistration> {
+        if !identifier(task_id) || !wait_condition(condition) {
+            return Err(invalid("wait is invalid"));
+        }
+        if let Some(attempt) = attempt_id {
+            if !identifier(attempt) {
+                return Err(invalid("wait attempt is invalid"));
+            }
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        schema36(&tx)?;
+        let task_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1)",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        if !task_exists {
+            return Err(invalid("wait task is missing"));
+        }
+        if let Some(attempt) = attempt_id {
+            let attempt_exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM attempts WHERE id=?1 AND task_id=?2)",
+                params![attempt, task_id],
+                |row| row.get(0),
+            )?;
+            if !attempt_exists {
+                return Err(invalid("wait attempt is missing"));
+            }
+        }
+        let plan_revision = current_revision(&tx)?;
+        let attempt_key = attempt_id.unwrap_or("");
+        let wait_id = sha256_hex(
+            format!("{task_id}\0{attempt_key}\0{condition}\0{plan_revision}").as_bytes(),
+        );
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT cursor_sequence FROM wait_conditions WHERE wait_id=?1",
+                [&wait_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(cursor_sequence) = existing {
+            tx.commit()?;
+            return Ok(WaitRegistration {
+                wait_id,
+                cursor_sequence,
+                already_registered: true,
+            });
+        }
+        let now = jiff::Timestamp::now().as_millisecond();
+        tx.execute(
+            "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.registered',?1,1,1,?2)",
+            params![
+                wait_id,
+                serde_json::json!({
+                    "task_id": task_id,
+                    "condition": condition,
+                    "plan_revision": plan_revision,
+                })
+                .to_string()
+            ],
+        )?;
+        let cursor_sequence =
+            i64::try_from(head(&tx)?).map_err(|_| invalid("wait cursor exceeds range"))?;
+        tx.execute(
+            "INSERT INTO wait_conditions(wait_id,task_id,attempt_id,condition,plan_revision,cursor_sequence,state,replayed_through,wake_requested,created_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,'waiting',NULL,0,?7)",
+            params![
+                wait_id,
+                task_id,
+                attempt_id,
+                condition,
+                integer(plan_revision)?,
+                cursor_sequence,
+                now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(WaitRegistration {
+            wait_id,
+            cursor_sequence,
+            already_registered: false,
+        })
+    }
+
+    /// Apply events after the cursor one time. A second call does not apply them again.
+    pub fn replay_wait(&mut self, wait_id: &str) -> Result<WaitReplay> {
+        if !identifier(wait_id) {
+            return Err(invalid("wait is invalid"));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        schema36(&tx)?;
+        let row: Option<(i64, String, Option<i64>, i64)> = tx
+            .query_row(
+                "SELECT cursor_sequence, state, replayed_through, wake_requested FROM wait_conditions WHERE wait_id=?1",
+                [wait_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((cursor_sequence, state, replayed_through, wake_requested)) = row else {
+            return Err(invalid("wait is not registered"));
+        };
+        if state == "replayed" {
+            let events_applied: i64 = tx.query_row(
+                "SELECT count(*) FROM wait_replay_events WHERE wait_id=?1",
+                [wait_id],
+                |row| row.get(0),
+            )?;
+            let replayed_through = replayed_through
+                .ok_or_else(|| StoreError::Corrupt("replayed wait has no cursor".into()))?;
+            tx.commit()?;
+            return Ok(WaitReplay {
+                wait_id: wait_id.to_string(),
+                cursor_sequence,
+                replayed_through,
+                events_applied,
+                wake_requested: wake_requested == 1,
+                proved: false,
+                already_replayed: true,
+            });
+        }
+        let events: Vec<(i64, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT sequence, kind FROM events WHERE sequence > ?1 ORDER BY sequence",
+            )?;
+            let rows = stmt.query_map(params![cursor_sequence], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(StoreError::from)?
+        };
+        let mut wake = false;
+        for (sequence, kind) in &events {
+            let is_wake = kind == "wait.wake";
+            wake |= is_wake;
+            tx.execute(
+                "INSERT INTO wait_replay_events(wait_id,event_sequence,kind,wake) VALUES(?1,?2,?3,?4)",
+                params![wait_id, sequence, kind, i64::from(is_wake)],
+            )?;
+        }
+        let replayed_through =
+            i64::try_from(head(&tx)?).map_err(|_| invalid("wait cursor exceeds range"))?;
+        let updated = tx.execute(
+            "UPDATE wait_conditions SET state='replayed', replayed_through=?2, wake_requested=?3 WHERE wait_id=?1 AND state='waiting'",
+            params![wait_id, replayed_through, i64::from(wake)],
+        )?;
+        if updated != 1 {
+            return Err(StoreError::Conflict);
+        }
+        tx.commit()?;
+        Ok(WaitReplay {
+            wait_id: wait_id.to_string(),
+            cursor_sequence,
+            replayed_through,
+            events_applied: i64::try_from(events.len())
+                .map_err(|_| invalid("wait replay exceeds range"))?,
+            wake_requested: wake,
+            proved: false,
+            already_replayed: false,
+        })
+    }
+
+    /// A pull-request poll is not feedback and not a replan. This writes nothing.
+    pub fn request_replan_from_poll(&mut self, poll: &PullRequestPoll) -> Result<ReplanDecision> {
+        let _ = (poll.url.as_str(), poll.check.as_str(), poll.closed);
+        Err(invalid("pull-request poll is not a replan trigger"))
+    }
+
+    /// Two automatic replans for this blocker and plan revision, then one inbox item.
+    /// The third does not insert a plan proposal.
+    pub fn request_replan(&mut self, feedback_id: &str) -> Result<ReplanDecision> {
+        if !identifier(feedback_id) {
+            return Err(invalid("replan requires a schema 29 feedback row"));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        schema36(&tx)?;
+        if let Some(decision) = existing_replan(&tx, feedback_id)? {
+            tx.commit()?;
+            return Ok(decision);
+        }
+        let Some(feedback) = load_feedback(&tx, feedback_id)? else {
+            return Err(invalid("replan requires a schema 29 feedback row"));
+        };
+        if !matches!(
+            feedback.category.as_str(),
+            "verifier_rejection" | "integrator_rejection" | "integrator_conflict" | "invalidation"
+        ) {
+            return Err(invalid("pull-request poll is not a replan trigger"));
+        }
+        let plan_revision = current_revision(&tx)?;
+        let fingerprint =
+            blocker_fingerprint(&feedback.task_id, &feedback.category, &feedback.reason);
+        let used = automatic_count(&tx, plan_revision, &fingerprint)?;
+        let now = jiff::Timestamp::now().as_millisecond();
+        if used < AUTOMATIC_REPLANS {
+            let replan_id = sha256_hex(format!("replan\0{feedback_id}").as_bytes());
+            let proposal_id = replan_id.clone();
+            tx.execute(
+                "INSERT INTO replan_requests(replan_id,feedback_id,plan_revision,blocker_fingerprint,outcome,proposal_id,inbox_id,created_unix_ms) VALUES(?1,?2,?3,?4,'automatic',?5,NULL,?6)",
+                params![
+                    replan_id,
+                    feedback_id,
+                    integer(plan_revision)?,
+                    fingerprint,
+                    proposal_id,
+                    now
+                ],
+            )?;
+            ack_replan_proposal(&tx, feedback_id, &proposal_id, now)?;
+            tx.commit()?;
+            return Ok(ReplanDecision::Automatic {
+                replan_id,
+                proposal_id,
+                automatic_count: used + 1,
+            });
+        }
+        if let Some(decision) = existing_escalation(&tx, plan_revision, &fingerprint)? {
+            tx.commit()?;
+            return Ok(decision);
+        }
+        let replan_id = sha256_hex(format!("replan\0{feedback_id}").as_bytes());
+        let inbox_id = sha256_hex(format!("escalate\0{plan_revision}\0{fingerprint}").as_bytes());
+        insert_escalation_inbox(&tx, &inbox_id, feedback_id, &feedback, plan_revision, now)?;
+        tx.execute(
+            "INSERT INTO replan_requests(replan_id,feedback_id,plan_revision,blocker_fingerprint,outcome,proposal_id,inbox_id,created_unix_ms) VALUES(?1,?2,?3,?4,'escalated',NULL,?5,?6)",
+            params![
+                replan_id,
+                feedback_id,
+                integer(plan_revision)?,
+                fingerprint,
+                inbox_id,
+                now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(ReplanDecision::Escalated {
+            replan_id,
+            inbox_id,
+        })
+    }
+
+    /// Same attempt. The retry row is not an attempt, so max_attempts_per_task stays put.
+    pub fn retry_infrastructure(
+        &mut self,
+        task_id: &str,
+        attempt_id: &str,
+    ) -> Result<InfrastructureRetry> {
+        if !identifier(task_id) || !identifier(attempt_id) {
+            return Err(invalid("infrastructure retry is invalid"));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        schema36(&tx)?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attempts WHERE id=?1 AND task_id=?2)",
+            params![attempt_id, task_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(invalid("infrastructure retry attempt is missing"));
+        }
+        let ordinal: i64 = tx.query_row(
+            "SELECT coalesce(max(retry_ordinal), 0) + 1 FROM attempt_infrastructure_retries WHERE attempt_id=?1",
+            [attempt_id],
+            |row| row.get(0),
+        )?;
+        let retry_id = sha256_hex(format!("{attempt_id}\0{ordinal}").as_bytes());
+        let now = jiff::Timestamp::now().as_millisecond();
+        tx.execute(
+            "INSERT INTO attempt_infrastructure_retries(retry_id,attempt_id,task_id,retry_ordinal,created_unix_ms) VALUES(?1,?2,?3,?4,?5)",
+            params![retry_id, attempt_id, task_id, ordinal, now],
+        )?;
+        let (attempts_consumed, max_attempts_per_task) = attempt_budget(&tx, task_id)?;
+        tx.commit()?;
+        Ok(InfrastructureRetry {
+            attempt_id: attempt_id.to_string(),
+            ordinal,
+            attempts_consumed,
+            max_attempts_per_task,
+        })
+    }
+
+    /// Acceptance failure mints a new attempt. A changed contract is a new revision.
+    /// The previous verification run is left as stored.
+    pub fn rework_acceptance(
+        &mut self,
+        feedback_id: &str,
+        contract_changed: bool,
+    ) -> Result<AcceptanceRework> {
+        if !identifier(feedback_id) {
+            return Err(invalid("acceptance rework requires verifier feedback"));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        schema36(&tx)?;
+        let Some(feedback) = load_feedback(&tx, feedback_id)? else {
+            return Err(invalid("acceptance rework requires verifier feedback"));
+        };
+        if feedback.category != "verifier_rejection" {
+            return Err(invalid("acceptance rework requires verifier feedback"));
+        }
+        let attempt_id = format!("rework-{}", &feedback_id[..32]);
+        let existing: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attempts WHERE id=?1 AND task_id=?2)",
+            params![attempt_id, feedback.task_id],
+            |row| row.get(0),
+        )?;
+        let contract_bytes = format!("rework\0{feedback_id}");
+        let contract_digest = sha256_hex(contract_bytes.as_bytes());
+        if existing {
+            let (attempts_consumed, _) = attempt_budget(&tx, &feedback.task_id)?;
+            let contract_revision = if contract_changed {
+                Some(contract_revision_for_digest(
+                    &tx,
+                    &feedback.task_id,
+                    &contract_digest,
+                )?)
+            } else {
+                None
+            };
+            tx.commit()?;
+            return Ok(AcceptanceRework {
+                attempt_id,
+                attempts_consumed,
+                contract_revision,
+            });
+        }
+        if contract_changed {
+            let has_contract: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_contracts WHERE task_id=?1)",
+                [&feedback.task_id],
+                |row| row.get(0),
+            )?;
+            if !has_contract {
+                return Err(invalid("acceptance rework has no contract revision"));
+            }
+        }
+        let (consumed, limit) = attempt_budget(&tx, &feedback.task_id)?;
+        if consumed >= limit {
+            return Err(invalid("task attempt limit reached"));
+        }
+        tx.execute(
+            "INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) VALUES(?1,?2,1,'reserved',NULL,?3,0)",
+            params![attempt_id, feedback.task_id, format!("rework:{attempt_id}")],
+        )?;
+        tx.execute(
+            "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('attempt.rework',?1,1,1,?2)",
+            params![
+                attempt_id,
+                serde_json::json!({"task_id": feedback.task_id, "feedback_id": feedback_id}).to_string()
+            ],
+        )?;
+        let contract_revision = if contract_changed {
+            Some(insert_rework_contract(
+                &tx,
+                &feedback.task_id,
+                &contract_bytes,
+                &contract_digest,
+            )?)
+        } else {
+            None
+        };
+        let (attempts_consumed, _) = attempt_budget(&tx, &feedback.task_id)?;
+        tx.commit()?;
+        Ok(AcceptanceRework {
+            attempt_id,
+            attempts_consumed,
+            contract_revision,
+        })
+    }
+}
+
+fn existing_replan(tx: &Connection, feedback_id: &str) -> Result<Option<ReplanDecision>> {
+    let row: Option<(String, String, Option<String>, Option<String>, i64)> = tx
+        .query_row(
+            "SELECT replan_id, outcome, proposal_id, inbox_id, plan_revision FROM replan_requests WHERE feedback_id=?1",
+            [feedback_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()?;
+    let Some((replan_id, outcome, proposal_id, inbox_id, plan_revision)) = row else {
+        return Ok(None);
+    };
+    let fingerprint: String = tx.query_row(
+        "SELECT blocker_fingerprint FROM replan_requests WHERE replan_id=?1",
+        [&replan_id],
+        |row| row.get(0),
+    )?;
+    let count = automatic_count(
+        tx,
+        u64::try_from(plan_revision)
+            .map_err(|_| StoreError::Corrupt("plan revision is invalid".into()))?,
+        &fingerprint,
+    )?;
+    Ok(Some(decision_from_row(
+        &outcome,
+        replan_id,
+        proposal_id,
+        inbox_id,
+        count,
+    )?))
+}
+
+fn existing_escalation(
+    tx: &Connection,
+    plan_revision: u64,
+    fingerprint: &str,
+) -> Result<Option<ReplanDecision>> {
+    let row: Option<(String, String)> = tx
+        .query_row(
+            "SELECT replan_id, inbox_id FROM replan_requests WHERE plan_revision=?1 AND blocker_fingerprint=?2 AND outcome='escalated'",
+            params![integer(plan_revision)?, fingerprint],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(row.map(|(replan_id, inbox_id)| ReplanDecision::Escalated {
+        replan_id,
+        inbox_id,
+    }))
+}
+
+fn contract_revision_for_digest(tx: &Connection, task_id: &str, digest: &str) -> Result<i64> {
+    tx.query_row(
+        "SELECT contract_revision FROM task_contracts WHERE task_id=?1 AND raw_digest=?2",
+        params![task_id, digest],
+        |row| row.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| StoreError::Corrupt("rework contract is missing".into()))
+}
+
+fn insert_rework_contract(tx: &Connection, task_id: &str, raw: &str, digest: &str) -> Result<i64> {
+    if let Ok(revision) = contract_revision_for_digest(tx, task_id, digest) {
+        return Ok(revision);
+    }
+    let (plan_revision, project_store, expected_head, repository, base_oid, object_format, memory_snapshot_id, route, previous): (Option<i64>, String, i64, String, String, String, Option<String>, String, i64) = tx.query_row(
+        "SELECT plan_revision, project_store, expected_head, repository, base_oid, object_format, memory_snapshot_id, route, contract_revision FROM task_contracts WHERE task_id=?1 ORDER BY contract_revision DESC LIMIT 1",
+        [task_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+            ))
+        },
+    )?;
+    let next = previous + 1;
+    tx.execute(
+        "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('contract.rework',?1,?2,1,?3)",
+        params![
+            task_id,
+            next,
+            serde_json::json!({"contract_revision": next, "digest": digest}).to_string()
+        ],
+    )?;
+    let installed = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        params![
+            task_id,
+            next,
+            plan_revision,
+            project_store,
+            expected_head,
+            repository,
+            base_oid,
+            object_format,
+            memory_snapshot_id,
+            route,
+            raw.as_bytes(),
+            digest,
+            installed
+        ],
+    )?;
+    Ok(next)
 }
 
 pub fn propose_plan(
@@ -299,7 +1061,11 @@ pub fn propose_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{DependencyRequirement, Mutation, QueueRequest, TaskId, TaskState};
+    use crate::domain::{
+        Attempt, AttemptId, AttemptState, DependencyRequirement, Mutation, QueueRequest, TaskId,
+        TaskState,
+    };
+    use crate::store::feedback::LocalFeedback;
 
     fn fixture() -> (tempfile::TempDir, SqliteStore) {
         let temp = tempfile::tempdir().unwrap();
@@ -557,11 +1323,22 @@ mod tests {
     fn proposal_path_does_not_call_verify_signature_or_write_contracts() {
         let source = include_str!("plans.rs");
         let production = source.split("mod tests").next().unwrap();
+        let proposal = production
+            .split("pub fn apply_plan_proposal")
+            .nth(1)
+            .unwrap()
+            .split("fn schema36")
+            .next()
+            .unwrap();
+        assert!(!proposal.contains("verify_signature"));
+        assert!(!proposal.contains("task_contracts"));
+        assert!(!proposal.contains("contract_scope_paths"));
+        assert!(!proposal.contains("contract_named_resources"));
+        assert!(!proposal.contains("install_contract"));
+        assert!(!proposal.contains("reserve_"));
         assert!(!production.contains("verify_signature"));
-        assert!(!production.contains("task_contracts"));
-        assert!(!production.contains("contract_scope_paths"));
-        assert!(!production.contains("contract_named_resources"));
         assert!(!production.contains("install_contract"));
+        assert!(!production.contains("pr_polling"));
         assert!(!production.contains("reserve_"));
         let sql = include_str!("../../migrations/0031_plan_revisions.sql");
         assert!(!sql.contains("task_contracts"));
@@ -638,14 +1415,14 @@ mod tests {
     fn upgrade_v1_from_30_to_31_and_import_requires_current_schema() {
         let fresh = tempfile::tempdir().unwrap();
         let mut created = SqliteStore::create(&fresh.path().join("state.db")).unwrap();
-        assert_eq!(user_version(&created.connection), 35);
+        assert_eq!(user_version(&created.connection), 36);
         assert_eq!(
             created
                 .connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            35
+            36
         );
         assert!(table_exists(&created.connection, "plan_proposals"));
         assert!(table_exists(&created.connection, "plan_revisions"));
@@ -658,7 +1435,7 @@ mod tests {
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
         raw.execute_batch(
-            "DROP TABLE IF EXISTS resource_claims; DROP TABLE IF EXISTS delegation_stop_obligations; DROP TABLE IF EXISTS delegation_revocations; DROP TABLE IF EXISTS delegation_grants; DROP TABLE IF EXISTS capability_evidence; DROP TABLE IF EXISTS contract_named_resources; DROP TABLE IF EXISTS contract_scope_paths; DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; UPDATE store_meta SET schema_version=30; PRAGMA user_version=30;",
+            "DROP TABLE IF EXISTS wait_replay_events; DROP TABLE IF EXISTS replan_requests; DROP TABLE IF EXISTS replan_budget_resets; DROP TABLE IF EXISTS attempt_infrastructure_retries; DROP TABLE IF EXISTS wait_conditions; DROP TABLE IF EXISTS resource_claims; DROP TABLE IF EXISTS delegation_stop_obligations; DROP TABLE IF EXISTS delegation_revocations; DROP TABLE IF EXISTS delegation_grants; DROP TABLE IF EXISTS capability_evidence; DROP TABLE IF EXISTS contract_named_resources; DROP TABLE IF EXISTS contract_scope_paths; DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; UPDATE store_meta SET schema_version=30; PRAGMA user_version=30;",
         )
         .unwrap();
         drop(raw);
@@ -671,20 +1448,558 @@ mod tests {
         ));
         assert_eq!(user_version(&db.connection), 30);
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 35);
+        assert_eq!(user_version(&db.connection), 36);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            35
+            36
         );
         assert!(table_exists(&db.connection, "plan_proposals"));
         assert!(table_exists(&db.connection, "plan_revisions"));
         check_schema(&db.connection).unwrap();
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 35);
+        assert_eq!(user_version(&reopened.connection), 36);
         assert!(table_exists(&reopened.connection, "plan_revisions"));
+    }
+
+    fn seed_task(db: &mut SqliteStore, id: &str) {
+        let head = db.read_snapshot(None).unwrap().head;
+        db.commit(Commit {
+            expected_head: head,
+            mutations: vec![Mutation::Task {
+                expected: None,
+                next: Task {
+                    id: TaskId::new(id).unwrap(),
+                    revision: 1,
+                    state: TaskState::Running,
+                    title: id.into(),
+                    active_attempt: None,
+                },
+            }],
+        })
+        .unwrap();
+    }
+
+    fn feedback_id(operation_id: &str) -> String {
+        sha256_hex(format!("{operation_id}\0{}\0{}", 1, "verifier_rejection").as_bytes())
+    }
+
+    fn record_rejection(db: &mut SqliteStore, operation_id: &str, task: &str) -> String {
+        db.testing_record_feedback(LocalFeedback {
+            operation_id: operation_id.into(),
+            outcome_revision: 1,
+            category: "verifier_rejection".into(),
+            task_id: task.into(),
+            reason: "checks_failed".into(),
+        })
+        .unwrap();
+        feedback_id(operation_id)
+    }
+
+    #[test]
+    fn upgrade_v1_from_35_to_36_and_create_end_at_user_version_36() {
+        let fresh = tempfile::tempdir().unwrap();
+        let created_path = fresh.path().join("state.db");
+        let created = SqliteStore::create(&created_path).unwrap();
+        drop(created);
+        assert_eq!(
+            user_version(&rusqlite::Connection::open(&created_path).unwrap()),
+            36
+        );
+        assert!(table_exists(
+            &rusqlite::Connection::open(&created_path).unwrap(),
+            "wait_conditions"
+        ));
+        assert!(table_exists(
+            &rusqlite::Connection::open(&created_path).unwrap(),
+            "replan_requests"
+        ));
+        let open_fn = include_str!("mod.rs")
+            .split("pub fn open")
+            .nth(1)
+            .unwrap()
+            .split("pub fn integrity_check")
+            .next()
+            .unwrap();
+        assert!(!open_fn.contains("upgrade_v1"));
+        assert!(!open_fn.contains("0036_waits"));
+        let migration = include_str!("../../migrations/0036_waits.sql").to_ascii_lowercase();
+        assert!(!migration.contains("update verification"));
+        assert!(!migration.contains("delete from verification"));
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        let mut db = SqliteStore::create(&path).unwrap();
+        seed_task(&mut db, "kept");
+        drop(db);
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.execute_batch(
+            "DROP TABLE IF EXISTS wait_replay_events; DROP TABLE IF EXISTS replan_requests; DROP TABLE IF EXISTS replan_budget_resets; DROP TABLE IF EXISTS attempt_infrastructure_retries; DROP TABLE IF EXISTS wait_conditions; UPDATE store_meta SET schema_version=35; PRAGMA user_version=35;",
+        )
+        .unwrap();
+        drop(raw);
+        let mut db = SqliteStore::open(&path).unwrap();
+        assert_eq!(user_version(&db.connection), 35);
+        assert!(!table_exists(&db.connection, "wait_conditions"));
+        assert!(!table_exists(&db.connection, "replan_requests"));
+        assert_eq!(db.read_snapshot(None).unwrap().tasks[0].title, "kept");
+        db.upgrade_v1().unwrap();
+        assert_eq!(user_version(&db.connection), 36);
+        assert_eq!(
+            db.connection
+                .query_row("SELECT schema_version FROM store_meta", [], |row| row
+                    .get::<_, u32>(0))
+                .unwrap(),
+            36
+        );
+        assert!(table_exists(&db.connection, "wait_conditions"));
+        assert!(table_exists(&db.connection, "replan_requests"));
+        assert!(table_exists(&db.connection, "replan_budget_resets"));
+        assert!(table_exists(
+            &db.connection,
+            "attempt_infrastructure_retries"
+        ));
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM wait_conditions"),
+            0
+        );
+        check_schema(&db.connection).unwrap();
+        drop(db);
+        let reopened = SqliteStore::open(&path).unwrap();
+        assert_eq!(user_version(&reopened.connection), 36);
+    }
+
+    #[test]
+    fn restart_replays_the_wait_cursor_once() {
+        let (_temp, mut db) = fixture();
+        seed_task(&mut db, "task");
+        let events_before = count(&db.connection, "SELECT count(*) FROM events");
+        assert!(matches!(
+            db.register_wait("missing", None, "dependency_evidence"),
+            Err(StoreError::Invalid(_))
+        ));
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM wait_conditions"),
+            0
+        );
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM events"),
+            events_before
+        );
+        let registered = db
+            .register_wait("task", None, "dependency_evidence")
+            .unwrap();
+        assert!(!registered.already_registered);
+        let cursor_event: i64 = db
+            .connection
+            .query_row(
+                "SELECT sequence FROM events WHERE kind='wait.registered' AND entity=?1",
+                [&registered.wait_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(registered.cursor_sequence, cursor_event);
+        let again = db
+            .register_wait("task", None, "dependency_evidence")
+            .unwrap();
+        assert!(again.already_registered);
+        assert_eq!(
+            again,
+            WaitRegistration {
+                already_registered: true,
+                ..registered.clone()
+            }
+        );
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM wait_conditions"),
+            1
+        );
+        db.connection
+            .execute(
+                "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake',?1,1,1,'{\"wake\":true}')",
+                [&registered.wait_id],
+            )
+            .unwrap();
+        db.connection
+            .execute(
+                "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('task.noted','task',1,1,'{}')",
+                [],
+            )
+            .unwrap();
+        let replayed = db.replay_wait(&registered.wait_id).unwrap();
+        assert!(!replayed.already_replayed);
+        assert!(replayed.wake_requested);
+        assert!(!replayed.proved);
+        assert_eq!(replayed.events_applied, 2);
+        assert_eq!(replayed.cursor_sequence, registered.cursor_sequence);
+        assert!(replayed.replayed_through > replayed.cursor_sequence);
+        db.connection
+            .execute(
+                "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake',?1,1,1,'{\"wake\":true}')",
+                [&registered.wait_id],
+            )
+            .unwrap();
+        let second = db.replay_wait(&registered.wait_id).unwrap();
+        assert!(second.already_replayed);
+        assert_eq!(second.events_applied, 2);
+        assert!(!second.proved);
+        assert_eq!(second.replayed_through, replayed.replayed_through);
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM wait_replay_events"),
+            2
+        );
+        let registration_replayed: i64 = db
+            .connection
+            .query_row(
+                "SELECT count(*) FROM wait_replay_events WHERE kind='wait.registered'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(registration_replayed, 0);
+        let stored: (String, String) = db
+            .connection
+            .query_row("SELECT state, condition FROM wait_conditions", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(stored, ("replayed".into(), "dependency_evidence".into()));
+        assert!(db
+            .connection
+            .execute("UPDATE wait_conditions SET wake_requested=0", [])
+            .is_err());
+    }
+
+    #[test]
+    fn third_replan_is_an_inbox_escalation_not_another_proposal() {
+        let (_temp, mut db) = fixture();
+        seed_task(&mut db, "task");
+        let mut ids = Vec::new();
+        for operation in ["op-1", "op-2", "op-3", "op-4"] {
+            ids.push(record_rejection(&mut db, operation, "task"));
+        }
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM plan_proposals"),
+            0
+        );
+        let first = db.request_replan(&ids[0]).unwrap();
+        let replay = db.request_replan(&ids[0]).unwrap();
+        assert_eq!(first, replay);
+        assert!(matches!(
+            first,
+            ReplanDecision::Automatic {
+                automatic_count: 1,
+                ..
+            }
+        ));
+        let second = db.request_replan(&ids[1]).unwrap();
+        assert!(matches!(
+            second,
+            ReplanDecision::Automatic {
+                automatic_count: 2,
+                ..
+            }
+        ));
+        let third = db.request_replan(&ids[2]).unwrap();
+        let ReplanDecision::Escalated { inbox_id, .. } = third.clone() else {
+            panic!("third replan must escalate");
+        };
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM plan_proposals"),
+            0
+        );
+        assert_eq!(
+            count(
+                &db.connection,
+                "SELECT count(*) FROM replan_requests WHERE outcome='automatic'"
+            ),
+            2
+        );
+        assert_eq!(
+            count(
+                &db.connection,
+                "SELECT count(*) FROM replan_requests WHERE outcome='escalated'"
+            ),
+            1
+        );
+        assert_eq!(count(&db.connection, "SELECT count(*) FROM inbox_items"), 1);
+        let kind: String = db
+            .connection
+            .query_row(
+                "SELECT json_extract(payload, '$.kind') FROM inbox_items WHERE id=?1",
+                [&inbox_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "replan-escalation");
+        let third_state: (String, Option<String>) = db
+            .connection
+            .query_row(
+                "SELECT state, replan_proposal_id FROM feedback_items WHERE feedback_id=?1",
+                [&ids[2]],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(third_state, ("open".into(), None));
+        let fourth = db.request_replan(&ids[3]).unwrap();
+        assert_eq!(fourth, third);
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM plan_proposals"),
+            0
+        );
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM replan_requests"),
+            3
+        );
+        assert_eq!(count(&db.connection, "SELECT count(*) FROM inbox_items"), 1);
+        let proposed = db
+            .apply_plan_proposal(&proposal(&one("task", "new plan", "")), 0, "reset-key")
+            .unwrap();
+        assert_eq!(proposed.plan_revision, 1);
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM replan_budget_resets"),
+            1
+        );
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM plan_proposals"),
+            1
+        );
+        let fifth = record_rejection(&mut db, "op-5", "task");
+        let reset = db.request_replan(&fifth).unwrap();
+        assert!(matches!(
+            reset,
+            ReplanDecision::Automatic {
+                automatic_count: 1,
+                ..
+            }
+        ));
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM plan_proposals"),
+            1
+        );
+        assert_eq!(count(&db.connection, "SELECT count(*) FROM inbox_items"), 1);
+        assert_eq!(
+            count(
+                &db.connection,
+                "SELECT count(*) FROM replan_requests WHERE outcome='automatic'"
+            ),
+            3
+        );
+    }
+
+    #[test]
+    fn pr_poll_fixture_does_not_create_a_replan() {
+        let (_temp, mut db) = fixture();
+        seed_task(&mut db, "task");
+        let proposals = count(&db.connection, "SELECT count(*) FROM plan_proposals");
+        let rejected = db.request_replan_from_poll(&PullRequestPoll {
+            url: "https://github.com/owner/repo/pull/7".into(),
+            check: "failure".into(),
+            closed: true,
+        });
+        assert!(
+            matches!(rejected, Err(StoreError::Invalid(message)) if message.contains("pull-request"))
+        );
+        assert!(matches!(
+            db.testing_record_feedback(LocalFeedback {
+                operation_id: "pr-poll-1".into(),
+                outcome_revision: 1,
+                category: "pr_poll".into(),
+                task_id: "task".into(),
+                reason: "https://github.com/owner/repo/pull/7".into(),
+            }),
+            Err(StoreError::Invalid(_))
+        ));
+        assert!(matches!(
+            db.request_replan("pr-poll-1"),
+            Err(StoreError::Invalid(_))
+        ));
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM feedback_items"),
+            0
+        );
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM replan_requests"),
+            0
+        );
+        assert_eq!(count(&db.connection, "SELECT count(*) FROM inbox_items"), 0);
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM plan_proposals"),
+            proposals
+        );
+        assert_eq!(count(&db.connection, "SELECT count(*) FROM attempts"), 0);
+    }
+
+    #[test]
+    fn infrastructure_retry_does_not_consume_max_attempts_per_task() {
+        let (_temp, mut db) = fixture();
+        seed_task(&mut db, "task");
+        let head = db.read_snapshot(None).unwrap().head;
+        db.commit(Commit {
+            expected_head: head,
+            mutations: vec![Mutation::Attempt {
+                expected: None,
+                next: Attempt {
+                    id: AttemptId::new("attempt-1").unwrap(),
+                    task: TaskId::new("task").unwrap(),
+                    revision: 1,
+                    state: AttemptState::Running,
+                    snapshot: None,
+                    reservation: "slot-1".into(),
+                    termination_observed: false,
+                },
+            }],
+        })
+        .unwrap();
+        let head = db.read_snapshot(None).unwrap().head;
+        db.set_scheduler_policy(head, 1, 0, 1).unwrap();
+        let feedback = record_rejection(&mut db, "accept-1", "task");
+        let first = db.retry_infrastructure("task", "attempt-1").unwrap();
+        assert_eq!(first.ordinal, 1);
+        assert_eq!(first.attempts_consumed, 1);
+        assert_eq!(first.max_attempts_per_task, 1);
+        let second = db.retry_infrastructure("task", "attempt-1").unwrap();
+        assert_eq!(second.ordinal, 2);
+        assert_eq!(second.attempts_consumed, 1);
+        assert_eq!(count(&db.connection, "SELECT count(*) FROM attempts"), 1);
+        assert_eq!(
+            count(
+                &db.connection,
+                "SELECT count(*) FROM attempt_infrastructure_retries"
+            ),
+            2
+        );
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM replan_requests"),
+            0
+        );
+        assert!(matches!(
+            db.rework_acceptance(&feedback, false),
+            Err(StoreError::Invalid(message)) if message.contains("attempt limit")
+        ));
+        assert_eq!(count(&db.connection, "SELECT count(*) FROM attempts"), 1);
+    }
+
+    fn seed_rejected_verification(db: &mut SqliteStore) {
+        seed_task(db, "task");
+        let head = db.read_snapshot(None).unwrap().head;
+        db.commit(Commit {
+            expected_head: head,
+            mutations: vec![Mutation::Attempt {
+                expected: None,
+                next: Attempt {
+                    id: AttemptId::new("attempt-1").unwrap(),
+                    task: TaskId::new("task").unwrap(),
+                    revision: 1,
+                    state: AttemptState::Running,
+                    snapshot: None,
+                    reservation: "slot-1".into(),
+                    termination_observed: false,
+                },
+            }],
+        })
+        .unwrap();
+        let project_store = std::fs::canonicalize(db.connection.path().unwrap())
+            .unwrap()
+            .display()
+            .to_string();
+        let installed: i64 = db
+            .connection
+            .query_row("SELECT max(sequence) FROM events", [], |row| row.get(0))
+            .unwrap();
+        let raw = b"contract-v1";
+        let digest = sha256_hex(raw);
+        let base = "b".repeat(40);
+        let oid = "a".repeat(40);
+        db.connection.execute(
+            "INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq) VALUES('task',1,NULL,?1,0,'/tmp/repo',?2,'sha1',NULL,'verify_only',?3,?4,?5)",
+            params![project_store, base, raw, digest, installed],
+        ).unwrap();
+        db.connection.execute(
+            "INSERT INTO acceptance_policies(task_id,contract_revision,policy_id,body) VALUES('task',1,'policy-1','{\"version\":1}')",
+            [],
+        ).unwrap();
+        let submission = "c".repeat(64);
+        db.connection.execute(
+            "INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,memory_snapshot_id,artifact_manifest,claimed_checks,created_unix_ms) VALUES(?1,?2,'submit-1',?3,'{}','task',1,?3,'attempt-1','/tmp/repo',?4,?5,'sha1',NULL,'[]','[]',0)",
+            params![submission, project_store, digest, base, oid],
+        ).unwrap();
+        db.connection.execute(
+            "INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,?2,'verify-1',?3,?4,'task',1,?3,'attempt-1','policy-1',?5,?6,NULL,'sha1',0,'linux-unshare-user-pid-mount-v1','[\"/usr/bin/true\"]','[]','rejected','checks_failed',1,NULL,1,1,0)",
+            params![
+                "d".repeat(64),
+                project_store,
+                digest,
+                submission,
+                sha256_hex(br#"{"version":1}"#),
+                oid
+            ],
+        ).unwrap();
+    }
+
+    fn verification_snapshot(
+        db: &Connection,
+    ) -> (String, String, Option<String>, String, i64, Option<String>) {
+        db.query_row(
+            "SELECT run_id, state, reason, attempt_id, contract_revision, receipt_digest FROM verification_runs",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn acceptance_rework_leaves_old_verification_rows_immutable() {
+        let (_temp, mut db) = fixture();
+        seed_rejected_verification(&mut db);
+        let before = verification_snapshot(&db.connection);
+        let old_digest: String = db
+            .connection
+            .query_row(
+                "SELECT raw_digest FROM task_contracts WHERE contract_revision=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let feedback = record_rejection(&mut db, "accept-2", "task");
+        let rework = db.rework_acceptance(&feedback, true).unwrap();
+        assert_eq!(rework.attempts_consumed, 2);
+        assert_eq!(rework.contract_revision, Some(2));
+        assert_eq!(count(&db.connection, "SELECT count(*) FROM attempts"), 2);
+        assert_eq!(verification_snapshot(&db.connection), before);
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM verified_results"),
+            0
+        );
+        let kept: String = db
+            .connection
+            .query_row(
+                "SELECT raw_digest FROM task_contracts WHERE contract_revision=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, old_digest);
+        assert_ne!(
+            db.connection
+                .query_row(
+                    "SELECT raw_digest FROM task_contracts WHERE contract_revision=2",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            old_digest
+        );
+        assert!(db
+            .connection
+            .execute("UPDATE verification_runs SET reason='rewritten'", [])
+            .is_err());
+        let again = db.rework_acceptance(&feedback, true).unwrap();
+        assert_eq!(again.attempt_id, rework.attempt_id);
+        assert_eq!(count(&db.connection, "SELECT count(*) FROM attempts"), 2);
+        assert_eq!(verification_snapshot(&db.connection), before);
     }
 }

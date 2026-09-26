@@ -61,6 +61,7 @@ impl SqliteStore {
         if version<=32 {tx.execute_batch(include_str!("../../migrations/0033_capability_evidence.sql"))?;}
         if version<=33 {tx.execute_batch(include_str!("../../migrations/0034_delegation_grants.sql"))?;}
         if version<=34 {tx.execute_batch(include_str!("../../migrations/0035_resource_claims.sql"))?;}
+        if version<=35 {tx.execute_batch(include_str!("../../migrations/0036_waits.sql"))?;}
         tx.commit()?;
         Ok(())
     }
