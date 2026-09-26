@@ -232,9 +232,6 @@ enum Command {
     /// Inspect or edit migrated task records without starting execution
     #[cfg(feature="state-store")]
     Task { slug:String, #[command(subcommand)] command:TaskCommand },
-    /// Signed factory admission. The only production writer of factory_admission.
-    #[cfg(all(feature = "state-store", target_os = "linux"))]
-    Factory { #[command(subcommand)] command: FactoryCommand },
     /// Record an untrusted worker result. Does not verify or launch.
     #[cfg(feature="state-store")]
     Result { slug:String, #[command(subcommand)] command:ResultCommand },
@@ -583,25 +580,6 @@ enum ResultCommand {
     /// Read stored submissions. Claimed checks are not evidence.
     Show { #[arg(long)] id:Option<String> },
 }
-#[cfg(all(feature = "state-store", target_os = "linux"))]
-#[derive(Subcommand)]
-enum FactoryCommand {
-    /// Verify raw bytes under admission@herdr-projects and set factory_admission. Does not launch.
-    Admission {
-        slug: String,
-        #[arg(long, conflicts_with = "disable", required_unless_present = "disable")]
-        enable: bool,
-        #[arg(long, conflicts_with = "enable")]
-        disable: bool,
-        #[arg(long)]
-        policy: PathBuf,
-        #[arg(long)]
-        signature: PathBuf,
-        /// Manifest file. Required for --enable. Not read for --disable.
-        #[arg(long, required_unless_present = "disable")]
-        evidence: Option<PathBuf>,
-    },
-}
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
 enum TaskCommand {
@@ -651,6 +629,22 @@ enum OperationsCommand { Inspect,
 enum FactoryCommand {
     /// Schema, admission, and bounded counters. No environment, argv, or secrets.
     Status { slug:String },
+    /// Verify raw bytes under admission@herdr-projects and set factory_admission. Does not launch.
+    #[cfg(target_os = "linux")]
+    Admission {
+        slug: String,
+        #[arg(long, conflicts_with = "disable", required_unless_present = "disable")]
+        enable: bool,
+        #[arg(long, conflicts_with = "enable")]
+        disable: bool,
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        signature: PathBuf,
+        /// Manifest file. Required for --enable. Not read for --disable.
+        #[arg(long, required_unless_present = "disable")]
+        evidence: Option<PathBuf>,
+    },
 }
 
 #[cfg(feature="state-store")]
@@ -947,17 +941,15 @@ pub fn run() -> Result<()> {
                 SchedulerCommand::Policy{max_active_workers,max_attempts_per_task,expected_revision,expected_head}=>println!("{}",herdr_projects::runtime::scheduler_policy(&dir,expected_head,expected_revision,max_active_workers,max_attempts_per_task)?),
             }Ok(())
         },
-        #[cfg(all(feature = "state-store", target_os = "linux"))]
-        Command::Factory { command } => match command {
+        #[cfg(feature="state-store")]
+        Command::Factory{command}=>match command {
+            #[cfg(target_os = "linux")]
             FactoryCommand::Admission { slug, enable, disable: _, policy, signature, evidence } => {
                 project::validate_slug(&slug)?;
                 let dir = ctx.root.join(&slug);
                 println!("{}", serde_json::to_string_pretty(&herdr_projects::authority::import_admission(&dir, enable, &policy, &signature, evidence.as_deref())?)?);
                 Ok(())
             }
-        },
-        #[cfg(feature="state-store")]
-        Command::Factory{command}=>match command {
             FactoryCommand::Status{slug}=>{
                 project::validate_slug(&slug)?;
                 let dir=ctx.root.join(slug);
