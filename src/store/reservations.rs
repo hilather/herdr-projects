@@ -137,6 +137,7 @@ impl SqliteStore {
         event(&tx,"attempt.reserved",attempt_id.as_str(),1,&record)?;event(&tx,"task.changed",attempt.task.as_str(),task_revision,&task)?;
         event(&tx,"operation.enqueued",operation_id.as_str(),task_revision,&record)?;
         let result=Reservation{head:head(&tx)?,record,task_revision};
+        super::consumer_bindings::reconcile_active(&tx)?;
         #[cfg(test)]
         tests::crash_boundary("before_reservation_commit");
         tx.commit()?;Ok(Some(result))
@@ -172,6 +173,7 @@ impl SqliteStore {
         if task.active_attempt.as_ref()==Some(id)||released {task.revision=task.revision.checked_add(1).ok_or_else(||invalid("task revision exhausted"))?;tx.execute("UPDATE tasks SET revision=?2,state=?3,active_attempt=?4 WHERE id=?1",params![task.id.as_str(),integer(task.revision)?,task.state.as_str(),task.active_attempt.as_ref().map(AttemptId::as_str)])?;event(&tx,"task.changed",task.id.as_str(),task.revision,&task)?;}
         let request=CancellationRequest{attempt:id.clone(),requested_unix_ms:now,reason:reason.into()};tx.execute("INSERT INTO attempt_cancellations VALUES(?1,?2,?3)",params![id.as_str(),now,reason])?;
         event(&tx,"attempt.cancellation_requested",id.as_str(),attempt.revision,&serde_json::json!({"request":request,"released":released,"attempt":attempt}))?;
+        super::consumer_bindings::reconcile_active(&tx)?;
         let result=CancellationChange{head:head(&tx)?,attempt:id.clone(),released,attempt_revision:attempt.revision,task_revision:task.revision};tx.commit()?;Ok(result)
     }
 }

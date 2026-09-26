@@ -203,7 +203,7 @@ pub(super) fn ensure_for_snapshot(
 pub(super) fn backfill_from_subscriptions(tx: &rusqlite::Transaction) -> Result<()> {
     let mut stmt = tx.prepare(
         "SELECT s.subscriber,s.snapshot_id,m.task_id FROM memory_subscriptions s
-         JOIN memory_snapshots m ON m.id=s.snapshot_id ORDER BY s.subscriber,s.id",
+         JOIN memory_snapshots m ON m.id=s.snapshot_id ORDER BY m.sequence,s.id",
     )?;
     let rows = stmt
         .query_map([], |row| {
@@ -216,41 +216,18 @@ pub(super) fn backfill_from_subscriptions(tx: &rusqlite::Transaction) -> Result<
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(stmt);
     for (subscriber, snapshot, task) in rows {
-        if load_by_snapshot(tx, &snapshot)?.is_some() {
-            continue;
-        }
-        let generation: i64 = tx.query_row(
-            "SELECT coalesce(max(generation),0)+1 FROM consumer_bindings WHERE consumer_id=?1",
-            [&subscriber],
-            |row| row.get(0),
-        )?;
-        let (routes, live_attempt) = route_state(tx, &snapshot)?;
         let task_id = if task == "coordinator" {
             None
         } else {
-            Some(task)
+            Some(task.as_str())
         };
-        let attempt = if task_id.is_some() {
-            live_attempt
-        } else {
-            None
-        };
-        insert_binding(
-            tx,
-            &subscriber,
-            &snapshot,
-            task_id.as_deref(),
-            attempt.as_deref(),
-            generation,
-            routes,
-        )?;
+        ensure_for_snapshot(tx, &subscriber, &snapshot, task_id)?;
     }
     Ok(())
 }
 
-/// O(non-retired bindings) per change. Move next to attempt and task writes
-/// once those updates share one function.
-pub(super) fn reconcile_active(tx: &rusqlite::Transaction) -> Result<()> {
+/// Must see attempt and task rows already written in this transaction.
+pub(super) fn reconcile_active(tx: &Connection) -> Result<()> {
     let version: u32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version < SCHEMA_VERSION {
         return Ok(());
@@ -391,6 +368,7 @@ impl SqliteStore {
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         require_schema(&tx)?;
+        reconcile_active(&tx)?;
         let Some(binding) = load(&tx, binding_id)? else {
             return Err(invalid("consumer binding is missing"));
         };
@@ -668,6 +646,59 @@ mod tests {
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
         assert_eq!(user_version(&reopened.connection), 37);
+    }
+
+    #[test]
+    fn backfill_numbers_generations_by_snapshot_sequence() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        let mut db = SqliteStore::create(&path).unwrap();
+        let tx = db.connection.transaction().unwrap();
+        let digest = "b".repeat(64);
+        let scope = "d".repeat(64);
+        for (id, sequence, manifest) in [
+            ("snap-old", 1, "c".repeat(64)),
+            ("snap-new", 5, "e".repeat(64)),
+        ] {
+            tx.execute(
+                "INSERT INTO memory_snapshots(id,task_id,task_revision,profile_name,profile_digest,config_digest,selection_policy_version,estimator,sequence,required_bytes,optional_bytes,budget_bytes,omitted_optional_count,manifest_hash,scope_digest) VALUES(?1,'coordinator',1,'planner',?2,NULL,1,'test',?3,0,0,0,0,?4,?5)",
+                params![id, digest, sequence, manifest, scope],
+            )
+            .unwrap();
+        }
+        // Subscription ids sort opposite snapshot age. Generation must follow sequence.
+        tx.execute(
+            "INSERT INTO memory_subscriptions(id,subscriber,snapshot_id,since_seq) VALUES('sub-z','coordinator:session','snap-old',1),('sub-a','coordinator:session','snap-new',1)",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        drop(db);
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.execute_batch(
+            "DROP TABLE IF EXISTS consumer_binding_undeliverable; DROP TABLE IF EXISTS consumer_binding_obligations; DROP TABLE IF EXISTS consumer_bindings; UPDATE store_meta SET schema_version=36; PRAGMA user_version=36;",
+        )
+        .unwrap();
+        drop(raw);
+        let mut db = SqliteStore::open(&path).unwrap();
+        let attempts = count(&db.connection, "SELECT count(*) FROM attempts");
+        db.upgrade_v1().unwrap();
+        let older = db
+            .consumer_binding_for_snapshot("snap-old")
+            .unwrap()
+            .unwrap();
+        let newer = db
+            .consumer_binding_for_snapshot("snap-new")
+            .unwrap()
+            .unwrap();
+        assert_eq!(older.generation, 1);
+        assert_eq!(newer.generation, 2);
+        assert!(older.attempt_id.is_none() && newer.attempt_id.is_none());
+        assert!(older.task_id.is_none() && newer.task_id.is_none());
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM attempts"),
+            attempts
+        );
     }
 
     #[test]

@@ -230,6 +230,7 @@ impl SqliteStore {
         ] {
             tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?1,?2,?3,1,?4)",params![kind,entity,integer(revision)?,value.map_err(|_|StoreError::Invalid("termination event encoding failed".into()))?])?;
         }
+        super::consumer_bindings::reconcile_active(&tx)?;
         tx.commit()?;
         Ok(attempt)
     }
@@ -397,6 +398,7 @@ impl SqliteStore {
         ] {
             tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?1,?2,?3,1,?4)",params![kind,entity,integer(revision)?,payload.map_err(|_|StoreError::Invalid("staged stop encoding failed".into()))?])?;
         }
+        super::consumer_bindings::reconcile_active(&tx)?;
         tx.commit()?;
         Ok(attempt)
     }

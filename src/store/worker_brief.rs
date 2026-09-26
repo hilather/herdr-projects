@@ -341,6 +341,7 @@ impl SqliteStore {
             now,
             claim.map(|c| c.owner.as_str()).unwrap_or("brief-recovery"),
         )?;
+        super::consumer_bindings::reconcile_active(&tx)?;
         tx.commit()?;
         Ok(result)
     }

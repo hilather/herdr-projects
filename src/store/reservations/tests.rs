@@ -403,6 +403,214 @@ fn sealed_reservation_binds_knowledge_and_pre_effect_checks_reject_later_changes
 }
 
 #[test]
+fn reserve_and_termination_refresh_bindings_without_generic_commit() {
+    use crate::domain::{
+        AttemptOutputReference, LaunchTarget, LaunchStoppedReceipt, PreparedLaunchStopped,
+        ResourceIdentity, RuntimeRoute, SnapshotPlan, SnapshotRequest, VersionedReference,
+    };
+    use crate::domain::SELECTION_ESTIMATOR;
+    use crate::worker_supervision::{ProcessIncarnation, SupervisorIdentity};
+    let (_temp, mut db, mut prepared) = fixture();
+    let launch = &mut prepared[0];
+    let profile = launch.inputs.effective_profile.as_ref().unwrap().clone();
+    let task_id = launch.inputs.task.as_str().to_string();
+    let config_digest = launch.inputs.config.digest.clone();
+    let snap = |db: &mut SqliteStore, instructions: &str| {
+        db.create_memory_snapshot(SnapshotPlan {
+            coordinator: false,
+            session_id: None,
+            request: SnapshotRequest {
+                schema_version: 1,
+                task_id: task_id.clone(),
+                profile: profile.name.clone(),
+                domains: vec![],
+                paths: vec![],
+                pinned_keys: vec![],
+                sensitivity: "default".into(),
+            },
+            profile_name: profile.name.clone(),
+            profile_digest: profile.definition_digest.clone(),
+            config_digest: config_digest.clone(),
+            budget_chars: 32_000,
+            estimator: SELECTION_ESTIMATOR.into(),
+            instructions: instructions.into(),
+            now_unix_ms: 1000,
+            expected_heads_digest: None,
+        })
+        .unwrap()
+    };
+    let reserved_snapshot = snap(&mut db, "reserved instructions");
+    let earlier = snap(&mut db, "earlier sibling instructions");
+    launch.inputs.memory = Some(VersionedReference {
+        id: reserved_snapshot.id.as_str().into(),
+        revision: 1,
+        digest: reserved_snapshot.manifest_hash.clone(),
+    });
+    let grant = ApprovalGrant {
+        version: 1,
+        scope: ApprovalScope::for_launch(&launch.inputs).unwrap(),
+        policy: profile.permission_policy.clone(),
+        issued_unix_ms: 0,
+        expires_unix_ms: 100_000,
+    };
+    let head = db.read_snapshot(None).unwrap().head;
+    launch.inputs.approval = db
+        .install_approval(&PreparedApproval { grant }, head, 1000)
+        .unwrap();
+    let head = db.read_snapshot(None).unwrap().head;
+    let reservation = db
+        .reserve_prepared(&[launch.clone()], head, 1000)
+        .unwrap();
+    let reserved_binding = db
+        .consumer_binding_for_snapshot(reserved_snapshot.id.as_str())
+        .unwrap()
+        .unwrap();
+    let earlier_binding = db
+        .consumer_binding_for_snapshot(earlier.id.as_str())
+        .unwrap()
+        .unwrap();
+    assert!(reserved_binding.active);
+    assert_eq!(
+        reserved_binding.attempt_id.as_deref(),
+        Some(reservation.record.attempt.as_str())
+    );
+    assert!(!earlier_binding.active);
+    let successor = snap(&mut db, "successor instructions");
+    let successor_binding = db
+        .consumer_binding_for_snapshot(successor.id.as_str())
+        .unwrap()
+        .unwrap();
+    assert!(!successor_binding.active);
+    let _claim = db
+        .claim_operation(&reservation.record.operation, 1, "worker", 1000, 1000)
+        .unwrap();
+    let supervisor = SupervisorIdentity {
+        version: 2,
+        boot_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+        host_id: Some("a".repeat(64)),
+        observer_namespace: (1, 2),
+        worker_namespace: (1, 3),
+        outer: ProcessIncarnation {
+            pid: 2,
+            device: 1,
+            inode: 1,
+        },
+        init: ProcessIncarnation {
+            pid: 3,
+            device: 1,
+            inode: 2,
+        },
+    };
+    let target = LaunchTarget {
+        version: 2,
+        attempt: reservation.record.attempt.clone(),
+        operation: reservation.record.operation.clone(),
+        route: RuntimeRoute {
+            machine: String::new(),
+            socket: "/tmp/herdr.sock".into(),
+            workspace_id: "ws".into(),
+            tab_id: "tab".into(),
+            pane_id: "pane".into(),
+            cwd: "/tmp/task".into(),
+        },
+        terminal: "term".into(),
+        session: ResourceIdentity {
+            device: 1,
+            inode: 2,
+            born_secs: 3,
+            born_nanos: 0,
+        },
+        supervisor: Some(supervisor),
+        observed_unix_ms: 1500,
+    };
+    db.connection
+        .execute(
+            "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_target',?1,1,1,?2)",
+            params![
+                reservation.record.operation.as_str(),
+                serde_json::to_string(&target).unwrap()
+            ],
+        )
+        .unwrap();
+    let head = db.read_snapshot(None).unwrap().head;
+    db.record_launch_stopped(
+        &PreparedLaunchStopped {
+            receipt: LaunchStoppedReceipt {
+                version: 1,
+                target: target.clone(),
+                host_reboot: None,
+                repository_snapshots: vec![],
+                output_snapshot: Some(AttemptOutputReference {
+                    source: crate::domain::worker_output_path(
+                        &reservation.record.inputs,
+                        &reservation.record.attempt,
+                    )
+                    .unwrap(),
+                    digest: None,
+                }),
+                observed_unix_ms: 1500,
+            },
+        },
+        1,
+        head,
+        1500,
+    )
+    .unwrap();
+    let successor_binding = db
+        .consumer_binding_for_snapshot(successor.id.as_str())
+        .unwrap()
+        .unwrap();
+    assert!(successor_binding.active);
+    let sequence: i64 = db
+        .connection
+        .query_row("SELECT max(sequence) FROM events", [], |row| row.get(0))
+        .unwrap();
+    let hash = "ab".repeat(32);
+    db.connection
+        .execute(
+            "INSERT INTO objects(hash,size,availability,collection,pin_count,fencing_token) VALUES(?1,1,'available','unclaimed',0,0)",
+            [&hash],
+        )
+        .unwrap();
+    db.connection
+        .execute(
+            "INSERT INTO memory_records(id,record_key,scope_id,kind,is_hard) VALUES('fact','fact','project','observation',0)",
+            [],
+        )
+        .unwrap();
+    db.connection
+        .execute(
+            "INSERT INTO memory_revisions(record_id,revision,body_hash,provenance_hash,promoted_seq,applicability) VALUES('fact',1,?1,?1,?2,'{\"domains\":[],\"paths\":[]}')",
+            params![hash, sequence],
+        )
+        .unwrap();
+    db.connection
+        .execute(
+            "INSERT INTO memory_delivery_intents(id,cause_id,subscriber,snapshot_id,task_id,record_id,revision,severity,triggering_seq,state) VALUES('delivery-keep','cause',?1,?2,?3,'fact',1,'informational',?4,'pending')",
+            params![
+                format!("task:{task_id}"),
+                reserved_snapshot.id.as_str(),
+                task_id,
+                sequence
+            ],
+        )
+        .unwrap();
+    db.retire_consumer_binding(
+        &reserved_binding.binding_id,
+        Some(&successor_binding.binding_id),
+    )
+    .unwrap();
+    assert!(db
+        .binding_obligations(&successor_binding.binding_id)
+        .unwrap()
+        .contains(&"delivery-keep".to_string()));
+    assert!(db
+        .binding_undeliverable(&reserved_binding.binding_id)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn untyped_launch_confirmation_and_capacity_release_are_atomic_refusals() {
     let (_temp,mut db,p)=fixture();
     let reservation=reserve(&mut db,&p);

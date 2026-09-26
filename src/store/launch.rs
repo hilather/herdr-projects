@@ -1007,6 +1007,7 @@ impl SqliteStore {
             now,
             claim.map(|c| c.owner.as_str()).unwrap_or("launch-recovery"),
         )?;
+        super::consumer_bindings::reconcile_active(&tx)?;
         #[cfg(test)]
         super::reservations::tests::crash_boundary("before_start_receipt_commit");
         tx.commit()?;

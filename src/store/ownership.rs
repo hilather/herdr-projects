@@ -68,6 +68,7 @@ impl SqliteStore {
         tx.execute("INSERT INTO runtime_ownership VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(binding_id) DO UPDATE SET revision=excluded.revision,binding_revision=excluded.binding_revision,attempt_id=excluded.attempt_id,payload=excluded.payload,payload_hash=excluded.payload_hash",params![id,integer(revision)?,integer(binding.revision)?,owned.attempt.as_ref().map(AttemptId::as_str),payload,format!("{:x}",Sha256::digest(payload.as_bytes()))])?;
         tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.adopted',?1,?2,1,?3)",params![id,integer(revision)?,payload])?;
         super::control::invalidate(&tx)?;
+        super::consumer_bindings::reconcile_active(&tx)?;
         let result=OwnershipChange{head:head(&tx)?,ownership:owned,task_revision:task.map(|t|t.revision)};tx.commit()?;Ok(result)
     }
 }
