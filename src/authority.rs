@@ -219,7 +219,9 @@ fn reason_code(error:&anyhow::Error)->&'static str {
     if text.contains("self-signature") {"self_signature"}
     else if text.contains("signature") {"signature_failed"}
     else if text.contains("wrong repo") {"wrong_repo"}
-    else if text.contains("expired") {"expired"}
+    // Dedicated expiry wording. A message that only mentions expiry next to an
+    // authority mismatch must not be stored as expired.
+    else if text.contains("grant is expired")||text.contains("authorization is expired") {"expired"}
     else if text.contains("different project")||text.contains("another project")||text.contains("belongs to a different") {"cross_project"}
     else if text.contains("conflict")||text.contains("expected_head") {"stale_head"}
     else if text.contains("invalid") {"invalid_document"}
@@ -754,11 +756,22 @@ mod tests {
         fs::write(&sig,&signature).unwrap();
         let installed=import_delegation(&project,&path,&sig).unwrap();
         let mut db=migration::open_active(&project).unwrap();
-        let decision=db.reserve_attempt(&installed,&repo.display().to_string(),1_000).unwrap();
+        let decision=db.reserve_attempt(&installed,&repo.display().to_string(),"refs/heads/factory","codex",1_000).unwrap();
         assert_eq!(decision.grant_id,installed);
         assert!(!decision.reserved);
         assert!(db.read_snapshot(None).unwrap().attempts.is_empty());
         assert!(db.read_snapshot(None).unwrap().operations.iter().all(|operation| operation.kind!="runtime.launch"));
+    }
+
+    #[test]
+    fn delegation_expiry_reason_does_not_classify_authority_mismatch_as_expired() {
+        assert_eq!(reason_code(&anyhow::anyhow!("delegation grant is expired")),"expired");
+        assert_eq!(reason_code(&anyhow::anyhow!("review authorization is expired")),"expired");
+        assert_ne!(reason_code(&anyhow::anyhow!("review authority mismatch")),"expired");
+        assert_ne!(reason_code(&anyhow::anyhow!("review authority changed")),"expired");
+        assert_ne!(reason_code(&anyhow::anyhow!("review authority mismatch or expired")),"expired");
+        assert_ne!(reason_code(&anyhow::anyhow!("invalid delegation repositories: stored text exceeds 16384")),"stale_head");
+        assert_eq!(reason_code(&anyhow::anyhow!("invalid delegation repositories: stored text exceeds 16384")),"invalid_document");
     }
 }
 
@@ -776,7 +789,8 @@ pub fn review_memory_proposal(project:&Path,proposal:&str,document:&Path,signatu
         let doc:crate::domain::MemoryReviewAuthorization=serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid signed memory review"))?;
         let now=jiff::Timestamp::now().as_millisecond();
         ensure!(doc.version==1 && doc.expected_head==expected_head && doc.review.proposal_id==proposal,"review command/document identity mismatch");
-        ensure!(doc.authority==owner.reference()? && doc.expires_unix_ms>now,"review authority mismatch or expired");
+        ensure!(doc.authority==owner.reference()?,"review authority mismatch");
+        ensure!(doc.expires_unix_ms>now,"review authorization is expired");
         ensure!(doc.project_store==project.join(".state/state.db").canonicalize()?.to_string_lossy(),"review belongs to another project");
         let signature=migration::read_plan_file(signature)?;
         verify_signature(&owner,&bytes,&signature,MEMORY_REVIEW_NAMESPACE,&RealRunner)?;
@@ -802,7 +816,8 @@ pub fn promote_memory_proposal(project:&Path,proposal:&str,decision:&str)->Resul
         let doc:crate::domain::MemoryReviewAuthorization=serde_json::from_value(stored["authorization"].clone()).map_err(|_|anyhow::anyhow!("review lacks signed authorization; review again"))?;
         let(owner,config)=policy(project)?;
         let now=jiff::Timestamp::now().as_millisecond();
-        ensure!(doc.authority==owner.reference()? && doc.expires_unix_ms>now,"review authority changed or expired");
+        ensure!(doc.authority==owner.reference()?,"review authority changed");
+        ensure!(doc.expires_unix_ms>now,"review authorization is expired");
         ensure!(doc.review.proposal_id==proposal && doc.proposal_digest==row.payload_digest,"review authorization mismatch");
         ensure!(doc.project_store==project.join(".state/state.db").canonicalize()?.to_string_lossy(),"review belongs to another project");
         ensure!(stored["config_digest"].as_str()==config.digest.as_deref(),"review configuration changed");

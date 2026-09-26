@@ -65,8 +65,11 @@ impl SqliteStore {
             .map_err(|_| invalid("invalid reviewed state"))?;
         if let Some(auth)=authorization {
             let covered:MemoryReviewAuthorization=serde_json::from_value(reviewed["authorization"].clone()).map_err(|_|invalid("review authorization missing"))?;
-            if covered!=auth.document || covered.expires_unix_ms<=now_unix_ms || control::read(&tx)?.config_digest!=auth.config_digest {
-                return Err(invalid("review authority changed or expired"));
+            if covered.expires_unix_ms<=now_unix_ms {
+                return Err(invalid("review authorization is expired"));
+            }
+            if covered!=auth.document || control::read(&tx)?.config_digest!=auth.config_digest {
+                return Err(invalid("review authority changed"));
             }
         } else if !cfg!(test) {return Err(invalid("verified reviewer authority required"));}
         let expected = reviewed.get("event_head").and_then(|v| v.as_u64())

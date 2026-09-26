@@ -640,6 +640,27 @@ impl PreparedDelegation {
         }
         Err("delegation is not a launch approval".into())
     }
+
+    /// Column text inserted for `repositories`. Same bytes the length CHECK measures.
+    pub(crate) fn repository_column(&self) -> Result<String, String> {
+        let encoded = self
+            .repositories
+            .iter()
+            .map(|repo| {
+                serde_json::json!({
+                    "repository": &repo.repository,
+                    "ref": &repo.git_ref,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_string(&encoded).map_err(|_| "delegation repository encoding failed".into())
+    }
+
+    /// Column text inserted for `profile_kinds`.
+    pub(crate) fn profile_kind_column(&self) -> Result<String, String> {
+        serde_json::to_string(&self.profile_kinds)
+            .map_err(|_| "delegation profile encoding failed".into())
+    }
 }
 
 impl UntrustedDelegationDocument {
@@ -734,7 +755,7 @@ impl UntrustedDelegationDocument {
         {
             return Err("invalid delegation authority reference".into());
         }
-        Ok(PreparedDelegation {
+        let prepared = PreparedDelegation {
             digest: format!("{:x}", Sha256::digest(raw)),
             raw: raw.to_vec(),
             issuer: self.issuer,
@@ -750,6 +771,15 @@ impl UntrustedDelegationDocument {
             policy_revision: self.policy_revision,
             project_store: self.project_store,
             authority: self.authority,
-        })
+        };
+        // SQLite length() is characters. A longer column fails the CHECK as a
+        // constraint conflict, which ingress would record as a stale head.
+        if prepared.repository_column()?.chars().count() > 16_384 {
+            return Err("invalid delegation repositories: stored text exceeds 16384".into());
+        }
+        if prepared.profile_kind_column()?.chars().count() > 1_024 {
+            return Err("invalid delegation profile kinds: stored text exceeds 1024".into());
+        }
+        Ok(prepared)
     }
 }

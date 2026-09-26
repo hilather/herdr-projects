@@ -93,16 +93,8 @@ impl SqliteStore {
                 .collect::<Vec<_>>(),
         )
         .map_err(|_| invalid("delegation action encoding failed"))?;
-        let repositories = serde_json::to_string(
-            &parsed
-                .repositories
-                .iter()
-                .map(|repo| serde_json::json!({"repository": repo.repository, "ref": repo.git_ref}))
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|_| invalid("delegation repository encoding failed"))?;
-        let kinds = serde_json::to_string(&parsed.profile_kinds)
-            .map_err(|_| invalid("delegation profile encoding failed"))?;
+        let repositories = parsed.repository_column().map_err(|error| invalid(&error))?;
+        let kinds = parsed.profile_kind_column().map_err(|error| invalid(&error))?;
         tx.execute(
             "INSERT INTO delegation_grants(id,raw_bytes,raw_digest,project_store,issuer,subject,subject_public_key,action_classes,repositories,profile_kinds,max_concurrent_attempts,expires_unix_ms,revocation_epoch,child_delegation,policy_revision,authority_digest,installed_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
@@ -198,6 +190,8 @@ impl SqliteStore {
         &mut self,
         grant_id: &str,
         repository: &str,
+        git_ref: &str,
+        profile_kind: &str,
         now: i64,
     ) -> Result<DelegationReserve> {
         super::delivery::now_check(now)?;
@@ -243,14 +237,35 @@ impl SqliteStore {
             ));
         }
         let actual = project_path(&self.connection)?;
-        if parsed.project_store != actual
-            || !parsed
-                .repositories
-                .iter()
-                .any(|repo| repo.repository == repository)
-        {
+        let path_matches = parsed
+            .repositories
+            .iter()
+            .any(|repo| repo.repository == repository);
+        if parsed.project_store != actual || !path_matches {
             self.record_delegation_denial(grant_id, "wrong_repo", &parsed.authority.digest, now)?;
             return Err(invalid("delegation grant is for the wrong repo"));
+        }
+        // The signed ref is part of the scope. A path match is not every ref on that path.
+        if !parsed
+            .repositories
+            .iter()
+            .any(|repo| repo.repository == repository && repo.git_ref == git_ref)
+        {
+            self.record_delegation_denial(grant_id, "wrong_ref", &parsed.authority.digest, now)?;
+            return Err(invalid("delegation grant is for the wrong ref"));
+        }
+        if !parsed
+            .profile_kinds
+            .iter()
+            .any(|kind| kind == profile_kind)
+        {
+            self.record_delegation_denial(
+                grant_id,
+                "profile_kind",
+                &parsed.authority.digest,
+                now,
+            )?;
+            return Err(invalid("delegation grant does not include the profile kind"));
         }
         if now >= parsed.expires_unix_ms {
             self.record_delegation_denial(grant_id, "expired", &parsed.authority.digest, now)?;
@@ -288,6 +303,7 @@ impl SqliteStore {
             )?;
             return Err(invalid("delegation does not grant reserve_attempt"));
         }
+        // max_concurrent_attempts stays on the row. This schema does not reserve, so the cap is not applied.
         // A matching reserve_attempt class is still not a launch approval.
         if parsed.matches_launch().is_ok() {
             return Err(invalid("delegation grant is not a launch approval"));
@@ -530,7 +546,9 @@ mod tests {
         let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
         admission_on(&db);
         let expired = install(&mut db, &repo_a, 5_000, 1_000);
-        let error = db.reserve_attempt(&expired, &repo_a, 5_000).unwrap_err();
+        let error = db
+            .reserve_attempt(&expired, &repo_a, "refs/heads/factory", "codex", 5_000)
+            .unwrap_err();
         assert!(
             matches!(error, StoreError::Invalid(ref message) if message.contains("expired")),
             "{error}"
@@ -539,7 +557,9 @@ mod tests {
         assert_eq!(denial_reasons(&db), vec!["expired".to_string()]);
 
         let wrong = install(&mut db, &repo_a, 9_000, 1_000);
-        let error = db.reserve_attempt(&wrong, &repo_b, 1_500).unwrap_err();
+        let error = db
+            .reserve_attempt(&wrong, &repo_b, "refs/heads/factory", "codex", 1_500)
+            .unwrap_err();
         assert!(
             matches!(error, StoreError::Invalid(ref message) if message.contains("wrong repo")),
             "{error}"
@@ -579,7 +599,9 @@ mod tests {
                 ],
             )
             .unwrap();
-        let error = db.reserve_attempt(&forged_id, &repo_a, 1_500).unwrap_err();
+        let error = db
+            .reserve_attempt(&forged_id, &repo_a, "refs/heads/factory", "codex", 1_500)
+            .unwrap_err();
         assert!(
             matches!(error, StoreError::Invalid(ref message) if message.contains("self-signature")),
             "{error}"
@@ -712,7 +734,9 @@ mod tests {
         let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
         let id = install(&mut db, &repo, 9_000, 1_000);
         let before = db.read_snapshot(None).unwrap();
-        let error = db.reserve_attempt(&id, &repo, 1_500).unwrap_err();
+        let error = db
+            .reserve_attempt(&id, &repo, "refs/heads/factory", "codex", 1_500)
+            .unwrap_err();
         assert!(
             matches!(error, StoreError::Invalid(ref message) if message.contains("admission is off")),
             "{error}"
@@ -720,7 +744,9 @@ mod tests {
         assert_eq!(db.read_snapshot(None).unwrap().attempts, before.attempts);
         assert!(denial_reasons(&db).is_empty());
         admission_on(&db);
-        let decision = db.reserve_attempt(&id, &repo, 1_500).unwrap();
+        let decision = db
+            .reserve_attempt(&id, &repo, "refs/heads/factory", "codex", 1_500)
+            .unwrap();
         assert_eq!(decision.grant_id, id);
         assert!(!decision.reserved);
         assert_eq!(attempts(&mut db), 0);
@@ -755,6 +781,147 @@ mod tests {
             .contains("child delegation"));
     }
 
+    fn scope_document(store: &str, repositories: serde_json::Value, profile_kinds: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "issuer": "owner",
+            "subject": "delegate",
+            "subject_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDelegationSubjectKeyExampleValue1234567890",
+            "action_classes": ["reserve_attempt"],
+            "repositories": repositories,
+            "profile_kinds": profile_kinds,
+            "max_concurrent_attempts": 1,
+            "expires_unix_ms": 9_000,
+            "revocation_epoch": 1,
+            "child_delegation": "forbidden",
+            "policy_revision": 1,
+            "project_store": store,
+            "authority": {"id": "owner-approval-policy", "revision": 1, "digest": "ab".repeat(32)}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn stored_scope_text_over_the_check_is_invalid_not_conflict() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
+        let store = std::fs::canonicalize(db.connection.path().unwrap())
+            .unwrap()
+            .display()
+            .to_string();
+        let repositories = (0..4)
+            .map(|index| {
+                serde_json::json!({
+                    "repository": format!("/{index}{}", "a".repeat(4094)),
+                    "ref": "refs/heads/factory"
+                })
+            })
+            .collect::<Vec<_>>();
+        let raw = scope_document(&store, serde_json::Value::Array(repositories), serde_json::json!(["codex"]));
+        let parse_error = PreparedDelegation::parse_verified(&raw).unwrap_err();
+        assert!(parse_error.contains("stored text exceeds 16384"), "{parse_error}");
+        let error = db
+            .install_delegation(
+                &PreparedDelegation {
+                    digest: "ab".repeat(32),
+                    raw,
+                    issuer: "owner".into(),
+                    subject: "delegate".into(),
+                    subject_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDelegationSubjectKeyExampleValue1234567890".into(),
+                    actions: vec![DelegationAction::ReserveAttempt],
+                    repositories: vec![],
+                    profile_kinds: vec!["codex".into()],
+                    max_concurrent_attempts: 1,
+                    expires_unix_ms: 9_000,
+                    revocation_epoch: 1,
+                    child_delegation: "forbidden".into(),
+                    policy_revision: 1,
+                    project_store: store.clone(),
+                    authority: VersionedReference {
+                        id: "owner-approval-policy".into(),
+                        revision: 1,
+                        digest: "ab".repeat(32),
+                    },
+                },
+                1_000,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, StoreError::Invalid(ref message) if message.contains("stored text")),
+            "{error:?}"
+        );
+        assert!(!matches!(error, StoreError::Conflict));
+        assert!(denial_reasons(&db).iter().all(|reason| reason != "stale_head"));
+        let kinds = (0..8)
+            .map(|index| format!("{index}{}", "\\".repeat(63)))
+            .collect::<Vec<_>>();
+        let raw = scope_document(
+            &store,
+            serde_json::json!([{"repository": store, "ref": "refs/heads/factory"}]),
+            serde_json::Value::Array(kinds.into_iter().map(serde_json::Value::String).collect()),
+        );
+        let parse_error = PreparedDelegation::parse_verified(&raw).unwrap_err();
+        assert!(parse_error.contains("profile kinds"), "{parse_error}");
+        assert_eq!(attempts(&mut db), 0);
+    }
+
+    #[test]
+    fn consultation_denies_ref_or_profile_kind_mismatch_without_reserving() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let repo = std::fs::canonicalize(repo).unwrap().display().to_string();
+        let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
+        let id = install(&mut db, &repo, 9_000, 1_000);
+        admission_on(&db);
+        let wrong_ref = db
+            .reserve_attempt(&id, &repo, "refs/heads/other", "codex", 1_500)
+            .unwrap_err();
+        assert!(
+            matches!(wrong_ref, StoreError::Invalid(ref message) if message.contains("wrong ref")),
+            "{wrong_ref}"
+        );
+        let wrong_kind = db
+            .reserve_attempt(&id, &repo, "refs/heads/factory", "claude", 1_500)
+            .unwrap_err();
+        assert!(
+            matches!(wrong_kind, StoreError::Invalid(ref message) if message.contains("profile kind")),
+            "{wrong_kind}"
+        );
+        // The stored cap is 1. Consultation does not enforce it and does not launch.
+        let first = db
+            .reserve_attempt(&id, &repo, "refs/heads/factory", "codex", 1_500)
+            .unwrap();
+        let second = db
+            .reserve_attempt(&id, &repo, "refs/heads/factory", "codex", 1_600)
+            .unwrap();
+        assert!(!first.reserved && !second.reserved);
+        assert!(PreparedDelegation::parse_verified(&document(
+            &std::fs::canonicalize(db.connection.path().unwrap()).unwrap().display().to_string(),
+            &repo,
+            "owner",
+            "delegate",
+            9_000,
+        ))
+        .unwrap()
+        .matches_launch()
+        .is_err());
+        assert_eq!(attempts(&mut db), 0);
+        assert_eq!(
+            db.connection
+                .query_row(
+                    "SELECT count(*) FROM operations WHERE kind='runtime.launch'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        let reasons = denial_reasons(&db);
+        assert!(reasons.contains(&"wrong_ref".to_string()));
+        assert!(reasons.contains(&"profile_kind".to_string()));
+    }
+
     #[test]
     fn revoked_delegation_stops_new_admits_and_does_not_undo_a_started_attempt() {
         let (_temp, mut db, prepared) = exact_grant_fixture();
@@ -786,7 +953,9 @@ mod tests {
         assert!(attempt.retains_capacity());
         assert!(!attempt.termination_observed);
         admission_on(&db);
-        let error = db.reserve_attempt(&id, &repo, 1_300).unwrap_err();
+        let error = db
+            .reserve_attempt(&id, &repo, "refs/heads/factory", "codex", 1_300)
+            .unwrap_err();
         assert!(
             matches!(error, StoreError::Invalid(ref message) if message.contains("revoked")),
             "{error}"
