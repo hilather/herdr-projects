@@ -4,9 +4,8 @@ use std::collections::{BTreeMap,BTreeSet};
 use herdr_projects::execution_guard::Resource;
 type Key=(String,String);
 const LIMIT:usize=128;
-/// Matches the default Transfer outstanding bound. Admission stops when the
-/// executor reports the lane is full, so a smaller pool still cannot overshoot.
-const DECLARED_LIMIT:usize=32;
+/// Local report reads share Transfer and keep 16 slots (`local_reports::PENDING_LIMIT`).
+const REPORT_RESERVE:usize=16;
 const RETENTION:Duration=Duration::from_secs(180);
 fn failure_delay(identity:&Identity)->Duration {
     // Launch retries observe durable boundaries under the original 30s lease.
@@ -172,8 +171,9 @@ impl Queue {
         if declared {self.admit_declared(&allowed,&mut errors);} else {self.admit_one(&key,&mut errors,false);}
         errors
     }
+    fn declared_limit(&self)->usize {self.executor.outstanding(crate::executor::Lane::Transfer).saturating_sub(REPORT_RESERVE)}
     fn admit_declared(&mut self,allowed:&impl Fn(&Identity)->bool,errors:&mut Vec<String>) {
-        while self.pending_sets.len()<DECLARED_LIMIT {
+        while self.pending_sets.len()<self.declared_limit() {
             let Some(key)=self.next_declared(allowed) else {break;};
             if !self.admit_one(&key,errors,true) {break;}
         }
@@ -399,9 +399,17 @@ mod tests {
         while queue.pending() {assert!(Instant::now()<deadline,"transfer ticket did not finish");let _=queue.drain();std::thread::yield_now();}
     }
     #[test]
+    fn declared_admission_leaves_the_report_reserve() {
+        let pool=Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),Arc::new(Immediate)).unwrap());
+        let queue=Queue::new(pool.clone());
+        assert_eq!(queue.declared_limit(),queue.executor.outstanding(crate::executor::Lane::Transfer)-REPORT_RESERVE);
+        assert_eq!(queue.declared_limit(),16);
+        assert!(pool.stop(Duration::from_secs(1)));
+    }
+    #[test]
     fn transfers_on_different_repos_overlap_and_the_same_git_dir_does_not() {
         let (gate,started)=gate();
-        let limits=crate::executor::Limits{workers:[1,2],outstanding:[4,4],per_project:2,per_machine:2};
+        let limits=crate::executor::Limits{workers:[1,2],outstanding:[4,18],per_project:2,per_machine:2};
         let pool=Arc::new(crate::executor::Executor::new(limits,gate.clone()).unwrap());let mut queue=Queue::new(pool.clone());
         queue.offer_scoped(transfer("/projects/a","live-copy:1","/repos/a"),footprint("/projects/a","/repos/a")).unwrap();
         queue.offer_scoped(transfer("/projects/b","live-copy:1","/repos/b"),footprint("/projects/b","/repos/b")).unwrap();
@@ -431,7 +439,7 @@ mod tests {
     #[test]
     fn launch_observes_a_single_root_exclusive_ticket() {
         let root=tempfile::tempdir().unwrap();let (gate,started)=gate();
-        let limits=crate::executor::Limits{workers:[2,2],outstanding:[4,4],per_project:2,per_machine:2};
+        let limits=crate::executor::Limits{workers:[2,2],outstanding:[4,18],per_project:2,per_machine:2};
         let pool=Arc::new(crate::executor::Executor::new(limits,gate.clone()).unwrap());let mut queue=Queue::new(pool.clone());
         for (project,operation) in [("/projects/a","canonical-launch:one"),("/projects/b","canonical-launch:two")] {
             let mut request=work(project,operation);request.command.program="launch".into();request.command.stdin=Some(root.path().display().to_string());request.lane=Lane::Control;request.identity.machine=format!("launch:{project}");
@@ -451,7 +459,7 @@ mod tests {
     #[test]
     fn cancellation_while_the_transfer_queue_is_saturated_still_runs_on_control() {
         let (gate,started)=gate();
-        let limits=crate::executor::Limits{workers:[1,1],outstanding:[2,1],per_project:4,per_machine:4};
+        let limits=crate::executor::Limits{workers:[1,1],outstanding:[4,17],per_project:4,per_machine:4};
         let pool=Arc::new(crate::executor::Executor::new(limits,gate.clone()).unwrap());let mut queue=Queue::new(pool.clone());
         queue.offer_scoped(transfer("/projects/a","live-copy:1","/repos/a"),footprint("/projects/a","/repos/a")).unwrap();
         queue.offer_scoped(transfer("/projects/b","live-copy:1","/repos/b"),footprint("/projects/b","/repos/b")).unwrap();

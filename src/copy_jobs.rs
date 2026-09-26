@@ -20,11 +20,8 @@ struct Input {
     finalization:Option<Finalization>,
     config:PathBuf,config_digest:Option<String>,herdr:String,helper:String,machine:String,target:Option<String>,
     #[serde(default)]
-    resources:Vec<DeclaredResource>,
+    resources:Vec<Resource>,
 }
-#[derive(Clone,Serialize,Deserialize,PartialEq,Eq)]
-#[serde(deny_unknown_fields)]
-struct DeclaredResource {class:String,identity:String}
 fn config(path:&Path)->Result<(Option<String>,Option<String>)> {
     let text=paths::read_root_config(path)?;
     ensure!(text.as_ref().is_none_or(|s|s.len()<=1024*1024),"copy configuration exceeds bounds");
@@ -166,11 +163,7 @@ fn execute(input:&Input,control:&Control,helpers:&Helpers)->Result<()> {
 fn execute_with(input:&Input,control:&Control,helpers:&Helpers,guard:&dyn ProjectEffect,locks:&[InheritedLock])->Result<()> {
     let project=Project::load(input.project.parent().context("copy project root missing")?,input.project.file_name().and_then(|s|s.to_str()).context("invalid copy project name")?)?;
     let expected=input.current(&project,guard,control)?;
-    if !input.resources.is_empty() {
-        let fresh=transfer_resources(&input.project,&expected.thread_dir);
-        let declared:Vec<_>=input.resources.iter().map(|resource|DeclaredResource{class:resource.class.clone(),identity:resource.identity.clone()}).collect();
-        ensure!(fresh==declared,"copy resource footprint changed");
-    }
+    ensure!(input.resources.is_empty()||transfer_resources(&input.project,&expected.thread_dir)==input.resources,"copy resource footprint changed");
     let resolved;
     let input=if !input.machine.is_empty()&&input.target.is_none() {
         ensure!(input.pending.is_some()||input.finalization.is_some(),"unobserved route requires final-copy work or retained recovery intent");
@@ -246,21 +239,30 @@ fn request_parts(ctx:&Ctx<'_>,project:&Project,expected:&Thread,target:Option<&s
     ensure!(machine.len()<=4096&&!machine.chars().any(char::is_control),"copy resource identity exceeds bounds");
     let identity=Identity{operation:format!("{kind}:{}",expected.id),revision:sequence.checked_add(1).context("copy sequence exhausted")?,project:path.to_str().context("copy project is not UTF-8")?.into(),machine,terminal:None};
     let deadline=Instant::now()+BUDGET;let mut command=Cmd::new(JOB,BUDGET).stdin(text);command.deadline=Some(deadline);
-    let footprint=resources.iter().map(|resource|Resource::new(&resource.class,&resource.identity)).collect::<Result<Vec<_>>>()?;
-    Ok((Request{identity,lane:Lane::Transfer,deadline,command},footprint))
+    Ok((Request{identity,lane:Lane::Transfer,deadline,command},resources))
 }
-fn transfer_resources(project:&Path,thread_dir:&str)->Vec<DeclaredResource> {
+fn transfer_resources(project:&Path,thread_dir:&str)->Vec<Resource> {
     let Some(git)=git_common_dir(Path::new(thread_dir)) else {return Vec::new();};
     let Ok(project)=project.canonicalize() else {return Vec::new();};
     let Some(project)=project.to_str() else {return Vec::new();};
-    let mut resources=vec![DeclaredResource{class:"artifact".into(),identity:project.into()},DeclaredResource{class:"git".into(),identity:git}];
-    resources.sort_by(|a,b|a.class.cmp(&b.class).then(a.identity.cmp(&b.identity)));resources
+    let (Ok(artifact),Ok(git))=(Resource::new("artifact",project),Resource::new("git",git)) else {return Vec::new();};
+    let mut resources=vec![artifact,git];resources.sort();resources
 }
-fn git_common_dir(thread_dir:&Path)->Option<String> {
-    if !thread_dir.is_absolute()||!real_path(thread_dir) {return None;}
-    let git=thread_dir.join(".git");
+fn git_common_dir(start:&Path)->Option<String> {
+    if !start.is_absolute()||!real_path(start) {return None;}
+    // Production thread directories live at <checkout>/.herdr-project/<slug>-<id>.
+    let mut cursor=start.to_path_buf();
+    let git=loop {
+        let candidate=cursor.join(".git");
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(meta) if meta.file_type().is_symlink() => return None,
+            Ok(meta) if meta.is_file()||meta.is_dir() => break candidate,
+            Ok(_) => return None,
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound => {if !cursor.pop() {return None;}},
+            Err(_) => return None,
+        }
+    };
     let meta=std::fs::symlink_metadata(&git).ok()?;
-    if meta.file_type().is_symlink() {return None;}
     let git_dir=if meta.is_dir() {
         if !real_path(&git) {return None;}
         git.canonicalize().ok()?
@@ -270,34 +272,34 @@ fn git_common_dir(thread_dir:&Path)->Option<String> {
         let target=line.strip_prefix("gitdir: ")?;
         if target.is_empty()||target.contains('\n')||target.contains('\0') {return None;}
         let target=Path::new(target);
-        let target=if target.is_absolute() {target.to_path_buf()} else {thread_dir.join(target)};
+        let base=git.parent()?;
+        let target=if target.is_absolute() {target.to_path_buf()} else {base.join(target)};
         if !real_path(&target) {return None;}
         target.canonicalize().ok()?
     } else {return None;};
     let common=match std::fs::symlink_metadata(git_dir.join("commondir")) {
-        Ok(meta) if meta.is_file()&&!meta.file_type().is_symlink() => resolve_common(&git_dir)?,
+        Ok(meta) if meta.is_file()&&!meta.file_type().is_symlink() => {
+            let text=std::fs::read_to_string(git_dir.join("commondir")).ok()?;
+            let text=text.strip_suffix('\n').unwrap_or(text.as_str());
+            if text.is_empty()||text.contains('\n')||Path::new(text).is_absolute() {return None;}
+            let mut cursor=git_dir.clone();
+            for component in Path::new(text).components() {
+                match component {
+                    std::path::Component::CurDir=>{},
+                    std::path::Component::ParentDir=>{if !cursor.pop() {return None;}},
+                    std::path::Component::Normal(part)=>cursor.push(part),
+                    _=>return None,
+                }
+                if !real_path(&cursor) {return None;}
+            }
+            cursor
+        }
         Ok(_) => return None,
         Err(error) if error.kind()==std::io::ErrorKind::NotFound => git_dir,
         Err(_) => return None,
     };
     if !real_path(&common) {return None;}
     common.canonicalize().ok()?.to_str().map(str::to_owned)
-}
-fn resolve_common(git_dir:&Path)->Option<PathBuf> {
-    let text=std::fs::read_to_string(git_dir.join("commondir")).ok()?;
-    let text=text.strip_suffix('\n').unwrap_or(text.as_str());
-    if text.is_empty()||text.contains('\n')||Path::new(text).is_absolute() {return None;}
-    let mut cursor=git_dir.to_path_buf();
-    for component in Path::new(text).components() {
-        match component {
-            std::path::Component::CurDir=>{},
-            std::path::Component::ParentDir=>{if !cursor.pop() {return None;}},
-            std::path::Component::Normal(part)=>cursor.push(part),
-            _=>return None,
-        }
-        if !real_path(&cursor) {return None;}
-    }
-    Some(cursor)
 }
 fn real_path(path:&Path)->bool {
     if !path.is_absolute() {return false;}
@@ -575,19 +577,23 @@ mod tests {
         assert!(thread::load(&project,&t.id).unwrap().pending_final_notice.is_none());
     }
     #[test]
-    fn artifact_transfer_declares_distinct_git_directories_and_one_common_dir() {
-        let root=tempfile::tempdir().unwrap();let plain=root.path().join("plain");fs::create_dir_all(&plain).unwrap();
-        assert!(transfer_resources(&plain,plain.to_str().unwrap()).is_empty(),"a tree without git keeps today's guard");
+    fn artifact_transfer_scopes_nested_thread_dirs_to_one_common_git_dir() {
+        let root=tempfile::tempdir().unwrap();
+        let plain=PathBuf::from(thread::thread_dir(root.path().join("plain").to_str().unwrap(),"demo","1"));fs::create_dir_all(&plain).unwrap();
+        assert!(transfer_resources(root.path(),plain.to_str().unwrap()).is_empty(),"a tree without git keeps today's guard");
         let repo=root.path().join("repo");fs::create_dir_all(repo.join(".git")).unwrap();
         let git=repo.join(".git").canonicalize().unwrap();
-        let resources=transfer_resources(&repo,repo.to_str().unwrap());
+        let nested=PathBuf::from(thread::thread_dir(repo.to_str().unwrap(),"demo","1"));fs::create_dir_all(&nested).unwrap();
+        let resources=transfer_resources(&repo,nested.to_str().unwrap());
         assert_eq!(resources.iter().find(|resource|resource.class=="git").unwrap().identity,git.to_str().unwrap());
         assert!(resources.iter().any(|resource|resource.class=="artifact"));
         let other=root.path().join("other");fs::create_dir_all(other.join(".git")).unwrap();
-        assert_ne!(transfer_resources(&other,other.to_str().unwrap()).iter().find(|resource|resource.class=="git").unwrap().identity,git.to_str().unwrap());
+        let other_nested=PathBuf::from(thread::thread_dir(other.to_str().unwrap(),"demo","2"));fs::create_dir_all(&other_nested).unwrap();
+        assert_ne!(transfer_resources(&other,other_nested.to_str().unwrap()).iter().find(|resource|resource.class=="git").unwrap().identity,git.to_str().unwrap());
         let wt=root.path().join("wt");let gitdir=repo.join(".git/worktrees/wt");fs::create_dir_all(&gitdir).unwrap();fs::create_dir_all(&wt).unwrap();
         fs::write(wt.join(".git"),format!("gitdir: {}\n",gitdir.display())).unwrap();fs::write(gitdir.join("commondir"),"../..\n").unwrap();
-        assert_eq!(transfer_resources(&wt,wt.to_str().unwrap()).iter().find(|resource|resource.class=="git").unwrap().identity,git.to_str().unwrap());
+        let wt_nested=PathBuf::from(thread::thread_dir(wt.to_str().unwrap(),"demo","3"));fs::create_dir_all(&wt_nested).unwrap();
+        assert_eq!(transfer_resources(&wt,wt_nested.to_str().unwrap()).iter().find(|resource|resource.class=="git").unwrap().identity,git.to_str().unwrap());
     }
     fn remote(root:&Path,project:&Project,t:&Thread,input:&mut Input,helpers:&Helpers,probe:&str) {
         thread::update(project,&t.id,|t|t.machine="box".into()).unwrap();let current=thread::load(project,&t.id).unwrap();input.execution=thread::execution_fingerprint(&current);input.machine="box".into();input.target=Some("user@box".into());

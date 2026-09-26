@@ -4,6 +4,7 @@
 //! lock in place, and never take an exclusive root guard while holding one.
 use std::{fs::{File,OpenOptions},os::unix::fs::{DirBuilderExt,OpenOptionsExt,MetadataExt},path::{Path,PathBuf}};
 use anyhow::{Result,Context,ensure};
+use serde::{Deserialize,Serialize};
 use sha2::{Digest,Sha256};
 
 fn lock_file(path:&Path)->Result<File> {
@@ -43,7 +44,8 @@ fn matches_project(guard_project:&Path,identity:(u64,u64),project:&Path)->Result
 
 /// Declared footprint. `git` is a common git directory. `artifact` is one
 /// project's publication directory. Unknown classes are not a footprint.
-#[derive(Clone,Debug,PartialEq,Eq,PartialOrd,Ord)]
+#[derive(Clone,Debug,PartialEq,Eq,PartialOrd,Ord,Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Resource {pub class:String,pub identity:String}
 impl Resource {
     pub fn new(class:impl Into<String>,identity:impl Into<String>)->Result<Self> {
@@ -106,27 +108,26 @@ impl ProjectSharedGuard {
         ensure!(std::fs::symlink_metadata(project.join(".state"))?.is_dir(),"project state must be a real directory");
         let project_file=lock_file(&project.join(".state/effect.lock"))?;
         project_file.try_lock_shared().context("another operation owns this project; retry")?;
+        let dir=root_path.join(".resource-fences");
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta)=>ensure!(meta.is_dir()&&!meta.file_type().is_symlink(),"resource fence directory must be a real directory"),
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound => {
+                std::fs::DirBuilder::new().mode(0o700).create(&dir).or_else(|err| if err.kind()==std::io::ErrorKind::AlreadyExists {Ok(())} else {Err(err)})?;
+                let meta=std::fs::symlink_metadata(&dir)?;
+                ensure!(meta.is_dir()&&!meta.file_type().is_symlink(),"resource fence directory must be a real directory");
+            }
+            Err(error)=>return Err(error.into()),
+        }
         let mut fences=Vec::with_capacity(ordered.len());
-        for resource in &ordered {fences.push(exclusive_file(&fence_path(&root_path,resource)?)?);}
+        for resource in &ordered {
+            let mut hasher=Sha256::new();hasher.update(resource.class.as_bytes());hasher.update([0]);hasher.update(resource.identity.as_bytes());
+            fences.push(exclusive_file(&dir.join(format!("{:x}",hasher.finalize())))?);
+        }
         let routine=lock_file(&root_path.join(".routine-execution.lock"))?;
         routine.try_lock_shared().context("another operation owns this lock; retry")?;
         let metadata=std::fs::metadata(&project)?;
         Ok(Self{_project:project_file,_root:root,_fences:fences,_routine:routine,project,identity:(metadata.dev(),metadata.ino())})
     }
-}
-fn fence_path(root:&Path,resource:&Resource)->Result<PathBuf> {
-    let dir=root.join(".resource-fences");
-    match std::fs::symlink_metadata(&dir) {
-        Ok(meta)=>ensure!(meta.is_dir()&&!meta.file_type().is_symlink(),"resource fence directory must be a real directory"),
-        Err(error) if error.kind()==std::io::ErrorKind::NotFound => {
-            std::fs::DirBuilder::new().mode(0o700).create(&dir).or_else(|err| if err.kind()==std::io::ErrorKind::AlreadyExists {Ok(())} else {Err(err)})?;
-            let meta=std::fs::symlink_metadata(&dir)?;
-            ensure!(meta.is_dir()&&!meta.file_type().is_symlink(),"resource fence directory must be a real directory");
-        }
-        Err(error)=>return Err(error.into()),
-    }
-    let mut hasher=Sha256::new();hasher.update(resource.class.as_bytes());hasher.update([0]);hasher.update(resource.identity.as_bytes());
-    Ok(dir.join(format!("{:x}",hasher.finalize())))
 }
 
 #[cfg(test)]

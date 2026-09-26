@@ -65,6 +65,7 @@ impl Executor {
         let(reply,receiver)=mpsc::sync_channel(1);state.queue[lane].push_back(Job{request,queued:Instant::now(),token:token.clone(),reply});state.admitted[lane]+=1;state.metrics.high_water[lane]=state.metrics.high_water[lane].max(state.admitted[lane]);
         self.shared.wake.notify_all();Ok(Ticket{receiver,cancellation:token})
     }
+    pub fn outstanding(&self,lane:Lane)->usize {self.shared.limits.outstanding[lane.index()]}
     pub fn metrics(&self)->Metrics {
         let state=self.shared.state.lock().unwrap();let mut metrics=state.metrics.clone();
         for lane in 0..2 {metrics.queued[lane]=state.queue[lane].len();metrics.running[lane]=state.running.values().filter(|(_,_,l)|*l==lane).count();}metrics

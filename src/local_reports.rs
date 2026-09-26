@@ -84,8 +84,10 @@ impl Reads {
         while self.pending.len()<PENDING_LIMIT {
             let Some(key)=self.offers.keys().min_by(|a,b|admission.compare(a,b)).cloned() else {break;};
             let candidate=self.offers.remove(&key).unwrap();let identity=candidate.request.identity.clone();let deadline=candidate.request.deadline+(SAMPLE_AGE-QUEUE_BUDGET);
-            match self.executor.submit(candidate.request) {
+            match self.executor.submit(candidate.request.clone()) {
                 Ok(ticket)=>{admission.accepted(&key);self.pending.insert(key,Pending{fingerprint:candidate.fingerprint,identity,ticket,deadline});},
+                // A full transfer lane is backpressure, not a failed observation.
+                Err(error) if error.to_string().contains("executor queue is full") => {self.offers.insert(key,candidate);break;},
                 Err(error)=>errors.push(format!("{} {}: report observation admission: {error:#}",key.0,key.1)),
             }
         }
