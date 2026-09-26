@@ -1648,28 +1648,6 @@ fn sql_count(path: &Path, query: &str) -> i64 {
 }
 
 #[cfg(target_os = "linux")]
-fn loose_objects(repo: &Path) -> Vec<(String, String)> {
-    let mut found = Vec::new();
-    for prefix in fs::read_dir(repo.join(".git/objects")).unwrap() {
-        let prefix = prefix.unwrap();
-        let name = prefix.file_name().into_string().unwrap();
-        if !prefix.file_type().unwrap().is_dir()
-            || name.len() != 2
-            || name == "info"
-            || name == "pack"
-        {
-            continue;
-        }
-        for file in fs::read_dir(prefix.path()).unwrap() {
-            let file = file.unwrap();
-            let rest = file.file_name().into_string().unwrap();
-            found.push((format!("{name}{rest}"), format!("{name}/{rest}")));
-        }
-    }
-    found
-}
-
-#[cfg(target_os = "linux")]
 fn install_fixture_contract(
     db_path: &Path,
     task: &str,
@@ -1860,9 +1838,9 @@ fn planning_gate_ten_logical_workers() {
     let repository = repo.display().to_string();
     let object_format = if oid.len() == 40 { "sha1" } else { "sha256" };
     assert!(matches!(oid.len(), 40 | 64), "{oid}");
-    let objects = loose_objects(&repo);
+    let object_path = format!("{}/{}", &oid[..2], &oid[2..]);
     assert!(
-        objects.iter().any(|(object, _)| object == &oid),
+        repo.join(".git/objects").join(&object_path).is_file(),
         "commit object missing"
     );
 
@@ -1975,20 +1953,11 @@ fn planning_gate_ten_logical_workers() {
 
     for (index, id) in workers.iter().enumerate() {
         let path = if index >= 8 {
-            "shared/gate.rs"
+            "shared/gate.rs".to_string()
         } else {
-            match index {
-                0 => "src/w00.rs",
-                1 => "src/w01.rs",
-                2 => "src/w02.rs",
-                3 => "src/w03.rs",
-                4 => "src/w04.rs",
-                5 => "src/w05.rs",
-                6 => "src/w06.rs",
-                _ => "src/w07.rs",
-            }
+            format!("src/w{index:02}.rs")
         };
-        install_fixture_contract(&db_path, id, &repository, &oid, object_format, path);
+        install_fixture_contract(&db_path, id, &repository, &oid, object_format, &path);
     }
     plant_profile(&db_path, &config);
     assert!(!herdr_projects::admission::wake_enabled(&project));
@@ -2082,7 +2051,7 @@ fn planning_gate_ten_logical_workers() {
             "object_format": object_format,
             "artifact_manifest": [{"path": "README", "oid": oid}],
             "claimed_checks": ["worker prose is not evidence"],
-            "objects": objects.iter().map(|(object, relative)| serde_json::json!({"oid": object, "relative_path": relative})).collect::<Vec<_>>()
+            "objects": [{"oid": oid, "relative_path": object_path}]
         });
         let receipt = db
             .submit_result(&serde_json::to_vec(&submission).unwrap())
