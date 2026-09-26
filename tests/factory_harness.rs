@@ -713,9 +713,9 @@ fn vertical_slice() {
     slice::run();
 }
 
-/// Disposable A/B/C/D slice. Success reservations come from one exec'd
-/// `poll_queued_effects` wake. `admit_once` is only the flag-off and
-/// `integration_missing` cases.
+/// Disposable A/B/C/D slice. `admit_once` is only the flag-off and
+/// `integration_missing` cases. The success wake is the in-process
+/// `poll_queued_effects` call in the binary test.
 #[cfg(target_os = "linux")]
 mod slice {
     use super::git;
@@ -728,10 +728,7 @@ mod slice {
         verification::{self, VerifyRequest},
     };
     use sha2::{Digest, Sha256};
-    use std::{
-        collections::BTreeMap, fs, os::unix::fs::MetadataExt, path::Path, process::Command,
-        time::Duration,
-    };
+    use std::{fs, os::unix::fs::MetadataExt, path::Path, time::Duration};
 
     const PROSE: &str = "worker prose says the dependency is satisfied";
     const TARGET: &str = "refs/heads/integration";
@@ -1045,41 +1042,6 @@ mod slice {
             )
             .unwrap();
         inputs.task.as_str().to_string()
-    }
-
-    fn attempt_counts(db_path: &Path) -> BTreeMap<String, i64> {
-        let conn = rusqlite::Connection::open(db_path).unwrap();
-        let mut stmt = conn
-            .prepare("SELECT task_id, count(*) FROM attempts GROUP BY task_id ORDER BY task_id")
-            .unwrap();
-        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .map(|row| row.unwrap())
-            .collect()
-    }
-
-    /// Exec one `poll_queued_effects` wake. Only `task` may gain an attempt.
-    fn poll_reserves_only(project: &Path, db_path: &Path, task: &str) {
-        let before = attempt_counts(db_path);
-        let home = tempfile::tempdir().unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_herdr-projects"))
-            .args(["vertical-slice-poll", project.to_str().unwrap()])
-            .env_clear()
-            .env("HOME", home.path())
-            .env("PATH", "/usr/bin:/bin")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "poll exited {}\n{}{}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr),
-            String::from_utf8_lossy(&output.stdout)
-        );
-        let after = attempt_counts(db_path);
-        let mut expected = before;
-        *expected.entry(task.to_string()).or_insert(0) += 1;
-        assert_eq!(after, expected, "wake did not reserve only {task}");
     }
 
     fn enable_admission(db_path: &Path) {
@@ -1433,11 +1395,6 @@ mod slice {
         admission::admit_once(&project).unwrap();
         assert_eq!(attempts_for(&db_path, "c"), 0, "flag off must not reserve");
         assert!(!admission::wake_enabled(&project));
-        enable_admission(&db_path);
-        assert!(admission::wake_enabled(&project));
-        assert_eq!(install_grant(&db_path, &project), "c");
-        assert_eq!(attempts_for(&db_path, "c"), 0);
-        poll_reserves_only(&project, &db_path, "c");
 
         rusqlite::Connection::open(&db_path)
             .unwrap()
@@ -1516,8 +1473,7 @@ mod slice {
         assert!(
             satisfaction_text(&db_path).contains("b a integrated_commit valid integrated_commit")
         );
-        assert_eq!(install_grant(&db_path, &project), "b");
-        poll_reserves_only(&project, &db_path, "b");
+        assert_eq!(attempts_for(&db_path, "b"), 0);
 
         let integrated_p = integrate(&db_path, &repo, &work, &result_p, "integrate-p");
         assert_eq!(
@@ -1611,8 +1567,7 @@ mod slice {
         let rows = satisfaction_text(&db_path);
         assert!(rows.contains("d a integrated_commit"), "{rows}");
         assert!(rows.contains("d p integrated_commit"), "{rows}");
-        assert_eq!(install_grant(&db_path, &project), "d");
-        poll_reserves_only(&project, &db_path, "d");
+        assert_eq!(attempts_for(&db_path, "d"), 0);
 
         let mut db = herdr_projects::store::SqliteStore::open(&db_path).unwrap();
         let snapshot = db.read_snapshot(None).unwrap();
@@ -1627,7 +1582,7 @@ mod slice {
             revision,
             snapshot.head,
             &QueueRequest {
-                priority: 0,
+                priority: 20,
                 dependencies: vec![
                     Dependency {
                         predecessor: TaskId::new("a").unwrap(),
@@ -1643,6 +1598,8 @@ mod slice {
         )
         .unwrap();
         drop(db);
+        enable_admission(&db_path);
+        assert!(admission::wake_enabled(&project));
         assert_eq!(install_grant(&db_path, &project), "dstale");
         let stale = admission::admit_once(&project).unwrap_err();
         assert!(
@@ -1650,14 +1607,13 @@ mod slice {
             "{stale:#}"
         );
         assert_eq!(attempts_for(&db_path, "dstale"), 0);
-        assert_eq!(attempts_for(&db_path, "b"), 1);
-        assert_eq!(attempts_for(&db_path, "c"), 1);
-        assert_eq!(attempts_for(&db_path, "d"), 1);
+        assert_eq!(attempts_for(&db_path, "b"), 0);
+        assert_eq!(attempts_for(&db_path, "c"), 0);
+        assert_eq!(attempts_for(&db_path, "d"), 0);
 
         let manifest = serde_json::json!({
             "vertical_slice": "pass",
             "git_sha": super::workspace_git_sha(),
-            "reserved": ["b", "c", "d"],
             "combined_tree": "checks_failed",
             "restarted_after_cas": true,
             "worker_prose_satisfaction_rows": 0

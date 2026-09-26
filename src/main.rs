@@ -94,19 +94,6 @@ fn main() {
             std::process::exit(72);
         }
     }
-    // Harness-only wake. Not a factory command and not present in release builds.
-    #[cfg(all(debug_assertions, feature = "state-store", target_os = "linux"))]
-    if std::env::args().nth(1).as_deref() == Some("vertical-slice-poll") {
-        let Some(project) = std::env::args().nth(2) else {
-            eprintln!("herdr-projects: vertical-slice-poll requires a project path");
-            std::process::exit(2);
-        };
-        if let Err(error) = canonical_controller::poll_project_once(std::path::Path::new(&project)) {
-            eprintln!("herdr-projects: {error:#}");
-            std::process::exit(1);
-        }
-        std::process::exit(0);
-    }
     extend_path();
     if let Err(error) = cli::run() {
         eprintln!("herdr-projects: {error:#}");

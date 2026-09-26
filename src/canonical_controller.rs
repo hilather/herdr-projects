@@ -50,29 +50,6 @@ pub fn poll(ctx:&Ctx,path:&Path,turn:u64)->Result<PollResult> {
 pub fn poll_queued(ctx:&Ctx,path:&Path,turn:u64,reads:&mut observations::Reads)->Result<PollResult> {
     poll_queued_effects(ctx,path,turn,reads,None)
 }
-/// One `poll_queued_effects` wake. Compiled into debug binaries so the factory
-/// harness can exec it. Release builds do not include this entry.
-#[cfg(all(debug_assertions, target_os = "linux"))]
-pub(crate) fn poll_project_once(project: &Path) -> Result<()> {
-    let env = crate::paths::Env::from_process()?;
-    let runner = crate::runner::RealRunner;
-    let ctx = crate::paths::Ctx {
-        env: &env,
-        root: env.home.clone(),
-        config_dir: env.config_dir(),
-        runner: &runner,
-        detached_ticker: false,
-    };
-    let pool = std::sync::Arc::new(crate::executor::Executor::new(
-        crate::executor::Limits::default(),
-        std::sync::Arc::new(crate::runner::RealRunner),
-    )?);
-    let mut reads = observations::Reads::new(pool.clone());
-    poll_queued_effects(&ctx, project, 0, &mut reads, None)?;
-    let _ = pool.stop(std::time::Duration::from_secs(2));
-    Ok(())
-}
-
 pub fn poll_queued_effects(ctx:&Ctx,path:&Path,turn:u64,reads:&mut observations::Reads,effects:Option<&mut crate::copy_jobs::Queue>)->Result<PollResult> {
     let (reachable,scheduled,error)=match reads.poll(ctx,path) {
         Ok(observations::Poll::Ready(sample))=>(sample.reachable.unwrap_or(false),sample.scheduled_work.unwrap_or(false),sample.diagnostic),
@@ -297,7 +274,7 @@ pub(crate) mod tests {
         let db_path=project.join(".state/state.db");
         let mut db=SqliteStore::create(&db_path).unwrap();
         let now=jiff::Timestamp::now().as_millisecond();
-        db.commit(Commit{expected_head:0,mutations:["pred","child"].into_iter().map(|id|Mutation::Task{expected:None,next:Task{id:TaskId::new(id).unwrap(),revision:1,state:TaskState::Draft,title:id.into(),active_attempt:None}}).collect()}).unwrap();
+        db.commit(Commit{expected_head:0,mutations:["pred","c"].into_iter().map(|id|Mutation::Task{expected:None,next:Task{id:TaskId::new(id).unwrap(),revision:1,state:TaskState::Draft,title:id.into(),active_attempt:None}}).collect()}).unwrap();
         let head=db.read_snapshot(None).unwrap().head;
         db.commit(Commit{expected_head:head,mutations:vec![Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("attempt-pred").unwrap(),task:TaskId::new("pred").unwrap(),revision:1,state:AttemptState::Completed,snapshot:None,reservation:"slot-pred".into(),termination_observed:true}}]}).unwrap();
         let digest="d".repeat(64);let oid="a".repeat(40);let result_id="e".repeat(64);
@@ -310,7 +287,7 @@ pub(crate) mod tests {
         raw.execute("INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,'/tmp/project',?1,?2,?2,'pred',1,?2,'attempt-pred','policy',?2,?3,?3,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?2,0,0,1)",rusqlite::params![result_id,digest,oid]).unwrap();
         raw.execute("INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?1,?2,?3,?3,'sha1',?2,?2,'linux-unshare-user-pid-mount-v1',0,1)",rusqlite::params![result_id,digest,oid]).unwrap();
         drop(raw);
-        let child=TaskId::new("child").unwrap();
+        let child=TaskId::new("c").unwrap();
         let snapshot=db.read_snapshot(None).unwrap();
         db.create_runtime(Some(&child),Some(snapshot.tasks.iter().find(|task|task.id==child).unwrap().revision),snapshot.head,&RuntimeRoute::default()).unwrap();
         let snapshot=db.read_snapshot(None).unwrap();
@@ -340,8 +317,13 @@ pub(crate) mod tests {
         let approval=grant.reference().unwrap();
         let payload=serde_json::to_vec(&grant).unwrap();
         rusqlite::Connection::open(&db_path).unwrap().execute("INSERT INTO approval_grants(id,payload,payload_hash) VALUES(?1,?2,?3)",rusqlite::params![approval.id,String::from_utf8(payload).unwrap(),approval.digest]).unwrap();
-        let attempts=||rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT count(*) FROM attempts WHERE task_id='child'",[],|row|row.get::<_,i64>(0)).unwrap();
-        assert_eq!(attempts(),0);
+        let attempts=|task:&str| rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT count(*) FROM attempts WHERE task_id=?1",[task],|row|row.get::<_,i64>(0)).unwrap();
+        let counts=|| -> Vec<(String,i64)> {
+            let conn=rusqlite::Connection::open(&db_path).unwrap();
+            let mut stmt=conn.prepare("SELECT task_id, count(*) FROM attempts GROUP BY task_id ORDER BY task_id").unwrap();
+            stmt.query_map([],|row| Ok((row.get(0)?,row.get(1)?))).unwrap().map(|row| row.unwrap()).collect()
+        };
+        assert_eq!(attempts("c"),0);
         let home=tempfile::tempdir().unwrap();
         let env=crate::paths::Env::for_test(home.path(),&[]);
         let runner=crate::runner::RealRunner;
@@ -349,13 +331,25 @@ pub(crate) mod tests {
         let pool=Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),Arc::new(crate::runner::RealRunner)).unwrap());
         let mut reads=observations::Reads::new(pool.clone());
         poll_queued_effects(&ctx,&project,0,&mut reads,None).unwrap();
-        assert_eq!(attempts(),0,"flag off must not reserve");
+        assert_eq!(attempts("c"),0,"flag off must not reserve");
         let column=["factory","_admission"].concat();
         rusqlite::Connection::open(&db_path).unwrap().execute(&format!("UPDATE project_control SET {column}=?1 WHERE singleton=1"),["on"]).unwrap();
+        let queued:Vec<String>={
+            let conn=rusqlite::Connection::open(&db_path).unwrap();
+            let mut stmt=conn.prepare("SELECT task_id FROM task_queue ORDER BY task_id").unwrap();
+            stmt.query_map([],|row| row.get(0)).unwrap().map(|row| row.unwrap()).collect()
+        };
+        assert_eq!(queued,vec!["c".to_string()],"C must be the only queued dependent");
+        let before=counts();
+        assert_eq!(attempts("c"),0);
         let mut reads=observations::Reads::new(pool.clone());
         poll_queued_effects(&ctx,&project,1,&mut reads,None).unwrap();
         assert!(pool.stop(std::time::Duration::from_secs(2)));
-        assert_eq!(attempts(),1,"flag on reserves one dependent");
+        assert_eq!(attempts("c"),1,"one poll_queued_effects wake reserves C");
+        let mut expected=before;
+        expected.push(("c".into(),1));
+        expected.sort();
+        assert_eq!(counts(),expected,"no other task gains an attempt");
     }
 
 }
