@@ -60,6 +60,7 @@ impl SqliteStore {
         if schema>=9&&super::control::read(&tx)?.state==ProjectState::Active {
             let mut changed=false;
             for owned in super::ownership::read_all(&tx)? {
+                if schema>=41 && !bindings.iter().any(|b|b.id==owned.binding) {changed=true;continue;}
                 if let Some(binding)=bindings.iter().find(|b|b.id==owned.binding&&b.revision==owned.binding_revision) {
                     let valid=match observations.iter().find(|o|o.binding==binding.id) {Some(o)=>super::ownership::observed(binding,binding.task.as_ref().and_then(|id|tasks.get(id).copied()),o,o.observed_unix_ms,o.config_digest.as_deref())&&super::ownership::matches(&owned,binding,o)?,None=>false};
                     if !valid{changed=true;}

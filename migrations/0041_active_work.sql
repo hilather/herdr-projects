@@ -13,7 +13,8 @@ CREATE TABLE active_work_index (
     ordinal INTEGER PRIMARY KEY CHECK (ordinal >= 0),
     binding_id TEXT NOT NULL UNIQUE REFERENCES runtime_bindings(id),
     task_id TEXT REFERENCES tasks(id),
-    attempt_id TEXT REFERENCES attempts(id),
+    -- Every retained attempt for the task. One column cannot reference each id.
+    attempt_ids TEXT NOT NULL CHECK (json_valid(attempt_ids) AND length(attempt_ids) <= 8192),
     retains_capacity INTEGER NOT NULL CHECK (retains_capacity IN (0, 1))
 ) STRICT;
 

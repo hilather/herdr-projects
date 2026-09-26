@@ -1,11 +1,11 @@
 # Runtime observation and reconciliation (T03.4)
 
-`reconcile PROJECT` collects a read-only observation batch from schema-v6-or-newer runtime
-bindings. `reconcile PROJECT --record` persists that batch and audit events against
+`reconcile PROJECT` collects a read-only observation batch from the schema 41 active
+inventory. Older stores need an explicit `migration PROJECT upgrade-store` before
+reconcile. `reconcile PROJECT --record` persists that batch and audit events against
 the exact event head, binding revisions and task revisions observed. Neither form
 launches, prompts, copies, removes or releases capacity. Recording evidence that
 invalidates an active ownership claim pauses control and requires reconciliation.
-Use `migration PROJECT upgrade-store` explicitly for older published stores.
 
 Pane queries use the recorded socket/machine, never an ambient session. Herdr
 version, pane and agent responses must be valid. Duplicate or inconsistent

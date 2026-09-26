@@ -18,7 +18,8 @@ pub struct ActiveWorkItem {
     pub ordinal: i64,
     pub binding: RuntimeBinding,
     pub task_revision: Option<u64>,
-    pub attempt_id: Option<String>,
+    /// Retained attempts for this task. The task's active attempt is first when it is one of them.
+    pub attempt_ids: Vec<String>,
     pub retains_capacity: bool,
     pub ownership: Option<RuntimeOwnership>,
 }
@@ -36,7 +37,6 @@ pub struct ActiveWorkPage {
     pub fullscan_steps: i64,
     pub head: u64,
     pub capacity_release_allowed: bool,
-    pub quiescence_certified: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,7 +49,6 @@ pub struct ActiveWorkRun {
     pub fullscan_steps: i64,
     pub head: u64,
     pub capacity_release_allowed: bool,
-    pub quiescence_certified: bool,
 }
 
 #[derive(Clone)]
@@ -57,6 +56,8 @@ struct Meta {
     incarnation: String,
     projection_revision: String,
     inventory_revision: u64,
+    /// True when any attempt still has termination_observed = 0, even with no binding.
+    retains_attempt_capacity: bool,
 }
 
 struct Account {
@@ -67,7 +68,7 @@ struct Account {
 struct IndexRow {
     ordinal: i64,
     binding_id: String,
-    attempt_id: Option<String>,
+    attempt_ids: String,
     retains_capacity: bool,
 }
 
@@ -144,6 +145,7 @@ fn load_meta(db: &Connection, account: &mut Account) -> Result<Meta> {
         incarnation,
         projection_revision,
         inventory_revision: inventory_revision as u64,
+        retains_attempt_capacity: false,
     })
 }
 
@@ -157,26 +159,54 @@ fn retained_rows(db: &Connection, account: &mut Account) -> Result<Vec<(String, 
     )
 }
 
+fn ordered_attempt_ids(
+    task_id: Option<&str>,
+    by_task: &std::collections::BTreeMap<String, Vec<String>>,
+    active_attempt: Option<&str>,
+) -> Vec<String> {
+    let Some(task_id) = task_id else {
+        return Vec::new();
+    };
+    let Some(ids) = by_task.get(task_id) else {
+        return Vec::new();
+    };
+    let mut ordered = Vec::with_capacity(ids.len());
+    if let Some(active) = active_attempt {
+        if ids.iter().any(|id| id == active) {
+            ordered.push(active.to_string());
+        }
+    }
+    for id in ids {
+        if ordered.first().map(String::as_str) != Some(id.as_str()) {
+            ordered.push(id.clone());
+        }
+    }
+    ordered
+}
+
 /// The projection is disposable. A fingerprint mismatch rebuilds it from attempts
-/// that still retain capacity and from bindings that have no attempt history.
+/// that still retain capacity, bindings with no attempt history, and bindings
+/// that still have an ownership row.
 fn ensure(db: &Connection, account: &mut Account) -> Result<Meta> {
     require_schema(db)?;
     let mut meta = load_meta(db, account)?;
     let retained = retained_rows(db, account)?;
+    meta.retains_attempt_capacity = !retained.is_empty();
     let next = fingerprint(&retained);
     if meta.projection_revision == next {
         return Ok(meta);
     }
-    let mut by_task = std::collections::BTreeMap::<String, (String, i64)>::new();
-    for (id, task, revision) in &retained {
-        by_task
-            .entry(task.clone())
-            .or_insert_with(|| (id.clone(), *revision));
+    let mut by_task = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for (id, task, _) in &retained {
+        by_task.entry(task.clone()).or_default().push(id.clone());
     }
     let candidates = query(
         db,
-        "SELECT b.id, b.task_id, EXISTS(SELECT 1 FROM attempts a WHERE a.task_id = b.task_id)
-         FROM runtime_bindings b ORDER BY b.id",
+        "SELECT b.id, b.task_id,
+                EXISTS(SELECT 1 FROM attempts a WHERE a.task_id = b.task_id),
+                EXISTS(SELECT 1 FROM runtime_ownership o WHERE o.binding_id = b.id),
+                t.active_attempt
+         FROM runtime_bindings b LEFT JOIN tasks t ON t.id = b.task_id ORDER BY b.id",
         [],
         account,
         |row| {
@@ -184,20 +214,27 @@ fn ensure(db: &Connection, account: &mut Account) -> Result<Meta> {
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<String>>(1)?,
                 row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         },
     )?;
     db.execute("DELETE FROM active_work_index", [])?;
     let mut ordinal = 0i64;
-    for (id, task_id, has_attempt) in candidates {
-        let attempt = task_id.as_ref().and_then(|task| by_task.get(task));
-        let include = task_id.is_none() || attempt.is_some() || has_attempt == 0;
+    for (id, task_id, has_attempt, owned, active_attempt) in candidates {
+        let attempt_ids =
+            ordered_attempt_ids(task_id.as_deref(), &by_task, active_attempt.as_deref());
+        // A still-owned binding stays observable until relinquish, even if every attempt is terminated.
+        let include =
+            task_id.is_none() || !attempt_ids.is_empty() || has_attempt == 0 || owned == 1;
         if !include {
             continue;
         }
+        let encoded = serde_json::to_string(&attempt_ids)
+            .map_err(|error| StoreError::Invalid(error.to_string()))?;
         db.execute(
-            "INSERT INTO active_work_index(ordinal, binding_id, task_id, attempt_id, retains_capacity) VALUES(?1,?2,?3,?4,?5)",
-            params![ordinal, id, task_id, attempt.map(|item| item.0.as_str()), i64::from(attempt.is_some())],
+            "INSERT INTO active_work_index(ordinal, binding_id, task_id, attempt_ids, retains_capacity) VALUES(?1,?2,?3,?4,?5)",
+            params![ordinal, id, task_id, encoded, i64::from(!attempt_ids.is_empty())],
         )?;
         ordinal += 1;
     }
@@ -418,8 +455,10 @@ fn load_ownership(
     }
     let owned: RuntimeOwnership = serde_json::from_str(&payload)
         .map_err(|_| StoreError::Corrupt("invalid ownership payload".into()))?;
-    let revision = u64::try_from(revision).unwrap_or(0);
-    let binding_revision = u64::try_from(binding_revision).unwrap_or(0);
+    let revision = u64::try_from(revision)
+        .map_err(|_| StoreError::Corrupt("ownership row identity mismatch".into()))?;
+    let binding_revision = u64::try_from(binding_revision)
+        .map_err(|_| StoreError::Corrupt("ownership row identity mismatch".into()))?;
     if owned.binding != binding_id
         || owned.revision != revision
         || owned.binding_revision != binding_revision
@@ -471,14 +510,14 @@ fn read_page(
     let start = cursor.unwrap_or(-1);
     let index_rows = query(
         db,
-        "SELECT ordinal, binding_id, attempt_id, retains_capacity FROM active_work_index WHERE ordinal > ?1 ORDER BY ordinal LIMIT ?2",
+        "SELECT ordinal, binding_id, attempt_ids, retains_capacity FROM active_work_index WHERE ordinal > ?1 ORDER BY ordinal LIMIT ?2",
         params![start, ACTIVE_WORK_PAGE as i64],
         account,
         |row| {
             Ok(IndexRow {
                 ordinal: row.get(0)?,
                 binding_id: row.get(1)?,
-                attempt_id: row.get(2)?,
+                attempt_ids: row.get(2)?,
                 retains_capacity: row.get::<_, i64>(3)? == 1,
             })
         },
@@ -504,11 +543,13 @@ fn read_page(
         };
         let ownership = load_ownership(db, &row.binding_id, account)?;
         expected = row.ordinal + 1;
+        let attempt_ids = serde_json::from_str(&row.attempt_ids)
+            .map_err(|_| StoreError::Corrupt("active inventory attempt ids are invalid".into()))?;
         items.push(ActiveWorkItem {
             ordinal: row.ordinal,
             binding,
             task_revision,
-            attempt_id: row.attempt_id,
+            attempt_ids,
             retains_capacity: row.retains_capacity,
             ownership,
         });
@@ -517,8 +558,9 @@ fn read_page(
     Ok((items, reached_end, false))
 }
 
-fn release_allowed(coverage: ActiveCoverage, items: &[ActiveWorkItem]) -> bool {
-    coverage == ActiveCoverage::Complete && items.iter().all(|item| !item.retains_capacity)
+fn release_allowed(coverage: ActiveCoverage, retains_attempt_capacity: bool) -> bool {
+    // Retained attempts block release even when no binding is indexed.
+    coverage == ActiveCoverage::Complete && !retains_attempt_capacity
 }
 
 fn page_from(
@@ -536,7 +578,7 @@ fn page_from(
     } else {
         ActiveCoverage::Complete
     };
-    let capacity_release_allowed = release_allowed(coverage, &items);
+    let capacity_release_allowed = release_allowed(coverage, meta.retains_attempt_capacity);
     ActiveWorkPage {
         incarnation: meta.incarnation.clone(),
         inventory_revision: meta.inventory_revision,
@@ -544,7 +586,6 @@ fn page_from(
         coverage,
         reached_end,
         missing,
-        quiescence_certified: capacity_release_allowed,
         capacity_release_allowed,
         rows_read: account.rows,
         fullscan_steps: account.fullscan,
@@ -614,13 +655,12 @@ impl SqliteStore {
         } else {
             ActiveCoverage::Complete
         };
-        let capacity_release_allowed = release_allowed(coverage, &items);
+        let capacity_release_allowed = release_allowed(coverage, meta.retains_attempt_capacity);
         Ok(ActiveWorkRun {
             incarnation: meta.incarnation,
             inventory_revision: meta.inventory_revision,
             coverage,
             capacity_release_allowed,
-            quiescence_certified: capacity_release_allowed,
             rows_read: account.rows,
             fullscan_steps: account.fullscan,
             head,
@@ -778,7 +818,7 @@ mod tests {
         let empty = db.reconcile_active_work(None).unwrap();
         assert_eq!(empty.coverage, ActiveCoverage::Complete);
         assert!(empty.items.is_empty());
-        assert!(empty.capacity_release_allowed && empty.quiescence_certified);
+        assert!(empty.capacity_release_allowed);
         for index in 0..3 {
             let task = format!("idle-{index}");
             insert_task(&db.connection, &task);
@@ -793,11 +833,11 @@ mod tests {
             .unwrap();
         let missing = db.reconcile_active_work(None).unwrap();
         assert_eq!(missing.coverage, ActiveCoverage::Incomplete);
-        assert!(!missing.capacity_release_allowed && !missing.quiescence_certified);
+        assert!(!missing.capacity_release_allowed);
         let jumped = db.active_work_page(Some(10_000)).unwrap();
         assert_eq!(jumped.coverage, ActiveCoverage::Incomplete);
         assert!(jumped.items.is_empty());
-        assert!(!jumped.capacity_release_allowed && !jumped.quiescence_certified);
+        assert!(!jumped.capacity_release_allowed);
     }
 
     #[test]
@@ -816,7 +856,7 @@ mod tests {
         let stopped = db.reconcile_active_work(Some(1)).unwrap();
         assert_eq!(stopped.coverage, ActiveCoverage::Incomplete);
         assert_eq!(stopped.items.len(), ACTIVE_WORK_PAGE);
-        assert!(!stopped.capacity_release_allowed && !stopped.quiescence_certified);
+        assert!(!stopped.capacity_release_allowed);
         let run = db.reconcile_active_work(None).unwrap();
         assert_eq!(run.coverage, ActiveCoverage::Complete);
         assert_eq!(run.items.len(), 129);
@@ -918,7 +958,7 @@ mod tests {
         assert_eq!(hot.coverage, ActiveCoverage::Complete);
         assert_eq!(hot.items.len(), 64);
         assert!(hot.items.iter().all(|item| item.retains_capacity));
-        assert!(!hot.capacity_release_allowed && !hot.quiescence_certified);
+        assert!(!hot.capacity_release_allowed);
         assert!(
             hot.rows_read <= ACTIVE_WORK_PAGE as u64 * 8 && hot.rows_read < 10_064,
             "hot rows {} fullscan {}",
@@ -938,5 +978,130 @@ mod tests {
                 .iter()
                 .all(|item| !item.binding.id.starts_with("task:r-"))
         );
+    }
+
+    fn insert_coordinator(db: &Connection) {
+        let payload = r#"{"id":"coordinator","task":null,"revision":1,"source_path":null,"source_digest":null,"session_source_digest":null,"verification":"unverified","identity":{}}"#;
+        let hash = format!("{:x}", Sha256::digest(payload.as_bytes()));
+        db.execute(
+            "INSERT INTO runtime_bindings(id,task_id,revision,source_path,payload,payload_hash) VALUES('coordinator',NULL,1,NULL,?1,?2)",
+            params![payload, hash],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn retained_attempt_blocks_release_without_an_indexed_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = SqliteStore::create(&dir.path().join("state.db")).unwrap();
+        insert_task(&db.connection, "held");
+        insert_attempt(&db.connection, "held", true);
+        let empty = db.reconcile_active_work(None).unwrap();
+        assert!(empty.items.is_empty());
+        assert_eq!(empty.coverage, ActiveCoverage::Complete);
+        assert!(!empty.capacity_release_allowed);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = SqliteStore::create(&dir.path().join("state.db")).unwrap();
+        insert_task(&db.connection, "held");
+        insert_attempt(&db.connection, "held", true);
+        insert_coordinator(&db.connection);
+        let coordinator = db.reconcile_active_work(None).unwrap();
+        assert_eq!(coordinator.coverage, ActiveCoverage::Complete);
+        assert_eq!(coordinator.items.len(), 1);
+        assert_eq!(coordinator.items[0].binding.id, "coordinator");
+        assert!(!coordinator.items[0].retains_capacity);
+        assert!(!coordinator.capacity_release_allowed);
+    }
+
+    #[test]
+    fn terminated_attempt_commit_removes_the_binding_from_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = SqliteStore::create(&dir.path().join("state.db")).unwrap();
+        insert_task(&db.connection, "gone");
+        insert_binding(&db.connection, "gone");
+        let primed = db.reconcile_active_work(None).unwrap();
+        assert_eq!(primed.items.len(), 1);
+        db.commit(Commit {
+            expected_head: primed.head,
+            mutations: vec![Mutation::Attempt {
+                expected: None,
+                next: Attempt {
+                    id: AttemptId::new("attempt-gone").unwrap(),
+                    task: TaskId::new("gone").unwrap(),
+                    revision: 1,
+                    state: AttemptState::Completed,
+                    snapshot: None,
+                    reservation: "attempt-gone".into(),
+                    termination_observed: true,
+                },
+            }],
+        })
+        .unwrap();
+        let after = db.reconcile_active_work(None).unwrap();
+        assert!(after.items.is_empty());
+        assert_eq!(after.coverage, ActiveCoverage::Complete);
+    }
+
+    #[test]
+    fn index_keeps_every_retained_attempt_and_prefers_the_active_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = SqliteStore::create(&dir.path().join("state.db")).unwrap();
+        insert_task(&db.connection, "z");
+        insert_binding(&db.connection, "z");
+        for name in ["attempt-z-a", "attempt-z-b"] {
+            db.connection
+                .execute(
+                    "INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) VALUES(?1,'z',1,'running',NULL,?1,0)",
+                    [name],
+                )
+                .unwrap();
+        }
+        db.connection
+            .execute(
+                "UPDATE tasks SET active_attempt='attempt-z-b' WHERE id='z'",
+                [],
+            )
+            .unwrap();
+        let run = db.reconcile_active_work(None).unwrap();
+        assert_eq!(run.items.len(), 1);
+        assert_eq!(
+            run.items[0].attempt_ids,
+            vec!["attempt-z-b".to_string(), "attempt-z-a".to_string()]
+        );
+        assert!(!run.capacity_release_allowed);
+    }
+
+    #[test]
+    fn owned_binding_stays_active_after_every_attempt_is_terminated() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = SqliteStore::create(&dir.path().join("state.db")).unwrap();
+        seed_pair(&db.connection, "old", false);
+        let owned = RuntimeOwnership {
+            binding: "task:old".into(),
+            revision: 1,
+            binding_revision: 1,
+            identity_digest: "ab".repeat(32),
+            origin: "adopted".into(),
+            attempt: Some(AttemptId::new("attempt-old").unwrap()),
+            session: None,
+            worktree: None,
+            agent: None,
+            config_digest: None,
+            observed_unix_ms: 1,
+        };
+        let payload = serde_json::to_string(&owned).unwrap();
+        let hash = format!("{:x}", Sha256::digest(payload.as_bytes()));
+        db.connection
+            .execute(
+                "INSERT INTO runtime_ownership(binding_id,revision,binding_revision,attempt_id,payload,payload_hash) VALUES(?1,1,1,?2,?3,?4)",
+                params!["task:old", "attempt-old", payload, hash],
+            )
+            .unwrap();
+        let run = db.reconcile_active_work(None).unwrap();
+        assert_eq!(run.items.len(), 1);
+        assert_eq!(run.items[0].binding.id, "task:old");
+        assert!(!run.items[0].retains_capacity);
+        assert!(run.capacity_release_allowed);
     }
 }

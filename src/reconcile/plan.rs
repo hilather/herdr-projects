@@ -38,16 +38,38 @@ fn unobserved_creations(snapshot:&Snapshot)->std::collections::BTreeSet<&crate::
 }
 const UNOBSERVED_CREATION:&str="Launch creation may have occurred, but no exact process identity was recorded. An empty process inventory or expired claim does not prove termination. Retain capacity and resources; inspect launch creation evidence without recreating or releasing the worker.";
 
+/// A binding whose attempts are all terminated and that has no ownership claim is
+/// historical. Recovery classifies it from the snapshot; it is not live inventory.
+fn historical_binding(snapshot:&Snapshot,binding:&crate::domain::RuntimeBinding)->bool {
+    let Some(task)=&binding.task else {return false};
+    if snapshot.ownership.iter().any(|owned|owned.binding==binding.id) {return false;}
+    let mut seen=false;
+    for attempt in &snapshot.attempts {
+        if &attempt.task!=task {continue;}
+        if attempt.retains_capacity() {return false;}
+        seen=true;
+    }
+    seen
+}
+
 pub fn build(snapshot:&Snapshot,batch:&ObservationBatch,now:i64,config:Option<&str>)->Result<RecoveryPlan> {
     use Classification as C;use RepairAction as A;use super::ResourceState as S;
     ensure!(now>=0&&batch.expected_head==snapshot.head&&!batch.dispatch_allowed&&batch.recorded_head.is_none(),"recovery plan requires an unapplied observation batch at the current head");
-    ensure!(batch.observations.len()==snapshot.runtime_bindings.len(),"recovery plan requires complete observations");
-    let mut seen=std::collections::BTreeSet::new();
-    for o in &batch.observations {o.validate().map_err(anyhow::Error::msg)?;ensure!(seen.insert(&o.binding)&&snapshot.runtime_bindings.iter().any(|b|b.id==o.binding&&b.revision==o.binding_revision&&o.task_revision==b.task.as_ref().and_then(|id|snapshot.tasks.iter().find(|t|&t.id==id).map(|t|t.revision))),"observation identities changed");}
+    let mut covered=std::collections::BTreeSet::new();
+    for o in &batch.observations {
+        o.validate().map_err(anyhow::Error::msg)?;
+        let binding=snapshot.runtime_bindings.iter().find(|b|b.id==o.binding&&b.revision==o.binding_revision&&o.task_revision==b.task.as_ref().and_then(|id|snapshot.tasks.iter().find(|t|&t.id==id).map(|t|t.revision))).ok_or_else(||anyhow::anyhow!("observation identities changed"))?;
+        if !historical_binding(snapshot,binding) {ensure!(covered.insert(o.binding.as_str()),"observation identities changed");}
+    }
+    ensure!(covered.len()==snapshot.runtime_bindings.iter().filter(|b|!historical_binding(snapshot,b)).count(),"recovery plan requires complete observations");
     let unobserved=unobserved_creations(snapshot);
     let mut items=Vec::new();let mut matched_attempts=std::collections::BTreeSet::new();
     let mut add=|kind:&str,id:&str,revision:u64,classification,action,reason:&str|items.push(RepairItem{entity_kind:kind.into(),entity:id.into(),expected_revision:revision,classification,action,reason:reason.into()});
     for binding in &snapshot.runtime_bindings {
+        if historical_binding(snapshot,binding) {
+            add("runtime",&binding.id,binding.revision,C::AlreadyCompleted,A::None,"Every attempt is terminated and no ownership claim remains. This historical binding is outside the live inventory.");
+            continue;
+        }
         let observation=batch.observations.iter().find(|o|o.binding==binding.id).expect("complete checked above");
         let owned=snapshot.ownership.iter().find(|o|o.binding==binding.id);
         let task=binding.task.as_ref().and_then(|id|snapshot.tasks.iter().find(|t|&t.id==id));
@@ -126,5 +148,22 @@ mod tests {
         assert_eq!(action(&snapshot,100),RepairAction::Wait);assert_eq!(action(&snapshot,101),RepairAction::ExpireClaim);
         snapshot.deliveries[0].state=DeliveryState::Pending;assert_eq!(action(&snapshot,101),RepairAction::DeliverAfterValidation);snapshot.operations[0].kind="legacy.notification".into();assert_eq!(action(&snapshot,101),RepairAction::InspectUnsupportedAdapter);
         batch.expected_head+=1;assert!(build(&snapshot,&batch,101,None).is_err());batch.expected_head-=1;batch.recorded_head=Some(snapshot.head);assert!(build(&snapshot,&batch,101,None).is_err());
+    }
+    #[test]
+    fn terminated_binding_plans_without_a_live_observation() {
+        let temp=tempfile::tempdir().unwrap();let mut db=SqliteStore::create(&temp.path().join("state.db")).unwrap();
+        let task=TaskId::new("old").unwrap();
+        let head=db.commit(Commit{expected_head:0,mutations:vec![
+            Mutation::Task{expected:None,next:Task{id:task.clone(),revision:1,state:TaskState::Succeeded,title:"old".into(),active_attempt:None}},
+            Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("attempt-old").unwrap(),task:task.clone(),revision:1,state:AttemptState::Completed,snapshot:None,reservation:"attempt-old".into(),termination_observed:true}},
+        ]}).unwrap();
+        db.create_runtime(Some(&task),Some(1),head,&Default::default()).unwrap();
+        let snapshot=db.read_snapshot(None).unwrap();
+        let batch=ObservationBatch{expected_head:snapshot.head,observations:vec![],dispatch_allowed:false,recorded_head:None};
+        let report=build(&snapshot,&batch,100,None).unwrap();
+        assert!(!report.dispatch_allowed);
+        let item=report.items.iter().find(|item|item.entity_kind=="runtime").unwrap();
+        assert_eq!(item.classification,Classification::AlreadyCompleted);
+        assert_eq!(item.action,RepairAction::None);
     }
 }

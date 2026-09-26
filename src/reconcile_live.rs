@@ -21,17 +21,17 @@ fn pane_state(identity:&herdr_projects::domain::RuntimeIdentity,state:&Result<(V
     (State::Present,agents.len()==1)
 }
 
-pub fn collect(ctx:&Ctx,project:&Path)->Result<ObservationBatch> {collect_limited(ctx,project,None,None)}
+pub fn collect(ctx:&Ctx,project:&Path)->Result<ObservationBatch> {collect_limited(ctx,project,None)}
 pub fn collect_controlled(ctx:&Ctx,project:&Path,control:&herdr_projects::store::controlled::ReadControl)->Result<ObservationBatch> {
-    collect_limited(ctx,project,Some(control),None)
+    collect_limited(ctx,project,Some(control))
 }
 fn map_store(error:herdr_projects::store::StoreError)->anyhow::Error {
     if matches!(error,herdr_projects::store::StoreError::UnsupportedSchema(_)) {anyhow::anyhow!("upgrade-store is required for reconciliation observations")} else {error.into()}
 }
-fn collect_limited(ctx:&Ctx,project:&Path,control:Option<&herdr_projects::store::controlled::ReadControl>,max_pages:Option<u32>)->Result<ObservationBatch> {
+fn collect_limited(ctx:&Ctx,project:&Path,control:Option<&herdr_projects::store::controlled::ReadControl>)->Result<ObservationBatch> {
     let run=match control {
-        Some(control)=>migration::open_active_controlled(project,control.clone())?.reconcile_active_work(max_pages).map_err(map_store)?,
-        None=>migration::open_active(project)?.reconcile_active_work(max_pages).map_err(map_store)?,
+        Some(control)=>migration::open_active_controlled(project,control.clone())?.reconcile_active_work(None).map_err(map_store)?,
+        None=>migration::open_active(project)?.reconcile_active_work(None).map_err(map_store)?,
     };
     ensure!(run.coverage==herdr_projects::store::ActiveCoverage::Complete,"active inventory coverage incomplete; capacity retained");
     let head=run.head;

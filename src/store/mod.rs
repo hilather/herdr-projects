@@ -222,6 +222,9 @@ impl SqliteStore {
                         Some(rev) => tx.execute("UPDATE attempts SET revision=?3,state=?4,snapshot=?5,reservation=?6,termination_observed=?7 WHERE id=?1 AND task_id=?2 AND revision=?8", params![id, next.task.as_str(), integer(next.revision)?, next.state.as_str(), next.snapshot, next.reservation, next.termination_observed, integer(*rev)?])?,
                     };
                     if count != 1 { return Err(StoreError::Conflict); }
+                    // A newly inserted terminated attempt does not change the retained-row
+                    // fingerprint, but it does remove a previously attempt-less binding.
+                    active_work::invalidate(&tx)?;
                     ("attempt.changed", id, next.revision)
                 },
                 Mutation::Enqueue(next) => {
