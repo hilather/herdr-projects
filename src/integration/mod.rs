@@ -36,6 +36,10 @@ pub enum Fault {
     CrashBeforeChecks,
     #[cfg(test)]
     UpdateRefRejected,
+    #[cfg(test)]
+    FailBuild,
+    #[cfg(test)]
+    ExpireBeforeRecord,
 }
 
 impl Default for Fault {
@@ -197,25 +201,66 @@ fn drive_new(
         let view = store.load_integration_operation(claim.operation.as_str())?;
         return Ok(outcome_of(&view));
     }
-    let built = repo.build_merge(&request.work_dir, base, &verified.commit_oid)?;
+    #[cfg(test)]
+    if request.fault == Fault::FailBuild {
+        let _ = ensure_retryable(store, claim.operation.as_str());
+        bail!("integration build failed");
+    }
+    let built = match repo.build_merge(&request.work_dir, base, &verified.commit_oid) {
+        Ok(built) => built,
+        Err(error) => {
+            // The pre-build lease may already be dead. Requeue so the next retry can record.
+            let _ = ensure_retryable(store, claim.operation.as_str());
+            return Err(error);
+        }
+    };
+    let operation_id = claim.operation.as_str().to_string();
     let BuiltCommit::Ready {
         oid,
         tree,
         checkout,
     } = built
     else {
+        let renewed = fresh_claim(store, &operation_id).ok();
         return finish(
             store,
-            claim.operation.as_str(),
-            Some(&claim),
+            &operation_id,
+            renewed.as_ref(),
             IntegrationFinish::Blocked {
                 reason: "merge_conflict",
             },
         );
     };
+    // The merge can outlive the 60s lease. Renew immediately before recording M.
+    #[cfg(test)]
+    if request.fault == Fault::ExpireBeforeRecord {
+        store.testing_expire_lease(claim.operation.as_str())?;
+        store.expire_claims(1)?;
+    }
+    let claim = match fresh_claim(store, &operation_id) {
+        Ok(claim) => claim,
+        Err(_) => {
+            return finish(
+                store,
+                &operation_id,
+                None,
+                IntegrationFinish::Discarded {
+                    reason: "claim_expired",
+                },
+            );
+        }
+    };
+    // The repository must hold M before the row exists, so resume does not depend on the work dir.
+    repo.copy_objects_from(&checkout)?;
+    if !repo.has_object(&oid)? || !repo.has_object(&tree)? {
+        let _ = ensure_retryable(store, &operation_id);
+        bail!("candidate commit was not stored");
+    }
     let now = now_ms();
-    // Persist M before update-ref so crash recovery can confirm only this oid.
-    store.record_candidate(&claim, &oid, &tree, &verified.commit_oid, now)?;
+    if let Err(error) = store.record_candidate(&claim, &oid, &tree, &verified.commit_oid, now) {
+        let _ = ensure_retryable(store, &operation_id);
+        return Err(error.into());
+    }
     #[cfg(test)]
     if request.fault == Fault::CrashBeforeChecks {
         let view = store.load_integration_operation(claim.operation.as_str())?;
@@ -279,8 +324,42 @@ fn resume_incomplete(
         .tree_oid
         .clone()
         .context("integration candidate is missing")?;
+    if !repo.has_object(&oid)? || !repo.has_object(&tree)? {
+        // Nothing was stored to check out. Drop the row so another generation can build.
+        if current == view.expected_old_oid {
+            return finish(
+                store,
+                &view.operation_id,
+                Some(&claim),
+                IntegrationFinish::Discarded {
+                    reason: "candidate_missing",
+                },
+            );
+        }
+        return finish(
+            store,
+            &view.operation_id,
+            Some(&claim),
+            IntegrationFinish::Reconciliation {
+                reason: "ambiguous_ref",
+            },
+        );
+    }
     let verified = store.load_verified_for_integration(&view.verified_result_id)?;
-    let checkout = repo.checkout_candidate(&request.work_dir, &oid)?;
+    let checkout = match repo.checkout_candidate(&request.work_dir, &oid) {
+        Ok(checkout) => checkout,
+        Err(_) if current == view.expected_old_oid => {
+            return finish(
+                store,
+                &view.operation_id,
+                Some(&claim),
+                IntegrationFinish::Discarded {
+                    reason: "candidate_missing",
+                },
+            );
+        }
+        Err(error) => return Err(error),
+    };
     if !checks_pass(&request.work_dir, &checkout, &verified, &oid, &tree)? {
         return finish(
             store,
@@ -424,6 +503,25 @@ fn classify_readback(
             reason: "ambiguous_ref",
         },
     )
+}
+
+fn ensure_retryable(store: &mut SqliteStore, operation_id: &str) -> Result<()> {
+    let now = now_ms();
+    if store.held_claim(operation_id, now).is_ok() {
+        return Ok(());
+    }
+    if store.requeue_expired_lease(operation_id, now).is_ok() {
+        return Ok(());
+    }
+    store
+        .finish_integration_observed(
+            operation_id,
+            IntegrationFinish::Discarded {
+                reason: "claim_expired",
+            },
+            now,
+        )
+        .map_err(anyhow::Error::from)
 }
 
 fn fresh_claim(store: &mut SqliteStore, operation_id: &str) -> Result<Claim> {

@@ -29,6 +29,18 @@ fn git(repo: &Path, args: &[&str]) {
     assert!(status.success(), "git {args:?}");
 }
 
+fn git_ok(repo: &Path, args: &[&str]) -> bool {
+    Command::new("/usr/bin/git")
+        .args(args)
+        .current_dir(repo)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 fn git_text(repo: &Path, args: &[&str]) -> String {
     git(repo, args);
     let output = Command::new("/usr/bin/git")
@@ -259,6 +271,79 @@ fn stale_base_does_not_publish() {
         vec![("discarded".into(), published)]
     );
     assert_eq!(dependencies(&db), before);
+    assert_local(&fixture);
+}
+
+#[test]
+fn packed_ancestor_tree_still_publishes() {
+    let fixture = fixture();
+    git(&fixture.repo, &["repack", "-a", "-d"]);
+    let tree = git_text(
+        &fixture.repo,
+        &["rev-parse", &format!("{}^{{tree}}", fixture.base)],
+    );
+    let loose = fixture
+        .repo
+        .join(".git/objects")
+        .join(&tree[..2])
+        .join(&tree[2..]);
+    if loose.exists() {
+        fs::remove_file(&loose).unwrap();
+    }
+    git(&fixture.repo, &["cat-file", "-t", &tree]);
+    let mut db = open(&fixture);
+    let outcome = integrate(&mut db, &request(&fixture, "integrate-pack", Fault::None)).unwrap();
+    assert_eq!(outcome.state, "integrated");
+    assert_eq!(
+        git_text(&fixture.repo, &["rev-parse", TARGET]),
+        outcome.commit_oid.unwrap()
+    );
+    assert_local(&fixture);
+}
+
+#[test]
+fn missing_candidate_object_discards_prepared_generation() {
+    let fixture = fixture();
+    let mut db = open(&fixture);
+    let prepared = integrate(
+        &mut db,
+        &request(&fixture, "integrate-missing", Fault::CrashBeforeChecks),
+    )
+    .unwrap();
+    assert_eq!(prepared.state, "candidate_prepared");
+    let oid = prepared.commit_oid.expect("candidate");
+    // Remove only the candidate commit. Its tree may be shared with the verified commit.
+    let path = fixture
+        .repo
+        .join(".git/objects")
+        .join(&oid[..2])
+        .join(&oid[2..]);
+    fs::remove_file(&path).unwrap();
+    assert!(!git_ok(&fixture.repo, &["cat-file", "-e", &oid]));
+    let discarded = integrate(&mut db, &request(&fixture, "integrate-missing", Fault::None)).unwrap();
+    assert_eq!(discarded.state, "discarded");
+    assert_eq!(discarded.reason.as_deref(), Some("candidate_missing"));
+    assert_eq!(git_text(&fixture.repo, &["rev-parse", TARGET]), fixture.base);
+    let published = integrate(&mut db, &request(&fixture, "integrate-again", Fault::None)).unwrap();
+    assert_eq!(published.state, "integrated");
+    assert_local(&fixture);
+}
+
+#[test]
+fn expired_claim_after_build_still_records() {
+    let fixture = fixture();
+    let mut db = open(&fixture);
+    let outcome = integrate(
+        &mut db,
+        &request(&fixture, "integrate-renew", Fault::ExpireBeforeRecord),
+    )
+    .unwrap();
+    assert_eq!(outcome.state, "integrated");
+    assert_ne!(outcome.commit_oid.as_deref(), Some(fixture.base.as_str()));
+    let failed = integrate(&mut db, &request(&fixture, "integrate-fail", Fault::FailBuild));
+    assert!(failed.is_err());
+    let resumed = integrate(&mut db, &request(&fixture, "integrate-fail", Fault::None)).unwrap();
+    assert_eq!(resumed.state, "integrated");
     assert_local(&fixture);
 }
 

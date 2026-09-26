@@ -22,6 +22,7 @@ const ALLOWED: &[&str] = &[
     "cat-file",
     "checkout",
     "worktree",
+    "pack-objects",
 ];
 
 pub(crate) fn command_allowed(args: &[String]) -> bool {
@@ -106,6 +107,10 @@ fn git_env() -> Vec<(String, String)> {
 }
 
 fn run_git(cwd: &Path, args: &[String]) -> Result<Output> {
+    run_git_stdin(cwd, args, None)
+}
+
+fn run_git_stdin(cwd: &Path, args: &[String], stdin: Option<String>) -> Result<Output> {
     if !command_allowed(args) {
         bail!("git command is not a local integration effect");
     }
@@ -114,6 +119,7 @@ fn run_git(cwd: &Path, args: &[String]) -> Result<Output> {
     command.cwd = Some(cwd.to_path_buf());
     command.env_clear = true;
     command.env = git_env();
+    command.stdin = stdin;
     RealRunner
         .run(&command)
         .with_context(|| format!("git {args:?}"))
@@ -270,7 +276,9 @@ impl GitRepo {
             ],
         )?;
         let oid = oid_line(&commit, len).context("commit-tree")?;
-        self.import_source_objects(&isolated.join(".git/objects"))?;
+        // Packs in the source repo are invisible once alternates are removed.
+        self.materialize_reachable(&isolated, &oid)?;
+        drop_alternates(&isolated, &oid)?;
         let checkout = run_git(
             &isolated,
             &["checkout".into(), "--detach".into(), oid.clone()],
@@ -278,8 +286,6 @@ impl GitRepo {
         if !checkout.success() {
             bail!("git checkout of the candidate failed: {}", checkout.stderr.trim());
         }
-        // The verifier copies this directory into a tmpfs. Alternates would point outside that copy.
-        let _ = fs::remove_file(isolated.join(".git/objects/info/alternates"));
         Ok(BuiltCommit::Ready {
             oid,
             tree,
@@ -300,8 +306,9 @@ impl GitRepo {
             self.prepare_isolated(&work)?;
             Output::default()
         };
+        self.materialize_reachable(&isolated, oid)?;
+        drop_alternates(&isolated, oid)?;
         if head.stdout.trim() != oid {
-            self.import_source_objects(&isolated.join(".git/objects"))?;
             let checkout = run_git(
                 &isolated,
                 &["checkout".into(), "--detach".into(), oid.into()],
@@ -312,11 +319,34 @@ impl GitRepo {
                     checkout.stderr.trim()
                 );
             }
-        } else {
-            self.import_source_objects(&isolated.join(".git/objects"))?;
         }
-        let _ = fs::remove_file(isolated.join(".git/objects/info/alternates"));
         Ok(isolated)
+    }
+
+    pub fn has_object(&self, oid: &str) -> Result<bool> {
+        let output = run_git(&self.path, &["cat-file".into(), "-e".into(), oid.into()])?;
+        Ok(output.success())
+    }
+
+    /// Walk the candidate through alternates, including source packs, and store a local pack.
+    fn materialize_reachable(&self, isolated: &Path, oid: &str) -> Result<()> {
+        fs::create_dir_all(isolated.join(".git/objects/pack")).context("object pack directory")?;
+        let packed = run_git_stdin(
+            isolated,
+            &[
+                "pack-objects".into(),
+                "--revs".into(),
+                ".git/objects/pack/pack".into(),
+            ],
+            Some(format!("{oid}\n")),
+        )?;
+        if !packed.success() {
+            bail!(
+                "could not materialize candidate objects: {}",
+                packed.stderr.trim()
+            );
+        }
+        Ok(())
     }
 
     fn prepare_isolated(&self, work: &Path) -> Result<PathBuf> {
@@ -349,10 +379,6 @@ impl GitRepo {
             .context("git alternates")?;
         writeln!(file, "{}", self.git_dir.join("objects").display()).context("git alternates")?;
         Ok(isolated)
-    }
-
-    fn import_source_objects(&self, dest: &Path) -> Result<()> {
-        copy_loose(&self.git_dir.join("objects"), dest)
     }
 
     pub fn copy_objects_from(&self, checkout: &Path) -> Result<()> {
@@ -456,6 +482,24 @@ impl GitRepo {
         }
         Ok(oid)
     }
+}
+
+fn drop_alternates(isolated: &Path, oid: &str) -> Result<()> {
+    let path = isolated.join(".git/objects/info/alternates");
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("drop alternates"),
+    }
+    // A missing packed tree must fail the build, not a later policy check.
+    let kind = run_git(
+        isolated,
+        &["cat-file".into(), "-t".into(), format!("{oid}^{{tree}}")],
+    )?;
+    if !kind.success() || kind.stdout.trim() != "tree" {
+        bail!("candidate tree was not materialized");
+    }
+    Ok(())
 }
 
 fn copy_loose(source: &Path, dest: &Path) -> Result<()> {
