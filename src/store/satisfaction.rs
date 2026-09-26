@@ -103,6 +103,11 @@ fn insert_valid(
             [satisfaction_id],
         )?;
     }
+    // A non-current receipt must not take the empty slot. Attach would then
+    // be unable to record the attempt that actually counts.
+    if !replace_existing {
+        return Ok(());
+    }
     let now = jiff::Timestamp::now().as_millisecond();
     tx.execute(
         "INSERT INTO dependency_satisfactions(satisfaction_id,task_id,predecessor_task,requirement,state,evidence_kind,evidence_id,created_unix_ms) VALUES(?1,?2,?3,?4,'valid',?4,?5,?6)",
@@ -187,19 +192,25 @@ pub(super) fn record_integrated_commit(tx: &Connection, integrated_id: &str) -> 
     Ok(())
 }
 
-fn latest_verified(tx: &Connection, predecessor: &str) -> Result<Option<String>> {
-    tx.query_row(
+/// Newest accepted result that may still replace, not merely the latest clock.
+/// A later run for an older attempt must not be the one attach records.
+fn current_verified(tx: &Connection, predecessor: &str) -> Result<Option<String>> {
+    let mut stmt = tx.prepare(
         "SELECT v.result_id
          FROM verified_results v
          JOIN verification_runs r ON r.run_id=v.run_id
          WHERE r.task_id=?1 AND r.state='accepted'
-         ORDER BY v.created_unix_ms DESC, v.result_id DESC
-         LIMIT 1",
-        [predecessor],
-        |row| row.get(0),
-    )
-    .optional()
-    .map_err(StoreError::from)
+         ORDER BY v.created_unix_ms DESC, v.result_id DESC",
+    )?;
+    let ids = stmt
+        .query_map([predecessor], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for result_id in ids {
+        if verified_result_may_replace(tx, &result_id)? {
+            return Ok(Some(result_id));
+        }
+    }
+    Ok(None)
 }
 
 fn latest_integrated(tx: &Connection, predecessor: &str) -> Result<Option<String>> {
@@ -235,7 +246,7 @@ pub(super) fn attach_stored_receipts(tx: &Connection, task_id: &str) -> Result<(
     for (predecessor, requirement) in edges {
         match requirement.as_str() {
             "verified_result" => {
-                if let Some(result_id) = latest_verified(tx, &predecessor)? {
+                if let Some(result_id) = current_verified(tx, &predecessor)? {
                     record_verified_result(tx, &result_id)?;
                 }
             }
@@ -468,6 +479,7 @@ mod tests {
         attempt: &str,
         result_id: &str,
         contract_revision: i64,
+        created_unix_ms: i64,
     ) {
         let digest = "d".repeat(64);
         let oid = "a".repeat(40);
@@ -500,14 +512,22 @@ mod tests {
             .unwrap();
         db.connection
             .execute(
-                "INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,'/tmp/project',?1,?2,?2,?3,?6,?2,?4,'policy',?2,?5,?5,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?2,0,0,?6)",
-                params![result_id, digest, task_id, attempt, oid, contract_revision],
+                "INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,'/tmp/project',?1,?2,?2,?3,?6,?2,?4,'policy',?2,?5,?5,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?2,0,0,?7)",
+                params![
+                    result_id,
+                    digest,
+                    task_id,
+                    attempt,
+                    oid,
+                    contract_revision,
+                    created_unix_ms
+                ],
             )
             .unwrap();
         db.connection
             .execute(
                 "INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?1,?2,?3,?3,'sha1',?2,?2,'linux-unshare-user-pid-mount-v1',0,?4)",
-                params![result_id, digest, oid, contract_revision],
+                params![result_id, digest, oid, created_unix_ms],
             )
             .unwrap();
         db.connection
@@ -783,7 +803,7 @@ mod tests {
         );
         drop(tx);
         let result_id = "e".repeat(64);
-        store_verified_receipt(&db, "pred", "attempt-1", &result_id, 1);
+        store_verified_receipt(&db, "pred", "attempt-1", &result_id, 1, 1);
         let tx = db.connection.transaction().unwrap();
         record_verified_result(&tx, &result_id).unwrap();
         let kinds: Vec<String> = {
@@ -899,8 +919,8 @@ mod tests {
         queued_predecessor(&mut db);
         let first = "e".repeat(64);
         let second = "f".repeat(64);
-        store_verified_receipt(&db, "pred", "attempt-1", &first, 1);
-        store_verified_receipt(&db, "pred", "attempt-1", &second, 1);
+        store_verified_receipt(&db, "pred", "attempt-1", &first, 1, 1);
+        store_verified_receipt(&db, "pred", "attempt-1", &second, 1, 2);
         let tx = db.connection.transaction().unwrap();
         record_verified_result(&tx, &first).unwrap();
         record_verified_result(&tx, &second).unwrap();
@@ -945,6 +965,79 @@ mod tests {
     }
 
     #[test]
+    fn queue_after_a_later_stale_run_still_uses_the_current_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
+        db.commit(Commit {
+            expected_head: 0,
+            mutations: vec![
+                task("pred", TaskState::Draft),
+                task("needs-verified", TaskState::Draft),
+            ],
+        })
+        .unwrap();
+        let head = db.read_snapshot(None).unwrap().head;
+        db.commit(Commit {
+            expected_head: head,
+            mutations: vec![
+                Mutation::Attempt {
+                    expected: None,
+                    next: Attempt {
+                        id: AttemptId::new("attempt-1").unwrap(),
+                        task: TaskId::new("pred").unwrap(),
+                        revision: 1,
+                        state: AttemptState::Completed,
+                        snapshot: None,
+                        reservation: "slot-pred".into(),
+                        termination_observed: true,
+                    },
+                },
+                Mutation::Attempt {
+                    expected: None,
+                    next: Attempt {
+                        id: AttemptId::new("attempt-2").unwrap(),
+                        task: TaskId::new("pred").unwrap(),
+                        revision: 1,
+                        state: AttemptState::Completed,
+                        snapshot: None,
+                        reservation: "slot-pred-2".into(),
+                        termination_observed: true,
+                    },
+                },
+            ],
+        })
+        .unwrap();
+        let current = "2".repeat(64);
+        let stale = "1".repeat(64);
+        store_verified_receipt(&db, "pred", "attempt-2", &current, 1, 1);
+        let tx = db.connection.transaction().unwrap();
+        record_verified_result(&tx, &current).unwrap();
+        tx.commit().unwrap();
+        store_verified_receipt(&db, "pred", "attempt-1", &stale, 1, 2);
+        let tx = db.connection.transaction().unwrap();
+        record_verified_result(&tx, &stale).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            satisfaction_states(&db.connection, "verified_result"),
+            Vec::<(String, String)>::new()
+        );
+        queue(
+            &mut db,
+            "needs-verified",
+            "pred",
+            DependencyRequirement::VerifiedResult,
+        );
+        assert_eq!(
+            satisfaction_states(&db.connection, "verified_result"),
+            vec![(current, "valid".into())]
+        );
+        assert_eq!(
+            dependency_lines(&db.queue_report(0).unwrap(), "needs-verified"),
+            vec!["admission_disabled:verified_result".to_string()]
+        );
+    }
+
+    #[test]
     fn older_attempt_run_does_not_invalidate_the_current_satisfaction() {
         let temp = tempfile::tempdir().unwrap();
         let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
@@ -968,7 +1061,7 @@ mod tests {
         .unwrap();
         let current = "2".repeat(64);
         let older = "1".repeat(64);
-        store_verified_receipt(&db, "pred", "attempt-2", &current, 1);
+        store_verified_receipt(&db, "pred", "attempt-2", &current, 1, 1);
         let tx = db.connection.transaction().unwrap();
         record_verified_result(&tx, &current).unwrap();
         tx.commit().unwrap();
@@ -1024,7 +1117,7 @@ mod tests {
         let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
         queued_predecessor(&mut db);
         let result_id = "e".repeat(64);
-        store_verified_receipt(&db, "pred", "attempt-1", &result_id, 1);
+        store_verified_receipt(&db, "pred", "attempt-1", &result_id, 1, 1);
         let tx = db.connection.transaction().unwrap();
         record_verified_result(&tx, &result_id).unwrap();
         tx.commit().unwrap();
@@ -1069,7 +1162,7 @@ mod tests {
         let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
         queued_predecessor(&mut db);
         let result_id = "e".repeat(64);
-        store_verified_receipt(&db, "pred", "attempt-1", &result_id, 1);
+        store_verified_receipt(&db, "pred", "attempt-1", &result_id, 1, 1);
         let tx = db.connection.transaction().unwrap();
         record_verified_result(&tx, &result_id).unwrap();
         tx.commit().unwrap();
@@ -1105,7 +1198,7 @@ mod tests {
             )
             .unwrap();
         let result_id = "e".repeat(64);
-        store_verified_receipt(&db, "pred", "attempt-1", &result_id, 1);
+        store_verified_receipt(&db, "pred", "attempt-1", &result_id, 1, 1);
         let tx = db.connection.transaction().unwrap();
         record_verified_result(&tx, &result_id).unwrap();
         tx.commit().unwrap();
