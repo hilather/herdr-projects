@@ -99,7 +99,12 @@ fn process_next(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::copy_job
 #[cfg(target_os="linux")]
 fn linux_admission(path:&Path)->Option<String> {
     if !herdr_projects::admission::wake_enabled(path) {return None;}
-    herdr_projects::admission::admit_once(path).err().map(|error| format!("{error:#}"))
+    // Ok(Some) is backpressure, not success. Prepared dispatch still runs after this note.
+    match herdr_projects::admission::admit_once(path) {
+        Ok(Some(block))=>Some(format!("{}: {}", block.blocker, block.reason)),
+        Ok(None)=>None,
+        Err(error)=>Some(format!("{error:#}")),
+    }
 }
 #[cfg(not(target_os="linux"))]
 fn linux_admission(_path:&Path)->Option<String> {None}
@@ -363,12 +368,20 @@ pub(crate) mod tests {
         assert_eq!(attempts("c"),0);
         let mut reads=observations::Reads::new(pool.clone());
         poll_queued_effects(&ctx,&project,1,&mut reads,None).unwrap();
-        assert!(pool.stop(std::time::Duration::from_secs(2)));
         assert_eq!(attempts("c"),1,"one poll_queued_effects wake reserves C");
         let mut expected=before;
         expected.push(("c".into(),1));
         expected.sort();
         assert_eq!(counts(),expected,"no other task gains an attempt");
+        let old=jiff::Timestamp::now().as_millisecond()-16*60*1000;
+        rusqlite::Connection::open(&db_path).unwrap().execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,memory_snapshot_id,artifact_manifest,claimed_checks,created_unix_ms) VALUES(?1,'/tmp/project','key-old',?2,'{}','pred',1,?2,'attempt-pred','/tmp/repo',?3,?3,'sha1',NULL,'[]','[]',?4)",rusqlite::params!["f".repeat(64),digest,oid,old]).unwrap();
+        let mut reads=observations::Reads::new(pool.clone());
+        let again=poll_queued_effects(&ctx,&project,2,&mut reads,None).unwrap();
+        let note=again.operation_error.unwrap_or_default();
+        assert!(note.contains("capacity_full: verification_backlog"),"{note}");
+        assert_eq!(attempts("c"),1,"backlog is diagnostic and must not reserve another attempt");
+        assert_eq!(counts(),expected,"backlog does not add an attempt");
+        assert!(pool.stop(std::time::Duration::from_secs(2)));
     }
 
 }

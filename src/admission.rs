@@ -195,8 +195,9 @@ fn backlog_ages(project: &Path) -> Result<(Option<i64>, Option<i64>)> {
         [],
         |row| row.get(0),
     )?;
+    // blocked, discarded, and reconciliation_required are terminal. They must not stall new reserves.
     let integration: Option<i64> = connection.query_row(
-        "SELECT MIN(created_unix_ms) FROM integration_operations WHERE state NOT IN ('integrated', 'discarded')",
+        "SELECT MIN(created_unix_ms) FROM integration_operations WHERE state IN ('effect_pending', 'candidate_prepared', 'validating')",
         [],
         |row| row.get(0),
     )?;
@@ -720,22 +721,24 @@ mod tests {
 
     #[test]
     fn integration_backlog_returns_capacity_full_and_terminal_rows_do_not() {
-        let (_root, project) = world(1, &[Spec { id: "early", priority: 0, age_ms: 0, paths: &[("README.md", "write")], named: &[] }]);
-        let now = jiff::Timestamp::now().as_millisecond();
-        insert_integration(&project, "integrated", now - backlog_watermark_ms(1) - 60_000);
-        assert_eq!(admit_once(&project).unwrap(), None);
-        assert_eq!(attempt_count(&project), 1);
-        assert_eq!(grant_and_admit(&project).as_deref(), Some("early"));
-        assert_eq!(attempt_count(&project), 2);
-
-        let (_root, project) = world(1, &[Spec { id: "early", priority: 0, age_ms: 0, paths: &[("README.md", "write")], named: &[] }]);
-        let now = jiff::Timestamp::now().as_millisecond();
-        insert_integration(&project, "effect_pending", now - backlog_watermark_ms(1) - 60_000);
-        let block = admit_once(&project).unwrap().expect("integration backlog");
-        assert_eq!(block, AdmissionBlock { blocker: "capacity_full", reason: "integration_backlog" });
-        assert_eq!(attempt_count(&project), 1);
-        assert!(grant_and_admit(&project).is_some());
-        assert_eq!(attempt_count(&project), 1);
+        let old = jiff::Timestamp::now().as_millisecond() - backlog_watermark_ms(1) - 60_000;
+        for state in ["integrated", "discarded", "blocked", "reconciliation_required"] {
+            let (_root, project) = world(1, &[Spec { id: "early", priority: 0, age_ms: 0, paths: &[("README.md", "write")], named: &[] }]);
+            insert_integration(&project, state, old);
+            assert_eq!(admit_once(&project).unwrap(), None, "{state} is terminal and must not block");
+            assert_eq!(attempt_count(&project), 1, "{state}");
+            assert_eq!(grant_and_admit(&project).as_deref(), Some("early"), "{state}");
+            assert_eq!(attempt_count(&project), 2, "{state}");
+        }
+        for state in ["effect_pending", "candidate_prepared", "validating"] {
+            let (_root, project) = world(1, &[Spec { id: "early", priority: 0, age_ms: 0, paths: &[("README.md", "write")], named: &[] }]);
+            insert_integration(&project, state, old);
+            let block = admit_once(&project).unwrap().expect(state);
+            assert_eq!(block, AdmissionBlock { blocker: "capacity_full", reason: "integration_backlog" }, "{state}");
+            assert_eq!(attempt_count(&project), 1, "{state}");
+            assert!(grant_and_admit(&project).is_some(), "{state}");
+            assert_eq!(attempt_count(&project), 1, "{state} still reserved");
+        }
     }
 
     fn snapshot_retains(project: &Path, task: &str) -> bool {
