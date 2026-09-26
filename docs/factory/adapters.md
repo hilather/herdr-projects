@@ -8,30 +8,30 @@ live launch. `PREPARED_LAUNCH_DISPATCH_ENABLED` is unchanged.
 
 ## Absent Claude binary
 
-The conformance check in `src/agents/probe.rs` skips when the Claude executable
-is not on `PATH`. It writes `claude-capability-manifest.json` with:
+The conformance check writes one `claude-capability-manifest.json`. `status`
+`unsupported` and `binary_present` false are written only when no Claude
+executable is on `PATH`. CI without Claude records that manifest. The harness
+opens a project store and leaves `capability_evidence` empty. A missing
+executable is still an error from `probe`, not a certificate.
 
-- `kind` `claude` and `status` `unsupported`
 - `launchable`, `protocol_capable`, `certified`, `workflow_certified`, and `live_launch` false
 - `model_mapping`, `effort_mapping`, and `environment_mapping` `refused`
 - `capability_levels` empty
 
-CI without Claude records `unsupported`. The skip does not write a
-`workflow-certified` or `launchable` row. Schema 33 `capability_evidence`
-accepts only `native` and `fake` adapters, and a `workflow-certified` level
-must be live. This harness inserts neither. A missing binary is not a
-substitute vendor. `probe` itself still errors on a missing executable; that
-error is not turned into a certificate.
-
 ## Present Claude binary
 
-A machine with Claude runs the same check. The installation probe is `--version`
-only, with a cleared environment, no profile arguments, and no agent session.
-A parsed version is not a model, effort, or environment mapping.
+When the executable is present, that same file is the live result. It is not
+left next to an absent placeholder. `unsupported` is recorded only when `probe`
+returns `profile probe cancelled or deadline exhausted; evidence discarded`,
+and `binary_present` stays true. A version observation is kept and stays
+uncertified. A non-success `--version` is `probe_failed`, not an absent skip.
+Executable changes and config changes fail the harness.
+
+The installation probe is `--version` only, with a cleared environment, no
+profile arguments, and no agent session. A parsed version is not a model,
+effort, or environment mapping.
 `ProfileDefinition::validate_gated_preparation` still refuses those fields.
 The probe leaves `launchable`, `protocol_capable`, and `certified` false.
-If the 20-second probe budget discards the evidence, the manifest stays
-`unsupported` and uncertified.
 
 ## Codex
 

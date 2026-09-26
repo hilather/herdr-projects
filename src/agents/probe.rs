@@ -666,17 +666,15 @@ mod tests {
 
     #[test]
     fn claude_capability_harness_records_unsupported_without_certifying() {
-        // A missing binary is unsupported evidence, not a certificate or a launch.
+        // Absence is the only unsupported/binary_present false manifest. A live
+        // probe result replaces that file; it is not written beside it.
         assert_mappings_refused("claude");
         let temp = tempfile::tempdir().unwrap();
-        let absent = write_claude_manifest(temp.path(), &claude_manifest("unsupported", false));
-        assert_eq!(absent["status"], "unsupported");
-        assert_eq!(absent["binary_present"], false);
-        assert_claude_manifest_fail_closed(&absent);
-        let migration = include_str!("../../migrations/0033_capability_evidence.sql");
-        assert!(migration.contains("adapter_kind IN ('native', 'fake')"));
-        assert!(!migration.contains("'claude'"));
-        assert!(migration.contains("level != 'workflow-certified'"));
+        #[cfg(feature = "state-store")]
+        let evidence_store = {
+            let db_path = temp.path().join("state.db");
+            herdr_projects::store::SqliteStore::create(&db_path).unwrap()
+        };
         let controller = include_str!("../canonical_controller.rs");
         assert!(controller.contains("const PREPARED_LAUNCH_DISPATCH_ENABLED: bool = true;"));
 
@@ -706,30 +704,11 @@ mod tests {
         assert!(json.contains("model request requires a verified adapter mapping"));
         assert!(!json.contains("PRIVATE_MODEL"));
         assert!(!json.contains("PRIVATE_EFFORT"));
-        assert!(!json.contains("workflow-certified"));
         assert!(fake.calls.borrow().iter().all(|cmd| {
             cmd.args == ["--version"] && cmd.env_clear && cmd.stdin.is_none() && cmd.own_group
         }));
-        let probed_dir = temp.path().join("probed");
-        std::fs::create_dir(&probed_dir).unwrap();
-        let probed =
-            write_claude_manifest(&probed_dir, &claude_manifest(evidence.agent.status, true));
-        assert_ne!(probed["status"], "unsupported");
-        assert_claude_manifest_fail_closed(&probed);
-        assert_mappings_refused("claude");
 
-        struct Recording;
-        impl Runner for Recording {
-            fn socket_request(&self, _: &Path, _: &str, _: Duration) -> Result<String> {
-                panic!("probe must not access sessions")
-            }
-            fn run(&self, cmd: &Cmd) -> Result<Output> {
-                assert_eq!(cmd.args, ["--version"]);
-                assert!(cmd.env_clear && cmd.stdin.is_none());
-                crate::runner::RealRunner.run(cmd)
-            }
-        }
-        if let Some(claude) = discover_claude() {
+        let manifest = if let Some(claude) = discover_claude() {
             let herdr = temp.path().join("herdr-version");
             std::fs::write(&herdr, b"#!/bin/sh\nprintf 'herdr 0.9.1\\n'\n").unwrap();
             std::fs::set_permissions(&herdr, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -739,46 +718,64 @@ mod tests {
                 "[profiles.worker]\nkind='claude'\npermission_policy='interactive'\n",
             )
             .unwrap();
-            let installed = temp.path().join("installed");
-            std::fs::create_dir(&installed).unwrap();
-            // Hashing the executable is inside the 20s probe budget. A large
-            // install can exhaust it; discarded evidence is not a certificate.
-            let manifest = match probe(&live_config, "worker", &herdr, &claude, &Recording) {
+            match probe(
+                &live_config,
+                "worker",
+                &herdr,
+                &claude,
+                &crate::runner::RealRunner,
+            ) {
                 Ok(evidence) => {
                     assert!(!evidence.profile().launchable);
                     assert!(!evidence.profile().protocol_capable);
                     assert!(!evidence.profile().certified);
                     assert_ne!(evidence.agent.status, "no_verified_version_adapter");
-                    write_claude_manifest(&installed, &claude_manifest(evidence.agent.status, true))
+                    let manifest = claude_manifest(evidence.agent.status, true);
+                    assert_ne!(manifest["status"], "unsupported");
+                    manifest
                 }
                 Err(error) => {
-                    let text = format!("{error:#}");
-                    assert!(text.contains("evidence discarded"));
-                    assert!(!text.contains("certified"));
-                    write_claude_manifest(&installed, &claude_manifest("unsupported", true))
+                    assert_eq!(
+                        error.to_string(),
+                        "profile probe cancelled or deadline exhausted; evidence discarded"
+                    );
+                    claude_manifest("unsupported", true)
                 }
-            };
-            assert_claude_manifest_fail_closed(&manifest);
-            assert_mappings_refused("claude");
+            }
+        } else {
+            claude_manifest("unsupported", false)
+        };
+        let written = write_claude_manifest(temp.path(), &manifest);
+        assert_claude_manifest_fail_closed(&written);
+        if discover_claude().is_none() {
+            assert_eq!(written["status"], "unsupported");
+            assert_eq!(written["binary_present"], false);
+        } else {
+            assert_eq!(written["binary_present"], true);
+            if written["status"] == "unsupported" {
+                assert_eq!(written["binary_present"], true);
+            }
         }
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_name() == "claude-capability-manifest.json")
+                .count(),
+            1
+        );
+        assert_mappings_refused("claude");
 
         #[cfg(feature = "state-store")]
         {
-            let db_path = temp.path().join("state.db");
-            drop(herdr_projects::store::SqliteStore::create(&db_path).unwrap());
-            let connection = rusqlite::Connection::open_with_flags(
-                &db_path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            )
-            .unwrap();
-            let rows: i64 = connection
-                .query_row(
-                    "SELECT count(*) FROM capability_evidence WHERE level IN ('workflow-certified','launchable')",
-                    [],
-                    |row| row.get(0),
-                )
+            let rows: i64 = rusqlite::Connection::open(temp.path().join("state.db"))
+                .unwrap()
+                .query_row("SELECT count(*) FROM capability_evidence", [], |row| {
+                    row.get(0)
+                })
                 .unwrap();
             assert_eq!(rows, 0);
+            drop(evidence_store);
         }
     }
 

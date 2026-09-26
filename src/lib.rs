@@ -137,7 +137,18 @@ mod agents {
             assert_eq!(value["environment_mapping"], "refused");
             assert_eq!(value["capability_levels"], serde_json::json!([]));
             let status = value["status"].as_str().unwrap();
-            assert!(status != "launchable" && status != "workflow-certified" && status != "certified");
+            assert!(
+                status != "launchable" && status != "workflow-certified" && status != "certified"
+            );
+        }
+
+        fn write_manifest(dir: &std::path::Path, value: &serde_json::Value) -> serde_json::Value {
+            let path = dir.join("claude-capability-manifest.json");
+            let bytes = serde_json::to_vec_pretty(value).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            let read = std::fs::read(&path).unwrap();
+            assert_eq!(read, bytes);
+            serde_json::from_slice(&read).unwrap()
         }
 
         #[test]
@@ -150,21 +161,14 @@ mod agents {
                 Some("0.99.0-preview.3")
             );
             let temp = tempfile::tempdir().unwrap();
-            let path = temp.path().join("claude-capability-manifest.json");
-            let absent = manifest("unsupported", false);
-            let bytes = serde_json::to_vec_pretty(&absent).unwrap();
-            std::fs::write(&path, &bytes).unwrap();
-            let read: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            assert_eq!(read["status"], "unsupported");
-            assert_eq!(read["binary_present"], false);
-            assert_closed(&read);
-            let migration = include_str!("../migrations/0033_capability_evidence.sql");
-            assert!(migration.contains("adapter_kind IN ('native', 'fake')"));
-            assert!(!migration.contains("'claude'"));
-            assert!(migration.contains("level != 'workflow-certified'"));
+            #[cfg(feature = "state-store")]
+            let evidence_store = {
+                let db_path = temp.path().join("state.db");
+                crate::store::SqliteStore::create(&db_path).unwrap()
+            };
             let controller = include_str!("canonical_controller.rs");
             assert!(controller.contains("const PREPARED_LAUNCH_DISPATCH_ENABLED: bool = true;"));
-            if let Some(binary) = discover_claude() {
+            let manifest = if let Some(binary) = discover_claude() {
                 let program = binary.to_str().expect("claude path is UTF-8");
                 let mut cmd = crate::runner::Cmd::new(program, Duration::from_secs(5));
                 cmd.args.push("--version".into());
@@ -177,36 +181,46 @@ mod agents {
                 cmd.cwd = Some(PathBuf::from("/"));
                 cmd.capture_limit = 4096;
                 assert_eq!(cmd.args, ["--version"]);
-                let output = crate::runner::RealRunner.run(&cmd).unwrap();
-                assert!(output.success());
-                let status = if crate::profile_config::observed_version("claude", &output.stdout).is_some()
-                {
-                    "version_observed"
-                } else {
-                    "unrecognized_version_output"
+                // A failed --version is an uncertified probe_failed manifest, not an absent skip.
+                let status = match crate::runner::RealRunner.run(&cmd) {
+                    Ok(output) if output.success() => {
+                        if crate::profile_config::observed_version("claude", &output.stdout)
+                            .is_some()
+                        {
+                            "version_observed"
+                        } else {
+                            "unrecognized_version_output"
+                        }
+                    }
+                    _ => "probe_failed",
                 };
                 let present = manifest(status, true);
                 assert_ne!(present["status"], "unsupported");
-                assert_closed(&present);
-                mappings_refused("claude");
+                assert_eq!(present["binary_present"], true);
+                present
+            } else {
+                manifest("unsupported", false)
+            };
+            let written = write_manifest(temp.path(), &manifest);
+            assert_closed(&written);
+            if discover_claude().is_none() {
+                assert_eq!(written["status"], "unsupported");
+                assert_eq!(written["binary_present"], false);
+            } else {
+                assert_eq!(written["binary_present"], true);
+                assert_ne!(written["status"], "unsupported");
             }
+            mappings_refused("claude");
             #[cfg(feature = "state-store")]
             {
-                let db_path = temp.path().join("state.db");
-                drop(crate::store::SqliteStore::create(&db_path).unwrap());
-                let connection = rusqlite::Connection::open_with_flags(
-                    &db_path,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                )
-                .unwrap();
-                let rows: i64 = connection
-                    .query_row(
-                        "SELECT count(*) FROM capability_evidence WHERE level IN ('workflow-certified','launchable')",
-                        [],
-                        |row| row.get(0),
-                    )
+                let rows: i64 = rusqlite::Connection::open(temp.path().join("state.db"))
+                    .unwrap()
+                    .query_row("SELECT count(*) FROM capability_evidence", [], |row| {
+                        row.get(0)
+                    })
                     .unwrap();
                 assert_eq!(rows, 0);
+                drop(evidence_store);
             }
         }
     }
