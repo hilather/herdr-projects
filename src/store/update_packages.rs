@@ -7,7 +7,7 @@ use serde::Serialize;
 const SCHEMA_VERSION: u32 = 39;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct UpdatePackage {
+pub struct UpdatePackage {
     pub package_id: String,
     pub binding_id: String,
     pub consumer_binding_generation: u64,
@@ -16,7 +16,7 @@ pub(crate) struct UpdatePackage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct UpdatePackageAck {
+pub struct UpdatePackageAck {
     pub schema_version: u32,
     pub package_id: String,
     pub manifest_hash: String,
@@ -25,7 +25,7 @@ pub(crate) struct UpdatePackageAck {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PackageAckReceipt {
+pub struct PackageAckReceipt {
     pub package_id: String,
     pub disposition: String,
     pub change_ids: Vec<String>,
@@ -516,8 +516,7 @@ fn acknowledge(
 impl SqliteStore {
     // Promotion commits obligations first. Nothing in this process calls the
     // materializer yet, so a crash before the package row can still rebuild it.
-    #[allow(dead_code)]
-    pub(crate) fn materialize_update_package(&mut self, binding_id: &str) -> Result<UpdatePackage> {
+    pub fn materialize_update_package(&mut self, binding_id: &str) -> Result<UpdatePackage> {
         if !binding_id_ok(binding_id) {
             return Err(invalid("invalid consumer binding"));
         }
@@ -529,8 +528,7 @@ impl SqliteStore {
         Ok(package)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn acknowledge_update_package(
+    pub fn acknowledge_update_package(
         &mut self,
         ack: &UpdatePackageAck,
         now: i64,
@@ -545,8 +543,7 @@ impl SqliteStore {
 
     /// Applied changes for this binding. Not the latest cursor package and not
     /// every change at or below a triggering sequence.
-    #[allow(dead_code)]
-    pub(crate) fn applied_cursor_covers(
+    pub fn applied_cursor_covers(
         &mut self,
         binding_id: &str,
         change_id: &str,

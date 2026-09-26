@@ -2277,3 +2277,890 @@ fn planning_gate_ten_logical_workers() {
         3
     );
 }
+
+#[cfg(target_os = "linux")]
+struct MemoryProject {
+    tmp: tempfile::TempDir,
+    project: PathBuf,
+    key: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+fn memory_project() -> MemoryProject {
+    let tmp = tempfile::tempdir().unwrap();
+    let key = tmp.path().join("owner");
+    assert!(
+        Command::new("/usr/bin/ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(&key)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let public = fs::read_to_string(key.with_extension("pub"))
+        .unwrap()
+        .split_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let config = tmp.path().join("config.toml");
+    fs::write(
+        &config,
+        format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n"),
+    )
+    .unwrap();
+    let project = tmp.path().join("project");
+    fs::create_dir(&project).unwrap();
+    for name in [".state", "threads", "inbox"] {
+        fs::create_dir(project.join(name)).unwrap();
+    }
+    fs::create_dir_all(project.join(".state/objects")).unwrap();
+    fs::write(
+        project.join("PROJECT.md"),
+        "+++\nname='Demo'\n+++\nOriginal instructions\n",
+    )
+    .unwrap();
+    fs::write(project.join("TASKS.md"), "").unwrap();
+    fs::write(project.join("MEMORY.md"), "Original memory").unwrap();
+    fs::write(
+        project.join(".state/project.json"),
+        r#"{"status":"paused"}"#,
+    )
+    .unwrap();
+    let plan = herdr_projects::migration::inspect_with_config(&project, &config).unwrap();
+    herdr_projects::migration::apply(&project, &plan, true).unwrap();
+    let state = herdr_projects::runtime::snapshot(&project).unwrap();
+    herdr_projects::runtime::set_state(
+        &project,
+        state.head,
+        state.control.unwrap().revision,
+        ProjectState::Active,
+        &config,
+    )
+    .unwrap();
+    assert_eq!(
+        herdr_projects::runtime::snapshot(&project)
+            .unwrap()
+            .schema_version,
+        40
+    );
+    MemoryProject { tmp, project, key }
+}
+
+#[cfg(target_os = "linux")]
+fn state_db(project: &Path) -> PathBuf {
+    project.join(".state/state.db")
+}
+
+#[cfg(target_os = "linux")]
+fn assert_admission_off(project: &Path) {
+    let flag: String = rusqlite::Connection::open(state_db(project))
+        .unwrap()
+        .query_row(
+            "SELECT factory_admission FROM project_control WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(flag, "off");
+}
+
+#[cfg(target_os = "linux")]
+fn sign_review(key: &Path, path: &Path, bytes: &[u8]) -> PathBuf {
+    fs::write(path, bytes).unwrap();
+    let sig = PathBuf::from(format!("{}.sig", path.display()));
+    let _ = fs::remove_file(&sig);
+    assert!(
+        Command::new("/usr/bin/ssh-keygen")
+            .args(["-Y", "sign", "-f"])
+            .arg(key)
+            .args(["-n", herdr_projects::authority::MEMORY_REVIEW_NAMESPACE])
+            .arg(path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    sig
+}
+
+#[cfg(target_os = "linux")]
+fn memory_read_set(project: &Path) -> MemoryReadSet {
+    let conn = rusqlite::Connection::open(state_db(project)).unwrap();
+    let required_set_generation: i64 = conn
+        .query_row(
+            "SELECT generation FROM memory_required_generation WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let policy_revision: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(revision), 0) FROM memory_policies",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let load = |sql: &str| -> Vec<(String, i64)> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    };
+    let record_heads = load(
+        "SELECT r.id, h.revision FROM memory_records r
+         JOIN memory_heads h ON h.record_id = r.id
+         WHERE h.status = 'active'
+           AND (r.is_hard = 1 OR r.kind IN ('constraint', 'hard_memory', 'contract'))
+         ORDER BY r.id",
+    )
+    .into_iter()
+    .map(|(record_id, revision)| ReadSetHead {
+        record_id,
+        revision: u64::try_from(revision).unwrap(),
+    })
+    .collect();
+    let validity_revisions = load(
+        "SELECT v.record_id, v.revision FROM memory_validity v
+         JOIN memory_heads h ON h.record_id = v.record_id AND h.revision = v.revision
+         JOIN memory_records r ON r.id = v.record_id
+         WHERE h.status = 'active'
+           AND (r.is_hard = 1 OR r.kind IN ('constraint', 'hard_memory', 'contract'))
+         ORDER BY v.record_id",
+    )
+    .into_iter()
+    .map(|(record_id, revision)| ReadSetValidity {
+        record_id,
+        revision: u64::try_from(revision).unwrap(),
+    })
+    .collect();
+    let scope_catalog_generations =
+        load("SELECT scope_id, generation FROM memory_scope_catalog ORDER BY scope_id")
+            .into_iter()
+            .map(|(scope_id, generation)| ScopeCatalogGeneration {
+                scope_id,
+                generation: u64::try_from(generation).unwrap(),
+            })
+            .collect();
+    MemoryReadSet {
+        record_heads,
+        validity_revisions,
+        reviewer_grant_id: None,
+        revocation_epoch: 0,
+        policy_revision: u64::try_from(policy_revision).unwrap(),
+        required_set_generation: u64::try_from(required_set_generation).unwrap(),
+        scope_catalog_generations,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn add_task_snapshot(project: &Path, task: &str, domains: &[&str], instructions: &str) -> String {
+    let head = herdr_projects::runtime::snapshot(project).unwrap().head;
+    herdr_projects::runtime::add_task(project, TaskId::new(task).unwrap(), task.into(), head)
+        .unwrap();
+    let mut memory = herdr_projects::memory::MemoryStore::from_sqlite(
+        herdr_projects::migration::open_active(project).unwrap(),
+        project.join(".state/objects"),
+    );
+    let snap = memory
+        .create_task_snapshot(
+            SnapshotRequest {
+                schema_version: 1,
+                task_id: task.into(),
+                profile: "worker".into(),
+                domains: domains.iter().map(|domain| (*domain).to_string()).collect(),
+                paths: Vec::new(),
+                pinned_keys: Vec::new(),
+                sensitivity: "default".into(),
+            },
+            "worker",
+            &"a".repeat(64),
+            None,
+            32_000,
+            instructions,
+            1,
+            None,
+        )
+        .unwrap();
+    snap.id.as_str().to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn bind_attempt(project: &Path, task: &str, attempt: &str, snapshot: &str) {
+    let mut db = herdr_projects::migration::open_active(project).unwrap();
+    let head = db.read_snapshot(None).unwrap().head;
+    db.commit(Commit {
+        expected_head: head,
+        mutations: vec![Mutation::Attempt {
+            expected: None,
+            next: Attempt {
+                id: AttemptId::new(attempt).unwrap(),
+                task: TaskId::new(task).unwrap(),
+                revision: 1,
+                state: AttemptState::Running,
+                snapshot: Some(snapshot.into()),
+                reservation: attempt.into(),
+                termination_observed: false,
+            },
+        }],
+    })
+    .unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn propose_observation(
+    project: &Path,
+    proposal: &str,
+    task: &str,
+    attempt: &str,
+    snapshot: &str,
+    key: &str,
+    domain: &str,
+) -> String {
+    let mut memory = herdr_projects::memory::MemoryStore::from_sqlite(
+        herdr_projects::migration::open_active(project).unwrap(),
+        project.join(".state/objects"),
+    );
+    let body = memory.ingest_object(key.as_bytes()).unwrap();
+    let doc = ProposalDocument {
+        schema_version: 1,
+        proposal_id: proposal.into(),
+        producer: ProposalProducer {
+            task_id: task.into(),
+            attempt_id: attempt.into(),
+        },
+        input_snapshot_id: snapshot.into(),
+        observed_revisions: Vec::new(),
+        repository: None,
+        changes: vec![ProposalChange {
+            record_key: key.into(),
+            expected: None,
+            kind: "observation".into(),
+            scope: Applicability {
+                domains: vec![domain.into()],
+                paths: Vec::new(),
+            },
+            claim: format!("note {key}"),
+            body_object: body.as_str().into(),
+            evidence: Vec::new(),
+            based_on: Vec::new(),
+            impact: "informational".into(),
+        }],
+    };
+    let receipt = memory
+        .propose(&serde_json::to_vec(&doc).unwrap(), 1_000)
+        .unwrap();
+    assert_eq!(receipt.validation, "accepted", "{}", receipt.reason);
+    receipt.payload_digest
+}
+
+#[cfg(target_os = "linux")]
+fn review_proposal(
+    fixture: &MemoryProject,
+    proposal: &str,
+    digest: &str,
+    key: &str,
+    read_set_version: Option<u32>,
+) -> ReviewDecision {
+    let head = herdr_projects::runtime::snapshot(&fixture.project)
+        .unwrap()
+        .head;
+    let doc = MemoryReviewAuthorization {
+        version: 1,
+        project_store: state_db(&fixture.project)
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string(),
+        authority: herdr_projects::authority::policy_reference(&fixture.project).unwrap(),
+        expected_head: head,
+        expires_unix_ms: jiff::Timestamp::now().as_millisecond() + 60_000,
+        proposal_digest: digest.into(),
+        record_keys: vec![key.into()],
+        review: ReviewDocument {
+            schema_version: 1,
+            proposal_id: proposal.into(),
+            decision: "approve".into(),
+            reason: "evidence supports the claim".into(),
+        },
+        read_set_version,
+        read_set: read_set_version
+            .filter(|version| *version == 2)
+            .map(|_| memory_read_set(&fixture.project)),
+    };
+    let path = fixture.tmp.path().join(format!("{proposal}.json"));
+    let sig = sign_review(&fixture.key, &path, &serde_json::to_vec(&doc).unwrap());
+    herdr_projects::authority::review_memory_proposal(&fixture.project, proposal, &path, &sig, head)
+        .unwrap()
+}
+
+#[cfg(target_os = "linux")]
+fn event_head(decision: &ReviewDecision) -> u64 {
+    let reviewed: serde_json::Value = serde_json::from_str(&decision.reviewed_heads).unwrap();
+    reviewed["event_head"].as_u64().unwrap()
+}
+
+#[cfg(target_os = "linux")]
+fn intents_for(db: &mut SqliteStore, cause: &str) -> Vec<serde_json::Value> {
+    db.memory_delivery_intents()
+        .unwrap()
+        .into_iter()
+        .filter(|row| row["cause_id"] == cause)
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn memory_gate_doc_is_a_simulator() {
+    let doc = include_str!("../docs/factory/memory-gate.md");
+    let lower = doc.to_ascii_lowercase();
+    assert!(lower.contains("simulator"));
+    assert!(lower.contains("no production flag was flipped"));
+    for scenario in [
+        "Two domains promote together",
+        "Same-head conflict",
+        "Subscription retirement",
+        "Barrier invalidation",
+        "Package gap",
+        "Coordinator receipt without an attempt",
+    ] {
+        assert!(doc.contains(scenario), "memory gate omits {scenario}");
+    }
+    assert!(lower.contains("does not claim a live 40-worker certificate"));
+    assert!(lower.contains("or a latency bar"));
+    assert!(!lower.contains("certificate passed"));
+    assert!(!lower.contains("latency bar met"));
+    assert!(!lower.contains("targets met"));
+    let controller = include_str!("../src/canonical_controller.rs");
+    assert!(controller.contains("const PREPARED_LAUNCH_DISPATCH_ENABLED: bool = true;"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn memory_two_domains_promote_and_same_head_conflicts() {
+    let fixture = memory_project();
+    let project = &fixture.project;
+    assert_admission_off(project);
+    let api_snap = add_task_snapshot(project, "api-task", &["api"], "api instructions");
+    bind_attempt(project, "api-task", "api-attempt", &api_snap);
+    let ui_snap = add_task_snapshot(project, "ui-task", &["ui"], "ui instructions");
+    bind_attempt(project, "ui-task", "ui-attempt", &ui_snap);
+    let api_digest = propose_observation(
+        project,
+        "mp-api",
+        "api-task",
+        "api-attempt",
+        &api_snap,
+        "api.error-envelope",
+        "api",
+    );
+    let ui_digest = propose_observation(
+        project,
+        "mp-ui",
+        "ui-task",
+        "ui-attempt",
+        &ui_snap,
+        "ui.copy",
+        "ui",
+    );
+    // v2 fences on the read set, not the event head, so an intervening review
+    // of the other domain does not block either promotion.
+    let api_review = review_proposal(
+        &fixture,
+        "mp-api",
+        &api_digest,
+        "api.error-envelope",
+        Some(2),
+    );
+    let ui_review = review_proposal(&fixture, "mp-ui", &ui_digest, "ui.copy", Some(2));
+    let api_promoted =
+        herdr_projects::authority::promote_memory_proposal(project, "mp-api", &api_review.id)
+            .unwrap();
+    let ui_promoted =
+        herdr_projects::authority::promote_memory_proposal(project, "mp-ui", &ui_review.id)
+            .unwrap();
+    assert!(!api_promoted.reused);
+    assert!(!ui_promoted.reused);
+    assert!(
+        api_promoted
+            .change_ids
+            .iter()
+            .all(|id| !ui_promoted.change_ids.contains(id))
+    );
+    let mut db = herdr_projects::migration::open_active(project).unwrap();
+    let api = db
+        .memory_record_by_key("api.error-envelope")
+        .unwrap()
+        .unwrap();
+    let ui = db.memory_record_by_key("ui.copy").unwrap().unwrap();
+    assert_ne!(api.id, ui.id);
+    assert_eq!(
+        db.memory_head(api.id.as_str()).unwrap().unwrap().revision,
+        1
+    );
+    assert_eq!(db.memory_head(ui.id.as_str()).unwrap().unwrap().revision, 1);
+    assert!(db.memory_promotion("mp-api").unwrap().is_some());
+    assert!(db.memory_promotion("mp-ui").unwrap().is_some());
+    drop(db);
+
+    let same_a = propose_observation(
+        project,
+        "mp-same-a",
+        "api-task",
+        "api-attempt",
+        &api_snap,
+        "api.same-a",
+        "api",
+    );
+    let same_b = propose_observation(
+        project,
+        "mp-same-b",
+        "api-task",
+        "api-attempt",
+        &api_snap,
+        "api.same-b",
+        "api",
+    );
+    let first_review = review_proposal(&fixture, "mp-same-a", &same_a, "api.same-a", None);
+    let shared_head = event_head(&first_review);
+    // Each review stamps a new event head. The second approval is stored at the
+    // first decision's head so both promotions expect that same fence.
+    {
+        let template: serde_json::Value =
+            serde_json::from_str(&first_review.reviewed_heads).unwrap();
+        let mut reviewed = template.clone();
+        reviewed["records"] = serde_json::json!({});
+        reviewed["authorization"]["proposal_digest"] = serde_json::json!(same_b);
+        reviewed["authorization"]["record_keys"] = serde_json::json!(["api.same-b"]);
+        reviewed["authorization"]["review"]["proposal_id"] = serde_json::json!("mp-same-b");
+        assert_eq!(reviewed["event_head"].as_u64(), Some(shared_head));
+        let conn = rusqlite::Connection::open(state_db(project)).unwrap();
+        conn.execute(
+            "INSERT INTO review_decisions(id,proposal_id,payload_digest,decision,classification,reviewed_heads,reason,created_unix_ms) VALUES('rev-same-b','mp-same-b',?1,'approve','[]',?2,'same event head',1)",
+            rusqlite::params![same_b, reviewed.to_string()],
+        )
+        .unwrap();
+    }
+    let stored = {
+        let mut db = herdr_projects::migration::open_active(project).unwrap();
+        db.review_decision("rev-same-b").unwrap().unwrap()
+    };
+    assert_eq!(event_head(&stored), shared_head);
+    let promoted =
+        herdr_projects::authority::promote_memory_proposal(project, "mp-same-a", &first_review.id)
+            .unwrap();
+    assert!(!promoted.reused);
+    let conflict =
+        herdr_projects::authority::promote_memory_proposal(project, "mp-same-b", "rev-same-b")
+            .unwrap_err();
+    let text = format!("{conflict:#}").to_ascii_lowercase();
+    assert!(text.contains("conflict"), "{conflict:#}");
+    let mut db = herdr_projects::migration::open_active(project).unwrap();
+    assert!(db.memory_promotion("mp-same-a").unwrap().is_some());
+    assert!(db.memory_promotion("mp-same-b").unwrap().is_none());
+    assert!(db.memory_record_by_key("api.same-b").unwrap().is_none());
+    assert_eq!(
+        sql_count(&state_db(project), "SELECT count(*) FROM memory_promotions"),
+        3
+    );
+    assert_admission_off(project);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn memory_retired_subscription_keeps_the_pending_obligation() {
+    let fixture = memory_project();
+    let project = &fixture.project;
+    let reader = add_task_snapshot(project, "reader", &["notes"], "reader instructions");
+    let writer = add_task_snapshot(project, "writer", &["notes"], "writer instructions");
+    bind_attempt(project, "writer", "writer-attempt", &writer);
+    let first_digest = propose_observation(
+        project,
+        "mp-note-1",
+        "writer",
+        "writer-attempt",
+        &writer,
+        "notes.one",
+        "notes",
+    );
+    let first_review = review_proposal(&fixture, "mp-note-1", &first_digest, "notes.one", None);
+    herdr_projects::authority::promote_memory_proposal(project, "mp-note-1", &first_review.id)
+        .unwrap();
+    let successor = {
+        let mut memory = herdr_projects::memory::MemoryStore::from_sqlite(
+            herdr_projects::migration::open_active(project).unwrap(),
+            project.join(".state/objects"),
+        );
+        memory
+            .create_task_snapshot(
+                SnapshotRequest {
+                    schema_version: 1,
+                    task_id: "reader".into(),
+                    profile: "worker".into(),
+                    domains: vec!["notes".into()],
+                    paths: Vec::new(),
+                    pinned_keys: Vec::new(),
+                    sensitivity: "default".into(),
+                },
+                "worker",
+                &"a".repeat(64),
+                None,
+                32_000,
+                "successor instructions",
+                1,
+                None,
+            )
+            .unwrap()
+            .id
+            .as_str()
+            .to_string()
+    };
+    let mut db = herdr_projects::migration::open_active(project).unwrap();
+    let pending = intents_for(&mut db, "mp-note-1");
+    let delivery = pending
+        .iter()
+        .find(|row| row["snapshot_id"] == reader)
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        pending.iter().find(|row| row["id"] == delivery).unwrap()["state"],
+        "pending"
+    );
+    let retired = db.consumer_binding_for_snapshot(&reader).unwrap().unwrap();
+    let next = db
+        .consumer_binding_for_snapshot(&successor)
+        .unwrap()
+        .unwrap();
+    db.retire_consumer_binding(&retired.binding_id, Some(&next.binding_id))
+        .unwrap();
+    db.retire_consumer_binding(&retired.binding_id, Some(&next.binding_id))
+        .unwrap();
+    let retired = db.consumer_binding(&retired.binding_id).unwrap().unwrap();
+    assert!(retired.retired);
+    assert!(!retired.active);
+    assert_eq!(
+        retired.successor_binding_id.as_deref(),
+        Some(next.binding_id.as_str())
+    );
+    assert!(
+        db.binding_obligations(&next.binding_id)
+            .unwrap()
+            .contains(&delivery)
+    );
+    assert_eq!(
+        intents_for(&mut db, "mp-note-1")
+            .iter()
+            .filter(|row| row["id"] == delivery)
+            .count(),
+        1
+    );
+    drop(db);
+    let second_digest = propose_observation(
+        project,
+        "mp-note-2",
+        "writer",
+        "writer-attempt",
+        &writer,
+        "notes.two",
+        "notes",
+    );
+    let second_review = review_proposal(&fixture, "mp-note-2", &second_digest, "notes.two", None);
+    herdr_projects::authority::promote_memory_proposal(project, "mp-note-2", &second_review.id)
+        .unwrap();
+    let mut db = herdr_projects::migration::open_active(project).unwrap();
+    let fresh = intents_for(&mut db, "mp-note-2");
+    assert!(fresh.iter().all(|row| row["snapshot_id"] != reader));
+    assert!(fresh.iter().any(|row| row["snapshot_id"] == successor));
+    let fresh_ids: Vec<String> = fresh
+        .iter()
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .collect();
+    let retired_obligations = db.binding_obligations(&retired.binding_id).unwrap();
+    assert!(fresh_ids.iter().all(|id| !retired_obligations.contains(id)));
+    let successor_obligations = db.binding_obligations(&next.binding_id).unwrap();
+    assert!(
+        fresh_ids
+            .iter()
+            .any(|id| successor_obligations.contains(id))
+    );
+    assert!(successor_obligations.contains(&delivery));
+    assert_eq!(
+        intents_for(&mut db, "mp-note-1")
+            .iter()
+            .filter(|row| row["id"] == delivery && row["state"] == "pending")
+            .count(),
+        1
+    );
+    assert_admission_off(project);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn memory_package_gap_and_coordinator_ack_without_an_attempt() {
+    let fixture = memory_project();
+    let project = &fixture.project;
+    let writer = add_task_snapshot(project, "writer", &["pkg"], "writer instructions");
+    bind_attempt(project, "writer", "writer-attempt", &writer);
+    let coordinator = {
+        let mut memory = herdr_projects::memory::MemoryStore::from_sqlite(
+            herdr_projects::migration::open_active(project).unwrap(),
+            project.join(".state/objects"),
+        );
+        memory
+            .create_coordinator_snapshot(
+                "gate",
+                "planner",
+                &"a".repeat(64),
+                None,
+                32_000,
+                "Coordinate",
+                1,
+            )
+            .unwrap()
+            .id
+            .as_str()
+            .to_string()
+    };
+    let first_digest = propose_observation(
+        project,
+        "mp-pkg-a",
+        "writer",
+        "writer-attempt",
+        &writer,
+        "pkg.a",
+        "pkg",
+    );
+    let first_review = review_proposal(&fixture, "mp-pkg-a", &first_digest, "pkg.a", None);
+    herdr_projects::authority::promote_memory_proposal(project, "mp-pkg-a", &first_review.id)
+        .unwrap();
+    let mut db = herdr_projects::migration::open_active(project).unwrap();
+    let binding = db
+        .consumer_binding_for_snapshot(&coordinator)
+        .unwrap()
+        .unwrap();
+    assert!(binding.attempt_id.is_none());
+    assert!(binding.task_id.is_none());
+    let first = db.materialize_update_package(&binding.binding_id).unwrap();
+    assert_eq!(first.change_ids.len(), 1);
+    let old_id = first.change_ids[0].clone();
+    drop(db);
+    let second_digest = propose_observation(
+        project,
+        "mp-pkg-b",
+        "writer",
+        "writer-attempt",
+        &writer,
+        "pkg.b",
+        "pkg",
+    );
+    let second_review = review_proposal(&fixture, "mp-pkg-b", &second_digest, "pkg.b", None);
+    herdr_projects::authority::promote_memory_proposal(project, "mp-pkg-b", &second_review.id)
+        .unwrap();
+    let mut db = herdr_projects::migration::open_active(project).unwrap();
+    let new_id = intents_for(&mut db, "mp-pkg-b")
+        .iter()
+        .find(|row| row["snapshot_id"] == coordinator)
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(!first.change_ids.contains(&new_id));
+    let attempts = sql_count(&state_db(project), "SELECT count(*) FROM attempts");
+    assert_eq!(attempts, 1);
+    let seen = herdr_projects::store::UpdatePackageAck {
+        schema_version: 1,
+        package_id: first.package_id.clone(),
+        manifest_hash: first.manifest_hash.clone(),
+        change_ids: first.change_ids.clone(),
+        disposition: "seen".into(),
+    };
+    db.acknowledge_update_package(&seen, 1).unwrap();
+    let mut applied = seen;
+    applied.disposition = "applied".into();
+    db.acknowledge_update_package(&applied, 1).unwrap();
+    assert!(
+        db.applied_cursor_covers(&binding.binding_id, &old_id)
+            .unwrap()
+    );
+    assert!(
+        !db.applied_cursor_covers(&binding.binding_id, &new_id)
+            .unwrap()
+    );
+    let reloaded = db.consumer_binding(&binding.binding_id).unwrap().unwrap();
+    assert!(reloaded.attempt_id.is_none());
+    drop(db);
+    assert_eq!(
+        sql_count(&state_db(project), "SELECT count(*) FROM attempts"),
+        attempts
+    );
+    let applied_new: i64 = rusqlite::Connection::open(state_db(project))
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM memory_change_receipts WHERE change_id=?1 AND disposition='applied'",
+            [&new_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(applied_new, 0);
+    assert_admission_off(project);
+}
+
+#[cfg(target_os = "linux")]
+struct BarrierSeed {
+    task: String,
+    attempt: String,
+    result: String,
+    verification: String,
+}
+
+#[cfg(target_os = "linux")]
+fn seed_barrier_member(path: &Path, task: &str) -> BarrierSeed {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let seq: i64 = conn
+        .query_row("SELECT coalesce(max(sequence),0) FROM events", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    if seq == 0 {
+        conn.execute(
+            "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('fixture',?1,1,1,'{}')",
+            [task],
+        )
+        .unwrap();
+    }
+    let installed: i64 = conn
+        .query_row("SELECT coalesce(max(sequence),0) FROM events", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let hash = "11".repeat(32);
+    let attempt = format!("attempt-{task}");
+    let snapshot = format!("snap-{task}");
+    conn.execute(
+        "INSERT INTO tasks(id,revision,state,title,active_attempt) VALUES(?1,1,'running',?1,NULL)",
+        [task],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO memory_snapshots(id,task_id,task_revision,profile_name,profile_digest,config_digest,selection_policy_version,estimator,sequence,required_bytes,optional_bytes,budget_bytes,omitted_optional_count,manifest_hash,scope_digest)
+         VALUES(?1,?2,1,'worker',?3,NULL,1,'test',1,0,0,0,0,?3,?3)",
+        rusqlite::params![snapshot, task, hash],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) VALUES(?1,?2,1,'running',?3,?4,0)",
+        rusqlite::params![attempt, task, snapshot, format!("slot-{task}")],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE tasks SET active_attempt=?2 WHERE id=?1",
+        rusqlite::params![task, attempt],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq)
+         VALUES(?1,1,NULL,'/tmp/project',0,'/tmp/repo',?2,'sha1',NULL,'verify_only',x'61',?3,?4)",
+        rusqlite::params![task, "b".repeat(40), hash, installed],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO acceptance_policies(task_id,contract_revision,policy_id,body) VALUES(?1,1,'policy-1','{}')",
+        [task],
+    )
+    .unwrap();
+    let submission = format!(
+        "{:x}",
+        Sha256::digest(format!("submission-{task}").as_bytes())
+    );
+    let result = format!("{:x}", Sha256::digest(format!("result-{task}").as_bytes()));
+    let verification = format!("{:x}", Sha256::digest(format!("run-{task}").as_bytes()));
+    conn.execute(
+        "INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,memory_snapshot_id,artifact_manifest,claimed_checks,created_unix_ms)
+         VALUES(?1,'/tmp/project',?2,?3,'{}',?4,1,?3,?5,'/tmp/repo',?6,?6,'sha1',NULL,'[]','[]',1)",
+        rusqlite::params![submission, format!("submit-{task}"), hash, task, attempt, "b".repeat(40)],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms)
+         VALUES(?1,'/tmp/project',?2,?3,?4,?5,1,?3,?6,'policy-1',?3,?7,?7,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?3,0,0,1)",
+        rusqlite::params![verification, format!("verify-{task}"), hash, submission, task, attempt, "c".repeat(40)],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms)
+         VALUES(?1,?2,?3,?4,?4,'sha1',?5,?5,'linux-unshare-user-pid-mount-v1',0,1)",
+        rusqlite::params![result, verification, submission, "c".repeat(40), hash],
+    )
+    .unwrap();
+    BarrierSeed {
+        task: task.into(),
+        attempt,
+        result,
+        verification,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn barrier_member(seed: &BarrierSeed) -> herdr_projects::store::BarrierMember {
+    herdr_projects::store::BarrierMember {
+        task_id: seed.task.clone(),
+        contract_revision: 1,
+        attempt_id: seed.attempt.clone(),
+        result_id: seed.result.clone(),
+        verification_id: seed.verification.clone(),
+        integration_id: None,
+        proposal_dispositions: Vec::new(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn memory_barrier_edit_invalidates_the_release_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state.db");
+    SqliteStore::create(&path).unwrap();
+    let alpha = seed_barrier_member(&path, "alpha");
+    let beta = seed_barrier_member(&path, "beta");
+    let mut db = SqliteStore::open(&path).unwrap();
+    assert_eq!(db.read_snapshot(None).unwrap().schema_version, 40);
+    let head = db.read_snapshot(None).unwrap().head;
+    let frozen = db.freeze_barrier(&[barrier_member(&alpha)], head).unwrap();
+    let head = db.read_snapshot(None).unwrap().head;
+    let edited = db
+        .freeze_barrier(&[barrier_member(&alpha), barrier_member(&beta)], head)
+        .unwrap();
+    assert_ne!(edited.barrier_id, frozen.barrier_id);
+    assert_ne!(edited.release_token, frozen.release_token);
+    let err = db
+        .release_barrier(&edited.barrier_id, &frozen.release_token, 0, 1)
+        .unwrap_err();
+    assert!(
+        matches!(err, herdr_projects::store::StoreError::Invalid(ref message) if message.contains("release token")),
+        "{err:?}"
+    );
+    assert!(
+        db.freeze_barrier(&[barrier_member(&alpha), barrier_member(&beta)], 0)
+            .unwrap()
+            .released_seq
+            .is_none()
+    );
+    let before = db.read_snapshot(None).unwrap().attempts;
+    assert!(before.iter().all(|attempt| !attempt.termination_observed));
+    let head = db.read_snapshot(None).unwrap().head;
+    let revoked = db.revoke_barrier(&frozen.barrier_id, head).unwrap();
+    assert!(revoked.revoked_seq.is_some());
+    let after = db.read_snapshot(None).unwrap().attempts;
+    assert_eq!(after, before);
+    assert!(after.iter().all(|attempt| !attempt.termination_observed));
+    let flag: String = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT factory_admission FROM project_control WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(flag, "off");
+}

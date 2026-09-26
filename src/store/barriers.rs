@@ -8,13 +8,13 @@ const SCHEMA_VERSION: u32 = 40;
 const MAX_MEMBERS: usize = 1_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProposalDisposition {
+pub struct ProposalDisposition {
     pub proposal_id: String,
     pub disposition: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BarrierMember {
+pub struct BarrierMember {
     pub task_id: String,
     pub contract_revision: u64,
     pub attempt_id: String,
@@ -25,7 +25,7 @@ pub(crate) struct BarrierMember {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FrozenBarrier {
+pub struct FrozenBarrier {
     pub barrier_id: String,
     pub required_set_generation: u64,
     pub memory_manifest_digest: String,
@@ -479,7 +479,7 @@ fn recheck_ready(db: &Connection, barrier: &FrozenBarrier, now: i64) -> Result<(
 }
 
 impl SqliteStore {
-    pub(crate) fn freeze_barrier(
+    pub fn freeze_barrier(
         &mut self,
         members: &[BarrierMember],
         expected_head: u64,
@@ -535,7 +535,7 @@ impl SqliteStore {
         Ok(stored)
     }
 
-    pub(crate) fn release_barrier(
+    pub fn release_barrier(
         &mut self,
         barrier_id: &str,
         token: &str,
@@ -583,7 +583,7 @@ impl SqliteStore {
         Ok(stored)
     }
 
-    pub(crate) fn revoke_barrier(
+    pub fn revoke_barrier(
         &mut self,
         barrier_id: &str,
         expected_head: u64,
