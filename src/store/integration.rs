@@ -417,10 +417,29 @@ impl SqliteStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         schema28(&tx)?;
-        tx.execute(
+        let updated = tx.execute(
             "UPDATE integration_operations SET state='discarded', reason='claim_failed' WHERE operation_id=?1 AND state='effect_pending'",
             [operation_id],
         )?;
+        if updated == 1 {
+            let (revision, task_id): (i64, Option<String>) = tx.query_row(
+                "SELECT d.revision, o.task_id FROM operation_delivery d JOIN operations o ON o.id=d.operation_id WHERE d.operation_id=?1",
+                [operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if let Some(task_id) = task_id {
+                super::feedback::insert_feedback(
+                    &tx,
+                    &super::feedback::LocalFeedback {
+                        operation_id: operation_id.to_string(),
+                        outcome_revision: revision,
+                        category: "integrator_rejection".into(),
+                        task_id,
+                        reason: "claim_failed".into(),
+                    },
+                )?;
+            }
+        }
         tx.commit()?;
         Ok(())
     }
@@ -714,13 +733,44 @@ fn apply_finish(
         }
         // An expired or ambiguous lease can still record the observation. A live claim is not required.
         let old = super::delivery::delivery(&tx, &id)?;
-        if matches!(
+        let outcome_revision = if matches!(
             old.state,
             DeliveryState::Claimed | DeliveryState::Ambiguous | DeliveryState::Pending
         ) {
-            super::delivery::update_outcome(&tx, &old, &outcome, now, LEASE_OWNER)?;
+            let delivered = super::delivery::update_outcome(&tx, &old, &outcome, now, LEASE_OWNER)?;
+            i64::try_from(delivered.revision).map_err(|_| invalid("delivery revision does not fit"))?
+        } else {
+            i64::try_from(old.revision).map_err(|_| invalid("delivery revision does not fit"))?
+        };
+        if let (Some(category), Some(why)) = (feedback_category(finish), reason) {
+            let task_id: Option<String> = tx.query_row(
+                "SELECT task_id FROM operations WHERE id=?1",
+                [operation_id],
+                |row| row.get(0),
+            )?;
+            let task_id = task_id.ok_or_else(|| invalid("integration feedback is missing a task"))?;
+            super::feedback::insert_feedback(
+                &tx,
+                &super::feedback::LocalFeedback {
+                    operation_id: operation_id.to_string(),
+                    outcome_revision,
+                    category: category.into(),
+                    task_id,
+                    reason: why.to_string(),
+                },
+            )?;
         }
         Ok(())
+}
+
+fn feedback_category(finish: &IntegrationFinish) -> Option<&'static str> {
+    match finish {
+        IntegrationFinish::Blocked { .. } | IntegrationFinish::Discarded { .. } => {
+            Some("integrator_rejection")
+        }
+        IntegrationFinish::Reconciliation { .. } => Some("integrator_conflict"),
+        IntegrationFinish::Confirm => None,
+    }
 }
 
 impl SqliteStore {
@@ -928,7 +978,7 @@ mod tests {
     fn upgrade_v1_from_27_to_28_preserves_historical_dependencies() {
         let fresh = tempfile::tempdir().unwrap();
         let created = SqliteStore::create(&fresh.path().join("state.db")).unwrap();
-        assert_eq!(user_version(&created.connection), 28);
+        assert_eq!(user_version(&created.connection), 29);
         assert!(table_exists(&created.connection, "integration_operations"));
         assert!(table_exists(&created.connection, "integration_candidates"));
         assert!(table_exists(&created.connection, "integrated_commits"));
@@ -980,7 +1030,7 @@ mod tests {
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
         raw.execute_batch(
-            "DROP TABLE IF EXISTS integrated_commits; DROP TABLE IF EXISTS integration_candidates; DROP TABLE IF EXISTS integration_operations; DROP TABLE IF EXISTS integration_target_leases; DROP TABLE IF EXISTS integration_targets; UPDATE store_meta SET schema_version=27; PRAGMA user_version=27;",
+            "DROP TABLE IF EXISTS feedback_claims; DROP TABLE IF EXISTS feedback_items; DROP TABLE IF EXISTS integrated_commits; DROP TABLE IF EXISTS integration_candidates; DROP TABLE IF EXISTS integration_operations; DROP TABLE IF EXISTS integration_target_leases; DROP TABLE IF EXISTS integration_targets; UPDATE store_meta SET schema_version=27; PRAGMA user_version=27;",
         )
         .unwrap();
         drop(raw);
@@ -1006,12 +1056,12 @@ mod tests {
             Err(StoreError::UnsupportedSchema(27))
         ));
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 28);
+        assert_eq!(user_version(&db.connection), 29);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            28
+            29
         );
         assert!(table_exists(&db.connection, "integrated_commits"));
         assert_eq!(db.testing_dependencies().unwrap(), before);
@@ -1038,6 +1088,6 @@ mod tests {
         check_schema(&db.connection).unwrap();
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 28);
+        assert_eq!(user_version(&reopened.connection), 29);
     }
 }

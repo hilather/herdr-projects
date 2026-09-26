@@ -414,6 +414,18 @@ impl SqliteStore {
                 ],
             )?;
         }
+        if state == "rejected" {
+            super::feedback::insert_feedback(
+                &tx,
+                &super::feedback::LocalFeedback {
+                    operation_id: run_id.clone(),
+                    outcome_revision: 1,
+                    category: "verifier_rejection".into(),
+                    task_id: target.task_id.clone(),
+                    reason: reason.unwrap_or("rejected").to_string(),
+                },
+            )?;
+        }
         tx.execute(
             "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?1,?2,1,1,?3)",
             params![
@@ -483,6 +495,163 @@ impl SqliteStore {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// One poll of a rejected verification. A second call is the duplicate poll.
+    #[cfg(test)]
+    pub(crate) fn testing_poll_rejected_verification(&mut self) -> Result<ExistingRun> {
+        self.seed_rejected_verification()?;
+        let target = self.rejected_verification_target()?;
+        let (stored, _) = self.commit_verification(
+            &target,
+            RunDraft {
+                idempotency_key: "verify-reject-1".into(),
+                payload_digest: sha256_hex(b"verifier-rejection-payload"),
+                argv: vec!["/usr/bin/true".into()],
+                libraries: vec![],
+                tree_oid: None,
+                exit_status: Some(1),
+                reason: Some("checks_failed".into()),
+                receipt: None,
+            },
+        )?;
+        Ok(stored)
+    }
+
+    #[cfg(test)]
+    fn seed_rejected_verification(&mut self) -> Result<()> {
+        use crate::domain::*;
+        let path = std::fs::canonicalize(
+            self.connection
+                .path()
+                .ok_or_else(|| invalid("store path missing"))?,
+        )
+        .map_err(|error| StoreError::Io(error.to_string()))?;
+        let project_store = path
+            .to_str()
+            .ok_or_else(|| invalid("store path is not utf-8"))?
+            .to_string();
+        let submission_id = "c".repeat(64);
+        let exists: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM result_submissions WHERE submission_id=?1)",
+            [&submission_id],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Ok(());
+        }
+        self.commit(Commit {
+            expected_head: 0,
+            mutations: vec![
+                Mutation::Task {
+                    expected: None,
+                    next: Task {
+                        id: TaskId::new("consumer").unwrap(),
+                        revision: 1,
+                        state: TaskState::Draft,
+                        title: "consumer".into(),
+                        active_attempt: None,
+                    },
+                },
+                Mutation::Task {
+                    expected: None,
+                    next: Task {
+                        id: TaskId::new("task").unwrap(),
+                        revision: 1,
+                        state: TaskState::Running,
+                        title: "verify".into(),
+                        active_attempt: None,
+                    },
+                },
+                Mutation::Attempt {
+                    expected: None,
+                    next: Attempt {
+                        id: AttemptId::new("attempt-1").unwrap(),
+                        task: TaskId::new("task").unwrap(),
+                        revision: 1,
+                        state: AttemptState::Running,
+                        snapshot: None,
+                        reservation: "slot-1".into(),
+                        termination_observed: false,
+                    },
+                },
+            ],
+        })?;
+        self.connection.execute(
+            "INSERT INTO task_dependencies(task_id,predecessor_id,requirement) VALUES('consumer','task','landed_commit')",
+            [],
+        )?;
+        let installed: i64 = self
+            .connection
+            .query_row("SELECT max(sequence) FROM events", [], |row| row.get(0))?;
+        let raw = b"contract-v1";
+        let raw_digest = sha256_hex(raw);
+        let policy = r#"{"version":1,"checks":["/usr/bin/true"]}"#;
+        let oid = "a".repeat(40);
+        let base = "b".repeat(40);
+        let tx = self.connection.transaction()?;
+        tx.execute(
+            "INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq) VALUES('task',1,NULL,?1,0,?2,?3,'sha1',NULL,'verify_only',?4,?5,?6)",
+            params![project_store, "/tmp/repo", base, raw, raw_digest, installed],
+        )?;
+        tx.execute(
+            "INSERT INTO acceptance_policies(task_id,contract_revision,policy_id,body) VALUES('task',1,'policy-1',?1)",
+            [policy],
+        )?;
+        tx.execute(
+            "INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,memory_snapshot_id,artifact_manifest,claimed_checks,created_unix_ms) VALUES(?1,?2,'submit-1',?3,'{}','task',1,?4,'attempt-1',?5,?6,?7,'sha1',NULL,'[]','[]',0)",
+            params![
+                submission_id,
+                project_store,
+                sha256_hex(b"verifier-rejection-payload"),
+                raw_digest,
+                "/tmp/repo",
+                base,
+                oid
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn rejected_verification_target(&mut self) -> Result<VerifyTarget> {
+        let path = std::fs::canonicalize(
+            self.connection
+                .path()
+                .ok_or_else(|| invalid("store path missing"))?,
+        )
+        .map_err(|error| StoreError::Io(error.to_string()))?;
+        let pin = std::fs::File::open(&path).map_err(|error| StoreError::Io(error.to_string()))?;
+        let meta = pin
+            .metadata()
+            .map_err(|error| StoreError::Io(error.to_string()))?;
+        let project_store = path
+            .to_str()
+            .ok_or_else(|| invalid("store path is not utf-8"))?
+            .to_string();
+        let policy = r#"{"version":1,"checks":["/usr/bin/true"]}"#;
+        let raw_digest = sha256_hex(b"contract-v1");
+        Ok(VerifyTarget {
+            project_store,
+            submission_id: "c".repeat(64),
+            payload_digest: sha256_hex(b"verifier-rejection-payload"),
+            task_id: "task".into(),
+            contract_revision: 1,
+            contract_digest: raw_digest,
+            attempt_id: "attempt-1".into(),
+            attempt_revision: 1,
+            candidate_oid: "a".repeat(40),
+            object_format: "sha1".into(),
+            policy_id: "policy-1".into(),
+            policy_body: policy.into(),
+            policy_digest: sha256_hex(policy.as_bytes()),
+            memory_fence: head(&self.connection)?,
+            store_device: i64::try_from(meta.dev()).map_err(|_| invalid("store device does not fit"))?,
+            store_inode: i64::try_from(meta.ino()).map_err(|_| invalid("store inode does not fit"))?,
+            objects: Vec::new(),
+            pin,
+        })
     }
 }
 
@@ -643,5 +812,67 @@ mod tests {
         let reopened = SqliteStore::open(&path).unwrap();
         assert_eq!(user_version(&reopened.connection), 27);
         assert!(table_exists(&reopened.connection, "verified_results"));
+    }
+
+    #[test]
+    fn duplicate_verifier_rejection_polls_do_not_insert_duplicate_feedback() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
+        let first = db.testing_poll_rejected_verification().unwrap();
+        let attempts: i64 = db
+            .connection
+            .query_row("SELECT count(*) FROM attempts", [], |row| row.get(0))
+            .unwrap();
+        let deps: Vec<(String, String, String)> = {
+            let mut stmt = db
+                .connection
+                .prepare(
+                    "SELECT task_id, predecessor_id, requirement FROM task_dependencies ORDER BY task_id, predecessor_id",
+                )
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let second = db.testing_poll_rejected_verification().unwrap();
+        assert_eq!(first.state, "rejected");
+        assert_eq!(first.reason.as_deref(), Some("checks_failed"));
+        assert_eq!(first.run_id, second.run_id);
+        assert_eq!(
+            db.connection
+                .query_row("SELECT count(*) FROM feedback_items", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.connection
+                .query_row("SELECT count(*) FROM verified_results", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.connection
+                .query_row("SELECT count(*) FROM attempts", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            attempts
+        );
+        let after: Vec<(String, String, String)> = {
+            let mut stmt = db
+                .connection
+                .prepare(
+                    "SELECT task_id, predecessor_id, requirement FROM task_dependencies ORDER BY task_id, predecessor_id",
+                )
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(after, deps);
+        assert_eq!(
+            deps,
+            vec![("consumer".into(), "task".into(), "landed_commit".into())]
+        );
     }
 }

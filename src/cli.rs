@@ -232,6 +232,9 @@ enum Command {
     /// Record an untrusted worker result. Does not verify or launch.
     #[cfg(feature="state-store")]
     Result { slug:String, #[command(subcommand)] command:ResultCommand },
+    /// Show or lease local verifier and integrator feedback. Does not reserve or satisfy.
+    #[cfg(feature="state-store")]
+    Feedback { slug:String, #[command(subcommand)] command:FeedbackCommand },
     /// Inspect durable delivery state (no external effects)
     #[cfg(feature="state-store")]
     Operations { slug:String, #[command(subcommand)] command:OperationsCommand },
@@ -542,6 +545,14 @@ enum MigrationCommand {
 enum ContractCommand {
     /// Verify raw bytes under contract@herdr-projects and install one contract. No launch.
     Put { #[arg(long)] input_file:PathBuf, #[arg(long)] signature:PathBuf },
+}
+#[cfg(feature="state-store")]
+#[derive(Subcommand)]
+enum FeedbackCommand {
+    /// Read local verifier and integrator feedback. A pull-request poll is not evidence.
+    Show { #[arg(long)] id: Option<String> },
+    /// Lease one feedback item. Does not reserve an attempt or satisfy a dependency.
+    Claim { id: String, #[arg(long)] owner: String, #[arg(long)] lease_ms: i64 },
 }
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
@@ -924,6 +935,16 @@ pub fn run() -> Result<()> {
                 #[cfg(target_os="linux")]
                 ResultCommand::Submit{input_file}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::submit_untrusted_result(&dir,&input_file)?)?),
                 ResultCommand::Show{id}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::show_results(&dir,id.as_deref())?)?),
+            }
+            Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Feedback{slug,command}=>{
+            project::validate_slug(&slug)?;
+            let dir=ctx.root.join(&slug);
+            match command {
+                FeedbackCommand::Show{id}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::show_feedback(&dir,id.as_deref())?)?),
+                FeedbackCommand::Claim{id,owner,lease_ms}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::claim_feedback(&dir,&id,&owner,lease_ms)?)?),
             }
             Ok(())
         },
