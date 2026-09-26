@@ -162,16 +162,64 @@ pub fn prepared_admission_inputs(project: &Path) -> Result<Option<LaunchInputs>>
     Ok(Some(seal(project_store, &state, &candidate, profile, placeholder_approval())?))
 }
 
+/// `capacity_full` while verify or integrate work is older than the watermark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionBlock {
+    pub blocker: &'static str,
+    pub reason: &'static str,
+}
+
+/// No schema column. Every scheduler policy revision uses this default.
+fn backlog_watermark_ms(_policy_revision: u64) -> i64 {
+    15 * 60 * 1000
+}
+
+fn backlog_reason(verification_age: Option<i64>, integration_age: Option<i64>, watermark: i64) -> Option<&'static str> {
+    if verification_age.is_some_and(|age| age > watermark) {
+        return Some("verification_backlog");
+    }
+    if integration_age.is_some_and(|age| age > watermark) {
+        return Some("integration_backlog");
+    }
+    None
+}
+
+fn backlog_ages(project: &Path) -> Result<(Option<i64>, Option<i64>)> {
+    let path = store_file(project)?;
+    let connection = rusqlite::Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    let verification: Option<i64> = connection.query_row(
+        "SELECT MIN(created_unix_ms) FROM result_submissions WHERE NOT EXISTS (SELECT 1 FROM verification_runs WHERE verification_runs.submission_id = result_submissions.submission_id)",
+        [],
+        |row| row.get(0),
+    )?;
+    let integration: Option<i64> = connection.query_row(
+        "SELECT MIN(created_unix_ms) FROM integration_operations WHERE state NOT IN ('integrated', 'discarded')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok((verification, integration))
+}
+
 /// Reserve at most one ready attempt through `reserve_prepared`. Does not launch.
-pub fn admit_once(project: &Path) -> Result<()> {
+/// A verify or integrate backlog older than the watermark returns `capacity_full` and does not reserve.
+pub fn admit_once(project: &Path) -> Result<Option<AdmissionBlock>> {
     let mut db = open_store(project)?;
     if !db.factory_admission_enabled()? {
-        return Ok(());
+        return Ok(None);
     }
     let now = jiff::Timestamp::now().as_millisecond();
     let project_store = store_file(project)?;
     let project_store = project_store.to_str().context("project store is not UTF-8")?;
     let state = db.read_snapshot(None)?;
+    let revision = state.scheduler.as_ref().map(|scheduler| scheduler.policy.revision).unwrap_or(0);
+    let watermark = backlog_watermark_ms(revision);
+    let (verification_oldest, integration_oldest) = backlog_ages(project)?;
+    if let Some(reason) = backlog_reason(verification_oldest.map(|created| now.saturating_sub(created)), integration_oldest.map(|created| now.saturating_sub(created)), watermark) {
+        return Ok(Some(AdmissionBlock { blocker: "capacity_full", reason }));
+    }
     let head = state.head;
     let profiles = db.admission_profiles()?;
     let control = state.control.clone().context("project control missing")?;
@@ -190,12 +238,12 @@ pub fn admit_once(project: &Path) -> Result<()> {
         if let Some(inputs) = sealed {
             // Head was read before this write. A later mutation conflicts instead of reserving a stale snapshot.
             db.reserve_prepared(&[PreparedLaunch { inputs }], head, now)?;
-            return Ok(());
+            return Ok(None);
         }
         // One denial for this task, then the next candidate. A grant for another profile is not this miss.
         record_missing_grant(&mut db, &candidate.task.id, head, now)?;
     }
-    Ok(())
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -568,6 +616,126 @@ mod tests {
         assert_eq!(blockers(&project).iter().find(|(task, _, _)| task == "late").unwrap().2, None);
         assert_eq!(grant_and_admit(&project).as_deref(), Some("late"));
         assert!(attempt_tasks(&project).contains(&"late".to_string()));
+    }
+
+    fn plant_finished_attempt(project: &Path) {
+        let mut db = SqliteStore::open(&project.join(".state/state.db")).unwrap();
+        let head = db.read_snapshot(None).unwrap().head;
+        db.commit(Commit { expected_head: head, mutations: vec![Mutation::Attempt { expected: None, next: Attempt {
+            id: AttemptId::new("attempt-1").unwrap(), task: TaskId::new("early").unwrap(), revision: 1, state: AttemptState::Completed, snapshot: None, reservation: "slot-backlog".into(), termination_observed: true,
+        } }] }).unwrap();
+    }
+    fn db(project: &Path) -> rusqlite::Connection {
+        let connection = rusqlite::Connection::open(project.join(".state/state.db")).unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        connection
+    }
+    fn insert_submission(connection: &rusqlite::Connection, project_store: &str, repository: &str, oid: &str, created_unix_ms: i64) -> String {
+        let digest = "ab".repeat(32);
+        let submission = "12".repeat(32);
+        connection.execute(
+            "INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,memory_snapshot_id,artifact_manifest,claimed_checks,created_unix_ms) VALUES(?1,?2,'submit-1',?3,'{}','early',1,?3,'attempt-1',?4,?5,?5,'sha1',NULL,'{}','[]',?6)",
+            rusqlite::params![submission, project_store, digest, repository, oid, created_unix_ms],
+        ).unwrap();
+        submission
+    }
+    fn insert_verified(connection: &rusqlite::Connection, project_store: &str, submission: &str, oid: &str, created_unix_ms: i64) -> String {
+        let digest = "ab".repeat(32);
+        let run = "34".repeat(32);
+        let result = "56".repeat(32);
+        connection.execute(
+            "INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,?2,'verify-1',?3,?4,'early',1,?3,'attempt-1','builds',?3,?5,?5,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','{}','accepted',NULL,0,?3,1,1,?6)",
+            rusqlite::params![run, project_store, digest, submission, oid, created_unix_ms],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?2,?3,?4,?4,'sha1',?5,?5,'linux-unshare-user-pid-mount-v1',0,?6)",
+            rusqlite::params![result, run, submission, oid, digest, created_unix_ms],
+        ).unwrap();
+        result
+    }
+    fn insert_integration(project: &Path, state: &str, created_unix_ms: i64) {
+        plant_finished_attempt(project);
+        let connection = db(project);
+        let (project_store, repository, oid): (String, String, String) = connection.query_row(
+            "SELECT project_store, repository, base_oid FROM task_contracts WHERE task_id='early' AND contract_revision=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        let submission = insert_submission(&connection, &project_store, &repository, &oid, created_unix_ms);
+        let result = insert_verified(&connection, &project_store, &submission, &oid, created_unix_ms);
+        let digest = format!("{:x}", sha2::Sha256::digest(b"{}"));
+        connection.execute(
+            "INSERT INTO operations(id,task_id,kind,target,payload_version,payload,payload_hash,expected_revision,due_unix_ms,idempotency_key) VALUES('op-1','early','integration.lease','refs/heads/queue',1,'{}',?1,1,0,'op-1')",
+            [&digest],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO integration_targets(repository,ref_name,created_unix_ms) VALUES(?1,'refs/heads/queue',?2)",
+            rusqlite::params![repository, created_unix_ms],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO integration_target_leases(repository,ref_name,operation_id,generation) VALUES(?1,'refs/heads/queue','op-1',1)",
+            [repository.as_str()],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO integration_operations(operation_id,project_store,idempotency_key,payload_digest,repository,ref_name,expected_old_oid,verified_result_id,candidate_id,state,generation,object_format,checks_passed,reason,created_unix_ms) VALUES('op-1',?1,'integrate-1',?2,?3,'refs/heads/queue',?4,?5,NULL,?6,1,'sha1',0,NULL,?7)",
+            rusqlite::params![project_store, digest, repository, oid, result, state, created_unix_ms],
+        ).unwrap();
+    }
+
+    #[test]
+    fn backlog_watermark_is_fifteen_minutes_and_equality_does_not_block() {
+        let watermark = backlog_watermark_ms(1);
+        assert_eq!(watermark, 15 * 60 * 1000);
+        assert_eq!(backlog_watermark_ms(4), watermark);
+        assert_eq!(backlog_reason(Some(watermark), Some(watermark), watermark), None);
+        assert_eq!(backlog_reason(Some(watermark + 1), None, watermark), Some("verification_backlog"));
+        assert_eq!(backlog_reason(None, Some(watermark + 1), watermark), Some("integration_backlog"));
+        assert_eq!(backlog_reason(Some(watermark + 1), Some(watermark + 5), watermark), Some("verification_backlog"));
+    }
+
+    fn attempt_count(project: &Path) -> usize {
+        SqliteStore::open(&project.join(".state/state.db")).unwrap().read_snapshot(None).unwrap().attempts.len()
+    }
+
+    #[test]
+    fn verification_backlog_returns_capacity_full_and_does_not_start_work() {
+        let (_root, project) = world(1, &[Spec { id: "early", priority: 0, age_ms: 0, paths: &[("README.md", "write")], named: &[] }]);
+        plant_finished_attempt(&project);
+        let connection = db(&project);
+        let (project_store, repository, oid): (String, String, String) = connection.query_row(
+            "SELECT project_store, repository, base_oid FROM task_contracts WHERE task_id='early' AND contract_revision=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        let now = jiff::Timestamp::now().as_millisecond();
+        insert_submission(&connection, &project_store, &repository, &oid, now - backlog_watermark_ms(1) - 60_000);
+        drop(connection);
+        let block = admit_once(&project).unwrap().expect("verification backlog");
+        assert_eq!(block, AdmissionBlock { blocker: "capacity_full", reason: "verification_backlog" });
+        assert!(prepared_admission_inputs(&project).unwrap().is_some());
+        assert_eq!(attempt_count(&project), 1);
+        assert!(grant_and_admit(&project).is_some());
+        assert_eq!(attempt_count(&project), 1);
+    }
+
+    #[test]
+    fn integration_backlog_returns_capacity_full_and_terminal_rows_do_not() {
+        let (_root, project) = world(1, &[Spec { id: "early", priority: 0, age_ms: 0, paths: &[("README.md", "write")], named: &[] }]);
+        let now = jiff::Timestamp::now().as_millisecond();
+        insert_integration(&project, "integrated", now - backlog_watermark_ms(1) - 60_000);
+        assert_eq!(admit_once(&project).unwrap(), None);
+        assert_eq!(attempt_count(&project), 1);
+        assert_eq!(grant_and_admit(&project).as_deref(), Some("early"));
+        assert_eq!(attempt_count(&project), 2);
+
+        let (_root, project) = world(1, &[Spec { id: "early", priority: 0, age_ms: 0, paths: &[("README.md", "write")], named: &[] }]);
+        let now = jiff::Timestamp::now().as_millisecond();
+        insert_integration(&project, "effect_pending", now - backlog_watermark_ms(1) - 60_000);
+        let block = admit_once(&project).unwrap().expect("integration backlog");
+        assert_eq!(block, AdmissionBlock { blocker: "capacity_full", reason: "integration_backlog" });
+        assert_eq!(attempt_count(&project), 1);
+        assert!(grant_and_admit(&project).is_some());
+        assert_eq!(attempt_count(&project), 1);
     }
 
     fn snapshot_retains(project: &Path, task: &str) -> bool {
