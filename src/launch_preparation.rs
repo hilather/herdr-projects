@@ -111,6 +111,50 @@ fn inputs(
     })
 }
 
+/// Inputs for one automatic reservation. The approval reference is filled by the
+/// caller after an installed grant matches; this does not launch or reserve.
+pub(crate) fn seal_admission_inputs(
+    project_store: &str,
+    task: &Task,
+    binding: &RuntimeBinding,
+    scheduler_revision: u64,
+    control_epoch: u64,
+    profile: &FrozenProfile,
+    approval: VersionedReference,
+    dependencies: Vec<DependencyInput>,
+    repositories: Vec<RepositoryInput>,
+    budget: Option<VersionedReference>,
+) -> Result<LaunchInputs, String> {
+    if !binding.identity.pane_id.is_empty()
+        || !binding.identity.tab_id.is_empty()
+        || !binding.identity.machine.is_empty()
+        || !binding.identity.worktree_path.is_empty()
+        || binding.task.as_ref() != Some(&task.id)
+    {
+        return Err("new launch requires an unused local binding".into());
+    }
+    Ok(LaunchInputs {
+        version: 2,
+        project_store: project_store.into(),
+        task: task.id.clone(),
+        task_revision: task.revision,
+        scheduler_revision,
+        control_epoch,
+        binding: binding.id.clone(),
+        binding_revision: binding.revision,
+        binding_digest: crate::store::ownership::identity_digest(binding).map_err(|e| e.to_string())?,
+        profile: profile.reference()?,
+        config: profile.config.clone(),
+        effective_profile: Some(profile.clone()),
+        approval,
+        repositories,
+        dependencies,
+        // A store that already has memory records stays unreserved; this wake does not mint a snapshot.
+        memory: None,
+        budget,
+    })
+}
+
 fn brief(project: &Path, db: &mut ControlledStore, inputs: &LaunchInputs) -> Result<crate::memory::WorkerBrief> {
     let reference = inputs.memory.as_ref().context("worker knowledge is required")?;
     let value = db.render_launch_knowledge(project,&reference.id)?;

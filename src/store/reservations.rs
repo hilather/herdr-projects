@@ -81,6 +81,8 @@ impl SqliteStore {
         let mut seen=BTreeSet::new();for p in prepared {validate_inputs(&p.inputs)?;if p.inputs.version!=2 {return Err(invalid("new reservations require effective profile evidence"));}if Path::new(&p.inputs.project_store)!=path||!seen.insert(&p.inputs.task){return Err(invalid("preparation belongs to another store or duplicates a task"));}}
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
         let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;if version<13{return Err(StoreError::UnsupportedSchema(version));}
+        // Older stores have no satisfaction rows. The flag stays off until a later signed install.
+        let admission_on=if version>=30 {super::satisfaction::admission_enabled(&tx)?}else{false};
         if head(&tx)?!=expected_head{return Err(StoreError::Conflict);}
         let scheduler=super::scheduler::read(&tx)?;let control=super::control::read(&tx)?;
         if control.state!=ProjectState::Active||control.reconciliation_required{return Err(invalid("project is not admitted"));}
@@ -89,12 +91,16 @@ impl SqliteStore {
         let queued:BTreeMap<_,_>=scheduler.queue.iter().map(|q|(&q.task,q)).collect();let mut ranked=Vec::new();
         for preparation in prepared {
             let i=&preparation.inputs;if i.scheduler_revision!=scheduler.policy.revision||i.control_epoch!=control.epoch||i.config.digest!=control.config_digest{return Err(StoreError::Conflict);}
-            if !i.dependencies.is_empty(){return Err(invalid("dependency evidence producers are not available"));}
+            let task=tasks.iter().find(|t|t.id==i.task&&t.revision==i.task_revision).cloned().ok_or(StoreError::Conflict)?;let queue=queued.get(&task.id).ok_or(StoreError::Conflict)?;
+            if !admission_on {
+                if !i.dependencies.is_empty()||!queue.dependencies.is_empty(){return Err(invalid("dependency evidence producers are not available"));}
+            } else {
+                super::satisfaction::require_dependency_evidence(&tx,i,&queue.dependencies,&tasks)?;
+            }
             super::worker_knowledge::validate(&tx,i,now)?;
             super::budget::check(&tx,i.budget.as_ref(),false)?;
             if !draft {super::approvals::validate_preparation(&tx,i,now)?;}
-            let task=tasks.iter().find(|t|t.id==i.task&&t.revision==i.task_revision).ok_or(StoreError::Conflict)?;let queue=queued.get(&task.id).ok_or(StoreError::Conflict)?;
-            if task.state!=TaskState::Queued||task.active_attempt.is_some()||!queue.dependencies.is_empty()||queue.enqueued_unix_ms>now||attempts.iter().any(|a|a.task==task.id&&a.retains_capacity()) {return Err(invalid("task is not ready for reservation"));}
+            if task.state!=TaskState::Queued||task.active_attempt.is_some()||queue.enqueued_unix_ms>now||attempts.iter().any(|a|a.task==task.id&&a.retains_capacity()) {return Err(invalid("task is not ready for reservation"));}
             if attempts.iter().filter(|a|a.task==task.id).count()>=scheduler.policy.max_attempts_per_task as usize{return Err(invalid("task attempt limit reached"));}
             let binding=bindings.iter().find(|b|b.id==i.binding&&b.revision==i.binding_revision&&b.task.as_ref()==Some(&task.id)).ok_or(StoreError::Conflict)?;
             if super::ownership::identity_digest(binding)?!=i.binding_digest{return Err(StoreError::Conflict);}

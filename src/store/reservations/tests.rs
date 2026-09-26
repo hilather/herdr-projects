@@ -893,3 +893,140 @@ fn reservation_requires_current_exact_unconsumed_approval_without_using_it() {
     assert!(super::super::approvals::validate_preparation(&db.connection,&reservation.record.inputs,1002).is_err());
     assert_eq!(db.read_snapshot(None).unwrap(),state);
 }
+
+fn plant_verified(db:&SqliteStore,task:&str,attempt:&str,result_id:&str) {
+    let digest="d".repeat(64);let oid="a".repeat(40);
+    let installed:i64=db.connection.query_row("SELECT COALESCE(MAX(sequence),1) FROM events",[],|row|row.get(0)).unwrap();
+    db.connection.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+    db.connection.execute("INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq) VALUES(?1,1,NULL,'/tmp/project',0,'/tmp/repo',?2,'sha1',NULL,'verify_only',?3,?4,?5)",params![task,oid,vec![b'x'],digest,installed]).unwrap();
+    db.connection.execute("INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,'/tmp/project',?1,?2,?2,?3,1,?2,?4,'policy',?2,?5,?5,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?2,0,0,1)",params![result_id,digest,task,attempt,oid]).unwrap();
+    db.connection.execute("INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?1,?2,?3,?3,'sha1',?2,?2,'linux-unshare-user-pid-mount-v1',0,1)",params![result_id,digest,oid]).unwrap();
+    db.connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+}
+fn reseal(db:&mut SqliteStore,task_name:&str,dependencies:Vec<DependencyInput>,repositories:Vec<RepositoryInput>,template:&LaunchInputs)->PreparedLaunch {
+    let snapshot=db.read_snapshot(None).unwrap();
+    let task=snapshot.tasks.iter().find(|task|task.id.as_str()==task_name).unwrap().clone();
+    let binding=snapshot.runtime_bindings.iter().find(|binding|binding.task.as_ref()==Some(&task.id)).unwrap();
+    let profile=template.effective_profile.clone().unwrap();
+    let mut inputs=LaunchInputs{version:2,project_store:template.project_store.clone(),task:task.id.clone(),task_revision:task.revision,scheduler_revision:snapshot.scheduler.as_ref().unwrap().policy.revision,control_epoch:snapshot.control.as_ref().unwrap().epoch,binding:binding.id.clone(),binding_revision:binding.revision,binding_digest:super::super::ownership::identity_digest(binding).unwrap(),profile:profile.reference().unwrap(),effective_profile:Some(profile.clone()),approval:VersionedReference{id:"unsigned-launch".into(),revision:1,digest:"0".repeat(64)},config:template.config.clone(),repositories,dependencies,memory:None,budget:template.budget.clone()};
+    let grant=ApprovalGrant{version:1,scope:ApprovalScope::for_launch(&inputs).unwrap(),policy:profile.permission_policy,issued_unix_ms:0,expires_unix_ms:100_000};
+    inputs.approval=db.install_approval(&PreparedApproval{grant},snapshot.head,1000).unwrap();
+    PreparedLaunch{inputs}
+}
+fn queue_dependency(db:&mut SqliteStore,task_name:&str,predecessor:&str,requirement:DependencyRequirement) {
+    let snapshot=db.read_snapshot(None).unwrap();
+    let task=snapshot.tasks.iter().find(|task|task.id.as_str()==task_name).unwrap().clone();
+    db.queue_task(&task.id,task.revision,snapshot.head,&QueueRequest{priority:0,dependencies:vec![Dependency{predecessor:TaskId::new(predecessor).unwrap(),requirement}]},1000).unwrap();
+}
+fn verified_dependent(db:&mut SqliteStore,template:&LaunchInputs)->PreparedLaunch {
+    let head=db.read_snapshot(None).unwrap().head;
+    db.commit(Commit{expected_head:head,mutations:vec![Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("attempt-b").unwrap(),task:TaskId::new("b").unwrap(),revision:1,state:AttemptState::Completed,snapshot:None,reservation:"slot-b".into(),termination_observed:true}}]}).unwrap();
+    plant_verified(db,"b","attempt-b",&"e".repeat(64));
+    queue_dependency(db,"a","b",DependencyRequirement::VerifiedResult);
+    let satisfaction_id:String=db.connection.query_row("SELECT satisfaction_id FROM dependency_satisfactions WHERE task_id='a' AND predecessor_task='b' AND state='valid'",[],|row|row.get(0)).unwrap();
+    let predecessor_revision=db.read_snapshot(None).unwrap().tasks.iter().find(|task|task.id.as_str()=="b").unwrap().revision;
+    reseal(db,"a",vec![DependencyInput{task:TaskId::new("b").unwrap(),task_revision:predecessor_revision,requirement:DependencyRequirement::VerifiedResult,evidence:VersionedReference{id:satisfaction_id.clone(),revision:1,digest:satisfaction_id}}],vec![],template)
+}
+#[test]
+fn flag_off_dependency_evidence_does_not_reserve_and_flag_on_reserves_one() {
+    let(_temp,mut db,prepared)=fixture();
+    let launch=verified_dependent(&mut db,&prepared[0].inputs);
+    let before=db.read_snapshot(None).unwrap();
+    let err=db.reserve_prepared(&[launch.clone()],before.head,1000).unwrap_err();
+    assert!(matches!(err,StoreError::Invalid(ref message) if message.contains("dependency evidence producers are not available")),"{err}");
+    assert!(db.read_snapshot(None).unwrap().attempts.iter().all(|attempt|attempt.task.as_str()!="a"));
+    db.testing_set_factory_admission(true).unwrap();
+    let stale=db.reserve_prepared(&[launch.clone()],0,1000).unwrap_err();
+    assert!(matches!(stale,StoreError::Conflict),"{stale}");
+    assert!(db.read_snapshot(None).unwrap().attempts.iter().all(|attempt|attempt.task.as_str()!="a"));
+    let head=db.read_snapshot(None).unwrap().head;
+    let reserved=db.reserve_prepared(&[launch],head,1000).unwrap();
+    assert_eq!(reserved.record.inputs.task.as_str(),"a");
+    let attempts=db.read_snapshot(None).unwrap().attempts;
+    assert_eq!(attempts.iter().filter(|attempt|attempt.task.as_str()=="a").count(),1);
+}
+#[test]
+fn lost_attempt_still_fills_the_only_slot() {
+    let(_temp,mut db,prepared)=fixture();
+    let launch=verified_dependent(&mut db,&prepared[0].inputs);
+    db.testing_set_factory_admission(true).unwrap();
+    let snapshot=db.read_snapshot(None).unwrap();
+    db.commit(Commit{expected_head:snapshot.head,mutations:vec![Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("lost-b").unwrap(),task:TaskId::new("b").unwrap(),revision:1,state:AttemptState::Lost,snapshot:None,reservation:"slot-lost".into(),termination_observed:false}}]}).unwrap();
+    let before=db.read_snapshot(None).unwrap();
+    let err=db.reserve_prepared(&[launch],before.head,1000).unwrap_err();
+    assert!(matches!(err,StoreError::Invalid(ref message) if message.contains("capacity")),"{err}");
+    let after=db.read_snapshot(None).unwrap();
+    assert!(after.attempts.iter().any(|attempt|attempt.id.as_str()=="lost-b"&&attempt.retains_capacity()));
+    assert!(after.attempts.iter().all(|attempt|attempt.task.as_str()!="a"));
+    assert_eq!(after.attempts.len(),before.attempts.len());
+}
+fn git_history()->(tempfile::TempDir,String,String) {
+    let dir=tempfile::tempdir().unwrap();let repo=dir.path().join("repo");std::fs::create_dir(&repo).unwrap();
+    let git=|args:&[&str]| {
+        let output=std::process::Command::new("/usr/bin/git").arg("-C").arg(&repo).args(args).env_clear().env("PATH","/usr/bin:/bin").env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL","/dev/null").env("GIT_AUTHOR_NAME","t").env("GIT_AUTHOR_EMAIL","t@example.com").env("GIT_COMMITTER_NAME","t").env("GIT_COMMITTER_EMAIL","t@example.com").output().unwrap();
+        assert!(output.status.success(),"git {args:?}: {}",String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    git(&["init","-b","main"]);std::fs::write(repo.join("a.txt"),"a").unwrap();git(&["add","a.txt"]);git(&["commit","-m","a"]);
+    let first=git(&["rev-parse","HEAD"]);
+    git(&["checkout","-b","side"]);std::fs::write(repo.join("b.txt"),"b").unwrap();git(&["add","b.txt"]);git(&["commit","-m","b"]);
+    let second=git(&["rev-parse","HEAD"]);
+    git(&["checkout","main"]);git(&["merge","--no-ff","-m","m","side"]);
+    let merge=git(&["rev-parse","HEAD"]);
+    assert_ne!(first,second);assert_ne!(merge,first);assert_ne!(merge,second);
+    (dir,std::fs::canonicalize(repo).unwrap().display().to_string(),format!("{first} {second} {merge}"))
+}
+fn plant_integrated(db:&SqliteStore,integrated_id:&str,verified_result_id:&str,repository:&str,commit_oid:&str) {
+    let digest="d".repeat(64);let old="c".repeat(40);let candidate=format!("{:x}",Sha256::digest(integrated_id.as_bytes()));
+    db.connection.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+    db.connection.execute("INSERT INTO integration_operations(operation_id,project_store,idempotency_key,payload_digest,repository,ref_name,expected_old_oid,verified_result_id,candidate_id,state,generation,object_format,checks_passed,reason,created_unix_ms) VALUES(?1,'/tmp/project',?1,?2,?5,'refs/heads/integration',?3,?4,NULL,'integrated',1,'sha1',1,NULL,1)",params![integrated_id,digest,old,verified_result_id,repository]).unwrap();
+    db.connection.execute("INSERT INTO integrated_commits(integrated_id,candidate_id,operation_id,repository,ref_name,commit_oid,tree_oid,expected_old_oid,object_format,created_unix_ms) VALUES(?1,?2,?1,?5,'refs/heads/integration',?3,?3,?4,'sha1',1)",params![integrated_id,candidate,commit_oid,old,repository]).unwrap();
+    db.connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+}
+#[test]
+fn two_integrated_parents_reserve_only_when_the_base_contains_both() {
+    let(_git,repository,oids)=git_history();
+    let mut oid=oids.split_whitespace();let first=oid.next().unwrap().to_string();let second=oid.next().unwrap().to_string();let merge=oid.next().unwrap().to_string();
+    for (pin,reserves) in [(merge,true),(first.clone(),false)] {
+        let(_temp,mut db,prepared)=fixture();
+        let snapshot=db.read_snapshot(None).unwrap();
+        db.commit(Commit{expected_head:snapshot.head,mutations:vec![Mutation::Task{expected:None,next:Task{id:TaskId::new("c").unwrap(),revision:1,state:TaskState::Draft,title:"c".into(),active_attempt:None}}]}).unwrap();
+        let head=db.read_snapshot(None).unwrap().head;
+        db.commit(Commit{expected_head:head,mutations:vec![Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("attempt-b").unwrap(),task:TaskId::new("b").unwrap(),revision:1,state:AttemptState::Completed,snapshot:None,reservation:"slot-b".into(),termination_observed:true}},Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("attempt-c").unwrap(),task:TaskId::new("c").unwrap(),revision:1,state:AttemptState::Completed,snapshot:None,reservation:"slot-c".into(),termination_observed:true}}]}).unwrap();
+        plant_verified(&db,"b","attempt-b",&"e".repeat(64));
+        plant_verified(&db,"c","attempt-c",&"f".repeat(64));
+        plant_integrated(&db,&"1".repeat(64),&"e".repeat(64),&repository,&first);
+        plant_integrated(&db,&"2".repeat(64),&"f".repeat(64),&repository,&second);
+        let snapshot=db.read_snapshot(None).unwrap();
+        let task=snapshot.tasks.iter().find(|task|task.id.as_str()=="a").unwrap().clone();
+        db.queue_task(&task.id,task.revision,snapshot.head,&QueueRequest{priority:0,dependencies:vec![Dependency{predecessor:TaskId::new("b").unwrap(),requirement:DependencyRequirement::IntegratedCommit},Dependency{predecessor:TaskId::new("c").unwrap(),requirement:DependencyRequirement::IntegratedCommit}]},1000).unwrap();
+        let mut satisfaction=|predecessor:&str|->(String,u64){
+            let id:String=db.connection.query_row("SELECT satisfaction_id FROM dependency_satisfactions WHERE task_id='a' AND predecessor_task=?1 AND requirement='integrated_commit' AND state='valid'",[predecessor],|row|row.get(0)).unwrap();
+            let revision=db.read_snapshot(None).unwrap().tasks.iter().find(|task|task.id.as_str()==predecessor).unwrap().revision;
+            (id,revision)
+        };
+        let (left_id,left_revision)=satisfaction("b");let (right_id,right_revision)=satisfaction("c");
+        let launch=reseal(&mut db,"a",vec![DependencyInput{task:TaskId::new("b").unwrap(),task_revision:left_revision,requirement:DependencyRequirement::IntegratedCommit,evidence:VersionedReference{id:left_id.clone(),revision:1,digest:left_id}},DependencyInput{task:TaskId::new("c").unwrap(),task_revision:right_revision,requirement:DependencyRequirement::IntegratedCommit,evidence:VersionedReference{id:right_id.clone(),revision:1,digest:right_id}}],vec![RepositoryInput{repository:repository.clone(),commit:pin.clone(),tree:"a".repeat(40)}],&prepared[0].inputs);
+        db.testing_set_factory_admission(true).unwrap();
+        let head=db.read_snapshot(None).unwrap().head;
+        let result=db.reserve_prepared(&[launch],head,1000);
+        if reserves {
+            let reserved=result.unwrap();
+            assert_eq!(reserved.record.inputs.task.as_str(),"a");
+            assert_eq!(reserved.record.inputs.repositories[0].commit,pin);
+        } else {
+            let err=result.unwrap_err();
+            assert!(matches!(err,StoreError::Invalid(ref message) if message.contains("integration_missing")),"{err}");
+            assert!(db.read_snapshot(None).unwrap().attempts.iter().all(|attempt|attempt.task.as_str()!="a"));
+        }
+    }
+}
+#[cfg(target_os="linux")]
+#[test]
+fn missing_grant_records_authority_missing_and_does_not_reserve() {
+    let(temp,mut db,_prepared)=fixture();
+    db.testing_set_factory_admission(true).unwrap();
+    crate::admission::admit_once(temp.path()).unwrap();
+    assert!(db.read_snapshot(None).unwrap().attempts.is_empty());
+    assert!(db.authority_denials().unwrap().iter().any(|denial|denial.reason_code=="authority_missing"));
+}

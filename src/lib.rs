@@ -56,6 +56,9 @@ pub mod profile_preparation;
 pub mod launch_preparation;
 
 #[cfg(all(feature = "state-store", target_os = "linux"))]
+pub mod admission;
+
+#[cfg(all(feature = "state-store", target_os = "linux"))]
 pub mod worktree_preparation;
 
 #[cfg(all(feature = "state-store", target_os = "linux"))]

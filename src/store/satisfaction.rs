@@ -375,6 +375,273 @@ pub(super) fn dependency_blocker(
     Ok(None)
 }
 
+pub(super) fn valid_satisfaction_id(
+    db: &Connection,
+    task_id: &str,
+    predecessor: &Task,
+    requirement: DependencyRequirement,
+) -> Result<Option<String>> {
+    // `admission_on: true` asks whether the receipt counts, not whether the flag is on.
+    if dependency_blocker(db, task_id, predecessor, requirement, true)?.is_some() {
+        return Ok(None);
+    }
+    db.query_row(
+        "SELECT satisfaction_id FROM dependency_satisfactions WHERE task_id=?1 AND predecessor_task=?2 AND requirement=?3 AND state='valid'",
+        params![task_id, predecessor.id.as_str(), requirement.as_str()],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+/// Queue edges and sealed dependency inputs must name the same valid rows.
+/// Two integrated commits on one ref also need a pinned base that contains both.
+pub(super) fn require_dependency_evidence(
+    db: &Connection,
+    inputs: &LaunchInputs,
+    dependencies: &[Dependency],
+    tasks: &[Task],
+) -> Result<()> {
+    if inputs.dependencies.len() != dependencies.len() {
+        return Err(invalid("task is not ready for reservation"));
+    }
+    let mut matched = std::collections::BTreeSet::new();
+    for edge in dependencies {
+        let predecessor = tasks
+            .iter()
+            .find(|task| task.id == edge.predecessor)
+            .ok_or(StoreError::Conflict)?;
+        let Some(dep) = inputs.dependencies.iter().find(|dep| {
+            dep.task == edge.predecessor
+                && dep.requirement == edge.requirement
+                && matched.insert(dep.task.clone())
+        }) else {
+            return Err(invalid("task is not ready for reservation"));
+        };
+        let Some(satisfaction_id) =
+            valid_satisfaction_id(db, inputs.task.as_str(), predecessor, edge.requirement)?
+        else {
+            return Err(invalid("task is not ready for reservation"));
+        };
+        if dep.evidence.digest != satisfaction_id || dep.task_revision != predecessor.revision {
+            return Err(invalid("task is not ready for reservation"));
+        }
+    }
+    if matched.len() != inputs.dependencies.len() {
+        return Err(invalid("task is not ready for reservation"));
+    }
+    require_integrated_base(db, inputs)
+}
+
+fn ancestor(repo: &std::path::Path, base: &str, commit: &str) -> bool {
+    if base == commit {
+        return true;
+    }
+    let Ok(output) = std::process::Command::new("/usr/bin/git")
+        .args([
+            "--no-pager",
+            "-C",
+            repo.to_str().unwrap_or(""),
+            "-c",
+            "safe.directory=*",
+            "merge-base",
+            "--is-ancestor",
+            commit,
+            base,
+        ])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+    else {
+        return false;
+    };
+    output.status.success()
+}
+
+fn require_integrated_base(db: &Connection, inputs: &LaunchInputs) -> Result<()> {
+    let mut stmt = db.prepare(
+        "SELECT i.repository, i.ref_name, i.commit_oid
+         FROM dependency_satisfactions s
+         JOIN integrated_commits i ON i.integrated_id=s.evidence_id AND s.evidence_kind='integrated_commit'
+         JOIN task_dependencies d ON d.task_id=s.task_id AND d.predecessor_id=s.predecessor_task AND d.requirement='integrated_commit'
+         WHERE s.task_id=?1 AND s.state='valid'
+         ORDER BY i.repository, i.ref_name, s.predecessor_task",
+    )?;
+    let rows = stmt
+        .query_map([inputs.task.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut groups: std::collections::BTreeMap<(String, String), Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (repository, ref_name, commit) in rows {
+        groups.entry((repository, ref_name)).or_default().push(commit);
+    }
+    for ((repository, _), commits) in groups {
+        if commits.len() < 2 {
+            continue;
+        }
+        let Some(pin) = inputs.repositories.iter().find(|repo| repo.repository == repository) else {
+            return Err(invalid("integration_missing"));
+        };
+        let contract_base: Option<String> = db
+            .query_row(
+                "SELECT base_oid FROM task_contracts WHERE task_id=?1 AND repository=?2 ORDER BY contract_revision DESC LIMIT 1",
+                params![inputs.task.as_str(), repository],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if contract_base.as_ref().is_some_and(|base| base != &pin.commit) {
+            return Err(invalid("integration_missing"));
+        }
+        let repo = std::path::Path::new(&repository);
+        if commits.iter().any(|commit| !ancestor(repo, &pin.commit, commit)) {
+            return Err(invalid("integration_missing"));
+        }
+    }
+    Ok(())
+}
+
+fn retained_profiles(db: &Connection) -> Result<Vec<FrozenProfile>> {
+    use std::os::unix::fs::MetadataExt;
+    let path = db
+        .path()
+        .ok_or_else(|| invalid("store path missing"))?;
+    let path = std::fs::canonicalize(path).map_err(|e| StoreError::Io(e.to_string()))?;
+    let metadata = std::fs::metadata(&path).map_err(|e| StoreError::Io(e.to_string()))?;
+    let mut stmt = db.prepare(
+        "SELECT profile_digest, report, report_digest FROM native_profiles ORDER BY profile_digest",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut profiles = Vec::new();
+    while let Some(row) = rows.next()? {
+        let (digest, report, report_digest): (String, String, String) =
+            (row.get(0)?, row.get(1)?, row.get(2)?);
+        if format!("{:x}", Sha256::digest(report.as_bytes())) != report_digest {
+            return Err(StoreError::Corrupt("native profile report digest mismatch".into()));
+        }
+        let value: serde_json::Value = serde_json::from_str(&report)
+            .map_err(|_| StoreError::Corrupt("invalid native profile report".into()))?;
+        if value["source_store"] != serde_json::json!([path, metadata.dev(), metadata.ino()]) {
+            continue;
+        }
+        let Some(profile) = value["preparation"]["profile"].as_object() else {
+            continue;
+        };
+        let profile: FrozenProfile = serde_json::from_value(serde_json::Value::Object(profile.clone()))
+            .map_err(|_| StoreError::Corrupt("invalid retained profile".into()))?;
+        if profile.reference().map_err(StoreError::Corrupt)?.digest != digest
+            || profile.validate_for_launch().is_err()
+        {
+            continue;
+        }
+        profiles.push(profile);
+    }
+    Ok(profiles)
+}
+
+impl SqliteStore {
+    pub(crate) fn factory_admission_enabled(&self) -> Result<bool> {
+        admission_enabled(&self.connection)
+    }
+
+    pub(crate) fn admission_profiles(&self) -> Result<Vec<FrozenProfile>> {
+        retained_profiles(&self.connection)
+    }
+
+    /// `None` when any edge lacks a current valid satisfaction. An empty queue is ready.
+    pub(crate) fn satisfied_edges(&self, task_id: &str) -> Result<Option<Vec<SatisfiedEdge>>> {
+        let tasks = read_tasks(&self.connection)?;
+        let mut stmt = self.connection.prepare(
+            "SELECT predecessor_id, requirement FROM task_dependencies WHERE task_id=?1 ORDER BY predecessor_id",
+        )?;
+        let edges = stmt
+            .query_map([task_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut satisfied = Vec::new();
+        for (predecessor_id, requirement) in edges {
+            let requirement = match requirement.as_str() {
+                "verified_result" => DependencyRequirement::VerifiedResult,
+                "integrated_commit" => DependencyRequirement::IntegratedCommit,
+                "integration_candidate" => DependencyRequirement::IntegrationCandidate,
+                "landed_commit" => DependencyRequirement::LandedCommit,
+                _ => return Err(StoreError::Corrupt("unknown dependency requirement".into())),
+            };
+            let predecessor = tasks
+                .iter()
+                .find(|task| task.id.as_str() == predecessor_id)
+                .ok_or(StoreError::Conflict)?;
+            let Some(satisfaction_id) =
+                valid_satisfaction_id(&self.connection, task_id, predecessor, requirement)?
+            else {
+                return Ok(None);
+            };
+            satisfied.push(SatisfiedEdge {
+                predecessor: predecessor.id.clone(),
+                predecessor_revision: predecessor.revision,
+                requirement,
+                satisfaction_id,
+            });
+        }
+        Ok(Some(satisfied))
+    }
+
+    pub(crate) fn contract_pins(&self, task_id: &str) -> Result<Vec<RepositoryInput>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT repository, base_oid FROM task_contracts WHERE task_id=?1 AND contract_revision=(SELECT MAX(contract_revision) FROM task_contracts c WHERE c.task_id=?1)",
+        )?;
+        let rows = stmt
+            .query_map([task_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut pins = Vec::new();
+        for (repository, base) in rows {
+            let tree = git_tree(&repository, &base).unwrap_or_else(|| base.clone());
+            pins.push(RepositoryInput { repository, commit: base, tree });
+        }
+        Ok(pins)
+    }
+}
+
+fn git_tree(repository: &str, commit: &str) -> Option<String> {
+    let output = std::process::Command::new("/usr/bin/git")
+        .args([
+            "--no-pager",
+            "-C",
+            repository,
+            "-c",
+            "safe.directory=*",
+            "rev-parse",
+            "--verify",
+            &format!("{commit}^{{tree}}"),
+        ])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let tree = text.trim();
+    if matches!(tree.len(), 40 | 64) && tree.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(tree.to_string())
+    } else {
+        None
+    }
+}
+
+pub(crate) struct SatisfiedEdge {
+    pub predecessor: TaskId,
+    pub predecessor_revision: u64,
+    pub requirement: DependencyRequirement,
+    pub satisfaction_id: String,
+}
+
 #[cfg(test)]
 impl SqliteStore {
     /// Library tests only. Not compiled into a release build and not `pub`.

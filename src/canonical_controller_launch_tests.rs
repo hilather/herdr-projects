@@ -18,7 +18,7 @@ fn enabled_dispatch_fixture_driver() {
     for path in &projects {
         let before=runtime::snapshot(path).unwrap();
         let ctx=Ctx{env:&env,root:path.parent().unwrap().into(),config_dir:home.path().join("config"),runner:&crate::runner::RealRunner,detached_ticker:false};
-        assert!(!process_next_with_launches(&ctx,path,0,Some(&mut queue),false).unwrap());
+        assert!(!process_next_with_launches(&ctx,path,0,Some(&mut queue),false).unwrap().0);
         assert_eq!(runtime::snapshot(path).unwrap(),before);
     }
     assert!(!queue.offered());
