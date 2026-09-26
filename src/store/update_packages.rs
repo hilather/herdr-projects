@@ -306,8 +306,8 @@ fn acknowledge(
         ));
     }
     let mut missing = Vec::new();
-    let mut retarget = Vec::new();
-    let mut same_sequence: Option<u64> = None;
+    let mut elsewhere = Vec::new();
+    let mut stored_sequences = Vec::new();
     for change_id in &package.change_ids {
         let row: Option<(String, i64)> = tx
             .query_row(
@@ -320,78 +320,55 @@ fn acknowledge(
         match row {
             None => missing.push(change_id.clone()),
             Some((stored_package, sequence)) if stored_package == package.package_id => {
-                let sequence = u64::try_from(sequence).map_err(|_| {
+                stored_sequences.push(u64::try_from(sequence).map_err(|_| {
                     StoreError::Corrupt("change receipt sequence is invalid".into())
-                })?;
-                if same_sequence.is_some_and(|previous| previous != sequence) {
-                    return Err(StoreError::Corrupt(
-                        "package acknowledgment receipts diverged".into(),
-                    ));
-                }
-                same_sequence = Some(sequence);
+                })?);
             }
-            Some(_) => retarget.push(change_id.clone()),
+            Some((stored_package, _)) => elsewhere.push((change_id.clone(), stored_package)),
         }
     }
-    if missing.is_empty() && retarget.is_empty() {
-        let Some(sequence) = same_sequence else {
+    if missing.is_empty() && elsewhere.is_empty() {
+        let Some(sequence) = stored_sequences.iter().copied().min() else {
             return Err(invalid(
                 "package acknowledgment must list that package's change ids",
             ));
         };
         return Ok(PackageAckReceipt {
-            package_id: package.package_id,
+            package_id: package.package_id.clone(),
             disposition: ack.disposition.clone(),
-            change_ids: package.change_ids,
+            change_ids: package.change_ids.clone(),
             sequence,
         });
     }
-    // A later package may take over seen rows that were never applied. Applied
-    // rows stay on the package that recorded them.
-    if !retarget.is_empty() && ack.disposition != "seen" {
-        return Err(StoreError::Conflict);
-    }
-    for change_id in &retarget {
-        let applied: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM memory_change_receipts WHERE binding_id=?1 AND change_id=?2 AND disposition='applied')",
-            params![package.binding_id, change_id],
-            |row| row.get(0),
-        )?;
-        if applied {
+    // A seen ack never moves an existing row onto an older or wider package.
+    if ack.disposition == "seen" {
+        if missing.is_empty() {
             return Err(StoreError::Conflict);
         }
-    }
-    if !missing.is_empty() && same_sequence.is_some() && retarget.is_empty() {
-        return Err(StoreError::Corrupt(
-            "package acknowledgment receipts are partial".into(),
-        ));
+        if !stored_sequences.is_empty() && elsewhere.is_empty() {
+            return Err(StoreError::Corrupt(
+                "package acknowledgment receipts are partial".into(),
+            ));
+        }
+    } else if !elsewhere.is_empty() || !stored_sequences.is_empty() {
+        return Err(if elsewhere.is_empty() {
+            StoreError::Corrupt("package acknowledgment receipts are partial".into())
+        } else {
+            StoreError::Conflict
+        });
     }
     if ack.disposition == "applied" {
-        for change_id in &package.change_ids {
-            let seen: Option<String> = tx
-                .query_row(
-                    "SELECT package_id FROM memory_change_receipts WHERE binding_id=?1 AND change_id=?2 AND disposition='seen'",
-                    params![package.binding_id, change_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if seen.as_deref() != Some(package.package_id.as_str()) {
-                return Err(invalid(
-                    "explicit seen acknowledgment required before applied",
-                ));
-            }
-        }
-        let mut stmt = tx.prepare(
+        let mut revisions_stmt = tx.prepare(
             "SELECT d.record_id, d.revision FROM update_package_members m
              JOIN memory_delivery_intents d ON d.id=m.change_id
              WHERE m.package_id=?1 ORDER BY m.position",
         )?;
-        let revisions = stmt
+        let revisions = revisions_stmt
             .query_map([&package.package_id], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        drop(stmt);
+        drop(revisions_stmt);
         for (record, revision) in revisions {
             let revision =
                 u64::try_from(revision).map_err(|_| invalid("invalid change revision"))?;
@@ -408,6 +385,87 @@ fn acknowledge(
                 ));
             }
         }
+        let mut seen_rows = Vec::new();
+        for change_id in &package.change_ids {
+            let seen: Option<String> = tx
+                .query_row(
+                    "SELECT package_id FROM memory_change_receipts WHERE binding_id=?1 AND change_id=?2 AND disposition='seen'",
+                    params![package.binding_id, change_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(seen_package) = seen else {
+                return Err(invalid(
+                    "explicit seen acknowledgment required before applied",
+                ));
+            };
+            seen_rows.push((change_id.clone(), seen_package));
+        }
+        let mut member_stmt =
+            tx.prepare("SELECT change_id FROM update_package_members WHERE package_id=?1")?;
+        for (_change_id, seen_package) in &seen_rows {
+            if seen_package == &package.package_id {
+                continue;
+            }
+            let members = member_stmt
+                .query_map([seen_package], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if members.is_empty()
+                || members
+                    .iter()
+                    .any(|id| !package.change_ids.iter().any(|mine| mine == id))
+            {
+                return Err(StoreError::Conflict);
+            }
+        }
+        drop(member_stmt);
+        let payload = serde_json::to_string(ack).map_err(|error| invalid(&error.to_string()))?;
+        tx.execute(
+            "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('memory.package_ack',?1,1,1,?2)",
+            params![package.package_id, payload],
+        )?;
+        let sequence = head(tx)?;
+        let stored = integer(sequence)?;
+        for (change_id, seen_package) in &seen_rows {
+            if seen_package == &package.package_id {
+                continue;
+            }
+            tx.execute(
+                "UPDATE memory_change_receipts SET package_id=?1
+                 WHERE binding_id=?2 AND change_id=?3 AND disposition='seen'",
+                params![package.package_id, package.binding_id, change_id],
+            )?;
+        }
+        let generation =
+            i64::try_from(binding.generation).map_err(|_| invalid("invalid consumer binding"))?;
+        for change_id in &package.change_ids {
+            tx.execute(
+                "INSERT INTO memory_change_receipts(binding_id,change_id,disposition,consumer_binding_generation,package_id,sequence)
+                 VALUES(?1,?2,'applied',?3,?4,?5)",
+                params![
+                    package.binding_id,
+                    change_id,
+                    generation,
+                    package.package_id,
+                    stored
+                ],
+            )?;
+        }
+        if binding.task_id.is_none() {
+            let updated = tx.execute(
+                "UPDATE consumer_bindings SET applied_cursor=?2 WHERE binding_id=?1 AND task_id IS NULL",
+                params![package.binding_id, package.package_id],
+            )?;
+            if updated != 1 {
+                return Err(StoreError::Conflict);
+            }
+        }
+        return Ok(PackageAckReceipt {
+            package_id: package.package_id,
+            disposition: ack.disposition.clone(),
+            change_ids: package.change_ids,
+            sequence,
+        });
     }
     let payload = serde_json::to_string(ack).map_err(|error| invalid(&error.to_string()))?;
     tx.execute(
@@ -418,18 +476,6 @@ fn acknowledge(
     let generation =
         i64::try_from(binding.generation).map_err(|_| invalid("invalid consumer binding"))?;
     let stored = integer(sequence)?;
-    if ack.disposition == "seen" {
-        for change_id in &package.change_ids {
-            if missing.iter().any(|id| id == change_id) {
-                continue;
-            }
-            tx.execute(
-                "UPDATE memory_change_receipts SET package_id=?1, sequence=?2
-                 WHERE binding_id=?3 AND change_id=?4 AND disposition='seen'",
-                params![package.package_id, stored, package.binding_id, change_id],
-            )?;
-        }
-    }
     for change_id in &missing {
         tx.execute(
             "INSERT INTO memory_change_receipts(binding_id,change_id,disposition,consumer_binding_generation,package_id,sequence)
@@ -443,17 +489,6 @@ fn acknowledge(
                 stored
             ],
         )?;
-    }
-    // Only a coordinator binding (no task) records the latest package id.
-    // Coverage is the applied receipts, not this column and not a sequence.
-    if ack.disposition == "applied" && binding.task_id.is_none() {
-        let updated = tx.execute(
-            "UPDATE consumer_bindings SET applied_cursor=?2 WHERE binding_id=?1 AND task_id IS NULL",
-            params![package.binding_id, package.package_id],
-        )?;
-        if updated != 1 {
-            return Err(StoreError::Conflict);
-        }
     }
     Ok(PackageAckReceipt {
         package_id: package.package_id,
@@ -491,19 +526,6 @@ impl SqliteStore {
         let receipt = acknowledge(&tx, ack, now)?;
         tx.commit()?;
         Ok(receipt)
-    }
-
-    /// Stored package, including one that materialize no longer returns.
-    #[allow(dead_code)]
-    pub(crate) fn update_package(&mut self, package_id: &str) -> Result<Option<UpdatePackage>> {
-        if !hex64(package_id) {
-            return Err(invalid("invalid package id"));
-        }
-        let tx = self.connection.transaction()?;
-        require_schema(&tx)?;
-        let package = load_package(&tx, package_id)?;
-        tx.commit()?;
-        Ok(package)
     }
 
     /// Applied changes for this binding. Not the latest cursor package and not
@@ -1119,13 +1141,96 @@ mod tests {
             .store
             .materialize_update_package(&binding.binding_id)
             .unwrap();
-        assert_eq!(
-            memory.store.update_package(&first.package_id).unwrap(),
-            Some(first.clone())
-        );
+        let stored_manifest: String = memory
+            .store
+            .connection
+            .query_row(
+                "SELECT manifest_hash FROM update_packages WHERE package_id=?1",
+                [&first.package_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored_members: Vec<String> = memory
+            .store
+            .connection
+            .prepare("SELECT change_id FROM update_package_members WHERE package_id=?1 ORDER BY position")
+            .unwrap()
+            .query_map([&first.package_id], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(stored_manifest, first.manifest_hash);
+        assert_eq!(stored_members, vec![old_id.clone()]);
+        let seen_first = memory
+            .store
+            .acknowledge_update_package(&ack(&first, "seen"), 1)
+            .unwrap();
         memory
             .store
             .acknowledge_update_package(&ack(&wider, "seen"), 1)
+            .unwrap();
+        let head_after_wider_seen = sequence(&memory, "SELECT max(sequence) FROM events");
+        let seen_package: (String, i64) = memory
+            .store
+            .connection
+            .query_row(
+                "SELECT package_id, sequence FROM memory_change_receipts WHERE binding_id=?1 AND change_id=?2 AND disposition='seen'",
+                params![binding.binding_id, old_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(seen_package.0, first.package_id);
+        assert_eq!(seen_package.1, seen_first.sequence as i64);
+        assert_eq!(
+            memory
+                .store
+                .acknowledge_update_package(&ack(&first, "seen"), 1)
+                .unwrap(),
+            seen_first
+        );
+        assert_eq!(
+            sequence(&memory, "SELECT max(sequence) FROM events"),
+            head_after_wider_seen
+        );
+        memory
+            .store
+            .connection
+            .execute(
+                "INSERT INTO memory_revisions SELECT record_id,2,body_hash,provenance_hash,promoted_seq,applicability FROM memory_revisions WHERE record_id='fact' AND revision=1",
+                [],
+            )
+            .unwrap();
+        memory
+            .store
+            .connection
+            .execute(
+                "UPDATE memory_heads SET revision=2 WHERE record_id='fact'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            memory
+                .store
+                .acknowledge_update_package(&ack(&wider, "applied"), 1),
+            Err(StoreError::Invalid(_))
+        ));
+        let still_first: String = memory
+            .store
+            .connection
+            .query_row(
+                "SELECT package_id FROM memory_change_receipts WHERE binding_id=?1 AND change_id=?2 AND disposition='seen'",
+                params![binding.binding_id, old_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_first, first.package_id);
+        memory
+            .store
+            .connection
+            .execute(
+                "UPDATE memory_heads SET revision=1 WHERE record_id='fact'",
+                [],
+            )
             .unwrap();
         memory
             .store
@@ -1143,15 +1248,47 @@ mod tests {
                 .applied_cursor_covers(&binding.binding_id, &new_id)
                 .unwrap()
         );
-        assert_eq!(
+        let moved: String = memory
+            .store
+            .connection
+            .query_row(
+                "SELECT package_id FROM memory_change_receipts WHERE binding_id=?1 AND change_id=?2 AND disposition='seen'",
+                params![binding.binding_id, old_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved, wider.package_id);
+        let head_after_apply = sequence(&memory, "SELECT max(sequence) FROM events");
+        assert!(matches!(
             memory
                 .store
-                .update_package(&first.package_id)
-                .unwrap()
-                .unwrap()
-                .change_ids,
-            vec![old_id.clone()]
+                .acknowledge_update_package(&ack(&first, "seen"), 1),
+            Err(StoreError::Conflict)
+        ));
+        assert_eq!(
+            sequence(&memory, "SELECT max(sequence) FROM events"),
+            head_after_apply
         );
+        let stayed: String = memory
+            .store
+            .connection
+            .query_row(
+                "SELECT package_id FROM memory_change_receipts WHERE binding_id=?1 AND change_id=?2 AND disposition='seen'",
+                params![binding.binding_id, old_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stayed, wider.package_id);
+        let unchanged_members: Vec<String> = memory
+            .store
+            .connection
+            .prepare("SELECT change_id FROM update_package_members WHERE package_id=?1 ORDER BY position")
+            .unwrap()
+            .query_map([&first.package_id], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(unchanged_members, vec![old_id.clone()]);
         let mut extra = ack(&first, "applied");
         extra.change_ids = vec![old_id, new_id.clone()];
         assert!(matches!(
