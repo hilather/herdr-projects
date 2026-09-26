@@ -5,8 +5,7 @@ CREATE TABLE update_packages (
     package_id TEXT PRIMARY KEY CHECK (length(package_id) = 64),
     binding_id TEXT NOT NULL REFERENCES consumer_bindings(binding_id),
     consumer_binding_generation INTEGER NOT NULL CHECK (consumer_binding_generation > 0),
-    manifest_hash TEXT NOT NULL CHECK (length(manifest_hash) = 64),
-    created_seq INTEGER NOT NULL REFERENCES events(sequence)
+    manifest_hash TEXT NOT NULL CHECK (length(manifest_hash) = 64)
 ) STRICT;
 
 CREATE TABLE update_package_members (
@@ -17,18 +16,17 @@ CREATE TABLE update_package_members (
     UNIQUE (package_id, position)
 ) STRICT;
 
--- Logical receipt key: (consumer_binding_generation, change_id, disposition).
+-- One receipt per binding, change, and disposition. Generation numbers repeat
+-- across consumers, so the binding id is the identity, not the generation.
 CREATE TABLE memory_change_receipts (
-    consumer_binding_generation INTEGER NOT NULL CHECK (consumer_binding_generation > 0),
+    binding_id TEXT NOT NULL REFERENCES consumer_bindings(binding_id),
     change_id TEXT NOT NULL REFERENCES memory_delivery_intents(id),
     disposition TEXT NOT NULL CHECK (disposition IN ('seen', 'applied')),
-    binding_id TEXT NOT NULL REFERENCES consumer_bindings(binding_id),
+    consumer_binding_generation INTEGER NOT NULL CHECK (consumer_binding_generation > 0),
     package_id TEXT NOT NULL REFERENCES update_packages(package_id),
     sequence INTEGER NOT NULL REFERENCES events(sequence),
-    PRIMARY KEY (consumer_binding_generation, change_id, disposition)
+    PRIMARY KEY (binding_id, change_id, disposition)
 ) STRICT;
-CREATE INDEX memory_change_receipts_by_generation
-    ON memory_change_receipts(consumer_binding_generation, change_id, disposition);
 
 CREATE TRIGGER update_packages_no_update
 BEFORE UPDATE ON update_packages
@@ -42,14 +40,20 @@ BEGIN SELECT RAISE(ABORT, 'update package member is immutable'); END;
 CREATE TRIGGER update_package_members_no_delete
 BEFORE DELETE ON update_package_members
 BEGIN SELECT RAISE(ABORT, 'update package member is immutable'); END;
+-- A later package may retarget an unapplied seen receipt. Applied rows stay fixed.
 CREATE TRIGGER memory_change_receipts_no_update
 BEFORE UPDATE ON memory_change_receipts
+WHEN OLD.binding_id != NEW.binding_id
+  OR OLD.change_id != NEW.change_id
+  OR OLD.disposition != NEW.disposition
+  OR OLD.consumer_binding_generation != NEW.consumer_binding_generation
+  OR OLD.disposition != 'seen'
 BEGIN SELECT RAISE(ABORT, 'memory change receipt is immutable'); END;
 CREATE TRIGGER memory_change_receipts_no_delete
 BEFORE DELETE ON memory_change_receipts
 BEGIN SELECT RAISE(ABORT, 'memory change receipt is immutable'); END;
 
--- Applied package id for a coordinator binding. Not a sequence watermark.
+-- Latest applied package id for a coordinator binding. Not coverage and not a sequence.
 ALTER TABLE consumer_bindings ADD COLUMN applied_cursor TEXT
     CHECK (applied_cursor IS NULL OR length(applied_cursor) = 64)
     REFERENCES update_packages(package_id);
