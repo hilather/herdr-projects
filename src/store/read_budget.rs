@@ -19,6 +19,12 @@ impl ReadBudget {
     pub(super) fn new(control: ReadControl) -> Self {
         Self { control, units: Cell::new(0), rows: Cell::new(0) }
     }
+    pub(super) fn check(&self) -> Result<()> { self.control.check() }
+    /// Snapshot accounting must not consume the budget of the following shadow read.
+    pub(super) fn restart(&self) {
+        self.units.set(0);
+        self.rows.set(0);
+    }
     fn charge(&self, units: usize) -> Result<()> {
         let next = self.units.get().checked_add(units)
             .filter(|n| *n <= MAX_UNITS)

@@ -416,6 +416,8 @@ pub use update_packages::{PackageAckReceipt, UpdatePackage, UpdatePackageAck};
 mod memory_invalidation;
 mod memory_reconciliation;
 mod worker_knowledge;
+mod targeted;
+pub use targeted::{hot_path_uses_snapshot, targeted_mismatch_count, HotPathRead, HOT_PATH_READ};
 
 #[cfg(target_os = "linux")]
 mod native_profiles;

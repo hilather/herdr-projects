@@ -31,7 +31,16 @@ impl crate::runner::Runner for ProbeBudget<'_> {
 pub fn poll(ctx:&Ctx,path:&Path,turn:u64)->Result<PollResult> {
     let path=path.canonicalize()?;
     let ownership=herdr_projects::execution_guard::ProjectGuard::acquire(&path)?;
-    let snapshot=runtime::snapshot(&path)?;
+    // The hot path stays on read_snapshot. Targeted readers only record a mismatch.
+    ensure!(herdr_projects::store::hot_path_uses_snapshot(),"hot path reader is read_snapshot");
+    let mut db=herdr_projects::migration::open_active(&path)?;
+    let snapshot=db.read_snapshot(None)?;
+    let now=jiff::Timestamp::now().as_millisecond();
+    if let Err(error)=db.shadow_against_snapshot(&snapshot,now,launch_dispatch_enabled()) {
+        if matches!(error,herdr_projects::store::StoreError::Cancelled|herdr_projects::store::StoreError::Deadline) {
+            anyhow::bail!("controller read aborted: {error}");
+        }
+    }
     ensure!(snapshot.schema_version>=9,"upgrade-store is required before canonical controller polling");
     // Collect without a SQLite transaction. Commit and expiry are serialized with
     // all supported lifecycle/effect adapters, without reacquiring ticker leadership.
