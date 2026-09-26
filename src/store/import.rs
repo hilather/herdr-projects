@@ -69,6 +69,7 @@ impl SqliteStore {
         if version<=37 {tx.execute_batch(include_str!("../../migrations/0038_memory_read_sets.sql"))?;}
         if version<=38 {tx.execute_batch(include_str!("../../migrations/0039_update_packages.sql"))?;}
         if version<=39 {tx.execute_batch(include_str!("../../migrations/0040_barriers.sql"))?;}
+        if version<=40 {tx.execute_batch(include_str!("../../migrations/0041_active_work.sql"))?;}
         tx.commit()?;
         Ok(())
     }

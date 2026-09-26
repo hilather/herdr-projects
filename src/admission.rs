@@ -244,7 +244,7 @@ mod tests {
         let created_path = fresh.path().join("state.db");
         let created = SqliteStore::create(&created_path).unwrap();
         drop(created);
-        assert_eq!(user_version(&created_path), 40);
+        assert_eq!(user_version(&created_path), 41);
         assert!(table_exists(&created_path, "resource_claims"));
         let open_fn = include_str!("store/mod.rs").split("pub fn open").nth(1).unwrap().split("pub fn integrity_check").next().unwrap();
         assert!(!open_fn.contains("upgrade_v1"));
@@ -257,7 +257,7 @@ mod tests {
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
         let sequence: i64 = raw.query_row("SELECT MAX(sequence) FROM events", [], |row| row.get(0)).unwrap();
-        raw.execute_batch("DROP TRIGGER IF EXISTS barrier_stale_briefs_no_update; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_delete; DROP TRIGGER IF EXISTS barrier_members_no_update; DROP TRIGGER IF EXISTS barrier_members_no_delete; DROP TRIGGER IF EXISTS barrier_revisions_no_membership_update; DROP TABLE IF EXISTS barrier_stale_briefs; DROP TABLE IF EXISTS barrier_members; DROP TABLE IF EXISTS barrier_revisions; DROP TRIGGER IF EXISTS memory_change_receipts_no_update; DROP TRIGGER IF EXISTS memory_change_receipts_no_delete; DROP TRIGGER IF EXISTS update_package_members_no_update; DROP TRIGGER IF EXISTS update_package_members_no_delete; DROP TRIGGER IF EXISTS update_packages_no_update; DROP TRIGGER IF EXISTS update_packages_no_delete; DROP TABLE IF EXISTS memory_change_receipts; DROP TABLE IF EXISTS update_package_members; ALTER TABLE consumer_bindings DROP COLUMN applied_cursor; DROP TABLE IF EXISTS update_packages; DROP TRIGGER IF EXISTS memory_read_set_on_record; DROP TRIGGER IF EXISTS memory_read_set_on_reclassify; DROP TRIGGER IF EXISTS memory_read_set_on_revision; DROP TRIGGER IF EXISTS memory_read_set_on_validity; DROP TRIGGER IF EXISTS memory_read_set_on_head; DROP TABLE IF EXISTS memory_scope_catalog; DROP TABLE IF EXISTS memory_required_generation; DROP TABLE IF EXISTS consumer_binding_undeliverable; DROP TABLE IF EXISTS consumer_binding_obligations; DROP TABLE IF EXISTS consumer_bindings; DROP TABLE IF EXISTS wait_replay_events; DROP TABLE IF EXISTS replan_requests; DROP TABLE IF EXISTS replan_budget_resets; DROP TABLE IF EXISTS attempt_infrastructure_retries; DROP TABLE IF EXISTS wait_conditions; DROP TABLE resource_claims; UPDATE store_meta SET schema_version=34; PRAGMA user_version=34;").unwrap();
+        raw.execute_batch("DROP INDEX IF EXISTS attempts_retained_by_id; DROP TABLE IF EXISTS active_work_index; DROP TABLE IF EXISTS active_work_meta; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_update; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_delete; DROP TRIGGER IF EXISTS barrier_members_no_update; DROP TRIGGER IF EXISTS barrier_members_no_delete; DROP TRIGGER IF EXISTS barrier_revisions_no_membership_update; DROP TABLE IF EXISTS barrier_stale_briefs; DROP TABLE IF EXISTS barrier_members; DROP TABLE IF EXISTS barrier_revisions; DROP TRIGGER IF EXISTS memory_change_receipts_no_update; DROP TRIGGER IF EXISTS memory_change_receipts_no_delete; DROP TRIGGER IF EXISTS update_package_members_no_update; DROP TRIGGER IF EXISTS update_package_members_no_delete; DROP TRIGGER IF EXISTS update_packages_no_update; DROP TRIGGER IF EXISTS update_packages_no_delete; DROP TABLE IF EXISTS memory_change_receipts; DROP TABLE IF EXISTS update_package_members; ALTER TABLE consumer_bindings DROP COLUMN applied_cursor; DROP TABLE IF EXISTS update_packages; DROP TRIGGER IF EXISTS memory_read_set_on_record; DROP TRIGGER IF EXISTS memory_read_set_on_reclassify; DROP TRIGGER IF EXISTS memory_read_set_on_revision; DROP TRIGGER IF EXISTS memory_read_set_on_validity; DROP TRIGGER IF EXISTS memory_read_set_on_head; DROP TABLE IF EXISTS memory_scope_catalog; DROP TABLE IF EXISTS memory_required_generation; DROP TABLE IF EXISTS consumer_binding_undeliverable; DROP TABLE IF EXISTS consumer_binding_obligations; DROP TABLE IF EXISTS consumer_bindings; DROP TABLE IF EXISTS wait_replay_events; DROP TABLE IF EXISTS replan_requests; DROP TABLE IF EXISTS replan_budget_resets; DROP TABLE IF EXISTS attempt_infrastructure_retries; DROP TABLE IF EXISTS wait_conditions; DROP TABLE resource_claims; UPDATE store_meta SET schema_version=34; PRAGMA user_version=34;").unwrap();
         raw.execute(
             "INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq) VALUES('kept',1,NULL,'/tmp/project',0,'/tmp/repo','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','sha1',NULL,'verify_only',x'61',?1,?2)",
             rusqlite::params!["ab".repeat(32), sequence],
@@ -271,7 +271,7 @@ mod tests {
         assert!(!table_exists(&path, "resource_claims"));
         assert_eq!(db.read_snapshot(None).unwrap().tasks[0].title, "kept");
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&path), 40);
+        assert_eq!(user_version(&path), 41);
         let claims: Vec<(i64, String, String, String, String)> = {
             let raw = rusqlite::Connection::open(&path).unwrap();
             let mut stmt = raw.prepare("SELECT ordinal, kind, resource, access, certainty FROM resource_claims ORDER BY ordinal").unwrap();
@@ -284,8 +284,8 @@ mod tests {
         ]);
         assert!(rusqlite::Connection::open(&path).unwrap().execute("DELETE FROM resource_claims", []).is_err());
         let mut reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&path), 40);
-        assert_eq!(reopened.read_snapshot(None).unwrap().schema_version, 40);
+        assert_eq!(user_version(&path), 41);
+        assert_eq!(reopened.read_snapshot(None).unwrap().schema_version, 41);
     }
 
     struct Spec {

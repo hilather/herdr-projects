@@ -1032,14 +1032,14 @@ mod tests {
     fn create_ends_at_40_and_upgrade_from_39_reaches_40() {
         let fresh = tempfile::tempdir().unwrap();
         let created = SqliteStore::create(&fresh.path().join("state.db")).unwrap();
-        assert_eq!(user_version(&created.connection), 40);
+        assert_eq!(user_version(&created.connection), 41);
         assert_eq!(
             created
                 .connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            40
+            41
         );
         for table in [
             "barrier_revisions",
@@ -1093,7 +1093,7 @@ mod tests {
             .unwrap();
         db.connection
             .execute_batch(
-                "DROP TRIGGER IF EXISTS barrier_stale_briefs_no_update; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_delete; DROP TRIGGER IF EXISTS barrier_members_no_update; DROP TRIGGER IF EXISTS barrier_members_no_delete; DROP TRIGGER IF EXISTS barrier_revisions_no_membership_update; DROP TABLE IF EXISTS barrier_stale_briefs; DROP TABLE IF EXISTS barrier_members; DROP TABLE IF EXISTS barrier_revisions; UPDATE store_meta SET schema_version=39; PRAGMA user_version=39;",
+                "DROP INDEX IF EXISTS attempts_retained_by_id; DROP TABLE IF EXISTS active_work_index; DROP TABLE IF EXISTS active_work_meta; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_update; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_delete; DROP TRIGGER IF EXISTS barrier_members_no_update; DROP TRIGGER IF EXISTS barrier_members_no_delete; DROP TRIGGER IF EXISTS barrier_revisions_no_membership_update; DROP TABLE IF EXISTS barrier_stale_briefs; DROP TABLE IF EXISTS barrier_members; DROP TABLE IF EXISTS barrier_revisions; UPDATE store_meta SET schema_version=39; PRAGMA user_version=39;",
             )
             .unwrap();
         drop(db);
@@ -1110,7 +1110,7 @@ mod tests {
             })
             .unwrap();
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 40);
+        assert_eq!(user_version(&db.connection), 41);
         assert_eq!(
             db.connection
                 .query_row("SELECT title FROM tasks WHERE id='kept'", [], |row| row
@@ -1122,7 +1122,7 @@ mod tests {
         );
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 40);
+        assert_eq!(user_version(&reopened.connection), 41);
     }
 
     #[test]

@@ -21,25 +21,32 @@ fn pane_state(identity:&herdr_projects::domain::RuntimeIdentity,state:&Result<(V
     (State::Present,agents.len()==1)
 }
 
-pub fn collect(ctx:&Ctx,project:&Path)->Result<ObservationBatch> {collect_with_snapshot(ctx,||runtime::snapshot(project))}
+pub fn collect(ctx:&Ctx,project:&Path)->Result<ObservationBatch> {collect_limited(ctx,project,None,None)}
 pub fn collect_controlled(ctx:&Ctx,project:&Path,control:&herdr_projects::store::controlled::ReadControl)->Result<ObservationBatch> {
-    collect_with_snapshot(ctx,||runtime::snapshot_controlled(project,control))
+    collect_limited(ctx,project,Some(control),None)
 }
-fn collect_with_snapshot(ctx:&Ctx,read:impl Fn()->Result<herdr_projects::domain::Snapshot>)->Result<ObservationBatch> {
-    let snapshot=read()?;
-    ensure!(snapshot.schema_version>=6,"upgrade-store is required for reconciliation observations");
-    ensure!(snapshot.runtime_bindings.len()<=128,"more than 128 runtime bindings; collector refuses an incomplete batch");
+fn map_store(error:herdr_projects::store::StoreError)->anyhow::Error {
+    if matches!(error,herdr_projects::store::StoreError::UnsupportedSchema(_)) {anyhow::anyhow!("upgrade-store is required for reconciliation observations")} else {error.into()}
+}
+fn collect_limited(ctx:&Ctx,project:&Path,control:Option<&herdr_projects::store::controlled::ReadControl>,max_pages:Option<u32>)->Result<ObservationBatch> {
+    let run=match control {
+        Some(control)=>migration::open_active_controlled(project,control.clone())?.reconcile_active_work(max_pages).map_err(map_store)?,
+        None=>migration::open_active(project)?.reconcile_active_work(max_pages).map_err(map_store)?,
+    };
+    ensure!(run.coverage==herdr_projects::store::ActiveCoverage::Complete,"active inventory coverage incomplete; capacity retained");
+    let head=run.head;
     let config=std::path::absolute(ctx.config_dir.join("config.toml"))?;
     let config=migration::config_reference(&config)?;
     let started=jiff::Timestamp::now().as_millisecond();
-    let needs_herdr=snapshot.runtime_bindings.iter().any(|b|!b.identity.pane_id.is_empty());
+    let needs_herdr=run.items.iter().any(|item|!item.binding.identity.pane_id.is_empty());
     let supported=!needs_herdr||herdr::version(&ctx.env.herdr_bin(),ctx.runner).is_ok_and(|v|v>=herdr::MIN_VERSION);
     let mut sessions:BTreeMap<(String,String),Result<(Vec<Pane>,Vec<Agent>),String>>=BTreeMap::new();
     let mut session_ids=BTreeMap::new();
     let mut worktrees:BTreeMap<String,Option<Vec<(String,String)>>>=BTreeMap::new();
     let mut common_dirs:BTreeMap<String,Option<std::path::PathBuf>>=BTreeMap::new();
     let mut observations=Vec::new();
-    for binding in &snapshot.runtime_bindings {
+    for item in &run.items {
+        let binding=&item.binding;
         let identity=&binding.identity;
         let (mut pane,mut agent_present)=if identity.pane_id.is_empty(){(State::Unrecorded,false)}
         else if !supported||!Path::new(&identity.socket).is_absolute(){(State::Unknown,false)}
@@ -81,14 +88,18 @@ fn collect_with_snapshot(ctx:&Ctx,read:impl Fn()->Result<herdr_projects::domain:
             if worktree_before.is_some()&&worktree_before==after&&common.is_some()&&common_dirs.get(&identity.repo)==Some(&common)&&top.as_deref()==Some(identity.worktree_path.as_str()) {worktree_identity=after;}else{worktree=State::Unknown;}
         }
         let mut agent_identity=if agent_present {sessions.get(&(identity.socket.clone(),identity.machine.clone())).and_then(|s|s.as_ref().ok()).and_then(|(_,agents)|agents.iter().find(|a|a.pane_id==identity.pane_id)).map(|a|herdr_projects::domain::AgentIdentity{kind:a.agent.clone(),name:a.name.clone()})}else{None};
-        if let Some(owned)=snapshot.ownership.iter().find(|o|o.binding==binding.id&&o.binding_revision==binding.revision) {
+        if let Some(owned)=item.ownership.as_ref().filter(|o|o.binding==binding.id&&o.binding_revision==binding.revision) {
             if owned.session!=session_identity||owned.agent!=agent_identity {pane=State::Mismatch;agent_present=false;agent_identity=None;}
         }
-        observations.push(RuntimeObservation{binding:binding.id.clone(),binding_revision:binding.revision,task_revision:binding.task.as_ref().and_then(|id|snapshot.tasks.iter().find(|t|&t.id==id).map(|t|t.revision)),observed_unix_ms:started,pane,worktree,agent_present,collector:"herdr-git-v2".into(),config_digest:config.digest.clone(),diagnostic:"Observation only: pane absence/idle is not termination, worktree identity is not preservation, and remote worktrees remain unverified. No ownership, capacity release or dispatch authorized.".into(),session_identity,worktree_identity,agent_identity});
+        observations.push(RuntimeObservation{binding:binding.id.clone(),binding_revision:binding.revision,task_revision:item.task_revision,observed_unix_ms:started,pane,worktree,agent_present,collector:"herdr-git-v2".into(),config_digest:config.digest.clone(),diagnostic:"Observation only: pane absence/idle is not termination, worktree identity is not preservation, and remote worktrees remain unverified. No ownership, capacity release or dispatch authorized.".into(),session_identity,worktree_identity,agent_identity});
     }
     ensure!(migration::config_reference(Path::new(&config.path))?==config,"config changed during observation; retry");
-    ensure!(read()?.head==snapshot.head,"project changed during observation; retry");
-    Ok(ObservationBatch{expected_head:snapshot.head,observations,dispatch_allowed:false,recorded_head:None})
+    let after=match control {
+        Some(control)=>migration::open_active_controlled(project,control.clone())?.current_head().map_err(map_store)?,
+        None=>migration::open_active(project)?.current_head().map_err(map_store)?,
+    };
+    ensure!(after==head,"project changed during observation; retry");
+    Ok(ObservationBatch{expected_head:head,observations,dispatch_allowed:false,recorded_head:None})
 }
 
 fn parse_worktrees(text:&str)->Option<Vec<(String,String)>> {

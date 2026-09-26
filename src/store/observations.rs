@@ -22,13 +22,28 @@ impl SqliteStore {
     /// Commit a complete collector batch against the exact state it observed.
     /// No external commands run here and no capacity/lifecycle state is changed.
     pub fn record_observations(&mut self,expected_head:u64,observations:&[RuntimeObservation])->Result<u64> {
-        if observations.len()>128 {return Err(StoreError::Invalid("observation batch exceeds 128 records".into()));}
         let mut seen=std::collections::BTreeSet::new();
         for observation in observations {observation.validate().map_err(StoreError::Invalid)?;if !seen.insert(&observation.binding){return Err(StoreError::Conflict);}}
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;check_schema(&tx)?;
         if head(&tx)?!=expected_head{return Err(StoreError::Conflict);}
-        let bindings=runtime::read_all(&tx)?;
-        if bindings.len()!=observations.len(){return Err(StoreError::Conflict);}
+        let schema:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
+        // Schema 41 records the active inventory. A retired binding is not a hole in that inventory,
+        // and a complete active batch may be larger than the old 128-binding refusal.
+        let bindings=if schema>=41 {
+            super::active_work::sync_projection(&tx)?;
+            let mut indexed=Vec::new();
+            let mut stmt=tx.prepare("SELECT binding_id FROM active_work_index ORDER BY ordinal")?;
+            let mut rows=stmt.query([])?;
+            while let Some(row)=rows.next()? {indexed.push(row.get::<_,String>(0)?);}
+            drop(rows);drop(stmt);
+            if indexed.len()!=observations.len()||indexed.iter().any(|id|!seen.contains(id)) {return Err(StoreError::Conflict);}
+            super::active_work::recorded_bindings(&tx,&indexed)?
+        } else {
+            if observations.len()>128 {return Err(StoreError::Invalid("observation batch exceeds 128 records".into()));}
+            let bindings=runtime::read_all(&tx)?;
+            if bindings.len()!=observations.len(){return Err(StoreError::Conflict);}
+            bindings
+        };
         let tasks=read_tasks(&tx)?.into_iter().map(|t|(t.id,t.revision)).collect::<std::collections::BTreeMap<_,_>>();
         for observation in observations {
             let binding=bindings.iter().find(|b|b.id==observation.binding).ok_or(StoreError::Conflict)?;

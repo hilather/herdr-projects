@@ -19,9 +19,10 @@ bounded Git porcelain output. Truncated/contradictory output is unknown; remote
 worktrees remain unknown. Local presence additionally requires matching Git common-directory and top-level
 paths and a stable directory incarnation; prunable registrations remain unknown.
 These checks identify a registration, not preservation
-or a tested commit. At most 128 bindings, 16 session endpoints and 16 repositories
-are queried per batch. Excess binding counts refuse an incomplete collection;
-excess endpoint/repository queries produce explicit unknown observations.
+or a tested commit. Active bindings are read in pages of 64. A page that does not
+reach complete coverage is incomplete and cannot release capacity. At most 16
+session endpoints and 16 repositories are queried per batch; excess endpoint or
+repository queries produce explicit unknown observations.
 
 Config fingerprints and the project head are rechecked after collection. Persistence
 requires complete binding coverage, rejects stale revisions or older timestamps,
