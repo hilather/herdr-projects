@@ -80,69 +80,6 @@ fn checkpoint_header(checkpoint_id: &str, kind: &str, snapshot_id: &str, session
     format!("Checkpoint {checkpoint_id} kind={kind} snapshot={snapshot_id} through_seq={through}. Session {session}. Continue with `context PROJECT --session {session}`. Acknowledge with `context PROJECT --session {session} --ack {checkpoint_id}`.\n\n")
 }
 
-/// Mandatory lines, counts, and blockers stay whole. Task changes are a prefix
-/// ordered by sequence. Cost grows with that prefix, so the first overflow ends
-/// the scan. A page that fits every change is bound to `head`.
-fn fit_delta_page<F: Fn(u64) -> u64>(
-    head: u64, from_seq: u64, budget: u64, constraints: &str, blocker_text: &str, snapshot: &Snapshot, header_chars: F,
-) -> Result<(String, u64)> {
-    let changes = changed_since(snapshot, from_seq);
-    let counts = delta_counts(snapshot, from_seq);
-    let prefix = format!("Runtime owner: SQLite; event head {head}. Checkpoint kind=delta from_seq={from_seq} through_seq=");
-    let mut tail = String::from(".\n\n");
-    tail.push_str(constraints);
-    tail.push('\n');
-    tail.push_str(&counts);
-    tail.push('\n');
-    tail.push_str(blocker_text);
-    tail.push_str("\n## Changed tasks\n");
-    let prefix_chars = prefix.chars().count() as u64;
-    let tail_chars = tail.chars().count() as u64;
-    let none = "(none)\n";
-    let none_chars = none.chars().count() as u64;
-    let lines: Vec<String> = changes.iter().map(|(_, task)| task_change_line(task)).collect();
-    let line_chars: Vec<u64> = lines.iter().map(|line| line.chars().count() as u64).collect();
-    let size = |included: usize, through: u64, lines_sum: u64| -> u64 {
-        let extra = if included == 0 { none_chars } else { 0 };
-        header_chars(through) + prefix_chars + through.to_string().chars().count() as u64 + tail_chars + lines_sum + extra
-    };
-    let mut best: Option<(usize, u64)> = None;
-    if changes.is_empty() {
-        let count = size(0, head, 0);
-        if count <= budget { best = Some((0, head)); }
-    } else {
-        let mut sum = 0u64;
-        for included in 1..=changes.len() {
-            sum += line_chars[included - 1];
-            let seq = changes[included - 1].0;
-            let through = if included == changes.len() { head } else { seq };
-            if size(included, through, sum) <= budget {
-                best = Some((included, through));
-                continue;
-            }
-            if included == changes.len() && seq < head && size(included, seq, sum) <= budget {
-                best = Some((included, seq));
-            }
-            break;
-        }
-    }
-    let Some((included, through)) = best else {
-        let floor = size(0, head, 0);
-        let needed = if floor > budget || changes.is_empty() { floor } else { size(1, changes[0].0, line_chars[0]) };
-        ensure!(needed <= budget, "required {needed} budget {budget}");
-        return Err(anyhow::anyhow!("required {needed} budget {budget}"));
-    };
-    let mut body = prefix;
-    body.push_str(&through.to_string());
-    body.push_str(&tail);
-    if included == 0 {
-        body.push_str(none);
-    } else {
-        for line in lines.iter().take(included) { body.push_str(line); }
-    }
-    Ok((body, through))
-}
-
 fn base_context(project: &Path) -> Result<(String, u64, Vec<String>, crate::domain::Snapshot)> {
     let snapshot = crate::runtime::snapshot(project)?;
     let (text, head, unseen) = crate::runtime::context_from_snapshot(project, &snapshot)?;
@@ -220,9 +157,53 @@ pub fn coordinator_context(project: &Path, herdr_session: &str, profile: &Checkp
         body.push_str(&blocker_text);
         (body, head)
     } else {
-        fit_delta_page(head, from_seq, profile.budget_chars, &constraints, &blocker_text, &snapshot, |through| {
-            checkpoint_header(&checkpoint_id, kind, snap.id.as_str(), herdr_session, through).chars().count() as u64
-        })?
+        // Task changes stay in sequence order. The first prefix that does not fit
+        // ends the scan. A page that fits every change uses `head` unless only the
+        // last included task sequence still fits.
+        let changes = changed_since(&snapshot, from_seq);
+        let counts = delta_counts(&snapshot, from_seq);
+        let render = |included: usize, through: u64| {
+            let mut body = format!("Runtime owner: SQLite; event head {head}. Checkpoint kind=delta from_seq={from_seq} through_seq={through}.\n\n");
+            body.push_str(&constraints);
+            body.push('\n');
+            body.push_str(&counts);
+            body.push('\n');
+            body.push_str(&blocker_text);
+            body.push_str("\n## Changed tasks\n");
+            if included == 0 {
+                body.push_str("(none)\n");
+            } else {
+                for (_, task) in changes.iter().take(included) { body.push_str(&task_change_line(task)); }
+            }
+            body
+        };
+        let page_chars = |included: usize, through: u64| -> u64 {
+            let body = render(included, through);
+            (checkpoint_header(&checkpoint_id, kind, snap.id.as_str(), herdr_session, through).chars().count() + body.chars().count()) as u64
+        };
+        let mut best: Option<(usize, u64)> = None;
+        if changes.is_empty() {
+            if page_chars(0, head) <= profile.budget_chars { best = Some((0, head)); }
+        } else {
+            for included in 1..=changes.len() {
+                let seq = changes[included - 1].0;
+                let through = if included == changes.len() { head } else { seq };
+                if page_chars(included, through) <= profile.budget_chars {
+                    best = Some((included, through));
+                    continue;
+                }
+                if included == changes.len() && seq < head && page_chars(included, seq) <= profile.budget_chars {
+                    best = Some((included, seq));
+                }
+                break;
+            }
+        }
+        let Some((included, through)) = best else {
+            let floor = page_chars(0, head);
+            let needed = if floor > profile.budget_chars || changes.is_empty() { floor } else { page_chars(1, changes[0].0) };
+            return Err(anyhow::anyhow!("required {needed} budget {}", profile.budget_chars));
+        };
+        (render(included, through), through)
     };
     let header = checkpoint_header(&checkpoint_id, kind, snap.id.as_str(), herdr_session, through);
     let text = format!("{header}{body}");
