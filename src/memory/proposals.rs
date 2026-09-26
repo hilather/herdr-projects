@@ -274,6 +274,26 @@ mod tests {
             "INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?2,?3,?4,?5,'sha1',?6,?6,'linux-unshare-user-pid-mount-v1',0,1)",
             rusqlite::params![result_id, run_id, "22".repeat(32), commit, tree, digest.as_str()],
         ).unwrap();
+        raw.execute(
+            "INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,'/tmp/project','verify-rejected',?2,?3,'task-api',1,?2,'att-api-2','policy-1',?2,?4,?5,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','rejected','checks_failed',1,NULL,0,0,1)",
+            rusqlite::params!["ff".repeat(32), digest.as_str(), "22".repeat(32), commit, tree],
+        ).unwrap();
+        raw.execute(
+            "INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?2,?3,?4,?5,'sha1',?6,?6,'linux-unshare-user-pid-mount-v1',0,1)",
+            rusqlite::params!["ee".repeat(32), "ff".repeat(32), "22".repeat(32), commit, tree, digest.as_str()],
+        ).unwrap();
+        raw.execute(
+            "INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,memory_snapshot_id,artifact_manifest,claimed_checks,created_unix_ms) VALUES(?1,'/tmp/project','submit-mismatch',?2,'{}','task-api',1,?2,'att-api-2',?3,?4,?5,'sha1',NULL,'[]','[]',1)",
+            rusqlite::params!["33".repeat(32), digest.as_str(), repository, "b".repeat(40), "d".repeat(40)],
+        ).unwrap();
+        raw.execute(
+            "INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,'/tmp/project','verify-mismatch',?2,?3,'task-api',1,?2,'att-api-2','policy-1',?2,?4,?5,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?2,0,0,1)",
+            rusqlite::params!["44".repeat(32), digest.as_str(), "33".repeat(32), commit, tree],
+        ).unwrap();
+        raw.execute(
+            "INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?2,?3,?4,?5,'sha1',?6,?6,'linux-unshare-user-pid-mount-v1',0,1)",
+            rusqlite::params!["55".repeat(32), "44".repeat(32), "33".repeat(32), commit, tree, digest.as_str()],
+        ).unwrap();
     }
     fn claim(doc: &mut ProposalDocument, id: &str, validation: Option<&str>) {
         doc.proposal_id = id.into();
@@ -296,6 +316,16 @@ mod tests {
         let mut run_only = doc(&snap, body.as_str(), "att-api-2", None);
         claim(&mut run_only, "mp-run", Some(&run));
         let rejected = memory.propose(&serde_json::to_vec(&run_only).unwrap(), 1_000).unwrap();
+        assert_eq!(rejected.validation, "rejected");
+        assert!(rejected.reason.contains("not a stored verified result"), "{}", rejected.reason);
+        let mut rejected_run = doc(&snap, body.as_str(), "att-api-2", None);
+        claim(&mut rejected_run, "mp-rejected-run", Some(&"ee".repeat(32)));
+        let rejected = memory.propose(&serde_json::to_vec(&rejected_run).unwrap(), 1_000).unwrap();
+        assert_eq!(rejected.validation, "rejected");
+        assert!(rejected.reason.contains("not a stored verified result"), "{}", rejected.reason);
+        let mut wrong_candidate = doc(&snap, body.as_str(), "att-api-2", None);
+        claim(&mut wrong_candidate, "mp-candidate", Some(&"55".repeat(32)));
+        let rejected = memory.propose(&serde_json::to_vec(&wrong_candidate).unwrap(), 1_000).unwrap();
         assert_eq!(rejected.validation, "rejected");
         assert!(rejected.reason.contains("not a stored verified result"), "{}", rejected.reason);
         let mut other_commit = doc(&snap, body.as_str(), "att-api-2", None);

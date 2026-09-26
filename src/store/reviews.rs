@@ -1,6 +1,6 @@
 //! Immutable review decisions and atomic promotion. Delivery ack is T06.3.
 use super::*;
-use crate::domain::{DelegationAction, PreparedDelegation, PromotionReceipt, ProposalDocument, ReviewDecision};
+use crate::domain::{DelegationAction, MemoryKind, MemoryRecordId, NewRevision, ObjectId, PreparedDelegation, PromotionReceipt, ProposalDocument, ReviewDecision};
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 
@@ -43,7 +43,7 @@ fn load_review_grant(db: &Connection, grant_id: &str, now: i64) -> Result<Prepar
     Ok(parsed)
 }
 fn reviewer_owns_attempt(db: &Connection, attempt_id: &str, task_id: &str, subject: &str) -> Result<bool> {
-    // Reservation is the worker identity stored for that attempt.
+    // `worker:<attempt_id>` is the reservation slot name, not the grant subject.
     let reservation: Option<String> = db.query_row(
         "SELECT reservation FROM attempts WHERE id=?1 AND task_id=?2",
         params![attempt_id, task_id],
@@ -75,6 +75,7 @@ fn deny_reviewer_proposal(db: &Connection, attempt_id: &str, task_id: &str, payl
         return Err(invalid("reviewer cannot approve their own attempt"));
     }
     if proposal_targets_hard(db, &doc)? { return Err(invalid("reviewer cannot approve a hard rule")); }
+    // Review scope is the repository path; the proposal does not carry a git ref.
     if doc.repository.as_ref().is_some_and(|repo| repo.dirty || !grant.repositories.iter().any(|scope| scope.repository == repo.id)) {
         return Err(invalid("delegation grant is for the wrong repo"));
     }
@@ -135,7 +136,10 @@ impl SqliteStore {
              JOIN verification_runs v ON v.run_id = r.run_id
              JOIN result_submissions s ON s.submission_id = r.submission_id
              JOIN task_contracts c ON c.task_id = v.task_id AND c.contract_revision = v.contract_revision
-             WHERE r.result_id=?1 AND s.repository=c.repository AND r.commit_oid=v.commit_oid AND r.tree_oid=v.tree_oid",
+             WHERE r.result_id=?1 AND r.submission_id=v.submission_id AND v.state='accepted'
+               AND s.candidate_oid=r.commit_oid AND s.repository=c.repository
+               AND r.commit_oid=v.commit_oid AND r.tree_oid=v.tree_oid
+               AND r.object_format=v.object_format AND s.object_format=r.object_format",
             [result_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).optional().map_err(StoreError::from)
@@ -153,11 +157,13 @@ impl SqliteStore {
              WHERE p.review_state='validated' AND json_valid(p.payload)
                AND EXISTS (SELECT 1 FROM attempts a WHERE a.id=p.attempt_id AND a.task_id=p.task_id)
                AND p.attempt_id <> ?1
+               -- worker:<attempt_id> is the reservation slot name, not the grant subject.
                AND NOT EXISTS (
                  SELECT 1 FROM attempts a
                  WHERE a.id=p.attempt_id AND (a.reservation=?1 OR a.reservation='worker:' || ?1)
                )
                AND COALESCE(json_extract(p.payload, '$.repository.dirty'), 0)=0
+               -- Review scope is the repository path; the proposal does not carry a git ref.
                AND (
                  json_extract(p.payload, '$.repository.id') IS NULL
                  OR EXISTS (SELECT 1 FROM json_each(?2) repo WHERE repo.value=json_extract(p.payload, '$.repository.id'))
@@ -261,6 +267,8 @@ impl SqliteStore {
         }
         let reviewed: serde_json::Value = serde_json::from_str(&decision.reviewed_heads)
             .map_err(|_| invalid("invalid reviewed state"))?;
+        let mut bound_changes: Option<Vec<NewRevision>> = None;
+        let mut bound_invalidations: Option<Vec<(String, String, String, String)>> = None;
         let authorization = match authority {
             PromotionAuthority::Owner(Some(auth)) => {
                 let covered:MemoryReviewAuthorization=serde_json::from_value(reviewed["authorization"].clone()).map_err(|_|invalid("review authorization missing"))?;
@@ -285,19 +293,89 @@ impl SqliteStore {
                     return Err(invalid("reviewer grant is required"));
                 }
                 let grant = load_review_grant(&tx, grant_id, now_unix_ms)?;
-                let (attempt_id, task_id, payload, review_state): (String, String, String, String) = tx.query_row(
-                    "SELECT attempt_id, task_id, payload, review_state FROM memory_proposals WHERE id=?1",
+                let (attempt_id, task_id, payload_digest, payload, review_state): (String, String, String, String, String) = tx.query_row(
+                    "SELECT attempt_id, task_id, payload_digest, payload, review_state FROM memory_proposals WHERE id=?1",
                     [proposal_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
                 )?;
                 if review_state != "validated" { return Err(invalid("proposal is not validated")); }
-                deny_reviewer_proposal(&tx, &attempt_id, &task_id, &payload, &grant)?;
-                if changes.iter().any(|next| matches!(next.kind, crate::domain::MemoryKind::Constraint | crate::domain::MemoryKind::HardMemory)) {
-                    return Err(invalid("reviewer cannot approve a hard rule"));
+                if payload_digest != decision.payload_digest {
+                    return Err(invalid("review does not cover current proposal digest"));
                 }
+                deny_reviewer_proposal(&tx, &attempt_id, &task_id, &payload, &grant)?;
+                let doc: ProposalDocument = serde_json::from_str(&payload).map_err(|_| invalid("stored proposal is unreadable"))?;
+                if doc.changes.is_empty() || changes.is_empty() {
+                    return Err(invalid("promotion requires the stored proposal changes"));
+                }
+                let prov_bytes = serde_json::json!({"proposal": proposal_id, "decision": &decision.id}).to_string();
+                let prov = ObjectId::from_hex(format!("{:x}", Sha256::digest(prov_bytes.as_bytes()))).map_err(|error| invalid(&error))?;
+                super::objects::require_available(&tx, prov.as_str())?;
+                let mut derived = Vec::new();
+                let mut derived_inv = Vec::new();
+                for change in &doc.changes {
+                    let body = ObjectId::parse(&change.body_object).map_err(|error| invalid(&error))?;
+                    super::objects::require_available(&tx, body.as_str())?;
+                    let existing: Option<(String, i64)> = tx.query_row(
+                        "SELECT id, is_hard FROM memory_records WHERE record_key=?1",
+                        [change.record_key.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    ).optional()?;
+                    let (id, expected) = if let Some((record_id, hard)) = existing {
+                        if hard == 1 { return Err(invalid("reviewer cannot approve a hard rule")); }
+                        let (revision, status): (i64, String) = tx.query_row(
+                            "SELECT revision, status FROM memory_heads WHERE record_id=?1",
+                            [&record_id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        ).optional()?.ok_or_else(|| invalid("promotion head missing"))?;
+                        if status != "active" { return Err(StoreError::Conflict); }
+                        let revision = u64::try_from(revision).map_err(|_| StoreError::Corrupt("memory head revision is corrupt".into()))?;
+                        if change.expected.as_ref().is_some_and(|expected| expected.revision != revision || expected.record_id != record_id) {
+                            return Err(StoreError::Conflict);
+                        }
+                        let id = MemoryRecordId::new(record_id).map_err(|error| invalid(&error))?;
+                        (id, change.expected.as_ref().map(|expected| expected.revision))
+                    } else if change.expected.is_some() {
+                        return Err(invalid("expected base record is missing"));
+                    } else {
+                        let id = MemoryRecordId::new(format!("mem-{:x}", Sha256::digest(change.record_key.as_bytes()))).map_err(|error| invalid(&error))?;
+                        (id, None)
+                    };
+                    let kind = crate::domain::parse_kind(&change.kind).map_err(|error| invalid(&error))?;
+                    if matches!(kind, MemoryKind::Constraint | MemoryKind::HardMemory) {
+                        return Err(invalid("reviewer cannot approve a hard rule"));
+                    }
+                    let mut dependencies = Vec::new();
+                    for dep in &change.based_on {
+                        dependencies.push((MemoryRecordId::new(dep.record_id.clone()).map_err(|error| invalid(&error))?, dep.revision, "based_on".into()));
+                    }
+                    let record_id = id.as_str().to_owned();
+                    derived.push(NewRevision {
+                        id, record_key: change.record_key.clone(), scope_id: "project".into(), kind,
+                        body_hash: body, provenance_hash: prov.clone(), applicability: change.scope.clone(),
+                        dependencies, expected, expiry_unix_ms: None, validity_state: "valid".into(), validity_reason: "promoted".into(),
+                    });
+                    let inv_id = format!("inv-{:x}", Sha256::digest(format!("{proposal_id}:{record_id}").as_bytes()));
+                    derived_inv.push((inv_id, task_id.clone(), record_id, change.impact.clone()));
+                }
+                let matches_proposal = derived.len() == changes.len() && derived_inv.len() == invalidations.len()
+                    && derived.iter().zip(changes).all(|(want, got)| {
+                        want.id == got.id && want.record_key == got.record_key && want.scope_id == got.scope_id && want.kind == got.kind
+                            && want.body_hash == got.body_hash && want.provenance_hash == got.provenance_hash
+                            && want.applicability == got.applicability && want.dependencies == got.dependencies
+                            && want.expected == got.expected && want.expiry_unix_ms == got.expiry_unix_ms
+                            && want.validity_state == got.validity_state && want.validity_reason == got.validity_reason
+                    })
+                    && derived_inv.iter().zip(invalidations).all(|(want, got)| want == got);
+                if !matches_proposal {
+                    return Err(invalid("promotion revisions do not match the stored proposal"));
+                }
+                bound_changes = Some(derived);
+                bound_invalidations = Some(derived_inv);
                 None
             }
         };
+        let changes = bound_changes.as_deref().unwrap_or(changes);
+        let invalidations = bound_invalidations.as_deref().unwrap_or(invalidations);
         let expected = reviewed.get("event_head").and_then(|v| v.as_u64())
             .and_then(|v| v.checked_add(1)).ok_or_else(|| invalid("review event fence missing"))?;
         // Documents without read_set_version 2 stay on the whole-state fence.
@@ -368,6 +446,7 @@ mod tests {
 
     use crate::domain::*;
     use crate::memory::MemoryStore;
+    use sha2::{Digest, Sha256};
 
     fn setup() -> (tempfile::TempDir, MemoryStore, String) {
         let root = tempfile::tempdir().unwrap();
@@ -430,6 +509,32 @@ mod tests {
         })).unwrap();
         let prepared = PreparedDelegation::parse_verified(&bytes).unwrap();
         memory.store.install_delegation(&prepared, 1_000).unwrap()
+    }
+    fn stored_promotion(memory: &mut MemoryStore, decision_id: &str) -> (NewRevision, (String, String, String, String)) {
+        let prov_bytes = serde_json::json!({"proposal": "mp-api-errors-01", "decision": decision_id}).to_string();
+        let prov = memory.ingest_object(prov_bytes.as_bytes()).unwrap();
+        let (_, payload) = memory.store.memory_proposal_payload("mp-api-errors-01").unwrap().unwrap();
+        let doc: ProposalDocument = serde_json::from_str(&payload).unwrap();
+        let change = &doc.changes[0];
+        let body = ObjectId::parse(&change.body_object).unwrap();
+        let id = MemoryRecordId::new(format!("mem-{:x}", Sha256::digest(change.record_key.as_bytes()))).unwrap();
+        let record_id = id.as_str().to_owned();
+        let revision = NewRevision {
+            id,
+            record_key: change.record_key.clone(),
+            scope_id: "project".into(),
+            kind: MemoryKind::Observation,
+            body_hash: body,
+            provenance_hash: prov,
+            applicability: change.scope.clone(),
+            dependencies: vec![],
+            expected: None,
+            expiry_unix_ms: None,
+            validity_state: "valid".into(),
+            validity_reason: "promoted".into(),
+        };
+        let inv_id = format!("inv-{:x}", Sha256::digest(format!("mp-api-errors-01:{record_id}").as_bytes()));
+        (revision, (inv_id, doc.producer.task_id, record_id, change.impact.clone()))
     }
     fn revision(body: &str) -> NewRevision {
         NewRevision {
@@ -509,15 +614,32 @@ mod tests {
         assert_eq!(replay.id, decision.id);
         assert!(memory.store.memory_promotion("mp-api-errors-01").unwrap().is_none());
         assert!(memory.store.memory_record_by_key("api.error-envelope").unwrap().is_none());
-        let invalidations = [("inv-1".into(), "task-api".into(), "mem-errors".into(), "reconcile_before_completion".into())];
-        let first = memory.store.promote_with_reviewer_grant("mp-api-errors-01", &decision, &[revision(&body)], &invalidations, 1_000, &grant).unwrap();
+        let (good, inv) = stored_promotion(&mut memory, &decision.id);
+        let empty = memory.store.promote_with_reviewer_grant("mp-api-errors-01", &decision, &[], &[], 1_000, &grant).unwrap_err();
+        assert!(matches!(empty, StoreError::Invalid(_)), "{empty:?}");
+        let mut wrong_key = good.clone();
+        wrong_key.record_key = "other.key".into();
+        let wrong = memory.store.promote_with_reviewer_grant("mp-api-errors-01", &decision, &[wrong_key], &[inv.clone()], 1_000, &grant).unwrap_err();
+        assert!(matches!(wrong, StoreError::Invalid(_)), "{wrong:?}");
+        let mut wrong_body = good.clone();
+        wrong_body.body_hash = ObjectId::from_hex("ab".repeat(32)).unwrap();
+        let wrong = memory.store.promote_with_reviewer_grant("mp-api-errors-01", &decision, &[wrong_body], &[inv.clone()], 1_000, &grant).unwrap_err();
+        assert!(matches!(wrong, StoreError::Invalid(_)), "{wrong:?}");
+        assert!(memory.store.memory_promotion("mp-api-errors-01").unwrap().is_none());
+        assert!(memory.store.memory_record_by_key("api.error-envelope").unwrap().is_none());
+        assert!(memory.store.memory_record_by_key("other.key").unwrap().is_none());
+        let first = memory.store.promote_with_reviewer_grant("mp-api-errors-01", &decision, &[good.clone()], &[inv.clone()], 1_000, &grant).unwrap();
         assert!(!first.reused);
-        assert_eq!(first.change_ids, vec!["mem-errors:1".to_string()]);
-        let again = memory.store.promote_with_reviewer_grant("mp-api-errors-01", &decision, &[revision(&body)], &invalidations, 1_000, &grant).unwrap();
+        assert_eq!(first.change_ids, vec![format!("{}:1", good.id.as_str())]);
+        let again = memory.store.promote_with_reviewer_grant("mp-api-errors-01", &decision, &[good.clone()], &[inv], 1_000, &grant).unwrap();
         assert!(again.reused);
         assert_eq!(again.sequence, first.sequence);
         let record = memory.store.memory_record_by_key("api.error-envelope").unwrap().unwrap();
+        assert_eq!(record.id, good.id);
         assert_eq!(record.kind, MemoryKind::Observation);
         assert!(!record.is_hard);
+        let stored = memory.store.memory_revision(record.id.as_str(), 1).unwrap().unwrap();
+        assert_eq!(stored.body_hash.as_str(), body);
+        assert_eq!(stored.body_hash, good.body_hash);
     }
 }
