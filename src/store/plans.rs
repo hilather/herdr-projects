@@ -378,6 +378,7 @@ pub struct AcceptanceRework {
 }
 
 struct FeedbackRow {
+    operation_id: String,
     category: String,
     task_id: String,
     reason: String,
@@ -385,13 +386,14 @@ struct FeedbackRow {
 
 fn load_feedback(tx: &Connection, feedback_id: &str) -> Result<Option<FeedbackRow>> {
     tx.query_row(
-        "SELECT category, task_id, reason FROM feedback_items WHERE feedback_id=?1",
+        "SELECT operation_id, category, task_id, reason FROM feedback_items WHERE feedback_id=?1",
         [feedback_id],
         |row| {
             Ok(FeedbackRow {
-                category: row.get(0)?,
-                task_id: row.get(1)?,
-                reason: row.get(2)?,
+                operation_id: row.get(0)?,
+                category: row.get(1)?,
+                task_id: row.get(2)?,
+                reason: row.get(3)?,
             })
         },
     )
@@ -903,11 +905,6 @@ impl SqliteStore {
         if feedback.category != "verifier_rejection" {
             return Err(invalid("acceptance rework requires verifier feedback"));
         }
-        let contract_revision = if contract_changed {
-            Some(installed_rework_revision(&tx, &feedback.task_id)?)
-        } else {
-            None
-        };
         let attempt_id = format!("rework-{}", &feedback_id[..32]);
         let existing: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM attempts WHERE id=?1 AND task_id=?2)",
@@ -915,6 +912,8 @@ impl SqliteStore {
             |row| row.get(0),
         )?;
         if existing {
+            // Replay returns the revision stored with this attempt, not a later install.
+            let contract_revision = stored_rework_contract(&tx, &attempt_id)?;
             let (attempts_consumed, _) = attempt_budget(&tx, &feedback.task_id)?;
             tx.commit()?;
             return Ok(AcceptanceRework {
@@ -923,6 +922,15 @@ impl SqliteStore {
                 contract_revision,
             });
         }
+        let contract_revision = if contract_changed {
+            Some(installed_rework_revision(
+                &tx,
+                &feedback.task_id,
+                &feedback.operation_id,
+            )?)
+        } else {
+            None
+        };
         let (consumed, limit) = attempt_budget(&tx, &feedback.task_id)?;
         if consumed >= limit {
             return Err(invalid("task attempt limit reached"));
@@ -1003,20 +1011,49 @@ fn existing_escalation(
     }))
 }
 
-/// Newer than the stored verification, and only if a signed install already wrote it.
-fn installed_rework_revision(tx: &Connection, task_id: &str) -> Result<i64> {
-    let verified: Option<i64> = tx.query_row(
-        "SELECT max(contract_revision) FROM verification_runs WHERE task_id=?1",
-        [task_id],
-        |row| row.get(0),
-    )?;
-    let floor = verified.unwrap_or(0);
+/// Floor is this feedback's verification run, not the newest run on the task.
+fn installed_rework_revision(tx: &Connection, task_id: &str, operation_id: &str) -> Result<i64> {
+    let floor: Option<i64> = tx
+        .query_row(
+            "SELECT contract_revision FROM verification_runs WHERE run_id=?1 AND task_id=?2",
+            params![operation_id, task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(floor) = floor else {
+        return Err(invalid("acceptance rework has no contract revision"));
+    };
     let revision: Option<i64> = tx.query_row(
         "SELECT max(c.contract_revision) FROM task_contracts c WHERE c.task_id=?1 AND c.contract_revision>?2 AND EXISTS (SELECT 1 FROM events e WHERE e.kind='contract.installed' AND e.entity=c.task_id AND e.revision=c.contract_revision)",
         params![task_id, floor],
         |row| row.get(0),
     )?;
     revision.ok_or_else(|| invalid("acceptance rework has no contract revision"))
+}
+
+fn stored_rework_contract(tx: &Connection, attempt_id: &str) -> Result<Option<i64>> {
+    let payload: Option<String> = tx
+        .query_row(
+            "SELECT payload FROM events WHERE kind='attempt.rework' AND entity=?1 ORDER BY sequence LIMIT 1",
+            [attempt_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(payload) = payload else {
+        return Err(StoreError::Corrupt("rework attempt has no event".into()));
+    };
+    let value: serde_json::Value = serde_json::from_str(&payload)
+        .map_err(|_| StoreError::Corrupt("rework event is invalid".into()))?;
+    match value.get("contract_revision") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(number)) => number
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| StoreError::Corrupt("rework contract revision is invalid".into())),
+        Some(_) => Err(StoreError::Corrupt(
+            "rework contract revision is invalid".into(),
+        )),
+    }
 }
 
 pub fn propose_plan(
@@ -1940,7 +1977,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        let feedback = record_rejection(&mut db, "accept-2", "task");
+        let feedback = record_rejection(&mut db, &"d".repeat(64), "task");
         assert!(matches!(
             db.rework_acceptance(&feedback, true),
             Err(StoreError::Invalid(message)) if message.contains("no contract revision")
@@ -2036,6 +2073,63 @@ mod tests {
             2
         );
         assert_eq!(verification_snapshot(&db.connection), before);
+        db.connection
+            .execute(
+                "INSERT INTO acceptance_policies(task_id,contract_revision,policy_id,body) VALUES('task',2,'policy-1','{\"version\":1}')",
+                [],
+            )
+            .unwrap();
+        db.connection
+            .execute(
+                "INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,?2,'verify-2',?3,?4,'task',2,?3,'attempt-1','policy-1',?5,?6,NULL,'sha1',0,'linux-unshare-user-pid-mount-v1','[\"/usr/bin/true\"]','[]','rejected','checks_failed',1,NULL,1,1,0)",
+                params![
+                    "e".repeat(64),
+                    project_store,
+                    next_digest,
+                    "c".repeat(64),
+                    sha256_hex(br#"{"version":1}"#),
+                    "a".repeat(40)
+                ],
+            )
+            .unwrap();
+        let later_raw = b"contract-v3-installed";
+        let later_digest = sha256_hex(later_raw);
+        db.connection
+            .execute(
+                "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('contract.installed','task',3,1,?1)",
+                [serde_json::json!({"digest": later_digest}).to_string()],
+            )
+            .unwrap();
+        let later_seq: i64 = db
+            .connection
+            .query_row("SELECT max(sequence) FROM events", [], |row| row.get(0))
+            .unwrap();
+        db.connection
+            .execute(
+                "INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq) VALUES('task',3,NULL,?1,0,'/tmp/repo',?2,'sha1',NULL,'verify_only',?3,?4,?5)",
+                params![project_store, "b".repeat(40), later_raw, later_digest, later_seq],
+            )
+            .unwrap();
+        let replay = db.rework_acceptance(&feedback, true).unwrap();
+        assert_eq!(replay.attempt_id, rework.attempt_id);
+        assert_eq!(replay.contract_revision, Some(2));
+        assert_eq!(count(&db.connection, "SELECT count(*) FROM attempts"), 2);
+        assert_eq!(
+            count(
+                &db.connection,
+                "SELECT count(*) FROM attempts WHERE termination_observed=0"
+            ),
+            1
+        );
+        let original: (String, i64) = db
+            .connection
+            .query_row(
+                "SELECT state, contract_revision FROM verification_runs WHERE run_id=?1",
+                ["d".repeat(64)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(original, ("rejected".into(), 1));
     }
 
     #[test]
