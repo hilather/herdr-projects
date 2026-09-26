@@ -559,9 +559,14 @@ mod tests {
         let production = source.split("mod tests").next().unwrap();
         assert!(!production.contains("verify_signature"));
         assert!(!production.contains("task_contracts"));
+        assert!(!production.contains("contract_scope_paths"));
+        assert!(!production.contains("contract_named_resources"));
+        assert!(!production.contains("install_contract"));
         assert!(!production.contains("reserve_"));
         let sql = include_str!("../../migrations/0031_plan_revisions.sql");
         assert!(!sql.contains("task_contracts"));
+        assert!(!sql.contains("contract_scope_paths"));
+        assert!(!sql.contains("contract_named_resources"));
         assert!(!sql.contains("verify_signature"));
         let cli = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli.rs"),
@@ -579,20 +584,68 @@ mod tests {
         assert!(!arm.contains("import_contract"));
         assert!(!arm.contains("reserve"));
         assert!(!arm.contains("task_contracts"));
+        assert!(!arm.contains("contract_scope_paths"));
+        assert!(!arm.contains("contract_named_resources"));
+    }
+
+    #[test]
+    fn plan_propose_leaves_scope_tables_empty() {
+        let (_temp, mut db) = fixture();
+        assert!(table_exists(&db.connection, "contract_scope_paths"));
+        assert!(table_exists(&db.connection, "contract_named_resources"));
+        let paths = count(&db.connection, "SELECT count(*) FROM contract_scope_paths");
+        let named = count(
+            &db.connection,
+            "SELECT count(*) FROM contract_named_resources",
+        );
+        let contracts = count(&db.connection, "SELECT count(*) FROM task_contracts");
+        let attempts = count(&db.connection, "SELECT count(*) FROM attempts");
+        let stored = db
+            .apply_plan_proposal(
+                &proposal(&one("alpha", "scope src/lib.rs schema lockfile", "")),
+                0,
+                "scope-key",
+            )
+            .unwrap();
+        assert!(!stored.replayed);
+        assert_eq!(stored.plan_revision, 1);
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM contract_scope_paths"),
+            paths
+        );
+        assert_eq!(
+            count(
+                &db.connection,
+                "SELECT count(*) FROM contract_named_resources"
+            ),
+            named
+        );
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM task_contracts"),
+            contracts
+        );
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM attempts"),
+            attempts
+        );
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM plan_revisions"),
+            1
+        );
     }
 
     #[test]
     fn upgrade_v1_from_30_to_31_and_import_requires_current_schema() {
         let fresh = tempfile::tempdir().unwrap();
         let mut created = SqliteStore::create(&fresh.path().join("state.db")).unwrap();
-        assert_eq!(user_version(&created.connection), 31);
+        assert_eq!(user_version(&created.connection), 32);
         assert_eq!(
             created
                 .connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            31
+            32
         );
         assert!(table_exists(&created.connection, "plan_proposals"));
         assert!(table_exists(&created.connection, "plan_revisions"));
@@ -605,7 +658,7 @@ mod tests {
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
         raw.execute_batch(
-            "DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; UPDATE store_meta SET schema_version=30; PRAGMA user_version=30;",
+            "DROP TABLE IF EXISTS contract_named_resources; DROP TABLE IF EXISTS contract_scope_paths; DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; UPDATE store_meta SET schema_version=30; PRAGMA user_version=30;",
         )
         .unwrap();
         drop(raw);
@@ -618,20 +671,20 @@ mod tests {
         ));
         assert_eq!(user_version(&db.connection), 30);
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 31);
+        assert_eq!(user_version(&db.connection), 32);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            31
+            32
         );
         assert!(table_exists(&db.connection, "plan_proposals"));
         assert!(table_exists(&db.connection, "plan_revisions"));
         check_schema(&db.connection).unwrap();
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 31);
+        assert_eq!(user_version(&reopened.connection), 32);
         assert!(table_exists(&reopened.connection, "plan_revisions"));
     }
 }

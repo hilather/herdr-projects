@@ -560,7 +560,7 @@ enum FeedbackCommand {
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
 enum PlanCommand {
-    /// Store one unsigned proposal. Does not launch, verify a signature, or install a task contract.
+    /// Store one unsigned proposal. Does not launch, verify a signature, install a task contract, or write scope.
     Propose {
         #[arg(value_name = "PROJECT")] slug: String,
         #[arg(long)] input_file: PathBuf,

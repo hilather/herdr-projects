@@ -526,6 +526,7 @@ mod tests {
             "version":1,"project_store":"/tmp/project/state.db","expected_head":1,"task_id":"task","contract_revision":1,
             "deliverable":"ship","non_goals":"no launch","acceptance_policies":[{"id":"builds","text":"tests pass"}],
             "repository":"/tmp/project/repo","base_oid":"ab".repeat(32),"object_format":"sha256","dependencies":[],
+            "scope":{"paths":[{"path":"src/lib.rs","access":"write"}],"named_resources":[{"name":"schema","access":"write"}]},
             "capability_flags":[],"profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_only",
             "authority":policy.reference().unwrap()
         })).unwrap();
@@ -539,6 +540,10 @@ mod tests {
         let signature=sign(&key,&original,CONTRACT_SIGNATURE_NAMESPACE);
         let prepared=prepare_contract(&policy,&original,&signature,&RealRunner).unwrap();
         assert_eq!(prepared.raw,original);
+        assert_eq!(prepared.scope_paths.len(),1);
+        assert_eq!(prepared.scope_paths[0].path,"src/lib.rs");
+        assert_eq!(prepared.named_resources.len(),1);
+        assert_eq!(prepared.named_resources[0].name.as_str(),"schema");
         let reserialized=serde_json::to_vec(&serde_json::from_slice::<serde_json::Value>(&original).unwrap()).unwrap();
         assert_ne!(reserialized,original);
         assert!(prepare_contract(&policy,&reserialized,&signature,&RealRunner).is_err());
@@ -567,7 +572,8 @@ mod tests {
             "version":1,"project_store":store.display().to_string(),"expected_head":head,"task_id":"task","contract_revision":1,
             "deliverable":"ship","non_goals":"no launch","acceptance_policies":[{"id":"builds","text":"tests pass"}],
             "repository":repo.canonicalize().unwrap().display().to_string(),"base_oid":"ab".repeat(32),"object_format":"sha256",
-            "dependencies":[],"capability_flags":[],"profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1",
+            "dependencies":[],"scope":{"paths":[{"path":"src/lib.rs","access":"write"},{"path":"migrations/","access":"read"}],"named_resources":[{"name":"schema","access":"write"},{"name":"generated","access":"read"}]},
+            "capability_flags":[],"profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1",
             "route":"verify_only","authority":owner.reference().unwrap()
         })).unwrap();
         document.push(b'\n');
@@ -584,7 +590,23 @@ mod tests {
         assert_eq!(denied.len(),2);
         assert!(denied.iter().any(|denial|denial.command=="put"&&denial.reason_code=="signature_failed"));
         fs::write(&sig,sign(&key,&document,CONTRACT_SIGNATURE_NAMESPACE)).unwrap();
-        assert!(!import_contract(&project,&path,&sig).unwrap().replayed);
+        let installed=import_contract(&project,&path,&sig).unwrap();
+        assert!(!installed.replayed);
+        assert_eq!(installed.contract_revision,1);
+        let raw=rusqlite::Connection::open(&store).unwrap();
+        let revisions:i64=raw.query_row("SELECT count(*) FROM task_contracts",[],|row|row.get(0)).unwrap();
+        assert_eq!(revisions,1);
+        let stored:Vec<u8>=raw.query_row("SELECT raw_bytes FROM task_contracts",[],|row|row.get(0)).unwrap();
+        assert_eq!(stored,document);
+        let mut path_stmt=raw.prepare("SELECT path,access,certainty FROM contract_scope_paths ORDER BY ordinal").unwrap();
+        let paths:Vec<(String,String,String)>=path_stmt.query_map([],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap().collect::<std::result::Result<Vec<_>,_>>().unwrap();
+        assert_eq!(paths,vec![("src/lib.rs".into(),"write".into(),"exact".into()),("migrations/".into(),"read".into(),"uncertain".into())]);
+        drop(path_stmt);
+        let mut named_stmt=raw.prepare("SELECT name,access FROM contract_named_resources ORDER BY name").unwrap();
+        let named:Vec<(String,String)>=named_stmt.query_map([],|row|Ok((row.get(0)?,row.get(1)?))).unwrap().collect::<std::result::Result<Vec<_>,_>>().unwrap();
+        assert_eq!(named,vec![("generated".into(),"read".into()),("schema".into(),"write".into())]);
+        let attempts:i64=raw.query_row("SELECT count(*) FROM attempts",[],|row|row.get(0)).unwrap();
+        assert_eq!(attempts,0);
         let denied=denials(&project).unwrap().into_iter().filter(|denial|denial.class=="contract").count();
         assert_eq!(denied,2);
     }

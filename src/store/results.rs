@@ -1,4 +1,5 @@
 //! Schema 26 contract install and untrusted result ingress.
+//! Schema 32 scope rows are written only by that signed install. Overlap is stored, not locked.
 //! Object bytes are fsynced before the submission row so a crash retries as one row.
 //! Claimed checks are stored and are not evidence.
 use super::*;
@@ -18,6 +19,7 @@ use std::{
 const OBJECT_LIMIT: u64 = 16 * 1024 * 1024;
 const SUBMISSION_LIMIT: usize = 256 * 1024;
 const SCHEMA_VERSION: u32 = 26;
+const SCOPE_SCHEMA: u32 = 32;
 
 fn invalid(message: &str) -> StoreError {
     StoreError::Invalid(message.into())
@@ -630,6 +632,12 @@ impl SqliteStore {
         if !task_exists {
             return Err(invalid("contract task is missing"));
         }
+        let version: u32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version < SCOPE_SCHEMA
+            && (!parsed.scope_paths.is_empty() || !parsed.named_resources.is_empty())
+        {
+            return Err(StoreError::UnsupportedSchema(version));
+        }
         tx.execute(
             "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('contract.installed',?1,?2,1,?3)",
             params![parsed.task_id.as_str(), integer(parsed.contract_revision)?, serde_json::json!({"digest": parsed.digest, "route": parsed.route.as_str()}).to_string()],
@@ -644,6 +652,20 @@ impl SqliteStore {
                 "INSERT INTO acceptance_policies(task_id,contract_revision,policy_id,body) VALUES(?1,?2,?3,?4)",
                 params![parsed.task_id.as_str(), integer(parsed.contract_revision)?, id, text],
             )?;
+        }
+        if version >= SCOPE_SCHEMA {
+            for (ordinal, path) in parsed.scope_paths.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO contract_scope_paths(task_id,contract_revision,ordinal,path,access,certainty) VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![parsed.task_id.as_str(), integer(parsed.contract_revision)?, integer(ordinal as u64)?, path.path, path.access.as_str(), path.certainty.as_str()],
+                )?;
+            }
+            for resource in &parsed.named_resources {
+                tx.execute(
+                    "INSERT INTO contract_named_resources(task_id,contract_revision,name,access) VALUES(?1,?2,?3,?4)",
+                    params![parsed.task_id.as_str(), integer(parsed.contract_revision)?, resource.name.as_str(), resource.access.as_str()],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(ContractInstall {
@@ -928,14 +950,14 @@ mod tests {
         let fresh = tempfile::tempdir().unwrap();
         let fresh_path = fresh.path().join("state.db");
         let mut created = SqliteStore::create(&fresh_path).unwrap();
-        assert_eq!(user_version(&created.connection), 31);
+        assert_eq!(user_version(&created.connection), 32);
         assert_eq!(
             created
                 .connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            31
+            32
         );
         created.import_legacy(&"ab".repeat(32), &[], &[]).unwrap();
         drop(created);
@@ -961,7 +983,7 @@ mod tests {
         let before = task_row(&db.connection);
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
-        raw.execute_batch("DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; DROP TABLE IF EXISTS dependency_satisfactions; DROP TABLE IF EXISTS factory_admission_policies; ALTER TABLE project_control DROP COLUMN factory_admission; DROP TABLE IF EXISTS feedback_claims; DROP TABLE IF EXISTS feedback_items; DROP TABLE IF EXISTS integrated_commits; DROP TABLE IF EXISTS integration_candidates; DROP TABLE IF EXISTS integration_operations; DROP TABLE IF EXISTS integration_target_leases; DROP TABLE IF EXISTS integration_targets; DROP TABLE IF EXISTS verified_results; DROP TABLE IF EXISTS verification_runs; DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; UPDATE store_meta SET schema_version=25; PRAGMA user_version=25;").unwrap();
+        raw.execute_batch("DROP TABLE IF EXISTS contract_named_resources; DROP TABLE IF EXISTS contract_scope_paths; DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; DROP TABLE IF EXISTS dependency_satisfactions; DROP TABLE IF EXISTS factory_admission_policies; ALTER TABLE project_control DROP COLUMN factory_admission; DROP TABLE IF EXISTS feedback_claims; DROP TABLE IF EXISTS feedback_items; DROP TABLE IF EXISTS integrated_commits; DROP TABLE IF EXISTS integration_candidates; DROP TABLE IF EXISTS integration_operations; DROP TABLE IF EXISTS integration_target_leases; DROP TABLE IF EXISTS integration_targets; DROP TABLE IF EXISTS verified_results; DROP TABLE IF EXISTS verification_runs; DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; UPDATE store_meta SET schema_version=25; PRAGMA user_version=25;").unwrap();
         drop(raw);
         let mut db = SqliteStore::open(&path).unwrap();
         assert_eq!(user_version(&db.connection), 25);
@@ -973,20 +995,20 @@ mod tests {
         ));
         assert_eq!(task_row(&db.connection), before);
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 31);
+        assert_eq!(user_version(&db.connection), 32);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            31
+            32
         );
         assert!(table_exists(&db.connection, "task_contracts"));
         assert!(table_exists(&db.connection, "result_submissions"));
         assert_eq!(task_row(&db.connection), before);
         check_schema(&db.connection).unwrap();
         let snapshot = db.read_snapshot(None).unwrap();
-        assert_eq!(snapshot.schema_version, 31);
+        assert_eq!(snapshot.schema_version, 32);
         assert_eq!(snapshot.tasks.len(), 1);
         assert_eq!(snapshot.tasks[0].title, "do not rewrite");
         drop(db);
@@ -1418,5 +1440,230 @@ mod tests {
             super::git_objects(&foreign_wt),
             Err(StoreError::Invalid(message)) if message.contains("common git directory")
         ));
+    }
+
+    fn count(db: &Connection, sql: &str) -> i64 {
+        db.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    fn scope_contract(fixture: &Fixture, task: &str, revision: u64, head: u64) -> Vec<u8> {
+        let mut value = serde_json::from_slice::<serde_json::Value>(&contract_bytes(
+            fixture,
+            "ship the widget",
+        ))
+        .unwrap();
+        value["task_id"] = serde_json::json!(task);
+        value["contract_revision"] = serde_json::json!(revision);
+        value["expected_head"] = serde_json::json!(head);
+        value["scope"] = serde_json::json!({
+            "paths": [
+                {"path": "src/lib.rs", "access": "write"},
+                {"path": "src/./nested//item.rs", "access": "read"},
+                {"path": "migrations/", "access": "write"},
+                {"path": "src/*.rs", "access": "write"}
+            ],
+            "named_resources": [
+                {"name": "schema", "access": "write"},
+                {"name": "lockfile", "access": "read"}
+            ]
+        });
+        let mut bytes = serde_json::to_vec_pretty(&value).unwrap();
+        bytes.push(b'\n');
+        bytes
+    }
+
+    #[test]
+    fn signed_contract_scope_stores_one_revision_and_overlap_is_not_locked() {
+        let fixture = fixture();
+        let mut db = SqliteStore::open(&fixture.db_path).unwrap();
+        let attempts = count(&db.connection, "SELECT count(*) FROM attempts");
+        let queued = count(&db.connection, "SELECT count(*) FROM task_queue");
+        let original = scope_contract(&fixture, fixture.task.as_str(), 1, fixture.head);
+        let installed = install(&mut db, &original);
+        assert!(!installed.replayed);
+        assert_eq!(installed.contract_revision, 1);
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM task_contracts"),
+            1
+        );
+        let stored: Vec<u8> = db
+            .connection
+            .query_row("SELECT raw_bytes FROM task_contracts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored, original);
+        let paths: Vec<(i64, String, String, String)> = {
+            let mut stmt = db
+                .connection
+                .prepare(
+                    "SELECT ordinal, path, access, certainty FROM contract_scope_paths ORDER BY ordinal",
+                )
+                .unwrap();
+            stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        assert_eq!(
+            paths,
+            vec![
+                (0, "src/lib.rs".into(), "write".into(), "exact".into()),
+                (
+                    1,
+                    "src/nested/item.rs".into(),
+                    "read".into(),
+                    "exact".into()
+                ),
+                (2, "migrations/".into(), "write".into(), "uncertain".into()),
+                (3, "src/*.rs".into(), "write".into(), "uncertain".into()),
+            ]
+        );
+        let named: Vec<(String, String)> = {
+            let mut stmt = db
+                .connection
+                .prepare("SELECT name, access FROM contract_named_resources ORDER BY name")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            named,
+            vec![
+                ("lockfile".into(), "read".into()),
+                ("schema".into(), "write".into()),
+            ]
+        );
+        assert!(install(&mut db, &original).replayed);
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM contract_scope_paths"),
+            4
+        );
+        assert_eq!(
+            count(
+                &db.connection,
+                "SELECT count(*) FROM contract_named_resources"
+            ),
+            2
+        );
+        let head = db.read_snapshot(None).unwrap().head;
+        let overlap = scope_contract(&fixture, "other", 1, head);
+        let second = install(&mut db, &overlap);
+        assert!(!second.replayed);
+        assert_eq!(second.contract_revision, 1);
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM task_contracts"),
+            2
+        );
+        assert_eq!(
+            count(
+                &db.connection,
+                "SELECT count(*) FROM contract_scope_paths WHERE path='src/lib.rs' AND access='write'"
+            ),
+            2
+        );
+        assert_eq!(
+            count(
+                &db.connection,
+                "SELECT count(*) FROM contract_named_resources WHERE name='schema' AND access='write'"
+            ),
+            2
+        );
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM attempts"),
+            attempts
+        );
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM task_queue"),
+            queued
+        );
+        let mut duplicate = serde_json::from_slice::<serde_json::Value>(&original).unwrap();
+        duplicate["scope"]["paths"] = serde_json::json!([
+            {"path": "src/lib.rs", "access": "write"},
+            {"path": "src/./lib.rs", "access": "read"}
+        ]);
+        let mut duplicate_bytes = serde_json::to_vec(&duplicate).unwrap();
+        duplicate_bytes.push(b'\n');
+        assert!(PreparedContract::parse_verified(&duplicate_bytes).is_err());
+        let mut escaped = duplicate;
+        escaped["scope"]["paths"] = serde_json::json!([{"path": "../secret", "access": "write"}]);
+        assert!(PreparedContract::parse_verified(&serde_json::to_vec(&escaped).unwrap()).is_err());
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM task_contracts"),
+            2
+        );
+    }
+
+    #[test]
+    fn upgrade_v1_from_31_to_32_and_create_end_at_user_version_32() {
+        let fresh = tempfile::tempdir().unwrap();
+        let mut created = SqliteStore::create(&fresh.path().join("state.db")).unwrap();
+        assert_eq!(user_version(&created.connection), 32);
+        assert_eq!(
+            created
+                .connection
+                .query_row("SELECT schema_version FROM store_meta", [], |row| row
+                    .get::<_, u32>(0))
+                .unwrap(),
+            32
+        );
+        assert!(table_exists(&created.connection, "contract_scope_paths"));
+        assert!(table_exists(
+            &created.connection,
+            "contract_named_resources"
+        ));
+        created.import_legacy(&"ab".repeat(32), &[], &[]).unwrap();
+        drop(created);
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        let db = SqliteStore::create(&path).unwrap();
+        drop(db);
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.execute_batch(
+            "DROP TABLE IF EXISTS contract_named_resources; DROP TABLE IF EXISTS contract_scope_paths; UPDATE store_meta SET schema_version=31; PRAGMA user_version=31;",
+        )
+        .unwrap();
+        drop(raw);
+        let mut db = SqliteStore::open(&path).unwrap();
+        assert_eq!(user_version(&db.connection), 31);
+        assert!(!table_exists(&db.connection, "contract_scope_paths"));
+        assert!(!table_exists(&db.connection, "contract_named_resources"));
+        assert!(matches!(
+            db.import_legacy(&"cd".repeat(32), &[], &[]),
+            Err(StoreError::UnsupportedSchema(31))
+        ));
+        assert_eq!(user_version(&db.connection), 31);
+        assert!(!table_exists(&db.connection, "contract_scope_paths"));
+        db.upgrade_v1().unwrap();
+        assert_eq!(user_version(&db.connection), 32);
+        assert_eq!(
+            db.connection
+                .query_row("SELECT schema_version FROM store_meta", [], |row| row
+                    .get::<_, u32>(0))
+                .unwrap(),
+            32
+        );
+        assert!(table_exists(&db.connection, "contract_scope_paths"));
+        assert!(table_exists(&db.connection, "contract_named_resources"));
+        assert_eq!(
+            count(&db.connection, "SELECT count(*) FROM contract_scope_paths"),
+            0
+        );
+        assert_eq!(
+            count(
+                &db.connection,
+                "SELECT count(*) FROM contract_named_resources"
+            ),
+            0
+        );
+        check_schema(&db.connection).unwrap();
+        db.import_legacy(&"cd".repeat(32), &[], &[]).unwrap();
+        drop(db);
+        let reopened = SqliteStore::open(&path).unwrap();
+        assert_eq!(user_version(&reopened.connection), 32);
+        assert!(table_exists(&reopened.connection, "contract_scope_paths"));
     }
 }

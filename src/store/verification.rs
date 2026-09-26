@@ -798,7 +798,7 @@ mod tests {
         let fresh = tempfile::tempdir().unwrap();
         let fresh_path = fresh.path().join("state.db");
         let created = SqliteStore::create(&fresh_path).unwrap();
-        assert_eq!(user_version(&created.connection), 31);
+        assert_eq!(user_version(&created.connection), 32);
         assert!(table_exists(&created.connection, "verification_runs"));
         assert!(table_exists(&created.connection, "verified_results"));
         drop(created);
@@ -810,7 +810,7 @@ mod tests {
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
         raw.execute_batch(
-            "DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; DROP TABLE IF EXISTS dependency_satisfactions; DROP TABLE IF EXISTS factory_admission_policies; ALTER TABLE project_control DROP COLUMN factory_admission; DROP TABLE IF EXISTS feedback_claims; DROP TABLE IF EXISTS feedback_items; DROP TABLE IF EXISTS integrated_commits; DROP TABLE IF EXISTS integration_candidates; DROP TABLE IF EXISTS integration_operations; DROP TABLE IF EXISTS integration_target_leases; DROP TABLE IF EXISTS integration_targets; DROP TABLE IF EXISTS verified_results; DROP TABLE IF EXISTS verification_runs; UPDATE store_meta SET schema_version = 26; PRAGMA user_version = 26;",
+            "DROP TABLE IF EXISTS contract_named_resources; DROP TABLE IF EXISTS contract_scope_paths; DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; DROP TABLE IF EXISTS dependency_satisfactions; DROP TABLE IF EXISTS factory_admission_policies; ALTER TABLE project_control DROP COLUMN factory_admission; DROP TABLE IF EXISTS feedback_claims; DROP TABLE IF EXISTS feedback_items; DROP TABLE IF EXISTS integrated_commits; DROP TABLE IF EXISTS integration_candidates; DROP TABLE IF EXISTS integration_operations; DROP TABLE IF EXISTS integration_target_leases; DROP TABLE IF EXISTS integration_targets; DROP TABLE IF EXISTS verified_results; DROP TABLE IF EXISTS verification_runs; UPDATE store_meta SET schema_version = 26; PRAGMA user_version = 26;",
         )
         .unwrap();
         drop(raw);
@@ -823,20 +823,20 @@ mod tests {
             Err(StoreError::UnsupportedSchema(26))
         ));
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 31);
+        assert_eq!(user_version(&db.connection), 32);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            31
+            32
         );
         assert!(table_exists(&db.connection, "verification_runs"));
         assert!(table_exists(&db.connection, "verified_results"));
         check_schema(&db.connection).unwrap();
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 31);
+        assert_eq!(user_version(&reopened.connection), 32);
         assert!(table_exists(&reopened.connection, "verified_results"));
     }
 

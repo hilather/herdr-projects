@@ -48,6 +48,65 @@ pub struct AcceptancePolicy {
     pub(crate) text: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ScopeAccess {
+    Read,
+    Write,
+}
+impl ScopeAccess {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+}
+
+/// Exact file paths can be compared literally. Globs and directory prefixes
+/// stay uncertain so a later schema can conflict without this install locking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ScopeCertainty {
+    Exact,
+    Uncertain,
+}
+impl ScopeCertainty {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Uncertain => "uncertain",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NamedResource {
+    Schema,
+    Lockfile,
+    Generated,
+}
+impl NamedResource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Schema => "schema",
+            Self::Lockfile => "lockfile",
+            Self::Generated => "generated",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractScopePath {
+    pub(crate) path: String,
+    pub(crate) access: ScopeAccess,
+    pub(crate) certainty: ScopeCertainty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractNamedResource {
+    pub(crate) name: NamedResource,
+    pub(crate) access: ScopeAccess,
+}
+
 /// Trusted install capability. JSON cannot construct it; callers pass the
 /// original signed bytes, which the store keeps without reserializing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +125,8 @@ pub struct PreparedContract {
     pub(crate) route: ContractRoute,
     pub(crate) authority: VersionedReference,
     pub(crate) acceptance_policies: Vec<AcceptancePolicy>,
+    pub(crate) scope_paths: Vec<ContractScopePath>,
+    pub(crate) named_resources: Vec<ContractNamedResource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -128,6 +189,29 @@ struct UntrustedDependency {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct UntrustedScopePath {
+    path: String,
+    access: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UntrustedNamedResource {
+    name: String,
+    access: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UntrustedScope {
+    #[serde(default)]
+    paths: Vec<UntrustedScopePath>,
+    #[serde(default)]
+    named_resources: Vec<UntrustedNamedResource>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UntrustedContractDocument {
     version: u32,
     project_store: String,
@@ -145,6 +229,8 @@ struct UntrustedContractDocument {
     #[serde(default)]
     memory_snapshot_id: Option<String>,
     dependencies: Vec<UntrustedDependency>,
+    #[serde(default)]
+    scope: UntrustedScope,
     capability_flags: Vec<String>,
     profile_kind: String,
     retry_class: String,
@@ -167,6 +253,67 @@ fn identifier(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte))
+}
+
+fn scope_access(value: &str) -> Result<ScopeAccess, String> {
+    match value {
+        "read" => Ok(ScopeAccess::Read),
+        "write" => Ok(ScopeAccess::Write),
+        _ => Err("invalid scope access".into()),
+    }
+}
+
+fn named_resource(value: &str) -> Result<NamedResource, String> {
+    match value {
+        "schema" => Ok(NamedResource::Schema),
+        "lockfile" => Ok(NamedResource::Lockfile),
+        "generated" => Ok(NamedResource::Generated),
+        _ => Err("invalid named resource".into()),
+    }
+}
+
+/// Collapse `.` and duplicate slashes. `..` is not a repo-relative path.
+/// A glob or trailing slash is uncertain overlap data, not a sandbox.
+fn normalize_scope_path(raw: &str) -> Result<(String, ScopeCertainty), String> {
+    if raw.is_empty()
+        || raw.len() > 512
+        || raw.starts_with('/')
+        || raw.contains('\\')
+        || raw.chars().any(char::is_control)
+    {
+        return Err("scope path must be repo-relative".into());
+    }
+    let directory = raw.ends_with('/');
+    let mut glob = false;
+    let mut parts = Vec::new();
+    for part in raw.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            return Err("scope path must be repo-relative".into());
+        }
+        if part.contains('*') || part.contains('?') || part.contains('[') {
+            glob = true;
+        }
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        return Err("scope path must be repo-relative".into());
+    }
+    let mut path = parts.join("/");
+    if directory {
+        path.push('/');
+    }
+    if path.len() > 512 {
+        return Err("scope path must be repo-relative".into());
+    }
+    let certainty = if directory || glob {
+        ScopeCertainty::Uncertain
+    } else {
+        ScopeCertainty::Exact
+    };
+    Ok((path, certainty))
 }
 
 impl PreparedContract {
@@ -266,6 +413,33 @@ impl UntrustedContractDocument {
                 return Err("invalid contract dependency".into());
             }
         }
+        if self.scope.paths.len() > 64 || self.scope.named_resources.len() > 8 {
+            return Err("contract scope exceeds bounds".into());
+        }
+        let mut seen_paths = std::collections::BTreeSet::new();
+        let mut scope_paths = Vec::new();
+        for path in self.scope.paths {
+            let access = scope_access(&path.access)?;
+            let (normalized, certainty) = normalize_scope_path(&path.path)?;
+            if !seen_paths.insert(normalized.clone()) {
+                return Err("invalid scope path".into());
+            }
+            scope_paths.push(ContractScopePath {
+                path: normalized,
+                access,
+                certainty,
+            });
+        }
+        let mut seen_resources = std::collections::BTreeSet::new();
+        let mut named_resources = Vec::new();
+        for resource in self.scope.named_resources {
+            let name = named_resource(&resource.name)?;
+            let access = scope_access(&resource.access)?;
+            if !seen_resources.insert(name) {
+                return Err("invalid named resource".into());
+            }
+            named_resources.push(ContractNamedResource { name, access });
+        }
         Ok(PreparedContract {
             digest: format!("{:x}", Sha256::digest(raw)),
             raw: raw.to_vec(),
@@ -281,6 +455,8 @@ impl UntrustedContractDocument {
             route: self.route,
             authority: self.authority,
             acceptance_policies,
+            scope_paths,
+            named_resources,
         })
     }
 }
