@@ -67,6 +67,7 @@ impl SqliteStore {
             super::consumer_bindings::backfill_from_subscriptions(&tx)?;
         }
         if version<=37 {tx.execute_batch(include_str!("../../migrations/0038_memory_read_sets.sql"))?;}
+        if version<=38 {tx.execute_batch(include_str!("../../migrations/0039_update_packages.sql"))?;}
         tx.commit()?;
         Ok(())
     }
