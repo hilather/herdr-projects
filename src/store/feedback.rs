@@ -440,13 +440,13 @@ mod tests {
     fn upgrade_v1_from_28_to_29_and_create_end_at_user_version_29() {
         let fresh = tempfile::tempdir().unwrap();
         let created = SqliteStore::create(&fresh.path().join("state.db")).unwrap();
-        assert_eq!(user_version(&created.connection), 32);
+        assert_eq!(user_version(&created.connection), 33);
         assert_eq!(
             created
                 .connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            32
+            33
         );
         assert!(table_exists(&created.connection, "feedback_items"));
         assert!(table_exists(&created.connection, "feedback_claims"));
@@ -458,7 +458,7 @@ mod tests {
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
         raw.execute_batch(
-            "DROP TABLE IF EXISTS contract_named_resources; DROP TABLE IF EXISTS contract_scope_paths; DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; DROP TABLE IF EXISTS dependency_satisfactions; DROP TABLE IF EXISTS factory_admission_policies; ALTER TABLE project_control DROP COLUMN factory_admission; DROP TABLE IF EXISTS feedback_claims; DROP TABLE IF EXISTS feedback_items; UPDATE store_meta SET schema_version=28; PRAGMA user_version=28;",
+            "DROP TABLE IF EXISTS capability_evidence; DROP TABLE IF EXISTS contract_named_resources; DROP TABLE IF EXISTS contract_scope_paths; DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; DROP TABLE IF EXISTS dependency_satisfactions; DROP TABLE IF EXISTS factory_admission_policies; ALTER TABLE project_control DROP COLUMN factory_admission; DROP TABLE IF EXISTS feedback_claims; DROP TABLE IF EXISTS feedback_items; UPDATE store_meta SET schema_version=28; PRAGMA user_version=28;",
         )
         .unwrap();
         drop(raw);
@@ -470,19 +470,19 @@ mod tests {
             Err(StoreError::UnsupportedSchema(28))
         ));
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 32);
+        assert_eq!(user_version(&db.connection), 33);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            32
+            33
         );
         assert!(table_exists(&db.connection, "feedback_items"));
         assert!(table_exists(&db.connection, "feedback_claims"));
         check_schema(&db.connection).unwrap();
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 32);
+        assert_eq!(user_version(&reopened.connection), 33);
         assert!(table_exists(&reopened.connection, "feedback_claims"));
     }
 

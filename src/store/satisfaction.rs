@@ -849,11 +849,11 @@ mod tests {
     }
 
     #[test]
-    fn schema_25_upgrade_preserves_landed_commit_bytes_and_ends_at_32() {
+    fn schema_25_upgrade_preserves_landed_commit_bytes_and_ends_at_33() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state.db");
         let mut db = SqliteStore::create(&path).unwrap();
-        assert_eq!(user_version(&db.connection), 32);
+        assert_eq!(user_version(&db.connection), 33);
         db.commit(Commit {
             expected_head: 0,
             mutations: vec![
@@ -878,7 +878,7 @@ mod tests {
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
         raw.execute_batch(
-            "DROP TABLE IF EXISTS contract_named_resources; DROP TABLE IF EXISTS contract_scope_paths; DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; DROP TABLE IF EXISTS dependency_satisfactions; DROP TABLE IF EXISTS factory_admission_policies;
+            "DROP TABLE IF EXISTS capability_evidence; DROP TABLE IF EXISTS contract_named_resources; DROP TABLE IF EXISTS contract_scope_paths; DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; DROP TABLE IF EXISTS dependency_satisfactions; DROP TABLE IF EXISTS factory_admission_policies;
              CREATE TABLE task_dependencies_v10 (
                 task_id TEXT NOT NULL, predecessor_id TEXT NOT NULL,
                 requirement TEXT NOT NULL CHECK(requirement IN ('verified_result','integration_candidate','landed_commit')),
@@ -917,7 +917,7 @@ mod tests {
         ));
         assert_eq!(user_version(&db.connection), 25);
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 32);
+        assert_eq!(user_version(&db.connection), 33);
         assert_eq!(dependencies(&db.connection), preserved);
         assert!(
             preserved
@@ -962,7 +962,7 @@ mod tests {
         check_schema(&db.connection).unwrap();
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 32);
+        assert_eq!(user_version(&reopened.connection), 33);
     }
 
     #[test]
