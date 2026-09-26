@@ -115,7 +115,7 @@ pub fn integrate(store: &mut SqliteStore, request: &IntegrateRequest) -> Result<
         }
         // An existing generation is classified from the ref. Do not discard a candidate
         // that is already the ref tip.
-        return resume(store, &repo, request, existing);
+        return resume(store, &repo, request, existing, false);
     }
     if repo.is_checked_out(&reference)? {
         bail!("integration ref is checked out");
@@ -163,7 +163,7 @@ pub fn reconcile_integration(
         fault: Fault::None,
     };
     // Reconcile never builds another merge. It only classifies the ref we already named.
-    resume(store, &repo, &request, view)
+    resume(store, &repo, &request, view, true)
 }
 
 fn resume(
@@ -171,6 +171,7 @@ fn resume(
     repo: &GitRepo,
     request: &IntegrateRequest,
     view: IntegrationView,
+    reconcile: bool,
 ) -> Result<IntegrateOutcome> {
     if matches!(
         view.state.as_str(),
@@ -179,9 +180,67 @@ fn resume(
         return Ok(outcome_of(&view));
     }
     if !view.checks_passed {
+        // Checks have not passed, so there is no candidate checkout to run.
+        // An empty reconcile work directory must not discard a stored commit.
+        if reconcile {
+            return unprepared_status(store, repo, &view);
+        }
         return resume_incomplete(store, repo, request, &view);
     }
     settle(store, repo, request, &view, true)
+}
+
+fn unprepared_status(
+    store: &mut SqliteStore,
+    repo: &GitRepo,
+    view: &IntegrationView,
+) -> Result<IntegrateOutcome> {
+    if view.state != "candidate_prepared" {
+        let loaded = store.load_integration_operation(&view.operation_id)?;
+        return Ok(outcome_of(&loaded));
+    }
+    let oid = view
+        .commit_oid
+        .clone()
+        .context("integration candidate is missing")?;
+    let tree = view
+        .tree_oid
+        .clone()
+        .context("integration candidate is missing")?;
+    if repo.has_object(&oid)? && repo.has_object(&tree)? {
+        let loaded = store.load_integration_operation(&view.operation_id)?;
+        return Ok(outcome_of(&loaded));
+    }
+    discard_absent_candidate(store, repo, view)
+}
+
+fn discard_absent_candidate(
+    store: &mut SqliteStore,
+    repo: &GitRepo,
+    view: &IntegrationView,
+) -> Result<IntegrateOutcome> {
+    let Some(current) = repo.ref_oid(&view.ref_name)? else {
+        bail!("integration ref is missing");
+    };
+    let claim = fresh_claim(store, &view.operation_id).ok();
+    if current == view.expected_old_oid {
+        return finish(
+            store,
+            &view.operation_id,
+            claim.as_ref(),
+            IntegrationFinish::Discarded {
+                reason: "candidate_missing",
+            },
+        );
+    }
+    finish(
+        store,
+        &view.operation_id,
+        claim.as_ref(),
+        IntegrationFinish::Reconciliation {
+            reason: "ambiguous_ref",
+        },
+    )
 }
 
 fn now_ms() -> i64 {
@@ -325,41 +384,11 @@ fn resume_incomplete(
         .clone()
         .context("integration candidate is missing")?;
     if !repo.has_object(&oid)? || !repo.has_object(&tree)? {
-        // Nothing was stored to check out. Drop the row so another generation can build.
-        if current == view.expected_old_oid {
-            return finish(
-                store,
-                &view.operation_id,
-                Some(&claim),
-                IntegrationFinish::Discarded {
-                    reason: "candidate_missing",
-                },
-            );
-        }
-        return finish(
-            store,
-            &view.operation_id,
-            Some(&claim),
-            IntegrationFinish::Reconciliation {
-                reason: "ambiguous_ref",
-            },
-        );
+        return discard_absent_candidate(store, repo, view);
     }
     let verified = store.load_verified_for_integration(&view.verified_result_id)?;
-    let checkout = match repo.checkout_candidate(&request.work_dir, &oid) {
-        Ok(checkout) => checkout,
-        Err(_) if current == view.expected_old_oid => {
-            return finish(
-                store,
-                &view.operation_id,
-                Some(&claim),
-                IntegrationFinish::Discarded {
-                    reason: "candidate_missing",
-                },
-            );
-        }
-        Err(error) => return Err(error),
-    };
+    // Checkout failure leaves candidate_prepared. Only a missing object discards it.
+    let checkout = repo.checkout_candidate(&request.work_dir, &oid)?;
     if !checks_pass(&request.work_dir, &checkout, &verified, &oid, &tree)? {
         return finish(
             store,

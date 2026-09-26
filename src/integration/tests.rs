@@ -330,6 +330,27 @@ fn missing_candidate_object_discards_prepared_generation() {
 }
 
 #[test]
+fn reconcile_keeps_prepared_generation_when_objects_exist() {
+    let fixture = fixture();
+    let mut db = open(&fixture);
+    let prepared = integrate(
+        &mut db,
+        &request(&fixture, "integrate-reconcile", Fault::CrashBeforeChecks),
+    )
+    .unwrap();
+    assert_eq!(prepared.state, "candidate_prepared");
+    let oid = prepared.commit_oid.clone().expect("candidate");
+    let reconciled = reconcile_integration(&mut db, &fixture.repo, "integrate-reconcile").unwrap();
+    assert_eq!(reconciled.state, "candidate_prepared");
+    assert_eq!(reconciled.commit_oid.as_deref(), Some(oid.as_str()));
+    assert_eq!(git_text(&fixture.repo, &["rev-parse", TARGET]), fixture.base);
+    let published = integrate(&mut db, &request(&fixture, "integrate-reconcile", Fault::None)).unwrap();
+    assert_eq!(published.state, "integrated");
+    assert_eq!(published.commit_oid.as_deref(), Some(oid.as_str()));
+    assert_local(&fixture);
+}
+
+#[test]
 fn expired_claim_after_build_still_records() {
     let fixture = fixture();
     let mut db = open(&fixture);
