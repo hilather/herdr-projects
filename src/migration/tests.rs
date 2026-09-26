@@ -818,3 +818,25 @@ fn notification_claims_and_suppression_require_reconciliation_before_import() {
     for phase in [Phase::Uncertain,Phase::NotShown] {claim.phase=phase;claim.error="pending delivery".into();value["notification_claim"]=serde_json::to_value(&claim).unwrap();assert!(validate_runtime(".state/ticker.json",&value).is_err());}
     claim.phase=Phase::Suppressed;value["notification_claim"]=serde_json::to_value(&claim).unwrap();assert!(validate_runtime(".state/ticker.json",&value).is_ok());value["notification_suppressed"]=serde_json::json!(["item-a"]);assert!(validate_runtime(".state/ticker.json",&value).is_err());
 }
+#[test]
+fn restore_into_a_new_root_and_deleting_the_ownership_marker_is_not_rollback() {
+    let (temp,project)=fixture(); let plan=inspect(&project).unwrap(); apply(&project,&plan,true).unwrap();
+    let live=project.join(".state/state.db"); let before=fs::read(&live).unwrap();
+    assert!(project.join(".state/format.json").is_file());
+    let destination=temp.path().join("restored");
+    restore_backup(&project,&destination).unwrap();
+    assert!(!destination.join(".state/state.db").exists());
+    assert!(!destination.join(".state/format.json").exists());
+    assert_eq!(fs::read(destination.join("PROJECT.md")).unwrap(),fs::read(project.join("PROJECT.md")).unwrap());
+    assert_eq!(fs::read(&live).unwrap(),before);
+    assert!(restore_backup(&project,&destination).is_err());
+    assert!(abort(&project).is_err());
+    fs::remove_file(project.join(".state/format.json")).unwrap();
+    assert!(open_active(&project).is_err());
+    assert!(recover(&project,true).is_err());
+    assert_eq!(fs::read(&live).unwrap(),before);
+    assert!(apply(&project,&plan,true).is_err());
+    assert_eq!(status(&project).unwrap().phase,Phase::Active);
+    assert!(journal_path(&project).is_file());
+    assert!(abort(&project).is_err());
+}

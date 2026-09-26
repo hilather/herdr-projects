@@ -3547,3 +3547,627 @@ fn scale_gate_for_32_and_64_workers() {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+fn fault_doc() {
+    let doc = include_str!("../docs/factory/faults.md");
+    assert!(doc.contains("`not frozen`"));
+    assert!(doc.contains("not a measured bar and not a lowered bar"));
+    assert!(doc.contains("targets were not claimed."));
+    assert!(doc.contains("not a decision SLA"));
+    assert!(doc.contains("herdr-projects factory status PROJECT"));
+    assert!(doc.contains("There is no `factory PROJECT status` command."));
+    assert!(doc.contains("A stop without termination evidence does not free a slot."));
+    assert!(doc.contains("coverage is not success."));
+    assert!(doc.contains("does not omit"));
+    assert!(doc.contains("in order to refuse SSH"));
+    assert!(doc.contains("route.machine"));
+    assert!(doc.contains("Deleting an ownership marker is not a rollback"));
+    assert!(doc.contains("must be reissued"));
+    assert_eq!(herdr_projects::store::SCHEMA, 41);
+    let controller = include_str!("../src/canonical_controller.rs");
+    assert!(controller.contains("const PREPARED_LAUNCH_DISPATCH_ENABLED: bool = true;"));
+    let lower = doc.to_ascii_lowercase();
+    for phrase in [
+        "targets met",
+        "targets were met",
+        "p95 passed",
+        "latency passed",
+        "40-worker certificate passed",
+        "dollar ledger passed",
+        "remote merge passed",
+    ] {
+        assert!(
+            !lower.contains(phrase),
+            "fault campaign claims a pass via {phrase}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn operation(id: &str, task: &TaskId, key: &str, due: i64) -> Operation {
+    Operation {
+        id: OperationId::new(id).unwrap(),
+        task: Some(task.clone()),
+        kind: "notify".into(),
+        target: "local".into(),
+        payload_version: 1,
+        payload: serde_json::json!({"notice": key}),
+        expected_revision: 1,
+        due_unix_ms: due,
+        idempotency_key: key.into(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fault_campaign_and_restore_rehearsal() {
+    fault_doc();
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("campaign");
+    fs::create_dir_all(project.join(".state")).unwrap();
+    let db_path = project.join(".state/state.db");
+    let (repo, oid) = build_repo(tmp.path(), SEED);
+    let repo = fs::canonicalize(&repo).unwrap();
+    let repository = repo.display().to_string();
+    let object_path = format!("{}/{}", &oid[..2], &oid[2..]);
+    assert!(repo.join(".git/objects").join(&object_path).is_file());
+
+    let task_id = TaskId::new("t-old").unwrap();
+    let old_attempt = AttemptId::new("attempt-old").unwrap();
+    let due = unix_ms();
+    let mut db = SqliteStore::create(&db_path).unwrap();
+    assert_eq!(db.read_snapshot(None).unwrap().schema_version, 41);
+    let op = operation("op-1", &task_id, "env-1", due);
+    db.commit(Commit {
+        expected_head: 0,
+        mutations: vec![
+            Mutation::Task {
+                expected: None,
+                next: Task {
+                    id: task_id.clone(),
+                    revision: 1,
+                    state: TaskState::Running,
+                    title: "old generation".into(),
+                    active_attempt: Some(old_attempt.clone()),
+                },
+            },
+            Mutation::Attempt {
+                expected: None,
+                next: Attempt {
+                    id: old_attempt.clone(),
+                    task: task_id.clone(),
+                    revision: 1,
+                    state: AttemptState::Running,
+                    snapshot: None,
+                    reservation: "slot-old".into(),
+                    termination_observed: false,
+                },
+            },
+            Mutation::Enqueue(op.clone()),
+        ],
+    })
+    .unwrap();
+    let duplicate = db.commit(Commit {
+        expected_head: db.current_head().unwrap(),
+        mutations: vec![Mutation::Enqueue(operation("op-2", &task_id, "env-1", due))],
+    });
+    assert!(
+        matches!(duplicate, Err(herdr_projects::store::StoreError::Conflict)),
+        "{duplicate:?}"
+    );
+    assert_eq!(db.read_snapshot(None).unwrap().operations.len(), 1);
+    let digest = format!("{:x}", Sha256::digest(b"proposal-a"));
+    let first = db
+        .insert_proposal(
+            "prop-1",
+            &digest,
+            "t-old",
+            "attempt-old",
+            None,
+            "rejected",
+            "{}",
+            "duplicate envelope",
+            "[]",
+            due,
+        )
+        .unwrap();
+    assert!(!first.reused);
+    let replayed = db
+        .insert_proposal(
+            "prop-1",
+            &digest,
+            "t-old",
+            "attempt-old",
+            None,
+            "rejected",
+            "{}",
+            "duplicate envelope",
+            "[]",
+            due,
+        )
+        .unwrap();
+    assert!(replayed.reused);
+    let conflict = db.insert_proposal(
+        "prop-1",
+        &"ab".repeat(32),
+        "t-old",
+        "attempt-old",
+        None,
+        "rejected",
+        "{\"other\":true}",
+        "conflicting payload",
+        "[]",
+        due,
+    );
+    assert!(
+        matches!(conflict, Err(herdr_projects::store::StoreError::Invalid(ref message)) if message.contains("idempotency")),
+        "{conflict:?}"
+    );
+    assert_eq!(
+        sql_count(&db_path, "SELECT count(*) FROM memory_proposals"),
+        1
+    );
+
+    let claim = db
+        .claim_operation(&op.id, 1, "campaign", due, 1_000)
+        .unwrap();
+    let before_cancel = db.queue_report(due).unwrap();
+    assert_eq!(before_cancel.policy.max_active_workers, 0);
+    assert_eq!(before_cancel.retained_attempts, 1);
+    let cancelled = db
+        .cancel_attempt(
+            &old_attempt,
+            1,
+            db.current_head().unwrap(),
+            "stop does not release the slot",
+            due,
+        )
+        .unwrap();
+    assert!(
+        !cancelled.released,
+        "slot released without termination evidence"
+    );
+    let after_cancel = db.queue_report(due).unwrap();
+    assert_eq!(after_cancel.retained_attempts, 1);
+    assert_eq!(after_cancel.available_slots, 0);
+    assert!(db.validate_claim(&claim, due).is_err());
+    assert!(db
+        .finish_operation(
+            &claim,
+            herdr_projects::operations::Outcome::Confirmed {
+                observed_identity: "old-attempt".into(),
+            },
+            due,
+        )
+        .is_err());
+    assert_eq!(db.expire_claims(due + 1_000).unwrap(), 1);
+    assert_eq!(db.expire_claims(due + 1_000).unwrap(), 0);
+    let expired = db.read_snapshot(None).unwrap();
+    let delivery = expired
+        .deliveries
+        .iter()
+        .find(|row| row.operation == op.id)
+        .unwrap();
+    assert_eq!(
+        delivery.state,
+        herdr_projects::operations::DeliveryState::Ambiguous
+    );
+    assert_eq!(delivery.attempts, 1);
+    assert!(db
+        .claim_operation(&op.id, delivery.revision, "campaign", due + 1_000, 1_000)
+        .is_err());
+    assert_eq!(expired.operations.len(), 1);
+    assert!(expired
+        .attempts
+        .iter()
+        .any(|attempt| attempt.id == old_attempt && !attempt.termination_observed));
+
+    db.commit(Commit {
+        expected_head: db.current_head().unwrap(),
+        mutations: vec![Mutation::Attempt {
+            expected: Some(cancelled.attempt_revision),
+            next: Attempt {
+                id: old_attempt.clone(),
+                task: task_id.clone(),
+                revision: cancelled.attempt_revision + 1,
+                state: AttemptState::Cancelled,
+                snapshot: None,
+                reservation: "slot-old".into(),
+                termination_observed: true,
+            },
+        }],
+    })
+    .unwrap();
+    let head = db.current_head().unwrap();
+    let task = db
+        .read_snapshot(None)
+        .unwrap()
+        .tasks
+        .into_iter()
+        .find(|task| task.id == task_id)
+        .unwrap();
+    let new_attempt = AttemptId::new("attempt-new").unwrap();
+    db.commit(Commit {
+        expected_head: head,
+        mutations: vec![
+            Mutation::Attempt {
+                expected: None,
+                next: Attempt {
+                    id: new_attempt.clone(),
+                    task: task_id.clone(),
+                    revision: 1,
+                    state: AttemptState::Running,
+                    snapshot: None,
+                    reservation: "slot-new".into(),
+                    termination_observed: false,
+                },
+            },
+            Mutation::Task {
+                expected: Some(task.revision),
+                next: Task {
+                    id: task_id.clone(),
+                    revision: task.revision + 1,
+                    state: TaskState::Running,
+                    title: "new generation".into(),
+                    active_attempt: Some(new_attempt.clone()),
+                },
+            },
+        ],
+    })
+    .unwrap();
+    let retry = db.retry_infrastructure("t-old", "attempt-old").unwrap();
+    assert_eq!(retry.attempt_id, "attempt-old");
+    assert_eq!(retry.ordinal, 1);
+    assert_eq!(sql_count(&db_path, "SELECT count(*) FROM attempts"), 2);
+    drop(db);
+
+    install_fixture_contract(&db_path, "t-old", &repository, &oid, "sha1", "src/old.rs");
+    let digest = {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.query_row(
+            "SELECT raw_digest FROM task_contracts WHERE task_id='t-old'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+    let submission = serde_json::json!({
+        "idempotency_key": "submit-old",
+        "task_id": "t-old",
+        "contract_revision": 1,
+        "contract_digest": digest,
+        "attempt_id": "attempt-old",
+        "repository": repository,
+        "base_oid": oid,
+        "candidate_oid": oid,
+        "object_format": "sha1",
+        "artifact_manifest": [{"path": "README", "oid": oid}],
+        "claimed_checks": ["old attempt is diagnostic"],
+        "objects": [{"oid": oid, "relative_path": object_path}]
+    });
+    let raw = serde_json::to_vec(&submission).unwrap();
+    let mut db = SqliteStore::open(&db_path).unwrap();
+    let stored = db.submit_result(&raw).unwrap();
+    assert!(!stored.replayed);
+    let again = db.submit_result(&raw).unwrap();
+    assert!(again.replayed);
+    assert_eq!(again.submission_id, stored.submission_id);
+    let mut conflicting = submission.clone();
+    conflicting["claimed_checks"] = serde_json::json!(["different payload"]);
+    let rejected = db.submit_result(&serde_json::to_vec(&conflicting).unwrap());
+    assert!(
+        matches!(rejected, Err(herdr_projects::store::StoreError::Conflict)),
+        "{rejected:?}"
+    );
+    assert_eq!(
+        sql_count(&db_path, "SELECT count(*) FROM result_submissions"),
+        1
+    );
+    let work = tmp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let mismatch = work.join("policy.json");
+    fs::write(&mismatch, b"{\"version\":1,\"checks\":[\"/bin/false\"]}").unwrap();
+    let other = work.join("other-policy.json");
+    fs::write(&other, b"{\"version\":1,\"checks\":[\"/bin/true\"]}").unwrap();
+    let request = herdr_projects::verification::VerifyRequest::new(
+        stored.submission_id.clone(),
+        "builds",
+        &mismatch,
+        "verify-old",
+        Duration::from_secs(5),
+        &work,
+    );
+    let outcome = herdr_projects::verification::verify(&mut db, &request).unwrap();
+    assert_eq!(outcome.state, "rejected");
+    assert!(!outcome.replayed);
+    let replay = herdr_projects::verification::verify(&mut db, &request).unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.run_id, outcome.run_id);
+    let mut changed = request;
+    changed.policy_path = other;
+    match herdr_projects::verification::verify(&mut db, &changed) {
+        Err(conflict) => assert!(
+            conflict.to_string().contains("idempotency conflict"),
+            "{conflict}"
+        ),
+        Ok(_) => panic!("conflicting verification payload was accepted"),
+    }
+    assert_eq!(
+        sql_count(&db_path, "SELECT count(*) FROM feedback_items"),
+        1
+    );
+    assert_eq!(
+        sql_count(&db_path, "SELECT count(*) FROM verified_results"),
+        0
+    );
+    assert_eq!(
+        sql_count(&db_path, "SELECT count(*) FROM dependency_satisfactions"),
+        0
+    );
+    let current = db.read_snapshot(None).unwrap();
+    assert_eq!(
+        current
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .unwrap()
+            .active_attempt
+            .as_ref(),
+        Some(&new_attempt)
+    );
+    assert_ne!(current.tasks[0].state, TaskState::Succeeded);
+    drop(db);
+    assert_admission_off(&project);
+
+    let barrier_path = tmp.path().join("barrier.db");
+    SqliteStore::create(&barrier_path).unwrap();
+    let alpha = seed_barrier_member(&barrier_path, "alpha");
+    let beta = seed_barrier_member(&barrier_path, "beta");
+    let mut db = SqliteStore::open(&barrier_path).unwrap();
+    let head = db.read_snapshot(None).unwrap().head;
+    let frozen_alpha = db.freeze_barrier(&[barrier_member(&alpha)], head).unwrap();
+    let head = db.read_snapshot(None).unwrap().head;
+    let frozen_beta = db.freeze_barrier(&[barrier_member(&beta)], head).unwrap();
+    let head = db.read_snapshot(None).unwrap().head;
+    let revoked = db.revoke_barrier(&frozen_alpha.barrier_id, head).unwrap();
+    assert!(revoked.revoked_seq.is_some());
+    let head = db.read_snapshot(None).unwrap().head;
+    let release = db.release_barrier(
+        &frozen_alpha.barrier_id,
+        &frozen_alpha.release_token,
+        head,
+        1,
+    );
+    assert!(
+        matches!(release, Err(herdr_projects::store::StoreError::Invalid(ref message)) if message.contains("revoked")),
+        "{release:?}"
+    );
+    let head = db.read_snapshot(None).unwrap().head;
+    let unrelated = db.freeze_barrier(&[barrier_member(&beta)], head).unwrap();
+    assert_eq!(unrelated.barrier_id, frozen_beta.barrier_id);
+    assert!(unrelated.revoked_seq.is_none());
+    assert!(db
+        .read_snapshot(None)
+        .unwrap()
+        .attempts
+        .iter()
+        .all(|attempt| !attempt.termination_observed));
+    let admission: String = rusqlite::Connection::open(&barrier_path)
+        .unwrap()
+        .query_row(
+            "SELECT factory_admission FROM project_control WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(admission, "off");
+    drop(db);
+
+    let root = tmp.path().join("alias-root");
+    for name in ["a", "b", "sneaky"] {
+        fs::create_dir_all(root.join(name).join(".state")).unwrap();
+    }
+    let git_dir = root.join("repos/real");
+    fs::create_dir_all(&git_dir).unwrap();
+    let alias = root.join("repos/alias");
+    std::os::unix::fs::symlink(&git_dir, &alias).unwrap();
+    let git_dir = fs::canonicalize(&git_dir).unwrap();
+    assert_eq!(fs::canonicalize(&alias).unwrap(), git_dir);
+    let footprint = |project: &Path| {
+        vec![
+            herdr_projects::execution_guard::Resource::new(
+                "artifact",
+                project.canonicalize().unwrap().to_str().unwrap(),
+            )
+            .unwrap(),
+            herdr_projects::execution_guard::Resource::new("git", git_dir.to_str().unwrap())
+                .unwrap(),
+        ]
+    };
+    let owner = herdr_projects::execution_guard::ProjectSharedGuard::acquire(
+        &root.join("a"),
+        &footprint(&root.join("a")),
+    )
+    .unwrap();
+    assert!(
+        herdr_projects::execution_guard::ProjectSharedGuard::acquire(
+            &root.join("b"),
+            &footprint(&root.join("b"))
+        )
+        .is_err(),
+        "aliased git directory accepted a second owner"
+    );
+    let project_lock =
+        herdr_projects::execution_guard::ProjectGuard::acquire(&root.join("b")).unwrap();
+    assert!(
+        herdr_projects::execution_guard::ProjectSharedGuard::acquire(
+            &root.join("b"),
+            &footprint(&root.join("b"))
+        )
+        .is_err(),
+        "project lock took the aliased git directory"
+    );
+    drop(project_lock);
+    fs::remove_dir_all(root.join("sneaky/.state")).unwrap();
+    std::os::unix::fs::symlink(root.join("a/.state"), root.join("sneaky/.state")).unwrap();
+    assert!(herdr_projects::execution_guard::ProjectGuard::acquire(&root.join("sneaky")).is_err());
+    assert!(
+        herdr_projects::execution_guard::ProjectSharedGuard::acquire(
+            &root.join("sneaky"),
+            &footprint(&root.join("sneaky"))
+        )
+        .is_err()
+    );
+    drop(owner);
+
+    let busy_project = tmp.path().join("busy");
+    fs::create_dir_all(busy_project.join(".state")).unwrap();
+    let busy_path = busy_project.join(".state/state.db");
+    let mut db = SqliteStore::create(&busy_path).unwrap();
+    let before = db.read_snapshot(None).unwrap();
+    let raw = rusqlite::Connection::open(&busy_path).unwrap();
+    raw.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
+    let busy = db.commit(Commit {
+        expected_head: before.head,
+        mutations: vec![Mutation::Task {
+            expected: None,
+            next: Task {
+                id: TaskId::new("t-busy").unwrap(),
+                revision: 1,
+                state: TaskState::Draft,
+                title: "busy".into(),
+                active_attempt: None,
+            },
+        }],
+    });
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(
+        matches!(busy, Err(herdr_projects::store::StoreError::Busy)),
+        "{busy:?}"
+    );
+    assert_eq!(db.read_snapshot(None).unwrap().tasks, before.tasks);
+    raw.execute_batch("ROLLBACK").unwrap();
+    drop(raw);
+    assert!(herdr_projects::watchdog::note(
+        &busy_project,
+        &herdr_projects::store::StoreError::Busy
+    )
+    .unwrap());
+    assert_eq!(
+        herdr_projects::watchdog::pause_reason(&busy_project),
+        Some("database_busy")
+    );
+    assert_eq!(sql_count(&busy_path, "SELECT count(*) FROM attempts"), 0);
+    assert_eq!(db.read_snapshot(None).unwrap().tasks.len(), 0);
+    drop(db);
+
+    let published = memory_project();
+    let published_db = state_db(&published.project);
+    let old_store = fs::canonicalize(&published_db)
+        .unwrap()
+        .display()
+        .to_string();
+    let bad = published.tmp.path().join("bad-contract.json");
+    fs::write(&bad, b"{}\n").unwrap();
+    assert!(Command::new("/usr/bin/ssh-keygen")
+        .args(["-Y", "sign", "-f"])
+        .arg(&published.key)
+        .args(["-n", herdr_projects::authority::SIGNATURE_NAMESPACE])
+        .arg(&bad)
+        .status()
+        .unwrap()
+        .success());
+    let signature = PathBuf::from(format!("{}.sig", bad.display()));
+    assert!(
+        herdr_projects::authority::import_contract(&published.project, &bad, &signature).is_err()
+    );
+    let denials = herdr_projects::authority::denials(&published.project).unwrap();
+    assert!(denials.iter().any(|denial| {
+        denial.class == "contract"
+            && denial.command == "put"
+            && denial.reason_code == "signature_failed"
+    }));
+    assert_eq!(
+        sql_count(&published_db, "SELECT count(*) FROM task_contracts"),
+        0
+    );
+    assert_admission_off(&published.project);
+    let live_bytes = fs::read(&published_db).unwrap();
+
+    let destination = published.tmp.path().join("restored");
+    herdr_projects::migration::restore_backup(&published.project, &destination).unwrap();
+    assert!(!destination.join(".state/state.db").exists());
+    assert!(!destination.join(".state/format.json").exists());
+    assert_eq!(fs::read(&published_db).unwrap(), live_bytes);
+    assert!(herdr_projects::migration::restore_backup(&published.project, &destination).is_err());
+    let new_store = destination
+        .join(".state/state.db")
+        .canonicalize()
+        .unwrap_or_else(|_| destination.join(".state/state.db"));
+    assert!(new_store.is_absolute());
+    assert_ne!(new_store.display().to_string(), old_store);
+    let config_path = tmp.path().join("grant-owner.toml");
+    fs::write(&config_path, "version = 1\n").unwrap();
+    let config = herdr_projects::migration::config_reference(&config_path).unwrap();
+    let scratch = tmp.path().join("grant-profile.db");
+    SqliteStore::create(&scratch).unwrap();
+    plant_profile(&scratch, &config);
+    let report: String = rusqlite::Connection::open(&scratch)
+        .unwrap()
+        .query_row("SELECT report FROM native_profiles", [], |row| row.get(0))
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_str(&report).unwrap();
+    let profile: FrozenProfile =
+        serde_json::from_value(report["preparation"]["profile"].clone()).unwrap();
+    let mut inputs: LaunchInputs =
+        serde_json::from_str(include_str!("fixtures/launch-inputs-v1.json")).unwrap();
+    inputs.version = 2;
+    inputs.project_store = old_store.clone();
+    inputs.profile = profile.reference().unwrap();
+    inputs.effective_profile = Some(profile.clone());
+    let now = unix_ms();
+    let grant = ApprovalGrant {
+        version: 1,
+        scope: ApprovalScope::for_launch(&inputs).unwrap(),
+        policy: profile.permission_policy.clone(),
+        issued_unix_ms: now - 1_000,
+        expires_unix_ms: now + 3_600_000,
+    };
+    inputs.approval = grant.reference().unwrap();
+    grant
+        .matches_launch(&inputs, &old_store, now)
+        .expect("old grant matches its own store");
+    let moved = grant.matches_launch(&inputs, &new_store.display().to_string(), now);
+    assert!(
+        matches!(moved, Err(ref message) if message.contains("different action")),
+        "{moved:?}"
+    );
+    let mut reissue = inputs.clone();
+    reissue.project_store = new_store.display().to_string();
+    assert!(grant
+        .matches_launch(&reissue, &reissue.project_store, now)
+        .is_err());
+    assert_ne!(
+        ApprovalScope::for_launch(&reissue).unwrap().project_store,
+        grant.scope.project_store
+    );
+
+    fs::remove_file(published.project.join(".state/format.json")).unwrap();
+    assert!(herdr_projects::migration::open_active(&published.project).is_err());
+    assert!(herdr_projects::migration::recover(&published.project, true).is_err());
+    assert_eq!(fs::read(&published_db).unwrap(), live_bytes);
+    assert!(published_db.is_file());
+    assert_eq!(
+        herdr_projects::migration::status(&published.project)
+            .unwrap()
+            .phase,
+        herdr_projects::migration::Phase::Active
+    );
+    assert!(published
+        .project
+        .join(".state/migration/journal.json")
+        .is_file());
+    assert!(herdr_projects::migration::abort(&published.project).is_err());
+}
