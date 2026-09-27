@@ -124,5 +124,15 @@ Recorded here rather than folded into the card that found them.
   1.9 s of its 5 s budget even when run alone, and occasionally misses it on a
   loaded machine. Consider building dependencies with optimisation in the test
   profile.
+- **Port the reviewed memory-review reminder work** (Herdr threads `t-0003`
+  implementation and `t-0004` review, branch
+  `hp/grok4-7-shiptest/t-0003-memory-workflow-reliability` at `b564f15`).
+  Durable memory-review obligations from worker Remember sections, delivered as
+  SQLite inbox rows by the canonical tick (about 2,100 lines, mostly
+  `src/memory_review.rs`, `src/doctor.rs`, `src/cli.rs`, `src/store/inbox.rs`).
+  The review closed all findings, but the branch predates schemas 27–44, so this
+  is a port: replay it onto `main`, re-verify, add a tick-level E2E (the review
+  noted none drives a full canonical `tick()`), then close both threads in
+  Herdr. Do after F1.
 - **Replace-verdict tests** (352 in `docs/reviews/2026-09-27-test-audit.tsv`):
   convert to E2E alongside feature work, starting with `store/barriers.rs`.
