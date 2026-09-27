@@ -1,6 +1,6 @@
 # F1 automatic verification and integration dispatch
 
-Status: planned, 27 September 2026. Scope is the dependent vertical slice (F1):
+Status: card 1 merged (#42), cards 2–4 open. Planned 27 September 2026. Scope is the dependent vertical slice (F1):
 verified worker results are integrated automatically and release dependents.
 Each card is one reviewable PR. Work stops at each card's stop condition; gaps
 found along the way are recorded as new cards, not folded into the current one.
@@ -29,16 +29,18 @@ hands it to `copy_jobs::Queue`; `canonical_finalization_jobs.rs` is the job
 template. Stored verification/integration receipts already write
 `dependency_satisfactions`, so only the automatic producers are missing.
 
-### 1. Durable verification jobs (enqueue only)
+### 1. Durable verification jobs (enqueue only) — done (#42)
 
-- Migration `0044`: per-project automation switches, off by default.
+- Migration `0044`: `result_automation_control` with a `verify` switch, off by
+  default. Card 3 adds the integration switch in its own migration.
 - `store/verification_jobs.rs`: for each (submission, acceptance policy) still
   pending, one `verification.run` operation. Identity is
   sha256(project_store, submission, contract_revision, policy_id, policy_digest).
   At most 8 new operations per turn; the insert rechecks contract revision,
   policy and fence in the same transaction.
 - `canonical_controller.rs::finish_poll` calls the service; CLI
-  `hp result auto <slug> --verify on|off --expected-head N`.
+  `hp result <slug> auto --verify on|off --expected-head N` (slug first, like the
+  other `result` subcommands). Enqueueing needs the project to be `active`.
 - Not yet executable: the kind is left out of the dispatch hint.
 - E2E first: `ticker_enqueues_one_verification_job_per_policy_across_restart`.
   Two-policy contract and a submission; automation off gives no operations;
@@ -52,8 +54,13 @@ template. Stored verification/integration receipts already write
   hint (pending and ambiguous) and `offer_next` wiring; a separate lane.
 - `verification/mod.rs` gains an internal entry taking the stored policy bytes
   and a deterministic scratch directory `.state/scratch/verify/<op>`.
+- Card 1 inserts `verification.run` operations without an `operation_delivery`
+  row; create it (pending) when the job becomes dispatchable.
 - Recovery: unrecorded or lease-expired jobs look up the run by key and confirm
   it, or remove scratch and redeliver with the same key.
+- A permanently failed job must not block its (submission, policy) forever:
+  the unique index from `0044` allows one job per pair, so define how an
+  operator retries it (a new operation identity or an explicit reset).
 - E2E first: `ticker_auto_verifies_once_and_recovers_after_kill`. Kill the
   ticker mid-check, restart: exactly one run and one receipt, delivery
   confirmed, dependent satisfaction valid, scratch removed. A policy exiting 3
@@ -92,3 +99,20 @@ its result is verified and integrated automatically and a dependent task
 launches on the integrated SHA, with one controller crash and one stale-head
 injection. Record the integrated SHA, transcripts and which parts were live
 versus fixture. Automation stays off by default until this passes.
+
+## Follow-up cards found along the way
+
+Recorded here rather than folded into the card that found them.
+
+- **Notification enqueue reads the whole snapshot** (`runtime.rs`
+  `enqueue_notification`). Its check needs every unseen inbox item and every
+  claimed or ambiguous delivery; add indexes for both in a migration, then read
+  only those rows.
+- **Remaining full-snapshot reads** in `finalization_delivery::enqueue`,
+  `preserved_outputs`, the finalization adapter validation and
+  `routines::schedule`. Same approach as #43 (`store/effect_rows.rs`).
+- **Opening a store runs a whole-database `quick_check`**, so even targeted
+  commands grow with database size. Decide whether the per-open check can be
+  scoped or moved to maintenance.
+- **Replace-verdict tests** (352 in `docs/reviews/2026-09-27-test-audit.tsv`):
+  convert to E2E alongside feature work, starting with `store/barriers.rs`.
