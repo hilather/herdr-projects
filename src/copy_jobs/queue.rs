@@ -14,7 +14,9 @@ fn failure_delay(identity:&Identity)->Duration {
 }
 struct Entry {work:Option<Request>,resources:Vec<Resource>,not_before:Instant,touched:Instant,last:u64,needed:bool}
 struct Pending {key:Key,identity:Identity,ticket:crate::executor::Ticket,resources:Vec<Resource>}
-pub struct Queue {executor:Arc<crate::executor::Executor>,entries:BTreeMap<Key,Entry>,pending:Option<Pending>,pending_sets:BTreeMap<Key,Pending>,sequence:u64,cursor:crate::fair_admission::Cursor}
+pub struct Queue {executor:Arc<crate::executor::Executor>,entries:BTreeMap<Key,Entry>,pending:Option<Pending>,pending_sets:BTreeMap<Key,Pending>,sequence:u64,cursor:crate::fair_admission::Cursor,
+    #[cfg(all(feature="state-store",target_os="linux"))]
+    verifier:Option<crate::canonical_verification_jobs::VerifierLane>}
 #[cfg(feature="state-store")]
 pub(crate) fn exclusive_root(identity:&Identity)->bool {
     identity.operation.starts_with("canonical-launch:")||identity.operation.starts_with("canonical-worker:")
@@ -33,8 +35,29 @@ fn completion_of(ticket:&crate::executor::Ticket,identity:&Identity)->Option<Res
     }
 }
 impl Queue {
-    pub fn new(executor:Arc<crate::executor::Executor>)->Self {Self{executor,entries:BTreeMap::new(),pending:None,pending_sets:BTreeMap::new(),sequence:0,cursor:crate::fair_admission::Cursor::default()}}
-    pub fn pending(&self)->bool {self.pending.is_some()||!self.pending_sets.is_empty()}
+    pub fn new(executor:Arc<crate::executor::Executor>)->Self {Self{executor,entries:BTreeMap::new(),pending:None,pending_sets:BTreeMap::new(),sequence:0,cursor:crate::fair_admission::Cursor::default(),
+        #[cfg(all(feature="state-store",target_os="linux"))]
+        verifier:None}}
+    /// Verification jobs get their own lane; without one they are never offered.
+    #[cfg(all(feature="state-store",target_os="linux"))]
+    pub fn with_verifier(mut self,lane:crate::canonical_verification_jobs::VerifierLane)->Self {self.verifier=Some(lane);self}
+    #[cfg(all(feature="state-store",target_os="linux"))]
+    pub fn offer_canonical_verification(&mut self,path:&Path,operation:&herdr_projects::domain::Operation,revision:u64,mode:crate::canonical_verification_jobs::Mode)->Result<()> {
+        let lane=self.verifier.as_mut().context("verifier lane unavailable")?;lane.offer(crate::canonical_verification_jobs::request(path,operation,revision,mode)?);Ok(())
+    }
+    /// One verifier at a time, never beside an exclusive root effect.
+    #[cfg(all(feature="state-store",target_os="linux"))]
+    pub fn admit_verifier(&mut self,allowed:impl Fn(&str)->bool)->Vec<String> {
+        if self.pending_exclusive_root(){return Vec::new();}
+        match self.verifier.as_mut() {Some(lane) if lane.offered_where(&allowed)=>lane.admit(),_=>Vec::new()}
+    }
+    fn verifier_pending(&self,project:Option<&str>)->bool {
+        #[cfg(all(feature="state-store",target_os="linux"))]
+        {self.verifier.as_ref().is_some_and(|lane|project.map_or(lane.pending(),|p|lane.pending_project(p)))}
+        #[cfg(not(all(feature="state-store",target_os="linux")))]
+        {let _=project;false}
+    }
+    pub fn pending(&self)->bool {self.pending.is_some()||!self.pending_sets.is_empty()||self.verifier_pending(None)}
     pub fn single_pending(&self)->bool {self.pending.is_some()}
     pub fn declared_pending(&self)->bool {!self.pending_sets.is_empty()}
     #[cfg(feature="state-store")]
@@ -47,7 +70,7 @@ impl Queue {
     pub fn offered_exclusive_root(&self)->bool {self.entries.values().any(|e|Instant::now()>=e.not_before&&e.work.as_ref().is_some_and(|r|r.deadline>Instant::now()&&exclusive_root(&r.identity)))}
 
     #[cfg(feature="state-store")]
-    pub fn pending_project(&self,project:&str)->bool {self.pending.as_ref().is_some_and(|p|p.key.0==project)||self.pending_sets.keys().any(|key|key.0==project)}
+    pub fn pending_project(&self,project:&str)->bool {self.pending.as_ref().is_some_and(|p|p.key.0==project)||self.pending_sets.keys().any(|key|key.0==project)||self.verifier_pending(Some(project))}
     fn held(&self,key:&Key)->bool {self.pending.as_ref().is_some_and(|p|&p.key==key)||self.pending_sets.contains_key(key)}
     pub fn outstanding(&self,project:&Project,id:&str)->bool {
         ["live-copy","final-copy"].iter().any(|kind|{
@@ -60,7 +83,11 @@ impl Queue {
         if self.held(&key){return;}
         if let Some(entry)=self.entries.get_mut(&key){entry.work=None;entry.needed=false;}
     }
-    pub fn offered(&self)->bool {self.entries.values().any(|e|e.work.is_some())}
+    pub fn offered(&self)->bool {
+        #[cfg(all(feature="state-store",target_os="linux"))]
+        if self.verifier.as_ref().is_some_and(|lane|lane.offered()){return true;}
+        self.entries.values().any(|e|e.work.is_some())
+    }
     fn prune(&mut self) {
         let now=Instant::now();let pending=self.pending.as_ref().map(|p|p.key.clone());
         let declared:BTreeSet<_>=self.pending_sets.keys().cloned().collect();
@@ -142,6 +169,8 @@ impl Queue {
             if let Some(result)=completion_of(&pending.ticket,&pending.identity) {finished.push((pending.key.clone(),result));}
         }
         let mut errors=Vec::new();
+        #[cfg(all(feature="state-store",target_os="linux"))]
+        if let Some(lane)=self.verifier.as_mut(){errors.extend(lane.drain());}
         for (key,result) in finished {
             let pending=if self.pending.as_ref().is_some_and(|p|p.key==key) {self.pending.take().unwrap()} else {self.pending_sets.remove(&key).unwrap()};
             errors.extend(self.settle(pending,result));

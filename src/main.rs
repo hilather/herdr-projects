@@ -21,6 +21,8 @@ mod canonical_finalization_jobs;
 mod canonical_brief_jobs;
 #[cfg(feature="state-store")]
 mod routine_jobs;
+#[cfg(all(feature="state-store",target_os="linux"))]
+mod canonical_verification_jobs;
 mod actions;
 mod agents;
 mod artifacts;

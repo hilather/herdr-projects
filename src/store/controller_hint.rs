@@ -60,7 +60,7 @@ pub(crate) fn read_with_launches(path:&Path,publication:&Publication,budget:&mut
         // dangling delivery as unknown rather than filtering it out via JOIN.
         let dangling:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operation_delivery d LEFT JOIN operations o ON o.id=d.operation_id WHERE d.state IN ('pending','ambiguous') AND o.id IS NULL)",[],|r|r.get(0))?;
         ensure!(!dangling,"controller hint has an unresolved dangling delivery");
-        let mut stmt=tx.prepare("SELECT o.id,o.kind,d.revision,d.state FROM operation_delivery d JOIN operations o ON o.id=d.operation_id WHERE (d.state='pending' AND d.next_due_ms<=?1 AND o.kind IN ('runtime.notification','runtime.finalization','runtime.worker_brief')) OR (d.state='ambiguous' AND o.kind='runtime.finalization')")?;
+        let mut stmt=tx.prepare("SELECT o.id,o.kind,d.revision,d.state FROM operation_delivery d JOIN operations o ON o.id=d.operation_id WHERE (d.state='pending' AND d.next_due_ms<=?1 AND o.kind IN ('runtime.notification','runtime.finalization','runtime.worker_brief','verification.run')) OR (d.state='ambiguous' AND o.kind IN ('runtime.finalization','verification.run'))")?;
         let mut rows=stmt.query([now])?;let mut candidates=Vec::new();
         while let Some(row)=rows.next()? {
             budget.record()?;measure(row,&[0,1,3],512,budget)?;budget.charge(32)?;

@@ -421,6 +421,8 @@ pub(crate) fn background_memory(ctx:&Ctx)->Result<Memory> {
     #[cfg(feature="state-store")]
     if cfg!(target_os="linux"){memory.canonical_observations=Some(crate::canonical_controller::observations::Reads::new(executor.clone()));}
     if cfg!(target_os="linux") {memory.copy_jobs=Some(crate::copy_jobs::Queue::new(executor.clone()));}
+    #[cfg(all(feature="state-store",target_os="linux"))]
+    {memory.copy_jobs=memory.copy_jobs.take().map(|queue|crate::canonical_verification_jobs::VerifierLane::new().map(|lane|queue.with_verifier(lane))).transpose()?;}
     memory.local_reports=Some(crate::local_reports::Reads::new(executor.clone()));
     if cfg!(target_os="linux"){memory.local_observations=Some(crate::local_observations::Reads::new(executor.clone()));}
     memory.pr_reads=Some(crate::pr_polling::Reads::with_executor(executor.clone()));
@@ -576,6 +578,12 @@ fn drain_executor(root:&Path,log:&Log,memory:&mut Memory)->Result<()> {
 /// Drain happens only at tick entry. Even a completed ticket holds its turn until
 /// then, preserving a full project effect pass before another background job.
 fn admit_background(_ctx:&Ctx,log:&Log,memory:&mut Memory,canonical:Vec<PathBuf>) {
+    // The verifier lane has its own executor; it waits only for the project's observations.
+    #[cfg(all(feature="state-store",target_os="linux"))]
+    if let Some(queue)=memory.copy_jobs.as_mut() {
+        let reads=memory.canonical_observations.as_ref();
+        for error in queue.admit_verifier(|project|!reads.is_some_and(|reads|reads.pending_project(project))){log.line(&error);}
+    }
     // The exclusive slot is still one ticket. Declared transfers may already be
     // running; top those up without admitting a launch or a routine beside them.
     if memory.copy_jobs.as_ref().is_some_and(|q|q.single_pending()){return;}

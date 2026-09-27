@@ -106,7 +106,6 @@ fn finish_poll(ctx:&Ctx,path:&Path,turn:u64,reachable:bool,observation_error:Opt
         Ok(report)=>report.pending,
         Err(error)=>{errors.push(format!("replan request service: {error:#}"));true},
     };
-    // Enqueue only: `verification.run` is not in the dispatch hint yet.
     let verification_work=match herdr_projects::store::service_project_verification_jobs(path) {
         Ok(report)=>report.pending,
         Err(error)=>{errors.push(format!("verification job service: {error:#}"));true},
@@ -183,6 +182,8 @@ fn dispatch_prepared(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::cop
         #[cfg(not(target_os="linux"))]
         anyhow::bail!("canonical termination requires Linux pidfs");
     }
+    // Verification runs only in the supervised verifier lane of the background ticker.
+    if operation.kind=="verification.run" {return Ok(false);}
     if hint.mode==EffectMode::Observe {
         ensure!(operation.kind=="runtime.finalization","unsupported observation hint");
         crate::finalization_delivery::observe(ctx,path,&operation.id,hint.delivery_revision,hint.head)?;
@@ -211,6 +212,8 @@ fn offer_next(ctx:&Ctx,path:&Path,turn:u64,effects:&mut crate::copy_jobs::Queue,
         "runtime.finalization"=>effects.offer_canonical_finalization(ctx,path,&hint.operation,hint.delivery_revision,match hint.mode {EffectMode::Deliver=>crate::canonical_finalization_jobs::Mode::Deliver,EffectMode::Observe=>crate::canonical_finalization_jobs::Mode::Observe})?,
         "runtime.launch" if hint.mode==EffectMode::Deliver=>effects.offer_canonical_launch(path,&hint.operation,hint.delivery_revision)?,
         "runtime.worker_brief"|"runtime.worker_termination"|"runtime.worker_brief_prepare"|"runtime.launch"=>effects.offer_canonical_brief(path,&hint.operation,hint.delivery_revision)?,
+        #[cfg(target_os="linux")]
+        "verification.run"=>effects.offer_canonical_verification(path,&hint.operation,hint.delivery_revision,match hint.mode {EffectMode::Deliver=>crate::canonical_verification_jobs::Mode::Deliver,EffectMode::Observe=>crate::canonical_verification_jobs::Mode::Observe})?,
         _=>anyhow::bail!("unsupported controller effect hint"),
     }
     Ok(false)

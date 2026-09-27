@@ -140,6 +140,7 @@ pub struct VerifyRequest {
     pub work_dir: PathBuf,
     pub(crate) unshare_program: PathBuf,
     pub(crate) fault: Fault,
+    pub(crate) cancellation: Option<crate::runner::Cancellation>,
 }
 
 impl VerifyRequest {
@@ -160,6 +161,7 @@ impl VerifyRequest {
             work_dir: work_dir.into(),
             unshare_program: PathBuf::from("/usr/bin/unshare"),
             fault: Fault::None,
+            cancellation: None,
         }
     }
 }
@@ -238,6 +240,86 @@ pub fn verify_project(project: &Path, request: &VerifyRequest) -> Result<VerifyO
     let outcome = outcome?;
     cleanup.context("verification recorded but scratch cleanup failed")?;
     Ok(outcome)
+}
+
+/// Automatic verifier timeout. The job lease (300 s) must cover the checkout,
+/// the check and the record.
+pub const AUTO_TIMEOUT: Duration = Duration::from_secs(240);
+
+/// One automatic verification job. The policy is the stored signed body, never
+/// an operator file, and the key is the job's operation id.
+pub struct StoredJob<'a> {
+    pub submission_id: &'a str,
+    pub policy_id: &'a str,
+    pub policy_digest: &'a str,
+    pub key: &'a str,
+    /// Deterministic per job; any leftover from an earlier attempt is removed first.
+    pub scratch: &'a Path,
+    pub cancellation: crate::runner::Cancellation,
+}
+
+/// Controller ingress. The caller holds project ownership and a live claim.
+/// The scratch directory is removed on every return path it can reach.
+pub fn verify_stored(store: &mut SqliteStore, job: &StoredJob<'_>) -> Result<VerifyOutcome> {
+    use std::os::unix::fs::DirBuilderExt;
+    clear_scratch(job.scratch)?;
+    let target = store.load_verify_target(job.submission_id, job.policy_id)?;
+    if sha256(&target.policy_body) != job.policy_digest {
+        bail!("stored acceptance policy changed since the job was enqueued");
+    }
+    let policy = target.policy_body.clone();
+    drop(target);
+    let parent = job.scratch.parent().context("verification scratch has no parent")?;
+    if let Err(error) = fs::DirBuilder::new().mode(0o700).create(parent) {
+        if error.kind() != std::io::ErrorKind::AlreadyExists { return Err(error.into()); }
+    }
+    if !fs::symlink_metadata(parent)?.is_dir() { bail!("verification scratch parent is not a directory"); }
+    fs::DirBuilder::new().mode(0o700).create(job.scratch).context("verification scratch directory")?;
+    let outcome = (|| {
+        let policy_path = job.scratch.join("policy.json");
+        fs::write(&policy_path, policy.as_bytes())?;
+        let mut request = VerifyRequest::new(job.submission_id, job.policy_id, policy_path, job.key, AUTO_TIMEOUT, job.scratch.join("work"));
+        request.cancellation = Some(job.cancellation.clone());
+        fs::DirBuilder::new().mode(0o700).create(&request.work_dir)?;
+        verify(store, &request)
+    })();
+    let cleanup = clear_scratch(job.scratch);
+    let outcome = outcome?;
+    cleanup.context("verification recorded but scratch cleanup failed")?;
+    Ok(outcome)
+}
+
+/// Remove a job's scratch directory, refusing to follow a symlink.
+pub fn clear_scratch(scratch: &Path) -> Result<()> {
+    match fs::symlink_metadata(scratch) {
+        Ok(meta) if meta.is_dir() => Ok(fs::remove_dir_all(scratch)?),
+        Ok(_) => bail!("verification scratch is not a directory"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The run recorded under `key`, if any: (run id, state). Only store rows count.
+pub fn recorded_run(store: &mut SqliteStore, project_store: &str, key: &str) -> Result<Option<(String, String)>> {
+    Ok(store.lookup_verification(project_store, key)?.map(|run| (run.run_id, run.state)))
+}
+
+/// Automatic runs never fall back to an unsandboxed check. Probe the same
+/// namespaces the verifier uses before any claim is taken.
+pub fn isolation_available() -> Result<()> {
+    let unshare = Path::new("/usr/bin/unshare");
+    if !unshare_ready(unshare) {
+        bail!("isolation unavailable: /usr/bin/unshare is missing or not root-owned");
+    }
+    let mut probe = crate::runner::Cmd::new(unshare.display().to_string(), Duration::from_secs(5));
+    probe.args = ["--user", "--map-root-user", "--mount", "--propagation", "private", "--pid", "--fork", "--mount-proc", "--kill-child=KILL", "--", "/bin/true"]
+        .into_iter().map(String::from).collect();
+    probe.env_clear = true;
+    let output = RealRunner.run(&probe).context("isolation unavailable")?;
+    if !output.success() {
+        bail!("isolation unavailable: unshare probe failed: {}", output.stderr.trim().chars().take(512).collect::<String>());
+    }
+    Ok(())
 }
 
 fn read_policy(path: &Path) -> Result<Vec<u8>> {
@@ -396,7 +478,7 @@ pub fn verify(store: &mut SqliteStore, request: &VerifyRequest) -> Result<Verify
             );
         }
     };
-    let launch = supervise::launch(&supervise::Spec {
+    let mut launch = supervise::launch(&supervise::Spec {
         unshare_program: request.unshare_program.clone(),
         timeout: request.timeout,
         checkout: checkout.path.clone(),
@@ -422,7 +504,10 @@ pub fn verify(store: &mut SqliteStore, request: &VerifyRequest) -> Result<Verify
             None,
         );
     }
+    launch.cmd.cancellation = request.cancellation.clone();
     let output = match RealRunner.run(&launch.cmd) {
+        // A cancelled check is no verdict: record nothing and let the caller retry.
+        Ok(output) if output.cancelled => bail!("verification cancelled before a verdict"),
         Ok(output) => output,
         Err(_) => {
             return persist(

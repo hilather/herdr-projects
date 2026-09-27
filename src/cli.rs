@@ -696,8 +696,12 @@ enum ResultCommand {
     Submit { #[arg(long)] input_file:PathBuf },
     /// Read stored submissions. Claimed checks are not evidence.
     Show { #[arg(long)] id:Option<String> },
-    /// Enable or disable automatic verification job enqueueing; does not run a verifier
+    /// Enable or disable automatic verification; the ticker runs each job in its verifier lane
     Auto { #[arg(long,value_parser=["on","off"])] verify:String, #[arg(long)] expected_head:u64 },
+    /// List automatic verification jobs, their delivery state and any pause reason
+    Jobs,
+    /// Return a permanently failed verification job to pending under the same run key
+    RetryVerification { operation:String, #[arg(long)] expected_revision:u64 },
 }
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
@@ -1189,6 +1193,8 @@ pub fn run() -> Result<()> {
                 },
                 ResultCommand::Show{id}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::show_results(&dir,id.as_deref())?)?),
                 ResultCommand::Auto{verify,expected_head}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::set_project_result_automation(&dir,expected_head,verify=="on")?)?),
+                ResultCommand::Jobs=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::project_verification_jobs(&dir)?)?),
+                ResultCommand::RetryVerification{operation,expected_revision}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::reset_project_verification_job(&dir,&operation,expected_revision)?)?),
             }
             Ok(())
         },

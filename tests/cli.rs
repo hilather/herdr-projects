@@ -1837,80 +1837,203 @@ fn ticker_canonical_routine_admits_from_hint_and_restart_keeps_one_execution() {
     let after=runtime::snapshot(&project).unwrap();assert_eq!(after.routine_receipts,before.routine_receipts);assert_eq!(after.deliveries,before.deliveries);assert_eq!(fs::read(project.join("ROUTINE_MARKER")).unwrap(),b"once");
 }
 
+/// An active project with an owner key, a SHA-256 repository with a base commit
+/// and a candidate commit adding `files`, driven only through the CLI and ticker.
+#[cfg(all(feature="state-store",target_os="linux"))]
+struct VerifyFixture {home:tempfile::TempDir,root:std::path::PathBuf,project:std::path::PathBuf,key:std::path::PathBuf,repo:std::path::PathBuf,store:String,base:String,candidate:String}
+#[cfg(all(feature="state-store",target_os="linux"))]
+struct Ticker(std::process::Child);
+#[cfg(all(feature="state-store",target_os="linux"))]
+impl Drop for Ticker {fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+#[cfg(all(feature="state-store",target_os="linux"))]
+impl VerifyFixture {
+    fn new(files:&[(&str,String)])->Self {
+        use std::fs;use herdr_projects::{domain::ProjectState,migration,runtime};
+        let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
+        for action in ["new","pause"]{assert!(hp(home.path(),&["--root",r,action,"demo"]).status.success());}
+        let key=home.path().join("owner");assert!(Command::new("/usr/bin/ssh-keygen").args(["-q","-t","ed25519","-N","","-f"]).arg(&key).output().unwrap().status.success());
+        let public=fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+        let project=root.join("demo");let config=home.path().join(".config/herdr-projects/config.toml");fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config,format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n")).unwrap();
+        let plan=migration::inspect_with_config(&project,&config).unwrap();migration::apply(&project,&plan,true).unwrap();
+        let s=runtime::snapshot(&project).unwrap();runtime::set_state(&project,s.head,s.control.unwrap().revision,ProjectState::Active,&config).unwrap();
+        let store=project.join(".state/state.db").canonicalize().unwrap().display().to_string();
+        let repo=home.path().join("repo");fs::create_dir(&repo).unwrap();
+        let mut fixture=VerifyFixture{home,root,project,key,repo,store,base:String::new(),candidate:String::new()};
+        fixture.git(&["init","-q","--object-format=sha256"]);fs::create_dir(fixture.repo.join("src")).unwrap();fs::write(fixture.repo.join("src/base.txt"),"base\n").unwrap();
+        fixture.git(&["add","."]);fixture.git(&["commit","-qm","base"]);fixture.base=fixture.git(&["rev-parse","HEAD"]);
+        for (path,text) in files {fs::write(fixture.repo.join(path),text).unwrap();}
+        fixture.git(&["add","."]);fixture.git(&["commit","-qm","result"]);fixture.candidate=fixture.git(&["rev-parse","HEAD"]);
+        fixture
+    }
+    fn r(&self)->&str {self.root.to_str().unwrap()}
+    fn db(&self)->rusqlite::Connection {rusqlite::Connection::open(self.project.join(".state/state.db")).unwrap()}
+    fn git(&self,args:&[&str])->String {
+        let out=Command::new("/usr/bin/git").env_clear().env("PATH","/usr/bin:/bin").env("HOME",self.home.path()).env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL","/dev/null")
+            .env("GIT_AUTHOR_NAME","fixture").env("GIT_AUTHOR_EMAIL","fixture@example.com").env("GIT_COMMITTER_NAME","fixture").env("GIT_COMMITTER_EMAIL","fixture@example.com")
+            .current_dir(&self.repo).args(args).output().unwrap();
+        assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+    /// A task with a running attempt, a signed contract carrying `policies`, and one submitted result.
+    fn submit(&self,task:&str,policies:&[(&str,String)])->String {
+        use std::fs;use herdr_projects::{authority::CONTRACT_SIGNATURE_NAMESPACE,domain::TaskId,runtime};
+        let head=runtime::add_task(&self.project,TaskId::new(task).unwrap(),"work".into(),runtime::snapshot(&self.project).unwrap().head).unwrap();
+        self.db().execute("INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) VALUES(?1,?2,1,'running',NULL,?1,0)",[format!("{task}-attempt"),task.to_owned()]).unwrap();
+        let repository=self.repo.canonicalize().unwrap().display().to_string();
+        let mut document=serde_json::to_vec_pretty(&serde_json::json!({
+            "version":3,"outputs":[{"path":"src/lib.rs","kind":"git_file"}],"scope":{"paths":[{"path":"src/","access":"write"}]},
+            "project_store":self.store,"expected_head":head,"task_id":task,"contract_revision":1,"deliverable":"ship","non_goals":"no launch",
+            "acceptance_policies":policies.iter().map(|(id,text)|serde_json::json!({"id":id,"text":text})).collect::<Vec<_>>(),
+            "repository":repository,"base_oid":self.base,"object_format":"sha256","dependencies":[],"capability_flags":[],
+            "profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_then_integrate","authority":herdr_projects::authority::policy_reference(&self.project).unwrap()
+        })).unwrap();document.push(b'\n');
+        let doc_path=self.home.path().join(format!("{task}-contract.json"));fs::write(&doc_path,&document).unwrap();
+        assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&self.key).args(["-n",CONTRACT_SIGNATURE_NAMESPACE]).arg(&doc_path).status().unwrap().success());
+        let installed=hp(self.home.path(),&["--root",self.r(),"task","demo","contract","put","--input-file",doc_path.to_str().unwrap(),"--signature",doc_path.with_extension("json.sig").to_str().unwrap()]);
+        assert!(installed.status.success(),"{}",String::from_utf8_lossy(&installed.stderr));let installed:serde_json::Value=serde_json::from_slice(&installed.stdout).unwrap();
+        let objects=self.git(&["rev-list","--objects","--all"]).lines().map(|line|{let oid=line.split_whitespace().next().unwrap();serde_json::json!({"oid":oid,"relative_path":format!("{}/{}",&oid[..2],&oid[2..])})}).collect::<Vec<_>>();
+        let submission=self.home.path().join(format!("{task}-result.json"));
+        fs::write(&submission,serde_json::to_vec(&serde_json::json!({"idempotency_key":format!("{task}-key"),"task_id":task,"contract_revision":1,"contract_digest":installed["digest"],"attempt_id":format!("{task}-attempt"),
+            "repository":repository,"base_oid":self.base,"candidate_oid":self.candidate,"object_format":"sha256",
+            "artifact_manifest":[{"path":"src/lib.rs","oid":self.candidate}],"claimed_checks":[],"objects":objects})).unwrap()).unwrap();
+        let submitted=hp(self.home.path(),&["--root",self.r(),"result","demo","submit","--input-file",submission.to_str().unwrap()]);
+        assert!(submitted.status.success(),"{}",String::from_utf8_lossy(&submitted.stderr));
+        serde_json::from_slice::<serde_json::Value>(&submitted.stdout).unwrap()["submission_id"].as_str().unwrap().to_owned()
+    }
+    fn automate(&self) {
+        let head=herdr_projects::runtime::snapshot(&self.project).unwrap().head.to_string();
+        let enabled=hp(self.home.path(),&["--root",self.r(),"result","demo","auto","--verify","on","--expected-head",&head]);
+        assert!(enabled.status.success(),"{}",String::from_utf8_lossy(&enabled.stderr));
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&enabled.stdout).unwrap()["verify"],true);
+    }
+    fn jobs(&self)->Vec<(herdr_projects::domain::Operation,herdr_projects::operations::Delivery)> {
+        let snapshot=herdr_projects::runtime::snapshot(&self.project).unwrap();
+        snapshot.operations.into_iter().filter(|op|op.kind=="verification.run").map(|op|{let d=snapshot.deliveries.iter().find(|d|d.operation==op.id).unwrap().clone();(op,d)}).collect()
+    }
+    fn spawn(&self)->Ticker {
+        Ticker(Command::new(BIN).env_clear().env("HOME",self.home.path()).env("PATH","/usr/bin:/bin").env("HERDR_BIN_PATH","/bin/false").args(["--root",self.r(),"ticker","run"])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap())
+    }
+    fn wait(&self,child:&mut Ticker,seconds:u64,predicate:&dyn Fn()->bool) {
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(seconds);
+        while !predicate(){assert!(child.0.try_wait().unwrap().is_none());assert!(std::time::Instant::now()<deadline,"{}\nverification jobs: {}",std::fs::read_to_string(self.root.join(".ticker.log")).unwrap_or_default(),String::from_utf8_lossy(&hp(self.home.path(),&["--root",self.r(),"result","demo","jobs"]).stdout));std::thread::sleep(std::time::Duration::from_millis(10));}
+    }
+    fn stop(&self,child:&mut Ticker) {
+        std::fs::write(self.root.join(".ticker.stop"),b"").unwrap();let deadline=std::time::Instant::now()+std::time::Duration::from_secs(8);
+        while child.0.try_wait().unwrap().is_none(){assert!(std::time::Instant::now()<deadline);std::thread::sleep(std::time::Duration::from_millis(10));}
+        std::fs::remove_file(self.root.join(".ticker.stop")).unwrap();
+    }
+}
+
 #[cfg(all(feature="state-store",target_os="linux"))]
 #[test]
 fn ticker_enqueues_one_verification_job_per_policy_across_restart() {
-    use std::{fs,process::Stdio,time::{Duration,Instant}};
-    use herdr_projects::{authority::CONTRACT_SIGNATURE_NAMESPACE,domain::*,migration,runtime,operations::DeliveryState};
+    use herdr_projects::operations::DeliveryState;
     use sha2::{Digest,Sha256};
-    let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
-    for action in ["new","pause"]{assert!(hp(home.path(),&["--root",r,action,"demo"]).status.success());}
-    let key=home.path().join("owner");assert!(Command::new("/usr/bin/ssh-keygen").args(["-q","-t","ed25519","-N","","-f"]).arg(&key).output().unwrap().status.success());
-    let public=fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
-    let project=root.join("demo");let config=home.path().join(".config/herdr-projects/config.toml");fs::create_dir_all(config.parent().unwrap()).unwrap();
-    fs::write(&config,format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n")).unwrap();
-    let plan=migration::inspect_with_config(&project,&config).unwrap();migration::apply(&project,&plan,true).unwrap();
-    let s=runtime::snapshot(&project).unwrap();runtime::set_state(&project,s.head,s.control.unwrap().revision,ProjectState::Active,&config).unwrap();
-    let head=runtime::add_task(&project,TaskId::new("task").unwrap(),"work".into(),runtime::snapshot(&project).unwrap().head).unwrap();
-    let db_path=project.join(".state/state.db");let store=db_path.canonicalize().unwrap().display().to_string();
-    rusqlite::Connection::open(&db_path).unwrap().execute("INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) VALUES('attempt-1','task',1,'running',NULL,'slot-1',0)",[]).unwrap();
-    let repo=home.path().join("repo");fs::create_dir(&repo).unwrap();
-    let git=|args:&[&str]|{
-        let out=Command::new("/usr/bin/git").env_clear().env("PATH","/usr/bin:/bin").env("HOME",home.path()).env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL","/dev/null")
-            .env("GIT_AUTHOR_NAME","fixture").env("GIT_AUTHOR_EMAIL","fixture@example.com").env("GIT_COMMITTER_NAME","fixture").env("GIT_COMMITTER_EMAIL","fixture@example.com")
-            .current_dir(&repo).args(args).output().unwrap();
-        assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));String::from_utf8(out.stdout).unwrap().trim().to_owned()
-    };
-    git(&["init","-q","--object-format=sha256"]);fs::create_dir(repo.join("src")).unwrap();fs::write(repo.join("src/base.txt"),"base\n").unwrap();git(&["add","."]);git(&["commit","-qm","base"]);let base=git(&["rev-parse","HEAD"]);
-    fs::write(repo.join("src/lib.rs"),"pub fn result() {}\n").unwrap();git(&["add","."]);git(&["commit","-qm","result"]);let candidate=git(&["rev-parse","HEAD"]);
-    let policies=[("builds",r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#),("clean",r#"{"version":1,"checks":["/usr/bin/true"]}"#)];
-    let mut document=serde_json::to_vec_pretty(&serde_json::json!({
-        "version":3,"outputs":[{"path":"src/lib.rs","kind":"git_file"}],"scope":{"paths":[{"path":"src/","access":"write"}]},
-        "project_store":store,"expected_head":head,"task_id":"task","contract_revision":1,"deliverable":"ship","non_goals":"no launch",
-        "acceptance_policies":policies.iter().map(|(id,text)|serde_json::json!({"id":id,"text":text})).collect::<Vec<_>>(),
-        "repository":repo.canonicalize().unwrap().display().to_string(),"base_oid":base,"object_format":"sha256","dependencies":[],"capability_flags":[],
-        "profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_then_integrate","authority":herdr_projects::authority::policy_reference(&project).unwrap()
-    })).unwrap();document.push(b'\n');
-    let doc_path=home.path().join("contract.json");fs::write(&doc_path,&document).unwrap();
-    assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&key).args(["-n",CONTRACT_SIGNATURE_NAMESPACE]).arg(&doc_path).status().unwrap().success());
-    let installed=hp(home.path(),&["--root",r,"task","demo","contract","put","--input-file",doc_path.to_str().unwrap(),"--signature",home.path().join("contract.json.sig").to_str().unwrap()]);
-    assert!(installed.status.success(),"{}",String::from_utf8_lossy(&installed.stderr));let installed:serde_json::Value=serde_json::from_slice(&installed.stdout).unwrap();
-    let objects=git(&["rev-list","--objects","--all"]).lines().map(|line|{let oid=line.split_whitespace().next().unwrap();serde_json::json!({"oid":oid,"relative_path":format!("{}/{}",&oid[..2],&oid[2..])})}).collect::<Vec<_>>();
-    let submission=home.path().join("result.json");
-    fs::write(&submission,serde_json::to_vec(&serde_json::json!({"idempotency_key":"cli-key","task_id":"task","contract_revision":1,"contract_digest":installed["digest"],"attempt_id":"attempt-1",
-        "repository":repo.canonicalize().unwrap().display().to_string(),"base_oid":base,"candidate_oid":candidate,"object_format":"sha256",
-        "artifact_manifest":[{"path":"src/lib.rs","oid":candidate}],"claimed_checks":[],"objects":objects})).unwrap()).unwrap();
-    let submitted=hp(home.path(),&["--root",r,"result","demo","submit","--input-file",submission.to_str().unwrap()]);
-    assert!(submitted.status.success(),"{}",String::from_utf8_lossy(&submitted.stderr));
-    let submission_id=serde_json::from_slice::<serde_json::Value>(&submitted.stdout).unwrap()["submission_id"].as_str().unwrap().to_owned();
-    struct Child(std::process::Child);impl Drop for Child{fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
-    let spawn=||Child(Command::new(BIN).env_clear().env("HOME",home.path()).env("PATH","/usr/bin:/bin").env("HERDR_BIN_PATH","/bin/false").args(["--root",r,"ticker","run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
-    let wait=|child:&mut Child,predicate:&dyn Fn()->bool|{let deadline=Instant::now()+Duration::from_secs(35);while !predicate(){assert!(child.0.try_wait().unwrap().is_none());assert!(Instant::now()<deadline,"{}",fs::read_to_string(root.join(".ticker.log")).unwrap_or_default());std::thread::sleep(Duration::from_millis(10));}};
-    let stop=|child:&mut Child|{fs::write(root.join(".ticker.stop"),b"").unwrap();let deadline=Instant::now()+Duration::from_secs(8);while child.0.try_wait().unwrap().is_none(){assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(10));}fs::remove_file(root.join(".ticker.stop")).unwrap();};
+    let f=VerifyFixture::new(&[("src/lib.rs","pub fn result() {}\n".into())]);
+    let policies=[("builds",r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#.to_owned()),("clean",r#"{"version":1,"checks":["/usr/bin/true"]}"#.to_owned())];
+    let submission_id=f.submit("task",&policies);
     // The metrics file is rewritten after every ticker turn has polled each canonical project.
-    let metrics=root.join(".ticker-metrics.json");
-    let turn=||{let _=fs::remove_file(&metrics);let mut child=spawn();wait(&mut child,&||metrics.is_file());stop(&mut child);};
-    let jobs=||runtime::snapshot(&project).unwrap().operations.into_iter().filter(|op|op.kind=="verification.run").collect::<Vec<_>>();
-    let runs=||rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT count(*) FROM verification_runs",[],|row|row.get::<_,u64>(0)).unwrap();
+    let metrics=f.root.join(".ticker-metrics.json");
+    let turn=||{let _=std::fs::remove_file(&metrics);let mut child=f.spawn();f.wait(&mut child,35,&||metrics.is_file());f.stop(&mut child);};
+    let runs=||f.db().query_row("SELECT count(*) FROM verification_runs",[],|row|row.get::<_,u64>(0)).unwrap();
     turn();
-    assert!(jobs().is_empty(),"automation is off by default");
-    let enabled=hp(home.path(),&["--root",r,"result","demo","auto","--verify","on","--expected-head",&runtime::snapshot(&project).unwrap().head.to_string()]);
-    assert!(enabled.status.success(),"{}",String::from_utf8_lossy(&enabled.stderr));
-    assert_eq!(serde_json::from_slice::<serde_json::Value>(&enabled.stdout).unwrap()["verify"],true);
-    let mut child=spawn();wait(&mut child,&||jobs().len()>=2);stop(&mut child);
+    assert!(f.jobs().is_empty(),"automation is off by default");
+    f.automate();
     let mut expected=policies.iter().map(|(id,text)|{
         let digest=format!("{:x}",Sha256::digest(text.as_bytes()));
-        format!("{:x}",Sha256::digest(serde_json::to_vec(&serde_json::json!([store,submission_id,1,id,digest])).unwrap()))
+        format!("{:x}",Sha256::digest(serde_json::to_vec(&serde_json::json!([f.store,submission_id,1,id,digest])).unwrap()))
     }).collect::<Vec<_>>();expected.sort();
+    // The first pass only enqueues; nothing has been offered or run yet.
+    turn();
+    let jobs=f.jobs();assert_eq!(jobs.iter().map(|(op,_)|op.id.as_str().to_owned()).collect::<Vec<_>>(),expected);
+    assert!(jobs.iter().all(|(_,d)|d.state==DeliveryState::Pending&&d.attempts==0));assert_eq!(runs(),0);
+    // An operator retires one job before it runs; it never runs until explicitly retried.
+    let (retired,delivery)=jobs[0].clone();let head=herdr_projects::runtime::snapshot(&f.project).unwrap().head.to_string();
+    let out=hp(f.home.path(),&["--root",f.r(),"operations","demo","retire",retired.id.as_str(),"--reason","fixture","--expected-revision",&delivery.revision.to_string(),"--expected-head",&head]);
+    assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let state=|id:&herdr_projects::domain::OperationId|f.jobs().into_iter().find(|(op,_)|&op.id==id).unwrap().1;
+    let mut child=f.spawn();f.wait(&mut child,90,&||f.jobs().iter().any(|(op,d)|op.id!=retired.id&&d.state==DeliveryState::Confirmed));f.stop(&mut child);
+    assert_eq!(state(&retired.id).state,DeliveryState::PermanentFailure);assert_eq!(runs(),1);
+    let out=hp(f.home.path(),&["--root",f.r(),"result","demo","retry-verification",retired.id.as_str(),"--expected-revision",&state(&retired.id).revision.to_string()]);
+    assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let listed:serde_json::Value=serde_json::from_slice(&hp(f.home.path(),&["--root",f.r(),"result","demo","jobs"]).stdout).unwrap();
+    assert_eq!(listed.as_array().unwrap().iter().find(|job|job["operation"]==retired.id.as_str()).unwrap()["delivery"]["state"],"pending");
+    let settled=||{let jobs=f.jobs();jobs.len()==2&&jobs.iter().all(|(_,d)|d.state==DeliveryState::Confirmed)};
+    let mut child=f.spawn();f.wait(&mut child,90,&settled);f.stop(&mut child);
+    // Each job ran once under its own key: one run per policy, never a duplicate.
     let check=||{
-        let snapshot=runtime::snapshot(&project).unwrap();let found=jobs();
-        assert_eq!(found.iter().map(|op|op.id.as_str().to_owned()).collect::<Vec<_>>(),expected);
-        for op in &found {let delivery=snapshot.deliveries.iter().find(|d|d.operation==op.id).unwrap();assert_eq!(delivery.state,DeliveryState::Pending);assert_eq!(delivery.attempts,0);}
-        assert_eq!(runs(),0);
+        let found=f.jobs();
+        assert_eq!(found.iter().map(|(op,_)|op.id.as_str().to_owned()).collect::<Vec<_>>(),expected);
+        for (op,delivery) in &found {
+            assert_eq!(delivery.state,DeliveryState::Confirmed);assert_eq!(delivery.attempts,1);
+            assert_eq!(f.db().query_row("SELECT count(*) FROM verification_runs WHERE idempotency_key=?1",[op.id.as_str()],|row|row.get::<_,u64>(0)).unwrap(),1);
+        }
+        assert_eq!(runs(),2);
     };
     check();
     turn();
     check();
+}
+
+#[cfg(all(feature="state-store",target_os="linux"))]
+#[test]
+fn ticker_auto_verifies_once_and_recovers_after_kill() {
+    use std::{io::{Read,Write},sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering}}};
+    use herdr_projects::{migration,runtime,operations::DeliveryState};
+    // The check speaks git's native protocol to a local fixture that holds each
+    // reply until released, so the ticker can be killed while the check runs.
+    let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();let port=listener.local_addr().unwrap().port();
+    let released=Arc::new(AtomicBool::new(false));let connections=Arc::new(AtomicUsize::new(0));
+    {let released=released.clone();let connections=connections.clone();std::thread::spawn(move||for stream in listener.incoming(){
+        let Ok(mut stream)=stream else{continue};connections.fetch_add(1,Ordering::SeqCst);let released=released.clone();
+        std::thread::spawn(move||{let mut buffer=[0u8;4096];let _=stream.read(&mut buffer);while !released.load(Ordering::SeqCst){std::thread::sleep(std::time::Duration::from_millis(10));}let _=stream.write_all(b"0000");let _=stream.read(&mut buffer);});
+    });}
+    // Three separated conflicting hunks: `git merge-file -p` exits 3 without writing.
+    let hunks=|side:&str|(1..=3).map(|n|format!("{side}{n}\n{}",(1..=8).map(|m|format!("same{n}{m}\n")).collect::<String>())).collect::<String>();
+    let f=VerifyFixture::new(&[("src/lib.rs","pub fn result() {}\n".into()),("src/m-base.txt",hunks("base")),("src/m-ours.txt",hunks("ours")),("src/m-theirs.txt",hunks("theirs"))]);
+    let wait_submission=f.submit("wait",&[("waits",format!(r#"{{"version":1,"checks":["/usr/bin/git","ls-remote","git://127.0.0.1:{port}/fixture"]}}"#))]);
+    let fail_submission=f.submit("fail",&[("exits-3",r#"{"version":1,"checks":["/usr/bin/git","merge-file","-p","src/m-ours.txt","src/m-base.txt","src/m-theirs.txt"]}"#.to_owned())]);
+    for (consumer,predecessor) in [("wait-consumer","wait"),("fail-consumer","fail")] {
+        let head=runtime::add_task(&f.project,herdr_projects::domain::TaskId::new(consumer).unwrap(),consumer.into(),runtime::snapshot(&f.project).unwrap().head).unwrap();
+        let request=f.home.path().join(format!("{consumer}.json"));
+        std::fs::write(&request,serde_json::json!({"priority":0,"dependencies":[{"predecessor":predecessor,"requirement":"verified_result"}]}).to_string()).unwrap();
+        let queued=hp(f.home.path(),&["--root",f.r(),"task","demo","queue",consumer,"--input-file",request.to_str().unwrap(),"--expected-revision","1","--expected-head",&head.to_string()]);
+        assert!(queued.status.success(),"{}",String::from_utf8_lossy(&queued.stderr));
+    }
+    f.automate();
+    let job=|submission:&str|f.jobs().into_iter().find(|(op,_)|op.payload["submission_id"]==submission);
+    let runs=|submission:&str|f.db().query_row("SELECT count(*) FROM verification_runs WHERE submission_id=?1",[submission],|row|row.get::<_,u64>(0)).unwrap();
+    let scratch=f.project.join(".verify-scratch");
+    let mut child=f.spawn();
+    f.wait(&mut child,90,&||connections.load(Ordering::SeqCst)>=1&&job(&wait_submission).is_some_and(|(_,d)|d.state==DeliveryState::Claimed));
+    let (op,_)=job(&wait_submission).unwrap();
+    assert!(scratch.join(op.id.as_str()).is_dir(),"the running job uses its deterministic scratch directory");
+    child.0.kill().unwrap();child.0.wait().unwrap();
+    // The orphaned check may finish, but only the killed controller could have recorded it.
+    released.store(true,Ordering::SeqCst);
+    let (_,claimed)=job(&wait_submission).unwrap();assert_eq!(claimed.state,DeliveryState::Claimed);assert_eq!(runs(&wait_submission),0);
+    migration::open_active(&f.project).unwrap().expire_claims(claimed.lease_until_ms.unwrap()+1).unwrap();
+    assert_eq!(job(&wait_submission).unwrap().1.state,DeliveryState::Ambiguous);
+    let mut child=f.spawn();
+    f.wait(&mut child,120,&||f.jobs().len()==2&&f.jobs().iter().all(|(_,d)|d.state==DeliveryState::Confirmed));
+    f.stop(&mut child);
+    let raw=f.db();
+    // The lost reply was observed by key and redelivered under the same key: exactly one run and one receipt.
+    let (op,delivery)=job(&wait_submission).unwrap();assert_eq!(delivery.attempts,2);
+    let (state,key,exit_status):(String,String,Option<i64>)=raw.query_row("SELECT state,idempotency_key,exit_status FROM verification_runs WHERE submission_id=?1",[&wait_submission],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+    assert_eq!((state.as_str(),key.as_str(),exit_status),("accepted",op.id.as_str(),Some(0)));
+    assert_eq!(runs(&wait_submission),1);
+    assert_eq!(raw.query_row("SELECT count(*) FROM verified_results WHERE submission_id=?1",[&wait_submission],|row|row.get::<_,u64>(0)).unwrap(),1);
+    let valid=|task:&str|raw.query_row("SELECT count(*) FROM dependency_satisfactions WHERE task_id=?1 AND state='valid'",[task],|row|row.get::<_,u64>(0)).unwrap();
+    assert_eq!(valid("wait-consumer"),1);
+    // A policy exiting 3 is a recorded rejection with its real status; it releases nothing.
+    let (state,reason,exit_status):(String,Option<String>,Option<i64>)=raw.query_row("SELECT state,reason,exit_status FROM verification_runs WHERE submission_id=?1",[&fail_submission],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+    assert_eq!((state.as_str(),reason.as_deref(),exit_status),("rejected",Some("checks_failed"),Some(3)));
+    assert_eq!(runs(&fail_submission),1);
+    assert_eq!(raw.query_row("SELECT count(*) FROM verified_results WHERE submission_id=?1",[&fail_submission],|row|row.get::<_,u64>(0)).unwrap(),0);
+    assert_eq!(valid("fail-consumer"),0);
+    assert_eq!(std::fs::read_dir(&scratch).map(|entries|entries.count()).unwrap_or(0),0,"scratch is removed after every job");
 }
 
 #[cfg(feature="state-store")]

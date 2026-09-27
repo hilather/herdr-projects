@@ -1,6 +1,6 @@
-//! Durable automatic verification jobs (enqueue only). An enqueued job grants
-//! no execution authority and is not verification evidence; no dispatcher
-//! offers `verification.run` yet.
+//! Durable automatic verification jobs. An enqueued job grants no execution
+//! authority and is not verification evidence; only a recorded verification run
+//! under the job key can confirm its delivery.
 use super::*;
 use serde::Serialize;
 
@@ -10,6 +10,24 @@ const TURN_LIMIT: usize = 8;
 pub struct ResultAutomationControl { pub revision: u64, pub verify: bool }
 #[derive(Debug, Default, Serialize)]
 pub struct VerificationJobTurn { pub pending: bool, pub enqueued: usize }
+#[derive(Debug, Serialize)]
+pub struct VerificationJob { pub operation: OperationId, pub submission_id: String, pub policy_id: String, pub delivery: crate::operations::Delivery, pub paused: Option<String> }
+
+/// Sealed confirmation: the evidence must name a run recorded under this job's
+/// key, submission, policy and store. Caller- or worker-written text cannot.
+pub(super) fn has_run(db: &Connection, id: &OperationId, run_id: &str) -> Result<bool> {
+    Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM verification_runs r JOIN operations o ON o.id=?1
+        WHERE r.run_id=?2 AND r.idempotency_key=o.idempotency_key AND r.project_store=json_extract(o.payload,'$.project_store')
+          AND r.submission_id=json_extract(o.payload,'$.submission_id') AND r.policy_id=json_extract(o.payload,'$.policy_id'))",
+        params![id.as_str(), run_id], |row| row.get(0))?)
+}
+/// The pause reason stands until the job is next claimed, finished or reset.
+const LATEST: &str = "SELECT kind,payload FROM events WHERE entity=?1 AND kind IN ('verification.paused','verification.job_reset','operation.claimed','operation.outcome') ORDER BY sequence DESC LIMIT 1";
+fn paused(db: &Connection, id: &OperationId) -> Result<Option<String>> {
+    let latest: Option<(String, String)> = db.query_row(LATEST, [id.as_str()], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+    Ok(latest.filter(|(kind, _)| kind == "verification.paused")
+        .and_then(|(_, payload)| serde_json::from_str::<serde_json::Value>(&payload).ok()?["reason"].as_str().map(str::to_owned)))
+}
 
 struct Candidate {
     submission_id: String,
@@ -98,6 +116,48 @@ impl SqliteStore {
         tx.commit()?;
         Ok(VerificationJobTurn { pending: more, enqueued })
     }
+    /// Records why a pending job was not started (for example, no isolation).
+    /// Repeating the same reason appends nothing.
+    pub fn note_verification_paused(&mut self, id: &OperationId, reason: &str) -> Result<()> {
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;check_schema(&tx)?;
+        let reason: String = reason.chars().take(1024).collect();
+        let revision: u64 = tx.query_row("SELECT d.revision FROM operation_delivery d JOIN operations o ON o.id=d.operation_id WHERE o.id=?1 AND o.kind='verification.run' AND d.state='pending'", [id.as_str()], |row| row.get(0))?;
+        if paused(&tx, id)?.as_deref() != Some(reason.as_str()) {
+            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('verification.paused',?1,?2,1,?3)", params![id.as_str(), integer(revision)?, serde_json::json!({"reason":reason}).to_string()])?;
+        }
+        tx.commit()?;Ok(())
+    }
+    pub fn verification_jobs(&mut self) -> Result<Vec<VerificationJob>> {
+        let tx = self.connection.transaction()?;check_schema(&tx)?;
+        let ids = {
+            let mut stmt = tx.prepare("SELECT id,json_extract(payload,'$.submission_id'),json_extract(payload,'$.policy_id') FROM operations WHERE kind='verification.run' ORDER BY id")?;
+            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut jobs = Vec::new();
+        for (id, submission_id, policy_id) in ids {
+            let operation = OperationId::new(id).map_err(StoreError::Corrupt)?;
+            let delivery = super::delivery::delivery(&tx, &operation)?;
+            let paused = if delivery.state == crate::operations::DeliveryState::Pending { paused(&tx, &operation)? } else { None };
+            jobs.push(VerificationJob { operation, submission_id, policy_id, delivery, paused });
+        }
+        tx.commit()?;Ok(jobs)
+    }
+    /// Operator retry of a permanently failed job: the same operation (and so
+    /// the same run key) returns to pending. Claim history is kept, so the
+    /// generic 32-claim bound still applies; an exhausted job is refused.
+    pub fn reset_verification_job(&mut self, id: &OperationId, expected_revision: u64, now: i64) -> Result<crate::operations::Delivery> {
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;check_schema(&tx)?;
+        let kind: String = tx.query_row("SELECT kind FROM operations WHERE id=?1", [id.as_str()], |row| row.get(0))?;
+        let old = super::delivery::delivery(&tx, id)?;
+        if kind != "verification.run" || old.revision != expected_revision || old.state != crate::operations::DeliveryState::PermanentFailure { return Err(StoreError::Conflict); }
+        if old.attempts >= 32 { return Err(StoreError::Invalid("claim history is exhausted; verify this policy manually with `result verify`".into())); }
+        let revision = old.revision.checked_add(1).ok_or(StoreError::Conflict)?;
+        tx.execute("UPDATE operation_delivery SET revision=?2,state='pending',owner=NULL,lease_until_ms=NULL,next_due_ms=?3 WHERE operation_id=?1", params![id.as_str(), integer(revision)?, now])?;
+        tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('verification.job_reset',?1,?2,1,?3)",
+            params![id.as_str(), integer(revision)?, serde_json::json!({"attempts":old.attempts,"previous":old.last_outcome}).to_string()])?;
+        let delivery = super::delivery::delivery(&tx, id)?;
+        tx.commit()?;Ok(delivery)
+    }
 }
 
 pub fn set_project_result_automation(project: &Path, expected_head: u64, verify: bool) -> anyhow::Result<ResultAutomationControl> {
@@ -109,4 +169,12 @@ pub fn service_project_verification_jobs(project: &Path) -> anyhow::Result<Verif
     let _guard = crate::migration::runtime_mutation(project)?;
     let control = controlled::ReadControl::new(std::time::Instant::now() + Duration::from_secs(2), Default::default());
     Ok(crate::migration::open_active_scoped(project, control)?.service_verification_jobs()?)
+}
+pub fn project_verification_jobs(project: &Path) -> anyhow::Result<Vec<VerificationJob>> {
+    Ok(crate::migration::open_active(project)?.verification_jobs()?)
+}
+pub fn reset_project_verification_job(project: &Path, id: &str, expected_revision: u64) -> anyhow::Result<crate::operations::Delivery> {
+    let _guard = crate::migration::runtime_mutation(project)?;
+    let id = OperationId::new(id.to_owned()).map_err(anyhow::Error::msg)?;
+    Ok(crate::migration::open_active(project)?.reset_verification_job(&id, expected_revision, jiff::Timestamp::now().as_millisecond())?)
 }
