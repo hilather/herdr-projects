@@ -1,6 +1,6 @@
 # F1 automatic verification and integration dispatch
 
-Status: card 1 merged (#42), cards 2–4 open. Planned 27 September 2026. Scope is the dependent vertical slice (F1):
+Status: cards 1–2 merged (#42, #48), cards 3–4 open. Planned 27 September 2026. Scope is the dependent vertical slice (F1):
 verified worker results are integrated automatically and release dependents.
 Each card is one reviewable PR. Work stops at each card's stop condition; gaps
 found along the way are recorded as new cards, not folded into the current one.
@@ -48,12 +48,13 @@ template. Stored verification/integration receipts already write
   keeps two and creates no `verification_runs`.
 - Stop: that test passes and existing tests are unchanged.
 
-### 2. Supervised verifier job with recovery
+### 2. Supervised verifier job with recovery — done (#48)
 
 - `canonical_verification_jobs.rs` on the finalization-job template; queue,
   hint (pending and ambiguous) and `offer_next` wiring; a separate lane.
 - `verification/mod.rs` gains an internal entry taking the stored policy bytes
-  and a deterministic scratch directory `.state/scratch/verify/<op>`.
+  and a deterministic scratch directory `<project>/.verify-scratch/<op>` (beside
+  `.state`: the verifier refuses a checkout inside the store directory).
 - Card 1 inserts `verification.run` operations without an `operation_delivery`
   row; create it (pending) when the job becomes dispatchable.
 - Recovery: unrecorded or lease-expired jobs look up the run by key and confirm
@@ -134,5 +135,14 @@ Recorded here rather than folded into the card that found them.
   is a port: replay it onto `main`, re-verify, add a tick-level E2E (the review
   noted none drives a full canonical `tick()`), then close both threads in
   Herdr. Do after F1.
+- **Verification jobs bound to an older task revision never run.** A task
+  revision change after enqueue leaves the job pending and unclaimable, and it
+  keeps counting toward backlog age. Retire and re-enqueue such jobs.
+- **The verifier holds project ownership for the whole check** (up to about
+  4 minutes), as the operator `verify` command does, blocking other effects in
+  that project and root-exclusive operations. Consider narrowing it to the
+  store transactions.
+- **No E2E for the isolation-unavailable pause** (`verification.paused`); it
+  cannot be simulated from outside without a hook in the shipped binary.
 - **Replace-verdict tests** (352 in `docs/reviews/2026-09-27-test-audit.tsv`):
   convert to E2E alongside feature work, starting with `store/barriers.rs`.
