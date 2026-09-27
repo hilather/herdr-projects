@@ -1,0 +1,38 @@
+#!/bin/sh
+# Build a host-native factory package without replacing the plugin executable.
+set -eu
+if [ "$#" -ne 0 ]; then
+    echo 'usage: scripts/build-factory' >&2
+    exit 2
+fi
+if [ "$(uname -s)" != Linux ]; then
+    echo 'Factory packages require Linux; macOS and SSH execution are not certified. See docs/factory/packaging.md.' >&2
+    exit 1
+fi
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+host=$(rustc -vV | sed -n 's/^host: //p')
+case "$host" in
+    *-linux-*) ;;
+    *) echo 'A Linux host Rust toolchain is required.' >&2; exit 1 ;;
+esac
+cd "$repo"
+cargo build --release --locked --features state-store --target-dir "$repo/target/factory" --target "$host"
+binary="$repo/target/factory/$host/release/herdr-projects"
+# Refuse incompatible linked SQLite before creating any package. This command
+# reads only compiled/runtime library information; it does not open a project.
+"$binary" build-info --require-factory >/dev/null
+mkdir -p "$repo/target/factory/packages"
+package=$(mktemp -d "$repo/target/factory/packages/package.XXXXXXXX")
+trap 'rm -rf -- "$package"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+install -m 755 "$binary" "$package/herdr-projects"
+"$package/herdr-projects" build-info --require-factory >"$package/build-info.json"
+install -m 644 docs/factory/packaging.md "$package/README.md"
+(
+    cd "$package"
+    sha256sum herdr-projects build-info.json README.md >SHA256SUMS
+)
+trap - EXIT HUP INT TERM
+printf '%s\n' "$package"

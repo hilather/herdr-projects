@@ -4,10 +4,14 @@ use std::collections::{BTreeMap,BTreeSet,VecDeque};
 fn schema(db:&Connection)->Result<()> {check_schema(db)?;let version:u32=db.query_row("PRAGMA user_version",[],|r|r.get(0))?;if version<10 {return Err(StoreError::UnsupportedSchema(version));}Ok(())}
 fn invalid(message:&str)->StoreError {StoreError::Invalid(message.into())}
 pub(crate) fn graph(tasks:&[Task],queue:&[QueueRecord])->Result<()> {
+    let task_ids:BTreeSet<_>=tasks.iter().map(|t|t.id.clone()).collect();
+    graph_ids(&task_ids,queue,None)
+}
+fn graph_ids(task_ids:&BTreeSet<TaskId>,queue:&[QueueRecord],budget:Option<&read_budget::ReadBudget>)->Result<()> {
     if queue.len()>10_000{return Err(invalid("queued task inventory exceeds 10000"));}
-    let task_ids:BTreeSet<_>=tasks.iter().map(|t|&t.id).collect();
     let mut degree:BTreeMap<TaskId,usize>=BTreeMap::new();let mut followers:BTreeMap<TaskId,Vec<TaskId>>=BTreeMap::new();let mut edge_count=0;
     for record in queue {
+        if let Some(budget)=budget {budget.check()?;}
         if !task_ids.contains(&record.task){return Err(invalid("queued task is missing"));}
         degree.entry(record.task.clone()).or_default();let mut seen=BTreeSet::new();
         for edge in &record.dependencies {
@@ -17,16 +21,21 @@ pub(crate) fn graph(tasks:&[Task],queue:&[QueueRecord])->Result<()> {
         }
     }
     let mut ready:VecDeque<_>=degree.iter().filter(|(_,n)|**n==0).map(|(id,_)|id.clone()).collect();let mut visited=0;
-    while let Some(id)=ready.pop_front(){visited+=1;if let Some(next)=followers.get(&id){for id in next {let n=degree.get_mut(id).unwrap();*n-=1;if *n==0{ready.push_back(id.clone());}}}}
+    while let Some(id)=ready.pop_front(){if let Some(budget)=budget {budget.check()?;}visited+=1;if let Some(next)=followers.get(&id){for id in next {let n=degree.get_mut(id).unwrap();*n-=1;if *n==0{ready.push_back(id.clone());}}}}
     if visited!=degree.len(){return Err(invalid("dependency cycle"));}Ok(())
 }
 pub(super) fn read(db:&Connection)->Result<SchedulerSnapshot> {read_with_tasks(db,&read_tasks(db)?,None)}
-pub(super) fn read_with_tasks(db:&Connection,tasks:&[Task],budget:Option<&read_budget::ReadBudget>)->Result<SchedulerSnapshot> {
+pub(super) fn read_policy(db:&Connection,budget:Option<&read_budget::ReadBudget>)->Result<SchedulerPolicy> {
     let mut stmt=db.prepare("SELECT revision,max_active_workers,max_attempts_per_task FROM scheduler_policy WHERE singleton=1")?;
     let mut rows=stmt.query([])?;
     let r=rows.next()?.ok_or_else(||StoreError::from(rusqlite::Error::QueryReturnedNoRows))?;
     if let Some(budget)=budget {budget.row(r,&[])?;}
     let policy=SchedulerPolicy{revision:r.get(0)?,max_active_workers:r.get(1)?,max_attempts_per_task:r.get(2)?};
+    if policy.revision==0 || policy.max_active_workers>1024 || !(1..=32).contains(&policy.max_attempts_per_task) {return Err(StoreError::Corrupt("invalid scheduler policy".into()));}
+    Ok(policy)
+}
+pub(super) fn read_with_tasks(db:&Connection,tasks:&[Task],budget:Option<&read_budget::ReadBudget>)->Result<SchedulerSnapshot> {
+    let policy=read_policy(db,budget)?;
     let mut stmt=db.prepare("SELECT task_id,priority,enqueued_unix_ms,enqueue_sequence FROM task_queue ORDER BY enqueue_sequence,task_id")?;
     let mut rows=stmt.query([])?;
     let mut queue=Vec::new();
@@ -45,47 +54,166 @@ pub(super) fn read_with_tasks(db:&Connection,tasks:&[Task],budget:Option<&read_b
     }
     graph(tasks,&queue)?;Ok(SchedulerSnapshot{policy,queue})
 }
-impl SqliteStore {
-    pub fn set_scheduler_policy(&mut self,head_expected:u64,revision:u64,max_active_workers:u32,max_attempts_per_task:u32)->Result<u64> {
-        if max_active_workers>1024||!(1..=32).contains(&max_attempts_per_task){return Err(invalid("invalid scheduler limits"));}
-        let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;if head(&tx)?!=head_expected{return Err(StoreError::Conflict);}
-        let old=read(&tx)?.policy;if old.revision!=revision{return Err(StoreError::Conflict);}
-        if old.max_active_workers==max_active_workers&&old.max_attempts_per_task==max_attempts_per_task{return Ok(head_expected);}
-        let policy=SchedulerPolicy{revision:revision.checked_add(1).ok_or_else(||invalid("policy revision exhausted"))?,max_active_workers,max_attempts_per_task};
-        tx.execute("UPDATE scheduler_policy SET revision=?1,max_active_workers=?2,max_attempts_per_task=?3 WHERE singleton=1",params![integer(policy.revision)?,max_active_workers,max_attempts_per_task])?;
-        tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('scheduler.policy_changed','scheduler',?1,1,?2)",params![integer(policy.revision)?,serde_json::to_string(&policy).map_err(|e|invalid(&e.to_string()))?])?;
-        let result=head(&tx)?;tx.commit()?;Ok(result)
+// Graph validation needs identities and edges, not unrelated task payloads or
+// retired attempts. Preserve validation of the whole bounded queue graph.
+fn queue_graph(db:&Connection,budget:&read_budget::ReadBudget)->Result<(BTreeSet<TaskId>,Vec<QueueRecord>)> {
+    let mut identities=BTreeSet::new();
+    let mut queue=Vec::new();
+    let mut stmt=db.prepare("SELECT q.task_id,q.priority,q.enqueued_unix_ms,q.enqueue_sequence,t.id FROM task_queue q LEFT JOIN tasks t ON t.id=q.task_id ORDER BY q.enqueue_sequence,q.task_id LIMIT 10001")?;
+    let mut rows=stmt.query([])?;
+    while let Some(row)=rows.next()? {
+        budget.row(row,&[])?;
+        if queue.len()==10_000 {return Err(invalid("queued task inventory exceeds 10000"));}
+        if row.get::<_,Option<String>>(4)?.is_none() {return Err(invalid("queued task is missing"));}
+        let id=TaskId::new(row.get::<_,String>(0)?).map_err(StoreError::Corrupt)?;
+        identities.insert(id.clone());
+        queue.push(QueueRecord{task:id,priority:row.get(1)?,enqueued_unix_ms:row.get(2)?,enqueue_sequence:row.get(3)?,dependencies:Vec::new()});
     }
-    pub fn queue_task(&mut self,id:&TaskId,revision:u64,head_expected:u64,request:&QueueRequest,now:i64)->Result<u64> {
+    let index:BTreeMap<_,_>=queue.iter().enumerate().map(|(i,q)|(q.task.as_str().to_string(),i)).collect();
+    let mut stmt=db.prepare("SELECT d.task_id,d.predecessor_id,d.requirement,t.id FROM task_dependencies d LEFT JOIN tasks t ON t.id=d.predecessor_id ORDER BY d.task_id,d.predecessor_id LIMIT 100001")?;
+    let mut rows=stmt.query([])?;
+    let mut edges=0;
+    while let Some(row)=rows.next()? {
+        budget.row(row,&[])?;edges+=1;
+        if edges>100_000 {return Err(invalid("dependency inventory exceeds bounds"));}
+        if row.get::<_,Option<String>>(3)?.is_none() {return Err(invalid("missing, duplicate or self dependency"));}
+        let task:String=row.get(0)?;
+        let predecessor=TaskId::new(row.get::<_,String>(1)?).map_err(StoreError::Corrupt)?;
+        let requirement=match row.get::<_,String>(2)?.as_str(){
+            "verified_result"=>DependencyRequirement::VerifiedResult,"integrated_commit"=>DependencyRequirement::IntegratedCommit,
+            "integration_candidate"=>DependencyRequirement::IntegrationCandidate,"landed_commit"=>DependencyRequirement::LandedCommit,
+            _=>return Err(StoreError::Corrupt("unknown dependency requirement".into())),
+        };
+        let at=*index.get(&task).ok_or_else(||StoreError::Corrupt("dependency has no queue record".into()))?;
+        if queue[at].dependencies.len()==256 {return Err(invalid("dependency inventory exceeds bounds"));}
+        identities.insert(predecessor.clone());
+        queue[at].dependencies.push(Dependency{predecessor,requirement});
+    }
+    graph_ids(&identities,&queue,Some(budget))?;
+    Ok((identities,queue))
+}
+
+fn queue_task_on(tx:&Connection,id:&TaskId,revision:u64,head_expected:u64,request:&QueueRequest,now:i64,budget:&read_budget::ReadBudget)->Result<u64> {
         super::delivery::now_check(now)?;if !(-20..=20).contains(&request.priority)||request.dependencies.len()>256{return Err(invalid("queue priority/dependency limits exceeded"));}
-        let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;if head(&tx)?!=head_expected{return Err(StoreError::Conflict);}
-        let tasks=read_tasks(&tx)?;let mut task=tasks.iter().find(|t|&t.id==id&&t.revision==revision).cloned().ok_or(StoreError::Conflict)?;
-        if task.active_attempt.is_some()||matches!(task.state,TaskState::Running|TaskState::Succeeded|TaskState::Cancelled)||read_attempts(&tx)?.iter().any(|a|&a.task==id&&a.retains_capacity()){return Err(invalid("task execution or terminal disposition must be reconciled before queueing"));}
-        let mut queue=read(&tx)?.queue;let previous=queue.iter().find(|q|&q.task==id).cloned();let mut dependencies=request.dependencies.clone();dependencies.sort_by(|a,b|a.predecessor.cmp(&b.predecessor));
+        schema(tx)?;if head(tx)?!=head_expected{return Err(StoreError::Conflict);}
+        let mut task=read_task_with_budget(tx,id.as_str(),Some(budget))?;if task.revision!=revision{return Err(StoreError::Conflict);}
+        if task.active_attempt.is_some()||matches!(task.state,TaskState::Running|TaskState::Succeeded|TaskState::Cancelled)||tx.query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE task_id=?1 AND termination_observed=0)",[id.as_str()],|row|row.get::<_,bool>(0))?{return Err(invalid("task execution or terminal disposition must be reconciled before queueing"));}
+        let (mut identities,mut queue)=queue_graph(tx,budget)?;let previous=queue.iter().find(|q|&q.task==id).cloned();let mut dependencies=request.dependencies.clone();dependencies.sort_by(|a,b|a.predecessor.cmp(&b.predecessor));
         if previous.as_ref().is_some_and(|p|p.priority==request.priority&&p.dependencies==dependencies)&&task.state==TaskState::Queued{return Ok(head_expected);}
         let record=QueueRecord{task:id.clone(),priority:request.priority,enqueued_unix_ms:previous.as_ref().map(|p|p.enqueued_unix_ms).unwrap_or(now),enqueue_sequence:previous.as_ref().map(|p|p.enqueue_sequence).unwrap_or(head_expected.checked_add(1).ok_or_else(||invalid("sequence exhausted"))?),dependencies};
-        queue.retain(|q|&q.task!=id);queue.push(record.clone());graph(&tasks,&queue)?;
+        identities.insert(id.clone());
+        for edge in &record.dependencies {budget.check()?;if tx.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1)",[edge.predecessor.as_str()],|row|row.get::<_,bool>(0))? {identities.insert(edge.predecessor.clone());}}
+        queue.retain(|q|&q.task!=id);queue.push(record.clone());graph_ids(&identities,&queue,Some(budget))?;
         task.revision=revision.checked_add(1).ok_or_else(||invalid("task revision exhausted"))?;task.state=TaskState::Queued;
         tx.execute("UPDATE tasks SET revision=?2,state='queued' WHERE id=?1",params![id.as_str(),integer(task.revision)?])?;
         tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('task.changed',?1,?2,1,?3)",params![id.as_str(),integer(task.revision)?,serde_json::to_string(&task).map_err(|e|invalid(&e.to_string()))?])?;
         tx.execute("INSERT INTO task_queue VALUES(?1,?2,?3,?4) ON CONFLICT(task_id) DO UPDATE SET priority=excluded.priority",params![id.as_str(),record.priority,record.enqueued_unix_ms,integer(record.enqueue_sequence)?])?;
         tx.execute("DELETE FROM task_dependencies WHERE task_id=?1",[id.as_str()])?;
         for edge in &record.dependencies {tx.execute("INSERT INTO task_dependencies VALUES(?1,?2,?3)",params![id.as_str(),edge.predecessor.as_str(),edge.requirement.as_str()])?;}
-        super::satisfaction::attach_stored_receipts(&tx, id.as_str())?;
+        super::satisfaction::attach_stored_receipts_with_budget(tx, id.as_str(), budget)?;
         tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('scheduler.task_queued',?1,?2,1,?3)",params![id.as_str(),integer(task.revision)?,serde_json::to_string(&record).map_err(|e|invalid(&e.to_string()))?])?;
-        let result=head(&tx)?;tx.commit()?;Ok(result)
+        budget.check()?;head(tx)
+
+}
+
+impl SqliteStore {
+    pub fn set_scheduler_policy(&mut self,head_expected:u64,revision:u64,max_active_workers:u32,max_attempts_per_task:u32)->Result<u64> {
+        self.set_scheduler_policy_with_budget(head_expected,revision,max_active_workers,max_attempts_per_task,None)
+    }
+    pub(crate) fn set_scheduler_policy_with_budget(&mut self,head_expected:u64,revision:u64,max_active_workers:u32,max_attempts_per_task:u32,budget:Option<&read_budget::ReadBudget>)->Result<u64> {
+        if let Some(budget)=budget {budget.check()?;}
+        if max_active_workers>1024||!(1..=32).contains(&max_attempts_per_task){return Err(invalid("invalid scheduler limits"));}
+        let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;if head(&tx)?!=head_expected{return Err(StoreError::Conflict);}
+        let old=read_policy(&tx,budget)?;if old.revision!=revision{return Err(StoreError::Conflict);}
+        if old.max_active_workers==max_active_workers&&old.max_attempts_per_task==max_attempts_per_task{return Ok(head_expected);}
+        let policy=SchedulerPolicy{revision:revision.checked_add(1).ok_or_else(||invalid("policy revision exhausted"))?,max_active_workers,max_attempts_per_task};
+        tx.execute("UPDATE scheduler_policy SET revision=?1,max_active_workers=?2,max_attempts_per_task=?3 WHERE singleton=1",params![integer(policy.revision)?,max_active_workers,max_attempts_per_task])?;
+        tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('scheduler.policy_changed','scheduler',?1,1,?2)",params![integer(policy.revision)?,serde_json::to_string(&policy).map_err(|e|invalid(&e.to_string()))?])?;
+        let result=head(&tx)?;if let Some(budget)=budget {budget.check()?;}tx.commit()?;Ok(result)
+    }
+    pub fn queue_task(&mut self,id:&TaskId,revision:u64,head_expected:u64,request:&QueueRequest,now:i64)->Result<u64> {
+        let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result=read_budget::with_local_deadline(&tx, |budget| queue_task_on(&tx,id,revision,head_expected,request,now,budget))?;
+        tx.commit()?;Ok(result)
+    }
+    pub(crate) fn queue_task_with_budget(&mut self,id:&TaskId,revision:u64,head_expected:u64,request:&QueueRequest,now:i64,budget:&read_budget::ReadBudget)->Result<u64> {
+        budget.check()?;
+        let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result=queue_task_on(&tx,id,revision,head_expected,request,now,budget)?;
+        budget.check()?;tx.commit()?;Ok(result)
     }
     pub fn queue_report(&mut self,now:i64)->Result<QueueReport> {
-        super::delivery::now_check(now)?;let tx=self.connection.transaction()?;schema(&tx)?;let scheduler=read(&tx)?;let tasks=read_tasks(&tx)?;let attempts=read_attempts(&tx)?;let control=super::control::read(&tx)?;
-        let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
-        let approvals=if version>=13 {super::approvals::read_all(&tx)?}else{Vec::new()};
-        let reported=queue_blockers(&tx,now,&tasks,&attempts,&scheduler,&control,&approvals)?;
-        let admission_on=super::satisfaction::admission_enabled(&tx)?;
-        let retained_attempts=attempts.iter().filter(|a|a.retains_capacity()).count();let available_slots=(scheduler.policy.max_active_workers as usize).saturating_sub(retained_attempts);
-        let launch_enabled=automatic_launch_enabled(admission_on,&reported);
-        let capability=CapabilityReport{prepared_dispatch:true,automatic_admission:admission_on,dependency_producers:false,integration:"unavailable",blockers:vec!["automatic_admission_does_not_draft_sign_or_reserve".into()]};
-        let report=QueueReport{head:head(&tx)?,policy:scheduler.policy,retained_attempts,available_slots,launch_enabled,capability,entries:reported};tx.commit()?;Ok(report)
+        let tx=self.connection.transaction()?;
+        let report=read_budget::with_local_deadline(&tx,|budget|queue_report_on(&tx,now,budget))?;
+        tx.commit()?;Ok(report)
     }
+    pub(crate) fn queue_report_with_budget(&mut self,now:i64,budget:&read_budget::ReadBudget)->Result<QueueReport> {
+        budget.check()?;
+        let tx=self.connection.transaction()?;
+        let report=queue_report_on(&tx,now,budget)?;
+        budget.check()?;tx.commit()?;Ok(report)
+    }
+}
+
+fn unused_launch_grant(db:&Connection,task:&str,version:u32,budget:&read_budget::ReadBudget)->Result<bool> {
+    if version<13 {return Ok(false);}
+    let mut stmt=db.prepare("SELECT g.id FROM approval_grants g WHERE json_extract(g.payload,'$.scope.task')=?1 AND json_extract(g.payload,'$.scope.class')='runtime_launch' AND NOT EXISTS(SELECT 1 FROM approval_uses u WHERE u.approval_id=g.id) ORDER BY g.id LIMIT 129")?;
+    let mut rows=stmt.query([task])?;
+    let mut count=0;
+    while let Some(row)=rows.next()? {
+        budget.row(row,&[])?;count+=1;
+        if count>128 {return Err(StoreError::Limit("queue approval candidates exceed 128".into()));}
+        let id:String=row.get(0)?;
+        let grant=super::approvals::grant(db,&id,Some(budget))?;
+        if grant.scope.task.as_str()==task && grant.scope.class==ApprovalClass::RuntimeLaunch {return Ok(true);}
+    }
+    Ok(false)
+}
+
+fn queue_report_on(db:&Connection,now:i64,budget:&read_budget::ReadBudget)->Result<QueueReport> {
+    super::delivery::now_check(now)?;schema(db)?;
+    let policy=read_policy(db,Some(budget))?;
+    let (_,queue)=queue_graph(db,budget)?;
+    let control=super::control::read_with_budget(db,Some(budget))?;
+    let version:u32=db.query_row("PRAGMA user_version",[],|row|row.get(0))?;
+    let admission_on=super::satisfaction::admission_enabled(db)?;
+    let retained_attempts:usize=db.query_row("SELECT count(*) FROM attempts WHERE termination_observed=0",[],|row|row.get(0))?;
+    let available_slots=(policy.max_active_workers as usize).saturating_sub(retained_attempts);
+    let budget_blockers=super::budget::admission_blockers_with_budget(db,budget)?;
+    let mut tasks=BTreeMap::new();
+    for record in &queue {
+        for id in std::iter::once(&record.task).chain(record.dependencies.iter().map(|edge|&edge.predecessor)) {
+            if !tasks.contains_key(id) {tasks.insert(id.clone(),read_task_with_budget(db,id.as_str(),Some(budget))?);}
+        }
+    }
+    let mut entries=Vec::new();
+    for record in &queue {
+        budget.check()?;
+        let task=&tasks[&record.task];let mut blockers=Vec::new();
+        if !super::contract_binding::queue_matches_with_budget(db,task.id.as_str(),Some(budget))? {blockers.push("contract_dependency_mismatch".into());}
+        if task.state!=TaskState::Queued {blockers.push(format!("task_state:{:?}",task.state));}
+        if control.state!=ProjectState::Active||control.reconciliation_required {blockers.push("project_not_admitted".into());}
+        if available_slots==0 {blockers.push("capacity_full".into());}
+        let held:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE task_id=?1 AND termination_observed=0)",[task.id.as_str()],|row|row.get(0))?;
+        if held {blockers.push("task_capacity_retained".into());}
+        if super::admission_read::attempt_count(db,task.id.as_str(),policy.max_attempts_per_task)? >= policy.max_attempts_per_task as u64 {blockers.push("attempt_limit".into());}
+        for edge in &record.dependencies {
+            if let Some(blocker)=super::satisfaction::dependency_blocker_with_budget(db,task.id.as_str(),&tasks[&edge.predecessor],edge.requirement,admission_on,Some(budget))? {blockers.push(blocker);}
+        }
+        if let Some(blocker)=super::capabilities::queue_capability_blocker_with_budget(db,task.id.as_str(),now,Some(budget))? {blockers.push(blocker);}
+        blockers.extend(budget_blockers.iter().cloned());
+        if !unused_launch_grant(db,task.id.as_str(),version,budget)? {blockers.push("owner_signature_not_scheduled".into());}
+        let retained_launch:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE task_id=?1 AND termination_observed=0 AND state IN ('reserved','launching','running','awaiting_input'))",[task.id.as_str()],|row|row.get(0))?;
+        if !retained_launch {blockers.push("launch_reserve_not_scheduled".into());blockers.push("controller_requires_reserved_attempt".into());}
+        let score=now.saturating_sub(record.enqueued_unix_ms).max(0)/60_000+record.priority as i64;
+        entries.push((record.enqueue_sequence,QueueEntry{task:task.id.clone(),task_revision:task.revision,effective_priority:score,blockers}));
+    }
+    entries.sort_by(|a,b|b.1.effective_priority.cmp(&a.1.effective_priority).then(a.0.cmp(&b.0)).then(a.1.task.cmp(&b.1.task)));
+    let entries:Vec<_>=entries.into_iter().map(|(_,entry)|entry).collect();
+    let launch_enabled=automatic_launch_enabled(admission_on,&entries);
+    let capability=CapabilityReport{prepared_dispatch:true,automatic_admission:admission_on,dependency_producers:false,integration:if cfg!(target_os="linux") {"operator_local"} else {"unavailable"},blockers:vec!["automatic_admission_does_not_draft_sign_or_reserve".into()]};
+    budget.check()?;
+    Ok(QueueReport{head:head(db)?,policy,retained_attempts,available_slots,launch_enabled,capability,entries})
 }
 
 pub(super) fn queue_blockers(db:&Connection,now:i64,tasks:&[Task],attempts:&[Attempt],scheduler:&SchedulerSnapshot,control:&ProjectControl,approvals:&[ApprovalRecord])->Result<Vec<QueueEntry>> {
@@ -94,6 +222,7 @@ pub(super) fn queue_blockers(db:&Connection,now:i64,tasks:&[Task],attempts:&[Att
     let budget_blockers=super::budget::report(db,false)?.blockers;let mut entries=Vec::new();
     for record in &scheduler.queue {
         let task=tasks.iter().find(|t|t.id==record.task).ok_or(StoreError::Conflict)?;let mut blockers=Vec::new();
+        if !super::contract_binding::queue_matches(db, task.id.as_str())? { blockers.push("contract_dependency_mismatch".into()); }
         if task.state!=TaskState::Queued {blockers.push(format!("task_state:{:?}",task.state));}
         if control.state!=ProjectState::Active||control.reconciliation_required {blockers.push("project_not_admitted".into());}
         if available_slots==0{blockers.push("capacity_full".into());}
@@ -153,7 +282,7 @@ mod tests {
     #[test]
     fn prepared_dispatch_stays_true_while_dependency_evidence_stays_blocked() {
         let(_temp,mut db)=fixture();queue(&mut db,"a",&request(0,&["b"]),0).unwrap();let report=db.queue_report(0).unwrap();
-        assert!(!report.launch_enabled);assert!(report.capability.prepared_dispatch);assert!(!report.capability.automatic_admission);assert!(!report.capability.dependency_producers);assert_eq!(report.capability.integration,"unavailable");
+        assert!(!report.launch_enabled);assert!(report.capability.prepared_dispatch);assert!(!report.capability.automatic_admission);assert!(!report.capability.dependency_producers);assert_eq!(report.capability.integration,if cfg!(target_os="linux") {"operator_local"} else {"unavailable"});
         assert_eq!(report.capability.blockers,vec!["automatic_admission_does_not_draft_sign_or_reserve".to_string()]);
         assert!(report.entries[0].blockers.iter().any(|b|b=="verified_dependency_evidence_unavailable:b:verified_result"));
         for stage in ["owner_signature_not_scheduled","launch_reserve_not_scheduled","controller_requires_reserved_attempt"] {assert!(report.entries[0].blockers.iter().any(|b|b==stage));}
@@ -169,7 +298,7 @@ mod tests {
         let s=db.read_snapshot(None).unwrap();let task=s.tasks.iter().find(|t|t.id.as_str()=="c").unwrap();
         let store_path=std::fs::canonicalize(temp.path().join("state.db")).unwrap().display().to_string();
         let profile=crate::domain::profile::fixture(crate::migration::ConfigReference{path:store_path.clone(),digest:None});
-        let inputs=LaunchInputs{version:2,project_store:store_path.clone(),task:task.id.clone(),task_revision:task.revision,scheduler_revision:1,control_epoch:0,binding:"local".into(),binding_revision:1,binding_digest:"a".repeat(64),profile:profile.reference().unwrap(),effective_profile:Some(profile.clone()),approval:VersionedReference{id:"pending".into(),revision:1,digest:"0".repeat(64)},config:crate::migration::ConfigReference{path:store_path,digest:None},repositories:vec![],dependencies:vec![],memory:None,budget:None};
+        let inputs=LaunchInputs{task_contract: None, version:2,project_store:store_path.clone(),task:task.id.clone(),task_revision:task.revision,scheduler_revision:1,control_epoch:0,binding:"local".into(),binding_revision:1,binding_digest:"a".repeat(64),profile:profile.reference().unwrap(),effective_profile:Some(profile.clone()),approval:VersionedReference{id:"pending".into(),revision:1,digest:"0".repeat(64)},config:crate::migration::ConfigReference{path:store_path,digest:None},repositories:vec![],dependencies:vec![],memory:None,budget:None};
         let grant=ApprovalGrant{version:1,scope:ApprovalScope::for_launch(&inputs).unwrap(),policy:profile.permission_policy,issued_unix_ms:0,expires_unix_ms:100_000};
         db.install_approval(&PreparedApproval{grant},s.head,1_000).unwrap();
         let report=db.queue_report(1_000).unwrap();assert!(!report.launch_enabled);
@@ -198,5 +327,5 @@ fn unrelated_task_count_never_makes_a_committed_store_unreadable() {
         let count=if chunk==10 {1}else{1000};let head=db.read_snapshot(None).unwrap().head;let mutations=(0..count).map(|i|{let id=TaskId::new(format!("task-{}",chunk*1000+i)).unwrap();Mutation::Task{expected:None,next:Task{id,revision:1,state:TaskState::Draft,title:"unqueued".into(),active_attempt:None}}}).collect();db.commit(Commit{expected_head:head,mutations}).unwrap();
     }
     let before=db.read_snapshot(None).unwrap();assert_eq!(before.tasks.len(),10_001);assert!(db.queue_report(0).unwrap().entries.is_empty());drop(db);
-    let raw=Connection::open(&path).unwrap();raw.execute_batch("DROP INDEX IF EXISTS attempts_retained_by_id; DROP TABLE IF EXISTS active_work_index; DROP TABLE IF EXISTS active_work_meta; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_update; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_delete; DROP TRIGGER IF EXISTS barrier_members_no_update; DROP TRIGGER IF EXISTS barrier_members_no_delete; DROP TRIGGER IF EXISTS barrier_revisions_no_membership_update; DROP TABLE IF EXISTS barrier_stale_briefs; DROP TABLE IF EXISTS barrier_members; DROP TABLE IF EXISTS barrier_revisions; DROP TRIGGER IF EXISTS memory_change_receipts_no_update; DROP TRIGGER IF EXISTS memory_change_receipts_no_delete; DROP TRIGGER IF EXISTS update_package_members_no_update; DROP TRIGGER IF EXISTS update_package_members_no_delete; DROP TRIGGER IF EXISTS update_packages_no_update; DROP TRIGGER IF EXISTS update_packages_no_delete; DROP TABLE IF EXISTS memory_change_receipts; DROP TABLE IF EXISTS update_package_members; ALTER TABLE consumer_bindings DROP COLUMN applied_cursor; DROP TABLE IF EXISTS update_packages; DROP TRIGGER IF EXISTS memory_read_set_on_record; DROP TRIGGER IF EXISTS memory_read_set_on_reclassify; DROP TRIGGER IF EXISTS memory_read_set_on_revision; DROP TRIGGER IF EXISTS memory_read_set_on_validity; DROP TRIGGER IF EXISTS memory_read_set_on_head; DROP TABLE IF EXISTS memory_scope_catalog; DROP TABLE IF EXISTS memory_required_generation; DROP TABLE IF EXISTS consumer_binding_undeliverable; DROP TABLE IF EXISTS consumer_binding_obligations; DROP TABLE IF EXISTS consumer_bindings; DROP TABLE IF EXISTS wait_replay_events; DROP TABLE IF EXISTS replan_requests; DROP TABLE IF EXISTS replan_budget_resets; DROP TABLE IF EXISTS attempt_infrastructure_retries; DROP TABLE IF EXISTS wait_conditions; DROP TABLE IF EXISTS resource_claims; DROP TABLE IF EXISTS delegation_stop_obligations; DROP TABLE IF EXISTS delegation_revocations; DROP TABLE IF EXISTS delegation_grants; DROP TABLE IF EXISTS capability_evidence; DROP TABLE IF EXISTS contract_named_resources; DROP TABLE IF EXISTS contract_scope_paths; DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; DROP TABLE IF EXISTS dependency_satisfactions; DROP TABLE IF EXISTS factory_admission_policies; ALTER TABLE project_control DROP COLUMN factory_admission; DROP TABLE IF EXISTS feedback_claims; DROP TABLE IF EXISTS feedback_items; DROP TABLE IF EXISTS integrated_commits; DROP TABLE IF EXISTS integration_candidates; DROP TABLE IF EXISTS integration_operations; DROP TABLE IF EXISTS integration_target_leases; DROP TABLE IF EXISTS integration_targets; DROP TABLE IF EXISTS verified_results; DROP TABLE IF EXISTS verification_runs; DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; UPDATE store_meta SET schema_version=9; PRAGMA user_version=9;").unwrap();drop(raw);let mut db=SqliteStore::open(&path).unwrap();db.upgrade_v1().unwrap();assert_eq!(db.read_snapshot(None).unwrap().tasks,before.tasks);let head=db.read_snapshot(None).unwrap().head;db.queue_task(&TaskId::new("task-0").unwrap(),1,head,&QueueRequest{priority:0,dependencies:vec![]},0).unwrap();assert_eq!(db.queue_report(0).unwrap().entries.len(),1);
+    let raw=Connection::open(&path).unwrap();crate::store::test_schema::historical(&raw, 9).unwrap();drop(raw);let mut db=SqliteStore::open(&path).unwrap();db.upgrade_v1().unwrap();assert_eq!(db.read_snapshot(None).unwrap().tasks,before.tasks);let head=db.read_snapshot(None).unwrap().head;db.queue_task(&TaskId::new("task-0").unwrap(),1,head,&QueueRequest{priority:0,dependencies:vec![]},0).unwrap();assert_eq!(db.queue_report(0).unwrap().entries.len(),1);
 }

@@ -25,6 +25,18 @@ fn fixture()->(tempfile::TempDir,std::path::PathBuf) {
 fn deadline()->Instant {Instant::now()+Duration::from_secs(5)}
 
 #[test]
+fn synchronous_turn_keeps_the_same_rotation_and_withdrawal_rules() {
+    let(_root,project)=fixture();
+    fs::write(project.join("a-first.sh"),"changed after approval").unwrap();
+    for turn in 0..4 {
+        let report=super::super::schedule_turn(&project,turn).unwrap();
+        assert!(report.active);assert_eq!(report.diagnostic.is_some(),turn%2==0);
+    }
+    assert_eq!(runtime::snapshot(&project).unwrap().routine_occurrences.len(),1);
+    assert!(!project.join("MUST_NOT_EXECUTE").exists());
+}
+
+#[test]
 fn held_planning_rotates_after_withdrawn_script_and_only_records_intent() {
     let(_root,project)=fixture();let guard=ProjectGuard::acquire(&project).unwrap();let cancellation=Cancellation::default();
     fs::write(project.join("a-first.sh"),"changed after approval").unwrap();

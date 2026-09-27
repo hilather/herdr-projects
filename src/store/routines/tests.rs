@@ -12,6 +12,126 @@ fn tick(db:&mut SqliteStore,d:&RoutineDefinition,now:i64)->Result<Option<Routine
     let head=db.read_snapshot(None)?.head;db.schedule_routine(&PreparedRoutineTick{definition:d.clone(),now},head)
 }
 #[test]
+fn planning_selection_uses_current_revisions_and_rejects_selected_corruption() {
+    let(_temp,mut db,mut d)=fixture(MissedRunPolicy::CoalesceLatest);
+    d.revision=2;
+    let head=db.current_head().unwrap();
+    db.install_routine(&PreparedRoutine{definition:d.clone()},head).unwrap();
+    let expected_head=db.current_head().unwrap();
+    db.connection.execute_batch("DROP TRIGGER routine_revisions_no_update").unwrap();
+    db.connection.execute("UPDATE routine_revisions SET payload=?1 WHERE revision=1",[serde_json::to_string(&"x".repeat(17*1024*1024)).unwrap()]).unwrap();
+    let control=super::super::controlled::ReadControl::new(std::time::Instant::now()+std::time::Duration::from_secs(5),Default::default());
+    let budget=super::super::read_budget::ReadBudget::new(control);
+    let(head,selected)=db.routine_planning_selection(Some("check"),&budget).unwrap();
+    assert_eq!(head,expected_head);assert_eq!(selected,Some(d));
+    assert!(db.read_snapshot(None).is_err(),"administrative validation still catches historical corruption");
+    db.connection.execute("UPDATE routine_revisions SET payload='{}' WHERE revision=2",[]).unwrap();
+    assert!(db.routine_planning_selection(None,&budget).is_err());
+}
+
+#[test]
+fn planning_selection_does_not_revive_an_enabled_historical_revision() {
+    let(_temp,mut db,mut d)=fixture(MissedRunPolicy::CoalesceLatest);
+    d.revision=2;d.enabled=false;
+    let head=db.current_head().unwrap();db.install_routine(&PreparedRoutine{definition:d},head).unwrap();
+    let control=super::super::controlled::ReadControl::new(std::time::Instant::now()+std::time::Duration::from_secs(5),Default::default());
+    let budget=super::super::read_budget::ReadBudget::new(control);
+    assert!(db.routine_planning_selection(None,&budget).unwrap().1.is_none());
+}
+
+#[test]
+fn large_valid_cleanup_receipts_make_progress_across_budgeted_wakes() {
+    let(_temp,mut db,mut d)=fixture(MissedRunPolicy::CoalesceLatest);
+    d.revision=2;d.output_cap_bytes=65_536;
+    let head=db.current_head().unwrap();db.install_routine(&PreparedRoutine{definition:d.clone()},head).unwrap();
+    for ordinal in 0..2 {
+        let now=1000+ordinal*60_000;let head=db.current_head().unwrap();
+        let occurrence=db.schedule_routine(&PreparedRoutineTick{definition:d.clone(),now},head).unwrap().unwrap();
+        let id=occurrence.operation.unwrap();let lease=now+30_000;
+        db.connection.execute("UPDATE operation_delivery SET revision=2,attempts=1,epoch=1,state='claimed',owner='routine-linux-namespace-v1',lease_until_ms=?2 WHERE operation_id=?1",params![id.as_str(),lease]).unwrap();
+        let receipt=RoutineReceipt{operation:id.clone(),routine:occurrence.routine,claim:crate::operations::Claim{operation:id,revision:2,epoch:1,owner:"routine-linux-namespace-v1".into(),lease_until_ms:lease},finished_unix_ms:now+1,cleanup_verified:true,succeeded:true,
+            stdout:vec![0;65_536],stderr:vec![0;65_536],stdout_truncated:false,stderr_truncated:false,stdout_total_bytes:65_536,stderr_total_bytes:65_536,elapsed_ms:1};
+        db.complete_routine(&crate::routines::CompletedRoutine{receipt}).unwrap();
+    }
+    db.connection.execute_batch("DELETE FROM routine_overlap_work; INSERT INTO routine_overlap_work SELECT operation_id,name FROM routine_occurrences WHERE operation_id IS NOT NULL;").unwrap();
+    let head=db.current_head().unwrap();
+    for wake in 0..2 {
+        let budget=super::super::read_budget::ReadBudget::new(super::super::controlled::ReadControl::new(std::time::Instant::now()+std::time::Duration::from_secs(5),Default::default()));
+        let occurrence=db.schedule_routine_with_budget(&PreparedRoutineTick{definition:d.clone(),now:121_000},head,Some(&budget)).unwrap();
+        if wake==0 {assert!(occurrence.is_none());assert_eq!(db.current_head().unwrap(),head);}
+        else {assert_eq!(occurrence.unwrap().disposition,RoutineDisposition::Enqueued);}
+    }
+}
+
+#[test]
+fn overlap_budget_is_shared_with_selection_and_rolls_back_on_exhaustion() {
+    let(_temp,mut db,d)=fixture(MissedRunPolicy::CoalesceLatest);
+    let mut receipt=claimed_receipt(&mut db,&d,true,true);
+    receipt.stdout=vec![0;4000];receipt.stdout_total_bytes=4000;
+    receipt.stderr=vec![0;4000];receipt.stderr_total_bytes=4000;
+    db.complete_routine(&crate::routines::CompletedRoutine{receipt}).unwrap();
+    let before=db.read_snapshot(None).unwrap();
+    let budget=super::super::read_budget::ReadBudget::new(super::super::controlled::ReadControl::new(std::time::Instant::now()+std::time::Duration::from_secs(5),Default::default()));
+    // Spend most of this operation's input allowance before selection. The
+    // receipt's dense JSON must consume the remainder, not get a fresh budget.
+    let raw=rusqlite::Connection::open_in_memory().unwrap();
+    let mut stmt=raw.prepare("SELECT zeroblob(16777216)").unwrap();
+    let mut rows=stmt.query([]).unwrap();let row=rows.next().unwrap().unwrap();
+    for _ in 0..3 {budget.row(row,&[]).unwrap();}
+    let(head,definition)=db.routine_planning_selection(None,&budget).unwrap();
+    let error=db.schedule_routine_with_budget(&PreparedRoutineTick{definition:definition.unwrap(),now:61_000},head,Some(&budget)).unwrap_err();
+    assert!(matches!(error,StoreError::Limit(_)),"{error}");
+    assert_eq!(db.read_snapshot(None).unwrap(),before);
+    let work:u64=db.connection.query_row("SELECT count(*) FROM routine_overlap_work",[],|r|r.get(0)).unwrap();assert_eq!(work,1);
+}
+
+#[test]
+fn overlap_scan_pages_persist_without_authorizing_before_the_last_entry() {
+    for unsafe_last in [false,true] {
+        let(temp,mut db,d)=fixture(MissedRunPolicy::CoalesceLatest);
+        for ordinal in 0..65 {
+            let head=db.current_head().unwrap();
+            let occurrence=db.schedule_routine(&PreparedRoutineTick{definition:d.clone(),now:1000+ordinal*60_000},head).unwrap().unwrap();
+            assert_eq!(occurrence.disposition,RoutineDisposition::Enqueued);
+            db.connection.execute("UPDATE operation_delivery SET state='permanent_failure' WHERE operation_id=?1",[occurrence.operation.unwrap().as_str()]).unwrap();
+        }
+        // Reconstruct the work index, as an older store's upgrade would do
+        // before its one-time validated pruning. Keep one unsafe row last.
+        db.connection.execute_batch("DELETE FROM routine_overlap_work; INSERT INTO routine_overlap_work SELECT operation_id,name FROM routine_occurrences WHERE operation_id IS NOT NULL;").unwrap();
+        if unsafe_last {db.connection.execute_batch("UPDATE operation_delivery SET state='ambiguous',attempts=1,epoch=1 WHERE operation_id=(SELECT MAX(operation_id) FROM routine_overlap_work);").unwrap();}
+        let head=db.current_head().unwrap();let now=1000+65*60_000;
+        assert!(db.schedule_routine(&PreparedRoutineTick{definition:d.clone(),now},head).unwrap().is_none());
+        assert_eq!(db.current_head().unwrap(),head);
+        let pending:u64=db.connection.query_row("SELECT count(*) FROM routine_overlap_work",[],|r|r.get(0)).unwrap();assert_eq!(pending,1);
+        drop(db);let mut db=SqliteStore::open(&temp.path().join("state.db")).unwrap();
+        let occurrence=db.schedule_routine(&PreparedRoutineTick{definition:d,now},head).unwrap().unwrap();
+        assert_eq!(occurrence.disposition,if unsafe_last {RoutineDisposition::SkippedOverlap}else{RoutineDisposition::Enqueued});
+        assert_eq!(occurrence.operation.is_some(),!unsafe_last);
+        assert_eq!(db.read_snapshot(None).unwrap().routine_occurrences.len(),66);
+    }
+}
+
+#[test]
+fn overlap_upgrade_prunes_only_verified_retirement_and_rolls_back_on_bad_receipts() {
+    let(_temp,mut db,d)=fixture(MissedRunPolicy::CoalesceLatest);
+    let receipt=claimed_receipt(&mut db,&d,true,true);
+    db.complete_routine(&crate::routines::CompletedRoutine{receipt:receipt.clone()}).unwrap();
+    let pending=tick(&mut db,&d,61_000).unwrap().unwrap().operation.unwrap();
+    crate::store::test_schema::historical(&db.connection,42).unwrap();
+    db.upgrade_v1().unwrap();
+    let indexed:Vec<String>=db.connection.prepare("SELECT operation_id FROM routine_overlap_work").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<std::result::Result<_,_>>().unwrap();
+    assert_eq!(indexed,vec![pending.as_str().to_string()]);
+    // An old completion is no longer indexed, but changing its evidence must
+    // reinsert it even when a newer routine occurrence already exists.
+    db.connection.execute("UPDATE events SET payload='[]' WHERE kind='routine.completed' AND entity=?1",[receipt.operation.as_str()]).unwrap();
+    let indexed:bool=db.connection.query_row("SELECT EXISTS(SELECT 1 FROM routine_overlap_work WHERE operation_id=?1)",[receipt.operation.as_str()],|r|r.get(0)).unwrap();assert!(indexed);
+    crate::store::test_schema::historical(&db.connection,42).unwrap();
+    assert!(db.upgrade_v1().is_err());
+    let version:u32=db.connection.query_row("PRAGMA user_version",[],|r|r.get(0)).unwrap();assert_eq!(version,42);
+    let table:bool=db.connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='routine_overlap_work')",[],|r|r.get(0)).unwrap();assert!(!table);
+}
+
+#[test]
 fn occurrence_cursor_and_outbox_commit_together_and_reopen_deduplicates() {
     let(temp,mut db,d)=fixture(MissedRunPolicy::CoalesceLatest);let before=db.read_snapshot(None).unwrap();
     db.connection.execute_batch("CREATE TRIGGER fail_occurrence BEFORE INSERT ON events WHEN NEW.kind='routine.occurrence_recorded' BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
@@ -72,8 +192,8 @@ fn schema15_upgrade_preserves_existing_outbox_without_inventing_routine_authorit
     let operation=Operation{id:OperationId::new("old-operation").unwrap(),task:Some(task.id.clone()),kind:"fixture".into(),target:"fixture".into(),payload_version:1,payload:serde_json::json!({}),expected_revision:1,due_unix_ms:0,idempotency_key:"old-operation".into()};
     db.commit(Commit{expected_head:0,mutations:vec![Mutation::Task{expected:None,next:task},Mutation::Enqueue(operation.clone())]}).unwrap();
     db.claim_operation(&operation.id,1,"old-worker",1000,1000).unwrap();
-    db.connection.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; UPDATE store_meta SET schema_version=15; PRAGMA user_version=15;").unwrap();
-    let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=26;
+    crate::store::test_schema::historical(&db.connection, 15).unwrap();
+    let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=crate::store::SCHEMA;
     assert_eq!(db.read_snapshot(None).unwrap(),before);assert!(before.routine_revisions.is_empty());assert!(before.routine_occurrences.is_empty());
     db.integrity_check().unwrap();
 }
@@ -84,6 +204,16 @@ fn claimed_receipt(db:&mut SqliteStore,d:&RoutineDefinition,cleanup:bool,success
     RoutineReceipt{operation:id.clone(),routine:o.routine,claim:crate::operations::Claim{operation:id,revision:2,epoch:1,owner:"routine-linux-namespace-v1".into(),lease_until_ms:31000},finished_unix_ms:1001,cleanup_verified:cleanup,succeeded:success,
         stdout:b"result".to_vec(),stderr:vec![],stdout_truncated:false,stderr_truncated:false,stdout_total_bytes:6,stderr_total_bytes:0,elapsed_ms:1}
 }
+#[test]
+fn completion_validates_its_own_evidence_without_decoding_unrelated_history() {
+    let(_temp,mut db,d)=fixture(MissedRunPolicy::CoalesceLatest);
+    let receipt=claimed_receipt(&mut db,&d,true,true);
+    db.connection.execute("INSERT INTO routine_revisions VALUES('unrelated',1,'{}',?1)",["0".repeat(64)]).unwrap();
+    db.complete_routine(&crate::routines::CompletedRoutine{receipt:receipt.clone()}).unwrap();
+    assert_eq!(super::super::delivery::delivery(&db.connection,&receipt.operation).unwrap().state,DeliveryState::Confirmed);
+    assert!(db.read_snapshot(None).is_err());
+}
+
 #[test]
 fn completion_inbox_outcome_and_overlap_release_are_atomic_and_survive_reopen() {
     for success in [true,false] {

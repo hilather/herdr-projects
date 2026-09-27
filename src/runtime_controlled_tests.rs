@@ -11,6 +11,19 @@ fn fixture()->(tempfile::TempDir,std::path::PathBuf,ObservationBatch) {
 }
 fn control()->ReadControl {ReadControl::new(Instant::now()+Duration::from_secs(5),Default::default())}
 #[test]
+fn observation_publication_does_not_decode_unrelated_task_history() {
+    let(_root,p,batch)=fixture();
+    assert!(!batch.observations.is_empty());
+    let raw=rusqlite::Connection::open(p.join(".state/state.db")).unwrap();
+    raw.execute("INSERT INTO tasks(id,revision,state,title,active_attempt) VALUES('invalid historical id',1,'succeeded','unrelated history',NULL)",[]).unwrap();
+    // The administrative snapshot still diagnoses the malformed identifier.
+    assert!(snapshot(&p).is_err());
+    let guard=ProjectGuard::acquire(&p).unwrap();
+    record_controller_observations_controlled(&p,&batch,&guard,&control()).unwrap();
+    assert_eq!(raw.query_row("SELECT count(*) FROM runtime_observations",[],|row|row.get::<_,usize>(0)).unwrap(),batch.observations.len());
+    assert!(snapshot(&p).is_err());
+}
+#[test]
 fn controlled_observation_commit_retains_guard_and_cancellation_refuses_entry() {
     let(_root,p,batch)=fixture();let before=snapshot(&p).unwrap();let guard=ProjectGuard::acquire(&p).unwrap();let c=control();c.cancellation().cancel();
     assert!(record_controller_observations_controlled(&p,&batch,&guard,&c).is_err());assert_eq!(snapshot(&p).unwrap(),before);

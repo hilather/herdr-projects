@@ -60,7 +60,7 @@ DROP TRIGGER IF EXISTS authority_denials_no_delete;
 CREATE TABLE authority_denials_v34 (
     id TEXT PRIMARY KEY NOT NULL,
     unix_ms INTEGER NOT NULL,
-    class TEXT NOT NULL CHECK (class IN ('approval','budget','routine-store','memory','contract','delegation')),
+    class TEXT NOT NULL CHECK (class IN ('approval','budget','routine-store','memory','contract','admission','delegation')),
     command TEXT NOT NULL,
     actor_channel TEXT NOT NULL CHECK (actor_channel IN ('cli-owner','unknown-rejected')),
     reason_code TEXT NOT NULL,

@@ -221,13 +221,16 @@ impl SqliteStore {
         })
     }
     pub fn memory_snapshot_inputs(&mut self, id: &str) -> Result<MemorySnapshotInputs> {
+        self.memory_snapshot_inputs_with_budget(id,None)
+    }
+    pub(crate) fn memory_snapshot_inputs_with_budget(&mut self,id:&str,budget:Option<&read_budget::ReadBudget>)->Result<MemorySnapshotInputs> {
         schema(&self.connection)?;
-        let row:Option<(String,String,String,String,String,String)>=self.connection.query_row("SELECT instructions,instruction_hash,request_json,request_hash,task_text,task_hash FROM memory_snapshot_inputs WHERE snapshot_id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
+        let row:Option<(String,String,String,String,String,String)>=read_budget::optional(&self.connection,"SELECT instructions,instruction_hash,request_json,request_hash,task_text,task_hash FROM memory_snapshot_inputs WHERE snapshot_id=?1",[id],budget,&[(2,1)],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
         let (instructions, instruction_hash, request, request_hash, task_text, task_hash) =
             row.ok_or_else(|| invalid("snapshot predates retained inputs; create a new snapshot"))?;
-        let scope: String = self.connection.query_row(
+        let scope: String = read_budget::one(&self.connection,
             "SELECT scope_digest FROM memory_snapshots WHERE id=?1",
-            [id],
+            [id], budget, &[],
             |r| r.get(0),
         )?;
         if format!("{:x}", Sha256::digest(task_text.as_bytes())) != task_hash

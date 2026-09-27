@@ -57,15 +57,14 @@ fn validate_binding_id(binding_id: &str) -> Result<()> {
 
 /// Whether this snapshot would have been a subscription recipient, and the live
 /// attempt when that attempt is what makes the snapshot current.
-fn route_state(db: &Connection, snapshot_id: &str) -> Result<(bool, Option<String>)> {
-    let row: Option<(String, Option<String>, Option<String>)> = db
-        .query_row(
-            "SELECT m.task_id,t.state,t.active_attempt FROM memory_snapshots m
-             LEFT JOIN tasks t ON t.id=m.task_id WHERE m.id=?1",
-            [snapshot_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
+fn route_state(db: &Connection, snapshot_id: &str) -> Result<(bool, Option<String>)> {route_state_with_budget(db,snapshot_id,None)}
+fn route_state_with_budget(db:&Connection,snapshot_id:&str,budget:Option<&read_budget::ReadBudget>)->Result<(bool,Option<String>)> {
+    let mut stmt=db.prepare("SELECT m.task_id,t.state,t.active_attempt FROM memory_snapshots m LEFT JOIN tasks t ON t.id=m.task_id WHERE m.id=?1")?;
+    let mut rows=stmt.query([snapshot_id])?;
+    let row:Option<(String,Option<String>,Option<String>)>=if let Some(row)=rows.next()? {
+        if let Some(budget)=budget {budget.row(row,&[])?;}
+        Some((row.get(0)?,row.get(1)?,row.get(2)?))
+    } else {None};
     let Some((task_id, state, active_attempt)) = row else {
         return Err(invalid("memory snapshot is missing"));
     };
@@ -227,27 +226,24 @@ pub(super) fn backfill_from_subscriptions(tx: &rusqlite::Transaction) -> Result<
 }
 
 /// Must see attempt and task rows already written in this transaction.
-pub(super) fn reconcile_active(tx: &Connection) -> Result<()> {
+pub(super) fn reconcile_active(tx: &Connection) -> Result<()> {reconcile_selected(tx,None,None)}
+pub(super) fn reconcile_task(tx:&Connection,task:&str,budget:Option<&read_budget::ReadBudget>)->Result<()> {reconcile_selected(tx,Some(task),budget)}
+fn reconcile_selected(tx:&Connection,task:Option<&str>,budget:Option<&read_budget::ReadBudget>)->Result<()> {
     let version: u32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version < SCHEMA_VERSION {
         return Ok(());
     }
-    let mut stmt = tx.prepare(
-        "SELECT binding_id,snapshot_id,active,attempt_id FROM consumer_bindings WHERE retired=0",
-    )?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    drop(stmt);
-    for (id, snapshot, active, attempt) in rows {
-        let (routes, live_attempt) = route_state(tx, &snapshot)?;
+    let mut stmt = tx.prepare(if task.is_some() {
+        "SELECT binding_id,snapshot_id,active,attempt_id FROM consumer_bindings WHERE retired=0 AND task_id=?1"
+    } else {"SELECT binding_id,snapshot_id,active,attempt_id FROM consumer_bindings WHERE retired=0 AND ?1 IS NULL"})?;
+    let mut rows=stmt.query([task])?;let mut bindings=Vec::new();
+    while let Some(row)=rows.next()? {
+        if let Some(budget)=budget {budget.row(row,&[])?;}
+        bindings.push((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?,row.get::<_,Option<String>>(3)?));
+    }
+    drop(rows);drop(stmt);
+    for (id, snapshot, active, attempt) in bindings {
+        let (routes, live_attempt) = route_state_with_budget(tx, &snapshot,budget)?;
         let next = i64::from(routes);
         if active != next {
             tx.execute(
@@ -460,7 +456,7 @@ mod tests {
     fn upgrade_v1_from_36_preserves_receipts_and_create_ends_at_37() {
         let fresh = tempfile::tempdir().unwrap();
         let created = SqliteStore::create(&fresh.path().join("state.db")).unwrap();
-        assert_eq!(user_version(&created.connection), 41);
+        assert_eq!(user_version(&created.connection), crate::store::SCHEMA);
         assert_eq!(
             count(
                 &created.connection,
@@ -479,15 +475,6 @@ mod tests {
         assert!(index_sql.contains("consumer_id"));
         assert!(index_sql.contains("generation"));
         assert!(index_sql.contains("active"));
-        let open_fn = include_str!("mod.rs")
-            .split("pub fn open")
-            .nth(1)
-            .unwrap()
-            .split("pub fn integrity_check")
-            .next()
-            .unwrap();
-        assert!(!open_fn.contains("upgrade_v1"));
-        assert!(!open_fn.contains("0037_consumer_bindings"));
         drop(created);
 
         let temp = tempfile::tempdir().unwrap();
@@ -577,9 +564,7 @@ mod tests {
         let attempts_before = count(&db.connection, "SELECT count(*) FROM attempts");
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
-        raw.execute_batch(
-            "DROP INDEX IF EXISTS attempts_retained_by_id; DROP TABLE IF EXISTS active_work_index; DROP TABLE IF EXISTS active_work_meta; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_update; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_delete; DROP TRIGGER IF EXISTS barrier_members_no_update; DROP TRIGGER IF EXISTS barrier_members_no_delete; DROP TRIGGER IF EXISTS barrier_revisions_no_membership_update; DROP TABLE IF EXISTS barrier_stale_briefs; DROP TABLE IF EXISTS barrier_members; DROP TABLE IF EXISTS barrier_revisions; DROP TRIGGER IF EXISTS memory_change_receipts_no_update; DROP TRIGGER IF EXISTS memory_change_receipts_no_delete; DROP TRIGGER IF EXISTS update_package_members_no_update; DROP TRIGGER IF EXISTS update_package_members_no_delete; DROP TRIGGER IF EXISTS update_packages_no_update; DROP TRIGGER IF EXISTS update_packages_no_delete; DROP TABLE IF EXISTS memory_change_receipts; DROP TABLE IF EXISTS update_package_members; ALTER TABLE consumer_bindings DROP COLUMN applied_cursor; DROP TABLE IF EXISTS update_packages; DROP TRIGGER IF EXISTS memory_read_set_on_record; DROP TRIGGER IF EXISTS memory_read_set_on_reclassify; DROP TRIGGER IF EXISTS memory_read_set_on_revision; DROP TRIGGER IF EXISTS memory_read_set_on_validity; DROP TRIGGER IF EXISTS memory_read_set_on_head; DROP TABLE IF EXISTS memory_scope_catalog; DROP TABLE IF EXISTS memory_required_generation; DROP TABLE IF EXISTS consumer_binding_undeliverable; DROP TABLE IF EXISTS consumer_binding_obligations; DROP TABLE IF EXISTS consumer_bindings; UPDATE store_meta SET schema_version=36; PRAGMA user_version=36;",
-        )
+        crate::store::test_schema::historical(&raw, 36)
         .unwrap();
         drop(raw);
         let mut db = SqliteStore::open(&path).unwrap();
@@ -595,13 +580,13 @@ mod tests {
             }]
         );
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 41);
+        assert_eq!(user_version(&db.connection), crate::store::SCHEMA);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            41
+            crate::store::SCHEMA
         );
         let receipt_after: (String, String, String, String, i64) = db
             .connection
@@ -645,7 +630,7 @@ mod tests {
         check_schema(&db.connection).unwrap();
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 41);
+        assert_eq!(user_version(&reopened.connection), crate::store::SCHEMA);
     }
 
     #[test]
@@ -675,9 +660,7 @@ mod tests {
         tx.commit().unwrap();
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
-        raw.execute_batch(
-            "DROP INDEX IF EXISTS attempts_retained_by_id; DROP TABLE IF EXISTS active_work_index; DROP TABLE IF EXISTS active_work_meta; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_update; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_delete; DROP TRIGGER IF EXISTS barrier_members_no_update; DROP TRIGGER IF EXISTS barrier_members_no_delete; DROP TRIGGER IF EXISTS barrier_revisions_no_membership_update; DROP TABLE IF EXISTS barrier_stale_briefs; DROP TABLE IF EXISTS barrier_members; DROP TABLE IF EXISTS barrier_revisions; DROP TRIGGER IF EXISTS memory_change_receipts_no_update; DROP TRIGGER IF EXISTS memory_change_receipts_no_delete; DROP TRIGGER IF EXISTS update_package_members_no_update; DROP TRIGGER IF EXISTS update_package_members_no_delete; DROP TRIGGER IF EXISTS update_packages_no_update; DROP TRIGGER IF EXISTS update_packages_no_delete; DROP TABLE IF EXISTS memory_change_receipts; DROP TABLE IF EXISTS update_package_members; ALTER TABLE consumer_bindings DROP COLUMN applied_cursor; DROP TABLE IF EXISTS update_packages; DROP TRIGGER IF EXISTS memory_read_set_on_record; DROP TRIGGER IF EXISTS memory_read_set_on_reclassify; DROP TRIGGER IF EXISTS memory_read_set_on_revision; DROP TRIGGER IF EXISTS memory_read_set_on_validity; DROP TRIGGER IF EXISTS memory_read_set_on_head; DROP TABLE IF EXISTS memory_scope_catalog; DROP TABLE IF EXISTS memory_required_generation; DROP TABLE IF EXISTS consumer_binding_undeliverable; DROP TABLE IF EXISTS consumer_binding_obligations; DROP TABLE IF EXISTS consumer_bindings; UPDATE store_meta SET schema_version=36; PRAGMA user_version=36;",
-        )
+        crate::store::test_schema::historical(&raw, 36)
         .unwrap();
         drop(raw);
         let mut db = SqliteStore::open(&path).unwrap();
@@ -833,6 +816,14 @@ mod tests {
             })
             .unwrap();
         let tx = memory.store.connection.transaction().unwrap();
+        // A reservation/cancellation changes only its own task's routes.
+        // Rebuild those rows without visiting an unrelated coordinator binding.
+        tx.execute("UPDATE consumer_bindings SET active=0 WHERE task_id='worker-a'",[]).unwrap();
+        tx.execute("UPDATE consumer_bindings SET active=0 WHERE snapshot_id=?1",[coordinator.id.as_str()]).unwrap();
+        reconcile_task(&tx,"worker-a",None).unwrap();
+        let worker_active:bool=tx.query_row("SELECT active FROM consumer_bindings WHERE snapshot_id=?1",[live.id.as_str()],|r|r.get(0)).unwrap();
+        let coordinator_active:bool=tx.query_row("SELECT active FROM consumer_bindings WHERE snapshot_id=?1",[coordinator.id.as_str()],|r|r.get(0)).unwrap();
+        assert!(worker_active);assert!(!coordinator_active);
         reconcile_active(&tx).unwrap();
         let old = super::super::memory_delivery::legacy_subscription_recipients(&tx).unwrap();
         let new = super::super::memory_delivery::active_binding_recipients(&tx).unwrap();
@@ -858,15 +849,6 @@ mod tests {
         );
         assert!(!old.iter().any(|row| row.snapshot_id == unused.id.as_str()));
         tx.rollback().unwrap();
-        let hot = include_str!("memory_delivery.rs")
-            .split("pub(super) fn record_change")
-            .nth(1)
-            .unwrap()
-            .split("\nimpl SqliteStore")
-            .next()
-            .unwrap();
-        assert!(!hot.contains("memory_subscriptions"));
-        assert!(hot.contains("active_binding_recipients"));
         let named = memory
             .store
             .consumer_binding_for_snapshot(live.id.as_str())

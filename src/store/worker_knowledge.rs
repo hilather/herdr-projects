@@ -2,6 +2,10 @@
 use super::*;
 
 pub(super) fn validate(tx: &Connection, inputs: &LaunchInputs, now: i64) -> Result<()> {
+    validate_with_budget(tx, inputs, now, None)
+}
+pub(super) fn validate_with_budget(tx: &Connection, inputs: &LaunchInputs, now: i64, budget: Option<&read_budget::ReadBudget>) -> Result<()> {
+    if let Some(budget) = budget { budget.check()?; }
     let actual = std::fs::canonicalize(
         tx.path()
             .ok_or_else(|| StoreError::Invalid("file-backed launch inputs required".into()))?,
@@ -31,9 +35,9 @@ pub(super) fn validate(tx: &Connection, inputs: &LaunchInputs, now: i64) -> Resu
     let profile = inputs.effective_profile.as_ref().ok_or_else(|| {
         StoreError::Invalid("knowledge requires retained profile evidence".into())
     })?;
-    let row:Option<(String,u64,String,String,Option<String>,String,u64)>=tx.query_row(
+    let row:Option<(String,u64,String,String,Option<String>,String,u64)>=read_budget::optional(tx,
         "SELECT task_id,task_revision,profile_name,profile_digest,config_digest,manifest_hash,sequence FROM memory_snapshots WHERE id=?1",
-        [&reference.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional()?;
+        [&reference.id],budget,&[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)))?;
     let Some((task, revision, name, digest, config, manifest, sequence)) = row else {
         return Err(StoreError::Invalid(
             "launch knowledge snapshot missing".into(),
@@ -61,7 +65,14 @@ pub(super) fn validate(tx: &Connection, inputs: &LaunchInputs, now: i64) -> Resu
             "launch knowledge predates retained inputs".into(),
         ));
     }
-    let latest:u64=tx.query_row("SELECT coalesce(max(sequence),0) FROM events WHERE kind IN ('memory.revision_inserted','memory.head_changed','memory.revoked','memory.validity_changed','memory.record_policy_changed','memory.policy_changed','memory.policy_applied')",[],|r|r.get(0))?;
+    // One indexed maximum per kind. Aggregating an IN-list through the
+    // kind/entity index otherwise visits every retained memory event.
+    let latest:u64=read_budget::one(tx,"WITH kinds(kind) AS (VALUES
+        ('memory.revision_inserted'),('memory.head_changed'),('memory.revoked'),
+        ('memory.validity_changed'),('memory.record_policy_changed'),
+        ('memory.policy_changed'),('memory.policy_applied'))
+        SELECT coalesce(max((SELECT max(sequence) FROM events WHERE events.kind=kinds.kind)),0) FROM kinds",
+        [],budget,&[],|r|r.get(0))?;
     if sequence < latest {
         return Err(StoreError::Invalid(
             "memory changed after knowledge selection; prepare a new snapshot and approval".into(),
@@ -80,6 +91,7 @@ pub(super) fn validate(tx: &Connection, inputs: &LaunchInputs, now: i64) -> Resu
         tx.prepare("SELECT record_id,revision FROM snapshot_entries WHERE snapshot_id=?1")?;
     let mut rows = stmt.query([&reference.id])?;
     while let Some(row) = rows.next()? {
+        if let Some(budget) = budget { budget.row(row, &[])?; }
         if !super::memory_invalidation::dependencies_current(
             tx,
             &row.get::<_, String>(0)?,
@@ -101,13 +113,13 @@ impl SqliteStore {
         attempt: &str,
         now: i64,
     ) -> Result<MemorySnapshot> {
+        self.attempt_knowledge_snapshot_with_budget(attempt, now, None)
+    }
+    pub(crate) fn attempt_knowledge_snapshot_with_budget(&mut self, attempt: &str, now: i64, budget: Option<&read_budget::ReadBudget>) -> Result<MemorySnapshot> {
+        if let Some(budget) = budget { budget.check()?; }
         let tx = self.connection.transaction()?;
         check_schema(&tx)?;
-        let records = super::reservations::read_inputs(&tx)?;
-        let record = records
-            .iter()
-            .find(|r| r.attempt.as_str() == attempt)
-            .ok_or_else(|| StoreError::Invalid("sealed attempt inputs missing".into()))?;
+        let record = super::reservations::read_attempt_input(&tx, attempt, budget)?;
         let reference = record
             .inputs
             .memory
@@ -119,15 +131,15 @@ impl SqliteStore {
                 "attempt knowledge is not bound to current live execution".into(),
             ));
         }
-        let control = super::control::read(&tx)?;
+        let control = super::control::read_with_budget(&tx, budget)?;
         if control.epoch != record.inputs.control_epoch
             || control.config_digest != record.inputs.config.digest
         {
             return Err(StoreError::Conflict);
         }
-        validate(&tx, &record.inputs, now)?;
+        validate_with_budget(&tx, &record.inputs, now, budget)?;
         let id = reference.id.clone();
         tx.commit()?;
-        self.read_memory_snapshot(&id)
+        self.read_memory_snapshot_with_budget(&id, budget)
     }
 }

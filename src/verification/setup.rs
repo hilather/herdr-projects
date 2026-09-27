@@ -17,6 +17,7 @@ const EXIT_TAMPER: i32 = 73;
 const EXIT_LEFTOVER: i32 = 74;
 const EXIT_POLICY: i32 = 75;
 const EXIT_CHECKS: i32 = 76;
+const EXIT_CHECK_FAILED: i32 = 77;
 
 pub fn setup_main() -> i32 {
     setup_from_args(&std::env::args().collect::<Vec<_>>())
@@ -136,7 +137,7 @@ fn enter(parsed: &Args) -> i32 {
     if seen_commit != commit || seen_tree != tree {
         return EXIT_TAMPER;
     }
-    // HEAD, not the index: staged edits and untracked files are still a different tree.
+    // Both the index and worktree must match HEAD before executing checks.
     match clean_tree(&parsed.git, &parsed.checkout) {
         Some(true) => {}
         Some(false) => return EXIT_TAMPER,
@@ -153,16 +154,29 @@ fn enter(parsed: &Args) -> i32 {
     };
     let _ = std::io::stdout().write_all(&output.stdout);
     let _ = std::io::stderr().write_all(&output.stderr);
-    let code = output.status.code().unwrap_or(72);
-    eprintln!("hp-verify checks={code}");
+    let code = output.status.code();
+    match code {
+        Some(code) => eprintln!("hp-verify checks={code}"),
+        None => eprintln!("hp-verify checks=signal"),
+    }
     reap();
     if leftover() {
         return EXIT_LEFTOVER;
     }
-    if !(0..71).contains(&code) {
-        return EXIT_SETUP;
+    // Checks run against a writable disposable copy. Successful execution is
+    // not proof that HEAD, the index, and tracked inputs still match the pin.
+    if git_line(&parsed.git,&parsed.checkout,&["rev-parse","HEAD"]).as_deref()!=Some(commit.as_str())
+        || git_line(&parsed.git,&parsed.checkout,&["rev-parse","HEAD^{tree}"]).as_deref()!=Some(tree.as_str()) {
+        return EXIT_TAMPER;
     }
-    code
+    match clean_tree(&parsed.git,&parsed.checkout) {
+        Some(true)=>{},
+        Some(false)=>return EXIT_TAMPER,
+        None=>return fail("post-check-diff",0),
+    }
+    // Child exit codes may overlap supervisor failures (71..77); classify the
+    // check outcome through a distinct supervisor code and retain its real code.
+    if code==Some(0) {0} else {EXIT_CHECK_FAILED}
 }
 
 fn git_line(git: &Path, checkout: &Path, args: &[&str]) -> Option<String> {
@@ -186,10 +200,15 @@ fn git_line(git: &Path, checkout: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn clean_tree(git: &Path, checkout: &Path) -> Option<bool> {
+    let index = Command::new(git)
+        .args(["-c","core.hooksPath=/dev/null","-C"]).arg(checkout)
+        .args(["diff","--cached","--quiet","--no-ext-diff","HEAD"]).status().ok()?.code()?;
+    if index==1 {return Some(false);}
+    if index!=0 {return None;}
     let diff = Command::new(git)
         .args(["-c", "core.hooksPath=/dev/null", "-C"])
         .arg(checkout)
-        .args(["diff", "--quiet", "HEAD"])
+        .args(["diff", "--quiet", "--no-ext-diff", "HEAD"])
         .status()
         .ok()?
         .code()?;

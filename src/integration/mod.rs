@@ -3,7 +3,7 @@
 //! A lost reply confirms that exact oid and no other. Dependencies are not satisfied.
 mod git;
 
-use std::{path::PathBuf, time::Duration};
+use std::{fs, path::{Path, PathBuf}, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -56,7 +56,7 @@ pub struct IntegrateRequest {
     pub fault: Fault,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct IntegrateOutcome {
     pub operation_id: String,
     pub state: String,
@@ -89,6 +89,51 @@ pub fn configure_integration_ref(
     store
         .configure_integration_ref(&repo.identity, ref_name)
         .map_err(anyhow::Error::from)
+}
+
+/// Explicit operator ingress; these commands never implicitly upgrade a store.
+pub fn configure_project(project: &Path, repository: &PathBuf, reference: &str) -> Result<()> {
+    let _guard = crate::migration::runtime_mutation(project)?;
+    let mut store = crate::migration::open_active(project)?;
+    if reference.len() > 1024 || !crate::store::integration::valid_ref_name(reference) { bail!("integration ref is invalid"); }
+    let repo = GitRepo::open(repository)?;
+    if repo.ref_oid(reference)?.is_none() { bail!("integration ref is missing"); }
+    if repo.is_checked_out(reference)? { bail!("integration ref is checked out"); }
+    store.configure_integration_ref(&repo.identity, reference)?;
+    Ok(())
+}
+
+pub fn integrate_project(project: &Path, request: &IntegrateRequest) -> Result<IntegrateOutcome> {
+    use std::os::unix::fs::DirBuilderExt;
+    if !request.work_dir.is_absolute() { bail!("integration work directory must be absolute"); }
+    validate_key(&request.idempotency_key)?;
+    let _guard = crate::migration::runtime_mutation(project)?;
+    let mut store = crate::migration::open_active(project)?;
+    fs::DirBuilder::new().mode(0o700).create(&request.work_dir)
+        .context("integration work directory must be new and have an existing parent")?;
+    struct Work(Option<PathBuf>);
+    impl Drop for Work { fn drop(&mut self) { if let Some(path) = &self.0 { let _ = fs::remove_dir_all(path); } } }
+    let mut work = Work(Some(request.work_dir.clone()));
+    let outcome = integrate(&mut store, request);
+    let cleanup = fs::remove_dir_all(&request.work_dir);
+    if cleanup.is_ok() { work.0 = None; }
+    let outcome = outcome?;
+    cleanup.context("integration recorded but scratch cleanup failed")?;
+    Ok(outcome)
+}
+
+fn validate_key(key: &str) -> Result<()> {
+    if key.is_empty() || key.len() > 128 || key.chars().any(char::is_control) {
+        bail!("integration idempotency key must be 1..128 bytes without control characters");
+    }
+    Ok(())
+}
+
+pub fn reconcile_project(project: &Path, repository: &PathBuf, key: &str) -> Result<IntegrateOutcome> {
+    validate_key(key)?;
+    let _guard = crate::migration::runtime_mutation(project)?;
+    let mut store = crate::migration::open_active(project)?;
+    reconcile_integration(&mut store, repository, key)
 }
 
 pub fn integrate(store: &mut SqliteStore, request: &IntegrateRequest) -> Result<IntegrateOutcome> {
@@ -447,6 +492,17 @@ fn settle(
     let Some(current) = repo.ref_oid(&view.ref_name)? else {
         bail!("integration ref is missing");
     };
+    // Recheck even a historical prepared candidate whose policy checks passed
+    // before required outputs were enforced on the combined tree.
+    let required = store.integration_required_outputs(&view.verified_result_id)?;
+    if !repo.required_outputs_present(&commit, &required)? {
+        let finish = if current == commit || view.reason.as_deref() == Some("publish_attempted") {
+            IntegrationFinish::Reconciliation { reason: "required_output_missing" }
+        } else {
+            IntegrationFinish::Blocked { reason: "required_output_missing" }
+        };
+        return finish_flexible(store, view, None, finish);
+    }
     if repo.commit_matches(&commit, &tree, &view.expected_old_oid, &parent)? && current == commit {
         return finish_flexible(store, view, None, IntegrationFinish::Confirm);
     }

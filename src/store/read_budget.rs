@@ -10,18 +10,46 @@ const MAX_FIELD: usize = 16 * 1024 * 1024;
 const MAX_COLUMNS: usize = 64;
 const STRUCTURE_WEIGHT: usize = 128;
 
-pub(super) struct ReadBudget {
+/// Account a selected row before its fields are copied or decoded.
+pub(crate) fn optional<T>(
+    db: &rusqlite::Connection, sql: &str, params: impl rusqlite::Params,
+    budget: Option<&ReadBudget>, json: &[(usize, usize)],
+    decode: impl FnOnce(&Row<'_>) -> rusqlite::Result<T>,
+) -> Result<Option<T>> {
+    if let Some(budget) = budget { budget.check()?; }
+    let mut statement = db.prepare(sql)?;
+    let mut rows = statement.query(params)?;
+    let Some(row) = rows.next()? else { return Ok(None); };
+    if let Some(budget) = budget { budget.row(row, json)?; }
+    Ok(Some(decode(row)?))
+}
+
+pub(crate) fn one<T>(
+    db: &rusqlite::Connection, sql: &str, params: impl rusqlite::Params,
+    budget: Option<&ReadBudget>, json: &[(usize, usize)],
+    decode: impl FnOnce(&Row<'_>) -> rusqlite::Result<T>,
+) -> Result<T> {
+    optional(db, sql, params, budget, json, decode)?
+        .ok_or_else(|| StoreError::from(rusqlite::Error::QueryReturnedNoRows))
+}
+
+pub(crate) struct ReadBudget {
     control: ReadControl,
     units: Cell<usize>,
     rows: Cell<usize>,
 }
 impl ReadBudget {
-    pub(super) fn new(control: ReadControl) -> Self {
+    pub(crate) fn new(control: ReadControl) -> Self {
         Self { control, units: Cell::new(0), rows: Cell::new(0) }
     }
-    pub(super) fn check(&self) -> Result<()> { self.control.check() }
+    pub(crate) fn check(&self) -> Result<()> { self.control.check() }
+    pub(crate) fn bytes(&self, length: usize) -> Result<()> {
+        self.check()?;
+        self.charge(length)
+    }
+    pub(crate) fn remaining_units(&self) -> usize { MAX_UNITS - self.units.get() }
     /// Snapshot accounting must not consume the budget of the following shadow read.
-    pub(super) fn restart(&self) {
+    pub(crate) fn restart(&self) {
         self.units.set(0);
         self.rows.set(0);
     }
@@ -34,7 +62,7 @@ impl ReadBudget {
     }
     /// Called before row.get or JSON decoding. JSON columns specify the number
     /// of parse/copy passes; raw provenance is deliberately not treated as JSON.
-    pub(super) fn row(&self, row: &Row<'_>, json: &[(usize, usize)]) -> Result<()> {
+    pub(crate) fn row(&self, row: &Row<'_>, json: &[(usize, usize)]) -> Result<()> {
         self.control.check()?;
         let count = self.rows.get().checked_add(1).filter(|n| *n <= MAX_ROWS)
             .ok_or_else(|| StoreError::Limit("snapshot exceeds 100000 returned rows".into()))?;
@@ -59,6 +87,11 @@ impl ReadBudget {
             self.json(bytes, passes)?;
         }
         self.control.check()
+    }
+    /// Account external JSON before decoding; share the caller's SQL/input budget.
+    pub(crate) fn input_json(&self,bytes:&[u8],passes:usize)->Result<()> {
+        self.bytes(bytes.len())?;
+        self.json(bytes,passes)
     }
     fn json(&self, bytes: &[u8], passes: usize) -> Result<()> {
         self.control.check()?;
@@ -135,4 +168,20 @@ mod tests {
         assert!(matches!(b.row(stmt.query([]).unwrap().next().unwrap().unwrap(),&[]),Err(StoreError::Limit(_))));
         assert!(matches!(budget().json(b"[]",usize::MAX),Err(StoreError::Limit(_))));
     }
+}
+
+/// Raw mutation callers own this local SQL handler. Controlled callers must
+/// propagate their existing budget instead of installing or renewing a handler.
+pub(super) fn with_local_deadline<T>(db: &rusqlite::Connection, operation: impl FnOnce(&ReadBudget) -> Result<T>) -> Result<T> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let control = ReadControl::new(deadline, Default::default());
+    let budget = ReadBudget::new(control.clone());
+    struct Deadline<'a>(&'a rusqlite::Connection);
+    impl Drop for Deadline<'_> { fn drop(&mut self) { self.0.progress_handler(0, None::<fn() -> bool>); } }
+    db.progress_handler(1000, Some(move || Instant::now() >= deadline));
+    let _deadline = Deadline(db);
+    let result = operation(&budget);
+    control.check()?;
+    result
 }

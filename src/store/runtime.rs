@@ -44,7 +44,30 @@ pub(super) fn import_sources(db:&Connection)->Result<()> {
 
 pub(super) fn read_all(db:&Connection)->Result<Vec<RuntimeBinding>> {read_all_with_budget(db,None)}
 pub(super) fn read_all_with_budget(db:&Connection,budget:Option<&read_budget::ReadBudget>)->Result<Vec<RuntimeBinding>> {
-    let mut stmt=db.prepare("SELECT b.id,b.task_id,b.revision,b.source_path,b.payload,b.payload_hash,s.digest,s.bytes FROM runtime_bindings b LEFT JOIN legacy_sources s ON s.path=b.source_path ORDER BY b.id")?;
+    read_selected(db, BindingSelection::All, budget)
+}
+pub(super) fn read_binding(db:&Connection,id:&str,budget:Option<&read_budget::ReadBudget>)->Result<Option<RuntimeBinding>> {
+    Ok(read_selected(db, BindingSelection::Id(id), budget)?.pop())
+}
+// Both branches are indexed: malformed routing fields remain uncertainty,
+// while valid unrelated panes need not be decoded for a conflict check.
+pub(super) const PANE_FILTER:&str = "WHERE b.id IN (SELECT id FROM runtime_bindings WHERE json_extract(payload,'$.identity.pane_id')=?1 UNION SELECT id FROM runtime_bindings WHERE json_type(payload,'$.identity.pane_id') IS NOT 'text')";
+pub(super) const WORKTREE_FILTER:&str = "WHERE b.id IN (SELECT id FROM runtime_bindings WHERE json_extract(payload,'$.identity.machine')='' AND json_extract(payload,'$.identity.worktree_path')<>'' UNION SELECT id FROM runtime_bindings WHERE json_type(payload,'$.identity.machine') IS NOT 'text' OR json_type(payload,'$.identity.worktree_path') IS NOT 'text')";
+pub(super) const INDEXED_WORKTREE_FILTER:&str = "WHERE b.id IN (SELECT id FROM runtime_bindings INDEXED BY runtime_bindings_local_worktrees WHERE json_extract(payload,'$.identity.machine')='' AND json_extract(payload,'$.identity.worktree_path')<>'' UNION SELECT id FROM runtime_bindings INDEXED BY runtime_bindings_unknown_worktrees WHERE json_type(payload,'$.identity.machine') IS NOT 'text' OR json_type(payload,'$.identity.worktree_path') IS NOT 'text')";
+#[derive(Clone,Copy)]
+pub(super) enum BindingSelection<'a> {All,Id(&'a str),Pane(&'a str),LocalWorktrees{indexed:bool}}
+impl<'a> BindingSelection<'a> {
+    pub(super) fn filter(self)->&'static str {match self {
+        Self::All=>"",Self::Id(_)=>"WHERE b.id=?1",Self::Pane(_)=>PANE_FILTER,
+        Self::LocalWorktrees{indexed:true}=>INDEXED_WORKTREE_FILTER,
+        Self::LocalWorktrees{indexed:false}=>WORKTREE_FILTER,
+    }}
+    pub(super) fn parameter(self)->Option<&'a str> {match self {Self::Id(value)|Self::Pane(value)=>Some(value),_=>None}}
+    pub(super) fn is_all(self)->bool {matches!(self,Self::All)}
+}
+pub(super) fn read_selected(db:&Connection,selection:BindingSelection<'_>,budget:Option<&read_budget::ReadBudget>)->Result<Vec<RuntimeBinding>> {
+    let sql=format!("SELECT b.id,b.task_id,b.revision,b.source_path,b.payload,b.payload_hash,s.digest,s.bytes FROM runtime_bindings b LEFT JOIN legacy_sources s ON s.path=b.source_path {} ORDER BY b.id",selection.filter());
+    let mut stmt=db.prepare(&sql)?;
     let session={
         let mut statement=db.prepare("SELECT digest,bytes FROM legacy_sources WHERE path='.state/coordinator.json' AND kind='runtime'")?;
         let mut rows=statement.query([])?;
@@ -55,7 +78,7 @@ pub(super) fn read_all_with_budget(db:&Connection,budget:Option<&read_budget::Re
     };
     if let Some((digest,bytes))=&session {if format!("{:x}",Sha256::digest(bytes))!=*digest {return Err(StoreError::Corrupt("runtime session source hash mismatch".into()));}}
     let session_digest=session.map(|s|s.0);
-    let mut rows=stmt.query([])?;
+    let mut rows=if let Some(value)=selection.parameter() {stmt.query([value])?} else {stmt.query([])?};
     let mut bindings=Vec::new();
     while let Some(r)=rows.next()? {
         if let Some(budget)=budget {budget.row(r,&[(4,2)])?;}
@@ -77,8 +100,10 @@ pub(super) fn read_all_with_budget(db:&Connection,budget:Option<&read_budget::Re
         }
         bindings.push(binding);
     }
+    if selection.is_all() {
     let expected:u64=db.query_row("SELECT count(*) FROM legacy_sources WHERE kind='thread' OR (path='.state/coordinator.json' AND kind='runtime')",[],|r|r.get(0))?;
     if bindings.iter().filter(|b|b.source_path.is_some()).count() as u64!=expected {return Err(StoreError::Corrupt("runtime binding inventory mismatch".into()));}
+    }
     Ok(bindings)
 }
 

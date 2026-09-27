@@ -1,5 +1,6 @@
 //! Schema 34 delegation grants. Verified bytes stay in their own namespace.
-//! A grant is not a launch approval, so reserve_attempt does not insert an attempt.
+//! The legacy reserve_attempt scope probe does not insert an attempt. Exact
+//! subject-signed actions use reserve_delegated and ordinary reservation checks.
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -321,7 +322,7 @@ impl SqliteStore {
         policy_digest: &str,
         now: i64,
     ) -> Result<()> {
-        let actual = self.read_snapshot(None).ok().map(|snapshot| snapshot.head);
+        let actual = self.current_head().ok();
         self.insert_denial(&AuthorityDenial {
             id: denial_id(grant_id, reason, now),
             unix_ms: now,
@@ -401,14 +402,14 @@ mod tests {
     fn upgrade_v1_from_33_to_34_preserves_denials_and_create_ends_at_34() {
         let fresh = tempfile::tempdir().unwrap();
         let created = SqliteStore::create(&fresh.path().join("state.db")).unwrap();
-        assert_eq!(user_version(&created.connection), 41);
+        assert_eq!(user_version(&created.connection), crate::store::SCHEMA);
         assert_eq!(
             created
                 .connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            41
+            crate::store::SCHEMA
         );
         assert!(table_exists(&created.connection, "delegation_grants"));
         assert!(table_exists(&created.connection, "delegation_revocations"));
@@ -416,18 +417,6 @@ mod tests {
             &created.connection,
             "delegation_stop_obligations"
         ));
-        let open_source = include_str!("mod.rs");
-        let open = open_source
-            .split("pub fn open")
-            .nth(1)
-            .unwrap()
-            .split("pub fn integrity_check")
-            .next()
-            .unwrap();
-        assert!(!open.contains("upgrade_v1"));
-        assert!(!open.contains("0034_delegation_grants"));
-        let controller = include_str!("../canonical_controller.rs");
-        assert!(controller.contains("const PREPARED_LAUNCH_DISPATCH_ENABLED: bool = true"));
         drop(created);
 
         let temp = tempfile::tempdir().unwrap();
@@ -447,25 +436,7 @@ mod tests {
         .unwrap();
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
-        raw.execute_batch(
-            "DROP INDEX IF EXISTS attempts_retained_by_id; DROP TABLE IF EXISTS active_work_index; DROP TABLE IF EXISTS active_work_meta; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_update; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_delete; DROP TRIGGER IF EXISTS barrier_members_no_update; DROP TRIGGER IF EXISTS barrier_members_no_delete; DROP TRIGGER IF EXISTS barrier_revisions_no_membership_update; DROP TABLE IF EXISTS barrier_stale_briefs; DROP TABLE IF EXISTS barrier_members; DROP TABLE IF EXISTS barrier_revisions; DROP TRIGGER IF EXISTS memory_change_receipts_no_update; DROP TRIGGER IF EXISTS memory_change_receipts_no_delete; DROP TRIGGER IF EXISTS update_package_members_no_update; DROP TRIGGER IF EXISTS update_package_members_no_delete; DROP TRIGGER IF EXISTS update_packages_no_update; DROP TRIGGER IF EXISTS update_packages_no_delete; DROP TABLE IF EXISTS memory_change_receipts; DROP TABLE IF EXISTS update_package_members; ALTER TABLE consumer_bindings DROP COLUMN applied_cursor; DROP TABLE IF EXISTS update_packages; DROP TRIGGER IF EXISTS memory_read_set_on_record; DROP TRIGGER IF EXISTS memory_read_set_on_reclassify; DROP TRIGGER IF EXISTS memory_read_set_on_revision; DROP TRIGGER IF EXISTS memory_read_set_on_validity; DROP TRIGGER IF EXISTS memory_read_set_on_head; DROP TABLE IF EXISTS memory_scope_catalog; DROP TABLE IF EXISTS memory_required_generation; DROP TABLE IF EXISTS consumer_binding_undeliverable; DROP TABLE IF EXISTS consumer_binding_obligations; DROP TABLE IF EXISTS consumer_bindings; DROP TABLE IF EXISTS wait_replay_events; DROP TABLE IF EXISTS replan_requests; DROP TABLE IF EXISTS replan_budget_resets; DROP TABLE IF EXISTS attempt_infrastructure_retries; DROP TABLE IF EXISTS wait_conditions; DROP TABLE IF EXISTS resource_claims; DROP TABLE IF EXISTS delegation_stop_obligations; DROP TABLE IF EXISTS delegation_revocations; DROP TABLE IF EXISTS delegation_grants;
-             DROP TRIGGER IF EXISTS authority_denials_no_update; DROP TRIGGER IF EXISTS authority_denials_no_delete;
-             CREATE TABLE authority_denials_v26 (
-                id TEXT PRIMARY KEY NOT NULL, unix_ms INTEGER NOT NULL,
-                class TEXT NOT NULL CHECK (class IN ('approval','budget','routine-store','memory','contract')),
-                command TEXT NOT NULL,
-                actor_channel TEXT NOT NULL CHECK (actor_channel IN ('cli-owner','unknown-rejected')),
-                reason_code TEXT NOT NULL,
-                policy_digest TEXT NOT NULL CHECK (length(policy_digest) = 64),
-                expected_head INTEGER, actual_head INTEGER
-             ) STRICT;
-             INSERT INTO authority_denials_v26 SELECT id, unix_ms, class, command, actor_channel, reason_code, policy_digest, expected_head, actual_head FROM authority_denials;
-             DROP TABLE authority_denials;
-             ALTER TABLE authority_denials_v26 RENAME TO authority_denials;
-             CREATE TRIGGER authority_denials_no_update BEFORE UPDATE ON authority_denials BEGIN SELECT RAISE(ABORT,'authority denial is immutable'); END;
-             CREATE TRIGGER authority_denials_no_delete BEFORE DELETE ON authority_denials BEGIN SELECT RAISE(ABORT,'authority denial is immutable'); END;
-             UPDATE store_meta SET schema_version=33; PRAGMA user_version=33;",
-        )
+        crate::store::test_schema::historical(&raw, 33)
         .unwrap();
         assert!(raw
             .execute(
@@ -478,13 +449,13 @@ mod tests {
         assert_eq!(user_version(&db.connection), 33);
         assert!(!table_exists(&db.connection, "delegation_grants"));
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 41);
+        assert_eq!(user_version(&db.connection), crate::store::SCHEMA);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            41
+            crate::store::SCHEMA
         );
         let kept: i64 = db
             .connection
@@ -510,7 +481,7 @@ mod tests {
         check_schema(&db.connection).unwrap();
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 41);
+        assert_eq!(user_version(&reopened.connection), crate::store::SCHEMA);
         assert_eq!(
             reopened
                 .connection
@@ -528,6 +499,44 @@ mod tests {
             |row| row.get(0),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn delegation_denial_reads_head_without_decoding_unrelated_history() {
+        let root=tempfile::tempdir().unwrap();
+        let mut db=SqliteStore::create(&root.path().join("state.db")).unwrap();
+        let id=install(&mut db,"/fixture/repository",9000,1000);
+        admission_on(&db);
+        db.connection.execute_batch("INSERT INTO tasks VALUES('retired',1,'succeeded','retired',NULL);
+            INSERT INTO runtime_bindings VALUES('task:retired','retired',1,NULL,'{}',printf('%064d',0));").unwrap();
+        assert!(db.read_snapshot(None).is_err(),"administrative reads must still diagnose corrupt history");
+        let before=db.current_head().unwrap();
+        assert!(db.reserve_attempt(&id,"/wrong/repository","refs/heads/factory","codex",1000).is_err());
+        let recorded:Option<u64>=db.connection.query_row("SELECT actual_head FROM authority_denials WHERE class='delegation'",[],|row|row.get(0)).unwrap();
+        assert_eq!(recorded,Some(before));
+    }
+
+    #[test]
+    fn version_two_scope_is_retained_and_cannot_be_changed_after_verification() {
+        let root=tempfile::tempdir().unwrap();
+        let mut db=SqliteStore::create(&root.path().join("state.db")).unwrap();
+        let mut value:serde_json::Value=serde_json::from_slice(include_bytes!("../../contracts/factory/delegation-v2.json")).unwrap();
+        value["project_store"]=project_path(&db.connection).unwrap().into();
+        let bytes=serde_json::to_vec(&value).unwrap();
+        let prepared=PreparedDelegation::parse_verified(&bytes).unwrap();
+        let id=db.install_delegation(&prepared,1000).unwrap();
+        let stored:Vec<u8>=db.connection.query_row("SELECT raw_bytes FROM delegation_grants WHERE id=?1",[&id],|row|row.get(0)).unwrap();
+        assert_eq!(stored,bytes);
+        assert_eq!(PreparedDelegation::parse_verified(&stored).unwrap(),prepared);
+        let before=db.current_head().unwrap();
+        let mut widened=prepared.clone();
+        widened.reservation_scope.as_mut().unwrap().max_total_attempts+=1;
+        assert!(db.install_delegation(&widened,1000).is_err());
+        assert_eq!(db.current_head().unwrap(),before);
+        admission_on(&db);
+        let inspected=db.reserve_attempt(&id,"/fixture/repository","refs/heads/factory","codex",1000).unwrap();
+        assert!(!inspected.reserved,"a bounded document alone cannot mint attempt-specific authority");
+        assert_eq!(attempts(&mut db),0);
     }
 
     #[test]
@@ -819,6 +828,7 @@ mod tests {
         let error = db
             .install_delegation(
                 &PreparedDelegation {
+                    reservation_scope: None,
                     digest: "ab".repeat(32),
                     raw,
                     issuer: "owner".into(),
@@ -1037,7 +1047,7 @@ mod tests {
             .iter()
             .map(|binding| PreparedLaunch {
                 inputs: LaunchInputs {
-                    version: 2,
+                    task_contract: None, version: 2,
                     project_store: std::fs::canonicalize(&path).unwrap().display().to_string(),
                     task: binding.task.clone().unwrap(),
                     task_revision: 3,

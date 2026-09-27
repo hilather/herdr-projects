@@ -1,0 +1,1330 @@
+
+running 620 tests
+test admission::tests::backlog_watermark_is_fifteen_minutes_and_equality_does_not_block ... ok
+test admission::tests::later_empty_contract_does_not_drop_the_reserved_claim ... ok
+test admission::tests::overlap_rules_block_exclusive_writes_named_resources_and_uncertain_paths ... ok
+test admission::tests::disjoint_tasks_stay_ready_and_overlapping_paths_do_not_both_reserve ... ok
+test admission::tests::cancel_does_not_free_a_slot_or_a_claim_before_termination ... ok
+test admission::tests::upgrade_v1_from_34_to_35_and_create_end_at_user_version_35 ... ok
+test agents::probe::claude_capability_harness_records_unsupported_without_certifying ... ok
+test admission::tests::verification_backlog_returns_capacity_full_and_does_not_start_work ... ok
+test authority::tests::contract_verifier_rejects_reserialized_json_and_a_256_kib_file ... ok
+test authority::tests::delegation_expiry_reason_does_not_classify_authority_mismatch_as_expired ... ok
+test admission::tests::shared_reads_proceed_and_named_write_blocks_the_later_reader ... ok
+test authority::tests::owner_policy_refuses_project_local_writable_and_symlink_files ... ok
+test authority::tests::real_signatures_require_exact_document_key_and_namespace ... ok
+test authority::tests::contract_put_records_one_denial_for_a_bad_signature_or_oversized_file_and_none_on_success ... ok
+test authority::tests::delegation_verifier_checks_raw_bytes_and_self_signed_grant_does_not_reserve ... ok
+test authority::tests::signed_memory_policy_requires_namespace_and_records_denials ... ok
+test authority::tests::signed_owner_ingress_uses_pinned_config_and_preserves_invalid_requests ... ok
+test canonical_worker::tests::brief_preparation_expiry_and_failed_commit_leave_no_delivery_obligation ... ok
+test admission::tests::integration_backlog_returns_capacity_full_and_terminal_rows_do_not ... ok
+test canonical_worker::tests::conflicting_legacy_socket_alias_prevents_brief_claim ... ok
+test authority::tests::signed_routines_require_enabled_config_and_recheck_script_before_effect ... ok
+test canonical_worker::tests::controller_hints_rotate_brief_and_termination_without_granting_authority ... ok
+test canonical_worker::tests::corrupt_target_payload_cannot_hide_a_retained_resource_using_a_terminated_peer ... ok
+test canonical_worker::tests::busy_foreign_and_changed_executable_workers_are_not_claimed ... ok
+test canonical_worker::tests::controller_recovers_missing_initial_brief_without_sending_or_duplicating_it ... ok
+test canonical_worker::tests::creation_and_recovery_refuse_terminal_replacement_during_process_observation ... ok
+test canonical_worker::tests::desired_stop_works_while_paused_and_revoked_and_retains_resources ... ok
+test canonical_worker::tests::enabled_controller_queue_launches_cancels_and_preserves_across_projects ... ignored, requires HP_CONTROLLER_TEST_BINARY pointing to the compiled main test executable
+test canonical_worker::tests::enabled_ticker_launches_and_preserves_with_shared_root_maintenance ... ignored, requires HP_CONTROLLER_TEST_BINARY pointing to the compiled main test executable
+test canonical_worker::tests::creation_claim_and_recovery_intent_roll_back_together_before_native_effects ... ok
+test canonical_worker::tests::exited_worker_reconciles_after_handles_are_lost_without_claiming_task_success ... ok
+test canonical_worker::tests::exit_before_any_identity_observation_keeps_uncertain_creation_reserved ... ok
+test canonical_worker::tests::direct_workers_require_positive_visible_readiness_not_managed_launch_flag ... ok
+test canonical_worker::tests::gate_release_boundary_is_one_use_and_does_not_confirm_a_start ... ok
+test canonical_worker::tests::last_moment_brief_preflight_blocks_changed_authority_without_submission ... ok
+test canonical_worker::tests::creation_retains_observed_supervisor_after_authority_changes ... ok
+test canonical_worker::tests::live_authenticated_controller_workflow ... ignored, requires explicit live workflow authorization, HP_LIVE_HERDR, HP_LIVE_AGENT, HP_LIVE_AUTH_FILE and HP_CONTROLLER_TEST_BINARY
+test canonical_worker::tests::live_canonical_caller_crash_after_creation_and_gate_input ... ignored, requires HP_LIVE_HERDR; SIGKILL after real native effects
+test canonical_worker::tests::live_canonical_historical_bootstrap_blocks_release_after_worker_stop ... ignored, requires HP_LIVE_HERDR; real historical bootstrap quiescence refusal
+test canonical_worker::tests::live_canonical_lost_creation_and_gate_replies_preserve_one_use ... ignored, requires HP_LIVE_HERDR; real native effects with a reply-dropping proxy
+test canonical_worker::tests::live_canonical_repository_creation_release_and_termination ... ignored, requires HP_LIVE_HERDR with workspace.create_command; disposable native server
+test canonical_worker::tests::live_canonical_server_restart_preserves_old_outputs_and_new_worker ... ignored, requires HP_LIVE_HERDR; actual server restart and replacement worker
+test canonical_worker::tests::live_canonical_supervised_root_creation_release_and_termination ... ignored, requires HP_LIVE_HERDR with workspace.create_command; disposable native server
+test canonical_worker::tests::live_canonical_unobserved_exit_keeps_capacity_and_refuses_replay ... ignored, requires HP_LIVE_HERDR; real native exit before durable identity capture
+test canonical_worker::tests::launch_advancement_refuses_unusable_environment_before_creation ... ok
+test canonical_worker::tests::live_native_crash_driver ... ok
+test canonical_worker::tests::live_gate_proof_refuses_the_same_child_after_exec ... ok
+test canonical_worker::tests::live_worker_without_cancellation_is_observed_without_being_stopped ... ok
+test canonical_worker::tests::gate_release_refuses_changed_target_authority_and_failed_commit_is_atomic ... ok
+test canonical_worker::tests::lost_creation_recovers_exact_resource_without_config_or_another_claim ... ok
+test canonical_worker::tests::lost_resource_creation_reply_retains_claim_and_never_creates_again ... ok
+test canonical_worker::tests::malformed_neighbor_identity_never_panics_claims_or_sends_a_brief ... ok
+test canonical_worker::tests::lost_or_foreign_brief_acknowledgments_retain_claim_and_never_repeat ... ok
+test canonical_worker::tests::native_brief_submits_retained_bytes_once_and_commits_running_state ... ok
+test canonical_worker::tests::lost_workspace_reply_recovers_exact_live_marker_even_after_revocation_and_expiry ... ok
+test canonical_worker::tests::native_brief_original_deadline_bounds_a_stalled_submission ... ok
+test canonical_worker::tests::native_resource_creation_records_gated_target_once_and_cancellation_retains_it ... ok
+test canonical_worker::tests::native_gate_submission_is_once_even_when_the_reply_is_lost ... ok
+test canonical_worker::tests::native_gate_refusal_does_not_consume_the_release_opportunity_or_send_input ... ok
+test canonical_worker::tests::observed_resource_exit_before_target_commit_remains_recoverable ... ok
+test canonical_worker::tests::native_start_confirmation_requires_real_exec_and_exact_agent_then_replays_read_only ... ok
+test canonical_worker::tests::readiness_lost_after_claim_prevents_prompt_and_retains_one_use_claim ... ok
+test canonical_worker::tests::new_workspace_creation_and_lost_layout_reply_are_one_use ... ok
+test canonical_worker::tests::recovery_target_commit_failure_retains_original_claim_and_can_be_reobserved ... ok
+test canonical_worker::tests::prepared_launch_selection_rotates_stages_and_excludes_cancelled_or_expired_effects ... ok
+test canonical_worker::tests::resource_preparation_enforces_profile_budget_before_claim_or_external_effect ... ok
+test canonical_worker::tests::resource_preparation_rejects_changed_config_before_consuming_approval_or_creating ... ok
+test canonical_worker::tests::staged_stop_commit_failure_retains_capacity_and_recovers_without_creation ... ok
+test canonical_worker::tests::staged_stop_requires_output_evidence_and_preserves_an_empty_directory ... ok
+test canonical_worker::tests::stop_before_brief_atomically_retires_send_and_commit_failure_keeps_capacity ... ok
+test canonical_worker::tests::staged_repository_stop_requires_and_records_preserved_partial_files ... ok
+test canonical_worker::tests::supervised_root_recovery_needs_exact_process_and_preserves_expired_authority ... ok
+test canonical_worker::tests::target_inventory_rejects_rehashed_inputs_and_broken_launch_operation_links ... ok
+test canonical_worker::tests::uncertain_initial_brief_never_becomes_a_fresh_preparation_hint ... ok
+test canonical_worker::tests::uncertain_creation_refuses_foreign_socket_duplicate_panes_and_changed_command ... ok
+test canonical_worker::tests::workspace_acknowledgment_loss_retains_uncertainty_without_layout_or_recreation ... ok
+test canonical_worker::tests::supervised_root_creation_and_commit_losses_recover_without_bootstrap_or_replay ... ok
+test canonical_worker::tests::workspace_receipt_commit_failure_never_submits_layout_or_recreates ... ok
+test domain::approval::tests::actor_claims_and_unknown_operation_classes_are_not_accepted_as_grant_fields ... ok
+test domain::approval::tests::approval_identity_is_non_circular_but_final_reference_is_required ... ok
+test domain::approval::tests::changed_actions_projects_revisions_and_expiry_cannot_reuse_a_grant ... ok
+test domain::launch::tests::full_attempt_ids_map_to_bounded_native_agent_names ... ok
+test domain::profile::tests::unknown_capabilities_remain_explicit_and_identity_covers_effective_inputs ... ok
+test execution_guard::tests::failed_project_acquisition_releases_root_and_refuses_symlinks_and_special_files ... ok
+test execution_guard::tests::projects_are_independent_and_root_barrier_remains_exclusive ... ok
+test execution_guard::tests::shared_guards_overlap_across_repos_and_exclude_one_git_dir ... ok
+test canonical_worker::tests::workspace_layout_commit_failure_resumes_without_recreating_workspace ... ok
+test factory_status::tests::newer_schema_does_not_guess_counters_or_leak_task_text ... ok
+test integration::git::tests::broker_rejects_network_and_non_cas_updates ... ok
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmpwODO3Q/repo/.git/
+[master (root-commit) 71fd95c] base
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/file.txt
+refs/heads/master
+Switched to a new branch 'worker'
+[worker 46e035d] verified
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/other.txt
+46e035d549ec8a00cba27b1500cf8e6bba02ad60
+Switched to branch 'master'
+71fd95c0820058b3efb9a1f3e3c5e8618a106574
+71fd95c0820058b3efb9a1f3e3c5e8618a106574
+111b062d9bc950be343987a488415141824d0798
+test factory_status::tests::status_json_omits_environment_and_counts_rows_from_the_active_page ... ok
+8fa5ef256268e791781937ff6818c89382ee4afc
+949825244b85e0195d193e83a7f381145b304dc2
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmpd6RFlZ/repo/.git/
+949825244b85e0195d193e83a7f381145b304dc2
+[master (root-commit) 2ffce96] base
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/file.txt
+refs/heads/master
+71fd95c0820058b3efb9a1f3e3c5e8618a106574
+46e035d549ec8a00cba27b1500cf8e6bba02ad60
+Switched to a new branch 'worker'
+test integration::tests::ambiguous_ref_enters_reconciliation_required ... ok
+[worker 1207b08] verified
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/other.txt
+1207b0807279a423bae26c7dc2a31dee3af008ba
+Switched to branch 'master'
+2ffce9625c4f070070dbde644e5f9543ee897887
+2ffce9625c4f070070dbde644e5f9543ee897887
+111b062d9bc950be343987a488415141824d0798
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmpfabCaS/repo/.git/
+[master (root-commit) 2ffce96] base
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/file.txt
+refs/heads/master
+Switched to a new branch 'worker'
+[worker 7c03fa4] verified
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/other.txt
+7c03fa46f0c124dac7c1c1ac606c4d066aae6e60
+Switched to branch 'master'
+2ffce9625c4f070070dbde644e5f9543ee897887
+2ffce9625c4f070070dbde644e5f9543ee897887
+111b062d9bc950be343987a488415141824d0798
+56499bc6a200beb611b16ff39960ba88cb4d8028
+56499bc6a200beb611b16ff39960ba88cb4d8028
+2ffce9625c4f070070dbde644e5f9543ee897887
+1207b0807279a423bae26c7dc2a31dee3af008ba
+2ffce9625c4f070070dbde644e5f9543ee897887
+1207b0807279a423bae26c7dc2a31dee3af008ba
+test integration::tests::crash_after_ref_update_confirms_only_exact_new_oid ... ok
+test canonical_worker::tests::launch_advancement_recovers_each_boundary_then_delivers_brief_and_stops ... ok
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmpmhntZR/repo/.git/
+[master (root-commit) 61895c4] base
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/file.txt
+refs/heads/master
+Switched to a new branch 'worker'
+[worker 151ca79] verified
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/other.txt
+151ca798a4de35b455f9937fa16dc44133d022e6
+Switched to branch 'master'
+61895c4fa376891ba6564350994de98914d76dc3
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmpzkcrV3/repo/.git/
+61895c4fa376891ba6564350994de98914d76dc3
+111b062d9bc950be343987a488415141824d0798
+[master (root-commit) 61895c4] base
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/file.txt
+refs/heads/master
+Switched to a new branch 'worker'
+[worker 151ca79] verified
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/other.txt
+151ca798a4de35b455f9937fa16dc44133d022e6
+Switched to branch 'master'
+61895c4fa376891ba6564350994de98914d76dc3
+61895c4fa376891ba6564350994de98914d76dc3
+111b062d9bc950be343987a488415141824d0798
+2ffce9625c4f070070dbde644e5f9543ee897887
+7c03fa46f0c124dac7c1c1ac606c4d066aae6e60
+test integration::tests::crash_before_checks_resumes_or_discards_instead_of_staying_pending ... ok
+5e5c208f046dcc2f868528f7c126ffa506d222ad
+61895c4fa376891ba6564350994de98914d76dc3
+151ca798a4de35b455f9937fa16dc44133d022e6
+test integration::tests::expired_claim_confirms_exact_oid_without_claimed_state ... ok
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmp2b2t83/repo/.git/
+[master (root-commit) 33f3d1a] base
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/file.txt
+refs/heads/master
+Switched to a new branch 'worker'
+[worker 9531e0e] verified
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/other.txt
+9531e0edddc36e63581f36adaa92abb7ebc441f8
+Switched to branch 'master'
+33f3d1a63aca4a235eb088f06db6ca96584ade03
+33f3d1a63aca4a235eb088f06db6ca96584ade03
+111b062d9bc950be343987a488415141824d0798
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmp2wOFSQ/repo/.git/
+61895c4fa376891ba6564350994de98914d76dc3
+151ca798a4de35b455f9937fa16dc44133d022e6
+[master (root-commit) bdaeadb] base
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/file.txt
+refs/heads/master
+test integration::tests::expired_claim_after_build_still_records ... ok
+Switched to a new branch 'worker'
+[worker a943ff5] verified
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/other.txt
+a943ff5ace6db615a7cdffbc8426ed922a59b0c7
+Switched to branch 'master'
+bdaeadbf3138bf027ab88245974030306364516e
+bdaeadbf3138bf027ab88245974030306364516e
+33f3d1a63aca4a235eb088f06db6ca96584ade03
+111b062d9bc950be343987a488415141824d0798
+ec20bad5303edcff6f616c5b7791d141186b9c9f
+tree
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmpApdi4e/repo/.git/
+[master (root-commit) bdaeadb] base
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/file.txt
+refs/heads/master
+Switched to a new branch 'worker'
+[worker a943ff5] verified
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/other.txt
+a943ff5ace6db615a7cdffbc8426ed922a59b0c7
+Switched to branch 'master'
+bdaeadbf3138bf027ab88245974030306364516e
+bdaeadbf3138bf027ab88245974030306364516e
+111b062d9bc950be343987a488415141824d0798
+bdaeadbf3138bf027ab88245974030306364516e
+33f3d1a63aca4a235eb088f06db6ca96584ade03
+9531e0edddc36e63581f36adaa92abb7ebc441f8
+test integration::tests::missing_candidate_object_discards_prepared_generation ... ok
+e065e4826676584e5fff4fc644b9f8ab81a48efb
+bdaeadbf3138bf027ab88245974030306364516e
+a943ff5ace6db615a7cdffbc8426ed922a59b0c7
+test integration::tests::packed_ancestor_tree_still_publishes ... ok
+bdaeadbf3138bf027ab88245974030306364516e
+a943ff5ace6db615a7cdffbc8426ed922a59b0c7
+test integration::tests::reconcile_keeps_prepared_generation_when_objects_exist ... ok
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmptfLOor/repo/.git/
+[master (root-commit) 8859b4e] base
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/file.txt
+refs/heads/master
+Switched to a new branch 'worker'
+[worker faf03be] verified
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/other.txt
+faf03be84a80fd5808a1b3b79741621fafa9dfc7
+Switched to branch 'master'
+8859b4e76c0100ddf358d155d8da7c7bf66f6233
+8859b4e76c0100ddf358d155d8da7c7bf66f6233
+111b062d9bc950be343987a488415141824d0798
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmpspKBGD/repo/.git/
+[master (root-commit) 8859b4e] base
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/file.txt
+refs/heads/master
+Switched to a new branch 'worker'
+[worker faf03be] verified
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/other.txt
+faf03be84a80fd5808a1b3b79741621fafa9dfc7
+Switched to branch 'master'
+8859b4e76c0100ddf358d155d8da7c7bf66f6233
+8859b4e76c0100ddf358d155d8da7c7bf66f6233
+111b062d9bc950be343987a488415141824d0798
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmpjpVnxp/repo/.git/
+[master (root-commit) 8859b4e] base
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/file.txt
+refs/heads/master
+Switched to a new branch 'worker'
+8859b4e76c0100ddf358d155d8da7c7bf66f6233
+[worker faf03be] verified
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/other.txt
+faf03be84a80fd5808a1b3b79741621fafa9dfc7
+Switched to branch 'master'
+8859b4e76c0100ddf358d155d8da7c7bf66f6233
+8859b4e76c0100ddf358d155d8da7c7bf66f6233
+8859b4e76c0100ddf358d155d8da7c7bf66f6233
+Switched to branch 'integration'
+111b062d9bc950be343987a488415141824d0798
+8859b4e76c0100ddf358d155d8da7c7bf66f6233
+Switched to branch 'master'
+8859b4e76c0100ddf358d155d8da7c7bf66f6233
+faf03be84a80fd5808a1b3b79741621fafa9dfc7
+test integration::tests::refuses_checked_out_ref_and_missing_configuration ... ok
+d9e1408899baa6774359dbeb9850c7f73cbba8a2
+d9e1408899baa6774359dbeb9850c7f73cbba8a2
+8859b4e76c0100ddf358d155d8da7c7bf66f6233
+faf03be84a80fd5808a1b3b79741621fafa9dfc7
+test integration::tests::retry_integrate_confirms_candidate_already_at_ref ... ok
+6637c257f04ded84f08e3312e60cbf9ea7802c94
+8859b4e76c0100ddf358d155d8da7c7bf66f6233
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmpcBD5u6/repo/.git/
+faf03be84a80fd5808a1b3b79741621fafa9dfc7
+[master (root-commit) 8859b4e] base
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/file.txt
+test integration::tests::stale_base_does_not_publish ... ok
+refs/heads/master
+Switched to a new branch 'worker'
+[worker faf03be] verified
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/other.txt
+faf03be84a80fd5808a1b3b79741621fafa9dfc7
+Switched to branch 'master'
+8859b4e76c0100ddf358d155d8da7c7bf66f6233
+8859b4e76c0100ddf358d155d8da7c7bf66f6233
+111b062d9bc950be343987a488415141824d0798
+8859b4e76c0100ddf358d155d8da7c7bf66f6233
+bf87ed50423e52205af504827ff10d89dcee1f6a
+8859b4e76c0100ddf358d155d8da7c7bf66f6233
+faf03be84a80fd5808a1b3b79741621fafa9dfc7
+test integration::tests::update_ref_failure_at_old_oid_stays_retryable ... ok
+test canonical_worker::tests::unsupported_connected_server_refuses_creation_before_approval_or_worktrees ... ok
+test memory::checkpoint::tests::changed_profile_or_instructions_force_full_context ... ok
+test memory::checkpoint::tests::acknowledgments_require_current_session_generation_and_exact_identity ... ok
+test memory::checkpoint::tests::checkpoint_publication_rejects_mixed_heads_and_foreign_session_snapshots ... ok
+test memory::checkpoint::tests::failed_read_leaves_cursor_and_missing_checkpoint_falls_back_to_full ... ok
+test memory::checkpoint::tests::new_session_is_full_ack_then_delta_keeps_blockers_and_records_sizes ... ok
+test memory::checkpoint::tests::delta_pages_ack_only_the_rendered_high_water_and_do_not_skip_holes ... ok
+test memory::checkpoint::tests::hundred_task_delta_is_smaller_and_overflow_does_not_move_the_cursor ... ok
+test memory::import::tests::brief_without_snapshot_succeeds_and_oversized_snapshot_fails_closed ... ok
+test memory::import::tests::cutover_switches_owner_preserves_runtime_and_rejects_divergent_projection ... ok
+test memory::import::tests::hard_rule_without_import_ack_is_an_active_fact_and_gc_keeps_pins ... ok
+test memory::import::tests::repeat_import_reuses_ids_and_hostile_markdown_cannot_install_approvals ... ok
+test memory::import::tests::snapshot_render_bounds_object_reads_before_hashing_and_preserves_unicode_budget ... ok
+test memory::import::tests::sealed_worker_knowledge_uses_retained_inputs_and_refuses_corrupt_bytes ... ok
+test memory::import::tests::traversal_symlink_oversize_and_nul_are_refused ... ok
+test memory::proposals::tests::duplicate_proposal_reuses_result_and_changed_bytes_conflict ... ok
+test memory::proposals::tests::invented_validation_id_is_refused_and_matching_verified_result_is_not_promoted ... ok
+test memory::proposals::tests::oversized_and_malformed_proposals_are_rejected ... ok
+test memory::import::tests::writers_must_stop_and_unknown_memory_owner_is_refused ... ok
+test memory::proposals::tests::spoofed_attempt_missing_evidence_stale_base_and_elevation_are_rejected ... ok
+test memory::regression_tests::accepted_evidence_survives_collection_before_and_after_promotion ... ok
+test memory::regression_tests::abandoned_gc_claim_must_be_recoverable_after_reopen ... ok
+test memory::regression_tests::accepted_proposal_must_protect_its_body_from_gc ... ok
+test memory::regression_tests::collection_failure_does_not_certify_purge ... ok
+test memory::regression_tests::concurrent_ingests_in_one_process_do_not_share_staging_files ... ok
+test memory::regression_tests::acknowledging_old_checkpoint_cannot_rewind_the_session ... ok
+test memory::regression_tests::coordinator_must_refuse_missing_mandatory_bytes ... ok
+test memory::regression_tests::coordinator_snapshots_need_session_specific_subscriptions ... ok
+test memory::regression_tests::coordinator_output_must_fit_profile_budget ... ok
+test memory::regression_tests::corrupt_object_bytes_must_not_be_rendered_as_verified_memory ... ok
+test memory::regression_tests::hard_memory_kind_is_mandatory_and_expiry_cannot_silently_remove_it ... ok
+test memory::regression_tests::concurrent_revision_reference_and_collection_never_lose_committed_bytes ... ok
+test memory::regression_tests::delta_must_include_changed_project_instructions ... ok
+test memory::regression_tests::cutover_must_verify_object_bytes_before_publishing_authority ... ok
+test memory::regression_tests::ingest_refuses_corrupt_existing_destination ... ok
+test memory::regression_tests::newly_hard_rule_must_not_reuse_optional_snapshot ... ok
+test memory::regression_tests::mandatory_body_must_count_towards_snapshot_budget ... ok
+test memory::regression_tests::import_plan_must_bind_the_supplied_inventory_to_its_digest ... ok
+test memory::regression_tests::promotion_rechecks_expiry_without_an_intervening_event ... ok
+test memory::regression_tests::promote_must_recheck_hard_rule_changes_since_review ... ok
+test memory::regression_tests::profile_only_fallback_never_borrows_task_scoped_snapshot ... ok
+test memory::regression_tests::promotion_replay_must_return_same_sequence ... ok
+test memory::regression_tests::snapshot_cache_must_not_reintroduce_expired_facts ... ok
+test memory::regression_tests::reingesting_collected_bytes_must_restore_availability ... ok
+test memory::regression_tests::unrelated_domain_and_path_must_not_match_only_because_of_kind_weight ... ok
+test memory::review::tests::competing_promotions_conflict_and_stale_review_must_be_repeated ... ok
+test memory::snapshot::tests::coordinator_constructor_skips_tasks_and_cli_rejects_reserved_id ... ok
+test memory::review::tests::aborted_promotion_leaves_no_partial_revision_or_intent ... ok
+test memory::regression_tests::supported_object_body_must_not_be_silently_truncated_on_render ... ok
+test memory::snapshot::tests::oversized_hard_rule_fails_closed_and_optional_never_displaces_mandatory ... ok
+test memory::snapshot::tests::same_inputs_reuse_manifest_and_unrelated_domain_is_excluded ... ok
+test memory::snapshot::tests::stale_heads_digest_conflicts_and_revoked_pin_blocks ... ok
+test memory::snapshot::tests::worker_selection_reserves_framing_before_optional_memory ... ok
+test memory::worker_brief::tests::checkout_mappings_count_toward_the_complete_brief_budget ... ok
+test memory::worker_brief::tests::framing_is_budgeted_and_retained_unicode_is_never_truncated ... ok
+test memory::worker_brief::tests::old_snapshots_cannot_silently_acquire_new_output_instructions ... ok
+test memory::tests::ingest_cancels_gc_claim_and_unreferenced_objects_are_purged ... ok
+test memory::tests::missing_expiry_and_revocation_are_not_active_facts ... ok
+test memory::tests::concurrent_cas_has_one_winner_and_hashes_survive_reopen ... ok
+test migration::identity_inventory::controller_hint_tests::effect_hint_busy_database_respects_short_read_budget ... ok
+test migration::identity_inventory::controller_hint_tests::effect_hint_duplicate_id_view_is_refused_without_collecting_payload_copies ... ok
+test migration::identity_inventory::controller_hint_tests::effect_hints_preserve_publication_cancellation_and_sql_deadline_checks ... ok
+test migration::identity_inventory::controller_hint_tests::effect_hints_refuse_overflow_without_starving_late_candidates ... ok
+test migration::identity_inventory::controller_hint_tests::effect_notification_route_is_only_a_bounded_hash_checked_hint ... ok
+test migration::identity_inventory::controller_hint_tests::routine_hints_bound_control_rows_and_interrupt_sql ... ok
+test migration::identity_inventory::controller_hint_tests::effect_hints_measure_selected_fields_and_refuse_corruption ... ok
+test migration::identity_inventory::controller_hint_tests::routine_hints_refuse_overflow_duplicate_and_dangling_candidates ... ok
+test migration::identity_inventory::tests::budget_and_corrupt_provenance_refuse_before_identity_is_returned ... ok
+test migration::identity_inventory::tests::controlled_open_keeps_cancellation_and_publication_byte_limits ... ok
+test migration::identity_inventory::tests::controlled_open_matches_snapshot_and_rejects_bad_publication ... ok
+test migration::identity_inventory::tests::deleted_canonical_binding_cannot_hide_retained_resource_references ... ok
+test migration::identity_inventory::controller_hint_tests::effect_hints_skip_unrelated_history_and_rotate_the_complete_eligible_set ... ok
+test migration::identity_inventory::tests::observation_head_sqlite_work_is_interrupted_by_its_original_budget ... ok
+test migration::identity_inventory::controller_hint_tests::routine_hints_skip_payloads_and_rotate_after_last_actual_admission ... ok
+test migration::identity_inventory::tests::sqlite_progress_interrupts_work_inside_a_query ... ok
+test migration::tests::altered_backup_marker_and_projection_remain_visible_and_preserved ... ok
+test migration::tests::canonical_inbox_drain_preserves_done_seen_and_does_not_replay_other_effects ... ok
+test migration::tests::canonical_runtime_creation_preserves_provenance_and_fences_task_and_control ... ok
+test migration::identity_inventory::tests::identity_inventory_matches_snapshot_without_materializing_unrelated_history ... ok
+test migration::tests::canonical_runtime_creation_refuses_unselected_retained_attempts ... ok
+test migration::identity_inventory::tests::observation_head_reads_no_historical_payload_and_fences_publication ... ok
+test migration::tests::claimed_inbox_intent_is_not_stolen_by_internal_drain ... ok
+test migration::tests::coordinator_prime_import_requires_confirmed_delivery_and_valid_counters ... ok
+test migration::tests::coordinator_start_import_requires_confirmed_delivery_and_retains_uncertain_history ... ok
+test migration::tests::controller_preserves_archived_state_and_retained_attempts_block_admission ... ok
+test migration::tests::controller_resume_requires_fresh_evidence_and_pause_fences_epoch ... ok
+test migration::tests::corrupt_retry_identity_types_and_dates_block_import ... ok
+test migration::tests::crash_child ... ok
+test migration::tests::corrupt_receipt_provenance_rolls_back_all_confirmations ... ok
+test migration::tests::external_config_absence_path_and_unsafe_files_are_bound ... ok
+test migration::identity_inventory::tests::oversized_payload_cancelled_budget_and_publication_mismatch_refuse ... ok
+test migration::tests::corrupt_or_missing_runtime_binding_is_visible ... ok
+test migration::tests::final_copy_obligations_and_invalid_counters_block_migration ... ok
+test migration::tests::failed_operation_import_rolls_back_sources_tasks_delivery_and_receipt ... ok
+test migration::tests::failed_record_lock_releases_project_and_root_ownership ... ok
+test migration::tests::guarded_controller_commit_expires_claim_without_replay ... ok
+test migration::tests::guarded_controller_commit_fences_identity_head_and_record_lock ... ok
+test migration::tests::guarded_controller_publication_failure_requires_forward_recovery ... ok
+test migration::tests::external_config_changes_block_apply_and_all_unpublished_recovery_phases ... ok
+test migration::tests::imported_receipts_confirm_atomically_without_live_effects_or_task_promotion ... ok
+test migration::tests::imported_receipts_cannot_confirm_new_lookalike_operations ... ok
+test migration::tests::inbox_indentation_conflicts_roll_back_deliveries_and_preserve_bytes ... ok
+test migration::tests::interrupted_controller_marker_publication_recovers_forward ... ok
+test migration::tests::malformed_known_settings_and_inbox_fields_block_cutover ... ok
+test migration::tests::maintenance_lock_and_confirmation_are_required ... ok
+test migration::tests::notification_claims_and_suppression_require_reconciliation_before_import ... ok
+test migration::tests::interrupted_directory_reservation_retries_and_invalid_store_can_abort_losslessly ... ok
+test migration::tests::old_schema_projection_does_not_conflict_after_inbox_upgrade ... FAILED
+test migration::tests::open_active_accepts_sqlite_memory_and_publish_control_marker_preserves_it ... ok
+test migration::tests::pending_brief_claims_refuse_migration_but_confirmed_history_is_validated ... ok
+test migration::tests::missing_receipts_and_changed_task_or_claim_never_authorize_confirmation ... ok
+test migration::tests::pending_live_projection_refuses_migration_until_exact_stage_recovery ... ok
+test migration::tests::killed_process_recovers_at_each_durable_journal_phase ... ok
+test migration::tests::pending_or_unresolved_launch_claim_requires_reconciliation_before_import ... ok
+test migration::tests::pending_copy_warning_imports_without_ticker_and_invalid_receipt_blocks ... ok
+test migration::tests::partial_projection_temporary_is_replaced_without_touching_final_edits ... ok
+test migration::tests::pending_obligations_import_atomically_as_ambiguous_without_losing_retry_state ... ok
+test migration::tests::pending_review_notice_imports_without_ticker_and_rejects_identity_corruption ... ok
+test migration::tests::pending_thread_status_notice_imports_without_ticker_state_and_rejects_corruption ... ok
+test migration::tests::plan_apply_export_restore_preserve_exact_sources_and_memory_authority ... ok
+test migration::tests::reconciliation_observations_are_atomic_fenced_and_never_release_capacity ... ok
+test migration::tests::restore_into_a_new_root_and_deleting_the_ownership_marker_is_not_rollback ... ok
+test migration::tests::published_v2_store_upgrades_explicitly_without_losing_migration_identity ... FAILED
+test migration::tests::retiring_an_ambiguous_intent_does_not_claim_absence_or_release_resources ... ok
+test migration::tests::runtime_rebind_invalidates_observations_claims_and_original_task_revision ... ok
+test migration::tests::runtime_bindings_preserve_recorded_identity_without_granting_ownership ... ok
+test migration::tests::runtime_rebind_refuses_active_attempt_and_duplicate_pane_without_partial_mutation ... ok
+test migration::tests::runtime_rebind_refuses_unselected_lost_attempt_that_retains_capacity ... ok
+test migration::tests::runtime_upgrade_failure_rolls_back_schema_and_can_be_retried ... FAILED
+test migration::tests::recover_every_publication_boundary_and_empty_database ... ok
+test migration::tests::runtime_upgrade_uses_provenance_preserves_edits_and_previous_exports ... FAILED
+test migration::tests::schema3_inbox_upgrade_reads_provenance_not_changed_legacy_files ... FAILED
+test migration::tests::schema8_upgrade_preserves_observation_foreign_keys_and_import_hashes ... FAILED
+test migration::tests::stale_plan_unknown_fields_and_corruption_never_switch_authority ... ok
+test migration::tests::symlink_sources_and_controlled_ancestors_refuse_without_external_writes ... ok
+test migration::tests::runtime_snapshot_checks_source_bytes_and_missing_links_on_open_connection ... ok
+test migration::tests::schema_v1_upgrade_is_explicit_and_retains_existing_rows ... ok
+test operations::dispatch::tests::dispatch_crash_child ... ok
+test migration::tests::schema9_queue_upgrade_preserves_old_exports_and_starts_with_closed_capacity ... FAILED
+test operations::dispatch::tests::lease_expiring_during_prepare_recheck_prevents_effect ... ok
+test operations::dispatch::tests::adapter_errors_and_lost_receipt_remain_uncertain_across_restart ... ok
+test migration::tests::task_edits_and_projection_recovery_preserve_new_state_and_originals ... ok
+test profile_config::tests::preparation_checks_whole_brief_and_supported_budget_policy ... ok
+test profile_config::tests::profile_file_with_model_still_errors ... ok
+test profile_config::tests::shared_validation_and_mapping_errors_do_not_expose_values ... ok
+test profile_config::tests::unknown_usage_refuses_missing_usage_as_zero ... ok
+test operations::dispatch::tests::service_claims_before_effect_records_receipt_and_refuses_replay ... ok
+test operations::dispatch::tests::dispatch_process_death_retains_claim_or_receipt_without_replay ... ok
+test profile_preparation::tests::cancelled_preparation_does_not_probe ... ok
+test operations::dispatch::tests::service_policy_denial_and_stale_binding_never_call_effect ... ok
+test profile_preparation::tests::launch_ingress::draft_preflight_rejects_closed_capacity_without_writing_approval_or_task_state ... ok
+test profile_preparation::tests::launch_ingress::draft_signature_and_reservation_preserve_the_exact_brief_and_one_use_boundary ... ok
+test profile_preparation::tests::launch_ingress::legacy_worktree_reference_blocks_new_creation_before_consuming_approval ... ok
+test profile_preparation::tests::launch_ingress::repository_observation_ignores_replacement_refs_and_refuses_lazy_fetch ... ok
+test profile_preparation::tests::launch_ingress::lost_worktree_receipt_commit_recovers_after_approval_revocation_without_git_add ... ok
+test profile_preparation::tests::changed_policy_binary_home_or_unmapped_configuration_discards_preparation ... ok
+test profile_preparation::tests::launch_ingress::source_only_working_directory_is_refused_before_approval_consumption ... ok
+test profile_preparation::tests::launch_ingress::preparation_stop_preserves_created_repositories_and_records_uncreated_plans_in_order ... ok
+test profile_preparation::tests::launch_ingress::started_worktree_proof_allows_output_but_rejects_reassociation ... ok
+test profile_preparation::tests::launch_ingress::signed_worktree_creation_retains_exact_checkout_and_recovers_without_replay ... ok
+test profile_preparation::tests::launch_ingress::worktree_inventory_retains_uncertain_paths_and_refuses_corrupt_provenance ... ok
+test profile_preparation::tests::launch_ingress::worktree_creation_supports_multiple_repositories_binary_files_and_symlinks ... ok
+test profile_preparation::tests::launch_ingress::worktree_route_maps_root_and_subdirectory_and_refuses_foreign_sources ... ok
+test profile_preparation::tests::live_production_native_interaction_verification ... ignored, requires patched HP_LIVE_HERDR, HP_LIVE_AGENT and explicit HP_LIVE_AUTH_FILE; submits one fixed prompt
+test profile_preparation::tests::live_production_native_profile_verification ... ignored, requires HP_LIVE_HERDR patched runtime and HP_LIVE_AGENT native Codex; isolated home, no prompt
+test profile_preparation::tests::live_unauthenticated_interaction_is_not_certified ... ignored, requires patched HP_LIVE_HERDR and HP_LIVE_AGENT; empty home, no authentication or prompt
+test profile_preparation::tests::native_retention_pin_close_preserves_database_lock ... ok
+test profile_preparation::tests::native_retention_refuses_foreign_replaced_store_and_changed_policy ... ok
+test profile_preparation::tests::native_retention_requires_explicit_schema_upgrade ... FAILED
+test profile_preparation::tests::native_retention_rolls_back_event_on_insert_failure ... ok
+test profile_preparation::tests::native_retention_survives_restart_is_idempotent_and_remains_a_report ... ok
+test profile_preparation::tests::native_verification_does_not_promote_version_only_helpers ... ok
+test profile_preparation::tests::native_verification_refuses_unmapped_startup_arguments_before_launch ... ok
+test profile_preparation::tests::launch_ingress::unsigned_or_changed_launch_inputs_never_create_a_reservation ... ok
+test profile_preparation::tests::prompt_capability_requires_typed_exact_native_acknowledgment ... ok
+test profile_preparation::tests::production_preparation_binds_inputs_without_fabricating_capabilities_or_authority ... ok
+test profile_preparation::tests::retained_revalidation_preserves_capability_distinctions_and_owns_the_barrier ... ok
+test profile_preparation::tests::launch_ingress::worktree_refusals_precede_approval_consumption_and_effects ... ok
+test profile_preparation::tests::retained_revalidation_proof_rechecks_mutable_inputs_and_cancellation ... ok
+test profile_preparation::tests::retained_revalidation_refuses_changed_executable_without_running_it ... ok
+test reconcile::plan::tests::ambiguous_stale_effects_never_become_retry_candidates_or_release_lost_capacity ... ok
+test reconcile::plan::tests::expired_claims_require_expiry_and_pending_adapters_only_receive_advice ... ok
+test reconcile::plan::tests::terminated_binding_plans_without_a_live_observation ... ok
+test routines::execution::tests::bootstrap_refusal_and_outer_deadline_leave_cleanup_unknown ... ok
+test routines::execution::tests::cancellation_never_certifies_cleanup_and_monitor_failure_is_not_success ... ok
+test routines::execution::tests::invalid_inputs_refuse_before_any_script_and_environment_is_explicit ... ok
+test profile_preparation::tests::retained_revalidation_rejects_consistently_rehashed_false_claims ... ok
+test routines::execution::tests::normal_failure_and_output_caps_keep_cleanup_separate_from_success ... ok
+test routines::planning::tests::held_planning_known_inactive_state_returns_no_cursor_or_liveness ... ok
+test routines::execution::tests::normal_exit_and_deadline_kill_detached_descendants_even_with_closed_pipes ... ok
+test routines::planning::tests::held_planning_never_rebases_a_stale_prepared_head ... ok
+test routines::planning::tests::held_planning_refuses_wrong_guard_cancelled_expired_and_busy_record_lock ... ok
+test routines::planning::tests::held_planning_rotates_after_withdrawn_script_and_only_records_intent ... ok
+test routines::tests::permission_parse_binds_exact_bytes_not_only_before_and_after_path_checks ... ok
+test runner::socket::tests::blocked_submission_obeys_same_deadline ... ok
+test runner::socket::tests::connects_once_to_a_real_path_and_exchanges_one_line ... ok
+test runner::socket::tests::refuses_invalid_requests_before_connecting ... ok
+test runner::socket::tests::reply_is_bounded_and_requires_a_complete_utf8_line ... ok
+test routines::planning::tests::held_planning_validates_without_record_lock_and_checks_cancellation_before_commit ... ok
+test runner::socket::tests::trickle_reply_cannot_restart_deadline ... ok
+test runner::streaming_tests::absolute_deadline_caps_a_longer_relative_process_timeout ... ok
+test runner::streaming_tests::file_sink_streams_beyond_capture_limit_and_caps_producers ... ok
+test runner::tests::blocked_stdin_obeys_deadline ... ok
+test runner::tests::captures_output_and_exit_code ... ok
+test runner::tests::captures_raw_bytes_without_lossy_transport ... ok
+test runner::tests::drains_both_streams_after_capture_limits_without_deadlocking ... ok
+test runner::tests::cancellation_interrupts_blocked_io_and_is_distinct_from_timeout ... ok
+test runner::tests::escaped_process_group_cannot_hold_pipe_collection_open ... ok
+test profile_preparation::tests::retained_revalidation_honors_original_deadline ... ok
+test runner::tests::missing_program_is_an_error ... ok
+test runner::tests::passes_stdin ... ok
+test runner::tests::pre_cancelled_command_is_not_spawned ... ok
+test runner::tests::short_lived_descendant_is_drained_normally ... ok
+test runner::tests::stdin_larger_than_pipe_capacity_is_written_and_closed ... ok
+test runner::tests::hard_kill_handles_ignored_term ... ok
+test runner::tests::unowned_descendant_cannot_hold_pipe_collection_open ... ok
+test runtime::controlled_tests::cancellation_after_observation_commit_preserves_db_and_recovery_repairs_marker ... ok
+test runner::tests::times_out_a_chatty_child ... ok
+test runtime::controlled_tests::controlled_observation_commit_retains_guard_and_cancellation_refuses_entry ... ok
+test schedule::tests::daily_dst_gaps_and_repeats_have_explicit_instants ... ok
+test schedule::tests::daily_large_gaps_and_skipped_dates_do_not_replay_an_instant ... ok
+test schedule::tests::daily_windows_match_enumerated_slots_around_timezone_transitions ... ok
+test schedule::tests::interval_windows_are_anchored_bounded_and_restart_safe ... ok
+test source_tree::tests::atomic_destination_is_never_its_own_temporary_and_collisions_are_preserved ... ok
+test source_tree::tests::cancelled_owned_cleanup_can_resume_after_a_durable_unlink ... ok
+test source_tree::tests::cleanup_budget_accepts_a_maximum_live_library_plus_stage_metadata ... ok
+test source_tree::tests::enumeration_depth_deadline_and_cancellation_limits_fail_closed ... ok
+test source_tree::tests::enumeration_restarts_and_open_handles_survive_ancestor_replacement ... ok
+test source_tree::tests::growth_and_aggregate_bytes_are_bounded_during_reads ... ok
+test source_tree::tests::link_targets_are_literal_bounded_bytes_and_never_dereferenced ... ok
+test source_tree::tests::missing_report_is_distinct_from_unsafe_or_oversize_report ... ok
+test source_tree::tests::owned_cleanup_accepts_maximum_source_depth_without_relaxing_source_limits ... ok
+test runtime::controlled_tests::expiry_sql_is_interrupted_without_undoing_published_observations ... ok
+test store::active_work::tests::adopt_without_a_new_attempt_puts_a_terminated_binding_back_in_the_index ... ok
+test store::active_work::tests::dropped_projection_rebuilds_the_same_active_set ... ok
+test store::active_work::tests::create_ends_at_41_and_upgrade_from_40_reaches_41 ... ok
+test store::active_work::tests::empty_inventory_is_complete_and_a_missing_page_is_not ... ok
+test store::active_work::tests::index_keeps_every_retained_attempt_and_prefers_the_active_one ... ok
+test store::active_work::tests::one_hundred_twenty_nine_active_bindings_page_instead_of_refusing ... ok
+test store::active_work::tests::owned_binding_stays_active_after_every_attempt_is_terminated ... ok
+test store::active_work::tests::retained_attempt_blocks_release_without_an_indexed_binding ... ok
+test store::active_work::tests::terminated_attempt_commit_removes_the_binding_from_the_index ... ok
+test store::barriers::tests::cleared_revocation_and_deleted_revision_are_rejected ... ok
+test runner::tests::group_kill_reaches_grandchildren ... ok
+test store::barriers::tests::create_ends_at_40_and_upgrade_from_39_reaches_40 ... ok
+test store::barriers::tests::idempotent_freeze_returns_the_stored_row_not_a_later_max ... ok
+test store::barriers::tests::mandatory_head_without_applied_blocks_release ... ok
+test profile_preparation::tests::launch_ingress::worktree_only_stop_fences_late_launch_and_preserves_uncertain_resources ... ok
+test store::barriers::tests::membership_edit_invalidates_the_release_token ... ok
+test store::barriers::tests::required_set_generation_move_blocks_release ... ok
+test store::barriers::tests::revocation_during_release_blocks_dependents_and_does_not_release_capacity ... ok
+test store::barriers::tests::revoked_barrier_blocks_reattach_and_later_evidence_until_a_later_release ... ok
+test store::barriers::tests::stale_brief_after_revocation_is_recorded_and_cannot_be_accepted ... ok
+test store::barriers::tests::values_the_check_cannot_store_are_invalid ... ok
+test store::budget::tests::policy_installation_is_atomic_project_bound_and_revision_checked ... ok
+test store::capabilities::tests::changed_profile_digest_does_not_keep_the_old_level ... ok
+test store::capabilities::tests::codex_shaped_fixture_is_launchable_without_workflow_certification ... ok
+test store::capabilities::tests::contract_level_the_profile_lacks_is_capability_unsupported_and_not_certified ... ok
+test store::capabilities::tests::later_observation_window_does_not_abort_another_digest ... ok
+test store::capabilities::tests::copied_native_profile_is_not_launchable ... ok
+test store::capabilities::tests::native_profile_evidence_ignores_certified_flag_and_does_not_mint_profiles ... ok
+test store::capabilities::tests::queue_report_before_observation_is_capability_unsupported ... ok
+test store::checkpoints::tests::schema16_upgrade_reaches_schema20_without_inventing_checkpoints ... FAILED
+test store::checkpoints::tests::schema19_upgrade_adds_empty_checkpoint_tables ... FAILED
+test store::capabilities::tests::upgrade_v1_from_32_to_34_and_create_end_at_user_version_34 ... ok
+test store::consumer_bindings::tests::coordinator_binding_is_addressable_without_an_attempt ... ok
+test store::consumer_bindings::tests::backfill_numbers_generations_by_snapshot_sequence ... ok
+test store::consumer_bindings::tests::retired_snapshot_gets_no_new_obligation_and_pending_stays_on_successor ... ok
+test store::consumer_bindings::tests::retirement_without_successor_records_why_it_is_undeliverable ... ok
+test store::consumer_bindings::tests::shadow_compare_drops_no_required_recipient ... ok
+test store::controlled::tests::cancelled_and_expired_open_refuse_without_modifying_store ... ok
+test store::consumer_bindings::tests::upgrade_v1_from_36_preserves_receipts_and_create_ends_at_37 ... ok
+test store::controlled::tests::commit_hook_veto_rolls_back_and_success_after_commit_is_not_relabelled ... ok
+test store::controlled::tests::controlled_writes_do_not_wait_for_legacy_busy_timeout ... ok
+test store::controlled::tests::controlled_open_preserves_integrity_and_schema_refusal ... ok
+test store::controlled::tests::core_snapshot_accounting_refuses_dense_json_before_decode ... ok
+test store::controlled::tests::core_snapshot_accounting_rejects_valid_dense_payload_and_view_amplification ... ok
+test store::controlled::tests::nested_delivery_json_uses_shared_structure_budget_before_decode ... ok
+test store::controlled::tests::opening_installs_progress_control_before_schema_queries ... ok
+test store::controlled::tests::core_snapshot_accounting_is_shared_across_tables_and_resets_per_snapshot ... ok
+test store::controlled::tests::projection_materializers_charge_actual_values_before_copy_or_validation ... ok
+test store::active_work::tests::reconcile_covers_sixty_four_active_among_ten_thousand_retired ... ok
+test store::controlled::tests::remaining_snapshot_readers_charge_join_and_nested_json_before_copy ... ok
+test store::controlled::tests::unrelated_error_is_not_reclassified_when_cancel_arrives_during_unwind ... ok
+test store::delegation::tests::consultation_denies_ref_or_profile_kind_mismatch_without_reserving ... ok
+test store::delegation::tests::delegation_document_does_not_satisfy_matches_launch ... ok
+test store::controlled::tests::snapshot_sql_retains_original_control_and_encoded_row_limit ... ok
+test store::delegation::tests::empty_delegation_tables_do_not_change_the_exact_grant_path ... ok
+test store::delegation::tests::expired_wrong_repo_and_self_signed_delegations_do_not_reserve ... ok
+test store::delegation::tests::revoked_delegation_stops_new_admits_and_does_not_undo_a_started_attempt ... ok
+test store::delegation::tests::stored_scope_text_over_the_check_is_invalid_not_conflict ... ok
+test store::delegation::tests::valid_delegation_with_admission_on_is_not_a_launch_and_flag_off_does_not_consult ... ok
+test store::delivery::tests::changed_entity_revision_fences_completion_without_losing_claim ... ok
+test store::delegation::tests::upgrade_v1_from_33_to_34_preserves_denials_and_create_ends_at_34 ... ok
+test store::delivery::tests::claim_outcome_and_restart_preserve_intent_and_audit ... ok
+test store::delivery::tests::delivery_crash_child ... ok
+test store::delivery::tests::concurrent_connections_have_one_claim_owner ... ok
+test store::delivery::tests::expired_claim_is_ambiguous_and_old_owner_cannot_finish_over_new_epoch ... ok
+test store::delivery::tests::only_no_effect_evidence_retries_and_stale_task_or_payload_blocks_claim ... ok
+test store::delivery::tests::project_scope_uses_control_revision_without_inventing_a_task ... ok
+test store::delivery::tests::retirement_refuses_an_owned_claim_until_expiry_without_erasing_intent ... ok
+test store::delivery::tests::retry_budget_and_input_bounds_preserve_delivery_invariants ... ok
+test store::delivery::tests::process_death_before_effect_after_effect_and_after_result_never_blindly_replays ... ok
+test store::feedback::tests::duplicate_verifier_rejection_feedback_polls_do_not_insert_duplicate_items ... ok
+test store::feedback::tests::pr_modules_do_not_write_feedback_or_satisfaction ... ok
+test store::feedback::tests::expired_feedback_claim_can_be_retaken_and_ack_does_not_reserve_or_satisfy ... ok
+test store::feedback::tests::pr_poll_category_does_not_insert_feedback_or_change_satisfaction ... ok
+test store::feedback::tests::stale_feedback_claim_cannot_ack ... ok
+test store::feedback::tests::upgrade_v1_from_28_to_29_and_create_end_at_user_version_29 ... ok
+test store::integration::tests::upgrade_v1_from_27_to_28_preserves_historical_dependencies ... ok
+test store::memory::tests::schema17_upgrade_adds_empty_memory_tables ... FAILED
+test store::memory_barrier::tests::applied_receipt_on_successor_covers_a_copied_obligation ... ok
+test store::memory_barrier::tests::changed_dependency_and_unrouted_mandatory_revision_are_blockers ... ok
+test store::memory_barrier::tests::exact_applied_receipt_covers_only_its_required_update ... ok
+test store::memory_barrier::tests::expiry_and_missing_snapshot_block_without_an_update_event ... ok
+test store::memory_barrier::tests::informational_invalidations_do_not_block_but_global_required_ones_do ... ok
+test store::memory_barrier::tests::invalidations_block_completion_and_attempt_clearing_but_not_unrelated_tasks ... ok
+test store::memory_barrier::tests::later_mutation_in_success_batch_cannot_drop_consumed_snapshot ... ok
+test store::memory_barrier::tests::older_memory_schemas_require_upgrade_before_success ... ok
+test store::memory_barrier::tests::seen_change_receipt_does_not_satisfy_enforce_but_applied_does ... ok
+test store::memory_barrier::tests::snapshot_presence_covers_a_required_update_without_a_receipt ... ok
+test store::memory_delivery::tests::routing_keeps_consumed_historical_dependencies_and_scope_boundaries ... ok
+test store::memory_invalidation::tests::expiry_of_a_source_excludes_derived_facts_without_a_write ... ok
+test store::memory_invalidation::tests::source_change_atomically_invalidates_transitive_consumers_and_replay_is_quiet ... ok
+test store::memory_policy::tests::memory_policy_installation_is_atomic_project_bound_and_revision_checked ... ok
+test store::memory_receipts::tests::worker_receipt_primary_key_still_replays_or_conflicts_on_delivery_and_attempt ... ok
+test store::memory_policy::tests::schema16_upgrade_adds_memory_policies_without_inventing_revisions ... FAILED
+test store::plans::tests::dependency_cycle_is_rejected_without_a_revision_or_reservation ... ok
+test store::plans::tests::acceptance_rework_leaves_old_verification_rows_immutable ... ok
+test store::plans::tests::expired_feedback_lease_can_ack_and_a_live_other_owner_conflicts ... ok
+test store::plans::tests::infrastructure_retry_does_not_consume_max_attempts_per_task ... ok
+test store::plans::tests::plan_propose_leaves_scope_tables_empty ... ok
+test store::plans::tests::pr_poll_fixture_does_not_create_a_replan ... ok
+test store::plans::tests::proposal_path_does_not_call_verify_signature_or_write_contracts ... ok
+test store::plans::tests::payload_above_256_kib_is_refused_and_exact_limit_is_an_unsigned_proposal ... ok
+test store::plans::tests::replay_of_the_same_bytes_returns_one_plan_revision ... ok
+test store::plans::tests::restart_replays_the_wait_cursor_once ... ok
+test store::plans::tests::same_key_and_different_bytes_conflict ... ok
+test store::plans::tests::stale_parent_conflicts_and_returns_the_current_revision ... ok
+test store::plans::tests::third_replan_is_an_inbox_escalation_not_another_proposal ... ok
+test store::plans::tests::upgrade_v1_from_30_to_31_and_import_requires_current_schema ... ok
+test store::plans::tests::upgrade_v1_from_35_to_36_and_create_end_at_user_version_36 ... ok
+test store::read_budget::tests::actual_rows_charge_repeated_join_values_before_decode ... ok
+test store::proposals::tests::schema20_upgrade_adds_empty_proposal_tables ... FAILED
+test store::read_budget::tests::field_column_row_and_arithmetic_limits_fail_closed ... ok
+test store::read_budget::tests::lexical_scan_counts_empty_dense_and_escaped_values ... ok
+test store::read_budget::tests::dense_json_and_repeated_passes_consume_shared_budget ... ok
+test store::read_budget::tests::long_strings_remain_cancellable_without_structure_expansion ... ok
+test store::read_set::tests::new_constraint_blocks_v2_promotion ... ok
+test store::read_set::tests::malformed_grant_id_is_invalid_not_a_conflict ... ok
+test store::read_set::tests::phantom_contract_conflicts_and_is_not_skipped ... ok
+test store::read_set::tests::reviewer_grant_in_the_read_set_does_not_let_a_worker_promote_a_hard_change ... ok
+test store::read_set::tests::unrelated_event_allows_v2_promotion_and_replay_returns_the_stored_row ... ok
+test store::read_set::tests::upgrade_v1_from_37_preserves_review_rows_and_create_ends_at_38 ... ok
+test store::read_set::tests::v1_document_omits_read_set_and_other_versions_are_not_v2 ... ok
+test store::reservations::tests::approval_consumption_rolls_back_if_claim_write_fails ... ok
+test store::reservations::tests::atomic_creation_crash_child ... ok
+test store::read_set::tests::v1_and_other_versions_still_conflict_on_an_intervening_event ... ok
+test store::controlled::tests::approval_read_does_not_double_count_already_budgeted_inputs ... ok
+test store::reservations::tests::brief_recovery_records_existing_delivery_without_renewing_authority ... ok
+test store::reservations::tests::budget_exhaustion_survives_reopen_and_cancel_does_not_refund_admissions ... ok
+test store::reservations::tests::brief_receipt_rejects_replaced_worker_or_prompt_and_stale_claim ... ok
+test store::reservations::tests::budget_upgrade_preserves_pending_operations_without_inventing_policy ... FAILED
+test store::reservations::tests::cancellation_failure_rolls_back_retirement_and_capacity_release ... ok
+test store::reservations::tests::budget_revision_change_blocks_claim_and_pre_effect_without_releasing_capacity ... ok
+test store::reservations::tests::brief_claim_and_pre_effect_refuse_revocation_pause_config_changes_and_cancellation ... ok
+test store::reservations::tests::cancellation_without_launch_proof_retains_the_attempt ... ok
+test store::reservations::tests::claim_and_cancellation_race_never_releases_a_claimed_worker ... ok
+test store::reservations::tests::competing_reservations_cannot_exceed_capacity_even_with_a_fresh_head ... ok
+test store::reservations::tests::flag_off_dependency_evidence_does_not_reserve_and_flag_on_reserves_one ... ok
+test store::reservations::tests::disk_config_change_withdraws_launch_authority_before_claim_or_effect ... ok
+test store::reservations::tests::incomplete_or_changed_profile_evidence_cannot_reserve_capacity ... ok
+test store::reservations::tests::launch_crash_child ... ok
+test store::reservations::tests::changed_attempt_state_refuses_claim_and_pre_effect_without_consuming_new_authority ... ok
+test store::reservations::tests::launch_approval_use_survives_restart_and_cannot_be_reused_after_no_effect_retry ... ok
+test store::reservations::tests::lost_attempt_still_fills_the_only_slot ... ok
+test store::reservations::tests::lost_start_response_recovers_exact_worker_without_reauthorizing_or_restarting ... ok
+test store::reservations::tests::missing_grant_records_authority_missing_and_does_not_reserve ... ok
+test store::reservations::tests::missing_parent_is_not_hidden_from_an_open_store ... ok
+test store::reservations::tests::orphan_launches_refuse_reads_and_upgrade_rolls_back ... ok
+test store::reservations::tests::missing_or_corrupt_approval_blocks_claim_without_consuming_it ... ok
+test store::reservations::tests::reservation_and_never_claimed_cancellation_survive_restart ... ok
+test store::reservations::tests::reservation_crash_child ... ok
+test store::controlled::tests::runtime_provenance_join_amplification_consumes_one_snapshot_budget ... ok
+test store::reservations::tests::project_outbox_upgrade_preserves_claims_inputs_and_consumed_approvals ... FAILED
+test store::reservations::tests::process_death_preserves_whole_reservation_or_original_queue ... ok
+test store::reservations::tests::reserve_and_termination_refresh_bindings_without_generic_commit ... ok
+test store::reservations::tests::satisfaction_flag_does_not_reserve_a_dependent_task ... ok
+test store::reservations::tests::retry_history_and_lost_attempts_retain_capacity_on_cancel ... ok
+test store::reservations::tests::schema10_upgrade_preserves_nonzero_claim_history ... FAILED
+test store::reservations::tests::schema11_upgrade_retains_records_and_blocks_old_format_insertions ... FAILED
+test store::reservations::tests::revoked_or_expired_approval_never_authorizes_launch_or_releases_capacity ... ok
+test store::reservations::tests::sealed_reservation_binds_knowledge_and_pre_effect_checks_reject_later_changes ... ok
+test store::reservations::tests::schema12_launches_upgrade_without_fabricating_grants_or_releasing_capacity ... FAILED
+test store::reservations::tests::selected_launch_target_is_immutable_and_replay_does_not_write ... ok
+test store::reservations::tests::reservation_requires_current_exact_unconsumed_approval_without_using_it ... ok
+test store::reservations::tests::sigkill_start_receipt_commit_never_splits_confirmation_ownership_and_attempt ... ok
+test store::reservations::tests::stale_or_cross_store_preparations_and_rollback_never_leak_reservations ... ok
+test store::reservations::tests::typed_start_crash_child ... ok
+test store::reservations::tests::sigkill_atomic_creation_never_leaves_a_claim_without_recovery_identity ... ok
+test store::reservations::tests::typed_start_receipt_publishes_exact_ownership_atomically_without_releasing_capacity ... ok
+test store::reservations::tests::two_integrated_parents_reserve_only_when_the_base_contains_both ... ok
+test store::reservations::tests::sigkill_launch_boundaries_preserve_capacity_authority_and_no_replay ... ok
+test store::reservations::tests::uncertain_brief_never_replays_even_after_no_effect_report ... ok
+test store::reservations::tests::untyped_launch_confirmation_and_capacity_release_are_atomic_refusals ... ok
+test store::reservations::tests::version_one_input_serialization_preserves_historical_identity ... ok
+test store::results::tests::contract_bytes_are_stored_raw_and_a_changed_revision_conflicts ... ok
+test store::reservations::tests::worker_brief_confirmation_is_atomic_distinct_and_retains_capacity ... ok
+test store::reservations::tests::unknown_provider_usage_is_explicit_and_never_an_implicit_zero ... ok
+test store::results::tests::gitfile_worktree_stages_common_loose_objects_and_skips_dirty_files ... ok
+test store::results::tests::kill_between_stage_and_commit_retries_as_one_row ... ok
+test store::results::tests::result_ingress_refuses_wrong_attempt_changed_contract_missing_escape_and_oversize ... ok
+test store::results::tests::signed_contract_scope_stores_one_revision_and_overlap_is_not_locked ... ok
+test store::reviews::tests::reviewer_cannot_approve_a_hard_rule ... ok
+test store::results::tests::upgrade_v1_from_31_to_32_and_create_end_at_user_version_32 ... ok
+test store::reviews::tests::reviewer_cannot_approve_own_attempt ... ok
+test store::results::tests::schema_26_upgrade_preserves_tasks_and_import_requires_current_schema ... ok
+test store::reviews::tests::reviewer_grant_does_not_promote_until_the_controller_writes ... ok
+test store::reviews::tests::unsigned_promotion_is_still_absent ... ok
+test store::routines::tests::competing_ticks_have_one_winner_and_disabled_or_paused_routines_do_not_enqueue ... ok
+test store::reviews::tests::schema21_upgrade_adds_empty_review_tables ... ok
+test store::routines::tests::missed_policy_skips_a_bounded_window_and_revisions_do_not_reuse_occurrences ... ok
+test store::reservations::tests::typed_start_receipt_refuses_wrong_incarnations_routes_attempts_and_expired_claims ... ok
+test store::routines::tests::occurrence_cursor_and_outbox_commit_together_and_reopen_deduplicates ... ok
+test store::routines::tests::completion_inbox_outcome_and_overlap_release_are_atomic_and_survive_reopen ... ok
+test store::routines::tests::stale_or_misbound_completion_cannot_release_a_claim ... ok
+test store::satisfaction::tests::launch_enabled_is_true_only_when_the_flag_is_on_and_an_entry_is_clear ... ok
+test store::routines::tests::schema15_upgrade_preserves_existing_outbox_without_inventing_routine_authority ... FAILED
+test store::routines::tests::uncertain_claim_history_blocks_overlap_across_revisions_and_retirement ... ok
+test store::routines::tests::unknown_cleanup_generic_confirmation_and_no_effect_retry_never_release_overlap ... ok
+test store::satisfaction::tests::migration_defaults_factory_admission_off_and_release_code_does_not_write_it ... FAILED
+test store::satisfaction::tests::newer_receipt_replaces_valid_satisfaction_without_rolling_back_the_commit ... ok
+test store::satisfaction::tests::older_attempt_run_does_not_invalidate_the_current_satisfaction ... ok
+test store::satisfaction::tests::open_memory_fence_hides_a_stored_satisfaction_until_it_resolves ... ok
+test store::satisfaction::tests::queue_after_a_later_stale_run_still_uses_the_current_receipt ... ok
+test store::satisfaction::tests::queue_report_satisfaction_rows_follow_the_admission_flag ... ok
+test store::scheduler::tests::aging_outweighs_new_priority_and_requeue_preserves_original_age ... ok
+test store::scheduler::tests::all_unterminated_states_count_and_lowering_policy_never_revokes_attempts ... ok
+test store::satisfaction::tests::superseded_attempt_or_older_contract_stays_unsatisfied ... ok
+test store::satisfaction::tests::schema_25_upgrade_preserves_landed_commit_bytes_and_ends_at_34 ... ok
+test store::scheduler::tests::competing_policy_writers_cannot_both_win_the_same_revision ... ok
+test store::scheduler::tests::graph_refusals_and_mid_transaction_failure_preserve_all_state ... ok
+test store::scheduler::tests::narrative_success_never_satisfies_verified_dependencies ... ok
+test store::targeted::tests::targeted_hot_path_is_the_production_default ... ok
+test store::scheduler::tests::prepared_dispatch_stays_true_while_dependency_evidence_stays_blocked ... ok
+test store::scheduler::tests::retained_reserved_attempt_omits_reserve_blocker_and_grant_omits_signature_blocker ... ok
+test store::targeted::tests::targeted_notification_candidate_matches_the_snapshot_and_a_future_due_stays_blocked ... ok
+test store::targeted::tests::targeted_shadow_deadline_and_cancellation_abort_without_another_read ... ok
+test store::targeted::tests::targeted_success_against_a_non_corrupt_snapshot_failure_is_a_mismatch ... ok
+test store::tests::atomic_records_intents_events_reopen_and_history ... ok
+test store::targeted::tests::targeted_shadow_matches_the_harness_history_fixture_including_a_corrupt_payload ... FAILED
+test store::tests::changed_schema_is_rechecked_before_commit_and_bad_payload_is_visible ... ok
+test store::tests::crash_child ... ok
+test store::tests::competing_connections_cannot_duplicate_ids_or_win_the_same_revision ... ok
+test store::tests::duplicate_intent_key_and_stale_binding_are_atomic ... ok
+test store::tests::disk_full_rolls_back_all_records_events_and_intents ... ok
+test store::tests::failures_roll_back_prior_changes_and_do_not_consume_event_sequences ... ok
+test store::tests::busy_is_bounded_and_reader_sees_only_committed_state ... ok
+test store::tests::foreign_keys_and_reservations_reject_invalid_batches ... ok
+test store::tests::invalid_ids_and_overflow_are_rejected ... ok
+test store::tests::refuses_unknown_schema_non_database_missing_and_symlink ... ok
+test store::update_packages::tests::crash_rebuilds_the_same_package_and_old_ack_does_not_apply_a_new_change ... ok
+test store::update_packages::tests::later_package_supersedes_unapplied_seen_and_old_package_stays_readable ... ok
+test store::tests::process_death_preserves_atomicity_on_both_sides_of_commit ... ok
+test store::update_packages::tests::same_generation_does_not_hide_another_bindings_copied_delivery ... ok
+test store::update_packages::tests::create_ends_at_39_and_upgrade_from_38_preserves_worker_receipts ... ok
+test store::verification::tests::duplicate_poll_inserts_missing_feedback_once ... ok
+test store::verification::tests::duplicate_verifier_rejection_polls_do_not_insert_duplicate_feedback ... ok
+test supervision::tests::environment_helper ... ok
+test supervision::tests::explicit_session_routing_is_bounded_and_never_an_inherited_setting ... ok
+test store::verification::tests::verifier_rejection_below_schema_29_rolls_back_without_feedback ... ok
+test supervision::tests::literal_arguments_stdin_environment_and_binary_sink_survive_supervision ... ok
+test supervision::tests::loader_and_shell_settings_do_not_reach_supervision_and_explicit_overrides_refuse ... ok
+test supervision::tests::owner_death_helper ... ok
+test store::verification::tests::upgrade_v1_from_26_to_27_and_open_does_not_migrate ... ok
+test supervision::tests::restrictive_git_settings_require_exact_values_clean_environment_and_system_git ... ok
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmpoJNilm/repo/.git/
+[master (root-commit) d875aa5] first
+ 2 files changed, 1 insertion(+)
+ create mode 100755 probe
+ create mode 100644 src/file.txt
+test verification::tests::candidate_inside_the_namespace_gets_enoent_for_hidden_paths ... ok
+test supervision::tests::failures_caps_cancellation_and_original_deadline_are_preserved ... ok
+test verification::tests::materialize_refuses_to_delete_a_nested_store ... ok
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmpkJtCpg/repo/.git/
+[master (root-commit) d4d3b9a] first
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/file.txt
+test verification::tests::happy_path_checks_out_retained_objects_and_keeps_capacity ... ok
+test verification::tests::parent_source_does_not_call_mount_or_pivot_root ... ok
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmp2VBjSq/repo/.git/
+[master (root-commit) d4d3b9a] first
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/file.txt
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmpcfgqqo/repo/.git/
+[master (root-commit) d4d3b9a] first
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/file.txt
+test verification::tests::moved_memory_fence_does_not_mint_a_receipt ... ok
+test verification::tests::recorded_argv_contains_a_program_after_dash ... ok
+hp-verify same-namespace
+test verification::tests::same_namespace_exits_without_calling_mount ... ok
+test verification::tests::policy_digest_mismatch_rejects_without_a_result ... ok
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmp4rWk6n/repo/.git/
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmpEJ8gaS/repo/.git/
+[master (root-commit) d4d3b9a] first
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/file.txt
+[master (root-commit) fbee896] first
+ 2 files changed, 1 insertion(+)
+ create mode 100755 probe
+ create mode 100644 src/file.txt
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmpQW5Qk9/repo/.git/
+[master (root-commit) d4d3b9a] first
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/file.txt
+test verification::tests::staged_and_untracked_changes_reject_without_a_result ... ok
+test verification::tests::unread_namespace_does_not_allow_mount ... ok
+test verification::tests::worker_forged_json_is_only_a_display_copy ... ok
+test watchdog::tests::admission_log_line_keeps_reason_and_task_id_only ... ok
+test watchdog::tests::busy_bound_matches_the_connection_handler ... ok
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmpXpvGpn/repo/.git/
+test watchdog::tests::busy_handler_fixture_pauses_admission_and_retains_attempts ... ok
+[master (root-commit) fbee896] first
+ 2 files changed, 1 insertion(+)
+ create mode 100755 probe
+ create mode 100644 src/file.txt
+test watchdog::tests::disk_full_fixture_pauses_admission_and_retains_attempts ... ok
+test watchdog::tests::other_store_errors_do_not_pause ... ok
+test store::scheduler::unrelated_task_count_never_makes_a_committed_store_unreadable ... ok
+test watchdog::tests::unreadable_pause_file_stays_paused_until_it_is_gone ... ok
+test worker_supervision::observation::tests::agent_selection_allows_orphans_but_refuses_duplicate_exact_agents ... ok
+test worker_supervision::observation::tests::ordinary_process_cannot_be_observed_as_a_supervisor ... ok
+test worker_supervision::observation::tests::reboot_classification_requires_same_host_and_preserves_legacy_uncertainty ... ok
+test supervision::tests::owner_sigkill_keeps_exclusion_until_bounded_cleanup_even_when_target_closes_fds ... ok
+test worker_supervision::observation::tests::recovered_stop_handles_partial_exit_and_reserves_time_for_forced_cleanup ... ok
+test worker_supervision::tests::gate_requires_exact_release_and_preserves_literal_arguments ... ok
+test worker_supervision::tests::gate_wait_is_included_in_wall_deadline ... ok
+test worker_supervision::tests::isolated_gate_passes_only_the_frozen_baseline_environment ... ok
+test worker_supervision::tests::literal_arguments_are_not_shell_programs ... ok
+test worker_supervision::tests::worker_limits_and_literal_vector_are_explicit ... ok
+test worktree_preparation::file_tests::fifo_probe_child ... ok
+
+running 1 test
+test worktree_preparation::file_tests::fifo_probe_child ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 624 filtered out; finished in 0.00s
+
+test worktree_preparation::file_tests::metadata_and_checkout_opens_reject_fifo_without_waiting_for_a_writer ... ok
+test worktree_preparation::file_tests::metadata_reads_accept_bounded_files_and_reject_indirection_and_special_nodes ... ok
+test worker_supervision::tests::deadline_stops_detached_descendants_without_a_controller_stop ... ok
+test worker_supervision::observation::tests::observation_pins_exact_lifetime_across_exit_and_reaping ... ok
+test worktree_preservation::output_reader::tests::reads_without_source_and_refuses_corruption_or_unsafe_storage ... ok
+test worktree_preservation::tests::file_scan_detects_same_size_same_mtime_edits_and_honors_control ... ok
+test worktree_preservation::tests::interrupted_file_publication_resumes_without_replacing_conflicting_bytes ... ok
+test worktree_preservation::tests::special_sources_are_rejected_without_following_or_waiting ... ok
+test worktree_preservation::output_reader::tests::digest_valid_manifests_still_require_safe_bounded_structure ... ok
+test worktree_preservation::git::tests::packed_history_and_index_restore_without_the_source_repository ... ok
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmpXrV5fq/repo/.git/
+[master (root-commit) 93f5f75] first
+ 2 files changed, 1 insertion(+)
+ create mode 100755 probe
+ create mode 100644 src/file.txt
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmpNP1zxa/repo/.git/
+[master (root-commit) f9b88f3] first
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/file.txt
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmpdERtXi/repo/.git/
+[master (root-commit) f9b88f3] first
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/file.txt
+test verification::tests::tampered_tree_timeout_leftover_and_setup_failure_reject_without_a_result ... ok
+
+failures:
+
+---- migration::tests::old_schema_projection_does_not_conflict_after_inbox_upgrade stdout ----
+
+thread 'migration::tests::old_schema_projection_does_not_conflict_after_inbox_upgrade' (1965811) panicked at src/migration/tests.rs:314:82:
+called `Result::unwrap()` on an `Err` value: state store: Io("table verification_runs already exists")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- migration::tests::published_v2_store_upgrades_explicitly_without_losing_migration_identity stdout ----
+
+thread 'migration::tests::published_v2_store_upgrades_explicitly_without_losing_migration_identity' (1965849) panicked at src/migration/tests.rs:252:30:
+called `Result::unwrap()` on an `Err` value: state store: Io("table verification_runs already exists")
+
+---- migration::tests::runtime_upgrade_failure_rolls_back_schema_and_can_be_retried stdout ----
+
+thread 'migration::tests::runtime_upgrade_failure_rolls_back_schema_and_can_be_retried' (1965860) panicked at src/migration/tests.rs:503:30:
+called `Result::unwrap()` on an `Err` value: state store: Io("table verification_runs already exists")
+
+---- migration::tests::runtime_upgrade_uses_provenance_preserves_edits_and_previous_exports stdout ----
+
+thread 'migration::tests::runtime_upgrade_uses_provenance_preserves_edits_and_previous_exports' (1965861) panicked at src/migration/tests.rs:466:30:
+called `Result::unwrap()` on an `Err` value: state store: Io("table verification_runs already exists")
+
+---- migration::tests::schema3_inbox_upgrade_reads_provenance_not_changed_legacy_files stdout ----
+
+thread 'migration::tests::schema3_inbox_upgrade_reads_provenance_not_changed_legacy_files' (1965865) panicked at src/migration/tests.rs:306:86:
+called `Result::unwrap()` on an `Err` value: state store: Io("table verification_runs already exists")
+
+---- migration::tests::schema8_upgrade_preserves_observation_foreign_keys_and_import_hashes stdout ----
+
+thread 'migration::tests::schema8_upgrade_preserves_observation_foreign_keys_and_import_hashes' (1965866) panicked at src/migration/tests.rs:629:30:
+called `Result::unwrap()` on an `Err` value: state store: Conflict
+
+---- migration::tests::schema9_queue_upgrade_preserves_old_exports_and_starts_with_closed_capacity stdout ----
+
+thread 'migration::tests::schema9_queue_upgrade_preserves_old_exports_and_starts_with_closed_capacity' (1965867) panicked at src/migration/tests.rs:636:30:
+called `Result::unwrap()` on an `Err` value: state store: Io("table verification_runs already exists")
+
+---- profile_preparation::tests::native_retention_requires_explicit_schema_upgrade stdout ----
+
+thread 'profile_preparation::tests::native_retention_requires_explicit_schema_upgrade' (1969423) panicked at src/profile_preparation.rs:556:28:
+called `Result::unwrap()` on an `Err` value: Io("table verification_runs already exists")
+
+---- store::checkpoints::tests::schema16_upgrade_reaches_schema20_without_inventing_checkpoints stdout ----
+
+thread 'store::checkpoints::tests::schema16_upgrade_reaches_schema20_without_inventing_checkpoints' (1972814) panicked at src/store/checkpoints.rs:121:72:
+called `Result::unwrap()` on an `Err` value: Io("table verification_runs already exists")
+
+---- store::checkpoints::tests::schema19_upgrade_adds_empty_checkpoint_tables stdout ----
+
+thread 'store::checkpoints::tests::schema19_upgrade_adds_empty_checkpoint_tables' (1972815) panicked at src/store/checkpoints.rs:111:72:
+called `Result::unwrap()` on an `Err` value: Io("table verification_runs already exists")
+
+---- store::memory::tests::schema17_upgrade_adds_empty_memory_tables stdout ----
+
+thread 'store::memory::tests::schema17_upgrade_adds_empty_memory_tables' (1972896) panicked at src/store/memory.rs:373:72:
+called `Result::unwrap()` on an `Err` value: Io("table verification_runs already exists")
+
+---- store::memory_policy::tests::schema16_upgrade_adds_memory_policies_without_inventing_revisions stdout ----
+
+thread 'store::memory_policy::tests::schema16_upgrade_adds_memory_policies_without_inventing_revisions' (1972913) panicked at src/store/memory_policy.rs:139:72:
+called `Result::unwrap()` on an `Err` value: Io("table verification_runs already exists")
+
+---- store::proposals::tests::schema20_upgrade_adds_empty_proposal_tables stdout ----
+
+thread 'store::proposals::tests::schema20_upgrade_adds_empty_proposal_tables' (1972931) panicked at src/store/proposals.rs:90:72:
+called `Result::unwrap()` on an `Err` value: Io("table verification_runs already exists")
+
+---- store::reservations::tests::budget_upgrade_preserves_pending_operations_without_inventing_policy stdout ----
+
+thread 'store::reservations::tests::budget_upgrade_preserves_pending_operations_without_inventing_policy' (1972995) panicked at src/store/reservations/tests.rs:158:64:
+called `Result::unwrap()` on an `Err` value: Io("table verification_runs already exists")
+
+---- store::reservations::tests::project_outbox_upgrade_preserves_claims_inputs_and_consumed_approvals stdout ----
+
+thread 'store::reservations::tests::project_outbox_upgrade_preserves_claims_inputs_and_consumed_approvals' (1973017) panicked at src/store/reservations/tests.rs:80:5:
+assertion `left == right` failed
+  left: Snapshot { schema_version: 41, head: 23, tasks: [Task { id: TaskId("a"), revision: 4, state: Running, title: "a", active_attempt: Some(AttemptId("attempt-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb")) }, Task { id: TaskId("b"), revision: 4, state: Running, title: "b", active_attempt: Some(AttemptId("attempt-f190fd44125d3b93b3aa0f54bae93bb8c1d46547e79d212fa3907a790fb6d21b")) }], attempts: [Attempt { id: AttemptId("attempt-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb"), task: TaskId("a"), revision: 1, state: Reserved, snapshot: None, reservation: "worker:attempt-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb", termination_observed: false }, Attempt { id: AttemptId("attempt-f190fd44125d3b93b3aa0f54bae93bb8c1d46547e79d212fa3907a790fb6d21b"), task: TaskId("b"), revision: 1, state: Reserved, snapshot: None, reservation: "worker:attempt-f190fd44125d3b93b3aa0f54bae93bb8c1d46547e79d212fa3907a790fb6d21b", termination_observed: false }], operations: [Operation { id: OperationId("launch-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb"), task: Some(TaskId("a")), kind: "runtime.launch", target: "task:a", payload_version: 1, payload: Object {"attempt": String("attempt-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb"), "inputs": Object {"approval": Object {"digest": String("55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214"), "id": String("approval-55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214"), "revision": Number(1)}, "binding": String("task:a"), "binding_digest": String("214df684e80d72f4c8a02471ab047a0fbfc70b7b91cc7daf1132293499e0572d"), "binding_revision": Number(1), "budget": Null, "config": Object {"digest": Null, "path": String("/tmp/.tmpirCOUY/config.toml")}, "control_epoch": Number(4), "dependencies": Array [], "effective_profile": Object {"adapter": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "agent": Object {"digest": String("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"), "path": String("/fixture/claude"), "version": String("1.0.0-preview.1")}, "arguments_digest": String("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"), "capabilities": Object {"checkpoint_acknowledgment": Object {"status": String("unknown")}, "launch": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "prompt_submission": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "readiness_observation": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "resume": Object {"status": String("unknown")}, "stop": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "structured_usage": Object {"status": String("unknown")}}, "config": Object {"digest": Null, "path": String("/tmp/.tmpirCOUY/config.toml")}, "definition_digest": String("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), "environment_names": Array [], "herdr": Object {"digest": String("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"), "path": String("/fixture/herdr"), "version": String("0.9.1")}, "kind": String("claude"), "name": String("fixture"), "permission_policy": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "version": Number(1), "workflow_certificate": Null}, "memory": Null, "profile": Object {"digest": String("b7e10a68e80c716587c5889ceae4f6b517b11637a814313adf9158fa3d132c21"), "id": String("profile-b7e10a68e80c716587c5889ceae4f6b517b11637a814313adf9158fa3d132c21"), "revision": Number(1)}, "project_store": String("/tmp/.tmpirCOUY/.state/state.db"), "repositories": Array [], "scheduler_revision": Number(2), "task": String("a"), "task_revision": Number(3), "version": Number(2)}, "operation": String("launch-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb")}, expected_revision: 4, due_unix_ms: 1000, idempotency_key: "launch-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb" }, Operation { id: OperationId("launch-f190fd44125d3b93b3aa0f54bae93bb8c1d46547e79d212fa3907a790fb6d21b"), task: Some(TaskId("b")), kind: "runtime.launch", target: "task:b", payload_version: 1, payload: Object {"attempt": String("attempt-f190fd44125d3b93b3aa0f54bae93bb8c1d46547e79d212fa3907a790fb6d21b"), "inputs": Object {"approval": Object {"digest": String("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"), "id": String("fixture-approval"), "revision": Number(1)}, "binding": String("task:b"), "binding_digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "binding_revision": Number(1), "budget": Null, "config": Object {"digest": Null, "path": String("/historical/config.toml")}, "control_epoch": Number(2), "dependencies": Array [], "memory": Null, "profile": Object {"digest": String("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), "id": String("fixture-profile"), "revision": Number(1)}, "project_store": String("/historical/state.db"), "repositories": Array [], "scheduler_revision": Number(2), "task": String("b"), "task_revision": Number(3), "version": Number(1)}, "operation": String("launch-f190fd44125d3b93b3aa0f54bae93bb8c1d46547e79d212fa3907a790fb6d21b")}, expected_revision: 4, due_unix_ms: 1000, idempotency_key: "launch-f190fd44125d3b93b3aa0f54bae93bb8c1d46547e79d212fa3907a790fb6d21b" }], deliveries: [Delivery { operation: OperationId("launch-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb"), revision: 2, state: Claimed, epoch: 1, attempts: 1, owner: Some("worker"), lease_until_ms: Some(2000), next_due_ms: 1000, last_outcome: None }, Delivery { operation: OperationId("launch-f190fd44125d3b93b3aa0f54bae93bb8c1d46547e79d212fa3907a790fb6d21b"), revision: 1, state: Pending, epoch: 0, attempts: 0, owner: None, lease_until_ms: None, next_due_ms: 1000, last_outcome: None }], inbox: [], runtime_bindings: [RuntimeBinding { id: "task:a", task: Some(TaskId("a")), revision: 1, source_path: None, source_digest: None, session_source_digest: None, verification: Unverified, identity: RuntimeIdentity { machine: "", socket: "", workspace_id: "", tab_id: "", pane_id: "", cwd: "", repo: "", branch: "", worktree_path: "", thread_dir: "", agent: "", agent_name: "", legacy_status: "", execution_fingerprint: None } }, RuntimeBinding { id: "task:b", task: Some(TaskId("b")), revision: 1, source_path: None, source_digest: None, session_source_digest: None, verification: Unverified, identity: RuntimeIdentity { machine: "", socket: "", workspace_id: "", tab_id: "", pane_id: "", cwd: "", repo: "", branch: "", worktree_path: "", thread_dir: "", agent: "", agent_name: "", legacy_status: "", execution_fingerprint: None } }], observations: [RuntimeObservation { binding: "task:a", binding_revision: 1, task_revision: Some(3), observed_unix_ms: 1000, pane: Unrecorded, worktree: Unrecorded, agent_present: false, collector: "herdr-git-v1", config_digest: None, diagnostic: "", session_identity: None, worktree_identity: None, agent_identity: None }, RuntimeObservation { binding: "task:b", binding_revision: 1, task_revision: Some(3), observed_unix_ms: 1000, pane: Unrecorded, worktree: Unrecorded, agent_present: false, collector: "herdr-git-v1", config_digest: None, diagnostic: "", session_identity: None, worktree_identity: None, agent_identity: None }], ownership: [], control: Some(ProjectControl { revision: 4, epoch: 4, state: Active, reconciliation_required: false, config_digest: None }), scheduler: Some(SchedulerSnapshot { policy: SchedulerPolicy { revision: 2, max_active_workers: 1, max_attempts_per_task: 3 }, queue: [QueueRecord { task: TaskId("a"), priority: 0, enqueued_unix_ms: 0, enqueue_sequence: 6, dependencies: [] }, QueueRecord { task: TaskId("b"), priority: 0, enqueued_unix_ms: 0, enqueue_sequence: 11, dependencies: [] }] }), attempt_inputs: [AttemptInputRecord { attempt: AttemptId("attempt-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb"), operation: OperationId("launch-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb"), inputs: LaunchInputs { version: 2, project_store: "/tmp/.tmpirCOUY/.state/state.db", task: TaskId("a"), task_revision: 3, scheduler_revision: 2, control_epoch: 4, binding: "task:a", binding_revision: 1, binding_digest: "214df684e80d72f4c8a02471ab047a0fbfc70b7b91cc7daf1132293499e0572d", profile: VersionedReference { id: "profile-b7e10a68e80c716587c5889ceae4f6b517b11637a814313adf9158fa3d132c21", revision: 1, digest: "b7e10a68e80c716587c5889ceae4f6b517b11637a814313adf9158fa3d132c21" }, effective_profile: Some(FrozenProfile { version: 1, name: "fixture", kind: "claude", definition_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", config: ConfigReference { path: "/tmp/.tmpirCOUY/config.toml", digest: None }, arguments_digest: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", environment_names: [], execution_home: None, permission_policy: VersionedReference { id: "test-only-evidence", revision: 1, digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, agent: ExecutableIdentity { path: "/fixture/claude", digest: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", version: "1.0.0-preview.1" }, herdr: ExecutableIdentity { path: "/fixture/herdr", digest: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", version: "0.9.1" }, adapter: VersionedReference { id: "test-only-evidence", revision: 1, digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, capabilities: ProfileCapabilities { launch: Supported { evidence: VersionedReference { id: "test-only-evidence", revision: 1, digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } }, readiness_observation: Supported { evidence: VersionedReference { id: "test-only-evidence", revision: 1, digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } }, prompt_submission: Supported { evidence: VersionedReference { id: "test-only-evidence", revision: 1, digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } }, stop: Supported { evidence: VersionedReference { id: "test-only-evidence", revision: 1, digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } }, checkpoint_acknowledgment: Unknown, structured_usage: Unknown, resume: Unknown }, workflow_certificate: None }), approval: VersionedReference { id: "approval-55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214", revision: 1, digest: "55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214" }, config: ConfigReference { path: "/tmp/.tmpirCOUY/config.toml", digest: None }, repositories: [], dependencies: [], memory: None, budget: None } }, AttemptInputRecord { attempt: AttemptId("attempt-f190fd44125d3b93b3aa0f54bae93bb8c1d46547e79d212fa3907a790fb6d21b"), operation: OperationId("launch-f190fd44125d3b93b3aa0f54bae93bb8c1d46547e79d212fa3907a790fb6d21b"), inputs: LaunchInputs { version: 1, project_store: "/historical/state.db", task: TaskId("b"), task_revision: 3, scheduler_revision: 2, control_epoch: 2, binding: "task:b", binding_revision: 1, binding_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", profile: VersionedReference { id: "fixture-profile", revision: 1, digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }, effective_profile: None, approval: VersionedReference { id: "fixture-approval", revision: 1, digest: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }, config: ConfigReference { path: "/historical/config.toml", digest: None }, repositories: [], dependencies: [], memory: None, budget: None } }], approvals: [ApprovalRecord { grant: ApprovalGrant { version: 1, scope: ApprovalScope { version: 1, class: RuntimeLaunch, project_store: "/tmp/.tmpirCOUY/.state/state.db", task: TaskId("a"), task_revision: 4, target: "task:a", action_digest: "1e2a497de8217bd21de24dce0fcf5b267f4007f6faf282e804fbff8624a43d96" }, policy: VersionedReference { id: "test-only-evidence", revision: 1, digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, issued_unix_ms: 0, expires_unix_ms: 100000 }, reference: VersionedReference { id: "approval-55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214", revision: 1, digest: "55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214" }, revoked: None, consumed: Some(ApprovalUse { operation: OperationId("launch-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb"), claim_revision: 2, claim_epoch: 1, consumed_unix_ms: 1000 }) }, ApprovalRecord { grant: ApprovalGrant { version: 1, scope: ApprovalScope { version: 1, class: RuntimeLaunch, project_store: "/tmp/.tmpirCOUY/.state/state.db", task: TaskId("b"), task_revision: 4, target: "task:b", action_digest: "4eaba741285076564a9ae33655b1713d60695612a626e5ca91012a6f567bc68d" }, policy: VersionedReference { id: "test-only-evidence", revision: 1, digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, issued_unix_ms: 0, expires_unix_ms: 100000 }, reference: VersionedReference { id: "approval-b9bdedda5e7a1cfc154936fc2e4887e5cb0f295af4b68fac203d19dd22beeb7a", revision: 1, digest: "b9bdedda5e7a1cfc154936fc2e4887e5cb0f295af4b68fac203d19dd22beeb7a" }, revoked: None, consumed: None }], budget_policies: [], memory_policies: [], routine_revisions: [], routine_occurrences: [], routine_receipts: [], cancellations: [], events: [Event { sequence: 1, kind: "task.changed", entity: "a", revision: 1, payload_version: 1, payload: Object {"active_attempt": Null, "id": String("a"), "revision": Number(1), "state": String("draft"), "title": String("a")} }, Event { sequence: 2, kind: "task.changed", entity: "b", revision: 1, payload_version: 1, payload: Object {"active_attempt": Null, "id": String("b"), "revision": Number(1), "state": String("draft"), "title": String("b")} }, Event { sequence: 3, kind: "runtime.created", entity: "task:a", revision: 1, payload_version: 1, payload: Object {"id": String("task:a"), "identity": Object {"agent": String(""), "agent_name": String(""), "branch": String(""), "cwd": String(""), "execution_fingerprint": Null, "legacy_status": String(""), "machine": String(""), "pane_id": String(""), "repo": String(""), "socket": String(""), "tab_id": String(""), "thread_dir": String(""), "workspace_id": String(""), "worktree_path": String("")}, "revision": Number(1), "session_source_digest": Null, "source_digest": Null, "source_path": Null, "task": String("a"), "verification": String("unverified")} }, Event { sequence: 4, kind: "task.changed", entity: "a", revision: 2, payload_version: 1, payload: Object {"active_attempt": Null, "id": String("a"), "revision": Number(2), "state": String("draft"), "title": String("a")} }, Event { sequence: 5, kind: "project.reconciliation_invalidated", entity: "project", revision: 2, payload_version: 1, payload: Object {"config_digest": Null, "epoch": Number(2), "reconciliation_required": Bool(true), "revision": Number(2), "state": String("paused")} }, Event { sequence: 6, kind: "task.changed", entity: "a", revision: 3, payload_version: 1, payload: Object {"active_attempt": Null, "id": String("a"), "revision": Number(3), "state": String("queued"), "title": String("a")} }, Event { sequence: 7, kind: "scheduler.task_queued", entity: "a", revision: 3, payload_version: 1, payload: Object {"dependencies": Array [], "enqueue_sequence": Number(6), "enqueued_unix_ms": Number(0), "priority": Number(0), "task": String("a")} }, Event { sequence: 8, kind: "runtime.created", entity: "task:b", revision: 1, payload_version: 1, payload: Object {"id": String("task:b"), "identity": Object {"agent": String(""), "agent_name": String(""), "branch": String(""), "cwd": String(""), "execution_fingerprint": Null, "legacy_status": String(""), "machine": String(""), "pane_id": String(""), "repo": String(""), "socket": String(""), "tab_id": String(""), "thread_dir": String(""), "workspace_id": String(""), "worktree_path": String("")}, "revision": Number(1), "session_source_digest": Null, "source_digest": Null, "source_path": Null, "task": String("b"), "verification": String("unverified")} }, Event { sequence: 9, kind: "task.changed", entity: "b", revision: 2, payload_version: 1, payload: Object {"active_attempt": Null, "id": String("b"), "revision": Number(2), "state": String("draft"), "title": String("b")} }, Event { sequence: 10, kind: "project.reconciliation_invalidated", entity: "project", revision: 3, payload_version: 1, payload: Object {"config_digest": Null, "epoch": Number(3), "reconciliation_required": Bool(true), "revision": Number(3), "state": String("paused")} }, Event { sequence: 11, kind: "task.changed", entity: "b", revision: 3, payload_version: 1, payload: Object {"active_attempt": Null, "id": String("b"), "revision": Number(3), "state": String("queued"), "title": String("b")} }, Event { sequence: 12, kind: "scheduler.task_queued", entity: "b", revision: 3, payload_version: 1, payload: Object {"dependencies": Array [], "enqueue_sequence": Number(11), "enqueued_unix_ms": Number(0), "priority": Number(0), "task": String("b")} }, Event { sequence: 13, kind: "scheduler.policy_changed", entity: "scheduler", revision: 2, payload_version: 1, payload: Object {"max_active_workers": Number(1), "max_attempts_per_task": Number(3), "revision": Number(2)} }, Event { sequence: 14, kind: "runtime.observed", entity: "task:a", revision: 1, payload_version: 1, payload: Object {"agent_present": Bool(false), "binding": String("task:a"), "binding_revision": Number(1), "collector": String("herdr-git-v1"), "config_digest": Null, "diagnostic": String(""), "observed_unix_ms": Number(1000), "pane": String("unrecorded"), "task_revision": Number(3), "worktree": String("unrecorded")} }, Event { sequence: 15, kind: "runtime.observed", entity: "task:b", revision: 1, payload_version: 1, payload: Object {"agent_present": Bool(false), "binding": String("task:b"), "binding_revision": Number(1), "collector": String("herdr-git-v1"), "config_digest": Null, "diagnostic": String(""), "observed_unix_ms": Number(1000), "pane": String("unrecorded"), "task_revision": Number(3), "worktree": String("unrecorded")} }, Event { sequence: 16, kind: "project.control_changed", entity: "project", revision: 4, payload_version: 1, payload: Object {"config_digest": Null, "epoch": Number(4), "reconciliation_required": Bool(false), "revision": Number(4), "state": String("active")} }, Event { sequence: 17, kind: "approval.installed", entity: "approval-55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214", revision: 1, payload_version: 1, payload: Object {"expires_unix_ms": Number(100000), "issued_unix_ms": Number(0), "policy": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "scope": Object {"action_digest": String("1e2a497de8217bd21de24dce0fcf5b267f4007f6faf282e804fbff8624a43d96"), "class": String("runtime_launch"), "project_store": String("/tmp/.tmpirCOUY/.state/state.db"), "target": String("task:a"), "task": String("a"), "task_revision": Number(4), "version": Number(1)}, "version": Number(1)} }, Event { sequence: 18, kind: "approval.installed", entity: "approval-b9bdedda5e7a1cfc154936fc2e4887e5cb0f295af4b68fac203d19dd22beeb7a", revision: 1, payload_version: 1, payload: Object {"expires_unix_ms": Number(100000), "issued_unix_ms": Number(0), "policy": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "scope": Object {"action_digest": String("4eaba741285076564a9ae33655b1713d60695612a626e5ca91012a6f567bc68d"), "class": String("runtime_launch"), "project_store": String("/tmp/.tmpirCOUY/.state/state.db"), "target": String("task:b"), "task": String("b"), "task_revision": Number(4), "version": Number(1)}, "version": Number(1)} }, Event { sequence: 19, kind: "attempt.reserved", entity: "attempt-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb", revision: 1, payload_version: 1, payload: Object {"attempt": String("attempt-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb"), "inputs": Object {"approval": Object {"digest": String("55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214"), "id": String("approval-55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214"), "revision": Number(1)}, "binding": String("task:a"), "binding_digest": String("214df684e80d72f4c8a02471ab047a0fbfc70b7b91cc7daf1132293499e0572d"), "binding_revision": Number(1), "budget": Null, "config": Object {"digest": Null, "path": String("/tmp/.tmpirCOUY/config.toml")}, "control_epoch": Number(4), "dependencies": Array [], "effective_profile": Object {"adapter": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "agent": Object {"digest": String("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"), "path": String("/fixture/claude"), "version": String("1.0.0-preview.1")}, "arguments_digest": String("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"), "capabilities": Object {"checkpoint_acknowledgment": Object {"status": String("unknown")}, "launch": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "prompt_submission": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "readiness_observation": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "resume": Object {"status": String("unknown")}, "stop": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "structured_usage": Object {"status": String("unknown")}}, "config": Object {"digest": Null, "path": String("/tmp/.tmpirCOUY/config.toml")}, "definition_digest": String("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), "environment_names": Array [], "herdr": Object {"digest": String("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"), "path": String("/fixture/herdr"), "version": String("0.9.1")}, "kind": String("claude"), "name": String("fixture"), "permission_policy": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "version": Number(1), "workflow_certificate": Null}, "memory": Null, "profile": Object {"digest": String("b7e10a68e80c716587c5889ceae4f6b517b11637a814313adf9158fa3d132c21"), "id": String("profile-b7e10a68e80c716587c5889ceae4f6b517b11637a814313adf9158fa3d132c21"), "revision": Number(1)}, "project_store": String("/tmp/.tmpirCOUY/.state/state.db"), "repositories": Array [], "scheduler_revision": Number(2), "task": String("a"), "task_revision": Number(3), "version": Number(2)}, "operation": String("launch-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb")} }, Event { sequence: 20, kind: "task.changed", entity: "a", revision: 4, payload_version: 1, payload: Object {"active_attempt": String("attempt-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb"), "id": String("a"), "revision": Number(4), "state": String("running"), "title": String("a")} }, Event { sequence: 21, kind: "operation.enqueued", entity: "launch-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb", revision: 4, payload_version: 1, payload: Object {"attempt": String("attempt-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb"), "inputs": Object {"approval": Object {"digest": String("55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214"), "id": String("approval-55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214"), "revision": Number(1)}, "binding": String("task:a"), "binding_digest": String("214df684e80d72f4c8a02471ab047a0fbfc70b7b91cc7daf1132293499e0572d"), "binding_revision": Number(1), "budget": Null, "config": Object {"digest": Null, "path": String("/tmp/.tmpirCOUY/config.toml")}, "control_epoch": Number(4), "dependencies": Array [], "effective_profile": Object {"adapter": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "agent": Object {"digest": String("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"), "path": String("/fixture/claude"), "version": String("1.0.0-preview.1")}, "arguments_digest": String("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"), "capabilities": Object {"checkpoint_acknowledgment": Object {"status": String("unknown")}, "launch": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "prompt_submission": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "readiness_observation": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "resume": Object {"status": String("unknown")}, "stop": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "structured_usage": Object {"status": String("unknown")}}, "config": Object {"digest": Null, "path": String("/tmp/.tmpirCOUY/config.toml")}, "definition_digest": String("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), "environment_names": Array [], "herdr": Object {"digest": String("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"), "path": String("/fixture/herdr"), "version": String("0.9.1")}, "kind": String("claude"), "name": String("fixture"), "permission_policy": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "version": Number(1), "workflow_certificate": Null}, "memory": Null, "profile": Object {"digest": String("b7e10a68e80c716587c5889ceae4f6b517b11637a814313adf9158fa3d132c21"), "id": String("profile-b7e10a68e80c716587c5889ceae4f6b517b11637a814313adf9158fa3d132c21"), "revision": Number(1)}, "project_store": String("/tmp/.tmpirCOUY/.state/state.db"), "repositories": Array [], "scheduler_revision": Number(2), "task": String("a"), "task_revision": Number(3), "version": Number(2)}, "operation": String("launch-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb")} }, Event { sequence: 22, kind: "approval.consumed", entity: "approval-55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214", revision: 1, payload_version: 1, payload: Object {"claim_epoch": Number(1), "claim_revision": Number(2), "consumed_unix_ms": Number(1000), "operation": String("launch-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb")} }, Event { sequence: 23, kind: "operation.claimed", entity: "launch-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb", revision: 2, payload_version: 1, payload: Object {"epoch": Number(1), "lease_until_ms": Number(2000), "owner": String("worker")} }] }
+ right: Snapshot { schema_version: 26, head: 23, tasks: [Task { id: TaskId("a"), revision: 4, state: Running, title: "a", active_attempt: Some(AttemptId("attempt-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb")) }, Task { id: TaskId("b"), revision: 4, state: Running, title: "b", active_attempt: Some(AttemptId("attempt-f190fd44125d3b93b3aa0f54bae93bb8c1d46547e79d212fa3907a790fb6d21b")) }], attempts: [Attempt { id: AttemptId("attempt-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb"), task: TaskId("a"), revision: 1, state: Reserved, snapshot: None, reservation: "worker:attempt-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb", termination_observed: false }, Attempt { id: AttemptId("attempt-f190fd44125d3b93b3aa0f54bae93bb8c1d46547e79d212fa3907a790fb6d21b"), task: TaskId("b"), revision: 1, state: Reserved, snapshot: None, reservation: "worker:attempt-f190fd44125d3b93b3aa0f54bae93bb8c1d46547e79d212fa3907a790fb6d21b", termination_observed: false }], operations: [Operation { id: OperationId("launch-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb"), task: Some(TaskId("a")), kind: "runtime.launch", target: "task:a", payload_version: 1, payload: Object {"attempt": String("attempt-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb"), "inputs": Object {"approval": Object {"digest": String("55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214"), "id": String("approval-55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214"), "revision": Number(1)}, "binding": String("task:a"), "binding_digest": String("214df684e80d72f4c8a02471ab047a0fbfc70b7b91cc7daf1132293499e0572d"), "binding_revision": Number(1), "budget": Null, "config": Object {"digest": Null, "path": String("/tmp/.tmpirCOUY/config.toml")}, "control_epoch": Number(4), "dependencies": Array [], "effective_profile": Object {"adapter": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "agent": Object {"digest": String("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"), "path": String("/fixture/claude"), "version": String("1.0.0-preview.1")}, "arguments_digest": String("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"), "capabilities": Object {"checkpoint_acknowledgment": Object {"status": String("unknown")}, "launch": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "prompt_submission": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "readiness_observation": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "resume": Object {"status": String("unknown")}, "stop": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "structured_usage": Object {"status": String("unknown")}}, "config": Object {"digest": Null, "path": String("/tmp/.tmpirCOUY/config.toml")}, "definition_digest": String("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), "environment_names": Array [], "herdr": Object {"digest": String("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"), "path": String("/fixture/herdr"), "version": String("0.9.1")}, "kind": String("claude"), "name": String("fixture"), "permission_policy": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "version": Number(1), "workflow_certificate": Null}, "memory": Null, "profile": Object {"digest": String("b7e10a68e80c716587c5889ceae4f6b517b11637a814313adf9158fa3d132c21"), "id": String("profile-b7e10a68e80c716587c5889ceae4f6b517b11637a814313adf9158fa3d132c21"), "revision": Number(1)}, "project_store": String("/tmp/.tmpirCOUY/.state/state.db"), "repositories": Array [], "scheduler_revision": Number(2), "task": String("a"), "task_revision": Number(3), "version": Number(2)}, "operation": String("launch-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb")}, expected_revision: 4, due_unix_ms: 1000, idempotency_key: "launch-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb" }, Operation { id: OperationId("launch-f190fd44125d3b93b3aa0f54bae93bb8c1d46547e79d212fa3907a790fb6d21b"), task: Some(TaskId("b")), kind: "runtime.launch", target: "task:b", payload_version: 1, payload: Object {"attempt": String("attempt-f190fd44125d3b93b3aa0f54bae93bb8c1d46547e79d212fa3907a790fb6d21b"), "inputs": Object {"approval": Object {"digest": String("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"), "id": String("fixture-approval"), "revision": Number(1)}, "binding": String("task:b"), "binding_digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "binding_revision": Number(1), "budget": Null, "config": Object {"digest": Null, "path": String("/historical/config.toml")}, "control_epoch": Number(2), "dependencies": Array [], "memory": Null, "profile": Object {"digest": String("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), "id": String("fixture-profile"), "revision": Number(1)}, "project_store": String("/historical/state.db"), "repositories": Array [], "scheduler_revision": Number(2), "task": String("b"), "task_revision": Number(3), "version": Number(1)}, "operation": String("launch-f190fd44125d3b93b3aa0f54bae93bb8c1d46547e79d212fa3907a790fb6d21b")}, expected_revision: 4, due_unix_ms: 1000, idempotency_key: "launch-f190fd44125d3b93b3aa0f54bae93bb8c1d46547e79d212fa3907a790fb6d21b" }], deliveries: [Delivery { operation: OperationId("launch-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb"), revision: 2, state: Claimed, epoch: 1, attempts: 1, owner: Some("worker"), lease_until_ms: Some(2000), next_due_ms: 1000, last_outcome: None }, Delivery { operation: OperationId("launch-f190fd44125d3b93b3aa0f54bae93bb8c1d46547e79d212fa3907a790fb6d21b"), revision: 1, state: Pending, epoch: 0, attempts: 0, owner: None, lease_until_ms: None, next_due_ms: 1000, last_outcome: None }], inbox: [], runtime_bindings: [RuntimeBinding { id: "task:a", task: Some(TaskId("a")), revision: 1, source_path: None, source_digest: None, session_source_digest: None, verification: Unverified, identity: RuntimeIdentity { machine: "", socket: "", workspace_id: "", tab_id: "", pane_id: "", cwd: "", repo: "", branch: "", worktree_path: "", thread_dir: "", agent: "", agent_name: "", legacy_status: "", execution_fingerprint: None } }, RuntimeBinding { id: "task:b", task: Some(TaskId("b")), revision: 1, source_path: None, source_digest: None, session_source_digest: None, verification: Unverified, identity: RuntimeIdentity { machine: "", socket: "", workspace_id: "", tab_id: "", pane_id: "", cwd: "", repo: "", branch: "", worktree_path: "", thread_dir: "", agent: "", agent_name: "", legacy_status: "", execution_fingerprint: None } }], observations: [RuntimeObservation { binding: "task:a", binding_revision: 1, task_revision: Some(3), observed_unix_ms: 1000, pane: Unrecorded, worktree: Unrecorded, agent_present: false, collector: "herdr-git-v1", config_digest: None, diagnostic: "", session_identity: None, worktree_identity: None, agent_identity: None }, RuntimeObservation { binding: "task:b", binding_revision: 1, task_revision: Some(3), observed_unix_ms: 1000, pane: Unrecorded, worktree: Unrecorded, agent_present: false, collector: "herdr-git-v1", config_digest: None, diagnostic: "", session_identity: None, worktree_identity: None, agent_identity: None }], ownership: [], control: Some(ProjectControl { revision: 4, epoch: 4, state: Active, reconciliation_required: false, config_digest: None }), scheduler: Some(SchedulerSnapshot { policy: SchedulerPolicy { revision: 2, max_active_workers: 1, max_attempts_per_task: 3 }, queue: [QueueRecord { task: TaskId("a"), priority: 0, enqueued_unix_ms: 0, enqueue_sequence: 6, dependencies: [] }, QueueRecord { task: TaskId("b"), priority: 0, enqueued_unix_ms: 0, enqueue_sequence: 11, dependencies: [] }] }), attempt_inputs: [AttemptInputRecord { attempt: AttemptId("attempt-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb"), operation: OperationId("launch-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb"), inputs: LaunchInputs { version: 2, project_store: "/tmp/.tmpirCOUY/.state/state.db", task: TaskId("a"), task_revision: 3, scheduler_revision: 2, control_epoch: 4, binding: "task:a", binding_revision: 1, binding_digest: "214df684e80d72f4c8a02471ab047a0fbfc70b7b91cc7daf1132293499e0572d", profile: VersionedReference { id: "profile-b7e10a68e80c716587c5889ceae4f6b517b11637a814313adf9158fa3d132c21", revision: 1, digest: "b7e10a68e80c716587c5889ceae4f6b517b11637a814313adf9158fa3d132c21" }, effective_profile: Some(FrozenProfile { version: 1, name: "fixture", kind: "claude", definition_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", config: ConfigReference { path: "/tmp/.tmpirCOUY/config.toml", digest: None }, arguments_digest: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", environment_names: [], execution_home: None, permission_policy: VersionedReference { id: "test-only-evidence", revision: 1, digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, agent: ExecutableIdentity { path: "/fixture/claude", digest: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", version: "1.0.0-preview.1" }, herdr: ExecutableIdentity { path: "/fixture/herdr", digest: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", version: "0.9.1" }, adapter: VersionedReference { id: "test-only-evidence", revision: 1, digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, capabilities: ProfileCapabilities { launch: Supported { evidence: VersionedReference { id: "test-only-evidence", revision: 1, digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } }, readiness_observation: Supported { evidence: VersionedReference { id: "test-only-evidence", revision: 1, digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } }, prompt_submission: Supported { evidence: VersionedReference { id: "test-only-evidence", revision: 1, digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } }, stop: Supported { evidence: VersionedReference { id: "test-only-evidence", revision: 1, digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } }, checkpoint_acknowledgment: Unknown, structured_usage: Unknown, resume: Unknown }, workflow_certificate: None }), approval: VersionedReference { id: "approval-55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214", revision: 1, digest: "55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214" }, config: ConfigReference { path: "/tmp/.tmpirCOUY/config.toml", digest: None }, repositories: [], dependencies: [], memory: None, budget: None } }, AttemptInputRecord { attempt: AttemptId("attempt-f190fd44125d3b93b3aa0f54bae93bb8c1d46547e79d212fa3907a790fb6d21b"), operation: OperationId("launch-f190fd44125d3b93b3aa0f54bae93bb8c1d46547e79d212fa3907a790fb6d21b"), inputs: LaunchInputs { version: 1, project_store: "/historical/state.db", task: TaskId("b"), task_revision: 3, scheduler_revision: 2, control_epoch: 2, binding: "task:b", binding_revision: 1, binding_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", profile: VersionedReference { id: "fixture-profile", revision: 1, digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }, effective_profile: None, approval: VersionedReference { id: "fixture-approval", revision: 1, digest: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }, config: ConfigReference { path: "/historical/config.toml", digest: None }, repositories: [], dependencies: [], memory: None, budget: None } }], approvals: [ApprovalRecord { grant: ApprovalGrant { version: 1, scope: ApprovalScope { version: 1, class: RuntimeLaunch, project_store: "/tmp/.tmpirCOUY/.state/state.db", task: TaskId("a"), task_revision: 4, target: "task:a", action_digest: "1e2a497de8217bd21de24dce0fcf5b267f4007f6faf282e804fbff8624a43d96" }, policy: VersionedReference { id: "test-only-evidence", revision: 1, digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, issued_unix_ms: 0, expires_unix_ms: 100000 }, reference: VersionedReference { id: "approval-55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214", revision: 1, digest: "55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214" }, revoked: None, consumed: Some(ApprovalUse { operation: OperationId("launch-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb"), claim_revision: 2, claim_epoch: 1, consumed_unix_ms: 1000 }) }, ApprovalRecord { grant: ApprovalGrant { version: 1, scope: ApprovalScope { version: 1, class: RuntimeLaunch, project_store: "/tmp/.tmpirCOUY/.state/state.db", task: TaskId("b"), task_revision: 4, target: "task:b", action_digest: "4eaba741285076564a9ae33655b1713d60695612a626e5ca91012a6f567bc68d" }, policy: VersionedReference { id: "test-only-evidence", revision: 1, digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, issued_unix_ms: 0, expires_unix_ms: 100000 }, reference: VersionedReference { id: "approval-b9bdedda5e7a1cfc154936fc2e4887e5cb0f295af4b68fac203d19dd22beeb7a", revision: 1, digest: "b9bdedda5e7a1cfc154936fc2e4887e5cb0f295af4b68fac203d19dd22beeb7a" }, revoked: None, consumed: None }], budget_policies: [], memory_policies: [], routine_revisions: [], routine_occurrences: [], routine_receipts: [], cancellations: [], events: [Event { sequence: 1, kind: "task.changed", entity: "a", revision: 1, payload_version: 1, payload: Object {"active_attempt": Null, "id": String("a"), "revision": Number(1), "state": String("draft"), "title": String("a")} }, Event { sequence: 2, kind: "task.changed", entity: "b", revision: 1, payload_version: 1, payload: Object {"active_attempt": Null, "id": String("b"), "revision": Number(1), "state": String("draft"), "title": String("b")} }, Event { sequence: 3, kind: "runtime.created", entity: "task:a", revision: 1, payload_version: 1, payload: Object {"id": String("task:a"), "identity": Object {"agent": String(""), "agent_name": String(""), "branch": String(""), "cwd": String(""), "execution_fingerprint": Null, "legacy_status": String(""), "machine": String(""), "pane_id": String(""), "repo": String(""), "socket": String(""), "tab_id": String(""), "thread_dir": String(""), "workspace_id": String(""), "worktree_path": String("")}, "revision": Number(1), "session_source_digest": Null, "source_digest": Null, "source_path": Null, "task": String("a"), "verification": String("unverified")} }, Event { sequence: 4, kind: "task.changed", entity: "a", revision: 2, payload_version: 1, payload: Object {"active_attempt": Null, "id": String("a"), "revision": Number(2), "state": String("draft"), "title": String("a")} }, Event { sequence: 5, kind: "project.reconciliation_invalidated", entity: "project", revision: 2, payload_version: 1, payload: Object {"config_digest": Null, "epoch": Number(2), "reconciliation_required": Bool(true), "revision": Number(2), "state": String("paused")} }, Event { sequence: 6, kind: "task.changed", entity: "a", revision: 3, payload_version: 1, payload: Object {"active_attempt": Null, "id": String("a"), "revision": Number(3), "state": String("queued"), "title": String("a")} }, Event { sequence: 7, kind: "scheduler.task_queued", entity: "a", revision: 3, payload_version: 1, payload: Object {"dependencies": Array [], "enqueue_sequence": Number(6), "enqueued_unix_ms": Number(0), "priority": Number(0), "task": String("a")} }, Event { sequence: 8, kind: "runtime.created", entity: "task:b", revision: 1, payload_version: 1, payload: Object {"id": String("task:b"), "identity": Object {"agent": String(""), "agent_name": String(""), "branch": String(""), "cwd": String(""), "execution_fingerprint": Null, "legacy_status": String(""), "machine": String(""), "pane_id": String(""), "repo": String(""), "socket": String(""), "tab_id": String(""), "thread_dir": String(""), "workspace_id": String(""), "worktree_path": String("")}, "revision": Number(1), "session_source_digest": Null, "source_digest": Null, "source_path": Null, "task": String("b"), "verification": String("unverified")} }, Event { sequence: 9, kind: "task.changed", entity: "b", revision: 2, payload_version: 1, payload: Object {"active_attempt": Null, "id": String("b"), "revision": Number(2), "state": String("draft"), "title": String("b")} }, Event { sequence: 10, kind: "project.reconciliation_invalidated", entity: "project", revision: 3, payload_version: 1, payload: Object {"config_digest": Null, "epoch": Number(3), "reconciliation_required": Bool(true), "revision": Number(3), "state": String("paused")} }, Event { sequence: 11, kind: "task.changed", entity: "b", revision: 3, payload_version: 1, payload: Object {"active_attempt": Null, "id": String("b"), "revision": Number(3), "state": String("queued"), "title": String("b")} }, Event { sequence: 12, kind: "scheduler.task_queued", entity: "b", revision: 3, payload_version: 1, payload: Object {"dependencies": Array [], "enqueue_sequence": Number(11), "enqueued_unix_ms": Number(0), "priority": Number(0), "task": String("b")} }, Event { sequence: 13, kind: "scheduler.policy_changed", entity: "scheduler", revision: 2, payload_version: 1, payload: Object {"max_active_workers": Number(1), "max_attempts_per_task": Number(3), "revision": Number(2)} }, Event { sequence: 14, kind: "runtime.observed", entity: "task:a", revision: 1, payload_version: 1, payload: Object {"agent_present": Bool(false), "binding": String("task:a"), "binding_revision": Number(1), "collector": String("herdr-git-v1"), "config_digest": Null, "diagnostic": String(""), "observed_unix_ms": Number(1000), "pane": String("unrecorded"), "task_revision": Number(3), "worktree": String("unrecorded")} }, Event { sequence: 15, kind: "runtime.observed", entity: "task:b", revision: 1, payload_version: 1, payload: Object {"agent_present": Bool(false), "binding": String("task:b"), "binding_revision": Number(1), "collector": String("herdr-git-v1"), "config_digest": Null, "diagnostic": String(""), "observed_unix_ms": Number(1000), "pane": String("unrecorded"), "task_revision": Number(3), "worktree": String("unrecorded")} }, Event { sequence: 16, kind: "project.control_changed", entity: "project", revision: 4, payload_version: 1, payload: Object {"config_digest": Null, "epoch": Number(4), "reconciliation_required": Bool(false), "revision": Number(4), "state": String("active")} }, Event { sequence: 17, kind: "approval.installed", entity: "approval-55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214", revision: 1, payload_version: 1, payload: Object {"expires_unix_ms": Number(100000), "issued_unix_ms": Number(0), "policy": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "scope": Object {"action_digest": String("1e2a497de8217bd21de24dce0fcf5b267f4007f6faf282e804fbff8624a43d96"), "class": String("runtime_launch"), "project_store": String("/tmp/.tmpirCOUY/.state/state.db"), "target": String("task:a"), "task": String("a"), "task_revision": Number(4), "version": Number(1)}, "version": Number(1)} }, Event { sequence: 18, kind: "approval.installed", entity: "approval-b9bdedda5e7a1cfc154936fc2e4887e5cb0f295af4b68fac203d19dd22beeb7a", revision: 1, payload_version: 1, payload: Object {"expires_unix_ms": Number(100000), "issued_unix_ms": Number(0), "policy": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "scope": Object {"action_digest": String("4eaba741285076564a9ae33655b1713d60695612a626e5ca91012a6f567bc68d"), "class": String("runtime_launch"), "project_store": String("/tmp/.tmpirCOUY/.state/state.db"), "target": String("task:b"), "task": String("b"), "task_revision": Number(4), "version": Number(1)}, "version": Number(1)} }, Event { sequence: 19, kind: "attempt.reserved", entity: "attempt-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb", revision: 1, payload_version: 1, payload: Object {"attempt": String("attempt-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb"), "inputs": Object {"approval": Object {"digest": String("55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214"), "id": String("approval-55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214"), "revision": Number(1)}, "binding": String("task:a"), "binding_digest": String("214df684e80d72f4c8a02471ab047a0fbfc70b7b91cc7daf1132293499e0572d"), "binding_revision": Number(1), "budget": Null, "config": Object {"digest": Null, "path": String("/tmp/.tmpirCOUY/config.toml")}, "control_epoch": Number(4), "dependencies": Array [], "effective_profile": Object {"adapter": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "agent": Object {"digest": String("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"), "path": String("/fixture/claude"), "version": String("1.0.0-preview.1")}, "arguments_digest": String("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"), "capabilities": Object {"checkpoint_acknowledgment": Object {"status": String("unknown")}, "launch": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "prompt_submission": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "readiness_observation": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "resume": Object {"status": String("unknown")}, "stop": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "structured_usage": Object {"status": String("unknown")}}, "config": Object {"digest": Null, "path": String("/tmp/.tmpirCOUY/config.toml")}, "definition_digest": String("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), "environment_names": Array [], "herdr": Object {"digest": String("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"), "path": String("/fixture/herdr"), "version": String("0.9.1")}, "kind": String("claude"), "name": String("fixture"), "permission_policy": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "version": Number(1), "workflow_certificate": Null}, "memory": Null, "profile": Object {"digest": String("b7e10a68e80c716587c5889ceae4f6b517b11637a814313adf9158fa3d132c21"), "id": String("profile-b7e10a68e80c716587c5889ceae4f6b517b11637a814313adf9158fa3d132c21"), "revision": Number(1)}, "project_store": String("/tmp/.tmpirCOUY/.state/state.db"), "repositories": Array [], "scheduler_revision": Number(2), "task": String("a"), "task_revision": Number(3), "version": Number(2)}, "operation": String("launch-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb")} }, Event { sequence: 20, kind: "task.changed", entity: "a", revision: 4, payload_version: 1, payload: Object {"active_attempt": String("attempt-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb"), "id": String("a"), "revision": Number(4), "state": String("running"), "title": String("a")} }, Event { sequence: 21, kind: "operation.enqueued", entity: "launch-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb", revision: 4, payload_version: 1, payload: Object {"attempt": String("attempt-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb"), "inputs": Object {"approval": Object {"digest": String("55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214"), "id": String("approval-55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214"), "revision": Number(1)}, "binding": String("task:a"), "binding_digest": String("214df684e80d72f4c8a02471ab047a0fbfc70b7b91cc7daf1132293499e0572d"), "binding_revision": Number(1), "budget": Null, "config": Object {"digest": Null, "path": String("/tmp/.tmpirCOUY/config.toml")}, "control_epoch": Number(4), "dependencies": Array [], "effective_profile": Object {"adapter": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "agent": Object {"digest": String("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"), "path": String("/fixture/claude"), "version": String("1.0.0-preview.1")}, "arguments_digest": String("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"), "capabilities": Object {"checkpoint_acknowledgment": Object {"status": String("unknown")}, "launch": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "prompt_submission": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "readiness_observation": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "resume": Object {"status": String("unknown")}, "stop": Object {"evidence": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "status": String("supported")}, "structured_usage": Object {"status": String("unknown")}}, "config": Object {"digest": Null, "path": String("/tmp/.tmpirCOUY/config.toml")}, "definition_digest": String("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), "environment_names": Array [], "herdr": Object {"digest": String("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"), "path": String("/fixture/herdr"), "version": String("0.9.1")}, "kind": String("claude"), "name": String("fixture"), "permission_policy": Object {"digest": String("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "id": String("test-only-evidence"), "revision": Number(1)}, "version": Number(1), "workflow_certificate": Null}, "memory": Null, "profile": Object {"digest": String("b7e10a68e80c716587c5889ceae4f6b517b11637a814313adf9158fa3d132c21"), "id": String("profile-b7e10a68e80c716587c5889ceae4f6b517b11637a814313adf9158fa3d132c21"), "revision": Number(1)}, "project_store": String("/tmp/.tmpirCOUY/.state/state.db"), "repositories": Array [], "scheduler_revision": Number(2), "task": String("a"), "task_revision": Number(3), "version": Number(2)}, "operation": String("launch-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb")} }, Event { sequence: 22, kind: "approval.consumed", entity: "approval-55ffed22172ad8c4bf48d3b741689a04f12c7363778d765c3ce48285b6a19214", revision: 1, payload_version: 1, payload: Object {"claim_epoch": Number(1), "claim_revision": Number(2), "consumed_unix_ms": Number(1000), "operation": String("launch-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb")} }, Event { sequence: 23, kind: "operation.claimed", entity: "launch-31cfdc4706505c83369b78ed72332456a31c73af20b0fda9e55d58f1a78670cb", revision: 2, payload_version: 1, payload: Object {"epoch": Number(1), "lease_until_ms": Number(2000), "owner": String("worker")} }] }
+
+---- store::reservations::tests::schema10_upgrade_preserves_nonzero_claim_history stdout ----
+
+thread 'store::reservations::tests::schema10_upgrade_preserves_nonzero_claim_history' (1973030) panicked at src/store/reservations/tests.rs:358:1592:
+called `Result::unwrap()` on an `Err` value: Io("table verification_runs already exists")
+
+---- store::reservations::tests::schema11_upgrade_retains_records_and_blocks_old_format_insertions stdout ----
+
+thread 'store::reservations::tests::schema11_upgrade_retains_records_and_blocks_old_format_insertions' (1973031) panicked at src/store/reservations/tests.rs:310:21:
+called `Result::unwrap()` on an `Err` value: Io("table verification_runs already exists")
+
+---- store::reservations::tests::schema12_launches_upgrade_without_fabricating_grants_or_releasing_capacity stdout ----
+
+thread 'store::reservations::tests::schema12_launches_upgrade_without_fabricating_grants_or_releasing_capacity' (1973032) panicked at src/store/reservations/tests.rs:202:68:
+called `Result::unwrap()` on an `Err` value: Io("table verification_runs already exists")
+
+---- store::routines::tests::schema15_upgrade_preserves_existing_outbox_without_inventing_routine_authority stdout ----
+
+thread 'store::routines::tests::schema15_upgrade_preserves_existing_outbox_without_inventing_routine_authority' (1973132) panicked at src/store/routines/tests.rs:76:68:
+called `Result::unwrap()` on an `Err` value: Io("table verification_runs already exists")
+
+---- store::satisfaction::tests::migration_defaults_factory_admission_off_and_release_code_does_not_write_it stdout ----
+
+thread 'store::satisfaction::tests::migration_defaults_factory_admission_off_and_release_code_does_not_write_it' (1973137) panicked at src/store/satisfaction.rs:1186:26:
+unexpected factory_admission writer in delegation.rs
+
+---- store::targeted::tests::targeted_shadow_matches_the_harness_history_fixture_including_a_corrupt_payload stdout ----
+
+thread 'store::targeted::tests::targeted_shadow_matches_the_harness_history_fixture_including_a_corrupt_payload' (1973159) panicked at src/store/targeted.rs:515:9:
+assertion `left == right` failed
+  left: 1
+ right: 0
+
+
+failures:
+    migration::tests::old_schema_projection_does_not_conflict_after_inbox_upgrade
+    migration::tests::published_v2_store_upgrades_explicitly_without_losing_migration_identity
+    migration::tests::runtime_upgrade_failure_rolls_back_schema_and_can_be_retried
+    migration::tests::runtime_upgrade_uses_provenance_preserves_edits_and_previous_exports
+    migration::tests::schema3_inbox_upgrade_reads_provenance_not_changed_legacy_files
+    migration::tests::schema8_upgrade_preserves_observation_foreign_keys_and_import_hashes
+    migration::tests::schema9_queue_upgrade_preserves_old_exports_and_starts_with_closed_capacity
+    profile_preparation::tests::native_retention_requires_explicit_schema_upgrade
+    store::checkpoints::tests::schema16_upgrade_reaches_schema20_without_inventing_checkpoints
+    store::checkpoints::tests::schema19_upgrade_adds_empty_checkpoint_tables
+    store::memory::tests::schema17_upgrade_adds_empty_memory_tables
+    store::memory_policy::tests::schema16_upgrade_adds_memory_policies_without_inventing_revisions
+    store::proposals::tests::schema20_upgrade_adds_empty_proposal_tables
+    store::reservations::tests::budget_upgrade_preserves_pending_operations_without_inventing_policy
+    store::reservations::tests::project_outbox_upgrade_preserves_claims_inputs_and_consumed_approvals
+    store::reservations::tests::schema10_upgrade_preserves_nonzero_claim_history
+    store::reservations::tests::schema11_upgrade_retains_records_and_blocks_old_format_insertions
+    store::reservations::tests::schema12_launches_upgrade_without_fabricating_grants_or_releasing_capacity
+    store::routines::tests::schema15_upgrade_preserves_existing_outbox_without_inventing_routine_authority
+    store::satisfaction::tests::migration_defaults_factory_admission_off_and_release_code_does_not_write_it
+    store::targeted::tests::targeted_shadow_matches_the_harness_history_fixture_including_a_corrupt_payload
+
+test result: FAILED. 586 passed; 21 failed; 13 ignored; 0 measured; 5 filtered out; finished in 117.62s
+

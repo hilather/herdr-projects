@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension};
 pub struct FactoryNumbers {
     pub schema: u32,
     pub factory_admission: String,
-    pub rows_decoded: u64,
+    pub active_inventory_page_rows: u64,
     pub queue_age_control_ms: Option<i64>,
     pub queue_age_verification_ms: Option<i64>,
     pub queue_age_integration_ms: Option<i64>,
@@ -38,10 +38,10 @@ fn count(db: &Connection, sql: &str) -> Result<u64> {
 }
 
 impl SqliteStore {
-    /// Counters for one project. `rows_decoded` is the active-work page, not a snapshot of retired rows.
+    /// Counters for one project. `active_inventory_page_rows` is the active-work page, not a snapshot of retired rows.
     pub fn factory_counters(&mut self, now: i64) -> Result<FactoryNumbers> {
         let schema: u32 = self.connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        let rows_decoded = match self.hot_path_rows_decoded() {
+        let active_inventory_page_rows = match self.active_inventory_page_rows() {
             Ok(rows) => rows,
             Err(StoreError::UnsupportedSchema(_)) => 0,
             Err(error) => return Err(error),
@@ -61,11 +61,15 @@ impl SqliteStore {
         } else {
             None
         };
-        let verification_oldest = if schema >= 26 {
+        let verification_oldest = if schema >= 43 {
+            optional_i64(db,"SELECT MIN(created_unix_ms) FROM pending_verification_work")?
+        } else if schema >= 27 {
             optional_i64(
                 db,
                 "SELECT MIN(created_unix_ms) FROM result_submissions WHERE NOT EXISTS (SELECT 1 FROM verification_runs WHERE verification_runs.submission_id = result_submissions.submission_id)",
             )?
+        } else if schema==26 {
+            optional_i64(db,"SELECT MIN(created_unix_ms) FROM result_submissions")?
         } else {
             None
         };
@@ -132,7 +136,7 @@ impl SqliteStore {
         Ok(FactoryNumbers {
             schema,
             factory_admission,
-            rows_decoded,
+            active_inventory_page_rows,
             queue_age_control_ms,
             queue_age_verification_ms: age_ms(now, verification_oldest),
             queue_age_integration_ms: age_ms(now, integration_oldest),

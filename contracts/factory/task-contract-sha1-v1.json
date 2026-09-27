@@ -1,0 +1,47 @@
+{
+  "acceptance_policies": [
+    {
+      "id": "tests",
+      "text": "{\"checks\":[\"true\"]}"
+    }
+  ],
+  "authority": {
+    "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "id": "owner-approval-policy",
+    "revision": 1
+  },
+  "base_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "capability_flags": [
+    "prompt_submit"
+  ],
+  "contract_revision": 2,
+  "deliverable": "Consume the verified predecessor and update src/output.rs.",
+  "dependencies": [
+    {
+      "edge": "verified_result",
+      "policy_id": "tests",
+      "predecessor": "task-producer"
+    }
+  ],
+  "expected_head": 7,
+  "non_goals": "No publication or unrelated changes.",
+  "object_format": "sha1",
+  "plan_revision": 1,
+  "profile_kind": "codex",
+  "project_store": "/fixture/project/.state/state.db",
+  "repository": "/fixture/repository",
+  "result_schema_id": "result-v1",
+  "retry_class": "none",
+  "route": "verify_only",
+  "scope": {
+    "named_resources": [],
+    "paths": [
+      {
+        "access": "write",
+        "path": "src/output.rs"
+      }
+    ]
+  },
+  "task_id": "task-consumer",
+  "version": 1
+}

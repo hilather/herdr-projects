@@ -15,7 +15,7 @@ fn lock_file(path:&Path)->Result<File> {
 }
 pub(crate) fn exclusive_file(path:&Path)->Result<File> {
     let file=lock_file(path)?;
-    file.try_lock().context("another operation owns this lock; retry")?;
+    file.try_lock().with_context(|| format!("another operation owns lock {}; retry", path.display()))?;
     Ok(file)
 }
 
@@ -133,6 +133,51 @@ impl ProjectSharedGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn concurrent_pre_exec_can_temporarily_retain_a_released_project_lock() {
+        use std::io::{Read, Write};
+        use std::os::{fd::{AsRawFd, FromRawFd}, unix::process::CommandExt};
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir_all(project.join(".state")).unwrap();
+        let guard = ProjectGuard::acquire(&project).unwrap();
+        let pipe = || {
+            let mut fds = [0; 2];
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
+        };
+        let (mut ready_read, ready_write) = pipe();
+        let (release_read, mut release_write) = pipe();
+        let spawned = std::thread::spawn(move || {
+            let ready_fd = ready_write.as_raw_fd();
+            let release_fd = release_read.as_raw_fd();
+            let mut command = std::process::Command::new("/usr/bin/true");
+            // Deliberately pause after fork and before CLOEXEC takes effect.
+            // Only async-signal-safe syscalls run in the child, with a deadline.
+            unsafe { command.pre_exec(move || {
+                let mut byte = 1u8;
+                if libc::write(ready_fd, (&byte as *const u8).cast(), 1) != 1 { return Err(std::io::Error::last_os_error()); }
+                let mut poll = libc::pollfd { fd: release_fd, events: libc::POLLIN, revents: 0 };
+                if libc::poll(&mut poll, 1, 5000) != 1 { return Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT)); }
+                if libc::read(release_fd, (&mut byte as *mut u8).cast(), 1) != 1 { return Err(std::io::Error::last_os_error()); }
+                Ok(())
+            }); }
+            let result = command.spawn().unwrap().wait().unwrap();
+            drop((ready_write, release_read));
+            result
+        });
+        let mut ready = libc::pollfd { fd: ready_read.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        assert_eq!(unsafe { libc::poll(&mut ready, 1, 5000) }, 1);
+        ready_read.read_exact(&mut [0u8]).unwrap();
+        drop(guard);
+        let contention = ProjectGuard::acquire(&project).err().expect("child must retain the inherited file description until exec");
+        release_write.write_all(&[1]).unwrap();
+        assert!(spawned.join().unwrap().success());
+        assert!(contention.chain().any(|cause| matches!(cause.downcast_ref::<std::fs::TryLockError>(), Some(std::fs::TryLockError::WouldBlock))));
+        assert!(contention.to_string().contains(project.join(".state/effect.lock").to_str().unwrap()));
+        assert!(ProjectGuard::acquire(&project).is_ok(), "exec must close unrequested inherited locks");
+    }
+
     #[test]
     fn projects_are_independent_and_root_barrier_remains_exclusive() {
         let root=tempfile::tempdir().unwrap();

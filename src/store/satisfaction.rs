@@ -81,25 +81,27 @@ fn predecessor_revoked(db: &Connection, predecessor: &str) -> Result<bool> {
     if version < 40 {
         return Ok(false);
     }
+    let source = if version >= 43 { "barrier_current_status" } else { "barrier_revisions" };
     // A revoked membership stays blocking until a later barrier for this task
     // is released. Checking here, not a one-shot satisfaction update, keeps a
     // re-record Invalid instead of a primary-key Conflict.
     db.query_row(
-        "SELECT EXISTS(
+        &format!("SELECT EXISTS(
             SELECT 1
             FROM barrier_members m
-            JOIN barrier_revisions b ON b.barrier_id=m.barrier_id
+            JOIN {source} b ON b.barrier_id=m.barrier_id
             WHERE m.task_id=?1
               AND b.revoked_seq IS NOT NULL
               AND NOT EXISTS (
                   SELECT 1
                   FROM barrier_members later_member
-                  JOIN barrier_revisions later ON later.barrier_id=later_member.barrier_id
+                  JOIN {source} later ON later.barrier_id=later_member.barrier_id
                   WHERE later_member.task_id=m.task_id
                     AND later.released_seq IS NOT NULL
+                    AND later.revoked_seq IS NULL
                     AND later.created_seq>b.created_seq
               )
-         )",
+         )"),
         [predecessor],
         |row| row.get(0),
     )
@@ -114,6 +116,20 @@ fn insert_valid(
     evidence_id: &str,
     replace_existing: bool,
 ) -> Result<()> {
+    insert_valid_with_budget(tx, task_id, predecessor, requirement, evidence_id, replace_existing, None)
+}
+
+fn insert_valid_with_budget(
+    tx: &Connection, task_id: &str, predecessor: &str, requirement: &str,
+    evidence_id: &str, replace_existing: bool, budget: Option<&read_budget::ReadBudget>,
+) -> Result<()> {
+    if let Some(budget) = budget { budget.check()?; }
+    let result = if requirement == "integrated_commit" {
+        if !super::contract_binding::integrated_output_checks_current(tx, evidence_id, budget)? { return Ok(()); }
+        tx.query_row("SELECT o.verified_result_id FROM integrated_commits i JOIN integration_operations o ON o.operation_id=i.operation_id WHERE i.integrated_id=?1", [evidence_id], |r| r.get::<_, String>(0))?
+    } else { evidence_id.to_string() };
+    if !super::contract_binding::policy_matches_with_budget(tx, task_id, predecessor, requirement, &result, budget)? { return Ok(()); }
+    if !super::contract_binding::verified_result_barrier_current(tx, &result, budget)? { return Ok(()); }
     if predecessor_revoked(tx, predecessor)? {
         return Err(invalid("dependency blocked"));
     }
@@ -229,71 +245,81 @@ pub(super) fn record_integrated_commit(tx: &Connection, integrated_id: &str) -> 
 
 /// Newest accepted result that may still replace, not merely the latest clock.
 /// A later run for an older attempt must not be the one attach records.
-fn current_verified(tx: &Connection, predecessor: &str) -> Result<Option<String>> {
+fn current_verified(tx: &Connection, task_id: &str, predecessor: &str, budget: &read_budget::ReadBudget) -> Result<Option<String>> {
     let mut stmt = tx.prepare(
         "SELECT v.result_id
-         FROM verified_results v
-         JOIN verification_runs r ON r.run_id=v.run_id
+         FROM verification_runs r JOIN verified_results v ON v.run_id=r.run_id
          WHERE r.task_id=?1 AND r.state='accepted'
-         ORDER BY v.created_unix_ms DESC, v.result_id DESC",
-    )?;
-    let ids = stmt
-        .query_map([predecessor], |row| row.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    for result_id in ids {
-        if verified_result_may_replace(tx, &result_id)? {
+           AND r.attempt_id=COALESCE((SELECT active_attempt FROM tasks WHERE id=?1),
+               (SELECT id FROM attempts WHERE task_id=?1 ORDER BY rowid DESC LIMIT 1))
+           AND r.contract_revision=(SELECT MAX(contract_revision) FROM task_contracts WHERE task_id=?1)
+           AND v.memory_fence=r.memory_fence AND v.isolation='linux-unshare-user-pid-mount-v1'
+         ORDER BY v.created_unix_ms DESC, v.result_id DESC")?;
+    let mut rows = stmt.query([predecessor])?;
+    while let Some(row) = rows.next()? {
+        budget.row(row, &[])?;
+        let result_id: String = row.get(0)?;
+        if super::contract_binding::policy_matches_with_budget(tx, task_id, predecessor, "verified_result", &result_id, Some(budget))?
+            && super::contract_binding::verified_result_barrier_current(tx, &result_id, Some(budget))? {
             return Ok(Some(result_id));
         }
     }
     Ok(None)
 }
 
-fn latest_integrated(tx: &Connection, predecessor: &str) -> Result<Option<String>> {
-    tx.query_row(
-        "SELECT i.integrated_id
+fn latest_integrated(tx: &Connection, task_id: &str, predecessor: &str, budget: &read_budget::ReadBudget) -> Result<Option<String>> {
+    let mut stmt = tx.prepare(
+        "SELECT i.integrated_id, o.verified_result_id
          FROM integrated_commits i
          JOIN integration_operations o ON o.operation_id=i.operation_id
          JOIN verified_results v ON v.result_id=o.verified_result_id
          JOIN verification_runs r ON r.run_id=v.run_id
          WHERE r.task_id=?1 AND r.state='accepted'
-         ORDER BY i.created_unix_ms DESC, i.integrated_id DESC
-         LIMIT 1",
-        [predecessor],
-        |row| row.get(0),
-    )
-    .optional()
-    .map_err(StoreError::from)
-}
-
-/// Edges queued after the receipt still see it. Edges with no receipt stay empty.
-pub(super) fn attach_stored_receipts(tx: &Connection, task_id: &str) -> Result<()> {
-    if !at_least_30(tx)? {
-        return Ok(());
-    }
-    let mut stmt = tx.prepare(
-        "SELECT predecessor_id, requirement FROM task_dependencies WHERE task_id=?1 ORDER BY predecessor_id",
-    )?;
-    let edges = stmt
-        .query_map([task_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    for (predecessor, requirement) in edges {
-        match requirement.as_str() {
-            "verified_result" => {
-                if let Some(result_id) = current_verified(tx, &predecessor)? {
-                    record_verified_result(tx, &result_id)?;
-                }
-            }
-            "integrated_commit" => {
-                if let Some(integrated_id) = latest_integrated(tx, &predecessor)? {
-                    record_integrated_commit(tx, &integrated_id)?;
-                }
-            }
-            _ => {}
+         ORDER BY i.created_unix_ms DESC, i.integrated_id DESC")?;
+    let mut rows = stmt.query([predecessor])?;
+    while let Some(row) = rows.next()? {
+        budget.row(row, &[])?;
+        let (integrated_id, result_id): (String,String) = (row.get(0)?,row.get(1)?);
+        if super::contract_binding::policy_matches_with_budget(tx, task_id, predecessor, "integrated_commit", &result_id, Some(budget))?
+            && super::contract_binding::integrated_output_checks_current(tx, &integrated_id, Some(budget))?
+            && super::contract_binding::verified_result_barrier_current(tx, &result_id, Some(budget))? {
+            return Ok(Some(integrated_id));
         }
     }
-    Ok(())
+    Ok(None)
+}
+
+/// Raw contract-install callers own this temporary SQL deadline. Queue mutation
+/// passes its original budget directly to attachment without renewing a handler.
+pub(super) fn attach_stored_receipts(tx: &Connection, task_id: &str) -> Result<()> {
+    read_budget::with_local_deadline(tx, |budget| attach_stored_receipts_with_budget(tx, task_id, budget))
+}
+
+pub(super) fn attach_stored_receipts_with_budget(tx: &Connection, task_id: &str, budget: &read_budget::ReadBudget) -> Result<()> {
+    if !at_least_30(tx)? { return Ok(()); }
+    let mut stmt = tx.prepare(
+        "SELECT predecessor_id, requirement FROM task_dependencies WHERE task_id=?1 ORDER BY predecessor_id LIMIT 257")?;
+    let mut rows = stmt.query([task_id])?;
+    let mut edges = Vec::new();
+    while let Some(row) = rows.next()? {
+        budget.row(row, &[])?;
+        if edges.len() == 256 { return Err(StoreError::Limit("receipt attachment exceeds 256 dependencies".into())); }
+        edges.push((row.get::<_,String>(0)?, row.get::<_,String>(1)?));
+    }
+    for (predecessor, requirement) in edges {
+        budget.check()?;
+        let evidence = match requirement.as_str() {
+            "verified_result" => current_verified(tx, task_id, &predecessor, budget)?,
+            "integrated_commit" => latest_integrated(tx, task_id, &predecessor, budget)?,
+            _ => None,
+        };
+        if let Some(evidence) = evidence {
+            // Attaching this consumer must not fan out through every other
+            // consumer. Native receipt publication owns that separate operation.
+            insert_valid_with_budget(tx, task_id, &predecessor, &requirement, &evidence, true, Some(budget))?;
+        }
+    }
+    budget.check()
 }
 
 pub(super) fn admission_enabled(db: &Connection) -> Result<bool> {
@@ -314,10 +340,14 @@ pub(super) fn admission_enabled(db: &Connection) -> Result<bool> {
     }
 }
 
-fn verified_counts(db: &Connection, task_id: &str, predecessor: &str) -> Result<bool> {
+fn verified_counts(db: &Connection, task_id: &str, predecessor: &str,budget:Option<&read_budget::ReadBudget>) -> Result<bool> {
     if predecessor_revoked(db, predecessor)? {
         return Ok(false);
     }
+    let result: Option<String> = db.query_row("SELECT evidence_id FROM dependency_satisfactions WHERE task_id=?1 AND predecessor_task=?2 AND requirement='verified_result' AND state='valid'", params![task_id, predecessor], |r| r.get(0)).optional()?;
+    let Some(result) = result else { return Ok(false) };
+    if !super::contract_binding::policy_matches_with_budget(db, task_id, predecessor, "verified_result", &result,budget)? { return Ok(false); }
+    if !super::contract_binding::verified_result_barrier_current(db, &result, budget)? { return Ok(false); }
     db.query_row(
         "SELECT EXISTS(
             SELECT 1
@@ -355,10 +385,16 @@ fn verified_counts(db: &Connection, task_id: &str, predecessor: &str) -> Result<
     .map_err(StoreError::from)
 }
 
-fn integrated_counts(db: &Connection, task_id: &str, predecessor: &str) -> Result<bool> {
+fn integrated_counts(db: &Connection, task_id: &str, predecessor: &str,budget:Option<&read_budget::ReadBudget>) -> Result<bool> {
     if predecessor_revoked(db, predecessor)? {
         return Ok(false);
     }
+    let result: Option<String> = db.query_row("SELECT o.verified_result_id FROM dependency_satisfactions s JOIN integrated_commits i ON i.integrated_id=s.evidence_id JOIN integration_operations o ON o.operation_id=i.operation_id WHERE s.task_id=?1 AND s.predecessor_task=?2 AND s.requirement='integrated_commit' AND s.state='valid'", params![task_id, predecessor], |r| r.get(0)).optional()?;
+    let Some(result) = result else { return Ok(false) };
+    let integrated: String = db.query_row("SELECT evidence_id FROM dependency_satisfactions WHERE task_id=?1 AND predecessor_task=?2 AND requirement='integrated_commit' AND state='valid'", params![task_id,predecessor], |row| row.get(0))?;
+    if !super::contract_binding::integrated_output_checks_current(db, &integrated, budget)? { return Ok(false); }
+    if !super::contract_binding::policy_matches_with_budget(db, task_id, predecessor, "integrated_commit", &result,budget)? { return Ok(false); }
+    if !super::contract_binding::verified_result_barrier_current(db, &result, budget)? { return Ok(false); }
     db.query_row(
         "SELECT EXISTS(
             SELECT 1
@@ -390,6 +426,9 @@ pub(super) fn dependency_blocker(
     requirement: DependencyRequirement,
     admission_on: bool,
 ) -> Result<Option<String>> {
+    dependency_blocker_with_budget(db,task_id,predecessor,requirement,admission_on,None)
+}
+pub(super) fn dependency_blocker_with_budget(db:&Connection,task_id:&str,predecessor:&Task,requirement:DependencyRequirement,admission_on:bool,budget:Option<&read_budget::ReadBudget>)->Result<Option<String>> {
     let pred = predecessor.id.as_str();
     let requirement_text = requirement.as_str();
     if matches!(predecessor.state, TaskState::Failed | TaskState::Cancelled) {
@@ -399,8 +438,8 @@ pub(super) fn dependency_blocker(
     }
     let valid = at_least_30(db)?
         && match requirement {
-            DependencyRequirement::VerifiedResult => verified_counts(db, task_id, pred)?,
-            DependencyRequirement::IntegratedCommit => integrated_counts(db, task_id, pred)?,
+            DependencyRequirement::VerifiedResult => verified_counts(db, task_id, pred,budget)?,
+            DependencyRequirement::IntegratedCommit => integrated_counts(db, task_id, pred,budget)?,
             DependencyRequirement::IntegrationCandidate | DependencyRequirement::LandedCommit => {
                 false
             }
@@ -416,14 +455,9 @@ pub(super) fn dependency_blocker(
     Ok(None)
 }
 
-pub(super) fn valid_satisfaction_id(
-    db: &Connection,
-    task_id: &str,
-    predecessor: &Task,
-    requirement: DependencyRequirement,
-) -> Result<Option<String>> {
+fn valid_satisfaction_id_with_budget(db:&Connection,task_id:&str,predecessor:&Task,requirement:DependencyRequirement,budget:Option<&read_budget::ReadBudget>)->Result<Option<String>> {
     // `admission_on: true` asks whether the receipt counts, not whether the flag is on.
-    if dependency_blocker(db, task_id, predecessor, requirement, true)?.is_some() {
+    if dependency_blocker_with_budget(db, task_id, predecessor, requirement, true,budget)?.is_some() {
         return Ok(None);
     }
     db.query_row(
@@ -437,13 +471,7 @@ pub(super) fn valid_satisfaction_id(
 
 /// Queue edges and sealed dependency inputs must name the same valid rows.
 /// Two integrated commits on one ref also need a pinned base that contains both.
-pub(super) fn require_dependency_evidence(
-    db: &Connection,
-    inputs: &LaunchInputs,
-    dependencies: &[Dependency],
-    tasks: &[Task],
-    proof: Option<&IntegratedProof>,
-) -> Result<()> {
+pub(super) fn require_dependency_evidence_with_budget(db:&Connection,inputs:&LaunchInputs,dependencies:&[Dependency],tasks:&[Task],proof:Option<&IntegratedProof>,budget:Option<&read_budget::ReadBudget>)->Result<()> {
     if inputs.dependencies.len() != dependencies.len() {
         return Err(invalid("task is not ready for reservation"));
     }
@@ -461,7 +489,7 @@ pub(super) fn require_dependency_evidence(
             return Err(invalid("task is not ready for reservation"));
         };
         let Some(satisfaction_id) =
-            valid_satisfaction_id(db, inputs.task.as_str(), predecessor, edge.requirement)?
+            valid_satisfaction_id_with_budget(db, inputs.task.as_str(), predecessor, edge.requirement,budget)?
         else {
             return Err(invalid("task is not ready for reservation"));
         };
@@ -472,7 +500,7 @@ pub(super) fn require_dependency_evidence(
     if matched.len() != inputs.dependencies.len() {
         return Err(invalid("task is not ready for reservation"));
     }
-    recheck_integrated_base(db, inputs, proof)
+    recheck_integrated_base(db, inputs, proof,budget)
 }
 
 pub(super) struct IntegratedProof {
@@ -483,6 +511,7 @@ pub(super) struct IntegratedProof {
 fn integrated_groups(
     db: &Connection,
     task_id: &str,
+    budget:Option<&read_budget::ReadBudget>,
 ) -> Result<std::collections::BTreeMap<(String, String), Vec<String>>> {
     let mut stmt = db.prepare(
         "SELECT i.repository, i.ref_name, i.commit_oid
@@ -490,15 +519,14 @@ fn integrated_groups(
          JOIN integrated_commits i ON i.integrated_id=s.evidence_id AND s.evidence_kind='integrated_commit'
          JOIN task_dependencies d ON d.task_id=s.task_id AND d.predecessor_id=s.predecessor_task AND d.requirement='integrated_commit'
          WHERE s.task_id=?1 AND s.state='valid'
-         ORDER BY i.repository, i.ref_name, s.predecessor_task",
+         ORDER BY i.repository, i.ref_name, s.predecessor_task LIMIT 257",
     )?;
-    let rows = stmt
-        .query_map([task_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut rows=stmt.query([task_id])?;let mut count=0;
     let mut groups = std::collections::BTreeMap::new();
-    for (repository, ref_name, commit) in rows {
+    while let Some(row)=rows.next()? {
+        count+=1;if count>256{return Err(StoreError::Limit("integrated dependency limit exceeded".into()));}
+        if let Some(budget)=budget {budget.row(row,&[])?;}
+        let repository:String=row.get(0)?;let ref_name:String=row.get(1)?;let commit:String=row.get(2)?;
         groups
             .entry((repository, ref_name))
             .or_insert_with(Vec::new)
@@ -518,8 +546,8 @@ fn contract_base(db: &Connection, task_id: &str, repository: &str) -> Result<Opt
 }
 
 /// Git runs before the reservation write transaction. Timeout, a non-UTF-8 path, or a non-ancestor is `integration_missing`.
-pub(super) fn prove_integrated_base(db: &Connection, inputs: &LaunchInputs) -> Result<IntegratedProof> {
-    let groups = integrated_groups(db, inputs.task.as_str())?;
+pub(super) fn prove_integrated_base(db: &Connection, inputs: &LaunchInputs, control: Option<&super::controlled::ReadControl>,budget:Option<&read_budget::ReadBudget>) -> Result<IntegratedProof> {
+    let groups = integrated_groups(db, inputs.task.as_str(),budget)?;
     let mut checked = std::collections::BTreeMap::new();
     for ((repository, ref_name), commits) in groups {
         if commits.len() < 2 {
@@ -537,7 +565,7 @@ pub(super) fn prove_integrated_base(db: &Connection, inputs: &LaunchInputs) -> R
                 continue;
             }
             // Failure here is not ancestry. Replace refs and a hang must not admit.
-            if bounded_git_ok(repo, &["merge-base", "--is-ancestor", commit, &pin.commit]).is_err() {
+            if bounded_git_ok(repo, &["merge-base", "--is-ancestor", commit, &pin.commit], control).is_err() {
                 return Err(invalid("integration_missing"));
             }
         }
@@ -546,8 +574,8 @@ pub(super) fn prove_integrated_base(db: &Connection, inputs: &LaunchInputs) -> R
     Ok(IntegratedProof { task: inputs.task.clone(), checked })
 }
 
-fn recheck_integrated_base(db: &Connection, inputs: &LaunchInputs, proof: Option<&IntegratedProof>) -> Result<()> {
-    let groups = integrated_groups(db, inputs.task.as_str())?;
+fn recheck_integrated_base(db: &Connection, inputs: &LaunchInputs, proof: Option<&IntegratedProof>,budget:Option<&read_budget::ReadBudget>) -> Result<()> {
+    let groups = integrated_groups(db, inputs.task.as_str(),budget)?;
     for ((repository, ref_name), commits) in &groups {
         if commits.len() < 2 {
             continue;
@@ -576,26 +604,32 @@ fn recheck_integrated_base(db: &Connection, inputs: &LaunchInputs, proof: Option
     Ok(())
 }
 
-fn bounded_git_ok(repo: &std::path::Path, args: &[&str]) -> std::result::Result<(), ()> {
+fn bounded_git_ok(repo: &std::path::Path, args: &[&str], control: Option<&super::controlled::ReadControl>) -> std::result::Result<(), ()> {
     let mut command = crate::runner::Cmd::repository_git_command(repo, args).map_err(|_| ())?;
-    command.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+    command.deadline = Some(control.map_or_else(||std::time::Instant::now()+std::time::Duration::from_secs(5),|c|c.deadline()));
+    if let Some(control)=control {control.check().map_err(|_|())?;command.cancellation=Some(control.cancellation());}
     let output = crate::runner::RealRunner.run(&command).map_err(|_| ())?;
     if output.success() { Ok(()) } else { Err(()) }
 }
 
-fn retained_profiles(db: &Connection) -> Result<Vec<FrozenProfile>> {
+fn retained_profiles(db: &Connection, config_digest:Option<&str>, budget: Option<&read_budget::ReadBudget>) -> Result<Vec<FrozenProfile>> {
     use std::os::unix::fs::MetadataExt;
     let path = db
         .path()
         .ok_or_else(|| invalid("store path missing"))?;
     let path = std::fs::canonicalize(path).map_err(|e| StoreError::Io(e.to_string()))?;
     let metadata = std::fs::metadata(&path).map_err(|e| StoreError::Io(e.to_string()))?;
+    let binding=serde_json::json!([path,metadata.dev(),metadata.ino()]).to_string();
     let mut stmt = db.prepare(
-        "SELECT profile_digest, report, report_digest FROM native_profiles ORDER BY profile_digest",
+        "SELECT profile_digest, report, report_digest FROM native_profiles WHERE json(json_extract(report,'$.source_store'))=?1 AND json_extract(report,'$.preparation.profile.config.digest') IS ?2 ORDER BY profile_digest LIMIT 257",
     )?;
-    let mut rows = stmt.query([])?;
+    let mut rows = stmt.query(params![binding,config_digest])?;
     let mut profiles = Vec::new();
+    let mut count=0;
     while let Some(row) = rows.next()? {
+        if let Some(budget)=budget {budget.row(row,&[(1,3)])?;}
+        count+=1;
+        if count>256 {return Err(StoreError::Limit("retained admission profile limit exceeded".into()));}
         let (digest, report, report_digest): (String, String, String) =
             (row.get(0)?, row.get(1)?, row.get(2)?);
         if format!("{:x}", Sha256::digest(report.as_bytes())) != report_digest {
@@ -612,6 +646,7 @@ fn retained_profiles(db: &Connection) -> Result<Vec<FrozenProfile>> {
         let profile: FrozenProfile = serde_json::from_value(serde_json::Value::Object(profile.clone()))
             .map_err(|_| StoreError::Corrupt("invalid retained profile".into()))?;
         if profile.reference().map_err(StoreError::Corrupt)?.digest != digest
+            || profile.config.digest.as_deref()!=config_digest
             || profile.validate_for_launch().is_err()
         {
             continue;
@@ -626,19 +661,52 @@ impl SqliteStore {
         admission_enabled(&self.connection)
     }
 
+    #[cfg(test)]
     pub(crate) fn admission_profiles(&self) -> Result<Vec<FrozenProfile>> {
-        retained_profiles(&self.connection)
+        let control=super::control::read_with_budget(&self.connection,None)?;
+        self.admission_profiles_with_budget(control.config_digest.as_deref(),None)
+    }
+    pub(crate) fn admission_profiles_with_budget(&self,config_digest:Option<&str>,budget:Option<&read_budget::ReadBudget>)->Result<Vec<FrozenProfile>> {
+        retained_profiles(&self.connection,config_digest,budget)
     }
 
     /// `None` when any edge lacks a current valid satisfaction. An empty queue is ready.
-    pub(crate) fn satisfied_edges(&self, task_id: &str) -> Result<Option<Vec<SatisfiedEdge>>> {
-        let tasks = read_tasks(&self.connection)?;
+    #[cfg(test)]
+    pub(crate) fn satisfied_edges(&self, task_id: &str) -> Result<Option<Vec<SatisfiedEdge>>> {self.satisfied_edges_with_budget(task_id,None)}
+    pub(crate) fn satisfied_edges_with_budget(&self,task_id:&str,budget:Option<&read_budget::ReadBudget>)->Result<Option<Vec<SatisfiedEdge>>> {
+        satisfied_edges_on(&self.connection,task_id,budget)
+    }
+
+    /// `None` when a contract base has no resolvable tree. That candidate is not reserved.
+    pub(crate) fn contract_pins_with_budget(&self,task_id:&str,control:Option<&super::controlled::ReadControl>,budget:Option<&read_budget::ReadBudget>)->Result<Option<Vec<RepositoryInput>>> {
         let mut stmt = self.connection.prepare(
-            "SELECT predecessor_id, requirement FROM task_dependencies WHERE task_id=?1 ORDER BY predecessor_id",
+            "SELECT repository, base_oid FROM task_contracts WHERE task_id=?1 AND contract_revision=(SELECT MAX(contract_revision) FROM task_contracts c WHERE c.task_id=?1)",
         )?;
-        let edges = stmt
-            .query_map([task_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut rows=stmt.query([task_id])?;
+        let mut pins = Vec::new();
+        while let Some(row)=rows.next()? {
+            if let Some(budget)=budget {budget.row(row,&[])?;}
+            let repository:String=row.get(0)?;let base:String=row.get(1)?;
+            let Some(tree) = git_tree(&repository, &base, control) else { return Ok(None); };
+            pins.push(RepositoryInput { repository, commit: base, tree });
+        }
+        Ok(Some(pins))
+    }
+
+
+}
+
+pub(super) fn satisfied_edges_on(db:&Connection,task_id:&str,budget:Option<&read_budget::ReadBudget>)->Result<Option<Vec<SatisfiedEdge>>> {
+        if !super::contract_binding::queue_matches_with_budget(db, task_id,budget)? { return Ok(None); }
+        let mut stmt = db.prepare(
+            "SELECT predecessor_id, requirement FROM task_dependencies WHERE task_id=?1 ORDER BY predecessor_id LIMIT 257",
+        )?;
+        let mut rows=stmt.query([task_id])?;let mut edges=Vec::new();
+        while let Some(row)=rows.next()? {
+            if edges.len()==256 {return Err(StoreError::Limit("task dependency limit exceeded".into()));}
+            if let Some(budget)=budget {budget.row(row,&[])?;}
+            edges.push((row.get::<_,String>(0)?,row.get::<_,String>(1)?));
+        }
         let mut satisfied = Vec::new();
         for (predecessor_id, requirement) in edges {
             let requirement = match requirement.as_str() {
@@ -648,12 +716,9 @@ impl SqliteStore {
                 "landed_commit" => DependencyRequirement::LandedCommit,
                 _ => return Err(StoreError::Corrupt("unknown dependency requirement".into())),
             };
-            let predecessor = tasks
-                .iter()
-                .find(|task| task.id.as_str() == predecessor_id)
-                .ok_or(StoreError::Conflict)?;
+            let predecessor = super::read_task_with_budget(db, &predecessor_id,budget)?;
             let Some(satisfaction_id) =
-                valid_satisfaction_id(&self.connection, task_id, predecessor, requirement)?
+                valid_satisfaction_id_with_budget(db, task_id, &predecessor, requirement,budget)?
             else {
                 return Ok(None);
             };
@@ -665,30 +730,6 @@ impl SqliteStore {
             });
         }
         Ok(Some(satisfied))
-    }
-
-    /// `None` when a contract base has no resolvable tree. That candidate is not reserved.
-    pub(crate) fn contract_pins(&self, task_id: &str) -> Result<Option<Vec<RepositoryInput>>> {
-        let mut stmt = self.connection.prepare(
-            "SELECT repository, base_oid FROM task_contracts WHERE task_id=?1 AND contract_revision=(SELECT MAX(contract_revision) FROM task_contracts c WHERE c.task_id=?1)",
-        )?;
-        let rows = stmt
-            .query_map([task_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut pins = Vec::new();
-        for (repository, base) in rows {
-            let Some(tree) = git_tree(&repository, &base) else { return Ok(None); };
-            pins.push(RepositoryInput { repository, commit: base, tree });
-        }
-        Ok(Some(pins))
-    }
-
-    /// True when this task's latest contract overlaps a claim still held by
-    /// another attempt. The holder keeps the revision installed at its reservation.
-    pub(crate) fn retained_claim_overlap(&self, task_id: &str) -> Result<bool> {
-        let attempts = super::read_attempts(&self.connection)?;
-        overlap_with_retained(&self.connection, task_id, &attempts)
-    }
 }
 
 pub(crate) struct ResourceClaim {
@@ -696,6 +737,31 @@ pub(crate) struct ResourceClaim {
     pub resource: String,
     pub access: String,
     pub certainty: String,
+}
+
+/// Advisory candidate-selection cache. Reservation independently reloads the
+/// held claims under its current-head write transaction.
+pub(crate) struct RetainedClaimSet {
+    holders: Vec<(TaskId,Vec<ResourceClaim>)>,
+}
+impl SqliteStore {
+    pub(crate) fn admission_retained_claims(&self,budget:Option<&read_budget::ReadBudget>)->Result<RetainedClaimSet> {
+        let mut holders=Vec::new();let mut seen=std::collections::BTreeSet::new();
+        for attempt in super::read_retained_attempts_with_budget(&self.connection,budget)? {
+            if let Some(revision)=revision_at_reservation(&self.connection,attempt.id.as_str(),attempt.task.as_str())? {
+                if seen.insert((attempt.task.clone(),revision)) {
+                    let claims=claim_rows(&self.connection,attempt.task.as_str(),revision,budget)?;
+                    if !claims.is_empty(){holders.push((attempt.task,claims));}
+                }
+            }
+        }
+        Ok(RetainedClaimSet{holders})
+    }
+    pub(crate) fn admission_claim_overlap(&self,task:&str,held:&RetainedClaimSet,budget:Option<&read_budget::ReadBudget>)->Result<bool> {
+        let Some(revision)=latest_contract_revision(&self.connection,task)? else{return Ok(false);};
+        let candidate=claim_rows(&self.connection,task,revision,budget)?;
+        Ok(held.holders.iter().any(|(owner,claims)|owner.as_str()!=task&&candidate.iter().any(|claim|claims.iter().any(|other|claims_conflict(claim,other)))))
+    }
 }
 
 pub(crate) fn claims_conflict(left: &ResourceClaim, right: &ResourceClaim) -> bool {
@@ -747,16 +813,17 @@ fn glob_segment(segment: &str) -> bool {
     segment.contains('*') || segment.contains('?') || segment.contains('[')
 }
 
-fn claim_rows(db: &Connection, task_id: &str, revision: i64) -> Result<Vec<ResourceClaim>> {
+fn claim_rows(db: &Connection, task_id: &str, revision: i64,budget:Option<&read_budget::ReadBudget>) -> Result<Vec<ResourceClaim>> {
     let mut stmt = db.prepare(
-        "SELECT kind, resource, access, certainty FROM resource_claims WHERE task_id=?1 AND contract_revision=?2 ORDER BY ordinal",
+        "SELECT kind, resource, access, certainty FROM resource_claims WHERE task_id=?1 AND contract_revision=?2 ORDER BY ordinal LIMIT 73",
     )?;
-    let rows = stmt
-        .query_map(rusqlite::params![task_id, revision], |row| {
-            Ok(ResourceClaim { kind: row.get(0)?, resource: row.get(1)?, access: row.get(2)?, certainty: row.get(3)? })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
+    let mut rows=stmt.query(params![task_id,revision])?;let mut claims=Vec::new();
+    while let Some(row)=rows.next()? {
+        if claims.len()==72 {return Err(StoreError::Limit("task resource claim limit exceeded".into()));}
+        if let Some(budget)=budget {budget.row(row,&[])?;}
+        claims.push(ResourceClaim{kind:row.get(0)?,resource:row.get(1)?,access:row.get(2)?,certainty:row.get(3)?});
+    }
+    Ok(claims)
 }
 
 fn latest_contract_revision(db: &Connection, task_id: &str) -> Result<Option<i64>> {
@@ -784,7 +851,7 @@ fn revision_at_reservation(db: &Connection, attempt_id: &str, task_id: &str) -> 
     )?)
 }
 
-pub(super) fn overlap_with_retained(db: &Connection, task_id: &str, attempts: &[Attempt]) -> Result<bool> {
+pub(super) fn overlap_with_retained_with_budget(db:&Connection,task_id:&str,attempts:&[Attempt],budget:Option<&read_budget::ReadBudget>)->Result<bool> {
     let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version < 35 {
         return Ok(false);
@@ -792,7 +859,7 @@ pub(super) fn overlap_with_retained(db: &Connection, task_id: &str, attempts: &[
     let Some(revision) = latest_contract_revision(db, task_id)? else {
         return Ok(false);
     };
-    let candidate = claim_rows(db, task_id, revision)?;
+    let candidate = claim_rows(db, task_id, revision,budget)?;
     if candidate.is_empty() {
         return Ok(false);
     }
@@ -803,7 +870,7 @@ pub(super) fn overlap_with_retained(db: &Connection, task_id: &str, attempts: &[
         let Some(held_revision) = revision_at_reservation(db, attempt.id.as_str(), attempt.task.as_str())? else {
             continue;
         };
-        let held = claim_rows(db, attempt.task.as_str(), held_revision)?;
+        let held = claim_rows(db, attempt.task.as_str(), held_revision,budget)?;
         if candidate.iter().any(|claim| held.iter().any(|other| claims_conflict(claim, other))) {
             return Ok(true);
         }
@@ -811,10 +878,11 @@ pub(super) fn overlap_with_retained(db: &Connection, task_id: &str, attempts: &[
     Ok(false)
 }
 
-fn git_tree(repository: &str, commit: &str) -> Option<String> {
+fn git_tree(repository: &str, commit: &str, control: Option<&super::controlled::ReadControl>) -> Option<String> {
     let spec = format!("{commit}^{{tree}}");
     let mut command = crate::runner::Cmd::repository_git_command(std::path::Path::new(repository), &["rev-parse", "--verify", &spec]).ok()?;
-    command.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+    command.deadline = Some(control.map_or_else(||std::time::Instant::now()+std::time::Duration::from_secs(5),|c|c.deadline()));
+    if let Some(control)=control {control.check().ok()?;command.cancellation=Some(control.cancellation());}
     let output = crate::runner::RealRunner.run(&command).ok()?;
     if !output.success() {
         return None;
@@ -859,7 +927,7 @@ impl SqliteStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     fn user_version(db: &Connection) -> u32 {
@@ -933,7 +1001,7 @@ mod tests {
             .cloned()
             .collect()
     }
-    fn store_verified_receipt(
+    pub(in crate::store) fn store_verified_receipt(
         db: &SqliteStore,
         task_id: &str,
         attempt: &str,
@@ -952,6 +1020,14 @@ mod tests {
             )
             .unwrap();
         if !have_contract {
+            let raw = serde_json::to_vec(&serde_json::json!({
+                "version":1,"project_store":"/tmp/project","expected_head":0,"task_id":task_id,"contract_revision":contract_revision,
+                "deliverable":"dependency fixture","non_goals":"no external work","acceptance_policies":[{"id":"policy","text":"{}"}],
+                "repository":"/tmp/repo","base_oid":oid,"object_format":"sha1","dependencies":[],"capability_flags":[],
+                "profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_only",
+                "authority":{"id":"owner-approval-policy","revision":1,"digest":digest}
+            })).unwrap();
+            let contract_digest = format!("{:x}", Sha256::digest(&raw));
             let installed: i64 = db
                 .connection
                 .query_row("SELECT COALESCE(MAX(sequence),1) FROM events", [], |row| {
@@ -961,18 +1037,23 @@ mod tests {
             db.connection
                 .execute(
                     "INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq) VALUES(?1,?2,NULL,'/tmp/project',0,'/tmp/repo',?3,'sha1',NULL,'verify_only',?4,?5,?6)",
-                    params![task_id, contract_revision, oid, vec![b'x'], digest.clone(), installed],
+                    params![task_id, contract_revision, oid, raw, contract_digest, installed],
                 )
                 .unwrap();
         }
-        // The run's other parents are not what this writer reads. Foreign keys
-        // stay off only for the receipt insert.
+        let contract_digest: String = db.connection.query_row("SELECT raw_digest FROM task_contracts WHERE task_id=?1 AND contract_revision=?2", params![task_id,contract_revision], |row| row.get(0)).unwrap();
+        let submission = format!("{:x}", Sha256::digest(format!("submission:{result_id}").as_bytes()));
+        let policy_digest = format!("{:x}", Sha256::digest(b"{}"));
+        // These unit receipts model verifier output, but retain exact contract
+        // and submission parents so applicability checks can follow lineage.
+        // Other integration/ownership parents remain synthetic in this fixture.
         db.connection
             .execute_batch("PRAGMA foreign_keys=OFF;")
             .unwrap();
+        db.connection.execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,memory_snapshot_id,artifact_manifest,claimed_checks,created_unix_ms) VALUES(?1,'/tmp/project',?1,?2,'{}',?3,?4,?5,?6,'/tmp/repo',?7,?7,'sha1',NULL,'[]','[]',?8)", params![submission,digest,task_id,contract_revision,contract_digest,attempt,oid,created_unix_ms]).unwrap();
         db.connection
             .execute(
-                "INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,'/tmp/project',?1,?2,?2,?3,?6,?2,?4,'policy',?2,?5,?5,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?2,0,0,?7)",
+                "INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,'/tmp/project',?1,?2,?9,?3,?6,?8,?4,'policy',?10,?5,?5,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?2,0,0,?7)",
                 params![
                     result_id,
                     digest,
@@ -980,16 +1061,20 @@ mod tests {
                     attempt,
                     oid,
                     contract_revision,
-                    created_unix_ms
+                    created_unix_ms,
+                    contract_digest,
+                    submission,
+                    policy_digest
                 ],
             )
             .unwrap();
         db.connection
             .execute(
-                "INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?1,?2,?3,?3,'sha1',?2,?2,'linux-unshare-user-pid-mount-v1',0,?4)",
-                params![result_id, digest, oid, created_unix_ms],
+                "INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?1,?5,?3,?3,'sha1',?6,?2,'linux-unshare-user-pid-mount-v1',0,?4)",
+                params![result_id, digest, oid, created_unix_ms, submission, policy_digest],
             )
             .unwrap();
+        db.connection.execute("INSERT INTO verification_contract_checks VALUES(?1,2)",[result_id]).unwrap();
         db.connection
             .execute_batch("PRAGMA foreign_keys=ON;")
             .unwrap();
@@ -1020,7 +1105,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state.db");
         let mut db = SqliteStore::create(&path).unwrap();
-        assert_eq!(user_version(&db.connection), 41);
+        assert_eq!(user_version(&db.connection), crate::store::SCHEMA);
         db.commit(Commit {
             expected_head: 0,
             mutations: vec![
@@ -1044,26 +1129,7 @@ mod tests {
         assert!(preserved.iter().any(|row| row.2 == "landed_commit"));
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
-        raw.execute_batch(
-            "DROP INDEX IF EXISTS attempts_retained_by_id; DROP TABLE IF EXISTS active_work_index; DROP TABLE IF EXISTS active_work_meta; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_update; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_delete; DROP TRIGGER IF EXISTS barrier_members_no_update; DROP TRIGGER IF EXISTS barrier_members_no_delete; DROP TRIGGER IF EXISTS barrier_revisions_no_membership_update; DROP TABLE IF EXISTS barrier_stale_briefs; DROP TABLE IF EXISTS barrier_members; DROP TABLE IF EXISTS barrier_revisions; DROP TRIGGER IF EXISTS memory_change_receipts_no_update; DROP TRIGGER IF EXISTS memory_change_receipts_no_delete; DROP TRIGGER IF EXISTS update_package_members_no_update; DROP TRIGGER IF EXISTS update_package_members_no_delete; DROP TRIGGER IF EXISTS update_packages_no_update; DROP TRIGGER IF EXISTS update_packages_no_delete; DROP TABLE IF EXISTS memory_change_receipts; DROP TABLE IF EXISTS update_package_members; ALTER TABLE consumer_bindings DROP COLUMN applied_cursor; DROP TABLE IF EXISTS update_packages; DROP TRIGGER IF EXISTS memory_read_set_on_record; DROP TRIGGER IF EXISTS memory_read_set_on_reclassify; DROP TRIGGER IF EXISTS memory_read_set_on_revision; DROP TRIGGER IF EXISTS memory_read_set_on_validity; DROP TRIGGER IF EXISTS memory_read_set_on_head; DROP TABLE IF EXISTS memory_scope_catalog; DROP TABLE IF EXISTS memory_required_generation; DROP TABLE IF EXISTS consumer_binding_undeliverable; DROP TABLE IF EXISTS consumer_binding_obligations; DROP TABLE IF EXISTS consumer_bindings; DROP TABLE IF EXISTS wait_replay_events; DROP TABLE IF EXISTS replan_requests; DROP TABLE IF EXISTS replan_budget_resets; DROP TABLE IF EXISTS attempt_infrastructure_retries; DROP TABLE IF EXISTS wait_conditions; DROP TABLE IF EXISTS resource_claims; DROP TABLE IF EXISTS delegation_stop_obligations; DROP TABLE IF EXISTS delegation_revocations; DROP TABLE IF EXISTS delegation_grants; DROP TABLE IF EXISTS capability_evidence; DROP TABLE IF EXISTS contract_named_resources; DROP TABLE IF EXISTS contract_scope_paths; DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; DROP TABLE IF EXISTS dependency_satisfactions; DROP TABLE IF EXISTS factory_admission_policies;
-             CREATE TABLE task_dependencies_v10 (
-                task_id TEXT NOT NULL, predecessor_id TEXT NOT NULL,
-                requirement TEXT NOT NULL CHECK(requirement IN ('verified_result','integration_candidate','landed_commit')),
-                PRIMARY KEY(task_id,predecessor_id), CHECK(task_id<>predecessor_id)
-             );
-             INSERT INTO task_dependencies_v10 SELECT task_id, predecessor_id, requirement FROM task_dependencies;
-             DROP TABLE task_dependencies;
-             ALTER TABLE task_dependencies_v10 RENAME TO task_dependencies;
-             ALTER TABLE project_control DROP COLUMN factory_admission;
-             DROP TABLE IF EXISTS feedback_claims; DROP TABLE IF EXISTS feedback_items;
-             DROP TABLE IF EXISTS integrated_commits; DROP TABLE IF EXISTS integration_candidates;
-             DROP TABLE IF EXISTS integration_operations; DROP TABLE IF EXISTS integration_target_leases;
-             DROP TABLE IF EXISTS integration_targets; DROP TABLE IF EXISTS verified_results;
-             DROP TABLE IF EXISTS verification_runs; DROP TABLE IF EXISTS result_objects;
-             DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies;
-             DROP TABLE IF EXISTS task_contracts;
-             UPDATE store_meta SET schema_version=25; PRAGMA user_version=25;",
-        )
+        crate::store::test_schema::historical(&raw, 25)
         .unwrap();
         drop(raw);
         let mut db = SqliteStore::open(&path).unwrap();
@@ -1084,7 +1150,7 @@ mod tests {
         ));
         assert_eq!(user_version(&db.connection), 25);
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 41);
+        assert_eq!(user_version(&db.connection), crate::store::SCHEMA);
         assert_eq!(dependencies(&db.connection), preserved);
         assert!(
             preserved
@@ -1129,66 +1195,7 @@ mod tests {
         check_schema(&db.connection).unwrap();
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 41);
-    }
-
-    #[test]
-    fn migration_defaults_factory_admission_off_and_release_code_does_not_write_it() {
-        let temp = tempfile::tempdir().unwrap();
-        let db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
-        let admission: String = db
-            .connection
-            .query_row(
-                "SELECT factory_admission FROM project_control WHERE singleton=1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(admission, "off");
-        assert!(!admission_enabled(&db.connection).unwrap());
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        fn walk(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
-            for entry in std::fs::read_dir(dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    walk(&path, files);
-                } else if path.extension().is_some_and(|ext| ext == "rs") {
-                    files.push(path);
-                }
-            }
-        }
-        walk(&root, &mut files);
-        for path in &files {
-            let text = std::fs::read_to_string(path).unwrap();
-            if !text.contains("SET factory_admission") {
-                continue;
-            }
-            let name = path.file_name().and_then(|name| name.to_str()).unwrap();
-            match name {
-                // The test setter stays behind cfg(test) and is not a CLI path.
-                "satisfaction.rs" => {
-                    let test_cfg = text.find("#[cfg(test)]").unwrap();
-                    assert!(text.find("SET factory_admission").unwrap() > test_cfg);
-                    assert!(!text[..test_cfg].contains("SET factory_admission"));
-                    assert!(!text[..test_cfg].contains("install_admission_policy"));
-                    assert!(text.contains("pub(super) fn testing_set_factory_admission"));
-                    assert!(!text.lines().any(|line| line.trim_start().starts_with("pub fn testing_set_factory_admission")));
-                }
-                "admission_policy.rs" => {
-                    let update_at = text.find("SET factory_admission").unwrap();
-                    if let Some(test_cfg) = text.find("#[cfg(test)]") {
-                        assert!(update_at < test_cfg);
-                    }
-                    assert!(text.contains("fn install_admission_policy"));
-                    assert!(!text.contains("testing_set_factory_admission"));
-                }
-                other => panic!("unexpected factory_admission writer in {other}"),
-            }
-        }
-        let cli = std::fs::read_to_string(root.join("cli.rs")).unwrap();
-        assert!(!cli.contains("testing_set_factory_admission"));
-        assert!(!cli.contains("SET factory_admission"));
+        assert_eq!(user_version(&reopened.connection), crate::store::SCHEMA);
     }
 
     #[test]
@@ -1549,18 +1556,22 @@ mod tests {
             .execute_batch("PRAGMA foreign_keys=OFF;")
             .unwrap();
         let tx = db.connection.transaction().unwrap();
-        let digest = "d".repeat(64);
+        let digest = format!("{:x}", Sha256::digest(b"{}"));
         let oid = "a".repeat(40);
+        let contract_digest: String = tx.query_row("SELECT raw_digest FROM task_contracts WHERE task_id='pred' AND contract_revision=1", [], |row| row.get(0)).unwrap();
+        let submission = format!("{:x}", Sha256::digest(format!("submission:{older}").as_bytes()));
+        tx.execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,memory_snapshot_id,artifact_manifest,claimed_checks,created_unix_ms) VALUES(?1,'/tmp/project',?1,?2,'{}','pred',1,?3,'attempt-1','/tmp/repo',?4,?4,'sha1',NULL,'[]','[]',2)", params![submission,digest,contract_digest,oid]).unwrap();
         tx.execute(
-            "INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,'/tmp/project',?1,?2,?2,'pred',1,?2,'attempt-1','policy',?2,?3,?3,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?2,0,0,2)",
-            params![older, digest, oid],
+            "INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,'/tmp/project',?1,?2,?5,'pred',1,?4,'attempt-1','policy',?2,?3,?3,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?2,0,0,2)",
+            params![older, digest, oid, contract_digest, submission],
         )
         .unwrap();
         tx.execute(
-            "INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?1,?2,?3,?3,'sha1',?2,?2,'linux-unshare-user-pid-mount-v1',0,2)",
-            params![older, digest, oid],
+            "INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?1,?4,?3,?3,'sha1',?2,?2,'linux-unshare-user-pid-mount-v1',0,2)",
+            params![older, digest, oid, submission],
         )
         .unwrap();
+        tx.execute("INSERT INTO verification_contract_checks VALUES(?1,2)",[&older]).unwrap();
         record_verified_result(&tx, &older).unwrap();
         tx.commit().unwrap();
         db.connection

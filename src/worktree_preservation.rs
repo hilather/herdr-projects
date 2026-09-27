@@ -110,11 +110,14 @@ fn capture(project:&Path,attempt:&AttemptId,expected_head:u64,deadline:Instant,c
 // Trusted termination calls this only after proving native quiescence, before
 // changing canonical disposition. Public capture still requires terminal state.
 pub(crate) fn capture_held(project:&Path,state:&crate::domain::Snapshot,record:&AttemptInputRecord,guard:&crate::execution_guard::RootGuard,control:&Control,include_git:bool)->Result<Vec<Snapshot>> {
+    capture_events_held(project,&state.events,record,guard,control,include_git)
+}
+pub(crate) fn capture_events_held(project:&Path,events:&[Event],record:&AttemptInputRecord,guard:&crate::execution_guard::RootGuard,control:&Control,include_git:bool)->Result<Vec<Snapshot>> {
     control.check()?;
     let deadline=control.deadline;
-    let proof=crate::worktree_preparation::pin_started_held(project,state,record,deadline,control.cancellation.clone())?;
+    let proof=crate::worktree_preparation::pin_started_events_held(project,events,record,deadline,control.cancellation.clone())?;
     if record.inputs.repositories.is_empty() {return Ok(vec![]);}
-    let event=state.events.iter().find(|e|e.kind=="runtime.worktrees_ready" && e.entity==record.operation.as_str()).context("ready worktree evidence missing")?;
+    let event=events.iter().find(|e|e.kind=="runtime.worktrees_ready" && e.entity==record.operation.as_str()).context("ready worktree evidence missing")?;
     let receipts:Vec<WorktreeReceipt>=serde_json::from_value(event.payload.clone())?;
     capture_receipts(project,record,proof,receipts,guard,control,include_git)
 }
@@ -225,10 +228,10 @@ mod tests {
 }
 
 
-pub(crate) fn capture_preparation_held(project:&Path,state:&crate::domain::Snapshot,record:&AttemptInputRecord,intent:&WorktreeCreation,guard:&crate::execution_guard::RootGuard,control:&Control)->Result<(Vec<PreparationSnapshotReference>,AttemptOutputReference)> {
+pub(crate) fn capture_preparation_held(project:&Path,events:&[Event],record:&AttemptInputRecord,intent:&WorktreeCreation,guard:&crate::execution_guard::RootGuard,control:&Control)->Result<(Vec<PreparationSnapshotReference>,AttemptOutputReference)> {
     control.check()?;
     let git=crate::worktree_preparation::Git{deadline:control.deadline,cancellation:control.cancellation.clone(),locks:guard.inherit()?};
-    let(proof,receipts,missing)=crate::worktree_preparation::pin_preparation_held(&git,state,intent)?;
+    let(proof,receipts,missing)=crate::worktree_preparation::pin_preparation_held(&git,events,intent)?;
     let captured=capture_receipts(project,record,proof,receipts,guard,control,true)?;
     let output=capture_outputs_held(project,record,control)?;
     for plan in &missing {crate::worktree_preparation::verify_uncreated(&git,plan)?;}

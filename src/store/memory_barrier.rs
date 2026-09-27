@@ -2,7 +2,7 @@
 use super::*;
 use crate::domain::{MemoryBlocker, MemoryReadiness};
 
-fn consumed_revisions(version: u32) -> String {
+pub(super) fn consumed_revisions(version: u32) -> String {
     // A seen package or change receipt is not consumed knowledge.
     let applied_package = if version >= 39 {
         " UNION SELECT d.record_id,d.revision FROM memory_change_receipts c JOIN memory_delivery_intents d ON d.id=c.change_id JOIN consumer_bindings b ON b.binding_id=c.binding_id WHERE c.disposition='applied' AND d.task_id=?1 AND b.attempt_id=?2 AND b.task_id=?1 AND b.snapshot_id=(SELECT snapshot FROM attempts WHERE id=?2 AND task_id=?1)"
@@ -21,12 +21,16 @@ fn consumed_revisions(version: u32) -> String {
 }
 
 pub(super) fn report(db: &Connection, task: &str, now: i64) -> Result<MemoryReadiness> {
+    report_with_budget(db,task,now,None)
+}
+
+pub(super) fn report_with_budget(db:&Connection,task:&str,now:i64,budget:Option<&read_budget::ReadBudget>)->Result<MemoryReadiness> {
+    if let Some(budget)=budget {budget.check()?;}
     check_schema(db)?;
     let version: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    let attempt: Option<String> = db.query_row(
+    let attempt: Option<String> = read_budget::one(db,
         "SELECT active_attempt FROM tasks WHERE id=?1",
-        [task],
-        |r| r.get(0),
+        [task], budget, &[], |r| r.get(0),
     )?;
     let mut report = MemoryReadiness {
         task_id: task.into(),
@@ -55,6 +59,7 @@ pub(super) fn report(db: &Connection, task: &str, now: i64) -> Result<MemoryRead
                     "memory completion blockers exceed 10000".into(),
                 ));
             }
+            if let Some(budget)=budget {budget.row(row,&[])?;}
             report.blockers.push(MemoryBlocker {
                 kind: row.get(0)?,
                 id: row.get(1)?,
@@ -67,6 +72,12 @@ pub(super) fn report(db: &Connection, task: &str, now: i64) -> Result<MemoryRead
         &[&task, &attempt],
     )?;
     // Acknowledgment alone never resolves a contradiction or revoked dependency.
+    if version >= 43 {
+        collect(
+            "SELECT 'required_barrier_revoked',r.barrier_id FROM attempt_barrier_invalidations i JOIN attempt_required_releases r ON r.attempt_id=i.attempt_id WHERE i.attempt_id=?1",
+            &[&attempt],
+        )?;
+    }
     collect(
         "SELECT 'unresolved_invalidation',id FROM memory_invalidations WHERE (task_id=?1 OR task_id IS NULL) AND resolved_seq IS NULL AND severity!='informational' ORDER BY id LIMIT 10001",
         &[&task],
@@ -129,7 +140,11 @@ pub(super) fn report(db: &Connection, task: &str, now: i64) -> Result<MemoryRead
 }
 
 pub(super) fn enforce(db: &Connection, task: &str, now: i64) -> Result<()> {
-    let report = report(db, task, now)?;
+    enforce_with_budget(db,task,now,None)
+}
+
+pub(super) fn enforce_with_budget(db:&Connection,task:&str,now:i64,budget:Option<&read_budget::ReadBudget>)->Result<()> {
+    let report = report_with_budget(db, task, now,budget)?;
     if let Some(blocker) = report.blockers.first() {
         return Err(StoreError::Invalid(format!(
             "memory completion blocked: {}:{} ({} blockers); inspect memory readiness",
@@ -143,22 +158,29 @@ pub(super) fn enforce(db: &Connection, task: &str, now: i64) -> Result<()> {
 
 impl SqliteStore {
     pub(crate) fn memory_consumed_objects(&mut self, task: &str) -> Result<Vec<ObjectId>> {
+        self.memory_consumed_objects_with_budget(task,None)
+    }
+    pub(crate) fn memory_consumed_objects_with_budget(&mut self, task: &str, budget: Option<&read_budget::ReadBudget>) -> Result<Vec<ObjectId>> {
+        if let Some(budget)=budget {budget.check()?;}
         let tx = self.connection.transaction()?;
         check_schema(&tx)?;
         let version: u32 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version < 24 {
             return Err(StoreError::UnsupportedSchema(version));
         }
-        let attempt: Option<String> = tx.query_row(
+        let attempt: Option<String> = read_budget::one(&tx,
             "SELECT active_attempt FROM tasks WHERE id=?1",
-            [task],
+            [task], budget, &[],
             |r| r.get(0),
         )?;
         let consumed = consumed_revisions(version);
         let mut stmt=tx.prepare(&format!("{consumed} SELECT DISTINCT r.body_hash FROM used u JOIN memory_revisions r ON r.record_id=u.record_id AND r.revision=u.revision ORDER BY r.body_hash LIMIT 10001"))?;
-        let rows = stmt
-            .query_map(params![task, attempt], |r| r.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut query=stmt.query(params![task, attempt])?;
+        let mut rows=Vec::new();
+        while let Some(row)=query.next()? {
+            if let Some(budget)=budget {budget.row(row,&[])?;}
+            rows.push(row.get::<_,String>(0)?);
+        }
         if rows.len() > 10000 {
             return Err(StoreError::Limit(
                 "consumed memory objects exceed 10000".into(),

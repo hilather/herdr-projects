@@ -60,7 +60,11 @@ fn collect_with(input:&Input,control:&Control,observe:impl FnOnce(&Input,&Contro
     input.current(control)?;
     let guard=ProjectGuard::acquire(&input.project)?;
     input.current(control)?;
-    ensure!(runtime::snapshot_controlled(&input.project,&sql_control(control))?.schema_version>=9,"upgrade-store is required before canonical controller polling");
+    // Only the schema header is needed here. Loading historical task bodies can
+    // block unrelated observation and planning work before either gets a turn.
+    let schema=migration::open_active_scoped(&input.project,sql_control(control))?
+        .read_targeted_hot_path(jiff::Timestamp::now().as_millisecond(),crate::canonical_controller::launch_dispatch_enabled())?;
+    ensure!(schema>=9,"upgrade-store is required before canonical controller polling");
     control.check()?;
     let mut errors=Vec::new();
     // Planning precedes probes so an offline endpoint cannot monopolize service.
@@ -75,7 +79,7 @@ fn collect_with(input:&Input,control:&Control,observe:impl FnOnce(&Input,&Contro
     let reachable=match observed {Ok(value)=>Some(value),Err(error)=>{errors.push(format!("canonical observation: {error:#}"));None}};
     let head=(||->Result<(u64,bool)>{
         input.current(control)?;guard.check_project(&input.project)?;
-        let db=migration::open_active_controlled(&input.project,sql_control(control))?;control.check()?;
+        let db=migration::open_active_scoped(&input.project,sql_control(control))?;control.check()?;
         let state=db.project_control()?.context("canonical control missing")?;
         let active=state.state==herdr_projects::domain::ProjectState::Active&&!state.reconciliation_required;
         let mut budget=herdr_projects::store::identity_inventory::Budget::new(2*1024*1024,0,control.deadline.min(Instant::now()+Duration::from_millis(100)),control.cancellation.clone())?;

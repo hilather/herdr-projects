@@ -12,7 +12,7 @@ fn schema(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn update(db: &Connection, delivery: &str, attempt: &str) -> Result<MemoryUpdate> {
+pub(super) fn update(db: &Connection, delivery: &str, attempt: &str) -> Result<MemoryUpdate> {
     schema(db)?;
     // Only the current, live attempt that consumed this exact starting snapshot
     // can read or acknowledge the update. Never infer identity from terminal state.

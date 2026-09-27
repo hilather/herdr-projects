@@ -137,7 +137,15 @@ pub(crate) mod tests {
     #[test]
     fn adoption_counts_live_worker_and_resume_requires_fresh_post_adoption_evidence() {
         let(world,path,_listener)=fixture();let head=runtime::snapshot(&path).unwrap().head;let change=adopt(&world.ctx(),&path,"thread:t-0001",2,head).unwrap();assert_eq!(change.ownership.origin,"adopted");assert!(change.ownership.session.is_some());assert!(change.ownership.attempt.is_some());let after=runtime::snapshot(&path).unwrap();assert_eq!(after.attempts.len(),1);assert!(after.attempts[0].retains_capacity());assert_eq!(after.tasks.iter().find(|t|t.id==after.attempts[0].task).unwrap().active_attempt.as_ref(),Some(&after.attempts[0].id));
-        let config=world.ctx().config_dir.join("config.toml");assert!(runtime::set_state(&path,after.head,after.control.unwrap().revision,ProjectState::Active,&config).is_err());crate::reconcile_live::run(&world.ctx(),&path,true).unwrap();let before=runtime::snapshot(&path).unwrap();assert!(runtime::admission(&path,&config).unwrap().blockers.is_empty());let active=runtime::set_state(&path,before.head,before.control.unwrap().revision,ProjectState::Active,&config).unwrap();assert_eq!(active.control.state,ProjectState::Active);
+        let config=world.ctx().config_dir.join("config.toml");assert!(runtime::set_state(&path,after.head,after.control.unwrap().revision,ProjectState::Active,&config).is_err());
+        let mut db=migration::open_active(&path).unwrap();
+        let wait=db.register_wait_with_trigger(after.tasks.iter().find(|task|task.active_attempt.is_some()).unwrap().id.as_str(),None,"adapter_recovery",None,
+            Some(&herdr_projects::domain::WaitTrigger::OwnedRuntimeRecovered{binding_id:"thread:t-0001".into(),binding_revision:2,ownership_revision:change.ownership.revision})).unwrap();
+        assert!(!db.replay_wait(&wait.wait_id).unwrap().wake_requested);drop(db);
+        crate::reconcile_live::run(&world.ctx(),&path,true).unwrap();
+        assert_eq!(herdr_projects::store::service_project_waits(&path).unwrap().notified,1);
+        assert_eq!(herdr_projects::store::service_project_waits(&path).unwrap().notified,0);
+        let before=runtime::snapshot(&path).unwrap();assert!(runtime::admission(&path,&config).unwrap().blockers.is_empty());let active=runtime::set_state(&path,before.head,before.control.unwrap().revision,ProjectState::Active,&config).unwrap();assert_eq!(active.control.state,ProjectState::Active);
         let head=runtime::snapshot(&path).unwrap().head;let again=adopt(&world.ctx(),&path,"thread:t-0001",2,head).unwrap();assert_eq!(again.ownership,change.ownership);assert_eq!(runtime::snapshot(&path).unwrap().attempts.len(),1);assert_eq!(world.runner.count("agent prompt"),0);
     }
     #[test]
@@ -163,7 +171,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn ownership_refuses_older_schema_neighbor_and_owned_coordinator_rebind() {
-        let(world,path,_listener)=fixture();let neighbor=project::create(&world.root,"old","",vec![]).unwrap();neighbor.set_status(project::Status::Paused).unwrap();let plan=migration::inspect(&neighbor.dir()).unwrap();migration::apply(&neighbor.dir(),&plan,true).unwrap();let raw=rusqlite::Connection::open(neighbor.state_dir().join("state.db")).unwrap();raw.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; DROP TABLE runtime_ownership; DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; UPDATE store_meta SET schema_version=4; PRAGMA user_version=4;").unwrap();let before=runtime::snapshot(&path).unwrap();assert!(adopt(&world.ctx(),&path,"thread:t-0001",2,before.head).is_err());assert_eq!(runtime::snapshot(&path).unwrap(),before);migration::upgrade_active(&neighbor.dir()).unwrap();
+        let(world,path,_listener)=fixture();let neighbor=project::create(&world.root,"old","",vec![]).unwrap();neighbor.set_status(project::Status::Paused).unwrap();let plan=migration::inspect(&neighbor.dir()).unwrap();migration::apply(&neighbor.dir(),&plan,true).unwrap();let raw=rusqlite::Connection::open(neighbor.state_dir().join("state.db")).unwrap();test_schema::historical(&raw, 4).unwrap();let before=runtime::snapshot(&path).unwrap();assert!(adopt(&world.ctx(),&path,"thread:t-0001",2,before.head).is_err());assert_eq!(runtime::snapshot(&path).unwrap(),before);migration::upgrade_active(&neighbor.dir()).unwrap();
         let route=RuntimeRoute::from_identity(&before.runtime_bindings[0].identity);runtime::rebind(&path,"thread:t-0001",2,before.head,&RuntimeRoute::default()).unwrap();let head=runtime::snapshot(&path).unwrap().head;runtime::create_binding(&path,None,None,head,&route).unwrap();let head=runtime::snapshot(&path).unwrap().head;adopt(&world.ctx(),&path,"coordinator",1,head).unwrap();let before=runtime::snapshot(&path).unwrap();assert!(runtime::rebind(&path,"coordinator",1,before.head,&RuntimeRoute::default()).is_err());assert_eq!(runtime::snapshot(&path).unwrap(),before);
     }
     #[test]
@@ -219,3 +227,7 @@ pub(crate) mod tests {
         let(world,path,_listener)=fixture();let binding=runtime::snapshot(&path).unwrap().runtime_bindings.remove(0);let herdr=crate::herdr::Herdr::new(world.env.herdr_bin(),&binding.identity.socket,&world.runner);assert!(crate::adopt::adoptable_agent(&world.ctx(),&herdr,&binding.identity.socket,"p").is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "store/test_schema.rs"]
+mod test_schema;

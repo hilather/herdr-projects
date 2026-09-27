@@ -15,15 +15,32 @@ active bindings 15 s, and a targeted decision 250 ms p95.
 
 ### Samples
 
-Observation-age and decision-latency samples were not collected in this docs
-change. No existing harness prints those samples, so this file does not attach
-a number and does not invent one.
+The corrected integrated fixture prints `scale_admission_sample` JSON records
+with raw wall-clock admission duration and connection-local SQLite row/VM-step
+counts. Each of the eight combinations uses 32/64 workers, 256/1,024 additional
+terminated attempts, 10,000 retired bindings, and 1,000/100,000 historical events.
+The current schema requires terminated attempt history to retire each binding,
+so another 10,000 supporting terminated attempts are present and reported
+separately. They do not replace the additional attempt-history dimension.
 
-`tests/factory_harness.rs` counts rows on a seeded logical clock. It does not
-record wall-clock observation age or decision latency. The targeted reader
-tests in `src/store/targeted.rs` compare decisions, including the harness
-history fixture, and do not print a timing sample. Cargo's own test duration
-is not a sample of either quantity.
+Samples exercise unsigned candidate selection after cancellation frees one slot
+(31/63 attempts still retain capacity; `workers` labels the initial active set).
+Every sample opens a new controlled connection. They do not measure signed
+reservation, launch, observation freshness, memory traffic, or slow providers.
+Five samples per combination are a smoke measurement, not sufficient evidence
+for tail-latency certification. Cargo's whole-test duration is not a decision
+sample. Run the disposable fixture with:
+
+```sh
+cargo test --locked --features state-store --test factory_harness scale_gate_for_32_and_64_workers -- --nocapture --test-threads=1
+```
+
+The correction run's [raw samples](../reviews/factory-corrections-evidence/scale-admission-inventory.jsonl),
+[hardware/source manifest](../reviews/factory-corrections-evidence/scale-admission-manifest.json)
+and [full harness log](../reviews/factory-corrections-evidence/integrated-harness.log)
+are retained. Its ten harness tests passed. Admission SQL work stayed unchanged
+across the tested history sizes at fixed worker count. The host was not frozen
+as a certification reference, and this is not a baseline comparison.
 
 ### Tick delay is not this bar
 
@@ -40,9 +57,12 @@ lowered bar. It is not a pass of the provisional targets. Latency targets were
 not claimed. This appendix does not add a numeric bar.
 
 `tests/factory_harness.rs` runs 32 and 64 logical workers against event
-histories of about 1,000 and about 100,000. It asserts no false satisfaction,
+histories of 1,000 and 100,000, with the additional attempt and retired-binding
+history described above. It asserts no false satisfaction,
 no slot released early, and complete coverage. The hot path constant must be
 `HotPathRead::Targeted`. Shadow / `HotPathRead::Snapshot` fails the gate. This
 is not a live 40-worker certificate. `max_active_workers` defaults are
-unchanged. `factory_admission` stays `off` in production code. The harness does
-not turn that column on. No live provider. No pull-request poll.
+unchanged. `factory_admission` stays `off` in production code. The disposable
+fixture temporarily enables admission after creating a synthetic active control
+row, then checks that missing contracts/grants prevent any new reservation.
+It restores the flag to `off`. No live provider. No pull-request poll.

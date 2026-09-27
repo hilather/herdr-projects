@@ -51,17 +51,10 @@ fn finish_start(
     let guard = crate::execution_guard::RootGuard::exclusive(
         project.parent().context("project root missing")?,
     )?;
-    let mut db = crate::migration::open_active(&project)?;
-    let state = db.read_snapshot(None)?;
-    let delivery = state
-        .deliveries
-        .iter()
-        .find(|d| &d.operation == operation)
-        .context("launch delivery missing")?;
-    ensure!(
-        delivery.revision == expected_revision,
-        "launch delivery changed"
-    );
+    let control = crate::store::controlled::ReadControl::new(deadline, cancellation.clone());
+    let mut db = crate::migration::open_active_scoped(&project, control)?;
+    let state = db.launch_start_selection(operation, expected_revision)?;
+    let delivery = &state.delivery;
     if delivery.state == crate::operations::DeliveryState::Confirmed {
         let event = state
             .events
@@ -88,14 +81,10 @@ fn finish_start(
             ),
         "launch has no recoverable claim"
     );
-    let record = state
-        .attempt_inputs
-        .iter()
-        .find(|r| &r.operation == operation)
-        .context("launch inputs missing")?;
-    let worktrees = crate::worktree_preparation::pin_started_held(
+    let record = &state.record;
+    let worktrees = crate::worktree_preparation::pin_started_events_held(
         &project,
-        &state,
+        &state.events,
         record,
         deadline,
         cancellation.clone(),
@@ -207,7 +196,7 @@ fn finish_start(
             deadline,
             cancellation.clone(),
         )?;
-        db.validate_claim(&claim, now())?;
+        db.validate_launch_claim(&claim, now())?;
         let rename_native = Native {
             deadline: deadline.min(
                 Instant::now()
@@ -295,7 +284,7 @@ fn finish_start(
     check(deadline, &cancellation)?;
     worktrees.check()?;
     receipt.observed_unix_ms = now();
-    let head = db.read_snapshot(None)?.head;
+    let head = db.current_head()?;
     db.observe_launch_started(
         &PreparedLaunchStarted {
             receipt: receipt.clone(),
@@ -317,10 +306,13 @@ pub fn reconcile_launch(
     cancellation: Cancellation,
 ) -> Result<bool> {
     check(deadline, &cancellation)?;
-    let state = crate::runtime::snapshot(project)?;
-    if state.deliveries.iter().any(|d| {
-        &d.operation == operation && d.state == crate::operations::DeliveryState::Confirmed
-    }) {
+    let select = || -> Result<_> {
+        let control = crate::store::controlled::ReadControl::new(deadline, cancellation.clone());
+        let mut db = crate::migration::open_active_scoped(project, control)?;
+        Ok(db.launch_advancement_selection(operation, expected_revision)?)
+    };
+    let state = select()?;
+    if state.delivery.state == crate::operations::DeliveryState::Confirmed {
         reconcile_start(
             project,
             operation,
@@ -341,12 +333,8 @@ pub fn reconcile_launch(
         return Ok(false);
     }
     check(deadline, &cancellation)?;
-    let state = crate::runtime::snapshot(project)?;
-    if state
-        .events
-        .iter()
-        .any(|e| e.kind == "runtime.launch_release" && e.entity == operation.as_str())
-    {
+    let state = select()?;
+    if state.kinds.contains("runtime.launch_release") {
         reconcile_start(
             project,
             operation,

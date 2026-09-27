@@ -524,9 +524,12 @@ pub fn render_knowledge_snapshot(project: &Path, id: &str) -> Result<serde_json:
 /// Caller supplies the canonical store and holds execution ownership. Controlled
 /// callers retain their SQL interruption hooks through the complete rendering.
 pub(crate) fn render_knowledge_snapshot_held(project: &Path, id: &str, db: &mut crate::store::SqliteStore) -> Result<serde_json::Value> {
-    let snapshot=db.read_memory_snapshot(id)?;
-    let inputs=db.memory_snapshot_inputs(id)?;
-    let (memory,_)=render_snapshot(project,db,&snapshot,snapshot.budget_bytes)?;
+    render_knowledge_snapshot_budgeted(project,id,db,None)
+}
+pub(crate) fn render_knowledge_snapshot_budgeted(project: &Path, id: &str, db: &mut crate::store::SqliteStore, budget: Option<&crate::store::read_budget::ReadBudget>) -> Result<serde_json::Value> {
+    let snapshot=db.read_memory_snapshot_with_budget(id,budget)?;
+    let inputs=db.memory_snapshot_inputs_with_budget(id,budget)?;
+    let (memory,_)=render_snapshot_budgeted(project,db,&snapshot,snapshot.budget_bytes,budget)?;
     let text=format!("# Project instructions\n\n{}\n\n# Task\n\n{}\n\n# Memory\n{}",inputs.instructions,inputs.task_text,memory);
     ensure!(text.chars().count() as u64<=snapshot.budget_bytes,"retained knowledge input exceeds snapshot budget");
     Ok(serde_json::json!({"snapshot":snapshot,"inputs":inputs,"text":text}))
@@ -541,19 +544,21 @@ pub fn render_attempt_knowledge(project:&Path,attempt:&str)->Result<serde_json::
 }
 /// Caller retains project or root execution ownership across rendering and use.
 pub(crate) fn render_attempt_knowledge_held(project:&Path,attempt:&str,db:&mut crate::store::SqliteStore)->Result<serde_json::Value> {
-    let snapshot=db.attempt_knowledge_snapshot(attempt,jiff::Timestamp::now().as_millisecond())?;
-    let state=db.read_snapshot(None)?;
-    let sealed=state.attempt_inputs.iter().find(|r|r.attempt.as_str()==attempt).context("sealed attempt inputs missing")?;
+    render_attempt_knowledge_budgeted(project,attempt,db,None)
+}
+pub(crate) fn render_attempt_knowledge_budgeted(project:&Path,attempt:&str,db:&mut crate::store::SqliteStore,budget:Option<&crate::store::read_budget::ReadBudget>)->Result<serde_json::Value> {
+    let snapshot=db.attempt_knowledge_snapshot_with_budget(attempt,jiff::Timestamp::now().as_millisecond(),budget)?;
+    let sealed=db.sealed_attempt_input(attempt,budget)?;
     ensure!(migration::config_reference(Path::new(&sealed.inputs.config.path))?==sealed.inputs.config,"worker configuration changed since approval");
     let mut evidence_bytes=0usize;
-    for object in db.memory_consumed_objects(sealed.inputs.task.as_str())? {
-        evidence_bytes=evidence_bytes.checked_add(super::read_object_with_budget(&objects_dir(project),&object,(64*1024*1024-evidence_bytes) as u64)?.len()).context("worker evidence byte count overflow")?;
+    for object in db.memory_consumed_objects_with_budget(sealed.inputs.task.as_str(),budget)? {
+        evidence_bytes=evidence_bytes.checked_add(super::read_object_controlled(&objects_dir(project),&object,(64*1024*1024-evidence_bytes) as u64,budget)?.len()).context("worker evidence byte count overflow")?;
         ensure!(evidence_bytes<=64*1024*1024,"worker evidence exceeds 64 MiB read budget");
     }
-    let rendered=render_knowledge_snapshot(project,snapshot.id.as_str())?;
+    let rendered=render_knowledge_snapshot_budgeted(project,snapshot.id.as_str(),db,budget)?;
     // Object reads occur outside SQL. Fence authoritative state again before
     // returning a launchable input; a concurrent revocation must not pass through.
-    let current=db.attempt_knowledge_snapshot(attempt,jiff::Timestamp::now().as_millisecond())?;
+    let current=db.attempt_knowledge_snapshot_with_budget(attempt,jiff::Timestamp::now().as_millisecond(),budget)?;
     ensure!(current==snapshot,"attempt knowledge changed while rendering");
     let worktrees=if sealed.inputs.repositories.is_empty() {vec![]} else {crate::domain::worktree_plans(&sealed.inputs,&sealed.attempt).map_err(anyhow::Error::msg)?};
     Ok(serde_json::json!({"estimator":snapshot.estimator,"output_directory":crate::domain::worker_output_path(&sealed.inputs,&sealed.attempt).map_err(anyhow::Error::msg)?,"worktrees":worktrees,"attempt_id":attempt,"snapshot_id":snapshot.id,"profile":snapshot.profile_name,"profile_digest":snapshot.profile_digest,"config_digest":snapshot.config_digest,"budget_chars":snapshot.budget_bytes,"text":rendered["text"]}))
@@ -574,13 +579,16 @@ pub fn load_attempt_memory(project: &Path, task_id: &str, attempt_id: &str, prof
 }
 
 fn render_snapshot(project: &Path, db: &mut crate::store::SqliteStore, snap: &MemorySnapshot, budget_chars: u64) -> Result<(String, Vec<(String, String)>), MemoryError> {
+    render_snapshot_budgeted(project,db,snap,budget_chars,None)
+}
+fn render_snapshot_budgeted(project: &Path, db: &mut crate::store::SqliteStore, snap: &MemorySnapshot, budget_chars: u64, budget:Option<&crate::store::read_budget::ReadBudget>) -> Result<(String, Vec<(String, String)>), MemoryError> {
     let objects = objects_dir(project);
     let mut rendered = String::new();
     let mut used_chars = 0u64;
     for entry in &snap.entries {
-        let rev = db.memory_revision(entry.record_id.as_str(), entry.revision)?
+        let rev = db.memory_revision_with_budget(entry.record_id.as_str(), entry.revision,budget)?
             .ok_or_else(|| MemoryError::Invalid("snapshot revision missing".into()))?;
-        let rec = db.memory_record(entry.record_id.as_str())?
+        let rec = db.memory_record_with_budget(entry.record_id.as_str(),budget)?
             .ok_or_else(|| MemoryError::Invalid("snapshot record missing".into()))?;
         let header = format!("\n## {}\n\n", rec.record_key);
         let overhead = header.chars().count() as u64 + 1;
@@ -594,7 +602,7 @@ fn render_snapshot(project: &Path, db: &mut crate::store::SqliteStore, snap: &Me
         let remaining_bytes = (64 * 1024 * 1024u64).saturating_sub(rendered.len() as u64)
             .saturating_sub(header.len() as u64 + 1)
             .min((remaining - overhead).saturating_mul(4));
-        let body = super::read_object_with_budget(&objects, &rev.body_hash, remaining_bytes)?;
+        let body = super::read_object_controlled(&objects, &rev.body_hash, remaining_bytes,budget)?;
         let text = String::from_utf8(body).map_err(|_| MemoryError::Invalid("memory body is not UTF-8".into()))?;
         let required = used_chars.saturating_add(overhead).saturating_add(text.chars().count() as u64);
         if required > budget_chars {
@@ -809,7 +817,7 @@ mod tests {
         memory.insert_revision(&ControlContext {now_unix_ms:now},NewRevision {id:MemoryRecordId::new("worker-fact").unwrap(),record_key:"worker-fact".into(),scope_id:"project".into(),kind:MemoryKind::Observation,body_hash:body.clone(),provenance_hash:body.clone(),applicability:Applicability {domains:vec![],paths:vec![]},dependencies:vec![],expected:None,expiry_unix_ms:None,validity_state:"valid".into(),validity_reason:"fixture".into()}).unwrap();
         let snapshot=memory.create_worker_snapshot(SnapshotRequest {schema_version:1,task_id:"worker".into(),profile:profile.name.clone(),domains:vec![],paths:vec![],pinned_keys:vec![],sensitivity:"default".into()},&profile.name,&profile.definition_digest,None,32000,"Captured instructions",now,None).unwrap();
         let state=db.read_snapshot(None).unwrap();
-        let mut inputs=LaunchInputs {version:2,project_store:project.join(".state/state.db").canonicalize().unwrap().display().to_string(),task:task.clone(),task_revision:3,scheduler_revision:state.scheduler.unwrap().policy.revision,control_epoch:state.control.unwrap().epoch,binding:binding.id.clone(),binding_revision:binding.revision,binding_digest:crate::store::ownership::identity_digest(&binding).unwrap(),profile:profile.reference().unwrap(),effective_profile:Some(profile.clone()),approval:VersionedReference {id:"placeholder".into(),revision:1,digest:"a".repeat(64)},config,repositories:vec![],dependencies:vec![],memory:Some(VersionedReference {id:snapshot.id.as_str().into(),revision:1,digest:snapshot.manifest_hash}),budget:None};
+        let mut inputs=LaunchInputs {task_contract: None, version:2,project_store:project.join(".state/state.db").canonicalize().unwrap().display().to_string(),task:task.clone(),task_revision:3,scheduler_revision:state.scheduler.unwrap().policy.revision,control_epoch:state.control.unwrap().epoch,binding:binding.id.clone(),binding_revision:binding.revision,binding_digest:crate::store::ownership::identity_digest(&binding).unwrap(),profile:profile.reference().unwrap(),effective_profile:Some(profile.clone()),approval:VersionedReference {id:"placeholder".into(),revision:1,digest:"a".repeat(64)},config,repositories:vec![],dependencies:vec![],memory:Some(VersionedReference {id:snapshot.id.as_str().into(),revision:1,digest:snapshot.manifest_hash}),budget:None};
         let grant=ApprovalGrant {version:1,scope:ApprovalScope::for_launch(&inputs).unwrap(),policy:profile.permission_policy,issued_unix_ms:now,expires_unix_ms:now+60000};
         inputs.approval=db.install_approval(&PreparedApproval {grant},state.head,now).unwrap();
         let head=db.read_snapshot(None).unwrap().head;let reserved=db.reserve_prepared(&[PreparedLaunch {inputs}],head,now).unwrap();

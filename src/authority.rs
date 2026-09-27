@@ -12,6 +12,67 @@ pub const MEMORY_SIGNATURE_NAMESPACE: &str = "memory@herdr-projects";
 pub const CONTRACT_SIGNATURE_NAMESPACE: &str = "contract@herdr-projects";
 pub const ADMISSION_SIGNATURE_NAMESPACE: &str = "admission@herdr-projects";
 pub const DELEGATION_SIGNATURE_NAMESPACE: &str = "delegation@herdr-projects";
+pub const DELEGATED_RESERVATION_SIGNATURE_NAMESPACE: &str = "delegated-reservation@herdr-projects";
+pub const BARRIER_RELEASE_SIGNATURE_NAMESPACE: &str = "barrier-release@herdr-projects";
+
+/// Explicit local revocation, like approval/delegation revocation. This reduces
+/// authority; it does not grant a release or clear retained attempt capacity.
+pub fn revoke_memory_barrier(project:&Path,id:&str,expected_head:u64,reason:&str)->Result<crate::store::FrozenBarrier> {
+    let control=crate::store::controlled::ReadControl::new(std::time::Instant::now()+Duration::from_secs(2),Default::default());
+    let result=(||{
+        let _guard=migration::runtime_mutation(project)?;
+        Ok(migration::open_active_scoped(project,control.clone())?.revoke_barrier(id,expected_head,reason)?)
+    })();
+    if let Err(error)=&result {record_cli_denial_controlled(project,"memory","barrier-revoke",Some(expected_head),error,control);}
+    result
+}
+
+#[cfg(test)]
+fn prepare_barrier_release(policy:&Policy,payload:&[u8],signature:&[u8],runner:&dyn Runner)->Result<crate::domain::PreparedBarrierRelease> {
+    prepare_barrier_release_controlled(policy,payload,signature,runner,None)
+}
+
+fn prepare_barrier_release_controlled(policy:&Policy,payload:&[u8],signature:&[u8],runner:&dyn Runner,control:Option<&crate::store::controlled::ReadControl>)->Result<crate::domain::PreparedBarrierRelease> {
+    verify_signature_controlled(policy,payload,signature,BARRIER_RELEASE_SIGNATURE_NAMESPACE,runner,control)?;
+    let prepared=crate::domain::PreparedBarrierRelease::parse_verified(payload)
+        .map_err(|_|anyhow::anyhow!("invalid barrier authorization document (contents withheld)"))?;
+    ensure!(prepared.document.authority==policy.reference()?,"barrier authorization names a different authority policy");
+    Ok(prepared)
+}
+
+/// Prepare unsigned current evidence for external owner review and signing.
+/// Drafting does not publish a release, reserve capacity, or launch workers.
+pub fn draft_barrier_release(project:&Path,barrier_id:&str,expires_unix_ms:i64)->Result<crate::domain::BarrierReleaseAuthorization> {
+    let control=crate::store::controlled::ReadControl::new(std::time::Instant::now()+Duration::from_secs(2),Default::default());
+    let _guard=migration::runtime_mutation(project)?;
+    let (owner,config)=policy(project)?;
+    let digest=config.digest.as_deref().context("barrier release requires a pinned configuration")?;
+    let document=migration::open_active_scoped(project,control.clone())?.draft_barrier_release(barrier_id,owner.reference()?,digest,expires_unix_ms)?;
+    ensure!(migration::config_reference(Path::new(&config.path))?==config,"owner configuration changed during drafting");
+    control.check()?;
+    Ok(document)
+}
+
+/// Verify the owner signature and atomically record release of the exact barrier.
+pub fn release_memory_barrier(project:&Path,document:&Path,signature:&Path,expected_head:u64)->Result<crate::store::FrozenBarrier> {
+    let control=crate::store::controlled::ReadControl::new(std::time::Instant::now()+Duration::from_secs(2),Default::default());
+    let result=(||{
+        let _guard=migration::runtime_mutation(project)?;
+        let (owner,config)=policy(project)?;
+        let bytes=migration::read_plan_file(document)?;
+        let sig=migration::read_plan_file(signature)?;
+        let prepared=prepare_barrier_release_controlled(&owner,&bytes,&sig,&RealRunner,Some(&control))?;
+        ensure!(prepared.document.expected_head==expected_head,"barrier authorization expected head mismatch");
+        ensure!(Some(prepared.document.config_digest.as_str())==config.digest.as_deref(),"barrier authorization configuration mismatch");
+        ensure!(prepared.document.project_store==project.join(".state/state.db").canonicalize()?.to_string_lossy(),"barrier authorization belongs to another project");
+        let mut db=migration::open_active_scoped(project,control.clone())?;
+        db.verify_barrier_objects(project,&prepared.document.barrier_id)?;
+        ensure!(migration::config_reference(Path::new(&config.path))?==config,"owner configuration changed during verification");
+        Ok(db.release_authorized_barrier(&prepared)?)
+    })();
+    if let Err(error)=&result {record_cli_denial_controlled(project,"memory","barrier-release",Some(expected_head),error,control);}
+    result
+}
 
 #[derive(Deserialize,Serialize)]
 #[serde(deny_unknown_fields)]
@@ -62,6 +123,11 @@ fn verify(policy:&Policy,payload:&[u8],signature:&[u8],runner:&dyn Runner)->Resu
 }
 
 fn verify_signature(policy:&Policy,payload:&[u8],signature:&[u8],namespace:&str,runner:&dyn Runner)->Result<()> {
+    verify_signature_controlled(policy,payload,signature,namespace,runner,None)
+}
+
+fn verify_signature_controlled(policy:&Policy,payload:&[u8],signature:&[u8],namespace:&str,runner:&dyn Runner,control:Option<&crate::store::controlled::ReadControl>)->Result<()> {
+    if let Some(control)=control {control.check()?;}
     policy.reference()?;
     ensure!(payload.len()<=65_536 && signature.len()<=8192,"signed document or signature exceeds bounds");
     let files=VerificationFiles::new()?;
@@ -72,7 +138,9 @@ fn verify_signature(policy:&Policy,payload:&[u8],signature:&[u8],namespace:&str,
         .args(["-I","owner","-n",namespace,"-s"]).arg(sig.to_str().context("invalid verification path")?)
         .stdin(std::str::from_utf8(payload).map_err(|_|anyhow::anyhow!("approval must be UTF-8"))?);
     command.capture_limit=4096;
+    if let Some(control)=control {command.deadline=Some(control.deadline());command.cancellation=Some(control.cancellation());}
     let result=runner.run(&command).map_err(|_|anyhow::anyhow!("approval signature verification failed"))?;
+    if let Some(control)=control {control.check()?;}
     ensure!(result.success()&&!result.stdout_truncated&&!result.stderr_truncated,"approval signature verification failed");
     Ok(())
 }
@@ -106,9 +174,8 @@ pub fn import_delegation(project:&Path,document:&Path,signature:&Path)->Result<S
     let result=(||{
         let _guard=migration::runtime_mutation(project)?;
         let mut db=migration::open_active(project)?;
-        let snapshot=db.read_snapshot(None)?;
         let (owner,config)=policy(project)?;
-        ensure!(snapshot.control.context("control schema upgrade required")?.config_digest==config.digest,"owner configuration is not acknowledged by project control");
+        ensure!(db.project_control()?.context("control schema upgrade required")?.config_digest==config.digest,"owner configuration is not acknowledged by project control");
         let payload=migration::read_plan_file(document).map_err(|_|anyhow::anyhow!("delegation document unreadable"))?;
         let signature=migration::read_plan_file(signature).map_err(|_|anyhow::anyhow!("delegation signature unreadable"))?;
         let prepared=prepare_delegation(&owner,&payload,&signature,&RealRunner)?;
@@ -116,6 +183,59 @@ pub fn import_delegation(project:&Path,document:&Path,signature:&Path)->Result<S
         Ok(db.install_delegation(&prepared,jiff::Timestamp::now().as_millisecond())?)
     })();
     if let Err(error)=&result {record_cli_denial(project,"delegation","import",None,error);}
+    result
+}
+
+fn prepare_delegated_reservation(grant:&PreparedDelegation,payload:&[u8],signature:&[u8],runner:&dyn Runner)->Result<crate::domain::PreparedDelegatedReservation> {
+    let subject=Policy {version:1,revision:1,approval_public_key:grant.subject_public_key.clone()};
+    verify_signature(&subject,payload,signature,DELEGATED_RESERVATION_SIGNATURE_NAMESPACE,runner)?;
+    let prepared=crate::domain::PreparedDelegatedReservation::parse_verified(payload).map_err(anyhow::Error::msg)?;
+    ensure!(prepared.request.grant_id==grant.digest && prepared.request.subject==grant.subject,"delegated request identity mismatch");
+    Ok(prepared)
+}
+
+/// Draft the next ready candidate without deriving or installing any authority.
+pub fn draft_delegated_reservation(project:&Path,grant_id:&str,key:&str)->Result<crate::domain::DelegatedReservationRequest> {
+    let inputs=crate::admission::prepared_admission_inputs(project)?.context("no ready candidate for a delegated draft")?;
+    let _guard=migration::runtime_mutation(project)?;
+    let mut db=migration::open_active(project)?;
+    let grant=db.delegation_for_reservation_signature(grant_id)?;
+    let (owner,config)=policy(project)?;
+    ensure!(grant.authority==owner.reference()? && inputs.config==config,"delegation or candidate does not match current owner configuration");
+    Ok(db.draft_delegated_reservation(grant_id,key,inputs,jiff::Timestamp::now().as_millisecond())?)
+}
+
+/// The grant ID selects the verification key; only its subject can sign the
+/// exact request. The owner policy and configuration remain current at ingress.
+pub fn reserve_delegated(project:&Path,document:&Path,signature:&Path)->Result<crate::domain::Reservation> {
+    let result=(||{
+        let _guard=migration::runtime_mutation(project)?;
+        let mut db=migration::open_active(project)?;
+        let payload=migration::read_plan_file(document)?;
+        let signature=migration::read_plan_file(signature)?;
+        // Parsing an untrusted selector confers no authority.
+        let selector=crate::domain::PreparedDelegatedReservation::parse_verified(&payload).map_err(anyhow::Error::msg)?;
+        let grant=db.delegation_for_reservation_signature(&selector.request.grant_id)?;
+        let prepared=prepare_delegated_reservation(&grant,&payload,&signature,&RealRunner)?;
+        // A prior response is read-only. Policy expiry/revocation cannot cause a
+        // successful request to be submitted again as a new effect.
+        if let Some(receipt)=db.delegated_reservation_receipt(&prepared)? {return Ok(receipt);}
+        let (owner,config)=policy(project)?;
+        ensure!(grant.authority==owner.reference()?,"delegation names a different current authority policy");
+        ensure!(db.project_control()?.context("control schema upgrade required")?.config_digest==config.digest,"owner configuration is not acknowledged by project control");
+        ensure!(prepared.request.inputs.config==config && migration::config_reference(Path::new(&config.path))?==config,"delegated configuration changed during verification");
+        Ok(db.reserve_delegated(&prepared,jiff::Timestamp::now().as_millisecond())?)
+    })();
+    if let Err(error)=&result {record_cli_denial(project,"delegation","reserve",None,error);}
+    result
+}
+
+pub fn revoke_delegation(project:&Path,id:&str,head:u64,reason:&str)->Result<u64> {
+    let result=(||{
+        let _guard=migration::runtime_mutation(project)?;
+        Ok(migration::open_active(project)?.revoke_delegation(id,head,jiff::Timestamp::now().as_millisecond(),reason)?)
+    })();
+    if let Err(error)=&result {record_cli_denial(project,"delegation","revoke",Some(head),error);}
     result
 }
 
@@ -229,8 +349,12 @@ fn reason_code(error:&anyhow::Error)->&'static str {
 }
 
 fn record_cli_denial(project:&Path,class:&str,command:&str,expected_head:Option<u64>,error:&anyhow::Error) {
-    let Ok(mut db)=migration::open_active(project) else {return};
-    let actual=db.read_snapshot(None).ok().map(|s|s.head);
+    let control=crate::store::controlled::ReadControl::new(std::time::Instant::now()+Duration::from_secs(2),Default::default());
+    record_cli_denial_controlled(project,class,command,expected_head,error,control);
+}
+fn record_cli_denial_controlled(project:&Path,class:&str,command:&str,expected_head:Option<u64>,error:&anyhow::Error,control:crate::store::controlled::ReadControl) {
+    let Ok(mut db)=migration::open_active_scoped(project,control) else {return};
+    let actual=db.current_head().ok();
     let policy_digest=policy(project).ok().and_then(|(p,_)|p.reference().ok()).map(|r|r.digest).unwrap_or_else(||"0".repeat(64));
     let unix_ms=jiff::Timestamp::now().as_millisecond();
     let reason=reason_code(error);
@@ -425,6 +549,41 @@ mod tests {
         ApprovalGrant{version:1,scope:ApprovalScope{version:1,class:ApprovalClass::RuntimeLaunch,project_store:"/fixture/state.db".into(),task:TaskId::new("task").unwrap(),task_revision:2,target:"task:task".into(),action_digest:"a".repeat(64)},policy:policy.reference().unwrap(),issued_unix_ms:now-1000,expires_unix_ms:now+60_000}
     }
     #[test]
+    fn barrier_release_signature_binds_owner_namespace_and_exact_evidence() {
+        let dir=tempfile::tempdir().unwrap();
+        let (owner_key,owner)=key(dir.path(),"owner");
+        let (other_key,_)=key(dir.path(),"other");
+        let mut document:crate::domain::BarrierReleaseAuthorization=serde_json::from_slice(
+            include_bytes!("../contracts/factory/barrier-release-v1.json")).unwrap();
+        document.authority=owner.reference().unwrap();
+        let bytes=serde_json::to_vec(&document).unwrap();
+        let signature=sign(&owner_key,&bytes,BARRIER_RELEASE_SIGNATURE_NAMESPACE);
+        let expired=crate::store::controlled::ReadControl::new(std::time::Instant::now(),Default::default());
+        let error=prepare_barrier_release_controlled(&owner,&bytes,&signature,&RealRunner,Some(&expired)).unwrap_err();
+        assert!(matches!(error.downcast_ref::<crate::store::StoreError>(),Some(crate::store::StoreError::Deadline)));
+        let control=crate::store::controlled::ReadControl::new(std::time::Instant::now()+Duration::from_secs(2),Default::default());
+        let prepared=prepare_barrier_release_controlled(&owner,&bytes,&signature,&RealRunner,Some(&control)).unwrap();
+        assert_eq!(prepared.raw,bytes);
+        let prepared=prepare_barrier_release(&owner,&bytes,&signature,&RealRunner).unwrap();
+        assert_eq!(prepared.raw,bytes);
+        assert_eq!(prepared.document,document);
+        for namespace in [SIGNATURE_NAMESPACE,MEMORY_RECONCILE_NAMESPACE,DELEGATION_SIGNATURE_NAMESPACE] {
+            let wrong=sign(&owner_key,&bytes,namespace);
+            assert!(prepare_barrier_release(&owner,&bytes,&wrong,&RealRunner).is_err());
+        }
+        let other=sign(&other_key,&bytes,BARRIER_RELEASE_SIGNATURE_NAMESPACE);
+        assert!(prepare_barrier_release(&owner,&bytes,&other,&RealRunner).is_err());
+        for field in ["barrier_id","memory_manifest_digest","store_incarnation","config_digest"] {
+            let mut changed=serde_json::to_value(&document).unwrap();
+            changed[field]=serde_json::json!("12".repeat(32));
+            assert!(prepare_barrier_release(&owner,&serde_json::to_vec(&changed).unwrap(),&signature,&RealRunner).is_err(),"{field}");
+        }
+        document.authority.revision+=1;
+        let bytes=serde_json::to_vec(&document).unwrap();
+        let signature=sign(&owner_key,&bytes,BARRIER_RELEASE_SIGNATURE_NAMESPACE);
+        assert!(prepare_barrier_release(&owner,&bytes,&signature,&RealRunner).is_err());
+    }
+    #[test]
     fn signed_routines_require_enabled_config_and_recheck_script_before_effect() {
         use crate::domain::*;
         for enabled in [false,true] {
@@ -520,11 +679,20 @@ mod tests {
         drop(db);crate::runtime::set_state(&project,snapshot.head,snapshot.control.unwrap().revision,ProjectState::Active,&config).unwrap();let mut db=migration::open_active(&project).unwrap();
         let snapshot=db.read_snapshot(None).unwrap();let mut grant=grant(&policy);
         grant.scope.project_store=project.join(".state/state.db").canonicalize().unwrap().display().to_string();grant.scope.task=snapshot.tasks[0].id.clone();grant.scope.task_revision=snapshot.tasks[0].revision+1;
+        let trigger=crate::domain::WaitTrigger::ApprovalDecision{approval_id:grant.reference().unwrap().id,task_revision:grant.scope.task_revision};
+        let wait=db.register_wait_with_trigger(grant.scope.task.as_str(),None,"user_decision",None,Some(&trigger)).unwrap();
+        assert!(!db.replay_wait(&wait.wait_id).unwrap().wake_requested);
+        let snapshot=db.read_snapshot(None).unwrap();
         let payload=serde_json::to_vec(&grant).unwrap();let document=dir.path().join("grant.json");let sig=dir.path().join("grant.sig");
         fs::write(&document,&payload).unwrap();fs::write(&sig,sign(&key,&payload,"wrong")).unwrap();drop(db);
         assert!(import_signed(&project,&document,&sig,snapshot.head).is_err());assert_eq!(crate::runtime::snapshot(&project).unwrap(),snapshot);
         fs::write(&sig,sign(&key,&payload,SIGNATURE_NAMESPACE)).unwrap();
         let reference=import_signed(&project,&document,&sig,snapshot.head).unwrap();assert_eq!(reference,grant.reference().unwrap());
+        assert_eq!(crate::store::service_project_waits(&project).unwrap().notified,1);
+        assert_eq!(crate::store::service_project_waits(&project).unwrap().notified,0);
+        let mut db=migration::open_active(&project).unwrap();
+        let replay=db.replay_wait(&wait.wait_id).unwrap();assert!(replay.wake_requested);assert!(!replay.proved);
+        assert!(db.replay_wait(&wait.wait_id).unwrap().already_replayed);drop(db);
         let installed=crate::runtime::snapshot(&project).unwrap();assert_eq!(installed.approvals.len(),1);
         let budget=crate::domain::BudgetPolicy{version:1,revision:1,project_store:grant.scope.project_store.clone(),authority:policy.reference().unwrap(),
             limits:crate::domain::BudgetLimits{max_attempts:Some(5),max_provider_tokens:Some(100),unknown_usage:crate::domain::UnknownUsagePolicy::Refuse}};
@@ -548,6 +716,26 @@ mod tests {
         assert!(import_budget(&project,&document,&sig,installed.head).is_err());
         assert!(import_signed(&project,&document,&sig,installed.head).is_err());assert_eq!(crate::runtime::snapshot(&project).unwrap(),installed);
     }
+    #[test]
+    fn denial_records_current_head_without_decoding_unrelated_tasks() {
+        let dir=tempfile::tempdir().unwrap();let (_key,owner)=key(dir.path(),"owner");
+        let project=dir.path().join("project");fs::create_dir(&project).unwrap();
+        for child in [".state","threads","inbox"] {fs::create_dir(project.join(child)).unwrap();}
+        fs::write(project.join("PROJECT.md"),"+++\nname='Project'\n+++\n").unwrap();
+        fs::write(project.join("TASKS.md"),"").unwrap();fs::write(project.join("MEMORY.md"),"").unwrap();
+        fs::write(project.join(".state/project.json"),r#"{"status":"paused"}"#).unwrap();
+        let config=dir.path().join("owner.toml");fs::write(&config,format!("[authority]\nversion=1\nrevision=1\napproval_public_key={:?}\n",owner.approval_public_key)).unwrap();
+        let plan=migration::inspect_with_config(&project,&config).unwrap();migration::apply(&project,&plan,true).unwrap();
+        let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();
+        raw.execute("INSERT INTO tasks VALUES('bad/task',1,'succeeded','corrupt unrelated fixture',NULL)",[]).unwrap();
+        let mut db=migration::open_active(&project).unwrap();let head=db.current_head().unwrap();assert!(db.read_snapshot(None).is_err());
+        record_cli_denial(&project,"memory","barrier-revoke",Some(head),&anyhow::anyhow!("barrier is not stored"));
+        let denials=db.authority_denials().unwrap();assert_eq!(denials.len(),1);assert_eq!(denials[0].actual_head,Some(head));
+        let expired=crate::store::controlled::ReadControl::new(std::time::Instant::now(),Default::default());
+        record_cli_denial_controlled(&project,"memory","barrier-revoke",Some(head),&anyhow::anyhow!("expired"),expired);
+        assert_eq!(db.authority_denials().unwrap().len(),1);assert_eq!(db.current_head().unwrap(),head);
+    }
+
     #[test]
     fn signed_memory_policy_requires_namespace_and_records_denials() {
         use crate::domain::{Applicability,ControlContext,MemoryKind,MemoryPolicy,MemoryPolicyOp,MemoryRecordId,NewRevision};
@@ -680,6 +868,33 @@ mod tests {
         assert_eq!(denied,2);
     }
 
+    #[test]
+    fn delegated_reservation_requires_subject_signature_over_exact_request_bytes() {
+        let directory=tempfile::tempdir().unwrap();
+        let (owner_key,owner)=key(directory.path(),"owner");
+        let (subject_key,subject)=key(directory.path(),"subject");
+        let mut document:serde_json::Value=serde_json::from_slice(include_bytes!("../contracts/factory/delegation-v2.json")).unwrap();
+        document["authority"]=serde_json::to_value(owner.reference().unwrap()).unwrap();
+        document["subject_public_key"]=subject.approval_public_key.clone().into();
+        let raw=serde_json::to_vec(&document).unwrap();
+        let grant=prepare_delegation(&owner,&raw,&sign(&owner_key,&raw,DELEGATION_SIGNATURE_NAMESPACE),&RealRunner).unwrap();
+        let request=crate::domain::DelegatedReservationRequest {
+            schema_version:1,grant_id:grant.digest.clone(),subject:grant.subject.clone(),store_incarnation:"a".repeat(64),
+            idempotency_key:"reservation-1".into(),expected_head:1,issued_unix_ms:1000,
+            inputs:serde_json::from_slice(include_bytes!("../tests/fixtures/launch-inputs-v1.json")).unwrap(),
+        };
+        let payload=serde_json::to_vec(&request).unwrap();
+        let signature=sign(&subject_key,&payload,DELEGATED_RESERVATION_SIGNATURE_NAMESPACE);
+        assert!(prepare_delegated_reservation(&grant,&payload,&signature,&RealRunner).is_ok());
+        let mut changed=payload.clone();changed.push(b'\n');
+        assert!(prepare_delegated_reservation(&grant,&changed,&signature,&RealRunner).is_err());
+        assert!(prepare_delegated_reservation(&grant,&payload,&sign(&owner_key,&payload,DELEGATED_RESERVATION_SIGNATURE_NAMESPACE),&RealRunner).is_err());
+        assert!(prepare_delegated_reservation(&grant,&payload,&sign(&subject_key,&payload,DELEGATION_SIGNATURE_NAMESPACE),&RealRunner).is_err());
+        let mut wrong=request;wrong.subject="another-subject".into();
+        let payload=serde_json::to_vec(&wrong).unwrap();
+        assert!(prepare_delegated_reservation(&grant,&payload,&sign(&subject_key,&payload,DELEGATED_RESERVATION_SIGNATURE_NAMESPACE),&RealRunner).is_err());
+    }
+
     fn delegation_bytes(policy:&Policy,store:&str,repository:&str,subject:&str,subject_key:&str)->Vec<u8> {
         let expires:i64=9_000_000_000_000;
         let mut bytes=serde_json::to_vec_pretty(&serde_json::json!({
@@ -719,6 +934,18 @@ mod tests {
         let signature=sign(&owner_key,&original,DELEGATION_SIGNATURE_NAMESPACE);
         let prepared=prepare_delegation(&owner,&original,&signature,&RealRunner).unwrap();
         assert_eq!(prepared.raw,original);
+        let mut bounded:serde_json::Value=serde_json::from_slice(include_bytes!("../contracts/factory/delegation-v2.json")).unwrap();
+        bounded["authority"]=serde_json::to_value(owner.reference().unwrap()).unwrap();
+        bounded["project_store"]=store.display().to_string().into();
+        bounded["subject_public_key"]=subject.approval_public_key.clone().into();
+        bounded["repositories"][0]["repository"]=repo.display().to_string().into();
+        bounded["reservation_scope"]["repository_bases"][0]["repository"]=repo.display().to_string().into();
+        let bounded_bytes=serde_json::to_vec(&bounded).unwrap();
+        let bounded_signature=sign(&owner_key,&bounded_bytes,DELEGATION_SIGNATURE_NAMESPACE);
+        assert!(prepare_delegation(&owner,&bounded_bytes,&bounded_signature,&RealRunner).unwrap().reservation_scope.is_some());
+        bounded["reservation_scope"]["max_total_attempts"]=5.into();
+        let widened=serde_json::to_vec(&bounded).unwrap();
+        assert!(prepare_delegation(&owner,&widened,&bounded_signature,&RealRunner).is_err());
         let reserialized=serde_json::to_vec(&serde_json::from_slice::<serde_json::Value>(&original).unwrap()).unwrap();
         assert_ne!(reserialized,original);
         assert!(prepare_delegation(&owner,&reserialized,&signature,&RealRunner).is_err());

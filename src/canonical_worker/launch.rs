@@ -17,23 +17,13 @@ pub fn advance_launch(
     let deadline = deadline.min(Instant::now() + Duration::from_secs(45));
     check(deadline, &cancellation)?;
     let project = project.canonicalize()?;
-    let state = crate::runtime::snapshot(&project)?;
-    let delivery = state
-        .deliveries
-        .iter()
-        .find(|d| &d.operation == operation)
-        .context("launch delivery missing")?;
-    ensure!(
-        delivery.revision == expected_revision,
-        "launch delivery changed"
-    );
-    ensure!(
-        state
-            .operations
-            .iter()
-            .any(|o| &o.id == operation && o.kind == "runtime.launch"),
-        "operation is not a worker launch"
-    );
+    let select = |revision| -> Result<_> {
+        let control = crate::store::controlled::ReadControl::new(deadline, cancellation.clone());
+        let mut db = crate::migration::open_active_scoped(&project, control)?;
+        Ok(db.launch_advancement_selection(operation, revision)?)
+    };
+    let state = select(expected_revision)?;
+    let delivery = &state.delivery;
     if delivery.state == DeliveryState::Confirmed {
         return super::reconcile_start(
             &project,
@@ -45,12 +35,7 @@ pub fn advance_launch(
         .map(Some);
     }
     let revision = if delivery.state == DeliveryState::Pending && delivery.attempts == 0 {
-        let profile = state
-            .attempt_inputs
-            .iter()
-            .find(|r| &r.operation == operation)
-            .and_then(|r| r.inputs.effective_profile.as_ref())
-            .context("launch profile missing")?;
+        let profile = state.record.inputs.effective_profile.as_ref().context("launch profile missing")?;
         super::resources::validate_execution_home(profile, &project)?;
         super::create_resource(
             &project,
@@ -73,24 +58,13 @@ pub fn advance_launch(
             "launch has no recoverable original claim"
         );
         if delivery.state==DeliveryState::Claimed
-            && state.events.iter().any(|e|e.entity==operation.as_str()&&e.kind=="runtime.worktrees_creation")
-            && !state.events.iter().any(|e|e.entity==operation.as_str()&&e.kind=="runtime.launch_creation") {
+            && state.kinds.contains("runtime.worktrees_creation")
+            && !state.kinds.contains("runtime.launch_creation") {
             super::create_resource(&project,operation,expected_revision,deadline,cancellation.clone())?;
         }
         if delivery.state == DeliveryState::Claimed
-            && state
-                .events
-                .iter()
-                .any(|e| e.entity == operation.as_str() && e.kind == "runtime.launch_workspace")
-            && !state.events.iter().any(|e| {
-                e.entity == operation.as_str()
-                    && matches!(
-                        e.kind.as_str(),
-                        "runtime.launch_layout"
-                            | "runtime.launch_target"
-                            | "runtime.launch_started"
-                    )
-            })
+            && state.kinds.contains("runtime.launch_workspace")
+            && !["runtime.launch_layout", "runtime.launch_target", "runtime.launch_started"].iter().any(|kind| state.kinds.contains(*kind))
         {
             super::continue_workspace_layout(
                 &project,
@@ -114,22 +88,9 @@ pub fn advance_launch(
         expected_revision
     };
     check(deadline, &cancellation)?;
-    let state = crate::runtime::snapshot(&project)?;
-    let delivery = state
-        .deliveries
-        .iter()
-        .find(|d| &d.operation == operation)
-        .context("launch delivery missing")?;
-    ensure!(
-        delivery.revision == revision,
-        "launch changed during advancement"
-    );
-    let has = |kind: &str| {
-        state
-            .events
-            .iter()
-            .any(|e| e.entity == operation.as_str() && e.kind == kind)
-    };
+    let state = select(revision)?;
+    let delivery = &state.delivery;
+    let has = |kind: &str| state.kinds.contains(kind);
     if !has("runtime.launch_release") {
         super::release_gate(
             &project,

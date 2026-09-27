@@ -89,7 +89,7 @@ fn inputs(
     ensure!(paths.len() <= 64, "too many bound repositories");
     let repositories = paths.iter().map(|p|repository(proof,p)).collect::<Result<Vec<_>>>()?;
     Ok(LaunchInputs {
-        version: 2, project_store: proof.store_path().to_str().context("project store is not UTF-8")?.into(),
+        task_contract: None, version: 2, project_store: proof.store_path().to_str().context("project store is not UTF-8")?.into(),
         task: task.id.clone(), task_revision: task.revision,
         scheduler_revision: state.scheduler.as_ref().context("scheduler missing")?.policy.revision,
         control_epoch: state.control.as_ref().context("project control missing")?.epoch,
@@ -124,7 +124,7 @@ pub(crate) fn seal_admission_inputs(
         return Err("new launch requires an unused local binding".into());
     }
     Ok(LaunchInputs {
-        version: 2,
+        task_contract: None, version: 2,
         project_store: project_store.into(),
         task: task.id.clone(),
         task_revision: task.revision,
@@ -173,6 +173,7 @@ pub fn draft(
     let mut db = crate::migration::open_active_controlled(&project,proof.read_control())?;
     let state = db.read_snapshot(Some(expected_head))?;
     let mut inputs = inputs(&proof,selection,&state,pending_approval())?;
+    inputs.task_contract = db.task_contract_reference(inputs.task.as_str())?;
     db.validate_launch_draft(&inputs,expected_head,now())?;
     let issued = now();
     let approval = ApprovalGrant { version: 1, scope: ApprovalScope::for_launch(&inputs).map_err(anyhow::Error::msg)?,
@@ -199,7 +200,8 @@ pub fn reserve(
     let project = project.canonicalize()?;
     let mut db = crate::migration::open_active_controlled(&project,proof.read_control())?;
     let state = db.read_snapshot(Some(expected_head))?;
-    let inputs = inputs(&proof,selection,&state,approval.clone())?;
+    let mut inputs = inputs(&proof,selection,&state,approval.clone())?;
+    inputs.task_contract = db.task_contract_reference(inputs.task.as_str())?;
     db.validate_launch_draft(&inputs,expected_head,now())?;
     let installed = state.approvals.iter().find(|a|a.reference==*approval).context("signed launch approval is not installed")?;
     ensure!(installed.revoked.is_none() && installed.consumed.is_none(), "launch approval is unavailable");

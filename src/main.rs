@@ -11,6 +11,9 @@ mod routine_jobs;
 mod actions;
 mod agents;
 mod artifacts;
+#[cfg(all(feature = "state-store", target_os = "linux"))]
+use herdr_projects::source_tree;
+#[cfg(not(all(feature = "state-store", target_os = "linux")))]
 mod source_tree;
 mod copy_jobs;
 mod brief_jobs;

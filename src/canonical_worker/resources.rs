@@ -159,14 +159,20 @@ pub fn create_resource(
 ) -> Result<LaunchTarget> {
     let deadline = deadline.min(Instant::now() + Duration::from_secs(45));
     check(deadline, &cancellation)?;
-    let state=crate::runtime::snapshot(project)?;
-    let record=state.attempt_inputs.iter().find(|r|&r.operation==operation).context("launch inputs missing")?;
-    let expected_revision=if !record.inputs.repositories.is_empty() {
-        let initial=state.deliveries.iter().find(|d|&d.operation==operation).context("launch delivery missing")?;
-        ensure!(initial.revision==expected_revision,"launch revision changed");
+    let canonical = project.canonicalize()?;
+    let guard = crate::execution_guard::RootGuard::exclusive(canonical.parent().context("project root missing")?)?;
+    let control = crate::store::controlled::ReadControl::new(deadline, cancellation.clone());
+    let mut db = crate::migration::open_active_scoped(project, control)?;
+    let (record, initial) = db.launch_preparation_input(operation, expected_revision)?;
+    let (expected_revision, selected_store) = if !record.inputs.repositories.is_empty() {
+        // Worktree preparation owns its root guard. Never carry a database
+        // connection across an unlocked interval where the store could change.
+        drop(db);
+        drop(guard);
         crate::worktree_preparation::prepare(project,operation,expected_revision,deadline,cancellation.clone())?;
-        if initial.attempts==0 {expected_revision.checked_add(1).context("launch revision overflow")?}else{expected_revision}
-    }else{expected_revision};
+        let revision = if initial.attempts==0 {expected_revision.checked_add(1).context("launch revision overflow")?}else{expected_revision};
+        (revision, None)
+    } else { (expected_revision, Some((db, guard))) };
     create_resource_inner(
         project,
         operation,
@@ -175,6 +181,7 @@ pub fn create_resource(
         cancellation,
         false,
         false,
+        selected_store,
     )
 }
 
@@ -195,6 +202,7 @@ pub fn continue_workspace_layout(
         cancellation,
         true,
         true,
+        None,
     )
 }
 
@@ -207,6 +215,7 @@ fn create_resource_inner(
     cancellation: Cancellation,
     continuing: bool,
     legacy_workspace: bool,
+    selected_store: Option<(crate::store::controlled::ControlledStore, crate::execution_guard::RootGuard)>,
 ) -> Result<LaunchTarget> {
     ensure!(
         !legacy_workspace || continuing || cfg!(test),
@@ -215,16 +224,16 @@ fn create_resource_inner(
     let deadline = deadline.min(Instant::now() + Duration::from_secs(45));
     check(deadline, &cancellation)?;
     let project = project.canonicalize()?;
-    let guard = crate::execution_guard::RootGuard::exclusive(
-        project.parent().context("project root missing")?,
-    )?;
-    let mut db = crate::migration::open_active(&project)?;
-    let state = db.read_snapshot(None)?;
-    let delivery = state
-        .deliveries
-        .iter()
-        .find(|d| &d.operation == operation)
-        .context("launch operation missing")?;
+    let (mut db, guard) = match selected_store {
+        Some(selected) => selected,
+        None => {
+            let guard = crate::execution_guard::RootGuard::exclusive(project.parent().context("project root missing")?)?;
+            let control = crate::store::controlled::ReadControl::new(deadline, cancellation.clone());
+            (crate::migration::open_active_scoped(&project, control)?, guard)
+        }
+    };
+    let state = db.resource_creation_selection(operation, expected_revision)?;
+    let delivery = &state.delivery;
     let worktree_continuation=!continuing && delivery.state==crate::operations::DeliveryState::Claimed && delivery.attempts==1
         && state.events.iter().any(|e|e.entity==operation.as_str()&&e.kind=="runtime.worktrees_ready")
         && !state.events.iter().any(|e|e.entity==operation.as_str()&&matches!(e.kind.as_str(),"runtime.launch_creation"|"runtime.launch_target"|"runtime.launch_started"));
@@ -252,11 +261,7 @@ fn create_resource_inner(
             },
         "resource creation was already attempted or changed"
     );
-    let record = state
-        .attempt_inputs
-        .iter()
-        .find(|i| &i.operation == operation)
-        .context("sealed launch inputs missing")?;
+    let record = &state.record;
     let profile = record
         .inputs
         .effective_profile
@@ -267,12 +272,8 @@ fn create_resource_inner(
         profile.herdr.version == "0.9.1",
         "resource adapter requires Herdr 0.9.1"
     );
-    let binding = state
-        .runtime_bindings
-        .iter()
-        .find(|b| b.id == record.inputs.binding)
-        .context("launch binding missing")?;
-    let (route,_) = db.worktree_execution_route(record,binding)?;
+    let binding = &state.binding;
+    let route = &state.route;
     route.validate().map_err(anyhow::Error::msg)?;
     ensure!(
         binding.identity.worktree_path.is_empty()
@@ -287,10 +288,10 @@ fn create_resource_inner(
             && Path::new(&route.cwd).is_dir(),
         "worker working directory changed"
     );
-    let worktrees=crate::worktree_preparation::verify_held(&project,&state,record,deadline,cancellation.clone(),guard.inherit()?)?;
+    let worktrees=crate::worktree_preparation::verify_events_held(&project,&state.events,record,deadline,cancellation.clone(),guard.inherit()?)?;
     // Refuse unusable retained knowledge before creating any external resource.
     let brief =
-        crate::memory::render_attempt_brief_held(&project, record.attempt.as_str(), &mut db)?;
+        db.render_attempt_brief(&project, record.attempt.as_str())?;
     let argv = command(profile, operation, brief.prompt_chars)?;
     executable(&profile.agent, deadline, &cancellation)?;
     let session = session_identity(Path::new(&route.socket))?;
@@ -367,7 +368,7 @@ fn create_resource_inner(
                 .lease_until_ms
                 .context("launch claim lease missing")?,
         };
-        db.validate_claim(&claim, now())?;
+        db.validate_launch_claim(&claim, now())?;
         if worktree_continuation {db.continue_worktree_launch_creation(&claim,&PreparedLaunchCreation{intent:creation.clone()},now())?;}
         claim
     } else {
@@ -388,7 +389,7 @@ fn create_resource_inner(
             "workspace.create_command",
             json!({"cwd":route.cwd,"label":worker_agent_name(&record.attempt),
                 "focus":false,"command":argv,"env":{}}),
-            || {worktrees.check()?;Ok(db.validate_claim(&claim, now())?)},
+            || {worktrees.check()?;Ok(db.validate_launch_claim(&claim, now())?)},
         )?;
         ensure!(
             created["type"].as_str() == Some("workspace_created"),
@@ -422,7 +423,7 @@ fn create_resource_inner(
             api.deadline,
             cancellation.clone(),
         )?;
-        retain_observed_target(&mut db, &target)?;
+        db.retain_observed_launch_target(&target, now())?;
         return Ok(target);
     }
     let workspace = if route.workspace_id.is_empty() {
@@ -442,7 +443,7 @@ fn create_resource_inner(
             let created=api.call(operation.as_str(),"workspace.create",
                 json!({"cwd":route.cwd,"label":worker_agent_name(&record.attempt),"focus":false,
                     "env":{"HP_WORKSPACE_CREATION":creation.workspace_token.as_ref().context("workspace creation marker missing")?}}),
-                ||Ok(db.validate_claim(&claim,now())?))?;
+                ||Ok(db.validate_launch_claim(&claim,now())?))?;
             ensure!(
                 created["type"].as_str() == Some("workspace_created"),
                 "invalid workspace creation response"
@@ -520,7 +521,7 @@ fn create_resource_inner(
         "tab_label":worker_agent_name(&record.attempt),"focus":false,
         "root":{"type":"pane","cwd":route.cwd,"command":argv,"env":{}}}),
         || {
-            db.validate_claim(&claim, now())?;
+            db.validate_launch_claim(&claim, now())?;
             if let Some(workspace) = &workspace {
                 let bootstrap =
                     api.pane_identity(operation, &workspace.route.pane_id, &workspace.route)?;
@@ -612,7 +613,7 @@ fn create_resource_inner(
         api.deadline,
         cancellation.clone(),
     )?;
-    retain_observed_target(&mut db, &target)?;
+    db.retain_observed_launch_target(&target, now())?;
     Ok(target)
 }
 
@@ -632,30 +633,10 @@ pub fn reconcile_resource(
     let guard = crate::execution_guard::RootGuard::exclusive(
         project.parent().context("project root missing")?,
     )?;
-    let mut db = crate::migration::open_active(&project)?;
-    let state = db.read_snapshot(None)?;
-    let delivery = state
-        .deliveries
-        .iter()
-        .find(|d| &d.operation == operation)
-        .context("launch delivery missing")?;
-    ensure!(
-        delivery.revision == expected_revision
-            && delivery.attempts == 1
-            && delivery.state != crate::operations::DeliveryState::Confirmed,
-        "launch recovery no longer matches claim history"
-    );
-    let record = state
-        .attempt_inputs
-        .iter()
-        .find(|i| &i.operation == operation)
-        .context("launch inputs missing")?;
-    ensure!(
-        state.attempts.iter().any(|a| a.id == record.attempt
-            && a.state == AttemptState::Reserved
-            && a.retains_capacity()),
-        "launch recovery no longer owns a reservation"
-    );
+    let control = crate::store::controlled::ReadControl::new(deadline, cancellation.clone());
+    let mut db = crate::migration::open_active_scoped(&project, control)?;
+    let state = db.resource_recovery_selection(operation, expected_revision)?;
+    let record = &state.record;
     if let Some(event) = state
         .events
         .iter()
@@ -674,24 +655,16 @@ pub fn reconcile_resource(
         .find(|e| e.kind == "runtime.launch_creation" && e.entity == operation.as_str())
         .context("pre-effect creation identity missing; retain uncertainty")?;
     let intent: LaunchCreationIntent = serde_json::from_value(event.payload.clone())?;
-    let binding = state
-        .runtime_bindings
-        .iter()
-        .find(|b| b.id == record.inputs.binding)
-        .context("launch binding missing")?;
+    let binding = &state.binding;
     ensure!(
         matches!(intent.version, 1 | 2)
             && (intent.version != 2
                 || (intent.route.workspace_id.is_empty() && intent.workspace_token.is_none()))
             && intent.operation == *operation
             && intent.attempt == record.attempt
-            && intent.route == db.worktree_execution_route(record,binding)?.0
+            && intent.route == state.route
             && binding.revision == record.inputs.binding_revision
-            && crate::store::ownership::identity_digest(binding)? == record.inputs.binding_digest
-            && state.approvals.iter().any(|g| g
-                .consumed
-                .as_ref()
-                .is_some_and(|u| u.operation == *operation)),
+            && crate::store::ownership::identity_digest(binding)? == record.inputs.binding_digest,
         "creation recovery provenance changed"
     );
     intent.route.validate().map_err(anyhow::Error::msg)?;
@@ -975,6 +948,7 @@ pub(super) fn create_legacy_resource(
         cancellation,
         false,
         true,
+        None,
     )
 }
 
@@ -994,13 +968,10 @@ pub fn release_gate(
     let guard = crate::execution_guard::RootGuard::exclusive(
         project.parent().context("project root missing")?,
     )?;
-    let mut db = crate::migration::open_active(&project)?;
-    let state = db.read_snapshot(None)?;
-    let delivery = state
-        .deliveries
-        .iter()
-        .find(|d| &d.operation == operation)
-        .context("launch delivery missing")?;
+    let control = crate::store::controlled::ReadControl::new(deadline, cancellation.clone());
+    let mut db = crate::migration::open_active_scoped(&project, control)?;
+    let state = db.resource_recovery_selection(operation, expected_revision)?;
+    let delivery = &state.delivery;
     ensure!(
         delivery.revision == expected_revision
             && delivery.state == crate::operations::DeliveryState::Claimed
@@ -1022,16 +993,12 @@ pub fn release_gate(
         owner: delivery.owner.clone().context("claim owner missing")?,
         lease_until_ms: delivery.lease_until_ms.context("claim lease missing")?,
     };
-    db.validate_claim(&claim, now())?;
+    db.validate_launch_claim(&claim, now())?;
     deadline = deadline.min(
         Instant::now()
             + Duration::from_millis(claim.lease_until_ms.saturating_sub(now()).max(0) as u64),
     );
-    let record = state
-        .attempt_inputs
-        .iter()
-        .find(|r| &r.operation == operation)
-        .context("launch inputs missing")?;
+    let record = &state.record;
     let profile = record
         .inputs
         .effective_profile
@@ -1057,8 +1024,8 @@ pub fn release_gate(
         "gate target does not match launch"
     );
     let brief =
-        crate::memory::render_attempt_brief_held(&project, record.attempt.as_str(), &mut db)?;
-    let worktrees=crate::worktree_preparation::verify_held(&project,&state,record,deadline,cancellation.clone(),guard.inherit()?)?;
+        db.render_attempt_brief(&project, record.attempt.as_str())?;
+    let worktrees=crate::worktree_preparation::verify_events_held(&project,&state.events,record,deadline,cancellation.clone(),guard.inherit()?)?;
     let argv = command(profile, operation, brief.prompt_chars)?;
     executable(&profile.agent, deadline, &cancellation)?;
     let supervisor = crate::worker_supervision::SupervisorObservation::reconnect(
@@ -1286,14 +1253,4 @@ pub(crate) fn validate_server_creation(profile:&FrozenProfile,route:&RuntimeRout
     if !route.workspace_id.is_empty() { return Ok(()); }
     let session=session_identity(Path::new(&route.socket))?;
     Api{executable:&profile.herdr,socket:&route.socket,session:&session,deadline,cancellation,locks}.require_workspace_command(operation)
-}
-
-/// Creation has already happened. Retain the exact observed incarnation even if
-/// the original claim expired or was revoked while the native reply arrived.
-/// This is observation only; it cannot renew permission to release the gate.
-fn retain_observed_target(db:&mut crate::store::SqliteStore,target:&LaunchTarget)->Result<()> {
-    let current=db.read_snapshot(None)?;
-    let delivery=current.deliveries.iter().find(|d|d.operation==target.operation).context("observed launch delivery missing")?;
-    db.observe_launch_target(&PreparedLaunchTarget{target:target.clone()},delivery.revision,current.head,now())?;
-    Ok(())
 }

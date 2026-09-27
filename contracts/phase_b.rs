@@ -1,4 +1,5 @@
-//! Compiled interface contract for W03–W07, not wired to Phase A persistence.
+//! Historical W03–W07 interface sketch; not compiled or used by the runtime.
+//! Production types live under src/domain; CLI workflows validate their behavior.
 #![allow(dead_code)]
 use serde::{Deserialize, Serialize};
 macro_rules! ids {

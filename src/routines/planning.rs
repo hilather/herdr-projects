@@ -1,7 +1,7 @@
 //! Routine intent planning under ownership already held by a background job.
 use std::{path::Path,time::Instant};
 use anyhow::{Result,ensure};
-use crate::{domain::{PreparedRoutineTick,ProjectState,RoutineDefinition},execution_guard::{ProjectGuard,exclusive_file},migration,runner::Cancellation};
+use crate::{domain::{PreparedRoutineTick,RoutineDefinition},execution_guard::{ProjectGuard,exclusive_file},migration,runner::Cancellation};
 
 /// Liveness and rotation bookkeeping, never permission to execute a command.
 #[derive(Debug,Default)]
@@ -27,16 +27,11 @@ fn check(cancellation:&Cancellation,deadline:Instant)->Result<()> {
 
 fn plan(project:&Path,last:Option<&str>,guard:&ProjectGuard,cancellation:&Cancellation,deadline:Instant,validate:impl FnOnce(&RoutineDefinition)->Result<()>)->Result<PlannedRoutine> {
     check(cancellation,deadline)?;guard.check_project(project)?;
-    let mut db=migration::open_active_controlled(project,crate::store::controlled::ReadControl::new(deadline,cancellation.clone()))?;
+    let mut db=migration::open_active_scoped(project,crate::store::controlled::ReadControl::new(deadline,cancellation.clone()))?;
     check(cancellation,deadline)?;
-    let snapshot=db.read_snapshot(None)?;
+    let (head,definition)=db.routine_planning_selection(last)?;
     check(cancellation,deadline)?;
-    if snapshot.schema_version<16||snapshot.control.as_ref().is_none_or(|c|c.state!=ProjectState::Active||c.reconciliation_required){return Ok(PlannedRoutine::default());}
-    let mut latest=std::collections::BTreeMap::new();
-    for definition in snapshot.routine_revisions {latest.insert(definition.name.clone(),definition);}
-    let enabled=latest.into_values().filter(|d|d.enabled).collect::<Vec<_>>();
-    let Some(first)=enabled.first()else{return Ok(PlannedRoutine::default());};
-    let definition=last.and_then(|last|enabled.iter().find(|d|d.name.as_str()>last)).unwrap_or(first).clone();
+    let Some(definition)=definition else{return Ok(PlannedRoutine::default());};
     ensure!(definition.project_store==project.join(".state/state.db").canonicalize()?.to_string_lossy(),"routine belongs to another project");
     let validated=validate(&definition);
     check(cancellation,deadline)?;guard.check_project(project)?;
@@ -46,7 +41,7 @@ fn plan(project:&Path,last:Option<&str>,guard:&ProjectGuard,cancellation:&Cancel
     // acquired afterward; the transaction must still match the original head.
     let _record=exclusive_file(&project.join(".state/lock"))?;
     check(cancellation,deadline)?;guard.check_project(project)?;
-    db.schedule_routine(&PreparedRoutineTick{definition,now:jiff::Timestamp::now().as_millisecond()},snapshot.head)?;
+    db.schedule_routine(&PreparedRoutineTick{definition,now:jiff::Timestamp::now().as_millisecond()},head)?;
     Ok(report)
 }
 

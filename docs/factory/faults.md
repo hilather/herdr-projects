@@ -2,8 +2,9 @@
 
 Rehearsal of faults this design already implements. It is not a live
 40-worker certificate, not a dollar ledger, and not a remote merge.
-`factory_admission` stays `off`. Fresh stores keep `max_active_workers` at
-0. `PREPARED_LAUNCH_DISPATCH_ENABLED` stays true. Schema stays 41. No
+`factory_admission` defaults to `off`. Fresh stores keep `max_active_workers` at
+0. `PREPARED_LAUNCH_DISPATCH_ENABLED` stays true. Correction fixtures use current
+schema 43; this rehearsal does not upgrade real project stores. No
 `recovery_epoch`. Effects are not replayed. `.state/state.db` is not
 overwritten in place.
 
@@ -26,6 +27,23 @@ not release capacity.
 
 `herdr-projects factory status PROJECT` prints counters. It does not launch
 or admit. There is no `factory PROJECT status` command.
+
+`counters.active_inventory_page_rows` measures only the first inventory page
+read by that status request. It is not a measurement of controller or admission
+work. `counters.rows_decoded` is currently `null`: complete decision-path row
+instrumentation is still pending. Neither a small inventory count nor an unknown
+value establishes that the factory scale gate passed.
+
+Admission ticker logs now include `sql_work` from the connection used for that
+decision, on both success and error. `sqlite_rows_returned` counts SQLite row
+notifications (including scalar queries); `sqlite_vm_steps` counts instructions
+in completed or reset statements, including interrupted statements. These are
+not decoded-object counts, elapsed SQL time, or a memory measurement. Opening
+checks after hook installation are included; filesystem/Git work and the earlier
+controller enabled probe are excluded. `duration_ms` covers the observed admission
+call. `connection_observed: false` means the call ended before the SQL observer
+was attached; zero counts then do not establish zero database work. A log without
+an observation has `sql_work: null`. No SQL text or row values enter these logs.
 
 ## Faults
 

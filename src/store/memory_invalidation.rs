@@ -16,10 +16,15 @@ pub(super) fn dependents(
     let mut stmt=tx.prepare("WITH RECURSIVE affected(id,revision) AS (
         SELECT derived_record,derived_revision FROM memory_dependencies WHERE source_record=?1 AND source_revision=?2
         UNION SELECT d.derived_record,d.derived_revision FROM memory_dependencies d JOIN affected a ON d.source_record=a.id AND d.source_revision=a.revision
-        ) SELECT id,revision FROM affected LIMIT 10001")?;
+        ) SELECT a.id,a.revision,EXISTS(
+            SELECT 1 FROM memory_records r JOIN memory_heads h ON h.record_id=r.id
+            JOIN memory_validity v ON v.record_id=h.record_id AND v.revision=h.revision
+            WHERE r.id=a.id AND h.revision=a.revision AND h.status='active' AND v.state='valid'
+              AND (r.is_hard=1 OR r.kind IN ('constraint','hard_memory','contract'))
+        ) FROM affected a LIMIT 10001")?;
     let rows = stmt
         .query_map(params![source, integer(revision)?], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?))
+            Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?, r.get::<_, bool>(2)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     if rows.len() > 10000 {
@@ -27,11 +32,16 @@ pub(super) fn dependents(
             "memory dependency invalidation exceeds 10000 revisions".into(),
         ));
     }
-    for (id, rev) in rows {
+    // Bound the source's complete barrier fan-out before removing any routing
+    // rows. Per-derived-record batches could otherwise evade the source limit.
+    // A required derived head also moves the global catalog/required fence.
+    super::barriers::memory_changed(tx, if rows.iter().any(|row| row.2) { None } else { Some(source) }, sequence)?;
+    for (id, rev, _) in rows {
         let changed=tx.execute("UPDATE memory_validity SET state='stale',reason='dependency_changed',evaluated_seq=?3
             WHERE record_id=?1 AND revision=?2 AND state='valid'
             AND EXISTS(SELECT 1 FROM memory_heads h WHERE h.record_id=?1 AND h.revision=?2 AND h.status='active')",params![id,integer(rev)?,integer(sequence)?])?;
         if changed != 0 {
+            super::barriers::memory_changed(tx, Some(&id), sequence)?;
             let cause = format!("dependency:{sequence}:{source}:{revision}");
             super::memory_delivery::record_change(
                 tx,
@@ -54,6 +64,7 @@ pub(super) fn changed(
     reason: &str,
 ) -> Result<()> {
     dependents(tx, id, revision, sequence)?;
+    super::barriers::memory_changed(tx, Some(id), sequence)?;
     super::memory_delivery::record_change(
         tx,
         &format!("{reason}:{sequence}"),

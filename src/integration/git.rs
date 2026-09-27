@@ -20,6 +20,7 @@ const ALLOWED: &[&str] = &[
     "commit-tree",
     "update-ref",
     "cat-file",
+    "ls-tree",
     "checkout",
     "worktree",
     "pack-objects",
@@ -97,6 +98,7 @@ fn git_env() -> Vec<(String, String)> {
         ("GIT_TERMINAL_PROMPT".into(), "0".into()),
         ("GIT_NO_LAZY_FETCH".into(), "1".into()),
         ("GIT_NO_REPLACE_OBJECTS".into(), "1".into()),
+        ("GIT_LITERAL_PATHSPECS".into(), "1".into()),
         ("GIT_OPTIONAL_LOCKS".into(), "0".into()),
         ("GIT_ALLOW_PROTOCOL".into(), "".into()),
         ("GIT_AUTHOR_NAME".into(), "integrator".into()),
@@ -230,6 +232,7 @@ impl GitRepo {
             &work,
             &[
                 "init".into(),
+                format!("--object-format={}", if self.object_len()? == 64 { "sha256" } else { "sha1" }),
                 "--template".into(),
                 template.display().to_string(),
                 isolated.display().to_string(),
@@ -360,6 +363,7 @@ impl GitRepo {
             work,
             &[
                 "init".into(),
+                format!("--object-format={}", if self.object_len()? == 64 { "sha256" } else { "sha1" }),
                 "--template".into(),
                 template.display().to_string(),
                 isolated.display().to_string(),
@@ -433,6 +437,28 @@ impl GitRepo {
             && actual_tree.stdout.trim() == tree
             && first.stdout.trim() == parent_base
             && second.stdout.trim() == parent_verified)
+    }
+
+    /// Inspect the exact committed tree, not a mutable checkout. Git does not
+    /// follow symlinks while resolving tree paths, including ancestor symlinks.
+    /// One bounded invocation covers the contract's at-most-64 literal paths.
+    pub fn required_outputs_present(&self, commit: &str, required: &[String]) -> Result<bool> {
+        if required.is_empty() { return Ok(true); }
+        let mut args = vec!["ls-tree".into(), "-z".into(), "--full-tree".into(), commit.into(), "--".into()];
+        // Prefix literal paths so a file named "push" is not mistaken for a
+        // transport command by the conservative command guard.
+        args.extend(required.iter().map(|path| format!("./{path}")));
+        let output = run_git(&self.path, &args)?;
+        if !output.success() { bail!("integration output tree inspection failed"); }
+        let mut files = std::collections::BTreeSet::new();
+        for entry in output.stdout_bytes.split(|byte| *byte == 0).filter(|entry| !entry.is_empty()) {
+            let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else { bail!("invalid integration output tree entry"); };
+            let header = &entry[..tab];
+            if header.starts_with(b"100644 blob ") || header.starts_with(b"100755 blob ") {
+                files.insert(entry[tab+1..].to_vec());
+            }
+        }
+        Ok(required.iter().all(|path| files.contains(path.as_bytes())))
     }
 
     /// Compare-and-swap. A missing expected oid is a refused command, not a forced update.

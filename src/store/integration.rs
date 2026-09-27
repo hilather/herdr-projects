@@ -238,6 +238,26 @@ impl SqliteStore {
         found.ok_or_else(|| invalid("integration operation is missing"))
     }
 
+    /// Read output requirements from the immutable signed contract. This is
+    /// separate from current authority: reconciliation still has to classify
+    /// an observed external effect after authority has been withdrawn.
+    pub(crate) fn integration_required_outputs(&mut self, result: &str) -> Result<Vec<String>> {
+        let tx = self.connection.transaction()?;
+        schema28(&tx)?;
+        let (raw,digest,task,revision): (Option<Vec<u8>>,String,String,u64) = tx.query_row(
+            "SELECT CASE WHEN length(c.raw_bytes)<=65536 THEN c.raw_bytes END,c.raw_digest,c.task_id,c.contract_revision
+             FROM verified_results r JOIN verification_runs v ON v.run_id=r.run_id AND v.submission_id=r.submission_id
+             JOIN task_contracts c ON c.task_id=v.task_id AND c.contract_revision=v.contract_revision AND c.raw_digest=v.contract_digest
+             WHERE r.result_id=?1", [result], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+        let raw = raw.ok_or_else(|| StoreError::Limit("integration contract exceeds 64 KiB".into()))?;
+        let contract = PreparedContract::parse_verified(&raw).map_err(StoreError::Corrupt)?;
+        if contract.digest != digest || contract.task_id.as_str() != task || contract.contract_revision != revision {
+            return Err(StoreError::Corrupt("integration contract binding mismatch".into()));
+        }
+        tx.commit()?;
+        Ok(contract.required_outputs)
+    }
+
     pub(crate) fn load_verified_for_integration(
         &mut self,
         result_id: &str,
@@ -299,6 +319,7 @@ impl SqliteStore {
         if sha256_hex(policy_body.as_bytes()) != policy_digest {
             return Err(StoreError::Corrupt("acceptance policy digest mismatch".into()));
         }
+        super::contract_binding::require_verified_result_barrier(&tx, &result_id, jiff::Timestamp::now().as_millisecond())?;
         tx.commit()?;
         Ok(VerifiedIntegration {
             result_id,
@@ -322,6 +343,7 @@ impl SqliteStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         schema28(&tx)?;
+        super::contract_binding::require_verified_result_barrier(&tx, &begin.verified.result_id, jiff::Timestamp::now().as_millisecond())?;
         let configured: Option<String> = tx
             .query_row(
                 "SELECT ref_name FROM integration_targets WHERE repository=?1",
@@ -518,6 +540,8 @@ impl SqliteStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         schema28(&tx)?;
         claim_held(&tx, claim, now)?;
+        let result_id: String = tx.query_row("SELECT verified_result_id FROM integration_operations WHERE operation_id=?1", [claim.operation.as_str()], |row| row.get(0))?;
+        super::contract_binding::require_verified_result_barrier(&tx, &result_id, now)?;
         // Remember that update-ref was attempted so a later third OID is not a stale base.
         let updated = tx.execute(
             "UPDATE integration_operations SET reason='publish_attempted' WHERE operation_id=?1 AND state='validating'",
@@ -674,6 +698,32 @@ fn apply_finish(
                     .tree_oid
                     .clone()
                     .ok_or_else(|| invalid("integration candidate is missing"))?;
+                match super::contract_binding::require_verified_result_barrier(tx, &view.verified_result_id, now) {
+                    Ok(()) => {},
+                    Err(StoreError::Invalid(_) | StoreError::Conflict) => {
+                        // Confirm is a trusted observation of the external ref.
+                        // Retain that observation even when its authority was
+                        // withdrawn during update-ref; never issue an applicable
+                        // integration receipt or claim the effect did not occur.
+                        apply_finish(tx, operation_id, &IntegrationFinish::Reconciliation {
+                            reason: "required_barrier_changed_after_publish",
+                        }, now)?;
+                        tx.execute(
+                            "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('integration.observed_stale_publication',?1,1,1,?2)",
+                            params![operation_id, serde_json::json!({
+                                "verified_result_id": view.verified_result_id,
+                                "candidate_id": candidate_id,
+                                "repository": view.repository,
+                                "ref_name": view.ref_name,
+                                "observed_commit_oid": commit_oid,
+                                "tree_oid": tree_oid,
+                                "reason": "required_barrier_changed_after_publish"
+                            }).to_string()],
+                        )?;
+                        return Ok(());
+                    },
+                    Err(error) => return Err(error),
+                }
                 let integrated_id = sha256_hex(
                     format!("{operation_id}\0{candidate_id}\0{commit_oid}").as_bytes(),
                 );
@@ -697,6 +747,12 @@ fn apply_finish(
                         created
                     ],
                 )?;
+                // Confirm is emitted only by the native integrator after its
+                // exact-commit output check. Historical replay never comes here.
+                let schema: u32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+                if schema >= 43 {
+                    tx.execute("INSERT INTO integration_contract_checks(integrated_id,version) VALUES(?1,1)", [&integrated_id])?;
+                }
                 // The wake event is not evidence. The satisfaction row is the stored receipt.
                 super::satisfaction::record_integrated_commit(tx, &integrated_id)?;
                 tx.execute(
@@ -896,6 +952,7 @@ impl SqliteStore {
                 now
             ],
         )?;
+        tx.execute("INSERT INTO verification_contract_checks VALUES(?1,2)",[&result_id])?;
         tx.commit()?;
         Ok(result_id)
     }
@@ -980,7 +1037,7 @@ mod tests {
     fn upgrade_v1_from_27_to_28_preserves_historical_dependencies() {
         let fresh = tempfile::tempdir().unwrap();
         let created = SqliteStore::create(&fresh.path().join("state.db")).unwrap();
-        assert_eq!(user_version(&created.connection), 41);
+        assert_eq!(user_version(&created.connection), crate::store::SCHEMA);
         assert!(table_exists(&created.connection, "integration_operations"));
         assert!(table_exists(&created.connection, "integration_candidates"));
         assert!(table_exists(&created.connection, "integrated_commits"));
@@ -1031,9 +1088,7 @@ mod tests {
         let before = db.testing_dependencies().unwrap();
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
-        raw.execute_batch(
-            "DROP INDEX IF EXISTS attempts_retained_by_id; DROP TABLE IF EXISTS active_work_index; DROP TABLE IF EXISTS active_work_meta; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_update; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_delete; DROP TRIGGER IF EXISTS barrier_members_no_update; DROP TRIGGER IF EXISTS barrier_members_no_delete; DROP TRIGGER IF EXISTS barrier_revisions_no_membership_update; DROP TABLE IF EXISTS barrier_stale_briefs; DROP TABLE IF EXISTS barrier_members; DROP TABLE IF EXISTS barrier_revisions; DROP TRIGGER IF EXISTS memory_change_receipts_no_update; DROP TRIGGER IF EXISTS memory_change_receipts_no_delete; DROP TRIGGER IF EXISTS update_package_members_no_update; DROP TRIGGER IF EXISTS update_package_members_no_delete; DROP TRIGGER IF EXISTS update_packages_no_update; DROP TRIGGER IF EXISTS update_packages_no_delete; DROP TABLE IF EXISTS memory_change_receipts; DROP TABLE IF EXISTS update_package_members; ALTER TABLE consumer_bindings DROP COLUMN applied_cursor; DROP TABLE IF EXISTS update_packages; DROP TRIGGER IF EXISTS memory_read_set_on_record; DROP TRIGGER IF EXISTS memory_read_set_on_reclassify; DROP TRIGGER IF EXISTS memory_read_set_on_revision; DROP TRIGGER IF EXISTS memory_read_set_on_validity; DROP TRIGGER IF EXISTS memory_read_set_on_head; DROP TABLE IF EXISTS memory_scope_catalog; DROP TABLE IF EXISTS memory_required_generation; DROP TABLE IF EXISTS consumer_binding_undeliverable; DROP TABLE IF EXISTS consumer_binding_obligations; DROP TABLE IF EXISTS consumer_bindings; DROP TABLE IF EXISTS wait_replay_events; DROP TABLE IF EXISTS replan_requests; DROP TABLE IF EXISTS replan_budget_resets; DROP TABLE IF EXISTS attempt_infrastructure_retries; DROP TABLE IF EXISTS wait_conditions; DROP TABLE IF EXISTS resource_claims; DROP TABLE IF EXISTS delegation_stop_obligations; DROP TABLE IF EXISTS delegation_revocations; DROP TABLE IF EXISTS delegation_grants; DROP TABLE IF EXISTS capability_evidence; DROP TABLE IF EXISTS contract_named_resources; DROP TABLE IF EXISTS contract_scope_paths; DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; DROP TABLE IF EXISTS dependency_satisfactions; DROP TABLE IF EXISTS factory_admission_policies; ALTER TABLE project_control DROP COLUMN factory_admission; DROP TABLE IF EXISTS feedback_claims; DROP TABLE IF EXISTS feedback_items; DROP TABLE IF EXISTS integrated_commits; DROP TABLE IF EXISTS integration_candidates; DROP TABLE IF EXISTS integration_operations; DROP TABLE IF EXISTS integration_target_leases; DROP TABLE IF EXISTS integration_targets; UPDATE store_meta SET schema_version=27; PRAGMA user_version=27;",
-        )
+        crate::store::test_schema::historical(&raw, 27)
         .unwrap();
         drop(raw);
         let mut db = SqliteStore::open(&path).unwrap();
@@ -1058,12 +1113,12 @@ mod tests {
             Err(StoreError::UnsupportedSchema(27))
         ));
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 41);
+        assert_eq!(user_version(&db.connection), crate::store::SCHEMA);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            41
+            crate::store::SCHEMA
         );
         assert!(table_exists(&db.connection, "integrated_commits"));
         assert_eq!(db.testing_dependencies().unwrap(), before);
@@ -1099,6 +1154,6 @@ mod tests {
         check_schema(&db.connection).unwrap();
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 41);
+        assert_eq!(user_version(&reopened.connection), crate::store::SCHEMA);
     }
 }

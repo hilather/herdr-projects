@@ -24,13 +24,25 @@ pub(super) fn read_all_with_budget(db:&Connection,budget:Option<&read_budget::Re
     }
     Ok(policies)
 }
-fn current(db:&Connection)->Result<Option<BudgetPolicy>> {
+pub(super) fn current_with_budget(db:&Connection,budget:Option<&read_budget::ReadBudget>)->Result<Option<BudgetPolicy>> {
     let version:u32=db.query_row("PRAGMA user_version",[],|r|r.get(0))?;
     if version<14 {return Ok(None);}
-    Ok(read_all(db)?.pop())
+    let mut stmt=db.prepare("SELECT revision,payload,payload_hash FROM budget_policies ORDER BY revision DESC LIMIT 1")?;
+    let mut rows=stmt.query([])?;
+    let row:Option<(u64,String,String)>=if let Some(row)=rows.next()? {
+        if let Some(budget)=budget {budget.row(row,&[(1,2)])?;}
+        Some((row.get(0)?,row.get(1)?,row.get(2)?))
+    } else {None};
+    row.map(|(revision,payload,digest)| {
+        if payload.len()>MAX_RECORD_BYTES || format!("{:x}",Sha256::digest(payload.as_bytes()))!=digest { return Err(StoreError::Corrupt("budget payload hash mismatch".into())); }
+        let policy:BudgetPolicy=serde_json::from_str(&payload).map_err(|_|StoreError::Corrupt("invalid budget record".into()))?;
+        if policy.revision!=revision || policy.reference().map_err(StoreError::Corrupt)?.digest!=digest { return Err(StoreError::Corrupt("budget identity mismatch".into())); }
+        Ok(policy)
+    }).transpose()
 }
-pub(super) fn report(db:&Connection,reserved:bool)->Result<BudgetReport> {
-    let policy=current(db)?;
+pub(super) fn report(db:&Connection,reserved:bool)->Result<BudgetReport> {report_with_budget(db,reserved,None)}
+fn report_with_budget(db:&Connection,reserved:bool,budget:Option<&read_budget::ReadBudget>)->Result<BudgetReport> {
+    let policy=current_with_budget(db,budget)?;
     let count:u64=db.query_row("SELECT count(*) FROM attempts",[],|r|r.get(0))?;
     let mut blockers=Vec::new();
     let mut incomplete=false;
@@ -49,16 +61,47 @@ pub(super) fn report(db:&Connection,reserved:bool)->Result<BudgetReport> {
     }
     Ok(BudgetReport{policy,admitted_attempts:count,provider_tokens:UsageAvailability::Unknown,incomplete,blockers})
 }
-pub(super) fn check(db:&Connection,reference:Option<&VersionedReference>,reserved:bool)->Result<()> {
-    let report=report(db,reserved)?;
-    let current=report.policy.as_ref().map(BudgetPolicy::reference).transpose().map_err(|s|invalid(&s))?;
+/// Decision paths need a threshold, not the administrative lifetime total.
+fn blockers_for_policy(db:&Connection,policy:Option<&BudgetPolicy>,reserved:bool,budget:Option<&read_budget::ReadBudget>)->Result<Vec<String>> {
+    if let Some(budget)=budget {budget.check()?;}
+    let Some(policy)=policy else {return Ok(Vec::new());};
+    let mut blockers=Vec::new();
+    if let Some(cap)=policy.limits.max_attempts {
+        // A reserved attempt already occupies one unit. Preserve count > cap
+        // for its claim/brief checks, versus count >= cap before reservation.
+        let threshold=cap+u64::from(reserved);
+        if threshold<=i64::MAX as u64 {
+            let count:u64=read_budget::one(db,
+                "SELECT count(*) FROM (SELECT 1 FROM attempts LIMIT ?1)",
+                [threshold as i64],budget,&[],|row|row.get(0))?;
+            if count>=threshold {blockers.push("attempt_budget_exhausted".into());}
+        }
+    }
+    if policy.limits.max_provider_tokens==Some(0) {blockers.push("provider_token_budget_exhausted".into());}
+    else if policy.limits.max_provider_tokens.is_some() && policy.limits.unknown_usage==UnknownUsagePolicy::Refuse {blockers.push("provider_usage_unavailable".into());}
+    if let Some(budget)=budget {budget.check()?;}
+    Ok(blockers)
+}
+pub(super) fn admission_blockers_with_budget(db:&Connection,budget:&read_budget::ReadBudget)->Result<Vec<String>> {
+    let policy=current_with_budget(db,Some(budget))?;
+    blockers_for_policy(db,policy.as_ref(),false,Some(budget))
+}
+
+pub(super) fn check_with_budget(db:&Connection,reference:Option<&VersionedReference>,reserved:bool,budget:Option<&read_budget::ReadBudget>)->Result<()> {
+    let policy=current_with_budget(db,budget)?;
+    let current=policy.as_ref().map(BudgetPolicy::reference).transpose().map_err(|s|invalid(&s))?;
     if current.as_ref()!=reference {return Err(invalid("budget policy changed or is not pinned"));}
-    if !report.blockers.is_empty() {return Err(invalid("budget admission refused"));}
+    if !blockers_for_policy(db,policy.as_ref(),reserved,budget)?.is_empty() {return Err(invalid("budget admission refused"));}
     Ok(())
 }
+
 impl SqliteStore {
     pub fn budget_report(&mut self)->Result<BudgetReport> {
         let tx=self.connection.transaction()?;check_schema(&tx)?;
+        // Administrative reports retain full history validation; admission's
+        // transactional check reads only the policy currently in force.
+        let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
+        if version>=14 {read_all(&tx)?;}
         let result=report(&tx,false)?;tx.commit()?;Ok(result)
     }
     pub fn install_budget(&mut self,prepared:&PreparedBudget,expected_head:u64)->Result<VersionedReference> {

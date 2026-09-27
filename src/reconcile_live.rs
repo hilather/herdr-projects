@@ -30,7 +30,7 @@ fn map_store(error:herdr_projects::store::StoreError)->anyhow::Error {
 }
 fn collect_limited(ctx:&Ctx,project:&Path,control:Option<&herdr_projects::store::controlled::ReadControl>)->Result<ObservationBatch> {
     let run=match control {
-        Some(control)=>migration::open_active_controlled(project,control.clone())?.reconcile_active_work(None).map_err(map_store)?,
+        Some(control)=>migration::open_active_scoped(project,control.clone())?.reconcile_active_work(None).map_err(map_store)?,
         None=>migration::open_active(project)?.reconcile_active_work(None).map_err(map_store)?,
     };
     ensure!(run.coverage==herdr_projects::store::ActiveCoverage::Complete,"active inventory coverage incomplete; capacity retained");
@@ -95,7 +95,7 @@ fn collect_limited(ctx:&Ctx,project:&Path,control:Option<&herdr_projects::store:
     }
     ensure!(migration::config_reference(Path::new(&config.path))?==config,"config changed during observation; retry");
     let after=match control {
-        Some(control)=>migration::open_active_controlled(project,control.clone())?.current_head().map_err(map_store)?,
+        Some(control)=>migration::open_active_scoped(project,control.clone())?.current_head().map_err(map_store)?,
         None=>migration::open_active(project)?.current_head().map_err(map_store)?,
     };
     ensure!(after==head,"project changed during observation; retry");

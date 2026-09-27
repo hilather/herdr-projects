@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{TaskId, VersionedReference};
+#[cfg(test)]
+mod delegation_tests;
+#[cfg(test)]
+mod contract_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -125,6 +129,11 @@ pub struct PreparedContract {
     pub(crate) route: ContractRoute,
     pub(crate) authority: VersionedReference,
     pub(crate) acceptance_policies: Vec<AcceptancePolicy>,
+    pub(crate) dependencies: Vec<ContractDependency>,
+    pub(crate) required_barrier: Option<super::BarrierReleaseReference>,
+    pub(crate) profile_kind: String,
+    pub(crate) capability_flags: Vec<String>,
+    pub(crate) required_outputs: Vec<String>,
     pub(crate) scope_paths: Vec<ContractScopePath>,
     pub(crate) named_resources: Vec<ContractNamedResource>,
 }
@@ -246,12 +255,16 @@ struct UntrustedAcceptancePolicy {
     text: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct UntrustedDependency {
-    predecessor: TaskId,
-    edge: String,
-    policy_id: String,
+pub(crate) struct ContractDependency {
+    pub(crate) predecessor: TaskId,
+    pub(crate) edge: String,
+    pub(crate) policy_id: String,
+    /// Exact predecessor policy. Legacy documents derive this from the local
+    /// policy with the same ID; explicit digests allow independent producers.
+    #[serde(default)]
+    pub(crate) policy_digest: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -279,6 +292,13 @@ struct UntrustedScope {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct UntrustedOutput {
+    path: String,
+    kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UntrustedContractDocument {
     version: u32,
     project_store: String,
@@ -295,9 +315,13 @@ struct UntrustedContractDocument {
     object_format: ObjectFormat,
     #[serde(default)]
     memory_snapshot_id: Option<String>,
-    dependencies: Vec<UntrustedDependency>,
+    dependencies: Vec<ContractDependency>,
+    #[serde(default)]
+    required_barrier: Option<super::BarrierReleaseReference>,
     #[serde(default)]
     scope: UntrustedScope,
+    #[serde(default)]
+    outputs: Option<Vec<UntrustedOutput>>,
     capability_flags: Vec<String>,
     profile_kind: String,
     retry_class: String,
@@ -397,12 +421,18 @@ impl PreparedContract {
 
 impl UntrustedContractDocument {
     fn into_prepared(self, raw: &[u8]) -> Result<PreparedContract, String> {
-        if self.version != 1
+        if !matches!(self.version, 1 | 2 | 3)
             || self.contract_revision == 0
             || self.contract_revision > i64::MAX as u64
             || self.expected_head > i64::MAX as u64
         {
             return Err("invalid contract version or revision".into());
+        }
+        match (self.version, &self.required_barrier) {
+            (1, None) => {},
+            (2 | 3, Some(reference)) => reference.validate()?,
+            (3, None) => {},
+            _ => return Err("version 2 requires an exact barrier release; version 1 cannot require one".into()),
         }
         if self
             .plan_revision
@@ -465,9 +495,9 @@ impl UntrustedContractDocument {
                 return Err("invalid capability flag".into());
             }
         }
+        let mut predecessors = std::collections::BTreeSet::new();
         for dependency in &self.dependencies {
-            // The predecessor stays inside the signed bytes. This schema does not satisfy it.
-            if dependency.predecessor == self.task_id
+            if !predecessors.insert(&dependency.predecessor) || dependency.predecessor == self.task_id
                 || !matches!(
                     dependency.edge.as_str(),
                     "verified_result"
@@ -475,7 +505,11 @@ impl UntrustedContractDocument {
                         | "integration_candidate"
                         | "landed_commit"
                 )
-                || !seen_policies.contains(&dependency.policy_id)
+                || !identifier(&dependency.policy_id)
+                || match &dependency.policy_digest {
+                    Some(digest) => !hex_oid(digest, ObjectFormat::Sha256),
+                    None => !seen_policies.contains(&dependency.policy_id),
+                }
             {
                 return Err("invalid contract dependency".into());
             }
@@ -496,6 +530,26 @@ impl UntrustedContractDocument {
                 access,
                 certainty,
             });
+        }
+        let outputs = match (self.version, self.outputs) {
+            (3, Some(outputs)) if !outputs.is_empty() && outputs.len() <= 64 => outputs,
+            (1 | 2, None) => Vec::new(),
+            _ => return Err("version 3 requires 1..64 outputs; older versions cannot declare outputs".into()),
+        };
+        let mut required_outputs = Vec::new();
+        let mut seen_outputs = std::collections::BTreeSet::new();
+        for output in outputs {
+            let (path, certainty) = normalize_scope_path(&output.path)?;
+            if output.kind != "git_file" || path != output.path
+                || certainty != ScopeCertainty::Exact
+                || path.split('/').any(|part| part.eq_ignore_ascii_case(".git"))
+                || !seen_outputs.insert(path.clone())
+                || !scope_paths.iter().any(|scope| scope.access == ScopeAccess::Write
+                    && (scope.path == path || (scope.path.ends_with('/') && path.starts_with(&scope.path))))
+            {
+                return Err("output must be a unique literal git file inside declared write scope".into());
+            }
+            required_outputs.push(path);
         }
         let mut seen_resources = std::collections::BTreeSet::new();
         let mut named_resources = Vec::new();
@@ -522,6 +576,11 @@ impl UntrustedContractDocument {
             route: self.route,
             authority: self.authority,
             acceptance_policies,
+            dependencies: self.dependencies,
+            required_barrier: self.required_barrier,
+            profile_kind: self.profile_kind,
+            capability_flags: self.capability_flags,
+            required_outputs,
             scope_paths,
             named_resources,
         })
@@ -579,6 +638,62 @@ pub struct PreparedDelegation {
     pub(crate) policy_revision: u64,
     pub(crate) project_store: String,
     pub(crate) authority: VersionedReference,
+    /// Version 1 remains inspection-only. Version 2 binds finite reservation scope.
+    pub(crate) reservation_scope: Option<DelegationReservationScope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DelegationRepositoryBase {
+    pub(crate) repository: String,
+    #[serde(rename="ref")]
+    pub(crate) git_ref: String,
+    pub(crate) commit_oid: String,
+    pub(crate) object_format: ObjectFormat,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DelegationReservationScope {
+    pub(crate) task_contracts: Vec<VersionedReference>,
+    pub(crate) profiles: Vec<VersionedReference>,
+    pub(crate) budget: VersionedReference,
+    pub(crate) repository_bases: Vec<DelegationRepositoryBase>,
+    pub(crate) max_total_attempts: u32,
+}
+
+impl DelegationReservationScope {
+    fn validate(&self, concurrent:u32,repositories:&[DelegationRepoScope])->Result<(),String> {
+        fn reference(value:&VersionedReference)->bool {
+            plain(&value.id,512)&&value.revision>0&&value.revision<=i64::MAX as u64&&hex_oid(&value.digest,ObjectFormat::Sha256)
+        }
+        fn references(values:&[VersionedReference],limit:usize)->bool {
+            !values.is_empty()&&values.len()<=limit&&values.iter().all(reference)
+                &&values.windows(2).all(|pair|pair[0].id<pair[1].id)
+        }
+        if !(1..=1024).contains(&self.max_total_attempts)||self.max_total_attempts<concurrent {
+            return Err("invalid delegation total attempt limit".into());
+        }
+        if !references(&self.task_contracts,128)||self.task_contracts.iter().any(|r|TaskId::new(&r.id).is_err()) {
+            return Err("delegation task contracts must be bounded, unique and sorted by task id".into());
+        }
+        if !references(&self.profiles,8)||!reference(&self.budget) {
+            return Err("delegation requires sorted exact profiles and a budget reference".into());
+        }
+        if self.repository_bases.len()!=repositories.len() {
+            return Err("delegation must pin every repository/ref base".into());
+        }
+        let mut previous=None;
+        for base in &self.repository_bases {
+            let key=(&base.repository,&base.git_ref);
+            if previous.is_some_and(|prior|prior>=key)||!hex_oid(&base.commit_oid,base.object_format)
+                ||!repositories.iter().any(|repo|repo.repository==base.repository&&repo.git_ref==base.git_ref) {
+                return Err("delegation repository bases must be exact, unique, sorted and object-format bound".into());
+            }
+            previous=Some(key);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -606,6 +721,8 @@ struct UntrustedDelegationDocument {
     policy_revision: u64,
     project_store: String,
     authority: VersionedReference,
+    #[serde(default)]
+    reservation_scope: Option<DelegationReservationScope>,
 }
 
 fn ssh_ed25519_key(value: &str) -> bool {
@@ -665,7 +782,7 @@ impl PreparedDelegation {
 
 impl UntrustedDelegationDocument {
     fn into_prepared(self, raw: &[u8]) -> Result<PreparedDelegation, String> {
-        if self.version != 1 {
+        if !matches!(self.version,1|2) {
             return Err("invalid delegation version".into());
         }
         if self.child_delegation != "forbidden" {
@@ -755,6 +872,16 @@ impl UntrustedDelegationDocument {
         {
             return Err("invalid delegation authority reference".into());
         }
+        match (self.version,&self.reservation_scope) {
+            (1,None)=>{},
+            (2,Some(scope))=>{
+                if actions!=[DelegationAction::ReserveAttempt] {
+                    return Err("version-2 delegation is scoped to reserve_attempt only".into());
+                }
+                scope.validate(self.max_concurrent_attempts,&repositories)?;
+            },
+            _=>return Err("delegation version and reservation scope disagree".into()),
+        }
         let prepared = PreparedDelegation {
             digest: format!("{:x}", Sha256::digest(raw)),
             raw: raw.to_vec(),
@@ -771,6 +898,7 @@ impl UntrustedDelegationDocument {
             policy_revision: self.policy_revision,
             project_store: self.project_store,
             authority: self.authority,
+            reservation_scope:self.reservation_scope,
         };
         // SQLite length() is characters. A longer column fails the CHECK as a
         // constraint conflict, which ingress would record as a stale head.

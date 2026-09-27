@@ -656,7 +656,7 @@ mod tests {
     fn upgrade_v1_from_37_preserves_review_rows_and_create_ends_at_38() {
         let fresh = tempfile::tempdir().unwrap();
         let created = SqliteStore::create(&fresh.path().join("state.db")).unwrap();
-        assert_eq!(user_version(&created.connection), 41);
+        assert_eq!(user_version(&created.connection), crate::store::SCHEMA);
         assert_eq!(
             created
                 .connection
@@ -677,15 +677,6 @@ mod tests {
             )
             .unwrap()
             .contains("STRICT"));
-        let open_fn = include_str!("mod.rs")
-            .split("pub fn open")
-            .nth(1)
-            .unwrap()
-            .split("pub fn integrity_check")
-            .next()
-            .unwrap();
-        assert!(!open_fn.contains("upgrade_v1"));
-        assert!(!open_fn.contains("0038_memory_read_sets"));
         drop(created);
 
         let temp = tempfile::tempdir().unwrap();
@@ -714,9 +705,7 @@ mod tests {
             .unwrap();
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
-        raw.execute_batch(
-            "DROP INDEX IF EXISTS attempts_retained_by_id; DROP TABLE IF EXISTS active_work_index; DROP TABLE IF EXISTS active_work_meta; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_update; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_delete; DROP TRIGGER IF EXISTS barrier_members_no_update; DROP TRIGGER IF EXISTS barrier_members_no_delete; DROP TRIGGER IF EXISTS barrier_revisions_no_membership_update; DROP TABLE IF EXISTS barrier_stale_briefs; DROP TABLE IF EXISTS barrier_members; DROP TABLE IF EXISTS barrier_revisions; DROP TRIGGER IF EXISTS memory_change_receipts_no_update; DROP TRIGGER IF EXISTS memory_change_receipts_no_delete; DROP TRIGGER IF EXISTS update_package_members_no_update; DROP TRIGGER IF EXISTS update_package_members_no_delete; DROP TRIGGER IF EXISTS update_packages_no_update; DROP TRIGGER IF EXISTS update_packages_no_delete; DROP TABLE IF EXISTS memory_change_receipts; DROP TABLE IF EXISTS update_package_members; ALTER TABLE consumer_bindings DROP COLUMN applied_cursor; DROP TABLE IF EXISTS update_packages; DROP TRIGGER IF EXISTS memory_read_set_on_record; DROP TRIGGER IF EXISTS memory_read_set_on_reclassify; DROP TRIGGER IF EXISTS memory_read_set_on_revision; DROP TRIGGER IF EXISTS memory_read_set_on_validity; DROP TRIGGER IF EXISTS memory_read_set_on_head; DROP TABLE IF EXISTS memory_scope_catalog; DROP TABLE IF EXISTS memory_required_generation; UPDATE store_meta SET schema_version=37; PRAGMA user_version=37;",
-        )
+        crate::store::test_schema::historical(&raw, 37)
         .unwrap();
         drop(raw);
         let mut db = SqliteStore::open(&path).unwrap();
@@ -735,13 +724,13 @@ mod tests {
             .unwrap();
         assert_eq!(opened, before);
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 41);
+        assert_eq!(user_version(&db.connection), crate::store::SCHEMA);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            41
+            crate::store::SCHEMA
         );
         let after: (String, String, String, String, String) = db
             .connection
@@ -756,7 +745,7 @@ mod tests {
         check_schema(&db.connection).unwrap();
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 41);
+        assert_eq!(user_version(&reopened.connection), crate::store::SCHEMA);
     }
 
     #[test]

@@ -6,9 +6,30 @@ pub(crate) fn read(
     publication: &Publication,
     budget: &mut Budget,
 ) -> Result<Vec<(String, WorktreePlan)>> {
+    read_selected(path, publication, budget, None)
+}
+
+/// Validate the complete retained provenance of one launch. This is not a
+/// conflict inventory: callers allocating paths must still check other owners.
+pub(crate) fn read_operation(
+    path: &Path,
+    publication: &Publication,
+    budget: &mut Budget,
+    operation: &OperationId,
+) -> Result<Vec<(String, WorktreePlan)>> {
+    read_selected(path, publication, budget, Some(operation))
+}
+
+fn read_selected(
+    path: &Path,
+    publication: &Publication,
+    budget: &mut Budget,
+    operation: Option<&OperationId>,
+) -> Result<Vec<(String, WorktreePlan)>> {
     read_published(path, publication, budget, |tx, budget| {
         let version: u32 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version < 13 {
+            ensure!(operation.is_none(), "selected worktree provenance requires launch approval schema");
             let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE kind IN ('runtime.worktrees_creation','runtime.worktrees_ready'))",[],|r|r.get(0))?;
             ensure!(
                 !exists,
@@ -16,9 +37,12 @@ pub(crate) fn read(
             );
             return Ok(vec![]);
         }
-        let orphan:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM events r LEFT JOIN events c ON c.entity=r.entity AND c.kind='runtime.worktrees_creation' WHERE r.kind='runtime.worktrees_ready' AND c.entity IS NULL)",[],|r|r.get(0))?;
+        let parameters: Vec<&str> = operation.into_iter().map(|op| op.as_str()).collect();
+        let scope = if operation.is_some() { " AND r.entity=?1" } else { "" };
+        let orphan:bool=tx.query_row(&format!("SELECT EXISTS(SELECT 1 FROM events r LEFT JOIN events c ON c.entity=r.entity AND c.kind='runtime.worktrees_creation' WHERE r.kind='runtime.worktrees_ready' AND c.entity IS NULL{scope})"),rusqlite::params_from_iter(parameters.iter()),|r|r.get(0))?;
         ensure!(!orphan, "worktree receipt lacks creation provenance");
-        let mut statement=tx.prepare("SELECT e.entity,e.payload,i.payload,i.payload_hash,a.id,a.task_id,
+        let scope = if operation.is_some() { " AND e.entity=?1" } else { "" };
+        let mut statement=tx.prepare(&format!("SELECT e.entity,e.payload,i.payload,i.payload_hash,a.id,a.task_id,
             o.task_id,o.kind,o.target,o.expected_revision,o.payload,o.payload_hash,o.payload_version,o.idempotency_key,
             d.attempts,u.claim_revision,u.claim_epoch,u.consumed_unix_ms,g.payload,g.payload_hash,r.payload,
             e.revision,d.epoch,d.revision,b.id,b.task_id,t.id
@@ -32,8 +56,8 @@ pub(crate) fn read(
             LEFT JOIN approval_uses u ON u.operation_id=o.id
             LEFT JOIN approval_grants g ON g.id=u.approval_id
             LEFT JOIN events r ON r.entity=e.entity AND r.kind='runtime.worktrees_ready'
-            WHERE e.kind='runtime.worktrees_creation'")?;
-        let mut rows = statement.query([])?;
+            WHERE e.kind='runtime.worktrees_creation'{scope}"))?;
+        let mut rows = statement.query(rusqlite::params_from_iter(parameters.iter()))?;
         let mut result = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         while let Some(row) = rows.next()? {
@@ -166,6 +190,7 @@ pub(crate) fn read(
                 result.push((record.inputs.binding.clone(), plan));
             }
         }
+        ensure!(operation.is_none() || !result.is_empty(), "selected worktree creation provenance missing");
         Ok(result)
     })
 }

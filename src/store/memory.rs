@@ -8,10 +8,12 @@ fn decode_applicability(raw:&str)->Result<Applicability> {
     let value:Applicability=serde_json::from_str(raw).map_err(|_|StoreError::Corrupt("invalid applicability".into()))?;
     value.validate().map_err(StoreError::Corrupt)?;Ok(value)
 }
-pub(super) fn record(db:&Connection,id:&str)->Result<Option<MemoryRecord>> {
+pub(super) fn record(db:&Connection,id:&str)->Result<Option<MemoryRecord>> {record_with_budget(db,id,None)}
+fn record_with_budget(db:&Connection,id:&str,budget:Option<&read_budget::ReadBudget>)->Result<Option<MemoryRecord>> {
     let mut stmt=db.prepare("SELECT id,record_key,scope_id,kind,is_hard FROM memory_records WHERE id=?1")?;
     let mut rows=stmt.query([id])?;
     let Some(row)=rows.next()? else {return Ok(None)};
+    if let Some(budget)=budget {budget.row(row,&[])?;}
     Ok(Some(MemoryRecord{id:MemoryRecordId::new(row.get::<_,String>(0)?).map_err(StoreError::Corrupt)?,record_key:row.get(1)?,scope_id:row.get(2)?,kind:parse_kind(&row.get::<_,String>(3)?).map_err(StoreError::Corrupt)?,is_hard:row.get::<_,i64>(4)?==1}))
 }
 fn insert_event(db:&Connection,kind:&str,entity:&str,revision:u64,payload:&str)->Result<u64> {
@@ -113,6 +115,7 @@ pub(crate) fn apply_memory_revision_in_tx(tx:&rusqlite::Transaction,next:&crate:
     if let Some((previous,_,_))=&current {
         super::memory_invalidation::dependents(tx,next.id.as_str(),*previous,seq)?;
     }
+    super::barriers::memory_changed(tx,Some(next.id.as_str()),seq)?;
     Ok((MemoryHead{record_id:next.id.clone(),revision,status:"active".into(),row_revision},seq))
 }
 impl SqliteStore {
@@ -268,8 +271,12 @@ impl SqliteStore {
         self.read_memory_snapshot(id.as_str())
     }
     pub fn read_memory_snapshot(&mut self,id:&str)->Result<crate::domain::MemorySnapshot> {
+        self.read_memory_snapshot_with_budget(id,None)
+    }
+    pub(crate) fn read_memory_snapshot_with_budget(&mut self,id:&str,budget:Option<&read_budget::ReadBudget>)->Result<crate::domain::MemorySnapshot> {
+        if let Some(budget)=budget {budget.check()?;}
         let tx=self.connection.transaction()?;
-        let row=tx.query_row("SELECT id,task_id,task_revision,profile_name,profile_digest,config_digest,selection_policy_version,estimator,sequence,required_bytes,optional_bytes,budget_bytes,omitted_optional_count,manifest_hash,scope_digest FROM memory_snapshots WHERE id=?1",[id],|r| Ok((
+        let row=read_budget::one(&tx,"SELECT id,task_id,task_revision,profile_name,profile_digest,config_digest,selection_policy_version,estimator,sequence,required_bytes,optional_bytes,budget_bytes,omitted_optional_count,manifest_hash,scope_digest FROM memory_snapshots WHERE id=?1",[id],budget,&[],|r| Ok((
             r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u64>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,
             r.get::<_,Option<String>>(5)?,r.get::<_,u32>(6)?,r.get::<_,String>(7)?,r.get::<_,u64>(8)?,r.get::<_,u64>(9)?,
             r.get::<_,u64>(10)?,r.get::<_,u64>(11)?,r.get::<_,u64>(12)?,r.get::<_,String>(13)?,r.get::<_,String>(14)?,
@@ -278,9 +285,10 @@ impl SqliteStore {
         let mut rows=stmt.query([id])?;
         let mut entries=Vec::new();
         while let Some(e)=rows.next()? {
+            if let Some(budget)=budget {budget.row(e,&[])?;}
             entries.push(crate::domain::SnapshotEntry{ordinal:e.get(0)?,record_id:MemoryRecordId::new(e.get::<_,String>(1)?).map_err(StoreError::Corrupt)?,revision:e.get(2)?,role:e.get(3)?,reason:e.get(4)?});
         }
-        let (subscriber,since):(String,u64)=tx.query_row("SELECT subscriber,since_seq FROM memory_subscriptions WHERE snapshot_id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let (subscriber,since):(String,u64)=read_budget::one(&tx,"SELECT subscriber,since_seq FROM memory_subscriptions WHERE snapshot_id=?1",[id],budget,&[],|r|Ok((r.get(0)?,r.get(1)?)))?;
         Ok(crate::domain::MemorySnapshot{
             id:crate::domain::SnapshotId::new(row.0).map_err(StoreError::Corrupt)?,task_id:row.1,task_revision:row.2,profile_name:row.3,
             profile_digest:row.4,config_digest:row.5,selection_policy_version:row.6,estimator:row.7,sequence:row.8,
@@ -309,6 +317,10 @@ impl SqliteStore {
         let tx=self.connection.transaction()?;schema(&tx)?;
         Ok(record(&tx,id)?)
     }
+    pub(crate) fn memory_record_with_budget(&mut self,id:&str,budget:Option<&read_budget::ReadBudget>)->Result<Option<MemoryRecord>> {
+        let tx=self.connection.transaction()?;schema(&tx)?;
+        record_with_budget(&tx,id,budget)
+    }
     pub fn memory_record_by_key(&mut self,key:&str)->Result<Option<MemoryRecord>> {
         let tx=self.connection.transaction()?;schema(&tx)?;
         let row:Option<(String,String,String,String,i64)>=tx.query_row("SELECT id,record_key,scope_id,kind,is_hard FROM memory_records WHERE record_key=?1",[key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
@@ -326,8 +338,11 @@ impl SqliteStore {
         })
     }
     pub fn memory_revision(&mut self,id:&str,revision:u64)->Result<Option<MemoryRevision>> {
+        self.memory_revision_with_budget(id,revision,None)
+    }
+    pub(crate) fn memory_revision_with_budget(&mut self,id:&str,revision:u64,budget:Option<&read_budget::ReadBudget>)->Result<Option<MemoryRevision>> {
         let tx=self.connection.transaction()?;schema(&tx)?;
-        let row:Option<(String,u64,String,String,u64,String)>=tx.query_row("SELECT record_id,revision,body_hash,provenance_hash,promoted_seq,applicability FROM memory_revisions WHERE record_id=?1 AND revision=?2",params![id,integer(revision)?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
+        let row:Option<(String,u64,String,String,u64,String)>=read_budget::optional(&tx,"SELECT record_id,revision,body_hash,provenance_hash,promoted_seq,applicability FROM memory_revisions WHERE record_id=?1 AND revision=?2",params![id,integer(revision)?],budget,&[(5,1)],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
         Ok(match row {
             Some((record_id,revision,body,prov,promoted_seq,applicability))=>Some(MemoryRevision{
                 record_id:MemoryRecordId::new(record_id).map_err(StoreError::Corrupt)?,revision,
@@ -358,6 +373,7 @@ pub(crate) fn apply_memory_op_in_tx(tx:&rusqlite::Transaction,op:MemoryPolicyOp,
     let seq=insert_event(tx,"memory.record_policy_changed",&id,revision,&serde_json::to_string(&op).map_err(|_|invalid("invalid policy"))?)?;
     if matches!(op,MemoryPolicyOp::RevokeHead) {super::memory_invalidation::changed(tx,&id,revision,seq,"policy")?;}
     else {super::memory_delivery::record_change(tx,&format!("policy:{seq}"),&id,revision,"stop_at_checkpoint",seq)?;}
+    super::barriers::memory_changed(tx,Some(&id),seq)?;
     Ok(())
 }
 use rusqlite::OptionalExtension;
@@ -369,8 +385,8 @@ mod tests {
     fn schema17_upgrade_adds_empty_memory_tables() {
         let temp=tempfile::tempdir().unwrap();let path=temp.path().join("state.db");
         let mut db=SqliteStore::create(&path).unwrap();
-        db.connection.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; UPDATE store_meta SET schema_version=17; PRAGMA user_version=17;").unwrap();
-        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=26;
+        crate::store::test_schema::historical(&db.connection, 17).unwrap();
+        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=crate::store::SCHEMA;
         assert_eq!(db.read_snapshot(None).unwrap(),before);
         assert!(db.memory_records().unwrap().is_empty());
         db.integrity_check().unwrap();

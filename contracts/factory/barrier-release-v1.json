@@ -1,0 +1,22 @@
+{
+  "action": "release_barrier",
+  "authority": {
+    "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "id": "owner-approval-policy",
+    "revision": 1
+  },
+  "barrier_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "config_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "control_epoch": 1,
+  "control_revision": 1,
+  "expected_head": 12,
+  "expires_unix_ms": 61000,
+  "issued_unix_ms": 1000,
+  "memory_manifest_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "memory_manifest_version": 2,
+  "project_store": "/fixture/.state/state.db",
+  "release_policy": "all_members_ready_v1",
+  "required_set_generation": 0,
+  "schema_version": 1,
+  "store_incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

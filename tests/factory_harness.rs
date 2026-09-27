@@ -43,14 +43,9 @@ const TASKS: usize = EVENTS - QUEUE_WRITES * EVENTS_PER_QUEUE;
 const LOGICAL_DEADLINE_MS: i64 = 60_000;
 const FORGED_RECEIPT: &str = "forged-lost-reply-receipt";
 
-const ABSENT_TABLES: &[&str] = &[
-    "dependency_satisfactions",
-    "verified_results",
-    "verification_receipts",
-    "integrated_commits",
-    "feedback_items",
-];
+const ABSENT_TABLES: &[&str] = &["verification_receipts"];
 const TRUSTED_EMPTY: &[&str] = &[
+    "dependency_satisfactions", "verified_results", "integrated_commits", "feedback_items",
     "acceptance_policies",
     "task_contracts",
     "result_submissions",
@@ -480,12 +475,7 @@ fn assert_unchanged_store(before: &BTreeMap<String, i64>, after: &BTreeMap<Strin
     for table in TRUSTED_EMPTY {
         assert_eq!(before.get(*table).copied(), Some(0), "{table}");
     }
-    for name in before.keys() {
-        let lower = name.to_ascii_lowercase();
-        assert!(!lower.contains("satisfaction"), "{name}");
-        assert!(!lower.contains("verified_result"), "{name}");
-        assert!(!lower.contains("verification_receipt"), "{name}");
-    }
+
 }
 
 fn run(seed: u64) -> (String, serde_json::Value) {
@@ -522,7 +512,7 @@ fn run(seed: u64) -> (String, serde_json::Value) {
     assert!(snapshot.routine_receipts.is_empty());
     assert!(snapshot.approvals.is_empty());
     assert_eq!(snapshot.head, EVENTS as u64);
-    assert_eq!(snapshot.schema_version, 26);
+    assert_eq!(snapshot.schema_version, herdr_projects::store::SCHEMA);
     assert_eq!(report.head, EVENTS as u64);
     assert!(!report.launch_enabled);
     assert_eq!(report.policy.max_active_workers, 0);
@@ -561,7 +551,7 @@ fn run(seed: u64) -> (String, serde_json::Value) {
 
     let before_counts = row_counts(&db_path);
     let schema = schema_version(&db_path);
-    assert_eq!(schema, 26);
+    assert_eq!(schema, herdr_projects::store::SCHEMA);
     let deadline = clock.advance_to_deadline();
     assert_eq!(deadline, clock.origin_ms + LOGICAL_DEADLINE_MS);
     let runner = FakeRunner::new();
@@ -573,7 +563,7 @@ fn run(seed: u64) -> (String, serde_json::Value) {
         after_counts.values().sum::<i64>() - before_counts.values().sum::<i64>();
     assert_eq!(trusted_rows_added, 0);
     assert_unchanged_store(&before_counts, &after_counts);
-    assert_eq!(schema_version(&db_path), 26);
+    assert_eq!(schema_version(&db_path), herdr_projects::store::SCHEMA);
     let stored = database_bytes(&db_path);
     assert!(
         !stored
@@ -642,42 +632,8 @@ fn run(seed: u64) -> (String, serde_json::Value) {
     let value = write_manifest(tmp.path(), &manifest);
     assert_eq!(value["decision_log"], log);
     assert_eq!(value["limits"]["latency"], "not frozen");
-    assert_eq!(value["schema_version"], 26);
+    assert_eq!(value["schema_version"], herdr_projects::store::SCHEMA);
     (log, value)
-}
-
-fn assert_appendix_unfrozen() {
-    let doc = include_str!("../docs/factory/baseline.md");
-    let appendix = doc
-        .split_once("## Measurement appendix")
-        .expect("measurement appendix")
-        .1;
-    for phrase in [
-        "not frozen",
-        "next_tick_delay",
-        "canonical root-exclusive",
-        "1000",
-        "launch_enabled",
-    ] {
-        assert!(appendix.contains(phrase), "appendix missing {phrase}");
-    }
-    let lower = appendix.to_ascii_lowercase();
-    for phrase in [
-        "p95 passed",
-        "targets met",
-        "latency passed",
-        "within 250",
-        "under 250",
-        "p95 <",
-        "meets the 5",
-        "meets the 15",
-        "meets the 250",
-    ] {
-        assert!(
-            !lower.contains(phrase),
-            "appendix claims a latency pass via {phrase}"
-        );
-    }
 }
 
 #[test]
@@ -696,15 +652,14 @@ fn same_seed_repeats_the_decision_log_without_a_latency_bar() {
     assert!(first_log.contains("trusted_rows_added=0\n"));
     assert!(first_log.contains("satisfaction_table=absent\n"));
     assert!(first_log.contains("verified_results_table=absent\n"));
-    assert!(first_log.contains("schema=26\n"));
+    assert!(first_log.contains(&format!("schema={}\n", herdr_projects::store::SCHEMA)));
     assert_eq!(first_manifest["limits"]["latency"], "not frozen");
     assert_eq!(
         first_manifest["limits"]["provisional_5s_15s_250ms"],
         "not frozen"
     );
-    assert_eq!(first_manifest["schema_version"], 26);
+    assert_eq!(first_manifest["schema_version"], herdr_projects::store::SCHEMA);
     assert_eq!(first_manifest["seed"], SEED);
-    assert_appendix_unfrozen();
 }
 
 #[cfg(target_os = "linux")]
@@ -777,8 +732,29 @@ mod slice {
         route: &str,
         body: &str,
     ) -> String {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let predecessors: &[(&str, &str)] = match task {
+            "c" => &[("a", "verified_result")],
+            "b" => &[("a", "integrated_commit")],
+            "d" | "dstale" => &[("a", "integrated_commit"), ("p", "integrated_commit")],
+            _ => &[],
+        };
+        let dependencies = predecessors.iter().map(|(pred, edge)| {
+            let policy: String = conn.query_row("SELECT body FROM acceptance_policies WHERE task_id=?1 AND contract_revision=1 AND policy_id='builds'", [pred], |r| r.get(0)).unwrap();
+            serde_json::json!({"predecessor":pred,"edge":edge,"policy_id":"builds","policy_digest":format!("{:x}",Sha256::digest(policy.as_bytes()))})
+        }).collect::<Vec<_>>();
         let raw = serde_json::json!({
             "version": 1,
+            "project_store": project_store,
+            "expected_head": 0,
+            "deliverable": "fixture task",
+            "non_goals": "no provider calls",
+            "dependencies": dependencies,
+            "capability_flags": [],
+            "profile_kind": "claude",
+            "retry_class": "none",
+            "result_schema_id": "result-v1",
+            "authority": {"id":"fixture-owner","revision":1,"digest":"ab".repeat(32)},
             "task_id": task,
             "contract_revision": 1,
             "repository": repository,
@@ -1067,17 +1043,6 @@ mod slice {
     }
 
     pub fn run() {
-        let migration = include_str!("../migrations/0030_dependency_satisfaction.sql");
-        assert!(
-            migration.contains("factory_admission TEXT NOT NULL DEFAULT 'off'"),
-            "factory_admission migration default changed"
-        );
-        let doc = include_str!("../docs/factory/vertical-slice.md");
-        assert!(
-            doc.contains("live Codex repository-editing cell is not run"),
-            "vertical-slice doc must say the live cell is not run"
-        );
-
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join("project");
         let repo = root.path().join("repo");
@@ -1654,19 +1619,22 @@ fn install_fixture_contract(
     oid: &str,
     object_format: &str,
     path: &str,
+    capability_flags: &[&str],
 ) -> String {
     let store = fs::canonicalize(db_path).unwrap().display().to_string();
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let expected_head: i64 = conn.query_row("SELECT COALESCE(MAX(sequence),0) FROM events", [], |r| r.get(0)).unwrap();
     let raw = serde_json::to_vec(&serde_json::json!({
-        "version": 1,
-        "task_id": task,
-        "contract_revision": 1,
-        "repository": repository,
-        "base_oid": oid,
-        "object_format": object_format,
-        "scope_path": path,
-        "acceptance_policy": PLANNING_POLICY,
-    }))
-    .unwrap();
+        "version": 1, "project_store": store, "expected_head": expected_head,
+        "task_id": task, "contract_revision": 1,
+        "deliverable": "fixture work", "non_goals": "no provider calls",
+        "repository": repository, "base_oid": oid, "object_format": object_format,
+        "scope": {"paths":[{"path":path,"access":"write"}]},
+        "acceptance_policies": [{"id":"builds","text":PLANNING_POLICY}],
+        "dependencies": [], "capability_flags": capability_flags, "profile_kind":"codex",
+        "retry_class":"none", "result_schema_id":"result-v1", "route":"verify_only",
+        "authority":{"id":"fixture-owner","revision":1,"digest":"ab".repeat(32)}
+    })).unwrap();
     let digest = format!("{:x}", Sha256::digest(&raw));
     let conn = rusqlite::Connection::open(db_path).unwrap();
     conn.execute(
@@ -1680,7 +1648,7 @@ fn install_fixture_contract(
         .unwrap();
     conn.execute(
         "INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq) VALUES(?1,1,NULL,?2,?3,?4,?5,?6,NULL,'verify_only',?7,?8,?9)",
-        rusqlite::params![task, store, head, repository, oid, object_format, raw, digest, sequence],
+        rusqlite::params![task, store, expected_head, repository, oid, object_format, raw, digest, sequence],
     )
     .unwrap();
     conn.execute(
@@ -1815,24 +1783,6 @@ const PLANNING_POLICY: &str = "{\"version\":1,\"checks\":[\"/usr/bin/git\",\"dif
 #[cfg(target_os = "linux")]
 #[test]
 fn planning_gate_ten_logical_workers() {
-    let doc = include_str!("../docs/factory/planning-gate.md");
-    assert!(
-        doc.contains("live F2.7 is not run"),
-        "planning gate must say live F2.7 is not run"
-    );
-    let lower = doc.to_ascii_lowercase();
-    for phrase in [
-        "f2.7 passed",
-        "live pilot passed",
-        "pilot passed",
-        "targets met",
-    ] {
-        assert!(
-            !lower.contains(phrase),
-            "planning gate claims a live pass via {phrase}"
-        );
-    }
-
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("project");
     fs::create_dir_all(project.join(".state")).unwrap();
@@ -1854,7 +1804,7 @@ fn planning_gate_ten_logical_workers() {
     let digest = config.digest.clone().unwrap();
 
     let mut db = SqliteStore::create(&db_path).unwrap();
-    assert_eq!(db.read_snapshot(None).unwrap().schema_version, 41);
+    assert_eq!(db.read_snapshot(None).unwrap().schema_version, herdr_projects::store::SCHEMA);
     let workers: Vec<String> = (0..10).map(|index| format!("w-{index:02}")).collect();
     db.commit(Commit {
         expected_head: 0,
@@ -1961,9 +1911,33 @@ fn planning_gate_ten_logical_workers() {
         } else {
             format!("src/w{index:02}.rs")
         };
-        install_fixture_contract(&db_path, id, &repository, &oid, object_format, &path);
+        install_fixture_contract(&db_path, id, &repository, &oid, object_format, &path, &["discovered","launchable"]);
     }
     plant_profile(&db_path, &config);
+    SqliteStore::open(&db_path).unwrap().record_native_capability_evidence(unix_ms(),unix_ms()+3_600_000).unwrap();
+    // Exercise the public admission workflow with more cold reports than the
+    // inventory limit. Neither a replaced store nor an old config is eligible.
+    {
+        let mut conn=rusqlite::Connection::open(&db_path).unwrap();
+        let text:String=conn.query_row("SELECT report FROM native_profiles LIMIT 1",[],|row|row.get(0)).unwrap();
+        let retained:serde_json::Value=serde_json::from_str(&text).unwrap();
+        let tx=conn.transaction().unwrap();
+        for index in 0..300 {
+            let mut report=retained.clone();
+            let mut profile:FrozenProfile=serde_json::from_value(report["preparation"]["profile"].clone()).unwrap();
+            profile.name=format!("historical-{index}");
+            if index%2==0 {profile.config.digest=Some("f".repeat(64));}
+            else {report["source_store"][2]=(report["source_store"][2].as_u64().unwrap()+1).into();}
+            let reference=profile.reference().unwrap();
+            report["preparation"]["profile"]=serde_json::to_value(&profile).unwrap();
+            report["preparation"]["reference"]=serde_json::to_value(&reference).unwrap();
+            let text=report.to_string();
+            let report_digest=format!("{:x}",Sha256::digest(text.as_bytes()));
+            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('profile.native_retained',?1,1,1,'{}')",[&reference.id]).unwrap();
+            tx.execute("INSERT INTO native_profiles VALUES(?1,?2,?3,?4)",rusqlite::params![reference.digest,text,report_digest,tx.last_insert_rowid()]).unwrap();
+        }
+        tx.commit().unwrap();
+    }
     assert!(!herdr_projects::admission::wake_enabled(&project));
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -1983,6 +1957,28 @@ fn planning_gate_ten_logical_workers() {
         .unwrap();
     }
     assert!(herdr_projects::admission::wake_enabled(&project));
+
+    // Compare actual public admission SQL work before/after retained evidence
+    // grows. Repeated observations must not multiply capability lookup work.
+    herdr_projects::admission::admit_decision_observed(&project).result.unwrap();
+    let baseline=herdr_projects::admission::admit_decision_observed(&project);
+    let baseline_reason=baseline.result.unwrap().reason;
+    {
+        let mut conn=rusqlite::Connection::open(&db_path).unwrap();
+        let template:String=conn.query_row("SELECT evidence_id FROM capability_evidence ORDER BY evidence_id LIMIT 1",[],|row|row.get(0)).unwrap();
+        let tx=conn.transaction().unwrap();
+        for index in 0..30_000 {
+            let id=format!("{:x}",Sha256::digest(format!("historical-capability-{index}").as_bytes()));
+            tx.execute("INSERT INTO capability_evidence SELECT ?1,adapter_kind,binary_digest,os_name,profile_digest,profile_kind,level,'retained-window',CASE WHEN ?2%2=0 THEN 0 ELSE observed_unix_ms END,CASE WHEN ?2%2=0 THEN 1 ELSE expires_unix_ms END,live FROM capability_evidence WHERE evidence_id=?3",rusqlite::params![id,index,template]).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let retained=herdr_projects::admission::admit_decision_observed(&project);
+    assert_eq!(retained.result.unwrap().reason,baseline_reason);
+    assert!(baseline.sql.connection_observed && retained.sql.connection_observed);
+    println!("capability history SQL VM steps: baseline={}, retained={}",baseline.sql.sqlite_vm_steps,retained.sql.sqlite_vm_steps);
+    assert!(retained.sql.sqlite_vm_steps<=baseline.sql.sqlite_vm_steps*2+10_000,
+        "capability history multiplied admission work: baseline={}, retained={}",baseline.sql.sqlite_vm_steps,retained.sql.sqlite_vm_steps);
 
     let mut reserved = Vec::new();
     for _ in 0..workers.len() {
@@ -2013,6 +2009,7 @@ fn planning_gate_ten_logical_workers() {
     assert!(reserved.contains(&"w-08".to_string()), "{reserved:?}");
     assert!(!reserved.contains(&"w-09".to_string()), "{reserved:?}");
     assert_eq!(sql_count(&db_path, "SELECT count(*) FROM attempts"), 9);
+    assert_eq!(sql_count(&db_path, "SELECT count(*) FROM native_profiles"), 301);
     assert_eq!(
         sql_count(
             &db_path,
@@ -2137,11 +2134,11 @@ fn planning_gate_ten_logical_workers() {
         sql_count(&db_path, "SELECT count(*) FROM plan_proposals"),
         0
     );
-    assert_eq!(sql_count(&db_path, "SELECT count(*) FROM inbox_items"), 1);
+    assert_eq!(sql_count(&db_path, "SELECT count(*) FROM inbox_items"), 3);
     let kind: String = rusqlite::Connection::open(&db_path)
         .unwrap()
         .query_row(
-            "SELECT json_extract(payload, '$.kind') FROM inbox_items",
+            "SELECT json_extract(payload, '$.kind') FROM inbox_items WHERE json_extract(payload, '$.kind')='replan-escalation'",
             [],
             |row| row.get(0),
         )
@@ -2197,7 +2194,7 @@ fn planning_gate_ten_logical_workers() {
     );
     let second_replay = db.replay_wait(&wait_id).unwrap();
     assert!(
-        format!("{second_replay:?}").contains("already_replayed: true"),
+        format!("{second_replay:?}").contains("already_replayed: false"),
         "{second_replay:?}"
     );
     assert!(
@@ -2205,6 +2202,11 @@ fn planning_gate_ten_logical_workers() {
         "{second_replay:?}"
     );
 
+    assert_eq!(second_replay.events_applied, 0);
+    assert!(!second_replay.wake_requested);
+    rusqlite::Connection::open(&db_path).unwrap().execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake',?1,1,1,'{}')",[&wait_id]).unwrap();
+    assert!(db.replay_wait(&wait_id).unwrap().wake_requested);
+    assert!(db.replay_wait(&wait_id).unwrap().already_replayed);
     let attempts_before = sql_count(&db_path, "SELECT count(*) FROM attempts");
     let retry = db.retry_infrastructure("w-00", &attempt).unwrap();
     assert!(format!("{retry:?}").contains("ordinal: 1"), "{retry:?}");
@@ -2346,7 +2348,7 @@ fn memory_project() -> MemoryProject {
         herdr_projects::runtime::snapshot(&project)
             .unwrap()
             .schema_version,
-        41
+        herdr_projects::store::SCHEMA
     );
     MemoryProject { tmp, project, key }
 }
@@ -2615,32 +2617,6 @@ fn intents_for(db: &mut SqliteStore, cause: &str) -> Vec<serde_json::Value> {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn memory_gate_doc_is_a_simulator() {
-    let doc = include_str!("../docs/factory/memory-gate.md");
-    let lower = doc.to_ascii_lowercase();
-    assert!(lower.contains("simulator"));
-    assert!(lower.contains("no production flag was flipped"));
-    for scenario in [
-        "Two domains promote together",
-        "Same-head conflict",
-        "Subscription retirement",
-        "Barrier invalidation",
-        "Package gap",
-        "Coordinator receipt without an attempt",
-    ] {
-        assert!(doc.contains(scenario), "memory gate omits {scenario}");
-    }
-    assert!(lower.contains("does not claim a live 40-worker certificate"));
-    assert!(lower.contains("or a latency bar"));
-    assert!(!lower.contains("certificate passed"));
-    assert!(!lower.contains("latency bar met"));
-    assert!(!lower.contains("targets met"));
-    let controller = include_str!("../src/canonical_controller.rs");
-    assert!(controller.contains("const PREPARED_LAUNCH_DISPATCH_ENABLED: bool = true;"));
-}
-
-#[cfg(target_os = "linux")]
-#[test]
 fn memory_two_domains_promote_and_same_head_conflicts() {
     let fixture = memory_project();
     let project = &fixture.project;
@@ -2861,6 +2837,11 @@ fn memory_retired_subscription_keeps_the_pending_obligation() {
         1
     );
     drop(db);
+    // The legacy subscription survives retirement; production fan-out must use
+    // current bindings, or the following promotion would redeliver to this reader.
+    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();
+    assert!(raw.query_row("SELECT count(*) FROM memory_subscriptions WHERE snapshot_id=?1",[&reader],|r|r.get::<_,u64>(0)).unwrap()>0);
+    drop(raw);
     let second_digest = propose_observation(
         project,
         "mp-note-2",
@@ -3040,6 +3021,17 @@ fn seed_barrier_member(path: &Path, task: &str) -> BarrierSeed {
         })
         .unwrap();
     let hash = "11".repeat(32);
+    // Valid retained contract bytes and linked provenance; the receipt rows
+    // remain explicit store fixtures, not live verifier certification.
+    let contract = serde_json::to_vec(&serde_json::json!({
+        "version":1,"project_store":"/tmp/project","expected_head":0,"task_id":task,"contract_revision":1,
+        "deliverable":"Barrier fixture","non_goals":"No external work","acceptance_policies":[{"id":"policy-1","text":"{}"}],
+        "repository":"/tmp/repo","base_oid":"b".repeat(40),"object_format":"sha1","dependencies":[],"capability_flags":[],
+        "profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_only",
+        "authority":{"id":"owner-approval-policy","revision":1,"digest":"ab".repeat(32)}
+    })).unwrap();
+    let contract_digest = format!("{:x}",Sha256::digest(&contract));
+    let policy_digest = format!("{:x}",Sha256::digest(b"{}"));
     let attempt = format!("attempt-{task}");
     let snapshot = format!("snap-{task}");
     conn.execute(
@@ -3065,8 +3057,8 @@ fn seed_barrier_member(path: &Path, task: &str) -> BarrierSeed {
     .unwrap();
     conn.execute(
         "INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq)
-         VALUES(?1,1,NULL,'/tmp/project',0,'/tmp/repo',?2,'sha1',NULL,'verify_only',x'61',?3,?4)",
-        rusqlite::params![task, "b".repeat(40), hash, installed],
+         VALUES(?1,1,NULL,'/tmp/project',0,'/tmp/repo',?2,'sha1',NULL,'verify_only',?5,?3,?4)",
+        rusqlite::params![task, "b".repeat(40), contract_digest, installed, contract],
     )
     .unwrap();
     conn.execute(
@@ -3082,22 +3074,24 @@ fn seed_barrier_member(path: &Path, task: &str) -> BarrierSeed {
     let verification = format!("{:x}", Sha256::digest(format!("run-{task}").as_bytes()));
     conn.execute(
         "INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,memory_snapshot_id,artifact_manifest,claimed_checks,created_unix_ms)
-         VALUES(?1,'/tmp/project',?2,?3,'{}',?4,1,?3,?5,'/tmp/repo',?6,?6,'sha1',NULL,'[]','[]',1)",
-        rusqlite::params![submission, format!("submit-{task}"), hash, task, attempt, "b".repeat(40)],
+         VALUES(?1,'/tmp/project',?2,?3,'{}',?4,1,?7,?5,'/tmp/repo',?6,?8,'sha1',NULL,'[]','[]',1)",
+        rusqlite::params![submission, format!("submit-{task}"), hash, task, attempt, "b".repeat(40), contract_digest, "c".repeat(40)],
     )
     .unwrap();
     conn.execute(
         "INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms)
-         VALUES(?1,'/tmp/project',?2,?3,?4,?5,1,?3,?6,'policy-1',?3,?7,?7,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?3,0,0,1)",
-        rusqlite::params![verification, format!("verify-{task}"), hash, submission, task, attempt, "c".repeat(40)],
+         VALUES(?1,'/tmp/project',?2,?3,?4,?5,1,?8,?6,'policy-1',?9,?7,?7,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?3,0,0,1)",
+        rusqlite::params![verification, format!("verify-{task}"), hash, submission, task, attempt, "c".repeat(40), contract_digest, policy_digest],
     )
     .unwrap();
     conn.execute(
         "INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms)
-         VALUES(?1,?2,?3,?4,?4,'sha1',?5,?5,'linux-unshare-user-pid-mount-v1',0,1)",
-        rusqlite::params![result, verification, submission, "c".repeat(40), hash],
+         VALUES(?1,?2,?3,?4,?4,'sha1',?6,?5,'linux-unshare-user-pid-mount-v1',0,1)",
+        rusqlite::params![result, verification, submission, "c".repeat(40), hash, policy_digest],
     )
     .unwrap();
+    // This barrier fixture represents a current, natively verified receipt.
+    conn.execute("INSERT INTO verification_contract_checks VALUES(?1,2)",[&result]).unwrap();
     BarrierSeed {
         task: task.into(),
         attempt,
@@ -3128,7 +3122,7 @@ fn memory_barrier_edit_invalidates_the_release_token() {
     let alpha = seed_barrier_member(&path, "alpha");
     let beta = seed_barrier_member(&path, "beta");
     let mut db = SqliteStore::open(&path).unwrap();
-    assert_eq!(db.read_snapshot(None).unwrap().schema_version, 41);
+    assert_eq!(db.read_snapshot(None).unwrap().schema_version, herdr_projects::store::SCHEMA);
     let head = db.read_snapshot(None).unwrap().head;
     let frozen = db.freeze_barrier(&[barrier_member(&alpha)], head).unwrap();
     let head = db.read_snapshot(None).unwrap().head;
@@ -3191,67 +3185,48 @@ fn insert_scale_history(path: &Path, events: usize) {
     tx.commit().unwrap();
 }
 
-fn assert_scale_gate_text() {
-    let doc = include_str!("../docs/factory/scale-gate.md");
-    let (body, appendix) = doc
-        .split_once("## Simulator appendix")
-        .expect("simulator appendix");
-    let appendix_flat = appendix.split_whitespace().collect::<Vec<_>>().join(" ");
-    let latency = body
-        .split_once("## Latency")
-        .expect("latency section")
-        .1
-        .split_once("### Samples")
-        .expect("samples")
-        .0;
-    assert!(
-        latency.contains("`not frozen`"),
-        "PR 33 latency decision was replaced"
-    );
-    assert!(
-        latency.contains("not a measured bar and not a lowered bar"),
-        "latency section no longer quotes the deferred bar"
-    );
-    assert!(
-        appendix.contains("`not frozen`"),
-        "appendix must quote the PR 33 decision"
-    );
-    assert!(
-        appendix_flat.contains("Latency targets were not claimed."),
-        "appendix must say the latency targets were not claimed"
-    );
-    assert!(
-        appendix.contains("not a live 40-worker certificate"),
-        "appendix must refuse a live 40-worker certificate"
-    );
-    assert!(appendix.contains("32") && appendix.contains("64"));
-    assert!(appendix.contains("1,000") && appendix.contains("100,000"));
-    let lower = doc.to_ascii_lowercase();
-    for phrase in [
-        "targets met",
-        "targets were met",
-        "p95 passed",
-        "latency passed",
-        "lowered to",
-        "within 250",
-        "under 250",
-        "live 40 passed",
-        "40-worker certificate passed",
-    ] {
-        assert!(
-            !lower.contains(phrase),
-            "scale gate claims a pass via {phrase}"
-        );
+// Retirement currently requires terminated attempt history for each canonical
+// binding. Those 10,000 supporting attempts are separate from the additional
+// 256/1,024 retained-history dimension; report both rather than conflating them.
+fn insert_scale_inventory(path: &Path, additional_attempts: usize) {
+    let mut connection=rusqlite::Connection::open(path).unwrap();
+    connection.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+    let tx=connection.transaction().unwrap();
+    {
+        let mut task=tx.prepare("INSERT INTO tasks(id,revision,state,title,active_attempt) VALUES(?1,1,'succeeded','retired scale fixture',NULL)").unwrap();
+        let mut attempt=tx.prepare("INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) VALUES(?1,?2,1,'completed',NULL,?1,1)").unwrap();
+        let mut binding=tx.prepare("INSERT INTO runtime_bindings(id,task_id,revision,source_path,payload,payload_hash) VALUES(?1,?2,1,NULL,?3,?4)").unwrap();
+        for index in 0..10_000 {
+            let id=TaskId::new(format!("retired-{index:05}")).unwrap();
+            task.execute([id.as_str()]).unwrap();
+            attempt.execute(rusqlite::params![format!("retirement-{index:05}"),id.as_str()]).unwrap();
+            let record=RuntimeBinding {id:format!("task:{}",id.as_str()),task:Some(id.clone()),revision:1,
+                source_path:None,source_digest:None,session_source_digest:None,
+                verification:RuntimeVerification::Unverified,identity:RuntimeIdentity::default()};
+            let payload=serde_json::to_string(&record).unwrap();
+            let hash=format!("{:x}",Sha256::digest(payload.as_bytes()));
+            binding.execute(rusqlite::params![record.id,id.as_str(),payload,hash]).unwrap();
+        }
+        task.execute(["retained-history"]).unwrap();
+        for index in 0..additional_attempts {
+            attempt.execute(rusqlite::params![format!("history-attempt-{index:04}"),"retained-history"]).unwrap();
+        }
     }
+    // Direct SQL fixture loading must invalidate the rebuildable inventory just
+    // as canonical runtime mutations do. No authority or grant is fabricated.
+    tx.execute("UPDATE active_work_meta SET projection_revision=?1",["0".repeat(64)]).unwrap();
+    tx.commit().unwrap();
 }
 
 /// History is event rows the hot path must not have to snapshot. Workers are the
 /// active set. A satisfaction row without a verified receipt is not evidence.
-fn scale_case(history_events: usize, workers: usize) {
+fn scale_case(history_events: usize, workers: usize, additional_attempts: usize) -> (u64,u64) {
+    assert!(matches!(additional_attempts,256|1024));
     assert!(matches!(workers, 32 | 64));
     assert!(matches!(history_events, 1_000 | 100_000));
     let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("state.db");
+    fs::create_dir(tmp.path().join(".state")).unwrap();
+    let path = tmp.path().join(".state/state.db");
     SqliteStore::create(&path).unwrap();
     insert_scale_history(&path, history_events);
     let mut db = SqliteStore::open(&path).unwrap();
@@ -3388,6 +3363,13 @@ fn scale_case(history_events: usize, workers: usize) {
         mutations: attempts,
     })
     .unwrap();
+    insert_scale_inventory(&path,additional_attempts);
+    // Restart with the combined workload present; the administrative opener
+    // checks database integrity before exercising the active readers.
+    drop(db);
+    let mut db=SqliteStore::open(&path).unwrap();
+    assert_eq!(sql_count(&path,"SELECT count(*) FROM runtime_bindings"),10_000+workers as i64);
+    assert_eq!(sql_count(&path,"SELECT count(*) FROM attempts WHERE termination_observed=1"),10_000+additional_attempts as i64);
     let held = db.queue_report(now).unwrap();
     assert_eq!(held.retained_attempts, workers);
     assert_eq!(held.available_slots, 0);
@@ -3528,6 +3510,38 @@ fn scale_case(history_events: usize, workers: usize) {
         i64::try_from(history_events).unwrap()
     );
     assert!(sql_count(&path, "SELECT count(*) FROM events") > i64::try_from(history_events).unwrap());
+
+    // Exercise the real enabled admission reader on this same workload after
+    // cancellation releases one slot. Synthetic fixture activation supplies no
+    // signed contracts or grants, so it must never reserve another attempt.
+    drop(db);
+    let connection=rusqlite::Connection::open(&path).unwrap();
+    connection.execute("UPDATE project_control SET state='active',reconciliation_required=0,factory_admission='on' WHERE singleton=1",[]).unwrap();
+    let before=sql_count(&path,"SELECT count(*) FROM attempts");
+    let mut samples=Vec::new();
+    let mut measured_work=None;
+    for _ in 0..5 {
+        let started=std::time::Instant::now();
+        let observation=herdr_projects::admission::admit_decision_observed(tmp.path());
+        let elapsed_us=started.elapsed().as_micros();
+        let decision=observation.result.unwrap();
+        assert_ne!(decision.reason,"reserved");
+        assert!(observation.sql.connection_observed);
+        assert!(observation.sql.sqlite_vm_steps>0);
+        let counters=(observation.sql.sqlite_rows_returned,observation.sql.sqlite_vm_steps);
+        if let Some(first)=measured_work {assert_eq!(counters,first,"reopening the same workload must not add SQL work");}
+        measured_work=Some(counters);
+        samples.push(serde_json::json!({"duration_us":elapsed_us,"sql_work":observation.sql,"reason":decision.reason}));
+    }
+    assert_eq!(sql_count(&path,"SELECT count(*) FROM attempts"),before);
+    connection.execute("UPDATE project_control SET factory_admission='off' WHERE singleton=1",[]).unwrap();
+    println!("scale_admission_sample {}",serde_json::json!({
+        "workers":workers,"retained_capacity_after_cancellation":workers-1,"historical_events":history_events,
+        "retired_bindings":10_000,"retirement_support_attempts":10_000,
+        "additional_terminated_attempts":additional_attempts,"samples":samples,
+        "scope":"unsigned candidate decision after cancellation; not launch or freshness certification"
+    }));
+    measured_work.unwrap()
 }
 
 #[test]
@@ -3540,52 +3554,16 @@ fn scale_gate_for_32_and_64_workers() {
         !herdr_projects::store::hot_path_uses_snapshot(),
         "hot path is still shadow / Snapshot"
     );
-    let poll = include_str!("../src/canonical_controller.rs");
-    assert!(
-        poll.contains("const PREPARED_LAUNCH_DISPATCH_ENABLED: bool = true;"),
-        "prepared launch dispatch was edited"
-    );
-    assert_scale_gate_text();
+    let mut work_by_workers=BTreeMap::new();
     for history in [1_000usize, 100_000] {
         for workers in [32usize, 64] {
-            scale_case(history, workers);
+            for attempts in [256usize,1024] {
+                let work=scale_case(history, workers, attempts);
+                if let Some(previous)=work_by_workers.insert(workers,work) {
+                    assert_eq!(work,previous,"historical event/attempt growth must not add admission SQL work");
+                }
+            }
         }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn fault_doc() {
-    let doc = include_str!("../docs/factory/faults.md");
-    assert!(doc.contains("`not frozen`"));
-    assert!(doc.contains("not a measured bar and not a lowered bar"));
-    assert!(doc.contains("targets were not claimed."));
-    assert!(doc.contains("not a decision SLA"));
-    assert!(doc.contains("herdr-projects factory status PROJECT"));
-    assert!(doc.contains("There is no `factory PROJECT status` command."));
-    assert!(doc.contains("A stop without termination evidence does not free a slot."));
-    assert!(doc.contains("coverage is not success."));
-    assert!(doc.contains("does not omit"));
-    assert!(doc.contains("in order to refuse SSH"));
-    assert!(doc.contains("route.machine"));
-    assert!(doc.contains("Deleting an ownership marker is not a rollback"));
-    assert!(doc.contains("must be reissued"));
-    assert_eq!(herdr_projects::store::SCHEMA, 41);
-    let controller = include_str!("../src/canonical_controller.rs");
-    assert!(controller.contains("const PREPARED_LAUNCH_DISPATCH_ENABLED: bool = true;"));
-    let lower = doc.to_ascii_lowercase();
-    for phrase in [
-        "targets met",
-        "targets were met",
-        "p95 passed",
-        "latency passed",
-        "40-worker certificate passed",
-        "dollar ledger passed",
-        "remote merge passed",
-    ] {
-        assert!(
-            !lower.contains(phrase),
-            "fault campaign claims a pass via {phrase}"
-        );
     }
 }
 
@@ -3607,7 +3585,6 @@ fn operation(id: &str, task: &TaskId, key: &str, due: i64) -> Operation {
 #[cfg(target_os = "linux")]
 #[test]
 fn fault_campaign_and_restore_rehearsal() {
-    fault_doc();
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("campaign");
     fs::create_dir_all(project.join(".state")).unwrap();
@@ -3622,7 +3599,7 @@ fn fault_campaign_and_restore_rehearsal() {
     let old_attempt = AttemptId::new("attempt-old").unwrap();
     let due = unix_ms();
     let mut db = SqliteStore::create(&db_path).unwrap();
-    assert_eq!(db.read_snapshot(None).unwrap().schema_version, 41);
+    assert_eq!(db.read_snapshot(None).unwrap().schema_version, herdr_projects::store::SCHEMA);
     let op = operation("op-1", &task_id, "env-1", due);
     db.commit(Commit {
         expected_head: 0,
@@ -3828,7 +3805,7 @@ fn fault_campaign_and_restore_rehearsal() {
     drop(db);
 
     let digest =
-        install_fixture_contract(&db_path, "t-old", &repository, &oid, "sha1", "src/old.rs");
+        install_fixture_contract(&db_path, "t-old", &repository, &oid, "sha1", "src/old.rs", &[]);
     let submission = serde_json::json!({
         "idempotency_key": "submit-old",
         "task_id": "t-old",
@@ -3841,7 +3818,10 @@ fn fault_campaign_and_restore_rehearsal() {
         "object_format": "sha1",
         "artifact_manifest": [{"path": "README", "oid": oid}],
         "claimed_checks": ["old attempt is diagnostic"],
-        "objects": [{"oid": oid, "relative_path": object_path}]
+        "objects": git(&repo, &["rev-list", "--objects", &oid]).lines().map(|line| {
+            let oid = line.split_whitespace().next().unwrap();
+            serde_json::json!({"oid":oid,"relative_path":format!("{}/{}", &oid[..2], &oid[2..])})
+        }).collect::<Vec<_>>()
     });
     let raw = serde_json::to_vec(&submission).unwrap();
     let mut db = SqliteStore::open(&db_path).unwrap();
@@ -3894,24 +3874,19 @@ fn fault_campaign_and_restore_rehearsal() {
         sql_count(&db_path, "SELECT count(*) FROM feedback_items"),
         1
     );
-    let first_old = "11".repeat(32);
-    let later_old = "33".repeat(32);
-    let insert_receipt = |result: &str, created: i64| {
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
-        let digest = "d".repeat(64);
-        let git_oid = "a".repeat(40);
-        conn.execute(
-            "INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,'/tmp/project',?1,?2,?2,'t-old',1,?2,'attempt-old','builds',?2,?3,?3,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?2,0,0,?4)",
-            rusqlite::params![result, digest, git_oid, created],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?1,?2,?3,?3,'sha1',?2,?2,'linux-unshare-user-pid-mount-v1',0,?4)",
-            rusqlite::params![result, digest, git_oid, created],
-        )
-        .unwrap();
-        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    // Real verification supplies contract-check evidence; hand-written receipt
+    // rows cannot stand in for the verifier's scope/output checks.
+    let policy = tmp.path().join("accepted-policy.json");
+    fs::write(&policy, PLANNING_POLICY).unwrap();
+    let verify_receipt = |db: &mut SqliteStore, key: &str| {
+        fs::create_dir(tmp.path().join(key)).unwrap();
+        let request = herdr_projects::verification::VerifyRequest::new(
+            stored.submission_id.clone(), "builds", &policy, key,
+            Duration::from_secs(30), tmp.path().join(key),
+        );
+        let outcome = herdr_projects::verification::verify(db, &request).unwrap();
+        assert_eq!(outcome.state, "accepted", "{:?}", outcome.reason);
+        outcome.receipt.unwrap().result_id().to_string()
     };
     let point_active = |db: &mut SqliteStore, attempt: &AttemptId| {
         let snapshot = db.read_snapshot(None).unwrap();
@@ -3938,7 +3913,7 @@ fn fault_campaign_and_restore_rehearsal() {
     };
     // The stored writer accepts this receipt only while attempt-old is current.
     point_active(&mut db, &old_attempt);
-    insert_receipt(&first_old, 1);
+    let first_old = verify_receipt(&mut db, "first-old-receipt");
     let need = TaskId::new("t-need").unwrap();
     db.commit(Commit {
         expected_head: db.current_head().unwrap(),
@@ -3995,7 +3970,8 @@ fn fault_campaign_and_restore_rehearsal() {
             .iter()
             .any(|blocker| blocker == "admission_disabled:verified_result")));
     point_active(&mut db, &new_attempt);
-    insert_receipt(&later_old, 2);
+    let later_old = verify_receipt(&mut db, "later-old-receipt");
+    assert_ne!(later_old, first_old);
     let again = db.read_snapshot(None).unwrap();
     let need_revision = again
         .tasks

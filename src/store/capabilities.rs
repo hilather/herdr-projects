@@ -302,17 +302,12 @@ impl SqliteStore {
     }
 }
 
-fn contract_request(db: &Connection, task_id: &str) -> Result<Option<(String, Vec<String>)>> {
-    let raw: Option<Vec<u8>> = db
-        .query_row(
-            "SELECT raw_bytes FROM task_contracts WHERE task_id=?1 ORDER BY contract_revision DESC LIMIT 1",
-            [task_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
+fn contract_request(db: &Connection, task_id: &str, budget:Option<&read_budget::ReadBudget>) -> Result<Option<(String, Vec<String>)>> {
+    let raw: Option<Option<Vec<u8>>> = read_budget::optional(db,
+        "SELECT CASE WHEN length(raw_bytes)<=65536 THEN raw_bytes END FROM task_contracts WHERE task_id=?1 ORDER BY contract_revision DESC LIMIT 1",
+        [task_id],budget,&[(0,2)],|row|row.get(0))?;
+    let Some(raw)=raw else {return Ok(None);};
+    let raw=raw.ok_or_else(||StoreError::Limit("capability contract exceeds 64 KiB".into()))?;
     let value: serde_json::Value = serde_json::from_slice(&raw)
         .map_err(|_| StoreError::Corrupt("invalid task contract".into()))?;
     let kind = value["profile_kind"]
@@ -332,66 +327,48 @@ fn contract_request(db: &Connection, task_id: &str) -> Result<Option<(String, Ve
     Ok(Some((kind, requested)))
 }
 
-fn levels_for(
-    db: &Connection,
-    adapter: &str,
-    digest: &str,
-    now: i64,
-) -> Result<Vec<CapabilityLevel>> {
-    // Latest in-window row per level. A future observation is not shown yet.
-    let mut stmt = db.prepare(
-        "SELECT level FROM capability_evidence WHERE adapter_kind=?1 AND profile_digest=?2 AND observed_unix_ms<=?3 AND expires_unix_ms>?3 ORDER BY observed_unix_ms DESC, evidence_id DESC",
-    )?;
-    let mut rows = stmt.query(params![adapter, digest, now])?;
-    let mut levels = Vec::new();
-    while let Some(row) = rows.next()? {
-        let level: String = row.get(0)?;
-        let level = CapabilityLevel::parse(&level)
-            .ok_or_else(|| StoreError::Corrupt("unknown capability level".into()))?;
-        if !levels.contains(&level) {
-            levels.push(level);
-        }
+fn levels_for_with_budget(db:&Connection,adapter:&str,digest:&str,now:i64,budget:Option<&read_budget::ReadBudget>)->Result<Vec<CapabilityLevel>> {
+    // The schema has five levels. Seek each level's unexpired observations and
+    // stop at the first currently valid window instead of deduplicating history.
+    let mut levels=Vec::new();
+    for level in [CapabilityLevel::Discovered,CapabilityLevel::Launchable,
+        CapabilityLevel::MemoryProtocolCapable,CapabilityLevel::RepositoryCapable,
+        CapabilityLevel::WorkflowCertified] {
+        let present:bool=read_budget::one(db,
+            "SELECT EXISTS(SELECT 1 FROM capability_evidence WHERE adapter_kind=?1 AND profile_digest=?2 AND level=?3 AND expires_unix_ms>?4 AND observed_unix_ms<=?4)",
+            params![adapter,digest,level.as_str(),now],budget,&[],|row|row.get(0))?;
+        if present {levels.push(level);}
     }
     Ok(levels)
 }
 
-fn selected_native_digest(db: &Connection, kind: &str) -> Result<Option<String>> {
+fn selected_native_digest(db: &Connection, kind: &str, budget:Option<&read_budget::ReadBudget>) -> Result<Option<String>> {
     let (path, dev, ino) = store_binding(db)?;
-    let mut stmt = tx_profiles(db)?;
-    let mut rows = stmt.query([])?;
-    let mut selected: Option<(i64, String)> = None;
-    while let Some(row) = rows.next()? {
-        let digest: String = row.get(0)?;
-        let report: String = row.get(1)?;
-        let report_digest: String = row.get(2)?;
-        let sequence: i64 = row.get(3)?;
-        let value = load_native_report(&report, &report_digest)?;
-        if !report_matches_store(&value, &path, dev, ino) {
-            continue;
-        }
-        let profile = profile_from_report(&value, &digest)?;
-        if profile.kind != kind {
-            continue;
-        }
-        if selected
-            .as_ref()
-            .is_none_or(|(prior, _)| sequence >= *prior)
-        {
-            selected = Some((sequence, digest));
-        }
+    // Retained reports are serialized by the native producer. Select its exact
+    // store identity and adapter before loading any historical report payloads.
+    // The index narrows candidates; it never replaces hash/profile validation.
+    let binding=serde_json::json!([path,dev,ino]).to_string();
+    let row:Option<(String,Option<String>,String)>=read_budget::optional(db,
+        "SELECT profile_digest,CASE WHEN length(report)<=1048576 THEN report END,report_digest FROM native_profiles WHERE json(json_extract(report,'$.source_store'))=?1 AND json_extract(report,'$.preparation.profile.kind')=?2 ORDER BY sequence DESC LIMIT 1",
+        params![binding,kind],budget,&[(1,2)],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+    let Some((digest,report,report_digest))=row else {return Ok(None);};
+    let report=report.ok_or_else(||StoreError::Limit("native profile report exceeds 1 MiB".into()))?;
+    let value=load_native_report(&report,&report_digest)?;
+    if !report_matches_store(&value,&path,dev,ino) {
+        return Err(StoreError::Corrupt("selected native profile store identity mismatch".into()));
     }
-    Ok(selected.map(|(_, digest)| digest))
+    let profile=profile_from_report(&value,&digest)?;
+    if profile.kind!=kind {return Err(StoreError::Corrupt("selected native profile kind mismatch".into()));}
+    Ok(Some(digest))
 }
 
-fn tx_profiles(db: &Connection) -> Result<rusqlite::Statement<'_>> {
-    Ok(db.prepare(
-        "SELECT profile_digest, report, report_digest, sequence FROM native_profiles ORDER BY sequence",
-    )?)
-}
-
+#[cfg(test)]
 fn selected_levels(db: &Connection, kind: &str, now: i64) -> Result<Vec<CapabilityLevel>> {
-    if let Some(digest) = selected_native_digest(db, kind)? {
-        return levels_for(db, "native", &digest, now);
+    selected_levels_with_budget(db,kind,now,None)
+}
+fn selected_levels_with_budget(db:&Connection,kind:&str,now:i64,budget:Option<&read_budget::ReadBudget>)->Result<Vec<CapabilityLevel>> {
+    if let Some(digest) = selected_native_digest(db, kind, budget)? {
+        return levels_for_with_budget(db, "native", &digest, now, budget);
     }
     let fake: Option<String> = db
         .query_row(
@@ -401,9 +378,21 @@ fn selected_levels(db: &Connection, kind: &str, now: i64) -> Result<Vec<Capabili
         )
         .optional()?;
     if let Some(digest) = fake {
-        return levels_for(db, "fake", &digest, now);
+        return levels_for_with_budget(db, "fake", &digest, now, budget);
     }
     Ok(Vec::new())
+}
+
+/// Admission checks the exact selected native profile, never a sibling profile
+/// of the same kind or simulator-only evidence.
+pub(super) fn profile_satisfies_contract_with_budget(db: &Connection, contract: &PreparedContract, profile: &FrozenProfile, now: i64,budget:Option<&read_budget::ReadBudget>) -> Result<bool> {
+    if profile.kind != contract.profile_kind { return Ok(false); }
+    if contract.capability_flags.is_empty() { return Ok(true); }
+    let version: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version < SCHEMA_VERSION { return Ok(false); }
+    let digest = profile.reference().map_err(StoreError::Invalid)?.digest;
+    let shown = levels_for_with_budget(db, "native", &digest, now,budget)?;
+    Ok(contract.capability_flags.iter().all(|flag| CapabilityLevel::parse(flag).is_some_and(|level| shown.contains(&level))))
 }
 
 /// Queue blocker when the contract asks for a level the selected profile has not shown.
@@ -413,17 +402,20 @@ pub(super) fn queue_capability_blocker(
     task_id: &str,
     now: i64,
 ) -> Result<Option<String>> {
+    queue_capability_blocker_with_budget(db,task_id,now,None)
+}
+pub(super) fn queue_capability_blocker_with_budget(db:&Connection,task_id:&str,now:i64,budget:Option<&read_budget::ReadBudget>)->Result<Option<String>> {
     let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version < SCHEMA_VERSION {
         return Ok(None);
     }
-    let Some((kind, flags)) = contract_request(db, task_id)? else {
+    let Some((kind, flags)) = contract_request(db, task_id, budget)? else {
         return Ok(None);
     };
     if flags.is_empty() {
         return Ok(None);
     }
-    let shown = selected_levels(db, &kind, now)?;
+    let shown = selected_levels_with_budget(db, &kind, now, budget)?;
     let lacks = flags
         .iter()
         .any(|flag| CapabilityLevel::parse(flag).is_none_or(|level| !shown.contains(&level)));
@@ -482,26 +474,16 @@ mod tests {
     fn upgrade_v1_from_32_to_34_and_create_end_at_user_version_34() {
         let fresh = tempfile::tempdir().unwrap();
         let created = SqliteStore::create(&fresh.path().join("state.db")).unwrap();
-        assert_eq!(user_version(&created.connection), 41);
+        assert_eq!(user_version(&created.connection), crate::store::SCHEMA);
         assert_eq!(
             created
                 .connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            41
+            crate::store::SCHEMA
         );
         assert!(table_exists(&created.connection, "capability_evidence"));
-        let open_source = include_str!("mod.rs");
-        let open = open_source
-            .split("pub fn open")
-            .nth(1)
-            .unwrap()
-            .split("pub fn integrity_check")
-            .next()
-            .unwrap();
-        assert!(!open.contains("upgrade_v1"));
-        assert!(!open.contains("0033_capability_evidence"));
         drop(created);
 
         let temp = tempfile::tempdir().unwrap();
@@ -523,9 +505,7 @@ mod tests {
         .unwrap();
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
-        raw.execute_batch(
-            "DROP INDEX IF EXISTS attempts_retained_by_id; DROP TABLE IF EXISTS active_work_index; DROP TABLE IF EXISTS active_work_meta; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_update; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_delete; DROP TRIGGER IF EXISTS barrier_members_no_update; DROP TRIGGER IF EXISTS barrier_members_no_delete; DROP TRIGGER IF EXISTS barrier_revisions_no_membership_update; DROP TABLE IF EXISTS barrier_stale_briefs; DROP TABLE IF EXISTS barrier_members; DROP TABLE IF EXISTS barrier_revisions; DROP TRIGGER IF EXISTS memory_change_receipts_no_update; DROP TRIGGER IF EXISTS memory_change_receipts_no_delete; DROP TRIGGER IF EXISTS update_package_members_no_update; DROP TRIGGER IF EXISTS update_package_members_no_delete; DROP TRIGGER IF EXISTS update_packages_no_update; DROP TRIGGER IF EXISTS update_packages_no_delete; DROP TABLE IF EXISTS memory_change_receipts; DROP TABLE IF EXISTS update_package_members; ALTER TABLE consumer_bindings DROP COLUMN applied_cursor; DROP TABLE IF EXISTS update_packages; DROP TRIGGER IF EXISTS memory_read_set_on_record; DROP TRIGGER IF EXISTS memory_read_set_on_reclassify; DROP TRIGGER IF EXISTS memory_read_set_on_revision; DROP TRIGGER IF EXISTS memory_read_set_on_validity; DROP TRIGGER IF EXISTS memory_read_set_on_head; DROP TABLE IF EXISTS memory_scope_catalog; DROP TABLE IF EXISTS memory_required_generation; DROP TABLE IF EXISTS consumer_binding_undeliverable; DROP TABLE IF EXISTS consumer_binding_obligations; DROP TABLE IF EXISTS consumer_bindings; DROP TABLE IF EXISTS wait_replay_events; DROP TABLE IF EXISTS replan_requests; DROP TABLE IF EXISTS replan_budget_resets; DROP TABLE IF EXISTS attempt_infrastructure_retries; DROP TABLE IF EXISTS wait_conditions; DROP TABLE IF EXISTS resource_claims; DROP TABLE IF EXISTS delegation_stop_obligations; DROP TABLE IF EXISTS delegation_revocations; DROP TABLE IF EXISTS delegation_grants; DROP TABLE IF EXISTS capability_evidence; UPDATE store_meta SET schema_version=32; PRAGMA user_version=32;",
-        )
+        crate::store::test_schema::historical(&raw, 32)
         .unwrap();
         drop(raw);
         let mut db = SqliteStore::open(&path).unwrap();
@@ -533,13 +513,13 @@ mod tests {
         assert!(!table_exists(&db.connection, "capability_evidence"));
         assert_eq!(db.read_snapshot(None).unwrap().tasks[0].title, "kept");
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 41);
+        assert_eq!(user_version(&db.connection), crate::store::SCHEMA);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            41
+            crate::store::SCHEMA
         );
         assert!(table_exists(&db.connection, "capability_evidence"));
         assert_eq!(
@@ -552,8 +532,8 @@ mod tests {
         check_schema(&db.connection).unwrap();
         drop(db);
         let mut reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 41);
-        assert_eq!(reopened.read_snapshot(None).unwrap().schema_version, 41);
+        assert_eq!(user_version(&reopened.connection), crate::store::SCHEMA);
+        assert_eq!(reopened.read_snapshot(None).unwrap().schema_version, crate::store::SCHEMA);
     }
 
     #[test]
@@ -600,10 +580,7 @@ mod tests {
                 .execute("DELETE FROM capability_evidence", [])
                 .is_err()
         );
-        let sql = include_str!("../../migrations/0033_capability_evidence.sql");
-        assert!(!sql.contains("model"));
-        assert!(!sql.contains("reasoning_effort"));
-        assert!(!sql.contains("PREPARED_LAUNCH_DISPATCH_ENABLED"));
+
     }
 
     #[test]

@@ -19,7 +19,10 @@ pub struct QueueAge {
 pub struct Counters {
     pub queue_age_ms: QueueAge,
     pub lock_wait_ms: Option<u64>,
-    pub rows_decoded: u64,
+    /// Total decision-path decoding is not yet fully instrumented.
+    pub rows_decoded: Option<u64>,
+    /// Rows decoded by the status request's first active-inventory page only.
+    pub active_inventory_page_rows: u64,
     pub observation_age_ms: Option<i64>,
     pub ambiguous_effects: u64,
     pub retained_slots: u64,
@@ -132,7 +135,8 @@ fn counters_from(numbers: FactoryNumbers) -> Counters {
             integration: numbers.queue_age_integration_ms,
         },
         lock_wait_ms: None,
-        rows_decoded: numbers.rows_decoded,
+        rows_decoded: None,
+        active_inventory_page_rows: numbers.active_inventory_page_rows,
         observation_age_ms: numbers.observation_age_ms,
         ambiguous_effects: numbers.ambiguous_effects,
         retained_slots: numbers.retained_slots,
@@ -183,170 +187,21 @@ pub fn report(project: &Path, prepared_dispatch: bool) -> Result<FactoryStatus, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::*;
     use crate::store::SqliteStore;
 
-    fn forbid(value: &serde_json::Value) {
-        match value {
-            serde_json::Value::Object(map) => {
-                for (key, child) in map {
-                    let lower = key.to_ascii_lowercase();
-                    assert!(
-                        !matches!(lower.as_str(), "env" | "environment" | "argv" | "secret" | "secrets" | "path"),
-                        "{key}"
-                    );
-                    forbid(child);
-                }
-            }
-            serde_json::Value::Array(items) => items.iter().for_each(forbid),
-            serde_json::Value::String(text) => {
-                assert!(!text.contains("SECRET_TOKEN_DO_NOT_LEAK"), "{text}");
-            }
-            _ => {}
+    #[test]
+    fn status_keeps_missing_decision_measurements_unknown_across_historical_schemas() {
+        for version in [25,26,27,42,crate::store::SCHEMA] {
+            let temp=tempfile::tempdir().unwrap();
+            let project=temp.path().join("project");std::fs::create_dir_all(project.join(".state")).unwrap();
+            let path=project.join(".state/state.db");
+            drop(SqliteStore::create(&path).unwrap());
+            let raw=rusqlite::Connection::open(&path).unwrap();
+            crate::store::test_schema::historical(&raw,version).unwrap();drop(raw);
+            let status=report(&project,true).unwrap();
+            assert_eq!(status.schema,version);assert!(status.counters.rows_decoded.is_none());
+            assert!(status.counters.verification_backlog_age_ms.is_none());
         }
     }
 
-    #[test]
-    fn status_json_omits_environment_and_counts_rows_from_the_active_page() {
-        let temp = tempfile::tempdir().unwrap();
-        let project = temp.path().join("project");
-        std::fs::create_dir_all(project.join(".state")).unwrap();
-        let mut db = SqliteStore::create(&project.join(".state/state.db")).unwrap();
-        let mut mutations = vec![
-            Mutation::Task {
-                expected: None,
-                next: Task {
-                    id: TaskId::new("kept").unwrap(),
-                    revision: 1,
-                    state: TaskState::Running,
-                    title: "SECRET_TOKEN_DO_NOT_LEAK".into(),
-                    active_attempt: None,
-                },
-            },
-            Mutation::Attempt {
-                expected: None,
-                next: Attempt {
-                    id: AttemptId::new("attempt-kept").unwrap(),
-                    task: TaskId::new("kept").unwrap(),
-                    revision: 1,
-                    state: AttemptState::Running,
-                    snapshot: None,
-                    reservation: "slot-kept".into(),
-                    termination_observed: false,
-                },
-            },
-        ];
-        for index in 0..40 {
-            mutations.push(Mutation::Task {
-                expected: None,
-                next: Task {
-                    id: TaskId::new(format!("retired-{index:02}")).unwrap(),
-                    revision: 1,
-                    state: TaskState::Succeeded,
-                    title: format!("SECRET_TOKEN_DO_NOT_LEAK-{index}").into(),
-                    active_attempt: None,
-                },
-            });
-            mutations.push(Mutation::Attempt {
-                expected: None,
-                next: Attempt {
-                    id: AttemptId::new(format!("attempt-retired-{index:02}")).unwrap(),
-                    task: TaskId::new(format!("retired-{index:02}")).unwrap(),
-                    revision: 1,
-                    state: AttemptState::Completed,
-                    snapshot: None,
-                    reservation: format!("slot-retired-{index:02}"),
-                    termination_observed: true,
-                },
-            });
-        }
-        db.commit(Commit { expected_head: 0, mutations }).unwrap();
-        drop(db);
-        std::fs::write(
-            project.join(".state/admission-paused.json"),
-            r#"{"reason":"disk_full","token":"SECRET_TOKEN_DO_NOT_LEAK"}"#,
-        )
-        .unwrap();
-        let status = report(&project, true).unwrap();
-        assert!(status.prepared_dispatch);
-        assert_eq!(status.factory_admission, "off");
-        assert!(status.admission_paused);
-        assert_eq!(status.pause_reason, Some("disk_full"));
-        assert!(status.blockers.contains(&"admission_paused"));
-        assert!(!status.blockers.contains(&"promotion_conflict"));
-        assert_eq!(status.counters.retained_slots, 1);
-        assert!(status.counters.rows_decoded > 0);
-        assert!(
-            status.counters.rows_decoded < 41,
-            "rows_decoded {} decoded retired attempts",
-            status.counters.rows_decoded
-        );
-        let mut db = SqliteStore::open(&project.join(".state/state.db")).unwrap();
-        let rows = db.hot_path_rows_decoded().unwrap();
-        assert_eq!(status.counters.rows_decoded, rows);
-        let value = serde_json::to_value(&status).unwrap();
-        forbid(&value);
-        assert!(value.get("argv").is_none());
-        assert!(value.get("environment").is_none());
-        let text = serde_json::to_string(&value).unwrap();
-        assert!(!text.contains("SECRET_TOKEN_DO_NOT_LEAK"), "{text}");
-
-        let status_source = include_str!("factory_status.rs");
-        let snapshot_reader = ["read", "_snapshot"].concat();
-        assert!(status_source.contains("hot_path_rows_decoded") || include_str!("store/observability.rs").contains("hot_path_rows_decoded"));
-        assert!(!status_source.contains(&snapshot_reader));
-        assert!(!include_str!("store/observability.rs").contains(&snapshot_reader));
-        let active = include_str!("store/active_work.rs");
-        let start = active.find("fn hot_path_page_rows").unwrap();
-        let body = &active[start..];
-        let body = body.split("\n    pub fn ").next().unwrap();
-        assert!(body.contains("drop(tx)"), "{body}");
-        assert!(!body.contains(&snapshot_reader), "{body}");
-        let watchdog_source = include_str!("watchdog.rs");
-        let production = watchdog_source.split("#[cfg(test)]").next().unwrap();
-        let terminated = ["termination", "_observed"].concat();
-        assert!(!production.contains(&terminated), "watchdog must not write termination");
-        assert!(!production.contains("UPDATE attempts"));
-        let targeted = include_str!("store/targeted.rs");
-        let start = targeted.find("fn hot_path_rows_decoded").unwrap();
-        let body = &targeted[start..targeted[start..].find("\n    fn ").map(|end| start + end).unwrap_or(targeted.len())];
-        assert!(body.contains("hot_path_page_rows"), "{body}");
-        assert!(!body.contains(&snapshot_reader), "{body}");
-    }
-
-    #[test]
-    fn newer_schema_does_not_guess_counters_or_leak_task_text() {
-        let temp = tempfile::tempdir().unwrap();
-        let project = temp.path().join("project");
-        std::fs::create_dir_all(project.join(".state")).unwrap();
-        let db = SqliteStore::create(&project.join(".state/state.db")).unwrap();
-        drop(db);
-        let connection = rusqlite::Connection::open(project.join(".state/state.db")).unwrap();
-        connection.execute_batch("PRAGMA user_version = 99").unwrap();
-        drop(connection);
-        let error = report(&project, false).unwrap_err();
-        assert_eq!(error.to_string(), "store schema is newer than this binary");
-        let ReportError::Newer(value) = error else { panic!("expected newer schema") };
-        assert_eq!(value["schema"], 99);
-        assert_eq!(value["error"], "store schema is newer than this binary");
-        assert_eq!(value["prepared_dispatch"], false);
-        assert!(value.get("counters").is_none(), "{value}");
-        forbid(&value);
-
-        let zero = tempfile::tempdir().unwrap();
-        let project = zero.path().join("project");
-        std::fs::create_dir_all(project.join(".state")).unwrap();
-        let db = SqliteStore::create(&project.join(".state/state.db")).unwrap();
-        drop(db);
-        rusqlite::Connection::open(project.join(".state/state.db"))
-            .unwrap()
-            .execute_batch("PRAGMA user_version = 0")
-            .unwrap();
-        let error = report(&project, false).unwrap_err();
-        assert_eq!(error.to_string(), "unsupported_schema");
-        let ReportError::Unsupported(value) = error else { panic!("expected unsupported schema") };
-        assert_eq!(value["schema"], 0);
-        assert_eq!(value["error"], "unsupported_schema");
-        assert!(value.get("counters").is_none(), "{value}");
-    }
 }

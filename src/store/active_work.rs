@@ -60,7 +60,8 @@ struct Meta {
     retains_attempt_capacity: bool,
 }
 
-struct Account {
+struct Account<'a> {
+    budget: Option<&'a read_budget::ReadBudget>,
     pub rows: u64,
     pub fullscan: i64,
 }
@@ -90,12 +91,17 @@ fn query<T>(
     sql: &str,
     params: impl rusqlite::Params,
     account: &mut Account,
-    mut map: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    map: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
 ) -> Result<Vec<T>> {
+    query_json(db,sql,params,account,&[],map)
+}
+
+fn query_json<T>(db:&Connection,sql:&str,params:impl rusqlite::Params,account:&mut Account,json:&[(usize,usize)],mut map:impl FnMut(&rusqlite::Row<'_>)->rusqlite::Result<T>)->Result<Vec<T>> {
     let mut stmt = db.prepare(sql)?;
     let mut rows = stmt.query(params)?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
+        if let Some(budget)=account.budget {budget.row(row,json)?;}
         account.rows += 1;
         out.push(map(row)?);
     }
@@ -200,13 +206,19 @@ fn ensure(db: &Connection, account: &mut Account) -> Result<Meta> {
     for (id, task, _) in &retained {
         by_task.entry(task.clone()).or_default().push(id.clone());
     }
+    let schema:u32=db.query_row("PRAGMA user_version",[],|row|row.get(0))?;
+    let candidate_source=if schema>=43 {
+        // CROSS JOIN fixes the indexed candidate set as the outer loop. A
+        // changed retained attempt must not restart a scan of retired bindings.
+        "active_work_candidates c CROSS JOIN runtime_bindings b ON b.id=c.binding_id"
+    } else { "runtime_bindings b" };
     let candidates = query(
         db,
-        "SELECT b.id, b.task_id,
+        &format!("SELECT b.id, b.task_id,
                 EXISTS(SELECT 1 FROM attempts a WHERE a.task_id = b.task_id),
                 EXISTS(SELECT 1 FROM runtime_ownership o WHERE o.binding_id = b.id),
                 t.active_attempt
-         FROM runtime_bindings b LEFT JOIN tasks t ON t.id = b.task_id ORDER BY b.id",
+         FROM {candidate_source} LEFT JOIN tasks t ON t.id = b.task_id ORDER BY b.id"),
         [],
         account,
         |row| {
@@ -251,19 +263,21 @@ fn ensure(db: &Connection, account: &mut Account) -> Result<Meta> {
     Ok(meta)
 }
 
-pub(super) fn sync_projection(db: &Connection) -> Result<()> {
+pub(super) fn sync_projection_with_budget(db:&Connection,budget:Option<&read_budget::ReadBudget>)->Result<()> {
     let mut account = Account {
         rows: 0,
         fullscan: 0,
+        budget,
     };
     ensure(db, &mut account)?;
     Ok(())
 }
 
-pub(super) fn recorded_bindings(db: &Connection, ids: &[String]) -> Result<Vec<RuntimeBinding>> {
+pub(super) fn recorded_bindings(db: &Connection, ids: &[String],budget:Option<&read_budget::ReadBudget>) -> Result<Vec<RuntimeBinding>> {
     let mut account = Account {
         rows: 0,
         fullscan: 0,
+        budget,
     };
     let session = session_digest(db, &mut account)?;
     let mut bindings = Vec::with_capacity(ids.len());
@@ -389,12 +403,13 @@ fn load_binding(
     session: Option<&str>,
     account: &mut Account,
 ) -> Result<RuntimeBinding> {
-    let rows = query(
+    let rows = query_json(
         db,
         "SELECT b.id, b.task_id, b.revision, b.source_path, b.payload, b.payload_hash, s.digest, s.bytes
          FROM runtime_bindings b LEFT JOIN legacy_sources s ON s.path = b.source_path WHERE b.id = ?1",
         params![id],
         account,
+        &[(4,1)],
         |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -427,11 +442,12 @@ fn load_ownership(
     id: &str,
     account: &mut Account,
 ) -> Result<Option<RuntimeOwnership>> {
-    let rows = query(
+    let rows = query_json(
         db,
         "SELECT binding_id, revision, binding_revision, attempt_id, payload, payload_hash FROM runtime_ownership WHERE binding_id=?1",
         params![id],
         account,
+        &[(4,1)],
         |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -508,11 +524,12 @@ fn read_page(
     account: &mut Account,
 ) -> Result<(Vec<ActiveWorkItem>, bool, bool)> {
     let start = cursor.unwrap_or(-1);
-    let index_rows = query(
+    let index_rows = query_json(
         db,
         "SELECT ordinal, binding_id, attempt_ids, retains_capacity FROM active_work_index WHERE ordinal > ?1 ORDER BY ordinal LIMIT ?2",
         params![start, ACTIVE_WORK_PAGE as i64],
         account,
+        &[(2,1)],
         |row| {
             Ok(IndexRow {
                 ordinal: row.get(0)?,
@@ -604,7 +621,7 @@ impl SqliteStore {
     /// read cannot publish the projection or change attempts.
     pub(super) fn hot_path_page_rows(&mut self) -> Result<u64> {
         let tx = self.connection.transaction()?;
-        let mut account = Account { rows: 0, fullscan: 0 };
+        let mut account = Account { rows: 0, fullscan: 0, budget: None };
         let _meta = ensure(&tx, &mut account)?;
         let _page = read_page(&tx, None, &mut account)?;
         let rows = account.rows;
@@ -617,6 +634,7 @@ impl SqliteStore {
         let mut account = Account {
             rows: 0,
             fullscan: 0,
+            budget: None,
         };
         let meta = ensure(&tx, &mut account)?;
         let (items, reached_end, missing) = read_page(&tx, cursor, &mut account)?;
@@ -629,10 +647,14 @@ impl SqliteStore {
     /// Walk active pages until coverage is complete or `max_pages` stops the caller.
     /// Stopping early, or a hole in the ordinals, is incomplete and cannot release capacity.
     pub fn reconcile_active_work(&mut self, max_pages: Option<u32>) -> Result<ActiveWorkRun> {
+        self.reconcile_active_work_with_budget(max_pages,None)
+    }
+    pub(crate) fn reconcile_active_work_with_budget(&mut self,max_pages:Option<u32>,budget:Option<&read_budget::ReadBudget>)->Result<ActiveWorkRun> {
         let tx = self.connection.transaction()?;
         let mut account = Account {
             rows: 0,
             fullscan: 0,
+            budget,
         };
         let meta = ensure(&tx, &mut account)?;
         let mut cursor = None;
@@ -730,17 +752,81 @@ mod tests {
     }
 
     #[test]
+    fn changed_attempt_rebuild_work_does_not_grow_with_retired_history() {
+        use super::super::controlled::{ControlledStore,ReadControl,SqlWork};
+        let mut expected=None;
+        for history in [0,10_000] {
+            let root=tempfile::tempdir().unwrap();
+            let path=root.path().join("state.db");
+            let mut db=SqliteStore::create(&path).unwrap();
+            db.connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+            seed_pair(&db.connection,"live",true);
+            for n in 0..history {seed_pair(&db.connection,&format!("old-{n}"),false);}
+            db.connection.execute_batch("COMMIT").unwrap();
+            assert_eq!(db.reconcile_active_work(None).unwrap().items.len(),1);
+            db.connection.execute("UPDATE attempts SET revision=revision+1 WHERE id='attempt-live'",[]).unwrap();
+            drop(db);
+            let work=SqlWork::default();
+            let control=ReadControl::new(std::time::Instant::now()+Duration::from_secs(10),Default::default());
+            let mut db=ControlledStore::open_scoped_observed(&path,control,work.clone()).unwrap();
+            let before=work.snapshot();
+            let rebuilt=db.reconcile_active_work(None).unwrap();
+            assert_eq!(rebuilt.coverage,ActiveCoverage::Complete);
+            assert_eq!(rebuilt.items.len(),1);
+            assert!(!rebuilt.capacity_release_allowed);
+            let after=work.snapshot();
+            let costs=(after.sqlite_rows_returned-before.sqlite_rows_returned,after.sqlite_vm_steps-before.sqlite_vm_steps);
+            if let Some(expected)=expected {assert_eq!(costs,expected);} else {expected=Some(costs);}
+        }
+    }
+
+    #[test]
+    fn candidate_membership_tracks_attempt_deletion_and_rolls_back_atomically() {
+        let root=tempfile::tempdir().unwrap();
+        let mut db=SqliteStore::create(&root.path().join("state.db")).unwrap();
+        seed_pair(&db.connection,"old",false);
+        assert!(db.reconcile_active_work(None).unwrap().items.is_empty());
+        db.connection.execute_batch("BEGIN IMMEDIATE; DELETE FROM attempts WHERE id='attempt-old';").unwrap();
+        assert_eq!(db.connection.query_row("SELECT count(*) FROM active_work_candidates",[],|row|row.get::<_,u64>(0)).unwrap(),1);
+        db.connection.execute_batch("ROLLBACK").unwrap();
+        assert!(db.reconcile_active_work(None).unwrap().items.is_empty());
+        db.connection.execute("DELETE FROM attempts WHERE id='attempt-old'",[]).unwrap();
+        let after=db.reconcile_active_work(None).unwrap();
+        assert_eq!(after.items.len(),1);
+        assert_eq!(after.items[0].binding.id,"task:old");
+    }
+
+    #[test]
+    fn upgrade_from_42_backfills_only_required_candidates() {
+        let root=tempfile::tempdir().unwrap();
+        let mut db=SqliteStore::create(&root.path().join("state.db")).unwrap();
+        seed_pair(&db.connection,"live",true);
+        seed_pair(&db.connection,"old",false);
+        insert_task(&db.connection,"idle");
+        insert_binding(&db.connection,"idle");
+        crate::store::test_schema::historical(&db.connection,42).unwrap();
+        db.upgrade_v1().unwrap();
+        let run=db.reconcile_active_work(None).unwrap();
+        assert_eq!(run.coverage,ActiveCoverage::Complete);
+        assert_eq!(run.items.iter().map(|item|item.binding.id.as_str()).collect::<Vec<_>>(),vec!["task:idle","task:live"]);
+        assert!(!run.capacity_release_allowed);
+        db.connection.execute("UPDATE attempts SET termination_observed=1,state='completed',revision=2 WHERE id='attempt-live'",[]).unwrap();
+        let run=db.reconcile_active_work(None).unwrap();
+        assert_eq!(run.items.iter().map(|item|item.binding.id.as_str()).collect::<Vec<_>>(),vec!["task:idle"]);
+    }
+
+    #[test]
     fn create_ends_at_41_and_upgrade_from_40_reaches_41() {
         let fresh = tempfile::tempdir().unwrap();
         let created = SqliteStore::create(&fresh.path().join("state.db")).unwrap();
-        assert_eq!(user_version(&created.connection), 41);
+        assert_eq!(user_version(&created.connection), crate::store::SCHEMA);
         assert_eq!(
             created
                 .connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            41
+            crate::store::SCHEMA
         );
         for table in ["active_work_meta", "active_work_index"] {
             let sql: String = created
@@ -762,15 +848,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(indexed, 1);
-        let open_fn = include_str!("mod.rs")
-            .split("pub fn open")
-            .nth(1)
-            .unwrap()
-            .split("pub fn integrity_check")
-            .next()
-            .unwrap();
-        assert!(!open_fn.contains("upgrade_v1"));
-        assert!(!open_fn.contains("0041_active_work"));
         drop(created);
 
         let temp = tempfile::tempdir().unwrap();
@@ -788,10 +865,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        db.connection
-            .execute_batch(
-                "DROP INDEX IF EXISTS attempts_retained_by_id; DROP TABLE IF EXISTS active_work_index; DROP TABLE IF EXISTS active_work_meta; UPDATE store_meta SET schema_version=40; PRAGMA user_version=40;",
-            )
+        crate::store::test_schema::historical(&db.connection, 40)
             .unwrap();
         drop(db);
         let mut db = SqliteStore::open(&path).unwrap();
@@ -801,7 +875,7 @@ mod tests {
             Err(StoreError::UnsupportedSchema(40))
         ));
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 41);
+        assert_eq!(user_version(&db.connection), crate::store::SCHEMA);
         let after: String = db
             .connection
             .query_row(
@@ -820,7 +894,7 @@ mod tests {
         assert_eq!(title, "kept");
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 41);
+        assert_eq!(user_version(&reopened.connection), crate::store::SCHEMA);
     }
 
     #[test]

@@ -2,6 +2,8 @@
 use super::*;
 use std::collections::BTreeMap;
 use crate::operations::DeliveryState;
+mod overlap;
+pub(super) fn backfill_overlap(db:&Connection)->Result<()> {overlap::backfill(db)}
 #[cfg(test)]
 mod tests;
 fn invalid(s:&str)->StoreError {StoreError::Invalid(s.into())}
@@ -70,13 +72,41 @@ pub(super) fn read_all_with_budget(db:&Connection,budget:Option<&read_budget::Re
     if expected!=cursors {return Err(corrupt("routine cursor does not match immutable occurrence history"));}
     Ok((definitions,occurrences))
 }
+fn selected_occurrence(db:&Connection,id:&OperationId,budget:Option<&read_budget::ReadBudget>)->Result<(RoutineDefinition,RoutineOccurrence)> {
+    let mut stmt=db.prepare("SELECT id,name,revision,scheduled_unix_ms,payload,payload_hash FROM routine_occurrences WHERE operation_id=?1")?;
+    let mut rows=stmt.query([id.as_str()])?;
+    let row=rows.next()?.ok_or_else(||invalid("routine operation lacks an approved occurrence"))?;
+    if let Some(budget)=budget {budget.row(row,&[(4,2)])?;}
+    let occurrence_id:String=row.get(0)?;let name:String=row.get(1)?;let revision:u64=row.get(2)?;let instant:i64=row.get(3)?;
+    let occurrence:RoutineOccurrence=decoded(&row.get::<_,String>(4)?,&row.get::<_,String>(5)?)?;
+    let mut definition_stmt=db.prepare("SELECT payload,payload_hash FROM routine_revisions WHERE name=?1 AND revision=?2")?;
+    let mut definition_rows=definition_stmt.query(params![name,revision])?;
+    let definition_row=definition_rows.next()?.ok_or_else(||corrupt("routine definition missing"))?;
+    if let Some(budget)=budget {budget.row(definition_row,&[(0,2)])?;}
+    let payload:String=definition_row.get(0)?;let hash:String=definition_row.get(1)?;
+    let definition:RoutineDefinition=decoded(&payload,&hash)?;
+    if definition.name!=name||definition.revision!=revision||definition.reference().map_err(StoreError::Corrupt)?.digest!=hash {return Err(corrupt("routine revision identity mismatch"));}
+    let previous:Option<i64>=db.query_row("SELECT MAX(scheduled_unix_ms) FROM routine_occurrences WHERE name=?1 AND revision=?2 AND scheduled_unix_ms<?3",params![name,revision,instant],|r|r.get(0))?;
+    let before=previous.unwrap_or(definition.start_unix_ms-1);
+    if occurrence.id!=occurrence_id||RoutineOccurrence::identity(&definition,instant).map_err(StoreError::Corrupt)?!=occurrence_id
+        ||occurrence.routine!=definition.reference().map_err(StoreError::Corrupt)?||occurrence.scheduled_unix_ms!=instant
+        ||occurrence.first_unix_ms<=before||occurrence.first_unix_ms<definition.start_unix_ms||instant<occurrence.first_unix_ms||instant>occurrence.observed_unix_ms
+        ||occurrence.slots==0||occurrence.slots>i64::MAX as u64||occurrence.control_revision==0||occurrence.control_revision>i64::MAX as u64
+        ||occurrence.operation.as_ref()!=Some(id)||occurrence.disposition!=RoutineDisposition::Enqueued {return Err(corrupt("routine occurrence binding mismatch"));}
+    let operation=read_operation_with_budget(db,id,budget)?;
+    if id.as_str()!=occurrence_id||operation.task.is_some()||operation.kind!="routine.run"||operation.target!=format!("routine:{}",name)
+        ||operation.expected_revision!=occurrence.control_revision||operation.payload_version!=1||operation.payload!=serde_json::to_value(&occurrence).map_err(|_|corrupt("invalid occurrence"))?
+        ||operation.due_unix_ms!=occurrence.observed_unix_ms||operation.idempotency_key!=occurrence_id {return Err(corrupt("routine outbox binding mismatch"));}
+    let (cursor,last):(i64,i64)=db.query_row("SELECT c.after_unix_ms,(SELECT MAX(scheduled_unix_ms) FROM routine_occurrences WHERE name=c.name AND revision=c.revision) FROM routine_cursors c WHERE name=?1 AND revision=?2",params![name,revision],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    if cursor!=last {return Err(corrupt("routine cursor does not match immutable occurrence history"));}
+    Ok((definition,occurrence))
+}
 pub(super) fn check(db:&Connection,id:&OperationId)->Result<()> {
-    schema(db)?;let(definitions,occurrences)=read_all(db)?;
-    let occurrence=occurrences.iter().find(|o|o.operation.as_ref()==Some(id)).ok_or_else(||invalid("routine operation lacks an approved occurrence"))?;
-    let definition=definitions.iter().rev().find(|d|format!("routine-{}",d.name)==occurrence.routine.id).ok_or_else(||invalid("routine definition missing"))?;
-    if !definition.enabled||definition.reference().map_err(|s|invalid(&s))?!=occurrence.routine {return Err(invalid("routine revision withdrawn"));}
-    project_matches(db,definition)?;
-    crate::routines::validate_current(definition).map_err(|_|invalid("routine authority or script changed"))?;
+    schema(db)?;let(definition,_)=selected_occurrence(db,id,None)?;
+    let latest:u64=db.query_row("SELECT MAX(revision) FROM routine_revisions WHERE name=?1",[&definition.name],|r|r.get(0))?;
+    if !definition.enabled||latest!=definition.revision {return Err(invalid("routine revision withdrawn"));}
+    project_matches(db,&definition)?;
+    crate::routines::validate_current(&definition).map_err(|_|invalid("routine authority or script changed"))?;
     let control=super::control::read(db)?;
     if control.config_digest!=definition.config.digest {return Err(invalid("routine configuration is not acknowledged"));}
     Ok(())
@@ -93,6 +123,32 @@ fn validate_receipt(r:&RoutineReceipt,d:&RoutineDefinition,o:&RoutineOccurrence)
         ||r.stderr_truncated!=(r.stderr_total_bytes>r.stderr.len() as u64)
         ||r.elapsed_ms>d.deadline_ms+30_000 {return Err(corrupt("routine completion binding or bounds mismatch"));}
     Ok(())
+}
+
+fn scheduling_cursor(db:&Connection,d:&RoutineDefinition,budget:Option<&read_budget::ReadBudget>)->Result<i64> {
+    let after:i64=db.query_row("SELECT after_unix_ms FROM routine_cursors WHERE name=?1 AND revision=?2",params![d.name,d.revision],|r|r.get(0))?;
+    let mut stmt=db.prepare("SELECT id,scheduled_unix_ms,payload,payload_hash,operation_id FROM routine_occurrences WHERE name=?1 AND revision=?2 ORDER BY scheduled_unix_ms DESC LIMIT 1")?;
+    let mut rows=stmt.query(params![d.name,d.revision])?;
+    let latest:Option<(String,i64,String,String,Option<String>)>=if let Some(row)=rows.next()? {
+        if let Some(budget)=budget {budget.row(row,&[(2,2)])?;}
+        Some((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))
+    } else {None};
+    let Some((id,instant,payload,hash,operation))=latest else {
+        if after!=d.start_unix_ms-1{return Err(corrupt("routine cursor does not match immutable occurrence history"));}
+        return Ok(after);
+    };
+    if after!=instant{return Err(corrupt("routine cursor does not match immutable occurrence history"));}
+    if let Some(operation)=operation {
+        selected_occurrence(db,&OperationId::new(operation).map_err(StoreError::Corrupt)?,budget)?;
+    } else {
+        let occurrence:RoutineOccurrence=decoded(&payload,&hash)?;
+        let previous:Option<i64>=db.query_row("SELECT MAX(scheduled_unix_ms) FROM routine_occurrences WHERE name=?1 AND revision=?2 AND scheduled_unix_ms<?3",params![d.name,d.revision,instant],|r|r.get(0))?;
+        if occurrence.id!=id||RoutineOccurrence::identity(d,instant).map_err(StoreError::Corrupt)?!=id||occurrence.routine!=d.reference().map_err(StoreError::Corrupt)?
+            ||occurrence.scheduled_unix_ms!=instant||occurrence.first_unix_ms<=previous.unwrap_or(d.start_unix_ms-1)||occurrence.first_unix_ms<d.start_unix_ms
+            ||instant<occurrence.first_unix_ms||instant>occurrence.observed_unix_ms||occurrence.slots==0||occurrence.slots>i64::MAX as u64
+            ||occurrence.control_revision==0||occurrence.control_revision>i64::MAX as u64||occurrence.operation.is_some()||occurrence.disposition==RoutineDisposition::Enqueued {return Err(corrupt("routine occurrence binding mismatch"));}
+    }
+    Ok(after)
 }
 
 /// Completion events use the existing atomic event log, with a digest and
@@ -122,15 +178,50 @@ pub(super) fn read_receipts_with_budget(db:&Connection,definitions:&[RoutineDefi
     Ok(result)
 }
 impl SqliteStore {
+    /// Read current definitions only. Historical revisions and occurrences are
+    /// administrative evidence, not inputs to round-robin name selection.
+    pub(super) fn routine_planning_selection(&mut self,last:Option<&str>,budget:&read_budget::ReadBudget)->Result<(u64,Option<RoutineDefinition>)> {
+        self.routine_planning_choice(last,None,budget)
+    }
+    pub(super) fn routine_planning_turn(&mut self,turn:u64,budget:&read_budget::ReadBudget)->Result<(u64,Option<RoutineDefinition>)> {
+        self.routine_planning_choice(None,Some(turn),budget)
+    }
+    fn routine_planning_choice(&mut self,last:Option<&str>,turn:Option<u64>,budget:&read_budget::ReadBudget)->Result<(u64,Option<RoutineDefinition>)> {
+        budget.check()?;
+        let tx=self.connection.transaction()?;
+        check_schema(&tx)?;
+        let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
+        let head=head(&tx)?;
+        if version<16 {return Ok((head,None));}
+        let control=super::control::read(&tx)?;
+        if control.state!=ProjectState::Active||control.reconciliation_required {return Ok((head,None));}
+        let mut stmt=tx.prepare("SELECT r.name,r.revision,r.payload,r.payload_hash FROM routine_revisions r JOIN (SELECT name,MAX(revision) AS revision FROM routine_revisions GROUP BY name LIMIT 129) current ON current.name=r.name AND current.revision=r.revision ORDER BY r.name")?;
+        let mut rows=stmt.query([])?;
+        let mut enabled=Vec::new();let mut count=0;
+        while let Some(row)=rows.next()? {
+            budget.row(row,&[(2,1)])?;
+            count+=1;if count>128 {return Err(corrupt("routine identity bound exceeded"));}
+            let name:String=row.get(0)?;let revision:u64=row.get(1)?;
+            let payload:String=row.get(2)?;let hash:String=row.get(3)?;
+            let definition:RoutineDefinition=decoded(&payload,&hash)?;
+            if definition.name!=name||definition.revision!=revision||definition.reference().map_err(StoreError::Corrupt)?.digest!=hash {return Err(corrupt("routine revision identity mismatch"));}
+            if definition.enabled {enabled.push(definition);}
+        }
+        budget.check()?;
+        let selected=if enabled.is_empty(){None}else{
+            let index=turn.map(|turn|(turn%enabled.len() as u64) as usize).unwrap_or_else(||enabled.iter().position(|d|last.is_none_or(|last|d.name.as_str()>last)).unwrap_or(0));
+            enabled.into_iter().nth(index)
+        };
+        Ok((head,selected))
+    }
     pub(crate) fn complete_routine(&mut self,completed:&crate::routines::CompletedRoutine)->Result<()> {
         use crate::operations::Outcome;
         let r=&completed.receipt;super::delivery::now_check(r.finished_unix_ms)?;
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
-        let(definitions,occurrences)=read_all(&tx)?;
-        if read_receipts(&tx,&definitions,&occurrences)?.iter().any(|old|old.operation==r.operation) {return Err(StoreError::Conflict);}
-        let o=occurrences.iter().find(|o|o.operation.as_ref()==Some(&r.operation)).ok_or_else(||invalid("routine occurrence missing"))?;
-        let d=definitions.iter().find(|d|d.reference().ok().as_ref()==Some(&r.routine)).ok_or_else(||invalid("routine revision missing"))?;
-        project_matches(&tx,d)?;validate_receipt(r,d,o)?;
+        let duplicate:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE kind='routine.completed' AND entity=?1)",[r.operation.as_str()],|row|row.get(0))?;
+        if duplicate {return Err(StoreError::Conflict);}
+        let(d,o)=selected_occurrence(&tx,&r.operation,None)?;
+        project_matches(&tx,&d)?;validate_receipt(r,&d,&o)?;
         let old=super::delivery::delivery(&tx,&r.operation)?;let c=&r.claim;
         if old.state!=DeliveryState::Claimed||old.revision!=c.revision||old.epoch!=c.epoch||old.attempts!=1
             ||old.owner.as_deref()!=Some(&c.owner)||old.lease_until_ms!=Some(c.lease_until_ms) {return Err(StoreError::Conflict);}
@@ -176,30 +267,40 @@ impl SqliteStore {
         log(&tx,"routine.revision_installed",&d.name,d.revision,d)?;tx.commit()?;Ok(reference)
     }
     pub fn schedule_routine(&mut self,prepared:&PreparedRoutineTick,expected_head:u64)->Result<Option<RoutineOccurrence>> {
+        self.schedule_routine_with_budget(prepared,expected_head,None)
+    }
+    pub(super) fn schedule_routine_with_budget(&mut self,prepared:&PreparedRoutineTick,expected_head:u64,budget:Option<&read_budget::ReadBudget>)->Result<Option<RoutineOccurrence>> {
+        if let Some(budget)=budget {budget.check()?;}
         let d=&prepared.definition;let now=prepared.now;super::delivery::now_check(now)?;
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
         if head(&tx)?!=expected_head {return Err(StoreError::Conflict);}
-        let(definitions,occurrences)=read_all(&tx)?;
-        if definitions.iter().rev().find(|old|old.name==d.name)!=Some(d) {return Err(StoreError::Conflict);}
+        let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
+        if version<43{return Err(StoreError::UnsupportedSchema(version));}
+        let mut stmt=tx.prepare("SELECT revision,payload,payload_hash FROM routine_revisions WHERE name=?1 ORDER BY revision DESC LIMIT 1")?;
+        let mut rows=stmt.query([&d.name])?;
+        let row=rows.next()?.ok_or(StoreError::Conflict)?;
+        if let Some(budget)=budget {budget.row(row,&[(1,2)])?;}
+        let revision:u64=row.get(0)?;let payload:String=row.get(1)?;let hash:String=row.get(2)?;
+        drop(rows);drop(stmt);
+        let current:RoutineDefinition=decoded(&payload,&hash)?;
+        if current.revision!=revision||current.name!=d.name||current.reference().map_err(StoreError::Corrupt)?.digest!=hash {return Err(corrupt("routine revision identity mismatch"));}
+        if &current!=d {return Err(StoreError::Conflict);}
         project_matches(&tx,d)?;
-        let control=super::control::read(&tx)?;
+        let control=super::control::read_with_budget(&tx,budget)?;
         if !d.enabled {tx.commit()?;return Ok(None);}
         if control.state!=ProjectState::Active||control.reconciliation_required||control.config_digest!=d.config.digest {return Err(invalid("routine project is not admitted"));}
-        let after:i64=tx.query_row("SELECT after_unix_ms FROM routine_cursors WHERE name=?1 AND revision=?2",params![d.name,integer(d.revision)?],|r|r.get(0))?;
+        let after=scheduling_cursor(&tx,d,budget)?;
         let schedule=crate::schedule::parse_schedule(&d.schedule).map_err(|_|invalid("invalid routine schedule"))?;
         let zone=jiff::tz::TimeZone::get(&d.timezone).map_err(|_|invalid("invalid routine timezone"))?;
         let Some(due)=crate::schedule::due_window(&schedule,&zone,d.start_unix_ms,after,now).map_err(|_|invalid("invalid routine clock"))? else {tx.commit()?;return Ok(None);};
-        if occurrences.len()>=100_000 {return Err(invalid("routine occurrence bound reached"));}
+        let count:u64=tx.query_row("SELECT count(*) FROM routine_occurrences",[],|r|r.get(0))?;
+        if count>=100_000 {return Err(invalid("routine occurrence bound reached"));}
         let reference=d.reference().map_err(|s|invalid(&s))?;
-        let mut overlap=false;
-        let receipts=read_receipts(&tx,&definitions,&occurrences)?;
-        let cleaned:BTreeMap<_,_>=receipts.iter().filter(|r|r.cleanup_verified).map(|r|(&r.operation,r.claim.epoch)).collect();
-        for o in occurrences.iter().filter(|o|o.routine.id==reference.id) {if let Some(id)=&o.operation {
-            let delivery=super::delivery::delivery(&tx,id)?;
-            let cleaned=cleaned.get(id)==Some(&delivery.epoch)
-                &&delivery.attempts==1&&matches!(delivery.state,DeliveryState::Confirmed|DeliveryState::PermanentFailure);
-            if !cleaned&&(delivery.attempts>0||matches!(delivery.state,DeliveryState::Pending|DeliveryState::Claimed|DeliveryState::Ambiguous)) {overlap=true;}
-        }}
+        let overlap=match overlap::scan(&tx,&d.name,budget)? {
+            overlap::Scan::Blocked=>true,
+            overlap::Scan::Clear=>false,
+            overlap::Scan::Incomplete=>{tx.commit()?;return Ok(None);},
+        };
         let disposition=if due.slots>1&&d.missed==MissedRunPolicy::Skip {RoutineDisposition::SkippedMissed}else if overlap {RoutineDisposition::SkippedOverlap}else{RoutineDisposition::Enqueued};
         let id=RoutineOccurrence::identity(d,due.last_unix_ms).map_err(|s|invalid(&s))?;
         let operation=if disposition==RoutineDisposition::Enqueued {Some(OperationId::new(id.clone()).map_err(|s|invalid(&s))?)}else{None};

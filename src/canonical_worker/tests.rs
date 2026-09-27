@@ -73,6 +73,7 @@ impl Fixture {
         )
         .unwrap();
         let config_path = root.path().join("config.toml");
+        if mode == "barrier-stop" { fs::write(&config_path, "# barrier worker fixture\n").unwrap(); }
         if mode.starts_with("resource") {
             fs::write(&config_path,"[profiles.fixture]\nkind='claude'\npermission_policy='interactive'\nextra_args=['30']\n[profiles.fixture.budget]\nmax_wall_seconds=20\nunknown_usage='allow_with_warning'\n").unwrap();
         }
@@ -209,6 +210,11 @@ elif r['method']=='pane.send_input':
  result={{'type':'ok'}}
 elif r['method']=='agent.prompt':
  with open(root/'sent','a') as f:f.write(json.dumps(r)+'\n')
+ if (root/'hold-prompt-reply').exists():
+  until=time.monotonic()+5
+  while not (root/'continue-prompt-reply').exists():
+   if time.monotonic()>until:sys.exit(4)
+   time.sleep(0.01)
  if mode=='lost':sys.exit(1)
  if mode=='stall':time.sleep(10)
  if mode=='wrong-terminal':a['terminal_id']='foreign'
@@ -302,6 +308,7 @@ print(json.dumps({{'id':('wrong' if mode=='wrong-id' and r['method']=='agent.pro
         )
         .unwrap();
         let mut profile = crate::domain::profile::fixture(config.clone());
+        if mode == "barrier-stop" { profile.permission_policy = VersionedReference { id: "owner-approval-policy".into(), revision: 1, digest: "ab".repeat(32) }; }
         if signer.is_some(){profile.permission_policy=crate::authority::policy_reference(&project).unwrap();}
         let identity = |path: &Path, version: &str| ExecutableIdentity {
             path: path.canonicalize().unwrap().display().to_string(),
@@ -361,6 +368,7 @@ print(json.dumps({{'id':('wrong' if mode=='wrong-id' and r['method']=='agent.pro
                 None,
             )
             .unwrap();
+        if mode == "barrier-stop" { crate::store::install_worker_barrier_fixture(&mut db, &project, &task, &profile); }
         let state = db.read_snapshot(None).unwrap();
         let repositories=if mode.contains("repository") {
             let git=|args:&[&str]|{let output=std::process::Command::new("/usr/bin/git").current_dir(&project).env_clear().env("PATH","/usr/bin:/bin").env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL","/dev/null").args(["-c","core.hooksPath=/dev/null","-c","user.name=fixture","-c","user.email=fixture@example.invalid"]).args(args).output().unwrap();assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));String::from_utf8(output.stdout).unwrap().trim().to_owned()};
@@ -368,7 +376,7 @@ print(json.dumps({{'id':('wrong' if mode=='wrong-id' and r['method']=='agent.pro
             vec![RepositoryInput{repository:project.display().to_string(),commit:git(&["rev-parse","HEAD"]),tree:git(&["rev-parse","HEAD^{tree}"])}]
         }else{vec![]};
         let mut inputs = LaunchInputs {
-            version: 2,
+            task_contract: if mode == "barrier-stop" { db.task_contract_reference(task.as_str()).unwrap() } else { None }, version: 2,
             project_store: project
                 .join(".state/state.db")
                 .canonicalize()
@@ -568,7 +576,7 @@ print(json.dumps({{'id':('wrong' if mode=='wrong-id' and r['method']=='agent.pro
         .unwrap();
         fs::write(root.path().join("agent.json"),serde_json::to_vec(&json!({"pane_id":route.pane_id,"tab_id":route.tab_id,"workspace_id":route.workspace_id,"cwd":route.cwd,"terminal_id":"term1","agent":agent.kind,"name":agent.name,"agent_status":"idle","interactive_ready":true,"launch_pending":false})).unwrap()).unwrap();
         handoff(&project, &reserved.record.attempt);
-        let head = db.read_snapshot(None).unwrap().head;
+        let head = db.current_head().unwrap();
         let operation =
             crate::memory::enqueue_attempt_brief(&project, reserved.record.attempt.as_str(), head)
                 .unwrap();
@@ -596,6 +604,129 @@ print(json.dumps({{'id':('wrong' if mode=='wrong-id' and r['method']=='agent.pro
             .map(|l| serde_json::from_str(l).unwrap())
             .collect()
     }
+}
+
+#[test]
+fn brief_rendering_accounts_selected_inputs_before_decode_or_claim() {
+    use crate::store::{controlled::{ControlledStore,ReadControl},StoreError};
+    let f=Fixture::new("ok");
+    let path=f.project.join(".state/state.db");
+    let mut db=ControlledStore::open_scoped(&path,ReadControl::new(Instant::now()+Duration::from_secs(10),Default::default())).unwrap();
+    let (intent,_,_)=db.worker_brief_selection(&f.operation.id,1).unwrap();
+    let raw=rusqlite::Connection::open(&path).unwrap();
+    // Model an oversized corrupt retained row, bypassing the ingress CHECK only
+    // in this fixture. Controlled reads must refuse it before copying/decoding.
+    raw.execute_batch("DROP TRIGGER snapshot_inputs_no_update; PRAGMA ignore_check_constraints=ON").unwrap();
+    raw.execute("UPDATE memory_snapshot_inputs SET instructions=?1 WHERE snapshot_id=?2",rusqlite::params!["x".repeat(16*1024*1024+1),intent.knowledge.as_ref().unwrap().id]).unwrap();
+    let error=db.render_attempt_brief(&f.project,intent.attempt.as_str()).unwrap_err();
+    assert!(matches!(error.downcast_ref::<StoreError>(),Some(StoreError::Limit(_))),"{error:?}");
+    let state:String=raw.query_row("SELECT state FROM operation_delivery WHERE operation_id=?1",[f.operation.id.as_str()],|row|row.get(0)).unwrap();
+    assert_eq!(state,"pending");
+    assert!(f.sent().is_empty());
+}
+
+#[test]
+fn brief_rendering_shares_deadline_and_does_not_scan_retained_history() {
+    use crate::store::controlled::{ControlledStore, ReadControl, SqlWork};
+    let f=Fixture::new("ok");
+    let path=f.project.join(".state/state.db");
+    let mut work=Vec::new();
+    for history in [0,10_000] {
+        let mut raw=rusqlite::Connection::open(&path).unwrap();
+        let payload:String=raw.query_row("SELECT payload FROM approval_grants ORDER BY id LIMIT 1",[],|row|row.get(0)).unwrap();
+        let mut retained:crate::domain::ApprovalGrant=serde_json::from_str(&payload).unwrap();
+        let original_expiry=retained.expires_unix_ms;
+        let tx=raw.transaction().unwrap();
+        for n in 0..history {
+            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('historical.noise',?1,1,1,'{}')",[format!("old-{n}")]).unwrap();
+            retained.expires_unix_ms=original_expiry+n+1;
+            let reference=retained.reference().unwrap();
+            tx.execute("INSERT INTO approval_grants VALUES(?1,?2,?3)",rusqlite::params![reference.id,serde_json::to_string(&retained).unwrap(),reference.digest]).unwrap();
+        }
+        tx.commit().unwrap();
+        drop(raw);
+        let observed=SqlWork::default();
+        let cancellation=Cancellation::default();
+        let control=ReadControl::new(Instant::now()+Duration::from_secs(10),cancellation.clone());
+        let mut db=ControlledStore::open_scoped_observed(&path,control,observed.clone()).unwrap();
+        let (intent,_,_)=db.worker_brief_selection(&f.operation.id,1).unwrap();
+        let brief=db.render_attempt_brief(&f.project,intent.attempt.as_str()).unwrap();
+        assert_eq!(brief.prompt_digest,intent.prompt_digest);
+        work.push(observed.snapshot().sqlite_vm_steps);
+        cancellation.cancel();
+        let error=db.render_attempt_brief(&f.project,intent.attempt.as_str()).unwrap_err();
+        assert!(matches!(error.downcast_ref::<crate::store::StoreError>(),Some(crate::store::StoreError::Cancelled)));
+        assert!(matches!(db.claim_worker_brief(&f.operation.id,1,now()),Err(crate::store::StoreError::Cancelled)));
+    }
+    eprintln!("brief selection/render SQL steps with 0/10000 historical events and approvals: {work:?}");
+    assert!(work[1]<=work[0]+500,"selected rendering scanned unrelated history: {work:?}");
+    assert!(f.sent().is_empty());
+}
+
+#[test]
+fn termination_selection_is_bounded_and_cancellable_with_retained_history() {
+    use crate::store::{controlled::{ControlledStore,ReadControl,SqlWork},StoreError};
+    let f=Fixture::new("ok");
+    let path=f.project.join(".state/state.db");
+    let before=runtime::snapshot(&f.project).unwrap();
+    let attempt=before.attempts.iter().find(|a|a.retains_capacity()).unwrap();
+    let mut work=Vec::new();
+    for history in [0,10_000] {
+        let mut raw=rusqlite::Connection::open(&path).unwrap();
+        let tx=raw.transaction().unwrap();
+        for n in 0..history {
+            // Valid unrelated event history; no selected lifecycle fact changes.
+            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_history',?1,1,1,'{}')",[format!("retired-{n}")]).unwrap();
+        }
+        tx.commit().unwrap();
+        drop(raw);
+        let observed=SqlWork::default();
+        let cancel=Cancellation::default();
+        let mut db=ControlledStore::open_scoped_observed(&path,ReadControl::new(Instant::now()+Duration::from_secs(10),cancel.clone()),observed.clone()).unwrap();
+        let selected=db.termination_selection(&attempt.id,attempt.revision).unwrap();
+        assert_eq!(selected.attempt,*attempt);
+        assert!(selected.worker.unwrap().events.iter().all(|e|e.entity==before.attempt_inputs[0].operation.as_str()));
+        work.push(observed.snapshot().sqlite_vm_steps);
+        cancel.cancel();
+        assert!(matches!(db.termination_selection(&attempt.id,attempt.revision),Err(StoreError::Cancelled)));
+    }
+    eprintln!("termination selection SQL steps at 0/10000 unrelated launch events: {work:?}");
+    assert!(work[1]<=work[0]+500,"termination selection scanned launch history: {work:?}");
+    assert!(f.sent().is_empty());
+}
+
+#[test]
+fn termination_does_not_decode_unrelated_approval_history() {
+    let f=Fixture::new("ok");
+    let mut db=migration::open_active(&f.project).unwrap();
+    let state=db.read_snapshot(None).unwrap();
+    let attempt=state.attempts.iter().find(|a|a.retains_capacity()).unwrap();
+    let cancelled=db.cancel_attempt(&attempt.id,attempt.revision,state.head,"stop fixture",now()).unwrap();
+    let raw=rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap();
+    raw.execute("INSERT INTO approval_grants VALUES('unrelated-history','{}',?1)",["a".repeat(64)]).unwrap();
+    drop(raw);
+    let stopped=reconcile_termination(&f.project,&attempt.id,cancelled.attempt_revision,Instant::now()+Duration::from_secs(10),Default::default()).unwrap().unwrap();
+    assert!(stopped.termination_observed);
+    assert!(!stopped.retains_capacity());
+    assert!(f.sent().is_empty());
+    assert!(db.read_snapshot(None).is_err());
+}
+
+#[test]
+fn brief_preparation_and_delivery_do_not_decode_unrelated_approval_history() {
+    let f = Fixture::with_handoff("ok", |project,attempt| {
+        let before=runtime::snapshot(project).unwrap();
+        let revision=before.attempts.iter().find(|a|&a.id==attempt).unwrap().revision;
+        let raw = rusqlite::Connection::open(project.join(".state/state.db")).unwrap();
+        // A deliberately corrupt cold row remains visible to administrative audit,
+        // but is not authority for this selected attempt or its retained knowledge.
+        raw.execute("INSERT INTO approval_grants VALUES('unrelated-history','{}',?1)", ["a".repeat(64)]).unwrap();
+        drop(raw);
+        prepare_brief(project,attempt,revision,Instant::now()+Duration::from_secs(10),Default::default()).unwrap();
+    });
+    assert!(migration::open_active(&f.project).unwrap().read_snapshot(None).is_err());
+    assert_eq!(f.send().unwrap().state, DeliveryState::Confirmed);
+    assert_eq!(f.sent().len(), 1);
 }
 
 #[test]
@@ -685,6 +816,151 @@ fn native_brief_original_deadline_bounds_a_stalled_submission() {
             .state,
         DeliveryState::Claimed
     );
+}
+
+#[test]
+fn barrier_revocation_during_prompt_preserves_stale_delivery_and_stop_recovery() {
+    for fail_commit in [false, true] {
+        let f = Fixture::new("barrier-stop");
+        let mut db = migration::open_active(&f.project).unwrap();
+        let initial = db.read_snapshot(None).unwrap();
+        let record = initial.attempt_inputs[0].clone();
+        let raw = rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap();
+        let barrier: String = raw.query_row("SELECT barrier_id FROM attempt_required_releases WHERE attempt_id=?1", [record.attempt.as_str()], |r| r.get(0)).unwrap();
+        let start: LaunchStartedReceipt = serde_json::from_value(initial.events.iter().find(|e| e.kind == "runtime.launch_started" && e.entity == record.operation.as_str()).unwrap().payload.clone()).unwrap();
+        if fail_commit {
+            raw.execute_batch("CREATE TRIGGER fail_stale_brief BEFORE INSERT ON events WHEN NEW.kind='runtime.worker_brief_stale' BEGIN SELECT RAISE(ABORT,'injected stale receipt failure'); END;").unwrap();
+        }
+        fs::write(f._root.path().join("hold-prompt-reply"), "").unwrap();
+        let result = std::thread::scope(|scope| {
+            let project = &f.project;
+            let root = f._root.path();
+            let barrier = &barrier;
+            let writer = scope.spawn(move || {
+                let deadline = Instant::now()+Duration::from_secs(5);
+                while !root.join("sent").exists() {
+                    assert!(Instant::now()<deadline,"prompt never reached the adapter");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                // Model a concurrent store transaction after the external
+                // effect, bypassing the fixture adapter's process-level guard.
+                let mut db = migration::open_active(project).unwrap();
+                let head = db.read_snapshot(None).unwrap().head;
+                let revoked = db.revoke_barrier(barrier, head);
+                fs::write(root.join("continue-prompt-reply"), "").unwrap();
+                revoked.unwrap();
+            });
+            let result = f.send();
+            writer.join().unwrap();
+            result
+        });
+        assert_eq!(f.sent().len(), 1);
+        if fail_commit { assert!(result.is_err()); } else { assert_eq!(result.unwrap().state,DeliveryState::Confirmed); }
+        let before = db.read_snapshot(None).unwrap();
+        assert!(db.memory_readiness(record.inputs.task.as_str(),now()).unwrap().blockers.iter().any(|b| b.kind == "required_barrier_revoked"));
+        assert!(before.attempts.iter().find(|a| a.id==record.attempt).unwrap().retains_capacity());
+        if fail_commit {
+            assert!(!before.events.iter().any(|e| e.kind=="runtime.worker_brief_delivered"));
+            assert!(f.send().is_err(),"an acknowledged effect must not be resubmitted");
+            raw.execute_batch("DROP TRIGGER fail_stale_brief").unwrap();
+            let delivery = before.deliveries.iter().find(|d| d.operation==f.operation.id).unwrap();
+            let observation_now = delivery.lease_until_ms.unwrap();
+            // Trusted fixture observation of the adapter's exact acknowledgment,
+            // not a fabricated claim that an unknown external prompt succeeded.
+            let prepared = PreparedWorkerBriefReceipt { receipt:WorkerBriefReceipt { version:1, operation:f.operation.id.clone(),
+                intent:serde_json::from_value(f.operation.payload.clone()).unwrap(), session:start.session.clone(),
+                terminal:start.terminal.clone(), agent:start.agent.clone(), observed_unix_ms:now() } };
+            // Advance the modeled store clock to lease expiry. Recovery must
+            // use independently retained acknowledgment evidence, never submit
+            // again or pretend the expired claim still authorizes completion.
+            db.expire_claims(observation_now).unwrap();
+            let expired = db.read_snapshot(None).unwrap();
+            let revision = expired.deliveries.iter().find(|d| d.operation==f.operation.id).unwrap().revision;
+            assert_eq!(expired.deliveries.iter().find(|d| d.operation==f.operation.id).unwrap().state,DeliveryState::Ambiguous);
+            drop(db);
+            db = migration::open_active(&f.project).unwrap();
+            db.observe_worker_brief_delivered(&prepared,revision,expired.head,observation_now).unwrap();
+            let recorded = db.read_snapshot(None).unwrap();
+            db.observe_worker_brief_delivered(&prepared,revision,recorded.head,observation_now).unwrap();
+            assert_eq!(db.read_snapshot(None).unwrap(),recorded);
+        }
+        let after = db.read_snapshot(None).unwrap();
+        let stale = after.events.iter().find(|e| e.kind=="runtime.worker_brief_stale").expect("missing post-effect stale-delivery observation");
+        assert_eq!(stale.entity,f.operation.id.as_str());
+        assert_eq!(stale.payload["barrier_id"],barrier);
+        assert_eq!(stale.payload["attempt_id"],record.attempt.as_str());
+        assert_eq!(raw.query_row("SELECT count(*) FROM barrier_pending_stops",[],|r|r.get::<_,u64>(0)).unwrap(),1);
+        drop(db);
+        assert_eq!(crate::store::service_project_barrier_stops(&f.project).unwrap().requested,1);
+        let pending = runtime::snapshot(&f.project).unwrap();
+        let attempt = pending.attempts.iter().find(|a| a.id==record.attempt).unwrap();
+        assert!(attempt.retains_capacity());
+        let done = reconcile_termination(&f.project,&record.attempt,attempt.revision,Instant::now()+Duration::from_secs(5),Default::default()).unwrap().unwrap();
+        assert!(done.termination_observed && !done.retains_capacity());
+        assert_eq!(f.sent().len(),1);
+    }
+}
+
+#[test]
+fn revoked_barrier_routes_a_real_supervised_stop_and_recovers_after_commit_failure() {
+    for sent in [false, true] {
+        let f = Fixture::new("barrier-stop");
+        if sent { f.send().unwrap(); }
+        fs::write(f.project.join("REPORT.md"), "retain barrier worker output").unwrap();
+        let mut db = migration::open_active(&f.project).unwrap();
+        let initial = db.read_snapshot(None).unwrap();
+        let record = initial.attempt_inputs[0].clone();
+        let raw = rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap();
+        let barrier: String = raw.query_row("SELECT barrier_id FROM attempt_required_releases WHERE attempt_id=?1", [record.attempt.as_str()], |row| row.get(0)).unwrap();
+        let started: LaunchStartedReceipt = serde_json::from_value(initial.events.iter().find(|e| e.kind == "runtime.launch_started" && e.entity == record.operation.as_str()).unwrap().payload.clone()).unwrap();
+        let supervisor = started.supervisor.unwrap();
+        assert!(!crate::worker_supervision::SupervisorObservation::recover_exited(&supervisor).unwrap());
+        db.revoke_barrier(&barrier, initial.head).unwrap();
+        let invalidated = db.read_snapshot(None).unwrap();
+        assert_eq!(invalidated.attempts, initial.attempts);
+        if sent {
+            let receipt: WorkerBriefReceipt = serde_json::from_value(initial.events.iter().find(|e| e.kind=="runtime.worker_brief_delivered" && e.entity==f.operation.id.as_str()).unwrap().payload.clone()).unwrap();
+            let delivery = initial.deliveries.iter().find(|d| d.operation==f.operation.id).unwrap();
+            db.observe_worker_brief_delivered(&PreparedWorkerBriefReceipt { receipt },delivery.revision,invalidated.head,now()).unwrap();
+            assert_eq!(db.read_snapshot(None).unwrap(),invalidated,"historical delivery replay must not invent a later race");
+            assert!(!invalidated.events.iter().any(|e| e.kind=="runtime.worker_brief_stale"));
+        }
+        assert_eq!(raw.query_row("SELECT count(*) FROM barrier_pending_stops", [], |row| row.get::<_,u64>(0)).unwrap(), 1);
+        if !sent {
+            assert!(f.send().is_err(), "revoked barrier still allowed a new worker prompt");
+            assert!(f.sent().is_empty());
+        }
+        drop(db);
+        // Reopen through the same controlled, guarded service used by polling.
+        assert_eq!(crate::store::service_project_barrier_stops(&f.project).unwrap().requested, 1);
+        let stopped_requested = runtime::snapshot(&f.project).unwrap();
+        let current = stopped_requested.attempts.iter().find(|a| a.id == record.attempt).unwrap();
+        assert!(current.retains_capacity() && !current.termination_observed);
+        assert!(!crate::worker_supervision::SupervisorObservation::recover_exited(&supervisor).unwrap());
+        assert!(stopped_requested.cancellations.iter().any(|c| c.attempt == record.attempt));
+        let hint = (0..4).find_map(|turn| {
+            let mut budget = crate::store::identity_inventory::Budget::new(2*1024*1024,1024,Instant::now()+Duration::from_secs(5),Default::default()).unwrap();
+            migration::read_controller_dispatch_hint(&f.project,&mut budget,turn,now(),true).unwrap().filter(|hint| hint.operation.kind == "runtime.worker_termination")
+        }).expect("controller must offer the retained stop");
+        assert_eq!(hint.operation.kind,"runtime.worker_termination");
+        assert_eq!(hint.operation.target,record.attempt.as_str());
+        raw.execute_batch("CREATE TRIGGER reject_barrier_worker_stop BEFORE INSERT ON events WHEN NEW.kind='runtime.worker_terminated' BEGIN SELECT RAISE(ABORT,'injected stop commit failure'); END;").unwrap();
+        assert!(reconcile_termination(&f.project,&record.attempt,current.revision,Instant::now()+Duration::from_secs(5),Default::default()).is_err());
+        assert!(crate::worker_supervision::SupervisorObservation::recover_exited(&supervisor).unwrap());
+        assert_eq!(runtime::snapshot(&f.project).unwrap(),stopped_requested);
+        raw.execute_batch("DROP TRIGGER reject_barrier_worker_stop").unwrap();
+        let done = reconcile_termination(&f.project,&record.attempt,current.revision,Instant::now()+Duration::from_secs(5),Default::default()).unwrap().unwrap();
+        assert!(done.termination_observed && !done.retains_capacity());
+        assert_eq!(done.state,AttemptState::Cancelled);
+        let after = runtime::snapshot(&f.project).unwrap();
+        assert_eq!(after.ownership,stopped_requested.ownership);
+        assert_eq!(after.runtime_bindings,stopped_requested.runtime_bindings);
+        assert_eq!(fs::read_to_string(f.project.join("REPORT.md")).unwrap(),"retain barrier worker output");
+        assert_eq!(f.sent().len(),usize::from(sent));
+        assert_eq!(crate::store::service_project_barrier_stops(&f.project).unwrap().requested,0);
+        reconcile_termination(&f.project,&record.attempt,done.revision,Instant::now()+Duration::from_secs(5),Default::default()).unwrap().unwrap();
+        assert_eq!(runtime::snapshot(&f.project).unwrap(),after);
+    }
 }
 
 #[test]
@@ -796,6 +1072,10 @@ fn stop_before_brief_atomically_retires_send_and_commit_failure_keeps_capacity()
         now(),
     )
     .unwrap();
+    let referenced=&state.attempts[0];
+    let wait=db.register_wait_with_trigger(referenced.task.as_str(),None,"resource_availability",None,
+        Some(&crate::domain::WaitTrigger::AttemptCapacityReleased{attempt_id:referenced.id.clone(),after_revision:referenced.revision})).unwrap();
+    assert!(!db.replay_wait(&wait.wait_id).unwrap().wake_requested);
     let before = db.read_snapshot(None).unwrap();
     let attempt = before.attempts[0].clone();
     let raw = rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap();
@@ -827,6 +1107,7 @@ fn stop_before_brief_atomically_retires_send_and_commit_failure_keeps_capacity()
     );
     assert_eq!(db.read_snapshot(None).unwrap(), before);
     assert!(before.attempts[0].retains_capacity());
+    assert!(!db.replay_wait(&wait.wait_id).unwrap().wake_requested);
     raw.execute_batch("DROP TRIGGER refuse_stop_commit")
         .unwrap();
     let done = reconcile_termination(
@@ -851,6 +1132,10 @@ fn stop_before_brief_atomically_retires_send_and_commit_failure_keeps_capacity()
     );
     assert!(f.send().is_err());
     assert!(f.sent().is_empty());
+    assert_eq!(crate::store::service_project_waits(&f.project).unwrap().notified,1);
+    assert!(db.replay_wait(&wait.wait_id).unwrap().already_replayed);
+    assert_eq!(crate::store::service_project_waits(&f.project).unwrap().notified,0);
+
 }
 
 #[test]
@@ -1155,6 +1440,7 @@ fn corrupt_target_payload_cannot_hide_a_retained_resource_using_a_terminated_pee
     )
     .unwrap();
     assert!(migration::read_launch_target_inventory(&f.project, &mut budget).is_err());
+    assert!(migration::read_pane_targets(&f.project,"w1:p1",&mut budget).is_err());
     assert!(f.sent().is_empty());
 }
 
@@ -1228,6 +1514,7 @@ fn target_inventory_rejects_rehashed_inputs_and_broken_launch_operation_links() 
             migration::read_launch_target_inventory(&f.project, &mut budget).is_err(),
             "{case}"
         );
+        assert!(migration::read_pane_targets(&f.project,"w1:p1",&mut budget).is_err(),"selected target accepted {case}");
         assert!(f.sent().is_empty());
     }
 }
@@ -1467,6 +1754,10 @@ fn staged_stop_commit_failure_retains_capacity_and_recovers_without_creation() {
         now(),
     )
     .unwrap();
+    let referenced=&state.attempts[0];
+    let wait=db.register_wait_with_trigger(referenced.task.as_str(),None,"resource_availability",None,
+        Some(&crate::domain::WaitTrigger::AttemptCapacityReleased{attempt_id:referenced.id.clone(),after_revision:referenced.revision})).unwrap();
+    assert!(!db.replay_wait(&wait.wait_id).unwrap().wake_requested);
     let before = db.read_snapshot(None).unwrap();
     let raw = rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap();
     raw.execute_batch("CREATE TRIGGER refuse_staged_stop BEFORE INSERT ON events WHEN NEW.kind='runtime.launch_stopped' BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
@@ -1488,6 +1779,7 @@ fn staged_stop_commit_failure_retains_capacity_and_recovers_without_creation() {
     );
     assert_eq!(db.read_snapshot(None).unwrap(), before);
     assert!(before.attempts[0].retains_capacity());
+    assert!(!db.replay_wait(&wait.wait_id).unwrap().wake_requested);
     raw.execute_batch("DROP TRIGGER refuse_staged_stop")
         .unwrap();
     let done = reconcile_termination(
@@ -1521,6 +1813,13 @@ fn staged_stop_commit_failure_retains_capacity_and_recovers_without_creation() {
             .count(),
         1
     );
+    assert_eq!(crate::store::service_project_waits(&f.project).unwrap().notified,1);
+    assert!(db.replay_wait(&wait.wait_id).unwrap().already_replayed);
+    assert_eq!(crate::store::service_project_waits(&f.project).unwrap().notified,0);
+    let renewed=db.rearm_wait(&wait.wait_id,None).unwrap();
+    assert!(db.replay_wait(&renewed.wait_id).unwrap().wake_requested);
+
+
 }
 
 #[test]
@@ -2394,7 +2693,7 @@ fn native_start_confirmation_requires_real_exec_and_exact_agent_then_replays_rea
 #[test]
 fn native_gate_submission_is_once_even_when_the_reply_is_lost() {
     use std::io::Write;
-    for mode in ["resource-release", "resource-release-lost"] {
+    for (mode, cold_history) in [("resource-release", false), ("resource-release-lost", false), ("resource-release", true)] {
         let mut f = Fixture::new(mode);
         let target = create_resource(
             &f.project,
@@ -2406,6 +2705,10 @@ fn native_gate_submission_is_once_even_when_the_reply_is_lost() {
         .unwrap();
         let state = runtime::snapshot(&f.project).unwrap();
         let revision = state.deliveries[0].revision;
+        if cold_history {
+            rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap()
+                .execute("INSERT INTO approval_grants VALUES('cold-gate-history','{}',?1)", ["a".repeat(64)]).unwrap();
+        }
         let mut input = f._worker.0.stdin.take().unwrap();
         let result = std::thread::scope(|scope| {
             scope.spawn(|| {
@@ -2438,6 +2741,33 @@ fn native_gate_submission_is_once_even_when_the_reply_is_lost() {
             )
         });
         assert_eq!(result.is_ok(), mode == "resource-release", "{result:?}");
+        if cold_history {
+            assert!(runtime::snapshot(&f.project).is_err());
+            let raw = rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap();
+            let releases: u64 = raw.query_row("SELECT count(*) FROM events WHERE entity=?1 AND kind='runtime.launch_release'", [f.operation.id.as_str()], |r| r.get(0)).unwrap();
+            let starts: u64 = raw.query_row("SELECT count(*) FROM events WHERE entity=?1 AND kind='runtime.launch_started'", [f.operation.id.as_str()], |r| r.get(0)).unwrap();
+            assert_eq!((releases, starts), (1, 0));
+            assert!(release_gate(&f.project, &f.operation.id, revision,
+                Instant::now() + Duration::from_secs(15), Default::default()).is_err());
+            assert_eq!(fs::read_to_string(f._root.path().join("gate-requests")).unwrap().lines().count(), 1);
+            fs::write(f._root.path().join("agent.json"), serde_json::to_vec(&json!({
+                "pane_id":target.route.pane_id, "tab_id":target.route.tab_id, "workspace_id":target.route.workspace_id,
+                "cwd":target.route.cwd, "terminal_id":target.terminal, "agent":"claude", "name":null
+            })).unwrap()).unwrap();
+            let started = name_started_agent(&f.project, &f.operation.id, revision,
+                Instant::now() + Duration::from_secs(15), Default::default()).unwrap();
+            assert_eq!(started.attempt, target.attempt);
+            let revision: u64 = raw.query_row("SELECT revision FROM operation_delivery WHERE operation_id=?1", [f.operation.id.as_str()], |r| r.get(0)).unwrap();
+            assert_eq!(reconcile_start(&f.project, &f.operation.id, revision,
+                Instant::now() + Duration::from_secs(15), Default::default()).unwrap(), started);
+            assert!(reconcile_launch(&f.project, &f.operation.id, revision,
+                Instant::now() + Duration::from_secs(15), Default::default()).unwrap());
+            assert_eq!(advance_launch(&f.project, &f.operation.id, revision,
+                Instant::now() + Duration::from_secs(15), Default::default()).unwrap(), Some(started));
+            assert_eq!(fs::read_to_string(f._root.path().join("name-requests")).unwrap().lines().count(), 1);
+            assert!(runtime::snapshot(&f.project).is_err());
+            continue;
+        }
         let after = runtime::snapshot(&f.project).unwrap();
         assert!(
             after
@@ -4232,4 +4562,460 @@ int main(int argc, char **argv) {
 #[ignore = "requires explicit live workflow authorization, HP_LIVE_HERDR, HP_LIVE_AGENT, HP_LIVE_AUTH_FILE and HP_CONTROLLER_TEST_BINARY"]
 fn live_authenticated_controller_workflow() {
     live_supervised_root_failure(false,None,false,LiveLifecycle::VendorWorkflow);
+}
+
+#[test]
+fn target_retention_uses_selected_history_and_original_control() {
+    use crate::store::{controlled::{ControlledStore, ReadControl, SqlWork}, StoreError};
+    let f = Fixture::new("resource");
+    let target = create_resource(&f.project, &f.operation.id, 1,
+        Instant::now() + Duration::from_secs(15), Default::default()).unwrap();
+    let path = f.project.join(".state/state.db");
+    let mut raw = rusqlite::Connection::open(&path).unwrap();
+    // An unrelated invalid grant is still rejected by administrative snapshots.
+    raw.execute("INSERT INTO approval_grants VALUES('unrelated-history','{}',?1)", ["a".repeat(64)]).unwrap();
+    let mut work = Vec::new();
+    for history in [0, 10_000] {
+        let tx = raw.transaction().unwrap();
+        for n in 0..history {
+            // Model retained target audit rows with distinct panes, not real launches.
+            let mut retained = target.clone();
+            retained.route.pane_id = format!("historical-pane-{n}");
+            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_target',?1,1,1,?2)",
+                rusqlite::params![format!("historical-target-{n}"), serde_json::to_string(&retained).unwrap()]).unwrap();
+        }
+        tx.commit().unwrap();
+        let observed = SqlWork::default();
+        let cancellation = Cancellation::default();
+        let mut db = ControlledStore::open_scoped_observed(&path,
+            ReadControl::new(Instant::now() + Duration::from_secs(10), cancellation.clone()), observed.clone()).unwrap();
+        db.retain_observed_launch_target(&target, now()).unwrap();
+        work.push(observed.snapshot().sqlite_vm_steps);
+        cancellation.cancel();
+        assert!(matches!(db.retain_observed_launch_target(&target, now()), Err(StoreError::Cancelled)));
+    }
+    // A retained target sharing the selected pane must still block observation.
+    raw.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_target','conflicting-target',1,1,?1)",
+        [serde_json::to_string(&target).unwrap()]).unwrap();
+    let mut db = ControlledStore::open_scoped_observed(&path,
+        ReadControl::new(Instant::now() + Duration::from_secs(10), Default::default()), SqlWork::default()).unwrap();
+    let error = db.retain_observed_launch_target(&target, now()).unwrap_err();
+    assert!(matches!(error, StoreError::Invalid(ref message) if message.contains("another retained launch")));
+    raw.execute("DELETE FROM events WHERE entity='conflicting-target'", []).unwrap();
+    let expired = ControlledStore::open_scoped_observed(&path,
+        ReadControl::new(Instant::now() - Duration::from_secs(1), Default::default()), SqlWork::default());
+    assert!(matches!(expired, Err(StoreError::Deadline)));
+    eprintln!("target retention SQL steps with 0/10000 unrelated target events: {work:?}");
+    assert!(work[1] <= work[0] + 500, "target retention scanned history: {work:?}");
+    assert!(migration::open_active(&f.project).unwrap().read_snapshot(None).is_err());
+    assert_eq!(fs::read_to_string(f._root.path().join("created")).unwrap().lines().count(), 1);
+}
+
+#[test]
+fn resource_recovery_selects_its_evidence_without_scanning_history() {
+    use crate::store::{controlled::{ControlledStore, ReadControl, SqlWork}, StoreError};
+    let f = Fixture::new("resource-lost");
+    assert!(create_resource(&f.project, &f.operation.id, 1,
+        Instant::now() + Duration::from_secs(15), Default::default()).is_err());
+    let before = runtime::snapshot(&f.project).unwrap();
+    let revision = before.deliveries.iter().find(|d| d.operation == f.operation.id).unwrap().revision;
+    let path = f.project.join(".state/state.db");
+    let mut raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute("INSERT INTO approval_grants VALUES('unrelated-history','{}',?1)", ["a".repeat(64)]).unwrap();
+    let mut work = Vec::new();
+    for history in [0, 10_000] {
+        let tx = raw.transaction().unwrap();
+        for n in 0..history {
+            // Deliberately invalid cold payloads are not recovery evidence for this operation.
+            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_creation',?1,1,1,'{}')",
+                [format!("cold-creation-{n}")]).unwrap();
+        }
+        tx.commit().unwrap();
+        let observed = SqlWork::default();
+        let cancellation = Cancellation::default();
+        let mut db = ControlledStore::open_scoped_observed(&path,
+            ReadControl::new(Instant::now() + Duration::from_secs(10), cancellation.clone()), observed.clone()).unwrap();
+        let selected = db.resource_recovery_selection(&f.operation.id, revision).unwrap();
+        assert_eq!(selected.record.operation, f.operation.id);
+        assert!(selected.events.iter().all(|e| e.entity == f.operation.id.as_str()));
+        assert!(selected.events.iter().any(|e| e.kind == "runtime.launch_creation"));
+        work.push(observed.snapshot().sqlite_vm_steps);
+        cancellation.cancel();
+        assert!(matches!(db.resource_recovery_selection(&f.operation.id, revision), Err(StoreError::Cancelled)));
+    }
+    eprintln!("resource recovery selection SQL steps at 0/10000 unrelated creation events: {work:?}");
+    assert!(work[1] <= work[0] + 500, "recovery selection scanned history: {work:?}");
+    // Remove synthetic creation evidence before the independent cross-project inventory audit.
+    raw.execute("DELETE FROM events WHERE entity GLOB 'cold-creation-*'", []).unwrap();
+    let recovered = reconcile_resource(&f.project, &f.operation.id, revision,
+        Instant::now() + Duration::from_secs(15), Default::default()).unwrap().unwrap();
+    assert_eq!(recovered.operation, f.operation.id);
+    assert!(migration::open_active(&f.project).unwrap().read_snapshot(None).is_err());
+    assert_eq!(fs::read_to_string(f._root.path().join("created")).unwrap().lines().count(), 1);
+}
+
+#[test]
+fn gate_selection_claim_and_render_share_bounded_reads() {
+    use crate::store::{controlled::{ControlledStore, ReadControl, SqlWork}, StoreError};
+    let f = Fixture::new("resource-release");
+    create_resource(&f.project, &f.operation.id, 1, Instant::now() + Duration::from_secs(15), Default::default()).unwrap();
+    let state = runtime::snapshot(&f.project).unwrap();
+    let claim = retained_launch_claim(&state, &f.operation.id);
+    let path = f.project.join(".state/state.db");
+    let mut raw = rusqlite::Connection::open(&path).unwrap();
+    let mut work = Vec::new();
+    for history in [0, 10_000] {
+        let tx = raw.transaction().unwrap();
+        for n in 0..history {
+            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_creation',?1,1,1,'{}')", [format!("cold-gate-{n}")]).unwrap();
+        }
+        tx.commit().unwrap();
+        let observed = SqlWork::default();
+        let cancellation = Cancellation::default();
+        let mut db = ControlledStore::open_scoped_observed(&path,
+            ReadControl::new(Instant::now() + Duration::from_secs(10), cancellation.clone()), observed.clone()).unwrap();
+        let selected = db.resource_recovery_selection(&f.operation.id, claim.revision).unwrap();
+        db.validate_launch_claim(&claim, now()).unwrap();
+        db.render_attempt_brief(&f.project, selected.record.attempt.as_str()).unwrap();
+        work.push(observed.snapshot().sqlite_vm_steps);
+        cancellation.cancel();
+        assert!(matches!(db.validate_launch_claim(&claim, now()), Err(StoreError::Cancelled)));
+    }
+    eprintln!("gate selection/claim/render SQL steps at 0/10000 creation events: {work:?}");
+    assert!(work[1] <= work[0] + 500, "gate preparation scanned history: {work:?}");
+    assert!(!f._root.path().join("gate-requests").exists());
+}
+
+#[test]
+fn resource_creation_ignores_cold_approval_history_without_replaying() {
+    let f = Fixture::new("resource");
+    let path = f.project.join(".state/state.db");
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute("INSERT INTO approval_grants VALUES('cold-creation-approval','{}',?1)", ["a".repeat(64)]).unwrap();
+    let target = create_resource(&f.project, &f.operation.id, 1,
+        Instant::now() + Duration::from_secs(15), Default::default()).unwrap();
+    assert_eq!(target.operation, f.operation.id);
+    assert!(target.supervisor.is_some());
+    assert!(migration::open_active(&f.project).unwrap().read_snapshot(None).is_err());
+    assert!(create_resource(&f.project, &f.operation.id, 1,
+        Instant::now() + Duration::from_secs(15), Default::default()).is_err());
+    assert_eq!(fs::read_to_string(f._root.path().join("created")).unwrap().lines().count(), 1);
+    let targets: u64 = raw.query_row("SELECT count(*) FROM events WHERE entity=?1 AND kind='runtime.launch_target'", [f.operation.id.as_str()], |r| r.get(0)).unwrap();
+    assert_eq!(targets, 1);
+}
+
+#[test]
+fn resource_creation_selection_and_render_are_history_bounded() {
+    use crate::store::{controlled::{ControlledStore, ReadControl, SqlWork}, StoreError};
+    let f = Fixture::new("resource");
+    let path = f.project.join(".state/state.db");
+    let mut raw = rusqlite::Connection::open(&path).unwrap();
+    let mut work = Vec::new();
+    for history in [0, 10_000] {
+        let tx = raw.transaction().unwrap();
+        for n in 0..history {
+            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_creation',?1,1,1,'{}')", [format!("retained-creation-{n}")]).unwrap();
+        }
+        tx.commit().unwrap();
+        let observed = SqlWork::default();
+        let cancellation = Cancellation::default();
+        let mut db = ControlledStore::open_scoped_observed(&path,
+            ReadControl::new(Instant::now() + Duration::from_secs(10), cancellation.clone()), observed.clone()).unwrap();
+        let selected = db.resource_creation_selection(&f.operation.id, 1).unwrap();
+        assert_eq!(selected.delivery.attempts, 0);
+        assert!(selected.events.is_empty());
+        db.render_attempt_brief(&f.project, selected.record.attempt.as_str()).unwrap();
+        work.push(observed.snapshot().sqlite_vm_steps);
+        cancellation.cancel();
+        assert!(matches!(db.resource_creation_selection(&f.operation.id, 1), Err(StoreError::Cancelled)));
+    }
+    eprintln!("creation selection/render SQL steps at 0/10000 retained creation events: {work:?}");
+    assert!(work[1] <= work[0] + 500, "creation preparation scanned history: {work:?}");
+    assert!(!f._root.path().join("created").exists());
+}
+
+#[test]
+fn launch_advancement_selection_is_bounded_and_operation_scoped() {
+    use crate::store::{controlled::{ControlledStore, ReadControl, SqlWork}, StoreError};
+    let f = Fixture::new("resource");
+    let path = f.project.join(".state/state.db");
+    let mut raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute("INSERT INTO approval_grants VALUES('cold-advancement-grant','{}',?1)", ["a".repeat(64)]).unwrap();
+    let kinds = ["runtime.worktrees_creation", "runtime.launch_creation", "runtime.launch_workspace", "runtime.launch_layout", "runtime.launch_target", "runtime.launch_started", "runtime.launch_release", "runtime.launch_name"];
+    let mut work = Vec::new();
+    for history in [0, 10_000] {
+        let tx = raw.transaction().unwrap();
+        for n in 0..history {
+            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?1,?2,1,1,'{}')",
+                rusqlite::params![kinds[n % kinds.len()], format!("other-launch-{n}")]).unwrap();
+        }
+        tx.commit().unwrap();
+        let observed = SqlWork::default();
+        let cancellation = Cancellation::default();
+        let mut db = ControlledStore::open_scoped_observed(&path,
+            ReadControl::new(Instant::now() + Duration::from_secs(10), cancellation.clone()), observed.clone()).unwrap();
+        let selected = db.launch_advancement_selection(&f.operation.id, 1).unwrap();
+        assert!(selected.kinds.is_empty());
+        assert_eq!(selected.record.operation, f.operation.id);
+        work.push(observed.snapshot().sqlite_vm_steps);
+        assert!(matches!(db.launch_advancement_selection(&f.operation.id, 2), Err(StoreError::Conflict)));
+        cancellation.cancel();
+        assert!(matches!(db.launch_advancement_selection(&f.operation.id, 1), Err(StoreError::Cancelled)));
+    }
+    eprintln!("advancement selection SQL steps at 0/10000 other launch events: {work:?}");
+    assert!(work[1] <= work[0] + 500, "advancement scanned history: {work:?}");
+    // The real entry point reaches its selected environment refusal rather than
+    // decoding the cold grant. No native creation is authorized by this fixture.
+    let error = advance_launch(&f.project, &f.operation.id, 1,
+        Instant::now() + Duration::from_secs(10), Default::default()).unwrap_err();
+    assert!(error.to_string().contains("explicit execution environment required"), "{error:#}");
+    assert!(!f._root.path().join("created").exists());
+    assert!(migration::open_active(&f.project).unwrap().read_snapshot(None).is_err());
+    // Presence probes are scoped to this operation; these modeled rows do not
+    // certify payloads or authorize effects, which the selected adapters validate.
+    let mut db = ControlledStore::open_scoped_observed(&path,
+        ReadControl::new(Instant::now() + Duration::from_secs(10), Default::default()), SqlWork::default()).unwrap();
+    for (index, kind) in kinds.iter().enumerate() {
+        raw.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?1,?2,1,1,'{}')",
+            rusqlite::params![kind, f.operation.id.as_str()]).unwrap();
+        let selected = db.launch_advancement_selection(&f.operation.id, 1).unwrap();
+        assert_eq!(selected.kinds, kinds[..=index].iter().map(|kind| kind.to_string()).collect());
+    }
+}
+
+#[test]
+fn launch_reconciliation_ignores_unrelated_history_without_releasing_a_gate() {
+    let f = Fixture::new("resource");
+    let target = create_resource(&f.project, &f.operation.id, 1,
+        Instant::now() + Duration::from_secs(15), Default::default()).unwrap();
+    let before = runtime::snapshot(&f.project).unwrap();
+    let revision = before.deliveries.iter().find(|d| d.operation == f.operation.id).unwrap().revision;
+    let raw = rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap();
+    raw.execute("INSERT INTO approval_grants VALUES('cold-reconciliation-grant','{}',?1)", ["a".repeat(64)]).unwrap();
+    // Another launch's release must not route this gated worker into start observation.
+    raw.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_release','another-launch',1,1,'{}')", []).unwrap();
+    assert!(reconcile_launch(&f.project, &f.operation.id, revision,
+        Instant::now() + Duration::from_secs(15), Default::default()).unwrap());
+    assert!(reconcile_launch(&f.project, &f.operation.id, revision + 1,
+        Instant::now() + Duration::from_secs(15), Default::default()).is_err());
+    let cancellation = Cancellation::default();
+    cancellation.cancel();
+    assert!(reconcile_launch(&f.project, &f.operation.id, revision,
+        Instant::now() + Duration::from_secs(15), cancellation).is_err());
+    assert!(migration::open_active(&f.project).unwrap().read_snapshot(None).is_err());
+    let releases: u64 = raw.query_row("SELECT count(*) FROM events WHERE entity=?1 AND kind IN ('runtime.launch_release','runtime.launch_started')", [f.operation.id.as_str()], |r| r.get(0)).unwrap();
+    assert_eq!(releases, 0);
+    let retained: String = raw.query_row("SELECT payload FROM events WHERE entity=?1 AND kind='runtime.launch_target'", [f.operation.id.as_str()], |r| r.get(0)).unwrap();
+    assert_eq!(serde_json::from_str::<LaunchTarget>(&retained).unwrap(), target);
+    assert_eq!(fs::read_to_string(f._root.path().join("created")).unwrap().lines().count(), 1);
+    assert!(!f._root.path().join("gate-requests").exists());
+}
+
+#[test]
+fn start_selection_is_bounded_and_cancellable_with_retained_history() {
+    use crate::store::{controlled::{ControlledStore, ReadControl, SqlWork}, StoreError};
+    let f = Fixture::new("resource");
+    let target = create_resource(&f.project, &f.operation.id, 1,
+        Instant::now() + Duration::from_secs(15), Default::default()).unwrap();
+    let path = f.project.join(".state/state.db");
+    let mut raw = rusqlite::Connection::open(&path).unwrap();
+    let revision: u64 = raw.query_row("SELECT revision FROM operation_delivery WHERE operation_id=?1", [f.operation.id.as_str()], |r| r.get(0)).unwrap();
+    let mut work = Vec::new();
+    for history in [0, 10_000] {
+        let tx = raw.transaction().unwrap();
+        for n in 0..history {
+            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_started',?1,1,1,'{}')", [format!("other-start-{n}")]).unwrap();
+        }
+        tx.commit().unwrap();
+        let observed = SqlWork::default();
+        let cancellation = Cancellation::default();
+        let mut db = ControlledStore::open_scoped_observed(&path,
+            ReadControl::new(Instant::now() + Duration::from_secs(10), cancellation.clone()), observed.clone()).unwrap();
+        let selected = db.launch_start_selection(&f.operation.id, revision).unwrap();
+        assert_eq!(selected.record.attempt, target.attempt);
+        assert_eq!(selected.events.len(), 1);
+        assert_eq!(selected.events[0].kind, "runtime.launch_target");
+        work.push(observed.snapshot().sqlite_vm_steps);
+        cancellation.cancel();
+        assert!(matches!(db.launch_start_selection(&f.operation.id, revision), Err(StoreError::Cancelled)));
+    }
+    eprintln!("start selection SQL steps at 0/10000 other start events: {work:?}");
+    assert!(work[1] <= work[0] + 500, "start selection scanned history: {work:?}");
+    assert!(!f._root.path().join("name-requests").exists());
+}
+
+#[test]
+fn pane_conflicts_remain_effect_fences_with_ten_thousand_retired_neighbors() {
+    use sha2::{Digest,Sha256};
+    let f=Fixture::new("ok");
+    let other=f._root.path().join("retired-neighbor");
+    fs::create_dir_all(other.join(".state")).unwrap();fs::create_dir(other.join("threads")).unwrap();
+    fs::write(other.join("PROJECT.md"),"+++\nname = 'Retired neighbor'\n+++\n").unwrap();
+    fs::write(other.join(".state/project.json"),r#"{"status":"paused"}"#).unwrap();
+    fs::write(other.join(".state/coordinator.json"),"{}").unwrap();
+    let plan=migration::inspect(&other).unwrap();migration::apply(&other,&plan,true).unwrap();
+    let coordinator=runtime::snapshot(&other).unwrap().runtime_bindings.remove(0);
+    let state=runtime::snapshot(&f.project).unwrap();
+    let route=state.runtime_bindings.iter().find(|b|!b.identity.pane_id.is_empty()).unwrap().identity.clone();
+    let mut raw=rusqlite::Connection::open(other.join(".state/state.db")).unwrap();
+    let tx=raw.transaction().unwrap();
+    for n in 0..10_000 {
+        let mut retired=coordinator.clone();let task=TaskId::new(format!("retired-{n}")).unwrap();
+        retired.id=format!("task:{}",task.as_str());retired.task=Some(task.clone());
+        retired.source_path=None;retired.source_digest=None;retired.session_source_digest=None;retired.identity=Default::default();
+        tx.execute("INSERT INTO tasks(id,revision,state,title) VALUES(?1,1,'cancelled','retired')",[task.as_str()]).unwrap();
+        let payload=serde_json::to_string(&retired).unwrap();
+        tx.execute("INSERT INTO runtime_bindings(id,task_id,revision,source_path,payload,payload_hash) VALUES(?1,?2,1,NULL,?3,?4)",rusqlite::params![retired.id,task.as_str(),payload,format!("{:x}",Sha256::digest(payload.as_bytes()))]).unwrap();
+    }
+    tx.commit().unwrap();
+    let alias=other.join(".state/socket-alias");std::os::unix::fs::symlink(&route.socket,&alias).unwrap();
+    for mode in ["alias","remote","corrupt"] {
+        let mut conflict=coordinator.clone();conflict.identity=route.clone();
+        conflict.identity.socket=alias.display().to_string();
+        if mode=="remote" {conflict.identity.machine="unresolved-host".into();}
+        let payload=serde_json::to_string(&conflict).unwrap();
+        let hash=if mode=="corrupt" {"0".repeat(64)} else {format!("{:x}",Sha256::digest(payload.as_bytes()))};
+        raw.execute("UPDATE runtime_bindings SET payload=?1,payload_hash=?2 WHERE id=?3",rusqlite::params![payload,hash,coordinator.id]).unwrap();
+        assert!(f.send().is_err(),"pane conflict accepted: {mode}");
+        assert!(f.sent().is_empty());assert_eq!(runtime::snapshot(&f.project).unwrap(),state);
+    }
+    let payload=serde_json::to_string(&coordinator).unwrap();
+    raw.execute("UPDATE runtime_bindings SET payload=?1,payload_hash=?2 WHERE id=?3",rusqlite::params![payload,format!("{:x}",Sha256::digest(payload.as_bytes())),coordinator.id]).unwrap();
+    f.send().unwrap();assert_eq!(f.sent().len(),1);
+}
+
+#[test]
+fn staged_pane_selection_ignores_other_panes_and_preserves_provenance_fences() {
+    use std::sync::{Arc,atomic::{AtomicU64,Ordering}};
+    let f=Fixture::new("ok");
+    let mut raw=rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap();
+    let selected=|limits:&mut crate::store::identity_inventory::Budget|migration::read_pane_targets(&f.project,"w1:p1",limits);
+    let budget=||crate::store::identity_inventory::Budget::new(50*1024*1024,1024,Instant::now()+Duration::from_secs(10),Default::default()).unwrap();
+    let expected=selected(&mut budget()).unwrap();assert_eq!(expected.len(),1);
+    let mut work=Vec::new();
+    for history in [0,10_000] {
+        let tx=raw.transaction().unwrap();
+        for n in 0..history {
+            // Modeled receipts for unrelated panes deliberately lack input
+            // provenance. Full administrative inventory must still refuse them.
+            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?1,?2,1,1,?3)",rusqlite::params![if n%2==0 {"runtime.launch_target"}else{"runtime.launch_workspace"},format!("cold-pane-{n}"),json!({"route":{"pane_id":format!("other-pane-{n}")}}).to_string()]).unwrap();
+        }
+        tx.commit().unwrap();
+        let mut limits=budget();let steps=Arc::new(AtomicU64::new(0));limits.sql_steps=Some(steps.clone());
+        assert_eq!(selected(&mut limits).unwrap(),expected);work.push(steps.load(Ordering::Relaxed));
+    }
+    eprintln!("staged pane selection SQL steps at 0/10000 other pane receipts: {work:?}");
+    assert!(work[1]<=work[0]+100,"staged pane query scanned history: {work:?}");
+    assert!(migration::read_launch_target_inventory(&f.project,&mut budget()).is_err());
+    let original:String=raw.query_row("SELECT payload FROM events WHERE entity=?1 AND kind='runtime.launch_target'",[expected[0].1.operation.as_str()],|r|r.get(0)).unwrap();
+    for bad in [Value::Null,json!(19),json!(""),json!([])] {
+        let mut payload:Value=serde_json::from_str(&original).unwrap();payload["route"]["pane_id"]=bad;
+        raw.execute("UPDATE events SET payload=?1 WHERE entity=?2 AND kind='runtime.launch_target'",rusqlite::params![payload.to_string(),expected[0].1.operation.as_str()]).unwrap();
+        assert!(selected(&mut budget()).is_err(),"unknown staged pane became absence");
+        assert!(f.send().is_err());assert!(f.sent().is_empty());
+    }
+    raw.execute("UPDATE events SET payload=?1 WHERE entity=?2 AND kind='runtime.launch_target'",rusqlite::params![original,expected[0].1.operation.as_str()]).unwrap();
+    // A duplicate cannot hide behind a different pane predicate.
+    raw.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) SELECT kind,entity,revision,payload_version,json_set(payload,'$.route.pane_id','different-pane') FROM events WHERE entity=?1 AND kind='runtime.launch_target'",[expected[0].1.operation.as_str()]).unwrap();
+    assert!(selected(&mut budget()).unwrap_err().to_string().contains("duplicate"));
+    raw.execute("DELETE FROM events WHERE entity=?1 AND kind='runtime.launch_target' AND json_extract(payload,'$.route.pane_id')='different-pane'",[expected[0].1.operation.as_str()]).unwrap();
+    let mut cancelled=budget();cancelled.cancellation.cancel();assert!(selected(&mut cancelled).is_err());
+    f.send().unwrap();assert_eq!(f.sent().len(),1);
+    assert!(migration::read_launch_target_inventory(&f.project,&mut budget()).is_err());
+}
+
+#[test]
+fn staged_pane_selection_reads_the_real_schema42_without_new_indexes() {
+    let f=Fixture::new("ok");
+    let budget=||crate::store::identity_inventory::Budget::new(50*1024*1024,1024,Instant::now()+Duration::from_secs(10),Default::default()).unwrap();
+    let expected=migration::read_pane_targets(&f.project,"w1:p1",&mut budget()).unwrap();
+    assert_eq!(expected.len(),1);
+    let raw=rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap();
+    crate::store::test_schema::historical(&raw,42).unwrap();
+    let indexes:u64=raw.query_row("SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN ('retained_launch_resources_pane','retained_launch_resources_unknown')",[],|r|r.get(0)).unwrap();
+    assert_eq!(indexes,0);
+    assert_eq!(migration::read_pane_targets(&f.project,"w1:p1",&mut budget()).unwrap(),expected);
+    migration::upgrade_active(&f.project).unwrap();
+    let retained:u64=raw.query_row("SELECT count(*) FROM retained_launch_resources",[],|r|r.get(0)).unwrap();assert_eq!(retained,1);
+    assert_eq!(migration::read_pane_targets(&f.project,"w1:p1",&mut budget()).unwrap(),expected);
+    raw.execute("UPDATE events SET payload=json_set(payload,'$.route.pane_id',NULL) WHERE kind='runtime.launch_target'",[]).unwrap();
+    assert!(migration::read_pane_targets(&f.project,"w1:p1",&mut budget()).is_err());
+    assert!(f.sent().is_empty());
+}
+
+#[test]
+fn retained_pane_projection_excludes_reused_history_and_tracks_recovery_boundaries() {
+    use std::sync::{Arc,atomic::{AtomicU64,Ordering}};
+    let mut f=Fixture::new("ok");
+    f._worker.0.kill().unwrap();f._worker.0.wait().unwrap();
+    let budget=||crate::store::identity_inventory::Budget::new(50*1024*1024,1024,Instant::now()+Duration::from_secs(10),Default::default()).unwrap();
+    let expected=migration::read_pane_targets(&f.project,"w1:p1",&mut budget()).unwrap();assert_eq!(expected.len(),1);
+    let target=&expected[0].1;
+    let mut raw=rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap();
+    let mut reads=Vec::new();let mut writes=Vec::new();
+    for history in [0,10_000] {
+        let tx=raw.transaction().unwrap();
+        for n in 0..history {
+            // Model archived relational keys sharing this pane. Payloads are
+            // intentionally not fresh authority for these synthetic operations.
+            let op=format!("archived-launch-{n}");let attempt=format!("archived-attempt-{n}");
+            tx.execute("INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) SELECT ?1,task_id,1,'cancelled',NULL,?1,1 FROM attempts WHERE id=?2",rusqlite::params![attempt,target.attempt.as_str()]).unwrap();
+            tx.execute("INSERT INTO attempt_inputs SELECT ?1,?2,payload,payload_hash FROM attempt_inputs WHERE operation_id=?3",rusqlite::params![attempt,op,target.operation.as_str()]).unwrap();
+            for kind in ["runtime.launch_started","runtime.launch_target"] {
+                tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) SELECT kind,?1,revision,payload_version,payload FROM events WHERE entity=?2 AND kind=?3",rusqlite::params![op,target.operation.as_str(),kind]).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        let count:u64=raw.query_row("SELECT count(*) FROM retained_launch_resources",[],|r|r.get(0)).unwrap();assert_eq!(count,1);
+        let mut limits=budget();let steps=Arc::new(AtomicU64::new(0));limits.sql_steps=Some(steps.clone());
+        assert_eq!(migration::read_pane_targets(&f.project,"w1:p1",&mut limits).unwrap(),expected);
+        reads.push(steps.load(Ordering::Relaxed));
+        let steps=Arc::new(AtomicU64::new(0));let observed=steps.clone();raw.progress_handler(1,Some(move||{observed.fetch_add(1,Ordering::Relaxed);false}));
+        raw.execute_batch("SAVEPOINT retire_selected").unwrap();
+        raw.execute("UPDATE attempts SET termination_observed=1 WHERE id=?1",[target.attempt.as_str()]).unwrap();
+        let count:u64=raw.query_row("SELECT count(*) FROM retained_launch_resources",[],|r|r.get(0)).unwrap();assert_eq!(count,0);
+        raw.execute_batch("ROLLBACK TO retire_selected; RELEASE retire_selected").unwrap();
+        writes.push(steps.load(Ordering::Relaxed));raw.progress_handler(0,None::<fn()->bool>);
+        assert_eq!(migration::read_pane_targets(&f.project,"w1:p1",&mut budget()).unwrap(),expected);
+    }
+    eprintln!("reused-pane selection SQL steps at 0/10000 terminated launches: {reads:?}; termination/rollback steps: {writes:?}");
+    assert!(reads[1]<=reads[0]+100,"retained pane selection scanned history: {reads:?}");
+    assert!(writes[1]<=writes[0]+100,"projection maintenance scanned history: {writes:?}");
+    // Acknowledged termination retires the target, but loss of start evidence
+    // restores the uncertain resource reference in the same transaction.
+    raw.execute("UPDATE attempts SET termination_observed=1 WHERE id=?1",[target.attempt.as_str()]).unwrap();
+    assert!(migration::read_pane_targets(&f.project,"w1:p1",&mut budget()).unwrap().is_empty());
+    raw.execute("DELETE FROM events WHERE entity=?1 AND kind='runtime.launch_started'",[target.operation.as_str()]).unwrap();
+    assert_eq!(migration::read_pane_targets(&f.project,"w1:p1",&mut budget()).unwrap(),expected);
+    raw.execute("UPDATE events SET payload=json_set(payload,'$.route.pane_id',NULL) WHERE entity=?1 AND kind='runtime.launch_target'",[target.operation.as_str()]).unwrap();
+    assert!(migration::read_pane_targets(&f.project,"w1:p1",&mut budget()).is_err());
+}
+
+#[test]
+fn retained_pane_projection_tracks_source_mutations_and_preserves_workspaces() {
+    let mut f=Fixture::new("ok");f._worker.0.kill().unwrap();f._worker.0.wait().unwrap();
+    let raw=rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap();
+    let budget=||crate::store::identity_inventory::Budget::new(50*1024*1024,1024,Instant::now()+Duration::from_secs(10),Default::default()).unwrap();
+    let expected=migration::read_pane_targets(&f.project,"w1:p1",&mut budget()).unwrap();let target=&expected[0].1;
+    let consistent=|| {
+        let same:bool=raw.query_row("SELECT NOT EXISTS(SELECT * FROM retained_launch_resources EXCEPT SELECT * FROM retained_launch_resource_source) AND NOT EXISTS(SELECT * FROM retained_launch_resource_source EXCEPT SELECT * FROM retained_launch_resources)",[],|r|r.get(0)).unwrap();assert!(same,"retained projection differs from audited inventory rule");
+    };
+    for mode in ["attempt-delete","input-delete","input-update","event-entity","event-kind","event-sequence"] {
+        raw.execute_batch("SAVEPOINT mutation").unwrap();
+        match mode {
+            "attempt-delete"=>{raw.execute("DELETE FROM attempts WHERE id=?1",[target.attempt.as_str()]).unwrap();},
+            "input-delete"=>{raw.execute_batch("DROP TRIGGER attempt_inputs_no_delete").unwrap();raw.execute("DELETE FROM attempt_inputs WHERE operation_id=?1",[target.operation.as_str()]).unwrap();},
+            "input-update"=>{raw.execute_batch("DROP TRIGGER attempt_inputs_no_update").unwrap();raw.execute("UPDATE attempt_inputs SET operation_id='moved-input' WHERE operation_id=?1",[target.operation.as_str()]).unwrap();},
+            "event-entity"=>{raw.execute("UPDATE events SET entity='moved-target' WHERE kind='runtime.launch_target'",[]).unwrap();},
+            "event-kind"=>{raw.execute("UPDATE events SET kind='unrelated' WHERE kind='runtime.launch_target'",[]).unwrap();},
+            _=>{raw.execute("UPDATE events SET sequence=sequence+10000 WHERE kind='runtime.launch_target'",[]).unwrap();}
+        }
+        consistent();raw.execute_batch("ROLLBACK TO mutation; RELEASE mutation").unwrap();consistent();
+    }
+    // Workspace ownership survives worker termination even after start is known.
+    raw.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) SELECT 'runtime.launch_workspace',entity,revision,payload_version,payload FROM events WHERE kind='runtime.launch_target'",[]).unwrap();
+    raw.execute("UPDATE attempts SET termination_observed=1 WHERE id=?1",[target.attempt.as_str()]).unwrap();consistent();
+    let remaining=migration::read_pane_targets(&f.project,"w1:p1",&mut budget()).unwrap();assert_eq!(remaining,expected);
+    let kinds:Vec<String>=raw.prepare("SELECT e.kind FROM retained_launch_resources r JOIN events e USING(sequence)").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    assert_eq!(kinds,vec!["runtime.launch_workspace"]);
 }

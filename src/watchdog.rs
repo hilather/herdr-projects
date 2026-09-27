@@ -104,9 +104,14 @@ fn write_pause(project: &Path, reason: &'static str) -> std::io::Result<bool> {
 
 /// One ticker line per admission decision. Reason and task id are allowlisted; environment is not copied.
 pub fn admission_log_line(reason: &str, task_id: Option<&str>, duration_ms: u128) -> String {
+    admission_log_line_observed(reason,task_id,duration_ms,None)
+}
+
+pub fn admission_log_line_observed(reason: &str, task_id: Option<&str>, duration_ms: u128,
+    sql: Option<crate::store::controlled::SqlWorkMetrics>) -> String {
     let reason = match reason {
         "disk_full" | "database_busy" | "admission_paused" | "admission_off" | "idle" | "reserved"
-        | "authority_missing" | "verification_backlog" | "integration_backlog" | "capacity_full" | "error" => reason,
+        | "authority_missing" | "scan_incomplete" | "verification_backlog" | "integration_backlog" | "capacity_full" | "error" => reason,
         _ => "error",
     };
     let task_id = task_id.filter(|id| {
@@ -118,6 +123,7 @@ pub fn admission_log_line(reason: &str, task_id: Option<&str>, duration_ms: u128
         "reason": reason,
         "task_id": task_id,
         "duration_ms": u64::try_from(duration_ms).unwrap_or(u64::MAX),
+        "sql_work": sql,
     })
     .to_string()
 }
@@ -126,21 +132,9 @@ pub fn admission_log_line(reason: &str, task_id: Option<&str>, duration_ms: u128
 mod tests {
     use super::*;
     use crate::domain::*;
-    use crate::store::{SqliteStore, StoreError, BUSY_RETRY_BOUND};
+    use crate::store::{SqliteStore, StoreError};
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
-
-    static BUSY_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-    fn give_up_past_bound(_retries: i32) -> bool {
-        BUSY_CALLS.fetch_add(1, Ordering::SeqCst);
-        // The fixture is already at BUSY_RETRY_BOUND, so the handler gives up inline.
-        match Instant::now().checked_sub(BUSY_RETRY_BOUND) {
-            Some(started) => started.elapsed() < BUSY_RETRY_BOUND,
-            None => false,
-        }
-    }
 
     fn project_with_attempt() -> (tempfile::TempDir, std::path::PathBuf) {
         let temp = tempfile::tempdir().unwrap();
@@ -198,13 +192,6 @@ mod tests {
     }
 
     #[test]
-    fn busy_bound_matches_the_connection_handler() {
-        let source = include_str!("store/mod.rs");
-        assert!(source.contains("busy_timeout(BUSY_RETRY_BOUND)"), "{source}");
-        assert_eq!(BUSY_RETRY_BOUND, std::time::Duration::from_millis(250));
-    }
-
-    #[test]
     fn unreadable_pause_file_stays_paused_until_it_is_gone() {
         let (_temp, project) = project_with_attempt();
         note(&project, &StoreError::DiskFull).unwrap();
@@ -235,9 +222,15 @@ mod tests {
         let before = attempts(&project);
         assert_eq!(before, vec![("attempt-kept".into(), 0)]);
         let connection = rusqlite::Connection::open(project.join(".state/state.db")).unwrap();
+        connection.execute("CREATE TABLE disk_full_probe(x)", []).unwrap();
         let pages: i64 = connection.query_row("PRAGMA page_count", [], |row| row.get(0)).unwrap();
+        let page_size: i64 = connection.query_row("PRAGMA page_size", [], |row| row.get(0)).unwrap();
         connection.pragma_update(None, "max_page_count", pages).unwrap();
-        let error = connection.execute("CREATE TABLE disk_full_probe(x)", []).unwrap_err();
+        // Rebuilding tables during migration can leave reusable pages. Force an
+        // allocation larger than the entire database, including its freelist.
+        let error = connection
+            .execute("INSERT INTO disk_full_probe VALUES (zeroblob(?1))", [(pages + 1) * page_size])
+            .unwrap_err();
         let store_error = StoreError::from(error);
         assert!(matches!(store_error, StoreError::DiskFull), "{store_error:?}");
         drop(connection);
@@ -259,24 +252,26 @@ mod tests {
     }
 
     #[test]
-    fn busy_handler_fixture_pauses_admission_and_retains_attempts() {
+    fn production_store_busy_timeout_pauses_without_writes_or_capacity_release() {
         let (_temp, project) = project_with_attempt();
         let before = attempts(&project);
-        let holder = rusqlite::Connection::open(project.join(".state/state.db")).unwrap();
-        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
-        let blocked = rusqlite::Connection::open(project.join(".state/state.db")).unwrap();
-        BUSY_CALLS.store(0, Ordering::SeqCst);
-        blocked.busy_handler(Some(give_up_past_bound)).unwrap();
-        let error = blocked.execute_batch("BEGIN IMMEDIATE").unwrap_err();
-        assert!(BUSY_CALLS.load(Ordering::SeqCst) >= 1, "busy handler was not invoked");
-        let store_error = StoreError::from(error);
-        assert!(matches!(store_error, StoreError::Busy), "{store_error:?}");
-        assert!(note(&project, &store_error).unwrap());
-        assert_eq!(pause_reason(&project), Some("database_busy"));
-        drop(blocked);
-        drop(holder);
-        assert_eq!(attempts(&project), before);
-        assert!(before.iter().all(|(_, observed)| *observed == 0));
+        let path=project.join(".state/state.db");
+        let mut blocked=SqliteStore::open(&path).unwrap();let head=blocked.current_head().unwrap();
+        let holder=rusqlite::Connection::open(&path).unwrap();holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let pending=||Commit{expected_head:head,mutations:vec![Mutation::Task{expected:None,next:Task{
+            id:TaskId::new("pending").unwrap(),revision:1,state:TaskState::Draft,title:"pending write".into(),active_attempt:None,
+        }}]};
+        let started=Instant::now();let error=blocked.commit(pending()).unwrap_err();
+        let elapsed=started.elapsed();
+        assert!(matches!(error,StoreError::Busy),"{error:?}");
+        assert!(elapsed>=std::time::Duration::from_millis(100) && elapsed<std::time::Duration::from_secs(2),"unexpected production busy wait: {elapsed:?}");
+        assert!(note(&project,&error).unwrap());assert_eq!(pause_reason(&project),Some("database_busy"));
+        assert_eq!(blocked.current_head().unwrap(),head);assert_eq!(attempts(&project),before);
+        assert_eq!(holder.query_row("SELECT count(*) FROM tasks WHERE id='pending'",[],|r|r.get::<_,u64>(0)).unwrap(),0);
+        holder.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(blocked.commit(pending()).unwrap(),head+1);
+        assert_eq!(attempts(&project),before);assert!(is_paused(&project));
+        assert!(before.iter().all(|(_,observed)|*observed==0));
     }
 
     #[test]
@@ -288,6 +283,12 @@ mod tests {
         assert_eq!(value["duration_ms"], 4);
         assert!(value.get("environment").is_none());
         assert!(value.get("argv").is_none());
+        assert!(value["sql_work"].is_null());
+        let metrics=crate::store::controlled::SqlWorkMetrics {connection_observed:true,sqlite_rows_returned:17,sqlite_vm_steps:231};
+        let measured=admission_log_line_observed("reserved",Some("task-1"),4,Some(metrics));
+        let measured:serde_json::Value=serde_json::from_str(&measured).unwrap();
+        assert_eq!(measured["sql_work"]["sqlite_rows_returned"],17);
+        assert_eq!(measured["sql_work"]["sqlite_vm_steps"],231);
         let dirty = admission_log_line("SECRET_TOKEN_DO_NOT_LEAK=1", Some("not a task"), 1);
         assert!(!dirty.contains("SECRET_TOKEN_DO_NOT_LEAK"), "{dirty}");
         assert!(dirty.contains("\"reason\":\"error\""));

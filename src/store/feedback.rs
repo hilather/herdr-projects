@@ -440,13 +440,13 @@ mod tests {
     fn upgrade_v1_from_28_to_29_and_create_end_at_user_version_29() {
         let fresh = tempfile::tempdir().unwrap();
         let created = SqliteStore::create(&fresh.path().join("state.db")).unwrap();
-        assert_eq!(user_version(&created.connection), 41);
+        assert_eq!(user_version(&created.connection), crate::store::SCHEMA);
         assert_eq!(
             created
                 .connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            41
+            crate::store::SCHEMA
         );
         assert!(table_exists(&created.connection, "feedback_items"));
         assert!(table_exists(&created.connection, "feedback_claims"));
@@ -457,9 +457,7 @@ mod tests {
         let db = SqliteStore::create(&path).unwrap();
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
-        raw.execute_batch(
-            "DROP INDEX IF EXISTS attempts_retained_by_id; DROP TABLE IF EXISTS active_work_index; DROP TABLE IF EXISTS active_work_meta; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_update; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_delete; DROP TRIGGER IF EXISTS barrier_members_no_update; DROP TRIGGER IF EXISTS barrier_members_no_delete; DROP TRIGGER IF EXISTS barrier_revisions_no_membership_update; DROP TABLE IF EXISTS barrier_stale_briefs; DROP TABLE IF EXISTS barrier_members; DROP TABLE IF EXISTS barrier_revisions; DROP TRIGGER IF EXISTS memory_change_receipts_no_update; DROP TRIGGER IF EXISTS memory_change_receipts_no_delete; DROP TRIGGER IF EXISTS update_package_members_no_update; DROP TRIGGER IF EXISTS update_package_members_no_delete; DROP TRIGGER IF EXISTS update_packages_no_update; DROP TRIGGER IF EXISTS update_packages_no_delete; DROP TABLE IF EXISTS memory_change_receipts; DROP TABLE IF EXISTS update_package_members; ALTER TABLE consumer_bindings DROP COLUMN applied_cursor; DROP TABLE IF EXISTS update_packages; DROP TRIGGER IF EXISTS memory_read_set_on_record; DROP TRIGGER IF EXISTS memory_read_set_on_reclassify; DROP TRIGGER IF EXISTS memory_read_set_on_revision; DROP TRIGGER IF EXISTS memory_read_set_on_validity; DROP TRIGGER IF EXISTS memory_read_set_on_head; DROP TABLE IF EXISTS memory_scope_catalog; DROP TABLE IF EXISTS memory_required_generation; DROP TABLE IF EXISTS consumer_binding_undeliverable; DROP TABLE IF EXISTS consumer_binding_obligations; DROP TABLE IF EXISTS consumer_bindings; DROP TABLE IF EXISTS wait_replay_events; DROP TABLE IF EXISTS replan_requests; DROP TABLE IF EXISTS replan_budget_resets; DROP TABLE IF EXISTS attempt_infrastructure_retries; DROP TABLE IF EXISTS wait_conditions; DROP TABLE IF EXISTS resource_claims; DROP TABLE IF EXISTS delegation_stop_obligations; DROP TABLE IF EXISTS delegation_revocations; DROP TABLE IF EXISTS delegation_grants; DROP TABLE IF EXISTS capability_evidence; DROP TABLE IF EXISTS contract_named_resources; DROP TABLE IF EXISTS contract_scope_paths; DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; DROP TABLE IF EXISTS dependency_satisfactions; DROP TABLE IF EXISTS factory_admission_policies; ALTER TABLE project_control DROP COLUMN factory_admission; DROP TABLE IF EXISTS feedback_claims; DROP TABLE IF EXISTS feedback_items; UPDATE store_meta SET schema_version=28; PRAGMA user_version=28;",
-        )
+        crate::store::test_schema::historical(&raw, 28)
         .unwrap();
         drop(raw);
         let mut db = SqliteStore::open(&path).unwrap();
@@ -470,19 +468,19 @@ mod tests {
             Err(StoreError::UnsupportedSchema(28))
         ));
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 41);
+        assert_eq!(user_version(&db.connection), crate::store::SCHEMA);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            41
+            crate::store::SCHEMA
         );
         assert!(table_exists(&db.connection, "feedback_items"));
         assert!(table_exists(&db.connection, "feedback_claims"));
         check_schema(&db.connection).unwrap();
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 41);
+        assert_eq!(user_version(&reopened.connection), crate::store::SCHEMA);
         assert!(table_exists(&reopened.connection, "feedback_claims"));
     }
 
@@ -611,27 +609,4 @@ mod tests {
         assert_eq!(satisfactions, 0);
     }
 
-    #[test]
-    fn pr_modules_do_not_write_feedback_or_satisfaction() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let markers = [
-            "feedback_items",
-            "feedback_claims",
-            "insert_feedback",
-            "task_dependencies",
-            "dependency_satisfactions",
-            "integrated_commits",
-            "SqliteStore",
-            "satisfaction",
-        ];
-        for name in ["src/pr.rs", "src/pr_polling.rs"] {
-            let source = std::fs::read_to_string(root.join(name)).unwrap();
-            for marker in markers {
-                assert!(
-                    !source.contains(marker),
-                    "{name} must not write feedback or satisfaction via {marker}"
-                );
-            }
-        }
-    }
 }

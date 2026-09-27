@@ -1,0 +1,18 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.20s
+     Running unittests src/lib.rs (target/debug/deps/herdr_projects-7f1eae6ae4b48993)
+
+running 1 test
+
+thread 'migration::tests::published_v2_store_upgrades_explicitly_without_losing_migration_identity' (21) panicked at src/migration/tests.rs:252:30:
+called `Result::unwrap()` on an `Err` value: state store: Io("table verification_runs already exists")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test migration::tests::published_v2_store_upgrades_explicitly_without_losing_migration_identity ... FAILED
+
+failures:
+
+failures:
+    migration::tests::published_v2_store_upgrades_explicitly_without_losing_migration_identity
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 621 filtered out; finished in 0.60s
+
+error: test failed, to rerun pass `--lib`

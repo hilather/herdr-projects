@@ -4,8 +4,14 @@ use crate::reconcile::{RuntimeObservation,ResourceState};
 pub(crate) fn identity_digest(binding:&RuntimeBinding)->Result<String> {Ok(format!("{:x}",Sha256::digest(serde_json::to_vec(&binding.identity).map_err(|e|StoreError::Invalid(e.to_string()))?)))}
 pub(super) fn read_all(db:&Connection)->Result<Vec<RuntimeOwnership>> {read_all_with_budget(db,None)}
 pub(super) fn read_all_with_budget(db:&Connection,budget:Option<&read_budget::ReadBudget>)->Result<Vec<RuntimeOwnership>> {
-    let mut stmt=db.prepare("SELECT binding_id,revision,binding_revision,attempt_id,payload,payload_hash FROM runtime_ownership ORDER BY binding_id")?;
-    let mut rows=stmt.query([])?;
+    read_selected(db, None, budget)
+}
+pub(super) fn read_binding(db:&Connection,id:&str,budget:Option<&read_budget::ReadBudget>)->Result<Option<RuntimeOwnership>> {
+    Ok(read_selected(db, Some(id), budget)?.pop())
+}
+fn read_selected(db:&Connection,id:Option<&str>,budget:Option<&read_budget::ReadBudget>)->Result<Vec<RuntimeOwnership>> {
+    let mut stmt=db.prepare(if id.is_some() {"SELECT binding_id,revision,binding_revision,attempt_id,payload,payload_hash FROM runtime_ownership WHERE binding_id=?1"} else {"SELECT binding_id,revision,binding_revision,attempt_id,payload,payload_hash FROM runtime_ownership ORDER BY binding_id"})?;
+    let mut rows=if let Some(id)=id {stmt.query([id])?} else {stmt.query([])?};
     let mut result=Vec::new();
     while let Some(r)=rows.next()? {
         if let Some(budget)=budget {budget.row(r,&[(4,1)])?;}

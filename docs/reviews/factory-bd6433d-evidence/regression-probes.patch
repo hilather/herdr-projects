@@ -1,0 +1,152 @@
+--- a/src/admission.rs
++++ b/src/admission.rs
+@@ -771,4 +771,25 @@
+         let mut db = SqliteStore::open(&project.join(".state/state.db")).unwrap();
+         db.read_snapshot(None).unwrap().attempts.iter().any(|attempt| attempt.task.as_str() == task && attempt.retains_capacity())
+     }
+-}
++    #[test]
++    fn review_probe_signed_contract_dependency_is_enforced() {
++        let (_root, project) = world(2, &[
++            Spec { id: "early", priority: 10, age_ms: 0, paths: &[], named: &[] },
++            Spec { id: "late", priority: 0, age_ms: 0, paths: &[], named: &[] },
++        ]);
++        let path = project.join(".state/state.db");
++        let raw = rusqlite::Connection::open(&path).unwrap();
++        let bytes: Vec<u8> = raw.query_row("SELECT raw_bytes FROM task_contracts WHERE task_id='early'", [], |r|r.get(0)).unwrap();
++        let mut doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
++        let mut db = SqliteStore::open(&path).unwrap();
++        doc["contract_revision"] = 2.into();
++        doc["expected_head"] = db.current_head().unwrap().into();
++        doc["dependencies"] = serde_json::json!([{"predecessor":"late", "edge":"verified_result", "policy_id":"builds"}]);
++        let prepared = PreparedContract::parse_verified(&serde_json::to_vec(&doc).unwrap()).unwrap();
++        db.install_contract(&prepared).unwrap();
++        assert_eq!(raw.query_row("SELECT count(*) FROM verified_results",[],|r|r.get::<_,i64>(0)).unwrap(),0);
++        let selected = grant_and_admit(&project);
++        assert_ne!(selected.as_deref(), Some("early"), "reserved a task whose signed predecessor has no verified result");
++    }
++
++}
+--- a/src/store/plans.rs
++++ b/src/store/plans.rs
+@@ -2192,4 +2192,24 @@
+             .unwrap();
+         assert_eq!(live, ("claimed".into(), 1, "active".into()));
+     }
+-}
++    #[test]
++    fn review_probe_wait_survives_poll_before_wake() {
++        let (_temp, mut db) = fixture();
++        seed_task(&mut db, "task");
++        let wait = db.register_wait("task", None, "dependency_evidence").unwrap();
++        assert!(!db.replay_wait(&wait.wait_id).unwrap().wake_requested);
++        db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake',?1,1,1,'{}')", [&wait.wait_id]).unwrap();
++        assert!(db.replay_wait(&wait.wait_id).unwrap().wake_requested, "matching wake arriving after first poll was lost");
++    }
++    #[test]
++    fn review_probe_wait_does_not_consume_another_tasks_wake() {
++        let (_temp, mut db) = fixture();
++        seed_task(&mut db, "one");
++        seed_task(&mut db, "two");
++        let one = db.register_wait("one", None, "dependency_evidence").unwrap();
++        let two = db.register_wait("two", None, "dependency_evidence").unwrap();
++        db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake',?1,1,1,'{}')", [&two.wait_id]).unwrap();
++        assert!(!db.replay_wait(&one.wait_id).unwrap().wake_requested, "unrelated wait woke this task");
++    }
++
++}
+--- a/src/verification/tests.rs
++++ b/src/verification/tests.rs
+@@ -720,3 +720,92 @@
+     }
+     Ok(())
+ }
++
++#[test]
++fn review_probe_sha256_retained_checkout() {
++    let world = world(false);
++    fs::remove_dir_all(world.repo.join(".git")).unwrap();
++    git(&world.repo, &["init", "--object-format=sha256"]);
++    git(&world.repo, &["add", "src/file.txt"]);
++    git(&world.repo, &["commit", "-m", "sha256"]);
++    let output=Command::new("/usr/bin/git").args(["rev-parse","HEAD"]).current_dir(&world.repo).output().unwrap();
++    let oid=String::from_utf8(output.stdout).unwrap().trim().to_string();
++    assert_eq!(oid.len(),64);
++    let objects = loose_objects(&world.repo).into_iter().map(|(oid,relative_path,bytes)|crate::store::verification::RetainedObject{oid,relative_path,bytes}).collect::<Vec<_>>();
++    let checkout=super::checkout::materialize(&world.work,&world.db_path,&objects,&oid);
++    assert!(checkout.is_ok(), "valid retained SHA256 objects failed: {:?}", checkout.err());
++}
++
++fn review_install_two_policies(world: &World, policy_body: &str) -> (String, String) {
++    let db_path = world.db_path.canonicalize().unwrap();
++    let repo = world.repo.canonicalize().unwrap();
++    let mut bytes = serde_json::to_vec(&serde_json::json!({
++        "version": 1,
++        "project_store": db_path,
++        "expected_head": world.head,
++        "task_id": world.task.as_str(),
++        "contract_revision": 1,
++        "deliverable": "verified checkout",
++        "non_goals": "no dependency release",
++        "acceptance_policies": [{"id": "builds", "text": policy_body}, {"id":"required-tests", "text": "{\"version\":1,\"checks\":[\"/usr/bin/git\",\"rev-parse\",\"--verify\",\"refs/heads/missing\"]}"}],
++        "repository": repo,
++        "base_oid": world.oid,
++        "object_format": "sha1",
++        "dependencies": [],
++        "capability_flags": [],
++        "profile_kind": "codex",
++        "retry_class": "none",
++        "result_schema_id": "result-v1",
++        "route": "verify_only",
++        "authority": {"id": "owner-approval-policy", "revision": 1, "digest": "ab".repeat(32)}
++    }))
++    .unwrap();
++    bytes.push(b'\n');
++    let mut db = SqliteStore::open(&world.db_path).unwrap();
++    let prepared = PreparedContract::parse_verified(&bytes).unwrap();
++    let installed = db.install_contract(&prepared).unwrap();
++    let objects = loose_objects(&repo);
++    assert!(objects.iter().any(|(oid, _, _)| oid == &world.oid));
++    let submission = serde_json::json!({
++        "idempotency_key": "submit-1",
++        "task_id": world.task.as_str(),
++        "contract_revision": 1,
++        "contract_digest": installed.digest,
++        "attempt_id": world.attempt.as_str(),
++        "repository": repo,
++        "base_oid": world.oid,
++        "candidate_oid": world.oid,
++        "object_format": "sha1",
++        "artifact_manifest": [{"path": "src/file.txt", "oid": world.oid}],
++        "claimed_checks": ["ignored"],
++        "objects": objects.iter().map(|(oid, relative, _)| serde_json::json!({"oid": oid, "relative_path": relative})).collect::<Vec<_>>()
++    });
++    let receipt = db
++        .submit_result(&serde_json::to_vec(&submission).unwrap())
++        .unwrap();
++    (receipt.submission_id, installed.digest)
++}
++
++#[test]
++fn review_probe_dependency_requires_selected_acceptance_policy() {
++    let mut world = world(false);
++    let mut db = SqliteStore::open(&world.db_path).unwrap();
++    db.commit(Commit{expected_head:world.head, mutations:vec![Mutation::Task{expected:None,next:Task{id:TaskId::new("consumer").unwrap(),revision:1,state:TaskState::Draft,title:"consumer".into(),active_attempt:None}}]}).unwrap();
++    db.queue_task(&TaskId::new("consumer").unwrap(),1,db.current_head().unwrap(),&QueueRequest{priority:0,dependencies:vec![Dependency{predecessor:world.task.clone(),requirement:DependencyRequirement::VerifiedResult}]},0).unwrap();
++    world.head=db.current_head().unwrap();
++    let policy=git_diff_policy(&world.work.join("checkout"));
++    let (submission, _) = review_install_two_policies(&world,&policy);
++    let raw=rusqlite::Connection::open(&world.db_path).unwrap();
++    let bytes:Vec<u8>=raw.query_row("SELECT raw_bytes FROM task_contracts WHERE task_id='task'",[],|r|r.get(0)).unwrap();
++    let mut contract:serde_json::Value=serde_json::from_slice(&bytes).unwrap();
++    contract["task_id"]="consumer".into();
++    contract["expected_head"]=db.current_head().unwrap().into();
++    contract["dependencies"]=serde_json::json!([{"predecessor":"task","edge":"verified_result","policy_id":"required-tests"}]);
++    db.install_contract(&PreparedContract::parse_verified(&serde_json::to_vec(&contract).unwrap()).unwrap()).unwrap();
++    let mut req=request(&world,&policy,Duration::from_secs(10));
++    req.submission_id=submission;
++    let outcome=verify(&mut db,&req).unwrap();
++    assert_eq!(outcome.state,"accepted", "{:?}",outcome.reason);
++    let rows:i64=raw.query_row("SELECT count(*) FROM dependency_satisfactions WHERE task_id='consumer' AND state='valid'",[],|r|r.get(0)).unwrap();
++    assert_eq!(rows,0,"dependency released after builds passed, though required-tests never ran");
++}

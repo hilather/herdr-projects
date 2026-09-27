@@ -211,6 +211,7 @@ fn parse_submission(raw: &[u8]) -> Result<ParsedSubmission> {
 }
 
 struct ContractRow {
+    required_outputs: Vec<String>,
     raw_digest: String,
     repository: String,
     base_oid: String,
@@ -230,7 +231,9 @@ fn load_contract(db: &Connection, task: &str, revision: u64) -> Result<ContractR
     if sha256_hex(&raw) != digest {
         return Err(StoreError::Corrupt("task contract digest mismatch".into()));
     }
+    let required_outputs = PreparedContract::parse_verified(&raw).map_err(|error| invalid(&error))?.required_outputs;
     Ok(ContractRow {
+        required_outputs,
         raw_digest: digest,
         repository,
         base_oid,
@@ -639,6 +642,7 @@ impl SqliteStore {
         {
             return Err(StoreError::UnsupportedSchema(version));
         }
+        super::contract_binding::validate_dependency_graph(&tx, &parsed)?;
         tx.execute(
             "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('contract.installed',?1,?2,1,?3)",
             params![parsed.task_id.as_str(), integer(parsed.contract_revision)?, serde_json::json!({"digest": parsed.digest, "route": parsed.route.as_str()}).to_string()],
@@ -682,6 +686,9 @@ impl SqliteStore {
                     params![parsed.task_id.as_str(), integer(parsed.contract_revision)?, integer((64 + index) as u64)?, resource.name.as_str(), resource.access.as_str()],
                 )?;
             }
+        }
+        if version >= 30 {
+            super::satisfaction::attach_stored_receipts(&tx, parsed.task_id.as_str())?;
         }
         tx.commit()?;
         Ok(ContractInstall {
@@ -887,12 +894,19 @@ fn check_submission(db: &Connection, submission: &ParsedSubmission) -> Result<()
     if contract.raw_digest != submission.contract_digest {
         return Err(invalid("changed contract bytes"));
     }
+    super::contract_binding::require_result_barrier(db, submission.task_id.as_str(), submission.contract_revision,
+        &submission.contract_digest, submission.attempt_id.as_str(), jiff::Timestamp::now().as_millisecond())?;
     if contract.repository != submission.repository
         || contract.base_oid != submission.base_oid
         || contract.object_format != submission.object_format.as_str()
         || contract.memory_snapshot_id != submission.memory_snapshot_id
     {
         return Err(invalid("result does not match the installed contract"));
+    }
+    let manifest: Vec<UntrustedArtifact> = serde_json::from_str(&submission.artifact_manifest)
+        .map_err(|_| invalid("invalid retained artifact manifest"))?;
+    if contract.required_outputs.iter().any(|output| !manifest.iter().any(|artifact| &artifact.path == output)) {
+        return Err(invalid("result manifest omits a required output"));
     }
     let canonical = fs::canonicalize(&submission.repository)
         .map_err(|_| invalid("result repository is unavailable"))?;
@@ -966,14 +980,14 @@ mod tests {
         let fresh = tempfile::tempdir().unwrap();
         let fresh_path = fresh.path().join("state.db");
         let mut created = SqliteStore::create(&fresh_path).unwrap();
-        assert_eq!(user_version(&created.connection), 41);
+        assert_eq!(user_version(&created.connection), crate::store::SCHEMA);
         assert_eq!(
             created
                 .connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            41
+            crate::store::SCHEMA
         );
         created.import_legacy(&"ab".repeat(32), &[], &[]).unwrap();
         drop(created);
@@ -999,7 +1013,7 @@ mod tests {
         let before = task_row(&db.connection);
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
-        raw.execute_batch("DROP INDEX IF EXISTS attempts_retained_by_id; DROP TABLE IF EXISTS active_work_index; DROP TABLE IF EXISTS active_work_meta; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_update; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_delete; DROP TRIGGER IF EXISTS barrier_members_no_update; DROP TRIGGER IF EXISTS barrier_members_no_delete; DROP TRIGGER IF EXISTS barrier_revisions_no_membership_update; DROP TABLE IF EXISTS barrier_stale_briefs; DROP TABLE IF EXISTS barrier_members; DROP TABLE IF EXISTS barrier_revisions; DROP TRIGGER IF EXISTS memory_change_receipts_no_update; DROP TRIGGER IF EXISTS memory_change_receipts_no_delete; DROP TRIGGER IF EXISTS update_package_members_no_update; DROP TRIGGER IF EXISTS update_package_members_no_delete; DROP TRIGGER IF EXISTS update_packages_no_update; DROP TRIGGER IF EXISTS update_packages_no_delete; DROP TABLE IF EXISTS memory_change_receipts; DROP TABLE IF EXISTS update_package_members; ALTER TABLE consumer_bindings DROP COLUMN applied_cursor; DROP TABLE IF EXISTS update_packages; DROP TRIGGER IF EXISTS memory_read_set_on_record; DROP TRIGGER IF EXISTS memory_read_set_on_reclassify; DROP TRIGGER IF EXISTS memory_read_set_on_revision; DROP TRIGGER IF EXISTS memory_read_set_on_validity; DROP TRIGGER IF EXISTS memory_read_set_on_head; DROP TABLE IF EXISTS memory_scope_catalog; DROP TABLE IF EXISTS memory_required_generation; DROP TABLE IF EXISTS consumer_binding_undeliverable; DROP TABLE IF EXISTS consumer_binding_obligations; DROP TABLE IF EXISTS consumer_bindings; DROP TABLE IF EXISTS wait_replay_events; DROP TABLE IF EXISTS replan_requests; DROP TABLE IF EXISTS replan_budget_resets; DROP TABLE IF EXISTS attempt_infrastructure_retries; DROP TABLE IF EXISTS wait_conditions; DROP TABLE IF EXISTS resource_claims; DROP TABLE IF EXISTS delegation_stop_obligations; DROP TABLE IF EXISTS delegation_revocations; DROP TABLE IF EXISTS delegation_grants; DROP TABLE IF EXISTS capability_evidence; DROP TABLE IF EXISTS contract_named_resources; DROP TABLE IF EXISTS contract_scope_paths; DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; DROP TABLE IF EXISTS dependency_satisfactions; DROP TABLE IF EXISTS factory_admission_policies; ALTER TABLE project_control DROP COLUMN factory_admission; DROP TABLE IF EXISTS feedback_claims; DROP TABLE IF EXISTS feedback_items; DROP TABLE IF EXISTS integrated_commits; DROP TABLE IF EXISTS integration_candidates; DROP TABLE IF EXISTS integration_operations; DROP TABLE IF EXISTS integration_target_leases; DROP TABLE IF EXISTS integration_targets; DROP TABLE IF EXISTS verified_results; DROP TABLE IF EXISTS verification_runs; DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; UPDATE store_meta SET schema_version=25; PRAGMA user_version=25;").unwrap();
+        crate::store::test_schema::historical(&raw, 25).unwrap();
         drop(raw);
         let mut db = SqliteStore::open(&path).unwrap();
         assert_eq!(user_version(&db.connection), 25);
@@ -1011,20 +1025,20 @@ mod tests {
         ));
         assert_eq!(task_row(&db.connection), before);
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 41);
+        assert_eq!(user_version(&db.connection), crate::store::SCHEMA);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            41
+            crate::store::SCHEMA
         );
         assert!(table_exists(&db.connection, "task_contracts"));
         assert!(table_exists(&db.connection, "result_submissions"));
         assert_eq!(task_row(&db.connection), before);
         check_schema(&db.connection).unwrap();
         let snapshot = db.read_snapshot(None).unwrap();
-        assert_eq!(snapshot.schema_version, 41);
+        assert_eq!(snapshot.schema_version, crate::store::SCHEMA);
         assert_eq!(snapshot.tasks.len(), 1);
         assert_eq!(snapshot.tasks[0].title, "do not rewrite");
         drop(db);
@@ -1616,14 +1630,14 @@ mod tests {
     fn upgrade_v1_from_31_to_32_and_create_end_at_user_version_32() {
         let fresh = tempfile::tempdir().unwrap();
         let mut created = SqliteStore::create(&fresh.path().join("state.db")).unwrap();
-        assert_eq!(user_version(&created.connection), 41);
+        assert_eq!(user_version(&created.connection), crate::store::SCHEMA);
         assert_eq!(
             created
                 .connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            41
+            crate::store::SCHEMA
         );
         assert!(table_exists(&created.connection, "contract_scope_paths"));
         assert!(table_exists(
@@ -1638,9 +1652,7 @@ mod tests {
         let db = SqliteStore::create(&path).unwrap();
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
-        raw.execute_batch(
-            "DROP INDEX IF EXISTS attempts_retained_by_id; DROP TABLE IF EXISTS active_work_index; DROP TABLE IF EXISTS active_work_meta; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_update; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_delete; DROP TRIGGER IF EXISTS barrier_members_no_update; DROP TRIGGER IF EXISTS barrier_members_no_delete; DROP TRIGGER IF EXISTS barrier_revisions_no_membership_update; DROP TABLE IF EXISTS barrier_stale_briefs; DROP TABLE IF EXISTS barrier_members; DROP TABLE IF EXISTS barrier_revisions; DROP TRIGGER IF EXISTS memory_change_receipts_no_update; DROP TRIGGER IF EXISTS memory_change_receipts_no_delete; DROP TRIGGER IF EXISTS update_package_members_no_update; DROP TRIGGER IF EXISTS update_package_members_no_delete; DROP TRIGGER IF EXISTS update_packages_no_update; DROP TRIGGER IF EXISTS update_packages_no_delete; DROP TABLE IF EXISTS memory_change_receipts; DROP TABLE IF EXISTS update_package_members; ALTER TABLE consumer_bindings DROP COLUMN applied_cursor; DROP TABLE IF EXISTS update_packages; DROP TRIGGER IF EXISTS memory_read_set_on_record; DROP TRIGGER IF EXISTS memory_read_set_on_reclassify; DROP TRIGGER IF EXISTS memory_read_set_on_revision; DROP TRIGGER IF EXISTS memory_read_set_on_validity; DROP TRIGGER IF EXISTS memory_read_set_on_head; DROP TABLE IF EXISTS memory_scope_catalog; DROP TABLE IF EXISTS memory_required_generation; DROP TABLE IF EXISTS consumer_binding_undeliverable; DROP TABLE IF EXISTS consumer_binding_obligations; DROP TABLE IF EXISTS consumer_bindings; DROP TABLE IF EXISTS wait_replay_events; DROP TABLE IF EXISTS replan_requests; DROP TABLE IF EXISTS replan_budget_resets; DROP TABLE IF EXISTS attempt_infrastructure_retries; DROP TABLE IF EXISTS wait_conditions; DROP TABLE IF EXISTS resource_claims; DROP TABLE IF EXISTS delegation_stop_obligations; DROP TABLE IF EXISTS delegation_revocations; DROP TABLE IF EXISTS delegation_grants; DROP TABLE IF EXISTS capability_evidence; DROP TABLE IF EXISTS contract_named_resources; DROP TABLE IF EXISTS contract_scope_paths; UPDATE store_meta SET schema_version=31; PRAGMA user_version=31;",
-        )
+        crate::store::test_schema::historical(&raw, 31)
         .unwrap();
         drop(raw);
         let mut db = SqliteStore::open(&path).unwrap();
@@ -1654,13 +1666,13 @@ mod tests {
         assert_eq!(user_version(&db.connection), 31);
         assert!(!table_exists(&db.connection, "contract_scope_paths"));
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 41);
+        assert_eq!(user_version(&db.connection), crate::store::SCHEMA);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            41
+            crate::store::SCHEMA
         );
         assert!(table_exists(&db.connection, "contract_scope_paths"));
         assert!(table_exists(&db.connection, "contract_named_resources"));
@@ -1679,7 +1691,7 @@ mod tests {
         db.import_legacy(&"cd".repeat(32), &[], &[]).unwrap();
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 41);
+        assert_eq!(user_version(&reopened.connection), crate::store::SCHEMA);
         assert!(table_exists(&reopened.connection, "contract_scope_paths"));
     }
 }

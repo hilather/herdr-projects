@@ -1,0 +1,90 @@
+
+running 5 tests
+test admission::tests::review_probe_signed_contract_dependency_is_enforced ... 
+thread 'admission::tests::review_probe_signed_contract_dependency_is_enforced' (10) panicked at src/admission.rs:792:9:
+assertion `left != right` failed: reserved a task whose signed predecessor has no verified result
+  left: Some("early")
+ right: Some("early")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test store::plans::tests::review_probe_wait_does_not_consume_another_tasks_wake ... 
+thread 'store::plans::tests::review_probe_wait_does_not_consume_another_tasks_wake' (21) panicked at src/store/plans.rs:2212:9:
+unrelated wait woke this task
+FAILED
+test store::plans::tests::review_probe_wait_survives_poll_before_wake ... 
+thread 'store::plans::tests::review_probe_wait_survives_poll_before_wake' (22) panicked at src/store/plans.rs:2202:9:
+matching wake arriving after first poll was lost
+FAILED
+test verification::tests::review_probe_dependency_requires_selected_acceptance_policy ... hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmpWI2GD8/repo/.git/
+[master (root-commit) 42082b6] first
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/file.txt
+
+thread 'verification::tests::review_probe_dependency_requires_selected_acceptance_policy' (23) panicked at src/verification/tests.rs:810:5:
+assertion `left == right` failed: dependency released after builds passed, though required-tests never ran
+  left: 1
+ right: 0
+FAILED
+test verification::tests::review_probe_sha256_retained_checkout ... hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmpIo6EdN/repo/.git/
+[master (root-commit) 42082b6] first
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/file.txt
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmpIo6EdN/repo/.git/
+[master (root-commit) 6d3eda0] sha256
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/file.txt
+
+thread 'verification::tests::review_probe_sha256_retained_checkout' (51) panicked at src/verification/tests.rs:736:5:
+valid retained SHA256 objects failed: Some(git checkout failed: fatal: git checkout: --detach does not take a path argument '6d3eda0980f6cd38cffbaccc17bfd021ed2fb82604bbf65dd828bd2211d7c81b')
+FAILED
+
+failures:
+
+failures:
+    admission::tests::review_probe_signed_contract_dependency_is_enforced
+    store::plans::tests::review_probe_wait_does_not_consume_another_tasks_wake
+    store::plans::tests::review_probe_wait_survives_poll_before_wake
+    verification::tests::review_probe_dependency_requires_selected_acceptance_policy
+    verification::tests::review_probe_sha256_retained_checkout
+
+test result: FAILED. 0 passed; 5 failed; 0 ignored; 0 measured; 620 filtered out; finished in 0.50s
+

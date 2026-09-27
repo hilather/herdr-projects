@@ -49,11 +49,6 @@ fn binding_current(db:&Connection,id:&OperationId,admission:bool)->Result<bool> 
     let control=super::control::read(db)?;
     Ok(control.revision==expected && (!admission || (control.state==ProjectState::Active&&!control.reconciliation_required)))
 }
-fn payload_valid(db:&Connection,id:&OperationId)->Result<()> {
-    let (payload,hash):(String,String)=db.query_row("SELECT payload,payload_hash FROM operations WHERE id=?1",[id.as_str()],|r|Ok((r.get(0)?,r.get(1)?)))?;
-    if format!("{:x}",Sha256::digest(payload.as_bytes()))!=hash {return Err(StoreError::Corrupt("operation payload hash mismatch".into()));}
-    Ok(())
-}
 pub(super) fn update_outcome(tx:&Connection,old:&Delivery,outcome:&Outcome,now:i64,actor:&str)->Result<Delivery> {
     text(outcome.evidence())?;
     // A caller-written string is not a worker identity or a termination receipt.
@@ -91,12 +86,16 @@ impl SqliteStore {
         self.claim_with_creation(id,expected,owner,now,lease_ms,None)
     }
     pub(super) fn claim_with_creation(&mut self,id:&OperationId,expected:u64,owner:&str,now:i64,lease_ms:i64,creation:Option<LaunchPreparation<'_>>)->Result<Claim> {
+        self.claim_with_creation_budget(id,expected,owner,now,lease_ms,creation,None)
+    }
+    pub(super) fn claim_with_creation_budget(&mut self,id:&OperationId,expected:u64,owner:&str,now:i64,lease_ms:i64,creation:Option<LaunchPreparation<'_>>,budget:Option<&read_budget::ReadBudget>)->Result<Claim> {
+        if let Some(budget)=budget {budget.check()?;}
         text(owner)?;now_check(now)?;
         if !(1..=300_000).contains(&lease_ms) { return Err(StoreError::Invalid("lease must be 1..300000 ms".into())); }
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;check_schema(&tx)?;
-        let old=delivery(&tx,id)?;
+        let old=delivery_with_budget(&tx,id,budget)?;
         if old.revision!=expected || old.state!=DeliveryState::Pending || old.next_due_ms>now || old.attempts>=32 { return Err(StoreError::Conflict); }
-        payload_valid(&tx,id)?;
+        read_operation_with_budget(&tx,id,budget)?;
         if !binding_current(&tx,id,true)? {return Err(StoreError::Conflict);}
         let revision=increment(old.revision)?;let epoch=increment(old.epoch)?;let until=now+lease_ms;
         let kind:String=tx.query_row("SELECT kind FROM operations WHERE id=?1",[id.as_str()],|r|r.get(0))?;
@@ -104,11 +103,11 @@ impl SqliteStore {
             // Claim history itself forbids replay, independently of approval
             // uniqueness or a later caller's assertion that nothing happened.
             if old.attempts!=0 || old.epoch!=0 {return Err(StoreError::Conflict);}
-            super::approvals::consume(&tx,id,revision,epoch,now)?;
+            super::approvals::consume_with_budget(&tx,id,revision,epoch,now,budget)?;
         }
         if kind=="runtime.worker_brief" {
             if old.attempts!=0 || old.epoch!=0 {return Err(StoreError::Conflict);}
-            super::worker_brief::check(&tx,id,now)?;
+            super::worker_brief::check_with_budget(&tx,id,now,budget)?;
         }
         if kind=="routine.run" {
             // No automatic or generic reconciliation retry can replay a script
@@ -126,12 +125,13 @@ impl SqliteStore {
             #[cfg(test)]
             super::reservations::tests::crash_boundary("creation_before_intent");
             match prepared {
-                LaunchPreparation::Native(p)=>{super::launch::record_creation(&tx,&claim,p,now)?;}
-                LaunchPreparation::Worktrees(p)=>{super::worktrees::record_creation(&tx,&claim,p,now)?;}
+                LaunchPreparation::Native(p)=>{super::launch::record_creation(&tx,&claim,p,now,budget)?;}
+                LaunchPreparation::Worktrees(p)=>{super::worktrees::record_creation(&tx,&claim,p,now,budget)?;}
             }
             #[cfg(test)]
             super::reservations::tests::crash_boundary("creation_before_commit");
         }
+        if let Some(budget)=budget {budget.check()?;}
         tx.commit()?;
         #[cfg(test)]
         if has_creation {super::reservations::tests::crash_boundary("creation_after_commit");}
@@ -140,16 +140,21 @@ impl SqliteStore {
     /// Last pre-effect fence; callers must separately retain exclusive external
     /// ownership. SQLite fencing cannot retract an effect after this check.
     pub fn validate_claim(&mut self,claim:&Claim,now:i64)->Result<()> {
+        self.validate_claim_with_budget(claim,now,None)
+    }
+    pub(super) fn validate_claim_with_budget(&mut self,claim:&Claim,now:i64,budget:Option<&read_budget::ReadBudget>)->Result<()> {
+        if let Some(budget)=budget {budget.check()?;}
         now_check(now)?;
         let tx=self.connection.transaction()?;check_schema(&tx)?;
-        let old=delivery(&tx,&claim.operation)?;
+        let old=delivery_with_budget(&tx,&claim.operation,budget)?;
         if old.state!=DeliveryState::Claimed || old.revision!=claim.revision || old.epoch!=claim.epoch || old.owner.as_deref()!=Some(&claim.owner) || old.lease_until_ms!=Some(claim.lease_until_ms) || now>=claim.lease_until_ms {return Err(StoreError::Conflict);}
-        payload_valid(&tx,&claim.operation)?;
+        read_operation_with_budget(&tx,&claim.operation,budget)?;
         if !binding_current(&tx,&claim.operation,true)? {return Err(StoreError::Conflict);}
         let kind:String=tx.query_row("SELECT kind FROM operations WHERE id=?1",[claim.operation.as_str()],|r|r.get(0))?;
-        if kind=="runtime.launch" {super::approvals::validate_use(&tx,claim,now)?;}
-        if kind=="runtime.worker_brief" {super::worker_brief::check(&tx,&claim.operation,now)?;}
+        if kind=="runtime.launch" {super::approvals::validate_use_with_budget(&tx,claim,now,budget)?;}
+        if kind=="runtime.worker_brief" {super::worker_brief::check_with_budget(&tx,&claim.operation,now,budget)?;}
         if kind=="routine.run" {super::routines::check(&tx,&claim.operation)?;}
+        if let Some(budget)=budget {budget.check()?;}
         tx.commit()?;Ok(())
     }
     /// Rechecks owner, epoch, revision and lease in the outcome transaction.

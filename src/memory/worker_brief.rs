@@ -82,17 +82,7 @@ pub fn render_attempt_brief(project: &Path, attempt: &str) -> Result<WorkerBrief
     compose_knowledge(knowledge)
 }
 
-pub(crate) fn render_attempt_brief_held(
-    project: &Path,
-    attempt: &str,
-    db: &mut crate::store::SqliteStore,
-) -> Result<WorkerBrief> {
-    compose_knowledge(super::import::render_attempt_knowledge_held(
-        project, attempt, db,
-    )?)
-}
-
-fn compose_knowledge(knowledge: serde_json::Value) -> Result<WorkerBrief> {
+pub(crate) fn compose_knowledge(knowledge: serde_json::Value) -> Result<WorkerBrief> {
     ensure!(knowledge["estimator"].as_str()==Some(WORKER_BRIEF_ESTIMATOR),"worker snapshot uses an older output contract; prepare a new worker snapshot and approved attempt");
     compose(
         knowledge["attempt_id"]
@@ -135,57 +125,11 @@ pub(crate) fn enqueue_attempt_brief_controlled(
     deadline: std::time::Instant,
     cancellation: crate::runner::Cancellation,
 ) -> Result<crate::domain::Operation> {
-    use crate::domain::{PreparedWorkerBrief, WorkerBriefIntent};
-    let check = || -> Result<()> {
-        ensure!(
-            !cancellation.is_cancelled() && std::time::Instant::now() < deadline,
-            "worker brief preparation cancelled or expired"
-        );
-        Ok(())
-    };
-    check()?;
-    let _guard = super::mutation_guard(project)?;
-    let mut db = crate::migration::open_active(project)?;
-    let brief = render_attempt_brief_held(project, attempt, &mut db)?;
-    let state = db.read_snapshot(Some(expected_head))?;
-    let record = state
-        .attempt_inputs
-        .iter()
-        .find(|r| r.attempt.as_str() == attempt)
-        .context("sealed attempt missing")?;
-    let binding = state
-        .runtime_bindings
-        .iter()
-        .find(|b| b.id == record.inputs.binding)
-        .context("worker binding missing")?;
-    let ownership = state
-        .ownership
-        .iter()
-        .find(|o| o.binding == binding.id)
-        .context("worker ownership missing")?;
-    ensure!(
-        record.inputs.memory.as_ref().map(|r| r.id.as_str()) == Some(brief.snapshot_id.as_str()),
-        "rendered brief knowledge changed"
-    );
-    let prepared = PreparedWorkerBrief {
-        intent: WorkerBriefIntent {
-            version: 1,
-            attempt: record.attempt.clone(),
-            launch: record.operation.clone(),
-            binding: binding.id.clone(),
-            binding_revision: binding.revision,
-            ownership_revision: ownership.revision,
-            knowledge: record.inputs.memory.clone(),
-            prompt_digest: brief.prompt_digest,
-            prompt_chars: brief.prompt_chars,
-        },
-    };
-    check()?;
-    Ok(db.enqueue_worker_brief(
-        &prepared,
-        expected_head,
-        jiff::Timestamp::now().as_millisecond(),
-    )?)
+    let control=crate::store::controlled::ReadControl::new(deadline,cancellation);
+    control.check()?;
+    let _guard=super::mutation_guard(project)?;
+    let mut db=crate::migration::open_active_scoped(project,control)?;
+    db.prepare_worker_brief(project,attempt,expected_head)
 }
 
 #[cfg(test)]

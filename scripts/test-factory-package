@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+# Disposable package acceptance probes; no live workers or actual project stores.
+import hashlib,json,os,subprocess,sys,tempfile
+from pathlib import Path
+if len(sys.argv)!=4:
+ raise SystemExit('usage: scripts/test-factory-package PACKAGE_DIRECTORY PRIOR_BINARY PRIOR_SHA256')
+repo=Path(__file__).resolve().parent.parent
+package=Path(sys.argv[1]).resolve();binary=package/'herdr-projects'
+legacy=Path(sys.argv[2]).resolve();prior=sys.argv[3]
+assert hashlib.sha256(legacy.read_bytes()).hexdigest()==prior
+subprocess.run(['sha256sum','-c','SHA256SUMS'],cwd=package,check=True,capture_output=True)
+with tempfile.TemporaryDirectory(prefix='factory-package-check-') as directory:
+ temp=Path(directory);root=temp/'projects';env={'HOME':str(temp),'PATH':os.defpath}
+ def run(exe,*args,environment=None):
+  return subprocess.run([str(exe),*args],env=environment or env,text=True,capture_output=True)
+ info=run(binary,'build-info','--require-factory');assert info.returncode==0,info.stderr
+ value=json.loads(info.stdout);assert value['state_store'] and isinstance(value['schema'],int) and value['schema']>0
+ created=run(binary,'--root',str(root),'new','package-probe');assert created.returncode==0,created.stderr
+ def contents(): return {str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}
+ before=contents();readonly=run(binary,'--root',str(root),'build-info','--require-factory');assert readonly.returncode==0
+ assert contents()==before
+ listed=run(legacy,'--root',str(root),'list');assert listed.returncode==0 and 'package-probe' in listed.stdout,(listed.stdout,listed.stderr)
+ assert not (root/'package-probe/.state/state.db').exists()
+ shim=temp/'old-sqlite.c';shim.write_text('int sqlite3_libversion_number(void) { return 3053003; }\nconst char *sqlite3_libversion(void) { return "3.53.3-fixture"; }\n')
+ lib=temp/'old-sqlite.so';subprocess.run(['cc','-shared','-fPIC',str(shim),'-o',str(lib)],check=True,capture_output=True)
+ old=run(binary,'build-info','--require-factory',environment={**env,'LD_PRELOAD':str(lib)})
+ assert old.returncode!=0 and 'SQLite 3.53.4' in old.stderr,(old.stdout,old.stderr)
+ assert json.loads(old.stdout)['sqlite']['compatible'] is False
+ mock=temp/'mock-bin';mock.mkdir();uname=mock/'uname';uname.write_text('#!/bin/sh\nprintf "Darwin\\n"\n');uname.chmod(0o755)
+ unsupported=run(repo/'scripts/build-factory',environment={**env,'PATH':str(mock)+':'+os.defpath})
+ assert unsupported.returncode!=0 and 'require Linux' in unsupported.stderr
+ record={'package_path':str(package),'build_info':value,'legacy_binary_sha256_before':prior,'legacy_binary_sha256_after':hashlib.sha256(legacy.read_bytes()).hexdigest(),'package_checksums_verified':True,'legacy_project_readable_by_prior_binary':True,'build_info_preserves_legacy_bytes':True,'legacy_store_not_migrated':True,'unsupported_sqlite_probe':{'method':'LD_PRELOAD version-function fixture; not an installation of old SQLite','stdout':json.loads(old.stdout),'exit_code':old.returncode,'stderr':old.stderr.strip()},'unsupported_platform_preflight':{'method':'mock uname=Darwin; no macOS execution','exit_code':unsupported.returncode,'stderr':unsupported.stderr.strip()}}
+ print(json.dumps(record,indent=2,sort_keys=True))

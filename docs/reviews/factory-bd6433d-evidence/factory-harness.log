@@ -1,0 +1,45 @@
+
+running 10 tests
+test fault_campaign_and_restore_rehearsal ... Signing file /tmp/.tmpx0nLbd/bad-contract.json
+Write signature to /tmp/.tmpx0nLbd/bad-contract.json.sig
+ok
+test memory_barrier_edit_invalidates_the_release_token ... ok
+test memory_gate_doc_is_a_simulator ... ok
+test memory_package_gap_and_coordinator_ack_without_an_attempt ... Signing file /tmp/.tmpHsuRZw/mp-pkg-a.json
+Write signature to /tmp/.tmpHsuRZw/mp-pkg-a.json.sig
+Signing file /tmp/.tmpHsuRZw/mp-pkg-b.json
+Write signature to /tmp/.tmpHsuRZw/mp-pkg-b.json.sig
+ok
+test memory_retired_subscription_keeps_the_pending_obligation ... Signing file /tmp/.tmppCOv0y/mp-note-1.json
+Write signature to /tmp/.tmppCOv0y/mp-note-1.json.sig
+Signing file /tmp/.tmppCOv0y/mp-note-2.json
+Write signature to /tmp/.tmppCOv0y/mp-note-2.json.sig
+ok
+test memory_two_domains_promote_and_same_head_conflicts ... Signing file /tmp/.tmpY8N8rZ/mp-api.json
+Write signature to /tmp/.tmpY8N8rZ/mp-api.json.sig
+Signing file /tmp/.tmpY8N8rZ/mp-ui.json
+Write signature to /tmp/.tmpY8N8rZ/mp-ui.json.sig
+Signing file /tmp/.tmpY8N8rZ/mp-same-a.json
+Write signature to /tmp/.tmpY8N8rZ/mp-same-a.json.sig
+ok
+test planning_gate_ten_logical_workers ... ok
+test same_seed_repeats_the_decision_log_without_a_latency_bar ... FAILED
+test scale_gate_for_32_and_64_workers ... ok
+test vertical_slice ... ok
+
+failures:
+
+---- same_seed_repeats_the_decision_log_without_a_latency_bar stdout ----
+
+thread 'same_seed_repeats_the_decision_log_without_a_latency_bar' (189) panicked at tests/factory_harness.rs:525:5:
+assertion `left == right` failed
+  left: 41
+ right: 26
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    same_seed_repeats_the_decision_log_without_a_latency_bar
+
+test result: FAILED. 9 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.14s
+

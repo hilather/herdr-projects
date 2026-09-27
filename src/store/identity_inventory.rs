@@ -3,12 +3,15 @@ use super::*;
 use anyhow::{Result,ensure};
 use std::time::Instant;
 use crate::runner::Cancellation;
+use super::runtime::BindingSelection;
 
-pub struct Budget {pub deadline:Instant,pub cancellation:Cancellation,remaining:usize,records:usize,used:usize}
+pub struct Budget {pub deadline:Instant,pub cancellation:Cancellation,remaining:usize,records:usize,used:usize,
+    #[cfg(test)] pub(crate) sql_steps:Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+}
 impl Budget {
     pub fn new(bytes:usize,records:usize,deadline:Instant,cancellation:Cancellation)->Result<Self> {
         ensure!(bytes<=50*1024*1024&&records<=1024,"identity budget exceeds supported bounds");
-        let budget=Self{deadline:deadline.min(Instant::now()+Duration::from_secs(10)),cancellation,remaining:bytes,records,used:0};budget.check()?;Ok(budget)
+        let budget=Self{deadline:deadline.min(Instant::now()+Duration::from_secs(10)),cancellation,remaining:bytes,records,used:0,#[cfg(test)] sql_steps:None};budget.check()?;Ok(budget)
     }
     pub fn check(&self)->Result<()> {ensure!(!self.cancellation.is_cancelled()&&Instant::now()<self.deadline,"identity inventory cancelled or expired");Ok(())}
     pub fn used(&self)->usize {self.used}
@@ -44,6 +47,14 @@ pub(super) fn read_published<T>(path:&Path,publication:&Publication,budget:&mut 
     db.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,32*1024*1024)?;
     let deadline=budget.deadline;let cancellation=budget.cancellation.clone();
     db.progress_handler(1000,Some(move||cancellation.is_cancelled()||Instant::now()>=deadline));
+    #[cfg(test)]
+    if let Some(steps)=budget.sql_steps.clone() {
+        let cancellation=budget.cancellation.clone();
+        db.progress_handler(1,Some(move|| {
+            steps.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+            cancellation.is_cancelled()||Instant::now()>=deadline
+        }));
+    }
     db.busy_timeout(Duration::from_millis(10))?;
     db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF;")?;
     let tx=db.transaction()?;check_schema(&tx)?;
@@ -65,16 +76,31 @@ pub(crate) fn read_head(path:&Path,publication:&Publication,budget:&mut Budget)-
 /// Selected but not yet acknowledged launch resources remain conflict evidence.
 /// Do not hide them merely because the runtime binding still has an empty pane.
 pub(crate) fn read_launch_targets(path:&Path,publication:&Publication,budget:&mut Budget)->Result<Vec<(String,LaunchTarget)>> {
+    read_targets(path,publication,budget,None)
+}
+pub(crate) fn read_pane_targets(path:&Path,publication:&Publication,budget:&mut Budget,pane:&str)->Result<Vec<(String,LaunchTarget)>> {
+    ensure!(!pane.is_empty(),"pane target selection requires an identity");
+    read_targets(path,publication,budget,Some(pane))
+}
+fn read_targets(path:&Path,publication:&Publication,budget:&mut Budget,pane:Option<&str>)->Result<Vec<(String,LaunchTarget)>> {
     read_published(path,publication,budget,|tx,budget|{
         let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
         if version<11{return Ok(Vec::new());}
-        let mut stmt=tx.prepare("SELECT e.entity,e.payload,i.payload,i.payload_hash,a.id,a.task_id,
-                o.task_id,o.kind,o.target,o.expected_revision,o.payload,o.payload_hash,o.payload_version,o.idempotency_key,e.kind FROM events e
+        // Current stores maintain lifecycle eligibility transactionally, so
+        // repeated reuse of a pane does not revisit terminated launch history.
+        // Older read-only stores retain the original indexed-event fallback.
+        let source=match (pane.is_some(),version>=43) {
+            (true,true)=>"(SELECT sequence FROM retained_launch_resources INDEXED BY retained_launch_resources_pane WHERE pane=?1 UNION SELECT sequence FROM retained_launch_resources INDEXED BY retained_launch_resources_unknown WHERE unknown_pane=1) candidates CROSS JOIN events e ON e.sequence=candidates.sequence",
+            (true,false)=>"(SELECT sequence FROM events WHERE kind IN ('runtime.launch_target','runtime.launch_workspace') AND json_extract(payload,'$.route.pane_id')=?1 UNION SELECT sequence FROM events WHERE kind IN ('runtime.launch_target','runtime.launch_workspace') AND (json_type(payload,'$.route.pane_id') IS NOT 'text' OR json_extract(payload,'$.route.pane_id')='')) candidates CROSS JOIN events e ON e.sequence=candidates.sequence",
+            (false,_)=>"events e",
+        };
+        let mut stmt=tx.prepare(&format!("SELECT e.entity,e.payload,i.payload,i.payload_hash,a.id,a.task_id,
+                o.task_id,o.kind,o.target,o.expected_revision,o.payload,o.payload_hash,o.payload_version,o.idempotency_key,e.kind FROM {source}
             LEFT JOIN attempt_inputs i ON i.operation_id=e.entity
             LEFT JOIN attempts a ON a.id=i.attempt_id
             LEFT JOIN operations o ON o.id=i.operation_id
-            WHERE e.kind='runtime.launch_workspace' OR (e.kind='runtime.launch_target' AND (a.id IS NULL OR a.termination_observed=0 OR NOT EXISTS(SELECT 1 FROM events started WHERE started.kind='runtime.launch_started' AND started.entity=e.entity)))")?;
-        let mut rows=stmt.query([])?;let mut targets=Vec::new();let mut seen=std::collections::BTreeSet::new();
+            WHERE (e.kind='runtime.launch_workspace' OR (e.kind='runtime.launch_target' AND (a.id IS NULL OR a.termination_observed=0 OR NOT EXISTS(SELECT 1 FROM events started WHERE started.kind='runtime.launch_started' AND started.entity=e.entity))))"))?;
+        let mut rows=if let Some(pane)=pane {stmt.query([pane])?}else{stmt.query([])?};let mut targets=Vec::new();let mut seen=std::collections::BTreeSet::new();
         while let Some(row)=rows.next()? {
             budget.record()?;
             for column in [0,1,2,3,4,5,6,7,8,10,11,13,14] {
@@ -84,6 +110,11 @@ pub(crate) fn read_launch_targets(path:&Path,publication:&Publication,budget:&mu
             let entity:String=row.get(0)?;let payload:String=row.get(1)?;let inputs:String=row.get(2)?;let hash:String=row.get(3)?;
             let kind:String=row.get(14)?;
             ensure!(seen.insert((entity.clone(),kind.clone())),"duplicate retained launch target");
+            if pane.is_some() {
+                budget.charge(8)?;
+                let count:u64=tx.query_row("SELECT count(*) FROM (SELECT 1 FROM events WHERE entity=?1 AND kind=?2 LIMIT 2)",params![entity,kind],|r|r.get(0))?;
+                ensure!(count==1,"duplicate retained launch target");
+            }
             ensure!(format!("{:x}",Sha256::digest(inputs.as_bytes()))==hash,"launch target input hash mismatch");
             let target:LaunchTarget=serde_json::from_str(&payload)?;let record:AttemptInputRecord=serde_json::from_str(&inputs)?;
             super::reservations::validate_inputs(&record.inputs)?;
@@ -114,18 +145,47 @@ pub(crate) fn read_launch_targets(path:&Path,publication:&Publication,budget:&mu
 }
 
 pub(crate) fn read(path:&Path,publication:&Publication,budget:&mut Budget)->Result<Vec<RuntimeBinding>> {
+    read_bindings(path,publication,budget,BindingSelection::All)
+}
+pub(crate) fn read_pane_bindings(path:&Path,publication:&Publication,budget:&mut Budget,pane:&str)->Result<Vec<RuntimeBinding>> {
+    ensure!(!pane.is_empty(), "pane conflict selection requires an identity");
+    read_bindings(path,publication,budget,BindingSelection::Pane(pane))
+}
+pub(crate) fn read_worktree_bindings(path:&Path,publication:&Publication,budget:&mut Budget)->Result<Vec<RuntimeBinding>> {
+    read_bindings(path,publication,budget,BindingSelection::LocalWorktrees{indexed:false})
+}
+fn read_bindings(path:&Path,publication:&Publication,budget:&mut Budget,selection:BindingSelection<'_>)->Result<Vec<RuntimeBinding>> {
     read_published(path,publication,budget,|tx,budget|{
     let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
+    let selection=if matches!(selection,BindingSelection::LocalWorktrees{..}) {BindingSelection::LocalWorktrees{indexed:version>=43}}else{selection};
+    if !selection.is_all() && version>=43 {
+        budget.charge(2)?;
+        let dangling:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM identity_reference_gaps WHERE kind IN ('observation','ownership'))",[],|r|r.get(0))?;
+        ensure!(!dangling,"identity inventory contains dangling resource references");
+        let missing:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM identity_reference_gaps WHERE kind='imported')",[],|r|r.get(0))?;
+        ensure!(!missing,"identity inventory contains missing imported bindings");
+    } else {
     for (minimum,table) in [(6,"runtime_observations"),(9,"runtime_ownership")] {
         if version>=minimum {
             let dangling:bool=tx.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table} r LEFT JOIN runtime_bindings b ON b.id=r.binding_id WHERE b.id IS NULL)"),[],|r|r.get(0))?;
             ensure!(!dangling,"identity inventory contains dangling resource references");
         }
     }
+    if !selection.is_all() {
+        // A deleted imported binding must not make its retained legacy identity
+        // disappear from conflict evidence merely because no pane is indexed.
+        let missing:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM legacy_sources s LEFT JOIN runtime_bindings b ON b.source_path=s.path WHERE (s.kind='thread' OR (s.path='.state/coordinator.json' AND s.kind='runtime')) AND b.id IS NULL)",[],|r|r.get(0))?;
+        ensure!(!missing,"identity inventory contains missing imported bindings");
+    }
+    }
     // Measure every field read by runtime::read_all before materializing any
     // payload or provenance blob. The snapshot stays fixed through validation.
-    let mut statement=tx.prepare("SELECT octet_length(b.id),coalesce(octet_length(b.task_id),0),coalesce(octet_length(b.source_path),0),octet_length(b.payload),octet_length(b.payload_hash),coalesce(octet_length(s.digest),0),coalesce(length(s.bytes),0) FROM runtime_bindings b LEFT JOIN legacy_sources s ON s.path=b.source_path ORDER BY b.id LIMIT ?1")?;
-    let mut rows=statement.query([budget.records as u64+1])?;let mut count=0;
+    let scope=selection.filter();let limit=if selection.parameter().is_some() {"?2"}else{"?1"};
+    let mut statement=tx.prepare(&format!("SELECT octet_length(b.id),coalesce(octet_length(b.task_id),0),coalesce(octet_length(b.source_path),0),octet_length(b.payload),octet_length(b.payload_hash),coalesce(octet_length(s.digest),0),coalesce(length(s.bytes),0) FROM runtime_bindings b LEFT JOIN legacy_sources s ON s.path=b.source_path {scope} ORDER BY b.id LIMIT {limit}"))?;
+    let mut values=Vec::<rusqlite::types::Value>::new();
+    if let Some(value)=selection.parameter() {values.push(value.to_owned().into());}
+    values.push((budget.records as i64+1).into());
+    let mut rows=statement.query(rusqlite::params_from_iter(values))?;let mut count=0;
     while let Some(row)=rows.next()? {
         budget.check()?;count+=1;ensure!(count<=budget.records,"identity inventory exceeds reference budget");
         for column in 0..7 {let n:usize=row.get(column)?;ensure!(n<=16*1024*1024,"identity field exceeds 16 MiB");budget.charge(n)?;}
@@ -135,10 +195,12 @@ pub(crate) fn read(path:&Path,publication:&Publication,budget:&mut Budget)->Resu
     let mut rows=statement.query([])?;
     if let Some(row)=rows.next()? {for column in 0..2 {let n:usize=row.get(column)?;ensure!(n<=16*1024*1024,"identity session provenance exceeds 16 MiB");budget.charge(n)?;}}
     drop(rows);drop(statement);budget.check()?;
-    let bindings=super::runtime::read_all(tx)?;ensure!(bindings.len()==count,"identity inventory changed");budget.check()?;
+    let bindings=super::runtime::read_selected(tx,selection,None)?;ensure!(bindings.len()==count,"identity inventory changed");budget.check()?;
     budget.records-=count;Ok(bindings)
     })
 }
 
 mod worktrees;
 pub(crate) use worktrees::read as read_worktrees;
+
+pub(crate) use worktrees::read_operation as read_worktree_operation;

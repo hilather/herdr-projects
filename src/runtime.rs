@@ -113,7 +113,7 @@ fn record_controller_controlled(project:&Path,batch:&crate::reconcile::Observati
     control.check()?;guard.check_project(project)?;
     ensure!(!batch.dispatch_allowed,"observations cannot authorize dispatch");
     let _record=crate::execution_guard::exclusive_file(&project.join(".state/lock"))?;
-    let mut db=migration::open_active_controlled(project,control.clone())?;
+    let mut db=migration::open_active_scoped(project,control.clone())?;
     guard.check_project(project)?;
     db.record_observations(batch.expected_head,&batch.observations)?;
     after_record();
@@ -205,14 +205,17 @@ pub fn relinquish(project:&Path,id:&str,expected_revision:u64,expected_head:u64,
 
 pub fn queue_task(project:&Path,id:&TaskId,revision:u64,head:u64,request:&crate::domain::QueueRequest)->Result<u64> {
     let _guard=migration::runtime_mutation(project)?;
-    Ok(migration::open_active(project)?.queue_task(id,revision,head,request,jiff::Timestamp::now().as_millisecond())?)
+    let control=crate::store::controlled::ReadControl::new(std::time::Instant::now()+std::time::Duration::from_secs(2),Default::default());
+    Ok(migration::open_active_scoped(project,control)?.queue_task(id,revision,head,request,jiff::Timestamp::now().as_millisecond())?)
 }
 pub fn scheduler_policy(project:&Path,head:u64,revision:u64,max_workers:u32,max_attempts:u32)->Result<u64> {
     let _guard=migration::runtime_mutation(project)?;
-    Ok(migration::open_active(project)?.set_scheduler_policy(head,revision,max_workers,max_attempts)?)
+    let control=crate::store::controlled::ReadControl::new(std::time::Instant::now()+std::time::Duration::from_secs(2),Default::default());
+    Ok(migration::open_active_scoped(project,control)?.set_scheduler_policy(head,revision,max_workers,max_attempts)?)
 }
 pub fn queue_report(project:&Path)->Result<crate::domain::QueueReport> {
-    Ok(migration::open_active(project)?.queue_report(jiff::Timestamp::now().as_millisecond())?)
+    let control=crate::store::controlled::ReadControl::new(std::time::Instant::now()+std::time::Duration::from_secs(2),Default::default());
+    Ok(migration::open_active_scoped(project,control)?.queue_report(jiff::Timestamp::now().as_millisecond())?)
 }
 
 pub fn cancel_attempt(project:&Path,id:&crate::domain::AttemptId,revision:u64,head:u64,reason:&str)->Result<crate::domain::CancellationChange> {

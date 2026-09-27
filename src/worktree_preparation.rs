@@ -383,22 +383,11 @@ pub fn prepare(
         locks: guard.inherit()?,
     };
     git.check()?;
-    let mut db = crate::migration::open_active(&project)?;
-    let state = db.read_snapshot(None)?;
-    let delivery = state
-        .deliveries
-        .iter()
-        .find(|d| &d.operation == operation)
-        .context("launch delivery missing")?;
-    ensure!(
-        delivery.revision == expected_revision,
-        "worktree launch revision changed"
-    );
-    let record = state
-        .attempt_inputs
-        .iter()
-        .find(|r| &r.operation == operation)
-        .context("worktree launch inputs missing")?;
+    let control = crate::store::controlled::ReadControl::new(deadline, git.cancellation.clone());
+    let mut db = crate::migration::open_active_scoped(&project, control)?;
+    let state = db.worktree_preparation_selection(operation, expected_revision)?;
+    let delivery = &state.delivery;
+    let record = &state.record;
     let plans = worktree_plans(&record.inputs, &record.attempt).map_err(anyhow::Error::msg)?;
     ensure!(!plans.is_empty(), "launch has no repository inputs");
     let prior: Vec<_> = state
@@ -430,7 +419,7 @@ pub fn prepare(
             "worktree creation already claimed without recovery intent"
         );
         let brief =
-            crate::memory::render_attempt_brief_held(&project, record.attempt.as_str(), &mut db)?;
+            db.render_attempt_brief(&project, record.attempt.as_str())?;
         crate::canonical_worker::validate_preparation_inputs(
             record
                 .inputs
@@ -449,11 +438,7 @@ pub fn prepare(
             git.deadline,
             git.cancellation.clone(),
         )?;
-        let binding = state
-            .runtime_bindings
-            .iter()
-            .find(|b| b.id == record.inputs.binding)
-            .context("worktree binding missing")?;
+        let binding = &state.binding;
         let (route, selected) =
             worktree_execution_route(&record.inputs, &record.attempt, &binding.identity)
                 .map_err(anyhow::Error::msg)?;
@@ -513,7 +498,7 @@ pub fn prepare(
                         .max(0) as u64,
                 ),
         );
-        db.validate_claim(&claim, crate::canonical_worker::now())?;
+        db.validate_launch_claim(&claim, crate::canonical_worker::now())?;
         let root = parent.parent().unwrap();
         if !root.exists() {
             fs::create_dir(root)?;
@@ -542,7 +527,7 @@ pub fn prepare(
             );
             git.source(plan)?;
             absent(Path::new(&plan.path))?;
-            db.validate_claim(&claim, crate::canonical_worker::now())?;
+            db.validate_launch_claim(&claim, crate::canonical_worker::now())?;
             git.run(
                 Path::new(&plan.source.repository),
                 &[
@@ -575,20 +560,11 @@ pub fn prepare(
         observation.check()?;
     }
     git.check()?;
-    let current = db.read_snapshot(None)?;
-    let revision = current
-        .deliveries
-        .iter()
-        .find(|d| &d.operation == operation)
-        .context("launch delivery disappeared")?
-        .revision;
-    db.observe_worktrees(
+    db.retain_observed_worktrees(
         &PreparedWorktreeReceipts {
             intent,
             receipts: receipts.clone(),
         },
-        revision,
-        current.head,
         crate::canonical_worker::now(),
     )?;
     Ok(receipts)
@@ -776,13 +752,9 @@ impl WorktreeProof {
         Ok(())
     }
 }
-pub(crate) fn verify_held(
-    project: &Path,
-    state: &Snapshot,
-    record: &AttemptInputRecord,
-    deadline: Instant,
-    cancellation: Cancellation,
-    locks: Vec<InheritedLock>,
+pub(crate) fn verify_events_held(
+    project: &Path, events: &[Event], record: &AttemptInputRecord,
+    deadline: Instant, cancellation: Cancellation, locks: Vec<InheritedLock>,
 ) -> Result<WorktreeProof> {
     if record.inputs.repositories.is_empty() {
         return Ok(WorktreeProof {
@@ -795,10 +767,9 @@ pub(crate) fn verify_held(
         deadline,
         cancellation.clone(),
     )?;
-    let _ = crate::migration::read_worktree_inventory(project, &mut budget)?;
+    let _ = crate::migration::read_worktree_operation(project, &record.operation, &mut budget)?;
     let event = |kind: &str| -> Result<&Event> {
-        let values = state
-            .events
+        let values = events
             .iter()
             .filter(|e| e.kind == kind && e.entity == record.operation.as_str())
             .collect::<Vec<_>>();
@@ -840,6 +811,7 @@ pub(crate) fn verify_held(
 
 /// After gate release, validate retained incarnations and associations without
 /// requiring pristine content: the worker may already be writing its output.
+#[cfg(test)]
 pub(crate) fn pin_started_held(
     project: &Path,
     state: &Snapshot,
@@ -847,6 +819,9 @@ pub(crate) fn pin_started_held(
     deadline: Instant,
     cancellation: Cancellation,
 ) -> Result<WorktreeProof> {
+    pin_started_events_held(project,&state.events,record,deadline,cancellation)
+}
+pub(crate) fn pin_started_events_held(project:&Path,events:&[Event],record:&AttemptInputRecord,deadline:Instant,cancellation:Cancellation)->Result<WorktreeProof> {
     if record.inputs.repositories.is_empty() {
         return Ok(WorktreeProof {
             observations: vec![],
@@ -858,11 +833,9 @@ pub(crate) fn pin_started_held(
         deadline,
         cancellation,
     )?;
-    crate::migration::read_worktree_inventory(project, &mut budget)?;
+    crate::migration::read_worktree_operation(project, &record.operation, &mut budget)?;
     let event = |kind: &str| -> Result<&Event> {
-        let events = state
-            .events
-            .iter()
+        let events = events.iter()
             .filter(|e| e.kind == kind && e.entity == record.operation.as_str())
             .collect::<Vec<_>>();
         ensure!(
@@ -969,9 +942,9 @@ mod file_tests {
 
 /// Recover preparation ownership without certifying that checkout completed.
 /// Existing ready receipts still fence the original directory incarnations.
-pub(crate) fn pin_preparation_held(git:&Git,state:&Snapshot,intent:&WorktreeCreation)->Result<(WorktreeProof,Vec<WorktreeReceipt>,Vec<WorktreePlan>)> {
+pub(crate) fn pin_preparation_held(git:&Git,events:&[Event],intent:&WorktreeCreation)->Result<(WorktreeProof,Vec<WorktreeReceipt>,Vec<WorktreePlan>)> {
     git.check()?;
-    let ready=state.events.iter().filter(|e|e.kind=="runtime.worktrees_ready"&&e.entity==intent.operation.as_str()).collect::<Vec<_>>();
+    let ready=events.iter().filter(|e|e.kind=="runtime.worktrees_ready"&&e.entity==intent.operation.as_str()).collect::<Vec<_>>();
     ensure!(ready.len()<=1,"duplicate ready worktree evidence");
     let retained:Option<Vec<WorktreeReceipt>>=ready.first().map(|e|serde_json::from_value(e.payload.clone())).transpose()?;
     let mut observations=Vec::new();let mut missing=Vec::new();

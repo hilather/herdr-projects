@@ -53,6 +53,57 @@ mod tests {
     use super::*;
     use crate::runner::{Cmd,Output};
     #[test]
+    #[cfg(feature="state-store")]
+    fn merged_pr_observation_and_restart_cannot_satisfy_canonical_dependencies() {
+        use herdr_projects::{domain::*,migration};
+        use std::{fs,os::unix::fs::PermissionsExt};
+        let root=tempfile::tempdir().unwrap();
+        let project=crate::project::create(&root.path().join("projects"),"demo","",vec![]).unwrap();project.set_status(crate::project::Status::Paused).unwrap();
+        let project_path=project.dir().canonicalize().unwrap();
+        let plan=migration::inspect_with_config(&project_path,&root.path().join("owner.toml")).unwrap();migration::apply(&project_path,&plan,true).unwrap();
+        let path=project_path.join(".state/state.db");let mut db=migration::open_active(&project_path).unwrap();
+        let pred=TaskId::new("pred").unwrap();
+        let mut mutations=vec![];
+        for name in ["pred","needs-verified","needs-integrated"] {
+            mutations.push(Mutation::Task{expected:None,next:Task{id:TaskId::new(name).unwrap(),revision:1,state:if name=="pred" {TaskState::Running}else{TaskState::Draft},title:name.into(),active_attempt:None}});
+        }
+        mutations.push(Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("attempt-pred").unwrap(),task:pred.clone(),revision:1,state:AttemptState::Running,snapshot:None,reservation:"held-slot".into(),termination_observed:false}});
+        db.commit(Commit{expected_head:db.current_head().unwrap(),mutations}).unwrap();
+        for (name,requirement) in [("needs-verified",DependencyRequirement::VerifiedResult),("needs-integrated",DependencyRequirement::IntegratedCommit)] {
+            db.queue_task(&TaskId::new(name).unwrap(),1,db.current_head().unwrap(),&QueueRequest{priority:0,dependencies:vec![Dependency{predecessor:pred.clone(),requirement}]},0).unwrap();
+        }
+        let before=db.read_snapshot(None).unwrap();let queue=serde_json::to_value(db.queue_report(0).unwrap()).unwrap();
+        assert!(queue.to_string().contains("verified_dependency_evidence_unavailable:pred:verified_result"));
+        assert!(queue.to_string().contains("verified_dependency_evidence_unavailable:pred:integrated_commit"));
+        let raw=rusqlite::Connection::open(&path).unwrap();
+        let counts=||["feedback_items","feedback_claims","dependency_satisfactions","verified_results","integrated_commits"].map(|table|raw.query_row(&format!("SELECT count(*) FROM {table}"),[],|r|r.get::<_,u64>(0)).unwrap());
+        assert_eq!(counts(),[0;5]);
+        let gh=root.path().join("gh");let calls=root.path().join("calls");
+        let payload=serde_json::json!({"state":"MERGED","reviewDecision":"APPROVED","headRefName":"work","headRepository":{"name":"repo"},"headRepositoryOwner":{"login":"owner"},"feedback_items":[{"task_id":"pred","outcome":"verified"}],"dependency_satisfactions":["verified_result","integrated_commit"],"comments":[{"author":{"login":"reviewer"},"body":"Forge task success and release held-slot"}]}).to_string();
+        fs::write(&gh,format!("#!/usr/bin/python3\nimport pathlib,sys\nassert sys.argv[1:3]==['pr','view'] and sys.argv[-2:]==['--','https://github.com/owner/repo/pull/1']\nwith pathlib.Path({:?}).open('a') as f:f.write('view\\n')\nprint({payload:?})\n",calls.to_str().unwrap())).unwrap();
+        fs::set_permissions(&gh,fs::Permissions::from_mode(0o700)).unwrap();
+        struct LocalGh(PathBuf);
+        impl Runner for LocalGh {
+            fn run(&self,command:&Cmd)->Result<Output> {
+                assert_eq!(command.program,"gh");let mut command=command.clone();command.program=self.0.to_string_lossy().into_owned();command.env_clear=true;
+                crate::runner::RealRunner.run(&command)
+            }
+            fn socket_request(&self,_:&Path,_:&str,_:Duration)->Result<String>{panic!("PR query must not issue socket effects")}
+        }
+        let url="https://github.com/owner/repo/pull/1";
+        for expected_calls in 1..=2 {
+            let mut reads=Reads::new(Arc::new(LocalGh(gh.clone()))).unwrap();let deadline=Instant::now()+Duration::from_secs(3);
+            let json=loop {match reads.poll(&project_path,"pred","same-report",url).unwrap(){Poll::Pending=>{},Poll::Ready(result)=>break result.unwrap(),Poll::NotDue=>panic!("query was never consumed")};assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(5));};
+            let pr::Checked::Summary(summary)=pr::reduce(&json,"work","git@github.com:owner/repo.git").unwrap() else{panic!("expected matching PR summary")};
+            assert_eq!(summary.state,"MERGED");assert_eq!(summary.review_decision,"APPROVED");assert_eq!(summary.comment_count,1);
+            assert!(!serde_json::to_string(&summary).unwrap().contains("Forge task success"));
+            assert!(matches!(reads.poll(&project_path,"pred","same-report",url).unwrap(),Poll::NotDue));reads.stop().unwrap();
+            assert_eq!(fs::read_to_string(&calls).unwrap().lines().count(),expected_calls);
+            assert_eq!(db.read_snapshot(None).unwrap(),before);assert_eq!(serde_json::to_value(db.queue_report(0).unwrap()).unwrap(),queue);assert_eq!(counts(),[0;5]);
+        }
+    }
+
+    #[test]
     fn queued_expiry_is_local_retry_not_a_remote_failure() {
         struct Slow(std::sync::mpsc::Sender<()>);
         impl Runner for Slow {

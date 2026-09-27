@@ -117,6 +117,19 @@ enum ApprovalCommand {
     Denials,
 }
 
+#[cfg(feature="state-store")]
+#[derive(Subcommand)]
+enum DelegationCommand {
+    /// Install an owner-signed delegation; creates no reservation
+    Import { document:PathBuf, signature:PathBuf },
+    /// Draft the next ready candidate under this grant; grants no authority
+    Draft { grant_id:String, #[arg(long)] idempotency_key:String },
+    /// Reserve one exact action signed by the delegated subject
+    Reserve { document:PathBuf, signature:PathBuf },
+    /// Revoke future delegated authority without claiming a worker has stopped
+    Revoke { grant_id:String, #[arg(long)] expected_head:u64, #[arg(long)] reason:String },
+}
+
 #[cfg(all(feature="state-store", target_os="linux"))]
 #[derive(Subcommand)]
 enum LaunchCommand {
@@ -162,7 +175,30 @@ enum MemoryCommand {
     Readiness { #[arg(long)] task:String },
     Invalidations { #[arg(long)] task:String },
     Reconcile { document:PathBuf, signature:PathBuf, #[arg(long)] expected_head:u64 },
+    /// Freeze exact completed member evidence without authorizing downstream work
+    BarrierFreeze { #[arg(long)] input:PathBuf, #[arg(long)] expected_head:u64 },
+    /// Inspect one immutable barrier and its historical release status
+    Barrier { #[arg(long)] id:String },
+    /// Draft exact current release bytes for external owner review and signing
+    BarrierReleaseDraft { #[arg(long)] id:String, #[arg(long)] expires_unix_ms:i64 },
+    /// Record release of an exact barrier using an owner-signed authorization
+    BarrierRelease { document:PathBuf, signature:PathBuf, #[arg(long)] expected_head:u64 },
+    /// Revoke an exact barrier through local operator control; retains capacity
+    BarrierRevoke { #[arg(long)] id:String, #[arg(long)] expected_head:u64, #[arg(long)] reason:String },
     Update { #[arg(long)] delivery:String, #[arg(long)] attempt:String },
+    /// Pull an immutable update manifest; does not acknowledge application
+    Package {
+        #[arg(long,required_unless_present="snapshot",conflicts_with="snapshot")] binding:Option<String>,
+        #[arg(long,required_unless_present="binding",conflicts_with="binding")] snapshot:Option<String>,
+        /// Select exact unresolved changes; repeat for a batch
+        #[arg(long="change")] changes:Vec<String>,
+    },
+    /// Aggregate existing exact-change receipts for the current live worker
+    PackageAck { #[arg(long)] attempt:String, #[arg(long)] input:PathBuf },
+    /// Retire an optional update using an exact applied newer revision
+    SupersedeUpdate { #[arg(long)] attempt:String, #[arg(long)] input:PathBuf },
+    /// Inspect retained supersession evidence for one exact obligation
+    Supersession { #[arg(long)] binding:String, #[arg(long)] change:String },
     Ack { #[arg(long)] input:PathBuf },
     Receipts { #[arg(long)] attempt:String },
     Plan { #[arg(long)] output:PathBuf },
@@ -205,6 +241,8 @@ enum Command {
     #[cfg(feature="state-store")]
     Approval { slug:String, #[command(subcommand)] command:ApprovalCommand },
     #[cfg(feature="state-store")]
+    Delegation { slug:String, #[command(subcommand)] command:DelegationCommand },
+    #[cfg(feature="state-store")]
     Budget { slug:String, #[command(subcommand)] command:BudgetCommand },
     /// Memory inspect, signed policy, markdown import, snapshot and cutover
     #[cfg(feature="state-store")]
@@ -232,7 +270,7 @@ enum Command {
     /// Inspect or edit migrated task records without starting execution
     #[cfg(feature="state-store")]
     Task { slug:String, #[command(subcommand)] command:TaskCommand },
-    /// Record an untrusted worker result. Does not verify or launch.
+    /// Record, verify and locally integrate task results.
     #[cfg(feature="state-store")]
     Result { slug:String, #[command(subcommand)] command:ResultCommand },
     /// Show or lease local verifier and integrator feedback. Does not reserve or satisfy.
@@ -385,12 +423,17 @@ enum Command {
     },
     /// Print the coordinator skill
     Skill,
+    /// Print compiled features/platform/SQLite as JSON without reading config or projects
+    BuildInfo {
+        /// Refuse unless this is a Linux state-store binary with compatible SQLite
+        #[arg(long)] require_factory: bool,
+    },
     /// Check the setup: versions, tools, root, ticker, sessions, and compiled features
     ///
     /// Reports whether `state-store` is compiled, the schema this binary can write,
     /// the linked SQLite version, and `prepared_dispatch`. A build without
     /// `state-store` says canonical factory commands are absent. Does not migrate.
-    /// The explicit factory binary is `cargo build --release --locked --features state-store`.
+    /// The explicit factory binary is `cargo build --release --locked --features state-store --target-dir target/factory`.
     /// Existing projects upgrade only through `migration PROJECT upgrade-store`.
     Doctor {
         #[command(flatten)]
@@ -555,6 +598,8 @@ enum ContractCommand {
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
 enum FeedbackCommand {
+    /// Request a bounded replan from retained verifier/integrator feedback
+    Replan { id: String },
     /// Read local verifier and integrator feedback. A pull-request poll is not evidence.
     Show { #[arg(long)] id: Option<String> },
     /// Lease one feedback item. Does not reserve an attempt or satisfy a dependency.
@@ -563,6 +608,14 @@ enum FeedbackCommand {
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
 enum PlanCommand {
+    /// Inspect accepted planning intent; does not report execution or grant authority
+    Inspect { slug:String, #[arg(long)] expected_plan_revision:Option<u64>, #[arg(long)] after:Option<String>, #[arg(long,default_value_t=32)] limit:usize },
+    /// Retain or recover immutable planner inputs without running inference
+    Session { slug:String, #[command(subcommand)] command:PlannerSessionCommand },
+    /// Enable or disable automatic feedback-to-replan requests; does not run a model
+    AutoReplan { slug:String, #[arg(value_parser=["on","off"])] mode:String, #[arg(long)] expected_head:u64 },
+    /// Register or replay a durable advisory wait; never grants launch authority
+    Wait { slug:String, #[command(subcommand)] command:WaitCommand },
     /// Store one unsigned proposal. Does not launch, verify a signature, install a task contract, or write scope.
     Propose {
         #[arg(value_name = "PROJECT")] slug: String,
@@ -573,7 +626,71 @@ enum PlanCommand {
 }
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
+enum PlannerSessionCommand {
+    Create {
+        id:String,
+        #[arg(long)] intent_file:PathBuf,
+        #[arg(long)] expected_head:u64,
+        #[arg(long)] expected_plan_revision:u64,
+        /// Retained event sequences, in strictly increasing order (at most 64)
+        #[arg(long)] evidence_event:Vec<u64>,
+    },
+    Show { id:String },
+}
+#[cfg(feature="state-store")]
+#[derive(Subcommand)]
+enum WaitCommand {
+    Register {
+        #[arg(long)] task:String,
+        #[arg(long)] attempt:Option<String>,
+        /// Exact signed approval whose installation or revocation requests reevaluation
+        #[arg(long,requires="approval_task_revision",conflicts_with="capacity_attempt")] approval_id:Option<String>,
+        #[arg(long,requires="approval_id")] approval_task_revision:Option<u64>,
+        /// Attempt whose proven termination permits capacity reevaluation
+        #[arg(long,requires="capacity_after_revision",conflicts_with="approval_id")] capacity_attempt:Option<String>,
+        #[arg(long,requires="capacity_attempt")] capacity_after_revision:Option<u64>,
+        /// Retained local runtime whose fresh matching observation requests reevaluation
+        #[arg(long,requires_all=["recovery_binding_revision","recovery_ownership_revision"],conflicts_with_all=["approval_id","capacity_attempt"])] recovery_binding:Option<String>,
+        #[arg(long,requires="recovery_binding")] recovery_binding_revision:Option<u64>,
+        #[arg(long,requires="recovery_binding")] recovery_ownership_revision:Option<u64>,
+        /// Advisory expiry, as an RFC 3339 timestamp with timezone
+        #[arg(long)] deadline:Option<jiff::Timestamp>,
+        #[arg(long,value_parser=["dependency_evidence","user_decision","resource_availability","adapter_recovery","validation_completion"])] condition:String,
+    },
+    /// Renew a terminal advisory wait after reevaluating its condition
+    Rearm { id:String, #[arg(long)] deadline:Option<jiff::Timestamp> },
+    Replay { id:String },
+}
+#[cfg(feature="state-store")]
+#[derive(Subcommand)]
 enum ResultCommand {
+    /// Configure an existing, unchecked-out local integration branch (immutable target).
+    #[cfg(target_os="linux")]
+    ConfigureIntegration { #[arg(long)] repository: PathBuf, #[arg(long)] reference: String },
+    /// Integrate a verified result into the configured local target using Git CAS.
+    #[cfg(target_os="linux")]
+    Integrate {
+        result: String,
+        #[arg(long)] repository: PathBuf,
+        #[arg(long)] idempotency_key: String,
+        /// New absolute scratch directory; must not already exist.
+        #[arg(long)] work_dir: PathBuf,
+    },
+    /// Reconcile a previously started integration without building a new candidate.
+    #[cfg(target_os="linux")]
+    ReconcileIntegration { #[arg(long)] repository: PathBuf, #[arg(long)] idempotency_key: String },
+    /// Run the exact signed acceptance policy against retained Git objects.
+    #[cfg(target_os="linux")]
+    Verify {
+        submission: String,
+        #[arg(long)] policy_id: String,
+        #[arg(long)] policy_file: PathBuf,
+        #[arg(long)] idempotency_key: String,
+        /// New absolute scratch directory; must not already exist.
+        #[arg(long)] work_dir: PathBuf,
+        #[arg(long, default_value_t=60, value_parser=clap::value_parser!(u64).range(1..=300))]
+        timeout_seconds: u64,
+    },
     /// Stage git objects and record one untrusted submission. Claimed checks are not evidence.
     #[cfg(target_os="linux")]
     Submit { #[arg(long)] input_file:PathBuf },
@@ -666,6 +783,14 @@ enum RuntimeCommand {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    if let Command::BuildInfo { require_factory }=&cli.command {
+        let info=doctor::build_info();
+        println!("{}",serde_json::to_string_pretty(&info)?);
+        if *require_factory && info["factory_runtime_compatible"]!=true {
+            bail!("factory runtime requires Linux, --features state-store, and SQLite 3.53.4 or later; see docs/factory/packaging.md");
+        }
+        return Ok(());
+    }
     if let Command::ReportHash {path}=&cli.command {
         println!("{}",serde_json::to_string(&crate::local_reports::Observation{hash:crate::source_tree::report_hash(path)?})?);return Ok(());
     }
@@ -798,14 +923,35 @@ pub fn run() -> Result<()> {
                     }
                 },
                 MemoryCommand::Update{delivery,attempt}=>herdr_projects::memory::read_memory_update(&dir,&delivery,&attempt)?,
+                MemoryCommand::Package{binding,snapshot,changes}=>serde_json::to_value(match (binding,snapshot) {
+                    (Some(binding),None)=>herdr_projects::memory::read_selected_update_package(&dir,&binding,&changes)?,
+                    (None,Some(snapshot))=>herdr_projects::memory::read_selected_snapshot_update_package(&dir,&snapshot,&changes)?,
+                    _=>anyhow::bail!("specify exactly one consumer binding or snapshot"),
+                })?,
                 MemoryCommand::Ack{input}=>{
                     let ack:herdr_projects::domain::MemoryUpdateAck=serde_json::from_slice(&herdr_projects::migration::read_plan_file(&input)?)
                         .map_err(|_|anyhow::anyhow!("invalid memory acknowledgment JSON (contents withheld)"))?;
                     serde_json::to_value(herdr_projects::memory::acknowledge_memory_update(&dir,&ack)?)?
                 },
+                MemoryCommand::PackageAck{attempt,input}=>{
+                    let ack:herdr_projects::store::UpdatePackageAck=serde_json::from_slice(&herdr_projects::migration::read_plan_file(&input)?)
+                        .map_err(|_|anyhow::anyhow!("invalid package acknowledgment JSON (contents withheld)"))?;
+                    serde_json::to_value(herdr_projects::memory::acknowledge_worker_update_package(&dir,&attempt,&ack)?)?
+                },
+                MemoryCommand::SupersedeUpdate{attempt,input}=>{
+                    let request:herdr_projects::store::WorkerUpdateSupersession=serde_json::from_slice(&herdr_projects::migration::read_plan_file(&input)?)
+                        .map_err(|_|anyhow::anyhow!("invalid memory supersession JSON (contents withheld)"))?;
+                    serde_json::to_value(herdr_projects::memory::supersede_worker_update(&dir,&attempt,&request)?)?
+                },
+                MemoryCommand::Supersession{binding,change}=>serde_json::to_value(herdr_projects::migration::open_active(&dir)?.worker_update_supersession(&binding,&change)?)?,
                 MemoryCommand::Receipts{attempt}=>serde_json::to_value(herdr_projects::migration::open_active(&dir)?.memory_update_receipts(&attempt)?)?,
                 MemoryCommand::Invalidations{task}=>serde_json::to_value(herdr_projects::migration::open_active(&dir)?.memory_invalidations(&task)?)?,
                 MemoryCommand::Reconcile{document,signature,expected_head}=>serde_json::to_value(herdr_projects::authority::reconcile_memory(&dir,&document,&signature,expected_head)?)?,
+                MemoryCommand::BarrierFreeze{input,expected_head}=>serde_json::to_value(herdr_projects::memory::freeze_memory_barrier_file(&dir,&input,expected_head)?)?,
+                MemoryCommand::Barrier{id}=>serde_json::to_value(herdr_projects::memory::inspect_memory_barrier(&dir,&id)?)?,
+                MemoryCommand::BarrierReleaseDraft{id,expires_unix_ms}=>serde_json::to_value(herdr_projects::authority::draft_barrier_release(&dir,&id,expires_unix_ms)?)?,
+                MemoryCommand::BarrierRelease{document,signature,expected_head}=>serde_json::to_value(herdr_projects::authority::release_memory_barrier(&dir,&document,&signature,expected_head)?)?,
+                MemoryCommand::BarrierRevoke{id,expected_head,reason}=>serde_json::to_value(herdr_projects::authority::revoke_memory_barrier(&dir,&id,expected_head,&reason)?)?,
                 MemoryCommand::Readiness{task}=>serde_json::to_value(herdr_projects::migration::open_active(&dir)?.memory_readiness(&task,jiff::Timestamp::now().as_millisecond())?)?,
                 MemoryCommand::Deliveries=>serde_json::to_value(herdr_projects::migration::open_active(&dir)?.memory_delivery_intents()?)?,
                 MemoryCommand::Candidate{id}=>herdr_projects::memory::import_candidate_preview(&dir,&id)?,
@@ -874,6 +1020,19 @@ pub fn run() -> Result<()> {
                 ApprovalCommand::Import { document,signature,expected_head }=>serde_json::to_value(herdr_projects::authority::import_signed(&dir,&document,&signature,expected_head)?)?,
                 ApprovalCommand::Revoke { id,expected_head,reason }=>serde_json::json!({"head":herdr_projects::authority::revoke(&dir,&id,expected_head,&reason)?}),
                 ApprovalCommand::Denials=>serde_json::to_value(herdr_projects::authority::denials(&dir)?)?,
+            };
+            println!("{}",serde_json::to_string_pretty(&value)?);
+            Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Delegation { slug, command } => {
+            project::validate_slug(&slug)?;
+            let dir=ctx.root.join(slug);
+            let value=match command {
+                DelegationCommand::Import { document,signature }=>serde_json::json!({"grant_id":herdr_projects::authority::import_delegation(&dir,&document,&signature)?}),
+                DelegationCommand::Draft { grant_id,idempotency_key }=>serde_json::to_value(herdr_projects::authority::draft_delegated_reservation(&dir,&grant_id,&idempotency_key)?)?,
+                DelegationCommand::Reserve { document,signature }=>serde_json::to_value(herdr_projects::authority::reserve_delegated(&dir,&document,&signature)?)?,
+                DelegationCommand::Revoke { grant_id,expected_head,reason }=>serde_json::json!({"head":herdr_projects::authority::revoke_delegation(&dir,&grant_id,expected_head,&reason)?}),
             };
             println!("{}",serde_json::to_string_pretty(&value)?);
             Ok(())
@@ -1001,6 +1160,31 @@ pub fn run() -> Result<()> {
             match command {
                 #[cfg(target_os="linux")]
                 ResultCommand::Submit{input_file}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::submit_untrusted_result(&dir,&input_file)?)?),
+                #[cfg(target_os="linux")]
+                ResultCommand::Verify{submission,policy_id,policy_file,idempotency_key,work_dir,timeout_seconds}=> {
+                    let request=herdr_projects::verification::VerifyRequest::new(submission,policy_id,policy_file,idempotency_key,std::time::Duration::from_secs(timeout_seconds),work_dir);
+                    let outcome=herdr_projects::verification::verify_project(&dir,&request)?;
+                    println!("{}",serde_json::to_string_pretty(&outcome)?);
+                    if outcome.state != "accepted" { anyhow::bail!("verification rejected: {}",outcome.reason.as_deref().unwrap_or("rejected")); }
+                },
+                #[cfg(target_os="linux")]
+                ResultCommand::ConfigureIntegration{repository,reference}=> {
+                    herdr_projects::integration::configure_project(&dir,&repository,&reference)?;
+                    println!("{}",serde_json::json!({"repository":repository.canonicalize()?,"reference":reference,"configured":true}));
+                },
+                #[cfg(target_os="linux")]
+                ResultCommand::Integrate{result,repository,idempotency_key,work_dir}=> {
+                    let request=herdr_projects::integration::IntegrateRequest{result_id:result,idempotency_key,repository,work_dir,fault:Default::default()};
+                    let outcome=herdr_projects::integration::integrate_project(&dir,&request)?;
+                    println!("{}",serde_json::to_string_pretty(&outcome)?);
+                    if outcome.state != "integrated" { anyhow::bail!("integration {}: {}",outcome.state,outcome.reason.as_deref().unwrap_or("not integrated")); }
+                },
+                #[cfg(target_os="linux")]
+                ResultCommand::ReconcileIntegration{repository,idempotency_key}=> {
+                    let outcome=herdr_projects::integration::reconcile_project(&dir,&repository,&idempotency_key)?;
+                    println!("{}",serde_json::to_string_pretty(&outcome)?);
+                    if outcome.state != "integrated" { anyhow::bail!("integration {}: {}",outcome.state,outcome.reason.as_deref().unwrap_or("not integrated")); }
+                },
                 ResultCommand::Show{id}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::show_results(&dir,id.as_deref())?)?),
             }
             Ok(())
@@ -1010,6 +1194,7 @@ pub fn run() -> Result<()> {
             project::validate_slug(&slug)?;
             let dir=ctx.root.join(&slug);
             match command {
+                FeedbackCommand::Replan{id}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::request_project_replan(&dir,&id)?)?),
                 FeedbackCommand::Show{id}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::show_feedback(&dir,id.as_deref())?)?),
                 FeedbackCommand::Claim{id,owner,lease_ms}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::claim_feedback(&dir,&id,&owner,lease_ms)?)?),
             }
@@ -1018,6 +1203,38 @@ pub fn run() -> Result<()> {
         #[cfg(feature="state-store")]
         Command::Plan{command}=>{
             match command {
+                PlanCommand::Inspect{slug,expected_plan_revision,after,limit}=>{
+                    project::validate_slug(&slug)?;
+                    println!("{}",serde_json::to_string_pretty(&herdr_projects::store::inspect_project_plan(&ctx.root.join(&slug),expected_plan_revision,after.as_deref(),limit)?)?);
+                }
+                PlanCommand::Session{slug,command}=>{
+                    project::validate_slug(&slug)?;let dir=ctx.root.join(&slug);
+                    let session=match command {
+                        PlannerSessionCommand::Create{id,intent_file,expected_head,expected_plan_revision,evidence_event}=>
+                            herdr_projects::store::create_project_planner_session(&dir,&id,&intent_file,&evidence_event,expected_plan_revision,expected_head)?,
+                        PlannerSessionCommand::Show{id}=>herdr_projects::store::show_project_planner_session(&dir,&id)?,
+                    };
+                    println!("{}",serde_json::to_string_pretty(&session)?);
+                }
+                PlanCommand::AutoReplan{slug,mode,expected_head}=>{
+                    project::validate_slug(&slug)?;
+                    println!("{}",serde_json::to_string_pretty(&herdr_projects::store::set_project_auto_replans(&ctx.root.join(&slug),expected_head,mode=="on")?)?);
+                }
+                PlanCommand::Wait{slug,command}=>{
+                    project::validate_slug(&slug)?;let dir=ctx.root.join(&slug);
+                    let value=match command {
+                        WaitCommand::Register{task,attempt,condition,deadline,approval_id,approval_task_revision,capacity_attempt,capacity_after_revision,recovery_binding,recovery_binding_revision,recovery_ownership_revision}=>{
+                            let trigger=if let Some(((binding_id,binding_revision),ownership_revision))=recovery_binding.zip(recovery_binding_revision).zip(recovery_ownership_revision) {
+                                Some(herdr_projects::domain::WaitTrigger::OwnedRuntimeRecovered{binding_id,binding_revision,ownership_revision})
+                            }else if let Some((attempt_id,after_revision))=capacity_attempt.zip(capacity_after_revision) {
+                                Some(herdr_projects::domain::WaitTrigger::AttemptCapacityReleased{attempt_id:herdr_projects::domain::AttemptId::new(attempt_id).map_err(anyhow::Error::msg)?,after_revision})
+                            }else {approval_id.zip(approval_task_revision).map(|(approval_id,task_revision)|herdr_projects::domain::WaitTrigger::ApprovalDecision{approval_id,task_revision})};
+                            serde_json::to_value(herdr_projects::store::register_project_wait_with_trigger(&dir,&task,attempt.as_deref(),&condition,deadline.map(|value|value.as_millisecond()),trigger.as_ref())?)?
+                        },
+                        WaitCommand::Rearm{id,deadline}=>serde_json::to_value(herdr_projects::store::rearm_project_wait(&dir,&id,deadline.map(|value|value.as_millisecond()))?)?,
+                        WaitCommand::Replay{id}=>serde_json::to_value(herdr_projects::store::replay_project_wait(&dir,&id)?)?,
+                    };println!("{}",serde_json::to_string_pretty(&value)?);
+                }
                 PlanCommand::Propose{slug,input_file,expected_plan_revision,idempotency_key}=>{
                     project::validate_slug(&slug)?;
                     let dir=ctx.root.join(&slug);
@@ -1317,6 +1534,7 @@ pub fn run() -> Result<()> {
             print!("{}", include_str!("../skill/COORDINATOR.md"));
             Ok(())
         }
+        Command::BuildInfo { .. } => unreachable!("build-info returns before environment resolution"),
         Command::Doctor { session } => {
             if !doctor::run(&ctx, &session.into())? {
                 bail!("some checks failed");

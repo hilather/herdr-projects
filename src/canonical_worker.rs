@@ -349,31 +349,9 @@ pub fn deliver_brief(
     let guard = crate::execution_guard::RootGuard::exclusive(
         project.parent().context("project root missing")?,
     )?;
-    let mut db = crate::migration::open_active(&project)?;
-    let state = db.read_snapshot(None)?;
-    ensure!(
-        state.deliveries.iter().any(|d| &d.operation == operation
-            && d.revision == expected_revision
-            && d.state == crate::operations::DeliveryState::Pending
-            && d.attempts == 0
-            && d.epoch == 0),
-        "brief delivery is stale or was already claimed"
-    );
-    let op = state
-        .operations
-        .iter()
-        .find(|o| &o.id == operation)
-        .context("brief operation missing")?;
-    ensure!(
-        op.kind == "runtime.worker_brief" && op.payload_version == 1,
-        "not a canonical worker brief"
-    );
-    let intent: WorkerBriefIntent = serde_json::from_value(op.payload.clone())?;
-    let input = state
-        .attempt_inputs
-        .iter()
-        .find(|r| r.attempt == intent.attempt && r.operation == intent.launch)
-        .context("brief launch inputs missing")?;
+    let control = crate::store::controlled::ReadControl::new(deadline, cancellation.clone());
+    let mut db = crate::migration::open_active_scoped(&project, control)?;
+    let (intent,input,start) = db.worker_brief_selection(operation,expected_revision)?;
     let profile = input
         .inputs
         .effective_profile
@@ -384,12 +362,6 @@ pub fn deliver_brief(
         profile.herdr.version == "0.9.1",
         "native brief adapter requires Herdr 0.9.1"
     );
-    let event = state
-        .events
-        .iter()
-        .find(|e| e.kind == "runtime.launch_started" && e.entity == intent.launch.as_str())
-        .context("typed launch receipt missing")?;
-    let start: LaunchStartedReceipt = serde_json::from_value(event.payload.clone())?;
     ensure!(
         start.route.machine.is_empty(),
         "native brief adapter supports local workers only"
@@ -402,7 +374,7 @@ pub fn deliver_brief(
         cancellation.clone(),
     )?;
     let brief =
-        crate::memory::render_attempt_brief_held(&project, intent.attempt.as_str(), &mut db)?;
+        db.render_attempt_brief(&project, intent.attempt.as_str())?;
     ensure!(
         brief.prompt_digest == intent.prompt_digest
             && brief.prompt_chars == intent.prompt_chars
@@ -420,13 +392,7 @@ pub fn deliver_brief(
     native.ready(&format!("{}:ready", operation.as_str()))?;
     // Readiness failures precede the claim. Any subsequent preflight failure
     // retains this one-use claim rather than reopening prompt submission.
-    let claim = db.claim_operation(
-        operation,
-        expected_revision,
-        "canonical-brief-adapter",
-        now(),
-        30_000,
-    )?;
+    let claim = db.claim_worker_brief(operation, expected_revision, now())?;
     native.deadline = native.deadline.min(
         Instant::now()
             + Duration::from_millis(claim.lease_until_ms.saturating_sub(now()).max(0) as u64),
@@ -439,7 +405,7 @@ pub fn deliver_brief(
         || {
             native.ready(&format!("{}:preflight-ready", operation.as_str()))?;
             executable(&profile.agent, deadline, &cancellation)?;
-            Ok(db.validate_claim(&claim, now())?)
+            Ok(db.validate_worker_brief_claim(&claim, now())?)
         },
     )?;
     ensure!(
@@ -458,7 +424,7 @@ pub fn deliver_brief(
             observed_unix_ms: now(),
         },
     };
-    Ok(db.record_worker_brief_delivered(&claim, &receipt, now())?)
+    Ok(db.record_worker_brief(&claim, &receipt, now())?)
 }
 
 /// Fulfill desired cancellation, or reconcile a naturally exited worker. Stop
@@ -481,32 +447,20 @@ pub fn reconcile_termination(
     let _guard = crate::execution_guard::RootGuard::exclusive(
         project.parent().context("project root missing")?,
     )?;
-    let mut db = crate::migration::open_active(&project)?;
-    let state = db.read_snapshot(None)?;
-    let current = state
-        .attempts
-        .iter()
-        .find(|a| &a.id == attempt)
-        .context("worker attempt missing")?;
-    ensure!(
-        current.revision == expected_revision,
-        "worker attempt revision changed"
-    );
-    if current.termination_observed {
-        return Ok(Some(current.clone()));
-    }
-    let record = state
-        .attempt_inputs
-        .iter()
-        .find(|r| &r.attempt == attempt)
-        .context("canonical attempt inputs missing")?;
+    let control=crate::store::controlled::ReadControl::new(deadline,cancellation.clone());
+    let mut db=crate::migration::open_active_scoped(&project,control)?;
+    let selected=db.termination_selection(attempt,expected_revision)?;
+    let current=&selected.attempt;
+    if current.termination_observed {return Ok(Some(current.clone()));}
+    let state=selected.worker.as_ref().context("canonical attempt inputs missing")?;
+    let record=&state.record;
     if state.events.iter().any(|e|e.kind=="runtime.worktrees_creation" && e.entity==record.operation.as_str())
         && !state.events.iter().any(|e|e.kind.starts_with("runtime.launch_") && e.entity==record.operation.as_str()) {
         let mut budget=crate::store::identity_inventory::Budget::new(50*1024*1024,1024,deadline,cancellation.clone())?;
-        crate::migration::read_worktree_inventory(&project,&mut budget)?;
+        crate::migration::read_worktree_operation(&project,&record.operation,&mut budget)?;
         check(deadline,&cancellation)?;
-        return Ok(db.stop_worktree_preparation(attempt,expected_revision,state.head,&_guard,|record,intent| {
-            crate::worktree_preservation::capture_preparation_held(&project,&state,record,intent,&_guard,&crate::source_tree::Control{deadline,cancellation:cancellation.clone()})
+        return Ok(db.stop_worktree_preparation(attempt,expected_revision,selected.head,&_guard,|record,intent| {
+            crate::worktree_preservation::capture_preparation_held(&project,&state.events,record,intent,&_guard,&crate::source_tree::Control{deadline,cancellation:cancellation.clone()})
                 .map_err(|error|crate::store::StoreError::Io(format!("preparation preservation failed: {error:#}")))
         },now())?);
     }
@@ -527,16 +481,8 @@ pub fn reconcile_termination(
                 && target.operation == record.operation,
             "staged worker target mismatch"
         );
-        let delivery = state
-            .deliveries
-            .iter()
-            .find(|d| d.operation == record.operation)
-            .context("staged launch delivery missing")?;
-        let binding = state
-            .runtime_bindings
-            .iter()
-            .find(|b| b.id == record.inputs.binding)
-            .context("staged binding missing")?;
+        let delivery=&state.delivery;
+        let binding=&state.binding;
         ensure!(
             current.state == AttemptState::Reserved
                 && current.retains_capacity()
@@ -545,15 +491,8 @@ pub fn reconcile_termination(
                 && binding.revision == record.inputs.binding_revision
                 && crate::store::ownership::identity_digest(binding)?
                     == record.inputs.binding_digest
-                && state
-                    .tasks
-                    .iter()
-                    .any(|t| t.id == current.task && t.active_attempt.as_ref() == Some(attempt))
-                && !state.ownership.iter().any(|o| o.binding == binding.id)
-                && state.approvals.iter().any(|g| g
-                    .consumed
-                    .as_ref()
-                    .is_some_and(|u| u.operation == record.operation)),
+                && state.task.id==current.task && state.task.active_attempt.as_ref()==Some(attempt)
+                && state.owner.is_none(),
             "staged launch no longer owns the original reservation"
         );
         let identity = target
@@ -561,7 +500,7 @@ pub fn reconcile_termination(
             .as_ref()
             .context("staged worker supervisor missing")?;
         if !SupervisorObservation::recover_exited(identity)? {
-            if !state.cancellations.iter().any(|c| &c.attempt == attempt) {
+            if !state.cancelled {
                 return Ok(None);
             }
             SupervisorObservation::stop_recorded(identity, stop_deadline, &cancellation)?;
@@ -572,7 +511,7 @@ pub fn reconcile_termination(
         );
         let host_reboot=SupervisorObservation::observe_reboot(identity)?;
         db.validate_workspace_quiescence(&record.operation,identity,host_reboot.as_ref())?;
-        let repository_snapshots=preserve_terminated_repositories(&project,&state,record,&_guard,deadline,cancellation.clone())?;
+        let repository_snapshots=preserve_terminated_repositories(&project,&state.events,record,&_guard,deadline,cancellation.clone())?;
         let output_snapshot=Some(crate::worktree_preservation::capture_outputs_held(&project,record,&crate::source_tree::Control{deadline,cancellation:cancellation.clone()})?);
         check(deadline,&cancellation)?;
         return Ok(Some(db.record_launch_stopped(
@@ -587,24 +526,16 @@ pub fn reconcile_termination(
                 },
             },
             expected_revision,
-            state.head,
+            selected.head,
             now(),
         )?));
     }
-    let owned = state
-        .ownership
-        .iter()
-        .find(|o| o.binding == record.inputs.binding)
-        .context("worker ownership missing")?;
+    let owned=state.owner.as_ref().context("worker ownership missing")?;
     ensure!(
         owned.origin == "launched" && owned.attempt.as_ref() == Some(attempt),
         "stop cannot adopt another worker"
     );
-    let binding = state
-        .runtime_bindings
-        .iter()
-        .find(|b| b.id == owned.binding)
-        .context("worker runtime binding missing")?;
+    let binding=&state.binding;
     ensure!(
         binding.revision == owned.binding_revision
             && crate::store::ownership::identity_digest(binding)? == owned.identity_digest,
@@ -620,11 +551,7 @@ pub fn reconcile_termination(
         start.version == 2 && &start.attempt == attempt && start.operation == record.operation,
         "worker lacks exact supervisor evidence"
     );
-    let launch = state
-        .deliveries
-        .iter()
-        .find(|d| d.operation == record.operation)
-        .context("worker launch delivery missing")?;
+    let launch=&state.delivery;
     ensure!(
         launch.state == crate::operations::DeliveryState::Confirmed
             && launch.last_outcome
@@ -636,7 +563,7 @@ pub fn reconcile_termination(
     let identity = start
         .supervisor
         .context("worker supervisor identity missing")?;
-    let cancelled = state.cancellations.iter().any(|c| &c.attempt == attempt);
+    let cancelled = state.cancelled;
     if !SupervisorObservation::recover_exited(&identity)? {
         if !cancelled {
             return Ok(None);
@@ -652,7 +579,7 @@ pub fn reconcile_termination(
     // an existing stop. The atomic store service checks exact retained ownership.
     let host_reboot=SupervisorObservation::observe_reboot(&identity)?;
     db.validate_workspace_quiescence(&record.operation,&identity,host_reboot.as_ref())?;
-    let repository_snapshots=preserve_terminated_repositories(&project,&state,record,&_guard,deadline,cancellation.clone())?;
+    let repository_snapshots=preserve_terminated_repositories(&project,&state.events,record,&_guard,deadline,cancellation.clone())?;
     let output_snapshot=Some(crate::worktree_preservation::capture_outputs_held(&project,record,&crate::source_tree::Control{deadline,cancellation:cancellation.clone()})?);
     let prepared = PreparedWorkerTermination {
         receipt: WorkerTerminationReceipt {
@@ -679,14 +606,14 @@ pub fn reconcile_termination(
     Ok(Some(db.record_worker_termination(
         &prepared,
         expected_revision,
-        state.head,
+        selected.head,
         now(),
     )?))
 }
 
 #[cfg(target_os="linux")]
-fn preserve_terminated_repositories(project:&Path,state:&Snapshot,record:&AttemptInputRecord,guard:&crate::execution_guard::RootGuard,deadline:Instant,cancellation:Cancellation)->Result<Vec<WorktreeSnapshotReference>> {
-    let snapshots=crate::worktree_preservation::capture_held(project,state,record,guard,&crate::source_tree::Control{deadline,cancellation},true)?;
+fn preserve_terminated_repositories(project:&Path,events:&[Event],record:&AttemptInputRecord,guard:&crate::execution_guard::RootGuard,deadline:Instant,cancellation:Cancellation)->Result<Vec<WorktreeSnapshotReference>> {
+    let snapshots=crate::worktree_preservation::capture_events_held(project,events,record,guard,&crate::source_tree::Control{deadline,cancellation},true)?;
     Ok(snapshots.into_iter().map(|s|WorktreeSnapshotReference{plan:s.manifest.worktree.plan,digest:s.digest}).collect())
 }
 
@@ -700,41 +627,8 @@ pub fn prepare_brief(
     cancellation: Cancellation,
 ) -> Result<Operation> {
     check(deadline, &cancellation)?;
-    let state = crate::runtime::snapshot(project)?;
-    let current = state
-        .attempts
-        .iter()
-        .find(|a| &a.id == attempt)
-        .context("worker attempt missing")?;
-    ensure!(
-        current.revision == expected_revision
-            && current.state == AttemptState::Launching
-            && current.retains_capacity(),
-        "worker attempt changed before brief preparation"
-    );
-    let record = state
-        .attempt_inputs
-        .iter()
-        .find(|r| &r.attempt == attempt)
-        .context("sealed worker inputs missing")?;
-    let event = state
-        .events
-        .iter()
-        .find(|e| e.kind == "runtime.launch_started" && e.entity == record.operation.as_str())
-        .context("worker start receipt missing")?;
-    let start: LaunchStartedReceipt = serde_json::from_value(event.payload.clone())?;
-    ensure!(
-        start.version == 2
-            && start.attempt == *attempt
-            && start.operation == record.operation
-            && start.supervisor.is_some(),
-        "worker lacks supervised start evidence"
-    );
-    crate::memory::enqueue_attempt_brief_controlled(
-        project,
-        attempt.as_str(),
-        state.head,
-        deadline,
-        cancellation,
-    )
+    let _guard=crate::migration::runtime_mutation(project)?;
+    let control=crate::store::controlled::ReadControl::new(deadline,cancellation);
+    let mut db=crate::migration::open_active_scoped(project,control)?;
+    db.prepare_supervised_worker_brief(project,attempt,expected_revision)
 }

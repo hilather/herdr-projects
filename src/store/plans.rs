@@ -1,15 +1,27 @@
 //! Schema 31 untrusted plan revisions. A proposal file is not a signature and
 //! is not installed as a task contract. Accepting one does not reserve an attempt.
-//! Schema 36 waits commit the cursor in that same transaction and replay it once.
+//! Waits commit their subscription cursor atomically and replay until a relevant wake.
 //! A schema 29 feedback row is the only replan trigger: two automatic replans for
 //! one blocker inside a plan revision, then one inbox escalation. A pull-request
 //! poll is not a trigger. Infrastructure retries stay on the same attempt.
 use super::*;
-use crate::domain::{Dependency, QueueRecord, Task, TaskId, TaskState};
+use crate::domain::{Dependency, QueueRecord, Task, TaskId, TaskState, WaitTrigger};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+mod waits;
+mod wait_triggers;
+mod wait_recovery;
+mod replan_service;
+mod sessions;
+mod graph;
+mod inspection;
+mod changes;
+pub use inspection::{PlanIntent,PlanIntentPage,inspect_project_plan};
+pub use sessions::{PlannerSession,PlannerInput,PlannerEventInput,create_project_planner_session,show_project_planner_session};
+pub use replan_service::{AutoReplanControl,ReplanTurn,set_project_auto_replans,service_project_replans};
+pub use waits::{WaitTurn,register_project_wait,register_project_wait_with_deadline,register_project_wait_with_trigger,rearm_project_wait,replay_project_wait,request_project_replan,service_project_waits};
 
 const SCHEMA_VERSION: u32 = 31;
 const PROPOSAL_LIMIT: usize = 256 * 1024;
@@ -50,24 +62,35 @@ pub struct PlanProposalReceipt {
     pub replayed: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ProposalFile {
     version: u32,
     contracts: Vec<ProposedContract>,
+    #[serde(default)]
+    planner: Option<sessions::PlannerBinding>,
+    #[serde(default)]
+    envelope: Option<changes::Envelope>,
+    #[serde(default)]
+    changes: Vec<changes::Change>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ProposedContract {
     task_id: TaskId,
     text: String,
     dependencies: Vec<Dependency>,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    cancellation_reason: Option<String>,
 }
 
 struct ParsedProposal {
     contracts: Vec<ProposedContract>,
     contract_texts: String,
+    planner: Option<sessions::PlannerBinding>,
+    envelope: Option<changes::Envelope>,
+    changes: Vec<changes::Change>,
 }
 
 fn parse_proposal(raw: &[u8]) -> Result<ParsedProposal> {
@@ -79,8 +102,14 @@ fn parse_proposal(raw: &[u8]) -> Result<ParsedProposal> {
     }
     let document: ProposalFile =
         serde_json::from_slice(raw).map_err(|_| invalid("invalid plan proposal"))?;
-    if document.version != 1 || document.contracts.is_empty() || document.contracts.len() > 1024 {
+    if !matches!((document.version,document.planner.is_some()),(1,false)|(2,true)|(3,true)) || document.contracts.is_empty() || document.contracts.len() > 1024 {
         return Err(invalid("invalid plan proposal"));
+    }
+    if document.version == 3 {
+        changes::validate_document(&document)?;
+    } else if document.envelope.is_some() || !document.changes.is_empty()
+        || document.contracts.iter().any(|c| c.cancellation_reason.is_some()) {
+        return Err(invalid("typed changes require proposal version 3"));
     }
     let mut seen = std::collections::BTreeSet::new();
     let mut listed = Vec::with_capacity(document.contracts.len());
@@ -104,41 +133,17 @@ fn parse_proposal(raw: &[u8]) -> Result<ParsedProposal> {
         return Err(invalid("plan proposal exceeds 256 KiB"));
     }
     Ok(ParsedProposal {
+        envelope: document.envelope,
+        changes: document.changes,
+        planner: document.planner,
         contracts: document.contracts,
         contract_texts,
     })
 }
 
-/// Cycle check uses the live queue plus this proposal. Mentioned tasks replace
-/// their edges; unmentioned queue edges stay. Nothing is written.
-fn reject_cycles(db: &Connection, proposal: &ParsedProposal) -> Result<()> {
-    let mut tasks = read_tasks(db)?;
-    let mut queue = scheduler::read(db)?.queue;
-    for contract in &proposal.contracts {
-        if !tasks.iter().any(|task| task.id == contract.task_id) {
-            tasks.push(Task {
-                id: contract.task_id.clone(),
-                revision: 1,
-                state: TaskState::Draft,
-                title: contract.task_id.as_str().to_string(),
-                active_attempt: None,
-            });
-        }
-        let dependencies = contract.dependencies.clone();
-        if let Some(existing) = queue.iter_mut().find(|row| row.task == contract.task_id) {
-            existing.dependencies = dependencies;
-        } else {
-            queue.push(QueueRecord {
-                task: contract.task_id.clone(),
-                priority: 0,
-                enqueued_unix_ms: 0,
-                enqueue_sequence: 0,
-                dependencies,
-            });
-        }
-    }
-    scheduler::graph(&tasks, &queue)
-}
+/// Cycle check overlays accepted planning intent and this proposal on the live
+/// queue. Unmentioned intent stays; execution state is never written here.
+fn reject_cycles(db: &Connection, proposal: &ParsedProposal,budget:Option<&read_budget::ReadBudget>) -> Result<()> {graph::validate(db,proposal,budget)}
 
 struct ExistingProposal {
     proposal_id: String,
@@ -151,10 +156,11 @@ fn lookup_proposal(
     db: &Connection,
     project_store: &str,
     key: &str,
+    budget:Option<&read_budget::ReadBudget>,
 ) -> Result<Option<ExistingProposal>> {
-    db.query_row(
+    read_budget::optional(db,
         "SELECT proposal_id, payload_digest, payload, plan_revision FROM plan_proposals WHERE project_store=?1 AND idempotency_key=?2",
-        params![project_store, key],
+        params![project_store, key],budget,&[],
         |row| {
             Ok(ExistingProposal {
                 proposal_id: row.get(0)?,
@@ -170,8 +176,6 @@ fn lookup_proposal(
             })
         },
     )
-    .optional()
-    .map_err(StoreError::from)
 }
 
 fn current_revision(db: &Connection) -> Result<u64> {
@@ -193,6 +197,10 @@ impl SqliteStore {
         expected_parent: u64,
         idempotency_key: &str,
     ) -> Result<PlanProposalReceipt> {
+        self.apply_plan_proposal_with_budget(raw,expected_parent,idempotency_key,None)
+    }
+    pub(crate) fn apply_plan_proposal_with_budget(&mut self,raw:&[u8],expected_parent:u64,idempotency_key:&str,budget:Option<&read_budget::ReadBudget>)->Result<PlanProposalReceipt> {
+        if let Some(budget)=budget {budget.check()?;budget.bytes(raw.len())?;}
         if raw.is_empty() || raw.len() > PROPOSAL_LIMIT {
             return Err(invalid("plan proposal exceeds 256 KiB"));
         }
@@ -209,12 +217,28 @@ impl SqliteStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         schema31(&tx)?;
-        if let Some(existing) = lookup_proposal(&tx, &project_store, idempotency_key)? {
+        if let Some(existing) = lookup_proposal(&tx, &project_store, idempotency_key,budget)? {
             if sha256_hex(&existing.payload) != existing.digest {
                 return Err(StoreError::Corrupt("plan proposal digest mismatch".into()));
             }
             if existing.digest != digest {
                 return Err(StoreError::Conflict);
+            }
+            let proposal=parse_proposal(raw)?;
+            changes::validate_replay(&tx,&proposal,&project_store,idempotency_key,existing.plan_revision-1,&existing.proposal_id,budget)?;
+            if let Some(binding)=proposal.planner {
+                sessions::validate_binding(&tx,&binding,existing.plan_revision-1,&project_store,budget)?;
+                let linked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM planner_proposal_inputs WHERE proposal_id=?1 AND session_id=?2 AND input_digest=?3)",
+                    params![existing.proposal_id,binding.session_id,binding.input_digest],|r|r.get(0))?;
+                if !linked {return Err(StoreError::Corrupt("planner proposal input link missing".into()));}
+            }
+            let schema:u32=tx.query_row("PRAGMA user_version",[],|row|row.get(0))?;
+            if schema>=43 {
+                let requested:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM replan_requests WHERE replan_id=?1 AND outcome='automatic')",[idempotency_key],|row|row.get(0))?;
+                if requested {
+                    let response:Option<String>=tx.query_row("SELECT proposal_id FROM replan_responses WHERE replan_id=?1",[idempotency_key],|row|row.get(0)).optional()?;
+                    if response.as_deref()!=Some(existing.proposal_id.as_str()) {return Err(StoreError::Conflict);}
+                }
             }
             let receipt = PlanProposalReceipt {
                 plan_revision: existing.plan_revision,
@@ -222,15 +246,24 @@ impl SqliteStore {
                 digest: existing.digest,
                 replayed: true,
             };
+            if let Some(budget)=budget {budget.check()?;}
             tx.commit()?;
             return Ok(receipt);
         }
         let proposal = parse_proposal(raw)?;
-        reject_cycles(&tx, &proposal)?;
         let current = current_revision(&tx)?;
         if current != expected_parent {
             return Err(StoreError::StalePlanParent(current));
         }
+        if let Some(binding)=&proposal.planner {sessions::validate_binding(&tx,binding,current,&project_store,budget)?;}
+        let schema:u32=tx.query_row("PRAGMA user_version",[],|row|row.get(0))?;
+        let replan_parent:Option<u64>=if schema>=43 {
+            tx.query_row("SELECT plan_revision FROM replan_requests WHERE replan_id=?1 AND outcome='automatic'",[idempotency_key],|row|row.get(0)).optional()?
+        }else{None};
+        if replan_parent.is_some_and(|parent|parent!=current) {return Err(StoreError::StalePlanParent(current));}
+        changes::validate_identity(&tx,&proposal,&project_store,idempotency_key,current,budget)?;
+        changes::validate_changes(&tx,&proposal,budget)?;
+        reject_cycles(&tx,&proposal,budget)?;
         let next = current
             .checked_add(1)
             .ok_or_else(|| invalid("plan revision exhausted"))?;
@@ -275,8 +308,24 @@ impl SqliteStore {
                 created_unix_ms
             ],
         )?;
+        changes::record(&tx,&proposal,&proposal_id)?;
+        if let Some(binding)=&proposal.planner {
+            tx.execute("INSERT INTO planner_proposal_inputs(proposal_id,session_id,input_digest) VALUES(?1,?2,?3)",
+                params![proposal_id,binding.session_id,binding.input_digest])?;
+        }
         // A new revision starts its own replan budget. Older rows stay put.
         record_replan_reset(&tx, next, created_unix_ms)?;
+        if replan_parent.is_some() {
+            tx.execute("INSERT INTO replan_responses VALUES(?1,?2,?3)",params![idempotency_key,proposal_id,created_unix_ms])?;
+            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('replan.responded',?1,1,1,?2)",params![idempotency_key,serde_json::json!({"proposal_id":proposal_id,"plan_revision":next}).to_string()])?;
+            let notice=sha256_hex(format!("replan-notice\0{idempotency_key}").as_bytes());
+            tx.execute("UPDATE inbox_items SET revision=revision+1,seen=1,done=1 WHERE id=?1 AND done=0",[&notice])?;
+            let revision:Option<u64>=tx.query_row("SELECT revision FROM inbox_items WHERE id=?1",[&notice],|row|row.get(0)).optional()?;
+            if let Some(revision)=revision {
+                tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('inbox.done',?1,?2,1,'{\"seen\":true,\"done\":true}')",params![notice,integer(revision)?])?;
+            }
+        }
+        if let Some(budget)=budget {budget.check()?;}
         tx.commit()?;
         Ok(PlanProposalReceipt {
             plan_revision: next,
@@ -384,10 +433,10 @@ struct FeedbackRow {
     reason: String,
 }
 
-fn load_feedback(tx: &Connection, feedback_id: &str) -> Result<Option<FeedbackRow>> {
-    tx.query_row(
+fn load_feedback(tx: &Connection, feedback_id: &str, budget:Option<&read_budget::ReadBudget>) -> Result<Option<FeedbackRow>> {
+    read_budget::optional(tx,
         "SELECT operation_id, category, task_id, reason FROM feedback_items WHERE feedback_id=?1",
-        [feedback_id],
+        [feedback_id],budget,&[],
         |row| {
             Ok(FeedbackRow {
                 operation_id: row.get(0)?,
@@ -397,13 +446,15 @@ fn load_feedback(tx: &Connection, feedback_id: &str) -> Result<Option<FeedbackRo
             })
         },
     )
-    .optional()
-    .map_err(StoreError::from)
+
 }
 
 fn automatic_count(tx: &Connection, plan_revision: u64, fingerprint: &str) -> Result<i64> {
+    // Revisions, not wall-clock ordering, delimit the budget. Reset timestamps
+    // are audit metadata: a clock correction must not hide requests already
+    // charged to this revision.
     let count: i64 = tx.query_row(
-        "SELECT count(*) FROM replan_requests WHERE plan_revision=?1 AND blocker_fingerprint=?2 AND outcome='automatic' AND created_unix_ms >= coalesce((SELECT reset_unix_ms FROM replan_budget_resets WHERE plan_revision=?1), 0)",
+        "SELECT count(*) FROM replan_requests WHERE plan_revision=?1 AND blocker_fingerprint=?2 AND outcome='automatic'",
         params![integer(plan_revision)?, fingerprint],
         |row| row.get(0),
     )?;
@@ -449,6 +500,34 @@ fn decision_from_row(
 }
 
 const REPLAN_OWNER: &str = "replan-controller";
+
+/// The feedback acknowledgment transfers responsibility to this durable request;
+/// it is not evidence that a planner has already produced an accepted proposal.
+fn ensure_replan_notice(tx:&Connection,decision:&ReplanDecision,budget:Option<&read_budget::ReadBudget>)->Result<()> {
+    let ReplanDecision::Automatic{replan_id,..}=decision else{return Ok(());};
+    let (feedback_id,parent,created):(String,u64,i64)=tx.query_row(
+        "SELECT feedback_id,plan_revision,created_unix_ms FROM replan_requests WHERE replan_id=?1 AND outcome='automatic'",
+        [replan_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+    let feedback=load_feedback(tx,&feedback_id,budget)?.ok_or_else(||StoreError::Corrupt("replan feedback is missing".into()))?;
+    let id=sha256_hex(format!("replan-notice\0{replan_id}").as_bytes());
+    let content=crate::domain::InboxContent {
+        id:id.clone(),kind:"replan-request".into(),subject:feedback.task_id.clone(),
+        created:jiff::Timestamp::from_millisecond(created).map_err(|error|invalid(&error.to_string()))?.to_string(),
+        summary:format!("plan revision requested for {}",feedback.task_id),
+        body:serde_json::json!({"schema_version":1,"replan_id":replan_id,"feedback_id":feedback_id,"task_id":feedback.task_id,"operation_id":feedback.operation_id,"category":feedback.category,"reason":feedback.reason,"expected_plan_revision":parent,"idempotency_key":replan_id,"response":"Submit an unsigned plan proposal using the expected plan revision and idempotency key. This request grants no execution authority."}).to_string(),
+    };
+    content.validate().map_err(StoreError::Invalid)?;
+    let payload=serde_json::to_string(&content).map_err(|error|invalid(&error.to_string()))?;
+    let hash=sha256_hex(payload.as_bytes());
+    let existing:Option<(String,String)>=read_budget::optional(tx,"SELECT payload,payload_hash FROM inbox_items WHERE id=?1",[&id],budget,&[],|row|Ok((row.get(0)?,row.get(1)?)))?;
+    if let Some((old,old_hash))=existing {
+        if old!=payload||old_hash!=hash {return Err(StoreError::Corrupt("replan notice identity mismatch".into()));}
+        return Ok(());
+    }
+    tx.execute("INSERT INTO inbox_items VALUES(?1,1,?2,?3,0,0)",params![id,payload,hash])?;
+    tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('replan.requested',?1,1,1,?2)",params![replan_id,serde_json::json!({"inbox_id":id,"feedback_id":feedback_id,"plan_revision":parent}).to_string()])?;
+    Ok(())
+}
 
 /// Ack the current lease. An unexpired claim held by someone else conflicts.
 /// An expired lease is marked expired so the next epoch can ack.
@@ -596,6 +675,18 @@ impl SqliteStore {
         attempt_id: Option<&str>,
         condition: &str,
     ) -> Result<WaitRegistration> {
+        self.register_wait_with_deadline(task_id,attempt_id,condition,None)
+    }
+    pub fn register_wait_with_deadline(&mut self,task_id:&str,attempt_id:Option<&str>,condition:&str,deadline:Option<i64>)->Result<WaitRegistration> {
+        self.register_wait_with_trigger(task_id,attempt_id,condition,deadline,None)
+    }
+    pub fn register_wait_with_trigger(&mut self,task_id:&str,attempt_id:Option<&str>,condition:&str,deadline:Option<i64>,trigger:Option<&WaitTrigger>)->Result<WaitRegistration> {
+        self.register_wait_with_budget(task_id,attempt_id,condition,deadline,trigger,None)
+    }
+    pub(crate) fn register_wait_with_budget(&mut self,task_id:&str,attempt_id:Option<&str>,condition:&str,deadline:Option<i64>,trigger:Option<&WaitTrigger>,budget:Option<&read_budget::ReadBudget>)->Result<WaitRegistration> {
+        if let Some(budget)=budget {budget.check()?;}
+        if let Some(trigger)=trigger {trigger.validate(condition).map_err(StoreError::Invalid)?;}
+        if deadline.is_some_and(|value|value<0||jiff::Timestamp::from_millisecond(value).is_err()) {return Err(invalid("invalid wait deadline"));}
         if !identifier(task_id) || !wait_condition(condition) {
             return Err(invalid("wait is invalid"));
         }
@@ -608,6 +699,8 @@ impl SqliteStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         schema36(&tx)?;
+        let schema:u32=tx.query_row("PRAGMA user_version",[],|row|row.get(0))?;
+        if (deadline.is_some()||trigger.is_some())&&schema<43 {return Err(StoreError::UnsupportedSchema(schema));}
         let task_exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1)",
             [task_id],
@@ -628,9 +721,10 @@ impl SqliteStore {
         }
         let plan_revision = current_revision(&tx)?;
         let attempt_key = attempt_id.unwrap_or("");
-        let wait_id = sha256_hex(
-            format!("{task_id}\0{attempt_key}\0{condition}\0{plan_revision}").as_bytes(),
-        );
+        let mut identity=format!("{task_id}\0{attempt_key}\0{condition}\0{plan_revision}");
+        if let Some(deadline)=deadline {identity.push_str(&format!("\0deadline\0{deadline}"));}
+        if let Some(trigger)=trigger {identity.push_str(&format!("\0trigger\0{}",serde_json::to_string(trigger).map_err(|_|invalid("wait trigger encoding failed"))?));}
+        let wait_id=sha256_hex(identity.as_bytes());
         let existing: Option<i64> = tx
             .query_row(
                 "SELECT cursor_sequence FROM wait_conditions WHERE wait_id=?1",
@@ -655,13 +749,17 @@ impl SqliteStore {
                     "task_id": task_id,
                     "condition": condition,
                     "plan_revision": plan_revision,
+                    "deadline_unix_ms": deadline,
+                    "trigger": trigger,
                 })
                 .to_string()
             ],
         )?;
         let cursor_sequence =
             i64::try_from(head(&tx)?).map_err(|_| invalid("wait cursor exceeds range"))?;
-        tx.execute(
+        if let Some(deadline)=deadline {
+            tx.execute("INSERT INTO wait_conditions(wait_id,task_id,attempt_id,condition,plan_revision,cursor_sequence,state,replayed_through,wake_requested,created_unix_ms,deadline_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,'waiting',NULL,0,?7,?8)",params![wait_id,task_id,attempt_id,condition,integer(plan_revision)?,cursor_sequence,now,deadline])?;
+        }else {tx.execute(
             "INSERT INTO wait_conditions(wait_id,task_id,attempt_id,condition,plan_revision,cursor_sequence,state,replayed_through,wake_requested,created_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,'waiting',NULL,0,?7)",
             params![
                 wait_id,
@@ -672,7 +770,16 @@ impl SqliteStore {
                 cursor_sequence,
                 now
             ],
-        )?;
+        )?;}
+        if let Some(trigger)=trigger {wait_triggers::insert(&tx,&wait_id,trigger,budget)?;}
+        // Evidence can precede subscription registration. Bind that observation
+        // to a new addressed wake in the same transaction, avoiding a lost wake.
+        if let Some((kind,entity,sequence))=current_wait_evidence(&tx,task_id,attempt_id,condition,trigger,budget)? {
+            if relevant_wait_event(&tx,task_id,attempt_id,condition,trigger,&kind,&entity,sequence,budget)? {
+                tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake',?1,1,1,?2)",params![wait_id,serde_json::json!({"source_sequence":sequence,"proved":false}).to_string()])?;
+            }
+        }
+        if let Some(budget)=budget {budget.check()?;}
         tx.commit()?;
         Ok(WaitRegistration {
             wait_id,
@@ -681,8 +788,11 @@ impl SqliteStore {
         })
     }
 
-    /// Apply events after the cursor one time. A second call does not apply them again.
+    /// Replay a bounded page once, retaining the subscription until its own wake.
     pub fn replay_wait(&mut self, wait_id: &str) -> Result<WaitReplay> {
+        self.replay_wait_with_budget(wait_id,None)
+    }
+    pub(crate) fn replay_wait_with_budget(&mut self, wait_id: &str,budget:Option<&read_budget::ReadBudget>) -> Result<WaitReplay> {
         if !identifier(wait_id) {
             return Err(invalid("wait is invalid"));
         }
@@ -690,6 +800,8 @@ impl SqliteStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         schema36(&tx)?;
+        let version: u32 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 42 { return Err(StoreError::UnsupportedSchema(version)); }
         let row: Option<(i64, String, Option<i64>, i64)> = tx
             .query_row(
                 "SELECT cursor_sequence, state, replayed_through, wake_requested FROM wait_conditions WHERE wait_id=?1",
@@ -697,10 +809,10 @@ impl SqliteStore {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
-        let Some((cursor_sequence, state, replayed_through, wake_requested)) = row else {
+        let Some((cursor_sequence, _state, replayed_through, wake_requested)) = row else {
             return Err(invalid("wait is not registered"));
         };
-        if state == "replayed" {
+        if wake_requested == 1 {
             let events_applied: i64 = tx.query_row(
                 "SELECT count(*) FROM wait_replay_events WHERE wait_id=?1",
                 [wait_id],
@@ -719,29 +831,46 @@ impl SqliteStore {
                 already_replayed: true,
             });
         }
-        let events: Vec<(i64, String)> = {
+        let (task,attempt,condition):(String,Option<String>,String)=tx.query_row(
+            "SELECT task_id,attempt_id,condition FROM wait_conditions WHERE wait_id=?1",[wait_id],
+            |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+        let trigger=wait_triggers::load(&tx,wait_id,budget)?;
+        let after = replayed_through.unwrap_or(cursor_sequence);
+        let deadline:Option<i64>=if version>=43 {tx.query_row("SELECT deadline_unix_ms FROM wait_conditions WHERE wait_id=?1",[wait_id],|row|row.get(0))?}else{None};
+        let expired=deadline.is_some_and(|deadline|jiff::Timestamp::now().as_millisecond()>=deadline);
+        let events: Vec<(i64, String, String)> = if expired {
+            // A timeout is an independent advisory trigger. Do not let an
+            // unrelated event backlog delay it, and never treat it as evidence.
+            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake',?1,1,1,?2)",params![wait_id,serde_json::json!({"reason":"deadline_expired","deadline_unix_ms":deadline,"proved":false}).to_string()])?;
+            vec![(integer(head(&tx)?)?,"wait.wake".into(),wait_id.into())]
+        }else {
             let mut stmt = tx.prepare(
-                "SELECT sequence, kind FROM events WHERE sequence > ?1 ORDER BY sequence",
+                "SELECT sequence, kind, entity FROM events WHERE sequence > ?1 ORDER BY sequence LIMIT 1000",
             )?;
-            let rows = stmt.query_map(params![cursor_sequence], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(StoreError::from)?
+            let mut rows=stmt.query(params![after])?;
+            let mut events=Vec::new();
+            while let Some(row)=rows.next()? {
+                if let Some(budget)=budget {budget.row(row,&[])?;}
+                events.push((row.get(0)?,row.get(1)?,row.get(2)?));
+            }
+            events
         };
         let mut wake = false;
-        for (sequence, kind) in &events {
-            let is_wake = kind == "wait.wake";
+        let mut wake_sequence = None;
+        for (sequence, kind, entity) in &events {
+            let is_wake = (kind == "wait.wake" && entity == wait_id)
+                || (!wake && relevant_wait_event(&tx,&task,attempt.as_deref(),&condition,trigger.as_ref(),kind,entity,*sequence,budget)?);
             wake |= is_wake;
+            if is_wake && wake_sequence.is_none() { wake_sequence=Some(*sequence); }
             tx.execute(
                 "INSERT INTO wait_replay_events(wait_id,event_sequence,kind,wake) VALUES(?1,?2,?3,?4)",
                 params![wait_id, sequence, kind, i64::from(is_wake)],
             )?;
         }
-        let replayed_through =
-            i64::try_from(head(&tx)?).map_err(|_| invalid("wait cursor exceeds range"))?;
+        let replayed_through = events.last().map_or(after, |event| event.0);
+        if let Some(sequence)=wake_sequence { insert_wait_notice(&tx,wait_id,&task,&condition,sequence,replayed_through,expired)?; }
         let updated = tx.execute(
-            "UPDATE wait_conditions SET state='replayed', replayed_through=?2, wake_requested=?3 WHERE wait_id=?1 AND state='waiting'",
+            "UPDATE wait_conditions SET state='replayed', replayed_through=?2, wake_requested=?3 WHERE wait_id=?1 AND wake_requested=0",
             params![wait_id, replayed_through, i64::from(wake)],
         )?;
         if updated != 1 {
@@ -769,6 +898,10 @@ impl SqliteStore {
     /// Two automatic replans for this blocker and plan revision, then one inbox item.
     /// The third does not insert a plan proposal.
     pub fn request_replan(&mut self, feedback_id: &str) -> Result<ReplanDecision> {
+        self.request_replan_selected(feedback_id,None,false)
+    }
+    fn request_replan_selected(&mut self, feedback_id:&str,budget:Option<&read_budget::ReadBudget>,automatic:bool)->Result<ReplanDecision> {
+        if let Some(budget)=budget {budget.check()?;}
         if !identifier(feedback_id) {
             return Err(invalid("replan requires a schema 29 feedback row"));
         }
@@ -776,11 +909,13 @@ impl SqliteStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         schema36(&tx)?;
+        if automatic && !replan_service::enabled(&tx)? {return Err(StoreError::Conflict);}
         if let Some(decision) = existing_replan(&tx, feedback_id)? {
+            ensure_replan_notice(&tx,&decision,budget)?;
             tx.commit()?;
             return Ok(decision);
         }
-        let Some(feedback) = load_feedback(&tx, feedback_id)? else {
+        let Some(feedback) = load_feedback(&tx, feedback_id,budget)? else {
             return Err(invalid("replan requires a schema 29 feedback row"));
         };
         if !matches!(
@@ -789,11 +924,12 @@ impl SqliteStore {
         ) {
             return Err(invalid("pull-request poll is not a replan trigger"));
         }
+        let now = jiff::Timestamp::now().as_millisecond();
+        if !replan_service::available(&tx,feedback_id,now)? {return Err(StoreError::Conflict);}
         let plan_revision = current_revision(&tx)?;
         let fingerprint =
             blocker_fingerprint(&feedback.task_id, &feedback.category, &feedback.reason);
         let used = automatic_count(&tx, plan_revision, &fingerprint)?;
-        let now = jiff::Timestamp::now().as_millisecond();
         if used < AUTOMATIC_REPLANS {
             let replan_id = sha256_hex(format!("replan\0{feedback_id}").as_bytes());
             let proposal_id = replan_id.clone();
@@ -809,14 +945,20 @@ impl SqliteStore {
                 ],
             )?;
             ack_replan_proposal(&tx, feedback_id, &proposal_id, now)?;
-            tx.commit()?;
-            return Ok(ReplanDecision::Automatic {
+            let decision=ReplanDecision::Automatic {
                 replan_id,
                 proposal_id,
                 automatic_count: used + 1,
-            });
+            };
+            ensure_replan_notice(&tx,&decision,budget)?;
+            replan_service::link(&tx,feedback_id,&decision)?;
+            if let Some(budget)=budget {budget.check()?;}
+            tx.commit()?;
+            return Ok(decision);
         }
         if let Some(decision) = existing_escalation(&tx, plan_revision, &fingerprint)? {
+            replan_service::link(&tx,feedback_id,&decision)?;
+            if let Some(budget)=budget {budget.check()?;}
             tx.commit()?;
             return Ok(decision);
         }
@@ -834,11 +976,11 @@ impl SqliteStore {
                 now
             ],
         )?;
+        let decision=ReplanDecision::Escalated {replan_id,inbox_id};
+        replan_service::link(&tx,feedback_id,&decision)?;
+        if let Some(budget)=budget {budget.check()?;}
         tx.commit()?;
-        Ok(ReplanDecision::Escalated {
-            replan_id,
-            inbox_id,
-        })
+        Ok(decision)
     }
 
     /// Same attempt. The retry row is not an attempt, so max_attempts_per_task stays put.
@@ -899,7 +1041,7 @@ impl SqliteStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         schema36(&tx)?;
-        let Some(feedback) = load_feedback(&tx, feedback_id)? else {
+        let Some(feedback) = load_feedback(&tx, feedback_id,None)? else {
             return Err(invalid("acceptance rework requires verifier feedback"));
         };
         if feedback.category != "verifier_rejection" {
@@ -962,10 +1104,66 @@ impl SqliteStore {
     }
 }
 
+fn current_wait_evidence(db:&Connection,task:&str,attempt:Option<&str>,condition:&str,trigger:Option<&WaitTrigger>,budget:Option<&read_budget::ReadBudget>)->Result<Option<(String,String,i64)>> {
+    if let Some(trigger)=trigger {return wait_triggers::current(db,trigger,budget);}
+    let query=match condition {
+        "validation_completion" => "SELECT e.kind,e.entity,e.sequence FROM verification_runs v JOIN events e ON e.entity=v.run_id AND e.kind IN ('verification.accepted','verification.rejected') WHERE v.task_id=?1 AND (?2 IS NULL OR v.attempt_id=?2) AND v.contract_revision=(SELECT MAX(contract_revision) FROM task_contracts WHERE task_id=?1) ORDER BY e.sequence DESC LIMIT 1",
+        "dependency_evidence" => "SELECT e.kind,e.entity,e.sequence FROM dependency_satisfactions d LEFT JOIN verified_results v ON d.evidence_kind='verified_result' AND v.result_id=d.evidence_id JOIN events e ON (d.evidence_kind='verified_result' AND e.kind='verification.accepted' AND e.entity=v.run_id) OR (d.evidence_kind='integrated_commit' AND e.kind='integration.wake' AND e.entity=d.evidence_id) WHERE d.task_id=?1 AND d.state='valid' AND (?2 IS NULL OR EXISTS(SELECT 1 FROM attempts a WHERE a.id=?2 AND a.task_id=?1)) ORDER BY e.sequence DESC LIMIT 1",
+        _=>return Ok(None),
+    };
+    read_budget::optional(db,query,params![task,attempt],budget,&[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))
+}
+
+/// Published receipts request reevaluation; they never bypass dependency,
+/// contract, policy, attempt-generation or capacity validation at reservation.
+fn relevant_wait_event(db:&Connection,task:&str,attempt:Option<&str>,condition:&str,trigger:Option<&WaitTrigger>,kind:&str,entity:&str,sequence:i64,budget:Option<&read_budget::ReadBudget>)->Result<bool> {
+    if let Some(trigger)=trigger {return wait_triggers::relevant(db,task,condition,trigger,kind,entity,sequence,budget);}
+    if condition=="dependency_evidence" && matches!(kind,"contract.installed"|"scheduler.task_queued") {
+        return Ok(entity==task && dependency_wait_ready(db,task,budget)?);
+    }
+    let query=match (condition,kind) {
+        ("validation_completion","verification.accepted"|"verification.rejected") =>
+            "SELECT EXISTS(SELECT 1 FROM verification_runs v WHERE v.run_id=?1 AND v.task_id=?2 AND (?3 IS NULL OR v.attempt_id=?3) AND v.contract_revision=(SELECT MAX(contract_revision) FROM task_contracts WHERE task_id=?2))",
+        ("dependency_evidence","verification.accepted") =>
+            "SELECT EXISTS(SELECT 1 FROM dependency_satisfactions d JOIN verified_results v ON v.result_id=d.evidence_id WHERE d.task_id=?2 AND d.state='valid' AND d.evidence_kind='verified_result' AND v.run_id=?1 AND (?3 IS NULL OR EXISTS(SELECT 1 FROM attempts a WHERE a.id=?3 AND a.task_id=?2)))",
+        ("dependency_evidence","integration.wake") =>
+            "SELECT EXISTS(SELECT 1 FROM dependency_satisfactions d JOIN integrated_commits i ON i.integrated_id=d.evidence_id WHERE d.task_id=?2 AND d.state='valid' AND d.evidence_kind='integrated_commit' AND i.integrated_id=?1 AND (?3 IS NULL OR EXISTS(SELECT 1 FROM attempts a WHERE a.id=?3 AND a.task_id=?2)))",
+        _=>return Ok(false),
+    };
+    let relevant:bool=db.query_row(query,params![entity,task,attempt],|row|row.get(0))?;
+    if relevant && condition=="dependency_evidence" {
+        return Ok(dependency_wait_ready(db,task,budget)?);
+    }
+    Ok(relevant)
+}
+
+fn dependency_wait_ready(db:&Connection,task:&str,budget:Option<&read_budget::ReadBudget>)->Result<bool> {
+    let bound:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM task_contracts WHERE task_id=?1)",[task],|row|row.get(0))?;
+    if !bound {return Ok(false);}
+    Ok(super::satisfaction::satisfied_edges_on(db,task,budget)?.is_some_and(|edges|!edges.is_empty()))
+}
+
+fn insert_wait_notice(tx:&Connection,wait:&str,task:&str,condition:&str,sequence:i64,through:i64,expired:bool)->Result<()> {
+    let trigger=if expired {"its deadline expired"}else{"a relevant event arrived"};
+    let id=sha256_hex(format!("wait-notice\0{wait}").as_bytes());
+    let content=InboxContent {id:id.clone(),kind:"wait-wake".into(),subject:task.into(),
+        created:jiff::Timestamp::now().to_string(),summary:format!("reevaluate {condition} for {task}"),
+        body:format!("Wait {wait} requests reevaluation because {trigger} (event {sequence}). Revalidate current evidence and authority; this wake is not proof or a launch grant.")};
+    content.validate().map_err(StoreError::Invalid)?;
+    let payload=serde_json::to_string(&content).map_err(|e|invalid(&e.to_string()))?;
+    tx.execute("INSERT INTO inbox_items VALUES(?1,1,?2,?3,0,0)",params![id,payload,sha256_hex(payload.as_bytes())])?;
+    tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.notified',?1,1,1,?2)",params![wait,serde_json::json!({"inbox_id":id,"trigger_sequence":sequence,"trigger_through":through,"proved":false}).to_string()])?;
+    Ok(())
+}
+
 fn existing_replan(tx: &Connection, feedback_id: &str) -> Result<Option<ReplanDecision>> {
+    let version:u32=tx.query_row("PRAGMA user_version",[],|row|row.get(0))?;
+    let query=if version>=43 {
+        "SELECT r.replan_id,r.outcome,r.proposal_id,r.inbox_id,r.plan_revision FROM replan_feedback_links l JOIN replan_requests r ON r.replan_id=l.replan_id WHERE l.feedback_id=?1"
+    }else {"SELECT replan_id,outcome,proposal_id,inbox_id,plan_revision FROM replan_requests WHERE feedback_id=?1"};
     let row: Option<(String, String, Option<String>, Option<String>, i64)> = tx
         .query_row(
-            "SELECT replan_id, outcome, proposal_id, inbox_id, plan_revision FROM replan_requests WHERE feedback_id=?1",
+            query,
             [feedback_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
@@ -1066,8 +1264,8 @@ pub fn propose_plan(
         crate::migration::runtime_mutation(project).map_err(|error| invalid(&error.to_string()))?;
     let bytes =
         crate::migration::read_plan_file(document).map_err(|error| invalid(&error.to_string()))?;
-    let mut db =
-        crate::migration::open_active(project).map_err(|error| invalid(&error.to_string()))?;
+    let control=controlled::ReadControl::new(std::time::Instant::now()+Duration::from_secs(2),Default::default());
+    let mut db=crate::migration::open_active_scoped(project,control).map_err(|error|invalid(&error.to_string()))?;
     db.apply_plan_proposal(&bytes, expected_parent, idempotency_key)
 }
 
@@ -1108,106 +1306,6 @@ mod tests {
     }
     fn edge(predecessor: &str) -> String {
         format!(r#"{{"predecessor":"{predecessor}","requirement":"verified_result"}}"#)
-    }
-
-    #[test]
-    fn replay_of_the_same_bytes_returns_one_plan_revision() {
-        let (_temp, mut db) = fixture();
-        let bytes = proposal(&one("alpha", "ship the widget", ""));
-        let first = db.apply_plan_proposal(&bytes, 0, "replay-key").unwrap();
-        assert!(!first.replayed);
-        assert_eq!(first.plan_revision, 1);
-        let second = db.apply_plan_proposal(&bytes, 0, "replay-key").unwrap();
-        assert!(second.replayed);
-        assert_eq!(
-            second,
-            PlanProposalReceipt {
-                replayed: true,
-                ..first
-            }
-        );
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM plan_revisions"),
-            1
-        );
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM plan_proposals"),
-            1
-        );
-        assert_eq!(
-            count(
-                &db.connection,
-                "SELECT count(*) FROM events WHERE kind='plan.proposed'"
-            ),
-            1
-        );
-        let stored: Vec<u8> = db
-            .connection
-            .query_row("SELECT payload FROM plan_proposals", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(stored, bytes);
-        let texts: String = db
-            .connection
-            .query_row("SELECT contract_texts FROM plan_revisions", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert!(texts.contains("ship the widget"));
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM task_contracts"),
-            0
-        );
-    }
-
-    #[test]
-    fn stale_parent_conflicts_and_returns_the_current_revision() {
-        let (_temp, mut db) = fixture();
-        let first = proposal(&one("alpha", "first text", ""));
-        let stored = db.apply_plan_proposal(&first, 0, "key-1").unwrap();
-        let before = count(&db.connection, "SELECT count(*) FROM plan_revisions");
-        let error = db
-            .apply_plan_proposal(&proposal(&one("beta", "other text", "")), 0, "key-2")
-            .unwrap_err();
-        assert!(
-            matches!(error, StoreError::StalePlanParent(current) if current == stored.plan_revision)
-        );
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM plan_revisions"),
-            before
-        );
-        let parent: i64 = db
-            .connection
-            .query_row(
-                "SELECT parent_revision FROM plan_revisions WHERE plan_revision=?1",
-                [stored.plan_revision as i64],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(parent, 0);
-        let digest: String = db
-            .connection
-            .query_row(
-                "SELECT payload_digest FROM plan_revisions WHERE plan_revision=?1",
-                [stored.plan_revision as i64],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(digest, stored.digest);
-    }
-
-    #[test]
-    fn same_key_and_different_bytes_conflict() {
-        let (_temp, mut db) = fixture();
-        db.apply_plan_proposal(&proposal(&one("alpha", "one", "")), 0, "same-key")
-            .unwrap();
-        let error = db
-            .apply_plan_proposal(&proposal(&one("alpha", "two", "")), 1, "same-key")
-            .unwrap_err();
-        assert!(matches!(error, StoreError::Conflict));
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM plan_revisions"),
-            1
-        );
     }
 
     #[test]
@@ -1333,109 +1431,17 @@ mod tests {
     }
 
     #[test]
-    fn proposal_path_does_not_call_verify_signature_or_write_contracts() {
-        let source = include_str!("plans.rs");
-        let production = source.split("mod tests").next().unwrap();
-        let proposal = production
-            .split("pub fn apply_plan_proposal")
-            .nth(1)
-            .unwrap()
-            .split("fn schema36")
-            .next()
-            .unwrap();
-        assert!(!proposal.contains("verify_signature"));
-        assert!(!proposal.contains("task_contracts"));
-        assert!(!proposal.contains("contract_scope_paths"));
-        assert!(!proposal.contains("contract_named_resources"));
-        assert!(!proposal.contains("install_contract"));
-        assert!(!proposal.contains("reserve_"));
-        assert!(!production.contains("verify_signature"));
-        assert!(!production.contains("install_contract"));
-        assert!(!production.contains("pr_polling"));
-        assert!(!production.contains("reserve_"));
-        let sql = include_str!("../../migrations/0031_plan_revisions.sql");
-        assert!(!sql.contains("task_contracts"));
-        assert!(!sql.contains("contract_scope_paths"));
-        assert!(!sql.contains("contract_named_resources"));
-        assert!(!sql.contains("verify_signature"));
-        let cli = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli.rs"),
-        )
-        .unwrap();
-        let start = cli.find("Command::Plan{command}").unwrap();
-        let rest = &cli[start..];
-        let end = rest[1..]
-            .find("\n        Command::")
-            .map(|offset| offset + 1)
-            .unwrap();
-        let arm = &rest[..end];
-        assert!(arm.contains("propose_plan"));
-        assert!(!arm.contains("verify_signature"));
-        assert!(!arm.contains("import_contract"));
-        assert!(!arm.contains("reserve"));
-        assert!(!arm.contains("task_contracts"));
-        assert!(!arm.contains("contract_scope_paths"));
-        assert!(!arm.contains("contract_named_resources"));
-    }
-
-    #[test]
-    fn plan_propose_leaves_scope_tables_empty() {
-        let (_temp, mut db) = fixture();
-        assert!(table_exists(&db.connection, "contract_scope_paths"));
-        assert!(table_exists(&db.connection, "contract_named_resources"));
-        let paths = count(&db.connection, "SELECT count(*) FROM contract_scope_paths");
-        let named = count(
-            &db.connection,
-            "SELECT count(*) FROM contract_named_resources",
-        );
-        let contracts = count(&db.connection, "SELECT count(*) FROM task_contracts");
-        let attempts = count(&db.connection, "SELECT count(*) FROM attempts");
-        let stored = db
-            .apply_plan_proposal(
-                &proposal(&one("alpha", "scope src/lib.rs schema lockfile", "")),
-                0,
-                "scope-key",
-            )
-            .unwrap();
-        assert!(!stored.replayed);
-        assert_eq!(stored.plan_revision, 1);
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM contract_scope_paths"),
-            paths
-        );
-        assert_eq!(
-            count(
-                &db.connection,
-                "SELECT count(*) FROM contract_named_resources"
-            ),
-            named
-        );
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM task_contracts"),
-            contracts
-        );
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM attempts"),
-            attempts
-        );
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM plan_revisions"),
-            1
-        );
-    }
-
-    #[test]
     fn upgrade_v1_from_30_to_31_and_import_requires_current_schema() {
         let fresh = tempfile::tempdir().unwrap();
         let mut created = SqliteStore::create(&fresh.path().join("state.db")).unwrap();
-        assert_eq!(user_version(&created.connection), 41);
+        assert_eq!(user_version(&created.connection), crate::store::SCHEMA);
         assert_eq!(
             created
                 .connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            41
+            crate::store::SCHEMA
         );
         assert!(table_exists(&created.connection, "plan_proposals"));
         assert!(table_exists(&created.connection, "plan_revisions"));
@@ -1447,9 +1453,7 @@ mod tests {
         let db = SqliteStore::create(&path).unwrap();
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
-        raw.execute_batch(
-            "DROP INDEX IF EXISTS attempts_retained_by_id; DROP TABLE IF EXISTS active_work_index; DROP TABLE IF EXISTS active_work_meta; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_update; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_delete; DROP TRIGGER IF EXISTS barrier_members_no_update; DROP TRIGGER IF EXISTS barrier_members_no_delete; DROP TRIGGER IF EXISTS barrier_revisions_no_membership_update; DROP TABLE IF EXISTS barrier_stale_briefs; DROP TABLE IF EXISTS barrier_members; DROP TABLE IF EXISTS barrier_revisions; DROP TRIGGER IF EXISTS memory_change_receipts_no_update; DROP TRIGGER IF EXISTS memory_change_receipts_no_delete; DROP TRIGGER IF EXISTS update_package_members_no_update; DROP TRIGGER IF EXISTS update_package_members_no_delete; DROP TRIGGER IF EXISTS update_packages_no_update; DROP TRIGGER IF EXISTS update_packages_no_delete; DROP TABLE IF EXISTS memory_change_receipts; DROP TABLE IF EXISTS update_package_members; ALTER TABLE consumer_bindings DROP COLUMN applied_cursor; DROP TABLE IF EXISTS update_packages; DROP TRIGGER IF EXISTS memory_read_set_on_record; DROP TRIGGER IF EXISTS memory_read_set_on_reclassify; DROP TRIGGER IF EXISTS memory_read_set_on_revision; DROP TRIGGER IF EXISTS memory_read_set_on_validity; DROP TRIGGER IF EXISTS memory_read_set_on_head; DROP TABLE IF EXISTS memory_scope_catalog; DROP TABLE IF EXISTS memory_required_generation; DROP TABLE IF EXISTS consumer_binding_undeliverable; DROP TABLE IF EXISTS consumer_binding_obligations; DROP TABLE IF EXISTS consumer_bindings; DROP TABLE IF EXISTS wait_replay_events; DROP TABLE IF EXISTS replan_requests; DROP TABLE IF EXISTS replan_budget_resets; DROP TABLE IF EXISTS attempt_infrastructure_retries; DROP TABLE IF EXISTS wait_conditions; DROP TABLE IF EXISTS resource_claims; DROP TABLE IF EXISTS delegation_stop_obligations; DROP TABLE IF EXISTS delegation_revocations; DROP TABLE IF EXISTS delegation_grants; DROP TABLE IF EXISTS capability_evidence; DROP TABLE IF EXISTS contract_named_resources; DROP TABLE IF EXISTS contract_scope_paths; DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; UPDATE store_meta SET schema_version=30; PRAGMA user_version=30;",
-        )
+        crate::store::test_schema::historical(&raw, 30)
         .unwrap();
         drop(raw);
         let mut db = SqliteStore::open(&path).unwrap();
@@ -1461,20 +1465,20 @@ mod tests {
         ));
         assert_eq!(user_version(&db.connection), 30);
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 41);
+        assert_eq!(user_version(&db.connection), crate::store::SCHEMA);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            41
+            crate::store::SCHEMA
         );
         assert!(table_exists(&db.connection, "plan_proposals"));
         assert!(table_exists(&db.connection, "plan_revisions"));
         check_schema(&db.connection).unwrap();
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 41);
+        assert_eq!(user_version(&reopened.connection), crate::store::SCHEMA);
         assert!(table_exists(&reopened.connection, "plan_revisions"));
     }
 
@@ -1520,7 +1524,7 @@ mod tests {
         drop(created);
         assert_eq!(
             user_version(&rusqlite::Connection::open(&created_path).unwrap()),
-            41
+            crate::store::SCHEMA
         );
         assert!(table_exists(
             &rusqlite::Connection::open(&created_path).unwrap(),
@@ -1530,18 +1534,6 @@ mod tests {
             &rusqlite::Connection::open(&created_path).unwrap(),
             "replan_requests"
         ));
-        let open_fn = include_str!("mod.rs")
-            .split("pub fn open")
-            .nth(1)
-            .unwrap()
-            .split("pub fn integrity_check")
-            .next()
-            .unwrap();
-        assert!(!open_fn.contains("upgrade_v1"));
-        assert!(!open_fn.contains("0036_waits"));
-        let migration = include_str!("../../migrations/0036_waits.sql").to_ascii_lowercase();
-        assert!(!migration.contains("update verification"));
-        assert!(!migration.contains("delete from verification"));
 
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state.db");
@@ -1549,9 +1541,7 @@ mod tests {
         seed_task(&mut db, "kept");
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
-        raw.execute_batch(
-            "DROP INDEX IF EXISTS attempts_retained_by_id; DROP TABLE IF EXISTS active_work_index; DROP TABLE IF EXISTS active_work_meta; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_update; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_delete; DROP TRIGGER IF EXISTS barrier_members_no_update; DROP TRIGGER IF EXISTS barrier_members_no_delete; DROP TRIGGER IF EXISTS barrier_revisions_no_membership_update; DROP TABLE IF EXISTS barrier_stale_briefs; DROP TABLE IF EXISTS barrier_members; DROP TABLE IF EXISTS barrier_revisions; DROP TRIGGER IF EXISTS memory_change_receipts_no_update; DROP TRIGGER IF EXISTS memory_change_receipts_no_delete; DROP TRIGGER IF EXISTS update_package_members_no_update; DROP TRIGGER IF EXISTS update_package_members_no_delete; DROP TRIGGER IF EXISTS update_packages_no_update; DROP TRIGGER IF EXISTS update_packages_no_delete; DROP TABLE IF EXISTS memory_change_receipts; DROP TABLE IF EXISTS update_package_members; ALTER TABLE consumer_bindings DROP COLUMN applied_cursor; DROP TABLE IF EXISTS update_packages; DROP TRIGGER IF EXISTS memory_read_set_on_record; DROP TRIGGER IF EXISTS memory_read_set_on_reclassify; DROP TRIGGER IF EXISTS memory_read_set_on_revision; DROP TRIGGER IF EXISTS memory_read_set_on_validity; DROP TRIGGER IF EXISTS memory_read_set_on_head; DROP TABLE IF EXISTS memory_scope_catalog; DROP TABLE IF EXISTS memory_required_generation; DROP TABLE IF EXISTS consumer_binding_undeliverable; DROP TABLE IF EXISTS consumer_binding_obligations; DROP TABLE IF EXISTS consumer_bindings; DROP TABLE IF EXISTS wait_replay_events; DROP TABLE IF EXISTS replan_requests; DROP TABLE IF EXISTS replan_budget_resets; DROP TABLE IF EXISTS attempt_infrastructure_retries; DROP TABLE IF EXISTS wait_conditions; UPDATE store_meta SET schema_version=35; PRAGMA user_version=35;",
-        )
+        crate::store::test_schema::historical(&raw, 35)
         .unwrap();
         drop(raw);
         let mut db = SqliteStore::open(&path).unwrap();
@@ -1560,13 +1550,13 @@ mod tests {
         assert!(!table_exists(&db.connection, "replan_requests"));
         assert_eq!(db.read_snapshot(None).unwrap().tasks[0].title, "kept");
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 41);
+        assert_eq!(user_version(&db.connection), crate::store::SCHEMA);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            41
+            crate::store::SCHEMA
         );
         assert!(table_exists(&db.connection, "wait_conditions"));
         assert!(table_exists(&db.connection, "replan_requests"));
@@ -1582,7 +1572,281 @@ mod tests {
         check_schema(&db.connection).unwrap();
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 41);
+        assert_eq!(user_version(&reopened.connection), crate::store::SCHEMA);
+    }
+
+    #[test]
+    fn automatic_replans_are_opt_in_bounded_and_coalesce_durably() {
+        let (root,mut db)=fixture();seed_task(&mut db,"task");
+        let ids:Vec<_>=(0..9).map(|n|record_rejection(&mut db,&format!("auto-{n}"),"task")).collect();
+        let budget=||read_budget::ReadBudget::new(controlled::ReadControl::new(std::time::Instant::now()+Duration::from_secs(5),Default::default()));
+        assert!(!db.service_replans(&budget()).unwrap().pending);
+        db.set_auto_replans(db.current_head().unwrap(),true).unwrap();
+        assert!(!db.service_replans(&budget()).unwrap().pending); // Paused project.
+        db.connection.execute("UPDATE project_control SET state='active'",[]).unwrap();
+        assert_eq!(db.service_replans(&budget()).unwrap().processed,8);
+        assert_eq!(db.service_replans(&budget()).unwrap().processed,1);
+        assert!(!db.service_replans(&budget()).unwrap().pending);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM replan_requests WHERE outcome='automatic'"),2);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM replan_requests WHERE outcome='escalated'"),1);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM replan_feedback_links"),9);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM inbox_items"),3);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM attempts"),0);
+        let decisions:Vec<_>=ids.iter().map(|id|db.request_replan(id).unwrap()).collect();
+        let path=PathBuf::from(db.connection.path().unwrap());drop(db);
+        let mut db=SqliteStore::open(&path).unwrap();let _keep=root;
+        assert!(!db.service_replans(&budget()).unwrap().pending);
+        db.apply_plan_proposal(&proposal(&one("task","new plan","")),0,"auto-new-plan").unwrap();
+        for (id,decision) in ids.iter().zip(decisions) {assert_eq!(db.request_replan(id).unwrap(),decision);}
+        let later=record_rejection(&mut db,"later-feedback","task");
+        db.set_auto_replans(db.current_head().unwrap(),false).unwrap();
+        assert!(!db.service_replans(&budget()).unwrap().pending);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM replan_pending_feedback"),1);
+        assert!(matches!(db.request_replan(&later).unwrap(),ReplanDecision::Automatic{automatic_count:1,..}));
+    }
+
+    #[test]
+    fn automatic_replans_respect_leases_and_retry_atomic_notice_failures() {
+        let (_root,mut db)=fixture();seed_task(&mut db,"task");
+        let held=record_rejection(&mut db,"held-feedback","task");
+        let ready=record_rejection(&mut db,"ready-feedback","task");
+        let now=jiff::Timestamp::now().as_millisecond();db.claim_feedback_item(&held,"another-consumer",now,60_000).unwrap();
+        db.set_auto_replans(db.current_head().unwrap(),true).unwrap();db.connection.execute("UPDATE project_control SET state='active'",[]).unwrap();
+        let budget=||read_budget::ReadBudget::new(controlled::ReadControl::new(std::time::Instant::now()+Duration::from_secs(5),Default::default()));
+        let before=db.current_head().unwrap();
+        db.connection.execute_batch("CREATE TEMP TRIGGER refuse_replan_notice BEFORE INSERT ON inbox_items BEGIN SELECT RAISE(ABORT,'fault'); END;").unwrap();
+        assert!(db.service_replans(&budget()).is_err());assert_eq!(db.current_head().unwrap(),before);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM replan_requests"),0);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM replan_pending_feedback"),2);
+        db.connection.execute_batch("DROP TRIGGER refuse_replan_notice;").unwrap();
+        for _ in 0..3 {db.service_replans(&budget()).unwrap();}
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM replan_feedback_links"),1);
+        assert!(existing_replan(&db.connection,&held).unwrap().is_none());assert!(existing_replan(&db.connection,&ready).unwrap().is_some());
+        assert!(db.service_replans(&budget()).unwrap().pending);
+    }
+
+    #[test]
+    fn automatic_replan_idle_selection_does_not_scan_linked_history() {
+        use std::sync::{Arc,atomic::{AtomicUsize,Ordering}};
+        let (_root,mut db)=fixture();seed_task(&mut db,"task");let first=record_rejection(&mut db,"baseline","task");
+        let decision=db.request_replan(&first).unwrap();let ReplanDecision::Automatic{replan_id,..}=decision else {panic!()};
+        db.set_auto_replans(db.current_head().unwrap(),true).unwrap();db.connection.execute("UPDATE project_control SET state='active'",[]).unwrap();
+        let mut work=Vec::new();
+        for history in [false,true] {
+            if history {
+                db.connection.execute_batch("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<10000) INSERT INTO feedback_items SELECT printf('%064d',x),printf('history-%d',x),1,'verifier_rejection','task','checks_failed','open',NULL,0 FROM n;").unwrap();
+                db.connection.execute("INSERT INTO replan_feedback_links SELECT feedback_id,?1 FROM feedback_items WHERE operation_id LIKE 'history-%'",[&replan_id]).unwrap();
+            }
+            let steps=Arc::new(AtomicUsize::new(0));let counter=steps.clone();db.connection.progress_handler(1,Some(move||{counter.fetch_add(1,Ordering::Relaxed);false}));
+            let budget=read_budget::ReadBudget::new(controlled::ReadControl::new(std::time::Instant::now()+Duration::from_secs(5),Default::default()));
+            assert!(!db.service_replans(&budget).unwrap().pending);
+            db.connection.progress_handler(0,None::<fn()->bool>);work.push(steps.load(Ordering::Relaxed));
+        }
+        eprintln!("automatic replan idle SQL steps at 0/10000 linked feedback rows: {work:?}");
+        assert!(work[1]<=work[0]+100,"linked history increased idle work: {work:?}");
+    }
+
+    #[test]
+    fn capacity_wait_requires_matching_termination_generation_and_receipt() {
+        let (_temp,mut db)=fixture();seed_task(&mut db,"parent");seed_task(&mut db,"child");
+        db.connection.execute("INSERT INTO attempts VALUES('child-attempt','child',1,'running',NULL,'slot',0)",[]).unwrap();
+        let trigger=WaitTrigger::AttemptCapacityReleased{attempt_id:crate::domain::AttemptId::new("child-attempt").unwrap(),after_revision:1};
+        let wait=db.register_wait_with_trigger("parent",None,"resource_availability",None,Some(&trigger)).unwrap();
+        db.connection.execute_batch("UPDATE attempts SET state='completed',revision=2 WHERE id='child-attempt'; INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('attempt.changed','child-attempt',2,1,'{}');").unwrap();
+        assert!(!db.replay_wait(&wait.wait_id).unwrap().wake_requested);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM attempts WHERE termination_observed=0"),1);
+        db.connection.execute_batch("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.worker_terminated','child-attempt',3,1,'{\"attempt\":\"child-attempt\"}');").unwrap();
+        assert!(!db.replay_wait(&wait.wait_id).unwrap().wake_requested);
+        // A terminal row does not make a receipt for another generation valid.
+        db.connection.execute_batch("UPDATE attempts SET termination_observed=1,revision=4 WHERE id='child-attempt'; INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.worker_terminated','child-attempt',4,1,'{\"attempt\":\"other-attempt\"}');").unwrap();
+        assert!(!db.replay_wait(&wait.wait_id).unwrap().wake_requested);
+        db.connection.execute_batch("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.worker_terminated','child-attempt',2,1,'{\"attempt\":\"child-attempt\"}'); UPDATE attempts SET revision=5 WHERE id='child-attempt'; INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.worker_terminated','child-attempt',5,1,'{\"attempt\":\"child-attempt\"}');").unwrap();
+        let termination_sequence=db.current_head().unwrap();
+        let path=PathBuf::from(db.connection.path().unwrap());drop(db);
+        let mut db=SqliteStore::open(&path).unwrap();
+        let result=db.replay_wait(&wait.wait_id).unwrap();
+        assert!(result.wake_requested);assert!(!result.proved);
+        let notified_sequence:u64=db.connection.query_row("SELECT json_extract(payload,'$.trigger_sequence') FROM events WHERE kind='wait.notified' AND entity=?1",[&wait.wait_id],|row|row.get(0)).unwrap();
+        assert_eq!(notified_sequence,termination_sequence);
+        // A late older-generation event must not hide the retained current
+        // termination when a successor registers after both events.
+        db.connection.execute_batch("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.worker_terminated','child-attempt',2,1,'{\"attempt\":\"child-attempt\"}');").unwrap();
+        let next=db.rearm_wait(&wait.wait_id,None).unwrap();
+        assert_eq!(wait_triggers::load(&db.connection,&next.wait_id,None).unwrap(),Some(trigger.clone()));
+        assert!(db.replay_wait(&next.wait_id).unwrap().wake_requested);
+        db.connection.execute_batch("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.worker_terminated','child-attempt',5,1,'{\"attempt\":\"child-attempt\"}');").unwrap();
+        let head=db.current_head().unwrap();
+        assert!(db.register_wait_with_trigger("parent",None,"resource_availability",Some(1),Some(&trigger)).is_err());
+        assert_eq!(db.current_head().unwrap(),head);
+    }
+
+    #[test]
+    fn capacity_wait_rejects_missing_attempt_future_revision_and_wrong_condition() {
+        let (_temp,mut db)=fixture();seed_task(&mut db,"parent");
+        let trigger=WaitTrigger::AttemptCapacityReleased{attempt_id:crate::domain::AttemptId::new("child-attempt").unwrap(),after_revision:2};
+        let head=db.current_head().unwrap();
+        assert!(db.register_wait_with_trigger("parent",None,"resource_availability",None,Some(&trigger)).is_err());
+        assert_eq!(db.current_head().unwrap(),head);
+        db.connection.execute("INSERT INTO attempts VALUES('child-attempt','parent',1,'running',NULL,'slot',0)",[]).unwrap();
+        assert!(db.register_wait_with_trigger("parent",None,"resource_availability",None,Some(&trigger)).is_err());
+        assert!(db.register_wait_with_trigger("parent",None,"validation_completion",None,Some(&trigger)).is_err());
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM wait_conditions"),0);
+        assert_eq!(db.current_head().unwrap(),head);
+    }
+
+    #[test]
+    fn approval_decision_wait_filters_identity_scope_and_survives_restart() {
+        let (_temp,mut db)=fixture();seed_task(&mut db,"task");seed_task(&mut db,"other");
+        let grant=wait_approval(&db,"task");
+        let id=grant.reference().unwrap().id;
+        let trigger=WaitTrigger::ApprovalDecision{approval_id:id.clone(),task_revision:2};
+        let wait=db.register_wait_with_trigger("task",None,"user_decision",None,Some(&trigger)).unwrap();
+        let other=db.register_wait_with_trigger("other",None,"user_decision",None,Some(&trigger)).unwrap();
+        let wrong_revision=db.register_wait_with_trigger("task",None,"user_decision",None,Some(&WaitTrigger::ApprovalDecision{approval_id:id.clone(),task_revision:3})).unwrap();
+        let untyped=db.register_wait("task",None,"user_decision").unwrap();
+        // An event without a retained authenticated decision is insufficient.
+        db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('approval.installed',?1,1,1,'{}')",[&id]).unwrap();
+        assert!(!db.replay_wait(&wait.wait_id).unwrap().wake_requested);
+        let unrelated=wait_approval(&db,"other");
+        db.install_approval(&crate::domain::PreparedApproval{grant:unrelated},db.current_head().unwrap(),jiff::Timestamp::now().as_millisecond()).unwrap();
+        assert!(!db.replay_wait(&wait.wait_id).unwrap().wake_requested);
+        db.install_approval(&crate::domain::PreparedApproval{grant},db.current_head().unwrap(),jiff::Timestamp::now().as_millisecond()).unwrap();
+        let decision_sequence=db.current_head().unwrap();
+        db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('unrelated','other',1,1,'{}')",[]).unwrap();
+        let path=PathBuf::from(db.connection.path().unwrap());drop(db);
+        let mut db=SqliteStore::open(&path).unwrap();
+        assert!(db.replay_wait(&wait.wait_id).unwrap().wake_requested);
+        let notice:(u64,u64)=db.connection.query_row("SELECT json_extract(payload,'$.trigger_sequence'),json_extract(payload,'$.trigger_through') FROM events WHERE kind='wait.notified' AND entity=?1",[&wait.wait_id],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!(notice.0,decision_sequence);assert!(notice.1>notice.0);
+        for wait in [&other,&wrong_revision,&untyped] {assert!(!db.replay_wait(&wait.wait_id).unwrap().wake_requested);}
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM inbox_items"),1);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM approval_uses"),0);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM attempts"),0);
+    }
+
+    fn wait_approval(db:&SqliteStore,task:&str)->crate::domain::ApprovalGrant {
+        use crate::domain::*;
+        let now=jiff::Timestamp::now().as_millisecond();
+        ApprovalGrant{version:1,scope:ApprovalScope{version:1,class:ApprovalClass::RuntimeLaunch,
+            project_store:std::fs::canonicalize(db.connection.path().unwrap()).unwrap().display().to_string(),
+            task:TaskId::new(task).unwrap(),task_revision:2,target:"binding".into(),action_digest:"a".repeat(64)},
+            policy:VersionedReference{id:"owner-policy".into(),revision:1,digest:"b".repeat(64)},issued_unix_ms:now-1000,expires_unix_ms:now+60_000}
+    }
+
+    #[test]
+    fn approval_decision_wait_retains_trigger_on_rearm_and_rechecks_history() {
+        let (_temp,mut db)=fixture();seed_task(&mut db,"task");
+        let grant=wait_approval(&db,"task");let id=grant.reference().unwrap().id;
+        let trigger=WaitTrigger::ApprovalDecision{approval_id:id.clone(),task_revision:2};
+        db.install_approval(&crate::domain::PreparedApproval{grant},db.current_head().unwrap(),jiff::Timestamp::now().as_millisecond()).unwrap();
+        let wait=db.register_wait_with_trigger("task",None,"user_decision",None,Some(&trigger)).unwrap();
+        assert!(db.replay_wait(&wait.wait_id).unwrap().wake_requested);
+        db.revoke_approval(&id,db.current_head().unwrap(),jiff::Timestamp::now().as_millisecond(),"withdrawn").unwrap();
+        let next=db.rearm_wait(&wait.wait_id,None).unwrap();
+        assert_eq!(wait_triggers::load(&db.connection,&next.wait_id,None).unwrap(),Some(trigger));
+        assert!(db.replay_wait(&next.wait_id).unwrap().wake_requested);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM approval_uses"),0);
+        assert!(db.connection.execute("DELETE FROM wait_triggers",[]).is_err());
+        assert!(db.connection.execute("UPDATE wait_triggers SET reference_revision=3",[]).is_err());
+        // A later task incarnation must not reuse an old decision as a trigger.
+        db.connection.execute("UPDATE tasks SET revision=3 WHERE id='task'",[]).unwrap();
+        let later=db.rearm_wait(&next.wait_id,None).unwrap();
+        assert!(!db.replay_wait(&later.wait_id).unwrap().wake_requested);
+    }
+
+    #[test]
+    fn approval_decision_wait_registration_is_atomic_and_validates_trigger() {
+        let (_temp,mut db)=fixture();seed_task(&mut db,"task");
+        let trigger=WaitTrigger::ApprovalDecision{approval_id:format!("approval-{}","a".repeat(64)),task_revision:2};
+        let head=db.current_head().unwrap();
+        assert!(db.register_wait_with_trigger("task",None,"dependency_evidence",None,Some(&trigger)).is_err());
+        let invalid=WaitTrigger::ApprovalDecision{approval_id:"approval-invalid".into(),task_revision:0};
+        assert!(db.register_wait_with_trigger("task",None,"user_decision",None,Some(&invalid)).is_err());
+        db.connection.execute_batch("CREATE TEMP TRIGGER refuse_wait_trigger BEFORE INSERT ON wait_triggers BEGIN SELECT RAISE(ABORT,'fault'); END;").unwrap();
+        assert!(db.register_wait_with_trigger("task",None,"user_decision",None,Some(&trigger)).is_err());
+        assert_eq!(db.current_head().unwrap(),head);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM wait_conditions"),0);
+        db.connection.execute_batch("DROP TRIGGER refuse_wait_trigger;").unwrap();
+        let wait=db.register_wait_with_trigger("task",None,"user_decision",None,Some(&trigger)).unwrap();
+        assert_eq!(db.register_wait_with_trigger("task",None,"user_decision",None,Some(&trigger)).unwrap(),WaitRegistration{already_registered:true,..wait});
+    }
+
+    #[test]
+    fn wait_rearm_survives_restart_and_preserves_terminal_evidence() {
+        let (_temp, mut db) = fixture();
+        seed_task(&mut db, "task");
+        db.connection.execute("INSERT INTO attempts VALUES('rearm-attempt','task',1,'running',NULL,'rearm-slot',0)",[]).unwrap();
+        let first = db.register_wait_with_deadline("task",Some("rearm-attempt"),"user_decision",Some(1)).unwrap();
+        assert!(db.rearm_wait(&first.wait_id,None).is_err());
+        let terminal = db.replay_wait(&first.wait_id).unwrap();
+        assert!(terminal.wake_requested);
+        let next = db.rearm_wait(&first.wait_id,None).unwrap();
+        assert_ne!(next.wait_id,first.wait_id);
+        assert!(!next.already_registered);
+        assert!(db.rearm_wait(&first.wait_id,Some(2)).is_err());
+        assert!(!db.replay_wait(&next.wait_id).unwrap().wake_requested);
+        // A duplicate addressed to the predecessor cannot wake its successor.
+        db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake',?1,1,1,'{}')",[&first.wait_id]).unwrap();
+        assert!(!db.replay_wait(&next.wait_id).unwrap().wake_requested);
+        let path=PathBuf::from(db.connection.path().unwrap());drop(db);
+        let mut db=SqliteStore::open(&path).unwrap();
+        assert_eq!(db.rearm_wait(&first.wait_id,None).unwrap(),WaitRegistration{already_registered:true,..next.clone()});
+        assert_eq!(db.replay_wait(&first.wait_id).unwrap(),WaitReplay{already_replayed:true,..terminal});
+        db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake',?1,1,1,'{}')",[&next.wait_id]).unwrap();
+        let budget=read_budget::ReadBudget::new(controlled::ReadControl::new(std::time::Instant::now()+Duration::from_secs(5),Default::default()));
+        assert_eq!(db.service_waits(&budget).unwrap().notified,1);
+        assert!(db.replay_wait(&next.wait_id).unwrap().already_replayed);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM inbox_items"),2);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM attempts WHERE termination_observed=0"),1);
+        assert!(db.connection.execute("DELETE FROM wait_rearms",[]).is_err());
+        assert!(db.connection.execute("UPDATE wait_rearms SET successor=predecessor",[]).is_err());
+    }
+
+    #[test]
+    fn wait_rearm_observes_retained_verification_before_subscription() {
+        let (_temp,mut db)=fixture();
+        seed_rejected_verification(&mut db);
+        let first=db.register_wait_with_deadline("task",Some("attempt-1"),"validation_completion",Some(1)).unwrap();
+        assert!(db.replay_wait(&first.wait_id).unwrap().wake_requested);
+        db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('verification.rejected',?1,1,1,'{}')",["d".repeat(64)]).unwrap();
+        let next=db.rearm_wait(&first.wait_id,None).unwrap();
+        let result=db.replay_wait(&next.wait_id).unwrap();
+        assert!(result.wake_requested);
+        assert!(!result.proved);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM inbox_items"),2);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM attempts WHERE termination_observed=0"),1);
+    }
+
+    #[test]
+    fn wait_rearm_cancelled_budget_writes_nothing() {
+        let (_temp,mut db)=fixture();seed_task(&mut db,"task");
+        let first=db.register_wait_with_deadline("task",None,"user_decision",Some(1)).unwrap();
+        db.replay_wait(&first.wait_id).unwrap();
+        let head=db.current_head().unwrap();
+        let budget=read_budget::ReadBudget::new(controlled::ReadControl::new(std::time::Instant::now()-Duration::from_secs(1),Default::default()));
+        assert!(db.rearm_wait_with_budget(&first.wait_id,None,Some(&budget)).is_err());
+        assert_eq!(db.current_head().unwrap(),head);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM wait_rearms"),0);
+    }
+
+    #[test]
+    fn wait_rearm_is_atomic_and_rejects_superseded_plans() {
+        let (_temp,mut db)=fixture();seed_task(&mut db,"task");
+        let first=db.register_wait_with_deadline("task",None,"user_decision",Some(1)).unwrap();
+        db.replay_wait(&first.wait_id).unwrap();
+        let head=db.current_head().unwrap();
+        db.connection.execute_batch("CREATE TEMP TRIGGER refuse_rearm BEFORE INSERT ON wait_rearms BEGIN SELECT RAISE(ABORT,'fault'); END;").unwrap();
+        assert!(db.rearm_wait(&first.wait_id,None).is_err());
+        assert_eq!(db.current_head().unwrap(),head);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM wait_conditions"),1);
+        db.connection.execute_batch("DROP TRIGGER refuse_rearm;").unwrap();
+        assert!(!db.rearm_wait(&first.wait_id,None).unwrap().already_registered);
+        db.apply_plan_proposal(&proposal(&one("task","new plan","")),0,"rearm-new-plan").unwrap();
+        let head=db.current_head().unwrap();
+        assert!(db.rearm_wait(&first.wait_id,None).is_err());
+        assert!(db.rearm_wait("missing",None).is_err());
+        assert!(db.rearm_wait(&first.wait_id,Some(-1)).is_err());
+        assert_eq!(db.current_head().unwrap(),head);
     }
 
     #[test]
@@ -1687,6 +1951,148 @@ mod tests {
     }
 
     #[test]
+    fn expired_wait_wakes_past_event_backlog_without_releasing_capacity() {
+        let (_root,mut db)=fixture();seed_task(&mut db,"task");
+        db.connection.execute("INSERT INTO attempts VALUES('deadline-attempt','task',1,'running',NULL,'deadline-slot',0)",[]).unwrap();
+        let wait=db.register_wait_with_deadline("task",Some("deadline-attempt"),"validation_completion",Some(1)).unwrap();
+        db.connection.execute_batch("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1500) INSERT INTO events(kind,entity,revision,payload_version,payload) SELECT 'unrelated','other',1,1,'{}' FROM n;").unwrap();
+        let budget=super::super::read_budget::ReadBudget::new(super::super::controlled::ReadControl::new(std::time::Instant::now()+Duration::from_secs(2),Default::default()));
+        assert_eq!(db.service_waits(&budget).unwrap().notified,1);
+        let replay=db.replay_wait(&wait.wait_id).unwrap();
+        assert!(replay.wake_requested&&replay.already_replayed);
+        assert!(!replay.proved);
+        assert_eq!(replay.events_applied,1);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM attempts WHERE termination_observed=0"),1);
+        let path=PathBuf::from(db.connection.path().unwrap());drop(db);
+        let mut db=SqliteStore::open(&path).unwrap();
+        assert!(db.replay_wait(&wait.wait_id).unwrap().already_replayed);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM inbox_items"),1);
+    }
+
+    #[test]
+    fn wait_deadline_is_part_of_registration_identity_and_cannot_be_mutated() {
+        let (_root,mut db)=fixture();seed_task(&mut db,"task");
+        let future=jiff::Timestamp::now().as_millisecond()+60_000;
+        let original=db.register_wait("task",None,"user_decision").unwrap();
+        let wait=db.register_wait_with_deadline("task",None,"user_decision",Some(future)).unwrap();
+        assert_ne!(wait.wait_id,original.wait_id);
+        assert!(db.register_wait_with_deadline("task",None,"user_decision",Some(future)).unwrap().already_registered);
+        assert!(!db.replay_wait(&wait.wait_id).unwrap().wake_requested);
+        assert!(db.connection.execute("UPDATE wait_conditions SET deadline_unix_ms=0 WHERE wait_id=?1",[&wait.wait_id]).is_err());
+        assert!(db.register_wait_with_deadline("task",None,"user_decision",Some(-1)).is_err());
+        assert!(db.register_wait_with_deadline("task",None,"user_decision",Some(i64::MAX)).is_err());
+    }
+
+    #[test]
+    fn expired_wait_notice_failure_rolls_back_the_deadline_event() {
+        let (_root,mut db)=fixture();seed_task(&mut db,"task");
+        let wait=db.register_wait_with_deadline("task",None,"user_decision",Some(0)).unwrap();
+        let head=db.current_head().unwrap();
+        db.connection.execute_batch("CREATE TRIGGER fail_deadline_notice BEFORE INSERT ON inbox_items BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+        assert!(db.replay_wait(&wait.wait_id).is_err());
+        assert_eq!(db.current_head().unwrap(),head);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM wait_replay_events"),0);
+        db.connection.execute_batch("DROP TRIGGER fail_deadline_notice;").unwrap();
+        assert!(db.replay_wait(&wait.wait_id).unwrap().wake_requested);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM inbox_items"),1);
+    }
+
+    #[test]
+    fn replan_request_notice_and_response_survive_restart_without_duplicate_work() {
+        let (root,mut db)=fixture();seed_task(&mut db,"task");
+        let feedback=record_rejection(&mut db,"notice-op","task");
+        let decision=db.request_replan(&feedback).unwrap();
+        let ReplanDecision::Automatic{replan_id,..}=decision.clone() else{panic!()};
+        let path=PathBuf::from(db.connection.path().unwrap());
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM inbox_items"),1);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM plan_proposals"),0);
+        drop(db);let mut db=SqliteStore::open(&path).unwrap();
+        assert_eq!(db.request_replan(&feedback).unwrap(),decision);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM inbox_items"),1);
+        let raw=proposal(&one("task","revised approach",""));
+        let response=db.apply_plan_proposal(&raw,0,&replan_id).unwrap();
+        let linked:String=db.connection.query_row("SELECT proposal_id FROM replan_responses WHERE replan_id=?1",[&replan_id],|row|row.get(0)).unwrap();
+        assert_eq!(linked,response.proposal_id);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM inbox_items WHERE done=1"),1);
+        assert!(db.apply_plan_proposal(&raw,0,&replan_id).unwrap().replayed);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM replan_responses"),1);
+        assert!(matches!(db.apply_plan_proposal(&proposal(&one("task","different","")),0,&replan_id),Err(StoreError::Conflict)));
+        drop(db);drop(root);
+    }
+
+    #[test]
+    fn proposal_key_used_before_a_replan_cannot_be_relabelled_as_its_response() {
+        let (_root,mut db)=fixture();seed_task(&mut db,"task");
+        let feedback=record_rejection(&mut db,"preexisting-key","task");
+        let key=sha256_hex(format!("replan\0{feedback}").as_bytes());
+        let raw=proposal(&one("task","earlier unrelated proposal",""));
+        db.apply_plan_proposal(&raw,0,&key).unwrap();
+        db.request_replan(&feedback).unwrap();
+        assert!(matches!(db.apply_plan_proposal(&raw,1,&key),Err(StoreError::Conflict)));
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM replan_responses"),0);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM inbox_items WHERE done=1"),0);
+    }
+
+    #[test]
+    fn replan_notice_failure_rolls_back_ack_and_budget() {
+        let (_root,mut db)=fixture();seed_task(&mut db,"task");
+        let feedback=record_rejection(&mut db,"notice-fail","task");
+        let head=db.current_head().unwrap();
+        db.connection.execute_batch("CREATE TRIGGER fail_notice BEFORE INSERT ON inbox_items BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+        assert!(db.request_replan(&feedback).is_err());
+        assert_eq!(db.current_head().unwrap(),head);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM replan_requests"),0);
+        let state:String=db.connection.query_row("SELECT state FROM feedback_items WHERE feedback_id=?1",[feedback],|row|row.get(0)).unwrap();
+        assert_eq!(state,"open");
+    }
+
+    #[test]
+    fn replan_response_failure_is_atomic_and_stale_requests_cannot_rebase() {
+        let (_root,mut db)=fixture();seed_task(&mut db,"task");
+        let feedback=record_rejection(&mut db,"response-fail","task");
+        let ReplanDecision::Automatic{replan_id,..}=db.request_replan(&feedback).unwrap() else{panic!()};
+        let raw=proposal(&one("task","new approach",""));
+        let head=db.current_head().unwrap();
+        db.connection.execute_batch("CREATE TRIGGER fail_response BEFORE INSERT ON replan_responses BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+        assert!(db.apply_plan_proposal(&raw,0,&replan_id).is_err());
+        assert_eq!(db.current_head().unwrap(),head);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM plan_proposals"),0);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM inbox_items WHERE done=1"),0);
+        db.connection.execute_batch("DROP TRIGGER fail_response;").unwrap();
+        db.apply_plan_proposal(&raw,0,"another-request").unwrap();
+        assert!(matches!(db.apply_plan_proposal(&raw,1,&replan_id),Err(StoreError::StalePlanParent(1))));
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM replan_responses"),0);
+    }
+
+    #[test]
+    fn replan_budget_survives_wall_clock_rollback_and_restart() {
+        for automatic in [false,true] {
+            let (_root,mut db)=fixture();seed_task(&mut db,"task");
+            // Model a reset committed before the wall clock moved backward.
+            // Do not change the host clock or rewrite immutable audit records.
+            record_replan_reset(&db.connection,0,jiff::Timestamp::now().as_millisecond()+86_400_000).unwrap();
+            let ids:Vec<_>=(0..4).map(|n|record_rejection(&mut db,&format!("clock-{n}"),"task")).collect();
+            if automatic {
+                db.set_auto_replans(db.current_head().unwrap(),true).unwrap();
+                db.connection.execute("UPDATE project_control SET state='active'",[]).unwrap();
+                let budget=read_budget::ReadBudget::new(controlled::ReadControl::new(std::time::Instant::now()+Duration::from_secs(5),Default::default()));
+                db.service_replans(&budget).unwrap();
+            } else {
+                for id in &ids {db.request_replan(id).unwrap();}
+            }
+            assert_eq!(count(&db.connection,"SELECT count(*) FROM replan_requests WHERE outcome='automatic'"),2,"automatic={automatic}");
+            assert_eq!(count(&db.connection,"SELECT count(*) FROM replan_requests WHERE outcome='escalated'"),1);
+            let path=PathBuf::from(db.connection.path().unwrap());drop(db);
+            let mut db=SqliteStore::open(&path).unwrap();
+            let more=record_rejection(&mut db,"clock-after-restart","task");
+            assert!(matches!(db.request_replan(&more).unwrap(),ReplanDecision::Escalated{..}));
+            db.apply_plan_proposal(&proposal(&one("task","new plan","")),0,"clock-new-plan").unwrap();
+            let fresh=record_rejection(&mut db,"clock-new-revision","task");
+            assert!(matches!(db.request_replan(&fresh).unwrap(),ReplanDecision::Automatic{automatic_count:1,..}));
+        }
+    }
+
+    #[test]
     fn third_replan_is_an_inbox_escalation_not_another_proposal() {
         let (_temp, mut db) = fixture();
         seed_task(&mut db, "task");
@@ -1738,7 +2144,7 @@ mod tests {
             ),
             1
         );
-        assert_eq!(count(&db.connection, "SELECT count(*) FROM inbox_items"), 1);
+        assert_eq!(count(&db.connection, "SELECT count(*) FROM inbox_items"), 3);
         let kind: String = db
             .connection
             .query_row(
@@ -1767,7 +2173,7 @@ mod tests {
             count(&db.connection, "SELECT count(*) FROM replan_requests"),
             3
         );
-        assert_eq!(count(&db.connection, "SELECT count(*) FROM inbox_items"), 1);
+        assert_eq!(count(&db.connection, "SELECT count(*) FROM inbox_items"), 3);
         let proposed = db
             .apply_plan_proposal(&proposal(&one("task", "new plan", "")), 0, "reset-key")
             .unwrap();
@@ -1793,7 +2199,7 @@ mod tests {
             count(&db.connection, "SELECT count(*) FROM plan_proposals"),
             1
         );
-        assert_eq!(count(&db.connection, "SELECT count(*) FROM inbox_items"), 1);
+        assert_eq!(count(&db.connection, "SELECT count(*) FROM inbox_items"), 4);
         assert_eq!(
             count(
                 &db.connection,
@@ -2192,4 +2598,100 @@ mod tests {
             .unwrap();
         assert_eq!(live, ("claimed".into(), 1, "active".into()));
     }
+    #[test]
+    fn review_probe_wait_survives_poll_before_wake() {
+        let (_temp, mut db) = fixture();
+        seed_task(&mut db, "task");
+        let wait = db.register_wait("task", None, "dependency_evidence").unwrap();
+        assert!(!db.replay_wait(&wait.wait_id).unwrap().wake_requested);
+        db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake',?1,1,1,'{}')", [&wait.wait_id]).unwrap();
+        assert!(db.replay_wait(&wait.wait_id).unwrap().wake_requested, "matching wake arriving after first poll was lost");
+    }
+    #[test]
+    fn wait_service_rotates_durably_and_notifies_only_once() {
+        let (root,mut db)=fixture();
+        let mut waits=Vec::new();
+        for n in 0..9 {
+            let task=format!("waiter-{n}");seed_task(&mut db,&task);
+            waits.push(db.register_wait(&task,None,"user_decision").unwrap().wait_id);
+        }
+        waits.sort();let last=waits.last().unwrap();
+        db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake',?1,1,1,'{}')",[last]).unwrap();
+        let budget=||read_budget::ReadBudget::new(controlled::ReadControl::new(std::time::Instant::now()+Duration::from_secs(5),Default::default()));
+        assert_eq!(db.service_waits(&budget()).unwrap().notified,0);
+        drop(db);
+        let mut db=SqliteStore::open(&root.path().join("state.db")).unwrap();
+        assert_eq!(db.service_waits(&budget()).unwrap().notified,1);
+        assert_eq!(db.service_waits(&budget()).unwrap().notified,0);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM inbox_items"),1);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM wait_conditions WHERE wake_requested=1"),1);
+    }
+
+    #[test]
+    fn wait_notice_failure_rolls_back_replay_for_retry() {
+        let (_root,mut db)=fixture();seed_task(&mut db,"waiting");
+        let wait=db.register_wait("waiting",None,"user_decision").unwrap();
+        db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake',?1,1,1,'{}')",[&wait.wait_id]).unwrap();
+        db.connection.execute_batch("CREATE TRIGGER fail_wait_notice BEFORE INSERT ON inbox_items BEGIN SELECT RAISE(ABORT,'fixture'); END").unwrap();
+        assert!(db.replay_wait(&wait.wait_id).is_err());
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM wait_conditions WHERE wake_requested=1"),0);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM wait_replay_events"),0);
+        db.connection.execute_batch("DROP TRIGGER fail_wait_notice").unwrap();
+        assert!(db.replay_wait(&wait.wait_id).unwrap().wake_requested);
+        assert!(db.replay_wait(&wait.wait_id).unwrap().already_replayed);
+        assert_eq!(count(&db.connection,"SELECT count(*) FROM inbox_items"),1);
+    }
+
+    #[test]
+    fn review_probe_wait_does_not_consume_another_tasks_wake() {
+        let (_temp, mut db) = fixture();
+        seed_task(&mut db, "one");
+        seed_task(&mut db, "two");
+        let one = db.register_wait("one", None, "dependency_evidence").unwrap();
+        let two = db.register_wait("two", None, "dependency_evidence").unwrap();
+        db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake',?1,1,1,'{}')", [&two.wait_id]).unwrap();
+        assert!(!db.replay_wait(&one.wait_id).unwrap().wake_requested, "unrelated wait woke this task");
+    }
+
+    #[test]
+    fn upgraded_wait_resumes_in_bounded_pages_after_restart() {
+        let (temp, mut db) = fixture();
+        seed_task(&mut db, "task");
+        let wait = db.register_wait("task", None, "dependency_evidence").unwrap();
+        super::super::test_schema::historical(&db.connection, 41).unwrap();
+        // The previous release persisted an empty first replay as terminal.
+        db.connection.execute("UPDATE wait_conditions SET state='replayed', replayed_through=cursor_sequence, wake_requested=0 WHERE wait_id=?1", [&wait.wait_id]).unwrap();
+        db.upgrade_v1().unwrap();
+        for _ in 0..1001 {
+            db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('task.noted','other',1,1,'{}')", []).unwrap();
+        }
+        db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake',?1,1,1,'{}')", [&wait.wait_id]).unwrap();
+        let first = db.replay_wait(&wait.wait_id).unwrap();
+        assert_eq!(first.events_applied, 1000);
+        assert!(!first.wake_requested);
+        drop(db);
+        let mut db = SqliteStore::open(&temp.path().join("state.db")).unwrap();
+        let second = db.replay_wait(&wait.wait_id).unwrap();
+        assert_eq!(second.events_applied, 2);
+        assert!(second.wake_requested);
+        assert!(second.replayed_through > first.replayed_through);
+        assert_eq!(count(&db.connection, "SELECT count(*) FROM wait_replay_events"), 1002);
+        assert!(db.replay_wait(&wait.wait_id).unwrap().already_replayed);
+    }
+
+    #[test]
+    fn upgrade_discards_an_unrelated_historical_wake() {
+        let (_temp, mut db) = fixture();
+        seed_task(&mut db, "task");
+        let wait = db.register_wait("task", None, "dependency_evidence").unwrap();
+        super::super::test_schema::historical(&db.connection, 41).unwrap();
+        db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake','another-wait',1,1,'{}')", []).unwrap();
+        let through = db.current_head().unwrap();
+        db.connection.execute("UPDATE wait_conditions SET state='replayed', replayed_through=?2, wake_requested=1 WHERE wait_id=?1", params![wait.wait_id, through]).unwrap();
+        db.upgrade_v1().unwrap();
+        assert!(!db.replay_wait(&wait.wait_id).unwrap().wake_requested);
+        db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake',?1,1,1,'{}')", [&wait.wait_id]).unwrap();
+        assert!(db.replay_wait(&wait.wait_id).unwrap().wake_requested);
+    }
+
 }

@@ -62,6 +62,16 @@ print(json.dumps({{'result':r}}))
     assert!(herdr_projects::execution_guard::ProjectGuard::acquire(&project).is_err());stop(&mut child);assert_eq!(runtime::snapshot(&project).unwrap(),before);
     fs::write(home.path().join("mode"),"ok").unwrap();let mut child=spawn();wait(&mut child,&||runtime::snapshot(&project).unwrap().head>before.head);stop(&mut child);
     assert!(herdr_projects::execution_guard::ProjectGuard::acquire(&project).is_ok());
+    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();
+    let observed=||raw.query_row("SELECT coalesce(max(observed_unix_ms),0) FROM runtime_observations",[],|row|row.get::<_,i64>(0)).unwrap();
+    let previous=observed();
+    raw.execute("INSERT INTO tasks VALUES('retired/invalid',1,'succeeded','unrelated historical task',NULL)",[]).unwrap();
+    assert!(runtime::snapshot(&project).is_err());
+    let mut child=spawn();wait(&mut child,&||observed()>previous);stop(&mut child);
+    assert!(runtime::snapshot(&project).is_err(),"background progress must not erase corrupt history");
+    raw.execute("DELETE FROM tasks WHERE id='retired/invalid'",[]).unwrap();
+    let after=runtime::snapshot(&project).unwrap();assert_eq!(after.tasks,before.tasks);assert_eq!(after.attempts,before.attempts);
+
 }
 
 #[cfg(feature="state-store")]
@@ -165,25 +175,35 @@ fn profile_probe_binds_explicit_binaries_without_launching_profile_arguments() {
     let home = tempfile::tempdir().unwrap();
     let config = home.path().join(".config/herdr-projects");
     std::fs::create_dir_all(&config).unwrap();
-    std::fs::write(config.join("config.toml"), "[profiles.worker]\nkind='codex'\npermission_policy='interactive'\nextra_args=['SECRET']\n").unwrap();
     let herdr = home.path().join("herdr-bin");
     let agent = home.path().join("agent-bin");
-    for (path, version) in [(&herdr, "herdr 0.9.1"), (&agent, "codex-cli 0.99.0-preview.3")] {
-        std::fs::write(path, format!("#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 2\nprintf '%s\\n' '{version}'\n")).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let missing=home.path().join("missing-agent");
+    for (kind, version, expected) in [("codex","codex-cli 0.99.0-preview.3","0.99.0-preview.3"),("claude","2.1.0 (Claude Code)","2.1.0")] {
+        std::fs::write(config.join("config.toml"),format!("[profiles.worker]\nkind='{kind}'\npermission_policy='interactive'\nextra_args=['SECRET']\nmodel='PRIVATE_MODEL'\nreasoning_effort='PRIVATE_EFFORT'\nenvironment=['PRIVATE_ENV']\n")).unwrap();
+        for (path, version) in [(&herdr, "herdr 0.9.1"), (&agent, version)] {
+            std::fs::write(path, format!("#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 2\nprintf '%s\\n' '{version}'\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let original_config = std::fs::read(config.join("config.toml")).unwrap();
+        let args=["profile", "probe", "worker", "--herdr-executable", herdr.to_str().unwrap(), "--agent-executable", agent.to_str().unwrap()];
+        let output = hp(home.path(), &args);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["scope"], "local_installation_only");assert_eq!(report["agent"]["status"],"version_observed");
+        assert_eq!(report["agent"]["version"], expected);assert_eq!(report["herdr"]["version"], "0.9.1");
+        assert_eq!(report["profile"]["agent_version"], report["agent"]["version"]);
+        assert_eq!(report["profile"]["herdr_version"], report["herdr"]["version"]);
+        for field in ["launchable","protocol_capable","certified"] {assert_eq!(report["profile"][field],false,"{kind}: {field}");}
+        assert_eq!(report["profile"]["capabilities"]["checkpoint_acknowledgment"], "unknown");
+        for secret in ["SECRET","PRIVATE_MODEL","PRIVATE_EFFORT","PRIVATE_ENV"] {assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));}
+        let mut absent=args;absent[6]=missing.to_str().unwrap();assert!(!hp(home.path(),&absent).status.success());
+        // A process that prints a plausible version and then fails supplies no evidence.
+        std::fs::write(&agent,format!("#!/bin/sh\nprintf '%s\\n' '{version}'\nexit 7\n")).unwrap();
+        let failed=hp(home.path(),&args);assert!(failed.status.success(),"{}",String::from_utf8_lossy(&failed.stderr));
+        let failed:serde_json::Value=serde_json::from_slice(&failed.stdout).unwrap();assert_eq!(failed["agent"]["status"],"probe_failed");assert!(failed["agent"]["version"].is_null());assert_eq!(failed["profile"]["launchable"],false);
+        assert_eq!(std::fs::read(config.join("config.toml")).unwrap(), original_config, "probing must not rewrite model, effort, arguments or environment");
+        assert!(!home.path().join(".herdr-projects").exists());
     }
-    let output = hp(home.path(), &["profile", "probe", "worker", "--herdr-executable", herdr.to_str().unwrap(), "--agent-executable", agent.to_str().unwrap()]);
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["scope"], "local_installation_only");
-    assert_eq!(report["agent"]["version"], "0.99.0-preview.3");
-    assert_eq!(report["herdr"]["version"], "0.9.1");
-    assert_eq!(report["profile"]["agent_version"], report["agent"]["version"]);
-    assert_eq!(report["profile"]["herdr_version"], report["herdr"]["version"]);
-    assert_eq!(report["profile"]["launchable"], false);
-    assert_eq!(report["profile"]["capabilities"]["checkpoint_acknowledgment"], "unknown");
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("SECRET"));
-    assert!(!home.path().join(".herdr-projects").exists());
 }
 
 #[test]
@@ -249,6 +269,37 @@ fn hp(home: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn build_info_is_independent_of_config_projects_and_sessions() {
+    let home=tempfile::tempdir().unwrap();
+    let config=home.path().join(".config/herdr-projects");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("config.toml"),"this is deliberately invalid TOML [").unwrap();
+    let root=home.path().join("must-not-be-created");
+    let output=hp(home.path(),&["--root",root.to_str().unwrap(),"build-info"]);
+    assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    let value:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["state_store"],cfg!(feature="state-store"));
+    assert_eq!(value["os"],std::env::consts::OS);
+    assert_eq!(value["live_capacity_certified"],false);
+    #[cfg(feature="state-store")]
+    {
+        assert_eq!(value["schema"],herdr_projects::store::SCHEMA);
+        assert_eq!(value["sqlite"]["version"],rusqlite::version());
+        assert_eq!(value["sqlite"]["minimum"],herdr_projects::store::MIN_SQLITE_VERSION);
+    }
+    #[cfg(not(feature="state-store"))]
+    {
+        assert!(value["schema"].is_null());
+        assert!(value["sqlite"].is_null());
+        assert_eq!(value["factory_runtime_compatible"],false);
+    }
+    let checked=hp(home.path(),&["--root",root.to_str().unwrap(),"build-info","--require-factory"]);
+    assert_eq!(checked.status.success(),value["factory_runtime_compatible"]==true);
+    assert!(!root.exists());
+    assert_eq!(std::fs::read_to_string(config.join("config.toml")).unwrap(),"this is deliberately invalid TOML [");
+}
+
+#[test]
 fn doctor_help_names_the_factory_binary_and_upgrade_command() {
     let home = tempfile::tempdir().unwrap();
     let out = hp(home.path(), &["doctor", "--help"]);
@@ -258,6 +309,7 @@ fn doctor_help_names_the_factory_binary_and_upgrade_command() {
         String::from_utf8_lossy(&out.stderr)
     );
     let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("--target-dir target/factory"),"{text}");
     assert!(
         text.contains("cargo build --release --locked --features state-store"),
         "{text}"
@@ -643,6 +695,262 @@ fn root_config_special_files_fail_promptly_without_an_explicit_root() {
 
 #[test]
 #[cfg(feature="state-store")]
+fn plan_wait_cli_registers_replays_and_keeps_capacity_untouched() {
+    use herdr_projects::{domain::*,migration};
+    let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
+    for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
+    let project=root.join("demo");
+    let plan=migration::inspect_with_config(&project,&home.path().join(".config/herdr-projects/config.toml")).unwrap();
+    migration::apply(&project,&plan,true).unwrap();
+    let mut db=migration::open_active(&project).unwrap();
+    db.commit(Commit{expected_head:db.current_head().unwrap(),mutations:vec![Mutation::Task{expected:None,next:Task{id:TaskId::new("parent").unwrap(),revision:1,state:TaskState::Blocked,title:"parent".into(),active_attempt:None}}]}).unwrap();
+    drop(db);
+    let registered=hp(home.path(),&["--root",root_arg,"plan","wait","demo","register","--task","parent","--condition","dependency_evidence"]);
+    assert!(registered.status.success(),"{}",String::from_utf8_lossy(&registered.stderr));
+    let value:serde_json::Value=serde_json::from_slice(&registered.stdout).unwrap();
+    let id=value["wait_id"].as_str().unwrap();
+    let replay=hp(home.path(),&["--root",root_arg,"plan","wait","demo","replay",id]);
+    assert!(replay.status.success(),"{}",String::from_utf8_lossy(&replay.stderr));
+    let value:serde_json::Value=serde_json::from_slice(&replay.stdout).unwrap();
+    assert_eq!(value["wake_requested"],false);assert_eq!(value["proved"],false);
+    let approval=format!("approval-{}","a".repeat(64));
+    let typed=hp(home.path(),&["--root",root_arg,"plan","wait","demo","register","--task","parent","--condition","user_decision","--approval-id",&approval,"--approval-task-revision","2"]);
+    assert!(typed.status.success(),"{}",String::from_utf8_lossy(&typed.stderr));
+    let typed:serde_json::Value=serde_json::from_slice(&typed.stdout).unwrap();
+    let replay=hp(home.path(),&["--root",root_arg,"plan","wait","demo","replay",typed["wait_id"].as_str().unwrap()]);
+    assert!(replay.status.success(),"{}",String::from_utf8_lossy(&replay.stderr));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&replay.stdout).unwrap()["wake_requested"],false);
+    assert!(!hp(home.path(),&["--root",root_arg,"plan","wait","demo","register","--task","parent","--condition","user_decision","--approval-id",&approval]).status.success());
+    assert!(!hp(home.path(),&["--root",root_arg,"plan","wait","demo","register","--task","parent","--condition","dependency_evidence","--approval-id",&approval,"--approval-task-revision","2"]).status.success());
+    assert!(!hp(home.path(),&["--root",root_arg,"feedback","demo","replan","missing-feedback"]).status.success());
+    let expired=hp(home.path(),&["--root",root_arg,"plan","wait","demo","register","--task","parent","--condition","user_decision","--deadline","2000-01-01T00:00:00Z"]);
+    assert!(expired.status.success(),"{}",String::from_utf8_lossy(&expired.stderr));
+    let expired:serde_json::Value=serde_json::from_slice(&expired.stdout).unwrap();
+    let replay=hp(home.path(),&["--root",root_arg,"plan","wait","demo","replay",expired["wait_id"].as_str().unwrap()]);
+    assert!(replay.status.success(),"{}",String::from_utf8_lossy(&replay.stderr));
+    let replay:serde_json::Value=serde_json::from_slice(&replay.stdout).unwrap();
+    assert_eq!(replay["wake_requested"],true);assert_eq!(replay["proved"],false);
+    let previous=expired["wait_id"].as_str().unwrap();
+    let rearmed=hp(home.path(),&["--root",root_arg,"plan","wait","demo","rearm",previous]);
+    assert!(rearmed.status.success(),"{}",String::from_utf8_lossy(&rearmed.stderr));
+    let rearmed:serde_json::Value=serde_json::from_slice(&rearmed.stdout).unwrap();
+    assert_ne!(rearmed["wait_id"],expired["wait_id"]);
+    let replay=hp(home.path(),&["--root",root_arg,"plan","wait","demo","replay",rearmed["wait_id"].as_str().unwrap()]);
+    assert!(replay.status.success(),"{}",String::from_utf8_lossy(&replay.stderr));
+    let replay:serde_json::Value=serde_json::from_slice(&replay.stdout).unwrap();
+    assert_eq!(replay["wake_requested"],false);
+    let again=hp(home.path(),&["--root",root_arg,"plan","wait","demo","rearm",previous]);
+    assert!(again.status.success(),"{}",String::from_utf8_lossy(&again.stderr));
+    let again:serde_json::Value=serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(again["wait_id"],rearmed["wait_id"]);
+    assert_eq!(again["already_registered"],true);
+    let mut db=migration::open_active(&project).unwrap();
+    db.commit(Commit{expected_head:db.current_head().unwrap(),mutations:vec![Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("capacity-holder").unwrap(),task:TaskId::new("parent").unwrap(),revision:1,state:AttemptState::Running,snapshot:None,reservation:"retained".into(),termination_observed:false}}]}).unwrap();drop(db);
+    let capacity=hp(home.path(),&["--root",root_arg,"plan","wait","demo","register","--task","parent","--condition","resource_availability","--capacity-attempt","capacity-holder","--capacity-after-revision","1"]);
+    assert!(capacity.status.success(),"{}",String::from_utf8_lossy(&capacity.stderr));
+    let capacity:serde_json::Value=serde_json::from_slice(&capacity.stdout).unwrap();
+    let replay=hp(home.path(),&["--root",root_arg,"plan","wait","demo","replay",capacity["wait_id"].as_str().unwrap()]);
+    assert!(replay.status.success(),"{}",String::from_utf8_lossy(&replay.stderr));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&replay.stdout).unwrap()["wake_requested"],false);
+    assert!(!hp(home.path(),&["--root",root_arg,"plan","wait","demo","register","--task","parent","--condition","resource_availability","--capacity-attempt","capacity-holder"]).status.success());
+    assert!(!hp(home.path(),&["--root",root_arg,"plan","wait","demo","register","--task","parent","--condition","resource_availability","--capacity-attempt","capacity-holder","--capacity-after-revision","1","--approval-id",&approval,"--approval-task-revision","2"]).status.success());
+    let snapshot=migration::open_active(&project).unwrap().read_snapshot(None).unwrap();
+    assert_eq!(snapshot.attempts.len(),1);assert!(snapshot.attempts[0].retains_capacity());
+}
+
+#[test]
+#[cfg(feature="state-store")]
+fn planner_session_cli_retains_inputs_and_replays_bound_proposals() {
+    use herdr_projects::migration;
+    let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
+    for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
+    let project=root.join("demo");let plan=migration::inspect_with_config(&project,&home.path().join(".config/herdr-projects/config.toml")).unwrap();migration::apply(&project,&plan,true).unwrap();
+    let before=migration::open_active(&project).unwrap().read_snapshot(None).unwrap();
+    let intent=home.path().join("intent.txt");std::fs::write(&intent,"Add an independently verified feature\n").unwrap();
+    let args=["--root",root_arg,"plan","session","demo","create","planner-1","--intent-file",intent.to_str().unwrap(),"--expected-head",&before.head.to_string(),"--expected-plan-revision","0"];
+    let created=hp(home.path(),&args);assert!(created.status.success(),"{}",String::from_utf8_lossy(&created.stderr));
+    let session:serde_json::Value=serde_json::from_slice(&created.stdout).unwrap();
+    let retry=hp(home.path(),&args);assert!(retry.status.success());assert_eq!(serde_json::from_slice::<serde_json::Value>(&retry.stdout).unwrap(),session);
+    let db=rusqlite::Connection::open(session["input"]["project_store"].as_str().unwrap()).unwrap();
+    let empty=hp(home.path(),&["--root",root_arg,"plan","inspect","demo"]);assert!(empty.status.success());
+    let empty:serde_json::Value=serde_json::from_slice(&empty.stdout).unwrap();assert_eq!(empty["plan_revision"],0);assert_eq!(empty["entries"],serde_json::json!([]));assert!(empty["next_after"].is_null());
+    let count=|table:&str|db.query_row(&format!("SELECT count(*) FROM {table}"),[],|r|r.get::<_,u64>(0)).unwrap();
+    let authority_tables=["task_contracts","contract_scope_paths","contract_named_resources","attempts","task_queue"];
+    let authority_before:Vec<_>=authority_tables.iter().map(|t|count(t)).collect();
+    let raw=serde_json::json!({"version":2,"planner":{"session_id":"planner-1","input_digest":session["input_digest"],"rationale":"Follow the retained intent"},"contracts":[{"task_id":"planned","text":"Implement and verify the feature","dependencies":[]}]});
+    let document=home.path().join("proposal.json");std::fs::write(&document,serde_json::to_vec(&raw).unwrap()).unwrap();
+    let propose=["--root",root_arg,"plan","propose","demo","--input-file",document.to_str().unwrap(),"--expected-plan-revision","0","--idempotency-key","planner-response"];
+    let accepted=hp(home.path(),&propose);assert!(accepted.status.success(),"{}",String::from_utf8_lossy(&accepted.stderr));
+    let first:serde_json::Value=serde_json::from_slice(&accepted.stdout).unwrap();assert_eq!(first["replayed"],false);assert_eq!(first["plan_revision"],1);
+    let shown=hp(home.path(),&["--root",root_arg,"plan","session","demo","show","planner-1"]);assert!(shown.status.success());
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&shown.stdout).unwrap(),session);
+    let replay=hp(home.path(),&propose);assert!(replay.status.success());assert_eq!(serde_json::from_slice::<serde_json::Value>(&replay.stdout).unwrap()["replayed"],true);
+    let head=migration::open_active(&project).unwrap().current_head().unwrap();
+    let mut changed=raw.clone();changed["contracts"][0]["text"]=serde_json::json!("Changed under the same key");
+    std::fs::write(&document,changed.to_string()).unwrap();
+    assert!(!hp(home.path(),&propose).status.success());
+    assert_eq!(migration::open_active(&project).unwrap().current_head().unwrap(),head);
+    std::fs::write(&document,serde_json::to_vec(&raw).unwrap()).unwrap();
+    let stale=hp(home.path(),&["--root",root_arg,"plan","propose","demo","--input-file",document.to_str().unwrap(),"--expected-plan-revision","0","--idempotency-key","stale-key"]);
+    assert!(!stale.status.success());assert_eq!(migration::open_active(&project).unwrap().current_head().unwrap(),head);
+    for table in ["plan_proposals","plan_revisions"] {assert_eq!(count(table),1);}
+    let (stored,parent,digest):(Vec<u8>,u64,String)=db.query_row("SELECT payload,parent_revision,payload_digest FROM plan_proposals",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    assert_eq!(stored,serde_json::to_vec(&raw).unwrap());assert_eq!(parent,0);assert_eq!(digest,first["digest"].as_str().unwrap());
+    assert_eq!(db.query_row("SELECT count(*) FROM events WHERE kind='plan.proposed'",[],|r|r.get::<_,u64>(0)).unwrap(),1);
+    let inspected=hp(home.path(),&["--root",root_arg,"plan","inspect","demo","--limit","1"]);
+    assert!(inspected.status.success(),"{}",String::from_utf8_lossy(&inspected.stderr));
+    let page:serde_json::Value=serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(page["plan_revision"],1);assert_eq!(page["entries"][0]["task_id"],"planned");assert!(page["next_after"].is_null());
+    assert_eq!(migration::open_active(&project).unwrap().current_head().unwrap(),head);
+    assert!(!hp(home.path(),&["--root",root_arg,"plan","inspect","demo","--after","planned"]).status.success());
+    let next=home.path().join("next.json");std::fs::write(&next,serde_json::json!({"version":1,"contracts":[{"task_id":"zz-next","text":"Follow the first planned task","dependencies":[{"predecessor":"planned","requirement":"verified_result"}]}]}).to_string()).unwrap();
+    let accepted=hp(home.path(),&["--root",root_arg,"plan","propose","demo","--input-file",next.to_str().unwrap(),"--expected-plan-revision","1","--idempotency-key","next"]);
+    assert!(accepted.status.success(),"{}",String::from_utf8_lossy(&accepted.stderr));
+    assert!(!hp(home.path(),&["--root",root_arg,"plan","inspect","demo","--after","planned","--expected-plan-revision","1"]).status.success());
+    let last=hp(home.path(),&["--root",root_arg,"plan","inspect","demo","--after","planned","--expected-plan-revision","2","--limit","1"]);assert!(last.status.success());
+    let page:serde_json::Value=serde_json::from_slice(&last.stdout).unwrap();assert_eq!(page["entries"][0]["task_id"],"zz-next");assert_eq!(page["entries"][0]["dependencies"][0]["predecessor"],"planned");assert!(page["next_after"].is_null());
+    // Each invocation starts a new process: retained references and retries must
+    // survive reopening the store throughout the complete typed-change flow.
+    use sha2::{Digest,Sha256};
+    let hash=|bytes:&[u8]|format!("{:x}",Sha256::digest(bytes));
+    let mut previous=serde_json::Value::Null;
+    for (step,kind) in ["create_contract","supersede_unstarted","add_dependencies","request_cancellation"].into_iter().enumerate() {
+        let parent=2+step as u64;let name=format!("typed-{step}");let parent_arg=parent.to_string();
+        let head=migration::open_active(&project).unwrap().current_head().unwrap().to_string();
+        let created=hp(home.path(),&["--root",root_arg,"plan","session","demo","create",&name,"--intent-file",intent.to_str().unwrap(),"--expected-head",&head,"--expected-plan-revision",&parent_arg]);
+        assert!(created.status.success(),"{}",String::from_utf8_lossy(&created.stderr));
+        let session:serde_json::Value=serde_json::from_slice(&created.stdout).unwrap();
+        let edge=serde_json::json!({"predecessor":"planned","requirement":"verified_result"});
+        let mut contract=serde_json::json!({"task_id":"typed-task","text":if step==0 {"Initial intent"}else{"Revised intent"},"dependencies":if step<2 {serde_json::json!([])}else{serde_json::json!([edge.clone()])}});
+        let mut change=serde_json::json!({"kind":kind,"task_id":"typed-task"});
+        if step>0 {change["expected"]=serde_json::json!({"proposal_id":previous["proposal_id"],"plan_revision":parent,"payload_digest":previous["digest"]});}
+        if step==2 {change["dependencies"]=serde_json::json!([edge]);}
+        if step==3 {change["reason"]=serde_json::json!("Requirements withdrawn");contract["cancellation_reason"]=change["reason"].clone();}
+        let planner=serde_json::json!({"session_id":name,"input_digest":session["input_digest"],"rationale":"Apply reviewed typed change"});
+        let mut payload=serde_json::json!({"contracts":[contract],"planner":planner,"changes":[change]});payload.sort_all_objects();
+        let mut raw=payload.clone();raw["version"]=serde_json::json!(3);
+        raw["envelope"]=serde_json::json!({"schema_version":1,"project_id":hash(format!("project-store\0{}",session["input"]["project_store"].as_str().unwrap()).as_bytes()),"store_incarnation":session["input"]["store_incarnation"],"request_id":name,"idempotency_key":name,"actor_id":name,"delegation":null,"expected_plan_revision":parent,"payload_digest":hash(&serde_json::to_vec(&payload).unwrap())});
+        let propose=["--root",root_arg,"plan","propose","demo","--input-file",document.to_str().unwrap(),"--expected-plan-revision",&parent_arg,"--idempotency-key",&name];
+        let head=migration::open_active(&project).unwrap().current_head().unwrap();
+        for field in ["project_id","store_incarnation","payload_digest","actor_id","idempotency_key"] {
+            let mut bad=raw.clone();bad["envelope"][field]=serde_json::json!("0".repeat(64));
+            std::fs::write(&document,bad.to_string()).unwrap();assert!(!hp(home.path(),&propose).status.success(),"accepted wrong {field}");
+            assert_eq!(migration::open_active(&project).unwrap().current_head().unwrap(),head);
+        }
+        if step>0 {
+            // Correctly hashed but stale source identity must still be refused.
+            let mut bad=raw.clone();bad["changes"][0]["expected"]["payload_digest"]=serde_json::json!("0".repeat(64));
+            let mut payload=serde_json::json!({"contracts":bad["contracts"],"planner":bad["planner"],"changes":bad["changes"]});payload.sort_all_objects();
+            bad["envelope"]["payload_digest"]=serde_json::json!(hash(&serde_json::to_vec(&payload).unwrap()));
+            std::fs::write(&document,bad.to_string()).unwrap();assert!(!hp(home.path(),&propose).status.success());
+            let mut reused=raw.clone();reused["envelope"]["request_id"]=serde_json::json!("typed-0");
+            std::fs::write(&document,reused.to_string()).unwrap();assert!(!hp(home.path(),&propose).status.success());
+            assert_eq!(migration::open_active(&project).unwrap().current_head().unwrap(),head);
+        }
+        std::fs::write(&document,raw.to_string()).unwrap();
+        let accepted=hp(home.path(),&propose);assert!(accepted.status.success(),"{}",String::from_utf8_lossy(&accepted.stderr));
+        previous=serde_json::from_slice(&accepted.stdout).unwrap();assert_eq!(previous["plan_revision"],parent+1);
+        let head=migration::open_active(&project).unwrap().current_head().unwrap();
+        let retry=hp(home.path(),&propose);assert!(retry.status.success(),"{}",String::from_utf8_lossy(&retry.stderr));
+        let replay:serde_json::Value=serde_json::from_slice(&retry.stdout).unwrap();assert_eq!(replay["proposal_id"],previous["proposal_id"]);assert_eq!(replay["replayed"],true);
+        assert_eq!(migration::open_active(&project).unwrap().current_head().unwrap(),head);
+    }
+    let inspected=hp(home.path(),&["--root",root_arg,"plan","inspect","demo"]);assert!(inspected.status.success());
+    let page:serde_json::Value=serde_json::from_slice(&inspected.stdout).unwrap();
+    let cancelled=page["entries"].as_array().unwrap().iter().find(|v|v["task_id"]=="typed-task").unwrap();
+    assert_eq!(cancelled["text"],"Revised intent");assert_eq!(cancelled["cancellation_reason"],"Requirements withdrawn");assert_eq!(cancelled["dependencies"][0]["predecessor"],"planned");
+    assert_eq!(cancelled["source_plan_revision"],6);assert_eq!(cancelled["proposal_id"],previous["proposal_id"]);assert_eq!(cancelled["payload_digest"],previous["digest"]);
+    let page1=hp(home.path(),&["--root",root_arg,"plan","inspect","demo","--limit","2"]);assert!(page1.status.success());
+    let page1:serde_json::Value=serde_json::from_slice(&page1.stdout).unwrap();assert_eq!(page1["next_after"],"typed-task");assert_eq!(page1["entries"][0]["task_id"],"planned");assert_eq!(page1["entries"][0]["source_plan_revision"],1);assert_eq!(page1["entries"][1],*cancelled);
+    let page2=hp(home.path(),&["--root",root_arg,"plan","inspect","demo","--limit","2","--after","typed-task","--expected-plan-revision","6"]);assert!(page2.status.success());
+    let page2:serde_json::Value=serde_json::from_slice(&page2.stdout).unwrap();assert_eq!(page2["entries"][0]["task_id"],"zz-next");assert!(page2["next_after"].is_null());
+    assert_eq!(authority_tables.iter().map(|t|count(t)).collect::<Vec<_>>(),authority_before);
+    assert_eq!(count("plan_proposals"),6);assert_eq!(count("plan_revisions"),6);assert_eq!(count("plan_proposal_requests"),4);
+    std::fs::write(&intent,"different input").unwrap();assert!(!hp(home.path(),&args).status.success());
+    let after=migration::open_active(&project).unwrap().read_snapshot(None).unwrap();
+    assert_eq!(before.tasks,after.tasks);assert_eq!(before.attempts,after.attempts);assert_eq!(before.control,after.control);
+}
+
+#[test]
+#[cfg(feature="state-store")]
+fn barrier_revoke_cli_records_refusal_without_releasing_capacity() {
+    use herdr_projects::migration;
+    let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
+    for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
+    let project=root.join("demo");let plan=migration::inspect_with_config(&project,&home.path().join(".config/herdr-projects/config.toml")).unwrap();migration::apply(&project,&plan,true).unwrap();
+    let before=migration::open_active(&project).unwrap().read_snapshot(None).unwrap();
+    let missing=hp(home.path(),&["--root",root_arg,"memory","demo","barrier","--id",&"a".repeat(64)]);
+    assert!(missing.status.success(),"{}",String::from_utf8_lossy(&missing.stderr));
+    assert!(serde_json::from_slice::<serde_json::Value>(&missing.stdout).unwrap().is_null());
+    let input=home.path().join("members.json");
+    for (raw,message) in [("[]".to_owned(),"membership is empty"),(format!("[{}null]","{},".repeat(200_000)),"input/structure accounting")] {
+        std::fs::write(&input,raw).unwrap();
+        let refused=hp(home.path(),&["--root",root_arg,"memory","demo","barrier-freeze","--input",input.to_str().unwrap(),"--expected-head",&before.head.to_string()]);
+        assert!(!refused.status.success());assert!(String::from_utf8_lossy(&refused.stderr).contains(message),"{}",String::from_utf8_lossy(&refused.stderr));
+    }
+    let result=hp(home.path(),&["--root",root_arg,"memory","demo","barrier-revoke","--id",&"a".repeat(64),"--expected-head",&before.head.to_string(),"--reason","operator withdrawal"]);
+    assert!(!result.status.success());assert!(String::from_utf8_lossy(&result.stderr).contains("barrier is not stored"));
+    let mut db=migration::open_active(&project).unwrap();let denials=db.authority_denials().unwrap();
+    assert_eq!(denials.len(),1);assert_eq!(denials[0].command,"barrier-revoke");assert_eq!(denials[0].actual_head,Some(before.head));
+    let after=db.read_snapshot(None).unwrap();assert_eq!(after.head,before.head);assert_eq!(after.attempts,before.attempts);assert_eq!(after.control,before.control);
+}
+
+#[test]
+#[cfg(feature="state-store")]
+fn auto_replan_cli_requires_current_head_and_preserves_execution_state() {
+    use herdr_projects::migration;
+    let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
+    for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
+    let project=root.join("demo");let plan=migration::inspect_with_config(&project,&home.path().join(".config/herdr-projects/config.toml")).unwrap();migration::apply(&project,&plan,true).unwrap();
+    let before=migration::open_active(&project).unwrap().read_snapshot(None).unwrap();
+    let on=hp(home.path(),&["--root",root_arg,"plan","auto-replan","demo","on","--expected-head",&before.head.to_string()]);
+    assert!(on.status.success(),"{}",String::from_utf8_lossy(&on.stderr));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&on.stdout).unwrap()["enabled"],true);
+    let stale=hp(home.path(),&["--root",root_arg,"plan","auto-replan","demo","off","--expected-head",&before.head.to_string()]);assert!(!stale.status.success());
+    let head=migration::open_active(&project).unwrap().current_head().unwrap();
+    let off=hp(home.path(),&["--root",root_arg,"plan","auto-replan","demo","off","--expected-head",&head.to_string()]);
+    assert!(off.status.success(),"{}",String::from_utf8_lossy(&off.stderr));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&off.stdout).unwrap()["enabled"],false);
+    let after=migration::open_active(&project).unwrap().read_snapshot(None).unwrap();
+    assert_eq!(after.attempts,before.attempts);assert_eq!(after.tasks,before.tasks);assert_eq!(after.control,before.control);
+}
+
+#[test]
+#[cfg(feature="state-store")]
+fn recovery_wait_cli_preserves_owned_resources() {
+    use herdr_projects::{domain::*,migration,reconcile::{RuntimeObservation,ResourceState}};
+    let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
+    for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
+    let project=root.join("demo");let plan=migration::inspect_with_config(&project,&home.path().join(".config/herdr-projects/config.toml")).unwrap();migration::apply(&project,&plan,true).unwrap();
+    let mut db=migration::open_active(&project).unwrap();
+    db.commit(Commit{expected_head:db.current_head().unwrap(),mutations:vec![Mutation::Task{expected:None,next:Task{id:TaskId::new("waiting-adapter").unwrap(),revision:1,state:TaskState::Blocked,title:"waiting".into(),active_attempt:None}}]}).unwrap();
+    let route=RuntimeRoute{socket:"/tmp/fixture-recovery.sock".into(),workspace_id:"w".into(),tab_id:"t".into(),pane_id:"p".into(),cwd:"/tmp".into(),..Default::default()};
+    let snapshot=db.read_snapshot(None).unwrap();
+    let binding=if let Some(binding)=snapshot.runtime_bindings.iter().find(|binding|binding.id=="coordinator") {
+        db.rebind_runtime(&binding.id,binding.revision,snapshot.head,&route).unwrap().binding
+    }else {db.create_runtime(None,None,snapshot.head,&route).unwrap().binding};
+    let snapshot=db.read_snapshot(None).unwrap();let now=jiff::Timestamp::now().as_millisecond();
+    let observations:Vec<_>=snapshot.runtime_bindings.iter().map(|entry|RuntimeObservation{
+        binding:entry.id.clone(),binding_revision:entry.revision,task_revision:entry.task.as_ref().map(|id|snapshot.tasks.iter().find(|task|&task.id==id).unwrap().revision),
+        observed_unix_ms:now,collector:"herdr-git-v2".into(),..Default::default()}).map(|mut observation|{
+            if observation.binding==binding.id {observation.pane=ResourceState::Present;observation.agent_present=true;observation.session_identity=Some(ResourceIdentity{device:1,inode:2,born_secs:3,born_nanos:0});observation.agent_identity=Some(AgentIdentity{kind:"fixture".into(),name:"fixture-agent".into()});}observation
+        }).collect();
+    db.record_observations(snapshot.head,&observations).unwrap();
+    let owned=db.adopt_runtime(&binding.id,binding.revision,db.current_head().unwrap(),now,None).unwrap().ownership;
+    let before=db.read_snapshot(None).unwrap();drop(db);
+    let registered=hp(home.path(),&["--root",root_arg,"plan","wait","demo","register","--task","waiting-adapter","--condition","adapter_recovery","--recovery-binding",&binding.id,"--recovery-binding-revision",&binding.revision.to_string(),"--recovery-ownership-revision",&owned.revision.to_string()]);
+    assert!(registered.status.success(),"{}",String::from_utf8_lossy(&registered.stderr));
+    let registered:serde_json::Value=serde_json::from_slice(&registered.stdout).unwrap();
+    let replay=hp(home.path(),&["--root",root_arg,"plan","wait","demo","replay",registered["wait_id"].as_str().unwrap()]);
+    assert!(replay.status.success(),"{}",String::from_utf8_lossy(&replay.stderr));
+    let replay:serde_json::Value=serde_json::from_slice(&replay.stdout).unwrap();assert_eq!(replay["wake_requested"],true);assert_eq!(replay["proved"],false);
+    assert!(!hp(home.path(),&["--root",root_arg,"plan","wait","demo","register","--task","waiting-adapter","--condition","adapter_recovery","--recovery-binding",&binding.id]).status.success());
+    let after=migration::open_active(&project).unwrap().read_snapshot(None).unwrap();
+    assert_eq!(after.ownership,before.ownership);assert_eq!(after.attempts,before.attempts);assert_eq!(after.control,before.control);
+}
+
+#[test]
+#[cfg(feature="state-store")]
 fn operation_expiry_is_visible_idempotent_and_never_dispatches() {
     use herdr_projects::{migration,operations::{Outcome,DeliveryState}};
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
@@ -681,7 +989,7 @@ fn migrated_runtime_bindings_require_explicit_upgrade_and_are_unverified() {
     for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
     let project=root.join("demo");std::fs::write(project.join("threads/t-0001.toml"),"id='t-0001'\nstatus='resolved'\nrepo='/repo'\n").unwrap();
     let plan=herdr_projects::migration::inspect(&project).unwrap();herdr_projects::migration::apply(&project,&plan,true).unwrap();
-    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();raw.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE memory_delivery_intents; DROP TABLE memory_import_decisions; DROP TABLE memory_import_candidates; DROP TABLE memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_cancellations; DROP TABLE attempt_inputs; DROP TABLE task_dependencies; DROP TABLE task_queue; DROP TABLE scheduler_policy; DROP TABLE runtime_ownership; DROP TABLE project_control; DROP TABLE runtime_observations; DROP TABLE runtime_bindings; UPDATE store_meta SET schema_version=4; PRAGMA user_version=4;").unwrap();drop(raw);
+    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();test_schema::historical(&raw, 4).unwrap();drop(raw);
     let args=["--root",root_arg,"migration","demo","bindings"];
     let out=hp(home.path(),&args);assert!(!out.status.success());assert!(String::from_utf8_lossy(&out.stderr).contains("upgrade-store"));
     assert!(hp(home.path(),&["--root",root_arg,"migration","demo","upgrade-store"]).status.success());
@@ -833,8 +1141,36 @@ fn scheduler_cli_queues_dependencies_without_launching_or_rewriting_legacy_tasks
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
     let project=root.join("demo");let original=std::fs::read(project.join("TASKS.md")).unwrap();let plan=migration::inspect(&project).unwrap();migration::apply(&project,&plan,true).unwrap();for id in ["a","b"] {runtime::add_task(&project,TaskId::new(id).unwrap(),id.into(),runtime::snapshot(&project).unwrap().head).unwrap();}
     let request=home.path().join("queue.json");std::fs::write(&request,r#"{"priority":2,"dependencies":[{"predecessor":"b","requirement":"landed_commit"}]}"#).unwrap();let before=runtime::snapshot(&project).unwrap();let out=hp(home.path(),&["--root",root_arg,"task","demo","queue","a","--input-file",request.to_str().unwrap(),"--expected-revision","1","--expected-head",&before.head.to_string()]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
-    let head=runtime::snapshot(&project).unwrap().head;let out=hp(home.path(),&["--root",root_arg,"scheduler","demo","policy","--max-active-workers","2","--max-attempts-per-task","3","--expected-revision","1","--expected-head",&head.to_string()]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));let out=hp(home.path(),&["--root",root_arg,"scheduler","demo","inspect"]);assert!(out.status.success());let report:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();assert_eq!(report["available_slots"],2);assert_eq!(report["launch_enabled"],false);assert_eq!(report["capability"]["prepared_dispatch"],true);assert_eq!(report["capability"]["automatic_admission"],false);assert_eq!(report["capability"]["dependency_producers"],false);assert_eq!(report["capability"]["integration"],"unavailable");assert_eq!(report["capability"]["blockers"],serde_json::json!(["automatic_admission_does_not_draft_sign_or_reserve"]));let blockers=report["entries"][0]["blockers"].as_array().unwrap();for stage in ["owner_signature_not_scheduled","launch_reserve_not_scheduled","controller_requires_reserved_attempt"]{assert!(blockers.iter().any(|s|s==stage));}assert!(blockers.iter().all(|s|s!="launch_draft_not_scheduled"));assert!(blockers.iter().any(|s|s.as_str().unwrap().contains("verified_dependency_evidence_unavailable:b:landed_commit")));assert!(blockers.iter().chain(report["capability"]["blockers"].as_array().unwrap()).all(|s|{let s=s.as_str().unwrap();!s.contains("launch_preparation_unavailable")&&!s.contains("verifier")&&!s.contains("integrator")&&!s.contains("producer")&&!s.contains("satisfaction")}));
+    let head=runtime::snapshot(&project).unwrap().head;let out=hp(home.path(),&["--root",root_arg,"scheduler","demo","policy","--max-active-workers","2","--max-attempts-per-task","3","--expected-revision","1","--expected-head",&head.to_string()]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));let out=hp(home.path(),&["--root",root_arg,"scheduler","demo","inspect"]);assert!(out.status.success());let report:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();assert_eq!(report["available_slots"],2);assert_eq!(report["launch_enabled"],false);assert_eq!(report["capability"]["prepared_dispatch"],true);assert_eq!(report["capability"]["automatic_admission"],false);assert_eq!(report["capability"]["dependency_producers"],false);assert_eq!(report["capability"]["integration"],if cfg!(target_os="linux") {"operator_local"} else {"unavailable"});assert_eq!(report["capability"]["blockers"],serde_json::json!(["automatic_admission_does_not_draft_sign_or_reserve"]));let blockers=report["entries"][0]["blockers"].as_array().unwrap();for stage in ["owner_signature_not_scheduled","launch_reserve_not_scheduled","controller_requires_reserved_attempt"]{assert!(blockers.iter().any(|s|s==stage));}assert!(blockers.iter().all(|s|s!="launch_draft_not_scheduled"));assert!(blockers.iter().any(|s|s.as_str().unwrap().contains("verified_dependency_evidence_unavailable:b:landed_commit")));assert!(blockers.iter().chain(report["capability"]["blockers"].as_array().unwrap()).all(|s|{let s=s.as_str().unwrap();!s.contains("launch_preparation_unavailable")&&!s.contains("verifier")&&!s.contains("integrator")&&!s.contains("producer")&&!s.contains("satisfaction")}));
     std::fs::write(&request,r#"{"priority":0,"dependencies":[{"predecessor":"a","requirement":"verified_result"}]}"#).unwrap();let before=runtime::snapshot(&project).unwrap();let out=hp(home.path(),&["--root",root_arg,"task","demo","queue","b","--input-file",request.to_str().unwrap(),"--expected-revision","1","--expected-head",&before.head.to_string()]);assert!(!out.status.success());assert_eq!(runtime::snapshot(&project).unwrap(),before);assert!(before.attempts.is_empty());assert!(before.operations.is_empty());assert_eq!(std::fs::read(project.join("TASKS.md")).unwrap(),original);
+    // Queue mutation and policy changes must not decode unrelated cold history.
+    runtime::add_task(&project, TaskId::new("cold-history").unwrap(), "retired history".into(), runtime::snapshot(&project).unwrap().head).unwrap();
+    let raw = rusqlite::Connection::open(project.join(".state/state.db")).unwrap();
+    raw.execute_batch("UPDATE tasks SET title=CAST(x'ff' AS TEXT) WHERE id='cold-history'; INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) VALUES('cold-attempt','cold-history',1,'completed',CAST(x'ff' AS TEXT),'historical-slot',1);").unwrap();
+    let head = || raw.query_row("SELECT MAX(sequence) FROM events",[],|r|r.get::<_,u64>(0)).unwrap();
+    std::fs::write(&request,r#"{"priority":0,"dependencies":[]}"#).unwrap();
+    let queued = hp(home.path(), &["--root",root_arg,"task","demo","queue","b","--input-file",request.to_str().unwrap(),"--expected-revision","1","--expected-head",&head().to_string()]);
+    assert!(queued.status.success(), "cold history blocked queue mutation: {}", String::from_utf8_lossy(&queued.stderr));
+    let policy = hp(home.path(), &["--root",root_arg,"scheduler","demo","policy","--max-active-workers","3","--max-attempts-per-task","3","--expected-revision","2","--expected-head",&head().to_string()]);
+    assert!(policy.status.success(), "cold history blocked policy update: {}", String::from_utf8_lossy(&policy.stderr));
+    let before_cycle = head();
+    std::fs::write(&request,r#"{"priority":0,"dependencies":[{"predecessor":"a","requirement":"verified_result"}]}"#).unwrap();
+    let cycle = hp(home.path(), &["--root",root_arg,"task","demo","queue","b","--input-file",request.to_str().unwrap(),"--expected-revision","2","--expected-head",&before_cycle.to_string()]);
+    assert!(!cycle.status.success()); assert_eq!(head(),before_cycle);
+    assert!(String::from_utf8_lossy(&cycle.stderr).contains("dependency cycle"));
+    assert_eq!(raw.query_row("SELECT hex(CAST(title AS BLOB)) FROM tasks WHERE id='cold-history'",[],|r|r.get::<_,String>(0)).unwrap(),"FF");
+    assert_eq!(raw.query_row("SELECT hex(CAST(snapshot AS BLOB)) FROM attempts WHERE id='cold-attempt'",[],|r|r.get::<_,String>(0)).unwrap(),"FF");
+    assert_eq!(raw.query_row("SELECT count(*) FROM attempts",[],|r|r.get::<_,u64>(0)).unwrap(),1);
+    assert_eq!(raw.query_row("SELECT count(*) FROM attempts WHERE termination_observed=0",[],|r|r.get::<_,u64>(0)).unwrap(),0);
+    let before_inspect = head();
+    let inspected = hp(home.path(), &["--root",root_arg,"scheduler","demo","inspect"]);
+    assert!(inspected.status.success(), "cold history blocked scheduler inspection: {}", String::from_utf8_lossy(&inspected.stderr));
+    let inspected: serde_json::Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(inspected["entries"].as_array().unwrap().len(),2);
+    assert_eq!(inspected["retained_attempts"],0); assert_eq!(inspected["available_slots"],3);
+    assert_eq!(head(),before_inspect);
+    assert_eq!(std::fs::read(project.join("TASKS.md")).unwrap(),original);
+
 }
 
 #[cfg(feature="state-store")]
@@ -1478,7 +1814,6 @@ fn profile_prepare_uses_pinned_owner_config_and_keeps_unknown_capabilities() {
 #[test]
 fn task_contract_put_and_result_submit_keep_worker_bytes_untrusted() {
     use herdr_projects::{authority::CONTRACT_SIGNATURE_NAMESPACE, domain::*, migration, runtime};
-    use sha2::{Digest, Sha256};
     use std::process::Command;
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join("root");
@@ -1512,26 +1847,44 @@ fn task_contract_put_and_result_submit_keep_worker_bytes_untrusted() {
         [],
     ).unwrap();
     let repo = home.path().join("repo");
-    std::fs::create_dir_all(repo.join(".git/objects")).unwrap();
-    let loose = |bytes: &[u8]| {
-        let oid = format!("{:x}", Sha256::digest(bytes));
-        let path = repo.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, bytes).unwrap();
-        oid
+    std::fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("/usr/bin/git").env_clear().env("PATH","/usr/bin:/bin").env("HOME",home.path())
+            .env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL","/dev/null")
+            .env("GIT_AUTHOR_NAME","fixture").env("GIT_AUTHOR_EMAIL","fixture@example.com")
+            .env("GIT_COMMITTER_NAME","fixture").env("GIT_COMMITTER_EMAIL","fixture@example.com")
+            .current_dir(&repo).args(args).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
     };
-    let base = loose(b"base-object");
-    let candidate = loose(b"candidate-object");
+    git(&["init","-q","--object-format=sha256"]);
+    std::fs::write(repo.join("outside-parent.txt"), "unchanged outside scope").unwrap();
+    std::fs::write(repo.join(".gitignore"), "/verification-artifact.tar\n").unwrap();
+    std::fs::write(repo.join("push"), "a literal output filename\n").unwrap();
+    std::fs::create_dir(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/required.txt"), "required baseline output\n").unwrap();
+    git(&["add","."]); git(&["commit","-qm","base"]);
+    let base = git(&["rev-parse","HEAD"]);
+    std::fs::write(repo.join("src/lib.rs"), "pub fn result() {}\n").unwrap();
+    git(&["add","."]); git(&["commit","-qm","allowed output"]);
+    let candidate = git(&["rev-parse","HEAD"]);
+    let objects = || git(&["rev-list","--objects","--all"]).lines().map(|line| {
+        let oid=line.split_whitespace().next().unwrap();
+        serde_json::json!({"oid":oid,"relative_path":format!("{}/{}",&oid[..2],&oid[2..])})
+    }).collect::<Vec<_>>();
+    let policy = r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#;
     let authority = herdr_projects::authority::policy_reference(&project).unwrap();
     let mut document = serde_json::to_vec_pretty(&serde_json::json!({
-        "version": 1,
+        "version": 3,
+        "outputs": [{"path":"src/lib.rs","kind":"git_file"},{"path":"src/required.txt","kind":"git_file"},{"path":"push","kind":"git_file"}],
+        "scope": {"paths":[{"path":"src/","access":"write"},{"path":"push","access":"write"}]},
         "project_store": db_path.canonicalize().unwrap().display().to_string(),
         "expected_head": head,
         "task_id": "task",
         "contract_revision": 1,
         "deliverable": "ship",
         "non_goals": "no launch",
-        "acceptance_policies": [{"id": "builds", "text": "tests pass"}],
+        "acceptance_policies": [{"id": "builds", "text": policy}],
         "repository": repo.canonicalize().unwrap().display().to_string(),
         "base_oid": base,
         "object_format": "sha256",
@@ -1540,7 +1893,7 @@ fn task_contract_put_and_result_submit_keep_worker_bytes_untrusted() {
         "profile_kind": "codex",
         "retry_class": "none",
         "result_schema_id": "result-v1",
-        "route": "verify_only",
+        "route": "verify_then_integrate",
         "authority": authority
     })).unwrap();
     document.push(b'\n');
@@ -1554,6 +1907,27 @@ fn task_contract_put_and_result_submit_keep_worker_bytes_untrusted() {
     let refused = hp(home.path(), &["--root", root_arg, "task", "demo", "contract", "put", "--input-file", huge.to_str().unwrap(), "--signature", sig_path.to_str().unwrap()]);
     assert!(!refused.status.success());
     assert_eq!(runtime::snapshot(&project).unwrap().head, before.head);
+    // Signed invalid declarations must fail through the public installation command.
+    let original: serde_json::Value = serde_json::from_slice(&document).unwrap();
+    let mut invalid_outputs = vec![serde_json::Value::Null, serde_json::json!([])];
+    for path in ["elsewhere/file", "src/../escape", "src/./file", "src//file", "src/*.txt", "src/", "src/.git/config", "/absolute"] {
+        invalid_outputs.push(serde_json::json!([{"path":path,"kind":"git_file"}]));
+    }
+    invalid_outputs.push(serde_json::json!([{"path":"src/lib.rs","kind":"unknown"}]));
+    for count in [2, 65] {
+        invalid_outputs.push(serde_json::Value::Array(vec![original["outputs"][0].clone(); count]));
+    }
+    for (index, outputs) in invalid_outputs.into_iter().enumerate() {
+        let mut invalid = original.clone(); invalid["outputs"] = outputs;
+        let path = home.path().join(format!("invalid-outputs-{index}.json"));
+        std::fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y", "sign", "-f"]).arg(&key).args(["-n", CONTRACT_SIGNATURE_NAMESPACE]).arg(&path).status().unwrap().success());
+        let signature = path.with_extension("json.sig");
+        let rejected = hp(home.path(), &["--root", root_arg, "task", "demo", "contract", "put", "--input-file", path.to_str().unwrap(), "--signature", signature.to_str().unwrap()]);
+        assert!(!rejected.status.success(), "accepted invalid output declaration {index}");
+        assert_eq!(runtime::snapshot(&project).unwrap().head, before.head);
+        assert_eq!(rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT count(*) FROM task_contracts", [], |row| row.get::<_,u64>(0)).unwrap(), 0);
+    }
     let installed = hp(home.path(), &["--root", root_arg, "task", "demo", "contract", "put", "--input-file", doc_path.to_str().unwrap(), "--signature", sig_path.to_str().unwrap()]);
     assert!(installed.status.success(), "{}", String::from_utf8_lossy(&installed.stderr));
     let installed: serde_json::Value = serde_json::from_slice(&installed.stdout).unwrap();
@@ -1574,13 +1948,29 @@ fn task_contract_put_and_result_submit_keep_worker_bytes_untrusted() {
         "base_oid": base,
         "candidate_oid": candidate,
         "object_format": "sha256",
-        "artifact_manifest": [{"path": "src/lib.rs", "oid": candidate}],
+        "artifact_manifest": [{"path": "src/lib.rs", "oid": candidate},{"path":"src/required.txt","oid":candidate},{"path":"push","oid":candidate}],
         "claimed_checks": ["cargo test"],
-        "objects": [
-            {"oid": base, "relative_path": format!("{}/{}", &base[..2], &base[2..])},
-            {"oid": candidate, "relative_path": format!("{}/{}", &candidate[..2], &candidate[2..])}
-        ]
+        "objects": objects()
     })).unwrap()).unwrap();
+    let untrusted:serde_json::Value=serde_json::from_slice(&std::fs::read(&submission).unwrap()).unwrap();
+    let before_submit=runtime::snapshot(&project).unwrap();
+    let forged=home.path().join("forged-result.json");
+    for field in ["verified","verification_receipt"] {
+        let mut claimed=untrusted.clone();
+        claimed[field]=if field=="verified" {serde_json::json!(true)} else {serde_json::json!({"run_id":"a".repeat(64),"result_id":"b".repeat(64),"commit_oid":candidate,"tree_oid":candidate,"object_format":"sha256","policy_digest":"c".repeat(64),"isolation":"linux-unshare-user-pid-mount-v1","exit_status":0,"memory_fence":0})};
+        std::fs::write(&forged,claimed.to_string()).unwrap();
+        let refused=hp(home.path(),&["--root",root_arg,"result","demo","submit","--input-file",forged.to_str().unwrap()]);
+        assert!(!refused.status.success(),"worker-supplied {field} was accepted");
+        assert_eq!(runtime::snapshot(&project).unwrap(),before_submit);
+    }
+    let mut missing: serde_json::Value = serde_json::from_slice(&std::fs::read(&submission).unwrap()).unwrap();
+    missing["artifact_manifest"] = serde_json::json!([]);
+    let missing_path = home.path().join("missing-output.json");
+    std::fs::write(&missing_path, serde_json::to_vec(&missing).unwrap()).unwrap();
+    let refused = hp(home.path(), &["--root", root_arg, "result", "demo", "submit", "--input-file", missing_path.to_str().unwrap()]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("required output"));
+    assert_eq!(runtime::snapshot(&project).unwrap(), before_submit);
     let submitted = hp(home.path(), &["--root", root_arg, "result", "demo", "submit", "--input-file", submission.to_str().unwrap()]);
     assert!(submitted.status.success(), "{}", String::from_utf8_lossy(&submitted.stderr));
     let again = hp(home.path(), &["--root", root_arg, "result", "demo", "submit", "--input-file", submission.to_str().unwrap()]);
@@ -1595,8 +1985,412 @@ fn task_contract_put_and_result_submit_keep_worker_bytes_untrusted() {
     assert_eq!(shown.as_array().unwrap().len(), 1);
     assert!(shown[0].get("verified").is_none());
     assert_eq!(shown[0]["claimed_checks"], serde_json::json!(["cargo test"]));
+    let raw=rusqlite::Connection::open(&db_path).unwrap();
+    for table in ["verification_runs","verified_results","dependency_satisfactions","feedback_items"] {
+        assert_eq!(raw.query_row(&format!("SELECT count(*) FROM {table}"),[],|row|row.get::<_,u64>(0)).unwrap(),0,"result submission manufactured {table}");
+    }
+    let after_submit=runtime::snapshot(&project).unwrap();assert_eq!(after_submit.tasks,before_submit.tasks);assert_eq!(after_submit.attempts,before_submit.attempts);
     let tasks: i64 = rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT count(*) FROM tasks", [], |row| row.get(0)).unwrap();
     assert_eq!(tasks, runtime::snapshot(&project).unwrap().tasks.len() as i64);
+    // Verify real retained SHA-256 Git objects through the operator CLI.
+    let policy_path = home.path().join("scope-policy.json"); std::fs::write(&policy_path, policy).unwrap();
+    let work = home.path().join("scope-work");
+    let verify = |id: &str, key: &str| hp(home.path(), &["--root",root_arg,"result","demo","verify",id,
+        "--policy-id","builds","--policy-file",policy_path.to_str().unwrap(),"--idempotency-key",key,
+        "--work-dir",work.to_str().unwrap(),"--timeout-seconds","30"]);
+    let good = verify(first["submission_id"].as_str().unwrap(), "scope-good");
+    assert!(good.status.success(), "{}", String::from_utf8_lossy(&good.stderr));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&good.stdout).unwrap()["state"], "accepted");
+    // A newer historical receipt must not hide an older usable receipt from
+    // the same active attempt when a consumer is queued after both runs.
+    let newer = verify(first["submission_id"].as_str().unwrap(), "scope-newer-historical");
+    assert!(newer.status.success(), "{}", String::from_utf8_lossy(&newer.stderr));
+    let newer: serde_json::Value = serde_json::from_slice(&newer.stdout).unwrap();
+    raw.execute("DELETE FROM verification_contract_checks WHERE result_id=?1", [newer["receipt"]["result_id"].as_str().unwrap()]).unwrap();
+    // A historical receipt has no proof that today's scope/output checks ran.
+    // Exercise receipt reuse through the public queue/scheduler workflow.
+    runtime::add_task(&project, TaskId::new("scope-consumer").unwrap(), "consume result".into(), runtime::snapshot(&project).unwrap().head).unwrap();
+    let queue_scope = home.path().join("queue-scope.json");
+    std::fs::write(&queue_scope, r#"{"priority":0,"dependencies":[{"predecessor":"task","requirement":"verified_result"}]}"#).unwrap();
+    // A database-side stall during evidence attachment must share the deadline
+    // and roll back the queue mutation and its events. Timeout bounds the test
+    // itself if the production interruption ever regresses.
+    let before_queue = runtime::snapshot(&project).unwrap();
+    raw.execute_batch("CREATE TRIGGER stall_receipt_attachment BEFORE INSERT ON dependency_satisfactions WHEN NEW.task_id='scope-consumer' BEGIN SELECT count(*) FROM (WITH RECURSIVE slow(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM slow WHERE n<1000000000) SELECT n FROM slow); END;").unwrap();
+    let stalled = Command::new("/usr/bin/timeout").env_clear().env("HOME",home.path())
+        .args(["--kill-after=1","10",BIN,"--root",root_arg,"task","demo","queue","scope-consumer","--input-file",queue_scope.to_str().unwrap(),"--expected-revision","1","--expected-head",&before_queue.head.to_string()]).output().unwrap();
+    assert!(!stalled.status.success()); assert_ne!(stalled.status.code(), Some(124), "receipt attachment exceeded the test watchdog");
+    assert!(String::from_utf8_lossy(&stalled.stderr).to_ascii_lowercase().contains("deadline"), "{}", String::from_utf8_lossy(&stalled.stderr));
+    assert_eq!(runtime::snapshot(&project).unwrap(), before_queue);
+    assert_eq!(raw.query_row("SELECT count(*) FROM task_queue WHERE task_id='scope-consumer'",[],|r|r.get::<_,u64>(0)).unwrap(),0);
+    assert_eq!(raw.query_row("SELECT count(*) FROM dependency_satisfactions WHERE task_id='scope-consumer'",[],|r|r.get::<_,u64>(0)).unwrap(),0);
+    raw.execute_batch("DROP TRIGGER stall_receipt_attachment;").unwrap();
+    let queued = hp(home.path(), &["--root",root_arg,"task","demo","queue","scope-consumer","--input-file",queue_scope.to_str().unwrap(),"--expected-revision","1","--expected-head",&runtime::snapshot(&project).unwrap().head.to_string()]);
+    assert!(queued.status.success(), "{}", String::from_utf8_lossy(&queued.stderr));
+    let evidence_missing = || {
+        let report = hp(home.path(), &["--root",root_arg,"scheduler","demo","inspect"]);
+        assert!(report.status.success(), "{}", String::from_utf8_lossy(&report.stderr));
+        let report: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+        report["entries"].as_array().unwrap().iter().find(|entry| entry["task"] == "scope-consumer").unwrap()["blockers"]
+            .as_array().unwrap().iter().any(|item| item.as_str().unwrap().contains("verified_dependency_evidence_unavailable"))
+    };
+    assert!(!evidence_missing(), "fresh scope-checked receipt should satisfy the dependency");
+    // Configure a target with an independent change, then return to the worker candidate.
+    git(&["checkout","-qb","factory-integration",&base]);
+    std::fs::write(repo.join("target-only.txt"), "independent target change\n").unwrap();
+    git(&["add","target-only.txt"]); git(&["commit","-qm","target advance"]);
+    let target_before = git(&["rev-parse","HEAD"]);
+    let configure = || hp(home.path(), &["--root",root_arg,"result","demo","configure-integration","--repository",repo.to_str().unwrap(),"--reference","refs/heads/factory-integration"]);
+    let checked_out = configure(); assert!(!checked_out.status.success());
+    assert!(String::from_utf8_lossy(&checked_out.stderr).contains("checked out"));
+    git(&["checkout","--detach",&candidate]);
+    let configured = configure(); assert!(configured.status.success(), "{}", String::from_utf8_lossy(&configured.stderr));
+    assert!(configure().status.success());
+    let integration_work = home.path().join("integration-work");
+    let integrate = |result: &str| hp(home.path(), &["--root",root_arg,"result","demo","integrate",result,
+        "--repository",repo.to_str().unwrap(),"--idempotency-key","integrate-scope","--work-dir",integration_work.to_str().unwrap()]);
+    let good: serde_json::Value = serde_json::from_slice(&good.stdout).unwrap();
+    let old_result = good["receipt"]["result_id"].as_str().unwrap();
+    // Version 1 attests earlier scope/output checks, not post-execution identity.
+    raw.execute("UPDATE verification_contract_checks SET version=1", []).unwrap();
+    let before_refusal = runtime::snapshot(&project).unwrap();
+    let historical_integration = integrate(old_result); assert!(!historical_integration.status.success());
+    assert!(String::from_utf8_lossy(&historical_integration.stderr).contains("fresh post-execution verification"));
+    assert!(!integration_work.exists());
+    assert_eq!(git(&["rev-parse","refs/heads/factory-integration"]), target_before);
+    assert_eq!(runtime::snapshot(&project).unwrap(), before_refusal);
+
+    assert!(evidence_missing(), "historical receipt must not certify newly introduced checks");
+    let historical = verify(first["submission_id"].as_str().unwrap(), "scope-good");
+    assert!(historical.status.success());
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&historical.stdout).unwrap()["replayed"], true);
+    assert!(evidence_missing(), "historical replay must not invent contract-check evidence");
+    assert_eq!(raw.query_row("SELECT version FROM verification_contract_checks WHERE result_id=?1",[old_result],|row|row.get::<_,u32>(0)).unwrap(),1);
+    let rechecked = verify(first["submission_id"].as_str().unwrap(), "scope-rechecked");
+    assert!(rechecked.status.success(), "{}", String::from_utf8_lossy(&rechecked.stderr));
+    assert!(!evidence_missing(), "fresh verification should restore usable evidence");
+    let rechecked: serde_json::Value = serde_json::from_slice(&rechecked.stdout).unwrap();
+    let result_id = rechecked["receipt"]["result_id"].as_str().unwrap();
+    assert_eq!(raw.query_row("SELECT version FROM verification_contract_checks WHERE result_id=?1",[result_id],|row|row.get::<_,u32>(0)).unwrap(),2);
+    std::fs::create_dir(&integration_work).unwrap();
+    std::fs::write(integration_work.join("keep"), b"operator data").unwrap();
+    assert!(!integrate(result_id).status.success());
+    assert_eq!(std::fs::read(integration_work.join("keep")).unwrap(), b"operator data");
+    std::fs::remove_dir_all(&integration_work).unwrap();
+    // Fail after the candidate is retained, then resume it from a new scratch dir.
+    raw.execute_batch("CREATE TRIGGER refuse_integration_checks BEFORE UPDATE OF checks_passed ON integration_operations WHEN NEW.checks_passed=1 BEGIN SELECT RAISE(ABORT,'injected checks write failure'); END;").unwrap();
+    let incomplete = integrate(result_id); assert!(!incomplete.status.success());
+    assert_eq!(raw.query_row("SELECT state FROM integration_operations WHERE idempotency_key='integrate-scope'",[],|r|r.get::<_,String>(0)).unwrap(), "candidate_prepared", "{}", String::from_utf8_lossy(&incomplete.stderr));
+    assert_eq!(raw.query_row("SELECT checks_passed FROM integration_operations WHERE idempotency_key='integrate-scope'",[],|r|r.get::<_,bool>(0)).unwrap(), false);
+    assert_eq!(git(&["rev-parse","refs/heads/factory-integration"]), target_before);
+    assert!(!integration_work.exists());
+    raw.execute_batch("DROP TRIGGER refuse_integration_checks; CREATE TRIGGER refuse_integration_receipt BEFORE INSERT ON integrated_commits BEGIN SELECT RAISE(ABORT,'injected receipt write failure'); END;").unwrap();
+    // The next failure occurs after Git CAS but before the receipt commits.
+    let interrupted = integrate(result_id); assert!(!interrupted.status.success());
+    assert_eq!(raw.query_row("SELECT state FROM integration_operations WHERE idempotency_key='integrate-scope'",[],|r|r.get::<_,String>(0)).unwrap(), "validating", "{}", String::from_utf8_lossy(&interrupted.stderr));
+    let published = git(&["rev-parse","refs/heads/factory-integration"]);
+    assert_ne!(published, target_before);
+    assert_eq!(raw.query_row("SELECT count(*) FROM integrated_commits",[],|r|r.get::<_,u64>(0)).unwrap(),0);
+    assert!(!integration_work.exists());
+    raw.execute_batch("DROP TRIGGER refuse_integration_receipt;").unwrap();
+    let integrated = hp(home.path(), &["--root",root_arg,"result","demo","reconcile-integration","--repository",repo.to_str().unwrap(),"--idempotency-key","integrate-scope"]);
+    assert!(integrated.status.success(), "{}", String::from_utf8_lossy(&integrated.stderr));
+    assert_eq!(git(&["rev-parse","refs/heads/factory-integration"]), published);
+    let integrated: serde_json::Value = serde_json::from_slice(&integrated.stdout).unwrap();
+    assert_eq!(integrated["state"], "integrated");
+    let merged = git(&["rev-parse","refs/heads/factory-integration"]);
+    assert_eq!(integrated["commit_oid"], merged);
+    assert_eq!(git(&["rev-parse",&format!("{merged}^1")]), target_before);
+    assert_eq!(git(&["rev-parse",&format!("{merged}^2")]), candidate);
+    assert_eq!(git(&["show",&format!("{merged}:target-only.txt")]), "independent target change");
+    assert!(!git(&["show",&format!("{merged}:src/lib.rs")]).is_empty());
+    assert!(!integration_work.exists());
+    let after_integration = runtime::snapshot(&project).unwrap();
+    assert_eq!(after_integration.attempts, before_refusal.attempts);
+    let replayed = integrate(result_id); assert!(replayed.status.success());
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&replayed.stdout).unwrap(), integrated);
+    let reconciled = hp(home.path(), &["--root",root_arg,"result","demo","reconcile-integration","--repository",repo.to_str().unwrap(),"--idempotency-key","integrate-scope"]);
+    assert!(reconciled.status.success(), "{}", String::from_utf8_lossy(&reconciled.stderr));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&reconciled.stdout).unwrap(), integrated);
+    assert_eq!(runtime::snapshot(&project).unwrap(), after_integration);
+    assert_eq!(raw.query_row("SELECT count(*) FROM integrated_commits",[],|r|r.get::<_,u64>(0)).unwrap(),1);
+    // Integrated dependencies require proof of the combined tree, independently
+    // of the worker-tree verifier's receipt and historical integration status.
+    let queue_integrated = |name: &str| {
+        runtime::add_task(&project, TaskId::new(name).unwrap(), "consume merged result".into(), runtime::snapshot(&project).unwrap().head).unwrap();
+        let input = home.path().join(format!("{name}.json"));
+        std::fs::write(&input, r#"{"priority":0,"dependencies":[{"predecessor":"task","requirement":"integrated_commit"}]}"#).unwrap();
+        let out = hp(home.path(), &["--root",root_arg,"task","demo","queue",name,"--input-file",input.to_str().unwrap(),"--expected-revision","1","--expected-head",&runtime::snapshot(&project).unwrap().head.to_string()]);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    };
+    let integrated_missing = |name: &str| {
+        let report = hp(home.path(), &["--root",root_arg,"scheduler","demo","inspect"]);
+        assert!(report.status.success(), "{}", String::from_utf8_lossy(&report.stderr));
+        let report: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+        report["entries"].as_array().unwrap().iter().find(|entry| entry["task"] == name).unwrap()["blockers"]
+            .as_array().unwrap().iter().any(|item| item.as_str().unwrap().contains("verified_dependency_evidence_unavailable"))
+    };
+    queue_integrated("integrated-consumer");
+    assert!(!integrated_missing("integrated-consumer"));
+    raw.execute("DELETE FROM integration_contract_checks", []).unwrap();
+    assert!(integrated_missing("integrated-consumer"), "historical integration must not certify merged outputs");
+    let historical = integrate(result_id); assert!(historical.status.success());
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&historical.stdout).unwrap(), integrated);
+    assert!(integrated_missing("integrated-consumer"), "replay must not invent merged-output proof");
+    queue_integrated("late-integrated-consumer");
+    assert!(integrated_missing("late-integrated-consumer"));
+    assert_eq!(raw.query_row("SELECT count(*) FROM dependency_satisfactions WHERE task_id='late-integrated-consumer' AND state='valid'",[],|r|r.get::<_,u64>(0)).unwrap(),0);
+    let fresh = hp(home.path(), &["--root",root_arg,"result","demo","integrate",result_id,
+        "--repository",repo.to_str().unwrap(),"--idempotency-key","integrate-fresh-proof","--work-dir",integration_work.to_str().unwrap()]);
+    assert!(fresh.status.success(), "{}", String::from_utf8_lossy(&fresh.stderr));
+    assert!(!integrated_missing("integrated-consumer")); assert!(!integrated_missing("late-integrated-consumer"));
+    assert_eq!(raw.query_row("SELECT count(*) FROM integrated_commits",[],|r|r.get::<_,u64>(0)).unwrap(),2);
+    assert_eq!(raw.query_row("SELECT count(*) FROM integration_contract_checks",[],|r|r.get::<_,u64>(0)).unwrap(),1);
+    // Moving an outside file into src still changes the unauthorized old path.
+    git(&["mv","outside-parent.txt","src/renamed.txt"]); git(&["commit","-qm","unauthorized rename"]);
+    let bad_oid = git(&["rev-parse","HEAD"]);
+    let mut bad = untrusted.clone(); bad["idempotency_key"] = "scope-bad-result".into();
+    bad["candidate_oid"] = bad_oid.into(); bad["objects"] = serde_json::json!(objects());
+    std::fs::write(&submission, serde_json::to_vec(&bad).unwrap()).unwrap();
+    let submitted = hp(home.path(), &["--root",root_arg,"result","demo","submit","--input-file",submission.to_str().unwrap()]);
+    assert!(submitted.status.success(), "{}", String::from_utf8_lossy(&submitted.stderr));
+    let submitted: serde_json::Value=serde_json::from_slice(&submitted.stdout).unwrap();
+    let bad_id=submitted["submission_id"].as_str().unwrap();
+    let before_violation=runtime::snapshot(&project).unwrap();
+    raw.execute_batch("CREATE TRIGGER refuse_scope_stop BEFORE INSERT ON attempt_cancellations BEGIN SELECT RAISE(ABORT,'injected stop failure'); END;").unwrap();
+    let failed=verify(bad_id,"scope-bad"); assert!(!failed.status.success());
+    assert_eq!(runtime::snapshot(&project).unwrap(),before_violation);
+    assert_eq!(raw.query_row("SELECT count(*) FROM verification_runs",[],|r|r.get::<_,u64>(0)).unwrap(),3);
+    assert_eq!(raw.query_row("SELECT count(*) FROM feedback_items",[],|r|r.get::<_,u64>(0)).unwrap(),0);
+    raw.execute_batch("DROP TRIGGER refuse_scope_stop;").unwrap();
+    let rejected=verify(bad_id,"scope-bad"); assert!(!rejected.status.success());
+    let rejected:serde_json::Value=serde_json::from_slice(&rejected.stdout).unwrap();
+    assert_eq!(rejected["reason"],"scope_violation"); assert!(rejected["receipt"].is_null());
+    let after_violation=runtime::snapshot(&project).unwrap();
+    let held=after_violation.attempts.iter().find(|a|a.id.as_str()=="attempt-1").unwrap();
+    assert!(held.retains_capacity()); assert_eq!(held.reservation,"slot-1");
+    assert_eq!(after_violation.cancellations.len(),1);
+    assert_eq!(raw.query_row("SELECT count(*) FROM verified_results",[],|r|r.get::<_,u64>(0)).unwrap(),3);
+    assert_eq!(raw.query_row("SELECT count(*) FROM feedback_items WHERE reason='scope_violation'",[],|r|r.get::<_,u64>(0)).unwrap(),1);
+    assert_eq!(raw.query_row("SELECT count(*) FROM replan_pending_feedback",[],|r|r.get::<_,u64>(0)).unwrap(),1);
+    let replay=verify(bad_id,"scope-bad"); assert!(!replay.status.success());
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&replay.stdout).unwrap()["replayed"],true);
+    assert_eq!(runtime::snapshot(&project).unwrap(),after_violation);
+    let feedback_id:String=raw.query_row("SELECT feedback_id FROM feedback_items WHERE reason='scope_violation'",[],|r|r.get(0)).unwrap();
+    let replan=hp(home.path(), &["--root",root_arg,"feedback","demo","replan",&feedback_id]);
+    assert!(replan.status.success(), "{}", String::from_utf8_lossy(&replan.stderr));
+    assert_eq!(raw.query_row("SELECT count(*) FROM replan_feedback_links WHERE feedback_id=?1",[&feedback_id],|r|r.get::<_,u64>(0)).unwrap(),1);
+    assert_eq!(runtime::snapshot(&project).unwrap().attempts,after_violation.attempts);
+
+
+    // Direct signed installation must reject cycles even before queue edges exist.
+    for task in ["peer", "leaf", "queued"] {
+        runtime::add_task(&project, TaskId::new(task).unwrap(), task.into(), runtime::snapshot(&project).unwrap().head).unwrap();
+    }
+    let install = |name: &str, task: &str, revision: u64, predecessors: &[&str]| {
+        let mut next: serde_json::Value = serde_json::from_slice(&document).unwrap();
+        next["task_id"] = task.into(); next["contract_revision"] = revision.into();
+        next["expected_head"] = runtime::snapshot(&project).unwrap().head.into();
+        next["dependencies"] = serde_json::json!(predecessors.iter().map(|predecessor| serde_json::json!({"predecessor":predecessor,"edge":"verified_result","policy_id":"builds"})).collect::<Vec<_>>());
+        let path = home.path().join(format!("{name}.json"));
+        std::fs::write(&path, serde_json::to_vec(&next).unwrap()).unwrap();
+        assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y", "sign", "-f"]).arg(&key).args(["-n", CONTRACT_SIGNATURE_NAMESPACE]).arg(&path).status().unwrap().success());
+        let signature = path.with_extension("json.sig");
+        hp(home.path(), &["--root", root_arg, "task", "demo", "contract", "put", "--input-file", path.to_str().unwrap(), "--signature", signature.to_str().unwrap()])
+    };
+    for (name, task, dependencies) in [("peer-contract", "peer", vec!["task"]), ("leaf-contract", "leaf", vec!["peer"])] {
+        let output = install(name, task, 1, &dependencies);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+    let queue = home.path().join("queue-cycle.json");
+    std::fs::write(&queue, r#"{"priority":0,"dependencies":[{"predecessor":"task","requirement":"verified_result"}]}"#).unwrap();
+    let output = hp(home.path(), &["--root", root_arg, "task", "demo", "queue", "queued", "--input-file", queue.to_str().unwrap(), "--expected-revision", "1", "--expected-head", &runtime::snapshot(&project).unwrap().head.to_string()]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let before_cycle = runtime::snapshot(&project).unwrap();
+    for (name, dependency) in [("direct-cycle", "peer"), ("transitive-cycle", "leaf"), ("queue-cycle-contract", "queued")] {
+        let output = install(name, "task", 2, &[dependency]);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("dependency cycle"), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(runtime::snapshot(&project).unwrap(), before_cycle);
+        assert_eq!(raw.query_row("SELECT count(*) FROM task_contracts WHERE task_id='task'", [], |row| row.get::<_,u64>(0)).unwrap(), 1);
+    }
+    // An old revision's edge must not reject a now-acyclic replacement graph.
+    let output = install("peer-remove-edge", "peer", 2, &[]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let output = install("acyclic-root", "task", 2, &["leaf"]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let after = runtime::snapshot(&project).unwrap();
+    assert_eq!(after.attempts, before_cycle.attempts);
+    assert_eq!(raw.query_row("SELECT count(*) FROM task_contracts WHERE task_id='task'", [], |row| row.get::<_,u64>(0)).unwrap(), 2);
+
+    // A target-side deletion of an unchanged required output merges cleanly.
+    // The signed policy alone (git diff --quiet) cannot establish its presence.
+    for kind in ["missing", "symlink", "directory", "ancestor-symlink"] {
+        git(&["checkout","factory-integration"]);
+        let required = repo.join("src/required.txt");
+        if kind == "ancestor-symlink" {
+            git(&["rm","-r","src"]);
+            std::fs::create_dir(repo.join("payload")).unwrap();
+            std::fs::write(repo.join("payload/required.txt"), "looks like a required file").unwrap();
+            std::fs::write(repo.join("payload/lib.rs"), "pub fn result() {}\n").unwrap();
+            std::os::unix::fs::symlink("payload", repo.join("src")).unwrap();
+        } else {
+            if required.symlink_metadata().is_ok() { std::fs::remove_file(&required).unwrap(); }
+            match kind {
+                "symlink" => std::os::unix::fs::symlink("lib.rs", &required).unwrap(),
+                "directory" => { std::fs::create_dir(&required).unwrap(); std::fs::write(required.join("child"), "not a file").unwrap(); },
+                _ => {},
+            }
+        }
+        git(&["add","-A"]); git(&["commit","-qm",&format!("target output {kind}")]);
+        let before_target = git(&["rev-parse","HEAD"]);
+        git(&["checkout","--detach",&candidate]);
+        let before_attempts = runtime::snapshot(&project).unwrap().attempts;
+        let key = format!("integrate-output-{kind}");
+        let run = || hp(home.path(), &["--root",root_arg,"result","demo","integrate",result_id,
+            "--repository",repo.to_str().unwrap(),"--idempotency-key",&key,"--work-dir",integration_work.to_str().unwrap()]);
+        let blocked = run();
+        assert!(!blocked.status.success(), "integration accepted {kind} required output");
+        let blocked: serde_json::Value = serde_json::from_slice(&blocked.stdout).unwrap();
+        assert_eq!(blocked["state"], "blocked"); assert_eq!(blocked["reason"], "required_output_missing");
+        assert_eq!(git(&["rev-parse","refs/heads/factory-integration"]), before_target);
+        assert_eq!(raw.query_row("SELECT count(*) FROM integrated_commits",[],|r|r.get::<_,u64>(0)).unwrap(),2);
+        assert_eq!(runtime::snapshot(&project).unwrap().attempts, before_attempts);
+        assert!(!integration_work.exists());
+        let feedback = raw.query_row("SELECT count(*) FROM feedback_items WHERE reason='required_output_missing'",[],|r|r.get::<_,u64>(0)).unwrap();
+        let replay = run(); assert!(!replay.status.success());
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&replay.stdout).unwrap(), blocked);
+        assert_eq!(raw.query_row("SELECT count(*) FROM feedback_items WHERE reason='required_output_missing'",[],|r|r.get::<_,u64>(0)).unwrap(), feedback);
+        assert!(feedback > 0);
+    }
+
+    // Signed checks must preserve exact source/index identity through execution,
+    // and rejected runs must retain the actual check's exit status.
+    let alternate_blob=git(&["rev-parse",&format!("{candidate}:outside-parent.txt")]);
+    let cases=[
+        ("index",vec!["update-index".to_string(),"--cacheinfo".into(),format!("100644,{alternate_blob},src/lib.rs")],"tampered_tree",0),
+        ("head",vec!["update-ref".into(),"HEAD".into(),base.clone()],"tampered_tree",0),
+        ("tracked",vec!["restore".into(),format!("--source={base}"),"--worktree".into(),"--".into(),"src/lib.rs".into()],"tampered_tree",0),
+        ("exit128",vec!["cat-file".into(),"-e".into(),"not-an-object".into()],"checks_failed",128),
+        ("ignored-output",vec!["archive".into(),"--format=tar".into(),"--output=verification-artifact.tar".into(),"HEAD".into()],"",0),
+    ];
+    let mut outcome_failures=Vec::new();
+    for (name,args,reason,exit_status) in cases {
+        let task=format!("verify-outcome-{name}");let attempt=format!("{task}-attempt");
+        let head=runtime::add_task(&project,TaskId::new(task.clone()).unwrap(),task.clone(),runtime::snapshot(&project).unwrap().head).unwrap();
+        raw.execute("INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) VALUES(?1,?2,1,'running',NULL,?1,0)",rusqlite::params![attempt,task]).unwrap();
+        let argv=std::iter::once("/usr/bin/git".to_string()).chain(args).collect::<Vec<_>>();
+        let body=serde_json::json!({"version":1,"checks":argv}).to_string();
+        let mut contract=original.clone();contract["task_id"]=task.clone().into();contract["expected_head"]=head.into();
+        contract["acceptance_policies"]=serde_json::json!([{"id":"builds","text":body}]);
+        if name=="ignored-output" {
+            contract["version"]=1.into();contract.as_object_mut().unwrap().remove("outputs");
+            contract["scope"]=serde_json::json!({"paths":[]});
+            contract["acceptance_policies"].as_array_mut().unwrap().push(
+                serde_json::json!({"id":"second-policy","text":body}));
+        }
+        let document_path=home.path().join(format!("{task}.json"));
+        std::fs::write(&document_path,serde_json::to_vec(&contract).unwrap()).unwrap();
+        assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&key).args(["-n",CONTRACT_SIGNATURE_NAMESPACE]).arg(&document_path).status().unwrap().success());
+        let signature=document_path.with_extension("json.sig");
+        let installed=hp(home.path(), &["--root",root_arg,"task","demo","contract","put","--input-file",document_path.to_str().unwrap(),"--signature",signature.to_str().unwrap()]);
+        assert!(installed.status.success(),"{}",String::from_utf8_lossy(&installed.stderr));
+        let installed:serde_json::Value=serde_json::from_slice(&installed.stdout).unwrap();
+        let mut proposal=untrusted.clone();proposal["task_id"]=task.into();proposal["attempt_id"]=attempt.into();
+        proposal["contract_digest"]=installed["digest"].clone();proposal["idempotency_key"]=format!("outcome-{name}").into();proposal["objects"]=serde_json::json!(objects());
+        let submission_path=home.path().join(format!("outcome-{name}-submission.json"));
+        std::fs::write(&submission_path,serde_json::to_vec(&proposal).unwrap()).unwrap();
+        let submitted=hp(home.path(), &["--root",root_arg,"result","demo","submit","--input-file",submission_path.to_str().unwrap()]);
+        assert!(submitted.status.success(),"{}",String::from_utf8_lossy(&submitted.stderr));
+        let submitted:serde_json::Value=serde_json::from_slice(&submitted.stdout).unwrap();
+        std::fs::write(&policy_path,&body).unwrap();
+        let before_attempts=runtime::snapshot(&project).unwrap().attempts;
+        let output=verify(submitted["submission_id"].as_str().unwrap(),&format!("outcome-{name}"));
+        let outcome:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();
+        let observed:Option<i64>=raw.query_row("SELECT exit_status FROM verification_runs WHERE run_id=?1",[outcome["run_id"].as_str().unwrap()],|row|row.get(0)).unwrap();
+        eprintln!("verifier outcome {name}: state={}, reason={}, exit_status={observed:?}",outcome["state"],outcome["reason"]);
+        let expected_accept=reason.is_empty();
+        let expected_reason=if expected_accept {serde_json::Value::Null} else {serde_json::json!(reason)};
+        if output.status.success()!=expected_accept||outcome["state"]!=if expected_accept {"accepted"} else {"rejected"}||outcome["reason"]!=expected_reason||outcome["receipt"].is_null()==expected_accept||observed!=Some(exit_status) {
+            outcome_failures.push(format!("{name}: {outcome}, exit_status={observed:?}"));
+        }
+        assert_eq!(runtime::snapshot(&project).unwrap().attempts,before_attempts);
+        assert!(!work.exists());
+        let replay=verify(submitted["submission_id"].as_str().unwrap(),&format!("outcome-{name}"));
+        let replay:serde_json::Value=serde_json::from_slice(&replay.stdout).unwrap();
+        assert_eq!(replay["run_id"],outcome["run_id"]);assert_eq!(replay["replayed"],true);
+        assert_eq!(raw.query_row("SELECT exit_status FROM verification_runs WHERE run_id=?1",[outcome["run_id"].as_str().unwrap()],|row|row.get::<_,Option<i64>>(0)).unwrap(),observed);
+        let receipts:u64=raw.query_row("SELECT count(*) FROM verified_results WHERE run_id=?1",[outcome["run_id"].as_str().unwrap()],|row|row.get(0)).unwrap();
+        assert_eq!(receipts,u64::from(expected_accept));
+        if expected_accept {
+            let old=outcome["receipt"]["result_id"].as_str().unwrap();
+            raw.execute("UPDATE verification_contract_checks SET version=1 WHERE result_id=?1",[old]).unwrap();
+            let consumer="unscoped-historical-consumer";
+            let head=runtime::add_task(&project,TaskId::new(consumer).unwrap(),consumer.into(),runtime::snapshot(&project).unwrap().head).unwrap();
+            let request=home.path().join("unscoped-history-queue.json");
+            std::fs::write(&request,serde_json::json!({"priority":0,"dependencies":[{"predecessor":proposal["task_id"],"requirement":"verified_result"}]}).to_string()).unwrap();
+            let queued=hp(home.path(), &["--root",root_arg,"task","demo","queue",consumer,"--input-file",request.to_str().unwrap(),"--expected-revision","1","--expected-head",&head.to_string()]);
+            assert!(queued.status.success(),"{}",String::from_utf8_lossy(&queued.stderr));
+            let usable=||raw.query_row("SELECT count(*) FROM dependency_satisfactions WHERE task_id=?1 AND state='valid'",[consumer],|row|row.get::<_,u64>(0)).unwrap();
+            assert_eq!(usable(),0,"unscoped historical proof must not release a dependency");
+            let replay=verify(submitted["submission_id"].as_str().unwrap(),&format!("outcome-{name}"));assert!(replay.status.success());
+            assert_eq!(usable(),0);
+            assert_eq!(raw.query_row("SELECT version FROM verification_contract_checks WHERE result_id=?1",[old],|row|row.get::<_,u32>(0)).unwrap(),1);
+            let fresh=verify(submitted["submission_id"].as_str().unwrap(),"unscoped-fresh-proof");
+            assert!(fresh.status.success(),"{}",String::from_utf8_lossy(&fresh.stderr));
+            assert_eq!(usable(),1);
+            let submission_id=submitted["submission_id"].as_str().unwrap();
+            let pending=||raw.query_row("SELECT count(*) FROM pending_verification_work WHERE submission_id=?1",[submission_id],|row|row.get::<_,u64>(0)).unwrap();
+            assert_eq!(pending(),1,"running one policy, even repeatedly, must not hide another pending policy");
+            let second=hp(home.path(), &["--root",root_arg,"result","demo","verify",submission_id,
+                "--policy-id","second-policy","--policy-file",policy_path.to_str().unwrap(),
+                "--idempotency-key","second-policy-run","--work-dir",work.to_str().unwrap()]);
+            assert!(second.status.success(),"{}",String::from_utf8_lossy(&second.stderr));
+            assert_eq!(pending(),0,"all policies now have completed runs");
+        }
+    }
+    assert!(outcome_failures.is_empty(),"verifier outcome failures: {outcome_failures:?}");
+
+    // Capability inspection must ignore profiles for other adapters/store identities,
+    // but still validate the selected report rather than trusting its indexed fields.
+    use std::os::unix::fs::MetadataExt;
+    let capability_head = runtime::add_task(&project, TaskId::new("capability-reader").unwrap(), "inspect capabilities".into(), runtime::snapshot(&project).unwrap().head).unwrap();
+    let mut contract = original.clone();
+    contract["task_id"] = "capability-reader".into();
+    contract["expected_head"] = capability_head.into();
+    contract["capability_flags"] = serde_json::json!(["discovered"]);
+    let path = home.path().join("capability-reader.json");
+    std::fs::write(&path, serde_json::to_vec(&contract).unwrap()).unwrap();
+    assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&key).args(["-n",CONTRACT_SIGNATURE_NAMESPACE]).arg(&path).status().unwrap().success());
+    let signature = path.with_extension("json.sig");
+    let installed = hp(home.path(), &["--root",root_arg,"task","demo","contract","put","--input-file",path.to_str().unwrap(),"--signature",signature.to_str().unwrap()]);
+    assert!(installed.status.success(), "{}", String::from_utf8_lossy(&installed.stderr));
+    let request = home.path().join("capability-queue.json");
+    std::fs::write(&request,r#"{"priority":0,"dependencies":[]}"#).unwrap();
+    let queued = hp(home.path(), &["--root",root_arg,"task","demo","queue","capability-reader","--input-file",request.to_str().unwrap(),"--expected-revision","1","--expected-head",&runtime::snapshot(&project).unwrap().head.to_string()]);
+    assert!(queued.status.success(), "{}", String::from_utf8_lossy(&queued.stderr));
+    let store_path = db_path.canonicalize().unwrap();
+    let metadata = std::fs::metadata(&store_path).unwrap();
+    let insert_profile = |id:&str, kind:&str, inode:u64| {
+        let report = serde_json::json!({"source_store":[store_path,metadata.dev(),inode],"preparation":{"profile":{"kind":kind}}}).to_string();
+        raw.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('profile.native_retained',?1,1,1,'{}')",[id]).unwrap();
+        raw.execute("INSERT INTO native_profiles VALUES(?1,?2,?3,(SELECT max(sequence) FROM events))",rusqlite::params![id,report,"0".repeat(64)]).unwrap();
+    };
+    insert_profile(&"1".repeat(64), "claude", metadata.ino());
+    insert_profile(&"2".repeat(64), "codex", metadata.ino()+1);
+    let inspect = || hp(home.path(), &["--root",root_arg,"scheduler","demo","inspect"]);
+    let before_inspect:u64 = raw.query_row("SELECT max(sequence) FROM events",[],|r|r.get(0)).unwrap();
+    let report = inspect();
+    assert!(report.status.success(), "unrelated native profile history blocked inspection: {}", String::from_utf8_lossy(&report.stderr));
+    let report:serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    let entry = report["entries"].as_array().unwrap().iter().find(|entry|entry["task"]=="capability-reader").unwrap();
+    assert!(entry["blockers"].as_array().unwrap().iter().any(|blocker|blocker=="capability_unsupported"));
+    assert_eq!(raw.query_row("SELECT max(sequence) FROM events",[],|r|r.get::<_,u64>(0)).unwrap(),before_inspect);
+    insert_profile(&"3".repeat(64), "codex", metadata.ino());
+    let selected_corrupt = inspect();
+    assert!(!selected_corrupt.status.success());
+    assert!(String::from_utf8_lossy(&selected_corrupt.stderr).contains("native profile report digest mismatch"));
+
 }
 
 #[cfg(all(feature = "state-store", target_os = "linux"))]
@@ -1824,4 +2618,154 @@ fn signed_factory_admission_command_stores_raw_bytes_or_writes_a_denial() {
     ).unwrap();
     assert_eq!(stored_disable, disable_doc);
     assert_eq!(denials(), 6);
+}
+
+#[cfg(feature = "state-store")]
+#[path = "../src/store/test_schema.rs"]
+mod test_schema;
+
+#[test]
+#[cfg(feature="state-store")]
+fn factory_status_cli_redacts_history_preserves_capacity_and_refuses_unknown_schema() {
+    use herdr_projects::{domain::*,migration,store::SCHEMA};
+    fn forbid(value:&serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map)=>for (key,child) in map {
+                assert!(!matches!(key.to_ascii_lowercase().as_str(),"env"|"environment"|"argv"|"secret"|"secrets"|"path"),"{key}");forbid(child);
+            },
+            serde_json::Value::Array(items)=>items.iter().for_each(forbid),
+            serde_json::Value::String(text)=>assert!(!text.contains("SECRET_TOKEN_DO_NOT_LEAK"),"{text}"),
+            _=>{},
+        }
+    }
+    let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
+    for action in ["new","pause"] {assert!(hp(home.path(),&["--root",r,action,"demo"]).status.success());}
+    let project=root.join("demo");let plan=migration::inspect_with_config(&project,&home.path().join(".config/herdr-projects/config.toml")).unwrap();migration::apply(&project,&plan,true).unwrap();
+    let mut db=migration::open_active(&project).unwrap();
+        let mut mutations = vec![
+            Mutation::Task {
+                expected: None,
+                next: Task {
+                    id: TaskId::new("kept").unwrap(),
+                    revision: 1,
+                    state: TaskState::Running,
+                    title: "SECRET_TOKEN_DO_NOT_LEAK".into(),
+                    active_attempt: None,
+                },
+            },
+            Mutation::Attempt {
+                expected: None,
+                next: Attempt {
+                    id: AttemptId::new("attempt-kept").unwrap(),
+                    task: TaskId::new("kept").unwrap(),
+                    revision: 1,
+                    // Losing contact is not termination evidence. Exercise the
+                    // production status/capacity reader for that distinction.
+                    state: AttemptState::Lost,
+                    snapshot: None,
+                    reservation: "slot-kept".into(),
+                    termination_observed: false,
+                },
+            },
+        ];
+        for index in 0..40 {
+            mutations.push(Mutation::Task {
+                expected: None,
+                next: Task {
+                    id: TaskId::new(format!("retired-{index:02}")).unwrap(),
+                    revision: 1,
+                    state: TaskState::Succeeded,
+                    title: format!("SECRET_TOKEN_DO_NOT_LEAK-{index}").into(),
+                    active_attempt: None,
+                },
+            });
+            mutations.push(Mutation::Attempt {
+                expected: None,
+                next: Attempt {
+                    id: AttemptId::new(format!("attempt-retired-{index:02}")).unwrap(),
+                    task: TaskId::new(format!("retired-{index:02}")).unwrap(),
+                    revision: 1,
+                    state: AttemptState::Completed,
+                    snapshot: None,
+                    reservation: format!("slot-retired-{index:02}"),
+                    termination_observed: true,
+                },
+            });
+        }
+    db.commit(Commit{expected_head:db.current_head().unwrap(),mutations}).unwrap();
+    let before=db.read_snapshot(None).unwrap();
+    let active_rows=db.active_inventory_page_rows().unwrap();drop(db);
+    std::fs::write(project.join(".state/admission-paused.json"),r#"{"reason":"disk_full","token":"SECRET_TOKEN_DO_NOT_LEAK"}"#).unwrap();
+    let command=["--root",r,"factory","status","demo"];
+    let output=hp(home.path(),&command);assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    let status:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();forbid(&status);
+    assert_eq!(status["prepared_dispatch"],true);assert_eq!(status["factory_admission"],"off");
+    assert_eq!(status["admission_paused"],true);assert_eq!(status["pause_reason"],"disk_full");
+    assert!(status["blockers"].as_array().unwrap().contains(&serde_json::json!("admission_paused")));
+    assert!(!status["blockers"].as_array().unwrap().contains(&serde_json::json!("promotion_conflict")));
+    assert_eq!(status["counters"]["retained_slots"],1);assert!(status["counters"]["rows_decoded"].is_null());
+    assert_eq!(status["counters"]["active_inventory_page_rows"],active_rows);assert!(active_rows>0 && active_rows<41);
+    assert_eq!(migration::open_active(&project).unwrap().read_snapshot(None).unwrap(),before);
+
+    // An irrelevant malformed historical ID makes full snapshot decoding fail.
+    // Status must still succeed through the bounded current-state reader.
+    let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();
+    raw.execute("INSERT INTO tasks VALUES('retired/invalid',1,'succeeded','SECRET_TOKEN_DO_NOT_LEAK',NULL)",[]).unwrap();
+    assert!(migration::open_active(&project).unwrap().read_snapshot(None).is_err());
+    let output=hp(home.path(),&command);assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    let cold:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();forbid(&cold);
+    assert_eq!(cold["counters"]["retained_slots"],1);assert_eq!(cold["counters"]["active_inventory_page_rows"],active_rows);
+    assert_eq!(raw.query_row("SELECT termination_observed FROM attempts WHERE id='attempt-kept'",[],|row|row.get::<_,bool>(0)).unwrap(),false);
+    raw.execute("DELETE FROM tasks WHERE id='retired/invalid'",[]).unwrap();
+    for (version,message) in [(SCHEMA+1,"store schema is newer than this binary"),(0,"unsupported_schema")] {
+        raw.pragma_update(None,"user_version",version).unwrap();
+        let output=hp(home.path(),&command);assert!(!output.status.success());
+        let refused:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();forbid(&refused);
+        assert_eq!(refused["schema"],version);assert_eq!(refused["error"],message);assert!(refused.get("counters").is_none());
+        assert_eq!(raw.query_row("PRAGMA user_version",[],|row|row.get::<_,u32>(0)).unwrap(),version);
+    }
+    raw.pragma_update(None,"user_version",SCHEMA).unwrap();
+    assert_eq!(migration::open_active(&project).unwrap().read_snapshot(None).unwrap(),before);
+}
+
+#[test]
+#[cfg(feature="state-store")]
+fn historical_store_cli_requires_explicit_upgrade_and_preserves_intent_and_capacity() {
+    use herdr_projects::{domain::*,migration,store::SCHEMA};
+    for version in 32..=42 {
+        let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
+        for command in ["new","pause"] {assert!(hp(home.path(),&["--root",r,command,"demo"]).status.success());}
+        let project=root.join("demo");let plan=migration::inspect_with_config(&project,&home.path().join(".config/herdr-projects/config.toml")).unwrap();migration::apply(&project,&plan,true).unwrap();
+        let path=project.join(".state/state.db");
+        let mut db=migration::open_active(&project).unwrap();
+        db.commit(Commit{expected_head:db.current_head().unwrap(),mutations:vec![
+            Mutation::Task{expected:None,next:Task{id:TaskId::new("kept").unwrap(),revision:1,state:TaskState::Running,title:"retained execution".into(),active_attempt:None}},
+            Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("attempt-kept").unwrap(),task:TaskId::new("kept").unwrap(),revision:1,state:AttemptState::Running,snapshot:None,reservation:"retained-capacity".into(),termination_observed:false}},
+        ]}).unwrap();
+        let proposal=br#"{"version":1,"contracts":[{"task_id":"planned","text":"retained planning intent","dependencies":[]}]}"#;
+        let receipt=db.apply_plan_proposal(proposal,0,"retained-plan").unwrap();
+        let before=db.read_snapshot(None).unwrap();drop(db);
+        let raw=rusqlite::Connection::open(&path).unwrap();test_schema::historical(&raw,version).unwrap();
+        let schema=||raw.query_row("PRAGMA user_version",[],|row|row.get::<_,u32>(0)).unwrap();
+        let has_projection=||raw.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='plan_task_intents')",[],|row|row.get::<_,bool>(0)).unwrap();
+        assert_eq!(schema(),version);assert!(!has_projection());
+        let status=hp(home.path(),&["--root",r,"factory","status","demo"]);
+        assert!(status.status.success(),"schema {version}: {}",String::from_utf8_lossy(&status.stderr));
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&status.stdout).unwrap()["schema"],version);
+        assert_eq!(schema(),version);assert!(!has_projection());
+        let inspect=hp(home.path(),&["--root",r,"plan","inspect","demo"]);assert!(!inspect.status.success());assert_eq!(schema(),version);
+        let guard=herdr_projects::execution_guard::ProjectGuard::acquire(&project).unwrap();
+        let upgrade=["--root",r,"migration","demo","upgrade-store"];
+        assert!(!hp(home.path(),&upgrade).status.success());assert_eq!(schema(),version);assert!(!has_projection());drop(guard);
+        let upgraded=hp(home.path(),&upgrade);assert!(upgraded.status.success(),"schema {version}: {}",String::from_utf8_lossy(&upgraded.stderr));
+        assert_eq!(schema(),SCHEMA);assert!(has_projection());
+        let after=migration::open_active(&project).unwrap().read_snapshot(None).unwrap();
+        assert_eq!(after.head,before.head);assert_eq!(after.tasks,before.tasks);assert_eq!(after.attempts,before.attempts);assert_eq!(after.control,before.control);
+        let retained:(Vec<u8>,String)=raw.query_row("SELECT payload,payload_digest FROM plan_proposals WHERE proposal_id=?1",[&receipt.proposal_id],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();assert_eq!(retained,(proposal.to_vec(),receipt.digest));
+        let inspect=hp(home.path(),&["--root",r,"plan","inspect","demo"]);assert!(inspect.status.success());
+        let page:serde_json::Value=serde_json::from_slice(&inspect.stdout).unwrap();assert_eq!(page["plan_revision"],1);assert_eq!(page["entries"][0]["text"],"retained planning intent");assert_eq!(page["entries"][0]["proposal_id"],receipt.proposal_id);
+        assert!(hp(home.path(),&upgrade).status.success());
+        assert_eq!(migration::open_active(&project).unwrap().read_snapshot(None).unwrap(),after);
+        assert_eq!(raw.query_row("SELECT count(*) FROM pragma_foreign_key_check",[],|row|row.get::<_,u64>(0)).unwrap(),0);
+    }
 }

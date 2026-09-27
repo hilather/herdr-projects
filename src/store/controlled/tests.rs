@@ -3,6 +3,147 @@ fn fixture()->(tempfile::TempDir,std::path::PathBuf) {
     let root=tempfile::tempdir().unwrap();let path=root.path().join("state.db");SqliteStore::create(&path).unwrap();(root,path)
 }
 fn control()->ReadControl {ReadControl::new(Instant::now()+Duration::from_secs(5),Cancellation::default())}
+fn padded_active_binding(path:&Path,padding:usize)->(u64,crate::reconcile::RuntimeObservation) {
+    let mut db=SqliteStore::open(path).unwrap();
+    let binding=db.create_runtime(None,None,0,&RuntimeRoute::default()).unwrap().binding;
+    let mut value=serde_json::to_value(&binding).unwrap();
+    value["unknown_padding"]=serde_json::Value::String("x".repeat(padding));
+    let payload=value.to_string();
+    db.connection.execute("UPDATE runtime_bindings SET payload=?1,payload_hash=?2 WHERE id=?3",params![payload,format!("{:x}",Sha256::digest(payload.as_bytes())),binding.id]).unwrap();
+    (db.current_head().unwrap(),crate::reconcile::RuntimeObservation{binding:binding.id,binding_revision:binding.revision,observed_unix_ms:1,collector:"herdr-git-v2".into(),..Default::default()})
+}
+#[test]
+fn active_binding_budget_is_checked_before_decode_and_rolls_back_publication() {
+    for publication in [false,true] {
+        let (_root,path)=fixture();
+        let (head,observation)=padded_active_binding(&path,17*1024*1024);
+        let mut db=ControlledStore::open_scoped(&path,control()).unwrap();
+        let result=if publication {db.record_observations(head,&[observation]).map(|_|())}
+            else {db.reconcile_active_work(None).map(|_|())};
+        assert!(matches!(result,Err(StoreError::Limit(_))),"{result:?}");
+        assert_eq!(db.current_head().unwrap(),head);
+        assert_eq!(db.store.connection.query_row("SELECT count(*) FROM runtime_observations",[],|row|row.get::<_,u64>(0)).unwrap(),0);
+        assert_eq!(db.store.connection.query_row("SELECT inventory_revision FROM active_work_meta",[],|row|row.get::<_,u64>(0)).unwrap(),0);
+    }
+}
+
+#[test]
+fn repeated_active_reads_share_the_original_input_budget() {
+    let (_root,path)=fixture();
+    padded_active_binding(&path,8*1024*1024);
+    let mut db=ControlledStore::open_scoped(&path,ReadControl::new(Instant::now()+Duration::from_secs(30),Cancellation::default())).unwrap();
+    let mut completed=0;
+    for _ in 0..10 {
+        match db.reconcile_active_work(None) {
+            Ok(run)=>{assert_eq!(run.items.len(),1);completed+=1;},
+            Err(StoreError::Limit(_))=>break,
+            other=>panic!("{other:?}"),
+        }
+    }
+    assert!(completed>0&&completed<10,"completed {completed} reads without exhausting the shared budget");
+    assert!(matches!(db.reconcile_active_work(None),Err(StoreError::Limit(_))));
+}
+#[test]
+fn controller_schema_guard_work_is_independent_of_retained_events() {
+    let (_root,path)=fixture();
+    let mut previous=None;
+    for count in [0,10_000] {
+        if count>0 {
+            let raw=Connection::open(&path).unwrap();
+            raw.execute("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<?1) INSERT INTO events(kind,entity,revision,payload_version,payload) SELECT 'fixture','history',1,1,'{}' FROM n",[count]).unwrap();
+        }
+        let work=SqlWork::default();
+        let db=ControlledStore::open_scoped_observed(&path,control(),work.clone()).unwrap();
+        assert_eq!(db.read_targeted_hot_path(0,true).unwrap(),SCHEMA);
+        let observed=work.snapshot();
+        let costs=(observed.sqlite_rows_returned,observed.sqlite_vm_steps);
+        assert!(costs.0>0 && costs.1>0);
+        if let Some(expected)=previous {assert_eq!(costs,expected);}
+        previous=Some(costs);
+        db.control.cancellation().cancel();
+        assert!(matches!(db.read_targeted_hot_path(0,true),Err(StoreError::Cancelled)));
+    }
+}
+#[test]
+fn sql_work_counts_reused_statements_and_survives_connection_drop() {
+    let (_root,path)=fixture();
+    let work=SqlWork::default();
+    let db=ControlledStore::open_scoped_observed(&path,control(),work.clone()).unwrap();
+    let before=work.snapshot();
+    assert!(before.connection_observed);
+    assert!(before.sqlite_rows_returned>0);
+    let mut statement=db.store.connection.prepare_cached("SELECT 42").unwrap();
+    let mut previous=before;
+    let mut steps=None;
+    for _ in 0..3 {
+        let value:i64=statement.query_row([],|row|row.get(0)).unwrap();
+        assert_eq!(value,42);
+        let current=work.snapshot();
+        assert_eq!(current.sqlite_rows_returned-previous.sqlite_rows_returned,1);
+        let delta=current.sqlite_vm_steps-previous.sqlite_vm_steps;
+        assert!(delta>0);
+        if let Some(expected)=steps {assert_eq!(delta,expected);} else {steps=Some(delta);}
+        previous=current;
+    }
+    drop(statement);
+    drop(db);
+    assert_eq!(work.snapshot().sqlite_rows_returned,previous.sqlite_rows_returned);
+}
+
+#[test]
+fn sql_work_retains_cancelled_statement_work_without_cross_connection_counts() {
+    let (_root,path)=fixture();
+    let work=SqlWork::default();
+    let db=ControlledStore::open_scoped_observed(&path,control(),work.clone()).unwrap();
+    let before=work.snapshot();
+    let unrelated=Connection::open_in_memory().unwrap();
+    unrelated.query_row("SELECT 1",[],|_|Ok(())).unwrap();
+    assert_eq!(work.snapshot().sqlite_rows_returned,before.sqlite_rows_returned);
+    let cancellation=db.control.cancellation();
+    let cancel=std::thread::spawn(move||{std::thread::sleep(Duration::from_millis(30));cancellation.cancel();});
+    let result=db.read(|store| {
+        store.connection.query_row("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n",[],|row|row.get::<_,i64>(0)).map_err(StoreError::from)
+    });
+    cancel.join().unwrap();
+    assert!(matches!(result,Err(StoreError::Cancelled)));
+    drop(db);
+    assert!(work.snapshot().sqlite_vm_steps>before.sqlite_vm_steps);
+}
+
+#[test]
+fn sql_work_retains_opening_failure_evidence() {
+    let (_root,path)=fixture();
+    Connection::open(&path).unwrap().execute_batch("PRAGMA user_version=999").unwrap();
+    let work=SqlWork::default();
+    assert!(ControlledStore::open_scoped_observed(&path,control(),work.clone()).is_err());
+    let metrics=work.snapshot();
+    assert!(metrics.connection_observed);
+    assert!(metrics.sqlite_rows_returned>0);
+    assert!(metrics.sqlite_vm_steps>0);
+    // The failed opener has dropped its connection and callback context owner;
+    // the observation remains usable without keeping either one alive.
+    Connection::open_in_memory().unwrap().query_row("SELECT 1",[],|_|Ok(())).unwrap();
+    assert_eq!(work.snapshot().sqlite_rows_returned,metrics.sqlite_rows_returned);
+}
+
+#[test]
+fn sql_work_exposes_scanning_hidden_behind_one_aggregate_row() {
+    let (_root,path)=fixture();
+    let work=SqlWork::default();
+    let db=ControlledStore::open_scoped_observed(&path,control(),work.clone()).unwrap();
+    let mut measurements=Vec::new();
+    for limit in [10,10_000] {
+        let before=work.snapshot();
+        let sum:i64=db.store.connection.query_row(
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<?1) SELECT sum(x) FROM n",
+            [limit],|row|row.get(0)).unwrap();
+        assert_eq!(sum,limit*(limit+1)/2);
+        let after=work.snapshot();
+        assert_eq!(after.sqlite_rows_returned-before.sqlite_rows_returned,1);
+        measurements.push(after.sqlite_vm_steps-before.sqlite_vm_steps);
+    }
+    assert!(measurements[1]>100*measurements[0],"a one-row aggregate must not hide increasing SQL work");
+}
 fn insert(db:&mut SqliteStore)->Result<u64> {
     let head=db.read_snapshot(None)?.head;
     db.commit(Commit{expected_head:head,mutations:vec![Mutation::Task{expected:None,next:Task{id:TaskId::new("task").unwrap(),revision:1,state:TaskState::Draft,title:"task".into(),active_attempt:None}}]})

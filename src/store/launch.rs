@@ -34,7 +34,7 @@ pub(super) fn has_started_receipt(
         params![operation.as_str(),payload], |row| row.get(0))?)
 }
 
-pub(super) fn record_creation(tx: &Connection, claim: &Claim, prepared: &PreparedLaunchCreation, now: i64) -> Result<u64> {
+pub(super) fn record_creation(tx: &Connection, claim: &Claim, prepared: &PreparedLaunchCreation, now: i64, budget: Option<&read_budget::ReadBudget>) -> Result<u64> {
     let intent = &prepared.intent;
     intent.route.validate().map_err(StoreError::Invalid)?;
     if !matches!(intent.version, 1 | 2)
@@ -57,7 +57,7 @@ pub(super) fn record_creation(tx: &Connection, claim: &Claim, prepared: &Prepare
     {
         return Err(invalid("invalid launch creation intent"));
     }
-    let delivery = super::delivery::delivery(tx, &claim.operation)?;
+    let delivery = super::delivery::delivery_with_budget(tx, &claim.operation, budget)?;
     if delivery.revision != claim.revision
         || delivery.state != DeliveryState::Claimed
         || delivery.epoch != claim.epoch
@@ -67,16 +67,11 @@ pub(super) fn record_creation(tx: &Connection, claim: &Claim, prepared: &Prepare
     {
         return Err(StoreError::Conflict);
     }
-    super::approvals::validate_use(tx, claim, now)?;
-    let record = super::reservations::read_inputs(tx)?
-        .into_iter()
-        .find(|r| r.operation == intent.operation && r.attempt == intent.attempt)
-        .ok_or(StoreError::Conflict)?;
-    let binding = super::runtime::read_all(tx)?
-        .into_iter()
-        .find(|b| b.id == record.inputs.binding)
-        .ok_or(StoreError::Conflict)?;
-    let (route,_) = super::worktrees::execution_route(tx, &record, &binding)?;
+    super::approvals::validate_use_with_budget(tx, claim, now, budget)?;
+    let record = super::reservations::read_input(tx, &intent.operation, budget)?;
+    if record.attempt != intent.attempt { return Err(StoreError::Conflict); }
+    let binding = super::runtime::read_binding(tx, &record.inputs.binding, budget)?.ok_or(StoreError::Conflict)?;
+    let (route,_) = super::worktrees::execution_route_with_budget(tx, &record, &binding, budget)?;
     if route != intent.route
         || binding.revision != record.inputs.binding_revision
         || super::ownership::identity_digest(&binding)? != record.inputs.binding_digest
@@ -100,9 +95,115 @@ pub(super) fn record_creation(tx: &Connection, claim: &Claim, prepared: &Prepare
     head(tx)
 }
 
+pub(crate) struct StartSelection {
+    pub delivery: Delivery,
+    pub record: AttemptInputRecord,
+    pub events: Vec<Event>,
+}
+impl SqliteStore {
+    pub(super) fn start_selection(&mut self, operation: &OperationId, expected: u64, budget: &read_budget::ReadBudget) -> Result<StartSelection> {
+        budget.check()?;
+        let tx = self.connection.transaction()?;
+        let delivery = super::delivery::delivery_with_budget(&tx, operation, Some(budget))?;
+        if delivery.revision != expected { return Err(StoreError::Conflict); }
+        let record = super::reservations::read_input(&tx, operation, Some(budget))?;
+        let mut statement = tx.prepare("SELECT sequence,kind,entity,revision,payload_version,payload FROM events WHERE entity=?1 AND kind IN ('runtime.launch_target','runtime.launch_release','runtime.launch_started','runtime.worktrees_creation','runtime.worktrees_ready') LIMIT 6")?;
+        let mut rows = statement.query([operation.as_str()])?;
+        let mut events = Vec::new();
+        let mut kinds = std::collections::BTreeSet::new();
+        while let Some(row) = rows.next()? {
+            budget.row(row, &[(5,1)])?;
+            let kind: String = row.get(1)?;
+            if !kinds.insert(kind.clone()) { return Err(invalid("duplicate start evidence")); }
+            let payload: String = row.get(5)?;
+            events.push(Event { sequence: row.get(0)?, kind, entity: row.get(2)?, revision: row.get(3)?, payload_version: row.get(4)?,
+                payload: serde_json::from_str(&payload).map_err(|_| invalid("invalid start evidence"))? });
+        }
+        budget.check()?;
+        Ok(StartSelection { delivery, record, events })
+    }
+}
+
+pub(crate) struct AdvancementSelection {
+    pub delivery: Delivery,
+    pub record: AttemptInputRecord,
+    pub kinds: std::collections::BTreeSet<String>,
+}
+impl SqliteStore {
+    pub(super) fn advancement_selection(&mut self, operation: &OperationId, expected: u64, budget: &read_budget::ReadBudget) -> Result<AdvancementSelection> {
+        budget.check()?;
+        let tx = self.connection.transaction()?;
+        let delivery = super::delivery::delivery_with_budget(&tx, operation, Some(budget))?;
+        if delivery.revision != expected { return Err(StoreError::Conflict); }
+        let record = super::reservations::read_input(&tx, operation, Some(budget))?;
+        // Probe each one-use boundary separately. Retained history and duplicate
+        // audit rows must not turn a presence check into a full event scan.
+        let mut statement = tx.prepare("WITH boundaries(kind) AS (VALUES ('runtime.worktrees_creation'),('runtime.launch_creation'),('runtime.launch_workspace'),('runtime.launch_layout'),('runtime.launch_target'),('runtime.launch_started'),('runtime.launch_release'),('runtime.launch_name')) SELECT kind FROM boundaries WHERE EXISTS(SELECT 1 FROM events WHERE entity=?1 AND kind=boundaries.kind)")?;
+        let mut rows = statement.query([operation.as_str()])?;
+        let mut kinds = std::collections::BTreeSet::new();
+        while let Some(row) = rows.next()? {
+            budget.row(row, &[])?;
+            kinds.insert(row.get(0)?);
+        }
+        budget.check()?;
+        Ok(AdvancementSelection { delivery, record, kinds })
+    }
+}
+
+pub(crate) struct ResourceRecoverySelection {
+    pub head: u64,
+    pub delivery: Delivery,
+    pub record: AttemptInputRecord,
+    pub binding: RuntimeBinding,
+    pub route: RuntimeRoute,
+    pub events: Vec<Event>,
+}
+impl SqliteStore {
+    pub(super) fn resource_recovery_selection(&mut self, operation: &OperationId, expected: u64,
+        budget: &read_budget::ReadBudget) -> Result<ResourceRecoverySelection> {
+        self.resource_selection(operation, expected, budget, false)
+    }
+    pub(super) fn resource_creation_selection(&mut self, operation: &OperationId, expected: u64,
+        budget: &read_budget::ReadBudget) -> Result<ResourceRecoverySelection> {
+        self.resource_selection(operation, expected, budget, true)
+    }
+    fn resource_selection(&mut self, operation: &OperationId, expected: u64,
+        budget: &read_budget::ReadBudget, creating: bool) -> Result<ResourceRecoverySelection> {
+        budget.check()?;
+        let tx = self.connection.transaction()?;
+        let head = head(&tx)?;
+        let delivery = super::delivery::delivery_with_budget(&tx, operation, Some(budget))?;
+        if delivery.revision != expected || !(delivery.attempts == 1 && delivery.state != DeliveryState::Confirmed
+            || creating && delivery.state == DeliveryState::Pending && delivery.attempts == 0 && delivery.epoch == 0) {
+            return Err(StoreError::Conflict);
+        }
+        let record = super::reservations::read_input(&tx, operation, Some(budget))?;
+        let attempt = read_attempt_with_budget(&tx, &record.attempt, Some(budget))?;
+        if attempt.state != AttemptState::Reserved || !attempt.retains_capacity() { return Err(StoreError::Conflict); }
+        let binding = super::runtime::read_binding(&tx, &record.inputs.binding, Some(budget))?.ok_or(StoreError::Conflict)?;
+        if delivery.attempts == 1 { super::approvals::validate_historical_consumption(&tx, &record, Some(budget))?; }
+        let route = super::worktrees::execution_route_with_budget(&tx, &record, &binding, Some(budget))?.0;
+        let mut statement = tx.prepare("SELECT sequence,kind,entity,revision,payload_version,payload FROM events WHERE entity=?1 AND kind IN ('runtime.launch_creation','runtime.launch_target','runtime.launch_workspace','runtime.launch_layout','runtime.launch_release','runtime.launch_started','runtime.worktrees_creation','runtime.worktrees_ready') ORDER BY sequence")?;
+        let mut rows = statement.query([operation.as_str()])?;
+        let mut events = Vec::new();
+        let mut kinds = std::collections::BTreeSet::new();
+        while let Some(row) = rows.next()? {
+            budget.row(row, &[(5,1)])?;
+            let kind: String = row.get(1)?;
+            if !kinds.insert(kind.clone()) { return Err(invalid("duplicate resource recovery evidence")); }
+            let payload: String = row.get(5)?;
+            events.push(Event { sequence: row.get(0)?, kind, entity: row.get(2)?, revision: row.get(3)?,
+                payload_version: row.get(4)?, payload: serde_json::from_str(&payload).map_err(|_| invalid("invalid resource recovery evidence"))? });
+        }
+        budget.check()?;
+        Ok(ResourceRecoverySelection { head, delivery, record, binding, route, events })
+    }
+}
+
 impl SqliteStore {
     /// Atomically consume approval, claim the launch and retain its recovery
     /// identity. A failure leaves the operation unclaimed and approval unused.
+    #[cfg(test)]
     pub(crate) fn claim_launch_creation(
         &mut self, expected: u64, prepared: &PreparedLaunchCreation, now: i64, lease_ms: i64,
     ) -> Result<Claim> {
@@ -110,13 +211,15 @@ impl SqliteStore {
     }
 
     /// Advance only the existing worktree claim; never consume approval twice.
-    pub(crate) fn continue_worktree_launch_creation(&mut self,claim:&Claim,prepared:&PreparedLaunchCreation,now:i64)->Result<()> {
-        self.validate_claim(claim,now)?;
+    pub(crate) fn continue_worktree_launch_creation_with_budget(&mut self,claim:&Claim,prepared:&PreparedLaunchCreation,now:i64,budget:Option<&read_budget::ReadBudget>)->Result<()> {
+        self.validate_claim_with_budget(claim,now,budget)?;
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;check_schema(&tx)?;
         if claim.owner!="canonical-worktree-adapter" {return Err(StoreError::Conflict);}
         let ready:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE kind='runtime.worktrees_ready' AND entity=?1)",[claim.operation.as_str()],|r|r.get(0))?;
         if !ready {return Err(invalid("worktree launch has no complete receipt"));}
-        record_creation(&tx,claim,prepared,now)?;tx.commit()?;Ok(())
+        record_creation(&tx,claim,prepared,now,budget)?;
+        if let Some(budget)=budget {budget.check()?;}
+        tx.commit()?;Ok(())
     }
 
     pub fn record_launch_workspace(
@@ -132,6 +235,7 @@ impl SqliteStore {
             &prepared.target,
             false,
             now,
+            None,
         )
     }
 
@@ -148,6 +252,7 @@ impl SqliteStore {
             &prepared.workspace,
             true,
             now,
+            None,
         )
     }
 
@@ -166,7 +271,20 @@ impl SqliteStore {
             &prepared.target,
             false,
             now,
+            None,
         )
+    }
+
+    pub(crate) fn observe_launch_workspace_with_budget(&mut self, prepared: &PreparedLaunchWorkspace,
+        revision: u64, head: u64, now: i64, budget: Option<&read_budget::ReadBudget>) -> Result<u64> {
+        self.record_workspace_boundary(None, Some(head), revision, &prepared.target, false, now, budget)
+    }
+
+    pub(crate) fn record_launch_workspace_with_budget(&mut self, claim: &Claim, prepared: &PreparedLaunchWorkspace, now: i64, budget: Option<&read_budget::ReadBudget>) -> Result<u64> {
+        self.record_workspace_boundary(Some(claim), None, claim.revision, &prepared.target, false, now, budget)
+    }
+    pub(crate) fn record_launch_layout_with_budget(&mut self, claim: &Claim, prepared: &PreparedLaunchLayout, now: i64, budget: Option<&read_budget::ReadBudget>) -> Result<u64> {
+        self.record_workspace_boundary(Some(claim), None, claim.revision, &prepared.workspace, true, now, budget)
     }
 
     fn record_workspace_boundary(
@@ -177,10 +295,12 @@ impl SqliteStore {
         target: &LaunchTarget,
         layout: bool,
         now: i64,
+        budget: Option<&read_budget::ReadBudget>,
     ) -> Result<u64> {
+        if let Some(budget) = budget { budget.check()?; }
         super::delivery::now_check(now)?;
         if let Some(claim) = claim {
-            self.validate_claim(claim, now)?;
+            self.validate_claim_with_budget(claim, now, budget)?;
         }
         target.route.validate().map_err(StoreError::Invalid)?;
         if target.version != 1
@@ -204,7 +324,9 @@ impl SqliteStore {
         if expected_head.is_some_and(|h| head(&tx).ok() != Some(h)) {
             return Err(StoreError::Conflict);
         }
-        let delivery = super::delivery::delivery(&tx, &target.operation)?;
+        let record = super::reservations::read_input(&tx, &target.operation, budget)?;
+        if record.attempt != target.attempt { return Err(StoreError::Conflict); }
+        let delivery = super::delivery::delivery_with_budget(&tx, &target.operation, budget)?;
         if delivery.revision != expected_revision || delivery.attempts != 1 {
             return Err(StoreError::Conflict);
         }
@@ -217,37 +339,27 @@ impl SqliteStore {
             {
                 return Err(StoreError::Conflict);
             }
-            super::approvals::validate_use(&tx, claim, now)?;
+            super::approvals::validate_use_with_budget(&tx, claim, now, budget)?;
         } else {
+            super::approvals::validate_historical_consumption(&tx, &record, budget)?;
             if layout
                 || !matches!(
                     delivery.state,
                     DeliveryState::Claimed | DeliveryState::Ambiguous
                 )
-                || !super::approvals::read_all(&tx)?.iter().any(|g| {
-                    g.consumed
-                        .as_ref()
-                        .is_some_and(|u| u.operation == target.operation)
-                })
+
             {
                 return Err(StoreError::Conflict);
             }
         }
-        let payload: String = tx.query_row(
+        let payload: String = read_budget::one(&tx,
             "SELECT payload FROM events WHERE kind='runtime.launch_creation' AND entity=?1",
-            [target.operation.as_str()],
+            [target.operation.as_str()], budget, &[(0,1)],
             |r| r.get(0),
         )?;
         let intent: LaunchCreationIntent =
             serde_json::from_str(&payload).map_err(|_| invalid("invalid creation intent"))?;
-        let record = super::reservations::read_inputs(&tx)?
-            .into_iter()
-            .find(|r| r.operation == target.operation && r.attempt == target.attempt)
-            .ok_or(StoreError::Conflict)?;
-        let binding = super::runtime::read_all(&tx)?
-            .into_iter()
-            .find(|b| b.id == record.inputs.binding)
-            .ok_or(StoreError::Conflict)?;
+        let binding = super::runtime::read_binding(&tx, &record.inputs.binding, budget)?.ok_or(StoreError::Conflict)?;
         if intent.version != 1
             || intent.operation != target.operation
             || intent.attempt != target.attempt
@@ -265,11 +377,8 @@ impl SqliteStore {
         {
             return Err(StoreError::Conflict);
         }
-        if !read_attempts(&tx)?.iter().any(|a| {
-            a.id == target.attempt && a.state == AttemptState::Reserved && a.retains_capacity()
-        }) {
-            return Err(StoreError::Conflict);
-        }
+        let attempt = read_attempt_with_budget(&tx, &target.attempt, budget)?;
+        if attempt.state != AttemptState::Reserved || !attempt.retains_capacity() { return Err(StoreError::Conflict); }
         if claim.is_none() && intent.workspace_token.is_none() {
             return Err(invalid("workspace creation lacks recovery marker"));
         }
@@ -285,9 +394,9 @@ impl SqliteStore {
             ));
         }
         if layout {
-            let payload: String = tx.query_row(
+            let payload: String = read_budget::one(&tx,
                 "SELECT payload FROM events WHERE kind='runtime.launch_workspace' AND entity=?1",
-                [target.operation.as_str()],
+                [target.operation.as_str()], budget, &[(0,1)],
                 |r| r.get(0),
             )?;
             if serde_json::from_str::<LaunchTarget>(&payload)
@@ -305,6 +414,7 @@ impl SqliteStore {
             target,
         )?;
         let result = head(&tx)?;
+        if let Some(budget) = budget { budget.check()?; }
         tx.commit()?;
         Ok(result)
     }
@@ -317,7 +427,7 @@ impl SqliteStore {
         prepared: &PreparedLaunchTarget,
         now: i64,
     ) -> Result<u64> {
-        self.apply_launch_target(Some(claim), None, claim.revision, prepared, now)
+        self.apply_launch_target(Some(claim), None, claim.revision, prepared, now, None)
     }
 
     /// Observation cannot renew a lease or authorize creation/start. A durable
@@ -329,7 +439,14 @@ impl SqliteStore {
         expected_head: u64,
         now: i64,
     ) -> Result<u64> {
-        self.apply_launch_target(None, Some(expected_head), expected_revision, prepared, now)
+        self.observe_launch_target_with_budget(prepared, expected_revision, expected_head, now, None)
+    }
+
+    pub(crate) fn observe_launch_target_with_budget(
+        &mut self, prepared: &PreparedLaunchTarget, expected_revision: u64,
+        expected_head: u64, now: i64, budget: Option<&read_budget::ReadBudget>,
+    ) -> Result<u64> {
+        self.apply_launch_target(None, Some(expected_head), expected_revision, prepared, now, budget)
     }
 
     fn apply_launch_target(
@@ -339,7 +456,9 @@ impl SqliteStore {
         expected_revision: u64,
         prepared: &PreparedLaunchTarget,
         now: i64,
+        budget: Option<&read_budget::ReadBudget>,
     ) -> Result<u64> {
+        if let Some(budget) = budget { budget.check()?; }
         super::delivery::now_check(now)?;
         let target = &prepared.target;
         target.route.validate().map_err(StoreError::Invalid)?;
@@ -371,10 +490,12 @@ impl SqliteStore {
         if expected_head.is_some_and(|h| head(&tx).ok() != Some(h)) {
             return Err(StoreError::Conflict);
         }
-        let old = super::delivery::delivery(&tx, &target.operation)?;
+        let old = super::delivery::delivery_with_budget(&tx, &target.operation, budget)?;
         if old.revision != expected_revision {
             return Err(StoreError::Conflict);
         }
+        let record = super::reservations::read_input(&tx, &target.operation, budget)?;
+        if record.attempt != target.attempt { return Err(StoreError::Conflict); }
         if let Some(claim) = claim {
             if old.state != DeliveryState::Claimed
                 || old.epoch != claim.epoch
@@ -386,19 +507,13 @@ impl SqliteStore {
             }
             super::approvals::validate_use(&tx, claim, now)?;
         } else {
-            if !super::approvals::read_all(&tx)?.iter().any(|g| {
-                g.consumed
-                    .as_ref()
-                    .is_some_and(|u| u.operation == target.operation)
-            }) {
-                return Err(StoreError::Conflict);
-            }
+            super::approvals::validate_historical_consumption(&tx, &record, budget)?;
             if old.attempts != 1 || old.state == DeliveryState::Confirmed || target.version != 2 {
                 return Err(StoreError::Conflict);
             }
-            let payload: String = tx.query_row(
+            let payload: String = read_budget::one(&tx,
                 "SELECT payload FROM events WHERE kind='runtime.launch_creation' AND entity=?1",
-                [target.operation.as_str()],
+                [target.operation.as_str()], budget, &[(0,1)],
                 |r| r.get(0),
             )?;
             let intent: LaunchCreationIntent =
@@ -417,23 +532,14 @@ impl SqliteStore {
                 return Err(StoreError::Conflict);
             }
         }
-        let record = super::reservations::read_inputs(&tx)?
-            .into_iter()
-            .find(|r| r.operation == target.operation && r.attempt == target.attempt)
+        let binding = super::runtime::read_binding(&tx, &record.inputs.binding, budget)?
             .ok_or(StoreError::Conflict)?;
-        let binding = super::runtime::read_all(&tx)?
-            .into_iter()
-            .find(|b| b.id == record.inputs.binding)
-            .ok_or(StoreError::Conflict)?;
+        let attempt = read_attempt_with_budget(&tx, &target.attempt, budget)?;
         if binding.revision != record.inputs.binding_revision
             || super::ownership::identity_digest(&binding)? != record.inputs.binding_digest
-            || !read_attempts(&tx)?.iter().any(|a| {
-                a.id == target.attempt && a.state == AttemptState::Reserved && a.retains_capacity()
-            })
-        {
-            return Err(StoreError::Conflict);
-        }
-        let (execution_route,_) = super::worktrees::execution_route(&tx,&record,&binding)?;
+            || attempt.state != AttemptState::Reserved || !attempt.retains_capacity()
+        { return Err(StoreError::Conflict); }
+        let (execution_route,_) = super::worktrees::execution_route_with_budget(&tx,&record,&binding,budget)?;
         if !binding.identity.worktree_path.is_empty()
             || !binding.identity.machine.is_empty()
             || target.route.socket != binding.identity.socket
@@ -448,9 +554,9 @@ impl SqliteStore {
             ));
         }
         let direct_root = if binding.identity.workspace_id.is_empty() && target.version == 2 {
-            let payload: String = tx.query_row(
+            let payload: String = read_budget::one(&tx,
                 "SELECT payload FROM events WHERE kind='runtime.launch_creation' AND entity=?1",
-                [target.operation.as_str()],
+                [target.operation.as_str()], budget, &[(0,1)],
                 |r| r.get(0),
             )?;
             let creation: LaunchCreationIntent = serde_json::from_str(&payload)
@@ -483,9 +589,9 @@ impl SqliteStore {
                 }
                 true
             } else if creation.version == 1 {
-                let payload: String = tx.query_row(
+                let payload: String = read_budget::one(&tx,
                 "SELECT payload FROM events WHERE kind='runtime.launch_workspace' AND entity=?1",
-                [target.operation.as_str()],
+                [target.operation.as_str()], budget, &[(0,1)],
                 |r| r.get(0),
             )?;
                 let workspace: LaunchTarget = serde_json::from_str(&payload)
@@ -508,26 +614,18 @@ impl SqliteStore {
         } else {
             false
         };
-        if super::runtime::read_all(&tx)?.iter().any(|other| {
-            other.id != binding.id
-                && other.identity.machine.is_empty()
-                && other.identity.socket == target.route.socket
-                && other.identity.pane_id == target.route.pane_id
-        }) {
-            return Err(invalid("launch target belongs to another runtime binding"));
-        }
-        let staged_conflict:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM events e JOIN attempts a ON a.id=json_extract(e.payload,'$.attempt') WHERE e.kind='runtime.launch_target' AND e.entity<>?1 AND a.termination_observed=0 AND json_extract(e.payload,'$.route.socket')=?2 AND json_extract(e.payload,'$.route.pane_id')=?3)",params![target.operation.as_str(),target.route.socket,target.route.pane_id],|r|r.get(0))?;
+        let binding_conflict: bool = read_budget::one(&tx,
+            "SELECT EXISTS(SELECT 1 FROM runtime_bindings WHERE id<>?1 AND json_extract(payload,'$.identity.machine')='' AND json_extract(payload,'$.identity.socket')=?2 AND json_extract(payload,'$.identity.pane_id')=?3)",
+            params![binding.id, target.route.socket, target.route.pane_id], budget, &[], |r| r.get(0))?;
+        if binding_conflict { return Err(invalid("launch target belongs to another runtime binding")); }
+        let staged_conflict:bool=read_budget::one(&tx,"SELECT EXISTS(SELECT 1 FROM events e JOIN attempts a ON a.id=json_extract(e.payload,'$.attempt') WHERE e.kind='runtime.launch_target' AND e.entity<>?1 AND a.termination_observed=0 AND json_extract(e.payload,'$.route.socket')=?2 AND json_extract(e.payload,'$.route.pane_id')=?3)",params![target.operation.as_str(),target.route.socket,target.route.pane_id],budget,&[],|r|r.get(0))?;
         if staged_conflict {
             return Err(invalid("launch target belongs to another retained launch"));
         }
         let payload = encode(target)?;
-        let prior: Option<String> = tx
-            .query_row(
-                "SELECT payload FROM events WHERE kind='runtime.launch_target' AND entity=?1",
-                [target.operation.as_str()],
-                |r| r.get(0),
-            )
-            .optional()?;
+        let prior: Option<String> = read_budget::optional(&tx,
+            "SELECT payload FROM events WHERE kind='runtime.launch_target' AND entity=?1",
+            [target.operation.as_str()], budget, &[], |r| r.get(0))?;
         if let Some(prior) = prior {
             if prior != payload {
                 return Err(invalid("launch target is immutable after selection"));
@@ -551,6 +649,7 @@ impl SqliteStore {
             target,
         )?;
         let result = head(&tx)?;
+        if let Some(budget) = budget { budget.check()?; }
         tx.commit()?;
         Ok(result)
     }
@@ -563,7 +662,11 @@ impl SqliteStore {
         prepared: &PreparedLaunchRelease,
         now: i64,
     ) -> Result<u64> {
-        self.record_launch_boundary(claim, &prepared.intent, now, false)
+        self.record_launch_boundary(claim, &prepared.intent, now, false, None)
+    }
+
+    pub(crate) fn record_launch_name_with_budget(&mut self, claim: &Claim, prepared: &PreparedLaunchName, now: i64, budget: Option<&read_budget::ReadBudget>) -> Result<u64> {
+        self.record_launch_boundary(claim, &prepared.intent, now, true, budget)
     }
 
     pub fn record_launch_name(
@@ -572,7 +675,11 @@ impl SqliteStore {
         prepared: &PreparedLaunchName,
         now: i64,
     ) -> Result<u64> {
-        self.record_launch_boundary(claim, &prepared.intent, now, true)
+        self.record_launch_boundary(claim, &prepared.intent, now, true, None)
+    }
+
+    pub(crate) fn record_launch_release_with_budget(&mut self, claim: &Claim, prepared: &PreparedLaunchRelease, now: i64, budget: Option<&read_budget::ReadBudget>) -> Result<u64> {
+        self.record_launch_boundary(claim, &prepared.intent, now, false, budget)
     }
 
     fn record_launch_boundary(
@@ -581,8 +688,9 @@ impl SqliteStore {
         intent: &LaunchReleaseIntent,
         now: i64,
         naming: bool,
+        budget: Option<&read_budget::ReadBudget>,
     ) -> Result<u64> {
-        self.validate_claim(claim, now)?;
+        self.validate_claim_with_budget(claim, now, budget)?;
         if intent.version != 1
             || intent.target.version != 2
             || intent.target.operation != claim.operation
@@ -603,7 +711,7 @@ impl SqliteStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         check_schema(&tx)?;
-        let delivery = super::delivery::delivery(&tx, &claim.operation)?;
+        let delivery = super::delivery::delivery_with_budget(&tx, &claim.operation, budget)?;
         if delivery.revision != claim.revision
             || delivery.state != DeliveryState::Claimed
             || delivery.epoch != claim.epoch
@@ -613,32 +721,20 @@ impl SqliteStore {
         {
             return Err(StoreError::Conflict);
         }
-        super::approvals::validate_use(&tx, claim, now)?;
-        let record = super::reservations::read_inputs(&tx)?
-            .into_iter()
-            .find(|r| r.operation == claim.operation && r.attempt == intent.target.attempt)
-            .ok_or(StoreError::Conflict)?;
-        let binding = super::runtime::read_all(&tx)?
-            .into_iter()
-            .find(|b| b.id == record.inputs.binding)
-            .ok_or(StoreError::Conflict)?;
+        super::approvals::validate_use_with_budget(&tx, claim, now, budget)?;
+        let record = super::reservations::read_input(&tx, &claim.operation, budget)?;
+        if record.attempt != intent.target.attempt { return Err(StoreError::Conflict); }
+        let binding = super::runtime::read_binding(&tx, &record.inputs.binding, budget)?.ok_or(StoreError::Conflict)?;
+        let attempt = read_attempt_with_budget(&tx, &record.attempt, budget)?;
+        let task = read_task_with_budget(&tx, record.inputs.task.as_str(), budget)?;
         if binding.revision != record.inputs.binding_revision
             || super::ownership::identity_digest(&binding)? != record.inputs.binding_digest
-            || super::ownership::read_all(&tx)?
-                .iter()
-                .any(|o| o.binding == binding.id)
-            || !read_attempts(&tx)?.iter().any(|a| {
-                a.id == record.attempt && a.state == AttemptState::Reserved && a.retains_capacity()
-            })
-            || !read_tasks(&tx)?.iter().any(|t| {
-                t.id == record.inputs.task && t.active_attempt.as_ref() == Some(&record.attempt)
-            })
-        {
-            return Err(StoreError::Conflict);
-        }
-        let payload: String = tx.query_row(
+            || super::ownership::read_binding(&tx, &binding.id, budget)?.is_some()
+            || attempt.state != AttemptState::Reserved || !attempt.retains_capacity()
+            || task.active_attempt.as_ref() != Some(&record.attempt) { return Err(StoreError::Conflict); }
+        let payload: String = read_budget::one(&tx,
             "SELECT payload FROM events WHERE kind='runtime.launch_target' AND entity=?1",
-            [claim.operation.as_str()],
+            [claim.operation.as_str()], budget, &[(0,1)],
             |r| r.get(0),
         )?;
         if serde_json::from_str::<LaunchTarget>(&payload)
@@ -647,14 +743,14 @@ impl SqliteStore {
         {
             return Err(StoreError::Conflict);
         }
-        let creation: String = tx.query_row(
+        let creation: String = read_budget::one(&tx,
             "SELECT payload FROM events WHERE kind='runtime.launch_creation' AND entity=?1",
-            [claim.operation.as_str()],
+            [claim.operation.as_str()], budget, &[(0,1)],
             |r| r.get(0),
         )?;
         let creation: LaunchCreationIntent = serde_json::from_str(&creation)
             .map_err(|_| invalid("invalid retained creation intent"))?;
-        let (execution_route,_) = super::worktrees::execution_route(&tx,&record,&binding)?;
+        let (execution_route,_) = super::worktrees::execution_route_with_budget(&tx,&record,&binding,budget)?;
         if !matches!(creation.version, 1 | 2)
             || (creation.version == 2
                 && (!creation.route.workspace_id.is_empty() || creation.workspace_token.is_some()))
@@ -671,9 +767,9 @@ impl SqliteStore {
             "runtime.launch_release"
         };
         if naming {
-            let payload: String = tx.query_row(
+            let payload: String = read_budget::one(&tx,
                 "SELECT payload FROM events WHERE kind='runtime.launch_release' AND entity=?1",
-                [claim.operation.as_str()],
+                [claim.operation.as_str()], budget, &[(0,1)],
                 |r| r.get(0),
             )?;
             let release: LaunchReleaseIntent = serde_json::from_str(&payload)
@@ -695,6 +791,7 @@ impl SqliteStore {
         }
         event(&tx, kind, claim.operation.as_str(), claim.revision, intent)?;
         let result = head(&tx)?;
+        if let Some(budget) = budget { budget.check()?; }
         tx.commit()?;
         Ok(result)
     }
@@ -707,7 +804,7 @@ impl SqliteStore {
         prepared: &PreparedLaunchStarted,
         now: i64,
     ) -> Result<Delivery> {
-        self.apply_launch_started(Some(claim), None, claim.revision, prepared, now)
+        self.apply_launch_started(Some(claim), None, claim.revision, prepared, now, None)
     }
 
     /// Reconcile a freshly observed exact worker after a lost launch response.
@@ -719,7 +816,11 @@ impl SqliteStore {
         expected_head: u64,
         now: i64,
     ) -> Result<Delivery> {
-        self.apply_launch_started(None, Some(expected_head), expected_revision, prepared, now)
+        self.observe_launch_started_with_budget(prepared, expected_revision, expected_head, now, None)
+    }
+
+    pub(crate) fn observe_launch_started_with_budget(&mut self, prepared: &PreparedLaunchStarted, revision: u64, head: u64, now: i64, budget: Option<&read_budget::ReadBudget>) -> Result<Delivery> {
+        self.apply_launch_started(None, Some(head), revision, prepared, now, budget)
     }
 
     fn apply_launch_started(
@@ -729,7 +830,9 @@ impl SqliteStore {
         expected_revision: u64,
         prepared: &PreparedLaunchStarted,
         now: i64,
+        budget: Option<&read_budget::ReadBudget>,
     ) -> Result<Delivery> {
+        if let Some(budget) = budget { budget.check()?; }
         super::delivery::now_check(now)?;
         let receipt = &prepared.receipt;
         receipt.route.validate().map_err(StoreError::Invalid)?;
@@ -766,7 +869,7 @@ impl SqliteStore {
                 return Err(StoreError::Conflict);
             }
         }
-        let old = super::delivery::delivery(&tx, &receipt.operation)?;
+        let old = super::delivery::delivery_with_budget(&tx, &receipt.operation, budget)?;
         // Exact receipt replay is read-only and cannot resurrect a later state.
         let payload = encode(receipt)?;
         if old.state == DeliveryState::Confirmed
@@ -781,6 +884,8 @@ impl SqliteStore {
         if old.revision != expected_revision {
             return Err(StoreError::Conflict);
         }
+        let record = super::reservations::read_input(&tx, &receipt.operation, budget)?;
+        if record.attempt != receipt.attempt { return Err(StoreError::Conflict); }
         if let Some(claim) = claim {
             if old.state != DeliveryState::Claimed
                 || old.epoch != claim.epoch
@@ -790,7 +895,7 @@ impl SqliteStore {
             {
                 return Err(StoreError::Conflict);
             }
-            super::approvals::validate_use(&tx, claim, now)?;
+            super::approvals::validate_use_with_budget(&tx, claim, now, budget)?;
         } else {
             let released: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE kind='runtime.launch_release' AND entity=?1)",
                 [receipt.operation.as_str()], |r|r.get(0))?;
@@ -803,28 +908,16 @@ impl SqliteStore {
             // Read/validate the durable use, without pretending observation is a
             // new approved action. Expired or revoked authority must not erase a
             // worker that already exists.
-            if !super::approvals::read_all(&tx)?.iter().any(|a| {
-                a.consumed
-                    .as_ref()
-                    .is_some_and(|u| u.operation == receipt.operation)
-            }) {
-                return Err(invalid("observed launch has no original approval use"));
-            }
+            super::approvals::validate_historical_consumption(&tx, &record, budget)?;
         }
-        let record = super::reservations::read_inputs(&tx)?
-            .into_iter()
-            .find(|record| {
-                record.operation == receipt.operation && record.attempt == receipt.attempt
-            })
-            .ok_or(StoreError::Conflict)?;
         let profile = record
             .inputs
             .effective_profile
             .as_ref()
             .ok_or(StoreError::Conflict)?;
-        let target: String = tx.query_row(
+        let target: String = read_budget::one(&tx,
             "SELECT payload FROM events WHERE kind='runtime.launch_target' AND entity=?1",
-            [receipt.operation.as_str()],
+            [receipt.operation.as_str()], budget, &[(0,1)],
             |r| r.get(0),
         )?;
         let target: LaunchTarget = serde_json::from_str(&target)
@@ -846,13 +939,9 @@ impl SqliteStore {
             ));
         }
         if target.version == 2 {
-            let released: Option<String> = tx
-                .query_row(
-                    "SELECT payload FROM events WHERE kind='runtime.launch_release' AND entity=?1",
-                    [receipt.operation.as_str()],
-                    |r| r.get(0),
-                )
-                .optional()?;
+            let released: Option<String> = read_budget::optional(&tx,
+                "SELECT payload FROM events WHERE kind='runtime.launch_release' AND entity=?1",
+                [receipt.operation.as_str()], budget, &[(0,1)], |r| r.get(0))?;
             let release: LaunchReleaseIntent = serde_json::from_str(
                 &released.ok_or_else(|| invalid("gated launch has no durable release intent"))?,
             )
@@ -865,32 +954,21 @@ impl SqliteStore {
                 return Err(invalid("start observation does not match the gate release"));
             }
         }
-        let mut binding = super::runtime::read_all(&tx)?
-            .into_iter()
-            .find(|binding| binding.id == record.inputs.binding)
-            .ok_or(StoreError::Conflict)?;
-        let task = read_tasks(&tx)?
-            .into_iter()
-            .find(|t| t.id == record.inputs.task)
-            .ok_or(StoreError::Conflict)?;
-        let attempt = read_attempts(&tx)?
-            .into_iter()
-            .find(|a| a.id == record.attempt)
-            .ok_or(StoreError::Conflict)?;
+        let mut binding = super::runtime::read_binding(&tx, &record.inputs.binding, budget)?.ok_or(StoreError::Conflict)?;
+        let task = read_task_with_budget(&tx, record.inputs.task.as_str(), budget)?;
+        let mut attempt = read_attempt_with_budget(&tx, &record.attempt, budget)?;
         if task.active_attempt.as_ref() != Some(&attempt.id)
             || !attempt.retains_capacity()
             || attempt.state != AttemptState::Reserved
             || binding.revision != record.inputs.binding_revision
             || super::ownership::identity_digest(&binding)? != record.inputs.binding_digest
-            || super::ownership::read_all(&tx)?
-                .iter()
-                .any(|o| o.binding == binding.id)
+            || super::ownership::read_binding(&tx, &binding.id, budget)?.is_some()
         {
             return Err(StoreError::Conflict);
         }
         // The first native adapter is local and does not create repository
         // worktrees. Such inputs must use a separate resource-creation service.
-        let (execution_route,worktree) = super::worktrees::execution_route(&tx,&record,&binding)?;
+        let (execution_route,worktree) = super::worktrees::execution_route_with_budget(&tx,&record,&binding,budget)?;
         if !binding.identity.worktree_path.is_empty()
             || !binding.identity.machine.is_empty()
             || receipt.agent.kind != profile.kind
@@ -906,14 +984,10 @@ impl SqliteStore {
                 "launch acknowledgment differs from prepared local execution",
             ));
         }
-        if super::runtime::read_all(&tx)?.iter().any(|other| {
-            other.id != binding.id
-                && other.identity.socket == receipt.route.socket
-                && other.identity.machine.is_empty()
-                && other.identity.pane_id == receipt.route.pane_id
-        }) {
-            return Err(invalid("launch pane belongs to another runtime binding"));
-        }
+        let conflict: bool = read_budget::one(&tx,
+            "SELECT EXISTS(SELECT 1 FROM runtime_bindings WHERE id<>?1 AND json_extract(payload,'$.identity.machine')='' AND json_extract(payload,'$.identity.socket')=?2 AND json_extract(payload,'$.identity.pane_id')=?3)",
+            params![binding.id, receipt.route.socket, receipt.route.pane_id], budget, &[], |r| r.get(0))?;
+        if conflict { return Err(invalid("launch pane belongs to another runtime binding")); }
         binding.revision = binding
             .revision
             .checked_add(1)
@@ -940,7 +1014,7 @@ impl SqliteStore {
                 format!("{:x}", Sha256::digest(binding_payload.as_bytes()))
             ],
         )?;
-        let previous:u64=tx.query_row("SELECT COALESCE(MAX(revision),0) FROM events WHERE kind IN ('runtime.adopted','runtime.launched') AND entity=?1",[&binding.id],|r|r.get(0))?;
+        let previous:u64=read_budget::one(&tx,"SELECT COALESCE(MAX(revision),0) FROM events WHERE kind IN ('runtime.adopted','runtime.launched') AND entity=?1",[&binding.id],budget,&[],|r|r.get(0))?;
         let owned = RuntimeOwnership {
             binding: binding.id.clone(),
             revision: previous.checked_add(1).ok_or(StoreError::Conflict)?,
@@ -967,10 +1041,6 @@ impl SqliteStore {
             ],
         )?;
         super::active_work::invalidate(&tx)?;
-        let mut attempt = read_attempts(&tx)?
-            .into_iter()
-            .find(|a| a.id == receipt.attempt)
-            .ok_or(StoreError::Conflict)?;
         attempt.revision = attempt
             .revision
             .checked_add(1)
@@ -1008,9 +1078,10 @@ impl SqliteStore {
             now,
             claim.map(|c| c.owner.as_str()).unwrap_or("launch-recovery"),
         )?;
-        super::consumer_bindings::reconcile_active(&tx)?;
+        super::consumer_bindings::reconcile_task(&tx,record.inputs.task.as_str(),budget)?;
         #[cfg(test)]
         super::reservations::tests::crash_boundary("before_start_receipt_commit");
+        if let Some(budget) = budget { budget.check()?; }
         tx.commit()?;
         Ok(result)
     }

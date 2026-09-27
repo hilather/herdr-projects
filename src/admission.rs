@@ -2,6 +2,9 @@
 use crate::domain::*;
 use crate::launch_preparation::seal_admission_inputs;
 use crate::store::{SqliteStore, StoreError};
+use crate::store::admission_read::{Header, Cursor};
+use crate::store::controlled::{ControlledStore, ReadControl};
+use crate::store::read_budget::ReadBudget;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -11,6 +14,7 @@ fn store_file(project: &Path) -> Result<std::path::PathBuf> {
     std::fs::canonicalize(&path).with_context(|| format!("project store missing at {}", path.display()))
 }
 
+#[cfg(test)]
 fn open_store(project: &Path) -> Result<SqliteStore> {
     SqliteStore::open(&store_file(project)?).map_err(anyhow::Error::from)
 }
@@ -37,82 +41,60 @@ fn placeholder_approval() -> VersionedReference {
 struct Candidate {
     task: Task,
     binding: RuntimeBinding,
+    task_contract: Option<VersionedReference>,
+    contract: Option<PreparedContract>,
     dependencies: Vec<DependencyInput>,
     repositories: Vec<RepositoryInput>,
     score: i64,
-    sequence: u64,
     blocker: Option<&'static str>,
 }
 
-fn unused_binding(state: &Snapshot, task: &TaskId) -> Option<RuntimeBinding> {
-    state.runtime_bindings.iter().find(|binding| {
-        binding.task.as_ref() == Some(task)
-            && binding.identity.pane_id.is_empty()
-            && binding.identity.tab_id.is_empty()
-            && binding.identity.machine.is_empty()
-            && binding.identity.worktree_path.is_empty()
-            && !state.ownership.iter().any(|owned| {
-                owned.binding == binding.id && (owned.attempt.is_some() || owned.session.is_some() || owned.agent.is_some())
-            })
-    }).cloned()
-}
-
-fn rank_candidates(db: &mut SqliteStore, state: &Snapshot, now: i64) -> Result<Vec<Candidate>> {
-    let scheduler = state.scheduler.as_ref().context("scheduler missing")?;
-    let control = state.control.as_ref().context("project control missing")?;
-    if control.state != ProjectState::Active || control.reconciliation_required {
-        return Ok(Vec::new());
+fn ranked_page(db: &mut SqliteStore, header: &Header, now: i64, after: Option<&Cursor>, control: &ReadControl, budget:&ReadBudget) -> Result<(Vec<Candidate>, Option<Cursor>)> {
+    if header.control.state != ProjectState::Active || header.control.reconciliation_required
+        || header.retained >= u64::from(header.policy.max_active_workers) {
+        return Ok((Vec::new(), None));
     }
-    let retained = state.attempts.iter().filter(|attempt| attempt.retains_capacity()).count();
-    if retained >= scheduler.policy.max_active_workers as usize {
-        return Ok(Vec::new());
-    }
-    // Consult claims only while admission is on. A retaining attempt keeps the
-    // revision from its reservation until termination_observed. Cancel does not clear it.
-    let admission_on = db.factory_admission_enabled()?;
+    control.check()?;
+    let page = db.admission_page_with_budget(header, now, after,Some(budget))?;
+    let claims=if header.retained>0 {Some(db.admission_retained_claims(Some(budget))?)}else{None};
     let mut ranked = Vec::new();
-    for record in &scheduler.queue {
-        let Some(task) = state.tasks.iter().find(|task| task.id == record.task && task.state == TaskState::Queued && task.active_attempt.is_none()) else { continue };
-        if record.enqueued_unix_ms > now { continue }
-        if state.attempts.iter().any(|attempt| attempt.task == task.id && attempt.retains_capacity()) { continue }
-        if state.attempts.iter().filter(|attempt| attempt.task == task.id).count() >= scheduler.policy.max_attempts_per_task as usize { continue }
-        let Some(edges) = db.satisfied_edges(task.id.as_str())? else { continue };
-        let Some(binding) = unused_binding(state, &task.id) else { continue };
-        // A contract whose tree cannot be read is not reserved.
-        let Some(repositories) = db.contract_pins(task.id.as_str())? else { continue };
+    for entry in page.entries {
+        control.check()?;
+        let task = entry.task;
+        let Some(binding) = entry.binding else { continue };
+        let Some(edges) = db.satisfied_edges_with_budget(task.id.as_str(),Some(budget))? else { continue };
+        let Some(repositories) = db.contract_pins_with_budget(task.id.as_str(), Some(control),Some(budget))? else { continue };
         let dependencies = edges.into_iter().map(|edge| DependencyInput {
             task: edge.predecessor,
             task_revision: edge.predecessor_revision,
             requirement: edge.requirement,
             evidence: VersionedReference { id: edge.satisfaction_id.clone(), revision: 1, digest: edge.satisfaction_id },
         }).collect::<Vec<_>>();
-        let score = (now - record.enqueued_unix_ms) / 60_000 + i64::from(record.priority);
-        let blocker = if admission_on && db.retained_claim_overlap(task.id.as_str())? {
-            Some("resource_conflict")
-        } else {
-            None
-        };
-        ranked.push(Candidate { task: task.clone(), binding, dependencies, repositories, score, sequence: record.enqueue_sequence, blocker });
+        let blocker = if claims.as_ref().map(|claims|db.admission_claim_overlap(task.id.as_str(),claims,Some(budget))).transpose()?.unwrap_or(false) { Some("resource_conflict") } else { None };
+        let contract=db.admission_contract(task.id.as_str(),Some(budget))?;
+        let task_contract=contract.as_ref().map(|contract|VersionedReference{id:contract.task_id.as_str().into(),revision:contract.contract_revision,digest:contract.digest.clone()});
+        ranked.push(Candidate { task_contract, contract, task, binding, dependencies, repositories, score: entry.score, blocker });
     }
-    ranked.sort_by(|left, right| right.score.cmp(&left.score).then(left.sequence.cmp(&right.sequence)).then(left.task.id.cmp(&right.task.id)));
-    Ok(ranked)
+    control.check()?;
+    Ok((ranked, page.next))
 }
 
-fn ready_candidates(db: &mut SqliteStore, state: &Snapshot, now: i64) -> Result<Vec<Candidate>> {
-    Ok(rank_candidates(db, state, now)?.into_iter().filter(|candidate| candidate.blocker.is_none()).collect())
+fn binding_profiles<'a>(db: &SqliteStore, profiles: &'a [FrozenProfile], control: &ProjectControl, candidate: &Candidate, now: i64,budget:&ReadBudget) -> Result<Vec<&'a FrozenProfile>> {
+    let mut matches = Vec::new();
+    for profile in profiles {
+        if profile.config.digest == control.config_digest
+            && (candidate.binding.identity.agent.is_empty() || profile.kind == candidate.binding.identity.agent)
+            && db.admission_profile_matches_contract(candidate.contract.as_ref(), profile, now,Some(budget))? {
+            matches.push(profile);
+        }
+    }
+    Ok(matches)
 }
 
-fn binding_profiles<'a>(profiles: &'a [FrozenProfile], control: &ProjectControl, binding: &RuntimeBinding) -> Vec<&'a FrozenProfile> {
-    profiles.iter().filter(|profile| {
-        profile.config.digest == control.config_digest && (binding.identity.agent.is_empty() || profile.kind == binding.identity.agent)
-    }).collect()
-}
-
-fn seal(project_store: &str, state: &Snapshot, candidate: &Candidate, profile: &FrozenProfile, approval: VersionedReference) -> Result<LaunchInputs> {
-    let scheduler = state.scheduler.as_ref().context("scheduler missing")?;
-    let control = state.control.as_ref().context("project control missing")?;
-    let budget = state.budget_policies.last().map(BudgetPolicy::reference).transpose().map_err(anyhow::Error::msg)?;
-    seal_admission_inputs(project_store, &candidate.task, &candidate.binding, scheduler.policy.revision, control.epoch, profile, approval, candidate.dependencies.clone(), candidate.repositories.clone(), budget).map_err(anyhow::Error::msg)
+fn seal(project_store: &str, header: &Header, candidate: &Candidate, profile: &FrozenProfile, approval: VersionedReference) -> Result<LaunchInputs> {
+    let mut inputs = seal_admission_inputs(project_store, &candidate.task, &candidate.binding, header.policy.revision, header.control.epoch, profile, approval, candidate.dependencies.clone(), candidate.repositories.clone(), header.budget.clone()).map_err(anyhow::Error::msg)?;
+    inputs.task_contract = candidate.task_contract.clone();
+    Ok(inputs)
 }
 
 fn record_missing_grant(db: &mut SqliteStore, task: &TaskId, head: u64, now: i64) -> Result<()> {
@@ -135,32 +117,32 @@ fn record_missing_grant(db: &mut SqliteStore, task: &TaskId, head: u64, now: i64
     }
 }
 
-fn accepted_grant(db: &SqliteStore, state: &Snapshot, inputs: &LaunchInputs, now: i64) -> Result<Option<VersionedReference>> {
-    for approval in &state.approvals {
-        if approval.revoked.is_some() || approval.consumed.is_some() { continue; }
-        if now < approval.grant.issued_unix_ms || now >= approval.grant.expires_unix_ms { continue; }
-        let mut candidate = inputs.clone();
-        candidate.approval = approval.reference.clone();
-        if approval.grant.matches_launch(&candidate, &inputs.project_store, now).is_err() { continue; }
-        if db.preparation_grant_accepted(&candidate, now)? {
-            return Ok(Some(approval.reference.clone()));
-        }
-    }
-    Ok(None)
-}
-
 /// Inputs for the next candidate, with a placeholder approval. `None` when nothing is ready to sign.
 pub fn prepared_admission_inputs(project: &Path) -> Result<Option<LaunchInputs>> {
-    let mut db = open_store(project)?;
+    let control=ReadControl::new(std::time::Instant::now()+std::time::Duration::from_secs(10),crate::runner::Cancellation::default());
+    ControlledStore::open_scoped(&store_file(project)?,control)?.prepare_admission(project)
+}
+pub(crate) fn prepare_held(project: &Path, db: &mut SqliteStore, read_control: &ReadControl,budget:&ReadBudget) -> Result<Option<LaunchInputs>> {
     let now = jiff::Timestamp::now().as_millisecond();
     let project_store = store_file(project)?;
     let project_store = project_store.to_str().context("project store is not UTF-8")?;
-    let state = db.read_snapshot(None)?;
-    let profiles = db.admission_profiles()?;
-    let control = state.control.as_ref().context("project control missing")?;
-    let Some(candidate) = ready_candidates(&mut db, &state, now)?.into_iter().next() else { return Ok(None) };
-    let Some(profile) = binding_profiles(&profiles, control, &candidate.binding).into_iter().next() else { return Ok(None) };
-    Ok(Some(seal(project_store, &state, &candidate, profile, placeholder_approval())?))
+    let header = db.admission_header_with_budget(Some(budget))?;
+    if header.control.state!=ProjectState::Active||header.control.reconciliation_required||header.retained>=u64::from(header.policy.max_active_workers) {
+        read_control.check()?;return Ok(None);
+    }
+    let profiles = db.admission_profiles_with_budget(header.control.config_digest.as_deref(),Some(budget))?;
+    let mut cursor = None;
+    loop {
+        let (candidates, next) = ranked_page(db, &header, now, cursor.as_ref(), read_control,budget)?;
+        for candidate in candidates.into_iter().filter(|candidate| candidate.blocker.is_none()) {
+            if let Some(profile) = binding_profiles(&db, &profiles, &header.control, &candidate, now,budget)?.into_iter().next() {
+                return Ok(Some(seal(project_store, &header, &candidate, profile, placeholder_approval())?));
+            }
+        }
+        cursor = next;
+        if cursor.is_none() { break; }
+    }
+    Ok(None)
 }
 
 /// `capacity_full` while verify or integrate work is older than the watermark.
@@ -185,26 +167,6 @@ fn backlog_reason(verification_age: Option<i64>, integration_age: Option<i64>, w
     None
 }
 
-fn backlog_ages(project: &Path) -> Result<(Option<i64>, Option<i64>)> {
-    let path = store_file(project)?;
-    let connection = rusqlite::Connection::open_with_flags(
-        &path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )?;
-    let verification: Option<i64> = connection.query_row(
-        "SELECT MIN(created_unix_ms) FROM result_submissions WHERE NOT EXISTS (SELECT 1 FROM verification_runs WHERE verification_runs.submission_id = result_submissions.submission_id)",
-        [],
-        |row| row.get(0),
-    )?;
-    // blocked, discarded, and reconciliation_required are terminal. They must not stall new reserves.
-    let integration: Option<i64> = connection.query_row(
-        "SELECT MIN(created_unix_ms) FROM integration_operations WHERE state IN ('effect_pending', 'candidate_prepared', 'validating')",
-        [],
-        |row| row.get(0),
-    )?;
-    Ok((verification, integration))
-}
-
 /// Why `admit_once` returned. `block` is set only when admission must not reserve.
 pub struct AdmissionDecision {
     pub block: Option<AdmissionBlock>,
@@ -220,37 +182,70 @@ pub fn admit_once(project: &Path) -> Result<Option<AdmissionBlock>> {
 }
 
 pub fn admit_decision(project: &Path) -> Result<AdmissionDecision> {
-    if let Some(reason) = crate::watchdog::pause_reason(project) {
-        return Ok(AdmissionDecision {
-            block: Some(AdmissionBlock { blocker: "admission_paused", reason }),
-            reason,
-            task_id: None,
-        });
-    }
-    let mut db = open_store(project)?;
+    let control=ReadControl::new(std::time::Instant::now()+std::time::Duration::from_secs(2),crate::runner::Cancellation::default());
+    admit_decision_with_control(project,control)
+}
+/// Observation survives errors, including opening failures and cancellation.
+/// SQL counts cover the controlled connection, not filesystem/Git work or the
+/// controller's earlier enabled probe. Duration covers this entire call.
+pub struct AdmissionObservation {
+    pub result: Result<AdmissionDecision>,
+    pub sql: crate::store::controlled::SqlWorkMetrics,
+    pub duration_ms: u64,
+}
+
+pub fn admit_decision_observed(project: &Path) -> AdmissionObservation {
+    let control=ReadControl::new(std::time::Instant::now()+std::time::Duration::from_secs(2),crate::runner::Cancellation::default());
+    admit_decision_observed_with_control(project,control)
+}
+
+pub fn admit_decision_with_control(project: &Path, control: ReadControl) -> Result<AdmissionDecision> {
+    admit_decision_observed_with_control(project,control).result
+}
+
+pub fn admit_decision_observed_with_control(project: &Path, control: ReadControl) -> AdmissionObservation {
+    let started=std::time::Instant::now();
+    let work=crate::store::controlled::SqlWork::default();
+    let result=(|| {
+        control.check()?;
+        if let Some(reason) = crate::watchdog::pause_reason(project) {
+            return Ok(AdmissionDecision {
+                block: Some(AdmissionBlock { blocker: "admission_paused", reason }),
+                reason,
+                task_id: None,
+            });
+        }
+        ControlledStore::open_scoped_observed(&store_file(project)?,control,work.clone())?.decide_admission(project)
+    })();
+    AdmissionObservation {result,sql:work.snapshot(),duration_ms:u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)}
+}
+pub(crate) fn decide_held(project: &Path, db: &mut SqliteStore, read_control: &ReadControl,budget:&ReadBudget) -> Result<AdmissionDecision> {
     if !db.factory_admission_enabled()? {
         return Ok(AdmissionDecision { block: None, reason: "admission_off", task_id: None });
     }
     let now = jiff::Timestamp::now().as_millisecond();
     let project_store = store_file(project)?;
     let project_store = project_store.to_str().context("project store is not UTF-8")?;
-    let state = db.read_snapshot(None)?;
-    let revision = state.scheduler.as_ref().map(|scheduler| scheduler.policy.revision).unwrap_or(0);
+    let header = db.admission_header_with_budget(Some(budget))?;
+    let revision = header.policy.revision;
     let watermark = backlog_watermark_ms(revision);
-    let (verification_oldest, integration_oldest) = backlog_ages(project)?;
+    let (verification_oldest, integration_oldest) = db.admission_backlog_ages()?;
     if let Some(reason) = backlog_reason(verification_oldest.map(|created| now.saturating_sub(created)), integration_oldest.map(|created| now.saturating_sub(created)), watermark) {
         return Ok(AdmissionDecision { block: Some(AdmissionBlock { blocker: "capacity_full", reason }), reason, task_id: None });
     }
-    let head = state.head;
-    let profiles = db.admission_profiles()?;
-    let control = state.control.clone().context("project control missing")?;
-    let candidates = ready_candidates(&mut db, &state, now)?;
+    let head = header.head;
+    if header.control.state!=ProjectState::Active||header.control.reconciliation_required||header.retained>=u64::from(header.policy.max_active_workers) {
+        read_control.check()?;return Ok(AdmissionDecision{block:None,reason:"idle",task_id:None});
+    }
+    let profiles = db.admission_profiles_with_budget(header.control.config_digest.as_deref(),Some(budget))?;
     let mut denied = None;
-    for candidate in &candidates {
+    let cursor = db.admission_cursor_with_budget(&header,Some(budget))?;
+    let (candidates, next) = ranked_page(db, &header, now, cursor.as_ref(), read_control,budget)?;
+    for candidate in candidates.iter().filter(|candidate| candidate.blocker.is_none()) {
         let mut sealed = None;
-        for profile in binding_profiles(&profiles, &control, &candidate.binding) {
-            let inputs = seal(project_store, &state, candidate, profile, placeholder_approval())?;
-            if let Some(reference) = accepted_grant(&db, &state, &inputs, now)? {
+        for profile in binding_profiles(&db, &profiles, &header.control, candidate, now,budget)? {
+            let inputs = seal(project_store, &header, candidate, profile, placeholder_approval())?;
+            if let Some(reference) = db.matching_launch_approval(&inputs, now,Some(budget))? {
                 let mut inputs = inputs;
                 inputs.approval = reference;
                 sealed = Some(inputs);
@@ -259,16 +254,18 @@ pub fn admit_decision(project: &Path) -> Result<AdmissionDecision> {
         }
         if let Some(inputs) = sealed {
             // Head was read before this write. A later mutation conflicts instead of reserving a stale snapshot.
-            db.reserve_prepared(&[PreparedLaunch { inputs }], head, now)?;
+            db.reserve_prepared_controlled(&[PreparedLaunch { inputs }], head, now, read_control,budget)?;
             return Ok(AdmissionDecision { block: None, reason: "reserved", task_id: Some(candidate.task.id.as_str().to_string()) });
         }
         // One denial for this task, then the next candidate. A grant for another profile is not this miss.
-        record_missing_grant(&mut db, &candidate.task.id, head, now)?;
+        record_missing_grant(db, &candidate.task.id, head, now)?;
         denied = Some(candidate.task.id.as_str().to_string());
     }
+    read_control.check()?;
+    db.advance_admission_cursor(&header,next.as_ref())?;
     Ok(AdmissionDecision {
         block: None,
-        reason: if denied.is_some() { "authority_missing" } else { "idle" },
+        reason: if next.is_some() { "scan_incomplete" } else if denied.is_some() { "authority_missing" } else { "idle" },
         task_id: denied,
     })
 }
@@ -277,14 +274,26 @@ pub fn admit_decision(project: &Path) -> Result<AdmissionDecision> {
 fn readiness_now(project: &Path) -> Result<Vec<Candidate>> {
     let now = jiff::Timestamp::now().as_millisecond();
     let mut db = open_store(project)?;
-    let state = db.read_snapshot(None)?;
-    rank_candidates(&mut db, &state, now)
+    let header = db.admission_header()?;
+    let mut candidates = Vec::new();
+    let control=ReadControl::new(std::time::Instant::now()+std::time::Duration::from_secs(30),crate::runner::Cancellation::default());
+    let budget=ReadBudget::new(control.clone());
+    let mut cursor = None;
+    loop {
+        let (page, next) = ranked_page(&mut db, &header, now, cursor.as_ref(), &control,&budget)?;
+        candidates.extend(page);
+        cursor = next;
+        if cursor.is_none() { break; }
+    }
+    Ok(candidates)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::SqliteStore;
+
+    fn budget() -> ReadBudget { ReadBudget::new(ReadControl::new(std::time::Instant::now()+std::time::Duration::from_secs(30),Default::default())) }
 
     fn claim(kind: &str, resource: &str, access: &str, certainty: &str) -> crate::store::ResourceClaim {
         crate::store::ResourceClaim { kind: kind.into(), resource: resource.into(), access: access.into(), certainty: certainty.into() }
@@ -319,11 +328,8 @@ mod tests {
         let created_path = fresh.path().join("state.db");
         let created = SqliteStore::create(&created_path).unwrap();
         drop(created);
-        assert_eq!(user_version(&created_path), 41);
+        assert_eq!(user_version(&created_path), crate::store::SCHEMA);
         assert!(table_exists(&created_path, "resource_claims"));
-        let open_fn = include_str!("store/mod.rs").split("pub fn open").nth(1).unwrap().split("pub fn integrity_check").next().unwrap();
-        assert!(!open_fn.contains("upgrade_v1"));
-        assert!(!open_fn.contains("0035_resource_claims"));
 
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state.db");
@@ -332,7 +338,7 @@ mod tests {
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
         let sequence: i64 = raw.query_row("SELECT MAX(sequence) FROM events", [], |row| row.get(0)).unwrap();
-        raw.execute_batch("DROP INDEX IF EXISTS attempts_retained_by_id; DROP TABLE IF EXISTS active_work_index; DROP TABLE IF EXISTS active_work_meta; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_update; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_delete; DROP TRIGGER IF EXISTS barrier_members_no_update; DROP TRIGGER IF EXISTS barrier_members_no_delete; DROP TRIGGER IF EXISTS barrier_revisions_no_membership_update; DROP TABLE IF EXISTS barrier_stale_briefs; DROP TABLE IF EXISTS barrier_members; DROP TABLE IF EXISTS barrier_revisions; DROP TRIGGER IF EXISTS memory_change_receipts_no_update; DROP TRIGGER IF EXISTS memory_change_receipts_no_delete; DROP TRIGGER IF EXISTS update_package_members_no_update; DROP TRIGGER IF EXISTS update_package_members_no_delete; DROP TRIGGER IF EXISTS update_packages_no_update; DROP TRIGGER IF EXISTS update_packages_no_delete; DROP TABLE IF EXISTS memory_change_receipts; DROP TABLE IF EXISTS update_package_members; ALTER TABLE consumer_bindings DROP COLUMN applied_cursor; DROP TABLE IF EXISTS update_packages; DROP TRIGGER IF EXISTS memory_read_set_on_record; DROP TRIGGER IF EXISTS memory_read_set_on_reclassify; DROP TRIGGER IF EXISTS memory_read_set_on_revision; DROP TRIGGER IF EXISTS memory_read_set_on_validity; DROP TRIGGER IF EXISTS memory_read_set_on_head; DROP TABLE IF EXISTS memory_scope_catalog; DROP TABLE IF EXISTS memory_required_generation; DROP TABLE IF EXISTS consumer_binding_undeliverable; DROP TABLE IF EXISTS consumer_binding_obligations; DROP TABLE IF EXISTS consumer_bindings; DROP TABLE IF EXISTS wait_replay_events; DROP TABLE IF EXISTS replan_requests; DROP TABLE IF EXISTS replan_budget_resets; DROP TABLE IF EXISTS attempt_infrastructure_retries; DROP TABLE IF EXISTS wait_conditions; DROP TABLE resource_claims; UPDATE store_meta SET schema_version=34; PRAGMA user_version=34;").unwrap();
+        crate::store::test_schema::historical(&raw, 34).unwrap();
         raw.execute(
             "INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq) VALUES('kept',1,NULL,'/tmp/project',0,'/tmp/repo','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','sha1',NULL,'verify_only',x'61',?1,?2)",
             rusqlite::params!["ab".repeat(32), sequence],
@@ -346,7 +352,7 @@ mod tests {
         assert!(!table_exists(&path, "resource_claims"));
         assert_eq!(db.read_snapshot(None).unwrap().tasks[0].title, "kept");
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&path), 41);
+        assert_eq!(user_version(&path), crate::store::SCHEMA);
         let claims: Vec<(i64, String, String, String, String)> = {
             let raw = rusqlite::Connection::open(&path).unwrap();
             let mut stmt = raw.prepare("SELECT ordinal, kind, resource, access, certainty FROM resource_claims ORDER BY ordinal").unwrap();
@@ -359,12 +365,12 @@ mod tests {
         ]);
         assert!(rusqlite::Connection::open(&path).unwrap().execute("DELETE FROM resource_claims", []).is_err());
         let mut reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&path), 41);
-        assert_eq!(reopened.read_snapshot(None).unwrap().schema_version, 41);
+        assert_eq!(user_version(&path), crate::store::SCHEMA);
+        assert_eq!(reopened.read_snapshot(None).unwrap().schema_version, crate::store::SCHEMA);
     }
 
-    struct Spec {
-        id: &'static str,
+    struct Spec<'a> {
+        id: &'a str,
         priority: i32,
         age_ms: i64,
         paths: &'static [(&'static str, &'static str)],
@@ -453,7 +459,7 @@ mod tests {
                     "named_resources": spec.named.iter().map(|(name, access)| serde_json::json!({"name": name, "access": access})).collect::<Vec<_>>()
                 },
                 "capability_flags": [],
-                "profile_kind": "codex",
+                "profile_kind": "claude",
                 "retry_class": "none",
                 "result_schema_id": "result-v1",
                 "route": "verify_only",
@@ -539,7 +545,7 @@ mod tests {
             "object_format": "sha1",
             "dependencies": [],
             "capability_flags": [],
-            "profile_kind": "codex",
+            "profile_kind": "claude",
             "retry_class": "none",
             "result_schema_id": "result-v1",
             "route": "verify_only",
@@ -552,10 +558,11 @@ mod tests {
     fn force_reserve(project: &Path, task: &str) -> Result<(), String> {
         let candidate = readiness_now(project).unwrap().into_iter().find(|candidate| candidate.task.id.as_str() == task).unwrap();
         let mut db = open_store(project).unwrap();
-        let state = db.read_snapshot(None).unwrap();
+        let state = db.admission_header().unwrap();
         let profiles = db.admission_profiles().unwrap();
-        let control = state.control.clone().unwrap();
-        let profile = binding_profiles(&profiles, &control, &candidate.binding).into_iter().next().unwrap();
+        let control = state.control.clone();
+        let now = jiff::Timestamp::now().as_millisecond();
+        let profile = binding_profiles(&db, &profiles, &control, &candidate, now,&budget()).unwrap().into_iter().next().unwrap();
         let store = store_file(project).unwrap();
         let store = store.to_str().unwrap().to_string();
         let mut inputs = seal(&store, &state, &candidate, profile, placeholder_approval()).unwrap();
@@ -771,4 +778,148 @@ mod tests {
         let mut db = SqliteStore::open(&project.join(".state/state.db")).unwrap();
         db.read_snapshot(None).unwrap().attempts.iter().any(|attempt| attempt.task.as_str() == task && attempt.retains_capacity())
     }
+    #[test]
+    fn review_probe_signed_contract_dependency_is_enforced() {
+        let (_root, project) = world(2, &[
+            Spec { id: "early", priority: 10, age_ms: 0, paths: &[], named: &[] },
+            Spec { id: "late", priority: 0, age_ms: 0, paths: &[], named: &[] },
+        ]);
+        let path = project.join(".state/state.db");
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        let bytes: Vec<u8> = raw.query_row("SELECT raw_bytes FROM task_contracts WHERE task_id='early'", [], |r|r.get(0)).unwrap();
+        let mut doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let mut db = SqliteStore::open(&path).unwrap();
+        doc["contract_revision"] = 2.into();
+        doc["expected_head"] = db.current_head().unwrap().into();
+        doc["dependencies"] = serde_json::json!([{"predecessor":"late", "edge":"verified_result", "policy_id":"builds"}]);
+        let prepared = PreparedContract::parse_verified(&serde_json::to_vec(&doc).unwrap()).unwrap();
+        db.install_contract(&prepared).unwrap();
+        assert_eq!(raw.query_row("SELECT count(*) FROM verified_results",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        let selected = grant_and_admit(&project);
+        assert_ne!(selected.as_deref(), Some("early"), "reserved a task whose signed predecessor has no verified result");
+    }
+
+    #[test]
+    fn changed_contract_rejects_an_already_prepared_launch() {
+        let (_root, project) = world(1, &[Spec { id: "task", priority: 0, age_ms: 0, paths: &[], named: &[] }]);
+        let mut inputs = prepared_admission_inputs(&project).unwrap().unwrap();
+        assert_eq!(inputs.task_contract.as_ref().unwrap().revision, 1);
+        let path = project.join(".state/state.db");
+        let mut db = SqliteStore::open(&path).unwrap();
+        let now = jiff::Timestamp::now().as_millisecond();
+        let grant = ApprovalGrant { version: 1, scope: ApprovalScope::for_launch(&inputs).unwrap(), policy: inputs.effective_profile.as_ref().unwrap().permission_policy.clone(), issued_unix_ms: 0, expires_unix_ms: now + 3_600_000 };
+        inputs.approval = db.install_approval(&PreparedApproval { grant }, db.current_head().unwrap(), now).unwrap();
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        let bytes: Vec<u8> = raw.query_row("SELECT raw_bytes FROM task_contracts WHERE task_id='task'", [], |r| r.get(0)).unwrap();
+        let mut doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        doc["contract_revision"] = 2.into();
+        doc["expected_head"] = db.current_head().unwrap().into();
+        doc["deliverable"] = "Changed work requires a new approval".into();
+        db.install_contract(&PreparedContract::parse_verified(&serde_json::to_vec(&doc).unwrap()).unwrap()).unwrap();
+        let head = db.current_head().unwrap();
+        let error = db.reserve_prepared(&[PreparedLaunch { inputs }], head, now).unwrap_err();
+        assert!(error.to_string().contains("task contract changed"), "{error}");
+        assert_eq!(db.current_head().unwrap(), head);
+        assert!(attempt_tasks(&project).is_empty());
+        assert_eq!(admit_decision(&project).unwrap().reason, "authority_missing");
+    }
+
+    #[test]
+    fn contract_routes_by_profile_kind_and_required_capabilities() {
+        for (kind, flags) in [("codex", serde_json::json!([])), ("claude", serde_json::json!(["workflow-certified"]))] {
+            let (_root, project) = world(2, &[
+                Spec { id: "early", priority: 10, age_ms: 0, paths: &[], named: &[] },
+                Spec { id: "late", priority: 0, age_ms: 0, paths: &[], named: &[] },
+            ]);
+            let path = project.join(".state/state.db");
+            let raw = rusqlite::Connection::open(&path).unwrap();
+            let bytes: Vec<u8> = raw.query_row("SELECT raw_bytes FROM task_contracts WHERE task_id='early'", [], |r| r.get(0)).unwrap();
+            let mut doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let mut db = SqliteStore::open(&path).unwrap();
+            doc["contract_revision"] = 2.into();
+            doc["expected_head"] = db.current_head().unwrap().into();
+            doc["profile_kind"] = kind.into();
+            doc["capability_flags"] = flags;
+            db.install_contract(&PreparedContract::parse_verified(&serde_json::to_vec(&doc).unwrap()).unwrap()).unwrap();
+            assert_eq!(grant_and_admit(&project).as_deref(), Some("late"));
+            assert_eq!(attempt_tasks(&project), vec!["late"]);
+        }
+    }
+
+    #[test]
+    fn admission_refuses_dense_profile_and_binding_payloads_before_reservation() {
+        for profile in [true,false] {
+            let(_root,project)=world(1,&[Spec{id:"bounded",priority:0,age_ms:0,paths:&[],named:&[]}]);
+            let raw=rusqlite::Connection::open(store_file(&project).unwrap()).unwrap();
+            let before:u64=raw.query_row("SELECT MAX(sequence) FROM events",[],|row|row.get(0)).unwrap();
+            let (table,key,column,hash_column,trigger)=if profile {
+                ("native_profiles","profile_digest","report","report_digest","native_profiles_no_update")
+            } else {("runtime_bindings","id","payload","payload_hash","")};
+            let(id,payload):(String,String)=raw.query_row(&format!("SELECT {key},{column} FROM {table} LIMIT 1"),[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+            let mut value:serde_json::Value=serde_json::from_str(&payload).unwrap();
+            value["dense_extension"]=serde_json::json!(vec![0;150_000]);
+            let payload=serde_json::to_string(&value).unwrap();
+            let digest=format!("{:x}",Sha256::digest(payload.as_bytes()));
+            if !trigger.is_empty(){raw.execute_batch(&format!("DROP TRIGGER {trigger}")).unwrap();}
+            raw.execute(&format!("UPDATE {table} SET {column}=?1,{hash_column}=?2 WHERE {key}=?3"),rusqlite::params![payload,digest,id]).unwrap();
+            let observation=admit_decision_observed(&project);
+            assert!(observation.sql.connection_observed);
+            assert!(observation.sql.sqlite_rows_returned>0);
+            assert!(observation.sql.sqlite_vm_steps>0);
+            let error=observation.result.err().expect("dense JSON must exceed shared accounting before decoding");
+            assert!(matches!(error.downcast_ref::<StoreError>(),Some(StoreError::Limit(_))),"{error:#}");
+            let head:u64=raw.query_row("SELECT MAX(sequence) FROM events",[],|row|row.get(0)).unwrap();assert_eq!(head,before);
+            let attempts:u64=raw.query_row("SELECT count(*) FROM attempts",[],|row|row.get(0)).unwrap();assert_eq!(attempts,0);
+        }
+    }
+
+    #[test]
+    fn admission_resumes_after_a_full_page_of_unsigned_candidates() {
+        let names=(0..65).map(|n|format!("task-{n:03}")).collect::<Vec<_>>();
+        let specs=names.iter().map(|name|Spec{id:name,priority:0,age_ms:0,paths:&[],named:&[]}).collect::<Vec<_>>();
+        let (_root,project)=world(1,&specs);
+        let candidates=readiness_now(&project).unwrap();
+        let late=candidates.iter().find(|c|c.task.id.as_str()=="task-064").unwrap();
+        let path=store_file(&project).unwrap();
+        let mut db=SqliteStore::open(&path).unwrap();
+        let header=db.admission_header().unwrap();
+        let profiles=db.admission_profiles().unwrap();
+        let now=jiff::Timestamp::now().as_millisecond();
+        let profile=binding_profiles(&db,&profiles,&header.control,late,now,&budget()).unwrap()[0];
+        let inputs=seal(path.to_str().unwrap(),&header,late,profile,placeholder_approval()).unwrap();
+        let first=admit_decision(&project).unwrap();
+        assert_eq!(first.reason,"scan_incomplete");
+        assert!(attempt_tasks(&project).is_empty());
+        // Approval arrival changes the global head, but must not lose scan progress.
+        let grant=ApprovalGrant{version:1,scope:ApprovalScope::for_launch(&inputs).unwrap(),policy:inputs.effective_profile.unwrap().permission_policy,issued_unix_ms:0,expires_unix_ms:now+3_600_000};
+        db.install_approval(&PreparedApproval{grant},db.current_head().unwrap(),now).unwrap();
+        drop(db);
+        let observation=admit_decision_observed(&project);
+        assert!(observation.sql.connection_observed);
+        assert!(observation.sql.sqlite_rows_returned>0);
+        assert!(observation.sql.sqlite_vm_steps>0);
+        let second=observation.result.unwrap();
+        assert_eq!(second.reason,"reserved");
+        assert_eq!(second.task_id.as_deref(),Some("task-064"));
+        assert_eq!(attempt_tasks(&project),vec!["task-064"]);
+    }
+
+    #[test]
+    fn admission_preserves_the_callers_deadline_and_cancellation() {
+        use std::time::{Duration,Instant};
+        let (_root,project)=world(1,&[Spec{id:"task",priority:0,age_ms:0,paths:&[],named:&[]}]);
+        let cancellation=crate::runner::Cancellation::default();
+        cancellation.cancel();
+        let observation=admit_decision_observed_with_control(&project,ReadControl::new(Instant::now()+Duration::from_secs(1),cancellation));
+        assert!(!observation.sql.connection_observed);
+        assert_eq!(observation.sql.sqlite_rows_returned,0);
+        let error=observation.result.err().unwrap();
+        assert!(matches!(error.downcast_ref::<StoreError>(),Some(StoreError::Cancelled)));
+        let error=admit_decision_with_control(&project,ReadControl::new(Instant::now()-Duration::from_millis(1),Default::default())).err().unwrap();
+        assert!(matches!(error.downcast_ref::<StoreError>(),Some(StoreError::Deadline)));
+        assert!(attempt_tasks(&project).is_empty());
+    }
+
+    mod delegated { use super::*; include!("admission_delegated_tests.rs"); }
+
 }

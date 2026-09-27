@@ -31,10 +31,12 @@ impl crate::runner::Runner for ProbeBudget<'_> {
 pub fn poll(ctx:&Ctx,path:&Path,turn:u64)->Result<PollResult> {
     let path=path.canonicalize()?;
     let ownership=herdr_projects::execution_guard::ProjectGuard::acquire(&path)?;
-    let mut db=herdr_projects::migration::open_active(&path)?;
     let now=jiff::Timestamp::now().as_millisecond();
     match herdr_projects::store::HOT_PATH_READ {
         herdr_projects::store::HotPathRead::Targeted=>{
+            let control=herdr_projects::store::controlled::ReadControl::new(
+                std::time::Instant::now()+std::time::Duration::from_secs(2),Default::default());
+            let db=herdr_projects::migration::open_active_scoped(&path,control)?;
             let schema=match db.read_targeted_hot_path(now,launch_dispatch_enabled()) {
                 Ok(schema)=>schema,
                 Err(error)=>{
@@ -48,6 +50,7 @@ pub fn poll(ctx:&Ctx,path:&Path,turn:u64)->Result<PollResult> {
             ensure!(schema>=9,"upgrade-store is required before canonical controller polling");
         }
         herdr_projects::store::HotPathRead::Snapshot=>{
+            let mut db=herdr_projects::migration::open_active(&path)?;
             let snapshot=db.read_snapshot(None)?;
             if let Err(error)=db.shadow_against_snapshot(&snapshot,now,launch_dispatch_enabled()) {
                 if matches!(error,herdr_projects::store::StoreError::Cancelled|herdr_projects::store::StoreError::Deadline) {
@@ -60,11 +63,12 @@ pub fn poll(ctx:&Ctx,path:&Path,turn:u64)->Result<PollResult> {
     // Collect without a SQLite transaction. Commit and expiry are serialized with
     // all supported lifecycle/effect adapters, without reacquiring ticker leadership.
     let budget=ProbeBudget{runner:ctx.runner,deadline:std::time::Instant::now()+std::time::Duration::from_secs(15)};
+    let control=herdr_projects::store::controlled::ReadControl::new(budget.deadline,Default::default());
     let probe_ctx=Ctx{env:ctx.env,root:ctx.root.clone(),config_dir:ctx.config_dir.clone(),runner:&budget,detached_ticker:ctx.detached_ticker};
-    let batch=crate::reconcile_live::collect(&probe_ctx,&path)?;
+    let batch=crate::reconcile_live::collect_controlled(&probe_ctx,&path,&control)?;
     ensure!(std::time::Instant::now()<budget.deadline,"automatic observation budget exhausted; use explicit reconciliation to investigate");
     let reachable=batch.observations.iter().any(|o|o.pane==ResourceState::Present||o.worktree==ResourceState::Present);
-    runtime::record_controller_observations_guarded(&path,&batch,&ownership)?;
+    runtime::record_controller_observations_controlled(&path,&batch,&ownership,&control)?;
     drop(ownership);
     finish_poll(ctx,&path,turn,reachable,None,None,None)
 }
@@ -88,22 +92,33 @@ fn finish_poll(ctx:&Ctx,path:&Path,turn:u64,reachable:bool,observation_error:Opt
     // explicit synchronous service; either path still offers independent effects.
     let scheduled=match background_plan {Some(active)=>Ok(herdr_projects::routines::ScheduleTurn{active,diagnostic:None}),None=>herdr_projects::routines::schedule_turn(path,turn)};
     let queued=effects.is_some();
-    let (admission_log,result)=process_next_with_launches(ctx,&path,turn,effects,launch_dispatch_enabled());
     let mut errors=observation_error.into_iter().collect::<Vec<_>>();
+    let stop_work=match herdr_projects::store::service_project_barrier_stops(path) {
+        Ok(report)=>report.pending,
+        Err(error)=>{errors.push(format!("barrier stop service: {error:#}"));true},
+    };
+    let (admission_log,result)=process_next_with_launches(ctx,&path,turn,effects,launch_dispatch_enabled());
+    let wait_work=match herdr_projects::store::service_project_waits(path) {
+        Ok(report)=>report.pending,
+        Err(error)=>{errors.push(format!("wait service: {error:#}"));true},
+    };
+    let replan_work=match herdr_projects::store::service_project_replans(path) {
+        Ok(report)=>report.pending,
+        Err(error)=>{errors.push(format!("replan request service: {error:#}"));true},
+    };
     let routine_work=match scheduled {Ok(report)=>{if let Some(error)=report.diagnostic {errors.push(format!("routine scheduling: {error}"));}report.active},Err(error)=>{errors.push(format!("routine scheduling: {error:#}"));false}};
     // An admission failure is diagnostic only. Already-prepared dispatch still runs.
     let (progress,unknown_effects)=match result {
         Ok((progress,admission))=>{if let Some(error)=admission {errors.push(format!("admission: {error}"));}(progress,false)}
         Err(error)=>{errors.push(format!("{error:#}"));(false,queued)}
     };
-    Ok(PollResult{reachable:reachable||progress,scheduled_work:routine_work,unknown_effects,operation_error:(!errors.is_empty()).then(||errors.join("; ")),admission_log})
+    Ok(PollResult{reachable:reachable||progress,scheduled_work:routine_work||wait_work||stop_work||replan_work,unknown_effects,operation_error:(!errors.is_empty()).then(||errors.join("; ")),admission_log})
 }
 fn process_next(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::copy_jobs::Queue>)->Result<bool> {
     Ok(process_next_with_launches(ctx,path,turn,effects,launch_dispatch_enabled()).1?.0)
 }
 #[cfg(target_os="linux")]
 fn linux_admission(path:&Path)->(Option<String>,Option<String>) {
-    let started=std::time::Instant::now();
     if herdr_projects::watchdog::is_paused(path) {
         let reason=herdr_projects::watchdog::pause_reason(path).unwrap_or("admission_paused");
         let line=herdr_projects::watchdog::admission_log_line(reason,None,0);
@@ -111,9 +126,10 @@ fn linux_admission(path:&Path)->(Option<String>,Option<String>) {
     }
     if !herdr_projects::admission::wake_enabled(path) {return (None,None);}
     // Ok(Some) is backpressure, not success. Prepared dispatch still runs after this note.
-    match herdr_projects::admission::admit_decision(path) {
+    let observation=herdr_projects::admission::admit_decision_observed(path);
+    match observation.result {
         Ok(decision)=>{
-            let line=herdr_projects::watchdog::admission_log_line(decision.reason,decision.task_id.as_deref(),started.elapsed().as_millis());
+            let line=herdr_projects::watchdog::admission_log_line_observed(decision.reason,decision.task_id.as_deref(),u128::from(observation.duration_ms),Some(observation.sql));
             let diagnostic=decision.block.map(|block| format!("{}: {}", block.blocker, block.reason));
             (diagnostic,Some(line))
         }
@@ -122,7 +138,7 @@ fn linux_admission(path:&Path)->(Option<String>,Option<String>) {
             if let Some(store)=error.downcast_ref::<herdr_projects::store::StoreError>() {
                 let _=herdr_projects::watchdog::note(path,store);
             }
-            let line=herdr_projects::watchdog::admission_log_line(reason,None,started.elapsed().as_millis());
+            let line=herdr_projects::watchdog::admission_log_line_observed(reason,None,u128::from(observation.duration_ms),Some(observation.sql));
             (Some(format!("{error:#}")),Some(line))
         }
     }
@@ -225,6 +241,42 @@ pub(crate) mod tests {
         (world,path)
     }
     #[test]
+    fn controller_creates_replan_requests_only_when_explicitly_enabled() {
+        use herdr_projects::domain::*;
+        let (world,path)=routine_fixture(&[]);let mut db=migration::open_active(&path).unwrap();
+        db.commit(Commit{expected_head:db.current_head().unwrap(),mutations:vec![Mutation::Task{expected:None,next:Task{id:TaskId::new("replan-task").unwrap(),revision:1,state:TaskState::Blocked,title:"replan".into(),active_attempt:None}}]}).unwrap();drop(db);
+        let raw=rusqlite::Connection::open(path.join(".state/state.db")).unwrap();
+        raw.execute("INSERT INTO feedback_items VALUES(?1,'fixture-verifier',1,'verifier_rejection','replan-task','checks_failed','open',NULL,0)",["a".repeat(64)]).unwrap();
+        finish_poll(&world.ctx(),&path,0,false,None,None,Some(false)).unwrap();
+        assert_eq!(raw.query_row("SELECT count(*) FROM replan_requests",[],|row|row.get::<_,usize>(0)).unwrap(),0);
+        let head=runtime::snapshot(&path).unwrap().head;herdr_projects::store::set_project_auto_replans(&path,head,true).unwrap();
+        for turn in 1..3 {let result=finish_poll(&world.ctx(),&path,turn,false,None,None,Some(false)).unwrap();assert!(!result.operation_error.unwrap_or_default().contains("replan request service"));}
+        assert_eq!(raw.query_row("SELECT count(*) FROM replan_requests",[],|row|row.get::<_,usize>(0)).unwrap(),1);
+        assert_eq!(raw.query_row("SELECT count(*) FROM attempts",[],|row|row.get::<_,usize>(0)).unwrap(),0);
+        assert_eq!(world.runner.count("agent prompt"),0);
+    }
+
+    #[test]
+    fn controller_services_a_wait_without_reserving_or_repeating_the_notice() {
+        use herdr_projects::domain::*;
+        let (world,path)=routine_fixture(&[]);
+        let mut db=migration::open_active(&path).unwrap();
+        db.commit(Commit{expected_head:db.current_head().unwrap(),mutations:vec![Mutation::Task{expected:None,next:Task{id:TaskId::new("waiting").unwrap(),revision:1,state:TaskState::Blocked,title:"waiting".into(),active_attempt:None}}]}).unwrap();
+        let wait=db.register_wait("waiting",None,"user_decision").unwrap();
+        drop(db);
+        let raw=rusqlite::Connection::open(path.join(".state/state.db")).unwrap();
+        raw.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake',?1,1,1,'{}')",[&wait.wait_id]).unwrap();
+        for turn in 0..2 {
+            let result=finish_poll(&world.ctx(),&path,turn,false,None,None,Some(false)).unwrap();
+            assert!(!result.operation_error.unwrap_or_default().contains("wait service:"));
+        }
+        let notices:i64=raw.query_row("SELECT count(*) FROM events WHERE kind='wait.notified'",[],|row|row.get(0)).unwrap();
+        assert_eq!(notices,1);
+        let attempts:i64=raw.query_row("SELECT count(*) FROM attempts",[],|row|row.get(0)).unwrap();
+        assert_eq!(attempts,0);
+    }
+
+    #[test]
     fn ticker_rotates_signed_routines_records_once_and_keeps_future_work_alive() {
         use std::fs;use herdr_projects::domain::*;
         let(world,path)=routine_fixture(&[("a-broken",b"touch MUST_NOT_EXECUTE\n",1000),("b-healthy",b"touch MUST_NOT_EXECUTE\n",1000)]);
@@ -266,7 +318,15 @@ pub(crate) mod tests {
     #[test]
     fn controller_expires_claims_without_replaying_ambiguous_notifications() {
         let(world,path,task)=notification_delivery::tests::fixture();let op=notification_delivery::enqueue(&world.ctx(),&path,&task,runtime::snapshot(&path).unwrap().head).unwrap();let mut db=migration::open_active(&path).unwrap();let now=jiff::Timestamp::now().as_millisecond();db.claim_operation(&op.id,1,"previous-controller",now,1).unwrap();std::thread::sleep(std::time::Duration::from_millis(3));
-        poll(&world.ctx(),&path,0).unwrap();assert_eq!(runtime::snapshot(&path).unwrap().deliveries[0].state,DeliveryState::Ambiguous);poll(&world.ctx(),&path,0).unwrap();assert_eq!(world.runner.count("notification show"),0);
+        let raw=rusqlite::Connection::open(path.join(".state/state.db")).unwrap();
+        raw.execute("INSERT INTO tasks VALUES('retired/invalid',1,'succeeded','cold history',NULL)",[]).unwrap();
+        assert!(runtime::snapshot(&path).is_err());
+        poll(&world.ctx(),&path,0).unwrap();
+        assert_eq!(raw.query_row("SELECT state FROM operation_delivery WHERE operation_id=?1",[op.id.as_str()],|r|r.get::<_,String>(0)).unwrap(),"ambiguous");
+        poll(&world.ctx(),&path,0).unwrap();assert_eq!(world.runner.count("notification show"),0);
+        assert!(runtime::snapshot(&path).is_err());
+        raw.execute("DELETE FROM tasks WHERE id='retired/invalid'",[]).unwrap();
+        assert_eq!(runtime::snapshot(&path).unwrap().deliveries[0].state,DeliveryState::Ambiguous);
     }
     #[test]
     fn paused_control_blocks_notification_and_execution_lease_blocks_the_pass() {
@@ -323,15 +383,27 @@ pub(crate) mod tests {
         db.commit(Commit{expected_head:0,mutations:["pred","c"].into_iter().map(|id|Mutation::Task{expected:None,next:Task{id:TaskId::new(id).unwrap(),revision:1,state:TaskState::Draft,title:id.into(),active_attempt:None}}).collect()}).unwrap();
         let head=db.read_snapshot(None).unwrap().head;
         db.commit(Commit{expected_head:head,mutations:vec![Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("attempt-pred").unwrap(),task:TaskId::new("pred").unwrap(),revision:1,state:AttemptState::Completed,snapshot:None,reservation:"slot-pred".into(),termination_observed:true}}]}).unwrap();
-        let digest="d".repeat(64);let oid="a".repeat(40);let result_id="e".repeat(64);
+        let oid="a".repeat(40);let result_id="e".repeat(64);
+        // Synthetic accepted evidence still needs a parseable contract and its
+        // exact digest; opaque fixture bytes must not bypass result provenance.
+        let contract=serde_json::to_vec(&serde_json::json!({
+            "version":1,"project_store":"/tmp/project","expected_head":0,"task_id":"pred","contract_revision":1,
+            "deliverable":"Controller fixture","non_goals":"No external worker","acceptance_policies":[{"id":"policy","text":"accept"}],
+            "repository":"/tmp/repo","base_oid":oid,"object_format":"sha1","dependencies":[],"capability_flags":[],
+            "profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_only",
+            "authority":{"id":"owner-approval-policy","revision":1,"digest":"d".repeat(64)}
+        })).unwrap();
+        let digest=format!("{:x}",Sha256::digest(&contract));
+        let policy_digest=format!("{:x}",Sha256::digest(b"accept"));
         let installed:i64=rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT COALESCE(MAX(sequence),1) FROM events",[],|row|row.get(0)).unwrap();
         let raw=rusqlite::Connection::open(&db_path).unwrap();
         raw.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        raw.execute("INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq) VALUES('pred',1,NULL,'/tmp/project',0,'/tmp/repo',?1,'sha1',NULL,'verify_only',?2,?3,?4)",rusqlite::params![oid,vec![b'x'],digest,installed]).unwrap();
+        raw.execute("INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq) VALUES('pred',1,NULL,'/tmp/project',0,'/tmp/repo',?1,'sha1',NULL,'verify_only',?2,?3,?4)",rusqlite::params![oid,contract,digest,installed]).unwrap();
         raw.execute("INSERT INTO acceptance_policies(task_id,contract_revision,policy_id,body) VALUES('pred',1,'policy','accept')",[]).unwrap();
         raw.execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,memory_snapshot_id,artifact_manifest,claimed_checks,created_unix_ms) VALUES(?1,'/tmp/project','key-pred',?1,'{}','pred',1,?1,'attempt-pred','/tmp/repo',?2,?2,'sha1',NULL,'[]','[]',1)",rusqlite::params![digest,oid]).unwrap();
-        raw.execute("INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,'/tmp/project',?1,?2,?2,'pred',1,?2,'attempt-pred','policy',?2,?3,?3,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?2,0,0,1)",rusqlite::params![result_id,digest,oid]).unwrap();
-        raw.execute("INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?1,?2,?3,?3,'sha1',?2,?2,'linux-unshare-user-pid-mount-v1',0,1)",rusqlite::params![result_id,digest,oid]).unwrap();
+        raw.execute("INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,'/tmp/project',?1,?2,?2,'pred',1,?2,'attempt-pred','policy',?4,?3,?3,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?2,0,0,1)",rusqlite::params![result_id,digest,oid,policy_digest]).unwrap();
+        raw.execute("INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?1,?2,?3,?3,'sha1',?4,?2,'linux-unshare-user-pid-mount-v1',0,1)",rusqlite::params![result_id,digest,oid,policy_digest]).unwrap();
+        raw.execute("INSERT INTO verification_contract_checks VALUES(?1,2)", [&result_id]).unwrap();
         drop(raw);
         let child=TaskId::new("c").unwrap();
         let snapshot=db.read_snapshot(None).unwrap();
@@ -389,7 +461,12 @@ pub(crate) mod tests {
         let before=counts();
         assert_eq!(attempts("c"),0);
         let mut reads=observations::Reads::new(pool.clone());
-        poll_queued_effects(&ctx,&project,1,&mut reads,None).unwrap();
+        let admitted=poll_queued_effects(&ctx,&project,1,&mut reads,None).unwrap();
+        let logged:serde_json::Value=serde_json::from_str(admitted.admission_log.as_deref().unwrap()).unwrap();
+        assert_eq!(logged["reason"],"reserved");
+        assert_eq!(logged["sql_work"]["connection_observed"],true);
+        assert!(logged["sql_work"]["sqlite_rows_returned"].as_u64().unwrap()>0);
+        assert!(logged["sql_work"]["sqlite_vm_steps"].as_u64().unwrap()>0);
         assert_eq!(attempts("c"),1,"one poll_queued_effects wake reserves C");
         let mut expected=before;
         expected.push(("c".into(),1));

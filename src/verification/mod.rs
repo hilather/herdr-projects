@@ -164,6 +164,7 @@ impl VerifyRequest {
     }
 }
 
+#[derive(Serialize)]
 pub struct VerifyOutcome {
     pub run_id: String,
     pub state: String,
@@ -216,9 +217,44 @@ pub(crate) fn program_allowed(program: &str, checkout: &Path) -> bool {
     program.starts_with(checkout)
 }
 
+/// Owner/operator CLI ingress. Work is isolated in a newly created directory;
+/// existing caller files are never reused or removed by this entry point.
+pub fn verify_project(project: &Path, request: &VerifyRequest) -> Result<VerifyOutcome> {
+    use std::os::unix::fs::DirBuilderExt;
+    if request.timeout < Duration::from_secs(1) || request.timeout > Duration::from_secs(300) {
+        bail!("verification timeout must be between 1 and 300 seconds");
+    }
+    if !request.work_dir.is_absolute() { bail!("verification work directory must be absolute"); }
+    let _guard = crate::migration::runtime_mutation(project)?;
+    let mut store = crate::migration::open_active(project)?;
+    fs::DirBuilder::new().mode(0o700).create(&request.work_dir)
+        .context("verification work directory must be new and have an existing parent")?;
+    struct Work(Option<PathBuf>);
+    impl Drop for Work { fn drop(&mut self) { if let Some(path) = &self.0 { let _ = fs::remove_dir_all(path); } } }
+    let mut work = Work(Some(request.work_dir.clone()));
+    let outcome = verify(&mut store, request);
+    let cleanup = fs::remove_dir_all(&request.work_dir);
+    if cleanup.is_ok() { work.0 = None; }
+    let outcome = outcome?;
+    cleanup.context("verification recorded but scratch cleanup failed")?;
+    Ok(outcome)
+}
+
+fn read_policy(path: &Path) -> Result<Vec<u8>> {
+    use std::{io::Read, os::unix::fs::OpenOptionsExt};
+    let file = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path).context("policy file is unreadable")?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > 4_000 { bail!("policy file must be a regular file of at most 4000 bytes"); }
+    let mut bytes = Vec::new();
+    file.take(4_001).read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() > 4_000 { bail!("policy document exceeds bounds"); }
+    Ok(bytes)
+}
+
 pub fn verify(store: &mut SqliteStore, request: &VerifyRequest) -> Result<VerifyOutcome> {
     let target = store.load_verify_target(&request.submission_id, &request.policy_id)?;
-    let policy_bytes = fs::read(&request.policy_path).context("policy file is unreadable")?;
+    let policy_bytes = read_policy(&request.policy_path)?;
     let payload_digest = sha256(&format!(
         "{}\0{}\0{}\0{}",
         target.submission_id,
@@ -254,6 +290,7 @@ pub fn verify(store: &mut SqliteStore, request: &VerifyRequest) -> Result<Verify
             Some("policy_digest_mismatch"),
             None,
             String::new(),
+            None,
         );
     }
     let checks = parse_checks(&policy_bytes)?;
@@ -262,7 +299,37 @@ pub fn verify(store: &mut SqliteStore, request: &VerifyRequest) -> Result<Verify
         Path::new(&target.project_store),
         &target.objects,
         &target.candidate_oid,
+        &target.object_format,
     )?;
+    if let Some(scopes) = &target.write_scopes {
+        let reason = match checkout::changed_paths(&checkout.path, &target.base_oid, &target.candidate_oid) {
+            Ok(paths) if paths.iter().any(|path| !scopes.iter().any(|scope|
+                path == scope.as_bytes() || (scope.ends_with('/') && path.starts_with(scope.as_bytes())))) => Some("scope_violation"),
+            Ok(_) => None,
+            Err(_) => Some("scope_diff_unavailable"),
+        };
+        if let Some(reason) = reason {
+            return persist(store, &target, request, payload_digest, Vec::new(), Vec::new(),
+                Some(checkout.tree), Some(reason), None, String::new(), None);
+        }
+    }
+    // Inspect the materialized candidate, never the worker's artifact claims.
+    // Disallow symlink ancestors as well as symlink final entries.
+    if target.required_outputs.iter().any(|output| {
+        let mut path = checkout.path.clone();
+        let parts: Vec<_> = output.split('/').collect();
+        parts.iter().enumerate().any(|(index, part)| {
+            path.push(part);
+            match fs::symlink_metadata(&path) {
+                Ok(meta) => meta.file_type().is_symlink()
+                    || if index + 1 == parts.len() { !meta.is_file() } else { !meta.is_dir() },
+                Err(_) => true,
+            }
+        })
+    }) {
+        return persist(store, &target, request, payload_digest, Vec::new(), Vec::new(),
+            Some(checkout.tree), Some("required_output_missing"), None, String::new(), None);
+    }
     if !program_allowed(&checks[0], &checkout.path) {
         return persist(
             store,
@@ -275,6 +342,7 @@ pub fn verify(store: &mut SqliteStore, request: &VerifyRequest) -> Result<Verify
             Some("checks_not_allowlisted"),
             None,
             String::new(),
+            None,
         );
     }
     if request.fault == Fault::DirtyTree {
@@ -324,6 +392,7 @@ pub fn verify(store: &mut SqliteStore, request: &VerifyRequest) -> Result<Verify
                 Some("isolation_setup_failed"),
                 None,
                 String::new(),
+                None,
             );
         }
     };
@@ -350,6 +419,7 @@ pub fn verify(store: &mut SqliteStore, request: &VerifyRequest) -> Result<Verify
             Some("isolation_setup_failed"),
             None,
             String::new(),
+            None,
         );
     }
     let output = match RealRunner.run(&launch.cmd) {
@@ -366,6 +436,7 @@ pub fn verify(store: &mut SqliteStore, request: &VerifyRequest) -> Result<Verify
                 Some("isolation_setup_failed"),
                 None,
                 String::new(),
+                None,
             );
         }
     };
@@ -396,6 +467,7 @@ pub fn verify(store: &mut SqliteStore, request: &VerifyRequest) -> Result<Verify
         report.reason,
         receipt,
         report.stdout,
+        report.exit_status,
     )
 }
 
@@ -410,12 +482,12 @@ fn persist(
     reason: Option<&str>,
     receipt: Option<VerificationReceipt>,
     stdout: String,
+    exit_status: Option<i32>,
 ) -> Result<VerifyOutcome> {
     let libraries = libraries
         .iter()
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>();
-    let exit_status = reason.and_then(|reason| (reason == "checks_failed").then_some(1));
     let (stored, receipt) = store.commit_verification(
         target,
         RunDraft {
@@ -438,6 +510,11 @@ fn persist(
         stdout,
         replayed: false,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn testing_receipt(target: &VerifyTarget, payload: &str, key: &str, commit: &str, tree: &str) -> VerificationReceipt {
+    issue_receipt(target, payload, key, commit, tree).unwrap()
 }
 
 fn issue_receipt(
@@ -485,6 +562,7 @@ struct ChildReport {
     reason: Option<&'static str>,
     tree: Option<String>,
     stdout: String,
+    exit_status: Option<i32>,
 }
 
 fn classify(output: &Output, commit: &str, tree: &str) -> ChildReport {
@@ -495,34 +573,40 @@ fn classify(output: &Output, commit: &str, tree: &str) -> ChildReport {
             reason: Some("timeout"),
             tree: None,
             stdout,
+            exit_status: None,
         };
     }
     let protocol = protocol(&output.stderr);
     let seen_tree = protocol.tree.clone();
+    let exit_status=protocol.checks.filter(|code|(0..=255).contains(code));
     match output.code {
         Some(73) => ChildReport {
             success: false,
             reason: Some("tampered_tree"),
             tree: seen_tree,
             stdout,
+            exit_status,
         },
         Some(74) => ChildReport {
             success: false,
             reason: Some("leftover_child"),
             tree: seen_tree,
             stdout,
+            exit_status,
         },
         Some(75) => ChildReport {
             success: false,
             reason: Some("policy_digest_mismatch"),
             tree: seen_tree,
             stdout,
+            exit_status,
         },
         Some(76) => ChildReport {
             success: false,
             reason: Some("checks_not_allowlisted"),
             tree: seen_tree,
             stdout,
+            exit_status,
         },
         Some(0)
             if protocol.commit.as_deref() == Some(commit)
@@ -534,6 +618,7 @@ fn classify(output: &Output, commit: &str, tree: &str) -> ChildReport {
                 reason: None,
                 tree: seen_tree,
                 stdout,
+                exit_status,
             }
         }
         Some(0) => ChildReport {
@@ -541,13 +626,15 @@ fn classify(output: &Output, commit: &str, tree: &str) -> ChildReport {
             reason: Some("tampered_tree"),
             tree: seen_tree,
             stdout,
+            exit_status,
         },
-        Some(code) if (1..71).contains(&code) && protocol.commit.as_deref() == Some(commit) => {
+        Some(code) if ((1..71).contains(&code) || code==77) && protocol.commit.as_deref() == Some(commit) => {
             ChildReport {
                 success: false,
                 reason: Some("checks_failed"),
                 tree: seen_tree,
                 stdout,
+                exit_status,
             }
         }
         _ => ChildReport {
@@ -555,6 +642,7 @@ fn classify(output: &Output, commit: &str, tree: &str) -> ChildReport {
             reason: Some("isolation_setup_failed"),
             tree: seen_tree,
             stdout,
+            exit_status,
         },
     }
 }

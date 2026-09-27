@@ -53,6 +53,9 @@ pub(crate) struct VerifyTarget {
     pub store_device: i64,
     pub store_inode: i64,
     pub objects: Vec<RetainedObject>,
+    pub required_outputs: Vec<String>,
+    pub base_oid: String,
+    pub write_scopes: Option<Vec<String>>,
     pin: File,
 }
 
@@ -214,6 +217,16 @@ impl SqliteStore {
         if sha256_hex(&raw) != raw_digest || raw_digest != contract_digest {
             return Err(StoreError::Corrupt("task contract digest mismatch".into()));
         }
+        let contract = crate::domain::PreparedContract::parse_verified(&raw).map_err(|error| invalid(&error))?;
+        let write_scopes = if contract.scope_paths.is_empty() { None } else {
+            Some(contract.scope_paths.iter().filter(|scope| scope.access == ScopeAccess::Write)
+                .filter(|scope| !scope.path.contains(['*', '?', '[']))
+                .map(|scope| scope.path.clone()).collect())
+        };
+        let base_oid = contract.base_oid;
+        let required_outputs = contract.required_outputs;
+        super::contract_binding::require_result_barrier(&tx, &task_id, u64::try_from(contract_revision).map_err(|_| invalid("invalid contract revision"))?,
+            &contract_digest, &attempt_id, jiff::Timestamp::now().as_millisecond())?;
         let mut objects = Vec::new();
         {
             let mut stmt = tx.prepare(
@@ -272,6 +285,9 @@ impl SqliteStore {
             store_device,
             store_inode,
             objects: retained,
+            required_outputs,
+            base_oid,
+            write_scopes,
             pin,
         })
     }
@@ -289,7 +305,7 @@ impl SqliteStore {
     }
 
     /// Record the run. A receipt is inserted only when the recheck still matches.
-    /// Attempts and dependency rows are left untouched.
+    /// Scope violations request cancellation atomically; release still requires proof.
     pub(crate) fn commit_verification(
         &mut self,
         target: &VerifyTarget,
@@ -330,6 +346,8 @@ impl SqliteStore {
             return Ok((existing, None));
         }
         let fresh = reload(&tx, target)?;
+        super::contract_binding::require_result_barrier(&tx, &target.task_id, u64::try_from(target.contract_revision).map_err(|_| invalid("invalid contract revision"))?,
+            &target.contract_digest, &target.attempt_id, jiff::Timestamp::now().as_millisecond())?;
         let expected_run = crate::verification::run_identity(
             &target.project_store,
             &draft.idempotency_key,
@@ -437,6 +455,12 @@ impl SqliteStore {
                     now
                 ],
             )?;
+            // Only fresh native acceptance can attest the current contract checks.
+            // Historical replay does not insert or backfill this evidence.
+            let version: u32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            if version >= 43 {
+                tx.execute("INSERT INTO verification_contract_checks(result_id,version) VALUES(?1,2)", [stored_result])?;
+            }
             // Narrative acceptance is not enough; only this stored receipt can satisfy.
             super::satisfaction::record_verified_result(&tx, stored_result)?;
         }
@@ -451,6 +475,15 @@ impl SqliteStore {
                     reason: reason.unwrap_or("rejected").to_string(),
                 },
             )?;
+        }
+        if reason == Some("scope_violation") {
+            let needs_stop: bool = tx.query_row("SELECT termination_observed=0 AND NOT EXISTS(SELECT 1 FROM attempt_cancellations WHERE attempt_id=?1) FROM attempts WHERE id=?1", [&target.attempt_id], |row| row.get(0))?;
+            if needs_stop {
+                let attempt = AttemptId::new(target.attempt_id.clone()).map_err(StoreError::Invalid)?;
+                super::reservations::cancel_attempt_in_transaction(&tx, &attempt,
+                    u64::try_from(fresh.attempt_revision).map_err(|_| invalid("invalid attempt revision"))?,
+                    "verified candidate changed files outside signed write scope", now, None)?;
+            }
         }
         tx.execute(
             "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?1,?2,1,1,?3)",
@@ -610,11 +643,17 @@ impl SqliteStore {
         let installed: i64 = self
             .connection
             .query_row("SELECT max(sequence) FROM events", [], |row| row.get(0))?;
-        let raw = b"contract-v1";
-        let raw_digest = sha256_hex(raw);
         let policy = r#"{"version":1,"checks":["/usr/bin/true"]}"#;
         let oid = "a".repeat(40);
         let base = "b".repeat(40);
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "version":1,"project_store":project_store,"expected_head":0,"task_id":"task","contract_revision":1,
+            "deliverable":"verification fixture","non_goals":"no live work","acceptance_policies":[{"id":"policy-1","text":policy}],
+            "repository":"/tmp/repo","base_oid":base,"object_format":"sha1","dependencies":[],"capability_flags":[],
+            "profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_only",
+            "authority":{"id":"owner-approval-policy","revision":1,"digest":"ab".repeat(32)}
+        })).unwrap();
+        let raw_digest = sha256_hex(&raw);
         let tx = self.connection.transaction()?;
         tx.execute(
             "INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq) VALUES('task',1,NULL,?1,0,?2,?3,'sha1',NULL,'verify_only',?4,?5,?6)",
@@ -657,7 +696,7 @@ impl SqliteStore {
             .ok_or_else(|| invalid("store path is not utf-8"))?
             .to_string();
         let policy = r#"{"version":1,"checks":["/usr/bin/true"]}"#;
-        let raw_digest = sha256_hex(b"contract-v1");
+        let raw_digest = self.connection.query_row("SELECT raw_digest FROM task_contracts WHERE task_id='task' AND contract_revision=1", [], |row| row.get(0))?;
         Ok(VerifyTarget {
             project_store,
             submission_id: "c".repeat(64),
@@ -676,6 +715,9 @@ impl SqliteStore {
             store_device: i64::try_from(meta.dev()).map_err(|_| invalid("store device does not fit"))?,
             store_inode: i64::try_from(meta.ino()).map_err(|_| invalid("store inode does not fit"))?,
             objects: Vec::new(),
+            required_outputs: Vec::new(),
+            base_oid: "a".repeat(40),
+            write_scopes: None,
             pin,
         })
     }
@@ -798,7 +840,7 @@ mod tests {
         let fresh = tempfile::tempdir().unwrap();
         let fresh_path = fresh.path().join("state.db");
         let created = SqliteStore::create(&fresh_path).unwrap();
-        assert_eq!(user_version(&created.connection), 41);
+        assert_eq!(user_version(&created.connection), crate::store::SCHEMA);
         assert!(table_exists(&created.connection, "verification_runs"));
         assert!(table_exists(&created.connection, "verified_results"));
         drop(created);
@@ -809,9 +851,7 @@ mod tests {
         db.import_legacy(&"ab".repeat(32), &[], &[]).unwrap();
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
-        raw.execute_batch(
-            "DROP INDEX IF EXISTS attempts_retained_by_id; DROP TABLE IF EXISTS active_work_index; DROP TABLE IF EXISTS active_work_meta; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_update; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_delete; DROP TRIGGER IF EXISTS barrier_members_no_update; DROP TRIGGER IF EXISTS barrier_members_no_delete; DROP TRIGGER IF EXISTS barrier_revisions_no_membership_update; DROP TABLE IF EXISTS barrier_stale_briefs; DROP TABLE IF EXISTS barrier_members; DROP TABLE IF EXISTS barrier_revisions; DROP TRIGGER IF EXISTS memory_change_receipts_no_update; DROP TRIGGER IF EXISTS memory_change_receipts_no_delete; DROP TRIGGER IF EXISTS update_package_members_no_update; DROP TRIGGER IF EXISTS update_package_members_no_delete; DROP TRIGGER IF EXISTS update_packages_no_update; DROP TRIGGER IF EXISTS update_packages_no_delete; DROP TABLE IF EXISTS memory_change_receipts; DROP TABLE IF EXISTS update_package_members; ALTER TABLE consumer_bindings DROP COLUMN applied_cursor; DROP TABLE IF EXISTS update_packages; DROP TRIGGER IF EXISTS memory_read_set_on_record; DROP TRIGGER IF EXISTS memory_read_set_on_reclassify; DROP TRIGGER IF EXISTS memory_read_set_on_revision; DROP TRIGGER IF EXISTS memory_read_set_on_validity; DROP TRIGGER IF EXISTS memory_read_set_on_head; DROP TABLE IF EXISTS memory_scope_catalog; DROP TABLE IF EXISTS memory_required_generation; DROP TABLE IF EXISTS consumer_binding_undeliverable; DROP TABLE IF EXISTS consumer_binding_obligations; DROP TABLE IF EXISTS consumer_bindings; DROP TABLE IF EXISTS wait_replay_events; DROP TABLE IF EXISTS replan_requests; DROP TABLE IF EXISTS replan_budget_resets; DROP TABLE IF EXISTS attempt_infrastructure_retries; DROP TABLE IF EXISTS wait_conditions; DROP TABLE IF EXISTS resource_claims; DROP TABLE IF EXISTS delegation_stop_obligations; DROP TABLE IF EXISTS delegation_revocations; DROP TABLE IF EXISTS delegation_grants; DROP TABLE IF EXISTS capability_evidence; DROP TABLE IF EXISTS contract_named_resources; DROP TABLE IF EXISTS contract_scope_paths; DROP TABLE IF EXISTS plan_revisions; DROP TABLE IF EXISTS plan_proposals; DROP TABLE IF EXISTS dependency_satisfactions; DROP TABLE IF EXISTS factory_admission_policies; ALTER TABLE project_control DROP COLUMN factory_admission; DROP TABLE IF EXISTS feedback_claims; DROP TABLE IF EXISTS feedback_items; DROP TABLE IF EXISTS integrated_commits; DROP TABLE IF EXISTS integration_candidates; DROP TABLE IF EXISTS integration_operations; DROP TABLE IF EXISTS integration_target_leases; DROP TABLE IF EXISTS integration_targets; DROP TABLE IF EXISTS verified_results; DROP TABLE IF EXISTS verification_runs; UPDATE store_meta SET schema_version = 26; PRAGMA user_version = 26;",
-        )
+        crate::store::test_schema::historical(&raw, 26)
         .unwrap();
         drop(raw);
         let mut db = SqliteStore::open(&path).unwrap();
@@ -823,21 +863,52 @@ mod tests {
             Err(StoreError::UnsupportedSchema(26))
         ));
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 41);
+        assert_eq!(user_version(&db.connection), crate::store::SCHEMA);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            41
+            crate::store::SCHEMA
         );
         assert!(table_exists(&db.connection, "verification_runs"));
         assert!(table_exists(&db.connection, "verified_results"));
         check_schema(&db.connection).unwrap();
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 41);
+        assert_eq!(user_version(&reopened.connection), crate::store::SCHEMA);
         assert!(table_exists(&reopened.connection, "verified_results"));
+    }
+
+    #[test]
+    fn pending_verification_projection_backfills_and_rolls_back_with_runs() {
+        for already_verified in [false,true] {
+            let temp=tempfile::tempdir().unwrap();
+            let mut db=SqliteStore::create(&temp.path().join("state.db")).unwrap();
+            db.seed_rejected_verification().unwrap();
+            assert_eq!(db.admission_backlog_ages().unwrap().0,Some(0));
+            if already_verified {
+                db.testing_poll_rejected_verification().unwrap();
+                assert_eq!(db.admission_backlog_ages().unwrap().0,None);
+            }
+            crate::store::test_schema::historical(&db.connection,42).unwrap();
+            assert!(!table_exists(&db.connection,"pending_verification_work"));
+            db.upgrade_v1().unwrap();
+            assert_eq!(db.admission_backlog_ages().unwrap().0,if already_verified {None} else {Some(0)});
+            if !already_verified {
+                // Feedback is committed after the run and its pending-work
+                // deletion. A failure there must restore the pending job.
+                db.connection.execute_batch("CREATE TRIGGER fail_feedback BEFORE INSERT ON feedback_items BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+                assert!(db.testing_poll_rejected_verification().is_err());
+                assert_eq!(db.admission_backlog_ages().unwrap().0,Some(0));
+                let runs:u64=db.connection.query_row("SELECT count(*) FROM verification_runs",[],|r|r.get(0)).unwrap();
+                assert_eq!(runs,0);
+                db.connection.execute_batch("DROP TRIGGER fail_feedback").unwrap();
+            }
+            db.testing_poll_rejected_verification().unwrap();
+            assert_eq!(db.admission_backlog_ages().unwrap().0,None);
+            db.integrity_check().unwrap();
+        }
     }
 
     #[test]
@@ -932,8 +1003,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
         let first = db.testing_poll_rejected_verification().unwrap();
+        // Model missing historical feedback together with its derived pending
+        // projection. Keep foreign keys enabled: deleting only the canonical
+        // row would create a dangling projection rather than this repair case.
         db.connection
-            .execute_batch("DROP TRIGGER IF EXISTS feedback_items_no_delete; DELETE FROM feedback_items;")
+            .execute_batch("BEGIN; DROP TRIGGER IF EXISTS feedback_items_no_delete; DELETE FROM replan_pending_feedback; DELETE FROM feedback_items; COMMIT;")
             .unwrap();
         assert_eq!(
             db.connection
@@ -943,6 +1017,7 @@ mod tests {
         );
         let repaired = db.testing_poll_rejected_verification().unwrap();
         assert_eq!(repaired.run_id, first.run_id);
+        assert_eq!(db.connection.query_row("SELECT count(*) FROM replan_pending_feedback",[],|row|row.get::<_,i64>(0)).unwrap(),1);
         assert_eq!(
             db.connection
                 .query_row("SELECT count(*) FROM feedback_items", [], |row| row.get::<_, i64>(0))
@@ -956,6 +1031,7 @@ mod tests {
             1
         );
         db.testing_poll_rejected_verification().unwrap();
+        assert_eq!(db.connection.query_row("SELECT count(*) FROM replan_pending_feedback",[],|row|row.get::<_,i64>(0)).unwrap(),1);
         assert_eq!(
             db.connection
                 .query_row("SELECT count(*) FROM feedback_items", [], |row| row.get::<_, i64>(0))

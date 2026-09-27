@@ -6,9 +6,11 @@ the selected dependency behind an opt-in feature; no authority migration has run
 
 ## Ownership and transaction boundary
 
-[Compiled illustrative types](../../contracts/phase_b.rs) separate task state,
-attempt state and terminal presentation. They are included by Cargo integration
-tests, and deliberately do not introduce a second runtime authority in Phase A.
+[Illustrative types](../../contracts/phase_b.rs) separate task state,
+attempt state and terminal presentation. Originally compiled by prototype
+integration tests, they are retained as a historical design reference. The
+2026-09-27 cleanup replaced those tests with production CLI workflow coverage;
+these types do not establish runtime correctness or introduce runtime authority.
 Identifiers for tasks, attempts, operations, snapshots, proposals, results and
 approvals are distinct Rust types. Production constructors and schemas belong to
 W03/W05; these illustrative wrappers do not validate untrusted strings.
@@ -83,8 +85,11 @@ own lockfile and no connection to user state:
 
 ```sh
 CARGO_TARGET_DIR=/tmp/herdr-sqlite-smoke-target cargo run --locked --manifest-path contracts/sqlite-smoke/Cargo.toml
-cargo test --locked --test contracts
 ```
+
+The former `cargo test --locked --test contracts` target was removed in the
+2026-09-27 cleanup. See the [test effectiveness audit](../reviews/2026-09-27-test-effectiveness.md)
+for its production workflow replacements.
 
 This is dependency/interface evidence, not W03 concurrency, WAL recovery or
 power-loss acceptance. W03 must add file-backed transaction/crash tests, busy

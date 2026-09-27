@@ -2,11 +2,11 @@
 //! Rebuilding reads those rows. It does not invent obligations or attempts.
 use super::*;
 use rusqlite::OptionalExtension;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const SCHEMA_VERSION: u32 = 39;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UpdatePackage {
     pub package_id: String,
     pub binding_id: String,
@@ -15,7 +15,8 @@ pub struct UpdatePackage {
     pub change_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdatePackageAck {
     pub schema_version: u32,
     pub package_id: String,
@@ -24,7 +25,7 @@ pub struct UpdatePackageAck {
     pub disposition: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PackageAckReceipt {
     pub package_id: String,
     pub disposition: String,
@@ -32,14 +33,43 @@ pub struct PackageAckReceipt {
     pub sequence: u64,
 }
 
-struct Member {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkerPackageAckReceipt {
+    pub schema_version: u32,
+    pub receipt: PackageAckReceipt,
+    pub evidence_sequence: u64,
+}
+
+#[derive(Serialize)]
+struct WorkerChangeReceipt {
     change_id: String,
-    record_id: String,
-    revision: u64,
-    body_hash: String,
-    severity: String,
-    triggering_seq: u64,
-    snapshot_id: String,
+    manifest_hash: String,
+    sequence: u64,
+}
+
+struct WorkerMembers {
+    package: UpdatePackage,
+    updates: Vec<MemoryUpdate>,
+    receipts: Vec<WorkerChangeReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UpdatePackageMember {
+    pub change_id: String,
+    pub record_id: String,
+    pub revision: u64,
+    pub body_hash: String,
+    pub severity: String,
+    pub triggering_seq: u64,
+    pub snapshot_id: String,
+}
+type Member = UpdatePackageMember;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UpdatePackageManifest {
+    pub schema_version: u32,
+    pub package: UpdatePackage,
+    pub members: Vec<UpdatePackageMember>,
 }
 
 struct BindingRow {
@@ -120,7 +150,8 @@ fn load_binding(db: &Connection, binding_id: &str) -> Result<BindingRow> {
 }
 
 fn unresolved_members(db: &Connection, binding_id: &str) -> Result<Vec<Member>> {
-    let mut stmt = db.prepare(
+    let supersession = supersession_filter(db)?;
+    let mut stmt = db.prepare(&format!(
         "SELECT o.delivery_id, d.record_id, d.revision, v.body_hash, d.severity, d.triggering_seq, d.snapshot_id
          FROM consumer_binding_obligations o
          JOIN memory_delivery_intents d ON d.id=o.delivery_id
@@ -130,8 +161,8 @@ fn unresolved_members(db: &Connection, binding_id: &str) -> Result<Vec<Member>> 
              SELECT 1 FROM memory_change_receipts c
              WHERE c.binding_id=?1 AND c.change_id=o.delivery_id AND c.disposition='applied'
          )
-         ORDER BY o.delivery_id LIMIT 10001",
-    )?;
+         {supersession} ORDER BY o.delivery_id LIMIT 10001"
+    ))?;
     let rows = stmt
         .query_map(params![binding_id], |row| {
             Ok(Member {
@@ -151,12 +182,14 @@ fn unresolved_members(db: &Connection, binding_id: &str) -> Result<Vec<Member>> 
         ));
     }
     let obligations: i64 = db.query_row(
-        "SELECT count(*) FROM consumer_binding_obligations o
+        &format!(
+            "SELECT count(*) FROM consumer_binding_obligations o
          WHERE o.binding_id=?1
          AND NOT EXISTS (
              SELECT 1 FROM memory_change_receipts c
              WHERE c.binding_id=?1 AND c.change_id=o.delivery_id AND c.disposition='applied'
-         )",
+         ) {supersession}"
+        ),
         params![binding_id],
         |row| row.get(0),
     )?;
@@ -166,6 +199,51 @@ fn unresolved_members(db: &Connection, binding_id: &str) -> Result<Vec<Member>> 
         ));
     }
     Ok(rows)
+}
+
+fn supersession_filter(db: &Connection) -> Result<&'static str> {
+    let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    Ok(if version >= 43 {
+        "AND NOT EXISTS(SELECT 1 FROM memory_update_supersessions s WHERE s.binding_id=o.binding_id AND s.change_id=o.delivery_id)"
+    } else {
+        ""
+    })
+}
+
+// Exact indexed lookups let a caller pull a bounded batch without scanning or
+// deleting the rest of a consumer's backlog. Every requested change must belong
+// to this binding and still need an applied receipt.
+fn selected_members(db: &Connection, binding: &str, selected: &[String]) -> Result<Vec<Member>> {
+    let selected = normalize_change_ids(selected)?;
+    let supersession = supersession_filter(db)?;
+    let mut query = db.prepare(&format!(
+        "SELECT o.delivery_id,d.record_id,d.revision,v.body_hash,d.severity,d.triggering_seq,d.snapshot_id
+         FROM consumer_binding_obligations o JOIN memory_delivery_intents d ON d.id=o.delivery_id
+         JOIN memory_revisions v ON v.record_id=d.record_id AND v.revision=d.revision
+         WHERE o.binding_id=?1 AND o.delivery_id=?2 AND NOT EXISTS (
+           SELECT 1 FROM memory_change_receipts c WHERE c.binding_id=?1 AND c.change_id=?2 AND c.disposition='applied') {supersession}"
+    ))?;
+    selected
+        .iter()
+        .map(|change| {
+            query
+                .query_row(params![binding, change], |row| {
+                    Ok(Member {
+                        change_id: row.get(0)?,
+                        record_id: row.get(1)?,
+                        revision: row.get(2)?,
+                        body_hash: row.get(3)?,
+                        severity: row.get(4)?,
+                        triggering_seq: row.get(5)?,
+                        snapshot_id: row.get(6)?,
+                    })
+                })
+                .optional()?
+                .ok_or_else(|| {
+                    invalid("selected change is not an unresolved obligation of this binding")
+                })
+        })
+        .collect()
 }
 
 fn load_package(db: &Connection, package_id: &str) -> Result<Option<UpdatePackage>> {
@@ -204,9 +282,19 @@ fn load_package(db: &Connection, package_id: &str) -> Result<Option<UpdatePackag
 }
 
 fn materialize(tx: &rusqlite::Transaction, binding_id: &str) -> Result<UpdatePackage> {
+    Ok(materialize_parts(tx, binding_id, None)?.0)
+}
+fn materialize_parts(
+    tx: &rusqlite::Transaction,
+    binding_id: &str,
+    selected: Option<&[String]>,
+) -> Result<(UpdatePackage, Vec<Member>)> {
     require_schema(tx)?;
     let binding = load_binding(tx, binding_id)?;
-    let members = unresolved_members(tx, binding_id)?;
+    let members = match selected {
+        Some(changes) => selected_members(tx, binding_id, changes)?,
+        None => unresolved_members(tx, binding_id)?,
+    };
     if members.is_empty() {
         return Err(invalid("no unresolved obligations"));
     }
@@ -226,7 +314,7 @@ fn materialize(tx: &rusqlite::Transaction, binding_id: &str) -> Result<UpdatePac
                 "stored update package does not match its obligations".into(),
             ));
         }
-        return Ok(existing);
+        return Ok((existing, members));
     }
     let generation =
         i64::try_from(binding.generation).map_err(|_| invalid("invalid consumer binding"))?;
@@ -245,13 +333,16 @@ fn materialize(tx: &rusqlite::Transaction, binding_id: &str) -> Result<UpdatePac
             ],
         )?;
     }
-    Ok(UpdatePackage {
-        package_id,
-        binding_id: binding_id.into(),
-        consumer_binding_generation: binding.generation,
-        manifest_hash: manifest,
-        change_ids,
-    })
+    Ok((
+        UpdatePackage {
+            package_id,
+            binding_id: binding_id.into(),
+            consumer_binding_generation: binding.generation,
+            manifest_hash: manifest,
+            change_ids,
+        },
+        members,
+    ))
 }
 
 fn normalize_change_ids(change_ids: &[String]) -> Result<Vec<String>> {
@@ -305,175 +396,76 @@ fn acknowledge(
             "update package generation does not match its binding".into(),
         ));
     }
+    // Package acceptance has its own immutable event. Logical change receipts
+    // retain their original source package even when another package repeats it.
+    // The kind/entity index bounds this lookup to this exact package (at most
+    // one accepted event per disposition), independent of event history.
+    let mut prior = tx.prepare(
+        "SELECT sequence,payload,revision,payload_version FROM events WHERE kind='memory.package_ack' AND entity=?1 ORDER BY sequence LIMIT 3",
+    )?;
+    let events = prior
+        .query_map([&package.package_id], |row| {
+            Ok((
+                row.get::<_, u64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, u64>(3)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if events.len() > 2 {
+        return Err(StoreError::Corrupt(
+            "duplicate package acceptance events".into(),
+        ));
+    }
+    let mut accepted = None;
+    let mut dispositions = std::collections::BTreeSet::new();
+    for (sequence, payload, revision, version) in events {
+        let event: UpdatePackageAck = serde_json::from_str(&payload)
+            .map_err(|_| StoreError::Corrupt("invalid package acceptance event".into()))?;
+        if revision != 1
+            || version != 1
+            || event.schema_version != 1
+            || event.package_id != package.package_id
+            || event.manifest_hash != package.manifest_hash
+            || normalize_change_ids(&event.change_ids)? != expected
+            || !matches!(event.disposition.as_str(), "seen" | "applied")
+            || !dispositions.insert(event.disposition.clone())
+        {
+            return Err(StoreError::Corrupt(
+                "package acceptance event mismatch".into(),
+            ));
+        }
+        if event.disposition == ack.disposition {
+            accepted = Some(sequence);
+        }
+    }
+    drop(prior);
     let mut missing = Vec::new();
-    let mut elsewhere = Vec::new();
-    let mut stored_sequences = Vec::new();
-    for change_id in &package.change_ids {
-        let row: Option<(String, i64)> = tx
+    for change in &package.change_ids {
+        let generation: Option<u64> = tx
             .query_row(
-                "SELECT package_id, sequence FROM memory_change_receipts
-                 WHERE binding_id=?1 AND change_id=?2 AND disposition=?3",
-                params![package.binding_id, change_id, ack.disposition],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT consumer_binding_generation FROM memory_change_receipts
+             WHERE binding_id=?1 AND change_id=?2 AND disposition=?3",
+                params![package.binding_id, change, ack.disposition],
+                |row| row.get(0),
             )
             .optional()?;
-        match row {
-            None => missing.push(change_id.clone()),
-            Some((stored_package, sequence)) if stored_package == package.package_id => {
-                stored_sequences.push(u64::try_from(sequence).map_err(|_| {
-                    StoreError::Corrupt("change receipt sequence is invalid".into())
-                })?);
-            }
-            Some((stored_package, _)) => elsewhere.push((change_id.clone(), stored_package)),
-        }
-    }
-    if missing.is_empty() && stored_sequences.is_empty() {
-        return Err(StoreError::Conflict);
-    }
-    if missing.is_empty() && ack.disposition == "seen" {
-        // Rows this ack inserted share the newest sequence on this package.
-        // A later apply retargets older rows here without changing their sequence.
-        let sequence =
-            stored_sequences.iter().copied().max().ok_or_else(|| {
-                invalid("package acknowledgment must list that package's change ids")
-            })?;
-        return Ok(PackageAckReceipt {
-            package_id: package.package_id.clone(),
-            disposition: ack.disposition.clone(),
-            change_ids: package.change_ids.clone(),
-            sequence,
-        });
-    }
-    if missing.is_empty() && elsewhere.is_empty() {
-        let sequence = stored_sequences[0];
-        if stored_sequences.iter().any(|stored| *stored != sequence) {
-            return Err(StoreError::Corrupt(
-                "package acknowledgment receipts diverged".into(),
-            ));
-        }
-        return Ok(PackageAckReceipt {
-            package_id: package.package_id.clone(),
-            disposition: ack.disposition.clone(),
-            change_ids: package.change_ids.clone(),
-            sequence,
-        });
-    }
-    // A seen ack never moves an existing row onto an older or wider package.
-    if ack.disposition == "seen" {
-        if !stored_sequences.is_empty() && elsewhere.is_empty() {
-            return Err(StoreError::Corrupt(
-                "package acknowledgment receipts are partial".into(),
-            ));
-        }
-    } else if !elsewhere.is_empty() || !stored_sequences.is_empty() {
-        return Err(if elsewhere.is_empty() {
-            StoreError::Corrupt("package acknowledgment receipts are partial".into())
-        } else {
-            StoreError::Conflict
-        });
-    }
-    if ack.disposition == "applied" {
-        let mut revisions_stmt = tx.prepare(
-            "SELECT d.record_id, d.revision FROM update_package_members m
-             JOIN memory_delivery_intents d ON d.id=m.change_id
-             WHERE m.package_id=?1 ORDER BY m.position",
-        )?;
-        let revisions = revisions_stmt
-            .query_map([&package.package_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        drop(revisions_stmt);
-        for (record, revision) in revisions {
-            let revision =
-                u64::try_from(revision).map_err(|_| invalid("invalid change revision"))?;
-            let current: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM memory_heads h JOIN memory_validity v ON v.record_id=h.record_id AND v.revision=h.revision
-                 WHERE h.record_id=?1 AND h.revision=?2 AND h.status='active' AND v.state='valid'
-                 AND (v.expiry_unix_ms IS NULL OR v.expiry_unix_ms>?3))",
-                params![record, i64::try_from(revision).map_err(|_| invalid("invalid change revision"))?, now],
-                |row| row.get(0),
-            )?;
-            if !current {
-                return Err(invalid(
-                    "cannot apply a superseded or invalid memory revision; pull the current update",
+        match generation {
+            None => missing.push(change),
+            Some(generation) if generation == binding.generation => {}
+            Some(_) => {
+                return Err(StoreError::Corrupt(
+                    "change receipt generation mismatch".into(),
                 ));
             }
         }
-        let mut seen_rows = Vec::new();
-        for change_id in &package.change_ids {
-            let seen: Option<String> = tx
-                .query_row(
-                    "SELECT package_id FROM memory_change_receipts WHERE binding_id=?1 AND change_id=?2 AND disposition='seen'",
-                    params![package.binding_id, change_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let Some(seen_package) = seen else {
-                return Err(invalid(
-                    "explicit seen acknowledgment required before applied",
-                ));
-            };
-            seen_rows.push((change_id.clone(), seen_package));
-        }
-        let mut member_stmt =
-            tx.prepare("SELECT change_id FROM update_package_members WHERE package_id=?1")?;
-        for (_change_id, seen_package) in &seen_rows {
-            if seen_package == &package.package_id {
-                continue;
-            }
-            let members = member_stmt
-                .query_map([seen_package], |row| row.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            if members.is_empty()
-                || members
-                    .iter()
-                    .any(|id| !package.change_ids.iter().any(|mine| mine == id))
-            {
-                return Err(StoreError::Conflict);
-            }
-        }
-        drop(member_stmt);
-        let payload = serde_json::to_string(ack).map_err(|error| invalid(&error.to_string()))?;
-        tx.execute(
-            "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('memory.package_ack',?1,1,1,?2)",
-            params![package.package_id, payload],
-        )?;
-        let sequence = head(tx)?;
-        let stored = integer(sequence)?;
-        for (change_id, seen_package) in &seen_rows {
-            if seen_package == &package.package_id {
-                continue;
-            }
-            tx.execute(
-                "UPDATE memory_change_receipts SET package_id=?1
-                 WHERE binding_id=?2 AND change_id=?3 AND disposition='seen'",
-                params![package.package_id, package.binding_id, change_id],
-            )?;
-        }
-        let generation =
-            i64::try_from(binding.generation).map_err(|_| invalid("invalid consumer binding"))?;
-        for change_id in &package.change_ids {
-            tx.execute(
-                "INSERT INTO memory_change_receipts(binding_id,change_id,disposition,consumer_binding_generation,package_id,sequence)
-                 VALUES(?1,?2,'applied',?3,?4,?5)",
-                params![
-                    package.binding_id,
-                    change_id,
-                    generation,
-                    package.package_id,
-                    stored
-                ],
-            )?;
-        }
-        if binding.task_id.is_none() {
-            let updated = tx.execute(
-                "UPDATE consumer_bindings SET applied_cursor=?2 WHERE binding_id=?1 AND task_id IS NULL",
-                params![package.binding_id, package.package_id],
-            )?;
-            if updated != 1 {
-                return Err(StoreError::Conflict);
-            }
+    }
+    if let Some(sequence) = accepted {
+        if !missing.is_empty() {
+            return Err(StoreError::Corrupt(
+                "package acceptance is missing change receipts".into(),
+            ));
         }
         return Ok(PackageAckReceipt {
             package_id: package.package_id,
@@ -482,28 +474,50 @@ fn acknowledge(
             sequence,
         });
     }
+    if ack.disposition == "applied" {
+        for change in &package.change_ids {
+            let eligible: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_delivery_intents d
+                 JOIN memory_heads h ON h.record_id=d.record_id AND h.revision=d.revision
+                 JOIN memory_validity v ON v.record_id=h.record_id AND v.revision=h.revision
+                 WHERE d.id=?1 AND h.status='active' AND v.state='valid'
+                 AND (v.expiry_unix_ms IS NULL OR v.expiry_unix_ms>?2))",
+                params![change, now],
+                |row| row.get(0),
+            )?;
+            if !eligible {
+                return Err(invalid(
+                    "cannot apply a superseded or invalid memory revision; pull the current update",
+                ));
+            }
+            let seen: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_change_receipts WHERE binding_id=?1 AND change_id=?2
+                 AND disposition='seen' AND consumer_binding_generation=?3)",
+                params![package.binding_id, change, integer(binding.generation)?], |row| row.get(0),
+            )?;
+            if !seen {
+                return Err(invalid(
+                    "explicit seen acknowledgment required before applied",
+                ));
+            }
+        }
+    }
     let payload = serde_json::to_string(ack).map_err(|error| invalid(&error.to_string()))?;
     tx.execute(
         "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('memory.package_ack',?1,1,1,?2)",
         params![package.package_id, payload],
     )?;
     let sequence = head(tx)?;
-    let generation =
-        i64::try_from(binding.generation).map_err(|_| invalid("invalid consumer binding"))?;
-    let stored = integer(sequence)?;
-    for change_id in &missing {
+    for change in missing {
         tx.execute(
             "INSERT INTO memory_change_receipts(binding_id,change_id,disposition,consumer_binding_generation,package_id,sequence)
              VALUES(?1,?2,?3,?4,?5,?6)",
-            params![
-                package.binding_id,
-                change_id,
-                ack.disposition,
-                generation,
-                package.package_id,
-                stored
-            ],
+            params![package.binding_id, change, ack.disposition, integer(binding.generation)?, package.package_id, integer(sequence)?],
         )?;
+    }
+    if ack.disposition == "applied" && binding.task_id.is_none() {
+        tx.execute("UPDATE consumer_bindings SET applied_cursor=?2 WHERE binding_id=?1 AND task_id IS NULL",
+            params![package.binding_id, package.package_id])?;
     }
     Ok(PackageAckReceipt {
         package_id: package.package_id,
@@ -513,9 +527,149 @@ fn acknowledge(
     })
 }
 
+// This production worker path aggregates existing exact-change declarations.
+// A caller's package manifest alone is never supporting application evidence.
+fn worker_members(db: &Connection, attempt: &str, ack: &UpdatePackageAck) -> Result<WorkerMembers> {
+    require_schema(db)?;
+    let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < 43 {
+        return Err(StoreError::UnsupportedSchema(version));
+    }
+    if ack.schema_version != 1
+        || !matches!(ack.disposition.as_str(), "seen" | "applied")
+        || !hex64(&ack.package_id)
+        || !hex64(&ack.manifest_hash)
+        || AttemptId::new(attempt).is_err()
+    {
+        return Err(invalid("invalid worker package acknowledgment"));
+    }
+    let package =
+        load_package(db, &ack.package_id)?.ok_or_else(|| invalid("update package is missing"))?;
+    let mut expected = package.change_ids.clone();
+    expected.sort();
+    if package.manifest_hash != ack.manifest_hash
+        || normalize_change_ids(&ack.change_ids)? != expected
+    {
+        return Err(invalid(
+            "worker acknowledgment does not match the exact package",
+        ));
+    }
+    let current: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM consumer_bindings b JOIN attempts a ON a.id=b.attempt_id AND a.task_id=b.task_id
+         JOIN tasks t ON t.id=a.task_id AND t.active_attempt=a.id
+         WHERE b.binding_id=?1 AND b.generation=?2 AND a.id=?3 AND a.snapshot=b.snapshot_id
+         AND b.active=1 AND b.retired=0 AND a.termination_observed=0 AND a.state IN ('running','awaiting_input'))",
+        params![package.binding_id, integer(package.consumer_binding_generation)?, attempt], |row| row.get(0),
+    )?;
+    if !current {
+        return Err(invalid(
+            "package does not belong to the current live worker binding",
+        ));
+    }
+    let mut updates = Vec::with_capacity(package.change_ids.len());
+    let mut receipts = Vec::with_capacity(package.change_ids.len());
+    for change in &package.change_ids {
+        let item = super::memory_receipts::update(db, change, attempt)?;
+        let received: Option<u64> = db.query_row(
+            "SELECT sequence FROM memory_update_receipts WHERE delivery_id=?1 AND attempt_id=?2 AND state=?3 AND manifest_hash=?4",
+            params![change, attempt, ack.disposition, item.manifest_hash], |row| row.get(0),
+        ).optional()?;
+        let sequence = received.ok_or_else(|| {
+            invalid("exact worker change receipts are required before package acknowledgment")
+        })?;
+        receipts.push(WorkerChangeReceipt {
+            change_id: change.clone(),
+            manifest_hash: item.manifest_hash.clone(),
+            sequence,
+        });
+        updates.push(item);
+    }
+    Ok(WorkerMembers {
+        package,
+        updates,
+        receipts,
+    })
+}
+
 impl SqliteStore {
-    // Promotion commits obligations first. Nothing in this process calls the
-    // materializer yet, so a crash before the package row can still rebuild it.
+    pub(crate) fn worker_package_updates(
+        &mut self,
+        attempt: &str,
+        ack: &UpdatePackageAck,
+    ) -> Result<Vec<MemoryUpdate>> {
+        let tx = self.connection.transaction()?;
+        Ok(worker_members(&tx, attempt, ack)?.updates)
+    }
+
+    pub(crate) fn acknowledge_worker_update_package(
+        &mut self,
+        attempt: &str,
+        ack: &UpdatePackageAck,
+        now: i64,
+    ) -> Result<WorkerPackageAckReceipt> {
+        super::delivery::now_check(now)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let members = worker_members(&tx, attempt, ack)?;
+        let receipt = acknowledge(&tx, ack, now)?;
+        let evidence = serde_json::json!({
+            "schema_version": 1, "protocol": "worker-change-declaration-v1",
+            "package_id": ack.package_id, "manifest_hash": ack.manifest_hash,
+            "binding_id": members.package.binding_id,
+            "consumer_binding_generation": members.package.consumer_binding_generation,
+            "attempt_id": attempt, "disposition": ack.disposition,
+            "package_receipt_sequence": receipt.sequence, "receipts": members.receipts,
+        });
+        let existing: Option<(u64, u64)> = tx.query_row(
+            "SELECT package_receipt_sequence,evidence_sequence FROM worker_package_acknowledgments WHERE package_id=?1 AND attempt_id=?2 AND disposition=?3",
+            params![ack.package_id, attempt, ack.disposition], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        let evidence_sequence = if let Some((accepted, sequence)) = existing {
+            let stored: Option<String> = tx.query_row(
+                "SELECT payload FROM events WHERE sequence=?1 AND kind='memory.worker_package_ack' AND entity=?2 AND revision=1 AND payload_version=1",
+                params![integer(sequence)?, ack.package_id], |row| row.get(0),
+            ).optional()?;
+            let stored =
+                stored.and_then(|payload| serde_json::from_str::<serde_json::Value>(&payload).ok());
+            if accepted != receipt.sequence || stored.as_ref() != Some(&evidence) {
+                return Err(StoreError::Corrupt(
+                    "worker package supporting evidence mismatch".into(),
+                ));
+            }
+            sequence
+        } else {
+            let payload =
+                serde_json::to_string(&evidence).map_err(|error| invalid(&error.to_string()))?;
+            if payload.len() > 8 * 1024 * 1024 {
+                return Err(StoreError::Limit(
+                    "worker package evidence exceeds 8 MiB".into(),
+                ));
+            }
+            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('memory.worker_package_ack',?1,1,1,?2)", params![ack.package_id, payload])?;
+            let sequence = head(&tx)?;
+            tx.execute(
+                "INSERT INTO worker_package_acknowledgments VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    ack.package_id,
+                    attempt,
+                    ack.disposition,
+                    integer(receipt.sequence)?,
+                    integer(sequence)?
+                ],
+            )?;
+            sequence
+        };
+        tx.commit()?;
+        Ok(WorkerPackageAckReceipt {
+            schema_version: 1,
+            receipt,
+            evidence_sequence,
+        })
+    }
+
+    /// Promotion commits obligations first; a later pull materializes the same
+    /// immutable package after a crash, without acknowledging any obligation.
     pub fn materialize_update_package(&mut self, binding_id: &str) -> Result<UpdatePackage> {
         if !binding_id_ok(binding_id) {
             return Err(invalid("invalid consumer binding"));
@@ -526,6 +680,45 @@ impl SqliteStore {
         let package = materialize(&tx, binding_id)?;
         tx.commit()?;
         Ok(package)
+    }
+
+    pub fn materialize_update_package_manifest(
+        &mut self,
+        binding_id: &str,
+    ) -> Result<UpdatePackageManifest> {
+        if !binding_id_ok(binding_id) {
+            return Err(invalid("invalid consumer binding"));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (package, members) = materialize_parts(&tx, binding_id, None)?;
+        tx.commit()?;
+        Ok(UpdatePackageManifest {
+            schema_version: 1,
+            package,
+            members,
+        })
+    }
+
+    pub fn materialize_selected_update_package_manifest(
+        &mut self,
+        binding_id: &str,
+        changes: &[String],
+    ) -> Result<UpdatePackageManifest> {
+        if !binding_id_ok(binding_id) {
+            return Err(invalid("invalid consumer binding"));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (package, members) = materialize_parts(&tx, binding_id, Some(changes))?;
+        tx.commit()?;
+        Ok(UpdatePackageManifest {
+            schema_version: 1,
+            package,
+            members,
+        })
     }
 
     pub fn acknowledge_update_package(
@@ -543,11 +736,7 @@ impl SqliteStore {
 
     /// Applied changes for this binding. Not the latest cursor package and not
     /// every change at or below a triggering sequence.
-    pub fn applied_cursor_covers(
-        &mut self,
-        binding_id: &str,
-        change_id: &str,
-    ) -> Result<bool> {
+    pub fn applied_cursor_covers(&mut self, binding_id: &str, change_id: &str) -> Result<bool> {
         if !binding_id_ok(binding_id) {
             return Err(invalid("invalid consumer binding"));
         }
@@ -936,14 +1125,14 @@ mod tests {
     fn create_ends_at_39_and_upgrade_from_38_preserves_worker_receipts() {
         let fresh = tempfile::tempdir().unwrap();
         let created = SqliteStore::create(&fresh.path().join("state.db")).unwrap();
-        assert_eq!(user_version(&created.connection), 41);
+        assert_eq!(user_version(&created.connection), crate::store::SCHEMA);
         assert_eq!(
             created
                 .connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            41
+            crate::store::SCHEMA
         );
         for table in [
             "update_packages",
@@ -991,15 +1180,6 @@ mod tests {
                 .unwrap()
                 .contains("created_seq")
         );
-        let open_fn = include_str!("mod.rs")
-            .split("pub fn open")
-            .nth(1)
-            .unwrap()
-            .split("pub fn integrity_check")
-            .next()
-            .unwrap();
-        assert!(!open_fn.contains("upgrade_v1"));
-        assert!(!open_fn.contains("0039_update_packages"));
         drop(created);
 
         let temp = tempfile::tempdir().unwrap();
@@ -1068,10 +1248,7 @@ mod tests {
         let attempts_before = count(&db.connection, "SELECT count(*) FROM attempts");
         drop(db);
         let raw = rusqlite::Connection::open(&path).unwrap();
-        raw.execute_batch(
-            "DROP INDEX IF EXISTS attempts_retained_by_id; DROP TABLE IF EXISTS active_work_index; DROP TABLE IF EXISTS active_work_meta; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_update; DROP TRIGGER IF EXISTS barrier_stale_briefs_no_delete; DROP TRIGGER IF EXISTS barrier_members_no_update; DROP TRIGGER IF EXISTS barrier_members_no_delete; DROP TRIGGER IF EXISTS barrier_revisions_no_membership_update; DROP TABLE IF EXISTS barrier_stale_briefs; DROP TABLE IF EXISTS barrier_members; DROP TABLE IF EXISTS barrier_revisions; DROP TRIGGER IF EXISTS memory_change_receipts_no_update; DROP TRIGGER IF EXISTS memory_change_receipts_no_delete; DROP TRIGGER IF EXISTS update_package_members_no_update; DROP TRIGGER IF EXISTS update_package_members_no_delete; DROP TRIGGER IF EXISTS update_packages_no_update; DROP TRIGGER IF EXISTS update_packages_no_delete; DROP TABLE IF EXISTS memory_change_receipts; DROP TABLE IF EXISTS update_package_members; ALTER TABLE consumer_bindings DROP COLUMN applied_cursor; DROP TABLE IF EXISTS update_packages; UPDATE store_meta SET schema_version=38; PRAGMA user_version=38;",
-        )
-        .unwrap();
+        crate::store::test_schema::historical(&raw, 38).unwrap();
         drop(raw);
         let mut db = SqliteStore::open(&path).unwrap();
         assert_eq!(user_version(&db.connection), 38);
@@ -1090,13 +1267,13 @@ mod tests {
             }]
         );
         db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), 41);
+        assert_eq!(user_version(&db.connection), crate::store::SCHEMA);
         assert_eq!(
             db.connection
                 .query_row("SELECT schema_version FROM store_meta", [], |row| row
                     .get::<_, u32>(0))
                 .unwrap(),
-            41
+            crate::store::SCHEMA
         );
         let after: (String, String, String, String, i64) = db
             .connection
@@ -1118,7 +1295,7 @@ mod tests {
         check_schema(&db.connection).unwrap();
         drop(db);
         let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), 41);
+        assert_eq!(user_version(&reopened.connection), crate::store::SCHEMA);
     }
 
     fn ack(package: &UpdatePackage, disposition: &str) -> UpdatePackageAck {
@@ -1129,6 +1306,114 @@ mod tests {
             change_ids: package.change_ids.clone(),
             disposition: disposition.into(),
         }
+    }
+
+    #[test]
+    fn selected_packages_preserve_logical_receipts_and_reject_foreign_or_missing_changes() {
+        let (_dir, mut memory) = coordinator();
+        let seq = sequence(&memory, "SELECT max(sequence) FROM events");
+        promote(&mut memory, "change-a", seq);
+        promote(&mut memory, "change-b", seq);
+        let binding = binding(&mut memory);
+        let wide = memory
+            .store
+            .materialize_update_package(&binding.binding_id)
+            .unwrap();
+        let original = memory
+            .store
+            .acknowledge_update_package(&ack(&wide, "seen"), 1)
+            .unwrap();
+        let selected = vec![wide.change_ids[0].clone()];
+        let narrow = memory
+            .store
+            .materialize_selected_update_package_manifest(&binding.binding_id, &selected)
+            .unwrap();
+        assert_eq!(narrow.package.change_ids, selected);
+        let seen = memory
+            .store
+            .acknowledge_update_package(&ack(&narrow.package, "seen"), 1)
+            .unwrap();
+        assert_ne!(seen.sequence, original.sequence);
+        let applied = memory
+            .store
+            .acknowledge_update_package(&ack(&narrow.package, "applied"), 1)
+            .unwrap();
+        assert_eq!(
+            memory
+                .store
+                .acknowledge_update_package(&ack(&narrow.package, "applied"), 1)
+                .unwrap(),
+            applied
+        );
+        assert_eq!(
+            memory
+                .store
+                .acknowledge_update_package(&ack(&wide, "seen"), 1)
+                .unwrap(),
+            original
+        );
+        let source: (String,u64) = memory.store.connection.query_row(
+            "SELECT package_id,sequence FROM memory_change_receipts WHERE change_id=?1 AND disposition='seen'",
+            [&selected[0]], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(source, (wide.package_id.clone(), original.sequence));
+        let remaining = &wide.change_ids[1];
+        assert_eq!(
+            memory
+                .store
+                .materialize_update_package(&binding.binding_id)
+                .unwrap()
+                .change_ids,
+            vec![remaining.clone()]
+        );
+        let before = sequence(&memory, "SELECT max(sequence) FROM events");
+        let packages = count(
+            &memory.store.connection,
+            "SELECT count(*) FROM update_packages",
+        );
+        for invalid in [
+            vec![],
+            selected,
+            vec![remaining.clone(), remaining.clone()],
+            vec![remaining.clone(), "missing".into()],
+        ] {
+            assert!(
+                memory
+                    .store
+                    .materialize_selected_update_package_manifest(&binding.binding_id, &invalid)
+                    .is_err()
+            );
+        }
+        assert!(
+            memory
+                .store
+                .materialize_selected_update_package_manifest(&"f".repeat(64), &[remaining.clone()])
+                .is_err()
+        );
+        assert_eq!(
+            sequence(&memory, "SELECT max(sequence) FROM events"),
+            before
+        );
+        assert_eq!(
+            count(
+                &memory.store.connection,
+                "SELECT count(*) FROM update_packages"
+            ),
+            packages
+        );
+        // A later explicit acknowledgment can reuse identical logical changes;
+        // it cannot alter the receipts or infer membership outside this package.
+        memory
+            .store
+            .acknowledge_update_package(&ack(&wide, "applied"), 1)
+            .unwrap();
+        assert_eq!(
+            memory
+                .store
+                .acknowledge_update_package(&ack(&narrow.package, "applied"), 1)
+                .unwrap(),
+            applied
+        );
     }
 
     #[test]
@@ -1280,7 +1565,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(moved, wider.package_id);
+        assert_eq!(moved, first.package_id);
         let head_after_apply = sequence(&memory, "SELECT max(sequence) FROM events");
         assert_eq!(
             memory
@@ -1294,12 +1579,13 @@ mod tests {
             sequence(&memory, "SELECT max(sequence) FROM events"),
             head_after_apply
         );
-        assert!(matches!(
+        assert_eq!(
             memory
                 .store
-                .acknowledge_update_package(&ack(&first, "seen"), 1),
-            Err(StoreError::Conflict)
-        ));
+                .acknowledge_update_package(&ack(&first, "seen"), 1)
+                .unwrap(),
+            seen_first
+        );
         assert_eq!(
             sequence(&memory, "SELECT max(sequence) FROM events"),
             head_after_apply
@@ -1313,7 +1599,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(stayed, wider.package_id);
+        assert_eq!(stayed, first.package_id);
         let unchanged_members: Vec<String> = memory
             .store
             .connection
@@ -1345,6 +1631,99 @@ mod tests {
             .applied_cursor_covers(&binding.binding_id, "")
             .unwrap_err();
         assert!(matches!(err, StoreError::Invalid(message) if message == "invalid change id"));
+    }
+
+    #[test]
+    fn upgrade_preserves_package_receipts_without_inventing_worker_protocol_evidence() {
+        let (_dir, mut memory) = coordinator();
+        let latest = sequence(&memory, "SELECT max(sequence) FROM events");
+        promote(&mut memory, "change-a", latest);
+        let binding = binding(&mut memory);
+        let package = memory
+            .store
+            .materialize_update_package(&binding.binding_id)
+            .unwrap();
+        let declaration = ack(&package, "seen");
+        let before = memory
+            .store
+            .acknowledge_update_package(&declaration, 1)
+            .unwrap();
+        promote(&mut memory, "change-b", latest);
+        let wider = memory
+            .store
+            .materialize_update_package(&binding.binding_id)
+            .unwrap();
+        let wider_seen = memory
+            .store
+            .acknowledge_update_package(&ack(&wider, "seen"), 1)
+            .unwrap();
+        let wider_applied = memory
+            .store
+            .acknowledge_update_package(&ack(&wider, "applied"), 1)
+            .unwrap();
+        crate::store::test_schema::historical(&memory.store.connection, 42).unwrap();
+        // Schema 39-42 permitted application to retarget a logical seen row.
+        // Preserve that historical source rather than inventing a new receipt
+        // or treating the old package's original acceptance event as missing.
+        memory.store.connection.execute(
+            "UPDATE memory_change_receipts SET package_id=?1 WHERE binding_id=?2 AND disposition='seen'",
+            params![wider.package_id,binding.binding_id],
+        ).unwrap();
+        let before_upgrade = sequence(&memory, "SELECT max(sequence) FROM events");
+        memory.store.upgrade_v1().unwrap();
+        assert_eq!(
+            memory
+                .store
+                .acknowledge_update_package(&declaration, 1)
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            memory
+                .store
+                .acknowledge_update_package(&ack(&wider, "seen"), 1)
+                .unwrap(),
+            wider_seen
+        );
+        assert_eq!(
+            memory
+                .store
+                .acknowledge_update_package(&ack(&wider, "applied"), 1)
+                .unwrap(),
+            wider_applied
+        );
+        assert_eq!(
+            sequence(&memory, "SELECT max(sequence) FROM events"),
+            before_upgrade
+        );
+        assert_eq!(
+            count(
+                &memory.store.connection,
+                "SELECT count(*) FROM memory_change_receipts"
+            ),
+            4
+        );
+        assert!(
+            memory
+                .store
+                .connection
+                .execute("UPDATE memory_change_receipts SET sequence=sequence", [])
+                .is_err()
+        );
+        assert_eq!(
+            count(
+                &memory.store.connection,
+                "SELECT count(*) FROM worker_package_acknowledgments"
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &memory.store.connection,
+                "SELECT count(*) FROM events WHERE kind='memory.worker_package_ack'"
+            ),
+            0
+        );
     }
 
     #[test]

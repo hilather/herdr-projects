@@ -45,7 +45,11 @@ pub fn materialize(
     store_file: &Path,
     objects: &[RetainedObject],
     oid: &str,
+    object_format: &str,
 ) -> Result<Checkout> {
+    if !matches!(object_format, "sha1" | "sha256") {
+        bail!("unsupported Git object format");
+    }
     let work = work.canonicalize().context("verification work directory")?;
     let store_file = store_file.canonicalize().context("project store")?;
     let store_dir = store_file
@@ -68,6 +72,7 @@ pub fn materialize(
         &work,
         &[
             "init".into(),
+            format!("--object-format={object_format}"),
             "--template".into(),
             template.display().to_string(),
             path.display().to_string(),
@@ -155,4 +160,20 @@ fn git_env() -> Vec<(String, String)> {
         ("GIT_COMMITTER_NAME".into(), "verifier".into()),
         ("GIT_COMMITTER_EMAIL".into(), "verifier@example.com".into()),
     ]
+}
+
+/// Compare complete trees without rename folding so both old and new names of
+/// a moved file must be authorized. NUL framing preserves arbitrary Git paths.
+pub(super) fn changed_paths(checkout: &Path, base: &str, candidate: &str) -> Result<Vec<Vec<u8>>> {
+    let output = run(checkout, &[
+        "diff-tree".into(), "--no-commit-id".into(), "--name-only".into(),
+        "--no-renames".into(), "--no-ext-diff".into(), "--no-textconv".into(),
+        "-r".into(), "-z".into(), base.into(), candidate.into(), "--".into(),
+    ], Some(checkout))?;
+    if !output.success() { bail!("candidate scope diff is unavailable or exceeds capture bounds"); }
+    let bytes = output.stdout_bytes;
+    if !bytes.is_empty() && bytes.last() != Some(&0) { bail!("candidate scope diff has invalid framing"); }
+    let paths: Vec<_> = bytes.split(|byte| *byte == 0).filter(|path| !path.is_empty()).map(Vec::from).collect();
+    if paths.len() > 10_000 { bail!("candidate scope diff exceeds 10000 files"); }
+    Ok(paths)
 }

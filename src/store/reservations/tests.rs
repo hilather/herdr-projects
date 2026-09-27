@@ -1,6 +1,6 @@
 use super::*;
 use crate::reconcile::RuntimeObservation;
-fn fixture()->(tempfile::TempDir,SqliteStore,Vec<PreparedLaunch>) {
+pub(in crate::store) fn fixture()->(tempfile::TempDir,SqliteStore,Vec<PreparedLaunch>) {
     fixture_at(15)
 }
 fn fixture_at(version:u32)->(tempfile::TempDir,SqliteStore,Vec<PreparedLaunch>) {
@@ -24,7 +24,7 @@ fn fixture_at(version:u32)->(tempfile::TempDir,SqliteStore,Vec<PreparedLaunch>) 
     let s=db.read_snapshot(None).unwrap();db.set_scheduler_policy(s.head,1,1,3).unwrap();let s=db.read_snapshot(None).unwrap();
     let observations=s.runtime_bindings.iter().map(|b|RuntimeObservation{binding:b.id.clone(),binding_revision:b.revision,task_revision:Some(3),observed_unix_ms:1000,collector:"herdr-git-v1".into(),..RuntimeObservation::default()}).collect::<Vec<_>>();
     db.record_observations(s.head,&observations).unwrap();let s=db.read_snapshot(None).unwrap();db.set_project_state(s.head,s.control.unwrap().revision,ProjectState::Active,1000,None).unwrap();
-    let s=db.read_snapshot(None).unwrap();let mut prepared:Vec<PreparedLaunch>=s.runtime_bindings.iter().map(|b|PreparedLaunch{inputs:LaunchInputs{version:2,project_store:std::fs::canonicalize(&path).unwrap().display().to_string(),task:b.task.clone().unwrap(),task_revision:3,scheduler_revision:s.scheduler.as_ref().unwrap().policy.revision,control_epoch:s.control.as_ref().unwrap().epoch,binding:b.id.clone(),binding_revision:b.revision,binding_digest:super::super::ownership::identity_digest(b).unwrap(),profile:crate::domain::profile::fixture(crate::migration::ConfigReference{path:temp.path().join("config.toml").display().to_string(),digest:None}).reference().unwrap(),effective_profile:Some(crate::domain::profile::fixture(crate::migration::ConfigReference{path:temp.path().join("config.toml").display().to_string(),digest:None})),approval:VersionedReference{id:"fixture-approval".into(),revision:1,digest:"b".repeat(64)},config:crate::migration::ConfigReference{path:temp.path().join("config.toml").display().to_string(),digest:None},repositories:vec![],dependencies:vec![],memory:None,budget:None}}).collect();
+    let s=db.read_snapshot(None).unwrap();let mut prepared:Vec<PreparedLaunch>=s.runtime_bindings.iter().map(|b|PreparedLaunch{inputs:LaunchInputs{task_contract: None, version:2,project_store:std::fs::canonicalize(&path).unwrap().display().to_string(),task:b.task.clone().unwrap(),task_revision:3,scheduler_revision:s.scheduler.as_ref().unwrap().policy.revision,control_epoch:s.control.as_ref().unwrap().epoch,binding:b.id.clone(),binding_revision:b.revision,binding_digest:super::super::ownership::identity_digest(b).unwrap(),profile:crate::domain::profile::fixture(crate::migration::ConfigReference{path:temp.path().join("config.toml").display().to_string(),digest:None}).reference().unwrap(),effective_profile:Some(crate::domain::profile::fixture(crate::migration::ConfigReference{path:temp.path().join("config.toml").display().to_string(),digest:None})),approval:VersionedReference{id:"fixture-approval".into(),revision:1,digest:"b".repeat(64)},config:crate::migration::ConfigReference{path:temp.path().join("config.toml").display().to_string(),digest:None},repositories:vec![],dependencies:vec![],memory:None,budget:None}}).collect();
     for p in &mut prepared {
         let grant=ApprovalGrant{version:1,scope:ApprovalScope::for_launch(&p.inputs).unwrap(),policy:p.inputs.effective_profile.as_ref().unwrap().permission_policy.clone(),issued_unix_ms:0,expires_unix_ms:100_000};
         let head=db.read_snapshot(None).unwrap().head;p.inputs.approval=db.install_approval(&PreparedApproval{grant},head,1000).unwrap();
@@ -76,7 +76,7 @@ fn project_outbox_upgrade_preserves_claims_inputs_and_consumed_approvals() {
         assert!(db.connection.execute("DELETE FROM approval_uses",[]).is_err());
         assert!(db.connection.execute("DELETE FROM attempt_inputs",[]).is_err());
     }
-    db.upgrade_v1().unwrap();before.schema_version=26;
+    db.upgrade_v1().unwrap();before.schema_version=crate::store::SCHEMA;
     assert_eq!(db.read_snapshot(None).unwrap(),before);db.integrity_check().unwrap();
     drop(db);let mut db=SqliteStore::open(&temp.path().join(".state/state.db")).unwrap();
     db.validate_claim(&claim,1001).unwrap();assert_eq!(db.read_snapshot(None).unwrap(),before);
@@ -154,9 +154,9 @@ fn unknown_provider_usage_is_explicit_and_never_an_implicit_zero() {
 #[test]
 fn budget_upgrade_preserves_pending_operations_without_inventing_policy() {
     let(_temp,mut db,p)=fixture();reserve(&mut db,&p);
-    db.connection.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; UPDATE store_meta SET schema_version=13; PRAGMA user_version=13;").unwrap();
+    crate::store::test_schema::historical(&db.connection, 13).unwrap();
     let before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();
-    let after=db.read_snapshot(None).unwrap();assert_eq!(after.schema_version,26);
+    let after=db.read_snapshot(None).unwrap();assert_eq!(after.schema_version,crate::store::SCHEMA);
     assert_eq!(after.events,before.events);assert_eq!(after.attempt_inputs,before.attempt_inputs);
     assert_eq!(after.deliveries,before.deliveries);assert!(after.budget_policies.is_empty());
 }
@@ -198,7 +198,7 @@ fn schema12_launches_upgrade_without_fabricating_grants_or_releasing_capacity() 
     for claimed in [false,true] {
         let(temp,mut db,p)=fixture();let r=reserve(&mut db,&p);
         let claim=claimed.then(||db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap());
-        db.connection.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; UPDATE store_meta SET schema_version=12; PRAGMA user_version=12;").unwrap();
+        crate::store::test_schema::historical(&db.connection, 12).unwrap();
         let before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();let after=db.read_snapshot(None).unwrap();
         assert_eq!(after.head,before.head);assert_eq!(after.events,before.events);assert_eq!(after.attempt_inputs,before.attempt_inputs);assert_eq!(after.deliveries,before.deliveries);assert!(after.approvals.is_empty());
         drop(db);let mut db=SqliteStore::open(&temp.path().join(".state/state.db")).unwrap();
@@ -288,7 +288,7 @@ fn version_one_input_serialization_preserves_historical_identity() {
 #[test]
 fn schema11_upgrade_retains_records_and_blocks_old_format_insertions() {
     let(temp,mut db,p)=fixture();
-    db.connection.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER attempt_inputs_effective_profile; UPDATE store_meta SET schema_version=11; PRAGMA user_version=11;").unwrap();
+    crate::store::test_schema::historical(&db.connection, 11).unwrap();
     // Reproduce a schema-11/v1 historical reservation, before v2's producer existed.
     let old_json=include_str!("../../../tests/fixtures/launch-inputs-v1.json").trim().replace(&"a".repeat(64),&p[0].inputs.binding_digest);
     let inputs:LaunchInputs=serde_json::from_str(&old_json).unwrap();
@@ -308,7 +308,7 @@ fn schema11_upgrade_retains_records_and_blocks_old_format_insertions() {
     let before=db.read_snapshot(None).unwrap();
     assert!(matches!(db.reserve_prepared(&p,before.head,1000),Err(StoreError::UnsupportedSchema(11))));
     db.upgrade_v1().unwrap();let after=db.read_snapshot(None).unwrap();
-    assert_eq!(after.schema_version,26);assert_eq!(after.attempt_inputs,before.attempt_inputs);assert_eq!(after.events,before.events);
+    assert_eq!(after.schema_version,crate::store::SCHEMA);assert_eq!(after.attempt_inputs,before.attempt_inputs);assert_eq!(after.events,before.events);
     assert_eq!(after.head,before.head);
     assert!(db.connection.execute("INSERT INTO attempt_inputs VALUES('old','old','{\"inputs\":{\"version\":1}}',?1)",params!["a".repeat(64)]).is_err());
     assert_eq!(after.attempt_inputs[0],record);
@@ -318,11 +318,57 @@ fn schema11_upgrade_retains_records_and_blocks_old_format_insertions() {
     assert!(db.cancel_attempt(&attempt,1,after.head,"cancel historical reservation",1001).unwrap().released);
 }
 #[test]
+fn capacity_wait_distinguishes_never_claimed_cancellation_from_uncertain_stop() {
+    use crate::domain::WaitTrigger;
+    for claimed in [false,true] {
+        let (_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);
+        if claimed {db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap();}
+        let trigger=WaitTrigger::AttemptCapacityReleased{attempt_id:r.record.attempt.clone(),after_revision:1};
+        let wait=db.register_wait_with_trigger("a",None,"resource_availability",None,Some(&trigger)).unwrap();
+        assert!(!db.replay_wait(&wait.wait_id).unwrap().wake_requested);
+        let cancelled=db.cancel_attempt(&r.record.attempt,1,db.current_head().unwrap(),"capacity trigger",1001).unwrap();
+        assert_eq!(cancelled.released,!claimed);
+        assert_eq!(db.replay_wait(&wait.wait_id).unwrap().wake_requested,!claimed);
+        assert_eq!(db.queue_report(1001).unwrap().available_slots,usize::from(!claimed));
+        if !claimed {
+            let next=db.rearm_wait(&wait.wait_id,None).unwrap();
+            assert!(db.replay_wait(&next.wait_id).unwrap().wake_requested);
+        }
+    }
+}
+
+#[test]
 fn reservation_and_never_claimed_cancellation_survive_restart() {
     let(temp,mut db,p)=fixture();let r=reserve(&mut db,&p);assert_eq!(r.record.inputs.task.as_str(),"a");let s=db.read_snapshot(None).unwrap();assert_eq!(s.attempt_inputs,vec![r.record.clone()]);assert_eq!(s.attempts.len(),1);assert!(s.attempts[0].retains_capacity());assert_eq!(db.queue_report(1000).unwrap().available_slots,0);
     assert!(db.connection.execute("UPDATE attempt_inputs SET payload='{}'",[]).is_err());assert!(db.connection.execute("DELETE FROM attempt_inputs",[]).is_err());
     drop(db);let mut db=SqliteStore::open(&temp.path().join(".state/state.db")).unwrap();let c=db.cancel_attempt(&r.record.attempt,1,r.head,"operator request",1001).unwrap();assert!(c.released);assert_eq!(db.queue_report(1001).unwrap().available_slots,1);assert_eq!(db.deliveries().unwrap()[0].state,DeliveryState::PermanentFailure);assert!(db.claim_operation(&r.record.operation,1,"worker",1002,1000).is_err());let s=db.read_snapshot(None).unwrap();assert_eq!(s.tasks[0].state,TaskState::Cancelled);assert_eq!(s.tasks[0].active_attempt,None);assert!(db.cancel_attempt(&r.record.attempt,c.attempt_revision,c.head,"operator request",1002).unwrap().released);assert_eq!(db.read_snapshot(None).unwrap(),s);
 }
+#[test]
+fn cancellation_reads_only_its_launch_and_keeps_other_retained_attempts() {
+    for other_retained in [false,true] {
+        let(_temp,mut db,p)=fixture();let reserved=reserve(&mut db,&p);
+        // An unrelated retired binding must not force cancellation to decode
+        // historical payloads. Full administrative reads still diagnose it.
+        db.connection.execute("UPDATE runtime_bindings SET payload='{}' WHERE task_id='b'",[]).unwrap();
+        db.connection.execute("INSERT INTO attempts VALUES('other','a',1,'running',NULL,'other-slot',?1)",[!other_retained]).unwrap();
+        let result=db.cancel_attempt(&reserved.record.attempt,1,reserved.head,"operator request",1001).unwrap();
+        assert_eq!(result.released,!other_retained);
+        assert_eq!(read_attempt(&db.connection,&reserved.record.attempt).unwrap().retains_capacity(),other_retained);
+        assert!(db.read_snapshot(None).is_err());
+    }
+}
+
+#[test]
+fn cancellation_rejects_corrupt_selected_binding_without_releasing_capacity() {
+    let(_temp,mut db,p)=fixture();let reserved=reserve(&mut db,&p);
+    db.connection.execute("UPDATE runtime_bindings SET payload='{}' WHERE id=?1",[&reserved.record.inputs.binding]).unwrap();
+    assert!(db.cancel_attempt(&reserved.record.attempt,1,reserved.head,"operator request",1001).is_err());
+    let attempt=read_attempt(&db.connection,&reserved.record.attempt).unwrap();
+    assert!(attempt.retains_capacity());assert_eq!(attempt.revision,1);
+    assert!(read_cancellations(&db.connection).unwrap().is_empty());
+    assert_eq!(head(&db.connection).unwrap(),reserved.head);
+}
+
 #[test]
 fn stale_or_cross_store_preparations_and_rollback_never_leak_reservations() {
     let(_temp,mut db,p)=fixture();let before=db.read_snapshot(None).unwrap();
@@ -347,7 +393,7 @@ fn claim_and_cancellation_race_never_releases_a_claimed_worker() {
 }
 #[test]
 fn orphan_launches_refuse_reads_and_upgrade_rolls_back() {
-    let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);db.connection.execute_batch("DROP TRIGGER attempt_inputs_no_delete; DELETE FROM attempt_inputs;").unwrap();assert!(db.read_snapshot(None).is_err());db.connection.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_inputs; DROP TABLE attempt_cancellations; UPDATE store_meta SET schema_version=10; PRAGMA user_version=10;").unwrap();assert!(db.upgrade_v1().is_err());let version:u32=db.connection.query_row("PRAGMA user_version",[],|r|r.get(0)).unwrap();assert_eq!(version,10);assert_eq!(db.read_snapshot(None).unwrap().operations[0].id,r.record.operation);
+    let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);db.connection.execute_batch("DROP TRIGGER attempt_inputs_no_delete; DELETE FROM attempt_inputs;").unwrap();assert!(db.read_snapshot(None).is_err());crate::store::test_schema::historical(&db.connection, 10).unwrap();assert!(db.upgrade_v1().is_err());let version:u32=db.connection.query_row("PRAGMA user_version",[],|r|r.get(0)).unwrap();assert_eq!(version,10);assert_eq!(db.read_snapshot(None).unwrap().operations[0].id,r.record.operation);
 }
 #[test]
 fn cancellation_without_launch_proof_retains_the_attempt() {
@@ -355,7 +401,7 @@ fn cancellation_without_launch_proof_retains_the_attempt() {
 }
 #[test]
 fn schema10_upgrade_preserves_nonzero_claim_history() {
-    let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap();db.connection.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; DROP TABLE routine_occurrences; DROP TABLE routine_cursors; DROP TABLE routine_revisions; DROP TABLE budget_policies; DROP TABLE approval_uses; DROP TABLE approval_revocations; DROP TABLE approval_grants; DROP TRIGGER operation_delivery_monotonic; DROP TABLE attempt_inputs; DROP TABLE attempt_cancellations; UPDATE operations SET kind='fixture'; UPDATE store_meta SET schema_version=10; PRAGMA user_version=10;").unwrap();let before=db.deliveries().unwrap();db.upgrade_v1().unwrap();assert_eq!(db.deliveries().unwrap(),before);assert!(db.read_snapshot(None).unwrap().attempt_inputs.is_empty());assert!(db.connection.execute("UPDATE operation_delivery SET attempts=0",[]).is_err());
+    let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap();crate::store::test_schema::historical(&db.connection, 10).and_then(|_| db.connection.execute_batch("UPDATE operations SET kind='fixture';")).unwrap();let before=db.deliveries().unwrap();db.upgrade_v1().unwrap();assert_eq!(db.deliveries().unwrap(),before);assert!(db.read_snapshot(None).unwrap().attempt_inputs.is_empty());assert!(db.connection.execute("UPDATE operation_delivery SET attempts=0",[]).is_err());
 }
 #[test]
 fn missing_parent_is_not_hidden_from_an_open_store() {
@@ -372,6 +418,45 @@ fn reservation_crash_child() {
 fn process_death_preserves_whole_reservation_or_original_queue() {
     use std::{process::{Command,Stdio},time::Instant};
     for phase in ["uncommitted","committed"] {let(temp,mut db,p)=fixture();let before=db.read_snapshot(None).unwrap();drop(db);std::fs::write(temp.path().join("inputs.json"),serde_json::to_vec(&p[0].inputs).unwrap()).unwrap();let mut child=Command::new(std::env::current_exe().unwrap()).args(["--exact","store::reservations::tests::reservation_crash_child","--nocapture"]).env("HP_RESERVATION_CRASH_ROOT",temp.path()).env("HP_RESERVATION_CRASH_PHASE",phase).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn().unwrap();let deadline=Instant::now()+Duration::from_secs(10);while !temp.path().join("ready").exists() {if Instant::now()>deadline||child.try_wait().unwrap().is_some(){let _=child.kill();let _=child.wait();panic!("child failed to reach {phase}");}std::thread::sleep(Duration::from_millis(10));}child.kill().unwrap();child.wait().unwrap();let mut db=SqliteStore::open(&temp.path().join(".state/state.db")).unwrap();let after=db.read_snapshot(None).unwrap();if phase=="uncommitted" {assert_eq!(after,before);}else{assert_eq!(after.attempt_inputs.len(),1);assert_eq!(after.operations.len(),1);assert_eq!(after.tasks[0].active_attempt,Some(after.attempts[0].id.clone()));assert_eq!(db.queue_report(1000).unwrap().available_slots,0);assert_eq!(db.deliveries().unwrap()[0].state,DeliveryState::Pending);}}
+}
+
+#[test]
+fn launch_knowledge_fence_does_not_scan_retained_memory_events() {
+    use std::sync::{Arc,atomic::{AtomicU64,Ordering}};
+    let mut work=Vec::new();
+    for history in [0,10_000] {
+        let (_temp,mut db,mut prepared)=fixture();
+        let tx=db.connection.transaction().unwrap();
+        for n in 0..history {
+            // Model retained audit history before this snapshot's selection.
+            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('memory.revision_inserted',?1,1,1,'{}')",[format!("historical-{n}")]).unwrap();
+        }
+        tx.commit().unwrap();
+        let p=&mut prepared[0];
+        let profile=p.inputs.effective_profile.as_ref().unwrap().clone();
+        let snapshot=db.create_memory_snapshot(SnapshotPlan {
+            coordinator:false,session_id:None,request:SnapshotRequest{schema_version:1,task_id:p.inputs.task.as_str().into(),profile:profile.name.clone(),domains:vec![],paths:vec![],pinned_keys:vec![],sensitivity:"default".into()},
+            profile_name:profile.name.clone(),profile_digest:profile.definition_digest.clone(),config_digest:p.inputs.config.digest.clone(),budget_chars:32000,estimator:SELECTION_ESTIMATOR.into(),instructions:"Retained instructions".into(),now_unix_ms:1000,expected_heads_digest:None,
+        }).unwrap();
+        p.inputs.memory=Some(VersionedReference{id:snapshot.id.as_str().into(),revision:1,digest:snapshot.manifest_hash});
+        let steps=Arc::new(AtomicU64::new(0));
+        let observed=steps.clone();
+        db.connection.progress_handler(1,Some(move||{observed.fetch_add(1,Ordering::Relaxed);false}));
+        let budget=super::super::read_budget::ReadBudget::new(super::super::controlled::ReadControl::new(std::time::Instant::now()+Duration::from_secs(10),Default::default()));
+        super::super::worker_knowledge::validate_with_budget(&db.connection,&p.inputs,1000,Some(&budget)).unwrap();
+        db.connection.progress_handler(0,None::<fn()->bool>);
+        work.push(steps.load(Ordering::Relaxed));
+        // The optimized lookup must still fence every relevant event kind.
+        for kind in ["memory.revision_inserted","memory.head_changed","memory.revoked","memory.validity_changed","memory.record_policy_changed","memory.policy_changed","memory.policy_applied"] {
+            db.connection.execute_batch("SAVEPOINT changed_memory").unwrap();
+            db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?1,'later',1,1,'{}')",[kind]).unwrap();
+            assert!(matches!(super::super::worker_knowledge::validate_with_budget(&db.connection,&p.inputs,1000,Some(&budget)),Err(StoreError::Invalid(message)) if message.contains("memory changed after knowledge selection")),"{kind}");
+            db.connection.execute_batch("ROLLBACK TO changed_memory; RELEASE changed_memory").unwrap();
+        }
+        super::super::worker_knowledge::validate_with_budget(&db.connection,&p.inputs,1000,Some(&budget)).unwrap();
+    }
+    eprintln!("launch knowledge validation SQL steps with 0/10000 retained memory events: {work:?}");
+    assert!(work[1]<=work[0]+500,"knowledge validation scanned retained memory history: {work:?}");
 }
 
 #[test]
@@ -833,6 +918,45 @@ fn worker_brief_confirmation_is_atomic_distinct_and_retains_capacity() {
 }
 
 #[test]
+fn brief_authority_reads_only_its_consumed_approval() {
+    use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+    let (_temp, mut db, prepared, _) = brief_fixture();
+    let operation = db.enqueue_worker_brief(&prepared, head(&db.connection).unwrap(), 1003).unwrap();
+    let selected = read_input(&db.connection, &prepared.intent.launch, None).unwrap();
+    let mut grant = super::super::approvals::read_all(&db.connection).unwrap()
+        .into_iter().find(|a| a.reference == selected.inputs.approval).unwrap().grant;
+    let mut work = Vec::new();
+    for history in [0, 10_000] {
+        // Valid unconsumed grants model retained history, not authority for this attempt.
+        let tx = db.connection.transaction().unwrap();
+        for index in 0..history {
+            grant.expires_unix_ms = 200_000 + index;
+            let reference = grant.reference().unwrap();
+            tx.execute("INSERT INTO approval_grants VALUES(?1,?2,?3)",
+                params![reference.id, serde_json::to_string(&grant).unwrap(), reference.digest]).unwrap();
+        }
+        tx.commit().unwrap();
+        let steps = Arc::new(AtomicU64::new(0));
+        let observed = steps.clone();
+        db.connection.progress_handler(1, Some(move || { observed.fetch_add(1, Ordering::Relaxed); false }));
+        let budget = super::super::read_budget::ReadBudget::new(super::super::controlled::ReadControl::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30), crate::runner::Cancellation::default()));
+        let result = super::super::worker_brief::check_with_budget(&db.connection, &operation.id, 1004, Some(&budget));
+        db.connection.progress_handler(0, None::<fn() -> bool>);
+        result.unwrap();
+        work.push(steps.load(Ordering::Relaxed));
+    }
+    eprintln!("brief pre-effect SQL steps with 0/10000 unrelated grants: {work:?}");
+    assert!(work[1] <= work[0] + 500, "brief validation scanned approval history: {work:?}");
+    // Selected corruption must still fail closed; historical claim checks matter
+    // even after a launch has a confirmed delivery.
+    db.connection.execute_batch("DROP TRIGGER approval_uses_no_update").unwrap();
+    db.connection.execute("UPDATE approval_uses SET claim_revision=claim_revision+100 WHERE approval_id=?1",
+        [&selected.inputs.approval.id]).unwrap();
+    assert!(matches!(super::super::worker_brief::check_with_budget(&db.connection, &operation.id, 1004, None), Err(StoreError::Corrupt(_))));
+}
+
+#[test]
 fn brief_claim_and_pre_effect_refuse_revocation_pause_config_changes_and_cancellation() {
     for claimed in [false,true] { for change in 0..4 {
         let(_temp,mut db,prepared,_)=brief_fixture();
@@ -1103,20 +1227,14 @@ fn reservation_requires_current_exact_unconsumed_approval_without_using_it() {
 }
 
 fn plant_verified(db:&SqliteStore,task:&str,attempt:&str,result_id:&str) {
-    let digest="d".repeat(64);let oid="a".repeat(40);
-    let installed:i64=db.connection.query_row("SELECT COALESCE(MAX(sequence),1) FROM events",[],|row|row.get(0)).unwrap();
-    db.connection.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
-    db.connection.execute("INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq) VALUES(?1,1,NULL,'/tmp/project',0,'/tmp/repo',?2,'sha1',NULL,'verify_only',?3,?4,?5)",params![task,oid,vec![b'x'],digest,installed]).unwrap();
-    db.connection.execute("INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,'/tmp/project',?1,?2,?2,?3,1,?2,?4,'policy',?2,?5,?5,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?2,0,0,1)",params![result_id,digest,task,attempt,oid]).unwrap();
-    db.connection.execute("INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?1,?2,?3,?3,'sha1',?2,?2,'linux-unshare-user-pid-mount-v1',0,1)",params![result_id,digest,oid]).unwrap();
-    db.connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    super::super::satisfaction::tests::store_verified_receipt(db,task,attempt,result_id,1,1);
 }
 fn reseal(db:&mut SqliteStore,task_name:&str,dependencies:Vec<DependencyInput>,repositories:Vec<RepositoryInput>,template:&LaunchInputs)->PreparedLaunch {
     let snapshot=db.read_snapshot(None).unwrap();
     let task=snapshot.tasks.iter().find(|task|task.id.as_str()==task_name).unwrap().clone();
     let binding=snapshot.runtime_bindings.iter().find(|binding|binding.task.as_ref()==Some(&task.id)).unwrap();
     let profile=template.effective_profile.clone().unwrap();
-    let mut inputs=LaunchInputs{version:2,project_store:template.project_store.clone(),task:task.id.clone(),task_revision:task.revision,scheduler_revision:snapshot.scheduler.as_ref().unwrap().policy.revision,control_epoch:snapshot.control.as_ref().unwrap().epoch,binding:binding.id.clone(),binding_revision:binding.revision,binding_digest:super::super::ownership::identity_digest(binding).unwrap(),profile:profile.reference().unwrap(),effective_profile:Some(profile.clone()),approval:VersionedReference{id:"unsigned-launch".into(),revision:1,digest:"0".repeat(64)},config:template.config.clone(),repositories,dependencies,memory:None,budget:template.budget.clone()};
+    let mut inputs=LaunchInputs{task_contract: None, version:2,project_store:template.project_store.clone(),task:task.id.clone(),task_revision:task.revision,scheduler_revision:snapshot.scheduler.as_ref().unwrap().policy.revision,control_epoch:snapshot.control.as_ref().unwrap().epoch,binding:binding.id.clone(),binding_revision:binding.revision,binding_digest:super::super::ownership::identity_digest(binding).unwrap(),profile:profile.reference().unwrap(),effective_profile:Some(profile.clone()),approval:VersionedReference{id:"unsigned-launch".into(),revision:1,digest:"0".repeat(64)},config:template.config.clone(),repositories,dependencies,memory:None,budget:template.budget.clone()};
     let grant=ApprovalGrant{version:1,scope:ApprovalScope::for_launch(&inputs).unwrap(),policy:profile.permission_policy,issued_unix_ms:0,expires_unix_ms:100_000};
     inputs.approval=db.install_approval(&PreparedApproval{grant},snapshot.head,1000).unwrap();
     PreparedLaunch{inputs}

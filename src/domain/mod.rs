@@ -4,6 +4,8 @@ pub(crate) mod profile;
 pub use profile::*;
 mod approval;
 pub use approval::*;
+mod wait;
+pub use wait::*;
 mod budget;
 pub use budget::*;
 mod routine;
@@ -22,6 +24,12 @@ mod worktrees;
 pub use worktrees::*;
 mod factory;
 pub use factory::*;
+mod delegated_reservation;
+pub use delegated_reservation::*;
+mod barrier_release;
+pub use barrier_release::*;
+mod barrier_reference;
+pub use barrier_reference::*;
 
 macro_rules! identifier {
     ($($name:ident),+) => { $(

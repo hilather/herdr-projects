@@ -1,0 +1,25 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running unittests src/lib.rs (target/debug/deps/herdr_projects-7f1eae6ae4b48993)
+
+running 1 test
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /tmp/.tmp6KOCpY/repo/.git/
+[master (root-commit) 7b496b8] first
+ 1 file changed, 1 insertion(+)
+ create mode 100644 src/file.txt
+test verification::tests::happy_path_checks_out_retained_objects_and_keeps_capacity ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 623 filtered out; finished in 0.32s
+

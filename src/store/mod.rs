@@ -4,9 +4,10 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{fmt, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 
-pub const SCHEMA: u32 = 41;
+pub const SCHEMA: u32 = 43;
 const APPLICATION: u32 = 1_213_222_994;
-const MIN_SQLITE: i32 = 3_053_004;
+pub const MIN_SQLITE: i32 = 3_053_004;
+pub const MIN_SQLITE_VERSION: &str = "3.53.4";
 /// SQLite's busy handler gives up after this. The watchdog treats the resulting
 /// `Busy` as past the retry bound and pauses admission.
 pub const BUSY_RETRY_BOUND: Duration = Duration::from_millis(250);
@@ -29,7 +30,7 @@ pub enum StoreError {
     Io(String),
 }
 pub mod controlled;
-mod read_budget;
+pub(crate) mod read_budget;
 impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "state store: {self:?}") }
 }
@@ -101,6 +102,8 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../migrations/0039_update_packages.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0040_barriers.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0041_active_work.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0042_wait_subscription.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0043_admission_indexes.sql"))?;
             tx.commit()?;
         }
         // Persist the initial directory entry as well as SQLite's own commit.
@@ -268,7 +271,7 @@ impl SqliteStore {
 }
 use rusqlite::OptionalExtension;
 fn engine_check() -> Result<()> {
-    if rusqlite::version_number() < MIN_SQLITE { return Err(StoreError::Invalid(format!("SQLite 3.53.4+ required; found {}", rusqlite::version()))); }
+    if rusqlite::version_number() < MIN_SQLITE { return Err(StoreError::Invalid(format!("SQLite {MIN_SQLITE_VERSION}+ required; found {}", rusqlite::version()))); }
     Ok(())
 }
 fn connect(path: &Path) -> Result<Connection> {
@@ -316,9 +319,36 @@ fn read_tasks_with_budget(db: &Connection, budget: Option<&read_budget::ReadBudg
     }
     Ok(result)
 }
+/// An indexed prerequisite lookup; unrelated task history is not decoded.
+fn read_task(db: &Connection, id: &str) -> Result<Task> { read_task_with_budget(db,id,None) }
+fn read_task_with_budget(db: &Connection, id: &str, budget: Option<&read_budget::ReadBudget>) -> Result<Task> {
+    let mut stmt = db.prepare("SELECT id,revision,state,title,active_attempt FROM tasks WHERE id=?1")?;
+    let mut rows = stmt.query([id])?;
+    let r = rows.next()?.ok_or(StoreError::Conflict)?;
+    if let Some(budget)=budget {budget.row(r,&[])?;}
+    decode(serde_json::json!({"id":r.get::<_,String>(0)?,"revision":r.get::<_,u64>(1)?,"state":r.get::<_,String>(2)?,"title":r.get::<_,String>(3)?,"active_attempt":r.get::<_,Option<String>>(4)?}))
+}
+fn read_attempt(db:&Connection,id:&AttemptId)->Result<Attempt> {
+    read_attempt_with_budget(db,id,None)
+}
+fn read_attempt_with_budget(db:&Connection,id:&AttemptId,budget:Option<&read_budget::ReadBudget>)->Result<Attempt> {
+    let mut stmt=db.prepare("SELECT id,task_id,revision,state,snapshot,reservation,termination_observed FROM attempts WHERE id=?1")?;
+    let mut rows=stmt.query([id.as_str()])?;
+    let r=rows.next()?.ok_or(StoreError::Conflict)?;
+    if let Some(budget)=budget {budget.row(r,&[])?;}
+    decode(serde_json::json!({"id":r.get::<_,String>(0)?,"task":r.get::<_,String>(1)?,"revision":r.get::<_,u64>(2)?,"state":r.get::<_,String>(3)?,"snapshot":r.get::<_,Option<String>>(4)?,"reservation":r.get::<_,String>(5)?,"termination_observed":r.get::<_,bool>(6)?}))
+}
+fn read_retained_attempts_with_budget(db:&Connection,budget:Option<&read_budget::ReadBudget>)->Result<Vec<Attempt>> {
+    let attempts=read_attempt_rows(db, "SELECT id,task_id,revision,state,snapshot,reservation,termination_observed FROM attempts WHERE termination_observed=0 ORDER BY id LIMIT 1025", budget)?;
+    if attempts.len()>1024 {return Err(StoreError::Limit("retained admission attempt limit exceeded".into()));}
+    Ok(attempts)
+}
 fn read_attempts(db: &Connection) -> Result<Vec<Attempt>> { read_attempts_with_budget(db, None) }
 fn read_attempts_with_budget(db: &Connection, budget: Option<&read_budget::ReadBudget>) -> Result<Vec<Attempt>> {
-    let mut stmt = db.prepare("SELECT id,task_id,revision,state,snapshot,reservation,termination_observed FROM attempts ORDER BY id")?;
+    read_attempt_rows(db, "SELECT id,task_id,revision,state,snapshot,reservation,termination_observed FROM attempts ORDER BY id", budget)
+}
+fn read_attempt_rows(db: &Connection, sql: &str, budget: Option<&read_budget::ReadBudget>) -> Result<Vec<Attempt>> {
+    let mut stmt = db.prepare(sql)?;
     let mut rows = stmt.query([])?;
     let mut result = Vec::new();
     while let Some(r) = rows.next()? {
@@ -408,14 +438,18 @@ mod memory_candidates;
 mod memory_delivery;
 mod consumer_bindings;
 mod memory_receipts;
+mod memory_supersession;
+pub use memory_supersession::{WorkerUpdateSupersession, WorkerUpdateSupersessionReceipt};
 mod update_packages;
 mod memory_barrier;
 mod barriers;
 mod active_work;
 pub use active_work::{ActiveCoverage, ActiveWorkItem, ActiveWorkPage, ActiveWorkRun, ACTIVE_WORK_PAGE};
-pub use barriers::{BarrierMember, FrozenBarrier, ProposalDisposition};
+pub use barriers::{BarrierMember, FrozenBarrier, ProposalDisposition, BarrierStopTurn, service_project_barrier_stops};
+#[cfg(test)]
+pub(crate) use barriers::tests::install_worker_barrier_fixture;
 pub use consumer_bindings::ConsumerBinding;
-pub use update_packages::{PackageAckReceipt, UpdatePackage, UpdatePackageAck};
+pub use update_packages::{PackageAckReceipt, WorkerPackageAckReceipt, UpdatePackage, UpdatePackageAck,UpdatePackageManifest,UpdatePackageMember};
 mod memory_invalidation;
 mod memory_reconciliation;
 mod worker_knowledge;
@@ -434,19 +468,25 @@ mod feedback;
 pub use feedback::{claim_feedback, show_feedback};
 
 mod satisfaction;
+mod contract_binding;
+pub(crate) mod admission_read;
 mod admission_policy;
 #[cfg(test)]
 pub(crate) use satisfaction::{claims_conflict, ResourceClaim};
 
 mod plans;
-pub use plans::{PlanProposalReceipt, propose_plan};
+pub use plans::{PlanIntent,PlanIntentPage,inspect_project_plan,PlannerSession,PlannerInput,PlannerEventInput,create_project_planner_session,show_project_planner_session,AutoReplanControl,ReplanTurn,set_project_auto_replans,service_project_replans,PlanProposalReceipt, propose_plan,WaitTurn,register_project_wait,register_project_wait_with_deadline,register_project_wait_with_trigger,rearm_project_wait,replay_project_wait,request_project_replan,service_project_waits};
 
 mod capabilities;
 
 mod delegation;
+mod delegated_reservation;
 pub use delegation::DelegationReserve;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod verification;
 #[cfg(target_os = "linux")]
 pub(crate) mod integration;
+
+#[cfg(test)]
+pub(crate) mod test_schema;

@@ -311,6 +311,8 @@ fn worktree_inventory_retains_uncertain_paths_and_refuses_corrupt_provenance() {
         // the exact payload/state without relying on an in-process snapshot.
         raw.execute_batch("RELEASE corrupt_inventory").unwrap();
         let error=worktree_inventory(&f.f.project).unwrap_err();
+        let mut selected_budget=crate::store::identity_inventory::Budget::new(50*1024*1024,1024,Instant::now()+Duration::from_secs(10),Default::default()).unwrap();
+        assert!(crate::migration::read_worktree_operation(&f.f.project,&reservation.record.operation,&mut selected_budget).is_err(),"selected provenance accepted {mode}");
         if mode=="oversized" {assert!(error.to_string().contains("exceeds bounds"),"{error}");}
         raw.execute("DELETE FROM events WHERE kind='runtime.worktrees_creation'",[]).unwrap();
         raw.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.worktrees_creation',?1,?2,1,?3)",rusqlite::params![event.entity,event.revision,serde_json::to_string(&event.payload).unwrap()]).unwrap();
@@ -406,6 +408,10 @@ fn worktree_only_stop_fences_late_launch_and_preserves_uncertain_resources() {
         let receipts=crate::worktree_preparation::prepare(&f.f.project,&reservation.record.operation,1,Instant::now()+Duration::from_secs(45),Default::default()).unwrap();
         let target=Path::new(&receipts[0].plan.path);
         let mut db=crate::migration::open_active(&f.f.project).unwrap();
+        let referenced=db.read_snapshot(None).unwrap().attempts[0].clone();
+        let wait=db.register_wait_with_trigger(referenced.task.as_str(),None,"resource_availability",None,
+            Some(&crate::domain::WaitTrigger::AttemptCapacityReleased{attempt_id:referenced.id.clone(),after_revision:referenced.revision})).unwrap();
+        assert!(!db.replay_wait(&wait.wait_id).unwrap().wake_requested);
         let initial=f.state();
         // Active preparation is not a termination hint or permission to stop.
         assert!(crate::canonical_worker::reconcile_termination(&f.f.project,&reservation.record.attempt,initial.attempts[0].revision,Instant::now()+Duration::from_secs(10),Default::default()).unwrap().is_none());
@@ -507,6 +513,12 @@ fn worktree_only_stop_fences_late_launch_and_preserves_uncertain_resources() {
         let mut budget=crate::store::identity_inventory::Budget::new(2*1024*1024,1024,Instant::now()+Duration::from_secs(5),Default::default()).unwrap();
         assert_eq!(crate::migration::read_worktree_inventory(&f.f.project,&mut budget).unwrap(),inventory);
         if mode!="uncreated" {assert_eq!(fs::read_to_string(target.join("file")).unwrap(),if mode=="partial" {"partial result"} else {"original\n"});}
+        assert_eq!(crate::store::service_project_waits(&f.f.project).unwrap().notified,1);
+        assert!(db.replay_wait(&wait.wait_id).unwrap().already_replayed);
+        let renewed=db.rearm_wait(&wait.wait_id,None).unwrap();
+        assert!(db.replay_wait(&renewed.wait_id).unwrap().wake_requested);
+
+
     }
 }
 
@@ -529,4 +541,182 @@ fn preparation_stop_preserves_created_repositories_and_records_uncreated_plans_i
     let manifest:crate::worktree_preservation::Manifest=serde_json::from_slice(&fs::read(directory.join("manifest.json")).unwrap()).unwrap();assert!(manifest.git.as_ref().unwrap().state.index.is_none());
     let file=manifest.entries.iter().find(|e|e.path=="partial.bin").unwrap();assert_eq!(fs::read(directory.join(&file.sha256)).unwrap(),[0,255,9]);assert_eq!(fs::read(present.join("partial.bin")).unwrap(),[0,255,9]);
     assert!(after.attempts[0].termination_observed&&!after.attempts[0].retains_capacity());
+}
+
+#[test]
+fn preparation_capture_releases_sqlite_and_rechecks_selected_state() {
+    for mode in ["unchanged", "head", "task_revision", "cancelled"] {
+        let f = LaunchFixture::new(true);
+        let draft = f.draft();
+        let approval = f.install(&draft);
+        let reservation = f.reserve(&approval).unwrap();
+        crate::worktree_preparation::prepare(&f.f.project, &reservation.record.operation, 1,
+            Instant::now() + Duration::from_secs(45), Default::default()).unwrap();
+        let mut db = crate::migration::open_active(&f.f.project).unwrap();
+        let initial = f.state();
+        db.cancel_attempt(&reservation.record.attempt, initial.attempts[0].revision,
+            initial.head, "capture boundary", crate::canonical_worker::now()).unwrap();
+        let before = f.state();
+        let guard = crate::execution_guard::RootGuard::exclusive(f.f.project.parent().unwrap()).unwrap();
+        let raw = rusqlite::Connection::open(f.f.project.join(".state/state.db")).unwrap();
+        raw.busy_timeout(Duration::ZERO).unwrap();
+        let cancellation = crate::runner::Cancellation::default();
+        let budget = crate::store::read_budget::ReadBudget::new(crate::store::controlled::ReadControl::new(
+            Instant::now() + Duration::from_secs(30), cancellation.clone()));
+        let result = db.stop_worktree_preparation_with_budget(&reservation.record.attempt,
+            before.attempts[0].revision, before.head, &guard, |record, intent| {
+                // A separate writer must be able to commit while preservation runs.
+                // Direct writes model a competing writer bypassing the root guard.
+                raw.execute_batch("BEGIN IMMEDIATE").unwrap();
+                match mode {
+                    "head" => { raw.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('fixture.capture_race','fixture',1,1,'{}')", []).unwrap(); }
+                    "task_revision" => { raw.execute("UPDATE tasks SET revision=revision+1 WHERE id=?1", [before.tasks[0].id.as_str()]).unwrap(); }
+                    _ => {}
+                }
+                raw.execute_batch("COMMIT").unwrap();
+                let captured = crate::worktree_preservation::capture_preparation_held(&f.f.project, &before.events,
+                    record, intent, &guard, &crate::source_tree::Control {
+                        deadline: Instant::now() + Duration::from_secs(10), cancellation: Default::default(),
+                    }).map_err(|e| crate::store::StoreError::Io(format!("capture: {e:#}")))?;
+                if mode == "cancelled" { cancellation.cancel(); }
+                Ok(captured)
+            }, crate::canonical_worker::now(), Some(&budget));
+        let after = f.state();
+        if mode == "unchanged" {
+            assert!(result.unwrap().unwrap().termination_observed);
+            assert!(!after.attempts[0].retains_capacity());
+        } else {
+            if mode == "cancelled" {
+                assert!(matches!(result, Err(crate::store::StoreError::Cancelled)));
+            } else {
+                assert!(matches!(result, Err(crate::store::StoreError::Conflict)), "{mode}: {result:?}");
+            }
+            assert_eq!(after.attempts, before.attempts);
+            assert_eq!(after.deliveries, before.deliveries);
+            assert!(after.attempts[0].retains_capacity());
+            assert!(!after.events.iter().any(|e| e.kind == "runtime.worktrees_stopped"));
+            assert!(f.f.project.join(".state/worktree-file-snapshots").join(reservation.record.attempt.as_str()).exists());
+        }
+    }
+}
+
+#[test]
+fn worktree_preparation_uses_selected_history_through_receipt_commit() {
+    use crate::store::{controlled::{ControlledStore, ReadControl, SqlWork}, StoreError};
+    let f = LaunchFixture::new(true);
+    let draft = f.draft();
+    let approval = f.install(&draft);
+    let reservation = f.reserve(&approval).unwrap();
+    let template=f.state().runtime_bindings[0].clone();
+    let path = f.f.project.join(".state/state.db");
+    let mut raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute("INSERT INTO approval_grants VALUES('cold-worktree-approval','{}',?1)", ["a".repeat(64)]).unwrap();
+    let mut work = Vec::new();
+    for history in [0, 10_000] {
+        let tx = raw.transaction().unwrap();
+        for n in 0..history {
+            let mut retired=template.clone();let task=TaskId::new(format!("retired-worktree-{n}")).unwrap();
+            retired.id=format!("task:{}",task.as_str());retired.task=Some(task.clone());
+            retired.source_path=None;retired.source_digest=None;retired.session_source_digest=None;retired.identity=Default::default();
+            tx.execute("INSERT INTO tasks(id,revision,state,title) VALUES(?1,1,'cancelled','retired')",[task.as_str()]).unwrap();
+            let payload=serde_json::to_string(&retired).unwrap();
+            tx.execute("INSERT INTO runtime_bindings VALUES(?1,?2,1,NULL,?3,?4)",rusqlite::params![retired.id,task.as_str(),payload,format!("{:x}",Sha256::digest(payload.as_bytes()))]).unwrap();
+            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('historical.noise',?1,1,1,'{}')", [format!("worktree-noise-{n}")]).unwrap();
+        }
+        tx.commit().unwrap();
+        let observed = SqlWork::default();
+        let cancellation = crate::runner::Cancellation::default();
+        let mut db = ControlledStore::open_scoped_observed(&path,
+            ReadControl::new(Instant::now() + Duration::from_secs(10), cancellation.clone()), observed.clone()).unwrap();
+        let selected = db.worktree_preparation_selection(&reservation.record.operation, 1).unwrap();
+        assert_eq!(selected.record, reservation.record);
+        assert!(selected.events.is_empty());
+        db.render_attempt_brief(&f.f.project, selected.record.attempt.as_str()).unwrap();
+        work.push(observed.snapshot().sqlite_vm_steps);
+        cancellation.cancel();
+        assert!(matches!(db.worktree_preparation_selection(&reservation.record.operation, 1), Err(StoreError::Cancelled)));
+    }
+    eprintln!("worktree selection/render SQL steps at 0/10000 retained events: {work:?}");
+    assert!(work[1] <= work[0] + 500, "worktree preparation scanned history: {work:?}");
+    let receipts = crate::worktree_preparation::prepare(&f.f.project, &reservation.record.operation, 1,
+        Instant::now() + Duration::from_secs(45), Default::default()).unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(fs::read(Path::new(&receipts[0].plan.path).join("file")).unwrap(), b"original\n");
+    let observed = crate::worktree_preparation::prepare(&f.f.project, &reservation.record.operation, 2,
+        Instant::now() + Duration::from_secs(45), Default::default()).unwrap();
+    assert_eq!(observed, receipts);
+    assert!(crate::migration::open_active(&f.f.project).unwrap().read_snapshot(None).is_err());
+    let ready: u64 = raw.query_row("SELECT count(*) FROM events WHERE entity=?1 AND kind='runtime.worktrees_ready'", [reservation.record.operation.as_str()], |r| r.get(0)).unwrap();
+    assert_eq!(ready, 1);
+}
+
+#[test]
+fn worktree_verification_and_stop_select_only_their_launch_provenance() {
+    use crate::store::identity_inventory::Budget;
+    let budget=||Budget::new(50*1024*1024,2,Instant::now()+Duration::from_secs(10),Default::default()).unwrap();
+    let f=LaunchFixture::new(true);
+    let draft=f.draft();let approval=f.install(&draft);let reservation=f.reserve(&approval).unwrap();
+    let selected=|limits:&mut Budget|crate::migration::read_worktree_operation(&f.f.project,&reservation.record.operation,limits);
+    assert!(selected(&mut budget()).is_err(),"missing creation is not provenance");
+    let receipts=crate::worktree_preparation::prepare(&f.f.project,&reservation.record.operation,1,Instant::now()+Duration::from_secs(45),Default::default()).unwrap();
+    let state=f.state();
+    let expected=vec![(f.selection.binding.clone(),receipts[0].plan.clone())];
+    assert_eq!(selected(&mut budget()).unwrap(),expected);
+    let mut db=crate::migration::open_active(&f.f.project).unwrap();
+    db.cancel_attempt(&reservation.record.attempt,state.attempts[0].revision,state.head,"cancel preparation",crate::canonical_worker::now()).unwrap();
+    let revision=f.state().attempts[0].revision;
+    let mut raw=rusqlite::Connection::open(f.f.project.join(".state/state.db")).unwrap();
+    let tx=raw.transaction().unwrap();
+    for n in 0..10_000 {
+        // Unrelated corrupt provenance must remain an administrative/inventory
+        // error, without blocking verification or cancellation of this launch.
+        tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?1,?2,1,1,'{}')",rusqlite::params![if n%2==0 {"runtime.worktrees_creation"} else {"runtime.worktrees_ready"},format!("cold-worktree-{n}")]).unwrap();
+    }
+    tx.commit().unwrap();
+    assert_eq!(selected(&mut budget()).unwrap(),expected);
+    assert!(worktree_inventory(&f.f.project).is_err());
+    let mut cancelled=budget();cancelled.cancellation.cancel();assert!(selected(&mut cancelled).is_err());
+    {
+        let guard=crate::execution_guard::RootGuard::exclusive(f.f.project.parent().unwrap()).unwrap();
+        crate::worktree_preparation::verify_events_held(&f.f.project,&state.events,&reservation.record,
+            Instant::now()+Duration::from_secs(10),Default::default(),guard.inherit().unwrap()).unwrap().check().unwrap();
+        crate::worktree_preparation::pin_started_events_held(&f.f.project,&state.events,&reservation.record,
+            Instant::now()+Duration::from_secs(10),Default::default()).unwrap().check().unwrap();
+    }
+    let stopped=crate::canonical_worker::reconcile_termination(&f.f.project,&reservation.record.attempt,revision,
+        Instant::now()+Duration::from_secs(20),Default::default()).unwrap().unwrap();
+    assert!(stopped.termination_observed);
+    assert!(!stopped.retains_capacity());
+    assert!(Path::new(&receipts[0].plan.path).exists());
+    let retained:usize=raw.query_row("SELECT count(*) FROM events WHERE kind='runtime.worktrees_stopped' AND entity=?1",[reservation.record.operation.as_str()],|r|r.get(0)).unwrap();
+    assert_eq!(retained,1);
+    assert!(worktree_inventory(&f.f.project).is_err());
+}
+
+#[test]
+fn canonical_worktree_paths_and_aliases_block_before_approval_consumption() {
+    let f=LaunchFixture::new(true);let draft=f.draft();let approval=f.install(&draft);let reservation=f.reserve(&approval).unwrap();
+    let neighbor=f.f.project.parent().unwrap().join("canonical-neighbor");
+    fs::create_dir_all(neighbor.join(".state")).unwrap();fs::create_dir(neighbor.join("threads")).unwrap();
+    fs::write(neighbor.join("PROJECT.md"),"+++\nname = 'Canonical neighbor'\n+++\n").unwrap();
+    fs::write(neighbor.join(".state/project.json"),r#"{"status":"paused"}"#).unwrap();
+    fs::write(neighbor.join(".state/coordinator.json"),"{}").unwrap();
+    let plan=crate::migration::inspect(&neighbor).unwrap();crate::migration::apply(&neighbor,&plan,true).unwrap();
+    let original=crate::runtime::snapshot(&neighbor).unwrap().runtime_bindings.remove(0);
+    let raw=rusqlite::Connection::open(neighbor.join(".state/state.db")).unwrap();
+    let path=Path::new(&draft.worktrees[0].path);
+    let alias=neighbor.join(".state/worktree-alias");std::os::unix::fs::symlink(f.f.project.join(".state"),&alias).unwrap();
+    let before=f.state();
+    for retained in [path.display().to_string(),alias.display().to_string(),path.join("nested").display().to_string()] {
+        let mut binding=original.clone();binding.identity.worktree_path=retained;
+        let payload=serde_json::to_string(&binding).unwrap();
+        raw.execute("UPDATE runtime_bindings SET payload=?1,payload_hash=?2 WHERE id=?3",rusqlite::params![payload,format!("{:x}",Sha256::digest(payload.as_bytes())),binding.id]).unwrap();
+        let error=crate::worktree_preparation::prepare(&f.f.project,&reservation.record.operation,1,Instant::now()+Duration::from_secs(45),Default::default()).unwrap_err();
+        assert!(error.to_string().contains("worktree path is referenced"),"{error:#}");
+        assert_eq!(f.state(),before);assert!(!path.exists());
+    }
+    let payload=serde_json::to_string(&original).unwrap();
+    raw.execute("UPDATE runtime_bindings SET payload=?1,payload_hash=?2 WHERE id=?3",rusqlite::params![payload,format!("{:x}",Sha256::digest(payload.as_bytes())),original.id]).unwrap();
+    let receipts=crate::worktree_preparation::prepare(&f.f.project,&reservation.record.operation,1,Instant::now()+Duration::from_secs(45),Default::default()).unwrap();
+    assert_eq!(receipts.len(),1);assert_eq!(fs::read(path.join("file")).unwrap(),b"original\n");
 }

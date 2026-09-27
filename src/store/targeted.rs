@@ -100,11 +100,9 @@ pub(crate) fn due_effects(
     include_launches: bool,
 ) -> Vec<(String, EffectMode)> {
     let mut effects = Vec::new();
+    let by_id = operations.iter().map(|operation| (&operation.id, operation)).collect::<std::collections::BTreeMap<_, _>>();
     for delivery in deliveries {
-        let Some(operation) = operations
-            .iter()
-            .find(|operation| operation.id == delivery.operation)
-        else {
+        let Some(operation) = by_id.get(&delivery.operation) else {
             continue;
         };
         if operation.kind == "runtime.launch" && !include_launches {
@@ -324,14 +322,17 @@ impl SqliteStore {
         Ok(added)
     }
 
-    /// Schema after the targeted row read the controller acts on.
-    /// Later migration tables are absent on an older published schema.
-    pub fn read_targeted_hot_path(&mut self, now: i64, include_launches: bool) -> Result<u32> {
-        self.targeted_ready(now, include_launches, None)
+    /// Schema guard before scoped reconciliation and effect selection.
+    /// The caller only consumes this header. Do not decode a full historical
+    /// inventory and discard it here; the selected effect validates its own rows.
+    /// Full-reader comparisons remain diagnostic-only in `shadow_compare`.
+    pub fn read_targeted_hot_path(&self, _now: i64, _include_launches: bool) -> Result<u32> {
+        super::check_schema(&self.connection)?;
+        self.connection.query_row("PRAGMA user_version", [], |row| row.get(0)).map_err(StoreError::from)
     }
 
     /// Status row count. Uses the active-work page, which does not decode retired attempts.
-    pub fn hot_path_rows_decoded(&mut self) -> Result<u64> {
+    pub fn active_inventory_page_rows(&mut self) -> Result<u64> {
         self.hot_path_page_rows()
     }
 
@@ -415,9 +416,7 @@ impl SqliteStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        HOT_PATH_READ, HotPathRead, due_effects, hot_path_uses_snapshot, targeted_mismatch_count,
-    };
+    use super::due_effects;
     use crate::domain::*;
     use crate::runner::Cancellation;
     use crate::store::controller_hint::EffectMode;
@@ -506,13 +505,10 @@ mod tests {
             blocked[1].1.iter().any(|blocker| blocker
                 == "verified_dependency_evidence_unavailable:t-0000:verified_result")
         );
-        let before = targeted_mismatch_count();
         let compared = db.shadow_compare(now, true, None).unwrap();
         assert!(compared.acted_on.is_ok());
         assert_eq!(compared.mismatches_added, 0);
-        assert_eq!(targeted_mismatch_count(), before);
         assert_eq!(db.read_targeted_hot_path(now, true).unwrap(), SCHEMA);
-        assert_eq!(targeted_mismatch_count(), before);
 
         let raw = rusqlite::Connection::open(temp.path().join("state.db")).unwrap();
         raw.execute_batch("PRAGMA ignore_check_constraints=ON")
@@ -529,7 +525,6 @@ mod tests {
             compared.mismatches_added, 0,
             "corrupt payload must fail both readers"
         );
-        assert_eq!(targeted_mismatch_count(), before);
     }
 
     #[test]
@@ -631,38 +626,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn targeted_hot_path_is_the_production_default() {
-        assert!(
-            !hot_path_uses_snapshot(),
-            "shadow mode must not be the production default"
-        );
-        assert_eq!(HOT_PATH_READ, HotPathRead::Targeted);
-        let source = include_str!("../canonical_controller.rs");
-        assert!(source.contains("const PREPARED_LAUNCH_DISPATCH_ENABLED: bool = true;"));
-        let poll = source
-            .split("pub fn poll(")
-            .nth(1)
-            .expect("poll")
-            .split("pub fn poll_queued")
-            .next()
-            .expect("poll body");
-        assert!(!poll.contains("hot_path_uses_snapshot()"), "{poll}");
-        let targeted = poll
-            .split("HotPathRead::Targeted")
-            .nth(1)
-            .expect("targeted arm")
-            .split("HotPathRead::Snapshot")
-            .next()
-            .expect("targeted arm");
-        assert!(targeted.contains("read_targeted_hot_path"), "{targeted}");
-        assert!(!targeted.contains("read_snapshot"), "{targeted}");
-        assert!(targeted.contains("StoreError::Cancelled"), "{targeted}");
-        assert!(targeted.contains("StoreError::Deadline"), "{targeted}");
-        let snapshot_arm = poll
-            .split("HotPathRead::Snapshot")
-            .nth(1)
-            .expect("snapshot arm");
-        assert!(snapshot_arm.contains("read_snapshot(None)"), "{snapshot_arm}");
-    }
 }

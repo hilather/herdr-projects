@@ -28,6 +28,10 @@ pub(crate) fn read_object(objects: &Path, id: &ObjectId) -> Result<Vec<u8>, Memo
     read_object_with_budget(objects,id,OBJECT_LIMIT)
 }
 pub(crate) fn read_object_with_budget(objects: &Path, id: &ObjectId, remaining:u64) -> Result<Vec<u8>, MemoryError> {
+    read_object_controlled(objects,id,remaining,None)
+}
+pub(crate) fn read_object_controlled(objects: &Path, id: &ObjectId, remaining:u64, budget:Option<&crate::store::read_budget::ReadBudget>) -> Result<Vec<u8>, MemoryError> {
+    if let Some(budget)=budget {budget.check()?;}
     let unavailable = || MemoryError::EvidenceUnavailable { object: id.clone() };
     let path = objects.join("sha256").join(&id.as_str()[..2]).join(id.as_str());
     let file = OpenOptions::new().read(true)
@@ -37,9 +41,24 @@ pub(crate) fn read_object_with_budget(objects: &Path, id: &ObjectId, remaining:u
     let limit=remaining.min(OBJECT_LIMIT);
     if metadata.len()>limit {return Err(MemoryError::RequiredContentTooLarge {required_bytes:metadata.len(),budget_bytes:limit});}
     let mut bytes = Vec::new();
-    file.take(limit + 1).read_to_end(&mut bytes).map_err(|_| unavailable())?;
+    let mut file=file.take(limit + 1);
+    let mut digest=Sha256::new();
+    let mut chunk=[0u8;65536];
+    loop {
+        if let Some(budget)=budget {budget.check()?;}
+        let count=match file.read(&mut chunk) {
+            Ok(count)=>count,
+            Err(error) if error.kind()==std::io::ErrorKind::Interrupted=>continue,
+            Err(_)=>return Err(unavailable()),
+        };
+        if count==0 {break;}
+        if let Some(budget)=budget {budget.bytes(count)?;}
+        digest.update(&chunk[..count]);
+        bytes.extend_from_slice(&chunk[..count]);
+    }
     if bytes.len() as u64 > limit || bytes.len() as u64 != metadata.len()
-        || format!("{:x}", Sha256::digest(&bytes)) != id.as_str() { return Err(unavailable()); }
+        || format!("{:x}", digest.finalize()) != id.as_str() { return Err(unavailable()); }
+    if let Some(budget)=budget {budget.check()?;}
     Ok(bytes)
 }
 
@@ -78,7 +97,9 @@ mod checkpoint;
 mod delivery;
 mod worker_brief;
 pub use worker_brief::{WorkerBrief, render_attempt_brief, enqueue_attempt_brief};
-pub(crate) use worker_brief::{render_attempt_brief_held, preview_worker_brief};
+pub(crate) use worker_brief::preview_worker_brief;
+pub(crate) use import::{render_attempt_knowledge_budgeted, render_knowledge_snapshot_budgeted};
+pub(crate) use worker_brief::compose_knowledge;
 pub(crate) use worker_brief::{WORKER_BRIEF_ESTIMATOR, framing_chars as worker_brief_framing_chars};
 pub use delivery::*;
 mod proposals;
@@ -198,6 +219,24 @@ mod tests {
         (root, MemoryStore::from_sqlite(store, db.parent().unwrap().join("objects")))
     }
     fn ctx() -> ControlContext { ControlContext { now_unix_ms: 1_000 } }
+    #[test]
+    fn controlled_objects_share_input_budget_and_check_cancellation_before_io() {
+        use crate::store::{controlled::ReadControl,read_budget::ReadBudget,StoreError};
+        use std::time::{Duration,Instant};
+        let (_root,mut memory)=fixture();
+        let body=vec![b'x';128*1024];
+        let id=memory.ingest_object(body.as_slice()).unwrap();
+        let cancel=crate::runner::Cancellation::default();
+        let budget=ReadBudget::new(ReadControl::new(Instant::now()+Duration::from_secs(10),cancel.clone()));
+        assert_eq!(read_object_controlled(&memory.objects,&id,OBJECT_LIMIT,Some(&budget)).unwrap(),body);
+        budget.bytes(budget.remaining_units()-65536).unwrap();
+        assert!(matches!(read_object_controlled(&memory.objects,&id,OBJECT_LIMIT,Some(&budget)),Err(MemoryError::Storage(StoreError::Limit(_)))));
+        cancel.cancel();
+        let missing=ObjectId::from_hex("a".repeat(64)).unwrap();
+        assert!(matches!(read_object_controlled(&memory.objects,&missing,OBJECT_LIMIT,Some(&budget)),Err(MemoryError::Storage(StoreError::Cancelled))));
+        let expired=ReadBudget::new(ReadControl::new(Instant::now(),Default::default()));
+        assert!(matches!(read_object_controlled(&memory.objects,&missing,OBJECT_LIMIT,Some(&expired)),Err(MemoryError::Storage(StoreError::Deadline))));
+    }
     fn revision(id: &str, body: ObjectId, provenance: ObjectId, expected: Option<u64>) -> NewRevision {
         NewRevision {
             id: MemoryRecordId::new(id).unwrap(), record_key: format!("memory/{id}.md"), scope_id: "project".into(),
@@ -263,6 +302,6 @@ mod tests {
 #[cfg(test)]
 mod regression_tests;
 
-pub(crate) use worker_brief::enqueue_attempt_brief_controlled;
 
-pub(crate) use import::render_knowledge_snapshot_held;
+mod barriers;
+pub use barriers::{freeze_memory_barrier,freeze_memory_barrier_file,inspect_memory_barrier};

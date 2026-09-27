@@ -59,6 +59,7 @@ impl SqliteStore {
         let payload=serde_json::to_string(policy).map_err(|_|invalid("memory policy encoding failed"))?;
         tx.execute("INSERT INTO memory_policies VALUES(?1,?2,?3)",params![integer(policy.revision)?,payload,reference.digest])?;
         tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('memory.policy_changed','project-memory-policy',?1,1,?2)",params![integer(policy.revision)?,payload])?;
+        super::barriers::memory_changed(&tx,None,head(&tx)?)?;
         if !matches!(policy.op,MemoryPolicyOp::Cutover) {
             let key=policy.record_key.as_deref().ok_or_else(||invalid("memory policy requires record_key"))?;
             super::memory::apply_memory_op_in_tx(&tx,policy.op,key)?;
@@ -135,9 +136,32 @@ mod tests {
     fn schema16_upgrade_adds_memory_policies_without_inventing_revisions() {
         let temp=tempfile::tempdir().unwrap();let path=temp.path().join("state.db");
         let mut db=SqliteStore::create(&path).unwrap();
-        db.connection.execute_batch("DROP TABLE IF EXISTS result_objects; DROP TABLE IF EXISTS result_submissions; DROP TABLE IF EXISTS acceptance_policies; DROP TABLE IF EXISTS task_contracts; DROP TABLE IF EXISTS native_profiles; DROP TABLE IF EXISTS memory_update_receipts; DROP TABLE IF EXISTS memory_delivery_intents; DROP TABLE IF EXISTS memory_import_decisions; DROP TABLE IF EXISTS memory_import_candidates; DROP TABLE IF EXISTS memory_snapshot_inputs; DROP TABLE memory_invalidations; DROP TABLE memory_promotions; DROP TABLE review_decisions; DROP TABLE proposal_validations; DROP TABLE memory_proposals; DROP TABLE coordinator_checkpoints; DROP TABLE coordinator_sessions; DROP TABLE memory_subscriptions; DROP TABLE snapshot_entries; DROP TABLE memory_snapshots; DROP TABLE memory_validity; DROP TABLE memory_dependencies; DROP TABLE memory_heads; DROP TABLE memory_revisions; DROP TABLE memory_records; DROP TABLE objects; DROP TABLE authority_denials; DROP TABLE memory_policies; UPDATE store_meta SET schema_version=16; PRAGMA user_version=16;").unwrap();
-        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=26;
+        crate::store::test_schema::historical(&db.connection, 16).unwrap();
+        let mut before=db.read_snapshot(None).unwrap();db.upgrade_v1().unwrap();before.schema_version=crate::store::SCHEMA;
         assert_eq!(db.read_snapshot(None).unwrap(),before);assert!(before.memory_policies.is_empty());
         db.integrity_check().unwrap();
     }
+    #[test]
+    fn admission_denials_survive_schema33_upgrade_and_published_schema41_is_repaired() {
+        let temp=tempfile::tempdir().unwrap();
+        let mut db=SqliteStore::create(&temp.path().join("state.db")).unwrap();
+        super::super::test_schema::historical(&db.connection,33).unwrap();
+        let denial=AuthorityDenial{id:"old-admission".into(),unix_ms:1,class:"admission".into(),command:"enable".into(),actor_channel:"cli-owner".into(),reason_code:"authority_missing".into(),policy_digest:"0".repeat(64),expected_head:None,actual_head:Some(0)};
+        db.insert_denial(&denial).unwrap();
+        db.upgrade_v1().unwrap();
+        assert_eq!(db.authority_denials().unwrap(),vec![denial]);
+        // Reproduce the published schema-34..42 CHECK that omitted admission.
+        let temp=tempfile::tempdir().unwrap();
+        let mut old=SqliteStore::create(&temp.path().join("state.db")).unwrap();
+        super::super::test_schema::historical(&old.connection,41).unwrap();
+        let migration=include_str!("../../migrations/0034_delegation_grants.sql");
+        let recreate=migration.split("DROP TRIGGER IF EXISTS authority_denials_no_update;").nth(1).unwrap().split("UPDATE store_meta").next().unwrap();
+        old.connection.execute_batch(&("DROP TRIGGER IF EXISTS authority_denials_no_update;".to_owned()+recreate).replace("'contract','admission','delegation'","'contract','delegation'")).unwrap();
+        let denial=AuthorityDenial{id:"new-admission".into(),unix_ms:2,class:"admission".into(),command:"enable".into(),actor_channel:"cli-owner".into(),reason_code:"authority_missing".into(),policy_digest:"0".repeat(64),expected_head:None,actual_head:Some(0)};
+        assert!(old.insert_denial(&denial).is_err());
+        old.upgrade_v1().unwrap();
+        old.insert_denial(&denial).unwrap();
+        assert_eq!(old.authority_denials().unwrap(),vec![denial]);
+    }
+
 }

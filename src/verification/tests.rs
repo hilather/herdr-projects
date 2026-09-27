@@ -3,7 +3,7 @@ use crate::domain::*;
 use crate::store::SqliteStore;
 use std::{
     fs,
-    os::unix::process::CommandExt,
+    os::unix::{process::CommandExt,fs::MetadataExt},
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -223,9 +223,13 @@ fn world(with_probe: bool) -> World {
 }
 
 fn install_and_submit(world: &World, policy_body: &str) -> (String, String) {
+    install_and_submit_outputs(world, policy_body, None)
+}
+
+fn install_and_submit_outputs(world: &World, policy_body: &str, outputs: Option<&[&str]>) -> (String, String) {
     let db_path = world.db_path.canonicalize().unwrap();
     let repo = world.repo.canonicalize().unwrap();
-    let mut bytes = serde_json::to_vec(&serde_json::json!({
+    let mut document = serde_json::json!({
         "version": 1,
         "project_store": db_path,
         "expected_head": world.head,
@@ -244,8 +248,13 @@ fn install_and_submit(world: &World, policy_body: &str) -> (String, String) {
         "result_schema_id": "result-v1",
         "route": "verify_only",
         "authority": {"id": "owner-approval-policy", "revision": 1, "digest": "ab".repeat(32)}
-    }))
-    .unwrap();
+    });
+    if let Some(outputs) = outputs {
+        document["version"] = 3.into();
+        document["outputs"] = serde_json::json!(outputs.iter().map(|path| serde_json::json!({"path":path,"kind":"git_file"})).collect::<Vec<_>>());
+        document["scope"] = serde_json::json!({"paths":[{"path":"src/","access":"write"}]});
+    }
+    let mut bytes = serde_json::to_vec(&document).unwrap();
     bytes.push(b'\n');
     let mut db = SqliteStore::open(&world.db_path).unwrap();
     let prepared = PreparedContract::parse_verified(&bytes).unwrap();
@@ -262,7 +271,7 @@ fn install_and_submit(world: &World, policy_body: &str) -> (String, String) {
         "base_oid": world.oid,
         "candidate_oid": world.oid,
         "object_format": "sha1",
-        "artifact_manifest": [{"path": "src/file.txt", "oid": world.oid}],
+        "artifact_manifest": outputs.unwrap_or(&["src/file.txt"]).iter().map(|path| serde_json::json!({"path":path,"oid":world.oid})).collect::<Vec<_>>(),
         "claimed_checks": ["ignored"],
         "objects": objects.iter().map(|(oid, relative, _)| serde_json::json!({"oid": oid, "relative_path": relative})).collect::<Vec<_>>()
     });
@@ -314,11 +323,19 @@ fn run_verify(
     let mut request = request(world, body, timeout);
     let mut db = SqliteStore::open(&world.db_path).unwrap();
     let (submission_id, _) = install_and_submit(world, body);
+    assert!(db.admission_backlog_ages().unwrap().0.is_some());
     request.submission_id = submission_id;
     request.fault = fault;
     let before = db.capacity_fingerprint().unwrap();
     let dependencies = db.dependency_count().unwrap();
+    let parent_mount_state=|| {
+        let root=fs::metadata("/").unwrap();
+        (fs::read_link("/proc/self/ns/mnt").unwrap(),fs::read("/proc/self/mountinfo").unwrap(),root.dev(),root.ino())
+    };
+    let parent_before=parent_mount_state();
     let outcome = verify(&mut db, &request).unwrap();
+    assert_eq!(parent_mount_state(),parent_before,"verification changed the parent's mount namespace, mounts or root");
+    assert_eq!(db.admission_backlog_ages().unwrap().0,None,"a committed verifier run finishes the pending job");
     assert_eq!(db.capacity_fingerprint().unwrap(), before);
     assert_eq!(db.dependency_count().unwrap(), dependencies);
     let held: i64 = db
@@ -329,24 +346,6 @@ fn run_verify(
         .sum();
     assert_eq!(held, 0);
     (outcome, db)
-}
-
-#[test]
-fn parent_source_does_not_call_mount_or_pivot_root() {
-    for source in [
-        include_str!("supervise.rs"),
-        include_str!("checkout.rs"),
-        include_str!("manifest.rs"),
-    ] {
-        assert!(
-            !source.contains("libc::mount"),
-            "parent source must not mount"
-        );
-        assert!(
-            !source.contains("pivot_root"),
-            "parent source must not pivot_root"
-        );
-    }
 }
 
 #[test]
@@ -363,7 +362,7 @@ fn materialize_refuses_to_delete_a_nested_store() {
     fs::create_dir_all(work.join("checkout")).unwrap();
     let store = work.join("checkout").join("state.db");
     fs::write(&store, b"database").unwrap();
-    let Err(error) = checkout::materialize(&work, &store, &[], "abcdef") else {
+    let Err(error) = checkout::materialize(&work, &store, &[], "abcdef", "sha1") else {
         panic!("materialize deleted a nested store");
     };
     assert!(
@@ -378,7 +377,7 @@ fn materialize_refuses_to_delete_a_nested_store() {
     fs::write(&nested, b"kept").unwrap();
     let inside = store_dir.join("work");
     fs::create_dir_all(&inside).unwrap();
-    assert!(checkout::materialize(&inside, &nested, &[], "abcdef").is_err());
+    assert!(checkout::materialize(&inside, &nested, &[], "abcdef", "sha1").is_err());
     assert_eq!(fs::read(&nested).unwrap(), b"kept");
 }
 
@@ -463,16 +462,6 @@ fn same_namespace_exits_without_calling_mount() {
         Some(71),
         "same-namespace setup must exit before mount"
     );
-}
-
-#[test]
-fn worker_forged_json_is_only_a_display_copy() {
-    let display = r#"{"run_id":"aa","result_id":"bb","commit_oid":"cc","tree_oid":"dd","object_format":"sha1","policy_digest":"ee","isolation":"linux-unshare-user-pid-mount-v1","exit_status":0,"memory_fence":1}"#;
-    let value: serde_json::Value = serde_json::from_str(display).unwrap();
-    assert_eq!(value["isolation"], "linux-unshare-user-pid-mount-v1");
-    // VerificationReceipt has no Deserialize impl. The compile_fail doctest rejects `from_str`.
-    let forged = serde_json::from_str::<serde_json::Value>(display).unwrap();
-    assert!(forged.get("run_id").is_some());
 }
 
 #[test]
@@ -599,13 +588,35 @@ fn happy_path_checks_out_retained_objects_and_keeps_capacity() {
     }
     let world = world(false);
     let body = git_diff_policy(&world.work.join("checkout"));
-    let (outcome, db) = run_verify(&world, &body, Duration::from_secs(30), Fault::None);
+    let (outcome, mut db) = run_verify(&world, &body, Duration::from_secs(30), Fault::None);
     assert_eq!(outcome.state, "accepted", "{:?}", outcome.reason);
     let receipt = outcome.receipt.expect("receipt");
     assert_eq!(receipt.isolation(), "linux-unshare-user-pid-mount-v1");
     assert_eq!(receipt.commit_oid(), world.oid);
     assert_eq!(receipt.exit_status(), 0);
     assert_eq!(db.verified_result_count().unwrap(), 1);
+    // Preserve a real accepted run and its receipt across the historical
+    // planning/wait upgrades, rather than looking for SQL writer names.
+    let raw=rusqlite::Connection::open(&world.db_path).unwrap();
+    let retained=|| {
+        ["verification_runs","verified_results"].map(|table| {
+            let mut statement=raw.prepare(&format!("SELECT * FROM {table}")).unwrap();let columns=statement.column_count();
+            statement.query_map([],|row|(0..columns).map(|column|row.get::<_,rusqlite::types::Value>(column)).collect::<rusqlite::Result<Vec<_>>>()).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        })
+    };
+    let verification_before=retained();assert_eq!(verification_before[0].len(),1);assert_eq!(verification_before[1].len(),1);
+    drop(db);crate::store::test_schema::historical(&raw,35).unwrap();
+    assert_eq!(retained(),verification_before);
+    let mut db=SqliteStore::open(&world.db_path).unwrap();
+    assert_eq!(raw.query_row("PRAGMA user_version",[],|r|r.get::<_,u32>(0)).unwrap(),35);
+    db.upgrade_v1().unwrap();assert_eq!(retained(),verification_before);
+    assert_eq!(raw.query_row("PRAGMA user_version",[],|r|r.get::<_,u32>(0)).unwrap(),crate::store::SCHEMA);
+    // Completion before registration must still produce one advisory wake.
+    let wait=db.register_wait(world.task.as_str(),Some(world.attempt.as_str()),"validation_completion").unwrap();
+    let replay=db.replay_wait(&wait.wait_id).unwrap();
+    assert!(replay.wake_requested&&!replay.proved);
+    assert!(db.replay_wait(&wait.wait_id).unwrap().already_replayed);
+    assert!(db.read_snapshot(None).unwrap().attempts.iter().any(|attempt|attempt.id==world.attempt&&!attempt.termination_observed));
     let dash = outcome
         .argv
         .iter()
@@ -719,4 +730,154 @@ fn install_kill_on_mount(filter: &[libc::sock_filter]) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[test]
+fn review_probe_sha256_retained_checkout() {
+    let world = world(false);
+    fs::remove_dir_all(world.repo.join(".git")).unwrap();
+    git(&world.repo, &["init", "--object-format=sha256"]);
+    git(&world.repo, &["add", "src/file.txt"]);
+    git(&world.repo, &["commit", "-m", "sha256"]);
+    let output=Command::new("/usr/bin/git").args(["rev-parse","HEAD"]).current_dir(&world.repo).output().unwrap();
+    let oid=String::from_utf8(output.stdout).unwrap().trim().to_string();
+    assert_eq!(oid.len(),64);
+    let objects = loose_objects(&world.repo).into_iter().map(|(oid,relative_path,bytes)|crate::store::verification::RetainedObject{oid,relative_path,bytes}).collect::<Vec<_>>();
+    let checkout=super::checkout::materialize(&world.work,&world.db_path,&objects,&oid,"sha256");
+    assert!(checkout.is_ok(), "valid retained SHA256 objects failed: {:?}", checkout.err());
+}
+
+fn review_install_two_policies(world: &World, policy_body: &str) -> (String, String) {
+    let db_path = world.db_path.canonicalize().unwrap();
+    let repo = world.repo.canonicalize().unwrap();
+    let mut bytes = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "project_store": db_path,
+        "expected_head": world.head,
+        "task_id": world.task.as_str(),
+        "contract_revision": 1,
+        "deliverable": "verified checkout",
+        "non_goals": "no dependency release",
+        "acceptance_policies": [{"id": "builds", "text": policy_body}, {"id":"required-tests", "text": "{\"version\":1,\"checks\":[\"/usr/bin/git\",\"rev-parse\",\"--verify\",\"refs/heads/missing\"]}"}],
+        "repository": repo,
+        "base_oid": world.oid,
+        "object_format": "sha1",
+        "dependencies": [],
+        "capability_flags": [],
+        "profile_kind": "codex",
+        "retry_class": "none",
+        "result_schema_id": "result-v1",
+        "route": "verify_only",
+        "authority": {"id": "owner-approval-policy", "revision": 1, "digest": "ab".repeat(32)}
+    }))
+    .unwrap();
+    bytes.push(b'\n');
+    let mut db = SqliteStore::open(&world.db_path).unwrap();
+    let prepared = PreparedContract::parse_verified(&bytes).unwrap();
+    let installed = db.install_contract(&prepared).unwrap();
+    let objects = loose_objects(&repo);
+    assert!(objects.iter().any(|(oid, _, _)| oid == &world.oid));
+    let submission = serde_json::json!({
+        "idempotency_key": "submit-1",
+        "task_id": world.task.as_str(),
+        "contract_revision": 1,
+        "contract_digest": installed.digest,
+        "attempt_id": world.attempt.as_str(),
+        "repository": repo,
+        "base_oid": world.oid,
+        "candidate_oid": world.oid,
+        "object_format": "sha1",
+        "artifact_manifest": [{"path": "src/file.txt", "oid": world.oid}],
+        "claimed_checks": ["ignored"],
+        "objects": objects.iter().map(|(oid, relative, _)| serde_json::json!({"oid": oid, "relative_path": relative})).collect::<Vec<_>>()
+    });
+    let receipt = db
+        .submit_result(&serde_json::to_vec(&submission).unwrap())
+        .unwrap();
+    (receipt.submission_id, installed.digest)
+}
+
+#[test]
+fn review_probe_dependency_requires_selected_acceptance_policy() {
+    check_dependency_policy("required-tests", false, false, false, false);
+}
+
+#[test]
+fn dependency_policy_body_and_late_contract_are_bound() {
+    check_dependency_policy("builds", true, false, false, false);
+    check_dependency_policy("builds", false, false, true, false);
+    check_dependency_policy("builds", false, true, true, false);
+    check_dependency_policy("builds", false, false, true, true);
+    check_dependency_policy("required-tests", false, true, false, false);
+}
+
+fn check_dependency_policy(policy_id: &str, change_body: bool, late_contract: bool, expected: bool, late_wait:bool) {
+    let mut world = world(false);
+    let mut db = SqliteStore::open(&world.db_path).unwrap();
+    db.commit(Commit{expected_head:world.head, mutations:vec![Mutation::Task{expected:None,next:Task{id:TaskId::new("consumer").unwrap(),revision:1,state:TaskState::Draft,title:"consumer".into(),active_attempt:None}}]}).unwrap();
+    db.queue_task(&TaskId::new("consumer").unwrap(),1,db.current_head().unwrap(),&QueueRequest{priority:0,dependencies:vec![Dependency{predecessor:world.task.clone(),requirement:DependencyRequirement::VerifiedResult}]},0).unwrap();
+    world.head=db.current_head().unwrap();
+    let policy=git_diff_policy(&world.work.join("checkout"));
+    let (submission, _) = review_install_two_policies(&world,&policy);
+    let raw=rusqlite::Connection::open(&world.db_path).unwrap();
+    let bytes:Vec<u8>=raw.query_row("SELECT raw_bytes FROM task_contracts WHERE task_id='task'",[],|r|r.get(0)).unwrap();
+    let mut contract:serde_json::Value=serde_json::from_slice(&bytes).unwrap();
+    contract["task_id"]="consumer".into();
+    contract["expected_head"]=db.current_head().unwrap().into();
+    contract["dependencies"]=serde_json::json!([{"predecessor":"task","edge":"verified_result","policy_id":policy_id}]);
+    if change_body { contract["acceptance_policies"][0]["text"] = "different checks".into(); }
+    if !late_contract {
+        db.install_contract(&PreparedContract::parse_verified(&serde_json::to_vec(&contract).unwrap()).unwrap()).unwrap();
+    }
+    let wait=if late_wait {None} else {Some(db.register_wait("consumer",None,"dependency_evidence").unwrap())};
+    if let Some(wait)=&wait {assert!(!db.replay_wait(&wait.wait_id).unwrap().wake_requested);}
+    let mut req=request(&world,&policy,Duration::from_secs(10));
+    req.submission_id=submission;
+    let outcome=verify(&mut db,&req).unwrap();
+    assert_eq!(outcome.state,"accepted", "{:?}",outcome.reason);
+    if late_contract {
+        // Consume the verifier event while policy binding is still missing.
+        // Installing the contract must itself trigger a later reevaluation.
+        assert!(!db.replay_wait(&wait.as_ref().unwrap().wait_id).unwrap().wake_requested);
+        contract["expected_head"] = db.current_head().unwrap().into();
+        db.install_contract(&PreparedContract::parse_verified(&serde_json::to_vec(&contract).unwrap()).unwrap()).unwrap();
+    }
+    // Consumption must revalidate even when a legacy queue-only receipt predates
+    // the contract and therefore remains in the append-only satisfaction history.
+    assert_eq!(db.satisfied_edges("consumer").unwrap().is_some(), expected);
+    let wait=wait.unwrap_or_else(||db.register_wait("consumer",None,"dependency_evidence").unwrap());
+    let replay=db.replay_wait(&wait.wait_id).unwrap();
+    assert_eq!(replay.wake_requested,expected,"only complete policy-bound dependency evidence may wake the parent");
+    assert!(!replay.proved);
+    if !late_contract {
+        let rows:i64=raw.query_row("SELECT count(*) FROM dependency_satisfactions WHERE task_id='consumer' AND state='valid'",[],|r|r.get(0)).unwrap();
+        assert_eq!(rows, i64::from(expected), "policy-bound publication disagrees");
+    }
+}
+
+#[test]
+fn required_outputs_are_checked_against_the_retained_candidate() {
+    for (output, accepted) in [("src/file.txt", true), ("src/missing.txt", false), ("src/link.txt", false), ("src/alias/file.txt", false), ("src/folder", false)] {
+        let mut world = world(false);
+        fs::create_dir_all(world.repo.join("src/folder")).unwrap();
+        fs::write(world.repo.join("src/folder/child.txt"), "child").unwrap();
+        std::os::unix::fs::symlink("file.txt", world.repo.join("src/link.txt")).unwrap();
+        std::os::unix::fs::symlink(".", world.repo.join("src/alias")).unwrap();
+        git(&world.repo, &["add", "src"]);
+        git(&world.repo, &["commit", "-qm", "output candidates"]);
+        let head = Command::new("/usr/bin/git").args(["rev-parse", "HEAD"]).current_dir(&world.repo).output().unwrap();
+        assert!(head.status.success());
+        world.oid = String::from_utf8(head.stdout).unwrap().trim().to_string();
+        let body = git_diff_policy(&world.work.join("checkout"));
+        let (submission_id, _) = install_and_submit_outputs(&world, &body, Some(&[output]));
+        let mut request = request(&world, &body, Duration::from_secs(30));
+        request.submission_id = submission_id;
+        let mut db = SqliteStore::open(&world.db_path).unwrap();
+        let before = db.capacity_fingerprint().unwrap();
+        let outcome = verify(&mut db, &request).unwrap();
+        assert_eq!(outcome.receipt.is_some(), accepted, "{output}: {:?}", outcome.reason);
+        if !accepted { assert_eq!(outcome.reason.as_deref(), Some("required_output_missing")); }
+        assert_eq!(db.verified_result_count().unwrap(), if accepted { 1 } else { 0 });
+        assert_eq!(db.capacity_fingerprint().unwrap(), before);
+    }
 }

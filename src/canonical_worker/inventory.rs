@@ -93,7 +93,7 @@ pub(super) fn check(
         let canonical =
             exists(&dir.join(".state/format.json"))? || exists(&dir.join(".state/migration"))?;
         if canonical {
-            for other in crate::migration::read_identity_inventory(&dir, &mut budget)? {
+            for other in crate::migration::read_pane_bindings(&dir, &target.pane_id, &mut budget)? {
                 if dir == project && other.id == binding {
                     continue;
                 }
@@ -104,7 +104,7 @@ pub(super) fn check(
                 )?;
             }
             for (owner, target) in
-                crate::migration::read_launch_target_inventory(&dir, &mut budget)?
+                crate::migration::read_pane_targets(&dir, &target.pane_id, &mut budget)?
             {
                 if dir == project && owner == binding {
                     continue;
@@ -185,7 +185,7 @@ pub(crate) fn check_worktrees(
         if !kind.is_dir(){continue;}let dir=entry.path();if !exists(&dir.join(".state"))?{continue;}
         ensure!(fs::symlink_metadata(dir.join(".state"))?.is_dir(),"worktree project state is aliased");
         if exists(&dir.join(".state/format.json"))?||exists(&dir.join(".state/migration"))? {
-            for other in crate::migration::read_identity_inventory(&dir,&mut budget)? {
+            for other in crate::migration::read_worktree_bindings(&dir,&mut budget)? {
                 if dir==project&&other.id==binding{continue;}
                 check(&other.identity.machine,&other.identity.worktree_path)?;
             }

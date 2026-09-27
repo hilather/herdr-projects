@@ -117,18 +117,13 @@ pub fn schedule(project:&Path,name:&str,expected_head:u64)->Result<Option<Routin
 #[derive(Default)]
 pub struct ScheduleTurn {pub active:bool,pub diagnostic:Option<String>}
 pub fn schedule_turn(project:&Path,turn:u64)->Result<ScheduleTurn> {
-    use crate::domain::ProjectState;
     let _guard=migration::runtime_mutation(project)?;
-    let mut db=migration::open_active(project)?;
-    let snapshot=db.read_snapshot(None)?;
-    if snapshot.schema_version<16 || snapshot.control.as_ref().is_none_or(|c|c.state!=ProjectState::Active||c.reconciliation_required) {return Ok(ScheduleTurn::default());}
-    let mut latest=std::collections::BTreeMap::new();
-    for d in snapshot.routine_revisions {latest.insert(d.name.clone(),d);}
-    let enabled:Vec<_>=latest.into_values().filter(|d|d.enabled).collect();
-    if enabled.is_empty() {return Ok(ScheduleTurn::default());}
-    let definition=enabled[(turn%enabled.len() as u64) as usize].clone();
+    let control=crate::store::controlled::ReadControl::new(std::time::Instant::now()+std::time::Duration::from_secs(2),Default::default());
+    let mut db=migration::open_active_scoped(project,control)?;
+    let (head,definition)=db.routine_planning_turn(turn)?;
+    let Some(definition)=definition else{return Ok(ScheduleTurn::default());};
     if let Err(error)=validate_current(&definition) {return Ok(ScheduleTurn{active:true,diagnostic:Some(format!("{}: {error:#}",definition.name))});}
-    db.schedule_routine(&PreparedRoutineTick{definition,now:jiff::Timestamp::now().as_millisecond()},snapshot.head)?;
+    db.schedule_routine(&PreparedRoutineTick{definition,now:jiff::Timestamp::now().as_millisecond()},head)?;
     // Keep a routine-only controller alive between scheduled instants, without
     // treating that as a claim that a herdr session was observed.
     Ok(ScheduleTurn{active:true,diagnostic:None})

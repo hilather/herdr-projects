@@ -18,6 +18,9 @@ pub struct LaunchInputs {
     pub task:TaskId,
     /// Task revision before reservation; the launch binds the next revision.
     pub task_revision:u64,
+    /// Exact signed contract; omitted for byte-stable historical launches.
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub task_contract:Option<VersionedReference>,
     pub scheduler_revision:u64,
     pub control_epoch:u64,
     pub binding:String,
@@ -50,7 +53,7 @@ pub struct PreparedLaunch {pub(crate) inputs:LaunchInputs}
 pub struct AttemptInputRecord {pub attempt:AttemptId,pub operation:OperationId,pub inputs:LaunchInputs}
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
 pub struct CancellationRequest {pub attempt:AttemptId,pub requested_unix_ms:i64,pub reason:String}
-#[derive(Debug,Serialize)]
+#[derive(Debug,Serialize,Deserialize)]
 pub struct Reservation {pub head:u64,pub record:AttemptInputRecord,pub task_revision:u64}
 #[derive(Debug,Serialize)]
 pub struct CancellationChange {pub head:u64,pub attempt:AttemptId,pub released:bool,pub attempt_revision:u64,pub task_revision:u64}

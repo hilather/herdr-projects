@@ -283,6 +283,27 @@ fn factory_platform_label(target_os: &str, live_ssh: bool) -> &'static str {
 }
 
 /// Identity of this binary only. Opening a project database would be a migration path.
+/// Does not resolve config, read projects, run tools, or contact sessions.
+pub fn build_info() -> serde_json::Value {
+    #[cfg(feature="state-store")]
+    let (schema,sqlite,compatible,dispatch)=(
+        Some(herdr_projects::store::SCHEMA),
+        serde_json::json!({"version":rusqlite::version(),"minimum":herdr_projects::store::MIN_SQLITE_VERSION,
+            "compatible":rusqlite::version_number()>=herdr_projects::store::MIN_SQLITE}),
+        rusqlite::version_number()>=herdr_projects::store::MIN_SQLITE,
+        Some(crate::canonical_controller::launch_dispatch_enabled()),
+    );
+    #[cfg(not(feature="state-store"))]
+    let (schema,sqlite,compatible,dispatch):(Option<u32>,serde_json::Value,bool,Option<bool>)=(None,serde_json::Value::Null,false,None);
+    serde_json::json!({
+        "version":crate::VERSION,"os":std::env::consts::OS,"arch":std::env::consts::ARCH,
+        "state_store":cfg!(feature="state-store"),"schema":schema,"sqlite":sqlite,
+        "prepared_dispatch":dispatch,
+        "factory_runtime_compatible":cfg!(all(feature="state-store",target_os="linux"))&&compatible,
+        "live_capacity_certified":false,
+    })
+}
+
 fn write_compiled_features(out: &mut String) {
     #[cfg(feature = "state-store")]
     {
@@ -296,7 +317,7 @@ fn write_compiled_features(out: &mut String) {
         );
         let _ = writeln!(
             out,
-            "factory: explicit factory binary `cargo build --release --locked --features state-store`"
+            "factory: explicit factory binary `cargo build --release --locked --features state-store --target-dir target/factory`"
         );
         let _ = writeln!(
             out,
@@ -311,7 +332,7 @@ fn write_compiled_features(out: &mut String) {
         let _ = writeln!(out, "prepared_dispatch: absent");
         let _ = writeln!(
             out,
-            "factory: canonical factory commands are absent; explicit factory binary `cargo build --release --locked --features state-store`"
+            "factory: canonical factory commands are absent; explicit factory binary `cargo build --release --locked --features state-store --target-dir target/factory`"
         );
         let _ = writeln!(out, "admission: absent");
     }

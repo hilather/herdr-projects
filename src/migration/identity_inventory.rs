@@ -17,10 +17,20 @@ fn publication(project:&Path,budget:&mut Budget)->Result<(std::path::PathBuf,Pub
 /// controlled writable handle returned to the caller. No intervening readonly
 /// connection can certify a subsequently reopened database.
 pub fn open_active_controlled(project:&Path,control:crate::store::controlled::ReadControl)->Result<crate::store::controlled::ControlledStore> {
+    open_active_checked(project,control,true)
+}
+/// Foreground selected-row reads retain publication and file-identity checks.
+/// Whole-store integrity verification remains available through the administrative opener.
+pub fn open_active_scoped(project:&Path,control:crate::store::controlled::ReadControl)->Result<crate::store::controlled::ControlledStore> {
+    open_active_checked(project,control,false)
+}
+fn open_active_checked(project:&Path,control:crate::store::controlled::ReadControl,integrity:bool)->Result<crate::store::controlled::ControlledStore> {
     control.check()?;
     let mut budget=Budget::new(50*1024*1024,0,control.deadline(),control.cancellation())?;
     let(project,expected)=publication(project,&mut budget)?;control.check()?;
-    let db=crate::store::controlled::ControlledStore::open(&project.join(".state/state.db"),control.clone())?;
+    let path=project.join(".state/state.db");
+    let db=if integrity {crate::store::controlled::ControlledStore::open(&path,control.clone())?}
+        else {crate::store::controlled::ControlledStore::open_scoped(&path,control.clone())?};
     ensure!(db.import_operation_count()?==expected.operations,"store imported operation count mismatch");
     ensure!(db.import_receipt()?==(expected.digest,expected.sources,expected.tasks),"store import identity mismatch");
     ensure!(db.project_control()?.map(|c|c.reconciliation_required).unwrap_or(true)==expected.reconciliation_required,"control/format publication interrupted; run migration recover before runtime commands");
@@ -51,6 +61,23 @@ pub fn read_identity_inventory(project:&Path,budget:&mut Budget)->Result<Vec<Run
     let(project,publication)=publication(project,budget)?;
     crate::store::identity_inventory::read(&project.join(".state/state.db"),&publication,budget)
 }
+/// Candidate bindings for a pane conflict check; malformed pane identities
+/// remain candidates and must pass the ordinary binding/provenance validator.
+pub(crate) fn read_pane_bindings(project:&Path,pane:&str,budget:&mut Budget)->Result<Vec<RuntimeBinding>> {
+    let(project,publication)=publication(project,budget)?;
+    crate::store::identity_inventory::read_pane_bindings(&project.join(".state/state.db"),&publication,budget,pane)
+}
+/// Local worktree references plus malformed machine/path identities. Retained
+/// nonempty paths remain references regardless of task/attempt terminal state.
+pub(crate) fn read_worktree_bindings(project:&Path,budget:&mut Budget)->Result<Vec<RuntimeBinding>> {
+    let(project,publication)=publication(project,budget)?;
+    crate::store::identity_inventory::read_worktree_bindings(&project.join(".state/state.db"),&publication,budget)
+}
+/// Matching staged panes plus malformed identities, with complete selected provenance.
+pub(crate) fn read_pane_targets(project:&Path,pane:&str,budget:&mut Budget)->Result<Vec<(String,crate::domain::LaunchTarget)>> {
+    let(project,publication)=publication(project,budget)?;
+    crate::store::identity_inventory::read_pane_targets(&project.join(".state/state.db"),&publication,budget,pane)
+}
 pub fn read_launch_target_inventory(project:&Path,budget:&mut Budget)->Result<Vec<(String,crate::domain::LaunchTarget)>> {
     let(project,publication)=publication(project,budget)?;
     crate::store::identity_inventory::read_launch_targets(&project.join(".state/state.db"),&publication,budget)
@@ -60,6 +87,12 @@ pub fn read_launch_target_inventory(project:&Path,budget:&mut Budget)->Result<Ve
 pub fn read_worktree_inventory(project:&Path,budget:&mut Budget)->Result<Vec<(String,crate::domain::WorktreePlan)>> {
     let(project,publication)=publication(project,budget)?;
     crate::store::identity_inventory::read_worktrees(&project.join(".state/state.db"),&publication,budget)
+}
+/// Exact launch provenance for verification/recovery after allocation. Does not
+/// replace the root-wide conflict inventory used when allocating resources.
+pub(crate) fn read_worktree_operation(project:&Path,operation:&crate::domain::OperationId,budget:&mut Budget)->Result<Vec<(String,crate::domain::WorktreePlan)>> {
+    let(project,publication)=publication(project,budget)?;
+    crate::store::identity_inventory::read_worktree_operation(&project.join(".state/state.db"),&publication,budget,operation)
 }
 pub fn read_routine_execution_hint(project:&Path,budget:&mut Budget,last:Option<&crate::domain::OperationId>,now:i64)->Result<Option<crate::store::controller_hint::RoutineExecutionHint>> {
     let(project,publication)=publication(project,budget)?;
@@ -95,17 +128,23 @@ mod tests {
         use crate::store::controlled::ReadControl;
         let(_root,p)=fixture();let expected=crate::runtime::snapshot(&p).unwrap();let control=||ReadControl::new(Instant::now()+Duration::from_secs(5),Default::default());
         assert_eq!(open_active_controlled(&p,control()).unwrap().read_snapshot(None).unwrap(),expected);
+        assert_eq!(open_active_scoped(&p,control()).unwrap().read_snapshot(None).unwrap(),expected);
         let marker=p.join(".state/format.json");let original=fs::read(&marker).unwrap();let mut value:serde_json::Value=serde_json::from_slice(&original).unwrap();value["reconciliation_required"]=false.into();fs::write(&marker,serde_json::to_vec(&value).unwrap()).unwrap();
-        assert!(open_active_controlled(&p,control()).is_err());fs::write(marker,original).unwrap();
+        assert!(open_active_controlled(&p,control()).is_err());
+        assert!(open_active_scoped(&p,control()).is_err());fs::write(marker,original).unwrap();
         let raw=rusqlite::Connection::open(p.join(".state/state.db")).unwrap();raw.execute("UPDATE migration_receipt SET source_digest=?1",["0".repeat(64)]).unwrap();
         assert!(open_active_controlled(&p,control()).is_err());
+        assert!(open_active_scoped(&p,control()).is_err());
     }
     #[test]
     fn controlled_open_keeps_cancellation_and_publication_byte_limits() {
         use crate::store::{controlled::ReadControl,StoreError};
         let(_root,p)=fixture();let cancellation=crate::runner::Cancellation::default();cancellation.cancel();
         let error=open_active_controlled(&p,ReadControl::new(Instant::now()+Duration::from_secs(5),cancellation)).err().unwrap();assert!(matches!(error.downcast_ref::<StoreError>(),Some(StoreError::Cancelled)));
+        let cancellation=crate::runner::Cancellation::default();cancellation.cancel();
+        let error=open_active_scoped(&p,ReadControl::new(Instant::now()+Duration::from_secs(5),cancellation)).err().unwrap();assert!(matches!(error.downcast_ref::<StoreError>(),Some(StoreError::Cancelled)));
         fs::write(journal_path(&p),vec![b' ';16*1024*1024+1]).unwrap();let error=open_active_controlled(&p,ReadControl::new(Instant::now()+Duration::from_secs(5),Default::default())).err().unwrap();assert!(error.to_string().contains("budget"));
+        let error=open_active_scoped(&p,ReadControl::new(Instant::now()+Duration::from_secs(5),Default::default())).err().unwrap();assert!(error.to_string().contains("budget"));
     }
     #[test]
     fn observation_head_reads_no_historical_payload_and_fences_publication() {
@@ -125,6 +164,111 @@ mod tests {
         assert!(read_observation_head(&p,&mut limits).is_err());assert!(started.elapsed()<Duration::from_secs(2));
         let mut cancelled=budget();cancelled.cancellation.cancel();assert!(read_observation_head(&p,&mut cancelled).is_err());
     }
+    #[test]
+    fn pane_candidates_ignore_retired_bindings_but_reject_unknown_routes() {
+        use std::sync::{Arc,atomic::{AtomicU64,Ordering}};
+        let(_root,p)=fixture();
+        let mut raw=rusqlite::Connection::open(p.join(".state/state.db")).unwrap();
+        let binding=crate::runtime::snapshot(&p).unwrap().runtime_bindings.remove(0);
+        let mut work=Vec::new();let mut worktree_work=Vec::new();
+        for history in [0,10_000] {
+            let tx=raw.transaction().unwrap();
+            for n in 0..history {
+                let mut retired=binding.clone();
+                let task=crate::domain::TaskId::new(format!("retired-{n}")).unwrap();
+                retired.id=format!("task:{}",task.as_str());retired.task=Some(task.clone());
+                retired.source_path=None;retired.source_digest=None;retired.session_source_digest=None;
+                retired.identity=Default::default();
+                tx.execute("INSERT INTO tasks(id,revision,state,title) VALUES(?1,1,'cancelled','retired')",[task.as_str()]).unwrap();
+                let payload=serde_json::to_string(&retired).unwrap();
+                tx.execute("INSERT INTO runtime_bindings(id,task_id,revision,source_path,payload,payload_hash) VALUES(?1,?2,?3,NULL,?4,?5)",rusqlite::params![retired.id,task.as_str(),retired.revision,payload,hash(payload.as_bytes())]).unwrap();
+                // Retained reference metadata must not turn the completeness
+                // check into a full-history scan before pane selection.
+                tx.execute("INSERT INTO runtime_observations VALUES(?1,1,1,0,'{}',?2)",rusqlite::params![retired.id,"0".repeat(64)]).unwrap();
+                tx.execute("INSERT INTO runtime_ownership VALUES(?1,1,1,NULL,'{}',?2)",rusqlite::params![retired.id,"0".repeat(64)]).unwrap();
+                tx.execute("INSERT INTO legacy_sources VALUES(?1,'inbox',?2,?3)",rusqlite::params![format!("inbox/cold-{n}.json"),hash(b"{}"),b"{}".as_slice()]).unwrap();
+            }
+            tx.commit().unwrap();
+            let mut limits=budget();let steps=Arc::new(AtomicU64::new(0));limits.sql_steps=Some(steps.clone());
+            assert!(read_pane_bindings(&p,"wanted-pane",&mut limits).unwrap().is_empty());
+            work.push(steps.load(Ordering::Relaxed));
+            let mut limits=budget();let steps=Arc::new(AtomicU64::new(0));limits.sql_steps=Some(steps.clone());
+            assert!(read_worktree_bindings(&p,&mut limits).unwrap().is_empty());
+            worktree_work.push(steps.load(Ordering::Relaxed));
+        }
+        eprintln!("pane candidate SQL steps with 0/10000 retired bindings: {work:?}");
+        assert!(work[1]<=work[0]+100,"pane inventory scanned retired bindings: {work:?}");
+        eprintln!("worktree binding SQL steps with 0/10000 retired bindings and references: {worktree_work:?}");
+        assert!(worktree_work[1]<=worktree_work[0]+100,"worktree binding inventory scanned history: {worktree_work:?}");
+        assert!(read_identity_inventory(&p,&mut budget()).is_err(),"full inventory retains its record bound");
+        let mut selected=binding.clone();selected.identity.pane_id="wanted-pane".into();
+        let payload=serde_json::to_string(&selected).unwrap();
+        raw.execute("UPDATE runtime_bindings SET payload=?1,payload_hash=?2 WHERE id=?3",rusqlite::params![payload,hash(payload.as_bytes()),selected.id]).unwrap();
+        assert_eq!(read_pane_bindings(&p,"wanted-pane",&mut budget()).unwrap(),vec![selected.clone()]);
+        raw.execute("UPDATE runtime_bindings SET payload_hash=?1 WHERE id=?2",rusqlite::params!["0".repeat(64),selected.id]).unwrap();
+        assert!(read_pane_bindings(&p,"wanted-pane",&mut budget()).is_err());
+        for bad in [serde_json::Value::Null,serde_json::json!(17),serde_json::json!([])] {
+            let mut payload=serde_json::to_value(&selected).unwrap();payload["identity"]["pane_id"]=bad;
+            let payload=payload.to_string();
+            raw.execute("UPDATE runtime_bindings SET payload=?1,payload_hash=?2 WHERE id=?3",rusqlite::params![payload,hash(payload.as_bytes()),selected.id]).unwrap();
+            assert!(read_pane_bindings(&p,"wanted-pane",&mut budget()).is_err(),"unknown pane must remain uncertainty");
+        }
+        let mut cancelled=budget();cancelled.cancellation.cancel();
+        assert!(read_pane_bindings(&p,"wanted-pane",&mut cancelled).is_err());
+        raw.execute("DELETE FROM runtime_bindings WHERE id=?1",[&selected.id]).unwrap();
+        assert!(read_pane_bindings(&p,"wanted-pane",&mut budget()).unwrap_err().to_string().contains("missing imported bindings"));
+    }
+
+    #[test]
+    fn identity_gap_backfill_and_imported_source_mutations_preserve_refusals() {
+        let(_root,p)=fixture();let binding=crate::runtime::snapshot(&p).unwrap().runtime_bindings.remove(0);
+        let mut raw=rusqlite::Connection::open(p.join(".state/state.db")).unwrap();
+        crate::store::test_schema::historical(&raw,42).unwrap();
+        let source:(String,String,Vec<u8>)=raw.query_row("SELECT kind,digest,bytes FROM legacy_sources WHERE path='.state/coordinator.json'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        raw.execute("DELETE FROM runtime_bindings WHERE id=?1",[&binding.id]).unwrap();
+        assert!(read_pane_bindings(&p,"unrelated-pane",&mut budget()).unwrap_err().to_string().contains("missing imported"));
+        // Exercise SQL backfill on a historical fault fixture, independently
+        // of the administrative upgrade service's integrity refusals.
+        let tx=raw.transaction().unwrap();tx.execute_batch(include_str!("../../migrations/0043_admission_indexes.sql")).unwrap();tx.commit().unwrap();
+        assert!(read_pane_bindings(&p,"unrelated-pane",&mut budget()).unwrap_err().to_string().contains("missing imported"));
+        raw.execute("UPDATE legacy_sources SET kind='inbox' WHERE path='.state/coordinator.json'",[]).unwrap();
+        assert!(read_pane_bindings(&p,"unrelated-pane",&mut budget()).unwrap().is_empty());
+        raw.execute("UPDATE legacy_sources SET kind='runtime' WHERE path='.state/coordinator.json'",[]).unwrap();
+        assert!(read_pane_bindings(&p,"unrelated-pane",&mut budget()).is_err());
+        raw.execute("DELETE FROM legacy_sources WHERE path='.state/coordinator.json'",[]).unwrap();
+        let gaps:u64=raw.query_row("SELECT count(*) FROM identity_reference_gaps",[],|r|r.get(0)).unwrap();assert_eq!(gaps,0);
+        raw.execute("INSERT INTO legacy_sources VALUES('.state/coordinator.json',?1,?2,?3)",rusqlite::params![source.0,source.1,source.2]).unwrap();
+        assert!(read_pane_bindings(&p,"unrelated-pane",&mut budget()).is_err());
+        let payload=serde_json::to_string(&binding).unwrap();
+        raw.execute("INSERT INTO runtime_bindings VALUES(?1,?2,?3,?4,?5,?6)",rusqlite::params![binding.id,binding.task.as_ref().map(crate::domain::TaskId::as_str),binding.revision,binding.source_path,payload,hash(payload.as_bytes())]).unwrap();
+        assert!(read_pane_bindings(&p,"unrelated-pane",&mut budget()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_worktree_selection_retains_paths_and_refuses_unknown_identity() {
+        let(_root,p)=fixture();let mut binding=crate::runtime::snapshot(&p).unwrap().runtime_bindings.remove(0);
+        binding.identity.worktree_path=p.join("retained-but-absent").display().to_string();
+        let raw=rusqlite::Connection::open(p.join(".state/state.db")).unwrap();
+        let write=|binding:&crate::domain::RuntimeBinding| {
+            let payload=serde_json::to_string(binding).unwrap();
+            raw.execute("UPDATE runtime_bindings SET payload=?1,payload_hash=?2 WHERE id=?3",rusqlite::params![payload,hash(payload.as_bytes()),binding.id]).unwrap();
+        };
+        write(&binding);assert_eq!(read_worktree_bindings(&p,&mut budget()).unwrap(),vec![binding.clone()]);
+        binding.identity.machine="remote".into();write(&binding);
+        assert!(read_worktree_bindings(&p,&mut budget()).unwrap().is_empty());
+        for field in ["machine","worktree_path"] {
+            let mut value=serde_json::to_value(&binding).unwrap();value["identity"][field]=serde_json::Value::Null;
+            let payload=value.to_string();raw.execute("UPDATE runtime_bindings SET payload=?1,payload_hash=?2 WHERE id=?3",rusqlite::params![payload,hash(payload.as_bytes()),binding.id]).unwrap();
+            assert!(read_worktree_bindings(&p,&mut budget()).is_err());
+        }
+        binding.identity.machine.clear();write(&binding);
+        raw.execute("UPDATE runtime_bindings SET payload_hash=?1 WHERE id=?2",rusqlite::params!["0".repeat(64),binding.id]).unwrap();
+        assert!(read_worktree_bindings(&p,&mut budget()).is_err());write(&binding);
+        let mut cancelled=budget();cancelled.cancellation.cancel();assert!(read_worktree_bindings(&p,&mut cancelled).is_err());
+        crate::store::test_schema::historical(&raw,42).unwrap();
+        assert_eq!(read_worktree_bindings(&p,&mut budget()).unwrap(),vec![binding]);
+    }
+
     #[test]
     fn identity_inventory_matches_snapshot_without_materializing_unrelated_history() {
         let(_root,p)=fixture();let expected=crate::runtime::snapshot(&p).unwrap().runtime_bindings;
@@ -169,6 +313,21 @@ mod tests {
                 let payload=serde_json::to_string(&owned).unwrap();db.execute("INSERT INTO runtime_ownership VALUES(?1,1,1,NULL,?2,?3)",rusqlite::params![binding.id,payload,hash(payload.as_bytes())]).unwrap();
             }else {db.execute("INSERT INTO runtime_observations VALUES(?1,1,1,0,'{}',?2)",rusqlite::params![binding.id,"0".repeat(64)]).unwrap();}
             db.execute("DELETE FROM runtime_bindings WHERE id=?1",[&binding.id]).unwrap();let error=read_identity_inventory(&p,&mut budget()).unwrap_err().to_string();assert!(error.contains("dangling"),"{table}: {error}");
+            assert!(read_pane_bindings(&p,"unrelated-pane",&mut budget()).unwrap_err().to_string().contains("dangling"));
+            let payload=serde_json::to_string(&binding).unwrap();
+            db.execute("INSERT INTO runtime_bindings VALUES(?1,?2,?3,?4,?5,?6)",rusqlite::params![binding.id,binding.task.as_ref().map(TaskId::as_str),binding.revision,binding.source_path,payload,hash(payload.as_bytes())]).unwrap();
+            assert!(read_pane_bindings(&p,"unrelated-pane",&mut budget()).unwrap().is_empty());
+            db.execute_batch("SAVEPOINT reference_move").unwrap();
+            db.execute(&format!("UPDATE {table} SET binding_id='missing-reference' WHERE binding_id=?1"),[&binding.id]).unwrap();
+            let gaps:u64=db.query_row("SELECT count(*) FROM identity_reference_gaps",[],|r|r.get(0)).unwrap();assert_eq!(gaps,1);
+            // A separate reader sees committed evidence, not this savepoint.
+            assert!(read_pane_bindings(&p,"unrelated-pane",&mut budget()).unwrap().is_empty());
+            db.execute_batch("ROLLBACK TO reference_move; RELEASE reference_move").unwrap();
+            let gaps:u64=db.query_row("SELECT count(*) FROM identity_reference_gaps",[],|r|r.get(0)).unwrap();assert_eq!(gaps,0);
+            db.execute(&format!("UPDATE {table} SET binding_id='missing-reference' WHERE binding_id=?1"),[&binding.id]).unwrap();
+            assert!(read_pane_bindings(&p,"unrelated-pane",&mut budget()).unwrap_err().to_string().contains("dangling"));
+            db.execute(&format!("DELETE FROM {table} WHERE binding_id='missing-reference'"),[]).unwrap();
+            assert!(read_pane_bindings(&p,"unrelated-pane",&mut budget()).unwrap().is_empty());
         }
     }
 

@@ -258,15 +258,15 @@ fn canonical_observation_pause_replaces_pre_observation_planning_liveness() {
 }
 
 #[test]
-fn canonical_initial_snapshot_sql_obeys_original_job_deadline() {
+fn canonical_initial_schema_sql_obeys_original_job_deadline() {
     let f=Fixture::new("ok");let input=f.input();let raw=rusqlite::Connection::open(f.path.join(".state/state.db")).unwrap();
-    raw.execute_batch("ALTER TABLE events RENAME TO original_events; CREATE VIEW events AS SELECT * FROM original_events WHERE (WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n)>0;").unwrap();
+    raw.execute_batch("ALTER TABLE store_meta RENAME TO original_meta; CREATE VIEW store_meta AS SELECT * FROM original_meta WHERE (WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n)>0;").unwrap();
     let start=Instant::now();let control=Control{deadline:start+Duration::from_millis(100),cancellation:Default::default()};
     let error=collect(&input,&control).err().unwrap();assert!(matches!(error.downcast_ref::<herdr_projects::store::StoreError>(),Some(herdr_projects::store::StoreError::Deadline)),"{error:#}");assert!(start.elapsed()<Duration::from_secs(2));assert!(!f.world.home.path().join("entered").exists());assert!(ProjectGuard::acquire(&f.path).is_ok());
 }
 
 #[test]
-fn canonical_post_probe_snapshot_cannot_restart_its_sql_budget() {
+fn canonical_post_probe_sql_cannot_restart_its_budget() {
     let f=Fixture::new("ok");let helper=f.env.herdr_bin();let script=fs::read_to_string(&helper).unwrap().replace("import pathlib,sys,json,time","import pathlib,sys,json,time,sqlite3").replace("mode=(root/'mode').read_text()",&format!("mode=(root/'mode').read_text()\nif not (root/'changed-sql').exists():\n db=sqlite3.connect({:?})\n db.executescript(\"ALTER TABLE events RENAME TO original_events; CREATE VIEW events AS SELECT * FROM original_events WHERE (WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n)>0;\")\n db.close()\n (root/'changed-sql').write_text('yes')",f.path.join(".state/state.db").display().to_string()));fs::write(&helper,script).unwrap();
     let start=Instant::now();let sample=collect(&f.input(),&Control{deadline:start+Duration::from_millis(700),cancellation:Default::default()}).unwrap();
     assert!(f.world.home.path().join("changed-sql").exists());assert!(sample.reachable.is_none());assert!(sample.head.is_none());assert!(sample.diagnostic.unwrap().contains("Deadline"));assert!(start.elapsed()<Duration::from_secs(2));assert!(ProjectGuard::acquire(&f.path).is_ok());
