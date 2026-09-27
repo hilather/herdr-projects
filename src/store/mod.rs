@@ -4,7 +4,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{fmt, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 
-pub const SCHEMA: u32 = 43;
+pub const SCHEMA: u32 = 44;
 const APPLICATION: u32 = 1_213_222_994;
 pub const MIN_SQLITE: i32 = 3_053_004;
 pub const MIN_SQLITE_VERSION: &str = "3.53.4";
@@ -104,6 +104,7 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../migrations/0041_active_work.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0042_wait_subscription.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0043_admission_indexes.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0044_result_automation.sql"))?;
             tx.commit()?;
         }
         // Persist the initial directory entry as well as SQLite's own commit.
@@ -476,6 +477,9 @@ pub(crate) use satisfaction::{claims_conflict, ResourceClaim};
 
 mod plans;
 pub use plans::{PlanIntent,PlanIntentPage,inspect_project_plan,PlannerSession,PlannerInput,PlannerEventInput,create_project_planner_session,show_project_planner_session,AutoReplanControl,ReplanTurn,set_project_auto_replans,service_project_replans,PlanProposalReceipt, propose_plan,WaitTurn,register_project_wait,register_project_wait_with_deadline,register_project_wait_with_trigger,rearm_project_wait,replay_project_wait,request_project_replan,service_project_waits};
+
+mod verification_jobs;
+pub use verification_jobs::{ResultAutomationControl,VerificationJobTurn,set_project_result_automation,service_project_verification_jobs};
 
 mod capabilities;
 

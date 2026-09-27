@@ -280,6 +280,14 @@ impl ControlledStore {
         self.work_budget.check()?;
         self.store.service_replans(&self.work_budget).map_err(|e|self.error(e))
     }
+    pub(crate) fn set_result_automation(&mut self,head:u64,verify:bool)->Result<super::verification_jobs::ResultAutomationControl> {
+        self.work_budget.check()?;
+        self.store.set_result_automation(head,verify).map_err(|e|self.error(e))
+    }
+    pub(crate) fn service_verification_jobs(&mut self)->Result<super::verification_jobs::VerificationJobTurn> {
+        self.work_budget.check()?;
+        self.store.service_verification_jobs(&self.work_budget).map_err(|e|self.error(e))
+    }
     pub(crate) fn create_planner_session(&mut self,id:&str,intent:&str,evidence:&[u64],parent:u64,cursor:u64)->Result<super::plans::PlannerSession> {
         self.work_budget.check()?;
         self.store.create_planner_session(id,intent,evidence,parent,cursor,&self.work_budget).map_err(|e|self.error(e))

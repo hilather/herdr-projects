@@ -696,6 +696,8 @@ enum ResultCommand {
     Submit { #[arg(long)] input_file:PathBuf },
     /// Read stored submissions. Claimed checks are not evidence.
     Show { #[arg(long)] id:Option<String> },
+    /// Enable or disable automatic verification job enqueueing; does not run a verifier
+    Auto { #[arg(long,value_parser=["on","off"])] verify:String, #[arg(long)] expected_head:u64 },
 }
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
@@ -1186,6 +1188,7 @@ pub fn run() -> Result<()> {
                     if outcome.state != "integrated" { anyhow::bail!("integration {}: {}",outcome.state,outcome.reason.as_deref().unwrap_or("not integrated")); }
                 },
                 ResultCommand::Show{id}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::show_results(&dir,id.as_deref())?)?),
+                ResultCommand::Auto{verify,expected_head}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::set_project_result_automation(&dir,expected_head,verify=="on")?)?),
             }
             Ok(())
         },

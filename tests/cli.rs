@@ -1749,6 +1749,82 @@ fn ticker_canonical_routine_admits_from_hint_and_restart_keeps_one_execution() {
     let after=runtime::snapshot(&project).unwrap();assert_eq!(after.routine_receipts,before.routine_receipts);assert_eq!(after.deliveries,before.deliveries);assert_eq!(fs::read(project.join("ROUTINE_MARKER")).unwrap(),b"once");
 }
 
+#[cfg(all(feature="state-store",target_os="linux"))]
+#[test]
+fn ticker_enqueues_one_verification_job_per_policy_across_restart() {
+    use std::{fs,process::Stdio,time::{Duration,Instant}};
+    use herdr_projects::{authority::CONTRACT_SIGNATURE_NAMESPACE,domain::*,migration,runtime,operations::DeliveryState};
+    use sha2::{Digest,Sha256};
+    let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
+    for action in ["new","pause"]{assert!(hp(home.path(),&["--root",r,action,"demo"]).status.success());}
+    let key=home.path().join("owner");assert!(Command::new("/usr/bin/ssh-keygen").args(["-q","-t","ed25519","-N","","-f"]).arg(&key).output().unwrap().status.success());
+    let public=fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+    let project=root.join("demo");let config=home.path().join(".config/herdr-projects/config.toml");fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config,format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n")).unwrap();
+    let plan=migration::inspect_with_config(&project,&config).unwrap();migration::apply(&project,&plan,true).unwrap();
+    let s=runtime::snapshot(&project).unwrap();runtime::set_state(&project,s.head,s.control.unwrap().revision,ProjectState::Active,&config).unwrap();
+    let head=runtime::add_task(&project,TaskId::new("task").unwrap(),"work".into(),runtime::snapshot(&project).unwrap().head).unwrap();
+    let db_path=project.join(".state/state.db");let store=db_path.canonicalize().unwrap().display().to_string();
+    rusqlite::Connection::open(&db_path).unwrap().execute("INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) VALUES('attempt-1','task',1,'running',NULL,'slot-1',0)",[]).unwrap();
+    let repo=home.path().join("repo");fs::create_dir(&repo).unwrap();
+    let git=|args:&[&str]|{
+        let out=Command::new("/usr/bin/git").env_clear().env("PATH","/usr/bin:/bin").env("HOME",home.path()).env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL","/dev/null")
+            .env("GIT_AUTHOR_NAME","fixture").env("GIT_AUTHOR_EMAIL","fixture@example.com").env("GIT_COMMITTER_NAME","fixture").env("GIT_COMMITTER_EMAIL","fixture@example.com")
+            .current_dir(&repo).args(args).output().unwrap();
+        assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init","-q","--object-format=sha256"]);fs::create_dir(repo.join("src")).unwrap();fs::write(repo.join("src/base.txt"),"base\n").unwrap();git(&["add","."]);git(&["commit","-qm","base"]);let base=git(&["rev-parse","HEAD"]);
+    fs::write(repo.join("src/lib.rs"),"pub fn result() {}\n").unwrap();git(&["add","."]);git(&["commit","-qm","result"]);let candidate=git(&["rev-parse","HEAD"]);
+    let policies=[("builds",r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#),("clean",r#"{"version":1,"checks":["/usr/bin/true"]}"#)];
+    let mut document=serde_json::to_vec_pretty(&serde_json::json!({
+        "version":3,"outputs":[{"path":"src/lib.rs","kind":"git_file"}],"scope":{"paths":[{"path":"src/","access":"write"}]},
+        "project_store":store,"expected_head":head,"task_id":"task","contract_revision":1,"deliverable":"ship","non_goals":"no launch",
+        "acceptance_policies":policies.iter().map(|(id,text)|serde_json::json!({"id":id,"text":text})).collect::<Vec<_>>(),
+        "repository":repo.canonicalize().unwrap().display().to_string(),"base_oid":base,"object_format":"sha256","dependencies":[],"capability_flags":[],
+        "profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_then_integrate","authority":herdr_projects::authority::policy_reference(&project).unwrap()
+    })).unwrap();document.push(b'\n');
+    let doc_path=home.path().join("contract.json");fs::write(&doc_path,&document).unwrap();
+    assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&key).args(["-n",CONTRACT_SIGNATURE_NAMESPACE]).arg(&doc_path).status().unwrap().success());
+    let installed=hp(home.path(),&["--root",r,"task","demo","contract","put","--input-file",doc_path.to_str().unwrap(),"--signature",home.path().join("contract.json.sig").to_str().unwrap()]);
+    assert!(installed.status.success(),"{}",String::from_utf8_lossy(&installed.stderr));let installed:serde_json::Value=serde_json::from_slice(&installed.stdout).unwrap();
+    let objects=git(&["rev-list","--objects","--all"]).lines().map(|line|{let oid=line.split_whitespace().next().unwrap();serde_json::json!({"oid":oid,"relative_path":format!("{}/{}",&oid[..2],&oid[2..])})}).collect::<Vec<_>>();
+    let submission=home.path().join("result.json");
+    fs::write(&submission,serde_json::to_vec(&serde_json::json!({"idempotency_key":"cli-key","task_id":"task","contract_revision":1,"contract_digest":installed["digest"],"attempt_id":"attempt-1",
+        "repository":repo.canonicalize().unwrap().display().to_string(),"base_oid":base,"candidate_oid":candidate,"object_format":"sha256",
+        "artifact_manifest":[{"path":"src/lib.rs","oid":candidate}],"claimed_checks":[],"objects":objects})).unwrap()).unwrap();
+    let submitted=hp(home.path(),&["--root",r,"result","demo","submit","--input-file",submission.to_str().unwrap()]);
+    assert!(submitted.status.success(),"{}",String::from_utf8_lossy(&submitted.stderr));
+    let submission_id=serde_json::from_slice::<serde_json::Value>(&submitted.stdout).unwrap()["submission_id"].as_str().unwrap().to_owned();
+    struct Child(std::process::Child);impl Drop for Child{fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+    let spawn=||Child(Command::new(BIN).env_clear().env("HOME",home.path()).env("PATH","/usr/bin:/bin").env("HERDR_BIN_PATH","/bin/false").args(["--root",r,"ticker","run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let wait=|child:&mut Child,predicate:&dyn Fn()->bool|{let deadline=Instant::now()+Duration::from_secs(35);while !predicate(){assert!(child.0.try_wait().unwrap().is_none());assert!(Instant::now()<deadline,"{}",fs::read_to_string(root.join(".ticker.log")).unwrap_or_default());std::thread::sleep(Duration::from_millis(10));}};
+    let stop=|child:&mut Child|{fs::write(root.join(".ticker.stop"),b"").unwrap();let deadline=Instant::now()+Duration::from_secs(8);while child.0.try_wait().unwrap().is_none(){assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(10));}fs::remove_file(root.join(".ticker.stop")).unwrap();};
+    // The metrics file is rewritten after every ticker turn has polled each canonical project.
+    let metrics=root.join(".ticker-metrics.json");
+    let turn=||{let _=fs::remove_file(&metrics);let mut child=spawn();wait(&mut child,&||metrics.is_file());stop(&mut child);};
+    let jobs=||runtime::snapshot(&project).unwrap().operations.into_iter().filter(|op|op.kind=="verification.run").collect::<Vec<_>>();
+    let runs=||rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT count(*) FROM verification_runs",[],|row|row.get::<_,u64>(0)).unwrap();
+    turn();
+    assert!(jobs().is_empty(),"automation is off by default");
+    let enabled=hp(home.path(),&["--root",r,"result","demo","auto","--verify","on","--expected-head",&runtime::snapshot(&project).unwrap().head.to_string()]);
+    assert!(enabled.status.success(),"{}",String::from_utf8_lossy(&enabled.stderr));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&enabled.stdout).unwrap()["verify"],true);
+    let mut child=spawn();wait(&mut child,&||jobs().len()>=2);stop(&mut child);
+    let mut expected=policies.iter().map(|(id,text)|{
+        let digest=format!("{:x}",Sha256::digest(text.as_bytes()));
+        format!("{:x}",Sha256::digest(serde_json::to_vec(&serde_json::json!([store,submission_id,1,id,digest])).unwrap()))
+    }).collect::<Vec<_>>();expected.sort();
+    let check=||{
+        let snapshot=runtime::snapshot(&project).unwrap();let found=jobs();
+        assert_eq!(found.iter().map(|op|op.id.as_str().to_owned()).collect::<Vec<_>>(),expected);
+        for op in &found {let delivery=snapshot.deliveries.iter().find(|d|d.operation==op.id).unwrap();assert_eq!(delivery.state,DeliveryState::Pending);assert_eq!(delivery.attempts,0);}
+        assert_eq!(runs(),0);
+    };
+    check();
+    turn();
+    check();
+}
+
 #[cfg(feature="state-store")]
 #[test]
 fn profile_prepare_uses_pinned_owner_config_and_keeps_unknown_capabilities() {
