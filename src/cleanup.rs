@@ -90,10 +90,29 @@ pub fn no_process_references(path: &Path) -> Result<()> {
                     && fs::read_dir(proc.join("task")).is_ok_and(|tasks| tasks.count() == 1);
                 ensure!(gone || zombie, "process identity changed during writer inspection; retry the checkpoint");
             },
+            Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+                && uid != 0 && privileged_or_defunct(&proc) => {},
             Err(error) => return Err(error).context("cannot establish writer quiescence"),
         }
     }
     Ok(())
+}
+
+/// The kernel refuses same-user inspection of zombies, non-dumpable processes
+/// (their /proc links become root-owned) and processes holding capabilities the
+/// caller lacks, such as `systemd --user` and `(sd-pam)`. A worker Herdr launches
+/// is an ordinary dumpable process with the caller's capabilities, so none of
+/// these is one; any other refusal still fails closed.
+#[cfg(target_os = "linux")]
+fn privileged_or_defunct(proc: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let field = |status: &str, key: &str| status.lines().find_map(|l| l.strip_prefix(key)).map(|v| v.trim().to_string());
+    let Ok(status) = fs::read_to_string(proc.join("status")) else { return false };
+    if field(&status, "State:").is_some_and(|state| state.starts_with('Z')) { return true; }
+    if fs::symlink_metadata(proc.join("cwd")).is_ok_and(|link| link.uid() == 0) { return true; }
+    let permitted = |status: &str| field(status, "CapPrm:").and_then(|v| u64::from_str_radix(&v, 16).ok());
+    let own = fs::read_to_string("/proc/self/status").ok().and_then(|s| permitted(&s));
+    matches!((permitted(&status), own), (Some(theirs), Some(own)) if theirs & !own != 0)
 }
 #[cfg(not(target_os = "linux"))]
 pub fn no_process_references(_: &Path) -> Result<()> { anyhow::bail!("writer quiescence inspection is currently supported on Linux only") }
