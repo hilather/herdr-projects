@@ -1,4 +1,18 @@
 //! Opt-in Phase B storage. Legacy commands do not create or open this database.
+/// Test harness only: SQLite's default memory statistics take one process-wide
+/// mutex on every allocation, so parallel tests contend on it and their wall-clock
+/// deadlines and approval windows expire. Disabled before SQLite initializes.
+#[cfg(all(test, feature = "state-store"))]
+#[used]
+#[unsafe(link_section = ".init_array")]
+static SQLITE_TEST_MEMSTATUS_HOOK: unsafe extern "C" fn() = disable_sqlite_test_memstatus;
+
+#[cfg(all(test, feature = "state-store"))]
+unsafe extern "C" fn disable_sqlite_test_memstatus() {
+    // SAFETY: runs from .init_array before main and before any SQLite use.
+    unsafe { rusqlite::ffi::sqlite3_config(rusqlite::ffi::SQLITE_CONFIG_MEMSTATUS, 0) };
+}
+
 #[cfg(feature = "state-store")]
 pub mod domain;
 #[cfg(feature = "state-store")]

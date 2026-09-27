@@ -1,3 +1,16 @@
+/// Test harness only, as in the library: SQLite's memory statistics serialize
+/// every allocation of every parallel test on one process-wide mutex.
+#[cfg(all(test, feature = "state-store"))]
+#[used]
+#[unsafe(link_section = ".init_array")]
+static SQLITE_TEST_MEMSTATUS_HOOK: unsafe extern "C" fn() = disable_sqlite_test_memstatus;
+
+#[cfg(all(test, feature = "state-store"))]
+unsafe extern "C" fn disable_sqlite_test_memstatus() {
+    // SAFETY: runs from .init_array before main and before any SQLite use.
+    unsafe { rusqlite::ffi::sqlite3_config(rusqlite::ffi::SQLITE_CONFIG_MEMSTATUS, 0) };
+}
+
 #[cfg(feature="state-store")]
 mod canonical_controller;
 #[cfg(feature="state-store")]

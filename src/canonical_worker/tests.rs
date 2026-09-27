@@ -638,10 +638,10 @@ fn brief_rendering_shares_deadline_and_does_not_scan_retained_history() {
         let original_expiry=retained.expires_unix_ms;
         let tx=raw.transaction().unwrap();
         for n in 0..history {
-            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('historical.noise',?1,1,1,'{}')",[format!("old-{n}")]).unwrap();
+            tx.prepare_cached("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('historical.noise',?1,1,1,'{}')").unwrap().execute([format!("old-{n}")]).unwrap();
             retained.expires_unix_ms=original_expiry+n+1;
             let reference=retained.reference().unwrap();
-            tx.execute("INSERT INTO approval_grants VALUES(?1,?2,?3)",rusqlite::params![reference.id,serde_json::to_string(&retained).unwrap(),reference.digest]).unwrap();
+            tx.prepare_cached("INSERT INTO approval_grants VALUES(?1,?2,?3)").unwrap().execute(rusqlite::params![reference.id,serde_json::to_string(&retained).unwrap(),reference.digest]).unwrap();
         }
         tx.commit().unwrap();
         drop(raw);
@@ -676,7 +676,7 @@ fn termination_selection_is_bounded_and_cancellable_with_retained_history() {
         let tx=raw.transaction().unwrap();
         for n in 0..history {
             // Valid unrelated event history; no selected lifecycle fact changes.
-            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_history',?1,1,1,'{}')",[format!("retired-{n}")]).unwrap();
+            tx.prepare_cached("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_history',?1,1,1,'{}')").unwrap().execute([format!("retired-{n}")]).unwrap();
         }
         tx.commit().unwrap();
         drop(raw);
@@ -4581,8 +4581,7 @@ fn target_retention_uses_selected_history_and_original_control() {
             // Model retained target audit rows with distinct panes, not real launches.
             let mut retained = target.clone();
             retained.route.pane_id = format!("historical-pane-{n}");
-            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_target',?1,1,1,?2)",
-                rusqlite::params![format!("historical-target-{n}"), serde_json::to_string(&retained).unwrap()]).unwrap();
+            tx.prepare_cached("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_target',?1,1,1,?2)").unwrap().execute(rusqlite::params![format!("historical-target-{n}"), serde_json::to_string(&retained).unwrap()]).unwrap();
         }
         tx.commit().unwrap();
         let observed = SqlWork::default();
@@ -4627,8 +4626,7 @@ fn resource_recovery_selects_its_evidence_without_scanning_history() {
         let tx = raw.transaction().unwrap();
         for n in 0..history {
             // Deliberately invalid cold payloads are not recovery evidence for this operation.
-            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_creation',?1,1,1,'{}')",
-                [format!("cold-creation-{n}")]).unwrap();
+            tx.prepare_cached("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_creation',?1,1,1,'{}')").unwrap().execute([format!("cold-creation-{n}")]).unwrap();
         }
         tx.commit().unwrap();
         let observed = SqlWork::default();
@@ -4667,7 +4665,7 @@ fn gate_selection_claim_and_render_share_bounded_reads() {
     for history in [0, 10_000] {
         let tx = raw.transaction().unwrap();
         for n in 0..history {
-            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_creation',?1,1,1,'{}')", [format!("cold-gate-{n}")]).unwrap();
+            tx.prepare_cached("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_creation',?1,1,1,'{}')").unwrap().execute([format!("cold-gate-{n}")]).unwrap();
         }
         tx.commit().unwrap();
         let observed = SqlWork::default();
@@ -4714,7 +4712,7 @@ fn resource_creation_selection_and_render_are_history_bounded() {
     for history in [0, 10_000] {
         let tx = raw.transaction().unwrap();
         for n in 0..history {
-            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_creation',?1,1,1,'{}')", [format!("retained-creation-{n}")]).unwrap();
+            tx.prepare_cached("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_creation',?1,1,1,'{}')").unwrap().execute([format!("retained-creation-{n}")]).unwrap();
         }
         tx.commit().unwrap();
         let observed = SqlWork::default();
@@ -4746,8 +4744,7 @@ fn launch_advancement_selection_is_bounded_and_operation_scoped() {
     for history in [0, 10_000] {
         let tx = raw.transaction().unwrap();
         for n in 0..history {
-            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?1,?2,1,1,'{}')",
-                rusqlite::params![kinds[n % kinds.len()], format!("other-launch-{n}")]).unwrap();
+            tx.prepare_cached("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?1,?2,1,1,'{}')").unwrap().execute(rusqlite::params![kinds[n % kinds.len()], format!("other-launch-{n}")]).unwrap();
         }
         tx.commit().unwrap();
         let observed = SqlWork::default();
@@ -4824,7 +4821,7 @@ fn start_selection_is_bounded_and_cancellable_with_retained_history() {
     for history in [0, 10_000] {
         let tx = raw.transaction().unwrap();
         for n in 0..history {
-            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_started',?1,1,1,'{}')", [format!("other-start-{n}")]).unwrap();
+            tx.prepare_cached("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_started',?1,1,1,'{}')").unwrap().execute([format!("other-start-{n}")]).unwrap();
         }
         tx.commit().unwrap();
         let observed = SqlWork::default();
@@ -4863,9 +4860,9 @@ fn pane_conflicts_remain_effect_fences_with_ten_thousand_retired_neighbors() {
         let mut retired=coordinator.clone();let task=TaskId::new(format!("retired-{n}")).unwrap();
         retired.id=format!("task:{}",task.as_str());retired.task=Some(task.clone());
         retired.source_path=None;retired.source_digest=None;retired.session_source_digest=None;retired.identity=Default::default();
-        tx.execute("INSERT INTO tasks(id,revision,state,title) VALUES(?1,1,'cancelled','retired')",[task.as_str()]).unwrap();
+        tx.prepare_cached("INSERT INTO tasks(id,revision,state,title) VALUES(?1,1,'cancelled','retired')").unwrap().execute([task.as_str()]).unwrap();
         let payload=serde_json::to_string(&retired).unwrap();
-        tx.execute("INSERT INTO runtime_bindings(id,task_id,revision,source_path,payload,payload_hash) VALUES(?1,?2,1,NULL,?3,?4)",rusqlite::params![retired.id,task.as_str(),payload,format!("{:x}",Sha256::digest(payload.as_bytes()))]).unwrap();
+        tx.prepare_cached("INSERT INTO runtime_bindings(id,task_id,revision,source_path,payload,payload_hash) VALUES(?1,?2,1,NULL,?3,?4)").unwrap().execute(rusqlite::params![retired.id,task.as_str(),payload,format!("{:x}",Sha256::digest(payload.as_bytes()))]).unwrap();
     }
     tx.commit().unwrap();
     let alias=other.join(".state/socket-alias");std::os::unix::fs::symlink(&route.socket,&alias).unwrap();
@@ -4898,7 +4895,7 @@ fn staged_pane_selection_ignores_other_panes_and_preserves_provenance_fences() {
         for n in 0..history {
             // Modeled receipts for unrelated panes deliberately lack input
             // provenance. Full administrative inventory must still refuse them.
-            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?1,?2,1,1,?3)",rusqlite::params![if n%2==0 {"runtime.launch_target"}else{"runtime.launch_workspace"},format!("cold-pane-{n}"),json!({"route":{"pane_id":format!("other-pane-{n}")}}).to_string()]).unwrap();
+            tx.prepare_cached("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?1,?2,1,1,?3)").unwrap().execute(rusqlite::params![if n%2==0 {"runtime.launch_target"}else{"runtime.launch_workspace"},format!("cold-pane-{n}"),json!({"route":{"pane_id":format!("other-pane-{n}")}}).to_string()]).unwrap();
         }
         tx.commit().unwrap();
         let mut limits=budget();let steps=Arc::new(AtomicU64::new(0));limits.sql_steps=Some(steps.clone());
@@ -4959,10 +4956,10 @@ fn retained_pane_projection_excludes_reused_history_and_tracks_recovery_boundari
             // Model archived relational keys sharing this pane. Payloads are
             // intentionally not fresh authority for these synthetic operations.
             let op=format!("archived-launch-{n}");let attempt=format!("archived-attempt-{n}");
-            tx.execute("INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) SELECT ?1,task_id,1,'cancelled',NULL,?1,1 FROM attempts WHERE id=?2",rusqlite::params![attempt,target.attempt.as_str()]).unwrap();
-            tx.execute("INSERT INTO attempt_inputs SELECT ?1,?2,payload,payload_hash FROM attempt_inputs WHERE operation_id=?3",rusqlite::params![attempt,op,target.operation.as_str()]).unwrap();
+            tx.prepare_cached("INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) SELECT ?1,task_id,1,'cancelled',NULL,?1,1 FROM attempts WHERE id=?2").unwrap().execute(rusqlite::params![attempt,target.attempt.as_str()]).unwrap();
+            tx.prepare_cached("INSERT INTO attempt_inputs SELECT ?1,?2,payload,payload_hash FROM attempt_inputs WHERE operation_id=?3").unwrap().execute(rusqlite::params![attempt,op,target.operation.as_str()]).unwrap();
             for kind in ["runtime.launch_started","runtime.launch_target"] {
-                tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) SELECT kind,?1,revision,payload_version,payload FROM events WHERE entity=?2 AND kind=?3",rusqlite::params![op,target.operation.as_str(),kind]).unwrap();
+                tx.prepare_cached("INSERT INTO events(kind,entity,revision,payload_version,payload) SELECT kind,?1,revision,payload_version,payload FROM events WHERE entity=?2 AND kind=?3").unwrap().execute(rusqlite::params![op,target.operation.as_str(),kind]).unwrap();
             }
         }
         tx.commit().unwrap();

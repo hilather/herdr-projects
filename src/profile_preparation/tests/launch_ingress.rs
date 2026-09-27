@@ -618,10 +618,10 @@ fn worktree_preparation_uses_selected_history_through_receipt_commit() {
             let mut retired=template.clone();let task=TaskId::new(format!("retired-worktree-{n}")).unwrap();
             retired.id=format!("task:{}",task.as_str());retired.task=Some(task.clone());
             retired.source_path=None;retired.source_digest=None;retired.session_source_digest=None;retired.identity=Default::default();
-            tx.execute("INSERT INTO tasks(id,revision,state,title) VALUES(?1,1,'cancelled','retired')",[task.as_str()]).unwrap();
+            tx.prepare_cached("INSERT INTO tasks(id,revision,state,title) VALUES(?1,1,'cancelled','retired')").unwrap().execute([task.as_str()]).unwrap();
             let payload=serde_json::to_string(&retired).unwrap();
-            tx.execute("INSERT INTO runtime_bindings VALUES(?1,?2,1,NULL,?3,?4)",rusqlite::params![retired.id,task.as_str(),payload,format!("{:x}",Sha256::digest(payload.as_bytes()))]).unwrap();
-            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('historical.noise',?1,1,1,'{}')", [format!("worktree-noise-{n}")]).unwrap();
+            tx.prepare_cached("INSERT INTO runtime_bindings VALUES(?1,?2,1,NULL,?3,?4)").unwrap().execute(rusqlite::params![retired.id,task.as_str(),payload,format!("{:x}",Sha256::digest(payload.as_bytes()))]).unwrap();
+            tx.prepare_cached("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('historical.noise',?1,1,1,'{}')").unwrap().execute([format!("worktree-noise-{n}")]).unwrap();
         }
         tx.commit().unwrap();
         let observed = SqlWork::default();
@@ -670,7 +670,7 @@ fn worktree_verification_and_stop_select_only_their_launch_provenance() {
     for n in 0..10_000 {
         // Unrelated corrupt provenance must remain an administrative/inventory
         // error, without blocking verification or cancellation of this launch.
-        tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?1,?2,1,1,'{}')",rusqlite::params![if n%2==0 {"runtime.worktrees_creation"} else {"runtime.worktrees_ready"},format!("cold-worktree-{n}")]).unwrap();
+        tx.prepare_cached("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?1,?2,1,1,'{}')").unwrap().execute(rusqlite::params![if n%2==0 {"runtime.worktrees_creation"} else {"runtime.worktrees_ready"},format!("cold-worktree-{n}")]).unwrap();
     }
     tx.commit().unwrap();
     assert_eq!(selected(&mut budget()).unwrap(),expected);
