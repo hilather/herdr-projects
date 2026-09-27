@@ -101,6 +101,7 @@ fn selected_occurrence(db:&Connection,id:&OperationId,budget:Option<&read_budget
     if cursor!=last {return Err(corrupt("routine cursor does not match immutable occurrence history"));}
     Ok((definition,occurrence))
 }
+pub(super) fn selected(db:&Connection,id:&OperationId)->Result<(RoutineDefinition,RoutineOccurrence)> {schema(db)?;selected_occurrence(db,id,None)}
 pub(super) fn check(db:&Connection,id:&OperationId)->Result<()> {
     schema(db)?;let(definition,_)=selected_occurrence(db,id,None)?;
     let latest:u64=db.query_row("SELECT MAX(revision) FROM routine_revisions WHERE name=?1",[&definition.name],|r|r.get(0))?;

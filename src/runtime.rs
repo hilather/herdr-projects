@@ -20,8 +20,7 @@ pub fn rename_task(project:&Path,id:&TaskId,title:String,expected_revision:u64,e
     ensure!(!title.trim().is_empty() && title.len()<=16_000,"title must contain 1–16000 bytes");
     let _maintenance=migration::runtime_mutation(project)?;
     let mut db=migration::open_active(project)?;
-    let snapshot=db.read_snapshot(Some(expected_head))?;
-    let mut task=snapshot.tasks.into_iter().find(|t|&t.id==id).context("task not found")?;
+    let mut task=db.task_at(id,Some(expected_head))?.context("task not found")?;
     ensure!(task.revision==expected_revision,"task revision conflict");
     ensure!(task.active_attempt.is_none(),"cannot edit a task with an active attempt");
     task.revision=task.revision.checked_add(1).context("task revision exhausted")?;task.title=title;
@@ -79,7 +78,7 @@ pub fn expire_operations(project:&Path)->Result<usize> {
 pub fn observe_imported_receipts(project:&Path,expected_head:Option<u64>)->Result<crate::operations::receipts::ReceiptReport> {
     let _maintenance=migration::runtime_mutation(project)?;
     let mut db=migration::open_active(project)?;
-    let head=match expected_head {Some(head)=>head,None=>db.read_snapshot(None)?.head};
+    let head=match expected_head {Some(head)=>head,None=>db.current_head()?};
     Ok(db.observe_imported_receipts(head,jiff::Timestamp::now().as_millisecond(),expected_head.is_some())?)
 }
 
@@ -183,7 +182,7 @@ pub fn enqueue_finalization(project:&Path,expected_head:u64,operation:crate::dom
     let _maintenance=migration::runtime_mutation(project)?;let mut db=migration::open_active(project)?;
     let payload=crate::operations::finalization::Finalization::decode(&operation)?;
     let config=migration::config_reference(Path::new(&payload.config.path))?;
-    payload.validate(&operation,&db.read_snapshot(Some(expected_head))?,&config)?;
+    payload.validate_rows(&operation,&db.finalization_rows(&operation,&payload.binding,Some(expected_head))?,&config)?;
     db.commit(Commit{expected_head,mutations:vec![Mutation::Enqueue(operation.clone())]})?;Ok(operation)
 }
 

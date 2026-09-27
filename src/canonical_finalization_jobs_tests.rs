@@ -1,7 +1,7 @@
 use super::*;
 use std::fs;
 use crate::finalization_delivery::tests::fixture;
-use herdr_projects::domain::TaskState;
+use herdr_projects::{domain::TaskState,runtime};
 fn input(ctx:&Ctx,path:&Path,op:&Operation,revision:u64,mode:Mode)->Input {serde_json::from_str(request(ctx,path,op,revision,mode).unwrap().command.stdin.as_ref().unwrap()).unwrap()}
 fn control()->Control {Control::default()}
 

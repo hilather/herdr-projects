@@ -340,17 +340,17 @@ fn read_attempt_with_budget(db:&Connection,id:&AttemptId,budget:Option<&read_bud
     decode(serde_json::json!({"id":r.get::<_,String>(0)?,"task":r.get::<_,String>(1)?,"revision":r.get::<_,u64>(2)?,"state":r.get::<_,String>(3)?,"snapshot":r.get::<_,Option<String>>(4)?,"reservation":r.get::<_,String>(5)?,"termination_observed":r.get::<_,bool>(6)?}))
 }
 fn read_retained_attempts_with_budget(db:&Connection,budget:Option<&read_budget::ReadBudget>)->Result<Vec<Attempt>> {
-    let attempts=read_attempt_rows(db, "SELECT id,task_id,revision,state,snapshot,reservation,termination_observed FROM attempts WHERE termination_observed=0 ORDER BY id LIMIT 1025", budget)?;
+    let attempts=read_attempt_rows(db, "SELECT id,task_id,revision,state,snapshot,reservation,termination_observed FROM attempts WHERE termination_observed=0 ORDER BY id LIMIT 1025", params![], budget)?;
     if attempts.len()>1024 {return Err(StoreError::Limit("retained admission attempt limit exceeded".into()));}
     Ok(attempts)
 }
 fn read_attempts(db: &Connection) -> Result<Vec<Attempt>> { read_attempts_with_budget(db, None) }
 fn read_attempts_with_budget(db: &Connection, budget: Option<&read_budget::ReadBudget>) -> Result<Vec<Attempt>> {
-    read_attempt_rows(db, "SELECT id,task_id,revision,state,snapshot,reservation,termination_observed FROM attempts ORDER BY id", budget)
+    read_attempt_rows(db, "SELECT id,task_id,revision,state,snapshot,reservation,termination_observed FROM attempts ORDER BY id", params![], budget)
 }
-fn read_attempt_rows(db: &Connection, sql: &str, budget: Option<&read_budget::ReadBudget>) -> Result<Vec<Attempt>> {
+fn read_attempt_rows(db: &Connection, sql: &str, params: impl rusqlite::Params, budget: Option<&read_budget::ReadBudget>) -> Result<Vec<Attempt>> {
     let mut stmt = db.prepare(sql)?;
-    let mut rows = stmt.query([])?;
+    let mut rows = stmt.query(params)?;
     let mut result = Vec::new();
     while let Some(r) = rows.next()? {
         if let Some(budget) = budget { budget.row(r, &[])?; }
@@ -455,6 +455,8 @@ mod memory_invalidation;
 mod memory_reconciliation;
 mod worker_knowledge;
 mod targeted;
+pub(crate) mod effect_rows;
+pub use effect_rows::FinalizationRows;
 pub use targeted::{hot_path_uses_snapshot, targeted_mismatch_count, HotPathRead, HOT_PATH_READ};
 mod observability;
 pub use observability::FactoryNumbers;

@@ -121,6 +121,94 @@ fn signed_routine_cli_records_then_explicitly_executes_once_with_durable_cleanup
     }
 }
 
+/// Retire 10,000 unrelated tasks/operations and add one undecodable cold row of
+/// each kind. The event head is unchanged, and any whole-history read now fails.
+#[cfg(feature="state-store")]
+fn retire_history(project:&Path) {
+    use sha2::{Digest,Sha256};
+    let mut raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();
+    let tx=raw.transaction().unwrap();let hash=format!("{:x}",Sha256::digest(b"{}"));
+    for n in 0..10_000 {
+        tx.execute("INSERT INTO tasks(id,revision,state,title,active_attempt) VALUES(?1,1,'succeeded','retired',NULL)",[format!("retired-{n}")]).unwrap();
+        tx.execute("INSERT INTO operations(id,task_id,kind,target,payload_version,payload,payload_hash,expected_revision,due_unix_ms,idempotency_key) VALUES(?1,?1,'runtime.retired','retired',1,'{}',?2,1,0,?1)",[format!("retired-{n}"),hash.clone()]).unwrap();
+    }
+    tx.execute_batch("UPDATE operation_delivery SET state='confirmed' WHERE operation_id LIKE 'retired-%';
+        INSERT INTO tasks(id,revision,state,title,active_attempt) VALUES('cold-history',1,'succeeded',CAST(x'ff' AS TEXT),NULL);
+        INSERT INTO operations(id,task_id,kind,target,payload_version,payload,payload_hash,expected_revision,due_unix_ms,idempotency_key) VALUES('cold-op','cold-history','runtime.retired','retired',1,'{}',printf('%064d',0),1,0,'cold-op');
+        UPDATE operation_delivery SET state='confirmed' WHERE operation_id='cold-op';").unwrap();
+    tx.commit().unwrap();
+    assert!(herdr_projects::runtime::snapshot(project).is_err(),"cold history must make whole-history reads fail");
+}
+
+#[cfg(all(feature="state-store",target_os="linux"))]
+#[test]
+fn effect_commands_read_only_their_rows_with_ten_thousand_retired_neighbors() {
+    use herdr_projects::{domain::*,authority,migration,runtime};
+    use sha2::{Digest,Sha256};
+    let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
+    for project in ["demo","fin"] {for action in ["new","pause"] {assert!(hp(home.path(),&["--root",r,action,project]).status.success());}}
+    let head_of=|project:&Path|rusqlite::Connection::open(project.join(".state/state.db")).unwrap().query_row("SELECT MAX(sequence) FROM events",[],|row|row.get::<_,u64>(0)).unwrap();
+    let delivery_of=|project:&Path,id:&str|rusqlite::Connection::open(project.join(".state/state.db")).unwrap().query_row("SELECT state,revision FROM operation_delivery WHERE operation_id=?1",[id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,u64>(1)?))).unwrap();
+
+    // Finalization: an ambiguous capture whose receipt is still unverified.
+    let fin=root.join("fin");let source=home.path().join("source");std::fs::create_dir_all(source.join("library")).unwrap();std::fs::write(source.join("report.md"),"report\n").unwrap();std::fs::write(source.join("library/result"),"bytes").unwrap();
+    std::fs::write(fin.join("threads/t-0001.toml"),format!("id='t-0001'\nstatus='resolved'\nthread_dir={}\n",serde_json::to_string(source.to_str().unwrap()).unwrap())).unwrap();
+    let plan=migration::inspect(&fin).unwrap();migration::apply(&fin,&plan,true).unwrap();
+    let out=hp(home.path(),&["--root",r,"operations","fin","finalize","thread:t-0001","--reason","review","--expected-head",&head_of(&fin).to_string()]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let op:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();let fin_op=op["id"].as_str().unwrap().to_owned();
+    std::fs::write(source.join("report.md"),"changed\n").unwrap();
+    let out=hp(home.path(),&["--root",r,"operations","fin","deliver-finalization",&fin_op,"--expected-revision","1"]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let (state,revision)=delivery_of(&fin,&fin_op);assert_eq!(state,"ambiguous");
+    let observe=|head:u64|{let started=std::time::Instant::now();let out=hp(home.path(),&["--root",r,"operations","fin","observe-finalization",&fin_op,"--expected-revision",&revision.to_string(),"--expected-head",&head.to_string()]);(out,started.elapsed())};
+    let (empty,empty_time)=observe(head_of(&fin));assert!(!empty.status.success());
+    let unresolved=String::from_utf8_lossy(&empty.stderr).into_owned();assert!(unresolved.contains("no verified finalization receipt"),"{unresolved}");
+
+    // Routine: one scheduled, enabled occurrence awaiting explicit execution.
+    let key=home.path().join("owner");assert!(Command::new("/usr/bin/ssh-keygen").args(["-q","-t","ed25519","-N","","-f"]).arg(&key).output().unwrap().status.success());
+    let public=std::fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+    let project=root.join("demo");let config=home.path().join("owner.toml");
+    std::fs::write(&config,format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[safety.{:?}]\nroutine_commands=true\n",project.display().to_string())).unwrap();
+    let plan=migration::inspect_with_config(&project,&config).unwrap();migration::apply(&project,&plan,true).unwrap();
+    let s=runtime::snapshot(&project).unwrap();runtime::set_state(&project,s.head,s.control.unwrap().revision,ProjectState::Active,&config).unwrap();
+    runtime::add_task(&project,TaskId::new("live").unwrap(),"live".into(),head_of(&project)).unwrap();
+    let script=project.join("check.sh");let bytes=b"printf once >> ROUTINE_MARKER\n";std::fs::write(&script,bytes).unwrap();
+    let definition=RoutineDefinition{version:1,name:"check".into(),revision:1,project_store:project.join(".state/state.db").canonicalize().unwrap().display().to_string(),
+        authority:authority::policy_reference(&project).unwrap(),config:migration::config_reference(&config).unwrap(),enabled:true,schedule:"every 1m".into(),timezone:"UTC".into(),start_unix_ms:0,
+        missed:MissedRunPolicy::CoalesceLatest,overlap:OverlapPolicy::Skip,script:script.display().to_string(),script_sha256:format!("{:x}",Sha256::digest(bytes)),cwd:project.display().to_string(),deadline_ms:1000,output_cap_bytes:4000};
+    let document=home.path().join("routine.json");std::fs::write(&document,serde_json::to_vec(&definition).unwrap()).unwrap();
+    assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&key).args(["-n",authority::ROUTINE_SIGNATURE_NAMESPACE]).arg(&document).output().unwrap().status.success());
+    let signature=home.path().join("routine.json.sig");
+    let out=hp(home.path(),&["--root",r,"routine-store","demo","import",document.to_str().unwrap(),signature.to_str().unwrap(),"--expected-head",&head_of(&project).to_string()]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let out=hp(home.path(),&["--root",r,"routine-store","demo","schedule","check","--expected-head",&head_of(&project).to_string()]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let routine_op=runtime::snapshot(&project).unwrap().operations[0].id.as_str().to_owned();
+
+    // Retain 10,000 unrelated rows plus undecodable cold rows in both stores.
+    retire_history(&fin);retire_history(&project);
+    let (fin_head,head)=(head_of(&fin),head_of(&project));
+
+    let (retained,retained_time)=observe(fin_head);assert!(!retained.status.success());
+    let stderr=String::from_utf8_lossy(&retained.stderr);assert!(stderr.contains("no verified finalization receipt"),"observation scanned retained history: {stderr}");
+    assert_eq!(delivery_of(&fin,&fin_op),(state.clone(),revision));assert_eq!(head_of(&fin),fin_head);
+    let stale=observe(fin_head-1).0;assert!(!stale.status.success()&&!String::from_utf8_lossy(&stale.stderr).contains("no verified finalization receipt"),"a stale head must be refused before the receipt check");
+    println!("finalization observe wall time: empty history={empty_time:?}, 10,000 retained={retained_time:?}");
+
+    // A stale head is refused before any claim; the current head executes once.
+    let stale=hp(home.path(),&["--root",r,"routine-store","demo","execute",&routine_op,"--expected-head",&(head-1).to_string()]);assert!(!stale.status.success());
+    assert_eq!(delivery_of(&project,&routine_op),("pending".into(),1));assert!(!project.join("ROUTINE_MARKER").exists());
+    let out=hp(home.path(),&["--root",r,"routine-store","demo","execute",&routine_op,"--expected-head",&head.to_string()]);
+    assert!(out.status.success(),"routine execution scanned retained history: {}",String::from_utf8_lossy(&out.stderr));
+    let receipt:RoutineReceipt=serde_json::from_slice(&out.stdout).unwrap();assert!(receipt.succeeded&&receipt.cleanup_verified,"{receipt:?}");
+    assert_eq!(delivery_of(&project,&routine_op).0,"confirmed");assert_eq!(std::fs::read(project.join("ROUTINE_MARKER")).unwrap(),b"once");
+    let replay=hp(home.path(),&["--root",r,"routine-store","demo","execute",&routine_op,"--expected-head",&head_of(&project).to_string()]);assert!(!replay.status.success());
+    assert_eq!(std::fs::read(project.join("ROUTINE_MARKER")).unwrap(),b"once");
+
+    // Operator task rename reads one task and the head only; fences still hold.
+    let head=head_of(&project);let out=hp(home.path(),&["--root",r,"task","demo","rename","live","--title","renamed","--expected-revision","1","--expected-head",&head.to_string()]);
+    assert!(out.status.success(),"task rename scanned retained history: {}",String::from_utf8_lossy(&out.stderr));assert_eq!(head_of(&project),head+1);
+    assert!(!hp(home.path(),&["--root",r,"task","demo","rename","live","--title","again","--expected-revision","1","--expected-head",&head_of(&project).to_string()]).status.success(),"a stale task revision must still be refused");
+    assert!(!hp(home.path(),&["--root",r,"task","demo","rename","live","--title","again","--expected-revision","2","--expected-head",&head.to_string()]).status.success(),"a stale head must still be refused");
+}
+
 #[cfg(feature="state-store")]
 #[test]
 fn approval_cli_uses_pinned_policy_and_refuses_unsigned_import() {

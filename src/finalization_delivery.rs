@@ -116,11 +116,11 @@ pub fn deliver(ctx:&Ctx,path:&Path,id:&OperationId,revision:u64)->Result<Dispatc
 }
 pub fn observe(ctx:&Ctx,path:&Path,id:&OperationId,revision:u64,head:u64)->Result<Delivery> {
     let control=Control::default();let path=path.canonicalize()?;let _lease=cleanup::lease(path.parent().context("project has no root")?)?;
-    let mut db=migration::open_active(&path)?;let snapshot=db.read_snapshot(Some(head))?;
-    let op=snapshot.operations.iter().find(|o|&o.id==id).context("operation not found")?;
-    let payload=Finalization::decode(op)?;payload.validate(op,&snapshot,&crate::notification_delivery::config(ctx,&path)?)?;
+    let mut db=migration::open_active(&path)?;let (_,rows)=db.operation_rows(id,Some(head))?;
+    let (op,_)=rows.context("operation not found")?;let op=&op;
+    let payload=Finalization::decode(op)?;payload.validate_rows(op,&db.finalization_rows(op,&payload.binding,Some(head))?,&crate::notification_delivery::config(ctx,&path)?)?;
     let receipt=load_receipt_controlled(&project(&path)?,op,&payload,&control)?.context("no verified finalization receipt; intent remains unresolved")?;
-    control.check()?;payload.validate(op,&db.read_snapshot(Some(head))?,&crate::notification_delivery::config(ctx,&path)?)?;control.check()?;
+    control.check()?;payload.validate_rows(op,&db.finalization_rows(op,&payload.binding,Some(head))?,&crate::notification_delivery::config(ctx,&path)?)?;control.check()?;
     Ok(db.observe_finalization(id,revision,head,&receipt,jiff::Timestamp::now().as_millisecond())?)
 }
 

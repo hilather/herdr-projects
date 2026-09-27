@@ -3,7 +3,7 @@ use std::{path::{Path,PathBuf},os::unix::fs::MetadataExt,sync::Arc,time::{Durati
 use anyhow::{Result,Context,ensure};
 use serde::{Serialize,Deserialize};
 use crate::{paths::{Ctx,Env},runner::{Runner,Cmd,Output},source_tree::{Control,Directory},finalization_delivery as receipt};
-use herdr_projects::{runtime,migration,execution_guard::ProjectGuard,domain::{Operation,OperationId,Snapshot},operations::{Claim,Outcome,DeliveryState,finalization::{Finalization,FinalizationReceipt,digest},dispatch::{self,DeliveryAdapter,PreparedDelivery,DispatchRequest,DispatchResult}}};
+use herdr_projects::{migration,execution_guard::ProjectGuard,domain::{Operation,OperationId},operations::{Claim,Outcome,DeliveryState,finalization::{Finalization,FinalizationReceipt,digest},dispatch::{self,DeliveryAdapter,PreparedDelivery,DispatchRequest,DispatchResult}}};
 const JOB:&str="\0herdr-projects-canonical-finalization";
 const BUDGET:Duration=Duration::from_secs(180);
 #[derive(Clone,Copy,Serialize,Deserialize,PartialEq,Eq)]
@@ -31,10 +31,11 @@ struct Adapter<'a,'b> {input:&'a Input,ctx:&'a Ctx<'b>,control:&'a Control,guard
 struct Prepared<'a,'b> {adapter:Adapter<'a,'b>,payload:Finalization,source:Source}
 enum Source {Receipt,Original((u64,u64)),#[cfg(target_os="linux")] Preserved}
 impl Adapter<'_,'_> {
-    fn validate(&self,operation:&Operation,payload:&Finalization)->Result<Snapshot> {
+    /// Returns the event head the intent was validated at.
+    fn validate(&self,operation:&Operation,payload:&Finalization)->Result<u64> {
         self.input.current(self.ctx,self.guard,self.control)?;
         ensure!(operation.id==self.input.operation&&digest(&serde_json::to_vec(operation)?)==self.input.operation_digest,"finalization operation changed");
-        let snapshot=runtime::snapshot(&self.input.project)?;payload.validate(operation,&snapshot,&self.input.config_reference)?;self.control.check()?;Ok(snapshot)
+        let rows=migration::open_active(&self.input.project)?.finalization_rows(operation,&payload.binding,None)?;payload.validate_rows(operation,&rows,&self.input.config_reference)?;self.control.check()?;Ok(rows.head)
     }
     fn claim(&self,operation:&Operation,payload:&Finalization,claim:&Claim)->Result<()> {
         self.validate(operation,payload)?;
@@ -92,12 +93,12 @@ fn execute(input:&Input,control:&Control)->Result<()> {
     let env=Env::for_observation(&input.home,&input.bin);let ctx=Ctx{env:&env,root:input.project.parent().context("finalization root missing")?.into(),config_dir:input.config.clone(),runner:&crate::runner::RealRunner,detached_ticker:false};
     input.current(&ctx,&guard,control)?;let mut db=migration::open_active(&input.project)?;let mut adapter=Adapter{input,ctx:&ctx,control,guard:&guard};
     if input.mode==Mode::Observe {
-        let snapshot=db.read_snapshot(None)?;let operation=snapshot.operations.iter().find(|op|op.id==input.operation).context("finalization operation missing")?;
-        let payload=Finalization::decode(operation)?;adapter.validate(operation,&payload)?;
-        ensure!(snapshot.deliveries.iter().any(|d|d.operation==input.operation&&d.revision==input.revision&&d.state==DeliveryState::Ambiguous),"finalization observation is stale");
-        let retained=receipt::load_receipt_controlled(&receipt::project(&input.project)?,operation,&payload,control)?.context("no verified finalization receipt; intent remains unresolved")?;
-        ensure!(adapter.validate(operation,&payload)?.head==snapshot.head,"finalization observation head changed");control.check()?;
-        db.observe_finalization(&input.operation,input.revision,snapshot.head,&retained,jiff::Timestamp::now().as_millisecond())?;return Ok(());
+        let (head,rows)=db.operation_rows(&input.operation,None)?;let (operation,delivery)=rows.context("finalization operation missing")?;
+        let payload=Finalization::decode(&operation)?;adapter.validate(&operation,&payload)?;
+        ensure!(delivery.revision==input.revision&&delivery.state==DeliveryState::Ambiguous,"finalization observation is stale");
+        let retained=receipt::load_receipt_controlled(&receipt::project(&input.project)?,&operation,&payload,control)?.context("no verified finalization receipt; intent remains unresolved")?;
+        ensure!(adapter.validate(&operation,&payload)?==head,"finalization observation head changed");control.check()?;
+        db.observe_finalization(&input.operation,input.revision,head,&retained,jiff::Timestamp::now().as_millisecond())?;return Ok(());
     }
     let result=dispatch::dispatch_one(&mut db,DispatchRequest{operation:&input.operation,expected_revision:input.revision,owner:"ticker.finalization",lease_ms:300_000},&mut adapter,||jiff::Timestamp::now().as_millisecond())?;
     match result {DispatchResult::Recorded(_)=>Ok(()),DispatchResult::Unrecorded{..}=>anyhow::bail!("canonical finalization outcome unrecorded; retain claim and observe after expiry")}

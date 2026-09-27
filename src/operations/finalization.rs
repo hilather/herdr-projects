@@ -34,9 +34,16 @@ impl Finalization {
     }
     pub fn artifact_key(&self)->String {format!("runtime-{}",digest(self.binding.as_bytes()))}
     pub fn validate<'a>(&self,op:&Operation,snapshot:&'a Snapshot,config:&ConfigReference)->Result<&'a RuntimeBinding> {
+        self.validate_parts(op,snapshot.control.as_ref().context("upgrade-store required")?,&snapshot.tasks,&snapshot.attempts,&snapshot.runtime_bindings,config)
+    }
+    /// Same checks as `validate`, over only the indexed rows the intent names.
+    pub fn validate_rows<'a>(&self,op:&Operation,rows:&'a crate::store::FinalizationRows,config:&ConfigReference)->Result<&'a RuntimeBinding> {
+        self.validate_parts(op,&rows.control,&rows.tasks,&rows.attempts,&rows.bindings,config)
+    }
+    fn validate_parts<'a>(&self,op:&Operation,control:&crate::domain::ProjectControl,tasks:&[crate::domain::Task],attempts:&[crate::domain::Attempt],bindings:&'a [RuntimeBinding],config:&ConfigReference)->Result<&'a RuntimeBinding> {
         ensure!(self.authority=="operator.artifact_finalization"&&&self.config==config,"finalization authority or config changed");
         ensure!(hash(&self.report_hash)&&!self.reason.trim().is_empty()&&self.reason.len()<=4096,"invalid finalization evidence/reason");
-        self.validate_state(op,snapshot.control.as_ref().context("upgrade-store required")?,&snapshot.tasks,&snapshot.attempts,&snapshot.runtime_bindings)
+        self.validate_state(op,control,tasks,attempts,bindings)
     }
     pub fn validate_state<'a>(&self,op:&Operation,control:&crate::domain::ProjectControl,tasks:&[crate::domain::Task],attempts:&[crate::domain::Attempt],bindings:&'a [RuntimeBinding])->Result<&'a RuntimeBinding> {
         ensure!(self.authority=="operator.artifact_finalization"&&hash(&self.report_hash)&&!self.reason.trim().is_empty()&&self.reason.len()<=4096,"invalid finalization scope or evidence");

@@ -405,6 +405,12 @@ impl ControlledStore {
         let value=self.store.read_snapshot_with_budget(at,Some(&budget)).map_err(|e|self.error(e))?;
         self.control.check()?;Ok(value)
     }
+    pub(crate) fn launch_rows(&mut self,at:u64,task:&TaskId,binding:&str,approval:Option<&VersionedReference>)->Result<super::effect_rows::LaunchRows> {
+        self.control.check()?;
+        let budget=read_budget::ReadBudget::new(self.control.clone());
+        let value=self.store.launch_rows(at,task,binding,approval,Some(&budget)).map_err(|e|self.error(e))?;
+        self.control.check()?;Ok(value)
+    }
     #[cfg(target_os="linux")]
     pub fn native_profile_report(&mut self, reference:&VersionedReference)->Result<Option<serde_json::Value>> {
         self.control.check()?;

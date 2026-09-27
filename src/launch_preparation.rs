@@ -1,5 +1,5 @@
 //! Trusted launch draft/reservation ingress. Selectors are data, never authority.
-use crate::{domain::*, profile_preparation::RevalidatedProfile, runner::Cancellation, store::controlled::ControlledStore};
+use crate::{domain::*, profile_preparation::RevalidatedProfile, runner::Cancellation, store::{controlled::ControlledStore, effect_rows::LaunchRows}};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, path::{Path, PathBuf}, time::{Duration, Instant}};
@@ -66,14 +66,14 @@ fn repository(proof: &RevalidatedProfile, path: &Path) -> Result<RepositoryInput
 }
 
 fn inputs(
-    proof: &RevalidatedProfile, selection: &LaunchSelection, state: &Snapshot,
+    proof: &RevalidatedProfile, selection: &LaunchSelection, state: &LaunchRows,
     approval: VersionedReference,
 ) -> Result<LaunchInputs> {
     let profile = proof.launch_profile()?.clone();
     ensure!(selection.profile == *proof.reference(), "selected profile differs from live proof");
     ensure!(selection.repositories.len() <= 64, "too many repository selections");
-    let task = state.tasks.iter().find(|t|t.id==selection.task).context("selected task missing")?;
-    let binding = state.runtime_bindings.iter().find(|b|b.id==selection.binding && b.task.as_ref()==Some(&task.id))
+    let task = state.task.as_ref().filter(|t|t.id==selection.task).context("selected task missing")?;
+    let binding = state.binding.as_ref().filter(|b|b.id==selection.binding && b.task.as_ref()==Some(&task.id))
         .context("selected task binding missing")?;
     let route = RuntimeRoute::from_identity(&binding.identity);
     route.validate().map_err(anyhow::Error::msg)?;
@@ -91,13 +91,13 @@ fn inputs(
     Ok(LaunchInputs {
         task_contract: None, version: 2, project_store: proof.store_path().to_str().context("project store is not UTF-8")?.into(),
         task: task.id.clone(), task_revision: task.revision,
-        scheduler_revision: state.scheduler.as_ref().context("scheduler missing")?.policy.revision,
-        control_epoch: state.control.as_ref().context("project control missing")?.epoch,
+        scheduler_revision: state.scheduler_revision,
+        control_epoch: state.control_epoch,
         binding: binding.id.clone(), binding_revision: binding.revision,
         binding_digest: crate::store::ownership::identity_digest(binding)?,
         profile: proof.reference().clone(), config: profile.config.clone(), effective_profile: Some(profile),
         approval, repositories, dependencies: Vec::new(), memory: Some(selection.knowledge.clone()),
-        budget: state.budget_policies.last().map(BudgetPolicy::reference).transpose().map_err(anyhow::Error::msg)?,
+        budget: state.budget.clone(),
     })
 }
 
@@ -171,7 +171,7 @@ pub fn draft(
     let proof = crate::profile_preparation::revalidate(project,&selection.profile,deadline,cancellation)?;
     let project = project.canonicalize()?;
     let mut db = crate::migration::open_active_controlled(&project,proof.read_control())?;
-    let state = db.read_snapshot(Some(expected_head))?;
+    let state = db.launch_rows(expected_head,&selection.task,&selection.binding,None)?;
     let mut inputs = inputs(&proof,selection,&state,pending_approval())?;
     inputs.task_contract = db.task_contract_reference(inputs.task.as_str())?;
     db.validate_launch_draft(&inputs,expected_head,now())?;
@@ -184,7 +184,7 @@ pub fn draft(
     proof.validate_for_launch()?;
     db.validate_launch_draft(&inputs,expected_head,now())?;
     let (attempt,_) = crate::store::reservations::record_ids(&inputs)?;
-    let binding=state.runtime_bindings.iter().find(|b|b.id==selection.binding).context("launch binding missing")?;
+    let binding=state.binding.as_ref().filter(|b|b.id==selection.binding).context("launch binding missing")?;
     worktree_execution_route(&inputs,&attempt,&binding.identity).map_err(anyhow::Error::msg)?;
     let worktrees = if inputs.repositories.is_empty() {vec![]} else {worktree_plans(&inputs,&attempt).map_err(anyhow::Error::msg)?};
     Ok(LaunchDraft { head: expected_head, inputs, approval, brief, worktrees })
@@ -199,16 +199,16 @@ pub fn reserve(
     let proof = crate::profile_preparation::revalidate(project,&selection.profile,deadline,cancellation)?;
     let project = project.canonicalize()?;
     let mut db = crate::migration::open_active_controlled(&project,proof.read_control())?;
-    let state = db.read_snapshot(Some(expected_head))?;
+    let state = db.launch_rows(expected_head,&selection.task,&selection.binding,Some(approval))?;
     let mut inputs = inputs(&proof,selection,&state,approval.clone())?;
     inputs.task_contract = db.task_contract_reference(inputs.task.as_str())?;
     db.validate_launch_draft(&inputs,expected_head,now())?;
-    let installed = state.approvals.iter().find(|a|a.reference==*approval).context("signed launch approval is not installed")?;
-    ensure!(installed.revoked.is_none() && installed.consumed.is_none(), "launch approval is unavailable");
-    installed.grant.matches_launch(&inputs,&inputs.project_store,now()).map_err(anyhow::Error::msg)?;
+    let (grant,revoked,consumed) = state.approval.as_ref().filter(|(grant,..)|grant.reference().ok().as_ref()==Some(approval)).context("signed launch approval is not installed")?;
+    ensure!(!revoked && !consumed, "launch approval is unavailable");
+    grant.matches_launch(&inputs,&inputs.project_store,now()).map_err(anyhow::Error::msg)?;
     brief(&project,&mut db,&inputs)?;
     let (attempt,_) = crate::store::reservations::record_ids(&inputs)?;
-    let binding=state.runtime_bindings.iter().find(|b|b.id==selection.binding).context("launch binding missing")?;
+    let binding=state.binding.as_ref().filter(|b|b.id==selection.binding).context("launch binding missing")?;
     worktree_execution_route(&inputs,&attempt,&binding.identity).map_err(anyhow::Error::msg)?;
     proof.validate_for_launch()?;
     Ok(db.reserve_prepared(&[PreparedLaunch { inputs }],expected_head,now())?)

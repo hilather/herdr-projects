@@ -35,10 +35,8 @@ fn execute_owned(project:&Path,operation:&crate::domain::OperationId,expected_he
     ensure!(deadline.is_none_or(|end|end>std::time::Instant::now()),"routine queue deadline elapsed");
     let _guard=migration::runtime_mutation(project)?;
     let mut db=migration::open_active(project)?;
-    let snapshot=db.read_snapshot(expected_head)?;
-    let occurrence=snapshot.routine_occurrences.iter().find(|o|o.operation.as_ref()==Some(operation)).context("routine occurrence not found")?;
-    let definition=snapshot.routine_revisions.iter().find(|d|d.reference().ok().as_ref()==Some(&occurrence.routine)).context("routine definition not found")?;
-    let delivery=snapshot.deliveries.iter().find(|d|&d.operation==operation).context("routine delivery not found")?;
+    let rows=db.routine_rows(operation,expected_head)?;
+    let (occurrence,definition,delivery)=(&rows.occurrence,&rows.definition,&rows.delivery);
     ensure!(delivery.state==DeliveryState::Pending && delivery.attempts==0,"routine already claimed; execution cannot be replayed");
     ensure!(expected_revision.is_none_or(|revision|delivery.revision==revision),"routine delivery revision changed in queue");
     let script=load_current(definition)?.context("routine is disabled")?;
