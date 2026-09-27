@@ -219,7 +219,7 @@ fn load(project:&Path)->Result<Journal> {
     ensure!(journal.plan.sources.iter().all(|s|safe_relative(&s.path)),"unsafe journal path");
     Ok(journal)
 }
-pub(crate) struct Maintenance { _locks:Vec<File>,_project:Option<crate::execution_guard::ProjectGuard>,_root:Option<crate::execution_guard::RootGuard> }
+pub(crate) struct Maintenance { _locks:Vec<crate::execution_guard::LockFile>,_project:Option<crate::execution_guard::ProjectGuard>,_root:Option<crate::execution_guard::RootGuard> }
 impl Maintenance {
     pub(crate) fn inherit_routine_execution(&self)->Result<Vec<crate::runner::InheritedLock>> {
         self._project.as_ref().context("runtime project ownership required")?.inherit_transfer()

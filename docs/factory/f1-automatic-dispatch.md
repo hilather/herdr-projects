@@ -114,5 +114,15 @@ Recorded here rather than folded into the card that found them.
 - **Opening a store runs a whole-database `quick_check`**, so even targeted
   commands grow with database size. Decide whether the per-open check can be
   scoped or moved to maintenance.
+- **Transferred locks can still outlive release.** Guards now unlock on drop
+  (#46), but a lock handed to a supervisor through `inherit_transfer` is only
+  closed, so a child forked concurrently on another thread can hold it until
+  it execs. Three unit tests still hit this in parallel runs. A fix needs a
+  gate between process spawning and transferred-lock release (about 68
+  `Command::new` sites).
+- **`approval_read_does_not_double_count_already_budgeted_inputs`** spends about
+  1.9 s of its 5 s budget even when run alone, and occasionally misses it on a
+  loaded machine. Consider building dependencies with optimisation in the test
+  profile.
 - **Replace-verdict tests** (352 in `docs/reviews/2026-09-27-test-audit.tsv`):
   convert to E2E alongside feature work, starting with `store/barriers.rs`.

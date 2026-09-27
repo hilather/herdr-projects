@@ -2,10 +2,25 @@
 //! Order: root barrier, project effect ownership, resource fences sorted by
 //! `(class, identity)`, then any short record lock. Never upgrade a shared
 //! lock in place, and never take an exclusive root guard while holding one.
-use std::{fs::{File,OpenOptions},os::unix::fs::{DirBuilderExt,OpenOptionsExt,MetadataExt},path::{Path,PathBuf}};
+use std::{fs::{File,OpenOptions},os::unix::fs::{DirBuilderExt,OpenOptionsExt,MetadataExt},path::{Path,PathBuf},sync::atomic::{AtomicBool,Ordering}};
 use anyhow::{Result,Context,ensure};
 use serde::{Deserialize,Serialize};
 use sha2::{Digest,Sha256};
+
+/// A held lock. Dropping it unlocks explicitly: a child forked by any thread
+/// shares the open file description until it execs, so merely closing the
+/// descriptor would leave the lock held for that window. A lock transferred to
+/// a supervisor must outlive this handle, so it is never unlocked here.
+pub(crate) struct LockFile {file:File,transferred:AtomicBool}
+impl LockFile {
+    /// A descriptor sharing this lock for a supervisor that keeps it held.
+    pub(crate) fn transfer(&self)->Result<File> {
+        self.transferred.store(true,Ordering::SeqCst);Ok(self.file.try_clone()?)
+    }
+}
+impl Drop for LockFile {
+    fn drop(&mut self) {if !self.transferred.load(Ordering::SeqCst) {let _=self.file.unlock();}}
+}
 
 fn lock_file(path:&Path)->Result<File> {
     let file=OpenOptions::new().read(true).write(true).create(true).truncate(false)
@@ -13,26 +28,31 @@ fn lock_file(path:&Path)->Result<File> {
     ensure!(file.metadata()?.is_file(),"execution lock must be a regular file");
     Ok(file)
 }
-pub(crate) fn exclusive_file(path:&Path)->Result<File> {
+fn held(file:File)->LockFile {LockFile{file,transferred:AtomicBool::new(false)}}
+pub(crate) fn exclusive_file(path:&Path)->Result<LockFile> {
     let file=lock_file(path)?;
     file.try_lock().with_context(|| format!("another operation owns lock {}; retry", path.display()))?;
-    Ok(file)
+    Ok(held(file))
+}
+fn shared_file(path:&Path,busy:&'static str)->Result<LockFile> {
+    let file=lock_file(path)?;
+    file.try_lock_shared().context(busy)?;
+    Ok(held(file))
 }
 
 /// Exclusive compatibility barrier for migration, cleanup and terminal effects.
-pub struct RootGuard {_file:File}
+pub struct RootGuard {_file:LockFile}
 impl RootGuard {
     #[cfg(feature="state-store")]
     pub(crate) fn inherit(&self)->Result<Vec<crate::runner::InheritedLock>> {
-        Ok(vec![crate::runner::InheritedLock::new(self._file.try_clone()?)])
+        Ok(vec![crate::runner::InheritedLock::new(self._file.transfer()?)])
     }
     pub fn exclusive(root:&Path)->Result<Self> {
         let file=exclusive_file(&root.join(".execution.lock"))?;
         Ok(Self{_file:file})
     }
     fn shared(root:&Path)->Result<Self> {
-        let file=lock_file(&root.join(".execution.lock"))?;
-        file.try_lock_shared().context("root maintenance or exclusive external operation is active; retry")?;
+        let file=shared_file(&root.join(".execution.lock"),"root maintenance or exclusive external operation is active; retry")?;
         Ok(Self{_file:file})
     }
 }
@@ -59,7 +79,7 @@ pub trait ProjectEffect {fn check_project(&self,project:&Path)->Result<()>;}
 
 /// Excludes effects within one project while preserving the root-wide barrier.
 /// Never acquire an exclusive root guard while retaining this shared guard.
-pub struct ProjectGuard {_project:File,_root:RootGuard,root:std::path::PathBuf,project:std::path::PathBuf,identity:(u64,u64)}
+pub struct ProjectGuard {_project:LockFile,_root:RootGuard,root:std::path::PathBuf,project:std::path::PathBuf,identity:(u64,u64)}
 impl ProjectEffect for ProjectGuard {fn check_project(&self,project:&Path)->Result<()> {ProjectGuard::check_project(self,project)}}
 impl ProjectGuard {
     pub fn check_project(&self,project:&Path)->Result<()> {matches_project(&self.project,self.identity,project)}
@@ -68,8 +88,8 @@ impl ProjectGuard {
     /// in the caller through publication. The historical lock name also fences
     /// routine jobs, including those surviving a previous ticker instance.
     pub fn inherit_transfer(&self)->Result<Vec<crate::runner::InheritedLock>> {
-        Ok(vec![crate::runner::InheritedLock::new(self._root._file.try_clone()?),crate::runner::InheritedLock::new(self._project.try_clone()?),
-            crate::runner::InheritedLock::new(exclusive_file(&self.root.join(".routine-execution.lock"))?)])
+        Ok(vec![crate::runner::InheritedLock::new(self._root._file.transfer()?),crate::runner::InheritedLock::new(self._project.transfer()?),
+            crate::runner::InheritedLock::new(exclusive_file(&self.root.join(".routine-execution.lock"))?.transfer()?)])
     }
     pub fn acquire(project:&Path)->Result<Self> {
         let project=project.canonicalize()?;
@@ -85,7 +105,7 @@ impl ProjectGuard {
 /// Shared project ownership for an effect that declared its footprint.
 /// The same git directory stays exclusive; a different repository does not.
 /// Holds shared root and project locks only — never upgrades them.
-pub struct ProjectSharedGuard {_project:File,_root:RootGuard,_fences:Vec<File>,_routine:File,project:PathBuf,identity:(u64,u64)}
+pub struct ProjectSharedGuard {_project:LockFile,_root:RootGuard,_fences:Vec<LockFile>,_routine:LockFile,project:PathBuf,identity:(u64,u64)}
 impl ProjectEffect for ProjectSharedGuard {fn check_project(&self,project:&Path)->Result<()> {ProjectSharedGuard::check_project(self,project)}}
 impl ProjectSharedGuard {
     pub fn check_project(&self,project:&Path)->Result<()> {matches_project(&self.project,self.identity,project)}
@@ -93,9 +113,9 @@ impl ProjectSharedGuard {
     /// so two declared footprints can overlap; exclusive routine ownership still
     /// belongs to an undeclared `ProjectGuard`.
     pub fn inherit_transfer(&self)->Result<Vec<crate::runner::InheritedLock>> {
-        let mut locks=vec![crate::runner::InheritedLock::new(self._root._file.try_clone()?),crate::runner::InheritedLock::new(self._project.try_clone()?)];
-        for fence in &self._fences {locks.push(crate::runner::InheritedLock::new(fence.try_clone()?));}
-        locks.push(crate::runner::InheritedLock::new(self._routine.try_clone()?));Ok(locks)
+        let mut locks=vec![crate::runner::InheritedLock::new(self._root._file.transfer()?),crate::runner::InheritedLock::new(self._project.transfer()?)];
+        for fence in &self._fences {locks.push(crate::runner::InheritedLock::new(fence.transfer()?));}
+        locks.push(crate::runner::InheritedLock::new(self._routine.transfer()?));Ok(locks)
     }
     pub fn acquire(project:&Path,resources:&[Resource])->Result<Self> {
         ensure!(!resources.is_empty(),"shared guard requires a declared footprint");
@@ -106,8 +126,7 @@ impl ProjectSharedGuard {
         let root_path=project.parent().context("project has no root")?.to_path_buf();
         let root=RootGuard::shared(&root_path)?;
         ensure!(std::fs::symlink_metadata(project.join(".state"))?.is_dir(),"project state must be a real directory");
-        let project_file=lock_file(&project.join(".state/effect.lock"))?;
-        project_file.try_lock_shared().context("another operation owns this project; retry")?;
+        let project_file=shared_file(&project.join(".state/effect.lock"),"another operation owns this project; retry")?;
         let dir=root_path.join(".resource-fences");
         match std::fs::symlink_metadata(&dir) {
             Ok(meta)=>ensure!(meta.is_dir()&&!meta.file_type().is_symlink(),"resource fence directory must be a real directory"),
@@ -123,8 +142,7 @@ impl ProjectSharedGuard {
             let mut hasher=Sha256::new();hasher.update(resource.class.as_bytes());hasher.update([0]);hasher.update(resource.identity.as_bytes());
             fences.push(exclusive_file(&dir.join(format!("{:x}",hasher.finalize())))?);
         }
-        let routine=lock_file(&root_path.join(".routine-execution.lock"))?;
-        routine.try_lock_shared().context("another operation owns this lock; retry")?;
+        let routine=shared_file(&root_path.join(".routine-execution.lock"),"another operation owns this lock; retry")?;
         let metadata=std::fs::metadata(&project)?;
         Ok(Self{_project:project_file,_root:root,_fences:fences,_routine:routine,project,identity:(metadata.dev(),metadata.ino())})
     }
@@ -134,7 +152,7 @@ impl ProjectSharedGuard {
 mod tests {
     use super::*;
     #[test]
-    fn concurrent_pre_exec_can_temporarily_retain_a_released_project_lock() {
+    fn released_lock_is_free_while_a_forked_child_awaits_exec_but_transferred_locks_stay_held() {
         use std::io::{Read, Write};
         use std::os::{fd::{AsRawFd, FromRawFd}, unix::process::CommandExt};
         let root = tempfile::tempdir().unwrap();
@@ -169,13 +187,20 @@ mod tests {
         let mut ready = libc::pollfd { fd: ready_read.as_raw_fd(), events: libc::POLLIN, revents: 0 };
         assert_eq!(unsafe { libc::poll(&mut ready, 1, 5000) }, 1);
         ready_read.read_exact(&mut [0u8]).unwrap();
+        // The child still shares the lock's file description, but dropping the
+        // guard unlocks it explicitly rather than waiting for the child's exec.
         drop(guard);
-        let contention = ProjectGuard::acquire(&project).err().expect("child must retain the inherited file description until exec");
+        let reacquired = ProjectGuard::acquire(&project).expect("a released lock must not stay held by a child awaiting exec");
         release_write.write_all(&[1]).unwrap();
         assert!(spawned.join().unwrap().success());
+        // A lock transferred to a supervisor outlives the guard until the
+        // supervisor's descriptors close.
+        let transferred = reacquired.inherit_transfer().unwrap();
+        drop(reacquired);
+        let contention = ProjectGuard::acquire(&project).err().expect("a transferred lock must stay held after its guard drops");
         assert!(contention.chain().any(|cause| matches!(cause.downcast_ref::<std::fs::TryLockError>(), Some(std::fs::TryLockError::WouldBlock))));
-        assert!(contention.to_string().contains(project.join(".state/effect.lock").to_str().unwrap()));
-        assert!(ProjectGuard::acquire(&project).is_ok(), "exec must close unrequested inherited locks");
+        drop(transferred);
+        assert!(ProjectGuard::acquire(&project).is_ok(), "closing the supervisor's descriptors releases the lock");
     }
 
     #[test]
