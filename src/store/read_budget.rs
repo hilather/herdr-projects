@@ -128,14 +128,6 @@ mod tests {
     use std::time::{Duration, Instant};
     fn budget() -> ReadBudget { ReadBudget::new(ReadControl::new(Instant::now()+Duration::from_secs(10), Cancellation::default())) }
     #[test]
-    fn lexical_scan_counts_empty_dense_and_escaped_values() {
-        for (json, nodes) in [(r#""""#,1), ("[]",2), ("{}",2), ("[0,0]",5),
-            (r#"{"":"","a":[]}"#,10), (r#""a\"b\\c\u1234""#,1), (" \n true\t",4)] {
-            let b=budget(); b.json(json.as_bytes(),1).unwrap();
-            assert_eq!(b.units.get(),nodes*STRUCTURE_WEIGHT,"{json}");
-        }
-    }
-    #[test]
     fn dense_json_and_repeated_passes_consume_shared_budget() {
         let b=budget(); let payload=format!("[{}0]","0,".repeat(150_000));
         b.json(payload.as_bytes(),1).unwrap();

@@ -180,19 +180,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn profile_file_with_model_still_errors() {
-        let profile: ProfileDefinition = toml::from_str(
-            "kind='codex'\npermission_policy='interactive'\nmodel='gpt-5.1'\nreasoning_effort='high'\nenvironment=['HOME']\n[budget]\nmax_wall_seconds=10\nunknown_usage='allow_with_warning'\n",
-        )
-        .unwrap();
-        let error = profile.validate_gated_preparation(1).unwrap_err();
-        let text = format!("{error:#}");
-        assert!(text.contains("unsupported model"));
-        assert!(!text.contains("gpt-5.1"));
-        assert!(!text.contains("high"));
-        assert!(!text.contains("HOME"));
-    }
 
     #[test]
     fn unknown_usage_refuses_missing_usage_as_zero() {

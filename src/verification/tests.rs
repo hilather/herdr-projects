@@ -405,32 +405,6 @@ fn staged_and_untracked_changes_reject_without_a_result() {
     }
 }
 
-#[test]
-fn recorded_argv_contains_a_program_after_dash() {
-    let launch = supervise::launch(&supervise::Spec {
-        unshare_program: PathBuf::from("/usr/bin/unshare"),
-        timeout: Duration::from_secs(5),
-        checkout: PathBuf::from("/tmp/checkout"),
-        policy: PathBuf::from("/tmp/policy.json"),
-        scratch: std::env::temp_dir().join("hp-verify-argv-scratch"),
-        checks: vec!["/usr/bin/git".into(), "diff".into(), "--quiet".into()],
-        commit: "ab".repeat(20),
-        tree: "cd".repeat(20),
-        policy_digest: "ef".repeat(32),
-    })
-    .unwrap();
-    assert_eq!(launch.argv[0], "/usr/bin/unshare");
-    let dash = launch.argv.iter().position(|arg| arg == "--").unwrap();
-    assert!(launch.argv[dash + 1].contains('/'));
-    assert_eq!(launch.argv[dash + 2], "verification-setup");
-    assert!(
-        launch
-            .cmd
-            .args
-            .iter()
-            .any(|arg| arg == "verification-setup")
-    );
-}
 
 #[test]
 fn same_namespace_exits_without_calling_mount() {

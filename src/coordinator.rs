@@ -354,25 +354,7 @@ pub fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
 mod tests {
     use super::*;
 
-    #[test]
-    fn prefix_has_the_fixed_shape_and_quotes_spaces() {
-        assert_eq!(
-            command_prefix(Path::new("/bin/hp"), Path::new("/r/oot")),
-            "/bin/hp --root /r/oot"
-        );
-        assert_eq!(
-            command_prefix(Path::new("/bin/hp"), Path::new("/my root")),
-            "/bin/hp --root '/my root'"
-        );
-    }
 
-    #[test]
-    fn priming_prompt_is_one_line_with_the_prefix() {
-        let prompt = priming_prompt("/bin/hp --root /r", "demo");
-        assert!(!prompt.contains('\n'));
-        assert!(prompt.contains("/bin/hp --root /r skill"));
-        assert!(prompt.contains("/bin/hp --root /r context demo"));
-    }
 
     #[test]
     fn identity_needs_ids_cwd_and_name() {

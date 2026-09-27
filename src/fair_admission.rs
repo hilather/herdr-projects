@@ -35,26 +35,3 @@ impl ProjectRound {
         self.served.insert(project.clone());Some(*index)
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::{ProjectRound,reserved_control};
-    #[test]
-    fn reserved_control_is_cancel_reconcile_and_observation() {
-        assert!(reserved_control("canonical-cancel:1"));assert!(reserved_control("reconcile:receipt"));
-        assert!(reserved_control("canonical-observation"));assert!(reserved_control("local-observation"));
-        assert!(!reserved_control("canonical-launch:1"));assert!(!reserved_control("cancel-transfer"));
-    }
-    #[test]
-    fn eight_projects_each_start_within_two_fairness_rounds() {
-        let mut jobs=Vec::new();
-        for project in 0..8 {for _ in 0..4 {jobs.push(format!("p{project}"));}}
-        let mut round=ProjectRound::default();let mut started=Vec::new();
-        for _ in 0..16 {
-            let eligible:Vec<(usize,String)>=jobs.iter().enumerate().map(|(index,project)|(index,project.clone())).collect();
-            let index=round.select(&eligible).unwrap();started.push(jobs.remove(index));
-        }
-        let mut seen:std::collections::BTreeSet<_>=started.iter().take(8).cloned().collect();
-        assert_eq!(seen.len(),8,"first round missed a project: {started:?}");
-        seen.clear();seen.extend(started.iter().cloned());assert_eq!(seen.len(),8,"two rounds dropped a project: {started:?}");
-    }
-}

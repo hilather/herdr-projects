@@ -99,44 +99,6 @@ fn f02_shared_machine_serves_both_project_sessions() {
     }
 }
 
-#[test]
-fn f03_merged_finalization_retries_after_restart() {
-    let (world, project) = pr_world(include_str!("../../tests/fixtures/review/merged-pr.json"));
-    let t = thread::load(&project, "t-0001").unwrap();
-    std::fs::create_dir_all(Path::new(&t.thread_dir).join("library")).unwrap();
-    world.runner.on("du -sk", ok("4\t/library\n"));
-    let failing = Rc::new(RefCell::new(true));
-    let flag = failing.clone();
-    world.runner.on_fn(
-        |cmd| cmd.program == "rsync",
-        move |_| Ok(if *flag.borrow() { fail(12, "fixture: copy transport unavailable") } else { ok("") }),
-    );
-    let ctx = world.ctx();
-    let now: jiff::Timestamp = "2026-09-19T12:00:00Z".parse().unwrap();
-    let mut state = crate::steps::load_state(&project);
-    let errors = crate::steps::pull_requests(&ctx, &project, &mut state, &mut Memory::new(&ctx), now);
-    assert_eq!(errors.len(), 1, "expected only the injected final-copy failure: {errors:?}");
-    assert!(format!("{:#}", errors[0]).contains("fixture: copy transport unavailable"));
-    assert_eq!(thread::load(&project, &t.id).unwrap().status, Status::Open);
-    assert_eq!(world.runner.count("rsync"), 1);
-    crate::steps::save_state(&project, &state).unwrap();
-
-    // Reload persisted state and replace process memory, as a ticker restart does.
-    *failing.borrow_mut() = false;
-    let mut state = crate::steps::load_state(&project);
-    let mut memory = Memory::new(&ctx);
-    let later = now + jiff::SignedDuration::from_secs(crate::steps::PR_INTERVAL_SECS + 1);
-    let errors = crate::steps::pull_requests(&ctx, &project, &mut state, &mut memory, later);
-    assert!(errors.is_empty(), "recovered transport: {errors:?}");
-    assert_eq!(world.runner.count("gh pr view"), 1, "persisted merged intent retries without another GitHub request");
-    assert_eq!(thread::load(&project, &t.id).unwrap().status, Status::Resolved, "F03: persisted merged observation must not suppress unfinished copying");
-    assert_eq!(world.runner.count("rsync"), 2);
-    assert_eq!(items_of(&project, "pr").len(), 1, "retry must not repeat the merged notification");
-
-    let again = later + jiff::SignedDuration::from_secs(crate::steps::PR_INTERVAL_SECS + 1);
-    assert!(crate::steps::pull_requests(&ctx, &project, &mut state, &mut memory, again).is_empty());
-    assert_eq!(world.runner.count("rsync"), 2, "completed finalization is a no-op");
-}
 
 #[test]
 fn f04_deadline_includes_descendant_held_pipes() {

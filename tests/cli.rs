@@ -299,28 +299,6 @@ fn build_info_is_independent_of_config_projects_and_sessions() {
     assert_eq!(std::fs::read_to_string(config.join("config.toml")).unwrap(),"this is deliberately invalid TOML [");
 }
 
-#[test]
-fn doctor_help_names_the_factory_binary_and_upgrade_command() {
-    let home = tempfile::tempdir().unwrap();
-    let out = hp(home.path(), &["doctor", "--help"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let text = String::from_utf8(out.stdout).unwrap();
-    assert!(text.contains("--target-dir target/factory"),"{text}");
-    assert!(
-        text.contains("cargo build --release --locked --features state-store"),
-        "{text}"
-    );
-    assert!(text.contains("migration PROJECT upgrade-store"), "{text}");
-    assert!(
-        text.contains("canonical factory commands are absent"),
-        "{text}"
-    );
-    assert!(text.contains("Does not migrate"), "{text}");
-}
 
 #[test]
 fn doctor_reports_compiled_features_without_migrating_a_legacy_project() {

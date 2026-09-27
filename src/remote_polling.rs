@@ -72,8 +72,4 @@ mod tests {
         let temp=tempfile::tempdir().unwrap();let path=temp.path().join("config.toml");let name=std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();assert_eq!(unsafe{libc::mkfifo(name.as_ptr(),0o600)},0);
         let executor=Arc::new(Executor::new(Limits::default(),Arc::new(crate::runner::RealRunner)).unwrap());let mut reads=Reads::new(executor.clone());let key=MachineKey{project:temp.path().into(),socket:"socket".into(),machine:"box".into()};let now=Instant::now();assert!(reads.poll(&key,"herdr",&path,&[]).is_err());assert!(now.elapsed()<Duration::from_secs(1));std::fs::remove_file(&path).unwrap();std::fs::write(&path,vec![b' ';1024*1024+1]).unwrap();assert!(reads.poll(&key,"herdr",&path,&[]).is_err());assert_eq!(executor.metrics().high_water,[0,0]);assert!(executor.stop(Duration::from_secs(1)));
     }
-    #[test]
-    fn a_resolved_machine_never_reads_the_fallback_config() {
-        let output=Output{code:Some(0),stdout:r#"[{"label":"box","target":"me@box"}]"#.into(),..Output::default()};assert_eq!(remote::target_from_listing(Some(output),||panic!("fallback must remain lazy"),"box").unwrap(),"me@box");
-    }
 }

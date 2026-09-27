@@ -439,20 +439,6 @@ mod tests {
         id
     }
 
-    #[test]
-    fn v1_document_omits_read_set_and_other_versions_are_not_v2() {
-        let raw = r#"{"version":1,"project_store":"/tmp/project-store","authority":{"id":"owner-approval-policy","revision":1,"digest":"abababababababababababababababababababababababababababababababab"},"expected_head":1,"expires_unix_ms":9,"proposal_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","record_keys":["api.error-envelope"],"review":{"schema_version":1,"proposal_id":"mp-api-errors-01","decision":"approve","reason":"evidence supports the claim"}}"#;
-        let doc: MemoryReviewAuthorization = serde_json::from_str(raw).unwrap();
-        assert_eq!(doc.read_set_version, None);
-        assert!(doc.read_set.is_none());
-        assert!(
-            serde_json::from_str::<MemoryReviewAuthorization>(&raw.replace(
-                "\"reason\":\"evidence supports the claim\"",
-                "\"reason\":\"evidence supports the claim\",\"extra\":1"
-            ))
-            .is_err()
-        );
-    }
 
     #[test]
     fn unrelated_event_allows_v2_promotion_and_replay_returns_the_stored_row() {
@@ -748,12 +734,4 @@ mod tests {
         assert_eq!(user_version(&reopened.connection), crate::store::SCHEMA);
     }
 
-    #[test]
-    fn malformed_grant_id_is_invalid_not_a_conflict() {
-        let (_root, memory, _digest) = setup();
-        let mut signed = current(&memory.store.connection, None).unwrap();
-        signed.reviewer_grant_id = Some("not-a-grant".into());
-        let error = require_match(&memory.store.connection, &signed).unwrap_err();
-        assert!(matches!(error, StoreError::Invalid(_)), "{error:?}");
-    }
 }

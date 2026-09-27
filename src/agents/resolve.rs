@@ -88,24 +88,7 @@ pub fn resolve_agent_kind(kind: &str, config: &Path, evidence: Option<&Probe>) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::profiles::Inspection;
 
-    #[test]
-    fn mock_workflow_flags_distinguish_launchable_protocol_and_certified() {
-        let cases = [
-            ("mock-launch-only", true, false, false),
-            ("mock-protocol", true, true, false),
-            ("mock-certified", true, true, true),
-        ];
-        let flags: Vec<_> = cases.iter().map(|(name, launchable, protocol, certified)| {
-            let inspection = Inspection::mock_workflow(name, *launchable, *protocol, *certified);
-            assert_eq!(inspection.name, *name);
-            (inspection.launchable, inspection.protocol_capable, inspection.certified)
-        }).collect();
-        assert_eq!(flags, vec![(true, false, false), (true, true, false), (true, true, true)]);
-        let live = Inspection::mock_workflow("live-probe", false, false, false);
-        assert!(!live.launchable && !live.protocol_capable && !live.certified);
-    }
 
     #[test]
     fn resolve_uses_named_profile_budget_and_never_emits_argv_or_frozen() {

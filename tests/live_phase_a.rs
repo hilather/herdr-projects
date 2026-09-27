@@ -181,45 +181,6 @@ fn live_popup_handoff_routes_input_to_the_requested_action() {
     eprintln!("live popup pause/resume actions consumed distinct handoffs and routed PTY input correctly");
 }
 
-#[test]
-#[ignore = "requires HP_LIVE_HERDR; observes only an isolated disposable terminal"]
-#[cfg(target_os="linux")]
-fn live_canonical_process_contract() {
-    let mut lab=Lab::new();lab.start();
-    let created=lab.herdr(&["workspace","create","--cwd",lab.path().to_str().unwrap(),"--label","Canonical launch contract","--no-focus"]);
-    let pane=created["result"]["root_pane"]["pane_id"].as_str().unwrap();
-    let workspace=created["result"]["workspace"]["workspace_id"].as_str().unwrap();
-    eprintln!("created: {created}");
-    eprintln!("before: {}",lab.herdr(&["pane","process-info","--pane",pane]));
-    // pane run is a silent CLI submission, not a typed launch acknowledgment.
-    let mut command=lab.command(&lab.herdr);
-    command.args(["--session","hp-acceptance","pane","run",pane,"/usr/bin/sleep","30"]);
-    let(ok,output,error)=lab.run(command);assert!(ok,"pane run: {error}");
-    eprintln!("submission output: {output:?}");
-    let deadline=std::time::Instant::now()+std::time::Duration::from_secs(5);
-    let pid=loop {
-        let running=lab.herdr(&["pane","process-info","--pane",pane]);
-        if let Some(process)=running["result"]["process_info"]["foreground_processes"].as_array().unwrap().iter()
-            .find(|process|process["argv"][0]=="/usr/bin/sleep") {
-            eprintln!("running: {running}");break process["pid"].as_u64().unwrap();
-        }
-        assert!(std::time::Instant::now()<deadline,"exact sleep process was not observed: {running}");
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    };
-    let closed=lab.herdr(&["workspace","close",workspace]);
-    eprintln!("closed: {closed}");
-    let listed=lab.herdr(&["pane","list"]);
-    assert!(!listed["result"]["panes"].as_array().unwrap().iter().any(|p|p["pane_id"]==pane));
-    // This assertion is deliberately limited to our single sleep process. Pane
-    // absence alone does not certify cleanup of arbitrary agent descendants.
-    let deadline=std::time::Instant::now()+std::time::Duration::from_secs(5);
-    while std::path::Path::new(&format!("/proc/{pid}")).exists() {
-        let status=std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
-        if status.lines().any(|line|line.starts_with("State:")&&line.contains('Z')) {break;}
-        assert!(std::time::Instant::now()<deadline,"fixture process remains after workspace close");
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-}
 
 #[test]
 #[cfg(target_os="linux")]

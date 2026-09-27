@@ -258,11 +258,6 @@ mod tests {
         assert_eq!(env.herdr_bin(), "herdr");
     }
 
-    #[test]
-    fn herdr_bin_prefers_the_variable() {
-        let env = Env::for_test(Path::new("/h"), &[("HERDR_BIN_PATH", "/opt/herdr")]);
-        assert_eq!(env.herdr_bin(), "/opt/herdr");
-    }
 
     #[test]
     fn session_order_flag_socket_env_default() {

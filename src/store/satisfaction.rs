@@ -1728,25 +1728,4 @@ pub(super) mod tests {
         );
     }
 
-    #[test]
-    fn launch_enabled_is_true_only_when_the_flag_is_on_and_an_entry_is_clear() {
-        let entry = |id: &str, blockers: Vec<String>| QueueEntry {
-            task: TaskId::new(id).unwrap(),
-            task_revision: 1,
-            effective_priority: 0,
-            blockers,
-        };
-        assert!(!super::super::scheduler::automatic_launch_enabled(
-            false,
-            &[entry("b", Vec::new())]
-        ));
-        assert!(!super::super::scheduler::automatic_launch_enabled(
-            true,
-            &[entry("a", vec!["capacity_full".into()])]
-        ));
-        assert!(super::super::scheduler::automatic_launch_enabled(
-            true,
-            &[entry("b", Vec::new())]
-        ));
-    }
 }

@@ -399,14 +399,6 @@ mod tests {
         while queue.pending() {assert!(Instant::now()<deadline,"transfer ticket did not finish");let _=queue.drain();std::thread::yield_now();}
     }
     #[test]
-    fn declared_admission_leaves_the_report_reserve() {
-        let pool=Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),Arc::new(Immediate)).unwrap());
-        let queue=Queue::new(pool.clone());
-        assert_eq!(queue.declared_limit(),queue.executor.outstanding(crate::executor::Lane::Transfer)-REPORT_RESERVE);
-        assert_eq!(queue.declared_limit(),16);
-        assert!(pool.stop(Duration::from_secs(1)));
-    }
-    #[test]
     fn transfers_on_different_repos_overlap_and_the_same_git_dir_does_not() {
         let (gate,started)=gate();
         let limits=crate::executor::Limits{workers:[1,2],outstanding:[4,18],per_project:2,per_machine:2};

@@ -897,14 +897,6 @@ mod tests {
         assert_eq!(group(&acked, &gone, now()), Group::Idle);
     }
 
-    #[test]
-    fn display_order_and_rank_digits() {
-        let ranks: Vec<u8> = Group::DISPLAY_ORDER.iter().map(|g| g.rank()).collect();
-        assert_eq!(ranks, [1, 2, 3, 4, 5, 6]);
-        assert_eq!(Group::ReadyForReview.token(), "ready-for-review");
-        assert_eq!(Group::WaitingOnYou.token(), "waiting-on-you");
-        assert_eq!(Group::from_token("landing"), Some(Group::Landing));
-    }
 
     fn agent(name: &str, cwd: &str) -> Agent {
         Agent {

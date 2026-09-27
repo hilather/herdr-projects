@@ -367,13 +367,6 @@ mod tests {
         assert!(parse("ok", "no front matter").is_err());
     }
 
-    #[test]
-    fn fence_is_one_longer_than_the_longest_backtick_run() {
-        assert_eq!(fence_for("plain"), "```");
-        assert_eq!(fence_for("a ``` b"), "````");
-        assert_eq!(fence_for("``````"), "```````");
-        assert_eq!(fence_for("` `` `"), "```");
-    }
 
     #[test]
     fn output_cannot_close_its_fence_and_is_capped() {

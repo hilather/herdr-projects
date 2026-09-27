@@ -392,13 +392,6 @@ pub struct WaitReplay {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct PullRequestPoll {
-    pub url: String,
-    pub check: String,
-    pub closed: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum ReplanDecision {
     Automatic {
         replan_id: String,
@@ -887,12 +880,6 @@ impl SqliteStore {
             proved: false,
             already_replayed: false,
         })
-    }
-
-    /// A pull-request poll is not feedback and not a replan. This writes nothing.
-    pub fn request_replan_from_poll(&mut self, poll: &PullRequestPoll) -> Result<ReplanDecision> {
-        let _ = (poll.url.as_str(), poll.check.as_str(), poll.closed);
-        Err(invalid("pull-request poll is not a replan trigger"))
     }
 
     /// Two automatic replans for this blocker and plan revision, then one inbox item.
@@ -2209,48 +2196,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pr_poll_fixture_does_not_create_a_replan() {
-        let (_temp, mut db) = fixture();
-        seed_task(&mut db, "task");
-        let proposals = count(&db.connection, "SELECT count(*) FROM plan_proposals");
-        let rejected = db.request_replan_from_poll(&PullRequestPoll {
-            url: "https://github.com/owner/repo/pull/7".into(),
-            check: "failure".into(),
-            closed: true,
-        });
-        assert!(
-            matches!(rejected, Err(StoreError::Invalid(message)) if message.contains("pull-request"))
-        );
-        assert!(matches!(
-            db.testing_record_feedback(LocalFeedback {
-                operation_id: "pr-poll-1".into(),
-                outcome_revision: 1,
-                category: "pr_poll".into(),
-                task_id: "task".into(),
-                reason: "https://github.com/owner/repo/pull/7".into(),
-            }),
-            Err(StoreError::Invalid(_))
-        ));
-        assert!(matches!(
-            db.request_replan("pr-poll-1"),
-            Err(StoreError::Invalid(_))
-        ));
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM feedback_items"),
-            0
-        );
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM replan_requests"),
-            0
-        );
-        assert_eq!(count(&db.connection, "SELECT count(*) FROM inbox_items"), 0);
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM plan_proposals"),
-            proposals
-        );
-        assert_eq!(count(&db.connection, "SELECT count(*) FROM attempts"), 0);
-    }
 
     #[test]
     fn infrastructure_retry_does_not_consume_max_attempts_per_task() {

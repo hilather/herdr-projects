@@ -46,32 +46,6 @@ pub struct Inspection {
     blockers: Vec<&'static str>,
 }
 
-#[cfg(test)]
-impl Inspection {
-    pub fn mock_workflow(name: &'static str, launchable: bool, protocol_capable: bool, certified: bool) -> Self {
-        Self {
-            schema_version: 1,
-            name: name.into(),
-            kind: "claude".into(),
-            config_digest: "a".repeat(64),
-            profile_digest: "b".repeat(64),
-            extra_argument_count: 0,
-            environment_reference_count: 0,
-            model_requested: false,
-            reasoning_effort_requested: false,
-            budget_requested: false,
-            capabilities: Capabilities {
-                launch: Capability::Unknown, readiness_observation: Capability::Unknown,
-                prompt_submission: Capability::Unknown, stop: Capability::Unknown,
-                checkpoint_acknowledgment: Capability::Unknown, structured_usage: Capability::Unknown,
-                resume: Capability::Unknown,
-            },
-            agent_version: None, herdr_version: None,
-            launchable, protocol_capable, certified, blockers: vec![],
-        }
-    }
-}
-
 fn identifier(value: &str) -> bool {
     !value.is_empty() && value.len() <= 64
         && value.as_bytes()[0].is_ascii_alphabetic()

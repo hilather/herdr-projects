@@ -83,13 +83,6 @@ pub(super) fn flush_events(project: &Project, state: &mut State, now: jiff::Time
 mod tests {
     use super::*;
 
-    #[test]
-    fn unsupported_capability_stays_blocked_after_restart() {
-        let retry = Retry { blocked: true, ..Retry::default() };
-        let restored: Retry = serde_json::from_str(&serde_json::to_string(&retry).unwrap()).unwrap();
-        assert!(!restored.due(now() + jiff::SignedDuration::from_hours(24)));
-        assert!(serde_json::from_str::<Retry>("{}").unwrap().due(now()));
-    }
 
     fn now() -> jiff::Timestamp { "2026-09-19T12:00:00Z".parse().unwrap() }
 

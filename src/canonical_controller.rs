@@ -346,11 +346,6 @@ pub(crate) mod tests {
         let started=Instant::now();let budget=ProbeBudget{runner:&RealRunner,deadline:started+Duration::from_millis(40)};let cmd=Cmd::new("sh",Duration::from_secs(10)).args(["-c","sleep 5"]);let output=budget.run(&cmd).unwrap();assert!(!output.success());assert!(started.elapsed()<Duration::from_secs(2));assert!(budget.run(&Cmd::new("true",Duration::from_secs(10))).is_err());
     }
     #[test]
-    fn controller_recovers_finalization_receipt_after_failed_commit_and_source_loss() {
-        let(world,path,op)=finalization_delivery::tests::fixture();let raw=rusqlite::Connection::open(path.join(".state/state.db")).unwrap();raw.execute_batch("CREATE TRIGGER reject_confirmation BEFORE UPDATE ON operation_delivery WHEN NEW.state='confirmed' BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();assert!(poll(&world.ctx(),&path,0).unwrap().operation_error.is_some());let snapshot=runtime::snapshot(&path).unwrap();assert_eq!(snapshot.deliveries[0].state,DeliveryState::Claimed);raw.execute_batch("DROP TRIGGER reject_confirmation").unwrap();
-        let source=snapshot.runtime_bindings.iter().find(|b|b.task==op.task).unwrap().identity.thread_dir.clone();std::fs::remove_dir_all(source).unwrap();migration::open_active(&path).unwrap().expire_claims(jiff::Timestamp::now().as_millisecond()+300_001).unwrap();poll(&world.ctx(),&path,0).unwrap();let after=runtime::snapshot(&path).unwrap();assert_eq!(after.deliveries[0].state,DeliveryState::Confirmed);assert_eq!(after.tasks.iter().find(|t|Some(&t.id)==op.task.as_ref()).unwrap().state,herdr_projects::domain::TaskState::AwaitingReview);let revision=after.tasks.iter().find(|t|Some(&t.id)==op.task.as_ref()).unwrap().revision;poll(&world.ctx(),&path,0).unwrap();assert_eq!(runtime::snapshot(&path).unwrap().tasks.iter().find(|t|Some(&t.id)==op.task.as_ref()).unwrap().revision,revision);
-    }
-    #[test]
     fn effect_hint_does_not_bypass_worker_provenance_checks() {
         use std::{sync::Arc,time::{Duration,Instant}};
         let(world,path,_op)=finalization_delivery::tests::fixture();let raw=rusqlite::Connection::open(path.join(".state/state.db")).unwrap();

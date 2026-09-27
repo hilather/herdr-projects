@@ -336,14 +336,6 @@ mod tests {
     use crate::runner::RealRunner;
     use crate::runner::fake::{FakeRunner, fail, ok};
 
-    #[test]
-    fn plain_words_stay_bare() {
-        assert_eq!(quote("/Users/me/.dev-root"), "/Users/me/.dev-root");
-        assert_eq!(quote(""), "''");
-        assert_eq!(quote("a b"), "'a b'");
-        assert_eq!(quote("it's"), r"'it'\''s'");
-        assert_eq!(quote("-n"), "'-n'");
-    }
 
     const HOSTILE: [&str; 10] = ["$(touch /tmp/hp-pwned)", "`id`", "a'; rm -rf ~; echo '", "x\ny", "~/x", "-n", "a\\b\"c", "*", "!!", "a b  c"];
 

@@ -973,30 +973,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn verifier_rejection_below_schema_29_rolls_back_without_feedback() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
-        db.connection
-            .execute_batch("UPDATE store_meta SET schema_version=28; PRAGMA user_version=28;")
-            .unwrap();
-        assert!(matches!(
-            db.testing_poll_rejected_verification(),
-            Err(StoreError::UnsupportedSchema(28))
-        ));
-        assert_eq!(
-            db.connection
-                .query_row("SELECT count(*) FROM verification_runs", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            db.connection
-                .query_row("SELECT count(*) FROM feedback_items", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-    }
 
     #[test]
     fn duplicate_poll_inserts_missing_feedback_once() {

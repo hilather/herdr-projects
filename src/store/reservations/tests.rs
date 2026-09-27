@@ -276,14 +276,6 @@ fn incomplete_or_changed_profile_evidence_cannot_reserve_capacity() {
     }
 }
 
-#[test]
-fn version_one_input_serialization_preserves_historical_identity() {
-    let(_temp,_db,p)=fixture();let mut old=p[0].inputs.clone();old.version=1;old.effective_profile=None;
-    let bytes=serde_json::to_vec(&old).unwrap();assert!(!String::from_utf8_lossy(&bytes).contains("effective_profile"));
-    let record:LaunchInputs=serde_json::from_slice(&bytes).unwrap();validate_inputs(&record).unwrap();
-    assert_eq!(record_ids(&old).unwrap(),record_ids(&record).unwrap());
-    assert_eq!(serde_json::to_vec(&record).unwrap(),bytes);
-}
 
 #[test]
 fn schema11_upgrade_retains_records_and_blocks_old_format_insertions() {

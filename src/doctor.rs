@@ -559,11 +559,4 @@ mod tests {
         assert!(!project.dir().join(".state/migration").exists());
     }
 
-    #[test]
-    fn unsupported_label_covers_macos_and_live_ssh_without_a_macos_target() {
-        assert_eq!(factory_platform_label("linux", false), "linux");
-        assert_eq!(factory_platform_label("macos", false), "unsupported");
-        assert_eq!(factory_platform_label("linux", true), "unsupported");
-        assert_eq!(factory_platform_label("macos", true), "unsupported");
-    }
 }

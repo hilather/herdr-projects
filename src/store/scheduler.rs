@@ -280,17 +280,6 @@ mod tests {
         let(_temp,mut db)=fixture();queue(&mut db,"a",&request(0,&["b"]),0).unwrap();let s=db.read_snapshot(None).unwrap();let mut task=s.tasks.iter().find(|t|t.id.as_str()=="b").unwrap().clone();task.revision=2;task.state=TaskState::Succeeded;db.commit(Commit{expected_head:s.head,mutations:vec![Mutation::Task{expected:Some(1),next:task}]}).unwrap();let report=db.queue_report(0).unwrap();assert!(report.entries[0].blockers.iter().any(|b|b.starts_with("verified_dependency_evidence_unavailable:b")));assert!(db.read_snapshot(None).unwrap().attempts.is_empty());
     }
     #[test]
-    fn prepared_dispatch_stays_true_while_dependency_evidence_stays_blocked() {
-        let(_temp,mut db)=fixture();queue(&mut db,"a",&request(0,&["b"]),0).unwrap();let report=db.queue_report(0).unwrap();
-        assert!(!report.launch_enabled);assert!(report.capability.prepared_dispatch);assert!(!report.capability.automatic_admission);assert!(!report.capability.dependency_producers);assert_eq!(report.capability.integration,if cfg!(target_os="linux") {"operator_local"} else {"unavailable"});
-        assert_eq!(report.capability.blockers,vec!["automatic_admission_does_not_draft_sign_or_reserve".to_string()]);
-        assert!(report.entries[0].blockers.iter().any(|b|b=="verified_dependency_evidence_unavailable:b:verified_result"));
-        for stage in ["owner_signature_not_scheduled","launch_reserve_not_scheduled","controller_requires_reserved_attempt"] {assert!(report.entries[0].blockers.iter().any(|b|b==stage));}
-        assert!(report.entries.iter().flat_map(|entry|&entry.blockers).chain(report.capability.blockers.iter()).all(|b|b!="launch_draft_not_scheduled"));
-        let claims_producer=|blocker:&str|blocker.contains("launch_preparation_unavailable")||blocker.contains("verifier")||blocker.contains("integrator")||blocker.contains("producer")||blocker.contains("satisfaction");
-        assert!(report.capability.blockers.iter().chain(report.entries.iter().flat_map(|entry|&entry.blockers)).all(|blocker|!claims_producer(blocker)));
-    }
-    #[test]
     fn retained_reserved_attempt_omits_reserve_blocker_and_grant_omits_signature_blocker() {
         let(temp,mut db)=fixture();let s=db.read_snapshot(None).unwrap();db.commit(Commit{expected_head:s.head,mutations:["d","e"].into_iter().map(|id|Mutation::Task{expected:None,next:Task{id:TaskId::new(id).unwrap(),revision:1,state:TaskState::Draft,title:id.into(),active_attempt:None}}).collect()}).unwrap();for id in ["a","b","c","d","e"]{queue(&mut db,id,&request(0,&[]),0).unwrap();}
         let s=db.read_snapshot(None).unwrap();

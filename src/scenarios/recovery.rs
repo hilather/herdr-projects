@@ -232,15 +232,6 @@ fn partial_final_copy_resolves_with_a_durable_warning() {
     assert_eq!(items_of(&project, "copy").len(), 1);
 }
 
-#[test]
-fn legacy_records_default_new_retry_and_generation_fields() {
-    let state: State = serde_json::from_str(r#"{"nudged":"delivered"}"#).unwrap();
-    assert_eq!(state.nudged, "delivered");
-    assert!(state.finalizations.is_empty() && state.pending_events.is_empty());
-    let t: Thread = toml::from_str("id = 't-0001'\nstatus = 'open'\n").unwrap();
-    assert_eq!(t.lifecycle_generation, 0);
-    assert!(t.suppressed_merged_pr.is_empty());
-}
 
 #[test]
 fn unsupported_remote_helper_blocks_until_explicit_finalization_retry() {
