@@ -860,3 +860,36 @@ Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
   fail: the launch that reached the cap could not be claimed.
 - Not recording the denial in `admission::decide_held` made the dependent
   workflow fail on the missing `authority_missing` denial.
+
+## Memory completion barrier unit tests replaced by CLI workflows
+
+The audit marked 9 `src/store/memory_barrier.rs` tests REPLACE; they built
+state with raw SQL and faked `user_version`. The new `tests/memory_barriers.rs`
+moves memory only through `memory propose/review/promote`, signed `memory
+import` policy and `memory reconcile`, and `memory update/ack/package`, and
+reads `memory readiness`. Attempts, snapshots, binding retirement, package
+acknowledgment and completion commits use the public store API because no
+worker is launched. Old stores are built with `test_schema::historical`.
+
+| New E2E test | Replaced unit tests |
+| --- | --- |
+| `promoted_invalidations_block_only_their_task_until_reconciled` | `invalidations_block_completion_and_attempt_clearing_but_not_unrelated_tasks`, informational half of `informational_invalidations_do_not_block_but_global_required_ones_do` |
+| `an_attempt_without_its_own_snapshot_cannot_complete` | missing-snapshot half of `expiry_and_missing_snapshot_block_without_an_update_event` |
+| `required_updates_need_the_attempts_own_applied_receipt` (exact `memory ack` and an applied package, per attempt and per change) | `exact_applied_receipt_covers_only_its_required_update`, `seen_change_receipt_does_not_satisfy_enforce_but_applied_does` |
+| `a_rebound_attempt_is_covered_by_its_new_snapshot_or_successor_package` | `snapshot_presence_covers_a_required_update_without_a_receipt`, `applied_receipt_on_successor_covers_a_copied_obligation` |
+| `changed_sources_and_unrouted_hard_rules_block_completion` (also: an applied newer revision stops relying on the old one's source) | `changed_dependency_and_unrouted_mandatory_revision_are_blockers` |
+| `older_memory_schemas_require_upgrade_before_completion` (v17 stays inspectable; v18, 21, 22, 23 refuse until `upgrade_v1`) | `older_memory_schemas_require_upgrade_before_success` |
+
+Kept, trimmed: `expiry_blocks_without_an_update_event`, because no public
+entry point writes a non-null `expiry_unix_ms`; and
+`global_required_invalidations_block_every_task`, because nothing in
+production records a task-less invalidation. `later_mutation_in_success_batch_cannot_drop_consumed_snapshot`
+was not in scope and is unchanged.
+
+Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
+- Counting a seen exact receipt as applied failed the receipt test.
+- Requiring a strictly newer snapshot revision failed the rebind test.
+- Dropping the dependency recursion from consumed revisions failed the source test.
+- Dropping the per-record `MAX(revision)` supersession failed the source test
+  (the updated consumer was fenced by its old revision's source).
+- Lowering the upgrade-required floor from 24 to 22 failed the schema test.
