@@ -20,6 +20,9 @@ case "$1 $2" in
   git -C "$4" worktree add -q -b "$6" "$dir" "$8" >&2 || exit 1
   n=$(ls "$HOME/wt" | wc -l)
   printf '{"result":{"root_pane":{"workspace_id":"w%s","tab_id":"w%s:t1","pane_id":"w%s:p1","cwd":"%s"},"worktree":{"path":"%s"}}}\n' "$n" "$n" "$n" "$dir" "$dir";;
+'worktree open') printf '{"result":{"root_pane":{"workspace_id":"w90","tab_id":"w90:t1","pane_id":"w90:p1","cwd":"%s"},"worktree":{"path":"%s"}}}\n' "$6" "$6";;
+'tab create') printf '{"result":{"root_pane":{"workspace_id":"%s","tab_id":"%s:t9","pane_id":"%s:p9"}}}\n' "$4" "$4" "$4";;
+'pane get') echo '{"result":{"pane":{}}}';;
 'agent prompt'|'pane report-metadata'|'pane clear-metadata') echo '{"result":{}}';;
 *) echo '{"error":{"code":"unsupported","message":"not in fixture"}}'; exit 1;;
 esac
@@ -75,6 +78,34 @@ impl Lab {
             (cols[0].to_string(), (cols[1].to_string(), cols[2].to_string()))
         }).collect()
     }
+    /// A foreground `ticker run`, so commands that end with `ticker start`
+    /// find it holding the lock instead of spawning a detached one. A ticker
+    /// whose first `try_lock` met the status probe's own lock exits quietly;
+    /// it is started again.
+    fn ticker(&self) -> Ticker {
+        let spawn = || Ticker(Command::new(BIN).env_clear().env("HOME", self.home.path()).env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", &self.fake)
+            .args(["--root", self.root().to_str().unwrap(), "ticker", "run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+        let mut ticker = spawn();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !self.ok(&["ticker", "status"]).contains("ticker: running") {
+            assert!(Instant::now() < deadline, "ticker never took its lock");
+            if ticker.0.try_wait().unwrap().is_some() { ticker = spawn(); }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        ticker
+    }
+    /// `ok`, retried while a running ticker's tick holds the execution lock.
+    fn ok_beside_ticker(&self, args: &[&str]) -> String {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let out = self.cli(args);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if out.status.success() { return String::from_utf8(out.stdout).unwrap(); }
+            assert!(stderr.contains("another operation owns lock") && Instant::now() < deadline, "{args:?}: {stderr}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    fn calls(&self) -> String { fs::read_to_string(self.path("herdr-calls")).unwrap_or_default() }
     fn git(&self, dir: &Path, args: &[&str]) -> String {
         let out = Command::new("/usr/bin/git").env_clear().env("PATH", "/usr/bin:/bin").env("HOME", self.home.path())
             .env("GIT_AUTHOR_NAME", "fixture").env("GIT_AUTHOR_EMAIL", "fixture@example.com")
@@ -207,6 +238,9 @@ fn report_review_ack_and_resolve_copy_home() {
     assert_eq!(resolved["report_hash"].as_str(), Some(sha(b"## Report\nrevised\n").as_str()));
     assert_eq!(resolved["status"].as_str(), Some("resolved"));
     assert_eq!(lab.list()["t-0001"], ("Resolved".to_string(), "manual".to_string()));
+    // Resolving takes the thread's labels off its pane.
+    let clear = "pane report-metadata w0:p2 --source herdr-projects --clear-token project --clear-token thread --clear-token review --clear-token rank";
+    assert!(lab.calls().lines().any(|l| l == clear), "{}", lab.calls());
 }
 
 struct Ticker(std::process::Child);
@@ -234,13 +268,7 @@ fn start_restart_and_adopt_write_briefs_branches_and_launch_line() {
     let (repo_arg, task_arg) = (repo.to_str().unwrap(), task.to_str().unwrap());
 
     // A running ticker, so the commands hand it the launch rather than spawning one.
-    let _ticker = Ticker(Command::new(BIN).env_clear().env("HOME", lab.home.path()).env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", &lab.fake)
-        .args(["--root", lab.root().to_str().unwrap(), "ticker", "run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !lab.ok(&["ticker", "status"]).contains("ticker: running") {
-        assert!(Instant::now() < deadline, "ticker never took its lock");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let _ticker = lab.ticker();
 
     fs::write(lab.path("refuse-worktree"), "").unwrap();
     let failed = lab.cli(&["thread", "start", "demo", "--title", "Fix the $(login) bug!", "--repo", repo_arg, "--task-file", task_arg]);
@@ -248,7 +276,7 @@ fn start_restart_and_adopt_write_briefs_branches_and_launch_line() {
     assert!(String::from_utf8_lossy(&failed.stderr).contains("thread t-0001 failed to start; `thread restart demo t-0001` retries"));
     assert_eq!(lab.record("t-0001")["status"].as_str(), Some("failed"));
 
-    let out = lab.ok(&["thread", "restart", "demo", "t-0001"]);
+    let out = lab.ok_beside_ticker(&["thread", "restart", "demo", "t-0001"]);
     assert!(out.starts_with("t-0001 is back in pane w1:p1"), "{out}");
     let first = lab.record("t-0001");
     let branch = "hp/demo/t-0001-fix-the-login-bug";
@@ -259,7 +287,7 @@ fn start_restart_and_adopt_write_briefs_branches_and_launch_line() {
     assert_eq!(first["agent_name"].as_str(), Some("hp-demo-t-0001"));
     let restarted = fs::read_to_string(Path::new(first["thread_dir"].as_str().unwrap()).join("brief.md")).unwrap();
 
-    let out = lab.ok(&["thread", "start", "demo", "--title", "???", "--repo", repo_arg, "--task-file", task_arg]);
+    let out = lab.ok_beside_ticker(&["thread", "start", "demo", "--title", "???", "--repo", repo_arg, "--task-file", task_arg]);
     let started: Value = serde_json::from_str(&out).unwrap();
     assert_eq!((started["id"].as_str(), started["branch"].as_str()), (Some("t-0002"), Some("hp/demo/t-0002")));
     let fresh = fs::read_to_string(Path::new(lab.record("t-0002")["thread_dir"].as_str().unwrap()).join("brief.md")).unwrap();
@@ -278,7 +306,19 @@ fn start_restart_and_adopt_write_briefs_branches_and_launch_line() {
     let resumed = restarted.find("previous attempt").expect("restart brief names the previous attempt");
     assert!(restarted.find("# Thread brief").unwrap() < resumed && resumed < restarted.find("Always run the tests.").unwrap());
     assert!(!fresh.contains("previous attempt"));
-    assert!(fs::read_to_string(repo.join(".git/info/exclude")).unwrap().lines().any(|l| l == ".herdr-project/"));
+    // Both placements share the repository's exclude file: one line, and the
+    // thread directories never show up as untracked files.
+    assert_eq!(fs::read_to_string(repo.join(".git/info/exclude")).unwrap().lines().filter(|l| *l == ".herdr-project/").count(), 1);
+    for cwd in [first_cwd, lab.record("t-0002")["cwd"].as_str().unwrap()] {
+        assert!(Path::new(cwd).join(".herdr-project").is_dir());
+        assert_eq!(lab.git(Path::new(cwd), &["status", "--porcelain", "--untracked-files=all"]), "", "{cwd}");
+    }
+    // Placement labels the pane for the sidebar: this project, this thread, working.
+    let calls = lab.calls();
+    for (pane, id) in [("w1:p1", "t-0001"), ("w2:p1", "t-0002")] {
+        let line = format!("pane report-metadata {pane} --source herdr-projects --ttl-ms 300000 --token project=demo --token thread={id} --token review=working --token rank=3");
+        assert!(calls.lines().any(|l| l == line), "{line}\n{calls}");
+    }
 
     // Adopting a ready agent sends it the one launch line, naming its own brief.
     let adopted_cwd = lab.path("elsewhere");
@@ -302,4 +342,150 @@ fn start_restart_and_adopt_write_briefs_branches_and_launch_line() {
     }
     let out = lab.cli(&["thread", "show", "demo", "t-12345"]);
     assert!(String::from_utf8_lossy(&out.stderr).contains("no thread `t-12345`"));
+}
+
+/// `thread restart` acts on what the record shows was reached and what herdr
+/// shows now: refusals leave every record and herdr untouched; the rest reuse
+/// a shell pane, reopen the worktree or tab, or create the placement again.
+#[test]
+fn restart_follows_what_the_record_reached() {
+    let lab = Lab::new();
+    let repo = lab.path("repo");
+    fs::create_dir(&repo).unwrap();
+    lab.git(&repo, &["init", "-q", "-b", "main"]);
+    lab.git(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+    lab.git(&repo, &["branch", "hp/demo/t-0006-half-made"]);
+    let (mut agents, mut panes) = (Vec::new(), Vec::new());
+    let mut thread = |n: usize, fields: Value, pane: bool, agent: Option<&str>| {
+        let (id, ws) = (format!("t-{n:04}"), format!("w{n}"));
+        let cwd = lab.path(&format!("wt{n}"));
+        let ids = json!({"workspace_id": ws, "tab_id": format!("{ws}:t1"), "pane_id": format!("{ws}:p1"), "cwd": cwd});
+        let mut record = json!({"id": id, "title": "Half made", "status": "open", "kind": "worktree", "created": ago(3600), "agent": "claude",
+            "agent_name": format!("hp-demo-{id}"), "repo": repo, "worktree_path": cwd});
+        for source in [&ids, &fields] { for (k, v) in source.as_object().unwrap() { record[k] = v.clone(); } }
+        lab.write_record(&id, &record);
+        if pane { panes.push(ids.clone()); }
+        if let Some(status) = agent {
+            let mut agent = ids;
+            agent["agent"] = json!("claude");
+            agent["name"] = json!(format!("hp-demo-{id}"));
+            agent["agent_status"] = json!(status);
+            agents.push(agent);
+        }
+    };
+    let refusals = [
+        (1, "t-0001 is running: its pane has an agent in it"),
+        (2, "t-0002 is being launched by the ticker (attempt 1 of 3)"),
+        (3, "an adopted thread cannot be restarted"),
+        (4, "t-0004 is resolved; `thread resolve --reopen` first"),
+        (5, "t-0005 is still starting"),
+        (6, "t-0006: no worktree was recorded but its branch already exists"),
+    ];
+    thread(1, json!({}), true, Some("working"));
+    thread(2, json!({"prompt_pending": true, "launch_attempts": 1}), true, None);
+    thread(3, json!({"kind": "adopted"}), false, None);
+    thread(4, json!({"status": "resolved", "resolved_reason": "manual"}), false, None);
+    thread(5, json!({"status": "starting", "created": ago(60), "worktree_path": ""}), false, None);
+    thread(6, json!({"status": "failed", "error": "boom", "worktree_path": ""}), false, None);
+    // Reuses the pane at its shell prompt; a launch that ran out of attempts is restartable.
+    thread(7, json!({}), true, None);
+    thread(8, json!({"prompt_pending": true, "launch_attempts": 3}), true, None);
+    // Reopens: the worktree through herdr, the tab in the project's `threads/<id>/`.
+    thread(9, json!({}), false, None);
+    thread(10, json!({"kind": "tab", "worktree_path": ""}), false, None);
+    // A start that stalled before creating anything is created again.
+    thread(11, json!({"status": "starting", "worktree_path": ""}), false, None);
+    lab.session(&agents, &panes);
+
+    let records = || fs::read_dir(lab.project().join("threads")).unwrap().map(|e| fs::read(e.unwrap().path()).unwrap()).collect::<Vec<_>>();
+    let before = records();
+    for (n, error) in refusals {
+        let stderr = String::from_utf8(lab.cli(&["thread", "restart", "demo", &format!("t-{n:04}")]).stderr).unwrap();
+        assert!(stderr.contains(error), "t-{n:04}: {stderr}");
+    }
+    assert_eq!(records(), before, "a refused restart changed a record");
+    assert!(lab.calls().lines().all(|l| l == "agent list" || l == "pane list"), "{}", lab.calls());
+
+    let _ticker = lab.ticker();
+    let restart = |n: usize| lab.ok_beside_ticker(&["thread", "restart", "demo", &format!("t-{n:04}")]);
+    assert_eq!(restart(7), "t-0007 is back in pane w7:p1; the ticker launches its agent\n");
+    assert_eq!(restart(8), "t-0008 is back in pane w8:p1; the ticker launches its agent\n");
+    assert!(!lab.calls().contains("worktree ") && !lab.calls().contains("tab create"), "{}", lab.calls());
+    for n in [7, 8] {
+        let record = lab.record(&format!("t-{n:04}"));
+        let cwd = lab.path(&format!("wt{n}"));
+        assert_eq!(record["thread_dir"].as_str().unwrap(), cwd.join(format!(".herdr-project/demo-t-{n:04}")).to_str().unwrap());
+        assert!(cwd.join(format!(".herdr-project/demo-t-{n:04}/brief.md")).is_file());
+    }
+
+    assert_eq!(restart(9), "t-0009 is back in pane w90:p1; the ticker launches its agent\n");
+    let open = format!("worktree open --cwd {} --path {} --label Half made --no-focus", repo.display(), lab.path("wt9").display());
+    assert!(lab.calls().lines().any(|l| l == open), "{}", lab.calls());
+    assert_eq!(lab.record("t-0009")["pane_id"].as_str(), Some("w90:p1"));
+
+    assert_eq!(restart(10), "t-0010 is back in pane w0:p9; the ticker launches its agent\n");
+    let folder = fs::canonicalize(lab.project().join("threads/t-0010")).unwrap();
+    let tab = format!("tab create --workspace w0 --cwd {} --label Half made --no-focus", folder.display());
+    assert!(lab.calls().lines().any(|l| l == tab), "{}", lab.calls());
+    assert!(folder.join(".herdr-project/demo-t-0010/brief.md").is_file());
+
+    let out = restart(11);
+    assert!(out.starts_with("t-0011 is back in pane w") && !out.contains("w11:p1"), "{out}");
+    assert!(lab.git(&repo, &["branch", "--list", "hp/demo/t-0011-half-made"]).contains("hp/demo/t-0011-half-made"));
+    assert_eq!(lab.record("t-0011")["branch"].as_str(), Some("hp/demo/t-0011-half-made"));
+}
+
+/// `thread prompt` sends only to a detected agent that is not waiting on the
+/// user, and queues text for one that is working.
+#[test]
+fn prompt_refuses_a_bare_shell_a_blocked_or_unknown_agent_and_sends_otherwise() {
+    let lab = Lab::new();
+    let ids = json!({"workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1", "cwd": lab.path("work")});
+    let mut record = json!({"id": "t-0001", "title": "Adopted", "status": "open", "kind": "adopted", "created": ago(3600), "agent": "claude", "agent_name": ""});
+    for (k, v) in ids.as_object().unwrap() { record[k] = v.clone(); }
+    lab.write_record("t-0001", &record);
+    fs::write(lab.path("text"), "  Also update the changelog.\n").unwrap();
+    let text = lab.path("text");
+    let prompt = |status: Option<&str>| {
+        let agents: Vec<Value> = status.map(|s| { let mut a = ids.clone(); a["name"] = json!("someone"); a["agent_status"] = json!(s); a }).into_iter().collect();
+        lab.session(&agents, std::slice::from_ref(&ids));
+        lab.cli(&["thread", "prompt", "demo", "t-0001", "--text-file", text.to_str().unwrap()])
+    };
+    for (status, error) in [(None, "text is never typed at a bare shell prompt"), (Some("unknown"), "t-0001's agent state is unknown; not sending"),
+                            (Some("blocked"), "agent_blocked: t-0001 is waiting on the user in its pane (w1:p1)")] {
+        let out = prompt(status);
+        assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains(error), "{status:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    assert!(!lab.calls().contains("agent prompt"), "{}", lab.calls());
+    for status in ["working", "idle"] {
+        let out = prompt(Some(status));
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), format!("sent to t-0001 (agent was {status})\n"));
+    }
+    let sent = lab.calls().lines().filter(|l| *l == "agent prompt w1:p1 Also update the changelog.").count();
+    assert_eq!(sent, 2, "{}", lab.calls());
+}
+
+/// `open --reprime` on a running coordinator asks for one more priming and
+/// keeps every other field of the coordinator record.
+#[test]
+fn reprime_updates_only_the_priming_fields_of_the_coordinator_record() {
+    let lab = Lab::new();
+    let state = lab.project().join(".state/coordinator.json");
+    let before: Value = serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
+    let agent = json!({"workspace_id": "w0", "tab_id": "w0:t1", "pane_id": "w0:p1", "cwd": lab.project(), "name": "coordinator", "agent": "claude", "agent_status": "working"});
+    lab.session(std::slice::from_ref(&agent), &[]);
+    let _ticker = lab.ticker();
+    let socket = lab.path("session.sock");
+    for round in 1..=2 {
+        let out = lab.ok_beside_ticker(&["open", "demo", "--reprime", "--socket", socket.to_str().unwrap()]);
+        assert!(out.starts_with("coordinator is running in pane w0:p1\n"), "{out}");
+        let after: Value = serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
+        for field in ["socket", "workspace_id", "tab_id", "pane_id", "agent_name", "cwd"] {
+            assert_eq!(after[field], before[field], "{field}");
+        }
+        assert_eq!((after["prime_request"].as_u64(), after["prime_pending"].as_bool()), (Some(round), Some(true)));
+    }
+    let leftovers: Vec<_> = fs::read_dir(lab.project().join(".state")).unwrap().flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp")).map(|e| e.file_name()).collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
 }

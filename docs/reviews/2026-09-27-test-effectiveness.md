@@ -893,3 +893,40 @@ Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
 - Dropping the per-record `MAX(revision)` supersession failed the source test
   (the updated consumer was fenced by its old revision's source).
 - Lowering the upgrade-required floor from 24 to 22 failed the schema test.
+
+## Thread restart/prompt and project unit tests replaced by CLI workflows
+
+The audit marked 9 `src/threads.rs` and 8 `src/project.rs` tests REPLACE. They
+called `restart_plan`, `prompt_state`, `thread_tokens`, `exclude_from_git`,
+`create`, `parse_project_md`, `load_safety` and `update_coordinator` directly.
+The replacements drive the compiled CLI against the fake herdr of
+`tests/threads.rs` (extended with `worktree open`, `tab create` and
+`pane get`) and a new `tests/projects.rs`, asserting output, the herdr call log
+and files on disk.
+
+| New E2E test | Replaced unit tests |
+| --- | --- |
+| `restart_follows_what_the_record_reached` (six refusals leave records and herdr untouched; shell-pane reuse, exhausted launch, worktree reopen, tab reopen, stale start recreated) | `restart_case_a`…`restart_case_e`, `restart_refuses_a_launch_in_progress_adopted_resolved_and_young_starting` |
+| `prompt_refuses_a_bare_shell_a_blocked_or_unknown_agent_and_sends_otherwise` | `prompt_refusals_and_sending_while_working` |
+| `start_restart_and_adopt_…` (now: one exclude line shared by two worktrees, clean `git status`, exact sidebar token line) and `report_review_ack_and_resolve_copy_home` (tokens cleared on resolve) | `exclude_is_added_once`, `token_values_and_ranks` |
+| `reprime_updates_only_the_priming_fields_of_the_coordinator_record` (`open --reprime` twice) | `coordinator_updates_keep_other_fields` |
+| `new_writes_the_skeleton_and_refuses_duplicates_and_escapes` | `create_writes_the_skeleton_and_refuses_a_second_time`, `slug_derivation_and_name_refusals`, `repo_arg_parsing` |
+| `list_and_commands_accept_only_folders_with_project_md_and_valid_slugs` | `only_folders_with_project_md_count`, `slug_validation` |
+| `context_reads_front_matter_and_reports_malformed_project_md` | `front_matter_parsing` |
+| `safety_overrides_are_keyed_by_canonical_project_path` | `safety_defaults_and_overrides_keyed_by_canonical_path` |
+
+The token test now asserts the `working`/rank 3 label placement writes, not
+the waiting-on-you rank; group-to-rank mapping under the ticker is left to the
+ticker scenarios. `writers_drop_their_write_when_project_md_is_gone` is
+FOCUSED_KEEP and unchanged.
+
+Finding: `ticker status` probes the lock with `try_lock`, so a status call that
+lands on a new ticker's first `try_lock` makes that ticker exit silently. The
+test helper restarts such a ticker; production is unchanged.
+
+Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
+- Letting `restart_plan` treat any attempted launch as finished (`launch_attempts < 1`)
+  failed the restart test: t-0002 was restarted mid-launch.
+- Dropping the already-listed check in `exclude_from_git` failed the start test
+  (two `.herdr-project/` lines).
+- Accepting `start_threads = "yolo"` in `parse_safety` failed the safety test.
