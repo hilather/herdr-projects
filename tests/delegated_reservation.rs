@@ -94,9 +94,25 @@ fn delegated_reserve_logs_grant_once() {
 
 struct Scenario { _home: tempfile::TempDir, db: PathBuf, grant_id: String, attempts: [String; 2], policy: VersionedReference, profile: String }
 
-/// Signed delegated reservations through the CLI: scope, quota and signature
-/// refusals, two accepted reservations and replays of the first.
-fn delegated_scenario() -> Scenario {
+const VERIFIER_POLICY: &str = r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#;
+
+fn git(home: &Path, repository: &Path, args: &[&str]) -> String {
+    let output = Command::new("/usr/bin/git").env_clear().env("PATH", "/usr/bin:/bin")
+        .env("HOME", home).env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "fixture").env("GIT_AUTHOR_EMAIL", "fixture@example.com")
+        .env("GIT_COMMITTER_NAME", "fixture").env("GIT_COMMITTER_EMAIL", "fixture@example.com")
+        .current_dir(repository).args(args).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+struct Installed { home: tempfile::TempDir, owner: PathBuf, subject: PathBuf, project: PathBuf, config: PathBuf, path: PathBuf, db: herdr_projects::store::SqliteStore,
+    repository: PathBuf, oid: String, authority: VersionedReference, first_contract: serde_json::Value, grant_id: String, profile: FrozenProfile, document: PathBuf }
+
+/// An active project with queued tasks `a`, `b` and `c`, each with a signed
+/// contract writing `writes`, a signed budget, and an installed delegation
+/// grant for `concurrent` attempts at once and two in its lifetime.
+fn install(concurrent: u32, writes: serde_json::Value) -> Installed {
     let home = tempfile::tempdir().unwrap();
     let (owner, public) = key(home.path(), "owner");
     let (subject, subject_public) = key(home.path(), "subject");
@@ -130,26 +146,17 @@ fn delegated_scenario() -> Scenario {
     runtime::set_state(&project, snapshot.head, snapshot.control.unwrap().revision, ProjectState::Active, &config).unwrap();
     let profile = synthetic_profile(&project, &config);
     let repository = home.path().join("repo"); fs::create_dir(&repository).unwrap();
-    let git = |args: &[&str]| {
-        let output = Command::new("/usr/bin/git").env_clear().env("PATH", "/usr/bin:/bin")
-            .env("HOME", home.path()).env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_AUTHOR_NAME", "fixture").env("GIT_AUTHOR_EMAIL", "fixture@example.com")
-            .env("GIT_COMMITTER_NAME", "fixture").env("GIT_COMMITTER_EMAIL", "fixture@example.com")
-            .current_dir(&repository).args(args).output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
-    };
+    let git = |args: &[&str]| git(home.path(), &repository, args);
     git(&["init", "--object-format=sha1"]); git(&["commit", "--allow-empty", "-m", "fixture"]);
     let oid = git(&["rev-parse", "HEAD"]);
     let authority = authority::policy_reference(&project).unwrap();
     let document = home.path().join("owner-document.json");
-    let verifier_policy = r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#;
     let mut contracts = Vec::new();
     let mut first_contract = serde_json::Value::Null;
     for task in ["a", "b", "c"] {
         let body = serde_json::json!({"version":1,"project_store":store,"expected_head":db.current_head().unwrap(),"task_id":task,"contract_revision":1,
-            "deliverable":"CLI fixture","non_goals":"no worker launch","acceptance_policies":[{"id":"builds","text":verifier_policy}],
-            "repository":repository,"base_oid":oid,"object_format":"sha1","dependencies":[],"scope":{"paths":[],"named_resources":[]},
+            "deliverable":"CLI fixture","non_goals":"no worker launch","acceptance_policies":[{"id":"builds","text":VERIFIER_POLICY}],
+            "repository":repository,"base_oid":oid,"object_format":"sha1","dependencies":[],"scope":{"paths":writes,"named_resources":[]},
             "capability_flags":[],"profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_only","authority":authority});
         if task == "a" { first_contract = body.clone(); }
         let signature = sign(&owner, &document, &serde_json::to_vec(&body).unwrap(), authority::CONTRACT_SIGNATURE_NAMESPACE);
@@ -162,19 +169,29 @@ fn delegated_scenario() -> Scenario {
     accepted(cli(home.path(), &["budget","demo","import",document.to_str().unwrap(),signature.to_str().unwrap(),"--expected-head",&db.current_head().unwrap().to_string()]));
     let grant = serde_json::json!({"version":2,"issuer":"owner","subject":"delegate","subject_public_key":subject_public,
         "action_classes":["reserve_attempt"],"repositories":[{"repository":repository,"ref":"refs/heads/factory"}],"profile_kinds":["codex"],
-        "max_concurrent_attempts":1,"expires_unix_ms":9_000_000_000_000i64,"revocation_epoch":1,"child_delegation":"forbidden",
+        "max_concurrent_attempts":concurrent,"expires_unix_ms":9_000_000_000_000i64,"revocation_epoch":1,"child_delegation":"forbidden",
         "policy_revision":authority.revision,"project_store":store,"authority":authority,
         "reservation_scope":{"task_contracts":contracts,"profiles":[profile.reference().unwrap()],"budget":policy.reference().unwrap(),
             "repository_bases":[{"repository":repository,"ref":"refs/heads/factory","commit_oid":oid,"object_format":"sha1"}],"max_total_attempts":2}});
     let signature = sign(&owner, &document, &serde_json::to_vec(&grant).unwrap(), authority::DELEGATION_SIGNATURE_NAMESPACE);
     let receipt = accepted(cli(home.path(), &["delegation","demo","import",document.to_str().unwrap(),signature.to_str().unwrap()]));
-    let grant_id = receipt["grant_id"].as_str().unwrap();
+    let grant_id = receipt["grant_id"].as_str().unwrap().to_owned();
     for task in ["a", "b", "c"] { worker_snapshot(&project, &profile, task); }
+    Installed { home, owner, subject, project, config, path, db, repository, oid, authority, first_contract, grant_id, profile, document }
+}
+
+/// Signed delegated reservations through the CLI: scope, quota and signature
+/// refusals, two accepted reservations and replays of the first.
+fn delegated_scenario() -> Scenario {
+    let Installed { home, owner, subject, project: _, config, path, mut db, repository, oid, authority, mut first_contract, grant_id, profile, document } = install(1, serde_json::json!([]));
+    let (grant_id, verifier_policy) = (grant_id.as_str(), VERIFIER_POLICY);
+    let git = |args: &[&str]| git(home.path(), &repository, args);
     let draft = |key: &str| accepted(cli(home.path(), &["delegation","demo","draft",grant_id,"--idempotency-key",key]));
     let request_path = home.path().join("request.json");
+    let before_draft = db.read_snapshot(None).unwrap();
     let first = draft("first");
     assert_eq!(first["inputs"]["task"], "a");
-    assert!(db.read_snapshot(None).unwrap().attempts.is_empty());
+    assert_eq!(db.read_snapshot(None).unwrap(), before_draft, "a draft writes nothing");
     let first_bytes = serde_json::to_vec(&first).unwrap();
     let reserve = |path: &Path, signature: &Path| cli(home.path(), &["delegation","demo","reserve",path.to_str().unwrap(),signature.to_str().unwrap()]);
     for (key, namespace) in [(&owner, authority::DELEGATED_RESERVATION_SIGNATURE_NAMESPACE), (&subject, authority::DELEGATION_SIGNATURE_NAMESPACE)] {
@@ -276,11 +293,13 @@ fn delegated_scenario() -> Scenario {
     assert_eq!(db.read_snapshot(None).unwrap().attempts, before_result.attempts);
     let second_path = home.path().join("second.json");
     let second = draft("second"); assert_eq!(second["inputs"]["task"], "b");
+    let before_second = db.read_snapshot(None).unwrap();
     let second_signature = sign(&subject, &second_path, &serde_json::to_vec(&second).unwrap(), authority::DELEGATED_RESERVATION_SIGNATURE_NAMESPACE);
     let rejected = reserve(&second_path, &second_signature);
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("concurrent"));
-    assert_eq!(db.read_snapshot(None).unwrap().attempts.len(), 1);
+    assert_eq!(db.read_snapshot(None).unwrap(), before_second);
+    assert!(before_second.attempts[0].retains_capacity());
     let cancelled = accepted(cli(home.path(), &["task","demo","cancel-attempt",first_receipt["record"]["attempt"].as_str().unwrap(),
         "--expected-revision","1","--expected-head",&db.current_head().unwrap().to_string(),"--reason","no launch requested"]));
     assert_eq!(cancelled["released"], true);
@@ -320,4 +339,82 @@ fn delegated_scenario() -> Scenario {
     assert!(db.read_snapshot(None).unwrap().attempts.iter().any(|attempt| attempt.retains_capacity()));
     let attempts = [&first_receipt, &second_receipt].map(|receipt| receipt["record"]["attempt"].as_str().unwrap().to_owned());
     Scenario { grant_id: grant_id.to_owned(), attempts, policy: authority, profile: profile.reference().unwrap().digest, db: path, _home: home }
+}
+
+impl Installed {
+    fn cli(&self, args: &[&str]) -> Output { cli(self.home.path(), args) }
+    fn draft(&self, key: &str) -> Output { self.cli(&["delegation","demo","draft",&self.grant_id,"--idempotency-key",key]) }
+    /// Sign `request` as the delegated subject and submit it.
+    fn reserve(&self, request: &serde_json::Value) -> Output {
+        let path = self.home.path().join(format!("{}.json", request["idempotency_key"].as_str().unwrap()));
+        let signature = sign(&self.subject, &path, &serde_json::to_vec(request).unwrap(), authority::DELEGATED_RESERVATION_SIGNATURE_NAMESPACE);
+        self.cli(&["delegation","demo","reserve",path.to_str().unwrap(),signature.to_str().unwrap()])
+    }
+    fn head(&self) -> String { self.db.current_head().unwrap().to_string() }
+    /// Requeue `task` at `priority` so the next draft picks the highest.
+    fn requeue(&self, task: &str, priority: i32) {
+        let request = self.home.path().join(format!("{task}-queue.json"));
+        fs::write(&request, serde_json::json!({"priority":priority,"dependencies":[]}).to_string()).unwrap();
+        let revision = runtime::snapshot(&self.project).unwrap().tasks.into_iter().find(|t| t.id.as_str() == task).unwrap().revision.to_string();
+        accepted(self.cli(&["task","demo","queue",task,"--input-file",request.to_str().unwrap(),"--expected-revision",&revision,"--expected-head",&self.head()]));
+        // A new task revision needs fresh binding observations and knowledge.
+        let snapshot = runtime::snapshot(&self.project).unwrap();
+        let observations = snapshot.runtime_bindings.iter().map(|binding| herdr_projects::reconcile::RuntimeObservation {
+            binding: binding.id.clone(), binding_revision: binding.revision,
+            task_revision: snapshot.tasks.iter().find(|t| Some(&t.id) == binding.task.as_ref()).map(|t| t.revision),
+            config_digest: migration::config_reference(&self.config).unwrap().digest,
+            observed_unix_ms: jiff::Timestamp::now().as_millisecond(), collector: "herdr-git-v1".into(), ..Default::default() }).collect::<Vec<_>>();
+        migration::open_active(&self.project).unwrap().record_observations(snapshot.head, &observations).unwrap();
+        worker_snapshot(&self.project, &self.profile, task);
+    }
+}
+
+/// Cancelling a claimed delegated launch does not free its slot, even once the
+/// claim's lease has expired: the worker's termination was never observed.
+#[test]
+fn a_cancelled_claimed_delegated_launch_keeps_its_slot_after_the_lease_expires() {
+    let mut s = install(1, serde_json::json!([]));
+    let first = accepted(s.reserve(&accepted(s.draft("first"))));
+    // The ticker's launch job is the only other caller of the claim.
+    let operation = OperationId::new(first["record"]["operation"].as_str().unwrap()).unwrap();
+    s.db.claim_operation(&operation, 1, "worker", jiff::Timestamp::now().as_millisecond(), 1_000).unwrap();
+    let attempt = first["record"]["attempt"].as_str().unwrap();
+    let cancelled = accepted(s.cli(&["task","demo","cancel-attempt",attempt,"--expected-revision","1","--expected-head",&s.head(),"--reason","stop uncertain worker"]));
+    assert_eq!(cancelled["released"], false);
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    let second = accepted(s.draft("second"));
+    assert_eq!(second["inputs"]["task"], "b");
+    let before = runtime::snapshot(&s.project).unwrap();
+    let refused = s.reserve(&second);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("concurrent"), "{}", String::from_utf8_lossy(&refused.stderr));
+    assert_eq!(runtime::snapshot(&s.project).unwrap(), before);
+    assert!(before.attempts.iter().all(Attempt::retains_capacity));
+}
+
+/// With automatic admission off (the default), a grant with room for two
+/// attempts is offered no draft for, and cannot reserve, a task whose signed
+/// write scope overlaps a retained attempt's.
+#[test]
+fn delegated_draft_and_reserve_refuse_an_overlapping_write_scope_with_admission_off() {
+    let s = install(2, serde_json::json!([{"path":"shared.txt","access":"write"}]));
+    assert_eq!(accepted(s.cli(&["scheduler","demo","inspect"]))["capability"]["automatic_admission"], false);
+    // Draft `b` while it ranks first, then reserve `a` ahead of it.
+    s.requeue("b", 1);
+    let mut second = accepted(s.draft("second"));
+    assert_eq!(second["inputs"]["task"], "b");
+    s.requeue("a", 2);
+    let first = accepted(s.draft("first"));
+    assert_eq!(first["inputs"]["task"], "a");
+    accepted(s.reserve(&first));
+    let before = runtime::snapshot(&s.project).unwrap();
+    // The ranker skips the conflicting task, so no draft is offered for it.
+    let refused = s.draft("second-again");
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("no ready candidate"), "{}", String::from_utf8_lossy(&refused.stderr));
+    second["expected_head"] = before.head.into();
+    let refused = s.reserve(&second);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("resource_conflict"), "{}", String::from_utf8_lossy(&refused.stderr));
+    assert_eq!(runtime::snapshot(&s.project).unwrap(), before);
 }

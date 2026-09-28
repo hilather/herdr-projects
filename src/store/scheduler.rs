@@ -267,42 +267,6 @@ mod tests {
         let before=db.read_snapshot(None).unwrap();let raw=Connection::open(temp.path().join("state.db")).unwrap();raw.execute_batch("CREATE TRIGGER fail_queue BEFORE INSERT ON events WHEN NEW.kind='scheduler.task_queued' BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();assert!(queue(&mut db,"c",&request(0,&[]),2).is_err());assert_eq!(db.read_snapshot(None).unwrap(),before);
     }
     #[test]
-    fn aging_outweighs_new_priority_and_requeue_preserves_original_age() {
-        let(_temp,mut db)=fixture();queue(&mut db,"a",&request(-20,&[]),0).unwrap();queue(&mut db,"b",&request(20,&[]),41*60_000).unwrap();let report=db.queue_report(41*60_000).unwrap();assert_eq!(report.entries[0].task.as_str(),"a");assert!(!report.launch_enabled);
-        let before=db.read_snapshot(None).unwrap();queue(&mut db,"a",&request(-19,&[]),42*60_000).unwrap();let after=db.read_snapshot(None).unwrap();let old=&before.scheduler.unwrap().queue[0];let new=&after.scheduler.unwrap().queue[0];assert_eq!((old.enqueued_unix_ms,old.enqueue_sequence),(new.enqueued_unix_ms,new.enqueue_sequence));let head=after.head;assert_eq!(queue(&mut db,"a",&request(-19,&[]),99*60_000).unwrap(),head);
-    }
-    #[test]
-    fn all_unterminated_states_count_and_lowering_policy_never_revokes_attempts() {
-        let(_temp,mut db)=fixture();queue(&mut db,"a",&request(0,&[]),0).unwrap();let before=db.read_snapshot(None).unwrap();let attempts=[AttemptState::AwaitingInput,AttemptState::Lost,AttemptState::Completed].into_iter().enumerate().map(|(i,state)|Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new(format!("attempt-{i}")).unwrap(),task:TaskId::new("b").unwrap(),revision:1,state,snapshot:None,reservation:format!("slot-{i}"),termination_observed:false}}).collect();db.commit(Commit{expected_head:before.head,mutations:attempts}).unwrap();let before=db.read_snapshot(None).unwrap();db.set_scheduler_policy(before.head,1,2,3).unwrap();let report=db.queue_report(0).unwrap();assert_eq!(report.retained_attempts,3);assert_eq!(report.available_slots,0);assert!(report.entries[0].blockers.contains(&"capacity_full".into()));assert_eq!(db.read_snapshot(None).unwrap().attempts,before.attempts);assert!(queue(&mut db,"b",&request(0,&[]),0).is_err());
-    }
-    #[test]
-    fn narrative_success_never_satisfies_verified_dependencies() {
-        let(_temp,mut db)=fixture();queue(&mut db,"a",&request(0,&["b"]),0).unwrap();let s=db.read_snapshot(None).unwrap();let mut task=s.tasks.iter().find(|t|t.id.as_str()=="b").unwrap().clone();task.revision=2;task.state=TaskState::Succeeded;db.commit(Commit{expected_head:s.head,mutations:vec![Mutation::Task{expected:Some(1),next:task}]}).unwrap();let report=db.queue_report(0).unwrap();assert!(report.entries[0].blockers.iter().any(|b|b.starts_with("verified_dependency_evidence_unavailable:b")));assert!(db.read_snapshot(None).unwrap().attempts.is_empty());
-    }
-    #[test]
-    fn retained_reserved_attempt_omits_reserve_blocker_and_grant_omits_signature_blocker() {
-        let(temp,mut db)=fixture();let s=db.read_snapshot(None).unwrap();db.commit(Commit{expected_head:s.head,mutations:["d","e"].into_iter().map(|id|Mutation::Task{expected:None,next:Task{id:TaskId::new(id).unwrap(),revision:1,state:TaskState::Draft,title:id.into(),active_attempt:None}}).collect()}).unwrap();for id in ["a","b","c","d","e"]{queue(&mut db,id,&request(0,&[]),0).unwrap();}
-        let s=db.read_snapshot(None).unwrap();
-        db.commit(Commit{expected_head:s.head,mutations:vec![Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("reserved-a").unwrap(),task:TaskId::new("a").unwrap(),revision:1,state:AttemptState::Reserved,snapshot:None,reservation:"worker:reserved-a".into(),termination_observed:false}},Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("lost-b").unwrap(),task:TaskId::new("b").unwrap(),revision:1,state:AttemptState::Lost,snapshot:None,reservation:"slot".into(),termination_observed:false}},Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("launching-d").unwrap(),task:TaskId::new("d").unwrap(),revision:1,state:AttemptState::Launching,snapshot:None,reservation:"worker:launching-d".into(),termination_observed:false}},Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("awaiting-e").unwrap(),task:TaskId::new("e").unwrap(),revision:1,state:AttemptState::AwaitingInput,snapshot:None,reservation:"worker:awaiting-e".into(),termination_observed:false}}]}).unwrap();
-        let s=db.read_snapshot(None).unwrap();let task=s.tasks.iter().find(|t|t.id.as_str()=="c").unwrap();
-        let store_path=std::fs::canonicalize(temp.path().join("state.db")).unwrap().display().to_string();
-        let profile=crate::domain::profile::fixture(crate::migration::ConfigReference{path:store_path.clone(),digest:None});
-        let inputs=LaunchInputs{task_contract: None, version:2,project_store:store_path.clone(),task:task.id.clone(),task_revision:task.revision,scheduler_revision:1,control_epoch:0,binding:"local".into(),binding_revision:1,binding_digest:"a".repeat(64),profile:profile.reference().unwrap(),effective_profile:Some(profile.clone()),approval:VersionedReference{id:"pending".into(),revision:1,digest:"0".repeat(64)},config:crate::migration::ConfigReference{path:store_path,digest:None},repositories:vec![],dependencies:vec![],memory:None,budget:None};
-        let grant=ApprovalGrant{version:1,scope:ApprovalScope::for_launch(&inputs).unwrap(),policy:profile.permission_policy,issued_unix_ms:0,expires_unix_ms:100_000};
-        db.install_approval(&PreparedApproval{grant},s.head,1_000).unwrap();
-        let report=db.queue_report(1_000).unwrap();assert!(!report.launch_enabled);
-        let entry=|id:&str|&report.entries.iter().find(|entry|entry.task.as_str()==id).unwrap().blockers;
-        assert!(entry("a").iter().all(|b|b!="launch_reserve_not_scheduled"&&b!="controller_requires_reserved_attempt"));
-        assert!(entry("d").iter().all(|b|b!="launch_reserve_not_scheduled"&&b!="controller_requires_reserved_attempt"));
-        assert!(entry("e").iter().all(|b|b!="launch_reserve_not_scheduled"&&b!="controller_requires_reserved_attempt"));
-        assert!(entry("a").iter().any(|b|b=="owner_signature_not_scheduled"));
-        assert!(entry("b").iter().any(|b|b=="launch_reserve_not_scheduled")&&entry("b").iter().any(|b|b=="controller_requires_reserved_attempt"));
-        assert!(entry("c").iter().all(|b|b!="owner_signature_not_scheduled"));
-        assert!(entry("c").iter().any(|b|b=="launch_reserve_not_scheduled"));
-        assert!(report.entries.iter().flat_map(|entry|&entry.blockers).all(|b|b!="launch_draft_not_scheduled"));
-        assert_eq!(report.capability.blockers,vec!["automatic_admission_does_not_draft_sign_or_reserve".to_string()]);
-    }
-    #[test]
     fn competing_policy_writers_cannot_both_win_the_same_revision() {
         use std::sync::{Arc,Barrier};let(temp,mut db)=fixture();let head=db.read_snapshot(None).unwrap().head;let barrier=Arc::new(Barrier::new(2));let threads:Vec<_>=[2,3].into_iter().map(|cap|{let path=temp.path().join("state.db");let barrier=barrier.clone();std::thread::spawn(move||{let mut db=SqliteStore::open(&path).unwrap();barrier.wait();db.set_scheduler_policy(head,1,cap,3)})}).collect();let result:Vec<_>=threads.into_iter().map(|t|t.join().unwrap()).collect();assert_eq!(result.iter().filter(|r|r.is_ok()).count(),1);assert_eq!(db.read_snapshot(None).unwrap().scheduler.unwrap().policy.revision,2);
     }

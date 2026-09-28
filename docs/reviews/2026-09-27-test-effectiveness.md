@@ -1167,3 +1167,80 @@ Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
   so the test now waits one more pass.
 - Dropping the script digest check from routine execution failed the routine
   test: the edited routine ran.
+
+## Scheduling, active-work, read-set, update-package and delegated unit tests replaced by E2E workflows
+
+The audit marked 20 tests REPLACE: 4 each in `src/store/scheduler.rs`,
+`src/store/active_work.rs`, `src/store/read_set.rs`,
+`src/store/update_packages.rs` and `src/admission_delegated_tests.rs`.
+19 were deleted.
+
+The new tests drive the compiled CLI:
+- `tests/scheduling.rs`: `task queue`, `scheduler policy/inspect`, signed
+  contracts and approvals, `launch draft/reserve`, `runtime
+  create/adopt/relinquish`, and `reconcile` against a fake Herdr.
+- `tests/memory_read_sets.rs`: `memory propose/review/promote/import`.
+- `tests/update_packages.rs`: promotion, then `memory package` pulls, each
+  pull in a fresh process.
+- `tests/delegated_reservation.rs`: `delegation draft/reserve`.
+
+Where no CLI path exists, the tests use the public API:
+- Attempts that no reservation produced (a worker's own success, or lost,
+  terminated or adopted-then-ended attempts) are written with the generic
+  commit.
+- One queue entry is back-dated with `SqliteStore::queue_task`, because the
+  binary has no clock override.
+- A launch claim goes through `claim_operation`.
+- Worker snapshots, consumer-binding retirement and package acknowledgment go
+  through the store API. Nothing outside tests calls
+  `acknowledge_update_package`.
+
+| New E2E test | Replaced unit tests |
+| --- | --- |
+| `queue_order_ages_and_a_requeue_keeps_the_original_age` | `aging_outweighs_new_priority_and_requeue_preserves_original_age` |
+| `every_unterminated_attempt_holds_capacity_and_a_lower_cap_revokes_nothing` | `all_unterminated_states_count_and_lowering_policy_never_revokes_attempts` |
+| `a_succeeded_predecessor_without_a_verified_result_keeps_its_dependent_blocked` | `narrative_success_never_satisfies_verified_dependencies` |
+| `queue_blockers_follow_reservations_unused_grants_and_live_attempts` | `retained_reserved_attempt_omits_reserve_blocker_and_grant_omits_signature_blocker` |
+| `owner_draft_and_reserve_refuse_an_overlapping_write_scope_with_admission_off` | `owner_reservation_and_draft_also_preserve_resources_with_automatic_admission_off` |
+| `delegated_draft_and_reserve_refuse_an_overlapping_write_scope_with_admission_off` | `delegated_reservation_respects_resource_claims_when_automatic_admission_is_off` |
+| `a_cancelled_claimed_delegated_launch_keeps_its_slot_after_the_lease_expires` | `cancelled_claim_with_expired_lease_still_consumes_delegated_capacity` |
+| `signed_cli_reservation_enforces_subject_scope_quotas_and_replays_after_revocation` (existing; now asserts that drafts and refusals write nothing) | `delegated_reservation_is_real_replayable_and_counts_lifetime_and_retained_capacity` |
+| `reconcile_observes_exactly_the_bindings_with_unfinished_work` | `terminated_attempt_commit_removes_the_binding_from_the_index`, `index_keeps_every_retained_attempt_and_prefers_the_active_one`, `owned_binding_stays_active_after_every_attempt_is_terminated` |
+| `unrelated_events_do_not_block_a_v2_promotion_and_replay_returns_the_stored_row` | `unrelated_event_allows_v2_promotion_and_replay_returns_the_stored_row` |
+| `a_new_hard_rule_blocks_a_v2_promotion` | `new_constraint_blocks_v2_promotion` |
+| `a_contract_promoted_after_the_review_blocks_a_v2_promotion` | `phantom_contract_conflicts_and_is_not_skipped` |
+| `reviews_without_a_v2_read_set_conflict_on_any_intervening_event` | `v1_and_other_versions_still_conflict_on_an_intervening_event` |
+| `coordinator_packages_rebuild_stably_and_receipts_keep_their_source` | `crash_rebuilds_the_same_package_and_old_ack_does_not_apply_a_new_change`, `selected_packages_preserve_logical_receipts_and_reject_foreign_or_missing_changes`, `later_package_supersedes_unapplied_seen_and_old_package_stays_readable` |
+| `a_change_applied_by_one_binding_stays_owed_by_the_bindings_it_was_copied_to` | `same_generation_does_not_hide_another_bindings_copied_delivery` |
+
+Some guarantees look different from the CLI:
+- The active-work inventory is visible as the set of bindings that
+  `reconcile` observes. Two of the unit tests' fields have no reader outside
+  `active_work.rs`: the order of attempt ids within an item, and
+  `capacity_release_allowed`. The E2E test asserts only that a binding with
+  two retained attempts is observed exactly once.
+- A delegated draft for a task whose write scope conflicts is not refused
+  with `resource_conflict`. The admission ranker skips that task, so the
+  draft reports no ready candidate. The E2E test signs a request drafted
+  before the conflict existed, and checks that reserving it is refused with
+  `resource_conflict`.
+- The superseded-package case now promotes a real revision through the CLI,
+  instead of editing heads with SQL.
+
+Kept: `adopt_without_a_new_attempt_puts_a_terminated_binding_back_in_the_index`.
+Adopting without creating an attempt needs a task binding that records only
+a worktree. No CLI path creates one: runtime routes carry no worktree, and
+only a ticker launch records one. A task binding with a pane always creates
+an attempt when it is adopted.
+
+Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
+- Dropping `awaiting_input` from the retained-launch states in the queue
+  report failed the queue-blocker test.
+- Skipping the retained-resource overlap check in `admit_prepared` failed
+  both write-scope tests: the owner one and the delegated one.
+- Dropping `owned == 1` from active-work inclusion failed the reconcile
+  test: the adopted binding vanished once its attempt terminated.
+- Treating any read-set version as v2 in `reviews.rs` failed the
+  intervening-event test.
+- Removing the `binding_id` filter from the first `unresolved_members`
+  query failed the copied-delivery test.

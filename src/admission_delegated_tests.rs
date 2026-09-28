@@ -67,54 +67,6 @@ fn request(db: &SqliteStore, grant: &str, inputs: &LaunchInputs, key: &str) -> P
 fn now() -> i64 { jiff::Timestamp::now().as_millisecond() }
 
 #[test]
-fn delegated_reservation_is_real_replayable_and_counts_lifetime_and_retained_capacity() {
-    let (_root, project, mut db, grant, inputs) = setup();
-    let before = db.read_snapshot(None).unwrap();
-    let draft = db.draft_delegated_reservation(&grant, "unsigned", inputs[0].clone(), now()).unwrap();
-    assert_eq!(draft.inputs, inputs[0]);
-    assert_eq!(draft.expected_head, before.head);
-    assert_eq!(db.read_snapshot(None).unwrap(), before);
-    let first = request(&db, &grant, &inputs[0], "first");
-    let reserved = db.reserve_delegated(&first, now()).unwrap();
-    assert!(db.read_snapshot(None).unwrap().attempts[0].retains_capacity());
-    let other = request(&db, &grant, &inputs[1], "second");
-    let before = db.read_snapshot(None).unwrap();
-    let error = db.reserve_delegated(&other, now()).unwrap_err();
-    assert!(error.to_string().contains("concurrent"), "{error}");
-    assert_eq!(db.read_snapshot(None).unwrap(), before);
-    db.cancel_attempt(&reserved.record.attempt, 1, before.head, "no launch", now()).unwrap();
-    drop(db);
-    let mut db = SqliteStore::open(&store_file(&project).unwrap()).unwrap();
-    let replay = db.reserve_delegated(&first, now()).unwrap();
-    assert_eq!(serde_json::to_value(&replay).unwrap(), serde_json::to_value(&reserved).unwrap());
-    let mut changed = first.request.clone(); changed.issued_unix_ms += 1;
-    let changed = PreparedDelegatedReservation::parse_verified(&serde_json::to_vec(&changed).unwrap()).unwrap();
-    assert!(matches!(db.reserve_delegated(&changed, now()), Err(StoreError::Conflict)));
-    let second = request(&db, &grant, &inputs[1], "second");
-    let second = db.reserve_delegated(&second, now()).unwrap();
-    db.cancel_attempt(&second.record.attempt, 1, second.head, "no launch", now()).unwrap();
-    let third = request(&db, &grant, &inputs[2], "third");
-    let error = db.reserve_delegated(&third, now()).unwrap_err();
-    assert!(error.to_string().contains("lifetime"), "{error}");
-    assert_eq!(db.read_snapshot(None).unwrap().attempts.len(), 2);
-}
-
-#[test]
-fn cancelled_claim_with_expired_lease_still_consumes_delegated_capacity() {
-    let (_root, _project, mut db, grant, inputs) = setup();
-    let first = request(&db, &grant, &inputs[0], "first");
-    let reserved = db.reserve_delegated(&first, now()).unwrap();
-    let claimed_at = now();
-    db.claim_operation(&reserved.record.operation, 1, "worker", claimed_at, 1_000).unwrap();
-    let cancelled = db.cancel_attempt(&reserved.record.attempt, 1, db.current_head().unwrap(), "stop uncertain worker", claimed_at+1).unwrap();
-    assert!(!cancelled.released);
-    let second = request(&db, &grant, &inputs[1], "second");
-    let error = db.reserve_delegated(&second, claimed_at+10_000).unwrap_err();
-    assert!(error.to_string().contains("concurrent"), "{error}");
-    assert!(db.read_snapshot(None).unwrap().attempts[0].retains_capacity());
-}
-
-#[test]
 fn concurrent_clients_cannot_double_spend_delegated_capacity() {
     let (_root, project, mut db, grant, inputs) = setup();
     let requests = [request(&db, &grant, &inputs[0], "first"), request(&db, &grant, &inputs[1], "second")];
@@ -143,47 +95,6 @@ fn concurrent_clients_cannot_double_spend_delegated_capacity() {
     let raw = rusqlite::Connection::open(path).unwrap();
     assert_eq!(raw.query_row("SELECT count(*) FROM delegated_reservations", [], |row| row.get::<_, u64>(0)).unwrap(), 1);
     assert_eq!(db.read_snapshot(None).unwrap().attempts.len(), 1);
-}
-
-#[test]
-fn delegated_reservation_respects_resource_claims_when_automatic_admission_is_off() {
-    let (_root, project, mut db, grant, inputs) = setup_with_limits(2, true);
-    let raw = rusqlite::Connection::open(&inputs[0].project_store).unwrap();
-    let column = ["factory", "_admission"].concat();
-    raw.execute(&format!("UPDATE project_control SET {column}=?1"), ["off"]).unwrap();
-    let first = request(&db, &grant, &inputs[0], "first");
-    db.reserve_delegated(&first, now()).unwrap();
-    assert!(prepared_admission_inputs(&project).unwrap().is_none());
-    let second = request(&db, &grant, &inputs[1], "second");
-    let before = db.read_snapshot(None).unwrap();
-    let draft_error = db.draft_delegated_reservation(&grant, "second-draft", inputs[1].clone(), now()).unwrap_err();
-    assert!(draft_error.to_string().contains("resource_conflict"), "{draft_error}");
-    let error = db.reserve_delegated(&second, now()).expect_err("a grant cannot authorize overlapping retained resource claims");
-    assert!(error.to_string().contains("resource_conflict"), "{error}");
-    assert_eq!(db.read_snapshot(None).unwrap(), before);
-}
-
-#[test]
-fn owner_reservation_and_draft_also_preserve_resources_with_automatic_admission_off() {
-    let (_root, _project, mut db, _grant, mut inputs) = setup_with_limits(2, true);
-    let raw = rusqlite::Connection::open(&inputs[0].project_store).unwrap();
-    let column = ["factory", "_admission"].concat();
-    raw.execute(&format!("UPDATE project_control SET {column}=?1"), ["off"]).unwrap();
-    for input in &mut inputs {
-        let approval = ApprovalGrant {
-            version: 1, scope: ApprovalScope::for_launch(input).unwrap(),
-            policy: input.effective_profile.as_ref().unwrap().permission_policy.clone(),
-            issued_unix_ms: now(), expires_unix_ms: 9_000_000_000_000,
-        };
-        input.approval = db.install_approval(&PreparedApproval { grant: approval }, db.current_head().unwrap(), now()).unwrap();
-    }
-    db.reserve_prepared(&[PreparedLaunch { inputs: inputs[0].clone() }], db.current_head().unwrap(), now()).unwrap();
-    let before = db.read_snapshot(None).unwrap();
-    let draft_error = db.validate_launch_draft(&inputs[1], before.head, now()).unwrap_err();
-    assert!(draft_error.to_string().contains("resource_conflict"), "{draft_error}");
-    let error = db.reserve_prepared(&[PreparedLaunch { inputs: inputs[1].clone() }], before.head, now()).unwrap_err();
-    assert!(error.to_string().contains("resource_conflict"), "{error}");
-    assert_eq!(db.read_snapshot(None).unwrap(), before);
 }
 
 #[test]

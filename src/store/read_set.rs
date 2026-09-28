@@ -205,7 +205,7 @@ pub(super) fn require_match(db: &Connection, signed: &MemoryReadSet) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{MemoryError, MemoryStore};
+    use crate::memory::MemoryStore;
 
     fn user_version(db: &Connection) -> u32 {
         db.query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -415,17 +415,6 @@ mod tests {
             .unwrap();
     }
 
-    fn unrelated_event(memory: &MemoryStore) {
-        memory
-            .store
-            .connection
-            .execute(
-                "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('fixture','unrelated',1,1,'{}')",
-                [],
-            )
-            .unwrap();
-    }
-
     fn insert_grant(memory: &MemoryStore) -> String {
         let id = "cd".repeat(32);
         memory
@@ -437,128 +426,6 @@ mod tests {
             )
             .unwrap();
         id
-    }
-
-
-    #[test]
-    fn unrelated_event_allows_v2_promotion_and_replay_returns_the_stored_row() {
-        let (_root, mut memory, digest) = setup();
-        let (decision, prepared) = reviewed(&mut memory, &digest, Some(2), None);
-        let before = generation(&memory.store.connection);
-        unrelated_event(&memory);
-        put(
-            &mut memory,
-            "note-optional",
-            "note.optional",
-            MemoryKind::Observation,
-        );
-        assert_eq!(generation(&memory.store.connection), before);
-        assert!(memory.store.read_snapshot(None).unwrap().head > decision_event_fence(&decision));
-        let first = memory
-            .promote_checked("mp-api-errors-01", &decision.id, 1_000, Some(&prepared))
-            .unwrap();
-        assert!(!first.reused);
-        unrelated_event(&memory);
-        let replay = memory
-            .promote_checked("mp-api-errors-01", &decision.id, 1_000, Some(&prepared))
-            .unwrap();
-        assert!(replay.reused);
-        assert_eq!(replay.sequence, first.sequence);
-        let stored: i64 = memory
-            .store
-            .connection
-            .query_row(
-                "SELECT sequence FROM memory_promotions WHERE proposal_id='mp-api-errors-01'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(replay.sequence, stored as u64);
-        assert!(memory.store.read_snapshot(None).unwrap().head > replay.sequence);
-    }
-
-    fn decision_event_fence(decision: &ReviewDecision) -> u64 {
-        let reviewed: serde_json::Value = serde_json::from_str(&decision.reviewed_heads).unwrap();
-        reviewed["event_head"].as_u64().unwrap() + 1
-    }
-
-    #[test]
-    fn new_constraint_blocks_v2_promotion() {
-        let (_root, mut memory, digest) = setup();
-        let (decision, prepared) = reviewed(&mut memory, &digest, Some(2), None);
-        let before = generation(&memory.store.connection);
-        put(
-            &mut memory,
-            "rule-constraint",
-            "rule.constraint",
-            MemoryKind::Constraint,
-        );
-        assert!(generation(&memory.store.connection) > before);
-        let error = memory
-            .promote_checked("mp-api-errors-01", &decision.id, 1_000, Some(&prepared))
-            .unwrap_err();
-        assert!(matches!(error, MemoryError::RevisionConflict { .. }));
-        assert!(memory
-            .store
-            .memory_promotion("mp-api-errors-01")
-            .unwrap()
-            .is_none());
-        assert!(memory
-            .store
-            .memory_record_by_key("rule.constraint")
-            .unwrap()
-            .is_some());
-    }
-
-    #[test]
-    fn phantom_contract_conflicts_and_is_not_skipped() {
-        let (_root, mut memory, digest) = setup();
-        let (decision, prepared) = reviewed(&mut memory, &digest, Some(2), None);
-        let before = generation(&memory.store.connection);
-        put(
-            &mut memory,
-            "api-contract",
-            "api.contract",
-            MemoryKind::Contract,
-        );
-        assert_eq!(generation(&memory.store.connection), before);
-        let error = memory
-            .promote_checked("mp-api-errors-01", &decision.id, 1_000, Some(&prepared))
-            .unwrap_err();
-        assert!(matches!(error, MemoryError::RevisionConflict { .. }));
-        assert!(memory
-            .store
-            .memory_promotion("mp-api-errors-01")
-            .unwrap()
-            .is_none());
-        let contract = memory
-            .store
-            .memory_record_by_key("api.contract")
-            .unwrap()
-            .unwrap();
-        assert_eq!(contract.kind, MemoryKind::Contract);
-        assert!(!contract.is_hard);
-    }
-
-    #[test]
-    fn v1_and_other_versions_still_conflict_on_an_intervening_event() {
-        for version in [None, Some(1), Some(3)] {
-            let (_root, mut memory, digest) = setup();
-            let (decision, prepared) = reviewed(&mut memory, &digest, version, None);
-            unrelated_event(&memory);
-            let error = memory
-                .promote_checked("mp-api-errors-01", &decision.id, 1_000, Some(&prepared))
-                .unwrap_err();
-            assert!(
-                matches!(error, MemoryError::RevisionConflict { .. }),
-                "{version:?} {error:?}"
-            );
-            assert!(memory
-                .store
-                .memory_promotion("mp-api-errors-01")
-                .unwrap()
-                .is_none());
-        }
     }
 
     #[test]
