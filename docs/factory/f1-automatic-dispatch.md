@@ -183,5 +183,9 @@ Recorded here rather than folded into the card that found them.
 - **No E2E for the isolation-unavailable pause** (`verification.paused`); it
   cannot be simulated from outside without a hook in the shipped binary.
 - **Integration job follow-ups (card 3):** there is no retry command for integration jobs, so a stale block holds the ref until an operator runs `result integrate`; jobs advance only on the 15 s ticker cadence.
+- **Naming recovery with no recorded intent loops.** If a start claim expires
+  before the `runtime.launch_name` intent is recorded, recovery has no
+  authority to rename and retries without end. Bound it and surface the
+  attempt for operator reconciliation.
 - **Replace-verdict tests** (352 in `docs/reviews/2026-09-27-test-audit.tsv`):
   convert to E2E alongside feature work, starting with `store/barriers.rs`.
