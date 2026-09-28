@@ -352,5 +352,10 @@ Recorded here rather than folded into the card that found them.
   (src/store/plans.rs) have no CLI command or production caller; only unit
   tests drive them. Decide whether infrastructure retries and acceptance
   rework get operator commands (F2 planning) or remove them.
+- **`ticker status` can make a starting ticker exit silently.** The status
+  probe `try_lock`s the ticker lock; if it lands on a starting ticker's first
+  `try_lock`, that ticker believes another is running and exits without a
+  message. Status should inspect without contending (or the ticker should retry
+  briefly and log). Found during the threads/project test conversion.
 - **Replace-verdict tests** (352 in `docs/reviews/2026-09-27-test-audit.tsv`):
   convert to E2E alongside feature work, starting with `store/barriers.rs`.
