@@ -118,19 +118,6 @@ fn failed_receipt_commit_is_a_copy_failure_and_keeps_the_source() {
 }
 
 #[test]
-fn lost_source_cannot_replace_a_previous_preservation_receipt() {
-    let (world, project, _work, record) = fixture();
-    let first = threads::final_copy(&world.ctx(), &project, &record);
-    assert!(matches!(first.outcome, thread::CopyOutcome::Complete));
-    let saved = thread::load(&project, &record.id).unwrap();
-    std::fs::remove_dir_all(&record.thread_dir).unwrap();
-    let failed = threads::final_copy(&world.ctx(), &project, &saved);
-    assert!(matches!(failed.outcome, thread::CopyOutcome::Failed(_)));
-    assert_eq!(thread::load(&project, &record.id).unwrap().artifact_snapshot, saved.artifact_snapshot);
-    crate::artifacts::load(&project, &saved, &saved.artifact_snapshot).unwrap();
-}
-
-#[test]
 fn corrupt_retry_state_is_preserved_and_healthy_projects_continue() {
     let world = World::new();
     let broken = world.project("broken", "a.sock");

@@ -139,7 +139,7 @@ impl Lab {
     fn finalization(&self, slug: &str) -> Value { self.state(slug)["finalizations"]["t-0001"].clone() }
     /// Inbox items of a project whose file name starts with `prefix`, as text.
     fn inbox(&self, slug: &str, prefix: &str) -> Vec<String> {
-        fs::read_dir(self.project(slug).join("inbox")).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+        fs::read_dir(self.project(slug).join("inbox")).unwrap().flatten().filter(|e| e.path().is_file() && e.file_name().to_string_lossy().starts_with(prefix))
             .map(|e| fs::read_to_string(e.path()).unwrap()).collect()
     }
     fn gh_calls(&self, number: u32) -> usize {
@@ -374,4 +374,52 @@ fn each_toast_claims_the_sorted_unseen_items_and_leaves_out_seen_and_handled_one
     ticker.stop();
     assert_eq!(claim()["batch"]["ids"], json!(["item-c"]), "{}", claim());
     assert_eq!(toasts(), 2);
+}
+
+/// `gh` failing for one pull request is reported once the failure has lasted
+/// the outage threshold, counted from the first failure even across a
+/// restart, and a healthy pull request in the same project does not reset
+/// it. Further failures add nothing; the first success adds one recovery item.
+#[test]
+fn a_gh_outage_outlasts_restarts_and_gives_one_item_each_way() {
+    let mut lab = Lab::new();
+    let project = lab.project_in_session("demo");
+    let source = lab.merged_thread("demo", 5, json!({}));
+    fs::remove_file(lab.path("gh/5.json")).unwrap();
+    let mut other = lab.thread("demo");
+    other.as_table_mut().unwrap().extend([("id".into(), "t-0002".into()), ("pane_id".into(), "pw2".into())]);
+    fs::write(project.join("threads/t-0002.toml"), toml::to_string(&other).unwrap()).unwrap();
+    fs::write(project.join("threads/t-0002.md"), format!("PR: {}\n", url(6))).unwrap();
+    lab.pull_request(6, "OPEN");
+    lab.session("demo", &[agent("p", &project, "coordinator"), agent("pw", &source, "worker-pw"), agent("pw2", &source, "worker-pw")],
+        &[pane("p", &project), pane("pw", &source), pane("pw2", &source)]);
+    let outages = || lab.inbox("demo", "").into_iter().filter(|item| item.contains("kind = \"outage\"")).collect::<Vec<_>>();
+    let since = || lab.state("demo")["gh_outages"][url(5)]["failing_since"].as_i64();
+    let run = |threshold: &str, done: &dyn Fn() -> bool| {
+        lab.edit_state("demo", |s| s["last_pr_check"] = json!(""));
+        let reads = (lab.gh_calls(5), lab.gh_calls(6));
+        let child = lab.command().env("HERDR_PROJECTS_OUTAGE_SECS", threshold).args(["ticker", "run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let mut ticker = Ticker { lab: &lab, child };
+        ticker.wait_for("both pull requests read", || lab.gh_calls(5) > reads.0 && lab.gh_calls(6) > reads.1 && done());
+        ticker.another_pass("demo");
+        ticker.stop();
+    };
+
+    run("3600", &|| since().is_some());
+    let first = since();
+    assert!(outages().is_empty());
+    for _ in 0..2 {
+        run("1", &|| !outages().is_empty());
+        assert_eq!(since(), first, "the failure streak was restarted");
+        let items = outages();
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert!(items[0].contains(&format!("`gh` has been failing for 0 minutes for {}", url(5))), "{}", items[0]);
+    }
+    assert!(lab.state("demo")["gh_outages"].get(url(6)).is_none());
+
+    lab.pull_request(5, "OPEN");
+    run("1", &|| outages().len() == 2);
+    let items = outages();
+    assert!(items.iter().any(|item| item.contains(&format!("`gh` is working again for {}", url(5)))), "{items:?}");
+    assert!(lab.state("demo")["gh_outages"].as_object().unwrap().is_empty());
 }

@@ -684,37 +684,6 @@ fn a_bad_pr_line_is_noted_once_and_never_reaches_gh() {
     assert_eq!(items_of(&project, "pr").len(), 1);
 }
 
-#[test]
-fn a_long_gh_outage_gives_one_item_and_one_recovery_item() {
-    let (world, project, t) = finished_world("idle");
-    thread::update(&project, &t.id, |t| t.last_group = "idle".into()).unwrap();
-    std::fs::write(thread::home_report_path(&project, "t-0001"), format!("PR: {PR_URL}\n")).unwrap();
-    let failing = Rc::new(RefCell::new(true));
-    let flag = failing.clone();
-    world.runner.on_fn(
-        |cmd| cmd.display().contains("gh pr view"),
-        move |_| Ok(if *flag.borrow() { fail(1, "could not resolve host") } else { ok(r#"{"state":"OPEN","headRefName":"x"}"#) }),
-    );
-    let ctx = world.ctx();
-    let mut memory = Memory::new(&ctx);
-    memory.outage_secs = 0;
-    let mut state = crate::steps::State::default();
-    let now = jiff::Timestamp::now();
-    for _ in 0..3 {
-        state.last_pr_check.clear();
-        crate::steps::pull_requests(&ctx, &project, &mut state, &mut memory, now);
-    }
-    assert_eq!(items_of(&project, "outage").len(), 1);
-    *failing.borrow_mut() = false;
-    for _ in 0..2 {
-        state.last_pr_check.clear();
-        crate::steps::pull_requests(&ctx, &project, &mut state, &mut memory, now);
-    }
-    let outages = items_of(&project, "outage");
-    assert_eq!(outages.len(), 2);
-    assert!(outages[1].summary.contains("working again"));
-}
-
 fn write_routine(project: &Project, name: &str, text: &str) {
     std::fs::write(project.dir().join("routines").join(format!("{name}.md")), text).unwrap();
 }

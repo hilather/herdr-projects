@@ -238,32 +238,6 @@ mod tests {
         let mut bytes=Vec::new();export(path,&mut bytes).unwrap();fs::write(archive,bytes).unwrap();receive(project,archive).unwrap()
     }
     #[test]
-    fn complete_live_stage_preserves_exact_received_bytes_after_source_loss() {
-        let(root,project,mut record)=super::super::tests::fixture();
-        let received=roundtrip(&project,Path::new(&record.thread_dir),&root.path().join("wire"));
-        fs::remove_dir_all(&record.thread_dir).unwrap();record.machine="remote-fixture".into();record.lifecycle_generation=7;
-        let saved=received.preserve_controlled(&project,&record,&Control::default(),||Ok(())).unwrap().unwrap();
-        assert_eq!(saved.manifest.machine,record.machine);assert_eq!(saved.manifest.source,record.thread_dir);assert_eq!(saved.manifest.generation,7);
-        assert_eq!(super::super::load(&project,&record,&saved.id).unwrap(),saved.manifest);
-        let path=project.state_dir().join("artifacts/t-0001").join(&saved.id);
-        assert_eq!(fs::read(path.join("report.md")).unwrap(),b"report\0\xff");assert!(path.join("library/empty").is_dir());
-        assert_eq!(received.preserve_controlled(&project,&record,&Control::default(),||Ok(())).unwrap().unwrap().id,saved.id);
-        assert!(received.staging.0.is_dir(),"preservation must leave projection ownership intact");
-        assert!(!project.dir().join("threads/t-0001.toml").exists(),"retention never certifies finalization");
-    }
-    #[test]
-    fn omitted_entries_never_become_preservation_receipts_but_empty_reports_can_be_retained() {
-        let(root,project,record)=super::super::tests::fixture();
-        std::os::unix::fs::symlink("artifact",Path::new(&record.thread_dir).join("library/link")).unwrap();
-        let partial=roundtrip(&project,Path::new(&record.thread_dir),&root.path().join("partial"));
-        assert!(!partial.notes().is_empty());assert!(partial.preserve_controlled(&project,&record,&Control::default(),||Ok(())).unwrap().is_none());
-        assert!(!project.state_dir().join("artifacts").exists());
-        fs::remove_file(Path::new(&record.thread_dir).join("library/link")).unwrap();fs::remove_file(Path::new(&record.thread_dir).join("report.md")).unwrap();
-        let complete=roundtrip(&project,Path::new(&record.thread_dir),&root.path().join("empty-report"));
-        let saved=complete.preserve_controlled(&project,&record,&Control::default(),||Ok(())).unwrap().unwrap();assert!(saved.manifest.report_hash().is_none());
-        assert!(super::super::load(&project,&record,&saved.id).is_ok());
-    }
-    #[test]
     fn preservation_refuses_changed_staged_bytes_wrong_project_and_lost_authority() {
         for fault in ["changed","project","cancelled","expired","authority","late-cancel"] {
             let(root,project,record)=super::super::tests::fixture();let received=roundtrip(&project,Path::new(&record.thread_dir),&root.path().join("wire"));

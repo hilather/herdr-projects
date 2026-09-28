@@ -141,16 +141,6 @@ mod tests {
         fs::read_dir(project.state_dir().join("artifacts/t-0001")).into_iter().flatten().map(|e|e.unwrap().file_name().into_string().unwrap()).collect()
     }
     #[test]
-    fn controlled_receive_retains_verified_bytes_and_leaves_input_owned_by_caller() {
-        let (root,project,record)=super::super::tests::fixture();let archive=archive(root.path(),&record);
-        let saved=receive_controlled(&project,&record,&archive,&Control::default(),||Ok(())).unwrap();
-        assert!(archive.is_file());assert_eq!(load(&project,&record,&saved.id).unwrap(),saved.manifest);
-        assert_eq!(fs::read(project.state_dir().join("artifacts/t-0001").join(&saved.id).join("report.md")).unwrap(),b"report\0\xff");
-        assert!(!project.dir().join("threads/t-0001.toml").exists(),"preservation alone cannot resolve or certify a thread");
-        assert_eq!(receive_controlled(&project,&record,&archive,&Control::default(),||Ok(())).unwrap().id,saved.id);
-        assert_eq!(stages(&project),vec![saved.id]);
-    }
-    #[test]
     fn cancellation_and_authority_withdrawal_never_publish_a_new_snapshot() {
         for fault in ["cancelled","expired","during-extraction","before-publish","authority"] {
             let(root,project,record)=super::super::tests::fixture();let archive=archive(root.path(),&record);let mut control=Control::default();
@@ -186,43 +176,6 @@ mod tests {
         }
         let control=Control::default();assert!(receive_controlled(&project,&record,&archive,&control,||{control.cancellation.cancel();Ok(())}).is_err());
         assert_eq!(stages(&project),vec![saved.id.clone()]);assert_eq!(load(&project,&record,&saved.id).unwrap(),saved.manifest);
-    }
-
-    #[test]
-    fn roundtrip_preserves_binary_empty_directories_and_hostile_names() {
-        let (_root, project, mut record) = super::super::tests::fixture();
-        fs::write(Path::new(&record.thread_dir).join("library/a 'λ$\nfile"), [0, 255, 254]).unwrap();
-        let mut bytes = Vec::new();
-        export(Path::new(&record.thread_dir), &mut bytes).unwrap();
-        record.machine = "remote".into();
-        let staging = staging(&project, &record).unwrap();
-        let archive = staging.0.join(".wire");
-        fs::write(&archive, bytes).unwrap();
-        let snapshot = receive(&project, &record, staging, &archive).unwrap();
-        load(&project, &record, &snapshot.id).unwrap();
-        assert_eq!(snapshot.manifest.machine, "remote");
-    }
-
-    #[test]
-    fn remote_handshake_blocks_old_helpers_and_streams_verified_bytes() {
-        use crate::{paths::Env, runner::fake::{FakeRunner, ok, fail}};
-        let (root, project, mut record) = super::super::tests::fixture();
-        record.machine = "fixture".into();
-        let env = Env::for_test(root.path(), &[]);
-        let runner = FakeRunner::new();
-        runner.on("--probe", fail(127, "helper missing"));
-        let ctx = Ctx { root: root.path().into(), config_dir: root.path().join("cfg"), env: &env, runner: &runner, detached_ticker: false };
-        assert!(capture_remote(&ctx, &project, &record, "fixture").err().unwrap().to_string().contains("[transport-unsupported]"));
-        assert!(!project.state_dir().join("artifacts").exists());
-        let runner = FakeRunner::new();
-        runner.on("--probe", ok(r#"{"schema":1}"#));
-        let mut output = ok("");
-        export(Path::new(&record.thread_dir), &mut output.stdout_bytes).unwrap();
-        runner.on("--path", output);
-        let ctx = Ctx { runner: &runner, ..ctx };
-        let result = capture_remote(&ctx, &project, &record, "fixture").unwrap();
-        assert_eq!(result.manifest.machine, "fixture");
-        load(&project, &record, &result.id).unwrap();
     }
 
     #[test]

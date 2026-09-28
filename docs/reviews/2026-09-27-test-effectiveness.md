@@ -1692,3 +1692,83 @@ accepting a zero interval (`every 0m`) failed the `routine list` test.
 This batch was recovered after a shared-stash collision between parallel
 agents: the unit-test deletions were re-applied from their preserved commit
 and the new tests copied from the original worktree.
+
+## Artifact, finalization, copy and delivery unit tests replaced by E2E workflows
+
+The audit marked 31 tests REPLACE in the artifact, final-copy, live-copy,
+report, delivery, outage and review-regression modules. 22 were deleted, 1
+was cut down and 8 are kept. `tests/artifacts.rs` drives `thread resolve`,
+`report-hash`, `delete` and `ticker run` against a Python fake herdr, a fake
+`gh` and a fake `ssh`; every copy uses the binary's own `artifact-stream`.
+`tests/delivery.rs` drives `ticker run` and `thread restart` against a fake
+herdr that serves its API bridge from files. Waits are on stored records and
+logged polls.
+
+| New E2E test | Replaced unit tests |
+| --- | --- |
+| `artifacts.rs::resolve_preserves_each_version_once_and_a_lost_source_keeps_the_last_snapshot` (resolves that stop at cleanup keep the lifecycle generation) | `published_snapshots_preserve_versions_and_reuse_identical_content`, `lost_source_cannot_replace_a_previous_preservation_receipt` |
+| `artifacts.rs::remote_resolve_needs_the_helper_and_streams_exact_bytes_once` | `remote_handshake_blocks_old_helpers_and_streams_verified_bytes`, `roundtrip_preserves_binary_empty_directories_and_hostile_names`, `controlled_receive_retains_verified_bytes_and_leaves_input_owned_by_caller` |
+| `artifacts.rs::report_hash_tells_a_missing_report_from_an_unsafe_one` | `missing_report_is_distinct_from_unsafe_or_oversize_report` |
+| `artifacts.rs::merged_finalization_keeps_what_each_source_shape_proves` (four projects: no report, a linked report, a report naming another PR, a home library linked outside the project) | `missing_reports_and_partial_stages_keep_distinct_preservation_semantics`, `merged_finalization_requires_the_published_report_to_keep_its_pr`, `pending_final_copy_excludes_legacy_lifecycle_and_live_copy_paths`, `complete_live_stage_preserves_exact_received_bytes_after_source_loss`, `omitted_entries_never_become_preservation_receipts_but_empty_reports_can_be_retained` |
+| `artifacts.rs::live_copies_get_a_receipt_and_review_notice_each_and_a_new_execution_is_announced_again` (reports A, B, A, then C with a linked library entry; then the worker moves to a new pane) | `additive_projection_is_durable_and_never_becomes_cleanup_evidence`, `distinct_copies_get_sequences_but_identical_receipts_reuse_them`, `repeated_hashes_and_changed_copy_notes_get_distinct_review_notices`, `historical_delivery_never_acknowledges_replacement_with_identical_report` |
+| `artifacts.rs::a_brief_waits_for_a_pending_live_copy` | copy-owned half of `stale_cancelled_and_copy_owned_threads_cannot_claim_or_acknowledge` |
+| `delivery.rs::a_lost_start_is_reported_once_and_only_a_restart_starts_the_agent_again` | `lost_start_recovers_once_and_requires_new_execution` |
+| `cli.rs::ticker_native_briefs_confirm_or_recover_uncertainty_without_replay` (existing) | `durable_claim_blocks_replay_and_confirmation_clears_only_matching_brief` |
+| `recovery.rs::a_gh_outage_outlasts_restarts_and_gives_one_item_each_way` | `a_long_gh_outage_gives_one_item_and_one_recovery_item`, `outage_streaks_survive_restart_and_healthy_resources_do_not_reset_them` |
+| `inbox.rs::unreadable_schedules_are_config_errors_and_healthy_routines_continue` (`routine list`, then a ticker pass) | `f05_unicode_schedule_returns_error_without_panicking`, `f05_overflow_schedule_returns_error_without_panicking` |
+| `ticker_jobs.rs::remote_machines_poll_on_their_own_deadlines_and_only_long_outages_are_reported` (extended: each project records what its session showed) | `f02_shared_machine_serves_both_project_sessions` |
+
+Some guarantees look different from the CLI:
+- Every successful `thread resolve` and `--reopen` starts a new lifecycle
+  generation, and a snapshot's manifest records it. Identical content is
+  reused only within one generation, so the test resolves with
+  `--remove-worktree` while the worker's pane is open: the snapshot is kept
+  and cleanup is refused, leaving the generation as it was.
+- A merged report that names another pull request is still copied home and
+  its snapshot published; the thread stays open with a `final-` notice that
+  eligibility changed.
+- A home library that links outside the project is the one public way to
+  leave a final copy pending. `thread resolve` (with or without
+  `--skip-copy`) and `delete` refuse until it is recovered; the recovery then
+  resolves from the received stage after the source is deleted.
+- The live-copy test stands for a replaced worker by rewriting the record's
+  pane and generation between two ticker runs.
+
+Kept, trimmed: `stale_and_cancelled_threads_cannot_claim_or_acknowledge`
+(from `stale_cancelled_and_copy_owned_threads_cannot_claim_or_acknowledge`).
+A claim under a cancelled control, or for a record that changed generation
+between the offer and the claim, needs a race no command can time.
+
+Kept:
+- `idle_observation_refuses_foreign_and_ambiguous_pane_occupants`,
+  `auto_resolve_waits_for_the_later_of_state_report_and_ticker_start` and
+  `a_failed_final_copy_blocks_auto_resolve`. Idle finalization needs a ticker
+  that has run for a whole day (`auto_resolve_days` of 0 disables it), and
+  the binary has no clock override.
+- `observation_is_offered_then_admitted_once_and_cannot_become_copy_receipt`
+  and `unused_hash_survives_pending_session_passes_without_renewing_expiry`.
+  They check when the report reader's samples are admitted and expire. The
+  reader is the binary's own `report-hash`, so no test can hold it open.
+- `artifact_transfer_scopes_nested_thread_dirs_to_one_common_git_dir`. The
+  git-directory resource only changes which copies may run at once, and the
+  local sender is the binary itself, so no test can hold a copy open to see it.
+- `historical_schema_one_root_entry_types_remain_readable`. No command
+  records a snapshot with a `report.md` directory or a `library` file: a
+  local resolve stops at a partial copy and the stream refuses them.
+- `preserved_outputs_publish_artifacts_without_original_source_and_recheck_authority`.
+  It needs a canonical worker's retained output snapshot, and no E2E harness
+  produces one yet.
+
+Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
+- Dropping the home report's pull-request check from merged
+  `resolution_eligible` failed the finalization test: the thread whose report
+  names another pull request was resolved as `merged`.
+- Restarting the outage streak on every failure in `Outage::record` failed
+  the outage test: no outage item was written after the restart.
+- Dropping the execution comparison for reports without a matching receipt
+  in `review_delivery::due` failed the live-copy test: the replaced worker's
+  identical report got no new notice.
+- Dropping the live-copy guards on briefs (`prompt_delivery::ready`, its
+  claim validation and the brief job's send check) also failed the brief
+  test, but only at the end: the ticker's own pass filters still held the
+  brief while the copy was pending, and the brief was never confirmed.

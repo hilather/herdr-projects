@@ -50,57 +50,6 @@ fn f01_artifact_copy_preserves_changed_bytes_with_identical_metadata() {
 }
 
 #[test]
-fn f02_shared_machine_serves_both_project_sessions() {
-    let world = World { runner: FakeRunner::new(), ..World::new() };
-    let projects = [world.project("alpha", "a.sock"), world.project("beta", "b.sock")];
-    for project in &projects {
-        world.thread(project, Path::new("/home/me/wt"), |t| {
-            t.machine = "box".into();
-            t.last_group = "working".into();
-            t.last_state = "working".into();
-            t.last_state_change = "2026-01-01T00:00:00Z".into();
-        });
-        let socket = project.coordinator().unwrap().socket;
-        let remote_socket = socket.clone();
-        let agent = agent_json("w2", "w2:t1", "w2:p1", "/home/me/wt", &format!("hp-{}-t-0001", project.slug), "blocked");
-        world.runner.on_fn(
-            move |cmd| is_machine_call(cmd) && cmd.display().contains("agent list") && socket_of(cmd) == remote_socket,
-            move |_| Ok(ok(&format!(r#"{{"result":{{"agents":[{agent}]}}}}"#))),
-        );
-        let pane = world.coordinator_pane(project);
-        world.runner.on_fn(
-            move |cmd| !is_machine_call(cmd) && cmd.display().contains("pane list") && socket_of(cmd) == socket,
-            move |_| Ok(ok(&format!(r#"{{"result":{{"panes":[{pane}]}}}}"#))),
-        );
-    }
-    world.runner.on_fn(is_machine_call, |_| Ok(ok(r#"{"result":{"panes":[]}}"#)));
-    world.runner.on("machine list --json", ok(r#"[{"id":"1","label":"box","target":"me@box"}]"#));
-    world.runner.on("ssh", ok("t-0001 -\n"));
-    world.runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
-    world.runner.on("report-metadata", ok(r#"{"result":{}}"#));
-    world.runner.on("notification show", ok(r#"{"result":{"shown":true}}"#));
-
-    let ctx = world.ctx();
-    let mut memory = Memory::new(&ctx);
-    let mut poll_counts = [0; 2];
-    for tick in 1..=12 {
-        assert!(ticker::tick_for_test(&ctx, &mut memory));
-        if tick % 4 == 0 {
-            for (index, project) in projects.iter().enumerate() {
-                let socket = project.coordinator().unwrap().socket;
-                let count = world.runner.calls.borrow().iter().filter(|cmd| {
-                    is_machine_call(cmd) && cmd.display().contains("agent list") && socket_of(cmd) == socket
-                }).count();
-                assert!(count > poll_counts[index], "F02: {} starved through tick {tick}; polls={count}", project.slug);
-                poll_counts[index] = count;
-                assert_eq!(thread::load(project, "t-0001").unwrap().last_group, "waiting-on-you");
-            }
-        }
-    }
-}
-
-
-#[test]
 fn f04_deadline_includes_descendant_held_pipes() {
     // The descendant exits by itself after two seconds even on the broken
     // runner, keeping this negative fixture finite and leaving no daemon behind.
@@ -111,19 +60,4 @@ fn f04_deadline_includes_descendant_held_pipes() {
     let elapsed = start.elapsed();
     assert!(out.timed_out && !out.success() && elapsed < Duration::from_secs(1),
         "F04: expected timeout within 1s including cleanup; elapsed={elapsed:?}, output={out:?}");
-}
-
-#[test]
-fn f05_unicode_schedule_returns_error_without_panicking() {
-    for text in ["every 1日", "every 1🦀", "every é"] {
-        assert!(crate::routine::parse_schedule(text).is_err(), "{text}");
-    }
-}
-
-#[test]
-fn f05_overflow_schedule_returns_error_without_panicking() {
-    for unit in ['m', 'h', 'd'] {
-        let text = format!("every {}{unit}", i64::MAX);
-        assert!(crate::routine::parse_schedule(&text).is_err(), "{text}");
-    }
 }

@@ -13,25 +13,6 @@ pub(super) fn fixture() -> (tempfile::TempDir, Project, Thread) {
 }
 
 #[test]
-fn published_snapshots_preserve_versions_and_reuse_identical_content() {
-    let (_root, project, record) = fixture();
-    let first = capture_local(&project, &record).unwrap();
-    assert_eq!(first.id, capture_local(&project, &record).unwrap().id);
-    let source = Path::new(&record.thread_dir).join("library/artifact");
-    let stamp = fs::metadata(&source).unwrap().modified().unwrap();
-    fs::write(&source, b"version B").unwrap();
-    File::options().write(true).open(&source).unwrap().set_modified(stamp).unwrap();
-    let second = capture_local(&project, &record).unwrap();
-    assert_ne!(first.id, second.id);
-    for (snapshot, expected) in [(&first, b"version A"), (&second, b"version B")] {
-        let dir = project.state_dir().join("artifacts/t-0001").join(&snapshot.id);
-        assert_eq!(fs::read(dir.join("library/artifact")).unwrap(), expected);
-        assert!(dir.join("library/empty").is_dir());
-        assert_eq!(load(&project, &record, &snapshot.id).unwrap(), snapshot.manifest);
-    }
-}
-
-#[test]
 fn source_change_and_staged_corruption_never_replace_good_evidence() {
     for corrupt_stage in [false, true] {
         let (_root, project, record) = fixture();

@@ -96,33 +96,6 @@ mod tests {
         assert!(crate::inbox::unhandled(&project).is_empty());assert!(inbox.join("done").join(format!("{}.md",notice.id)).exists());
     }
     #[test]
-    fn historical_delivery_never_acknowledges_replacement_with_identical_report() {
-        let (_root,project,t)=fixture();let t=copy(&project,&t,b"A");prepare(&project,&t).unwrap();
-        let notice=load(&project,&t.id).unwrap().pending_review_notice.unwrap();
-        update(&project,&t.id,|t|{t.lifecycle_generation+=1;t.pane_id="replacement".into();}).unwrap();
-        deliver(&project).unwrap();let replacement=load(&project,&t.id).unwrap();
-        assert!(replacement.last_review_item_hash.is_empty());assert!(replacement.last_review_execution.is_empty());
-        assert_eq!(replacement.last_review_copy_sequence,0);assert_eq!(replacement.pane_id,"replacement");
-        let replacement=copy(&project,&replacement,b"A");prepare(&project,&replacement).unwrap();
-        let new=load(&project,&t.id).unwrap().pending_review_notice.unwrap();
-        assert_ne!(new.execution,notice.execution);assert_ne!(new.id,notice.id);assert_eq!(new.sequence,2);
-        deliver(&project).unwrap();assert_eq!(crate::inbox::unhandled(&project).len(),2);
-    }
-    #[test]
-    fn repeated_hashes_and_changed_copy_notes_get_distinct_review_notices() {
-        let (_root,project,mut t)=fixture();let mut ids=std::collections::BTreeSet::new();
-        for bytes in [b"A",b"B",b"A"] {
-            t=copy(&project,&t,bytes);prepare(&project,&t).unwrap();
-            let notice=load(&project,&t.id).unwrap().pending_review_notice.unwrap();assert!(ids.insert(notice.id));
-            deliver(&project).unwrap();t=load(&project,&t.id).unwrap();
-        }
-        copy_delivery::record(&project,&t,&Copied{artifact_snapshot:None,outcome:CopyOutcome::Partial(vec!["library skipped".into()]),report_hash:Some(sha256_hex(b"A"))}).unwrap();
-        copy_delivery::deliver(&project).unwrap();t=load(&project,&t.id).unwrap();prepare(&project,&t).unwrap();
-        let notice=load(&project,&t.id).unwrap().pending_review_notice.unwrap();
-        assert_eq!(notice.sequence,4);assert_eq!(notice.copy_receipt.as_ref().unwrap().sequence,4);
-        assert!(notice.summary.contains("library skipped"));assert!(ids.insert(notice.id));
-    }
-    #[test]
     fn legacy_acknowledgement_is_preserved_and_stale_preparation_refuses() {
         let (_root,project,t)=fixture();let t=update(&project,&t.id,|t|{t.report_hash="legacy-hash".into();t.last_review_item_hash="legacy-hash".into();}).unwrap();
         prepare(&project,&t).unwrap();assert!(load(&project,&t.id).unwrap().pending_review_notice.is_none());

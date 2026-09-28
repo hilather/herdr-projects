@@ -62,12 +62,6 @@ mod tests {
         let confirmed=load(&p,&t.id).unwrap();assert!(confirmed.prompt_pending);assert_eq!(group(&confirmed,&Live{pane_exists:true,..Default::default()},jiff::Timestamp::now()),Group::WaitingOnYou);assert!(prompt_delivery::ready(&confirmed).is_ok());assert!(ready(&confirmed).is_err());let mut edited=confirmed.clone();edited.pr="https://example.invalid/pr/1".into();assert!(ready(&edited).is_err(),"PR changes must not authorize another start");assert!(confirm(&p,&g,&t.id,&claim,&c).is_err());
     }
     #[test]
-    fn lost_start_recovers_once_and_requires_new_execution(){
-        let(_root,p,t)=fixture();let g=ProjectGuard::acquire(&p.dir()).unwrap();claim(&p,&g,&t,&[],&"b".repeat(64),"terminal",&Control::default()).unwrap();recover(&p,&g).unwrap();recover(&p,&g).unwrap();
-        let failed=load(&p,&t.id).unwrap();assert_eq!(failed.status,Status::Failed);assert_eq!(failed.launch_claim.as_ref().unwrap().phase,Phase::Uncertain);assert!(ready(&failed).is_err());assert_eq!(crate::inbox::unhandled(&p).len(),1);
-        update(&p,&t.id,|t|{t.status=Status::Open;t.lifecycle_generation+=1;}).unwrap();assert!(ready(&load(&p,&t.id).unwrap()).is_ok());
-    }
-    #[test]
     fn historical_uncertainty_does_not_fail_replacement_or_duplicate_notice(){
         let(_root,p,t)=fixture();let g=ProjectGuard::acquire(&p.dir()).unwrap();claim(&p,&g,&t,&[],&"b".repeat(64),"terminal",&Control::default()).unwrap();update(&p,&t.id,|t|t.lifecycle_generation+=1).unwrap();recover(&p,&g).unwrap();
         assert_eq!(load(&p,&t.id).unwrap().status,Status::Open);assert_eq!(crate::inbox::unhandled(&p).len(),1);recover(&p,&g).unwrap();assert_eq!(crate::inbox::unhandled(&p).len(),1);

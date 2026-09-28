@@ -145,18 +145,6 @@ mod tests {
         assert_eq!(load(&project,&t.id).unwrap(),current);
     }
     #[test]
-    fn distinct_copies_get_sequences_but_identical_receipts_reuse_them() {
-        let (_root,project,t)=fixture();record(&project,&t,&partial(b"A")).unwrap();deliver(&project).unwrap();
-        let current=load(&project,&t.id).unwrap();record(&project,&current,&partial(b"A")).unwrap();
-        assert_eq!(load(&project,&t.id).unwrap(),current);
-        for (bytes,sequence) in [(b"B",2),(b"A",3)] {
-            let current=load(&project,&t.id).unwrap();record(&project,&current,&partial(bytes)).unwrap();
-            assert_eq!(load(&project,&t.id).unwrap().copy_receipt.unwrap().sequence,sequence);deliver(&project).unwrap();
-        }
-        let current=load(&project,&t.id).unwrap();let mut changed=partial(b"A");changed.outcome=CopyOutcome::Partial(vec!["different omission".into()]);
-        record(&project,&current,&changed).unwrap();assert_eq!(load(&project,&t.id).unwrap().copy_receipt.unwrap().sequence,4);
-    }
-    #[test]
     fn failed_library_after_report_publication_never_advances_receipt() {
         let (_root,project,t)=fixture();record(&project,&t,&partial(b"A")).unwrap();deliver(&project).unwrap();
         let current=load(&project,&t.id).unwrap();

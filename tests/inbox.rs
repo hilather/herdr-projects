@@ -129,3 +129,36 @@ fn ticker_items_are_listed_seen_once_and_moved_to_done() {
     assert!(lab.items().is_empty());
     assert!(lab.ok(&["context", "demo", "--peek"]).contains("## Inbox (0 unhandled)"));
 }
+
+/// Replaces `f05_unicode_schedule_returns_error_without_panicking` and
+/// `f05_overflow_schedule_returns_error_without_panicking`.
+///
+/// Schedules with non-ASCII units or intervals too large to count in seconds
+/// are refused, never a crash: `routine list` names each broken file, and
+/// the ticker writes one `config-error` item per file while a healthy due
+/// routine still gives its item.
+#[test]
+fn unreadable_schedules_are_config_errors_and_healthy_routines_continue() {
+    let lab = Lab::new();
+    let broken = ["1日", "1🦀", "é", &format!("{}m", i64::MAX), &format!("{}h", i64::MAX), &format!("{}d", i64::MAX)];
+    for (n, schedule) in broken.iter().enumerate() {
+        fs::write(lab.project().join(format!("routines/broken{n}.md")), format!("+++\nschedule = \"every {schedule}\"\n+++\nNever.\n")).unwrap();
+    }
+    fs::write(lab.project().join("routines/healthy.md"), "+++\nschedule = \"every 1h\"\n+++\nContinue working.\n").unwrap();
+    fs::write(lab.project().join(".state/ticker.json"), r#"{"routines":{"healthy":{"last_run":"2026-01-01T00:00:00Z"}}}"#).unwrap();
+    fs::write(lab.home.path().join("panes.json"), r#"{"result":{"panes":[]}}"#).unwrap();
+    fs::write(lab.home.path().join("agents.json"), r#"{"result":{"agents":[]}}"#).unwrap();
+
+    let listed = lab.ok(&["routine", "list", "demo"]);
+    assert!(listed.contains("healthy\tevery 1h\tenabled"), "{listed}");
+    for (n, schedule) in broken.iter().enumerate() {
+        assert!(listed.contains(&format!("routines/broken{n}.md\tconfig-error: bad schedule `every {schedule}`")), "{listed}");
+    }
+    lab.tick_until(|| lab.items().len() >= broken.len() + 1);
+    let items = lab.items();
+    assert_eq!(items.iter().filter(|id| id.contains("-config-error-")).count(), broken.len(), "{items:?}");
+    let routine: Vec<_> = items.iter().filter(|id| id.contains("-routine-healthy-")).collect();
+    assert_eq!(routine.len(), 1, "{items:?}");
+    let text = fs::read_to_string(lab.project().join(format!("inbox/{}.md", routine[0]))).unwrap();
+    assert!(text.contains("Continue working."), "{text}");
+}

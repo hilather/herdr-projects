@@ -199,15 +199,6 @@ mod tests {
         assert!(thread::load(&project,&t.id).unwrap().pending_live_copy.is_none());
     }
     #[test]
-    fn additive_projection_is_durable_and_never_becomes_cleanup_evidence() {
-        let (_root,project,t,staged)=fixture();let home=project.dir().join("library").join(&t.id);fs::create_dir_all(&home).unwrap();fs::write(home.join("retained"),b"old content").unwrap();
-        let guard=ProjectGuard::acquire(&project.dir()).unwrap();staged.publish(&project,&guard,&t,AUTHORITY,||Ok(())).unwrap();
-        assert_eq!(fs::read(thread::home_report_path(&project,&t.id)).unwrap(),b"report\0\xff");
-        assert_eq!(fs::read(home.join("artifact")).unwrap(),b"version A");assert_eq!(fs::read(home.join("retained")).unwrap(),b"old content");
-        let current=thread::load(&project,&t.id).unwrap();assert!(current.pending_live_copy.is_none());assert_eq!(current.copy_receipt.unwrap().report_hash,current.report_hash);
-        assert!(current.artifact_snapshot.is_empty());assert_eq!(fs::read_dir(project.state_dir().join("live-copies")).unwrap().count(),0);
-    }
-    #[test]
     fn interruption_recovers_exact_stage_after_source_loss_and_blocks_lifecycle() {
         let (_root,project,t,staged)=fixture();let guard=ProjectGuard::acquire(&project.dir()).unwrap();
         staged.begin(&project,&guard,&t,AUTHORITY,&mut ||Ok(())).unwrap();

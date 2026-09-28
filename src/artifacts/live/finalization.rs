@@ -115,16 +115,6 @@ mod tests {
         assert!(resume_controlled(&project,&guard,&t.id,AUTHORITY,&Control::default(),||Ok(true)).is_err());
     }
     #[test]
-    fn missing_reports_and_partial_stages_keep_distinct_preservation_semantics() {
-        for mode in ["missing","partial","omitted-report"] {
-            let(_root,project,t,stage,purpose)=fixture(mode);let guard=ProjectGuard::acquire(&project.dir()).unwrap();begin(&project,&guard,&t,stage,purpose);
-            resume_controlled(&project,&guard,&t.id,AUTHORITY,&Control::default(),||Ok(true)).unwrap();let result=thread::load(&project,&t.id).unwrap();assert_eq!(result.status,thread::Status::Resolved);
-            if mode=="missing" {let snapshot=super::super::super::load(&project,&result,&result.artifact_snapshot).unwrap();assert!(snapshot.report_hash().is_none());assert_eq!(result.report_hash,t.report_hash);assert!(result.copy_receipt.is_none());assert_eq!(fs::read(thread::home_report_path(&project,&t.id)).unwrap(),b"old");}
-            else {assert!(result.artifact_snapshot.is_empty());assert!(!result.pending_final_notice.as_ref().unwrap().body.is_empty());}
-            if mode=="omitted-report" {assert_eq!(result.report_hash,t.report_hash);assert!(result.copy_receipt.is_none());}
-        }
-    }
-    #[test]
     fn changed_eligibility_completes_copy_without_stranding_intent_or_resolving() {
         let(_root,project,t,stage,purpose)=fixture("complete");let guard=ProjectGuard::acquire(&project.dir()).unwrap();begin(&project,&guard,&t,stage,purpose);
         resume_with(&project,&guard,&t.id,AUTHORITY,&Control::default(),&mut ||Ok(true),||{thread::update(&project,&t.id,|t|t.last_group=thread::Group::Working.token().into())?;Ok(())}).unwrap();
@@ -148,31 +138,6 @@ mod tests {
             }
             assert!(resume_controlled(&project,&guard,&t.id,AUTHORITY,&control,||{ensure!(fault!="authority","revoked");Ok(true)}).is_err());assert_eq!(thread::load(&project,&t.id).unwrap(),pending);assert_eq!(fs::read(thread::home_report_path(&project,&t.id)).unwrap(),b"report\0\xff");
         }
-    }
-    #[test]
-    fn merged_finalization_requires_the_published_report_to_keep_its_pr() {
-        for mode in ["same-pr","changed-pr","missing-report","stale-observation"] {
-            let(root,project,t,old_stage,_)=fixture("complete");drop(old_stage);
-            let url="https://github.com/owner/repo/pull/1";let old=format!("PR: {url}\nold\n");
-            let t=thread::update(&project,&t.id,|t|{t.pr=url.into();t.pr_state="MERGED".into();t.report_hash=thread::sha256_hex(old.as_bytes());}).unwrap();fs::write(thread::home_report_path(&project,&t.id),old).unwrap();
-            let report=Path::new(&t.thread_dir).join("report.md");
-            if mode=="missing-report" {fs::remove_file(&report).unwrap();}else {fs::write(&report,format!("PR: {}\nnew\n",if mode=="changed-pr"{"https://github.com/owner/repo/pull/2"}else{url})).unwrap();}
-            let mut bytes=Vec::new();export(Path::new(&t.thread_dir),&mut bytes).unwrap();let archive=root.path().join("merged");fs::write(&archive,bytes).unwrap();let stage=receive(&project,&archive).unwrap();
-            let guard=ProjectGuard::acquire(&project.dir()).unwrap();begin(&project,&guard,&t,stage,Purpose::Merged{pr:url.into()});
-            if mode=="stale-observation" {thread::update(&project,&t.id,|t|t.pr_state="OPEN".into()).unwrap();}
-            resume_controlled(&project,&guard,&t.id,AUTHORITY,&Control::default(),||Ok(true)).unwrap();let current=thread::load(&project,&t.id).unwrap();
-            assert_eq!(current.status,if mode=="changed-pr"||mode=="stale-observation"{thread::Status::Open}else{thread::Status::Resolved},"{mode}");assert!(current.pending_final_copy.is_none());
-        }
-    }
-    #[test]
-    fn pending_final_copy_excludes_legacy_lifecycle_and_live_copy_paths() {
-        let(root,project,t,stage,purpose)=fixture("complete");let guard=ProjectGuard::acquire(&project.dir()).unwrap();begin(&project,&guard,&t,stage,purpose);drop(guard);
-        let current=thread::load(&project,&t.id).unwrap();let env=crate::paths::Env::for_test(root.path(),&[]);let runner=crate::runner::fake::FakeRunner::new();
-        let ctx=crate::paths::Ctx{root:root.path().into(),config_dir:root.path().join("cfg"),env:&env,runner:&runner,detached_ticker:false};
-        assert!(crate::threads::resolve(&ctx,&project.slug,&t.id,&crate::threads::ResolveArgs{skip_copy:true,..Default::default()}).unwrap_err().to_string().contains("recover"));
-        assert!(crate::lifecycle::delete(&ctx,&project.slug,true).unwrap_err().to_string().contains("recover"));
-        assert!(crate::cleanup::remove(&ctx,&project,&current,true).unwrap_err().to_string().contains("recover"));
-        assert!(matches!(thread::copy_home_local(&project,&current,true,&runner).outcome,thread::CopyOutcome::Failed(_)));assert_eq!(thread::load(&project,&t.id).unwrap(),current);
     }
     #[test]
     fn completed_notice_replays_once_even_after_handling_and_execution_replacement() {

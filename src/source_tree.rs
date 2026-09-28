@@ -341,25 +341,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_report_is_distinct_from_unsafe_or_oversize_report() {
-        let temp=tempfile::tempdir().unwrap();let path=temp.path().join("report.md");
-        assert_eq!(report(temp.path()).unwrap(),None);
-        assert_eq!(report(&temp.path().join("missing")).unwrap(),None);
-        for kind in ["symlink","hardlink","fifo","oversize","directory"] {
-            match kind {
-                "symlink"=>symlink("missing",&path).unwrap(),
-                "hardlink"=>{fs::write(temp.path().join("original"),b"data").unwrap();fs::hard_link(temp.path().join("original"),&path).unwrap();},
-                "fifo"=>{let name=CString::new(path.as_os_str().as_bytes()).unwrap();assert_eq!(unsafe{libc::mkfifo(name.as_ptr(),0o600)},0);},
-                "oversize"=>File::create(&path).unwrap().set_len(BYTE_LIMIT+1).unwrap(),
-                "directory"=>fs::create_dir(&path).unwrap(),
-                _=>unreachable!(),
-            }
-            assert!(report(temp.path()).is_err(),"{kind}");
-            if kind=="directory" {fs::remove_dir(&path).unwrap();} else {fs::remove_file(&path).unwrap();}
-        }
-    }
-
-    #[test]
     fn growth_and_aggregate_bytes_are_bounded_during_reads() {
         let temp=tempfile::tempdir().unwrap();let path=temp.path().join("file");
         fs::write(&path,b"ab").unwrap();let mut file=File::open(&path).unwrap();

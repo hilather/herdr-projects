@@ -83,33 +83,7 @@ pub(super) fn flush_events(project: &Project, state: &mut State, now: jiff::Time
 mod tests {
     use super::*;
 
-
     fn now() -> jiff::Timestamp { "2026-09-19T12:00:00Z".parse().unwrap() }
-
-    #[test]
-    fn outage_streaks_survive_restart_and_healthy_resources_do_not_reset_them() {
-        let root = tempfile::tempdir().unwrap();
-        let a = project::create(root.path(), "a", "test", vec![]).unwrap();
-        let b = project::create(root.path(), "b", "test", vec![]).unwrap();
-        for project in [&a, &b] {
-            let mut state = State::default();
-            record_outage(project, &mut state, "bad-pr", None, Some("offline"), now(), 60).unwrap();
-            record_outage(project, &mut state, "healthy-pr", None, None, now(), 60).unwrap();
-        }
-        for project in [&a, &b] {
-            let mut state = load_state(project);
-            let later = now() + jiff::SignedDuration::from_secs(61);
-            record_outage(project, &mut state, "bad-pr", None, Some("still offline"), later, 60).unwrap();
-            record_outage(project, &mut state, "healthy-pr", None, None, later, 60).unwrap();
-            assert_eq!(state.pending_events.len(), 1);
-            assert!(flush_events(project, &mut state, later).is_empty());
-            let mut restarted = load_state(project);
-            record_outage(project, &mut restarted, "bad-pr", None, None, later, 60).unwrap();
-            assert!(flush_events(project, &mut restarted, later).is_empty());
-            assert_eq!(inbox::unhandled(project).len(), 2);
-            assert!(load_state(project).gh_outages.is_empty());
-        }
-    }
 
     #[test]
     fn failed_inbox_delivery_retries_and_replay_recognizes_handled_events() {

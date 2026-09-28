@@ -73,15 +73,6 @@ mod tests {
         let t=allocate(&project,|t|{t.status=Status::Open;t.prompt_pending=true;}).unwrap();(root,project,t)
     }
     #[test]
-    fn durable_claim_blocks_replay_and_confirmation_clears_only_matching_brief() {
-        let(_root,project,t)=fixture();let guard=ProjectGuard::acquire(&project.dir()).unwrap();let control=Control::default();
-        let pending=claim(&project,&guard,&t,"read the brief",&control).unwrap();let current=load(&project,&t.id).unwrap();
-        assert_eq!(current.prompt_claim.as_ref(),Some(&pending));assert!(current.prompt_pending);assert!(ready(&current).is_err());assert!(copy_delivery::ready(&current).is_err());
-        assert!(claim(&project,&guard,&current,"read the brief",&control).is_err());
-        confirm(&project,&guard,&t.id,&pending,&control).unwrap();let confirmed=load(&project,&t.id).unwrap();assert!(!confirmed.prompt_pending);assert_eq!(confirmed.prompt_claim.as_ref().unwrap().phase,Phase::Confirmed);
-        assert!(confirm(&project,&guard,&t.id,&pending,&control).is_err());recover(&project,&guard).unwrap();assert_eq!(load(&project,&t.id).unwrap(),confirmed);
-    }
-    #[test]
     fn lost_claim_becomes_uncertain_and_handled_notice_does_not_duplicate() {
         let(_root,project,t)=fixture();let guard=ProjectGuard::acquire(&project.dir()).unwrap();let pending=claim(&project,&guard,&t,"read the brief",&Control::default()).unwrap();
         let id=format!("brief-{}-{}-{}",t.id,pending.execution,pending.sequence);
@@ -101,11 +92,10 @@ mod tests {
         let next=claim(&project,&guard,&current,"new brief",&Control::default()).unwrap();assert_eq!(next.sequence,2);assert_ne!(next.execution,pending.execution);
     }
     #[test]
-    fn stale_cancelled_and_copy_owned_threads_cannot_claim_or_acknowledge() {
+    fn stale_and_cancelled_threads_cannot_claim_or_acknowledge() {
         let(_root,project,t)=fixture();let guard=ProjectGuard::acquire(&project.dir()).unwrap();let control=Control::default();control.cancellation.cancel();
         assert!(claim(&project,&guard,&t,"brief",&control).is_err());assert_eq!(load(&project,&t.id).unwrap(),t);
         update(&project,&t.id,|t|t.lifecycle_generation+=1).unwrap();assert!(claim(&project,&guard,&t,"brief",&Control::default()).is_err());
-        let mut current=load(&project,&t.id).unwrap();current.pending_live_copy=Some(herdr_projects::live_copy_intent::LiveCopyIntent{sequence:1,execution:"a".repeat(64),authority:"a".repeat(64),previous_hash:String::new(),previous_receipt:None,report_hash:"a".repeat(64),stage_digest:"a".repeat(64)});assert!(ready(&current).is_err());
         let current=load(&project,&t.id).unwrap();let pending=claim(&project,&guard,&current,"brief",&Control::default()).unwrap();assert!(confirm(&project,&guard,&t.id,&pending,&control).is_err());assert_eq!(load(&project,&t.id).unwrap().prompt_claim.as_ref(),Some(&pending));
     }
     #[test]

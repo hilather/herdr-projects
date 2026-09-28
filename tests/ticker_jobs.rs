@@ -291,13 +291,14 @@ fn a_failed_coordinator_start_backs_off_while_another_project_works() {
 }
 
 /// Replaces `machine_cadence_and_backoff_are_scoped_to_project_and_session`,
-/// `remote_deadlines_ignore_tick_counts_and_backoff_starts_after_failure` and
-/// `short_outages_write_nothing_and_long_ones_write_one_item_each_way`.
+/// `remote_deadlines_ignore_tick_counts_and_backoff_starts_after_failure`,
+/// `short_outages_write_nothing_and_long_ones_write_one_item_each_way` and
+/// `f02_shared_machine_serves_both_project_sessions`.
 ///
 /// Projects `a` and `b` each watch a remote thread on a machine both call
 /// `box`. While `a`'s machine is down, `b`'s is still polled on its own
-/// one-minute deadline, never on every 15 s pass, and `a`'s waits for its
-/// two-minute retry. With a zero outage threshold `a` gets one outage item,
+/// one-minute deadline, never on every 15 s pass, and records what it saw;
+/// `a`'s waits for its two-minute retry. With a zero outage threshold `a` gets one outage item,
 /// and one more when it is back after a restart; `b`'s short outage, below the
 /// threshold, writes nothing either way.
 #[test]
@@ -328,6 +329,8 @@ fn remote_machines_poll_on_their_own_deadlines_and_only_long_outages_are_reporte
     assert_eq!(outages("a").len(), 1, "{:?}", outages("a"));
     assert!(outages("a")[0].contains("`box` has been unreachable"), "{:?}", outages("a"));
     assert!(outages("b").is_empty());
+    let state = |slug: &str| fs::read_to_string(lab.project(slug).join("threads/t-0001.toml")).unwrap();
+    assert!(state("b").contains("last_state = \"working\"") && !state("a").contains("last_state = \"working\""), "{}\n{}", state("a"), state("b"));
 
     // A restart polls at once. `a` is still down and reported, `b` goes down
     // below a one-hour threshold; then both come back.
@@ -344,6 +347,7 @@ fn remote_machines_poll_on_their_own_deadlines_and_only_long_outages_are_reporte
     assert_eq!(a.len(), 2, "{a:?}");
     assert!(a.iter().any(|item| item.contains("reachable again")), "{a:?}");
     assert!(outages("b").is_empty(), "{:?}", outages("b"));
+    assert!(["a", "b"].iter().all(|slug| state(slug).contains("last_state = \"working\"")), "{}\n{}", state("a"), state("b"));
 }
 
 /// Replaces `native_ok_refresh_is_repeatable_and_does_not_write_execution_state`
