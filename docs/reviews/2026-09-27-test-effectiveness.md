@@ -930,3 +930,45 @@ Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
 - Dropping the already-listed check in `exclude_from_git` failed the start test
   (two `.herdr-project/` lines).
 - Accepting `start_threads = "yolo"` in `parse_safety` failed the safety test.
+
+## Ticker unit tests replaced by CLI workflows
+
+The audit marked 9 `src/ticker.rs` tests and 6 `src/ticker/copy_admission.rs`
+tests REPLACE. Fourteen were deleted after `tests/ticker.rs` covered their
+guarantees through `ticker start/status/stop/run`, `thread list` and one
+Python fake herdr that serves several sessions in one root, told apart by
+the socket each call names. Waits are on observed polls and records, never
+on elapsed time; a pass is 15 s, so the crate takes about two minutes.
+
+| New E2E test | Replaced unit tests |
+| --- | --- |
+| `ticker_commands_keep_one_current_ticker_per_root` (missing and empty roots; stale stop file; `start` twice; a lock held as another version, and as this version with a stop in progress, released only once `start` renews the stop request) | `start_decisions`, `start_and_run_create_nothing_without_projects`, `lock_probe_sees_a_holder_and_its_version`, `stop_with_a_free_lock_removes_a_stale_stop_file` |
+| `ticker_primes_ready_coordinators_and_leaves_other_sessions_alone` (seven projects: idle, blocked, refused prime, foreign cwd, shell prompt at three attempts, `agent list` failing, socket missing) | `pending_prime_is_delivered_only_to_a_ready_agent`, `rejected_prime_stays_pending`, `a_pane_with_other_identity_is_left_alone`, `shell_prompt_pane_gets_at_most_three_launch_attempts`, `unreachable_session_reads_no_state` |
+| `ticker_launch_cap_fails_exhausted_threads_but_not_an_acknowledged_last_start` | `exhausted_legacy_launches_fail_visibly_with_or_without_queue`, `confirmed_launch_at_legacy_cap_is_not_failed_by_stale_no_agent_sample` |
+| `ticker_announces_review_only_for_a_fresh_copy_of_the_changed_report` (copy while working, stop, change the report, go idle) | `newly_ready_thread_does_not_announce_old_unannounced_receipt_while_copy_is_offered` |
+| `ticker_holds_remote_briefs_and_launches_without_a_saved_session_contract` (a saved machine without profile id or session) | `remote_briefs_queue_without_synchronous_effects_and_require_saved_session_contract`, `delayed_remote_shell_cannot_bypass_launch_queue_with_synchronous_starts` |
+
+The deleted prime and launch tests drove the synchronous `agent prompt` /
+`agent start` path. On Linux, `ticker run` always goes through the queued
+JSON bridge, so the E2E tests assert the same guarantees on that path. The
+cap on coordinator starts is now checked as "no start at three attempts". A
+failed start already blocks retries through its claim. The supported remote
+brief and launch paths stay covered by `tests/cli.rs`
+(`ticker_remote_briefs_confirm_or_recover_uncertainty_without_replay`,
+`ticker_local_and_remote_launches_acknowledge_once_and_recover_lost_replies`).
+
+Kept: `retained_merged_projection_blocks_brief_prompts_and_agent_starts`. A
+retained `pending_final_copy` exists only while a native final copy is in
+flight or after a crash inside it. No command pauses a local copy there, and
+writing the intent by hand would mean forging its stage digest and archive.
+
+Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
+- Keeping a same-version ticker while a stop was in progress failed the
+  commands test ("`ticker start` kept a ticker that was being stopped").
+- Failing launches only past three attempts (`>` for `>=`) failed the
+  launch-cap test (timed out waiting for the exhausted launch to fail).
+- Priming without the readiness checks (ticker offer and worker) failed the
+  prime test (the blocked coordinator was primed).
+- Dropping only the `deferred` guard on review notices did not fail the
+  review test, because the outstanding-copy guard also holds the notice.
+  Dropping both announced the stale hash and failed it.

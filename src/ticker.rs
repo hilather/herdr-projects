@@ -1181,63 +1181,7 @@ mod copy_admission;
 mod tests {
     use super::*;
     use crate::paths::Env;
-    use crate::runner::fake::{FakeRunner, fail, ok};
-
-    fn held(version: &str) -> LockState {
-        LockState::Held(Info {
-            version: version.into(),
-            ..Info::default()
-        })
-    }
-
-    #[test]
-    fn start_decisions() {
-        assert_eq!(decide_start(&LockState::Free, "v1", false), StartAction::Spawn);
-        assert_eq!(decide_start(&LockState::Free, "v1", true), StartAction::Spawn);
-        assert_eq!(decide_start(&held("v1"), "v1", false), StartAction::Nothing);
-        assert_eq!(decide_start(&held("v0"), "v1", false), StartAction::StopThenSpawn);
-        // A stop in progress: finish it, then spawn.
-        assert_eq!(decide_start(&held("v1"), "v1", true), StartAction::StopThenSpawn);
-    }
-
-    #[test]
-    fn start_and_run_create_nothing_without_projects() {
-        let home = tempfile::tempdir().unwrap();
-        let missing = home.path().join("root");
-        let env = Env::for_test(home.path(), &[]);
-        let runner = FakeRunner::new();
-        let ctx = Ctx { env: &env, root: missing.clone(), config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: true };
-        start(&ctx).unwrap();
-        assert!(!missing.exists());
-        run(&ctx).unwrap();
-        assert!(!missing.exists());
-
-        std::fs::create_dir(&missing).unwrap();
-        start(&ctx).unwrap();
-        run(&ctx).unwrap();
-        assert_eq!(std::fs::read_dir(&missing).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn lock_probe_sees_a_holder_and_its_version() {
-        let root = tempfile::tempdir().unwrap();
-        assert_eq!(lock_state(root.path()), LockState::Free);
-        let mut file = File::options().create(true).write(true).truncate(false).open(lock_path(root.path())).unwrap();
-        file.lock().unwrap();
-        file.write_all(br#"{"version":"v9","pid":1}"#).unwrap();
-        match lock_state(root.path()) {
-            LockState::Held(info) => assert_eq!(info.version, "v9"),
-            LockState::Free => panic!("lock should be held"),
-        }
-        drop(file);
-        // Another test may fork a child at this instant; until that child execs,
-        // it shares the locked descriptor. Real callers poll too (`ticker stop`).
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while lock_state(root.path()) != LockState::Free && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(lock_state(root.path()), LockState::Free);
-    }
+    use crate::runner::fake::{FakeRunner, ok};
 
     #[test]
     fn executor_metrics_file_is_redacted_regular_and_refuses_symlinks() {
@@ -1264,17 +1208,7 @@ mod tests {
         assert_eq!(metrics_state(root.path()), MetricsFile::Invalid);
     }
 
-    #[test]
-    fn stop_with_a_free_lock_removes_a_stale_stop_file() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(stop_path(root.path()), b"").unwrap();
-        stop(root.path()).unwrap();
-        assert!(!stop_path(root.path()).exists());
-    }
-
     const AGENT_READY: &str = r#"{"result":{"agents":[{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","name":"hp-demo-coordinator","agent":"claude","agent_status":"idle","cwd":"CWD"}]}}"#;
-    const AGENT_BLOCKED: &str = r#"{"result":{"agents":[{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","name":"hp-demo-coordinator","agent":"claude","agent_status":"blocked","cwd":"CWD"}]}}"#;
-    const NO_AGENTS: &str = r#"{"result":{"agents":[]}}"#;
     const PANE: &str = r#"{"result":{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","cwd":"CWD"}]}}"#;
 
     struct Fixture {
@@ -1360,90 +1294,6 @@ mod tests {
             assert_eq!(runner.count("agent start"), 0);
             assert!(f.project.coordinator().unwrap().prime_pending);
         }
-    }
-
-    #[test]
-    fn pending_prime_is_delivered_only_to_a_ready_agent() {
-        let f = fixture(true);
-        let runner = FakeRunner::new();
-        runner.on("agent list", ok(&with_cwd(AGENT_BLOCKED, &f)));
-        runner.on("pane list", ok(&with_cwd(PANE, &f)));
-        runner.on("report-metadata", ok("{}"));
-        let ctx = Ctx { env: &f.env, root: f.root.clone(), config_dir: f.root.join("cfg"), runner: &runner, detached_ticker: false };
-        assert!(tick_project(&ctx, &f.project).unwrap());
-        assert_eq!(runner.count("agent prompt"), 0);
-        assert!(f.project.coordinator().unwrap().prime_pending);
-
-        let runner = FakeRunner::new();
-        runner.on("agent list", ok(&with_cwd(AGENT_READY, &f)));
-        runner.on("pane list", ok(&with_cwd(PANE, &f)));
-        runner.on("agent prompt", ok(r#"{"result":{}}"#));
-        runner.on("report-metadata", ok("{}"));
-        let ctx = Ctx { env: &f.env, root: f.root.clone(), config_dir: f.root.join("cfg"), runner: &runner, detached_ticker: false };
-        assert!(tick_project(&ctx, &f.project).unwrap());
-        assert_eq!(runner.count("agent prompt"), 1);
-        assert!(!f.project.coordinator().unwrap().prime_pending);
-        // The prompt went to the recorded socket.
-        let calls = runner.calls.borrow();
-        let prompt = calls.iter().find(|c| c.display().contains("agent prompt")).unwrap();
-        assert!(prompt.env.iter().any(|(k, v)| k == "HERDR_SOCKET_PATH" && v == &f.project.coordinator().unwrap().socket));
-    }
-
-    #[test]
-    fn rejected_prime_stays_pending() {
-        let f = fixture(true);
-        let runner = FakeRunner::new();
-        runner.on("agent list", ok(&with_cwd(AGENT_READY, &f)));
-        runner.on("pane list", ok(&with_cwd(PANE, &f)));
-        runner.on("agent prompt", fail(1, r#"{"error":{"code":"agent_blocked","message":"blocked"}}"#));
-        let ctx = Ctx { env: &f.env, root: f.root.clone(), config_dir: f.root.join("cfg"), runner: &runner, detached_ticker: false };
-        assert!(tick_project(&ctx, &f.project).is_err());
-        assert!(f.project.coordinator().unwrap().prime_pending);
-    }
-
-    #[test]
-    fn a_pane_with_other_identity_is_left_alone() {
-        let f = fixture(true);
-        let runner = FakeRunner::new();
-        // Same ids, different working directory: not our pane.
-        runner.on("agent list", ok(&AGENT_READY.replace("CWD", "/somewhere/else")));
-        runner.on("pane list", ok(&PANE.replace("CWD", "/somewhere/else")));
-        let ctx = Ctx { env: &f.env, root: f.root.clone(), config_dir: f.root.join("cfg"), runner: &runner, detached_ticker: false };
-        assert!(tick_project(&ctx, &f.project).unwrap());
-        assert_eq!(runner.count("agent prompt"), 0);
-        assert_eq!(runner.count("agent start"), 0);
-        assert_eq!(runner.count("report-metadata"), 0);
-    }
-
-    #[test]
-    fn shell_prompt_pane_gets_at_most_three_launch_attempts() {
-        let f = fixture(true);
-        let runner = FakeRunner::new();
-        runner.on("agent list", ok(NO_AGENTS));
-        runner.on("pane list", ok(&with_cwd(PANE, &f)));
-        runner.on("agent start", fail(1, r#"{"error":{"code":"timeout","message":"no agent"}}"#));
-        let ctx = Ctx { env: &f.env, root: f.root.clone(), config_dir: f.root.join("cfg"), runner: &runner, detached_ticker: false };
-        for _ in 0..5 {
-            let _ = tick_project(&ctx, &f.project);
-        }
-        assert_eq!(runner.count("agent start"), 3);
-        assert_eq!(runner.count("agent prompt"), 0);
-    }
-
-    #[test]
-    fn unreachable_session_reads_no_state() {
-        let f = fixture(true);
-        let runner = FakeRunner::new();
-        runner.on("agent list", fail(1, "connection refused"));
-        let ctx = Ctx { env: &f.env, root: f.root.clone(), config_dir: f.root.join("cfg"), runner: &runner, detached_ticker: false };
-        assert!(!tick_project(&ctx, &f.project).unwrap());
-
-        // A socket file that is gone is not even called.
-        std::fs::remove_file(f.project.coordinator().unwrap().socket).unwrap();
-        let runner = FakeRunner::new();
-        let ctx = Ctx { env: &f.env, root: f.root.clone(), config_dir: f.root.join("cfg"), runner: &runner, detached_ticker: false };
-        assert!(!tick_project(&ctx, &f.project).unwrap());
-        assert!(runner.calls.borrow().is_empty());
     }
 
     #[test]

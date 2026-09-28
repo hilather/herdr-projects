@@ -19,27 +19,6 @@ fn drain(memory:&mut Memory) {
         assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(2));
     }
 }
-#[test]
-fn newly_ready_thread_does_not_announce_old_unannounced_receipt_while_copy_is_offered() {
-    let world=crate::scenarios::World::new();let project=world.project("demo","session.sock");
-    let socket=project.try_coordinator().unwrap().unwrap().socket;std::fs::remove_file(&socket).unwrap();let _listener=std::os::unix::net::UnixListener::bind(&socket).unwrap();
-    let t=world.thread(&project,world.home.path(),|t|t.last_group=thread::Group::Idle.token().into());
-    std::fs::create_dir_all(&t.thread_dir).unwrap();std::fs::write(Path::new(&t.thread_dir).join("report.md"),b"new").unwrap();
-    std::fs::write(thread::home_report_path(&project,&t.id),b"old").unwrap();
-    thread::copy_delivery::record(&project,&t,&thread::Copied{artifact_snapshot:None,outcome:thread::CopyOutcome::Complete,report_hash:Some(thread::sha256_hex(b"old"))}).unwrap();
-    *world.panes.borrow_mut()=format!("[{},{}]",world.coordinator_pane(&project),crate::scenarios::pane_json("w2","w2:t1","w2:p1",&t.cwd));
-    *world.agents.borrow_mut()=format!("[{}]",crate::scenarios::agent_json("w2","w2:t1","w2:p1",&t.cwd,&t.agent_name,"idle"));
-    let pool=Arc::new(Executor::new(Limits::default(),Arc::new(Immediate)).unwrap());let ctx=world.ctx();let mut memory=Memory::new(&ctx);memory.copy_jobs=Some(crate::copy_jobs::Queue::new(pool.clone()));
-    assert!(tick_project_with(&ctx,&project,&mut memory).unwrap());
-    let current=thread::load(&project,&t.id).unwrap();assert_eq!(current.last_group,thread::Group::ReadyForReview.token());
-    assert!(memory.copy_jobs.as_ref().unwrap().outstanding(&project,&t.id));assert!(current.pending_review_notice.is_none());assert!(current.last_review_item_hash.is_empty());
-    assert_eq!(current.report_hash,thread::sha256_hex(b"old"));assert_eq!(pool.metrics().high_water[1],0,"single project pass may only offer copies");
-    // Even a forged successful completion cannot change the copy receipt. The
-    // next fresh source observation must offer it again before review preparation.
-    memory.copy_jobs.as_mut().unwrap().admit();drain(&mut memory);
-    assert!(tick_project_with(&ctx,&project,&mut memory).unwrap());assert!(thread::load(&project,&t.id).unwrap().last_review_item_hash.is_empty());
-    assert!(pool.stop(Duration::from_secs(1)));
-}
 #[cfg(feature="state-store")]
 #[test]
 fn copy_and_routine_backlogs_alternate_only_after_ticket_drain() {
@@ -112,63 +91,4 @@ fn retained_merged_projection_blocks_brief_prompts_and_agent_starts() {
     launch_pass(&ctx,&project,&herdr,&[current],&[],&[pane],&mut may_start,&mut errors);
     assert!(errors.is_empty());assert_eq!(world.runner.count("agent prompt"),0);assert_eq!(world.runner.count("agent start"),0);
     let current=thread::load(&project,&t.id).unwrap();assert!(current.prompt_pending);assert!(current.pending_final_copy.is_some());assert_eq!(current.launch_attempts,t.launch_attempts);
-}
-
-#[cfg(target_os="linux")]
-#[test]
-fn remote_briefs_queue_without_synchronous_effects_and_require_saved_session_contract() {
-    use std::os::unix::net::UnixListener;
-    for supported in [true,false] {
-        let world=crate::scenarios::World::new();let project=world.project("remote","session.sock");
-        let socket=world.home.path().join("session.sock");std::fs::remove_file(&socket).unwrap();let _listener=UnixListener::bind(&socket).unwrap();
-        let t=world.thread(&project,world.home.path(),|t|{t.machine="saved".into();t.prompt_pending=true;});
-        let agents=vec![serde_json::from_str(&crate::scenarios::agent_json("w2","w2:t1","w2:p1",&t.cwd,&t.agent_name,"idle")).unwrap()];
-        let panes=vec![serde_json::from_str(&crate::scenarios::pane_json("w2","w2:t1","w2:p1",&t.cwd)).unwrap()];
-        let route=supported.then(||crate::remote_api::Route{id:"a".repeat(32),label:"saved".into(),target:"fixture.invalid".into(),session:"named".into(),enabled:true,selected:false});
-        let observation=crate::remote_polling::Observation{agents,panes,route,target:"fixture.invalid".into(),hashes:Default::default()};
-        let ctx=world.ctx();let herdr=Herdr::new(ctx.env.herdr_bin(),&socket,ctx.runner);let pool=Arc::new(Executor::new(Limits::default(),Arc::new(Immediate)).unwrap());let mut queue=crate::copy_jobs::Queue::new(pool.clone());let mut errors=Vec::new();
-        apply_remote(&ctx,&project,&herdr,"saved",&[t.clone()],observation,true,&mut false,&mut errors,Some(&mut queue),&mut Default::default(),&mut Default::default()).unwrap();
-        assert_eq!(queue.offered(),supported);assert_eq!(errors.is_empty(),supported,"{errors:?}");
-        assert!(!world.runner.calls.borrow().iter().any(|c|["agent list","pane list","agent prompt","agent start","machine list"].iter().any(|text|c.display().contains(text))),"admission performed a synchronous terminal preflight/effect");
-        assert!(thread::load(&project,&t.id).unwrap().prompt_pending);assert!(thread::load(&project,&t.id).unwrap().prompt_claim.is_none());
-        if supported {assert!(queue.admit().is_empty());let end=Instant::now()+Duration::from_secs(3);while queue.pending(){assert!(Instant::now()<end);assert!(queue.drain().is_empty());std::thread::sleep(Duration::from_millis(2));}assert!(thread::load(&project,&t.id).unwrap().prompt_pending);}
-        assert!(pool.stop(Duration::from_secs(1)));
-    }
-}
-
-#[test]
-fn delayed_remote_shell_cannot_bypass_launch_queue_with_synchronous_starts() {
-    for changed_route in [false,true] {
-        let world=crate::scenarios::World::new();let project=world.project("remote","session.sock");let t=world.thread(&project,world.home.path(),|t|{t.machine="saved".into();t.prompt_pending=true;});
-        *world.agents.borrow_mut()=format!("[{}]",crate::scenarios::agent_json("w2","w2:t1","w2:p1",&t.cwd,&t.agent_name,"working"));
-        let pane=crate::scenarios::pane_json("w2","w2:t1","w2:p1",&t.cwd);*world.panes.borrow_mut()=format!("[{pane}]");
-        world.runner.on("machine list",crate::runner::fake::ok(&serde_json::json!([{"label":"saved","target":if changed_route{"changed.invalid"}else{"fixture.invalid"}}]).to_string()));
-        let observation=crate::remote_polling::Observation{agents:vec![],panes:vec![serde_json::from_str(&pane).unwrap()],route:None,target:"fixture.invalid".into(),hashes:Default::default()};
-        let ctx=world.ctx();let herdr=Herdr::new(ctx.env.herdr_bin(),world.home.path().join("session.sock"),ctx.runner);let pool=Arc::new(Executor::new(Limits::default(),Arc::new(Immediate)).unwrap());let mut queue=crate::copy_jobs::Queue::new(pool.clone());
-        let result=apply_remote(&ctx,&project,&herdr,"saved",&[t.clone()],observation,true,&mut true,&mut Vec::new(),Some(&mut queue),&mut Default::default(),&mut Default::default());
-        assert!(result.is_ok());assert_eq!(thread::load(&project,&t.id).unwrap().launch_attempts,0);assert_eq!(world.runner.count("agent start"),0);
-        assert_eq!(world.runner.count("machine list"),0);assert_eq!(world.runner.count("agent list"),0);assert!(pool.stop(Duration::from_secs(1)));
-    }
-}
-
-#[test]
-fn exhausted_legacy_launches_fail_visibly_with_or_without_queue(){
-    for queued in [false,true]{let world=crate::scenarios::World::new();let project=world.project("demo","session.sock");let t=world.thread(&project,world.home.path(),|t|{t.prompt_pending=true;t.launch_attempts=thread::MAX_LAUNCH_ATTEMPTS;});
-        let panes=vec![serde_json::from_str(&crate::scenarios::pane_json("w2","w2:t1","w2:p1",&t.cwd)).unwrap()];let ctx=world.ctx();let herdr=Herdr::new(ctx.env.herdr_bin(),world.home.path().join("session.sock"),ctx.runner);let mut errors=Vec::new();
-        let pool=Arc::new(Executor::new(Limits::default(),Arc::new(Immediate)).unwrap());let mut queue=crate::copy_jobs::Queue::new(pool.clone());
-        if queued{offer_launches(&ctx,&project,&[t.clone()],&[],&panes,&mut queue,None,&mut errors);}else{launch_pass(&ctx,&project,&herdr,&[t.clone()],&[],&panes,&mut true,&mut errors);}
-        assert!(errors.is_empty());assert_eq!(thread::load(&project,&t.id).unwrap().status,thread::Status::Failed);assert!(!queue.offered());assert_eq!(world.runner.count("agent start"),0);assert!(pool.stop(Duration::from_secs(1)));
-    }
-}
-
-#[test]
-fn confirmed_launch_at_legacy_cap_is_not_failed_by_stale_no_agent_sample(){
-    for queued in [false,true]{let world=crate::scenarios::World::new();let project=world.project("demo","session.sock");let t=world.thread(&project,world.home.path(),|t|{t.prompt_pending=true;t.launch_attempts=thread::MAX_LAUNCH_ATTEMPTS-1;});
-        {let guard=herdr_projects::execution_guard::ProjectGuard::acquire(&project.dir()).unwrap();let control=crate::source_tree::Control::default();let claim=thread::launch_delivery::claim(&project,&guard,&t,&[],&"a".repeat(64),"terminal",&control).unwrap();thread::launch_delivery::confirm(&project,&guard,&t.id,&claim,&control).unwrap();}
-        let t=thread::load(&project,&t.id).unwrap();
-        let panes=vec![serde_json::from_str(&crate::scenarios::pane_json("w2","w2:t1","w2:p1",&t.cwd)).unwrap()];let ctx=world.ctx();let herdr=Herdr::new(ctx.env.herdr_bin(),world.home.path().join("session.sock"),ctx.runner);let mut errors=Vec::new();
-        let pool=Arc::new(Executor::new(Limits::default(),Arc::new(Immediate)).unwrap());let mut queue=crate::copy_jobs::Queue::new(pool.clone());
-        if queued{offer_launches(&ctx,&project,&[t.clone()],&[],&panes,&mut queue,None,&mut errors);}else{launch_pass(&ctx,&project,&herdr,&[t.clone()],&[],&panes,&mut true,&mut errors);}
-        assert!(errors.is_empty());assert_eq!(thread::load(&project,&t.id).unwrap().status,thread::Status::Open);assert_eq!(thread::group(&t,&thread::Live{pane_exists:true,..Default::default()},jiff::Timestamp::now()),thread::Group::WaitingOnYou);assert!(!queue.offered());assert_eq!(world.runner.count("agent start"),0);assert!(pool.stop(Duration::from_secs(1)));
-    }
 }
