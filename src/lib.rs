@@ -89,3 +89,6 @@ pub mod result_capture;
 
 #[cfg(all(feature = "state-store", target_os = "linux"))]
 pub mod integration;
+
+#[cfg(feature = "state-store")]
+pub mod telemetry;

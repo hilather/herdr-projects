@@ -98,6 +98,12 @@ Stop if a transition path exists that baseline §1 does not list (add it first).
 
 ## S5 — Codex usage adapter (sidecar)
 
+**Done, live certification pending (S7).** `telemetry <slug> collect|usage`
+and a ticker hook (once per 300 s, 8 MiB) write `telemetry.db` (0001);
+`CERTIFIED` is empty, so `codex_usage_binds_and_sums_exactly` is `#[ignore]`d
+as the gate and every Codex attempt reads `cli_version_uncertified`. Outcome
+`usage` wiring waits for S3. Refinements in contracts §5.
+
 Goal: `herdr-projects telemetry <slug> collect` scans Codex execution homes,
 binds rollouts, writes `telemetry.db` idempotently; outcome `usage` reads it.
 Files: `migrations/telemetry/0001_codex_usage.sql` (`rollout_sources`,

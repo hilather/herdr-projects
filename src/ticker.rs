@@ -558,6 +558,7 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
                 Err(error) => log.line(&format!("{slug}: memory-review remind: {error:#}")),
             }
             integrity_pass(ctx,log,slug);
+            telemetry_pass(ctx,log,slug);
         }
         admit_background(ctx,log,memory,canonical.into_iter().map(|slug|ctx.root.join(slug)).collect());
         if let Some(reads)=memory.local_reports.as_mut(){for error in reads.admit(){log.line(&error);}}
@@ -585,6 +586,20 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         reachable
     }
 
+}
+/// Codex usage collect off the poll path: at most once per interval per project
+/// (default 300 s, `HERDR_PROJECTS_TELEMETRY_COLLECT_SECS`, 0 disables), within
+/// the tick byte budget. Writes only the sidecar; never blocks canonical work.
+#[cfg(feature="state-store")]
+fn telemetry_pass(ctx:&Ctx,log:&Log,slug:&str) {
+    static LAST:std::sync::Mutex<std::collections::BTreeMap<String,Instant>>=std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let secs=ctx.env.var("HERDR_PROJECTS_TELEMETRY_COLLECT_SECS").and_then(|v|v.parse().ok()).unwrap_or(300u64);
+    if secs==0 {return;}
+    let Ok(mut last)=LAST.lock() else {return};
+    if last.get(slug).is_some_and(|at|at.elapsed()<Duration::from_secs(secs)) {return;}
+    last.insert(slug.to_owned(),Instant::now());drop(last);
+    use herdr_projects::telemetry::codex;
+    if let Err(error)=codex::collect(&ctx.root.join(slug),codex::Budget::TICK,false) {log.line(&format!("{slug}: telemetry collect: {error:#}"));}
 }
 /// Whole-store check off the poll path: at most once per interval per project
 /// (default one hour, `HERDR_PROJECTS_INTEGRITY_CHECK_SECS`), with its own budget.

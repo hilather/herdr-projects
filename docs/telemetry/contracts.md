@@ -257,6 +257,43 @@ codex-auto-review`) follow the same rule; if bound they form a separate model
 segment of that attempt, otherwise they stay unbound. Binding is recomputed,
 never guessed from PID, title or file time.
 
+S5 refinements:
+- CLI `telemetry <slug> collect` (creates the sidecar, then prints) and
+  `telemetry <slug> usage` (read-only); both print `{attempts, sessions}`,
+  collect adds `collected{files, bytes, records, budget_exhausted}`. Budget:
+  256 MiB per CLI collect, 8 MiB per ticker collect (once per 300 s per project,
+  `HERDR_PROJECTS_TELEMETRY_COLLECT_SECS`, `0` off; no sidecar is created for a
+  project without a Codex home). Lines over 16 MiB are skipped whole.
+- Homes scanned = `execution_home` of Codex `effective_profile`s in
+  `attempt_inputs` plus Codex `native_profiles`; symlinks are not followed,
+  depth ≤ 4. Paths are stored as `sha256:` digests (`path_digest`,
+  `home_digest`).
+- File position: `collect_offsets(path_digest, device, inode, byte_offset,
+  records, rate_limits, model, effort)`, advanced in the same sidecar
+  transaction as the rows. A changed device/inode or a file shorter than the
+  offset re-reads from 0; existing keys then dedupe or quarantine.
+- Only the first `session_meta` of a file counts; records before it advance
+  the ordinal but are not stored. `source` keeps a string, or the first key of
+  an object source. Rule 2 is evaluated at read time on the raw `cwd` into
+  `cwd_attempt` (the path component after `<project>/.state/worktrees/`); the
+  raw `cwd` is not stored.
+- Precedence: `invariant_violation` before `cli_version_uncertified`; any
+  record not accepted stores `NULL` counters. `payload_digest` is stored for
+  every record (needed for replay/quarantine). Rate limits and turns are
+  stored for uncertified versions (metadata, no counters); `thread_usage` /
+  `token_count_usage` and discrepancies only for certified versions.
+- Discrepancies compare all six usage fields; the row keeps
+  `summed_total`, `reported_total` and the differing field names, and is
+  deleted when the difference disappears. `used_percent` is the JSON number's
+  text (`37.5`). Rate-limit `ordinal` = position among `token_count` events
+  with `rate_limits`; `observed_ts` = the line's `timestamp`.
+- Attempt `usage`: `collection_not_run` without a sidecar, `adapter_absent`
+  for non-Codex kinds, then `not_bound`, `quarantined`,
+  `cli_version_uncertified`, else sums of accepted records plus `records`.
+- Rule 4 `ambiguous` cannot arise within one project because worktree
+  directories are attempt-unique; it stays as a guard. Several rollouts bound
+  to one attempt (guardian, resume) all count.
+
 ## 6. Metric subset
 
 Definitions follow doc 07; adaptations are marked. Window = activity or
