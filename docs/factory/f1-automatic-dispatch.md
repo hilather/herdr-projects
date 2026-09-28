@@ -1,6 +1,6 @@
 # F1 automatic verification and integration dispatch
 
-Status: cards 1–2 merged (#42, #48), cards 3–4 open. Planned 27 September 2026. Scope is the dependent vertical slice (F1):
+Status: cards 1–2 merged (#42, #48), card 3 done, card 4 open. Planned 27 September 2026. Scope is the dependent vertical slice (F1):
 verified worker results are integrated automatically and release dependents.
 Each card is one reviewable PR. Work stops at each card's stop condition; gaps
 found along the way are recorded as new cards, not folded into the current one.
@@ -68,7 +68,7 @@ template. Stored verification/integration receipts already write
   is rejected with `exit_status=3` and releases nothing.
 - Stop: that test and the verifier and CLI subsets pass.
 
-### 3. Serial integration per target
+### 3. Serial integration per target — done
 
 - Eligible results: every policy accepted, `verify_then_integrate` route, a
   configured target, no integration operation yet.
@@ -144,5 +144,6 @@ Recorded here rather than folded into the card that found them.
   store transactions.
 - **No E2E for the isolation-unavailable pause** (`verification.paused`); it
   cannot be simulated from outside without a hook in the shipped binary.
+- **Integration job follow-ups (card 3):** there is no retry command for integration jobs, so a stale block holds the ref until an operator runs `result integrate`; jobs advance only on the 15 s ticker cadence.
 - **Replace-verdict tests** (352 in `docs/reviews/2026-09-27-test-audit.tsv`):
   convert to E2E alongside feature work, starting with `store/barriers.rs`.

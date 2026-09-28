@@ -2096,6 +2096,13 @@ fn ticker_auto_integrates_two_results_serially_and_recovers_stale_and_crash() {
     assert!(landed.contains(&raw.query_row("SELECT commit_oid FROM integrated_commits i JOIN integration_operations o ON o.operation_id=i.operation_id WHERE o.idempotency_key=?1",[op.id.as_str()],|row|row.get::<_,String>(0)).unwrap()));
     assert_eq!(job(&two).unwrap().1.attempts,2);
     assert_eq!(std::fs::read_dir(f.project.join(".integrate-scratch")).map(|entries|entries.count()).unwrap_or(0),0,"scratch is removed after every job");
+    // Submission history does not enter the producer's turn: thousands of
+    // unrelated submissions leave its pending projection empty.
+    raw.execute("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<3000)
+        INSERT INTO result_submissions SELECT printf('%064x',i),project_store,'seed-'||i,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,memory_snapshot_id,artifact_manifest,claimed_checks,created_unix_ms
+        FROM n,result_submissions WHERE submission_id=?1",[&one]).unwrap();
+    raw.execute("DELETE FROM pending_verification_work WHERE submission_id GLOB '0000*'",[]).unwrap();
+    let pending=||f.db().query_row("SELECT count(*) FROM pending_integration_work",[],|row|row.get::<_,u64>(0)).unwrap();assert_eq!(pending(),0);
     // The target moves outside the controller between verification and integration.
     auto(&["--integrate","off"]);
     let c3=candidate("three");let three=f.submit_at("three",&clean,&c3);
@@ -2117,6 +2124,7 @@ fn ticker_auto_integrates_two_results_serially_and_recovers_stale_and_crash() {
     let listed=String::from_utf8(hp(f.home.path(),&["--root",f.r(),"result","demo","jobs"]).stdout).unwrap();assert!(listed.contains("target moved"),"{listed}");
     assert_eq!(tip(),moved,"the moved ref is not overwritten");assert_eq!(integrated(),2);
     assert_eq!(f.db().query_row("SELECT count(*) FROM integration_operations",[],|row|row.get::<_,u64>(0)).unwrap(),2,"nothing is rebuilt");
+    assert_eq!(pending(),0);
 }
 
 #[cfg(feature="state-store")]

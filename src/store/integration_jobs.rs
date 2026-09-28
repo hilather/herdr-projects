@@ -5,6 +5,24 @@ use super::*;
 use serde::Serialize;
 
 const TURN_LIMIT: usize = 8;
+/// Pending rows examined per turn; rows waiting on a busy target stay queued.
+const SCAN_LIMIT: usize = 32;
+const ELIGIBLE: &str = "SELECT s.submission_id,s.project_store,s.task_id,t.revision,s.repository,g.ref_name,
+        (SELECT r.result_id FROM verified_results r JOIN verification_runs v ON v.run_id=r.run_id
+         JOIN verification_contract_checks k ON k.result_id=r.result_id AND k.version=2 WHERE r.submission_id=s.submission_id AND v.state='accepted' ORDER BY v.policy_id,r.result_id LIMIT 1)
+     FROM result_submissions s
+     JOIN task_contracts c ON c.task_id=s.task_id AND c.contract_revision=s.contract_revision AND c.raw_digest=s.contract_digest
+     JOIN integration_targets g ON g.repository=s.repository
+     JOIN tasks t ON t.id=s.task_id
+     WHERE s.submission_id=?1 AND c.route='verify_then_integrate'
+       AND NOT EXISTS(SELECT 1 FROM pending_verification_work w WHERE w.submission_id=s.submission_id)
+       AND EXISTS(SELECT 1 FROM acceptance_policies p WHERE p.task_id=s.task_id AND p.contract_revision=s.contract_revision)
+       AND NOT EXISTS(SELECT 1 FROM acceptance_policies p WHERE p.task_id=s.task_id AND p.contract_revision=s.contract_revision
+           AND NOT EXISTS(SELECT 1 FROM verification_runs v JOIN verified_results r ON r.run_id=v.run_id
+               JOIN verification_contract_checks k ON k.result_id=r.result_id AND k.version=2
+               WHERE v.submission_id=s.submission_id AND v.policy_id=p.policy_id AND v.state='accepted'))
+       AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.kind='integration.run' AND json_extract(o.payload,'$.submission_id')=s.submission_id)
+       AND NOT EXISTS(SELECT 1 FROM verified_results r JOIN integration_operations i ON i.verified_result_id=r.result_id WHERE r.submission_id=s.submission_id)";
 const UNFINISHED: &str = "('effect_pending','candidate_prepared','validating','reconciliation_required')";
 
 #[derive(Debug, Default, Serialize)]
@@ -36,37 +54,27 @@ impl SqliteStore {
         budget.check()?;
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;check_schema(&tx)?;
         if !enabled(&tx)? { return Ok(IntegrationJobTurn::default()); }
-        let mut candidates = Vec::new();
-        {
-            let mut stmt = tx.prepare(
-                "SELECT s.submission_id,s.project_store,s.task_id,t.revision,s.repository,g.ref_name,
-                    (SELECT r.result_id FROM verified_results r JOIN verification_runs v ON v.run_id=r.run_id
-                     JOIN verification_contract_checks k ON k.result_id=r.result_id AND k.version=2 WHERE r.submission_id=s.submission_id AND v.state='accepted' ORDER BY v.policy_id,r.result_id LIMIT 1)
-                 FROM result_submissions s
-                 JOIN task_contracts c ON c.task_id=s.task_id AND c.contract_revision=s.contract_revision AND c.raw_digest=s.contract_digest
-                 JOIN integration_targets g ON g.repository=s.repository
-                 JOIN tasks t ON t.id=s.task_id
-                 WHERE c.route='verify_then_integrate'
-                   AND NOT EXISTS(SELECT 1 FROM pending_verification_work w WHERE w.submission_id=s.submission_id)
-                   AND EXISTS(SELECT 1 FROM acceptance_policies p WHERE p.task_id=s.task_id AND p.contract_revision=s.contract_revision)
-                   AND NOT EXISTS(SELECT 1 FROM acceptance_policies p WHERE p.task_id=s.task_id AND p.contract_revision=s.contract_revision
-                       AND NOT EXISTS(SELECT 1 FROM verification_runs v JOIN verified_results r ON r.run_id=v.run_id
-                           JOIN verification_contract_checks k ON k.result_id=r.result_id AND k.version=2
-                           WHERE v.submission_id=s.submission_id AND v.policy_id=p.policy_id AND v.state='accepted'))
-                   AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.kind='integration.run' AND json_extract(o.payload,'$.submission_id')=s.submission_id)
-                   AND NOT EXISTS(SELECT 1 FROM verified_results r JOIN integration_operations i ON i.verified_result_id=r.result_id WHERE r.submission_id=s.submission_id)
-                 ORDER BY s.created_unix_ms,s.submission_id LIMIT ?1")?;
-            let mut rows = stmt.query([TURN_LIMIT as i64 + 1])?;
-            while let Some(row) = rows.next()? {
-                budget.row(row, &[])?;
-                candidates.push(Candidate { submission_id: row.get(0)?, project_store: row.get(1)?, task_id: row.get(2)?, task_revision: row.get(3)?,
-                    repository: row.get(4)?, reference: row.get(5)?, result_id: row.get(6)? });
-            }
-        }
-        let more = candidates.len() > TURN_LIMIT;
+        // Only the pending projection is read, oldest first and bounded; each
+        // candidate's full eligibility is rechecked here, and a row that is not
+        // eligible now is dropped (a later verified result or target re-adds it).
+        let ids = {
+            let mut stmt = tx.prepare("SELECT submission_id FROM pending_integration_work ORDER BY created_unix_ms,submission_id LIMIT ?1")?;
+            let mut rows = stmt.query([SCAN_LIMIT as i64 + 1])?;let mut ids = Vec::new();
+            while let Some(row) = rows.next()? { budget.row(row, &[])?; ids.push(row.get::<_, String>(0)?); }
+            ids
+        };
+        let more = ids.len() > SCAN_LIMIT;
         let now = jiff::Timestamp::now().as_millisecond();
         let mut enqueued = 0;
-        for candidate in candidates.iter().take(TURN_LIMIT) {
+        for submission_id in ids.iter().take(SCAN_LIMIT) {
+            if enqueued == TURN_LIMIT { break; }
+            budget.check()?;
+            let candidate = tx.query_row(ELIGIBLE, [submission_id], |row| Ok(Candidate { submission_id: row.get(0)?, project_store: row.get(1)?, task_id: row.get(2)?, task_revision: row.get(3)?,
+                repository: row.get(4)?, reference: row.get(5)?, result_id: row.get(6)? })).optional()?;
+            let Some(candidate) = candidate else {
+                tx.execute("DELETE FROM pending_integration_work WHERE submission_id=?1", [submission_id])?;
+                continue;
+            };
             budget.check()?;
             let encoded = serde_json::to_vec(&serde_json::json!([candidate.project_store, candidate.result_id, candidate.repository, candidate.reference]))
                 .map_err(|error| StoreError::Invalid(error.to_string()))?;
