@@ -237,7 +237,9 @@ S3 refinements:
   predates_dispatch_log`.
 - `accepted` checks any submission of the attempt against the task's current
   contract revision and route. `usage` is `unavailable: adapter_absent` for
-  non-Codex kinds and `collection_not_run` for Codex until S5 lands.
+  non-Codex kinds; for Codex it is `collection_not_run` without a sidecar,
+  else the sidecar's attempt usage (§5 "Attempt `usage`", the same value
+  `telemetry usage` prints), read without creating or migrating the sidecar.
 - Verifier reasons are fixed codes today; the excerpt test adds a later run
   with a free-text reason to show display-time redaction.
 

@@ -443,6 +443,44 @@ fn quota_headroom_at_dispatch() {
         "value": unavailable("no_observation")}]));
 }
 
+fn outcome_usage(f: &Fixture) -> serde_json::Value { f.cli_args(&["attempts", "--json"]).0["attempts"][0]["usage"].clone() }
+
+/// Contracts §4 `usage` in `telemetry attempts`: the certified bound sums, else
+/// the reason, the same as `usage` reports for that attempt.
+#[test]
+fn attempts_show_bound_usage_or_its_reason() {
+    let f = Fixture::new();
+    f.rollout(&f.home, SID, &["head.jsonl", "tail.jsonl"], &f.worktree(), f.decided + 1_000, "0.154.0");
+    assert_eq!(outcome_usage(&f), unavailable("collection_not_run"));
+    assert!(!f.project.join(".state/telemetry.db").exists(), "attempts creates no sidecar");
+    f.cli("collect");
+    // 1000 + 500 input, 400 + 100 cached, 120 + 60 output, 80 + 20 reasoning, 1120 + 560 total.
+    assert_eq!(outcome_usage(&f), serde_json::json!({"input_tokens": 1500, "cached_input_tokens": 500, "cache_write_input_tokens": 0,
+        "output_tokens": 180, "reasoning_output_tokens": 100, "total_tokens": 1680, "records": 2}));
+    let text = Command::new(BIN).env_clear().env("HOME", f.tmp.path().join("home")).env("PATH", "/usr/bin:/bin")
+        .args(["--root", f.root.to_str().unwrap(), "telemetry", "demo", "attempts"]).output().unwrap();
+    assert!(String::from_utf8(text.stdout).unwrap().trim_end().ends_with("usage=in=1500 out=180 total=1680"));
+
+    let f = Fixture::new();
+    f.rollout(&f.home, SID, &["head.jsonl"], &f.worktree(), f.decided - 60_000, "0.154.0");
+    f.cli("collect");
+    assert_eq!(outcome_usage(&f), unavailable("not_bound"));
+
+    let f = Fixture::new();
+    f.rollout(&f.home, SID, &["head.jsonl", "tail.jsonl"], &f.worktree(), f.decided + 1_000, "0.999.0");
+    f.cli("collect");
+    assert_eq!(outcome_usage(&f), unavailable("cli_version_uncertified"));
+
+    let f = Fixture::new();
+    let path = f.rollout(&f.home, SID, &["head.jsonl", "tail.jsonl"], &f.worktree(), f.decided + 1_000, "0.154.0");
+    f.cli("collect");
+    let replacement = path.with_extension("tmp");
+    fs::write(&replacement, fs::read_to_string(&path).unwrap().replace("\"resp-2\"", "\"resp-2b\"")).unwrap();
+    fs::rename(&replacement, &path).unwrap();
+    f.cli("collect");
+    assert_eq!(outcome_usage(&f), unavailable("quarantined"));
+}
+
 /// Every file under `dir` with its length and modification time.
 fn tree(dir: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
     let mut out = Vec::new();

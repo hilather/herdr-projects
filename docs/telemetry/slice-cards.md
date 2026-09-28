@@ -109,7 +109,7 @@ Stop if a transition path exists that baseline §1 does not list (add it first).
 write `telemetry.db` (0001); `CERTIFIED = ["0.154.0"]`, and the gate test
 `codex_usage_binds_and_sums_exactly` runs un-ignored. A session holding rows
 collected before certification stays `cli_version_uncertified` (never `0`).
-Outcome `usage` wiring (`telemetry attempts`) is still not done: follow-up.
+Outcome `usage` in `telemetry attempts` reads the sidecar (follow-up done).
 Refinements in contracts §5.
 
 Goal: `herdr-projects telemetry <slug> collect` scans Codex execution homes,
@@ -200,8 +200,11 @@ Stop if the panel would write, launch, or read content outside contracts §7.
   `reads_leave_state_untouched`.
 - No action opens the fleet pane yet.
 
-**Follow-ups found in live certification:** `telemetry attempts` still reports
-Codex usage as `collection_not_run` even when the sidecar has bound, certified
-usage (the S3→S5 wiring was never done). Sessions ingested before a version was
-certified stay `cli_version_uncertified`; re-ingesting or updating those rows
-after certification is not implemented.
+**Follow-ups found in live certification:**
+- Done: `telemetry attempts` reports the sidecar's bound, certified usage or
+  its reason (`not_bound`, `quarantined`, `cli_version_uncertified`;
+  `collection_not_run` only without a sidecar);
+  `attempts_show_bound_usage_or_its_reason`.
+- Sessions ingested before a version was certified stay
+  `cli_version_uncertified`; re-ingesting or updating those rows after
+  certification is not implemented.

@@ -26,6 +26,13 @@ pub fn attempts(project: &Path) -> anyhow::Result<Value> {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows.into_iter().map(|(attempt, task, state, kind)| record(&db, version, &attempt, &task, &state, kind.as_deref(), home.as_deref())).collect::<rusqlite::Result<Vec<_>>>()?
     };
+    // Contracts §4/§5 `usage`: the sidecar's bound, certified sums or its reason.
+    let mut records = records;
+    if let Some(sidecar) = super::sidecar::read(project)? {
+        for record in records.iter_mut().filter(|r| r["usage"]["reason"] == "collection_not_run") {
+            record["usage"] = super::sidecar::attempt_usage(&sidecar, record["attempt_id"].as_str().unwrap_or_default())?;
+        }
+    }
     Ok(json!({"attempts": records}))
 }
 
@@ -97,6 +104,7 @@ fn record(db: &Connection, version: u32, attempt: &str, task: &str, state: &str,
         AND t.contract_revision=(SELECT max(contract_revision) FROM task_contracts WHERE task_id=?2)
         AND (t.route='verify_only' OR EXISTS(SELECT 1 FROM integration_operations i JOIN integrated_commits c ON c.operation_id=i.operation_id WHERE i.verified_result_id=r.result_id)))",
         [attempt, task], |r| r.get(0))?;
+    // Without a sidecar; `attempts` replaces it with the sidecar's answer.
     let usage = status("unavailable", if kind == Some("codex") { "collection_not_run" } else { "adapter_absent" });
     Ok(json!({
         "accepted": accepted, "active_ms": active, "attempt_id": attempt,
@@ -112,6 +120,7 @@ fn record(db: &Connection, version: u32, attempt: &str, task: &str, state: &str,
 /// One line per attempt for the terminal.
 pub fn text(report: &Value) -> String {
     let show = |v: &Value| match v {
+        Value::Object(map) if map.contains_key("total_tokens") => format!("in={} out={} total={}", map["input_tokens"], map["output_tokens"], map["total_tokens"]),
         Value::Object(map) => format!("{}:{}", map.get("status").or(map.get("state")).and_then(Value::as_str).unwrap_or("?"), map.get("reason").and_then(Value::as_str).unwrap_or("")),
         other => other.to_string(),
     };
