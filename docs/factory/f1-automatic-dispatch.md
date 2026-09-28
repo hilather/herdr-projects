@@ -1,6 +1,6 @@
 # F1 automatic verification and integration dispatch
 
-Status: cards 1–2 merged (#42, #48), card 3 done, card 4 open. Planned 27 September 2026. Scope is the dependent vertical slice (F1):
+Status: cards 1–3 merged (#42, #48, #49), card 4 done; the live F1.7 check is next. Planned 27 September 2026. Scope is the dependent vertical slice (F1):
 verified worker results are integrated automatically and release dependents.
 Each card is one reviewable PR. Work stops at each card's stop condition; gaps
 found along the way are recorded as new cards, not folded into the current one.
@@ -82,7 +82,7 @@ template. Stored verification/integration receipts already write
 - Out of scope: remote push, pull requests, feedback routing (F1.6).
 - Stop: that test and the integration subset pass.
 
-### 4. Dependent release through the ticker
+### 4. Dependent release through the ticker — done
 
 - Mostly test code; glue only where the chain breaks.
 - E2E first: `ticker_auto_chain_releases_verified_integrated_and_fan_in_dependents`.
@@ -92,6 +92,10 @@ template. Stored verification/integration receipts already write
   restart mid-chain produces no duplicates.
 - Stop: that test passes, one full suite run is green, and a gate note records
   that this is fixture-only evidence.
+- Result: no production glue was needed. Consumers carry queue edges only (no
+  signed consumer contract), and factory admission stays off, so a released
+  edge reports `admission_disabled:<edge>` instead of missing evidence. Gate
+  note: `docs/reviews/2026-09-27-f1-fixture-gate.md`.
 
 ## F1.7 live check (needs explicit authorization to spend)
 

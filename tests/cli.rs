@@ -1893,10 +1893,11 @@ impl VerifyFixture {
         let installed=hp(self.home.path(),&["--root",self.r(),"task","demo","contract","put","--input-file",doc_path.to_str().unwrap(),"--signature",doc_path.with_extension("json.sig").to_str().unwrap()]);
         assert!(installed.status.success(),"{}",String::from_utf8_lossy(&installed.stderr));let installed:serde_json::Value=serde_json::from_slice(&installed.stdout).unwrap();
         let objects=self.git(&["rev-list","--objects","--all"]).lines().map(|line|{let oid=line.split_whitespace().next().unwrap();serde_json::json!({"oid":oid,"relative_path":format!("{}/{}",&oid[..2],&oid[2..])})}).collect::<Vec<_>>();
+        // Every worker claims success; only verification evidence may release anything.
         let submission=self.home.path().join(format!("{task}-result.json"));
         fs::write(&submission,serde_json::to_vec(&serde_json::json!({"idempotency_key":format!("{task}-key"),"task_id":task,"contract_revision":1,"contract_digest":installed["digest"],"attempt_id":format!("{task}-attempt"),
             "repository":repository,"base_oid":self.base,"candidate_oid":candidate,"object_format":"sha256",
-            "artifact_manifest":[{"path":"src/lib.rs","oid":candidate}],"claimed_checks":[],"objects":objects})).unwrap()).unwrap();
+            "artifact_manifest":[{"path":"src/lib.rs","oid":candidate}],"claimed_checks":["all checks passed"],"objects":objects})).unwrap()).unwrap();
         let submitted=hp(self.home.path(),&["--root",self.r(),"result","demo","submit","--input-file",submission.to_str().unwrap()]);
         assert!(submitted.status.success(),"{}",String::from_utf8_lossy(&submitted.stderr));
         serde_json::from_slice::<serde_json::Value>(&submitted.stdout).unwrap()["submission_id"].as_str().unwrap().to_owned()
@@ -2125,6 +2126,112 @@ fn ticker_auto_integrates_two_results_serially_and_recovers_stale_and_crash() {
     assert_eq!(tip(),moved,"the moved ref is not overwritten");assert_eq!(integrated(),2);
     assert_eq!(f.db().query_row("SELECT count(*) FROM integration_operations",[],|row|row.get::<_,u64>(0)).unwrap(),2,"nothing is rebuilt");
     assert_eq!(pending(),0);
+}
+
+#[cfg(all(feature="state-store",target_os="linux"))]
+#[test]
+fn ticker_auto_chain_releases_verified_integrated_and_fan_in_dependents() {
+    use std::{io::{Read,Write},sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering}}};
+    use herdr_projects::{migration,runtime,domain::TaskId,operations::DeliveryState};
+    // Only `a`'s policy speaks git's native protocol to this local fixture: its
+    // first connection is verification, its second the integration candidate
+    // check, which is held so the ticker can be killed between the two.
+    let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();let port=listener.local_addr().unwrap().port();
+    let held=Arc::new(AtomicBool::new(true));let connections=Arc::new(AtomicUsize::new(0));
+    {let held=held.clone();let connections=connections.clone();std::thread::spawn(move||for stream in listener.incoming(){
+        let Ok(mut stream)=stream else{continue};let index=connections.fetch_add(1,Ordering::SeqCst);let held=held.clone();
+        std::thread::spawn(move||{let mut buffer=[0u8;4096];let _=stream.read(&mut buffer);while index==1&&held.load(Ordering::SeqCst){std::thread::sleep(std::time::Duration::from_millis(10));}let _=stream.write_all(b"0000");let _=stream.read(&mut buffer);});
+    });}
+    let lib="pub fn result() {}\n";
+    let f=VerifyFixture::new(&[("src/lib.rs",lib.into()),("src/a.txt","a\n".into())]);
+    f.git(&["checkout","-q","-b","e",&f.base]);std::fs::write(f.repo.join("src/lib.rs"),lib).unwrap();std::fs::write(f.repo.join("src/e.txt"),"e\n").unwrap();
+    f.git(&["add","."]);f.git(&["commit","-qm","e"]);let e_candidate=f.git(&["rev-parse","HEAD"]);
+    let clean=[("clean",r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#.to_owned())];
+    let waits=[("waits",format!(r#"{{"version":1,"checks":["/usr/bin/git","ls-remote","git://127.0.0.1:{port}/fixture"]}}"#))];
+    // Both workers submit and claim success; that claim is all that exists so far.
+    let a=f.submit("a",&waits);let e=f.submit_at("e",&clean,&e_candidate);
+    for (consumer,edges) in [("b",vec![("a","verified_result")]),("c",vec![("a","integrated_commit")]),("d",vec![("a","integrated_commit"),("e","integrated_commit")])] {
+        let head=runtime::add_task(&f.project,TaskId::new(consumer).unwrap(),format!("consumer {consumer}"),runtime::snapshot(&f.project).unwrap().head).unwrap();
+        let request=f.home.path().join(format!("{consumer}-queue.json"));
+        std::fs::write(&request,serde_json::json!({"priority":0,"dependencies":edges.iter().map(|(p,r)|serde_json::json!({"predecessor":p,"requirement":r})).collect::<Vec<_>>()}).to_string()).unwrap();
+        let queued=hp(f.home.path(),&["--root",f.r(),"task","demo","queue",consumer,"--input-file",request.to_str().unwrap(),"--expected-revision","1","--expected-head",&head.to_string()]);
+        assert!(queued.status.success(),"{}",String::from_utf8_lossy(&queued.stderr));
+    }
+    const TARGET:&str="refs/heads/integration";
+    f.git(&["branch","integration",&f.base]);
+    let configured=hp(f.home.path(),&["--root",f.r(),"result","demo","configure-integration","--repository",f.repo.to_str().unwrap(),"--reference",TARGET]);
+    assert!(configured.status.success(),"{}",String::from_utf8_lossy(&configured.stderr));
+    // Dependency blockers of one queued consumer, sorted. Factory admission stays
+    // off (the default), so an edge whose evidence counts reports only
+    // `admission_disabled:<edge>`; missing evidence reports `..._unavailable`.
+    let dependency=|task:&str|{
+        let out=hp(f.home.path(),&["--root",f.r(),"scheduler","demo","inspect"]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+        let report:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();
+        let entry=report["entries"].as_array().unwrap().iter().find(|entry|entry["task"]==task).unwrap().clone();
+        let mut found=entry["blockers"].as_array().unwrap().iter().map(|s|s.as_str().unwrap().to_owned())
+            .filter(|s|["verified_dependency_evidence_unavailable:","predecessor_failed:","admission_disabled:"].iter().any(|p|s.starts_with(p))).collect::<Vec<_>>();
+        found.sort();found
+    };
+    let missing=|p:&str,r:&str|format!("verified_dependency_evidence_unavailable:{p}:{r}");
+    let counts=|r:&str|format!("admission_disabled:{r}");
+    let satisfactions=||f.db().prepare("SELECT task_id,predecessor_task,requirement,state,evidence_id FROM dependency_satisfactions ORDER BY task_id,predecessor_task,requirement,created_unix_ms")
+        .unwrap().query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    let count=|sql:&str|f.db().query_row(sql,[],|row|row.get::<_,u64>(0)).unwrap();
+    // No false release: submissions and worker success claims release nothing.
+    assert_eq!(dependency("b"),[missing("a","verified_result")]);
+    assert_eq!(dependency("c"),[missing("a","integrated_commit")]);
+    assert_eq!(dependency("d"),[missing("a","integrated_commit"),missing("e","integrated_commit")]);
+    assert!(satisfactions().is_empty());assert_eq!(count("SELECT count(*) FROM verification_runs"),0);
+    for switch in ["--verify","--integrate"] {
+        let head=runtime::snapshot(&f.project).unwrap().head.to_string();
+        let out=hp(f.home.path(),&["--root",f.r(),"result","demo","auto",switch,"on","--expected-head",&head]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    }
+    let job=|submission:&str|{let snapshot=runtime::snapshot(&f.project).unwrap();snapshot.operations.into_iter().find(|op|op.kind=="integration.run"&&op.payload["submission_id"]==submission)
+        .map(|op|{let d=snapshot.deliveries.iter().find(|d|d.operation==op.id).unwrap().clone();(op,d)})};
+    let integrated_by=|task:&str|f.db().prepare("SELECT i.integrated_id,i.commit_oid FROM integrated_commits i JOIN integration_operations o ON o.operation_id=i.operation_id
+        JOIN verified_results v ON v.result_id=o.verified_result_id JOIN verification_runs r ON r.run_id=v.run_id WHERE r.task_id=?1").unwrap()
+        .query_map([task],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    let verified=|submission:&str|f.db().query_row("SELECT result_id FROM verified_results WHERE submission_id=?1",[submission],|row|row.get::<_,String>(0)).unwrap();
+    // Only the ticker works from here. It is killed while `a` is verified but not yet integrated.
+    let mut child=f.spawn();
+    f.wait(&mut child,150,&||connections.load(Ordering::SeqCst)>=2&&job(&a).is_some_and(|(_,d)|d.state==DeliveryState::Claimed));
+    assert!(integrated_by("a").is_empty());
+    let a_result=verified(&a);
+    assert_eq!(dependency("b"),[counts("verified_result")],"a verified result releases its dependent before integration");
+    assert_eq!(dependency("c"),[missing("a","integrated_commit")],"verification alone does not release an integrated-commit edge");
+    assert!(dependency("d").contains(&missing("a","integrated_commit")));
+    let rows=satisfactions();
+    assert_eq!(rows[0],("b".into(),"a".into(),"verified_result".into(),"valid".into(),a_result.clone()));
+    assert!(rows.iter().all(|(task,predecessor,..)|task=="b"||(task=="d"&&predecessor=="e")),"{rows:?}");
+    child.0.kill().unwrap();child.0.wait().unwrap();held.store(false,Ordering::SeqCst);
+    let (_,claimed)=job(&a).unwrap();assert_eq!(claimed.state,DeliveryState::Claimed);assert!(integrated_by("a").is_empty());
+    migration::open_active(&f.project).unwrap().expire_claims(claimed.lease_until_ms.unwrap()+1).unwrap();
+    let mut child=f.spawn();
+    f.wait(&mut child,150,&||[&a,&e].iter().all(|s|job(s).is_some_and(|(_,d)|d.state==DeliveryState::Confirmed)));
+    f.stop(&mut child);
+    // One run, one verified result, one integration and one publication per predecessor, across the kill.
+    assert_eq!(count("SELECT count(*) FROM verification_runs"),2);assert_eq!(count("SELECT count(*) FROM verified_results"),2);
+    assert_eq!(count("SELECT count(*) FROM integration_operations"),2);assert_eq!(count("SELECT count(*) FROM integrated_commits"),2);
+    assert!(f.jobs().iter().all(|(_,d)|d.state==DeliveryState::Confirmed&&d.attempts==1));assert_eq!(job(&a).unwrap().1.attempts,2);
+    let (a_integrated,a_commit)=integrated_by("a").pop().unwrap();let (e_integrated,e_commit)=integrated_by("e").pop().unwrap();
+    let tip=f.git(&["rev-parse",TARGET]);
+    // The integrated-commit dependent is released on `a`'s integrated SHA, which carries `a`'s result.
+    assert_eq!(dependency("c"),[counts("integrated_commit")]);
+    assert_eq!(f.git(&["rev-parse",&format!("{a_commit}^2")]),f.candidate);assert_eq!(f.git(&["show",&format!("{a_commit}:src/a.txt")]),"a");
+    // The fan-in dependent is released only with both, on a tip containing both.
+    assert_eq!(dependency("d"),[counts("integrated_commit"),counts("integrated_commit")]);
+    for commit in [&a_commit,&e_commit,&f.candidate,&e_candidate] {f.git(&["merge-base","--is-ancestor",commit,&tip]);}
+    assert!(tip==a_commit||tip==e_commit);
+    assert_eq!(dependency("b"),[counts("verified_result")]);
+    let valid=|t:&str,p:&str,r:&str,evidence:&str|(t.to_owned(),p.to_owned(),r.to_owned(),"valid".to_owned(),evidence.to_owned());
+    assert_eq!(satisfactions(),[valid("b","a","verified_result",&a_result),valid("c","a","integrated_commit",&a_integrated),
+        valid("d","a","integrated_commit",&a_integrated),valid("d","e","integrated_commit",&e_integrated)],"exactly one satisfaction per edge");
+    // Independent check: a fresh clone of the target ref holds both results and passes the policy.
+    let clone=f.home.path().join("fresh");let clone=clone.to_str().unwrap();
+    f.git(&["clone","-q","--branch","integration",f.repo.to_str().unwrap(),clone]);
+    assert_eq!(f.git(&["-C",clone,"rev-parse","HEAD"]),tip);
+    f.git(&["-C",clone,"diff","--quiet"]);
+    assert_eq!(f.git(&["-C",clone,"ls-files"]).lines().collect::<Vec<_>>(),["src/a.txt","src/base.txt","src/e.txt","src/lib.rs"]);
 }
 
 #[cfg(feature="state-store")]
