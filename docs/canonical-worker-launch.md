@@ -334,7 +334,11 @@ are required before recording the start receipt.
 
 Naming fences only the target pane's own agent entry, so other workers on the
 same Herdr server may change status meanwhile; no other agent may hold the
-target's name. A lost acknowledgment leaves the naming intent intact.
+target's name. Within that entry, only the state a starting agent moves itself
+may change: its terminal title (Codex animates a spinner there for several
+seconds), `agent_status`, `focused`, and the `state_change_seq`/`revision`
+counters, which may only increase. Every other field, including pane, terminal,
+cwd, foreground cwd, kind, name and any field Herdr adds later, must be equal. A lost acknowledgment leaves the naming intent intact.
 `reconcile_start` observes the expected name without renewed authority. If the
 intent is recorded but the exact target agent is still unnamed, recovery sends the
 same rename once more, which is idempotent; a different name is refused. If the

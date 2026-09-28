@@ -123,6 +123,18 @@ if r['method']=='ping':
 elif r['method']=='agent.list':
  if mode=='busy':a['agent_status']='working'
  if mode=='foreign':a['terminal_id']='foreign'
+ # The target's own entry as a starting Codex TUI shows it: an animated title,
+ # status and change counters move on every read ('drift' names an identity
+ # field that moves too).
+ churn=root/'own-entry-churn'
+ if churn.exists():
+  n=int((root/'churn-reads').read_text())+1 if (root/'churn-reads').exists() else 1
+  (root/'churn-reads').write_text(str(n))
+  a.update({{'terminal_title':'⠋⠙⠹'[n%3]+' work','terminal_title_stripped':'work','revision':n,'state_change_seq':n//2,
+   'agent_status':['unknown','working'][n%2],'focused':n%2==0,'foreground_cwd':str(project)}})
+  drift=churn.read_text()
+  if drift=='revision':a['revision']=1000-n
+  elif drift:a[drift]=str(project)+'/'+str(n)
  result={{'type':'agent_list','agents':[a]}}
  # Another worker on the same server, whose status changes on every read.
  if (root/'shared-server-agent').exists():
@@ -3003,6 +3015,33 @@ fn resume_launch(f: &Fixture) -> Result<Option<LaunchStartedReceipt>> {
             reconcile_launch(&f.project, &hint.operation.id, hint.delivery_revision, deadline, Default::default())?;
             Ok(runtime::snapshot(&f.project)?.events.iter().find(|e| e.kind == "runtime.launch_started").map(|e| serde_json::from_value(e.payload.clone()).unwrap()))
         }
+    }
+}
+
+#[test]
+fn a_starting_agent_whose_own_display_state_moves_is_named_once_but_identity_drift_is_refused() {
+    let requests = |f: &Fixture| fs::read_to_string(f._root.path().join("name-requests")).unwrap_or_default().lines().count();
+    let name = |f: &Fixture| serde_json::from_slice::<Value>(&fs::read(f._root.path().join("agent.json")).unwrap()).unwrap()["name"].clone();
+    let events = |f: &Fixture, kind: &str| runtime::snapshot(&f.project).unwrap().events.iter().filter(|e| e.kind == kind).count();
+    for drift in ["", "foreground_cwd", "cwd", "revision"] {
+        let mut f = Fixture::new("resource-release");
+        fs::write(f._root.path().join("own-entry-churn"), drift).unwrap();
+        let result = advance_released_launch(&mut f);
+        let attempt = runtime::snapshot(&f.project).unwrap().attempts[0].id.clone();
+        if drift.is_empty() {
+            // Title spinner, status and counters moved between the inventory
+            // and the rename; the worker is still named once and started.
+            let receipt = result.unwrap_or_else(|e| panic!("{e:#}")).unwrap();
+            assert_eq!(receipt.attempt, attempt);
+            assert_eq!(name(&f), json!(worker_agent_name(&attempt)));
+            assert_eq!((requests(&f), events(&f, "runtime.launch_name"), events(&f, "runtime.launch_started")), (1, 1, 1));
+            continue;
+        }
+        // An identity field moved (or a counter went back): nothing is renamed.
+        let error = result.unwrap_err();
+        assert!(format!("{error:#}").contains(if drift == "cwd" { "identity" } else { "changed before naming" }), "{drift}: {error:#}");
+        assert_eq!((requests(&f), name(&f)), (0, Value::Null), "{drift}");
+        assert_eq!((events(&f, "runtime.launch_name"), events(&f, "runtime.launch_started")), (0, 0), "{drift}");
     }
 }
 

@@ -240,11 +240,14 @@ fn finish_start(
                 worktrees.check()?;
                 process.check()?;
                 // Only the target's own entry is fenced; other agents on the
-                // same server may change status meanwhile.
+                // same server may change status meanwhile, and the target's
+                // own display state moves while the agent starts.
                 let current = rename_native.call(operation.as_str(), "agent.list", json!({}))?;
+                let now_agent = target_agent(&current, &target.route.pane_id, &receipt.agent.name)?;
                 ensure!(
-                    target_agent(&current, &target.route.pane_id, &receipt.agent.name)? == agent,
-                    "native agent changed before naming"
+                    same_agent(&agent, &now_agent),
+                    "native agent changed before naming ({})",
+                    entry_change(&agent, &now_agent)
                 );
                 worktrees.check()?;
                 process.check()?;
@@ -307,6 +310,78 @@ fn finish_start(
         now(),
     )?;
     Ok(receipt)
+}
+
+/// Fields of the target's own entry that an agent changes while it starts:
+/// its terminal title (Codex animates a spinner there), detected status, focus
+/// and the server's change counters. Every other field, including any Herdr adds
+/// later, is identity and must stay exactly equal.
+const VOLATILE_AGENT_FIELDS: [&str; 6] = [
+    "agent_status",
+    "terminal_title",
+    "terminal_title_stripped",
+    "focused",
+    "state_change_seq",
+    "revision",
+];
+
+/// The same live agent: identity fields are equal, and change counters only
+/// move forward (a reset means a different incarnation).
+fn same_agent(before: &Value, after: &Value) -> bool {
+    let (Some(b), Some(a)) = (before.as_object(), after.as_object()) else {
+        return false;
+    };
+    let identity = |o: &serde_json::Map<String, Value>| {
+        o.iter()
+            .filter(|(k, _)| !VOLATILE_AGENT_FIELDS.contains(&k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<serde_json::Map<_, _>>()
+    };
+    let forward = |key: &str| match (b.get(key), a.get(key)) {
+        (None, None) => true,
+        (Some(old), Some(new)) => old
+            .as_u64()
+            .zip(new.as_u64())
+            .is_some_and(|(old, new)| new >= old),
+        _ => false,
+    };
+    identity(b) == identity(a) && forward("state_change_seq") && forward("revision")
+}
+
+/// Name the fields that differ (bounded); values only for small state flags.
+fn entry_change(before: &Value, after: &Value) -> String {
+    let empty = serde_json::Map::new();
+    let (b, a) = (
+        before.as_object().unwrap_or(&empty),
+        after.as_object().unwrap_or(&empty),
+    );
+    let mut keys: Vec<&String> = b.keys().chain(a.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    keys.into_iter()
+        .filter(|k| b.get(*k) != a.get(*k))
+        .take(16)
+        .map(|k| {
+            let show = |v: Option<&Value>| match v {
+                Some(v @ (Value::Bool(_) | Value::Null | Value::Number(_))) => v.to_string(),
+                Some(Value::String(s))
+                    if s.len() <= 16
+                        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+                {
+                    s.clone()
+                }
+                Some(_) => "<value>".into(),
+                None => "<absent>".into(),
+            };
+            format!(
+                "{}: {} -> {}",
+                k.chars().take(40).collect::<String>(),
+                show(b.get(k)),
+                show(a.get(k))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Select the target pane's single agent entry. Other agents on the same server
