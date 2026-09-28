@@ -140,10 +140,9 @@ impl Fixture {
 fn attempt_usage(report: &serde_json::Value) -> serde_json::Value { report["attempts"][0]["usage"].clone() }
 fn unavailable(reason: &str) -> serde_json::Value { serde_json::json!({"status": "unavailable", "reason": reason}) }
 
-/// Gate: `0.154.0` is certified only by the live run (card S5/S7); until then
-/// counters are not persisted and this test fails. No test hook certifies it.
+/// Gate: `0.154.0` is certified only by the live run (card S5,
+/// docs/telemetry/codex-live-0.154.0.md); no test hook certifies it.
 #[test]
-#[ignore = "gate: passes only after the live run certifies codex 0.154.0"]
 fn codex_usage_binds_and_sums_exactly() {
     let f = Fixture::new();
     let path = f.rollout(&f.home, SID, &["head.jsonl"], &f.worktree(), f.decided + 1_000, "0.154.0");
@@ -226,6 +225,24 @@ fn uncertified_version_keeps_no_counters() {
     assert_eq!(f.count("codex_discrepancy"), 0);
     assert_eq!(attempt_usage(&report), unavailable("cli_version_uncertified"));
     assert_eq!(report["sessions"][0]["certified"], false);
+}
+
+/// Found by the 0.154.0 live run: rows collected while the version was still
+/// uncertified keep NULL counters; certifying it later must not turn them into 0.
+#[test]
+fn records_collected_before_certification_stay_unavailable() {
+    let f = Fixture::new();
+    f.rollout(&f.home, SID, &["head.jsonl", "tail.jsonl"], &f.worktree(), f.decided + 1_000, "0.154.0");
+    f.cli("collect");
+    // The rows exactly as an uncertified collect stored them (`uncertified_version_keeps_no_counters`).
+    f.sidecar().execute("UPDATE codex_usage SET accepted=0,reason='cli_version_uncertified',cache_write_input_tokens=NULL,cached_input_tokens=NULL,
+        input_tokens=NULL,output_tokens=NULL,reasoning_output_tokens=NULL,total_tokens=NULL", []).unwrap();
+    let (report, _) = f.cli("collect");
+    assert_eq!(report["collected"]["records"], 0, "nothing is re-read past the offset");
+    assert_eq!(attempt_usage(&report), unavailable("cli_version_uncertified"));
+    assert_eq!(attempt_usage(&f.cli("usage").0), unavailable("cli_version_uncertified"));
+    let metrics = f.report();
+    assert_eq!(metric(&metrics, "M08")["value"], unavailable("no_certified_source"));
 }
 
 #[test]
@@ -363,10 +380,9 @@ fn golden_acceptance_and_amplification() {
     assert!(text.lines().any(|l| l.starts_with("M31 ") && l.contains("n/a")), "{text}");
 }
 
-/// Gate like `codex_usage_binds_and_sums_exactly`: counters exist only once
-/// the live run certifies codex 0.154.0; no test hook certifies it.
+/// Gate like `codex_usage_binds_and_sums_exactly`: counters exist only because
+/// the live run certified codex 0.154.0; no test hook certifies it.
 #[test]
-#[ignore = "gate: passes only after the live run certifies codex 0.154.0"]
 fn usage_metrics_follow_certified_sources() {
     let f = Fixture::new();
     f.rollout(&f.home, SID, &["head.jsonl", "tail.jsonl"], &f.worktree(), f.decided + 1_000, "0.154.0");

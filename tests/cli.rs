@@ -3087,8 +3087,11 @@ fn live_f1_worker_result_integrates_and_dependent_launches_on_integrated_sha() {
         let Ok(mut stream)=stream else{continue};let index=connections.fetch_add(1,Ordering::SeqCst);let held=held.clone();
         std::thread::spawn(move||{let mut buffer=[0u8;4096];let _=stream.read(&mut buffer);while index==1&&held.load(Ordering::SeqCst){std::thread::sleep(Duration::from_millis(10));}let _=stream.write_all(b"0000");let _=stream.read(&mut buffer);});
     });}
-    let f=VerifyFixture::with_worker(&[("src/start.txt","disposable F1.7 repository\n".into())],
+    let mut f=VerifyFixture::with_worker(&[("src/start.txt","disposable F1.7 repository\n".into())],
         "kind='codex'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=1200\nunknown_usage='allow_with_warning'\n");
+    // `HP_LIVE_F1_KEEP=1` keeps the disposable project and execution home, pass
+    // or fail, for the telemetry live certification; the login copy is always removed.
+    if std::env::var_os("HP_LIVE_F1_KEEP").is_some() {f.home.disable_cleanup(true);say(&format!("keeping: --root {} (HOME {})",f.r(),f.home.path().display()));}
     let start=f.candidate.clone();let branch=f.git(&["symbolic-ref","--short","HEAD"]);
     let repository=f.repo.canonicalize().unwrap();
     let head=||runtime::snapshot(&f.project).unwrap().head;
@@ -3114,6 +3117,7 @@ fn live_f1_worker_result_integrates_and_dependent_launches_on_integrated_sha() {
         // Any supervised worker carries its unique execution home in its argv.
         let _=Command::new("/usr/bin/pkill").args(["-KILL","-f"]).arg(&self.agent_home).status();
         for server in &mut self.servers{let _=server.kill();let _=server.wait();}
+        let _=fs::remove_file(self.agent_home.join(".codex/auth.json"));
     }}
     let mut cleanup=Cleanup{servers:Vec::new(),agent_home:agent_home.clone()};
     let (herdr,agent)=if live {
@@ -3372,12 +3376,15 @@ fn live_f1_worker_result_integrates_and_dependent_launches_on_integrated_sha() {
         if out.status.success() {break;}
         assert!(["Conflict","owns lock","retry"].iter().any(|s|stderr.contains(s))&&Instant::now()<deadline,"{stderr}");std::thread::sleep(Duration::from_millis(200));
     }}
-    f.wait(&mut child,180,&||runtime::snapshot(&f.project).unwrap().attempts.iter().filter(|x|[&a_attempt,&b_attempt].contains(&&x.id.as_str().to_owned())).all(|x|x.termination_observed));
+    // Termination can publish control state while this reads; a torn read retries.
+    f.wait(&mut child,180,&||runtime::snapshot(&f.project).is_ok_and(|s|s.attempts.iter().filter(|x|[&a_attempt,&b_attempt].contains(&&x.id.as_str().to_owned())).all(|x|x.termination_observed)));
     f.stop(&mut child);
     for kind in ["runtime.launch_started","runtime.worker_terminated"] {assert_eq!(events(kind),2,"{kind}");}
     let brief=runtime::snapshot(&f.project).unwrap();
     let confirmed=brief.operations.iter().filter(|o|o.kind=="runtime.worker_brief").filter(|o|brief.deliveries.iter().any(|d|d.operation==o.id&&d.state==DeliveryState::Confirmed)).count();
     assert_eq!(confirmed,2,"each worker received its brief once");
+    // The workers are terminated: the private login copy is no longer needed.
+    if live {let _=fs::remove_file(agent_home.join(".codex/auth.json"));}
     if live {
         // Sanitized transcript: only the workers' shell commands and final replies.
         let mut rollouts=Vec::new();let mut stack=vec![agent_home.join(".codex/sessions")];
@@ -3401,6 +3408,7 @@ fn live_f1_worker_result_integrates_and_dependent_launches_on_integrated_sha() {
     }
     say(&format!("PASS: a integrated {a_commit}; s recovered {tip}; b base {a_commit}; launches {}",events("runtime.launch_started")));
     drop(cleanup);
+    assert!(!agent_home.join(".codex/auth.json").exists(),"the login copy is removed");
 }
 
 #[cfg(feature="state-store")]

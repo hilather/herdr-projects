@@ -324,6 +324,10 @@ S5 refinements:
 - Attempt `usage`: `collection_not_run` without a sidecar, `adapter_absent`
   for non-Codex kinds, then `not_bound`, `quarantined`,
   `cli_version_uncertified`, else sums of accepted records plus `records`.
+- Certified: `0.154.0` (live run, [codex-live-0.154.0.md](codex-live-0.154.0.md)).
+  Rows stored while their version was uncertified are not re-read after
+  certification; a session holding any keeps attempt usage and the S6
+  metrics at `cli_version_uncertified`, never `0`.
 - Rule 4 `ambiguous` cannot arise within one project because worktree
   directories are attempt-unique; it stays as a guard. Several rollouts bound
   to one attempt (guardian, resume) all count.

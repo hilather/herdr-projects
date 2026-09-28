@@ -72,7 +72,11 @@ pub fn report(project: &Path) -> Result<Value> {
 }
 
 pub(super) fn attempt_usage(db: &Connection, attempt: &str) -> Result<Value> {
-    let bound: Vec<(String, String, bool)> = db.prepare("SELECT DISTINCT session_id,cli_version,EXISTS(SELECT 1 FROM codex_quarantine q WHERE q.session_id=s.session_id)
+    // Records collected before their version was certified keep NULL counters,
+    // so the session stays uncertified rather than summing to 0.
+    let bound: Vec<(String, String, bool)> = db.prepare("SELECT DISTINCT session_id,
+        CASE WHEN EXISTS(SELECT 1 FROM codex_usage u WHERE u.session_id=s.session_id AND u.reason='cli_version_uncertified') THEN '' ELSE cli_version END,
+        EXISTS(SELECT 1 FROM codex_quarantine q WHERE q.session_id=s.session_id)
         FROM rollout_sources s WHERE binding='bound' AND attempt_id=?1")?
         .query_map([attempt], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
     if bound.is_empty() {

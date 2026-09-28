@@ -93,7 +93,10 @@ fn usage_metrics(sidecar: Option<&Connection>, attempts: &[Attempt], since: Opti
     };
     // (session, binding, attempt, certified, quarantined, records, accepted records, session start)
     type Source = (String, String, Option<String>, bool, bool, i64, i64, Option<i64>);
-    let sources: Vec<Source> = db.prepare("SELECT s.session_id,s.binding,s.attempt_id,s.cli_version,EXISTS(SELECT 1 FROM codex_quarantine q WHERE q.session_id=s.session_id),
+    // Records collected before their version was certified keep NULL counters:
+    // such a source stays uncertified (see `sidecar::attempt_usage`).
+    let sources: Vec<Source> = db.prepare("SELECT s.session_id,s.binding,s.attempt_id,
+        CASE WHEN EXISTS(SELECT 1 FROM codex_usage u WHERE u.path_digest=s.path_digest AND u.reason='cli_version_uncertified') THEN '' ELSE s.cli_version END,EXISTS(SELECT 1 FROM codex_quarantine q WHERE q.session_id=s.session_id),
         s.records,(SELECT count(*) FROM codex_usage u WHERE u.path_digest=s.path_digest AND u.accepted=1),s.session_unix_ms FROM rollout_sources s ORDER BY s.path_digest")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, super::codex::certified(&r.get::<_, String>(3)?), r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?
         .collect::<rusqlite::Result<_>>()?;

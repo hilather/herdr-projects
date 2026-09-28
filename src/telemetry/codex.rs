@@ -10,8 +10,9 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-/// Versions whose counters are accepted. Empty until the live run certifies one (card S5/S7).
-pub const CERTIFIED: &[&str] = &[];
+/// Versions whose counters are accepted: each certified by a live run
+/// (`0.154.0`: docs/telemetry/codex-live-0.154.0.md).
+pub const CERTIFIED: &[&str] = &["0.154.0"];
 /// Longest line parsed; longer lines are skipped whole without being retained.
 const MAX_LINE: u64 = 16 << 20;
 const MAX_DEPTH: usize = 4;

@@ -104,11 +104,13 @@ Stop if a transition path exists that baseline §1 does not list (add it first).
 
 ## S5 — Codex usage adapter (sidecar)
 
-**Done, live certification pending (S7).** `telemetry <slug> collect|usage`
-and a ticker hook (once per 300 s, 8 MiB) write `telemetry.db` (0001);
-`CERTIFIED` is empty, so `codex_usage_binds_and_sums_exactly` is `#[ignore]`d
-as the gate and every Codex attempt reads `cli_version_uncertified`. Outcome
-`usage` wiring waits for S3. Refinements in contracts §5.
+**Done; live certification done** ([codex-live-0.154.0.md](codex-live-0.154.0.md)).
+`telemetry <slug> collect|usage` and a ticker hook (once per 300 s, 8 MiB)
+write `telemetry.db` (0001); `CERTIFIED = ["0.154.0"]`, and the gate test
+`codex_usage_binds_and_sums_exactly` runs un-ignored. A session holding rows
+collected before certification stays `cli_version_uncertified` (never `0`).
+Outcome `usage` wiring (`telemetry attempts`) is still not done: follow-up.
+Refinements in contracts §5.
 
 Goal: `herdr-projects telemetry <slug> collect` scans Codex execution homes,
 binds rollouts, writes `telemetry.db` idempotently; outcome `usage` reads it.
@@ -143,9 +145,8 @@ worktree, a subset rule fails, or ordinals restart within one file.
 
 **Done.** `telemetry <slug> report [--json|--text] [--since MS]` reads
 `state.db` read-only and the sidecar if present; nothing is written. Like S5's
-gate, `usage_metrics_follow_certified_sources` is `#[ignore]`d until `0.154.0`
-is certified (it passes with the version certified locally). Refinements in
-contracts §6.
+gate, `usage_metrics_follow_certified_sources` runs un-ignored since `0.154.0`
+was certified. Refinements in contracts §6.
 
 Goal: `herdr-projects telemetry <slug> report [--json|--text] [--since MS]`
 for M02, M07, M08, M09, M13, M15, M40; M31–M33 listed unavailable. Files:
@@ -186,8 +187,10 @@ plus a `doctor` line for sidecar presence and last collect age. Files:
   not run", exit 0, nothing written.
 Stop if the panel would write, launch, or read content outside contracts §7.
 
-**Owner review gate** after S7: scratch-project demo, S5 live evidence,
-`attempts = dispatch_decisions`, zero canaries; contracts §8 stays deferred.
+**Owner review gate** after S7: scratch-project demo, S5 live evidence
+(done: `0.154.0` certified, zero canaries, see
+[codex-live-0.154.0.md](codex-live-0.154.0.md)),
+`attempts = dispatch_decisions`; contracts §8 stays deferred.
 
 **Follow-ups found in S7:** the panel and S6 report open the canonical store
 `immutable` when no `-wal` file exists (a plain read-only open of a WAL
