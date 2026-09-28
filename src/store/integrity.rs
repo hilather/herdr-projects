@@ -3,7 +3,9 @@
 //! Administrative opens always run the check. Hot-path (scoped) opens run it
 //! only when no check is recorded for the current schema version, so a
 //! controller poll or a targeted command does not scan the whole database.
-//! The ticker repeats it once per interval (`migration::periodic_integrity_check`).
+//! The ticker repeats it once per interval (`migration::periodic_integrity_check`)
+//! off its hot pass, one table at a time so a large store resumes where a
+//! budgeted run stopped.
 use super::{Result, SqliteStore, StoreError};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
@@ -18,8 +20,12 @@ const MAX_BYTES: u64 = 512;
 pub struct IntegrityRecord {
     pub checked_unix_ms: i64,
     pub schema: u32,
-    /// `ok` or `corrupt`. Details are not retained: they can echo row bytes.
+    /// `ok`, `corrupt` or `incomplete`. Details are not retained: they can
+    /// echo row bytes.
     pub result: String,
+    /// For `incomplete`: the first table the resumed check still has to cover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_table: Option<String>,
 }
 
 pub fn record_path(db: &Path) -> PathBuf {
@@ -39,7 +45,7 @@ pub fn load(db: &Path) -> Option<IntegrityRecord> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn save(db: &Path, record: &IntegrityRecord) -> Result<()> {
+pub(crate) fn save(db: &Path, record: &IntegrityRecord) -> Result<()> {
     let io = |error: std::io::Error| StoreError::Io(error.to_string());
     let path = record_path(db);
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
@@ -71,13 +77,42 @@ pub(crate) fn check_and_record(db: &Path, store: &SqliteStore) -> Result<()> {
         Err(StoreError::Corrupt(_)) => "corrupt",
         Err(_) => return result,
     };
-    save(db, &IntegrityRecord { checked_unix_ms: jiff::Timestamp::now().as_millisecond(), schema, result: outcome.into() })?;
+    save(db, &IntegrityRecord::now(schema, outcome, None))?;
     result
+}
+
+impl IntegrityRecord {
+    pub(crate) fn now(schema: u32, result: &str, next_table: Option<String>) -> Self {
+        Self { checked_unix_ms: jiff::Timestamp::now().as_millisecond(), schema, result: result.into(), next_table }
+    }
+}
+
+/// Every table, in the order the resumable check covers them.
+pub(crate) fn tables(store: &SqliteStore) -> Result<Vec<String>> {
+    let mut statement = store.connection.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")?;
+    let names = statement.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(std::iter::once("sqlite_schema".to_string()).chain(names).collect())
+}
+
+/// `quick_check` and `foreign_key_check` limited to one table and its
+/// indexes. Unlike the whole-store form it skips free-page accounting, which
+/// administrative opens (`doctor`, `factory status`, migration) still cover.
+pub(crate) fn check_table(store: &SqliteStore, table: &str) -> Result<()> {
+    let name = table.replace('\'', "''");
+    let mut statement = store.connection.prepare(&format!("PRAGMA quick_check('{name}')"))?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    if rows != ["ok"] {
+        return Err(StoreError::Corrupt(rows.join("; ")));
+    }
+    if table != "sqlite_schema" && store.connection.prepare(&format!("PRAGMA foreign_key_check('{name}')"))?.query([])?.next()?.is_some() {
+        return Err(StoreError::Corrupt("foreign key violation".into()));
+    }
+    Ok(())
 }
 
 /// Records a failure found before the check could run (for example while opening).
 pub(crate) fn record_corrupt(db: &Path, schema: u32) -> Result<()> {
-    save(db, &IntegrityRecord { checked_unix_ms: jiff::Timestamp::now().as_millisecond(), schema, result: "corrupt".into() })
+    save(db, &IntegrityRecord::now(schema, "corrupt", None))
 }
 
 /// Scoped opens check once after the schema version changes (or while no

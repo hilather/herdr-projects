@@ -78,6 +78,14 @@ pub fn pause_integrity(project: &Path) -> std::io::Result<bool> {
     write_pause(project, INTEGRITY)
 }
 
+/// While an integrity failure stands, queued effect jobs (verification,
+/// integration, finalization, notification) are held as well as admission:
+/// they would act on rows from a store that failed its check. Other pauses
+/// keep already-queued effects running.
+pub fn effects_paused(project: &Path) -> Option<&'static str> {
+    pause_reason(project).filter(|reason| *reason == INTEGRITY)
+}
+
 fn write_pause(project: &Path, reason: &'static str) -> std::io::Result<bool> {
     let path = pause_path(project);
     if let Ok(meta) = fs::symlink_metadata(&path) {

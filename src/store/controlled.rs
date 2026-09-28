@@ -397,8 +397,10 @@ impl ControlledStore {
     fn read<T>(&self,read:impl FnOnce(&SqliteStore)->Result<T>)->Result<T> {
         self.control.check()?;let value=read(&self.store).map_err(|e|self.error(e))?;self.control.check()?;Ok(value)
     }
-    /// Budgeted, cancellable whole-store check whose definite outcome is recorded.
-    pub(crate) fn integrity_check_recorded(&self,path:&Path)->Result<()> {self.read(|s|super::integrity::check_and_record(path,s))}
+    /// Cancellable pieces of the resumable whole-store check.
+    pub(crate) fn integrity_schema(&self)->Result<u32> {self.read(super::integrity::schema)}
+    pub(crate) fn integrity_tables(&self)->Result<Vec<String>> {self.read(super::integrity::tables)}
+    pub(crate) fn integrity_check_table(&self,table:&str)->Result<()> {self.read(|s|super::integrity::check_table(s,table))}
     pub fn project_control(&self)->Result<Option<ProjectControl>> {self.read(SqliteStore::project_control)}
     pub fn import_operation_count(&self)->Result<u64> {self.read(SqliteStore::import_operation_count)}
     pub fn import_receipt(&self)->Result<(String,u64,u64)> {self.read(SqliteStore::import_receipt)}

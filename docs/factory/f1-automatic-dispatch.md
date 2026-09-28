@@ -184,8 +184,21 @@ Recorded here rather than folded into the card that found them.
   a 30 s budget, recorded in `.state/integrity-check.json` so restarts do not
   repeat it. A failure pauses admission (`integrity_check_failed`) and is
   never repaired automatically; `factory status` and `doctor` show the last
-  check. No schema change. E2E:
-  `hot_paths_skip_the_whole_store_check_and_the_ticker_checks_once_per_interval_then_pauses_on_corruption`.
+  check. No schema change.
+  Follow-ups — done (this PR): the check no longer runs inline in the
+  ticker's pass. It runs on its own thread and connection with its own
+  budget (`HERDR_PROJECTS_INTEGRITY_CHECK_BUDGET_MS`, default 30 s), one
+  table at a time (`PRAGMA quick_check(<table>)` and `foreign_key_check`),
+  always finishing at least one table. Out of budget it records
+  `incomplete` with `next_table`; an incomplete check is always due and the
+  next pass resumes there, so any store size completes; a schema change
+  restarts it. Per-table checks skip free-page accounting, which the
+  administrative opens still run. A failure now also holds queued
+  verification, integration, finalization and notification jobs for that
+  project (`effects_paused: "integrity_check_failed"` in `factory status`);
+  other pauses keep queued effects running. Migration removes the staged
+  store's `integrity-check.json` from `.state/migration/` at cutover. E2E:
+  `hot_paths_skip_the_whole_store_check_and_the_ticker_checks_off_its_pass_then_pauses_admission_and_effects_on_corruption`.
 - **Transferred locks can still outlive release.** Guards now unlock on drop
   (#46), but a lock handed to a supervisor through `inherit_transfer` is only
   closed, so a child forked concurrently on another thread can hold it until

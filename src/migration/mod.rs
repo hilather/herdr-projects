@@ -347,6 +347,10 @@ fn advance(project:&Path,journal:&mut Journal)->Result<()> {
             ensure!(!exists(&staged.with_extension("db-wal")),"staged WAL remains; cannot publish database alone");
             fs::rename(&staged,&published)?; sync_dir(&project.join(".state"))?; sync_dir(&project.join(".state/migration"))?;
         }
+        // Creating the staged store recorded its check beside it. That record
+        // describes the staged file; the published store records its own.
+        let staged_record=crate::store::integrity::record_path(&staged);
+        if fs::symlink_metadata(&staged_record).is_ok() {fs::remove_file(&staged_record)?;sync_dir(&project.join(".state/migration"))?;}
         verify_db(project,&published,&journal.plan)?;
         let marker=Format{version:1,runtime:"sqlite-v2".into(),memory:"legacy-markdown".into(),migration:journal.plan.digest.clone(),reconciliation_required:true};
         let path=project.join(".state/format.json");
@@ -526,22 +530,45 @@ fn open_published(project:&Path,enforce_control:bool,integrity:bool)->Result<Sql
 }
 
 #[derive(Debug,Clone,PartialEq,Eq)]
-pub enum IntegrityOutcome {NotDue,Ok,Corrupt}
+pub enum IntegrityOutcome {NotDue,Ok,Corrupt,Incomplete}
+/// Whether the periodic check should run: none recorded, the last one
+/// unfinished, or the last definite one older than `interval`.
+pub fn integrity_check_due(project:&Path,interval:std::time::Duration)->bool {
+    crate::store::integrity::load(&project.join(".state/state.db")).is_none_or(|r|r.result=="incomplete"
+        ||jiff::Timestamp::now().as_millisecond().saturating_sub(r.checked_unix_ms)>=interval.as_millis() as i64)
+}
 /// The ticker's whole-store check, at most once per `interval` per project and
-/// recorded durably, so a restart does not repeat it. Deadline or cancellation
-/// leaves no record and retries next pass. Corruption pauses admission and is
-/// never repaired here.
-pub fn periodic_integrity_check(project:&Path,interval:std::time::Duration,control:crate::store::controlled::ReadControl)->Result<IntegrityOutcome> {
-    use crate::store::{integrity,StoreError};
+/// recorded durably, so a restart does not repeat it. It runs one table at a
+/// time on its own connection and always finishes at least one table; once
+/// `budget` is spent (or on cancellation or the control's deadline) it records
+/// `incomplete` with the next table and the next run resumes there, so a store
+/// of any size completes over several runs. A schema change restarts it.
+/// Corruption pauses admission and effect dispatch and is never repaired here.
+pub fn periodic_integrity_check(project:&Path,interval:std::time::Duration,budget:std::time::Duration,control:crate::store::controlled::ReadControl)->Result<IntegrityOutcome> {
+    use crate::store::{integrity::{self,IntegrityRecord},StoreError};
     let project=checked_project(project)?;let path=project.join(".state/state.db");
-    let last=integrity::load(&path);
-    if last.as_ref().is_some_and(|r|jiff::Timestamp::now().as_millisecond().saturating_sub(r.checked_unix_ms)<interval.as_millis() as i64) {return Ok(IntegrityOutcome::NotDue);}
-    let result=open_active_scoped(&project,control).and_then(|db|Ok(db.integrity_check_recorded(&path)?));
-    let Err(error)=result else {return Ok(IntegrityOutcome::Ok)};
+    if !integrity_check_due(&project,interval) {return Ok(IntegrityOutcome::NotDue);}
+    let last=integrity::load(&path);let started=std::time::Instant::now();
+    let mut schema=last.as_ref().map_or(0,|r|r.schema);
+    let result=(||->Result<IntegrityOutcome> {
+        let db=open_active_scoped(&project,control)?;
+        schema=db.integrity_schema()?;
+        let resume=last.as_ref().filter(|r|r.result=="incomplete"&&r.schema==schema).and_then(|r|r.next_table.clone());
+        let mut checked=false;
+        for table in db.integrity_tables()?.into_iter().filter(|t|resume.as_ref().is_none_or(|next|t>=next)) {
+            let outcome=if checked&&started.elapsed()>=budget {Err(StoreError::Deadline)} else {db.integrity_check_table(&table)};
+            if matches!(outcome,Err(StoreError::Cancelled|StoreError::Deadline)) {
+                integrity::save(&path,&IntegrityRecord::now(schema,"incomplete",Some(table)))?;
+                return Ok(IntegrityOutcome::Incomplete);
+            }
+            outcome?;checked=true;
+        }
+        integrity::save(&path,&IntegrityRecord::now(schema,"ok",None))?;
+        Ok(IntegrityOutcome::Ok)
+    })();
+    let Err(error)=result else {return result};
     if !matches!(error.downcast_ref::<StoreError>(),Some(StoreError::Corrupt(_))) {return Err(error);}
-    if integrity::load(&path).is_none_or(|r|r.result!="corrupt"||last.as_ref()==Some(&r)) {
-        integrity::record_corrupt(&path,last.map_or(0,|r|r.schema))?;
-    }
+    integrity::record_corrupt(&path,schema)?;
     crate::watchdog::pause_integrity(&project)?;
     Ok(IntegrityOutcome::Corrupt)
 }

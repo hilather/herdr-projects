@@ -4411,9 +4411,10 @@ fn historical_store_cli_requires_explicit_upgrade_and_preserves_intent_and_capac
 }
 
 #[test]
-#[cfg(feature="state-store")]
-fn hot_paths_skip_the_whole_store_check_and_the_ticker_checks_once_per_interval_then_pauses_on_corruption() {
-    use std::{fs, io::{Seek, SeekFrom, Write}, process::Stdio, time::{Duration, Instant}};
+#[cfg(all(feature="state-store",target_os="linux"))]
+fn hot_paths_skip_the_whole_store_check_and_the_ticker_checks_off_its_pass_then_pauses_admission_and_effects_on_corruption() {
+    use std::{fs, io::{Seek, SeekFrom, Write}, os::unix::{fs::PermissionsExt, net::UnixListener}, process::Stdio, time::{Duration, Instant}};
+    use herdr_projects::{domain::{ProjectState, RuntimeRoute, TaskId}, migration, runtime};
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join("root");
     let r = root.to_str().unwrap();
@@ -4427,6 +4428,9 @@ fn hot_paths_skip_the_whole_store_check_and_the_ticker_checks_once_per_interval_
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     }
     let project = root.join("demo");
+    // The staged store's check record does not outlive the move.
+    assert!(!project.join(".state/migration/integrity-check.json").exists());
+    assert!(!project.join(".state/integrity-check.json").exists());
     let db = project.join(".state/state.db");
     // A large store: many retired rows that no targeted reader visits.
     let raw = rusqlite::Connection::open(&db).unwrap();
@@ -4436,20 +4440,26 @@ fn hot_paths_skip_the_whole_store_check_and_the_ticker_checks_once_per_interval_
     let root_page: u64 = raw.query_row("SELECT rootpage FROM sqlite_schema WHERE name='retired_history'", [], |row| row.get(0)).unwrap();
     let page_size: u64 = raw.query_row("PRAGMA page_size", [], |row| row.get(0)).unwrap();
     drop(raw);
+    // Notification delivery records each send.
+    let helper = h.join("herdr");
+    fs::write(&helper, format!("#!/usr/bin/python3\nimport sys,json,pathlib\nif sys.argv[1:]==['remote-api-bridge','--check']:print('herdr-api-bridge-v1');sys.exit(0)\nif sys.argv[1:]!=['remote-api-bridge']:sys.exit(1)\nrequest=json.loads(sys.stdin.readline())\nwith open(pathlib.Path({:?})/'sent','a') as f:f.write(request['method']+'\\n')\nprint(json.dumps({{'id':request['id'],'result':{{'type':'notification_show','shown':True,'reason':'shown'}}}}))\n", h.display().to_string())).unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
 
     struct Child(std::process::Child);
     impl Drop for Child { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
     let metrics = root.join(".ticker-metrics.json");
     let log = || fs::read_to_string(root.join(".ticker.log")).unwrap_or_default();
-    // One full canonical `ticker run` pass, optionally with an integrity interval.
-    let turn = |interval: Option<&str>| {
+    // A canonical `ticker run` for at least one full pass and until `until`
+    // holds, with an optional integrity interval and budget.
+    let turn = |interval: Option<&str>, budget: Option<&str>, until: &dyn Fn() -> bool| {
         let _ = fs::remove_file(&metrics);
         let mut command = Command::new(BIN);
-        command.env_clear().env("HOME", h).env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", "/bin/false");
+        command.env_clear().env("HOME", h).env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", &helper);
         if let Some(seconds) = interval { command.env("HERDR_PROJECTS_INTEGRITY_CHECK_SECS", seconds); }
+        if let Some(ms) = budget { command.env("HERDR_PROJECTS_INTEGRITY_CHECK_BUDGET_MS", ms); }
         let mut child = Child(command.args(["--root", r, "ticker", "run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
         let end = Instant::now() + Duration::from_secs(35);
-        while !metrics.is_file() {
+        while !metrics.is_file() || !until() {
             assert!(child.0.try_wait().unwrap().is_none(), "{}", log());
             assert!(Instant::now() < end, "{}", log());
             std::thread::sleep(Duration::from_millis(10));
@@ -4463,26 +4473,47 @@ fn hot_paths_skip_the_whole_store_check_and_the_ticker_checks_once_per_interval_
         let out = hp(h, &["--root", r, "factory", "status", "demo"]);
         (out.status.success(), serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap_or_default())
     };
+    let record = || serde_json::from_slice::<serde_json::Value>(&fs::read(project.join(".state/integrity-check.json")).unwrap_or_default()).unwrap_or_default();
 
-    // A due check runs in the ticker and is recorded; a restarted ticker
-    // inside the interval does not repeat it.
-    turn(None);
+    // A due check runs off the ticker's pass. One that exceeds its budget
+    // records how far it got without holding up the pass (metrics publish
+    // while it is unfinished), and a later pass resumes and completes it. A
+    // restarted ticker inside the interval does not repeat it.
+    turn(None, None, &|| true);
     let (_, created) = status();
-    turn(Some("0"));
+    turn(Some("0"), Some("0"), &|| record()["result"] == "incomplete");
+    let partial = status().1;
+    assert_eq!(partial["integrity"]["result"], "incomplete", "{partial}");
+    assert!(partial["integrity"]["next_table"].is_string(), "{partial}");
+    assert!(log().contains("demo: store integrity check incomplete within its budget"), "{}", log());
+    turn(None, None, &|| record()["result"] == "ok" && record()["checked_unix_ms"].as_i64() > created["integrity"]["checked_unix_ms"].as_i64());
     let (ok, first) = status();
-    turn(None);
+    turn(None, None, &|| true);
     let (_, second) = status();
+
+    // A task with a notification route, for effect dispatch below.
+    let task = TaskId::new("notification").unwrap();
+    let head = runtime::add_task(&project, task.clone(), "notification".into(), runtime::snapshot(&project).unwrap().head).unwrap();
+    let socket = h.join("notification.sock");
+    let _listener = UnixListener::bind(&socket).unwrap();
+    runtime::create_binding(&project, None, None, head, &RuntimeRoute { socket: socket.display().to_string(), ..Default::default() }).unwrap();
+    assert!(hp(h, &["--root", r, "reconcile", "demo", "--record"]).status.success());
+    let config = h.join(".config/herdr-projects/config.toml");
+    let snapshot = runtime::snapshot(&project).unwrap();
+    runtime::set_state(&project, snapshot.head, snapshot.control.unwrap().revision, ProjectState::Active, &config).unwrap();
 
     // Corrupt one page of the retired rows, as a torn write would.
     let raw = rusqlite::Connection::open(&db).unwrap();
     raw.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())).unwrap();
     drop(raw);
+    let offset = (root_page - 1) * page_size;
+    let original = fs::read(&db).unwrap()[offset as usize..][..16].to_vec();
     let mut file = fs::OpenOptions::new().write(true).open(&db).unwrap();
-    file.seek(SeekFrom::Start((root_page - 1) * page_size)).unwrap();
+    file.seek(SeekFrom::Start(offset)).unwrap();
     file.write_all(&[0xff; 16]).unwrap();
     file.sync_all().unwrap();
     drop(file);
-    let damaged = || fs::read(&db).unwrap()[((root_page - 1) * page_size) as usize..][..16] == [0xff; 16];
+    let damaged = || fs::read(&db).unwrap()[offset as usize..][..16] == [0xff; 16];
 
     // Hot paths never run the whole-store check: a targeted operator read and
     // a controller poll still succeed, and nothing is paused.
@@ -4492,14 +4523,13 @@ fn hot_paths_skip_the_whole_store_check_and_the_ticker_checks_once_per_interval_
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success() && stderr.contains("operation not found"), "{stderr}");
     fs::write(project.join("threads/t-0001.md"), REMEMBER_REPORT).unwrap();
-    turn(None);
+    turn(None, None, &|| log().contains("demo: memory-review reminder delivered"));
     assert!(!log().contains("Corrupt"), "{}", log());
-    assert!(log().contains("demo: memory-review reminder delivered"), "{}", log());
     assert!(!project.join(".state/admission-paused.json").exists());
 
     assert!(ok, "{first}");
     assert_eq!(first["integrity"]["result"], "ok", "{first}");
-    assert!(first["integrity"]["checked_unix_ms"].as_i64().unwrap() > created["integrity"]["checked_unix_ms"].as_i64().unwrap(), "{created}");
+    assert!(first["integrity"]["next_table"].is_null(), "{first}");
     assert_eq!(second["integrity"], first["integrity"]);
 
     // Administrative paths still refuse the corrupt store immediately.
@@ -4507,25 +4537,46 @@ fn hot_paths_skip_the_whole_store_check_and_the_ticker_checks_once_per_interval_
     assert!(!ok);
     assert_eq!(refused["error"], "store_corrupt", "{refused}");
     assert_eq!(refused["integrity"], first["integrity"]);
+    assert!(refused["effects_paused"].is_null(), "{refused}");
     let doctor = hp(h, &["--root", r, "doctor"]);
     let text = String::from_utf8_lossy(&doctor.stdout);
     assert!(text.contains("[FAIL] project demo: store integrity:"), "{text}");
     assert!(!hp(h, &["--root", r, "migration", "demo", "upgrade-store"]).status.success());
 
-    // Once the interval elapses the ticker's check finds it and pauses the
-    // project with a visible reason. It never repairs the store.
-    turn(Some("0"));
-    assert!(log().contains("demo: store integrity check failed; admission paused"), "{}", log());
+    // Once the interval elapses the ticker's check finds it and pauses
+    // admission and effect dispatch with a visible reason. It never repairs
+    // the store.
+    turn(Some("0"), None, &|| log().contains("demo: store integrity check failed; admission and effect dispatch paused"));
     let (ok, paused) = status();
     assert!(!ok);
     assert_eq!(paused["error"], "store_corrupt", "{paused}");
     assert_eq!(paused["admission_paused"], true);
     assert_eq!(paused["pause_reason"], "integrity_check_failed");
+    assert_eq!(paused["effects_paused"], "integrity_check_failed");
     assert_eq!(paused["integrity"]["result"], "corrupt");
     assert!(paused["integrity"]["checked_unix_ms"].as_i64().unwrap() > first["integrity"]["checked_unix_ms"].as_i64().unwrap());
-    turn(Some("0"));
+
+    // A notification queued while the failure stands is held, pass after pass.
+    let head: u64 = rusqlite::Connection::open(&db).unwrap().query_row("SELECT coalesce(max(sequence),0) FROM events", [], |row| row.get(0)).unwrap();
+    let op = runtime::enqueue_notification(&project, &task, head, &migration::config_reference(&config).unwrap()).unwrap();
+    let delivery = || rusqlite::Connection::open(&db).unwrap().query_row("SELECT state FROM operation_delivery WHERE operation_id=?1", [op.id.as_str()], |row| row.get::<_, String>(0)).unwrap();
+    turn(Some("0"), None, &|| log().matches("demo: store integrity check failed").count() >= 3);
+    assert!(!h.join("sent").exists(), "{}", log());
+    assert_eq!(delivery(), "pending");
     assert_eq!(status().1["pause_reason"], "integrity_check_failed");
     assert!(damaged());
+
+    // Once the operator restores the store and clears the pause, the held
+    // notification goes out.
+    let mut file = fs::OpenOptions::new().write(true).open(&db).unwrap();
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(&original).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    fs::remove_file(project.join(".state/admission-paused.json")).unwrap();
+    turn(None, None, &|| h.join("sent").exists());
+    assert_eq!(fs::read_to_string(h.join("sent")).unwrap(), "notification.show\n");
+    assert!(status().1["effects_paused"].is_null());
 }
 
 const REMEMBER_REPORT: &str = "## Report\n\ndid work\n\n## Remember\n\nAlways run the linter.\n\n## Next\n\nmore\n";

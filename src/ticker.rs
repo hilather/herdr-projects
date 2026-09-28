@@ -300,6 +300,7 @@ fn which(tool: &str, path_var: &str) -> String {
         .unwrap_or_else(|| "(not found)".to_string())
 }
 
+#[derive(Clone)]
 pub struct Log {
     path: PathBuf,
 }
@@ -601,18 +602,31 @@ fn telemetry_pass(ctx:&Ctx,log:&Log,slug:&str) {
     use herdr_projects::telemetry::codex;
     if let Err(error)=codex::collect(&ctx.root.join(slug),codex::Budget::TICK,false) {log.line(&format!("{slug}: telemetry collect: {error:#}"));}
 }
-/// Whole-store check off the poll path: at most once per interval per project
-/// (default one hour, `HERDR_PROJECTS_INTEGRITY_CHECK_SECS`), with its own budget.
+/// Whole-store check off the ticker's pass: at most once per interval per
+/// project (default one hour, `HERDR_PROJECTS_INTEGRITY_CHECK_SECS`), on its
+/// own thread and connection with its own budget (default 30 s,
+/// `HERDR_PROJECTS_INTEGRITY_CHECK_BUDGET_MS`). An unfinished check records
+/// its progress and resumes on a later pass; the pass never waits for it.
 #[cfg(feature="state-store")]
 fn integrity_pass(ctx:&Ctx,log:&Log,slug:&str) {
-    use herdr_projects::migration::{periodic_integrity_check,IntegrityOutcome};
+    use herdr_projects::migration::{integrity_check_due,periodic_integrity_check,IntegrityOutcome};
+    static RUNNING:std::sync::Mutex<std::collections::BTreeMap<PathBuf,std::thread::JoinHandle<()>>>=std::sync::Mutex::new(std::collections::BTreeMap::new());
     let interval=Duration::from_secs(ctx.env.var("HERDR_PROJECTS_INTEGRITY_CHECK_SECS").and_then(|v|v.parse().ok()).unwrap_or(3600));
-    let control=herdr_projects::store::controlled::ReadControl::new(std::time::Instant::now()+Duration::from_secs(30),Default::default());
-    match periodic_integrity_check(&ctx.root.join(slug),interval,control) {
-        Ok(IntegrityOutcome::Corrupt)=>log.line(&format!("{slug}: store integrity check failed; admission paused (integrity_check_failed); preserve the store and restore it, never auto-repair")),
-        Ok(_)=>{},
+    let budget=Duration::from_millis(ctx.env.var("HERDR_PROJECTS_INTEGRITY_CHECK_BUDGET_MS").and_then(|v|v.parse().ok()).unwrap_or(30_000));
+    let project=ctx.root.join(slug);
+    let Ok(mut running)=RUNNING.lock() else {return};
+    if running.get(&project).is_some_and(|check|!check.is_finished()) || !integrity_check_due(&project,interval) {return;}
+    // A single table still has a hard limit, so a stuck read cannot pin the thread.
+    let control=herdr_projects::store::controlled::ReadControl::new(Instant::now()+budget.max(Duration::from_secs(30)).saturating_mul(10),Default::default());
+    let (line,slug,path)=(log.clone(),slug.to_owned(),project.clone());
+    let check=std::thread::Builder::new().name("integrity-check".into()).spawn(move||{let log=line;match periodic_integrity_check(&path,interval,budget,control) {
+        Ok(IntegrityOutcome::Corrupt)=>log.line(&format!("{slug}: store integrity check failed; admission and effect dispatch paused (integrity_check_failed); preserve the store and restore it, never auto-repair")),
+        Ok(IntegrityOutcome::Incomplete)=>log.line(&format!("{slug}: store integrity check incomplete within its budget; resumes on a later pass")),
+        Ok(IntegrityOutcome::Ok)=>log.line(&format!("{slug}: store integrity check ok")),
+        Ok(IntegrityOutcome::NotDue)=>{},
         Err(error)=>log.line(&format!("{slug}: store integrity check: {error:#}")),
-    }
+    }});
+    match check {Ok(check)=>{running.insert(project,check);},Err(error)=>log.line(&format!("{}: store integrity check: {error}",project.display()))}
 }
 fn drain_executor(root:&Path,log:&Log,memory:&mut Memory)->Result<()> {
     let result=memory.pr_reads.as_mut().expect("ticker shared executor").stop();
@@ -626,7 +640,7 @@ fn admit_background(_ctx:&Ctx,log:&Log,memory:&mut Memory,canonical:Vec<PathBuf>
     #[cfg(all(feature="state-store",target_os="linux"))]
     if let Some(queue)=memory.copy_jobs.as_mut() {
         let reads=memory.canonical_observations.as_ref();
-        for error in queue.admit_verifier(|project|!reads.is_some_and(|reads|reads.pending_project(project))){log.line(&error);}
+        for error in queue.admit_verifier(|project|!reads.is_some_and(|reads|reads.pending_project(project))&&herdr_projects::watchdog::effects_paused(Path::new(project)).is_none()){log.line(&error);}
     }
     // The exclusive slot is still one ticket. Declared transfers may already be
     // running; top those up without admitting a launch or a routine beside them.

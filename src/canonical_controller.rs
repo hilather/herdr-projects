@@ -167,6 +167,7 @@ fn dispatch_prepared(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::cop
     let mut budget=Budget::new(2*1024*1024,1024,std::time::Instant::now()+std::time::Duration::from_millis(100),Default::default())?;
     let Some(hint)=herdr_projects::migration::read_controller_dispatch_hint(path,&mut budget,turn,jiff::Timestamp::now().as_millisecond(),include_launches)? else{return Ok(false);};
     let operation=&hint.operation;
+    if effect_held(path,&operation.kind) {return Ok(false);}
     if operation.kind=="runtime.launch" {
         #[cfg(target_os="linux")]
         return match hint.mode {
@@ -205,12 +206,17 @@ fn dispatch_prepared(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::cop
     }
 }
 
+/// Queued effect jobs are held while an integrity failure stands.
+fn effect_held(path:&Path,kind:&str)->bool {
+    matches!(kind,"verification.run"|"integration.run"|"runtime.finalization"|"runtime.notification")&&herdr_projects::watchdog::effects_paused(path).is_some()
+}
 // A hint selects work only. Concrete workers retain full validation before
 // claiming or acting; a route hint does not certify provenance or authority.
 fn offer_next(ctx:&Ctx,path:&Path,turn:u64,effects:&mut crate::copy_jobs::Queue,include_launches:bool)->Result<bool> {
     use herdr_projects::store::{identity_inventory::Budget,controller_hint::EffectMode};
     let mut budget=Budget::new(2*1024*1024,1024,std::time::Instant::now()+std::time::Duration::from_millis(100),Default::default())?;
     let Some(hint)=herdr_projects::migration::read_controller_dispatch_hint(path,&mut budget,turn,jiff::Timestamp::now().as_millisecond(),include_launches)? else{return Ok(false);};
+    if effect_held(path,&hint.operation.kind) {return Ok(false);}
     match hint.operation.kind.as_str() {
         "runtime.notification"=>effects.offer_canonical_notification(ctx,path,&hint.operation,hint.delivery_revision,hint.notification_socket.as_deref().context("notification route hint missing")?)?,
         "runtime.finalization"=>effects.offer_canonical_finalization(ctx,path,&hint.operation,hint.delivery_revision,match hint.mode {EffectMode::Deliver=>crate::canonical_finalization_jobs::Mode::Deliver,EffectMode::Observe=>crate::canonical_finalization_jobs::Mode::Observe})?,

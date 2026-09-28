@@ -42,6 +42,8 @@ pub struct FactoryStatus {
     pub platform: &'static str,
     pub admission_paused: bool,
     pub pause_reason: Option<&'static str>,
+    /// Set while queued effect jobs are held too (an integrity failure).
+    pub effects_paused: Option<&'static str>,
     pub blockers: Vec<&'static str>,
     /// The last recorded whole-store check; null until one has run.
     pub integrity: Option<IntegrityRecord>,
@@ -173,6 +175,7 @@ pub fn report(project: &Path, prepared_dispatch: bool) -> Result<FactoryStatus, 
             let mut value = refused_schema(version, prepared_dispatch, "store_corrupt");
             value["admission_paused"] = pause_reason.is_some().into();
             value["pause_reason"] = serde_json::json!(pause_reason);
+            value["effects_paused"] = serde_json::json!(watchdog::effects_paused(project));
             value["integrity"] = serde_json::json!(integrity::load(&db_path));
             return Err(ReportError::Corrupt(value));
         }
@@ -194,6 +197,7 @@ pub fn report(project: &Path, prepared_dispatch: bool) -> Result<FactoryStatus, 
         platform: platform(),
         admission_paused: paused,
         pause_reason,
+        effects_paused: watchdog::effects_paused(project),
         blockers,
         integrity: integrity::load(&db_path),
         counters: counters_from(numbers),
