@@ -262,5 +262,9 @@ Recorded here rather than folded into the card that found them.
   limit. E2E: the `five` (two 18 s policies publish) and `six` (seven policies
   refused) cases of
   `ticker_auto_integrates_two_results_serially_and_recovers_stale_and_crash`.
+- **`stock_herdr_unconfirmed_launch_closes_its_workspace_and_counts_nothing`
+  failed once** (exec-path check in the stock shell stand-in), then passed
+  repeatedly. Investigate the stand-in's timing before it becomes a regular
+  flake.
 - **Replace-verdict tests** (352 in `docs/reviews/2026-09-27-test-audit.tsv`):
   convert to E2E alongside feature work, starting with `store/barriers.rs`.
