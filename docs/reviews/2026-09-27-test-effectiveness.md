@@ -658,3 +658,41 @@ Mutation check, each restored byte-for-byte afterwards:
 - Disabling the revoked-requirement check in `contract_binding::result_barrier`
   made the downstream test fail only on its message; the later "not currently
   released" check still refused the submission.
+
+## Memory regression unit tests replaced by E2E workflows
+
+The audit marked 14 `src/memory/regression_tests.rs` tests REPLACE. Eleven
+were deleted after `tests/memory_regressions.rs` covered their guarantees over a
+disposable migrated project through the compiled CLI: `memory propose`,
+owner-signed `memory review`, `memory promote`, signed `memory import` hard-rule
+policy, `memory inspect`/`snapshot-input` and `context --session/--ack`. Running
+attempts, worker snapshots, object ingestion and GC use the public store API
+because no worker launches and GC has no CLI verb.
+
+| New E2E test | Replaced unit tests |
+| --- | --- |
+| `reviewed_proposals_keep_their_bytes_through_gc_recheck_hard_rules_and_replay` | `reingesting_collected_bytes_must_restore_availability`, `accepted_proposal_must_protect_its_body_from_gc`, `accepted_evidence_survives_collection_before_and_after_promotion`, `promotion_replay_must_return_same_sequence`, `promote_must_recheck_hard_rule_changes_since_review` |
+| `snapshots_follow_hard_rules_and_scope_and_the_profile_fallback_stays_project_wide` | `newly_hard_rule_must_not_reuse_optional_snapshot`, `unrelated_domain_and_path_must_not_match_only_because_of_kind_weight`, `profile_only_fallback_never_borrows_task_scoped_snapshot` |
+| `coordinator_sessions_keep_independent_monotonic_cursors_and_see_instruction_edits` | `coordinator_snapshots_need_session_specific_subscriptions` (now observed as independent full/delta cursors, not the internal subscriber string), `delta_must_include_changed_project_instructions` (the CLI reads the edited PROJECT.md itself), `acknowledging_old_checkpoint_cannot_rewind_the_session` |
+
+Kept: `snapshot_cache_must_not_reintroduce_expired_facts`,
+`promotion_rechecks_expiry_without_an_intervening_event` and
+`hard_memory_kind_is_mandatory_and_expiry_cannot_silently_remove_it`. Every
+production path writes `expiry_unix_ms: None` (promotion, import, checkpoint and
+snapshot revisions; candidates only carry an existing value forward), and
+`hard_memory` kind cannot be promoted by a reviewer, so an expiring record
+exists only through injected state and an injected clock. Driving these
+end-to-end would mean raw SQL fault injection, which is what the unit tests
+already do.
+
+Two findings from the conversion: promoted `task_local` records get the
+`project` scope, so pinning one into any task snapshot is refused ("belongs to
+another task"); and any signed policy change after review already fails
+promotion through the review fence, before the dedicated mandatory-rule check.
+
+Mutation check, each restored byte-for-byte afterwards:
+- Dropping the `last_checkpoint_id`/cursor-range guard from
+  `ack_coordinator_checkpoint` made the coordinator test fail: the stale ack
+  rewound the cursor and the next delta repeated `new-task`.
+- Dropping the `TaskLocal` filter from `load_brief_memory` made the snapshot
+  test fail: the profile-only fallback rendered `private task finding`.
