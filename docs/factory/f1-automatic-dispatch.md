@@ -126,7 +126,9 @@ decision.
 
 Recorded here rather than folded into the card that found them.
 
-- **Two workers on one Herdr server fail start naming** (F1.7). The naming
+- **Two workers on one Herdr server fail start naming** (F1.7) — done (this
+  PR): the fence compares only the target agent's entry, and recovery finishes a
+  recorded rename the target never received. The naming
   fence in `canonical_worker/start.rs` compares the whole `agent.list`, so any
   change in another agent's entry refuses the rename; recovery
   (`allow_name=false`) then loops on "native worker name mismatch". Compare

@@ -332,13 +332,16 @@ a matching native route/terminal/kind, an exact supervised process, and a commit
 does not prove the rename or process start; fresh native and process observations
 are required before recording the start receipt.
 
-A lost acknowledgment leaves the naming intent intact. `reconcile_start` can
-observe the expected name without renewed authority, but neither recovery nor the
-explicit naming service repeats an uncertain rename. An already-confirmed launch
-now reconciles its receipt directly instead of re-entering creation recovery.
-Fixture tests cover naming success, lost reply, foreign-name refusal, failed event
-commit before submission, and refusal to retry when the name disappears. Live
-vendor-agent naming and controller admission remain pending.
+Naming fences only the target pane's own agent entry, so other workers on the
+same Herdr server may change status meanwhile; no other agent may hold the
+target's name. A lost acknowledgment leaves the naming intent intact.
+`reconcile_start` observes the expected name without renewed authority. If the
+intent is recorded but the exact target agent is still unnamed, recovery sends the
+same rename once more, which is idempotent; a different name is refused. The
+explicit naming service stays one-use. An already-confirmed launch reconciles its
+receipt directly instead of re-entering creation recovery. Fixture tests cover
+naming success, lost reply, foreign-name refusal, failed event commit before
+submission, two workers on one server, and recovery of an unapplied rename.
 
 ### Bounded launch advancement
 
@@ -349,7 +352,8 @@ creating a resource, then revalidates it before release. It shares one deadline 
 across stages. It creates only a never-claimed delivery, expects precisely the
 revision produced by that claim, and recovers later stages from durable events.
 Uncertain creation is discovered rather than repeated; unknown absence retains
-capacity. Recorded release and naming requests are never repeated. Expired claims
+capacity. Recorded release requests are never repeated; a recorded rename is
+repeated only while the exact target agent is still unnamed. Expired claims
 and uncertain naming take the observation-only start path. Each effect service
 revalidates authority and identity immediately before its own durable boundary.
 

@@ -19,7 +19,8 @@ pub fn reconcile_start(
 }
 
 /// Assign the expected name to an unnamed, exact live agent once, then observe
-/// start. A lost acknowledgment is recovered by observation, never rename replay.
+/// start. A lost acknowledgment is recovered by observation; recovery repeats
+/// only a recorded rename that never took effect on the same unnamed agent.
 pub fn name_started_agent(
     project: &Path,
     operation: &OperationId,
@@ -151,28 +152,28 @@ fn finish_start(
         locks: guard.inherit()?,
     };
     let result = native.call(operation.as_str(), "agent.list", json!({}))?;
-    ensure!(
-        result["type"].as_str() == Some("agent_list"),
-        "invalid native agent inventory"
-    );
-    let agents = result["agents"]
-        .as_array()
-        .context("agent inventory missing")?;
-    ensure!(
-        agents.len() <= 256,
-        "agent inventory exceeds recovery limit"
-    );
-    let matching: Vec<_> = agents
-        .iter()
-        .filter(|a| a["pane_id"].as_str() == Some(&target.route.pane_id))
-        .collect();
-    ensure!(matching.len() == 1, "agent absent or ambiguous");
-    let agent = matching[0];
-    if allow_name && agent["name"].as_str() != Some(&receipt.agent.name) {
-        ensure!(
-            agent.get("name").is_none_or(Value::is_null),
-            "refusing to replace an existing agent name"
-        );
+    let agent = target_agent(&result, &target.route.pane_id, &receipt.agent.name)?;
+    let unnamed = agent.get("name").is_none_or(Value::is_null);
+    // A recorded naming intent lets recovery finish a rename that never took
+    // effect. The same name on the same exact agent is idempotent.
+    let intent = match state.events.iter().find(|e| {
+        e.kind == "runtime.launch_name" && e.entity == operation.as_str()
+    }) {
+        Some(event) => {
+            let intent: LaunchReleaseIntent = serde_json::from_value(event.payload.clone())?;
+            ensure!(
+                intent.version == 1
+                    && intent.target == target
+                    && intent.observed_unix_ms >= release.observed_unix_ms,
+                "naming intent identity mismatch"
+            );
+            true
+        }
+        None => false,
+    };
+    let rename = allow_name && agent["name"].as_str() != Some(&receipt.agent.name);
+    if rename || (intent && unnamed) {
+        ensure!(unnamed, "refusing to replace an existing agent name");
         let mut candidate = agent.clone();
         candidate["name"] = json!(receipt.agent.name);
         native.agent(&candidate, false)?;
@@ -182,12 +183,16 @@ fn finish_start(
                 .is_none_or(|v| v.as_bool() == Some(false)),
             "native launch remains pending"
         );
-        let claim = crate::operations::Claim {
-            operation: operation.clone(),
-            revision: delivery.revision,
-            epoch: delivery.epoch,
-            owner: delivery.owner.clone().context("claim owner missing")?,
-            lease_until_ms: delivery.lease_until_ms.context("claim lease missing")?,
+        let claim = if rename {
+            Some(crate::operations::Claim {
+                operation: operation.clone(),
+                revision: delivery.revision,
+                epoch: delivery.epoch,
+                owner: delivery.owner.clone().context("claim owner missing")?,
+                lease_until_ms: delivery.lease_until_ms.context("claim lease missing")?,
+            })
+        } else {
+            None
         };
         inventory::check(
             &project,
@@ -196,14 +201,18 @@ fn finish_start(
             deadline,
             cancellation.clone(),
         )?;
-        db.validate_launch_claim(&claim, now())?;
-        let rename_native = Native {
-            deadline: deadline.min(
+        let mut rename_deadline = deadline;
+        if let Some(claim) = &claim {
+            db.validate_launch_claim(claim, now())?;
+            rename_deadline = deadline.min(
                 Instant::now()
                     + Duration::from_millis(
                         claim.lease_until_ms.saturating_sub(now()).max(0) as u64
                     ),
-            ),
+            );
+        }
+        let rename_native = Native {
+            deadline: rename_deadline,
             locks: guard.inherit()?,
             cancellation: cancellation.clone(),
             ..native
@@ -215,58 +224,47 @@ fn finish_start(
             || {
                 worktrees.check()?;
                 process.check()?;
+                // Only the target's own entry is fenced; other agents on the
+                // same server may change status meanwhile.
                 let current = rename_native.call(operation.as_str(), "agent.list", json!({}))?;
                 ensure!(
-                    current == result,
-                    "native agent inventory changed before naming"
+                    target_agent(&current, &target.route.pane_id, &receipt.agent.name)? == agent,
+                    "native agent changed before naming"
                 );
                 worktrees.check()?;
                 process.check()?;
                 executable(&profile.agent, deadline, &cancellation)?;
-                db.record_launch_name(
-                    &claim,
-                    &PreparedLaunchName {
-                        intent: LaunchReleaseIntent {
-                            version: 1,
-                            target: target.clone(),
-                            observed_unix_ms: now(),
+                if let Some(claim) = &claim {
+                    db.record_launch_name(
+                        claim,
+                        &PreparedLaunchName {
+                            intent: LaunchReleaseIntent {
+                                version: 1,
+                                target: target.clone(),
+                                observed_unix_ms: now(),
+                            },
                         },
-                    },
-                    now(),
-                )?;
+                        now(),
+                    )?;
+                }
                 Ok(())
             },
         )?;
         // The mutation reply alone cannot certify start. Re-read native identity.
         let result = native.call(operation.as_str(), "agent.list", json!({}))?;
+        let named = target_agent(&result, &target.route.pane_id, &receipt.agent.name)?;
+        native.agent(&named, false)?;
         ensure!(
-            result["type"].as_str() == Some("agent_list"),
-            "invalid native agent inventory"
-        );
-        let agents = result["agents"]
-            .as_array()
-            .context("agent inventory missing")?;
-        ensure!(
-            agents.len() <= 256,
-            "agent inventory exceeds recovery limit"
-        );
-        let matches: Vec<_> = agents
-            .iter()
-            .filter(|a| a["pane_id"].as_str() == Some(&target.route.pane_id))
-            .collect();
-        ensure!(matches.len() == 1, "agent absent or ambiguous");
-        native.agent(matches[0], false)?;
-        ensure!(
-            matches[0]
+            named
                 .get("launch_pending")
                 .is_none_or(|v| v.as_bool() == Some(false)),
             "native launch remains pending"
         );
     } else {
-        native.agent(agent, false)?;
+        native.agent(&agent, false)?;
     }
     ensure!(
-        matching[0]
+        agent
             .get("launch_pending")
             .is_none_or(|v| v.as_bool() == Some(false)),
         "native launch remains pending"
@@ -294,6 +292,31 @@ fn finish_start(
         now(),
     )?;
     Ok(receipt)
+}
+
+/// Select the target pane's single agent entry. Other agents on the same server
+/// may change freely, but none may hold the target's deterministic name.
+fn target_agent(result: &Value, pane: &str, name: &str) -> Result<Value> {
+    ensure!(
+        result["type"].as_str() == Some("agent_list"),
+        "invalid native agent inventory"
+    );
+    let agents = result["agents"]
+        .as_array()
+        .context("agent inventory missing")?;
+    ensure!(
+        agents.len() <= 256,
+        "agent inventory exceeds recovery limit"
+    );
+    let (matching, others): (Vec<_>, Vec<_>) = agents
+        .iter()
+        .partition(|a| a["pane_id"].as_str() == Some(pane));
+    ensure!(matching.len() == 1, "agent absent or ambiguous");
+    ensure!(
+        others.iter().all(|a| a["name"].as_str() != Some(name)),
+        "worker name held by another agent"
+    );
+    Ok(matching[0].clone())
 }
 
 /// Continue observation across target discovery and start confirmation. Each

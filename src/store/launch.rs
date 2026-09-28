@@ -107,7 +107,7 @@ impl SqliteStore {
         let delivery = super::delivery::delivery_with_budget(&tx, operation, Some(budget))?;
         if delivery.revision != expected { return Err(StoreError::Conflict); }
         let record = super::reservations::read_input(&tx, operation, Some(budget))?;
-        let mut statement = tx.prepare("SELECT sequence,kind,entity,revision,payload_version,payload FROM events WHERE entity=?1 AND kind IN ('runtime.launch_target','runtime.launch_release','runtime.launch_started','runtime.worktrees_creation','runtime.worktrees_ready') LIMIT 6")?;
+        let mut statement = tx.prepare("SELECT sequence,kind,entity,revision,payload_version,payload FROM events WHERE entity=?1 AND kind IN ('runtime.launch_target','runtime.launch_release','runtime.launch_name','runtime.launch_started','runtime.worktrees_creation','runtime.worktrees_ready') LIMIT 7")?;
         let mut rows = statement.query([operation.as_str()])?;
         let mut events = Vec::new();
         let mut kinds = std::collections::BTreeSet::new();

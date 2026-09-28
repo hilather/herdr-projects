@@ -124,6 +124,14 @@ elif r['method']=='agent.list':
  if mode=='busy':a['agent_status']='working'
  if mode=='foreign':a['terminal_id']='foreign'
  result={{'type':'agent_list','agents':[a]}}
+ # Another worker on the same server, whose status changes on every read.
+ if (root/'shared-server-agent').exists():
+  path=pathlib.Path((root/'shared-server-agent').read_text())
+  b=json.loads(path.read_text())
+  b['agent_status']='working' if b.get('agent_status')=='idle' else 'idle'
+  path.write_text(json.dumps(b))
+  b.update({{'workspace_id':'w2','tab_id':'w2:t1','pane_id':'w2:p1','terminal_id':'term2'}})
+  result['agents'].append(b)
 elif r['method']=='agent.explain':
  e={{'agent':'claude','state':'idle','manifest_source':'bundled','manifest_version':'2026.09.14.1',
  'matched_rule':{{'id':'prompt','state':'idle'}},'visible_idle':True,'visible_blocker':False,
@@ -137,6 +145,7 @@ elif r['method']=='agent.explain':
  result={{'type':'agent_explain','explain':e}}
 elif r['method']=='agent.rename':
  with open(root/'name-requests','a') as f:f.write(json.dumps(r)+'\n')
+ if (root/'drop-name-request').exists():sys.exit(1)
  a['name']=r['params']['name']
  (root/'agent.json').write_text(json.dumps(a))
  if (root/'lose-name-reply').exists():sys.exit(1)
@@ -2893,7 +2902,7 @@ fn native_gate_submission_is_once_even_when_the_reply_is_lost() {
             1
         );
         if mode == "resource-release-lost" {
-            // An uncertain rename is not retried even if the name disappears.
+            // The naming service stays one-use even if the name disappears.
             let named_agent = fs::read(&agent_path).unwrap();
             fs::write(&agent_path, serde_json::to_vec(&agent).unwrap()).unwrap();
             let before = runtime::snapshot(&f.project).unwrap();
@@ -2935,6 +2944,114 @@ fn native_gate_submission_is_once_even_when_the_reply_is_lost() {
         );
         assert!(f.sent().is_empty());
     }
+}
+
+// Drive one released launch through the controller's hint, as the dispatcher does.
+fn advance_released_launch(f: &mut Fixture) -> Result<Option<LaunchStartedReceipt>> {
+    use std::io::Write;
+    let mut input = f._worker.0.stdin.take().unwrap();
+    let initial = runtime::snapshot(&f.project).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let f = &*f;
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let request = f._root.path().join("gate-requests");
+            while !request.exists() {
+                assert!(Instant::now() < deadline, "gate request missing");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let request: Value = serde_json::from_str(fs::read_to_string(request).unwrap().lines().next().unwrap()).unwrap();
+            input.write_all(request["params"]["text"].as_str().unwrap().as_bytes()).unwrap();
+            let stage: Value = serde_json::from_slice(&fs::read(f._root.path().join("stage.json")).unwrap()).unwrap();
+            let argv: Vec<String> = serde_json::from_value(stage["argv"].clone()).unwrap();
+            let supervisor = crate::worker_supervision::SupervisorObservation::observe(f._worker.0.id(), &argv).unwrap();
+            let profile = initial.attempt_inputs[0].inputs.effective_profile.as_ref().unwrap();
+            while supervisor.agent_process(Path::new(&profile.agent.path), &profile.arguments_digest).is_err() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            fs::write(f._root.path().join("agent.json"), serde_json::to_vec(&json!({
+                "pane_id":"w1:p1", "tab_id":"w1:t1", "workspace_id":"w1", "cwd":f.project.display().to_string(),
+                "terminal_id":"term1", "agent":"claude", "name":null, "interactive_ready":true, "agent_status":"idle"
+            })).unwrap()).unwrap();
+            fs::write(f._root.path().join("gate-sent"), "").unwrap();
+        });
+        resume_launch(f)
+    })
+}
+
+fn resume_launch(f: &Fixture) -> Result<Option<LaunchStartedReceipt>> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let hint = (0..4).find_map(|turn| {
+        let mut budget = crate::store::identity_inventory::Budget::new(2 * 1024 * 1024, 1024, deadline, Default::default()).unwrap();
+        migration::read_controller_dispatch_hint(&f.project, &mut budget, turn, now(), true).unwrap().filter(|h| h.operation.id == f.operation.id)
+    }).expect("controller must offer the launch");
+    match hint.mode {
+        crate::store::controller_hint::EffectMode::Deliver => advance_launch(&f.project, &hint.operation.id, hint.delivery_revision, deadline, Default::default()),
+        crate::store::controller_hint::EffectMode::Observe => {
+            reconcile_launch(&f.project, &hint.operation.id, hint.delivery_revision, deadline, Default::default())?;
+            Ok(runtime::snapshot(&f.project)?.events.iter().find(|e| e.kind == "runtime.launch_started").map(|e| serde_json::from_value(e.payload.clone()).unwrap()))
+        }
+    }
+}
+
+#[test]
+fn workers_sharing_one_herdr_server_are_named_independently_and_recover_unapplied_names() {
+    let mut a = Fixture::new("resource-release");
+    let a_receipt = advance_released_launch(&mut a).unwrap().unwrap();
+    let a_agent = a._root.path().join("agent.json");
+    let requests = |f: &Fixture| fs::read_to_string(f._root.path().join("name-requests")).unwrap_or_default().lines().count();
+    let name = |f: &Fixture| serde_json::from_slice::<Value>(&fs::read(f._root.path().join("agent.json")).unwrap()).unwrap()["name"].clone();
+    let events = |f: &Fixture, kind: &str| runtime::snapshot(&f.project).unwrap().events.iter().filter(|e| e.kind == kind).count();
+    // A confirmed launch is no longer offered; replaying it only observes.
+    let replay = |f: &Fixture| {
+        let revision = runtime::snapshot(&f.project).unwrap().deliveries.iter().find(|d| d.operation == f.operation.id).unwrap().revision;
+        advance_launch(&f.project, &f.operation.id, revision, Instant::now() + Duration::from_secs(15), Default::default()).unwrap()
+    };
+    for case in ["shared", "unapplied", "renamed"] {
+        let mut b = Fixture::new("resource-release");
+        // B's server also lists A, whose status changes between every read.
+        fs::write(b._root.path().join("shared-server-agent"), a_agent.display().to_string()).unwrap();
+        if case != "shared" {
+            fs::write(b._root.path().join("drop-name-request"), "").unwrap();
+        }
+        let first = advance_released_launch(&mut b);
+        let attempt = runtime::snapshot(&b.project).unwrap().attempts[0].id.clone();
+        if case == "shared" {
+            let receipt = first.unwrap_or_else(|e| panic!("{e:#}")).unwrap();
+            assert_eq!(receipt.attempt, attempt);
+            assert_eq!(name(&b), json!(worker_agent_name(&attempt)));
+            assert_eq!((requests(&b), events(&b, "runtime.launch_started")), (1, 1));
+            continue;
+        }
+        // The naming intent was recorded but the rename never took effect.
+        assert!(first.is_err());
+        fs::remove_file(b._root.path().join("drop-name-request")).unwrap();
+        assert_eq!((requests(&b), name(&b)), (1, Value::Null));
+        assert_eq!((events(&b, "runtime.launch_name"), events(&b, "runtime.launch_started")), (1, 0));
+        if case == "renamed" {
+            let path = b._root.path().join("agent.json");
+            let mut agent: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            agent["name"] = json!("someone-else");
+            fs::write(&path, serde_json::to_vec(&agent).unwrap()).unwrap();
+            for _ in 0..3 {
+                assert!(resume_launch(&b).is_err());
+            }
+            assert_eq!((requests(&b), name(&b)), (1, json!("someone-else")));
+            assert_eq!(events(&b, "runtime.launch_started"), 0);
+            continue;
+        }
+        // A restart finishes the unapplied rename once, then only observes it.
+        let receipt = resume_launch(&b).unwrap_or_else(|e| panic!("{e:#}")).unwrap();
+        assert_eq!(receipt.attempt, attempt);
+        assert_eq!((requests(&b), name(&b)), (2, json!(worker_agent_name(&attempt))));
+        assert_eq!(replay(&b), Some(receipt));
+        assert_eq!((requests(&b), events(&b, "runtime.launch_started")), (2, 1));
+    }
+    // A keeps its own name, receipt and single rename.
+    assert_eq!(name(&a), json!(a_receipt.agent.name));
+    assert_eq!(requests(&a), 1);
+    assert_eq!(replay(&a), Some(a_receipt));
 }
 
 #[test]
