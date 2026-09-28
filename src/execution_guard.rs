@@ -2,6 +2,8 @@
 //! Order: root barrier, project effect ownership, resource fences sorted by
 //! `(class, identity)`, then any short record lock. Never upgrade a shared
 //! lock in place, and never take an exclusive root guard while holding one.
+//! A `CheckGuard` keeps only the root and one fence; it releases the fence
+//! before taking project ownership again.
 use std::{fs::{File,OpenOptions},os::unix::fs::{DirBuilderExt,OpenOptionsExt,MetadataExt},path::{Path,PathBuf},sync::atomic::{AtomicBool,Ordering}};
 use anyhow::{Result,Context,ensure};
 use serde::{Deserialize,Serialize};
@@ -63,14 +65,15 @@ fn matches_project(guard_project:&Path,identity:(u64,u64),project:&Path)->Result
 }
 
 /// Declared footprint. `git` is a common git directory. `artifact` is one
-/// project's publication directory. Unknown classes are not a footprint.
+/// project's publication directory. `scratch` is one job's scratch directory.
+/// Unknown classes are not a footprint.
 #[derive(Clone,Debug,PartialEq,Eq,PartialOrd,Ord,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Resource {pub class:String,pub identity:String}
 impl Resource {
     pub fn new(class:impl Into<String>,identity:impl Into<String>)->Result<Self> {
         let class=class.into();let identity=identity.into();
-        ensure!(matches!(class.as_str(),"git"|"artifact"),"unknown effect resource");
+        ensure!(matches!(class.as_str(),"git"|"artifact"|"scratch"),"unknown effect resource");
         ensure!(!identity.is_empty()&&identity.len()<=4096&&!identity.chars().any(char::is_control)&&Path::new(&identity).is_absolute(),"invalid effect resource");
         Ok(Self{class,identity})
     }
@@ -91,6 +94,17 @@ impl ProjectGuard {
         Ok(vec![crate::runner::InheritedLock::new(self._root._file.transfer()?),crate::runner::InheritedLock::new(self._project.transfer()?),
             crate::runner::InheritedLock::new(exclusive_file(&self.root.join(".routine-execution.lock"))?.transfer()?)])
     }
+    /// Take `resource`'s fence under this ownership (fences follow the project lock).
+    pub fn fence(&self,resource:&Resource)->Result<Fence> {
+        Resource::new(&resource.class,&resource.identity)?;
+        Ok(Fence{_file:fence_file(&self.root,resource)?})
+    }
+    /// Keep the shared root and `fence`; release project ownership. Other
+    /// project effects may then run, while root-exclusive maintenance waits.
+    pub fn narrow(self,fence:Fence)->CheckGuard {
+        let ProjectGuard{_project,_root,project,identity,..}=self;drop(_project);
+        CheckGuard{_fence:fence,_root,project,identity}
+    }
     pub fn acquire(project:&Path)->Result<Self> {
         let project=project.canonicalize()?;
         let root_path=project.parent().context("project has no root")?.to_path_buf();
@@ -99,6 +113,44 @@ impl ProjectGuard {
         let file=exclusive_file(&project.join(".state/effect.lock"))?;
         let metadata=std::fs::metadata(&project)?;
         Ok(Self{_project:file,_root:root,root:root_path,project,identity:(metadata.dev(),metadata.ino())})
+    }
+}
+
+/// An exclusive resource fence held beside project or root ownership.
+pub struct Fence {_file:LockFile}
+fn fence_file(root:&Path,resource:&Resource)->Result<LockFile> {
+    let dir=root.join(".resource-fences");
+    match std::fs::symlink_metadata(&dir) {
+        Ok(meta)=>ensure!(meta.is_dir()&&!meta.file_type().is_symlink(),"resource fence directory must be a real directory"),
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound => {
+            std::fs::DirBuilder::new().mode(0o700).create(&dir).or_else(|err| if err.kind()==std::io::ErrorKind::AlreadyExists {Ok(())} else {Err(err)})?;
+            let meta=std::fs::symlink_metadata(&dir)?;
+            ensure!(meta.is_dir()&&!meta.file_type().is_symlink(),"resource fence directory must be a real directory");
+        }
+        Err(error)=>return Err(error.into()),
+    }
+    let mut hasher=Sha256::new();hasher.update(resource.class.as_bytes());hasher.update([0]);hasher.update(resource.identity.as_bytes());
+    exclusive_file(&dir.join(format!("{:x}",hasher.finalize())))
+}
+
+/// A long isolated check that needs no project ownership: the root stays
+/// shared and the check's fence excludes anyone else from its resource.
+pub struct CheckGuard {_fence:Fence,_root:RootGuard,project:PathBuf,identity:(u64,u64)}
+impl CheckGuard {
+    /// Release the fence, then take project ownership again, retrying while
+    /// another effect holds it until `wait` passes. The root stays shared throughout.
+    pub fn widen(self,wait:std::time::Duration)->Result<ProjectGuard> {
+        let CheckGuard{_fence,_root,project,identity}=self;drop(_fence);
+        let until=std::time::Instant::now()+wait;
+        let guard=loop {
+            match ProjectGuard::acquire(&project) {
+                Ok(guard)=>break guard,
+                Err(error) if std::time::Instant::now()>=until=>return Err(error.context("project ownership was not regained after the check")),
+                Err(_)=>std::thread::sleep(std::time::Duration::from_millis(25)),
+            }
+        };
+        guard.check_project(&project)?;ensure!(guard.identity==identity,"execution guard belongs to a different project");
+        Ok(guard)
     }
 }
 
@@ -127,21 +179,8 @@ impl ProjectSharedGuard {
         let root=RootGuard::shared(&root_path)?;
         ensure!(std::fs::symlink_metadata(project.join(".state"))?.is_dir(),"project state must be a real directory");
         let project_file=shared_file(&project.join(".state/effect.lock"),"another operation owns this project; retry")?;
-        let dir=root_path.join(".resource-fences");
-        match std::fs::symlink_metadata(&dir) {
-            Ok(meta)=>ensure!(meta.is_dir()&&!meta.file_type().is_symlink(),"resource fence directory must be a real directory"),
-            Err(error) if error.kind()==std::io::ErrorKind::NotFound => {
-                std::fs::DirBuilder::new().mode(0o700).create(&dir).or_else(|err| if err.kind()==std::io::ErrorKind::AlreadyExists {Ok(())} else {Err(err)})?;
-                let meta=std::fs::symlink_metadata(&dir)?;
-                ensure!(meta.is_dir()&&!meta.file_type().is_symlink(),"resource fence directory must be a real directory");
-            }
-            Err(error)=>return Err(error.into()),
-        }
         let mut fences=Vec::with_capacity(ordered.len());
-        for resource in &ordered {
-            let mut hasher=Sha256::new();hasher.update(resource.class.as_bytes());hasher.update([0]);hasher.update(resource.identity.as_bytes());
-            fences.push(exclusive_file(&dir.join(format!("{:x}",hasher.finalize())))?);
-        }
+        for resource in &ordered {fences.push(fence_file(&root_path,resource)?);}
         let routine=shared_file(&root_path.join(".routine-execution.lock"),"another operation owns this lock; retry")?;
         let metadata=std::fs::metadata(&project)?;
         Ok(Self{_project:project_file,_root:root,_fences:fences,_routine:routine,project,identity:(metadata.dev(),metadata.ino())})

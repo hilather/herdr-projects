@@ -1,12 +1,15 @@
 //! Automatic verification jobs run in their own single-worker lane, one at a
 //! time, with their own budget. The verifier records its run under the job key
 //! (the operation id); only that stored row can confirm the delivery.
+//! Project ownership covers the load, the claim and the record; the isolated
+//! check itself holds only the shared root and the job's scratch fence, so other
+//! project effects are not blocked for its whole duration.
 use std::{collections::BTreeMap,path::{Path,PathBuf},os::unix::fs::MetadataExt,sync::Arc,time::{Duration,Instant}};
 use anyhow::{Result,Context,ensure};
 use serde::{Serialize,Deserialize};
 use crate::{executor::{Executor,Identity,Lane,Limits,Request,Ticket},runner::{Runner,Cmd,Output,RealRunner},source_tree::Control};
-use herdr_projects::{migration,execution_guard::ProjectGuard,domain::{Operation,OperationId},store::SqliteStore,verification,
-    operations::{Claim,Outcome,DeliveryState,dispatch::{self,DeliveryAdapter,PreparedDelivery,DispatchRequest,DispatchResult}}};
+use herdr_projects::{migration,execution_guard::{CheckGuard,ProjectGuard,Resource},domain::{Operation,OperationId},store::SqliteStore,verification,
+    operations::{Claim,Outcome,DeliveryState}};
 const JOB:&str="\0herdr-projects-canonical-verification";
 /// Verifier timeout plus checkout and record; the claim lease is the store's 300 s maximum.
 const BUDGET:Duration=Duration::from_secs(330);
@@ -29,37 +32,32 @@ pub fn request(path:&Path,operation:&Operation,revision:u64,mode:Mode)->Result<R
     Ok(Request{identity:Identity{operation:format!("canonical-verification-{kind}:{}",operation.id.as_str()),revision,project:input.project.display().to_string(),machine:"local-verifier".into(),terminal:None},lane:Lane::Transfer,deadline,command})
 }
 
-#[derive(Clone,Copy)]
-struct Adapter<'a> {project:&'a Path,payload:&'a Payload,scratch:&'a Path,control:&'a Control}
-struct Prepared<'a> {adapter:Adapter<'a>}
-impl<'a> DeliveryAdapter for Adapter<'a> {
-    type Prepared=Prepared<'a>;
-    fn prepare(&mut self,operation:&Operation)->Result<Prepared<'a>> {
-        ensure!(operation.kind=="verification.run","not a verification job");self.control.check()?;Ok(Prepared{adapter:*self})
+enum Slot {Project(ProjectGuard),Check(CheckGuard),Lost}
+/// Project ownership handed to the verifier around its isolated check.
+struct Ownership<'a> {slot:Slot,scratch:Resource,claim:&'a Claim,control:&'a Control}
+impl verification::CheckOwnership for Ownership<'_> {
+    fn release(&mut self)->Result<()> {
+        let Slot::Project(guard)=std::mem::replace(&mut self.slot,Slot::Lost) else {anyhow::bail!("verification does not hold project ownership")};
+        match guard.fence(&self.scratch) {
+            Ok(fence)=>{self.slot=Slot::Check(guard.narrow(fence));Ok(())}
+            Err(error)=>{self.slot=Slot::Project(guard);Err(error)}
+        }
     }
-}
-impl PreparedDelivery for Prepared<'_> {
-    fn revalidate(&mut self,_:&Operation)->Result<()>{self.adapter.control.check()}
-    fn deliver(&mut self,operation:&Operation,_:&Claim)->Result<Outcome> {
-        let a=self.adapter;let mut db=migration::open_active(a.project)?;
-        let job=verification::StoredJob{submission_id:&a.payload.submission_id,policy_id:&a.payload.policy_id,policy_digest:&a.payload.policy_digest,
-            key:operation.id.as_str(),scratch:a.scratch,cancellation:a.control.cancellation.clone()};
-        let error=match verification::verify_stored(&mut db,&job) {Ok(_)=>None,Err(error)=>Some(error)};
-        // Success or not, only a run stored under the key is evidence.
-        Ok(match (recorded(&mut db,a.payload,operation)?,error) {
-            (Some(run),_)=>Outcome::Confirmed{observed_identity:run},
-            (None,_) if a.control.check().is_err()=>Outcome::Retryable{no_effect_evidence:"verifier cancelled before a verdict; no run is recorded under the job key".into()},
-            (None,error)=>Outcome::PermanentFailure{diagnostic:format!("verifier stopped before recording a verdict: {}; retry with `result <slug> retry-verification`",
-                error.map_or_else(||"no run recorded".into(),|e|format!("{e:#}")).chars().take(2048).collect::<String>())},
-        })
+    fn reacquire(&mut self,store:&mut SqliteStore)->Result<()> {
+        let Slot::Check(check)=std::mem::replace(&mut self.slot,Slot::Lost) else {anyhow::bail!("verification is not narrowed to its check")};
+        self.slot=Slot::Project(check.widen(self.control.deadline.saturating_duration_since(Instant::now()))?);
+        // The claim carries the task revision fence and the lease.
+        store.validate_claim(self.claim,now()).map_err(|error|verification::FenceChanged(format!("job claim no longer holds: {error}")))?;Ok(())
     }
+    fn held(&self)->bool {matches!(self.slot,Slot::Project(_))}
 }
+fn now()->i64 {jiff::Timestamp::now().as_millisecond()}
 fn recorded(db:&mut SqliteStore,payload:&Payload,operation:&Operation)->Result<Option<String>> {
     Ok(verification::recorded_run(db,&payload.project_store,operation.id.as_str())?.map(|(run,_)|run))
 }
 
 fn execute(input:&Input,control:&Control)->Result<()> {
-    control.check()?;let guard=ProjectGuard::acquire(&input.project)?;guard.check_project(&input.project)?;
+    control.check()?;let mut guard=ProjectGuard::acquire(&input.project)?;guard.check_project(&input.project)?;
     let metadata=std::fs::metadata(&input.project)?;ensure!((metadata.dev(),metadata.ino())==input.identity,"verification project changed");
     let mut db=migration::open_active(&input.project)?;
     let (_,rows)=db.operation_rows(&input.operation,None)?;let (operation,delivery)=rows.context("verification job missing")?;
@@ -67,13 +65,13 @@ fn execute(input:&Input,control:&Control)->Result<()> {
     let payload:Payload=serde_json::from_value(operation.payload.clone())?;
     // Beside, not inside, `.state`: the verifier refuses a checkout within the store directory.
     let scratch=input.project.join(".verify-scratch").join(operation.id.as_str());
-    let now=||jiff::Timestamp::now().as_millisecond();
+    let fence=Resource::new("scratch",scratch.display().to_string())?;
     if input.mode==Mode::Observe {
         // A lost reply: confirm a recorded run, or prove there is none and redeliver under the same key.
         ensure!(delivery.state==DeliveryState::Ambiguous,"verification observation is stale");
         let outcome=match recorded(&mut db,&payload,&operation)? {
             Some(run)=>Outcome::Confirmed{observed_identity:run},
-            None=>{verification::clear_scratch(&scratch)?;Outcome::Retryable{no_effect_evidence:"no verification run is recorded under the job key; scratch removed; redeliver with the same key".into()}},
+            None=>{let _fence=guard.fence(&fence)?;verification::clear_scratch(&scratch)?;Outcome::Retryable{no_effect_evidence:"no verification run is recorded under the job key; scratch removed; redeliver with the same key".into()}},
         };
         db.observe_operation(&operation.id,input.revision,OWNER,outcome,now())?;return Ok(());
     }
@@ -81,11 +79,31 @@ fn execute(input:&Input,control:&Control)->Result<()> {
         // Never run unsandboxed: stay pending with a visible reason.
         db.note_verification_paused(&operation.id,&format!("{error:#}"))?;return Err(error.context("verification paused"));
     }
-    let mut adapter=Adapter{project:&input.project,payload:&payload,scratch:&scratch,control};
-    match dispatch::dispatch_one(&mut db,DispatchRequest{operation:&input.operation,expected_revision:input.revision,owner:OWNER,lease_ms:LEASE_MS},&mut adapter,now)? {
-        DispatchResult::Recorded(_)=>Ok(()),
-        DispatchResult::Unrecorded{..}=>anyhow::bail!("verification outcome unrecorded; retain claim and observe after expiry"),
-    }
+    let claim=db.claim_operation(&input.operation,input.revision,OWNER,now(),LEASE_MS)?;
+    let outcome=if control.check().is_err() {
+        Outcome::Retryable{no_effect_evidence:"adapter authorization withdrawn before deliver was called".into()}
+    } else {
+        db.validate_claim(&claim,now()).map_err(|error|anyhow::anyhow!("verification outcome unrecorded ({error}); retain claim and observe after expiry"))?;
+        let mut ownership=Ownership{slot:Slot::Project(guard),scratch:fence,claim:&claim,control};
+        let job=verification::StoredJob{submission_id:&payload.submission_id,policy_id:&payload.policy_id,policy_digest:&payload.policy_digest,
+            key:operation.id.as_str(),scratch:&scratch,cancellation:control.cancellation.clone()};
+        let result=verification::verify_stored(&mut db,&job,&mut ownership);
+        // Never record without project ownership: the claim expires and is observed by key.
+        let Slot::Project(held)=ownership.slot else {anyhow::bail!("verification outcome unrecorded: {}; retain claim and observe after expiry",
+            result.err().map_or_else(||"project ownership was not regained".into(),|e|format!("{e:#}")))};
+        guard=held;
+        // Success or not, only a run stored under the key is evidence.
+        match (recorded(&mut db,&payload,&operation),result) {
+            (Err(_),_)=>Outcome::Ambiguous{observation_required:"adapter failed after delivery began; observe effect before retry (details withheld)".into()},
+            (Ok(Some(run)),_)=>Outcome::Confirmed{observed_identity:run},
+            (Ok(None),Err(error)) if error.is::<verification::FenceChanged>()=>Outcome::Retryable{no_effect_evidence:format!("{error}; no run is recorded under the job key; redeliver with the same key")},
+            (Ok(None),_) if control.check().is_err()=>Outcome::Retryable{no_effect_evidence:"verifier cancelled before a verdict; no run is recorded under the job key".into()},
+            (Ok(None),error)=>Outcome::PermanentFailure{diagnostic:format!("verifier stopped before recording a verdict: {}; retry with `result <slug> retry-verification`",
+                error.err().map_or_else(||"no run recorded".into(),|e|format!("{e:#}")).chars().take(2048).collect::<String>())},
+        }
+    };
+    db.finish_operation(&claim,outcome,now()).map_err(|error|anyhow::anyhow!("verification outcome unrecorded ({error}); retain claim and observe after expiry"))?;
+    drop(guard);Ok(())
 }
 pub struct JobRunner {pub inner:Arc<dyn Runner+Send+Sync>}
 impl Runner for JobRunner {

@@ -194,10 +194,23 @@ Recorded here rather than folded into the card that found them.
   0047 adds the fence to the one-job unique indexes. Integration jobs get the
   same treatment. A retired job cannot be retried with `retry-*`. E2E:
   `ticker_replaces_result_jobs_bound_to_an_older_task_revision`.
-- **The verifier holds project ownership for the whole check** (up to about
-  4 minutes), as the operator `verify` command does, blocking other effects in
-  that project and root-exclusive operations. Consider narrowing it to the
-  store transactions.
+- **The verifier holds project ownership for the whole check** — partly done
+  (this PR). An automatic verification job now holds exclusive project
+  ownership only to load and fence its inputs, claim, prepare scratch and
+  record. The isolated check runs under a `CheckGuard`: the shared root (so
+  migration and cleanup are still refused) plus a `scratch` resource fence on
+  the job's scratch directory, which observation also takes before removing
+  it. Afterwards the job regains ownership (retrying until its deadline),
+  revalidates the claim (lease and task revision) and reloads the target; if
+  the submission, contract, policy or attempt changed, it records no verdict
+  and the job is retried or, after a task revision change, left for lease
+  expiry, observation by key and replacement. Without regained ownership it
+  records nothing. E2E:
+  `ticker_auto_verification_releases_project_ownership_during_the_check`.
+  Still open: integration jobs keep exclusive ownership throughout, because
+  their candidate policy checks run inside `integrate_job` between the merge
+  and the compare-and-swap publication, and the operator `result verify`
+  command still holds ownership for its whole check.
 - **No E2E for the isolation-unavailable pause** (`verification.paused`); it
   cannot be simulated from outside without a hook in the shipped binary.
 - **Integration job follow-ups (card 3):** retry command done (this PR):

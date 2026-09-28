@@ -2166,6 +2166,79 @@ fn ticker_auto_verifies_once_and_recovers_after_kill() {
 
 #[cfg(all(feature="state-store",target_os="linux"))]
 #[test]
+fn ticker_auto_verification_releases_project_ownership_during_the_check() {
+    use std::{io::{Read,Write},sync::{Arc,atomic::{AtomicUsize,Ordering}}};
+    use herdr_projects::{migration,runtime,operations::DeliveryState};
+    // A local git-protocol fixture holds connection `n` until `released > n`.
+    let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();let port=listener.local_addr().unwrap().port();
+    let released=Arc::new(AtomicUsize::new(0));let connections=Arc::new(AtomicUsize::new(0));
+    {let released=released.clone();let connections=connections.clone();std::thread::spawn(move||for stream in listener.incoming(){
+        let Ok(mut stream)=stream else{continue};let index=connections.fetch_add(1,Ordering::SeqCst);let released=released.clone();
+        std::thread::spawn(move||{let mut buffer=[0u8;4096];let _=stream.read(&mut buffer);while released.load(Ordering::SeqCst)<=index{std::thread::sleep(std::time::Duration::from_millis(10));}let _=stream.write_all(b"0000");let _=stream.read(&mut buffer);});
+    });}
+    let f=VerifyFixture::new(&[("src/lib.rs","pub fn result() {}\n".into())]);
+    let waits=[("waits",format!(r#"{{"version":1,"checks":["/usr/bin/git","ls-remote","git://127.0.0.1:{port}/fixture"]}}"#))];
+    let first=f.submit("first",&waits);
+    runtime::add_task(&f.project,herdr_projects::domain::TaskId::new("other").unwrap(),"other".into(),runtime::snapshot(&f.project).unwrap().head).unwrap();
+    f.automate();
+    let job=|submission:&str|f.jobs().into_iter().find(|(op,_)|op.payload["submission_id"]==submission);
+    let runs=|submission:&str|f.db().query_row("SELECT count(*) FROM verification_runs WHERE submission_id=?1",[submission],|row|row.get::<_,u64>(0)).unwrap();
+    // Renaming needs project ownership. The ticker's own turn holds it briefly,
+    // so only a lock held for the whole check makes every attempt fail.
+    let rename=|task:&str,title:&str|{
+        for _ in 0..40 {
+            let snapshot=runtime::snapshot(&f.project).unwrap();let revision=snapshot.tasks.iter().find(|t|t.id.as_str()==task).unwrap().revision;
+            let out=hp(f.home.path(),&["--root",f.r(),"task","demo","rename",task,"--title",title,"--expected-revision",&revision.to_string(),"--expected-head",&snapshot.head.to_string()]);
+            if out.status.success() {return;}
+            let stderr=String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(stderr.contains("owns"),"{stderr}");std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("the running verification check kept project ownership");
+    };
+    let scratch=f.project.join(".verify-scratch");
+    let mut child=f.spawn();
+    f.wait(&mut child,90,&||connections.load(Ordering::SeqCst)>=1&&job(&first).is_some_and(|(_,d)|d.state==DeliveryState::Claimed));
+    // While the isolated check runs, another project effect proceeds, but
+    // root-exclusive maintenance is still refused.
+    rename("other","renamed during the check");
+    assert!(herdr_projects::execution_guard::RootGuard::exclusive(&f.root).is_err(),"the check keeps the root shared");
+    assert_eq!(runs(&first),0);
+    released.store(1,Ordering::SeqCst);
+    f.wait(&mut child,90,&||job(&first).is_some_and(|(_,d)|d.state==DeliveryState::Confirmed));
+    f.stop(&mut child);
+    let (op,delivery)=job(&first).unwrap();assert_eq!(delivery.attempts,1);
+    let (state,key):(String,String)=f.db().query_row("SELECT state,idempotency_key FROM verification_runs WHERE submission_id=?1",[&first],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert_eq!((state.as_str(),key.as_str(),runs(&first)),("accepted",op.id.as_str(),1));
+    assert_eq!(runtime::snapshot(&f.project).unwrap().tasks.iter().find(|t|t.id.as_str()=="other").unwrap().title,"renamed during the check");
+    // The job's own task moves during the check: no verdict is recorded, and
+    // recovery replaces the job with one fenced on the new revision.
+    let second=f.submit("second",&waits);
+    let mut child=f.spawn();
+    f.wait(&mut child,90,&||connections.load(Ordering::SeqCst)>=2&&job(&second).is_some_and(|(_,d)|d.state==DeliveryState::Claimed));
+    let (old,_)=job(&second).unwrap();
+    rename("second","moved during the check");
+    released.store(2,Ordering::SeqCst);
+    f.wait(&mut child,90,&||!scratch.join(old.id.as_str()).exists());
+    f.stop(&mut child);
+    let (_,claimed)=job(&second).unwrap();
+    assert_eq!((claimed.state,runs(&second)),(DeliveryState::Claimed,0),"a stale check records nothing");
+    migration::open_active(&f.project).unwrap().expire_claims(claimed.lease_until_ms.unwrap()+1).unwrap();
+    released.store(usize::MAX,Ordering::SeqCst);
+    let replaced=||f.jobs().into_iter().find(|(op,_)|op.payload["submission_id"]==second.as_str()&&op.id!=old.id);
+    let mut child=f.spawn();
+    f.wait(&mut child,120,&||replaced().is_some_and(|(_,d)|d.state==DeliveryState::Confirmed));
+    f.stop(&mut child);
+    let retired=f.jobs().into_iter().find(|(op,_)|op.id==old.id).unwrap().1;
+    assert_eq!(retired.state,DeliveryState::PermanentFailure);
+    assert!(serde_json::to_string(&retired.last_outcome).unwrap().contains("task_revision_changed"),"{:?}",retired.last_outcome);
+    let (new,_)=replaced().unwrap();
+    let (state,key):(String,String)=f.db().query_row("SELECT state,idempotency_key FROM verification_runs WHERE submission_id=?1",[&second],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert_eq!((state.as_str(),key.as_str(),runs(&second)),("accepted",new.id.as_str(),1));
+    assert_eq!(std::fs::read_dir(&scratch).map(|entries|entries.count()).unwrap_or(0),0,"scratch is removed after every job");
+}
+
+#[cfg(all(feature="state-store",target_os="linux"))]
+#[test]
 fn ticker_auto_integrates_two_results_serially_and_recovers_stale_and_crash() {
     use std::{io::{Read,Write},sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering}}};
     use herdr_projects::{migration,runtime,operations::{DeliveryState,Outcome}};

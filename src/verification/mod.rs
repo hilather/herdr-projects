@@ -258,9 +258,32 @@ pub struct StoredJob<'a> {
     pub cancellation: crate::runner::Cancellation,
 }
 
-/// Controller ingress. The caller holds project ownership and a live claim.
-/// The scratch directory is removed on every return path it can reach.
-pub fn verify_stored(store: &mut SqliteStore, job: &StoredJob<'_>) -> Result<VerifyOutcome> {
+/// Project ownership for an automatic check. The job loads and records under
+/// it, and gives it up only while the isolated check runs in its own scratch.
+pub trait CheckOwnership {
+    /// Narrow ownership to the check's scratch fence and the shared root.
+    fn release(&mut self) -> Result<()>;
+    /// Take project ownership again and recheck the job's own fences; a
+    /// [`FenceChanged`] error means nothing may be recorded.
+    fn reacquire(&mut self, store: &mut SqliteStore) -> Result<()>;
+    /// Whether project ownership is held now.
+    fn held(&self) -> bool;
+}
+
+/// The job's inputs changed while the check ran; no verdict was recorded.
+#[derive(Debug)]
+pub struct FenceChanged(pub String);
+impl std::fmt::Display for FenceChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "verification inputs changed during the check: {}", self.0)
+    }
+}
+impl std::error::Error for FenceChanged {}
+
+/// Controller ingress. The caller holds project ownership and a live claim;
+/// `ownership` is released only around the isolated check. The scratch
+/// directory is removed on every return path it can reach under ownership.
+pub fn verify_stored(store: &mut SqliteStore, job: &StoredJob<'_>, ownership: &mut dyn CheckOwnership) -> Result<VerifyOutcome> {
     use std::os::unix::fs::DirBuilderExt;
     clear_scratch(job.scratch)?;
     let target = store.load_verify_target(job.submission_id, job.policy_id)?;
@@ -281,8 +304,10 @@ pub fn verify_stored(store: &mut SqliteStore, job: &StoredJob<'_>) -> Result<Ver
         let mut request = VerifyRequest::new(job.submission_id, job.policy_id, policy_path, job.key, AUTO_TIMEOUT, job.scratch.join("work"));
         request.cancellation = Some(job.cancellation.clone());
         fs::DirBuilder::new().mode(0o700).create(&request.work_dir)?;
-        verify(store, &request)
+        verify_owned(store, &request, Some(&mut *ownership))
     })();
+    // Without ownership, recovery (observation by key) removes the scratch.
+    if !ownership.held() { return outcome; }
     let cleanup = clear_scratch(job.scratch);
     let outcome = outcome?;
     cleanup.context("verification recorded but scratch cleanup failed")?;
@@ -335,6 +360,10 @@ fn read_policy(path: &Path) -> Result<Vec<u8>> {
 }
 
 pub fn verify(store: &mut SqliteStore, request: &VerifyRequest) -> Result<VerifyOutcome> {
+    verify_owned(store, request, None)
+}
+
+fn verify_owned(store: &mut SqliteStore, request: &VerifyRequest, ownership: Option<&mut dyn CheckOwnership>) -> Result<VerifyOutcome> {
     let target = store.load_verify_target(&request.submission_id, &request.policy_id)?;
     let policy_bytes = read_policy(&request.policy_path)?;
     let payload_digest = sha256(&format!(
@@ -505,7 +534,22 @@ pub fn verify(store: &mut SqliteStore, request: &VerifyRequest) -> Result<Verify
         );
     }
     launch.cmd.cancellation = request.cancellation.clone();
-    let output = match RealRunner.run(&launch.cmd) {
+    // The check touches only its own scratch; record only if the inputs still hold.
+    let (ran, target) = match ownership {
+        Some(ownership) => {
+            ownership.release()?;
+            let ran = RealRunner.run(&launch.cmd);
+            ownership.reacquire(store)?;
+            let fresh = store.load_verify_target(&request.submission_id, &request.policy_id)
+                .map_err(|error| FenceChanged(format!("{error}")))?;
+            if !fresh.same_job(&target) {
+                return Err(FenceChanged("submission, contract, policy or attempt changed".into()).into());
+            }
+            (ran, fresh)
+        }
+        None => (RealRunner.run(&launch.cmd), target),
+    };
+    let output = match ran {
         // A cancelled check is no verdict: record nothing and let the caller retry.
         Ok(output) if output.cancelled => bail!("verification cancelled before a verdict"),
         Ok(output) => output,

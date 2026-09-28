@@ -126,6 +126,21 @@ fn read_retained(path: &Path, expected_hash: &str, size: u64) -> Result<Vec<u8>>
 }
 
 impl VerifyTarget {
+    /// The same job inputs, reloaded later; only the event head may differ.
+    pub(crate) fn same_job(&self, other: &VerifyTarget) -> bool {
+        self.project_store == other.project_store
+            && self.payload_digest == other.payload_digest
+            && self.task_id == other.task_id
+            && self.contract_revision == other.contract_revision
+            && self.contract_digest == other.contract_digest
+            && self.attempt_id == other.attempt_id
+            && self.attempt_revision == other.attempt_revision
+            && self.candidate_oid == other.candidate_oid
+            && self.object_format == other.object_format
+            && self.policy_digest == other.policy_digest
+            && self.store_device == other.store_device
+            && self.store_inode == other.store_inode
+    }
     fn pin_matches(&self) -> Result<()> {
         let meta = self
             .pin

@@ -1,8 +1,9 @@
 //! Automatic integration jobs. They share the single-worker result lane with
-//! verification jobs (both hold exclusive project ownership), one job at a
-//! time, with their own budget. The integrator publishes only through its
-//! expected-old compare-and-swap; only an integrated operation under the job
-//! key (the operation id) can confirm the delivery.
+//! verification jobs, one job at a time, with their own budget. The integrator
+//! publishes only through its expected-old compare-and-swap; only an integrated
+//! operation under the job key (the operation id) can confirm the delivery.
+//! Unlike verification, the whole job keeps project ownership: its candidate
+//! checks run inside the integrator between the merge and the publication.
 use std::{path::{Path,PathBuf},os::unix::fs::MetadataExt,time::{Duration,Instant}};
 use anyhow::{Result,Context,ensure};
 use serde::{Serialize,Deserialize};
