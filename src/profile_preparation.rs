@@ -264,9 +264,11 @@ fn prepare_locked(
         herdr,
         adapter: VersionedReference {
             id: "canonical-local-herdr-0.9.1".into(),
-            revision: 2,
+            revision: 3,
+            // Either direct-root transport may launch; verification evidence
+            // names the one it actually exercised.
             digest: digest(
-                b"canonical-local-herdr-0.9.1;isolated-gate-v1;direct-exec-v1;native-name-v1;workspace.create_command-v1;pane.get",
+                b"canonical-local-herdr-0.9.1;isolated-gate-v1;direct-exec-v1;native-name-v1;direct-root:workspace.create_command-v1|workspace.create+exec-launch-v1;pane.get",
             ),
         },
         capabilities: ProfileCapabilities {
@@ -473,7 +475,7 @@ mod tests {
                 init: crate::worker_supervision::ProcessIncarnation { pid: 21, device: 1, inode: 5 },
             },
             native_kind: preparation.profile.kind.clone(),
-            observed_unix_ms: 1000, stopped_unix_ms: 1001, interaction: None,
+            observed_unix_ms: 1000, stopped_unix_ms: 1001, interaction: None, transport: None,
         };
         let hash = digest(&serde_json::to_vec(&evidence).unwrap());
         let reference = VersionedReference { id: format!("native-transport-{hash}"), revision: 1, digest: hash };

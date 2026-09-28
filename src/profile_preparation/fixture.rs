@@ -20,6 +20,7 @@ pub(crate) fn retain(project: &Path, herdr: &Path, agent: &Path, home: &Path) ->
             terminal:"fixture-terminal".into(),readiness_manifest:"fixture-manifest".into(),
             prompt_digest:"a".repeat(64),acknowledged_unix_ms:999,
         }),
+        transport:None,
     };
     native::apply_evidence(&mut preparation,&evidence).unwrap();
     let source=project.join(".state/state.db").canonicalize().unwrap();

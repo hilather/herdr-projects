@@ -93,3 +93,14 @@ hashes the launch inputs with the approval reference removed. Draft sets
 (`proof.store_path()`). A grant whose scope names a different path does not
 match, including after the database file is moved. Content identity is not a
 signature. `PreparedDelegation::matches_launch` does not bind a launch.
+
+## Herdr direct-root transport
+
+The Herdr compatibility patch in `patches/herdr/` is optional. Stock Herdr
+0.9.1 or later works: without `capabilities.workspace_create_command`, a new
+worker workspace starts its default shell and the adapter types
+`exec <herdr-projects> launch-exec <private spec>` into it, then counts the
+launch only after observing the exact supervisor as that pane's process. An
+unconfirmed launch closes its workspace. See
+[canonical worker launch](../canonical-worker-launch.md) and the upstream request
+<https://github.com/herdrdev/herdr/discussions/3345>.

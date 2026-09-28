@@ -375,12 +375,27 @@ verified Codex startup/naming/termination contract and remaining certification g
 
 ### Creating a worker workspace
 
-New launches without a workspace use `workspace.create_command` from the locally
-validated Herdr compatibility patch in `patches/herdr/`. The first pane itself
-runs the bounded, gated PID-namespace supervisor. The adapter never falls back
-to shell creation when this method is unavailable. The installed stock Herdr
-binary has not been replaced, and production capability certification remains
-required before admission.
+New launches without a workspace use `workspace.create_command` when the
+connected server advertises it (the optional patch in `patches/herdr/`). The
+first pane itself runs the bounded, gated PID-namespace supervisor. Stock Herdr
+(0.9.1 and upstream HEAD) lacks that method, so the adapter instead uses
+`workspace.create` and types one line into the new default shell:
+`exec <herdr-projects> launch-exec <spec>`. Both paths are absolute and must
+match `[A-Za-z0-9/._-]`, so no shell (POSIX, fish, ...) needs quoting. The
+literal supervisor argv and working directory are written first to a private
+single-use spec (`.state/launch-specs/<command-digest>.spec`, directory 0700,
+file 0600). The launcher requires that private file, its digest-bound name, the
+matching argv digest and the canonical supervisor vector, deletes it, changes to
+the recorded directory and execs the argv, replacing the shell in place. The
+launch counts only once bounded `pane.process_info` polling observes the exact
+supervisor as the root pane's process, leaving six seconds of the original
+deadline for cleanup. Otherwise (hanging rc files, swallowed input, refused spec)
+the adapter deletes the spec and closes the workspace; no workspace or target is
+recorded and the retained claim recovers nothing. Version 3 creation intents mark
+this transport and recover exactly like version 2; recovery deletes an unconsumed
+spec. Upstream support is tracked in
+<https://github.com/herdrdev/herdr/discussions/3345>. Production capability
+certification remains required before admission.
 
 Version 2 `runtime.launch_creation` intents distinguish this path from historical
 bootstrap launches. The exact command digest and server session are retained
@@ -478,13 +493,15 @@ method is `pane.get`. Fixture dispatch now uses that same method.
 
 Before a fresh direct-root launch consumes approval, the adapter sends a bounded
 read-only `ping` to the exact socket incarnation. It requires the expected Herdr
-version and boolean `capabilities.workspace_create_command: true`. Repository
-launches perform this admission before the worktree claim and repeat it before
-native creation. Missing, false, malformed or version-mismatched advertisements
-refuse creation without consuming the approval or creating checkout paths.
+version. `capabilities.workspace_create_command: true` selects the patched
+method; a missing or false advertisement selects the stock exec-into-shell
+launcher, whose typed paths are validated at this point. Repository launches
+perform this admission before the worktree claim and repeat it before native
+creation. Malformed or version-mismatched advertisements, or launcher paths
+outside the safe character set, refuse creation without consuming the approval
+or creating checkout paths.
 
-The local compatibility patch advertises the capability. The earlier patch build
-without advertisement is deliberately refused for fresh workspace creation.
+The optional compatibility patch advertises the capability.
 Recovery of already-recorded native resources still uses their retained identities;
 this check does not retroactively remove resources or replay requests. Existing
 workspace launches retain their `layout.apply` path. The advertisement establishes

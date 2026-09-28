@@ -31,6 +31,29 @@ fn launch_worker_snapshot_cli_retains_instructions_and_refuses_missing_source() 
 
 #[cfg(all(feature="state-store",target_os="linux"))]
 #[test]
+fn launch_exec_consumes_one_private_digest_bound_spec_and_execs_the_supervisor() {
+    use sha2::{Digest,Sha256};use std::{fs,os::unix::fs::{DirBuilderExt,PermissionsExt}};
+    let home=tempfile::tempdir().unwrap();let base=home.path().canonicalize().unwrap();
+    let dir=base.join("launch-specs");fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    let marker=base.join("started");
+    let argv=herdr_projects::worker_supervision::command(Path::new("/usr/bin/touch"),&[marker.display().to_string()],5).unwrap();
+    let digest=format!("{:x}",Sha256::digest(serde_json::to_vec(&argv).unwrap()));
+    let body=serde_json::to_vec(&serde_json::json!({"version":1,"operation":"cli","cwd":base,"command_digest":digest,"argv":argv})).unwrap();
+    let spec=dir.join(format!("{digest}.spec"));let other=dir.join(format!("{}.spec","0".repeat(64)));
+    let run=|path:&Path|Command::new(BIN).env_clear().env("PATH","/usr/bin:/bin").arg("launch-exec").arg(path).output().unwrap();
+    // A spec bound to another digest, or readable by others, is refused and kept.
+    for (path,mode) in [(&other,0o600),(&spec,0o644)] {
+        fs::write(path,&body).unwrap();fs::set_permissions(path,fs::Permissions::from_mode(mode)).unwrap();
+        let out=run(path);assert!(!out.status.success());assert!(path.exists()&&!marker.exists());fs::remove_file(path).unwrap();
+    }
+    fs::write(&spec,&body).unwrap();fs::set_permissions(&spec,fs::Permissions::from_mode(0o600)).unwrap();
+    let out=run(&spec);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    assert!(marker.exists());assert!(!spec.exists());
+    assert!(!run(&spec).status.success(),"a consumed spec must not launch again");
+}
+
+#[cfg(all(feature="state-store",target_os="linux"))]
+#[test]
 fn ticker_canonical_observations_commit_cancel_and_restart_in_the_shared_pool() {
     use std::{fs,os::unix::{fs::PermissionsExt,net::UnixListener},process::Stdio,time::{Duration,Instant}};
     use herdr_projects::{migration,runtime,domain::RuntimeRoute,reconcile::ResourceState};

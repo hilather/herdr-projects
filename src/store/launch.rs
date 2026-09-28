@@ -37,8 +37,8 @@ pub(super) fn has_started_receipt(
 pub(super) fn record_creation(tx: &Connection, claim: &Claim, prepared: &PreparedLaunchCreation, now: i64, budget: Option<&read_budget::ReadBudget>) -> Result<u64> {
     let intent = &prepared.intent;
     intent.route.validate().map_err(StoreError::Invalid)?;
-    if !matches!(intent.version, 1 | 2)
-        || (intent.version == 2
+    if !matches!(intent.version, 1..=3)
+        || (intent.version >= 2
             && (!intent.route.workspace_id.is_empty() || intent.workspace_token.is_some()))
         || intent.workspace_token.as_ref().is_some_and(|token| {
             token.len() != 64
@@ -518,8 +518,8 @@ impl SqliteStore {
             )?;
             let intent: LaunchCreationIntent =
                 serde_json::from_str(&payload).map_err(|_| invalid("invalid creation intent"))?;
-            if !matches!(intent.version, 1 | 2)
-                || (intent.version == 2
+            if !matches!(intent.version, 1..=3)
+                || (intent.version >= 2
                     && (!intent.route.workspace_id.is_empty() || intent.workspace_token.is_some()))
                 || intent.operation != target.operation
                 || intent.attempt != target.attempt
@@ -561,7 +561,7 @@ impl SqliteStore {
             )?;
             let creation: LaunchCreationIntent = serde_json::from_str(&payload)
                 .map_err(|_| invalid("invalid retained creation intent"))?;
-            if creation.version == 2 {
+            if matches!(creation.version, 2 | 3) {
                 if creation.operation != target.operation
                     || creation.attempt != target.attempt
                     || creation.session != target.session
@@ -751,8 +751,8 @@ impl SqliteStore {
         let creation: LaunchCreationIntent = serde_json::from_str(&creation)
             .map_err(|_| invalid("invalid retained creation intent"))?;
         let (execution_route,_) = super::worktrees::execution_route_with_budget(&tx,&record,&binding,budget)?;
-        if !matches!(creation.version, 1 | 2)
-            || (creation.version == 2
+        if !matches!(creation.version, 1..=3)
+            || (creation.version >= 2
                 && (!creation.route.workspace_id.is_empty() || creation.workspace_token.is_some()))
             || creation.operation != claim.operation
             || creation.attempt != record.attempt

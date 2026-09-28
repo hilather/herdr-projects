@@ -172,6 +172,8 @@ pub struct PreparedLaunchStopped {
 pub struct LaunchCreationIntent {
     /// 1: existing workspace tab or historical shell/bootstrap workspace.
     /// 2: literal supervised first pane via workspace.create_command.
+    /// 3: stock workspace.create whose default shell execs the fixed launcher
+    ///    (`herdr-projects launch-exec <spec>`); recovered exactly like 2.
     pub version: u32,
     pub operation: OperationId,
     pub attempt: AttemptId,

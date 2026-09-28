@@ -226,8 +226,10 @@ herdr-projects profile verify-native PROJECT PROFILE \
 
 This command performs installation preparation, then starts a disposable Herdr
 server with its own temporary home, configuration, socket and working directory.
-It uses `workspace.create_command`, so stock Herdr 0.9.1 without the compatibility
-patch is unsupported. The current verified mapping requires empty `extra_args`; positional prompts and
+It uses `workspace.create_command` when the server advertises it; stock Herdr
+0.9.1 uses the exec-into-shell launcher described in
+[canonical worker launch](canonical-worker-launch.md). The evidence's `transport`
+field records which one was verified. The current verified mapping requires empty `extra_args`; positional prompts and
 vendor subcommands must not run a task during this transport check. The exact
 configured agent runs with the explicit execution home; the agent can read its credentials/configuration there.
 No task prompt is submitted. Use an empty temporary home for an unauthenticated

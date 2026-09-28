@@ -406,6 +406,9 @@ enum Command {
     /// Read-only bounded report observation, before environment resolution.
     #[command(hide = true)]
     ReportHash { #[arg(long)] path:PathBuf },
+    /// Stock Herdr launcher: consume one private launch spec and exec it.
+    #[command(hide = true)]
+    LaunchExec { spec: PathBuf },
     /// Versioned binary artifact transport for remote preservation.
     #[command(hide = true)]
     ArtifactStream {
@@ -800,6 +803,12 @@ pub fn run() -> Result<()> {
     }
     if let Command::ReportHash {path}=&cli.command {
         println!("{}",serde_json::to_string(&crate::local_reports::Observation{hash:crate::source_tree::report_hash(path)?})?);return Ok(());
+    }
+    if let Command::LaunchExec { spec } = &cli.command {
+        #[cfg(all(feature="state-store",target_os="linux"))]
+        return herdr_projects::canonical_worker::exec_launch_spec(spec).map(|never| match never {});
+        #[cfg(not(all(feature="state-store",target_os="linux")))]
+        bail!("launch-exec {} requires Linux and --features state-store", spec.display());
     }
     if let Command::ArtifactStream { probe, path, live } = &cli.command {
         if *probe { crate::artifacts::probe(); return Ok(()); }
@@ -1361,7 +1370,7 @@ pub fn run() -> Result<()> {
             println!("{}",serde_json::to_string_pretty(&value)?);
             Ok(())
         }
-        Command::ReportHash {..}|Command::ArtifactStream { .. } => unreachable!("artifact transport handled before environment resolution"),
+        Command::ReportHash {..}|Command::LaunchExec {..}|Command::ArtifactStream { .. } => unreachable!("artifact transport handled before environment resolution"),
         Command::New { name, goal, repos } => {
             let repos = repos.iter().map(|arg| project::parse_repo_arg(arg)).collect();
             let project = project::create(&ctx.root, &name, &goal, repos)?;

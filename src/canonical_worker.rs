@@ -17,6 +17,10 @@ pub(crate) mod inventory;
 mod launch;
 #[cfg(target_os = "linux")]
 pub use launch::advance_launch;
+#[cfg(target_os = "linux")]
+pub(crate) mod launch_spec;
+#[cfg(target_os = "linux")]
+pub use launch_spec::exec as exec_launch_spec;
 mod resources;
 pub(crate) use resources::validate_server_creation;
 #[cfg(target_os = "linux")]

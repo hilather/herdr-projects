@@ -1,5 +1,14 @@
 # Supervised workspace creation compatibility patch
 
+This patch is optional. Stock Herdr 0.9.1 or later works without it: when a
+server does not advertise `capabilities.workspace_create_command`, the adapter
+creates the workspace with `workspace.create`, types
+`exec <herdr-projects> launch-exec <private spec>` into its default shell, and
+confirms the exact supervisor replaced that shell before counting the launch
+(see `docs/canonical-worker-launch.md`). Patched servers keep using
+`workspace.create_command`, which never starts a shell at all. Upstream support
+is requested in <https://github.com/herdrdev/herdr/discussions/3345>.
+
 `workspace-create-command.patch` applies to Herdr 0.9.1 source commit
 `065ef9d6a531c49fb8bee7e818ef837065b21ee9`. It is a local compatibility
 patch, not an upstream release or an installed runtime update.
@@ -64,8 +73,8 @@ The canonical adapter now uses this API for new workspaces, with version 2
 creation intents, atomic root/workspace ownership and observation-only lost-reply
 recovery. Existing workspace launches still use `layout.apply`; historical
 bootstrap receipts retain their recovery path. Stock 0.9.1 does not support this
-method, and the adapter does not fall back to shell creation. Version alone
-cannot certify capability. Server capability admission now refuses unsupported
+method; the adapter then uses the exec-into-shell launcher (version 3 creation
+intents). Version alone cannot certify capability. Server capability admission now refuses unsupported
 endpoints before resource effects. Resource cleanup and complete vendor workflow
 acceptance remain pending; dispatch is
 disabled. Remove this patch only when an upstream method provides the same

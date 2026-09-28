@@ -76,7 +76,12 @@ pub struct NativeEvidence {
     pub stopped_unix_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interaction: Option<InteractionEvidence>,
+    /// Direct-root transport actually exercised. Historical evidence omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
 }
+pub(crate) const COMMAND_TRANSPORT: &str = "workspace.create_command-v1";
+pub(crate) const STOCK_TRANSPORT: &str = "workspace.create+exec-launch-v1";
 
 #[derive(Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -390,7 +395,28 @@ pub(super) fn verify(
         execution_home,
     )?;
     let cwd = lab.root.join("work");
-    let created=api.call("workspace.create_command",json!({"cwd":cwd,"command":argv,"focus":false,"label":"Profile transport verification","env":{}}))?;
+    // Patched servers start argv directly; stock servers start the default shell,
+    // which then execs the fixed launcher. Evidence records which was verified.
+    let ping = api.call("ping", json!({}))?;
+    let advertised = &ping["capabilities"]["workspace_create_command"];
+    ensure!(
+        ping["type"] == "pong"
+            && ping["version"].as_str() == Some(profile.herdr.version.as_str())
+            && (advertised.is_null() || advertised.is_boolean()),
+        "native probe server does not advertise a verified direct-root launch contract"
+    );
+    let launch = if advertised.as_bool() == Some(true) {
+        None
+    } else {
+        let digest = crate::canonical_worker::launch_spec::digest(&argv)?;
+        let launch = crate::canonical_worker::launch_spec::plan(&lab.root, &digest)?;
+        crate::canonical_worker::launch_spec::write(&launch, "profile-transport-verification", cwd.to_str().context("probe directory is not UTF-8")?, &argv)?;
+        Some(launch)
+    };
+    let created = match &launch {
+        None => api.call("workspace.create_command",json!({"cwd":cwd,"command":argv,"focus":false,"label":"Profile transport verification","env":{}}))?,
+        Some(_) => api.call("workspace.create",json!({"cwd":cwd,"focus":false,"label":"Profile transport verification","env":{}}))?,
+    };
     ensure!(
         created["type"] == "workspace_created" && created["workspace"]["pane_count"] == 1,
         "invalid native probe workspace"
@@ -398,6 +424,10 @@ pub(super) fn verify(
     let pane = created["root_pane"]["pane_id"]
         .as_str()
         .context("probe root pane missing")?;
+    if let Some(launch) = &launch {
+        let sent = api.call("pane.send_input", json!({"pane_id":pane,"text":launch.line,"keys":[]}))?;
+        ensure!(sent["type"] == "ok", "uncertain native probe launcher input");
+    }
     let workspace = created["workspace"]["workspace_id"]
         .as_str()
         .context("probe workspace missing")?;
@@ -438,6 +468,9 @@ pub(super) fn verify(
         std::thread::sleep(Duration::from_millis(25));
     };
     lab.worker = Some(observation.identity().clone());
+    if let Some(launch) = &launch {
+        ensure!(fs::symlink_metadata(&launch.spec).is_err(), "native probe launcher did not consume its spec");
+    }
     observation.waiting_gate(&argv)?.check()?;
     let agent = executable(Path::new(&profile.agent.path), deadline, &cancellation)?;
     ensure!(
@@ -527,6 +560,7 @@ pub(super) fn verify(
         observed_unix_ms,
         stopped_unix_ms,
         interaction,
+        transport: Some(if launch.is_some() { STOCK_TRANSPORT } else { COMMAND_TRANSPORT }.into()),
     };
     apply_evidence(&mut preparation, &evidence)?;
     Ok(NativePreparation {

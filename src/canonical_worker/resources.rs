@@ -72,13 +72,16 @@ struct Api<'a> {
     locks: Vec<InheritedLock>,
 }
 impl Api<'_> {
-    fn require_workspace_command(&self, operation: &OperationId) -> Result<()> {
+    /// Patched servers advertise `workspace.create_command`; stock servers omit
+    /// the capability (or report false) and use the exec-into-shell launcher.
+    fn direct_root_transport(&self, operation: &OperationId) -> Result<bool> {
         let reply=self.call(operation.as_str(), "ping", json!({}), || Ok(()))?;
+        let advertised=&reply["capabilities"]["workspace_create_command"];
         ensure!(reply["type"].as_str()==Some("pong")
             && reply["version"].as_str()==Some(self.executable.version.as_str())
-            && reply["capabilities"]["workspace_create_command"].as_bool()==Some(true),
-            "connected Herdr server does not advertise the verified workspace.create_command contract");
-        Ok(())
+            && (advertised.is_null() || advertised.is_boolean()),
+            "connected Herdr server does not advertise the verified direct-root launch contract");
+        Ok(advertised.as_bool()==Some(true))
     }
 
     fn pane_identity(
@@ -304,14 +307,18 @@ fn create_resource_inner(
         locks: guard.inherit()?,
     };
     let direct_root = route.workspace_id.is_empty() && !legacy_workspace;
-    if direct_root { api.require_workspace_command(operation)?; }
+    let command_digest = super::launch_spec::digest(&argv)?;
+    // Stock Herdr: plan (and validate) the typed launcher line before any effect.
+    let launch = if direct_root && !api.direct_root_transport(operation)? {
+        Some(super::launch_spec::plan(&project.join(".state"), &command_digest)?)
+    } else { None };
     let creation = LaunchCreationIntent {
-        version: if direct_root { 2 } else { 1 },
+        version: if launch.is_some() { 3 } else if direct_root { 2 } else { 1 },
         operation: operation.clone(),
         attempt: record.attempt.clone(),
         route: route.clone(),
         session: session.clone(),
-        command_digest: format!("{:x}", Sha256::digest(serde_json::to_vec(&argv)?)),
+        command_digest,
         workspace_token: if route.workspace_id.is_empty() && !direct_root {
             if continuing {
                 serde_json::from_value::<LaunchCreationIntent>(
@@ -383,6 +390,21 @@ fn create_resource_inner(
         Instant::now()
             + Duration::from_millis(claim.lease_until_ms.saturating_sub(now()).max(0) as u64),
     );
+    if let Some(launch) = &launch {
+        let target = stock_root(&api, &creation, launch, &argv, || {
+            worktrees.check()?;
+            Ok(db.validate_launch_claim(&claim, now())?)
+        })?;
+        inventory::check(
+            &project,
+            &record.inputs.binding,
+            &target.route,
+            api.deadline,
+            cancellation.clone(),
+        )?;
+        db.retain_observed_launch_target(&target, now())?;
+        return Ok(target);
+    }
     if direct_root {
         let created = api.call(
             operation.as_str(),
@@ -657,8 +679,8 @@ pub fn reconcile_resource(
     let intent: LaunchCreationIntent = serde_json::from_value(event.payload.clone())?;
     let binding = &state.binding;
     ensure!(
-        matches!(intent.version, 1 | 2)
-            && (intent.version != 2
+        matches!(intent.version, 1..=3)
+            && (intent.version == 1
                 || (intent.route.workspace_id.is_empty() && intent.workspace_token.is_none()))
             && intent.operation == *operation
             && intent.attempt == record.attempt
@@ -737,12 +759,16 @@ pub fn reconcile_resource(
     } else {
         intent.route.clone()
     };
-    let found = if intent.version == 2 {
-        recover_supervised_root(&api, &intent)?
-    } else {
+    let found = if intent.version == 1 {
         find_created_target(&api, &intent, &route)?
+    } else {
+        recover_supervised_root(&api, &intent)?
     };
     let Some((target, _observation)) = found else {
+        // A stock launch that was never confirmed must not start later.
+        if intent.version == 3 {
+            super::launch_spec::remove(&super::launch_spec::path(&project.join(".state"), &intent.command_digest))?;
+        }
         return Ok(None);
     };
     inventory::check(
@@ -791,7 +817,7 @@ fn find_created_target(
         "creation recovery pane inventory exceeds limit"
     );
     ensure!(
-        intent.version != 2 || panes.len() == 1,
+        intent.version == 1 || panes.len() == 1,
         "direct workspace root layout changed"
     );
     let mut found = None;
@@ -1249,8 +1275,83 @@ fn recover_workspace(
 }
 
 /// Read-only admission before worktree creation consumes the launch approval.
-pub(crate) fn validate_server_creation(profile:&FrozenProfile,route:&RuntimeRoute,operation:&OperationId,deadline:Instant,cancellation:Cancellation,locks:Vec<InheritedLock>)->Result<()> {
+pub(crate) fn validate_server_creation(project:&Path,profile:&FrozenProfile,route:&RuntimeRoute,operation:&OperationId,deadline:Instant,cancellation:Cancellation,locks:Vec<InheritedLock>)->Result<()> {
     if !route.workspace_id.is_empty() { return Ok(()); }
     let session=session_identity(Path::new(&route.socket))?;
-    Api{executable:&profile.herdr,socket:&route.socket,session:&session,deadline,cancellation,locks}.require_workspace_command(operation)
+    let api=Api{executable:&profile.herdr,socket:&route.socket,session:&session,deadline,cancellation,locks};
+    if !api.direct_root_transport(operation)? {
+        #[cfg(target_os = "linux")]
+        super::launch_spec::plan(&project.join(".state"), &"0".repeat(64))?;
+    }
+    Ok(())
+}
+
+/// Stock Herdr direct root: create a default-shell workspace, type one line that
+/// execs the fixed launcher, and count the launch only after the pane's process
+/// is the exact supervisor. Any unconfirmed outcome removes the spec and closes
+/// the workspace; the retained claim then recovers nothing.
+#[cfg(target_os = "linux")]
+fn stock_root(
+    api: &Api<'_>,
+    intent: &LaunchCreationIntent,
+    launch: &super::launch_spec::Launch,
+    argv: &[String],
+    preflight: impl FnOnce() -> Result<()>,
+) -> Result<LaunchTarget> {
+    // Leave enough of the original deadline to close the workspace afterward.
+    const CLEANUP_RESERVE: Duration = Duration::from_secs(6);
+    let operation = intent.operation.as_str();
+    super::launch_spec::write(launch, operation, &intent.route.cwd, argv)?;
+    let created = api.call(operation, "workspace.create",
+        json!({"cwd":intent.route.cwd,"label":worker_agent_name(&intent.attempt),"focus":false,"env":{}}),
+        preflight);
+    let created = match created {
+        Ok(created) => created,
+        Err(error) => {
+            // Unknown workspace: removing the spec makes any late exec refuse.
+            super::launch_spec::remove(&launch.spec)?;
+            return Err(error);
+        }
+    };
+    let workspace = created["workspace"]["workspace_id"].as_str().filter(|id| !id.is_empty() && id.len() <= 512);
+    let confirmed = (|| {
+        ensure!(created["type"].as_str() == Some("workspace_created"), "invalid workspace creation response");
+        let workspace = workspace.context("created workspace missing")?;
+        let pane = created["root_pane"]["pane_id"].as_str().context("created root pane missing")?;
+        let route = RuntimeRoute { workspace_id: workspace.into(), ..intent.route.clone() };
+        let sent = api.call(operation, "pane.send_input",
+            json!({"pane_id":pane,"text":launch.line,"keys":[]}), || Ok(()))?;
+        ensure!(sent["type"].as_str() == Some("ok"), "uncertain launcher input acknowledgment");
+        let confirm_by = api.deadline.checked_sub(CLEANUP_RESERVE).context("insufficient launch budget")?;
+        let mut last = None;
+        while Instant::now() < confirm_by {
+            check(api.deadline, &api.cancellation)?;
+            // The supervisor may still be forking its namespace init; retry.
+            match find_created_target(api, intent, &route) {
+                Ok(Some((target, _))) => {
+                    ensure!(target.route.pane_id == pane, "supervisor is not the created root pane");
+                    ensure!(std::fs::symlink_metadata(&launch.spec).is_err(), "launcher did not consume its spec");
+                    return Ok(target);
+                }
+                Ok(None) => {}
+                Err(error) => last = Some(error),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let error = anyhow::anyhow!("stock Herdr shell did not exec the launcher before the launch deadline");
+        Err(match last { Some(last) => error.context(format!("{last:#}")), None => error })
+    })();
+    let error = match confirmed {
+        Ok(target) => return Ok(target),
+        Err(error) => error,
+    };
+    let mut cleanup = super::launch_spec::remove(&launch.spec);
+    if let Some(workspace) = workspace {
+        let closer = Api { cancellation: Cancellation::default(), locks: api.locks.clone(), ..*api };
+        cleanup = cleanup.and(closer.call(operation, "workspace.close", json!({"workspace_id":workspace}), || Ok(())).map(|_| ()));
+    }
+    Err(match cleanup {
+        Ok(()) => error.context("unconfirmed launch workspace closed"),
+        Err(cleanup) => error.context(format!("unconfirmed launch cleanup failed: {cleanup:#}")),
+    })
 }

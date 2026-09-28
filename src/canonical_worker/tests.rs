@@ -115,8 +115,10 @@ if sys.argv[1:]==['--version']:print('herdr 0.9.1');sys.exit(0)
 root=pathlib.Path({root:?});project=pathlib.Path({project:?});mode={mode:?}
 r=json.loads(sys.stdin.readline())
 a=json.loads((root/'agent.json').read_text())
+stock='stock' in mode
 if r['method']=='ping':
  result={{'type':'pong','version':'0.9.1','capabilities':{{'workspace_create_command':True}}}}
+ if stock:result={{'type':'pong','version':'0.9.1'}}
  if (root/'server-capability.json').exists():result=json.loads((root/'server-capability.json').read_text())
 elif r['method']=='agent.list':
  if mode=='busy':a['agent_status']='working'
@@ -146,7 +148,16 @@ elif r['method']=='workspace.list':
   request=json.loads(requests.read_text().splitlines()[0])
   rows=[{{'workspace_id':'w1','label':request['params']['label'],'pane_count':1,'tab_count':1}}]
  if (root/'duplicate-workspaces').exists():rows=rows*2
+ if (root/'closed-workspaces').exists():rows=[]
  result={{'type':'workspace_list','workspaces':rows}}
+elif r['method']=='workspace.close':
+ with open(root/'closed-workspaces','a') as f:f.write(r['params']['workspace_id']+'\n')
+ result={{'type':'ok'}}
+elif r['method']=='workspace.create_command' and stock:sys.exit(2)
+elif r['method']=='workspace.create' and stock:
+ with open(root/'workspace-requests','a') as f:f.write(json.dumps(r)+'\n')
+ (root/'direct-created').write_text('created')
+ result={{'type':'workspace_created','workspace':{{'workspace_id':'w1','pane_count':1}},'root_pane':{{'pane_id':'w1:p1'}}}}
 elif r['method']=='workspace.create_command':
  with open(root/'workspace-requests','a') as f:f.write(json.dumps(r)+'\n')
  if (root/'reject-workspace-command').exists():sys.exit(2)
@@ -192,10 +203,14 @@ elif r['method']=='pane.get':
  if r['params']['pane_id']=='w1:p2':result['pane'].update({{'pane_id':'w1:p2','tab_id':'w1:t2','terminal_id':'term2','cwd':None}})
 elif r['method']=='pane.process_info':
  stage=json.loads((root/'stage.json').read_text())
+ if stock:stage=json.loads((root/'stock-stage.json').read_text()) if (root/'stock-stage.json').exists() else {{'pid':1,'argv':['-sh']}}
  result={{'process_info':{{'pane_id':'w1:p1','foreground_processes':[stage]}}}}
  if (root/'no-processes').exists():result['process_info'].pop('foreground_processes')
  if r['params']['pane_id']=='w1:p0':result['process_info']={{'pane_id':'w1:p0','foreground_processes':[json.loads((root/'bootstrap.json').read_text())] if (root/'bootstrap.json').exists() else []}}
  if r['params']['pane_id']=='w1:p2':result['process_info']={{'pane_id':'w1:p2'}}
+elif r['method']=='pane.send_input' and stock and r['params']['text'].startswith('exec '):
+ with open(root/'exec-requests','a') as f:f.write(r['params']['text'])
+ result={{'type':'ok'}}
 elif r['method']=='pane.send_input':
  request_path=root/'gate-requests'
  previous=request_path.read_text() if request_path.exists() else ''
@@ -4370,8 +4385,6 @@ fn live_unobserved_exit(f:&Fixture,lab:&Path,binary:&Path,socket:&Path) {
 fn unsupported_connected_server_refuses_creation_before_approval_or_worktrees() {
     for mode in ["resource-release-workspace", "resource-release-workspace-repository"] {
         for capability in [
-            json!({"type":"pong","version":"0.9.1"}),
-            json!({"type":"pong","version":"0.9.1","capabilities":{"workspace_create_command":false}}),
             json!({"type":"pong","version":"0.9.1","capabilities":{"workspace_create_command":"true"}}),
             json!({"type":"pong","version":"0.9.2","capabilities":{"workspace_create_command":true}}),
             json!({"type":"unknown","version":"0.9.1","capabilities":{"workspace_create_command":true}}),
@@ -4385,6 +4398,134 @@ fn unsupported_connected_server_refuses_creation_before_approval_or_worktrees() 
             assert!(!f._root.path().join("workspace-requests").exists());
             assert!(!f.project.join(".state/worktrees").exists());
         }
+    }
+}
+
+/// Stands in for `herdr-projects launch-exec <spec>`: this harness is not that
+/// binary, so the fixture shell runs the same library launcher through it.
+#[test]
+fn stock_shell_exec_helper() {
+    let Some(spec) = std::env::var_os("HP_STOCK_EXEC_SPEC") else { return };
+    let error = crate::canonical_worker::exec_launch_spec(Path::new(&spec)).unwrap_err();
+    eprintln!("{error:#}");
+    std::process::exit(125);
+}
+
+/// A stock Herdr pane: its default shell honours the typed `exec` line, and
+/// Herdr reports the pane's live foreground process. `tamper` breaks the spec's
+/// privacy first; `execute=false` models a shell that swallows the input.
+fn stock_shell(root: &Path, done: &std::sync::atomic::AtomicBool, execute: bool, tamper: bool) -> Option<Worker> {
+    use std::{io::Write, sync::atomic::Ordering};
+    let requests = root.join("exec-requests");
+    while !requests.exists() {
+        if done.load(Ordering::Acquire) { return None; }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let line = fs::read_to_string(&requests).unwrap();
+    let words: Vec<&str> = line.split_whitespace().collect();
+    assert!(line.ends_with('\n') && line.lines().count() == 1, "{line:?}");
+    assert!(line.trim_end().bytes().all(|b| b.is_ascii_alphanumeric() || b" /._-".contains(&b)), "{line:?}");
+    assert_eq!(words.len(), 4);
+    assert_eq!((words[0], words[2]), ("exec", "launch-exec"));
+    assert_eq!(Path::new(words[1]), std::env::current_exe().unwrap().canonicalize().unwrap());
+    let spec = Path::new(words[3]);
+    assert_eq!(fs::metadata(spec).unwrap().permissions().mode() & 0o777, 0o600);
+    if tamper { fs::set_permissions(spec, fs::Permissions::from_mode(0o644)).unwrap(); }
+    if !execute { return None; }
+    let mut shell = Worker(std::process::Command::new(words[1])
+        .args(["--exact", "canonical_worker::tests::stock_shell_exec_helper", "--nocapture"])
+        .env_clear().env("PATH", "/usr/bin:/bin").env("HP_STOCK_EXEC_SPEC", spec)
+        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .spawn().unwrap());
+    let pid = shell.0.id();
+    let mut released = false;
+    while !done.load(Ordering::Acquire) {
+        if let Ok(bytes) = fs::read(format!("/proc/{pid}/cmdline")) {
+            let argv: Vec<String> = bytes.strip_suffix(&[0]).unwrap_or(&bytes).split(|b| *b == 0)
+                .map(|w| String::from_utf8_lossy(w).into_owned()).collect();
+            let staged = root.join("stock-stage.pending");
+            fs::write(&staged, serde_json::to_vec(&json!({"pid":pid,"argv":argv})).unwrap()).unwrap();
+            fs::rename(&staged, root.join("stock-stage.json")).unwrap();
+        }
+        if !released && root.join("gate-requests").exists() {
+            let request: Value = serde_json::from_str(fs::read_to_string(root.join("gate-requests")).unwrap().lines().next().unwrap()).unwrap();
+            shell.0.stdin.as_mut().unwrap().write_all(request["params"]["text"].as_str().unwrap().as_bytes()).unwrap();
+            fs::write(root.join("agent.json"), serde_json::to_vec(&json!({"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1",
+                "cwd":fs::read_to_string(root.join("project-path")).unwrap(),"terminal_id":"term1","agent":"claude","name":null,
+                "interactive_ready":true,"agent_status":"idle"})).unwrap()).unwrap();
+            fs::write(root.join("gate-sent"), b"").unwrap();
+            released = true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Some(shell)
+}
+
+#[test]
+fn stock_herdr_launch_execs_the_launcher_in_place_of_the_shell() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let f = Fixture::new("resource-release-workspace-stock");
+    let root = f._root.path();
+    fs::write(root.join("project-path"), f.project.display().to_string()).unwrap();
+    let done = AtomicBool::new(false);
+    let (started, shell) = std::thread::scope(|scope| {
+        let shell = scope.spawn(|| stock_shell(root, &done, true, false));
+        let started = advance_launch(&f.project, &f.operation.id, 1, Instant::now() + Duration::from_secs(40), Default::default());
+        done.store(true, Ordering::Release);
+        (started, shell.join().unwrap())
+    });
+    let started = started.unwrap().unwrap();
+    let shell = shell.unwrap();
+    let state = runtime::snapshot(&f.project).unwrap();
+    let creation = state.events.iter().find(|e| e.kind == "runtime.launch_creation").unwrap();
+    assert_eq!(creation.payload["version"], 3);
+    let target: LaunchTarget = serde_json::from_value(state.events.iter().find(|e| e.kind == "runtime.launch_target").unwrap().payload.clone()).unwrap();
+    assert_eq!(started.attempt, target.attempt);
+    assert_eq!(target.route.pane_id, "w1:p1");
+    // The pane's original process was replaced in place: no shell remains.
+    let supervisor = target.supervisor.as_ref().unwrap();
+    assert_eq!(supervisor.outer.pid, shell.0.id());
+    let cmdline = fs::read(format!("/proc/{}/cmdline", shell.0.id())).unwrap();
+    assert!(cmdline.starts_with(b"/usr/bin/unshare\0"));
+    assert_eq!(format!("{:x}", Sha256::digest(serde_json::to_vec(&cmdline.strip_suffix(&[0]).unwrap().split(|b| *b == 0)
+        .map(|w| String::from_utf8(w.to_vec()).unwrap()).collect::<Vec<_>>()).unwrap())), creation.payload["command_digest"].as_str().unwrap());
+    assert_eq!(fs::read_dir(f.project.join(".state/launch-specs")).unwrap().count(), 0);
+    let requests = fs::read_to_string(root.join("workspace-requests")).unwrap();
+    assert_eq!(requests.lines().count(), 1);
+    assert_eq!(serde_json::from_str::<Value>(requests.trim()).unwrap()["method"], "workspace.create");
+    for name in ["exec-requests", "gate-requests", "name-requests"] {
+        assert_eq!(fs::read_to_string(root.join(name)).unwrap().lines().count(), 1, "{name}");
+    }
+    assert!(!root.join("closed-workspaces").exists());
+}
+
+#[test]
+fn stock_herdr_unconfirmed_launch_closes_its_workspace_and_counts_nothing() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for (execute, tamper) in [(false, false), (true, true)] {
+        let f = Fixture::new("resource-release-workspace-stock");
+        let root = f._root.path();
+        let done = AtomicBool::new(false);
+        let error = std::thread::scope(|scope| {
+            let shell = scope.spawn(|| stock_shell(root, &done, execute, tamper));
+            let result = create_resource(&f.project, &f.operation.id, 1, Instant::now() + Duration::from_secs(10), Default::default());
+            done.store(true, Ordering::Release);
+            drop(shell.join().unwrap());
+            result.unwrap_err()
+        });
+        assert!(format!("{error:#}").contains("did not exec the launcher"), "{error:#}");
+        assert!(format!("{error:#}").contains("workspace closed"), "{error:#}");
+        assert_eq!(fs::read_to_string(root.join("closed-workspaces")).unwrap(), "w1\n");
+        assert_eq!(fs::read_dir(f.project.join(".state/launch-specs")).unwrap().count(), 0);
+        let before = runtime::snapshot(&f.project).unwrap();
+        assert_eq!(before.events.iter().find(|e| e.kind == "runtime.launch_creation").unwrap().payload["version"], 3);
+        assert!(!before.events.iter().any(|e| matches!(e.kind.as_str(),
+            "runtime.launch_workspace" | "runtime.launch_target" | "runtime.launch_release" | "runtime.launch_started")));
+        assert!(reconcile_resource(&f.project, &f.operation.id, before.deliveries[0].revision,
+            Instant::now() + Duration::from_secs(10), Default::default()).unwrap().is_none());
+        assert_eq!(runtime::snapshot(&f.project).unwrap(), before);
+        assert!(!root.join("gate-requests").exists());
+        assert_eq!(fs::read_to_string(root.join("workspace-requests")).unwrap().lines().count(), 1);
     }
 }
 

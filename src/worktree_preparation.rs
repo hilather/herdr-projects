@@ -443,7 +443,7 @@ pub fn prepare(
             worktree_execution_route(&record.inputs, &record.attempt, &binding.identity)
                 .map_err(anyhow::Error::msg)?;
         crate::canonical_worker::validate_server_creation(
-            record.inputs.effective_profile.as_ref().context("worktree profile missing")?,
+            &project, record.inputs.effective_profile.as_ref().context("worktree profile missing")?,
             &route, operation, git.deadline, git.cancellation.clone(), guard.inherit()?,
         )?;
         let parent = parent_preflight(&project, &plans)?;
