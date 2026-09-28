@@ -67,6 +67,35 @@ fn synthetic_profile(project: &Path, config: &Path) -> FrozenProfile {
 
 #[test]
 fn signed_cli_reservation_enforces_subject_scope_quotas_and_replays_after_revocation() {
+    delegated_scenario();
+}
+
+#[test]
+fn delegated_reserve_logs_grant_once() {
+    let s = delegated_scenario();
+    let p = &s.policy;
+    // Contracts §2 bytes of `synthetic_profile`, written out by hand.
+    let configuration = format!(concat!(r#"{{"adapter":{{"digest":"{a}","id":"synthetic-cli-fixture","revision":1}},"agent_digest":"{d}","agent_version":"1.0.0","#,
+        r#""arguments_digest":"{c}","definition_digest":"{b}","environment_names":[],"kind":"codex","#,
+        r#""permission_policy":{{"digest":"{pd}","id":"{pi}","revision":{pr}}},"reasoning_effort":null,"reasoning_effort_reason":"mapping_unverified","#,
+        r#""requested_model":null,"requested_model_reason":"mapping_unverified","schema":"agent_configuration.v1"}}"#),
+        a = "a".repeat(64), b = "b".repeat(64), c = "c".repeat(64), d = "d".repeat(64), pd = p.digest, pi = p.id, pr = p.revision);
+    let id = format!("sha256:{:x}", Sha256::digest(configuration.as_bytes()));
+    let raw = rusqlite::Connection::open(&s.db).unwrap();
+    assert_eq!(raw.query_row("SELECT configuration_id,canonical_json FROM agent_configurations", [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).unwrap(), (id.clone(), configuration));
+    let eligible = format!(r#"[{{"configuration_id":"{id}","probability_ppm":1000000,"profile_digest":"{}","status":"chosen"}}]"#, s.profile);
+    // Two reservations and two replays of the first: one decision per attempt.
+    let rows: Vec<(String, String, String, String, String, String, Option<String>)> = raw.prepare("SELECT attempt_id,chosen_configuration_id,eligible,chooser_kind,chooser_principal,reason_codes,note FROM dispatch_decisions ORDER BY rowid").unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))).unwrap().map(Result::unwrap).collect();
+    let row = |attempt: &str| (attempt.to_owned(), id.clone(), eligible.clone(), "delegated".to_owned(), format!("grant:{}", s.grant_id), r#"["delegated_grant","only_eligible"]"#.to_owned(), None);
+    assert_eq!(rows, [row(&s.attempts[0]), row(&s.attempts[1])]);
+}
+
+struct Scenario { _home: tempfile::TempDir, db: PathBuf, grant_id: String, attempts: [String; 2], policy: VersionedReference, profile: String }
+
+/// Signed delegated reservations through the CLI: scope, quota and signature
+/// refusals, two accepted reservations and replays of the first.
+fn delegated_scenario() -> Scenario {
     let home = tempfile::tempdir().unwrap();
     let (owner, public) = key(home.path(), "owner");
     let (subject, subject_public) = key(home.path(), "subject");
@@ -280,7 +309,7 @@ fn signed_cli_reservation_enforces_subject_scope_quotas_and_replays_after_revoca
     let mut altered = first; altered["issued_unix_ms"] = (altered["issued_unix_ms"].as_i64().unwrap()+1).into();
     let signature = sign(&subject, &request_path, &serde_json::to_vec(&altered).unwrap(), authority::DELEGATED_RESERVATION_SIGNATURE_NAMESPACE);
     assert!(!reserve(&request_path, &signature).status.success());
-    let raw = rusqlite::Connection::open(path).unwrap();
+    let raw = rusqlite::Connection::open(&path).unwrap();
     assert_eq!(raw.query_row("SELECT count(*) FROM delegated_reservations", [], |row| row.get::<_,u64>(0)).unwrap(), 2);
     assert_eq!(raw.query_row("SELECT count(*) FROM approval_uses", [], |row| row.get::<_,u64>(0)).unwrap(), 0);
     // Telemetry: one classification per reserved task; replays and refusals add none. Empty scope: read_only, 0 points.
@@ -288,4 +317,6 @@ fn signed_cli_reservation_enforces_subject_scope_quotas_and_replays_after_revoca
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap().map(Result::unwrap).collect();
     assert_eq!(classified, [("a".into(), 1, "read_only".into(), "small".into()), ("b".into(), 1, "read_only".into(), "small".into())]);
     assert!(db.read_snapshot(None).unwrap().attempts.iter().any(|attempt| attempt.retains_capacity()));
+    let attempts = [&first_receipt, &second_receipt].map(|receipt| receipt["record"]["attempt"].as_str().unwrap().to_owned());
+    Scenario { grant_id: grant_id.to_owned(), attempts, policy: authority, profile: profile.reference().unwrap().digest, db: path, _home: home }
 }

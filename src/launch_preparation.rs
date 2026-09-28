@@ -13,6 +13,11 @@ pub struct LaunchSelection {
     pub knowledge: VersionedReference,
     #[serde(default)]
     pub repositories: Vec<PathBuf>,
+    /// Telemetry only (contracts §3): not part of the inputs or the signed grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Reviewable inputs and an unsigned document for the existing owner-signature
@@ -214,5 +219,6 @@ pub fn reserve(
     let binding=state.binding.as_ref().filter(|b|b.id==selection.binding).context("launch binding missing")?;
     worktree_execution_route(&inputs,&attempt,&binding.identity).map_err(anyhow::Error::msg)?;
     proof.validate_for_launch()?;
-    Ok(db.reserve_prepared(&[PreparedLaunch { inputs }],expected_head,now())?)
+    let dispatch = DispatchContext::Operator { reason: selection.reason.clone(), note: selection.note.clone() };
+    Ok(db.reserve_prepared(&[PreparedLaunch { inputs }],expected_head,now(),&dispatch)?)
 }

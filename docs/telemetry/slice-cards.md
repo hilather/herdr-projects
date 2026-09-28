@@ -47,6 +47,10 @@ Stop if classification needs an outcome field or a read outside the transaction.
 
 ## S2 — AgentConfiguration and DispatchDecision (0050)
 
+**Done.** `agent_configurations` and `dispatch_decisions` (0050) written in
+`admit_prepared` after the attempt row for all three paths; drafts, refusals
+and delegated replays write none. Refinements in contracts §3.
+
 Goal: exactly one decision per new attempt, same transaction, all three
 paths. Files: `migrations/0050_dispatch_decisions.sql`
 (`agent_configurations`, `dispatch_decisions`, immutable),
@@ -81,7 +85,8 @@ and `herdr-projects telemetry <slug> attempts [--json]`. Files:
 `src/telemetry/outcome.rs`; `src/cli.rs`. Tests (`vertical_slice` extensions):
 (A task whose attempt was cancelled cannot be re-queued through the public
 CLI; tests needing a second attempt reset the task as S1's
-`second_attempt_reuses_classification` does.)
+`second_attempt_reuses_classification` does — now the `requeue` helper in
+`tests/factory_harness.rs`. A decision's `rowid` order is insertion order.)
 - `outcome_success_path` — four marks in order; `candidate_oid` = submitted
   commit; `accepted`/`integrated`/`accepted = true`; Claude fixture →
   `usage: unavailable adapter_absent`; `attention_not_collected`.

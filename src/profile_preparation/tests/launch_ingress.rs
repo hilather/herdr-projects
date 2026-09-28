@@ -81,7 +81,7 @@ print(json.dumps({{'id':r['id'],'result':result}}))
             schema_version:1,task_id:task.as_str().into(),profile:frozen.name.clone(),domains:vec![],paths:vec![],pinned_keys:vec![],sensitivity:"default".into(),
         },&frozen.name,&frozen.definition_digest,frozen.config.digest.as_deref(),32000,"Retained project instructions",now,None).unwrap();
         let knowledge=VersionedReference{id:snapshot.id.as_str().into(),revision:1,digest:snapshot.manifest_hash};
-        Self { selection:LaunchSelection { task,binding:binding.id,profile,knowledge,repositories:if repository {vec![work]}else{vec![]} }, f,key,_socket:socket }
+        Self { selection:LaunchSelection { task,binding:binding.id,profile,knowledge,repositories:if repository {vec![work]}else{vec![]},reason:None,note:None }, f,key,_socket:socket }
     }
     fn state(&self) -> Snapshot { crate::runtime::snapshot(&self.f.project).unwrap() }
     fn draft(&self) -> LaunchDraft {

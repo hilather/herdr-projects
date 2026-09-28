@@ -1,7 +1,53 @@
-//! Telemetry rows written inside the reservation transaction (contracts §1).
+//! Telemetry rows written inside the reservation transaction (contracts §1–§3).
 //! Reads are keyed by primary key and bounded; nothing here reads outcomes.
 use super::*;
-use crate::domain::{classify_task, ContractScope, TASK_TAXONOMY};
+use crate::domain::{agent_configuration, classify_task, excerpt, AgentConfiguration, ContractScope, DispatchContext, EligibleProfile, OPERATOR_REASONS, PreparedDelegatedReservation, TASK_TAXONOMY};
+
+fn invalid(message:&str)->StoreError {StoreError::Invalid(message.into())}
+
+/// The contracts §3 decision for a new attempt, after its `attempts` row. The
+/// context only describes the choice: its chosen entry must be the reserved profile.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn record_decision(tx:&Connection,inputs:&LaunchInputs,attempt:&AttemptId,task_revision:u64,classification:Option<&str>,dispatch:&DispatchContext,delegated:Option<&PreparedDelegatedReservation>,now:i64)->Result<()> {
+    let profile=inputs.effective_profile.as_ref().ok_or_else(||invalid("dispatch requires an effective profile"))?;
+    let chosen=agent_configuration(profile);
+    let only=||vec![EligibleProfile{configuration:chosen.clone(),profile_digest:inputs.profile.digest.clone(),status:"chosen"}];
+    let (kind,principal,mut reasons,note,eligible)=match (dispatch,delegated) {
+        (DispatchContext::Operator{reason,note},None)=>{
+            let reason=reason.as_deref().unwrap_or("unspecified");
+            if !OPERATOR_REASONS.contains(&reason) {return Err(invalid("unknown dispatch reason"));}
+            let home=std::env::var("HOME").ok();
+            ("operator",format!("approval:{}",inputs.approval.digest),vec![reason],note.as_deref().and_then(|n|excerpt(n,home.as_deref())),only())
+        }
+        (DispatchContext::Automatic{eligible},None)=>{
+            let mut picked=eligible.iter().filter(|e|e.status=="chosen");
+            let valid=eligible.len()<=256&&eligible.iter().all(|e|matches!(e.status,"chosen"|"no_knowledge"|"no_approval"|"not_evaluated"));
+            if !valid||!matches!((picked.next(),picked.next()),(Some(e),None) if e.configuration==chosen&&e.profile_digest==inputs.profile.digest) {
+                return Err(invalid("dispatch eligible set differs from the reserved profile"));
+            }
+            ("automatic_admission","rule:automatic-admission.v1".to_owned(),vec!["first_matching_approval"],None,eligible.clone())
+        }
+        (DispatchContext::Delegated,Some(delegated))=>("delegated",format!("grant:{}",delegated.request.grant_id),vec!["delegated_grant"],None,only()),
+        _=>return Err(invalid("dispatch context differs from the reservation path")),
+    };
+    if kind!="operator"&&eligible.len()==1 {reasons.push("only_eligible");}
+    reasons.sort_unstable();reasons.dedup();
+    for entry in &eligible {insert_configuration(tx,&entry.configuration,now)?;}
+    let eligible=serde_json::Value::Array(eligible.iter().map(|e|serde_json::json!({"configuration_id":e.configuration.id,
+        "probability_ppm":if e.status=="chosen"{1_000_000}else{0},"profile_digest":e.profile_digest,"status":e.status})).collect()).to_string();
+    let contract=inputs.task_contract.as_ref().map(|c|integer(c.revision)).transpose()?;
+    tx.execute("INSERT INTO dispatch_decisions VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,NULL,?12)",params![attempt.as_str(),inputs.task.as_str(),integer(task_revision)?,contract,
+        classification,chosen.id,eligible,kind,principal,serde_json::json!(reasons).to_string(),note,now])?;
+    Ok(())
+}
+
+/// Content-addressed and immutable: an existing ID must carry identical bytes.
+fn insert_configuration(tx:&Connection,configuration:&AgentConfiguration,now:i64)->Result<()> {
+    tx.execute("INSERT INTO agent_configurations VALUES(?1,?2,?3) ON CONFLICT(configuration_id) DO NOTHING",params![configuration.id,configuration.canonical_json,now])?;
+    let stored:String=tx.query_row("SELECT canonical_json FROM agent_configurations WHERE configuration_id=?1",[&configuration.id],|r|r.get(0))?;
+    if stored!=configuration.canonical_json {return Err(StoreError::Corrupt("agent configuration bytes differ".into()));}
+    Ok(())
+}
 
 /// Reuse revision 1 for `(task, contract revision, taxonomy)` or write it now.
 pub(super) fn classify_in_transaction(tx:&Connection,inputs:&LaunchInputs,dependencies:usize,now:i64,budget:Option<&read_budget::ReadBudget>)->Result<String> {

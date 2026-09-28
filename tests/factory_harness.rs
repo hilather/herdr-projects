@@ -1149,9 +1149,18 @@ fn second_attempt_reuses_classification() {
     assert_eq!((first[0].3.as_str(), first[0].4.as_str()), ("code", "small"));
     assert_eq!(first[0].5, r#"{"dependencies":0,"repositories":1,"route":"verify_only","uncertain_write_paths":0,"write_named_resources":0,"write_paths":1}"#);
 
-    // Cancel before any launch claim; that releases the slot and cancels the task.
-    let mut db = SqliteStore::open(&db_path).unwrap();
-    let attempt: String = rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT id FROM attempts", [], |r| r.get(0)).unwrap();
+    requeue(&db_path);
+    admit_ready(&project);
+    assert_eq!(sql_count(&db_path, "SELECT count(*) FROM attempts WHERE task_id='retry'"), 2);
+    assert_eq!(sql_count(&db_path, "SELECT count(*) FROM task_classifications"), 1);
+    assert_eq!(classifications(&db_path), first);
+}
+
+/// Cancel the one task's reserved attempt before any launch claim and queue the task again.
+#[cfg(target_os = "linux")]
+fn requeue(db_path: &Path) {
+    let mut db = SqliteStore::open(db_path).unwrap();
+    let attempt: String = rusqlite::Connection::open(db_path).unwrap().query_row("SELECT id FROM attempts WHERE state='reserved'", [], |r| r.get(0)).unwrap();
     let cancelled = db.cancel_attempt(&AttemptId::new(attempt).unwrap(), 1, db.current_head().unwrap(), "retry the task", unix_ms()).unwrap();
     assert!(cancelled.released);
     // No production path re-opens a cancelled task; the fixture blocks it as a failed attempt would.
@@ -1162,11 +1171,116 @@ fn second_attempt_reuses_classification() {
     task.revision += 1;task.state = TaskState::Blocked;
     db.commit(Commit { expected_head: snapshot.head, mutations: vec![Mutation::Task { expected: Some(expected), next: task.clone() }] }).unwrap();
     db.queue_task(&task.id, task.revision, db.current_head().unwrap(), &QueueRequest { priority: 0, dependencies: Vec::new() }, unix_ms()).unwrap();
+}
+
+/// Automatic admission where only `granted` holds a launch approval. Knowledge
+/// is retained for `granted` first so the prepared inputs are its own.
+#[cfg(target_os = "linux")]
+fn admit_granted(project: &Path, granted: &str) {
+    let db_path = project.join(".state/state.db");
+    worker_snapshots_for(project, Some(granted));
+    let inputs = herdr_projects::admission::prepared_admission_inputs(project).unwrap().expect("a ready candidate");
+    assert_eq!(inputs.effective_profile.as_ref().unwrap().name, granted);
+    insert_grant(&db_path, &inputs);
+    worker_snapshots_for(project, None);
+    let before = sql_count(&db_path, "SELECT count(*) FROM attempts");
+    herdr_projects::admission::admit_once(project).unwrap();
+    assert_eq!(sql_count(&db_path, "SELECT count(*) FROM attempts"), before + 1, "admission did not reserve");
+}
+
+#[cfg(target_os = "linux")]
+/// A further retained profile with the capability evidence the fixture contract requires.
+fn plant_arm(db_path: &Path, config: &herdr_projects::migration::ConfigReference, name: &str, version: &str) -> FrozenProfile {
+    let profile = plant_profile_as(db_path, sim_profile(config, name, version));
+    SqliteStore::open(db_path).unwrap().record_native_capability_evidence(unix_ms(), unix_ms() + 3_600_000).unwrap();
+    profile
+}
+
+#[cfg(target_os = "linux")]
+/// Contracts §2 bytes of a `sim_profile` fixture, written out by hand.
+fn sim_configuration(version: &str) -> String {
+    format!(concat!(r#"{{"adapter":{{"digest":"{a}","id":"sim-evidence","revision":1}},"agent_digest":"{e}","agent_version":"{version}","#,
+        r#""arguments_digest":"{c}","definition_digest":"{b}","environment_names":[],"kind":"codex","#,
+        r#""permission_policy":{{"digest":"{d}","id":"sim-policy","revision":1}},"reasoning_effort":null,"reasoning_effort_reason":"mapping_unverified","#,
+        r#""requested_model":null,"requested_model_reason":"mapping_unverified","schema":"agent_configuration.v1"}}"#),
+        a = "a".repeat(64), b = "b".repeat(64), c = "c".repeat(64), d = "d".repeat(64), e = "e".repeat(64), version = version)
+}
+
+#[cfg(target_os = "linux")]
+fn sha256_id(bytes: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes.as_bytes()))
+}
+
+#[cfg(target_os = "linux")]
+/// `(task_id, task_revision, contract_revision, classification_id, chosen_configuration_id, eligible,
+/// chooser_kind, chooser_principal, reason_codes, note, policy, seed)` in insertion order.
+type DecisionRow = (String, i64, Option<i64>, Option<String>, String, String, String, String, String, Option<String>, Option<String>, Option<String>);
+#[cfg(target_os = "linux")]
+fn decisions(db_path: &Path) -> Vec<DecisionRow> {
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let mut stmt = conn.prepare("SELECT task_id,task_revision,contract_revision,classification_id,chosen_configuration_id,eligible,chooser_kind,chooser_principal,reason_codes,note,policy,seed FROM dispatch_decisions ORDER BY rowid").unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?))).unwrap().map(Result::unwrap).collect()
+}
+
+#[cfg(target_os = "linux")]
+fn configurations(db_path: &Path) -> Vec<(String, String)> {
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let mut stmt = conn.prepare("SELECT configuration_id,canonical_json FROM agent_configurations ORDER BY configuration_id").unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn automatic_admission_logs_eligible_profiles() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = classification_project(tmp.path(), "pick", Some("src/pick.rs"));
+    let db_path = project.join(".state/state.db");
+    let config = herdr_projects::migration::config_reference(&tmp.path().join("owner.toml")).unwrap();
+    let sim = sim_profile(&config, "sim", "1.0.0");
+    let next = plant_arm(&db_path, &config, "sim-next", "0.154.1");
+    // Admission evaluates retained profiles in profile-digest order; the second holds the only grant.
+    let mut arms = [(sim.reference().unwrap().digest, "sim", sim_configuration("1.0.0")), (next.reference().unwrap().digest, "sim-next", sim_configuration("0.154.1"))];
+    arms.sort();
+    admit_granted(&project, arms[1].1);
+    let eligible = format!(concat!(r#"[{{"configuration_id":"{}","probability_ppm":0,"profile_digest":"{}","status":"no_approval"}},"#,
+        r#"{{"configuration_id":"{}","probability_ppm":1000000,"profile_digest":"{}","status":"chosen"}}]"#),
+        sha256_id(&arms[0].2), arms[0].0, sha256_id(&arms[1].2), arms[1].0);
+    let task_revision = sql_count(&db_path, "SELECT revision FROM tasks WHERE id='pick'");
+    let classification = classifications(&db_path)[0].0.clone();
+    assert_eq!(decisions(&db_path), [("pick".into(), task_revision, Some(1), Some(classification), sha256_id(&arms[1].2), eligible,
+        "automatic_admission".into(), "rule:automatic-admission.v1".into(), r#"["first_matching_approval"]"#.into(), None, None, None)]);
+    let mut expected = vec![(sha256_id(&arms[0].2), arms[0].2.clone()), (sha256_id(&arms[1].2), arms[1].2.clone())];
+    expected.sort();
+    assert_eq!(configurations(&db_path), expected);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn configuration_identity_is_stable_and_versioned() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = classification_project(tmp.path(), "arm", Some("src/arm.rs"));
+    let db_path = project.join(".state/state.db");
+    let mut db = SqliteStore::open(&db_path).unwrap();
+    let snapshot = db.read_snapshot(None).unwrap();
+    db.set_scheduler_policy(snapshot.head, snapshot.scheduler.unwrap().policy.revision, 1, 3).unwrap();
     drop(db);
+    let current = sim_configuration("1.0.0");
     admit_ready(&project);
-    assert_eq!(sql_count(&db_path, "SELECT count(*) FROM attempts WHERE task_id='retry'"), 2);
-    assert_eq!(sql_count(&db_path, "SELECT count(*) FROM task_classifications"), 1);
-    assert_eq!(classifications(&db_path), first);
+    requeue(&db_path);
+    admit_ready(&project);
+    // The same profile on two attempts is one arm, stored as the exact canonical bytes.
+    assert_eq!(configurations(&db_path), [(sha256_id(&current), current.clone())]);
+    requeue(&db_path);
+    let config = herdr_projects::migration::config_reference(&tmp.path().join("owner.toml")).unwrap();
+    plant_arm(&db_path, &config, "sim-next", "0.154.1");
+    admit_granted(&project, "sim-next");
+    let upgraded = sim_configuration("0.154.1");
+    let mut expected = vec![(sha256_id(&current), current.clone()), (sha256_id(&upgraded), upgraded.clone())];
+    expected.sort();
+    assert_eq!(configurations(&db_path), expected, "an agent version change is a new arm");
+    let chosen = decisions(&db_path).into_iter().map(|row| row.4).collect::<Vec<_>>();
+    assert_eq!(chosen, [sha256_id(&current), sha256_id(&current), sha256_id(&upgraded)]);
+    assert_eq!(sql_count(&db_path, "SELECT count(*) FROM attempts"), 3);
 }
 
 #[cfg(target_os = "linux")]
@@ -1280,6 +1394,11 @@ fn install_fixture_contract(
 /// Retained worker knowledge for every queued task at its current revision and
 /// every retained profile; automatic admission binds it to build the brief.
 fn worker_snapshots(project: &Path) {
+    worker_snapshots_for(project, None);
+}
+
+/// `worker_snapshots` for one retained profile name only (`None`: every profile).
+fn worker_snapshots_for(project: &Path, only: Option<&str>) {
     let db_path = project.join(".state/state.db");
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     let profiles = conn.prepare("SELECT report FROM native_profiles").unwrap()
@@ -1289,7 +1408,7 @@ fn worker_snapshots(project: &Path) {
     let tasks = conn.prepare("SELECT id,revision FROM tasks WHERE state='queued'").unwrap()
         .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
     for (task, revision) in tasks {
-        for profile in &profiles {
+        for profile in profiles.iter().filter(|profile| only.is_none_or(|name| profile.name == name)) {
             let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM memory_snapshots WHERE task_id=?1 AND task_revision=?2 AND profile_name=?3 AND profile_digest=?4)",
                 rusqlite::params![task, revision, profile.name, profile.definition_digest], |row| row.get(0)).unwrap();
             if exists { continue; }
@@ -1305,7 +1424,12 @@ fn plant_profile(
     db_path: &Path,
     config: &herdr_projects::migration::ConfigReference,
 ) -> FrozenProfile {
-    use std::os::unix::fs::MetadataExt;
+    plant_profile_as(db_path, sim_profile(config, "sim", "1.0.0"))
+}
+
+/// The retained `sim` fixture profile under another name and agent version.
+#[cfg(target_os = "linux")]
+fn sim_profile(config: &herdr_projects::migration::ConfigReference, name: &str, version: &str) -> FrozenProfile {
     let evidence = VersionedReference {
         id: "sim-evidence".into(),
         revision: 1,
@@ -1314,9 +1438,9 @@ fn plant_profile(
     let supported = CapabilityEvidence::Supported {
         evidence: evidence.clone(),
     };
-    let profile = FrozenProfile {
+    FrozenProfile {
         version: 1,
-        name: "sim".into(),
+        name: name.into(),
         kind: "codex".into(),
         definition_digest: "b".repeat(64),
         config: config.clone(),
@@ -1332,7 +1456,7 @@ fn plant_profile(
         agent: ExecutableIdentity {
             path: "/usr/bin/git".into(),
             digest: "e".repeat(64),
-            version: "1.0.0".into(),
+            version: version.into(),
         },
         herdr: ExecutableIdentity {
             path: "/usr/bin/git".into(),
@@ -1349,7 +1473,12 @@ fn plant_profile(
             resume: CapabilityEvidence::Unknown,
         },
         workflow_certificate: None,
-    };
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn plant_profile_as(db_path: &Path, profile: FrozenProfile) -> FrozenProfile {
+    use std::os::unix::fs::MetadataExt;
     profile.validate_for_launch().unwrap();
     let reference = profile.reference().unwrap();
     let returned = profile.clone();

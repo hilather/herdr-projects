@@ -136,6 +136,36 @@ Invariant: `count(attempts) = count(dispatch_decisions)` for attempts created
 at or after migration 0050; older attempts report decision `unavailable`,
 reason `predates_dispatch_log`.
 
+S2 refinements:
+- `profile_digest` is the bare hex `FrozenProfile::reference()` digest (equal
+  to `inputs.profile.digest`), not `sha256:`-prefixed, so it joins to
+  `native_profiles` and attempt inputs.
+- `classification_id` is always set: S1 writes an `unscoped` row for a task
+  without a contract. The column stays nullable.
+- `agent_configurations` receives every configuration in `eligible`, not only
+  the chosen one; `first_decided_unix_ms` is the first decision that weighed it.
+- Operator `reason` is one code from `operator_selected`, `recommended`,
+  `operator_preference`, `availability`, `exploration`, `replay`,
+  `continuation`, `unspecified`; any other value refuses the reservation.
+  Operator decisions never add `only_eligible`. `LaunchSelection.reason`/`note`
+  are serde-default and skipped when absent; the grant is derived from
+  `LaunchInputs` only, so its digest is unchanged.
+- The note excerpt is applied by the store before the insert, with the
+  process `HOME` as the home prefix; a note empty after the excerpt is `null`.
+  Rule 3 applies to words that start with `/` or `~` or contain `://`. Rule 4's
+  run class includes `/`, so a ≥20-char path segment run with letters and
+  digits is masked too (conservative).
+- Automatic admission: statuses follow the sealing loop (`no_knowledge` when no
+  worker snapshot seals, `no_approval` when none matches, `not_evaluated` for
+  profiles after the chosen one). The context is descriptive: the store refuses
+  it unless exactly one entry is `chosen` and it is the reserved profile. A
+  candidate with no chosen profile reserves nothing and writes nothing.
+- Entry points: `SqliteStore::reserve_prepared` keeps its signature as an
+  operator reservation without reason; `reserve_prepared_dispatched`,
+  `reserve_prepared_controlled` and the controlled `reserve_prepared` take a
+  `DispatchContext`; drafts pass a fixed operator context and return first.
+- A store at schema 49 reserving before upgrade writes the classification only.
+
 ## 4. AttemptOutcome record
 
 **Lifecycle marks** (migration 0051): `attempt_lifecycle(attempt_id,

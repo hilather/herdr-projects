@@ -447,6 +447,7 @@ print(json.dumps({{'id':('wrong' if mode=='wrong-id' and r['method']=='agent.pro
         let selection=signer.map(|_|crate::launch_preparation::LaunchSelection {
             task:task.clone(),binding:binding.id.clone(),profile:profile.reference().unwrap(),
             knowledge:inputs.memory.clone().unwrap(),repositories:inputs.repositories.iter().map(|r|PathBuf::from(&r.repository)).collect(),
+            reason:None,note:None,
         });
         let grant = if let Some(selection)=&selection {
             let draft=crate::launch_preparation::draft(&project,selection,state.head,Duration::from_secs(60),Instant::now()+Duration::from_secs(20),Default::default()).unwrap();

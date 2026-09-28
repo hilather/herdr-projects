@@ -455,8 +455,8 @@ impl ControlledStore {
         self.store.validate_launch_draft(inputs,head,now).map_err(|e|self.error(e))?;
         self.control.check()
     }
-    pub(crate) fn reserve_prepared(&mut self,prepared:&[PreparedLaunch],head:u64,now:i64)->Result<Reservation> {
-        self.mutation(|store|store.reserve_prepared(prepared,head,now))
+    pub(crate) fn reserve_prepared(&mut self,prepared:&[PreparedLaunch],head:u64,now:i64,dispatch:&DispatchContext)->Result<Reservation> {
+        self.mutation(|store|store.reserve_prepared_dispatched(prepared,head,now,dispatch))
     }
     pub(crate) fn render_launch_knowledge(&mut self,project:&Path,id:&str)->anyhow::Result<serde_json::Value> {
         self.control.check()?;

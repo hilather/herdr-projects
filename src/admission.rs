@@ -86,6 +86,10 @@ fn binding_profiles<'a>(db: &SqliteStore, profiles: &'a [FrozenProfile], control
     Ok(matches)
 }
 
+fn arm(profile: &FrozenProfile, status: &'static str) -> Result<EligibleProfile> {
+    Ok(EligibleProfile { configuration: agent_configuration(profile), profile_digest: profile.reference().map_err(anyhow::Error::msg)?.digest, status })
+}
+
 /// `None` when the task has no retained worker snapshot for this profile: without
 /// knowledge no worker brief can be built, so the candidate is not launched promptless.
 fn seal(db: &SqliteStore, project_store: &str, header: &Header, candidate: &Candidate, profile: &FrozenProfile, approval: VersionedReference, budget: &ReadBudget) -> Result<Option<LaunchInputs>> {
@@ -252,20 +256,26 @@ pub(crate) fn decide_held(project: &Path, db: &mut SqliteStore, read_control: &R
     for candidate in candidates.iter().filter(|candidate| candidate.blocker.is_none()) {
         let mut sealed = None;
         let (mut matched, mut knowledge) = (false, false);
-        for profile in binding_profiles(&db, &profiles, &header.control, candidate, now,budget)? {
+        // Telemetry: the status each matched profile reached, in evaluation order. Never consulted to choose.
+        let matches = binding_profiles(&db, &profiles, &header.control, candidate, now,budget)?;
+        let mut eligible = Vec::with_capacity(matches.len());
+        for profile in &matches {
             matched = true;
-            let Some(inputs) = seal(db, project_store, &header, candidate, profile, placeholder_approval(), budget)? else { continue };
+            let Some(inputs) = seal(db, project_store, &header, candidate, profile, placeholder_approval(), budget)? else { eligible.push(arm(profile, "no_knowledge")?); continue };
             knowledge = true;
             if let Some(reference) = db.matching_launch_approval(&inputs, now,Some(budget))? {
                 let mut inputs = inputs;
                 inputs.approval = reference;
                 sealed = Some(inputs);
+                eligible.push(arm(profile, "chosen")?);
                 break;
             }
+            eligible.push(arm(profile, "no_approval")?);
         }
         if let Some(inputs) = sealed {
+            for profile in &matches[eligible.len()..] { eligible.push(arm(profile, "not_evaluated")?); }
             // Head was read before this write. A later mutation conflicts instead of reserving a stale snapshot.
-            db.reserve_prepared_controlled(&[PreparedLaunch { inputs }], head, now, read_control,budget)?;
+            db.reserve_prepared_controlled(&[PreparedLaunch { inputs }], head, now, read_control,budget,&DispatchContext::Automatic { eligible })?;
             return Ok(AdmissionDecision { block: None, reason: "reserved", task_id: Some(candidate.task.id.as_str().to_string()) });
         }
         if matched && !knowledge {

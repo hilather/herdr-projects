@@ -4842,3 +4842,99 @@ fn doctor_checks_coordinator_identity_priming_and_memory_owner_without_writing()
     assert!(text.contains("[FAIL] project demo: unknown format.memory `weird-v9`"), "{text}");
     assert_eq!(fs::read_to_string(&format).unwrap(), r#"{"version":1,"runtime":"sqlite-v2","memory":"weird-v9","migration":"abc","reconciliation_required":true}"#);
 }
+
+/// Operator launches of uncontracted queued tasks through the CLI: unused local
+/// bindings, a fake Codex profile, retained knowledge and one signed approval per
+/// task. Returns `(selection, approval digest)` per task and the profile digest.
+#[cfg(all(feature="state-store",target_os="linux"))]
+fn signed_launches(tasks:&[&str])->(VerifyFixture,std::os::unix::net::UnixListener,Vec<(std::path::PathBuf,String)>,String) {
+    use std::fs;use herdr_projects::{runtime,migration,domain::{TaskId,RuntimeRoute,ProjectState}};
+    let f=VerifyFixture::with_worker(&[("src/lib.rs","pub fn base() {}\n".into())],
+        "kind='codex'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=60\nunknown_usage='allow_with_warning'\n");
+    let repository=f.repo.canonicalize().unwrap();
+    let head=||runtime::snapshot(&f.project).unwrap().head.to_string();
+    let cli=|args:&[&str]|{let mut all=vec!["--root",f.r()];all.extend_from_slice(args);let out=hp(f.home.path(),&all);
+        assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap_or(serde_json::Value::Null)};
+    let request=f.home.path().join("queue.json");fs::write(&request,r#"{"priority":0,"dependencies":[]}"#).unwrap();
+    for task in tasks {
+        runtime::add_task(&f.project,TaskId::new(*task).unwrap(),format!("task {task}"),runtime::snapshot(&f.project).unwrap().head).unwrap();
+        cli(&["task","demo","queue",task,"--input-file",request.to_str().unwrap(),"--expected-revision","1","--expected-head",&head()]);
+    }
+    let policy=runtime::snapshot(&f.project).unwrap().scheduler.unwrap().policy.revision.to_string();
+    cli(&["scheduler","demo","policy","--max-active-workers","4","--max-attempts-per-task","3","--expected-revision",&policy,"--expected-head",&head()]);
+    let socket=f.home.path().join("native.sock");let listener=std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let config=f.home.path().join(".config/herdr-projects/config.toml");
+    let bindings=tasks.iter().map(|task|{
+        let revision=runtime::snapshot(&f.project).unwrap().tasks.into_iter().find(|t|t.id.as_str()==*task).unwrap().revision;
+        runtime::create_binding(&f.project,Some(&TaskId::new(*task).unwrap()),Some(revision),runtime::snapshot(&f.project).unwrap().head,
+            &RuntimeRoute{socket:socket.display().to_string(),cwd:repository.display().to_string(),..Default::default()}).unwrap()
+    }).collect::<Vec<_>>();
+    let observations=bindings.iter().map(|change|herdr_projects::reconcile::RuntimeObservation{binding:change.binding.id.clone(),binding_revision:change.binding.revision,
+        task_revision:change.task_revision,observed_unix_ms:jiff::Timestamp::now().as_millisecond(),collector:"herdr-git-v2".into(),
+        config_digest:migration::config_reference(&config).unwrap().digest,..Default::default()}).collect::<Vec<_>>();
+    migration::open_active(&f.project).unwrap().record_observations(runtime::snapshot(&f.project).unwrap().head,&observations).unwrap();
+    let snapshot=runtime::snapshot(&f.project).unwrap();
+    runtime::set_state(&f.project,snapshot.head,snapshot.control.unwrap().revision,ProjectState::Active,&config).unwrap();
+    let profile=f.fake_launchable_profile("codex","codex-cli 0.154.0");
+    let launches=tasks.iter().zip(&bindings).map(|(task,change)|{
+        fs::write(f.project.join("PROJECT.md"),format!("Instructions for {task}")).unwrap();
+        let scope=f.home.path().join(format!("{task}-scope.json"));
+        fs::write(&scope,serde_json::json!({"schema_version":1,"task_id":task,"profile":"worker","domains":[],"paths":[],"pinned_keys":[],"sensitivity":"default"}).to_string()).unwrap();
+        let snapshot=cli(&["memory","demo","snapshot","--task",task,"--profile","worker","--input-file",scope.to_str().unwrap(),"--worker"]);
+        let selection=f.home.path().join(format!("{task}-selection.json"));
+        fs::write(&selection,serde_json::json!({"task":task,"binding":change.binding.id,"profile":profile,
+            "knowledge":{"id":snapshot["id"],"revision":1,"digest":snapshot["manifest_hash"]},"repositories":[repository]}).to_string()).unwrap();
+        let drafted=cli(&["launch","demo","draft","--selection",selection.to_str().unwrap(),"--expected-head",&head()]);
+        let document=f.home.path().join(format!("{task}-approval.json"));fs::write(&document,serde_json::to_vec_pretty(&drafted["approval"]).unwrap()).unwrap();
+        assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&f.key).args(["-n",herdr_projects::authority::SIGNATURE_NAMESPACE]).arg(&document).output().unwrap().status.success());
+        let approval=cli(&["approval","demo","import",document.to_str().unwrap(),document.with_extension("json.sig").to_str().unwrap(),"--expected-head",&head()]);
+        (selection,approval["digest"].as_str().unwrap().to_owned())
+    }).collect();
+    (f,listener,launches,profile.digest)
+}
+
+#[cfg(all(feature="state-store",target_os="linux"))]
+#[test]
+fn launch_reserve_records_operator_reason() {
+    let (f,_listener,launches,profile)=signed_launches(&["a","b"]);
+    let reserve=|selection:&Path,approval:&str|{
+        let head=herdr_projects::runtime::snapshot(&f.project).unwrap().head.to_string();
+        let out=hp(f.home.path(),&["--root",f.r(),"launch","demo","reserve","--selection",selection.to_str().unwrap(),"--approval-digest",approval,"--expected-head",&head]);
+        assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
+    };
+    // The grant signs inputs only: a reason and note added after signing still reserve against it.
+    let (selection,approval)=&launches[0];
+    let mut chosen:serde_json::Value=serde_json::from_slice(&std::fs::read(selection).unwrap()).unwrap();
+    chosen["reason"]="operator_preference".into();
+    chosen["note"]=format!("/home/u/x?token=abc {}\nsecond line is dropped","ab12".repeat(10)).into();
+    std::fs::write(selection,chosen.to_string()).unwrap();
+    let a=reserve(selection,approval);
+    let b=reserve(&launches[1].0,&launches[1].1);
+    let db=f.db();
+    let configuration:String=db.query_row("SELECT configuration_id FROM agent_configurations",[],|r|r.get(0)).unwrap();
+    let eligible=format!(r#"[{{"configuration_id":"{configuration}","probability_ppm":1000000,"profile_digest":"{profile}","status":"chosen"}}]"#);
+    let rows=db.prepare("SELECT attempt_id,chosen_configuration_id,eligible,chooser_kind,chooser_principal,reason_codes,note,policy,seed FROM dispatch_decisions ORDER BY task_id").unwrap()
+        .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,
+            r.get::<_,Option<String>>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,Option<String>>(8)?))).unwrap().map(Result::unwrap).collect::<Vec<_>>();
+    let row=|reservation:&serde_json::Value,approval:&str,reasons:&str,note:Option<&str>|(reservation["record"]["attempt"].as_str().unwrap().to_owned(),configuration.clone(),eligible.clone(),
+        "operator".to_owned(),format!("approval:{approval}"),reasons.to_owned(),note.map(str::to_owned),None,None);
+    assert_eq!(rows,[row(&a,approval,r#"["operator_preference"]"#,Some("~/x [redacted]")),row(&b,&launches[1].1,r#"["unspecified"]"#,None)]);
+}
+
+#[cfg(all(feature="state-store",target_os="linux"))]
+#[test]
+fn rejected_reservation_writes_no_decision() {
+    let (f,_listener,launches,_)=signed_launches(&["a"]);
+    let (selection,approval)=&launches[0];
+    let counts=||f.db().query_row("SELECT (SELECT count(*) FROM attempts),(SELECT count(*) FROM dispatch_decisions)",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?))).unwrap();
+    let head=||herdr_projects::runtime::snapshot(&f.project).unwrap().head;
+    let launch=|command:&str,head:u64|{let mut args=vec!["--root",f.r(),"launch","demo",command,"--selection",selection.to_str().unwrap()];
+        if command=="reserve" {args.extend(["--approval-digest",approval.as_str()]);}
+        let head=head.to_string();args.extend(["--expected-head",&head]);hp(f.home.path(),&args)};
+    assert_eq!(counts(),(0,0),"drafts write no decision");
+    assert!(!launch("reserve",head()-1).status.success(),"a stale head is refused");
+    assert!(launch("draft",head()).status.success());
+    assert_eq!(counts(),(0,0));
+    assert!(launch("reserve",head()).status.success());
+    assert_eq!(counts(),(1,1));
+}

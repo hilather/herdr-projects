@@ -85,25 +85,31 @@ impl SqliteStore {
     /// Select the oldest/aged highest-priority trusted preparation. Approval,
     /// capacity and all mutable input checks stay inside the transaction.
     pub fn reserve_prepared(&mut self,prepared:&[PreparedLaunch],expected_head:u64,now:i64)->Result<Reservation> {
-        self.admit_prepared(prepared,expected_head,now,false,None,None,None)?.ok_or_else(||invalid("reservation missing"))
+        self.reserve_prepared_dispatched(prepared,expected_head,now,&DispatchContext::OPERATOR)
+    }
+    /// `reserve_prepared` with the operator's telemetry reason and note (contracts §3).
+    pub fn reserve_prepared_dispatched(&mut self,prepared:&[PreparedLaunch],expected_head:u64,now:i64,dispatch:&DispatchContext)->Result<Reservation> {
+        self.admit_prepared(prepared,expected_head,now,false,None,None,None,dispatch)?.ok_or_else(||invalid("reservation missing"))
     }
 
     /// A draft checks the same admission conditions without requiring an approval
     /// that cannot be signed until the exact action has been constructed.
     /// This path returns before any task, attempt, event or operation is written.
     pub(crate) fn validate_launch_draft(&mut self,inputs:&LaunchInputs,expected_head:u64,now:i64)->Result<()> {
-        self.admit_prepared(&[PreparedLaunch{inputs:inputs.clone()}],expected_head,now,true,None,None,None)?;
+        self.admit_prepared(&[PreparedLaunch{inputs:inputs.clone()}],expected_head,now,true,None,None,None,&DispatchContext::OPERATOR)?;
         Ok(())
     }
 
-    pub(crate) fn reserve_prepared_controlled(&mut self,prepared:&[PreparedLaunch],expected_head:u64,now:i64,control:&super::controlled::ReadControl,budget:&read_budget::ReadBudget)->Result<Reservation> {
+    pub(crate) fn reserve_prepared_controlled(&mut self,prepared:&[PreparedLaunch],expected_head:u64,now:i64,control:&super::controlled::ReadControl,budget:&read_budget::ReadBudget,dispatch:&DispatchContext)->Result<Reservation> {
         control.check()?;
-        self.admit_prepared(prepared,expected_head,now,false,Some(control),Some(budget),None)?.ok_or_else(||invalid("reservation missing"))
+        self.admit_prepared(prepared,expected_head,now,false,Some(control),Some(budget),None,dispatch)?.ok_or_else(||invalid("reservation missing"))
     }
     pub(super) fn reserve_delegated_prepared(&mut self, prepared:&[PreparedLaunch], delegated:&PreparedDelegatedReservation, now:i64)->Result<Reservation> {
-        self.admit_prepared(prepared,delegated.request.expected_head,now,false,None,None,Some(delegated))?.ok_or_else(||invalid("delegated reservation missing"))
+        self.admit_prepared(prepared,delegated.request.expected_head,now,false,None,None,Some(delegated),&DispatchContext::Delegated)?.ok_or_else(||invalid("delegated reservation missing"))
     }
-    fn admit_prepared(&mut self,prepared:&[PreparedLaunch],expected_head:u64,now:i64,draft:bool,control:Option<&super::controlled::ReadControl>,budget:Option<&read_budget::ReadBudget>,delegated:Option<&PreparedDelegatedReservation>)->Result<Option<Reservation>> {
+    /// `dispatch` is written as the telemetry decision only; it never selects or authorizes.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_prepared(&mut self,prepared:&[PreparedLaunch],expected_head:u64,now:i64,draft:bool,control:Option<&super::controlled::ReadControl>,budget:Option<&read_budget::ReadBudget>,delegated:Option<&PreparedDelegatedReservation>,dispatch:&DispatchContext)->Result<Option<Reservation>> {
         super::delivery::now_check(now)?;if prepared.is_empty()||prepared.len()>128{return Err(invalid("reservation requires 1–128 ready preparations"));}
         let path=std::fs::canonicalize(self.connection.path().ok_or_else(||invalid("store path missing"))?).map_err(|e|StoreError::Io(e.to_string()))?;
         let mut seen=BTreeSet::new();for p in prepared {validate_inputs(&p.inputs)?;if p.inputs.version!=2 {return Err(invalid("new reservations require effective profile evidence"));}if Path::new(&p.inputs.project_store)!=path||!seen.insert(&p.inputs.task){return Err(invalid("preparation belongs to another store or duplicates a task"));}}
@@ -182,10 +188,11 @@ impl SqliteStore {
         let task_revision=inputs.task_revision.checked_add(1).ok_or_else(||invalid("task revision exhausted"))?;
         let mut task=tasks.iter().find(|t|t.id==inputs.task).cloned().ok_or(StoreError::Conflict)?;task.revision=task_revision;task.state=TaskState::Running;task.active_attempt=Some(attempt_id.clone());
         // Telemetry: classify before the first attempt row; later attempts reuse it.
-        if version>=49 {super::dispatch_log::classify_in_transaction(&tx,&inputs,queued.get(&inputs.task).ok_or(StoreError::Conflict)?.dependencies.len(),now,budget)?;}
+        let classification=if version>=49 {Some(super::dispatch_log::classify_in_transaction(&tx,&inputs,queued.get(&inputs.task).ok_or(StoreError::Conflict)?.dependencies.len(),now,budget)?)} else {None};
         let record=AttemptInputRecord{attempt:attempt_id.clone(),operation:operation_id.clone(),inputs};let payload=serde_json::to_string(&record).map_err(|e|invalid(&e.to_string()))?;if payload.len()>MAX_RECORD_BYTES{return Err(invalid("attempt inputs exceed 1 MiB"));}
         let digest=format!("{:x}",Sha256::digest(payload.as_bytes()));let attempt=Attempt{id:attempt_id.clone(),task:record.inputs.task.clone(),revision:1,state:AttemptState::Reserved,snapshot:record.inputs.memory.as_ref().map(|r|r.id.clone()),reservation:format!("worker:{}",attempt_id.as_str()),termination_observed:false};
         tx.execute("INSERT INTO attempts VALUES(?1,?2,1,'reserved',?4,?3,0)",params![attempt_id.as_str(),attempt.task.as_str(),attempt.reservation,attempt.snapshot])?;
+        if version>=50 {super::dispatch_log::record_decision(&tx,&record.inputs,&attempt_id,task_revision,classification.as_deref(),dispatch,delegated,now)?;}
         tx.execute("UPDATE tasks SET revision=?2,state='running',active_attempt=?3 WHERE id=?1",params![attempt.task.as_str(),integer(task_revision)?,attempt_id.as_str()])?;
         tx.execute("INSERT INTO operations VALUES(?1,?2,'runtime.launch',?3,1,?4,?5,?6,?7,?1)",params![operation_id.as_str(),attempt.task.as_str(),record.inputs.binding,payload,digest,integer(task_revision)?,now])?;
         tx.execute("INSERT INTO attempt_inputs VALUES(?1,?2,?3,?4)",params![attempt_id.as_str(),operation_id.as_str(),payload,digest])?;
