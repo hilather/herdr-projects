@@ -348,5 +348,9 @@ Recorded here rather than folded into the card that found them.
   exist, but no production path calls them; prompt delivery currently blocks a
   brief under a revoked barrier without recording it. Wire the recording into
   the prompt/brief path when F3 barrier workflows are activated. Not dead code.
+- **Unwired plan operations:** `retry_infrastructure` and `rework_acceptance`
+  (src/store/plans.rs) have no CLI command or production caller; only unit
+  tests drive them. Decide whether infrastructure retries and acceptance
+  rework get operator commands (F2 planning) or remove them.
 - **Replace-verdict tests** (352 in `docs/reviews/2026-09-27-test-audit.tsv`):
   convert to E2E alongside feature work, starting with `store/barriers.rs`.

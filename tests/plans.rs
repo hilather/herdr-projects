@@ -1,4 +1,5 @@
 #![cfg(all(feature = "state-store", target_os = "linux"))]
+#![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
 //! Plan proposals, advisory waits and feedback-driven replans through the
 //! compiled CLI over a disposable project store. Feedback is real: signed
 //! contracts, CLI submissions and sandboxed verification whose policy fails.
