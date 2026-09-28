@@ -4791,18 +4791,26 @@ fn ticker_delivers_one_memory_review_row_and_a_crash_retry_neither_duplicates_no
     assert_eq!(reminders(), rows);
     assert_eq!(obligation()["notified"], 1);
 
-    // Divergent bytes under the stable id fail loudly without advancing.
+    // A disposition inside the crash window re-renders the summary under the
+    // same stable id. The committed row already surfaced the obligation, so
+    // the next pass counts it once: no second row, the committed row kept as
+    // is, no store write and no error on later passes.
     crash_before_count();
     assert_eq!(memory_review_json(h, r, &["defer", &id, "--reason", "ask the owner"])["status"], "deferred");
     let head = herdr_projects::runtime::snapshot(&project).unwrap().head;
-    let out = memory_review(h, r, &["remind"]);
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("divergent"), "{}", String::from_utf8_lossy(&out.stderr));
     turn();
-    assert!(log().contains("memory-review remind"), "{}", log());
+    assert!(!log().contains("memory-review remind:"), "{}", log());
     assert_eq!(reminders(), rows);
-    assert_eq!(obligation()["notified"], 0);
+    assert_eq!(obligation()["notified"], 1);
+    assert_eq!(obligation()["status"], "deferred");
     assert_eq!(herdr_projects::runtime::snapshot(&project).unwrap().head, head);
+    turn();
+    assert!(!log().contains("memory-review remind:"), "{}", log());
+    assert_eq!(reminders(), rows);
+    assert_eq!(obligation()["notified"], 1);
+    let out = memory_review(h, r, &["remind"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(obligation()["notified"], 1);
 }
 
 #[cfg(unix)]

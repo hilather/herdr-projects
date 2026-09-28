@@ -882,7 +882,9 @@ pub fn emit_due_legacy(project: &crate::project::Project) -> Result<usize> {
 /// a committed delivery row, so a crash between the insert commit and the
 /// counter update retries the same stable id and the store reports
 /// `AlreadyDelivered`: exactly one advancement per row, never a duplicate,
-/// never a skipped count. Failed or rejected delivery advances nothing, so
+/// never a skipped count. That holds even if the obligation was dispositioned
+/// inside the window and now renders a different summary: the committed row
+/// is kept as is and counts as the delivery. Failed or rejected delivery advances nothing, so
 /// the cap is never consumed without delivery. Per-obligation isolated: every
 /// due obligation is attempted and failures are all reported.
 #[cfg(feature = "state-store")]
@@ -907,7 +909,8 @@ pub fn deliver_migrated(project_dir: &Path, project_slug: &str) -> Result<Vec<(S
 
 /// Insert one reminder row under project ownership with a bounded
 /// head-conflict retry. The store resolves an already-committed row
-/// (`AlreadyDelivered`) or divergent bytes (an error, no retry) before its
+/// (`AlreadyDelivered`, even with a re-rendered summary) or a divergent
+/// identity (an error, no retry) before its
 /// head check, and reads only the head and that row, never a whole snapshot.
 #[cfg(feature = "state-store")]
 fn deliver_one_migrated(project_dir: &Path, item: &str, thread_id: &str, summary: &str) -> Result<()> {

@@ -7,15 +7,22 @@ pub struct InboxContent {
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
 pub struct InboxItem { pub revision:u64,pub content:InboxContent,pub seen:bool,pub done:bool }
 /// Outcome of a memory-review reminder delivery. `AlreadyDelivered` means a
-/// row with this stable id and identical delivery bytes committed earlier, so
-/// a retry between the insert commit and the caller's counter update must
-/// advance that counter exactly once, never insert again.
+/// row with this stable id and the same reminder identity (kind, subject and
+/// empty body) committed earlier, so a retry between the insert commit and
+/// the caller's counter update must advance that counter exactly once, never
+/// insert again. The summary may differ: it renders mutable obligation state
+/// (a disposition inside the crash window changes it), and the committed row
+/// already surfaced the obligation.
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
 pub enum ReminderOutcome { Delivered, AlreadyDelivered }
 impl InboxContent {
     pub fn validate(&self)->Result<(),String> {
         if self.id.is_empty() || self.id.len()>512 || self.id.starts_with('.') || self.id.contains("..") || !self.id.bytes().all(|b|b.is_ascii_alphanumeric()||b"-_.".contains(&b)) {return Err("invalid inbox identity".into());}
         Ok(())
+    }
+    /// Same reminder identity: everything but the rendered summary.
+    pub(crate) fn same_reminder(&self,other:&Self)->bool {
+        self.id==other.id && self.kind==other.kind && self.subject==other.subject && self.body.trim_end()==other.body.trim_matches('\n').trim_end()
     }
     pub(crate) fn same_delivery(&self,other:&Self)->bool {
         self.id==other.id && self.kind==other.kind && self.subject==other.subject && self.summary==other.summary && self.body.trim_end()==other.body.trim_matches('\n').trim_end()

@@ -207,17 +207,24 @@ Recorded here rather than folded into the card that found them.
   intake writes `inbox_items` and `inbox.delivered`). Adapted to current
   `main`: delivery holds project ownership and reads only the head and the
   row instead of a whole snapshot, and a divergent row is an error before the
-  head check, so it never spends a conflict retry. E2E:
+  head check, so it never spends a conflict retry (see below for what counts
+  as divergent). E2E:
   `ticker_delivers_one_memory_review_row_and_a_crash_retry_neither_duplicates_nor_double_counts`
   drives full `ticker run` passes; legacy workflow and doctor checks are
   covered through the CLI. Herdr threads `t-0003` and `t-0004` can be closed.
-- **A disposition inside the reminder crash window wedges that reminder.** If a
-  crash lands after the reminder row commits but before `notified` advances,
-  and the obligation is then deferred, the retry renders a different summary
-  under the same stable id. Delivery reports divergent bytes on every tick and
-  never advances (the port keeps the reviewed behaviour; the E2E pins it).
-  Treating a committed row for that id as delivered regardless of summary
-  would clear it.
+- **A disposition inside the reminder crash window wedges that reminder** —
+  done (this PR). If a crash lands after the reminder row commits but before
+  `notified` advances, and the obligation is then deferred, the retry renders
+  a different summary under the same stable id, and delivery used to report
+  divergent bytes on every tick without advancing. Rule now: a committed row
+  with the same stable id, kind, subject and (empty) body is the delivery
+  (`AlreadyDelivered`) whatever its summary, because the summary renders
+  mutable obligation state and the row already surfaced the obligation; the
+  row is left untouched and `notified` advances once. A different kind,
+  subject or body under the id cannot come from a re-render and stays a
+  divergent-bytes error (as does a payload hash mismatch). E2E:
+  `ticker_delivers_one_memory_review_row_and_a_crash_retry_neither_duplicates_nor_double_counts`
+  (crash, defer, next pass advances once, no second row, no error later).
 - **Verification jobs bound to an older task revision never run** — done (this
   PR). A task revision change after enqueue left the job pending and
   unclaimable, and it kept counting toward backlog age. The producer now

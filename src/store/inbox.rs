@@ -112,10 +112,15 @@ impl SqliteStore {
         if let Some((payload,hash))=existing {
             if format!("{:x}",Sha256::digest(payload.as_bytes()))!=hash{return Err(StoreError::Corrupt("inbox payload hash mismatch".into()));}
             let old:InboxContent=serde_json::from_str(&payload).map_err(|e|StoreError::Corrupt(e.to_string()))?;
-            // Same stable id and delivery bytes: a retry after the insert
-            // committed. Divergent bytes under one id are never a silent
-            // overwrite or a second reminder spend.
-            if !old.same_delivery(&content){return Err(StoreError::Invalid(format!("inbox row {} holds divergent bytes; preserve and repair the store",content.id)));}
+            // Same stable id and reminder identity: a retry after the insert
+            // committed. The summary is a rendering of mutable obligation
+            // state, so a disposition between the commit and the caller's
+            // counter update legitimately changes it; the committed row
+            // already surfaced the obligation and counts as delivered, left
+            // untouched. A different kind, subject or body under one id
+            // cannot come from a re-render: it is corruption or tampering,
+            // never a silent overwrite or a second reminder spend.
+            if !old.same_reminder(&content){return Err(StoreError::Invalid(format!("inbox row {} holds divergent bytes; preserve and repair the store",content.id)));}
             return Ok(ReminderOutcome::AlreadyDelivered);
         }
         if head(&tx)?!=expected_head{return Err(StoreError::Conflict);}
