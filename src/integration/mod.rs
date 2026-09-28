@@ -145,17 +145,31 @@ pub fn reconcile_project(project: &Path, repository: &PathBuf, key: &str) -> Res
     reconcile_integration(&mut store, repository, key)
 }
 
+/// Each acceptance policy gets its own candidate check budget, like the
+/// verifier's per-check timeout; one slow policy cannot starve the next.
+pub const POLICY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Most policies whose checks fit the claim lease (the store allows 300 s) and
+/// the automatic job budget (240 s) with room for the merge and publication.
+pub const MAX_POLICIES: usize = 6;
+/// The claim lease the checks run under: every policy's budget plus a margin
+/// for recording the verdicts.
+fn checks_lease_ms(policies: usize) -> i64 {
+    (policies as u64 * POLICY_TIMEOUT.as_millis() as u64 + 30_000) as i64
+}
+
 /// A refusal before any build or ref update.
 #[derive(Debug)]
 pub enum Refused {
     CheckedOut,
     TargetMoved { expected: String, current: String },
+    TooManyPolicies { count: usize },
 }
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::CheckedOut => f.write_str("integration ref is checked out"),
             Self::TargetMoved { expected, current } => write!(f, "integration target moved since verification: ref is at {current}, expected {expected}; blocked for an operator or replan"),
+            Self::TooManyPolicies { count } => write!(f, "integration refused: {count} acceptance policies need {count} x {}s of candidate checks, more than one integration claim can cover (at most {MAX_POLICIES} policies); nothing was built; replan the contract with fewer policies", POLICY_TIMEOUT.as_secs()),
         }
     }
 }
@@ -212,6 +226,9 @@ fn integrate_unlisted(store: &mut SqliteStore, request: &IntegrateRequest, expec
     }
     if verified.route != "verify_then_integrate" {
         bail!("verified result is not routed to integration");
+    }
+    if verified.policies.len() > MAX_POLICIES {
+        return Err(Refused::TooManyPolicies { count: verified.policies.len() }.into());
     }
     let digest = payload_digest(
         &request.idempotency_key,
@@ -439,7 +456,8 @@ fn drive_new(
         let view = store.load_integration_operation(claim.operation.as_str())?;
         return Ok(outcome_of(&view));
     }
-    if !policies_pass(store, &claim, &request.work_dir, &checkout, verified, &oid, &tree)? {
+    let (passed, claim) = policies_pass(store, claim, &request.work_dir, &checkout, verified, &oid, &tree)?;
+    if !passed {
         return finish(
             store,
             claim.operation.as_str(),
@@ -503,7 +521,8 @@ fn resume_incomplete(
     let verified = store.load_verified_for_integration(&view.verified_result_id)?;
     // Checkout failure leaves candidate_prepared. Only a missing object discards it.
     let checkout = repo.checkout_candidate(&request.work_dir, &oid)?;
-    if !policies_pass(store, &claim, &request.work_dir, &checkout, &verified, &oid, &tree)? {
+    let (passed, claim) = policies_pass(store, claim, &request.work_dir, &checkout, &verified, &oid, &tree)?;
+    if !passed {
         return finish(
             store,
             claim.operation.as_str(),
@@ -721,31 +740,34 @@ fn finish(
 }
 
 /// Every acceptance policy of the contract revision runs on the candidate, in
-/// id order, within one 30 s budget; the first failure stops the check. Each
-/// verdict is recorded under the claim.
+/// id order, each within its own `POLICY_TIMEOUT`; the first failure stops the
+/// check. The claim is first extended to cover every policy's budget, and each
+/// verdict is recorded under it. Returns the extended claim.
 fn policies_pass(
     store: &mut SqliteStore,
-    claim: &Claim,
+    claim: Claim,
     work: &Path,
     checkout: &Path,
     verified: &VerifiedIntegration,
     commit: &str,
     tree: &str,
-) -> Result<bool> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+) -> Result<(bool, Claim)> {
+    if verified.policies.len() > MAX_POLICIES {
+        bail!("{}", Refused::TooManyPolicies { count: verified.policies.len() });
+    }
+    let claim = store.extend_integration_lease(&claim, checks_lease_ms(verified.policies.len()), now_ms())?;
     let mut checks = Vec::new();
     let mut all = !verified.policies.is_empty();
     for (index, (policy_id, body)) in verified.policies.iter().enumerate() {
-        let timeout = deadline.saturating_duration_since(std::time::Instant::now());
-        let passed = timeout >= Duration::from_secs(1) && check_passes(work, checkout, index, body, timeout, commit, tree)?;
+        let passed = check_passes(work, checkout, index, body, POLICY_TIMEOUT, commit, tree)?;
         checks.push((policy_id.clone(), format!("{:x}", Sha256::digest(body.as_bytes())), passed));
         if !passed {
             all = false;
             break;
         }
     }
-    store.record_policy_checks(claim, &checks, now_ms())?;
-    Ok(all)
+    store.record_policy_checks(&claim, &checks, now_ms())?;
+    Ok((all, claim))
 }
 
 fn check_passes(

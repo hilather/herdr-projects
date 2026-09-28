@@ -2398,6 +2398,43 @@ fn ticker_auto_integrates_two_results_serially_and_recovers_stale_and_crash() {
     assert!(diagnostic.contains("checks_failed")&&diagnostic.contains("no-three"),"{diagnostic}");
     assert_eq!(checks(&four),[("clean".to_owned(),true),("no-three".to_owned(),false)]);
     assert_eq!(tip(),third,"nothing is published");assert_eq!(integrated(),3);
+    // Each policy has its own candidate check budget: two policies that each
+    // take longer than half of the old shared 30 s budget both pass and publish.
+    let slow_listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();let slow_port=slow_listener.local_addr().unwrap().port();
+    let slow=Arc::new(AtomicBool::new(false));
+    {let slow=slow.clone();std::thread::spawn(move||for stream in slow_listener.incoming(){
+        let Ok(mut stream)=stream else{continue};let slow=slow.clone();
+        std::thread::spawn(move||{let mut buffer=[0u8;4096];let _=stream.read(&mut buffer);if slow.load(Ordering::SeqCst){std::thread::sleep(std::time::Duration::from_secs(18));}let _=stream.write_all(b"0000");let _=stream.read(&mut buffer);});
+    });}
+    let takes=|id:&str|(id.to_owned(),format!(r#"{{"version":1,"checks":["/usr/bin/git","ls-remote","git://127.0.0.1:{slow_port}/{id}"]}}"#));
+    let (slow_a,slow_b)=(takes("slow-a"),takes("slow-b"));
+    auto(&["--integrate","off"]);
+    let c5=candidate("five");let five=f.submit_at("five",&[(slow_a.0.as_str(),slow_a.1.clone()),(slow_b.0.as_str(),slow_b.1.clone())],&c5);
+    let verified=||{let runs=f.jobs().into_iter().filter(|(op,_)|op.payload["submission_id"]==five.as_str()).collect::<Vec<_>>();runs.len()==2&&runs.iter().all(|(_,d)|d.state==DeliveryState::Confirmed)};
+    let mut child=f.spawn();f.wait(&mut child,90,&verified);f.stop(&mut child);
+    slow.store(true,Ordering::SeqCst);auto(&["--integrate","on"]);
+    let mut child=f.spawn();f.wait(&mut child,180,&||job(&five).is_some_and(|(_,d)|matches!(d.state,DeliveryState::Confirmed|DeliveryState::PermanentFailure)));f.stop(&mut child);
+    let (_,delivery)=job(&five).unwrap();assert_eq!(delivery.state,DeliveryState::Confirmed,"{:?}",delivery.last_outcome);
+    assert_eq!(checks(&five),[("slow-a".to_owned(),true),("slow-b".to_owned(),true)]);
+    let fifth=tip();assert_eq!(integrated(),4);assert_eq!(f.git(&["rev-parse",&format!("{fifth}^1")]),third);
+    // Policies whose budgets together exceed one claim lease are refused before any build.
+    // The operator verifies each policy directly, sparing seven ticker turns.
+    auto(&["--integrate","off","--verify","off"]);
+    let many=(0..7).map(|n|absent(&format!("absent-{n}"),&format!("src/absent-{n}.txt"))).collect::<Vec<_>>();
+    let c6=candidate("six");let six=f.submit_at("six",&many.iter().map(|(id,body)|(id.as_str(),body.clone())).collect::<Vec<_>>(),&c6);
+    for (id,body) in &many {
+        let policy=f.home.path().join(format!("{id}.json"));std::fs::write(&policy,body).unwrap();
+        let out=hp(f.home.path(),&["--root",f.r(),"result","demo","verify",&six,"--policy-id",id,"--policy-file",policy.to_str().unwrap(),
+            "--idempotency-key",&format!("six-{id}"),"--work-dir",f.home.path().join(format!("six-{id}")).to_str().unwrap(),"--timeout-seconds","30"]);
+        assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["state"],"accepted");
+    }
+    auto(&["--integrate","on"]);
+    let mut child=f.spawn();f.wait(&mut child,90,&||job(&six).is_some_and(|(_,d)|d.state==DeliveryState::PermanentFailure));f.stop(&mut child);
+    let Some(Outcome::PermanentFailure{diagnostic})=job(&six).unwrap().1.last_outcome else {panic!("too many policies are refused")};
+    assert!(diagnostic.contains("7 acceptance policies")&&diagnostic.contains("at most 6"),"{diagnostic}");
+    assert_eq!(f.db().query_row("SELECT count(*) FROM integration_operations",[],|row|row.get::<_,u64>(0)).unwrap(),5,"nothing is built");
+    assert_eq!((tip(),integrated()),(fifth,4));
 }
 
 #[cfg(all(feature="state-store",target_os="linux"))]

@@ -522,6 +522,31 @@ impl SqliteStore {
         Ok(candidate_id)
     }
 
+    /// Extend a live claim so it covers the candidate policy checks. The lease
+    /// only grows, stays within the store's maximum, and keeps the claim's
+    /// revision and epoch; the new expiry is recorded as an event.
+    pub(crate) fn extend_integration_lease(&mut self, claim: &Claim, lease_ms: i64, now: i64) -> Result<Claim> {
+        if !(1..=300_000).contains(&lease_ms) {
+            return Err(invalid("lease must be 1..300000 ms"));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        schema28(&tx)?;
+        claim_held(&tx, claim, now)?;
+        let until = claim.lease_until_ms.max(now + lease_ms);
+        tx.execute(
+            "UPDATE operation_delivery SET lease_until_ms=?2 WHERE operation_id=?1",
+            params![claim.operation.as_str(), until],
+        )?;
+        tx.execute(
+            "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('integration.lease_extended',?1,?2,1,?3)",
+            params![claim.operation.as_str(), integer(claim.revision)?, serde_json::json!({"owner": claim.owner, "epoch": claim.epoch, "lease_until_ms": until}).to_string()],
+        )?;
+        tx.commit()?;
+        Ok(Claim { lease_until_ms: until, ..claim.clone() })
+    }
+
     /// One row per acceptance policy rechecked on the candidate, under the live claim.
     pub(crate) fn record_policy_checks(&mut self, claim: &Claim, checks: &[(String, String, bool)], now: i64) -> Result<()> {
         let tx = self

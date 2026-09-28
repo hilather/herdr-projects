@@ -12,7 +12,8 @@ use herdr_projects::{migration,execution_guard::ProjectGuard,domain::{Operation,
     integration::{self,IntegrateOutcome,IntegrateRequest,Refused},
     operations::{Claim,Outcome,DeliveryState,dispatch::{self,DeliveryAdapter,PreparedDelivery,DispatchRequest,DispatchResult}}};
 pub const JOB:&str="\0herdr-projects-canonical-integration";
-/// Merge, candidate checks (30 s) and publication; the claim lease is the store's 300 s maximum.
+/// Merge, candidate checks (each policy within `integration::POLICY_TIMEOUT`, at most
+/// `integration::MAX_POLICIES`) and publication; the claim lease is the store's 300 s maximum.
 const BUDGET:Duration=Duration::from_secs(240);
 const LEASE_MS:i64=300_000;
 const OWNER:&str="ticker.integration";
@@ -73,6 +74,7 @@ impl PreparedDelivery for Prepared<'_> {
             Err(error)=>match error.downcast_ref::<Refused>() {
                 Some(Refused::CheckedOut)=>Outcome::Retryable{no_effect_evidence:format!("{error}: the target is checked out in a user worktree; nothing was published")},
                 Some(refused@Refused::TargetMoved{..})=>Outcome::PermanentFailure{diagnostic:format!("{refused}; {RETRY}")},
+                Some(refused@Refused::TooManyPolicies{..})=>Outcome::PermanentFailure{diagnostic:refused.to_string()},
                 None=>Outcome::Ambiguous{observation_required:format!("integration stopped: {}; reconcile by key before any new effect",format!("{error:#}").chars().take(2048).collect::<String>())},
             },
         })

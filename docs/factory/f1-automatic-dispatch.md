@@ -147,7 +147,7 @@ Recorded here rather than folded into the card that found them.
   reported `predecessor_failed`.
 - **Integration rechecks one policy** (F1.7): done (this PR). The candidate
   check runs every acceptance policy of the contract revision, in id order
-  within one 30 s budget, and publishes only if all pass. Each verdict is
+  (each with its own budget; see below), and publishes only if all pass. Each verdict is
   recorded in `integration_policy_checks` (migration 0046) and returned as
   `policies`; a failing policy is named in the job diagnostic.
 - **Codex cannot commit under `workspace-write`** (F1.7) — done (this PR):
@@ -252,9 +252,15 @@ Recorded here rather than folded into the card that found them.
   stops offering it. The worker keeps running and holding capacity until an
   operator cancels the attempt; nothing is renamed. E2E: the `expired` case of
   `workers_sharing_one_herdr_server_are_named_independently_and_recover_unapplied_names`.
-- **Integration policy rechecks share one 30 s budget.** Since every acceptance
-  policy is rechecked on the candidate, several slow policies can exhaust the
-  shared budget and block the job. Give each policy its own bounded budget
-  within the claim lease, or lengthen the lease with the policy count.
+- **Integration policy rechecks share one 30 s budget** — done (this PR). Since
+  every acceptance policy was rechecked on the candidate within one shared
+  budget, several slow policies could exhaust it and block the job. Each policy
+  now gets its own 30 s check budget, and the integration claim is extended to
+  cover all of them (30 s per policy plus 30 s to record) before the checks
+  run. A contract with more than 6 policies, which one lease and the 240 s job
+  budget cannot cover, is refused before any build with a diagnostic naming the
+  limit. E2E: the `five` (two 18 s policies publish) and `six` (seven policies
+  refused) cases of
+  `ticker_auto_integrates_two_results_serially_and_recovers_stale_and_crash`.
 - **Replace-verdict tests** (352 in `docs/reviews/2026-09-27-test-audit.tsv`):
   convert to E2E alongside feature work, starting with `store/barriers.rs`.
