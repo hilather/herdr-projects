@@ -542,6 +542,21 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
                     memory.canonical_effects_unknown=true;log.line(&format!("{slug}: canonical controller: {error:#}"));
                 }
             }
+            // Migrated projects ingest Remember obligations and deliver due
+            // reminders as stable rows into the SQLite inbox (never legacy
+            // inbox files). Failures log and retry next tick; a failed
+            // delivery never consumes the reminder cap.
+            if let Err(error) = crate::memory_review::ingest_all(&ctx.root.join(slug)) {
+                log.line(&format!("{slug}: memory-review ingest: {error:#}"));
+            }
+            match crate::memory_review::deliver_migrated(&ctx.root.join(slug), slug) {
+                Ok(delivered) => {
+                    for (item, _) in delivered {
+                        log.line(&format!("{slug}: memory-review reminder delivered: {item}"));
+                    }
+                }
+                Err(error) => log.line(&format!("{slug}: memory-review remind: {error:#}")),
+            }
         }
         admit_background(ctx,log,memory,canonical.into_iter().map(|slug|ctx.root.join(slug)).collect());
         if let Some(reads)=memory.local_reports.as_mut(){for error in reads.admit(){log.line(&error);}}
@@ -1087,6 +1102,10 @@ fn tick_slow(ctx: &Ctx, project: &Project, seen: &Seen, memory: &mut Memory) -> 
     }
 
     errors.extend(thread::copy_delivery::deliver(project).err());
+    // Durable Remember review: ingest home reports, then emit bounded stable
+    // reminders. Archiving a `thread-state` item never clears these obligations.
+    errors.extend(crate::memory_review::ingest_all(&project.dir()).err().map(|e| anyhow::anyhow!("memory-review ingest: {e:#}")));
+    errors.extend(crate::memory_review::emit_due_legacy(project).err().map(|e| anyhow::anyhow!("memory-review remind: {e:#}")));
     errors.extend(steps::write_thread_items_ready(project, &mut state, &transitions, seen.session_lost,|t| {
         !deferred.contains(&t.id)&&(t.is_remote()||seen.local_reports.as_ref().is_none_or(|reports|reports.get(&t.id).is_some_and(|sample|sample.matches(t))))&&memory.copy_jobs.as_ref().is_none_or(|q|!q.outstanding(project,&t.id)&&(!t.is_remote()||observed.contains(&t.id)))
     }).err());

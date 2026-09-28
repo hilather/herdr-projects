@@ -4235,3 +4235,357 @@ fn historical_store_cli_requires_explicit_upgrade_and_preserves_intent_and_capac
         assert_eq!(raw.query_row("SELECT count(*) FROM pragma_foreign_key_check",[],|row|row.get::<_,u64>(0)).unwrap(),0);
     }
 }
+
+const REMEMBER_REPORT: &str = "## Report\n\ndid work\n\n## Remember\n\nAlways run the linter.\n\n## Next\n\nmore\n";
+
+/// Runs `memory-review demo ARGS` against `root`.
+fn memory_review(home: &Path, root: &str, args: &[&str]) -> std::process::Output {
+    let mut full = vec!["--root", root, "memory-review", "demo"];
+    full.extend_from_slice(args);
+    hp(home, &full)
+}
+
+/// `memory-review demo ARGS` must succeed and print JSON.
+fn memory_review_json(home: &Path, root: &str, args: &[&str]) -> serde_json::Value {
+    let out = memory_review(home, root, args);
+    assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[test]
+fn memory_review_keeps_legacy_remember_obligations_through_archive_until_an_explicit_disposition() {
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let r = root.to_str().unwrap();
+    assert!(hp(home.path(), &["--root", r, "new", "demo"]).status.success());
+    let project = root.join("demo");
+    let h = home.path();
+    let text = |out: std::process::Output| String::from_utf8_lossy(&out.stdout).into_owned();
+    let context = || { let out = hp(h, &["--root", r, "context", "demo", "--peek"]); assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr)); text(out) };
+    let list = || memory_review_json(h, r, &["list"]).as_array().unwrap().clone();
+    let memory_before = fs::read(project.join("MEMORY.md")).unwrap();
+
+    // One unreadable report is named without blocking the readable one.
+    fs::write(project.join("threads/t-0001.md"), REMEMBER_REPORT).unwrap();
+    fs::write(project.join("threads/t-0002.md"), [0xff, 0xfe]).unwrap();
+    let out = memory_review(h, r, &["ingest", "--all"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("t-0002"));
+    fs::remove_file(project.join("threads/t-0002.md")).unwrap();
+    // Retries never stack a second obligation for the same report bytes.
+    memory_review_json(h, r, &["ingest", "--all"]);
+    let obligations = list();
+    assert_eq!(obligations.len(), 1);
+    fs::write(project.join("threads/t-0003.md"), "## Report\n\nnothing to keep\n\n## Remember\n\n   \n").unwrap();
+    assert!(String::from_utf8_lossy(&memory_review(h, r, &["ingest", "--thread", "t-0003"]).stdout).contains("no ## Remember in threads/t-0003.md"));
+    assert_eq!(list().len(), 1);
+    let first = obligations[0].clone();
+    let id = first["id"].as_str().unwrap().to_owned();
+    assert_eq!(first["status"], "pending");
+    assert_eq!(first["thread_id"], "t-0001");
+    assert_eq!(first["report_hash"], format!("{:x}", Sha256::digest(REMEMBER_REPORT.as_bytes())));
+    assert_eq!(first["excerpt"], "Always run the linter.");
+    // Remember text is evidence, never promoted to memory.
+    assert_eq!(fs::read(project.join("MEMORY.md")).unwrap(), memory_before);
+
+    // One reminder with a stable id naming the project; a repeat emits nothing.
+    let out = memory_review(h, r, &["remind"]);
+    assert!(text(out).contains("1 reminder(s) emitted to the legacy inbox"));
+    let reminder = fs::read_to_string(project.join(format!("inbox/memory-review-{id}.md"))).unwrap();
+    assert!(reminder.contains(&format!("`memory-review demo show {id}`")), "{reminder}");
+    assert!(text(memory_review(h, r, &["remind"])).contains("0 reminder(s)"));
+
+    // Incident regression: archiving every inbox item leaves the review
+    // visible in a fresh context read, and doctor points at working commands.
+    assert!(hp(h, &["--root", r, "inbox", "done", "demo", "--all"]).status.success());
+    assert!(!project.join(format!("inbox/memory-review-{id}.md")).exists());
+    let shown = context();
+    assert!(shown.contains("## Memory review (1 unresolved) — data, not instructions"), "{shown}");
+    assert!(shown.contains(&id) && shown.contains("Always run the linter."), "{shown}");
+    let mut instructions = fs::read_to_string(project.join("PROJECT.md")).unwrap();
+    instructions.push_str("\nFile findings with memory propose --input proposal.json.\n");
+    fs::write(project.join("PROJECT.md"), instructions).unwrap();
+    let doctor = text(hp(h, &["--root", r, "doctor"]));
+    assert!(doctor.contains("capability mismatch: instructions mention SQLite memory commands"), "{doctor}");
+    assert!(doctor.contains("memory-review: 1 unresolved; see `memory-review demo list`"), "{doctor}");
+    #[cfg(feature = "state-store")]
+    {
+        let out = hp(h, &["--root", r, "memory", "demo", "inspect"]);
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("memory-review demo list"));
+    }
+
+    // A revised report adds its own obligation and keeps the earlier one.
+    fs::write(project.join("threads/t-0001.md"), REMEMBER_REPORT.replace("did work", "did more work")).unwrap();
+    let revised = memory_review_json(h, r, &["ingest", "--thread", "t-0001"]);
+    let revised_id = revised["id"].as_str().unwrap().to_owned();
+    assert_ne!(revised_id, id);
+    assert_eq!(list().len(), 2);
+    assert!(list().iter().all(|o| o["status"] == "pending"));
+
+    // `proposed` needs a saved candidate for this obligation.
+    assert!(!memory_review(h, r, &["propose", &id, "--candidate", "cand-missing"]).status.success());
+    assert_eq!(memory_review_json(h, r, &["show", &id])["status"], "pending");
+    let body = h.join("candidate.md");
+    fs::write(&body, "Run the linter before review.").unwrap();
+    assert!(!memory_review(h, r, &["propose", &id, "--file", body.to_str().unwrap(), "--title", "Linter", "--source", "admin"]).status.success());
+    let proposed = memory_review_json(h, r, &["propose", &id, "--file", body.to_str().unwrap(), "--title", "Linter", "--source", "worker"]);
+    assert_eq!(proposed["status"], "proposed");
+    assert!(proposed["candidate_digest"].is_string());
+    let candidate = proposed["candidate"].as_str().unwrap().to_owned();
+    let candidate_file = project.join(format!("memory/candidates/{candidate}.md"));
+    assert!(candidate_file.is_file());
+    assert_eq!(fs::read(project.join("MEMORY.md")).unwrap(), memory_before);
+    assert_eq!(memory_review_json(h, r, &["propose", &id, "--candidate", &candidate])["status"], "proposed");
+    assert!(!memory_review(h, r, &["propose", &revised_id, "--candidate", &candidate]).status.success());
+    assert!(!memory_review(h, r, &["reject", &id, "--reason", "late"]).status.success());
+    // The link pins the candidate bytes and the Remember evidence.
+    let saved = fs::read(&candidate_file).unwrap();
+    fs::write(&candidate_file, [saved.as_slice(), b"\nForged addition.\n"].concat()).unwrap();
+    assert!(!memory_review(h, r, &["show", &id]).status.success());
+    fs::write(&candidate_file, &saved).unwrap();
+    let evidence = project.join(format!(".state/memory-review-evidence/{}.txt", first["remember_hash"].as_str().unwrap()));
+    let retained = fs::read(&evidence).unwrap();
+    fs::write(&evidence, "forged").unwrap();
+    assert!(!memory_review(h, r, &["show", &id]).status.success());
+    fs::write(&evidence, &retained).unwrap();
+    assert_eq!(memory_review_json(h, r, &["show", &id])["status"], "proposed");
+
+    // Deferred stays visible and reminds on a bounded cadence.
+    assert!(!memory_review(h, r, &["defer", &revised_id, "--reason", "   "]).status.success());
+    assert_eq!(memory_review_json(h, r, &["defer", &revised_id, "--reason", "ask the owner"])["status"], "deferred");
+    assert!(text(memory_review(h, r, &["remind"])).contains("1 reminder(s)"));
+    assert!(text(memory_review(h, r, &["remind"])).contains("0 reminder(s)"));
+    assert!(context().contains("## Memory review (1 unresolved)"));
+    let rejected = memory_review_json(h, r, &["reject", &revised_id, "--reason", "transient status"]);
+    assert_eq!((rejected["status"].as_str(), rejected["reason"].as_str()), (Some("rejected"), Some("transient status")));
+    assert!(context().contains("## Memory review (0 unresolved)"));
+
+    // Unsafe identifiers fail closed.
+    assert!(!memory_review(h, r, &["show", "../x"]).status.success());
+    assert!(!memory_review(h, r, &["ingest", "--thread", "../x"]).status.success());
+    assert!(!memory_review(h, r, &["propose", "../x", "--candidate", "cand-x"]).status.success());
+
+    // Explicit user decisions are recorded with provenance on legacy memory.
+    let decision = h.join("decision.md");
+    fs::write(&decision, "Use Postgres for billing.").unwrap();
+    assert!(!memory_review(h, r, &["record", "--title", "Use Postgres", "--file", decision.to_str().unwrap(), "--provenance", ""]).status.success());
+    let out = memory_review(h, r, &["record", "--title", "Use Postgres", "--file", decision.to_str().unwrap(), "--provenance", "user chat: remember our DB choice"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(fs::read_to_string(project.join("memory/use-postgres.md")).unwrap().contains("provenance=user chat: remember our DB choice"));
+    assert!(fs::read_to_string(project.join("MEMORY.md")).unwrap().contains("memory/use-postgres.md"));
+
+    // Context shows the true total with a truncation note.
+    for n in 0..21 {
+        fs::write(project.join(format!("threads/t-{:04}.md", 100 + n)), REMEMBER_REPORT.replace("did work", &format!("run {n}"))).unwrap();
+    }
+    memory_review_json(h, r, &["ingest", "--all"]);
+    let shown = context();
+    assert!(shown.contains("## Memory review (21 unresolved)"), "{shown}");
+    assert!(shown.contains("(showing 20 of 21; see `memory-review demo list`)"), "{shown}");
+
+    // A corrupt store is preserved and reported, never a false `(none)`.
+    fs::write(project.join(".state/memory-review.json"), "{broken").unwrap();
+    assert!(!memory_review(h, r, &["list"]).status.success());
+    assert!(!memory_review(h, r, &["ingest", "--all"]).status.success());
+    assert!(context().contains("Memory review error:"));
+    assert_eq!(fs::read(project.join(".state/memory-review.json")).unwrap(), b"{broken");
+}
+
+#[cfg(not(feature = "state-store"))]
+#[test]
+fn memory_review_remind_without_the_state_store_prints_due_reviews_and_records_nothing() {
+    use std::fs;
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let r = root.to_str().unwrap();
+    assert!(hp(home.path(), &["--root", r, "new", "demo"]).status.success());
+    let project = root.join("demo");
+    fs::write(project.join("threads/t-0001.md"), REMEMBER_REPORT).unwrap();
+    let id = memory_review_json(home.path(), r, &["ingest", "--all"])[0]["id"].as_str().unwrap().to_owned();
+    fs::write(project.join(".state/format.json"), r#"{"version":1,"runtime":"sqlite-v2","memory":"sqlite-v1","migration":"abc","reconciliation_required":true}"#).unwrap();
+    let before = fs::read(project.join(".state/memory-review.json")).unwrap();
+    let out = memory_review(home.path(), r, &["remind"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let printed = String::from_utf8_lossy(&out.stdout);
+    assert!(printed.contains(&id) && printed.contains("recorded nothing"), "{printed}");
+    assert_eq!(fs::read(project.join(".state/memory-review.json")).unwrap(), before);
+    assert!(!project.join(format!("inbox/memory-review-{id}.md")).exists());
+    // SQLite-owned memory refuses direct Markdown records.
+    let decision = home.path().join("decision.md");
+    fs::write(&decision, "x").unwrap();
+    assert!(!memory_review(home.path(), r, &["record", "--title", "X", "--file", decision.to_str().unwrap(), "--provenance", "user chat: x"]).status.success());
+}
+
+#[cfg(all(feature = "state-store", target_os = "linux"))]
+#[test]
+fn ticker_delivers_one_memory_review_row_and_a_crash_retry_neither_duplicates_nor_double_counts() {
+    use std::{fs, process::Stdio, time::{Duration, Instant}};
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let r = root.to_str().unwrap();
+    let h = home.path();
+    for action in ["new", "pause"] { assert!(hp(h, &["--root", r, action, "demo"]).status.success()); }
+    let plan = h.join("plan.json");
+    for args in [vec!["plan", "--output", plan.to_str().unwrap()], vec!["apply", "--plan", plan.to_str().unwrap(), "--writers-stopped"]] {
+        let mut full = vec!["--root", r, "migration", "demo"];
+        full.extend(args);
+        let out = hp(h, &full);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+    let project = root.join("demo");
+    fs::write(project.join("threads/t-0001.md"), REMEMBER_REPORT).unwrap();
+
+    struct Child(std::process::Child);
+    impl Drop for Child { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+    let metrics = root.join(".ticker-metrics.json");
+    let log = || fs::read_to_string(root.join(".ticker.log")).unwrap_or_default();
+    // One full canonical `ticker run` pass: metrics publish at the end of a tick.
+    let turn = || {
+        let _ = fs::remove_file(&metrics);
+        let mut child = Child(Command::new(BIN).env_clear().env("HOME", h).env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", "/bin/false")
+            .args(["--root", r, "ticker", "run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+        let end = Instant::now() + Duration::from_secs(35);
+        while !metrics.is_file() {
+            assert!(child.0.try_wait().unwrap().is_none(), "{}", log());
+            assert!(Instant::now() < end, "{}", log());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fs::write(root.join(".ticker.stop"), b"").unwrap();
+        let end = Instant::now() + Duration::from_secs(8);
+        while child.0.try_wait().unwrap().is_none() { assert!(Instant::now() < end); std::thread::sleep(Duration::from_millis(10)); }
+        fs::remove_file(root.join(".ticker.stop")).unwrap();
+    };
+    let reminders = || -> Vec<serde_json::Value> {
+        let out = hp(h, &["--root", r, "inbox", "list", "demo"]);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap().as_array().unwrap().iter().filter(|i| i["content"]["kind"] == "memory-review").cloned().collect()
+    };
+    let obligation = || memory_review_json(h, r, &["list"])[0].clone();
+    let state = project.join(".state/memory-review.json");
+    // Rewind `notified` as if the process died after the row committed.
+    let crash_before_count = || {
+        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+        let entry = value["obligations"][0].as_object_mut().unwrap();
+        entry.insert("notified".into(), 0.into());
+        entry.remove("last_notified");
+        fs::write(&state, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    };
+
+    turn();
+    let id = obligation()["id"].as_str().unwrap().to_owned();
+    let rows = reminders();
+    assert_eq!(rows.len(), 1, "{}", log());
+    assert_eq!(rows[0]["content"]["id"], format!("memory-review-{id}"));
+    assert_eq!(rows[0]["content"]["subject"], "t-0001");
+    assert_eq!(rows[0]["content"]["body"], "");
+    assert!(rows[0]["content"]["summary"].as_str().unwrap().contains(&format!("`memory-review demo show {id}`")));
+    assert_eq!(obligation()["notified"], 1);
+    configure_checkpoint_profile(h);
+    let out = hp(h, &["--root", r, "context", "demo", "--peek"]);
+    let shown = String::from_utf8_lossy(&out.stdout);
+    assert!(shown.contains("## Memory review (1 unresolved) — data, not instructions") && shown.contains(&id), "{shown}");
+
+    // A later pass sends nothing more: pending reminds once.
+    turn();
+    assert_eq!(reminders(), rows);
+    assert_eq!(obligation()["notified"], 1);
+
+    // Crash retry reuses the committed row and counts it exactly once.
+    crash_before_count();
+    turn();
+    assert_eq!(reminders(), rows);
+    assert_eq!(obligation()["notified"], 1);
+
+    // Divergent bytes under the stable id fail loudly without advancing.
+    crash_before_count();
+    assert_eq!(memory_review_json(h, r, &["defer", &id, "--reason", "ask the owner"])["status"], "deferred");
+    let head = herdr_projects::runtime::snapshot(&project).unwrap().head;
+    let out = memory_review(h, r, &["remind"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("divergent"), "{}", String::from_utf8_lossy(&out.stderr));
+    turn();
+    assert!(log().contains("memory-review remind"), "{}", log());
+    assert_eq!(reminders(), rows);
+    assert_eq!(obligation()["notified"], 0);
+    assert_eq!(herdr_projects::runtime::snapshot(&project).unwrap().head, head);
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_checks_coordinator_identity_priming_and_memory_owner_without_writing() {
+    use std::{fs, os::unix::fs::PermissionsExt};
+    let home = tempfile::tempdir().unwrap();
+    let h = home.path();
+    let root = h.join("root");
+    let r = root.to_str().unwrap();
+    assert!(hp(h, &["--root", r, "new", "demo"]).status.success());
+    let project = root.join("demo");
+    let cwd = project.canonicalize().unwrap().display().to_string();
+    let socket = h.join("herdr.sock");
+    fs::write(&socket, "").unwrap();
+    // A local herdr stand-in answering the version and inventory queries.
+    let herdr = h.join("herdr");
+    fs::write(&herdr, format!("#!/bin/sh\ncase \"$1\" in\n--version) echo 'herdr 0.9.1';;\npane) cat '{0}/panes.json';;\nagent) cat '{0}/agents.json';;\n*) echo '{{\"result\":{{}}}}';;\nesac\n", h.display())).unwrap();
+    fs::set_permissions(&herdr, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(h.join("panes.json"), serde_json::json!({"result": {"panes": [{"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1", "cwd": cwd}]}}).to_string()).unwrap();
+    let record = |prime_pending: bool| serde_json::json!({"socket": socket.display().to_string(), "workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1",
+        "agent_name": "hp-demo-coordinator", "cwd": cwd, "prime_pending": prime_pending, "prime_request": 1}).to_string();
+    let agents = |name: &str, kind: &str, status: &str| {
+        let agents = if name.is_empty() { serde_json::json!([]) } else {
+            serde_json::json!([{"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1", "name": name, "agent": kind, "agent_status": status, "cwd": cwd}])
+        };
+        fs::write(h.join("agents.json"), serde_json::json!({"result": {"agents": agents}}).to_string()).unwrap();
+    };
+    let doctor = || {
+        let before = fs::read(project.join(".state/coordinator.json")).ok();
+        let out = Command::new(BIN).env_clear().env("HOME", h).env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", &herdr).args(["--root", r, "doctor"]).output().unwrap();
+        assert_eq!(fs::read(project.join(".state/coordinator.json")).ok(), before, "doctor must not write the coordinator record");
+        (String::from_utf8_lossy(&out.stdout).into_owned(), out.status.success())
+    };
+
+    fs::write(project.join(".state/coordinator.json"), record(false)).unwrap();
+    agents("hp-demo-coordinator", "claude", "idle");
+    let (text, _) = doctor();
+    assert!(text.contains("[ok  ] project demo: active; socket"), "{text}");
+    assert!(text.contains("coordinator identity: live agent `hp-demo-coordinator` matches w1:w1:t1:w1:p1 (kind `claude`)"), "{text}");
+    // A matching agent that is not ready yet is normal startup.
+    fs::write(project.join(".state/coordinator.json"), record(true)).unwrap();
+    agents("hp-demo-coordinator", "claude", "working");
+    assert!(doctor().0.contains("priming pending (normal startup)"));
+    // A pane without the agent is not ok and gives read-only guidance.
+    agents("", "", "");
+    let (text, _) = doctor();
+    assert!(text.contains("exists but holds no agent") && text.contains("open demo --reprime"), "{text}");
+    assert!(text.contains("[warn] project demo: active; socket") && !text.contains("[ok  ] project demo: active; socket"), "{text}");
+    agents("someone-else", "claude", "idle");
+    let (text, _) = doctor();
+    assert!(text.contains("holds `someone-else`") && text.contains("do not rename"), "{text}");
+    agents("hp-demo-coordinator", "codex", "idle");
+    assert!(doctor().0.contains("coordinator kind mismatch: configured `claude` but live agent kind is `codex`"));
+
+    // A migrated SQLite-memory project gets the same identity check, and its
+    // memory-owner and instruction checks, still without writes.
+    let format = project.join(".state/format.json");
+    fs::write(&format, r#"{"version":1,"runtime":"sqlite-v2","memory":"sqlite-v1","migration":"abc","reconciliation_required":true}"#).unwrap();
+    let (text, _) = doctor();
+    assert!(text.contains("migrated runtime=sqlite-v2 memory=sqlite-v1"), "{text}");
+    assert!(text.contains("coordinator kind mismatch: configured `claude` but live agent kind is `codex`"), "{text}");
+    assert!(!text.contains("capability mismatch"), "{text}");
+    let instructions = fs::read_to_string(project.join("PROJECT.md")).unwrap();
+    fs::write(project.join("PROJECT.md"), format!("{instructions}\nDo not edit MEMORY.md; it is a generated projection.\n")).unwrap();
+    assert!(!doctor().0.contains("capability mismatch"));
+    fs::write(project.join("PROJECT.md"), format!("{instructions}\nWhen the user says remember, edit MEMORY.md directly.\n")).unwrap();
+    assert!(doctor().0.contains("capability mismatch: instructions say to edit MEMORY.md as authority"));
+    let decision = h.join("decision.md");
+    fs::write(&decision, "x").unwrap();
+    assert!(!memory_review(h, r, &["record", "--title", "X", "--file", decision.to_str().unwrap(), "--provenance", "user chat: x"]).status.success());
+    // An unknown memory owner fails rather than reporting ok.
+    fs::write(&format, r#"{"version":1,"runtime":"sqlite-v2","memory":"weird-v9","migration":"abc","reconciliation_required":true}"#).unwrap();
+    let (text, healthy) = doctor();
+    assert!(!healthy);
+    assert!(text.contains("[FAIL] project demo: unknown format.memory `weird-v9`"), "{text}");
+    assert_eq!(fs::read_to_string(&format).unwrap(), r#"{"version":1,"runtime":"sqlite-v2","memory":"weird-v9","migration":"abc","reconciliation_required":true}"#);
+}

@@ -188,14 +188,24 @@ Recorded here rather than folded into the card that found them.
   profile.
 - **Port the reviewed memory-review reminder work** (Herdr threads `t-0003`
   implementation and `t-0004` review, branch
-  `hp/grok4-7-shiptest/t-0003-memory-workflow-reliability` at `b564f15`).
-  Durable memory-review obligations from worker Remember sections, delivered as
-  SQLite inbox rows by the canonical tick (about 2,100 lines, mostly
-  `src/memory_review.rs`, `src/doctor.rs`, `src/cli.rs`, `src/store/inbox.rs`).
-  The review closed all findings, but the branch predates schemas 27–44, so this
-  is a port: replay it onto `main`, re-verify, add a tick-level E2E (the review
-  noted none drives a full canonical `tick()`), then close both threads in
-  Herdr. Do after F1.
+  `hp/grok4-7-shiptest/t-0003-memory-workflow-reliability` at `b564f15`) —
+  done (this PR). Replayed onto `main`: durable memory-review obligations from
+  worker Remember sections, delivered by the canonical tick as one SQLite inbox
+  row, committed before `notified` advances. No schema change was needed (the
+  intake writes `inbox_items` and `inbox.delivered`). Adapted to current
+  `main`: delivery holds project ownership and reads only the head and the
+  row instead of a whole snapshot, and a divergent row is an error before the
+  head check, so it never spends a conflict retry. E2E:
+  `ticker_delivers_one_memory_review_row_and_a_crash_retry_neither_duplicates_nor_double_counts`
+  drives full `ticker run` passes; legacy workflow and doctor checks are
+  covered through the CLI. Herdr threads `t-0003` and `t-0004` can be closed.
+- **A disposition inside the reminder crash window wedges that reminder.** If a
+  crash lands after the reminder row commits but before `notified` advances,
+  and the obligation is then deferred, the retry renders a different summary
+  under the same stable id. Delivery reports divergent bytes on every tick and
+  never advances (the port keeps the reviewed behaviour; the E2E pins it).
+  Treating a committed row for that id as delivered regardless of summary
+  would clear it.
 - **Verification jobs bound to an older task revision never run** — done (this
   PR). A task revision change after enqueue left the job pending and
   unclaimable, and it kept counting toward backlog age. The producer now

@@ -111,6 +111,14 @@ claims and typed validation IDs are refused until revision-bound validation can
 resolve them; arbitrary strings are never treated as verified evidence. General
 worker object staging through the CLI is still missing.
 
+This is a state-store-only worker intake with genuine identities. A coordinator
+summary of a report `## Remember` must not forge `task_id`, `attempt_id`, or
+`input_snapshot_id` to fit it. Coordinator and worker Remember claims use
+`memory-review PROJECT ingest/propose/reject/defer` file candidates instead
+(legacy: `memory/candidates/`; SQLite-memory: `.state/memory-review-candidates/`),
+which still require an explicit user or signed-control decision before they can
+become memory. See [operations](operations.md#remember-review).
+
 Proposal review requires an expiring, one-proposal owner authorization containing:
 
 - `version`, canonical `project_store`, current `authority` and `expected_head`;

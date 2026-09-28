@@ -6,6 +6,12 @@ pub struct InboxContent {
 }
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
 pub struct InboxItem { pub revision:u64,pub content:InboxContent,pub seen:bool,pub done:bool }
+/// Outcome of a memory-review reminder delivery. `AlreadyDelivered` means a
+/// row with this stable id and identical delivery bytes committed earlier, so
+/// a retry between the insert commit and the caller's counter update must
+/// advance that counter exactly once, never insert again.
+#[derive(Debug,Clone,Copy,PartialEq,Eq)]
+pub enum ReminderOutcome { Delivered, AlreadyDelivered }
 impl InboxContent {
     pub fn validate(&self)->Result<(),String> {
         if self.id.is_empty() || self.id.len()>512 || self.id.starts_with('.') || self.id.contains("..") || !self.id.bytes().all(|b|b.is_ascii_alphanumeric()||b"-_.".contains(&b)) {return Err("invalid inbox identity".into());}

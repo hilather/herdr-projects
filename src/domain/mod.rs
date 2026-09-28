@@ -144,7 +144,7 @@ pub struct Commit {
 }
 
 mod inbox;
-pub use inbox::{InboxContent,InboxItem};
+pub use inbox::{InboxContent,InboxItem,ReminderOutcome};
 mod runtime;
 pub use runtime::{RuntimeBinding,RuntimeIdentity,RuntimeVerification,RuntimeRoute,RouteChange};
 mod control;

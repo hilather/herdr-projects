@@ -84,6 +84,48 @@ impl SqliteStore {
         }
         tx.commit()?;Ok(count)
     }
+    /// Deliver one memory-review reminder row with a caller-stable id.
+    ///
+    /// Purpose-built intake following the `enqueue_*` pattern: optimistic head
+    /// check, idempotent insert with same-content verification, and an
+    /// `inbox.delivered` event in one transaction. No signed control is
+    /// required: like legacy ticker inbox writes, this creates
+    /// coordinator-visible data only — no memory authority, ownership,
+    /// delivery, or external-effect state changes. Scope is fenced inside the
+    /// store: kind must be `memory-review`, the id must carry the
+    /// `memory-review-` prefix, and the body must be empty (the summary is a
+    /// pointer; Remember text never lands in the DB inbox).
+    pub fn deliver_memory_review_reminder(&mut self,expected_head:u64,content:&InboxContent,now:i64)->Result<crate::domain::ReminderOutcome> {
+        use crate::domain::ReminderOutcome;
+        super::delivery::now_check(now)?;
+        content.validate().map_err(StoreError::Invalid)?;
+        if content.kind!="memory-review"||!content.id.starts_with("memory-review-")||!content.body.is_empty()||content.subject.is_empty()||content.summary.is_empty() {
+            return Err(StoreError::Invalid("memory-review reminder requires kind memory-review, a memory-review- id, a subject, a summary, and an empty body".into()));
+        }
+        let mut content=content.clone();
+        content.summary=content.summary.chars().map(|c|if c.is_control(){' '}else{c}).collect();
+        let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;check_schema(&tx)?;
+        // An existing row resolves before the head check: it is either the
+        // committed delivery being retried or a divergent row that no retry
+        // can fix, so neither should spend a head-conflict retry.
+        let existing:Option<(String,String)>=tx.query_row("SELECT payload,payload_hash FROM inbox_items WHERE id=?1",[content.id.as_str()],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        if let Some((payload,hash))=existing {
+            if format!("{:x}",Sha256::digest(payload.as_bytes()))!=hash{return Err(StoreError::Corrupt("inbox payload hash mismatch".into()));}
+            let old:InboxContent=serde_json::from_str(&payload).map_err(|e|StoreError::Corrupt(e.to_string()))?;
+            // Same stable id and delivery bytes: a retry after the insert
+            // committed. Divergent bytes under one id are never a silent
+            // overwrite or a second reminder spend.
+            if !old.same_delivery(&content){return Err(StoreError::Invalid(format!("inbox row {} holds divergent bytes; preserve and repair the store",content.id)));}
+            return Ok(ReminderOutcome::AlreadyDelivered);
+        }
+        if head(&tx)?!=expected_head{return Err(StoreError::Conflict);}
+        content.created=jiff::Timestamp::from_millisecond(now).map_err(|e|StoreError::Invalid(e.to_string()))?.to_string();
+        let item=InboxItem{revision:1,content:content.clone(),seen:false,done:false};
+        insert(&tx,&item)?;
+        tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('inbox.delivered',?1,1,1,?2)",params![content.id,serde_json::to_string(&content).map_err(|e|StoreError::Invalid(e.to_string()))?])?;
+        tx.commit()?;
+        Ok(ReminderOutcome::Delivered)
+    }
     /// Update only items actually shown to the caller at this event head.
     pub fn update_inbox(&mut self,expected_head:u64,ids:&[String],done:bool)->Result<usize> {
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;check_schema(&tx)?;

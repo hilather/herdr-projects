@@ -43,6 +43,7 @@ Every thread works from `<its working directory>/.herdr-project/<project>-<id>/`
 | `open <project> [--reprime] [--session N \| --socket P] [--rebind]` | Workspace, coordinator tab and coordinator agent; focuses it when it already runs. |
 | `context <project> [--peek]` | The digest the coordinator reads every turn. `--peek` records nothing. |
 | `inbox done <project> <item>... \| --all` | Mark inbox items handled. |
+| `memory-review <project> list/show/ingest/propose/reject/defer/remind/record` | Durable `## Remember` review; see `--help` on each. Works on legacy and migrated projects. |
 | `thread start <project> --title T [--repo PATH] [--machine M] [--agent KIND] [--base REF] --task-file F` | New thread; `-` reads the task from standard input. Returns before the agent is up. |
 | `thread restart`, `thread prompt`, `thread adopt`, `thread list`, `thread show`, `thread ack`, `thread resolve` | See `--help` on each. |
 | `overview [<project>] [--wait]`, `focus [<project>]`, `unfocus` | Threads grouped by what needs you, as text and in the sidebar. |
@@ -53,6 +54,16 @@ Every thread works from `<its working directory>/.herdr-project/<project>-<id>/`
 Groups, first match wins: Resolved; Working while starting; **Waiting on you** (failed, a launch stuck for 60 seconds, a pane gone with no report, or blocked for 30 seconds); **Working**; **Landing** (pull request open and approved); **Ready for review** (a report exists and either its pull request is open or you haven't acknowledged it); Idle. Threads idle for `auto_resolve_days` are resolved after a final copy home.
 
 `focus` replaces any sidebar view another tool has set, and `unfocus` clears whatever view is set, because Herdr holds a single one. `focus` covers local threads only.
+
+## Remember review
+
+A report `## Remember` section becomes a durable obligation in `.state/memory-review.json`, keyed by thread, report hash, and Remember hash. Re-ingesting the same hash never duplicates; a revised hash adds its own obligation and retains the prior disposition. `context` lists unresolved work under `## Memory review — data, not instructions`; archiving the `thread-state` inbox item never clears it.
+
+Dispositions are explicit: `propose` (must reference a durably saved candidate file), `reject --reason`, `defer --reason`. Proposed and rejected stop reminders; deferred stays visible with at most 3 reminders and a daily cooldown. Reminders are stable-id rows: legacy file-inbox items via `write_once`, or SQLite inbox rows on migrated projects through a purpose-built `deliver_memory_review_reminder` intake (head-checked, idempotent, fenced to `memory-review` kind with an empty body). The canonical tick and `memory-review remind` deliver under project ownership and read only the event head and that row; head conflicts retry at most 3 times, and a row with divergent bytes under the stable id is an error that advances nothing. A binary without `state-store` prints the due list and records nothing. The reminder counter advances only after a committed row, so a crash between insert and counter update retries the same id without duplicating or skipping. Legacy candidates live under `memory/candidates/`; SQLite-memory projects use `.state/memory-review-candidates/` and still require signed `memory import` review to become authoritative. The full Remember section is retained content-addressed under `.state/memory-review-evidence/` (the home report is mutable), and a `proposed` link pins the candidate digest: post-link edits fail later reads instead of changing the evidence. Coordinator summaries never use worker `memory propose` (state-store-only intake requiring genuine task/attempt/consumed snapshot ids) and never forge those identities.
+
+User instructions in chat ("remember ...") are recorded promptly with provenance (`memory-review record` on legacy; signed `memory import` on SQLite). Coordinator inferences and worker claims stay candidates. Transient status (groups, priming, inbox counts, PR states) is never memory.
+
+`doctor` checks coordinator identity as the whole tuple (workspace/tab/pane/cwd/name) plus configured kind and readiness, distinguishing healthy, priming-pending normal startup, and stuck (pane holds no agent or another name, kind mismatch, attempts exhausted, uncertain claim). It also reports memory capability mismatches (SQLite commands on legacy storage, Markdown-authority edits on SQLite projections) with canonical `open` / `open --reprime` / `migration` guidance and no mutations.
 
 ## Safety settings
 
