@@ -990,16 +990,6 @@ mod tests {
         assert!(db.read_snapshot(None).unwrap().operations.iter().all(|operation| operation.kind!="runtime.launch"));
     }
 
-    #[test]
-    fn delegation_expiry_reason_does_not_classify_authority_mismatch_as_expired() {
-        assert_eq!(reason_code(&anyhow::anyhow!("delegation grant is expired")),"expired");
-        assert_eq!(reason_code(&anyhow::anyhow!("review authorization is expired")),"expired");
-        assert_ne!(reason_code(&anyhow::anyhow!("review authority mismatch")),"expired");
-        assert_ne!(reason_code(&anyhow::anyhow!("review authority changed")),"expired");
-        assert_ne!(reason_code(&anyhow::anyhow!("review authority mismatch or expired")),"expired");
-        assert_ne!(reason_code(&anyhow::anyhow!("invalid delegation repositories: stored text exceeds 16384")),"stale_head");
-        assert_eq!(reason_code(&anyhow::anyhow!("invalid delegation repositories: stored text exceeds 16384")),"invalid_document");
-    }
 }
 
 pub const MEMORY_REVIEW_NAMESPACE:&str="memory-review@herdr-projects";

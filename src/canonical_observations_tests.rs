@@ -228,14 +228,6 @@ fn canonical_planning_precedes_slow_probes_and_retains_selection_after_expiry() 
 }
 
 #[test]
-fn canonical_withdrawn_routine_does_not_discard_valid_observations() {
-    let(world,path)=crate::canonical_controller::tests::routine_fixture(&[("first",b"touch MUST_NOT_EXECUTE\n",1000)]);
-    fs::write(path.join("first.sh"),"withdrawn script").unwrap();let input=Input::new(&world.ctx(),&path).unwrap();
-    let sample=collect(&input,&Control{deadline:Instant::now()+BUDGET,cancellation:Default::default()}).unwrap();
-    assert_eq!(sample.reachable,Some(false));assert_eq!(sample.scheduled_work,Some(true));assert!(sample.head.is_some());assert!(sample.diagnostic.unwrap().contains("script changed"));assert!(runtime::snapshot(&path).unwrap().routine_occurrences.is_empty());
-}
-
-#[test]
 fn canonical_rotation_registry_refuses_overflow_without_forgetting_present_projects() {
     let f=Fixture::new("failed");let pool=f.pool();let mut reads=Reads::new(pool.clone());
     for n in 0..ROTATION_LIMIT {reads.rotation.insert((format!("/fixture/{n}"),"canonical-observation".into()),Rotation{identity:(1,n as u64),last:Some("second".into())});}

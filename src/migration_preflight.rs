@@ -87,39 +87,6 @@ pub fn inspect(ctx:&Ctx,project:&Path)->Result<Report> {
     Ok(Report{source_digest:plan.digest,storage,references,herdr_version:version,observations,blockers,warnings})
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{paths::Env,runner::fake::{FakeRunner,ok,fail}};
-    #[test]
-    fn preflight_distinguishes_absent_unreachable_and_reused_panes_without_mutation() {
-        for state in ["absent","unknown","mismatch","present_pane"] {
-            let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let project=crate::project::create(&root,"demo","",vec![]).unwrap();project.set_status(crate::project::Status::Paused).unwrap();
-            std::fs::write(project.state_dir().join("coordinator.json"),br#"{"socket":"/recorded/session.sock","pane_id":"p1","workspace_id":"w1","tab_id":"t1","cwd":"/repo"}"#).unwrap();
-            let env=Env::for_test(home.path(),&[("HERDR_SESSION","wrong-inherited-session")]);let runner=FakeRunner::new();runner.on("--version",ok("herdr 0.9.1"));
-            match state {
-                "unknown"=>{runner.on("pane list",fail(1,"unreachable"));},
-                "absent"=>{runner.on("pane list",ok(r#"{"result":{"panes":[]}}"#));},
-                "mismatch"=>{runner.on("pane list",ok(r#"{"result":{"panes":[{"pane_id":"p1","workspace_id":"other","tab_id":"t1","cwd":"/repo"}]}}"#));},
-                _=>{runner.on("pane list",ok(r#"{"result":{"panes":[{"pane_id":"p1","workspace_id":"w1","tab_id":"t1","cwd":"/repo"}]}}"#));},
-            }
-            runner.on("agent list",ok(r#"{"result":{"agents":[]}}"#));
-            let ctx=Ctx{env:&env,root:root.clone(),config_dir:env.config_dir(),runner:&runner,detached_ticker:false};
-            let before=migration::inspect(&project.dir()).unwrap();let report=inspect(&ctx,&project.dir()).unwrap();assert_eq!(report.observations[0].state,state);assert!(!report.blockers.is_empty());assert_eq!(migration::inspect(&project.dir()).unwrap(),before);
-            assert!(runner.calls.borrow().iter().all(|c|!c.display().contains("start")&&!c.display().contains("prompt")));
-            for call in runner.calls.borrow().iter().filter(|c|!c.display().contains("--version")) {assert!(call.env.iter().any(|(k,v)|k=="HERDR_SOCKET_PATH"&&v=="/recorded/session.sock"));}
-            assert!(!project.state_dir().join("migration").exists());
-        }
-    }
-    #[test]
-    fn config_reports_fingerprints_not_values() {
-        let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let project=crate::project::create(&root,"demo","",vec![]).unwrap();project.set_status(crate::project::Status::Paused).unwrap();
-        let env=Env::for_test(home.path(),&[]);std::fs::create_dir_all(env.config_dir()).unwrap();std::fs::write(env.config_dir().join("config.toml"),"private_value='secret-must-not-print'\n").unwrap();
-        let runner=FakeRunner::new();let ctx=Ctx{env:&env,root,config_dir:env.config_dir(),runner:&runner,detached_ticker:false};let report=inspect(&ctx,&project.dir()).unwrap();
-        let json=serde_json::to_string(&report).unwrap();assert!(json.contains("private_value"));assert!(!json.contains("secret-must-not-print"));assert!(report.references[0].sha256.is_some());assert!(runner.calls.borrow().is_empty());assert_eq!(report.storage.destination,project.state_dir().display().to_string());
-    }
-}
-
 /// Validate safety against exactly the same fingerprint bound into the plan.
 pub fn plan(ctx:&Ctx,project:&Path)->Result<migration::Plan> {
     let config=std::path::absolute(ctx.config_dir.join("config.toml"))?;

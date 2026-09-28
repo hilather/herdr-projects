@@ -1490,3 +1490,88 @@ Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
 - Never recording `skip` missed runs as skipped failed
   `missed_slots_are_skipped_or_coalesced_and_a_revision_never_reuses_an_occurrence`:
   three missed slots enqueued a run.
+
+## Agent, profile, remote-route, token, routine, admission and handoff unit tests replaced by E2E workflows
+
+The audit marked 23 tests REPLACE across `src/agents.rs`,
+`src/agents/{resolve,probe}.rs`, `src/profile_config.rs`, `src/herdr.rs`,
+`src/coordinator.rs`, `src/remote_api.rs`, `src/migration_preflight.rs`,
+`src/canonical_observations_tests.rs`, `src/authority.rs`,
+`src/routine_jobs.rs`, `src/admission.rs`, `src/token_jobs_tests.rs` and
+`src/actions/handoff.rs`. 21 were deleted, 2 are kept.
+
+The new tests drive the compiled CLI:
+- `tests/agents.rs` (new): `profile resolve` and `profile probe` over the
+  owner's config, with shell fixtures that log each invocation.
+- `tests/actions.rs` (new): `action pause` and `action adopt-workspace` open
+  their popups through a fake `herdr plugin pane open`; `pane pick` and
+  `pane adopt` consume the handoff ids it logged.
+- `tests/routines.rs` (new, state-store build): signed routines installed
+  with `routine-store import`, run by a foreground `ticker run`.
+- Extended: `tests/threads.rs` (`thread start` beside a ticker),
+  `tests/doctor.rs`, `tests/adopt.rs` (`thread adopt`), `tests/remote.rs`
+  (remote briefs through a fake `ssh` and remote bridge),
+  `tests/ticker_jobs.rs` (the fake herdr now logs token refresh parameters),
+  and, in the state-store build, `tests/profiles.rs` (`profile prepare`),
+  `tests/migration.rs` (`migration preflight`),
+  `tests/memory_regressions.rs` (`memory review`, `approval denials`) and
+  `tests/scheduling.rs` (`launch draft` beside a reserved holder).
+
+| New E2E test | Replaced unit tests |
+| --- | --- |
+| `profile_resolve_turns_token_budgets_into_character_envelopes_without_arguments` | `resolve_uses_named_profile_budget_and_never_emits_argv_or_frozen`, `missing_budget_defaults_to_brief_character_cap`, `unknown_usage_refuses_missing_usage_as_zero` |
+| `profile_probe_runs_only_verified_adapters_and_withholds_unrecognized_output` | `version_probe_preserves_prerelease_and_bounds_commands`, `unknown_adapter_does_not_execute_and_raw_errors_are_withheld` |
+| `prepare_refuses_worker_budgets_outside_the_supported_bounds` | `preparation_checks_whole_brief_and_supported_budget_policy` |
+| `thread_start_uses_agent_arguments_only_for_the_kind_they_are_bound_to` | `empty_defaults_allow_mixed_kinds_but_flags_require_exact_binding` |
+| `doctor_compares_herdr_versions_numerically_and_fails_without_one` | `parses_versions` |
+| `a_pane_is_the_coordinator_only_while_ids_directory_and_name_all_match` | `identity_needs_ids_cwd_and_name` |
+| `remote_briefs_use_only_a_trustworthy_route_and_a_quoted_bridge` | `unavailable_ambiguous_disabled_and_malformed_inventory_refuse`, `bridge_command_freezes_host_session_and_quotes_remote_binary` |
+| `preflight_observes_the_recorded_session_and_fingerprints_config_without_mutation` | `preflight_distinguishes_absent_unreachable_and_reused_panes_without_mutation`, `config_reports_fingerprints_not_values` |
+| `a_changed_routine_script_is_not_run_but_the_binding_is_still_observed` | `canonical_withdrawn_routine_does_not_discard_valid_observations` |
+| `refused_reviews_record_expiry_only_for_an_expired_authorization` | `delegation_expiry_reason_does_not_classify_authority_mismatch_as_expired` |
+| `routines_of_two_projects_run_alternately_and_once_each` | `project_fairness_advances_on_admission_not_ticker_cadence` |
+| `drafts_beside_a_reserved_holder_refuse_only_overlapping_claims` | `overlap_rules_block_exclusive_writes_named_resources_and_uncertain_paths` |
+| `token_refreshes_follow_each_panes_current_group_and_write_no_execution_state` | `native_ok_refresh_is_repeatable_and_does_not_write_execution_state`, `refresh_uses_current_group_and_allows_busy_or_empty_owned_thread_panes` |
+| `popups_opened_together_each_consume_their_own_context_once` | `concurrent_actions_keep_separate_context_and_cannot_replay` |
+
+`ticker_admits_signed_work_once_and_restart_does_not_replay` was already
+covered by `ticker_canonical_routine_admits_from_hint_and_restart_keeps_one_execution`
+in tests/cli.rs (one receipt, one delivery attempt, one marker across a
+ticker restart), so it was deleted without a new test. The test-only
+re-export of `claims_conflict` in `src/store/mod.rs` went with the admission
+test that used it.
+
+Some guarantees look different from the CLI:
+- The exact-boundary case of the whole-brief budget (400 characters fit,
+  401 do not) has no CLI handle; a brief over the budget is refused in
+  `profile_budgets_refuse_preparation_and_draft_before_any_approval`
+  (tests/canonical_worker.rs), which also covers `unknown_usage='block'`.
+- The repeatability of a token refresh and a busy agent's `working` token
+  are asserted by `ticker_tokens_use_supervised_local_remote_and_coordinator_refreshes_after_restart`
+  in tests/cli.rs; the new ticker test covers the idle and agent-less panes,
+  the coordinator without an agent, and that no execution state changes.
+- Denial reasons are read from `approval denials` after refused
+  `memory review` commands, the same classifier every signed command uses;
+  the delegation grant's own "grant is expired" wording is not reached.
+- The probe's command bounds (5 s timeout, 4 KiB capture) are not
+  observable; the tests assert that each executable gets `--version` alone.
+
+Kept, because no public entry point reaches the state in a test's time:
+- `canonical_worker_repeated_negative_completions_clear_exit_veto`: the veto
+  only matters to the ticker's idle exit, which happens after five minutes
+  without a reachable session and has no override.
+- `backlog_watermark_is_fifteen_minutes_and_equality_does_not_block`: a
+  backlog needs a verification submission or integration fifteen minutes
+  old; no command backdates one, and the kept admission tests plant such
+  rows with SQL.
+
+Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
+- Dropping the directory comparison from `coordinator::agent_matches` failed
+  the adopt test: the restarted pane in another directory was refused as
+  the coordinator.
+- Letting a named-resource read pass a held write in `claims_conflict`
+  failed the draft test: the `named-read` candidate was drafted.
+- Removing the rotation past the last admitted project in routine admission
+  failed the routine test: the runs were `first, first, second, second`.
+  (With routines left to the ticker's own scheduling the runs alternate
+  anyway, so the test queues both backlogs with `routine-store schedule`.)

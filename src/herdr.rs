@@ -444,13 +444,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parses_versions() {
-        assert_eq!(parse_version("herdr 0.9.0\n"), Some(Version(0, 9, 0)));
-        assert_eq!(parse_version("herdr 0.9.2-preview.3"), Some(Version(0, 9, 2)));
-        assert_eq!(parse_version("0.10.0"), Some(Version(0, 10, 0)));
-        assert_eq!(parse_version("herdr"), None);
-        assert!(Version(0, 9, 0) < MIN_VERSION);
-        assert!(Version(0, 10, 0) > MIN_VERSION);
-    }
 }

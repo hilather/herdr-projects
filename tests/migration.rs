@@ -344,3 +344,45 @@ fn retiring_an_imported_ambiguous_finalization_keeps_the_effect_possible() {
     let listed = p.ok(&["operations", "demo", "inspect"]);
     assert_eq!(listed.as_array().unwrap().iter().find(|d| d["operation"] == operation.as_str()).unwrap()["state"], "permanent_failure");
 }
+
+/// Replaces `preflight_distinguishes_absent_unreachable_and_reused_panes_without_mutation`
+/// and `config_reports_fingerprints_not_values`.
+///
+/// `migration preflight` asks the recorded session, never an inherited one,
+/// about the coordinator's pane: an empty listing is absence, a failed one is
+/// unknown, a pane with other ids is a mismatch. It reports the external
+/// config by key names and digest only, and changes nothing.
+#[test]
+fn preflight_observes_the_recorded_session_and_fingerprints_config_without_mutation() {
+    use std::os::unix::fs::PermissionsExt;
+    let pane = |workspace: &str| json!({"pane_id": "p1", "workspace_id": workspace, "tab_id": "t1", "cwd": "/repo"});
+    for (state, panes) in [("absent", Some(json!([]))), ("unknown", None), ("mismatch", Some(json!([pane("other")]))), ("present_pane", Some(json!([pane("w1")])))] {
+        let p = Project::new("pause");
+        let home = p.home.path();
+        p.write(".state/coordinator.json", br#"{"socket":"/recorded/session.sock","pane_id":"p1","workspace_id":"w1","tab_id":"t1","cwd":"/repo"}"#);
+        fs::create_dir_all(home.join(".config/herdr-projects")).unwrap();
+        fs::write(home.join(".config/herdr-projects/config.toml"), "private_value='secret-must-not-print'\n").unwrap();
+        if let Some(panes) = &panes { fs::write(home.join("panes.json"), json!({"result": {"panes": panes}}).to_string()).unwrap(); }
+        fs::write(home.join("herdr"), "#!/bin/sh\nprintf '%s %s\\n' \"$HERDR_SOCKET_PATH\" \"$*\" >> \"$HOME/calls\"\ncase \"$*\" in\n--version) echo 'herdr 0.9.1';;\n\
+'pane list') cat \"$HOME/panes.json\" || exit 1;;\n'agent list') echo '{\"result\":{\"agents\":[]}}';;\n*) exit 9;;\nesac\n").unwrap();
+        fs::set_permissions(home.join("herdr"), fs::Permissions::from_mode(0o700)).unwrap();
+        let before = (p.ok(&["migration", "demo", "inspect"])["digest"].clone(), fs::read_dir(p.project.join(".state")).unwrap().count());
+        let out = Command::new(BIN).env_clear().env("HOME", home).env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", home.join("herdr"))
+            .env("HERDR_SESSION", "wrong-inherited-session").args(["--root", home.join("root").to_str().unwrap(), "migration", "demo", "preflight"]).output().unwrap();
+        assert!(out.status.success(), "{state}: {}", String::from_utf8_lossy(&out.stderr));
+        let text = String::from_utf8(out.stdout).unwrap();
+        let report: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(report["observations"][0]["state"], state, "{text}");
+        assert!(!report["blockers"].as_array().unwrap().is_empty(), "{text}");
+        let config = &report["references"][0];
+        assert_eq!((&config["present"], &config["keys"]), (&json!(true), &json!(["private_value"])));
+        assert_eq!(config["sha256"].as_str().map(str::len), Some(64));
+        assert!(!text.contains("secret-must-not-print"), "{text}");
+        assert_eq!(report["storage"]["destination"].as_str(), p.project.join(".state").to_str());
+        let calls = fs::read_to_string(home.join("calls")).unwrap();
+        assert!(calls.lines().filter(|l| !l.ends_with(" --version")).all(|l| l.starts_with("/recorded/session.sock ")), "{calls}");
+        assert!(calls.contains("pane list") && !calls.contains("start") && !calls.contains("prompt"), "{calls}");
+        assert_eq!((p.ok(&["migration", "demo", "inspect"])["digest"].clone(), fs::read_dir(p.project.join(".state")).unwrap().count()), before);
+        assert!(!p.project.join(".state/migration").exists() && !p.project.join(".state/state.db").exists());
+    }
+}

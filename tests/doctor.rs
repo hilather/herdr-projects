@@ -71,3 +71,26 @@ fn doctor_fails_only_on_required_checks_and_changes_nothing() {
     assert!(text.contains(&format!("[FAIL] project demo: invalid retry state {}", state.display())), "{text}");
     assert_eq!((fs::read(&state).unwrap(), fs::read(&metrics).unwrap()), (b"{broken".to_vec(), b"{broken".to_vec()));
 }
+
+/// Replaces `parses_versions`.
+///
+/// `doctor` reads herdr's version from its first numeric word, ignores a
+/// pre-release suffix and compares numerically, not as text; output with no
+/// version fails the check.
+#[test]
+fn doctor_compares_herdr_versions_numerically_and_fails_without_one() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    script(&home.join("herdr"), "#!/bin/sh\ncase \"$*\" in\n--version) cat \"$HOME/herdr-version\";;\n'session list --json') echo '{\"sessions\":[]}';;\n*) echo '{\"result\":{}}';;\nesac\n");
+    fs::create_dir(home.join("bin")).unwrap();
+    for (reported, line) in [
+        ("herdr 0.9.2-preview.3\n", "[ok  ] herdr: 0.9.2 ("),
+        ("0.10.0\n", "[ok  ] herdr: 0.10.0 ("),
+        ("herdr 0.9.0-preview.9\n", "[FAIL] herdr: 0.9.0 ("),
+        ("herdr\n", "[FAIL] herdr: could not read a version from `herdr`"),
+    ] {
+        fs::write(home.join("herdr-version"), reported).unwrap();
+        let (_, text) = doctor(home, &home.join("root"));
+        assert!(text.contains(line), "{reported}: {text}");
+    }
+}

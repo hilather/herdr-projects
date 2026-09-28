@@ -14,12 +14,14 @@ struct Lab { home: tempfile::TempDir, project: PathBuf, config: PathBuf }
 
 impl Lab {
     /// A paused migrated project whose `worker` profile passes `extra_args`.
-    fn new(extra_args: &str) -> Self {
+    fn new(extra_args: &str) -> Self { Self::with_budget(extra_args, "[profiles.worker.budget]\nmax_wall_seconds=60\nunknown_usage='allow_with_warning'\n") }
+    /// As `new`, with `budget` as the rest of the profile definition.
+    fn with_budget(extra_args: &str, budget: &str) -> Self {
         let home = tempfile::tempdir().unwrap();
         let config = home.path().join(".config/herdr-projects/config.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key='ssh-ed25519 {}'\n[profiles.worker]\nkind='claude'\n\
-permission_policy='interactive'\nextra_args={extra_args}\n[profiles.worker.budget]\nmax_wall_seconds=60\nunknown_usage='allow_with_warning'\n", "A".repeat(48))).unwrap();
+permission_policy='interactive'\nextra_args={extra_args}\n{budget}", "A".repeat(48))).unwrap();
         let lab = Lab { project: home.path().join("root/demo"), config, home };
         for command in ["new", "pause"] { lab.ok(&[command, "demo"]); }
         migration::apply(&lab.project, &migration::inspect_with_config(&lab.project, &lab.config).unwrap(), true).unwrap();
@@ -120,4 +122,30 @@ fn verify_native_does_not_retain_a_helper_that_only_answers_its_version() {
     let retained = lab.cli(&["profile", "retained", "demo", &digest]);
     assert!(!retained.status.success() && String::from_utf8_lossy(&retained.stderr).contains("retained native profile not found"));
     assert!(lab.calls("claude").iter().all(|c| c == "--version"), "{:?}", lab.calls("claude"));
+}
+
+/// Replaces `preparation_checks_whole_brief_and_supported_budget_policy`.
+///
+/// A worker profile is prepared only with a wall deadline of one second to
+/// one week and positive token limits whose character estimate fits; the
+/// refusal writes nothing. (A brief over the input budget and a profile that
+/// blocks on unknown usage are refused in tests/canonical_worker.rs.)
+#[test]
+fn prepare_refuses_worker_budgets_outside_the_supported_bounds() {
+    let budget = |fields: &str| format!("[profiles.worker.budget]\n{fields}unknown_usage='allow_with_warning'\n");
+    for (definition, error) in [
+        (String::new(), "worker profile requires a wall deadline"),
+        (budget(""), "worker profile requires a wall deadline"),
+        (budget("max_wall_seconds=0\n"), "profile budget limits must be positive bounded integers"),
+        (budget("max_wall_seconds=604801\n"), "worker wall deadline exceeds supported bounds"),
+        (budget(&format!("max_wall_seconds=60\nsoft_input_tokens={}\n", i64::MAX)), "profile token budget exceeds character conversion bounds"),
+        (budget("max_wall_seconds=60\nsoft_output_tokens=0\n"), "profile budget limits must be positive bounded integers"),
+    ] {
+        let lab = Lab::with_budget("[]", &definition);
+        let refused = lab.refused("prepare", &[]);
+        assert!(refused.contains(error), "{definition}: {refused}");
+    }
+    let lab = Lab::with_budget("[]", &budget("max_wall_seconds=604800\nsoft_input_tokens=100\n"));
+    let out = lab.profile("prepare", &[]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 }

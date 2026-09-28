@@ -310,44 +310,6 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         path
     }
-    #[test]
-    fn version_probe_preserves_prerelease_and_bounds_commands() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = executable(temp.path());
-        let fake = Fake {
-            calls: RefCell::new(vec![]),
-            response: "codex-cli 0.99.0-preview.3\n".into(),
-        };
-        let evidence = run_version(&path, "codex", &fake).unwrap();
-        assert_eq!(evidence.version.as_deref(), Some("0.99.0-preview.3"));
-        let calls = fake.calls.borrow();
-        assert_eq!(calls[0].args, ["--version"]);
-        assert!(calls[0].own_group && calls[0].env_clear && calls[0].stdin.is_none());
-        assert_eq!(calls[0].timeout, Duration::from_secs(5));
-        assert_eq!(calls[0].capture_limit, 4096);
-    }
-    #[test]
-    fn unknown_adapter_does_not_execute_and_raw_errors_are_withheld() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = executable(temp.path());
-        let fake = Fake {
-            calls: RefCell::new(vec![]),
-            response: "SECRET invalid output".into(),
-        };
-        assert_eq!(
-            run_version(&path, "muse", &fake).unwrap().status,
-            "no_verified_version_adapter"
-        );
-        assert!(fake.calls.borrow().is_empty());
-        let evidence = run_version(&path, "claude", &fake).unwrap();
-        assert_eq!(evidence.status, "unrecognized_version_output");
-        assert!(!serde_json::to_string(&evidence).unwrap().contains("SECRET"));
-        assert_eq!(
-            version("claude", "2.1.0 (Claude Code)"),
-            Some("2.1.0".into())
-        );
-        assert!(version("herdr", "herdr 0.9.1\nSECRET").is_none());
-    }
 
     #[test]
     fn changing_executable_or_config_discards_observation() {

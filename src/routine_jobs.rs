@@ -176,28 +176,6 @@ mod tests {
     }
     #[cfg(target_os="linux")]
     #[test]
-    fn ticker_admits_signed_work_once_and_restart_does_not_replay() {
-        let(world,path)=crate::canonical_controller::tests::routine_fixture(&[("check",b"printf once >> marker",1000)]);
-        let pool=Arc::new(Executor::new(Limits::default(),Arc::new(JobRunner{inner:Arc::new(Forbidden)})).unwrap());
-        let mut memory=crate::steps::Memory::new(&world.ctx());memory.routine_jobs=Some(Queue::new(pool.clone()));
-        let deadline=Instant::now()+Duration::from_secs(5);
-        loop {
-            assert!(crate::ticker::tick_for_test(&world.ctx(),&mut memory));
-            let s=runtime::snapshot(&path).unwrap();
-            if !s.routine_receipts.is_empty() {assert!(s.routine_receipts[0].cleanup_verified);assert_eq!(s.deliveries[0].state,DeliveryState::Confirmed);break;}
-            assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(10));
-        }
-        // Lose all in-memory admission history, as on a ticker restart.
-        assert!(pool.stop(Duration::from_secs(2)));drop(memory);drop(pool);
-        let pool=Arc::new(Executor::new(Limits::default(),Arc::new(JobRunner{inner:Arc::new(Forbidden)})).unwrap());
-        let mut memory=crate::steps::Memory::new(&world.ctx());memory.routine_jobs=Some(Queue::new(pool.clone()));
-        for _ in 0..3 {assert!(crate::ticker::tick_for_test(&world.ctx(),&mut memory));}
-        assert!(!memory.routine_jobs.as_ref().unwrap().pending());
-        let s=runtime::snapshot(&path).unwrap();assert_eq!(s.routine_occurrences.len(),1);assert_eq!(s.routine_receipts.len(),1);assert_eq!(s.deliveries[0].attempts,1);
-        assert_eq!(std::fs::read(path.join("marker")).unwrap(),b"once");assert!(pool.stop(Duration::from_secs(2)));
-    }
-    #[cfg(target_os="linux")]
-    #[test]
     fn completed_ticket_must_be_drained_before_any_other_project_can_queue() {
         let(_first,path)=crate::canonical_controller::tests::routine_fixture(&[("check",b"touch marker",1000)]);
         let(_second,other)=crate::canonical_controller::tests::routine_fixture(&[("check",b"touch marker",1000)]);
@@ -208,24 +186,6 @@ mod tests {
         // Even after the worker completes, no admission may race the next pass.
         queue.admit(&other).unwrap();assert_eq!(queue.entries.len(),1);assert!(!other.join("marker").exists());
         assert!(queue.drain().is_empty());queue.admit(&other).unwrap();assert!(queue.entries.contains_key(&other));
-        assert!(pool.stop(Duration::from_secs(2)));
-    }
-    #[cfg(target_os="linux")]
-    #[test]
-    fn project_fairness_advances_on_admission_not_ticker_cadence() {
-        let(_first,path)=crate::canonical_controller::tests::routine_fixture(&[("a",b"true",1000),("b",b"true",1000)]);
-        let(_second,other)=crate::canonical_controller::tests::routine_fixture(&[("a",b"true",1000),("b",b"true",1000)]);
-        for path in [&path,&other] {for name in ["a","b"] {routines::schedule(path,name,runtime::snapshot(path).unwrap().head).unwrap();}}
-        let pool=Arc::new(Executor::new(Limits::default(),Arc::new(JobRunner{inner:Arc::new(Forbidden)})).unwrap());let mut queue=Queue::new(pool.clone());
-        let mut admitted=Vec::new();
-        for _ in 0..2 {
-            // Same scan order at every opportunity; both still have backlog.
-            assert!(queue.admit_projects([path.clone(),other.clone()]).is_empty());
-            admitted.push(queue.last_project.clone().unwrap());
-            let deadline=Instant::now()+Duration::from_secs(3);while queue.pending(){assert!(queue.drain().is_empty());assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(5));}
-        }
-        assert_ne!(admitted[0],admitted[1]);
-        for path in [&path,&other] {assert_eq!(runtime::snapshot(path).unwrap().routine_receipts.len(),1);}
         assert!(pool.stop(Duration::from_secs(2)));
     }
     #[cfg(target_os="linux")]

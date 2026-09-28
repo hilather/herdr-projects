@@ -573,3 +573,36 @@ fn memory_changes_reach_the_coordinator_and_only_the_live_worker_that_consumed_t
     assert!(to(unused.id.as_str()).is_empty(), "a snapshot no attempt used received a delivery");
     assert_eq!(runtime::snapshot(&p.project).unwrap().attempts.len(), attempts, "routing created an attempt");
 }
+
+/// Replaces `delegation_expiry_reason_does_not_classify_authority_mismatch_as_expired`.
+///
+/// Refused `memory review` commands are recorded as authority denials with a
+/// reason: an expired authorization is `expired`, one naming another
+/// authority policy is not, and an unreadable document is `invalid_document`.
+/// None of them changes the head.
+#[test]
+fn refused_reviews_record_expiry_only_for_an_expired_authorization() {
+    let p = Project::new();
+    let snapshot = p.producer("writer");
+    let receipt = p.propose("proposal-a", "writer", &snapshot, "ops.fact", &p.ingest(b"claim"), json!({}));
+    let head = p.head();
+    let mut authority = serde_json::to_value(authority::policy_reference(&p.project).unwrap()).unwrap();
+    let valid = json!({"version":1,"project_store":p.store,"authority":authority,"expected_head":head,"expires_unix_ms":jiff::Timestamp::now().as_millisecond()+60_000,
+        "proposal_digest":receipt["payload_digest"],"record_keys":["ops.fact"],"review":{"schema_version":1,"proposal_id":"proposal-a","decision":"approve","reason":"reviewed"}});
+    authority["digest"] = json!("0".repeat(64));
+    let mut expired = valid.clone();
+    expired["expires_unix_ms"] = json!(jiff::Timestamp::now().as_millisecond() - 1);
+    let mut foreign = valid.clone();
+    foreign["authority"] = authority;
+    let reasons: Vec<String> = [("expired", expired.to_string()), ("foreign", foreign.to_string()), ("malformed", "{\"version\":1}".to_owned())].iter().map(|(name, body)| {
+        let (doc, sig) = p.sign(&format!("{name}.json"), body.as_bytes(), authority::MEMORY_REVIEW_NAMESPACE);
+        let out = p.cli(&["memory", "demo", "review", "--proposal", "proposal-a", "--decision-file", doc.to_str().unwrap(), "--signature", sig.to_str().unwrap(), "--expected-head", &head.to_string()]);
+        assert!(!out.status.success(), "{name} review accepted");
+        assert_eq!(p.head(), head);
+        let denials = p.ok(&["approval", "demo", "denials"]);
+        let last = denials.as_array().unwrap().last().unwrap().clone();
+        assert_eq!((last["class"].as_str(), last["command"].as_str()), (Some("memory"), Some("review")), "{denials}");
+        last["reason_code"].as_str().unwrap().to_owned()
+    }).collect();
+    assert_eq!(reasons, ["expired", "refused", "invalid_document"]);
+}

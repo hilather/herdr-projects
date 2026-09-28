@@ -49,15 +49,6 @@ print(json.dumps({{'id':'wrong' if mode=='wrong-id' and r['method']=='pane.repor
     fn sent(&self)->Vec<serde_json::Value>{fs::read_to_string(self.root.path().join("sent")).unwrap_or_default().lines().map(|l|serde_json::from_str(l).unwrap()).collect()}
 }
 #[test]
-fn native_ok_refresh_is_repeatable_and_does_not_write_execution_state() {
-    for coordinator in [false,true] {let f=Fixture::new("ok",coordinator);let before=fs::read(f.p.state_dir().join("coordinator.json")).unwrap();execute(&f.input,&Control::default()).unwrap();execute(&f.input,&Control::default()).unwrap();let sent=f.sent();assert_eq!(sent.len(),2);assert_eq!(sent[0],sent[1]);assert_eq!(sent[0]["tokens"]["project"],"demo");assert_eq!(sent[0]["tokens"]["thread"],if coordinator{"coordinator"}else{&f.t.id});assert_eq!(fs::read(f.p.state_dir().join("coordinator.json")).unwrap(),before);if !coordinator{assert_eq!(thread::load(&f.p,&f.t.id).unwrap(),f.t);}}
-}
-#[test]
-fn refresh_uses_current_group_and_allows_busy_or_empty_owned_thread_panes() {
-    for mode in ["ok","busy","no-agent"] {let f=Fixture::new(mode,false);execute_with(&f.input,&Control::default(),||{thread::update(&f.p,&f.t.id,|t|t.report_hash="report".into())?;Ok(())}).unwrap();assert_eq!(f.sent()[0]["tokens"]["review"],if mode=="busy"{"working"}else{"ready-for-review"});}
-    let f=Fixture::new("no-agent",true);assert!(execute(&f.input,&Control::default()).is_err());assert!(f.sent().is_empty());
-}
-#[test]
 fn stale_ambiguous_and_foreign_targets_refuse_before_refresh() {
     for mode in ["foreign","foreign-kind","foreign-pane","agent-terminal","duplicate-agent","duplicate-pane","no-pane","no-terminal","unsupported"] {let f=Fixture::new(mode,false);assert!(execute(&f.input,&Control::default()).is_err(),"{mode}");assert!(f.sent().is_empty());}
     for change in ["generation","resolved","removal","socket","config","settings","paused","cancel"] {

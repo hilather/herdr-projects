@@ -489,3 +489,55 @@ fn reprime_updates_only_the_priming_fields_of_the_coordinator_record() {
         .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp")).map(|e| e.file_name()).collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
 }
+
+/// Replaces `empty_defaults_allow_mixed_kinds_but_flags_require_exact_binding`.
+///
+/// Without `thread_agent_args` any valid kind starts a thread. Once the
+/// owner lists arguments, `thread start` refuses them until they are bound to
+/// a kind, and then for every other kind, as well as a malformed kind or an
+/// argument with a NUL, before anything is recorded or created in herdr.
+#[test]
+fn thread_start_uses_agent_arguments_only_for_the_kind_they_are_bound_to() {
+    let lab = Lab::new();
+    let config = lab.path(".config/herdr-projects/config.toml");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let safety = format!("[safety.{:?}]\n", lab.project().canonicalize().unwrap().display().to_string());
+    fs::write(lab.path("task.md"), "Do the thing.").unwrap();
+    let task = lab.path("task.md");
+    let _ticker = lab.ticker();
+    let start = |kind: &str| lab.cli(&["thread", "start", "demo", "--title", kind, "--agent", kind, "--task-file", task.to_str().unwrap()]);
+    let refused = |kind: &str| -> String {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let out = start(kind);
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(!out.status.success(), "{kind} started");
+            if !stderr.contains("another operation owns lock") { return stderr; }
+            assert!(Instant::now() < deadline, "{stderr}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let threads = || fs::read_dir(lab.project().join("threads")).unwrap().flatten().filter(|e| e.path().extension().is_some_and(|x| x == "toml")).count();
+
+    for (args, kind, error) in [
+        ("thread_agent_args=['--vendor-option']\n", "claude", "thread_agent_args is not bound to an agent kind"),
+        ("thread_agent_args=['--vendor-option']\nthread_agent_args_kind='claude'\n", "codex", "thread_agent_args belongs to agent kind `claude`, not requested kind `codex`"),
+        ("thread_agent_args=[\"bad\\u0000argument\"]\nthread_agent_args_kind='claude'\n", "claude", "exceeds argument limits or contains NUL"),
+        ("", "9bad", "invalid agent kind identifier"),
+    ] {
+        fs::write(&config, format!("{safety}{args}")).unwrap();
+        let stderr = refused(kind);
+        assert!(stderr.contains(error), "{kind}: {stderr}");
+        assert_eq!(threads(), 0);
+        assert!(!lab.calls().contains("tab create"), "{}", lab.calls());
+    }
+
+    fs::write(&config, format!("{safety}thread_agent_args=['--vendor-option']\nthread_agent_args_kind='claude'\n")).unwrap();
+    lab.ok_beside_ticker(&["thread", "start", "demo", "--title", "claude", "--agent", "claude", "--task-file", task.to_str().unwrap()]);
+    assert_eq!(lab.record("t-0001")["agent"].as_str(), Some("claude"));
+    fs::write(&config, &safety).unwrap();
+    for kind in ["codex", "muse"] {
+        lab.ok_beside_ticker(&["thread", "start", "demo", "--title", kind, "--agent", kind, "--task-file", task.to_str().unwrap()]);
+    }
+    assert_eq!((lab.record("t-0002")["agent"].as_str(), lab.record("t-0003")["agent"].as_str()), (Some("codex"), Some("muse")));
+}

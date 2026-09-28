@@ -75,22 +75,6 @@ mod tests {
         let mut changed=r.clone();changed.selected=true;changed.label="renamed".into();assert!(r.same_destination(&changed));
         changed.session="other".into();assert!(!r.same_destination(&changed));changed=r.clone();changed.enabled=false;assert!(!r.same_destination(&changed));
     }
-    #[test]
-    fn unavailable_ambiguous_disabled_and_malformed_inventory_refuse() {
-        let r=route();let mut other=r.clone();other.id="b".repeat(32);
-        assert!(resolve(&output(&[r.clone(),other]),&r.label).is_err());assert!(resolve(&output(&[r.clone(),r.clone()]),&r.id).is_err());
-        let mut disabled=r.clone();disabled.enabled=false;assert!(resolve(&output(&[disabled]),&r.id).is_err());
-        let mut changed=r.clone();changed.session="../another".into();assert!(resolve(&output(&[changed]),&r.id).is_err());
-        let mut failed=output(&[r.clone()]);failed.code=Some(1);assert!(resolve(&failed,&r.id).is_err());
-        let old=Output{code:Some(0),stdout:r#"[{"id":"a","label":"fixture","target":"host"}]"#.into(),..Default::default()};assert!(resolve(&old,"fixture").is_err());
-    }
-    #[test]
-    fn bridge_command_freezes_host_session_and_quotes_remote_binary() {
-        let r=route();let cmd=r.command("/opt/Herdr's bin/herdr",false).unwrap();
-        assert_eq!(cmd.program,"ssh");assert_eq!(&cmd.args[..3],["-T","-o","StrictHostKeyChecking=yes"]);assert_eq!(cmd.args[8],r.target);assert!(cmd.args[9].contains("remote-api-bridge"));assert!(cmd.args[9].contains("named-session"));assert!(cmd.stdin.is_none());
-        assert!(!cmd.args.iter().any(|a|a=="--machine"));assert!(r.command("--malicious",false).is_err());
-        let mut default=r;default.session="default".into();assert!(default.command("herdr",true).unwrap().args.last().unwrap().contains("--session default remote-api-bridge --check"));
-    }
     #[cfg(target_os="linux")]
     #[test]
     fn concrete_transport_keeps_json_literal_and_rejects_lost_or_wrong_acknowledgement() {

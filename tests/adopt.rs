@@ -264,3 +264,44 @@ fn adopt_workspace_without_an_agent_creates_no_project() {
     assert!(!lab.project("from-workspace").exists());
     assert!(lab.calls().iter().all(|c| c.ends_with("agent list") || c.ends_with("--version")), "{:?}", lab.calls());
 }
+
+/// Replaces `identity_needs_ids_cwd_and_name`.
+///
+/// The coordinator's pane cannot be adopted while herdr lists its recorded
+/// agent there. The same ids with another directory, agent name or tab are a
+/// different pane after a server restart, and can be adopted (in the
+/// default build; the state-store build's runtime ownership still refuses it).
+#[test]
+fn a_pane_is_the_coordinator_only_while_ids_directory_and_name_all_match() {
+    let mut lab = Lab::new();
+    let work = lab.path("work");
+    fs::create_dir(&work).unwrap();
+    let projects: Vec<PathBuf> = ["cwd", "name", "tab"].iter().map(|slug| lab.project_in_session(slug, slug)).collect();
+    for project in &projects { lab.session(project.file_name().unwrap().to_str().unwrap(), project, &[]); }
+    let _ticker = lab.ticker();
+    for (project, field) in projects.iter().zip(["cwd", "name", "tab"]) {
+        let stderr = lab.refused(&["thread", "adopt", field, "--pane", "p", "--title", "coordinator"]);
+        assert!(stderr.contains(&format!("pane p is the coordinator of `{field}`")), "{stderr}");
+        assert_eq!(lab.threads(field), 0);
+
+        let mut restarted = agent("p", project, "coordinator", "idle");
+        match field {
+            "cwd" => restarted["cwd"] = json!(work),
+            "name" => restarted["name"] = json!("other"),
+            _ => restarted["tab_id"] = json!("w:t2"),
+        }
+        let pane = json!({"workspace_id": restarted["workspace_id"], "tab_id": restarted["tab_id"], "pane_id": "p", "terminal_id": restarted["terminal_id"], "cwd": restarted["cwd"]});
+        fs::write(lab.path(&format!("{field}.agents")), json!([restarted]).to_string()).unwrap();
+        fs::write(lab.path(&format!("{field}.panes")), json!([pane]).to_string()).unwrap();
+        if cfg!(feature = "state-store") {
+            // The state-store build also refuses any pane id the coordinator's
+            // runtime ownership still names in this session.
+            let stderr = lab.refused(&["thread", "adopt", field, "--pane", "p", "--title", "restarted"]);
+            assert!(stderr.contains(&format!("resource is already referenced by {field}/coordinator")), "{stderr}");
+            continue;
+        }
+        let adopted: Value = serde_json::from_str(&lab.ok(&["thread", "adopt", field, "--pane", "p", "--title", "restarted"])).unwrap();
+        assert_eq!(adopted["id"].as_str(), Some("t-0001"), "{field}");
+        assert_eq!(lab.thread(field, "t-0001")["pane_id"].as_str(), Some("p"));
+    }
+}

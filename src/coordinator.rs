@@ -381,35 +381,3 @@ pub fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
     let shown = items.into_iter().map(|i| i.id).collect();
     Ok((out, shown))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-
-
-    #[test]
-    fn identity_needs_ids_cwd_and_name() {
-        let record = Coordinator {
-            workspace_id: "w1".into(),
-            tab_id: "w1:t1".into(),
-            pane_id: "w1:p1".into(),
-            cwd: "/r/demo".into(),
-            agent_name: "hp-demo-coordinator".into(),
-            ..Coordinator::default()
-        };
-        let agent = Agent {
-            workspace_id: "w1".into(),
-            tab_id: "w1:t1".into(),
-            pane_id: "w1:p1".into(),
-            cwd: "/r/demo".into(),
-            name: "hp-demo-coordinator".into(),
-            ..Agent::default()
-        };
-        assert!(agent_matches(&record, &agent));
-        // Same ids after a server restart, but a different pane.
-        assert!(!agent_matches(&record, &Agent { cwd: "/elsewhere".into(), ..agent.clone() }));
-        assert!(!agent_matches(&record, &Agent { name: "other".into(), ..agent.clone() }));
-        assert!(!agent_matches(&record, &Agent { tab_id: "w1:t2".into(), ..agent }));
-    }
-}

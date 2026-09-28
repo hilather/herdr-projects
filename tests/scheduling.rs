@@ -174,10 +174,12 @@ impl Factory {
         ["launch", "demo", "reserve", "--selection", selection.to_str().unwrap(), "--approval-digest", approval, "--expected-head", &self.head().to_string()].map(String::from).to_vec()
     }
     /// Owner-sign a contract for `task` whose scope writes `path`.
-    fn contract(&self, task: &str, path: &str) {
+    fn contract(&self, task: &str, path: &str) { self.scoped_contract(task, json!({"paths":[{"path":path,"access":"write"}],"named_resources":[]})); }
+    /// Owner-sign a contract for `task` with `scope`.
+    fn scoped_contract(&self, task: &str, scope: Value) {
         let body = json!({"version":1,"project_store":self.store,"expected_head":self.head(),"task_id":task,"contract_revision":1,
             "deliverable":"scheduling fixture","non_goals":"no worker launch","acceptance_policies":[{"id":"builds","text":r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#}],
-            "repository":self.repo.canonicalize().unwrap(),"base_oid":self.base,"object_format":"sha256","dependencies":[],"scope":{"paths":[{"path":path,"access":"write"}],"named_resources":[]},
+            "repository":self.repo.canonicalize().unwrap(),"base_oid":self.base,"object_format":"sha256","dependencies":[],"scope":scope,
             "capability_flags":[],"profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_only",
             "authority":authority::policy_reference(&self.project).unwrap()});
         let (doc, sig) = self.sign(&format!("{task}-contract.json"), &serde_json::to_vec(&body).unwrap(), authority::CONTRACT_SIGNATURE_NAMESPACE);
@@ -312,6 +314,44 @@ fn owner_draft_and_reserve_refuse_an_overlapping_write_scope_with_admission_off(
     for args in [f.draft_args(&second), f.reserve_args(&second, &granted)] {
         let refused = f.refused(&strs(&args));
         assert!(refused.contains("resource_conflict"), "{refused}");
+    }
+    assert_eq!(f.attempts().len(), 1);
+}
+
+/// Replaces `overlap_rules_block_exclusive_writes_named_resources_and_uncertain_paths`.
+///
+/// Drafting next to a reserved holder refuses exactly the scopes that could
+/// overlap its claims: a read of a file it writes, any access under a
+/// directory or glob it names (uncertain paths), and a named resource it
+/// writes. Another file, a shared read, a path outside the glob, another
+/// named resource and a path spelled like a resource name are drafted.
+#[test]
+fn drafts_beside_a_reserved_holder_refuse_only_overlapping_claims() {
+    let path = |path: &str, access: &str| json!({"scope": {"paths": [{"path": path, "access": access}], "named_resources": []}});
+    let named = |name: &str, access: &str| json!({"scope": {"paths": [], "named_resources": [{"name": name, "access": access}]}});
+    let cases = [
+        ("read-written", path("README.md", "read"), true), ("glob-match", path("src/lib.rs", "read"), true),
+        ("dir-match", path("migrations/0035_resource_claims.sql", "read"), true), ("named-read", named("schema", "read"), true),
+        ("other-file", path("src2/b.rs", "write"), false), ("shared-read", path("shared.md", "read"), false),
+        ("glob-miss", path("docs/lib.rs", "read"), false), ("named-other", named("lockfile", "write"), false),
+        ("path-schema", path("schema", "write"), false),
+    ];
+    let tasks: Vec<&str> = std::iter::once("holder").chain(cases.iter().map(|(task, _, _)| *task)).collect();
+    let f = Factory::new(16, &tasks, &tasks);
+    f.scoped_contract("holder", json!({"paths": [{"path": "README.md", "access": "write"}, {"path": "shared.md", "access": "read"},
+        {"path": "src/*.rs", "access": "read"}, {"path": "migrations/", "access": "read"}], "named_resources": [{"name": "schema", "access": "write"}]}));
+    f.queue("holder", 0, json!([]));
+    let holder = f.selection("holder");
+    let approval = f.approve(&holder);
+    f.ok(&strs(&f.reserve_args(&holder, &approval)));
+    for (task, scope, conflict) in &cases {
+        f.scoped_contract(task, scope["scope"].clone());
+        f.queue(task, 0, json!([]));
+        let selection = f.selection(task);
+        let out = f.cli(&strs(&f.draft_args(&selection)));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(!out.status.success(), *conflict, "{task}: {stderr}");
+        if *conflict { assert!(stderr.contains("resource_conflict"), "{task}: {stderr}"); }
     }
     assert_eq!(f.attempts().len(), 1);
 }

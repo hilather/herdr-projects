@@ -496,8 +496,6 @@ mod satisfaction;
 mod contract_binding;
 pub(crate) mod admission_read;
 mod admission_policy;
-#[cfg(test)]
-pub(crate) use satisfaction::{claims_conflict, ResourceClaim};
 
 mod plans;
 pub use plans::{PlanIntent,PlanIntentPage,inspect_project_plan,PlannerSession,PlannerInput,PlannerEventInput,create_project_planner_session,show_project_planner_session,AutoReplanControl,ReplanTurn,set_project_auto_replans,service_project_replans,PlanProposalReceipt, propose_plan,WaitTurn,register_project_wait,register_project_wait_with_deadline,register_project_wait_with_trigger,rearm_project_wait,replay_project_wait,request_project_replan,service_project_waits};

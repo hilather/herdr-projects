@@ -95,23 +95,6 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_actions_keep_separate_context_and_cannot_replay() {
-        let world = World::new();
-        let initial = env(&world, "");
-        let ctx = Ctx { env: &initial, ..world.ctx() };
-        let one = create(&ctx, "pick", &Handoff { command: "pause".into(), socket: "/a.sock".into(), ..Default::default() }).unwrap();
-        let two = create(&ctx, "adopt", &Handoff { pane_id: "origin:pane".into(), socket: "/a.sock".into(), ..Default::default() }).unwrap();
-        assert_ne!(one, two);
-        for (id, action) in [(&two, "adopt"), (&one, "pick")] {
-            let env = env(&world, id);
-            let ctx = Ctx { env: &env, ..world.ctx() };
-            let found = consume(&ctx, action).unwrap();
-            if action == "pick" { assert_eq!(found.command, "pause"); } else { assert_eq!(found.pane_id, "origin:pane"); }
-            assert!(consume(&ctx, action).is_err());
-        }
-    }
-
-    #[test]
     fn two_consumers_can_claim_the_same_handoff_only_once() {
         let world = World::new();
         let initial = env(&world, "");

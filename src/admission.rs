@@ -322,26 +322,6 @@ mod tests {
 
     fn budget() -> ReadBudget { ReadBudget::new(ReadControl::new(std::time::Instant::now()+std::time::Duration::from_secs(30),Default::default())) }
 
-    fn claim(kind: &str, resource: &str, access: &str, certainty: &str) -> crate::store::ResourceClaim {
-        crate::store::ResourceClaim { kind: kind.into(), resource: resource.into(), access: access.into(), certainty: certainty.into() }
-    }
-
-    #[test]
-    fn overlap_rules_block_exclusive_writes_named_resources_and_uncertain_paths() {
-        let read = claim("path", "README.md", "read", "exact");
-        let write = claim("path", "README.md", "write", "exact");
-        assert!(!crate::store::claims_conflict(&read, &read));
-        assert!(crate::store::claims_conflict(&write, &read));
-        assert!(!crate::store::claims_conflict(&claim("path", "src/a.rs", "write", "exact"), &claim("path", "src/b.rs", "write", "exact")));
-        assert!(crate::store::claims_conflict(&claim("path", "migrations/", "read", "uncertain"), &claim("path", "migrations/0035_resource_claims.sql", "read", "exact")));
-        assert!(crate::store::claims_conflict(&claim("path", "src/*.rs", "read", "uncertain"), &claim("path", "src/lib.rs", "read", "exact")));
-        assert!(!crate::store::claims_conflict(&claim("path", "src/*.rs", "read", "uncertain"), &claim("path", "docs/lib.rs", "read", "exact")));
-        assert!(crate::store::claims_conflict(&claim("named", "schema", "write", "exact"), &claim("named", "schema", "read", "exact")));
-        assert!(!crate::store::claims_conflict(&claim("named", "schema", "read", "exact"), &claim("named", "schema", "read", "exact")));
-        assert!(!crate::store::claims_conflict(&claim("named", "schema", "write", "exact"), &claim("named", "lockfile", "write", "exact")));
-        assert!(!crate::store::claims_conflict(&claim("path", "migrations/", "write", "uncertain"), &claim("named", "schema", "write", "exact")));
-    }
-
     fn user_version(path: &Path) -> u32 {
         rusqlite::Connection::open(path).unwrap().query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap()
     }

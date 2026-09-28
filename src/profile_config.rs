@@ -145,24 +145,6 @@ mod tests {
         toml::from_str("kind='claude'\npermission_policy='interactive'\n[budget]\nmax_wall_seconds=10\nsoft_input_tokens=100\nunknown_usage='allow_with_warning'").unwrap()
     }
     #[test]
-    fn preparation_checks_whole_brief_and_supported_budget_policy() {
-        let mut profile = definition();
-        assert_eq!(profile.validate_gated_preparation(400).unwrap(), 10);
-        assert!(profile.validate_gated_preparation(401).is_err());
-        profile.budget.as_mut().unwrap().unknown_usage = UnknownUsage::Block;
-        assert!(profile.validate_gated_preparation(1).is_err());
-        profile.budget.as_mut().unwrap().unknown_usage = UnknownUsage::AllowWithWarning;
-        for wall in [0, 604801, u64::MAX] {
-            profile.budget.as_mut().unwrap().max_wall_seconds = Some(wall);
-            assert!(profile.validate_gated_preparation(1).is_err());
-        }
-        profile.budget.as_mut().unwrap().max_wall_seconds = Some(10);
-        profile.budget.as_mut().unwrap().soft_input_tokens = Some(i64::MAX as u64);
-        assert!(profile.validate_gated_preparation(1).is_err());
-        profile.budget = None;
-        assert!(profile.validate_gated_preparation(1).is_err());
-    }
-    #[test]
     fn shared_validation_and_mapping_errors_do_not_expose_values() {
         for field in 0..7 {
             let mut profile = definition();
@@ -178,30 +160,6 @@ mod tests {
             let error = profile.validate_gated_preparation(1).unwrap_err();
             assert!(!format!("{error:#}").contains("PRIVATE"));
         }
-    }
-
-
-    #[test]
-    fn unknown_usage_refuses_missing_usage_as_zero() {
-        let blocked: ProfileDefinition = toml::from_str(
-            "kind='codex'\npermission_policy='interactive'\n[budget]\nmax_wall_seconds=10\nunknown_usage='block'\n",
-        )
-        .unwrap();
-        let budget = blocked.budget.as_ref().unwrap();
-        assert!(budget.soft_input_tokens.is_none());
-        assert!(budget.soft_output_tokens.is_none());
-        assert_ne!(blocked.input_budget_chars().unwrap(), 0);
-        assert!(blocked.validate_gated_preparation(1).is_err());
-        assert!(toml::from_str::<ProfileDefinition>(
-            "kind='codex'\npermission_policy='interactive'\n[budget]\nmax_wall_seconds=10\nsoft_input_tokens=5\n"
-        )
-        .is_err());
-        let zero: ProfileDefinition = toml::from_str(
-            "kind='codex'\npermission_policy='interactive'\n[budget]\nmax_wall_seconds=10\nsoft_input_tokens=0\nunknown_usage='allow_with_warning'\n",
-        )
-        .unwrap();
-        assert_eq!(zero.budget.as_ref().unwrap().soft_input_tokens, Some(0));
-        assert!(zero.validate().is_err());
     }
 }
 

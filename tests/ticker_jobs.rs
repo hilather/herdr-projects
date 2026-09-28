@@ -14,7 +14,8 @@ const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
 /// `machines.json`), and fails every call while `NAME.down` exists. Bridge
 /// requests follow `NAME.reply`: `ack`, `null` (a start acknowledged without
 /// an agent kind), `lost` (no reply) or `unsupported` (no bridge at all).
-/// Every call is logged to `calls` as `TIME NAME ARGS [METHOD]`.
+/// Every call is logged to `calls` as `TIME NAME ARGS [METHOD]`, and every
+/// token refresh's parameters to `tokens`.
 const FAKE_HERDR: &str = r#"#!/usr/bin/python3
 import json,os,pathlib,sys,time
 home=pathlib.Path(os.environ['HOME']);args=sys.argv[1:]
@@ -39,7 +40,9 @@ elif args==['agent','list']:print(json.dumps({'result':{'agents':read('agents')}
 elif args==['pane','list']:print(json.dumps({'result':{'panes':read('panes')}}))
 elif request is not None and request['method'] in ('agent.list','pane.list'):
     kind=request['method'].split('.')[0]+'s';print(json.dumps({'id':request['id'],'result':{kind:read(kind)}}))
-elif request is not None and request['method']=='pane.report_metadata':print(json.dumps({'id':request['id'],'result':{'type':'ok'}}))
+elif request is not None and request['method']=='pane.report_metadata':
+    with open(home/'tokens','a') as f:f.write(json.dumps(dict(request['params'],session=name))+'\n')
+    print(json.dumps({'id':request['id'],'result':{'type':'ok'}}))
 elif request is not None:
     if mode=='lost':sys.exit(1)
     params=request['params']
@@ -339,4 +342,61 @@ fn remote_machines_poll_on_their_own_deadlines_and_only_long_outages_are_reporte
     assert_eq!(a.len(), 2, "{a:?}");
     assert!(a.iter().any(|item| item.contains("reachable again")), "{a:?}");
     assert!(outages("b").is_empty(), "{:?}", outages("b"));
+}
+
+/// Replaces `native_ok_refresh_is_repeatable_and_does_not_write_execution_state`
+/// and `refresh_uses_current_group_and_allows_busy_or_empty_owned_thread_panes`.
+///
+/// The ticker refreshes each thread pane's tokens from the group the thread
+/// is in when the refresh is sent: an idle agent, or a pane whose agent has
+/// gone, with an unacknowledged report is `ready-for-review` (a working agent's
+/// `working` is asserted in tests/cli.rs). A coordinator is refreshed only while its agent is
+/// listed. Refreshes change no thread or coordinator execution state.
+#[test]
+fn token_refreshes_follow_each_panes_current_group_and_write_no_execution_state() {
+    let mut lab = Lab::new();
+    let project = lab.project_in_session("tok", json!({"prime_pending": false}));
+    use sha2::Digest;
+    let lone = lab.project_in_session("lone", json!({"prime_pending": false}));
+    lab.session("lone", &[], &[pane_at("p", &lone)]);
+    let mut agents = vec![agent_at("p", &project, "coordinator", "idle")];
+    let mut panes = vec![pane_at("p", &project)];
+    for (n, status) in [(1, Some("idle")), (2, None)] {
+        let (id, pane) = (format!("t-000{n}"), format!("p{n}"));
+        let dir = lab.path(&format!("work-{n}"));
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("report.md"), format!("report {n}")).unwrap();
+        fs::write(project.join(format!("threads/{id}.toml")), toml::to_string(&json!({"id": id, "title": id, "status": "open", "kind": "adopted",
+            "created": jiff::Timestamp::now().to_string(), "agent": "claude", "agent_name": "worker", "workspace_id": "w", "tab_id": "w:t", "pane_id": pane,
+            "cwd": dir, "thread_dir": dir, "report_hash": format!("{:x}", sha2::Sha256::digest(format!("report {n}")))})).unwrap()).unwrap();
+        panes.push(pane_at(&pane, &dir));
+        if let Some(status) = status { agents.push(agent_at(&pane, &dir, "worker", status)); }
+    }
+    lab.session("tok", &agents, &panes);
+    let execution = || -> Vec<Value> {
+        let mut state = vec![lab.coordinator("tok"), lab.coordinator("lone")];
+        for n in 1..=2 {
+            let record: Value = toml::from_str(&fs::read_to_string(project.join(format!("threads/t-000{n}.toml"))).unwrap()).unwrap();
+            let field = |key: &str, default: Value| record.get(key).cloned().unwrap_or(default);
+            state.push(json!([record["status"], record["pane_id"], field("prompt_pending", json!(false)), field("prompt_sequence", json!(0)),
+                field("launch_sequence", json!(0)), field("lifecycle_generation", json!(0)), field("report_hash", json!(""))]));
+        }
+        state
+    };
+    let before = execution();
+    let tokens = || -> Vec<Value> { fs::read_to_string(lab.path("tokens")).unwrap_or_default().lines().map(|l| serde_json::from_str(l).unwrap()).collect() };
+    let review = |thread: &str| tokens().iter().rev().find(|t| t["tokens"]["thread"] == thread).map(|t| t["tokens"]["review"].clone());
+    let mut ticker = lab.run_ticker(&[]);
+    ticker.wait_for("a refresh of every pane", 120, || {
+        review("t-0001") == Some(json!("ready-for-review")) && review("t-0002") == Some(json!("ready-for-review"))
+            && tokens().iter().any(|t| t["tokens"]["thread"] == "coordinator")
+    });
+    ticker.next_pass();
+    ticker.stop();
+    for token in tokens() {
+        assert_eq!((token["session"].as_str(), token["tokens"]["project"].as_str(), token["ttl_ms"].as_u64()), (Some("tok"), Some("tok"), Some(300_000)), "{token}");
+    }
+    let coordinator = tokens().into_iter().find(|t| t["tokens"]["thread"] == "coordinator").unwrap();
+    assert_eq!((coordinator["pane_id"].as_str(), coordinator["tokens"]["rank"].as_str()), (Some("p"), Some("0")));
+    assert_eq!(execution(), before);
 }
