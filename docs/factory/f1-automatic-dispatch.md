@@ -294,5 +294,12 @@ Recorded here rather than folded into the card that found them.
   only admission; queued effect jobs keep running on the store until an
   operator acts. A leftover `integrity-check.json` stays in `.state/migration/`
   after migration.
+- **Dependent start fails naming on its own Herdr server** (telemetry live
+  certification, 2 of 3 live attempts): worker B, alone on an isolated server,
+  failed with "native agent changed before naming" and then `start_unnamed`.
+  This is a different race from the shared-server one fixed in #55. The live
+  F1 harness under `workspace-write` + capture has not passed end to end yet;
+  A's side (sandboxed work, capture, verify, crash fault, integration, stale
+  recovery) passed in all three attempts.
 - **Replace-verdict tests** (352 in `docs/reviews/2026-09-27-test-audit.tsv`):
   convert to E2E alongside feature work, starting with `store/barriers.rs`.

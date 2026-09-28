@@ -198,3 +198,9 @@ database creates `-wal`/`-shm` files); a writer that starts mid-read could
 make one display read inconsistent pages — display only, never the store.
 The S6 report still opens an existing sidecar read-write. No action opens the
 fleet pane yet. "Last collect" is the last ingest time.
+
+**Follow-ups found in live certification:** `telemetry attempts` still reports
+Codex usage as `collection_not_run` even when the sidecar has bound, certified
+usage (the S3→S5 wiring was never done). Sessions ingested before a version was
+certified stay `cli_version_uncertified`; re-ingesting or updating those rows
+after certification is not implemented.
