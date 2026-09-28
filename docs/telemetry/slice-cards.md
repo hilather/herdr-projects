@@ -188,3 +188,10 @@ Stop if the panel would write, launch, or read content outside contracts §7.
 
 **Owner review gate** after S7: scratch-project demo, S5 live evidence,
 `attempts = dispatch_decisions`, zero canaries; contracts §8 stays deferred.
+
+**Follow-ups found in S7:** the panel and S6 report open the canonical store
+`immutable` when no `-wal` file exists (a plain read-only open of a WAL
+database creates `-wal`/`-shm` files); a writer that starts mid-read could
+make one display read inconsistent pages — display only, never the store.
+The S6 report still opens an existing sidecar read-write. No action opens the
+fleet pane yet. "Last collect" is the last ingest time.
