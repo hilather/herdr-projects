@@ -172,7 +172,8 @@ Stores are opened read-only without creating SQLite side files (`immutable`
 when no `-wal` exists; the S6 report uses the same open). `doctor` prints
 `telemetry: <sidecar presence; last collect age>` per store (last collect =
 newest `collect_offsets.updated_unix_ms`, i.e. last ingest); the default build
-says the panel needs `state-store` and doctor warns. No action opens the pane.
+says the panel needs `state-store` and doctor warns. The **Projects: fleet**
+action opens the pane (follow-up done).
 
 Goal: read-only `pane fleet` popup (`herdr-plugin.toml` `[[panes]] id =
 "fleet"`, `placement = "popup"`, command `target/release/herdr-projects pane
@@ -198,7 +199,9 @@ Stop if the panel would write, launch, or read content outside contracts §7.
   no file; the `immutable` open is guarded by a SHARED-range read lock and used
   only when no `-wal`/`-shm` pair exists (contracts §0 "Reads");
   `reads_leave_state_untouched`.
-- No action opens the fleet pane yet.
+- Done: the **Projects: fleet** action (`herdr-plugin.toml` `[[actions]] id =
+  "fleet"`, `src/actions.rs`) opens the popup with the invoking workspace's
+  project as handoff; `fleet_action_opens_the_fleet_pane`.
 
 **Follow-ups found in live certification:**
 - Done: `telemetry attempts` reports the sidecar's bound, certified usage or

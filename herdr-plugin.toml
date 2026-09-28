@@ -60,6 +60,12 @@ contexts = ["workspace"]
 command = ["target/release/herdr-projects", "action", "resume"]
 
 [[actions]]
+id = "fleet"
+title = "Projects: fleet"
+contexts = ["workspace"]
+command = ["target/release/herdr-projects", "action", "fleet"]
+
+[[actions]]
 id = "doctor"
 title = "Projects: check setup"
 contexts = ["workspace"]

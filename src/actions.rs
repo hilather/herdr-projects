@@ -73,6 +73,8 @@ pub fn run_action(ctx: &Ctx, id: &str) -> Result<()> {
     match id {
         "new" => open_pane(ctx, "new", &base),
         "overview" => open_pane(ctx, "overview", &Handoff { slug: current_slug(ctx).unwrap_or_default(), ..base }),
+        // The read-only fleet popup, scoped to the invoking workspace's project if any.
+        "fleet" => open_pane(ctx, "fleet", &Handoff { slug: current_slug(ctx).unwrap_or_default(), ..base }),
         "open" | "pause" | "resume" => match current_slug(ctx) {
             Some(slug) => run_on_slug(ctx, id, &slug),
             None => open_pane(ctx, "pick", &Handoff { command: id.to_string(), ..base }),

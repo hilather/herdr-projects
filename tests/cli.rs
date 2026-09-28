@@ -5077,3 +5077,38 @@ fn fleet_without_state_store_says_so() {
     let doctor=String::from_utf8(hp(home.path(),&["--root",root.to_str().unwrap(),"doctor"]).stdout).unwrap();
     assert!(doctor.contains("[warn] telemetry: fleet panel unavailable: this build lacks `state-store`"),"{doctor}");
 }
+
+/// Telemetry S7 follow-up: the manifest's `fleet` action opens the `fleet`
+/// popup through `herdr plugin pane open`, and the popup it opens renders the
+/// fleet view from the handoff and root it was given.
+#[cfg(all(feature="state-store",target_os="linux"))]
+#[test]
+fn fleet_action_opens_the_fleet_pane() {
+    use std::os::unix::fs::PermissionsExt;
+    let (home,r,_)=fleet_fixture();
+    let manifest:toml::Value=toml::from_str(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"),"/herdr-plugin.toml")).unwrap()).unwrap();
+    let command=|table:&str|manifest[table].as_array().unwrap().iter().find(|entry|entry["id"].as_str()==Some("fleet")).unwrap_or_else(||panic!("no fleet {table}"))["command"]
+        .as_array().unwrap().iter().skip(1).map(|arg|arg.as_str().unwrap().to_owned()).collect::<Vec<_>>();
+    assert_eq!(command("panes"),["pane","fleet"]);
+    let fake=home.path().join("fake-herdr");
+    std::fs::write(&fake,"#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$HOME/herdr-call\"\necho '{\"result\":{\"type\":\"ok\"}}'\n").unwrap();
+    std::fs::set_permissions(&fake,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let state=home.path().join("plugin-state");
+    let out=Command::new(BIN).env_clear().env("HOME",home.path()).env("PATH","/usr/bin:/bin").env("HERDR_BIN_PATH",&fake)
+        .env("HERDR_SOCKET_PATH",home.path().join("herdr.sock")).env("HERDR_PLUGIN_STATE_DIR",&state).env("HERDR_PROJECTS_ROOT",&r)
+        .args(command("actions")).output().unwrap();
+    assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let call=std::fs::read_to_string(home.path().join("herdr-call")).unwrap();
+    let call:Vec<&str>=call.lines().collect();
+    assert_eq!(call[..7],["plugin","pane","open","--plugin","herdr-projects","--entrypoint","fleet"]);
+    let envs:Vec<(&str,&str)>=call.windows(2).filter(|pair|pair[0]=="--env").map(|pair|pair[1].split_once('=').unwrap()).collect();
+    assert_eq!(envs.iter().map(|(name,_)|*name).collect::<Vec<_>>(),["HERDR_PROJECTS_HANDOFF","HERDR_PROJECTS_ROOT"]);
+    assert_eq!(envs[1].1,r);
+    let out=Command::new(BIN).env_clear().env("HOME",home.path()).env("PATH","/usr/bin:/bin").env("HERDR_PLUGIN_STATE_DIR",&state)
+        .env("HERDR_SOCKET_PATH",home.path().join("herdr.sock")).envs(envs.iter().copied()).args(command("panes")).stdin(std::process::Stdio::null()).output().unwrap();
+    assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let text=String::from_utf8(out.stdout).unwrap();
+    assert!(text.lines().any(|l|l.starts_with("── demo · fleet · as of ")),"{text}");
+    assert!(text.lines().any(|l|l=="usage: collection not run (no telemetry sidecar)"),"{text}");
+    assert!(!text.contains("error"),"the handoff is consumed once, as given: {text}");
+}
