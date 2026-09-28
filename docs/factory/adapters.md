@@ -62,4 +62,5 @@ worktree's index is reset to the branch tip; its files are not touched.
 
 Submit that OID as usual with `result submit`; the submission format is
 unchanged. The captured commit is still an untrusted candidate, and only
-verification evidence releases anything.
+verification evidence releases anything. The F1.7 harness
+(`scripts/test-live-f1`) follows this flow: `workspace-write`, capture, submit.

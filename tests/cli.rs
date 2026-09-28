@@ -2822,12 +2822,12 @@ fn controller_captures_uncommitted_worker_edits_for_submission_and_verification(
 #[cfg(all(feature="state-store",target_os="linux"))]
 const RUNNING_HERDR_SERVER: &str = r#"
 import json,os,sys,socket,subprocess
-path=sys.argv[1];root=os.path.dirname(path);s={}
+path=sys.argv[1];kind=(sys.argv[2:] or ['claude'])[0];root=os.path.dirname(path);s={}
 server=socket.socket(socket.AF_UNIX);server.bind(path);server.listen()
 while True:
  c,_=server.accept();f=c.makefile('rw');r=json.loads(f.readline());m=r['method'];p=r.get('params') or {}
  pane={'pane_id':'w1:p1','workspace_id':'w1','tab_id':'w1:t1','terminal_id':'term1','cwd':s.get('cwd')}
- agent=dict(pane,agent='claude',interactive_ready=True,agent_status='idle',**({'name':s['name']} if 'name' in s else {}))
+ agent=dict(pane,agent=kind,interactive_ready=True,agent_status='idle',**({'name':s['name']} if 'name' in s else {}))
  res=None
  if m=='ping':res={'type':'pong','version':'0.9.1','capabilities':{'workspace_create_command':True}}
  elif m=='workspace.create_command' and 'pid' not in s:
@@ -2843,7 +2843,7 @@ while True:
   fd=os.open(s['fifo'],os.O_WRONLY);os.write(fd,p['text'].encode());os.close(fd);s['released']=True;res={'type':'ok'}
  elif m=='agent.list':res={'type':'agent_list','agents':[agent] if s.get('released') else []}
  elif m=='agent.rename':s['name']=agent['name']=p['name'];res={'type':'agent_info','agent':agent}
- elif m=='agent.explain':res={'type':'agent_explain','explain':{'agent':'claude','state':'idle','manifest_source':'bundled','manifest_version':'2026.09.14.1',
+ elif m=='agent.explain':res={'type':'agent_explain','explain':{'agent':kind,'state':'idle','manifest_source':'bundled','manifest_version':'2026.09.14.1',
   'matched_rule':{'id':'prompt','state':'idle'},'visible_idle':True,'visible_blocker':False,'visible_working':False,'screen_detection_skipped':False,
   'skip_state_update':False,'local_override_shadowing_remote':False,'fallback_reason':None,'warning':None}}
  elif m=='agent.prompt':res={'type':'agent_prompted','agent':agent}
@@ -2851,13 +2851,30 @@ while True:
  c.close()
 "#;
 
+/// A Herdr bridge to `RUNNING_HERDR_SERVER` and an agent that stays up.
+#[cfg(all(feature="state-store",target_os="linux"))]
+fn running_herdr_binaries(bin:&Path,name:&str,version:&str)->(std::path::PathBuf,std::path::PathBuf) {
+    use std::{fs,os::unix::fs::PermissionsExt};
+    let (herdr,agent)=(bin.join("herdr"),bin.join(name));
+    fs::write(&herdr,"#!/usr/bin/python3\nimport os,socket,sys\nif sys.argv[1:]==['--version']:print('herdr 0.9.1');sys.exit(0)\nimport json\nprobe={('pane','list'):'pane.list',('agent','list'):'agent.list'}.get(tuple(sys.argv[1:]))\n\
+assert probe or sys.argv[1:]==['remote-api-bridge']\nline=json.dumps({'id':'probe','method':probe}).encode()+b'\\n' if probe else sys.stdin.buffer.readline()\n\
+c=socket.socket(socket.AF_UNIX);c.connect(os.environ['HERDR_SOCKET_PATH']);c.sendall(line)\nreply=c.makefile('rb').readline()\nif not reply:sys.exit(1)\n\
+sys.stdout.buffer.write(json.dumps({'result':json.loads(reply)['result']}).encode() if probe else reply)\n").unwrap();
+    // The agent must be the exact executable it names, so build a tiny one.
+    let source=bin.join(format!("{name}.rs"));
+    fs::write(&source,format!("fn main(){{if std::env::args().nth(1).as_deref()==Some(\"--version\"){{println!(\"{version}\");return}}loop{{std::thread::park()}}}}")).unwrap();
+    assert!(Command::new("rustc").args(["--edition","2021","-o"]).arg(&agent).arg(&source).status().unwrap().success());
+    for path in [&herdr,&agent] {fs::set_permissions(path,fs::Permissions::from_mode(0o700)).unwrap();}
+    (herdr,agent)
+}
+
 /// F1 follow-up: a worker whose result is verified and integrated ends by
 /// completion. Its termination is proven before capacity is released, its
 /// task succeeds instead of being cancelled, and its dependent stays released.
 #[cfg(all(feature="state-store",target_os="linux"))]
 #[test]
 fn completing_a_verified_worker_stops_it_and_keeps_its_dependent_released() {
-    use std::{fs,os::unix::fs::PermissionsExt,time::{Duration,Instant}};
+    use std::{fs,time::{Duration,Instant}};
     use herdr_projects::{migration,runtime,domain::{TaskId,RuntimeRoute,AttemptState,TaskState},operations::DeliveryState};
     let f=VerifyFixture::with_worker(&[("src/start.txt","start\n".into())],
         "kind='claude'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=600\nunknown_usage='allow_with_warning'\n");
@@ -2870,16 +2887,7 @@ fn completing_a_verified_worker_stops_it_and_keeps_its_dependent_released() {
     // A Herdr stand-in that really runs the supervised worker, and an agent that stays up.
     let bin=f.home.path().join("bin");let agent_home=f.home.path().join("agent-home");
     for dir in [&bin,&agent_home,&f.home.path().join("lab-a"),&f.home.path().join("lab-b")] {fs::create_dir_all(dir).unwrap();}
-    let (herdr,agent)=(bin.join("herdr"),bin.join("claude"));
-    fs::write(&herdr,"#!/usr/bin/python3\nimport os,socket,sys\nif sys.argv[1:]==['--version']:print('herdr 0.9.1');sys.exit(0)\nimport json\nprobe={('pane','list'):'pane.list',('agent','list'):'agent.list'}.get(tuple(sys.argv[1:]))\n\
-assert probe or sys.argv[1:]==['remote-api-bridge']\nline=json.dumps({'id':'probe','method':probe}).encode()+b'\\n' if probe else sys.stdin.buffer.readline()\n\
-c=socket.socket(socket.AF_UNIX);c.connect(os.environ['HERDR_SOCKET_PATH']);c.sendall(line)\nreply=c.makefile('rb').readline()\nif not reply:sys.exit(1)\n\
-sys.stdout.buffer.write(json.dumps({'result':json.loads(reply)['result']}).encode() if probe else reply)\n").unwrap();
-    // The agent must be the exact executable it names, so build a tiny one.
-    let source=f.home.path().join("agent.rs");
-    fs::write(&source,"fn main(){if std::env::args().nth(1).as_deref()==Some(\"--version\"){println!(\"2.1.0 (Claude Code)\");return}loop{std::thread::park()}}").unwrap();
-    assert!(Command::new("rustc").args(["--edition","2021","-o"]).arg(&agent).arg(&source).status().unwrap().success());
-    for path in [&herdr,&agent] {fs::set_permissions(path,fs::Permissions::from_mode(0o700)).unwrap();}
+    let (herdr,agent)=running_herdr_binaries(&bin,"claude","2.1.0 (Claude Code)");
     let sockets=[f.home.path().join("lab-a/native.sock"),f.home.path().join("lab-b/native.sock")];
     struct Lab(Vec<std::process::Child>,std::path::PathBuf);
     impl Drop for Lab {fn drop(&mut self){
@@ -3022,8 +3030,9 @@ sys.stdout.buffer.write(json.dumps({'result':json.loads(reply)['result']}).encod
     assert_eq!(drafted["inputs"]["dependencies"][0]["task"],"a");
 }
 
-/// F1.7 acceptance. `HP_LIVE_F1_MODE=fixture` is the dry run: the harness plays
-/// both workers. `live` (only via `scripts/test-live-f1`) launches two real
+/// F1.7 acceptance. `HP_LIVE_F1_MODE=fixture` is the dry run: the ticker
+/// launches stand-in workers on a local Herdr stand-in and the harness writes
+/// their files. `live` (only via `scripts/test-live-f1`) launches two real
 /// agents through the ticker on an isolated stock Herdr server; worker output is
 /// untrusted and only verification and integration evidence release anything.
 #[cfg(all(feature="state-store",target_os="linux"))]
@@ -3053,13 +3062,17 @@ fn live_f1_worker_result_integrates_and_dependent_launches_on_integrated_sha() {
     let repository=f.repo.canonicalize().unwrap();
     let head=||runtime::snapshot(&f.project).unwrap().head;
     let ok=|out:std::process::Output|{assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap_or(serde_json::Value::Null)};
-    // A running ticker can hold the effect lock briefly; the CLI asks for a retry.
-    let cli=|args:&[&str]|{let mut all=vec!["--root",f.r()];all.extend_from_slice(args);let deadline=Instant::now()+Duration::from_secs(60);
-        loop {let out=hp(f.home.path(),&all);if out.status.success()||!String::from_utf8_lossy(&out.stderr).contains("owns lock")||Instant::now()>deadline{return ok(out);}std::thread::sleep(Duration::from_millis(200));}};
+    // A running ticker can hold the effect lock briefly, and a running worker's
+    // observations advance the head; the CLI asks for a retry at the new head.
+    let cli=|args:&[&str]|{let mut all=vec!["--root".to_owned(),f.r().to_owned()];all.extend(args.iter().map(|a|a.to_string()));let deadline=Instant::now()+Duration::from_secs(60);
+        loop {let out=hp(f.home.path(),&all.iter().map(String::as_str).collect::<Vec<_>>());let stderr=String::from_utf8_lossy(&out.stderr);
+            if out.status.success()||!(stderr.contains("; retry")||stderr.contains("state store: Conflict"))||Instant::now()>deadline{return ok(out);}
+            if let Some(i)=all.iter().position(|a|a=="--expected-head") {all[i+1]=head().to_string();}
+            std::thread::sleep(Duration::from_millis(200));}};
     let sign=|path:&Path,namespace:&str|assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&f.key).args(["-n",namespace]).arg(path).output().unwrap().status.success());
 
-    // Native lab: one isolated stock Herdr server per worker (live), or bare
-    // sockets (fixture). Two live workers on one server break start naming:
+    // Native lab: one isolated stock Herdr server per worker (live), or a local
+    // stand-in that really runs the launched worker (fixture). Two live workers on one server break start naming:
     // its inventory fence compares every agent, and the other worker's entry
     // changes (see the F1.7 gate note).
     let lab=tempfile::Builder::new().prefix("hpf17-").tempdir_in("/tmp").unwrap();
@@ -3072,7 +3085,6 @@ fn live_f1_worker_result_integrates_and_dependent_launches_on_integrated_sha() {
         for server in &mut self.servers{let _=server.kill();let _=server.wait();}
     }}
     let mut cleanup=Cleanup{servers:Vec::new(),agent_home:agent_home.clone()};
-    let mut _fixture_sockets=Vec::new();
     let (herdr,agent)=if live {
         let herdr=PathBuf::from(std::env::var_os("HP_LIVE_HERDR").expect("HP_LIVE_HERDR"));
         let agent=PathBuf::from(std::env::var_os("HP_LIVE_AGENT").expect("HP_LIVE_AGENT"));
@@ -3097,14 +3109,20 @@ fn live_f1_worker_result_integrates_and_dependent_launches_on_integrated_sha() {
         fs::write(agent_home.join(".gitconfig"),"[user]\n\tname = F1.7 worker\n\temail = worker@example.invalid\n").unwrap();
         (herdr,agent)
     } else {
-        for socket in &sockets {fs::create_dir_all(socket.parent().unwrap()).unwrap();_fixture_sockets.push(std::os::unix::net::UnixListener::bind(socket).unwrap());}
-        (PathBuf::new(),PathBuf::new())
+        let bin=f.home.path().join("bin");fs::create_dir_all(&bin).unwrap();
+        for socket in &sockets {
+            fs::create_dir_all(socket.parent().unwrap()).unwrap();
+            cleanup.servers.push(Command::new("/usr/bin/python3").args(["-c",RUNNING_HERDR_SERVER]).arg(socket).arg("codex").spawn().unwrap());
+            let deadline=Instant::now()+Duration::from_secs(10);
+            while !socket.exists(){assert!(Instant::now()<deadline,"fixture server failed to start");std::thread::sleep(Duration::from_millis(10));}
+        }
+        running_herdr_binaries(&bin,"codex","codex-cli 0.154.0")
     };
-    // Codex's workspace-write sandbox makes Git metadata (including a linked
-    // worktree's gitdir) read-only, so a sandboxed worker cannot commit. The
-    // workers run unsandboxed in a disposable home with exact trust entries.
+    // Workers run in Codex's workspace-write sandbox (Git metadata read-only)
+    // and only edit files; the controller captures their edits with
+    // `result capture`. A disposable home holds exact trust entries.
     let trust=|worktrees:&[&str]|{
-        let mut text="approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\nmodel_reasoning_effort = 'low'\ncheck_for_update_on_startup = false\n".to_owned();
+        let mut text="approval_policy = 'never'\nsandbox_mode = 'workspace-write'\nmodel_reasoning_effort = 'low'\ncheck_for_update_on_startup = false\n".to_owned();
         for path in [f.project.to_str().unwrap(),repository.to_str().unwrap()].iter().chain(worktrees) {text.push_str(&format!("[projects.{}]\ntrust_level = 'trusted'\n",serde_json::to_string(path).unwrap()));}
         if live {fs::write(agent_home.join(".codex/config.toml"),text).unwrap();}
     };
@@ -3145,7 +3163,7 @@ fn live_f1_worker_result_integrates_and_dependent_launches_on_integrated_sha() {
     migration::open_active(&f.project).unwrap().record_observations(head(),&observations).unwrap();
     let control=runtime::snapshot(&f.project).unwrap().control.unwrap().revision;
     runtime::set_state(&f.project,head(),control,herdr_projects::domain::ProjectState::Active,&config).unwrap();
-    let profile=if live {f.launchable_profile_with(&herdr,&agent,&agent_home)} else {f.fake_launchable_profile("codex","codex-cli 0.154.0")};
+    let profile=f.launchable_profile_with(&herdr,&agent,&agent_home);
     const TARGET:&str="refs/heads/integration";
     f.git(&["branch","integration",&start]);
     cli(&["result","demo","configure-integration","--repository",repository.to_str().unwrap(),"--reference",TARGET]);
@@ -3182,26 +3200,33 @@ fn live_f1_worker_result_integrates_and_dependent_launches_on_integrated_sha() {
         if event.kind.starts_with("runtime.")&&seen.borrow_mut().insert((event.kind.clone(),event.entity.clone())) {say(&format!("controller: {} {}",event.kind,&event.entity[..event.entity.len().min(20)]));}
     };
 
-    // 1. Worker A edits and commits in its worktree.
+    // 1. The ticker launches worker A, which edits files in its worktree and
+    // never commits (the fixture harness writes the file for it).
     let herdr_bin=herdr.to_str().unwrap().to_owned();
-    let spawn=||if live {f.spawn_with(&herdr_bin)} else {f.spawn()};
-    let (a_attempt,a_worktree,mut child)=if live {
-        let (attempt,worktree)=launch("a","F1.7 disposable acceptance task A. Work only in the current directory, which is a disposable git worktree. Create the file src/a.txt containing exactly the line F17_LIVE_A_OK followed by a newline. Then run: git add src/a.txt && git commit -m 'Add F1.7 marker A'. Do not change any other file, do not push, and do not use the network. After the commit exists, stop and reply DONE.");
-        trust(&[worktree.to_str().unwrap()]);
-        let mut child=spawn();
-        f.wait(&mut child,300,&||{milestones();worktree.join("src/a.txt").is_file()}&&wt_git(&worktree,&["rev-parse","HEAD"])!=start&&wt_git(&worktree,&["status","--porcelain"]).is_empty());
-        say(&format!("a: worker launched ({} launch_started) and committed in its worktree",events("runtime.launch_started")));
-        (attempt,worktree,child)
-    } else {
-        f.db().execute("INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) VALUES('a-attempt','a',1,'running',NULL,'a-attempt',0)",[]).unwrap();
-        let worktree=f.home.path().join("a-worktree");f.git(&["worktree","add","-q","--detach",worktree.to_str().unwrap(),&start]);
-        fs::write(worktree.join("src/a.txt"),"F17_LIVE_A_OK\n").unwrap();wt_git(&worktree,&["add","src/a.txt"]);wt_git(&worktree,&["commit","-qm","Add F1.7 marker A"]);
-        ("a-attempt".to_owned(),worktree,spawn())
-    };
-    let a_candidate=wt_git(&a_worktree,&["rev-parse","HEAD"]);
+    let spawn=||f.spawn_with(&herdr_bin);
+    // A worker counts as launched once the controller has delivered its brief.
+    let launched=|count:usize|{milestones();let state=runtime::snapshot(&f.project).unwrap();
+        events("runtime.launch_started")>=count&&state.operations.iter().filter(|o|o.kind=="runtime.worker_brief")
+            .filter(|o|state.deliveries.iter().any(|d|d.operation==o.id&&d.state==DeliveryState::Confirmed)).count()>=count};
+    let (a_attempt,a_worktree)=launch("a","F1.7 disposable acceptance task A. Work only in the current directory, which is a disposable git worktree. Create the file src/a.txt containing exactly the line F17_LIVE_A_OK followed by a newline. Do not commit, do not change any other file, do not push, and do not use the network. Then stop and reply DONE.");
+    trust(&[a_worktree.to_str().unwrap()]);
+    let mut child=spawn();
+    f.wait(&mut child,300,&||launched(1));
+    if !live {fs::write(a_worktree.join("src/a.txt"),"F17_LIVE_A_OK\n").unwrap();}
+    f.wait(&mut child,300,&||a_worktree.join("src/a.txt").is_file()&&fs::read(a_worktree.join("src/a.txt")).unwrap()==b"F17_LIVE_A_OK\n");
+    // Capture takes the root lock exclusively; the worker keeps running.
+    f.stop(&mut child);
+    say(&format!("a: worker launched ({} launch_started) and wrote src/a.txt",events("runtime.launch_started")));
+    assert_eq!(wt_git(&a_worktree,&["rev-parse","HEAD"]),start,"the worker did not commit");
+    // The controller commits the worker's edits on the attempt's own branch.
+    let captured=cli(&["result","demo","capture",&a_attempt]);
+    assert_eq!((captured["captured"].as_bool(),captured["base_oid"].as_str()),(Some(true),Some(start.as_str())));
+    let a_candidate=captured["candidate_oid"].as_str().unwrap().to_owned();
+    let mut child=spawn();
+    assert_eq!(wt_git(&a_worktree,&["rev-parse","HEAD"]),a_candidate);
     assert_eq!(wt_git(&a_worktree,&["rev-parse","HEAD^"]),start);
-    assert_eq!(fs::read_to_string(a_worktree.join("src/a.txt")).unwrap(),"F17_LIVE_A_OK\n");
-    say(&format!("a: candidate {a_candidate}: {}",wt_git(&a_worktree,&["log","-1","--format=%s <%ae>"])));
+    assert_eq!(wt_git(&a_worktree,&["show","HEAD:src/a.txt"]),"F17_LIVE_A_OK");
+    say(&format!("a: captured candidate {a_candidate}: {}",wt_git(&a_worktree,&["log","-1","--format=%s <%ae>"])));
 
     // 2. The harness submits A's result; the worker's claims are untrusted.
     let objects=f.git(&["rev-list","--objects","--all",&a_candidate]).lines().map(|line|{let oid=line.split_whitespace().next().unwrap();serde_json::json!({"oid":oid,"relative_path":format!("{}/{}",&oid[..2],&oid[2..])})}).collect::<Vec<_>>();
@@ -3290,7 +3315,7 @@ fn live_f1_worker_result_integrates_and_dependent_launches_on_integrated_sha() {
     say(&format!("recovery: operator integrated s onto the moved target: {tip}"));
 
     // 4. Dependent B launches on A's integrated SHA.
-    if live {f.stop(&mut child);}
+    f.stop(&mut child);
     f.git(&["checkout","-q","--detach",&a_commit]);
     let b_prompt="F1.7 disposable acceptance task B. Work only in the current directory. Read src/a.txt and create src/b.txt containing exactly the same bytes. Do not commit, do not change any other file, and do not use the network. Then stop and reply DONE.";
     let (b_attempt,b_worktree)=launch("b",b_prompt);
@@ -3298,32 +3323,31 @@ fn live_f1_worker_result_integrates_and_dependent_launches_on_integrated_sha() {
     assert_eq!(record.inputs.repositories[0].commit,a_commit,"b's pinned base is a's integrated SHA");
     let satisfaction=f.db().query_row("SELECT satisfaction_id FROM dependency_satisfactions WHERE task_id='b' AND state='valid' AND evidence_id=?1",[&a_integrated],|row|row.get::<_,String>(0)).unwrap();
     assert_eq!(record.inputs.dependencies.len(),1);assert_eq!(record.inputs.dependencies[0].evidence.id,satisfaction);
-    if live {
-        trust(&[a_worktree.to_str().unwrap(),b_worktree.to_str().unwrap()]);
-        child=spawn();
-        f.wait(&mut child,300,&||{milestones();b_worktree.join("src/b.txt").is_file()}&&fs::read(b_worktree.join("src/b.txt")).unwrap()==b"F17_LIVE_A_OK\n");
-    } else {
-        let operation=record.operation.clone();
-        let receipts=herdr_projects::worktree_preparation::prepare(&f.project,&operation,1,Instant::now()+Duration::from_secs(45),Default::default()).unwrap();
-        assert_eq!(PathBuf::from(&receipts[0].plan.path),b_worktree);
-        fs::copy(b_worktree.join("src/a.txt"),b_worktree.join("src/b.txt")).unwrap();
-    }
+    trust(&[a_worktree.to_str().unwrap(),b_worktree.to_str().unwrap()]);
+    child=spawn();
+    f.wait(&mut child,300,&||launched(2));
+    if !live {fs::copy(b_worktree.join("src/a.txt"),b_worktree.join("src/b.txt")).unwrap();}
+    f.wait(&mut child,300,&||{milestones();b_worktree.join("src/b.txt").is_file()}&&fs::read(b_worktree.join("src/b.txt")).unwrap()==b"F17_LIVE_A_OK\n");
     assert_eq!(wt_git(&b_worktree,&["rev-parse","HEAD"]),a_commit,"b's worktree is checked out at a's integrated SHA");
     say(&format!("b: worker started on {} and wrote src/b.txt from a's integrated file",wt_git(&b_worktree,&["rev-parse","HEAD"])));
 
+    assert_eq!(events("runtime.launch_started"),2,"the controller started both workers");
+    // Stop both workers through the product and wait for proven termination.
+    // The running ticker advances revisions; retry a stale compare-and-swap.
+    for attempt in [&a_attempt,&b_attempt] {let deadline=Instant::now()+Duration::from_secs(60);loop {
+        let revision=runtime::snapshot(&f.project).unwrap().attempts.into_iter().find(|x|x.id.as_str()==attempt.as_str()).unwrap().revision;
+        let out=hp(f.home.path(),&["--root",f.r(),"task","demo","cancel-attempt",attempt,"--expected-revision",&revision.to_string(),"--expected-head",&head().to_string(),"--reason","F1.7 acceptance complete"]);
+        let stderr=String::from_utf8_lossy(&out.stderr);
+        if out.status.success() {break;}
+        assert!(["Conflict","owns lock","retry"].iter().any(|s|stderr.contains(s))&&Instant::now()<deadline,"{stderr}");std::thread::sleep(Duration::from_millis(200));
+    }}
+    f.wait(&mut child,180,&||runtime::snapshot(&f.project).unwrap().attempts.iter().filter(|x|[&a_attempt,&b_attempt].contains(&&x.id.as_str().to_owned())).all(|x|x.termination_observed));
+    f.stop(&mut child);
+    for kind in ["runtime.launch_started","runtime.worker_terminated"] {assert_eq!(events(kind),2,"{kind}");}
+    let brief=runtime::snapshot(&f.project).unwrap();
+    let confirmed=brief.operations.iter().filter(|o|o.kind=="runtime.worker_brief").filter(|o|brief.deliveries.iter().any(|d|d.operation==o.id&&d.state==DeliveryState::Confirmed)).count();
+    assert_eq!(confirmed,2,"each worker received its brief once");
     if live {
-        assert_eq!(events("runtime.launch_started"),2,"the controller started both workers");
-        // Stop both workers through the product and wait for proven termination.
-        for attempt in [&a_attempt,&b_attempt] {
-            let revision=runtime::snapshot(&f.project).unwrap().attempts.into_iter().find(|x|x.id.as_str()==attempt.as_str()).unwrap().revision;
-            cli(&["task","demo","cancel-attempt",attempt,"--expected-revision",&revision.to_string(),"--expected-head",&head().to_string(),"--reason","F1.7 acceptance complete"]);
-        }
-        f.wait(&mut child,180,&||runtime::snapshot(&f.project).unwrap().attempts.iter().filter(|x|[&a_attempt,&b_attempt].contains(&&x.id.as_str().to_owned())).all(|x|x.termination_observed));
-        f.stop(&mut child);
-        for kind in ["runtime.launch_started","runtime.worker_terminated"] {assert_eq!(events(kind),2,"{kind}");}
-        let brief=runtime::snapshot(&f.project).unwrap();
-        let confirmed=brief.operations.iter().filter(|o|o.kind=="runtime.worker_brief").filter(|o|brief.deliveries.iter().any(|d|d.operation==o.id&&d.state==DeliveryState::Confirmed)).count();
-        assert_eq!(confirmed,2,"each worker received its brief once");
         // Sanitized transcript: only the workers' shell commands and final replies.
         let mut rollouts=Vec::new();let mut stack=vec![agent_home.join(".codex/sessions")];
         while let Some(dir)=stack.pop(){for entry in fs::read_dir(&dir).into_iter().flatten().flatten(){let p=entry.path();if p.is_dir(){stack.push(p)}else if p.extension().is_some_and(|e|e=="jsonl"){rollouts.push(p)}}}
@@ -3343,7 +3367,7 @@ fn live_f1_worker_result_integrates_and_dependent_launches_on_integrated_sha() {
                 eprintln!("{}",text.chars().take(200).collect::<String>());
             }
         }
-    } else {f.stop(&mut child);}
+    }
     say(&format!("PASS: a integrated {a_commit}; s recovered {tip}; b base {a_commit}; launches {}",events("runtime.launch_started")));
     drop(cleanup);
 }

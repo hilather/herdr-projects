@@ -13,7 +13,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--herdr', type=Path)
 parser.add_argument('--agent', type=Path, help='Resolved Codex executable (not a version-manager shim).')
 parser.add_argument('--auth-file', type=Path)
-parser.add_argument('--dry-run', action='store_true', help='Fixture workers only; no agent, login or Herdr server.')
+parser.add_argument('--dry-run', action='store_true', help='Stand-in Herdr and agent; the harness writes the workers\' files. No real agent, login or Herdr server.')
 parser.add_argument('--allow-authenticated-workflow', action='store_true',
                     help='Authorize temporary login use and two short worker sessions in a disposable project; may consume account usage.')
 args = parser.parse_args()
