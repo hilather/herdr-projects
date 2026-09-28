@@ -972,3 +972,44 @@ Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
 - Dropping only the `deferred` guard on review notices did not fail the
   review test, because the outstanding-copy guard also holds the notice.
   Dropping both announced the stale hash and failed it.
+
+## Satisfaction and capability unit tests replaced by E2E workflows
+
+The audit marked 6 `src/store/satisfaction.rs` tests and 5
+`src/store/capabilities.rs` tests REPLACE. All eleven were deleted. The
+guarantees are now asserted through `scheduler inspect` and stored rows.
+
+`tests/satisfaction.rs` drives signed contracts, `result submit/verify`,
+`result configure-integration/integrate`, signed `factory admission` and memory
+`promote`/`reconcile`. Attempts go through the public store API, because no
+worker is launched.
+
+`tests/capabilities.rs` queues signed contracts through the CLI. The native
+verifier needs a live agent, so the test writes its retained report in the
+form `retain_native_profile` uses, and `profile retained` reads it back.
+Evidence is recorded through the public `record_native_capability_evidence`,
+which has no CLI command.
+
+| New E2E test | Replaced unit tests |
+| --- | --- |
+| `receipts_satisfy_their_own_edges_and_admission_gates_them` | `queue_report_satisfaction_rows_follow_the_admission_flag`, `newer_receipt_replaces_valid_satisfaction_without_rolling_back_the_commit` |
+| `a_late_verification_of_an_older_attempt_keeps_the_current_receipt` | `queue_after_a_later_stale_run_still_uses_the_current_receipt`, `older_attempt_run_does_not_invalidate_the_current_satisfaction` |
+| `a_new_attempt_or_contract_revision_hides_the_stored_satisfaction` | `superseded_attempt_or_older_contract_stays_unsatisfied` |
+| `an_open_memory_fence_hides_the_satisfaction_until_reconciled` | `open_memory_fence_hides_a_stored_satisfaction_until_it_resolves` |
+| `native_evidence_shows_launch_levels_but_never_certifies` | `codex_shaped_fixture_is_launchable_without_workflow_certification`, `contract_level_the_profile_lacks_is_capability_unsupported_and_not_certified` |
+| `a_changed_profile_does_not_inherit_the_old_level` | `changed_profile_digest_does_not_keep_the_old_level` |
+| `evidence_counts_only_inside_its_observation_window` | `later_observation_window_does_not_abort_another_digest`, `queue_report_before_observation_is_capability_unsupported` |
+
+The deleted capability tests used the test-only fake adapter. The E2E tests
+assert the same rules on native evidence, because that is the only producer
+outside library tests. The test-only `testing_set_factory_admission` and
+`selected_levels`, and the now-unused unit fixture helpers, were removed with
+the tests.
+
+Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
+- Dropping `observed_unix_ms<=now` from the capability level query failed the
+  window test: evidence observed in the future counted.
+- Letting any verified receipt replace the current satisfaction failed the
+  late-verification test: the older attempt's result took the valid row.
+- Dropping the open memory invalidation check from `verified_counts` failed
+  the memory fence test.

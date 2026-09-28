@@ -362,10 +362,6 @@ fn selected_native_digest(db: &Connection, kind: &str, budget:Option<&read_budge
     Ok(Some(digest))
 }
 
-#[cfg(test)]
-fn selected_levels(db: &Connection, kind: &str, now: i64) -> Result<Vec<CapabilityLevel>> {
-    selected_levels_with_budget(db,kind,now,None)
-}
 fn selected_levels_with_budget(db:&Connection,kind:&str,now:i64,budget:Option<&read_budget::ReadBudget>)->Result<Vec<CapabilityLevel>> {
     if let Some(digest) = selected_native_digest(db, kind, budget)? {
         return levels_for_with_budget(db, "native", &digest, now, budget);
@@ -536,85 +532,6 @@ mod tests {
         assert_eq!(reopened.read_snapshot(None).unwrap().schema_version, crate::store::SCHEMA);
     }
 
-    #[test]
-    fn codex_shaped_fixture_is_launchable_without_workflow_certification() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
-        let profile = codex_fixture();
-        let digest = profile.reference().unwrap().digest;
-        db.record_fake_adapter_evidence(&profile, 1_000, 10_000)
-            .unwrap();
-        db.record_fake_adapter_evidence(&profile, 1_000, 10_000)
-            .unwrap();
-        let levels = stored_levels(&db.connection, &digest);
-        assert_eq!(
-            levels,
-            vec!["discovered".to_string(), "launchable".to_string()]
-        );
-        assert!(!levels.iter().any(|level| level == "workflow-certified"));
-        let live: i64 = db
-            .connection
-            .query_row(
-                "SELECT max(live) FROM capability_evidence WHERE profile_digest=?1",
-                [&digest],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(live, 0);
-        let os_name: String = db
-            .connection
-            .query_row(
-                "SELECT os_name FROM capability_evidence WHERE profile_digest=?1 AND level='launchable'",
-                [&digest],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(os_name, "fixture");
-        assert!(
-            db.connection
-                .execute("UPDATE capability_evidence SET live=1", [])
-                .is_err()
-        );
-        assert!(
-            db.connection
-                .execute("DELETE FROM capability_evidence", [])
-                .is_err()
-        );
-
-    }
-
-    #[test]
-    fn changed_profile_digest_does_not_keep_the_old_level() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
-        let original = codex_fixture();
-        let original_digest = original.reference().unwrap().digest;
-        db.record_fake_adapter_evidence(&original, 1_000, 10_000)
-            .unwrap();
-        let mut changed = original;
-        // Model and extra args are inside these digests, so the old row no longer applies.
-        changed.definition_digest = "f".repeat(64);
-        changed.arguments_digest = "9".repeat(64);
-        changed.capabilities.stop = crate::domain::CapabilityEvidence::Unknown;
-        let changed_digest = changed.reference().unwrap().digest;
-        assert_ne!(original_digest, changed_digest);
-        db.record_fake_adapter_evidence(&changed, 2_000, 10_000)
-            .unwrap();
-        assert!(
-            stored_levels(&db.connection, &original_digest).contains(&"launchable".to_string())
-        );
-        let changed_levels = stored_levels(&db.connection, &changed_digest);
-        assert!(!changed_levels.iter().any(|level| level == "launchable"));
-        assert!(
-            !changed_levels
-                .iter()
-                .any(|level| level == "workflow-certified")
-        );
-        let shown = selected_levels(&db.connection, "codex", 3_000).unwrap();
-        assert!(!shown.contains(&CapabilityLevel::Launchable));
-        assert!(!shown.contains(&CapabilityLevel::WorkflowCertified));
-    }
-
     fn queue_task(db: &mut SqliteStore, id: &str) {
         let snapshot = db.read_snapshot(None).unwrap();
         let task = snapshot
@@ -661,85 +578,6 @@ mod tests {
         .unwrap();
         let prepared = PreparedContract::parse_verified(&bytes).unwrap();
         db.install_contract(&prepared).unwrap();
-    }
-
-    #[test]
-    fn contract_level_the_profile_lacks_is_capability_unsupported_and_not_certified() {
-        let temp = tempfile::tempdir().unwrap();
-        let repo = temp.path().join("repo");
-        std::fs::create_dir(&repo).unwrap();
-        let repo = std::fs::canonicalize(&repo).unwrap();
-        let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
-        db.commit(Commit {
-            expected_head: 0,
-            mutations: ["ask-certified", "ask-launch", "ask-model"]
-                .into_iter()
-                .map(|id| Mutation::Task {
-                    expected: None,
-                    next: Task {
-                        id: TaskId::new(id).unwrap(),
-                        revision: 1,
-                        state: TaskState::Draft,
-                        title: id.into(),
-                        active_attempt: None,
-                    },
-                })
-                .collect(),
-        })
-        .unwrap();
-        for id in ["ask-certified", "ask-launch", "ask-model"] {
-            queue_task(&mut db, id);
-        }
-        let repo = repo.display().to_string();
-        install_contract(&mut db, &repo, "ask-certified", &["workflow-certified"]);
-        install_contract(&mut db, &repo, "ask-launch", &["launchable"]);
-        install_contract(&mut db, &repo, "ask-model", &["model"]);
-        let profile = codex_fixture();
-        db.record_fake_adapter_evidence(&profile, 1_000, 10_000)
-            .unwrap();
-        let report = db.queue_report(2_000).unwrap();
-        let blockers = |id: &str| {
-            report
-                .entries
-                .iter()
-                .find(|entry| entry.task.as_str() == id)
-                .unwrap()
-                .blockers
-                .clone()
-        };
-        assert!(
-            blockers("ask-certified")
-                .iter()
-                .any(|blocker| blocker == "capability_unsupported")
-        );
-        assert!(
-            blockers("ask-model")
-                .iter()
-                .any(|blocker| blocker == "capability_unsupported")
-        );
-        assert!(
-            blockers("ask-launch")
-                .iter()
-                .all(|blocker| blocker != "capability_unsupported")
-        );
-        assert!(
-            report
-                .entries
-                .iter()
-                .flat_map(|entry| &entry.blockers)
-                .chain(report.capability.blockers.iter())
-                .all(|blocker| !blocker.contains("certified"))
-        );
-        assert!(!report.launch_enabled);
-        let certified: i64 = db
-            .connection
-            .query_row(
-                "SELECT count(*) FROM capability_evidence WHERE level='workflow-certified'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(certified, 0);
     }
 
     #[test]
@@ -855,96 +693,6 @@ mod tests {
             params![reference.digest, report, report_digest],
         )
         .unwrap();
-    }
-
-    #[test]
-    fn later_observation_window_does_not_abort_another_digest() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
-        let first = codex_fixture();
-        let mut second = codex_fixture();
-        second.name = "other".into();
-        second.arguments_digest = "9".repeat(64);
-        let first_digest = first.reference().unwrap().digest;
-        let second_digest = second.reference().unwrap().digest;
-        bind_native(&db.connection, &first);
-        bind_native(&db.connection, &second);
-        db.record_native_capability_evidence(1_000, 2_000).unwrap();
-        db.record_native_capability_evidence(3_000, 8_000).unwrap();
-        let windows = |digest: &str, observed: i64| -> i64 {
-            db.connection
-                .query_row(
-                    "SELECT count(*) FROM capability_evidence WHERE profile_digest=?1 AND observed_unix_ms=?2 AND level='launchable'",
-                    params![digest, observed],
-                    |row| row.get(0),
-                )
-                .unwrap()
-        };
-        assert_eq!(windows(&first_digest, 1_000), 1);
-        assert_eq!(windows(&first_digest, 3_000), 1);
-        assert_eq!(windows(&second_digest, 3_000), 1);
-        assert!(
-            !selected_levels(&db.connection, "codex", 2_500)
-                .unwrap()
-                .contains(&CapabilityLevel::Launchable)
-        );
-        let shown = selected_levels(&db.connection, "codex", 4_000).unwrap();
-        assert!(shown.contains(&CapabilityLevel::Launchable));
-        assert!(!shown.contains(&CapabilityLevel::WorkflowCertified));
-    }
-
-    #[test]
-    fn queue_report_before_observation_is_capability_unsupported() {
-        let temp = tempfile::tempdir().unwrap();
-        let repo = temp.path().join("repo");
-        std::fs::create_dir(&repo).unwrap();
-        let repo = std::fs::canonicalize(repo).unwrap().display().to_string();
-        let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
-        db.commit(Commit {
-            expected_head: 0,
-            mutations: vec![Mutation::Task {
-                expected: None,
-                next: Task {
-                    id: TaskId::new("ask-launch").unwrap(),
-                    revision: 1,
-                    state: TaskState::Draft,
-                    title: "ask-launch".into(),
-                    active_attempt: None,
-                },
-            }],
-        })
-        .unwrap();
-        queue_task(&mut db, "ask-launch");
-        install_contract(&mut db, &repo, "ask-launch", &["launchable"]);
-        let current = codex_fixture();
-        db.record_fake_adapter_evidence(&current, 5_000, 9_000)
-            .unwrap();
-        let early = db.queue_report(2_000).unwrap();
-        assert!(
-            early.entries[0]
-                .blockers
-                .iter()
-                .any(|blocker| blocker == "capability_unsupported")
-        );
-        let during = db.queue_report(6_000).unwrap();
-        assert!(
-            during.entries[0]
-                .blockers
-                .iter()
-                .all(|blocker| blocker != "capability_unsupported")
-        );
-        let mut future = current;
-        future.arguments_digest = "9".repeat(64);
-        future.capabilities.stop = crate::domain::CapabilityEvidence::Unknown;
-        db.record_fake_adapter_evidence(&future, 8_000, 12_000)
-            .unwrap();
-        let still_current = db.queue_report(6_000).unwrap();
-        assert!(
-            still_current.entries[0]
-                .blockers
-                .iter()
-                .all(|blocker| blocker != "capability_unsupported")
-        );
     }
 
     #[test]
