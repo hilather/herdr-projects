@@ -56,6 +56,14 @@ impl Finalization {
         let id=self.operation_id(op.expected_revision)?;ensure!(op.id==id&&op.idempotency_key==id.as_str(),"finalization identity mismatch");Ok(binding)
     }
     fn operation_id(&self,revision:u64)->Result<OperationId> {OperationId::new(format!("finalize-{}",digest(&serde_json::to_vec(&(self,revision))?))).map_err(anyhow::Error::msg)}
+    /// `operation` over `finalization_binding_rows`: the binding, its task and that task's attempts.
+    pub fn operation_rows(self,rows:&crate::store::FinalizationRows,now:i64)->Result<Operation> {
+        let binding=rows.bindings.iter().find(|b|b.id==self.binding).context("binding not found")?;
+        let task=binding.task.as_ref().context("coordinator cannot be finalized as a task")?;
+        let task=rows.tasks.iter().find(|t|&t.id==task).context("task not found")?;
+        let id=self.operation_id(task.revision)?;
+        let op=Operation{id:id.clone(),task:Some(task.id.clone()),kind:"runtime.finalization".into(),target:self.binding.clone(),payload_version:1,payload:serde_json::to_value(&self)?,expected_revision:task.revision,due_unix_ms:now,idempotency_key:id.as_str().into()};self.validate_rows(&op,rows,&self.config)?;Ok(op)
+    }
     pub fn operation(self,snapshot:&Snapshot,now:i64)->Result<Operation> {
         let binding=snapshot.runtime_bindings.iter().find(|b|b.id==self.binding).context("binding not found")?;
         let task=binding.task.as_ref().context("coordinator cannot be finalized as a task")?;

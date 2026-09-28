@@ -46,7 +46,7 @@ impl SqliteStore {
         read_attempt_input(&self.connection,attempt,budget)
     }
 }
-fn read_input_rows(db:&Connection,operation:Option<&OperationId>,budget:Option<&read_budget::ReadBudget>)->Result<Vec<AttemptInputRecord>> {
+pub(super) fn read_input_rows(db:&Connection,operation:Option<&OperationId>,budget:Option<&read_budget::ReadBudget>)->Result<Vec<AttemptInputRecord>> {
     let columns="SELECT i.attempt_id,i.operation_id,i.payload,i.payload_hash,a.task_id,o.task_id,o.kind,o.target,o.expected_revision,o.payload,o.payload_hash,o.payload_version,o.idempotency_key FROM attempt_inputs i JOIN attempts a ON a.id=i.attempt_id JOIN operations o ON o.id=i.operation_id";
     let sql=format!("{columns} {}",if operation.is_some(){"WHERE i.operation_id=?1"}else{"ORDER BY i.attempt_id"});
     let mut stmt=db.prepare(&sql)?;

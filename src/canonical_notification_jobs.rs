@@ -3,7 +3,9 @@ use std::{path::{Path,PathBuf},os::unix::fs::{MetadataExt,FileTypeExt},sync::Arc
 use anyhow::{Result,Context,ensure};
 use serde::{Serialize,Deserialize};
 use crate::{paths::{Ctx,Env},runner::{Runner,Cmd,Output,InheritedLock},source_tree::Control};
-use herdr_projects::{runtime,migration,execution_guard::ProjectGuard,domain::{Operation,OperationId},operations::{Claim,Outcome,notification::Notification,dispatch::{self,DeliveryAdapter,PreparedDelivery,DispatchRequest,DispatchResult}}};
+use herdr_projects::{migration,execution_guard::ProjectGuard,domain::{Operation,OperationId},operations::{Claim,Outcome,notification::Notification,dispatch::{self,DeliveryAdapter,PreparedDelivery,DispatchRequest,DispatchResult}}};
+#[cfg(test)]
+use herdr_projects::runtime;
 const JOB:&str="\0herdr-projects-canonical-notification";
 const BUDGET:Duration=Duration::from_secs(45);
 fn socket_identity(path:&Path)->Result<(u64,u64)>{let m=std::fs::symlink_metadata(path)?;ensure!(m.file_type().is_socket(),"notification endpoint must be a socket");Ok((m.dev(),m.ino()))}
@@ -32,8 +34,8 @@ impl Adapter<'_,'_> {
     fn validate(&self,operation:&Operation,notification:&Notification)->Result<()> {
         self.input.current(self.ctx,self.guard,self.control)?;
         ensure!(operation.id==self.input.operation&&fingerprint(operation)?==self.input.operation_digest,"notification operation changed");
-        let snapshot=runtime::snapshot(&self.input.project)?;
-        ensure!(Path::new(&notification.validate(operation,&snapshot,&self.input.config_reference)?.identity.socket)==self.input.socket,"notification route changed");self.control.check()
+        let rows=migration::open_active(&self.input.project)?.notification_rows(operation.task.as_ref(),None)?;
+        ensure!(Path::new(&notification.validate_rows(operation,&rows,&self.input.config_reference)?.identity.socket)==self.input.socket,"notification route changed");self.control.check()
     }
     fn run(&self,command:Cmd)->Result<Output>{herdr_projects::supervision::run(command,self.control.deadline,self.control.cancellation.clone(),self.locks)}
 }

@@ -171,9 +171,9 @@ pub fn enqueue_notification(project:&Path,task:&TaskId,expected_head:u64,config:
     let _maintenance=migration::runtime_mutation(project)?;
     ensure!(migration::config_reference(Path::new(&config.path))?==*config,"config changed before notification enqueue");
     let mut db=migration::open_active(project)?;
-    let snapshot=db.read_snapshot(Some(expected_head))?;
+    let rows=db.notification_rows(Some(task),Some(expected_head))?;
     let slug=project.file_name().and_then(|s|s.to_str()).context("invalid project slug")?;
-    let operation=crate::operations::notification::build(&snapshot,task,slug,config.clone(),jiff::Timestamp::now().as_millisecond())?;
+    let operation=crate::operations::notification::build_rows(&rows,task,slug,config.clone(),jiff::Timestamp::now().as_millisecond())?;
     db.commit(Commit{expected_head,mutations:vec![Mutation::Enqueue(operation.clone())]})?;
     Ok(operation)
 }

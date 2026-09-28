@@ -8,7 +8,7 @@ use crate::{domain::*,runner::Cancellation,source_tree::{self,Budget,Control,Dir
 mod git;
 mod outputs;
 mod output_reader;
-pub use output_reader::{load_outputs,load_binding_outputs,VerifiedOutputs};
+pub use output_reader::{load_outputs,load_binding_outputs,load_binding_output_rows,VerifiedOutputs};
 pub use outputs::OutputManifest;
 pub(crate) use outputs::capture_outputs_held;
 pub use git::Archive as GitArchive;

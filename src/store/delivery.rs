@@ -21,8 +21,11 @@ pub(super) fn delivery_with_budget(db:&Connection,id:&OperationId,budget:Option<
     decode(value)
 }
 pub(super) fn read_all(db:&Connection)->Result<Vec<Delivery>> {read_all_with_budget(db,None)}
-pub(super) fn read_all_with_budget(db:&Connection,budget:Option<&read_budget::ReadBudget>)->Result<Vec<Delivery>> {
-    let mut stmt=db.prepare("SELECT operation_id FROM operation_delivery ORDER BY operation_id")?;
+pub(super) fn read_all_with_budget(db:&Connection,budget:Option<&read_budget::ReadBudget>)->Result<Vec<Delivery>> {read_matching(db,"",budget)}
+/// Exactly the claimed or ambiguous deliveries, through `operation_delivery_unresolved`.
+pub(super) fn read_unresolved(db:&Connection)->Result<Vec<Delivery>> {read_matching(db,"WHERE state IN ('claimed','ambiguous')",None)}
+fn read_matching(db:&Connection,filter:&str,budget:Option<&read_budget::ReadBudget>)->Result<Vec<Delivery>> {
+    let mut stmt=db.prepare(&format!("SELECT operation_id FROM operation_delivery {filter} ORDER BY operation_id"))?;
     let mut rows=stmt.query([])?;
     let mut result=Vec::new();
     while let Some(row)=rows.next()? {

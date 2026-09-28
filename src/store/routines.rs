@@ -24,6 +24,18 @@ fn decoded<T:serde::de::DeserializeOwned>(payload:&str,hash:&str)->Result<T> {
 fn log(db:&Connection,kind:&str,entity:&str,revision:u64,value:&impl serde::Serialize)->Result<()> {
     db.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?1,?2,?3,1,?4)",params![kind,entity,integer(revision)?,encoded(value)?.0])?;Ok(())
 }
+/// The latest installed revision of `name`, identity-checked; the one `read_all` lists last for it.
+pub(super) fn latest(db:&Connection,name:&str,budget:Option<&read_budget::ReadBudget>)->Result<Option<RoutineDefinition>> {
+    schema(db)?;
+    let mut stmt=db.prepare("SELECT revision,payload,payload_hash FROM routine_revisions WHERE name=?1 ORDER BY revision DESC LIMIT 1")?;
+    let mut rows=stmt.query([name])?;
+    let Some(row)=rows.next()? else {return Ok(None);};
+    if let Some(budget)=budget {budget.row(row,&[(1,2)])?;}
+    let revision:u64=row.get(0)?;let payload:String=row.get(1)?;let hash:String=row.get(2)?;
+    let current:RoutineDefinition=decoded(&payload,&hash)?;
+    if current.revision!=revision||current.name!=name||current.reference().map_err(StoreError::Corrupt)?.digest!=hash {return Err(corrupt("routine revision identity mismatch"));}
+    Ok(Some(current))
+}
 pub(super) fn read_all(db:&Connection)->Result<(Vec<RoutineDefinition>,Vec<RoutineOccurrence>)> {read_all_with_budget(db,None)}
 pub(super) fn read_all_with_budget(db:&Connection,budget:Option<&read_budget::ReadBudget>)->Result<(Vec<RoutineDefinition>,Vec<RoutineOccurrence>)> {
     let mut definitions=Vec::new();let mut last=BTreeMap::new();
@@ -277,14 +289,7 @@ impl SqliteStore {
         if head(&tx)?!=expected_head {return Err(StoreError::Conflict);}
         let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
         if version<43{return Err(StoreError::UnsupportedSchema(version));}
-        let mut stmt=tx.prepare("SELECT revision,payload,payload_hash FROM routine_revisions WHERE name=?1 ORDER BY revision DESC LIMIT 1")?;
-        let mut rows=stmt.query([&d.name])?;
-        let row=rows.next()?.ok_or(StoreError::Conflict)?;
-        if let Some(budget)=budget {budget.row(row,&[(1,2)])?;}
-        let revision:u64=row.get(0)?;let payload:String=row.get(1)?;let hash:String=row.get(2)?;
-        drop(rows);drop(stmt);
-        let current:RoutineDefinition=decoded(&payload,&hash)?;
-        if current.revision!=revision||current.name!=d.name||current.reference().map_err(StoreError::Corrupt)?.digest!=hash {return Err(corrupt("routine revision identity mismatch"));}
+        let current=latest(&tx,&d.name,budget)?.ok_or(StoreError::Conflict)?;
         if &current!=d {return Err(StoreError::Conflict);}
         project_matches(&tx,d)?;
         let control=super::control::read_with_budget(&tx,budget)?;

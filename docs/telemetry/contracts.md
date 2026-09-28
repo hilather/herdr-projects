@@ -21,7 +21,7 @@ needs a new reviewed revision, not a silent reinterpretation.
   (RFC 8785 subset, as doc 03 §4). Digests are `sha256:` + lowercase hex.
 - **Time.** Unix milliseconds from the controller's `now` at the transition.
   Codex times are kept as reported and never reorder canonical events.
-- **Stores.** Canonical: `<project>/.state/state.db`, migrations 0048–0050.
+- **Stores.** Canonical: `<project>/.state/state.db`, migrations 0049–0051.
   Sidecar: `<project>/.state/telemetry.db`, own sequence under
   `migrations/telemetry/`, mode 0600, created on first collect. No
   cross-database transaction or foreign key; sidecar rows reference canonical
@@ -127,19 +127,19 @@ add their fixed code (`first_matching_approval` / `delegated_grant`), plus
 `only_eligible` when the eligible set has one entry.
 
 Invariant: `count(attempts) = count(dispatch_decisions)` for attempts created
-at or after migration 0049; older attempts report decision `unavailable`,
+at or after migration 0050; older attempts report decision `unavailable`,
 reason `predates_dispatch_log`.
 
 ## 4. AttemptOutcome record
 
-**Lifecycle marks** (migration 0050): `attempt_lifecycle(attempt_id,
+**Lifecycle marks** (migration 0051): `attempt_lifecycle(attempt_id,
 state, attempt_revision, unix_ms, source)`, PK `(attempt_id, state)`, written
 in the same transaction as each transition: `reserved`
 (`admit_prepared`), `launching` (`apply_launch_started`), `running`
 (`apply_worker_brief`), terminal `completed|failed|cancelled|lost`
 (`record_worker_termination_with_budget`, `record_launch_stopped_with_budget`,
 `stop_worktree_preparation_with_budget`, `cancel_attempt_in_transaction`).
-`source` names the function. A mark missing because the attempt predates 0050
+`source` names the function. A mark missing because the attempt predates 0051
 reads `unavailable: predates_lifecycle_log`.
 
 **Outcome** is a read-only projection (no table), one per attempt:

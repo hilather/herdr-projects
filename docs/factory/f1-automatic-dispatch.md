@@ -159,12 +159,20 @@ Recorded here rather than folded into the card that found them.
   worktrees through the product.
 
 - **Notification enqueue reads the whole snapshot** (`runtime.rs`
-  `enqueue_notification`). Its check needs every unseen inbox item and every
-  claimed or ambiguous delivery; add indexes for both in a migration, then read
-  only those rows.
+  `enqueue_notification`) — done (this PR). Migration 0048 indexes unseen
+  inbox items and claimed or ambiguous deliveries; `notification_rows` reads
+  only those (with their operations), the task and the coordinator route,
+  fenced to the head in one transaction. The notification delivery adapters
+  (operator and ticker) validate over the same rows.
 - **Remaining full-snapshot reads** in `finalization_delivery::enqueue`,
   `preserved_outputs`, the finalization adapter validation and
-  `routines::schedule`. Same approach as #43 (`store/effect_rows.rs`).
+  `routines::schedule` — done (this PR). Enqueue reads the binding, its task
+  and that task's live attempts (`finalization_binding_rows`); the adapter
+  and the receipt commit validate over `finalization_rows`; preserved outputs
+  read only termination events naming the binding (or naming none legibly,
+  indexed in 0048); scheduling reads the routine's latest revision;
+  `dispatch_one` reads one operation. Same approach as #43
+  (`store/effect_rows.rs`).
 - **Opening a store runs a whole-database `quick_check`**, so even targeted
   commands grow with database size. Decide whether the per-open check can be
   scoped or moved to maintenance.

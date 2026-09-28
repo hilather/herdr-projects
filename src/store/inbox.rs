@@ -3,8 +3,11 @@ use crate::operations::{DeliveryState,Outcome};
 use std::collections::BTreeSet;
 
 pub(super) fn read_all(db:&Connection)->Result<Vec<InboxItem>> {read_all_with_budget(db,None)}
-pub(super) fn read_all_with_budget(db:&Connection,budget:Option<&read_budget::ReadBudget>)->Result<Vec<InboxItem>> {
-    let mut stmt=db.prepare("SELECT revision,payload,payload_hash,seen,done,id FROM inbox_items ORDER BY id")?;
+pub(super) fn read_all_with_budget(db:&Connection,budget:Option<&read_budget::ReadBudget>)->Result<Vec<InboxItem>> {read_matching(db,"",budget)}
+/// Exactly the items with `!seen && !done`, through `inbox_items_unseen`.
+pub(super) fn read_unseen(db:&Connection)->Result<Vec<InboxItem>> {read_matching(db,"WHERE seen=0 AND done=0",None)}
+fn read_matching(db:&Connection,filter:&str,budget:Option<&read_budget::ReadBudget>)->Result<Vec<InboxItem>> {
+    let mut stmt=db.prepare(&format!("SELECT revision,payload,payload_hash,seen,done,id FROM inbox_items {filter} ORDER BY id"))?;
     let mut rows=stmt.query([])?;
     let mut result=Vec::new();
     while let Some(r)=rows.next()? {

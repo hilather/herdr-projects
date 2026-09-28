@@ -4,7 +4,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{fmt, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 
-pub const SCHEMA: u32 = 47;
+pub const SCHEMA: u32 = 48;
 const APPLICATION: u32 = 1_213_222_994;
 pub const MIN_SQLITE: i32 = 3_053_004;
 pub const MIN_SQLITE_VERSION: &str = "3.53.4";
@@ -108,6 +108,7 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../migrations/0045_result_integration.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0046_integration_policy_checks.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0047_result_job_revisions.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0048_effect_row_indexes.sql"))?;
             tx.commit()?;
         }
         // Persist the initial directory entry as well as SQLite's own commit.
@@ -459,7 +460,7 @@ mod memory_reconciliation;
 mod worker_knowledge;
 mod targeted;
 pub(crate) mod effect_rows;
-pub use effect_rows::FinalizationRows;
+pub use effect_rows::{BindingOutputRows, FinalizationRows, NotificationRows};
 pub use targeted::{hot_path_uses_snapshot, targeted_mismatch_count, HotPathRead, HOT_PATH_READ};
 mod observability;
 pub use observability::FactoryNumbers;

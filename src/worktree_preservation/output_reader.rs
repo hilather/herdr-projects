@@ -58,9 +58,17 @@ pub fn load_outputs(project:&Path,attempt:&AttemptId,reference:&AttemptOutputRef
 /// Resolve only canonical termination evidence for this exact runtime binding.
 /// Historical bindings without output receipts continue to use their local source.
 pub fn load_binding_outputs(project:&Path,state:&crate::domain::Snapshot,binding:&RuntimeBinding,control:&Control)->Result<Option<VerifiedOutputs>> {
+    load_outputs_from(project,&state.events,&state.attempts,&state.attempt_inputs,binding,control)
+}
+/// Same checks over `binding_output_rows`: every termination event that names
+/// this binding (or none legibly), and the attempts and inputs they cite.
+pub fn load_binding_output_rows(project:&Path,rows:&crate::store::BindingOutputRows,binding:&RuntimeBinding,control:&Control)->Result<Option<VerifiedOutputs>> {
+    load_outputs_from(project,&rows.events,&rows.attempts,&rows.attempt_inputs,binding,control)
+}
+fn load_outputs_from(project:&Path,events:&[crate::domain::Event],attempts:&[crate::domain::Attempt],inputs:&[crate::domain::AttemptInputRecord],binding:&RuntimeBinding,control:&Control)->Result<Option<VerifiedOutputs>> {
     control.check()?;
     let mut selected=None;
-    for event in state.events.iter().filter(|e|e.kind=="runtime.worker_terminated") {
+    for event in events.iter().filter(|e|e.kind=="runtime.worker_terminated") {
         let receipt:WorkerTerminationReceipt=serde_json::from_value(event.payload.clone())?;
         if receipt.binding!=binding.id {continue;}
         ensure!(event.payload_version==1&&event.entity==receipt.attempt.as_str(),"output event identity mismatch");
@@ -69,10 +77,10 @@ pub fn load_binding_outputs(project:&Path,state:&crate::domain::Snapshot,binding
     }
     let Some(receipt)=selected else{return Ok(None);};
     let Some(reference)=receipt.output_snapshot.as_ref() else{return Ok(None);};
-    let attempt=state.attempts.iter().find(|a|a.id==receipt.attempt).context("output attempt missing")?;
+    let attempt=attempts.iter().find(|a|a.id==receipt.attempt).context("output attempt missing")?;
     ensure!(receipt.version==1&&receipt.binding_revision==binding.revision&&attempt.termination_observed&&!attempt.retains_capacity()
         &&binding.task.as_ref()==Some(&attempt.task),"output termination binding changed");
-    let record=state.attempt_inputs.iter().find(|r|r.attempt==attempt.id&&r.operation==receipt.launch).context("output launch inputs missing")?;
+    let record=inputs.iter().find(|r|r.attempt==attempt.id&&r.operation==receipt.launch).context("output launch inputs missing")?;
     let source=worker_output_path(&record.inputs,&attempt.id).map_err(anyhow::Error::msg)?;
     ensure!(record.inputs.binding==binding.id&&record.inputs.task==attempt.task&&reference.source==source&&binding.identity.thread_dir==source&&binding.identity.machine.is_empty()
         &&Path::new(&record.inputs.project_store)==project.join(".state/state.db"),"output source identity mismatch");

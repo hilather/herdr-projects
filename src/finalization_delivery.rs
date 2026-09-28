@@ -48,14 +48,14 @@ pub(crate) fn save_receipt_authorized(project:&Project,op:&Operation,receipt:&Fi
 
 #[cfg(target_os="linux")]
 pub(crate) fn preserved_outputs(path:&Path,binding:&str,control:&Control)->Result<Option<herdr_projects::worktree_preservation::VerifiedOutputs>> {
-    control.check()?;let state=runtime::snapshot(path)?;
-    let binding=state.runtime_bindings.iter().find(|b|b.id==binding).context("output binding missing")?;
-    herdr_projects::worktree_preservation::load_binding_outputs(path,&state,binding,&herdr_projects::source_tree::Control{deadline:control.deadline,cancellation:control.cancellation.clone()})
+    control.check()?;let rows=migration::open_active(path)?.binding_output_rows(binding,None)?;
+    let binding=rows.binding.as_ref().context("output binding missing")?;
+    herdr_projects::worktree_preservation::load_binding_output_rows(path,&rows,binding,&herdr_projects::source_tree::Control{deadline:control.deadline,cancellation:control.cancellation.clone()})
 }
 
 pub fn enqueue(ctx:&Ctx,path:&Path,binding:&str,head:u64,reason:String)->Result<Operation> {
-    let path=path.canonicalize()?;let snapshot=runtime::snapshot(&path)?;ensure!(snapshot.head==head,"project head changed");
-    let binding=snapshot.runtime_bindings.iter().find(|b|b.id==binding).context("runtime binding not found")?;
+    let path=path.canonicalize()?;let rows=migration::open_active(&path)?.finalization_binding_rows(binding,Some(head))?;
+    let binding=rows.bindings.first().context("runtime binding not found")?;
     ensure!(binding.identity.machine.is_empty()&&Path::new(&binding.identity.thread_dir).is_absolute(),"finalization requires a recorded local source");
     #[cfg(target_os="linux")]
     let retained=preserved_outputs(&path,&binding.id,&Control::default())?;
@@ -63,8 +63,8 @@ pub fn enqueue(ctx:&Ctx,path:&Path,binding:&str,head:u64,reason:String)->Result<
     let report_hash=if let Some(outputs)=retained {outputs.report_hash().context("preserved output has no report")?.to_owned()}else{source_report_hash(binding)?};
     #[cfg(not(target_os="linux"))]
     let report_hash=source_report_hash(binding)?;
-    let payload=Finalization{authority:"operator.artifact_finalization".into(),binding:binding.id.clone(),binding_revision:binding.revision,control_epoch:snapshot.control.as_ref().context("upgrade-store required")?.epoch,config:crate::notification_delivery::config(ctx,&path)?,source:binding.identity.thread_dir.clone(),report_hash,reason};
-    let op=payload.operation(&snapshot,jiff::Timestamp::now().as_millisecond())?;
+    let payload=Finalization{authority:"operator.artifact_finalization".into(),binding:binding.id.clone(),binding_revision:binding.revision,control_epoch:rows.control.epoch,config:crate::notification_delivery::config(ctx,&path)?,source:binding.identity.thread_dir.clone(),report_hash,reason};
+    let op=payload.operation_rows(&rows,jiff::Timestamp::now().as_millisecond())?;
     runtime::enqueue_finalization(&path,head,op)
 }
 fn source_report_hash(binding:&herdr_projects::domain::RuntimeBinding)->Result<String> {
@@ -82,12 +82,12 @@ impl<'a,'b> DeliveryAdapter for Adapter<'a,'b> {
     fn prepare(&mut self,op:&Operation)->Result<Self::Prepared> {
         let control=Control::default();let lease=cleanup::lease(self.path.parent().context("project has no root")?)?;
         let payload=Finalization::decode(op)?;
-        payload.validate(op,&runtime::snapshot(&self.path)?,&crate::notification_delivery::config(self.ctx,&self.path)?)?;
+        payload.validate_rows(op,&migration::open_active(&self.path)?.finalization_rows(op,&payload.binding,None)?,&crate::notification_delivery::config(self.ctx,&self.path)?)?;
         Ok(Prepared{ctx:self.ctx,path:self.path.clone(),project:project(&self.path)?,payload,control,_lease:lease})
     }
 }
 impl Prepared<'_,'_> {
-    fn validate_current(&self,op:&Operation)->Result<()> {self.control.check()?;self.payload.validate(op,&runtime::snapshot(&self.path)?,&crate::notification_delivery::config(self.ctx,&self.path)?)?;self.control.check()}
+    fn validate_current(&self,op:&Operation)->Result<()> {self.control.check()?;self.payload.validate_rows(op,&migration::open_active(&self.path)?.finalization_rows(op,&self.payload.binding,None)?,&crate::notification_delivery::config(self.ctx,&self.path)?)?;self.control.check()}
 }
 impl PreparedDelivery for Prepared<'_,'_> {
     fn revalidate(&mut self,op:&Operation)->Result<()> {self.validate_current(op)}

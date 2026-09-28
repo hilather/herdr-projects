@@ -169,7 +169,7 @@ fn effect_commands_read_only_their_rows_with_ten_thousand_retired_neighbors() {
     use herdr_projects::{domain::*,authority,migration,runtime};
     use sha2::{Digest,Sha256};
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
-    for project in ["demo","fin"] {for action in ["new","pause"] {assert!(hp(home.path(),&["--root",r,action,project]).status.success());}}
+    for project in ["demo","fin","note"] {for action in ["new","pause"] {assert!(hp(home.path(),&["--root",r,action,project]).status.success());}}
     let head_of=|project:&Path|rusqlite::Connection::open(project.join(".state/state.db")).unwrap().query_row("SELECT MAX(sequence) FROM events",[],|row|row.get::<_,u64>(0)).unwrap();
     let delivery_of=|project:&Path,id:&str|rusqlite::Connection::open(project.join(".state/state.db")).unwrap().query_row("SELECT state,revision FROM operation_delivery WHERE operation_id=?1",[id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,u64>(1)?))).unwrap();
 
@@ -205,8 +205,16 @@ fn effect_commands_read_only_their_rows_with_ten_thousand_retired_neighbors() {
     let out=hp(home.path(),&["--root",r,"routine-store","demo","schedule","check","--expected-head",&head_of(&project).to_string()]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
     let routine_op=runtime::snapshot(&project).unwrap().operations[0].id.as_str().to_owned();
 
-    // Retain 10,000 unrelated rows plus undecodable cold rows in both stores.
-    retire_history(&fin);retire_history(&project);
+    // Notification: one unseen inbox item and an explicit coordinator route.
+    let note=root.join("note");std::fs::write(note.join("inbox/message.md"),"+++\nid='message'\nsummary='private text'\n+++\n").unwrap();
+    let plan=migration::inspect(&note).unwrap();migration::apply(&note,&plan,true).unwrap();
+    let note_head=runtime::add_task(&note,TaskId::new("notify").unwrap(),"notify".into(),head_of(&note)).unwrap();
+    runtime::create_binding(&note,None,None,note_head,&RuntimeRoute{socket:"/explicit/notification.sock".into(),..Default::default()}).unwrap();
+    assert!(hp(home.path(),&["--root",r,"reconcile","note","--record"]).status.success());
+    let s=runtime::snapshot(&note).unwrap();runtime::set_state(&note,s.head,s.control.unwrap().revision,ProjectState::Active,&home.path().join(".config/herdr-projects/config.toml")).unwrap();
+
+    // Retain 10,000 unrelated rows plus undecodable cold rows in every store.
+    retire_history(&fin);retire_history(&project);retire_history(&note);
     let (fin_head,head)=(head_of(&fin),head_of(&project));
 
     let (retained,retained_time)=observe(fin_head);assert!(!retained.status.success());
@@ -230,6 +238,37 @@ fn effect_commands_read_only_their_rows_with_ten_thousand_retired_neighbors() {
     assert!(out.status.success(),"task rename scanned retained history: {}",String::from_utf8_lossy(&out.stderr));assert_eq!(head_of(&project),head+1);
     assert!(!hp(home.path(),&["--root",r,"task","demo","rename","live","--title","again","--expected-revision","1","--expected-head",&head_of(&project).to_string()]).status.success(),"a stale task revision must still be refused");
     assert!(!hp(home.path(),&["--root",r,"task","demo","rename","live","--title","again","--expected-revision","2","--expected-head",&head.to_string()]).status.success(),"a stale head must still be refused");
+
+    // Routine scheduling reads the latest revision only; a stale head is refused.
+    let head=head_of(&project);
+    assert!(!hp(home.path(),&["--root",r,"routine-store","demo","schedule","check","--expected-head",&(head-1).to_string()]).status.success(),"a stale head must refuse scheduling");
+    let out=hp(home.path(),&["--root",r,"routine-store","demo","schedule","check","--expected-head",&head.to_string()]);
+    assert!(out.status.success(),"routine scheduling scanned retained history: {}",String::from_utf8_lossy(&out.stderr));
+
+    // Notification enqueue and delivery read only unseen items and unresolved deliveries.
+    let head=head_of(&note);
+    assert!(!hp(home.path(),&["--root",r,"operations","note","notify","notify","--expected-head",&(head-1).to_string()]).status.success(),"a stale head must refuse notification");
+    assert_eq!(head_of(&note),head);
+    let out=hp(home.path(),&["--root",r,"operations","note","notify","notify","--expected-head",&head.to_string()]);
+    assert!(out.status.success(),"notification enqueue scanned retained history: {}",String::from_utf8_lossy(&out.stderr));
+    let op:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();let note_op=op["id"].as_str().unwrap().to_owned();assert_eq!(op["payload"]["inbox_ids"],serde_json::json!(["message"]));
+    let fake=home.path().join(".local/bin/herdr");std::fs::create_dir_all(fake.parent().unwrap()).unwrap();
+    std::fs::write(&fake,b"#!/bin/sh\nif [ \"$1\" = '--version' ]; then echo 'herdr 0.9.1'; exit 0; fi\n[ \"$1\" = notification ] && [ \"$2\" = show ] || exit 9\nprintf 'effect\\n' >> \"$HOME/effects\"\nprintf '%s\\n' '{\"result\":{\"shown\":true}}'\n").unwrap();
+    { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&fake,std::fs::Permissions::from_mode(0o700)).unwrap(); }
+    let out=Command::new(BIN).env_clear().env("HOME",home.path()).env("HERDR_BIN_PATH",&fake).args(["--root",r,"operations","note","deliver-notification",&note_op,"--expected-revision","1"]).output().unwrap();
+    assert!(out.status.success(),"notification delivery scanned retained history: {}",String::from_utf8_lossy(&out.stderr));
+    assert_eq!(delivery_of(&note,&note_op).0,"confirmed");assert_eq!(std::fs::read_to_string(home.path().join("effects")).unwrap(),"effect\n");
+
+    // Finalization enqueue and delivery read the binding, its task and attempts only.
+    let head=head_of(&fin);
+    assert!(!hp(home.path(),&["--root",r,"operations","fin","finalize","thread:t-0001","--reason","again","--expected-head",&(head-1).to_string()]).status.success(),"a stale head must refuse finalization");
+    assert_eq!(head_of(&fin),head);
+    let out=hp(home.path(),&["--root",r,"operations","fin","finalize","thread:t-0001","--reason","again","--expected-head",&head.to_string()]);
+    assert!(out.status.success(),"finalization enqueue scanned retained history: {}",String::from_utf8_lossy(&out.stderr));
+    let op:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();let again=op["id"].as_str().unwrap().to_owned();
+    let out=hp(home.path(),&["--root",r,"operations","fin","deliver-finalization",&again,"--expected-revision","1"]);
+    assert!(out.status.success(),"finalization delivery scanned retained history: {}",String::from_utf8_lossy(&out.stderr));
+    assert_eq!(delivery_of(&fin,&again).0,"confirmed");
 }
 
 #[cfg(feature="state-store")]

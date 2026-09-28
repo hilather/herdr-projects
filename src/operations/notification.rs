@@ -2,7 +2,7 @@
 use anyhow::{Context,Result,ensure};
 use serde::{Deserialize,Serialize};
 use sha2::{Digest,Sha256};
-use crate::{domain::{Operation,OperationId,ProjectState,RuntimeBinding,RuntimeRoute,Snapshot,TaskId},migration::ConfigReference};
+use crate::{domain::{InboxItem,Operation,OperationId,ProjectControl,ProjectState,RuntimeBinding,RuntimeRoute,Snapshot,Task,TaskId},migration::ConfigReference,store::NotificationRows};
 
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -15,19 +15,31 @@ pub struct Notification {
     pub title:String,
     pub body:String,
 }
-fn unseen(snapshot:&Snapshot)->Vec<String> {
-    let mut ids:Vec<_>=snapshot.inbox.iter().filter(|i|!i.seen&&!i.done).map(|i|i.content.id.clone()).collect();ids.sort();ids
+/// The rows the check reads. Built from a snapshot or from `notification_rows`,
+/// whose inbox and delivery filters equal the `unseen` and overlap predicates.
+struct Rows<'a> {control:Option<&'a ProjectControl>,tasks:&'a [Task],bindings:&'a [RuntimeBinding],inbox:&'a [InboxItem],deliveries:&'a [super::Delivery],operations:&'a [Operation]}
+impl<'a> From<&'a Snapshot> for Rows<'a> {
+    fn from(s:&'a Snapshot)->Self {Rows{control:s.control.as_ref(),tasks:&s.tasks,bindings:&s.runtime_bindings,inbox:&s.inbox,deliveries:&s.deliveries,operations:&s.operations}}
+}
+impl<'a> From<&'a NotificationRows> for Rows<'a> {
+    fn from(r:&'a NotificationRows)->Self {Rows{control:Some(&r.control),tasks:&r.tasks,bindings:&r.bindings,inbox:&r.inbox,deliveries:&r.deliveries,operations:&r.operations}}
+}
+fn unseen(rows:&Rows)->Vec<String> {
+    let mut ids:Vec<_>=rows.inbox.iter().filter(|i|!i.seen&&!i.done).map(|i|i.content.id.clone()).collect();ids.sort();ids
 }
 fn identity(ids:&[String])->String {format!("notify-{:x}",Sha256::digest(serde_json::to_vec(ids).expect("string list is serializable")))}
 
-pub fn build(snapshot:&Snapshot,task:&TaskId,project_slug:&str,config:ConfigReference,now:i64)->Result<Operation> {
-    let binding=snapshot.runtime_bindings.iter().find(|b|b.id=="coordinator").context("register a coordinator notification route first")?;
+pub fn build(snapshot:&Snapshot,task:&TaskId,project_slug:&str,config:ConfigReference,now:i64)->Result<Operation> {build_from(&snapshot.into(),task,project_slug,config,now)}
+/// `build` over only the rows `notification_rows` reads.
+pub fn build_rows(rows:&NotificationRows,task:&TaskId,project_slug:&str,config:ConfigReference,now:i64)->Result<Operation> {build_from(&rows.into(),task,project_slug,config,now)}
+fn build_from(snapshot:&Rows,task:&TaskId,project_slug:&str,config:ConfigReference,now:i64)->Result<Operation> {
+    let binding=snapshot.bindings.iter().find(|b|b.id=="coordinator").context("register a coordinator notification route first")?;
     let task=snapshot.tasks.iter().find(|t|&t.id==task).context("task not found")?;
     let inbox_ids=unseen(snapshot);ensure!(!inbox_ids.is_empty(),"no unseen inbox items");ensure!(inbox_ids.len()<=1000,"notification batch exceeds 1000 inbox items");
     let id=identity(&inbox_ids);
-    let notification=Notification{authority:"operator.session_notification".into(),binding_revision:binding.revision,control_epoch:snapshot.control.as_ref().context("upgrade-store required")?.epoch,config,inbox_ids,title:format!("herdr-projects: {project_slug}"),body:format!("{} new inbox item(s). The coordinator reads them at its next turn.",unseen(snapshot).len())};
+    let notification=Notification{authority:"operator.session_notification".into(),binding_revision:binding.revision,control_epoch:snapshot.control.context("upgrade-store required")?.epoch,config,inbox_ids,title:format!("herdr-projects: {project_slug}"),body:format!("{} new inbox item(s). The coordinator reads them at its next turn.",unseen(snapshot).len())};
     let op=Operation{id:OperationId::new(id.clone()).map_err(anyhow::Error::msg)?,task:Some(task.id.clone()),kind:"runtime.notification".into(),target:"coordinator".into(),payload_version:1,payload:serde_json::to_value(&notification)?,expected_revision:task.revision,due_unix_ms:now,idempotency_key:id};
-    notification.validate(&op,snapshot,&notification.config)?;Ok(op)
+    notification.validate_from(&op,snapshot,&notification.config)?;Ok(op)
 }
 impl Notification {
     pub fn decode(operation:&Operation)->Result<Self> {
@@ -44,23 +56,26 @@ impl Notification {
         let id=identity(&self.inbox_ids);ensure!(operation.id.as_str()==id&&operation.idempotency_key==id,"notification identity mismatch");
         Ok(())
     }
-    pub fn validate<'a>(&self,operation:&Operation,snapshot:&'a Snapshot,config:&ConfigReference)->Result<&'a RuntimeBinding> {
+    pub fn validate<'a>(&self,operation:&Operation,snapshot:&'a Snapshot,config:&ConfigReference)->Result<&'a RuntimeBinding> {self.validate_from(operation,&snapshot.into(),config)}
+    /// Same checks as `validate`, over only the rows `notification_rows` reads.
+    pub fn validate_rows<'a>(&self,operation:&Operation,rows:&'a NotificationRows,config:&ConfigReference)->Result<&'a RuntimeBinding> {self.validate_from(operation,&rows.into(),config)}
+    fn validate_from<'a>(&self,operation:&Operation,snapshot:&Rows<'a>,config:&ConfigReference)->Result<&'a RuntimeBinding> {
         self.validate_payload(operation)?;
         ensure!(&self.config==config,"notification config reference changed");
         ensure!(self.inbox_ids==unseen(snapshot),"notification inbox set changed");
         // An altered route, task or configuration cannot launder a possible
         // prior effect into a new overlapping notification batch.
-        for delivery in &snapshot.deliveries {
+        for delivery in snapshot.deliveries {
             if delivery.operation==operation.id||!matches!(delivery.state,super::DeliveryState::Claimed|super::DeliveryState::Ambiguous){continue;}
             let previous=snapshot.operations.iter().find(|op|op.id==delivery.operation).context("notification overlap history is incomplete")?;
             if previous.kind!="runtime.notification"{continue;}
             let previous_notice=Self::decode(previous)?;previous_notice.validate_payload(previous)?;
             ensure!(!previous_notice.inbox_ids.iter().any(|id|self.inbox_ids.binary_search(id).is_ok()),"notification overlaps an unresolved possible effect; consume the older inbox items or explicitly retire its operation before enqueueing another batch");
         }
-        let control=snapshot.control.as_ref().context("upgrade-store required")?;
+        let control=snapshot.control.context("upgrade-store required")?;
         ensure!(control.state==ProjectState::Active&&!control.reconciliation_required&&control.epoch==self.control_epoch&&control.config_digest==config.digest,"notification lifecycle admission changed");
         ensure!(snapshot.tasks.iter().any(|t|Some(&t.id)==operation.task.as_ref()&&t.revision==operation.expected_revision),"notification task changed");
-        let binding=snapshot.runtime_bindings.iter().find(|b|b.id=="coordinator"&&b.revision==self.binding_revision&&b.task.is_none()).context("notification route changed")?;
+        let binding=snapshot.bindings.iter().find(|b|b.id=="coordinator"&&b.revision==self.binding_revision&&b.task.is_none()).context("notification route changed")?;
         RuntimeRoute::from_identity(&binding.identity).validate().map_err(anyhow::Error::msg)?;
         ensure!(binding.identity.machine.is_empty()&&std::path::Path::new(&binding.identity.socket).is_absolute(),"notification requires an explicit local session socket");
         Ok(binding)

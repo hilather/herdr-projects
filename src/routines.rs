@@ -101,8 +101,7 @@ fn load_current(definition:&RoutineDefinition)->Result<Option<Vec<u8>>> {
 pub fn schedule(project:&Path,name:&str,expected_head:u64)->Result<Option<RoutineOccurrence>> {
     let _guard=migration::runtime_mutation(project)?;
     let mut db=migration::open_active(project)?;
-    let snapshot=db.read_snapshot(Some(expected_head))?;
-    let definition=snapshot.routine_revisions.into_iter().rev().find(|d|d.name==name).context("routine not found")?;
+    let definition=db.latest_routine(name,Some(expected_head))?.context("routine not found")?;
     ensure!(definition.project_store==project.join(".state/state.db").canonicalize()?.to_string_lossy(),"routine belongs to another project");
     validate_current(&definition)?;
     let now=jiff::Timestamp::now().as_millisecond();

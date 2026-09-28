@@ -41,8 +41,8 @@ pub fn dispatch_one<A: DeliveryAdapter>(
     adapter: &mut A,
     mut clock: impl FnMut() -> i64,
 ) -> Result<DispatchResult> {
-    let operation = store.read_snapshot(None)?.operations.into_iter()
-        .find(|op| &op.id == request.operation).context("operation not found")?;
+    let (_, rows) = store.operation_rows(request.operation, None)?;
+    let (operation, _) = rows.context("operation not found")?;
     let mut prepared = adapter.prepare(&operation)?;
     let claim = store.claim_operation(request.operation, request.expected_revision,
         request.owner, clock(), request.lease_ms)?;
