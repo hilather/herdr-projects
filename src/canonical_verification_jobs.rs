@@ -90,6 +90,7 @@ fn execute(input:&Input,control:&Control)->Result<()> {
 pub struct JobRunner {pub inner:Arc<dyn Runner+Send+Sync>}
 impl Runner for JobRunner {
     fn run(&self,command:&Cmd)->Result<Output> {
+        if command.program==crate::canonical_integration_jobs::JOB{return crate::canonical_integration_jobs::run(command);}
         if command.program!=JOB{return self.inner.run(command);}
         let entered=Instant::now();ensure!(!command.timeout.is_zero()&&command.timeout<=BUDGET,"invalid verification budget");
         let text=command.stdin.as_deref().context("verification input missing")?;ensure!(text.len()<=64*1024,"verification input exceeds bounds");
@@ -99,7 +100,8 @@ impl Runner for JobRunner {
     fn socket_request(&self,path:&Path,line:&str,timeout:Duration)->Result<String>{self.inner.socket_request(path,line,timeout)}
 }
 
-/// The verifier lane: its own executor with one worker, one offer and one ticket.
+/// The result lane: its own executor with one worker, one offer and one ticket.
+/// It runs verification and integration jobs, one at a time.
 pub struct VerifierLane {executor:Arc<Executor>,offer:Option<Request>,pending:Option<(Identity,Ticket)>,cooldown:BTreeMap<String,Instant>}
 impl VerifierLane {
     pub fn new()->Result<Self> {

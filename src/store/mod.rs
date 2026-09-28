@@ -4,7 +4,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{fmt, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 
-pub const SCHEMA: u32 = 44;
+pub const SCHEMA: u32 = 45;
 const APPLICATION: u32 = 1_213_222_994;
 pub const MIN_SQLITE: i32 = 3_053_004;
 pub const MIN_SQLITE_VERSION: &str = "3.53.4";
@@ -105,6 +105,7 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../migrations/0042_wait_subscription.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0043_admission_indexes.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0044_result_automation.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0045_result_integration.sql"))?;
             tx.commit()?;
         }
         // Persist the initial directory entry as well as SQLite's own commit.
@@ -482,6 +483,8 @@ pub use plans::{PlanIntent,PlanIntentPage,inspect_project_plan,PlannerSession,Pl
 
 mod verification_jobs;
 pub use verification_jobs::{ResultAutomationControl,VerificationJob,VerificationJobTurn,set_project_result_automation,service_project_verification_jobs,project_verification_jobs,reset_project_verification_job};
+mod integration_jobs;
+pub use integration_jobs::{IntegrationJobTurn,service_project_integration_jobs};
 
 mod capabilities;
 

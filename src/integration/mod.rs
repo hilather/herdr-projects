@@ -136,7 +136,48 @@ pub fn reconcile_project(project: &Path, repository: &PathBuf, key: &str) -> Res
     reconcile_integration(&mut store, repository, key)
 }
 
+/// A refusal before any build or ref update.
+#[derive(Debug)]
+pub enum Refused {
+    CheckedOut,
+    TargetMoved { expected: String, current: String },
+}
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CheckedOut => f.write_str("integration ref is checked out"),
+            Self::TargetMoved { expected, current } => write!(f, "integration target moved since verification: ref is at {current}, expected {expected}; blocked for an operator or replan"),
+        }
+    }
+}
+impl std::error::Error for Refused {}
+
 pub fn integrate(store: &mut SqliteStore, request: &IntegrateRequest) -> Result<IntegrateOutcome> {
+    integrate_at(store, request, None)
+}
+
+/// Automatic ingress. A new integration starts only when the target is at the
+/// tip the controller expects (its latest recorded integration, else the base
+/// the result was verified against); an existing one resumes under its key.
+pub fn integrate_job(store: &mut SqliteStore, request: &IntegrateRequest, submission_id: &str) -> Result<IntegrateOutcome> {
+    let repo = GitRepo::open(&request.repository)?;
+    let Some(reference) = store.integration_ref(&repo.identity)? else {
+        bail!("integration ref is not configured");
+    };
+    let expected = store.expected_integration_tip(&repo.identity, &reference, submission_id)?;
+    integrate_at(store, request, Some(&expected))
+}
+
+/// A lost reply: classify the operation named by `key`, if any, without building.
+pub fn observe_job(store: &mut SqliteStore, repository: &PathBuf, key: &str) -> Result<Option<IntegrateOutcome>> {
+    let repo = GitRepo::open(repository)?;
+    if store.find_integration(&repo.identity, key)?.is_none() {
+        return Ok(None);
+    }
+    reconcile_integration(store, repository, key).map(Some)
+}
+
+fn integrate_at(store: &mut SqliteStore, request: &IntegrateRequest, expected_base: Option<&str>) -> Result<IntegrateOutcome> {
     let repo = GitRepo::open(&request.repository)?;
     let Some(reference) = store.integration_ref(&repo.identity)? else {
         bail!("integration ref is not configured");
@@ -163,11 +204,14 @@ pub fn integrate(store: &mut SqliteStore, request: &IntegrateRequest) -> Result<
         return resume(store, &repo, request, existing, false);
     }
     if repo.is_checked_out(&reference)? {
-        bail!("integration ref is checked out");
+        return Err(Refused::CheckedOut.into());
     }
     let Some(base) = repo.ref_oid(&reference)? else {
         bail!("integration ref is missing");
     };
+    if let Some(expected) = expected_base.filter(|expected| *expected != base) {
+        return Err(Refused::TargetMoved { expected: expected.to_owned(), current: base }.into());
+    }
     if base.len() != oid_len(&verified.object_format)? {
         bail!("integration ref oid does not match object format");
     }
@@ -521,7 +565,7 @@ fn settle(
             return Ok(outcome_of(&loaded));
         }
         if repo.is_checked_out(&view.ref_name)? {
-            bail!("integration ref is checked out");
+            return Err(Refused::CheckedOut.into());
         }
         let claim = fresh_claim(store, &view.operation_id)?;
         store.mark_publish_attempted(&claim, now_ms())?;

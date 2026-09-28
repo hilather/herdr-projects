@@ -110,13 +110,17 @@ fn finish_poll(ctx:&Ctx,path:&Path,turn:u64,reachable:bool,observation_error:Opt
         Ok(report)=>report.pending,
         Err(error)=>{errors.push(format!("verification job service: {error:#}"));true},
     };
+    let integration_work=match herdr_projects::store::service_project_integration_jobs(path) {
+        Ok(report)=>report.pending,
+        Err(error)=>{errors.push(format!("integration job service: {error:#}"));true},
+    };
     let routine_work=match scheduled {Ok(report)=>{if let Some(error)=report.diagnostic {errors.push(format!("routine scheduling: {error}"));}report.active},Err(error)=>{errors.push(format!("routine scheduling: {error:#}"));false}};
     // An admission failure is diagnostic only. Already-prepared dispatch still runs.
     let (progress,unknown_effects)=match result {
         Ok((progress,admission))=>{if let Some(error)=admission {errors.push(format!("admission: {error}"));}(progress,false)}
         Err(error)=>{errors.push(format!("{error:#}"));(false,queued)}
     };
-    Ok(PollResult{reachable:reachable||progress,scheduled_work:routine_work||wait_work||stop_work||replan_work||verification_work,unknown_effects,operation_error:(!errors.is_empty()).then(||errors.join("; ")),admission_log})
+    Ok(PollResult{reachable:reachable||progress,scheduled_work:routine_work||wait_work||stop_work||replan_work||verification_work||integration_work,unknown_effects,operation_error:(!errors.is_empty()).then(||errors.join("; ")),admission_log})
 }
 fn process_next(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::copy_jobs::Queue>)->Result<bool> {
     Ok(process_next_with_launches(ctx,path,turn,effects,launch_dispatch_enabled()).1?.0)
@@ -183,7 +187,7 @@ fn dispatch_prepared(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::cop
         anyhow::bail!("canonical termination requires Linux pidfs");
     }
     // Verification runs only in the supervised verifier lane of the background ticker.
-    if operation.kind=="verification.run" {return Ok(false);}
+    if operation.kind=="verification.run"||operation.kind=="integration.run" {return Ok(false);}
     if hint.mode==EffectMode::Observe {
         ensure!(operation.kind=="runtime.finalization","unsupported observation hint");
         crate::finalization_delivery::observe(ctx,path,&operation.id,hint.delivery_revision,hint.head)?;
@@ -214,6 +218,8 @@ fn offer_next(ctx:&Ctx,path:&Path,turn:u64,effects:&mut crate::copy_jobs::Queue,
         "runtime.worker_brief"|"runtime.worker_termination"|"runtime.worker_brief_prepare"|"runtime.launch"=>effects.offer_canonical_brief(path,&hint.operation,hint.delivery_revision)?,
         #[cfg(target_os="linux")]
         "verification.run"=>effects.offer_canonical_verification(path,&hint.operation,hint.delivery_revision,match hint.mode {EffectMode::Deliver=>crate::canonical_verification_jobs::Mode::Deliver,EffectMode::Observe=>crate::canonical_verification_jobs::Mode::Observe})?,
+        #[cfg(target_os="linux")]
+        "integration.run"=>effects.offer_canonical_integration(path,&hint.operation,hint.delivery_revision,match hint.mode {EffectMode::Deliver=>crate::canonical_verification_jobs::Mode::Deliver,EffectMode::Observe=>crate::canonical_verification_jobs::Mode::Observe})?,
         _=>anyhow::bail!("unsupported controller effect hint"),
     }
     Ok(false)

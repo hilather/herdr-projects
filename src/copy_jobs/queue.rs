@@ -45,6 +45,11 @@ impl Queue {
     pub fn offer_canonical_verification(&mut self,path:&Path,operation:&herdr_projects::domain::Operation,revision:u64,mode:crate::canonical_verification_jobs::Mode)->Result<()> {
         let lane=self.verifier.as_mut().context("verifier lane unavailable")?;lane.offer(crate::canonical_verification_jobs::request(path,operation,revision,mode)?);Ok(())
     }
+    /// Integration jobs share the verifier lane: one result job at a time.
+    #[cfg(all(feature="state-store",target_os="linux"))]
+    pub fn offer_canonical_integration(&mut self,path:&Path,operation:&herdr_projects::domain::Operation,revision:u64,mode:crate::canonical_verification_jobs::Mode)->Result<()> {
+        let lane=self.verifier.as_mut().context("verifier lane unavailable")?;lane.offer(crate::canonical_integration_jobs::request(path,operation,revision,mode)?);Ok(())
+    }
     /// One verifier at a time, never beside an exclusive root effect.
     #[cfg(all(feature="state-store",target_os="linux"))]
     pub fn admit_verifier(&mut self,allowed:impl Fn(&str)->bool)->Vec<String> {

@@ -696,9 +696,10 @@ enum ResultCommand {
     Submit { #[arg(long)] input_file:PathBuf },
     /// Read stored submissions. Claimed checks are not evidence.
     Show { #[arg(long)] id:Option<String> },
-    /// Enable or disable automatic verification; the ticker runs each job in its verifier lane
-    Auto { #[arg(long,value_parser=["on","off"])] verify:String, #[arg(long)] expected_head:u64 },
-    /// List automatic verification jobs, their delivery state and any pause reason
+    /// Enable or disable automatic verification and integration; the ticker runs each job in its result lane
+    #[command(group=clap::ArgGroup::new("switch").required(true).multiple(true).args(["verify","integrate"]))]
+    Auto { #[arg(long,value_parser=["on","off"])] verify:Option<String>, #[arg(long,value_parser=["on","off"])] integrate:Option<String>, #[arg(long)] expected_head:u64 },
+    /// List automatic verification and integration jobs, their delivery state and any pause reason
     Jobs,
     /// Return a permanently failed verification job to pending under the same run key
     RetryVerification { operation:String, #[arg(long)] expected_revision:u64 },
@@ -1192,7 +1193,7 @@ pub fn run() -> Result<()> {
                     if outcome.state != "integrated" { anyhow::bail!("integration {}: {}",outcome.state,outcome.reason.as_deref().unwrap_or("not integrated")); }
                 },
                 ResultCommand::Show{id}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::show_results(&dir,id.as_deref())?)?),
-                ResultCommand::Auto{verify,expected_head}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::set_project_result_automation(&dir,expected_head,verify=="on")?)?),
+                ResultCommand::Auto{verify,integrate,expected_head}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::set_project_result_automation(&dir,expected_head,verify.map(|v|v=="on"),integrate.map(|v|v=="on"))?)?),
                 ResultCommand::Jobs=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::project_verification_jobs(&dir)?)?),
                 ResultCommand::RetryVerification{operation,expected_revision}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::reset_project_verification_job(&dir,&operation,expected_revision)?)?),
             }

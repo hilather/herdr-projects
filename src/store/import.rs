@@ -73,6 +73,7 @@ impl SqliteStore {
         if version<=41 {tx.execute_batch(include_str!("../../migrations/0042_wait_subscription.sql"))?;}
         if version<=42 {tx.execute_batch(include_str!("../../migrations/0043_admission_indexes.sql"))?;super::routines::backfill_overlap(&tx)?;}
         if version<=43 {tx.execute_batch(include_str!("../../migrations/0044_result_automation.sql"))?;}
+        if version<=44 {tx.execute_batch(include_str!("../../migrations/0045_result_integration.sql"))?;}
         tx.commit()?;
         Ok(())
     }

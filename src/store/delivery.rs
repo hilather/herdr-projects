@@ -65,6 +65,9 @@ pub(super) fn update_outcome(tx:&Connection,old:&Delivery,outcome:&Outcome,now:i
         if kind=="verification.run" && !super::verification_jobs::has_run(tx,&old.operation,outcome.evidence())? {
             return Err(StoreError::Invalid("verification confirmation requires a recorded run under the job key".into()));
         }
+        if kind=="integration.run" && !super::integration_jobs::has_integration(tx,&old.operation,outcome.evidence())? {
+            return Err(StoreError::Invalid("integration confirmation requires an integrated operation under the job key".into()));
+        }
     }
     if let Outcome::Confirmed{observed_identity}=outcome {super::finalization::apply_receipt(tx,&old.operation,observed_identity)?;}
     let mut state=match outcome { Outcome::Confirmed{..}=>"confirmed",Outcome::Retryable{..}=>"pending",Outcome::Ambiguous{..}=>"ambiguous",Outcome::PermanentFailure{..}=>"permanent_failure" };

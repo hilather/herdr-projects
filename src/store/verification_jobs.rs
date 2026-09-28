@@ -7,11 +7,12 @@ use serde::Serialize;
 const TURN_LIMIT: usize = 8;
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
-pub struct ResultAutomationControl { pub revision: u64, pub verify: bool }
+pub struct ResultAutomationControl { pub revision: u64, pub verify: bool, pub integrate: bool }
 #[derive(Debug, Default, Serialize)]
 pub struct VerificationJobTurn { pub pending: bool, pub enqueued: usize }
 #[derive(Debug, Serialize)]
-pub struct VerificationJob { pub operation: OperationId, pub submission_id: String, pub policy_id: String, pub delivery: crate::operations::Delivery, pub paused: Option<String> }
+/// An automatic verification or integration job (`kind`); integration jobs have no policy.
+pub struct VerificationJob { pub operation: OperationId, pub kind: String, pub submission_id: String, pub policy_id: Option<String>, pub delivery: crate::operations::Delivery, pub paused: Option<String> }
 
 /// Sealed confirmation: the evidence must name a run recorded under this job's
 /// key, submission, policy and store. Caller- or worker-written text cannot.
@@ -22,10 +23,10 @@ pub(super) fn has_run(db: &Connection, id: &OperationId, run_id: &str) -> Result
         params![id.as_str(), run_id], |row| row.get(0))?)
 }
 /// The pause reason stands until the job is next claimed, finished or reset.
-const LATEST: &str = "SELECT kind,payload FROM events WHERE entity=?1 AND kind IN ('verification.paused','verification.job_reset','operation.claimed','operation.outcome') ORDER BY sequence DESC LIMIT 1";
+const LATEST: &str = "SELECT kind,payload FROM events WHERE entity=?1 AND kind IN ('verification.paused','integration.paused','verification.job_reset','operation.claimed','operation.outcome') ORDER BY sequence DESC LIMIT 1";
 fn paused(db: &Connection, id: &OperationId) -> Result<Option<String>> {
     let latest: Option<(String, String)> = db.query_row(LATEST, [id.as_str()], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
-    Ok(latest.filter(|(kind, _)| kind == "verification.paused")
+    Ok(latest.filter(|(kind, _)| kind.ends_with(".paused"))
         .and_then(|(_, payload)| serde_json::from_str::<serde_json::Value>(&payload).ok()?["reason"].as_str().map(str::to_owned)))
 }
 
@@ -52,19 +53,23 @@ fn identity(candidate: &Candidate, policy_digest: &str) -> Result<OperationId> {
 }
 
 impl SqliteStore {
-    pub fn set_result_automation(&mut self, expected_head: u64, verify: bool) -> Result<ResultAutomationControl> {
+    /// `None` leaves a switch unchanged. The integration switch needs schema 45.
+    pub fn set_result_automation(&mut self, expected_head: u64, verify: Option<bool>, integrate: Option<bool>) -> Result<ResultAutomationControl> {
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;check_schema(&tx)?;
         let schema = version(&tx)?;
-        if schema < 44 { return Err(StoreError::UnsupportedSchema(schema)); }
+        if schema < 44 || (integrate.is_some() && schema < 45) { return Err(StoreError::UnsupportedSchema(schema)); }
         if head(&tx)? != expected_head { return Err(StoreError::Conflict); }
-        let (revision, old): (u64, bool) = tx.query_row("SELECT revision,verify FROM result_automation_control WHERE singleton=1", [], |row| Ok((row.get(0)?, row.get(1)?)))?;
-        let revision = if old == verify { revision } else {
+        let (revision, old_verify): (u64, bool) = tx.query_row("SELECT revision,verify FROM result_automation_control WHERE singleton=1", [], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let old_integrate: bool = schema >= 45 && tx.query_row("SELECT integrate FROM result_automation_control WHERE singleton=1", [], |row| row.get(0))?;
+        let (verify, integrate) = (verify.unwrap_or(old_verify), integrate.unwrap_or(old_integrate));
+        let revision = if (old_verify, old_integrate) == (verify, integrate) { revision } else {
             let next = revision.checked_add(1).ok_or(StoreError::Conflict)?;
             tx.execute("UPDATE result_automation_control SET revision=?1,verify=?2 WHERE singleton=1", params![integer(next)?, verify])?;
-            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('result.automation_changed','project',?1,1,?2)", params![integer(next)?, serde_json::json!({"verify":verify}).to_string()])?;
+            if schema >= 45 { tx.execute("UPDATE result_automation_control SET integrate=?1 WHERE singleton=1", [integrate])?; }
+            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('result.automation_changed','project',?1,1,?2)", params![integer(next)?, serde_json::json!({"verify":verify,"integrate":integrate}).to_string()])?;
             next
         };
-        tx.commit()?;Ok(ResultAutomationControl { revision, verify })
+        tx.commit()?;Ok(ResultAutomationControl { revision, verify, integrate })
     }
     /// At most `TURN_LIMIT` new jobs per turn. Each insert rechecks the contract
     /// revision, the exact policy body and the task revision fence it records.
@@ -121,24 +126,25 @@ impl SqliteStore {
     pub fn note_verification_paused(&mut self, id: &OperationId, reason: &str) -> Result<()> {
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;check_schema(&tx)?;
         let reason: String = reason.chars().take(1024).collect();
-        let revision: u64 = tx.query_row("SELECT d.revision FROM operation_delivery d JOIN operations o ON o.id=d.operation_id WHERE o.id=?1 AND o.kind='verification.run' AND d.state='pending'", [id.as_str()], |row| row.get(0))?;
+        let (revision, kind): (u64, String) = tx.query_row("SELECT d.revision,o.kind FROM operation_delivery d JOIN operations o ON o.id=d.operation_id WHERE o.id=?1 AND o.kind IN ('verification.run','integration.run') AND d.state='pending'", [id.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))?;
         if paused(&tx, id)?.as_deref() != Some(reason.as_str()) {
-            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('verification.paused',?1,?2,1,?3)", params![id.as_str(), integer(revision)?, serde_json::json!({"reason":reason}).to_string()])?;
+            let event = if kind == "integration.run" { "integration.paused" } else { "verification.paused" };
+            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?4,?1,?2,1,?3)", params![id.as_str(), integer(revision)?, serde_json::json!({"reason":reason}).to_string(), event])?;
         }
         tx.commit()?;Ok(())
     }
     pub fn verification_jobs(&mut self) -> Result<Vec<VerificationJob>> {
         let tx = self.connection.transaction()?;check_schema(&tx)?;
         let ids = {
-            let mut stmt = tx.prepare("SELECT id,json_extract(payload,'$.submission_id'),json_extract(payload,'$.policy_id') FROM operations WHERE kind='verification.run' ORDER BY id")?;
-            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?
+            let mut stmt = tx.prepare("SELECT id,kind,json_extract(payload,'$.submission_id'),json_extract(payload,'$.policy_id') FROM operations WHERE kind IN ('verification.run','integration.run') ORDER BY kind DESC,id")?;
+            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut jobs = Vec::new();
-        for (id, submission_id, policy_id) in ids {
+        for (id, kind, submission_id, policy_id) in ids {
             let operation = OperationId::new(id).map_err(StoreError::Corrupt)?;
             let delivery = super::delivery::delivery(&tx, &operation)?;
             let paused = if delivery.state == crate::operations::DeliveryState::Pending { paused(&tx, &operation)? } else { None };
-            jobs.push(VerificationJob { operation, submission_id, policy_id, delivery, paused });
+            jobs.push(VerificationJob { operation, kind, submission_id, policy_id, delivery, paused });
         }
         tx.commit()?;Ok(jobs)
     }
@@ -160,10 +166,10 @@ impl SqliteStore {
     }
 }
 
-pub fn set_project_result_automation(project: &Path, expected_head: u64, verify: bool) -> anyhow::Result<ResultAutomationControl> {
+pub fn set_project_result_automation(project: &Path, expected_head: u64, verify: Option<bool>, integrate: Option<bool>) -> anyhow::Result<ResultAutomationControl> {
     let _guard = crate::migration::runtime_mutation(project)?;
     let control = controlled::ReadControl::new(std::time::Instant::now() + Duration::from_secs(2), Default::default());
-    Ok(crate::migration::open_active_scoped(project, control)?.set_result_automation(expected_head, verify)?)
+    Ok(crate::migration::open_active_scoped(project, control)?.set_result_automation(expected_head, verify, integrate)?)
 }
 pub fn service_project_verification_jobs(project: &Path) -> anyhow::Result<VerificationJobTurn> {
     let _guard = crate::migration::runtime_mutation(project)?;

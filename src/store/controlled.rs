@@ -280,9 +280,13 @@ impl ControlledStore {
         self.work_budget.check()?;
         self.store.service_replans(&self.work_budget).map_err(|e|self.error(e))
     }
-    pub(crate) fn set_result_automation(&mut self,head:u64,verify:bool)->Result<super::verification_jobs::ResultAutomationControl> {
+    pub(crate) fn set_result_automation(&mut self,head:u64,verify:Option<bool>,integrate:Option<bool>)->Result<super::verification_jobs::ResultAutomationControl> {
         self.work_budget.check()?;
-        self.store.set_result_automation(head,verify).map_err(|e|self.error(e))
+        self.store.set_result_automation(head,verify,integrate).map_err(|e|self.error(e))
+    }
+    pub(crate) fn service_integration_jobs(&mut self)->Result<super::integration_jobs::IntegrationJobTurn> {
+        self.work_budget.check()?;
+        self.store.service_integration_jobs(&self.work_budget).map_err(|e|self.error(e))
     }
     pub(crate) fn service_verification_jobs(&mut self)->Result<super::verification_jobs::VerificationJobTurn> {
         self.work_budget.check()?;
