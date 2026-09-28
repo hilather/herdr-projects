@@ -21,7 +21,8 @@ const ELIGIBLE: &str = "SELECT s.submission_id,s.project_store,s.task_id,t.revis
            AND NOT EXISTS(SELECT 1 FROM verification_runs v JOIN verified_results r ON r.run_id=v.run_id
                JOIN verification_contract_checks k ON k.result_id=r.result_id AND k.version=2
                WHERE v.submission_id=s.submission_id AND v.policy_id=p.policy_id AND v.state='accepted'))
-       AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.kind='integration.run' AND json_extract(o.payload,'$.submission_id')=s.submission_id)
+       AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.kind='integration.run' AND json_extract(o.payload,'$.submission_id')=s.submission_id
+           AND NOT EXISTS(SELECT 1 FROM events e WHERE e.entity=o.id AND e.kind='integration.job_retired'))
        AND NOT EXISTS(SELECT 1 FROM verified_results r JOIN integration_operations i ON i.verified_result_id=r.result_id WHERE r.submission_id=s.submission_id)";
 const UNFINISHED: &str = "('effect_pending','candidate_prepared','validating','reconciliation_required')";
 
@@ -54,6 +55,10 @@ impl SqliteStore {
         budget.check()?;
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;check_schema(&tx)?;
         if !enabled(&tx)? { return Ok(IntegrationJobTurn::default()); }
+        let now = jiff::Timestamp::now().as_millisecond();
+        let version: u32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        // Retired first, so a replaced job's submission is back in the pending projection.
+        let stale = version >= 47 && super::verification_jobs::retire_stale(&tx, "integration", budget, now)?;
         // Only the pending projection is read, oldest first and bounded; each
         // candidate's full eligibility is rechecked here, and a row that is not
         // eligible now is dropped (a later verified result or target re-adds it).
@@ -63,8 +68,7 @@ impl SqliteStore {
             while let Some(row) = rows.next()? { budget.row(row, &[])?; ids.push(row.get::<_, String>(0)?); }
             ids
         };
-        let more = ids.len() > SCAN_LIMIT;
-        let now = jiff::Timestamp::now().as_millisecond();
+        let more = stale || ids.len() > SCAN_LIMIT;
         let mut enqueued = 0;
         for submission_id in ids.iter().take(SCAN_LIMIT) {
             if enqueued == TURN_LIMIT { break; }
@@ -76,9 +80,7 @@ impl SqliteStore {
                 continue;
             };
             budget.check()?;
-            let encoded = serde_json::to_vec(&serde_json::json!([candidate.project_store, candidate.result_id, candidate.repository, candidate.reference]))
-                .map_err(|error| StoreError::Invalid(error.to_string()))?;
-            let id = OperationId::new(sha256_hex(&encoded)).map_err(StoreError::Invalid)?;
+            let id = super::verification_jobs::fresh_id(&tx, serde_json::json!([candidate.project_store, candidate.result_id, candidate.repository, candidate.reference]), candidate.task_revision)?;
             let payload = serde_json::json!({"version":1,"project_store":candidate.project_store,"submission_id":candidate.submission_id,"task_id":candidate.task_id,
                 "result_id":candidate.result_id,"repository":candidate.repository,"ref":candidate.reference}).to_string();
             enqueued += tx.execute(&format!(

@@ -40,16 +40,55 @@ struct Candidate {
     body: String,
 }
 
+/// A pending job whose task revision fence no longer holds can never be
+/// claimed. Retire it durably (reason `task_revision_changed`) so the producer
+/// can enqueue a job fenced on the current revision. Claimed and ambiguous jobs
+/// are never retired here; they go through observation first. Returns whether
+/// more stale jobs remain than one turn retires.
+pub(super) fn retire_stale(tx: &Connection, lane: &str, budget: &read_budget::ReadBudget, now: i64) -> Result<bool> {
+    let stale = {
+        let mut stmt = tx.prepare("SELECT o.id,o.expected_revision,t.revision FROM operation_delivery d JOIN operations o ON o.id=d.operation_id JOIN tasks t ON t.id=o.task_id
+            WHERE d.state='pending' AND o.kind=?1 AND o.expected_revision<>t.revision ORDER BY o.id LIMIT ?2")?;
+        let mut rows = stmt.query(params![format!("{lane}.run"), TURN_LIMIT as i64 + 1])?;let mut stale = Vec::new();
+        while let Some(row) = rows.next()? { budget.row(row, &[])?; stale.push((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)); }
+        stale
+    };
+    for (id, bound, current) in stale.iter().take(TURN_LIMIT) {
+        budget.check()?;
+        let id = OperationId::new(id.clone()).map_err(StoreError::Corrupt)?;
+        let outcome = crate::operations::Outcome::PermanentFailure { diagnostic: format!("task_revision_changed: bound to task revision {bound}, task is now at {current}; a job for the current revision replaces it") };
+        let retired = super::delivery::update_outcome(tx, &super::delivery::delivery(tx, &id)?, &outcome, now, "result-automation")?;
+        tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?4,?1,?2,1,?3)", params![id.as_str(), integer(retired.revision)?,
+            serde_json::json!({"reason":"task_revision_changed","bound_revision":bound,"task_revision":current}).to_string(), format!("{lane}.job_retired")])?;
+        if lane == "integration" {
+            tx.execute("INSERT OR IGNORE INTO pending_integration_work SELECT s.submission_id,s.created_unix_ms FROM result_submissions s JOIN operations o ON o.id=?1
+                WHERE s.submission_id=json_extract(o.payload,'$.submission_id')", [id.as_str()])?;
+        }
+    }
+    Ok(stale.len() > TURN_LIMIT)
+}
+/// The job id for a pair; a replacement for a retired job also binds the task revision.
+pub(super) fn fresh_id(tx: &Connection, parts: serde_json::Value, task_revision: i64) -> Result<OperationId> {
+    let encode = |value: &serde_json::Value| -> Result<OperationId> {
+        let encoded = serde_json::to_vec(value).map_err(|error| StoreError::Invalid(error.to_string()))?;
+        OperationId::new(sha256_hex(&encoded)).map_err(StoreError::Invalid)
+    };
+    let base = encode(&parts)?;
+    if !tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1)", [base.as_str()], |row| row.get::<_, bool>(0))? { return Ok(base); }
+    let mut parts = parts;
+    if let Some(array) = parts.as_array_mut() { array.push(task_revision.into()); }
+    encode(&parts)
+}
+
 fn version(db: &Connection) -> Result<u32> { Ok(db.query_row("PRAGMA user_version", [], |row| row.get(0))?) }
 fn enabled(db: &Connection) -> Result<bool> {
     Ok(db.query_row("SELECT verify=1 AND EXISTS(SELECT 1 FROM project_control WHERE singleton=1 AND state='active') FROM result_automation_control WHERE singleton=1", [], |row| row.get(0))?)
 }
 fn sha256_hex(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
-/// sha256(project_store, submission, contract_revision, policy_id, policy_digest)
-fn identity(candidate: &Candidate, policy_digest: &str) -> Result<OperationId> {
-    let encoded = serde_json::to_vec(&serde_json::json!([candidate.project_store, candidate.submission_id, candidate.contract_revision, candidate.policy_id, policy_digest]))
-        .map_err(|error| StoreError::Invalid(error.to_string()))?;
-    OperationId::new(sha256_hex(&encoded)).map_err(StoreError::Invalid)
+/// sha256(project_store, submission, contract_revision, policy_id, policy_digest),
+/// plus the task revision for a job replacing a retired one.
+fn identity(tx: &Connection, candidate: &Candidate, policy_digest: &str) -> Result<OperationId> {
+    fresh_id(tx, serde_json::json!([candidate.project_store, candidate.submission_id, candidate.contract_revision, candidate.policy_id, policy_digest]), candidate.task_revision)
 }
 
 impl SqliteStore {
@@ -73,10 +112,13 @@ impl SqliteStore {
     }
     /// At most `TURN_LIMIT` new jobs per turn. Each insert rechecks the contract
     /// revision, the exact policy body and the task revision fence it records.
+    /// Pending jobs whose fence no longer holds are retired first and replaced.
     pub(crate) fn service_verification_jobs(&mut self, budget: &read_budget::ReadBudget) -> Result<VerificationJobTurn> {
         budget.check()?;
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;check_schema(&tx)?;
         if version(&tx)? < 44 || !enabled(&tx)? { return Ok(VerificationJobTurn::default()); }
+        let now = jiff::Timestamp::now().as_millisecond();
+        let stale = version(&tx)? >= 47 && retire_stale(&tx, "verification", budget, now)?;
         let mut candidates = Vec::new();
         {
             let mut stmt = tx.prepare(
@@ -87,7 +129,8 @@ impl SqliteStore {
                  JOIN acceptance_policies p ON p.task_id=s.task_id AND p.contract_revision=s.contract_revision
                  WHERE NOT EXISTS(SELECT 1 FROM verification_runs r WHERE r.submission_id=s.submission_id AND r.policy_id=p.policy_id)
                    AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.kind='verification.run'
-                       AND json_extract(o.payload,'$.submission_id')=s.submission_id AND json_extract(o.payload,'$.policy_id')=p.policy_id)
+                       AND json_extract(o.payload,'$.submission_id')=s.submission_id AND json_extract(o.payload,'$.policy_id')=p.policy_id
+                       AND NOT EXISTS(SELECT 1 FROM events e WHERE e.entity=o.id AND e.kind='verification.job_retired'))
                  ORDER BY w.created_unix_ms,w.submission_id,p.policy_id LIMIT ?1")?;
             let mut rows = stmt.query([TURN_LIMIT as i64 + 1])?;
             while let Some(row) = rows.next()? {
@@ -95,13 +138,12 @@ impl SqliteStore {
                 candidates.push(Candidate { submission_id: row.get(0)?, project_store: row.get(1)?, task_id: row.get(2)?, task_revision: row.get(3)?, contract_revision: row.get(4)?, policy_id: row.get(5)?, body: row.get(6)? });
             }
         }
-        let more = candidates.len() > TURN_LIMIT;
-        let now = jiff::Timestamp::now().as_millisecond();
+        let more = stale || candidates.len() > TURN_LIMIT;
         let mut enqueued = 0;
         for candidate in candidates.iter().take(TURN_LIMIT) {
             budget.check()?;
             let policy_digest = sha256_hex(candidate.body.as_bytes());
-            let id = identity(candidate, &policy_digest)?;
+            let id = identity(&tx, candidate, &policy_digest)?;
             let payload = serde_json::json!({"version":1,"project_store":candidate.project_store,"submission_id":candidate.submission_id,"task_id":candidate.task_id,
                 "contract_revision":candidate.contract_revision,"policy_id":candidate.policy_id,"policy_digest":policy_digest}).to_string();
             enqueued += tx.execute(
@@ -164,6 +206,9 @@ impl SqliteStore {
         let kind: String = tx.query_row("SELECT kind FROM operations WHERE id=?1", [id.as_str()], |row| row.get(0))?;
         let old = super::delivery::delivery(&tx, id)?;
         if kind != format!("{lane}.run") || old.revision != expected_revision || old.state != crate::operations::DeliveryState::PermanentFailure { return Err(StoreError::Conflict); }
+        if tx.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE entity=?1 AND kind=?2)", params![id.as_str(), format!("{lane}.job_retired")], |row| row.get::<_, bool>(0))? {
+            return Err(StoreError::Invalid("this job was bound to an older task revision and has been replaced by a job for the current revision".into()));
+        }
         if old.attempts >= 32 {
             let manual = if lane == "integration" { "integrate this result manually with `result integrate`" } else { "verify this policy manually with `result verify`" };
             return Err(StoreError::Invalid(format!("claim history is exhausted; {manual}")));

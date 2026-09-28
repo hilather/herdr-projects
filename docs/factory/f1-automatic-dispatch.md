@@ -176,9 +176,16 @@ Recorded here rather than folded into the card that found them.
   is a port: replay it onto `main`, re-verify, add a tick-level E2E (the review
   noted none drives a full canonical `tick()`), then close both threads in
   Herdr. Do after F1.
-- **Verification jobs bound to an older task revision never run.** A task
-  revision change after enqueue leaves the job pending and unclaimable, and it
-  keeps counting toward backlog age. Retire and re-enqueue such jobs.
+- **Verification jobs bound to an older task revision never run** — done (this
+  PR). A task revision change after enqueue left the job pending and
+  unclaimable, and it kept counting toward backlog age. The producer now
+  retires a pending (never a claimed or ambiguous) job whose fence no longer
+  holds, at most 8 per turn, as a permanent failure with reason
+  `task_revision_changed` and a `<lane>.job_retired` event, and enqueues a job
+  fenced on the current revision (its id also binds the revision). Migration
+  0047 adds the fence to the one-job unique indexes. Integration jobs get the
+  same treatment. A retired job cannot be retried with `retry-*`. E2E:
+  `ticker_replaces_result_jobs_bound_to_an_older_task_revision`.
 - **The verifier holds project ownership for the whole check** (up to about
   4 minutes), as the operator `verify` command does, blocking other effects in
   that project and root-exclusive operations. Consider narrowing it to the

@@ -4,7 +4,7 @@ Fixed spec for implementers. Contracts: [contracts.md](contracts.md); code
 facts: [baseline.md](baseline.md). Base `main` `ebfe10e`, schema 45.
 
 Order: S1 → S2 → S3 → S5 → S6 → S7, then **owner review**. S4 (attention) is
-deferred. Canonical migrations: S1 `0047`, S2 `0048`, S3 `0049`; each bumps
+deferred. Canonical migrations: S1 `0048`, S2 `0049`, S3 `0050`; each bumps
 `SCHEMA` and adds its `include_str!` step in `src/store/mod.rs` and stays
 loadable by `src/store/test_schema.rs` `historical`. S5 uses only the sidecar
 `migrations/telemetry/0001_codex_usage.sql` (`historical` reads
@@ -25,10 +25,10 @@ production code. Extend `tests/factory_harness.rs` (`vertical_slice`,
 outside the named transaction; persist a field not in contracts §5/§7; turn
 an unavailable value into 0; or need cross-database atomicity.
 
-## S1 — Task classification v1 (0047)
+## S1 — Task classification v1 (0048)
 
 Goal: every reservation writes or reuses the contracts §1 row inside
-`admit_prepared`. Files: `migrations/0047_task_classifications.sql`
+`admit_prepared`. Files: `migrations/0048_task_classifications.sql`
 (immutable, unique `(task_id, contract_revision, taxonomy, revision)`),
 `src/domain/telemetry.rs`, `src/store/dispatch_log.rs`,
 `src/store/reservations.rs`. Tests (`tests/factory_harness.rs`):
@@ -41,10 +41,10 @@ Goal: every reservation writes or reuses the contracts §1 row inside
   (`band = unknown`).
 Stop if classification needs an outcome field or a read outside the transaction.
 
-## S2 — AgentConfiguration and DispatchDecision (0048)
+## S2 — AgentConfiguration and DispatchDecision (0049)
 
 Goal: exactly one decision per new attempt, same transaction, all three
-paths. Files: `migrations/0048_dispatch_decisions.sql`
+paths. Files: `migrations/0049_dispatch_decisions.sql`
 (`agent_configurations`, `dispatch_decisions`, immutable),
 `src/store/dispatch_log.rs`, `src/store/reservations.rs` (`DispatchContext`
 argument on `admit_prepared` and its four wrappers), `src/admission.rs`
@@ -67,11 +67,11 @@ argument on `admit_prepared` and its four wrappers), `src/admission.rs`
 Stop if passing the eligible set would widen what a caller may launch, or a
 delegated replay would write a second row.
 
-## S3 — Attempt outcome record (0049)
+## S3 — Attempt outcome record (0050)
 
 Goal: lifecycle marks at every transition, the read-only outcome projection,
 and `herdr-projects telemetry <slug> attempts [--json]`. Files:
-`migrations/0049_attempt_lifecycle.sql`; marks in `src/store/reservations.rs`,
+`migrations/0050_attempt_lifecycle.sql`; marks in `src/store/reservations.rs`,
 `src/store/launch.rs`, `src/store/worker_brief.rs`,
 `src/store/worker_termination.rs`, `src/store/worktrees.rs`;
 `src/telemetry/outcome.rs`; `src/cli.rs`. Tests (`vertical_slice` extensions):
@@ -81,7 +81,7 @@ and `herdr-projects telemetry <slug> attempts [--json]`. Files:
 - `outcome_rejected_verification_reason_is_excerpted` — one line, ≤160, `~`.
 - `cancelled_before_launch_is_censored_not_zero` — `active_ms` unavailable,
   `cancelled`, no `0` in the JSON.
-- `pre_0049_attempt_reports_predates_lifecycle_log` — upgrade from 47.
+- `pre_0050_attempt_reports_predates_lifecycle_log` — upgrade from 48.
 Stop if a transition path exists that baseline §1 does not list (add it first).
 
 ## S5 — Codex usage adapter (sidecar)

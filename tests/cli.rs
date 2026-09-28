@@ -2048,6 +2048,64 @@ fn ticker_enqueues_one_verification_job_per_policy_across_restart() {
 
 #[cfg(all(feature="state-store",target_os="linux"))]
 #[test]
+fn ticker_replaces_result_jobs_bound_to_an_older_task_revision() {
+    use herdr_projects::operations::DeliveryState;
+    let f=VerifyFixture::new(&[("src/lib.rs","pub fn result() {}\n".into())]);
+    let submission_id=f.submit("task",&[("clean",r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#.to_owned())]);
+    let metrics=f.root.join(".ticker-metrics.json");
+    let turn=||{let _=std::fs::remove_file(&metrics);let mut child=f.spawn();f.wait(&mut child,35,&||metrics.is_file());f.stop(&mut child);};
+    f.automate();
+    // The first pass only enqueues, fenced on the task revision at that moment.
+    turn();
+    let jobs=f.jobs();assert_eq!(jobs.len(),1);let (old,delivery)=jobs[0].clone();
+    assert_eq!((delivery.state,delivery.attempts),(DeliveryState::Pending,0));
+    // The task revision moves before the job runs, so the old job can never be claimed.
+    let snapshot=herdr_projects::runtime::snapshot(&f.project).unwrap();
+    let revision=snapshot.tasks.iter().find(|t|t.id.as_str()=="task").unwrap().revision;assert_eq!(old.expected_revision,revision);
+    let out=hp(f.home.path(),&["--root",f.r(),"task","demo","rename","task","--title","renamed","--expected-revision",&revision.to_string(),"--expected-head",&snapshot.head.to_string()]);
+    assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let replaced=||f.jobs().into_iter().find(|(op,_)|op.id!=old.id);
+    let mut child=f.spawn();f.wait(&mut child,90,&||replaced().is_some_and(|(_,d)|d.state==DeliveryState::Confirmed));f.stop(&mut child);
+    // The old job is retired without ever being claimed, and says why.
+    let listed:serde_json::Value=serde_json::from_slice(&hp(f.home.path(),&["--root",f.r(),"result","demo","jobs"]).stdout).unwrap();
+    let retired=listed.as_array().unwrap().iter().find(|job|job["operation"]==old.id.as_str()).unwrap();
+    assert_eq!(retired["delivery"]["state"],"permanent_failure");assert_eq!(retired["delivery"]["attempts"],0);
+    assert!(retired["delivery"]["last_outcome"].to_string().contains("task_revision_changed"),"{retired}");
+    // The replacement is bound to the new revision and ran once under its own key to an accepted verdict.
+    let (new,delivery)=replaced().unwrap();
+    assert_eq!(new.expected_revision,revision+1);assert_eq!(new.payload["submission_id"],submission_id.as_str());assert_eq!(delivery.attempts,1);
+    let (key,state,reason):(String,String,Option<String>)=f.db().query_row("SELECT idempotency_key,state,reason FROM verification_runs WHERE submission_id=?1",[&submission_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+    assert_eq!((key.as_str(),state.as_str(),reason),(new.id.as_str(),"accepted",None));
+    // Nothing further is enqueued or retired on a later turn.
+    turn();
+    assert_eq!(f.jobs().len(),2);
+    assert_eq!(f.db().query_row("SELECT count(*) FROM verification_runs",[],|row|row.get::<_,u64>(0)).unwrap(),1);
+    // An integration job fenced on a revision that later moves is replaced the same way.
+    f.git(&["branch","integration",&f.base]);
+    let configured=hp(f.home.path(),&["--root",f.r(),"result","demo","configure-integration","--repository",f.repo.to_str().unwrap(),"--reference","refs/heads/integration"]);
+    assert!(configured.status.success(),"{}",String::from_utf8_lossy(&configured.stderr));
+    let head=herdr_projects::runtime::snapshot(&f.project).unwrap().head.to_string();
+    assert!(hp(f.home.path(),&["--root",f.r(),"result","demo","auto","--integrate","on","--expected-head",&head]).status.success());
+    let integrations=||{let snapshot=herdr_projects::runtime::snapshot(&f.project).unwrap();snapshot.operations.into_iter().filter(|op|op.kind=="integration.run")
+        .map(|op|{let d=snapshot.deliveries.iter().find(|d|d.operation==op.id).unwrap().clone();(op,d)}).collect::<Vec<_>>()};
+    turn();
+    let found=integrations();assert_eq!(found.len(),1);let (old,delivery)=found[0].clone();
+    assert_eq!((old.expected_revision,delivery.state,delivery.attempts),(revision+1,DeliveryState::Pending,0));
+    let head=herdr_projects::runtime::snapshot(&f.project).unwrap().head.to_string();
+    let out=hp(f.home.path(),&["--root",f.r(),"task","demo","rename","task","--title","again","--expected-revision",&(revision+1).to_string(),"--expected-head",&head]);
+    assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let replaced=||integrations().into_iter().find(|(op,_)|op.id!=old.id);
+    let mut child=f.spawn();f.wait(&mut child,90,&||replaced().is_some_and(|(_,d)|d.state==DeliveryState::Confirmed));f.stop(&mut child);
+    let (new,_)=replaced().unwrap();assert_eq!(new.expected_revision,revision+2);
+    let listed:serde_json::Value=serde_json::from_slice(&hp(f.home.path(),&["--root",f.r(),"result","demo","jobs"]).stdout).unwrap();
+    let retired=listed.as_array().unwrap().iter().find(|job|job["operation"]==old.id.as_str()).unwrap();
+    assert_eq!((retired["delivery"]["state"].as_str(),retired["delivery"]["attempts"].as_u64()),(Some("permanent_failure"),Some(0)));
+    assert!(retired["delivery"]["last_outcome"].to_string().contains("task_revision_changed"),"{retired}");
+    assert_eq!(f.db().query_row("SELECT count(*) FROM integrated_commits",[],|row|row.get::<_,u64>(0)).unwrap(),1);
+}
+
+#[cfg(all(feature="state-store",target_os="linux"))]
+#[test]
 fn ticker_auto_verifies_once_and_recovers_after_kill() {
     use std::{io::{Read,Write},sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering}}};
     use herdr_projects::{migration,runtime,operations::DeliveryState};

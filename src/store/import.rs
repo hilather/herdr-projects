@@ -75,6 +75,7 @@ impl SqliteStore {
         if version<=43 {tx.execute_batch(include_str!("../../migrations/0044_result_automation.sql"))?;}
         if version<=44 {tx.execute_batch(include_str!("../../migrations/0045_result_integration.sql"))?;}
         if version<=45 {tx.execute_batch(include_str!("../../migrations/0046_integration_policy_checks.sql"))?;}
+        if version<=46 {tx.execute_batch(include_str!("../../migrations/0047_result_job_revisions.sql"))?;}
         tx.commit()?;
         Ok(())
     }
