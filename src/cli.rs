@@ -706,6 +706,8 @@ enum ResultCommand {
     Jobs,
     /// Return a permanently failed verification job to pending under the same run key
     RetryVerification { operation:String, #[arg(long)] expected_revision:u64 },
+    /// Return a permanently failed integration job to pending under the same key, after resolving its cause; the next run rechecks the target
+    RetryIntegration { operation:String, #[arg(long)] expected_revision:u64 },
 }
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
@@ -1205,6 +1207,7 @@ pub fn run() -> Result<()> {
                 ResultCommand::Auto{verify,integrate,expected_head}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::set_project_result_automation(&dir,expected_head,verify.map(|v|v=="on"),integrate.map(|v|v=="on"))?)?),
                 ResultCommand::Jobs=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::project_verification_jobs(&dir)?)?),
                 ResultCommand::RetryVerification{operation,expected_revision}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::reset_project_verification_job(&dir,&operation,expected_revision)?)?),
+                ResultCommand::RetryIntegration{operation,expected_revision}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::reset_project_integration_job(&dir,&operation,expected_revision)?)?),
             }
             Ok(())
         },

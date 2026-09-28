@@ -62,6 +62,14 @@ pub struct IntegrateOutcome {
     pub state: String,
     pub commit_oid: Option<String>,
     pub reason: Option<String>,
+    /// Acceptance policies rechecked on the candidate, by id, with their verdicts.
+    pub policies: Vec<PolicyCheck>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct PolicyCheck {
+    pub policy_id: String,
+    pub passed: bool,
 }
 
 fn payload_digest(key: &str, result_id: &str, repository: &str, reference: &str) -> String {
@@ -77,6 +85,7 @@ fn outcome_of(view: &IntegrationView) -> IntegrateOutcome {
         state: view.state.clone(),
         commit_oid: view.commit_oid.clone(),
         reason: view.reason.clone(),
+        policies: Vec::new(),
     }
 }
 
@@ -178,6 +187,21 @@ pub fn observe_job(store: &mut SqliteStore, repository: &PathBuf, key: &str) -> 
 }
 
 fn integrate_at(store: &mut SqliteStore, request: &IntegrateRequest, expected_base: Option<&str>) -> Result<IntegrateOutcome> {
+    let outcome = integrate_unlisted(store, request, expected_base)?;
+    with_policies(store, outcome)
+}
+
+/// Attach the stored per-policy verdicts of the operation's candidate.
+fn with_policies(store: &mut SqliteStore, mut outcome: IntegrateOutcome) -> Result<IntegrateOutcome> {
+    outcome.policies = store
+        .integration_policy_checks(&outcome.operation_id)?
+        .into_iter()
+        .map(|(policy_id, passed)| PolicyCheck { policy_id, passed })
+        .collect();
+    Ok(outcome)
+}
+
+fn integrate_unlisted(store: &mut SqliteStore, request: &IntegrateRequest, expected_base: Option<&str>) -> Result<IntegrateOutcome> {
     let repo = GitRepo::open(&request.repository)?;
     let Some(reference) = store.integration_ref(&repo.identity)? else {
         bail!("integration ref is not configured");
@@ -252,7 +276,8 @@ pub fn reconcile_integration(
         fault: Fault::None,
     };
     // Reconcile never builds another merge. It only classifies the ref we already named.
-    resume(store, &repo, &request, view, true)
+    let outcome = resume(store, &repo, &request, view, true)?;
+    with_policies(store, outcome)
 }
 
 fn resume(
@@ -414,7 +439,7 @@ fn drive_new(
         let view = store.load_integration_operation(claim.operation.as_str())?;
         return Ok(outcome_of(&view));
     }
-    if !checks_pass(&request.work_dir, &checkout, verified, &oid, &tree)? {
+    if !policies_pass(store, &claim, &request.work_dir, &checkout, verified, &oid, &tree)? {
         return finish(
             store,
             claim.operation.as_str(),
@@ -478,7 +503,7 @@ fn resume_incomplete(
     let verified = store.load_verified_for_integration(&view.verified_result_id)?;
     // Checkout failure leaves candidate_prepared. Only a missing object discards it.
     let checkout = repo.checkout_candidate(&request.work_dir, &oid)?;
-    if !checks_pass(&request.work_dir, &checkout, &verified, &oid, &tree)? {
+    if !policies_pass(store, &claim, &request.work_dir, &checkout, &verified, &oid, &tree)? {
         return finish(
             store,
             claim.operation.as_str(),
@@ -695,14 +720,44 @@ fn finish(
     finish_flexible(store, &view, claim, kind)
 }
 
-fn checks_pass(
-    work: &std::path::Path,
-    checkout: &std::path::Path,
+/// Every acceptance policy of the contract revision runs on the candidate, in
+/// id order, within one 30 s budget; the first failure stops the check. Each
+/// verdict is recorded under the claim.
+fn policies_pass(
+    store: &mut SqliteStore,
+    claim: &Claim,
+    work: &Path,
+    checkout: &Path,
     verified: &VerifiedIntegration,
     commit: &str,
     tree: &str,
 ) -> Result<bool> {
-    let checks = match parse_checks(verified.policy_body.as_bytes()) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut checks = Vec::new();
+    let mut all = !verified.policies.is_empty();
+    for (index, (policy_id, body)) in verified.policies.iter().enumerate() {
+        let timeout = deadline.saturating_duration_since(std::time::Instant::now());
+        let passed = timeout >= Duration::from_secs(1) && check_passes(work, checkout, index, body, timeout, commit, tree)?;
+        checks.push((policy_id.clone(), format!("{:x}", Sha256::digest(body.as_bytes())), passed));
+        if !passed {
+            all = false;
+            break;
+        }
+    }
+    store.record_policy_checks(claim, &checks, now_ms())?;
+    Ok(all)
+}
+
+fn check_passes(
+    work: &Path,
+    checkout: &Path,
+    index: usize,
+    body: &str,
+    timeout: Duration,
+    commit: &str,
+    tree: &str,
+) -> Result<bool> {
+    let checks = match parse_checks(body.as_bytes()) {
         Ok(checks) => checks,
         Err(_) => return Ok(false),
     };
@@ -710,16 +765,16 @@ fn checks_pass(
     if !verification::unshare_ready(&unshare) {
         return Ok(false);
     }
-    let policy_path = work.join("integration-policy.json");
-    std::fs::write(&policy_path, verified.policy_body.as_bytes()).context("policy file")?;
-    let policy_digest = format!("{:x}", Sha256::digest(verified.policy_body.as_bytes()));
+    let policy_path = work.join(format!("integration-policy-{index}.json"));
+    std::fs::write(&policy_path, body.as_bytes()).context("policy file")?;
+    let policy_digest = format!("{:x}", Sha256::digest(body.as_bytes()));
     // The child copies the candidate checkout into its tmpfs. Do not point it at the host branch.
     let launch = supervise::launch(&supervise::Spec {
         unshare_program: unshare,
-        timeout: Duration::from_secs(30),
+        timeout,
         checkout: checkout.to_path_buf(),
         policy: policy_path,
-        scratch: work.join("ns-root"),
+        scratch: work.join(format!("ns-root-{index}")),
         checks,
         commit: commit.to_string(),
         tree: tree.to_string(),

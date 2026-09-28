@@ -74,6 +74,7 @@ impl SqliteStore {
         if version<=42 {tx.execute_batch(include_str!("../../migrations/0043_admission_indexes.sql"))?;super::routines::backfill_overlap(&tx)?;}
         if version<=43 {tx.execute_batch(include_str!("../../migrations/0044_result_automation.sql"))?;}
         if version<=44 {tx.execute_batch(include_str!("../../migrations/0045_result_integration.sql"))?;}
+        if version<=45 {tx.execute_batch(include_str!("../../migrations/0046_integration_policy_checks.sql"))?;}
         tx.commit()?;
         Ok(())
     }

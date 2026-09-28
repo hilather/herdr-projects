@@ -29,11 +29,15 @@ pub fn request(path:&Path,operation:&Operation,revision:u64,mode:Mode)->Result<R
     Ok(Request{identity:Identity{operation:format!("canonical-integration-{kind}:{}",operation.id.as_str()),revision,project:input.project.display().to_string(),machine:"local-integrator".into(),terminal:None},lane:Lane::Transfer,deadline,command})
 }
 
+const RETRY:&str="once resolved, retry with `result <slug> retry-integration <operation> --expected-revision <revision>`";
 /// Terminal states end the job; anything else resumes under the same key.
 fn classify(outcome:IntegrateOutcome)->Outcome {
     match outcome.state.as_str() {
         "integrated"=>Outcome::Confirmed{observed_identity:outcome.operation_id},
-        "blocked"|"discarded"|"reconciliation_required"=>Outcome::PermanentFailure{diagnostic:format!("integration {}: {}; blocked for an operator or replan",outcome.state,outcome.reason.as_deref().unwrap_or("no reason"))},
+        "blocked"|"discarded"|"reconciliation_required"=>{
+            let failed=outcome.policies.iter().filter(|check|!check.passed).map(|check|format!(" (policy {} failed on the integrated candidate)",check.policy_id)).collect::<String>();
+            Outcome::PermanentFailure{diagnostic:format!("integration {}: {}{failed}; blocked for an operator or replan; {RETRY}",outcome.state,outcome.reason.as_deref().unwrap_or("no reason"))}
+        },
         state=>Outcome::Retryable{no_effect_evidence:format!("integration {state} under the job key; the ref was not moved; resume with the same key")},
     }
 }
@@ -67,7 +71,7 @@ impl PreparedDelivery for Prepared<'_> {
             Ok(outcome)=>classify(outcome),
             Err(error)=>match error.downcast_ref::<Refused>() {
                 Some(Refused::CheckedOut)=>Outcome::Retryable{no_effect_evidence:format!("{error}: the target is checked out in a user worktree; nothing was published")},
-                Some(refused@Refused::TargetMoved{..})=>Outcome::PermanentFailure{diagnostic:refused.to_string()},
+                Some(refused@Refused::TargetMoved{..})=>Outcome::PermanentFailure{diagnostic:format!("{refused}; {RETRY}")},
                 None=>Outcome::Ambiguous{observation_required:format!("integration stopped: {}; reconcile by key before any new effect",format!("{error:#}").chars().take(2048).collect::<String>())},
             },
         })

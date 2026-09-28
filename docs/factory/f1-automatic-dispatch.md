@@ -137,8 +137,11 @@ Recorded here rather than folded into the card that found them.
   it, and that marks the task cancelled, so its dependents report
   `predecessor_failed`. A verified or integrated result should let the attempt
   end without failing the task.
-- **Integration rechecks one policy** (F1.7): the candidate check runs only the
-  first accepted policy by id, not every policy of the contract.
+- **Integration rechecks one policy** (F1.7): done (this PR). The candidate
+  check runs every acceptance policy of the contract revision, in id order
+  within one 30 s budget, and publishes only if all pass. Each verdict is
+  recorded in `integration_policy_checks` (migration 0046) and returned as
+  `policies`; a failing policy is named in the job diagnostic.
 - **Codex cannot commit under `workspace-write`** (F1.7): its sandbox makes Git
   metadata read-only, including a linked worktree's gitdir. Decide the worker
   sandbox and who commits.
@@ -182,10 +185,19 @@ Recorded here rather than folded into the card that found them.
   store transactions.
 - **No E2E for the isolation-unavailable pause** (`verification.paused`); it
   cannot be simulated from outside without a hook in the shipped binary.
-- **Integration job follow-ups (card 3):** there is no retry command for integration jobs, so a stale block holds the ref until an operator runs `result integrate`; jobs advance only on the 15 s ticker cadence.
+- **Integration job follow-ups (card 3):** retry command done (this PR):
+  `hp result <slug> retry-integration <op> --expected-revision N` returns a
+  permanently failed integration job to pending under the same key and records
+  `integration.job_reset`; the next run rechecks the target, so a still-moved
+  ref blocks again untouched. `result jobs` shows the reason and retry hint.
+  Still open: jobs advance only on the 15 s ticker cadence.
 - **Naming recovery with no recorded intent loops.** If a start claim expires
   before the `runtime.launch_name` intent is recorded, recovery has no
   authority to rename and retries without end. Bound it and surface the
   attempt for operator reconciliation.
+- **Integration policy rechecks share one 30 s budget.** Since every acceptance
+  policy is rechecked on the candidate, several slow policies can exhaust the
+  shared budget and block the job. Give each policy its own bounded budget
+  within the claim lease, or lengthen the lease with the policy count.
 - **Replace-verdict tests** (352 in `docs/reviews/2026-09-27-test-audit.tsv`):
   convert to E2E alongside feature work, starting with `store/barriers.rs`.

@@ -2174,8 +2174,13 @@ fn ticker_auto_integrates_two_results_serially_and_recovers_stale_and_crash() {
     let pending=||f.db().query_row("SELECT count(*) FROM pending_integration_work",[],|row|row.get::<_,u64>(0)).unwrap();assert_eq!(pending(),0);
     // The target moves outside the controller between verification and integration.
     auto(&["--integrate","off"]);
-    let c3=candidate("three");let three=f.submit_at("three",&clean,&c3);
-    let verified=||f.jobs().iter().any(|(op,d)|op.payload["submission_id"]==three.as_str()&&d.state==DeliveryState::Confirmed);
+    // Every policy of a contract is rechecked on the integrated candidate; each
+    // of these passes alone and fails only once the other result is combined.
+    let empty=f.git(&["hash-object","-t","tree","/dev/null"]);
+    let absent=|id:&str,path:&str|(id.to_owned(),format!(r#"{{"version":1,"checks":["/usr/bin/git","diff","--quiet","{empty}","HEAD","--","{path}"]}}"#));
+    let (no_four,no_three)=(absent("no-four","src/four.txt"),absent("no-three","src/three.txt"));
+    let c3=candidate("three");let three=f.submit_at("three",&[(clean[0].0,clean[0].1.clone()),(no_four.0.as_str(),no_four.1.clone())],&c3);
+    let verified=||{let runs=f.jobs().into_iter().filter(|(op,_)|op.payload["submission_id"]==three.as_str()).collect::<Vec<_>>();runs.len()==2&&runs.iter().all(|(_,d)|d.state==DeliveryState::Confirmed)};
     let mut child=f.spawn();f.wait(&mut child,90,&verified);f.stop(&mut child);
     assert!(job(&three).is_none());
     let moved=f.git(&["commit-tree",&format!("{second}^{{tree}}"),"-p",&second,"-m","outside the controller"]);
@@ -2194,6 +2199,35 @@ fn ticker_auto_integrates_two_results_serially_and_recovers_stale_and_crash() {
     assert_eq!(tip(),moved,"the moved ref is not overwritten");assert_eq!(integrated(),2);
     assert_eq!(f.db().query_row("SELECT count(*) FROM integration_operations",[],|row|row.get::<_,u64>(0)).unwrap(),2,"nothing is rebuilt");
     assert_eq!(pending(),0);
+    // Operator retry: only a permanently failed integration job, at its revision.
+    assert!(listed.contains("retry-integration"),"{listed}");
+    let retry=|submission:&str,revision:u64|{let (op,_)=job(submission).unwrap();hp(f.home.path(),&["--root",f.r(),"result","demo","retry-integration",op.id.as_str(),"--expected-revision",&revision.to_string()])};
+    let revision=|submission:&str|job(submission).unwrap().1.revision;
+    assert!(!retry(&one,revision(&one)).status.success(),"a confirmed job is not retried");
+    assert!(!retry(&three,revision(&three)+1).status.success(),"a stale revision is refused");
+    // Retried before the cause is resolved, staleness is rechecked: the moved ref is not overwritten.
+    let out=retry(&three,revision(&three));assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    assert_eq!(job(&three).unwrap().1.state,DeliveryState::Pending);
+    let mut child=f.spawn();f.wait(&mut child,90,&||job(&three).is_some_and(|(_,d)|d.state==DeliveryState::PermanentFailure));f.stop(&mut child);
+    assert_eq!(tip(),moved);assert_eq!(integrated(),2);
+    // The operator resets the target; the retried job publishes under the same key.
+    f.git(&["update-ref",TARGET,&second,&moved]);
+    let out=retry(&three,revision(&three));assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let mut child=f.spawn();f.wait(&mut child,90,&||job(&three).is_some_and(|(_,d)|d.state==DeliveryState::Confirmed));f.stop(&mut child);
+    let third=tip();assert_eq!(integrated(),3);assert_eq!(f.git(&["rev-parse",&format!("{third}^1")]),second);
+    // The receipt lists every policy that ran on the integrated candidate.
+    let checks=|submission:&str|{let (op,_)=job(submission).unwrap();f.db().prepare("SELECT p.policy_id,p.passed FROM integration_policy_checks p JOIN integration_operations o ON o.operation_id=p.operation_id WHERE o.idempotency_key=?1 ORDER BY p.policy_id")
+        .unwrap().query_map([op.id.as_str()],|row|Ok((row.get::<_,String>(0)?,row.get::<_,bool>(1)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()};
+    assert_eq!(checks(&three),[("clean".to_owned(),true),("no-four".to_owned(),true)]);
+    assert_eq!(f.db().query_row("SELECT count(*) FROM integrated_commits i JOIN integration_policy_checks p ON p.operation_id=i.operation_id WHERE i.commit_oid=?1 AND p.passed=1",[&third],|row|row.get::<_,u64>(0)).unwrap(),2);
+    // `four` passes both policies alone; combined with `three`, its second policy fails.
+    let c4=candidate("four");let four=f.submit_at("four",&[(clean[0].0,clean[0].1.clone()),(no_three.0.as_str(),no_three.1.clone())],&c4);
+    let mut child=f.spawn();f.wait(&mut child,150,&||job(&four).is_some_and(|(_,d)|d.state==DeliveryState::PermanentFailure));f.stop(&mut child);
+    assert!(f.jobs().iter().filter(|(op,_)|op.payload["submission_id"]==four.as_str()).all(|(_,d)|d.state==DeliveryState::Confirmed),"both policies pass alone");
+    let Some(Outcome::PermanentFailure{diagnostic})=job(&four).unwrap().1.last_outcome else {panic!("combined check fails")};
+    assert!(diagnostic.contains("checks_failed")&&diagnostic.contains("no-three"),"{diagnostic}");
+    assert_eq!(checks(&four),[("clean".to_owned(),true),("no-three".to_owned(),false)]);
+    assert_eq!(tip(),third,"nothing is published");assert_eq!(integrated(),3);
 }
 
 #[cfg(all(feature="state-store",target_os="linux"))]

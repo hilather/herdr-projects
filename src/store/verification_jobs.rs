@@ -23,7 +23,7 @@ pub(super) fn has_run(db: &Connection, id: &OperationId, run_id: &str) -> Result
         params![id.as_str(), run_id], |row| row.get(0))?)
 }
 /// The pause reason stands until the job is next claimed, finished or reset.
-const LATEST: &str = "SELECT kind,payload FROM events WHERE entity=?1 AND kind IN ('verification.paused','integration.paused','verification.job_reset','operation.claimed','operation.outcome') ORDER BY sequence DESC LIMIT 1";
+const LATEST: &str = "SELECT kind,payload FROM events WHERE entity=?1 AND kind IN ('verification.paused','integration.paused','verification.job_reset','integration.job_reset','operation.claimed','operation.outcome') ORDER BY sequence DESC LIMIT 1";
 fn paused(db: &Connection, id: &OperationId) -> Result<Option<String>> {
     let latest: Option<(String, String)> = db.query_row(LATEST, [id.as_str()], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
     Ok(latest.filter(|(kind, _)| kind.ends_with(".paused"))
@@ -152,15 +152,26 @@ impl SqliteStore {
     /// the same run key) returns to pending. Claim history is kept, so the
     /// generic 32-claim bound still applies; an exhausted job is refused.
     pub fn reset_verification_job(&mut self, id: &OperationId, expected_revision: u64, now: i64) -> Result<crate::operations::Delivery> {
+        self.reset_result_job(id, "verification", expected_revision, now)
+    }
+    /// The same for an integration job. The next run rechecks the target from
+    /// scratch, so a target that is still moved blocks again untouched.
+    pub fn reset_integration_job(&mut self, id: &OperationId, expected_revision: u64, now: i64) -> Result<crate::operations::Delivery> {
+        self.reset_result_job(id, "integration", expected_revision, now)
+    }
+    fn reset_result_job(&mut self, id: &OperationId, lane: &str, expected_revision: u64, now: i64) -> Result<crate::operations::Delivery> {
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;check_schema(&tx)?;
         let kind: String = tx.query_row("SELECT kind FROM operations WHERE id=?1", [id.as_str()], |row| row.get(0))?;
         let old = super::delivery::delivery(&tx, id)?;
-        if kind != "verification.run" || old.revision != expected_revision || old.state != crate::operations::DeliveryState::PermanentFailure { return Err(StoreError::Conflict); }
-        if old.attempts >= 32 { return Err(StoreError::Invalid("claim history is exhausted; verify this policy manually with `result verify`".into())); }
+        if kind != format!("{lane}.run") || old.revision != expected_revision || old.state != crate::operations::DeliveryState::PermanentFailure { return Err(StoreError::Conflict); }
+        if old.attempts >= 32 {
+            let manual = if lane == "integration" { "integrate this result manually with `result integrate`" } else { "verify this policy manually with `result verify`" };
+            return Err(StoreError::Invalid(format!("claim history is exhausted; {manual}")));
+        }
         let revision = old.revision.checked_add(1).ok_or(StoreError::Conflict)?;
         tx.execute("UPDATE operation_delivery SET revision=?2,state='pending',owner=NULL,lease_until_ms=NULL,next_due_ms=?3 WHERE operation_id=?1", params![id.as_str(), integer(revision)?, now])?;
-        tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('verification.job_reset',?1,?2,1,?3)",
-            params![id.as_str(), integer(revision)?, serde_json::json!({"attempts":old.attempts,"previous":old.last_outcome}).to_string()])?;
+        tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?4,?1,?2,1,?3)",
+            params![id.as_str(), integer(revision)?, serde_json::json!({"attempts":old.attempts,"previous":old.last_outcome}).to_string(), format!("{lane}.job_reset")])?;
         let delivery = super::delivery::delivery(&tx, id)?;
         tx.commit()?;Ok(delivery)
     }
@@ -183,4 +194,9 @@ pub fn reset_project_verification_job(project: &Path, id: &str, expected_revisio
     let _guard = crate::migration::runtime_mutation(project)?;
     let id = OperationId::new(id.to_owned()).map_err(anyhow::Error::msg)?;
     Ok(crate::migration::open_active(project)?.reset_verification_job(&id, expected_revision, jiff::Timestamp::now().as_millisecond())?)
+}
+pub fn reset_project_integration_job(project: &Path, id: &str, expected_revision: u64) -> anyhow::Result<crate::operations::Delivery> {
+    let _guard = crate::migration::runtime_mutation(project)?;
+    let id = OperationId::new(id.to_owned()).map_err(anyhow::Error::msg)?;
+    Ok(crate::migration::open_active(project)?.reset_integration_job(&id, expected_revision, jiff::Timestamp::now().as_millisecond())?)
 }

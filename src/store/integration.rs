@@ -58,7 +58,8 @@ pub(crate) struct VerifiedIntegration {
     pub repository: String,
     pub task_id: String,
     pub task_revision: i64,
-    pub policy_body: String,
+    /// Every acceptance policy of the contract revision, by id: (id, body).
+    pub policies: Vec<(String, String)>,
     pub route: String,
 }
 
@@ -304,7 +305,7 @@ impl SqliteStore {
             repository,
             task_id,
             _policy_id,
-            _contract_revision,
+            contract_revision,
             policy_body,
             route,
             task_revision,
@@ -320,6 +321,10 @@ impl SqliteStore {
             return Err(StoreError::Corrupt("acceptance policy digest mismatch".into()));
         }
         super::contract_binding::require_verified_result_barrier(&tx, &result_id, jiff::Timestamp::now().as_millisecond())?;
+        let policies = tx
+            .prepare("SELECT policy_id, body FROM acceptance_policies WHERE task_id=?1 AND contract_revision=?2 ORDER BY policy_id")?
+            .query_map(params![task_id, contract_revision], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
         tx.commit()?;
         Ok(VerifiedIntegration {
             result_id,
@@ -328,7 +333,7 @@ impl SqliteStore {
             repository,
             task_id,
             task_revision,
-            policy_body,
+            policies,
             route,
         })
     }
@@ -515,6 +520,39 @@ impl SqliteStore {
         }
         tx.commit()?;
         Ok(candidate_id)
+    }
+
+    /// One row per acceptance policy rechecked on the candidate, under the live claim.
+    pub(crate) fn record_policy_checks(&mut self, claim: &Claim, checks: &[(String, String, bool)], now: i64) -> Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        schema28(&tx)?;
+        claim_held(&tx, claim, now)?;
+        let version: u32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version >= 46 {
+            for (policy_id, digest, passed) in checks {
+                tx.execute(
+                    "INSERT OR REPLACE INTO integration_policy_checks(operation_id,policy_id,policy_digest,passed) VALUES(?1,?2,?3,?4)",
+                    params![claim.operation.as_str(), policy_id, digest, passed],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The policies rechecked on an operation's candidate, by id, with their verdicts.
+    pub(crate) fn integration_policy_checks(&mut self, operation_id: &str) -> Result<Vec<(String, bool)>> {
+        let version: u32 = self.connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version < 46 {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .connection
+            .prepare("SELECT policy_id, passed FROM integration_policy_checks WHERE operation_id=?1 ORDER BY policy_id")?
+            .query_map([operation_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub(crate) fn mark_checks_passed(&mut self, claim: &Claim, now: i64) -> Result<()> {
