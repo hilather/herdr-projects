@@ -7,7 +7,13 @@ use serde_json::{Value, json};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-const MIGRATIONS: &[&str] = &[include_str!("../../migrations/telemetry/0001_codex_usage.sql")];
+const MIGRATIONS: &[&str] = &[include_str!("../../migrations/telemetry/0001_codex_usage.sql"), include_str!("../../migrations/telemetry/0002_reevaluation.sql")];
+
+/// Whether a sidecar read without migrating has the 0002 `reevaluation` column.
+fn reevaluation_column(db: &Connection) -> rusqlite::Result<&'static str> {
+    let present: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('rollout_sources') WHERE name='reevaluation')", [], |r| r.get(0))?;
+    Ok(if present { "s.reevaluation" } else { "NULL" })
+}
 
 pub fn path(project: &Path) -> PathBuf {
     project.join(".state").join("telemetry.db")
@@ -68,17 +74,18 @@ pub fn report(project: &Path) -> Result<Value> {
         return Ok(json!({"attempts": attempts.collect::<Vec<_>>(), "sessions": []}));
     };
     let mut sessions = Vec::new();
-    let mut stmt = db.prepare("SELECT s.session_id,s.binding,s.attempt_id,s.cli_version,s.records,s.cwd,s.originator,s.source,
+    let mut stmt = db.prepare(&format!("SELECT s.session_id,s.binding,s.attempt_id,s.cli_version,s.records,s.cwd,s.originator,s.source,
         (SELECT count(*) FROM codex_usage u WHERE u.session_id=s.session_id AND u.accepted=1),
-        EXISTS(SELECT 1 FROM codex_quarantine q WHERE q.session_id=s.session_id)
-        FROM rollout_sources s ORDER BY s.session_id,s.path_digest")?;
+        EXISTS(SELECT 1 FROM codex_quarantine q WHERE q.session_id=s.session_id),{}
+        FROM rollout_sources s ORDER BY s.session_id,s.path_digest", reevaluation_column(&db)?))?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, String>(3)?,
-        r.get::<_, i64>(4)?, r.get::<_, String>(5)?, r.get::<_, Option<String>>(6)?, r.get::<_, Option<String>>(7)?, r.get::<_, i64>(8)?, r.get::<_, bool>(9)?)))?;
+        r.get::<_, i64>(4)?, r.get::<_, String>(5)?, r.get::<_, Option<String>>(6)?, r.get::<_, Option<String>>(7)?, r.get::<_, i64>(8)?, r.get::<_, bool>(9)?,
+        r.get::<_, Option<String>>(10)?)))?;
     for row in rows {
-        let (session, binding, attempt, version, records, cwd, originator, source, accepted, quarantined) = row?;
+        let (session, binding, attempt, version, records, cwd, originator, source, accepted, quarantined, reevaluation) = row?;
         sessions.push(json!({"session_id": session, "binding": binding, "attempt_id": attempt, "cli_version": version,
             "certified": super::codex::certified(&version), "records": records, "accepted": accepted, "quarantined": quarantined,
-            "cwd": cwd, "originator": originator, "source": source}));
+            "cwd": cwd, "originator": originator, "source": source, "reevaluation": reevaluation}));
     }
     let mut out = Vec::new();
     for attempt in &attempts {
@@ -89,13 +96,14 @@ pub fn report(project: &Path) -> Result<Value> {
 }
 
 pub(super) fn attempt_usage(db: &Connection, attempt: &str) -> Result<Value> {
-    // Records collected before their version was certified keep NULL counters,
-    // so the session stays uncertified rather than summing to 0.
-    let bound: Vec<(String, String, bool)> = db.prepare("SELECT DISTINCT session_id,
+    // Records collected before their version was certified keep NULL counters
+    // until a collect re-reads their rollout, so the session stays uncertified
+    // rather than summing to 0; `detail` says when that rollout is gone.
+    let bound: Vec<(String, String, bool, Option<String>)> = db.prepare(&format!("SELECT DISTINCT session_id,
         CASE WHEN EXISTS(SELECT 1 FROM codex_usage u WHERE u.session_id=s.session_id AND u.reason='cli_version_uncertified') THEN '' ELSE cli_version END,
-        EXISTS(SELECT 1 FROM codex_quarantine q WHERE q.session_id=s.session_id)
-        FROM rollout_sources s WHERE binding='bound' AND attempt_id=?1")?
-        .query_map([attempt], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+        EXISTS(SELECT 1 FROM codex_quarantine q WHERE q.session_id=s.session_id),{}
+        FROM rollout_sources s WHERE binding='bound' AND attempt_id=?1", reevaluation_column(db)?))?
+        .query_map([attempt], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
     if bound.is_empty() {
         return Ok(unavailable("not_bound"));
     }
@@ -103,7 +111,9 @@ pub(super) fn attempt_usage(db: &Connection, attempt: &str) -> Result<Value> {
         return Ok(unavailable("quarantined"));
     }
     if bound.iter().any(|s| !super::codex::certified(&s.1)) {
-        return Ok(unavailable("cli_version_uncertified"));
+        let mut usage = unavailable("cli_version_uncertified");
+        if let Some(detail) = bound.iter().filter(|s| !super::codex::certified(&s.1)).find_map(|s| s.3.clone()) { usage["detail"] = json!(detail); }
+        return Ok(usage);
     }
     let mut sums = [0i64; 6];
     let mut records = 0;

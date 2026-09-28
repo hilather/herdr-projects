@@ -227,22 +227,62 @@ fn uncertified_version_keeps_no_counters() {
     assert_eq!(report["sessions"][0]["certified"], false);
 }
 
+impl Fixture {
+    /// Rewrite the sidecar as a binary that did not yet certify the version
+    /// stored it (`uncertified_version_keeps_no_counters`): NULL counters, no
+    /// reported totals, no discrepancies.
+    fn as_if_collected_uncertified(&self) {
+        self.sidecar().execute_batch("UPDATE codex_usage SET accepted=0,reason='cli_version_uncertified',cache_write_input_tokens=NULL,
+            cached_input_tokens=NULL,input_tokens=NULL,output_tokens=NULL,reasoning_output_tokens=NULL,total_tokens=NULL;
+            UPDATE rollout_sources SET thread_usage=NULL,token_count_usage=NULL; DELETE FROM codex_discrepancy;").unwrap();
+    }
+}
+
 /// Found by the 0.154.0 live run: rows collected while the version was still
-/// uncertified keep NULL counters; certifying it later must not turn them into 0.
+/// uncertified are re-read from their rollout once it is certified, without
+/// double counting; until then they are unavailable, never 0.
 #[test]
-fn records_collected_before_certification_stay_unavailable() {
+fn records_collected_before_certification_are_reread() {
     let f = Fixture::new();
     f.rollout(&f.home, SID, &["head.jsonl", "tail.jsonl"], &f.worktree(), f.decided + 1_000, "0.154.0");
     f.cli("collect");
-    // The rows exactly as an uncertified collect stored them (`uncertified_version_keeps_no_counters`).
-    f.sidecar().execute("UPDATE codex_usage SET accepted=0,reason='cli_version_uncertified',cache_write_input_tokens=NULL,cached_input_tokens=NULL,
-        input_tokens=NULL,output_tokens=NULL,reasoning_output_tokens=NULL,total_tokens=NULL", []).unwrap();
+    f.as_if_collected_uncertified();
+    assert_eq!(attempt_usage(&f.cli("usage").0), unavailable("cli_version_uncertified"), "a read re-reads nothing");
     let (report, _) = f.cli("collect");
-    assert_eq!(report["collected"]["records"], 0, "nothing is re-read past the offset");
-    assert_eq!(attempt_usage(&report), unavailable("cli_version_uncertified"));
-    assert_eq!(attempt_usage(&f.cli("usage").0), unavailable("cli_version_uncertified"));
-    let metrics = f.report();
-    assert_eq!(metric(&metrics, "M08")["value"], unavailable("no_certified_source"));
+    assert_eq!((&report["collected"]["records"], &report["collected"]["reevaluated"]), (&0.into(), &2.into()));
+    // 1000 + 500 input, 400 + 100 cached, 120 + 60 output, 80 + 20 reasoning, 1120 + 560 total.
+    let sums = serde_json::json!({"input_tokens": 1500, "cached_input_tokens": 500, "cache_write_input_tokens": 0,
+        "output_tokens": 180, "reasoning_output_tokens": 100, "total_tokens": 1680, "records": 2});
+    assert_eq!(attempt_usage(&report), sums);
+    let rows = [(1, DIGEST_1.into(), 1, None, Some(1000), Some(400), Some(120), Some(80), Some(1120)),
+        (2, DIGEST_2.into(), 1, None, Some(500), Some(100), Some(60), Some(20), Some(560))];
+    assert_eq!(f.usage(), rows);
+    assert_eq!(f.sidecar().query_row("SELECT kind,summed_total,reported_total FROM codex_discrepancy", [],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))).unwrap(), ("token_count_total".to_owned(), 1680, 900));
+    assert_eq!(f.binding(), ("bound".to_owned(), Some(f.attempt.clone())));
+    assert_eq!(metric(&f.report(), "M08")["value"], 1500);
+    let (again, _) = f.cli("collect");
+    assert_eq!((&again["collected"]["records"], &again["collected"]["reevaluated"]), (&0.into(), &0.into()));
+    assert_eq!(attempt_usage(&again), sums, "no double count");
+    assert_eq!(outcome_usage(&f), sums);
+    assert_eq!(f.usage(), rows);
+    assert_eq!((f.count("codex_usage"), f.count("codex_turns"), f.count("codex_rate_limits"), f.count("codex_quarantine")), (2, 2, 2, 0));
+}
+
+#[test]
+fn uncertified_records_without_their_rollout_stay_unavailable() {
+    let f = Fixture::new();
+    let path = f.rollout(&f.home, SID, &["head.jsonl", "tail.jsonl"], &f.worktree(), f.decided + 1_000, "0.154.0");
+    f.cli("collect");
+    f.as_if_collected_uncertified();
+    fs::remove_file(path).unwrap();
+    let (report, _) = f.cli("collect");
+    let expected = serde_json::json!({"status": "unavailable", "reason": "cli_version_uncertified", "detail": "rollout_unavailable"});
+    assert_eq!(attempt_usage(&report), expected);
+    assert_eq!(report["sessions"][0]["reevaluation"], "rollout_unavailable");
+    assert_eq!(outcome_usage(&f), expected);
+    assert_eq!(f.usage().iter().map(|r| (r.2, r.3.as_deref(), r.8)).collect::<Vec<_>>(), [(0, Some("cli_version_uncertified"), None); 2]);
+    assert_eq!(metric(&f.report(), "M08")["value"], unavailable("no_certified_source"));
 }
 
 #[test]

@@ -65,9 +65,10 @@ worktree path matched.
   in `usage` and in the S6 report (test
   `records_collected_before_certification_stay_unavailable`). Such rows are
   not re-read; a fresh sidecar (as done here) recovers the counters.
-  Upgrading them in place is a follow-up.
+  Upgrading them in place is a follow-up. (Later done: collect re-reads such
+  rollouts, `records_collected_before_certification_are_reread`.)
 - `telemetry attempts` still prints `usage: collection_not_run` for Codex
   attempts even with a sidecar: the outcome `usage` wiring (S5 card) is not
-  done. Follow-up.
+  done. Follow-up. (Later done: `attempts_show_bound_usage_or_its_reason`.)
 - A worker that never received its brief writes no rollout: attempt 3's B is
   `not_bound`, as expected.

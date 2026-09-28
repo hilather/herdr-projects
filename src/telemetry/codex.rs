@@ -38,6 +38,8 @@ pub struct Collected {
     pub files: u64,
     pub bytes: u64,
     pub records: u64,
+    /// Records stored while their version was uncertified, accepted on re-read.
+    pub reevaluated: u64,
     pub budget_exhausted: bool,
 }
 
@@ -109,22 +111,39 @@ pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Co
     let worktrees = format!("{}/.state/worktrees/", project.display());
     let mut done = Collected::default();
     let mut remaining = budget.bytes;
+    let reread = reread(&db)?;
+    let mut seen = std::collections::BTreeSet::new();
     for home in &homes {
         let mut files = Vec::new();
         walk(&Path::new(home).join(".codex/sessions"), 0, &mut files);
         files.sort();
+        seen.extend(files.iter().map(|file| digest(file.as_os_str().as_encoded_bytes())));
         for file in files {
             if remaining == 0 {
                 done.budget_exhausted = true;
                 break;
             }
-            let read = tail(&mut db, &file, &digest(home.as_bytes()), &worktrees, remaining, &mut done)?;
+            let read = tail(&mut db, &file, &digest(home.as_bytes()), &worktrees, remaining, &reread, &mut done)?;
             remaining -= read.min(remaining);
         }
     }
     done.budget_exhausted |= remaining == 0;
+    for key in reread.difference(&seen) {
+        db.execute("UPDATE rollout_sources SET reevaluation='rollout_unavailable' WHERE path_digest=?1", [key])?;
+    }
     bind(&db, &attempts)?;
     Ok(Some(done))
+}
+
+/// Sources whose version is now certified but that hold rows stored while it
+/// was not, at or before their offset: re-read from the start (contracts §5).
+/// Rows past the offset are reached by the ordinary tail, so a re-read that
+/// runs out of budget continues instead of starting over.
+fn reread(db: &Connection) -> Result<std::collections::BTreeSet<String>> {
+    let sources: Vec<(String, String)> = db.prepare("SELECT s.path_digest,s.cli_version FROM rollout_sources s JOIN collect_offsets o ON o.path_digest=s.path_digest
+        WHERE EXISTS(SELECT 1 FROM codex_usage u WHERE u.path_digest=s.path_digest AND u.reason='cli_version_uncertified' AND u.ordinal<=o.records)")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    Ok(sources.into_iter().filter(|(_, version)| certified(version)).map(|(key, _)| key).collect())
 }
 
 /// Regular `rollout-*.jsonl` files only; symlinks are never followed.
@@ -271,7 +290,7 @@ struct Cursor {
 }
 
 /// Ingest complete lines of one rollout after its stored offset, in one sidecar transaction.
-fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance: u64, done: &mut Collected) -> Result<u64> {
+fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance: u64, reread: &std::collections::BTreeSet<String>, done: &mut Collected) -> Result<u64> {
     let key = digest(file.as_os_str().as_encoded_bytes());
     let Ok(mut handle) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(file) else { return Ok(0) };
     let meta = handle.metadata()?;
@@ -279,9 +298,10 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
     let stored = tx.query_row("SELECT device,inode,byte_offset,records,rate_limits,model,effort FROM collect_offsets WHERE path_digest=?1", [&key],
         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))).optional()?;
     let mut cursor = match stored {
-        Some((dev, ino, offset, records, rate_limits, model, effort)) if dev as u64 == meta.dev() && ino as u64 == meta.ino() && offset as u64 <= meta.len() =>
+        Some((dev, ino, offset, records, rate_limits, model, effort)) if !reread.contains(&key) && dev as u64 == meta.dev() && ino as u64 == meta.ino() && offset as u64 <= meta.len() =>
             Cursor { offset: offset as u64, records, rate_limits, model, effort, session: None },
-        // New or replaced file: read from the start; existing keys dedupe or quarantine.
+        // New, replaced or re-read file: read from the start; existing keys
+        // dedupe, re-evaluate or quarantine.
         _ => {
             tx.execute("DELETE FROM rollout_sources WHERE path_digest=?1", [&key])?;
             Cursor { offset: 0, records: 0, rate_limits: 0, model: None, effort: None, session: None }
@@ -363,17 +383,24 @@ fn ingest(tx: &Transaction, line: &[u8], key: &str, home: &str, worktrees: &str,
             let Some((session, version, _)) = &cursor.session else { return Ok(()) };
             let payload = json!({"response_id": record.response_id, "turn_id": record.turn_id, "model": cursor.model, "effort": cursor.effort, "usage": record.usage.json()});
             let payload_digest = digest(payload.to_string().as_bytes());
-            let first: Option<String> = tx.query_row("SELECT payload_digest FROM codex_usage WHERE session_id=?1 AND ordinal=?2", params![session, cursor.records], |r| r.get(0)).optional()?;
+            let first: Option<(String, Option<String>)> = tx.query_row("SELECT payload_digest,reason FROM codex_usage WHERE session_id=?1 AND ordinal=?2",
+                params![session, cursor.records], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
             match first {
-                Some(first) if first == payload_digest => {}
-                Some(first) => {
+                // Stored while uncertified, now certified: the same record, evaluated again.
+                Some((first, Some(reason))) if first == payload_digest && reason == "cli_version_uncertified" && certified(version) => {
+                    let (reason, c) = evaluate(&record.usage, version);
+                    tx.execute("UPDATE codex_usage SET cache_write_input_tokens=?3,cached_input_tokens=?4,input_tokens=?5,output_tokens=?6,
+                        reasoning_output_tokens=?7,total_tokens=?8,accepted=?9,reason=?10 WHERE session_id=?1 AND ordinal=?2",
+                        params![session, cursor.records, c[0], c[1], c[2], c[3], c[4], c[5], reason.is_none(), reason])?;
+                    done.reevaluated += 1;
+                }
+                Some((first, _)) if first == payload_digest => {}
+                Some((first, _)) => {
                     tx.execute("INSERT OR IGNORE INTO codex_quarantine(session_id,ordinal,first_digest,new_digest,observed_unix_ms) VALUES(?1,?2,?3,?4,?5)",
                         params![session, cursor.records, first, payload_digest, now])?;
                 }
                 None => {
-                    let valid = record.usage.counters().filter(|[_, cached, input, output, reasoning, total]| *total == input + output && cached <= input && reasoning <= output);
-                    let reason = if valid.is_none() { Some("invariant_violation") } else if !certified(version) { Some("cli_version_uncertified") } else { None };
-                    let c = valid.filter(|_| reason.is_none()).map(|c| c.map(Some)).unwrap_or([None; 6]);
+                    let (reason, c) = evaluate(&record.usage, version);
                     tx.execute("INSERT INTO codex_usage(session_id,ordinal,path_digest,response_id,turn_id,model,effort,payload_digest,cache_write_input_tokens,cached_input_tokens,
                         input_tokens,output_tokens,reasoning_output_tokens,total_tokens,accepted,reason,observed_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                         params![session, cursor.records, key, record.response_id, record.turn_id, cursor.model, cursor.effort, payload_digest,
@@ -409,6 +436,14 @@ fn ingest(tx: &Transaction, line: &[u8], key: &str, home: &str, worktrees: &str,
         _ => {}
     }
     Ok(())
+}
+
+/// Contracts §5 validation: `invariant_violation` before
+/// `cli_version_uncertified`; a record not accepted keeps no counters.
+fn evaluate(usage: &Usage, version: &str) -> (Option<&'static str>, [Option<i64>; 6]) {
+    let valid = usage.counters().filter(|[_, cached, input, output, reasoning, total]| *total == input + output && cached <= input && reasoning <= output);
+    let reason = if valid.is_none() { Some("invariant_violation") } else if !certified(version) { Some("cli_version_uncertified") } else { None };
+    (reason, valid.filter(|_| reason.is_none()).map(|c| c.map(Some)).unwrap_or([None; 6]))
 }
 
 /// Σ accepted usage vs the last reported `thread_token_usage` and `token_count` totals.

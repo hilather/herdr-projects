@@ -309,7 +309,7 @@ never guessed from PID, title or file time.
 S5 refinements:
 - CLI `telemetry <slug> collect` (creates the sidecar, then prints) and
   `telemetry <slug> usage` (read-only); both print `{attempts, sessions}`,
-  collect adds `collected{files, bytes, records, budget_exhausted}`. Budget:
+  collect adds `collected{files, bytes, records, reevaluated, budget_exhausted}`. Budget:
   256 MiB per CLI collect, 8 MiB per ticker collect (once per 300 s per project,
   `HERDR_PROJECTS_TELEMETRY_COLLECT_SECS`, `0` off; no sidecar is created for a
   project without a Codex home). Lines over 16 MiB are skipped whole.
@@ -338,10 +338,19 @@ S5 refinements:
   with `rate_limits`; `observed_ts` = the line's `timestamp`.
 - Attempt `usage`: `collection_not_run` without a sidecar, `adapter_absent`
   for non-Codex kinds, then `not_bound`, `quarantined`,
-  `cli_version_uncertified`, else sums of accepted records plus `records`.
+  `cli_version_uncertified` (optional `detail: "rollout_unavailable"`), else
+  sums of accepted records plus `records`.
 - Certified: `0.154.0` (live run, [codex-live-0.154.0.md](codex-live-0.154.0.md)).
-  Rows stored while their version was uncertified are not re-read after
-  certification; a session holding any keeps attempt usage and the S6
+  Re-evaluation: every collect (CLI and ticker) re-reads from byte 0 each
+  rollout whose `cli_version` is now certified and that holds rows stored
+  while it was not (at or before its offset). A row with the same key and
+  `payload_digest` is evaluated again (validation above) and its counters
+  stored; any other key dedupes or quarantines as usual, so nothing is counted
+  twice. `collected.reevaluated` counts rows accepted this way; migration 0002
+  adds `rollout_sources.reevaluation`. A source whose rollout is no longer
+  found under a scanned home is marked `reevaluation = 'rollout_unavailable'`;
+  until re-read, a session holding such rows keeps attempt usage (with
+  `detail: "rollout_unavailable"` when its rollout is gone) and the S6
   metrics at `cli_version_uncertified`, never `0`.
 - Rule 4 `ambiguous` cannot arise within one project because worktree
   directories are attempt-unique; it stays as a guard. Several rollouts bound

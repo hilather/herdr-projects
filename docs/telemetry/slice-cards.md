@@ -107,8 +107,8 @@ Stop if a transition path exists that baseline §1 does not list (add it first).
 **Done; live certification done** ([codex-live-0.154.0.md](codex-live-0.154.0.md)).
 `telemetry <slug> collect|usage` and a ticker hook (once per 300 s, 8 MiB)
 write `telemetry.db` (0001); `CERTIFIED = ["0.154.0"]`, and the gate test
-`codex_usage_binds_and_sums_exactly` runs un-ignored. A session holding rows
-collected before certification stays `cli_version_uncertified` (never `0`).
+`codex_usage_binds_and_sums_exactly` runs un-ignored. Rows collected before
+certification are re-read after it (never `0` meanwhile).
 Outcome `usage` in `telemetry attempts` reads the sidecar (follow-up done).
 Refinements in contracts §5.
 
@@ -205,6 +205,9 @@ Stop if the panel would write, launch, or read content outside contracts §7.
   its reason (`not_bound`, `quarantined`, `cli_version_uncertified`;
   `collection_not_run` only without a sidecar);
   `attempts_show_bound_usage_or_its_reason`.
-- Sessions ingested before a version was certified stay
-  `cli_version_uncertified`; re-ingesting or updating those rows after
-  certification is not implemented.
+- Done: sessions ingested before their version was certified are re-read
+  from their rollout on the next collect (CLI or ticker) and accepted, without
+  double counting; a gone rollout keeps `cli_version_uncertified` with
+  `detail: rollout_unavailable` (contracts §5 "Re-evaluation");
+  `records_collected_before_certification_are_reread`,
+  `uncertified_records_without_their_rollout_stay_unavailable`.
