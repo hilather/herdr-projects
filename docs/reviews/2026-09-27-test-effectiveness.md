@@ -1109,3 +1109,61 @@ Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
 - Dropping the retry-due check from the notification worker failed the toast
   test: the toast was resent before its recorded backoff.
 - Letting unreadable executor metrics fail `doctor` failed the doctor test.
+
+## Controller, start, queue and cadence unit tests replaced by ticker workflows
+
+The audit marked 17 tests REPLACE: 6 in `src/canonical_controller.rs`, 5 in
+`src/copy_jobs/queue.rs`, 3 in `src/coordinator_start_jobs_tests.rs` and 3 in
+`src/steps.rs`. Fourteen were deleted. `tests/controller.rs` drives a migrated
+project through the CLI and `ticker run`, with a bridge stand-in that logs
+each request. `tests/ticker_jobs.rs` drives legacy coordinators, tokens and
+remote machines with a variant of the `tests/ticker.rs` fake herdr that logs
+every call with its time. Waits are on logged calls, stored state or the
+per-pass metrics file. The cadence tests need real 15 s passes, so the crate
+takes about 2.5 minutes.
+
+| New E2E test | Replaced unit tests |
+| --- | --- |
+| `ticker_notifies_an_expired_wait_once_and_reserves_nothing` (two passes, then a restart) | `controller_services_a_wait_without_reserving_or_repeating_the_notice` |
+| `ticker_delivers_a_notification_once_only_while_active_and_unleased` (root execution lease held, then released, restart; a second project paused) | `paused_control_blocks_notification_and_execution_lease_blocks_the_pass`, `ticker_delivers_accepted_notification_under_leadership_and_restart_does_not_replay` |
+| `ticker_runs_an_approved_routine_once_beside_one_edited_after_approval` (two signed routines, one script edited, a notification delivered in the same run) | `ticker_rotates_signed_routines_records_once_and_keeps_future_work_alive` |
+| `ticker_reserves_a_ready_dependent_once_only_with_factory_admission_on` (real verified predecessor, knowledge snapshot, signed approval) | `poll_reserves_one_dependent_only_when_factory_admission_is_already_on` |
+| `plans.rs::ticker_requests_replans_only_while_enabled_and_active` (existing) | `controller_creates_replan_requests_only_when_explicitly_enabled` |
+| `open_after_a_coordinator_start_keeps_its_claim_and_never_starts_again` (lost and kind-less start replies; plain `open`, then `open --reprime`) | `open_retains_launch_history_and_queues_a_new_request_without_starting`, `plain_open_cannot_turn_a_missing_agent_observation_into_another_launch_request` |
+| `token_refreshes_cool_down_while_another_coordinator_starts_and_primes` | `token_refreshes_cool_down_without_blocking_other_work`, `coordinator_start_confirms_submission_once_without_certifying_readiness` |
+| `a_failed_coordinator_start_backs_off_while_another_project_works` (no bridge, so the start fails before claiming) | `errors_back_off_without_resetting_history_and_failed_submission_does_not_advance` |
+| `remote_machines_poll_on_their_own_deadlines_and_only_long_outages_are_reported` (two projects on machine `box`; outage threshold set through `HERDR_PROJECTS_OUTAGE_SECS` across restarts) | `machine_cadence_and_backoff_are_scoped_to_project_and_session`, `remote_deadlines_ignore_tick_counts_and_backoff_starts_after_failure`, `short_outages_write_nothing_and_long_ones_write_one_item_each_way` |
+
+Cooldowns are read from pass timing. The ticker admits one job per pass,
+rotating between projects, and settles it in the next pass. A 30 s cooldown
+therefore puts the next run three passes (45 s) later; without one it comes
+two passes (30 s) later. With three or more busy projects the rotation alone
+spaces a job 45 s apart, so each cooldown test uses exactly two projects.
+
+Not carried over: the queue's internal sequence and history counters; the
+`Pending` launch phase for plain `open`, which needs a crash inside a start;
+and the controller's `verification_backlog` note, which needs a result
+submission older than 15 minutes. That backlog stays covered by
+`admission::tests::verification_backlog_returns_capacity_full_and_does_not_start_work`.
+Automatic admission prepares launch inputs without repositories, so the
+signed approval in the admission test is drafted with none.
+
+Kept: `termination_poll_cools_down_without_delaying_launch_service`,
+`recovery_observations_cool_down_but_original_claim_can_still_advance` and
+`canonical_launch_failure_keeps_short_backoff_and_other_projects_rotate`.
+They need a native worker whose termination or recovery poll keeps finding
+nothing new, or a launch job that fails without writing a durable boundary,
+beside a second native launch. The Herdr lab server in
+`tests/canonical_worker.rs` supports neither yet.
+
+Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
+- Dropping the token cooldown from `Queue::settle` failed the token test
+  (refreshes 30 s apart).
+- Dropping the failure backoff from `Queue::settle` failed the start test
+  (retries 30 s, then 15 s apart).
+- Retrying a failed machine after the one-minute interval instead of the
+  two-minute delay failed the remote test ("a was retried before its backoff").
+  It first survived, because the ticker stopped before `a`'s job was logged,
+  so the test now waits one more pass.
+- Dropping the script digest check from routine execution failed the routine
+  test: the edited routine ran.

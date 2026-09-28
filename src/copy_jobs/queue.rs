@@ -271,15 +271,6 @@ mod tests {
         while queue.pending(){errors.extend(queue.drain());assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(2));}errors
     }
     #[test]
-    fn token_refreshes_cool_down_without_blocking_other_work() {
-        let pool=Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),Arc::new(Immediate)).unwrap());let mut queue=Queue::new(pool.clone());
-        queue.offer_request(work("a","tokens:1")).unwrap();queue.admit();assert!(drain(&mut queue).is_empty());
-        let key=("a".into(),"tokens:1".into());assert!(queue.entries[&key].not_before>Instant::now()+Duration::from_secs(29));
-        queue.offer_request(work("a","tokens:1")).unwrap();queue.admit();assert!(!queue.pending());
-        queue.offer_request(work("b","brief:1")).unwrap();queue.admit();assert_eq!(queue.pending.as_ref().unwrap().key,("b".into(),"brief:1".into()));assert!(drain(&mut queue).is_empty());
-        assert!(pool.stop(Duration::from_secs(1)));
-    }
-    #[test]
     fn projects_and_threads_rotate_only_on_admission_and_completed_tickets_hold_turn() {
         let pool=Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),Arc::new(Immediate)).unwrap());let mut queue=Queue::new(pool.clone());
         let mut found=Vec::new();
@@ -326,15 +317,6 @@ mod tests {
             assert!(queue.entries.len()<=LIMIT);assert!(queue.cursor.history_len()<=LIMIT);
         }
         assert!(queue.cursor.overflow());assert_eq!(seen.len(),(LIMIT+1)*2);assert!(pool.stop(Duration::from_secs(1)));
-    }
-    #[test]
-    fn errors_back_off_without_resetting_history_and_failed_submission_does_not_advance() {
-        let pool=Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),Arc::new(Immediate)).unwrap());let mut queue=Queue::new(pool.clone());
-        let mut failed=work("a","1");failed.command.program="fail".into();queue.offer_request(failed).unwrap();queue.admit();assert_eq!(drain(&mut queue).len(),1);
-        queue.offer_request(work("a","1")).unwrap();assert!(queue.admit().is_empty());assert!(!queue.pending());assert!(queue.entries[&("a".into(),"1".into())].needed);
-        queue.offer_request(work("b","1")).unwrap();queue.admit();assert_eq!(queue.pending.as_ref().unwrap().key.0,"b");assert!(drain(&mut queue).is_empty());
-        assert!(pool.stop(Duration::from_secs(1)));let last=queue.sequence;
-        queue.offer_request(work("c","1")).unwrap();assert_eq!(queue.admit().len(),1);assert_eq!(queue.sequence,last);assert_eq!(queue.entries[&("c".into(),"1".into())].last,0);
     }
     #[cfg(feature="state-store")]
     #[test]

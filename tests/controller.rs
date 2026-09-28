@@ -1,0 +1,362 @@
+#![cfg(all(feature = "state-store", target_os = "linux"))]
+#![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
+//! The canonical controller through `ticker run`: waits, notifications,
+//! signed routines and automatic admission over a disposable migrated
+//! project, set up through the compiled CLI. A Herdr bridge stand-in answers
+//! `notification.show` and logs every request. Each ticker pass republishes
+//! the executor metrics file, so waits count passes, never elapsed time.
+use herdr_projects::{authority, domain::*, migration, operations::DeliveryState, runtime};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::{fs, os::unix::fs::{MetadataExt, PermissionsExt}, path::PathBuf, process::{Child, Command, Output, Stdio}, time::{Duration, Instant}};
+
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+
+/// Answers the bridge check and `notification.show`, logging each request.
+const HERDR: &str = "#!/usr/bin/python3\nimport json,os,sys\nhome=os.environ['HOME']\n\
+if sys.argv[1:]==['--version']:print('herdr 0.9.1');sys.exit(0)\n\
+if sys.argv[1:]==['remote-api-bridge','--check']:print('herdr-api-bridge-v1');sys.exit(0)\n\
+if sys.argv[1:]!=['remote-api-bridge']:sys.exit(2)\n\
+r=json.loads(sys.stdin.readline())\nopen(home+'/requests','a').write(r['method']+'\\n')\n\
+if r['method']!='notification.show':sys.exit(3)\n\
+print(json.dumps({'id':r['id'],'result':{'type':'notification_show','shown':True,'reason':'shown'}}))\n";
+
+struct Lab { home: tempfile::TempDir, project: PathBuf, key: PathBuf, _socket: std::os::unix::net::UnixListener }
+struct Ticker(Child);
+impl Drop for Ticker { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+
+impl Lab {
+    /// A paused migrated project `demo` with an owner key and one unseen
+    /// inbox item; `config` is
+    /// appended to the owner's configuration.
+    fn new(config: &str) -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let key = home.path().join("owner");
+        assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).output().unwrap().status.success());
+        let socket = std::os::unix::net::UnixListener::bind(home.path().join("session.sock")).unwrap();
+        let lab = Lab { project: home.path().join("root/demo"), key, home, _socket: socket };
+        for command in ["new", "pause"] { lab.ok(&[command, "demo"]); }
+        let public = fs::read_to_string(lab.key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+        let path = lab.config();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n{}", config.replace("PROJECT", &format!("{:?}", lab.project.display().to_string())))).unwrap();
+        fs::write(lab.path("herdr"), HERDR).unwrap();
+        fs::set_permissions(lab.path("herdr"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(lab.project.join("inbox/message.md"), "+++\nid='message'\nsummary='private text'\n+++\n").unwrap();
+        migration::apply(&lab.project, &migration::inspect_with_config(&lab.project, &path).unwrap(), true).unwrap();
+        lab
+    }
+    /// Set the paused project active under the owner's configuration.
+    fn activate(&self) {
+        let s = self.state();
+        runtime::set_state(&self.project, s.head, s.control.unwrap().revision, ProjectState::Active, &self.config()).unwrap();
+    }
+    fn path(&self, name: &str) -> PathBuf { self.home.path().join(name) }
+    fn config(&self) -> PathBuf { self.path(".config/herdr-projects/config.toml") }
+    fn store(&self) -> PathBuf { self.project.join(".state/state.db") }
+    fn cli(&self, args: &[&str]) -> Output {
+        Command::new(BIN).env_clear().env("HOME", self.home.path()).env("PATH", "/usr/bin:/bin")
+            .args(["--root", self.path("root").to_str().unwrap()]).args(args).output().unwrap()
+    }
+    fn ok(&self, args: &[&str]) -> Value {
+        let out = self.cli(args);
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        serde_json::from_slice(&out.stdout).unwrap_or(Value::Null)
+    }
+    /// The store may be mid-publication under a running ticker; read again.
+    fn state(&self) -> Snapshot {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop { match runtime::snapshot(&self.project) { Ok(s) => return s, Err(e) => { assert!(Instant::now() < deadline, "{e:#}"); std::thread::sleep(Duration::from_millis(20)); } } }
+    }
+    fn head(&self) -> String { self.state().head.to_string() }
+    fn set_state(&self, state: &str) {
+        let control = self.state().control.unwrap().revision.to_string();
+        self.ok(&["runtime", "demo", "state", state, "--expected-revision", &control, "--expected-head", &self.head()]);
+    }
+    fn add(&self, task: &str) { self.ok(&["task", "demo", "add", task, "--title", task, "--expected-head", &self.head()]); }
+    fn count(&self, sql: &str) -> i64 { rusqlite::Connection::open(self.store()).unwrap().query_row(sql, [], |row| row.get(0)).unwrap() }
+    /// Owner-sign `bytes` written to `name`; returns (document, signature).
+    fn sign(&self, name: &str, bytes: &[u8], namespace: &str) -> (String, String) {
+        let path = self.path(name);
+        fs::write(&path, bytes).unwrap();
+        assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y", "sign", "-f"]).arg(&self.key).args(["-n", namespace]).arg(&path).output().unwrap().status.success());
+        (path.display().to_string(), format!("{}.sig", path.display()))
+    }
+    /// Record a coordinator route to the lab session (while paused).
+    fn route(&self) {
+        runtime::create_binding(&self.project, None, None, self.state().head, &RuntimeRoute { socket: self.path("session.sock").display().to_string(), ..Default::default() }).unwrap();
+        self.ok(&["reconcile", "demo", "--record"]);
+    }
+    /// Queue a coordinator notification about the new task `task`.
+    fn notify(&self, task: &str) -> OperationId {
+        self.add(task);
+        OperationId::new(self.ok(&["operations", "demo", "notify", task, "--expected-head", &self.head()])["id"].as_str().unwrap()).unwrap()
+    }
+    fn delivery(&self, operation: &OperationId) -> herdr_projects::operations::Delivery {
+        self.state().deliveries.into_iter().find(|d| &d.operation == operation).unwrap()
+    }
+    fn shown(&self) -> usize { fs::read_to_string(self.path("requests")).unwrap_or_default().lines().filter(|l| *l == "notification.show").count() }
+    fn log(&self) -> String { fs::read_to_string(self.path("root/.ticker.log")).unwrap_or_default() }
+    fn spawn(&self) -> Ticker {
+        Ticker(Command::new(BIN).env_clear().env("HOME", self.home.path()).env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", self.path("herdr"))
+            .args(["--root", self.path("root").to_str().unwrap(), "ticker", "run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap())
+    }
+    fn wait(&self, ticker: &mut Ticker, predicate: &dyn Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !predicate() {
+            assert!(ticker.0.try_wait().unwrap().is_none(), "ticker exited");
+            assert!(Instant::now() < deadline, "{}", self.log());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    fn stop(&self, mut ticker: Ticker) {
+        let stop = self.path("root/.ticker.stop");
+        fs::write(&stop, b"").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ticker.0.try_wait().unwrap().is_none() { assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(10)); }
+        fs::remove_file(&stop).unwrap();
+    }
+    /// Wait for `passes` more completed passes of `ticker`.
+    fn passes(&self, ticker: &mut Ticker, passes: usize) {
+        let metrics = self.path("root/.ticker-metrics.json");
+        let inode = || fs::metadata(&metrics).map(|m| m.ino()).ok();
+        for _ in 0..passes {
+            let last = inode();
+            self.wait(ticker, &|| inode() != last);
+        }
+    }
+    /// Run a fresh ticker until `until` holds and `passes` passes more are done.
+    fn run(&self, passes: usize, until: &dyn Fn() -> bool) {
+        let mut ticker = self.spawn();
+        self.wait(&mut ticker, until);
+        self.passes(&mut ticker, passes);
+        self.stop(ticker);
+    }
+}
+
+/// Replaces `controller_services_a_wait_without_reserving_or_repeating_the_notice`.
+///
+/// A wait whose deadline has passed is woken by the first pass and notified
+/// once: later passes and a restarted ticker add no notice, and servicing
+/// it reserves no attempt and prompts nobody.
+#[test]
+fn ticker_notifies_an_expired_wait_once_and_reserves_nothing() {
+    let lab = Lab::new("");
+    lab.activate();
+    lab.add("waiting");
+    let wait = lab.ok(&["plan", "wait", "demo", "register", "--task", "waiting", "--condition", "user_decision", "--deadline", "2000-01-01T00:00:00Z"]);
+    let id = wait["wait_id"].as_str().unwrap().to_owned();
+    let notices = || lab.count(&format!("SELECT count(*) FROM events WHERE kind='wait.notified' AND entity='{id}'"));
+    lab.run(2, &|| notices() == 1);
+    lab.run(1, &|| true);
+    assert_eq!(notices(), 1);
+    let inbox: Vec<_> = lab.state().inbox.into_iter().filter(|i| i.content.kind == "wait-wake").collect();
+    assert_eq!(inbox.len(), 1, "{inbox:?}");
+    assert!(inbox[0].content.body.contains(&id) && inbox[0].content.body.contains("deadline expired"), "{:?}", inbox[0].content.body);
+    assert!(lab.state().attempts.is_empty());
+    assert!(!lab.path("requests").exists(), "servicing a wait touched Herdr");
+}
+
+/// Replaces `paused_control_blocks_notification_and_execution_lease_blocks_the_pass`
+/// and `ticker_delivers_accepted_notification_under_leadership_and_restart_does_not_replay`.
+///
+/// While another command holds the root's exclusive execution lease the
+/// ticker leaves a queued notification pending and shows nothing. Released,
+/// it shows it once, and a restarted ticker does not show it again. In another
+/// project, a notification queued before the project is paused stays pending.
+#[test]
+fn ticker_delivers_a_notification_once_only_while_active_and_unleased() {
+    let lab = Lab::new("");
+    lab.route();
+    lab.activate();
+    let op = lab.notify("notify");
+    let before = lab.state();
+    {
+        let lease = fs::File::options().create(true).truncate(false).read(true).write(true).open(lab.path("root/.execution.lock")).unwrap();
+        lease.lock().unwrap();
+        lab.run(2, &|| true);
+    }
+    let after = lab.state();
+    assert_eq!((&after.deliveries, &after.operations, &after.attempts, &after.control), (&before.deliveries, &before.operations, &before.attempts, &before.control));
+    assert_eq!(lab.shown(), 0);
+
+    lab.run(0, &|| lab.delivery(&op).state == DeliveryState::Confirmed);
+    lab.run(2, &|| true);
+    assert_eq!((lab.delivery(&op).attempts, lab.shown()), (1, 1));
+
+    let paused = Lab::new("");
+    paused.route();
+    paused.activate();
+    let op = paused.notify("notify");
+    paused.set_state("paused");
+    paused.run(2, &|| true);
+    assert_eq!((paused.delivery(&op).state, paused.delivery(&op).attempts, paused.shown()), (DeliveryState::Pending, 0, 0));
+}
+
+/// Replaces `ticker_rotates_signed_routines_records_once_and_keeps_future_work_alive`.
+///
+/// Two owner-signed routines are due; one script is edited after approval.
+/// The ticker refuses the edited one without running it, still runs the
+/// other once and delivers a queued notification. A restart runs nothing
+/// again.
+#[test]
+fn ticker_runs_an_approved_routine_once_beside_one_edited_after_approval() {
+    let lab = Lab::new("[safety.PROJECT]\nroutine_commands=true\n");
+    lab.route();
+    lab.activate();
+    let project = lab.project.canonicalize().unwrap();
+    for (name, script) in [("a-broken", "printf ran >> BROKEN_MARKER\n"), ("b-healthy", "printf once >> HEALTHY_MARKER\n")] {
+        let path = project.join(format!("{name}.sh"));
+        fs::write(&path, script).unwrap();
+        let definition = RoutineDefinition { version: 1, name: name.into(), revision: 1, project_store: lab.store().canonicalize().unwrap().display().to_string(),
+            authority: authority::policy_reference(&project).unwrap(), config: migration::config_reference(&lab.config()).unwrap(), enabled: true,
+            schedule: "every 1h".into(), timezone: "UTC".into(), start_unix_ms: jiff::Timestamp::now().as_millisecond() - 1000, missed: MissedRunPolicy::CoalesceLatest,
+            overlap: OverlapPolicy::Skip, script: path.display().to_string(), script_sha256: format!("{:x}", Sha256::digest(script)), cwd: project.display().to_string(),
+            deadline_ms: 1000, output_cap_bytes: 4000 };
+        let (doc, sig) = lab.sign(&format!("{name}.json"), &serde_json::to_vec(&definition).unwrap(), authority::ROUTINE_SIGNATURE_NAMESPACE);
+        lab.ok(&["routine-store", "demo", "import", &doc, &sig, "--expected-head", &lab.head()]);
+    }
+    fs::write(project.join("a-broken.sh"), "printf edited >> BROKEN_MARKER\n").unwrap();
+    let op = lab.notify("notify");
+    let ran = || lab.state().routine_receipts.len();
+    lab.run(1, &|| ran() == 1 && lab.delivery(&op).state == DeliveryState::Confirmed);
+    let state = lab.state();
+    assert_eq!(state.routine_occurrences.iter().map(|o| o.routine.id.as_str()).collect::<Vec<_>>(), ["routine-b-healthy"]);
+    assert!(state.routine_receipts[0].succeeded);
+    assert!(lab.log().contains("a-broken"), "{}", lab.log());
+    lab.run(2, &|| true);
+    let after = lab.state();
+    assert_eq!((after.routine_occurrences, after.routine_receipts), (state.routine_occurrences, state.routine_receipts));
+    assert_eq!(fs::read(project.join("HEALTHY_MARKER")).unwrap(), b"once");
+    assert!(!project.join("BROKEN_MARKER").exists());
+    assert_eq!(lab.shown(), 1);
+}
+
+/// Replaces `poll_reserves_one_dependent_only_when_factory_admission_is_already_on`.
+///
+/// A queued dependent whose predecessor has an accepted verification, worker
+/// knowledge and an owner-signed launch approval is reserved by the ticker
+/// only once factory admission is on, and then exactly once.
+#[test]
+fn ticker_reserves_a_ready_dependent_once_only_with_factory_admission_on() {
+    const POLICY: &str = r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#;
+    let lab = Lab::new("[profiles.worker]\nkind='codex'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=60\nunknown_usage='allow_with_warning'\n");
+    let repo = lab.path("repo");
+    fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| -> String {
+        let out = Command::new("/usr/bin/git").env_clear().env("PATH", "/usr/bin:/bin").env("HOME", lab.home.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_AUTHOR_NAME", "fixture").env("GIT_AUTHOR_EMAIL", "fixture@example.com")
+            .env("GIT_COMMITTER_NAME", "fixture").env("GIT_COMMITTER_EMAIL", "fixture@example.com").current_dir(&repo).args(args).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "-q", "--object-format=sha256"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+    let (base, repo) = (git(&["rev-parse", "HEAD"]), repo.canonicalize().unwrap());
+    let store = lab.store().canonicalize().unwrap().display().to_string();
+
+    lab.add("pred");
+    lab.add("dep");
+    let request = lab.path("queue.json");
+    fs::write(&request, json!({"priority":0,"dependencies":[{"predecessor":"pred","requirement":"verified_result"}]}).to_string()).unwrap();
+    lab.ok(&["task", "demo", "queue", "dep", "--input-file", request.to_str().unwrap(), "--expected-revision", "1", "--expected-head", &lab.head()]);
+    let policy = lab.state().scheduler.unwrap().policy.revision.to_string();
+    lab.ok(&["scheduler", "demo", "policy", "--max-active-workers", "1", "--max-attempts-per-task", "3", "--expected-revision", &policy, "--expected-head", &lab.head()]);
+    let dep = TaskId::new("dep").unwrap();
+    let state = lab.state();
+    let binding = runtime::create_binding(&lab.project, Some(&dep), Some(state.tasks.iter().find(|t| t.id == dep).unwrap().revision), state.head,
+        &RuntimeRoute { socket: lab.path("session.sock").display().to_string(), cwd: repo.display().to_string(), ..Default::default() }).unwrap();
+    migration::open_active(&lab.project).unwrap().record_observations(lab.state().head, &[herdr_projects::reconcile::RuntimeObservation {
+        binding: binding.binding.id.clone(), binding_revision: binding.binding.revision, task_revision: binding.task_revision,
+        observed_unix_ms: jiff::Timestamp::now().as_millisecond(), collector: "herdr-git-v2".into(),
+        config_digest: migration::config_reference(&lab.config()).unwrap().digest, ..Default::default() }]).unwrap();
+    lab.activate();
+    let profile = launchable_profile(&lab);
+
+    // The predecessor's worker submits and the signed policy accepts it.
+    let plant = |state: AttemptState, terminated: bool| {
+        let mut db = migration::open_active(&lab.project).unwrap();
+        let expected = lab.state().attempts.into_iter().find(|a| a.id.as_str() == "pred-attempt").map(|a| a.revision);
+        let next = Attempt { id: AttemptId::new("pred-attempt").unwrap(), task: TaskId::new("pred").unwrap(), revision: expected.map_or(1, |r| r + 1), state,
+            snapshot: None, reservation: "pred-slot".into(), termination_observed: terminated };
+        db.commit(Commit { expected_head: db.current_head().unwrap(), mutations: vec![Mutation::Attempt { expected, next }] }).unwrap();
+    };
+    plant(AttemptState::Running, false);
+    let contract = json!({"version":1,"project_store":store,"expected_head":lab.state().head,"task_id":"pred","contract_revision":1,
+        "deliverable":"predecessor","non_goals":"no worker launch","acceptance_policies":[{"id":"builds","text":POLICY}],
+        "repository":repo,"base_oid":base,"object_format":"sha256","dependencies":[],"scope":{"paths":[],"named_resources":[]},
+        "capability_flags":[],"profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_only",
+        "authority":authority::policy_reference(&lab.project).unwrap()});
+    let (doc, sig) = lab.sign("contract.json", &serde_json::to_vec(&contract).unwrap(), authority::CONTRACT_SIGNATURE_NAMESPACE);
+    let digest = lab.ok(&["task", "demo", "contract", "put", "--input-file", &doc, "--signature", &sig])["digest"].clone();
+    let objects: Vec<_> = git(&["rev-list", "--objects", "--all"]).lines().map(|line| {
+        let oid = line.split_whitespace().next().unwrap();
+        json!({"oid":oid,"relative_path":format!("{}/{}", &oid[..2], &oid[2..])})
+    }).collect();
+    let submission = lab.path("submission.json");
+    fs::write(&submission, json!({"idempotency_key":"pred-1","task_id":"pred","contract_revision":1,"contract_digest":digest,"attempt_id":"pred-attempt",
+        "repository":repo,"base_oid":base,"candidate_oid":base,"object_format":"sha256","artifact_manifest":[],"claimed_checks":[],"objects":objects}).to_string()).unwrap();
+    let submitted = lab.ok(&["result", "demo", "submit", "--input-file", submission.to_str().unwrap()]);
+    fs::write(lab.path("policy.json"), POLICY).unwrap();
+    let run = lab.ok(&["result", "demo", "verify", submitted["submission_id"].as_str().unwrap(), "--policy-id", "builds", "--policy-file", lab.path("policy.json").to_str().unwrap(),
+        "--idempotency-key", "pred-verify", "--work-dir", lab.path("verify-work").to_str().unwrap()]);
+    assert_eq!(run["state"], "accepted", "{run}");
+    plant(AttemptState::Completed, true);
+
+    // Worker knowledge and an owner-signed launch approval for the dependent,
+    // without repositories, as automatic admission prepares it.
+    let scope = lab.path("scope.json");
+    fs::write(&scope, json!({"schema_version":1,"task_id":"dep","profile":"worker","domains":[],"paths":[],"pinned_keys":[],"sensitivity":"default"}).to_string()).unwrap();
+    let snapshot = lab.ok(&["memory", "demo", "snapshot", "--task", "dep", "--profile", "worker", "--input-file", scope.to_str().unwrap(), "--worker"]);
+    let selection = lab.path("selection.json");
+    fs::write(&selection, json!({"task":"dep","binding":binding.binding.id,"profile":profile,
+        "knowledge":{"id":snapshot["id"],"revision":1,"digest":snapshot["manifest_hash"]},"repositories":[]}).to_string()).unwrap();
+    let drafted = lab.ok(&["launch", "demo", "draft", "--selection", selection.to_str().unwrap(), "--expected-head", &lab.head()]);
+    let (doc, sig) = lab.sign("approval.json", &serde_json::to_vec_pretty(&drafted["approval"]).unwrap(), authority::SIGNATURE_NAMESPACE);
+    lab.ok(&["approval", "demo", "import", &doc, &sig, "--expected-head", &lab.head()]);
+
+    let reserved = || lab.state().attempts.iter().filter(|a| a.task == dep).count();
+    lab.run(2, &|| true);
+    assert_eq!(reserved(), 0, "admission is off: {}", lab.log());
+    // Fixture only: automatic admission is enabled by a signed factory manifest.
+    rusqlite::Connection::open(lab.store()).unwrap().execute("UPDATE project_control SET factory_admission='on' WHERE singleton=1", []).unwrap();
+    lab.run(2, &|| reserved() == 1);
+    assert_eq!(reserved(), 1);
+    assert_eq!(lab.state().attempts.len(), 2, "no other task gained an attempt");
+    let logged: Vec<Value> = lab.log().lines().filter_map(|line| line.find('{').and_then(|at| serde_json::from_str(&line[at..]).ok())).collect();
+    assert!(logged.iter().any(|line| line["reason"] == "reserved"), "{}", lab.log());
+}
+
+/// Prepare `worker` over fake binaries; only the native interaction evidence,
+/// which needs a real agent session, is planted.
+fn launchable_profile(lab: &Lab) -> VersionedReference {
+    use herdr_projects::worker_supervision::{ProcessIncarnation, SupervisorIdentity};
+    let (bin, agent_home) = (lab.path("bin"), lab.path("agent-home"));
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&agent_home).unwrap();
+    let (herdr, agent) = (bin.join("herdr"), bin.join("codex"));
+    fs::write(&herdr, "#!/usr/bin/python3\nimport sys,json\nif sys.argv[1:]==['--version']:print('herdr 0.9.1');sys.exit(0)\nr=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'result':{'type':'pong','version':'0.9.1','capabilities':{'workspace_create_command':True}}}))\n").unwrap();
+    fs::write(&agent, "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 2\nprintf '%s\\n' 'codex-cli 0.154.0'\n").unwrap();
+    for path in [&herdr, &agent] { fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap(); }
+    let prepared = lab.ok(&["profile", "prepare", "demo", "worker", "--herdr-executable", herdr.to_str().unwrap(),
+        "--agent-executable", agent.to_str().unwrap(), "--execution-home", agent_home.to_str().unwrap()]);
+    let mut profile: FrozenProfile = serde_json::from_value(prepared["profile"].clone()).unwrap();
+    #[derive(serde::Serialize)] struct Interaction { session: ResourceIdentity, terminal: &'static str, readiness_manifest: &'static str, prompt_digest: String, acknowledged_unix_ms: i64 }
+    #[derive(serde::Serialize)] struct Evidence { version: u32, prepared_profile: VersionedReference, supervisor: SupervisorIdentity, native_kind: String, observed_unix_ms: i64, stopped_unix_ms: i64, interaction: Interaction }
+    let evidence = Evidence { version: 2, prepared_profile: profile.reference().unwrap(), native_kind: profile.kind.clone(), observed_unix_ms: 1000, stopped_unix_ms: 1001,
+        supervisor: SupervisorIdentity { version: 1, boot_id: "00000000-0000-0000-0000-000000000001".into(), host_id: None, observer_namespace: (1, 2), worker_namespace: (1, 3),
+            outer: ProcessIncarnation { pid: 20, device: 1, inode: 4 }, init: ProcessIncarnation { pid: 21, device: 1, inode: 5 } },
+        interaction: Interaction { session: ResourceIdentity { device: 1, inode: 2, born_secs: 1, born_nanos: 0 }, terminal: "fixture-terminal", readiness_manifest: "fixture-manifest", prompt_digest: "a".repeat(64), acknowledged_unix_ms: 999 } };
+    let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&evidence).unwrap()));
+    let supported = CapabilityEvidence::Supported { evidence: VersionedReference { id: format!("native-transport-{hash}"), revision: 1, digest: hash } };
+    let c = &mut profile.capabilities;
+    (c.launch, c.stop, c.readiness_observation, c.prompt_submission) = (supported.clone(), supported.clone(), supported.clone(), supported);
+    let reference = profile.reference().unwrap();
+    let store = lab.store().canonicalize().unwrap();
+    let metadata = fs::metadata(&store).unwrap();
+    let report = json!({"preparation":{"profile":profile,"reference":reference,"launchable":true,"protocol_capable":false,"certified":false},
+        "evidence":evidence,"source_store":[store,metadata.dev(),metadata.ino()]}).to_string();
+    rusqlite::Connection::open(&store).unwrap().execute("INSERT INTO native_profiles(profile_digest,report,report_digest,sequence) VALUES(?1,?2,?3,(SELECT max(sequence) FROM events))",
+        rusqlite::params![reference.digest, report, format!("{:x}", Sha256::digest(report.as_bytes()))]).unwrap();
+    reference
+}

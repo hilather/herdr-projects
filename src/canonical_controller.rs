@@ -234,8 +234,8 @@ fn offer_next(ctx:&Ctx,path:&Path,turn:u64,effects:&mut crate::copy_jobs::Queue,
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::{runner::fake::ok,notification_delivery,finalization_delivery};
-    use herdr_projects::{domain::ProjectState,operations::DeliveryState};
+    use crate::{notification_delivery,finalization_delivery};
+    use herdr_projects::operations::DeliveryState;
     pub(crate) fn routine_fixture(scripts:&[(&str,&[u8],u64)])->(crate::scenarios::World,std::path::PathBuf) {
         use crate::{scenarios::World,project,runner::{RealRunner,Runner,Cmd}};
         use herdr_projects::{authority,domain::*};
@@ -260,81 +260,7 @@ pub(crate) mod tests {
         }
         (world,path)
     }
-    #[test]
-    fn controller_creates_replan_requests_only_when_explicitly_enabled() {
-        use herdr_projects::domain::*;
-        let (world,path)=routine_fixture(&[]);let mut db=migration::open_active(&path).unwrap();
-        db.commit(Commit{expected_head:db.current_head().unwrap(),mutations:vec![Mutation::Task{expected:None,next:Task{id:TaskId::new("replan-task").unwrap(),revision:1,state:TaskState::Blocked,title:"replan".into(),active_attempt:None}}]}).unwrap();drop(db);
-        let raw=rusqlite::Connection::open(path.join(".state/state.db")).unwrap();
-        raw.execute("INSERT INTO feedback_items VALUES(?1,'fixture-verifier',1,'verifier_rejection','replan-task','checks_failed','open',NULL,0)",["a".repeat(64)]).unwrap();
-        finish_poll(&world.ctx(),&path,0,false,None,None,Some(false)).unwrap();
-        assert_eq!(raw.query_row("SELECT count(*) FROM replan_requests",[],|row|row.get::<_,usize>(0)).unwrap(),0);
-        let head=runtime::snapshot(&path).unwrap().head;herdr_projects::store::set_project_auto_replans(&path,head,true).unwrap();
-        for turn in 1..3 {let result=finish_poll(&world.ctx(),&path,turn,false,None,None,Some(false)).unwrap();assert!(!result.operation_error.unwrap_or_default().contains("replan request service"));}
-        assert_eq!(raw.query_row("SELECT count(*) FROM replan_requests",[],|row|row.get::<_,usize>(0)).unwrap(),1);
-        assert_eq!(raw.query_row("SELECT count(*) FROM attempts",[],|row|row.get::<_,usize>(0)).unwrap(),0);
-        assert_eq!(world.runner.count("agent prompt"),0);
-    }
 
-    #[test]
-    fn controller_services_a_wait_without_reserving_or_repeating_the_notice() {
-        use herdr_projects::domain::*;
-        let (world,path)=routine_fixture(&[]);
-        let mut db=migration::open_active(&path).unwrap();
-        db.commit(Commit{expected_head:db.current_head().unwrap(),mutations:vec![Mutation::Task{expected:None,next:Task{id:TaskId::new("waiting").unwrap(),revision:1,state:TaskState::Blocked,title:"waiting".into(),active_attempt:None}}]}).unwrap();
-        let wait=db.register_wait("waiting",None,"user_decision").unwrap();
-        drop(db);
-        let raw=rusqlite::Connection::open(path.join(".state/state.db")).unwrap();
-        raw.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake',?1,1,1,'{}')",[&wait.wait_id]).unwrap();
-        for turn in 0..2 {
-            let result=finish_poll(&world.ctx(),&path,turn,false,None,None,Some(false)).unwrap();
-            assert!(!result.operation_error.unwrap_or_default().contains("wait service:"));
-        }
-        let notices:i64=raw.query_row("SELECT count(*) FROM events WHERE kind='wait.notified'",[],|row|row.get(0)).unwrap();
-        assert_eq!(notices,1);
-        let attempts:i64=raw.query_row("SELECT count(*) FROM attempts",[],|row|row.get(0)).unwrap();
-        assert_eq!(attempts,0);
-    }
-
-    #[test]
-    fn ticker_rotates_signed_routines_records_once_and_keeps_future_work_alive() {
-        use std::fs;use herdr_projects::domain::*;
-        let(world,path)=routine_fixture(&[("a-broken",b"touch MUST_NOT_EXECUTE\n",1000),("b-healthy",b"touch MUST_NOT_EXECUTE\n",1000)]);
-        let config=world.ctx().config_dir.join("config.toml");
-        fs::write(path.join("a-broken.sh"),"edited after approval").unwrap();
-        let leader=fs::File::create(world.root.join(".ticker.lock")).unwrap();leader.try_lock().unwrap();
-        let mut memory=crate::steps::Memory::new(&world.ctx());
-        assert!(crate::ticker::tick_for_test(&world.ctx(),&mut memory));
-        assert!(runtime::snapshot(&path).unwrap().routine_occurrences.is_empty());
-        assert!(crate::ticker::tick_for_test(&world.ctx(),&mut memory));
-        let s=runtime::snapshot(&path).unwrap();assert_eq!(s.routine_occurrences.len(),1);assert_eq!(s.routine_occurrences[0].routine.id,"routine-b-healthy");
-        assert_eq!(s.deliveries[0].state,DeliveryState::Pending);assert_eq!(s.deliveries[0].attempts,0);assert!(!path.join("MUST_NOT_EXECUTE").exists());
-        // A fresh controller must not duplicate the due instant, and a routine
-        // with only future work keeps the controller alive without a session.
-        let mut restarted=crate::steps::Memory::new(&world.ctx());crate::ticker::tick_for_test(&world.ctx(),&mut restarted);
-        assert!(crate::ticker::tick_for_test(&world.ctx(),&mut restarted));assert_eq!(runtime::snapshot(&path).unwrap().routine_occurrences.len(),1);
-        let s=runtime::snapshot(&path).unwrap();runtime::set_state(&path,s.head,s.control.unwrap().revision,ProjectState::Paused,&config).unwrap();
-        assert!(!crate::ticker::tick_for_test(&world.ctx(),&mut restarted));assert_eq!(runtime::snapshot(&path).unwrap().routine_occurrences.len(),1);
-        let s=runtime::snapshot(&path).unwrap();let pending=&s.deliveries[0];
-        runtime::retire_operation(&path,&pending.operation,pending.revision,s.head,"fixture: retire the unclaimed occurrence before resuming").unwrap();
-        let task=TaskId::new("notify").unwrap();let head=runtime::snapshot(&path).unwrap().head;
-        let head=runtime::add_task(&path,task.clone(),"notification".into(),head).unwrap();
-        runtime::create_binding(&path,None,None,head,&RuntimeRoute{socket:"/explicit/routine-notification.sock".into(),..Default::default()}).unwrap();
-        crate::reconcile_live::run(&world.ctx(),&path,true).unwrap();let s=runtime::snapshot(&path).unwrap();
-        runtime::set_state(&path,s.head,s.control.unwrap().revision,ProjectState::Active,&config).unwrap();
-        world.runner.on("--version",ok("herdr 0.9.1")).on("notification show",ok(r#"{"result":{"shown":true}}"#));
-        let op=notification_delivery::enqueue(&world.ctx(),&path,&task,runtime::snapshot(&path).unwrap().head).unwrap();
-        let result=poll(&world.ctx(),&path,0).unwrap();assert!(result.operation_error.unwrap().contains("a-broken"));
-        assert_eq!(world.runner.count("notification show"),1);
-        assert_eq!(runtime::snapshot(&path).unwrap().deliveries.iter().find(|d|d.operation==op.id).unwrap().state,DeliveryState::Confirmed);
-    }
-
-    #[test]
-    fn ticker_delivers_accepted_notification_under_leadership_and_restart_does_not_replay() {
-        let(world,path,task)=notification_delivery::tests::fixture();world.runner.on("--version",ok("herdr 0.9.1"));world.runner.on("notification show",ok(r#"{"result":{"shown":true}}"#));let leader=std::fs::File::create(world.root.join(".ticker.lock")).unwrap();leader.try_lock().unwrap();
-        let before=runtime::snapshot(&path).unwrap();let config=world.ctx().config_dir.join("config.toml");let paused=runtime::set_state(&path,before.head,before.control.unwrap().revision,ProjectState::Paused,&config).unwrap();runtime::set_state(&path,paused.head,paused.control.revision,ProjectState::Active,&config).unwrap();let head=runtime::snapshot(&path).unwrap().head;runtime::add_task(&path,herdr_projects::domain::TaskId::new("second").unwrap(),"new task".into(),head).unwrap();assert!(migration::upgrade_active(&path).is_err());let op=notification_delivery::enqueue(&world.ctx(),&path,&task,runtime::snapshot(&path).unwrap().head).unwrap();let mut memory=crate::steps::Memory::new(&world.ctx());assert!(crate::ticker::tick_for_test(&world.ctx(),&mut memory));assert_eq!(world.runner.count("notification show"),1);assert_eq!(runtime::snapshot(&path).unwrap().deliveries.iter().find(|d|d.operation==op.id).unwrap().state,DeliveryState::Confirmed);
-        drop(leader);let mut restarted=crate::steps::Memory::new(&world.ctx());crate::ticker::tick_for_test(&world.ctx(),&mut restarted);assert_eq!(world.runner.count("notification show"),1);assert_eq!(world.runner.count("agent prompt"),0);
-    }
     #[test]
     fn controller_expires_claims_without_replaying_ambiguous_notifications() {
         let(world,path,task)=notification_delivery::tests::fixture();let op=notification_delivery::enqueue(&world.ctx(),&path,&task,runtime::snapshot(&path).unwrap().head).unwrap();let mut db=migration::open_active(&path).unwrap();let now=jiff::Timestamp::now().as_millisecond();db.claim_operation(&op.id,1,"previous-controller",now,1).unwrap();std::thread::sleep(std::time::Duration::from_millis(3));
@@ -347,11 +273,6 @@ pub(crate) mod tests {
         assert!(runtime::snapshot(&path).is_err());
         raw.execute("DELETE FROM tasks WHERE id='retired/invalid'",[]).unwrap();
         assert_eq!(runtime::snapshot(&path).unwrap().deliveries[0].state,DeliveryState::Ambiguous);
-    }
-    #[test]
-    fn paused_control_blocks_notification_and_execution_lease_blocks_the_pass() {
-        let(world,path,task)=notification_delivery::tests::fixture();let op=notification_delivery::enqueue(&world.ctx(),&path,&task,runtime::snapshot(&path).unwrap().head).unwrap();let before=runtime::snapshot(&path).unwrap();let lease=crate::cleanup::lease(&world.root).unwrap();assert!(poll(&world.ctx(),&path,0).is_err());assert_eq!(runtime::snapshot(&path).unwrap(),before);drop(lease);
-        runtime::set_state(&path,before.head,before.control.unwrap().revision,ProjectState::Paused,&world.ctx().config_dir.join("config.toml")).unwrap();assert!(poll(&world.ctx(),&path,0).unwrap().operation_error.is_some());let after=runtime::snapshot(&path).unwrap();assert_eq!(after.deliveries.iter().find(|d|d.operation==op.id).unwrap().state,DeliveryState::Pending);assert_eq!(world.runner.count("notification show"),0);
     }
     #[test]
     fn blocked_operation_preserves_live_reachability_and_capacity() {
@@ -381,124 +302,6 @@ pub(crate) mod tests {
         let(world,path,_op)=finalization_delivery::tests::fixture();let raw=rusqlite::Connection::open(path.join(".state/state.db")).unwrap();raw.execute("UPDATE operations SET payload_hash=?1",["0".repeat(64)]).unwrap();
         let pool=Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),Arc::new(crate::runner::RealRunner)).unwrap());let mut queue=crate::copy_jobs::Queue::new(pool.clone());
         let result=finish_poll(&world.ctx(),&path,0,false,None,Some(&mut queue),Some(false)).unwrap();assert!(!result.reachable);assert!(!result.scheduled_work);assert!(result.unknown_effects);assert!(result.operation_error.unwrap().contains("hash mismatch"));assert!(!queue.offered());assert!(pool.stop(std::time::Duration::from_secs(2)));
-    }
-
-    #[cfg(target_os="linux")]
-    #[test]
-    fn poll_reserves_one_dependent_only_when_factory_admission_is_already_on() {
-        use herdr_projects::{domain::*,reconcile::RuntimeObservation,store::SqliteStore};
-        use sha2::{Digest,Sha256};
-        use std::{os::unix::fs::MetadataExt,sync::Arc};
-        let root=tempfile::tempdir().unwrap();
-        let project=root.path().join("project");
-        std::fs::create_dir_all(project.join(".state")).unwrap();
-        let db_path=project.join(".state/state.db");
-        let mut db=SqliteStore::create(&db_path).unwrap();
-        let now=jiff::Timestamp::now().as_millisecond();
-        db.commit(Commit{expected_head:0,mutations:["pred","c"].into_iter().map(|id|Mutation::Task{expected:None,next:Task{id:TaskId::new(id).unwrap(),revision:1,state:TaskState::Draft,title:id.into(),active_attempt:None}}).collect()}).unwrap();
-        let head=db.read_snapshot(None).unwrap().head;
-        db.commit(Commit{expected_head:head,mutations:vec![Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("attempt-pred").unwrap(),task:TaskId::new("pred").unwrap(),revision:1,state:AttemptState::Completed,snapshot:None,reservation:"slot-pred".into(),termination_observed:true}}]}).unwrap();
-        let oid="a".repeat(40);let result_id="e".repeat(64);
-        // Synthetic accepted evidence still needs a parseable contract and its
-        // exact digest; opaque fixture bytes must not bypass result provenance.
-        let contract=serde_json::to_vec(&serde_json::json!({
-            "version":1,"project_store":"/tmp/project","expected_head":0,"task_id":"pred","contract_revision":1,
-            "deliverable":"Controller fixture","non_goals":"No external worker","acceptance_policies":[{"id":"policy","text":"accept"}],
-            "repository":"/tmp/repo","base_oid":oid,"object_format":"sha1","dependencies":[],"capability_flags":[],
-            "profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_only",
-            "authority":{"id":"owner-approval-policy","revision":1,"digest":"d".repeat(64)}
-        })).unwrap();
-        let digest=format!("{:x}",Sha256::digest(&contract));
-        let policy_digest=format!("{:x}",Sha256::digest(b"accept"));
-        let installed:i64=rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT COALESCE(MAX(sequence),1) FROM events",[],|row|row.get(0)).unwrap();
-        let raw=rusqlite::Connection::open(&db_path).unwrap();
-        raw.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        raw.execute("INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq) VALUES('pred',1,NULL,'/tmp/project',0,'/tmp/repo',?1,'sha1',NULL,'verify_only',?2,?3,?4)",rusqlite::params![oid,contract,digest,installed]).unwrap();
-        raw.execute("INSERT INTO acceptance_policies(task_id,contract_revision,policy_id,body) VALUES('pred',1,'policy','accept')",[]).unwrap();
-        raw.execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,memory_snapshot_id,artifact_manifest,claimed_checks,created_unix_ms) VALUES(?1,'/tmp/project','key-pred',?1,'{}','pred',1,?1,'attempt-pred','/tmp/repo',?2,?2,'sha1',NULL,'[]','[]',1)",rusqlite::params![digest,oid]).unwrap();
-        raw.execute("INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,'/tmp/project',?1,?2,?2,'pred',1,?2,'attempt-pred','policy',?4,?3,?3,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]','accepted',NULL,0,?2,0,0,1)",rusqlite::params![result_id,digest,oid,policy_digest]).unwrap();
-        raw.execute("INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms) VALUES(?1,?1,?2,?3,?3,'sha1',?4,?2,'linux-unshare-user-pid-mount-v1',0,1)",rusqlite::params![result_id,digest,oid,policy_digest]).unwrap();
-        raw.execute("INSERT INTO verification_contract_checks VALUES(?1,2)", [&result_id]).unwrap();
-        drop(raw);
-        let child=TaskId::new("c").unwrap();
-        let snapshot=db.read_snapshot(None).unwrap();
-        db.create_runtime(Some(&child),Some(snapshot.tasks.iter().find(|task|task.id==child).unwrap().revision),snapshot.head,&RuntimeRoute::default()).unwrap();
-        let snapshot=db.read_snapshot(None).unwrap();
-        let revision=snapshot.tasks.iter().find(|task|task.id==child).unwrap().revision;
-        db.queue_task(&child,revision,snapshot.head,&QueueRequest{priority:0,dependencies:vec![Dependency{predecessor:TaskId::new("pred").unwrap(),requirement:DependencyRequirement::VerifiedResult}]},now).unwrap();
-        let snapshot=db.read_snapshot(None).unwrap();
-        db.set_scheduler_policy(snapshot.head,snapshot.scheduler.as_ref().unwrap().policy.revision,1,3).unwrap();
-        let snapshot=db.read_snapshot(None).unwrap();
-        let binding=snapshot.runtime_bindings.iter().find(|binding|binding.task.as_ref()==Some(&child)).unwrap();
-        let task_revision=snapshot.tasks.iter().find(|task|task.id==child).unwrap().revision;
-        db.record_observations(snapshot.head,&[RuntimeObservation{binding:binding.id.clone(),binding_revision:binding.revision,task_revision:Some(task_revision),observed_unix_ms:now,collector:"herdr-git-v1".into(),..RuntimeObservation::default()}]).unwrap();
-        let snapshot=db.read_snapshot(None).unwrap();
-        db.set_project_state(snapshot.head,snapshot.control.as_ref().unwrap().revision,ProjectState::Active,now,None).unwrap();
-        let evidence=VersionedReference{id:"test-only-evidence".into(),revision:1,digest:"a".repeat(64)};
-        let supported=CapabilityEvidence::Supported{evidence:evidence.clone()};
-        let profile=FrozenProfile{version:1,name:"fixture".into(),kind:"claude".into(),definition_digest:"b".repeat(64),config:herdr_projects::migration::ConfigReference{path:"/no/such/admission-config.toml".into(),digest:None},arguments_digest:"c".repeat(64),environment_names:vec![],execution_home:None,permission_policy:evidence.clone(),adapter:evidence,agent:ExecutableIdentity{path:"/usr/bin/git".into(),digest:"d".repeat(64),version:"1.0.0".into()},herdr:ExecutableIdentity{path:"/usr/bin/git".into(),digest:"e".repeat(64),version:"0.9.1".into()},capabilities:ProfileCapabilities{launch:supported.clone(),readiness_observation:supported.clone(),prompt_submission:supported.clone(),stop:supported,checkpoint_acknowledgment:CapabilityEvidence::Unknown,structured_usage:CapabilityEvidence::Unknown,resume:CapabilityEvidence::Unknown},workflow_certificate:None};
-        let reference=profile.reference().unwrap();
-        let canonical=std::fs::canonicalize(&db_path).unwrap();
-        let metadata=std::fs::metadata(&canonical).unwrap();
-        let report=serde_json::json!({"preparation":{"profile":profile,"reference":reference,"launchable":true,"protocol_capable":false,"certified":false},"source_store":[canonical,metadata.dev(),metadata.ino()]});
-        let text=serde_json::to_string(&report).unwrap();
-        let report_digest=format!("{:x}",Sha256::digest(text.as_bytes()));
-        let sequence:i64=rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT MAX(sequence) FROM events",[],|row|row.get(0)).unwrap();
-        rusqlite::Connection::open(&db_path).unwrap().execute("INSERT INTO native_profiles(profile_digest,report,report_digest,sequence) VALUES(?1,?2,?3,?4)",rusqlite::params![reference.digest,text,report_digest,sequence]).unwrap();
-        // Retained worker knowledge: without it no brief exists and nothing is reserved.
-        herdr_projects::memory::MemoryStore::from_sqlite(SqliteStore::open(&db_path).unwrap(),project.join(".state/objects")).create_worker_snapshot(SnapshotRequest{schema_version:1,task_id:"c".into(),profile:profile.name.clone(),domains:vec![],paths:vec![],pinned_keys:vec![],sensitivity:"default".into()},
-            &profile.name,&profile.definition_digest,None,32000,"Controller fixture instructions",now,None).unwrap();
-        let inputs=herdr_projects::admission::prepared_admission_inputs(&project).unwrap().expect("ready dependent");
-        let grant=ApprovalGrant{version:1,scope:ApprovalScope::for_launch(&inputs).unwrap(),policy:inputs.effective_profile.as_ref().unwrap().permission_policy.clone(),issued_unix_ms:0,expires_unix_ms:now+3_600_000};
-        let approval=grant.reference().unwrap();
-        let payload=serde_json::to_vec(&grant).unwrap();
-        rusqlite::Connection::open(&db_path).unwrap().execute("INSERT INTO approval_grants(id,payload,payload_hash) VALUES(?1,?2,?3)",rusqlite::params![approval.id,String::from_utf8(payload).unwrap(),approval.digest]).unwrap();
-        let attempts=|task:&str| rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT count(*) FROM attempts WHERE task_id=?1",[task],|row|row.get::<_,i64>(0)).unwrap();
-        let counts=|| -> Vec<(String,i64)> {
-            let conn=rusqlite::Connection::open(&db_path).unwrap();
-            let mut stmt=conn.prepare("SELECT task_id, count(*) FROM attempts GROUP BY task_id ORDER BY task_id").unwrap();
-            stmt.query_map([],|row| Ok((row.get(0)?,row.get(1)?))).unwrap().map(|row| row.unwrap()).collect()
-        };
-        assert_eq!(attempts("c"),0);
-        let home=tempfile::tempdir().unwrap();
-        let env=crate::paths::Env::for_test(home.path(),&[]);
-        let runner=crate::runner::RealRunner;
-        let ctx=crate::paths::Ctx{env:&env,root:home.path().into(),config_dir:home.path().join("config"),runner:&runner,detached_ticker:false};
-        let pool=Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),Arc::new(crate::runner::RealRunner)).unwrap());
-        let mut reads=observations::Reads::new(pool.clone());
-        poll_queued_effects(&ctx,&project,0,&mut reads,None).unwrap();
-        assert_eq!(attempts("c"),0,"flag off must not reserve");
-        let column=["factory","_admission"].concat();
-        rusqlite::Connection::open(&db_path).unwrap().execute(&format!("UPDATE project_control SET {column}=?1 WHERE singleton=1"),["on"]).unwrap();
-        let queued:Vec<String>={
-            let conn=rusqlite::Connection::open(&db_path).unwrap();
-            let mut stmt=conn.prepare("SELECT task_id FROM task_queue ORDER BY task_id").unwrap();
-            stmt.query_map([],|row| row.get(0)).unwrap().map(|row| row.unwrap()).collect()
-        };
-        assert_eq!(queued,vec!["c".to_string()],"C must be the only queued dependent");
-        let before=counts();
-        assert_eq!(attempts("c"),0);
-        let mut reads=observations::Reads::new(pool.clone());
-        let admitted=poll_queued_effects(&ctx,&project,1,&mut reads,None).unwrap();
-        let logged:serde_json::Value=serde_json::from_str(admitted.admission_log.as_deref().unwrap()).unwrap();
-        assert_eq!(logged["reason"],"reserved");
-        assert_eq!(logged["sql_work"]["connection_observed"],true);
-        assert!(logged["sql_work"]["sqlite_rows_returned"].as_u64().unwrap()>0);
-        assert!(logged["sql_work"]["sqlite_vm_steps"].as_u64().unwrap()>0);
-        assert_eq!(attempts("c"),1,"one poll_queued_effects wake reserves C");
-        let mut expected=before;
-        expected.push(("c".into(),1));
-        expected.sort();
-        assert_eq!(counts(),expected,"no other task gains an attempt");
-        let old=jiff::Timestamp::now().as_millisecond()-16*60*1000;
-        rusqlite::Connection::open(&db_path).unwrap().execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,memory_snapshot_id,artifact_manifest,claimed_checks,created_unix_ms) VALUES(?1,'/tmp/project','key-old',?2,'{}','pred',1,?2,'attempt-pred','/tmp/repo',?3,?3,'sha1',NULL,'[]','[]',?4)",rusqlite::params!["f".repeat(64),digest,oid,old]).unwrap();
-        let mut reads=observations::Reads::new(pool.clone());
-        let again=poll_queued_effects(&ctx,&project,2,&mut reads,None).unwrap();
-        let note=again.operation_error.unwrap_or_default();
-        assert!(note.contains("capacity_full: verification_backlog"),"{note}");
-        assert_eq!(attempts("c"),1,"backlog is diagnostic and must not reserve another attempt");
-        assert_eq!(counts(),expected,"backlog does not add an attempt");
-        assert!(pool.stop(std::time::Duration::from_secs(2)));
     }
 
 }

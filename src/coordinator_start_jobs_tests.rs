@@ -47,13 +47,6 @@ sys.exit(2)
     fn sent(&self)->bool{self.root.path().join("sent").exists()}
 }
 #[test]
-fn coordinator_start_confirms_submission_once_without_certifying_readiness() {
-    for mode in ["confirmed","native","null"] {
-        let f=Fixture::new(mode);execute(&f.input,&Control::default()).unwrap();let c=f.record();assert!(c.prime_pending);assert_eq!(c.launch_claim.unwrap().phase,LaunchPhase::Confirmed);assert_eq!(c.launch_attempts,1);
-        assert!(super::super::ready(&f.record()).is_ok());assert!(execute(&f.input,&Control::default()).is_err());assert_eq!(fs::read(f.root.path().join("sent")).unwrap(),b"start");
-    }
-}
-#[test]
 fn coordinator_start_refuses_busy_foreign_ambiguous_and_unsupported_targets_before_claiming() {
     for mode in ["busy","foreign-busy","duplicate","unsupported","no-terminal"] {
         let f=Fixture::new(mode);assert!(execute(&f.input,&Control::default()).is_err(),"{mode}");assert!(!f.sent());assert!(f.record().launch_claim.is_none());assert_eq!(f.record().launch_attempts,0);
@@ -91,23 +84,6 @@ fn blocked_coordinator_start_retains_ownership_and_cancels() {
     assert!(ProjectGuard::acquire(&f.project.dir()).is_err());control.cancellation.cancel();assert!(worker.join().unwrap().is_err());f.recover();assert!(f.record().launch_claim.unwrap().notified);
 }
 #[test]
-fn open_retains_launch_history_and_queues_a_new_request_without_starting() {
-    let world=crate::scenarios::World::new();let project=world.project("demo","a.sock");*world.panes.borrow_mut()=format!("[{}]",world.coordinator_pane(&project));
-    project.update_coordinator(|c|{c.prime_request=1;c.prime_pending=true;c.launch_sequence=1;c.launch_claim=Some(LaunchClaim{sequence:1,generation:1,execution:"a".repeat(64),arguments_digest:"b".repeat(64),route_digest:"c".repeat(64),terminal:"terminal".into(),phase:LaunchPhase::Uncertain,error:"lost reply".into(),notified:true});}).unwrap();
-    let before=project.coordinator().unwrap();let ctx=world.ctx();crate::coordinator::open(&ctx,"demo",&crate::coordinator::OpenOptions{session:paths::SessionFlags{socket:Some(before.socket.clone().into()),..Default::default()},reprime:true,rebind:false}).unwrap();
-    let after=project.coordinator().unwrap();assert_eq!(after.prime_request,2);assert_eq!(after.launch_claim,before.launch_claim);assert_eq!(after.launch_attempts,0);assert!(after.prime_pending);assert_eq!(world.runner.count("agent start"),0);assert_eq!(world.runner.count("agent prompt"),0);
-}
-#[test]
 fn coordinator_start_refuses_a_thread_sharing_its_pane() {
     let f=Fixture::new("confirmed");thread::allocate(&f.project,|t|{t.status=thread::Status::Resolved;t.pane_id="p".into();}).unwrap();assert!(execute(&f.input,&Control::default()).is_err());assert!(!f.sent());assert!(f.record().launch_claim.is_none());
-}
-
-#[test]
-fn plain_open_cannot_turn_a_missing_agent_observation_into_another_launch_request() {
-    for phase in [LaunchPhase::Confirmed,LaunchPhase::Uncertain,LaunchPhase::Pending] {
-        let world=crate::scenarios::World::new();let project=world.project("demo","a.sock");*world.panes.borrow_mut()=format!("[{}]",world.coordinator_pane(&project));
-        project.update_coordinator(|c|{c.prime_request=1;c.prime_pending=true;c.launch_sequence=1;c.launch_claim=Some(LaunchClaim{sequence:1,generation:1,execution:"a".repeat(64),arguments_digest:"b".repeat(64),route_digest:"c".repeat(64),terminal:"terminal".into(),error:if phase==LaunchPhase::Uncertain{"lost reply".into()}else{String::new()},notified:phase!=LaunchPhase::Pending,phase:phase.clone()});}).unwrap();
-        let before=project.coordinator().unwrap();let ctx=world.ctx();let error=crate::coordinator::open(&ctx,"demo",&crate::coordinator::OpenOptions{session:paths::SessionFlags{socket:Some(before.socket.clone().into()),..Default::default()},reprime:false,rebind:false}).unwrap_err();
-        assert!(error.to_string().contains("open --reprime"));assert_eq!(project.coordinator().unwrap(),before);assert!(ready(&before).is_err());assert_eq!(world.runner.count("agent start"),0);assert_eq!(world.runner.count("agent prompt"),0);
-    }
 }
