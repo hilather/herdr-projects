@@ -12,12 +12,13 @@ use std::{fs, path::PathBuf, process::{Command, Output}};
 const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
 const POLICY: &str = r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#;
 
-struct Factory { home: tempfile::TempDir, project: PathBuf, key: PathBuf, repo: PathBuf, store: String, base: String, candidate: String }
+struct Factory { home: tempfile::TempDir, project: PathBuf, key: PathBuf, repo: PathBuf, store: String, base: String, candidate: String, format: &'static str }
 
 impl Factory {
-    /// A repository with a base commit, a candidate commit that adds `src/lib.rs`,
-    /// and an unchecked-out `integration` branch at the base.
-    fn new() -> Self {
+    fn new() -> Self { Self::with_format("sha1") }
+    /// A repository in object `format` with a base commit, a candidate commit
+    /// that adds `src/lib.rs`, and an unchecked-out `integration` branch at the base.
+    fn with_format(format: &'static str) -> Self {
         let home = tempfile::tempdir().unwrap();
         let key = home.path().join("owner");
         assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).status().unwrap().success());
@@ -26,13 +27,13 @@ impl Factory {
         fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n")).unwrap();
         let repo = home.path().join("repo");
         fs::create_dir(&repo).unwrap();
-        let mut f = Factory { project: home.path().join("root/demo"), key, repo: repo.canonicalize().unwrap(), store: String::new(), base: String::new(), candidate: String::new(), home };
+        let mut f = Factory { project: home.path().join("root/demo"), key, repo: repo.canonicalize().unwrap(), store: String::new(), base: String::new(), candidate: String::new(), format, home };
         for command in ["new", "pause"] { f.ok(&[command, "demo"]); }
         migration::apply(&f.project, &migration::inspect_with_config(&f.project, &config).unwrap(), true).unwrap();
         let s = runtime::snapshot(&f.project).unwrap();
         runtime::set_state(&f.project, s.head, s.control.unwrap().revision, ProjectState::Active, &config).unwrap();
         f.store = f.project.join(".state/state.db").canonicalize().unwrap().display().to_string();
-        f.git(&["init", "-q", "--object-format=sha1", "--initial-branch=main"]);
+        f.git(&["init", "-q", &format!("--object-format={format}"), "--initial-branch=main"]);
         f.git(&["commit", "-q", "--allow-empty", "-m", "base"]);
         f.base = f.git(&["rev-parse", "HEAD"]);
         f.git(&["branch", "integration"]);
@@ -74,13 +75,22 @@ impl Factory {
     }
     fn db(&self) -> herdr_projects::store::SqliteStore { migration::open_active(&self.project).unwrap() }
     fn memory(&self) -> MemoryStore { MemoryStore::from_sqlite(self.db(), self.project.join(".state/objects")) }
+    /// A contract document for `task` that may integrate, writing `scope`.
+    fn contract_body(&self, task: &str, revision: u64, deliverable: &str, scope: Value) -> Value {
+        json!({"version":1,"project_store":self.store,"expected_head":self.head(),"task_id":task,"contract_revision":revision,
+            "deliverable":deliverable,"non_goals":"no worker launch","acceptance_policies":[{"id":"builds","text":POLICY}],
+            "repository":self.repo,"base_oid":self.base,"object_format":self.format,"dependencies":[],"scope":scope,
+            "capability_flags":[],"profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_then_integrate",
+            "authority":authority::policy_reference(&self.project).unwrap()})
+    }
+    /// `task contract put` of the owner-signed contract document `bytes`.
+    fn put(&self, name: &str, bytes: &[u8]) -> Output {
+        let (doc, sig) = self.sign(name, bytes, authority::CONTRACT_SIGNATURE_NAMESPACE);
+        self.cli(&["task", "demo", "contract", "put", "--input-file", doc.to_str().unwrap(), "--signature", sig.to_str().unwrap()])
+    }
     /// Install (or revise) a signed contract that may integrate; returns its digest.
     fn contract(&self, task: &str, revision: u64) -> String {
-        let body = json!({"version":1,"project_store":self.store,"expected_head":self.head(),"task_id":task,"contract_revision":revision,
-            "deliverable":"dependency fixture","non_goals":"no worker launch","acceptance_policies":[{"id":"builds","text":POLICY}],
-            "repository":self.repo,"base_oid":self.base,"object_format":"sha1","dependencies":[],"scope":{"paths":[{"path":"src/","access":"write"}],"named_resources":[]},
-            "capability_flags":[],"profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_then_integrate",
-            "authority":authority::policy_reference(&self.project).unwrap()});
+        let body = self.contract_body(task, revision, "dependency fixture", json!({"paths":[{"path":"src/","access":"write"}],"named_resources":[]}));
         let (doc, sig) = self.sign(&format!("{task}-contract-{revision}.json"), &serde_json::to_vec(&body).unwrap(), authority::CONTRACT_SIGNATURE_NAMESPACE);
         self.ok(&["task", "demo", "contract", "put", "--input-file", doc.to_str().unwrap(), "--signature", sig.to_str().unwrap()])["digest"].as_str().unwrap().into()
     }
@@ -135,7 +145,7 @@ impl Factory {
         }).collect();
         let submission = json!({"idempotency_key":key,"task_id":task,"contract_revision":revision,"contract_digest":digest,
             "attempt_id":attempt,"repository":self.repo,"base_oid":self.base,"candidate_oid":self.candidate,
-            "object_format":"sha1","artifact_manifest":[],"claimed_checks":[],"objects":objects});
+            "object_format":self.format,"artifact_manifest":[],"claimed_checks":[],"objects":objects});
         let path = self.path(&format!("{key}.json"));
         fs::write(&path, serde_json::to_vec(&submission).unwrap()).unwrap();
         self.ok(&["result", "demo", "submit", "--input-file", path.to_str().unwrap()])["submission_id"].as_str().unwrap().into()
@@ -335,4 +345,99 @@ fn an_open_memory_fence_hides_the_satisfaction_until_reconciled() {
     assert_eq!(f.blockers("needs-verified"), disabled("verified_result"));
     assert_eq!(queued(), before);
     assert_eq!(f.satisfactions("verified_result"), [(result, "valid".into())]);
+}
+
+impl Factory {
+    fn count(&self, sql: &str) -> i64 { self.raw().query_row(sql, [], |r| r.get(0)).unwrap() }
+    fn stored_contract(&self, task: &str) -> Vec<u8> {
+        self.raw().query_row("SELECT raw_bytes FROM task_contracts WHERE task_id=?1", [task], |r| r.get(0)).unwrap()
+    }
+}
+
+/// Replaces `contract_bytes_are_stored_raw_and_a_changed_revision_conflicts`.
+///
+/// The signed contract bytes are kept exactly as signed, not re-serialized.
+/// Installing the same bytes again replays the same digest, even after the
+/// head moved; different bytes for the same revision are refused and the
+/// stored bytes stay the original.
+#[test]
+fn a_contract_revision_keeps_its_signed_bytes_and_refuses_different_ones() {
+    let f = Factory::new();
+    f.ok(&["task", "demo", "add", "task", "--title", "task", "--expected-head", &f.head().to_string()]);
+    let scope = json!({"paths":[{"path":"src/","access":"write"}],"named_resources":[]});
+    let mut original = serde_json::to_vec_pretty(&f.contract_body("task", 1, "ship the widget", scope.clone())).unwrap();
+    original.push(b'\n');
+    let installed: Value = serde_json::from_slice(&f.put("original.json", &original).stdout).unwrap();
+    assert_eq!(installed["replayed"], false, "{installed}");
+    assert_eq!(f.stored_contract("task"), original);
+    f.ok(&["task", "demo", "add", "later", "--title", "later", "--expected-head", &f.head().to_string()]);
+    let replay = f.put("original.json", &original);
+    assert!(replay.status.success(), "{}", String::from_utf8_lossy(&replay.stderr));
+    let replay: Value = serde_json::from_slice(&replay.stdout).unwrap();
+    assert_eq!((&replay["replayed"], &replay["digest"]), (&json!(true), &installed["digest"]));
+
+    let head = f.head();
+    let changed = f.put("changed.json", &serde_json::to_vec(&f.contract_body("task", 1, "ship something else", scope)).unwrap());
+    assert!(!changed.status.success());
+    assert!(String::from_utf8_lossy(&changed.stderr).contains("changed contract bytes"), "{}", String::from_utf8_lossy(&changed.stderr));
+    assert_eq!(f.head(), head);
+    assert_eq!(f.stored_contract("task"), original);
+    assert_eq!(f.count("SELECT count(*) FROM task_contracts"), 1);
+}
+
+/// Replaces `signed_contract_scope_stores_one_revision_and_overlap_is_not_locked`.
+///
+/// A contract's declared scope is stored with its revision: exact paths,
+/// uncertain prefixes and globs, and named resources. A second task may
+/// declare the same writes; installing contracts reserves and queues nothing.
+/// A scope naming one path twice, or a path outside the repository, is refused.
+#[test]
+fn contract_scopes_are_stored_as_declared_and_overlapping_ones_are_not_locked() {
+    let f = Factory::new();
+    for task in ["task", "other"] { f.ok(&["task", "demo", "add", task, "--title", task, "--expected-head", &f.head().to_string()]); }
+    let scope = json!({"paths":[{"path":"src/lib.rs","access":"write"},{"path":"src/nested/item.rs","access":"read"},
+        {"path":"migrations/","access":"write"},{"path":"src/*.rs","access":"write"}],
+        "named_resources":[{"name":"schema","access":"write"},{"name":"lockfile","access":"read"}]});
+    for task in ["task", "other"] {
+        let out = f.put(&format!("{task}.json"), &serde_json::to_vec(&f.contract_body(task, 1, "scoped", scope.clone())).unwrap());
+        assert!(out.status.success(), "{task}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap()["contract_revision"], 1);
+    }
+    let raw = f.raw();
+    let paths: Vec<(i64, String, String, String)> = raw.prepare("SELECT ordinal, path, access, certainty FROM contract_scope_paths WHERE task_id='task' ORDER BY ordinal").unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap().map(Result::unwrap).collect();
+    let row = |o: i64, p: &str, a: &str, c: &str| (o, p.to_owned(), a.to_owned(), c.to_owned());
+    assert_eq!(paths, [row(0, "src/lib.rs", "write", "exact"), row(1, "src/nested/item.rs", "read", "exact"),
+        row(2, "migrations/", "write", "uncertain"), row(3, "src/*.rs", "write", "uncertain")]);
+    let named: Vec<(String, String, String)> = raw.prepare("SELECT task_id, name, access FROM contract_named_resources ORDER BY task_id, name").unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(Result::unwrap).collect();
+    let named_row = |t: &str, n: &str, a: &str| (t.to_owned(), n.to_owned(), a.to_owned());
+    assert_eq!(named, [named_row("other", "lockfile", "read"), named_row("other", "schema", "write"), named_row("task", "lockfile", "read"), named_row("task", "schema", "write")]);
+    assert_eq!(f.count("SELECT count(*) FROM contract_scope_paths WHERE path='src/lib.rs' AND access='write'"), 2);
+    assert_eq!((f.count("SELECT count(*) FROM attempts"), f.count("SELECT count(*) FROM task_queue")), (0, 0));
+
+    f.ok(&["task", "demo", "add", "bad", "--title", "bad", "--expected-head", &f.head().to_string()]);
+    for (name, paths) in [("duplicate", json!([{"path":"src/lib.rs","access":"write"},{"path":"src/./lib.rs","access":"read"}])),
+        ("escape", json!([{"path":"../secret","access":"write"}]))] {
+        let head = f.head();
+        let out = f.put(&format!("{name}.json"), &serde_json::to_vec(&f.contract_body("bad", 1, name, json!({"paths":paths,"named_resources":[]}))).unwrap());
+        assert!(!out.status.success(), "{name} scope accepted");
+        assert_eq!(f.head(), head);
+    }
+    assert_eq!(f.count("SELECT count(*) FROM task_contracts"), 2);
+}
+
+/// Replaces `review_probe_sha256_retained_checkout`.
+///
+/// A SHA-256 repository's retained objects check out in the sandbox and its
+/// submission is accepted and recorded as the dependency's evidence.
+#[test]
+fn a_sha256_repository_submission_is_verified_from_its_retained_objects() {
+    let f = Factory::with_format("sha256");
+    assert_eq!(f.candidate.len(), 64);
+    f.predecessor("pred", &[]);
+    f.consumer("needs-verified", "pred", "verified_result");
+    let result = f.verified("pred", "pred-1", "sha256");
+    assert_eq!(f.satisfactions("verified_result"), [(result, "valid".into())]);
+    assert_eq!(f.blockers("needs-verified"), disabled("verified_result"));
 }

@@ -24,30 +24,7 @@ fn fixture()->(tempfile::TempDir,std::path::PathBuf) {
 }
 fn deadline()->Instant {Instant::now()+Duration::from_secs(5)}
 
-#[test]
-fn synchronous_turn_keeps_the_same_rotation_and_withdrawal_rules() {
-    let(_root,project)=fixture();
-    fs::write(project.join("a-first.sh"),"changed after approval").unwrap();
-    for turn in 0..4 {
-        let report=super::super::schedule_turn(&project,turn).unwrap();
-        assert!(report.active);assert_eq!(report.diagnostic.is_some(),turn%2==0);
-    }
-    assert_eq!(runtime::snapshot(&project).unwrap().routine_occurrences.len(),1);
-    assert!(!project.join("MUST_NOT_EXECUTE").exists());
-}
 
-#[test]
-fn held_planning_rotates_after_withdrawn_script_and_only_records_intent() {
-    let(_root,project)=fixture();let guard=ProjectGuard::acquire(&project).unwrap();let cancellation=Cancellation::default();
-    fs::write(project.join("a-first.sh"),"changed after approval").unwrap();
-    let mut last=None;
-    for expected in ["a-first","b-second","a-first","b-second"] {
-        let report=schedule_next_guarded(&project,last.as_deref(),&guard,&cancellation,deadline()).unwrap();
-        assert!(report.active);assert_eq!(report.selected_name.as_deref(),Some(expected));assert_eq!(report.diagnostic.is_some(),expected=="a-first");last=report.selected_name;
-    }
-    let snapshot=runtime::snapshot(&project).unwrap();assert_eq!(snapshot.routine_occurrences.len(),1);assert_eq!(snapshot.deliveries[0].attempts,0);assert!(!project.join("MUST_NOT_EXECUTE").exists());
-    assert!(ProjectGuard::acquire(&project).is_err());
-}
 
 #[test]
 fn held_planning_refuses_wrong_guard_cancelled_expired_and_busy_record_lock() {
@@ -84,10 +61,4 @@ fn held_planning_never_rebases_a_stale_prepared_head() {
     });
     assert!(result.is_err());let snapshot=runtime::snapshot(&project).unwrap();assert_eq!(snapshot.tasks.len(),1);assert!(snapshot.routine_occurrences.is_empty());
     assert!(schedule_next_guarded(&project,None,&guard,&cancellation,deadline()).unwrap().active);
-}
-
-#[test]
-fn held_planning_known_inactive_state_returns_no_cursor_or_liveness() {
-    let(root,project)=fixture();let snapshot=runtime::snapshot(&project).unwrap();runtime::set_state(&project,snapshot.head,snapshot.control.unwrap().revision,ProjectState::Paused,&root.path().join("owner.toml")).unwrap();
-    let guard=ProjectGuard::acquire(&project).unwrap();let report=schedule_next_guarded(&project,Some("a-first"),&guard,&Cancellation::default(),deadline()).unwrap();assert!(!report.active);assert!(report.selected_name.is_none());assert!(report.diagnostic.is_none());assert!(runtime::snapshot(&project).unwrap().routine_occurrences.is_empty());
 }

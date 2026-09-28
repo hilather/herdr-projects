@@ -1,26 +1,6 @@
 use crate::execution_guard::GatedSpawn;
 use super::*;
 
-#[test]
-fn project_scope_uses_control_revision_without_inventing_a_task() {
-    let temp=tempfile::tempdir().unwrap();let mut db=SqliteStore::create(&temp.path().join("state.db")).unwrap();
-    let snapshot=db.read_snapshot(None).unwrap();
-    db.set_project_state(snapshot.head,snapshot.control.unwrap().revision,ProjectState::Active,1000,None).unwrap();
-    let snapshot=db.read_snapshot(None).unwrap();let revision=snapshot.control.as_ref().unwrap().revision;
-    let id=OperationId::new("project-routine").unwrap();
-    // Only a sealed routine service may produce this in production. Raw SQL is fixture setup.
-    db.connection.execute("INSERT INTO operations VALUES(?1,NULL,'routine.run','routine:check',1,'{}',?2,?3,0,?1)",params![id.as_str(),format!("{:x}",Sha256::digest(b"{}")),integer(revision).unwrap()]).unwrap();
-    let snapshot=db.read_snapshot(None).unwrap();assert!(snapshot.tasks.is_empty());
-    assert!(snapshot.operations[0].task.is_none());
-    assert!(db.commit(Commit{expected_head:snapshot.head,mutations:vec![Mutation::Enqueue(snapshot.operations[0].clone())]}).is_err());
-    assert_eq!(db.read_snapshot(None).unwrap(),snapshot);
-    assert!(binding_current(&db.connection,&id,true).unwrap());
-    assert!(db.claim_operation(&id,1,"routine-worker",1000,1000).is_err());
-    assert_eq!(db.read_snapshot(None).unwrap(),snapshot);
-    db.set_project_state(snapshot.head,revision,ProjectState::Paused,1001,None).unwrap();
-    assert!(!binding_current(&db.connection,&id,true).unwrap());
-    assert!(db.read_snapshot(None).unwrap().tasks.is_empty());
-}
 fn fixture()->(tempfile::TempDir,SqliteStore,OperationId) {
     let temp=tempfile::tempdir().unwrap();let mut db=SqliteStore::create(&temp.path().join("state.db")).unwrap();
     let task=Task{id:TaskId::new("task").unwrap(),revision:1,state:TaskState::Ready,title:"fixture".into(),active_attempt:None};
@@ -28,16 +8,6 @@ fn fixture()->(tempfile::TempDir,SqliteStore,OperationId) {
     let op=Operation{id:id.clone(),task:Some(task.id.clone()),kind:"fixture".into(),target:"disposable".into(),payload_version:1,payload:serde_json::json!({"key":"value"}),expected_revision:1,due_unix_ms:100,idempotency_key:"unique".into()};
     db.commit(Commit{expected_head:0,mutations:vec![Mutation::Task{expected:None,next:task},Mutation::Enqueue(op)]}).unwrap();
     (temp,db,id)
-}
-#[test]
-fn claim_outcome_and_restart_preserve_intent_and_audit() {
-    let (temp,mut db,id)=fixture();assert!(db.claim_operation(&id,1,"worker",99,1000).is_err());
-    let claim=db.claim_operation(&id,1,"worker",100,1000).unwrap();
-    assert!(db.claim_operation(&id,1,"second",100,1000).is_err());
-    let done=db.finish_operation(&claim,Outcome::Confirmed{observed_identity:"resource-1".into()},101).unwrap();
-    assert_eq!(done.state,DeliveryState::Confirmed);drop(db);
-    let mut db=SqliteStore::open(&temp.path().join("state.db")).unwrap();assert_eq!(db.deliveries().unwrap(),vec![done]);
-    assert_eq!(db.read_snapshot(None).unwrap().events.len(),4);
 }
 #[test]
 fn expired_claim_is_ambiguous_and_old_owner_cannot_finish_over_new_epoch() {

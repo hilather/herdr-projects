@@ -140,15 +140,6 @@ mod tests {
         assert!(work[1]<=work[0]+100,"superseded history increased proposal work: {work:?}");
     }
 
-    #[test]
-    fn successive_proposals_cannot_hide_a_cycle_in_accepted_intent() {
-        let (_root,mut db)=fixture();
-        db.connection.execute_batch("INSERT INTO tasks VALUES('a',1,'draft','a',NULL),('b',1,'draft','b',NULL);").unwrap();
-        db.apply_plan_proposal(&proposal("a",&["b"]),0,"first").unwrap();
-        let head=db.current_head().unwrap();
-        assert!(matches!(db.apply_plan_proposal(&proposal("b",&["a"]),1,"second"),Err(StoreError::Invalid(message)) if message.contains("cycle")));
-        assert_eq!(db.current_head().unwrap(),head);assert_eq!(current_revision(&db.connection).unwrap(),1);
-    }
 
     #[test]
     fn proposal_work_is_independent_of_unqueued_task_history() {
@@ -170,21 +161,6 @@ mod tests {
         }
         eprintln!("proposal accept/replay/stale SQL steps at 0/10000 unqueued tasks: {work:?}");
         for phase in 0..3 {assert!(work[1][phase]<=work[0][phase]+100,"unrelated history increased proposal work: {work:?}");}
-    }
-    #[test]
-    fn proposal_graph_preserves_unmentioned_edges_and_refuses_bad_dependencies() {
-        let (_root,mut db)=fixture();
-        db.connection.execute_batch("INSERT INTO tasks VALUES('a',1,'queued','a',NULL),('b',1,'succeeded','b',NULL); INSERT INTO task_queue VALUES('a',0,0,1); INSERT INTO task_dependencies(task_id,predecessor_id,requirement) VALUES('a','b','verified_result');").unwrap();
-        let head=db.current_head().unwrap();
-        for raw in [proposal("b",&["a"]),proposal("c",&["missing"]),proposal("c",&["b","b"]),proposal("c",&["c"])] {
-            assert!(db.apply_plan_proposal_with_budget(&raw,0,"bad",Some(&budget())).is_err());assert_eq!(db.current_head().unwrap(),head);
-        }
-        let expired=read_budget::ReadBudget::new(controlled::ReadControl::new(std::time::Instant::now(),Default::default()));
-        assert!(matches!(db.apply_plan_proposal_with_budget(&proposal("c",&["b"]),0,"expired",Some(&expired)),Err(StoreError::Deadline)));
-        assert_eq!(db.current_head().unwrap(),head);
-        let raw=serde_json::to_vec(&serde_json::json!({"version":1,"contracts":[{"task_id":"a","text":"replace proposed edges","dependencies":[{"predecessor":"c","requirement":"verified_result"}]},{"task_id":"c","text":"new predecessor","dependencies":[]}]})).unwrap();
-        db.apply_plan_proposal_with_budget(&raw,0,"valid",Some(&budget())).unwrap();
-        assert_eq!(db.connection.query_row("SELECT predecessor_id FROM task_dependencies WHERE task_id='a'",[],|r|r.get::<_,String>(0)).unwrap(),"b");
     }
     #[test]
     fn proposal_graph_refuses_overfull_queue_before_acceptance() {

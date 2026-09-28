@@ -1397,3 +1397,96 @@ Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
   plan test.
 - Dropping the reference check from the default build's `cleanup::restore`
   failed the reopen test: the worktree was reopened under a new owner.
+
+## Store, plan, feedback, memory and routine unit tests replaced by E2E workflows
+
+The audit marked 30 tests REPLACE across `src/store` (results, plans,
+feedback, delivery, consumer bindings, verification, targeted reads, memory
+invalidation and delivery, delegation, routines, `tests.rs`), `src/memory`,
+`src/verification/tests.rs` and `src/routines/planning/tests.rs`. 26 were
+deleted, 1 was cut down, and 3 were kept.
+
+The new tests drive the compiled CLI:
+- `tests/satisfaction.rs` (extended): `task contract put` with exact signed
+  bytes and scopes; a SHA-256 repository through `result submit/verify`.
+- `tests/plans.rs` (extended): `plan propose`, `plan session`, repeated
+  rejecting `result verify`, and `plan wait register/replay/rearm` for an
+  adapter-recovery wait. The runtime binding, its ownership and its pane
+  observations are recorded through the public store API, while the project
+  is paused, because no Herdr pane exists.
+- `tests/controller.rs` (extended): `routine-store import/schedule`, and
+  `ticker run` for routines and a notification retry. The Herdr stand-in can
+  answer one show as `busy` and logs the time of each show.
+- `tests/memory_regressions.rs` (extended): `memory propose/review/promote`,
+  signed `revoke_head`, `memory deliveries` and coordinator `context`.
+- `tests/reservations.rs` (extended): `launch draft/reserve` with no
+  delegation rows.
+- `tests/store_records.rs` (new): `task add/rename/show`.
+
+| New E2E test | Replaced unit tests |
+| --- | --- |
+| `a_contract_revision_keeps_its_signed_bytes_and_refuses_different_ones` | `contract_bytes_are_stored_raw_and_a_changed_revision_conflicts` |
+| `contract_scopes_are_stored_as_declared_and_overlapping_ones_are_not_locked` | `signed_contract_scope_stores_one_revision_and_overlap_is_not_locked` |
+| `a_sha256_repository_submission_is_verified_from_its_retained_objects` | `review_probe_sha256_retained_checkout` |
+| `a_later_proposal_cannot_close_a_cycle_through_accepted_intent` | `successive_proposals_cannot_hide_a_cycle_in_accepted_intent` |
+| `bad_dependencies_are_refused_and_proposals_leave_queued_edges_alone` | `proposal_graph_preserves_unmentioned_edges_and_refuses_bad_dependencies` |
+| `a_planner_session_keeps_its_exact_inputs_and_bound_proposal_across_restarts` | `session_retains_exact_inputs_and_acceptance_across_restart` |
+| `a_repeated_rejected_verification_records_its_feedback_once` | `duplicate_verifier_rejection_feedback_polls_do_not_insert_duplicate_items`, `duplicate_verifier_rejection_polls_do_not_insert_duplicate_feedback` |
+| `a_recovery_wait_wakes_once_the_owned_pane_is_back_and_changes_no_ownership` | `recovery_wait_notifies_once_after_restart_and_preserves_ownership` |
+| `missed_slots_are_skipped_or_coalesced_and_a_revision_never_reuses_an_occurrence` | `missed_policy_skips_a_bounded_window_and_revisions_do_not_reuse_occurrences` |
+| `the_ticker_runs_routines_only_while_active_and_never_revives_a_disabled_revision` | `held_planning_known_inactive_state_returns_no_cursor_or_liveness`, `project_scope_uses_control_revision_without_inventing_a_task`, `planning_selection_does_not_revive_an_enabled_historical_revision` |
+| `ticker_runs_an_approved_routine_once_beside_one_edited_after_approval` (existing) | `synchronous_turn_keeps_the_same_rotation_and_withdrawal_rules`, `held_planning_rotates_after_withdrawn_script_and_only_records_intent` |
+| `a_notification_retry_is_not_delivered_before_it_is_due` | `targeted_notification_candidate_matches_the_snapshot_and_a_future_due_stays_blocked` |
+| `ticker_delivers_a_notification_once_only_while_active_and_unleased` (existing) | `claim_outcome_and_restart_preserve_intent_and_audit` |
+| `a_repeated_proposal_is_reused_and_changed_bytes_under_its_id_are_refused` | `duplicate_proposal_reuses_result_and_changed_bytes_conflict` |
+| `competing_reviewed_rewrites_promote_once_and_the_loser_must_be_proposed_again` | `competing_promotions_conflict_and_stale_review_must_be_repeated` |
+| `missing_bodies_are_rejected_and_revoked_records_leave_the_facts_but_keep_their_bytes` | missing-evidence and revocation half of `missing_expiry_and_revocation_are_not_active_facts`, `ingest_cancels_gc_claim_and_unreferenced_objects_are_purged` |
+| `memory_changes_reach_the_coordinator_and_only_the_live_worker_that_consumed_them` | `routing_keeps_consumed_historical_dependencies_and_scope_boundaries`, `coordinator_binding_is_addressable_without_an_attempt`, `shadow_compare_drops_no_required_recipient` |
+| `an_exact_approval_reserves_its_launch_without_any_delegation_record` | `empty_delegation_tables_do_not_change_the_exact_grant_path` |
+| `task_changes_commit_with_their_events_and_survive_reopening` | `atomic_records_intents_events_reopen_and_history` |
+| `path_like_task_ids_and_out_of_range_revisions_are_refused` | `invalid_ids_and_overflow_are_rejected` |
+
+Some guarantees look different from the CLI:
+- A paused project cannot resume while a routine run is still queued, so
+  the routine test retires the run before resuming. It then shows that the
+  paused pass left the run pending and unrun, and that the active ticker
+  plans only the enabled routines.
+- A notification whose retry is not yet due is visible as the time between
+  Herdr's two shows: at least the one-second backoff. The targeted reader's
+  agreement with the snapshot is an in-process counter with no reader
+  outside the process, so it is not asserted.
+- The shadow comparison of old and new memory routing has no CLI form. The
+  E2E test asserts what it protected: the live worker and the coordinator
+  session receive the change, and a snapshot no attempt used receives
+  nothing. The coordinator's subscriber is `coordinator:` plus a digest of
+  the session, not the session name.
+- A promotion is refused when another review was recorded after its own
+  review. The test therefore reviews and promotes the winner before it
+  reviews the rival.
+- A recovery wait is serviced through `plan wait replay`, which also
+  notifies. The ticker would observe the fixture's pane itself and overwrite
+  the planted observation.
+
+Kept:
+- `pr_poll_category_does_not_insert_feedback_or_change_satisfaction`. Only
+  verification and integration write feedback, and each uses a fixed
+  category. The refusal of an external-poll category is reached only
+  through a `cfg(test)` hook.
+- `unread_namespace_does_not_allow_mount`. No command can make the host
+  mount-namespace link unreadable; every real verify run takes the
+  new-namespace branch.
+- `expiry_of_a_source_excludes_derived_facts_without_a_write`, and
+  `expired_records_are_not_active_facts` (cut down from
+  `missing_expiry_and_revocation_are_not_active_facts`). No command sets a
+  record's expiry.
+
+Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
+- Skipping the "changed contract bytes" check on an existing revision failed
+  `a_contract_revision_keeps_its_signed_bytes_and_refuses_different_ones`:
+  different bytes replayed as the stored revision.
+- Dropping the task-local scope check in memory routing failed
+  `memory_changes_reach_the_coordinator_and_only_the_live_worker_that_consumed_them`:
+  the reader received another task's local note.
+- Never recording `skip` missed runs as skipped failed
+  `missed_slots_are_skipped_or_coalesced_and_a_revision_never_reuses_an_occurrence`:
+  three missed slots enqueued a run.

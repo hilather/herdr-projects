@@ -416,10 +416,8 @@ impl SqliteStore {
 
 #[cfg(test)]
 mod tests {
-    use super::due_effects;
     use crate::domain::*;
     use crate::runner::Cancellation;
-    use crate::store::controller_hint::EffectMode;
     use crate::store::{SCHEMA, SqliteStore, StoreError, controlled};
     use std::time::{Duration, Instant};
 
@@ -581,49 +579,5 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn targeted_notification_candidate_matches_the_snapshot_and_a_future_due_stays_blocked() {
-        let (_temp, mut db) = open();
-        db.commit(Commit {
-            expected_head: 0,
-            mutations: vec![Mutation::Task {
-                expected: None,
-                next: task(0),
-            }],
-        })
-        .unwrap();
-        let operation = |id: &str, due: i64| Operation {
-            id: OperationId::new(id).unwrap(),
-            task: Some(TaskId::new("t-0000").unwrap()),
-            kind: "runtime.notification".into(),
-            target: "coord".into(),
-            payload_version: 1,
-            payload: serde_json::json!({"inbox":[]}),
-            expected_revision: 1,
-            due_unix_ms: due,
-            idempotency_key: id.into(),
-        };
-        db.commit(Commit {
-            expected_head: 1,
-            mutations: vec![
-                Mutation::Enqueue(operation("notify-now", 0)),
-                Mutation::Enqueue(operation("notify-later", 50_000)),
-            ],
-        })
-        .unwrap();
-        let compared = db.shadow_compare(0, true, None).unwrap();
-        assert_eq!(compared.mismatches_added, 0);
-        let snapshot = compared.acted_on.unwrap();
-        assert_eq!(
-            due_effects(&snapshot.operations, &snapshot.deliveries, 0, true),
-            vec![("notify-now".to_string(), EffectMode::Deliver)]
-        );
-        assert!(
-            snapshot
-                .operations
-                .iter()
-                .any(|operation| operation.id.as_str() == "notify-later")
-        );
-    }
 
 }

@@ -268,34 +268,18 @@ mod tests {
         assert_eq!(facts[0].revision.body_hash.as_str(), body.as_str());
         assert_eq!(facts[0].revision.applicability.domains, ["ui"]);
     }
+    // Missing evidence and revocation are covered end to end by
+    // `missing_bodies_are_rejected_and_revoked_records_leave_the_facts_but_keep_their_bytes`.
+    // No command sets a record's expiry, so this half stays here.
     #[test]
-    fn missing_expiry_and_revocation_are_not_active_facts() {
+    fn expired_records_are_not_active_facts() {
         let (_root, mut memory) = fixture();
         let body = memory.ingest_object(&b"body"[..]).unwrap();
         let prov = memory.ingest_object(&b"prov"[..]).unwrap();
-        let missing = ObjectId::from_hex("ab".repeat(32)).unwrap();
-        assert!(matches!(memory.insert_revision(&ctx(), revision("gone", missing, prov.clone(), None)), Err(MemoryError::EvidenceUnavailable { .. })));
-        let mut expired = revision("old", body.clone(), prov.clone(), None); expired.expiry_unix_ms = Some(10);
+        let mut expired = revision("old", body, prov, None); expired.expiry_unix_ms = Some(10);
         memory.insert_revision(&ctx(), expired).unwrap();
         assert!(memory.active_facts(11).unwrap().is_empty());
         assert_eq!(memory.active_facts(5).unwrap().len(), 1);
-        let live = memory.insert_revision(&ctx(), revision("live", body, prov, None)).unwrap();
-        memory.revoke(&ctx(), &MemoryRecordId::new("live").unwrap(), live.revision).unwrap();
-        assert!(memory.active_facts(1_000).unwrap().iter().all(|f| f.record.id.as_str() != "live"));
-    }
-    #[test]
-    fn ingest_cancels_gc_claim_and_unreferenced_objects_are_purged() {
-        let (_root, mut memory) = fixture();
-        let body = memory.ingest_object(&b"collect-me"[..]).unwrap();
-        let prov = memory.ingest_object(&b"prov"[..]).unwrap();
-        let head = memory.insert_revision(&ctx(), revision("tmp", body.clone(), prov.clone(), None)).unwrap();
-        memory.revoke(&ctx(), &MemoryRecordId::new("tmp").unwrap(), head.revision).unwrap();
-        // Still referenced by immutable revision history, so GC must not delete.
-        assert_eq!(memory.collect_unreferenced().unwrap(), 0);
-        let orphan = memory.ingest_object(&b"orphan-bytes"[..]).unwrap();
-        assert_eq!(memory.collect_unreferenced().unwrap(), 1);
-        let path = memory.objects.join("sha256").join(&orphan.as_str()[..2]).join(orphan.as_str());
-        assert!(!path.exists());
     }
 }
 

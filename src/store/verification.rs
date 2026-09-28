@@ -929,67 +929,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn duplicate_verifier_rejection_polls_do_not_insert_duplicate_feedback() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
-        let first = db.testing_poll_rejected_verification().unwrap();
-        let attempts: i64 = db
-            .connection
-            .query_row("SELECT count(*) FROM attempts", [], |row| row.get(0))
-            .unwrap();
-        let deps: Vec<(String, String, String)> = {
-            let mut stmt = db
-                .connection
-                .prepare(
-                    "SELECT task_id, predecessor_id, requirement FROM task_dependencies ORDER BY task_id, predecessor_id",
-                )
-                .unwrap();
-            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-                .unwrap()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .unwrap()
-        };
-        let second = db.testing_poll_rejected_verification().unwrap();
-        assert_eq!(first.state, "rejected");
-        assert_eq!(first.reason.as_deref(), Some("checks_failed"));
-        assert_eq!(first.run_id, second.run_id);
-        assert_eq!(
-            db.connection
-                .query_row("SELECT count(*) FROM feedback_items", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            db.connection
-                .query_row("SELECT count(*) FROM verified_results", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            db.connection
-                .query_row("SELECT count(*) FROM attempts", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            attempts
-        );
-        let after: Vec<(String, String, String)> = {
-            let mut stmt = db
-                .connection
-                .prepare(
-                    "SELECT task_id, predecessor_id, requirement FROM task_dependencies ORDER BY task_id, predecessor_id",
-                )
-                .unwrap();
-            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-                .unwrap()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .unwrap()
-        };
-        assert_eq!(after, deps);
-        assert_eq!(
-            deps,
-            vec![("consumer".into(), "task".into(), "landed_commit".into())]
-        );
-    }
 
 
     #[test]

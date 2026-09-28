@@ -71,11 +71,14 @@ impl Project {
         self.memory().create_task_snapshot(request, profile, &"a".repeat(64), None, 32_000, "Project instructions",
             jiff::Timestamp::now().as_millisecond(), None).unwrap()
     }
+    fn record_task(&self, task: &str) -> Option<Task> { runtime::snapshot(&self.project).unwrap().tasks.into_iter().find(|t| t.id.as_str() == task) }
     fn add_task(&self, task: &str) { self.ok(&["task", "demo", "add", task, "--title", task, "--expected-head", &self.head().to_string()]); }
     /// A task whose running attempt consumed a fresh worker snapshot; returns the snapshot id.
-    fn producer(&self, task: &str) -> String {
-        self.add_task(task);
-        let snapshot = self.snapshot(task, "worker", &[], &[], &[]);
+    fn producer(&self, task: &str) -> String { self.worker(task, &[]) }
+    /// A task whose running attempt consumed a worker snapshot scoped to `paths`.
+    fn worker(&self, task: &str, paths: &[&str]) -> String {
+        if self.record_task(task).is_none() { self.add_task(task); }
+        let snapshot = self.snapshot(task, "worker", &[], paths, &[]);
         let mut db = migration::open_active(&self.project).unwrap();
         let state = db.read_snapshot(None).unwrap();
         let mut next = state.tasks.iter().find(|t| t.id.as_str() == task).unwrap().clone();
@@ -413,4 +416,160 @@ fn cutover_hands_memory_to_the_store_and_never_overwrites_an_edited_projection()
     assert!(projected.contains("memory projection") && projected.contains("index body"), "{projected}");
     // The runtime store still takes work after the owner changed.
     p.add_task("after-cutover");
+}
+
+impl Project {
+    /// `memory propose` of the exact proposal document `proposal`.
+    fn propose_raw(&self, name: &str, proposal: &Value) -> Output {
+        let path = self.path(&format!("{name}.json"));
+        fs::write(&path, serde_json::to_vec(proposal).unwrap()).unwrap();
+        self.cli(&["memory", "demo", "propose", "--input", path.to_str().unwrap()])
+    }
+    fn change(&self, id: &str, producer: &str, snapshot: &str, key: &str, body: &ObjectId, change: Value) -> Value {
+        let mut proposal = json!({"schema_version":1,"proposal_id":id,"producer":{"task_id":producer,"attempt_id":format!("{producer}-attempt")},
+            "input_snapshot_id":snapshot,"changes":[{"record_key":key,"kind":"observation","scope":{"domains":[],"paths":[]},
+            "claim":key,"body_object":body.as_str(),"evidence":[],"based_on":[],"impact":"informational"}]});
+        if let Value::Object(change) = change { for (k, v) in change { proposal["changes"][0][k] = v; } }
+        proposal
+    }
+    fn id(&self, key: &str) -> String { self.record(key).unwrap()["id"].as_str().unwrap().to_owned() }
+    fn active(&self, key: &str) -> bool {
+        self.ok(&["memory", "demo", "inspect"])["active_facts"].as_array().unwrap().iter().any(|f| f["record"]["record_key"] == key)
+    }
+}
+
+/// Replaces `duplicate_proposal_reuses_result_and_changed_bytes_conflict`.
+///
+/// Proposing the same bytes again returns the stored receipt; different
+/// bytes under the same proposal id are refused without a write.
+#[test]
+fn a_repeated_proposal_is_reused_and_changed_bytes_under_its_id_are_refused() {
+    let p = Project::new();
+    let snapshot = p.producer("writer");
+    let body = p.ingest(b"validation errors carry a request id");
+    let first = p.propose("mp-api", "writer", &snapshot, "api.errors", &body, json!({"kind":"contract","impact":"reconcile_before_completion"}));
+    let head = p.head();
+    let again = p.propose("mp-api", "writer", &snapshot, "api.errors", &body, json!({"kind":"contract","impact":"reconcile_before_completion"}));
+    assert_eq!((&again["proposal_id"], &again["payload_digest"], &again["reused"]), (&first["proposal_id"], &first["payload_digest"], &json!(true)));
+    assert_eq!(first["reused"], false);
+    assert_eq!(p.head(), head);
+    let changed = p.change("mp-api", "writer", &snapshot, "api.errors", &body, json!({"kind":"contract","impact":"reconcile_before_completion","claim":"different"}));
+    assert!(!p.propose_raw("mp-api-changed", &changed).status.success(), "changed bytes reused a proposal id");
+    assert_eq!(p.head(), head);
+}
+
+/// Replaces `competing_promotions_conflict_and_stale_review_must_be_repeated`.
+///
+/// Two reviewed proposals rewrite the same revision. The first promoted wins;
+/// the other is refused at promote and the record stays at the winner's
+/// revision. A new proposal against the current revision must be reviewed
+/// again before it promotes.
+#[test]
+fn competing_reviewed_rewrites_promote_once_and_the_loser_must_be_proposed_again() {
+    let p = Project::new();
+    let snapshot = p.producer("writer");
+    p.remember("writer", &snapshot, "api.errors", b"first claim", json!({}));
+    let base = p.expected("api.errors");
+    let receipts: Vec<Value> = ["a", "b"].iter().map(|n| p.propose(&format!("rewrite-{n}"), "writer", &snapshot, "api.errors", &p.ingest(format!("claim {n}").as_bytes()), json!({"expected":base}))).collect();
+    let decision = p.review("rewrite-a", "api.errors", &receipts[0]);
+    let won = p.promote("rewrite-a", &decision);
+    assert!(won.status.success(), "{}", String::from_utf8_lossy(&won.stderr));
+    let winner = p.expected("api.errors");
+    assert_eq!(winner["revision"], 2);
+    let loser = p.review("rewrite-b", "api.errors", &receipts[1]);
+    let head = p.head();
+    assert!(!p.promote("rewrite-b", &loser).status.success(), "a stale rewrite promoted over the winner");
+    assert_eq!((p.head(), p.expected("api.errors")), (head, winner.clone()));
+    let receipt = p.propose("rewrite-c", "writer", &snapshot, "api.errors", &p.ingest(b"claim c"), json!({"expected":winner}));
+    assert!(!p.promote("rewrite-c", &loser).status.success(), "another proposal's review was reused");
+    let decision = p.review("rewrite-c", "api.errors", &receipt);
+    assert!(p.promote("rewrite-c", &decision).status.success());
+    assert_eq!(p.expected("api.errors")["revision"], 3);
+}
+
+/// Replaces `missing_expiry_and_revocation_are_not_active_facts` (missing
+/// evidence and revocation) and `ingest_cancels_gc_claim_and_unreferenced_objects_are_purged`.
+///
+/// A proposal whose body was never stored is rejected. A revoked record is no
+/// longer an active fact, but its body stays retained by revision history
+/// while an unreferenced object is collected.
+#[test]
+fn missing_bodies_are_rejected_and_revoked_records_leave_the_facts_but_keep_their_bytes() {
+    let p = Project::new();
+    let snapshot = p.producer("writer");
+    let missing = ObjectId::from_hex("ab".repeat(32)).unwrap();
+    let out = p.propose_raw("mp-missing", &p.change("mp-missing", "writer", &snapshot, "gone", &missing, json!({})));
+    let rejected: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
+    assert_eq!(rejected["validation"], "rejected", "{rejected}");
+    assert!(rejected["reason"].as_str().unwrap().contains("missing"), "{rejected}");
+    assert!(p.record("gone").is_none());
+
+    let body = p.ingest(b"revoked claim body");
+    p.remember("writer", &snapshot, "live", b"revoked claim body", json!({}));
+    assert!(p.active("live"));
+    p.policy("revoke_head", "live");
+    assert!(!p.active("live"), "a revoked record is still an active fact");
+    let orphan = p.ingest(b"orphan bytes");
+    assert!(p.collect() >= 1);
+    assert!(!p.available(&orphan));
+    assert!(p.available(&body), "collection removed a revoked record's body");
+}
+
+/// Replaces `routing_keeps_consumed_historical_dependencies_and_scope_boundaries`,
+/// `coordinator_binding_is_addressable_without_an_attempt` and
+/// `shadow_compare_drops_no_required_recipient`.
+///
+/// A worker on `ui/components/button.rs` consumed `derived`, which was based
+/// on `source`. Later revisions are delivered to that worker for `source` and
+/// `derived` (even once `derived` moves out of its scope and drops the
+/// dependency) but not for another task's local note or a record on
+/// `ui-extra/`. Every change reaches the coordinator session, which has no
+/// attempt. A snapshot the worker never used receives nothing.
+#[test]
+fn memory_changes_reach_the_coordinator_and_only_the_live_worker_that_consumed_them() {
+    let p = Project::new();
+    let writer = p.producer("writer");
+    let other = p.producer("other");
+    p.remember("writer", &writer, "source", b"source 1", json!({"scope":{"domains":[],"paths":["backend/**"]}}));
+    let source = p.expected("source");
+    let scribe = p.worker("scribe", &["backend/api.rs"]);
+    p.remember("scribe", &scribe, "derived", b"derived 1", json!({"scope":{"domains":[],"paths":["ui/**"]},"based_on":[source]}));
+    p.remember("other", &other, "foreign", b"foreign 1", json!({"kind":"task_local","scope":{"domains":[],"paths":["ui/**"]}}));
+    p.remember("writer", &writer, "near-prefix", b"near 1", json!({"scope":{"domains":[],"paths":["ui-extra/**"]}}));
+    p.add_task("reader");
+    let unused = p.snapshot("reader", "worker", &[], &["backend/api.rs"], &[]);
+    let live = p.worker("reader", &["ui/components/button.rs"]);
+    let consumed: Vec<String> = p.ok(&["memory", "demo", "snapshot-input", "--id", &live])["snapshot"]["entries"].as_array().unwrap().iter()
+        .map(|e| e["record_id"].as_str().unwrap().to_owned()).collect();
+    assert_eq!(consumed, [p.id("derived")]);
+    let coordinator = p.context(&["--peek", "--session", "session-a"]);
+    let coordinator = coordinator.split_whitespace().find_map(|w| w.strip_prefix("snapshot=")).unwrap().to_owned();
+    let attempts = runtime::snapshot(&p.project).unwrap().attempts.len();
+
+    let before = p.ok(&["memory", "demo", "deliveries"]).as_array().unwrap().len();
+    for (producer, snapshot, key, change) in [("scribe", &scribe, "derived", json!({"scope":{"domains":[],"paths":["backend/**"]}})),
+        ("writer", &writer, "source", json!({"scope":{"domains":[],"paths":["backend/**"]}})),
+        ("other", &other, "foreign", json!({"kind":"task_local","scope":{"domains":[],"paths":["ui/**"]}})),
+        ("writer", &writer, "near-prefix", json!({"scope":{"domains":[],"paths":["ui-extra/**"]}}))] {
+        let mut change = change;
+        change["expected"] = p.expected(key);
+        let id = format!("update-{key}");
+        let receipt = p.propose(&id, producer, snapshot, key, &p.ingest(format!("{key} 2").as_bytes()), change);
+        let decision = p.review(&id, key, &receipt);
+        let out = p.promote(&id, &decision);
+        assert!(out.status.success(), "{key}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    let deliveries = p.ok(&["memory", "demo", "deliveries"]).as_array().unwrap()[before..].to_vec();
+    let to = |snapshot: &str| -> Vec<String> {
+        let mut keys: Vec<String> = deliveries.iter().filter(|d| d["snapshot_id"] == snapshot)
+            .map(|d| ["source", "derived", "foreign", "near-prefix"].into_iter().find(|k| p.id(k) == d["record_id"].as_str().unwrap()).unwrap().to_owned()).collect();
+        keys.sort();
+        keys
+    };
+    assert_eq!(to(&live), ["derived", "source"]);
+    assert!(deliveries.iter().filter(|d| d["snapshot_id"] == live.as_str()).all(|d| d["task_id"] == "reader" && d["subscriber"] == "task:reader"));
+    assert_eq!(to(&coordinator), ["derived", "foreign", "near-prefix", "source"]);
+    assert!(deliveries.iter().filter(|d| d["snapshot_id"] == coordinator.as_str()).all(|d| d["subscriber"].as_str().unwrap().starts_with("coordinator:") && d["task_id"].is_null()), "{deliveries:?}");
+    assert!(to(unused.id.as_str()).is_empty(), "a snapshot no attempt used received a delivery");
+    assert_eq!(runtime::snapshot(&p.project).unwrap().attempts.len(), attempts, "routing created an attempt");
 }

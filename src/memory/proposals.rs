@@ -188,21 +188,6 @@ mod tests {
         }
     }
     #[test]
-    fn duplicate_proposal_reuses_result_and_changed_bytes_conflict() {
-        let (_root, mut memory, body, snap) = fixture();
-        let first = serde_json::to_vec(&doc(&snap, body.as_str(), "att-api-2", None)).unwrap();
-        let a = memory.propose(&first, 1_000).unwrap();
-        let b = memory.propose(&first, 1_000).unwrap();
-        assert_eq!(a.proposal_id, b.proposal_id);
-        assert_eq!(a.payload_digest, b.payload_digest);
-        assert!(b.reused);
-        assert_eq!(a.validation, "accepted");
-        let mut other = doc(&snap, body.as_str(), "att-api-2", None);
-        other.changes[0].claim = "different".into();
-        let err = memory.propose(&serde_json::to_vec(&other).unwrap(), 1_000).unwrap_err();
-        assert!(matches!(err, MemoryError::IdempotencyKeyConflict));
-    }
-    #[test]
     fn spoofed_attempt_missing_evidence_stale_base_and_elevation_are_rejected() {
         let (_root, mut memory, body, snap) = fixture();
         let mut spoof_doc = doc(&snap, body.as_str(), "att-missing", None);

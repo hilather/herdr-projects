@@ -16,24 +16,6 @@ fn lab() -> (TempDir, SqliteStore) {
     (temp, db)
 }
 
-#[test]
-fn atomic_records_intents_events_reopen_and_history() {
-    let (temp, mut db) = lab();
-    let mut task = task("t-1", 1);
-    task.active_attempt = Some(AttemptId::new("a-1").unwrap());
-    let attempt = Attempt { id: AttemptId::new("a-1").unwrap(), task: task.id.clone(), revision: 1, state: AttemptState::Reserved, snapshot: None, reservation: "slot-1".into(), termination_observed: false };
-    assert_eq!(db.commit(Commit { expected_head: 0, mutations: vec![put(task.clone(), None), Mutation::Attempt { expected: None, next: attempt.clone() }, Mutation::Enqueue(intent("op-1"))] }).unwrap(), 3);
-    let before = db.read_snapshot(Some(3)).unwrap();
-    assert_eq!(before.tasks, vec![task]);
-    assert_eq!(before.attempts, vec![attempt]);
-    assert!(before.attempts[0].retains_capacity());
-    assert_eq!(before.operations, vec![intent("op-1")]);
-    assert_eq!(before.events.iter().map(|e| e.sequence).collect::<Vec<_>>(), vec![1,2,3]);
-    assert!(matches!(db.read_snapshot(Some(0)), Err(StoreError::HistoryUnavailable(0))));
-    db.checkpoint().unwrap();
-    drop(db);
-    assert_eq!(SqliteStore::open(&temp.path().join("state.db")).unwrap().read_snapshot(None).unwrap(), before);
-}
 
 #[test]
 fn failures_roll_back_prior_changes_and_do_not_consume_event_sequences() {
@@ -159,13 +141,6 @@ fn changed_schema_is_rechecked_before_commit_and_bad_payload_is_visible() {
     assert!(matches!(db.commit(Commit { expected_head:2, mutations:vec![put(task("t-1",2),Some(1))] }),Err(StoreError::UnsupportedSchema(version)) if version==SCHEMA+1));
 }
 
-#[test]
-fn invalid_ids_and_overflow_are_rejected() {
-    assert!(TaskId::new("../../other").is_err());
-    assert!(serde_json::from_str::<TaskId>("\"bad id\"").is_err());
-    let (_temp, mut db) = lab();
-    assert!(matches!(db.commit(Commit { expected_head:0, mutations:vec![put(task("t-1",u64::MAX),Some(u64::MAX-1))] }),Err(StoreError::Invalid(_))));
-}
 
 // The subprocess is a native test-harness child. Readiness is explicit, not a
 // guessed delay. Parent kills it at pre-commit and post-commit boundaries.

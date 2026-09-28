@@ -78,26 +78,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn recovery_wait_notifies_once_after_restart_and_preserves_ownership() {
-        let (_root,mut db,mut good,trigger)=fixture();
-        let mut down=good.clone();down.pane=ResourceState::Unknown;down.agent_present=false;down.session_identity=None;down.agent_identity=None;
-        db.record_observations(db.current_head().unwrap(),&[down]).unwrap();
-        let wait=db.register_wait_with_trigger("parent",None,"adapter_recovery",None,Some(&trigger)).unwrap();
-        assert!(!db.replay_wait(&wait.wait_id).unwrap().wake_requested);
-        good.observed_unix_ms=jiff::Timestamp::now().as_millisecond();
-        db.record_observations(db.current_head().unwrap(),std::slice::from_ref(&good)).unwrap();
-        let before=db.read_snapshot(None).unwrap();
-        let path=PathBuf::from(db.connection.path().unwrap());drop(db);
-        let mut db=SqliteStore::open(&path).unwrap();
-        let budget=read_budget::ReadBudget::new(controlled::ReadControl::new(std::time::Instant::now()+Duration::from_secs(5),Default::default()));
-        assert_eq!(db.service_waits(&budget).unwrap().notified,1);
-        assert_eq!(db.service_waits(&budget).unwrap().notified,0);
-        let after=db.read_snapshot(None).unwrap();
-        assert_eq!(after.ownership,before.ownership);assert_eq!(after.attempts,before.attempts);assert_eq!(after.control,before.control);
-        let next=db.rearm_wait(&wait.wait_id,None).unwrap();
-        assert!(db.replay_wait(&next.wait_id).unwrap().wake_requested);
-    }
 
     #[test]
     fn recovery_wait_uses_indexed_current_publication_despite_late_old_events() {

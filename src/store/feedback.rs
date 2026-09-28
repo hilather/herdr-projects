@@ -484,19 +484,6 @@ mod tests {
         assert!(table_exists(&reopened.connection, "feedback_claims"));
     }
 
-    #[test]
-    fn duplicate_verifier_rejection_feedback_polls_do_not_insert_duplicate_items() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut db = SqliteStore::create(&temp.path().join("state.db")).unwrap();
-        seed_tasks(&mut db);
-        let attempts = count(&db.connection, "SELECT count(*) FROM attempts");
-        let deps = dependencies(&db.connection);
-        db.testing_record_feedback(rejection("task")).unwrap();
-        db.testing_record_feedback(rejection("task")).unwrap();
-        assert_eq!(count(&db.connection, "SELECT count(*) FROM feedback_items"), 1);
-        assert_eq!(count(&db.connection, "SELECT count(*) FROM attempts"), attempts);
-        assert_eq!(dependencies(&db.connection), deps);
-    }
 
     #[test]
     fn expired_feedback_claim_can_be_retaken_and_ack_does_not_reserve_or_satisfy() {

@@ -382,3 +382,24 @@ fn dependent_reserves_once_after_verified_evidence_and_never_without_a_grant() {
     assert_eq!(f.attempts().iter().filter(|a| a.task.as_str() == "dep").count(), 1);
     assert!(!f.reserve_at(&selection, &approval, f.head()).status.success(), "the running dependent is not reserved again");
 }
+
+/// Replaces `empty_delegation_tables_do_not_change_the_exact_grant_path`.
+///
+/// With no delegation grant or revocation on record, an exact owner-signed
+/// launch approval reserves one attempt and queues its `runtime.launch`.
+#[test]
+fn an_exact_approval_reserves_its_launch_without_any_delegation_record() {
+    let f = Factory::new(1, &[], &[("a", json!([]))]);
+    let raw = rusqlite::Connection::open(&f.store).unwrap();
+    let delegations = || ["delegation_grants", "delegation_revocations"].map(|t| raw.query_row(&format!("SELECT count(*) FROM {t}"), [], |r| r.get::<_, i64>(0)).unwrap());
+    assert_eq!(delegations(), [0, 0]);
+    let reserved = f.reserve("a");
+    let attempts = f.attempts();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].id.as_str(), reserved["record"]["attempt"]);
+    let state = runtime::snapshot(&f.project).unwrap();
+    let launch = state.operations.iter().find(|o| o.id.as_str() == reserved["record"]["operation"]).unwrap();
+    assert_eq!((launch.kind.as_str(), launch.task.as_ref().map(|t| t.as_str())), ("runtime.launch", Some("a")));
+    assert_eq!(f.delivery(&reserved).state, DeliveryState::Pending);
+    assert_eq!(delegations(), [0, 0]);
+}

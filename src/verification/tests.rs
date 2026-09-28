@@ -707,20 +707,6 @@ fn install_kill_on_mount(filter: &[libc::sock_filter]) -> std::io::Result<()> {
     Ok(())
 }
 
-#[test]
-fn review_probe_sha256_retained_checkout() {
-    let world = world(false);
-    fs::remove_dir_all(world.repo.join(".git")).unwrap();
-    git(&world.repo, &["init", "--object-format=sha256"]);
-    git(&world.repo, &["add", "src/file.txt"]);
-    git(&world.repo, &["commit", "-m", "sha256"]);
-    let output=Command::new("/usr/bin/git").args(["rev-parse","HEAD"]).current_dir(&world.repo).output_gated().unwrap();
-    let oid=String::from_utf8(output.stdout).unwrap().trim().to_string();
-    assert_eq!(oid.len(),64);
-    let objects = loose_objects(&world.repo).into_iter().map(|(oid,relative_path,bytes)|crate::store::verification::RetainedObject{oid,relative_path,bytes}).collect::<Vec<_>>();
-    let checkout=super::checkout::materialize(&world.work,&world.db_path,&objects,&oid,"sha256");
-    assert!(checkout.is_ok(), "valid retained SHA256 objects failed: {:?}", checkout.err());
-}
 
 fn review_install_two_policies(world: &World, policy_body: &str) -> (String, String) {
     let db_path = world.db_path.canonicalize().unwrap();

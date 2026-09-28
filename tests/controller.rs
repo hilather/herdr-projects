@@ -1,7 +1,8 @@
 #![cfg(all(feature = "state-store", target_os = "linux"))]
 #![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
 //! The canonical controller through `ticker run`: waits, notifications,
-//! signed routines and automatic admission over a disposable migrated
+//! signed routines (also scheduled directly with `routine-store schedule`)
+//! and automatic admission over a disposable migrated
 //! project, set up through the compiled CLI. A Herdr bridge stand-in answers
 //! `notification.show` and logs every request. Each ticker pass republishes
 //! the executor metrics file, so waits count passes, never elapsed time.
@@ -12,14 +13,19 @@ use std::{fs, os::unix::fs::{MetadataExt, PermissionsExt}, path::PathBuf, proces
 
 const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
 
-/// Answers the bridge check and `notification.show`, logging each request.
-const HERDR: &str = "#!/usr/bin/python3\nimport json,os,sys\nhome=os.environ['HOME']\n\
+/// Answers the bridge check and `notification.show`, logging each request
+/// and the time of each show. While `$HOME/busy` exists, one show is answered
+/// as not shown (`busy`) and the file is removed.
+const HERDR: &str = "#!/usr/bin/python3\nimport json,os,sys,time\nhome=os.environ['HOME']\n\
 if sys.argv[1:]==['--version']:print('herdr 0.9.1');sys.exit(0)\n\
 if sys.argv[1:]==['remote-api-bridge','--check']:print('herdr-api-bridge-v1');sys.exit(0)\n\
 if sys.argv[1:]!=['remote-api-bridge']:sys.exit(2)\n\
 r=json.loads(sys.stdin.readline())\nopen(home+'/requests','a').write(r['method']+'\\n')\n\
 if r['method']!='notification.show':sys.exit(3)\n\
-print(json.dumps({'id':r['id'],'result':{'type':'notification_show','shown':True,'reason':'shown'}}))\n";
+open(home+'/shows','a').write(str(int(time.time()*1000))+'\\n')\n\
+busy=os.path.exists(home+'/busy')\n\
+if busy:os.remove(home+'/busy')\n\
+print(json.dumps({'id':r['id'],'result':{'type':'notification_show','shown':not busy,'reason':'busy' if busy else 'shown'}}))\n";
 
 struct Lab { home: tempfile::TempDir, project: PathBuf, key: PathBuf, _socket: std::os::unix::net::UnixListener }
 struct Ticker(Child);
@@ -359,4 +365,122 @@ fn launchable_profile(lab: &Lab) -> VersionedReference {
     rusqlite::Connection::open(&store).unwrap().execute("INSERT INTO native_profiles(profile_digest,report,report_digest,sequence) VALUES(?1,?2,?3,(SELECT max(sequence) FROM events))",
         rusqlite::params![reference.digest, report, format!("{:x}", Sha256::digest(report.as_bytes()))]).unwrap();
     reference
+}
+
+impl Lab {
+    /// Owner-sign and import revision `revision` of routine `name` (every
+    /// `schedule` from `start`), whose script appends `once` to `<name>.marker`.
+    fn routine(&self, name: &str, revision: u64, enabled: bool, schedule: &str, start: i64, missed: MissedRunPolicy) -> Output {
+        let project = self.project.canonicalize().unwrap();
+        let script = project.join(format!("{name}.sh"));
+        let body = format!("printf once >> {name}.marker\n");
+        fs::write(&script, &body).unwrap();
+        let definition = RoutineDefinition { version: 1, name: name.into(), revision, project_store: self.store().canonicalize().unwrap().display().to_string(),
+            authority: authority::policy_reference(&project).unwrap(), config: migration::config_reference(&self.config()).unwrap(), enabled,
+            schedule: schedule.into(), timezone: "UTC".into(), start_unix_ms: start, missed, overlap: OverlapPolicy::Skip,
+            script: script.display().to_string(), script_sha256: format!("{:x}", Sha256::digest(&body)), cwd: project.display().to_string(),
+            deadline_ms: 1000, output_cap_bytes: 4000 };
+        let (doc, sig) = self.sign(&format!("{name}-{revision}.json"), &serde_json::to_vec(&definition).unwrap(), authority::ROUTINE_SIGNATURE_NAMESPACE);
+        self.cli(&["routine-store", "demo", "import", &doc, &sig, "--expected-head", &self.head()])
+    }
+    fn schedule(&self, name: &str) -> Output { self.cli(&["routine-store", "demo", "schedule", name, "--expected-head", &self.head()]) }
+    fn marker(&self, name: &str) -> Option<String> { fs::read_to_string(self.project.join(format!("{name}.marker"))).ok() }
+}
+
+/// Replaces `missed_policy_skips_a_bounded_window_and_revisions_do_not_reuse_occurrences`.
+///
+/// Three due slots under `coalesce_latest` enqueue one run. A new revision
+/// retires that unrun operation; under `skip` its own three missed slots are
+/// recorded as skipped with no operation. A later revision records a fresh
+/// occurrence for the same slot, and re-importing it is refused.
+#[test]
+fn missed_slots_are_skipped_or_coalesced_and_a_revision_never_reuses_an_occurrence() {
+    let lab = Lab::new("[safety.PROJECT]\nroutine_commands=true\n");
+    lab.activate();
+    let start = jiff::Timestamp::now().as_millisecond() - 150_000;
+    let schedule = |revision: u64, missed: MissedRunPolicy| {
+        assert!(lab.routine("check", revision, true, "every 1m", start, missed).status.success());
+        let out = lab.schedule("check");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        lab.state().routine_occurrences.into_iter().find(|o| o.routine.revision == revision).unwrap()
+    };
+    let first = schedule(1, MissedRunPolicy::CoalesceLatest);
+    assert_eq!((first.slots, first.disposition.clone()), (3, RoutineDisposition::Enqueued));
+    let operation = first.operation.clone().unwrap();
+    let skipped = schedule(2, MissedRunPolicy::Skip);
+    assert_eq!((skipped.slots, skipped.disposition, skipped.operation), (3, RoutineDisposition::SkippedMissed, None));
+    assert_ne!(skipped.id, first.id);
+    assert_eq!(lab.delivery(&operation).state, DeliveryState::PermanentFailure, "a new revision left the old run deliverable");
+    let next = schedule(3, MissedRunPolicy::CoalesceLatest);
+    assert_eq!((next.disposition.clone(), next.scheduled_unix_ms), (RoutineDisposition::Enqueued, first.scheduled_unix_ms));
+    assert!(next.id != first.id && next.operation.is_some() && next.operation != first.operation);
+    let before = lab.state();
+    assert!(!lab.routine("check", 3, true, "every 1m", start, MissedRunPolicy::CoalesceLatest).status.success());
+    assert_eq!(lab.state(), before);
+    assert!(before.tasks.is_empty() && before.operations.iter().all(|o| o.task.is_none()));
+}
+
+/// Replaces `held_planning_known_inactive_state_returns_no_cursor_or_liveness`,
+/// `project_scope_uses_control_revision_without_inventing_a_task` and
+/// `planning_selection_does_not_revive_an_enabled_historical_revision`.
+/// With `ticker_runs_an_approved_routine_once_beside_one_edited_after_approval`
+/// it also replaces `synchronous_turn_keeps_the_same_rotation_and_withdrawal_rules`
+/// and `held_planning_rotates_after_withdrawn_script_and_only_records_intent`.
+///
+/// A routine run is project work: it names no task and none is invented.
+/// While the project is paused the ticker neither plans routines nor runs a
+/// queued run, which must be retired before the project resumes. Once active
+/// the ticker plans and runs the other enabled routine once; a routine whose
+/// latest revision is disabled is never planned from its enabled first one.
+#[test]
+fn the_ticker_runs_routines_only_while_active_and_never_revives_a_disabled_revision() {
+    let lab = Lab::new("[safety.PROJECT]\nroutine_commands=true\n");
+    lab.route();
+    lab.activate();
+    let start = jiff::Timestamp::now().as_millisecond() - 1000;
+    for (name, revision, enabled) in [("idle", 1, true), ("idle", 2, false), ("check", 1, true), ("later", 1, true)] {
+        assert!(lab.routine(name, revision, enabled, "every 1h", start, MissedRunPolicy::CoalesceLatest).status.success());
+    }
+    assert!(lab.schedule("check").status.success());
+    let queued = lab.state();
+    let operation = queued.routine_occurrences[0].operation.clone().unwrap();
+    assert!(queued.operations.iter().all(|o| o.task.is_none()) && queued.tasks.is_empty());
+    lab.set_state("paused");
+    lab.run(2, &|| true);
+    let paused = lab.state();
+    assert_eq!(paused.routine_occurrences, queued.routine_occurrences, "a paused project planned a routine");
+    assert!(paused.routine_receipts.is_empty());
+    let delivery = lab.delivery(&operation);
+    assert_eq!((delivery.state, delivery.attempts), (DeliveryState::Pending, 0));
+    assert_eq!((lab.marker("check"), lab.marker("later")), (None, None));
+    lab.ok(&["operations", "demo", "retire", operation.as_str(), "--reason", "paused", "--expected-revision", &delivery.revision.to_string(), "--expected-head", &lab.head()]);
+
+    lab.ok(&["reconcile", "demo", "--record"]);
+    lab.activate();
+    lab.run(2, &|| lab.state().routine_receipts.len() == 1);
+    let active = lab.state();
+    let mut planned: Vec<&str> = active.routine_occurrences.iter().map(|o| o.routine.id.as_str()).collect();
+    planned.sort();
+    assert_eq!(planned, ["routine-check", "routine-later"], "the disabled routine was planned");
+    assert_eq!((lab.marker("later").as_deref(), lab.marker("check"), lab.marker("idle")), (Some("once"), None, None));
+    assert!(active.tasks.is_empty() && active.attempts.is_empty());
+}
+
+/// Replaces `targeted_notification_candidate_matches_the_snapshot_and_a_future_due_stays_blocked`.
+///
+/// A notification Herdr reports as not shown (`busy`) is retried, but not
+/// before its retry is due: the second show comes at least the one-second
+/// backoff after the first, and it is then confirmed once.
+#[test]
+fn a_notification_retry_is_not_delivered_before_it_is_due() {
+    let lab = Lab::new("");
+    lab.route();
+    lab.activate();
+    fs::write(lab.path("busy"), b"").unwrap();
+    let op = lab.notify("notify");
+    lab.run(2, &|| lab.delivery(&op).state == DeliveryState::Confirmed);
+    let shows: Vec<i64> = fs::read_to_string(lab.path("shows")).unwrap().lines().map(|l| l.parse().unwrap()).collect();
+    assert_eq!(shows.len(), 2, "{shows:?}");
+    assert!(shows[1] - shows[0] >= 1000, "retried before due: {shows:?}");
+    assert_eq!(lab.delivery(&op).attempts, 2);
 }

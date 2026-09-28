@@ -168,47 +168,6 @@ mod tests {
         serde_json::to_vec(&ReviewDocument { schema_version: 1, proposal_id: proposal.into(), decision: "approve".into(), reason: "evidence supports the claim".into() }).unwrap()
     }
     #[test]
-    fn competing_promotions_conflict_and_stale_review_must_be_repeated() {
-        let (_root, mut memory, body) = setup();
-        let decision = memory.review(&approve("mp-api-errors-01"), 1_000).unwrap();
-        assert!(decision.classification.contains("disjoint"));
-        let first = memory.promote("mp-api-errors-01", &decision.id, 1_000).unwrap();
-        assert!(!first.reused);
-        assert!(!first.change_ids.is_empty());
-        let replay = memory.promote("mp-api-errors-01", &decision.id, 1_000).unwrap();
-        assert!(replay.reused);
-        let rec = memory.store.memory_record_by_key("api.error-envelope").unwrap().unwrap();
-        assert_eq!(rec.kind, MemoryKind::Contract);
-        assert!(!rec.is_hard);
-        let snap = memory.store.memory_proposal("mp-api-errors-01").unwrap().unwrap().snapshot_id.unwrap();
-        let rec = memory.store.memory_record_by_key("api.error-envelope").unwrap().unwrap();
-        let other = ProposalDocument {
-            schema_version: 1, proposal_id: "mp-api-errors-02".into(),
-            producer: ProposalProducer { task_id: "task-api".into(), attempt_id: "att-api-2".into() },
-            input_snapshot_id: snap.clone(), observed_revisions: vec![], repository: None,
-            changes: vec![ProposalChange {
-                record_key: "api.error-envelope".into(),
-                expected: Some(ObservedRevision { record_id: rec.id.as_str().into(), revision: 1 }),
-                kind: "contract".into(),
-                scope: Applicability { domains: vec!["api".into()], paths: vec!["src/api".into()] },
-                claim: "other claim".into(), body_object: format!("sha256:{body}"), evidence: vec![], based_on: vec![],
-                impact: "reconcile_before_completion".into(),
-            }],
-        };
-        memory.propose(&serde_json::to_vec(&other).unwrap(), 2_000).unwrap();
-        let d2 = memory.review(&approve("mp-api-errors-02"), 2_000).unwrap();
-        let newer = NewRevision {
-            id: rec.id.clone(), record_key: "api.error-envelope".into(), scope_id: "project".into(),
-            kind: MemoryKind::Contract, body_hash: ObjectId::from_hex(body.clone()).unwrap(), provenance_hash: ObjectId::from_hex(body.clone()).unwrap(),
-            applicability: Applicability { domains: vec!["api".into()], paths: vec!["src/api".into()] },
-            dependencies: vec![], expected: Some(1), expiry_unix_ms: None, validity_state: String::new(), validity_reason: String::new(),
-        };
-        memory.insert_revision(&ControlContext { now_unix_ms: 2_000 }, newer).unwrap();
-        assert!(matches!(memory.promote("mp-api-errors-02", &d2.id, 2_000).unwrap_err(), MemoryError::RevisionConflict { .. }));
-        let head = memory.store.memory_head(rec.id.as_str()).unwrap().unwrap();
-        assert_eq!(head.revision, 2);
-    }
-    #[test]
     fn aborted_promotion_leaves_no_partial_revision_or_intent() {
         let (_root, mut memory, _body) = setup();
         let decision = memory.review(&approve("mp-api-errors-01"), 1_000).unwrap();

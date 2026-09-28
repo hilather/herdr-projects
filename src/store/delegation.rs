@@ -700,35 +700,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn empty_delegation_tables_do_not_change_the_exact_grant_path() {
-        let (temp, mut db, prepared) = exact_grant_fixture();
-        assert_eq!(
-            db.connection
-                .query_row("SELECT count(*) FROM delegation_grants", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            db.connection
-                .query_row("SELECT count(*) FROM delegation_revocations", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-        let head = db.read_snapshot(None).unwrap().head;
-        let reserved = db.reserve_prepared(&prepared, head, 1_000).unwrap();
-        let snapshot = db.read_snapshot(None).unwrap();
-        assert_eq!(snapshot.attempts.len(), 1);
-        assert!(snapshot
-            .operations
-            .iter()
-            .any(|operation| operation.kind == "runtime.launch"));
-        assert_eq!(snapshot.attempts[0].id, reserved.record.attempt);
-        drop(db);
-        drop(temp);
-    }
 
     #[test]
     fn valid_delegation_with_admission_on_is_not_a_launch_and_flag_off_does_not_consult() {

@@ -157,29 +157,6 @@ mod tests {
     fn proposal(session:&PlannerSession)->Vec<u8> {
         serde_json::to_vec(&serde_json::json!({"version":2,"planner":{"session_id":session.input.session_id,"input_digest":session.input_digest,"rationale":"Use the retained intent and evidence"},"contracts":[{"task_id":"task","text":"Deliver the requested change","dependencies":[]}]})).unwrap()
     }
-    #[test]
-    fn session_retains_exact_inputs_and_acceptance_across_restart() {
-        let (_root,mut db)=fixture();
-        db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('fixture.evidence','task',1,1,'{\"message\":\"untrusted text\"}')",[]).unwrap();
-        let cursor=db.current_head().unwrap();
-        let first=db.create_planner_session("session","User intent\nsecond line",&[cursor],0,cursor,&budget()).unwrap();
-        assert_eq!(first.input.evidence[0].payload,"{\"message\":\"untrusted text\"}");
-        let after=db.current_head().unwrap();
-        assert_eq!(db.create_planner_session("session","User intent\nsecond line",&[cursor],0,cursor,&budget()).unwrap().input_digest,first.input_digest);
-        assert_eq!(db.current_head().unwrap(),after);
-        assert!(matches!(db.create_planner_session("session","changed",&[cursor],0,cursor,&budget()),Err(StoreError::Conflict)));
-        let raw=proposal(&first);let accepted=db.apply_plan_proposal(&raw,0,"response").unwrap();
-        let head=db.current_head().unwrap();let path=PathBuf::from(db.connection.path().unwrap());drop(db);
-        let mut db=SqliteStore::open(&path).unwrap();
-        assert_eq!(db.planner_session("session",&budget()).unwrap().input,first.input);
-        let replay=db.apply_plan_proposal(&raw,0,"response").unwrap();assert!(replay.replayed);assert_eq!(replay.proposal_id,accepted.proposal_id);
-        assert_eq!(db.current_head().unwrap(),head);
-        for table in ["planner_sessions","planner_proposal_inputs","plan_proposals","plan_revisions"] {
-            assert_eq!(db.connection.query_row(&format!("SELECT count(*) FROM {table}"),[],|r|r.get::<_,u64>(0)).unwrap(),1);
-            assert!(db.connection.execute(&format!("DELETE FROM {table}"),[]).is_err());
-        }
-        assert_eq!(db.connection.query_row("SELECT count(*) FROM attempts",[],|r|r.get::<_,u64>(0)).unwrap(),0);
-    }
 
     #[test]
     fn session_proposal_binding_is_atomic_and_cannot_rebase() {

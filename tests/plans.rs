@@ -4,7 +4,8 @@
 //! compiled CLI over a disposable project store. Feedback is real: signed
 //! contracts, CLI submissions and sandboxed verification whose policy fails.
 //! Attempts are recorded through the public store API because no worker is
-//! launched.
+//! launched, and so are the runtime observations a recovery wait reads,
+//! because no Herdr pane exists.
 use herdr_projects::{authority, domain::*, migration, runtime};
 use serde_json::{json, Value};
 use std::{fs, path::PathBuf, process::{Command, Output}};
@@ -95,10 +96,9 @@ impl Factory {
         let sig = format!("{}.sig", doc.display());
         self.ok(&["task", "demo", "contract", "put", "--input-file", doc.to_str().unwrap(), "--signature", &sig])["digest"].as_str().unwrap().into()
     }
-    /// Submit a result for the task's attempt, have the verifier reject it and
-    /// return the feedback item that rejection recorded.
-    fn reject(&self, task: &str, digest: &str, key: &str) -> String {
-        let before: Vec<String> = self.feedback().iter().map(|f| f["feedback_id"].as_str().unwrap().into()).collect();
+    /// Submit (or resubmit) a result for the task's attempt and run the
+    /// verifier under `key`, which rejects it; returns the verification run.
+    fn rejection(&self, task: &str, digest: &str, key: &str) -> Value {
         let objects: Vec<_> = self.git(&["rev-list", "--objects", "--all"]).lines().map(|line| {
             let oid = line.split_whitespace().next().unwrap();
             json!({"oid":oid,"relative_path":format!("{}/{}", &oid[..2], &oid[2..])})
@@ -115,6 +115,13 @@ impl Factory {
             "--policy-file", policy.to_str().unwrap(), "--idempotency-key", key, "--work-dir", work.to_str().unwrap()]);
         let run: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
         assert_eq!((run["state"].as_str(), run["reason"].as_str()), (Some("rejected"), Some("checks_failed")), "{}", String::from_utf8_lossy(&out.stderr));
+        run
+    }
+    /// Have the verifier reject a submission and return the feedback item that
+    /// rejection recorded.
+    fn reject(&self, task: &str, digest: &str, key: &str) -> String {
+        let before: Vec<String> = self.feedback().iter().map(|f| f["feedback_id"].as_str().unwrap().into()).collect();
+        self.rejection(task, digest, key);
         let added: Vec<String> = self.feedback().iter().map(|f| f["feedback_id"].as_str().unwrap().to_owned()).filter(|id| !before.contains(id)).collect();
         assert_eq!(added.len(), 1, "one rejection records one feedback item");
         added[0].clone()
@@ -354,4 +361,179 @@ fn ticker_requests_replans_only_while_enabled_and_active() {
     assert_eq!(f.ok(&["feedback", "demo", "show", "--id", &later])[0]["state"], "open");
     assert_eq!(f.replan(&later)["Automatic"]["automatic_count"], 1);
     for (id, decision) in ids.iter().zip(decisions) { assert_eq!(f.replan(id), decision, "decisions survive the new plan"); }
+}
+
+/// Replaces `successive_proposals_cannot_hide_a_cycle_in_accepted_intent`.
+///
+/// A later proposal cannot close a cycle through edges only an earlier,
+/// accepted proposal introduced; the refusal leaves the plan at revision 1.
+#[test]
+fn a_later_proposal_cannot_close_a_cycle_through_accepted_intent() {
+    let f = Factory::new();
+    for task in ["a", "b"] { f.add(task); }
+    assert!(f.propose(json!([contract("a", "after b", &["b"])]), 0, "first").status.success());
+    let head = f.head();
+    let out = f.propose(json!([contract("b", "after a", &["a"])]), 1, "second");
+    assert!(!out.status.success(), "a cycle through accepted intent was accepted");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cycle"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(f.head(), head);
+    assert_eq!(f.ok(&["plan", "inspect", "demo"])["plan_revision"], 1);
+}
+
+/// Replaces `proposal_graph_preserves_unmentioned_edges_and_refuses_bad_dependencies`.
+///
+/// A proposal naming a missing predecessor, the same predecessor twice or
+/// itself is refused without a write. An accepted proposal that gives a
+/// queued task different proposed edges leaves its queued dependency alone.
+#[test]
+fn bad_dependencies_are_refused_and_proposals_leave_queued_edges_alone() {
+    let f = Factory::new();
+    for task in ["a", "b"] { f.add(task); }
+    let queue = f.path("queue.json");
+    fs::write(&queue, r#"{"priority":0,"dependencies":[{"predecessor":"b","requirement":"verified_result"}]}"#).unwrap();
+    f.ok(&["task", "demo", "queue", "a", "--input-file", queue.to_str().unwrap(), "--expected-revision", "1", "--expected-head", &f.head().to_string()]);
+    let queued = || f.count("SELECT count(*) FROM task_dependencies WHERE task_id='a' AND predecessor_id='b'");
+    assert_eq!(queued(), 1);
+    for (key, contracts) in [("missing", json!([contract("c", "after missing", &["missing"])])), ("duplicate", json!([contract("c", "twice", &["b", "b"])])),
+        ("self", json!([contract("c", "after itself", &["c"])]))] {
+        let head = f.head();
+        assert!(!f.propose(contracts, 0, key).status.success(), "{key} accepted");
+        assert_eq!(f.head(), head);
+    }
+    assert_eq!(f.ok(&["plan", "inspect", "demo"])["plan_revision"], 0);
+    let out = f.propose(json!([contract("a", "replace proposed edges", &["c"]), contract("c", "new predecessor", &[])]), 0, "valid");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(queued(), 1);
+    assert_eq!(f.count("SELECT count(*) FROM task_dependencies"), 1);
+}
+
+/// Replaces `session_retains_exact_inputs_and_acceptance_across_restart`.
+///
+/// A planner session keeps the exact evidence payload it was given; creating
+/// it again replays it without a write and different intent is refused. The
+/// proposal bound to it replays after a restart, and none of the retained
+/// planning rows can be deleted. No attempt is created.
+#[test]
+fn a_planner_session_keeps_its_exact_inputs_and_bound_proposal_across_restarts() {
+    let f = Factory::new();
+    f.add("evidence-task");
+    let evidence = f.head();
+    let payload: String = rusqlite::Connection::open(&f.store).unwrap().query_row("SELECT payload FROM events WHERE sequence=?1", [evidence], |r| r.get(0)).unwrap();
+    let intent = f.path("intent.txt");
+    fs::write(&intent, "User intent\nsecond line").unwrap();
+    let create = |head: u64| f.cli(&["plan", "session", "demo", "create", "session", "--intent-file", intent.to_str().unwrap(), "--expected-head", &head.to_string(),
+        "--expected-plan-revision", "0", "--evidence-event", &evidence.to_string()]);
+    let out = create(evidence);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let session: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(session["input"]["evidence"][0]["payload"], payload.as_str());
+    let head = f.head();
+    let again = create(evidence);
+    assert!(again.status.success());
+    assert_eq!(serde_json::from_slice::<Value>(&again.stdout).unwrap(), session);
+    assert_eq!(f.head(), head);
+    fs::write(&intent, "changed").unwrap();
+    assert!(!create(evidence).status.success());
+    assert_eq!(f.head(), head);
+
+    let proposal = f.path("session-proposal.json");
+    fs::write(&proposal, json!({"version":2,"planner":{"session_id":"session","input_digest":session["input_digest"],"rationale":"Use the retained intent and evidence"},
+        "contracts":[contract("task", "Deliver the requested change", &[])]}).to_string()).unwrap();
+    let propose = || f.ok(&["plan", "propose", "demo", "--input-file", proposal.to_str().unwrap(), "--expected-plan-revision", "0", "--idempotency-key", "response"]);
+    let accepted = propose();
+    let head = f.head();
+    let replay = propose();
+    assert_eq!((&replay["replayed"], &replay["proposal_id"]), (&json!(true), &accepted["proposal_id"]));
+    assert_eq!(f.head(), head);
+    assert_eq!(f.ok(&["plan", "session", "demo", "show", "session"]), session);
+    let raw = rusqlite::Connection::open(&f.store).unwrap();
+    for table in ["planner_sessions", "planner_proposal_inputs", "plan_proposals", "plan_revisions"] {
+        assert_eq!(f.count(&format!("SELECT count(*) FROM {table}")), 1, "{table}");
+        assert!(raw.execute(&format!("DELETE FROM {table}"), []).is_err(), "{table} rows can be deleted");
+    }
+    assert_eq!(f.count("SELECT count(*) FROM attempts"), 0);
+}
+
+/// Replaces `duplicate_verifier_rejection_feedback_polls_do_not_insert_duplicate_items`
+/// and `duplicate_verifier_rejection_polls_do_not_insert_duplicate_feedback`.
+///
+/// Running the same rejected verification again replays the stored run and
+/// records no second feedback item, no verified result, no attempt and no
+/// change to the queued consumer's dependency.
+#[test]
+fn a_repeated_rejected_verification_records_its_feedback_once() {
+    let f = Factory::new();
+    let digest = f.task("task");
+    f.add("consumer");
+    let queue = f.path("queue.json");
+    fs::write(&queue, r#"{"priority":0,"dependencies":[{"predecessor":"task","requirement":"verified_result"}]}"#).unwrap();
+    f.ok(&["task", "demo", "queue", "consumer", "--input-file", queue.to_str().unwrap(), "--expected-revision", "1", "--expected-head", &f.head().to_string()]);
+    let first = f.rejection("task", &digest, "reject");
+    let tables = || ["feedback_items", "verification_runs", "verified_results", "attempts", "task_dependencies"].map(|t| f.count(&format!("SELECT count(*) FROM {t}")));
+    assert_eq!(tables(), [1, 1, 0, 1, 1]);
+    let second = f.rejection("task", &digest, "reject");
+    assert_eq!((&second["run_id"], &first["replayed"], &second["replayed"]), (&first["run_id"], &json!(false), &json!(true)));
+    assert_eq!(tables(), [1, 1, 0, 1, 1]);
+    assert_eq!(f.feedback()[0]["state"], "open");
+    assert_eq!(f.count("SELECT count(*) FROM task_dependencies WHERE task_id='consumer' AND predecessor_id='task' AND requirement='verified_result'"), 1);
+}
+
+/// Replaces `recovery_wait_notifies_once_after_restart_and_preserves_ownership`.
+///
+/// An adapter-recovery wait on an owned coordinator binding does not wake
+/// while the pane is observed down. Once it is observed present again, the
+/// next replay (a new process) wakes it and notifies once; a later replay
+/// notifies nothing more. Ownership, attempts and control are unchanged and
+/// a rearmed successor wakes from the same evidence.
+#[test]
+fn a_recovery_wait_wakes_once_the_owned_pane_is_back_and_changes_no_ownership() {
+    use herdr_projects::reconcile::{ResourceState, RuntimeObservation};
+    let f = Factory::new();
+    f.add("waiting");
+    // Ownership is recorded while the project is paused, as `runtime adopt` requires.
+    let control = runtime::snapshot(&f.project).unwrap().control.unwrap();
+    f.ok(&["runtime", "demo", "state", "paused", "--expected-revision", &control.revision.to_string(), "--expected-head", &f.head().to_string()]);
+    let mut db = migration::open_active(&f.project).unwrap();
+    let route = RuntimeRoute { socket: "/tmp/fixture-recovery.sock".into(), workspace_id: "w".into(), tab_id: "t".into(), pane_id: "p".into(), cwd: "/tmp".into(), ..Default::default() };
+    let snapshot = db.read_snapshot(None).unwrap();
+    let binding = match snapshot.runtime_bindings.iter().find(|b| b.id == "coordinator") {
+        Some(b) => db.rebind_runtime(&b.id, b.revision, snapshot.head, &route).unwrap().binding,
+        None => db.create_runtime(None, None, snapshot.head, &route).unwrap().binding,
+    };
+    let observe = |db: &mut herdr_projects::store::SqliteStore, present: bool| {
+        let snapshot = db.read_snapshot(None).unwrap();
+        let now = jiff::Timestamp::now().as_millisecond();
+        let observations: Vec<_> = snapshot.runtime_bindings.iter().map(|b| {
+            let mut o = RuntimeObservation { binding: b.id.clone(), binding_revision: b.revision, observed_unix_ms: now, collector: "herdr-git-v2".into(),
+                task_revision: b.task.as_ref().map(|id| snapshot.tasks.iter().find(|t| &t.id == id).unwrap().revision), ..Default::default() };
+            if b.id == binding.id && present {
+                o.pane = ResourceState::Present;
+                o.agent_present = true;
+                o.session_identity = Some(ResourceIdentity { device: 1, inode: 2, born_secs: 3, born_nanos: 0 });
+                o.agent_identity = Some(AgentIdentity { kind: "fixture".into(), name: "agent".into() });
+            } else if b.id == binding.id { o.pane = ResourceState::Unknown; }
+            o
+        }).collect();
+        db.record_observations(snapshot.head, &observations).unwrap();
+    };
+    observe(&mut db, true);
+    let owned = db.adopt_runtime(&binding.id, binding.revision, db.current_head().unwrap(), jiff::Timestamp::now().as_millisecond(), None).unwrap().ownership;
+    observe(&mut db, false);
+    drop(db);
+    let wait = f.wait(&["register", "--task", "waiting", "--condition", "adapter_recovery", "--recovery-binding", &binding.id,
+        "--recovery-binding-revision", &binding.revision.to_string(), "--recovery-ownership-revision", &owned.revision.to_string()]);
+    assert_eq!(f.replay(&wait)["wake_requested"], false, "woke while the pane was down");
+    let mut db = migration::open_active(&f.project).unwrap();
+    observe(&mut db, true);
+    let before = db.read_snapshot(None).unwrap();
+    drop(db);
+    let woke = f.replay(&wait);
+    assert_eq!((&woke["wake_requested"], &woke["proved"]), (&json!(true), &json!(false)));
+    assert_eq!(f.inbox_of("wait-wake"), 1);
+    assert_eq!(f.replay(&wait)["already_replayed"], true);
+    assert_eq!(f.inbox_of("wait-wake"), 1, "a replay notified again");
+    let after = runtime::snapshot(&f.project).unwrap();
+    assert_eq!((&after.ownership, &after.attempts, &after.control), (&before.ownership, &before.attempts, &before.control));
+    let successor = f.wait(&["rearm", wait["wait_id"].as_str().unwrap()]);
+    assert_eq!(f.replay(&successor)["wake_requested"], true);
 }

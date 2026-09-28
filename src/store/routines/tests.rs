@@ -29,15 +29,6 @@ fn planning_selection_uses_current_revisions_and_rejects_selected_corruption() {
     assert!(db.routine_planning_selection(None,&budget).is_err());
 }
 
-#[test]
-fn planning_selection_does_not_revive_an_enabled_historical_revision() {
-    let(_temp,mut db,mut d)=fixture(MissedRunPolicy::CoalesceLatest);
-    d.revision=2;d.enabled=false;
-    let head=db.current_head().unwrap();db.install_routine(&PreparedRoutine{definition:d},head).unwrap();
-    let control=super::super::controlled::ReadControl::new(std::time::Instant::now()+std::time::Duration::from_secs(5),Default::default());
-    let budget=super::super::read_budget::ReadBudget::new(control);
-    assert!(db.routine_planning_selection(None,&budget).unwrap().1.is_none());
-}
 
 #[test]
 fn large_valid_cleanup_receipts_make_progress_across_budgeted_wakes() {
@@ -146,18 +137,6 @@ fn occurrence_cursor_and_outbox_commit_together_and_reopen_deduplicates() {
     assert!(overlap.operation.is_none());assert_eq!(db.read_snapshot(None).unwrap().operations.len(),1);
     db.connection.execute("UPDATE routine_cursors SET after_unix_ms=999999",[]).unwrap();
     assert!(db.read_snapshot(None).is_err());
-}
-#[test]
-fn missed_policy_skips_a_bounded_window_and_revisions_do_not_reuse_occurrences() {
-    let(_temp,mut db,mut d)=fixture(MissedRunPolicy::Skip);
-    let o=tick(&mut db,&d,121_000).unwrap().unwrap();assert_eq!(o.slots,3);assert_eq!(o.disposition,RoutineDisposition::SkippedMissed);
-    assert!(db.read_snapshot(None).unwrap().operations.is_empty());
-    let o=tick(&mut db,&d,181_000).unwrap().unwrap();assert!(o.operation.is_some());
-    d.revision+=1;d.missed=MissedRunPolicy::CoalesceLatest;
-    let head=db.read_snapshot(None).unwrap().head;db.install_routine(&PreparedRoutine{definition:d.clone()},head).unwrap();
-    assert_eq!(db.deliveries().unwrap()[0].state,DeliveryState::PermanentFailure);
-    let next=tick(&mut db,&d,181_000).unwrap().unwrap();assert_ne!(next.id,o.id);assert_eq!(next.disposition,RoutineDisposition::Enqueued);
-    let before=db.read_snapshot(None).unwrap();assert!(db.install_routine(&PreparedRoutine{definition:d},before.head).is_err());assert_eq!(db.read_snapshot(None).unwrap(),before);
 }
 #[test]
 fn uncertain_claim_history_blocks_overlap_across_revisions_and_retirement() {
