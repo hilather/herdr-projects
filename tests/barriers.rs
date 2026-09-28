@@ -1,4 +1,5 @@
 #![cfg(all(feature = "state-store", target_os = "linux"))]
+#![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
 //! Barrier freeze/release/revoke through the compiled CLI over a disposable
 //! project store. Members are real verified results: signed contracts, CLI
 //! submissions and sandboxed verification. Attempts are recorded through the

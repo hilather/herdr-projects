@@ -1,4 +1,5 @@
 #![cfg(target_os = "linux")]
+#![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
 //! Thread records, groups, briefs and the report copy through the compiled
 //! CLI. herdr is a shell fixture that serves `agent list` / `pane list` from
 //! files and logs every other call; git, du and rsync are the real tools.

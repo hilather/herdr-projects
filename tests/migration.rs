@@ -1,4 +1,5 @@
 #![cfg(all(feature = "state-store", target_os = "linux"))]
+#![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
 //! Legacy-project migration workflows driven through the compiled CLI:
 //! `migration inspect/plan/apply/recover/status`, `reconcile --record`,
 //! `runtime state/admission/rebind/create`, `task add/list` and

@@ -1,4 +1,5 @@
 #![cfg(all(feature = "state-store", target_os = "linux"))]
+#![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
 //! Regressions from the 2026-09-20 memory audit, driven through the compiled
 //! CLI over a disposable migrated project: `memory propose/review/promote`,
 //! signed `memory import` policy, `memory inspect/snapshot-input` and
