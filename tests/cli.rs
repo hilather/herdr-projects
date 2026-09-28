@@ -588,6 +588,38 @@ fn ticker_start_without_projects_creates_nothing() {
     assert!(!home.path().join(".config").exists());
 }
 
+/// A transient lock probe (`ticker status`, `ticker start`'s decision) landing
+/// on a starting ticker must not make it exit; a real holder is named in the log.
+#[cfg(target_os="linux")]
+#[test]
+fn ticker_run_outlasts_a_transient_lock_probe_and_names_a_real_holder() {
+    use std::{fs,io::Write,time::{Duration,Instant},process::Stdio};
+    struct Child(std::process::Child);impl Drop for Child{fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+    let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
+    assert!(hp(home.path(),&["--root",r,"new","demo"]).status.success());
+    let spawn=||Child(Command::new(BIN).env_clear().env("HOME",home.path()).env("PATH","/usr/bin:/bin").env("HERDR_BIN_PATH","/bin/false").args(["--root",r,"ticker","run"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let open=||fs::File::options().read(true).write(true).create(true).truncate(false).open(root.join(".ticker.lock")).unwrap();
+    let log=||fs::read_to_string(root.join(".ticker.log")).unwrap_or_default();
+    // A probe holds the lock across the ticker's start; afterwards the ticker must own it.
+    let probe=open();probe.lock().unwrap();
+    let mut child=spawn();std::thread::sleep(Duration::from_millis(200));drop(probe);
+    let pid=format!("pid:     {}",child.0.id());let end=Instant::now()+Duration::from_secs(10);
+    while !String::from_utf8_lossy(&hp(home.path(),&["--root",r,"ticker","status"]).stdout).contains(&pid) {
+        assert!(child.0.try_wait().unwrap().is_none(),"ticker exited: {}",log());
+        assert!(Instant::now()<end,"{}",log());std::thread::sleep(Duration::from_millis(20));
+    }
+    fs::write(root.join(".ticker.stop"),b"").unwrap();let end=Instant::now()+Duration::from_secs(10);
+    while child.0.try_wait().unwrap().is_none(){assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(10));}
+    fs::remove_file(root.join(".ticker.stop")).unwrap();
+    // A holder that outlasts the retry window is named, not silently deferred to.
+    let mut holder=open();holder.lock().unwrap();holder.set_len(0).unwrap();
+    holder.write_all(br#"{"version":"9.9.9-fake","pid":424242,"root":"x","started":"then","tools":[]}"#).unwrap();
+    let mut child=spawn();let end=Instant::now()+Duration::from_secs(15);
+    while child.0.try_wait().unwrap().is_none(){assert!(Instant::now()<end,"{}",log());std::thread::sleep(Duration::from_millis(20));}
+    assert!(log().lines().any(|l|l.contains("424242")&&l.contains("9.9.9-fake")),"{}",log());
+    assert!(fs::read_to_string(root.join(".ticker.lock")).unwrap().contains("424242"));drop(holder);
+}
+
 #[test]
 fn repair_is_explicit_hash_checked_and_preserves_original_bytes() {
     let home = tempfile::tempdir().unwrap();

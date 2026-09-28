@@ -25,6 +25,7 @@ pub const TICK: Duration = Duration::from_secs(15);
 const STOP_WAIT: Duration = Duration::from_secs(60);
 const IDLE_EXIT: Duration = Duration::from_secs(300);
 const LOG_CAP: u64 = 1_000_000;
+const LOCK_RETRY: Duration = Duration::from_secs(1);
 
 fn lock_path(root: &Path) -> PathBuf {
     root.join(".ticker.lock")
@@ -161,18 +162,38 @@ pub enum LockState {
     Held(Info),
 }
 
-/// Probes the lock without keeping it. The file is never created here.
+/// Probes the lock without keeping it. The file is never created here. The
+/// probe is shared: it conflicts only with a ticker's exclusive lock, never
+/// with another probe.
 pub fn lock_state(root: &Path) -> LockState {
     let Ok(mut file) = File::options().read(true).write(true).open(lock_path(root)) else {
         return LockState::Free;
     };
-    match file.try_lock() {
+    match file.try_lock_shared() {
         Ok(()) => LockState::Free,
-        Err(_) => {
-            let mut text = String::new();
-            let _ = file.read_to_string(&mut text);
-            LockState::Held(serde_json::from_str(&text).unwrap_or_default())
+        Err(_) => LockState::Held(read_info(&mut file)),
+    }
+}
+
+fn read_info(file: &mut File) -> Info {
+    let mut text = String::new();
+    let _ = file.seek(SeekFrom::Start(0)).and_then(|_| file.read_to_string(&mut text));
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+/// A starting ticker's exclusive `try_lock`, retried briefly: a transient
+/// probe (`ticker status`, `ticker start`'s decision) must not read as a
+/// running ticker.
+fn acquire(lock: &File) -> bool {
+    let deadline = Instant::now() + LOCK_RETRY;
+    loop {
+        if lock.try_lock().is_ok() {
+            return true;
         }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -339,7 +360,11 @@ pub fn run(ctx: &Ctx) -> Result<()> {
         .read(true)
         .write(true)
         .open(lock_path(root))?;
-    if lock.try_lock().is_err() {
+    if !acquire(&lock) {
+        let holder = read_info(&mut lock);
+        let line = format!("another ticker holds the lock (pid {}, version {}); exiting", holder.pid, holder.version);
+        Log { path: log_path(root) }.line(&line);
+        eprintln!("{line}");
         return Ok(());
     }
     let path_var = ctx.env.var("PATH").unwrap_or("").to_string();
