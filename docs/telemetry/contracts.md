@@ -359,6 +359,35 @@ verified, integration `blocked`), t4 (`failed`), t5 (queued, no evidence).
 Attempts: t1 ×1, t2 ×2, t3 ×1, t4 ×2, t5 ×1. `T = {t1, t2, t4}` (t3 and t5
 open) → M02 = 2/3; M07 = (1+2+2)/2 = 5/2.
 
+S6 refinements:
+- Shape: `{metrics: {Mnn: {...}}, since_unix_ms, tasks: {terminal, accepted,
+  open, succeeded_without_evidence}}`. Every metric has `definition` and
+  `name`; `value` is a value, `null` with `reason: empty_denominator`, or
+  `unavailable`. Ratios carry `numerator`, `denominator` and `value` as the
+  unreduced string `"n/d"` (no floats). Sums (M08, M09) carry `value` and
+  `coverage {certified_sessions, excluded}`, where `excluded` counts sources
+  by `unbound`, `ambiguous`, `orphan`, `quarantined`, `cli_version_uncertified`.
+- M02 `excluded {open, outside_window}`; M07 counts every attempt of tasks in
+  `T` and flags `attempts_without_decision`.
+- Window (`--since`, absent = all): tasks with an attempt decided at or after
+  it; M13 and M40 by `decided_unix_ms`; M08/M09/M15 by `session_unix_ms`.
+- M08/M09/M15 source = bound, non-quarantined, certified rollouts of a known
+  attempt; none → `unavailable: no_certified_source` (also without a sidecar).
+  M15 counts accepted records of that source with a non-null `model`.
+- M13: without a sidecar `unavailable: collection_not_run`; otherwise
+  terminated (`completed|failed|cancelled|lost`) Codex attempts, with
+  `adapter_absent` (terminated non-Codex) and `incomplete` by first failing
+  reason: `not_bound`, `quarantined`, `cli_version_uncertified`,
+  `records_not_accepted` (a source's `records` ≠ its accepted rows).
+- M40: `decisions` in decision order, each `{attempt_id, decided_unix_ms,
+  value}`; with an observation `value` is the exact decimal string plus
+  `age_ms`, `limit_id`, `window_minutes`. Same home = the rollout's
+  `home_digest` equals the digest of the attempt's `execution_home`; ties on
+  `observed_ts` take the higher ordinal. Unavailable reasons: `adapter_absent`,
+  `collection_not_run`, `no_observation`, `unparseable_observation`.
+- `--text` prints one line per metric (M40 one per decision); unknown is `n/a
+  (<reason>)`. Text is the default; `--json` prints the object above.
+
 ## 7. Privacy allowlist and excerpts
 
 Default: metadata only (IDs, digests, enums, counters, timestamps, durations).

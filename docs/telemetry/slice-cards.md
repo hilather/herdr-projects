@@ -141,6 +141,12 @@ worktree, a subset rule fails, or ordinals restart within one file.
 
 ## S6 — Metric report
 
+**Done.** `telemetry <slug> report [--json|--text] [--since MS]` reads
+`state.db` read-only and the sidecar if present; nothing is written. Like S5's
+gate, `usage_metrics_follow_certified_sources` is `#[ignore]`d until `0.154.0`
+is certified (it passes with the version certified locally). Refinements in
+contracts §6.
+
 Goal: `herdr-projects telemetry <slug> report [--json|--text] [--since MS]`
 for M02, M07, M08, M09, M13, M15, M40; M31–M33 listed unavailable. Files:
 `src/telemetry/metrics.rs`, CLI; no migration. Tests (`tests/telemetry.rs`):

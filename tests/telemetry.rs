@@ -15,7 +15,7 @@ const DIGEST_1: &str = "sha256:c56c0b798f22b872890b69470f332d6be530384c7f5d5b61d
 const DIGEST_2: &str = "sha256:6c2dcf23c84488655ff53556237af61da2717e13172cdf50dad886d53e84be41";
 const DIGEST_2B: &str = "sha256:49f430f4555d26b959282f29656f343ad7e239dadf49714298b21d46e61e698f";
 
-struct Fixture { tmp: tempfile::TempDir, root: PathBuf, project: PathBuf, home: PathBuf, attempt: String, decided: i64 }
+struct Fixture { tmp: tempfile::TempDir, root: PathBuf, project: PathBuf, home: PathBuf, attempt: String, decided: i64, config: herdr_projects::migration::ConfigReference }
 
 impl Fixture {
     /// Project `demo` with one attempt reserved by automatic admission on a Codex
@@ -40,7 +40,7 @@ impl Fixture {
         let revision = db.read_snapshot(None).unwrap().tasks[0].revision;
         db.queue_task(&id, revision, db.current_head().unwrap(), &QueueRequest { priority: 0, dependencies: Vec::new() }, unix_ms() - 1_000).unwrap();
         let snapshot = db.read_snapshot(None).unwrap();
-        db.set_scheduler_policy(snapshot.head, snapshot.scheduler.unwrap().policy.revision, 1, 2).unwrap();
+        db.set_scheduler_policy(snapshot.head, snapshot.scheduler.unwrap().policy.revision, 1, 3).unwrap();
         let snapshot = db.read_snapshot(None).unwrap();
         let binding = &snapshot.runtime_bindings[0];
         db.record_observations(snapshot.head, &[herdr_projects::reconcile::RuntimeObservation { binding: binding.id.clone(), binding_revision: binding.revision,
@@ -49,18 +49,18 @@ impl Fixture {
         let snapshot = db.read_snapshot(None).unwrap();
         db.set_project_state(snapshot.head, snapshot.control.unwrap().revision, ProjectState::Active, unix_ms(), Some(&digest)).unwrap();
         drop(db);
-        plant_profile(&db_path, codex_profile(&config, "codex", &home));
+        plant_profile(&db_path, codex_profile(&config, "codex", "codex", Some(&home)));
         SqliteStore::open(&db_path).unwrap().record_native_capability_evidence(unix_ms(), unix_ms() + 3_600_000).unwrap();
         // Fixture only. Production code has no writer for this column.
         rusqlite::Connection::open(&db_path).unwrap().execute("UPDATE project_control SET factory_admission='on' WHERE singleton=1", []).unwrap();
-        worker_snapshots(&project);
+        worker_snapshots(&project, None);
         let inputs = herdr_projects::admission::prepared_admission_inputs(&project).unwrap().expect("a ready candidate");
         insert_grant(&db_path, &inputs);
         herdr_projects::admission::admit_once(&project).unwrap();
         let (attempt, decided) = rusqlite::Connection::open(&db_path).unwrap()
             .query_row("SELECT attempt_id,decided_unix_ms FROM dispatch_decisions", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-        plant_profile(&db_path, codex_profile(&config, "other", &base.join("other-home")));
-        Fixture { tmp, root, project, home, attempt, decided }
+        plant_profile(&db_path, codex_profile(&config, "codex", "other", Some(&base.join("other-home"))));
+        Fixture { tmp, root, project, home, attempt, decided, config }
     }
 
     fn worktree(&self) -> String { format!("{}/.state/worktrees/{}/repo-00", self.project.display(), self.attempt) }
@@ -76,9 +76,11 @@ impl Fixture {
         path
     }
 
-    fn cli(&self, command: &str) -> (serde_json::Value, Vec<u8>) {
+    fn cli(&self, command: &str) -> (serde_json::Value, Vec<u8>) { self.cli_args(&[command]) }
+
+    fn cli_args(&self, args: &[&str]) -> (serde_json::Value, Vec<u8>) {
         let out = Command::new(BIN).env_clear().env("HOME", self.tmp.path().join("home")).env("PATH", "/usr/bin:/bin")
-            .args(["--root", self.root.to_str().unwrap(), "telemetry", "demo", command]).output().unwrap();
+            .args(["--root", self.root.to_str().unwrap(), "telemetry", "demo"]).args(args).output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         let mut bytes = out.stdout.clone();
         bytes.extend_from_slice(&out.stderr);
@@ -99,6 +101,39 @@ impl Fixture {
     /// `(binding, attempt_id)` of the one rollout source.
     fn binding(&self) -> (String, Option<String>) {
         self.sidecar().query_row("SELECT binding,attempt_id FROM rollout_sources", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+    }
+
+    fn report(&self) -> serde_json::Value { self.cli_args(&["report", "--json"]).0 }
+
+    /// Cancel the reserved attempt (released: the task is cancelled).
+    fn cancel_reserved(&self) {
+        let db_path = self.project.join(".state/state.db");
+        let attempt: String = rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT id FROM attempts WHERE state='reserved'", [], |r| r.get(0)).unwrap();
+        let mut db = SqliteStore::open(&db_path).unwrap();
+        assert!(db.cancel_attempt(&AttemptId::new(attempt).unwrap(), 1, db.current_head().unwrap(), "next arm", unix_ms()).unwrap().released);
+    }
+
+    /// Cancel the reserved attempt, queue the task again and admit it on `profile` only.
+    fn readmit(&self, profile: &str) {
+        let db_path = self.project.join(".state/state.db");
+        self.cancel_reserved();
+        let mut db = SqliteStore::open(&db_path).unwrap();
+        // No production path re-opens a cancelled task; the fixture blocks it as a failed attempt would.
+        let snapshot = db.read_snapshot(None).unwrap();
+        let mut task = snapshot.tasks[0].clone();
+        let expected = task.revision;
+        task.revision += 1;
+        task.state = TaskState::Blocked;
+        db.commit(Commit { expected_head: snapshot.head, mutations: vec![Mutation::Task { expected: Some(expected), next: task.clone() }] }).unwrap();
+        db.queue_task(&task.id, task.revision, db.current_head().unwrap(), &QueueRequest { priority: 0, dependencies: Vec::new() }, unix_ms()).unwrap();
+        db.record_native_capability_evidence(unix_ms(), unix_ms() + 3_600_000).unwrap();
+        drop(db);
+        worker_snapshots(&self.project, Some(profile));
+        let inputs = herdr_projects::admission::prepared_admission_inputs(&self.project).unwrap().expect("a ready candidate");
+        assert_eq!(inputs.effective_profile.as_ref().unwrap().name, profile);
+        insert_grant(&db_path, &inputs);
+        herdr_projects::admission::admit_once(&self.project).unwrap();
+        assert_eq!(rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT count(*) FROM attempts WHERE state='reserved'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
     }
 }
 
@@ -268,6 +303,130 @@ fn content_never_persists() {
     assert_eq!(fs::metadata(state.join("telemetry.db")).unwrap().permissions().mode() & 0o777, 0o600);
 }
 
+fn metric(report: &serde_json::Value, id: &str) -> serde_json::Value { report["metrics"][id].clone() }
+
+/// Contracts §6 worked example, planted row by row into a fresh canonical store:
+/// t1 verify_only verified; t2 verified and integrated; t3 verified, integration
+/// blocked; t4 failed; t5 queued. Attempts 1, 2, 1, 2, 1; none has a decision.
+#[test]
+fn golden_acceptance_and_amplification() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("root/demo");
+    fs::create_dir_all(project.join(".state")).unwrap();
+    let db_path = project.join(".state/state.db");
+    drop(SqliteStore::create(&db_path).unwrap());
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    let oid = "a".repeat(40);
+    let hex = |c: char| c.to_string().repeat(64);
+    for (task, state, route, attempts) in [("t1", "succeeded", Some("verify_only"), 1), ("t2", "succeeded", Some("verify_then_integrate"), 2),
+        ("t3", "blocked", Some("verify_then_integrate"), 1), ("t4", "failed", None, 2), ("t5", "queued", None, 1)] {
+        db.execute("INSERT INTO tasks(id,revision,state,title) VALUES(?1,1,?2,?1)", [task, state]).unwrap();
+        for n in 1..=attempts {
+            db.execute("INSERT INTO attempts(id,task_id,revision,state,reservation,termination_observed) VALUES(?1,?2,2,'completed',?1,1)", [format!("{task}-a{n}"), task.to_owned()]).unwrap();
+        }
+        if let Some(route) = route {
+            db.execute("INSERT INTO task_contracts(task_id,contract_revision,project_store,expected_head,repository,base_oid,object_format,route,raw_bytes,raw_digest,installed_seq)
+                VALUES(?1,1,'store',1,'/repo',?2,'sha1',?3,x'7b7d',?4,1)", rusqlite::params![task, oid, route, hex('c')]).unwrap();
+        }
+    }
+    for (task, attempt, sub, result) in [("t1", "t1-a1", '1', '4'), ("t2", "t2-a2", '2', '5'), ("t3", "t3-a1", '3', '6')] {
+        db.execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,artifact_manifest,claimed_checks,created_unix_ms)
+            VALUES(?1,'store',?1,?2,'{}',?3,1,?2,?4,'/repo',?5,?5,'sha1','[]','[]',1000)", rusqlite::params![hex(sub), hex('d'), task, attempt, oid]).unwrap();
+        db.execute("INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms)
+            VALUES(?1,?1,?2,?3,?3,'sha1',?4,?4,'linux-unshare-user-pid-mount-v1',0,2000)", rusqlite::params![hex(result), hex(sub), oid, hex('e')]).unwrap();
+    }
+    for (operation, result, state) in [("op-t2", '5', "integrated"), ("op-t3", '6', "blocked")] {
+        db.execute("INSERT INTO integration_operations(operation_id,project_store,idempotency_key,payload_digest,repository,ref_name,expected_old_oid,verified_result_id,state,generation,object_format,checks_passed,created_unix_ms)
+            VALUES(?1,'store',?1,?2,'/repo','refs/heads/main',?3,?4,?5,1,'sha1',1,3000)", rusqlite::params![operation, hex('f'), oid, hex(result), state]).unwrap();
+    }
+    db.execute("INSERT INTO integrated_commits(integrated_id,candidate_id,operation_id,repository,ref_name,commit_oid,tree_oid,expected_old_oid,object_format,created_unix_ms)
+        VALUES(?1,?1,'op-t2','/repo','refs/heads/main',?2,?2,?2,'sha1',4000)", rusqlite::params![hex('9'), oid]).unwrap();
+    drop(db);
+    let out = Command::new(BIN).env_clear().env("HOME", tmp.path()).env("PATH", "/usr/bin:/bin")
+        .args(["--root", tmp.path().join("root").to_str().unwrap(), "telemetry", "demo", "report", "--json"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["tasks"], serde_json::json!({"accepted": 2, "open": 2, "succeeded_without_evidence": 0, "terminal": 3}));
+    let m02 = metric(&report, "M02");
+    assert_eq!((&m02["definition"], &m02["numerator"], &m02["denominator"], &m02["value"]), (&"M02.slice-v1".into(), &2.into(), &3.into(), &"2/3".into()));
+    let m07 = metric(&report, "M07");
+    assert_eq!((&m07["definition"], &m07["numerator"], &m07["denominator"], &m07["value"]), (&"M07.slice-v1".into(), &5.into(), &2.into(), &"5/2".into()));
+    assert_eq!(m07["attempts_without_decision"], 5, "counted and flagged");
+    for id in ["M31", "M32", "M33"] {
+        assert_eq!(metric(&report, id)["value"], unavailable("attention_not_collected"), "{id}");
+    }
+    let text = Command::new(BIN).env_clear().env("HOME", tmp.path()).env("PATH", "/usr/bin:/bin")
+        .args(["--root", tmp.path().join("root").to_str().unwrap(), "telemetry", "demo", "report", "--text"]).output().unwrap();
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.lines().any(|l| l.starts_with("M02 ") && l.contains("2/3")), "{text}");
+    assert!(text.lines().any(|l| l.starts_with("M31 ") && l.contains("n/a")), "{text}");
+}
+
+/// Gate like `codex_usage_binds_and_sums_exactly`: counters exist only once
+/// the live run certifies codex 0.154.0; no test hook certifies it.
+#[test]
+#[ignore = "gate: passes only after the live run certifies codex 0.154.0"]
+fn usage_metrics_follow_certified_sources() {
+    let f = Fixture::new();
+    f.rollout(&f.home, SID, &["head.jsonl", "tail.jsonl"], &f.worktree(), f.decided + 1_000, "0.154.0");
+    plant_profile(&f.project.join(".state/state.db"), codex_profile(&f.config, "claude", "claude", None));
+    f.readmit("claude");
+    f.readmit("other");
+    f.cancel_reserved();
+    f.cli("collect");
+    let report = f.report();
+    let m08 = metric(&report, "M08");
+    assert_eq!((&m08["definition"], &m08["value"]), (&"M08.slice-v1".into(), &1500.into()));
+    let m09 = metric(&report, "M09");
+    assert_eq!((&m09["value"], &m09["reasoning_output_tokens"]), (&180.into(), &100.into()), "reasoning is a subset, not added");
+    let m13 = metric(&report, "M13");
+    assert_eq!((&m13["numerator"], &m13["denominator"], &m13["value"], &m13["adapter_absent"]), (&1.into(), &2.into(), &"1/2".into(), &1.into()));
+    assert_eq!(m13["incomplete"], serde_json::json!({"not_bound": 1}));
+    let m15 = metric(&report, "M15");
+    assert_eq!((&m15["numerator"], &m15["denominator"], &m15["value"]), (&2.into(), &2.into(), &"2/2".into()));
+}
+
+#[test]
+fn no_source_is_unavailable_not_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("root/demo");
+    fs::create_dir_all(project.join(".state")).unwrap();
+    drop(SqliteStore::create(&project.join(".state/state.db")).unwrap());
+    let out = Command::new(BIN).env_clear().env("HOME", tmp.path()).env("PATH", "/usr/bin:/bin")
+        .args(["--root", tmp.path().join("root").to_str().unwrap(), "telemetry", "demo", "report", "--json"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    for id in ["M02", "M07"] {
+        let m = metric(&report, id);
+        assert_eq!((&m["value"], &m["reason"]), (&serde_json::Value::Null, &"empty_denominator".into()), "{id}");
+    }
+    for id in ["M08", "M09", "M15"] {
+        assert_eq!(metric(&report, id)["value"], unavailable("no_certified_source"), "{id}");
+    }
+    assert_eq!(metric(&report, "M13")["value"], unavailable("collection_not_run"));
+    assert_eq!(metric(&report, "M40")["decisions"], serde_json::json!([]));
+    assert!(!project.join(".state/telemetry.db").exists(), "the report writes nothing");
+}
+
+#[test]
+fn quota_headroom_at_dispatch() {
+    let f = Fixture::new();
+    f.rollout(&f.home, SID, &["head.jsonl"], &f.worktree(), f.decided - 60_000, "0.154.0");
+    f.cli("collect");
+    let report = f.report();
+    assert_eq!(metric(&report, "M40")["decisions"], serde_json::json!([{"age_ms": 60000, "attempt_id": f.attempt, "decided_unix_ms": f.decided,
+        "limit_id": "codex", "value": "62.5", "window_minutes": 300}]));
+    // Rate limits are metadata, kept for an uncertified version; counters are not.
+    assert_eq!(metric(&report, "M08")["value"], unavailable("no_certified_source"));
+
+    let f = Fixture::new();
+    f.rollout(&f.home, SID, &["head.jsonl"], &f.worktree(), f.decided + 1_000, "0.154.0");
+    f.cli("collect");
+    assert_eq!(metric(&f.report(), "M40")["decisions"], serde_json::json!([{"attempt_id": f.attempt, "decided_unix_ms": f.decided,
+        "value": unavailable("no_observation")}]));
+}
+
 fn contains_canary(bytes: &[u8]) -> bool {
     let lower = bytes.to_ascii_lowercase();
     lower.windows(6).any(|w| w == b"canary")
@@ -275,12 +434,12 @@ fn contains_canary(bytes: &[u8]) -> bool {
 
 fn unix_ms() -> i64 { jiff::Timestamp::now().as_millisecond() }
 
-fn codex_profile(config: &herdr_projects::migration::ConfigReference, name: &str, home: &Path) -> FrozenProfile {
+fn codex_profile(config: &herdr_projects::migration::ConfigReference, kind: &str, name: &str, home: Option<&Path>) -> FrozenProfile {
     let evidence = VersionedReference { id: "sim-evidence".into(), revision: 1, digest: "a".repeat(64) };
     let supported = CapabilityEvidence::Supported { evidence: evidence.clone() };
     FrozenProfile {
-        version: 1, name: name.into(), kind: "codex".into(), definition_digest: "b".repeat(64), config: config.clone(),
-        arguments_digest: "c".repeat(64), environment_names: Vec::new(), execution_home: Some(home.display().to_string()),
+        version: 1, name: name.into(), kind: kind.into(), definition_digest: "b".repeat(64), config: config.clone(),
+        arguments_digest: "c".repeat(64), environment_names: Vec::new(), execution_home: home.map(|home| home.display().to_string()),
         permission_policy: VersionedReference { id: "sim-policy".into(), revision: 1, digest: "d".repeat(64) }, adapter: evidence,
         agent: ExecutableIdentity { path: "/usr/bin/git".into(), digest: "e".repeat(64), version: "0.154.0".into() },
         herdr: ExecutableIdentity { path: "/usr/bin/git".into(), digest: "f".repeat(64), version: "1.0.0".into() },
@@ -306,15 +465,19 @@ fn plant_profile(db_path: &Path, profile: FrozenProfile) {
         rusqlite::params![reference.digest, text, format!("{:x}", Sha256::digest(text.as_bytes())), conn.last_insert_rowid()]).unwrap();
 }
 
-/// Retained worker knowledge for the queued task and every retained profile.
-fn worker_snapshots(project: &Path) {
+/// Retained worker knowledge for the queued task and every retained profile (or only `only`).
+fn worker_snapshots(project: &Path, only: Option<&str>) {
     let db_path = project.join(".state/state.db");
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     let profiles = conn.prepare("SELECT report FROM native_profiles").unwrap()
         .query_map([], |row| row.get::<_, String>(0)).unwrap()
         .map(|report| serde_json::from_value::<FrozenProfile>(serde_json::from_str::<serde_json::Value>(&report.unwrap()).unwrap()["preparation"]["profile"].clone()).unwrap())
         .collect::<Vec<_>>();
-    for profile in profiles {
+    let revision: i64 = conn.query_row("SELECT revision FROM tasks WHERE id='work'", [], |r| r.get(0)).unwrap();
+    for profile in profiles.into_iter().filter(|p| only.is_none_or(|name| p.name == name)) {
+        let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM memory_snapshots WHERE task_id='work' AND task_revision=?1 AND profile_name=?2)",
+            rusqlite::params![revision, profile.name], |r| r.get(0)).unwrap();
+        if exists { continue; }
         let mut memory = herdr_projects::memory::MemoryStore::from_sqlite(SqliteStore::open(&db_path).unwrap(), project.join(".state/objects"));
         memory.create_worker_snapshot(SnapshotRequest { schema_version: 1, task_id: "work".into(), profile: profile.name.clone(), domains: vec![], paths: vec![], pinned_keys: vec![], sensitivity: "default".into() },
             &profile.name, &profile.definition_digest, profile.config.digest.as_deref(), 32000, "Factory fixture instructions", unix_ms(), None).unwrap();

@@ -850,6 +850,9 @@ enum TelemetryCommand {
     Collect,
     /// Print per-attempt usage and rollout bindings from the sidecar. Writes nothing.
     Usage,
+    /// Metric report (M02, M07, M08, M09, M13, M15, M40; attention unavailable). Read-only.
+    Report { #[arg(long, conflicts_with = "text")] json:bool, #[arg(long)] text:bool, /// Activity window start, Unix ms
+        #[arg(long)] since:Option<i64> },
 }
 
 #[cfg(feature="state-store")]
@@ -1225,6 +1228,13 @@ pub fn run() -> Result<()> {
             project::validate_slug(&slug)?;
             let report=herdr_projects::telemetry::outcome::attempts(&ctx.root.join(slug))?;
             if json {println!("{}",serde_json::to_string_pretty(&report)?);} else {print!("{}",herdr_projects::telemetry::outcome::text(&report));}
+            Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Telemetry{slug,command:TelemetryCommand::Report{json,text:_,since}}=>{
+            project::validate_slug(&slug)?;
+            let report=herdr_projects::telemetry::metrics::report(&ctx.root.join(slug),since)?;
+            if json {println!("{}",serde_json::to_string_pretty(&report)?);} else {print!("{}",herdr_projects::telemetry::metrics::text(&report));}
             Ok(())
         },
         #[cfg(feature="state-store")]
