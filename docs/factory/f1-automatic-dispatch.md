@@ -336,5 +336,9 @@ Recorded here rather than folded into the card that found them.
   `a_starting_agent_whose_own_display_state_moves_is_named_once_but_identity_drift_is_refused`.
   The live F1 harness under `workspace-write` + capture passed end to end twice
   in a row (see the F1 live gate note).
+- **Dead stale-brief code:** `record_stale_brief` and `accept_stale_brief`
+  (src/store/barriers.rs, with `StaleBrief`) have no production caller or CLI
+  command; only a unit test drives them. Remove them with their test, or wire
+  them to a real workflow.
 - **Replace-verdict tests** (352 in `docs/reviews/2026-09-27-test-audit.tsv`):
   convert to E2E alongside feature work, starting with `store/barriers.rs`.
