@@ -354,6 +354,10 @@ fn approval_read_does_not_double_count_already_budgeted_inputs() {
     raw.execute("INSERT INTO attempt_inputs VALUES(?1,?2,?3,?4)",params![&attempt,&operation,&payload,&hash]).unwrap();
     drop(raw);
     let expected=SqliteStore::open(&path).unwrap().read_snapshot(None).unwrap();
-    let mut db=ControlledStore::open(&path,control()).unwrap();
+    // The byte budget is under test, not the clock: decoding and hashing these
+    // payloads takes seconds in an unoptimised build, so a wall-clock deadline
+    // would only measure machine load. Other tests cover the deadline.
+    let unhurried=ReadControl::new(Instant::now()+Duration::from_secs(3600),Cancellation::default());
+    let mut db=ControlledStore::open(&path,unhurried).unwrap();
     assert_eq!(db.read_snapshot(None).unwrap(),expected);
 }

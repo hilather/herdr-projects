@@ -182,10 +182,12 @@ Recorded here rather than folded into the card that found them.
   it execs. Three unit tests still hit this in parallel runs. A fix needs a
   gate between process spawning and transferred-lock release (about 68
   `Command::new` sites).
-- **`approval_read_does_not_double_count_already_budgeted_inputs`** spends about
-  1.9 s of its 5 s budget even when run alone, and occasionally misses it on a
-  loaded machine. Consider building dependencies with optimisation in the test
-  profile.
+- **`approval_read_does_not_double_count_already_budgeted_inputs`** spent
+  seconds of its 5 s budget even when run alone, and occasionally missed it on a
+  loaded machine — done (this PR). The time goes to decoding and hashing its
+  7 MiB payloads in an unoptimised build; the test asserts the byte budget, not
+  the clock, so its read now runs under a far deadline. Deadline behaviour keeps
+  its own tests.
 - **Port the reviewed memory-review reminder work** (Herdr threads `t-0003`
   implementation and `t-0004` review, branch
   `hp/grok4-7-shiptest/t-0003-memory-workflow-reliability` at `b564f15`) —
