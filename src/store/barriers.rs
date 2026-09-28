@@ -938,11 +938,6 @@ fn load_brief(db: &Connection, brief_id: &str) -> Result<Option<StaleBrief>> {
 pub(super) mod tests {
     use super::*;
 
-    fn user_version(db: &Connection) -> u32 {
-        db.query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap()
-    }
-
     fn head_of(db: &SqliteStore) -> u64 {
         db.connection
             .query_row("SELECT coalesce(max(sequence),0) FROM events", [], |row| {
@@ -1188,43 +1183,6 @@ pub(super) mod tests {
         integrated
     }
 
-    fn hard_head(db: &Connection) {
-        db.execute(
-            "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('fixture','hard',1,1,'{}')",
-            [],
-        )
-        .unwrap();
-        let seq: i64 = db
-            .query_row("SELECT last_insert_rowid()", [], |row| row.get(0))
-            .unwrap();
-        let hash = digest();
-        db.execute(
-            "INSERT INTO objects(hash,size,availability,collection,pin_count,fencing_token) VALUES(?1,1,'available','unclaimed',0,0)",
-            [&hash],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO memory_records(id,record_key,scope_id,kind,is_hard) VALUES('rule','rule','project','hard_memory',1)",
-            [],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO memory_revisions(record_id,revision,body_hash,provenance_hash,promoted_seq,applicability) VALUES('rule',1,?1,?1,?2,'{\"domains\":[],\"paths\":[]}')",
-            params![hash, seq],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO memory_validity(record_id,revision,state,reason,expiry_unix_ms,evaluated_seq) VALUES('rule',1,'valid','fixture',NULL,?1)",
-            [seq],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO memory_heads(record_id,revision,status,row_revision) VALUES('rule',1,'active',1)",
-            [],
-        )
-        .unwrap();
-    }
-
     fn optional_head(db: &Connection, kind: &str) {
         let seq: u64 = db
             .query_row("SELECT max(sequence) FROM events", [], |r| r.get(0))
@@ -1247,102 +1205,6 @@ pub(super) mod tests {
         .unwrap();
         db.execute("INSERT INTO memory_heads VALUES('note',1,'active',1)", [])
             .unwrap();
-    }
-
-    #[test]
-    fn barrier_read_set_rejects_memory_applied_after_freeze() {
-        let (_dir, mut db) = open_store();
-        let seeded = seed(&db.connection, "alpha", "verify_only");
-        optional_head(&db.connection, "observation");
-        let member = member_of(&seeded, vec![]);
-        let frozen = db.freeze_barrier(&[member.clone()], head_of(&db)).unwrap();
-        let seq = head_of(&db);
-        db.connection.execute("INSERT INTO memory_delivery_intents VALUES('optional-update','fixture','task:alpha','snap-alpha','alpha','note',1,'informational',?1,'pending')",[seq]).unwrap();
-        let update = db
-            .memory_update("optional-update", &seeded.attempt)
-            .unwrap();
-        let mut ack = MemoryUpdateAck {
-            schema_version: 1,
-            delivery_id: update.delivery_id,
-            attempt_id: seeded.attempt.clone(),
-            manifest_hash: update.manifest_hash,
-            state: "seen".into(),
-        };
-        db.acknowledge_memory_update(&ack, 1).unwrap();
-        ack.state = "applied".into();
-        db.acknowledge_memory_update(&ack, 1).unwrap();
-        let before = head_of(&db);
-        assert!(
-            db.release_barrier(&frozen.barrier_id, &frozen.release_token, before, 1)
-                .is_err(),
-            "newly consumed optional memory released the old barrier"
-        );
-        assert_eq!(head_of(&db), before);
-        let fresh = db.freeze_barrier(&[member], before).unwrap();
-        assert_ne!(fresh.barrier_id, frozen.barrier_id);
-    }
-
-    #[test]
-    fn barrier_read_set_rejects_contract_scope_phantoms() {
-        let (_dir, mut db) = open_store();
-        let seeded = seed(&db.connection, "alpha", "verify_only");
-        let frozen = db
-            .freeze_barrier(&[member_of(&seeded, vec![])], head_of(&db))
-            .unwrap();
-        optional_head(&db.connection, "contract");
-        assert_eq!(
-            required_generation(&db.connection).unwrap(),
-            frozen.required_set_generation
-        );
-        let before = head_of(&db);
-        assert!(
-            db.release_barrier(&frozen.barrier_id, &frozen.release_token, before, 1)
-                .is_err(),
-            "a scope catalog change did not fence release"
-        );
-        assert_eq!(head_of(&db), before);
-    }
-
-    #[test]
-    fn barrier_read_set_rejects_task_revision_changes() {
-        let (_dir, mut db) = open_store();
-        let seeded = seed(&db.connection, "alpha", "verify_only");
-        let frozen = db
-            .freeze_barrier(&[member_of(&seeded, vec![])], head_of(&db))
-            .unwrap();
-        db.connection
-            .execute("UPDATE tasks SET revision=revision+1 WHERE id='alpha'", [])
-            .unwrap();
-        let before = head_of(&db);
-        assert!(
-            db.release_barrier(&frozen.barrier_id, &frozen.release_token, before, 1)
-                .is_err(),
-            "a changed task revision released frozen membership"
-        );
-        assert_eq!(head_of(&db), before);
-    }
-
-    #[test]
-    fn barrier_read_set_ignores_unconsumed_optional_noise() {
-        let (_dir, mut db) = open_store();
-        let seeded = seed(&db.connection, "alpha", "verify_only");
-        let member = member_of(&seeded, vec![]);
-        let frozen = db.freeze_barrier(&[member.clone()], head_of(&db)).unwrap();
-        optional_head(&db.connection, "observation");
-        insert_event(
-            &db.connection,
-            "fixture",
-            "unrelated",
-            &serde_json::json!({}),
-        )
-        .unwrap();
-        assert_eq!(db.freeze_barrier(&[member], 0).unwrap(), frozen);
-        assert!(
-            db.release_barrier(&frozen.barrier_id, &frozen.release_token, head_of(&db), 1)
-                .unwrap()
-                .released_seq
-                .is_some()
-        );
     }
 
     #[test]
@@ -1779,22 +1641,6 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn downstream_barrier_revocation_blocks_new_result_submission_but_preserves_history() {
-        let (_dir, mut db, reservation, reference, mut submission) = downstream_result_fixture();
-        let original = serde_json::to_vec(&submission).unwrap();
-        db.submit_result(&original).unwrap();
-        db.revoke_barrier(&reference.barrier_id, head_of(&db)).unwrap();
-        let before = db.read_snapshot(None).unwrap();
-        assert!(db.submit_result(&original).unwrap().replayed);
-        submission["idempotency_key"] = "after-revocation".into();
-        let error = db.submit_result(&serde_json::to_vec(&submission).unwrap()).unwrap_err();
-        assert!(error.to_string().contains("barrier"), "{error}");
-        assert_eq!(db.read_snapshot(None).unwrap(), before);
-        assert_eq!(db.connection.query_row("SELECT count(*) FROM result_submissions WHERE task_id='a'", [], |row| row.get::<_,u64>(0)).unwrap(), 1);
-        assert!(before.attempts.iter().find(|a| a.id == reservation.record.attempt).unwrap().retains_capacity());
-    }
-
-    #[test]
     fn downstream_attempt_cannot_drop_its_barrier_by_using_a_later_v1_contract() {
         for terminated in [false, true] {
             let (_dir, mut db, reservation, _reference, mut submission) = downstream_result_fixture();
@@ -2130,34 +1976,6 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn revocation_records_the_live_consumer_without_releasing_capacity() {
-        let (dir, mut db, preparation, reference) = downstream_fixture();
-        let reservation = db.reserve_prepared(&[preparation], head_of(&db), 1000).unwrap();
-        let stored: (String,u64,String) = db.connection.query_row("SELECT barrier_id,release_sequence,authorization_digest FROM attempt_required_releases WHERE attempt_id=?1", [reservation.record.attempt.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
-        assert_eq!(stored, (reference.barrier_id.clone(),reference.release_sequence,reference.authorization_digest.clone()));
-        assert!(db.connection.execute("DELETE FROM barrier_live_consumers", []).is_err());
-        let attempts = db.read_snapshot(None).unwrap().attempts;
-        db.revoke_barrier(&reference.barrier_id, head_of(&db)).unwrap();
-        let readiness = db.memory_readiness("a", 1001).unwrap();
-        assert!(readiness.blockers.iter().any(|b| b.kind == "required_barrier_revoked" && b.id == reference.barrier_id), "{readiness:?}");
-        assert_eq!(db.read_snapshot(None).unwrap().attempts, attempts);
-        assert_eq!(db.connection.query_row("SELECT count(*) FROM barrier_live_consumers", [], |row| row.get::<_,u64>(0)).unwrap(), 0);
-        assert_eq!(db.connection.query_row("SELECT count(*) FROM attempt_barrier_invalidations", [], |row| row.get::<_,u64>(0)).unwrap(), 1);
-        assert!(db.connection.execute("UPDATE attempt_required_releases SET release_sequence=release_sequence", []).is_err());
-        assert!(db.connection.execute("DELETE FROM attempt_required_releases", []).is_err());
-        assert!(db.connection.execute("UPDATE attempt_barrier_invalidations SET sequence=sequence", []).is_err());
-        assert!(db.connection.execute("DELETE FROM attempt_barrier_invalidations", []).is_err());
-        assert!(attempts.iter().find(|a| a.id == reservation.record.attempt).unwrap().retains_capacity());
-        let head = head_of(&db);
-        db.revoke_barrier(&reference.barrier_id, 0).unwrap();
-        assert_eq!(head_of(&db), head);
-        drop(db);
-        let mut db = SqliteStore::open(&dir.path().join(".state/state.db")).unwrap();
-        assert!(db.memory_readiness("a", 1001).unwrap().blockers.iter().any(|b| b.kind == "required_barrier_revoked"));
-        assert_eq!(db.read_snapshot(None).unwrap().attempts, attempts);
-    }
-
-    #[test]
     fn barrier_stop_service_preserves_claimed_capacity_and_proves_unstarted_cancellation() {
         for claimed in [false, true] {
             let (dir, mut db, preparation, reference) = downstream_fixture();
@@ -2189,21 +2007,6 @@ pub(super) mod tests {
             assert!(!report.pending);
             assert_eq!(db.read_snapshot(None).unwrap(), after);
         }
-    }
-
-    #[test]
-    fn barrier_stop_routing_preserves_an_existing_cancellation() {
-        let (_dir, mut db, preparation, reference) = downstream_fixture();
-        let reservation = db.reserve_prepared(&[preparation], head_of(&db), 1000).unwrap();
-        db.claim_operation(&reservation.record.operation, 1, "fixture", 1000, 1000).unwrap();
-        let attempt = db.read_snapshot(None).unwrap().attempts.into_iter().find(|a| a.id == reservation.record.attempt).unwrap();
-        db.cancel_attempt(&attempt.id, attempt.revision, head_of(&db), "operator requested stop", 1001).unwrap();
-        let before = db.read_snapshot(None).unwrap();
-        db.revoke_barrier(&reference.barrier_id, before.head).unwrap();
-        assert_eq!(db.read_snapshot(None).unwrap().cancellations, before.cancellations);
-        assert_eq!(db.read_snapshot(None).unwrap().attempts, before.attempts);
-        assert_eq!(db.connection.query_row("SELECT count(*) FROM barrier_pending_stops", [], |row| row.get::<_,u64>(0)).unwrap(), 0);
-        assert!(db.connection.execute("INSERT INTO barrier_pending_stops VALUES(?1)", [attempt.id.as_str()]).is_err());
     }
 
     #[test]
@@ -2249,18 +2052,6 @@ pub(super) mod tests {
         db.revoke_barrier(&reference.barrier_id, before.head).unwrap();
         assert!(db.memory_readiness("a", 1001).unwrap().blockers.iter().any(|b| b.kind == "required_barrier_revoked"));
         assert!(db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('attempt.barrier_invalidated','not-bound',1,1,'{}')", []).is_err());
-    }
-
-    #[test]
-    fn terminated_consumers_leave_live_routing_but_keep_their_requirement() {
-        let (_dir, mut db, preparation, reference) = downstream_fixture();
-        let reservation = db.reserve_prepared(&[preparation], head_of(&db), 1000).unwrap();
-        db.connection.execute("UPDATE attempts SET termination_observed=1 WHERE id=?1", [reservation.record.attempt.as_str()]).unwrap();
-        assert_eq!(db.connection.query_row("SELECT count(*) FROM barrier_live_consumers", [], |row| row.get::<_,u64>(0)).unwrap(), 0);
-        db.revoke_barrier(&reference.barrier_id, head_of(&db)).unwrap();
-        assert_eq!(db.connection.query_row("SELECT count(*) FROM attempt_barrier_invalidations", [], |row| row.get::<_,u64>(0)).unwrap(), 0);
-        assert_eq!(db.connection.query_row("SELECT count(*) FROM attempt_required_releases", [], |row| row.get::<_,u64>(0)).unwrap(), 1);
-        assert!(super::super::contract_binding::require_result_barrier(&db.connection, "a", 1, &reservation.record.inputs.task_contract.as_ref().unwrap().digest, reservation.record.attempt.as_str(), 1001).is_err());
     }
 
     // Synthetic routing population, not approved admissions or worker effects.
@@ -2631,55 +2422,6 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn barrier_memory_routing_distinguishes_noise_from_changed_evidence() {
-        for change in ["optional_noise", "consumed", "contract", "policy", "legacy"] {
-            let (_dir, mut db) = open_store();
-            let seeded = seed(&db.connection, "alpha", "verify_only");
-            optional_head(&db.connection, "observation");
-            if change == "consumed" {
-                db.connection.execute("INSERT INTO snapshot_entries VALUES('snap-alpha',1,'note',1,'optional','fixture')", []).unwrap();
-            }
-            let frozen = if change == "legacy" {
-                legacy_barrier(&db.connection, &member_of(&seeded, vec![]))
-            } else {
-                db.freeze_barrier(&[member_of(&seeded, vec![])], head_of(&db)).unwrap()
-            };
-            // Merely routing an existing revision must not invalidate evidence.
-            let cause = head_of(&db);
-            let tx = db.connection.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
-            super::super::memory_delivery::record_change(&tx, "redelivery", "note", 1, "informational", cause).unwrap();
-            tx.commit().unwrap();
-            assert!(db.frozen_barrier(&frozen.barrier_id).unwrap().unwrap().revoked_seq.is_none());
-            if change == "policy" {
-                let expected_head = head_of(&db);
-                let policy = PreparedMemoryPolicy { policy: MemoryPolicy {
-                    version: 1, project_store: db.connection.path().unwrap().into(), revision: 1,
-                    authority: VersionedReference { id: "owner-approval-policy".into(), revision: 1, digest: digest() },
-                    expected_head, op: MemoryPolicyOp::ImportAck, record_key: Some("note".into()),
-                    memory_plan_digest: None, expected_memory_owner: None,
-                }};
-                db.install_memory_policy(&policy, expected_head).unwrap();
-            } else {
-                let id = if change == "consumed" { "note" } else { "other" };
-                db.insert_memory_revision(&NewRevision {
-                    id: MemoryRecordId::new(id).unwrap(), record_key: id.into(), scope_id: "project".into(),
-                    kind: if change == "contract" { MemoryKind::Contract } else { MemoryKind::Observation },
-                    body_hash: ObjectId::from_hex(digest()).unwrap(), provenance_hash: ObjectId::from_hex(digest()).unwrap(),
-                    applicability: Applicability { domains: vec![], paths: vec![] }, dependencies: vec![],
-                    expected: if change == "consumed" { Some(1) } else { None }, expiry_unix_ms: None,
-                    validity_state: "valid".into(), validity_reason: "fixture".into(),
-                }).unwrap();
-            }
-            let current = db.frozen_barrier(&frozen.barrier_id).unwrap().unwrap();
-            assert_eq!(current.revoked_seq.is_some(), change != "optional_noise", "{change}");
-            if change != "optional_noise" {
-                assert_eq!(db.connection.query_row("SELECT count(*) FROM barrier_open_memory_records", [], |row| row.get::<_,u64>(0)).unwrap(), 0);
-                assert_eq!(db.connection.query_row("SELECT count(*) FROM barrier_open_memory_unknown", [], |row| row.get::<_,u64>(0)).unwrap(), 0);
-            }
-        }
-    }
-
-    #[test]
     fn barrier_memory_publication_rolls_back_when_revocation_fails_or_fanout_overflows() {
         for fault in ["publication", "fanout"] {
             let (_dir, mut db) = open_store();
@@ -2702,35 +2444,6 @@ pub(super) mod tests {
             assert_eq!(db.connection.query_row("SELECT is_hard FROM memory_records WHERE id='note'", [], |row| row.get::<_,u64>(0)).unwrap(), 0);
             assert_eq!(db.connection.query_row("SELECT reason FROM memory_validity WHERE record_id='note' AND revision=1", [], |row| row.get::<_,String>(0)).unwrap(), "fixture");
         }
-    }
-
-    #[test]
-    fn retired_worker_barrier_is_revoked_when_its_transitive_source_changes() {
-        let (_dir, mut db) = open_store();
-        let seeded = seed(&db.connection, "alpha", "verify_only");
-        optional_head(&db.connection, "observation");
-        db.connection.execute("INSERT INTO memory_records SELECT 'source','source',scope_id,kind,is_hard FROM memory_records WHERE id='note'",[]).unwrap();
-        db.connection.execute("INSERT INTO memory_revisions SELECT 'source',revision,body_hash,provenance_hash,promoted_seq,applicability FROM memory_revisions WHERE record_id='note'",[]).unwrap();
-        db.connection.execute("INSERT INTO memory_validity SELECT 'source',revision,state,reason,expiry_unix_ms,evaluated_seq FROM memory_validity WHERE record_id='note'",[]).unwrap();
-        db.connection.execute("INSERT INTO memory_heads SELECT 'source',revision,status,row_revision FROM memory_heads WHERE record_id='note'",[]).unwrap();
-        db.connection.execute("INSERT INTO memory_dependencies VALUES('note',1,'source',1,'supports')", []).unwrap();
-        db.connection.execute("INSERT INTO snapshot_entries VALUES('snap-alpha',1,'note',1,'optional','fixture')", []).unwrap();
-        let binding = "34".repeat(32);
-        db.connection.execute("INSERT INTO consumer_bindings(binding_id,consumer_id,generation,snapshot_id,attempt_id,task_id,active,retired,successor_binding_id,created_unix_ms) VALUES(?1,'task:alpha',1,'snap-alpha','attempt-alpha','alpha',1,0,NULL,1)", [&binding]).unwrap();
-        db.retire_consumer_binding(&binding, None).unwrap();
-        let frozen = db.freeze_barrier(&[member_of(&seeded, vec![])], head_of(&db)).unwrap();
-        let released = db.release_barrier(&frozen.barrier_id, &frozen.release_token, head_of(&db), 1).unwrap();
-        let records: Vec<String> = db.connection.prepare("SELECT record_id FROM barrier_open_memory_records WHERE barrier_id=?1 ORDER BY record_id").unwrap().query_map([&frozen.barrier_id], |row| row.get(0)).unwrap().collect::<std::result::Result<_,_>>().unwrap();
-        assert_eq!(records, vec!["note", "source"]);
-        assert!(db.connection.execute("DELETE FROM barrier_open_memory_records", []).is_err());
-        assert!(db.connection.execute("UPDATE barrier_open_memory_records SET record_id=record_id", []).is_err());
-        assert_eq!(db.connection.query_row("SELECT count(*) FROM consumer_bindings WHERE active=1", [], |row| row.get::<_,u64>(0)).unwrap(), 0);
-        db.apply_memory_op(MemoryPolicyOp::RevokeHead, "source", head_of(&db)).unwrap();
-        let current = db.frozen_barrier(&released.barrier_id).unwrap().unwrap();
-        assert!(current.revoked_seq.is_some(), "barrier source invalidation must not require an active worker binding");
-        assert_eq!(current.released_seq, released.released_seq);
-        assert_eq!(db.connection.query_row("SELECT count(*) FROM memory_delivery_intents", [], |row| row.get::<_,u64>(0)).unwrap(), 0);
-        assert_eq!(db.connection.query_row("SELECT count(*) FROM barrier_open_memory_records", [], |row| row.get::<_,u64>(0)).unwrap(), 0);
     }
 
     #[test]
@@ -2824,35 +2537,6 @@ pub(super) mod tests {
         let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(payload["invalidation_id"], "old-alpha");
         assert_eq!(payload["reason"], "schema43_unresolved_invalidation");
-    }
-
-    #[test]
-    fn memory_invalidation_revokes_pending_and_released_barriers_atomically() {
-        let (_dir, mut db, prepared) = authorized_fixture();
-        let released = db.release_authorized_barrier(&prepared).unwrap();
-        satisfy(&db.connection, "downstream", "alpha", &released.members[0].result_id);
-        let beta = seed(&db.connection, "beta", "verify_only");
-        let pending = db.freeze_barrier(&[member_of(&beta, vec![])], head_of(&db)).unwrap();
-        let before_attempt = attempt_row(&db.connection, "attempt-alpha");
-        let cause = insert_event(&db.connection, "fixture", "memory-cause", &serde_json::json!({})).unwrap();
-        db.connection.execute("INSERT INTO memory_invalidations VALUES('advice','alpha','cause',NULL,'informational',?1,NULL,'advice')", [cause]).unwrap();
-        db.connection.execute("INSERT INTO memory_invalidations VALUES('resolved','alpha','cause',NULL,'stop_at_checkpoint',?1,?1,'already resolved')", [cause]).unwrap();
-        assert!(db.frozen_barrier(&released.barrier_id).unwrap().unwrap().revoked_seq.is_none());
-        db.connection.execute("INSERT INTO memory_invalidations VALUES('scoped','alpha','cause',NULL,'stop_at_checkpoint',?1,NULL,'changed source')", [cause]).unwrap();
-        let current = db.frozen_barrier(&released.barrier_id).unwrap().unwrap();
-        assert!(current.revoked_seq.is_some(), "memory invalidation must revoke a released member's barrier");
-        assert_eq!(current.released_seq, released.released_seq);
-        assert!(db.frozen_barrier(&pending.barrier_id).unwrap().unwrap().revoked_seq.is_none());
-        let count = head_of(&db);
-        db.connection.execute("INSERT OR IGNORE INTO memory_invalidations VALUES('scoped','alpha','cause',NULL,'stop_at_checkpoint',?1,NULL,'changed source')", [cause]).unwrap();
-        assert_eq!(head_of(&db), count);
-        db.connection.execute("INSERT INTO memory_invalidations VALUES('global',NULL,'cause',NULL,'reconcile_before_completion',?1,NULL,'global change')", [cause]).unwrap();
-        assert!(db.frozen_barrier(&pending.barrier_id).unwrap().unwrap().revoked_seq.is_some());
-        assert_eq!(attempt_row(&db.connection, "attempt-alpha"), before_attempt);
-        assert_eq!(db.connection.query_row("SELECT count(*) FROM events WHERE kind='barrier.revoked'", [], |row| row.get::<_,u64>(0)).unwrap(), 2);
-        db.connection.execute("UPDATE memory_invalidations SET resolved_seq=?1 WHERE resolved_seq IS NULL", [head_of(&db)]).unwrap();
-        assert!(db.frozen_barrier(&released.barrier_id).unwrap().unwrap().revoked_seq.is_some());
-        assert!(super::super::satisfaction::record_verified_result(&db.connection, &released.members[0].result_id).is_err());
     }
 
     #[test]
@@ -3100,90 +2784,6 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn create_ends_at_40_and_upgrade_from_39_reaches_40() {
-        let fresh = tempfile::tempdir().unwrap();
-        let created = SqliteStore::create(&fresh.path().join("state.db")).unwrap();
-        assert_eq!(user_version(&created.connection), crate::store::SCHEMA);
-        assert_eq!(
-            created
-                .connection
-                .query_row("SELECT schema_version FROM store_meta", [], |row| row
-                    .get::<_, u32>(0))
-                .unwrap(),
-            crate::store::SCHEMA
-        );
-        for table in [
-            "barrier_revisions",
-            "barrier_members",
-            "barrier_stale_briefs",
-        ] {
-            let sql: String = created
-                .connection
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
-                    [table],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(sql.contains("STRICT"), "{table}");
-        }
-        for index in [
-            "barrier_members_by_attempt",
-            "barrier_members_by_result",
-            "barrier_stale_briefs_by_attempt",
-        ] {
-            let count: i64 = created
-                .connection
-                .query_row(
-                    "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",
-                    [index],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(count, 1, "{index}");
-        }
-        drop(created);
-
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("state.db");
-        let db = SqliteStore::create(&path).unwrap();
-        db.connection
-            .execute(
-                "INSERT INTO tasks(id,revision,state,title,active_attempt) VALUES('kept',1,'draft','kept',NULL)",
-                [],
-            )
-            .unwrap();
-        crate::store::test_schema::historical(&db.connection, 39).unwrap();
-        drop(db);
-        let mut db = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&db.connection), 39);
-        assert!(matches!(
-            db.import_legacy(&"cd".repeat(32), &[], &[]),
-            Err(StoreError::UnsupportedSchema(39))
-        ));
-        let title: String = db
-            .connection
-            .query_row("SELECT title FROM tasks WHERE id='kept'", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        db.upgrade_v1().unwrap();
-        assert_eq!(user_version(&db.connection), crate::store::SCHEMA);
-        assert_eq!(
-            db.connection
-                .query_row("SELECT title FROM tasks WHERE id='kept'", [], |row| row
-                    .get::<_, String>(
-                    0
-                ))
-                .unwrap(),
-            title
-        );
-        drop(db);
-        let reopened = SqliteStore::open(&path).unwrap();
-        assert_eq!(user_version(&reopened.connection), crate::store::SCHEMA);
-    }
-
-    #[test]
     fn membership_edit_invalidates_the_release_token() {
         let (_dir, mut db) = open_store();
         let first = seed(&db.connection, "alpha", "verify_then_integrate");
@@ -3289,37 +2889,6 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn barrier_rechecks_latest_contract_before_freeze_and_release() {
-        let (_dir, mut db) = open_store();
-        let seeded = seed(&db.connection, "alpha", "verify_only");
-        let member = member_of(&seeded, vec![]);
-        let frozen = db.freeze_barrier(&[member.clone()], head_of(&db)).unwrap();
-        let next =
-            PreparedContract::parse_verified(&contract_bytes("alpha", "verify_only", 2)).unwrap();
-        db.connection.execute(
-            "INSERT INTO task_contracts SELECT task_id,2,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,?1,?2,installed_seq FROM task_contracts WHERE task_id='alpha' AND contract_revision=1",
-            params![next.raw,next.digest],
-        ).unwrap();
-        db.connection
-            .execute(
-                "INSERT INTO acceptance_policies VALUES('alpha',2,'policy-1','{}')",
-                [],
-            )
-            .unwrap();
-        let before = head_of(&db);
-        let error = db
-            .release_barrier(&frozen.barrier_id, &frozen.release_token, before, 1)
-            .unwrap_err();
-        assert!(
-            matches!(error,StoreError::Invalid(ref message) if message.contains("contract is no longer current")),
-            "{error:?}"
-        );
-        assert!(db.freeze_barrier(&[member], before).is_err());
-        assert_eq!(head_of(&db), before);
-        assert!(expanded_released(&db, &frozen.barrier_id).is_none());
-    }
-
-    #[test]
     fn barrier_rechecks_frozen_memory_manifest_at_release() {
         let (_dir, mut db) = open_store();
         let seeded = seed(&db.connection, "alpha", "verify_only");
@@ -3411,133 +2980,6 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn mandatory_head_without_applied_blocks_release() {
-        let (_dir, mut db) = open_store();
-        let seeded = seed(&db.connection, "alpha", "verify_only");
-        hard_head(&db.connection);
-        let head = head_of(&db);
-        let frozen = db
-            .freeze_barrier(&[member_of(&seeded, vec![])], head)
-            .unwrap();
-        let head = head_of(&db);
-        let error = db
-            .release_barrier(&frozen.barrier_id, &frozen.release_token, head, 1)
-            .unwrap_err();
-        assert!(
-            matches!(error, StoreError::Invalid(ref message) if message.contains("mandatory_revision_missing")),
-            "{error:?}"
-        );
-        assert!(expanded_released(&db, &frozen.barrier_id).is_none());
-    }
-
-    #[test]
-    fn required_set_generation_move_blocks_release() {
-        let (_dir, mut db) = open_store();
-        let seeded = seed(&db.connection, "alpha", "verify_only");
-        let head = head_of(&db);
-        let frozen = db
-            .freeze_barrier(&[member_of(&seeded, vec![])], head)
-            .unwrap();
-        db.connection
-            .execute(
-                "UPDATE memory_required_generation SET generation=generation+1",
-                [],
-            )
-            .unwrap();
-        let head = head_of(&db);
-        let error = db
-            .release_barrier(&frozen.barrier_id, &frozen.release_token, head, 1)
-            .unwrap_err();
-        assert!(
-            matches!(error, StoreError::Invalid(ref message) if message.contains("required set generation moved")),
-            "{error:?}"
-        );
-        assert!(expanded_released(&db, &frozen.barrier_id).is_none());
-    }
-
-    #[test]
-    fn revocation_during_release_blocks_dependents_and_does_not_release_capacity() {
-        let (_dir, mut db) = open_store();
-        let seeded = seed(&db.connection, "alpha", "verify_only");
-        satisfy(&db.connection, "downstream", "alpha", &seeded.result);
-        let before = attempt_row(&db.connection, &seeded.attempt);
-        let live_before: i64 = db
-            .connection
-            .query_row(
-                "SELECT count(*) FROM attempts WHERE termination_observed=0",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let predecessor = Task {
-            id: TaskId::new("alpha").unwrap(),
-            revision: 1,
-            state: TaskState::Running,
-            title: "alpha".into(),
-            active_attempt: Some(AttemptId::new(&seeded.attempt).unwrap()),
-        };
-        assert!(
-            super::super::satisfaction::dependency_blocker(
-                &db.connection,
-                "downstream",
-                &predecessor,
-                DependencyRequirement::VerifiedResult,
-                true
-            )
-            .unwrap()
-            .is_none()
-        );
-        let head = head_of(&db);
-        let frozen = db
-            .freeze_barrier(&[member_of(&seeded, vec![])], head)
-            .unwrap();
-        let head = head_of(&db);
-        let revoked = db.revoke_barrier(&frozen.barrier_id, head).unwrap();
-        assert!(revoked.revoked_seq.is_some());
-        let again = db.revoke_barrier(&frozen.barrier_id, 0).unwrap();
-        assert_eq!(again.revoked_seq, revoked.revoked_seq);
-        let admission: String = db
-            .connection
-            .query_row("SELECT factory_admission FROM project_control", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(admission, "off");
-        let head = head_of(&db);
-        let error = db
-            .release_barrier(&frozen.barrier_id, &frozen.release_token, head, 1)
-            .unwrap_err();
-        assert!(
-            matches!(error, StoreError::Invalid(ref message) if message.contains("revoked")),
-            "{error:?}"
-        );
-        let after = attempt_row(&db.connection, &seeded.attempt);
-        assert_eq!(after, before);
-        assert_eq!(after.1, 0);
-        let live_after: i64 = db
-            .connection
-            .query_row(
-                "SELECT count(*) FROM attempts WHERE termination_observed=0",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(live_before, live_after);
-        assert!(
-            super::super::satisfaction::dependency_blocker(
-                &db.connection,
-                "downstream",
-                &predecessor,
-                DependencyRequirement::VerifiedResult,
-                true
-            )
-            .unwrap()
-            .is_some()
-        );
-        assert!(expanded_released(&db, &frozen.barrier_id).is_none());
-    }
-
-    #[test]
     fn stale_brief_after_revocation_is_recorded_and_cannot_be_accepted() {
         let (_dir, mut db) = open_store();
         let seeded = seed(&db.connection, "alpha", "verify_only");
@@ -3588,155 +3030,6 @@ pub(super) mod tests {
                 .execute("UPDATE barrier_stale_briefs SET accepted=1", [])
                 .is_err()
         );
-    }
-
-    #[test]
-    fn idempotent_freeze_returns_the_stored_row_not_a_later_max() {
-        let (_dir, mut db) = open_store();
-        let first = seed(&db.connection, "alpha", "verify_only");
-        let second = seed(&db.connection, "beta", "verify_only");
-        let head = head_of(&db);
-        let original = db
-            .freeze_barrier(&[member_of(&first, vec![])], head)
-            .unwrap();
-        db.connection
-            .execute(
-                "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('fixture','later',1,1,'{}')",
-                [],
-            )
-            .unwrap();
-        let replay = db.freeze_barrier(&[member_of(&first, vec![])], 0).unwrap();
-        assert_eq!(replay, original);
-        let head = head_of(&db);
-        let later = db
-            .freeze_barrier(
-                &[member_of(&first, vec![]), member_of(&second, vec![])],
-                head,
-            )
-            .unwrap();
-        assert_ne!(later.barrier_id, original.barrier_id);
-        let head = head_of(&db);
-        let again = db
-            .freeze_barrier(&[member_of(&first, vec![])], head)
-            .unwrap();
-        assert_eq!(again.barrier_id, original.barrier_id);
-        assert_eq!(
-            db.connection
-                .query_row("SELECT count(*) FROM barrier_revisions", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            2
-        );
-    }
-
-    #[test]
-    fn values_the_check_cannot_store_are_invalid() {
-        let (_dir, mut db) = open_store();
-        let seeded = seed(&db.connection, "alpha", "verify_only");
-        let mut member = member_of(
-            &seeded,
-            vec![ProposalDisposition {
-                proposal_id: "prop-alpha".into(),
-                disposition: "maybe".into(),
-            }],
-        );
-        let head = head_of(&db);
-        let error = db.freeze_barrier(&[member.clone()], head).unwrap_err();
-        assert!(matches!(error, StoreError::Invalid(_)), "{error:?}");
-        member.proposal_dispositions.clear();
-        member.integration_id = Some("short".into());
-        let head = head_of(&db);
-        let error = db.freeze_barrier(&[member], head).unwrap_err();
-        assert!(matches!(error, StoreError::Invalid(_)), "{error:?}");
-        assert_eq!(
-            db.connection
-                .query_row("SELECT count(*) FROM barrier_revisions", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-    }
-
-    fn valid_satisfactions(db: &Connection, predecessor: &str) -> i64 {
-        db.query_row(
-            "SELECT count(*) FROM dependency_satisfactions WHERE predecessor_task=?1 AND state='valid'",
-            [predecessor],
-            |row| row.get(0),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn revoked_barrier_blocks_reattach_and_later_evidence_until_a_later_release() {
-        let (_dir, mut db) = open_store();
-        let seeded = seed(&db.connection, "alpha", "verify_only");
-        satisfy(&db.connection, "downstream", "alpha", &seeded.result);
-        let head = head_of(&db);
-        let frozen = db
-            .freeze_barrier(&[member_of(&seeded, vec![])], head)
-            .unwrap();
-        let head = head_of(&db);
-        db.revoke_barrier(&frozen.barrier_id, head).unwrap();
-        let valid = valid_satisfactions(&db.connection, "alpha");
-        let same =
-            super::super::satisfaction::record_verified_result(&db.connection, &seeded.result);
-        assert!(
-            matches!(same, Err(StoreError::Invalid(ref message)) if message.contains("dependency blocked")),
-            "{same:?}"
-        );
-        let (later_result, _) = add_result(&db.connection, &seeded, "alpha-later");
-        let later =
-            super::super::satisfaction::record_verified_result(&db.connection, &later_result);
-        assert!(
-            matches!(later, Err(StoreError::Invalid(ref message)) if message.contains("dependency blocked")),
-            "{later:?}"
-        );
-        assert_eq!(valid_satisfactions(&db.connection, "alpha"), valid);
-        let predecessor = Task {
-            id: TaskId::new("alpha").unwrap(),
-            revision: 1,
-            state: TaskState::Running,
-            title: "alpha".into(),
-            active_attempt: Some(AttemptId::new(&seeded.attempt).unwrap()),
-        };
-        assert!(
-            super::super::satisfaction::dependency_blocker(
-                &db.connection,
-                "downstream",
-                &predecessor,
-                DependencyRequirement::VerifiedResult,
-                true
-            )
-            .unwrap()
-            .is_some()
-        );
-        let other = seed(&db.connection, "beta", "verify_only");
-        let head = head_of(&db);
-        let released = db
-            .freeze_barrier(
-                &[member_of(&seeded, vec![]), member_of(&other, vec![])],
-                head,
-            )
-            .unwrap();
-        let head = head_of(&db);
-        db.release_barrier(&released.barrier_id, &released.release_token, head, 1)
-            .unwrap();
-        super::super::satisfaction::record_verified_result(&db.connection, &later_result).unwrap();
-        assert!(valid_satisfactions(&db.connection, "alpha") >= valid);
-        assert!(
-            super::super::satisfaction::dependency_blocker(
-                &db.connection,
-                "downstream",
-                &predecessor,
-                DependencyRequirement::VerifiedResult,
-                true
-            )
-            .unwrap()
-            .is_none()
-        );
-        // A superseding release is useful only while it remains applicable.
-        db.revoke_barrier(&released.barrier_id, head_of(&db)).unwrap();
-        assert!(super::super::satisfaction::record_verified_result(&db.connection, &later_result).is_err());
     }
 
     #[test]

@@ -615,3 +615,46 @@ excluding the same two renamed controller tests leaves **20 removed/replaced**.
 The old two-test target took 0.00s at the last full checkpoint. No measurable
 full-suite speedup is claimed, and no full suite was rerun for these test-only
 changes. The nine duplicate binary executions are a separate count.
+
+## Barrier unit tests replaced by CLI workflows
+
+The audit marked 20 `src/store/barriers.rs` tests REPLACE. Nineteen were deleted
+after `tests/barriers.rs` covered their guarantees through the compiled CLI:
+signed contracts, `result submit`/`verify` in the sandbox, `memory barrier-*`,
+signed memory review/policy/reconcile, `scheduler inspect` and a signed
+delegated reservation. Attempts, one task edit and one binding retirement use
+the public store API because no worker launches; the delegated profile report
+is the same synthetic row `tests/delegated_reservation.rs` uses.
+
+| New E2E test | Replaced unit tests |
+| --- | --- |
+| `release_refuses_evidence_that_moved_after_freeze_but_ignores_unrelated_memory` | `values_the_check_cannot_store_are_invalid`, `idempotent_freeze_returns_the_stored_row_not_a_later_max`, `barrier_read_set_rejects_task_revision_changes`, `barrier_read_set_rejects_memory_applied_after_freeze`, `barrier_read_set_rejects_contract_scope_phantoms`, `barrier_rechecks_latest_contract_before_freeze_and_release`, `barrier_read_set_ignores_unconsumed_optional_noise` |
+| `hard_memory_blocks_release_until_the_member_has_applied_it` | `required_set_generation_move_blocks_release` (a hard-rule change now revokes the pending barrier), `mandatory_head_without_applied_blocks_release` |
+| `revocation_blocks_dependents_and_retains_capacity_until_a_later_release` | `revocation_during_release_blocks_dependents_and_does_not_release_capacity`, `revoked_barrier_blocks_reattach_and_later_evidence_until_a_later_release` |
+| `memory_changes_revoke_barriers_over_the_evidence_they_invalidate` | `barrier_memory_routing_distinguishes_noise_from_changed_evidence`, `retired_worker_barrier_is_revoked_when_its_transitive_source_changes`, `memory_invalidation_revokes_pending_and_released_barriers_atomically` |
+| `revoked_upstream_barrier_blocks_downstream_results_but_keeps_capacity_and_cancellations` | `downstream_barrier_revocation_blocks_new_result_submission_but_preserves_history`, `revocation_records_the_live_consumer_without_releasing_capacity`, `barrier_stop_routing_preserves_an_existing_cancellation`, `terminated_consumers_leave_live_routing_but_keep_their_requirement` |
+
+`create_ends_at_40_and_upgrade_from_39_reaches_40` was dropped without a
+replacement: its STRICT/index checks were schema text, and row preservation
+across the 39→40 step is covered by
+`schema9_queue_upgrade_preserves_old_exports_and_starts_with_closed_capacity`,
+which upgrades through every later step and compares tasks, attempts and head.
+
+Kept: `stale_brief_after_revocation_is_recorded_and_cannot_be_accepted`.
+`record_stale_brief`/`accept_stale_brief` have no production caller or CLI
+entry point, so there is nothing end-to-end to drive. The unit-only details the
+deleted tests also checked (internal routing-table counts, append-only triggers,
+the legacy-manifest case) remain covered by the kept fault-injection and
+upgrade tests in the same module.
+
+Mutation check, each restored byte-for-byte afterwards:
+- Disabling the release-time memory manifest comparison in
+  `recheck_ready_with_budget` made
+  `release_refuses_evidence_that_moved_after_freeze_but_ignores_unrelated_memory`
+  fail: a release after the task edit was accepted.
+- Disabling the `predecessor_revoked` check in satisfaction recording made
+  `revocation_blocks_dependents_and_retains_capacity_until_a_later_release`
+  fail: verification under a revoked barrier was accepted.
+- Disabling the revoked-requirement check in `contract_binding::result_barrier`
+  made the downstream test fail only on its message; the later "not currently
+  released" check still refused the submission.
