@@ -95,11 +95,6 @@ fn notification_consumption_requires_seen_or_handled_evidence_not_disappearance(
     }
 }
 #[test]
-fn native_not_shown_receipt_allows_bounded_retry_without_uncertainty() {
-    let f=Fixture::new(false,"not-shown");execute(&f.input,&Control::default()).unwrap();assert_eq!(f.state().notification_claim.unwrap().phase,NoticePhase::NotShown);execute(&f.input,&Control::default()).unwrap();assert_eq!(f.sends(),1);
-    let mut state=f.state();state.notification_retry.retry.next_attempt=String::new();steps::save_state(&f.p,&state).unwrap();f.script("confirmed");execute(&f.input,&Control::default()).unwrap();assert_eq!(f.sends(),2);assert_eq!(f.state().notification_claim.unwrap().phase,NoticePhase::Confirmed);
-}
-#[test]
 fn notification_preflight_and_post_claim_changes_do_not_send() {
     for how in ["busy","duplicate","unsupported","unprimed","cancel","settings","consumed"] {
         let f=Fixture::new(true,how);if how=="unprimed"{f.p.update_coordinator(|c|c.prime_pending=true).unwrap();}

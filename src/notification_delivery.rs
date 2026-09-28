@@ -113,13 +113,6 @@ pub(crate) mod tests {
         }
     }
     #[test]
-    fn notification_typed_safety_is_checked_even_when_generic_config_is_admitted() {
-        let(world,dir,task)=fixture();let config_path=world.ctx().config_dir.join("config.toml");std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-        std::fs::write(&config_path,format!("[safety.{}]\nstart_threads='invalid'\n",serde_json::to_string(dir.to_str().unwrap()).unwrap())).unwrap();
-        crate::reconcile_live::run(&world.ctx(),&dir,true).unwrap();let snapshot=runtime::snapshot(&dir).unwrap();runtime::set_state(&dir,snapshot.head,snapshot.control.unwrap().revision,ProjectState::Active,&config_path).unwrap();
-        assert!(enqueue(&world.ctx(),&dir,&task,runtime::snapshot(&dir).unwrap().head).is_err());assert!(migration::open_active(&dir).unwrap().deliveries().unwrap().is_empty());assert_eq!(world.runner.count("notification show"),0);
-    }
-    #[test]
     fn notification_policy_withdrawn_after_prepare_records_proven_no_effect() {
         let(world,dir,task)=fixture();let operation=queued(&world,&dir,&task);let config_path=world.ctx().config_dir.join("config.toml");
         world.runner.on_fn(|c|c.args==["--version"],move |_|{std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();std::fs::write(&config_path,"# changed after prepare").unwrap();Ok(ok("herdr 0.9.1"))});

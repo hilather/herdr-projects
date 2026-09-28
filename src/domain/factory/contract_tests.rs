@@ -67,20 +67,3 @@ fn task_contract_vectors_reject_duplicate_and_unknown_critical_fields() {
         assert!(PreparedContract::parse_verified(&serde_json::to_vec(&value).unwrap()).is_err(),"{pointer}");
     }
 }
-
-#[test]
-fn task_contract_vectors_reject_ambiguous_dependencies_and_mismatched_git_formats() {
-    for raw in [SHA1,SHA256] {
-        let original:serde_json::Value=serde_json::from_slice(raw).unwrap();
-        let mut duplicate=original.clone();
-        let dependency=duplicate["dependencies"][0].clone();
-        duplicate["dependencies"].as_array_mut().unwrap().push(dependency);
-        assert!(PreparedContract::parse_verified(&serde_json::to_vec(&duplicate).unwrap()).is_err());
-        let mut wrong_format=original.clone();
-        wrong_format["object_format"]=if original["object_format"]=="sha1" {"sha256".into()}else{"sha1".into()};
-        assert!(PreparedContract::parse_verified(&serde_json::to_vec(&wrong_format).unwrap()).is_err());
-        let mut wrong_revision=original;
-        wrong_revision["contract_revision"]=0.into();
-        assert!(PreparedContract::parse_verified(&serde_json::to_vec(&wrong_revision).unwrap()).is_err());
-    }
-}

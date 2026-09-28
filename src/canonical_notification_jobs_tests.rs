@@ -120,23 +120,6 @@ fn canonical_notification_consumption_or_explicit_retirement_resolves_overlap() 
         assert_eq!(f.delivery().state,if consume{DeliveryState::Ambiguous}else{DeliveryState::PermanentFailure});
     }
 }
-#[test]
-fn canonical_notification_malformed_unresolved_history_is_not_assumed_disjoint() {
-    let f=Fixture::new("lost");execute(&f.input(),&control()).unwrap();let new=add_inbox(&f);let mut snapshot=runtime::snapshot(&f.path).unwrap();
-    for item in &mut snapshot.inbox{item.seen=item.content.id!=new;}
-    for change in ["decode","identity","revision","config","digest"] {
-        let mut bad=snapshot.clone();let operation=bad.operations.iter_mut().find(|op|op.id==f.operation.id).unwrap();
-        match change {
-            "decode"=>operation.payload=serde_json::json!({"invalid":"old notification"}),
-            "identity"=>operation.payload["inbox_ids"]=serde_json::json!(["../bad"]),
-            "revision"=>operation.payload["binding_revision"]=serde_json::json!(0),
-            "config"=>operation.payload["config"]["path"]=serde_json::json!("relative"),
-            "digest"=>operation.payload["config"]["digest"]=serde_json::json!("not-a-hash"),
-            _=>unreachable!(),
-        }
-        assert!(herdr_projects::operations::notification::build(&bad,f.operation.task.as_ref().unwrap(),"notify",crate::notification_delivery::config(&f.ctx(),&f.path).unwrap(),jiff::Timestamp::now().as_millisecond()).is_err(),"{change}");
-    }
-}
 
 #[test]
 fn canonical_notification_ticker_defers_effect_without_blocking_legacy_status() {

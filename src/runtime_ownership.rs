@@ -222,10 +222,6 @@ pub(crate) mod tests {
         }
         assert!(remote_runner.calls.borrow().iter().any(|c|c.args.windows(2).any(|a|a==["--machine","offline-host"])));assert_eq!(remote_runner.count("agent prompt"),0);assert_eq!(remote_runner.count("agent start"),0);
     }
-    #[test]
-    fn legacy_adoption_cannot_steal_a_canonical_reference() {
-        let(world,path,_listener)=fixture();let binding=runtime::snapshot(&path).unwrap().runtime_bindings.remove(0);let herdr=crate::herdr::Herdr::new(world.env.herdr_bin(),&binding.identity.socket,&world.runner);assert!(crate::adopt::adoptable_agent(&world.ctx(),&herdr,&binding.identity.socket,"p").is_err());
-    }
 }
 
 #[cfg(test)]

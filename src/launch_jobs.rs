@@ -94,10 +94,6 @@ else:sys.exit(3)
         fn recover(&self){let guard=ProjectGuard::acquire(&self.project.dir()).unwrap();thread::launch_delivery::recover(&self.project,&guard).unwrap();}
     }
     #[test]
-    fn concrete_launch_acknowledges_submission_without_waiting_for_interactive_readiness(){
-        for mode in ["confirmed","native-pending"] {let f=Fixture::new(mode);execute(&f.input,&Control::default()).unwrap();let t=thread::load(&f.project,&f.t.id).unwrap();assert!(t.prompt_pending);assert_eq!(t.launch_claim.unwrap().phase,thread::launch_delivery::Phase::Confirmed);assert!(execute(&f.input,&Control::default()).is_err());assert_eq!(fs::read(f.root.path().join("started")).unwrap(),b"start");}
-    }
-    #[test]
     fn ambiguous_busy_missing_capability_and_missing_terminal_do_not_claim(){
         for mode in ["busy","foreign-busy","ambiguous","no-terminal","unsupported"]{let f=Fixture::new(mode);assert!(execute(&f.input,&Control::default()).is_err(),"{mode}");assert!(!f.started());assert!(thread::load(&f.project,&f.t.id).unwrap().launch_claim.is_none());}
     }

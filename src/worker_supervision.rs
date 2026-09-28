@@ -417,31 +417,4 @@ mod tests {
         assert!(posix_command(&[]).is_err());
         assert!(posix_command(&["bad\0argument".into()]).is_err());
     }
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn worker_limits_and_literal_vector_are_explicit() {
-        let argv = command(
-            Path::new("/fixture/agent"),
-            &["--literal".into(), "space value".into()],
-            123,
-        )
-        .unwrap();
-        assert_eq!(
-            &argv[argv.len() - 4..],
-            &["123s", "/fixture/agent", "--literal", "space value"]
-        );
-        assert!(argv.iter().any(|a| a == "--kill-child=KILL"));
-        assert!(command(Path::new("relative"), &[], 1).is_err());
-        for wall in [0, 604801, u64::MAX] {
-            assert!(command(Path::new("/fixture/agent"), &[], wall).is_err());
-        }
-        assert!(
-            command(
-                Path::new("/fixture/agent"),
-                &["newline\nargument".into()],
-                1
-            )
-            .is_err()
-        );
-    }
 }

@@ -305,3 +305,40 @@ fn a_pane_is_the_coordinator_only_while_ids_directory_and_name_all_match() {
         assert_eq!(lab.thread(field, "t-0001")["pane_id"].as_str(), Some("p"));
     }
 }
+
+/// Replaces `legacy_adoption_cannot_steal_a_canonical_reference`.
+///
+/// A migrated project in the same root binds its thread to pane `w5:p1` of
+/// session `a`. Adopting that pane into a legacy project is refused before
+/// anything is recorded; the same pane id in session `b` is another pane and
+/// is adopted.
+#[cfg(feature = "state-store")]
+#[test]
+fn adopt_refuses_a_pane_that_a_migrated_project_already_binds() {
+    use herdr_projects::{domain::RuntimeRoute, migration, runtime};
+    let mut lab = Lab::new();
+    let demo = lab.project_in_session("demo", "a");
+    let other = lab.project_in_session("other", "b");
+    let work = lab.path("work");
+    fs::create_dir(&work).unwrap();
+    lab.session("a", &demo, &[agent("w5:p1", &work, "my-agent", "idle")]);
+    lab.session("b", &other, &[agent("w5:p1", &work, "my-agent", "idle")]);
+    for command in ["new", "pause"] { lab.ok(&[command, "owned"]); }
+    let owned = lab.project("owned").canonicalize().unwrap();
+    fs::write(owned.join("threads/t-0001.toml"), "id='t-0001'\nstatus='resolved'\n").unwrap();
+    migration::apply(&owned, &migration::inspect(&owned).unwrap(), true).unwrap();
+    let head = runtime::snapshot(&owned).unwrap().head;
+    runtime::rebind(&owned, "thread:t-0001", 1, head, &RuntimeRoute { socket: lab.socket("a").display().to_string(), workspace_id: "w5".into(),
+        tab_id: "w5:t1".into(), pane_id: "w5:p1".into(), cwd: work.display().to_string(), ..Default::default() }).unwrap();
+    let bound = runtime::snapshot(&owned).unwrap();
+    let _ticker = lab.ticker();
+
+    let stderr = lab.refused(&["thread", "adopt", "demo", "--pane", "w5:p1", "--title", "stolen"]);
+    assert!(stderr.contains("thread:t-0001"), "{stderr}");
+    assert_eq!(lab.threads("demo"), 0);
+    assert!(!work.join(".herdr-project/demo-t-0001").exists());
+    assert_eq!(runtime::snapshot(&owned).unwrap(), bound);
+
+    lab.ok(&["thread", "adopt", "other", "--pane", "w5:p1", "--title", "other session"]);
+    assert_eq!(lab.thread("other", "t-0001")["pane_id"].as_str(), Some("w5:p1"));
+}

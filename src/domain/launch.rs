@@ -131,25 +131,6 @@ pub struct PreparedWorkerTermination {
     pub(crate) receipt: WorkerTerminationReceipt,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn full_attempt_ids_map_to_bounded_native_agent_names() {
-        let first = AttemptId::new(format!("attempt-{}", "a".repeat(64))).unwrap();
-        let second = AttemptId::new(format!("attempt-{}", "b".repeat(64))).unwrap();
-        let name = worker_agent_name(&first);
-        assert_eq!(name.len(), 32);
-        assert!(name.as_bytes()[0].is_ascii_lowercase());
-        assert!(
-            name.bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-_".contains(&b))
-        );
-        assert_eq!(name, worker_agent_name(&first));
-        assert_ne!(name, worker_agent_name(&second));
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchStoppedReceipt {

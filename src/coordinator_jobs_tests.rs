@@ -45,14 +45,6 @@ sys.exit(2)
     fn refresh(&mut self) {let c=self.record();self.input.execution=execution(&c);self.input.request=c.prime_request;self.input.sequence=c.prime_sequence;}
 }
 #[test]
-fn concrete_prime_confirms_once_and_requires_an_explicit_new_request() {
-    let mut f=Fixture::new();execute(&f.input,&Control::default()).unwrap();assert!(!f.record().prime_pending);assert_eq!(f.record().prime_claim.unwrap().delivery.phase,Phase::Confirmed);
-    assert!(execute(&f.input,&Control::default()).is_err());
-    f.project.update_coordinator(|c|c.prime_pending=true).unwrap();assert!(execute(&f.input,&Control::default()).is_err());
-    f.project.update_coordinator(|c|c.prime_request+=1).unwrap();f.refresh();execute(&f.input,&Control::default()).unwrap();
-    assert_eq!(fs::read(f.root.path().join("sent")).unwrap(),b"sendsend");assert_eq!(f.record().prime_sequence,2);
-}
-#[test]
 fn lost_and_mismatched_prime_replies_recover_once_without_replay() {
     for mode in ["lost","foreign","terminal","kind","wrongid"] {
         let mut f=Fixture::new();f.script(mode);assert!(execute(&f.input,&Control::default()).is_err(),"{mode}");assert!(f.sent());

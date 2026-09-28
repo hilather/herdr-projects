@@ -201,3 +201,52 @@ fn unfocus_reads_herdr_stdout_reports_its_stderr_on_failure_and_survives_a_missi
     assert!(stderr.contains(&format!("could not run `{}`", missing.display())) && !stderr.contains("panicked"), "{stderr}");
     assert!(requests.try_recv().is_err(), "no request may reach the socket after a failed lookup");
 }
+
+/// Replaces the runner socket test `connects_once_to_a_real_path_and_exchanges_one_line`.
+///
+/// `unfocus --session` opens one connection to the socket path herdr names,
+/// writes exactly one request line, and reads the reply up to its newline even
+/// when it arrives in pieces and is followed by other bytes.
+#[test]
+fn unfocus_sends_one_line_over_one_connection_and_reads_one_reply_line() {
+    use std::{io::Read, os::unix::net::UnixListener, time::Duration};
+    let lab = Lab::new();
+    let socket = lab.path("named.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    fs::write(lab.path("sessions.json"), json!({"sessions": [{"name": "work", "default": false, "running": true, "socket_path": socket}]}).to_string()).unwrap();
+    let server = std::thread::spawn(move || {
+        let mut connections = Vec::new();
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { if !connections.is_empty() { break; } std::thread::sleep(Duration::from_millis(10)); continue; }
+                Err(e) => panic!("{e}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\n") && stream.read(&mut byte).unwrap() == 1 { request.push(byte[0]); }
+            stream.write_all(br#"{"id":"herdr-projects","#).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            stream.write_all(b"\"result\":{}}\n{\"trailing\":").unwrap();
+            // The client sends nothing more and closes its end.
+            let mut rest = Vec::new();
+            let _ = stream.read_to_end(&mut rest);
+            connections.push((request, rest));
+            // Let a second connection, if any, arrive before deciding.
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        connections
+    });
+    assert_eq!(lab.ok(&["unfocus", "--session", "work"]), "sidebar view cleared\n");
+    let connections = server.join().unwrap();
+    assert_eq!(connections.len(), 1, "{connections:?}");
+    let (request, rest) = &connections[0];
+    let line = String::from_utf8(request.clone()).unwrap();
+    assert_eq!(line.matches('\n').count(), 1, "{line:?}");
+    assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["method"], "agent.view.clear");
+    assert!(rest.is_empty(), "bytes after the request line: {rest:?}");
+}

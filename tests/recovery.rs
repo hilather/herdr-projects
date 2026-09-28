@@ -344,3 +344,34 @@ fn a_declined_toast_is_retried_after_restart_only_once_its_backoff_is_due() {
     assert_eq!((claim()["sequence"].as_u64(), claim()["retry_of"].as_u64()), (Some(2), Some(1)));
     assert_eq!(lab.state("demo")["notification_retry"]["retry"]["attempts"].as_u64().unwrap_or(0), 0);
 }
+
+/// Replaces `strict_inventory_captures_sorted_unseen_ids_and_verifies_consumption`.
+///
+/// A toast claims every unseen inbox item, sorted whatever order they were
+/// written in. Items `context` has shown and items handled with `inbox done`
+/// are left out of the next toast, which claims only the new unseen item.
+#[test]
+fn each_toast_claims_the_sorted_unseen_items_and_leaves_out_seen_and_handled_ones() {
+    let mut lab = Lab::new();
+    let project = lab.project_in_session("demo");
+    let write = |id: &str| fs::write(project.join(format!("inbox/{id}.md")), format!("+++\nid='{id}'\nkind='test'\nsummary='Fixture {id}'\n+++\n")).unwrap();
+    let claim = || lab.state("demo")["notification_claim"].clone();
+    let toasts = || fs::read_to_string(lab.path("demo.toasts")).unwrap_or_default().lines().count();
+    write("item-b");
+    write("item-a");
+    let mut ticker = lab.run_ticker();
+    ticker.wait_for("the first toast", || claim()["phase"] == "confirmed");
+    ticker.stop();
+    assert_eq!(claim()["batch"]["ids"], json!(["item-a", "item-b"]), "{}", claim());
+
+    lab.ok(&["context", "demo"]);
+    write("item-d");
+    write("item-c");
+    lab.ok(&["inbox", "done", "demo", "item-d"]);
+    let mut ticker = lab.run_ticker();
+    ticker.wait_for("the second toast", || claim()["sequence"] == 2 && claim()["phase"] == "confirmed");
+    ticker.another_pass("demo");
+    ticker.stop();
+    assert_eq!(claim()["batch"]["ids"], json!(["item-c"]), "{}", claim());
+    assert_eq!(toasts(), 2);
+}

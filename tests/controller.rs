@@ -15,14 +15,19 @@ const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
 
 /// Answers the bridge check and `notification.show`, logging each request
 /// and the time of each show. While `$HOME/busy` exists, one show is answered
-/// as not shown (`busy`) and the file is removed.
-const HERDR: &str = "#!/usr/bin/python3\nimport json,os,sys,time\nhome=os.environ['HOME']\n\
+/// as not shown (`busy`) and the file is removed. While `$HOME/fail` exists a
+/// show fails without a reply. Each show logs to `during` the delivery states
+/// the project store holds at that moment.
+const HERDR: &str = "#!/usr/bin/python3\nimport json,os,sqlite3,sys,time\nhome=os.environ['HOME']\n\
 if sys.argv[1:]==['--version']:print('herdr 0.9.1');sys.exit(0)\n\
 if sys.argv[1:]==['remote-api-bridge','--check']:print('herdr-api-bridge-v1');sys.exit(0)\n\
 if sys.argv[1:]!=['remote-api-bridge']:sys.exit(2)\n\
 r=json.loads(sys.stdin.readline())\nopen(home+'/requests','a').write(r['method']+'\\n')\n\
 if r['method']!='notification.show':sys.exit(3)\n\
 open(home+'/shows','a').write(str(int(time.time()*1000))+'\\n')\n\
+db=sqlite3.connect('file:'+home+'/root/demo/.state/state.db?mode=ro',uri=True)\n\
+open(home+'/during','a').write(','.join(s for (s,) in db.execute('SELECT state FROM operation_delivery ORDER BY operation_id'))+'\\n')\n\
+if os.path.exists(home+'/fail'):sys.exit(1)\n\
 busy=os.path.exists(home+'/busy')\n\
 if busy:os.remove(home+'/busy')\n\
 print(json.dumps({'id':r['id'],'result':{'type':'notification_show','shown':not busy,'reason':'busy' if busy else 'shown'}}))\n";
@@ -483,4 +488,159 @@ fn a_notification_retry_is_not_delivered_before_it_is_due() {
     assert_eq!(shows.len(), 2, "{shows:?}");
     assert!(shows[1] - shows[0] >= 1000, "retried before due: {shows:?}");
     assert_eq!(lab.delivery(&op).attempts, 2);
+}
+
+impl Lab {
+    /// Rewrite the owner's configuration with `extra` appended to the
+    /// authority table, then record and reactivate under it.
+    fn reconfigure(&self, extra: &str) {
+        let config = fs::read_to_string(self.config()).unwrap();
+        let base = config.split("\n[").next().unwrap();
+        fs::write(self.config(), format!("{base}\n{}", extra.replace("PROJECT", &format!("{:?}", self.project.display().to_string())))).unwrap();
+        self.ok(&["reconcile", "demo", "--record"]);
+        self.activate();
+    }
+    /// A delivery state per notification operation, as stored.
+    fn deliveries(&self) -> Vec<(String, DeliveryState)> {
+        let state = self.state();
+        state.deliveries.iter().map(|d| (d.operation.as_str().to_owned(), d.state)).collect()
+    }
+}
+
+/// Replaces the dispatch test `service_claims_before_effect_records_receipt_and_refuses_replay`.
+///
+/// While Herdr shows the notification the store already records the
+/// delivery as claimed; afterwards it is confirmed with one attempt, and an
+/// explicit operator delivery of the same operation is refused and shows
+/// nothing, as is a restarted ticker.
+#[test]
+fn a_notification_is_claimed_before_it_is_shown_and_never_shown_twice() {
+    let lab = Lab::new("");
+    lab.route();
+    lab.activate();
+    let op = lab.notify("notify");
+    lab.run(0, &|| lab.delivery(&op).state == DeliveryState::Confirmed);
+    assert_eq!(fs::read_to_string(lab.path("during")).unwrap(), "claimed\n");
+    let delivery = lab.delivery(&op);
+    assert_eq!((delivery.attempts, lab.shown()), (1, 1));
+    let out = Command::new(BIN).env_clear().env("HOME", lab.home.path()).env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", lab.path("herdr"))
+        .args(["--root", lab.path("root").to_str().unwrap(), "operations", "demo", "deliver-notification", op.as_str(), "--expected-revision", &delivery.revision.to_string()]).output().unwrap();
+    assert!(!out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    lab.run(2, &|| true);
+    assert_eq!((lab.delivery(&op), lab.shown()), (delivery, 1));
+}
+
+/// Replaces `notification_typed_safety_is_checked_even_when_generic_config_is_admitted`.
+///
+/// Owner configuration whose project safety table is invalid still records
+/// and activates, but a notification is refused and nothing is queued; with
+/// the table fixed the same notification is accepted.
+#[test]
+fn a_notification_is_refused_while_the_project_safety_settings_are_invalid() {
+    let lab = Lab::new("");
+    lab.route();
+    lab.reconfigure("[safety.PROJECT]\nstart_threads='invalid'\n");
+    lab.add("notify");
+    let before = lab.state();
+    let out = lab.cli(&["operations", "demo", "notify", "notify", "--expected-head", &lab.head()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && stderr.contains("invalid notification safety configuration"), "{stderr}");
+    assert_eq!(lab.state(), before);
+    lab.reconfigure("[safety.PROJECT]\nstart_threads='propose'\n");
+    lab.ok(&["operations", "demo", "notify", "notify", "--expected-head", &lab.head()]);
+    assert_eq!(lab.deliveries().len(), 1);
+    assert!(!lab.path("requests").exists());
+}
+
+/// Replaces `canonical_notification_malformed_unresolved_history_is_not_assumed_disjoint`.
+///
+/// A notification whose show failed stays ambiguous. Once its item is handled
+/// a new item may be notified, but not while the stored payload of the
+/// ambiguous one cannot be read as a valid notification: its items are then
+/// unknown and may overlap. Restored, the new notification is accepted.
+#[test]
+fn a_malformed_ambiguous_notification_blocks_new_notifications() {
+    let lab = Lab::new("");
+    lab.route();
+    lab.activate();
+    fs::write(lab.path("fail"), b"").unwrap();
+    let old = lab.notify("notify");
+    lab.run(0, &|| lab.delivery(&old).state == DeliveryState::Ambiguous);
+    lab.ok(&["inbox", "done", "demo", "message"]);
+    lab.add("waiting");
+    lab.ok(&["plan", "wait", "demo", "register", "--task", "waiting", "--condition", "user_decision", "--deadline", "2000-01-01T00:00:00Z"]);
+    lab.run(0, &|| lab.state().inbox.iter().any(|i| i.content.kind == "wait-wake"));
+    assert_eq!(lab.shown(), 1);
+
+    let raw = rusqlite::Connection::open(lab.store()).unwrap();
+    let original: String = raw.query_row("SELECT payload FROM operations WHERE id=?1", [old.as_str()], |r| r.get(0)).unwrap();
+    let store = |payload: &str| {
+        raw.execute("UPDATE operations SET payload=?1,payload_hash=?2 WHERE id=?3", rusqlite::params![payload, format!("{:x}", Sha256::digest(payload)), old.as_str()]).unwrap();
+    };
+    let valid: Value = serde_json::from_str(&original).unwrap();
+    for (pointer, value) in [("", json!({"invalid": "old notification"})), ("/inbox_ids", json!(["../bad"])), ("/binding_revision", json!(0)),
+        ("/config/path", json!("relative")), ("/config/digest", json!("not-a-hash"))] {
+        let mut bad = valid.clone();
+        *bad.pointer_mut(pointer).unwrap() = value;
+        store(&bad.to_string());
+        let before = lab.state();
+        let out = lab.cli(&["operations", "demo", "notify", "waiting", "--expected-head", &lab.head()]);
+        assert!(!out.status.success(), "{pointer}: accepted {}", String::from_utf8_lossy(&out.stdout));
+        assert_eq!(lab.state(), before, "{pointer}");
+    }
+    store(&original);
+    lab.ok(&["operations", "demo", "notify", "waiting", "--expected-head", &lab.head()]);
+    assert_eq!(lab.deliveries().iter().filter(|(_, s)| *s == DeliveryState::Pending).count(), 1);
+}
+
+/// Replaces the schedule test `interval_windows_are_anchored_bounded_and_restart_safe`.
+///
+/// Interval slots are anchored at the routine's start: three due minutes
+/// schedule the last of them, and scheduling again before the next slot adds
+/// nothing. A start decades back counts every missed slot at once, and an
+/// interval longer than all of time has exactly its first slot.
+#[test]
+fn interval_slots_are_anchored_at_the_start_counted_in_bulk_and_never_rescheduled() {
+    let lab = Lab::new("[safety.PROJECT]\nroutine_commands=true\n");
+    lab.activate();
+    let start = jiff::Timestamp::now().as_millisecond() - 150_000;
+    assert!(lab.routine("check", 1, true, "every 1m", start, MissedRunPolicy::CoalesceLatest).status.success());
+    assert!(lab.schedule("check").status.success());
+    let first = lab.state().routine_occurrences;
+    assert_eq!((first.len(), first[0].slots, first[0].first_unix_ms, first[0].scheduled_unix_ms), (1, 3, start, start + 120_000));
+    let before = lab.state();
+    let again = lab.schedule("check");
+    assert_eq!(lab.state(), before, "{}", String::from_utf8_lossy(&again.stdout));
+
+    for (name, schedule, slots) in [("decades", "every 1m", jiff::Timestamp::now().as_millisecond() / 60_000 + 1), ("forever", "every 100000000000d", 1)] {
+        assert!(lab.routine(name, 1, true, schedule, 0, MissedRunPolicy::CoalesceLatest).status.success(), "{name}");
+        let started = Instant::now();
+        let out = lab.schedule(name);
+        assert!(out.status.success() && started.elapsed() < Duration::from_secs(5), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+        let occurrence = lab.state().routine_occurrences.into_iter().find(|o| o.routine.id == format!("routine-{name}")).unwrap();
+        assert_eq!(occurrence.first_unix_ms, 0, "{name}");
+        assert!(occurrence.slots.abs_diff(slots as u64) <= 1, "{name}: {} slots, expected {slots}", occurrence.slots);
+    }
+}
+
+/// Replaces the watchdog test `other_store_errors_do_not_pause`.
+///
+/// With automatic admission on, a store error that is neither a full disk
+/// nor a busy database is logged by every pass as an admission error, but
+/// admission is not paused: no pause file is written and `status` reports
+/// none.
+#[test]
+fn a_store_error_that_is_not_a_full_disk_or_busy_database_does_not_pause_admission() {
+    let lab = Lab::new("");
+    lab.activate();
+    let raw = rusqlite::Connection::open(lab.store()).unwrap();
+    // Fixture only: automatic admission is enabled by a signed factory manifest.
+    raw.execute("UPDATE project_control SET factory_admission='on' WHERE singleton=1", []).unwrap();
+    raw.execute_batch("ALTER TABLE pending_verification_work RENAME TO held_aside").unwrap();
+    let errors = || lab.log().lines().filter(|line| line.contains(r#""reason":"error""#)).count();
+    lab.run(0, &|| errors() >= 2);
+    assert!(!lab.project.join(".state/admission-paused.json").exists(), "{}", lab.log());
+    raw.execute_batch("ALTER TABLE held_aside RENAME TO pending_verification_work").unwrap();
+    let status = lab.ok(&["factory", "status", "demo"]);
+    assert_eq!((&status["admission_paused"], &status["pause_reason"]), (&json!(false), &Value::Null), "{status}");
 }

@@ -179,42 +179,6 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
 
-    #[test]
-    fn connects_once_to_a_real_path_and_exchanges_one_line() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("server.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let thread = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            let mut server = loop {
-                match listener.accept() {
-                    Ok((server, _)) => break server,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        assert!(
-                            Instant::now() < deadline,
-                            "test connection was not established"
-                        );
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(e) => panic!("test accept failed: {e}"),
-                }
-            };
-            server
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut request = String::new();
-            BufReader::new(server.try_clone().unwrap())
-                .read_line(&mut request)
-                .unwrap();
-            assert_eq!(request, "{}\n");
-            server.write_all(b"{\"result\":true}\n").unwrap();
-        });
-        let reply = round_trip(&path, "{}", Duration::from_secs(2));
-        thread.join().unwrap();
-        assert_eq!(reply.unwrap(), "{\"result\":true}\n");
-    }
-
     fn peer(
         action: impl FnOnce(UnixStream) + Send + 'static,
     ) -> (UnixStream, std::thread::JoinHandle<()>) {

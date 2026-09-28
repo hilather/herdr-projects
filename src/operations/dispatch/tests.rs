@@ -50,12 +50,6 @@ fn run(db:&mut SqliteStore,id:&OperationId,adapter:&mut Adapter,late:bool)->Resu
     dispatch_one(db,DispatchRequest{operation:id,expected_revision:1,owner:"worker",lease_ms:1000},adapter,||{tick+=1;if late&&tick==3{1100}else{100}})
 }
 #[test]
-fn service_claims_before_effect_records_receipt_and_refuses_replay() {
-    let(temp,mut db,id)=fixture();let calls=Rc::new(Cell::new(0));let mut a=Adapter{path:temp.path().join("state.db"),calls:calls.clone(),mode:"ok"};
-    assert!(matches!(run(&mut db,&id,&mut a,false).unwrap(),DispatchResult::Recorded(d) if d.state==DeliveryState::Confirmed));
-    assert!(run(&mut db,&id,&mut a,false).is_err());assert_eq!(calls.get(),1);
-}
-#[test]
 fn service_policy_denial_and_stale_binding_never_call_effect() {
     for mode in ["denied","revoked","stale"] {
         let(temp,mut db,id)=fixture();let calls=Rc::new(Cell::new(0));let mut a=Adapter{path:temp.path().join("state.db"),calls:calls.clone(),mode};

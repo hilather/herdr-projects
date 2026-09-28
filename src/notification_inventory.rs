@@ -49,12 +49,6 @@ mod tests {
     use super::*;
     fn fixture()->(tempfile::TempDir,Project){let t=tempfile::tempdir().unwrap();let p=crate::project::create(t.path(),"demo","",vec![]).unwrap();crate::inbox::write_once(&p,"item-a","test","fixture","A","").unwrap();(t,p)}
     #[test]
-    fn strict_inventory_captures_sorted_unseen_ids_and_verifies_consumption() {
-        let(_t,p)=fixture();crate::inbox::write_once(&p,"item-b","test","fixture","B","").unwrap();let c=Control::default();assert_eq!(capture(&p,&c).unwrap().ids,["item-a","item-b"]);
-        assert!(!consumed(&p,&["item-a".into()],&c).unwrap());crate::inbox::mark_seen(&p,&["item-a".into()]).unwrap();assert_eq!(capture(&p,&c).unwrap().ids,["item-b"]);assert!(consumed(&p,&["item-a".into()],&c).unwrap());
-        crate::inbox::done(&p,&["item-b".into()],false).unwrap();assert!(consumed(&p,&["item-b".into()],&c).unwrap());assert!(capture(&p,&c).unwrap().ids.is_empty());
-    }
-    #[test]
     fn malformed_aliased_fifo_oversized_inbox_and_seen_files_refuse_promptly() {
         for target in ["inbox/item-a.md",".state/inbox-seen.json"] {for mode in ["malformed","alias","fifo","oversized"] {
             let(_t,p)=fixture();let path=p.dir().join(target);let _=fs::remove_file(&path);

@@ -6,19 +6,6 @@ use herdr_projects::{domain::TaskState,runtime};
 fn input(ctx:&Ctx,path:&Path,op:&Operation,revision:u64,mode:Mode)->Input {serde_json::from_str(request(ctx,path,op,revision,mode).unwrap().command.stdin.as_ref().unwrap()).unwrap()}
 fn control()->Control {Control::default()}
 
-#[test]
-fn canonical_finalization_controller_queues_capture_and_worker_commits_once() {
-    let(world,path,op)=fixture();let before=runtime::snapshot(&path).unwrap();let ctx=world.ctx();let request=input(&ctx,&path,&op,1,Mode::Deliver);
-    let pool=Arc::new(crate::executor::Executor::new(crate::executor::Limits::default(),Arc::new(JobRunner{inner:Arc::new(crate::runner::RealRunner)})).unwrap());
-    let mut queue=crate::copy_jobs::Queue::new(pool.clone());let mut reads=crate::canonical_controller::observations::Reads::new(pool.clone());
-    let result=crate::canonical_controller::poll_queued_effects(&ctx,&path,0,&mut reads,Some(&mut queue)).unwrap();assert!(result.operation_error.is_none(),"{:?}",result.operation_error);
-    assert!(queue.offered());assert_eq!(runtime::snapshot(&path).unwrap().deliveries,before.deliveries);assert!(!path.join(".state/canonical-artifacts").exists());
-    assert!(queue.admit().is_empty());let deadline=Instant::now()+Duration::from_secs(5);
-    while queue.pending(){assert!(queue.drain().is_empty());assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(5));}
-    let after=runtime::snapshot(&path).unwrap();assert_eq!(after.deliveries[0].state,DeliveryState::Confirmed);assert_eq!(after.deliveries[0].attempts,1);
-    assert_eq!(after.tasks.iter().find(|t|Some(&t.id)==op.task.as_ref()).unwrap().state,TaskState::AwaitingReview);assert_eq!(after.runtime_bindings,before.runtime_bindings);assert_eq!(after.attempts,before.attempts);
-    assert!(execute(&request,&control()).is_err());assert_eq!(runtime::snapshot(&path).unwrap(),after);assert!(pool.stop(Duration::from_secs(2)));
-}
 
 #[test]
 fn canonical_finalization_stale_or_cancelled_ingress_never_claims_or_captures() {

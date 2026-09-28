@@ -441,3 +441,33 @@ fn a_sha256_repository_submission_is_verified_from_its_retained_objects() {
     assert_eq!(f.satisfactions("verified_result"), [(result, "valid".into())]);
     assert_eq!(f.blockers("needs-verified"), disabled("verified_result"));
 }
+
+/// Replaces `task_contract_vectors_reject_ambiguous_dependencies_and_mismatched_git_formats`.
+///
+/// For each object format, an owner-signed contract that repeats its one
+/// dependency, names the other object format than its repository, or has
+/// revision zero is refused and nothing is written; the same contract with
+/// its dependency once, the repository's format and revision one is accepted.
+#[test]
+fn contracts_with_a_repeated_dependency_another_object_format_or_revision_zero_are_refused() {
+    for format in ["sha1", "sha256"] {
+        let f = Factory::with_format(format);
+        for task in ["pred", "consumer"] { f.ok(&["task", "demo", "add", task, "--title", task, "--expected-head", &f.head().to_string()]); }
+        let mut body = f.contract_body("consumer", 1, "consumer", json!({"paths":[{"path":"src/","access":"write"}],"named_resources":[]}));
+        let mut dependency = json!({"predecessor":"pred","edge":"verified_result","policy_id":"builds"});
+        if format == "sha256" { use sha2::Digest; dependency["policy_digest"] = json!(format!("{:x}", sha2::Sha256::digest(POLICY.as_bytes()))); }
+        body["dependencies"] = json!([dependency]);
+        let other = if format == "sha1" { "sha256" } else { "sha1" };
+        for (what, pointer, value) in [("repeated dependency", "/dependencies", json!([dependency, dependency])), ("object format", "/object_format", json!(other)),
+            ("revision zero", "/contract_revision", json!(0))] {
+            let mut bad = body.clone();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            let before = runtime::snapshot(&f.project).unwrap();
+            let out = f.put(&format!("{format}-{}.json", what.replace(' ', "-")), &serde_json::to_vec(&bad).unwrap());
+            assert!(!out.status.success(), "{format} {what}: accepted");
+            assert_eq!(runtime::snapshot(&f.project).unwrap(), before, "{format} {what}");
+        }
+        let out = f.put(&format!("{format}-valid.json"), &serde_json::to_vec(&body).unwrap());
+        assert!(out.status.success(), "{format}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+}

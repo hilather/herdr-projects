@@ -1575,3 +1575,97 @@ Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
   failed the routine test: the runs were `first, first, second, second`.
   (With routines left to the ticker's own scheduling the runs alternate
   anyway, so the test queues both backlogs with `routine-store schedule`.)
+
+## Job, notification, schedule, watchdog and socket unit tests replaced by E2E workflows
+
+The audit marked 18 tests REPLACE across the legacy and canonical job
+workers (`notification_jobs_tests`, `coordinator_jobs_tests`, `launch_jobs`,
+`legacy_routine_jobs`, `canonical_notification_jobs_tests`,
+`canonical_finalization_jobs_tests`, `canonical_brief_jobs`), notification
+inventory and delivery, `operations/dispatch/tests.rs`, `schedule`,
+`watchdog`, `runtime_ownership`, `worker_supervision`, `domain/launch`,
+`domain/factory/contract_tests.rs`, `local_observations_tests` and
+`runner/socket`. 16 were deleted and 2 were kept.
+
+The new tests drive the compiled CLI:
+- `tests/controller.rs` (extended): `ticker run`, `operations notify` and
+  `deliver-notification`, `inbox done`, `plan wait register`, `routine-store
+  import/schedule` and `factory status`. The Herdr stand-in can now fail a
+  show, and logs the delivery states it reads from the store while it shows.
+- `tests/ticker_jobs.rs` (extended): legacy `ticker run` priming, thread
+  starts and a background routine, and `open --reprime`. Its stand-in now
+  shows notifications.
+- `tests/recovery.rs` (extended): toasts through `ticker run`, `context`
+  and `inbox done`.
+- `tests/canonical_worker.rs` (extended): the worker's creation command and
+  agent name as the Herdr server receives them, and `profile prepare`.
+- `tests/adopt.rs` (extended, state-store build): `thread adopt` beside a
+  migrated project whose binding is recorded through the public store API.
+- `tests/satisfaction.rs` (extended): `task contract put`.
+- `tests/overview.rs` (extended): `unfocus --session` against a socket
+  server that counts connections and bytes.
+
+| E2E test | Replaces |
+|---|---|
+| `a_notification_is_claimed_before_it_is_shown_and_never_shown_twice` | `service_claims_before_effect_records_receipt_and_refuses_replay` |
+| `a_notification_is_refused_while_the_project_safety_settings_are_invalid` | `notification_typed_safety_is_checked_even_when_generic_config_is_admitted` |
+| `a_malformed_ambiguous_notification_blocks_new_notifications` | `canonical_notification_malformed_unresolved_history_is_not_assumed_disjoint` |
+| `interval_slots_are_anchored_at_the_start_counted_in_bulk_and_never_rescheduled` | `interval_windows_are_anchored_bounded_and_restart_safe` |
+| `a_store_error_that_is_not_a_full_disk_or_busy_database_does_not_pause_admission` | `other_store_errors_do_not_pause` |
+| `a_primed_coordinator_is_primed_again_only_after_an_explicit_reprime` | `concrete_prime_confirms_once_and_requires_an_explicit_new_request` |
+| `a_thread_start_is_confirmed_on_acknowledgement_without_waiting_for_the_agent` | `concrete_launch_acknowledges_submission_without_waiting_for_interactive_readiness` |
+| `a_due_legacy_routine_is_claimed_once_and_delivered_after_its_command_ends` | `ticker_offers_without_advancing_until_worker_claim_and_then_delivers` |
+| `each_toast_claims_the_sorted_unseen_items_and_leaves_out_seen_and_handled_ones` | `strict_inventory_captures_sorted_unseen_ids_and_verifies_consumption` |
+| `a_declined_toast_is_retried_after_restart_only_once_its_backoff_is_due` (existing) | `native_not_shown_receipt_allows_bounded_retry_without_uncertainty` |
+| `ticker_canonical_finalization_preserves_once_and_recovers_receipt_after_restart` (existing, `tests/cli.rs`) | `canonical_finalization_controller_queues_capture_and_worker_commits_once` |
+| `adopt_refuses_a_pane_that_a_migrated_project_already_binds` | `legacy_adoption_cannot_steal_a_canonical_reference` |
+| `ticker_launches_and_briefs_once_then_stops_a_cancelled_worker_while_paused_and_revoked` (extended) and `a_worker_wall_deadline_outside_one_second_to_seven_days_is_refused` | `worker_limits_and_literal_vector_are_explicit`, `full_attempt_ids_map_to_bounded_native_agent_names` |
+| `contracts_with_a_repeated_dependency_another_object_format_or_revision_zero_are_refused` | `task_contract_vectors_reject_ambiguous_dependencies_and_mismatched_git_formats` |
+| `unfocus_sends_one_line_over_one_connection_and_reads_one_reply_line` | `connects_once_to_a_real_path_and_exchanges_one_line` |
+
+Some guarantees look different from the CLI:
+- A notification is claimed before its effect: the stand-in reads the
+  store while it shows and finds the delivery `claimed`.
+- The malformed payload is planted by rewriting the stored operation and its
+  payload hash. The new, disjoint item is a wait-wake item, because a
+  migrated project has no other CLI that writes one. Restoring the payload
+  makes the same notification acceptable, so the refusal comes from the
+  history.
+- The invalid safety table is caught by the notification check only; the
+  configuration still records and activates.
+- The watchdog test makes the admission read fail by renaming one of its
+  tables for the ticker's passes, then restores it so `factory status` can
+  report that nothing paused. Nothing public makes a store report a
+  constraint conflict on that read.
+- The next due minute adding one slot is not asserted: it needs a real
+  minute of waiting.
+- The worker's wall bounds are refused by `profile prepare` before the
+  creation command is built. The creation command itself is asserted in the
+  launch test: `--kill-child=KILL`, the `600s` deadline, and the exact agent
+  executable last. Two distinct attempts are not launched, so the test shows
+  the name is bounded and stable, not that two attempts differ.
+- Legacy prompt readiness is not shown with a real agent: the session never
+  lists an agent in the pane, so a brief would need one.
+- The legacy routine's cursor is read while its command blocks; the window
+  between the offer and the worker's claim cannot be held open from outside.
+
+Kept:
+- `launch_queue_preserves_deadline_and_rejects_cancelled_or_conflicting_actions`
+  (`canonical_brief_jobs`). It checks a queued request's deadline and
+  cancellation tokens and a job input that asks for both launch advancement
+  and resource recovery. No public entry point builds such an input or
+  cancels a queued request before it runs.
+- `failed_retries_keep_classification_but_route_changes_and_partial_samples_do_not`
+  (`local_observations_tests`). The classification only vetoes the ticker's
+  five-minute idle exit, which has no override; each case would wait five
+  minutes.
+
+Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
+- Classifying every store error as `database_busy` in `watchdog::cause`
+  failed the watchdog test: the first failed admission read paused
+  admission, and later passes logged `database_busy` instead of `error`.
+- Skipping an unreadable or invalid ambiguous notification in the overlap
+  check failed the malformed-history test: the new notification was
+  accepted.
+- Dropping the "new request" condition from the coordinator prime check
+  failed the prime test: marking the record pending primed it again.

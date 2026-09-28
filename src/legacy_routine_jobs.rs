@@ -227,16 +227,4 @@ mod tests {
         ticket.cancel();wait(||pool.metrics().completed[1]==1);let completion=ticket.try_recv().unwrap().unwrap();assert!(completion.result.unwrap().success());assert!(pool.stop(Duration::from_secs(2)));
         let state=steps::try_load_state(&project).unwrap();assert_eq!(state.routines["check"].dispatch.as_ref().unwrap().result.as_ref().unwrap().exit,"cancelled");deliver_saved(&project);assert!(crate::cleanup::lease(&world.root).is_ok());
     }
-    #[test]
-    fn ticker_offers_without_advancing_until_worker_claim_and_then_delivers() {
-        let (world,project,_,input)=fixture("printf once >> count; printf result");
-        *world.panes.borrow_mut()=format!("[{}]",world.coordinator_pane(&project));
-        let pool=Arc::new(Executor::new(Limits::default(),Arc::new(JobRunner{inner:Arc::new(Untrusted)})).unwrap());
-        let ctx=world.ctx();let mut memory=steps::Memory::new(&ctx);memory.copy_jobs=Some(crate::copy_jobs::Queue::new(pool.clone()));
-        assert!(crate::ticker::tick_project_with(&ctx,&project,&mut memory).unwrap());
-        assert_eq!(steps::try_load_state(&project).unwrap().routines["check"].last_run,input.previous);assert!(!project.dir().join("count").exists());assert!(memory.copy_jobs.as_ref().unwrap().offered());
-        assert!(memory.copy_jobs.as_mut().unwrap().admit().is_empty());wait(||pool.metrics().completed[1]==1);
-        assert!(memory.copy_jobs.as_mut().unwrap().drain().is_empty());assert!(crate::ticker::tick_project_with(&ctx,&project,&mut memory).unwrap());
-        assert_eq!(std::fs::read(project.dir().join("count")).unwrap(),b"once");assert_eq!(crate::inbox::unhandled(&project).iter().filter(|i|i.kind=="routine").count(),1);assert!(pool.stop(Duration::from_secs(1)));
-    }
 }

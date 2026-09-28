@@ -292,6 +292,20 @@ fn ticker_launches_and_briefs_once_then_stops_a_cancelled_worker_while_paused_an
 
     // One gated creation with the usage warning, one target in the created pane, one brief.
     assert_eq!((lab.count("workspace.create_command"), lab.count("agent.prompt")), (1, 1));
+    // The worker runs in its own namespace, killed with it, under the
+    // profile's 600 s wall deadline, and ends by running the exact agent
+    // executable.
+    let argv: Vec<String> = serde_json::from_value(lab.requests().into_iter().find(|(m, _)| m == "workspace.create_command").unwrap().1["command"].clone()).unwrap();
+    let agent = lab.path("bin/claude").display().to_string();
+    assert!(argv.iter().any(|a| a == "--kill-child=KILL"), "{argv:?}");
+    let wall = argv.iter().position(|a| a == "600s").unwrap_or_else(|| panic!("{argv:?}"));
+    assert!(argv[..wall].ends_with(&["--".to_owned()]) && argv.last() == Some(&agent), "{argv:?}");
+    // The native agent name is bounded and derived from the full attempt id.
+    let names: Vec<String> = lab.requests().into_iter().filter(|(m, _)| m == "agent.rename").map(|(_, p)| p["name"].as_str().unwrap().to_owned()).collect();
+    assert!(!names.is_empty() && names.iter().all(|n| n == &names[0]), "{names:?}");
+    let name = &names[0];
+    assert!(name.len() == 32 && name.as_bytes()[0].is_ascii_lowercase() && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-_".contains(&b)), "{name}");
+    assert!(attempt.as_str().len() > 32 && !attempt.as_str().starts_with(name.as_str()), "{} {name}", attempt.as_str());
     let creation = &lab.events("runtime.launch_creation")[0];
     assert_eq!(creation.payload["usage_warning"], "provider_usage_unavailable");
     let target: LaunchTarget = serde_json::from_value(lab.events("runtime.launch_target")[0].payload.clone()).unwrap();
@@ -540,4 +554,26 @@ fn a_legacy_thread_holding_the_planned_worktree_blocks_its_creation() {
     fs::write(neighbor.join("PROJECT.md"), "legacy fixture").unwrap();
     fs::write(neighbor.join("threads/t-0001.toml"), format!("id='t-0001'\nworktree_path={}\n", json!(lab.planned_worktree(&attempt)))).unwrap();
     lab.assert_preparation_refused(&approval, &attempt, "worktree path is referenced");
+}
+
+/// Replaces `worker_limits_and_literal_vector_are_explicit` with
+/// `ticker_launches_and_briefs_once_then_stops_a_cancelled_worker_while_paused_and_revoked`,
+/// which checks the worker's argument vector.
+///
+/// A worker profile whose wall deadline is below one second or above seven
+/// days cannot be prepared.
+#[test]
+fn a_worker_wall_deadline_outside_one_second_to_seven_days_is_refused() {
+    let lab = Lab::new("unknown_usage='allow_with_warning'");
+    let config = lab.path(".config/herdr-projects/config.toml");
+    let original = fs::read_to_string(&config).unwrap();
+    for (wall, reason) in [("0", "budget limits must be positive bounded integers"), ("604801", "worker wall deadline exceeds supported bounds")] {
+        fs::write(&config, original.replace("max_wall_seconds=600", &format!("max_wall_seconds={wall}"))).unwrap();
+        let error = lab.refused(&["profile", "prepare", "demo", "worker", "--herdr-executable", lab.herdr.to_str().unwrap(),
+            "--agent-executable", lab.path("bin/claude").to_str().unwrap(), "--execution-home", lab.path("agent-home").to_str().unwrap()]);
+        assert!(error.contains(reason), "{wall}: {error}");
+    }
+    fs::write(&config, original.replace("max_wall_seconds=600", "max_wall_seconds=604800")).unwrap();
+    lab.ok(&["profile", "prepare", "demo", "worker", "--herdr-executable", lab.herdr.to_str().unwrap(),
+        "--agent-executable", lab.path("bin/claude").to_str().unwrap(), "--execution-home", lab.path("agent-home").to_str().unwrap()]);
 }

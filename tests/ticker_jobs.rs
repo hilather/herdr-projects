@@ -14,6 +14,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
 /// `machines.json`), and fails every call while `NAME.down` exists. Bridge
 /// requests follow `NAME.reply`: `ack`, `null` (a start acknowledged without
 /// an agent kind), `lost` (no reply) or `unsupported` (no bridge at all).
+/// A notification is always shown.
 /// Every call is logged to `calls` as `TIME NAME ARGS [METHOD]`, and every
 /// token refresh's parameters to `tokens`.
 const FAKE_HERDR: &str = r#"#!/usr/bin/python3
@@ -40,6 +41,7 @@ elif args==['agent','list']:print(json.dumps({'result':{'agents':read('agents')}
 elif args==['pane','list']:print(json.dumps({'result':{'panes':read('panes')}}))
 elif request is not None and request['method'] in ('agent.list','pane.list'):
     kind=request['method'].split('.')[0]+'s';print(json.dumps({'id':request['id'],'result':{kind:read(kind)}}))
+elif request is not None and request['method']=='notification.show':print(json.dumps({'id':request['id'],'result':{'type':'notification_show','shown':True,'reason':'shown'}}))
 elif request is not None and request['method']=='pane.report_metadata':
     with open(home/'tokens','a') as f:f.write(json.dumps(dict(request['params'],session=name))+'\n')
     print(json.dumps({'id':request['id'],'result':{'type':'ok'}}))
@@ -399,4 +401,121 @@ fn token_refreshes_follow_each_panes_current_group_and_write_no_execution_state(
     let coordinator = tokens().into_iter().find(|t| t["tokens"]["thread"] == "coordinator").unwrap();
     assert_eq!((coordinator["pane_id"].as_str(), coordinator["tokens"]["rank"].as_str()), (Some("p"), Some("0")));
     assert_eq!(execution(), before);
+}
+
+/// Replaces `concrete_prime_confirms_once_and_requires_an_explicit_new_request`.
+///
+/// The ticker primes a ready coordinator once. Marking the record pending
+/// again, without a new request, primes nothing; `open --reprime` asks for a
+/// new prime, which the ticker delivers once more.
+#[test]
+fn a_primed_coordinator_is_primed_again_only_after_an_explicit_reprime() {
+    let mut lab = Lab::new();
+    let project = lab.project_in_session("demo", json!({}));
+    lab.session("demo", &[agent_at("p", &project, "coordinator", "idle")], &[pane_at("p", &project)]);
+    let prompts = || lab.times("demo", "agent.prompt").len();
+    let settle = |what: &str, done: &dyn Fn() -> bool| {
+        let mut ticker = lab.run_ticker(&[]);
+        ticker.wait_for(what, 60, done);
+        ticker.next_pass();
+        ticker.next_pass();
+        ticker.stop();
+    };
+    settle("the prime", &|| lab.coordinator("demo")["prime_pending"] == false);
+    let primed = lab.coordinator("demo");
+    assert_eq!((prompts(), &primed["prime_claim"]["delivery"]["phase"], &primed["prime_sequence"]), (1, &json!("confirmed"), &json!(1)), "{primed}");
+
+    let mut pending = primed.clone();
+    pending["prime_pending"] = json!(true);
+    fs::write(project.join(".state/coordinator.json"), pending.to_string()).unwrap();
+    settle("two passes", &|| true);
+    assert_eq!(prompts(), 1, "primed again without a new request");
+
+    {
+        let version = lab.ok(&["--version"]).trim().rsplit(' ').next().unwrap().to_string();
+        let _ticker = hold_lock(&lab.root(), &version);
+        lab.ok(&["open", "demo", "--socket", lab.socket("demo").to_str().unwrap(), "--reprime"]);
+    }
+    assert_eq!(lab.coordinator("demo")["prime_request"], json!(2));
+    settle("the second prime", &|| prompts() == 2 && lab.coordinator("demo")["prime_pending"] == false);
+    let reprimed = lab.coordinator("demo");
+    assert_eq!((prompts(), &reprimed["prime_claim"]["delivery"]["phase"], &reprimed["prime_sequence"]), (2, &json!("confirmed"), &json!(2)), "{reprimed}");
+}
+
+/// Replaces `concrete_launch_acknowledges_submission_without_waiting_for_interactive_readiness`.
+///
+/// A thread waiting in an empty pane is started once. The acknowledgement
+/// confirms the start, with or without an agent kind, although no ready
+/// agent appears: later passes neither start it again nor brief it.
+#[test]
+fn a_thread_start_is_confirmed_on_acknowledgement_without_waiting_for_the_agent() {
+    for reply in ["ack", "null"] {
+        let mut lab = Lab::new();
+        let project = lab.project_in_session("demo", json!({"prime_pending": false}));
+        let work = lab.path("work");
+        fs::create_dir(&work).unwrap();
+        fs::write(project.join("threads/t-0001.toml"), toml::to_string(&json!({"id": "t-0001", "title": "task", "status": "open", "kind": "tab",
+            "created": jiff::Timestamp::now().to_string(), "agent": "claude", "agent_name": "worker", "workspace_id": "w", "tab_id": "w:t", "pane_id": "pw",
+            "cwd": work, "thread_dir": work, "prompt_pending": true})).unwrap()).unwrap();
+        lab.session("demo", &[agent_at("p", &project, "coordinator", "idle")], &[pane_at("p", &project), pane_at("pw", &work)]);
+        lab.set("demo.reply", Some(reply));
+        let thread = || -> toml::Value { toml::from_str(&fs::read_to_string(project.join("threads/t-0001.toml")).unwrap()).unwrap() };
+        let mut ticker = lab.run_ticker(&[]);
+        ticker.wait_for("the confirmed start", 60, || thread().get("launch_claim").and_then(|c| c.get("phase")).and_then(|p| p.as_str()) == Some("confirmed"));
+        ticker.next_pass();
+        ticker.next_pass();
+        ticker.stop();
+        let record = thread();
+        assert_eq!(lab.times("demo", "agent.start").len(), 1, "{reply}");
+        assert_eq!((record["prompt_pending"].as_bool(), record["status"].as_str()), (Some(true), Some("open")), "{reply}: {record}");
+        assert!(lab.times("demo", "agent.prompt").is_empty(), "{reply}");
+    }
+}
+
+/// Replaces `ticker_offers_without_advancing_until_worker_claim_and_then_delivers`.
+///
+/// A due, approved legacy routine runs in the background: while its command
+/// runs the ticker has advanced the routine to this occurrence and recorded
+/// its claim but delivered nothing, and it keeps passing. Once the command
+/// ends its output is delivered as one inbox item, and nothing runs again.
+#[test]
+fn a_due_legacy_routine_is_claimed_once_and_delivered_after_its_command_ends() {
+    use sha2::{Digest, Sha256};
+    let mut lab = Lab::new();
+    let project = lab.project_in_session("demo", json!({"prime_pending": false}));
+    lab.session("demo", &[agent_at("p", &project, "coordinator", "idle")], &[pane_at("p", &project)]);
+    let command = "printf once >> count; while [ ! -e release ]; do sleep 0.05; done; printf routine-result";
+    fs::write(project.join("routines/check.md"), format!("+++\nschedule = \"every 24h\"\ncommand = {}\n+++\nInspect output.\n", json!(command))).unwrap();
+    let config = lab.path(".config/herdr-projects");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("config.toml"), format!("[safety.{:?}]\nroutine_commands = true\n", project.display().to_string())).unwrap();
+    fs::write(config.join("approved-routines.json"), json!([{"project": project, "routine": "check",
+        "command_sha256": format!("{:x}", Sha256::digest(command.as_bytes())), "approved": "fixture"}]).to_string()).unwrap();
+    let previous = "2026-01-01T00:00:00Z";
+    fs::write(project.join(".state/ticker.json"), json!({"routines": {"check": {"last_run": previous}}}).to_string()).unwrap();
+    let routine = || -> Value { serde_json::from_slice::<Value>(&fs::read(project.join(".state/ticker.json")).unwrap()).unwrap()["routines"]["check"].clone() };
+    let delivered = || -> Vec<String> { fs::read_dir(project.join("inbox")).unwrap().flatten().filter(|e| e.path().is_file())
+        .map(|e| fs::read_to_string(e.path()).unwrap()).filter(|text| text.contains("routine")).collect() };
+
+    let mut ticker = lab.run_ticker(&[]);
+    ticker.wait_for("the routine command", 60, || project.join("count").exists());
+    ticker.next_pass();
+    let running = routine();
+    assert!(running["last_run"].as_str().is_some_and(|run| run != previous), "{running}");
+    assert!(running["dispatch"].is_object() && running["dispatch"]["result"].is_null(), "{running}");
+    assert!(delivered().is_empty());
+    fs::write(project.join("release"), b"").unwrap();
+    ticker.wait_for("the routine result", 60, || delivered().len() == 1);
+    ticker.wait_for("the delivery acknowledged", 60, || routine()["dispatch"].is_null());
+    ticker.next_pass();
+    ticker.stop();
+    let mut ticker = lab.run_ticker(&[]);
+    ticker.next_pass();
+    ticker.next_pass();
+    ticker.stop();
+    assert_eq!(fs::read(project.join("count")).unwrap(), b"once");
+    let items = delivered();
+    assert_eq!(items.len(), 1);
+    assert!(items[0].contains("routine-result"), "{}", items[0]);
+    assert_eq!(routine()["last_run"], running["last_run"]);
 }

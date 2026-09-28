@@ -127,20 +127,6 @@ mod tests {
     use super::*;
     fn ms(text:&str)->i64 {text.parse::<jiff::Timestamp>().unwrap().as_millisecond()}
     #[test]
-    fn interval_windows_are_anchored_bounded_and_restart_safe() {
-        let zone=jiff::tz::TimeZone::UTC;
-        let schedule=parse_schedule("every 1m").unwrap();
-        let first=due_window(&schedule,&zone,1000,-1,181_001).unwrap().unwrap();
-        assert_eq!(first,DueWindow{first_unix_ms:1000,last_unix_ms:181_000,slots:4});
-        assert!(due_window(&schedule,&zone,1000,first.last_unix_ms,181_001).unwrap().is_none());
-        assert!(due_window(&schedule,&zone,1000,first.last_unix_ms,10_000).unwrap().is_none());
-        assert_eq!(due_window(&schedule,&zone,1000,first.last_unix_ms,241_000).unwrap().unwrap().slots,1);
-        let centuries=due_window(&schedule,&zone,0,-1,ms("9999-01-01T00:00:00Z")).unwrap().unwrap();
-        assert!(centuries.slots>1_000_000_000);
-        let huge=Schedule::Every(i64::MAX);
-        assert_eq!(due_window(&huge,&zone,0,-1,ms("9999-01-01T00:00:00Z")).unwrap().unwrap().slots,1);
-    }
-    #[test]
     fn daily_dst_gaps_and_repeats_have_explicit_instants() {
         let zone=jiff::tz::TimeZone::get("America/New_York").unwrap();
         let schedule=parse_schedule("daily 02:30").unwrap();

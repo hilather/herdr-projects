@@ -227,14 +227,6 @@ mod tests {
         assert!(!is_paused(&project));
     }
 
-    #[test]
-    fn other_store_errors_do_not_pause() {
-        let (_temp, project) = project_with_attempt();
-        let before = attempts(&project);
-        assert!(!note(&project, &StoreError::Conflict).unwrap());
-        assert!(!is_paused(&project));
-        assert_eq!(attempts(&project), before);
-    }
 
     #[test]
     fn disk_full_fixture_pauses_admission_and_retains_attempts() {
