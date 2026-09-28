@@ -2278,6 +2278,76 @@ fn ticker_auto_verification_releases_project_ownership_during_the_check() {
 
 #[cfg(all(feature="state-store",target_os="linux"))]
 #[test]
+fn operator_verify_releases_project_ownership_during_the_check() {
+    use std::{io::{Read,Write},sync::{Arc,atomic::{AtomicUsize,Ordering}}};
+    use herdr_projects::runtime;
+    // A local git-protocol fixture holds connection `n` until `released > n`.
+    let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();let port=listener.local_addr().unwrap().port();
+    let released=Arc::new(AtomicUsize::new(0));let connections=Arc::new(AtomicUsize::new(0));
+    {let released=released.clone();let connections=connections.clone();std::thread::spawn(move||for stream in listener.incoming(){
+        let Ok(mut stream)=stream else{continue};let index=connections.fetch_add(1,Ordering::SeqCst);let released=released.clone();
+        std::thread::spawn(move||{let mut buffer=[0u8;4096];let _=stream.read(&mut buffer);while released.load(Ordering::SeqCst)<=index{std::thread::sleep(std::time::Duration::from_millis(10));}let _=stream.write_all(b"0000");let _=stream.read(&mut buffer);});
+    });}
+    let f=VerifyFixture::new(&[("src/lib.rs","pub fn result() {}\n".into())]);
+    let body=format!(r#"{{"version":1,"checks":["/usr/bin/git","ls-remote","git://127.0.0.1:{port}/fixture"]}}"#);
+    let policy=f.home.path().join("waits.json");std::fs::write(&policy,&body).unwrap();
+    let first=f.submit("first",&[("waits",body.clone())]);
+    runtime::add_task(&f.project,herdr_projects::domain::TaskId::new("other").unwrap(),"other".into(),runtime::snapshot(&f.project).unwrap().head).unwrap();
+    let runs=|submission:&str|f.db().query_row("SELECT count(*) FROM verification_runs WHERE submission_id=?1",[submission],|row|row.get::<_,u64>(0)).unwrap();
+    let work=|name:&str|f.home.path().join(format!("work-{name}"));
+    let verify=|submission:&str,key:&str,dir:&str|Command::new(BIN).env_clear().env("HOME",f.home.path()).args(["--root",f.r(),"result","demo","verify",submission,"--policy-id","waits",
+        "--policy-file",policy.to_str().unwrap(),"--idempotency-key",key,"--work-dir",work(dir).to_str().unwrap(),"--timeout-seconds","60"])
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let wait_for=|count:usize|{let deadline=std::time::Instant::now()+std::time::Duration::from_secs(60);
+        while connections.load(Ordering::SeqCst)<count{assert!(std::time::Instant::now()<deadline,"the check never started");std::thread::sleep(std::time::Duration::from_millis(10));}};
+    // Only a lock held for the whole check makes every rename attempt fail.
+    let rename=|task:&str,title:&str|{
+        for _ in 0..40 {
+            let snapshot=runtime::snapshot(&f.project).unwrap();let revision=snapshot.tasks.iter().find(|t|t.id.as_str()==task).unwrap().revision;
+            let out=hp(f.home.path(),&["--root",f.r(),"task","demo","rename",task,"--title",title,"--expected-revision",&revision.to_string(),"--expected-head",&snapshot.head.to_string()]);
+            if out.status.success() {return;}
+            let stderr=String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(stderr.contains("owns"),"{stderr}");std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("the running operator verification kept project ownership");
+    };
+    let child=verify(&first,"operator-first","first");
+    wait_for(1);
+    // While the check runs, another project effect proceeds; root-exclusive maintenance is still refused.
+    rename("other","renamed during the check");
+    assert!(herdr_projects::execution_guard::RootGuard::exclusive(&f.root).is_err(),"the check keeps the root shared");
+    assert_eq!(runs(&first),0);
+    released.store(1,Ordering::SeqCst);
+    let out=child.wait_with_output().unwrap();assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let outcome:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!((outcome["state"].as_str(),outcome["replayed"].as_bool()),(Some("accepted"),Some(false)));
+    let key:String=f.db().query_row("SELECT idempotency_key FROM verification_runs WHERE submission_id=?1",[&first],|row|row.get(0)).unwrap();
+    assert_eq!((key.as_str(),runs(&first)),("operator-first",1));
+    assert_eq!(runtime::snapshot(&f.project).unwrap().tasks.iter().find(|t|t.id.as_str()=="other").unwrap().title,"renamed during the check");
+    assert!(!work("first").exists(),"the work directory is removed");
+    // The same key replays the recorded run without a second check.
+    let out=verify(&first,"operator-first","replay").wait_with_output().unwrap();assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["replayed"],true);
+    assert_eq!((runs(&first),connections.load(Ordering::SeqCst)),(1,1));
+    // The submission's own task moves during the check: nothing is recorded.
+    let second=f.submit("second",&[("waits",body.clone())]);
+    let child=verify(&second,"operator-second","second");
+    wait_for(2);
+    rename("second","moved during the check");
+    released.store(2,Ordering::SeqCst);
+    let out=child.wait_with_output().unwrap();let stderr=String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success()&&stderr.contains("verification inputs changed during the check"),"{stderr}");
+    assert_eq!(runs(&second),0,"a stale check records nothing");
+    assert!(!work("second").exists(),"the work directory is removed");
+    // Nothing holds the key: a fresh check under it records one run.
+    released.store(usize::MAX,Ordering::SeqCst);
+    let out=verify(&second,"operator-second","again").wait_with_output().unwrap();assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["state"],"accepted");
+    assert_eq!(runs(&second),1);
+}
+
+#[cfg(all(feature="state-store",target_os="linux"))]
+#[test]
 fn ticker_auto_integrates_two_results_serially_and_recovers_stale_and_crash() {
     use std::{io::{Read,Write},sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering}}};
     use herdr_projects::{migration,runtime,operations::{DeliveryState,Outcome}};

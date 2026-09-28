@@ -221,25 +221,49 @@ pub(crate) fn program_allowed(program: &str, checkout: &Path) -> bool {
 
 /// Owner/operator CLI ingress. Work is isolated in a newly created directory;
 /// existing caller files are never reused or removed by this entry point.
+/// Runtime ownership covers the load and the record; the isolated check holds
+/// only the shared root and the work directory's fence.
 pub fn verify_project(project: &Path, request: &VerifyRequest) -> Result<VerifyOutcome> {
     use std::os::unix::fs::DirBuilderExt;
     if request.timeout < Duration::from_secs(1) || request.timeout > Duration::from_secs(300) {
         bail!("verification timeout must be between 1 and 300 seconds");
     }
     if !request.work_dir.is_absolute() { bail!("verification work directory must be absolute"); }
-    let _guard = crate::migration::runtime_mutation(project)?;
+    let scratch = crate::execution_guard::Resource::new("scratch", request.work_dir.display().to_string())?;
+    let guard = crate::migration::runtime_mutation(project)?;
     let mut store = crate::migration::open_active(project)?;
     fs::DirBuilder::new().mode(0o700).create(&request.work_dir)
         .context("verification work directory must be new and have an existing parent")?;
     struct Work(Option<PathBuf>);
     impl Drop for Work { fn drop(&mut self) { if let Some(path) = &self.0 { let _ = fs::remove_dir_all(path); } } }
     let mut work = Work(Some(request.work_dir.clone()));
-    let outcome = verify(&mut store, request);
+    // The work directory is this call's own, so it is removed with or without ownership.
+    let mut ownership = OperatorOwnership { slot: OperatorSlot::Project(guard), project: project.to_path_buf(), scratch, wait: request.timeout };
+    let outcome = verify_owned(&mut store, request, Some(&mut ownership));
     let cleanup = fs::remove_dir_all(&request.work_dir);
     if cleanup.is_ok() { work.0 = None; }
     let outcome = outcome?;
     cleanup.context("verification recorded but scratch cleanup failed")?;
     Ok(outcome)
+}
+
+enum OperatorSlot { Project(crate::migration::Maintenance), Check(crate::execution_guard::CheckGuard), Lost }
+/// Operator runtime ownership, handed to the verifier around its isolated check.
+struct OperatorOwnership { slot: OperatorSlot, project: PathBuf, scratch: crate::execution_guard::Resource, wait: Duration }
+impl CheckOwnership for OperatorOwnership {
+    fn release(&mut self) -> Result<()> {
+        let OperatorSlot::Project(guard) = std::mem::replace(&mut self.slot, OperatorSlot::Lost) else { bail!("verification does not hold project ownership") };
+        match guard.fence(&self.scratch) {
+            Ok(fence) => { self.slot = OperatorSlot::Check(guard.narrow(fence)?); Ok(()) }
+            Err(error) => { self.slot = OperatorSlot::Project(guard); Err(error) }
+        }
+    }
+    fn reacquire(&mut self, _: &mut SqliteStore) -> Result<()> {
+        let OperatorSlot::Check(check) = std::mem::replace(&mut self.slot, OperatorSlot::Lost) else { bail!("verification is not narrowed to its check") };
+        self.slot = OperatorSlot::Project(crate::migration::Maintenance::widen(check, &self.project, self.wait)?);
+        Ok(())
+    }
+    fn held(&self) -> bool { matches!(self.slot, OperatorSlot::Project(_)) }
 }
 
 /// Automatic verifier timeout. The job lease (300 s) must cover the checkout,
@@ -373,13 +397,12 @@ fn verify_owned(store: &mut SqliteStore, request: &VerifyRequest, ownership: Opt
         sha256(&String::from_utf8_lossy(&policy_bytes)),
         target.candidate_oid
     ));
-    if let Some(existing) =
-        store.lookup_verification(&target.project_store, &request.idempotency_key)?
-    {
+    let replay = |store: &mut SqliteStore, target: &VerifyTarget| -> Result<Option<VerifyOutcome>> {
+        let Some(existing) = store.lookup_verification(&target.project_store, &request.idempotency_key)? else { return Ok(None) };
         if existing.payload_digest != payload_digest {
             bail!("verification idempotency conflict");
         }
-        return Ok(VerifyOutcome {
+        Ok(Some(VerifyOutcome {
             run_id: existing.run_id,
             state: existing.state,
             reason: existing.reason,
@@ -387,7 +410,10 @@ fn verify_owned(store: &mut SqliteStore, request: &VerifyRequest, ownership: Opt
             argv: existing.argv,
             stdout: String::new(),
             replayed: true,
-        });
+        }))
+    };
+    if let Some(replayed) = replay(store, &target)? {
+        return Ok(replayed);
     }
     if policy_bytes != target.policy_body.as_bytes() {
         return persist(
@@ -542,7 +568,11 @@ fn verify_owned(store: &mut SqliteStore, request: &VerifyRequest, ownership: Opt
             let fresh = store.load_verify_target(&request.submission_id, &request.policy_id)
                 .map_err(|error| FenceChanged(format!("{error}")))?;
             if !fresh.same_job(&target) {
-                return Err(FenceChanged("submission, contract, policy or attempt changed".into()).into());
+                return Err(FenceChanged("task, submission, contract, policy or attempt changed".into()).into());
+            }
+            // Another caller may have recorded under the same key meanwhile.
+            if let Some(replayed) = replay(store, &fresh)? {
+                return Ok(replayed);
             }
             (ran, fresh)
         }

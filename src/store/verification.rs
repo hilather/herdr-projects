@@ -40,6 +40,7 @@ pub(crate) struct VerifyTarget {
     pub submission_id: String,
     pub payload_digest: String,
     pub task_id: String,
+    pub task_revision: i64,
     pub contract_revision: i64,
     pub contract_digest: String,
     pub attempt_id: String,
@@ -131,6 +132,7 @@ impl VerifyTarget {
         self.project_store == other.project_store
             && self.payload_digest == other.payload_digest
             && self.task_id == other.task_id
+            && self.task_revision == other.task_revision
             && self.contract_revision == other.contract_revision
             && self.contract_digest == other.contract_digest
             && self.attempt_id == other.attempt_id
@@ -187,8 +189,9 @@ impl SqliteStore {
         let project_store = path.to_string_lossy().into_owned();
         let row = tx
             .query_row(
-                "SELECT s.payload_digest, s.idempotency_key, s.task_id, s.contract_revision, s.contract_digest, s.attempt_id, s.candidate_oid, s.object_format, a.revision, p.body, c.raw_bytes, c.raw_digest
+                "SELECT s.payload_digest, s.idempotency_key, s.task_id, s.contract_revision, s.contract_digest, s.attempt_id, s.candidate_oid, s.object_format, a.revision, p.body, c.raw_bytes, c.raw_digest, t.revision
                  FROM result_submissions s
+                 JOIN tasks t ON t.id = s.task_id
                  JOIN attempts a ON a.id = s.attempt_id AND a.task_id = s.task_id
                  JOIN task_contracts c ON c.task_id = s.task_id AND c.contract_revision = s.contract_revision
                  JOIN acceptance_policies p ON p.task_id = s.task_id AND p.contract_revision = s.contract_revision AND p.policy_id = ?3
@@ -208,6 +211,7 @@ impl SqliteStore {
                         row.get::<_, String>(9)?,
                         row.get::<_, Vec<u8>>(10)?,
                         row.get::<_, String>(11)?,
+                        row.get::<_, i64>(12)?,
                     ))
                 },
             )
@@ -225,6 +229,7 @@ impl SqliteStore {
             policy_body,
             raw,
             raw_digest,
+            task_revision,
         )) = row
         else {
             return Err(invalid("verification target is missing"));
@@ -283,6 +288,7 @@ impl SqliteStore {
             submission_id: submission_id.to_string(),
             payload_digest,
             task_id,
+            task_revision,
             contract_revision,
             contract_digest,
             attempt_id,
@@ -713,6 +719,7 @@ impl SqliteStore {
             submission_id: "c".repeat(64),
             payload_digest: sha256_hex(b"verifier-rejection-payload"),
             task_id: "task".into(),
+            task_revision: 1,
             contract_revision: 1,
             contract_digest: raw_digest,
             attempt_id: "attempt-1".into(),

@@ -241,10 +241,17 @@ Recorded here rather than folded into the card that found them.
   expiry, observation by key and replacement. Without regained ownership it
   records nothing. E2E:
   `ticker_auto_verification_releases_project_ownership_during_the_check`.
+  The operator `result verify` command now does the same — done (this PR): it
+  holds runtime ownership (project lock and record lock) to load and record,
+  runs the check under a `CheckGuard` fenced on its work directory, regains
+  ownership within its timeout, and records nothing if the task, submission,
+  contract, policy or attempt changed (the target now carries the task
+  revision); the error names the changed inputs. A run recorded under the same
+  key meanwhile is replayed. E2E:
+  `operator_verify_releases_project_ownership_during_the_check`.
   Still open: integration jobs keep exclusive ownership throughout, because
   their candidate policy checks run inside `integrate_job` between the merge
-  and the compare-and-swap publication, and the operator `result verify`
-  command still holds ownership for its whole check.
+  and the compare-and-swap publication.
 - **No E2E for the isolation-unavailable pause** (`verification.paused`); it
   cannot be simulated from outside without a hook in the shipped binary.
 - **Integration job follow-ups (card 3):** retry command done (this PR):

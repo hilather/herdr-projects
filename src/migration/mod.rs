@@ -224,6 +224,25 @@ impl Maintenance {
     pub(crate) fn inherit_routine_execution(&self)->Result<Vec<crate::runner::InheritedLock>> {
         self._project.as_ref().context("runtime project ownership required")?.inherit_transfer()
     }
+    /// Take `resource`'s fence under this runtime ownership.
+    pub(crate) fn fence(&self,resource:&crate::execution_guard::Resource)->Result<crate::execution_guard::Fence> {
+        self._project.as_ref().context("runtime project ownership required")?.fence(resource)
+    }
+    /// Release the record lock and project ownership, keeping the shared root
+    /// and `fence`, for a long check that touches only the fenced resource.
+    pub(crate) fn narrow(self,fence:crate::execution_guard::Fence)->Result<crate::execution_guard::CheckGuard> {
+        let Maintenance{_locks,_project,_root}=self;drop(_locks);drop(_root);
+        Ok(_project.context("runtime project ownership required")?.narrow(fence))
+    }
+    /// Take runtime ownership of `project` again after [`Maintenance::narrow`],
+    /// waiting up to `wait` for another effect to finish.
+    pub(crate) fn widen(check:crate::execution_guard::CheckGuard,project:&Path,wait:std::time::Duration)->Result<Self> {
+        let guard=check.widen(wait)?;guard.check_project(project)?;
+        // The record lock is only ever taken under project ownership, which is now held.
+        let record=crate::execution_guard::exclusive_file(&project.join(".state/lock"))?;
+        no_pending_cutover(project)?;
+        Ok(Self{_locks:vec![record],_project:Some(guard),_root:None})
+    }
     fn runtime(project:&Path)->Result<Self> {
         let guard=crate::execution_guard::ProjectGuard::acquire(project)?;
         let record=crate::execution_guard::exclusive_file(&project.join(".state/lock"))?;
@@ -473,12 +492,16 @@ pub(crate) fn maintenance(project:&Path)->Result<Maintenance> {
 pub(crate) fn runtime_mutation(project:&Path)->Result<Maintenance> {
     let project=checked_project(project)?;
     let guard=Maintenance::runtime(&project)?;
-    let journal=memory_journal_path(&project);
+    no_pending_cutover(&project)?;
+    Ok(guard)
+}
+fn no_pending_cutover(project:&Path)->Result<()> {
+    let journal=memory_journal_path(project);
     if exists(&journal) {
         let memory:crate::memory::MemoryJournal=serde_json::from_slice(&read(&journal)?)?;
         ensure!(memory.phase!=Phase::CutoverPending,"memory cutover is pending; repeat the signed memory cutover command to recover before mutations");
     }
-    Ok(guard)
+    Ok(())
 }
 /// Validates published authority without requiring tasks to remain at import
 /// revisions. Accepted post-cutover edits must never trigger a legacy rollback.
