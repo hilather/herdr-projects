@@ -425,7 +425,7 @@ pub(super) fn verify(
         .as_str()
         .context("probe root pane missing")?;
     if let Some(launch) = &launch {
-        let sent = api.call("pane.send_input", json!({"pane_id":pane,"text":launch.line,"keys":[]}))?;
+        let sent = api.call("pane.send_input", json!({"pane_id":pane,"text":launch.line,"keys":["Enter"]}))?;
         ensure!(sent["type"] == "ok", "uncertain native probe launcher input");
     }
     let workspace = created["workspace"]["workspace_id"]

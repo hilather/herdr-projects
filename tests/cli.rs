@@ -1870,14 +1870,16 @@ struct Ticker(std::process::Child);
 impl Drop for Ticker {fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
 #[cfg(all(feature="state-store",target_os="linux"))]
 impl VerifyFixture {
-    fn new(files:&[(&str,String)])->Self {
+    fn new(files:&[(&str,String)])->Self {Self::with_worker(files,"kind='claude'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=60\nunknown_usage='allow_with_warning'\n")}
+    /// `worker` is the body of the `[profiles.worker]` table.
+    fn with_worker(files:&[(&str,String)],worker:&str)->Self {
         use std::fs;use herdr_projects::{domain::ProjectState,migration,runtime};
         let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
         for action in ["new","pause"]{assert!(hp(home.path(),&["--root",r,action,"demo"]).status.success());}
         let key=home.path().join("owner");assert!(Command::new("/usr/bin/ssh-keygen").args(["-q","-t","ed25519","-N","","-f"]).arg(&key).output().unwrap().status.success());
         let public=fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
         let project=root.join("demo");let config=home.path().join(".config/herdr-projects/config.toml");fs::create_dir_all(config.parent().unwrap()).unwrap();
-        fs::write(&config,format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[profiles.worker]\nkind='claude'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=60\nunknown_usage='allow_with_warning'\n")).unwrap();
+        fs::write(&config,format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[profiles.worker]\n{worker}")).unwrap();
         let plan=migration::inspect_with_config(&project,&config).unwrap();migration::apply(&project,&plan,true).unwrap();
         let s=runtime::snapshot(&project).unwrap();runtime::set_state(&project,s.head,s.control.unwrap().revision,ProjectState::Active,&config).unwrap();
         let store=project.join(".state/state.db").canonicalize().unwrap().display().to_string();
@@ -1935,8 +1937,9 @@ impl VerifyFixture {
         let snapshot=herdr_projects::runtime::snapshot(&self.project).unwrap();
         snapshot.operations.into_iter().filter(|op|op.kind=="verification.run").map(|op|{let d=snapshot.deliveries.iter().find(|d|d.operation==op.id).unwrap().clone();(op,d)}).collect()
     }
-    fn spawn(&self)->Ticker {
-        Ticker(Command::new(BIN).env_clear().env("HOME",self.home.path()).env("PATH","/usr/bin:/bin").env("HERDR_BIN_PATH","/bin/false").args(["--root",self.r(),"ticker","run"])
+    fn spawn(&self)->Ticker {self.spawn_with("/bin/false")}
+    fn spawn_with(&self,herdr:&str)->Ticker {
+        Ticker(Command::new(BIN).env_clear().env("HOME",self.home.path()).env("PATH","/usr/bin:/bin").env("HERDR_BIN_PATH",herdr).args(["--root",self.r(),"ticker","run"])
             .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap())
     }
     fn wait(&self,child:&mut Ticker,seconds:u64,predicate:&dyn Fn()->bool) {
@@ -1951,16 +1954,23 @@ impl VerifyFixture {
     /// Retain a launchable `worker` profile over fake Herdr and agent binaries.
     /// Native interaction needs a real agent session, so only that evidence is
     /// planted, in the verifier's exact shape; launch revalidates everything else live.
-    fn launchable_profile(&self)->herdr_projects::domain::VersionedReference {
-        use std::{fs,os::unix::fs::{MetadataExt,PermissionsExt}};
-        use herdr_projects::{domain::*,worker_supervision::{ProcessIncarnation,SupervisorIdentity}};
-        use sha2::{Digest,Sha256};
+    fn launchable_profile(&self)->herdr_projects::domain::VersionedReference {self.fake_launchable_profile("claude","2.1.0 (Claude Code)")}
+    fn fake_launchable_profile(&self,name:&str,version:&str)->herdr_projects::domain::VersionedReference {
+        use std::{fs,os::unix::fs::PermissionsExt};
         let bin=self.home.path().join("bin");let agent_home=self.home.path().join("agent-home");fs::create_dir_all(&bin).unwrap();fs::create_dir_all(&agent_home).unwrap();
-        let (herdr,agent)=(bin.join("herdr"),bin.join("claude"));
+        let (herdr,agent)=(bin.join("herdr"),bin.join(name));
         // Herdr answers one native request with a pong that offers workspace creation.
         fs::write(&herdr,"#!/usr/bin/python3\nimport sys,json\nif sys.argv[1:]==['--version']:print('herdr 0.9.1');sys.exit(0)\nr=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'result':{'type':'pong','version':'0.9.1','capabilities':{'workspace_create_command':True}}}))\n").unwrap();
-        fs::write(&agent,"#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 2\nprintf '%s\\n' '2.1.0 (Claude Code)'\n").unwrap();
+        fs::write(&agent,format!("#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 2\nprintf '%s\\n' '{version}'\n")).unwrap();
         for path in [&herdr,&agent] {fs::set_permissions(path,fs::Permissions::from_mode(0o700)).unwrap();}
+        self.launchable_profile_with(&herdr,&agent,&agent_home)
+    }
+    /// Prepare `worker` over the given binaries and plant only the native
+    /// interaction evidence (the verifier would need its own agent session).
+    fn launchable_profile_with(&self,herdr:&Path,agent:&Path,agent_home:&Path)->herdr_projects::domain::VersionedReference {
+        use std::{fs,os::unix::fs::MetadataExt};
+        use herdr_projects::{domain::*,worker_supervision::{ProcessIncarnation,SupervisorIdentity}};
+        use sha2::{Digest,Sha256};
         let out=hp(self.home.path(),&["--root",self.r(),"profile","prepare","demo","worker","--herdr-executable",herdr.to_str().unwrap(),
             "--agent-executable",agent.to_str().unwrap(),"--execution-home",agent_home.to_str().unwrap()]);
         assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
@@ -2373,6 +2383,332 @@ fn ticker_auto_chain_releases_verified_integrated_and_fan_in_dependents() {
     let receipts=herdr_projects::worktree_preparation::prepare(&f.project,&operation,1,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default()).unwrap();
     assert_eq!(receipts.len(),1);
     assert_eq!(f.git(&["-C",&receipts[0].plan.path,"rev-parse","HEAD"]),a_commit);
+}
+
+/// F1.7 acceptance. `HP_LIVE_F1_MODE=fixture` is the dry run: the harness plays
+/// both workers. `live` (only via `scripts/test-live-f1`) launches two real
+/// agents through the ticker on an isolated stock Herdr server; worker output is
+/// untrusted and only verification and integration evidence release anything.
+#[cfg(all(feature="state-store",target_os="linux"))]
+#[test]
+#[ignore = "F1.7: HP_LIVE_F1_MODE=fixture, or live with HP_LIVE_HERDR, HP_LIVE_AGENT and HP_LIVE_AUTH_FILE via scripts/test-live-f1"]
+fn live_f1_worker_result_integrates_and_dependent_launches_on_integrated_sha() {
+    use std::{fs,io::{Read,Write},os::unix::fs::PermissionsExt,sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering}},time::{Duration,Instant}};
+    use std::path::PathBuf;
+    use herdr_projects::{migration,runtime,domain::{TaskId,RuntimeRoute},operations::{DeliveryState,Outcome}};
+    let live=match std::env::var("HP_LIVE_F1_MODE").as_deref(){Ok("live")=>true,Ok("fixture")=>false,_=>panic!("set HP_LIVE_F1_MODE=fixture or live")};
+    let clock=Instant::now();
+    let say=|text:&str|eprintln!("[f1.7 +{:>4}s {}] {text}",clock.elapsed().as_secs(),&jiff::Timestamp::now().to_string()[11..19]);
+    say(if live {"mode: live (two real agent sessions)"} else {"mode: fixture dry run (harness plays both workers)"});
+    // Only `a`'s `await` policy speaks git's native protocol to this fixture: its
+    // first connection is verification, the second the integration candidate
+    // check, which is held so the ticker can be killed mid-integration. The
+    // integration job rechecks the first accepted policy by id, hence `await`.
+    let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();let port=listener.local_addr().unwrap().port();
+    let held=Arc::new(AtomicBool::new(true));let connections=Arc::new(AtomicUsize::new(0));
+    {let held=held.clone();let connections=connections.clone();std::thread::spawn(move||for stream in listener.incoming(){
+        let Ok(mut stream)=stream else{continue};let index=connections.fetch_add(1,Ordering::SeqCst);let held=held.clone();
+        std::thread::spawn(move||{let mut buffer=[0u8;4096];let _=stream.read(&mut buffer);while index==1&&held.load(Ordering::SeqCst){std::thread::sleep(Duration::from_millis(10));}let _=stream.write_all(b"0000");let _=stream.read(&mut buffer);});
+    });}
+    let f=VerifyFixture::with_worker(&[("src/start.txt","disposable F1.7 repository\n".into())],
+        "kind='codex'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=1200\nunknown_usage='allow_with_warning'\n");
+    let start=f.candidate.clone();let branch=f.git(&["symbolic-ref","--short","HEAD"]);
+    let repository=f.repo.canonicalize().unwrap();
+    let head=||runtime::snapshot(&f.project).unwrap().head;
+    let ok=|out:std::process::Output|{assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap_or(serde_json::Value::Null)};
+    // A running ticker can hold the effect lock briefly; the CLI asks for a retry.
+    let cli=|args:&[&str]|{let mut all=vec!["--root",f.r()];all.extend_from_slice(args);let deadline=Instant::now()+Duration::from_secs(60);
+        loop {let out=hp(f.home.path(),&all);if out.status.success()||!String::from_utf8_lossy(&out.stderr).contains("owns lock")||Instant::now()>deadline{return ok(out);}std::thread::sleep(Duration::from_millis(200));}};
+    let sign=|path:&Path,namespace:&str|assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&f.key).args(["-n",namespace]).arg(path).output().unwrap().status.success());
+
+    // Native lab: one isolated stock Herdr server per worker (live), or bare
+    // sockets (fixture). Two live workers on one server break start naming:
+    // its inventory fence compares every agent, and the other worker's entry
+    // changes (see the F1.7 gate note).
+    let lab=tempfile::Builder::new().prefix("hpf17-").tempdir_in("/tmp").unwrap();
+    let sockets=[lab.path().join("a/native.sock"),lab.path().join("b/native.sock")];
+    let agent_home=f.home.path().join("agent-home");fs::create_dir_all(&agent_home).unwrap();
+    struct Cleanup{servers:Vec<std::process::Child>,agent_home:PathBuf}
+    impl Drop for Cleanup {fn drop(&mut self){
+        // Any supervised worker carries its unique execution home in its argv.
+        let _=Command::new("/usr/bin/pkill").args(["-KILL","-f"]).arg(&self.agent_home).status();
+        for server in &mut self.servers{let _=server.kill();let _=server.wait();}
+    }}
+    let mut cleanup=Cleanup{servers:Vec::new(),agent_home:agent_home.clone()};
+    let mut _fixture_sockets=Vec::new();
+    let (herdr,agent)=if live {
+        let herdr=PathBuf::from(std::env::var_os("HP_LIVE_HERDR").expect("HP_LIVE_HERDR"));
+        let agent=PathBuf::from(std::env::var_os("HP_LIVE_AGENT").expect("HP_LIVE_AGENT"));
+        let auth=PathBuf::from(std::env::var_os("HP_LIVE_AUTH_FILE").expect("HP_LIVE_AUTH_FILE"));
+        assert!(herdr.is_absolute()&&agent.is_absolute()&&auth.is_absolute());
+        for socket in &sockets {
+            let dir=socket.parent().unwrap();
+            let (home,runtime_dir,config)=(dir.join("home"),dir.join("runtime"),dir.join("config.toml"));
+            fs::create_dir_all(&home).unwrap();fs::create_dir(&runtime_dir).unwrap();fs::set_permissions(&runtime_dir,fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(&config,"onboarding = false\n[terminal]\ndefault_shell = '/bin/sh'\nshell_mode = 'non_login'\n[update]\nversion_check = false\nmanifest_check = false\n").unwrap();
+            let log=fs::File::create(dir.join("server.log")).unwrap();
+            cleanup.servers.push(Command::new(&herdr).arg("server").env_clear().env("HOME",&home).env("PATH","/usr/bin:/bin").env("SHELL","/bin/sh")
+                .env("TERM","xterm-256color").env("LANG","C.UTF-8").env("HERDR_CONFIG_PATH",&config).env("HERDR_SOCKET_PATH",socket)
+                .env("XDG_RUNTIME_DIR",&runtime_dir).current_dir(dir).stdin(std::process::Stdio::null()).stdout(log.try_clone().unwrap()).stderr(log).spawn().unwrap());
+            let deadline=Instant::now()+Duration::from_secs(15);
+            while !socket.exists(){assert!(Instant::now()<deadline,"native server failed to start");std::thread::sleep(Duration::from_millis(25));}
+        }
+        // Credentials: a private copy in the disposable execution home, never read here.
+        let codex=agent_home.join(".codex");fs::create_dir(&codex).unwrap();fs::set_permissions(&codex,fs::Permissions::from_mode(0o700)).unwrap();
+        let metadata=fs::symlink_metadata(&auth).unwrap();assert!(metadata.is_file()&&metadata.len()<=256*1024&&metadata.permissions().mode()&0o077==0);
+        fs::copy(&auth,codex.join("auth.json")).unwrap();fs::set_permissions(codex.join("auth.json"),fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(agent_home.join(".gitconfig"),"[user]\n\tname = F1.7 worker\n\temail = worker@example.invalid\n").unwrap();
+        (herdr,agent)
+    } else {
+        for socket in &sockets {fs::create_dir_all(socket.parent().unwrap()).unwrap();_fixture_sockets.push(std::os::unix::net::UnixListener::bind(socket).unwrap());}
+        (PathBuf::new(),PathBuf::new())
+    };
+    // Codex's workspace-write sandbox makes Git metadata (including a linked
+    // worktree's gitdir) read-only, so a sandboxed worker cannot commit. The
+    // workers run unsandboxed in a disposable home with exact trust entries.
+    let trust=|worktrees:&[&str]|{
+        let mut text="approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\nmodel_reasoning_effort = 'low'\ncheck_for_update_on_startup = false\n".to_owned();
+        for path in [f.project.to_str().unwrap(),repository.to_str().unwrap()].iter().chain(worktrees) {text.push_str(&format!("[projects.{}]\ntrust_level = 'trusted'\n",serde_json::to_string(path).unwrap()));}
+        if live {fs::write(agent_home.join(".codex/config.toml"),text).unwrap();}
+    };
+    trust(&[]);
+
+    // Tasks: `a` (signed contract, verify_then_integrate) and `b` (integrated commit of `a`).
+    let policies=[("content",r#"{"version":1,"checks":["/usr/bin/git","grep","--quiet","--no-index","-e","^F17_LIVE_A_OK$","--","src/a.txt"]}"#.to_owned()),
+        ("clean",r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#.to_owned()),
+        ("await",format!(r#"{{"version":1,"checks":["/usr/bin/git","ls-remote","git://127.0.0.1:{port}/fixture"]}}"#))];
+    let added=runtime::add_task(&f.project,TaskId::new("a").unwrap(),"F1.7 live task a".into(),head()).unwrap();
+    let mut contract=serde_json::to_vec_pretty(&serde_json::json!({
+        "version":3,"outputs":[{"path":"src/a.txt","kind":"git_file"}],"scope":{"paths":[{"path":"src/","access":"write"}]},
+        "project_store":f.store,"expected_head":added,"task_id":"a","contract_revision":1,"deliverable":"src/a.txt holds the marker","non_goals":"no other change",
+        "acceptance_policies":policies.iter().map(|(id,text)|serde_json::json!({"id":id,"text":text})).collect::<Vec<_>>(),
+        "repository":repository,"base_oid":start,"object_format":"sha256","dependencies":[],"capability_flags":[],
+        "profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_then_integrate","authority":herdr_projects::authority::policy_reference(&f.project).unwrap()
+    })).unwrap();contract.push(b'\n');
+    let contract_path=f.home.path().join("a-contract.json");fs::write(&contract_path,&contract).unwrap();sign(&contract_path,herdr_projects::authority::CONTRACT_SIGNATURE_NAMESPACE);
+    let installed=cli(&["task","demo","contract","put","--input-file",contract_path.to_str().unwrap(),"--signature",contract_path.with_extension("json.sig").to_str().unwrap()]);
+    runtime::add_task(&f.project,TaskId::new("b").unwrap(),"F1.7 live dependent b".into(),head()).unwrap();
+    for (task,edges) in [("a",serde_json::json!([])),("b",serde_json::json!([{"predecessor":"a","requirement":"integrated_commit"}]))] {
+        let request=f.home.path().join(format!("{task}-queue.json"));fs::write(&request,serde_json::json!({"priority":0,"dependencies":edges}).to_string()).unwrap();
+        cli(&["task","demo","queue",task,"--input-file",request.to_str().unwrap(),"--expected-revision","1","--expected-head",&head().to_string()]);
+    }
+    let policy=runtime::snapshot(&f.project).unwrap().scheduler.unwrap().policy.revision.to_string();
+    cli(&["scheduler","demo","policy","--max-active-workers","4","--max-attempts-per-task","3","--expected-revision",&policy,"--expected-head",&head().to_string()]);
+    let config=f.home.path().join(".config/herdr-projects/config.toml");
+    let mut bindings=std::collections::BTreeMap::new();
+    for (task,socket) in ["a","b"].into_iter().zip(&sockets) {
+        let revision=runtime::snapshot(&f.project).unwrap().tasks.into_iter().find(|t|t.id.as_str()==task).unwrap().revision;
+        let change=runtime::create_binding(&f.project,Some(&TaskId::new(task).unwrap()),Some(revision),head(),
+            &RuntimeRoute{socket:socket.display().to_string(),cwd:repository.display().to_string(),..Default::default()}).unwrap();
+        bindings.insert(task,(change.binding,change.task_revision));
+    }
+    let observations=bindings.values().map(|(binding,task_revision)|herdr_projects::reconcile::RuntimeObservation{binding:binding.id.clone(),binding_revision:binding.revision,
+        task_revision:*task_revision,observed_unix_ms:jiff::Timestamp::now().as_millisecond(),collector:"herdr-git-v2".into(),
+        config_digest:migration::config_reference(&config).unwrap().digest,..Default::default()}).collect::<Vec<_>>();
+    migration::open_active(&f.project).unwrap().record_observations(head(),&observations).unwrap();
+    let control=runtime::snapshot(&f.project).unwrap().control.unwrap().revision;
+    runtime::set_state(&f.project,head(),control,herdr_projects::domain::ProjectState::Active,&config).unwrap();
+    let profile=if live {f.launchable_profile_with(&herdr,&agent,&agent_home)} else {f.fake_launchable_profile("codex","codex-cli 0.154.0")};
+    const TARGET:&str="refs/heads/integration";
+    f.git(&["branch","integration",&start]);
+    cli(&["result","demo","configure-integration","--repository",repository.to_str().unwrap(),"--reference",TARGET]);
+    for switch in ["--verify","--integrate"] {cli(&["result","demo","auto",switch,"on","--expected-head",&head().to_string()]);}
+    say(&format!("setup: repository start {start}, target {TARGET}, automation verify+integrate on"));
+
+    // Operator launch: retained instructions, draft, owner signature, reservation.
+    let launch=|task:&str,instructions:&str|->(String,PathBuf) {
+        fs::write(f.project.join("PROJECT.md"),instructions).unwrap();
+        let scope=f.home.path().join(format!("{task}-scope.json"));
+        fs::write(&scope,serde_json::json!({"schema_version":1,"task_id":task,"profile":"worker","domains":[],"paths":[],"pinned_keys":[],"sensitivity":"default"}).to_string()).unwrap();
+        let snapshot=cli(&["memory","demo","snapshot","--task",task,"--profile","worker","--input-file",scope.to_str().unwrap(),"--worker"]);
+        let selection=f.home.path().join(format!("{task}-selection.json"));
+        fs::write(&selection,serde_json::json!({"task":task,"binding":bindings[task].0.id,"profile":profile,
+            "knowledge":{"id":snapshot["id"],"revision":1,"digest":snapshot["manifest_hash"]},"repositories":[repository]}).to_string()).unwrap();
+        let drafted=cli(&["launch","demo","draft","--selection",selection.to_str().unwrap(),"--expected-head",&head().to_string()]);
+        assert!(drafted["brief"]["text"].as_str().unwrap().contains(instructions),"the brief carries the retained instructions");
+        let document=f.home.path().join(format!("{task}-approval.json"));fs::write(&document,serde_json::to_vec_pretty(&drafted["approval"]).unwrap()).unwrap();
+        sign(&document,herdr_projects::authority::SIGNATURE_NAMESPACE);
+        let approval=cli(&["approval","demo","import",document.to_str().unwrap(),document.with_extension("json.sig").to_str().unwrap(),"--expected-head",&head().to_string()]);
+        let reservation=cli(&["launch","demo","reserve","--selection",selection.to_str().unwrap(),"--approval-digest",approval["digest"].as_str().unwrap(),"--expected-head",&head().to_string()]);
+        assert_eq!(reservation["record"]["inputs"],drafted["inputs"]);
+        let attempt=reservation["record"]["attempt"].as_str().unwrap().to_owned();
+        let inputs:herdr_projects::domain::LaunchInputs=serde_json::from_value(drafted["inputs"].clone()).unwrap();
+        let plan=herdr_projects::domain::worktree_plans(&inputs,&herdr_projects::domain::AttemptId::new(attempt.clone()).unwrap()).unwrap().remove(0);
+        say(&format!("{task}: drafted, signed and reserved attempt {attempt}; worktree base {}",inputs.repositories[0].commit));
+        (attempt,PathBuf::from(plan.path))
+    };
+    let wt_git=|path:&Path,args:&[&str]|{let mut all=vec!["-C",path.to_str().unwrap()];all.extend_from_slice(args);f.git(&all)};
+    let events=|kind:&str|runtime::snapshot(&f.project).unwrap().events.into_iter().filter(|e|e.kind==kind).count();
+    // Report each runtime milestone once, as the controller records it.
+    let seen=std::cell::RefCell::new(std::collections::BTreeSet::new());
+    let milestones=||for event in runtime::snapshot(&f.project).unwrap().events {
+        if event.kind.starts_with("runtime.")&&seen.borrow_mut().insert((event.kind.clone(),event.entity.clone())) {say(&format!("controller: {} {}",event.kind,&event.entity[..event.entity.len().min(20)]));}
+    };
+
+    // 1. Worker A edits and commits in its worktree.
+    let herdr_bin=herdr.to_str().unwrap().to_owned();
+    let spawn=||if live {f.spawn_with(&herdr_bin)} else {f.spawn()};
+    let (a_attempt,a_worktree,mut child)=if live {
+        let (attempt,worktree)=launch("a","F1.7 disposable acceptance task A. Work only in the current directory, which is a disposable git worktree. Create the file src/a.txt containing exactly the line F17_LIVE_A_OK followed by a newline. Then run: git add src/a.txt && git commit -m 'Add F1.7 marker A'. Do not change any other file, do not push, and do not use the network. After the commit exists, stop and reply DONE.");
+        trust(&[worktree.to_str().unwrap()]);
+        let mut child=spawn();
+        f.wait(&mut child,300,&||{milestones();worktree.join("src/a.txt").is_file()}&&wt_git(&worktree,&["rev-parse","HEAD"])!=start&&wt_git(&worktree,&["status","--porcelain"]).is_empty());
+        say(&format!("a: worker launched ({} launch_started) and committed in its worktree",events("runtime.launch_started")));
+        (attempt,worktree,child)
+    } else {
+        f.db().execute("INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) VALUES('a-attempt','a',1,'running',NULL,'a-attempt',0)",[]).unwrap();
+        let worktree=f.home.path().join("a-worktree");f.git(&["worktree","add","-q","--detach",worktree.to_str().unwrap(),&start]);
+        fs::write(worktree.join("src/a.txt"),"F17_LIVE_A_OK\n").unwrap();wt_git(&worktree,&["add","src/a.txt"]);wt_git(&worktree,&["commit","-qm","Add F1.7 marker A"]);
+        ("a-attempt".to_owned(),worktree,spawn())
+    };
+    let a_candidate=wt_git(&a_worktree,&["rev-parse","HEAD"]);
+    assert_eq!(wt_git(&a_worktree,&["rev-parse","HEAD^"]),start);
+    assert_eq!(fs::read_to_string(a_worktree.join("src/a.txt")).unwrap(),"F17_LIVE_A_OK\n");
+    say(&format!("a: candidate {a_candidate}: {}",wt_git(&a_worktree,&["log","-1","--format=%s <%ae>"])));
+
+    // 2. The harness submits A's result; the worker's claims are untrusted.
+    let objects=f.git(&["rev-list","--objects","--all",&a_candidate]).lines().map(|line|{let oid=line.split_whitespace().next().unwrap();serde_json::json!({"oid":oid,"relative_path":format!("{}/{}",&oid[..2],&oid[2..])})}).collect::<Vec<_>>();
+    let submission=f.home.path().join("a-result.json");
+    fs::write(&submission,serde_json::to_vec(&serde_json::json!({"idempotency_key":"a-live-result","task_id":"a","contract_revision":1,"contract_digest":installed["digest"],"attempt_id":a_attempt,
+        "repository":repository,"base_oid":start,"candidate_oid":a_candidate,"object_format":"sha256",
+        "artifact_manifest":[{"path":"src/a.txt","oid":a_candidate}],"claimed_checks":["worker says all checks passed"],"objects":objects})).unwrap()).unwrap();
+    let a=cli(&["result","demo","submit","--input-file",submission.to_str().unwrap()])["submission_id"].as_str().unwrap().to_owned();
+    say(&format!("a: submitted {a}"));
+    let job=|submission:&str|{let snapshot=runtime::snapshot(&f.project).unwrap();snapshot.operations.into_iter().find(|op|op.kind=="integration.run"&&op.payload["submission_id"]==submission)
+        .map(|op|{let d=snapshot.deliveries.iter().find(|d|d.operation==op.id).unwrap().clone();(op,d)})};
+    let count=|sql:&str|f.db().query_row(sql,[],|row|row.get::<_,u64>(0)).unwrap();
+    let integrated_by=|task:&str|f.db().prepare("SELECT i.integrated_id,i.commit_oid FROM integrated_commits i JOIN integration_operations o ON o.operation_id=i.operation_id
+        JOIN verified_results v ON v.result_id=o.verified_result_id JOIN verification_runs r ON r.run_id=v.run_id WHERE r.task_id=?1").unwrap()
+        .query_map([task],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    let blockers=|task:&str|{
+        let report=cli(&["scheduler","demo","inspect"]);
+        let entry=report["entries"].as_array().unwrap().iter().find(|entry|entry["task"]==task).unwrap().clone();
+        let mut found=entry["blockers"].as_array().unwrap().iter().map(|s|s.as_str().unwrap().to_owned())
+            .filter(|s|["verified_dependency_evidence_unavailable:","predecessor_failed:","admission_disabled:"].iter().any(|p|s.starts_with(p))).collect::<Vec<_>>();
+        found.sort();found
+    };
+    assert_eq!(blockers("b"),["verified_dependency_evidence_unavailable:a:integrated_commit"],"a submission releases nothing");
+
+    // 3a. Kill -9 the ticker while A's integration candidate check runs.
+    f.wait(&mut child,240,&||connections.load(Ordering::SeqCst)>=2&&job(&a).is_some_and(|(_,d)|d.state==DeliveryState::Claimed));
+    assert!(integrated_by("a").is_empty());
+    assert_eq!(blockers("b"),["verified_dependency_evidence_unavailable:a:integrated_commit"],"verification alone does not release b");
+    let (op,_)=job(&a).unwrap();
+    child.0.kill().unwrap();child.0.wait().unwrap();held.store(false,Ordering::SeqCst);
+    say(&format!("fault 1: ticker killed with SIGKILL while integration {} was claimed (state {})",&op.id.as_str()[..12],
+        f.db().query_row("SELECT state FROM integration_operations WHERE idempotency_key=?1",[op.id.as_str()],|row|row.get::<_,String>(0)).unwrap()));
+    let (_,claimed)=job(&a).unwrap();assert_eq!(claimed.state,DeliveryState::Claimed);assert!(integrated_by("a").is_empty());
+    // A restart recovers only after the dead owner's lease lapses. Advance it for
+    // this job alone when nothing else is claimed; otherwise wait it out.
+    let snapshot=runtime::snapshot(&f.project).unwrap();
+    // The integration's own `integration.lease` claim belongs to the killed job.
+    let others=snapshot.deliveries.iter().filter(|d|d.state==DeliveryState::Claimed&&d.operation!=op.id
+            &&!snapshot.operations.iter().any(|o|o.id==d.operation&&o.kind=="integration.lease"))
+        .map(|d|snapshot.operations.iter().find(|o|o.id==d.operation).map_or("?".into(),|o|format!("{}@{}",o.kind,d.lease_until_ms.unwrap_or(0)-claimed.lease_until_ms.unwrap()))).collect::<Vec<_>>();
+    say(&format!("other claims at the kill: {others:?}"));
+    let others=others.len();
+    if others==0 {migration::open_active(&f.project).unwrap().expire_claims(claimed.lease_until_ms.unwrap()+1).unwrap();}
+    else {
+        say(&format!("{others} other claims held; waiting for the lease to lapse"));
+        while jiff::Timestamp::now().as_millisecond()<=claimed.lease_until_ms.unwrap(){std::thread::sleep(Duration::from_secs(1));}
+        cli(&["operations","demo","expire"]);
+    }
+    let mut child=spawn();
+    f.wait(&mut child,240,&||job(&a).is_some_and(|(_,d)|d.state==DeliveryState::Confirmed));
+    let (a_integrated,a_commit)=integrated_by("a").pop().unwrap();
+    assert_eq!(count("SELECT count(*) FROM verification_runs WHERE task_id='a'"),3,"one run per policy");
+    assert_eq!(count("SELECT count(*) FROM integration_operations"),1);assert_eq!(count("SELECT count(*) FROM integrated_commits"),1);
+    assert_eq!(job(&a).unwrap().1.attempts,2);
+    assert_eq!(f.git(&["rev-parse",TARGET]),a_commit);
+    assert_eq!(f.git(&["rev-parse",&format!("{a_commit}^1")]),start);assert_eq!(f.git(&["rev-parse",&format!("{a_commit}^2")]),a_candidate);
+    assert_eq!(f.git(&["show",&format!("{a_commit}:src/a.txt")]),"F17_LIVE_A_OK");
+    assert_eq!(blockers("b"),["admission_disabled:integrated_commit"],"b is released by a's integrated commit");
+    say(&format!("a: restarted ticker integrated once: {a_commit} (delivery attempts 2, 1 integration, 1 publication); b released"));
+
+    // 3b. Stale target: a fixture-verified result `s` is blocked, then recovered by the operator.
+    cli(&["result","demo","auto","--integrate","off","--expected-head",&head().to_string()]);
+    f.git(&["checkout","-q","-b","s",&start]);fs::write(f.repo.join("src/s.txt"),"s\n").unwrap();fs::write(f.repo.join("src/lib.rs"),"pub fn s() {}\n").unwrap();f.git(&["add","src"]);f.git(&["commit","-qm","fixture s"]);
+    let s_candidate=f.git(&["rev-parse","HEAD"]);f.git(&["checkout","-q",&branch]);
+    let clean=[("clean",r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#.to_owned())];
+    let s=f.submit_at("s",&clean,&s_candidate);
+    f.wait(&mut child,300,&||f.jobs().iter().any(|(op,d)|op.payload["submission_id"]==s.as_str()&&d.state==DeliveryState::Confirmed));
+    assert_eq!(f.db().query_row("SELECT state FROM verification_runs WHERE submission_id=?1",[&s],|row|row.get::<_,String>(0)).unwrap(),"accepted");
+    assert!(job(&s).is_none());
+    let moved=f.git(&["commit-tree",&format!("{a_commit}^{{tree}}"),"-p",&a_commit,"-m","moved outside the controller"]);
+    f.git(&["update-ref",TARGET,&moved,&a_commit]);
+    cli(&["result","demo","auto","--integrate","on","--expected-head",&head().to_string()]);
+    f.wait(&mut child,300,&||job(&s).is_some_and(|(_,d)|d.state==DeliveryState::PermanentFailure));
+    let Some(Outcome::PermanentFailure{diagnostic})=job(&s).unwrap().1.last_outcome else {panic!("stale job is blocked")};
+    assert!(diagnostic.contains("target moved"),"{diagnostic}");
+    assert_eq!(f.git(&["rev-parse",TARGET]),moved,"the moved ref is not overwritten");assert_eq!(count("SELECT count(*) FROM integrated_commits"),1);
+    say(&format!("fault 2: target moved to {moved}; s blocked: {diagnostic}"));
+    let s_result=f.db().query_row("SELECT result_id FROM verified_results WHERE submission_id=?1",[&s],|row|row.get::<_,String>(0)).unwrap();
+    let work=f.home.path().join("s-operator-integration");
+    cli(&["result","demo","integrate",&s_result,"--repository",repository.to_str().unwrap(),"--idempotency-key","s-operator-recovery","--work-dir",work.to_str().unwrap()]);
+    let tip=f.git(&["rev-parse",TARGET]);
+    assert_eq!(f.git(&["rev-parse",&format!("{tip}^1")]),moved);assert_eq!(f.git(&["rev-parse",&format!("{tip}^2")]),s_candidate);
+    assert_eq!(f.git(&["show",&format!("{tip}:src/s.txt")]),"s");assert_eq!(f.git(&["show",&format!("{tip}:src/a.txt")]),"F17_LIVE_A_OK");
+    assert_eq!(count("SELECT count(*) FROM integrated_commits"),2);
+    f.git(&["merge-base","--is-ancestor",&a_commit,&tip]);
+    say(&format!("recovery: operator integrated s onto the moved target: {tip}"));
+
+    // 4. Dependent B launches on A's integrated SHA.
+    if live {f.stop(&mut child);}
+    f.git(&["checkout","-q","--detach",&a_commit]);
+    let b_prompt="F1.7 disposable acceptance task B. Work only in the current directory. Read src/a.txt and create src/b.txt containing exactly the same bytes. Do not commit, do not change any other file, and do not use the network. Then stop and reply DONE.";
+    let (b_attempt,b_worktree)=launch("b",b_prompt);
+    let record=runtime::snapshot(&f.project).unwrap().attempt_inputs.into_iter().find(|r|r.attempt.as_str()==b_attempt).unwrap();
+    assert_eq!(record.inputs.repositories[0].commit,a_commit,"b's pinned base is a's integrated SHA");
+    let satisfaction=f.db().query_row("SELECT satisfaction_id FROM dependency_satisfactions WHERE task_id='b' AND state='valid' AND evidence_id=?1",[&a_integrated],|row|row.get::<_,String>(0)).unwrap();
+    assert_eq!(record.inputs.dependencies.len(),1);assert_eq!(record.inputs.dependencies[0].evidence.id,satisfaction);
+    if live {
+        trust(&[a_worktree.to_str().unwrap(),b_worktree.to_str().unwrap()]);
+        child=spawn();
+        f.wait(&mut child,300,&||{milestones();b_worktree.join("src/b.txt").is_file()}&&fs::read(b_worktree.join("src/b.txt")).unwrap()==b"F17_LIVE_A_OK\n");
+    } else {
+        let operation=record.operation.clone();
+        let receipts=herdr_projects::worktree_preparation::prepare(&f.project,&operation,1,Instant::now()+Duration::from_secs(45),Default::default()).unwrap();
+        assert_eq!(PathBuf::from(&receipts[0].plan.path),b_worktree);
+        fs::copy(b_worktree.join("src/a.txt"),b_worktree.join("src/b.txt")).unwrap();
+    }
+    assert_eq!(wt_git(&b_worktree,&["rev-parse","HEAD"]),a_commit,"b's worktree is checked out at a's integrated SHA");
+    say(&format!("b: worker started on {} and wrote src/b.txt from a's integrated file",wt_git(&b_worktree,&["rev-parse","HEAD"])));
+
+    if live {
+        assert_eq!(events("runtime.launch_started"),2,"the controller started both workers");
+        // Stop both workers through the product and wait for proven termination.
+        for attempt in [&a_attempt,&b_attempt] {
+            let revision=runtime::snapshot(&f.project).unwrap().attempts.into_iter().find(|x|x.id.as_str()==attempt.as_str()).unwrap().revision;
+            cli(&["task","demo","cancel-attempt",attempt,"--expected-revision",&revision.to_string(),"--expected-head",&head().to_string(),"--reason","F1.7 acceptance complete"]);
+        }
+        f.wait(&mut child,180,&||runtime::snapshot(&f.project).unwrap().attempts.iter().filter(|x|[&a_attempt,&b_attempt].contains(&&x.id.as_str().to_owned())).all(|x|x.termination_observed));
+        f.stop(&mut child);
+        for kind in ["runtime.launch_started","runtime.worker_terminated"] {assert_eq!(events(kind),2,"{kind}");}
+        let brief=runtime::snapshot(&f.project).unwrap();
+        let confirmed=brief.operations.iter().filter(|o|o.kind=="runtime.worker_brief").filter(|o|brief.deliveries.iter().any(|d|d.operation==o.id&&d.state==DeliveryState::Confirmed)).count();
+        assert_eq!(confirmed,2,"each worker received its brief once");
+        // Sanitized transcript: only the workers' shell commands and final replies.
+        let mut rollouts=Vec::new();let mut stack=vec![agent_home.join(".codex/sessions")];
+        while let Some(dir)=stack.pop(){for entry in fs::read_dir(&dir).into_iter().flatten().flatten(){let p=entry.path();if p.is_dir(){stack.push(p)}else if p.extension().is_some_and(|e|e=="jsonl"){rollouts.push(p)}}}
+        rollouts.sort();
+        for rollout in rollouts {
+            eprintln!("--- worker session transcript excerpt");
+            for line in fs::read_to_string(&rollout).unwrap().lines() {
+                let Ok(value)=serde_json::from_str::<serde_json::Value>(line) else{continue};
+                let payload=&value["payload"];
+                let text=match (value["type"].as_str(),payload["type"].as_str()) {
+                    (Some("response_item"),Some("function_call"))=>format!("$ {}",payload["arguments"].as_str().unwrap_or_default()),
+                    (Some("response_item"),Some("custom_tool_call"))=>format!("$ {}",payload["input"].as_str().unwrap_or_default()),
+                    (Some("response_item"),Some("local_shell_call"))=>format!("$ {}",payload["action"]["command"]),
+                    (Some("response_item"),Some("message")) if payload["role"]=="assistant"=>format!("> {}",payload["content"].as_array().into_iter().flatten().filter_map(|c|c["text"].as_str()).collect::<Vec<_>>().join(" ")),
+                    _=>continue,
+                };
+                eprintln!("{}",text.chars().take(200).collect::<String>());
+            }
+        }
+    } else {f.stop(&mut child);}
+    say(&format!("PASS: a integrated {a_commit}; s recovered {tip}; b base {a_commit}; launches {}",events("runtime.launch_started")));
+    drop(cleanup);
 }
 
 #[cfg(feature="state-store")]

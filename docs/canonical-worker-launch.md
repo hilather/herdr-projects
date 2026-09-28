@@ -380,7 +380,8 @@ connected server advertises it (the optional patch in `patches/herdr/`). The
 first pane itself runs the bounded, gated PID-namespace supervisor. Stock Herdr
 (0.9.1 and upstream HEAD) lacks that method, so the adapter instead uses
 `workspace.create` and types one line into the new default shell:
-`exec <herdr-projects> launch-exec <spec>`. Both paths are absolute and must
+`exec <herdr-projects> launch-exec <spec>`, submitted with an `Enter` key
+(stock Herdr does not run a trailing newline in typed text). Both paths are absolute and must
 match `[A-Za-z0-9/._-]`, so no shell (POSIX, fish, ...) needs quoting. The
 literal supervisor argv and working directory are written first to a private
 single-use spec (`.state/launch-specs/<command-digest>.spec`, directory 0700,

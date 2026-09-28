@@ -6,6 +6,10 @@ mod native;
 mod revalidation;
 #[cfg(target_os = "linux")]
 pub use revalidation::{RevalidatedProfile, revalidate};
+
+/// Upper bound for one preparation or revalidation. Each pass hashes the agent
+/// executable several times; a stock Codex binary is about 260 MB.
+pub const BUDGET: Duration = Duration::from_secs(60);
 #[cfg(target_os = "linux")]
 pub use native::{
     InteractionEvidence, NativeEvidence, NativePreparation, verify_interaction, verify_native,
@@ -137,7 +141,7 @@ fn prepare_locked(
     guard: &crate::execution_guard::RootGuard,
     expected: Option<&FrozenProfile>,
 ) -> Result<ProfilePreparation> {
-    let deadline = deadline.min(Instant::now() + Duration::from_secs(20));
+    let deadline = deadline.min(Instant::now() + BUDGET);
     check(deadline, &cancellation)?;
     ensure!(
         !name.is_empty()
@@ -205,6 +209,11 @@ fn prepare_locked(
             ("LANG".into(), "C".into()),
             ("LC_ALL".into(), "C".into()),
         ];
+        // Without HOME, Codex falls back to the account's ~/.codex and creates
+        // helper links there even for --version; give it the execution home.
+        if kind == "codex" {
+            cmd.env.push(("HOME".into(), execution_home.to_str().context("execution home is not UTF-8")?.into()));
+        }
         cmd.cwd = Some("/".into());
         cmd.capture_limit = 4096;
         ensure!(

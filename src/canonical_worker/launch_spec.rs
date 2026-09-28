@@ -25,7 +25,8 @@ struct Spec {
     argv: Vec<String>,
 }
 
-/// One planned exec-into-shell launch. `line` needs no quoting in any shell.
+/// One planned exec-into-shell launch. `line` needs no quoting in any shell and
+/// has no newline: stock Herdr runs typed text only on an explicit Enter key.
 pub(crate) struct Launch {
     pub(crate) line: String,
     pub(crate) spec: PathBuf,
@@ -68,7 +69,7 @@ pub(crate) fn plan(state: &Path, command_digest: &str) -> Result<Launch> {
     let launcher = std::env::current_exe()?.canonicalize()?;
     ensure!(launcher.is_file(), "launcher executable missing");
     let spec = path(&state.canonicalize()?, command_digest);
-    let line = format!("exec {} {SUBCOMMAND} {}\n", safe(&launcher)?, safe(&spec)?);
+    let line = format!("exec {} {SUBCOMMAND} {}", safe(&launcher)?, safe(&spec)?);
     Ok(Launch { line, spec })
 }
 

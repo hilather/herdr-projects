@@ -1320,7 +1320,7 @@ fn stock_root(
         let pane = created["root_pane"]["pane_id"].as_str().context("created root pane missing")?;
         let route = RuntimeRoute { workspace_id: workspace.into(), ..intent.route.clone() };
         let sent = api.call(operation, "pane.send_input",
-            json!({"pane_id":pane,"text":launch.line,"keys":[]}), || Ok(()))?;
+            json!({"pane_id":pane,"text":launch.line,"keys":["Enter"]}), || Ok(()))?;
         ensure!(sent["type"].as_str() == Some("ok"), "uncertain launcher input acknowledgment");
         let confirm_by = api.deadline.checked_sub(CLEANUP_RESERVE).context("insufficient launch budget")?;
         let mut last = None;

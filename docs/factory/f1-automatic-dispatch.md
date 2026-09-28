@@ -1,6 +1,6 @@
 # F1 automatic verification and integration dispatch
 
-Status: cards 1–3 merged (#42, #48, #49), card 4 done; the live F1.7 check is next. Planned 27 September 2026. Scope is the dependent vertical slice (F1):
+Status: cards 1–3 merged (#42, #48, #49), cards 4–5 done; the live F1.7 check passed on 28 September 2026 (`docs/reviews/2026-09-27-f1-live-gate.md`). Planned 27 September 2026. Scope is the dependent vertical slice (F1):
 verified worker results are integrated automatically and release dependents.
 Each card is one reviewable PR. Work stops at each card's stop condition; gaps
 found along the way are recorded as new cards, not folded into the current one.
@@ -112,9 +112,34 @@ launches on the integrated SHA, with one controller crash and one stale-head
 injection. Record the integrated SHA, transcripts and which parts were live
 versus fixture. Automation stays off by default until this passes.
 
+Result: **passed** (live attempt 2 of 3), `scripts/test-live-f1`. A real Codex
+worker, launched by the ticker on stock Herdr 0.9.1, committed A's change; the
+ticker verified and integrated it (`1d205ca9…`) across a `kill -9`, a stale
+target was blocked and recovered by an operator integration, and a second
+Codex worker started for B on a worktree whose HEAD was A's integrated SHA.
+Glue: the stock exec line is sent with an Enter key, profile preparation has a
+60 s budget, and the Codex version probe runs with the execution home.
+Decision 1 (automation off by default) is unchanged; lifting it is a separate
+decision.
+
 ## Follow-up cards found along the way
 
 Recorded here rather than folded into the card that found them.
+
+- **Two workers on one Herdr server fail start naming** (F1.7). The naming
+  fence in `canonical_worker/start.rs` compares the whole `agent.list`, so any
+  change in another agent's entry refuses the rename; recovery
+  (`allow_name=false`) then loops on "native worker name mismatch". Compare
+  only the target agent, and let recovery finish an unapplied rename.
+- **No completion path for a finished worker** (F1.7). Only cancellation stops
+  it, and that marks the task cancelled, so its dependents report
+  `predecessor_failed`. A verified or integrated result should let the attempt
+  end without failing the task.
+- **Integration rechecks one policy** (F1.7): the candidate check runs only the
+  first accepted policy by id, not every policy of the contract.
+- **Codex cannot commit under `workspace-write`** (F1.7): its sandbox makes Git
+  metadata read-only, including a linked worktree's gitdir. Decide the worker
+  sandbox and who commits.
 
 - **Notification enqueue reads the whole snapshot** (`runtime.rs`
   `enqueue_notification`). Its check needs every unseen inbox item and every

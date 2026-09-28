@@ -147,7 +147,7 @@ pub fn revalidate(
     deadline: Instant,
     cancellation: Cancellation,
 ) -> Result<RevalidatedProfile> {
-    let deadline = deadline.min(Instant::now() + Duration::from_secs(20));
+    let deadline = deadline.min(Instant::now() + super::BUDGET);
     check(deadline, &cancellation)?;
     let project = project.canonicalize()?;
     let guard = RootGuard::exclusive(project.parent().context("project root missing")?)?;

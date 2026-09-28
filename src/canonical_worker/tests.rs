@@ -209,7 +209,10 @@ elif r['method']=='pane.process_info':
  if r['params']['pane_id']=='w1:p0':result['process_info']={{'pane_id':'w1:p0','foreground_processes':[json.loads((root/'bootstrap.json').read_text())] if (root/'bootstrap.json').exists() else []}}
  if r['params']['pane_id']=='w1:p2':result['process_info']={{'pane_id':'w1:p2'}}
 elif r['method']=='pane.send_input' and stock and r['params']['text'].startswith('exec '):
- with open(root/'exec-requests','a') as f:f.write(r['params']['text'])
+ # Stock Herdr 0.9.1 types a trailing newline without submitting it; only an
+ # Enter key runs the line.
+ if r['params'].get('keys')==['Enter'] and '\n' not in r['params']['text']:
+  with open(root/'exec-requests','a') as f:f.write(r['params']['text']+'\n')
  result={{'type':'ok'}}
 elif r['method']=='pane.send_input':
  request_path=root/'gate-requests'

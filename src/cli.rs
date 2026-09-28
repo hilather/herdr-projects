@@ -829,7 +829,7 @@ pub fn run() -> Result<()> {
                 };
                 serde_json::to_value(herdr_projects::profile_preparation::revalidate(
                     &root.join(slug), &reference,
-                    std::time::Instant::now()+std::time::Duration::from_secs(20), Default::default())?)?
+                    std::time::Instant::now()+herdr_projects::profile_preparation::BUDGET, Default::default())?)?
             }
             #[cfg(all(feature="state-store", target_os="linux"))]
             ProfileCommand::Retained { slug, digest } => {
@@ -856,7 +856,7 @@ pub fn run() -> Result<()> {
                 project::validate_slug(slug)?;
                 serde_json::to_value(herdr_projects::profile_preparation::prepare(
                     &root.join(slug), name, herdr_executable, agent_executable, execution_home,
-                    std::time::Instant::now()+std::time::Duration::from_secs(20), Default::default())?)?
+                    std::time::Instant::now()+herdr_projects::profile_preparation::BUDGET, Default::default())?)?
             }
             #[cfg(all(feature="state-store", target_os="linux"))]
             ProfileCommand::VerifyNative { slug, name, herdr_executable, agent_executable, execution_home, retain } => {
@@ -1063,7 +1063,7 @@ pub fn run() -> Result<()> {
                 anyhow::ensure!(bytes.len()<=1024*1024,"launch selection exceeds bounds");
                 serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid launch selection (contents withheld)"))
             };
-            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(20);
+            let deadline=std::time::Instant::now()+herdr_projects::profile_preparation::BUDGET;
             let value=match command {
                 LaunchCommand::Draft { selection, expected_head, validity_seconds } =>
                     serde_json::to_value(herdr_projects::launch_preparation::draft(&project,&load(&selection)?,expected_head,std::time::Duration::from_secs(validity_seconds),deadline,Default::default())?)?,
