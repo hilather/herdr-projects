@@ -2723,7 +2723,7 @@ fn ticker_auto_chain_releases_verified_integrated_and_fan_in_dependents() {
     // Unused local routes in the repository for `c` and `g`; recording their observation re-admits the project.
     let config=f.home.path().join(".config/herdr-projects/config.toml");
     let mut bindings=std::collections::BTreeMap::new();
-    for task in ["c","g"] {
+    for task in ["c","d","g"] {
         let revision=runtime::snapshot(&f.project).unwrap().tasks.into_iter().find(|t|t.id.as_str()==task).unwrap().revision;
         let change=runtime::create_binding(&f.project,Some(&TaskId::new(task).unwrap()),Some(revision),head(),
             &RuntimeRoute{socket:socket.display().to_string(),cwd:repository.display().to_string(),..Default::default()}).unwrap();
@@ -2786,6 +2786,32 @@ fn ticker_auto_chain_releases_verified_integrated_and_fan_in_dependents() {
     let receipts=herdr_projects::worktree_preparation::prepare(&f.project,&operation,1,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default()).unwrap();
     assert_eq!(receipts.len(),1);
     assert_eq!(f.git(&["-C",&receipts[0].plan.path,"rev-parse","HEAD"]),a_commit);
+    // The fan-in dependent `d` reserves only on a base containing both integrated parents.
+    let scope=f.home.path().join("d-scope.json");
+    std::fs::write(&scope,r#"{"schema_version":1,"task_id":"d","profile":"worker","domains":[],"paths":[],"pinned_keys":[],"sensitivity":"default"}"#).unwrap();
+    let out=hp(f.home.path(),&["--root",f.r(),"memory","demo","snapshot","--task","d","--profile","worker","--input-file",scope.to_str().unwrap(),"--worker"]);
+    assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let snapshot:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();
+    let d_selection=selection("d",serde_json::json!({"id":snapshot["id"],"revision":1,"digest":snapshot["manifest_hash"]}));
+    let first_parent=if tip==a_commit {&e_commit} else {&a_commit};
+    f.git(&["checkout","-q","--detach",first_parent]);
+    let before=head();let refused=draft(&d_selection);
+    assert!(!refused.status.success());assert!(String::from_utf8_lossy(&refused.stderr).contains("integration_missing"),"{}",String::from_utf8_lossy(&refused.stderr));
+    assert_eq!(head(),before,"a base holding one parent reserves nothing");
+    f.git(&["checkout","-q","--detach",&tip]);
+    let drafted=draft(&d_selection);assert!(drafted.status.success(),"{}",String::from_utf8_lossy(&drafted.stderr));
+    let drafted:serde_json::Value=serde_json::from_slice(&drafted.stdout).unwrap();
+    let edges=drafted["inputs"]["dependencies"].as_array().unwrap().iter().map(|d|(d["task"].as_str().unwrap(),d["requirement"].as_str().unwrap())).collect::<Vec<_>>();
+    assert_eq!(edges,[("a","integrated_commit"),("e","integrated_commit")]);
+    let document=f.home.path().join("d-approval.json");std::fs::write(&document,serde_json::to_vec_pretty(&drafted["approval"]).unwrap()).unwrap();
+    assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&f.key).args(["-n",herdr_projects::authority::SIGNATURE_NAMESPACE]).arg(&document).output().unwrap().status.success());
+    let out=hp(f.home.path(),&["--root",f.r(),"approval","demo","import",document.to_str().unwrap(),document.with_extension("json.sig").to_str().unwrap(),"--expected-head",&head().to_string()]);
+    assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let approval:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();
+    let out=hp(f.home.path(),&["--root",f.r(),"launch","demo","reserve","--selection",d_selection.to_str().unwrap(),"--approval-digest",approval["digest"].as_str().unwrap(),"--expected-head",&head().to_string()]);
+    assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let reservation:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(reservation["record"]["inputs"]["repositories"][0]["commit"],tip.as_str(),"the fan-in base holds both parents");
 }
 
 /// The worker only edits its worktree (its gitdir is read-only, as under

@@ -809,3 +809,54 @@ Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
 - Allowing a third automatic replan failed both replan tests.
 - Dropping the active-project condition from the auto-replan switch failed
   the ticker test ("a paused project requests nothing").
+
+## Reservation unit tests replaced by E2E workflows
+
+The audit marked 12 `src/store/reservations/tests.rs` tests REPLACE (one since
+renamed to `dependency_evidence_reserves_one_whether_or_not_automatic_admission_is_on`).
+Ten were deleted after `tests/reservations.rs` covered their guarantees over a
+disposable project. Tasks are queued, drafted, owner-signed and reserved through
+the compiled CLI (`task queue`, `launch draft`, `approval import`, `launch reserve`,
+`budget import`), and checked through `scheduler inspect`, `budget inspect`,
+`task show`, `task cancel-attempt`, `plan wait` and `approval denials`. Launch
+claims use the public store API, since only the ticker's launch job claims.
+Attempts that no reservation produces (adopted, lost, a predecessor's worker)
+are recorded with the public generic commit, and automatic admission runs
+through `admission::admit_once`.
+
+| New E2E test | Replaced unit tests |
+| --- | --- |
+| `budget_limits_gate_reservation_and_cancellation_never_refunds` | `unknown_provider_usage_is_explicit_and_never_an_implicit_zero`, `budget_exhaustion_survives_reopen_and_cancel_does_not_refund_admissions` |
+| `cancellation_releases_capacity_only_without_a_launch_claim` | `capacity_wait_distinguishes_never_claimed_cancellation_from_uncertain_stop`, `reservation_and_never_claimed_cancellation_survive_restart`, `retry_history_and_lost_attempts_retain_capacity_on_cancel` |
+| `unproven_attempts_keep_their_slots_through_cancellation` | `cancellation_without_launch_proof_retains_the_attempt`, `lost_attempt_still_fills_the_only_slot` |
+| `dependent_reserves_once_after_verified_evidence_and_never_without_a_grant` | `satisfaction_flag_does_not_reserve_a_dependent_task`, `missing_grant_records_authority_missing_and_does_not_reserve` |
+| `tests/cli.rs` `ticker_auto_chain_releases_verified_integrated_and_fan_in_dependents` (extended: the fan-in dependent `d` drafts `integration_missing` on the first integrated commit and reserves on the tip holding both) | `two_integrated_parents_reserve_only_when_the_base_contains_both` |
+
+Kept:
+- `dependency_evidence_reserves_one_whether_or_not_automatic_admission_is_on`.
+  Its stale-head and bound-reservation halves are now in the dependent
+  workflow. Its third half, a launch whose inputs omit the dependency
+  binding, cannot be built outside the crate: `PreparedLaunch` has a
+  crate-private field, and `launch draft`/`reserve` and admission always seal
+  the current satisfactions.
+- `reserve_and_termination_refresh_bindings_without_generic_commit`. The
+  successor's consumer binding becomes active only on a worker-stop receipt,
+  and that receipt needs the `runtime.launch_target` event that only a real
+  native launch writes. Handing obligations to the successor is already
+  covered end to end by `memory_retired_subscription_keeps_the_pending_obligation`
+  in `tests/factory_harness.rs`.
+
+The trigger checks in the deleted tests (`attempt_inputs` and
+`operation_delivery` refuse rewrites) are not reachable through any public
+writer. `schema10_upgrade_preserves_nonzero_claim_history` and
+`orphan_launches_refuse_reads_and_upgrade_rolls_back` still exercise them.
+
+Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
+- Dropping `never_claimed` from the release condition in
+  `cancel_attempt_in_transaction` made the cancellation workflow fail: the
+  claimed, no-effect retry of `b` was released.
+- Making the reserved attempt count against its own cap in
+  `budget::blockers_for_policy` (`threshold=cap`) made the budget workflow
+  fail: the launch that reached the cap could not be claimed.
+- Not recording the denial in `admission::decide_held` made the dependent
+  workflow fail on the missing `authority_missing` denial.

@@ -35,20 +35,6 @@ fn fixture_at(version:u32)->(tempfile::TempDir,SqliteStore,Vec<PreparedLaunch>) 
 fn reserve(db:&mut SqliteStore,p:&[PreparedLaunch])->Reservation {let h=db.read_snapshot(None).unwrap().head;db.reserve_prepared(p,h,1000).unwrap()}
 
 #[test]
-fn satisfaction_flag_does_not_reserve_a_dependent_task() {
-    let(_temp,mut db,p)=fixture();
-    db.testing_set_factory_admission(true).unwrap();
-    db.connection.execute(
-        "INSERT INTO task_dependencies(task_id,predecessor_id,requirement) VALUES('a','b','verified_result')",
-        [],
-    ).unwrap();
-    let head=db.read_snapshot(None).unwrap().head;
-    let err=db.reserve_prepared(&p,head,1000).unwrap_err();
-    assert!(matches!(err, StoreError::Invalid(ref message) if message.contains("not ready") || message.contains("dependency")), "{err}");
-    assert!(db.read_snapshot(None).unwrap().attempts.is_empty());
-}
-
-#[test]
 fn project_outbox_upgrade_preserves_claims_inputs_and_consumed_approvals() {
     let(temp,mut db,p)=fixture_at(14);let r=reserve(&mut db,&p);
     let claim=db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap();
@@ -86,35 +72,6 @@ fn project_outbox_upgrade_preserves_claims_inputs_and_consumed_approvals() {
     assert!(db.connection.execute("DELETE FROM attempt_inputs",[]).is_err());
 }
 
-fn budget(db:&mut SqliteStore,p:&mut [PreparedLaunch],limits:BudgetLimits) {
-    let snapshot=db.read_snapshot(None).unwrap();
-    let policy=BudgetPolicy{version:1,project_store:p[0].inputs.project_store.clone(),revision:snapshot.budget_policies.len() as u64+1,
-        authority:p[0].inputs.effective_profile.as_ref().unwrap().permission_policy.clone(),limits};
-    let reference=db.install_budget(&PreparedBudget{policy},snapshot.head).unwrap();
-    for p in p {
-        p.inputs.budget=Some(reference.clone());
-        let grant=ApprovalGrant{version:1,scope:ApprovalScope::for_launch(&p.inputs).unwrap(),policy:p.inputs.effective_profile.as_ref().unwrap().permission_policy.clone(),issued_unix_ms:0,expires_unix_ms:100_000};
-        let head=db.read_snapshot(None).unwrap().head;
-        p.inputs.approval=db.install_approval(&PreparedApproval{grant},head,1000).unwrap();
-    }
-}
-#[test]
-fn budget_exhaustion_survives_reopen_and_cancel_does_not_refund_admissions() {
-    let(temp,mut db,mut p)=fixture();
-    budget(&mut db,&mut p,BudgetLimits{max_attempts:Some(1),max_provider_tokens:None,unknown_usage:UnknownUsagePolicy::Refuse});
-    let r=reserve(&mut db,&p);
-    let head=db.read_snapshot(None).unwrap().head;
-    db.cancel_attempt(&r.record.attempt,1,head,"cancel without effect",1001).unwrap();
-    drop(db);let mut db=SqliteStore::open(&temp.path().join(".state/state.db")).unwrap();
-    let report=db.budget_report().unwrap();assert_eq!(report.admitted_attempts,1);
-    assert_eq!(report.provider_tokens,UsageAvailability::Unknown);
-    assert!(report.blockers.contains(&"attempt_budget_exhausted".into()));
-    assert!(db.queue_report(1002).unwrap().entries.iter().all(|entry|entry.blockers.contains(&"attempt_budget_exhausted".into())));
-    let before=db.read_snapshot(None).unwrap();
-    let other=p.into_iter().filter(|p|p.inputs.task!=r.record.inputs.task).collect::<Vec<_>>();
-    assert!(db.reserve_prepared(&other,before.head,1002).is_err());
-    assert_eq!(db.read_snapshot(None).unwrap(),before);
-}
 #[test]
 fn budget_revision_change_blocks_claim_and_pre_effect_without_releasing_capacity() {
     for claimed in [false,true] {
@@ -130,26 +87,6 @@ fn budget_revision_change_blocks_claim_and_pre_effect_without_releasing_capacity
         else {assert!(db.claim_operation(&r.record.operation,1,"worker",1001,1000).is_err());}
         assert_eq!(db.read_snapshot(None).unwrap(),before);
         assert!(before.attempts[0].retains_capacity());
-    }
-}
-#[test]
-fn unknown_provider_usage_is_explicit_and_never_an_implicit_zero() {
-    for (unknown_usage,tokens,admitted) in [(UnknownUsagePolicy::Refuse,10,false),(UnknownUsagePolicy::AllowIncomplete,10,true),(UnknownUsagePolicy::AllowIncomplete,0,false)] {
-        let(_temp,mut db,mut p)=fixture();
-        budget(&mut db,&mut p,BudgetLimits{max_attempts:Some(1),max_provider_tokens:Some(tokens),unknown_usage});
-        let report=db.budget_report().unwrap();assert_eq!(report.provider_tokens,UsageAvailability::Unknown);
-        let before=db.read_snapshot(None).unwrap();
-        if !admitted {
-            assert!(!report.blockers.is_empty());assert!(db.reserve_prepared(&p,before.head,1000).is_err());
-            assert_eq!(db.read_snapshot(None).unwrap(),before);
-        } else {
-            assert!(report.incomplete);assert!(report.blockers.is_empty());
-            let r=reserve(&mut db,&p);
-            // Reaching the count limit after reserving must not reject its own launch.
-            let claim=db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap();
-            db.validate_claim(&claim,1001).unwrap();
-            assert!(db.budget_report().unwrap().blockers.contains(&"attempt_budget_exhausted".into()));
-        }
     }
 }
 #[test]
@@ -311,32 +248,6 @@ fn schema11_upgrade_retains_records_and_blocks_old_format_insertions() {
     assert!(db.cancel_attempt(&attempt,1,after.head,"cancel historical reservation",1001).unwrap().released);
 }
 #[test]
-fn capacity_wait_distinguishes_never_claimed_cancellation_from_uncertain_stop() {
-    use crate::domain::WaitTrigger;
-    for claimed in [false,true] {
-        let (_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);
-        if claimed {db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap();}
-        let trigger=WaitTrigger::AttemptCapacityReleased{attempt_id:r.record.attempt.clone(),after_revision:1};
-        let wait=db.register_wait_with_trigger("a",None,"resource_availability",None,Some(&trigger)).unwrap();
-        assert!(!db.replay_wait(&wait.wait_id).unwrap().wake_requested);
-        let cancelled=db.cancel_attempt(&r.record.attempt,1,db.current_head().unwrap(),"capacity trigger",1001).unwrap();
-        assert_eq!(cancelled.released,!claimed);
-        assert_eq!(db.replay_wait(&wait.wait_id).unwrap().wake_requested,!claimed);
-        assert_eq!(db.queue_report(1001).unwrap().available_slots,usize::from(!claimed));
-        if !claimed {
-            let next=db.rearm_wait(&wait.wait_id,None).unwrap();
-            assert!(db.replay_wait(&next.wait_id).unwrap().wake_requested);
-        }
-    }
-}
-
-#[test]
-fn reservation_and_never_claimed_cancellation_survive_restart() {
-    let(temp,mut db,p)=fixture();let r=reserve(&mut db,&p);assert_eq!(r.record.inputs.task.as_str(),"a");let s=db.read_snapshot(None).unwrap();assert_eq!(s.attempt_inputs,vec![r.record.clone()]);assert_eq!(s.attempts.len(),1);assert!(s.attempts[0].retains_capacity());assert_eq!(db.queue_report(1000).unwrap().available_slots,0);
-    assert!(db.connection.execute("UPDATE attempt_inputs SET payload='{}'",[]).is_err());assert!(db.connection.execute("DELETE FROM attempt_inputs",[]).is_err());
-    drop(db);let mut db=SqliteStore::open(&temp.path().join(".state/state.db")).unwrap();let c=db.cancel_attempt(&r.record.attempt,1,r.head,"operator request",1001).unwrap();assert!(c.released);assert_eq!(db.queue_report(1001).unwrap().available_slots,1);assert_eq!(db.deliveries().unwrap()[0].state,DeliveryState::PermanentFailure);assert!(db.claim_operation(&r.record.operation,1,"worker",1002,1000).is_err());let s=db.read_snapshot(None).unwrap();assert_eq!(s.tasks[0].state,TaskState::Cancelled);assert_eq!(s.tasks[0].active_attempt,None);assert!(db.cancel_attempt(&r.record.attempt,c.attempt_revision,c.head,"operator request",1002).unwrap().released);assert_eq!(db.read_snapshot(None).unwrap(),s);
-}
-#[test]
 fn cancellation_reads_only_its_launch_and_keeps_other_retained_attempts() {
     for other_retained in [false,true] {
         let(_temp,mut db,p)=fixture();let reserved=reserve(&mut db,&p);
@@ -373,10 +284,6 @@ fn competing_reservations_cannot_exceed_capacity_even_with_a_fresh_head() {
     use std::sync::{Arc,Barrier};let(temp,mut db,p)=fixture();let h=db.read_snapshot(None).unwrap().head;let gate=Arc::new(Barrier::new(2));let workers:Vec<_>=p.into_iter().map(|p|{let gate=gate.clone();let path=temp.path().join(".state/state.db");std::thread::spawn(move||{let mut db=SqliteStore::open(&path).unwrap();gate.wait();let result=db.reserve_prepared(&[p.clone()],h,1000);(result,p)})}).collect();let results:Vec<_>=workers.into_iter().map(|w|w.join().unwrap()).collect();assert_eq!(results.iter().filter(|(r,_)|r.is_ok()).count(),1);let loser=&results.iter().find(|(r,_)|r.is_err()).unwrap().1;let h=db.read_snapshot(None).unwrap().head;assert!(matches!(db.reserve_prepared(&[loser.clone()],h,1000),Err(StoreError::Invalid(s)) if s.contains("capacity")));assert_eq!(db.read_snapshot(None).unwrap().attempts.len(),1);
 }
 #[test]
-fn retry_history_and_lost_attempts_retain_capacity_on_cancel() {
-    for lost in [false,true] {let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);let claim=db.claim_operation(&r.record.operation,1,"worker",1000,1000).unwrap();db.finish_operation(&claim,Outcome::Retryable{no_effect_evidence:"fixture rejected before dispatch".into()},1001).unwrap();assert!(db.connection.execute("UPDATE operation_delivery SET attempts=0,epoch=0",[]).is_err());if lost {db.connection.execute("UPDATE attempts SET state='lost'",[]).unwrap();}let h=db.read_snapshot(None).unwrap().head;let c=db.cancel_attempt(&r.record.attempt,1,h,"cancel uncertain",1002).unwrap();assert!(!c.released);assert_eq!(db.queue_report(1002).unwrap().available_slots,0);let s=db.read_snapshot(None).unwrap();assert!(s.attempts[0].retains_capacity());assert_eq!(s.cancellations.len(),1);let revision=db.deliveries().unwrap()[0].revision;assert!(db.claim_operation(&r.record.operation,revision,"worker",3000,1000).is_err());}
-}
-#[test]
 fn cancellation_failure_rolls_back_retirement_and_capacity_release() {
     let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);let before=db.read_snapshot(None).unwrap();db.connection.execute_batch("CREATE TRIGGER fail_cancel BEFORE INSERT ON attempt_cancellations BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();assert!(db.cancel_attempt(&r.record.attempt,1,r.head,"cancel",1001).is_err());assert_eq!(db.read_snapshot(None).unwrap(),before);
 }
@@ -387,10 +294,6 @@ fn claim_and_cancellation_race_never_releases_a_claimed_worker() {
 #[test]
 fn orphan_launches_refuse_reads_and_upgrade_rolls_back() {
     let(_temp,mut db,p)=fixture();let r=reserve(&mut db,&p);db.connection.execute_batch("DROP TRIGGER attempt_inputs_no_delete; DELETE FROM attempt_inputs;").unwrap();assert!(db.read_snapshot(None).is_err());crate::store::test_schema::historical(&db.connection, 10).unwrap();assert!(db.upgrade_v1().is_err());let version:u32=db.connection.query_row("PRAGMA user_version",[],|r|r.get(0)).unwrap();assert_eq!(version,10);assert_eq!(db.read_snapshot(None).unwrap().operations[0].id,r.record.operation);
-}
-#[test]
-fn cancellation_without_launch_proof_retains_the_attempt() {
-    let(_temp,mut db,_p)=fixture();let s=db.read_snapshot(None).unwrap();let id=AttemptId::new("adopted").unwrap();db.commit(Commit{expected_head:s.head,mutations:vec![Mutation::Attempt{expected:None,next:Attempt{id:id.clone(),task:TaskId::new("a").unwrap(),revision:1,state:AttemptState::Running,snapshot:None,reservation:"adopted-slot".into(),termination_observed:false}}]}).unwrap();let h=db.read_snapshot(None).unwrap().head;assert!(!db.cancel_attempt(&id,1,h,"request stop",1000).unwrap().released);assert_eq!(db.queue_report(1000).unwrap().available_slots,0);
 }
 #[test]
 fn schema10_upgrade_preserves_nonzero_claim_history() {
@@ -1263,89 +1166,4 @@ fn dependency_evidence_reserves_one_whether_or_not_automatic_admission_is_on() {
     assert_eq!(reserved.record.inputs.task.as_str(),"a");
     let attempts=db.read_snapshot(None).unwrap().attempts;
     assert_eq!(attempts.iter().filter(|attempt|attempt.task.as_str()=="a").count(),1);
-}
-#[test]
-fn lost_attempt_still_fills_the_only_slot() {
-    let(_temp,mut db,prepared)=fixture();
-    let launch=verified_dependent(&mut db,&prepared[0].inputs);
-    db.testing_set_factory_admission(true).unwrap();
-    let snapshot=db.read_snapshot(None).unwrap();
-    db.commit(Commit{expected_head:snapshot.head,mutations:vec![Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("lost-b").unwrap(),task:TaskId::new("b").unwrap(),revision:1,state:AttemptState::Lost,snapshot:None,reservation:"slot-lost".into(),termination_observed:false}}]}).unwrap();
-    let before=db.read_snapshot(None).unwrap();
-    let err=db.reserve_prepared(&[launch],before.head,1000).unwrap_err();
-    assert!(matches!(err,StoreError::Invalid(ref message) if message.contains("capacity")),"{err}");
-    let after=db.read_snapshot(None).unwrap();
-    assert!(after.attempts.iter().any(|attempt|attempt.id.as_str()=="lost-b"&&attempt.retains_capacity()));
-    assert!(after.attempts.iter().all(|attempt|attempt.task.as_str()!="a"));
-    assert_eq!(after.attempts.len(),before.attempts.len());
-}
-fn git_history()->(tempfile::TempDir,String,String) {
-    let dir=tempfile::tempdir().unwrap();let repo=dir.path().join("repo");std::fs::create_dir(&repo).unwrap();
-    let git=|args:&[&str]| {
-        let output=std::process::Command::new("/usr/bin/git").arg("-C").arg(&repo).args(args).env_clear().env("PATH","/usr/bin:/bin").env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL","/dev/null").env("GIT_AUTHOR_NAME","t").env("GIT_AUTHOR_EMAIL","t@example.com").env("GIT_COMMITTER_NAME","t").env("GIT_COMMITTER_EMAIL","t@example.com").output_gated().unwrap();
-        assert!(output.status.success(),"git {args:?}: {}",String::from_utf8_lossy(&output.stderr));
-        String::from_utf8(output.stdout).unwrap().trim().to_string()
-    };
-    git(&["init","-b","main"]);std::fs::write(repo.join("a.txt"),"a").unwrap();git(&["add","a.txt"]);git(&["commit","-m","a"]);
-    let first=git(&["rev-parse","HEAD"]);
-    git(&["checkout","-b","side"]);std::fs::write(repo.join("b.txt"),"b").unwrap();git(&["add","b.txt"]);git(&["commit","-m","b"]);
-    let second=git(&["rev-parse","HEAD"]);
-    git(&["checkout","main"]);git(&["merge","--no-ff","-m","m","side"]);
-    let merge=git(&["rev-parse","HEAD"]);
-    assert_ne!(first,second);assert_ne!(merge,first);assert_ne!(merge,second);
-    (dir,std::fs::canonicalize(repo).unwrap().display().to_string(),format!("{first} {second} {merge}"))
-}
-fn plant_integrated(db:&SqliteStore,integrated_id:&str,verified_result_id:&str,repository:&str,commit_oid:&str) {
-    let digest="d".repeat(64);let old="c".repeat(40);let candidate=format!("{:x}",Sha256::digest(integrated_id.as_bytes()));
-    db.connection.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
-    db.connection.execute("INSERT INTO integration_operations(operation_id,project_store,idempotency_key,payload_digest,repository,ref_name,expected_old_oid,verified_result_id,candidate_id,state,generation,object_format,checks_passed,reason,created_unix_ms) VALUES(?1,'/tmp/project',?1,?2,?5,'refs/heads/integration',?3,?4,NULL,'integrated',1,'sha1',1,NULL,1)",params![integrated_id,digest,old,verified_result_id,repository]).unwrap();
-    db.connection.execute("INSERT INTO integrated_commits(integrated_id,candidate_id,operation_id,repository,ref_name,commit_oid,tree_oid,expected_old_oid,object_format,created_unix_ms) VALUES(?1,?2,?1,?5,'refs/heads/integration',?3,?3,?4,'sha1',1)",params![integrated_id,candidate,commit_oid,old,repository]).unwrap();
-    db.connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-}
-#[test]
-fn two_integrated_parents_reserve_only_when_the_base_contains_both() {
-    let(_git,repository,oids)=git_history();
-    let mut oid=oids.split_whitespace();let first=oid.next().unwrap().to_string();let second=oid.next().unwrap().to_string();let merge=oid.next().unwrap().to_string();
-    for (pin,reserves) in [(merge,true),(first.clone(),false)] {
-        let(_temp,mut db,prepared)=fixture();
-        let snapshot=db.read_snapshot(None).unwrap();
-        db.commit(Commit{expected_head:snapshot.head,mutations:vec![Mutation::Task{expected:None,next:Task{id:TaskId::new("c").unwrap(),revision:1,state:TaskState::Draft,title:"c".into(),active_attempt:None}}]}).unwrap();
-        let head=db.read_snapshot(None).unwrap().head;
-        db.commit(Commit{expected_head:head,mutations:vec![Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("attempt-b").unwrap(),task:TaskId::new("b").unwrap(),revision:1,state:AttemptState::Completed,snapshot:None,reservation:"slot-b".into(),termination_observed:true}},Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("attempt-c").unwrap(),task:TaskId::new("c").unwrap(),revision:1,state:AttemptState::Completed,snapshot:None,reservation:"slot-c".into(),termination_observed:true}}]}).unwrap();
-        plant_verified(&db,"b","attempt-b",&"e".repeat(64));
-        plant_verified(&db,"c","attempt-c",&"f".repeat(64));
-        plant_integrated(&db,&"1".repeat(64),&"e".repeat(64),&repository,&first);
-        plant_integrated(&db,&"2".repeat(64),&"f".repeat(64),&repository,&second);
-        let snapshot=db.read_snapshot(None).unwrap();
-        let task=snapshot.tasks.iter().find(|task|task.id.as_str()=="a").unwrap().clone();
-        db.queue_task(&task.id,task.revision,snapshot.head,&QueueRequest{priority:0,dependencies:vec![Dependency{predecessor:TaskId::new("b").unwrap(),requirement:DependencyRequirement::IntegratedCommit},Dependency{predecessor:TaskId::new("c").unwrap(),requirement:DependencyRequirement::IntegratedCommit}]},1000).unwrap();
-        let mut satisfaction=|predecessor:&str|->(String,u64){
-            let id:String=db.connection.query_row("SELECT satisfaction_id FROM dependency_satisfactions WHERE task_id='a' AND predecessor_task=?1 AND requirement='integrated_commit' AND state='valid'",[predecessor],|row|row.get(0)).unwrap();
-            let revision=db.read_snapshot(None).unwrap().tasks.iter().find(|task|task.id.as_str()==predecessor).unwrap().revision;
-            (id,revision)
-        };
-        let (left_id,left_revision)=satisfaction("b");let (right_id,right_revision)=satisfaction("c");
-        let launch=reseal(&mut db,"a",vec![DependencyInput{task:TaskId::new("b").unwrap(),task_revision:left_revision,requirement:DependencyRequirement::IntegratedCommit,evidence:VersionedReference{id:left_id.clone(),revision:1,digest:left_id}},DependencyInput{task:TaskId::new("c").unwrap(),task_revision:right_revision,requirement:DependencyRequirement::IntegratedCommit,evidence:VersionedReference{id:right_id.clone(),revision:1,digest:right_id}}],vec![RepositoryInput{repository:repository.clone(),commit:pin.clone(),tree:"a".repeat(40)}],&prepared[0].inputs);
-        db.testing_set_factory_admission(true).unwrap();
-        let head=db.read_snapshot(None).unwrap().head;
-        let result=db.reserve_prepared(&[launch],head,1000);
-        if reserves {
-            let reserved=result.unwrap();
-            assert_eq!(reserved.record.inputs.task.as_str(),"a");
-            assert_eq!(reserved.record.inputs.repositories[0].commit,pin);
-        } else {
-            let err=result.unwrap_err();
-            assert!(matches!(err,StoreError::Invalid(ref message) if message.contains("integration_missing")),"{err}");
-            assert!(db.read_snapshot(None).unwrap().attempts.iter().all(|attempt|attempt.task.as_str()!="a"));
-        }
-    }
-}
-#[cfg(target_os="linux")]
-#[test]
-fn missing_grant_records_authority_missing_and_does_not_reserve() {
-    let(temp,mut db,_prepared)=fixture();
-    db.testing_set_factory_admission(true).unwrap();
-    crate::admission::admit_once(temp.path()).unwrap();
-    assert!(db.read_snapshot(None).unwrap().attempts.is_empty());
-    assert!(db.authority_denials().unwrap().iter().any(|denial|denial.reason_code=="authority_missing"));
 }
