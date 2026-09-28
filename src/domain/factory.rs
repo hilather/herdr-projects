@@ -408,6 +408,13 @@ fn normalize_scope_path(raw: &str) -> Result<(String, ScopeCertainty), String> {
 }
 
 impl PreparedContract {
+    /// Literal write scopes a result may change; `None` when the contract declares no scope.
+    pub(crate) fn write_scopes(&self) -> Option<Vec<String>> {
+        if self.scope_paths.is_empty() { return None; }
+        Some(self.scope_paths.iter().filter(|scope| scope.access == ScopeAccess::Write)
+            .filter(|scope| !scope.path.contains(['*', '?', '[']))
+            .map(|scope| scope.path.clone()).collect())
+    }
     /// Parse bytes that have already been signature-checked. Does not verify a signature.
     pub(crate) fn parse_verified(raw: &[u8]) -> Result<Self, String> {
         if raw.len() > 65_536 {
@@ -910,4 +917,10 @@ impl UntrustedDelegationDocument {
         }
         Ok(prepared)
     }
+}
+
+/// A changed repository path is inside a write scope when it equals the scope
+/// or lies under a scope that names a directory (trailing `/`).
+pub(crate) fn in_write_scope(scopes: &[String], path: &[u8]) -> bool {
+    scopes.iter().any(|scope| path == scope.as_bytes() || (scope.ends_with('/') && path.starts_with(scope.as_bytes())))
 }

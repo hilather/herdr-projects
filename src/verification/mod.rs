@@ -414,8 +414,7 @@ fn verify_owned(store: &mut SqliteStore, request: &VerifyRequest, ownership: Opt
     )?;
     if let Some(scopes) = &target.write_scopes {
         let reason = match checkout::changed_paths(&checkout.path, &target.base_oid, &target.candidate_oid) {
-            Ok(paths) if paths.iter().any(|path| !scopes.iter().any(|scope|
-                path == scope.as_bytes() || (scope.ends_with('/') && path.starts_with(scope.as_bytes())))) => Some("scope_violation"),
+            Ok(paths) if paths.iter().any(|path| !crate::domain::in_write_scope(scopes, path)) => Some("scope_violation"),
             Ok(_) => None,
             Err(_) => Some("scope_diff_unavailable"),
         };

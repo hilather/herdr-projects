@@ -85,4 +85,7 @@ pub mod worktree_preparation;
 pub mod verification;
 
 #[cfg(all(feature = "state-store", target_os = "linux"))]
+pub mod result_capture;
+
+#[cfg(all(feature = "state-store", target_os = "linux"))]
 pub mod integration;

@@ -324,6 +324,9 @@ impl ControlledStore {
         self.control.check()?;
         self.store.replay_wait_with_budget(id,Some(&self.work_budget)).map_err(|e|self.error(e))
     }
+    pub(crate) fn attempt_contract(&self, task: &str, frozen: Option<&crate::domain::VersionedReference>) -> Result<Option<crate::domain::PreparedContract>> {
+        self.read(|store| store.attempt_contract(task, frozen))
+    }
     pub(crate) fn task_contract_reference(&self, task: &str) -> Result<Option<crate::domain::VersionedReference>> {
         self.read(|store| store.task_contract_reference(task))
     }

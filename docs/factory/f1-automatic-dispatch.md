@@ -150,9 +150,13 @@ Recorded here rather than folded into the card that found them.
   within one 30 s budget, and publishes only if all pass. Each verdict is
   recorded in `integration_policy_checks` (migration 0046) and returned as
   `policies`; a failing policy is named in the job diagnostic.
-- **Codex cannot commit under `workspace-write`** (F1.7): its sandbox makes Git
-  metadata read-only, including a linked worktree's gitdir. Decide the worker
-  sandbox and who commits.
+- **Codex cannot commit under `workspace-write`** (F1.7) — done (this PR):
+  workers keep `workspace-write` and never commit; the controller commits for
+  them with `result capture` (see `adapters.md`, "Worker sandbox and
+  commits"). Its sandbox makes Git metadata read-only, including a linked
+  worktree's gitdir. The live harness still runs `danger-full-access` and has
+  the worker commit; switching it to capture needs its fixture mode to prepare
+  worktrees through the product.
 
 - **Notification enqueue reads the whole snapshot** (`runtime.rs`
   `enqueue_notification`). Its check needs every unseen inbox item and every

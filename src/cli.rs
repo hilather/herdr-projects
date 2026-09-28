@@ -694,6 +694,9 @@ enum ResultCommand {
         #[arg(long, default_value_t=60, value_parser=clap::value_parser!(u64).range(1..=300))]
         timeout_seconds: u64,
     },
+    /// Commit a sandboxed worker's uncommitted edits on its attempt branch with a fixed identity; prints the candidate OID. Not evidence.
+    #[cfg(target_os="linux")]
+    Capture { attempt:String, #[arg(long)] message:Option<String> },
     /// Stage git objects and record one untrusted submission. Claimed checks are not evidence.
     #[cfg(target_os="linux")]
     Submit { #[arg(long)] input_file:PathBuf },
@@ -1179,6 +1182,8 @@ pub fn run() -> Result<()> {
             project::validate_slug(&slug)?;
             let dir=ctx.root.join(&slug);
             match command {
+                #[cfg(target_os="linux")]
+                ResultCommand::Capture{attempt,message}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::result_capture::capture_project(&dir,&attempt,message.as_deref())?)?),
                 #[cfg(target_os="linux")]
                 ResultCommand::Submit{input_file}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::submit_untrusted_result(&dir,&input_file)?)?),
                 #[cfg(target_os="linux")]

@@ -233,11 +233,7 @@ impl SqliteStore {
             return Err(StoreError::Corrupt("task contract digest mismatch".into()));
         }
         let contract = crate::domain::PreparedContract::parse_verified(&raw).map_err(|error| invalid(&error))?;
-        let write_scopes = if contract.scope_paths.is_empty() { None } else {
-            Some(contract.scope_paths.iter().filter(|scope| scope.access == ScopeAccess::Write)
-                .filter(|scope| !scope.path.contains(['*', '?', '[']))
-                .map(|scope| scope.path.clone()).collect())
-        };
+        let write_scopes = contract.write_scopes();
         let base_oid = contract.base_oid;
         let required_outputs = contract.required_outputs;
         super::contract_binding::require_result_barrier(&tx, &task_id, u64::try_from(contract_revision).map_err(|_| invalid("invalid contract revision"))?,

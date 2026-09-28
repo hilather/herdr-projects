@@ -339,6 +339,17 @@ impl SqliteStore {
             None=>Ok(true),
         }
     }
+    /// The contract a reservation froze, or the latest one for an unfrozen attempt.
+    pub(crate) fn attempt_contract(&self, task: &str, frozen: Option<&VersionedReference>) -> Result<Option<PreparedContract>> {
+        let Some(frozen) = frozen else { return latest(&self.connection, task); };
+        let raw: Vec<u8> = self.connection.query_row("SELECT raw_bytes FROM task_contracts WHERE task_id=?1 AND contract_revision=?2",
+            params![task, frozen.revision], |row| row.get(0))?;
+        let contract = PreparedContract::parse_verified(&raw).map_err(StoreError::Corrupt)?;
+        if contract.digest != frozen.digest || contract.task_id.as_str() != task || contract.contract_revision != frozen.revision {
+            return Err(StoreError::Corrupt("frozen task contract binding mismatch".into()));
+        }
+        Ok(Some(contract))
+    }
     pub(crate) fn task_contract_reference(&self, task: &str) -> Result<Option<VersionedReference>> {
         Ok(latest(&self.connection, task)?.as_ref().map(reference))
     }

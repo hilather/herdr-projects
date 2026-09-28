@@ -2550,6 +2550,122 @@ fn ticker_auto_chain_releases_verified_integrated_and_fan_in_dependents() {
     assert_eq!(f.git(&["-C",&receipts[0].plan.path,"rev-parse","HEAD"]),a_commit);
 }
 
+/// The worker only edits its worktree (its gitdir is read-only, as under
+/// Codex `workspace-write`); the controller captures the edits as a commit on
+/// the attempt's branch, and that untrusted commit is submitted and verified.
+#[cfg(all(feature="state-store",target_os="linux"))]
+#[test]
+fn controller_captures_uncommitted_worker_edits_for_submission_and_verification() {
+    use std::{fs,os::unix::fs::PermissionsExt,path::PathBuf};
+    use herdr_projects::{runtime,domain::{TaskId,RuntimeRoute},operations::DeliveryState};
+    let f=VerifyFixture::with_worker(&[("src/lib.rs","pub fn base() {}\n".into())],
+        "kind='codex'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=60\nunknown_usage='allow_with_warning'\n");
+    let start=f.candidate.clone();let repository=f.repo.canonicalize().unwrap();
+    let head=||runtime::snapshot(&f.project).unwrap().head;
+    let ok=|out:std::process::Output|{assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap_or(serde_json::Value::Null)};
+    let cli=|args:&[&str]|{let mut all=vec!["--root",f.r()];all.extend_from_slice(args);hp(f.home.path(),&all)};
+    let sign=|path:&Path,namespace:&str|assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&f.key).args(["-n",namespace]).arg(path).output().unwrap().status.success());
+    // A signed contract scoped to src/, queued, and an operator-approved launch with a prepared worktree.
+    let policies=[("content",r#"{"version":1,"checks":["/usr/bin/git","grep","--quiet","--no-index","-e","^CAPTURED_OK$","--","src/a.txt"]}"#)];
+    let added=runtime::add_task(&f.project,TaskId::new("a").unwrap(),"capture task".into(),head()).unwrap();
+    let mut contract=serde_json::to_vec_pretty(&serde_json::json!({
+        "version":3,"outputs":[{"path":"src/a.txt","kind":"git_file"}],"scope":{"paths":[{"path":"src/","access":"write"}]},
+        "project_store":f.store,"expected_head":added,"task_id":"a","contract_revision":1,"deliverable":"src/a.txt","non_goals":"no other change",
+        "acceptance_policies":policies.iter().map(|(id,text)|serde_json::json!({"id":id,"text":text})).collect::<Vec<_>>(),
+        "repository":repository,"base_oid":start,"object_format":"sha256","dependencies":[],"capability_flags":[],
+        "profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_then_integrate","authority":herdr_projects::authority::policy_reference(&f.project).unwrap()
+    })).unwrap();contract.push(b'\n');
+    let contract_path=f.home.path().join("a-contract.json");fs::write(&contract_path,&contract).unwrap();sign(&contract_path,herdr_projects::authority::CONTRACT_SIGNATURE_NAMESPACE);
+    let installed=ok(cli(&["task","demo","contract","put","--input-file",contract_path.to_str().unwrap(),"--signature",contract_path.with_extension("json.sig").to_str().unwrap()]));
+    let request=f.home.path().join("a-queue.json");fs::write(&request,r#"{"priority":0,"dependencies":[]}"#).unwrap();
+    ok(cli(&["task","demo","queue","a","--input-file",request.to_str().unwrap(),"--expected-revision","1","--expected-head",&head().to_string()]));
+    let policy=runtime::snapshot(&f.project).unwrap().scheduler.unwrap().policy.revision.to_string();
+    ok(cli(&["scheduler","demo","policy","--max-active-workers","4","--max-attempts-per-task","3","--expected-revision",&policy,"--expected-head",&head().to_string()]));
+    let socket=f.home.path().join("native.sock");let _listener=std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let config=f.home.path().join(".config/herdr-projects/config.toml");
+    let revision=runtime::snapshot(&f.project).unwrap().tasks.into_iter().find(|t|t.id.as_str()=="a").unwrap().revision;
+    let binding=runtime::create_binding(&f.project,Some(&TaskId::new("a").unwrap()),Some(revision),head(),
+        &RuntimeRoute{socket:socket.display().to_string(),cwd:repository.display().to_string(),..Default::default()}).unwrap();
+    herdr_projects::migration::open_active(&f.project).unwrap().record_observations(head(),&[herdr_projects::reconcile::RuntimeObservation{binding:binding.binding.id.clone(),
+        binding_revision:binding.binding.revision,task_revision:binding.task_revision,observed_unix_ms:jiff::Timestamp::now().as_millisecond(),collector:"herdr-git-v2".into(),
+        config_digest:herdr_projects::migration::config_reference(&config).unwrap().digest,..Default::default()}]).unwrap();
+    let control=runtime::snapshot(&f.project).unwrap().control.unwrap().revision;
+    runtime::set_state(&f.project,head(),control,herdr_projects::domain::ProjectState::Active,&config).unwrap();
+    let profile=f.fake_launchable_profile("codex","codex-cli 0.154.0");
+    fs::write(f.project.join("PROJECT.md"),"Edit files only; never commit.").unwrap();
+    let scope=f.home.path().join("a-scope.json");
+    fs::write(&scope,r#"{"schema_version":1,"task_id":"a","profile":"worker","domains":[],"paths":[],"pinned_keys":[],"sensitivity":"default"}"#).unwrap();
+    let snapshot=ok(cli(&["memory","demo","snapshot","--task","a","--profile","worker","--input-file",scope.to_str().unwrap(),"--worker"]));
+    let selection=f.home.path().join("a-selection.json");
+    fs::write(&selection,serde_json::json!({"task":"a","binding":binding.binding.id,"profile":profile,
+        "knowledge":{"id":snapshot["id"],"revision":1,"digest":snapshot["manifest_hash"]},"repositories":[repository]}).to_string()).unwrap();
+    let drafted=ok(cli(&["launch","demo","draft","--selection",selection.to_str().unwrap(),"--expected-head",&head().to_string()]));
+    let document=f.home.path().join("a-approval.json");fs::write(&document,serde_json::to_vec_pretty(&drafted["approval"]).unwrap()).unwrap();
+    sign(&document,herdr_projects::authority::SIGNATURE_NAMESPACE);
+    let approval=ok(cli(&["approval","demo","import",document.to_str().unwrap(),document.with_extension("json.sig").to_str().unwrap(),"--expected-head",&head().to_string()]));
+    let reservation=ok(cli(&["launch","demo","reserve","--selection",selection.to_str().unwrap(),"--approval-digest",approval["digest"].as_str().unwrap(),"--expected-head",&head().to_string()]));
+    let attempt=reservation["record"]["attempt"].as_str().unwrap().to_owned();
+    let operation=herdr_projects::domain::OperationId::new(reservation["record"]["operation"].as_str().unwrap()).unwrap();
+    let receipts=herdr_projects::worktree_preparation::prepare(&f.project,&operation,1,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default()).unwrap();
+    let worktree=PathBuf::from(&receipts[0].plan.path);let branch=format!("refs/heads/{}",receipts[0].plan.branch);
+    let wt=|args:&[&str]|{let mut all=vec!["-C",worktree.to_str().unwrap()];all.extend_from_slice(args);f.git(&all)};
+    let capture=|attempt:&str|cli(&["result","demo","capture",attempt]);
+    let refused=|out:std::process::Output,needle:&str|{assert!(!out.status.success(),"{}",String::from_utf8_lossy(&out.stdout));
+        let stderr=String::from_utf8_lossy(&out.stderr);assert!(stderr.contains(needle),"{stderr}");assert_eq!(f.git(&["rev-parse",&branch]),start,"a refused capture moves nothing");};
+
+    // 1. The worker edits without committing: its gitdir is read-only, so Git refuses it.
+    let gitdir=PathBuf::from(wt(&["rev-parse","--absolute-git-dir"]));let mode=fs::metadata(&gitdir).unwrap().permissions().mode();
+    fs::set_permissions(&gitdir,fs::Permissions::from_mode(0o555)).unwrap();
+    fs::write(worktree.join("src/a.txt"),"CAPTURED_OK\n").unwrap();fs::write(worktree.join("src/.gitignore"),"*.log\n").unwrap();fs::write(worktree.join("src/scratch.log"),"ignored\n").unwrap();
+    let sandboxed=Command::new("/usr/bin/git").env_clear().env("PATH","/usr/bin:/bin").env("HOME",f.home.path()).env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL","/dev/null")
+        .args(["-C",worktree.to_str().unwrap(),"add","src/a.txt"]).output().unwrap();
+    assert!(!sandboxed.status.success(),"a sandboxed worker cannot stage");
+    fs::set_permissions(&gitdir,fs::Permissions::from_mode(mode)).unwrap();
+
+    // 2. Refusals: an attempt without this worktree, a moved worktree lock, out-of-scope edits, an escaping symlink.
+    f.db().execute("INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) VALUES('stranger','a',1,'completed',NULL,'stranger',1)",[]).unwrap();
+    refused(capture("stranger"),"launch inputs");
+    let reason=fs::read_to_string(gitdir.join("locked")).unwrap();
+    wt(&["worktree","unlock",worktree.to_str().unwrap()]);wt(&["worktree","lock","--reason","someone else",worktree.to_str().unwrap()]);
+    refused(capture(&attempt),"worktree association changed");
+    wt(&["worktree","unlock",worktree.to_str().unwrap()]);wt(&["worktree","lock","--reason",&reason,worktree.to_str().unwrap()]);
+    fs::write(worktree.join("outside.txt"),"out of scope\n").unwrap();
+    refused(capture(&attempt),"outside the contract's write scope");
+    fs::remove_file(worktree.join("outside.txt")).unwrap();
+    std::os::unix::fs::symlink("../../escape",worktree.join("src/link")).unwrap();
+    refused(capture(&attempt),"symlink");
+    fs::remove_file(worktree.join("src/link")).unwrap();
+
+    // 3. Capture commits the worktree with the controller's fixed identity; a repeat is a no-op.
+    let first=ok(capture(&attempt));
+    let candidate=first["candidate_oid"].as_str().unwrap().to_owned();
+    assert_eq!((first["captured"].as_bool(),first["base_oid"].as_str(),first["branch"].as_str()),(Some(true),Some(start.as_str()),Some(branch.as_str())));
+    assert_eq!(f.git(&["rev-parse",&branch]),candidate);assert_eq!(f.git(&["rev-parse",&format!("{candidate}^")]),start);
+    assert_eq!(f.git(&["log","-1","--format=%an <%ae>|%cn <%ce>|%s",&candidate]),
+        format!("herdr-projects <capture@herdr-projects.invalid>|herdr-projects <capture@herdr-projects.invalid>|Capture attempt {attempt}"));
+    assert_eq!(f.git(&["diff-tree","-r","--name-only","--no-commit-id",&start,&candidate]),"src/.gitignore\nsrc/a.txt","ignored files stay out");
+    assert_eq!(wt(&["status","--porcelain"]),"","the worktree index matches the capture");
+    let again=ok(capture(&attempt));
+    assert_eq!((again["candidate_oid"].as_str(),again["captured"].as_bool()),(Some(candidate.as_str()),Some(false)));
+
+    // 4. The captured commit is submitted as an untrusted result and automatic verification accepts it.
+    let objects=f.git(&["rev-list","--objects",&candidate]).lines().map(|line|{let oid=line.split_whitespace().next().unwrap();serde_json::json!({"oid":oid,"relative_path":format!("{}/{}",&oid[..2],&oid[2..])})}).collect::<Vec<_>>();
+    let submission=f.home.path().join("a-result.json");
+    fs::write(&submission,serde_json::to_vec(&serde_json::json!({"idempotency_key":"a-captured","task_id":"a","contract_revision":1,"contract_digest":installed["digest"],"attempt_id":attempt,
+        "repository":repository,"base_oid":start,"candidate_oid":candidate,"object_format":"sha256",
+        "artifact_manifest":[{"path":"src/a.txt","oid":candidate}],"claimed_checks":[],"objects":objects})).unwrap()).unwrap();
+    let submitted=ok(cli(&["result","demo","submit","--input-file",submission.to_str().unwrap()]))["submission_id"].as_str().unwrap().to_owned();
+    f.automate();let mut child=f.spawn();
+    f.wait(&mut child,120,&||f.jobs().iter().any(|(op,d)|op.payload["submission_id"]==submitted.as_str()&&d.state==DeliveryState::Confirmed));
+    f.stop(&mut child);
+    assert_eq!(f.db().query_row("SELECT state FROM verification_runs WHERE submission_id=?1",[&submitted],|row|row.get::<_,String>(0)).unwrap(),"accepted");
+
+    // 5. Further edits are captured on top of the previous capture.
+    fs::write(worktree.join("src/b.txt"),"more\n").unwrap();
+    let next=ok(capture(&attempt));let next_oid=next["candidate_oid"].as_str().unwrap();
+    assert_ne!(next_oid,candidate);assert_eq!(f.git(&["rev-parse",&format!("{next_oid}^")]),candidate);assert_eq!(f.git(&["rev-parse",&branch]),next_oid);
+}
+
 /// Local stand-in for a Herdr server that runs the launched command for real,
 /// outside the caller's short-lived bridge namespace. The supervisor reads its
 /// release line from a FIFO standing in for the pane.

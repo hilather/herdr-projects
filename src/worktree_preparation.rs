@@ -90,7 +90,7 @@ impl Git {
         self.check()?;
         Ok(output.stdout_bytes)
     }
-    fn run(&self, path: &Path, args: &[&str]) -> Result<String> {
+    pub(crate) fn run(&self, path: &Path, args: &[&str]) -> Result<String> {
         let bytes = self.capture(path, args, None, 8192)?;
         Ok(std::str::from_utf8(&bytes)
             .context("worktree Git output is not UTF-8")?
