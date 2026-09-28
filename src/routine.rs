@@ -275,25 +275,6 @@ mod tests {
     }
 
     #[test]
-    fn schedule_parsing() {
-        assert_eq!(parse_schedule("every 5m").unwrap(), Schedule::Every(300));
-        assert_eq!(parse_schedule(" every 2h ").unwrap(), Schedule::Every(7200));
-        assert_eq!(parse_schedule("every 1d").unwrap(), Schedule::Every(86_400));
-        assert_eq!(parse_schedule("daily 07:30").unwrap(), Schedule::Daily(7, 30));
-        for bad in ["", "every", "every 0m", "every -1h", "every 5x", "every m", "daily 24:00", "daily 7", "daily 07:60", "hourly", "* * * * *"] {
-            assert!(parse_schedule(bad).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn every_is_due_after_its_interval() {
-        let now = zoned("2026-09-17T12:00:00+02:00[Europe/Stockholm]");
-        let schedule = Schedule::Every(3600);
-        assert!(!is_due(&schedule, "2026-09-17T09:30:00Z".parse().unwrap(), &now));
-        assert!(is_due(&schedule, "2026-09-17T09:00:00Z".parse().unwrap(), &now));
-    }
-
-    #[test]
     fn schedule_interval_boundaries_and_malformed_utf8_text() {
         for (unit, scale) in [('m', 60), ('h', 3600), ('d', 86_400)] {
             let max = i64::MAX / scale;
@@ -331,21 +312,6 @@ mod tests {
     }
 
     #[test]
-    fn daily_is_due_once_per_local_day() {
-        let schedule = Schedule::Daily(7, 30);
-        let before = zoned("2026-09-17T07:29:00+02:00[Europe/Stockholm]");
-        let after = zoned("2026-09-17T07:31:00+02:00[Europe/Stockholm]");
-        let ran_yesterday: jiff::Timestamp = "2026-09-16T05:30:10Z".parse().unwrap();
-        assert!(!is_due(&schedule, ran_yesterday, &before));
-        assert!(is_due(&schedule, ran_yesterday, &after));
-        let ran_today: jiff::Timestamp = "2026-09-17T05:30:10Z".parse().unwrap();
-        assert!(!is_due(&schedule, ran_today, &after));
-        // A ticker that was down over 07:30 still runs it once when it is back.
-        let late = zoned("2026-09-17T23:00:00+02:00[Europe/Stockholm]");
-        assert!(is_due(&schedule, ran_yesterday, &late));
-    }
-
-    #[test]
     fn daily_follows_local_time_across_a_daylight_saving_change() {
         // Stockholm leaves summer time on 2026-10-25: 07:30 local moves from
         // 05:30Z to 06:30Z.
@@ -353,18 +319,6 @@ mod tests {
         let ran: jiff::Timestamp = "2026-10-24T05:30:05Z".parse().unwrap();
         assert!(!is_due(&schedule, ran, &zoned("2026-10-25T06:45:00+01:00[Europe/Stockholm]")));
         assert!(is_due(&schedule, ran, &zoned("2026-10-25T07:30:00+01:00[Europe/Stockholm]")));
-    }
-
-    #[test]
-    fn routine_parsing_and_name_validation() {
-        let r = parse("nightly", "+++\nschedule = \"daily 02:00\"\ncommand = \"./check.sh\"\n+++\n\nLook at the output.\n").unwrap();
-        assert_eq!((r.name.as_str(), r.command.as_str(), r.enabled, r.prompt.as_str()), ("nightly", "./check.sh", true, "Look at the output."));
-        let r = parse("p", "+++\nschedule = \"every 1h\"\nenabled = false\n+++\nPrompt").unwrap();
-        assert!(r.command.is_empty() && !r.enabled);
-        assert!(parse("Bad_Name", "+++\nschedule = \"every 1h\"\n+++\n").is_err());
-        assert!(parse("../x", "+++\nschedule = \"every 1h\"\n+++\n").is_err());
-        assert!(parse("ok", "+++\nschedule = \"sometimes\"\n+++\n").is_err());
-        assert!(parse("ok", "no front matter").is_err());
     }
 
 
@@ -402,32 +356,5 @@ mod tests {
         assert!(!is_approved(config.path(), &project, &edited));
         let renamed = Routine { name: "watch2".into(), ..routine };
         assert!(!is_approved(config.path(), &project, &renamed));
-    }
-
-    #[test]
-    fn approve_refuses_without_a_terminal() {
-        // cargo test runs with standard input that is not a terminal.
-        let root = tempfile::tempdir().unwrap();
-        let config = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
-        std::fs::write(project.dir().join("routines/watch.md"), "+++\nschedule = \"every 1m\"\ncommand = \"echo hi\"\n+++\n").unwrap();
-        if !std::io::stdin().is_terminal() {
-            let error = approve(config.path(), &project, "watch").unwrap_err().to_string();
-            assert!(error.contains("terminal"), "{error}");
-            assert!(approvals(config.path()).is_empty());
-        }
-    }
-
-    #[test]
-    fn broken_files_are_reported_with_their_hash() {
-        let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
-        std::fs::write(project.dir().join("routines/good.md"), "+++\nschedule = \"every 1h\"\n+++\nP").unwrap();
-        std::fs::write(project.dir().join("routines/Bad Name.md"), "+++\nschedule = \"every 1h\"\n+++\nP").unwrap();
-        std::fs::write(project.dir().join("routines/broken.md"), "+++\nschedule = \n+++\n").unwrap();
-        let (routines, broken) = load_all(&project);
-        assert_eq!(routines.len(), 1);
-        assert_eq!(broken.len(), 2);
-        assert!(broken.iter().all(|b| b.hash.len() == 64));
     }
 }

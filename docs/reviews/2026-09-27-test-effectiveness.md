@@ -1669,3 +1669,26 @@ Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
   accepted.
 - Dropping the "new request" condition from the coordinator prime check
   failed the prime test: marking the record pending primed it again.
+
+## Routine and path unit tests replaced by CLI workflows
+
+Replaced the 12 REPLACE tests in `src/routine.rs` (6) and `src/paths.rs` (6)
+with two new crates that run the compiled CLI in both builds:
+
+- `tests/paths.rs` (4): projects-root precedence (`--root` >
+  `HERDR_PROJECTS_ROOT` > config.toml `root` > `~/.herdr-projects`) observed
+  through where `new` creates a project; a malformed config.toml refused
+  without echoing its contents; `HERDR_BIN_PATH`; session precedence and
+  refusals through `doctor` against a fake herdr.
+- `tests/routine_files.rs` (3): `routine list` with valid, invalid and
+  unparseable routine files; `routine approve` refused without a terminal;
+  `ticker run` writing inbox items for due every/daily routines (including
+  missed days) and once per unparseable file content.
+
+No test was kept. Mutation checks, each restored and verified with `cmp`:
+letting `HERDR_PROJECTS_ROOT` override `--root` failed the precedence test;
+accepting a zero interval (`every 0m`) failed the `routine list` test.
+
+This batch was recovered after a shared-stash collision between parallel
+agents: the unit-test deletions were re-applied from their preserved commit
+and the new tests copied from the original worktree.
