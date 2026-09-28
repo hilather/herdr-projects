@@ -335,7 +335,7 @@ mod tests {
     use herdr_projects::execution_guard::GatedSpawn;
     use super::*;
     use crate::runner::RealRunner;
-    use crate::runner::fake::{FakeRunner, fail, ok};
+    use crate::runner::fake::{FakeRunner, ok};
 
 
     const HOSTILE: [&str; 10] = ["$(touch /tmp/hp-pwned)", "`id`", "a'; rm -rf ~; echo '", "x\ny", "~/x", "-n", "a\\b\"c", "*", "!!", "a b  c"];
@@ -409,22 +409,6 @@ mod tests {
         drop(calls);
         assert!(ssh(&runner, "-oProxyCommand=evil", "true", None, SSH_TIMEOUT).is_err());
         assert!(ssh(&runner, "host; rm -rf ~", "true", None, SSH_TIMEOUT).is_err());
-    }
-
-    #[test]
-    fn target_comes_from_herdr_then_from_config() {
-        let config = tempfile::tempdir().unwrap();
-        std::fs::write(config.path().join("config.toml"), "[machines.box]\nssh = \"me@box.local\"\n").unwrap();
-        let runner = FakeRunner::new();
-        runner.on("machine list --json", ok(r#"[{"id":"abc","label":"m1","target":"m1.local","session":"default"}]"#));
-        assert_eq!(ssh_target(&runner, "herdr", config.path(), "m1").unwrap(), "m1.local");
-        assert_eq!(ssh_target(&runner, "herdr", config.path(), "abc").unwrap(), "m1.local");
-        assert_eq!(ssh_target(&runner, "herdr", config.path(), "box").unwrap(), "me@box.local");
-        assert!(ssh_target(&runner, "herdr", config.path(), "nope").is_err());
-
-        let broken = FakeRunner::new();
-        broken.on("machine list --json", fail(1, "no"));
-        assert_eq!(ssh_target(&broken, "herdr", config.path(), "box").unwrap(), "me@box.local");
     }
 
     #[test]
@@ -535,15 +519,6 @@ mod tests {
             let runner = FakeRunner::new();
             runner.on("ssh", ok(reply));
             assert!(layout(&runner, "box", "/repo/library").is_err());
-        }
-    }
-    #[test]
-    fn saved_route_selection_matches_id_precedence_and_refuses_ambiguous_or_disabled_profiles() {
-        use crate::runner::fake::ok;
-        let listed=ok(r#"[{"id":"chosen","label":"first","target":"correct"},{"id":"other","label":"chosen","target":"wrong"}]"#);
-        assert_eq!(target_from_listing(Some(listed),||None,"chosen").unwrap(),"correct");
-        for text in [r#"[{"id":"a","label":"same","target":"a"},{"id":"b","label":"same","target":"b"}]"#,r#"[{"id":"a","label":"same","target":"a","enabled":false}]"#,r#"[{"id":"a","label":"same","target":"a"},{"id":"a","label":"different","target":"b"}]"#] {
-            assert!(target_from_listing(Some(ok(text)),||panic!("must not fall back"),"same").is_err());
         }
     }
 

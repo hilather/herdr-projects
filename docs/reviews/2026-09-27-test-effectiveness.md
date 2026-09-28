@@ -1323,3 +1323,77 @@ Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
 - Sending empty stdin from `RealRunner` failed
   `ticker_launches_and_briefs_once_then_stops_a_cancelled_worker_while_paused_and_revoked`
   at its first CLI step that pipes input to a subprocess.
+
+## Adopt, pull request, remote, recovery-plan, live-reconcile and cleanup unit tests replaced by E2E workflows
+
+The audit marked 20 tests REPLACE: 4 each in `src/adopt.rs` and
+`src/pr.rs`, 3 each in `src/remote.rs`, `src/reconcile/plan.rs`,
+`src/reconcile_live.rs` and `src/cleanup.rs`. 19 were deleted.
+
+The new tests drive the compiled CLI:
+- `tests/adopt.rs`: `thread adopt` and `adopt-workspace` beside a
+  foreground `ticker run`, against a fake herdr serving several sessions.
+- `tests/pull_requests.rs`: `ticker run` with a fake `gh pr view`. The
+  second read is forced by clearing `last_pr_check` in the ticker state, as
+  in tests/recovery.rs.
+- `tests/remote.rs`: `doctor`, which resolves the SSH target of every
+  machine an open remote thread uses, through the same code as the copies
+  and report polls.
+- `tests/cleanup.rs`: `thread resolve --remove-worktree --writers-stopped`,
+  then `thread resolve --reopen` and `thread restart`, with real git.
+- `tests/reconcile.rs` (state-store build only): `migration plan/apply`,
+  `task add/list`, `runtime create/inspect`, `reconcile --record` and
+  `reconcile --plan`. A fake `git` on `PATH` answers only
+  `worktree list --porcelain -z`, and only while a fixture listing exists;
+  every other git call reaches the real git.
+
+Where no CLI path exists, the tests use the public API: the reconcile plan
+test writes attempts, queued operations, delivery claims, the lease-expiry
+sweep and a task revision bump with `SqliteStore` (`commit`,
+`claim_operation`, `expire_claims`).
+
+| New E2E test | Replaced unit tests |
+| --- | --- |
+| `adopting_ready_agents_briefs_and_prompts_each_in_its_own_directory` | `adopting_a_ready_agent_writes_a_brief_and_prompts_it` |
+| `a_busy_adopted_agent_is_prompted_by_the_ticker_once_it_is_done` | `a_busy_agent_gets_its_prompt_later_even_when_it_ends_in_done` |
+| `adopt_refuses_panes_without_an_agent_or_already_adopted_before_recording_anything` | `refusals_happen_before_anything_is_created` |
+| `adopt_workspace_without_an_agent_creates_no_project` | `adopt_workspace_refuses_without_an_agent_and_creates_nothing` |
+| `pull_requests_match_the_threads_origin_and_branch_and_notices_name_only_new_commenters` | `origin_normalization_for_the_three_url_forms`, `owner_repo_or_branch_mismatch_ignores_the_pull_request`, `names_are_cut_to_80_characters`, `change_descriptions_name_only_new_commenters` |
+| `saved_machines_resolve_by_id_then_label_then_config_and_refuse_ambiguity` | `target_comes_from_herdr_then_from_config`, `saved_route_selection_matches_id_precedence_and_refuses_ambiguous_or_disabled_profiles` |
+| `recovery_plans_advise_without_retrying_ambiguous_effects_or_releasing_lost_capacity` | `ambiguous_stale_effects_never_become_retry_candidates_or_release_lost_capacity`, `expired_claims_require_expiry_and_pending_adapters_only_receive_advice`, `terminated_binding_plans_without_a_live_observation` |
+| `reconcile_records_pane_evidence_from_what_each_session_lists` | `pane_evidence_distinguishes_absence_unknown_mismatch_and_inconsistent_agents` |
+| `reconcile_records_worktree_evidence_only_from_complete_git_listings` | `worktree_parser_rejects_incomplete_or_duplicate_identity`, `collector_uses_store_provenance_and_never_calls_effect_commands` |
+| `reopen_restores_the_removed_worktree_unless_its_branch_path_or_owner_changed` | `reopen_refuses_changed_branch_replaced_path_and_new_owner` |
+| `canonical_references_keep_the_worktree_but_an_unrelated_binding_does_not` | `canonical_references_block_cleanup_but_unrelated_projects_do_not` |
+| `canonical_references_made_after_removal_block_the_reopen` | `reopen_checks_new_canonical_references_to_the_absent_path` |
+
+Some guarantees look different from the CLI:
+- Reopening is `thread resolve --reopen` followed by `thread restart`; the
+  restart is what adds the worktree back. A path replaced by a dangling
+  symbolic link is refused in both builds, but the state-store build refuses
+  it earlier, while checking canonical references ("dangling alias").
+- The plan builder's own precondition checks (a batch at another head, or
+  one already recorded) have no CLI path: `reconcile --plan` always collects
+  a fresh batch at the current head. They are not covered.
+- The worktree listings that real git never prints (a block both detached
+  and on a branch, two `bare` fields, two `worktree` fields) come from the
+  fake `git`.
+
+Kept: `remote_library_transfer_compares_content_without_following_links`.
+It checks the rsync arguments of `remote::fetch_dir`. Its only caller is
+the ticker's direct remote copy (`thread::copy_home_remote`), which runs
+only without the copy-job queue, that is on non-Linux builds. On Linux,
+where the tests run, remote copies go through the copy jobs and the
+`artifact-stream` helper, so no public entry point reaches `fetch_dir`.
+
+Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
+- Dropping the `ssh://git@github.com/` form from `normalize_origin` failed
+  the pull request test: the thread with that origin got no PR state.
+- Dropping the detached-with-branch refusal from `parse_worktrees` failed the
+  worktree test: that listing became a mismatch instead of unknown.
+- Dropping the socket comparison from `adoptable_agent` failed the refusal
+  test: the same pane id in another session was refused as already adopted.
+- Classifying an ambiguous delivery as a retry candidate failed the recovery
+  plan test.
+- Dropping the reference check from the default build's `cleanup::restore`
+  failed the reopen test: the worktree was reopened under a new owner.

@@ -249,22 +249,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn origin_normalization_for_the_three_url_forms() {
-        for origin in [
-            "https://github.com/Owner/Repo",
-            "https://github.com/Owner/Repo.git",
-            "https://github.com/Owner/Repo/",
-            "git@github.com:Owner/Repo.git",
-            "ssh://git@github.com/Owner/Repo.git",
-        ] {
-            assert_eq!(normalize_origin(origin).as_deref(), Some("owner/repo"), "{origin}");
-        }
-        for bad in ["", "https://gitlab.com/o/r", "git@github.com:o", "https://github.com/o/r/extra"] {
-            assert_eq!(normalize_origin(bad), None, "{bad}");
-        }
-    }
-
     const VIEW: &str = r#"{
         "state":"OPEN","reviewDecision":"APPROVED","headRefName":"hp/demo/t-0001-x",
         "headRepository":{"name":"App"},"headRepositoryOwner":{"login":"Forker"},
@@ -289,30 +273,6 @@ mod tests {
         let stored = serde_json::to_string(&summary).unwrap() + &describe_change(None, &summary);
         assert!(!stored.contains("IGNORE ALL"));
         assert!(!stored.contains('\n') && !stored.contains('\u{7}'));
-    }
-
-    #[test]
-    fn owner_repo_or_branch_mismatch_ignores_the_pull_request() {
-        assert!(matches!(reduce(VIEW, "hp/demo/t-0001-x", "https://github.com/upstream/app").unwrap(), Checked::Ignored(_)));
-        assert!(matches!(reduce(VIEW, "hp/demo/t-0002-y", "git@github.com:forker/app.git").unwrap(), Checked::Ignored(_)));
-        assert!(matches!(reduce(VIEW, "", "git@github.com:forker/app.git").unwrap(), Checked::Ignored(_)));
-        assert!(matches!(reduce(VIEW, "hp/demo/t-0001-x", "").unwrap(), Checked::Ignored(_)));
-    }
-
-    #[test]
-    fn names_are_cut_to_80_characters() {
-        assert_eq!(sanitize(&"x".repeat(200)).len(), 80);
-        assert_eq!(sanitize("a\r\nb\tc"), "abc");
-    }
-
-    #[test]
-    fn change_descriptions_name_only_new_commenters() {
-        let old = Summary { commenters: vec!["alice".into()], comment_count: 1, state: "OPEN".into(), ..Summary::default() };
-        let new = Summary { commenters: vec!["alice".into(), "bob".into()], comment_count: 2, state: "OPEN".into(), ..Summary::default() };
-        let text = describe_change(Some(&old), &new);
-        assert!(text.contains("new commenters: bob"), "{text}");
-        assert!(!text.contains("alice"));
-        assert!(text.contains("2 comment(s)"));
     }
 
     #[test]

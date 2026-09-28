@@ -127,48 +127,6 @@ pub fn run(ctx:&Ctx,project:&Path,apply:bool)->Result<ObservationBatch> {
     Ok(batch)
 }
 
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use herdr_projects::domain::RuntimeIdentity;
-    #[test]
-    fn pane_evidence_distinguishes_absence_unknown_mismatch_and_inconsistent_agents() {
-        let identity=RuntimeIdentity{pane_id:"p".into(),workspace_id:"w".into(),tab_id:"t".into(),cwd:"/cwd".into(),..Default::default()};
-        let pane=Pane{pane_id:"p".into(),workspace_id:"w".into(),tab_id:"t".into(),cwd:"/cwd".into()};
-        let agent=Agent{pane_id:"p".into(),workspace_id:"w".into(),tab_id:"t".into(),cwd:"/cwd".into(),..Default::default()};
-        assert_eq!(pane_state(&identity,&Err("unreachable".into())),(State::Unknown,false));
-        assert_eq!(pane_state(&identity,&Ok((vec![],vec![]))),(State::Absent,false));
-        assert_eq!(pane_state(&identity,&Ok((vec![],vec![agent.clone()]))),(State::Unknown,false));
-        assert_eq!(pane_state(&identity,&Ok((vec![pane.clone(),pane.clone()],vec![]))),(State::Unknown,false));
-        assert_eq!(pane_state(&identity,&Ok((vec![pane.clone()],vec![agent.clone()]))),(State::Present,true));
-        let mut wrong=agent;wrong.workspace_id="wrong".into();assert_eq!(pane_state(&identity,&Ok((vec![pane.clone()],vec![wrong]))),(State::Unknown,false));
-        let mut wrong=pane;wrong.cwd="/other".into();assert_eq!(pane_state(&identity,&Ok((vec![wrong],vec![]))),(State::Mismatch,false));
-    }
-    #[test]
-    fn worktree_parser_rejects_incomplete_or_duplicate_identity() {
-        assert!(parse_worktrees("worktree /a\0branch refs/heads/a\0detached\0\0").is_none());
-        assert!(parse_worktrees("worktree /a\0bare\0bare\0\0").is_none());
-        assert!(parse_worktrees("").is_none());assert!(parse_worktrees("worktree /a\0branch refs/heads/a\0").is_none());
-        assert!(parse_worktrees("worktree /a\0worktree /b\0branch refs/heads/a\0\0").is_none());
-        assert_eq!(parse_worktrees("worktree /a\0HEAD abc\0branch refs/heads/a\0\0").unwrap(),vec![("/a".into(),"refs/heads/a".into())]);
-        assert_eq!(parse_worktrees("worktree /a\0HEAD abc\0detached\0\0").unwrap(),vec![("/a".into(),String::new())]);
-    }
-    #[test]
-    fn collector_uses_store_provenance_and_never_calls_effect_commands() {
-        use crate::{paths::Env,runner::fake::{FakeRunner,ok}};
-        let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let project=crate::project::create(&root,"demo","",vec![]).unwrap();project.set_status(crate::project::Status::Paused).unwrap();
-        std::fs::write(project.dir().join("threads/t-1.toml"),"id='t-1'\nstatus='resolved'\nrepo='/repo'\nbranch='topic'\nworktree_path='/worktree'\n").unwrap();
-        let plan=migration::inspect(&project.dir()).unwrap();migration::apply(&project.dir(),&plan,true).unwrap();
-        std::fs::write(project.dir().join("threads/t-1.toml"),"changed").unwrap();
-        let env=Env::for_test(home.path(),&[]);let runner=FakeRunner::new();runner.on("worktree list",ok("worktree /worktree\0HEAD abc\0branch refs/heads/topic\0\0"));
-        let ctx=Ctx{env:&env,root,config_dir:env.config_dir(),runner:&runner,detached_ticker:false};
-        let batch=run(&ctx,&project.dir(),true).unwrap();assert!(batch.recorded_head.is_some());assert!(!batch.dispatch_allowed);assert_eq!(batch.observations[0].worktree,State::Unknown);assert_eq!(batch.observations[0].pane,State::Unrecorded);
-        assert!(runner.calls.borrow().iter().all(|c|c.display().contains("worktree list")||c.display().contains("rev-parse")));
-        assert_eq!(runtime::snapshot(&project.dir()).unwrap().observations,batch.observations);
-    }
-}
-
 /// Incarnation evidence is local and conservative. Unsupported birth-time metadata
 /// or aliases do not become authority merely because Herdr returned a pane ID.
 pub(crate) fn resource_identity(path:&Path,socket:bool)->Option<herdr_projects::domain::ResourceIdentity> {
