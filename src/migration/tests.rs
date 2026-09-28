@@ -548,31 +548,19 @@ fn runtime_rebind_refuses_active_attempt_and_duplicate_pane_without_partial_muta
     assert!(db.rebind_runtime("thread:t-0001",1,head,&Default::default()).is_err());assert_eq!(db.read_snapshot(None).unwrap(),before);assert!(before.attempts[0].retains_capacity());
 }
 
-#[test]
-fn runtime_rebind_refuses_unselected_lost_attempt_that_retains_capacity() {
-    use crate::domain::{Commit,Mutation,Attempt,AttemptId,AttemptState};
-    let(_temp,project)=fixture();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();
-    let task=before.tasks.iter().find(|t|t.id.as_str()=="legacy-t-0001").unwrap();assert!(task.active_attempt.is_none());
-    let attempt=Attempt{id:AttemptId::new("unselected-lost").unwrap(),task:task.id.clone(),revision:1,state:AttemptState::Lost,snapshot:None,reservation:"retained".into(),termination_observed:false};
-    let head=db.commit(Commit{expected_head:before.head,mutations:vec![Mutation::Attempt{expected:None,next:attempt}]}).unwrap();let before=db.read_snapshot(None).unwrap();
-    assert!(db.rebind_runtime("thread:t-0001",1,head,&new_route()).is_err());assert_eq!(db.read_snapshot(None).unwrap(),before);
-}
-
 fn unrecorded_observations(snapshot:&crate::domain::Snapshot,now:i64)->Vec<crate::reconcile::RuntimeObservation> {
     snapshot.runtime_bindings.iter().map(|b|crate::reconcile::RuntimeObservation{binding:b.id.clone(),binding_revision:b.revision,task_revision:b.task.as_ref().and_then(|id|snapshot.tasks.iter().find(|t|&t.id==id).map(|t|t.revision)),observed_unix_ms:now,pane:crate::reconcile::ResourceState::Unrecorded,worktree:crate::reconcile::ResourceState::Unrecorded,agent_present:false,collector:"herdr-git-v1".into(),config_digest:None,diagnostic:"fixture recorded no resources".into(),..Default::default()}).collect()
 }
+// `reconcile --record` stamps observations with the wall clock, so the 30s
+// freshness window is only reachable with an injected time. Resume gating,
+// config binding and pause fencing are covered end to end in tests/migration.rs.
 #[test]
-fn controller_resume_requires_fresh_evidence_and_pause_fences_epoch() {
+fn controller_resume_rejects_stale_evidence() {
     use crate::domain::ProjectState;
-    let(_temp,project)=fixture();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();assert_eq!(before.control.as_ref().unwrap().state,ProjectState::Paused);
-    assert!(db.set_project_state(before.head,1,ProjectState::Active,100,None).is_err());
+    let(_temp,project)=fixture();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();
     let head=db.record_observations(before.head,&unrecorded_observations(&before,100)).unwrap();
     assert!(db.set_project_state(head,1,ProjectState::Active,30_101,None).is_err());
-    assert!(db.set_project_state(head,1,ProjectState::Active,101,Some(&"a".repeat(64))).is_err());
-    let active=db.set_project_state(head,1,ProjectState::Active,101,None).unwrap();assert!(!active.control.reconciliation_required);db.validate_control_epoch(active.control.epoch,None).unwrap();assert!(db.validate_control_epoch(active.control.epoch,Some(&"b".repeat(64))).is_err());
-    publish_control_marker(&project,&db).unwrap();let marker:Format=serde_json::from_slice(&read(&project.join(".state/format.json")).unwrap()).unwrap();assert!(!marker.reconciliation_required);
-    let paused=db.set_project_state(active.head,active.control.revision,ProjectState::Paused,102,None).unwrap();assert!(paused.control.epoch>active.control.epoch);assert!(db.validate_control_epoch(active.control.epoch,None).is_err());publish_control_marker(&project,&db).unwrap();
-    assert_eq!(read(&project.join(".state/project.json")).unwrap(),br#"{"status":"paused"}"#);
+    db.set_project_state(head,1,ProjectState::Active,101,None).unwrap();
 }
 #[test]
 fn interrupted_controller_marker_publication_recovers_forward() {
@@ -582,44 +570,6 @@ fn interrupted_controller_marker_publication_recovers_forward() {
     assert!(open_active(&project).is_err());recover(&project,true).unwrap();let mut db=open_active(&project).unwrap();assert_eq!(db.read_snapshot(None).unwrap().control,Some(active.control.clone()));
     let route=new_route();let rebound=db.rebind_runtime("thread:t-0001",1,active.head,&route).unwrap();assert!(open_active(&project).is_err());drop(db);recover(&project,true).unwrap();let after=crate::runtime::snapshot(&project).unwrap();assert_eq!(after.head,rebound.head);assert_eq!(after.control.unwrap().state,ProjectState::Paused);
 }
-#[test]
-fn controller_preserves_archived_state_and_retained_attempts_block_admission() {
-    use crate::domain::{ProjectState,Attempt,AttemptId,AttemptState,Commit,Mutation};
-    let(_temp,project)=fixture();fs::write(project.join(".state/project.json"),br#"{"status":"archived"}"#).unwrap();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();assert_eq!(before.control.as_ref().unwrap().state,ProjectState::Archived);assert!(db.set_project_state(before.head,1,ProjectState::Active,100,None).is_err());
-    let paused=db.set_project_state(before.head,1,ProjectState::Paused,100,None).unwrap();let attempt=Attempt{id:AttemptId::new("lost-unselected").unwrap(),task:TaskId::new("legacy-t-0001").unwrap(),revision:1,state:AttemptState::Lost,snapshot:None,reservation:"held".into(),termination_observed:false};let head=db.commit(Commit{expected_head:paused.head,mutations:vec![Mutation::Attempt{expected:None,next:attempt}]}).unwrap();let snapshot=db.read_snapshot(None).unwrap();let head=db.record_observations(head,&unrecorded_observations(&snapshot,100)).unwrap();assert!(db.set_project_state(head,paused.control.revision,ProjectState::Active,101,None).is_err());assert!(db.read_snapshot(None).unwrap().attempts[0].retains_capacity());
-}
-#[test]
-fn retiring_an_ambiguous_intent_does_not_claim_absence_or_release_resources() {
-    let(_temp,project)=receipt_fixture(false);let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();let op=&before.operations[0];
-    let result=db.retire_operation(&op.id,1,before.head,"superseded by operator",100).unwrap();assert_eq!(result.state,crate::operations::DeliveryState::PermanentFailure);assert!(serde_json::to_string(&result.last_outcome).unwrap().contains("effect remains possible"));assert!(db.retire_operation(&op.id,1,before.head,"stale",101).is_err());let after=db.read_snapshot(None).unwrap();assert_eq!(after.tasks,before.tasks);assert_eq!(after.attempts,before.attempts);assert_eq!(after.operations,before.operations);
-}
-
-#[test]
-fn canonical_runtime_creation_preserves_provenance_and_fences_task_and_control() {
-    use crate::domain::{ProjectState,TaskId};
-    let(_temp,project)=fixture();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();let task=TaskId::new("new-task").unwrap();
-    let before=crate::runtime::snapshot(&project).unwrap();crate::runtime::add_task(&project,task.clone(),"new task".into(),before.head).unwrap();
-    let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();let sources=db.imported_sources().unwrap();
-    let head=db.record_observations(before.head,&unrecorded_observations(&before,100)).unwrap();let active=db.set_project_state(head,1,ProjectState::Active,101,None).unwrap();publish_control_marker(&project,&db).unwrap();
-    assert!(db.create_runtime(Some(&task),Some(2),active.head,&Default::default()).is_err());
-    let created=crate::runtime::create_binding(&project,Some(&task),Some(1),active.head,&new_route()).unwrap();assert_eq!(created.binding.id,"task:new-task");assert!(created.binding.source_path.is_none());assert!(created.binding.source_digest.is_none());assert_eq!(created.task_revision,Some(2));
-    let after=crate::runtime::snapshot(&project).unwrap();assert_eq!(after.control.as_ref().unwrap().state,ProjectState::Paused);assert!(after.control.as_ref().unwrap().epoch>active.control.epoch);assert_eq!(db.imported_sources().unwrap(),sources);assert_eq!(after.runtime_bindings.iter().find(|b|b.source_path.is_some()).unwrap(),&before.runtime_bindings[0]);
-    assert!(db.validate_control_epoch(active.control.epoch,None).is_err());assert!(db.create_runtime(Some(&task),Some(2),after.head,&Default::default()).is_err());assert_eq!(db.read_snapshot(None).unwrap(),after);
-    assert!(db.create_runtime(None,None,after.head,&new_route()).is_err());
-    let coordinator=crate::runtime::create_binding(&project,None,None,after.head,&Default::default()).unwrap();assert_eq!(coordinator.binding.id,"coordinator");
-    drop(db);recover(&project,true).unwrap();assert_eq!(crate::runtime::snapshot(&project).unwrap().runtime_bindings.len(),3);assert!(!project.join("threads/new-task.toml").exists());assert!(!project.join(".state/coordinator.json").exists());
-}
-
-#[test]
-fn canonical_runtime_creation_refuses_unselected_retained_attempts() {
-    use crate::domain::{TaskId,Attempt,AttemptId,AttemptState,Commit,Mutation};
-    let(_temp,project)=fixture();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();let task=TaskId::new("new-task").unwrap();
-    let before=crate::runtime::snapshot(&project).unwrap();let head=crate::runtime::add_task(&project,task.clone(),"new".into(),before.head).unwrap();let mut db=open_active(&project).unwrap();
-    let attempt=Attempt{id:AttemptId::new("lost").unwrap(),task:task.clone(),revision:1,state:AttemptState::Lost,snapshot:None,reservation:"held".into(),termination_observed:false};let head=db.commit(Commit{expected_head:head,mutations:vec![Mutation::Attempt{expected:None,next:attempt}]}).unwrap();let before=db.read_snapshot(None).unwrap();
-    assert!(db.create_runtime(Some(&task),Some(1),head,&Default::default()).is_err());assert_eq!(db.read_snapshot(None).unwrap(),before);
-    assert!(db.create_runtime(None,Some(1),head,&Default::default()).is_err());assert!(db.create_runtime(Some(&task),None,head,&Default::default()).is_err());
-}
-
 #[test]
 fn schema8_upgrade_preserves_observation_foreign_keys_and_import_hashes() {
     let(_temp,project)=fixture();let plan=inspect(&project).unwrap();apply(&project,&plan,true).unwrap();let mut db=open_active(&project).unwrap();let before=db.read_snapshot(None).unwrap();db.record_observations(before.head,&unrecorded_observations(&before,100)).unwrap();let before=db.read_snapshot(None).unwrap();drop(db);
@@ -750,74 +700,6 @@ fn pending_review_notice_imports_without_ticker_and_rejects_identity_corruption(
     assert_eq!(db.read_snapshot(None).unwrap().operations,plan.operations);
 }
 
-#[test]
-fn pending_live_projection_refuses_migration_until_exact_stage_recovery() {
-    let (_temp,project)=fixture();let path=project.join("threads/t-0001.toml");
-    let mut value:toml::Value=toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-    value.as_table_mut().unwrap().insert("pending_live_copy".into(),toml::Value::Table(Default::default()));
-    fs::write(&path,toml::to_string(&value).unwrap()).unwrap();
-    assert!(validate_thread(&value).unwrap_err().to_string().contains("pending live projection"));
-    let plan=inspect(&project).unwrap();assert!(plan.blockers.iter().any(|b|b.starts_with("threads/t-0001.toml:")),"{:?}",plan.blockers);
-}
-
-
-#[test]
-fn final_copy_obligations_and_invalid_counters_block_migration() {
-    let (_temp,project)=fixture();let path=project.join("threads/t-0001.toml");
-    let original:toml::Value=toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-    for (field,value) in [("pending_final_copy",toml::Value::Table(Default::default())),("pending_final_notice",toml::Value::Table(Default::default())),("final_copy_sequence",toml::Value::Integer(-1))] {
-        let mut changed=original.clone();changed.as_table_mut().unwrap().insert(field.into(),value);fs::write(&path,toml::to_string(&changed).unwrap()).unwrap();
-        assert!(validate_thread(&changed).is_err());assert!(inspect(&project).unwrap().blockers.iter().any(|b|b.starts_with("threads/t-0001.toml:")));
-    }
-}
-
-#[test]
-fn pending_brief_claims_refuse_migration_but_confirmed_history_is_validated() {
-    let mut value:toml::Value=toml::from_str("id = 't-0001'\nstatus = 'open'\nprompt_sequence = 1\n").unwrap();
-    let claim=crate::prompt_claim::Claim{sequence:1,execution:"a".repeat(64),prompt:"brief".into(),phase:crate::prompt_claim::Phase::Pending,error:String::new(),notified:false};
-    value.as_table_mut().unwrap().insert("prompt_claim".into(),toml::Value::try_from(&claim).unwrap());assert!(validate_thread(&value).is_err());
-    let confirmed=crate::prompt_claim::Claim{phase:crate::prompt_claim::Phase::Confirmed,notified:true,..claim};value["prompt_claim"]=toml::Value::try_from(&confirmed).unwrap();validate_thread(&value).unwrap();
-    value["prompt_claim"]["execution"]=toml::Value::String("invalid".into());assert!(validate_thread(&value).is_err());
-}
-
-#[test]
-fn pending_or_unresolved_launch_claim_requires_reconciliation_before_import() {
-    let mut value:toml::Value=toml::from_str("id='t-0001'\nstatus='open'\nlaunch_sequence=1\n").unwrap();
-    let mut claim=crate::launch_claim::Claim{sequence:1,generation:0,execution:"a".repeat(64),arguments_digest:"b".repeat(64),route_digest:"c".repeat(64),terminal:"terminal".into(),phase:crate::launch_claim::Phase::Pending,error:String::new(),notified:false};
-    value.as_table_mut().unwrap().insert("launch_claim".into(),toml::Value::try_from(&claim).unwrap());assert!(validate_thread(&value).is_err());
-    claim.phase=crate::launch_claim::Phase::Confirmed;claim.notified=true;value["launch_claim"]=toml::Value::try_from(&claim).unwrap();assert!(validate_thread(&value).is_ok());
-    claim.phase=crate::launch_claim::Phase::Uncertain;claim.error="lost acknowledgement".into();value["launch_claim"]=toml::Value::try_from(&claim).unwrap();assert!(validate_thread(&value).is_err());value["status"]="resolved".into();assert!(validate_thread(&value).is_ok());
-}
-
-#[test]
-fn coordinator_prime_import_requires_confirmed_delivery_and_valid_counters() {
-    let mut value=serde_json::json!({"prime_request":1,"prime_sequence":1,"prime_claim":null});
-    assert!(validate_runtime(".state/coordinator.json",&value).is_ok());
-    let mut claim=crate::coordinator_prime::Claim{request:1,delivery:crate::prompt_claim::Claim{sequence:1,execution:"a".repeat(64),prompt:"prime".into(),phase:crate::prompt_claim::Phase::Pending,error:String::new(),notified:false}};
-    value["prime_claim"]=serde_json::to_value(&claim).unwrap();assert!(validate_runtime(".state/coordinator.json",&value).is_err());
-    claim.delivery.phase=crate::prompt_claim::Phase::Uncertain;claim.delivery.error="lost reply".into();claim.delivery.notified=true;
-    value["prime_claim"]=serde_json::to_value(&claim).unwrap();assert!(validate_runtime(".state/coordinator.json",&value).is_err());
-    claim.delivery.phase=crate::prompt_claim::Phase::Confirmed;claim.delivery.error.clear();value["prime_claim"]=serde_json::to_value(&claim).unwrap();assert!(validate_runtime(".state/coordinator.json",&value).is_ok());
-    value["prime_request"]=0.into();assert!(validate_runtime(".state/coordinator.json",&value).is_err());
-}
-#[test]
-fn coordinator_start_import_requires_confirmed_delivery_and_retains_uncertain_history() {
-    let mut value=serde_json::json!({"prime_request":1,"launch_sequence":1,"launch_claim":null});assert!(validate_runtime(".state/coordinator.json",&value).is_ok());
-    let mut claim=crate::launch_claim::Claim{sequence:1,generation:1,execution:"a".repeat(64),arguments_digest:"b".repeat(64),route_digest:"c".repeat(64),terminal:"terminal".into(),phase:crate::launch_claim::Phase::Pending,error:String::new(),notified:false};
-    value["launch_claim"]=serde_json::to_value(&claim).unwrap();assert!(validate_runtime(".state/coordinator.json",&value).is_err());
-    claim.phase=crate::launch_claim::Phase::Confirmed;claim.notified=true;value["launch_claim"]=serde_json::to_value(&claim).unwrap();assert!(validate_runtime(".state/coordinator.json",&value).is_ok());
-    claim.phase=crate::launch_claim::Phase::Uncertain;claim.error="lost reply".into();value["launch_claim"]=serde_json::to_value(&claim).unwrap();assert!(validate_runtime(".state/coordinator.json",&value).is_err());
-    value["prime_request"]=2.into();assert!(validate_runtime(".state/coordinator.json",&value).is_err());
-}
-#[test]
-fn notification_claims_and_suppression_require_reconciliation_before_import() {
-    use crate::notification_claim::{Batch,Claim,Mode,Phase};
-    let mut claim=Claim{sequence:1,batch:Some(Batch::new(vec!["item-a".into()]).unwrap()),mode:Mode::Toast,authority:"a".repeat(64),payload:"fixture".into(),phase:Phase::Pending,retry_of:None,error:String::new()};
-    let mut value=serde_json::json!({"notification_sequence":1,"notification_claim":claim,"notification_suppressed":[]});assert!(validate_runtime(".state/ticker.json",&value).is_err());
-    claim.phase=Phase::Confirmed;value["notification_claim"]=serde_json::to_value(&claim).unwrap();assert!(validate_runtime(".state/ticker.json",&value).is_ok());
-    for phase in [Phase::Uncertain,Phase::NotShown] {claim.phase=phase;claim.error="pending delivery".into();value["notification_claim"]=serde_json::to_value(&claim).unwrap();assert!(validate_runtime(".state/ticker.json",&value).is_err());}
-    claim.phase=Phase::Suppressed;value["notification_claim"]=serde_json::to_value(&claim).unwrap();assert!(validate_runtime(".state/ticker.json",&value).is_ok());value["notification_suppressed"]=serde_json::json!(["item-a"]);assert!(validate_runtime(".state/ticker.json",&value).is_err());
-}
 #[test]
 fn restore_into_a_new_root_and_deleting_the_ownership_marker_is_not_rollback() {
     let (temp,project)=fixture(); let plan=inspect(&project).unwrap(); apply(&project,&plan,true).unwrap();

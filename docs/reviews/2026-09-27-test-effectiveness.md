@@ -731,3 +731,39 @@ Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
   "adopted agent matched without its name".
 - Inlining memory past the 32,000-character cap failed the brief assertions in
   the start/restart workflow.
+
+## Migration unit tests replaced by E2E workflows
+
+The audit marked 13 `src/migration/tests.rs` tests REPLACE. Twelve were
+deleted after `tests/migration.rs` covered their guarantees through the compiled
+CLI over a CLI-created legacy project: `migration inspect/plan/apply/recover/
+status`, `reconcile --record`, `runtime state/admission/rebind/create`,
+`task add/list` and `operations retire`. Legacy claim records are serialized
+from the public claim types; lost attempts that retain capacity are committed
+with the public store API because no operator verb records them.
+
+| New E2E test | Replaced unit tests |
+| --- | --- |
+| `legacy_records_with_unreconciled_effects_block_migration_until_resolved` | `pending_live_projection_refuses_migration_until_exact_stage_recovery`, `final_copy_obligations_and_invalid_counters_block_migration`, `pending_brief_claims_refuse_migration_but_confirmed_history_is_validated`, `pending_or_unresolved_launch_claim_requires_reconciliation_before_import`, `coordinator_prime_import_requires_confirmed_delivery_and_valid_counters`, `coordinator_start_import_requires_confirmed_delivery_and_retains_uncertain_history`, `notification_claims_and_suppression_require_reconciliation_before_import` |
+| `migrated_project_resumes_only_with_matching_evidence_and_pause_fences_the_epoch` | most of `controller_resume_requires_fresh_evidence_and_pause_fences_epoch` (see below) |
+| `archived_projects_and_retained_attempts_refuse_resume_rebind_and_binding_creation` | `controller_preserves_archived_state_and_retained_attempts_block_admission`, `runtime_rebind_refuses_unselected_lost_attempt_that_retains_capacity`, `canonical_runtime_creation_refuses_unselected_retained_attempts` |
+| `canonical_bindings_created_after_resume_keep_imported_provenance_and_repause` | `canonical_runtime_creation_preserves_provenance_and_fences_task_and_control` |
+| `retiring_an_imported_ambiguous_finalization_keeps_the_effect_possible` | `retiring_an_ambiguous_intent_does_not_claim_absence_or_release_resources` |
+
+The blocker table asserts exactly which record paths `migration inspect`
+refuses, since per-record causes are reported only as "invalid or unsupported
+record"; each refused fixture differs from an accepted sibling by one field.
+Evidence recorded under one config no longer authorizes resume after the config
+changes, which the unit test expressed as a digest argument.
+
+Kept, trimmed to `controller_resume_rejects_stale_evidence`: `reconcile
+--record` stamps observations with the wall clock, so the 30 s freshness window
+is only reachable with an injected time.
+
+Mutation check, each restored byte-for-byte afterwards:
+- Dropping `claim.generation<=request` from the coordinator start rule made the
+  blocker-table test fail (a generation-2 start was accepted).
+- Dropping the observation `config_digest` match from resume blockers made the
+  resume test fail (resume succeeded after the config changed).
+- Dropping the retained-attempt check from `create_runtime` made the archived
+  test fail (a binding was created for a task holding a lost attempt).
