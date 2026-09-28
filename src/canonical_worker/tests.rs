@@ -221,7 +221,17 @@ elif r['method']=='pane.send_input' and stock and r['params']['text'].startswith
  # Stock Herdr 0.9.1 types a trailing newline without submitting it; only an
  # Enter key runs the line.
  if r['params'].get('keys')==['Enter'] and '\n' not in r['params']['text']:
-  with open(root/'exec-requests','a') as f:f.write(r['params']['text']+'\n')
+  # Publish the whole line at once, and acknowledge it only after the pane's
+  # shell has read it, so the launch cannot give up and remove its spec first.
+  request_path=root/'exec-requests'
+  previous=request_path.read_text() if request_path.exists() else ''
+  pending=root/'exec-requests.pending'
+  pending.write_text(previous+r['params']['text']+'\n')
+  pending.replace(request_path)
+  deadline=time.monotonic()+3
+  while not (root/'exec-read').exists():
+   if time.monotonic()>deadline:sys.exit(3)
+   time.sleep(0.01)
  result={{'type':'ok'}}
 elif r['method']=='pane.send_input':
  request_path=root/'gate-requests'
@@ -4585,6 +4595,8 @@ fn stock_shell(root: &Path, done: &std::sync::atomic::AtomicBool, execute: bool,
     let spec = Path::new(words[3]);
     assert_eq!(fs::metadata(spec).unwrap().permissions().mode() & 0o777, 0o600);
     if tamper { fs::set_permissions(spec, fs::Permissions::from_mode(0o644)).unwrap(); }
+    // Herdr acknowledges the input only now.
+    fs::write(root.join("exec-read"), b"").unwrap();
     if !execute { return None; }
     let mut shell = Worker(std::process::Command::new(words[1])
         .args(["--exact", "canonical_worker::tests::stock_shell_exec_helper", "--nocapture"])

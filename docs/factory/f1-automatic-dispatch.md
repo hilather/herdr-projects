@@ -280,9 +280,14 @@ Recorded here rather than folded into the card that found them.
   refused) cases of
   `ticker_auto_integrates_two_results_serially_and_recovers_stale_and_crash`.
 - **`stock_herdr_unconfirmed_launch_closes_its_workspace_and_counts_nothing`
-  failed once** (exec-path check in the stock shell stand-in), then passed
-  repeatedly. Investigate the stand-in's timing before it becomes a regular
-  flake.
+  failed once** (exec-line check in the stock shell stand-in) — done (this
+  PR). The fake Herdr appended `exec-requests` with `open('a')`, so the
+  stand-in could see the file before its line was written and read it empty
+  (reproduced under CPU load). The fake now publishes the file by rename and
+  acknowledges the typed line only after the stand-in has read it and checked
+  the spec, so the launch cannot give up and remove the spec first. Under
+  heavy artificial load the product's own 10 s launch budget can still run
+  out before the workspace close; that is the budget, not the stand-in.
 - **Periodic integrity check limits** (open-check PR): it runs inline in the
   ticker pass with a 30 s budget, so a very large store may never finish a
   check; move it to a background lane or make it incremental. A failure pauses
