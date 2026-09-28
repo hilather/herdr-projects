@@ -132,6 +132,11 @@ fn hold_open() {
 /// A popup's body. Errors are printed and the popup is held open, so the user
 /// can read them before it closes.
 pub fn run_pane(ctx: &Ctx, id: &str) -> Result<()> {
+    if id == "fleet" {
+        fleet(ctx);
+        hold_open();
+        return Ok(());
+    }
     let handoff = match handoff::consume(ctx, id) {
         Ok(handoff) => handoff,
         Err(error) => { println!("error: {error:#}"); hold_open(); return Err(error); }
@@ -172,6 +177,36 @@ pub fn run_pane(ctx: &Ctx, id: &str) -> Result<()> {
     }
     hold_open();
     result
+}
+
+/// Read-only fleet view (telemetry S7): the project of the invoking workspace
+/// (or of an optional handoff), else every project with a canonical store.
+/// Writes nothing: a handoff is consumed only when one was passed.
+fn fleet(ctx: &Ctx) {
+    #[cfg(not(feature = "state-store"))]
+    { let _ = ctx; println!("fleet panel unavailable: this build lacks the `state-store` feature; rebuild with `cargo build --release --locked --features state-store`"); }
+    #[cfg(feature = "state-store")]
+    {
+        let handoff = ctx.env.var(handoff::ENV).map(|_| handoff::consume(ctx, "fleet"));
+        let slug = match handoff {
+            Some(Err(error)) => { println!("error: {error:#}"); return; }
+            Some(Ok(handoff)) if !handoff.slug.is_empty() => Some(handoff.slug),
+            _ => current_slug(ctx),
+        };
+        let now = jiff::Timestamp::now();
+        for slug in slug.map_or_else(|| project::list_slugs(&ctx.root), |slug| vec![slug]) {
+            let dir = ctx.root.join(&slug);
+            println!("── {slug} · fleet · as of {} ──", now.strftime("%Y-%m-%d %H:%M:%S UTC"));
+            if !dir.join(".state/state.db").is_file() {
+                println!("no canonical store; telemetry n/a\n");
+                continue;
+            }
+            match herdr_projects::telemetry::panel::render(&dir, now.as_millisecond()) {
+                Ok(text) => println!("{text}"),
+                Err(error) => println!("error: {error:#}\n"),
+            }
+        }
+    }
 }
 
 #[cfg(test)]

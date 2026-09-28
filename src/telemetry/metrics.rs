@@ -1,8 +1,8 @@
 //! Contracts §6 metric subset: a read-only report over `state.db` and the
 //! sidecar. Unknown is never 0: a ratio with an empty denominator is `null`
 //! with `empty_denominator`; a value without a source is `unavailable`.
-use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use anyhow::Result;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -32,8 +32,7 @@ fn ratio(id: &str, numerator: usize, denominator: usize, extra: Value) -> Value 
 /// `herdr-projects telemetry <slug> report`. `since` bounds the activity window (Unix ms).
 pub fn report(project: &Path, since: Option<i64>) -> Result<Value> {
     let path = project.join(".state/state.db");
-    let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW)
-        .with_context(|| format!("open {}", path.display()))?;
+    let db = super::read_only(&path)?;
     let table = |name: &str| db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [name], |r| r.get::<_, bool>(0));
     let decided = if table("dispatch_decisions")? { "(SELECT decided_unix_ms FROM dispatch_decisions d WHERE d.attempt_id=a.id)" } else { "NULL" };
     let attempts: Vec<Attempt> = db.prepare(&format!("SELECT a.id,a.task_id,a.state,json_extract(i.payload,'$.inputs.effective_profile.kind'),

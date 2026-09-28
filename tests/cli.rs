@@ -4969,3 +4969,103 @@ fn rejected_reservation_writes_no_decision() {
     assert!(launch("reserve",head()).status.success());
     assert_eq!(counts(),(1,1));
 }
+
+/// A canonical store planted row by row: t1 failed (one failed attempt); t2
+/// running with attempt t2-a1 decided on a `codex 0.154.0` configuration and
+/// reserved 90.5 s ago; t3 queued with attempt t3-a1 that predates both logs.
+#[cfg(all(feature="state-store",target_os="linux"))]
+fn fleet_fixture() -> (tempfile::TempDir, String, i64) {
+    let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let project=root.join("demo");
+    std::fs::create_dir_all(project.join(".state")).unwrap();std::fs::write(project.join("PROJECT.md"),"# demo\n").unwrap();std::fs::write(project.join(".state/format.json"),r#"{"memory":"sqlite-v1","runtime":"sqlite-v1"}"#).unwrap();let db_path=project.join(".state/state.db");
+    drop(herdr_projects::store::SqliteStore::create(&db_path).unwrap());
+    let db=rusqlite::Connection::open(&db_path).unwrap();db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    let now=jiff::Timestamp::now().as_millisecond();let config=format!("sha256:{}","c".repeat(64));
+    for (task,state,attempt,attempt_state,done) in [("t1","failed","t1-a1","failed",1),("t2","running","t2-a1","running",0),("t3","queued","t3-a1","reserved",0)] {
+        db.execute("INSERT INTO tasks(id,revision,state,title) VALUES(?1,1,?2,?1)",[task,state]).unwrap();
+        db.execute("INSERT INTO attempts(id,task_id,revision,state,reservation,termination_observed) VALUES(?1,?2,1,?3,?1,?4)",rusqlite::params![attempt,task,attempt_state,done]).unwrap();
+    }
+    db.execute("INSERT INTO agent_configurations(configuration_id,canonical_json,first_decided_unix_ms) VALUES(?1,'{\"agent_version\":\"0.154.0\",\"kind\":\"codex\"}',?2)",rusqlite::params![config,now-90_500]).unwrap();
+    db.execute("INSERT INTO dispatch_decisions(attempt_id,task_id,task_revision,chosen_configuration_id,eligible,chooser_kind,chooser_principal,reason_codes,decided_unix_ms)
+        VALUES('t2-a1','t2',1,?1,json_array(?1),'operator','owner','[\"operator_preference\"]',?2)",rusqlite::params![config,now-90_500]).unwrap();
+    for (state,at) in [("reserved",now-90_500),("launching",now-80_000),("running",now-70_000)] {
+        db.execute("INSERT INTO attempt_lifecycle(attempt_id,state,attempt_revision,unix_ms,source) VALUES('t2-a1',?1,1,?2,'fixture')",rusqlite::params![state,at]).unwrap();
+    }
+    drop(db);
+    let r=root.to_str().unwrap().to_owned();(home,r,now-90_500)
+}
+
+/// Every file under `dir` with its length and modification time.
+#[cfg(all(feature="state-store",target_os="linux"))]
+fn tree(dir:&Path)->Vec<(std::path::PathBuf,u64,std::time::SystemTime)> {
+    let mut out=Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path=entry.unwrap().path();let meta=std::fs::symlink_metadata(&path).unwrap();
+        if meta.is_dir() {out.extend(tree(&path));} else {out.push((path,meta.len(),meta.modified().unwrap()));}
+    }
+    out.sort();out
+}
+
+#[cfg(all(feature="state-store",target_os="linux"))]
+#[test]
+fn fleet_text_matches_report_json() {
+    let (home,r,decided)=fleet_fixture();
+    // A sidecar with nothing collected: no Codex home, so no rollout is ever read.
+    assert!(hp(home.path(),&["--root",&r,"telemetry","demo","collect"]).status.success());
+    let out=hp(home.path(),&["--root",&r,"telemetry","demo","report","--json"]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let report:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["tasks"],serde_json::json!({"accepted":0,"open":2,"succeeded_without_evidence":0,"terminal":1}));
+    assert_eq!((&report["metrics"]["M02"]["value"],&report["metrics"]["M07"]["reason"],&report["metrics"]["M13"]["reason"]),(&"0/1".into(),&"empty_denominator".into(),&"empty_denominator".into()));
+    assert_eq!(report["metrics"]["M40"]["decisions"],serde_json::json!([{"attempt_id":"t2-a1","decided_unix_ms":decided,"value":{"reason":"no_observation","status":"unavailable"}}]));
+    let out=hp(home.path(),&["--root",&r,"pane","fleet"]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let text=String::from_utf8(out.stdout).unwrap();
+    let line=|prefix:&str|text.lines().find(|l|l.starts_with(prefix)).unwrap_or_else(||panic!("no `{prefix}` in {text}")).to_owned();
+    assert_eq!(line("M02 "),"M02 task_acceptance_rate 0/1");
+    for (id,metric) in report["metrics"].as_object().unwrap() {
+        let shown=line(&format!("{id} "));
+        let expected=match (&metric["value"],metric["decisions"].as_array()) {
+            (_,Some(decisions))=>format!("n/a ({})",decisions[0]["value"]["reason"].as_str().unwrap()),
+            (serde_json::Value::String(value),_)=>value.clone(),
+            (serde_json::Value::Null,_)=>format!("n/a ({})",metric["reason"].as_str().unwrap()),
+            (value,_)=>format!("n/a ({})",value["reason"].as_str().unwrap()),
+        };
+        assert!(shown.ends_with(&expected),"{shown} != {expected}");
+        if expected.starts_with("n/a") {assert!(!shown.split_whitespace().any(|w|w=="0"),"unavailable must not read 0: {shown}");}
+    }
+    assert_eq!(line("tasks "),"tasks terminal=1 accepted=0 open=2 succeeded_without_evidence=0");
+    assert!(line("usage: ").contains("last collect n/a (no_rollouts)"),"{text}");
+    let active=line("t2-a1 ");
+    assert!(active.contains("t2 codex 0.154.0 running elapsed 1m3")&&active.ends_with("usage n/a (not_bound)"),"{active}");
+    assert_eq!(line("t3-a1 "),"t3-a1 t3 n/a (predates_dispatch_log) reserved elapsed n/a (predates_lifecycle_log) usage n/a (not_bound)");
+    assert!(!text.contains("t1-a1"),"terminal attempts are not active: {text}");
+    let doctor=String::from_utf8(hp(home.path(),&["--root",&r,"doctor"]).stdout).unwrap();
+    assert!(doctor.contains("[ok  ] project demo: telemetry: sidecar present; last collect n/a (no_rollouts)\n"),"{doctor}");
+}
+
+#[cfg(all(feature="state-store",target_os="linux"))]
+#[test]
+fn fleet_without_sidecar_says_unavailable() {
+    let (home,r,_)=fleet_fixture();
+    let before=tree(home.path());
+    let out=hp(home.path(),&["--root",&r,"pane","fleet"]);
+    assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let text=String::from_utf8(out.stdout).unwrap();
+    assert!(text.lines().any(|l|l=="usage: collection not run (no telemetry sidecar)"),"{text}");
+    assert!(text.lines().any(|l|l.starts_with("t2-a1 t2 codex 0.154.0 running elapsed ")&&l.ends_with(" usage n/a (collection_not_run)")),"{text}");
+    assert!(text.lines().any(|l|l=="M13 usage_coverage n/a (collection_not_run)"),"{text}");
+    assert!(text.lines().any(|l|l=="M08 input_tokens n/a (no_certified_source)"),"{text}");
+    assert_eq!(tree(home.path()),before,"the panel writes nothing");
+    let doctor=String::from_utf8(hp(home.path(),&["--root",&r,"doctor"]).stdout).unwrap();
+    assert!(doctor.contains("[ok  ] project demo: telemetry: collection not run (no telemetry sidecar)\n"),"{doctor}");
+}
+
+#[cfg(not(feature="state-store"))]
+#[test]
+fn fleet_without_state_store_says_so() {
+    let home=tempfile::tempdir().unwrap();let root=home.path().join("root");
+    let out=hp(home.path(),&["--root",root.to_str().unwrap(),"pane","fleet"]);
+    assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("fleet panel unavailable: this build lacks the `state-store` feature"));
+    assert!(!root.exists());
+    let doctor=String::from_utf8(hp(home.path(),&["--root",root.to_str().unwrap(),"doctor"]).stdout).unwrap();
+    assert!(doctor.contains("[warn] telemetry: fleet panel unavailable: this build lacks `state-store`"),"{doctor}");
+}

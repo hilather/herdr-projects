@@ -200,6 +200,8 @@ fn report(
             "does not exist yet; `new` creates it".into(),
         );
     }
+    #[cfg(not(feature = "state-store"))]
+    check(&mut out, None, "telemetry", "fleet panel unavailable: this build lacks `state-store`; rebuild with `cargo build --release --locked --features state-store`".into());
 
     match crate::ticker::lock_state(root) {
         crate::ticker::LockState::Free => check(&mut out, None, "ticker", "not running".into()),
@@ -280,6 +282,11 @@ fn report(
                         Err(error) if matches!(error.downcast_ref(), Some(herdr_projects::store::StoreError::Corrupt(_))) => check(&mut out, Some(false), &label,
                             format!("store integrity: corrupt; last periodic check {last}; preserve the store and restore it, never auto-repair")),
                         Err(_) => {},
+                    }
+                    // Telemetry S7: sidecar presence and last collect age, read-only.
+                    match herdr_projects::telemetry::panel::collection(&dir, jiff::Timestamp::now().as_millisecond()) {
+                        Ok(line) => check(&mut out, Some(true), &label, format!("telemetry: {line}")),
+                        Err(error) => check(&mut out, None, &label, format!("telemetry: sidecar unreadable: {error:#}")),
                     }
                 }
                 if memory == "sqlite-v1" {

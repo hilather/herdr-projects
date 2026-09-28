@@ -88,3 +88,9 @@ id = "adopt"
 title = "Continue as a project"
 placement = "popup"
 command = ["target/release/herdr-projects", "pane", "adopt"]
+
+[[panes]]
+id = "fleet"
+title = "Projects: fleet"
+placement = "popup"
+command = ["target/release/herdr-projects", "pane", "fleet"]

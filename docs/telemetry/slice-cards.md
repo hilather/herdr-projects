@@ -163,6 +163,16 @@ Stop if a metric needs a field not in contracts §5.
 
 ## S7 — Basic workspace panel
 
+**Done.** `pane fleet` (popup, no handoff needed) renders the project of the
+invoking workspace, else every project with a canonical store: collection
+header, the S6 text report, then active attempts (`<kind> <agent_version>`,
+attempt state, elapsed since the `reserved` mark, usage or `n/a (<reason>)`).
+Stores are opened read-only without creating SQLite side files (`immutable`
+when no `-wal` exists; the S6 report uses the same open). `doctor` prints
+`telemetry: <sidecar presence; last collect age>` per store (last collect =
+newest `collect_offsets.updated_unix_ms`, i.e. last ingest); the default build
+says the panel needs `state-store` and doctor warns. No action opens the pane.
+
 Goal: read-only `pane fleet` popup (`herdr-plugin.toml` `[[panes]] id =
 "fleet"`, `placement = "popup"`, command `target/release/herdr-projects pane
 fleet`, dispatched by `src/actions.rs` `run_pane`) showing the S6 text report
