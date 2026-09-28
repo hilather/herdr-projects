@@ -79,6 +79,9 @@ and `herdr-projects telemetry <slug> attempts [--json]`. Files:
 `src/store/launch.rs`, `src/store/worker_brief.rs`,
 `src/store/worker_termination.rs`, `src/store/worktrees.rs`;
 `src/telemetry/outcome.rs`; `src/cli.rs`. Tests (`vertical_slice` extensions):
+(A task whose attempt was cancelled cannot be re-queued through the public
+CLI; tests needing a second attempt reset the task as S1's
+`second_attempt_reuses_classification` does.)
 - `outcome_success_path` — four marks in order; `candidate_oid` = submitted
   commit; `accepted`/`integrated`/`accepted = true`; Claude fixture →
   `usage: unavailable adapter_absent`; `attention_not_collected`.

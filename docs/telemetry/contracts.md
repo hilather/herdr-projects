@@ -64,6 +64,12 @@ Record: `classification_id` (digest of the canonical record without the ID),
 Reclassification appends a revision with a reason; analysis uses revision 1.
 Coordinator/operator classification and agreement sampling are deferred.
 
+S1 refinements: a task with no contract stores `route`, `write_paths`,
+`uncertain_write_paths` and `write_named_resources` as `unavailable:
+no_contract`, never 0, and its band is `unknown`. Classes `docs` and `tests`
+require at least one write path, so a contract that only writes a named
+resource is not `docs`.
+
 ## 2. AgentConfiguration
 
 Content-addressed comparison arm derived from the attempt's `FrozenProfile`
