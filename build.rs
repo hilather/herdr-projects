@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // The build script holds no execution locks.
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 

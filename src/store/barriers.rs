@@ -936,6 +936,7 @@ fn load_brief(db: &Connection, brief_id: &str) -> Result<Option<StaleBrief>> {
 
 #[cfg(test)]
 pub(super) mod tests {
+    use crate::execution_guard::GatedSpawn;
     use super::*;
 
     fn head_of(db: &SqliteStore) -> u64 {
@@ -2302,7 +2303,7 @@ pub(super) mod tests {
         fs::write(project.join("MEMORY.md"), "").unwrap();
         fs::write(project.join(".state/project.json"), r#"{"status":"paused"}"#).unwrap();
         let key = dir.path().join("owner");
-        assert!(Command::new("/usr/bin/ssh-keygen").args(["-q","-t","ed25519","-N","","-f"]).arg(&key).status().unwrap().success());
+        assert!(Command::new("/usr/bin/ssh-keygen").args(["-q","-t","ed25519","-N","","-f"]).arg(&key).status_gated().unwrap().success());
         let public = fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
         let config = dir.path().join("owner.toml");
         fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n")).unwrap();
@@ -2336,7 +2337,7 @@ pub(super) mod tests {
         let bytes = serde_json::to_vec(&document).unwrap();
         fs::write(&path, &bytes).unwrap();
         for namespace in [crate::authority::SIGNATURE_NAMESPACE, crate::authority::BARRIER_RELEASE_SIGNATURE_NAMESPACE] {
-            let output = Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&key).args(["-n",namespace]).arg(&path).output().unwrap();
+            let output = Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&key).args(["-n",namespace]).arg(&path).output_gated().unwrap();
             assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
             let result = crate::authority::release_memory_barrier(&project, &path, &signature, document.expected_head);
             if namespace == crate::authority::SIGNATURE_NAMESPACE {

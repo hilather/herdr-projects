@@ -131,6 +131,7 @@ fn request_with_route(ctx:&Ctx,project:&Project,t:&Thread,remote:Option<Remote>,
 
 #[cfg(all(test,target_os="linux"))]
 mod tests {
+    use herdr_projects::execution_guard::GatedSpawn;
     use super::*;
     use std::{fs,os::unix::{fs::PermissionsExt,net::UnixListener}};
     struct Fixture {root:tempfile::TempDir,project:Project,t:Thread,input:Input,_listener:UnixListener}
@@ -255,7 +256,7 @@ mod tests {
         if std::env::var_os(CHILD).is_none() {
             let bin=tempfile::tempdir().unwrap();let ssh=bin.path().join("ssh");
             fs::write(&ssh,"#!/usr/bin/python3\nimport subprocess,sys\nassert sys.argv[1:4] == ['-T','-o','StrictHostKeyChecking=yes']\nassert sys.argv[-2] == 'fixture.invalid'\nsys.exit(subprocess.call(sys.argv[-1],shell=True))\n").unwrap();fs::set_permissions(&ssh,fs::Permissions::from_mode(0o700)).unwrap();
-            let result=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","brief_jobs::tests::remote_sender_uses_frozen_bridge_and_recovers_without_replay","--nocapture"]).env(CHILD,"1").env("PATH",format!("{}:/usr/bin:/bin",bin.path().display())).output().unwrap();
+            let result=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","brief_jobs::tests::remote_sender_uses_frozen_bridge_and_recovers_without_replay","--nocapture"]).env(CHILD,"1").env("PATH",format!("{}:/usr/bin:/bin",bin.path().display())).output_gated().unwrap();
             assert!(result.status.success(),"{}\n{}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));return;
         }
         fn fixture(mode:&str)->Fixture {

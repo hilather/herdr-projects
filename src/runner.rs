@@ -28,10 +28,10 @@ pub const CAPTURE_LIMIT: usize = 1024 * 1024;
 /// Sealed ownership handle. Only trusted library ingress can arrange an
 /// inherited lock; ordinary command descriptions cannot name arbitrary FDs.
 #[derive(Debug,Clone)]
-pub struct InheritedLock(Arc<std::fs::File>);
+pub struct InheritedLock(Arc<crate::execution_guard::TransferredFile>);
 impl PartialEq for InheritedLock {fn eq(&self,other:&Self)->bool {Arc::ptr_eq(&self.0,&other.0)}}
 impl InheritedLock {
-    pub(crate) fn new(file:std::fs::File)->Self {Self(Arc::new(file))}
+    pub(crate) fn new(file:crate::execution_guard::TransferredFile)->Self {Self(Arc::new(file))}
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -246,7 +246,8 @@ impl Runner for RealRunner {
 
         // Duplicate above stdio, leaving every parent descriptor CLOEXEC.
         // Clearing it only in this child's pre_exec avoids leaking ownership
-        // through a concurrent spawn in another executor worker.
+        // through a concurrent spawn in another executor worker. These copies
+        // close ungated: `cmd` keeps a gated copy alive until they are gone.
         anyhow::ensure!(cmd.inherited_locks.len()<=16,"too many inherited execution locks");
         let inherited=cmd.inherited_locks.iter().map(|lock|->io::Result<std::fs::File>{
             use std::os::fd::FromRawFd;
@@ -267,8 +268,7 @@ impl Runner for RealRunner {
             });}
         }
 
-        let mut child = command
-            .spawn()
+        let mut child = crate::execution_guard::GatedSpawn::spawn_gated(&mut command)
             .with_context(|| format!("could not run `{}`", cmd.program))?;
 
         let result = collect(&mut child, cmd, started);

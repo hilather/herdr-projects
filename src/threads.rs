@@ -796,6 +796,7 @@ pub fn print_show(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use herdr_projects::execution_guard::GatedSpawn;
     use super::*;
 
     fn now() -> jiff::Timestamp {
@@ -902,7 +903,7 @@ mod tests {
     #[test]
     fn exclude_is_added_once() {
         let repo = tempfile::tempdir().unwrap();
-        let run = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(repo.path()).args(args).output().unwrap();
+        let run = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(repo.path()).args(args).output_gated().unwrap();
         run(&["init", "-q"]);
         let cwd = repo.path().to_string_lossy().into_owned();
         exclude_from_git(&crate::runner::RealRunner, &cwd).unwrap();

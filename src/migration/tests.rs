@@ -1,3 +1,4 @@
+use crate::execution_guard::GatedSpawn;
 use super::*;
 use tempfile::TempDir;
 fn fixture()->(TempDir,std::path::PathBuf) {
@@ -151,7 +152,7 @@ fn killed_process_recovers_at_each_durable_journal_phase() {
     for phase in ["Prepared","Imported","Verified","CutoverPending","Active"] {
         let (temp,project)=fixture();
         let mut child=Command::new(std::env::current_exe().unwrap()).args(["--exact","migration::tests::crash_child","--nocapture"])
-            .env("HP_MIGRATION_CRASH_ROOT",temp.path()).env("HP_MIGRATION_CRASH_PHASE",phase).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn().unwrap();
+            .env("HP_MIGRATION_CRASH_ROOT",temp.path()).env("HP_MIGRATION_CRASH_PHASE",phase).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn_gated().unwrap();
         let deadline=Instant::now()+Duration::from_secs(10);
         while !temp.path().join("crash-ready").exists() {
             if Instant::now()>deadline||child.try_wait().unwrap().is_some(){let _=child.kill();let _=child.wait();panic!("child did not reach {phase}");}

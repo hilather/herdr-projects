@@ -332,6 +332,7 @@ pub fn fetch_dir(runner: &dyn Runner, target: &str, remote_dir: &str, local_dir:
 
 #[cfg(test)]
 mod tests {
+    use herdr_projects::execution_guard::GatedSpawn;
     use super::*;
     use crate::runner::RealRunner;
     use crate::runner::fake::{FakeRunner, fail, ok};
@@ -365,7 +366,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("it's a $(repo)");
         std::fs::create_dir(&repo).unwrap();
-        std::process::Command::new("git").arg("-C").arg(&repo).args(["init", "-q"]).output().unwrap();
+        std::process::Command::new("git").arg("-C").arg(&repo).args(["init", "-q"]).output_gated().unwrap();
         let cwd = repo.to_string_lossy().into_owned();
         let dir = format!("{cwd}/.herdr-project/demo-t-0001");
         let runner = FakeRunner::new();

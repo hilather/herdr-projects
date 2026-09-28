@@ -4,24 +4,69 @@
 //! lock in place, and never take an exclusive root guard while holding one.
 //! A `CheckGuard` keeps only the root and one fence; it releases the fence
 //! before taking project ownership again.
-use std::{fs::{File,OpenOptions},os::unix::fs::{DirBuilderExt,OpenOptionsExt,MetadataExt},path::{Path,PathBuf},sync::atomic::{AtomicBool,Ordering}};
+use std::{fs::{File,OpenOptions},mem::ManuallyDrop,os::{fd::{AsRawFd,RawFd},unix::fs::{DirBuilderExt,OpenOptionsExt,MetadataExt}},path::{Path,PathBuf},
+    process::{Child,Command,ExitStatus,Output,Stdio},sync::{PoisonError,RwLock,atomic::{AtomicBool,Ordering}}};
 use anyhow::{Result,Context,ensure};
 use serde::{Deserialize,Serialize};
 use sha2::{Digest,Sha256};
 
+/// Process creation and the close of a transferred lock exclude each other.
+/// A child forked by any thread holds a copy of every descriptor until it
+/// execs (CLOEXEC then closes it), and a flock belongs to the open file
+/// description, so closing the parent's last copy of a transferred lock while
+/// another thread is between fork and exec would leave that child holding it.
+/// Every spawn in this crate goes through [`GatedSpawn`], which holds the gate
+/// shared only until the child has exec'd; closing a transferred copy holds it
+/// exclusively. Clippy's `disallowed-methods` refuses the ungated calls.
+static SPAWN_GATE:RwLock<()>=RwLock::new(());
+
+/// Spawning through the gate. `output_gated` pipes stdout and stderr and
+/// closes stdin, as `Command::output` does by default.
+pub trait GatedSpawn {
+    fn spawn_gated(&mut self)->std::io::Result<Child>;
+    fn status_gated(&mut self)->std::io::Result<ExitStatus> {self.spawn_gated()?.wait()}
+    fn output_gated(&mut self)->std::io::Result<Output>;
+}
+impl GatedSpawn for Command {
+    #[allow(clippy::disallowed_methods)]
+    fn spawn_gated(&mut self)->std::io::Result<Child> {
+        // std returns from spawn only after the child has exec'd or failed.
+        let _gate=SPAWN_GATE.read().unwrap_or_else(PoisonError::into_inner);self.spawn()
+    }
+    fn output_gated(&mut self)->std::io::Result<Output> {
+        self.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn_gated()?.wait_with_output()
+    }
+}
+/// Close a descriptor of a transferred lock while no fork awaits exec.
+fn close_transferred(file:File) {let _gate=SPAWN_GATE.write().unwrap_or_else(PoisonError::into_inner);drop(file);}
+
+/// One copy of a transferred lock's description, closed through the gate.
+#[derive(Debug)]
+pub(crate) struct TransferredFile(ManuallyDrop<File>);
+impl AsRawFd for TransferredFile {fn as_raw_fd(&self)->RawFd {self.0.as_raw_fd()}}
+impl Drop for TransferredFile {
+    // SAFETY: the file is taken once, here, and never used again.
+    fn drop(&mut self) {close_transferred(unsafe{ManuallyDrop::take(&mut self.0)})}
+}
+
 /// A held lock. Dropping it unlocks explicitly: a child forked by any thread
 /// shares the open file description until it execs, so merely closing the
 /// descriptor would leave the lock held for that window. A lock transferred to
-/// a supervisor must outlive this handle, so it is never unlocked here.
-pub(crate) struct LockFile {file:File,transferred:AtomicBool}
+/// a supervisor must outlive this handle, so it is never unlocked here; its
+/// copies close through the spawn gate instead.
+pub(crate) struct LockFile {file:ManuallyDrop<File>,transferred:AtomicBool}
 impl LockFile {
     /// A descriptor sharing this lock for a supervisor that keeps it held.
-    pub(crate) fn transfer(&self)->Result<File> {
-        self.transferred.store(true,Ordering::SeqCst);Ok(self.file.try_clone()?)
+    pub(crate) fn transfer(&self)->Result<TransferredFile> {
+        self.transferred.store(true,Ordering::SeqCst);Ok(TransferredFile(ManuallyDrop::new(self.file.try_clone()?)))
     }
 }
 impl Drop for LockFile {
-    fn drop(&mut self) {if !self.transferred.load(Ordering::SeqCst) {let _=self.file.unlock();}}
+    fn drop(&mut self) {
+        // SAFETY: the file is taken once, here, and never used again.
+        let file=unsafe{ManuallyDrop::take(&mut self.file)};
+        if self.transferred.load(Ordering::SeqCst) {close_transferred(file)} else {let _=file.unlock();}
+    }
 }
 
 fn lock_file(path:&Path)->Result<File> {
@@ -30,7 +75,7 @@ fn lock_file(path:&Path)->Result<File> {
     ensure!(file.metadata()?.is_file(),"execution lock must be a regular file");
     Ok(file)
 }
-fn held(file:File)->LockFile {LockFile{file,transferred:AtomicBool::new(false)}}
+fn held(file:File)->LockFile {LockFile{file:ManuallyDrop::new(file),transferred:AtomicBool::new(false)}}
 pub(crate) fn exclusive_file(path:&Path)->Result<LockFile> {
     let file=lock_file(path)?;
     file.try_lock().with_context(|| format!("another operation owns lock {}; retry", path.display()))?;
@@ -190,26 +235,22 @@ impl ProjectSharedGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn released_lock_is_free_while_a_forked_child_awaits_exec_but_transferred_locks_stay_held() {
-        use std::io::{Read, Write};
+    /// Spawn `/usr/bin/true` on another thread, paused after fork and before
+    /// exec (so before CLOEXEC takes effect) until the returned pipe is written.
+    fn child_paused_before_exec()->(File,std::thread::JoinHandle<std::process::ExitStatus>) {
+        use std::io::Read;
         use std::os::{fd::{AsRawFd, FromRawFd}, unix::process::CommandExt};
-        let root = tempfile::tempdir().unwrap();
-        let project = root.path().join("project");
-        std::fs::create_dir_all(project.join(".state")).unwrap();
-        let guard = ProjectGuard::acquire(&project).unwrap();
         let pipe = || {
             let mut fds = [0; 2];
             assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
             unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
         };
         let (mut ready_read, ready_write) = pipe();
-        let (release_read, mut release_write) = pipe();
+        let (release_read, release_write) = pipe();
         let spawned = std::thread::spawn(move || {
             let ready_fd = ready_write.as_raw_fd();
             let release_fd = release_read.as_raw_fd();
-            let mut command = std::process::Command::new("/usr/bin/true");
-            // Deliberately pause after fork and before CLOEXEC takes effect.
+            let mut command = Command::new("/usr/bin/true");
             // Only async-signal-safe syscalls run in the child, with a deadline.
             unsafe { command.pre_exec(move || {
                 let mut byte = 1u8;
@@ -219,18 +260,29 @@ mod tests {
                 if libc::read(release_fd, (&mut byte as *mut u8).cast(), 1) != 1 { return Err(std::io::Error::last_os_error()); }
                 Ok(())
             }); }
-            let result = command.spawn().unwrap().wait().unwrap();
+            let result = command.spawn_gated().unwrap().wait().unwrap();
             drop((ready_write, release_read));
             result
         });
         let mut ready = libc::pollfd { fd: ready_read.as_raw_fd(), events: libc::POLLIN, revents: 0 };
         assert_eq!(unsafe { libc::poll(&mut ready, 1, 5000) }, 1);
         ready_read.read_exact(&mut [0u8]).unwrap();
+        (release_write, spawned)
+    }
+
+    #[test]
+    fn released_lock_is_free_while_a_forked_child_awaits_exec_but_transferred_locks_stay_held() {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir_all(project.join(".state")).unwrap();
+        let guard = ProjectGuard::acquire(&project).unwrap();
+        let (mut release, spawned) = child_paused_before_exec();
         // The child still shares the lock's file description, but dropping the
         // guard unlocks it explicitly rather than waiting for the child's exec.
         drop(guard);
         let reacquired = ProjectGuard::acquire(&project).expect("a released lock must not stay held by a child awaiting exec");
-        release_write.write_all(&[1]).unwrap();
+        release.write_all(&[1]).unwrap();
         assert!(spawned.join().unwrap().success());
         // A lock transferred to a supervisor outlives the guard until the
         // supervisor's descriptors close.
@@ -238,8 +290,28 @@ mod tests {
         drop(reacquired);
         let contention = ProjectGuard::acquire(&project).err().expect("a transferred lock must stay held after its guard drops");
         assert!(contention.chain().any(|cause| matches!(cause.downcast_ref::<std::fs::TryLockError>(), Some(std::fs::TryLockError::WouldBlock))));
-        drop(transferred);
-        assert!(ProjectGuard::acquire(&project).is_ok(), "closing the supervisor's descriptors releases the lock");
+        // The supervisor side has released; `transferred` is the last copy.
+        // Closing it while another thread's child awaits exec must not leave
+        // the lock with that child: the next acquisition succeeds at once.
+        let (mut release, spawned) = child_paused_before_exec();
+        let (closing, closing_started) = std::sync::mpsc::channel();
+        let (closed, acquisition) = std::sync::mpsc::channel();
+        let closer = std::thread::spawn({
+            let project = project.clone();
+            move || {
+                closing.send(()).unwrap();
+                drop(transferred);
+                closed.send(ProjectGuard::acquire(&project).map(drop).map_err(|error| format!("{error:#}"))).unwrap();
+            }
+        });
+        closing_started.recv().unwrap();
+        // Give an ungated close time to finish while the child is still paused.
+        let early = acquisition.recv_timeout(std::time::Duration::from_millis(200)).ok();
+        release.write_all(&[1]).unwrap();
+        let result = early.unwrap_or_else(|| acquisition.recv().unwrap());
+        assert!(result.is_ok(), "a released transferred lock must not stay held by a child awaiting exec: {result:?}");
+        closer.join().unwrap();
+        assert!(spawned.join().unwrap().success());
     }
 
     #[test]

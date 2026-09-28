@@ -1,3 +1,4 @@
+use crate::execution_guard::GatedSpawn;
 use super::*;
 use crate::domain::*;
 use crate::store::SqliteStore;
@@ -31,7 +32,7 @@ fn git(repo: &Path, args: &[&str]) {
         .env("GIT_COMMITTER_EMAIL", "verifier@example.com")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .status()
+        .status_gated()
         .unwrap();
     assert!(status.success(), "git {args:?}");
 }
@@ -76,7 +77,7 @@ int main(int argc, char **argv) {
         .args(["-O2", "-o"])
         .arg(dest)
         .arg(&source)
-        .status()
+        .status_gated()
         .unwrap();
     assert!(status.success(), "gcc probe");
 }
@@ -201,7 +202,7 @@ fn world(with_probe: bool) -> World {
         Command::new("/usr/bin/git")
             .args(["rev-parse", "HEAD"])
             .current_dir(&repo)
-            .output()
+            .output_gated()
             .unwrap()
             .stdout,
     )
@@ -430,7 +431,7 @@ fn same_namespace_exits_without_calling_mount() {
     unsafe {
         command.pre_exec(move || install_kill_on_mount(&filter));
     }
-    let status = command.status().unwrap();
+    let status = command.status_gated().unwrap();
     assert_eq!(
         status.code(),
         Some(71),
@@ -713,7 +714,7 @@ fn review_probe_sha256_retained_checkout() {
     git(&world.repo, &["init", "--object-format=sha256"]);
     git(&world.repo, &["add", "src/file.txt"]);
     git(&world.repo, &["commit", "-m", "sha256"]);
-    let output=Command::new("/usr/bin/git").args(["rev-parse","HEAD"]).current_dir(&world.repo).output().unwrap();
+    let output=Command::new("/usr/bin/git").args(["rev-parse","HEAD"]).current_dir(&world.repo).output_gated().unwrap();
     let oid=String::from_utf8(output.stdout).unwrap().trim().to_string();
     assert_eq!(oid.len(),64);
     let objects = loose_objects(&world.repo).into_iter().map(|(oid,relative_path,bytes)|crate::store::verification::RetainedObject{oid,relative_path,bytes}).collect::<Vec<_>>();
@@ -839,7 +840,7 @@ fn required_outputs_are_checked_against_the_retained_candidate() {
         std::os::unix::fs::symlink(".", world.repo.join("src/alias")).unwrap();
         git(&world.repo, &["add", "src"]);
         git(&world.repo, &["commit", "-qm", "output candidates"]);
-        let head = Command::new("/usr/bin/git").args(["rev-parse", "HEAD"]).current_dir(&world.repo).output().unwrap();
+        let head = Command::new("/usr/bin/git").args(["rev-parse", "HEAD"]).current_dir(&world.repo).output_gated().unwrap();
         assert!(head.status.success());
         world.oid = String::from_utf8(head.stdout).unwrap().trim().to_string();
         let body = git_diff_policy(&world.work.join("checkout"));

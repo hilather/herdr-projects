@@ -1,3 +1,4 @@
+use crate::execution_guard::GatedSpawn;
 use super::*;
 use crate::{domain::{Commit,Mutation,Task,TaskId,TaskState},operations::DeliveryState};
 use std::{cell::Cell,rc::Rc,path::PathBuf};
@@ -106,7 +107,7 @@ fn dispatch_process_death_retains_claim_or_receipt_without_replay() {
     for phase in ["before","after","committed"] {
         let(temp,db,id)=fixture();drop(db);
         let mut child=Command::new(std::env::current_exe().unwrap()).args(["--exact","operations::dispatch::tests::dispatch_crash_child","--nocapture"])
-            .env("HP_DISPATCH_CRASH_ROOT",temp.path()).env("HP_DISPATCH_CRASH_PHASE",phase).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn().unwrap();
+            .env("HP_DISPATCH_CRASH_ROOT",temp.path()).env("HP_DISPATCH_CRASH_PHASE",phase).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn_gated().unwrap();
         let deadline=Instant::now()+Duration::from_secs(10);
         while !temp.path().join("ready").exists() {
             if Instant::now()>deadline||child.try_wait().unwrap().is_some(){let _=child.kill();let _=child.wait();panic!("dispatch child failed at {phase}");}

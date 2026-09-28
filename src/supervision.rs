@@ -89,6 +89,7 @@ fn trusted_helper(path:&Path)->Result<()> {
 
 #[cfg(all(test,target_os="linux"))]
 mod tests {
+    use crate::execution_guard::GatedSpawn;
     use super::*;
     use crate::execution_guard::{ProjectGuard,RootGuard};
     fn fixture()->(tempfile::TempDir,std::path::PathBuf,ProjectGuard) {
@@ -155,7 +156,7 @@ mod tests {
         let status=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","supervision::tests::environment_helper","--nocapture"])
             .env("HP_TRANSFER_ENVIRONMENT_PROJECT",&project).env("LD_LIBRARY_PATH","/nonexistent-transfer-fixture")
             .env("BASH_ENV",&startup).env("ENV",&startup).current_dir(&project)
-            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap();
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status_gated().unwrap();
         assert!(status.success());assert!(!project.join("STARTUP_MUST_NOT_RUN").exists());
     }
     #[test]
@@ -185,7 +186,7 @@ mod tests {
         let(root,project,guard)=fixture();drop(guard);
         let other=root.path().join("other");std::fs::create_dir_all(other.join(".state")).unwrap();
         let mut owner=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","supervision::tests::owner_death_helper","--nocapture"])
-            .env("HP_TRANSFER_OWNER_DEATH_PROJECT",&project).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+            .env("HP_TRANSFER_OWNER_DEATH_PROJECT",&project).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn_gated().unwrap();
         let deadline=Instant::now()+Duration::from_secs(4);
         while !project.join("started").exists() {
             if owner.try_wait().unwrap().is_some(){panic!("transfer owner exited before target started");}

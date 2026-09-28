@@ -127,6 +127,7 @@ impl Drop for Queue {
 
 #[cfg(test)]
 mod tests {
+    use herdr_projects::execution_guard::GatedSpawn;
     use super::*;
     use crate::executor::{Executor,Limits};
     use herdr_projects::{runtime,routines,domain::TaskId,operations::DeliveryState};
@@ -151,7 +152,7 @@ mod tests {
         let mut owner=std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact","routine_jobs::tests::owner_death_helper","--nocapture"])
             .env("HP_ROUTINE_OWNER_DEATH_PROJECT",&path).env("HP_ROUTINE_OWNER_DEATH_OPERATION",first.as_str())
-            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn_gated().unwrap();
         let deadline=Instant::now()+Duration::from_secs(5);
         while !path.join("started").exists() {
             if owner.try_wait().unwrap().is_some(){panic!("routine owner exited before script started");}

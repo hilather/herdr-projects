@@ -1,3 +1,4 @@
+use crate::execution_guard::GatedSpawn;
 use super::*;
 use std::{process::{Command, Stdio}, sync::{Arc, Barrier}, thread, time::Instant};
 use tempfile::TempDir;
@@ -196,7 +197,7 @@ fn process_death_preserves_atomicity_on_both_sides_of_commit() {
             .env("HP_STORE_CRASH_ROOT",temp.path()).env_remove("HP_STORE_AFTER_COMMIT")
             .stdout(Stdio::null()).stderr(Stdio::inherit());
         if after { command.env("HP_STORE_AFTER_COMMIT","1"); }
-        let mut child = command.spawn().unwrap();
+        let mut child = command.spawn_gated().unwrap();
         let deadline = Instant::now()+Duration::from_secs(10);
         while !temp.path().join("ready").exists() {
             if Instant::now() >= deadline || child.try_wait().unwrap().is_some() {

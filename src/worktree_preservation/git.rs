@@ -97,13 +97,14 @@ pub(super) fn verify(git:&Git,receipt:&WorktreeReceipt,control:&Control,archive:
 
 #[cfg(test)]
 mod tests {
+    use crate::execution_guard::GatedSpawn;
     use super::*;
     use std::{fs,process::{Command,Stdio},time::Duration};
     fn command(path:&Path,args:&[&str],input:Option<&[u8]>)->Vec<u8> {
         let mut child=Command::new("/usr/bin/git").current_dir(path).env_clear()
             .env("PATH","/usr/bin:/bin").env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL","/dev/null")
             .args(["-c","core.hooksPath=/dev/null","-c","user.name=Fixture","-c","user.email=f@example.invalid","-c","commit.gpgsign=false"])
-            .args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            .args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn_gated().unwrap();
         if let Some(bytes)=input {child.stdin.take().unwrap().write_all(bytes).unwrap();}else{drop(child.stdin.take());}
         let output=child.wait_with_output().unwrap();assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));output.stdout
     }

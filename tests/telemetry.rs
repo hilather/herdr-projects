@@ -2,6 +2,7 @@
 //! rollouts under its execution home, and `herdr-projects telemetry` on the CLI.
 
 #![cfg(all(feature = "state-store", target_os = "linux"))]
+#![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
 
 use herdr_projects::{domain::*, store::SqliteStore};
 use sha2::{Digest, Sha256};

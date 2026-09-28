@@ -1,3 +1,4 @@
+use herdr_projects::execution_guard::GatedSpawn;
 use super::*;
 use std::{fs,os::unix::{fs::PermissionsExt,net::UnixListener}};
 struct Fixture {root:tempfile::TempDir,p:Project,t:Thread,input:Input,_socket:UnixListener}
@@ -93,7 +94,7 @@ fn blocked_refresh_retains_ownership_and_cancels_while_neighbor_can_observe() {
 #[test]
 fn remote_refresh_uses_frozen_route_and_refuses_changed_destination() {
     const CHILD:&str="HP_REMOTE_TOKEN_FIXTURE";
-    if std::env::var_os(CHILD).is_none(){let bin=tempfile::tempdir().unwrap();let ssh=bin.path().join("ssh");fs::write(&ssh,"#!/usr/bin/python3\nimport subprocess,sys\nassert sys.argv[1:4]==['-T','-o','StrictHostKeyChecking=yes']\nassert sys.argv[-2]=='fixture.invalid'\nsys.exit(subprocess.call(sys.argv[-1],shell=True))\n").unwrap();fs::set_permissions(&ssh,fs::Permissions::from_mode(0o700)).unwrap();let out=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","token_jobs::tests::remote_refresh_uses_frozen_route_and_refuses_changed_destination","--nocapture"]).env(CHILD,"1").env("PATH",format!("{}:/usr/bin:/bin",bin.path().display())).output().unwrap();assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));return;}
+    if std::env::var_os(CHILD).is_none(){let bin=tempfile::tempdir().unwrap();let ssh=bin.path().join("ssh");fs::write(&ssh,"#!/usr/bin/python3\nimport subprocess,sys\nassert sys.argv[1:4]==['-T','-o','StrictHostKeyChecking=yes']\nassert sys.argv[-2]=='fixture.invalid'\nsys.exit(subprocess.call(sys.argv[-1],shell=True))\n").unwrap();fs::set_permissions(&ssh,fs::Permissions::from_mode(0o700)).unwrap();let out=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","token_jobs::tests::remote_refresh_uses_frozen_route_and_refuses_changed_destination","--nocapture"]).env(CHILD,"1").env("PATH",format!("{}:/usr/bin:/bin",bin.path().display())).output_gated().unwrap();assert!(out.status.success(),"{}\n{}",String::from_utf8_lossy(&out.stdout),String::from_utf8_lossy(&out.stderr));return;}
     for change in ["none","session","disabled","selector","cancel"] {
         let mut f=Fixture::new("ok",false);thread::update(&f.p,&f.t.id,|t|t.machine="saved".into()).unwrap();f.t=thread::load(&f.p,&f.t.id).unwrap();f.input.target=Target::Thread{id:f.t.id.clone(),execution:thread::execution_fingerprint(&f.t)};
         let binary=f.input.herdr.clone();f.input.herdr=f.root.path().join("local").display().to_string();let route=crate::remote_api::Route{id:"a".repeat(32),label:"saved".into(),target:"fixture.invalid".into(),session:"named-session".into(),enabled:true,selected:false};

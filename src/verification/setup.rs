@@ -1,5 +1,6 @@
 //! Child side of isolation. `unshare` has already started the new namespaces.
 //! The same-namespace check returns before any mount.
+use crate::execution_guard::GatedSpawn;
 use std::{
     ffi::CString,
     fs,
@@ -94,7 +95,7 @@ fn enter(parsed: &Args) -> i32 {
         return fail("env", 0);
     }
     let scratch = PathBuf::from(scratch);
-    let libraries = match Command::new("/usr/bin/ldd").arg(&parsed.git).output() {
+    let libraries = match Command::new("/usr/bin/ldd").arg(&parsed.git).output_gated() {
         Ok(output) if output.status.success() => {
             super::manifest::parse_ldd(&String::from_utf8_lossy(&output.stdout))
         }
@@ -147,7 +148,7 @@ fn enter(parsed: &Args) -> i32 {
     let output = match Command::new(&checks[0])
         .args(&checks[1..])
         .current_dir(&parsed.checkout)
-        .output()
+        .output_gated()
     {
         Ok(output) => output,
         Err(error) => return fail("exec", error.raw_os_error().unwrap_or(0)),
@@ -186,7 +187,7 @@ fn git_line(git: &Path, checkout: &Path, args: &[&str]) -> Option<String> {
         .arg("-C")
         .arg(checkout)
         .args(args)
-        .output()
+        .output_gated()
         .ok()?;
     if !output.status.success() {
         return None;
@@ -202,14 +203,14 @@ fn git_line(git: &Path, checkout: &Path, args: &[&str]) -> Option<String> {
 fn clean_tree(git: &Path, checkout: &Path) -> Option<bool> {
     let index = Command::new(git)
         .args(["-c","core.hooksPath=/dev/null","-C"]).arg(checkout)
-        .args(["diff","--cached","--quiet","--no-ext-diff","HEAD"]).status().ok()?.code()?;
+        .args(["diff","--cached","--quiet","--no-ext-diff","HEAD"]).status_gated().ok()?.code()?;
     if index==1 {return Some(false);}
     if index!=0 {return None;}
     let diff = Command::new(git)
         .args(["-c", "core.hooksPath=/dev/null", "-C"])
         .arg(checkout)
         .args(["diff", "--quiet", "--no-ext-diff", "HEAD"])
-        .status()
+        .status_gated()
         .ok()?
         .code()?;
     if diff == 1 {
@@ -222,7 +223,7 @@ fn clean_tree(git: &Path, checkout: &Path) -> Option<bool> {
         .args(["-c", "core.hooksPath=/dev/null", "-C"])
         .arg(checkout)
         .args(["ls-files", "--others", "--exclude-standard"])
-        .output()
+        .output_gated()
         .ok()?;
     if !untracked.status.success() {
         return None;

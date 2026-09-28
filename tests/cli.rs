@@ -1,4 +1,5 @@
 //! End-to-end checks of the built binary with a scrubbed environment.
+#![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
 
 use std::path::Path;
 use std::process::Command;

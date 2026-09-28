@@ -1,3 +1,4 @@
+use crate::execution_guard::GatedSpawn;
 use super::*;
 
 #[test]
@@ -99,7 +100,7 @@ fn process_death_before_effect_after_effect_and_after_result_never_blindly_repla
     for phase in ["before_effect","after_effect","after_result"] {
         let (temp,db,id)=fixture();drop(db);
         let mut child=Command::new(std::env::current_exe().unwrap()).args(["--exact","store::delivery::tests::delivery_crash_child","--nocapture"])
-            .env("HP_DELIVERY_CRASH_ROOT",temp.path()).env("HP_DELIVERY_CRASH_PHASE",phase).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn().unwrap();
+            .env("HP_DELIVERY_CRASH_ROOT",temp.path()).env("HP_DELIVERY_CRASH_PHASE",phase).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn_gated().unwrap();
         let deadline=Instant::now()+Duration::from_secs(10);
         while !temp.path().join("ready").exists() {
             if Instant::now()>deadline||child.try_wait().unwrap().is_some(){let _=child.kill();let _=child.wait();panic!("child failed to reach {phase}");}

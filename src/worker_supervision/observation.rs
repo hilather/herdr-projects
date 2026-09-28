@@ -681,6 +681,7 @@ fn verify_command(pid: u32, expected: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::execution_guard::GatedSpawn;
     use super::*;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -738,7 +739,7 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
+            .spawn_gated()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
         let observation = loop {
@@ -814,7 +815,7 @@ mod tests {
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
-                    .spawn()
+                    .spawn_gated()
                     .unwrap(),
             );
             let end = Instant::now() + Duration::from_secs(2);
@@ -912,7 +913,7 @@ while True: time.sleep(1)
             let executable=Path::new("/usr/bin/python3");
             let argv=super::super::command(executable,&arguments,10).unwrap();
             let mut child=Command::new(&argv[0]).args(&argv[1..]).env_clear()
-                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn_gated().unwrap();
             let deadline=Instant::now()+Duration::from_secs(3);
             let observation=loop {
                 if ready.exists() {

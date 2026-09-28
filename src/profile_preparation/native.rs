@@ -1,4 +1,5 @@
 //! Native transport and optional one-use prompt observations; never workflow certification.
+use crate::execution_guard::GatedSpawn;
 use super::*;
 use crate::{
     runner::InheritedLock,
@@ -364,7 +365,7 @@ pub(super) fn verify(
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()?,
+            .spawn_gated()?,
     );
     while !fs::symlink_metadata(&socket).is_ok_and(|m| m.file_type().is_socket()) {
         check(deadline, &cancellation)?;

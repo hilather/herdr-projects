@@ -1,4 +1,5 @@
 //! Run explicitly; never discovers or connects to an existing user session.
+#![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
 #[path = "support/live.rs"]
 mod live;
 use live::Lab;

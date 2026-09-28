@@ -201,10 +201,16 @@ Recorded here rather than folded into the card that found them.
   `hot_paths_skip_the_whole_store_check_and_the_ticker_checks_off_its_pass_then_pauses_admission_and_effects_on_corruption`.
 - **Transferred locks can still outlive release.** Guards now unlock on drop
   (#46), but a lock handed to a supervisor through `inherit_transfer` is only
-  closed, so a child forked concurrently on another thread can hold it until
-  it execs. Three unit tests still hit this in parallel runs. A fix needs a
-  gate between process spawning and transferred-lock release (about 68
-  `Command::new` sites).
+  closed, so a child forked concurrently on another thread could hold it until
+  it execs — done (this PR). A process-wide spawn gate
+  (`execution_guard::GatedSpawn`) is held shared from fork until the child has
+  exec'd, and every parent copy of a transferred lock closes holding it
+  exclusively, so no fork is in flight when the last copy closes. Transferred
+  locks are still never unlocked: the supervisor keeps them until its
+  descendants exit. Every spawn in `src/` goes through the gate; `clippy.toml`
+  disallows the ungated `Command::{spawn,output,status}` (integration test
+  crates and `build.rs` opt out). Extended
+  `released_lock_is_free_while_a_forked_child_awaits_exec_but_transferred_locks_stay_held`.
 - **`approval_read_does_not_double_count_already_budgeted_inputs`** spent
   seconds of its 5 s budget even when run alone, and occasionally missed it on a
   loaded machine — done (this PR). The time goes to decoding and hashing its

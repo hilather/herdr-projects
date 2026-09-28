@@ -1,5 +1,6 @@
 #![cfg(feature = "state-store")]
 //! Regression coverage derived from the 2026-09-20 independent memory audit.
+use crate::execution_guard::GatedSpawn;
 use crate as herdr_projects;
 use herdr_projects::{domain::*, memory::*, store::SqliteStore};
 use std::{fs, path::Path};
@@ -314,7 +315,7 @@ fn cutover_must_verify_object_bytes_before_publishing_authority() {
         Command::new("/usr/bin/ssh-keygen")
             .args(["-q", "-t", "ed25519", "-N", "", "-f"])
             .arg(&key)
-            .status()
+            .status_gated()
             .unwrap()
             .success()
     );
@@ -394,7 +395,7 @@ fn cutover_must_verify_object_bytes_before_publishing_authority() {
             .arg(&key)
             .args(["-n", authority::MEMORY_SIGNATURE_NAMESPACE])
             .arg(&doc)
-            .output()
+            .output_gated()
             .unwrap()
             .status
             .success()

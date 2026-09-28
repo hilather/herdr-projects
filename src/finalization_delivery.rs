@@ -126,6 +126,7 @@ pub fn observe(ctx:&Ctx,path:&Path,id:&OperationId,revision:u64,head:u64)->Resul
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use herdr_projects::execution_guard::GatedSpawn;
     use super::*;
     use crate::scenarios::World;
     use herdr_projects::{domain::{TaskState,Attempt,AttemptId,AttemptState,Commit,Mutation},operations::DeliveryState};
@@ -222,7 +223,7 @@ pub(crate) mod tests {
     fn finalization_process_death_preserves_intent_and_recovers_published_receipt() {
         use std::{process::{Command,Stdio},time::{Duration,Instant}};
         for phase in ["before","after","committed"] {
-            let(world,path,op)=fixture();let mut child=Command::new(std::env::current_exe().unwrap()).args(["--exact","finalization_delivery::tests::finalization_crash_child","--nocapture"]).env("HP_FINALIZE_CRASH_HOME",world.home.path()).env("HP_FINALIZE_CRASH_PHASE",phase).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn().unwrap();let deadline=Instant::now()+Duration::from_secs(10);
+            let(world,path,op)=fixture();let mut child=Command::new(std::env::current_exe().unwrap()).args(["--exact","finalization_delivery::tests::finalization_crash_child","--nocapture"]).env("HP_FINALIZE_CRASH_HOME",world.home.path()).env("HP_FINALIZE_CRASH_PHASE",phase).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn_gated().unwrap();let deadline=Instant::now()+Duration::from_secs(10);
             while !world.home.path().join("finalization-ready").exists(){if child.try_wait().unwrap().is_some(){panic!("crash fixture exited before ready");}if Instant::now()>deadline{let _=child.kill();let _=child.wait();panic!("crash fixture readiness timeout");}std::thread::sleep(Duration::from_millis(10));}
             child.kill().unwrap();child.wait().unwrap();migration::recover(&path,true).unwrap();let mut db=migration::open_active(&path).unwrap();let delivery=db.deliveries().unwrap().into_iter().find(|d|d.operation==op.id).unwrap();
             if phase=="committed" {assert_eq!(delivery.state,DeliveryState::Confirmed);assert_eq!(db.read_snapshot(None).unwrap().tasks.iter().find(|t|Some(&t.id)==op.task.as_ref()).unwrap().revision,op.expected_revision+1);continue;}

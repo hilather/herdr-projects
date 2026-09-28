@@ -1,3 +1,4 @@
+use crate::execution_guard::GatedSpawn;
 use super::*;
 use crate::domain::*;
 use crate::store::SqliteStore;
@@ -24,7 +25,7 @@ fn git(repo: &Path, args: &[&str]) {
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
-        .status()
+        .status_gated()
         .unwrap();
     assert!(status.success(), "git {args:?}");
 }
@@ -36,7 +37,7 @@ fn git_ok(repo: &Path, args: &[&str]) -> bool {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .status()
+        .status_gated()
         .map(|status| status.success())
         .unwrap_or(false)
 }
@@ -48,7 +49,7 @@ fn git_text(repo: &Path, args: &[&str]) -> String {
         .current_dir(repo)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .output()
+        .output_gated()
         .unwrap();
     String::from_utf8(output.stdout).unwrap().trim().to_string()
 }

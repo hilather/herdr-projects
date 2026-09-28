@@ -316,6 +316,7 @@ fn readiness_now(project: &Path) -> Result<Vec<Candidate>> {
 
 #[cfg(test)]
 mod tests {
+    use crate::execution_guard::GatedSpawn;
     use super::*;
     use crate::store::SqliteStore;
 
@@ -405,7 +406,7 @@ mod tests {
 
     fn git_commit(repo: &std::path::Path) -> String {
         let git = |args: &[&str]| {
-            let output = std::process::Command::new("/usr/bin/git").arg("-C").arg(repo).args(args).env_clear().env("PATH", "/usr/bin:/bin").env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@example.com").env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@example.com").output().unwrap();
+            let output = std::process::Command::new("/usr/bin/git").arg("-C").arg(repo).args(args).env_clear().env("PATH", "/usr/bin:/bin").env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@example.com").env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@example.com").output_gated().unwrap();
             assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
             String::from_utf8(output.stdout).unwrap().trim().to_string()
         };

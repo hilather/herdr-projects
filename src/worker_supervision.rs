@@ -233,6 +233,7 @@ pub fn posix_command(argv: &[String]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::execution_guard::GatedSpawn;
     use super::*;
     #[test]
     #[cfg(target_os = "linux")]
@@ -255,7 +256,7 @@ mod tests {
             .env("UNAPPROVED_VARIABLE", "must-not-reach-agent")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .spawn()
+            .spawn_gated()
             .unwrap();
         child
             .stdin
@@ -313,7 +314,7 @@ mod tests {
                 .args(&argv[1..])
                 .current_dir(root.path())
                 .stdin(Stdio::piped())
-                .spawn()
+                .spawn_gated()
                 .unwrap();
             std::thread::sleep(Duration::from_millis(60));
             assert!(child.try_wait().unwrap().is_none(), "gate failed to wait");
@@ -353,7 +354,7 @@ mod tests {
         let mut child = Command::new(&argv[0])
             .args(&argv[1..])
             .stdin(Stdio::piped())
-            .spawn()
+            .spawn_gated()
             .unwrap();
         let start = Instant::now();
         assert!(!child.wait().unwrap().success());
@@ -408,7 +409,7 @@ mod tests {
         let output = std::process::Command::new("/bin/sh")
             .args(["-c", &line])
             .current_dir(root.path())
-            .output()
+            .output_gated()
             .unwrap();
         assert!(output.status.success());
         assert_eq!(String::from_utf8(output.stdout).unwrap(), payload);

@@ -1,3 +1,4 @@
+use crate::execution_guard::GatedSpawn;
 use super::*;
 use crate::reconcile::RuntimeObservation;
 pub(in crate::store) fn fixture()->(tempfile::TempDir,SqliteStore,Vec<PreparedLaunch>) {
@@ -409,7 +410,7 @@ fn reservation_crash_child() {
 #[test]
 fn process_death_preserves_whole_reservation_or_original_queue() {
     use std::{process::{Command,Stdio},time::Instant};
-    for phase in ["uncommitted","committed"] {let(temp,mut db,p)=fixture();let before=db.read_snapshot(None).unwrap();drop(db);std::fs::write(temp.path().join("inputs.json"),serde_json::to_vec(&p[0].inputs).unwrap()).unwrap();let mut child=Command::new(std::env::current_exe().unwrap()).args(["--exact","store::reservations::tests::reservation_crash_child","--nocapture"]).env("HP_RESERVATION_CRASH_ROOT",temp.path()).env("HP_RESERVATION_CRASH_PHASE",phase).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn().unwrap();let deadline=Instant::now()+Duration::from_secs(10);while !temp.path().join("ready").exists() {if Instant::now()>deadline||child.try_wait().unwrap().is_some(){let _=child.kill();let _=child.wait();panic!("child failed to reach {phase}");}std::thread::sleep(Duration::from_millis(10));}child.kill().unwrap();child.wait().unwrap();let mut db=SqliteStore::open(&temp.path().join(".state/state.db")).unwrap();let after=db.read_snapshot(None).unwrap();if phase=="uncommitted" {assert_eq!(after,before);}else{assert_eq!(after.attempt_inputs.len(),1);assert_eq!(after.operations.len(),1);assert_eq!(after.tasks[0].active_attempt,Some(after.attempts[0].id.clone()));assert_eq!(db.queue_report(1000).unwrap().available_slots,0);assert_eq!(db.deliveries().unwrap()[0].state,DeliveryState::Pending);}}
+    for phase in ["uncommitted","committed"] {let(temp,mut db,p)=fixture();let before=db.read_snapshot(None).unwrap();drop(db);std::fs::write(temp.path().join("inputs.json"),serde_json::to_vec(&p[0].inputs).unwrap()).unwrap();let mut child=Command::new(std::env::current_exe().unwrap()).args(["--exact","store::reservations::tests::reservation_crash_child","--nocapture"]).env("HP_RESERVATION_CRASH_ROOT",temp.path()).env("HP_RESERVATION_CRASH_PHASE",phase).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn_gated().unwrap();let deadline=Instant::now()+Duration::from_secs(10);while !temp.path().join("ready").exists() {if Instant::now()>deadline||child.try_wait().unwrap().is_some(){let _=child.kill();let _=child.wait();panic!("child failed to reach {phase}");}std::thread::sleep(Duration::from_millis(10));}child.kill().unwrap();child.wait().unwrap();let mut db=SqliteStore::open(&temp.path().join(".state/state.db")).unwrap();let after=db.read_snapshot(None).unwrap();if phase=="uncommitted" {assert_eq!(after,before);}else{assert_eq!(after.attempt_inputs.len(),1);assert_eq!(after.operations.len(),1);assert_eq!(after.tasks[0].active_attempt,Some(after.attempts[0].id.clone()));assert_eq!(db.queue_report(1000).unwrap().available_slots,0);assert_eq!(db.deliveries().unwrap()[0].state,DeliveryState::Pending);}}
 }
 
 #[test]
@@ -752,7 +753,7 @@ fn sigkill_atomic_creation_never_leaves_a_claim_without_recovery_identity() {
         let mut child=Command::new(std::env::current_exe().unwrap())
             .args(["--exact","store::reservations::tests::atomic_creation_crash_child","--nocapture"])
             .env("HERDR_ATOMIC_CREATION_DB",&path).env("HERDR_LAUNCH_CRASH_POINT",point)
-            .env("HERDR_LAUNCH_CRASH_MARKER",&marker).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn().unwrap();
+            .env("HERDR_LAUNCH_CRASH_MARKER",&marker).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn_gated().unwrap();
         let deadline=Instant::now()+Duration::from_secs(10);
         while !marker.exists() && Instant::now()<deadline {
             if let Some(status)=child.try_wait().unwrap() {panic!("child exited before {point}: {status}");}
@@ -808,7 +809,7 @@ fn sigkill_launch_boundaries_preserve_capacity_authority_and_no_replay() {
         let mut child=Command::new(std::env::current_exe().unwrap())
             .args(["--exact","store::reservations::tests::launch_crash_child","--nocapture"])
             .env("HERDR_LAUNCH_CRASH_DB",&path).env("HERDR_LAUNCH_CRASH_POINT",point)
-            .env("HERDR_LAUNCH_CRASH_MARKER",&marker).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            .env("HERDR_LAUNCH_CRASH_MARKER",&marker).stdout(Stdio::null()).stderr(Stdio::null()).spawn_gated().unwrap();
         let deadline=Instant::now()+Duration::from_secs(20);
         while !marker.exists() && Instant::now()<deadline {
             if let Some(status)=child.try_wait().unwrap() {panic!("crash child exited before {point}: {status}");}
@@ -1126,7 +1127,7 @@ fn sigkill_start_receipt_commit_never_splits_confirmation_ownership_and_attempt(
         let mut child=Command::new(std::env::current_exe().unwrap())
             .args(["--exact","store::reservations::tests::typed_start_crash_child","--nocapture"])
             .env("HERDR_TYPED_START_DB",&path).env("HERDR_LAUNCH_CRASH_POINT",point)
-            .env("HERDR_LAUNCH_CRASH_MARKER",&marker).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            .env("HERDR_LAUNCH_CRASH_MARKER",&marker).stdout(Stdio::null()).stderr(Stdio::null()).spawn_gated().unwrap();
         let deadline=Instant::now()+Duration::from_secs(20);
         while !marker.exists()&&Instant::now()<deadline {
             if let Some(status)=child.try_wait().unwrap(){panic!("typed receipt child exited before {point}: {status}");}
@@ -1281,7 +1282,7 @@ fn lost_attempt_still_fills_the_only_slot() {
 fn git_history()->(tempfile::TempDir,String,String) {
     let dir=tempfile::tempdir().unwrap();let repo=dir.path().join("repo");std::fs::create_dir(&repo).unwrap();
     let git=|args:&[&str]| {
-        let output=std::process::Command::new("/usr/bin/git").arg("-C").arg(&repo).args(args).env_clear().env("PATH","/usr/bin:/bin").env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL","/dev/null").env("GIT_AUTHOR_NAME","t").env("GIT_AUTHOR_EMAIL","t@example.com").env("GIT_COMMITTER_NAME","t").env("GIT_COMMITTER_EMAIL","t@example.com").output().unwrap();
+        let output=std::process::Command::new("/usr/bin/git").arg("-C").arg(&repo).args(args).env_clear().env("PATH","/usr/bin:/bin").env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL","/dev/null").env("GIT_AUTHOR_NAME","t").env("GIT_AUTHOR_EMAIL","t@example.com").env("GIT_COMMITTER_NAME","t").env("GIT_COMMITTER_EMAIL","t@example.com").output_gated().unwrap();
         assert!(output.status.success(),"git {args:?}: {}",String::from_utf8_lossy(&output.stderr));
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     };

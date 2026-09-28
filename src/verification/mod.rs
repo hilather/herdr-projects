@@ -8,6 +8,7 @@ mod manifest;
 mod setup;
 pub(crate) mod supervise;
 
+#[cfg(test)] use crate::execution_guard::GatedSpawn;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -506,7 +507,7 @@ fn verify_owned(store: &mut SqliteStore, request: &VerifyRequest, ownership: Opt
             .current_dir(&checkout.path)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .status()
+            .status_gated()
             .context("git add")?;
         if !status.success() {
             bail!("could not stage the checkout change");

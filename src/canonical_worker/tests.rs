@@ -1,3 +1,4 @@
+use crate::execution_guard::GatedSpawn;
 use super::*;
 use crate::{memory::MemoryStore, migration, operations::DeliveryState, runtime};
 use std::{
@@ -420,7 +421,7 @@ print(json.dumps({{'id':('wrong' if mode=='wrong-id' and r['method']=='agent.pro
         if mode == "barrier-stop" { crate::store::install_worker_barrier_fixture(&mut db, &project, &task, &profile); }
         let state = db.read_snapshot(None).unwrap();
         let repositories=if mode.contains("repository") {
-            let git=|args:&[&str]|{let output=std::process::Command::new("/usr/bin/git").current_dir(&project).env_clear().env("PATH","/usr/bin:/bin").env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL","/dev/null").args(["-c","core.hooksPath=/dev/null","-c","user.name=fixture","-c","user.email=fixture@example.invalid"]).args(args).output().unwrap();assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));String::from_utf8(output.stdout).unwrap().trim().to_owned()};
+            let git=|args:&[&str]|{let output=std::process::Command::new("/usr/bin/git").current_dir(&project).env_clear().env("PATH","/usr/bin:/bin").env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL","/dev/null").args(["-c","core.hooksPath=/dev/null","-c","user.name=fixture","-c","user.email=fixture@example.invalid"]).args(args).output_gated().unwrap();assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));String::from_utf8(output.stdout).unwrap().trim().to_owned()};
             git(&["init","--quiet"]);fs::write(project.join("source.txt"),"approved base\n").unwrap();git(&["add","source.txt"]);git(&["commit","--quiet","-m","baseline"]);
             vec![RepositoryInput{repository:project.display().to_string(),commit:git(&["rev-parse","HEAD"]),tree:git(&["rev-parse","HEAD^{tree}"])}]
         }else{vec![]};
@@ -477,7 +478,7 @@ print(json.dumps({{'id':('wrong' if mode=='wrong-id' and r['method']=='agent.pro
             let payload=serde_json::to_vec_pretty(&grant).unwrap();
             fs::write(&document,&payload).unwrap();
             let signed=std::process::Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(key)
-                .args(["-n",crate::authority::SIGNATURE_NAMESPACE]).arg(&document).output().unwrap();
+                .args(["-n",crate::authority::SIGNATURE_NAMESPACE]).arg(&document).output_gated().unwrap();
             assert!(signed.status.success());
             let signature=document.with_extension("json.sig");
             let mut tampered=grant.clone();tampered.expires_unix_ms+=1;
@@ -500,7 +501,7 @@ print(json.dumps({{'id':('wrong' if mode=='wrong-id' and r['method']=='agent.pro
             crate::launch_preparation::reserve(&project,selection,&inputs.approval,head,Instant::now()+Duration::from_secs(20),Default::default()).unwrap()
         } else {db.reserve_prepared(&[PreparedLaunch { inputs }], head, time).unwrap()};
         if live {
-            let worker=Worker(std::process::Command::new("/usr/bin/sleep").arg("300").spawn().unwrap());
+            let worker=Worker(std::process::Command::new("/usr/bin/sleep").arg("300").spawn_gated().unwrap());
             let operation=db.read_snapshot(None).unwrap().operations.into_iter().find(|o|o.id==reserved.record.operation).unwrap();
             return Self{_root:root,project,operation,_socket:socket,_worker:worker};
         }
@@ -537,7 +538,7 @@ print(json.dumps({{'id':('wrong' if mode=='wrong-id' and r['method']=='agent.pro
                 })
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
-                .spawn()
+                .spawn_gated()
                 .unwrap(),
         );
         let end = Instant::now() + Duration::from_secs(3);
@@ -3950,7 +3951,7 @@ fn lost_workspace_reply_recovers_exact_live_marker_even_after_revocation_and_exp
                 .env_clear()
                 .env("HP_WORKSPACE_CREATION", token)
                 .current_dir(&f.project)
-                .spawn()
+                .spawn_gated()
                 .unwrap(),
         );
         fs::write(
@@ -4233,7 +4234,7 @@ fn crash_native_caller(project:&Path,operation:&OperationId,revision:u64,method:
     let mut child=Worker(std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact","canonical_worker::tests::live_native_crash_driver","--nocapture"])
         .env("HP_NATIVE_CRASH_REQUEST",serde_json::to_string(&(project,operation,revision,method)).unwrap())
-        .stdin(std::process::Stdio::null()).spawn().unwrap());
+        .stdin(std::process::Stdio::null()).spawn_gated().unwrap());
     let deadline=Instant::now()+Duration::from_secs(15);
     while !lab.join("dropped").exists() {
         assert!(child.0.try_wait().unwrap().is_none(),"native crash caller ended before the effect");
@@ -4293,7 +4294,7 @@ fn live_supervised_root_failure(repository:bool, lost_reply:Option<&str>, crash:
             .env("TERM", "xterm-256color").env("LANG", "C.UTF-8")
             .env("HERDR_CONFIG_PATH", &config).env("HERDR_SOCKET_PATH", &socket)
             .env("XDG_RUNTIME_DIR", &runtime_dir).current_dir(lab.path())
-            .stdin(Stdio::null()).stdout(log.try_clone().unwrap()).stderr(log).spawn().unwrap())
+            .stdin(Stdio::null()).stdout(log.try_clone().unwrap()).stderr(log).spawn_gated().unwrap())
     };
     let wait_server=|server:&mut Worker| {
         let deadline=Instant::now()+Duration::from_secs(15);
@@ -4332,14 +4333,14 @@ sys.exit(result.returncode)
     }
     let signer=lab.path().join("workflow-owner");
     if lifecycle==LiveLifecycle::VendorWorkflow {
-        assert!(Command::new("/usr/bin/ssh-keygen").args(["-q","-t","ed25519","-N","","-f"]).arg(&signer).status().unwrap().success());
+        assert!(Command::new("/usr/bin/ssh-keygen").args(["-q","-t","ed25519","-N","","-f"]).arg(&signer).status_gated().unwrap().success());
     }
     let mut f = Fixture::with_project(if repository {"resource-release-workspace-repository"} else {"resource-release-workspace"}, |_,_| {}, Some((if lost_reply.is_some(){&proxy}else{&binary}, &socket)),None,(lifecycle==LiveLifecycle::VendorWorkflow).then_some(signer.as_path()));
     if lifecycle==LiveLifecycle::VendorWorkflow {
         let driver=PathBuf::from(std::env::var_os("HP_CONTROLLER_TEST_BINARY").expect("compiled controller test binary required"));
         fs::write(f.project.join("PROJECT.md"),"+++\nname='Worker fixture'\n+++\nNew instructions must not replace the retained attempt input.").unwrap();
         let status=Command::new(driver).args(["--exact","canonical_controller::launch_tests::live_dispatch_workflow_driver","--nocapture"])
-            .env("HP_LIVE_DISPATCH_PROJECT",&f.project).status().unwrap();
+            .env("HP_LIVE_DISPATCH_PROJECT",&f.project).status_gated().unwrap();
         // Even a failed driver must stop an identity already recorded by the
         // production launch path before its credential-bearing home is removed.
         let state=runtime::snapshot(&f.project).unwrap();
@@ -4642,7 +4643,7 @@ fn stock_shell(root: &Path, done: &std::sync::atomic::AtomicBool, execute: bool,
         .args(["--exact", "canonical_worker::tests::stock_shell_exec_helper", "--nocapture"])
         .env_clear().env("PATH", "/usr/bin:/bin").env("HP_STOCK_EXEC_SPEC", spec)
         .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-        .spawn().unwrap());
+        .spawn_gated().unwrap());
     let pid = shell.0.id();
     let mut released = false;
     while !done.load(Ordering::Acquire) {
@@ -4852,9 +4853,9 @@ int main(int argc, char **argv) {
     sleep(30); return 0;
 }
 "#).unwrap();
-    assert!(Command::new("/usr/bin/cc").arg(&source).arg("-o").arg(common.path().join("fixture-agent")).status().unwrap().success());
+    assert!(Command::new("/usr/bin/cc").arg(&source).arg("-o").arg(common.path().join("fixture-agent")).status_gated().unwrap().success());
     let signer=common.path().join("owner-key");
-    assert!(Command::new("/usr/bin/ssh-keygen").args(["-q","-t","ed25519","-N","","-f"]).arg(&signer).status().unwrap().success());
+    assert!(Command::new("/usr/bin/ssh-keygen").args(["-q","-t","ed25519","-N","","-f"]).arg(&signer).status_gated().unwrap().success());
     let mut fixtures=(0..3).map(|n|Fixture::with_project("resource-release-workspace-repository",|_,_|{},None,whole_ticker.then(||common.path().join(format!("project-{n}"))).as_deref(),Some(&signer))).collect::<Vec<_>>();
     fixtures.sort_by(|a,b|a.project.cmp(&b.project));
     fs::write(fixtures[0]._root.path().join("lose-name-reply"),b"lost acknowledgment").unwrap();
@@ -4881,7 +4882,7 @@ int main(int argc, char **argv) {
             });
         }
         let mut child=Command::new(binary).args(["--exact",if whole_ticker {"canonical_controller::launch_tests::enabled_ticker_fixture_driver"}else{"canonical_controller::launch_tests::enabled_dispatch_fixture_driver"},"--nocapture"])
-            .env("HP_CONTROLLER_FIXTURE_PROJECTS",serde_json::to_string(&projects).unwrap()).stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap();
+            .env("HP_CONTROLLER_FIXTURE_PROJECTS",serde_json::to_string(&projects).unwrap()).stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn_gated().unwrap();
         let status=loop {
             if let Some(status)=child.try_wait().unwrap(){break status;}
             if Instant::now()>=deadline{child.kill().unwrap();break child.wait().unwrap();}

@@ -1,4 +1,5 @@
 #![cfg(feature = "state-store")]
+#![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
 use herdr_projects::{authority, domain::*, memory::*, migration, runtime};
 use std::{
     fs,

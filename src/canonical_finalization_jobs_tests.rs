@@ -1,3 +1,4 @@
+use herdr_projects::execution_guard::GatedSpawn;
 use super::*;
 use std::fs;
 use crate::finalization_delivery::tests::fixture;
@@ -65,7 +66,7 @@ fn canonical_finalization_owner_death_recovers_only_verified_receipts_without_so
     use std::process::{Command,Stdio};
     for phase in ["before","after","committed"] {
         let(world,path,op)=fixture();fs::write(world.home.path().join("input.json"),serde_json::to_vec(&input(&world.ctx(),&path,&op,1,Mode::Deliver)).unwrap()).unwrap();
-        let mut child=Command::new(std::env::current_exe().unwrap()).args(["--exact","canonical_finalization_jobs::tests::canonical_finalization_crash_child","--nocapture"]).env("HP_CANONICAL_FINALIZATION_CRASH",world.home.path()).env("HP_CANONICAL_FINALIZATION_PHASE",phase).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn().unwrap();let deadline=Instant::now()+Duration::from_secs(10);
+        let mut child=Command::new(std::env::current_exe().unwrap()).args(["--exact","canonical_finalization_jobs::tests::canonical_finalization_crash_child","--nocapture"]).env("HP_CANONICAL_FINALIZATION_CRASH",world.home.path()).env("HP_CANONICAL_FINALIZATION_PHASE",phase).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn_gated().unwrap();let deadline=Instant::now()+Duration::from_secs(10);
         while !world.home.path().join("ready").exists(){if child.try_wait().unwrap().is_some(){panic!("crash child exited");}if Instant::now()>deadline{let _=child.kill();let _=child.wait();panic!("crash child timed out");}std::thread::sleep(Duration::from_millis(10));}
         assert!(ProjectGuard::acquire(&path).is_err());assert!(herdr_projects::execution_guard::RootGuard::exclusive(&world.root).is_err());
         child.kill().unwrap();child.wait().unwrap();assert!(ProjectGuard::acquire(&path).is_ok());

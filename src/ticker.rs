@@ -3,6 +3,7 @@
 //! Everything it does is "check on an interval, compare with last time, act".
 //! It exits on request through a stop file, never through signals.
 
+use herdr_projects::execution_guard::GatedSpawn;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -245,7 +246,7 @@ fn spawn(root: &Path) -> Result<()> {
             Ok(())
         });
     }
-    command.spawn().context("could not start the ticker")?;
+    command.spawn_gated().context("could not start the ticker")?;
     Ok(())
 }
 

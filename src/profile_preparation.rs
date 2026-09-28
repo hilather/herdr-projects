@@ -307,6 +307,7 @@ pub(crate) mod fixture;
 
 #[cfg(test)]
 mod tests {
+    use crate::execution_guard::GatedSpawn;
     #[cfg(target_os = "linux")]
     mod launch_ingress;
     use super::*;
@@ -611,7 +612,7 @@ except sqlite3.OperationalError as error:
         raise
 else:
     raise SystemExit('database exclusion was lost')
-"#]).arg(&path).output().unwrap();
+"#]).arg(&path).output_gated().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         raw.execute_batch("ROLLBACK;").unwrap();
     }

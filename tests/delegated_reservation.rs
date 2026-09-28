@@ -1,6 +1,7 @@
 #![cfg(all(feature = "state-store", target_os = "linux"))]
 //! Real CLI/signature ingress over a disposable store. The installed native
 //! profile is synthetic; this test does not certify an adapter or start workers.
+#![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
 use herdr_projects::{authority, domain::*, migration, runtime};
 use sha2::{Digest, Sha256};
 use std::{fs, os::unix::fs::MetadataExt, path::{Path, PathBuf}, process::{Command, Output}};

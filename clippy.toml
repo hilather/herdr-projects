@@ -1,0 +1,6 @@
+# Every spawn holds the spawn gate until the child execs (see execution_guard).
+disallowed-methods = [
+    { path = "std::process::Command::spawn", reason = "use execution_guard::GatedSpawn::spawn_gated" },
+    { path = "std::process::Command::output", reason = "use execution_guard::GatedSpawn::output_gated" },
+    { path = "std::process::Command::status", reason = "use execution_guard::GatedSpawn::status_gated" },
+]

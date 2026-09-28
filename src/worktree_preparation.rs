@@ -885,6 +885,7 @@ pub(crate) fn pin_started_events_held(project:&Path,events:&[Event],record:&Atte
 
 #[cfg(test)]
 mod file_tests {
+    use crate::execution_guard::GatedSpawn;
     use super::*;
 
     #[test]
@@ -904,7 +905,7 @@ mod file_tests {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "worktree_preparation::file_tests::fifo_probe_child"])
             .env("HP_WORKTREE_FIFO_PROBE", &path)
-            .spawn().unwrap();
+            .spawn_gated().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(status) = child.try_wait().unwrap() {

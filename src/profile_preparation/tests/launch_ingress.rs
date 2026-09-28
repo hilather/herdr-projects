@@ -1,3 +1,4 @@
+use crate::execution_guard::GatedSpawn;
 use super::*;
 use crate::{launch_preparation::{self, LaunchDraft, LaunchSelection}, store::SqliteStore};
 use std::process::Command;
@@ -13,7 +14,7 @@ fn git(path: &Path, args: &[&str]) -> String {
     let output=Command::new("/usr/bin/git").current_dir(path).env_clear()
         .env("PATH","/usr/bin:/bin").env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL","/dev/null")
         .args(["-c","core.hooksPath=/dev/null","-c","user.name=fixture","-c","user.email=fixture@example.invalid"])
-        .args(args).output().unwrap();
+        .args(args).output_gated().unwrap();
     assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
     String::from_utf8(output.stdout).unwrap().trim().into()
 }
@@ -34,7 +35,7 @@ print(json.dumps({{'id':r['id'],'result':result}}))
 "#,root=f._root.path().display().to_string())).unwrap();
         let key=f._root.path().join("signer");
         assert!(Command::new("/usr/bin/ssh-keygen").args(["-q","-t","ed25519","-N","","-f"])
-            .arg(&key).status().unwrap().success());
+            .arg(&key).status_gated().unwrap().success());
         let public=fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
         fs::write(&f.config,fs::read_to_string(&f.config).unwrap()
             .replace(&format!("ssh-ed25519 {}","A".repeat(48)),&public)
@@ -91,7 +92,7 @@ print(json.dumps({{'id':r['id'],'result':result}}))
         let document=self.f._root.path().join("approval.json");
         fs::write(&document,serde_json::to_vec_pretty(&draft.approval).unwrap()).unwrap();
         assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&self.key)
-            .args(["-n",crate::authority::SIGNATURE_NAMESPACE]).arg(&document).output().unwrap().status.success());
+            .args(["-n",crate::authority::SIGNATURE_NAMESPACE]).arg(&document).output_gated().unwrap().status.success());
         crate::authority::import_signed(&self.f.project,&document,&document.with_extension("json.sig"),self.state().head).unwrap()
     }
     fn reserve(&self, approval: &VersionedReference) -> Result<Reservation> {
