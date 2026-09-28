@@ -781,31 +781,6 @@ fn brief_preparation_and_delivery_do_not_decode_unrelated_approval_history() {
 }
 
 #[test]
-fn native_brief_submits_retained_bytes_once_and_commits_running_state() {
-    let f = Fixture::new("ok");
-    fs::write(f.project.join("PROJECT.md"), "Replacement must not be sent").unwrap();
-    assert_eq!(f.send().unwrap().state, DeliveryState::Confirmed);
-    let sent = f.sent();
-    assert_eq!(sent.len(), 1);
-    let text = sent[0]["params"]["text"].as_str().unwrap();
-    assert!(
-        text.contains("Retained instructions")
-            && text.contains("Retained task")
-            && !text.contains("Replacement must not be sent")
-    );
-    let intent: WorkerBriefIntent = serde_json::from_value(f.operation.payload.clone()).unwrap();
-    assert_eq!(
-        format!("{:x}", Sha256::digest(text.as_bytes())),
-        intent.prompt_digest
-    );
-    let state = runtime::snapshot(&f.project).unwrap();
-    assert_eq!(state.attempts[0].state, AttemptState::Running);
-    assert!(state.attempts[0].retains_capacity());
-    assert!(f.send().is_err());
-    assert_eq!(f.sent().len(), 1);
-}
-
-#[test]
 fn busy_foreign_and_changed_executable_workers_are_not_claimed() {
     for mode in ["busy", "foreign", "changed-executable"] {
         let f = Fixture::new(mode);
@@ -1015,101 +990,6 @@ fn revoked_barrier_routes_a_real_supervised_stop_and_recovers_after_commit_failu
 }
 
 #[test]
-fn desired_stop_works_while_paused_and_revoked_and_retains_resources() {
-    let f = Fixture::new("ok");
-    f.send().unwrap();
-    let artifact = f.project.join("REPORT.md");
-    fs::write(&artifact, "retain this report").unwrap();
-    let mut db = migration::open_active(&f.project).unwrap();
-    let state = db.read_snapshot(None).unwrap();
-    let attempt = state.attempts[0].clone();
-    db.cancel_attempt(
-        &attempt.id,
-        attempt.revision,
-        state.head,
-        "operator stop",
-        now(),
-    )
-    .unwrap();
-    let state = db.read_snapshot(None).unwrap();
-    let grant = state
-        .approvals
-        .iter()
-        .find(|a| a.consumed.is_some())
-        .unwrap();
-    db.revoke_approval(&grant.reference.id, state.head, now(), "stop execution")
-        .unwrap();
-    let state = db.read_snapshot(None).unwrap();
-    runtime::set_state(
-        &f.project,
-        state.head,
-        state.control.unwrap().revision,
-        ProjectState::Paused,
-        Path::new(&state.attempt_inputs[0].inputs.config.path),
-    )
-    .unwrap();
-    let before = runtime::snapshot(&f.project).unwrap();
-    let attempt = before.attempts[0].clone();
-    let done = reconcile_termination(
-        &f.project,
-        &attempt.id,
-        attempt.revision,
-        Instant::now() + Duration::from_secs(5),
-        Default::default(),
-    )
-    .unwrap()
-    .unwrap();
-    assert!(done.termination_observed);
-    assert_eq!(done.state, AttemptState::Cancelled);
-    let after = runtime::snapshot(&f.project).unwrap();
-    assert_eq!(after.control, before.control);
-    assert_eq!(after.ownership, before.ownership);
-    assert_eq!(after.runtime_bindings, before.runtime_bindings);
-    assert_eq!(after.tasks[0].state, TaskState::Cancelled);
-    assert!(after.tasks[0].active_attempt.is_none());
-    assert_eq!(fs::read_to_string(artifact).unwrap(), "retain this report");
-    assert!(
-        after
-            .events
-            .iter()
-            .any(|e| e.kind == "runtime.worker_resources_retained")
-    );
-    assert!(
-        reconcile_termination(
-            &f.project,
-            &attempt.id,
-            done.revision,
-            Instant::now() + Duration::from_secs(5),
-            Default::default()
-        )
-        .unwrap()
-        .unwrap()
-        .termination_observed
-    );
-    assert_eq!(runtime::snapshot(&f.project).unwrap(), after);
-}
-
-#[test]
-fn live_worker_without_cancellation_is_observed_without_being_stopped() {
-    let f = Fixture::new("ok");
-    let before = runtime::snapshot(&f.project).unwrap();
-    let attempt = &before.attempts[0];
-    assert!(
-        reconcile_termination(
-            &f.project,
-            &attempt.id,
-            attempt.revision,
-            Instant::now() + Duration::from_secs(3),
-            Default::default()
-        )
-        .unwrap()
-        .is_none()
-    );
-    assert_eq!(runtime::snapshot(&f.project).unwrap(), before);
-    assert!(f.send().is_ok());
-}
-
-#[test]
 fn stop_before_brief_atomically_retires_send_and_commit_failure_keeps_capacity() {
     let f = Fixture::new("ok");
     let mut db = migration::open_active(&f.project).unwrap();
@@ -1240,41 +1120,6 @@ fn conflicting_legacy_socket_alias_prevents_brief_claim() {
     assert!(f.send().is_err());
     assert_eq!(runtime::snapshot(&f.project).unwrap(), before);
     assert!(f.sent().is_empty());
-}
-
-#[test]
-fn controller_hints_rotate_brief_and_termination_without_granting_authority() {
-    let f = Fixture::new("ok");
-    let read = |turn| {
-        let mut budget = crate::store::identity_inventory::Budget::new(
-            2 * 1024 * 1024,
-            1024,
-            Instant::now() + Duration::from_secs(1),
-            Default::default(),
-        )
-        .unwrap();
-        migration::read_controller_effect_hint(&f.project, &mut budget, turn, now())
-            .unwrap()
-            .unwrap()
-    };
-    let first = read(0);
-    let next = read(1);
-    assert_ne!(first.operation.kind, next.operation.kind);
-    assert!(
-        [first.operation.kind.as_str(), next.operation.kind.as_str()]
-            .contains(&"runtime.worker_termination")
-    );
-    assert!(f.sent().is_empty());
-    let mut budget = crate::store::identity_inventory::Budget::new(
-        2 * 1024 * 1024,
-        1024,
-        Instant::now() + Duration::from_secs(1),
-        Default::default(),
-    )
-    .unwrap();
-    let targets = migration::read_launch_target_inventory(&f.project, &mut budget).unwrap();
-    assert_eq!(targets.len(), 1);
-    assert_eq!(targets[0].1.route.pane_id, "w1:p1");
 }
 
 #[test]
@@ -1649,139 +1494,6 @@ fn last_moment_brief_preflight_blocks_changed_authority_without_submission() {
         );
         assert!(f.sent().is_empty());
     }
-}
-
-#[test]
-fn native_resource_creation_records_gated_target_once_and_cancellation_retains_it() {
-    let f = Fixture::new("resource");
-    let target = create_resource(
-        &f.project,
-        &f.operation.id,
-        1,
-        Instant::now() + Duration::from_secs(15),
-        Default::default(),
-    )
-    .unwrap();
-    assert_eq!(target.version, 2);
-    assert!(target.supervisor.is_some());
-    let state = runtime::snapshot(&f.project).unwrap();
-    let creation = state
-        .events
-        .iter()
-        .find(|e| e.kind == "runtime.launch_creation")
-        .unwrap();
-    assert_eq!(
-        creation.payload["usage_warning"],
-        "provider_usage_unavailable"
-    );
-    assert_eq!(state.attempts[0].state, AttemptState::Reserved);
-    assert!(state.ownership.is_empty());
-    assert!(
-        !state
-            .events
-            .iter()
-            .any(|e| e.kind == "runtime.launch_started")
-    );
-    assert!(
-        create_resource(
-            &f.project,
-            &f.operation.id,
-            1,
-            Instant::now() + Duration::from_secs(15),
-            Default::default()
-        )
-        .is_err()
-    );
-    assert_eq!(
-        fs::read_to_string(f._root.path().join("created"))
-            .unwrap()
-            .lines()
-            .count(),
-        1
-    );
-    let mut db = migration::open_active(&f.project).unwrap();
-    db.cancel_attempt(
-        &target.attempt,
-        state.attempts[0].revision,
-        state.head,
-        "stop staged resource",
-        now(),
-    )
-    .unwrap();
-    let state = db.read_snapshot(None).unwrap();
-    let result = reconcile_termination(
-        &f.project,
-        &target.attempt,
-        state.attempts[0].revision,
-        Instant::now() + Duration::from_secs(5),
-        Default::default(),
-    )
-    .unwrap()
-    .unwrap();
-    assert!(!result.retains_capacity());
-    assert_eq!(result.state, AttemptState::Cancelled);
-    let after = db.read_snapshot(None).unwrap();
-    assert!(after.ownership.is_empty());
-    assert!(
-        !after
-            .events
-            .iter()
-            .any(|e| e.kind == "runtime.launch_started")
-    );
-    let mut budget = crate::store::identity_inventory::Budget::new(
-        2 * 1024 * 1024,
-        1024,
-        Instant::now() + Duration::from_secs(1),
-        Default::default(),
-    )
-    .unwrap();
-    assert_eq!(
-        migration::read_launch_target_inventory(&f.project, &mut budget).unwrap()[0].1,
-        target
-    );
-    assert!(f.sent().is_empty());
-}
-
-#[test]
-fn lost_resource_creation_reply_retains_claim_and_never_creates_again() {
-    let f = Fixture::new("resource-lost");
-    assert!(
-        create_resource(
-            &f.project,
-            &f.operation.id,
-            1,
-            Instant::now() + Duration::from_secs(15),
-            Default::default()
-        )
-        .is_err()
-    );
-    let state = runtime::snapshot(&f.project).unwrap();
-    assert_eq!(state.deliveries[0].state, DeliveryState::Claimed);
-    assert!(state.attempts[0].retains_capacity());
-    assert!(
-        !state
-            .events
-            .iter()
-            .any(|e| e.kind == "runtime.launch_target")
-    );
-    assert!(
-        create_resource(
-            &f.project,
-            &f.operation.id,
-            1,
-            Instant::now() + Duration::from_secs(15),
-            Default::default()
-        )
-        .is_err()
-    );
-    assert_eq!(
-        fs::read_to_string(f._root.path().join("created"))
-            .unwrap()
-            .lines()
-            .count(),
-        1
-    );
-    assert!(f.sent().is_empty());
 }
 
 #[test]
@@ -2317,34 +2029,6 @@ fn exit_before_any_identity_observation_keeps_uncertain_creation_reserved() {
             .count(),
         1
     );
-    }
-}
-
-#[test]
-fn resource_preparation_enforces_profile_budget_before_claim_or_external_effect() {
-    for (mode, expected) in [
-        ("resource-small-input", "profile input budget"),
-        (
-            "resource-block-usage",
-            "verified usage telemetry is required",
-        ),
-    ] {
-        let f = Fixture::new(mode);
-        let before = runtime::snapshot(&f.project).unwrap();
-        let error = create_resource(
-            &f.project,
-            &f.operation.id,
-            1,
-            Instant::now() + Duration::from_secs(15),
-            Default::default(),
-        )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains(expected), "{error:#}");
-        assert_eq!(runtime::snapshot(&f.project).unwrap(), before);
-        assert!(before.approvals.iter().all(|a| a.consumed.is_none()));
-        assert_eq!(before.deliveries[0].attempts, 0);
-        assert!(!f._root.path().join("created").exists());
-        assert!(f.sent().is_empty());
     }
 }
 
@@ -4584,26 +4268,6 @@ fn live_unobserved_exit(f:&Fixture,lab:&Path,binary:&Path,socket:&Path) {
     let requests=fs::read_to_string(lab.join("requests")).unwrap();
     assert_eq!(requests.lines().filter(|m|*m=="workspace.create_command").count(),1);
     assert_eq!(requests.lines().filter(|m|*m=="pane.send_input").count(),0);
-}
-
-#[test]
-fn unsupported_connected_server_refuses_creation_before_approval_or_worktrees() {
-    for mode in ["resource-release-workspace", "resource-release-workspace-repository"] {
-        for capability in [
-            json!({"type":"pong","version":"0.9.1","capabilities":{"workspace_create_command":"true"}}),
-            json!({"type":"pong","version":"0.9.2","capabilities":{"workspace_create_command":true}}),
-            json!({"type":"unknown","version":"0.9.1","capabilities":{"workspace_create_command":true}}),
-        ] {
-            let f=Fixture::new(mode);
-            fs::write(f._root.path().join("server-capability.json"),serde_json::to_vec(&capability).unwrap()).unwrap();
-            let before=runtime::snapshot(&f.project).unwrap();
-            let error=create_resource(&f.project,&f.operation.id,1,Instant::now()+Duration::from_secs(15),Default::default()).unwrap_err();
-            assert!(error.to_string().contains("does not advertise"),"{mode}: {error:#}");
-            assert_eq!(runtime::snapshot(&f.project).unwrap(),before);
-            assert!(!f._root.path().join("workspace-requests").exists());
-            assert!(!f.project.join(".state/worktrees").exists());
-        }
-    }
 }
 
 /// Stands in for `herdr-projects launch-exec <spec>`: this harness is not that

@@ -1013,3 +1013,54 @@ Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
   late-verification test: the older attempt's result took the valid row.
 - Dropping the open memory invalidation check from `verified_counts` failed
   the memory fence test.
+
+## Canonical worker unit tests replaced by ticker workflows
+
+The audit marked 9 `src/canonical_worker/tests.rs` tests REPLACE. Eight were
+deleted after `tests/canonical_worker.rs` covered them. That file queues,
+drafts, owner-signs and reserves a launch through the CLI. `ticker run` then
+creates the worker on a Herdr stand-in server that runs the supervised
+command for real, briefs it and stops it. The server logs every request, so
+each test counts the external effects it caused. The server is a logging
+variant of `RUNNING_HERDR_SERVER` with switches for a changed ping reply, a
+lost creation reply and a gate release that is never sent. Waits are on
+server requests, store state or the per-pass metrics file, never on elapsed
+time. Ticks are 15 s, so the crate takes about 40 s.
+
+| New E2E test | Replaced unit tests |
+| --- | --- |
+| `ticker_launches_and_briefs_once_then_stops_a_cancelled_worker_while_paused_and_revoked` (PROJECT.md changed after approval; two more passes on the live worker; CLI cancel, approval revoke and `runtime state paused`) | `native_brief_submits_retained_bytes_once_and_commits_running_state`, `controller_hints_rotate_brief_and_termination_without_granting_authority`, `live_worker_without_cancellation_is_observed_without_being_stopped`, `desired_stop_works_while_paused_and_revoked_and_retains_resources` |
+| `ticker_retires_a_cancelled_gated_worker_without_starting_it` | `native_resource_creation_records_gated_target_once_and_cancellation_retains_it` |
+| `ticker_recovers_a_lost_creation_reply_without_creating_again` (with a ticker restart) | `lost_resource_creation_reply_retains_claim_and_never_creates_again` |
+| `ticker_launches_nothing_on_a_server_without_the_launch_contract_or_while_paused` (three bad ping replies, then paused) | `unsupported_connected_server_refuses_creation_before_approval_or_worktrees` |
+| `profile_budgets_refuse_preparation_and_draft_before_any_approval` | `resource_preparation_enforces_profile_budget_before_claim_or_external_effect` |
+
+The budget refusal now happens earlier than in the deleted test. The whole
+brief is refused at `launch draft` ("exceeding the captured budget"), and a
+blocking `unknown_usage` is refused at `profile prepare`. Both happen before
+any approval. `create_resource` re-checks the budget, but it reads the frozen
+profile, so no CLI path reaches that check with a different budget.
+
+Behaviour changed since the audit: a lost creation reply no longer leaves the
+claim waiting for expiry. The same pass finds the labelled workspace through
+`workspace.list` and carries on to one brief. The test asserts exactly one
+`workspace.create_command` and one `agent.prompt` across a ticker restart.
+
+Kept: `prepared_launch_selection_rotates_stages_and_excludes_cancelled_or_expired_effects`.
+`ticker_does_not_dispatch_a_launch_cancelled_before_creation` and the paused
+case above now cover its paused and cancelled branches end to end. Its other
+branches are not reachable without forging state:
+- an expired launch lease needs a SIGKILL mid-launch and a 30 s wait;
+- a `reconciliation_required` flag that disagrees with `format.json`, and
+  a zero read budget, need hand-edited store rows.
+
+Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
+- Accepting any `workspace_create_command` value in `direct_root_transport`
+  failed the launch-contract test: the string `"true"` led to a
+  `workspace.create` request.
+- Stopping a started worker without a cancellation or completion
+  (`reconcile_termination`) failed the brief test: the worker was stopped
+  before its brief was confirmed.
+- Dropping `c.state='active'` from the launch dispatch hint did not fail the
+  paused test. Launch ingress checks the paused state again and refuses before
+  any Herdr request, so the guarantee still holds.
