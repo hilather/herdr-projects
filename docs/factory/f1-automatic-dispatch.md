@@ -276,5 +276,11 @@ Recorded here rather than folded into the card that found them.
   failed once** (exec-path check in the stock shell stand-in), then passed
   repeatedly. Investigate the stand-in's timing before it becomes a regular
   flake.
+- **Periodic integrity check limits** (open-check PR): it runs inline in the
+  ticker pass with a 30 s budget, so a very large store may never finish a
+  check; move it to a background lane or make it incremental. A failure pauses
+  only admission; queued effect jobs keep running on the store until an
+  operator acts. A leftover `integrity-check.json` stays in `.state/migration/`
+  after migration.
 - **Replace-verdict tests** (352 in `docs/reviews/2026-09-27-test-audit.tsv`):
   convert to E2E alongside feature work, starting with `store/barriers.rs`.
