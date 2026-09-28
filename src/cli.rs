@@ -714,6 +714,8 @@ enum ResultCommand {
 enum TaskCommand {
     /// Record cancellation; release capacity only with proof launch was never claimed
     CancelAttempt { attempt:String, #[arg(long)] expected_revision:u64, #[arg(long)] expected_head:u64, #[arg(long)] reason:String },
+    /// End the task's started attempt successfully once its submission has accepted verification for every policy; the controller stops the worker and releases capacity only after proven termination
+    Complete { id:String, #[arg(long)] expected_revision:u64 },
     /// Verify a signed task contract and install it. Does not launch.
     #[cfg(target_os="linux")]
     Contract { #[command(subcommand)] command:ContractCommand },
@@ -1160,6 +1162,7 @@ pub fn run() -> Result<()> {
                     println!("{}",runtime::queue_task(&dir,&TaskId::new(id).map_err(anyhow::Error::msg)?,expected_revision,expected_head,&request)?);
                 },
                 TaskCommand::CancelAttempt{attempt,expected_revision,expected_head,reason}=>println!("{}",serde_json::to_string_pretty(&runtime::cancel_attempt(&dir,&herdr_projects::domain::AttemptId::new(attempt).map_err(anyhow::Error::msg)?,expected_revision,expected_head,&reason)?)?),
+                TaskCommand::Complete{id,expected_revision}=>println!("{}",serde_json::to_string_pretty(&runtime::request_completion(&dir,&TaskId::new(id).map_err(anyhow::Error::msg)?,expected_revision)?)?),
                 TaskCommand::List=>println!("{}",serde_json::to_string_pretty(&runtime::snapshot(&dir)?)?),
                 TaskCommand::Show{id}=>{
                     let id=TaskId::new(id).map_err(anyhow::Error::msg)?;

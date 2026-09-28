@@ -431,7 +431,7 @@ pub fn deliver_brief(
     Ok(db.record_worker_brief(&claim, &receipt, now())?)
 }
 
-/// Fulfill desired cancellation, or reconcile a naturally exited worker. Stop
+/// Fulfill desired cancellation or completion, or reconcile a naturally exited worker. Stop
 /// remains available while paused/revoked because it narrows existing execution.
 /// Unknown or inaccessible process identity retains capacity. Files, worktrees,
 /// panes and runtime ownership remain in place for explicit preservation/review.
@@ -569,7 +569,7 @@ pub fn reconcile_termination(
         .context("worker supervisor identity missing")?;
     let cancelled = state.cancelled;
     if !SupervisorObservation::recover_exited(&identity)? {
-        if !cancelled {
+        if !cancelled && !state.completion {
             return Ok(None);
         }
         check(deadline, &cancellation)?;
@@ -600,6 +600,8 @@ pub fn reconcile_termination(
             retained_resources: binding.identity.clone(),
             cause: if cancelled {
                 WorkerTerminationCause::Cancellation
+            } else if state.completion {
+                WorkerTerminationCause::Completion
             } else {
                 WorkerTerminationCause::ProcessExit
             },

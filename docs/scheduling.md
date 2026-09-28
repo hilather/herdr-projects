@@ -124,6 +124,22 @@ send a stop signal. There is no termination adapter yet.
 | Claimed, retried, ambiguous or lost | Request audited; task revision fences old launch/result | Retained |
 | Adopted attempt without sealed inputs | Request audited | Retained |
 
+A worker whose result has been accepted is ended by completion, not cancellation:
+
+```sh
+herdr-projects task demo complete TASK --expected-revision R
+```
+
+The task's active attempt must have started, carry no cancellation, and have a
+submission whose every acceptance policy has an accepted verification run with
+a current contract check; otherwise the command refuses and writes nothing. It
+records the request only. The controller then stops the worker through the same
+termination path as cancellation and releases capacity only after proven exit,
+marking the attempt `completed` and the task `succeeded` (or `blocked` while
+memory obligations remain). A repeated request returns the recorded one with
+`replayed: true`. Dependents are released by verification or integration
+evidence as before; completion neither grants nor withdraws it.
+
 Schema upgrades preserve previous exports and claim history. Unsupported preexisting
 `runtime.launch` intents without sealed inputs block upgrade before commit; they
 cannot be promoted into launch authority. Reservation crash/rollback tests cover DB

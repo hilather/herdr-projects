@@ -133,10 +133,18 @@ Recorded here rather than folded into the card that found them.
   change in another agent's entry refuses the rename; recovery
   (`allow_name=false`) then loops on "native worker name mismatch". Compare
   only the target agent, and let recovery finish an unapplied rename.
-- **No completion path for a finished worker** (F1.7). Only cancellation stops
-  it, and that marks the task cancelled, so its dependents report
-  `predecessor_failed`. A verified or integrated result should let the attempt
-  end without failing the task.
+- **No completion path for a finished worker** (F1.7) — done (this PR):
+  `hp task <slug> complete <task> --expected-revision N` records a completion
+  request for the task's started attempt, refused unless one of its
+  submissions has an accepted run with a current contract check for every
+  acceptance policy. The existing termination path stops the worker and
+  releases capacity only on proven exit; the attempt becomes `completed` and
+  the task `succeeded` (`blocked` if memory obligations remain), never
+  `cancelled`. Repeats return the recorded request. Dependents still rely only
+  on verified or integrated evidence. Operator-only: the controller does not
+  complete automatically after verification yet. Only cancellation stopped a
+  finished worker, which marked the task cancelled, so its dependents
+  reported `predecessor_failed`.
 - **Integration rechecks one policy** (F1.7): done (this PR). The candidate
   check runs every acceptance policy of the contract revision, in id order
   within one 30 s budget, and publishes only if all pass. Each verdict is

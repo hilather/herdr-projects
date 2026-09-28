@@ -217,6 +217,11 @@ pub fn queue_report(project:&Path)->Result<crate::domain::QueueReport> {
     Ok(migration::open_active_scoped(project,control)?.queue_report(jiff::Timestamp::now().as_millisecond())?)
 }
 
+pub fn request_completion(project:&Path,task:&crate::domain::TaskId,revision:u64)->Result<crate::domain::CompletionChange> {
+    let _guard=migration::runtime_mutation(project)?;
+    Ok(migration::open_active(project)?.request_completion(task,revision,jiff::Timestamp::now().as_millisecond())?)
+}
+
 pub fn cancel_attempt(project:&Path,id:&crate::domain::AttemptId,revision:u64,head:u64,reason:&str)->Result<crate::domain::CancellationChange> {
     let _guard=migration::runtime_mutation(project)?;
     Ok(migration::open_active(project)?.cancel_attempt(id,revision,head,reason,jiff::Timestamp::now().as_millisecond())?)

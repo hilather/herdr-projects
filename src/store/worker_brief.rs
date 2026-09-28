@@ -78,7 +78,8 @@ fn authority_with_budget(db: &Connection, record: &AttemptInputRecord, now: i64,
         || control.reconciliation_required
         || control.epoch != inputs.control_epoch
         || control.config_digest != inputs.config.digest
-        || db.query_row("SELECT EXISTS(SELECT 1 FROM attempt_cancellations WHERE attempt_id=?1)", [record.attempt.as_str()], |row| row.get::<_,bool>(0))?
+        || db.query_row("SELECT EXISTS(SELECT 1 FROM attempt_cancellations WHERE attempt_id=?1)
+            OR EXISTS(SELECT 1 FROM events WHERE kind='attempt.completion_requested' AND entity=?1)", [record.attempt.as_str()], |row| row.get::<_,bool>(0))?
     {
         return Err(StoreError::Conflict);
     }

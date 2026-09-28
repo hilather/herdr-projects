@@ -57,3 +57,7 @@ pub struct CancellationRequest {pub attempt:AttemptId,pub requested_unix_ms:i64,
 pub struct Reservation {pub head:u64,pub record:AttemptInputRecord,pub task_revision:u64}
 #[derive(Debug,Serialize)]
 pub struct CancellationChange {pub head:u64,pub attempt:AttemptId,pub released:bool,pub attempt_revision:u64,pub task_revision:u64}
+/// An operator request to end an attempt successfully. It releases nothing:
+/// capacity is freed only when the worker's termination is proven.
+#[derive(Debug,Serialize)]
+pub struct CompletionChange {pub head:u64,pub task:TaskId,pub attempt:AttemptId,pub attempt_revision:u64,pub replayed:bool,pub terminated:bool}

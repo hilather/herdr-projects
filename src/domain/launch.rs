@@ -101,6 +101,8 @@ pub struct PreparedWorkerBriefReceipt {
 pub enum WorkerTerminationCause {
     Cancellation,
     ProcessExit,
+    /// Stopped after an operator completion request for an accepted result.
+    Completion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -14,6 +14,8 @@ pub(crate) struct TerminationWorker {
     pub delivery:crate::operations::Delivery,
     pub events:Vec<Event>,
     pub cancelled:bool,
+    /// An operator completion request: stop the worker without failing its task.
+    pub completion:bool,
 }
 impl SqliteStore {
     pub(super) fn termination_selection(&mut self,id:&AttemptId,expected:u64,budget:&read_budget::ReadBudget)->Result<TerminationSelection> {
@@ -30,6 +32,7 @@ impl SqliteStore {
         let delivery=super::delivery::delivery_with_budget(&tx,&record.operation,Some(budget))?;
         super::approvals::validate_historical_consumption(&tx,&record,Some(budget))?;
         let cancelled=tx.query_row("SELECT EXISTS(SELECT 1 FROM attempt_cancellations WHERE attempt_id=?1)",[id.as_str()],|row|row.get(0))?;
+        let completion=completion_requested(&tx,id)?;
         let mut query=tx.prepare("SELECT sequence,kind,entity,revision,payload_version,payload FROM events WHERE entity=?1 AND (kind GLOB 'runtime.launch_*' OR kind IN ('runtime.worktrees_creation','runtime.worktrees_ready')) ORDER BY sequence")?;
         let mut rows=query.query([record.operation.as_str()])?;
         let mut events=Vec::new();
@@ -39,7 +42,7 @@ impl SqliteStore {
             events.push(Event{sequence:row.get(0)?,kind:row.get(1)?,entity:row.get(2)?,revision:row.get(3)?,payload_version:row.get(4)?,payload:serde_json::from_str(&payload).map_err(|e|StoreError::Corrupt(e.to_string()))?});
         }
         budget.check()?;
-        Ok(TerminationSelection{head,attempt,worker:Some(TerminationWorker{record,task,binding,owner,delivery,events,cancelled})})
+        Ok(TerminationSelection{head,attempt,worker:Some(TerminationWorker{record,task,binding,owner,delivery,events,cancelled,completion})})
     }
 }
 
@@ -183,9 +186,15 @@ impl SqliteStore {
             return Err(StoreError::Conflict);
         }
         let cancelled:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM attempt_cancellations WHERE attempt_id=?1)",[attempt.id.as_str()],|row|row.get(0))?;
-        if (receipt.cause == WorkerTerminationCause::Cancellation) != cancelled {
+        // Cancellation overrides a completion request; either names the cause.
+        let completion=!cancelled&&completion_requested(&tx,&attempt.id)?;
+        let cause=if cancelled {WorkerTerminationCause::Cancellation} else if completion {WorkerTerminationCause::Completion} else {WorkerTerminationCause::ProcessExit};
+        if receipt.cause != cause {
             return Err(StoreError::Conflict);
         }
+        // A completed task must also clear its memory obligations; otherwise it
+        // stays blocked (not failed) for the operator, as a process exit does.
+        let succeeded=completion&&super::memory_barrier::report_with_budget(&tx,task.id.as_str(),now,budget)?.blockers.is_empty();
         // Retire outstanding brief obligations without asserting whether an
         // uncertain submission happened. Every old claim is fenced atomically.
         let mut query=tx.prepare("SELECT id FROM operations WHERE kind='runtime.worker_brief' AND json_extract(payload,'$.attempt')=?1 ORDER BY id")?;
@@ -213,6 +222,8 @@ impl SqliteStore {
         attempt.termination_observed = true;
         attempt.state = if cancelled {
             AttemptState::Cancelled
+        } else if completion {
+            AttemptState::Completed
         } else {
             AttemptState::Failed
         };
@@ -220,6 +231,8 @@ impl SqliteStore {
         task.active_attempt = None;
         task.state = if cancelled {
             TaskState::Cancelled
+        } else if succeeded {
+            TaskState::Succeeded
         } else {
             TaskState::Blocked
         };
@@ -429,5 +442,65 @@ impl SqliteStore {
         if let Some(budget)=budget {budget.check()?;}
         tx.commit()?;
         Ok(attempt)
+    }
+}
+
+fn completion_requested(db:&Connection,attempt:&AttemptId)->Result<bool> {
+    Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE kind='attempt.completion_requested' AND entity=?1)",[attempt.as_str()],|row|row.get(0))?)
+}
+
+/// Accepted evidence: a submission of this attempt under the task's installed
+/// contract whose every acceptance policy has an accepted run, a verified
+/// result and a current (version 2) contract check.
+const ACCEPTED_SUBMISSION: &str = "SELECT s.submission_id FROM result_submissions s
+    JOIN task_contracts c ON c.task_id=s.task_id AND c.contract_revision=s.contract_revision AND c.raw_digest=s.contract_digest
+    WHERE s.task_id=?1 AND s.attempt_id=?2
+      AND EXISTS(SELECT 1 FROM acceptance_policies p WHERE p.task_id=s.task_id AND p.contract_revision=s.contract_revision)
+      AND NOT EXISTS(SELECT 1 FROM acceptance_policies p WHERE p.task_id=s.task_id AND p.contract_revision=s.contract_revision
+          AND NOT EXISTS(SELECT 1 FROM verification_runs v JOIN verified_results r ON r.run_id=v.run_id
+              JOIN verification_contract_checks k ON k.result_id=r.result_id AND k.version=2
+              WHERE v.submission_id=s.submission_id AND v.policy_id=p.policy_id AND v.state='accepted'))
+    ORDER BY s.created_unix_ms,s.submission_id LIMIT 1";
+
+impl SqliteStore {
+    /// Ask the controller to stop a task's started worker because its result
+    /// was accepted. Only the attempt's state is requested here; the existing
+    /// termination path stops the worker, proves its exit and only then
+    /// releases capacity, marking the attempt completed and the task
+    /// succeeded. Dependents keep relying on verification or integration
+    /// evidence, never on this state. A repeat returns the recorded request.
+    pub fn request_completion(&mut self,task_id:&TaskId,expected_revision:u64,now:i64)->Result<CompletionChange> {
+        super::delivery::now_check(now)?;
+        let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        check_schema(&tx)?;
+        let version:u32=tx.query_row("PRAGMA user_version",[],|row|row.get(0))?;
+        if version<43 {return Err(StoreError::UnsupportedSchema(version));}
+        let task=read_task(&tx,task_id.as_str())?;
+        let requested:Option<String>=tx.query_row("SELECT e.entity FROM events e JOIN attempts a ON a.id=e.entity
+            WHERE e.kind='attempt.completion_requested' AND a.task_id=?1 ORDER BY e.sequence DESC LIMIT 1",[task_id.as_str()],|row|row.get(0)).optional()?;
+        if let Some(requested)=requested {
+            let attempt=read_attempt(&tx,&AttemptId::new(requested).map_err(StoreError::Corrupt)?)?;
+            if task.active_attempt.as_ref().is_none_or(|active|*active==attempt.id) {
+                return Ok(CompletionChange{head:head(&tx)?,task:task.id,attempt_revision:attempt.revision,terminated:attempt.termination_observed,attempt:attempt.id,replayed:true});
+            }
+        }
+        if task.revision!=expected_revision {return Err(StoreError::Conflict);}
+        let active=task.active_attempt.clone().ok_or_else(||StoreError::Invalid("task has no active attempt to complete".into()))?;
+        let mut attempt=read_attempt(&tx,&active)?;
+        if !attempt.retains_capacity() {return Err(StoreError::Invalid("attempt already has termination evidence".into()));}
+        if tx.query_row("SELECT EXISTS(SELECT 1 FROM attempt_cancellations WHERE attempt_id=?1)",[active.as_str()],|row|row.get::<_,bool>(0))? {
+            return Err(StoreError::Invalid("attempt has a cancellation request".into()));
+        }
+        let started:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM attempt_inputs i JOIN events e ON e.entity=i.operation_id AND e.kind='runtime.launch_started' WHERE i.attempt_id=?1)",[active.as_str()],|row|row.get(0))?;
+        if !started {return Err(StoreError::Invalid("worker has not started; cancel the attempt instead".into()));}
+        let submission:Option<String>=tx.query_row(ACCEPTED_SUBMISSION,params![task_id.as_str(),active.as_str()],|row|row.get(0)).optional()?;
+        let submission=submission.ok_or_else(||StoreError::Invalid("completion requires a submission of this attempt with accepted verification for every acceptance policy".into()))?;
+        attempt.revision=attempt.revision.checked_add(1).ok_or(StoreError::Conflict)?;
+        tx.execute("UPDATE attempts SET revision=?2 WHERE id=?1",params![active.as_str(),integer(attempt.revision)?])?;
+        let payload=serde_json::json!({"version":1,"task":task_id,"attempt":active,"submission":submission,"requested_unix_ms":now}).to_string();
+        tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('attempt.completion_requested',?1,?2,1,?3)",params![active.as_str(),integer(attempt.revision)?,payload])?;
+        let change=CompletionChange{head:head(&tx)?,task:task.id,attempt:active,attempt_revision:attempt.revision,replayed:false,terminated:false};
+        tx.commit()?;
+        Ok(change)
     }
 }
