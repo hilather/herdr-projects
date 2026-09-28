@@ -59,8 +59,8 @@ pub fn report(project: &Path, since: Option<i64>) -> Result<Value> {
     metrics.insert("M02", ratio("M02", accepted, terminal.len(), json!({"excluded": {"open": open, "outside_window": outside}})));
     metrics.insert("M07", ratio("M07", cohort.len(), accepted, json!({"attempts_without_decision": cohort.iter().filter(|a| a.decided.is_none()).count()})));
 
-    let sidecar = super::sidecar::open(project, false)?;
-    usage_metrics(sidecar.as_ref(), &attempts, since, &in_window, &mut metrics)?;
+    let sidecar = super::sidecar::read(project)?;
+    usage_metrics(sidecar.as_deref(), &attempts, since, &in_window, &mut metrics)?;
     for id in ["M31", "M32", "M33"] { metrics.insert(id, metric(id, json!({"value": unavailable("attention_not_collected")}))); }
     let mut decisions = Vec::new();
     for a in attempts.iter().filter(|a| a.decided.is_some() && in_window(a)) {

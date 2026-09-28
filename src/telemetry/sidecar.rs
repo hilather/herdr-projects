@@ -43,10 +43,27 @@ pub fn open(project: &Path, create: bool) -> Result<Option<Connection>> {
     Ok(Some(db))
 }
 
+/// The sidecar opened strictly read-only (`super::read_only`); absent → `None`.
+pub(crate) fn read(project: &Path) -> Result<Option<super::ReadOnly>> {
+    let path = path(project);
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(meta) if !meta.is_file() => bail!("telemetry sidecar is not a regular file"),
+        Ok(_) => {}
+    }
+    let db = super::read_only(&path)?;
+    let version: usize = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version == 0 || version > MIGRATIONS.len() {
+        bail!("telemetry sidecar schema {version} is not readable by this binary");
+    }
+    Ok(Some(db))
+}
+
 /// Per-attempt usage (contracts §4 `usage`) and per-rollout metadata. Read-only.
 pub fn report(project: &Path) -> Result<Value> {
     let attempts = super::codex::canonical_attempts(project)?;
-    let Some(db) = open(project, false)? else {
+    let Some(db) = read(project)? else {
         let attempts = attempts.iter().map(|a| json!({"attempt_id": a.id, "usage": unavailable(if a.codex() { "collection_not_run" } else { "adapter_absent" })}));
         return Ok(json!({"attempts": attempts.collect::<Vec<_>>(), "sessions": []}));
     };

@@ -30,11 +30,10 @@ fn show_usage(value: &Value) -> String {
 
 /// Sidecar presence and age of the last collect that ingested a rollout.
 pub fn collection(project: &Path, now_ms: i64) -> Result<String> {
-    let path = super::sidecar::path(project);
-    if std::fs::symlink_metadata(&path).is_err() {
+    let Some(db) = super::sidecar::read(project)? else {
         return Ok("collection not run (no telemetry sidecar)".into());
-    }
-    let last: Option<i64> = read_only(&path)?.query_row("SELECT max(updated_unix_ms) FROM collect_offsets", [], |r| r.get(0))?;
+    };
+    let last: Option<i64> = db.query_row("SELECT max(updated_unix_ms) FROM collect_offsets", [], |r| r.get(0))?;
     Ok(format!("sidecar present; last collect {}", last.map_or("n/a (no_rollouts)".into(), |at| format!("{} ago", elapsed(now_ms - at)))))
 }
 
@@ -52,8 +51,7 @@ pub fn render(project: &Path, now_ms: i64) -> Result<String> {
         "SELECT a.id,a.task_id,a.state,{label},{reserved},json_extract(i.payload,'$.inputs.effective_profile.kind') FROM attempts a
          LEFT JOIN attempt_inputs i ON i.attempt_id=a.id WHERE a.state NOT IN ('completed','failed','cancelled','lost') ORDER BY a.rowid"))?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?.collect::<rusqlite::Result<_>>()?;
-    let sidecar = super::sidecar::path(project);
-    let sidecar = if std::fs::symlink_metadata(&sidecar).is_ok() { Some(read_only(&sidecar)?) } else { None };
+    let sidecar = super::sidecar::read(project)?;
     out += &format!("\nactive attempts ({})\n", active.len());
     for (id, task, state, label, reserved, kind) in active {
         let usage = match (kind.as_deref(), &sidecar) {

@@ -2,7 +2,6 @@
 //! attempt (one with sealed `attempt_inputs`), joining the dispatch decision,
 //! lifecycle marks, result, verification and integration. Missing values are
 //! `unavailable` or `censored` with a reason, never 0.
-use crate::store::{SqliteStore, StoreError};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path};
@@ -14,16 +13,19 @@ fn status(status: &str, reason: &str) -> Value {
 }
 
 /// `{"attempts": [...]}` in reservation order.
-pub fn attempts(project: &Path) -> Result<Value, StoreError> {
-    let mut store = SqliteStore::open(&project.join(".state/state.db"))?;
+/// Opened strictly read-only (contracts §0 "Reads"), in one read transaction.
+pub fn attempts(project: &Path) -> anyhow::Result<Value> {
+    let store = super::read_only(&project.join(".state/state.db"))?;
+    crate::store::check_schema(&store)?;
     let home = std::env::var("HOME").ok();
-    let records = store.telemetry_read(|db| {
+    let records = {
+        let db = store.unchecked_transaction()?;
         let version: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         let rows = db.prepare("SELECT i.attempt_id,a.task_id,a.state,json_extract(i.payload,'$.inputs.effective_profile.kind') FROM attempt_inputs i JOIN attempts a ON a.id=i.attempt_id ORDER BY i.rowid")?
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows.into_iter().map(|(attempt, task, state, kind)| record(db, version, &attempt, &task, &state, kind.as_deref(), home.as_deref())).collect::<rusqlite::Result<Vec<_>>>()
-    })?;
+        rows.into_iter().map(|(attempt, task, state, kind)| record(&db, version, &attempt, &task, &state, kind.as_deref(), home.as_deref())).collect::<rusqlite::Result<Vec<_>>>()?
+    };
     Ok(json!({"attempts": records}))
 }
 

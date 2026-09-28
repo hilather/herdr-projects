@@ -305,7 +305,7 @@ fn connect(path: &Path) -> Result<Connection> {
     db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF; PRAGMA synchronous=FULL;")?;
     Ok(db)
 }
-fn check_schema(db: &Connection) -> Result<()> {
+pub(crate) fn check_schema(db: &Connection) -> Result<()> {
     let version: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version == 0 || version > SCHEMA { return Err(StoreError::UnsupportedSchema(version)); }
     let application: u32 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;

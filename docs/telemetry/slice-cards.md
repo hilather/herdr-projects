@@ -192,12 +192,13 @@ Stop if the panel would write, launch, or read content outside contracts §7.
 [codex-live-0.154.0.md](codex-live-0.154.0.md)),
 `attempts = dispatch_decisions`; contracts §8 stays deferred.
 
-**Follow-ups found in S7:** the panel and S6 report open the canonical store
-`immutable` when no `-wal` file exists (a plain read-only open of a WAL
-database creates `-wal`/`-shm` files); a writer that starts mid-read could
-make one display read inconsistent pages — display only, never the store.
-The S6 report still opens an existing sidecar read-write. No action opens the
-fleet pane yet. "Last collect" is the last ingest time.
+**Follow-ups found in S7:** "Last collect" is the last ingest time.
+- Done: every reader (panel, S6 report, `attempts`, `usage`, doctor, the
+  collector's canonical read) opens both stores strictly read-only and creates
+  no file; the `immutable` open is guarded by a SHARED-range read lock and used
+  only when no `-wal`/`-shm` pair exists (contracts §0 "Reads");
+  `reads_leave_state_untouched`.
+- No action opens the fleet pane yet.
 
 **Follow-ups found in live certification:** `telemetry attempts` still reports
 Codex usage as `collection_not_run` even when the sidecar has bound, certified

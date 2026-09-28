@@ -443,6 +443,66 @@ fn quota_headroom_at_dispatch() {
         "value": unavailable("no_observation")}]));
 }
 
+/// Every file under `dir` with its length and modification time.
+fn tree(dir: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        let meta = fs::symlink_metadata(&path).unwrap();
+        if meta.is_dir() { out.extend(tree(&path)); } else { out.push((path, meta.len(), meta.modified().unwrap())); }
+    }
+    out.sort();
+    out
+}
+
+fn names(dir: &Path) -> Vec<PathBuf> { tree(dir).into_iter().map(|(path, ..)| path).collect() }
+
+/// `pane fleet` as the plugin popup runs it (stdin closed: the hold-open prompt returns).
+fn fleet_pane(f: &Fixture) -> String {
+    fs::write(f.project.join("PROJECT.md"), "# demo\n").unwrap();
+    let out = Command::new(BIN).env_clear().env("HOME", f.tmp.path().join("home")).env("PATH", "/usr/bin:/bin")
+        .args(["--root", f.root.to_str().unwrap(), "pane", "fleet"]).stdin(std::process::Stdio::null()).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Contracts §0 read-only opens: `attempts`, `usage`, `report` and the fleet
+/// pane write nothing under `.state`, with or without a live sidecar writer.
+#[test]
+fn reads_leave_state_untouched() {
+    let f = Fixture::new();
+    let path = f.rollout(&f.home, SID, &["head.jsonl"], &f.worktree(), f.decided + 1_000, "0.154.0");
+    f.cli("collect");
+    let state = f.project.join(".state");
+    let before = tree(&state);
+    assert!(!before.iter().any(|(p, ..)| p.to_string_lossy().ends_with("-wal") || p.to_string_lossy().ends_with("-shm")), "{before:?}");
+    f.cli_args(&["attempts", "--json"]);
+    f.cli("usage");
+    f.report();
+    let pane = fleet_pane(&f);
+    assert!(pane.contains("M08 input_tokens 1000\n"), "{pane}");
+    assert_eq!(tree(&state), before, "no reader writes or creates a file");
+
+    // A live writer (the ticker) keeps the sidecar's WAL open: readers see its
+    // committed frames through the existing `-shm` and still create nothing.
+    let writer = f.sidecar();
+    let _ = writer.query_row("SELECT count(*) FROM codex_usage", [], |r| r.get::<_, i64>(0)).unwrap();
+    let tail = fs::read_to_string(Path::new(FIXTURES).join("tail.jsonl")).unwrap();
+    let ts = jiff::Timestamp::from_millisecond(f.decided + 1_000).unwrap().to_string();
+    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    std::io::Write::write_all(&mut file, tail.replace("@SID@", SID).replace("@CWD@", &f.worktree()).replace("@TS@", &ts).as_bytes()).unwrap();
+    f.cli("collect");
+    let live = names(&state);
+    assert!(live.iter().any(|p| p.ends_with("telemetry.db-wal")), "{live:?}");
+    assert_eq!(metric(&f.report(), "M08")["value"], 1500, "the WAL's committed frames are read");
+    f.cli_args(&["attempts", "--json"]);
+    f.cli("usage");
+    let pane = fleet_pane(&f);
+    assert!(pane.contains("M08 input_tokens 1500\n"), "{pane}");
+    assert_eq!(names(&state), live);
+    drop(writer);
+}
+
 fn contains_canary(bytes: &[u8]) -> bool {
     let lower = bytes.to_ascii_lowercase();
     lower.windows(6).any(|w| w == b"canary")

@@ -26,6 +26,19 @@ needs a new reviewed revision, not a silent reinterpretation.
   `migrations/telemetry/`, mode 0600, created on first collect. No
   cross-database transaction or foreign key; sidecar rows reference canonical
   IDs by value and record `orphan` when the canonical row is missing.
+- **Reads.** `attempts`, `usage`, `report`, the fleet pane, `doctor` and the
+  collector's canonical read open `state.db` and `telemetry.db` strictly
+  read-only and create no file (`telemetry::read_only`): first an advisory
+  read lock on SQLite's SHARED byte range of the main file (held until the
+  connection closes, so no writer can take EXCLUSIVE to checkpoint-on-close or
+  delete `-wal`/`-shm`); then, when both `-wal` and `-shm` exist, a plain
+  read-only open that reads committed WAL frames through the existing `-shm`;
+  otherwise (no connection has the file open) an `immutable` open, because a
+  plain read-only open would create `-wal`/`-shm` that only a writer removes.
+  Residual: in the `immutable` case a writer that opens mid-read and
+  auto-checkpoints (≥1000 WAL pages) could show one display inconsistent
+  pages; the stores are never affected. A sidecar whose schema this binary
+  does not know is refused, never migrated, by a reader.
 
 ## 1. TaskClassification (taxonomy v1)
 

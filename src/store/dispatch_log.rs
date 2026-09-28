@@ -88,11 +88,3 @@ fn contract_scope(tx:&Connection,task:&str,revision:i64,budget:Option<&read_budg
     while let Some(row)=rows.next()? {if let Some(budget)=budget {budget.row(row,&[])?;}write_named_resources.push(row.get(0)?);}
     Ok(ContractScope{revision:u64::try_from(revision).map_err(|_|StoreError::Conflict)?,route,write_paths,write_named_resources})
 }
-
-impl SqliteStore {
-    /// One read transaction for a read-only telemetry projection; nothing is written.
-    pub(crate) fn telemetry_read<T>(&mut self,read:impl FnOnce(&Connection)->rusqlite::Result<T>)->Result<T> {
-        let tx=self.connection.transaction()?;check_schema(&tx)?;
-        let value=read(&tx)?;tx.commit()?;Ok(value)
-    }
-}

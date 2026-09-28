@@ -2,7 +2,7 @@
 //! `<execution_home>/.codex/sessions/**/rollout-*.jsonl`, allowlisted typed
 //! fields only, idempotent by `(session_id, ordinal)`, bound by cwd and time.
 use anyhow::Result;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::Deserialize;
 use serde_json::{Number, Value, json};
 use sha2::{Digest, Sha256};
@@ -60,7 +60,7 @@ fn canonical(project: &Path) -> Result<(Vec<CanonicalAttempt>, Vec<String>)> {
     if !path.exists() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
+    let db = super::read_only(&path)?;
     let table = |name: &str| db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [name], |r| r.get::<_, bool>(0));
     let profile = |value: &Value| (value["kind"].as_str().map(str::to_owned), value["execution_home"].as_str().map(str::to_owned));
     let mut attempts = Vec::new();
