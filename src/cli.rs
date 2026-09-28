@@ -258,12 +258,12 @@ enum Command {
     /// Inspect dependency queue and configure per-project scheduling limits
     #[cfg(feature="state-store")]
     Scheduler { slug:String, #[command(subcommand)] command:SchedulerCommand },
+    /// Telemetry: read-only projections and the usage sidecar; never grants launch, accepts results or changes budgets
+    #[cfg(feature="state-store")]
+    Telemetry { slug:String, #[command(subcommand)] command:TelemetryCommand },
     /// Read-only factory counters. Does not launch, admit, or print environment values.
     #[cfg(feature="state-store")]
     Factory { #[command(subcommand)] command:FactoryCommand },
-    /// Telemetry sidecar: analytics only, never grants launch or changes budgets.
-    #[cfg(feature="state-store")]
-    Telemetry { slug:String, #[command(subcommand)] command:TelemetryCommand },
     /// Inspect or explicitly rebind migrated runtime routing without granting ownership
     #[cfg(feature="state-store")]
     Runtime { slug:String, #[command(subcommand)] command:RuntimeCommand },
@@ -844,6 +844,8 @@ enum OperationsCommand { Inspect,
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
 enum TelemetryCommand {
+    /// One outcome record per canonical attempt (lifecycle, result, verification, integration)
+    Attempts { #[arg(long)] json:bool },
     /// Read Codex rollouts under each Codex execution home into .state/telemetry.db, then print usage.
     Collect,
     /// Print per-attempt usage and rollout bindings from the sidecar. Writes nothing.
@@ -1217,6 +1219,13 @@ pub fn run() -> Result<()> {
                 SchedulerCommand::Inspect=>println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::queue_report(&dir)?)?),
                 SchedulerCommand::Policy{max_active_workers,max_attempts_per_task,expected_revision,expected_head}=>println!("{}",herdr_projects::runtime::scheduler_policy(&dir,expected_head,expected_revision,max_active_workers,max_attempts_per_task)?),
             }Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Telemetry{slug,command:TelemetryCommand::Attempts{json}}=>{
+            project::validate_slug(&slug)?;
+            let report=herdr_projects::telemetry::outcome::attempts(&ctx.root.join(slug))?;
+            if json {println!("{}",serde_json::to_string_pretty(&report)?);} else {print!("{}",herdr_projects::telemetry::outcome::text(&report));}
+            Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command}=>{

@@ -2871,9 +2871,10 @@ sys.stdout.buffer.write(json.dumps({'result':json.loads(reply)['result']}).encod
 /// F1 follow-up: a worker whose result is verified and integrated ends by
 /// completion. Its termination is proven before capacity is released, its
 /// task succeeds instead of being cancelled, and its dependent stays released.
+/// Telemetry S3: the same run is the outcome record's success path.
 #[cfg(all(feature="state-store",target_os="linux"))]
 #[test]
-fn completing_a_verified_worker_stops_it_and_keeps_its_dependent_released() {
+fn outcome_success_path() {
     use std::{fs,time::{Duration,Instant}};
     use herdr_projects::{migration,runtime,domain::{TaskId,RuntimeRoute,AttemptState,TaskState},operations::DeliveryState};
     let f=VerifyFixture::with_worker(&[("src/start.txt","start\n".into())],
@@ -3028,6 +3029,36 @@ fn completing_a_verified_worker_stops_it_and_keeps_its_dependent_released() {
     let drafted=cli(&["launch","demo","draft","--selection",selection.to_str().unwrap(),"--expected-head",&head().to_string()]);
     assert_eq!(drafted["inputs"]["repositories"][0]["commit"],a_commit.as_str());
     assert_eq!(drafted["inputs"]["dependencies"][0]["task"],"a");
+
+    // Four lifecycle marks, one per transition, in order; the completion request only bumps the revision.
+    let marks=f.db().prepare("SELECT state,attempt_revision,unix_ms,source FROM attempt_lifecycle WHERE attempt_id=?1 ORDER BY rowid").unwrap()
+        .query_map([&attempt],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?))).unwrap().map(Result::unwrap).collect::<Vec<_>>();
+    assert_eq!(marks.iter().map(|(state,revision,_,source)|(state.as_str(),*revision,source.as_str())).collect::<Vec<_>>(),
+        [("reserved",1,"admit_prepared"),("launching",2,"apply_launch_started"),("running",3,"apply_worker_brief"),("completed",5,"record_worker_termination_with_budget")]);
+    assert!(marks.windows(2).all(|pair|pair[0].2<=pair[1].2),"{marks:?}");
+    let (configuration,classification,submitted_ms):(String,String,i64)=f.db().query_row("SELECT d.chosen_configuration_id,d.classification_id,s.created_unix_ms
+        FROM dispatch_decisions d JOIN result_submissions s ON s.attempt_id=d.attempt_id WHERE d.attempt_id=?1",[&attempt],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    let report=cli(&["telemetry","demo","attempts","--json"]);
+    assert_eq!(report,serde_json::json!({"attempts":[{
+        "accepted":true,
+        "active_ms":marks[3].2-marks[2].2,
+        "attempt_id":attempt,
+        "attention":{"reason":"attention_not_collected","status":"unavailable"},
+        // min(1,8) + 2 x 1 uncertain (trailing-slash scope) + 1 verify_then_integrate = 4.
+        "classification":{"band":"medium","class":"code","classification_id":classification},
+        "configuration_id":configuration,
+        "integration":{"state":"integrated"},
+        "launching_unix_ms":marks[1].2,
+        "queue_to_launch_ms":marks[1].2-marks[0].2,
+        "reserved_unix_ms":marks[0].2,
+        "result":{"candidate_oid":a_candidate,"created_unix_ms":submitted_ms,"state":"submitted","submission_id":a},
+        "running_unix_ms":marks[2].2,
+        "task_id":"a",
+        "terminal_state":"completed",
+        "terminal_unix_ms":marks[3].2,
+        "usage":{"reason":"adapter_absent","status":"unavailable"},
+        "verification":{"state":"accepted"}
+    }]}));
 }
 
 /// F1.7 acceptance. `HP_LIVE_F1_MODE=fixture` is the dry run: the ticker

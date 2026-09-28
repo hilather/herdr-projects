@@ -53,6 +53,8 @@ slice keeps this unchanged (TM2.4 bridge deferred).
 | `launching` | `src/store/launch.rs` `apply_launch_started` | none retained |
 | `running` | `src/store/worker_brief.rs` `apply_worker_brief` | none retained |
 | Terminal (`completed`/`failed`/`cancelled`/`lost`) | `src/store/worker_termination.rs` `record_worker_termination_with_budget`, `record_launch_stopped_with_budget`; `src/store/worktrees.rs` `stop_worktree_preparation_with_budget`; `src/store/reservations.rs` `cancel_attempt_in_transaction` | `now` passed in, not stored on the attempt |
+| Completion request (task `complete`, PR #58) | `src/store/worker_termination.rs` `request_completion` | Revision bump and `attempt.completion_requested` event only; the terminal `completed` (task `succeeded`) is then written by `record_worker_termination_with_budget` (cause `Completion`) |
+| Non-canonical attempts (no `attempt_inputs` row) | `src/store/ownership.rs` `adopt_runtime` inserts `adopt-*` attempts as `running`; `src/store/mod.rs` `commit` (`Mutation::Attempt`) writes any state but refuses sealed launch attempts | No dispatch decision or inputs; outside the outcome record (added for S3) |
 | `result_submissions` (attempt, candidate_oid, created_unix_ms) | `migrations/0026_factory_results.sql` | yes |
 | `verification_runs`, `verified_results` | `migrations/0027_verification_runs.sql` | yes |
 | `integration_operations`, `integration_candidates`, `integrated_commits` | `migrations/0028_integration.sql`, `0045_result_integration.sql` | yes |

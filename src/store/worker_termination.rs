@@ -244,6 +244,7 @@ impl SqliteStore {
                 attempt.state.as_str()
             ],
         )?;
+        super::dispatch_log::mark(&tx, &attempt, now, "record_worker_termination_with_budget")?;
         tx.execute(
             "UPDATE tasks SET revision=?2,state=?3,active_attempt=NULL WHERE id=?1",
             params![
@@ -402,6 +403,7 @@ impl SqliteStore {
                 attempt.state.as_str()
             ],
         )?;
+        super::dispatch_log::mark(&tx, &attempt, now, "record_launch_stopped_with_budget")?;
         tx.execute(
             "UPDATE tasks SET revision=?2,state=?3,active_attempt=NULL WHERE id=?1",
             params![

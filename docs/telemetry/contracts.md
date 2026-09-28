@@ -194,6 +194,40 @@ reads `unavailable: predates_lifecycle_log`.
 | `usage` | §5 sums if a certified bound rollout exists, else `unavailable` with reason `adapter_absent` (non-Codex kind), `not_bound`, `cli_version_uncertified`, `quarantined`, `collection_not_run` |
 | `attention` | always `unavailable`, reason `attention_not_collected` (S4 deferred) |
 
+S3 refinements:
+- Marks cover canonical attempts only (an `attempt_inputs` row). Adopted
+  attempts and generic `commit` writes (baseline §1) have no decision and are
+  not projected. A state keeps its first mark (`ON CONFLICT DO NOTHING`), so a
+  mark never blocks its transition. `cancel_attempt_in_transaction` marks
+  `cancelled` only when it releases the attempt; otherwise the termination
+  path writes the terminal mark later. Task `complete` writes no mark itself:
+  its terminal `completed` comes from `record_worker_termination_with_budget`.
+- An attempt without a `reserved` mark predates the log: its missing marks,
+  `active_ms` and `queue_to_launch_ms` are `unavailable:
+  predates_lifecycle_log` (a later mark written after the upgrade is shown).
+  For a logged attempt a mark not yet or never reached is `null`.
+- `terminal_state` is the attempt row's state when terminal, else `open`, so a
+  pre-0051 terminal attempt still reports its state. `active_ms`: open with a
+  running mark → `censored: open`; no running mark → `unavailable:
+  not_running`. `queue_to_launch_ms` without a launch mark → `censored` with
+  reason `open` or the terminal state (e.g. `cancelled`).
+- Shapes: `result` `{state: submitted|not_submitted, submission_id,
+  candidate_oid, created_unix_ms}`; `verification` `{state:
+  accepted|rejected|pending|not_submitted, reason?}` (latest run of the
+  earliest submission, reason excerpted with the reader's `HOME`);
+  `integration` `{state}` from the same submission: `not_applicable` unless the
+  route is `verify_then_integrate`, then `not_submitted`, `pending` (no
+  operation), the latest operation state, `integrated` (with an
+  `integrated_commits` row) or `integrated_unconfirmed` (state without a
+  commit row); `classification` `{classification_id, class, band}`. A missing
+  decision makes `configuration_id` and `classification` `unavailable:
+  predates_dispatch_log`.
+- `accepted` checks any submission of the attempt against the task's current
+  contract revision and route. `usage` is `unavailable: adapter_absent` for
+  non-Codex kinds and `collection_not_run` for Codex until S5 lands.
+- Verifier reasons are fixed codes today; the excerpt test adds a later run
+  with a free-text reason to show display-time redaction.
+
 ## 5. Codex usage (sidecar)
 
 **Source.** Rollout JSONL files under

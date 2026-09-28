@@ -1078,6 +1078,7 @@ impl SqliteStore {
             "UPDATE attempts SET revision=?2,state='launching' WHERE id=?1",
             params![attempt.id.as_str(), integer(attempt.revision)?],
         )?;
+        super::dispatch_log::mark(&tx, &attempt, now, "apply_launch_started")?;
         tx.execute(
             "DELETE FROM runtime_observations WHERE binding_id=?1",
             [&binding.id],

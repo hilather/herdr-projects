@@ -77,6 +77,12 @@ delegated replay would write a second row.
 
 ## S3 — Attempt outcome record (0051)
 
+**Done.** `attempt_lifecycle` (0051) marks written in each transition's
+transaction; `telemetry <slug> attempts [--json]` projects one outcome per
+canonical attempt. The success path extends the F1 completion test
+(`tests/cli.rs`); the upgrade test starts from schema 50, 0051's actual
+predecessor. Refinements in contracts §4.
+
 Goal: lifecycle marks at every transition, the read-only outcome projection,
 and `herdr-projects telemetry <slug> attempts [--json]`. Files:
 `migrations/0051_attempt_lifecycle.sql`; marks in `src/store/reservations.rs`,

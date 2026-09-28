@@ -5,6 +5,17 @@ use crate::domain::{agent_configuration, classify_task, excerpt, AgentConfigurat
 
 fn invalid(message:&str)->StoreError {StoreError::Invalid(message.into())}
 
+/// Contracts §4 lifecycle mark in the transition's own transaction. `source`
+/// names the transition function; a state keeps the first time it was reached.
+/// Stores before 0051 have no mark table and record nothing.
+pub(super) fn mark(tx:&Connection,attempt:&Attempt,now:i64,source:&str)->Result<()> {
+    let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
+    if version<51 {return Ok(());}
+    tx.execute("INSERT INTO attempt_lifecycle VALUES(?1,?2,?3,?4,?5) ON CONFLICT(attempt_id,state) DO NOTHING",
+        params![attempt.id.as_str(),attempt.state.as_str(),integer(attempt.revision)?,now,source])?;
+    Ok(())
+}
+
 /// The contracts §3 decision for a new attempt, after its `attempts` row. The
 /// context only describes the choice: its chosen entry must be the reserved profile.
 #[allow(clippy::too_many_arguments)]
@@ -76,4 +87,12 @@ fn contract_scope(tx:&Connection,task:&str,revision:i64,budget:Option<&read_budg
     let mut rows=stmt.query(params![task,revision])?;
     while let Some(row)=rows.next()? {if let Some(budget)=budget {budget.row(row,&[])?;}write_named_resources.push(row.get(0)?);}
     Ok(ContractScope{revision:u64::try_from(revision).map_err(|_|StoreError::Conflict)?,route,write_paths,write_named_resources})
+}
+
+impl SqliteStore {
+    /// One read transaction for a read-only telemetry projection; nothing is written.
+    pub(crate) fn telemetry_read<T>(&mut self,read:impl FnOnce(&Connection)->rusqlite::Result<T>)->Result<T> {
+        let tx=self.connection.transaction()?;check_schema(&tx)?;
+        let value=read(&tx)?;tx.commit()?;Ok(value)
+    }
 }

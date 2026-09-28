@@ -78,6 +78,9 @@ pub mod watchdog;
 #[cfg(feature = "state-store")]
 pub mod factory_status;
 
+#[cfg(feature = "state-store")]
+pub mod telemetry;
+
 #[cfg(all(feature = "state-store", target_os = "linux"))]
 pub mod worktree_preparation;
 
@@ -89,6 +92,3 @@ pub mod result_capture;
 
 #[cfg(all(feature = "state-store", target_os = "linux"))]
 pub mod integration;
-
-#[cfg(feature = "state-store")]
-pub mod telemetry;

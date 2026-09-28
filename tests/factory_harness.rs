@@ -1315,6 +1315,147 @@ fn task_without_contract_is_unscoped() {
     assert_eq!(rows[0].0, format!("sha256:{:x}", Sha256::digest(record.as_bytes())));
 }
 
+/// `herdr-projects telemetry <project> attempts --json`, the project under its parent root.
+#[cfg(target_os = "linux")]
+fn telemetry_attempts(project: &Path) -> serde_json::Value {
+    let root = project.parent().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_herdr-projects")).env_clear().env("HOME", root)
+        .args(["--root", root.to_str().unwrap(), "telemetry", project.file_name().unwrap().to_str().unwrap(), "attempts", "--json"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+/// `(state, attempt_revision, unix_ms, source)` lifecycle marks of the only attempt, in insertion order.
+#[cfg(target_os = "linux")]
+fn lifecycle_marks(db_path: &Path) -> Vec<(String, i64, i64, String)> {
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let mut stmt = conn.prepare("SELECT state,attempt_revision,unix_ms,source FROM attempt_lifecycle ORDER BY rowid").unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap().map(Result::unwrap).collect()
+}
+
+/// Cancel the one reserved attempt before any launch claim; returns its ID.
+#[cfg(target_os = "linux")]
+fn cancel_reserved(db_path: &Path) -> String {
+    let attempt: String = rusqlite::Connection::open(db_path).unwrap().query_row("SELECT id FROM attempts WHERE state='reserved'", [], |r| r.get(0)).unwrap();
+    let mut db = SqliteStore::open(db_path).unwrap();
+    assert!(db.cancel_attempt(&AttemptId::new(attempt.clone()).unwrap(), 1, db.current_head().unwrap(), "not needed", unix_ms()).unwrap().released);
+    attempt
+}
+
+#[cfg(target_os = "linux")]
+fn has_numeric_zero(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Number(n) => n.as_i64() == Some(0),
+        serde_json::Value::Array(items) => items.iter().any(has_numeric_zero),
+        serde_json::Value::Object(map) => map.values().any(has_numeric_zero),
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cancelled_before_launch_is_censored_not_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = classification_project(tmp.path(), "gone", Some("src/gone.rs"));
+    let db_path = project.join(".state/state.db");
+    admit_ready(&project);
+    let attempt = cancel_reserved(&db_path);
+    let marks = lifecycle_marks(&db_path);
+    assert_eq!(marks.iter().map(|(s, r, _, source)| (s.as_str(), *r, source.as_str())).collect::<Vec<_>>(),
+        [("reserved", 1, "admit_prepared"), ("cancelled", 2, "cancel_attempt_in_transaction")]);
+    let classification = classifications(&db_path)[0].0.clone();
+    let report = telemetry_attempts(&project);
+    assert_eq!(report, serde_json::json!({"attempts": [{
+        "accepted": false,
+        "active_ms": {"reason": "not_running", "status": "unavailable"},
+        "attempt_id": attempt,
+        "attention": {"reason": "attention_not_collected", "status": "unavailable"},
+        "classification": {"band": "small", "class": "code", "classification_id": classification},
+        "configuration_id": sha256_id(&sim_configuration("1.0.0")),
+        "integration": {"state": "not_applicable"},
+        "launching_unix_ms": null,
+        "queue_to_launch_ms": {"reason": "cancelled", "status": "censored"},
+        "reserved_unix_ms": marks[0].2,
+        "result": {"state": "not_submitted"},
+        "running_unix_ms": null,
+        "task_id": "gone",
+        "terminal_state": "cancelled",
+        "terminal_unix_ms": marks[1].2,
+        "usage": {"reason": "collection_not_run", "status": "unavailable"},
+        "verification": {"state": "not_submitted"}
+    }]}));
+    assert!(!has_numeric_zero(&report), "unknown durations are never 0: {report}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn outcome_rejected_verification_reason_is_excerpted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = classification_project(tmp.path(), "rej", Some("src/rej.rs"));
+    let db_path = project.join(".state/state.db");
+    admit_ready(&project);
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let (attempt, digest, repository, oid): (String, String, String, String) = conn.query_row(
+        "SELECT a.id,c.raw_digest,c.repository,c.base_oid FROM attempts a JOIN task_contracts c ON c.task_id=a.task_id", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
+    let work = tmp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let policy = work.join("policy.json");
+    fs::write(&policy, b"{\"version\":1,\"checks\":[\"/bin/false\"]}").unwrap();
+    let mut db = SqliteStore::open(&db_path).unwrap();
+    let submission = serde_json::json!({"idempotency_key": "submit-rej", "task_id": "rej", "contract_revision": 1, "contract_digest": digest,
+        "attempt_id": attempt, "repository": repository, "base_oid": oid, "candidate_oid": oid, "object_format": "sha1",
+        "artifact_manifest": [{"path": "README", "oid": oid}], "claimed_checks": ["worker prose is not evidence"],
+        "objects": [{"oid": oid, "relative_path": format!("{}/{}", &oid[..2], &oid[2..])}]});
+    let submitted = db.submit_result(&serde_json::to_vec(&submission).unwrap()).unwrap().submission_id;
+    let request = herdr_projects::verification::VerifyRequest::new(submitted.clone(), "builds", &policy, "verify-rej", Duration::from_secs(5), &work);
+    let outcome = herdr_projects::verification::verify(&mut db, &request).unwrap();
+    assert_eq!((outcome.state.as_str(), outcome.reason.as_deref()), ("rejected", Some("policy_digest_mismatch")));
+    let submitted_ms: i64 = conn.query_row("SELECT created_unix_ms FROM result_submissions", [], |r| r.get(0)).unwrap();
+    let report = telemetry_attempts(&project);
+    let record = &report["attempts"][0];
+    assert_eq!(record["result"], serde_json::json!({"candidate_oid": oid, "created_unix_ms": submitted_ms, "state": "submitted", "submission_id": submitted}));
+    assert_eq!(record["verification"], serde_json::json!({"reason": "policy_digest_mismatch", "state": "rejected"}));
+    assert_eq!((&record["integration"], &record["accepted"]), (&serde_json::json!({"state": "not_applicable"}), &serde_json::json!(false)));
+    // Verifier reasons are fixed codes today; a free-text reason is still shown only as an excerpt.
+    conn.execute("INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms)
+        SELECT ?1,project_store,'verify-later',payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,'rejected',?2,exit_status,NULL,store_device,store_inode,created_unix_ms+1 FROM verification_runs",
+        rusqlite::params!["f".repeat(64), "check failed in /home/alice/src/x.rs?token=abc123def\nsecond line is dropped"]).unwrap();
+    let report = telemetry_attempts(&project);
+    assert_eq!(report["attempts"][0]["verification"], serde_json::json!({"reason": "check failed in ~/src/x.rs", "state": "rejected"}));
+}
+
+#[cfg(target_os = "linux")]
+#[path = "../src/store/test_schema.rs"]
+mod test_schema;
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pre_0051_attempt_reports_predates_lifecycle_log() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = classification_project(tmp.path(), "old", Some("src/old.rs"));
+    let db_path = project.join(".state/state.db");
+    // Schema 50 is 0051's predecessor (S2's dispatch log already exists there).
+    test_schema::historical(&rusqlite::Connection::open(&db_path).unwrap(), 50).unwrap();
+    admit_ready(&project);
+    assert_eq!(sql_count(&db_path, "SELECT count(*) FROM dispatch_decisions"), 1);
+    SqliteStore::open(&db_path).unwrap().upgrade_v1().unwrap();
+    assert_eq!(sql_count(&db_path, "PRAGMA user_version"), 51);
+    let attempt = cancel_reserved(&db_path);
+    let marks = lifecycle_marks(&db_path);
+    assert_eq!(marks.iter().map(|(s, r, _, source)| (s.as_str(), *r, source.as_str())).collect::<Vec<_>>(),
+        [("cancelled", 2, "cancel_attempt_in_transaction")]);
+    let predates = serde_json::json!({"reason": "predates_lifecycle_log", "status": "unavailable"});
+    let report = telemetry_attempts(&project);
+    let record = &report["attempts"][0];
+    assert_eq!(record["attempt_id"], attempt.as_str());
+    assert_eq!(record["configuration_id"], sha256_id(&sim_configuration("1.0.0")).as_str());
+    for key in ["reserved_unix_ms", "launching_unix_ms", "running_unix_ms", "active_ms", "queue_to_launch_ms"] {
+        assert_eq!(record[key], predates, "{key}");
+    }
+    assert_eq!((&record["terminal_state"], &record["terminal_unix_ms"]), (&serde_json::json!("cancelled"), &serde_json::json!(marks[0].2)));
+    assert!(!has_numeric_zero(&report), "{report}");
+}
+
 #[cfg(target_os = "linux")]
 fn unix_ms() -> i64 {
     i64::try_from(

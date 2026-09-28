@@ -193,6 +193,7 @@ impl SqliteStore {
         let digest=format!("{:x}",Sha256::digest(payload.as_bytes()));let attempt=Attempt{id:attempt_id.clone(),task:record.inputs.task.clone(),revision:1,state:AttemptState::Reserved,snapshot:record.inputs.memory.as_ref().map(|r|r.id.clone()),reservation:format!("worker:{}",attempt_id.as_str()),termination_observed:false};
         tx.execute("INSERT INTO attempts VALUES(?1,?2,1,'reserved',?4,?3,0)",params![attempt_id.as_str(),attempt.task.as_str(),attempt.reservation,attempt.snapshot])?;
         if version>=50 {super::dispatch_log::record_decision(&tx,&record.inputs,&attempt_id,task_revision,classification.as_deref(),dispatch,delegated,now)?;}
+        super::dispatch_log::mark(&tx,&attempt,now,"admit_prepared")?;
         tx.execute("UPDATE tasks SET revision=?2,state='running',active_attempt=?3 WHERE id=?1",params![attempt.task.as_str(),integer(task_revision)?,attempt_id.as_str()])?;
         tx.execute("INSERT INTO operations VALUES(?1,?2,'runtime.launch',?3,1,?4,?5,?6,?7,?1)",params![operation_id.as_str(),attempt.task.as_str(),record.inputs.binding,payload,digest,integer(task_revision)?,now])?;
         tx.execute("INSERT INTO attempt_inputs VALUES(?1,?2,?3,?4)",params![attempt_id.as_str(),operation_id.as_str(),payload,digest])?;
@@ -253,6 +254,7 @@ pub(super) fn cancel_attempt_in_transaction(tx:&Connection,id:&AttemptId,expecte
         }
         attempt.revision=attempt.revision.checked_add(1).ok_or_else(||invalid("attempt revision exhausted"))?;
         tx.execute("UPDATE attempts SET revision=?2,state=?3,termination_observed=?4 WHERE id=?1",params![id.as_str(),integer(attempt.revision)?,attempt.state.as_str(),attempt.termination_observed])?;
+        if released {super::dispatch_log::mark(tx,&attempt,now,"cancel_attempt_in_transaction")?;}
         if task.active_attempt.as_ref()==Some(id)||released {task.revision=task.revision.checked_add(1).ok_or_else(||invalid("task revision exhausted"))?;tx.execute("UPDATE tasks SET revision=?2,state=?3,active_attempt=?4 WHERE id=?1",params![task.id.as_str(),integer(task.revision)?,task.state.as_str(),task.active_attempt.as_ref().map(AttemptId::as_str)])?;event(tx,"task.changed",task.id.as_str(),task.revision,&task)?;}
         let request=CancellationRequest{attempt:id.clone(),requested_unix_ms:now,reason:reason.into()};tx.execute("INSERT INTO attempt_cancellations VALUES(?1,?2,?3)",params![id.as_str(),now,reason])?;
         event(tx,"attempt.cancellation_requested",id.as_str(),attempt.revision,&serde_json::json!({"request":request,"released":released,"attempt":attempt}))?;

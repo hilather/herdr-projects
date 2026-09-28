@@ -310,6 +310,7 @@ impl SqliteStore {
             "UPDATE attempts SET revision=?2,state='running' WHERE id=?1",
             params![attempt.id.as_str(), integer(attempt.revision)?],
         )?;
+        super::dispatch_log::mark(&tx, &attempt, now, "apply_worker_brief")?;
         tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.worker_brief_delivered',?1,?2,1,?3)", params![receipt.operation.as_str(),integer(old.revision)?,payload])?;
         let schema: u32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if schema >= 43 {
