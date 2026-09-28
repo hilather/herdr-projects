@@ -181,6 +181,8 @@ impl SqliteStore {
         let(attempt_id,operation_id)=record_ids(&inputs)?;
         let task_revision=inputs.task_revision.checked_add(1).ok_or_else(||invalid("task revision exhausted"))?;
         let mut task=tasks.iter().find(|t|t.id==inputs.task).cloned().ok_or(StoreError::Conflict)?;task.revision=task_revision;task.state=TaskState::Running;task.active_attempt=Some(attempt_id.clone());
+        // Telemetry: classify before the first attempt row; later attempts reuse it.
+        if version>=49 {super::dispatch_log::classify_in_transaction(&tx,&inputs,queued.get(&inputs.task).ok_or(StoreError::Conflict)?.dependencies.len(),now,budget)?;}
         let record=AttemptInputRecord{attempt:attempt_id.clone(),operation:operation_id.clone(),inputs};let payload=serde_json::to_string(&record).map_err(|e|invalid(&e.to_string()))?;if payload.len()>MAX_RECORD_BYTES{return Err(invalid("attempt inputs exceed 1 MiB"));}
         let digest=format!("{:x}",Sha256::digest(payload.as_bytes()));let attempt=Attempt{id:attempt_id.clone(),task:record.inputs.task.clone(),revision:1,state:AttemptState::Reserved,snapshot:record.inputs.memory.as_ref().map(|r|r.id.clone()),reservation:format!("worker:{}",attempt_id.as_str()),termination_observed:false};
         tx.execute("INSERT INTO attempts VALUES(?1,?2,1,'reserved',?4,?3,0)",params![attempt_id.as_str(),attempt.task.as_str(),attempt.reservation,attempt.snapshot])?;

@@ -30,6 +30,8 @@ mod barrier_release;
 pub use barrier_release::*;
 mod barrier_reference;
 pub use barrier_reference::*;
+mod telemetry;
+pub use telemetry::*;
 
 macro_rules! identifier {
     ($($name:ident),+) => { $(

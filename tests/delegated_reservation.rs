@@ -283,5 +283,9 @@ fn signed_cli_reservation_enforces_subject_scope_quotas_and_replays_after_revoca
     let raw = rusqlite::Connection::open(path).unwrap();
     assert_eq!(raw.query_row("SELECT count(*) FROM delegated_reservations", [], |row| row.get::<_,u64>(0)).unwrap(), 2);
     assert_eq!(raw.query_row("SELECT count(*) FROM approval_uses", [], |row| row.get::<_,u64>(0)).unwrap(), 0);
+    // Telemetry: one classification per reserved task; replays and refusals add none. Empty scope: read_only, 0 points.
+    let classified: Vec<(String, i64, String, String)> = raw.prepare("SELECT task_id,contract_revision,class,band FROM task_classifications ORDER BY task_id").unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap().map(Result::unwrap).collect();
+    assert_eq!(classified, [("a".into(), 1, "read_only".into(), "small".into()), ("b".into(), 1, "read_only".into(), "small".into())]);
     assert!(db.read_snapshot(None).unwrap().attempts.iter().any(|attempt| attempt.retains_capacity()));
 }

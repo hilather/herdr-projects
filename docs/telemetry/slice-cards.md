@@ -27,6 +27,10 @@ an unavailable value into 0; or need cross-database atomicity.
 
 ## S1 — Task classification v1 (0049)
 
+**Done.** `task_classifications` (0049) written or reused in `admit_prepared`
+for all three paths; no-contract features are `unavailable: no_contract`, and
+`docs`/`tests` need at least one write path.
+
 Goal: every reservation writes or reuses the contracts §1 row inside
 `admit_prepared`. Files: `migrations/0049_task_classifications.sql`
 (immutable, unique `(task_id, contract_revision, taxonomy, revision)`),

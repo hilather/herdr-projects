@@ -2750,6 +2750,10 @@ fn controller_captures_uncommitted_worker_edits_for_submission_and_verification(
     sign(&document,herdr_projects::authority::SIGNATURE_NAMESPACE);
     let approval=ok(cli(&["approval","demo","import",document.to_str().unwrap(),document.with_extension("json.sig").to_str().unwrap(),"--expected-head",&head().to_string()]));
     let reservation=ok(cli(&["launch","demo","reserve","--selection",selection.to_str().unwrap(),"--approval-digest",approval["digest"].as_str().unwrap(),"--expected-head",&head().to_string()]));
+    // Telemetry: the operator reservation classified `src/` (one uncertain write path): 1 + 2 + 1 = 4.
+    let classified:(String,String,String)=rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap().query_row(
+        "SELECT class,band,features FROM task_classifications WHERE task_id='a' AND contract_revision=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    assert_eq!(classified,("code".into(),"medium".into(),r#"{"dependencies":0,"repositories":1,"route":"verify_then_integrate","uncertain_write_paths":1,"write_named_resources":0,"write_paths":1}"#.into()));
     let attempt=reservation["record"]["attempt"].as_str().unwrap().to_owned();
     let operation=herdr_projects::domain::OperationId::new(reservation["record"]["operation"].as_str().unwrap()).unwrap();
     let receipts=herdr_projects::worktree_preparation::prepare(&f.project,&operation,1,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default()).unwrap();

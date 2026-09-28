@@ -481,6 +481,96 @@ mod slice {
     }
 
     pub fn run() {
+        let (root, project, db_path) = through_d();
+        let mut db = herdr_projects::store::SqliteStore::open(&db_path).unwrap();
+        let snapshot = db.read_snapshot(None).unwrap();
+        let revision = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.id.as_str() == "dstale")
+            .unwrap()
+            .revision;
+        db.queue_task(
+            &TaskId::new("dstale").unwrap(),
+            revision,
+            snapshot.head,
+            &QueueRequest {
+                priority: 20,
+                dependencies: vec![
+                    Dependency {
+                        predecessor: TaskId::new("a").unwrap(),
+                        requirement: DependencyRequirement::IntegratedCommit,
+                    },
+                    Dependency {
+                        predecessor: TaskId::new("p").unwrap(),
+                        requirement: DependencyRequirement::IntegratedCommit,
+                    },
+                ],
+            },
+            jiff::Timestamp::now().as_millisecond(),
+        )
+        .unwrap();
+        drop(db);
+        enable_admission(&db_path);
+        assert!(admission::wake_enabled(&project));
+        assert_eq!(install_grant(&db_path, &project), "dstale");
+        let stale = admission::admit_once(&project).unwrap_err();
+        assert!(
+            stale.to_string().contains("integration_missing"),
+            "{stale:#}"
+        );
+        assert_eq!(attempts_for(&db_path, "dstale"), 0);
+        assert_eq!(attempts_for(&db_path, "b"), 0);
+        assert_eq!(attempts_for(&db_path, "c"), 0);
+        assert_eq!(attempts_for(&db_path, "d"), 0);
+
+        let manifest = serde_json::json!({
+            "vertical_slice": "pass",
+            "git_sha": super::workspace_git_sha(),
+            "combined_tree": "checks_failed",
+            "restarted_after_cas": true,
+            "worker_prose_satisfaction_rows": 0
+        });
+        let path = root.path().join("vertical-slice-manifest.json");
+        let text = serde_json::to_vec_pretty(&manifest).unwrap();
+        fs::write(&path, &text).unwrap();
+        let read: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(read["vertical_slice"], "pass");
+        assert_eq!(read["git_sha"], super::workspace_git_sha());
+        assert!(read["git_sha"].as_str().unwrap().len() >= 40);
+    }
+
+    /// `d` after `through_d`: 3 exact + 1 uncertain write paths (plus a read
+    /// path), 2 dependencies, 1 repository, `verify_then_integrate`.
+    pub fn classify_first_attempt() {
+        let (_root, project, db_path) = through_d();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        for (ordinal, path, access, certainty) in [(0, "src/fn.txt", "write", "exact"), (1, "src/peer.txt", "write", "exact"),
+            (2, "src/state.txt", "write", "exact"), (3, "src/gen/", "write", "uncertain"), (4, "README", "read", "exact")] {
+            conn.execute("INSERT INTO contract_scope_paths(task_id,contract_revision,ordinal,path,access,certainty) VALUES('d',1,?1,?2,?3,?4)",
+                rusqlite::params![ordinal, path, access, certainty]).unwrap();
+        }
+        drop(conn);
+        enable_admission(&db_path);
+        assert_eq!(install_grant(&db_path, &project), "d");
+        assert_eq!(count(&db_path, "SELECT count(*) FROM task_classifications"), 0, "a draft wrote a classification");
+        let before = jiff::Timestamp::now().as_millisecond();
+        admission::admit_once(&project).unwrap();
+        let after = jiff::Timestamp::now().as_millisecond();
+        assert_eq!(attempts_for(&db_path, "d"), 1);
+        let rows = super::classifications(&db_path);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let (id, task, revision, class, band, features, created) = rows[0].clone();
+        assert_eq!((task.as_str(), revision, class.as_str(), band.as_str()), ("d", Some(1), "code", "large"));
+        assert_eq!(features, r#"{"dependencies":2,"repositories":1,"route":"verify_then_integrate","uncertain_write_paths":1,"write_named_resources":0,"write_paths":4}"#);
+        assert!((before..=after).contains(&created), "{created} outside {before}..={after}");
+        let record = format!(r#"{{"band":"large","class":"code","classifier":"rule:task-taxonomy.v1","contract_revision":1,"created_unix_ms":{created},"features":{features},"reason":null,"revision":1,"task_id":"d","taxonomy":"task-taxonomy.v1"}}"#);
+        assert_eq!(id, format!("sha256:{:x}", Sha256::digest(record.as_bytes())));
+    }
+
+    /// Shared prefix: a and p verified and integrated, `d` queued behind both
+    /// (route `verify_then_integrate`) and not yet reserved.
+    pub fn through_d() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join("project");
         let repo = root.path().join("repo");
@@ -935,7 +1025,7 @@ mod slice {
             &project_store,
             &repository,
             &tip,
-            "verify_only",
+            "verify_then_integrate",
             &policy_consumer,
         );
         let mut db = herdr_projects::store::SqliteStore::open(&db_path).unwrap();
@@ -971,64 +1061,144 @@ mod slice {
         assert!(rows.contains("d a integrated_commit"), "{rows}");
         assert!(rows.contains("d p integrated_commit"), "{rows}");
         assert_eq!(attempts_for(&db_path, "d"), 0);
-
-        let mut db = herdr_projects::store::SqliteStore::open(&db_path).unwrap();
-        let snapshot = db.read_snapshot(None).unwrap();
-        let revision = snapshot
-            .tasks
-            .iter()
-            .find(|task| task.id.as_str() == "dstale")
-            .unwrap()
-            .revision;
-        db.queue_task(
-            &TaskId::new("dstale").unwrap(),
-            revision,
-            snapshot.head,
-            &QueueRequest {
-                priority: 20,
-                dependencies: vec![
-                    Dependency {
-                        predecessor: TaskId::new("a").unwrap(),
-                        requirement: DependencyRequirement::IntegratedCommit,
-                    },
-                    Dependency {
-                        predecessor: TaskId::new("p").unwrap(),
-                        requirement: DependencyRequirement::IntegratedCommit,
-                    },
-                ],
-            },
-            jiff::Timestamp::now().as_millisecond(),
-        )
-        .unwrap();
-        drop(db);
-        enable_admission(&db_path);
-        assert!(admission::wake_enabled(&project));
-        assert_eq!(install_grant(&db_path, &project), "dstale");
-        let stale = admission::admit_once(&project).unwrap_err();
-        assert!(
-            stale.to_string().contains("integration_missing"),
-            "{stale:#}"
-        );
-        assert_eq!(attempts_for(&db_path, "dstale"), 0);
-        assert_eq!(attempts_for(&db_path, "b"), 0);
-        assert_eq!(attempts_for(&db_path, "c"), 0);
-        assert_eq!(attempts_for(&db_path, "d"), 0);
-
-        let manifest = serde_json::json!({
-            "vertical_slice": "pass",
-            "git_sha": super::workspace_git_sha(),
-            "combined_tree": "checks_failed",
-            "restarted_after_cas": true,
-            "worker_prose_satisfaction_rows": 0
-        });
-        let path = root.path().join("vertical-slice-manifest.json");
-        let text = serde_json::to_vec_pretty(&manifest).unwrap();
-        fs::write(&path, &text).unwrap();
-        let read: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(read["vertical_slice"], "pass");
-        assert_eq!(read["git_sha"], super::workspace_git_sha());
-        assert!(read["git_sha"].as_str().unwrap().len() >= 40);
+        (root, project, db_path)
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn classification_is_written_before_first_attempt() {
+    slice::classify_first_attempt();
+}
+
+/// `(classification_id, task_id, contract_revision, class, band, features, created_unix_ms)`
+/// for every revision-1 `task-taxonomy.v1` row.
+#[cfg(target_os = "linux")]
+type ClassificationRow = (String, String, Option<i64>, String, String, String, i64);
+#[cfg(target_os = "linux")]
+fn classifications(db_path: &Path) -> Vec<ClassificationRow> {
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let mut stmt = conn.prepare("SELECT classification_id,task_id,contract_revision,class,band,features,created_unix_ms FROM task_classifications WHERE taxonomy='task-taxonomy.v1' AND classifier='rule:task-taxonomy.v1' AND revision=1 AND reason IS NULL ORDER BY task_id").unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))).unwrap().map(Result::unwrap).collect()
+}
+
+/// One queued task on an active project with a retained `sim` profile and
+/// automatic admission on. `contract_path` installs the one-path fixture contract.
+#[cfg(target_os = "linux")]
+fn classification_project(tmp: &Path, task: &str, contract_path: Option<&str>) -> PathBuf {
+    let project = tmp.join("project");
+    fs::create_dir_all(project.join(".state")).unwrap();
+    let db_path = project.join(".state/state.db");
+    let (repo, oid) = build_repo(tmp, SEED);
+    let repository = fs::canonicalize(&repo).unwrap().display().to_string();
+    let config_path = tmp.join("owner.toml");
+    fs::write(&config_path, "version = 1\n").unwrap();
+    let config = herdr_projects::migration::config_reference(&config_path).unwrap();
+    let digest = config.digest.clone().unwrap();
+    let mut db = SqliteStore::create(&db_path).unwrap();
+    let id = TaskId::new(task).unwrap();
+    db.commit(Commit { expected_head: 0, mutations: vec![Mutation::Task { expected: None,
+        next: Task { id: id.clone(), revision: 1, state: TaskState::Draft, title: task.into(), active_attempt: None } }] }).unwrap();
+    let head = db.current_head().unwrap();
+    db.create_runtime(Some(&id), Some(1), head, &RuntimeRoute::default()).unwrap();
+    let revision = db.read_snapshot(None).unwrap().tasks[0].revision;
+    db.queue_task(&id, revision, db.current_head().unwrap(), &QueueRequest { priority: 0, dependencies: Vec::new() }, unix_ms() - 1_000).unwrap();
+    let snapshot = db.read_snapshot(None).unwrap();
+    db.set_scheduler_policy(snapshot.head, snapshot.scheduler.unwrap().policy.revision, 1, 2).unwrap();
+    let now = unix_ms();
+    let snapshot = db.read_snapshot(None).unwrap();
+    let binding = &snapshot.runtime_bindings[0];
+    db.record_observations(snapshot.head, &[herdr_projects::reconcile::RuntimeObservation { binding: binding.id.clone(), binding_revision: binding.revision,
+        task_revision: Some(snapshot.tasks[0].revision), observed_unix_ms: now, collector: "herdr-git-v1".into(), config_digest: Some(digest.clone()),
+        ..herdr_projects::reconcile::RuntimeObservation::default() }]).unwrap();
+    let snapshot = db.read_snapshot(None).unwrap();
+    db.set_project_state(snapshot.head, snapshot.control.unwrap().revision, ProjectState::Active, now, Some(&digest)).unwrap();
+    drop(db);
+    if let Some(path) = contract_path {
+        let object_format = if oid.len() == 40 { "sha1" } else { "sha256" };
+        install_fixture_contract(&db_path, task, &repository, &oid, object_format, path, &["discovered", "launchable"]);
+    }
+    plant_profile(&db_path, &config);
+    SqliteStore::open(&db_path).unwrap().record_native_capability_evidence(unix_ms(), unix_ms() + 3_600_000).unwrap();
+    // Fixture only. Production code has no writer for this column.
+    rusqlite::Connection::open(&db_path).unwrap().execute("UPDATE project_control SET factory_admission='on' WHERE singleton=1", []).unwrap();
+    project
+}
+
+/// Automatic admission of the one ready task, with its grant.
+#[cfg(target_os = "linux")]
+fn admit_ready(project: &Path) {
+    let db_path = project.join(".state/state.db");
+    worker_snapshots(project);
+    let inputs = herdr_projects::admission::prepared_admission_inputs(project).unwrap().expect("a ready candidate");
+    insert_grant(&db_path, &inputs);
+    let before = sql_count(&db_path, "SELECT count(*) FROM attempts");
+    herdr_projects::admission::admit_once(project).unwrap();
+    assert_eq!(sql_count(&db_path, "SELECT count(*) FROM attempts"), before + 1, "admission did not reserve");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn second_attempt_reuses_classification() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = classification_project(tmp.path(), "retry", Some("src/retry.rs"));
+    let db_path = project.join(".state/state.db");
+    admit_ready(&project);
+    let first = classifications(&db_path);
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert_eq!((first[0].3.as_str(), first[0].4.as_str()), ("code", "small"));
+    assert_eq!(first[0].5, r#"{"dependencies":0,"repositories":1,"route":"verify_only","uncertain_write_paths":0,"write_named_resources":0,"write_paths":1}"#);
+
+    // Cancel before any launch claim; that releases the slot and cancels the task.
+    let mut db = SqliteStore::open(&db_path).unwrap();
+    let attempt: String = rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT id FROM attempts", [], |r| r.get(0)).unwrap();
+    let cancelled = db.cancel_attempt(&AttemptId::new(attempt).unwrap(), 1, db.current_head().unwrap(), "retry the task", unix_ms()).unwrap();
+    assert!(cancelled.released);
+    // No production path re-opens a cancelled task; the fixture blocks it as a failed attempt would.
+    let snapshot = db.read_snapshot(None).unwrap();
+    let mut task = snapshot.tasks[0].clone();
+    assert_eq!(task.state, TaskState::Cancelled);
+    let expected = task.revision;
+    task.revision += 1;task.state = TaskState::Blocked;
+    db.commit(Commit { expected_head: snapshot.head, mutations: vec![Mutation::Task { expected: Some(expected), next: task.clone() }] }).unwrap();
+    db.queue_task(&task.id, task.revision, db.current_head().unwrap(), &QueueRequest { priority: 0, dependencies: Vec::new() }, unix_ms()).unwrap();
+    drop(db);
+    admit_ready(&project);
+    assert_eq!(sql_count(&db_path, "SELECT count(*) FROM attempts WHERE task_id='retry'"), 2);
+    assert_eq!(sql_count(&db_path, "SELECT count(*) FROM task_classifications"), 1);
+    assert_eq!(classifications(&db_path), first);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn schema_write_classifies_schema_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = classification_project(tmp.path(), "schema", Some("migrations/0001_init.sql"));
+    let db_path = project.join(".state/state.db");
+    rusqlite::Connection::open(&db_path).unwrap().execute_batch(
+        "INSERT INTO contract_named_resources(task_id,contract_revision,name,access) VALUES('schema',1,'schema','write'),('schema',1,'lockfile','read');").unwrap();
+    admit_ready(&project);
+    let rows = classifications(&db_path);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    // min(1,8) + 3 x 1 named write = 4.
+    assert_eq!((rows[0].1.as_str(), rows[0].2, rows[0].3.as_str(), rows[0].4.as_str()), ("schema", Some(1), "schema_change", "medium"));
+    assert_eq!(rows[0].5, r#"{"dependencies":0,"repositories":1,"route":"verify_only","uncertain_write_paths":0,"write_named_resources":1,"write_paths":1}"#);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn task_without_contract_is_unscoped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = classification_project(tmp.path(), "loose", None);
+    let db_path = project.join(".state/state.db");
+    admit_ready(&project);
+    let rows = classifications(&db_path);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!((rows[0].1.as_str(), rows[0].2, rows[0].3.as_str(), rows[0].4.as_str()), ("loose", None, "unscoped", "unknown"));
+    // Contract properties are unknown, never zero.
+    assert_eq!(rows[0].5, r#"{"dependencies":0,"repositories":0,"route":{"reason":"no_contract","status":"unavailable"},"uncertain_write_paths":{"reason":"no_contract","status":"unavailable"},"write_named_resources":{"reason":"no_contract","status":"unavailable"},"write_paths":{"reason":"no_contract","status":"unavailable"}}"#);
+    let record = format!(r#"{{"band":"unknown","class":"unscoped","classifier":"rule:task-taxonomy.v1","contract_revision":null,"created_unix_ms":{},"features":{},"reason":null,"revision":1,"task_id":"loose","taxonomy":"task-taxonomy.v1"}}"#, rows[0].6, rows[0].5);
+    assert_eq!(rows[0].0, format!("sha256:{:x}", Sha256::digest(record.as_bytes())));
 }
 
 #[cfg(target_os = "linux")]
