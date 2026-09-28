@@ -696,3 +696,38 @@ Mutation check, each restored byte-for-byte afterwards:
   rewound the cursor and the next delta repeated `new-task`.
 - Dropping the `TaskLocal` filter from `load_brief_memory` made the snapshot
   test fail: the profile-only fallback rendered `private task finding`.
+
+## Thread unit tests replaced by CLI workflows
+
+The audit marked 16 `src/thread.rs` tests REPLACE. Fifteen were deleted after
+`tests/threads.rs` covered their guarantees through the compiled CLI, with a
+shell herdr fixture serving `agent list`/`pane list` and logging other calls,
+and real git, du and rsync. Thread records are seeded as TOML files, the same
+form the ticker leaves on disk. The file runs in both the default and the
+`state-store` build.
+
+| New E2E test | Replaced unit tests |
+| --- | --- |
+| `thread_list_groups_every_record_and_live_state` (28 cases, each a thread `thread list` must group and annotate, and listing leaves every record byte-identical) | `row1_resolved_wins_over_everything`, `row2_starting_is_working_for_five_minutes`, `row3_waiting_on_you`, `row4_working_including_a_launch_in_progress`, `row5_landing_needs_open_and_approved`, `row6_ready_for_review_until_ack_or_while_pr_open`, `row7_idle_and_precedence`, `pane_gone_with_a_report_keeps_its_place`, `identity_check_before_acting_on_a_pane`, `adopted_threads_match_without_the_name`, `live_state_duration_comes_from_the_record_only_when_states_agree` |
+| `report_review_ack_and_resolve_copy_home` (list → `thread ack` → report edit → `thread resolve` with a symlinked library entry) | `updates_are_atomic_and_keep_other_fields`, `copies_report_and_library_and_skips_symlinks` |
+| `start_restart_and_adopt_write_briefs_branches_and_launch_line` (failed `thread start`, `thread restart`, a second start, `thread adopt`, `thread show` id refusals) | `ids_branches_and_dirs`, `brief_order_and_memory_cap` |
+
+The E2E timing thresholds use margins (10 s and 120 s around the 30 s and 60 s
+debounces, 10 s and 400 s around the 300 s start window)
+rather than the exact one-second edges, because wall-clock time passes between
+seeding and listing.
+
+Kept: `imported_receipt_fingerprint_matches_legacy_execution_identity`. The lib
+recomputes the binary's execution fingerprint only for a legacy finalization
+receipt whose thread is already resolved while `ticker.json` still holds the
+pending entry, a state reached only by a crash between those two writes. No
+CLI entry point injects that crash, and the test compares the two
+implementations for every thread kind.
+
+Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
+- Making an open pull request `Landing` without approval failed the list table
+  on the changes-requested and acknowledged-with-open-PR cases.
+- Requiring the agent name for adopted threads failed the list table on
+  "adopted agent matched without its name".
+- Inlining memory past the 32,000-character cap failed the brief assertions in
+  the start/restart workflow.
