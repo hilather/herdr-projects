@@ -32,19 +32,19 @@ pub fn request(path:&Path,operation:&Operation,revision:u64,mode:Mode)->Result<R
     Ok(Request{identity:Identity{operation:format!("canonical-verification-{kind}:{}",operation.id.as_str()),revision,project:input.project.display().to_string(),machine:"local-verifier".into(),terminal:None},lane:Lane::Transfer,deadline,command})
 }
 
-enum Slot {Project(ProjectGuard),Check(CheckGuard),Lost}
-/// Project ownership handed to the verifier around its isolated check.
-struct Ownership<'a> {slot:Slot,scratch:Resource,claim:&'a Claim,control:&'a Control}
+pub(crate) enum Slot {Project(ProjectGuard),Check(CheckGuard),Lost}
+/// Project ownership handed to the verifier or integrator around its isolated check.
+pub(crate) struct Ownership<'a> {pub(crate) slot:Slot,pub(crate) scratch:Resource,pub(crate) claim:&'a Claim,pub(crate) control:&'a Control}
 impl verification::CheckOwnership for Ownership<'_> {
     fn release(&mut self)->Result<()> {
-        let Slot::Project(guard)=std::mem::replace(&mut self.slot,Slot::Lost) else {anyhow::bail!("verification does not hold project ownership")};
+        let Slot::Project(guard)=std::mem::replace(&mut self.slot,Slot::Lost) else {anyhow::bail!("the check does not hold project ownership")};
         match guard.fence(&self.scratch) {
             Ok(fence)=>{self.slot=Slot::Check(guard.narrow(fence));Ok(())}
             Err(error)=>{self.slot=Slot::Project(guard);Err(error)}
         }
     }
     fn reacquire(&mut self,store:&mut SqliteStore)->Result<()> {
-        let Slot::Check(check)=std::mem::replace(&mut self.slot,Slot::Lost) else {anyhow::bail!("verification is not narrowed to its check")};
+        let Slot::Check(check)=std::mem::replace(&mut self.slot,Slot::Lost) else {anyhow::bail!("the check is not narrowed")};
         self.slot=Slot::Project(check.widen(self.control.deadline.saturating_duration_since(Instant::now()))?);
         // The claim carries the task revision fence and the lease.
         store.validate_claim(self.claim,now()).map_err(|error|verification::FenceChanged(format!("job claim no longer holds: {error}")))?;Ok(())

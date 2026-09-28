@@ -50,7 +50,7 @@ pub(crate) fn valid_ref_name(name: &str) -> bool {
         })
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct VerifiedIntegration {
     pub result_id: String,
     pub commit_oid: String,

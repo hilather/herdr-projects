@@ -238,7 +238,7 @@ pub fn verify_project(project: &Path, request: &VerifyRequest) -> Result<VerifyO
     impl Drop for Work { fn drop(&mut self) { if let Some(path) = &self.0 { let _ = fs::remove_dir_all(path); } } }
     let mut work = Work(Some(request.work_dir.clone()));
     // The work directory is this call's own, so it is removed with or without ownership.
-    let mut ownership = OperatorOwnership { slot: OperatorSlot::Project(guard), project: project.to_path_buf(), scratch, wait: request.timeout };
+    let mut ownership = OperatorOwnership::new(guard, project, scratch, request.timeout);
     let outcome = verify_owned(&mut store, request, Some(&mut ownership));
     let cleanup = fs::remove_dir_all(&request.work_dir);
     if cleanup.is_ok() { work.0 = None; }
@@ -248,18 +248,24 @@ pub fn verify_project(project: &Path, request: &VerifyRequest) -> Result<VerifyO
 }
 
 enum OperatorSlot { Project(crate::migration::Maintenance), Check(crate::execution_guard::CheckGuard), Lost }
-/// Operator runtime ownership, handed to the verifier around its isolated check.
-struct OperatorOwnership { slot: OperatorSlot, project: PathBuf, scratch: crate::execution_guard::Resource, wait: Duration }
+/// Operator runtime ownership, handed to the verifier or integrator around its isolated check.
+pub(crate) struct OperatorOwnership { slot: OperatorSlot, project: PathBuf, scratch: crate::execution_guard::Resource, wait: Duration }
+impl OperatorOwnership {
+    /// `scratch` fences the check's work directory; `wait` bounds regaining ownership.
+    pub(crate) fn new(guard: crate::migration::Maintenance, project: &Path, scratch: crate::execution_guard::Resource, wait: Duration) -> Self {
+        Self { slot: OperatorSlot::Project(guard), project: project.to_path_buf(), scratch, wait }
+    }
+}
 impl CheckOwnership for OperatorOwnership {
     fn release(&mut self) -> Result<()> {
-        let OperatorSlot::Project(guard) = std::mem::replace(&mut self.slot, OperatorSlot::Lost) else { bail!("verification does not hold project ownership") };
+        let OperatorSlot::Project(guard) = std::mem::replace(&mut self.slot, OperatorSlot::Lost) else { bail!("the check does not hold project ownership") };
         match guard.fence(&self.scratch) {
             Ok(fence) => { self.slot = OperatorSlot::Check(guard.narrow(fence)?); Ok(()) }
             Err(error) => { self.slot = OperatorSlot::Project(guard); Err(error) }
         }
     }
     fn reacquire(&mut self, _: &mut SqliteStore) -> Result<()> {
-        let OperatorSlot::Check(check) = std::mem::replace(&mut self.slot, OperatorSlot::Lost) else { bail!("verification is not narrowed to its check") };
+        let OperatorSlot::Check(check) = std::mem::replace(&mut self.slot, OperatorSlot::Lost) else { bail!("the check is not narrowed") };
         self.slot = OperatorSlot::Project(crate::migration::Maintenance::widen(check, &self.project, self.wait)?);
         Ok(())
     }

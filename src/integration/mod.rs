@@ -1,6 +1,9 @@
 //! Local integrator. Checks run on the candidate checkout, not the worker branch.
 //! The configured ref moves only through `update-ref` with the expected old oid.
 //! A lost reply confirms that exact oid and no other. Dependencies are not satisfied.
+//! Ownership covers the claim, the merge and the publication; the candidate
+//! policy checks hold only the shared root and the work directory's fence, and
+//! everything publication depends on is rechecked once ownership is regained.
 mod git;
 
 use std::{fs, path::{Path, PathBuf}, time::Duration};
@@ -18,7 +21,7 @@ use crate::{
             IntegrationBegin, IntegrationFinish, IntegrationView, LEASE_OWNER, VerifiedIntegration,
         },
     },
-    verification::{self, parse_checks, supervise},
+    verification::{self, CheckOwnership, parse_checks, supervise},
 };
 
 use git::{BuiltCommit, GitRepo};
@@ -116,14 +119,17 @@ pub fn integrate_project(project: &Path, request: &IntegrateRequest) -> Result<I
     use std::os::unix::fs::DirBuilderExt;
     if !request.work_dir.is_absolute() { bail!("integration work directory must be absolute"); }
     validate_key(&request.idempotency_key)?;
-    let _guard = crate::migration::runtime_mutation(project)?;
+    let scratch = crate::execution_guard::Resource::new("scratch", request.work_dir.display().to_string())?;
+    let guard = crate::migration::runtime_mutation(project)?;
     let mut store = crate::migration::open_active(project)?;
     fs::DirBuilder::new().mode(0o700).create(&request.work_dir)
         .context("integration work directory must be new and have an existing parent")?;
     struct Work(Option<PathBuf>);
     impl Drop for Work { fn drop(&mut self) { if let Some(path) = &self.0 { let _ = fs::remove_dir_all(path); } } }
     let mut work = Work(Some(request.work_dir.clone()));
-    let outcome = integrate(&mut store, request);
+    // The work directory is this call's own, so it is removed with or without ownership.
+    let mut ownership = verification::OperatorOwnership::new(guard, project, scratch, REGAIN);
+    let outcome = integrate_at(&mut store, request, None, Some(&mut ownership));
     let cleanup = fs::remove_dir_all(&request.work_dir);
     if cleanup.is_ok() { work.0 = None; }
     let outcome = outcome?;
@@ -157,6 +163,20 @@ fn checks_lease_ms(policies: usize) -> i64 {
     (policies as u64 * POLICY_TIMEOUT.as_millis() as u64 + 30_000) as i64
 }
 
+/// How long an operator integration waits to regain ownership after its checks.
+const REGAIN: Duration = Duration::from_secs(60);
+
+/// Something publication depends on changed while the candidate checks ran
+/// without project ownership; nothing was recorded or published.
+#[derive(Debug)]
+pub struct InputsChanged(pub String);
+impl std::fmt::Display for InputsChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "integration inputs changed during the candidate check: {}; nothing was published", self.0)
+    }
+}
+impl std::error::Error for InputsChanged {}
+
 /// A refusal before any build or ref update.
 #[derive(Debug)]
 pub enum Refused {
@@ -176,19 +196,20 @@ impl std::fmt::Display for Refused {
 impl std::error::Error for Refused {}
 
 pub fn integrate(store: &mut SqliteStore, request: &IntegrateRequest) -> Result<IntegrateOutcome> {
-    integrate_at(store, request, None)
+    integrate_at(store, request, None, None)
 }
 
 /// Automatic ingress. A new integration starts only when the target is at the
 /// tip the controller expects (its latest recorded integration, else the base
 /// the result was verified against); an existing one resumes under its key.
-pub fn integrate_job(store: &mut SqliteStore, request: &IntegrateRequest, submission_id: &str) -> Result<IntegrateOutcome> {
+/// `ownership` is released only around the candidate policy checks.
+pub fn integrate_job(store: &mut SqliteStore, request: &IntegrateRequest, submission_id: &str, ownership: &mut dyn CheckOwnership) -> Result<IntegrateOutcome> {
     let repo = GitRepo::open(&request.repository)?;
     let Some(reference) = store.integration_ref(&repo.identity)? else {
         bail!("integration ref is not configured");
     };
     let expected = store.expected_integration_tip(&repo.identity, &reference, submission_id)?;
-    integrate_at(store, request, Some(&expected))
+    integrate_at(store, request, Some(&expected), Some(ownership))
 }
 
 /// A lost reply: classify the operation named by `key`, if any, without building.
@@ -200,8 +221,8 @@ pub fn observe_job(store: &mut SqliteStore, repository: &PathBuf, key: &str) -> 
     reconcile_integration(store, repository, key).map(Some)
 }
 
-fn integrate_at(store: &mut SqliteStore, request: &IntegrateRequest, expected_base: Option<&str>) -> Result<IntegrateOutcome> {
-    let outcome = integrate_unlisted(store, request, expected_base)?;
+fn integrate_at(store: &mut SqliteStore, request: &IntegrateRequest, expected_base: Option<&str>, ownership: Option<&mut dyn CheckOwnership>) -> Result<IntegrateOutcome> {
+    let outcome = integrate_unlisted(store, request, expected_base, ownership)?;
     with_policies(store, outcome)
 }
 
@@ -215,7 +236,7 @@ fn with_policies(store: &mut SqliteStore, mut outcome: IntegrateOutcome) -> Resu
     Ok(outcome)
 }
 
-fn integrate_unlisted(store: &mut SqliteStore, request: &IntegrateRequest, expected_base: Option<&str>) -> Result<IntegrateOutcome> {
+fn integrate_unlisted(store: &mut SqliteStore, request: &IntegrateRequest, expected_base: Option<&str>, ownership: Option<&mut dyn CheckOwnership>) -> Result<IntegrateOutcome> {
     let repo = GitRepo::open(&request.repository)?;
     let Some(reference) = store.integration_ref(&repo.identity)? else {
         bail!("integration ref is not configured");
@@ -242,7 +263,7 @@ fn integrate_unlisted(store: &mut SqliteStore, request: &IntegrateRequest, expec
         }
         // An existing generation is classified from the ref. Do not discard a candidate
         // that is already the ref tip.
-        return resume(store, &repo, request, existing, false);
+        return resume(store, &repo, request, existing, false, ownership);
     }
     if repo.is_checked_out(&reference)? {
         return Err(Refused::CheckedOut.into());
@@ -273,7 +294,7 @@ fn integrate_unlisted(store: &mut SqliteStore, request: &IntegrateRequest, expec
             return Err(error.into());
         }
     };
-    drive_new(store, &repo, request, &verified, &base, claim)
+    drive_new(store, &repo, request, &verified, &base, claim, ownership)
 }
 
 pub fn reconcile_integration(
@@ -293,7 +314,7 @@ pub fn reconcile_integration(
         fault: Fault::None,
     };
     // Reconcile never builds another merge. It only classifies the ref we already named.
-    let outcome = resume(store, &repo, &request, view, true)?;
+    let outcome = resume(store, &repo, &request, view, true, None)?;
     with_policies(store, outcome)
 }
 
@@ -303,6 +324,7 @@ fn resume(
     request: &IntegrateRequest,
     view: IntegrationView,
     reconcile: bool,
+    ownership: Option<&mut dyn CheckOwnership>,
 ) -> Result<IntegrateOutcome> {
     if matches!(
         view.state.as_str(),
@@ -316,7 +338,7 @@ fn resume(
         if reconcile {
             return unprepared_status(store, repo, &view);
         }
-        return resume_incomplete(store, repo, request, &view);
+        return resume_incomplete(store, repo, request, &view, ownership);
     }
     settle(store, repo, request, &view, true)
 }
@@ -385,6 +407,7 @@ fn drive_new(
     verified: &VerifiedIntegration,
     base: &str,
     claim: Claim,
+    ownership: Option<&mut dyn CheckOwnership>,
 ) -> Result<IntegrateOutcome> {
     #[cfg(test)]
     if request.fault == Fault::CrashBeforeBuild {
@@ -456,7 +479,7 @@ fn drive_new(
         let view = store.load_integration_operation(claim.operation.as_str())?;
         return Ok(outcome_of(&view));
     }
-    let (passed, claim) = policies_pass(store, claim, &request.work_dir, &checkout, verified, &oid, &tree)?;
+    let (passed, claim) = policies_pass(store, claim, &request.work_dir, &checkout, verified, &oid, &tree, ownership)?;
     if !passed {
         return finish(
             store,
@@ -481,6 +504,7 @@ fn resume_incomplete(
     repo: &GitRepo,
     request: &IntegrateRequest,
     view: &IntegrationView,
+    ownership: Option<&mut dyn CheckOwnership>,
 ) -> Result<IntegrateOutcome> {
     let Some(current) = repo.ref_oid(&view.ref_name)? else {
         bail!("integration ref is missing");
@@ -505,6 +529,7 @@ fn resume_incomplete(
             &verified,
             &view.expected_old_oid,
             claim,
+            ownership,
         );
     }
     let oid = view
@@ -521,7 +546,7 @@ fn resume_incomplete(
     let verified = store.load_verified_for_integration(&view.verified_result_id)?;
     // Checkout failure leaves candidate_prepared. Only a missing object discards it.
     let checkout = repo.checkout_candidate(&request.work_dir, &oid)?;
-    let (passed, claim) = policies_pass(store, claim, &request.work_dir, &checkout, &verified, &oid, &tree)?;
+    let (passed, claim) = policies_pass(store, claim, &request.work_dir, &checkout, &verified, &oid, &tree, ownership)?;
     if !passed {
         return finish(
             store,
@@ -742,7 +767,10 @@ fn finish(
 /// Every acceptance policy of the contract revision runs on the candidate, in
 /// id order, each within its own `POLICY_TIMEOUT`; the first failure stops the
 /// check. The claim is first extended to cover every policy's budget, and each
-/// verdict is recorded under it. Returns the extended claim.
+/// verdict is recorded under it. Returns the extended claim. With `ownership`,
+/// the checks run without project ownership, and nothing is recorded unless
+/// ownership is regained and every input is [`unchanged`].
+#[allow(clippy::too_many_arguments)]
 fn policies_pass(
     store: &mut SqliteStore,
     claim: Claim,
@@ -751,23 +779,57 @@ fn policies_pass(
     verified: &VerifiedIntegration,
     commit: &str,
     tree: &str,
+    ownership: Option<&mut dyn CheckOwnership>,
 ) -> Result<(bool, Claim)> {
     if verified.policies.len() > MAX_POLICIES {
         bail!("{}", Refused::TooManyPolicies { count: verified.policies.len() });
     }
     let claim = store.extend_integration_lease(&claim, checks_lease_ms(verified.policies.len()), now_ms())?;
-    let mut checks = Vec::new();
-    let mut all = !verified.policies.is_empty();
-    for (index, (policy_id, body)) in verified.policies.iter().enumerate() {
-        let passed = check_passes(work, checkout, index, body, POLICY_TIMEOUT, commit, tree)?;
-        checks.push((policy_id.clone(), format!("{:x}", Sha256::digest(body.as_bytes())), passed));
-        if !passed {
-            all = false;
-            break;
+    let run = || -> Result<(Vec<(String, String, bool)>, bool)> {
+        let mut checks = Vec::new();
+        let mut all = !verified.policies.is_empty();
+        for (index, (policy_id, body)) in verified.policies.iter().enumerate() {
+            let passed = check_passes(work, checkout, index, body, POLICY_TIMEOUT, commit, tree)?;
+            checks.push((policy_id.clone(), format!("{:x}", Sha256::digest(body.as_bytes())), passed));
+            if !passed {
+                all = false;
+                break;
+            }
         }
-    }
+        Ok((checks, all))
+    };
+    // The checks touch only the candidate checkout in the fenced work directory.
+    let ran = match ownership {
+        Some(ownership) => {
+            ownership.release()?;
+            let ran = run();
+            ownership.reacquire(store)?;
+            unchanged(store, &claim, verified, commit, tree)?;
+            ran
+        }
+        None => run(),
+    };
+    let (checks, all) = ran?;
     store.record_policy_checks(&claim, &checks, now_ms())?;
     Ok((all, claim))
+}
+
+/// Everything publication depends on, reloaded under regained ownership: the
+/// claim (lease and task revision), the verified result with its contract and
+/// policies, and the recorded candidate. `settle` then classifies the target
+/// ref, and the compare-and-swap enforces its expected old oid.
+fn unchanged(store: &mut SqliteStore, claim: &Claim, verified: &VerifiedIntegration, commit: &str, tree: &str) -> Result<()> {
+    let changed = |what: String| anyhow::Error::from(InputsChanged(what));
+    store.validate_claim(claim, now_ms()).map_err(|error| changed(format!("integration claim no longer holds: {error}")))?;
+    let fresh = store.load_verified_for_integration(&verified.result_id).map_err(|error| changed(error.to_string()))?;
+    if fresh != *verified {
+        return Err(changed("task, contract, policies or verified result changed".into()));
+    }
+    let view = store.load_integration_operation(claim.operation.as_str())?;
+    if view.state != "candidate_prepared" || view.checks_passed || view.commit_oid.as_deref() != Some(commit) || view.tree_oid.as_deref() != Some(tree) {
+        return Err(changed("the candidate changed".into()));
+    }
+    Ok(())
 }
 
 fn check_passes(

@@ -248,7 +248,7 @@ Recorded here rather than folded into the card that found them.
   0047 adds the fence to the one-job unique indexes. Integration jobs get the
   same treatment. A retired job cannot be retried with `retry-*`. E2E:
   `ticker_replaces_result_jobs_bound_to_an_older_task_revision`.
-- **The verifier holds project ownership for the whole check** — partly done
+- **The verifier holds project ownership for the whole check** — done
   (this PR). An automatic verification job now holds exclusive project
   ownership only to load and fence its inputs, claim, prepare scratch and
   record. The isolated check runs under a `CheckGuard`: the shared root (so
@@ -269,9 +269,21 @@ Recorded here rather than folded into the card that found them.
   revision); the error names the changed inputs. A run recorded under the same
   key meanwhile is replayed. E2E:
   `operator_verify_releases_project_ownership_during_the_check`.
-  Still open: integration jobs keep exclusive ownership throughout, because
-  their candidate policy checks run inside `integrate_job` between the merge
-  and the compare-and-swap publication.
+  Integration jobs and the operator `result integrate` command now do the
+  same — done (this PR): they hold ownership to claim, load and build the
+  merged candidate in scratch, run the candidate policy checks under a
+  `CheckGuard` fenced on that scratch, then regain ownership and recheck the
+  job claim, the integration claim (lease and task revision), the verified
+  result with its contract and policies, and the recorded candidate before
+  recording any verdict. If anything changed nothing is recorded or published
+  and the job resumes under its key (`candidate_prepared` is rechecked). A
+  target moved during the checks is still discarded as a stale base (the
+  diagnostic says the target moved) and the expected-old compare-and-swap
+  still guards the update; serial-per-target holds because a new generation
+  cannot begin while one is prepared. E2E:
+  `integration_releases_project_ownership_during_the_candidate_check`; the
+  kill mid-check recovery stays covered by
+  `ticker_auto_integrates_two_results_serially_and_recovers_stale_and_crash`.
 - **No E2E for the isolation-unavailable pause** (`verification.paused`); it
   cannot be simulated from outside without a hook in the shipped binary.
 - **Integration job follow-ups (card 3):** retry command done (this PR):

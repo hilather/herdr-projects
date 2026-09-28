@@ -2509,6 +2509,97 @@ fn ticker_auto_integrates_two_results_serially_and_recovers_stale_and_crash() {
 
 #[cfg(all(feature="state-store",target_os="linux"))]
 #[test]
+fn integration_releases_project_ownership_during_the_candidate_check() {
+    use std::{io::{Read,Write},sync::{Arc,atomic::{AtomicUsize,Ordering}}};
+    use herdr_projects::{runtime,operations::{DeliveryState,Outcome}};
+    // A local git-protocol fixture holds connection `n` until `released > n`.
+    // Each submission's policy connects once to verify and once more to check
+    // the integrated candidate.
+    let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();let port=listener.local_addr().unwrap().port();
+    let released=Arc::new(AtomicUsize::new(1));let connections=Arc::new(AtomicUsize::new(0));
+    {let released=released.clone();let connections=connections.clone();std::thread::spawn(move||for stream in listener.incoming(){
+        let Ok(mut stream)=stream else{continue};let index=connections.fetch_add(1,Ordering::SeqCst);let released=released.clone();
+        std::thread::spawn(move||{let mut buffer=[0u8;4096];let _=stream.read(&mut buffer);while released.load(Ordering::SeqCst)<=index{std::thread::sleep(std::time::Duration::from_millis(10));}let _=stream.write_all(b"0000");let _=stream.read(&mut buffer);});
+    });}
+    let lib="pub fn result() {}\n";
+    let f=VerifyFixture::new(&[("src/lib.rs",lib.into())]);
+    let candidate=|name:&str|{f.git(&["checkout","-q","-b",name,&f.base]);std::fs::write(f.repo.join("src/lib.rs"),lib).unwrap();std::fs::write(f.repo.join(format!("src/{name}.txt")),name).unwrap();f.git(&["add","."]);f.git(&["commit","-qm",name]);f.git(&["rev-parse","HEAD"])};
+    let waits=[("waits",format!(r#"{{"version":1,"checks":["/usr/bin/git","ls-remote","git://127.0.0.1:{port}/fixture"]}}"#))];
+    const TARGET:&str="refs/heads/integration";
+    f.git(&["branch","integration",&f.base]);
+    let configured=hp(f.home.path(),&["--root",f.r(),"result","demo","configure-integration","--repository",f.repo.to_str().unwrap(),"--reference",TARGET]);
+    assert!(configured.status.success(),"{}",String::from_utf8_lossy(&configured.stderr));
+    runtime::add_task(&f.project,herdr_projects::domain::TaskId::new("other").unwrap(),"other".into(),runtime::snapshot(&f.project).unwrap().head).unwrap();
+    let auto=|args:&[&str]|{let head=runtime::snapshot(&f.project).unwrap().head.to_string();let mut all=vec!["--root",f.r(),"result","demo","auto"];all.extend_from_slice(args);all.extend(["--expected-head",&head]);
+        let out=hp(f.home.path(),&all);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));};
+    let job=|submission:&str|{let snapshot=runtime::snapshot(&f.project).unwrap();snapshot.operations.into_iter().find(|op|op.kind=="integration.run"&&op.payload["submission_id"]==submission)
+        .map(|op|{let d=snapshot.deliveries.iter().find(|d|d.operation==op.id).unwrap().clone();(op,d)})};
+    let tip=||f.git(&["rev-parse",TARGET]);
+    let integrated=||f.db().query_row("SELECT count(*) FROM integrated_commits",[],|row|row.get::<_,u64>(0)).unwrap();
+    let checking=|count:usize|{let deadline=std::time::Instant::now()+std::time::Duration::from_secs(150);
+        while connections.load(Ordering::SeqCst)<count{assert!(std::time::Instant::now()<deadline,"the candidate check never started");std::thread::sleep(std::time::Duration::from_millis(10));}};
+    // Renaming needs project ownership. Only a lock held for the whole check makes every attempt fail.
+    let rename=|title:&str|{
+        for _ in 0..40 {
+            let snapshot=runtime::snapshot(&f.project).unwrap();let revision=snapshot.tasks.iter().find(|t|t.id.as_str()=="other").unwrap().revision;
+            let out=hp(f.home.path(),&["--root",f.r(),"task","demo","rename","other","--title",title,"--expected-revision",&revision.to_string(),"--expected-head",&snapshot.head.to_string()]);
+            if out.status.success() {return;}
+            let stderr=String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(stderr.contains("owns"),"{stderr}");std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("the running integration check kept project ownership");
+    };
+    let title=||runtime::snapshot(&f.project).unwrap().tasks.iter().find(|t|t.id.as_str()=="other").unwrap().title.clone();
+    // Automatic: another project effect proceeds during the candidate check,
+    // root-exclusive maintenance does not, and the job then publishes once.
+    let one=f.submit("one",&waits);
+    auto(&["--verify","on","--integrate","on"]);
+    let mut child=f.spawn();
+    checking(2);f.wait(&mut child,30,&||job(&one).is_some_and(|(_,d)|d.state==DeliveryState::Claimed));
+    rename("renamed during the automatic check");
+    assert!(herdr_projects::execution_guard::RootGuard::exclusive(&f.root).is_err(),"the check keeps the root shared");
+    assert_eq!((integrated(),tip()),(0,f.base.clone()));
+    released.store(3,Ordering::SeqCst);
+    f.wait(&mut child,90,&||job(&one).is_some_and(|(_,d)|d.state==DeliveryState::Confirmed));
+    assert_eq!((integrated(),job(&one).unwrap().1.attempts),(1,1));
+    let first=tip();assert_eq!(f.git(&["rev-parse",&format!("{first}^1")]),f.base);assert_eq!(title(),"renamed during the automatic check");
+    // The target moves during the check: nothing is published, the job is
+    // blocked as a moved target, and the ref is left where it was moved.
+    let c2=candidate("two");let two=f.submit_at("two",&waits,&c2);
+    checking(4);f.wait(&mut child,60,&||job(&two).is_some_and(|(_,d)|d.state==DeliveryState::Claimed));
+    let moved=f.git(&["commit-tree",&format!("{first}^{{tree}}"),"-p",&first,"-m","outside the controller"]);
+    f.git(&["update-ref",TARGET,&moved,&first]);
+    released.store(5,Ordering::SeqCst);
+    f.wait(&mut child,90,&||job(&two).is_some_and(|(_,d)|d.state==DeliveryState::PermanentFailure));
+    f.stop(&mut child);
+    let Some(Outcome::PermanentFailure{diagnostic})=job(&two).unwrap().1.last_outcome else {panic!("a moved target blocks the job")};
+    assert!(diagnostic.contains("target moved"),"{diagnostic}");
+    assert_eq!((tip(),integrated()),(moved.clone(),1),"the moved ref is not overwritten");
+    // Operator: `result integrate` also releases ownership during its check.
+    f.git(&["update-ref",TARGET,&first,&moved]);
+    auto(&["--integrate","off"]);
+    let c3=candidate("three");let three=f.submit_at("three",&waits,&c3);
+    let mut child=f.spawn();
+    f.wait(&mut child,90,&||connections.load(Ordering::SeqCst)>=5&&f.jobs().iter().any(|(op,d)|op.payload["submission_id"]==three.as_str()&&d.state==DeliveryState::Confirmed));
+    f.stop(&mut child);
+    let result:String=f.db().query_row("SELECT result_id FROM verified_results WHERE submission_id=?1",[&three],|row|row.get(0)).unwrap();
+    let work=f.home.path().join("operator-work");
+    let operator=Command::new(BIN).env_clear().env("HOME",f.home.path()).env("PATH","/usr/bin:/bin").args(["--root",f.r(),"result","demo","integrate",&result,
+        "--repository",f.repo.to_str().unwrap(),"--idempotency-key","operator-three","--work-dir",work.to_str().unwrap()])
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    checking(6);
+    rename("renamed during the operator check");
+    assert_eq!((integrated(),tip()),(1,first.clone()));
+    released.store(usize::MAX,Ordering::SeqCst);
+    let out=operator.wait_with_output().unwrap();assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["state"],"integrated");
+    let third=tip();assert_eq!(f.git(&["rev-parse",&format!("{third}^1")]),first);
+    assert_eq!((integrated(),title()),(2,"renamed during the operator check".to_owned()));
+    assert!(!work.exists(),"the work directory is removed");
+}
+
+#[cfg(all(feature="state-store",target_os="linux"))]
+#[test]
 fn ticker_auto_chain_releases_verified_integrated_and_fan_in_dependents() {
     use std::{io::{Read,Write},sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering}}};
     use herdr_projects::{migration,runtime,domain::TaskId,operations::DeliveryState};
