@@ -136,49 +136,20 @@ mod tests {
         assert_eq!(exact.budget_bytes,worker.required_bytes);
     }
     #[test]
-    fn same_inputs_reuse_manifest_and_unrelated_domain_is_excluded() {
-        let (_root,mut memory)=fixture();
-        put(&mut memory,"ui-note",MemoryKind::Observation,&["ui"],b"ui-body");
-        put(&mut memory,"infra-note",MemoryKind::Observation,&["infra"],b"infra-body");
-        put(&mut memory,"api-contract",MemoryKind::Contract,&["infra"],b"contract");
-        let req=request(&["ui"],&["memory/api-contract.md"]);
-        let a=memory.create_task_snapshot(req.clone(), "implementation", &digest(), Some(&digest()), 32_000, "# Project\n", 1_000, None).unwrap();
-        let b=memory.create_task_snapshot(req, "implementation", &digest(), Some(&digest()), 32_000, "# Project\n", 1_000, None).unwrap();
-        assert_eq!(a.id, b.id); assert_eq!(a.manifest_hash, b.manifest_hash);
-        let ids:Vec<_>=a.entries.iter().map(|e|e.record_id.as_str().to_string()).collect();
-        assert!(ids.contains(&"ui-note".into()));
-        assert!(!ids.contains(&"infra-note".into()));
-        assert!(ids.contains(&"api-contract".into()));
-        assert_eq!(a.since_seq, a.sequence);
-        put(&mut memory,"later",MemoryKind::Observation,&["ui"],b"later");
-        let head=memory.create_task_snapshot(request(&["ui"],&[]), "implementation", &digest(), Some(&digest()), 32_000, "# Project\n", 1_000, None).unwrap();
-        assert!(head.sequence > a.since_seq);
-    }
-    #[test]
     fn oversized_hard_rule_fails_closed_and_optional_never_displaces_mandatory() {
         let (_root,mut memory)=fixture();
         put(&mut memory,"rule",MemoryKind::Constraint,&["ui"],&vec![b'x'; 8_000]);
         let err=memory.create_task_snapshot(request(&["ui"],&[]), "implementation", &digest(), None, 100, "tiny", 1_000, None).unwrap_err();
         assert!(matches!(err, MemoryError::RequiredContentTooLarge { .. }));
     }
+    // No command passes an expected heads digest (the CLI and checkpoints pass
+    // `None`), so this conflict cannot be reached end to end. The revoked-pin
+    // refusal is covered by tests/memory_regressions.rs.
     #[test]
-    fn coordinator_constructor_skips_tasks_and_cli_rejects_reserved_id() {
-        let (_root,mut memory)=fixture();
-        put(&mut memory,"hard",MemoryKind::Constraint,&["ui"],b"body");
-        let snap=memory.create_coordinator_snapshot("sess-1", "planner", &digest(), None, 32_000, "coord", 1_000).unwrap();
-        assert_eq!(snap.task_id, "coordinator");
-        assert!(snap.entries.iter().all(|e| e.role=="mandatory"));
-        assert!(memory.create_task_snapshot(SnapshotRequest{schema_version:1,task_id:"coordinator".into(),profile:"p".into(),domains:vec![],paths:vec![],pinned_keys:vec![],sensitivity:"default".into()}, "p", &digest(), None, 32_000, "", 1_000, None).is_err());
-    }
-    #[test]
-    fn stale_heads_digest_conflicts_and_revoked_pin_blocks() {
+    fn stale_heads_digest_conflicts() {
         let (_root,mut memory)=fixture();
         put(&mut memory,"pin",MemoryKind::Contract,&["ui"],b"pin");
         let stale="b".repeat(64);
         assert!(matches!(memory.create_task_snapshot(request(&["ui"],&[]), "implementation", &digest(), None, 32_000, "x", 1_000, Some(&stale)), Err(MemoryError::RevisionConflict { .. })));
-        let head=memory.create_task_snapshot(request(&["ui"],&["memory/pin.md"]), "implementation", &digest(), None, 32_000, "x", 1_000, None).unwrap();
-        memory.revoke(&ctx(), &MemoryRecordId::new("pin").unwrap(), 1).unwrap();
-        assert!(memory.create_task_snapshot(request(&["ui"],&["memory/pin.md"]), "implementation", &digest(), None, 32_000, "x", 1_000, None).is_err());
-        assert!(head.estimator.contains("char-count"));
     }
 }

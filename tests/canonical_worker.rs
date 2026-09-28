@@ -67,7 +67,9 @@ impl Lab {
     /// An active project with an owner key, a SHA-256 repository, the queued
     /// task `work` bound to the lab server, and a `worker` profile whose
     /// budget table is `budget`. The server runs only once `serve` is called.
-    fn new(budget: &str) -> Self {
+    fn new(budget: &str) -> Self { Self::bound(budget, |repo| repo.to_owned()) }
+    /// As `new`, with the binding's working directory `cwd(repository)`.
+    fn bound(budget: &str, cwd: impl Fn(&std::path::Path) -> PathBuf) -> Self {
         let home = tempfile::tempdir().unwrap();
         let key = home.path().join("owner");
         assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).output().unwrap().status.success());
@@ -88,7 +90,7 @@ impl Lab {
         lab.ok(&["task", "demo", "queue", "work", "--input-file", request.to_str().unwrap(), "--expected-revision", "1", "--expected-head", &lab.head().to_string()]);
         let policy = lab.state().scheduler.unwrap().policy.revision.to_string();
         lab.ok(&["scheduler", "demo", "policy", "--max-active-workers", "1", "--max-attempts-per-task", "3", "--expected-revision", &policy, "--expected-head", &lab.head().to_string()]);
-        let route = RuntimeRoute { socket: lab.socket().display().to_string(), cwd: lab.repo.canonicalize().unwrap().display().to_string(), ..Default::default() };
+        let route = RuntimeRoute { socket: lab.socket().display().to_string(), cwd: cwd(&lab.repo.canonicalize().unwrap()).display().to_string(), ..Default::default() };
         let id = TaskId::new("work").unwrap();
         let revision = runtime::snapshot(&lab.project).unwrap().tasks.into_iter().find(|t| t.id == id).unwrap().revision;
         let change = runtime::create_binding(&lab.project, Some(&id), Some(revision), lab.head(), &route).unwrap();
@@ -453,4 +455,89 @@ fn ticker_retires_a_cancelled_gated_worker_without_starting_it() {
     assert!(lab.events("runtime.launch_started").is_empty() && lab.state().ownership.is_empty());
     assert_eq!(serde_json::from_value::<LaunchTarget>(lab.events("runtime.launch_target")[0].payload.clone()).unwrap(), target);
     assert_eq!((lab.count("workspace.create_command"), lab.count("agent.prompt")), (1, 0));
+}
+
+impl Lab {
+    /// The worktree `launch draft` planned for `attempt`, as `memory attempt-input` reports it.
+    fn planned_worktree(&self, attempt: &AttemptId) -> PathBuf {
+        PathBuf::from(self.ok(&["memory", "demo", "attempt-input", "--attempt", attempt.as_str()])["worktrees"][0]["path"].as_str().unwrap())
+    }
+    /// Ticker passes refuse to prepare the reserved launch with `reason`: no
+    /// worktree, no Herdr request, the approval unused and the attempt reserved.
+    fn assert_preparation_refused(&mut self, approval: &str, attempt: &AttemptId, reason: &str) {
+        let worktree = self.planned_worktree(attempt);
+        self.serve();
+        let before = self.state();
+        let log = || fs::read_to_string(self.path("root/.ticker.log")).unwrap_or_default();
+        let mut ticker = self.spawn();
+        self.wait(&mut ticker, 60, &|| log().matches(reason).count() >= 2);
+        self.stop(ticker);
+        assert_eq!(self.count("workspace.create_command"), 0, "{:?}", self.requests());
+        assert!(!worktree.exists(), "{}", worktree.display());
+        self.assert_only_observed(&before);
+        assert!(self.state().approvals.iter().any(|a| a.reference.id == approval && a.consumed.is_none()));
+        assert_eq!(self.attempt(attempt).state, AttemptState::Reserved);
+    }
+}
+
+/// Replaces `draft_preflight_rejects_closed_capacity_without_writing_approval_or_task_state`.
+#[test]
+fn draft_is_refused_while_the_scheduler_admits_no_workers() {
+    let mut lab = Lab::new("unknown_usage='allow_with_warning'");
+    lab.prepare_profile();
+    let selection = lab.selection("Retained instructions");
+    let policy = lab.state().scheduler.unwrap().policy.revision.to_string();
+    lab.ok(&["scheduler", "demo", "policy", "--max-active-workers", "0", "--max-attempts-per-task", "3", "--expected-revision", &policy, "--expected-head", &lab.head().to_string()]);
+    let error = lab.refused(&["launch", "demo", "draft", "--selection", selection.to_str().unwrap(), "--expected-head", &lab.head().to_string()]);
+    assert!(error.contains("project worker capacity is full"), "{error}");
+    let state = lab.state();
+    assert!(state.approvals.is_empty() && state.attempts.is_empty() && state.operations.is_empty());
+    assert_eq!(state.tasks[0].active_attempt, None);
+}
+
+/// Replaces `worktree_route_maps_root_and_subdirectory_and_refuses_foreign_sources`.
+#[test]
+fn a_subdirectory_binding_runs_in_the_same_subdirectory_of_the_new_worktree() {
+    let mut lab = Lab::bound("unknown_usage='allow_with_warning'", |repo| repo.join("subdir"));
+    fs::create_dir(lab.repo.join("subdir")).unwrap();
+    fs::write(lab.repo.join("subdir/file"), "tracked\n").unwrap();
+    lab.git(&["add", "subdir/file"]);
+    lab.git(&["commit", "-q", "-m", "subdir"]);
+    let (_, attempt) = lab.reserve("Retained instructions");
+    let worktree = lab.planned_worktree(&attempt);
+    lab.serve();
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 60, &|| lab.count("workspace.create_command") == 1);
+    lab.stop(ticker);
+    let creation = lab.requests().into_iter().find(|(m, _)| m == "workspace.create_command").unwrap().1;
+    assert_eq!(creation["cwd"].as_str(), worktree.join("subdir").to_str(), "{creation}");
+    assert_eq!(fs::read_to_string(worktree.join("subdir/file")).unwrap(), "tracked\n");
+
+    // A binding outside every selected repository cannot even be drafted.
+    let mut foreign = Lab::bound("unknown_usage='allow_with_warning'", |repo| repo.parent().unwrap().join("lab"));
+    foreign.prepare_profile();
+    let selection = foreign.selection("Retained instructions");
+    let error = foreign.refused(&["launch", "demo", "draft", "--selection", selection.to_str().unwrap(), "--expected-head", &foreign.head().to_string()]);
+    assert!(error.contains("working directory is outside the approved repositories"), "{error}");
+}
+
+/// Replaces `source_only_working_directory_is_refused_before_approval_consumption`.
+#[test]
+fn an_untracked_working_directory_is_refused_before_the_approval_is_used() {
+    let mut lab = Lab::bound("unknown_usage='allow_with_warning'", |repo| repo.join("untracked-dir"));
+    fs::create_dir(lab.repo.join("untracked-dir")).unwrap();
+    let (approval, attempt) = lab.reserve("Retained instructions");
+    lab.assert_preparation_refused(&approval, &attempt, "working directory is absent from the approved repository tree");
+}
+
+/// Replaces `legacy_worktree_reference_blocks_new_creation_before_consuming_approval`.
+#[test]
+fn a_legacy_thread_holding_the_planned_worktree_blocks_its_creation() {
+    let mut lab = Lab::new("unknown_usage='allow_with_warning'");
+    let (approval, attempt) = lab.reserve("Retained instructions");
+    let neighbor = lab.path("root/legacy-neighbor");
+    for dir in [".state", "threads"] { fs::create_dir_all(neighbor.join(dir)).unwrap(); }
+    fs::write(neighbor.join("PROJECT.md"), "legacy fixture").unwrap();
+    fs::write(neighbor.join("threads/t-0001.toml"), format!("id='t-0001'\nworktree_path={}\n", json!(lab.planned_worktree(&attempt)))).unwrap();
+    lab.assert_preparation_refused(&approval, &attempt, "worktree path is referenced");
 }

@@ -1244,3 +1244,82 @@ Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
   intervening-event test.
 - Removing the `binding_id` filter from the first `unresolved_members`
   query failed the copied-delivery test.
+
+## Profile, launch-ingress, memory, inbox, overview and runner unit tests replaced by E2E workflows
+
+The audit marked 22 tests REPLACE: 4 in
+`src/profile_preparation/tests/launch_ingress.rs` and 3 each in
+`src/profile_preparation.rs`, `src/memory/snapshot.rs`,
+`src/memory/import.rs`, `src/inbox.rs`, `src/overview.rs` and
+`src/runner.rs`. 20 were deleted and 2 were cut down to the part no command
+can reach.
+
+The new tests drive the compiled CLI:
+- `tests/profiles.rs`: `profile prepare`, `profile verify-native --retain`
+  and `profile retained`, over fixture executables that log every call.
+- `tests/canonical_worker.rs` (extended): `launch draft/reserve`, then
+  `ticker run` against the Herdr stand-in server. `Lab::bound` sets the
+  binding's working directory; the planned worktree is read back through
+  `memory attempt-input`.
+- `tests/memory_regressions.rs` (extended): `memory snapshot`,
+  `snapshot-input`, `plan`, `import`, `cutover`, signed policies and
+  `context --session`. The policy helper now numbers each policy revision.
+- `tests/inbox.rs`: one `ticker run` pass writes thread-state and routine
+  items; `context` and `inbox done` handle them.
+- `tests/overview.rs`: `overview`, `focus` and `unfocus` with a fake herdr.
+
+| New E2E test | Replaced unit tests |
+| --- | --- |
+| `prepare_freezes_the_installation_without_capabilities_authority_or_secrets` | `production_preparation_binds_inputs_without_fabricating_capabilities_or_authority` |
+| `verify_native_refuses_unmapped_startup_arguments_before_launching_anything` | `native_verification_refuses_unmapped_startup_arguments_before_launch` |
+| `verify_native_does_not_retain_a_helper_that_only_answers_its_version` | `native_verification_does_not_promote_version_only_helpers` |
+| `draft_is_refused_while_the_scheduler_admits_no_workers` | `draft_preflight_rejects_closed_capacity_without_writing_approval_or_task_state` |
+| `a_subdirectory_binding_runs_in_the_same_subdirectory_of_the_new_worktree` | `worktree_route_maps_root_and_subdirectory_and_refuses_foreign_sources` |
+| `an_untracked_working_directory_is_refused_before_the_approval_is_used` | `source_only_working_directory_is_refused_before_approval_consumption` |
+| `a_legacy_thread_holding_the_planned_worktree_blocks_its_creation` | `legacy_worktree_reference_blocks_new_creation_before_consuming_approval` |
+| `repeated_snapshot_reuses_its_manifest_and_selects_by_scope_or_pin` | `same_inputs_reuse_manifest_and_unrelated_domain_is_excluded` |
+| `coordinator_snapshots_hold_only_hard_rules_and_the_task_id_is_reserved` | `coordinator_constructor_skips_tasks_and_cli_rejects_reserved_id` |
+| `a_snapshot_pinning_a_revoked_record_is_refused` | revoked-pin half of `stale_heads_digest_conflicts_and_revoked_pin_blocks` |
+| `repeated_legacy_import_reuses_records_and_hostile_markdown_stays_inert` | `repeat_import_reuses_ids_and_hostile_markdown_cannot_install_approvals` |
+| `an_imported_record_made_a_hard_rule_is_active_and_survives_collection` | `hard_rule_without_import_ack_is_an_active_fact_and_gc_keeps_pins` |
+| `cutover_hands_memory_to_the_store_and_never_overwrites_an_edited_projection` | `cutover_switches_owner_preserves_runtime_and_rejects_divergent_projection` |
+| `ticker_items_are_listed_seen_once_and_moved_to_done` | `lists_marks_seen_and_moves_to_done`, `two_events_in_one_tick_get_two_items`, routine-body half of `routine_items_carry_a_body_and_subjects_are_made_file_safe` |
+| `overview_prints_groups_in_display_order_and_names_the_pane_that_needs_you` | `groups_print_in_display_order_not_precedence_order` |
+| `overview_without_a_slug_resolves_the_workspace_only_within_its_own_socket` | `workspace_resolves_through_the_coordinator_or_a_thread_in_the_same_socket_only` |
+| `overview_and_focus_refuse_a_path_like_slug` | `an_explicit_slug_is_validated` |
+| `unfocus_reads_herdr_stdout_reports_its_stderr_on_failure_and_survives_a_missing_binary` | `captures_output_and_exit_code`, `missing_program_is_an_error` |
+
+`passes_stdin` was deleted without a new test. Every ticker job child reads
+its request from stdin, and the kept `stdin_larger_than_pipe_capacity_is_written_and_closed`
+checks the bytes exactly. The mutation check below shows the ticker
+workflows fail when stdin is dropped.
+
+Some guarantees look different from the CLI:
+- A refused worktree preparation is visible as the ticker log naming the
+  reason on two passes, with no Herdr request, no worktree, the approval
+  unused and the attempt still reserved.
+- The binding route has no `repo` field that a command can set, so the
+  unit test's repository-mismatch case has no E2E form. A binding outside
+  every selected repository is refused at `launch draft`.
+- The imported-projection refusal is reached through cutover recovery: a
+  publication failure after the signed policy commits, then a hand edit.
+
+Kept, trimmed:
+- `stale_heads_digest_conflicts` (from
+  `stale_heads_digest_conflicts_and_revoked_pin_blocks`). No command passes
+  an expected heads digest; the CLI and coordinator checkpoints pass `None`.
+- `hostile_subjects_are_made_file_safe` (from
+  `routine_items_carry_a_body_and_subjects_are_made_file_safe`). Every
+  caller of `inbox::write` passes a validated slug or thread id, so no
+  command can supply a hostile subject.
+
+Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
+- Dropping the socket check in `project_for_workspace` failed the workspace
+  test: `beta`'s socket resolved to `alpha`.
+- Not persisting the inbox counter failed the inbox test: the three items
+  of one pass shared a counter.
+- Always mapping a binding to the worktree root failed the subdirectory
+  test: the worker was created in the root, not `subdir`.
+- Sending empty stdin from `RealRunner` failed
+  `ticker_launches_and_briefs_once_then_stops_a_cancelled_worker_while_paused_and_revoked`
+  at its first CLI step that pipes input to a subprocess.

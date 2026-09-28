@@ -387,28 +387,6 @@ mod tests {
         }
     }
     #[test]
-    fn production_preparation_binds_inputs_without_fabricating_capabilities_or_authority() {
-        let f = Fixture::new();
-        let before = crate::runtime::snapshot(&f.project).unwrap();
-        let prepared = f.prepare().unwrap();
-        assert_eq!(prepared.reference, prepared.profile.reference().unwrap());
-        assert_eq!(prepared.profile.agent.version, "2.1.0-preview.1");
-        assert_eq!(
-            prepared.profile.permission_policy,
-            crate::authority::policy_reference(&f.project).unwrap()
-        );
-        assert_eq!(prepared.profile.execution_home.as_deref(), f.home.to_str());
-        assert!(!prepared.launchable && !prepared.protocol_capable && !prepared.certified);
-        assert!(prepared.profile.validate_for_launch().is_err());
-        assert!(
-            !serde_json::to_string(&prepared)
-                .unwrap()
-                .contains("PRIVATE_ARG")
-        );
-        assert_eq!(crate::runtime::snapshot(&f.project).unwrap(), before);
-        assert_eq!(f.prepare().unwrap().reference, prepared.reference);
-    }
-    #[test]
     fn changed_policy_binary_home_or_unmapped_configuration_discards_preparation() {
         for case in [
             "config-during-probe",
@@ -736,31 +714,6 @@ else:
     }
     #[test]
     #[cfg(target_os = "linux")]
-    fn native_verification_does_not_promote_version_only_helpers() {
-        let f = Fixture::new();
-        let config = fs::read_to_string(&f.config)
-            .unwrap()
-            .replace("extra_args=['PRIVATE_ARG']", "extra_args=[]");
-        fs::write(&f.config, config).unwrap();
-        f.prepare().unwrap();
-        let before = crate::runtime::snapshot(&f.project).unwrap();
-        assert!(
-            verify_native(
-                &f.project,
-                "worker",
-                &f.herdr,
-                &f.agent,
-                &f.home,
-                Instant::now() + Duration::from_secs(10),
-                Default::default()
-            )
-            .is_err()
-        );
-        assert_eq!(crate::runtime::snapshot(&f.project).unwrap(), before);
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
     #[ignore = "requires HP_LIVE_HERDR patched runtime and HP_LIVE_AGENT native Codex; isolated home, no prompt"]
     fn live_production_native_profile_verification() {
         let f = Fixture::with_kind("codex");
@@ -824,26 +777,6 @@ else:
         );
     }
 
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn native_verification_refuses_unmapped_startup_arguments_before_launch() {
-        let f = Fixture::new();
-        let before = crate::runtime::snapshot(&f.project).unwrap();
-        let error = verify_native(
-            &f.project,
-            "worker",
-            &f.herdr,
-            &f.agent,
-            &f.home,
-            Instant::now() + Duration::from_secs(10),
-            Default::default(),
-        )
-        .err()
-        .unwrap();
-        assert!(error.to_string().contains("empty extra_args"));
-        assert!(!error.to_string().contains("PRIVATE_ARG"));
-        assert_eq!(crate::runtime::snapshot(&f.project).unwrap(), before);
-    }
     #[test]
     #[cfg(target_os = "linux")]
     #[ignore = "requires patched HP_LIVE_HERDR, HP_LIVE_AGENT and explicit HP_LIVE_AUTH_FILE; submits one fixed prompt"]

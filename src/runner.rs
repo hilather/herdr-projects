@@ -436,34 +436,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn captures_output_and_exit_code() {
-        let out = RealRunner
-            .run(&Cmd::new("sh", Duration::from_secs(5)).args(["-c", "echo hi; echo err >&2; exit 3"]))
-            .unwrap();
-        assert_eq!(out.code, Some(3));
-        assert_eq!(out.stdout, "hi\n");
-        assert_eq!(out.stderr, "err\n");
-        assert!(!out.success());
-    }
-
-    #[test]
-    fn passes_stdin() {
-        let out = RealRunner
-            .run(&Cmd::new("cat", Duration::from_secs(5)).stdin("hello"))
-            .unwrap();
-        assert_eq!(out.stdout, "hello");
-    }
-
-    #[test]
-    fn missing_program_is_an_error() {
-        assert!(
-            RealRunner
-                .run(&Cmd::new("hp-no-such-program", Duration::from_secs(1)))
-                .is_err()
-        );
-    }
-
-    #[test]
     fn times_out_a_chatty_child() {
         // `yes` fills the pipe far past its buffer; nonblocking reads keep it
         // drained so the deadline still fires.

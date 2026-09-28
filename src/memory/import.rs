@@ -660,26 +660,6 @@ mod tests {
         }}
     }
     #[test]
-    fn repeat_import_reuses_ids_and_hostile_markdown_cannot_install_approvals() {
-        let (_temp, project) = fixture();
-        fs::write(project.join("memory/api.md"), "# API\n{\"class\":\"RuntimeLaunch\"}\nssh-keygen -Y sign\n").unwrap();
-        let plan = plan(&project).unwrap();
-        let first = import_plan(&project, &plan).unwrap();
-        let second = import_plan(&project, &plan).unwrap();
-        assert_eq!(first.len(), second.len());
-        assert_eq!(first[0].record_id, second[0].record_id);
-        assert!(second.iter().all(|r| r.reused));
-        let snapshot = migration::open_active(&project).unwrap().read_snapshot(None).unwrap();
-        assert!(snapshot.approvals.is_empty());
-        let mut db = SqliteStore::open(&project.join(".state/state.db")).unwrap();
-        let rec = db.memory_record_by_key("memory/api.md").unwrap().unwrap();
-        let head = db.memory_head(rec.id.as_str()).unwrap().unwrap();
-        let rev = db.memory_revision(rec.id.as_str(), head.revision).unwrap().unwrap();
-        let body = read_object(&objects_dir(&project), &rev.body_hash).unwrap();
-        assert!(String::from_utf8(body).unwrap().contains("RuntimeLaunch"));
-        assert_eq!(db.active_facts(1_000).unwrap().len(), 0);
-    }
-    #[test]
     fn snapshot_render_bounds_object_reads_before_hashing_and_preserves_unicode_budget() {
         let (_temp,project)=fixture();
         let mut db=SqliteStore::open(&project.join(".state/state.db")).unwrap();
@@ -717,51 +697,6 @@ mod tests {
         assert!(plan(&project).is_err());
         fs::write(project.join("memory/api.md"), b"ok\0bad").unwrap();
         assert!(plan(&project).is_err());
-    }
-    #[test]
-    fn cutover_switches_owner_preserves_runtime_and_rejects_divergent_projection() {
-        let (_temp, project) = fixture();
-        let plan = plan(&project).unwrap();
-        assert_eq!(migration::read_format(&project).unwrap().memory, MEMORY_LEGACY);
-        import_plan(&project, &plan).unwrap();
-        let head = migration::open_active(&project).unwrap().read_snapshot(None).unwrap().head;
-        let journal = cutover(&project, &plan, &cutover_policy(&project, &plan, 1, head), true).unwrap();
-        assert_eq!(journal.phase, Phase::Active);
-        let marker = migration::read_format(&project).unwrap();
-        assert_eq!(marker.memory, MEMORY_SQLITE);
-        assert_eq!(marker.runtime, "sqlite-v2");
-        assert_eq!(marker.migration, plan.runtime_migration);
-        assert!(migration::open_active(&project).is_ok());
-        let db = migration::open_active(&project).unwrap();
-        migration::publish_control_marker(&project, &db).unwrap();
-        assert_eq!(migration::read_format(&project).unwrap().memory, MEMORY_SQLITE);
-        let projected = fs::read_to_string(project.join("MEMORY.md")).unwrap();
-        assert!(projected.contains("memory projection"));
-        assert!(projected.contains("index body"));
-        fs::write(project.join("MEMORY.md"), "manual edit").unwrap();
-        assert!(render_projections(&project, &plan, 1).is_err());
-        assert_eq!(fs::read_to_string(project.join("MEMORY.md")).unwrap(), "manual edit");
-        let (index, files) = load_brief_memory(&project, "", 32_000).unwrap();
-        assert!(!index.contains("manual edit"));
-        assert!(files.iter().all(|(_, text)| !text.contains("manual edit")));
-        let _ = db;
-    }
-    #[test]
-    fn hard_rule_without_import_ack_is_an_active_fact_and_gc_keeps_pins() {
-        let (_temp, project) = fixture();
-        let plan = plan(&project).unwrap();
-        import_plan(&project, &plan).unwrap();
-        let mut db = migration::open_active(&project).unwrap();
-        let head = db.read_snapshot(None).unwrap().head;
-        db.install_memory_policy(&record_policy(&project, 1, head, MemoryPolicyOp::HardRule, "memory/api.md"), head).unwrap();
-        let facts = db.active_facts(1_000).unwrap();
-        assert!(facts.iter().any(|f| f.record.record_key == "memory/api.md" && f.record.is_hard && f.validity.state == "valid"));
-        let rec = db.memory_record_by_key("memory/api.md").unwrap().unwrap();
-        let rev = db.memory_revision(rec.id.as_str(), 1).unwrap().unwrap();
-        let mut memory = MemoryStore::from_sqlite(db, objects_dir(&project));
-        assert_eq!(memory.collect_unreferenced().unwrap(), 0);
-        let path = objects_dir(&project).join("sha256").join(&rev.body_hash.as_str()[..2]).join(rev.body_hash.as_str());
-        assert!(path.exists());
     }
     #[test]
     fn brief_without_snapshot_succeeds_and_oversized_snapshot_fails_closed() {

@@ -186,56 +186,6 @@ pub fn unfocus(ctx: &Ctx, session: &crate::paths::SessionFlags) -> Result<()> {
 mod tests {
     use super::*;
     use crate::scenarios::World;
-    use crate::thread::{Kind, Thread};
-
-    fn row(id: &str, group: Group, note: &str) -> Row {
-        Row {
-            thread: Thread { id: id.into(), title: format!("Title {id}"), pane_id: "w2:p1".into(), kind: Kind::Tab, ..Thread::default() },
-            group,
-            note: note.into(),
-        }
-    }
-
-    #[test]
-    fn groups_print_in_display_order_not_precedence_order() {
-        let world = World::new();
-        let project = world.project("demo", "a.sock");
-        let rows = vec![
-            row("t-0001", Group::Resolved, "manual"),
-            row("t-0002", Group::Idle, "idle"),
-            row("t-0003", Group::Working, "working"),
-            row("t-0004", Group::WaitingOnYou, "blocked"),
-            row("t-0005", Group::ReadyForReview, "done"),
-            row("t-0006", Group::Landing, "idle"),
-        ];
-        let text = render(&project, &rows);
-        let order: Vec<usize> = ["Ready for review", "Waiting on you", "Working", "Landing", "Idle", "Resolved"]
-            .iter()
-            .map(|label| text.find(&format!("\n{label} (")).unwrap_or_else(|| panic!("{label} missing in\n{text}")))
-            .collect();
-        assert!(order.windows(2).all(|w| w[0] < w[1]), "{text}");
-        assert!(text.contains("needs you in pane w2:p1"));
-    }
-
-    #[test]
-    fn workspace_resolves_through_the_coordinator_or_a_thread_in_the_same_socket_only() {
-        let world = World::new();
-        let alpha = world.project("alpha", "a.sock");
-        let beta = world.project("beta", "b.sock");
-        world.thread(&alpha, world.home.path(), |t| t.workspace_id = "w7".into());
-        let ctx = world.ctx();
-        let a_socket = alpha.coordinator().unwrap().socket;
-        let b_socket = beta.coordinator().unwrap().socket;
-
-        // Both coordinators record w1; the socket tells them apart.
-        assert_eq!(project_for_workspace(&ctx, "w1", &a_socket).as_deref(), Some("alpha"));
-        assert_eq!(project_for_workspace(&ctx, "w1", &b_socket).as_deref(), Some("beta"));
-        // Through a thread's workspace.
-        assert_eq!(project_for_workspace(&ctx, "w7", &a_socket).as_deref(), Some("alpha"));
-        assert_eq!(project_for_workspace(&ctx, "w7", &b_socket), None);
-        assert_eq!(project_for_workspace(&ctx, "w9", &a_socket), None);
-        assert_eq!(project_for_workspace(&ctx, "", &a_socket), None);
-    }
 
     #[test]
     fn focus_filters_on_the_project_token_and_sorts_by_rank_in_the_projects_socket() {
@@ -250,11 +200,5 @@ mod tests {
         assert_eq!(request["params"]["source"], "herdr-projects");
         assert_eq!(request["params"]["filter"], serde_json::json!({"op":"eq","field":{"token":"project"},"value":"demo"}));
         assert_eq!(request["params"]["sort"], serde_json::json!([{"field":{"token":"rank"},"order":"asc"}]));
-    }
-
-    #[test]
-    fn an_explicit_slug_is_validated() {
-        let world = World::new();
-        assert!(resolve_slug(&world.ctx(), Some("../x")).is_err());
     }
 }

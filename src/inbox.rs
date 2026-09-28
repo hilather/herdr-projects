@@ -205,61 +205,15 @@ pub fn done(project: &Project, ids: &[String], all: bool) -> Result<usize> {
 mod tests {
     use super::*;
 
-    fn write_item(project: &Project, id: &str, body: &str) {
-        let text = format!(
-            "+++\nid = \"{id}\"\nkind = \"routine\"\nsubject = \"r\"\ncreated = \"2026-09-17T00:00:00Z\"\nsummary = \"s\"\n+++\n{body}"
-        );
-        std::fs::write(inbox_dir(project).join(format!("{id}.md")), text).unwrap();
-    }
-
+    // Every production caller of `write` passes a validated slug or thread id,
+    // so no command can reach this with a hostile subject; kept for the
+    // file-name guarantee. The routine body is covered by tests/inbox.rs.
     #[test]
-    fn lists_marks_seen_and_moves_to_done() {
-        let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
-        write_item(&project, "20260917T000002Z-routine-r-2", "\nbody text\n");
-        write_item(&project, "20260917T000001Z-routine-r-1", "");
-        let items = unhandled(&project);
-        assert_eq!(items.len(), 2);
-        assert!(items[0].id.ends_with("-1"));
-        assert_eq!(items[1].body, "body text");
-
-        mark_seen(&project, &[items[0].id.clone()]).unwrap();
-        assert_eq!(seen(&project).len(), 1);
-
-        assert_eq!(done(&project, &[items[0].id.clone()], false).unwrap(), 1);
-        assert_eq!(unhandled(&project).len(), 1);
-        assert!(inbox_dir(&project).join("done").join(format!("{}.md", items[0].id)).is_file());
-        assert_eq!(done(&project, &[], true).unwrap(), 1);
-        assert!(unhandled(&project).is_empty());
-    }
-
-    #[test]
-    fn two_events_in_one_tick_get_two_items() {
-        let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
-        let a = write(&project, "thread-state", "t-0001", "first", "").unwrap();
-        let b = write(&project, "thread-state", "t-0001", "second\nline", "").unwrap();
-        assert_ne!(a, b);
-        assert!(a.ends_with("-thread-state-t-0001-1"), "{a}");
-        assert!(b.ends_with("-thread-state-t-0001-2"), "{b}");
-        let items = unhandled(&project);
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[1].summary, "second line");
-        assert!(items.iter().all(|i| i.body.is_empty()));
-        // A written item can be marked done by its id.
-        assert_eq!(done(&project, &[a], false).unwrap(), 1);
-    }
-
-    #[test]
-    fn routine_items_carry_a_body_and_subjects_are_made_file_safe() {
+    fn hostile_subjects_are_made_file_safe() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
         let id = write(&project, "outage", "Elias MacBook/../x", "down", "").unwrap();
         assert!(id.contains("-outage-elias-macbook----x-"), "{id}");
-        write(&project, "routine", "nightly", "due", "Check the build.\n\n```\nout\n```").unwrap();
-        let routine = unhandled(&project).into_iter().find(|i| i.kind == "routine").unwrap();
-        assert!(routine.body.starts_with("Check the build."));
-        assert!(routine.body.ends_with("```"));
     }
 
     #[test]

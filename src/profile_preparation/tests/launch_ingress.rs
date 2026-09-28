@@ -20,8 +20,7 @@ fn git(path: &Path, args: &[&str]) -> String {
 }
 
 impl LaunchFixture {
-    fn new(repository: bool) -> Self { Self::with_cwd(repository, "") }
-    fn with_cwd(repository: bool, suffix: &str) -> Self {
+    fn new(repository: bool) -> Self {
         let f=Fixture::new();
         let socket=std::os::unix::net::UnixListener::bind(f._root.path().join("native.sock")).unwrap();
         fs::write(&f.herdr,format!(r#"#!/usr/bin/python3
@@ -62,7 +61,7 @@ print(json.dumps({{'id':r['id'],'result':result}}))
             id:task.clone(),revision:1,state:TaskState::Draft,title:"Retained task".into(),active_attempt:None,
         }}]}).unwrap();
         let state=db.read_snapshot(None).unwrap();
-        let route=RuntimeRoute{socket:f._root.path().join("native.sock").display().to_string(),cwd:if suffix.is_empty() {work.display().to_string()} else {work.join(suffix).display().to_string()},..Default::default()};
+        let route=RuntimeRoute{socket:f._root.path().join("native.sock").display().to_string(),cwd:work.display().to_string(),..Default::default()};
         db.create_runtime(Some(&task),Some(1),state.head,&route).unwrap();
         let state=db.read_snapshot(None).unwrap();
         db.queue_task(&task,2,state.head,&QueueRequest{priority:0,dependencies:vec![]},crate::canonical_worker::now()).unwrap();
@@ -168,17 +167,6 @@ fn repository_observation_ignores_replacement_refs_and_refuses_lazy_fetch() {
     assert_ne!(git(path,&["rev-parse","HEAD^{tree}"]),actual_tree);
     let draft=f.draft();assert_eq!(draft.inputs.repositories[0].tree,actual_tree);
     git(path,&["config","remote.origin.promisor","true"]);
-    let before=f.state();
-    assert!(launch_preparation::draft(&f.f.project,&f.selection,before.head,Duration::from_secs(60),Instant::now()+Duration::from_secs(20),Default::default()).is_err());
-    assert_eq!(f.state(),before);
-}
-
-#[test]
-fn draft_preflight_rejects_closed_capacity_without_writing_approval_or_task_state() {
-    let f=LaunchFixture::new(false);
-    let mut db=SqliteStore::open(&f.f.project.join(".state/state.db")).unwrap();
-    let state=db.read_snapshot(None).unwrap();
-    db.set_scheduler_policy(state.head,state.scheduler.unwrap().policy.revision,0,3).unwrap();
     let before=f.state();
     assert!(launch_preparation::draft(&f.f.project,&f.selection,before.head,Duration::from_secs(60),Instant::now()+Duration::from_secs(20),Default::default()).is_err());
     assert_eq!(f.state(),before);
@@ -331,16 +319,6 @@ fn worktree_inventory_retains_uncertain_paths_and_refuses_corrupt_provenance() {
 }
 
 #[test]
-fn legacy_worktree_reference_blocks_new_creation_before_consuming_approval() {
-    let f=LaunchFixture::new(true);let draft=f.draft();let approval=f.install(&draft);let reservation=f.reserve(&approval).unwrap();
-    let neighbor=f.f.project.parent().unwrap().join("legacy-neighbor");fs::create_dir(&neighbor).unwrap();fs::create_dir(neighbor.join(".state")).unwrap();fs::create_dir(neighbor.join("threads")).unwrap();
-    fs::write(neighbor.join("PROJECT.md"),"legacy fixture").unwrap();
-    fs::write(neighbor.join("threads/t-0001.toml"),format!("id='t-0001'\nworktree_path={}\n",serde_json::to_string(&draft.worktrees[0].path).unwrap())).unwrap();
-    let before=f.state();assert!(crate::worktree_preparation::prepare(&f.f.project,&reservation.record.operation,1,Instant::now()+Duration::from_secs(45),Default::default()).is_err());
-    assert_eq!(f.state(),before);assert!(!Path::new(&draft.worktrees[0].path).exists());
-}
-
-#[test]
 fn started_worktree_proof_allows_output_but_rejects_reassociation() {
     let f=LaunchFixture::new(true); let draft=f.draft(); let approval=f.install(&draft); let reservation=f.reserve(&approval).unwrap();
     let receipts=crate::worktree_preparation::prepare(&f.f.project,&reservation.record.operation,1,Instant::now()+Duration::from_secs(45),Default::default()).unwrap();
@@ -370,36 +348,6 @@ fn started_worktree_proof_allows_output_but_rejects_reassociation() {
     proof.check().unwrap();
     crate::worktree_preparation::pin_started_held(&f.f.project,&state,&reservation.record,Instant::now()+Duration::from_secs(10),Default::default()).unwrap().check().unwrap();
     assert_eq!(f.state(),state,"identity observation must not rewrite canonical records");
-}
-
-#[test]
-fn worktree_route_maps_root_and_subdirectory_and_refuses_foreign_sources() {
-    let f=LaunchFixture::new(true); let draft=f.draft();
-    let attempt=AttemptId::new(draft.brief.attempt_id.clone()).unwrap();
-    let mut identity=f.state().runtime_bindings[0].identity.clone();
-    let source=draft.inputs.repositories[0].repository.clone();
-    for suffix in ["", "/", "/subdir", "/subdir//"] {
-        identity.cwd=format!("{source}{suffix}");
-        let (route,plan)=worktree_execution_route(&draft.inputs,&attempt,&identity).unwrap();
-        let plan=plan.unwrap();
-        assert_eq!(route.cwd,if suffix.contains("subdir") {format!("{}/subdir",plan.path)} else {plan.path});
-    }
-    identity.cwd="/tmp/foreign".into();
-    assert!(worktree_execution_route(&draft.inputs,&attempt,&identity).is_err());
-    identity.cwd=source;identity.repo="/tmp/foreign".into();
-    assert!(worktree_execution_route(&draft.inputs,&attempt,&identity).is_err());
-}
-
-#[test]
-fn source_only_working_directory_is_refused_before_approval_consumption() {
-    let f=LaunchFixture::with_cwd(true,"untracked-dir");
-    fs::create_dir(f.selection.repositories[0].join("untracked-dir")).unwrap();
-    let draft=f.draft();let approval=f.install(&draft);let reservation=f.reserve(&approval).unwrap();
-    let before=f.state();
-    let error=crate::worktree_preparation::prepare(&f.f.project,&reservation.record.operation,1,Instant::now()+Duration::from_secs(45),Default::default()).unwrap_err();
-    assert!(error.to_string().contains("working directory is absent"),"{error:#}");
-    assert_eq!(f.state(),before);
-    assert!(!Path::new(&draft.worktrees[0].path).exists());
 }
 
 #[test]

@@ -122,10 +122,10 @@ impl Project {
     }
     /// Install an owner-signed memory policy operation through `memory import`.
     fn policy(&self, op: &str, key: &str) {
-        let head = self.head();
-        let body = json!({"version":1,"project_store":self.store,"revision":1,"authority":authority::policy_reference(&self.project).unwrap(),
+        let (head, revision) = (self.head(), self.ok(&["memory", "demo", "inspect"])["policies"].as_array().unwrap().len() + 1);
+        let body = json!({"version":1,"project_store":self.store,"revision":revision,"authority":authority::policy_reference(&self.project).unwrap(),
             "expected_head":head,"op":op,"record_key":key});
-        let (doc, sig) = self.sign(&format!("policy-{op}-{key}.json"), &serde_json::to_vec(&body).unwrap(), authority::MEMORY_SIGNATURE_NAMESPACE);
+        let (doc, sig) = self.sign(&format!("policy-{revision}.json"), &serde_json::to_vec(&body).unwrap(), authority::MEMORY_SIGNATURE_NAMESPACE);
         self.ok(&["memory", "demo", "import", doc.to_str().unwrap(), sig.to_str().unwrap(), "--expected-head", &head.to_string()]);
     }
     fn context(&self, args: &[&str]) -> String {
@@ -250,4 +250,167 @@ fn coordinator_sessions_keep_independent_monotonic_cursors_and_see_instruction_e
     let _ = p.cli(&["context", "demo", "--session", "session-a", "--ack", checkpoint(&a2)]);
     let a4 = p.context(&["--peek", "--session", "session-a"]);
     assert!(a4.contains("kind=delta") && !a4.contains("new-task"), "stale acknowledgment rewound the session: {a4}");
+}
+
+impl Project {
+    /// `memory snapshot` for `task` on the `planner` profile.
+    fn cli_snapshot(&self, task: &str, domains: &[&str], pinned: &[&str]) -> Output {
+        let scope = self.path("scope.json");
+        fs::write(&scope, json!({"schema_version":1,"task_id":task,"profile":"planner","domains":domains,"paths":[],"pinned_keys":pinned,"sensitivity":"default"}).to_string()).unwrap();
+        self.cli(&["memory", "demo", "snapshot", "--task", task, "--profile", "planner", "--input-file", scope.to_str().unwrap()])
+    }
+    fn snapshot_ok(&self, task: &str, domains: &[&str], pinned: &[&str]) -> Value {
+        let out = self.cli_snapshot(task, domains, pinned);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+    fn entry_keys(&self, snapshot: &Value) -> Vec<String> {
+        let records = self.ok(&["memory", "demo", "inspect"])["records"].as_array().unwrap().clone();
+        snapshot["entries"].as_array().unwrap().iter()
+            .map(|e| records.iter().find(|r| r["id"] == e["record_id"]).unwrap()["record_key"].as_str().unwrap().to_owned()).collect()
+    }
+    /// The legacy files `memory plan` inventories: an index and one note.
+    fn legacy_memory(&self, note: &str) {
+        fs::write(self.project.join("MEMORY.md"), "# Memory\nindex body\n").unwrap();
+        fs::write(self.project.join("memory/api.md"), note).unwrap();
+    }
+}
+
+/// Replaces `same_inputs_reuse_manifest_and_unrelated_domain_is_excluded`.
+#[test]
+fn repeated_snapshot_reuses_its_manifest_and_selects_by_scope_or_pin() {
+    let p = Project::new();
+    let snapshot = p.producer("writer");
+    p.remember("writer", &snapshot, "ui.note", b"ui body", json!({"scope":{"domains":["ui"],"paths":[]}}));
+    p.remember("writer", &snapshot, "infra.note", b"infra body", json!({"scope":{"domains":["infra"],"paths":[]}}));
+    p.remember("writer", &snapshot, "api.contract", b"contract body", json!({"scope":{"domains":["infra"],"paths":[]}}));
+    p.add_task("ui-task");
+    let first = p.snapshot_ok("ui-task", &["ui"], &["api.contract"]);
+    let again = p.snapshot_ok("ui-task", &["ui"], &["api.contract"]);
+    assert_eq!((&again["id"], &again["manifest_hash"]), (&first["id"], &first["manifest_hash"]));
+    let keys = p.entry_keys(&first);
+    assert!(keys.contains(&"ui.note".into()) && keys.contains(&"api.contract".into()), "{keys:?}");
+    assert!(!keys.contains(&"infra.note".into()), "unrelated domain selected: {keys:?}");
+    // A later record makes a new snapshot at a later sequence.
+    p.remember("writer", &snapshot, "ui.later", b"later body", json!({"scope":{"domains":["ui"],"paths":[]}}));
+    let later = p.snapshot_ok("ui-task", &["ui"], &["api.contract"]);
+    assert_ne!(later["id"], first["id"]);
+    assert!(later["sequence"].as_u64() > first["sequence"].as_u64());
+    assert!(p.entry_keys(&later).contains(&"ui.later".into()));
+}
+
+/// Replaces `coordinator_constructor_skips_tasks_and_cli_rejects_reserved_id`.
+#[test]
+fn coordinator_snapshots_hold_only_hard_rules_and_the_task_id_is_reserved() {
+    let p = Project::new();
+    let snapshot = p.producer("writer");
+    p.remember("writer", &snapshot, "ops.rule", b"always rule", json!({}));
+    p.remember("writer", &snapshot, "ops.note", b"optional note", json!({}));
+    p.policy("hard_rule", "ops.rule");
+    let context = p.context(&["--peek", "--session", "session-a"]);
+    let id = context.split_whitespace().find_map(|w| w.strip_prefix("snapshot=")).unwrap();
+    let rendered = p.ok(&["memory", "demo", "snapshot-input", "--id", id]);
+    assert_eq!(rendered["snapshot"]["task_id"], "coordinator");
+    assert_eq!(p.entry_keys(&rendered["snapshot"]), ["ops.rule"]);
+    assert!(rendered["snapshot"]["entries"].as_array().unwrap().iter().all(|e| e["role"] == "mandatory"));
+    assert!(!rendered["text"].as_str().unwrap().contains("optional note"));
+    // No task snapshot can take the coordinator's id.
+    let head = p.head();
+    let out = p.cli_snapshot("coordinator", &[], &[]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("reserved"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(p.head(), head);
+}
+
+/// Replaces the revoked-pin half of `stale_heads_digest_conflicts_and_revoked_pin_blocks`.
+#[test]
+fn a_snapshot_pinning_a_revoked_record_is_refused() {
+    let p = Project::new();
+    let snapshot = p.producer("writer");
+    p.remember("writer", &snapshot, "pin.contract", b"pinned body", json!({"scope":{"domains":["ui"],"paths":[]}}));
+    p.add_task("ui-task");
+    assert_eq!(p.entry_keys(&p.snapshot_ok("ui-task", &["ui"], &["pin.contract"])), ["pin.contract"]);
+    p.policy("revoke_head", "pin.contract");
+    let head = p.head();
+    let out = p.cli_snapshot("ui-task", &["ui"], &["pin.contract"]);
+    assert!(!out.status.success(), "a revoked pin was snapshotted: {}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(p.head(), head);
+    // Unpinned, the revoked record is simply not selected.
+    assert!(p.entry_keys(&p.snapshot_ok("ui-task", &["ui"], &[])).is_empty());
+}
+
+/// Replaces `repeat_import_reuses_ids_and_hostile_markdown_cannot_install_approvals`.
+#[test]
+fn repeated_legacy_import_reuses_records_and_hostile_markdown_stays_inert() {
+    let p = Project::new();
+    p.legacy_memory("# API\n{\"class\":\"RuntimeLaunch\"}\nssh-keygen -Y sign\n");
+    let first = p.ok(&["memory", "demo", "import"]);
+    let second = p.ok(&["memory", "demo", "import"]);
+    let ids = |v: &Value| v.as_array().unwrap().iter().map(|r| r["record_id"].clone()).collect::<Vec<_>>();
+    assert_eq!(ids(&first), ids(&second));
+    assert!(second.as_array().unwrap().iter().all(|r| r["reused"] == true), "{second}");
+    assert!(p.record("memory/api.md").is_some());
+    // Imported text grants nothing and is not yet an active fact.
+    let state = runtime::snapshot(&p.project).unwrap();
+    assert!(state.approvals.is_empty() && state.memory_policies.is_empty());
+    assert_eq!(p.ok(&["memory", "demo", "inspect"])["active_facts"], json!([]));
+}
+
+/// Replaces `hard_rule_without_import_ack_is_an_active_fact_and_gc_keeps_pins`.
+#[test]
+fn an_imported_record_made_a_hard_rule_is_active_and_survives_collection() {
+    let p = Project::new();
+    p.legacy_memory("# API\nobservation body\n");
+    p.ok(&["memory", "demo", "import"]);
+    p.policy("hard_rule", "memory/api.md");
+    let facts = p.ok(&["memory", "demo", "inspect"])["active_facts"].clone();
+    let fact = facts.as_array().unwrap().iter().find(|f| f["record"]["record_key"] == "memory/api.md").unwrap_or_else(|| panic!("{facts}"));
+    assert_eq!((&fact["record"]["is_hard"], &fact["validity"]["state"]), (&json!(true), &json!("valid")), "{fact}");
+    p.collect();
+    p.add_task("reader");
+    let snapshot = p.snapshot_ok("reader", &[], &[]);
+    let rendered = p.ok(&["memory", "demo", "snapshot-input", "--id", snapshot["id"].as_str().unwrap()]);
+    assert!(rendered["text"].as_str().unwrap().contains("observation body"), "{rendered}");
+}
+
+/// Replaces `cutover_switches_owner_preserves_runtime_and_rejects_divergent_projection`.
+#[test]
+fn cutover_hands_memory_to_the_store_and_never_overwrites_an_edited_projection() {
+    let p = Project::new();
+    p.legacy_memory("# API\nobservation body\n");
+    let plan_file = p.path("memory-plan.json");
+    let plan = p.ok(&["memory", "demo", "plan", "--output", plan_file.to_str().unwrap()]);
+    p.ok(&["memory", "demo", "import"]);
+    assert_eq!(p.ok(&["memory", "demo", "inspect"])["authority"], "legacy-markdown");
+    let head = p.head();
+    let policy = json!({"version":1,"project_store":p.store,"revision":1,"authority":authority::policy_reference(&p.project).unwrap(),
+        "expected_head":head,"op":"cutover","memory_plan_digest":plan["digest"],"expected_memory_owner":"legacy-markdown"});
+    let (doc, sig) = p.sign("cutover.json", &serde_json::to_vec(&policy).unwrap(), authority::MEMORY_SIGNATURE_NAMESPACE);
+    let cutover = || p.cli(&["memory", "demo", "cutover", "--plan", plan_file.to_str().unwrap(), doc.to_str().unwrap(), sig.to_str().unwrap(),
+        "--expected-head", &head.to_string(), "--writers-stopped"]);
+
+    // Publication fails after the signed policy commits; the index is then edited by hand.
+    fs::create_dir(p.project.join("MEMORY.projection-next")).unwrap();
+    assert!(!cutover().status.success());
+    fs::remove_dir(p.project.join("MEMORY.projection-next")).unwrap();
+    fs::write(p.project.join("MEMORY.md"), "manual edit").unwrap();
+    let out = cutover();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("edited memory projection preserved"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(fs::read_to_string(p.project.join("MEMORY.md")).unwrap(), "manual edit");
+
+    // With the original bytes back, recovery completes and later replays are stable.
+    fs::write(p.project.join("MEMORY.md"), "# Memory\nindex body\n").unwrap();
+    for _ in 0..2 {
+        let out = cutover();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap()["phase"], "active");
+    }
+    let format: Value = serde_json::from_slice(&fs::read(p.project.join(".state/format.json")).unwrap()).unwrap();
+    assert_eq!((&format["memory"], &format["runtime"]), (&json!("sqlite-v1"), &json!("sqlite-v2")));
+    assert_eq!(p.ok(&["memory", "demo", "inspect"])["authority"], "sqlite-v1");
+    let projected = fs::read_to_string(p.project.join("MEMORY.md")).unwrap();
+    assert!(projected.contains("memory projection") && projected.contains("index body"), "{projected}");
+    // The runtime store still takes work after the owner changed.
+    p.add_task("after-cutover");
 }
