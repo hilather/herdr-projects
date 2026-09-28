@@ -1259,10 +1259,7 @@ pub fn propose_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{
-        Attempt, AttemptId, AttemptState, DependencyRequirement, Mutation, QueueRequest, TaskId,
-        TaskState,
-    };
+    use crate::domain::{Attempt, AttemptId, AttemptState, Mutation, TaskId, TaskState};
     use crate::store::feedback::LocalFeedback;
 
     fn fixture() -> (tempfile::TempDir, SqliteStore) {
@@ -1290,85 +1287,6 @@ mod tests {
     }
     fn one(task: &str, text: &str, deps: &str) -> String {
         format!(r#"{{"task_id":"{task}","text":"{text}","dependencies":[{deps}]}}"#)
-    }
-    fn edge(predecessor: &str) -> String {
-        format!(r#"{{"predecessor":"{predecessor}","requirement":"verified_result"}}"#)
-    }
-
-    #[test]
-    fn dependency_cycle_is_rejected_without_a_revision_or_reservation() {
-        let (_temp, mut db) = fixture();
-        db.commit(Commit {
-            expected_head: 0,
-            mutations: ["a", "b"]
-                .into_iter()
-                .map(|id| Mutation::Task {
-                    expected: None,
-                    next: Task {
-                        id: TaskId::new(id).unwrap(),
-                        revision: 1,
-                        state: TaskState::Draft,
-                        title: id.into(),
-                        active_attempt: None,
-                    },
-                })
-                .collect(),
-        })
-        .unwrap();
-        let head = db.read_snapshot(None).unwrap().head;
-        db.queue_task(
-            &TaskId::new("a").unwrap(),
-            1,
-            head,
-            &QueueRequest {
-                priority: 0,
-                dependencies: vec![Dependency {
-                    predecessor: TaskId::new("b").unwrap(),
-                    requirement: DependencyRequirement::VerifiedResult,
-                }],
-            },
-            0,
-        )
-        .unwrap();
-        let attempts = count(&db.connection, "SELECT count(*) FROM attempts");
-        let dependencies = count(&db.connection, "SELECT count(*) FROM task_dependencies");
-        let queued = count(&db.connection, "SELECT count(*) FROM task_queue");
-        let cyclic = proposal(&format!(
-            "{},{}",
-            one("a", "loop", &edge("b")),
-            one("b", "loop", &edge("a"))
-        ));
-        let error = db.apply_plan_proposal(&cyclic, 0, "cycle-key").unwrap_err();
-        assert!(matches!(error, StoreError::Invalid(message) if message.contains("cycle")));
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM plan_revisions"),
-            0
-        );
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM attempts"),
-            attempts
-        );
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM task_dependencies"),
-            dependencies
-        );
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM task_queue"),
-            queued
-        );
-        let with_live_edge = proposal(&one("b", "closes the live edge", &edge("a")));
-        let error = db
-            .apply_plan_proposal(&with_live_edge, 0, "live-cycle")
-            .unwrap_err();
-        assert!(matches!(error, StoreError::Invalid(message) if message.contains("cycle")));
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM plan_revisions"),
-            0
-        );
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM task_contracts"),
-            0
-        );
     }
 
     #[test]
@@ -1563,36 +1481,6 @@ mod tests {
     }
 
     #[test]
-    fn automatic_replans_are_opt_in_bounded_and_coalesce_durably() {
-        let (root,mut db)=fixture();seed_task(&mut db,"task");
-        let ids:Vec<_>=(0..9).map(|n|record_rejection(&mut db,&format!("auto-{n}"),"task")).collect();
-        let budget=||read_budget::ReadBudget::new(controlled::ReadControl::new(std::time::Instant::now()+Duration::from_secs(5),Default::default()));
-        assert!(!db.service_replans(&budget()).unwrap().pending);
-        db.set_auto_replans(db.current_head().unwrap(),true).unwrap();
-        assert!(!db.service_replans(&budget()).unwrap().pending); // Paused project.
-        db.connection.execute("UPDATE project_control SET state='active'",[]).unwrap();
-        assert_eq!(db.service_replans(&budget()).unwrap().processed,8);
-        assert_eq!(db.service_replans(&budget()).unwrap().processed,1);
-        assert!(!db.service_replans(&budget()).unwrap().pending);
-        assert_eq!(count(&db.connection,"SELECT count(*) FROM replan_requests WHERE outcome='automatic'"),2);
-        assert_eq!(count(&db.connection,"SELECT count(*) FROM replan_requests WHERE outcome='escalated'"),1);
-        assert_eq!(count(&db.connection,"SELECT count(*) FROM replan_feedback_links"),9);
-        assert_eq!(count(&db.connection,"SELECT count(*) FROM inbox_items"),3);
-        assert_eq!(count(&db.connection,"SELECT count(*) FROM attempts"),0);
-        let decisions:Vec<_>=ids.iter().map(|id|db.request_replan(id).unwrap()).collect();
-        let path=PathBuf::from(db.connection.path().unwrap());drop(db);
-        let mut db=SqliteStore::open(&path).unwrap();let _keep=root;
-        assert!(!db.service_replans(&budget()).unwrap().pending);
-        db.apply_plan_proposal(&proposal(&one("task","new plan","")),0,"auto-new-plan").unwrap();
-        for (id,decision) in ids.iter().zip(decisions) {assert_eq!(db.request_replan(id).unwrap(),decision);}
-        let later=record_rejection(&mut db,"later-feedback","task");
-        db.set_auto_replans(db.current_head().unwrap(),false).unwrap();
-        assert!(!db.service_replans(&budget()).unwrap().pending);
-        assert_eq!(count(&db.connection,"SELECT count(*) FROM replan_pending_feedback"),1);
-        assert!(matches!(db.request_replan(&later).unwrap(),ReplanDecision::Automatic{automatic_count:1,..}));
-    }
-
-    #[test]
     fn automatic_replans_respect_leases_and_retry_atomic_notice_failures() {
         let (_root,mut db)=fixture();seed_task(&mut db,"task");
         let held=record_rejection(&mut db,"held-feedback","task");
@@ -1664,20 +1552,6 @@ mod tests {
         db.connection.execute_batch("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.worker_terminated','child-attempt',5,1,'{\"attempt\":\"child-attempt\"}');").unwrap();
         let head=db.current_head().unwrap();
         assert!(db.register_wait_with_trigger("parent",None,"resource_availability",Some(1),Some(&trigger)).is_err());
-        assert_eq!(db.current_head().unwrap(),head);
-    }
-
-    #[test]
-    fn capacity_wait_rejects_missing_attempt_future_revision_and_wrong_condition() {
-        let (_temp,mut db)=fixture();seed_task(&mut db,"parent");
-        let trigger=WaitTrigger::AttemptCapacityReleased{attempt_id:crate::domain::AttemptId::new("child-attempt").unwrap(),after_revision:2};
-        let head=db.current_head().unwrap();
-        assert!(db.register_wait_with_trigger("parent",None,"resource_availability",None,Some(&trigger)).is_err());
-        assert_eq!(db.current_head().unwrap(),head);
-        db.connection.execute("INSERT INTO attempts VALUES('child-attempt','parent',1,'running',NULL,'slot',0)",[]).unwrap();
-        assert!(db.register_wait_with_trigger("parent",None,"resource_availability",None,Some(&trigger)).is_err());
-        assert!(db.register_wait_with_trigger("parent",None,"validation_completion",None,Some(&trigger)).is_err());
-        assert_eq!(count(&db.connection,"SELECT count(*) FROM wait_conditions"),0);
         assert_eq!(db.current_head().unwrap(),head);
     }
 
@@ -1759,52 +1633,6 @@ mod tests {
     }
 
     #[test]
-    fn wait_rearm_survives_restart_and_preserves_terminal_evidence() {
-        let (_temp, mut db) = fixture();
-        seed_task(&mut db, "task");
-        db.connection.execute("INSERT INTO attempts VALUES('rearm-attempt','task',1,'running',NULL,'rearm-slot',0)",[]).unwrap();
-        let first = db.register_wait_with_deadline("task",Some("rearm-attempt"),"user_decision",Some(1)).unwrap();
-        assert!(db.rearm_wait(&first.wait_id,None).is_err());
-        let terminal = db.replay_wait(&first.wait_id).unwrap();
-        assert!(terminal.wake_requested);
-        let next = db.rearm_wait(&first.wait_id,None).unwrap();
-        assert_ne!(next.wait_id,first.wait_id);
-        assert!(!next.already_registered);
-        assert!(db.rearm_wait(&first.wait_id,Some(2)).is_err());
-        assert!(!db.replay_wait(&next.wait_id).unwrap().wake_requested);
-        // A duplicate addressed to the predecessor cannot wake its successor.
-        db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake',?1,1,1,'{}')",[&first.wait_id]).unwrap();
-        assert!(!db.replay_wait(&next.wait_id).unwrap().wake_requested);
-        let path=PathBuf::from(db.connection.path().unwrap());drop(db);
-        let mut db=SqliteStore::open(&path).unwrap();
-        assert_eq!(db.rearm_wait(&first.wait_id,None).unwrap(),WaitRegistration{already_registered:true,..next.clone()});
-        assert_eq!(db.replay_wait(&first.wait_id).unwrap(),WaitReplay{already_replayed:true,..terminal});
-        db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake',?1,1,1,'{}')",[&next.wait_id]).unwrap();
-        let budget=read_budget::ReadBudget::new(controlled::ReadControl::new(std::time::Instant::now()+Duration::from_secs(5),Default::default()));
-        assert_eq!(db.service_waits(&budget).unwrap().notified,1);
-        assert!(db.replay_wait(&next.wait_id).unwrap().already_replayed);
-        assert_eq!(count(&db.connection,"SELECT count(*) FROM inbox_items"),2);
-        assert_eq!(count(&db.connection,"SELECT count(*) FROM attempts WHERE termination_observed=0"),1);
-        assert!(db.connection.execute("DELETE FROM wait_rearms",[]).is_err());
-        assert!(db.connection.execute("UPDATE wait_rearms SET successor=predecessor",[]).is_err());
-    }
-
-    #[test]
-    fn wait_rearm_observes_retained_verification_before_subscription() {
-        let (_temp,mut db)=fixture();
-        seed_rejected_verification(&mut db);
-        let first=db.register_wait_with_deadline("task",Some("attempt-1"),"validation_completion",Some(1)).unwrap();
-        assert!(db.replay_wait(&first.wait_id).unwrap().wake_requested);
-        db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('verification.rejected',?1,1,1,'{}')",["d".repeat(64)]).unwrap();
-        let next=db.rearm_wait(&first.wait_id,None).unwrap();
-        let result=db.replay_wait(&next.wait_id).unwrap();
-        assert!(result.wake_requested);
-        assert!(!result.proved);
-        assert_eq!(count(&db.connection,"SELECT count(*) FROM inbox_items"),2);
-        assert_eq!(count(&db.connection,"SELECT count(*) FROM attempts WHERE termination_observed=0"),1);
-    }
-
-    #[test]
     fn wait_rearm_cancelled_budget_writes_nothing() {
         let (_temp,mut db)=fixture();seed_task(&mut db,"task");
         let first=db.register_wait_with_deadline("task",None,"user_decision",Some(1)).unwrap();
@@ -1834,107 +1662,6 @@ mod tests {
         assert!(db.rearm_wait("missing",None).is_err());
         assert!(db.rearm_wait(&first.wait_id,Some(-1)).is_err());
         assert_eq!(db.current_head().unwrap(),head);
-    }
-
-    #[test]
-    fn restart_replays_the_wait_cursor_once() {
-        let (_temp, mut db) = fixture();
-        seed_task(&mut db, "task");
-        let events_before = count(&db.connection, "SELECT count(*) FROM events");
-        assert!(matches!(
-            db.register_wait("missing", None, "dependency_evidence"),
-            Err(StoreError::Invalid(_))
-        ));
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM wait_conditions"),
-            0
-        );
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM events"),
-            events_before
-        );
-        let registered = db
-            .register_wait("task", None, "dependency_evidence")
-            .unwrap();
-        assert!(!registered.already_registered);
-        let cursor_event: i64 = db
-            .connection
-            .query_row(
-                "SELECT sequence FROM events WHERE kind='wait.registered' AND entity=?1",
-                [&registered.wait_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(registered.cursor_sequence, cursor_event);
-        let again = db
-            .register_wait("task", None, "dependency_evidence")
-            .unwrap();
-        assert!(again.already_registered);
-        assert_eq!(
-            again,
-            WaitRegistration {
-                already_registered: true,
-                ..registered.clone()
-            }
-        );
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM wait_conditions"),
-            1
-        );
-        db.connection
-            .execute(
-                "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake',?1,1,1,'{\"wake\":true}')",
-                [&registered.wait_id],
-            )
-            .unwrap();
-        db.connection
-            .execute(
-                "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('task.noted','task',1,1,'{}')",
-                [],
-            )
-            .unwrap();
-        let replayed = db.replay_wait(&registered.wait_id).unwrap();
-        assert!(!replayed.already_replayed);
-        assert!(replayed.wake_requested);
-        assert!(!replayed.proved);
-        assert_eq!(replayed.events_applied, 2);
-        assert_eq!(replayed.cursor_sequence, registered.cursor_sequence);
-        assert!(replayed.replayed_through > replayed.cursor_sequence);
-        db.connection
-            .execute(
-                "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake',?1,1,1,'{\"wake\":true}')",
-                [&registered.wait_id],
-            )
-            .unwrap();
-        let second = db.replay_wait(&registered.wait_id).unwrap();
-        assert!(second.already_replayed);
-        assert_eq!(second.events_applied, 2);
-        assert!(!second.proved);
-        assert_eq!(second.replayed_through, replayed.replayed_through);
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM wait_replay_events"),
-            2
-        );
-        let registration_replayed: i64 = db
-            .connection
-            .query_row(
-                "SELECT count(*) FROM wait_replay_events WHERE kind='wait.registered'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(registration_replayed, 0);
-        let stored: (String, String) = db
-            .connection
-            .query_row("SELECT state, condition FROM wait_conditions", [], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
-            .unwrap();
-        assert_eq!(stored, ("replayed".into(), "dependency_evidence".into()));
-        assert!(db
-            .connection
-            .execute("UPDATE wait_conditions SET wake_requested=0", [])
-            .is_err());
     }
 
     #[test]
@@ -1982,29 +1709,6 @@ mod tests {
         db.connection.execute_batch("DROP TRIGGER fail_deadline_notice;").unwrap();
         assert!(db.replay_wait(&wait.wait_id).unwrap().wake_requested);
         assert_eq!(count(&db.connection,"SELECT count(*) FROM inbox_items"),1);
-    }
-
-    #[test]
-    fn replan_request_notice_and_response_survive_restart_without_duplicate_work() {
-        let (root,mut db)=fixture();seed_task(&mut db,"task");
-        let feedback=record_rejection(&mut db,"notice-op","task");
-        let decision=db.request_replan(&feedback).unwrap();
-        let ReplanDecision::Automatic{replan_id,..}=decision.clone() else{panic!()};
-        let path=PathBuf::from(db.connection.path().unwrap());
-        assert_eq!(count(&db.connection,"SELECT count(*) FROM inbox_items"),1);
-        assert_eq!(count(&db.connection,"SELECT count(*) FROM plan_proposals"),0);
-        drop(db);let mut db=SqliteStore::open(&path).unwrap();
-        assert_eq!(db.request_replan(&feedback).unwrap(),decision);
-        assert_eq!(count(&db.connection,"SELECT count(*) FROM inbox_items"),1);
-        let raw=proposal(&one("task","revised approach",""));
-        let response=db.apply_plan_proposal(&raw,0,&replan_id).unwrap();
-        let linked:String=db.connection.query_row("SELECT proposal_id FROM replan_responses WHERE replan_id=?1",[&replan_id],|row|row.get(0)).unwrap();
-        assert_eq!(linked,response.proposal_id);
-        assert_eq!(count(&db.connection,"SELECT count(*) FROM inbox_items WHERE done=1"),1);
-        assert!(db.apply_plan_proposal(&raw,0,&replan_id).unwrap().replayed);
-        assert_eq!(count(&db.connection,"SELECT count(*) FROM replan_responses"),1);
-        assert!(matches!(db.apply_plan_proposal(&proposal(&one("task","different","")),0,&replan_id),Err(StoreError::Conflict)));
-        drop(db);drop(root);
     }
 
     #[test]
@@ -2077,123 +1781,6 @@ mod tests {
             let fresh=record_rejection(&mut db,"clock-new-revision","task");
             assert!(matches!(db.request_replan(&fresh).unwrap(),ReplanDecision::Automatic{automatic_count:1,..}));
         }
-    }
-
-    #[test]
-    fn third_replan_is_an_inbox_escalation_not_another_proposal() {
-        let (_temp, mut db) = fixture();
-        seed_task(&mut db, "task");
-        let mut ids = Vec::new();
-        for operation in ["op-1", "op-2", "op-3", "op-4"] {
-            ids.push(record_rejection(&mut db, operation, "task"));
-        }
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM plan_proposals"),
-            0
-        );
-        let first = db.request_replan(&ids[0]).unwrap();
-        let replay = db.request_replan(&ids[0]).unwrap();
-        assert_eq!(first, replay);
-        assert!(matches!(
-            first,
-            ReplanDecision::Automatic {
-                automatic_count: 1,
-                ..
-            }
-        ));
-        let second = db.request_replan(&ids[1]).unwrap();
-        assert!(matches!(
-            second,
-            ReplanDecision::Automatic {
-                automatic_count: 2,
-                ..
-            }
-        ));
-        let third = db.request_replan(&ids[2]).unwrap();
-        let ReplanDecision::Escalated { inbox_id, .. } = third.clone() else {
-            panic!("third replan must escalate");
-        };
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM plan_proposals"),
-            0
-        );
-        assert_eq!(
-            count(
-                &db.connection,
-                "SELECT count(*) FROM replan_requests WHERE outcome='automatic'"
-            ),
-            2
-        );
-        assert_eq!(
-            count(
-                &db.connection,
-                "SELECT count(*) FROM replan_requests WHERE outcome='escalated'"
-            ),
-            1
-        );
-        assert_eq!(count(&db.connection, "SELECT count(*) FROM inbox_items"), 3);
-        let kind: String = db
-            .connection
-            .query_row(
-                "SELECT json_extract(payload, '$.kind') FROM inbox_items WHERE id=?1",
-                [&inbox_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(kind, "replan-escalation");
-        let third_state: (String, Option<String>) = db
-            .connection
-            .query_row(
-                "SELECT state, replan_proposal_id FROM feedback_items WHERE feedback_id=?1",
-                [&ids[2]],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(third_state, ("open".into(), None));
-        let fourth = db.request_replan(&ids[3]).unwrap();
-        assert_eq!(fourth, third);
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM plan_proposals"),
-            0
-        );
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM replan_requests"),
-            3
-        );
-        assert_eq!(count(&db.connection, "SELECT count(*) FROM inbox_items"), 3);
-        let proposed = db
-            .apply_plan_proposal(&proposal(&one("task", "new plan", "")), 0, "reset-key")
-            .unwrap();
-        assert_eq!(proposed.plan_revision, 1);
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM replan_budget_resets"),
-            1
-        );
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM plan_proposals"),
-            1
-        );
-        let fifth = record_rejection(&mut db, "op-5", "task");
-        let reset = db.request_replan(&fifth).unwrap();
-        assert!(matches!(
-            reset,
-            ReplanDecision::Automatic {
-                automatic_count: 1,
-                ..
-            }
-        ));
-        assert_eq!(
-            count(&db.connection, "SELECT count(*) FROM plan_proposals"),
-            1
-        );
-        assert_eq!(count(&db.connection, "SELECT count(*) FROM inbox_items"), 4);
-        assert_eq!(
-            count(
-                &db.connection,
-                "SELECT count(*) FROM replan_requests WHERE outcome='automatic'"
-            ),
-            3
-        );
     }
 
 
@@ -2544,15 +2131,6 @@ mod tests {
         assert_eq!(live, ("claimed".into(), 1, "active".into()));
     }
     #[test]
-    fn review_probe_wait_survives_poll_before_wake() {
-        let (_temp, mut db) = fixture();
-        seed_task(&mut db, "task");
-        let wait = db.register_wait("task", None, "dependency_evidence").unwrap();
-        assert!(!db.replay_wait(&wait.wait_id).unwrap().wake_requested);
-        db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake',?1,1,1,'{}')", [&wait.wait_id]).unwrap();
-        assert!(db.replay_wait(&wait.wait_id).unwrap().wake_requested, "matching wake arriving after first poll was lost");
-    }
-    #[test]
     fn wait_service_rotates_durably_and_notifies_only_once() {
         let (root,mut db)=fixture();
         let mut waits=Vec::new();
@@ -2585,17 +2163,6 @@ mod tests {
         assert!(db.replay_wait(&wait.wait_id).unwrap().wake_requested);
         assert!(db.replay_wait(&wait.wait_id).unwrap().already_replayed);
         assert_eq!(count(&db.connection,"SELECT count(*) FROM inbox_items"),1);
-    }
-
-    #[test]
-    fn review_probe_wait_does_not_consume_another_tasks_wake() {
-        let (_temp, mut db) = fixture();
-        seed_task(&mut db, "one");
-        seed_task(&mut db, "two");
-        let one = db.register_wait("one", None, "dependency_evidence").unwrap();
-        let two = db.register_wait("two", None, "dependency_evidence").unwrap();
-        db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('wait.wake',?1,1,1,'{}')", [&two.wait_id]).unwrap();
-        assert!(!db.replay_wait(&one.wait_id).unwrap().wake_requested, "unrelated wait woke this task");
     }
 
     #[test]

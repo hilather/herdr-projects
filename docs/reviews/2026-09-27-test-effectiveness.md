@@ -767,3 +767,45 @@ Mutation check, each restored byte-for-byte afterwards:
   resume test fail (resume succeeded after the config changed).
 - Dropping the retained-attempt check from `create_runtime` made the archived
   test fail (a binding was created for a task holding a lost attempt).
+
+## Plan, wait and replan unit tests replaced by CLI workflows
+
+The audit marked 12 `src/store/plans.rs` tests REPLACE. Ten were deleted after
+`tests/plans.rs` covered their guarantees through the compiled CLI. Feedback
+is real: signed verify-only contracts, `result submit` and sandboxed
+`result verify` whose allowlisted check fails (`checks_failed`). Attempts,
+and one attempt's observed end, are recorded through the public store API
+because no worker is launched.
+
+| New E2E test | Replaced unit tests |
+| --- | --- |
+| `cyclic_proposals_are_refused_without_a_revision_contract_or_queue_change` (`task queue` an edge, then `plan propose` an internal cycle and one closing the queued edge; plan, scheduler, tasks and contracts unchanged) | `dependency_cycle_is_rejected_without_a_revision_or_reservation` |
+| `verifier_rejections_replan_twice_then_escalate_until_a_new_plan` (five rejections, `feedback replan`, a planner response keyed by the replan id, replays across processes) | `third_replan_is_an_inbox_escalation_not_another_proposal`, `replan_request_notice_and_response_survive_restart_without_duplicate_work` |
+| `validation_waits_wake_once_on_their_own_verdict_and_rearm_from_retained_evidence` (`plan wait register/replay/rearm` around a real rejection, with a second task's wait) | `capacity_wait_rejects_missing_attempt_future_revision_and_wrong_condition`, `restart_replays_the_wait_cursor_once`, `review_probe_wait_survives_poll_before_wake`, `review_probe_wait_does_not_consume_another_tasks_wake`, `wait_rearm_survives_restart_and_preserves_terminal_evidence`, `wait_rearm_observes_retained_verification_before_subscription` |
+| `ticker_requests_replans_only_while_enabled_and_active` (`ticker run` passes with the switch off, on while paused, on while active, then off after a new plan) | `automatic_replans_are_opt_in_bounded_and_coalesce_durably` |
+
+Each ticker pass is marked by an expired-deadline wait that the wait service
+wakes just before the replan service runs. The eight-per-turn batch size is
+not observable from outside; the drained outcome (two requests, one
+escalation joined by the rest) is. Nothing in production addresses a wake to
+a rearmed predecessor, so that raw-event case was not carried over.
+
+Kept: `infrastructure_retry_does_not_consume_max_attempts_per_task` and
+`acceptance_rework_leaves_old_verification_rows_immutable`.
+`retry_infrastructure` and `rework_acceptance` have no CLI command and no
+production caller (only `tests/factory_harness.rs` calls the former as a
+library), so neither can be reached end-to-end yet.
+
+Two findings: a replayed `feedback replan` reports the current automatic
+count for its plan revision, not the count when it was first decided; and a
+replay of an already-woken wait reports `events_applied` summed over every
+page, while the waking replay reported only its own page.
+
+Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
+- Ignoring queued edges in the proposal graph check failed the cycle test
+  ("live-cycle accepted").
+- Dropping the task filter from the validation-wake query failed the wait
+  test ("another task's verdict woke this wait").
+- Allowing a third automatic replan failed both replan tests.
+- Dropping the active-project condition from the auto-replan switch failed
+  the ticker test ("a paused project requests nothing").
