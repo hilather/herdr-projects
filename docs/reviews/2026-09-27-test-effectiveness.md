@@ -1064,3 +1064,48 @@ Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
 - Dropping `c.state='active'` from the launch dispatch hint did not fail the
   paused test. Launch ingress checks the paused state again and refuses before
   any Herdr request, so the guarantee still holds.
+
+## Recovery and doctor unit tests replaced by E2E workflows
+
+The audit marked 6 `src/scenarios/recovery.rs` tests and 5 `src/doctor.rs`
+tests REPLACE. Ten were deleted. `tests/recovery.rs` drives `ticker run`,
+`thread resolve` and `doctor` against a Python fake herdr, a fake `gh` that
+answers per pull request, and a fake `ssh`. The final copy is the binary's
+own `artifact-stream`. `tests/doctor.rs` runs `doctor` with fake herdr and
+`gh` binaries, and the real git, ssh and rsync.
+
+| New E2E test | Replaced unit tests |
+| --- | --- |
+| `merged_finalization_retries_failed_copies_and_is_withdrawn_by_reopen_or_a_new_report` (three merged PRs in one root: source moved aside, then `resolve --skip-copy` + `--reopen`, or a home report naming another PR, then the source restored; a symlink in the library) | `manual_reopen_invalidates_pending_and_future_finalization_of_the_old_pr`, `changed_report_pr_invalidates_pending_before_thread_metadata_catches_up`, `partial_final_copy_resolves_with_a_durable_warning`, and the pending-finalization half of `retry_diagnostics_include_unopened_projects_and_corrupt_state` |
+| `remote_merged_finalization_waits_for_the_helper_and_an_explicit_resolve` | `unsupported_remote_helper_blocks_until_explicit_finalization_retry` |
+| `a_declined_toast_is_retried_after_restart_only_once_its_backoff_is_due` (includes `doctor` on the waiting retry) | `notifications_retry_after_restart_only_after_backoff_and_confirmation`, and the notification half of `retry_diagnostics_include_unopened_projects_and_corrupt_state` |
+| `doctor_fails_only_on_required_checks_and_changes_nothing` | `old_herdr_fails_and_names_the_minimum`, `new_herdr_passes_and_warnings_do_not_fail`, `executor_metrics_are_advisory_and_never_fail_doctor`, and the corrupt-state half of `retry_diagnostics_include_unopened_projects_and_corrupt_state` |
+| `doctor_reports_compiled_features_without_migrating_a_legacy_project` (already in `tests/cli.rs`) | `compiled_features_leave_a_legacy_project_readable_and_unmigrated` |
+
+The deleted recovery tests drove the synchronous copy and `nudge_at` paths.
+On Linux, `ticker run` always uses the queued copy and notification workers,
+so the E2E tests assert the guarantees there:
+- A partial merged copy leaves one `final-` notice naming the omitted link.
+  It no longer writes a `copy` event.
+- A missing remote helper is retried with backoff, not marked `blocked`.
+  The thread stays open until an explicit `thread resolve` succeeds.
+- A declined toast (`not-shown`) is retried after its recorded backoff. A
+  coordinator prompt without a valid reply stays uncertain until it is
+  reconciled; it is not retried by itself.
+  `ticker_notifications_recover_across_restart_and_reconcile_through_cli`
+  covers that case with a lost reply.
+
+A permission-denied library file does not fail the copy: the transfer runs in
+a user namespace mapped to root. The test moves the source aside instead.
+
+Kept: `idle_auto_resolve_does_not_bypass_a_pending_merge_retry`. Auto-resolve
+counts idle time from the later of the thread's changes and the ticker's own
+start, so it cannot fire until a ticker has run for a whole day. The binary
+has no clock override.
+
+Mutation check, each restored byte-for-byte afterwards (`cmp` against a copy):
+- Making `invalidate_finalization` a no-op failed the finalization test: the
+  reopened thread was resolved as `merged` once its source came back.
+- Dropping the retry-due check from the notification worker failed the toast
+  test: the toast was resent before its recorded backoff.
+- Letting unreadable executor metrics fail `doctor` failed the doctor test.

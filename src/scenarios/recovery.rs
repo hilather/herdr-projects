@@ -1,7 +1,6 @@
 //! W01 file-backed recovery and fault boundaries. External services are mocked.
 
 use super::*;
-use crate::herdr::Herdr;
 use crate::steps::{self, Memory, State};
 
 const MERGED: &str = include_str!("../../tests/fixtures/review/merged-pr.json");
@@ -78,19 +77,6 @@ fn crash_after_thread_commit_does_not_repeat_the_copy() {
 }
 
 #[test]
-fn manual_reopen_invalidates_pending_and_future_finalization_of_the_old_pr() {
-    let (world, project) = copy_fixture();
-    world.runner.on("rsync", fail(12, "offline"));
-    assert_eq!(poll(&world, &project, now()).len(), 1);
-    threads::resolve(&world.ctx(), "demo", "t-0001", &ResolveArgs { skip_copy: true, ..ResolveArgs::default() }).unwrap();
-    threads::resolve(&world.ctx(), "demo", "t-0001", &ResolveArgs { reopen: true, ..ResolveArgs::default() }).unwrap();
-    for seconds in [1, 121, 242] { assert!(poll(&world, &project, later(now(), seconds)).is_empty()); }
-    assert_eq!(world.runner.count("rsync"), 1);
-    assert_eq!(thread::load(&project, "t-0001").unwrap().status, Status::Open);
-    assert!(steps::load_state(&project).finalizations.is_empty());
-}
-
-#[test]
 fn a_thread_rebound_during_copy_is_not_resolved() {
     let (world, project) = copy_fixture();
     let changed = project.clone();
@@ -104,18 +90,6 @@ fn a_thread_rebound_during_copy_is_not_resolved() {
     assert!(poll(&world, &project, later(now(), 121)).is_empty());
     assert_eq!(world.runner.count("rsync"), 1);
     assert!(steps::load_state(&project).finalizations.is_empty());
-}
-
-#[test]
-fn changed_report_pr_invalidates_pending_before_thread_metadata_catches_up() {
-    let (world, project) = copy_fixture();
-    world.runner.on("rsync", fail(12, "offline"));
-    assert_eq!(poll(&world, &project, now()).len(), 1);
-    std::fs::write(thread::home_report_path(&project, "t-0001"), "PR: https://github.com/owner/app/pull/8\n").unwrap();
-    assert!(poll(&world, &project, later(now(), 1)).is_empty());
-    assert!(steps::load_state(&project).finalizations.is_empty());
-    assert_eq!(world.runner.count("rsync"), 1);
-    assert_eq!(thread::load(&project, "t-0001").unwrap().status, Status::Open);
 }
 
 #[test]
@@ -151,37 +125,6 @@ fn failed_intent_write_prevents_copy() {
 }
 
 #[test]
-fn notifications_retry_after_restart_only_after_backoff_and_confirmation() {
-    for prompt in [false, true] {
-        let world = World { runner: FakeRunner::new(), ..World::new() };
-        let project = world.project("demo", "a.sock");
-        inbox::write(&project, "routine", "r", "due", "").unwrap();
-        let success = Rc::new(RefCell::new(false));
-        let flag = success.clone();
-        world.runner.on_fn(|_| true, move |_| Ok(if *flag.borrow() {
-            ok(r#"{"result":{"shown":true}}"#)
-        } else if prompt { fail(1, "agent blocked") } else { ok(r#"{"result":{"shown":false,"reason":"disabled"}}"#) }));
-        let herdr = Herdr::new("herdr", "/fixture.sock", &world.runner);
-        let (mut settings, _) = project.read_project_md().unwrap();
-        settings.nudge = prompt;
-        let mut state = State::default();
-        assert!(steps::nudge_at(&project, &mut state, &settings, &herdr, Some("w1:p1"), now()).is_err());
-        let mut restarted = steps::load_state(&project);
-        assert!(restarted.nudged.is_empty());
-        assert_eq!(restarted.notification_retry.retry.attempts, 1);
-        assert!(!restarted.notification_retry.retry.last_error.is_empty());
-        *success.borrow_mut() = true;
-        steps::nudge_at(&project, &mut restarted, &settings, &herdr, Some("w1:p1"), later(now(), 1)).unwrap();
-        assert_eq!(world.runner.calls.borrow().len(), 1);
-        let due = restarted.notification_retry.retry.next_attempt.parse().unwrap();
-        steps::nudge_at(&project, &mut restarted, &settings, &herdr, Some("w1:p1"), due).unwrap();
-        assert!(!steps::load_state(&project).nudged.is_empty());
-        steps::nudge_at(&project, &mut restarted, &settings, &herdr, Some("w1:p1"), later(due, 400)).unwrap();
-        assert_eq!(world.runner.calls.borrow().len(), 2);
-    }
-}
-
-#[test]
 fn notification_failure_does_not_stop_the_project_slow_pass() {
     let world = World { runner: FakeRunner::new(), ..World::new() };
     let project = world.project("demo", "a.sock");
@@ -214,52 +157,6 @@ fn idle_auto_resolve_does_not_bypass_a_pending_merge_retry() {
     assert!(steps::auto_resolve(&ctx, &project, &settings, &memory, &steps::load_state(&project), now()).is_empty());
     assert_eq!(world.runner.count("rsync"), 1);
     assert_eq!(thread::load(&project, "t-0001").unwrap().status, Status::Open);
-}
-
-#[test]
-fn partial_final_copy_resolves_with_a_durable_warning() {
-    let (world, project) = pr_world(MERGED);
-    let t = thread::load(&project, "t-0001").unwrap();
-    std::fs::create_dir_all(&t.thread_dir).unwrap();
-    std::os::unix::fs::symlink("/missing-library", Path::new(&t.thread_dir).join("library")).unwrap();
-    assert!(poll(&world, &project, now()).is_empty());
-    assert_eq!(thread::load(&project, "t-0001").unwrap().status, Status::Resolved);
-    let warnings = items_of(&project, "copy");
-    assert_eq!(warnings.len(), 1);
-    assert!(warnings[0].summary.contains("partial"));
-    assert!(warnings[0].summary.contains("symbolic link"));
-    assert!(poll(&world, &project, later(now(), 121)).is_empty());
-    assert_eq!(items_of(&project, "copy").len(), 1);
-}
-
-
-#[test]
-fn unsupported_remote_helper_blocks_until_explicit_finalization_retry() {
-    let (world, project) = copy_fixture();
-    let record = thread::update(&project, "t-0001", |t| t.machine = "box".into()).unwrap();
-    let installed = Rc::new(RefCell::new(false));
-    let available = installed.clone();
-    world.runner.on("machine list --json", ok(r#"[{"label":"box","target":"fixture"}]"#));
-    world.runner.on_fn(|cmd| cmd.display().contains("artifact-stream --probe"), move |_| {
-        Ok(if *available.borrow() { ok(r#"{"schema":1}"#) } else { fail(127, "helper missing") })
-    });
-    let source = record.thread_dir.clone();
-    world.runner.on_fn(|cmd| cmd.display().contains("artifact-stream --path"), move |_| {
-        let mut output = ok("");
-        crate::artifacts::export(Path::new(&source), &mut output.stdout_bytes)?;
-        Ok(output)
-    });
-    world.runner.on("rsync", ok(""));
-    assert_eq!(poll(&world, &project, now()).len(), 1);
-    assert!(steps::load_state(&project).finalizations["t-0001"].retry.blocked);
-    assert!(poll(&world, &project, later(now(), 86_400)).is_empty());
-    assert_eq!(world.runner.count("artifact-stream --probe"), 1);
-    *installed.borrow_mut() = true;
-    threads::resolve(&world.ctx(), "demo", "t-0001", &ResolveArgs::default()).unwrap();
-    assert_eq!(thread::load(&project, "t-0001").unwrap().status, Status::Resolved);
-    assert!(!thread::load(&project, "t-0001").unwrap().artifact_snapshot.is_empty());
-    assert!(poll(&world, &project, later(now(), 86_401)).is_empty());
-    assert!(steps::load_state(&project).finalizations.is_empty());
 }
 
 #[test]
