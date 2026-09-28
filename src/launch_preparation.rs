@@ -173,7 +173,7 @@ pub fn draft(
         "draft approval validity must be 1–86400 whole seconds");
     let proof = crate::profile_preparation::revalidate(project,&selection.profile,deadline,cancellation)?;
     let project = project.canonicalize()?;
-    let mut db = crate::migration::open_active_controlled(&project,proof.read_control())?;
+    let mut db = crate::migration::open_active_scoped(&project,proof.read_control())?;
     let state = db.launch_rows(expected_head,&selection.task,&selection.binding,None)?;
     let mut inputs = inputs(&proof,selection,&state,pending_approval())?;
     inputs.task_contract = db.task_contract_reference(inputs.task.as_str())?;
@@ -201,7 +201,7 @@ pub fn reserve(
 ) -> Result<Reservation> {
     let proof = crate::profile_preparation::revalidate(project,&selection.profile,deadline,cancellation)?;
     let project = project.canonicalize()?;
-    let mut db = crate::migration::open_active_controlled(&project,proof.read_control())?;
+    let mut db = crate::migration::open_active_scoped(&project,proof.read_control())?;
     let state = db.launch_rows(expected_head,&selection.task,&selection.binding,Some(approval))?;
     let mut inputs = inputs(&proof,selection,&state,approval.clone())?;
     inputs.task_contract = db.task_contract_reference(inputs.task.as_str())?;

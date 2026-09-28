@@ -34,7 +34,7 @@ impl Adapter<'_,'_> {
     fn validate(&self,operation:&Operation,notification:&Notification)->Result<()> {
         self.input.current(self.ctx,self.guard,self.control)?;
         ensure!(operation.id==self.input.operation&&fingerprint(operation)?==self.input.operation_digest,"notification operation changed");
-        let rows=migration::open_active(&self.input.project)?.notification_rows(operation.task.as_ref(),None)?;
+        let rows=migration::open_active_unchecked(&self.input.project)?.notification_rows(operation.task.as_ref(),None)?;
         ensure!(Path::new(&notification.validate_rows(operation,&rows,&self.input.config_reference)?.identity.socket)==self.input.socket,"notification route changed");self.control.check()
     }
     fn run(&self,command:Cmd)->Result<Output>{herdr_projects::supervision::run(command,self.control.deadline,self.control.cancellation.clone(),self.locks)}
@@ -73,7 +73,7 @@ impl PreparedDelivery for Prepared<'_,'_> {
 fn execute(input:&Input,control:&Control)->Result<()> {
     control.check()?;let guard=ProjectGuard::acquire(&input.project)?;let locks=guard.inherit_transfer()?;
     let env=Env::for_observation(&input.home,&input.bin);let ctx=Ctx{env:&env,root:input.project.parent().context("notification root missing")?.into(),config_dir:input.config.clone(),runner:&crate::runner::RealRunner,detached_ticker:false};
-    input.current(&ctx,&guard,control)?;let mut db=migration::open_active(&input.project)?;
+    input.current(&ctx,&guard,control)?;let mut db=migration::open_active_unchecked(&input.project)?;
     let mut adapter=Adapter{input,ctx:&ctx,control,guard:&guard,locks:&locks};
     let result=dispatch::dispatch_one(&mut db,DispatchRequest{operation:&input.operation,expected_revision:input.revision,owner:"ticker.notification",lease_ms:60_000},&mut adapter,||jiff::Timestamp::now().as_millisecond())?;
     match result {DispatchResult::Recorded(_)=>Ok(()),DispatchResult::Unrecorded{..}=>anyhow::bail!("canonical notification outcome unrecorded; inspect operation after claim expiry")}

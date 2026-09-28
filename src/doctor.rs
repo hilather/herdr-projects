@@ -270,6 +270,18 @@ fn report(
                     continue;
                 }
                 check(&mut out, Some(true), &label, format!("migrated runtime={runtime} memory={memory}; legacy thread/inbox files are pre-cutover originals"));
+                #[cfg(feature="state-store")]
+                {
+                    // Doctor always runs the whole-store check and shows the ticker's last one.
+                    let last = herdr_projects::store::integrity::load(&dir.join(".state/state.db"))
+                        .map_or("none recorded".to_string(), |r| format!("{} at {} (schema {})", r.result, r.checked_unix_ms, r.schema));
+                    match herdr_projects::migration::open_active(&dir) {
+                        Ok(_) => check(&mut out, Some(true), &label, format!("store integrity: ok; last periodic check {last}")),
+                        Err(error) if matches!(error.downcast_ref(), Some(herdr_projects::store::StoreError::Corrupt(_))) => check(&mut out, Some(false), &label,
+                            format!("store integrity: corrupt; last periodic check {last}; preserve the store and restore it, never auto-repair")),
+                        Err(_) => {},
+                    }
+                }
                 if memory == "sqlite-v1" {
                     // A prohibition ("do not edit MEMORY.md") is correct guidance,
                     // not a mismatch; only an instruction to edit as authority warns.

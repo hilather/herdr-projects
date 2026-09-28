@@ -557,6 +557,7 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
                 }
                 Err(error) => log.line(&format!("{slug}: memory-review remind: {error:#}")),
             }
+            integrity_pass(ctx,log,slug);
         }
         admit_background(ctx,log,memory,canonical.into_iter().map(|slug|ctx.root.join(slug)).collect());
         if let Some(reads)=memory.local_reports.as_mut(){for error in reads.admit(){log.line(&error);}}
@@ -584,6 +585,19 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         reachable
     }
 
+}
+/// Whole-store check off the poll path: at most once per interval per project
+/// (default one hour, `HERDR_PROJECTS_INTEGRITY_CHECK_SECS`), with its own budget.
+#[cfg(feature="state-store")]
+fn integrity_pass(ctx:&Ctx,log:&Log,slug:&str) {
+    use herdr_projects::migration::{periodic_integrity_check,IntegrityOutcome};
+    let interval=Duration::from_secs(ctx.env.var("HERDR_PROJECTS_INTEGRITY_CHECK_SECS").and_then(|v|v.parse().ok()).unwrap_or(3600));
+    let control=herdr_projects::store::controlled::ReadControl::new(std::time::Instant::now()+Duration::from_secs(30),Default::default());
+    match periodic_integrity_check(&ctx.root.join(slug),interval,control) {
+        Ok(IntegrityOutcome::Corrupt)=>log.line(&format!("{slug}: store integrity check failed; admission paused (integrity_check_failed); preserve the store and restore it, never auto-repair")),
+        Ok(_)=>{},
+        Err(error)=>log.line(&format!("{slug}: store integrity check: {error:#}")),
+    }
 }
 fn drain_executor(root:&Path,log:&Log,memory:&mut Memory)->Result<()> {
     let result=memory.pr_reads.as_mut().expect("ticker shared executor").stop();

@@ -67,7 +67,7 @@ impl<'a> DeliveryAdapter for Adapter<'a> {
 impl PreparedDelivery for Prepared<'_> {
     fn revalidate(&mut self,_:&Operation)->Result<()>{self.adapter.control.check()}
     fn deliver(&mut self,operation:&Operation,_:&Claim)->Result<Outcome> {
-        let a=self.adapter;let mut db=migration::open_active(a.project)?;
+        let a=self.adapter;let mut db=migration::open_active_unchecked(a.project)?;
         let request=IntegrateRequest{result_id:a.payload.result_id.clone(),idempotency_key:operation.id.as_str().into(),repository:a.payload.repository.clone(),work_dir:a.scratch.to_path_buf(),fault:Default::default()};
         Ok(match with_scratch(a.scratch,||integration::integrate_job(&mut db,&request,&a.payload.submission_id)) {
             Ok(outcome)=>classify(outcome),
@@ -84,7 +84,7 @@ impl PreparedDelivery for Prepared<'_> {
 fn execute(input:&Input,control:&Control)->Result<()> {
     control.check()?;let guard=ProjectGuard::acquire(&input.project)?;guard.check_project(&input.project)?;
     let metadata=std::fs::metadata(&input.project)?;ensure!((metadata.dev(),metadata.ino())==input.identity,"integration project changed");
-    let mut db=migration::open_active(&input.project)?;
+    let mut db=migration::open_active_unchecked(&input.project)?;
     let (_,rows)=db.operation_rows(&input.operation,None)?;let (operation,delivery)=rows.context("integration job missing")?;
     ensure!(operation.kind=="integration.run"&&delivery.revision==input.revision,"integration job is stale");
     let payload:Payload=serde_json::from_value(operation.payload.clone())?;

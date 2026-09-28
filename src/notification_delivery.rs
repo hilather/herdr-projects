@@ -29,7 +29,7 @@ impl<'a,'b> DeliveryAdapter for Adapter<'a,'b> {
         let lease=cleanup::lease(self.project.parent().context("project has no root")?)?;
         let notification=Notification::decode(op)?;
         let reference=config(self.ctx,&self.project)?;
-        let rows=migration::open_active(&self.project)?.notification_rows(op.task.as_ref(),None)?;
+        let rows=migration::open_active_unchecked(&self.project)?.notification_rows(op.task.as_ref(),None)?;
         let socket=notification.validate_rows(op,&rows,&reference)?.identity.socket.clone();
         ensure!(herdr::version(&self.ctx.env.herdr_bin(),self.ctx.runner)?>=herdr::MIN_VERSION,"unsupported Herdr version");
         Ok(Prepared{ctx:self.ctx,project:self.project.clone(),notification,socket,_lease:lease})
@@ -38,7 +38,7 @@ impl<'a,'b> DeliveryAdapter for Adapter<'a,'b> {
 impl PreparedDelivery for Prepared<'_,'_> {
     fn revalidate(&mut self,op:&Operation)->Result<()> {
         let reference=config(self.ctx,&self.project)?;
-        let rows=migration::open_active(&self.project)?.notification_rows(op.task.as_ref(),None)?;
+        let rows=migration::open_active_unchecked(&self.project)?.notification_rows(op.task.as_ref(),None)?;
         ensure!(self.notification.validate_rows(op,&rows,&reference)?.identity.socket==self.socket,"notification socket changed");Ok(())
     }
     fn deliver(&mut self,op:&Operation,claim:&Claim)->Result<Outcome> {
@@ -55,7 +55,7 @@ impl PreparedDelivery for Prepared<'_,'_> {
 
 pub fn deliver(ctx:&Ctx,project:&Path,id:&OperationId,revision:u64)->Result<DispatchResult> {
     let project=project.canonicalize()?;
-    let mut db=migration::open_active(&project)?;
+    let mut db=migration::open_active_unchecked(&project)?;
     let mut adapter=Adapter{ctx,project};
     dispatch::dispatch_one(&mut db,DispatchRequest{operation:id,expected_revision:revision,owner:"operator.notification",lease_ms:60_000},&mut adapter,||jiff::Timestamp::now().as_millisecond())
 }

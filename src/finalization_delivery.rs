@@ -48,13 +48,13 @@ pub(crate) fn save_receipt_authorized(project:&Project,op:&Operation,receipt:&Fi
 
 #[cfg(target_os="linux")]
 pub(crate) fn preserved_outputs(path:&Path,binding:&str,control:&Control)->Result<Option<herdr_projects::worktree_preservation::VerifiedOutputs>> {
-    control.check()?;let rows=migration::open_active(path)?.binding_output_rows(binding,None)?;
+    control.check()?;let rows=migration::open_active_unchecked(path)?.binding_output_rows(binding,None)?;
     let binding=rows.binding.as_ref().context("output binding missing")?;
     herdr_projects::worktree_preservation::load_binding_output_rows(path,&rows,binding,&herdr_projects::source_tree::Control{deadline:control.deadline,cancellation:control.cancellation.clone()})
 }
 
 pub fn enqueue(ctx:&Ctx,path:&Path,binding:&str,head:u64,reason:String)->Result<Operation> {
-    let path=path.canonicalize()?;let rows=migration::open_active(&path)?.finalization_binding_rows(binding,Some(head))?;
+    let path=path.canonicalize()?;let rows=migration::open_active_unchecked(&path)?.finalization_binding_rows(binding,Some(head))?;
     let binding=rows.bindings.first().context("runtime binding not found")?;
     ensure!(binding.identity.machine.is_empty()&&Path::new(&binding.identity.thread_dir).is_absolute(),"finalization requires a recorded local source");
     #[cfg(target_os="linux")]
@@ -82,12 +82,12 @@ impl<'a,'b> DeliveryAdapter for Adapter<'a,'b> {
     fn prepare(&mut self,op:&Operation)->Result<Self::Prepared> {
         let control=Control::default();let lease=cleanup::lease(self.path.parent().context("project has no root")?)?;
         let payload=Finalization::decode(op)?;
-        payload.validate_rows(op,&migration::open_active(&self.path)?.finalization_rows(op,&payload.binding,None)?,&crate::notification_delivery::config(self.ctx,&self.path)?)?;
+        payload.validate_rows(op,&migration::open_active_unchecked(&self.path)?.finalization_rows(op,&payload.binding,None)?,&crate::notification_delivery::config(self.ctx,&self.path)?)?;
         Ok(Prepared{ctx:self.ctx,path:self.path.clone(),project:project(&self.path)?,payload,control,_lease:lease})
     }
 }
 impl Prepared<'_,'_> {
-    fn validate_current(&self,op:&Operation)->Result<()> {self.control.check()?;self.payload.validate_rows(op,&migration::open_active(&self.path)?.finalization_rows(op,&self.payload.binding,None)?,&crate::notification_delivery::config(self.ctx,&self.path)?)?;self.control.check()}
+    fn validate_current(&self,op:&Operation)->Result<()> {self.control.check()?;self.payload.validate_rows(op,&migration::open_active_unchecked(&self.path)?.finalization_rows(op,&self.payload.binding,None)?,&crate::notification_delivery::config(self.ctx,&self.path)?)?;self.control.check()}
 }
 impl PreparedDelivery for Prepared<'_,'_> {
     fn revalidate(&mut self,op:&Operation)->Result<()> {self.validate_current(op)}
@@ -111,12 +111,12 @@ impl PreparedDelivery for Prepared<'_,'_> {
     }
 }
 pub fn deliver(ctx:&Ctx,path:&Path,id:&OperationId,revision:u64)->Result<DispatchResult> {
-    let path=path.canonicalize()?;let mut db=migration::open_active(&path)?;let mut adapter=Adapter{ctx,path};
+    let path=path.canonicalize()?;let mut db=migration::open_active_unchecked(&path)?;let mut adapter=Adapter{ctx,path};
     dispatch::dispatch_one(&mut db,DispatchRequest{operation:id,expected_revision:revision,owner:"operator.finalization",lease_ms:300_000},&mut adapter,||jiff::Timestamp::now().as_millisecond())
 }
 pub fn observe(ctx:&Ctx,path:&Path,id:&OperationId,revision:u64,head:u64)->Result<Delivery> {
     let control=Control::default();let path=path.canonicalize()?;let _lease=cleanup::lease(path.parent().context("project has no root")?)?;
-    let mut db=migration::open_active(&path)?;let (_,rows)=db.operation_rows(id,Some(head))?;
+    let mut db=migration::open_active_unchecked(&path)?;let (_,rows)=db.operation_rows(id,Some(head))?;
     let (op,_)=rows.context("operation not found")?;let op=&op;
     let payload=Finalization::decode(op)?;payload.validate_rows(op,&db.finalization_rows(op,&payload.binding,Some(head))?,&crate::notification_delivery::config(ctx,&path)?)?;
     let receipt=load_receipt_controlled(&project(&path)?,op,&payload,&control)?.context("no verified finalization receipt; intent remains unresolved")?;

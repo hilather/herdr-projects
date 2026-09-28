@@ -109,7 +109,7 @@ pub fn update_inbox(project:&Path,expected_head:u64,ids:&[String],done:bool)->Re
 /// Expiry records ambiguity only, so it is safe during the dispatch freeze.
 pub fn expire_operations(project:&Path)->Result<usize> {
     let _maintenance=migration::runtime_mutation(project)?;
-    Ok(migration::open_active(project)?.expire_claims(jiff::Timestamp::now().as_millisecond())?)
+    Ok(migration::open_active_unchecked(project)?.expire_claims(jiff::Timestamp::now().as_millisecond())?)
 }
 
 pub fn observe_imported_receipts(project:&Path,expected_head:Option<u64>)->Result<crate::operations::receipts::ReceiptReport> {
@@ -137,7 +137,7 @@ pub fn record_controller_observations_guarded(project:&Path,batch:&crate::reconc
     guard.check_project(project)?;
     let _record=crate::execution_guard::exclusive_file(&project.join(".state/lock"))?;
     record_observations_held(project,batch)?;
-    migration::open_active(project)?.expire_claims(jiff::Timestamp::now().as_millisecond())?;
+    migration::open_active_unchecked(project)?.expire_claims(jiff::Timestamp::now().as_millisecond())?;
     Ok(())
 }
 /// Retain original SQL cancellation through observation commit, derived marker
@@ -207,7 +207,7 @@ pub fn create_binding(project:&Path,task:Option<&TaskId>,task_revision:Option<u6
 pub fn enqueue_notification(project:&Path,task:&TaskId,expected_head:u64,config:&migration::ConfigReference)->Result<crate::domain::Operation> {
     let _maintenance=migration::runtime_mutation(project)?;
     ensure!(migration::config_reference(Path::new(&config.path))?==*config,"config changed before notification enqueue");
-    let mut db=migration::open_active(project)?;
+    let mut db=migration::open_active_unchecked(project)?;
     let rows=db.notification_rows(Some(task),Some(expected_head))?;
     let slug=project.file_name().and_then(|s|s.to_str()).context("invalid project slug")?;
     let operation=crate::operations::notification::build_rows(&rows,task,slug,config.clone(),jiff::Timestamp::now().as_millisecond())?;
@@ -216,7 +216,7 @@ pub fn enqueue_notification(project:&Path,task:&TaskId,expected_head:u64,config:
 }
 
 pub fn enqueue_finalization(project:&Path,expected_head:u64,operation:crate::domain::Operation)->Result<crate::domain::Operation> {
-    let _maintenance=migration::runtime_mutation(project)?;let mut db=migration::open_active(project)?;
+    let _maintenance=migration::runtime_mutation(project)?;let mut db=migration::open_active_unchecked(project)?;
     let payload=crate::operations::finalization::Finalization::decode(&operation)?;
     let config=migration::config_reference(Path::new(&payload.config.path))?;
     payload.validate_rows(&operation,&db.finalization_rows(&operation,&payload.binding,Some(expected_head))?,&config)?;

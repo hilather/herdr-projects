@@ -158,7 +158,7 @@ pub fn revalidate(
     let metadata = source_file.metadata()?;
     ensure!(metadata.is_file(), "project store must be a regular file");
     let source = (path.clone(), metadata.dev(), metadata.ino());
-    let mut store = ControlledStore::open(&path, ReadControl::new(deadline, cancellation.clone()).with_row_limit(2 * 1024 * 1024)?)?;
+    let mut store = ControlledStore::open_scoped(&path, ReadControl::new(deadline, cancellation.clone()).with_row_limit(2 * 1024 * 1024)?)?;
     let value = store.native_profile_report(reference)?.context("retained native profile missing")?;
     drop(store);
     let report: Report = serde_json::from_value(value)

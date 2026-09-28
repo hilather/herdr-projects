@@ -49,6 +49,7 @@ pub fn pause_reason(project: &Path) -> Option<&'static str> {
     match value.get("reason").and_then(|reason| reason.as_str()) {
         Some("disk_full") => Some("disk_full"),
         Some("database_busy") => Some("database_busy"),
+        Some(INTEGRITY) => Some(INTEGRITY),
         _ => Some("admission_paused"),
     }
 }
@@ -64,6 +65,17 @@ pub fn note(project: &Path, error: &StoreError) -> std::io::Result<bool> {
         return Ok(true);
     }
     write_pause(project, reason)
+}
+
+const INTEGRITY: &str = "integrity_check_failed";
+
+/// The periodic whole-store check failed. Like other pauses, only an operator
+/// removes it, after preserving and restoring the store.
+pub fn pause_integrity(project: &Path) -> std::io::Result<bool> {
+    if is_paused(project) {
+        return Ok(true);
+    }
+    write_pause(project, INTEGRITY)
 }
 
 fn write_pause(project: &Path, reason: &'static str) -> std::io::Result<bool> {

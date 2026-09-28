@@ -1,5 +1,5 @@
 //! Read-only factory status. Counters are bounded and carry no environment, argv, or secrets.
-use crate::store::{FactoryNumbers, SqliteStore, StoreError, SCHEMA};
+use crate::store::{integrity::{self, IntegrityRecord}, FactoryNumbers, SqliteStore, StoreError, SCHEMA};
 use crate::watchdog;
 use rusqlite::OpenFlags;
 use serde::Serialize;
@@ -43,6 +43,8 @@ pub struct FactoryStatus {
     pub admission_paused: bool,
     pub pause_reason: Option<&'static str>,
     pub blockers: Vec<&'static str>,
+    /// The last recorded whole-store check; null until one has run.
+    pub integrity: Option<IntegrityRecord>,
     pub counters: Counters,
 }
 
@@ -54,6 +56,8 @@ pub enum ReportError {
     Unsupported(serde_json::Value),
     /// Newer than this binary. The value is the only JSON that may be printed.
     Newer(serde_json::Value),
+    /// The whole-store check failed. The value is the only JSON that may be printed.
+    Corrupt(serde_json::Value),
 }
 
 impl std::fmt::Display for ReportError {
@@ -63,6 +67,7 @@ impl std::fmt::Display for ReportError {
             Self::Io(error) => write!(f, "{error}"),
             Self::Unsupported(_) => write!(f, "unsupported_schema"),
             Self::Newer(_) => write!(f, "store schema is newer than this binary"),
+            Self::Corrupt(_) => write!(f, "store_corrupt"),
         }
     }
 }
@@ -161,10 +166,20 @@ pub fn report(project: &Path, prepared_dispatch: bool) -> Result<FactoryStatus, 
             "store schema is newer than this binary",
         )));
     }
-    let mut db = SqliteStore::open(&db_path).map_err(ReportError::Store)?;
+    let pause_reason = watchdog::pause_reason(project);
+    let mut db = match SqliteStore::open(&db_path) {
+        Ok(db) => db,
+        Err(StoreError::Corrupt(_)) => {
+            let mut value = refused_schema(version, prepared_dispatch, "store_corrupt");
+            value["admission_paused"] = pause_reason.is_some().into();
+            value["pause_reason"] = serde_json::json!(pause_reason);
+            value["integrity"] = serde_json::json!(integrity::load(&db_path));
+            return Err(ReportError::Corrupt(value));
+        }
+        Err(error) => return Err(ReportError::Store(error)),
+    };
     let now = jiff::Timestamp::now().as_millisecond();
     let numbers = db.factory_counters(now).map_err(ReportError::Store)?;
-    let pause_reason = watchdog::pause_reason(project);
     let paused = pause_reason.is_some();
     let promotion_pages = promotion_pages(project, numbers.promotion_conflicts);
     let blockers = blockers(&numbers, paused, promotion_pages);
@@ -180,6 +195,7 @@ pub fn report(project: &Path, prepared_dispatch: bool) -> Result<FactoryStatus, 
         admission_paused: paused,
         pause_reason,
         blockers,
+        integrity: integrity::load(&db_path),
         counters: counters_from(numbers),
     })
 }

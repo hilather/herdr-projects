@@ -368,7 +368,7 @@ impl ControlledStore {
         store.read(|s|{s.connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF; PRAGMA synchronous=FULL;")?;Ok(())})?;
         store.read(|s|check_schema(&s.connection))?;
         store.read(|s|enable_wal(&s.connection))?;
-        if integrity {store.read(SqliteStore::integrity_check)?;}
+        if integrity {store.read(SqliteStore::integrity_check)?;} else {store.read(|s|super::integrity::check_if_schema_changed(path,s))?;}
         let after=std::fs::symlink_metadata(path).map_err(|e|StoreError::Io(e.to_string()))?;
         if !after.is_file()||after.nlink()!=1||(before.dev(),before.ino())!=(after.dev(),after.ino()){return Err(StoreError::Invalid("controlled database changed during open".into()));}
         store.control.check()?;Ok(store)
@@ -397,6 +397,8 @@ impl ControlledStore {
     fn read<T>(&self,read:impl FnOnce(&SqliteStore)->Result<T>)->Result<T> {
         self.control.check()?;let value=read(&self.store).map_err(|e|self.error(e))?;self.control.check()?;Ok(value)
     }
+    /// Budgeted, cancellable whole-store check whose definite outcome is recorded.
+    pub(crate) fn integrity_check_recorded(&self,path:&Path)->Result<()> {self.read(|s|super::integrity::check_and_record(path,s))}
     pub fn project_control(&self)->Result<Option<ProjectControl>> {self.read(SqliteStore::project_control)}
     pub fn import_operation_count(&self)->Result<u64> {self.read(SqliteStore::import_operation_count)}
     pub fn import_receipt(&self)->Result<(String,u64,u64)> {self.read(SqliteStore::import_receipt)}

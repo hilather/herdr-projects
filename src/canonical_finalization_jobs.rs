@@ -35,11 +35,11 @@ impl Adapter<'_,'_> {
     fn validate(&self,operation:&Operation,payload:&Finalization)->Result<u64> {
         self.input.current(self.ctx,self.guard,self.control)?;
         ensure!(operation.id==self.input.operation&&digest(&serde_json::to_vec(operation)?)==self.input.operation_digest,"finalization operation changed");
-        let rows=migration::open_active(&self.input.project)?.finalization_rows(operation,&payload.binding,None)?;payload.validate_rows(operation,&rows,&self.input.config_reference)?;self.control.check()?;Ok(rows.head)
+        let rows=migration::open_active_unchecked(&self.input.project)?.finalization_rows(operation,&payload.binding,None)?;payload.validate_rows(operation,&rows,&self.input.config_reference)?;self.control.check()?;Ok(rows.head)
     }
     fn claim(&self,operation:&Operation,payload:&Finalization,claim:&Claim)->Result<()> {
         self.validate(operation,payload)?;
-        migration::open_active(&self.input.project)?.validate_claim(claim,jiff::Timestamp::now().as_millisecond())?;self.control.check()
+        migration::open_active_unchecked(&self.input.project)?.validate_claim(claim,jiff::Timestamp::now().as_millisecond())?;self.control.check()
     }
 }
 impl<'a,'b> DeliveryAdapter for Adapter<'a,'b> {
@@ -91,7 +91,7 @@ fn execute(input:&Input,control:&Control)->Result<()> {
     // routines and stay alive through capture, receipt and database persistence.
     let _locks=guard.inherit_transfer()?;
     let env=Env::for_observation(&input.home,&input.bin);let ctx=Ctx{env:&env,root:input.project.parent().context("finalization root missing")?.into(),config_dir:input.config.clone(),runner:&crate::runner::RealRunner,detached_ticker:false};
-    input.current(&ctx,&guard,control)?;let mut db=migration::open_active(&input.project)?;let mut adapter=Adapter{input,ctx:&ctx,control,guard:&guard};
+    input.current(&ctx,&guard,control)?;let mut db=migration::open_active_unchecked(&input.project)?;let mut adapter=Adapter{input,ctx:&ctx,control,guard:&guard};
     if input.mode==Mode::Observe {
         let (head,rows)=db.operation_rows(&input.operation,None)?;let (operation,delivery)=rows.context("finalization operation missing")?;
         let payload=Finalization::decode(&operation)?;adapter.validate(&operation,&payload)?;

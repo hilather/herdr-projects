@@ -174,8 +174,18 @@ Recorded here rather than folded into the card that found them.
   `dispatch_one` reads one operation. Same approach as #43
   (`store/effect_rows.rs`).
 - **Opening a store runs a whole-database `quick_check`**, so even targeted
-  commands grow with database size. Decide whether the per-open check can be
-  scoped or moved to maintenance.
+  commands grow with database size — done (this PR). Hot paths (controller
+  polls, effect jobs, targeted commands over `effect_rows`/`admission_read`)
+  open through `open_active_scoped`/`open_active_unchecked` and skip the
+  check, except on the first open after the schema version changes.
+  Migration, upgrade, restore, `doctor`, `factory status` and snapshot reads
+  keep it and refuse a corrupt store. The ticker runs the check at most once
+  per project per `HERDR_PROJECTS_INTEGRITY_CHECK_SECS` (default 3600), with
+  a 30 s budget, recorded in `.state/integrity-check.json` so restarts do not
+  repeat it. A failure pauses admission (`integrity_check_failed`) and is
+  never repaired automatically; `factory status` and `doctor` show the last
+  check. No schema change. E2E:
+  `hot_paths_skip_the_whole_store_check_and_the_ticker_checks_once_per_interval_then_pauses_on_corruption`.
 - **Transferred locks can still outlive release.** Guards now unlock on drop
   (#46), but a lock handed to a supervisor through `inherit_transfer` is only
   closed, so a child forked concurrently on another thread can hold it until

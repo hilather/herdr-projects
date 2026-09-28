@@ -59,7 +59,7 @@ fn recorded(db:&mut SqliteStore,payload:&Payload,operation:&Operation)->Result<O
 fn execute(input:&Input,control:&Control)->Result<()> {
     control.check()?;let mut guard=ProjectGuard::acquire(&input.project)?;guard.check_project(&input.project)?;
     let metadata=std::fs::metadata(&input.project)?;ensure!((metadata.dev(),metadata.ino())==input.identity,"verification project changed");
-    let mut db=migration::open_active(&input.project)?;
+    let mut db=migration::open_active_unchecked(&input.project)?;
     let (_,rows)=db.operation_rows(&input.operation,None)?;let (operation,delivery)=rows.context("verification job missing")?;
     ensure!(operation.kind=="verification.run"&&delivery.revision==input.revision,"verification job is stale");
     let payload:Payload=serde_json::from_value(operation.payload.clone())?;

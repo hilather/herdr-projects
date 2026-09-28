@@ -922,7 +922,7 @@ fn deliver_one_migrated(project_dir: &Path, item: &str, thread_id: &str, summary
     };
     let _ownership = herdr_projects::execution_guard::ProjectGuard::acquire(project_dir)?;
     for _ in 0..3 {
-        let mut db = herdr_projects::migration::open_active(project_dir)?;
+        let mut db = herdr_projects::migration::open_active_unchecked(project_dir)?;
         let head = db.current_head()?;
         let now_ms = jiff::Timestamp::now().as_millisecond();
         match db.deliver_memory_review_reminder(head, &content, now_ms) {

@@ -30,6 +30,7 @@ pub enum StoreError {
     Io(String),
 }
 pub mod controlled;
+pub mod integrity;
 pub(crate) mod read_budget;
 impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "state store: {self:?}") }
@@ -115,7 +116,10 @@ impl SqliteStore {
         std::fs::File::open(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))
             .and_then(|parent| parent.sync_all()).map_err(|e| StoreError::Io(e.to_string()))?;
         enable_wal(&connection)?;
-        Ok(Self { connection })
+        let store = Self { connection };
+        // A new store starts with a recorded check for its schema version.
+        integrity::check_and_record(path, &store)?;
+        Ok(store)
     }
     /// Existing, recognized schemas only. Unknown versions are inspected before
     /// setting WAL or doing any application writes; migrations are never implicit.
@@ -126,6 +130,17 @@ impl SqliteStore {
         enable_wal(&connection)?;
         let store = Self { connection };
         store.integrity_check()?;
+        Ok(store)
+    }
+    /// Hot paths: like `open`, but the whole-store check runs only when none is
+    /// recorded for this schema version (see `integrity`).
+    pub(crate) fn open_scoped(path: &Path) -> Result<Self> {
+        engine_check()?;
+        let connection = connect(path)?;
+        check_schema(&connection)?;
+        enable_wal(&connection)?;
+        let store = Self { connection };
+        integrity::check_if_schema_changed(path, &store)?;
         Ok(store)
     }
     pub fn integrity_check(&self) -> Result<()> {

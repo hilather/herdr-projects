@@ -34,7 +34,7 @@ fn execute_owned(project:&Path,operation:&crate::domain::OperationId,expected_he
     ensure!(!cancellation.is_cancelled(),"routine cancelled before claim");
     ensure!(deadline.is_none_or(|end|end>std::time::Instant::now()),"routine queue deadline elapsed");
     let _guard=migration::runtime_mutation(project)?;
-    let mut db=migration::open_active(project)?;
+    let mut db=migration::open_active_unchecked(project)?;
     let rows=db.routine_rows(operation,expected_head)?;
     let (occurrence,definition,delivery)=(&rows.occurrence,&rows.definition,&rows.delivery);
     ensure!(delivery.state==DeliveryState::Pending && delivery.attempts==0,"routine already claimed; execution cannot be replayed");

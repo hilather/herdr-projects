@@ -344,7 +344,7 @@ fn advance(project:&Path,journal:&mut Journal)->Result<()> {
     let marker:Format=serde_json::from_slice(&read(&project.join(".state/format.json"))?)?;
     ensure!(published_format_matches(&marker,&journal),"active ownership marker mismatch");
     // After ownership publication, tasks/events may legitimately have advanced.
-    let mut db=open_published(project,false)?;
+    let mut db=open_published(project,false,true)?;
     ensure!(db.imported_sources()?==expected_import(project,&journal.plan)?,"imported provenance changed");
     publish_control_marker(project,&db)?;
     crate::projections::export(project,&mut db)?;
@@ -482,19 +482,45 @@ pub(crate) fn runtime_mutation(project:&Path)->Result<Maintenance> {
 }
 /// Validates published authority without requiring tasks to remain at import
 /// revisions. Accepted post-cutover edits must never trigger a legacy rollback.
-pub fn open_active(project:&Path)->Result<SqliteStore> {open_published(project,true)}
-fn open_published(project:&Path,enforce_control:bool)->Result<SqliteStore> {
+/// Administrative opens also run the whole-store check.
+pub fn open_active(project:&Path)->Result<SqliteStore> {open_published(project,true,true)}
+/// Hot paths (effect jobs, targeted commands): publication checks only. The
+/// whole-store check runs after a schema change and in the ticker's periodic check.
+pub fn open_active_unchecked(project:&Path)->Result<SqliteStore> {open_published(project,true,false)}
+fn open_published(project:&Path,enforce_control:bool,integrity:bool)->Result<SqliteStore> {
     let project=checked_project(project)?;
     let journal=load(&project)?;
     ensure!(journal.phase==Phase::Active,"migration has not completed; recover before using the store");
     let marker:Format=serde_json::from_slice(&read(&project.join(".state/format.json"))?)?;
     ensure!(published_format_matches(&marker,&journal),"active ownership marker mismatch");
-    let db=SqliteStore::open(&project.join(".state/state.db"))?;
+    let path=project.join(".state/state.db");
+    let db=if integrity {SqliteStore::open(&path)?} else {SqliteStore::open_scoped(&path)?};
     ensure!(db.import_operation_count()?==journal.plan.operations.len() as u64,"store imported operation count mismatch");
     let receipt=db.import_receipt()?;
     ensure!(receipt==(journal.plan.digest,journal.plan.sources.iter().filter(|s|s.kind!="backup").count() as u64,journal.plan.tasks.len() as u64),"store import identity mismatch");
     if enforce_control {ensure!(marker.reconciliation_required==db.project_control()?.map(|c|c.reconciliation_required).unwrap_or(true),"control/format publication interrupted; run migration recover before runtime commands");}
     Ok(db)
+}
+
+#[derive(Debug,Clone,PartialEq,Eq)]
+pub enum IntegrityOutcome {NotDue,Ok,Corrupt}
+/// The ticker's whole-store check, at most once per `interval` per project and
+/// recorded durably, so a restart does not repeat it. Deadline or cancellation
+/// leaves no record and retries next pass. Corruption pauses admission and is
+/// never repaired here.
+pub fn periodic_integrity_check(project:&Path,interval:std::time::Duration,control:crate::store::controlled::ReadControl)->Result<IntegrityOutcome> {
+    use crate::store::{integrity,StoreError};
+    let project=checked_project(project)?;let path=project.join(".state/state.db");
+    let last=integrity::load(&path);
+    if last.as_ref().is_some_and(|r|jiff::Timestamp::now().as_millisecond().saturating_sub(r.checked_unix_ms)<interval.as_millis() as i64) {return Ok(IntegrityOutcome::NotDue);}
+    let result=open_active_scoped(&project,control).and_then(|db|Ok(db.integrity_check_recorded(&path)?));
+    let Err(error)=result else {return Ok(IntegrityOutcome::Ok)};
+    if !matches!(error.downcast_ref::<StoreError>(),Some(StoreError::Corrupt(_))) {return Err(error);}
+    if integrity::load(&path).is_none_or(|r|r.result!="corrupt"||last.as_ref()==Some(&r)) {
+        integrity::record_corrupt(&path,last.map_or(0,|r|r.schema))?;
+    }
+    crate::watchdog::pause_integrity(&project)?;
+    Ok(IntegrityOutcome::Corrupt)
 }
 
 /// Explicitly upgrade a supported published database; dispatch remains frozen.

@@ -1228,6 +1228,10 @@ pub fn run() -> Result<()> {
                         println!("{}",serde_json::to_string_pretty(&value)?);
                         bail!("unsupported_schema");
                     }
+                    Err(herdr_projects::factory_status::ReportError::Corrupt(value))=>{
+                        println!("{}",serde_json::to_string_pretty(&value)?);
+                        bail!("store_corrupt: the whole-store check failed; preserve the store and restore it");
+                    }
                     Err(error)=>return Err(error.into()),
                 }
                 Ok(())
