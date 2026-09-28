@@ -97,6 +97,13 @@ template. Stored verification/integration receipts already write
   edge reports `admission_disabled:<edge>` instead of missing evidence. Gate
   note: `docs/reviews/2026-09-27-f1-fixture-gate.md`.
 
+### 5. Launch released dependents — done
+
+- Operator `launch draft` binds every queued edge to its current valid satisfaction (the signed grant covers them) and refuses a still-blocked dependent; reservation checks that evidence whether factory admission is on or off.
+- Admission and delegated drafts bind the task's newest retained worker snapshot for the profile, so the brief is built; without one the candidate is skipped (`knowledge_missing`) instead of launching promptless.
+- Every integrated-commit dependency, even a single one, must be an ancestor of the pinned base.
+- E2E: `ticker_auto_chain_releases_verified_integrated_and_fan_in_dependents` now drafts, signs and reserves `c` on `a`'s integrated SHA, builds its brief and worktree, and refuses a blocked dependent and a base without the integrated commit.
+
 ## F1.7 live check (needs explicit authorization to spend)
 
 One authenticated worker on the first adapter edits a disposable repository;

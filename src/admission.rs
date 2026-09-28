@@ -64,12 +64,7 @@ fn ranked_page(db: &mut SqliteStore, header: &Header, now: i64, after: Option<&C
         let Some(binding) = entry.binding else { continue };
         let Some(edges) = db.satisfied_edges_with_budget(task.id.as_str(),Some(budget))? else { continue };
         let Some(repositories) = db.contract_pins_with_budget(task.id.as_str(), Some(control),Some(budget))? else { continue };
-        let dependencies = edges.into_iter().map(|edge| DependencyInput {
-            task: edge.predecessor,
-            task_revision: edge.predecessor_revision,
-            requirement: edge.requirement,
-            evidence: VersionedReference { id: edge.satisfaction_id.clone(), revision: 1, digest: edge.satisfaction_id },
-        }).collect::<Vec<_>>();
+        let dependencies = edges.into_iter().map(|edge| edge.input()).collect::<Vec<_>>();
         let blocker = if claims.as_ref().map(|claims|db.admission_claim_overlap(task.id.as_str(),claims,Some(budget))).transpose()?.unwrap_or(false) { Some("resource_conflict") } else { None };
         let contract=db.admission_contract(task.id.as_str(),Some(budget))?;
         let task_contract=contract.as_ref().map(|contract|VersionedReference{id:contract.task_id.as_str().into(),revision:contract.contract_revision,digest:contract.digest.clone()});
@@ -91,10 +86,18 @@ fn binding_profiles<'a>(db: &SqliteStore, profiles: &'a [FrozenProfile], control
     Ok(matches)
 }
 
-fn seal(project_store: &str, header: &Header, candidate: &Candidate, profile: &FrozenProfile, approval: VersionedReference) -> Result<LaunchInputs> {
-    let mut inputs = seal_admission_inputs(project_store, &candidate.task, &candidate.binding, header.policy.revision, header.control.epoch, profile, approval, candidate.dependencies.clone(), candidate.repositories.clone(), header.budget.clone()).map_err(anyhow::Error::msg)?;
+/// `None` when the task has no retained worker snapshot for this profile: without
+/// knowledge no worker brief can be built, so the candidate is not launched promptless.
+fn seal(db: &SqliteStore, project_store: &str, header: &Header, candidate: &Candidate, profile: &FrozenProfile, approval: VersionedReference, budget: &ReadBudget) -> Result<Option<LaunchInputs>> {
+    let Some(memory) = db.worker_knowledge_selection(&candidate.task, profile, Some(budget))? else { return Ok(None) };
+    let mut inputs = seal_admission_inputs(project_store, &candidate.task, &candidate.binding, header.policy.revision, header.control.epoch, profile, approval, candidate.dependencies.clone(), candidate.repositories.clone(), header.budget.clone(), memory).map_err(anyhow::Error::msg)?;
     inputs.task_contract = candidate.task_contract.clone();
-    Ok(inputs)
+    Ok(Some(inputs))
+}
+
+fn knowledge_missing(task: &TaskId) -> anyhow::Error {
+    let task = task.as_str();
+    anyhow::anyhow!("knowledge_missing: ready task {task} has no worker knowledge snapshot for a matching profile; create one with `memory <slug> snapshot --task {task} --worker`")
 }
 
 fn record_missing_grant(db: &mut SqliteStore, task: &TaskId, head: u64, now: i64) -> Result<()> {
@@ -132,17 +135,21 @@ pub(crate) fn prepare_held(project: &Path, db: &mut SqliteStore, read_control: &
     }
     let profiles = db.admission_profiles_with_budget(header.control.config_digest.as_deref(),Some(budget))?;
     let mut cursor = None;
+    let mut missing = None;
     loop {
         let (candidates, next) = ranked_page(db, &header, now, cursor.as_ref(), read_control,budget)?;
         for candidate in candidates.into_iter().filter(|candidate| candidate.blocker.is_none()) {
-            if let Some(profile) = binding_profiles(&db, &profiles, &header.control, &candidate, now,budget)?.into_iter().next() {
-                return Ok(Some(seal(project_store, &header, &candidate, profile, placeholder_approval())?));
+            for profile in binding_profiles(&db, &profiles, &header.control, &candidate, now,budget)? {
+                if let Some(inputs) = seal(db, project_store, &header, &candidate, profile, placeholder_approval(), budget)? {
+                    return Ok(Some(inputs));
+                }
+                missing.get_or_insert_with(|| candidate.task.id.clone());
             }
         }
         cursor = next;
         if cursor.is_none() { break; }
     }
-    Ok(None)
+    match missing { Some(task) => Err(knowledge_missing(&task)), None => Ok(None) }
 }
 
 /// `capacity_full` while verify or integrate work is older than the watermark.
@@ -239,12 +246,16 @@ pub(crate) fn decide_held(project: &Path, db: &mut SqliteStore, read_control: &R
     }
     let profiles = db.admission_profiles_with_budget(header.control.config_digest.as_deref(),Some(budget))?;
     let mut denied = None;
+    let mut missing = None;
     let cursor = db.admission_cursor_with_budget(&header,Some(budget))?;
     let (candidates, next) = ranked_page(db, &header, now, cursor.as_ref(), read_control,budget)?;
     for candidate in candidates.iter().filter(|candidate| candidate.blocker.is_none()) {
         let mut sealed = None;
+        let (mut matched, mut knowledge) = (false, false);
         for profile in binding_profiles(&db, &profiles, &header.control, candidate, now,budget)? {
-            let inputs = seal(project_store, &header, candidate, profile, placeholder_approval())?;
+            matched = true;
+            let Some(inputs) = seal(db, project_store, &header, candidate, profile, placeholder_approval(), budget)? else { continue };
+            knowledge = true;
             if let Some(reference) = db.matching_launch_approval(&inputs, now,Some(budget))? {
                 let mut inputs = inputs;
                 inputs.approval = reference;
@@ -257,6 +268,11 @@ pub(crate) fn decide_held(project: &Path, db: &mut SqliteStore, read_control: &R
             db.reserve_prepared_controlled(&[PreparedLaunch { inputs }], head, now, read_control,budget)?;
             return Ok(AdmissionDecision { block: None, reason: "reserved", task_id: Some(candidate.task.id.as_str().to_string()) });
         }
+        if matched && !knowledge {
+            // Fail closed: no retained worker snapshot means no brief, so no launch.
+            missing.get_or_insert_with(|| candidate.task.id.as_str().to_string());
+            continue;
+        }
         // One denial for this task, then the next candidate. A grant for another profile is not this miss.
         record_missing_grant(db, &candidate.task.id, head, now)?;
         denied = Some(candidate.task.id.as_str().to_string());
@@ -265,8 +281,8 @@ pub(crate) fn decide_held(project: &Path, db: &mut SqliteStore, read_control: &R
     db.advance_admission_cursor(&header,next.as_ref())?;
     Ok(AdmissionDecision {
         block: None,
-        reason: if next.is_some() { "scan_incomplete" } else if denied.is_some() { "authority_missing" } else { "idle" },
-        task_id: denied,
+        reason: if next.is_some() { "scan_incomplete" } else if denied.is_some() { "authority_missing" } else if missing.is_some() { "knowledge_missing" } else { "idle" },
+        task_id: denied.or(missing),
     })
 }
 
@@ -471,7 +487,19 @@ mod tests {
         drop(db);
         plant_profile(&db_path);
         admission_on(&db_path);
+        for spec in specs { worker_snapshot(&project, spec.id); }
         (root, project)
+    }
+
+    /// The retained worker knowledge an automatic launch binds for its brief.
+    fn worker_snapshot(project: &Path, task: &str) -> VersionedReference {
+        let profile = crate::domain::profile::fixture(crate::migration::ConfigReference { path: "/no/such/admission-config.toml".into(), digest: None });
+        let db = SqliteStore::open(&project.join(".state/state.db")).unwrap();
+        let mut memory = crate::memory::MemoryStore::from_sqlite(db, project.join(".state/objects"));
+        let snapshot = memory.create_worker_snapshot(SnapshotRequest {
+            schema_version: 1, task_id: task.into(), profile: profile.name.clone(), domains: vec![], paths: vec![], pinned_keys: vec![], sensitivity: "default".into(),
+        }, &profile.name, &profile.definition_digest, None, 32000, "Admission fixture instructions", jiff::Timestamp::now().as_millisecond(), None).unwrap();
+        VersionedReference { id: snapshot.id.as_str().into(), revision: 1, digest: snapshot.manifest_hash }
     }
 
     fn blockers(project: &Path) -> Vec<(String, i64, Option<&'static str>)> {
@@ -565,7 +593,7 @@ mod tests {
         let profile = binding_profiles(&db, &profiles, &control, &candidate, now,&budget()).unwrap().into_iter().next().unwrap();
         let store = store_file(project).unwrap();
         let store = store.to_str().unwrap().to_string();
-        let mut inputs = seal(&store, &state, &candidate, profile, placeholder_approval()).unwrap();
+        let mut inputs = seal(&db, &store, &state, &candidate, profile, placeholder_approval(), &budget()).unwrap().unwrap();
         let now = jiff::Timestamp::now().as_millisecond();
         let grant = ApprovalGrant {
             version: 1,
@@ -886,7 +914,7 @@ mod tests {
         let profiles=db.admission_profiles().unwrap();
         let now=jiff::Timestamp::now().as_millisecond();
         let profile=binding_profiles(&db,&profiles,&header.control,late,now,&budget()).unwrap()[0];
-        let inputs=seal(path.to_str().unwrap(),&header,late,profile,placeholder_approval()).unwrap();
+        let inputs=seal(&db,path.to_str().unwrap(),&header,late,profile,placeholder_approval(),&budget()).unwrap().unwrap();
         let first=admit_decision(&project).unwrap();
         assert_eq!(first.reason,"scan_incomplete");
         assert!(attempt_tasks(&project).is_empty());

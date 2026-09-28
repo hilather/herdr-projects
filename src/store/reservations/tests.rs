@@ -1246,18 +1246,18 @@ fn verified_dependent(db:&mut SqliteStore,template:&LaunchInputs)->PreparedLaunc
     reseal(db,"a",vec![DependencyInput{task:TaskId::new("b").unwrap(),task_revision:predecessor_revision,requirement:DependencyRequirement::VerifiedResult,evidence:VersionedReference{id:satisfaction_id.clone(),revision:1,digest:satisfaction_id}}],vec![],template)
 }
 #[test]
-fn flag_off_dependency_evidence_does_not_reserve_and_flag_on_reserves_one() {
+fn dependency_evidence_reserves_one_whether_or_not_automatic_admission_is_on() {
+    // The admission flag gates automatic dispatch only; an explicit reservation of
+    // a released dependent binds the same current satisfactions either way.
     let(_temp,mut db,prepared)=fixture();
     let launch=verified_dependent(&mut db,&prepared[0].inputs);
-    let before=db.read_snapshot(None).unwrap();
-    let err=db.reserve_prepared(&[launch.clone()],before.head,1000).unwrap_err();
-    assert!(matches!(err,StoreError::Invalid(ref message) if message.contains("dependency evidence producers are not available")),"{err}");
-    assert!(db.read_snapshot(None).unwrap().attempts.iter().all(|attempt|attempt.task.as_str()!="a"));
-    db.testing_set_factory_admission(true).unwrap();
     let stale=db.reserve_prepared(&[launch.clone()],0,1000).unwrap_err();
     assert!(matches!(stale,StoreError::Conflict),"{stale}");
     assert!(db.read_snapshot(None).unwrap().attempts.iter().all(|attempt|attempt.task.as_str()!="a"));
+    let mut unbound=launch.clone();unbound.inputs.dependencies.clear();
     let head=db.read_snapshot(None).unwrap().head;
+    let err=db.reserve_prepared(&[unbound],head,1000).unwrap_err();
+    assert!(matches!(err,StoreError::Invalid(ref message) if message.contains("not ready")),"{err}");
     let reserved=db.reserve_prepared(&[launch],head,1000).unwrap();
     assert_eq!(reserved.record.inputs.task.as_str(),"a");
     let attempts=db.read_snapshot(None).unwrap().attempts;

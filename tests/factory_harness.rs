@@ -429,6 +429,7 @@ mod slice {
     }
 
     fn install_grant(db_path: &Path, project: &Path) -> String {
+        super::worker_snapshots(project);
         let inputs = admission::prepared_admission_inputs(project)
             .unwrap()
             .unwrap_or_else(|| panic!("no ready candidate\n{}", satisfaction_text(db_path)));
@@ -1106,6 +1107,29 @@ fn install_fixture_contract(
     digest
 }
 
+/// Retained worker knowledge for every queued task at its current revision and
+/// every retained profile; automatic admission binds it to build the brief.
+fn worker_snapshots(project: &Path) {
+    let db_path = project.join(".state/state.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let profiles = conn.prepare("SELECT report FROM native_profiles").unwrap()
+        .query_map([], |row| row.get::<_, String>(0)).unwrap()
+        .map(|report| serde_json::from_value::<FrozenProfile>(serde_json::from_str::<serde_json::Value>(&report.unwrap()).unwrap()["preparation"]["profile"].clone()).unwrap())
+        .collect::<Vec<_>>();
+    let tasks = conn.prepare("SELECT id,revision FROM tasks WHERE state='queued'").unwrap()
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    for (task, revision) in tasks {
+        for profile in &profiles {
+            let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM memory_snapshots WHERE task_id=?1 AND task_revision=?2 AND profile_name=?3 AND profile_digest=?4)",
+                rusqlite::params![task, revision, profile.name, profile.definition_digest], |row| row.get(0)).unwrap();
+            if exists { continue; }
+            let mut memory = herdr_projects::memory::MemoryStore::from_sqlite(SqliteStore::open(&db_path).unwrap(), project.join(".state/objects"));
+            memory.create_worker_snapshot(SnapshotRequest { schema_version: 1, task_id: task.clone(), profile: profile.name.clone(), domains: vec![], paths: vec![], pinned_keys: vec![], sensitivity: "default".into() },
+                &profile.name, &profile.definition_digest, profile.config.digest.as_deref(), 32000, "Factory fixture instructions", unix_ms(), None).unwrap();
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn plant_profile(
     db_path: &Path,
@@ -1419,6 +1443,7 @@ fn planning_gate_ten_logical_workers() {
 
     let mut reserved = Vec::new();
     for _ in 0..workers.len() {
+        worker_snapshots(&project);
         let Some(inputs) = herdr_projects::admission::prepared_admission_inputs(&project).unwrap()
         else {
             break;

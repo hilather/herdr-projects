@@ -470,7 +470,7 @@ fn valid_satisfaction_id_with_budget(db:&Connection,task_id:&str,predecessor:&Ta
 }
 
 /// Queue edges and sealed dependency inputs must name the same valid rows.
-/// Two integrated commits on one ref also need a pinned base that contains both.
+/// Integrated commits also need a pinned base that contains every one of them.
 pub(super) fn require_dependency_evidence_with_budget(db:&Connection,inputs:&LaunchInputs,dependencies:&[Dependency],tasks:&[Task],proof:Option<&IntegratedProof>,budget:Option<&read_budget::ReadBudget>)->Result<()> {
     if inputs.dependencies.len() != dependencies.len() {
         return Err(invalid("task is not ready for reservation"));
@@ -549,10 +549,8 @@ fn contract_base(db: &Connection, task_id: &str, repository: &str) -> Result<Opt
 pub(super) fn prove_integrated_base(db: &Connection, inputs: &LaunchInputs, control: Option<&super::controlled::ReadControl>,budget:Option<&read_budget::ReadBudget>) -> Result<IntegratedProof> {
     let groups = integrated_groups(db, inputs.task.as_str(),budget)?;
     let mut checked = std::collections::BTreeMap::new();
+    // Every integrated-commit dependency, even a single one, must be contained in the pinned base.
     for ((repository, ref_name), commits) in groups {
-        if commits.len() < 2 {
-            continue;
-        }
         let Some(pin) = inputs.repositories.iter().find(|repo| repo.repository == repository) else {
             return Err(invalid("integration_missing"));
         };
@@ -577,9 +575,6 @@ pub(super) fn prove_integrated_base(db: &Connection, inputs: &LaunchInputs, cont
 fn recheck_integrated_base(db: &Connection, inputs: &LaunchInputs, proof: Option<&IntegratedProof>,budget:Option<&read_budget::ReadBudget>) -> Result<()> {
     let groups = integrated_groups(db, inputs.task.as_str(),budget)?;
     for ((repository, ref_name), commits) in &groups {
-        if commits.len() < 2 {
-            continue;
-        }
         let Some(pin) = inputs.repositories.iter().find(|repo| repo.repository == *repository) else {
             return Err(invalid("integration_missing"));
         };
@@ -596,7 +591,7 @@ fn recheck_integrated_base(db: &Connection, inputs: &LaunchInputs, proof: Option
     }
     if let Some(proof) = proof.filter(|proof| proof.task == inputs.task) {
         for key in proof.checked.keys() {
-            if !groups.get(key).is_some_and(|commits| commits.len() >= 2) {
+            if !groups.contains_key(key) {
                 return Err(invalid("integration_missing"));
             }
         }
@@ -901,6 +896,18 @@ pub(crate) struct SatisfiedEdge {
     pub predecessor_revision: u64,
     pub requirement: DependencyRequirement,
     pub satisfaction_id: String,
+}
+
+impl SatisfiedEdge {
+    /// The sealed launch input naming this edge's current valid satisfaction.
+    pub(crate) fn input(self) -> DependencyInput {
+        DependencyInput {
+            task: self.predecessor,
+            task_revision: self.predecessor_revision,
+            requirement: self.requirement,
+            evidence: VersionedReference { id: self.satisfaction_id.clone(), revision: 1, digest: self.satisfaction_id },
+        }
+    }
 }
 
 #[cfg(test)]

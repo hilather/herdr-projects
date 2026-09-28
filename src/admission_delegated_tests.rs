@@ -32,7 +32,7 @@ fn setup_with_limits(concurrent: u32, overlap: bool) -> (tempfile::TempDir, std:
     let header = db.admission_header().unwrap();
     let profiles = db.admission_profiles_with_budget(header.control.config_digest.as_deref(),None).unwrap();
     let mut inputs: Vec<_> = readiness_now(&project).unwrap().iter().map(|candidate|
-        seal(&initial.project_store, &header, candidate, &profiles[0], placeholder_approval()).unwrap()).collect();
+        seal(&db, &initial.project_store, &header, candidate, &profiles[0], placeholder_approval(), &budget()).unwrap().unwrap()).collect();
     inputs.sort_by(|a,b| a.task.cmp(&b.task));
     let mut document: serde_json::Value = serde_json::from_slice(include_bytes!("../contracts/factory/delegation-v2.json")).unwrap();
     document["project_store"] = initial.project_store.into();

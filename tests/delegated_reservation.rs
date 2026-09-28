@@ -32,6 +32,13 @@ fn sign(key: &Path, path: &Path, bytes: &[u8], namespace: &str) -> PathBuf {
     signature
 }
 
+/// Retained worker knowledge for `task`; an automatic draft binds it for the brief.
+fn worker_snapshot(project: &Path, profile: &FrozenProfile, task: &str) {
+    let mut memory = herdr_projects::memory::MemoryStore::from_sqlite(migration::open_active(project).unwrap(), project.join(".state/objects"));
+    memory.create_worker_snapshot(SnapshotRequest { schema_version: 1, task_id: task.into(), profile: profile.name.clone(), domains: vec![], paths: vec![], pinned_keys: vec![], sensitivity: "default".into() },
+        &profile.name, &profile.definition_digest, profile.config.digest.as_deref(), 32000, "Delegated fixture instructions", jiff::Timestamp::now().as_millisecond(), None).unwrap();
+}
+
 fn synthetic_profile(project: &Path, config: &Path) -> FrozenProfile {
     let evidence = VersionedReference { id: "synthetic-cli-fixture".into(), revision: 1, digest: "a".repeat(64) };
     let supported = CapabilityEvidence::Supported { evidence: evidence.clone() };
@@ -132,6 +139,7 @@ fn signed_cli_reservation_enforces_subject_scope_quotas_and_replays_after_revoca
     let signature = sign(&owner, &document, &serde_json::to_vec(&grant).unwrap(), authority::DELEGATION_SIGNATURE_NAMESPACE);
     let receipt = accepted(cli(home.path(), &["delegation","demo","import",document.to_str().unwrap(),signature.to_str().unwrap()]));
     let grant_id = receipt["grant_id"].as_str().unwrap();
+    for task in ["a", "b", "c"] { worker_snapshot(&project, &profile, task); }
     let draft = |key: &str| accepted(cli(home.path(), &["delegation","demo","draft",grant_id,"--idempotency-key",key]));
     let request_path = home.path().join("request.json");
     let first = draft("first");

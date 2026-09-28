@@ -439,6 +439,9 @@ pub(crate) mod tests {
         let report_digest=format!("{:x}",Sha256::digest(text.as_bytes()));
         let sequence:i64=rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT MAX(sequence) FROM events",[],|row|row.get(0)).unwrap();
         rusqlite::Connection::open(&db_path).unwrap().execute("INSERT INTO native_profiles(profile_digest,report,report_digest,sequence) VALUES(?1,?2,?3,?4)",rusqlite::params![reference.digest,text,report_digest,sequence]).unwrap();
+        // Retained worker knowledge: without it no brief exists and nothing is reserved.
+        herdr_projects::memory::MemoryStore::from_sqlite(SqliteStore::open(&db_path).unwrap(),project.join(".state/objects")).create_worker_snapshot(SnapshotRequest{schema_version:1,task_id:"c".into(),profile:profile.name.clone(),domains:vec![],paths:vec![],pinned_keys:vec![],sensitivity:"default".into()},
+            &profile.name,&profile.definition_digest,None,32000,"Controller fixture instructions",now,None).unwrap();
         let inputs=herdr_projects::admission::prepared_admission_inputs(&project).unwrap().expect("ready dependent");
         let grant=ApprovalGrant{version:1,scope:ApprovalScope::for_launch(&inputs).unwrap(),policy:inputs.effective_profile.as_ref().unwrap().permission_policy.clone(),issued_unix_ms:0,expires_unix_ms:now+3_600_000};
         let approval=grant.reference().unwrap();

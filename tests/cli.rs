@@ -1877,7 +1877,7 @@ impl VerifyFixture {
         let key=home.path().join("owner");assert!(Command::new("/usr/bin/ssh-keygen").args(["-q","-t","ed25519","-N","","-f"]).arg(&key).output().unwrap().status.success());
         let public=fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
         let project=root.join("demo");let config=home.path().join(".config/herdr-projects/config.toml");fs::create_dir_all(config.parent().unwrap()).unwrap();
-        fs::write(&config,format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n")).unwrap();
+        fs::write(&config,format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[profiles.worker]\nkind='claude'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=60\nunknown_usage='allow_with_warning'\n")).unwrap();
         let plan=migration::inspect_with_config(&project,&config).unwrap();migration::apply(&project,&plan,true).unwrap();
         let s=runtime::snapshot(&project).unwrap();runtime::set_state(&project,s.head,s.control.unwrap().revision,ProjectState::Active,&config).unwrap();
         let store=project.join(".state/state.db").canonicalize().unwrap().display().to_string();
@@ -1947,6 +1947,41 @@ impl VerifyFixture {
         std::fs::write(self.root.join(".ticker.stop"),b"").unwrap();let deadline=std::time::Instant::now()+std::time::Duration::from_secs(8);
         while child.0.try_wait().unwrap().is_none(){assert!(std::time::Instant::now()<deadline);std::thread::sleep(std::time::Duration::from_millis(10));}
         std::fs::remove_file(self.root.join(".ticker.stop")).unwrap();
+    }
+    /// Retain a launchable `worker` profile over fake Herdr and agent binaries.
+    /// Native interaction needs a real agent session, so only that evidence is
+    /// planted, in the verifier's exact shape; launch revalidates everything else live.
+    fn launchable_profile(&self)->herdr_projects::domain::VersionedReference {
+        use std::{fs,os::unix::fs::{MetadataExt,PermissionsExt}};
+        use herdr_projects::{domain::*,worker_supervision::{ProcessIncarnation,SupervisorIdentity}};
+        use sha2::{Digest,Sha256};
+        let bin=self.home.path().join("bin");let agent_home=self.home.path().join("agent-home");fs::create_dir_all(&bin).unwrap();fs::create_dir_all(&agent_home).unwrap();
+        let (herdr,agent)=(bin.join("herdr"),bin.join("claude"));
+        // Herdr answers one native request with a pong that offers workspace creation.
+        fs::write(&herdr,"#!/usr/bin/python3\nimport sys,json\nif sys.argv[1:]==['--version']:print('herdr 0.9.1');sys.exit(0)\nr=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'result':{'type':'pong','version':'0.9.1','capabilities':{'workspace_create_command':True}}}))\n").unwrap();
+        fs::write(&agent,"#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 2\nprintf '%s\\n' '2.1.0 (Claude Code)'\n").unwrap();
+        for path in [&herdr,&agent] {fs::set_permissions(path,fs::Permissions::from_mode(0o700)).unwrap();}
+        let out=hp(self.home.path(),&["--root",self.r(),"profile","prepare","demo","worker","--herdr-executable",herdr.to_str().unwrap(),
+            "--agent-executable",agent.to_str().unwrap(),"--execution-home",agent_home.to_str().unwrap()]);
+        assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+        let mut profile:FrozenProfile=serde_json::from_value(serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["profile"].clone()).unwrap();
+        #[derive(serde::Serialize)] struct Interaction{session:ResourceIdentity,terminal:&'static str,readiness_manifest:&'static str,prompt_digest:String,acknowledged_unix_ms:i64}
+        #[derive(serde::Serialize)] struct Evidence{version:u32,prepared_profile:VersionedReference,supervisor:SupervisorIdentity,native_kind:String,observed_unix_ms:i64,stopped_unix_ms:i64,interaction:Interaction}
+        let evidence=Evidence{version:2,prepared_profile:profile.reference().unwrap(),native_kind:profile.kind.clone(),observed_unix_ms:1000,stopped_unix_ms:1001,
+            supervisor:SupervisorIdentity{version:1,boot_id:"00000000-0000-0000-0000-000000000001".into(),host_id:None,observer_namespace:(1,2),worker_namespace:(1,3),
+                outer:ProcessIncarnation{pid:20,device:1,inode:4},init:ProcessIncarnation{pid:21,device:1,inode:5}},
+            interaction:Interaction{session:ResourceIdentity{device:1,inode:2,born_secs:1,born_nanos:0},terminal:"fixture-terminal",readiness_manifest:"fixture-manifest",prompt_digest:"a".repeat(64),acknowledged_unix_ms:999}};
+        let hash=format!("{:x}",Sha256::digest(serde_json::to_vec(&evidence).unwrap()));
+        let supported=CapabilityEvidence::Supported{evidence:VersionedReference{id:format!("native-transport-{hash}"),revision:1,digest:hash}};
+        let c=&mut profile.capabilities;
+        (c.launch,c.stop,c.readiness_observation,c.prompt_submission)=(supported.clone(),supported.clone(),supported.clone(),supported);
+        let reference=profile.reference().unwrap();
+        let path=self.project.join(".state/state.db").canonicalize().unwrap();let metadata=fs::metadata(&path).unwrap();
+        let report=serde_json::json!({"preparation":{"profile":profile,"reference":reference,"launchable":true,"protocol_capable":false,"certified":false},
+            "evidence":evidence,"source_store":[path,metadata.dev(),metadata.ino()]}).to_string();
+        self.db().execute("INSERT INTO native_profiles(profile_digest,report,report_digest,sequence) VALUES(?1,?2,?3,(SELECT max(sequence) FROM events))",
+            rusqlite::params![reference.digest,report,format!("{:x}",Sha256::digest(report.as_bytes()))]).unwrap();
+        reference
     }
 }
 
@@ -2255,6 +2290,89 @@ fn ticker_auto_chain_releases_verified_integrated_and_fan_in_dependents() {
     assert_eq!(f.git(&["-C",clone,"rev-parse","HEAD"]),tip);
     f.git(&["-C",clone,"diff","--quiet"]);
     assert_eq!(f.git(&["-C",clone,"ls-files"]).lines().collect::<Vec<_>>(),["src/a.txt","src/base.txt","src/e.txt","src/lib.rs"]);
+
+    // Card 5: the operator drafts, signs and reserves a launch of the released
+    // dependent `c` on `a`'s integrated SHA, and its worker brief is built.
+    use herdr_projects::domain::RuntimeRoute;
+    let profile=f.launchable_profile();
+    let head=||runtime::snapshot(&f.project).unwrap().head;
+    // `g` waits on an integration of `b` that never happens.
+    let request=f.home.path().join("g-queue.json");
+    std::fs::write(&request,r#"{"priority":0,"dependencies":[{"predecessor":"b","requirement":"integrated_commit"}]}"#).unwrap();
+    runtime::add_task(&f.project,TaskId::new("g").unwrap(),"consumer g".into(),head()).unwrap();
+    let queued=hp(f.home.path(),&["--root",f.r(),"task","demo","queue","g","--input-file",request.to_str().unwrap(),"--expected-revision","1","--expected-head",&head().to_string()]);
+    assert!(queued.status.success(),"{}",String::from_utf8_lossy(&queued.stderr));
+    let policy=runtime::snapshot(&f.project).unwrap().scheduler.unwrap().policy.revision.to_string();
+    let out=hp(f.home.path(),&["--root",f.r(),"scheduler","demo","policy","--max-active-workers","4","--max-attempts-per-task","3","--expected-revision",&policy,"--expected-head",&head().to_string()]);
+    assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let socket=f.home.path().join("native.sock");let _listener=std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let repository=f.repo.canonicalize().unwrap();
+    // Unused local routes in the repository for `c` and `g`; recording their observation re-admits the project.
+    let config=f.home.path().join(".config/herdr-projects/config.toml");
+    let mut bindings=std::collections::BTreeMap::new();
+    for task in ["c","g"] {
+        let revision=runtime::snapshot(&f.project).unwrap().tasks.into_iter().find(|t|t.id.as_str()==task).unwrap().revision;
+        let change=runtime::create_binding(&f.project,Some(&TaskId::new(task).unwrap()),Some(revision),head(),
+            &RuntimeRoute{socket:socket.display().to_string(),cwd:repository.display().to_string(),..Default::default()}).unwrap();
+        bindings.insert(task,(change.binding,change.task_revision));
+    }
+    let observations=bindings.values().map(|(binding,task_revision)|herdr_projects::reconcile::RuntimeObservation{binding:binding.id.clone(),binding_revision:binding.revision,
+        task_revision:*task_revision,observed_unix_ms:jiff::Timestamp::now().as_millisecond(),collector:"herdr-git-v2".into(),
+        config_digest:migration::config_reference(&config).unwrap().digest,..Default::default()}).collect::<Vec<_>>();
+    migration::open_active(&f.project).unwrap().record_observations(head(),&observations).unwrap();
+    // The fixture's submitting workers (raw `running` rows) have exited.
+    f.db().execute("UPDATE attempts SET state='completed',termination_observed=1 WHERE id IN ('a-attempt','e-attempt')",[]).unwrap();
+    let control=runtime::snapshot(&f.project).unwrap().control.unwrap().revision;
+    runtime::set_state(&f.project,head(),control,herdr_projects::domain::ProjectState::Active,&config).unwrap();
+    let selection=|task:&str,knowledge:serde_json::Value|{
+        let path=f.home.path().join(format!("{task}-selection.json"));
+        std::fs::write(&path,serde_json::json!({"task":task,"binding":bindings[task].0.id,"profile":profile,"knowledge":knowledge,"repositories":[repository]}).to_string()).unwrap();
+        path
+    };
+    let draft=|path:&Path|hp(f.home.path(),&["--root",f.r(),"launch","demo","draft","--selection",path.to_str().unwrap(),"--expected-head",&head().to_string()]);
+    let g=selection("g",serde_json::json!({"id":"unused","revision":1,"digest":"0".repeat(64)}));
+    let before=head();let refused=draft(&g);
+    assert!(!refused.status.success());assert!(String::from_utf8_lossy(&refused.stderr).contains("not released"),"{}",String::from_utf8_lossy(&refused.stderr));
+    assert_eq!(head(),before,"a refused draft writes nothing");
+    let scope=f.home.path().join("c-scope.json");
+    std::fs::write(&scope,r#"{"schema_version":1,"task_id":"c","profile":"worker","domains":[],"paths":[],"pinned_keys":[],"sensitivity":"default"}"#).unwrap();
+    std::fs::write(f.project.join("PROJECT.md"),"Retained instructions for dependent c").unwrap();
+    let c_selection=selection("c",serde_json::Value::Null);
+    let out=hp(f.home.path(),&["--root",f.r(),"memory","demo","snapshot","--task","c","--profile","worker","--input-file",scope.to_str().unwrap(),"--worker"]);
+    assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let snapshot:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();
+    let mut chosen:serde_json::Value=serde_json::from_slice(&std::fs::read(&c_selection).unwrap()).unwrap();
+    chosen["knowledge"]=serde_json::json!({"id":snapshot["id"],"revision":1,"digest":snapshot["manifest_hash"]});
+    std::fs::write(&c_selection,chosen.to_string()).unwrap();
+    // A single integrated-commit dependency still needs a base containing it.
+    f.git(&["checkout","-q","--detach",&f.base]);
+    let before=head();let refused=draft(&c_selection);
+    assert!(!refused.status.success());assert!(String::from_utf8_lossy(&refused.stderr).contains("integration_missing"),"{}",String::from_utf8_lossy(&refused.stderr));
+    assert_eq!(head(),before);
+    f.git(&["checkout","-q","--detach",&a_commit]);
+    let drafted=draft(&c_selection);assert!(drafted.status.success(),"{}",String::from_utf8_lossy(&drafted.stderr));
+    let drafted:serde_json::Value=serde_json::from_slice(&drafted.stdout).unwrap();
+    assert_eq!(drafted["inputs"]["repositories"][0]["commit"],a_commit.as_str(),"the worktree base is a's integrated SHA");
+    let satisfaction=f.db().query_row("SELECT satisfaction_id FROM dependency_satisfactions WHERE task_id='c' AND state='valid' AND evidence_id=?1",[&a_integrated],|row|row.get::<_,String>(0)).unwrap();
+    assert_eq!(drafted["inputs"]["dependencies"],serde_json::json!([{"task":"a","task_revision":1,"requirement":"integrated_commit",
+        "evidence":{"id":satisfaction,"revision":1,"digest":satisfaction}}]),"the grant covers the exact dependency binding");
+    let brief=drafted["brief"]["text"].as_str().unwrap();assert!(brief.contains("Retained instructions for dependent c"),"{brief}");
+    let document=f.home.path().join("c-approval.json");std::fs::write(&document,serde_json::to_vec_pretty(&drafted["approval"]).unwrap()).unwrap();
+    assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&f.key).args(["-n",herdr_projects::authority::SIGNATURE_NAMESPACE]).arg(&document).output().unwrap().status.success());
+    let out=hp(f.home.path(),&["--root",f.r(),"approval","demo","import",document.to_str().unwrap(),document.with_extension("json.sig").to_str().unwrap(),"--expected-head",&head().to_string()]);
+    assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let approval:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();assert_eq!(approval,drafted["inputs"]["approval"]);
+    let out=hp(f.home.path(),&["--root",f.r(),"launch","demo","reserve","--selection",c_selection.to_str().unwrap(),"--approval-digest",approval["digest"].as_str().unwrap(),"--expected-head",&head().to_string()]);
+    assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+    let reservation:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(reservation["record"]["inputs"],drafted["inputs"]);
+    let attempt=reservation["record"]["attempt"].as_str().unwrap();assert_eq!(attempt,drafted["brief"]["attempt_id"]);
+    assert_eq!(herdr_projects::memory::render_attempt_brief(&f.project,attempt).unwrap().text,brief,"the reserved attempt carries the worker prompt");
+    // The prepared worktree is checked out at a's integrated SHA.
+    let operation=herdr_projects::domain::OperationId::new(reservation["record"]["operation"].as_str().unwrap()).unwrap();
+    let receipts=herdr_projects::worktree_preparation::prepare(&f.project,&operation,1,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default()).unwrap();
+    assert_eq!(receipts.len(),1);
+    assert_eq!(f.git(&["-C",&receipts[0].plan.path,"rev-parse","HEAD"]),a_commit);
 }
 
 #[cfg(feature="state-store")]

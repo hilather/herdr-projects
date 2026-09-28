@@ -28,6 +28,8 @@ pub(crate) struct LaunchRows {
     pub(crate) budget: Option<VersionedReference>,
     /// Grant, whether it was revoked, and whether it was consumed.
     pub(crate) approval: Option<(ApprovalGrant, bool, bool)>,
+    /// Every queued edge bound to its current valid satisfaction; `None` while any edge is unsatisfied.
+    pub(crate) dependencies: Option<Vec<DependencyInput>>,
 }
 
 fn fenced(db: &Connection, at: Option<u64>) -> Result<u64> {
@@ -93,6 +95,9 @@ impl SqliteStore {
                 }
                 _ => None,
             },
+            dependencies: if tx.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))? >= 30 {
+                satisfaction::satisfied_edges_on(&tx, task.as_str(), budget)?.map(|edges| edges.into_iter().map(|edge| edge.input()).collect())
+            } else { Some(Vec::new()) },
         };
         tx.commit()?;
         Ok(rows)

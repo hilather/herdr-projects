@@ -109,7 +109,7 @@ impl SqliteStore {
         let mut seen=BTreeSet::new();for p in prepared {validate_inputs(&p.inputs)?;if p.inputs.version!=2 {return Err(invalid("new reservations require effective profile evidence"));}if Path::new(&p.inputs.project_store)!=path||!seen.insert(&p.inputs.task){return Err(invalid("preparation belongs to another store or duplicates a task"));}}
         let opened:u32=self.connection.query_row("PRAGMA user_version",[],|r|r.get(0))?;
         // Ancestry is a process. Prove it before the write transaction so a hang cannot block prepared dispatch.
-        let proofs=if opened>=30 && super::satisfaction::admission_enabled(&self.connection)? {
+        let proofs=if opened>=30 {
             let mut proofs=Vec::with_capacity(prepared.len());
             for preparation in prepared {proofs.push(super::satisfaction::prove_integrated_base(&self.connection,&preparation.inputs,control,budget)?);}
             proofs
@@ -117,8 +117,10 @@ impl SqliteStore {
         if let Some(control)=control {control.check()?;}
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
         let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;if version<13{return Err(StoreError::UnsupportedSchema(version));}
-        // Older stores have no satisfaction rows. The flag stays off until a later signed install.
-        let admission_on=if version>=30 {super::satisfaction::admission_enabled(&tx)?}else{false};
+        // Older stores have no satisfaction rows. Newer stores check dependency
+        // evidence whether or not automatic admission is on: an operator-signed
+        // launch of a released dependent binds the same current satisfactions.
+        let evidence=version>=30;
         if let Some(delegated)=delegated {
             if prepared.len()!=1 || draft { return Err(invalid("delegation requires one exact reservation")); }
             if let Some(result)=super::delegated_reservation::replay(&tx,delegated)? {tx.commit()?;return Ok(Some(result));}
@@ -146,7 +148,7 @@ impl SqliteStore {
         for preparation in prepared {
             let i=&preparation.inputs;if i.scheduler_revision!=scheduler.policy.revision||i.control_epoch!=control.epoch||i.config.digest!=control.config_digest{return Err(StoreError::Conflict);}
             let task=tasks.iter().find(|t|t.id==i.task&&t.revision==i.task_revision).cloned().ok_or(StoreError::Conflict)?;let queue=queued.get(&task.id).ok_or(StoreError::Conflict)?;
-            if !admission_on {
+            if !evidence {
                 if !i.dependencies.is_empty()||!queue.dependencies.is_empty(){return Err(invalid("dependency evidence producers are not available"));}
             } else {
                 let proof=proofs.iter().find(|proof|proof.task==i.task);

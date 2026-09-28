@@ -88,6 +88,8 @@ fn inputs(
     if !binding.identity.repo.is_empty() { paths.insert(PathBuf::from(&binding.identity.repo)); }
     ensure!(paths.len() <= 64, "too many bound repositories");
     let repositories = paths.iter().map(|p|repository(proof,p)).collect::<Result<Vec<_>>>()?;
+    // The grant covers these exact bindings; a still-blocked dependent is not drafted.
+    let dependencies = state.dependencies.clone().context("task dependency is not satisfied; the task is not released")?;
     Ok(LaunchInputs {
         task_contract: None, version: 2, project_store: proof.store_path().to_str().context("project store is not UTF-8")?.into(),
         task: task.id.clone(), task_revision: task.revision,
@@ -96,7 +98,7 @@ fn inputs(
         binding: binding.id.clone(), binding_revision: binding.revision,
         binding_digest: crate::store::ownership::identity_digest(binding)?,
         profile: proof.reference().clone(), config: profile.config.clone(), effective_profile: Some(profile),
-        approval, repositories, dependencies: Vec::new(), memory: Some(selection.knowledge.clone()),
+        approval, repositories, dependencies, memory: Some(selection.knowledge.clone()),
         budget: state.budget.clone(),
     })
 }
@@ -114,6 +116,7 @@ pub(crate) fn seal_admission_inputs(
     dependencies: Vec<DependencyInput>,
     repositories: Vec<RepositoryInput>,
     budget: Option<VersionedReference>,
+    memory: VersionedReference,
 ) -> Result<LaunchInputs, String> {
     if !binding.identity.pane_id.is_empty()
         || !binding.identity.tab_id.is_empty()
@@ -139,8 +142,8 @@ pub(crate) fn seal_admission_inputs(
         approval,
         repositories,
         dependencies,
-        // A store that already has memory records stays unreserved; this wake does not mint a snapshot.
-        memory: None,
+        // The task's retained worker snapshot; this wake does not mint one.
+        memory: Some(memory),
         budget,
     })
 }
