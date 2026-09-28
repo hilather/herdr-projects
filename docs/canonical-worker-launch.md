@@ -337,8 +337,11 @@ same Herdr server may change status meanwhile; no other agent may hold the
 target's name. A lost acknowledgment leaves the naming intent intact.
 `reconcile_start` observes the expected name without renewed authority. If the
 intent is recorded but the exact target agent is still unnamed, recovery sends the
-same rename once more, which is idempotent; a different name is refused. The
-explicit naming service stays one-use. An already-confirmed launch reconciles its
+same rename once more, which is idempotent; a different name is refused. If the
+claim expired before any naming intent was recorded, no rename was sent and none
+may be: recovery closes the launch delivery as a permanent failure with reason
+`start_unnamed` and stops retrying, leaving the running worker and its capacity
+for the operator to cancel. The explicit naming service stays one-use. An already-confirmed launch reconciles its
 receipt directly instead of re-entering creation recovery. Fixture tests cover
 naming success, lost reply, foreign-name refusal, failed event commit before
 submission, two workers on one server, and recovery of an unapplied rename.

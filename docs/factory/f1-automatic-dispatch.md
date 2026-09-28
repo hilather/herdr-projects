@@ -243,10 +243,15 @@ Recorded here rather than folded into the card that found them.
   `integration.job_reset`; the next run rechecks the target, so a still-moved
   ref blocks again untouched. `result jobs` shows the reason and retry hint.
   Still open: jobs advance only on the 15 s ticker cadence.
-- **Naming recovery with no recorded intent loops.** If a start claim expires
-  before the `runtime.launch_name` intent is recorded, recovery has no
-  authority to rename and retries without end. Bound it and surface the
-  attempt for operator reconciliation.
+- **Naming recovery with no recorded intent loops** — done (this PR). If a
+  start claim expired before the `runtime.launch_name` intent was recorded,
+  recovery had no authority to rename and retried without end. Recovery that
+  finds the exact worker without its name, no naming intent and an ambiguous
+  (expired) claim now closes the launch delivery as a permanent failure with
+  reason `start_unnamed` and the `cancel-attempt` remedy, and the controller
+  stops offering it. The worker keeps running and holding capacity until an
+  operator cancels the attempt; nothing is renamed. E2E: the `expired` case of
+  `workers_sharing_one_herdr_server_are_named_independently_and_recover_unapplied_names`.
 - **Integration policy rechecks share one 30 s budget.** Since every acceptance
   policy is rechecked on the candidate, several slow policies can exhaust the
   shared budget and block the job. Give each policy its own bounded budget

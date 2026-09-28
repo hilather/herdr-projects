@@ -41,6 +41,10 @@ impl ControlledStore {
         self.control.check()?;
         self.store.start_selection(operation, expected, &self.work_budget).map_err(|e| self.error(e))
     }
+    pub(crate) fn block_unnamed_start(&mut self, operation: &OperationId, expected: u64, diagnostic: &str, now: i64) -> Result<crate::operations::Delivery> {
+        self.control.check()?;
+        self.store.block_unnamed_start(operation, expected, diagnostic, now, &self.work_budget).map_err(|e| self.error(e))
+    }
     pub(crate) fn record_launch_name(&mut self, claim: &crate::operations::Claim, prepared: &PreparedLaunchName, now: i64) -> Result<u64> {
         self.control.check()?;
         self.store.record_launch_name_with_budget(claim, prepared, now, Some(&self.work_budget)).map_err(|e| self.error(e))

@@ -172,6 +172,21 @@ fn finish_start(
         None => false,
     };
     let rename = allow_name && agent["name"].as_str() != Some(&receipt.agent.name);
+    // The claim expired before any naming intent, so no rename was ever sent
+    // and nothing may send one now. Retrying cannot help: hand it to an operator.
+    if !allow_name
+        && !intent
+        && agent["name"].as_str() != Some(&receipt.agent.name)
+        && delivery.state == crate::operations::DeliveryState::Ambiguous
+    {
+        let diagnostic = format!(
+            "start_unnamed: the launch claim expired before a naming intent was recorded, so worker pane {} was never named and recovery has no authority to name it; the worker keeps running and holding capacity; reconcile it with `hp task <slug> cancel-attempt {}`",
+            target.route.pane_id,
+            record.attempt.as_str()
+        );
+        db.block_unnamed_start(operation, delivery.revision, &diagnostic, now())?;
+        anyhow::bail!("{diagnostic}");
+    }
     if rename || (intent && unnamed) {
         ensure!(unnamed, "refusing to replace an existing agent name");
         let mut candidate = agent.clone();

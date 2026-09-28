@@ -94,7 +94,7 @@ pub(crate) fn read_with_launches(path:&Path,publication:&Publication,budget:&mut
         if version>=11 {
             let mut stmt=tx.prepare("SELECT o.id,d.revision FROM operations o JOIN operation_delivery d ON d.operation_id=o.id
                 JOIN attempt_inputs i ON i.operation_id=o.id JOIN attempts a ON a.id=i.attempt_id
-                WHERE o.kind='runtime.launch' AND d.attempts=1 AND d.state<>'confirmed' AND a.state='reserved' AND a.termination_observed=0
+                WHERE o.kind='runtime.launch' AND d.attempts=1 AND d.state IN ('claimed','ambiguous') AND a.state='reserved' AND a.termination_observed=0
                 AND EXISTS(SELECT 1 FROM events e WHERE e.kind='runtime.launch_creation' AND e.entity=o.id)
                 AND (NOT EXISTS(SELECT 1 FROM events e WHERE e.kind='runtime.launch_target' AND e.entity=o.id)
                     OR (EXISTS(SELECT 1 FROM events e WHERE e.kind='runtime.launch_release' AND e.entity=o.id)

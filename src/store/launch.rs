@@ -124,6 +124,34 @@ impl SqliteStore {
     }
 }
 
+impl SqliteStore {
+    /// Close an expired start that recorded no naming intent. Without the claim
+    /// no service may rename the worker, so recovery cannot finish; the launch
+    /// leaves the recovery queue and waits for an operator. Capacity and the
+    /// running worker are retained.
+    pub(super) fn block_unnamed_start(&mut self, operation: &OperationId, expected: u64, diagnostic: &str, now: i64, budget: &read_budget::ReadBudget) -> Result<Delivery> {
+        budget.check()?;
+        super::delivery::now_check(now)?;
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        check_schema(&tx)?;
+        let delivery = super::delivery::delivery_with_budget(&tx, operation, Some(budget))?;
+        if delivery.revision != expected || delivery.state != DeliveryState::Ambiguous || delivery.attempts != 1 {
+            return Err(StoreError::Conflict);
+        }
+        let kinds = |kind: &str| -> Result<bool> {
+            Ok(tx.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE kind=?1 AND entity=?2)", params![kind, operation.as_str()], |r| r.get(0))?)
+        };
+        if !kinds("runtime.launch_release")? || kinds("runtime.launch_name")? || kinds("runtime.launch_started")? {
+            return Err(StoreError::Conflict);
+        }
+        let outcome = Outcome::PermanentFailure { diagnostic: diagnostic.into() };
+        let result = super::delivery::update_outcome(&tx, &delivery, &outcome, now, "start-recovery")?;
+        budget.check()?;
+        tx.commit()?;
+        Ok(result)
+    }
+}
+
 pub(crate) struct AdvancementSelection {
     pub delivery: Delivery,
     pub record: AttemptInputRecord,

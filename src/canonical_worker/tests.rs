@@ -3008,15 +3008,49 @@ fn workers_sharing_one_herdr_server_are_named_independently_and_recover_unapplie
         let revision = runtime::snapshot(&f.project).unwrap().deliveries.iter().find(|d| d.operation == f.operation.id).unwrap().revision;
         advance_launch(&f.project, &f.operation.id, revision, Instant::now() + Duration::from_secs(15), Default::default()).unwrap()
     };
-    for case in ["shared", "unapplied", "renamed"] {
-        let mut b = Fixture::new("resource-release");
+    for case in ["shared", "unapplied", "renamed", "expired"] {
+        // "expired" loses the gate reply after the release is recorded, so the
+        // launch stops before any naming intent.
+        let mut b = Fixture::new(if case == "expired" { "resource-release-lost" } else { "resource-release" });
         // B's server also lists A, whose status changes between every read.
         fs::write(b._root.path().join("shared-server-agent"), a_agent.display().to_string()).unwrap();
-        if case != "shared" {
+        if case == "unapplied" || case == "renamed" {
             fs::write(b._root.path().join("drop-name-request"), "").unwrap();
         }
         let first = advance_released_launch(&mut b);
         let attempt = runtime::snapshot(&b.project).unwrap().attempts[0].id.clone();
+        if case == "expired" {
+            assert!(first.is_err());
+            assert_eq!((events(&b, "runtime.launch_release"), events(&b, "runtime.launch_name")), (1, 0));
+            // The claim expires before the naming service ever runs.
+            let lease = runtime::snapshot(&b.project).unwrap().deliveries.iter().find(|d| d.operation == b.operation.id).unwrap().lease_until_ms.unwrap();
+            assert_eq!(migration::open_active(&b.project).unwrap().expire_claims(lease).unwrap(), 1);
+            let error = resume_launch(&b).unwrap_err();
+            assert!(format!("{error:#}").contains("start_unnamed"), "{error:#}");
+            // Recovery stops: the launch is no longer offered, and is surfaced
+            // with a durable reason while the worker keeps its capacity.
+            let deadline = Instant::now() + Duration::from_secs(15);
+            for turn in 0..8 {
+                let mut budget = crate::store::identity_inventory::Budget::new(2 * 1024 * 1024, 1024, deadline, Default::default()).unwrap();
+                let hint = migration::read_controller_dispatch_hint(&b.project, &mut budget, turn, now(), true).unwrap();
+                assert!(hint.is_none_or(|h| h.operation.id != b.operation.id), "blocked launch offered again");
+            }
+            let state = runtime::snapshot(&b.project).unwrap();
+            let delivery = state.deliveries.iter().find(|d| d.operation == b.operation.id).unwrap();
+            assert_eq!(delivery.state, DeliveryState::PermanentFailure);
+            match &delivery.last_outcome {
+                Some(crate::operations::Outcome::PermanentFailure { diagnostic }) => {
+                    assert!(diagnostic.starts_with("start_unnamed:") && diagnostic.contains(&format!("cancel-attempt {}", attempt.as_str())), "{diagnostic}");
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(state.attempts[0].state, crate::domain::AttemptState::Reserved);
+            assert!(!state.attempts[0].termination_observed);
+            // Nothing was renamed without an intent.
+            assert_eq!((requests(&b), name(&b)), (0, Value::Null));
+            assert_eq!((events(&b, "runtime.launch_name"), events(&b, "runtime.launch_started")), (0, 0));
+            continue;
+        }
         if case == "shared" {
             let receipt = first.unwrap_or_else(|e| panic!("{e:#}")).unwrap();
             assert_eq!(receipt.attempt, attempt);
