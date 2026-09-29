@@ -2,8 +2,9 @@
 
 Owned by lane D ([phase2-lanes.md](phase2-lanes.md)); common rules are
 [contracts.md](contracts.md) §0 and §7. Plan doc 06 §2 (TM3.1), doc 07 §5
-(M20–M24), doc 10 §5. Canonical migration `0054_review_capture.sql` (schema
-54); store API `src/store/review_capture.rs`; CLI
+(M20–M24), doc 10 §5. Canonical migrations `0054_review_capture.sql` (schema
+54) and `0055_finding_triage.sql` (schema 55, §5); store API
+`src/store/review_capture.rs` and `src/store/finding_triage.rs`; CLI
 `telemetry <slug> review ...` (`src/telemetry/review/`). Sidecar stream
 `review` has no tables yet. Nothing about reviews comes from the Codex
 adapter (contracts-collection.md A3).
@@ -46,7 +47,8 @@ only: no source, diff, brief, prompt or review text is stored anywhere.
 - **Completion** `review_completions`: at most one per session, from the
   reviewer's receipt `review_receipt.v1` `{schema, session_id, submission_id,
   candidate_oid, outcome, reason?, findings[], evidence[]}` (unknown fields
-  refuse the receipt, ≤64 KiB). `outcome` ∈ `completed`, `incomplete`,
+  refuse the receipt, ≤64 KiB). Since 0055 a `findings` entry may also be
+  `{ref, title}` (§5); any other key in it refuses the receipt. `outcome` ∈ `completed`, `incomplete`,
   `failed`, `timed_out`, `interrupted`; a completed review has no reason,
   others one of `budget_exhausted`, `reviewer_error`, `scope_unavailable`,
   `operator_stopped`, `unspecified` (default). `findings` are
@@ -124,8 +126,108 @@ never 0.
   failed, timed-out or interrupted sessions never count as completed; an
   empty denominator is `null` with `empty_denominator`; a store before 0054
   `unavailable: review_capture_absent`.
-- **M21–M24** need accepted decisions: `unavailable:
-  no_reviewer_authority_producer`.
+- **M22 proposal validation rate** and **M23 duplicate-report share**
+  (`M22.v1`, `M23.v1`, `basis: owner_triage`, `trust: operator_owner.v1`):
+  §5.
+- **M21** (sum of discovery credit) and **M24** (M21 per review cost) are
+  `unavailable: discovery_credit_unallocated`: no role-specific credit
+  allocation (TM3.3) or review lifecycle cost exists. M21 carries a labeled
+  `drilldown.validated_unique_findings` count, never as its value.
 
 Also in `telemetry <slug> report` and the fleet pane through the lane metrics
 hook.
+
+## 5. Finding triage and duplicate history (TM3.2, card D2)
+
+Canonical migration `0055_finding_triage.sql`; store API
+`src/store/finding_triage.rs`; CLI `telemetry <slug> review findings
+show|validate|reject|duplicate|reset|split|restore|merge|unmerge`.
+
+**Authority decision.** A reviewer's report is always a proposal. The only
+triage principal is `operator:cli`, the project owner at the CLI, recorded
+with authority `operator_owner.v1`. The owner already holds every project
+decision at the CLI (operator dispatch, operator candidate selection), so
+this needs no delegation. No delegated or scoped reviewer authority exists
+(§2); until one does, `SqliteStore` refuses every other principal, writing
+nothing: a worker (`worker:*` or any attempt's identity, including the
+reviewing and authoring attempts), an import (`import:*`), or any other name.
+A trigger and CHECKs repeat the rule on raw rows. Review acceptance (§2)
+stays inactive: triage decides findings, not reviews.
+
+**Records**, all append-only (every UPDATE/DELETE aborts). One ledger,
+`finding_log(seq, kind, principal, authority, expected_seq,
+recorded_unix_ms)`, orders every change. Its `seq` is the replay watermark.
+`kind` `submitted` has `authority = proposal`; every other kind needs
+`operator:cli` with `operator_owner.v1`. Detail rows share the ledger's `seq`:
+
+- **Submission** `finding_submissions`: one per `finding:<ref>` of a review
+  completion, written in the completion's transaction (`submitted`).
+  Completions recorded before 0055 are backfilled in completion order.
+  `(session_id, finding_ref)` is unique. The reference must be in that
+  completion's `finding_refs` (trigger). `source = review_receipt`, `trust =
+  proposal`. The optional `title` is a contracts §7 excerpt (rules 1–5,
+  `crate::domain::excerpt`, ≤160) of the receipt's `{ref, title}` entry. A
+  title enters the receipt digest only when present, so untitled D1 receipts
+  keep their digests. `review complete` returns `finding_submissions` ids.
+- **Claims** `finding_claim_sets` + `finding_claims`: revisioned atomic claims
+  beneath an unchanged submission. `initial` is revision 1 with one claim.
+  `split` makes a new revision of 2–32 claims, each with an optional title
+  excerpt. `restore` makes an earlier initial or split revision current again
+  with its same claims, so their decisions return: a split is reversible.
+  Only the current revision's claims can be decided.
+- **Canonical finding** `canonical_findings`: identity `finding:canonical-<seq>`
+  (the minting decision's `seq`, usable as a `finding:` reference in
+  `prior_findings`). It is minted by a `validated` decision with `--new`, and
+  its title is the owner's excerpt or the claim's.
+- **Decision** `finding_decisions`: `validated` (a finding, ≥1 evidence
+  reference, `severity` ∈ critical/high/medium/low/informational under
+  `finding_severity.v1`), `rejected` (`insufficient_evidence`,
+  `intended_behavior`, `out_of_scope`), `duplicate` (of an existing finding),
+  or `pending` (a correction back to pending: `reopened` or
+  `decided_in_error`). Evidence uses the §1 reference forms. A later decision
+  on a claim supersedes the earlier one (`supersedes`) and never deletes it.
+- **Relationship** `finding_relationships`: `merge` source → target (same
+  root cause). It is refused when the source is already merged or both are
+  already one group, so no cycle forms. `unmerge` reverses exactly one active
+  merge.
+
+`--expect-seq N` refuses any write unless the ledger head is still `N`.
+
+**Derived state** (`finding_state(db, as_of)`, `review findings show
+[--as-of SEQ]`) replays the ledger up to `SEQ` (default the head, refused
+beyond it) on a strictly read-only connection. The same ledger gives the
+same state at every sequence, so the current view and every historical view
+are reproducible.
+
+- Each submission's claims are its current claim revision at `SEQ`. Each
+  claim's decision is its latest decision at `SEQ` (none means `pending`).
+- Groups: a finding's root follows the merges active at `SEQ`. Among the
+  claims validated into one root, the earliest (submission `seq`, then claim
+  ordinal) is the discovery and stays `validated`. Every later one is
+  derived `duplicate`, so several titles for one defect give one unique
+  finding. `decided` keeps the recorded decision; `outcome` is the derived one.
+- A submission is `pending` while any claim is pending. Otherwise it has one
+  exclusive outcome: `validated_only`, `rejected_only`, `duplicate_only` or
+  `mixed`. `has_validated_claim` means at least one validated claim, so a
+  mixed submission can count. A split never adds submissions.
+- A finding's `status` is `validated` (a root with a discovery claim),
+  `merged`, or `unvalidated`. `unique_findings` counts the `validated` ones.
+- `history` lists every ledger row up to `SEQ` with its subject.
+
+**Metrics** (`review report`, `telemetry <slug> report`), over original
+submissions windowed by arrival (`--since`):
+
+- M22 = submissions with `has_validated_claim` / adjudicated submissions.
+- M23 = `duplicate_only` / adjudicated submissions.
+
+Both show `buckets` (the four outcomes), `pending` (outside the
+denominator), `claim_drilldown` (labeled claim counts) and `as_of_seq`. An
+empty denominator is `null` with `empty_denominator`, and a store before
+0055 gives `unavailable: finding_triage_absent`. Merge, unmerge, split and
+restore recompute the buckets without changing the number of submissions.
+
+Not built: finding occurrences on later artifacts and reopen lineage (TM3.3),
+discovery or other role credit (M21/M24), conflict records between
+submissions, imports of third-party review comments (any such producer can
+only write submissions), and a scoped reviewer-authority grant that would let
+a principal other than the owner triage.

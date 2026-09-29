@@ -9,6 +9,7 @@
 use super::*;
 use crate::domain::agent_configuration;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub const OPPORTUNITY_SCHEMA: &str = "review_opportunity.v1";
 pub const SESSION_SCHEMA: &str = "review_session.v1";
@@ -111,6 +112,8 @@ pub struct ReviewCompletion {
     pub completed_unix_ms: i64,
     /// True when an identical receipt was already recorded.
     pub replayed: bool,
+    /// The finding submission of each reference (store schema 55 and later).
+    pub finding_submissions: Vec<i64>,
 }
 
 /// The reviewer's receipt. Unknown fields (e.g. a self-declared `accepted`)
@@ -125,10 +128,36 @@ struct Receipt {
     outcome: String,
     #[serde(default)]
     reason: Option<String>,
+    /// `finding:<ref>`, or `{"ref": "finding:<ref>", "title": "..."}` (the
+    /// title is kept only as a contracts §7 excerpt). Nothing else: a finding
+    /// entry that carries a decision or severity is refused.
     #[serde(default)]
-    findings: Vec<String>,
+    findings: Vec<serde_json::Value>,
     #[serde(default)]
     evidence: Vec<String>,
+}
+
+/// Finding references of a receipt, and the excerpted title of each titled one.
+fn receipt_findings(entries: &[serde_json::Value]) -> Result<(Vec<String>, BTreeMap<String, String>)> {
+    let mut refs = Vec::with_capacity(entries.len());
+    let mut titles = BTreeMap::new();
+    for entry in entries {
+        match entry {
+            serde_json::Value::String(r) => refs.push(r.clone()),
+            serde_json::Value::Object(map) => {
+                if let Some(field) = map.keys().find(|k| !["ref", "title"].contains(&k.as_str())) { return Err(invalid(format!("invalid review receipt: unknown field `{field}` in a finding"))); }
+                let Some(r) = map.get("ref").and_then(|v| v.as_str()) else { return Err(invalid("invalid review receipt: a finding object needs a string `ref`".into())) };
+                match map.get("title") {
+                    None | Some(serde_json::Value::Null) => {}
+                    Some(serde_json::Value::String(t)) => { if let Some(t) = super::finding_triage::title_excerpt(t) { titles.insert(r.to_owned(), t); } }
+                    Some(_) => return Err(invalid("invalid review receipt: a finding title is a string".into())),
+                }
+                refs.push(r.to_owned());
+            }
+            _ => return Err(invalid("invalid review receipt: a finding is a reference or {ref, title}".into())),
+        }
+    }
+    Ok((refs, titles))
 }
 
 fn invalid(message: String) -> StoreError { StoreError::Invalid(message) }
@@ -334,7 +363,8 @@ impl SqliteStore {
             (_, Some(reason)) if END_REASONS.contains(&reason.as_str()) => Some(reason),
             (_, Some(reason)) => return Err(invalid(format!("unknown review end reason {reason}"))),
         };
-        let findings = refs(&r.findings, finding_ref, MAX_FINDINGS, "finding")?;
+        let (findings, titles) = receipt_findings(&r.findings)?;
+        let findings = refs(&findings, finding_ref, MAX_FINDINGS, "finding")?;
         let evidence = refs(&r.evidence, evidence_ref, MAX_REFS, "evidence")?;
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         schema_54(&tx)?;
@@ -344,24 +374,30 @@ impl SqliteStore {
         if r.submission_id != submission || r.candidate_oid != candidate {
             return Err(invalid(format!("review receipt names another candidate: session {} reviews submission {submission} at {candidate}", r.session_id)));
         }
-        let receipt_digest = digest(&serde_json::json!({"candidate_oid": candidate, "evidence": evidence, "findings": findings, "outcome": r.outcome,
-            "reason": reason, "schema": RECEIPT_SCHEMA, "session_id": r.session_id, "submission_id": submission}).to_string());
+        let mut normalized = serde_json::json!({"candidate_oid": candidate, "evidence": evidence, "findings": findings, "outcome": r.outcome,
+            "reason": reason, "schema": RECEIPT_SCHEMA, "session_id": r.session_id, "submission_id": submission});
+        // Titles enter the digest only when present, so untitled receipts keep their digest.
+        if !titles.is_empty() { normalized["titles"] = serde_json::json!(titles); }
+        let receipt_digest = digest(&normalized.to_string());
         let existing: Option<(String, String, i64)> = tx.query_row("SELECT receipt_digest,recorder_principal,completed_unix_ms FROM review_completions WHERE session_id=?1", [&r.session_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).optional()?;
-        let (recorder, completed_at, replayed) = match existing {
+        let (recorder, completed_at, replayed, submissions) = match existing {
             Some((stored, _, _)) if stored != receipt_digest => return Err(invalid(format!("review session {} already has a different completion", r.session_id))),
-            Some((_, recorder, at)) => (recorder, at, true),
+            Some((_, recorder, at)) => (recorder, at, true, super::finding_triage::session_submissions(&tx, &r.session_id)?),
             None => {
                 tx.execute("INSERT INTO review_completions(session_id,outcome,reason,submission_id,candidate_oid,findings_submitted,finding_refs,evidence_refs,coverage_basis,trust,receipt_digest,recorder_principal,completed_unix_ms)
                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'declared','proposal',?9,?10,?11)",
                     params![r.session_id, r.outcome, reason, submission, candidate, findings.len() as i64, serde_json::json!(findings).to_string(), serde_json::json!(evidence).to_string(), receipt_digest, principal, now])?;
+                // Each finding reference becomes a submission (a proposal) once the store has finding triage.
+                let version: u32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+                let submissions = if version >= 55 { super::finding_triage::record_submissions(&tx, &r.session_id, &findings, &titles, principal, now)? } else { Vec::new() };
                 tx.commit()?;
-                (principal.to_owned(), now, false)
+                (principal.to_owned(), now, false, submissions)
             }
         };
         Ok(ReviewCompletion { session_id: r.session_id, outcome: r.outcome, reason, submission_id: submission, candidate_oid: candidate, findings_submitted: findings.len(),
             finding_refs: findings, evidence_refs: evidence, coverage_basis: "declared".into(), trust: "proposal".into(), receipt_digest,
-            recorder_principal: recorder, completed_unix_ms: completed_at, replayed })
+            recorder_principal: recorder, completed_unix_ms: completed_at, replayed, finding_submissions: submissions })
     }
 
     /// Privileged acceptance of a session's completion. Inactive: no canonical

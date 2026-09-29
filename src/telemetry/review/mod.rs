@@ -3,7 +3,7 @@
 //! Hooks registered centrally in `super::LANES`; this lane adds subcommands,
 //! metrics, tick work and `migrations/telemetry/review/NNNN_*.sql` here only.
 //! Writes go through the canonical store (`SqliteStore`, one `state.db`
-//! transaction each); `show`, `present`, `report` and the metrics hook read
+//! transaction each); `show`, `present`, `report`, `findings show` and the metrics hook read
 //! `state.db` strictly read-only.
 use anyhow::{Context, Result};
 use rusqlite::OptionalExtension;
@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::store::{ReviewAssignmentChoice, ReviewOpportunitySpec, SqliteStore};
+use crate::store::{FindingSummary, FindingTarget, ReviewAssignmentChoice, ReviewOpportunitySpec, SqliteStore, TriageOutcome, TriageRequest, finding_state};
 
 pub const STREAM: &str = "review";
 /// `include_str!` of `migrations/telemetry/review/`, in order; index + 1 is the stream version.
@@ -22,6 +22,10 @@ const OPERATOR: &str = "operator:cli";
 /// Why acceptance and every accepted-quality metric are inactive.
 const INACTIVE: &str = "no_reviewer_authority_producer";
 const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
+/// Recorded on the owner's finding triage (contracts-review.md §5).
+const TRIAGE_AUTHORITY: &str = "operator_owner.v1";
+/// M21 and M24 need role-specific discovery credit allocations (TM3.3), and M24 review cost.
+const NO_CREDIT: &str = "discovery_credit_unallocated";
 
 /// `herdr-projects telemetry <slug> review ...`
 #[derive(clap::Subcommand)]
@@ -88,12 +92,109 @@ pub enum Command {
         #[arg(long)]
         since: Option<i64>,
     },
-    /// Lane metrics (M20; M21-M24 inactive) as JSON. Read-only.
+    /// Lane metrics (M20, M22, M23; M21 and M24 unavailable) as JSON. Read-only.
     Report {
-        /// Window start (Unix ms), by the assignment (unassigned: by creation).
+        /// Window start (Unix ms), by the assignment (unassigned: by creation;
+        /// finding submissions: by arrival).
         #[arg(long)]
         since: Option<i64>,
     },
+    /// Finding submissions, claims, triage and duplicate history.
+    #[command(subcommand)]
+    Findings(FindingsCommand),
+}
+
+/// `herdr-projects telemetry <slug> review findings ...`. Every write is a
+/// triage decision or correction by `operator:cli`, the project owner.
+#[derive(clap::Subcommand)]
+pub enum FindingsCommand {
+    /// Submissions, claims, canonical findings and history replayed to a
+    /// history sequence, as JSON. Read-only.
+    Show {
+        /// Replay the history only up to this sequence (default: its head).
+        #[arg(long)]
+        as_of: Option<i64>,
+    },
+    /// Validate a claim: mint a new canonical finding (`--new`) or link an existing one (`--finding`).
+    Validate {
+        claim: i64,
+        #[arg(long, conflicts_with = "finding", required_unless_present = "finding")]
+        new: bool,
+        /// Title of the new canonical finding (kept as a contracts §7 excerpt).
+        #[arg(long, requires = "new")]
+        title: Option<String>,
+        #[arg(long)]
+        finding: Option<String>,
+        /// `critical`, `high`, `medium`, `low` or `informational` (finding_severity.v1).
+        #[arg(long)]
+        severity: String,
+        #[command(flatten)]
+        common: DecisionArgs,
+    },
+    /// Reject a claim: `insufficient_evidence`, `intended_behavior` or `out_of_scope`.
+    Reject {
+        claim: i64,
+        #[arg(long)]
+        reason: String,
+        #[command(flatten)]
+        common: DecisionArgs,
+    },
+    /// Mark a claim a duplicate of an existing canonical finding.
+    Duplicate {
+        claim: i64,
+        #[arg(long)]
+        of: String,
+        #[command(flatten)]
+        common: DecisionArgs,
+    },
+    /// Return a claim to pending (`reopened` or `decided_in_error`).
+    Reset {
+        claim: i64,
+        #[arg(long)]
+        reason: Option<String>,
+        #[command(flatten)]
+        common: DecisionArgs,
+    },
+    /// Split a submission into claims, one `--claim TITLE` each (2 to 32).
+    Split {
+        submission: i64,
+        #[arg(long = "claim", required = true)]
+        claims: Vec<String>,
+        #[arg(long)]
+        expect_seq: Option<i64>,
+    },
+    /// Make an earlier claim revision of a submission current again.
+    Restore {
+        submission: i64,
+        #[arg(long)]
+        revision: i64,
+        #[arg(long)]
+        expect_seq: Option<i64>,
+    },
+    /// Merge canonical finding SOURCE into TARGET (same root cause).
+    Merge {
+        source: String,
+        #[arg(long)]
+        into: String,
+        #[arg(long)]
+        expect_seq: Option<i64>,
+    },
+    /// Reverse the merge recorded at history sequence SEQ.
+    Unmerge {
+        seq: i64,
+        #[arg(long)]
+        expect_seq: Option<i64>,
+    },
+}
+
+#[derive(clap::Args)]
+pub struct DecisionArgs {
+    /// `sha256:<hex64>` or `verification_run:<hex64>`, repeatable.
+    #[arg(long = "evidence")]
+    evidence: Vec<String>,
+    /// Refuse unless the finding history head is still this sequence.
+    #[arg(long)]
+    expect_seq: Option<i64>,
 }
 
 /// The command's stdout.
@@ -125,8 +226,38 @@ pub fn run(project: &Path, command: Command) -> Result<String> {
         Command::Present { opportunity } => present(project, &opportunity)?,
         Command::Show { since } => show(project, since)?,
         Command::Report { since } => json!({"metrics": metrics(project, since)?, "since_unix_ms": since}),
+        Command::Findings(command) => findings(project, command, now)?,
     };
     Ok(serde_json::to_string_pretty(&value)? + "\n")
+}
+
+fn findings(project: &Path, command: FindingsCommand, now: i64) -> Result<Value> {
+    let open = || SqliteStore::open(&project.join(".state/state.db"));
+    let decide = |claim: i64, outcome: TriageOutcome, common: DecisionArgs| -> Result<Value> {
+        let request = TriageRequest { outcome, evidence: common.evidence, expected_seq: common.expect_seq };
+        Ok(json!({"event": open()?.triage_finding_claim(claim, &request, OPERATOR, now)?}))
+    };
+    match command {
+        FindingsCommand::Show { as_of } => {
+            let db = read(project)?.context("finding triage needs store schema 55")?;
+            let state = finding_state(&db, as_of)?.context("finding triage needs store schema 55")?;
+            Ok(json!({"findings": state}))
+        }
+        FindingsCommand::Validate { claim, new, title, finding, severity, common } => {
+            let target = match finding { Some(id) if !new => FindingTarget::Existing(id), _ => FindingTarget::New { title } };
+            decide(claim, TriageOutcome::Validated { target, severity }, common)
+        }
+        FindingsCommand::Reject { claim, reason, common } => decide(claim, TriageOutcome::Rejected { reason }, common),
+        FindingsCommand::Duplicate { claim, of, common } => decide(claim, TriageOutcome::Duplicate { of }, common),
+        FindingsCommand::Reset { claim, reason, common } => decide(claim, TriageOutcome::Pending { reason }, common),
+        FindingsCommand::Split { submission, claims, expect_seq } => {
+            let titles: Vec<Option<String>> = claims.into_iter().map(Some).collect();
+            Ok(json!({"event": open()?.split_finding_submission(submission, &titles, expect_seq, OPERATOR, now)?}))
+        }
+        FindingsCommand::Restore { submission, revision, expect_seq } => Ok(json!({"event": open()?.restore_finding_claims(submission, revision, expect_seq, OPERATOR, now)?})),
+        FindingsCommand::Merge { source, into, expect_seq } => Ok(json!({"event": open()?.merge_findings(&source, &into, expect_seq, OPERATOR, now)?})),
+        FindingsCommand::Unmerge { seq, expect_seq } => Ok(json!({"event": open()?.unmerge_findings(seq, expect_seq, OPERATOR, now)?})),
+    }
 }
 
 fn unavailable(reason: &str) -> Value { json!({"status": "unavailable", "reason": reason}) }
@@ -217,7 +348,7 @@ fn ratio(numerator: usize, denominator: usize) -> Value {
 
 /// Metrics merged into `telemetry <slug> report` (`super::metrics::report`).
 /// M20 review completion over assigned opportunities (declared coverage);
-/// M21-M24 need accepted decisions and are inactive.
+/// M22/M23 over fully triaged submissions; M21/M24 need discovery credit.
 pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> {
     let mut m20 = json!({"definition": "M20.v1", "name": "review_completion", "basis": "declared", "trust": "proposal"});
     match read(project)? {
@@ -245,9 +376,35 @@ pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Va
         }
     }
     let mut out = BTreeMap::from([("M20".to_owned(), m20)]);
-    for (id, name) in [("M21", "validated_unique_findings"), ("M22", "proposal_validation_rate"), ("M23", "duplicate_report_share"), ("M24", "review_discovery_efficiency")] {
-        out.insert(id.to_owned(), json!({"definition": format!("{id}.v1"), "name": name, "value": unavailable(INACTIVE)}));
+    // M22/M23 over original submissions, from the owner's triage (contracts-review.md §5).
+    let triage = match read(project)? { Some(db) => finding_state(&db, None)?, None => None };
+    let mut m22 = json!({"definition": "M22.v1", "name": "proposal_validation_rate", "basis": "owner_triage", "trust": TRIAGE_AUTHORITY});
+    let mut m23 = json!({"definition": "M23.v1", "name": "duplicate_report_share", "basis": "owner_triage", "trust": TRIAGE_AUTHORITY});
+    let mut unique = unavailable("finding_triage_absent");
+    match &triage {
+        None => for m in [&mut m22, &mut m23] { m["value"] = unavailable("finding_triage_absent"); },
+        Some(state) => {
+            let s = FindingSummary::of(state.submissions.iter().filter(|x| since.is_none_or(|at| x.recorded_unix_ms >= at)));
+            let buckets = json!({"validated_only": s.validated_only, "rejected_only": s.rejected_only, "duplicate_only": s.duplicate_only, "mixed": s.mixed});
+            for (m, numerator) in [(&mut m22, s.has_validated_claim), (&mut m23, s.duplicate_only)] {
+                m["numerator"] = json!(numerator);
+                m["denominator"] = json!(s.adjudicated);
+                m["value"] = ratio(numerator, s.adjudicated);
+                if s.adjudicated == 0 { m["reason"] = json!("empty_denominator"); }
+                m["buckets"] = buckets.clone();
+                m["pending"] = json!(s.pending);
+                m["claim_drilldown"] = json!(s.claims);
+                m["as_of_seq"] = json!(state.as_of_seq);
+            }
+            unique = json!(state.unique_findings);
+        }
     }
+    out.insert("M22".to_owned(), m22);
+    out.insert("M23".to_owned(), m23);
+    // M21 sums discovery credit, and M24 divides it by review cost: neither is allocated yet.
+    out.insert("M21".to_owned(), json!({"definition": "M21.v1", "name": "validated_unique_findings", "value": unavailable(NO_CREDIT),
+        "drilldown": {"validated_unique_findings": unique}}));
+    out.insert("M24".to_owned(), json!({"definition": "M24.v1", "name": "review_discovery_efficiency", "value": unavailable(NO_CREDIT)}));
     Ok(out)
 }
 
