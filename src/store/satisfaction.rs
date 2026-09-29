@@ -846,18 +846,25 @@ fn revision_at_reservation(db: &Connection, attempt_id: &str, task_id: &str) -> 
     )?)
 }
 
-pub(super) fn overlap_with_retained_with_budget(db:&Connection,task_id:&str,attempts:&[Attempt],budget:Option<&read_budget::ReadBudget>)->Result<bool> {
+/// The first retained holder whose claims overlap `task_id`'s, as bounded
+/// display text: both claims (kind, resource excerpt, access) and the holder's
+/// task and attempt ids. Never file content.
+pub(super) fn overlap_with_retained_with_budget(db:&Connection,task_id:&str,attempts:&[Attempt],budget:Option<&read_budget::ReadBudget>)->Result<Option<String>> {
     let version: u32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version < 35 {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(revision) = latest_contract_revision(db, task_id)? else {
-        return Ok(false);
+        return Ok(None);
     };
     let candidate = claim_rows(db, task_id, revision,budget)?;
     if candidate.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
+    let show = |claim: &ResourceClaim| {
+        let resource: String = claim.resource.chars().map(|c| if c.is_control() { '?' } else { c }).take(128).collect();
+        format!("{} {} ({})", claim.kind, resource, claim.access)
+    };
     for attempt in attempts {
         if !attempt.retains_capacity() || attempt.task.as_str() == task_id {
             continue;
@@ -866,11 +873,13 @@ pub(super) fn overlap_with_retained_with_budget(db:&Connection,task_id:&str,atte
             continue;
         };
         let held = claim_rows(db, attempt.task.as_str(), held_revision,budget)?;
-        if candidate.iter().any(|claim| held.iter().any(|other| claims_conflict(claim, other))) {
-            return Ok(true);
+        for claim in &candidate {
+            if let Some(other) = held.iter().find(|other| claims_conflict(claim, other)) {
+                return Ok(Some(format!("{} overlaps {} held by task {} attempt {}", show(claim), show(other), attempt.task.as_str(), attempt.id.as_str())));
+            }
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 fn git_tree(repository: &str, commit: &str, control: Option<&super::controlled::ReadControl>) -> Option<String> {

@@ -179,8 +179,9 @@ impl SqliteStore {
         // holder stays on the revision current when that attempt was reserved.
         // Disabling automatic dispatch does not waive canonical resource
         // ownership for explicit owner or delegated reservations and drafts.
-        if super::satisfaction::overlap_with_retained_with_budget(&tx, inputs.task.as_str(), &attempts,budget)? {
-            return Err(invalid("resource_conflict"));
+        // The stable code stays the prefix; the detail names the holder and both claims.
+        if let Some(overlap)=super::satisfaction::overlap_with_retained_with_budget(&tx, inputs.task.as_str(), &attempts,budget)? {
+            return Err(invalid(&format!("resource_conflict: {overlap}")));
         }
         if draft {return Ok(None);}
         if version>=43 {tx.execute("DELETE FROM admission_scan_cursor",[])?;}

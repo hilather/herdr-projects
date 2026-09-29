@@ -311,9 +311,12 @@ fn owner_draft_and_reserve_refuse_an_overlapping_write_scope_with_admission_off(
     let approval = f.approve(&first);
     f.ok(&strs(&f.reserve_args(&first, &approval)));
     assert_eq!(f.inspect()["available_slots"], 1);
+    let holder = f.attempts()[0].id.as_str().to_owned();
     for args in [f.draft_args(&second), f.reserve_args(&second, &granted)] {
         let refused = f.refused(&strs(&args));
-        assert!(refused.contains("resource_conflict"), "{refused}");
+        // The stable code first, then the holder and the overlapping claims.
+        let detail = format!("resource_conflict: path shared.txt (write) overlaps path shared.txt (write) held by task first attempt {holder}");
+        assert!(refused.contains(&detail), "{refused}");
     }
     assert_eq!(f.attempts().len(), 1);
 }
