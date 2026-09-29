@@ -19,7 +19,8 @@ needs a new reviewed revision, not a silent reinterpretation.
 - Lane contracts, each owned by its lane: collection
   ([contracts-collection.md](contracts-collection.md)), accounting
   ([contracts-accounting.md](contracts-accounting.md)), quality
-  ([contracts-quality.md](contracts-quality.md)).
+  ([contracts-quality.md](contracts-quality.md)), review
+  ([contracts-review.md](contracts-review.md)).
 
 ## 0. Common rules
 
@@ -35,7 +36,7 @@ needs a new reviewed revision, not a silent reinterpretation.
   (RFC 8785 subset, as doc 03 §4). Digests are `sha256:` + lowercase hex.
 - **Time.** Unix milliseconds from the controller's `now` at the transition.
   Codex times are kept as reported and never reorder canonical events.
-- **Stores.** Canonical: `<project>/.state/state.db`, migrations 0049–0053 (0052 collector bindings, contracts-collection.md; 0053 candidate groups, contracts-quality.md §3).
+- **Stores.** Canonical: `<project>/.state/state.db`, migrations 0049–0054 (0052 collector bindings, contracts-collection.md; 0053 candidate groups, contracts-quality.md §3; 0054 review capture, contracts-review.md).
   Sidecar: `<project>/.state/telemetry.db`, own sequence under
   `migrations/telemetry/`, mode 0600, created on first collect. No
   cross-database transaction or foreign key; sidecar rows reference canonical
@@ -486,4 +487,7 @@ staleness (M50); resume/compaction reconciliation beyond quarantine.
 Landed since phase 1 (see the lane contracts): collector bindings
 (contracts-collection.md), usage ledger, session graph and rate-card
 estimates (contracts-accounting.md §2–§4), proxy signals and integration
-outcomes (contracts-quality.md §1–§2).
+outcomes, candidate groups and selection (contracts-quality.md §1–§4),
+attention intervals (contracts-accounting.md §6), Codex session metadata
+(contracts-collection.md A4), review opportunities, sessions and completions
+(contracts-review.md).
