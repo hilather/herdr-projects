@@ -187,11 +187,13 @@ fn reread(db: &Connection) -> Result<std::collections::BTreeSet<String>> {
     Ok(sources.into_iter().filter(|(_, version)| certified(version)).map(|(key, _)| key).collect())
 }
 
-/// Sources with a session read before the A4 metadata existed (ingest 0004):
-/// no `rollout_metadata` row although their `session_meta` was stored.
+/// Sources with a session read before the A4 metadata (ingest 0004) or the A5
+/// thread lineage (ingest 0005) existed: no `rollout_metadata` or no
+/// `rollout_threads` row although their `session_meta` was stored.
 fn backfill(db: &Connection) -> Result<std::collections::BTreeSet<String>> {
     Ok(db.prepare("SELECT s.path_digest FROM rollout_sources s JOIN collect_offsets o ON o.path_digest=s.path_digest
-        WHERE NOT EXISTS(SELECT 1 FROM rollout_metadata m WHERE m.path_digest=s.path_digest)")?
+        WHERE NOT EXISTS(SELECT 1 FROM rollout_metadata m WHERE m.path_digest=s.path_digest)
+        OR NOT EXISTS(SELECT 1 FROM rollout_threads t WHERE t.path_digest=s.path_digest)")?
         .query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)
 }
 
@@ -353,6 +355,7 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
         _ => {
             tx.execute("DELETE FROM rollout_sources WHERE path_digest=?1", [&key])?;
             tx.execute("DELETE FROM rollout_metadata WHERE path_digest=?1", [&key])?;
+            tx.execute("DELETE FROM rollout_threads WHERE path_digest=?1", [&key])?;
             Cursor { offset: 0, records: 0, rate_limits: 0, model: None, effort: None, session: None }
         }
     };
@@ -465,6 +468,12 @@ fn record(tx: &Transaction, tag: &Tag, line: &[u8], key: &str, home: &str, workt
                 VALUES(?1,?2,?3,?4,?5,?6)", params![key, text("model_provider", sanitize::Class::Text), text("forked_from_id", sanitize::Class::Id),
                     text("subagent_kind", sanitize::Class::Tag), text("subagent_parent_thread_id", sanitize::Class::Id),
                     sanitize::field(&raw, "subagent_depth", sanitize::Class::Number).as_i64()])?;
+            // A5 thread lineage (contracts-collection.md), as leniently. A guardian
+            // names its parent in `parent_thread_id` and reports the parent's id as
+            // `session_id`; its usage stays keyed by its own `id` (below).
+            tx.execute("INSERT OR REPLACE INTO rollout_threads(path_digest,parent_thread_id,session_id,thread_source) VALUES(?1,?2,?3,?4)",
+                params![key, text("parent_thread_id", sanitize::Class::Id), text("session_id", sanitize::Class::Id).filter(|id| *id != meta.id),
+                    text("thread_source", sanitize::Class::Tag)])?;
             cursor.session = Some((meta.id, meta.cli_version, at));
         }
         (Some("turn_context"), _) => {
@@ -474,6 +483,8 @@ fn record(tx: &Transaction, tag: &Tag, line: &[u8], key: &str, home: &str, workt
             };
             (cursor.model, cursor.effort) = (payload.model, payload.effort);
         }
+        // Keyed by the rollout's own `session_meta.id`, never the record's
+        // `session_id`: a guardian's records report its parent's (A5).
         (Some("token_usage_record"), _) => {
             let Ok(Envelope { payload: record }) = serde_json::from_slice::<Envelope<UsageRecord>>(line) else { return Ok(false) };
             cursor.records += 1;

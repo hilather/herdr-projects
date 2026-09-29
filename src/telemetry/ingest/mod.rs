@@ -14,11 +14,13 @@ const SCHEMA_VERSION: i64 = 1;
 const MAX_ENVELOPE: usize = 64 << 10;
 
 /// `measurement.normalization_version` of a Codex kind's envelope: raised when
-/// its allowlist grows (A4: `session_meta` and `token_count`), so an envelope
-/// written under the smaller allowlist is superseded, not a digest conflict.
+/// its allowlist grows (A4: `session_meta` and `token_count`; A5:
+/// `session_meta`), so an envelope written under the smaller allowlist is
+/// superseded, not a digest conflict.
 fn normalization_version(kind: &str) -> i64 {
     match kind {
-        "session_meta" | "token_count" => 2,
+        "session_meta" => 3,
+        "token_count" => 2,
         _ => 1,
     }
 }

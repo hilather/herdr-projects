@@ -35,7 +35,8 @@ fn ledger(f: &Fixture) -> Vec<String> {
     let db = f.sidecar();
     let mut out = Vec::new();
     for table in ["source_observations", "ingest_quarantine", "coverage_gaps", "source_cursors", "codex_usage", "codex_turns", "codex_rate_limits",
-        "codex_quarantine", "codex_discrepancy", "collect_offsets", "rollout_sources", "rollout_metadata", "codex_usage_times", "codex_rate_limit_windows"] {
+        "codex_quarantine", "codex_discrepancy", "collect_offsets", "rollout_sources", "rollout_metadata", "codex_usage_times", "codex_rate_limit_windows",
+        "rollout_threads"] {
         let mut stmt = db.prepare(&format!("SELECT * FROM {table} ORDER BY 1,2")).unwrap();
         let names: Vec<String> = stmt.column_names().into_iter().map(str::to_owned).collect();
         let rows = stmt.query_map([], |r| Ok(names.iter().enumerate().filter(|(_, n)| !matches!(n.as_str(), "observed_unix_ms" | "updated_unix_ms"))

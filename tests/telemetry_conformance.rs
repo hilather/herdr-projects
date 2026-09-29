@@ -7,7 +7,9 @@
 //! unavailable, and `collectors capabilities` matching what is emitted. A4
 //! (TM1.3 remainder) adds session metadata, per-record times, subagent and
 //! guardian child sessions, model switches, resume across files and the
-//! upgrade of a sidecar read before A4.
+//! upgrade of a sidecar read before A4. A5 adds the thread lineage a rollout
+//! reports outside `source` and a guardian shaped like the live one, whose
+//! usage records report its parent's session id.
 
 #![cfg(all(feature = "state-store", target_os = "linux"))]
 #![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
@@ -24,7 +26,9 @@ const EDGE: &str = "../codex-conformance/edge.jsonl";
 const EDGE_SID: &str = "00000000-0000-4000-8000-0000000a3ed6";
 const OLD_SID: &str = "00000000-0000-4000-8000-0000000a3001";
 /// A4 child sessions: a `thread_spawn` subagent of the edge session with a
-/// model switch, and a guardian (`review` subagent, `codex-auto-review`).
+/// model switch, and a guardian of the edge session in the live 0.154.0 shape
+/// (`other: guardian` subagent, `codex-auto-review`, `parent_thread_id` and
+/// `session_id` the edge session's, as are its usage records' `session_id`).
 const CHILD: &str = "../codex-conformance/child.jsonl";
 const CHILD_SID: &str = "00000000-0000-4000-8000-0000000a4c01";
 const GUARDIAN: &str = "../codex-conformance/guardian.jsonl";
@@ -101,7 +105,7 @@ fn ledger(f: &Fixture) -> Vec<String> {
     let mut out = Vec::new();
     for table in ["source_observations", "ingest_quarantine", "coverage_gaps", "source_cursors", "codex_usage", "codex_turns", "codex_rate_limits",
         "codex_quarantine", "codex_discrepancy", "collect_offsets", "rollout_sources", "source_bindings", "rollout_metadata", "codex_usage_times",
-        "codex_rate_limit_windows"] {
+        "codex_rate_limit_windows", "rollout_threads"] {
         let mut stmt = db.prepare(&format!("SELECT * FROM {table} ORDER BY 1,2")).unwrap();
         let names: Vec<String> = stmt.column_names().into_iter().map(str::to_owned).collect();
         let rows = stmt.query_map([], |r| Ok(names.iter().enumerate().filter(|(_, n)| !matches!(n.as_str(), "observed_unix_ms" | "updated_unix_ms"))
@@ -316,7 +320,7 @@ fn uncertified_version_is_gated_everywhere() {
 
 fn contains_sentinel(bytes: &[u8]) -> Option<&'static str> {
     let lower = bytes.to_ascii_lowercase();
-    ["a3leak", "a4leak", "canary"].into_iter().find(|needle| lower.windows(needle.len()).any(|w| w == needle.as_bytes()))
+    ["a3leak", "a4leak", "a5leak", "canary"].into_iter().find(|needle| lower.windows(needle.len()).any(|w| w == needle.as_bytes()))
 }
 
 /// Privacy: sentinels planted in content fields, unknown kinds, unknown
@@ -332,7 +336,9 @@ fn planted_sentinels_never_leak() {
     for needle in ["A3LEAK_UNKNOWN_KIND", "A3LEAK_UNKNOWN_FIELD", "A3LEAK_TRUNCATED", "A3LEAK_BAD_RECORD", "A3LEAK_CREDITS", "A3LEAK_LIMIT_NAME", "CANARY_USER",
         // A4: subagent names and paths, tool arguments, commands and output, MCP results, guardian transcripts.
         "A4LEAK_AGENT_PATH", "A4LEAK_NICKNAME", "A4LEAK_ROLE", "A4LEAK_ARGUMENTS", "A4LEAK_COMMAND", "A4LEAK_OUTPUT", "A4LEAK_STDERR",
-        "A4LEAK_MCP_ARGUMENTS", "A4LEAK_MCP_RESULT", "A4LEAK_CREDITS", "A4LEAK_GUARDIAN_TRANSCRIPT", "A4LEAK_GUARDIAN_VERDICT"] {
+        "A4LEAK_MCP_ARGUMENTS", "A4LEAK_MCP_RESULT", "A4LEAK_CREDITS", "A4LEAK_GUARDIAN_TRANSCRIPT", "A4LEAK_GUARDIAN_VERDICT",
+        // A5: the uncollected `multi_agent_version` beside the collected lineage.
+        "A5LEAK_MULTI_AGENT"] {
         assert!(corpus.windows(needle.len()).any(|w| w == needle.as_bytes()), "{needle}");
     }
     let mut output = f.cli("collect").1;
@@ -432,6 +438,9 @@ const CAPABILITIES: &str = "codex rollout_jsonl certified_versions=0.154.0
   session_meta.subagent_kind available=true basis=reported_excerpt certified=live caveat=from_source_subagent
   session_meta.subagent_parent_thread_id available=true basis=reported certified=fixture caveat=from_source_subagent
   session_meta.subagent_depth available=true basis=reported certified=fixture caveat=from_source_subagent
+  session_meta.parent_thread_id available=true basis=reported certified=live caveat=observed_for_guardian_only
+  session_meta.session_id available=true basis=reported certified=live caveat=guardian_reports_parent_session
+  session_meta.thread_source available=true basis=reported_excerpt certified=live caveat=observed_user_and_guardian_review_only
   session_meta.forked_from_ordinal_exclusive available=false basis=unavailable certified=none reason=not_collected
   session_meta.agent_nickname available=false basis=unavailable certified=none reason=not_collected
   session_meta.agent_role available=false basis=unavailable certified=none reason=not_collected
@@ -542,19 +551,28 @@ fn rows<T: rusqlite::types::FromSql>(f: &Fixture, sql: &str) -> Vec<Vec<T>> {
     stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect()).unwrap().map(Result::unwrap).collect()
 }
 
-/// A4 session metadata as collected, with the span of the usage record times.
-fn session(f: &Fixture, sid: &str, path: &Path, records: i64, forked: Value, subagent: Value, times: [i64; 2]) -> Value {
+/// A4 session metadata and A5 thread lineage as collected, with the span of
+/// the usage record times.
+#[allow(clippy::too_many_arguments)]
+fn session(f: &Fixture, sid: &str, path: &Path, records: i64, forked: Value, subagent: Value, thread: Value, times: [i64; 2]) -> Value {
     json!({"session_id": sid, "path_digest": source(path), "binding": "bound", "attempt_id": f.attempt, "records": records, "model_provider": "openai",
-        "forked_from_id": forked, "subagent": subagent, "record_times": {"stored": records, "timed": records, "first_unix_ms": times[0], "last_unix_ms": times[1]}})
+        "forked_from_id": forked, "subagent": subagent, "thread": thread,
+        "record_times": {"stored": records, "timed": records, "first_unix_ms": times[0], "last_unix_ms": times[1]}})
 }
+
+/// `head.jsonl` reports `thread_source` `user` and `session_id` = its `id`
+/// (shown `null`); `child.jsonl` reports neither.
+fn user_thread() -> Value { json!({"parent_thread_id": null, "session_id": null, "source": "user"}) }
 
 fn no_subagent() -> Value { json!({"kind": null, "parent_thread_id": null, "depth": null}) }
 
 /// A4 on the CLI: the session's model provider, its fork and subagent parent
-/// ids (a `thread_spawn` child names the edge session; a guardian `review`
-/// child names none), each usage record's line time, a model switch inside a
-/// session, and the secondary rate-limit window with the reached type. Child
-/// and guardian rollouts bound to the attempt count in its usage once each.
+/// ids (a `thread_spawn` child names the edge session in `source`; the
+/// guardian names none there), each usage record's line time, a model switch
+/// inside a session, and the secondary rate-limit window with the reached
+/// type. A5: the thread lineage (the guardian names the edge session as its
+/// parent thread and reported session). Child and guardian rollouts bound to
+/// the attempt count in its usage once each.
 #[test]
 fn session_metadata_record_times_and_child_usage_are_collected() {
     let f = Fixture::new();
@@ -571,12 +589,12 @@ fn session_metadata_record_times_and_child_usage_are_collected() {
     let at = f.decided + 1_000;
     let (sessions, _) = f.cli_args(&["collectors", "sessions"]);
     assert_eq!(sessions, json!({"sessions": [
-        session(&f, SID, &complete, 2, Value::Null, no_subagent(), [at, at]),
-        session(&f, EDGE_SID, &edge, 3, Value::Null, no_subagent(), [at, at]),
+        session(&f, SID, &complete, 2, Value::Null, no_subagent(), user_thread(), [at, at]),
+        session(&f, EDGE_SID, &edge, 3, Value::Null, no_subagent(), user_thread(), [at, at]),
         session(&f, CHILD_SID, &child, 2, json!(EDGE_SID), json!({"kind": "thread_spawn", "parent_thread_id": EDGE_SID, "depth": 1}),
-            [1_893_456_001_500, 1_893_456_003_000]),
-        session(&f, GUARDIAN_SID, &guardian, 1, Value::Null, json!({"kind": "review", "parent_thread_id": null, "depth": null}),
-            [1_893_456_062_000, 1_893_456_062_000]),
+            json!({"parent_thread_id": null, "session_id": null, "source": null}), [1_893_456_001_500, 1_893_456_003_000]),
+        session(&f, GUARDIAN_SID, &guardian, 1, Value::Null, json!({"kind": "other", "parent_thread_id": null, "depth": null}),
+            json!({"parent_thread_id": EDGE_SID, "session_id": EDGE_SID, "source": "guardian_review"}), [1_893_456_062_000, 1_893_456_062_000]),
     ]}));
 
     // The child switches from gpt-5.5 to gpt-5.5-mini at its second turn.
@@ -633,10 +651,10 @@ fn resume_across_files_dedupes_history_and_quarantines_an_ordinal_restart() {
         [vec![T(SID.into()), I(1), T(DIGEST_1.into()), T("sha256:924252b6d27afbe340fd147fd3747364940dd51917cf08c3ca05be4ad9d394b4".into())]]);
 }
 
-/// The sidecar as the A3 binary left it: no A4 tables, ingest stream 3, and
-/// envelopes of the narrower `session_meta`/`token_count` allowlist.
+/// The sidecar as the A3 binary left it: no A4 (or A5) tables, ingest stream
+/// 3, and envelopes of the narrower `session_meta`/`token_count` allowlist.
 fn downgrade_to_a3(f: &Fixture) {
-    f.sidecar().execute_batch("DROP TABLE rollout_metadata; DROP TABLE codex_usage_times; DROP TABLE codex_rate_limit_windows;
+    f.sidecar().execute_batch("DROP TABLE rollout_metadata; DROP TABLE codex_usage_times; DROP TABLE codex_rate_limit_windows; DROP TABLE rollout_threads;
         UPDATE telemetry_streams SET version=3 WHERE stream='ingest';
         UPDATE source_observations SET payload='{}',payload_digest='sha256:a3',
             measurement='{\"coverage\":\"complete\",\"measurement_basis\":\"reported\",\"normalization_version\":1}'
@@ -660,11 +678,11 @@ fn rollouts_read_before_a4_gain_their_metadata_on_the_next_collect() {
     let (before, _) = f.cli_args(&["collectors", "sessions"]);
     let predates = unavailable("predates_collection");
     for s in before["sessions"].as_array().unwrap() {
-        assert_eq!([&s["model_provider"], &s["forked_from_id"], &s["subagent"], &s["record_times"]], [&predates; 4], "{s}");
+        assert_eq!([&s["model_provider"], &s["forked_from_id"], &s["subagent"], &s["thread"], &s["record_times"]], [&predates; 5], "{s}");
     }
     let (upgraded, _) = f.cli("collect");
     assert_eq!(upgraded["collected"]["records"], 0, "the re-read counts nothing twice");
-    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 4}));
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 5}));
     assert!(fresh == ledger(&f), "the upgraded sidecar equals a fresh collect");
     assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage);
     assert_eq!(f.cli_args(&["collectors", "sessions"]).0, fresh_sessions);
@@ -675,7 +693,92 @@ fn rollouts_read_before_a4_gain_their_metadata_on_the_next_collect() {
     let (sessions, _) = f.cli_args(&["collectors", "sessions"]);
     let pending = unavailable("pending_reread");
     let child_row = sessions["sessions"].as_array().unwrap().iter().find(|s| s["session_id"] == CHILD_SID).unwrap();
-    assert_eq!([&child_row["model_provider"], &child_row["forked_from_id"], &child_row["subagent"], &child_row["record_times"]], [&pending; 4]);
+    assert_eq!([&child_row["model_provider"], &child_row["forked_from_id"], &child_row["subagent"], &child_row["thread"], &child_row["record_times"]], [&pending; 5]);
     assert_eq!(sessions["sessions"][0]["model_provider"], "openai");
     assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage, "the gone rollout's records still count");
+}
+
+/// A5, the live guardian shape (codex-live-0.154.0-a4.md §5): the guardian's
+/// usage record reports the edge (parent) session's `session_id`, yet usage
+/// is keyed by the rollout's own `session_meta.id` and ordinal. So the
+/// guardian's record takes none of the parent's ordinals (no quarantine),
+/// the parent's thread total still reconciles, each response is stored once
+/// under the rollout that wrote it, and the attempt counts the guardian's 30
+/// tokens once beside the parent's, whichever rollout is read first. The
+/// envelope keeps the reported parent id under the guardian's own identity.
+#[test]
+fn guardian_usage_reporting_its_parent_session_stays_with_its_rollout() {
+    let f = Fixture::new();
+    let [edge, guardian] = ["edge", "guardian"].map(|name| plant(&f, name));
+    let (report, _) = f.cli("collect");
+    // edge 1300/450/0/160/90/1460 (3 records) + guardian 25/0/0/5/1/30 (1 record).
+    let sums = json!({"input_tokens": 1325, "cached_input_tokens": 450, "cache_write_input_tokens": 0, "output_tokens": 165,
+        "reasoning_output_tokens": 91, "total_tokens": 1490, "records": 4});
+    assert_eq!(attempt_usage(&report), sums);
+    use rusqlite::types::Value::{Integer as I, Text as T};
+    let usage = |guardian: &Path| {
+        let row = |sid: &str, ordinal: i64, path: &Path, response: &str| vec![T(sid.into()), I(ordinal), T(source(path)), T(response.into()), I(1)];
+        [row(EDGE_SID, 1, &edge, "resp-1"), row(EDGE_SID, 2, &edge, "resp-3"), row(EDGE_SID, 3, &edge, "resp-4"), row(GUARDIAN_SID, 1, guardian, "resp-g1")]
+    };
+    let stored = |f: &Fixture| rows::<rusqlite::types::Value>(f, "SELECT session_id,ordinal,path_digest,response_id,accepted FROM codex_usage ORDER BY session_id,ordinal");
+    assert_eq!(stored(&f), usage(&guardian));
+    assert_eq!((f.count("codex_quarantine"), f.count("codex_discrepancy")), (0, 0));
+
+    // Envelopes: under the guardian's own identity, its reported lineage and the parent's id in the record.
+    let guardian_envelope = |kind: &str, path: &str| f.sidecar().query_row(&format!("SELECT identity,json_extract(payload,'{path}') FROM source_observations
+        WHERE producer_epoch=?1 AND event_kind=?2"), rusqlite::params![source(&guardian), kind], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).unwrap();
+    let identity = format!(r#"{{"session_id":"{GUARDIAN_SID}"}}"#);
+    assert_eq!(guardian_envelope("codex.token_usage_record.v1", "$.session_id"), (identity.clone(), EDGE_SID.to_owned()));
+    for (path, value) in [("$.parent_thread_id", EDGE_SID), ("$.session_id", EDGE_SID), ("$.thread_source", "guardian_review"), ("$.source", "subagent")] {
+        assert_eq!(guardian_envelope("codex.session_meta.v1", path), (identity.clone(), value.to_owned()));
+    }
+
+    // The accounting graph keeps the two apart: the guardian's 30 is not in the edge session's 1460.
+    f.cli_args(&["accounting", "sync"]);
+    let (graph, _) = f.cli_args(&["accounting", "sessions"]);
+    let totals: Vec<(String, String, Value)> = graph["sessions"].as_array().unwrap().iter()
+        .map(|s| (s["session_id"].as_str().unwrap().to_owned(), s["role"].as_str().unwrap().to_owned(), s["total_tokens"].clone())).collect();
+    assert_eq!(totals, [(EDGE_SID.to_owned(), "primary".to_owned(), json!(1460)), (GUARDIAN_SID.to_owned(), "guardian".to_owned(), json!(30))]);
+
+    // Read the guardian's rollout before its parent's: the same rows and sums.
+    remove_sidecar(&f);
+    let first = guardian.with_file_name("rollout-2026-09-28T00-00-00-a-guardian.jsonl");
+    fs::rename(&guardian, &first).unwrap();
+    assert_eq!(attempt_usage(&f.cli("collect").0), sums);
+    assert_eq!(stored(&f), usage(&first));
+    assert_eq!((f.count("codex_quarantine"), f.count("codex_discrepancy")), (0, 0));
+}
+
+/// The sidecar as the A4 binary left it: no `rollout_threads`, ingest stream
+/// 4, and `session_meta` envelopes of the A4 allowlist (normalization 2).
+fn downgrade_to_a4(f: &Fixture) {
+    f.sidecar().execute_batch("DROP TABLE rollout_threads; UPDATE telemetry_streams SET version=4 WHERE stream='ingest';
+        UPDATE source_observations SET payload=json_remove(payload,'$.parent_thread_id','$.session_id','$.thread_source'),payload_digest='sha256:a4',
+            measurement='{\"coverage\":\"complete\",\"measurement_basis\":\"reported\",\"normalization_version\":2}'
+            WHERE event_kind='codex.session_meta.v1';").unwrap();
+}
+
+/// Upgrade: a sidecar written before A5 is read (read-only) with its thread
+/// lineage `unavailable: predates_collection` and its A4 metadata intact. The
+/// next collect migrates it to ingest 5 and reads every rollout again: the
+/// lineage is filled, the A4 `session_meta` envelopes are superseded without a
+/// digest conflict, nothing is counted twice, and the ledger equals a fresh collect.
+#[test]
+fn rollouts_read_before_a5_gain_their_thread_lineage_on_the_next_collect() {
+    let f = Fixture::new();
+    for name in ["complete", "edge", "guardian"] { plant(&f, name); }
+    f.cli("collect");
+    let (fresh, fresh_usage, fresh_sessions) = (ledger(&f), f.cli_args(&["usage", "--json"]).0, f.cli_args(&["collectors", "sessions"]).0);
+
+    downgrade_to_a4(&f);
+    let (before, _) = f.cli_args(&["collectors", "sessions"]);
+    let sessions = before["sessions"].as_array().unwrap();
+    assert!(sessions.iter().all(|s| s["thread"] == unavailable("predates_collection") && s["model_provider"] == "openai"), "{before}");
+    assert_eq!(sessions[2]["subagent"]["kind"], "other");
+    let (upgraded, _) = f.cli("collect");
+    assert_eq!(upgraded["collected"]["records"], 0, "the re-read counts nothing twice");
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 5}));
+    assert!(fresh == ledger(&f), "the upgraded sidecar equals a fresh collect");
+    assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage);
+    assert_eq!(f.cli_args(&["collectors", "sessions"]).0, fresh_sessions);
 }

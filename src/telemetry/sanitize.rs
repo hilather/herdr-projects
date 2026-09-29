@@ -30,7 +30,8 @@ pub fn codex_allowlist(kind: &str) -> Option<Vec<(String, Class)>> {
     let usage = |prefix: &'static str| USAGE.iter().map(move |f| (format!("{prefix}.{f}"), Number));
     Some(match kind {
         "session_meta" => fields(&[("id", Id), ("timestamp", Text), ("cwd", Path), ("cli_version", Text), ("originator", Text), ("source", Tag),
-            ("model_provider", Text), ("forked_from_id", Id), ("subagent_kind", Tag), ("subagent_parent_thread_id", Id), ("subagent_depth", Number)]),
+            ("model_provider", Text), ("forked_from_id", Id), ("subagent_kind", Tag), ("subagent_parent_thread_id", Id), ("subagent_depth", Number),
+            ("parent_thread_id", Id), ("session_id", Id), ("thread_source", Tag)]),
         "turn_context" => fields(&[("turn_id", Id), ("model", Text), ("effort", Text)]),
         "token_usage_record" => fields(&[("session_id", Id), ("turn_id", Id), ("response_id", Id)]).into_iter()
             .chain(usage("usage")).chain(usage("thread_token_usage")).collect(),

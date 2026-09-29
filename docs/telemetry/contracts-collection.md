@@ -297,7 +297,7 @@ of five: `parent_thread_id`, `depth`, `agent_path`, `agent_nickname`,
   `source`: `session_meta.parent_thread_id` and `session_meta.session_id`
   both equal the parent's `session_meta.id`, `thread_source` is
   `guardian_review`, and its `token_usage_record.session_id` is the parent's
-  (`thread_id` is its own). None of these is collected yet; see
+  (`thread_id` is its own). A5 (below) collects these keys; see
   [codex-live-0.154.0-a4.md](codex-live-0.154.0-a4.md).
 - Whether `parent_thread_id` equals the parent's `session_meta.id` holds in
   the fixtures only (thread id = session id in every 0.154.0 fixture).
@@ -345,7 +345,8 @@ of five: `parent_thread_id`, `depth`, `agent_path`, `agent_nickname`,
 Corpus cases `child` (`codex-conformance/child.jsonl`: a `thread_spawn`
 subagent and fork of the edge session, a model switch, exec and MCP tool
 records, the secondary window and a reached type) and `guardian`
-(`guardian.jsonl`: `review` subagent, `codex-auto-review`) join `CASES`, with
+(`guardian.jsonl`: `codex-auto-review`; since A5 in the live shape, see
+A5 below) join `CASES`, with
 `A4LEAK_*` sentinels in agent names and paths, tool arguments, commands,
 output, MCP results, credits and guardian transcripts.
 
@@ -428,3 +429,118 @@ subagent and trigger one auto-review. Then, from the disposable root:
   review of the §7 wording above.
 - **Steward:** apply the §5/§7 text above to `contracts.md` and list ingest
   0004 in its index.
+
+## A5: Codex thread lineage and guardian usage identity
+
+Source: the live A4 run ([codex-live-0.154.0-a4.md](codex-live-0.154.0-a4.md)
+§5). The 0.154.0 guardian names its parent outside `source`, and its usage
+records report the parent's session id.
+
+### Fields
+
+| Envelope field (`session_meta`) | Read from | Class (§7 rule) | Stored in | Certified (caveat) |
+|---|---|---|---|---|
+| `parent_thread_id` | top-level `parent_thread_id` | Id | `rollout_threads.parent_thread_id` | live (`observed_for_guardian_only`: only the guardian had the key; a spawned subagent was not observed) |
+| `session_id` | `session_id` | Id | `rollout_threads.session_id`, only when it differs from `session_meta.id` (`NULL`: absent or equal) | live (`guardian_reports_parent_session`: primaries report their own `id`, the guardian its parent's) |
+| `thread_source` | `thread_source` | Tag (excerpt) | `rollout_threads.thread_source` | live (`observed_user_and_guardian_review_only`: values seen were `user` and `guardian_review`) |
+
+All three are identifiers or an enum-like tag that Codex writes about the
+thread, never text a person or model wrote. `multi_agent_version` is not
+collected (not needed; `A5LEAK_MULTI_AGENT` sentinel). The subagent tag
+stays as A4 collects it: the live guardian's `source` is
+`{"subagent": {"other": "guardian"}}`, so `subagent_kind` is `other`, and
+its `other` string (`guardian`) is still not collected.
+
+### Collection rules
+
+- Sidecar stream `ingest` 0005 adds `rollout_threads(path_digest PK,
+  parent_thread_id, session_id, thread_source)`, written from the file's
+  first `session_meta` with `rollout_metadata`, in the same transaction and
+  as leniently (a value of another type is `NULL`, never a malformed
+  record). `CREATE TABLE IF NOT EXISTS`, so a sidecar whose stream table was
+  lost re-runs it.
+- **Upgrade.** A source with a `rollout_sources` row but no
+  `rollout_threads` row was read before A5; each collect reads it again from
+  byte 0 within its budget, exactly like the A4 backfill. Stored keys
+  dedupe; `collected.records` counts nothing twice.
+- **Envelopes.** `session_meta` envelopes carry the three fields (absent as
+  `null`; `session_id` verbatim, even when equal to `id`) with
+  `measurement.normalization_version` 3. An A4 envelope (version 2) of the
+  same `event_id` is superseded in place, not a `digest_conflict`.
+- `collectors sessions` adds `thread {parent_thread_id, session_id,
+  source}` per rollout source. `thread.session_id` is `null` when the rollout
+  reports its own id. A sidecar without `rollout_threads` shows `thread`
+  `unavailable: predates_collection`; a source waiting for its re-read
+  `unavailable: pending_reread`.
+- Existing outputs (`usage`, `attempts`, `report`, `bindings`, accounting)
+  are unchanged. Changed on purpose: the `session_meta` envelope payload,
+  digest and normalization version, the capabilities table, and the first
+  collect after the upgrade re-reads bytes.
+
+### Guardian usage identity
+
+A guardian's `token_usage_record.session_id` is its parent's id. The adapter
+never keys usage by that field: `codex_usage`, `codex_usage_times`,
+`codex_turns`, `codex_rate_limits`, the reconciliation and the envelope
+identity all use the rollout's own `session_meta.id`, and the ordinal counts
+records within that rollout. So a guardian's records take their own
+`(session_id, ordinal)` keys, never the parent's (which would otherwise
+collide at ordinal 1 and quarantine both). The envelope keeps the reported
+value in `payload.session_id` as evidence. No code change was needed; A5
+proves it (below). The live run agrees: the attempt counted the guardian's
+7462 once beside the parent's 29760.
+
+### Conformance (tests/telemetry_conformance.rs)
+
+`codex-conformance/guardian.jsonl` now has the live shape: `source`
+`{"subagent": {"other": "guardian"}}`, `thread_source` `guardian_review`,
+`parent_thread_id` and `session_id` = the edge session's id, and its usage
+record's `session_id` = the edge session's id (`thread_id` its own,
+`root_turn_id` an edge turn). `codex-0.154.0/head.jsonl` reports
+`thread_source` `user`, as the live primaries did.
+
+| Property | Test |
+|---|---|
+| The guardian's usage record (reporting the edge session's `session_id`, its own rollout, its own `response_id`) is stored under the guardian's id at ordinal 1; the edge keeps ordinals 1–3; no quarantine, no discrepancy; attempt usage = 1460 + 30 = 1490 with 4 records, also when the guardian's rollout is read first; envelope identity is the guardian's, its payload keeps the reported id; the accounting graph shows the edge 1460 and the guardian 30 apart | `guardian_usage_reporting_its_parent_session_stays_with_its_rollout` |
+| Lineage per rollout in `collectors sessions` (guardian: parent and session = edge, source `guardian_review`; primaries: `user`) | `session_metadata_record_times_and_child_usage_are_collected` |
+| Upgrade of an A4 sidecar: `predates_collection` read-only, then a re-read that equals a fresh collect, no digest conflict, nothing counted twice | `rollouts_read_before_a5_gain_their_thread_lineage_on_the_next_collect` |
+| Sentinels, capabilities matching emitted fields (each new one valued) | `planted_sentinels_never_leak`, `capabilities_match_emitted_fields` |
+
+### Proposed contracts.md §5 addition (steward applies)
+
+- §5 *Allowlisted fields*, after the A4 `source.subagent` text: "and the
+  thread lineage `parent_thread_id`, `session_id` and `thread_source` of
+  `session_meta` (sidecar stream `ingest` 0005 `rollout_threads`); usage is
+  keyed by the rollout's own `session_meta.id`, never by a record's
+  `session_id`, which a guardian reports as its parent's."
+- Index: list ingest 0005.
+
+### Follow-ups
+
+- **B2 (session graph), to link guardians:**
+  1. Read `rollout_threads` (`LEFT JOIN` on `path_digest`, tolerate the
+     table missing on a read-only pre-A5 sidecar) beside `rollout_metadata`.
+  2. Use `rollout_threads.parent_thread_id` as native parent evidence when
+     `subagent_parent_thread_id` is `NULL`, with its own `link_basis` (for
+     example `thread_parent_thread_id`), and only when it differs from the
+     session's own id. A guardian then becomes `linked_child` of the parent
+     session when that session is collected, else `unlinked_child` with
+     `parent_not_collected` and the claimed id, instead of
+     `no_native_parent_evidence`.
+  3. Role: `thread_source = 'guardian_review'` is guardian evidence beside
+     the model (`codex-auto-review`); `subagent_kind` is `other` for the
+     live guardian, not `review`, so the `Some("review")` arm alone never
+     matches it (today the model fallback makes it `guardian`; a
+     `Some(_) => "subagent"` arm must not win over it).
+  4. Inclusion: the guardian's usage is separate spend (the live parent's
+     thread total excluded it), so a linked guardian is `separate`, never
+     part of the parent's inclusive total. Its link is `live`-certified
+     evidence, unlike the fixture-certified `thread_spawn` link.
+  5. Never use `token_usage_record.session_id` or `session_meta.session_id`
+     as a node key: both name the parent for a guardian.
+  6. Update `tests/fixtures/telemetry/accounting/guardian.jsonl` (lane B) to
+     the live shape and `tests/telemetry_accounting.rs` expectations
+     (`unlinked_child`/`no_native_parent_evidence` becomes a link).
+- **Lane A (optional):** collect the `source.subagent.other` string (Tag,
+  `guardian`) as the kind's detail, if B2 wants it beyond `thread_source`.
+- **Steward:** apply the §5 text above and list ingest 0005 in the index.
