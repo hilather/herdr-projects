@@ -534,7 +534,6 @@ no code path may read it.
 M33 typed attention reasons; transactional outbox (TM0.4);
 spool; budget bridge enforcement and any change to `UnknownUsagePolicy` (TM2.4;
 the shadow bridge landed, contracts-accounting.md §14);
-
 Claude and OTLP adapters; candidate-group selection and races; stochastic
 assignment policies; coordinator digest,
 sidebar suffix and inbox alerts; retention jobs and restore; configuration
