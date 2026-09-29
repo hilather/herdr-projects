@@ -69,8 +69,9 @@ counts); migrating to 2 clears `usage_ledger`, so a ledger synced before reads
 `ledger_not_synced` until the next sync. `accounting sessions` prints it
 read-only.
 
-`session_graph`, one node per rollout source. Links come only from native
-evidence:
+`session_graph`, one node per rollout source (table `session_nodes` from
+stream version 6, §7; `session_graph` is no longer written).
+Links come only from native evidence:
 
 - Resume: rollouts of one `session_meta.id` form one session. The rollout with
   the most `records` (then lowest `path_digest`) is the root; every other is
@@ -80,12 +81,31 @@ evidence:
   stays 200. Any `conflict` in the session (quarantine), or an epoch the root
   does not cover, makes every such node `unresolved`: the session total and
   its parent are `unavailable: inclusion_unknown`.
-- Role: `guardian` when a record carries model `codex-auto-review`,
-  `subagent` when `source = subagent`, else `primary`. The Codex tables keep no
-  parent id (`source` stores only its first key), so a guardian or subagent
-  root is `unlinked_child` with parent `unavailable:
-  no_native_parent_evidence`: reported apart and never added to any other
-  session. Linking needs a native parent id captured by lane A (A4).
+- Role, from the root rollout's A4 `rollout_metadata` (certified `fixture`)
+  first: `guardian` when `subagent_kind = review` or a record carries model
+  `codex-auto-review`; `subagent` for any other `subagent_kind` (or, without
+  A4 metadata, `source = subagent`); `fork` when the session names a
+  `forked_from_id` and is no subagent; else `primary`.
+- Child link (A4, §7): a session whose root rollout names
+  `subagent_parent_thread_id` (else `forked_from_id`), other than itself,
+  equal to a collected `rollout_sources.session_id` is a `linked_child` of
+  that session, with `link_basis` `parent_thread_id` / `forked_from_id` and
+  `certified: fixture` (whether `parent_thread_id` equals the parent's
+  `session_meta.id` holds in fixtures only). A named parent that was not
+  collected makes it `unlinked_child` with parent `unavailable:
+  parent_not_collected` (and the named `session_id`); a guardian or subagent
+  naming none (a `review` guardian never does) is `unlinked_child` with
+  `unavailable: no_native_parent_evidence`. Never by inference (cwd,
+  attempt, time).
+- A linked child is **never** added to its parent's total. The parent lists
+  it under `children {sessions: [{session_id, role, link_basis, certified,
+  total_tokens, inclusion}], total_tokens}`: `inclusion` is `separate` for a
+  spawned subagent, and `unavailable: fork_replay_not_certified` for a
+  session naming a `forked_from_id` (a fork may replay its parent's records,
+  `forked_from_ordinal_exclusive` is not collected, live probe step 3). The
+  children `total_tokens` is their sum only when every child total is known
+  (`unavailable: incomplete` otherwise) and none is a fork
+  (`fork_replay_not_certified`).
 - `inclusive_total` = Σ normalized `total_tokens` of the delta entries the
   rollout observed (accepted or duplicate); `NULL` when it observed one that
   is not counted and normalized (session total `unavailable: incomplete`).
@@ -100,15 +120,28 @@ and Σ input, output, reasoning (subset) and total, so segments + mixed +
 unallocated = the session total. The requested model is not recorded; the
 model is as reported by `turn_context`.
 
-The rollup sums root totals of `primary` sessions (`sessions`) and of
-unlinked children (`unlinked_children`) separately; with any incomplete or
-unresolved session both are `unavailable: incomplete_sessions`, never a
-partial sum.
+The rollup sums root totals of `primary` sessions (`sessions`), of linked
+children (`linked_children`, `unavailable: fork_replay_not_certified` when
+one is a fork) and of unlinked children (`unlinked_children`) separately;
+with any incomplete or unresolved session all three are `unavailable:
+incomplete_sessions`, never a partial sum. The three are never added
+together. M08/M09 (§2) count each record once per session regardless;
+whether a child session's records replay its parent's is the open live-probe
+question.
 
 Test `model_switch_splits_segments_not_task`: gpt-5.5 50 then gpt-5.5-mini
 150 → two segments, total 200; the resumed epoch of 50 stays inside the root
 of 200; an unlinked guardian of 50 (unallocated 10, `codex-auto-review` 30,
 mixed 10) is reported apart; a rewritten record makes the session unresolved.
+
+Test `child_sessions_link_to_parent_without_double_count`: a parent of 100
+and a spawned subagent of 30 naming it → the child is linked
+(`parent_thread_id`, `fixture`), the parent stays 100 with `children` 30,
+rollup 100 / 30 / 0. A fork of 40 (`forked_from_id`), a subagent of 20
+naming an uncollected parent (`parent_not_collected`) and a `review`
+guardian of 50 (`no_native_parent_evidence`) join: `children` and
+`linked_children` become `fork_replay_not_certified`, `unlinked_children`
+70; M08/M09 stay 190/50 (each record once).
 
 ## 4. Rate cards and published-rate estimates (B3, TM2.3)
 
@@ -132,8 +165,12 @@ TOML number is refused, so no float touches money. The card is canonicalized
 append-only (SQL triggers refuse UPDATE/DELETE): the same version with the
 same digest imports as a no-op, with a different digest it is refused; a
 changed price is a new version. `accounting rate-cards` lists them. The card
-`provider` is recorded as asserted by the card: Codex rows carry no model
-provider, so applicability is `product` + `model`.
+`provider` is recorded as asserted by the card and checked against the
+rollout's reported A4 `model_provider` (§7): applicability is `product` +
+`model`, then, when the storing rollout reports a provider, only cards of
+that provider (none left: `provider_mismatch`). Without a reported provider
+the result is unchanged but a priced entry is marked `provider_check:
+provider_unverified` (`matched` otherwise).
 
 **Valuations** (`valuation_revisions`, `valuations`): `accounting reprice`
 values every delta entry of the synced ledger (§1; `ledger_not_synced`
@@ -144,10 +181,16 @@ revision, and repricing never changes measured tokens. Basis is always
 `published_rate_estimate`; there are no provider charges, and an estimate is
 never added to one.
 
-Usage time: Codex rows carry no per-record timestamp, so an entry's usage
-interval is bounded by its storing rollout's session start
-(`rollout_sources.session_unix_ms`) and its first observation
-(`codex_usage.observed_unix_ms`), `[min, max]` of the two (policy
+Usage time: an entry's usage interval is its A4 record time
+(`codex_usage_times.record_unix_ms`, the `token_usage_record` line
+`timestamp`, certified `fixture`) as `[t, t]`, basis `record_time`. When that
+is `NULL` or absent (no line time, or a row stored before A4), it falls back
+to its storing rollout's session start (`rollout_sources.session_unix_ms`)
+and its first observation (`codex_usage.observed_unix_ms`), `[min, max]` of
+the two, basis `session_start..first_observed`. Each valuation records its
+basis (`usage_interval.basis`). Policy
+`usage_interval=record_time|session_start..first_observed;split=none;provider=checked_when_reported`
+(revisions appended before A4 keep
 `usage_interval=session_start..first_observed;split=none`). The card
 versions of the entry's product and model overlapping that interval are the
 candidates; the highest version must cover the whole interval. Unpriced
@@ -157,9 +200,10 @@ reasons (the entry is `unavailable`, never 0):
 | --- | --- |
 | `usage_not_counted` | not counted (no `accepted` disposition) or not normalized |
 | `model_unknown` | no reported model |
-| `usage_time_unknown` | no session start |
+| `usage_time_unknown` | no record time and no session start |
 | `cache_write_convention_unknown` | cache writes > 0 (codex-v1 does not certify their overlap with input) |
 | `no_rate_card` | no card for the product and model overlaps the interval |
+| `provider_mismatch` | the rollout reports a model provider and no overlapping card is of that provider |
 | `ambiguous_rate_cards` | cards of more than one `card_id` overlap it |
 | `rate_change_within_usage_interval` | the winning version does not cover the whole interval (no evidence to split) |
 | `<category>_rate_missing` | a category with tokens has no rate (e.g. cached input and no `cache_read` rate) |
@@ -169,11 +213,24 @@ reasons (the entry is `unavailable`, never 0):
 Amount = Σ over categories with tokens of `tokens × rate / rate_unit`, exact
 (fixed-point `i128`, trimmed decimal string), with per-category components.
 
+Reproducibility across the A4 change: stream version 6 records each new
+valuation's `usage_basis` and `provider_check` in the append-only side table
+`valuation_bases` (not new `valuations` columns, so the migration can re-run);
+earlier revisions have no rows there and `cost --revision N` omits both, so
+they read back byte-identical.
+A reprice compares against the latest revision as it was computed: against a
+pre-A4 revision, a result whose rows all use the fallback interval (or none),
+report no provider and keep the same roles is the same result and appends
+nothing; anything else (a record time, a provider check, a session now
+`fork`/linked) appends a revision.
+
 **`accounting cost [--json] [--revision N]`** (read-only; `not_priced`
 before the first reprice) shows the latest revision or revision N, byte-
 identical to when it was appended. Per session and per attempt (bound
-attempt of the storing rollout; guardian/subagent sessions summed apart as
-`unlinked_children`, §3): `estimate` is `complete {currency, amount}` when
+attempt of the storing rollout; every non-`primary` session, guardian,
+subagent or fork, linked or not, summed apart under the key
+`unlinked_children`, §3; the key predates A4 linking and is kept for
+compatibility): `estimate` is `complete {currency, amount}` when
 every entry is priced in one currency; `partial {currency, priced_amount}`
 (labeled, never the total) when some are not; `unavailable mixed_currency
 {priced_by_currency}` when priced in several currencies (never added, no
@@ -188,10 +245,20 @@ boundary; input 2, output 4 per 10^6, no cache-read rate) prices doc 10's
 input 2, cache read 0.50, output 8) prices doc 05's 800 new + 200 cached +
 300 output at `0.0041`; gpt-5.5-mini (no card), a cache write, a cached read
 under version 1 and a session straddling the boundary are unavailable with
-their reasons, leaving the attempt `partial` at `0.0081`. A corrected
+their reasons, leaving the attempt `partial` at `0.0081` (the straddling
+record has no line time, so it keeps the fallback interval). A corrected
 version 3 (output 6 → `0.0035`) and a EUR card (`0.00021`) append revision 2
 (attempt `mixed_currency`: USD `0.0075`, EUR `0.00021`); revision 1 reads
 back byte-identical and the ledger is unchanged.
+
+Test `record_times_narrow_rate_card_interval`: one session starting before a
+boundary and first observed after it; its record timed before the boundary
+prices at `0.004` (version 1), the one timed after at `0.0041` (version 2),
+the one without a line time straddles (`rate_change_within_usage_interval`,
+basis `session_start..first_observed`). Provider `openai` against the
+`synthetic` cards is `provider_mismatch`; no provider prices at `0.00036`
+marked `provider_unverified`; attempt `partial` `0.00846`. Version 3 appends
+revision 2 (`0.00782`); revision 1 reads back byte-identical.
 
 ## 5. Quota windows (B4, TM2.7)
 
@@ -203,11 +270,13 @@ M38–M40. The live run observed the fields but certified no semantics
 ([codex-live-0.154.0.md](codex-live-0.154.0.md)); every output says
 `semantics: not_certified`.
 
-**Observations** (`quota_observations`, one per `codex_rate_limits` row):
+**Observations** (`quota_window_observations` from stream version 6, §7;
+one per `codex_rate_limits` row and window kind):
 service `codex`; account = the rollout's `home_digest` (one execution home is
 one login; a session seen under two homes is `account_ambiguous`); `limit_id`;
-`window_kind` `primary` (the collector allowlist, contracts §5, keeps only
-`primary`); unit `percent`; `window_minutes`; `resets_unix_ms` (`resets_at`
+`window_kind` `primary`, or `secondary` from the snapshot's A4
+`codex_rate_limit_windows` row (certified `fixture`; the live run saw
+`null`); unit `percent`; `window_minutes`; `resets_unix_ms` (`resets_at`
 seconds × 1000); `used` and `remaining = 100 − used` as exact trimmed decimal
 strings (`42.0` → `42`); `plan_type`; `observed_unix_ms` (the line's
 `timestamp`); `trust`; `window_id`. Per (account, limit), in
@@ -215,6 +284,7 @@ strings (`42.0` → `42`); `plan_type`; `observed_unix_ms` (the line's
 
 | Trust | When | Window |
 | --- | --- | --- |
+| `not_reported` | `secondary` only: the snapshot's secondary window was `null` | none |
 | `incomplete` | `limit_id`, `used_percent`, `window_minutes` or `resets_at` missing (e.g. `primary: null`) | none |
 | `unparseable` | `used` not a plain decimal in 0–100, or `window_minutes` ≤ 0 | none |
 | `account_ambiguous` | the session's rollouts lie under several homes | none |
@@ -223,9 +293,14 @@ strings (`42.0` → `42`); `plan_type`; `observed_unix_ms` (the line's
 | `window_conflict` | same `resets_at`, different `window_minutes` | none |
 | `used_decreased_without_reset` | same window, `used` below its high-water mark | the window (counted in `flagged`) |
 
+Trust is tracked per (account, limit, window kind): a secondary window has
+its own `window_minutes`/`resets_at` and the same rules. A snapshot without
+an A4 row (stored before A4) has no secondary observation. Each observation
+keeps the snapshot's `rate_limit_reached_type` as evidence only.
+
 A reset starts a new window identity; nothing is ever subtracted across one
 or within one. **Windows** (`quota_windows`): `window_id =
-codex:<account>:<limit_id>:primary:<resets_unix_ms>`, window start =
+codex:<account>:<limit_id>:<window_kind>:<resets_unix_ms>`, window start =
 reset − `window_minutes`, first/last trusted observation, `first_used`,
 `used` (high-water), `remaining`, `observed_increase = used − first_used`
 (account-wide: never attributed to a task, as the window's invocation scope
@@ -233,11 +308,13 @@ is not certified), latest `plan_type`, trusted `observations` and `flagged`.
 
 **`accounting quota [--json]`** (read-only; `collection_not_run` without a
 sidecar, `ledger_not_synced` before a sync): `windows`, `observations`
-(count per trust), and `metrics`:
+(count per window kind and trust), `evidence.rate_limit_reached_type`
+(`snapshots` per value, `semantics: not_certified`, `certified: fixture`),
+and `metrics`:
 
 - M38 `throttled_time_share`: `unavailable throttling_not_certified`. Codex
-  rollouts carry no throttled intervals; the allowlist keeps no availability
-  events (`rate_limit_reached_type` is a point flag, not collected).
+  rollouts carry no throttled intervals; `rate_limit_reached_type` is a point
+  tag kept as evidence only until its semantics are certified.
 - M39 `provider_error_rate`: `unavailable provider_errors_not_certified`. No
   typed provider error field is collected or certified; human-readable
   messages never become certified fields.
@@ -250,7 +327,10 @@ sidecar, `ledger_not_synced` before a sync): `windows`, `observations`
   `age_ms > stale_after_ms` = 900000, value still shown); if the window reset
   at or before the decision, `value` is `unavailable
   window_reset_since_observation` (the new window's value is unknown).
-  `secondary` is `unavailable not_collected`. Decision-level reasons:
+  `secondary` follows the same rules from the secondary observations; with
+  no trusted one it is `unavailable not_reported` (the latest snapshot's
+  window was `null`), `not_collected` (no snapshot carries the kind, e.g.
+  stored before A4) or `no_trusted_observation`. Decision-level reasons:
   `adapter_absent`, `execution_home_unknown`, `no_observation` (no snapshot
   of the account by then), `no_trusted_observation`. Native units; never
   summed or averaged across accounts, limits or services.
@@ -267,6 +347,14 @@ increase `7.25`, remaining `87.75`), never −55. A snapshot 20 minutes old is
 `stale` (`62.5`, age 1200000); one whose window reset before the decision is
 `window_reset_since_observation`; no snapshot is `no_observation` and one
 with `primary: null` is `incomplete` → `no_trusted_observation`, never 0.
+Its rollouts report `secondary: null`: `not_reported`.
+
+Test `secondary_window_is_tracked`: a 10,080-minute secondary window reads
+10 → 12.5 before dispatch (headroom `87.5`, age 120000, increase `2.5`),
+11 afterwards (flagged), then `null` (`not_reported`) while the primary
+resets (20 → 30, then 5 → 6 in a new window); one `primary` reached type
+is evidence; M38 stays unavailable. With the A4 rows removed (as stored
+before A4), secondary is `not_collected`.
 
 ## 6. Human attention intervals (B6b, TM1.8 remainder "S4")
 
@@ -357,3 +445,21 @@ ending at 4.5 → `attempt_ended`; a2 waits 2–6 (240000), at 7 (censored by a
 10–13 and from 13 (`not_observed`); a3 cancelled before any pass is
 `not_observed`. Union 300000, sum 360000; M31 `2/1`; M32
 `360000/660000`; every Herdr call is `agent list`; no screen text stored.
+
+## 7. A4 metadata (B7) and stream version 6
+
+Stream `accounting` version 6 (`0006_a4_metadata.sql`) consumes lane A's A4
+tables (ingest 0004, contracts-collection.md A4), read by SQL only, all
+certified `fixture` until the planned live run: `rollout_metadata`
+(§3 roles and child links, §4 provider check), `codex_usage_times` (§4 usage
+interval) and `codex_rate_limit_windows` (§5 secondary window and reached
+type). It adds the derived tables `session_nodes` (replacing
+`session_graph`: roles `fork`, linkage `linked_child`, `parent_session_id`,
+`link_basis`, `parent_reason`, `claimed_parent_session_id`, `forked`) and
+`quota_window_observations` (replacing `quota_observations`: keyed by window
+kind, trust `not_reported`, `rate_limit_reached_type`), and the append-only
+`valuation_bases(revision, entry_id, usage_basis, provider_check)`. Like
+every stream migration it is re-runnable (`IF NOT EXISTS`, no `ALTER`). The superseded tables
+are left as they were (no longer written or read; nothing is dropped).
+Migrating to 6 clears `usage_ledger`, so everything reads
+`ledger_not_synced` until the next sync.

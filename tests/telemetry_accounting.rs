@@ -26,6 +26,8 @@ const BEFORE: &str = "00000000-0000-4000-8000-0000000b3001";
 const AFTER: &str = "00000000-0000-4000-8000-0000000b3002";
 const STRADDLE: &str = "00000000-0000-4000-8000-0000000b3003";
 const CACHE: &str = "00000000-0000-4000-8000-0000000b3004";
+/// The valuation policy of revisions appended since A4 metadata is consumed.
+const POLICY: &str = "usage_interval=record_time|session_start..first_observed;split=none;provider=checked_when_reported";
 /// Session id written literally in `guardian.jsonl`.
 const GUARDIAN_SID: &str = "00000000-0000-4000-8000-0000000c0de9";
 
@@ -133,7 +135,7 @@ fn model_switch_splits_segments_not_task() {
              "rollouts": [{"path_digest": g, "linkage": "unlinked_child", "parent": null, "evidence": null, "inclusive_total": 50, "attempt_id": attempt}],
              "segments": [segment(1, "codex-auto-review", 2, [25, 5, 1, 30])],
              "mixed": bucket(3, 4, 2, [7, 3, 0, 10]), "unallocated": bucket(1, 1, 1, [8, 2, 0, 10])}],
-        "rollup": {"sessions": 200, "unlinked_children": 50, "incomplete_sessions": 0}}));
+        "rollup": {"sessions": 200, "linked_children": 0, "unlinked_children": 50, "incomplete_sessions": 0}}));
 
     // Segments reconcile to the session: 50 + 150 = 200 and 30 + 10 + 10 = 50;
     // the attempt's M08/M09 still count every accepted record once (160 + 40 input, 40 + 10 output).
@@ -144,7 +146,7 @@ fn model_switch_splits_segments_not_task() {
     f.cli("collect");
     f.cli_args(&["accounting", "sync"]);
     assert_eq!(f.cli_args(&["accounting", "sessions"]).1, first);
-    assert_eq!((f.count("session_graph"), f.count("model_segments")), (3, 5));
+    assert_eq!((f.count("session_nodes"), f.count("model_segments")), (3, 5));
 
     // A third rollout rewriting record 2 of the session quarantines it (contracts §5):
     // inclusion is unknown, so neither the session nor the rollup shows a total.
@@ -156,7 +158,82 @@ fn model_switch_splits_segments_not_task() {
     assert_eq!((&sessions["sessions"][0]["linkage"], &sessions["sessions"][0]["parent"], &sessions["sessions"][0]["total_tokens"]),
         (&"unresolved".into(), &unknown, &unknown));
     let partial = json!({"status": "unavailable", "reason": "incomplete_sessions"});
-    assert_eq!(sessions["rollup"], json!({"sessions": partial, "unlinked_children": partial, "incomplete_sessions": 1}));
+    assert_eq!(sessions["rollup"], json!({"sessions": partial, "linked_children": partial, "unlinked_children": partial, "incomplete_sessions": 1}));
+}
+
+/// Session ids written literally in the child-session rollouts; `ABSENT` is a
+/// parent no rollout carries.
+const PARENT: &str = "00000000-0000-4000-8000-0000000b7001";
+const SPAWNED: &str = "00000000-0000-4000-8000-0000000b7002";
+const FORKED: &str = "00000000-0000-4000-8000-0000000b7003";
+const ORPHAN: &str = "00000000-0000-4000-8000-0000000b7004";
+const ABSENT: &str = "00000000-0000-4000-8000-0000000b7fff";
+
+/// Contracts-collection A4 → B2: a spawned subagent (30) whose
+/// `parent_thread_id` names a collected parent (100) is linked under it with
+/// that basis, certified `fixture`, and kept in a separate `children`
+/// subtotal: the parent stays 100, never 130. A fork (40) of the same parent
+/// is linked by `forked_from_id`, but a fork may replay its parent's records,
+/// so its inclusion and the children subtotal are `fork_replay_not_certified`,
+/// never a sum. A subagent naming a parent that was not collected (20) is
+/// `parent_not_collected`; a `review` guardian (50) has no parent id. Every
+/// record still counts once in M08/M09.
+#[test]
+fn child_sessions_link_to_parent_without_double_count() {
+    let f = Fixture::new();
+    let at = f.decided + 1_000;
+    let part = |name: &str| format!("{ACCOUNTING}/{name}");
+    let plant = |name: &str| f.rollout(&f.home, name, &[&part(&format!("{name}.jsonl"))], &f.worktree(), at, "0.154.0");
+    plant("parent");
+    plant("spawned");
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let (sessions, _) = f.cli_args(&["accounting", "sessions"]);
+    let of = |sessions: &serde_json::Value, sid: &str| sessions["sessions"].as_array().unwrap().iter().find(|s| s["session_id"] == sid).cloned()
+        .unwrap_or_else(|| panic!("{sid} in {sessions}"));
+    let spawned = json!({"session_id": SPAWNED, "role": "subagent", "link_basis": "parent_thread_id", "certified": "fixture", "total_tokens": 30, "inclusion": "separate"});
+    let parent = of(&sessions, PARENT);
+    assert_eq!((&parent["role"], &parent["linkage"], &parent["parent"], &parent["total_tokens"]), (&json!("primary"), &json!("root"), &json!(null), &json!(100)));
+    assert_eq!(parent["children"], json!({"sessions": [spawned], "total_tokens": 30}));
+    let child = of(&sessions, SPAWNED);
+    assert_eq!((&child["role"], &child["linkage"], &child["parent"], &child["total_tokens"]), (&json!("subagent"), &json!("linked_child"),
+        &json!({"session_id": PARENT, "link_basis": "parent_thread_id", "certified": "fixture"}), &json!(30)));
+    assert_eq!(child.get("children"), None);
+    assert_eq!(sessions["rollup"], json!({"sessions": 100, "linked_children": 30, "unlinked_children": 0, "incomplete_sessions": 0}), "100 + 30 apart, never 130 in the parent");
+    let report = f.report();
+    assert_eq!((&report["metrics"]["M08"]["value"], &report["metrics"]["M09"]["value"]), (&json!(80 + 25), &json!(20 + 5)));
+
+    // A fork, a subagent of an uncollected parent and a guardian join.
+    plant("forked");
+    plant("orphan-child");
+    f.rollout(&f.home, "guardian", &[GUARDIAN], &f.worktree(), at, "0.154.0");
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let (sessions, first) = f.cli_args(&["accounting", "sessions"]);
+    let not_certified = json!({"status": "unavailable", "reason": "fork_replay_not_certified"});
+    assert_eq!(of(&sessions, PARENT)["total_tokens"], 100);
+    assert_eq!(of(&sessions, PARENT)["children"], json!({"sessions": [spawned,
+        {"session_id": FORKED, "role": "fork", "link_basis": "forked_from_id", "certified": "fixture", "total_tokens": 40, "inclusion": not_certified}],
+        "total_tokens": not_certified}));
+    let fork = of(&sessions, FORKED);
+    assert_eq!((&fork["role"], &fork["linkage"], &fork["parent"], &fork["total_tokens"]), (&json!("fork"), &json!("linked_child"),
+        &json!({"session_id": PARENT, "link_basis": "forked_from_id", "certified": "fixture"}), &json!(40)));
+    let orphan = of(&sessions, ORPHAN);
+    assert_eq!((&orphan["role"], &orphan["linkage"], &orphan["parent"], &orphan["total_tokens"]), (&json!("subagent"), &json!("unlinked_child"),
+        &json!({"status": "unavailable", "reason": "parent_not_collected", "session_id": ABSENT}), &json!(20)));
+    let guardian = of(&sessions, GUARDIAN_SID);
+    assert_eq!((&guardian["role"], &guardian["linkage"], &guardian["parent"], &guardian["total_tokens"]), (&json!("guardian"), &json!("unlinked_child"),
+        &json!({"status": "unavailable", "reason": "no_native_parent_evidence"}), &json!(50)));
+    assert_eq!(sessions["rollup"], json!({"sessions": 100, "linked_children": not_certified, "unlinked_children": 20 + 50, "incomplete_sessions": 0}));
+    // Each record counts once: 80 + 25 + 30 + 15 + 40 input, 20 + 5 + 10 + 5 + 10 output.
+    let report = f.report();
+    assert_eq!((&report["metrics"]["M08"]["value"], &report["metrics"]["M09"]["value"]), (&json!(190), &json!(50)));
+    assert_eq!(report["metrics"]["M08"]["coverage"], json!({"certified_sessions": 5, "excluded": {}}));
+
+    // Replay: a second collect and sync leave the graph byte-identical.
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "sessions"]).1, first);
 }
 
 /// Rate card fixture `name` (invented synthetic rates) with its rate boundary
@@ -227,7 +304,7 @@ fn repricing_uses_rate_effective_at_usage_time() {
     let valuation = |cost: &serde_json::Value, sid: &str, n: i64| session(cost, sid)["entries"].as_array().unwrap().iter()
         .find(|e| e["entry_id"] == format!("codex:{sid}:{n}")).unwrap()["valuation"].clone();
     assert_eq!((&cost["revision"], &cost["basis"], &cost["policy"]),
-        (&1.into(), &"published_rate_estimate".into(), &"usage_interval=session_start..first_observed;split=none".into()));
+        (&1.into(), &"published_rate_estimate".into(), &POLICY.into()));
 
     // Doc 10 golden: 1000 × 2 / 10^6 + 500 × 4 / 10^6 = 0.004 exactly, by version 1.
     let before = session(&cost, BEFORE);
@@ -314,8 +391,8 @@ fn headroom(f: &Fixture) -> serde_json::Value {
 /// 60,000 ms, fresh; observed increase 60 − 40 = 20. After the reset time the
 /// window reports 5 then 12.25 under a later `resets_at`: a new window
 /// (increase 7.25, remaining 87.75), never a consumption of 5 − 60 = −55.
-/// `secondary` is not collected, so it is unavailable, not 0; M38/M39 have no
-/// certified Codex source.
+/// The rollout reports `secondary: null`, so it is `not_reported`, not 0;
+/// M38/M39 have no certified Codex source.
 #[test]
 fn window_reset_starts_new_window_not_negative() {
     let f = Fixture::new();
@@ -346,9 +423,9 @@ fn window_reset_starts_new_window_not_negative() {
          "window_start_unix_ms": r2 * 1000 - 18_000_000, "resets_unix_ms": r2 * 1000, "start_evidence": "reset_elapsed",
          "first_observed_unix_ms": t5, "last_observed_unix_ms": t5 + 600_000, "first_used": "5", "used": "12.25", "remaining": "87.75",
          "observed_increase": "7.25", "plan_type": "pro", "observations": 2, "flagged": 0}]));
-    assert_eq!(quota["observations"], json!({"trusted": 5, "used_decreased_without_reset": 1}));
+    assert_eq!(quota["observations"], json!({"primary": {"trusted": 5, "used_decreased_without_reset": 1}, "secondary": {"not_reported": 6}}));
     // The drop is kept as observed and flagged inside its window, never subtracted.
-    assert_eq!(f.sidecar().query_row("SELECT used,remaining,trust,window_id FROM quota_observations WHERE observed_unix_ms=?1", [d - 5_400_000],
+    assert_eq!(f.sidecar().query_row("SELECT used,remaining,trust,window_id FROM quota_window_observations WHERE observed_unix_ms=?1 AND window_kind='primary'", [d - 5_400_000],
         |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?))).unwrap(),
         ("50".to_owned(), "50".to_owned(), "used_decreased_without_reset".to_owned(), w1.clone()));
 
@@ -356,10 +433,10 @@ fn window_reset_starts_new_window_not_negative() {
     assert_eq!(headroom(&f), json!({"attempt_id": f.attempt, "decided_unix_ms": d, "service": "codex", "account": account, "windows": [
         {"limit_id": "codex", "window_kind": "primary", "unit": "percent", "window_id": w1, "window_minutes": 300, "resets_unix_ms": r1 * 1000,
          "observed_unix_ms": t4, "age_ms": 60_000, "value": "40", "used": "60", "freshness": "fresh"},
-        {"limit_id": "codex", "window_kind": "secondary", "value": unavailable("not_collected")}]}));
+        {"limit_id": "codex", "window_kind": "secondary", "value": unavailable("not_reported")}]}));
     assert_eq!((&quota["metrics"]["M40"]["definition"], &quota["metrics"]["M40"]["stale_after_ms"]), (&json!("M40.quota-windows-v1"), &json!(900_000)));
     let text = f.text(&["accounting", "quota"]);
-    for line in [format!("M40 {} codex primary remaining 40% age_ms=60000 fresh", f.attempt), format!("M40 {} codex secondary n/a (not_collected)", f.attempt),
+    for line in [format!("M40 {} codex primary remaining 40% age_ms=60000 fresh", f.attempt), format!("M40 {} codex secondary n/a (not_reported)", f.attempt),
         "M38 throttled_time_share n/a (throttling_not_certified)".to_owned()] {
         assert!(text.lines().any(|l| l == line), "{line:?} in\n{text}");
     }
@@ -374,7 +451,7 @@ fn window_reset_starts_new_window_not_negative() {
     f.cli("collect");
     f.cli_args(&["accounting", "sync"]);
     assert_eq!(f.cli_args(&["accounting", "quota", "--json"]).1, first);
-    assert_eq!((f.count("quota_observations"), f.count("quota_windows")), (6, 2));
+    assert_eq!((f.count("quota_window_observations"), f.count("quota_windows")), (12, 2));
 
     // A snapshot 20 minutes old at dispatch is stale (value kept with its age); one
     // whose window reset before the decision no longer applies.
@@ -407,9 +484,138 @@ fn window_reset_starts_new_window_not_negative() {
     f.cli("collect");
     assert_eq!(f.cli_args(&["accounting", "sync"]).0["quota_windows"], 0);
     let (quota, _) = f.cli_args(&["accounting", "quota", "--json"]);
-    assert_eq!((&quota["windows"], &quota["observations"]), (&json!([]), &json!({"incomplete": 1})));
+    assert_eq!((&quota["windows"], &quota["observations"]), (&json!([]), &json!({"primary": {"incomplete": 1}, "secondary": {"not_reported": 1}})));
     assert_eq!(headroom(&f)["value"], unavailable("no_trusted_observation"));
     assert!(f.text(&["accounting", "quota"]).lines().any(|l| l == format!("M40 {} n/a (no_trusted_observation)", f.attempt)));
+}
+
+/// Session ids written literally in the record-time rollouts.
+const TIMED: &str = "00000000-0000-4000-8000-0000000b7101";
+const OTHER_PROVIDER: &str = "00000000-0000-4000-8000-0000000b7102";
+const UNVERIFIED: &str = "00000000-0000-4000-8000-0000000b7103";
+
+/// Contracts-collection A4 → B3: one session starting before a rate boundary
+/// and first observed after it. With its A4 record times each record is
+/// priced by the card at its own time: 1,000 in + 500 out before the boundary
+/// at $0.004 (version 1), 800 new + 200 cached + 300 out after it at $0.0041
+/// (version 2). Its record without a line time falls back to session start →
+/// first observed, which straddles the boundary: unavailable, not split. A
+/// session reporting provider `openai` against the `synthetic` cards is
+/// `provider_mismatch`; one reporting none is priced ($0.00036) but marked
+/// `provider_unverified`. A corrected version 3 appends revision 2 only; the
+/// first reads back byte-identical.
+#[test]
+fn record_times_narrow_rate_card_interval() {
+    let f = Fixture::new();
+    let d = f.decided;
+    let boundary = d + 200;
+    quota_rollout(&f, "timed", "timed.jsonl", d, &[d + 100, d + 300], &[]);
+    quota_rollout(&f, "other-provider", "other-provider.jsonl", d, &[d + 100], &[]);
+    quota_rollout(&f, "unverified", "unverified.jsonl", d, &[d + 300], &[]);
+    while unix_ms() <= d + 300 { std::thread::sleep(Duration::from_millis(1)); }
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let measured = f.cli_args(&["accounting", "entries"]).1;
+    for name in ["rates-v1.json", "rates-v2.toml"] { f.cli_args(&["accounting", "import-rate-card", &rate_card(&f, name, boundary)]); }
+    assert_eq!(f.cli_args(&["accounting", "reprice"]).0, json!({"revision": 1, "appended": true, "entries": 5}));
+    assert_eq!(f.cli_args(&["accounting", "reprice"]).0, json!({"revision": 1, "appended": false, "entries": 5}));
+    let (cost, first) = f.cli_args(&["accounting", "cost", "--json"]);
+    assert_eq!(cost["policy"], POLICY);
+    let entry = |cost: &serde_json::Value, sid: &str, n: i64| cost["sessions"].as_array().unwrap().iter().find(|s| s["session_id"] == sid).unwrap()["entries"]
+        .as_array().unwrap().iter().find(|e| e["entry_id"] == format!("codex:{sid}:{n}")).cloned().unwrap();
+    let priced = |version: i64, amount: &str, components: serde_json::Value| json!({"status": "priced", "basis": "published_rate_estimate",
+        "rate_card": {"card_id": "synthetic-codex", "version": version}, "currency": "USD", "amount": amount, "components": components});
+    let at = |t: i64| json!({"from_unix_ms": t, "to_unix_ms": t, "basis": "record_time"});
+
+    // 1000 × 2 + 500 × 4 per 10^6 = 0.004 at d + 100 (version 1).
+    let e = entry(&cost, TIMED, 1);
+    assert_eq!((&e["usage_interval"], &e["valuation"], &e["provider_check"]),
+        (&at(d + 100), &priced(1, "0.004", json!({"input": "0.002", "output": "0.002"})), &json!("matched")));
+    // 800 × 2 + 200 × 0.5 + 300 × 8 per 10^6 = 0.0041 at d + 300 (version 2).
+    let e = entry(&cost, TIMED, 2);
+    assert_eq!((&e["usage_interval"], &e["valuation"], &e["provider_check"]),
+        (&at(d + 300), &priced(2, "0.0041", json!({"input": "0.0016", "cache_read": "0.0001", "output": "0.0024"})), &json!("matched")));
+    // No line time: session start → first observation, across the boundary.
+    let e = entry(&cost, TIMED, 3);
+    assert_eq!((&e["usage_interval"]["from_unix_ms"], &e["usage_interval"]["basis"], &e["valuation"], e.get("provider_check")),
+        (&json!(d), &json!("session_start..first_observed"), &json!({"status": "unavailable", "reason": "rate_change_within_usage_interval"}), None));
+    assert!(e["usage_interval"]["to_unix_ms"].as_i64().unwrap() > boundary);
+    assert_eq!(entry(&cost, OTHER_PROVIDER, 1)["valuation"], json!({"status": "unavailable", "reason": "provider_mismatch"}));
+    // 100 × 2 + 20 × 8 per 10^6 = 0.00036, no provider to check.
+    let e = entry(&cost, UNVERIFIED, 1);
+    assert_eq!((&e["valuation"], &e["provider_check"]), (&priced(2, "0.00036", json!({"input": "0.0002", "output": "0.00016"})), &json!("provider_unverified")));
+    assert_eq!(cost["attempts"], json!([{"attempt_id": f.attempt, "estimate": {"status": "partial", "reason": "unpriced_entries", "currency": "USD", "priced_amount": "0.00846"},
+        "coverage": {"entries": 5, "priced": 3, "unpriced": {"provider_mismatch": 1, "rate_change_within_usage_interval": 1}}, "unlinked_children": null}]));
+
+    // Version 3 (output 6 from the boundary): 800 × 2 + 200 × 0.5 + 300 × 6 = 0.0035; 100 × 2 + 20 × 6 = 0.00032.
+    f.cli_args(&["accounting", "import-rate-card", &rate_card(&f, "rates-v3.json", boundary)]);
+    assert_eq!(f.cli_args(&["accounting", "reprice"]).0, json!({"revision": 2, "appended": true, "entries": 5}));
+    let (cost, _) = f.cli_args(&["accounting", "cost", "--json"]);
+    assert_eq!(entry(&cost, TIMED, 1)["valuation"], priced(1, "0.004", json!({"input": "0.002", "output": "0.002"})));
+    assert_eq!(entry(&cost, TIMED, 2)["valuation"], priced(3, "0.0035", json!({"input": "0.0016", "cache_read": "0.0001", "output": "0.0018"})));
+    assert_eq!(entry(&cost, UNVERIFIED, 1)["valuation"], priced(3, "0.00032", json!({"input": "0.0002", "output": "0.00012"})));
+    assert_eq!(cost["attempts"][0]["estimate"]["priced_amount"], "0.00782");
+    assert_eq!(f.cli_args(&["accounting", "cost", "--json", "--revision", "1"]).1, first);
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "reprice"]).0, json!({"revision": 2, "appended": false, "entries": 5}));
+    assert_eq!(f.cli_args(&["accounting", "entries"]).1, measured);
+    assert_eq!((f.count("valuation_revisions"), f.count("valuations")), (2, 10));
+}
+
+/// Contracts-collection A4 → B4: the snapshot's `secondary` window (10,080
+/// minutes) is a second window kind under the primary's trust rules. It reads
+/// 10 → 12.5 before dispatch (headroom 87.5, age 120,000 ms, increase 2.5),
+/// then 11 without a reset (flagged, not subtracted), then `null`
+/// (`not_reported`). The primary resets meanwhile (20 → 30, then 5 → 6 in a
+/// new window). `rate_limit_reached_type` is counted as evidence only; M38
+/// stays unavailable. Snapshots read before A4 have no secondary row:
+/// `not_collected`.
+#[test]
+fn secondary_window_is_tracked() {
+    let f = Fixture::new();
+    let d = f.decided;
+    let (r1, s1) = (d / 1000 + 3_600, d / 1000 + 86_400);
+    let r2 = r1 + 18_000;
+    let (t3, t2) = (r1 * 1000 + 60_000, d - 120_000);
+    quota_rollout(&f, "secondary", "quota-secondary.jsonl", d - 7_200_000, &[d - 7_200_000, t2, t3, t3 + 60_000], &[r1, r2, s1]);
+    f.cli("collect");
+    assert_eq!(f.cli_args(&["accounting", "sync"]).0["quota_windows"], 3);
+    let (quota, first) = f.cli_args(&["accounting", "quota", "--json"]);
+    let account = digest(&f.home);
+    let id = |kind: &str, resets: i64| format!("codex:{account}:codex:{kind}:{}", resets * 1000);
+    let window = |kind: &str, minutes: i64, resets: i64, evidence: &str, (first, last): (i64, i64), [first_used, used, remaining, increase]: [&str; 4], (observations, flagged): (i64, i64)|
+        json!({"window_id": id(kind, resets), "service": "codex", "account": account, "limit_id": "codex", "window_kind": kind, "unit": "percent",
+            "window_minutes": minutes, "window_start_unix_ms": resets * 1000 - minutes * 60_000, "resets_unix_ms": resets * 1000, "start_evidence": evidence,
+            "first_observed_unix_ms": first, "last_observed_unix_ms": last, "first_used": first_used, "used": used, "remaining": remaining,
+            "observed_increase": increase, "plan_type": "pro", "observations": observations, "flagged": flagged});
+    assert_eq!(quota["windows"], json!([
+        window("primary", 300, r1, "first_observation", (d - 7_200_000, t2), ["20", "30", "70", "10"], (2, 0)),
+        window("primary", 300, r2, "reset_elapsed", (t3, t3 + 60_000), ["5", "6", "94", "1"], (2, 0)),
+        window("secondary", 10_080, s1, "first_observation", (d - 7_200_000, t2), ["10", "12.5", "87.5", "2.5"], (2, 1))]));
+    assert_eq!(quota["observations"], json!({"primary": {"trusted": 4}, "secondary": {"trusted": 2, "used_decreased_without_reset": 1, "not_reported": 1}}));
+    assert_eq!(quota["evidence"], json!({"rate_limit_reached_type": {"snapshots": {"primary": 1}, "semantics": "not_certified", "certified": "fixture"}}));
+    assert_eq!(quota["metrics"]["M38"]["value"], json!({"status": "unavailable", "reason": "throttling_not_certified"}));
+
+    // Headroom at dispatch per window kind, from the snapshot two minutes before it.
+    let at = |kind: &str, minutes: i64, resets: i64, value: &str, used: &str| json!({"limit_id": "codex", "window_kind": kind, "unit": "percent",
+        "window_id": id(kind, resets), "window_minutes": minutes, "resets_unix_ms": resets * 1000, "observed_unix_ms": t2, "age_ms": 120_000,
+        "value": value, "used": used, "freshness": "fresh"});
+    assert_eq!(headroom(&f)["windows"], json!([at("primary", 300, r1, "70", "30"), at("secondary", 10_080, s1, "87.5", "12.5")]));
+    assert!(f.text(&["accounting", "quota"]).lines().any(|l| l == format!("M40 {} codex secondary remaining 87.5% age_ms=120000 fresh", f.attempt)));
+
+    // Replay: a second collect and sync leave the windows byte-identical.
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "quota", "--json"]).1, first);
+    assert_eq!((f.count("quota_window_observations"), f.count("quota_windows")), (8, 3));
+
+    // Fixture only: snapshots stored before A4 have no secondary row.
+    f.sidecar().execute_batch("DELETE FROM codex_rate_limit_windows").unwrap();
+    f.cli_args(&["accounting", "sync"]);
+    let (quota, _) = f.cli_args(&["accounting", "quota", "--json"]);
+    assert_eq!(quota["observations"], json!({"primary": {"trusted": 4}}));
+    assert_eq!(headroom(&f)["windows"][1], json!({"limit_id": "codex", "window_kind": "secondary", "value": {"status": "unavailable", "reason": "not_collected"}}));
 }
 
 /// Herdr stand-in: logs every call with its socket, answers `agent list` from
@@ -483,7 +689,7 @@ fn attention_intervals_union_and_censor() {
         (serde_json::from_str(&text).unwrap_or(serde_json::Value::Null), text)
     };
     cli(&["collect"]);
-    assert_eq!(cli(&["accounting", "status"]).0, json!({"stream": "accounting", "version": 5}));
+    assert_eq!(cli(&["accounting", "status"]).0, json!({"stream": "accounting", "version": 6}));
     // Before any pass nothing was collected: unavailable, never 0.
     let report = cli(&["report", "--json"]).0;
     for id in ["M31", "M32", "M33"] {

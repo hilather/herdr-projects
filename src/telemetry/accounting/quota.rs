@@ -1,5 +1,6 @@
 //! Quota windows (docs/telemetry/contracts-accounting.md §5, doc 05 §5b):
-//! Codex rate-limit snapshots (`codex_rate_limits`, read by SQL only) become
+//! Codex rate-limit snapshots (`codex_rate_limits` and, from A4, the secondary
+//! window in `codex_rate_limit_windows`, read by SQL only) become
 //! observations with a trust level and the provider windows they identify,
 //! rebuilt whole by each sync. A reset starts a new window, so nothing is ever
 //! subtracted across one; a `used` below the window's high-water mark without
@@ -18,9 +19,8 @@ pub const STALE_AFTER_MS: i64 = 900_000;
 /// Fixed-point places for native percent values (Codex prints at most a few).
 const PLACES: u32 = 12;
 const HUNDRED: i128 = 100 * 10i128.pow(PLACES);
-/// The Codex collector (contracts §5 allowlist) stores only the `primary` window.
-const COLLECTED: &str = "primary";
-const NOT_COLLECTED: &str = "secondary";
+/// Window kinds of a Codex snapshot; `secondary` comes from A4 (ingest 0004), certified `fixture`.
+const KINDS: [&str; 2] = ["primary", "secondary"];
 
 /// `0 ≤ used ≤ 100` in plain decimal notation, as a fixed-point value.
 fn percent(text: &str) -> Option<i128> {
@@ -43,6 +43,7 @@ struct Window {
     id: String,
     account: String,
     limit: String,
+    kind: &'static str,
     minutes: i64,
     resets: i64,
     evidence: &'static str,
@@ -59,6 +60,7 @@ struct Window {
 struct Snapshot<'a> {
     account: &'a str,
     limit: &'a str,
+    kind: &'static str,
     minutes: i64,
     resets: i64,
     observed: i64,
@@ -68,73 +70,86 @@ struct Snapshot<'a> {
 
 impl Window {
     fn open(s: &Snapshot, evidence: &'static str) -> Window {
-        Window { id: format!("codex:{}:{}:{COLLECTED}:{}", s.account, s.limit, s.resets), account: s.account.to_owned(), limit: s.limit.to_owned(),
+        Window { id: format!("codex:{}:{}:{}:{}", s.account, s.limit, s.kind, s.resets), account: s.account.to_owned(), limit: s.limit.to_owned(), kind: s.kind,
             minutes: s.minutes, resets: s.resets, evidence, first_observed: s.observed, last_observed: s.observed, first_used: s.used, used: s.used,
             plan: s.plan.clone(), observations: 1, flagged: 0 }
     }
 }
 
-/// Rebuild `quota_observations` and `quota_windows` inside the sync
-/// transaction; returns the number of windows. Per account (execution home)
-/// and limit, snapshots are taken in `(observed, session, ordinal)` order.
+/// One window of a snapshot as collected: `used_percent` text, `window_minutes`, `resets_at` seconds.
+type Fields = (Option<String>, Option<i64>, Option<i64>);
+
+/// Rebuild `quota_window_observations` and `quota_windows` inside the sync
+/// transaction; returns the number of windows. Per account (execution home),
+/// limit and window kind, snapshots are taken in `(observed, session, ordinal)`
+/// order. The secondary window (A4) follows the same rules; a snapshot whose
+/// A4 row is absent (read before A4) has no secondary observation.
 pub fn store(tx: &Connection) -> Result<usize> {
-    tx.execute_batch("DELETE FROM quota_observations; DELETE FROM quota_windows;")?;
-    type Row = (String, i64, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<String>, i64, Option<String>, i64);
+    tx.execute_batch("DELETE FROM quota_window_observations; DELETE FROM quota_windows;")?;
+    type Row = (String, i64, Option<String>, Fields, Option<String>, i64, Option<String>, i64, Option<Fields>, Option<String>);
     let rows: Vec<Row> = tx.prepare("SELECT l.session_id,l.ordinal,l.limit_id,l.used_percent,l.window_minutes,l.resets_at,l.plan_type,l.observed_ts,
         (SELECT min(s.home_digest) FROM rollout_sources s WHERE s.session_id=l.session_id),
-        (SELECT count(DISTINCT s.home_digest) FROM rollout_sources s WHERE s.session_id=l.session_id)
-        FROM codex_rate_limits l ORDER BY l.observed_ts,l.session_id,l.ordinal")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)))?
+        (SELECT count(DISTINCT s.home_digest) FROM rollout_sources s WHERE s.session_id=l.session_id),
+        w.session_id IS NOT NULL,w.secondary_used_percent,w.secondary_window_minutes,w.secondary_resets_at,w.rate_limit_reached_type
+        FROM codex_rate_limits l LEFT JOIN codex_rate_limit_windows w ON w.session_id=l.session_id AND w.ordinal=l.ordinal
+        ORDER BY l.observed_ts,l.session_id,l.ordinal")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, (r.get(3)?, r.get(4)?, r.get(5)?), r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?,
+            r.get::<_, bool>(10)?.then(|| Ok::<_, rusqlite::Error>((r.get(11)?, r.get(12)?, r.get(13)?))).transpose()?, r.get(14)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    let (mut current, mut done) = (BTreeMap::<(String, String), Window>::new(), Vec::new());
-    for (session, ordinal, limit, used_text, minutes, resets_s, plan, observed, account, homes) in rows {
-        let used = used_text.as_deref().and_then(percent);
-        let resets = resets_s.and_then(|s| s.checked_mul(1000));
-        let (trust, window_id) = match (&account, &limit, &used_text, minutes, resets) {
-            (Some(_), _, _, _, _) if homes > 1 => ("account_ambiguous", None),
-            (Some(account), Some(limit), Some(_), Some(minutes), Some(resets)) => match used {
-                Some(used) if minutes > 0 && minutes.checked_mul(60_000).is_some_and(|w| resets.checked_sub(w).is_some()) => {
-                    let key = (account.clone(), limit.clone());
-                    let snapshot = Snapshot { account, limit, minutes, resets, observed, used, plan: &plan };
-                    match current.get_mut(&key) {
-                        None => {
-                            let w = Window::open(&snapshot, "first_observation");
-                            let id = w.id.clone();
-                            current.insert(key, w);
-                            ("trusted", Some(id))
-                        }
-                        Some(w) if resets > w.resets => {
-                            let evidence = if observed >= w.resets { "reset_elapsed" } else { "reset_moved" };
-                            let next = Window::open(&snapshot, evidence);
-                            let id = next.id.clone();
-                            done.push(std::mem::replace(w, next));
-                            ("trusted", Some(id))
-                        }
-                        Some(w) if resets < w.resets => ("window_regressed", None),
-                        Some(w) if minutes != w.minutes => ("window_conflict", None),
-                        Some(w) if used < w.used => { w.flagged += 1; ("used_decreased_without_reset", Some(w.id.clone())) }
-                        Some(w) => {
-                            (w.used, w.last_observed, w.observations) = (used, observed, w.observations + 1);
-                            if plan.is_some() { w.plan = plan.clone(); }
-                            ("trusted", Some(w.id.clone()))
+    let (mut current, mut done) = (BTreeMap::<(String, String, &str), Window>::new(), Vec::new());
+    for (session, ordinal, limit, primary, plan, observed, account, homes, secondary, reached) in rows {
+        for (kind, fields) in KINDS.into_iter().zip([Some(primary), secondary]) {
+            let Some((used_text, minutes, resets_s)) = fields else { continue };
+            let used = used_text.as_deref().and_then(percent);
+            let resets = resets_s.and_then(|s| s.checked_mul(1000));
+            let (trust, window_id) = match (&account, &limit, &used_text, minutes, resets) {
+                (Some(_), _, _, _, _) if homes > 1 => ("account_ambiguous", None),
+                // A secondary window the rollout reported as `null`.
+                (_, _, None, None, None) if kind == "secondary" => ("not_reported", None),
+                (Some(account), Some(limit), Some(_), Some(minutes), Some(resets)) => match used {
+                    Some(used) if minutes > 0 && minutes.checked_mul(60_000).is_some_and(|w| resets.checked_sub(w).is_some()) => {
+                        let key = (account.clone(), limit.clone(), kind);
+                        let snapshot = Snapshot { account, limit, kind, minutes, resets, observed, used, plan: &plan };
+                        match current.get_mut(&key) {
+                            None => {
+                                let w = Window::open(&snapshot, "first_observation");
+                                let id = w.id.clone();
+                                current.insert(key, w);
+                                ("trusted", Some(id))
+                            }
+                            Some(w) if resets > w.resets => {
+                                let evidence = if observed >= w.resets { "reset_elapsed" } else { "reset_moved" };
+                                let next = Window::open(&snapshot, evidence);
+                                let id = next.id.clone();
+                                done.push(std::mem::replace(w, next));
+                                ("trusted", Some(id))
+                            }
+                            Some(w) if resets < w.resets => ("window_regressed", None),
+                            Some(w) if minutes != w.minutes => ("window_conflict", None),
+                            Some(w) if used < w.used => { w.flagged += 1; ("used_decreased_without_reset", Some(w.id.clone())) }
+                            Some(w) => {
+                                (w.used, w.last_observed, w.observations) = (used, observed, w.observations + 1);
+                                if plan.is_some() { w.plan = plan.clone(); }
+                                ("trusted", Some(w.id.clone()))
+                            }
                         }
                     }
-                }
-                _ => ("unparseable", None),
-            },
-            _ => ("incomplete", None),
-        };
-        let account = account.filter(|_| homes == 1);
-        tx.execute("INSERT INTO quota_observations(session_id,ordinal,service,account,limit_id,window_kind,unit,window_minutes,resets_unix_ms,used,remaining,plan_type,
-            observed_unix_ms,trust,window_id) VALUES(?1,?2,'codex',?3,?4,?5,'percent',?6,?7,?8,?9,?10,?11,?12,?13)",
-            params![session, ordinal, account, limit, COLLECTED, minutes, resets, used.map(show), used.map(|u| show(HUNDRED - u)), plan, observed, trust, window_id])?;
+                    _ => ("unparseable", None),
+                },
+                _ => ("incomplete", None),
+            };
+            tx.execute("INSERT INTO quota_window_observations(session_id,ordinal,service,account,limit_id,window_kind,unit,window_minutes,resets_unix_ms,used,remaining,
+                plan_type,observed_unix_ms,trust,window_id,rate_limit_reached_type) VALUES(?1,?2,'codex',?3,?4,?5,'percent',?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                params![session, ordinal, account.as_ref().filter(|_| homes == 1), limit, kind, minutes, resets, used.map(show), used.map(|u| show(HUNDRED - u)),
+                    plan, observed, trust, window_id, reached])?;
+        }
     }
     done.extend(current.into_values());
     for w in &done {
         tx.execute("INSERT INTO quota_windows(window_id,service,account,limit_id,window_kind,unit,window_minutes,window_start_unix_ms,resets_unix_ms,start_evidence,
             first_observed_unix_ms,last_observed_unix_ms,first_used,used,remaining,observed_increase,plan_type,observations,flagged)
             VALUES(?1,'codex',?2,?3,?4,'percent',?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
-            params![w.id, w.account, w.limit, COLLECTED, w.minutes, w.resets - w.minutes * 60_000, w.resets, w.evidence, w.first_observed, w.last_observed,
+            params![w.id, w.account, w.limit, w.kind, w.minutes, w.resets - w.minutes * 60_000, w.resets, w.evidence, w.first_observed, w.last_observed,
                 show(w.first_used), show(w.used), show(HUNDRED - w.used), show(w.used - w.first_used), w.plan, w.observations, w.flagged])?;
     }
     Ok(done.len())
@@ -142,13 +157,13 @@ pub fn store(tx: &Connection) -> Result<usize> {
 
 pub(crate) fn synced(db: &Connection) -> Result<bool> {
     let table = |name: &str| db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [name], |r| r.get::<_, bool>(0));
-    Ok(table("usage_ledger")? && table("quota_windows")? && db.query_row("SELECT 1 FROM usage_ledger", [], |_| Ok(())).optional()?.is_some())
+    Ok(table("usage_ledger")? && table("quota_window_observations")? && db.query_row("SELECT 1 FROM usage_ledger", [], |_| Ok(())).optional()?.is_some())
 }
 
 /// M38/M39 (doc 07): Codex 0.154.0 exposes neither on a certified field.
 pub fn availability_metrics() -> [(&'static str, &'static str, Value); 2] {
     [("M38", "throttled_time_share", json!({"value": unavailable("throttling_not_certified"),
-        "detail": "codex rollouts record no throttled intervals; the collector allowlist (contracts §5) keeps no availability events"})),
+        "detail": "codex rollouts record no throttled intervals; rate_limit_reached_type is kept as evidence only, its semantics are not certified"})),
      ("M39", "provider_error_rate", json!({"value": unavailable("provider_errors_not_certified"),
         "detail": "no typed provider error field is collected or certified for codex 0.154.0; human-readable messages are never certified"}))]
 }
@@ -170,35 +185,47 @@ fn decisions(project: &Path) -> Result<Vec<Decision>> {
     Ok(rows)
 }
 
-/// Extended M40 for one decision: per limit and window kind, the latest
-/// trusted remaining value of the attempt's account observed at or before the
-/// decision, with its age. Native percent; never summed across accounts or services.
+/// One window kind of one limit at a decision: the latest trusted remaining
+/// value of the account observed at or before it, with its age. Without one:
+/// `not_reported` (the latest snapshot's window was `null`), `not_collected`
+/// (no snapshot carries the kind, e.g. read before A4), else `no_trusted_observation`.
+fn window(db: &Connection, account: &str, limit: &str, kind: &str, decided: i64) -> Result<Value> {
+    let trusted = db.query_row("SELECT window_id,observed_unix_ms,resets_unix_ms,window_minutes,used,remaining FROM quota_window_observations
+        WHERE account=?1 AND limit_id=?2 AND window_kind=?3 AND observed_unix_ms<=?4 AND trust='trusted'
+        ORDER BY observed_unix_ms DESC,session_id DESC,ordinal DESC LIMIT 1", params![account, limit, kind, decided],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?))).optional()?;
+    let Some((window, observed, resets, minutes, used, remaining)) = trusted else {
+        let latest: Option<String> = db.query_row("SELECT trust FROM quota_window_observations WHERE account=?1 AND limit_id=?2 AND window_kind=?3 AND observed_unix_ms<=?4
+            ORDER BY observed_unix_ms DESC,session_id DESC,ordinal DESC LIMIT 1", params![account, limit, kind, decided], |r| r.get(0)).optional()?;
+        let reason = match latest.as_deref() { Some("not_reported") => "not_reported", None => "not_collected", Some(_) => "no_trusted_observation" };
+        return Ok(json!({"limit_id": limit, "window_kind": kind, "value": unavailable(reason)}));
+    };
+    let age = decided - observed;
+    let mut entry = json!({"limit_id": limit, "window_kind": kind, "unit": "percent", "window_id": window, "window_minutes": minutes,
+        "resets_unix_ms": resets, "observed_unix_ms": observed, "age_ms": age});
+    if decided >= resets {
+        // The window reset after the snapshot: its remaining value no longer applies, and the new window's is unknown.
+        entry["value"] = unavailable("window_reset_since_observation");
+    } else {
+        entry["value"] = json!(remaining);
+        entry["used"] = json!(used);
+        entry["freshness"] = json!(if age > STALE_AFTER_MS { "stale" } else { "fresh" });
+    }
+    Ok(entry)
+}
+
+/// Extended M40 for one decision: per limit, each window kind (`window`).
+/// Native percent; never summed across accounts, limits, kinds or services.
 pub(crate) fn headroom(db: &Connection, home: &str, decided: i64) -> Result<Value> {
     let account = format!("sha256:{:x}", <sha2::Sha256 as sha2::Digest>::digest(home.as_bytes()));
-    let seen: i64 = db.query_row("SELECT count(*) FROM quota_observations WHERE account=?1 AND observed_unix_ms<=?2", params![account, decided], |r| r.get(0))?;
+    let seen: i64 = db.query_row("SELECT count(*) FROM quota_window_observations WHERE account=?1 AND observed_unix_ms<=?2", params![account, decided], |r| r.get(0))?;
     if seen == 0 { return Ok(json!({"account": account, "value": unavailable("no_observation")})); }
-    let limits: Vec<String> = db.prepare("SELECT DISTINCT limit_id FROM quota_observations WHERE account=?1 AND observed_unix_ms<=?2 AND trust='trusted' ORDER BY limit_id")?
+    let limits: Vec<String> = db.prepare("SELECT DISTINCT limit_id FROM quota_window_observations WHERE account=?1 AND observed_unix_ms<=?2 AND trust='trusted' ORDER BY limit_id")?
         .query_map(params![account, decided], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
     if limits.is_empty() { return Ok(json!({"account": account, "value": unavailable("no_trusted_observation")})); }
     let mut windows = Vec::new();
     for limit in limits {
-        let (window, observed, resets, minutes, used, remaining): (String, i64, i64, i64, String, String) = db.query_row("SELECT window_id,observed_unix_ms,resets_unix_ms,
-            window_minutes,used,remaining FROM quota_observations WHERE account=?1 AND limit_id=?2 AND observed_unix_ms<=?3 AND trust='trusted'
-            ORDER BY observed_unix_ms DESC,session_id DESC,ordinal DESC LIMIT 1", params![account, limit, decided],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?;
-        let age = decided - observed;
-        let mut entry = json!({"limit_id": limit, "window_kind": COLLECTED, "unit": "percent", "window_id": window, "window_minutes": minutes,
-            "resets_unix_ms": resets, "observed_unix_ms": observed, "age_ms": age});
-        if decided >= resets {
-            // The window reset after the snapshot: its remaining value no longer applies, and the new window's is unknown.
-            entry["value"] = unavailable("window_reset_since_observation");
-        } else {
-            entry["value"] = json!(remaining);
-            entry["used"] = json!(used);
-            entry["freshness"] = json!(if age > STALE_AFTER_MS { "stale" } else { "fresh" });
-        }
-        windows.push(entry);
-        windows.push(json!({"limit_id": limit, "window_kind": NOT_COLLECTED, "value": unavailable("not_collected")}));
+        for kind in KINDS { windows.push(window(db, &account, &limit, kind, decided)?); }
     }
     Ok(json!({"account": account, "windows": windows}))
 }
@@ -217,10 +244,18 @@ pub fn read(project: &Path, db: &Connection) -> Result<Value> {
             "used": r.get::<_, String>(12)?, "remaining": r.get::<_, String>(13)?, "observed_increase": r.get::<_, String>(14)?,
             "plan_type": r.get::<_, Option<String>>(15)?, "observations": r.get::<_, i64>(16)?, "flagged": r.get::<_, i64>(17)?})))?
         .collect::<rusqlite::Result<_>>()?;
-    let mut trust = BTreeMap::<String, i64>::new();
-    for row in db.prepare("SELECT trust,count(*) FROM quota_observations GROUP BY trust")?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+    let mut trust = BTreeMap::<String, BTreeMap<String, i64>>::new();
+    for row in db.prepare("SELECT window_kind,trust,count(*) FROM quota_window_observations GROUP BY window_kind,trust")?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))? {
+        let (kind, t, n) = row?;
+        trust.entry(kind).or_default().insert(t, n);
+    }
+    // `rate_limit_reached_type` per snapshot: evidence only, never a throttling metric.
+    let mut reached = BTreeMap::<String, i64>::new();
+    for row in db.prepare("SELECT rate_limit_reached_type,count(DISTINCT session_id||':'||ordinal) FROM quota_window_observations
+        WHERE rate_limit_reached_type IS NOT NULL GROUP BY 1")?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
         let (t, n) = row?;
-        trust.insert(t, n);
+        reached.insert(t, n);
     }
     let mut list = Vec::new();
     for (attempt, kind, home, decided) in decisions(project)? {
@@ -239,7 +274,8 @@ pub fn read(project: &Path, db: &Connection) -> Result<Value> {
     let mut m40 = super::metric("M40", "quota_headroom_at_dispatch", json!({"decisions": list, "stale_after_ms": STALE_AFTER_MS}));
     m40["definition"] = json!("M40.quota-windows-v1");
     metrics.insert("M40".to_owned(), m40);
-    Ok(json!({"semantics": "not_certified", "windows": windows, "observations": trust, "metrics": metrics}))
+    Ok(json!({"semantics": "not_certified", "windows": windows, "observations": trust,
+        "evidence": {"rate_limit_reached_type": {"snapshots": reached, "semantics": "not_certified", "certified": "fixture"}}, "metrics": metrics}))
 }
 
 /// Text view: one line per window, metric and decision window; unknown is `n/a (<reason>)`, never 0.

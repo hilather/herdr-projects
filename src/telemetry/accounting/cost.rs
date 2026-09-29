@@ -11,8 +11,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 pub const BASIS: &str = "published_rate_estimate";
-/// How the usage time of an entry is bounded, and that a rate change inside it is never split.
-pub const POLICY: &str = "usage_interval=session_start..first_observed;split=none";
+/// How the usage time of an entry is bounded (its record time when collected,
+/// else session start to first observation), that a rate change inside it is
+/// never split, and that a reported model provider must match the card's.
+pub const POLICY: &str = "usage_interval=record_time|session_start..first_observed;split=none;provider=checked_when_reported";
+/// The policy of revisions appended before A4 metadata was consumed.
+const LEGACY_POLICY: &str = "usage_interval=session_start..first_observed;split=none";
+const RECORD_TIME: &str = "record_time";
+const FALLBACK: &str = "session_start..first_observed";
 const CATEGORIES: [&str; 4] = ["input", "cache_read", "cache_write", "output"];
 /// Text view: amounts rounded half-up to this many decimal places.
 const TEXT_PLACES: u32 = 6;
@@ -313,6 +319,7 @@ pub fn list(db: &Connection) -> Result<Value> {
 struct Card {
     id: String,
     version: i64,
+    provider: String,
     currency: String,
     places: u32,
     from: i64,
@@ -322,7 +329,7 @@ struct Card {
 }
 
 /// One valuation row (the `valuations` columns after `revision`).
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct Row {
     entry_id: String,
     session_id: String,
@@ -330,6 +337,9 @@ struct Row {
     attempt_id: Option<String>,
     model: Option<String>,
     usage: Option<(i64, i64)>,
+    /// How `usage` was bounded (`record_time` or the fallback); absent in a legacy revision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage_basis: Option<&'static str>,
     /// `[new_input, cache_read, cache_write, output]`.
     quantities: Option<[i64; 4]>,
     reason: Option<String>,
@@ -337,6 +347,18 @@ struct Row {
     currency: Option<String>,
     amount: Option<String>,
     components: Option<BTreeMap<String, String>>,
+    /// A priced entry's provider check (`matched` or `provider_unverified`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_check: Option<&'static str>,
+}
+
+impl Row {
+    /// The same result as a revision before A4 would give: the fallback
+    /// interval (or none) and no reported provider.
+    fn legacy(&self) -> bool {
+        self.usage_basis.is_none_or(|b| b == FALLBACK) && self.provider_check.is_none_or(|c| c == "provider_unverified")
+            && self.reason.as_deref() != Some("provider_mismatch")
+    }
 }
 
 fn cards(db: &Connection) -> Result<Vec<(String, BTreeSet<String>, Card)>> {
@@ -345,7 +367,7 @@ fn cards(db: &Connection) -> Result<Vec<(String, BTreeSet<String>, Card)>> {
     let mut rates = db.prepare(
         "SELECT category,cache_tier,rate FROM rate_card_rates WHERE card_id=?1 AND version=?2",
     )?;
-    let mut stmt = db.prepare("SELECT card_id,version,product,currency,rate_unit,effective_from_unix_ms,effective_to_unix_ms FROM rate_cards")?;
+    let mut stmt = db.prepare("SELECT card_id,version,product,currency,rate_unit,effective_from_unix_ms,effective_to_unix_ms,provider FROM rate_cards")?;
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();
     while let Some(r) = rows.next()? {
@@ -354,6 +376,7 @@ fn cards(db: &Connection) -> Result<Vec<(String, BTreeSet<String>, Card)>> {
         let mut card = Card {
             id: id.clone(),
             version,
+            provider: r.get(7)?,
             currency: r.get(3)?,
             places: unit.ilog10(),
             from: r.get(5)?,
@@ -382,24 +405,32 @@ fn cards(db: &Connection) -> Result<Vec<(String, BTreeSet<String>, Card)>> {
 }
 
 /// Price one entry: the one card version effective over the whole usage
-/// interval, every non-zero category rated, amounts exact.
+/// interval, every non-zero category rated, amounts exact. A reported model
+/// provider keeps only the cards of that provider (none: `provider_mismatch`).
 fn price<'a>(
     cards: &'a [(String, BTreeSet<String>, Card)],
     product: &str,
     model: &str,
+    provider: Option<&str>,
     (from, to): (i64, i64),
     q: [i64; 4],
 ) -> std::result::Result<(&'a Card, Dec, BTreeMap<String, String>), &'static str> {
     if q[2] > 0 {
         return Err("cache_write_convention_unknown");
     }
-    let overlapping: Vec<&Card> = cards
+    let mut overlapping: Vec<&Card> = cards
         .iter()
         .filter(|(p, models, c)| {
             p == product && models.contains(model) && c.from <= to && c.to.is_none_or(|t| t > from)
         })
         .map(|c| &c.2)
         .collect();
+    if let Some(provider) = provider.filter(|_| !overlapping.is_empty()) {
+        overlapping.retain(|c| c.provider == provider);
+        if overlapping.is_empty() {
+            return Err("provider_mismatch");
+        }
+    }
     let Some(card) = overlapping.iter().max_by_key(|c| c.version) else {
         return Err("no_rate_card");
     };
@@ -445,14 +476,17 @@ pub fn reprice(db: &mut Connection) -> Result<Value> {
         return Ok(super::unavailable("ledger_not_synced"));
     };
     let cards = cards(&tx)?;
-    // Each delta entry with the rollout that stored it: its attempt, the
-    // session start and the first observation bound the usage time.
+    // Each delta entry with the rollout that stored it: its attempt, its A4
+    // record time (else the session start and the first observation) bound
+    // the usage time; its A4 model provider is checked against the card's.
     let mut stmt = tx.prepare("SELECT e.entry_id,e.session_id,e.source,e.model,e.new_input_tokens,e.cache_read_tokens,e.cache_write_tokens,e.output_tokens,
         EXISTS(SELECT 1 FROM usage_dispositions d WHERE d.entry_id=e.entry_id AND d.disposition='accepted'),
-        coalesce((SELECT g.role FROM session_graph g WHERE g.session_id=e.session_id LIMIT 1),'primary'),
-        s.attempt_id,s.session_unix_ms,u.observed_unix_ms
+        coalesce((SELECT g.role FROM session_nodes g WHERE g.session_id=e.session_id LIMIT 1),'primary'),
+        s.attempt_id,s.session_unix_ms,u.observed_unix_ms,t.record_unix_ms,m.model_provider
         FROM usage_entries e LEFT JOIN codex_usage u ON u.session_id=e.session_id AND u.ordinal=e.position
-        LEFT JOIN rollout_sources s ON s.path_digest=u.path_digest WHERE e.basis='delta' ORDER BY e.entry_id")?;
+        LEFT JOIN rollout_sources s ON s.path_digest=u.path_digest
+        LEFT JOIN codex_usage_times t ON t.session_id=e.session_id AND t.ordinal=e.position
+        LEFT JOIN rollout_metadata m ON m.path_digest=u.path_digest WHERE e.basis='delta' ORDER BY e.entry_id")?;
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();
     while let Some(r) = rows.next()? {
@@ -462,8 +496,14 @@ pub fn reprice(db: &mut Connection) -> Result<Value> {
             .iter()
             .all(Option::is_some)
             .then(|| q.map(Option::unwrap_or_default));
-        let (start, observed): (Option<i64>, Option<i64>) = (r.get(11)?, r.get(12)?);
-        let usage = start.zip(observed).map(|(a, b)| (a.min(b), a.max(b)));
+        let (start, observed, record, provider): (Option<i64>, Option<i64>, Option<i64>, Option<String>) = (r.get(11)?, r.get(12)?, r.get(13)?, r.get(14)?);
+        let (usage, usage_basis) = match record {
+            Some(at) => (Some((at, at)), Some(RECORD_TIME)),
+            None => {
+                let usage = start.zip(observed).map(|(a, b)| (a.min(b), a.max(b)));
+                (usage, usage.map(|_| FALLBACK))
+            }
+        };
         let mut row = Row {
             entry_id: r.get(0)?,
             session_id: r.get(1)?,
@@ -471,19 +511,21 @@ pub fn reprice(db: &mut Connection) -> Result<Value> {
             attempt_id: r.get(10)?,
             model: model.clone(),
             usage,
+            usage_basis,
             quantities,
             reason: None,
             card: None,
             currency: None,
             amount: None,
             components: None,
+            provider_check: None,
         };
         let source: String = r.get(2)?;
         let result = match (counted, quantities, model.as_deref(), usage) {
             (false, ..) | (_, None, ..) => Err("usage_not_counted"),
             (_, _, None, _) => Err("model_unknown"),
             (_, _, _, None) => Err("usage_time_unknown"),
-            (true, Some(q), Some(model), Some(usage)) => price(&cards, &source, model, usage, q),
+            (true, Some(q), Some(model), Some(usage)) => price(&cards, &source, model, provider.as_deref(), usage, q),
         };
         match result {
             Ok((card, amount, components)) => {
@@ -493,6 +535,7 @@ pub fn reprice(db: &mut Connection) -> Result<Value> {
                     Some(amount.to_string()),
                     Some(components),
                 );
+                row.provider_check = Some(if provider.is_some() { "matched" } else { "provider_unverified" });
             }
             Err(reason) => row.reason = Some(reason.to_owned()),
         }
@@ -501,15 +544,30 @@ pub fn reprice(db: &mut Connection) -> Result<Value> {
     drop(rows);
     drop(stmt);
     let digest = digest(serde_json::to_string(&(POLICY, &out))?.as_bytes());
-    let latest: Option<(i64, String)> = tx
+    let latest: Option<(i64, String, String)> = tx
         .query_row(
-            "SELECT revision,digest FROM valuation_revisions ORDER BY revision DESC LIMIT 1",
+            "SELECT revision,digest,policy FROM valuation_revisions ORDER BY revision DESC LIMIT 1",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    if let Some((revision, _)) = latest.as_ref().filter(|l| l.1 == digest) {
-        return Ok(json!({"revision": revision, "appended": false, "entries": out.len()}));
+    // A revision appended before A4 is compared as it was computed then: a
+    // result that only adds the fallback basis and unverified providers is the same.
+    let same = |(_, stored, policy): &(i64, String, String)| -> Result<bool> {
+        if policy != LEGACY_POLICY {
+            return Ok(*stored == digest);
+        }
+        if !out.iter().all(Row::legacy) {
+            return Ok(false);
+        }
+        // Without the A4 fields a row serializes exactly as it did before them.
+        let rows: Vec<Row> = out.iter().map(|row| Row { usage_basis: None, provider_check: None, ..row.clone() }).collect();
+        Ok(*stored == self::digest(serde_json::to_string(&(LEGACY_POLICY, &rows))?.as_bytes()))
+    };
+    if let Some(latest) = &latest
+        && same(latest)?
+    {
+        return Ok(json!({"revision": latest.0, "appended": false, "entries": out.len()}));
     }
     let revision = latest.map_or(1, |l| l.0 + 1);
     tx.execute("INSERT INTO valuation_revisions(revision,basis,policy,ledger_synced_unix_ms,digest,computed_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",
@@ -526,6 +584,8 @@ pub fn reprice(db: &mut Connection) -> Result<Value> {
             params![revision, row.entry_id, row.session_id, row.role, row.attempt_id, row.model, row.usage.map(|u| u.0), row.usage.map(|u| u.1),
                 q[0], q[1], q[2], q[3], if row.reason.is_none() { "priced" } else { "unavailable" }, row.reason, row.card.as_ref().map(|c| &c.0),
                 row.card.as_ref().map(|c| c.1), row.currency, row.amount, components])?;
+        tx.execute("INSERT INTO valuation_bases(revision,entry_id,usage_basis,provider_check) VALUES(?1,?2,?3,?4)",
+            params![revision, row.entry_id, row.usage_basis, row.provider_check])?;
     }
     tx.commit()?;
     Ok(json!({"revision": revision, "appended": true, "entries": out.len()}))
@@ -605,8 +665,15 @@ pub fn cost(db: &Connection, revision: Option<i64>) -> Result<Value> {
         [revision], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))).optional()? else {
         bail!("valuation revision {revision} does not exist (latest is {latest})");
     };
-    let mut stmt = db.prepare("SELECT entry_id,session_id,role,attempt_id,model,usage_from_unix_ms,usage_to_unix_ms,new_input_tokens,cache_read_tokens,cache_write_tokens,
-        output_tokens,status,reason,card_id,card_version,currency,amount,components FROM valuations WHERE revision=?1 ORDER BY session_id,entry_id")?;
+    // Stream version 6 records the A4 bases; a sidecar read before its upgrade has none.
+    let (extra, join) = if table(db, "valuation_bases")? {
+        ("b.usage_basis,b.provider_check", "LEFT JOIN valuation_bases b ON b.revision=v.revision AND b.entry_id=v.entry_id")
+    } else {
+        ("NULL,NULL", "")
+    };
+    let mut stmt = db.prepare(&format!("SELECT v.entry_id,v.session_id,v.role,v.attempt_id,v.model,v.usage_from_unix_ms,v.usage_to_unix_ms,v.new_input_tokens,
+        v.cache_read_tokens,v.cache_write_tokens,v.output_tokens,v.status,v.reason,v.card_id,v.card_version,v.currency,v.amount,v.components,{extra}
+        FROM valuations v {join} WHERE v.revision=?1 ORDER BY v.session_id,v.entry_id"))?;
     let mut rows = stmt.query([revision])?;
     let mut sessions = BTreeMap::<String, (String, Option<String>, Vec<Value>)>::new();
     while let Some(r) = rows.next()? {
@@ -618,11 +685,16 @@ pub fn cost(db: &Connection, revision: Option<i64>) -> Result<Value> {
             super::unavailable(&r.get::<_, String>(12)?)
         };
         let from: Option<i64> = r.get(5)?;
-        let entry = json!({"entry_id": r.get::<_, String>(0)?, "model": r.get::<_, Option<String>>(4)?,
-            "usage_interval": from.map(|from| Ok::<_, rusqlite::Error>(json!({"from_unix_ms": from, "to_unix_ms": r.get::<_, i64>(6)?}))).transpose()?,
+        let (usage_basis, provider_check): (Option<String>, Option<String>) = (r.get(18)?, r.get(19)?);
+        let mut interval = from.map(|from| Ok::<_, rusqlite::Error>(json!({"from_unix_ms": from, "to_unix_ms": r.get::<_, i64>(6)?}))).transpose()?;
+        // A4 fields appear only on revisions that recorded them, so earlier ones read back unchanged.
+        if let (Some(interval), Some(basis)) = (interval.as_mut(), usage_basis) { interval["basis"] = json!(basis); }
+        let mut entry = json!({"entry_id": r.get::<_, String>(0)?, "model": r.get::<_, Option<String>>(4)?,
+            "usage_interval": interval,
             "quantities": {"new_input_tokens": r.get::<_, Option<i64>>(7)?, "cache_read_tokens": r.get::<_, Option<i64>>(8)?,
                 "cache_write_tokens": r.get::<_, Option<i64>>(9)?, "output_tokens": r.get::<_, Option<i64>>(10)?},
             "valuation": valuation});
+        if let Some(check) = provider_check { entry["provider_check"] = json!(check); }
         sessions
             .entry(r.get(1)?)
             .or_insert((r.get(2)?, r.get(3)?, Vec::new()))
