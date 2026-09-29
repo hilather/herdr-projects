@@ -45,7 +45,7 @@ mod coordinator;
 mod coordinator_jobs;
 mod notification_inventory;
 mod doctor;
-mod herdr;
+use herdr_projects::herdr;
 mod inbox;
 mod lifecycle;
 mod overview;

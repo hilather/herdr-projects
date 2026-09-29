@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::runner::{Cmd, Runner};
+use crate::runner::{Cmd, Output, Runner};
 
 pub const MIN_VERSION: Version = Version(0, 9, 1);
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -122,6 +122,14 @@ impl<'a> Herdr<'a> {
     }
 }
 
+/// herdr prints one JSON object; on failure it carries `error`, and which
+/// stream it lands on is not something to depend on.
+pub fn reply_json(out: &Output) -> Option<serde_json::Value> {
+    [&out.stdout, &out.stderr]
+        .into_iter()
+        .find_map(|text| serde_json::from_str::<serde_json::Value>(text.trim()).ok())
+}
+
 /// A herdr call that failed. `code` is herdr's own error code (for example
 /// `agent_blocked` or `pane_not_found`), or `timeout` / `unreachable` / `failed`
 /// when herdr never answered with one.
@@ -203,12 +211,7 @@ impl<'a> Herdr<'a> {
                 message: out.error_text(),
             });
         }
-        // herdr prints one JSON object; on failure it carries `error`, and
-        // which stream it lands on is not something to depend on.
-        let reply = [&out.stdout, &out.stderr]
-            .into_iter()
-            .find_map(|text| serde_json::from_str::<serde_json::Value>(text.trim()).ok());
-        if let Some(reply) = reply {
+        if let Some(reply) = reply_json(&out) {
             if let Some(error) = reply.get("error") {
                 return Err(HerdrError {
                     code: error["code"].as_str().unwrap_or("failed").to_string(),
@@ -243,6 +246,15 @@ impl<'a> Herdr<'a> {
 
     pub fn agent_list(&self) -> Result<Vec<Agent>, HerdrError> {
         self.call_as(&["agent", "list"], "agents")
+    }
+
+    /// Read-only `agent list` with its captured reply capped at `capture_limit`
+    /// bytes. Returns herdr's raw output, for a caller that accounts its own
+    /// byte budget and reads the reply with [`reply_json`].
+    pub fn agent_list_bounded(&self, timeout: Duration, capture_limit: usize) -> Result<Output> {
+        let mut cmd = self.cmd(timeout).args(["agent", "list"]);
+        cmd.capture_limit = capture_limit;
+        self.runner.run(&cmd)
     }
 
     fn created(result: &serde_json::Value) -> Result<Created, HerdrError> {

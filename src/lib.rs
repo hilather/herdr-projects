@@ -32,6 +32,8 @@ pub mod reconcile;
 
 /// Bounded external command execution shared by the CLI and trusted library ingress.
 pub mod runner;
+/// Typed calls to the herdr CLI, shared by the CLI and the telemetry attention sampler.
+pub mod herdr;
 pub mod execution_guard;
 pub mod supervision;
 pub mod status_notice;

@@ -16,7 +16,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::unavailable;
-use crate::runner::{Cmd, RealRunner, Runner};
+use crate::herdr::{self, Herdr};
+use crate::runner::RealRunner;
 
 pub const SOURCE: &str = "herdr-agent-list-v1";
 /// The `agent_status` label stock Herdr gives an agent waiting on the human.
@@ -88,17 +89,16 @@ fn herdr_bin() -> String {
     std::env::var("HERDR_BIN_PATH").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "herdr".to_owned())
 }
 
-/// One read-only `herdr agent list` on `socket` (the same command, socket
-/// variable and `HERDR_SESSION` removal as the CLI's Herdr client), through the
-/// gated runner, with its reply bounded by the remaining byte budget.
+/// One read-only `herdr agent list` on `socket` through the shared Herdr
+/// client (its socket variable and `HERDR_SESSION` removal) and the gated
+/// runner, with its reply bounded by the remaining byte budget.
 fn agent_list(bin: &str, socket: &str, remaining: &mut u64) -> std::result::Result<Vec<Value>, &'static str> {
     if !Path::new(socket).exists() { return Err("herdr_unreachable"); }
-    let mut cmd = Cmd::new(bin, CALL_TIMEOUT).args(["agent", "list"]).env("HERDR_SOCKET_PATH", socket).env_remove("HERDR_SESSION");
-    cmd.capture_limit = (*remaining).min(MAX_REPLY) as usize;
-    let out = RealRunner.run(&cmd).map_err(|_| "herdr_unreachable")?;
+    let limit = (*remaining).min(MAX_REPLY) as usize;
+    let out = Herdr::new(bin, socket, &RealRunner).agent_list_bounded(CALL_TIMEOUT, limit).map_err(|_| "herdr_unreachable")?;
     *remaining = remaining.saturating_sub(out.stdout_total_bytes.saturating_add(out.stderr_total_bytes));
     if out.stdout_truncated || out.stderr_truncated { return Err("budget_exhausted"); }
-    let reply = [&out.stdout, &out.stderr].into_iter().find_map(|text| serde_json::from_str::<Value>(text.trim()).ok());
+    let reply = herdr::reply_json(&out);
     if reply.as_ref().is_some_and(|r| r.get("error").is_some()) { return Err("herdr_error"); }
     if !out.success() { return Err("herdr_unreachable"); }
     let agents = reply.as_ref().and_then(|r| r["result"]["agents"].as_array()).ok_or("herdr_reply_invalid")?;
@@ -370,10 +370,7 @@ fn not_collected() -> BTreeMap<String, Value> {
 /// tasks with an attempt decided in the window, as the central report does.
 fn cohort(project: &Path, since: Option<i64>) -> Result<(BTreeSet<String>, usize)> {
     let db = crate::telemetry::read_only(&project.join(".state/state.db"))?;
-    let tasks: Vec<(String, String, bool)> = db.prepare("SELECT t.id,t.state,EXISTS(SELECT 1 FROM task_contracts c JOIN result_submissions s ON s.task_id=c.task_id AND s.contract_revision=c.contract_revision
-        JOIN verified_results r ON r.submission_id=s.submission_id WHERE c.task_id=t.id AND c.contract_revision=(SELECT max(contract_revision) FROM task_contracts WHERE task_id=t.id)
-        AND (c.route='verify_only' OR EXISTS(SELECT 1 FROM integration_operations i JOIN integrated_commits k ON k.operation_id=i.operation_id WHERE i.verified_result_id=r.result_id)))
-        FROM tasks t ORDER BY t.id")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+    let tasks = crate::telemetry::metrics::task_evidence(&db)?;
     let windowed: Option<BTreeSet<String>> = match since {
         None => None,
         Some(since) => Some(if db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='dispatch_decisions')", [], |r| r.get::<_, bool>(0))? {

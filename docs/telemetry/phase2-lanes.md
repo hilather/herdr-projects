@@ -157,7 +157,7 @@ merges one PR at a time.
   `source_observations` should null them out before any reader appears.
 - **Done (A7):** **Lost final events** (lane A): record coverage for a rollout that is idle
   without `task_complete`.
-- **Herdr client in the lib** (steward): `src/herdr.rs` is binary-only.
+- **Done (steward):** **Herdr client in the lib** (steward): `src/herdr.rs` is binary-only.
   B6b re-runs `agent list` through the lib runner.
 - **Outcome `attention`** (steward): show B6b's per-attempt summary in the
   §4 outcome record, and share the M31 T/A cohort SQL from `metrics.rs`.

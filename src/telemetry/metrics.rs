@@ -29,6 +29,16 @@ fn ratio(id: &str, numerator: usize, denominator: usize, extra: Value) -> Value 
     metric(id, body)
 }
 
+/// Contracts §6 `T`/`A` evidence: every task `(id, state, accepted)`, where
+/// accepted means a verified result for its current contract revision that is
+/// verify-only or integrated. Shared by this report and the attention M31 cohort.
+pub(crate) fn task_evidence(db: &Connection) -> Result<Vec<(String, String, bool)>> {
+    Ok(db.prepare("SELECT t.id,t.state,EXISTS(SELECT 1 FROM task_contracts c JOIN result_submissions s ON s.task_id=c.task_id AND s.contract_revision=c.contract_revision
+        JOIN verified_results r ON r.submission_id=s.submission_id WHERE c.task_id=t.id AND c.contract_revision=(SELECT max(contract_revision) FROM task_contracts WHERE task_id=t.id)
+        AND (c.route='verify_only' OR EXISTS(SELECT 1 FROM integration_operations i JOIN integrated_commits k ON k.operation_id=i.operation_id WHERE i.verified_result_id=r.result_id)))
+        FROM tasks t ORDER BY t.id")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?)
+}
+
 /// `herdr-projects telemetry <slug> report`. `since` bounds the activity window (Unix ms).
 pub fn report(project: &Path, since: Option<i64>) -> Result<Value> {
     let path = project.join(".state/state.db");
@@ -42,10 +52,7 @@ pub fn report(project: &Path, since: Option<i64>) -> Result<Value> {
     let in_window = |a: &Attempt| since.is_none_or(|since| a.decided.is_some_and(|at| at >= since));
 
     // Contracts §6 `T` and `A`: evidence for the task's current contract revision.
-    let tasks: Vec<(String, String, bool)> = db.prepare("SELECT t.id,t.state,EXISTS(SELECT 1 FROM task_contracts c JOIN result_submissions s ON s.task_id=c.task_id AND s.contract_revision=c.contract_revision
-        JOIN verified_results r ON r.submission_id=s.submission_id WHERE c.task_id=t.id AND c.contract_revision=(SELECT max(contract_revision) FROM task_contracts WHERE task_id=t.id)
-        AND (c.route='verify_only' OR EXISTS(SELECT 1 FROM integration_operations i JOIN integrated_commits k ON k.operation_id=i.operation_id WHERE i.verified_result_id=r.result_id)))
-        FROM tasks t ORDER BY t.id")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+    let tasks = task_evidence(&db)?;
     let (mut terminal, mut accepted, mut open, mut without_evidence, mut outside) = (BTreeSet::new(), 0, 0, 0, 0);
     for (task, state, evidence) in &tasks {
         if since.is_some() && !attempts.iter().any(|a| &a.task == task && in_window(a)) { outside += 1; continue; }
