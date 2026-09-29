@@ -521,6 +521,7 @@ mod delegated_reservation;
 mod dispatch_log;
 mod candidate_groups;
 pub use candidate_groups::{CandidateArm,CandidateGroup,CandidateSelection,SelectionChoice,NO_SELECTION_REASONS,SELECTED_REASONS};
+pub use candidate_groups::{ArmOutcome,arm_outcome};
 mod review_capture;
 pub use review_capture::{ReviewAssignment,ReviewAssignmentChoice,ReviewCompletion,ReviewOpportunity,ReviewOpportunitySpec,ReviewSession};
 mod finding_triage;

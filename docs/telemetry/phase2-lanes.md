@@ -144,7 +144,7 @@ merges one PR at a time.
   member of an unselected group, and `select_candidate` queues the winner.
   Until then, `groups show` reports `integration_hold.enforced=false` and
   lists candidates that integrated without a selection.
-- **C5 M42 uncertainty** (lane C): a group-level percentile bootstrap with a
+- **Done (C5):** **C5 M42 uncertainty** (lane C): a group-level percentile bootstrap with a
   recorded seed. **Min-sample registry** (TM4.1): replaces the constant 10.
   **Shared `arm_outcome` helper** (steward re-export). **Judge
   configuration id**. **Runner-up order for operator and judge selections**.

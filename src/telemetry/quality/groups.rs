@@ -9,7 +9,8 @@ use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use std::path::Path;
 
-use crate::store::{SelectionChoice, SqliteStore};
+use super::registry;
+use crate::store::{SelectionChoice, SqliteStore, arm_outcome};
 
 /// Principal recorded for groups and selections made on this CLI.
 const OPERATOR: &str = "operator:cli";
@@ -46,6 +47,13 @@ pub enum Command {
         /// Judge name, recorded as principal `judge:<name>`; requires `--submission`.
         #[arg(long, requires = "submission", conflicts_with = "reason")]
         judge: Option<String>,
+        /// With `--judge`: the judge's configuration ID (`sha256:...`), recorded in the evidence.
+        #[arg(long, requires = "judge")]
+        judge_configuration: Option<String>,
+        /// Runner-up, best first, once per rank (evidence `rank` 2, 3, ...):
+        /// an arm number with `--arm`, a presented submission with `--judge`.
+        #[arg(long = "runner-up", conflicts_with_all = ["none", "rule"])]
+        runner_up: Vec<String>,
         /// Reason code for `--arm` or `--none` (contracts-quality.md §3).
         #[arg(long)]
         reason: Option<String>,
@@ -59,9 +67,10 @@ pub enum Command {
         /// Window start (Unix ms), by the selection time.
         #[arg(long)]
         since: Option<i64>,
-        /// Closed groups a cell needs before its value is shown.
-        #[arg(long, default_value_t = MIN_GROUPS, value_parser = clap::value_parser!(u32).range(1..=10_000))]
-        min_groups: u32,
+        /// Closed groups a cell needs before its value is shown, overriding
+        /// the registry minimum (reported as `min_sample.source = override`).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=10_000))]
+        min_groups: Option<u32>,
     },
     /// Groups with their arms, each arm's outcome and own cost, and the
     /// selection, as JSON. Read-only.
@@ -73,14 +82,19 @@ pub fn run(project: &Path, command: Command) -> Result<Value> {
     let open = || SqliteStore::open(&project.join(".state/state.db"));
     Ok(match command {
         Command::Create { task, arms } => json!({"group": open()?.create_candidate_group(&task, &arms, OPERATOR, now)?}),
-        Command::Select { group, arm, submission, none, rule, judge, reason } => {
+        Command::Select { group, arm, submission, none, rule, judge, judge_configuration, runner_up, reason } => {
             let mut store = open()?;
             let selection = if rule { store.select_candidate_by_rule(&group, now)? }
-                else if let Some(judge) = judge { store.select_candidate_by_judge(&group, submission.as_deref().unwrap_or_default(), &judge, now)? }
+                else if let Some(judge) = judge {
+                    store.select_candidate_by_judge(&group, submission.as_deref().unwrap_or_default(), &judge, judge_configuration.as_deref(), &runner_up, now)?
+                }
                 else {
                     let choice = match arm {
-                        Some(arm) => SelectionChoice::Arm { arm, submission },
-                        None if none && submission.is_none() => SelectionChoice::NoSelection,
+                        Some(arm) => {
+                            let runner_up = runner_up.iter().map(|r| r.parse::<u32>().map_err(|_| anyhow::anyhow!("--runner-up {r} is not an arm number"))).collect::<Result<_>>()?;
+                            SelectionChoice::Arm { arm, submission, runner_up }
+                        }
+                        None if none && submission.is_none() && runner_up.is_empty() => SelectionChoice::NoSelection,
                         None => anyhow::bail!("select needs --arm, --none, --rule or --judge with --submission"),
                     };
                     store.select_candidate(&group, &choice, reason.as_deref().unwrap_or("unspecified"), OPERATOR, now)?
@@ -88,7 +102,7 @@ pub fn run(project: &Path, command: Command) -> Result<Value> {
             json!({"selection": selection})
         }
         Command::Present { group } => present(project, &group)?,
-        Command::Report { since, min_groups } => json!({"metrics": paired_metrics(project, since, min_groups)?, "since_unix_ms": since, "min_groups": min_groups}),
+        Command::Report { since, min_groups } => json!({"metrics": paired_metrics(project, since, min_groups)?, "since_unix_ms": since, "min_sample": registry::min_sample_json("M42", min_groups).1}),
         Command::Show => show(project)?,
     })
 }
@@ -177,34 +191,8 @@ fn show(project: &Path) -> Result<Value> {
     Ok(json!({"groups": groups}))
 }
 
-/// Provisional minimum of closed groups per cell (plan doc 07 §6: 10 closed
-/// candidate groups containing both arms for paired metrics); below it a cell
-/// is `unavailable: insufficient_data` with its counts.
-pub const MIN_GROUPS: u32 = 10;
-const TERMINAL_ATTEMPT: [&str; 4] = ["completed", "failed", "cancelled", "lost"];
 /// Same key as the store's judge selection (`candidate_presentation.v1`).
 const PRESENTATION: &str = "candidate_presentation.v1";
-
-/// A bound arm's first candidate and verified outcome (`arm_outcome.v1`,
-/// contracts-quality.md §4, as the store computes it for selections).
-fn arm_outcome(db: &rusqlite::Connection, attempt: &str) -> Result<(Option<String>, &'static str)> {
-    let state: Option<String> = db.query_row("SELECT state FROM attempts WHERE id=?1", [attempt], |r| r.get(0)).optional()?;
-    let submissions: Vec<String> = db.prepare("SELECT submission_id FROM result_submissions WHERE attempt_id=?1 ORDER BY created_unix_ms,rowid")?
-        .query_map([attempt], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-    let mut states = Vec::with_capacity(submissions.len());
-    for submission in &submissions {
-        let policies: Vec<Option<String>> = db.prepare("SELECT (SELECT v.state FROM verification_runs v WHERE v.submission_id=?1 AND v.policy_id=p.policy_id ORDER BY v.created_unix_ms DESC,v.rowid DESC LIMIT 1)
-            FROM (SELECT a.policy_id FROM acceptance_policies a JOIN result_submissions s ON s.task_id=a.task_id AND s.contract_revision=a.contract_revision WHERE s.submission_id=?1
-                UNION SELECT policy_id FROM verification_runs WHERE submission_id=?1) p")?
-            .query_map([submission], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-        let is = |state: &'static str| move |s: &Option<String>| s.as_deref() == Some(state);
-        states.push(if policies.iter().any(is("rejected")) { "rejected" } else if !policies.is_empty() && policies.iter().all(is("accepted")) { "accepted" } else { "pending" });
-    }
-    let terminal = state.as_deref().is_some_and(|s| TERMINAL_ATTEMPT.contains(&s));
-    let outcome = if states.contains(&"accepted") { "accepted" } else if states.contains(&"pending") || !terminal { "pending" }
-        else if submissions.is_empty() { "no_candidate" } else { "rejected" };
-    Ok((submissions.into_iter().next(), outcome))
-}
 
 /// `{"group_id", "candidates": [{position, submission_id, repository, base_oid,
 /// candidate_oid}]}`: each bound arm's first candidate, ordered by
@@ -222,7 +210,7 @@ fn present(project: &Path, group: &str) -> Result<Value> {
         .query_map([group], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
     let mut shown = Vec::new();
     for attempt in attempts {
-        let Some(submission) = arm_outcome(&db, &attempt)?.0 else { continue };
+        let Some(submission) = arm_outcome(&db, &attempt)?.first else { continue };
         let key = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(format!("{PRESENTATION}:{group}:{submission}").as_bytes()));
         let (repository, base, candidate): (String, String, String) = db.query_row("SELECT repository,base_oid,candidate_oid FROM result_submissions WHERE submission_id=?1", [&submission],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
@@ -233,10 +221,10 @@ fn present(project: &Path, group: &str) -> Result<Value> {
     Ok(json!({"group_id": group, "presentation": PRESENTATION, "candidates": candidates}))
 }
 
-/// One closed group: selector kind, the selected configuration (if any) and
-/// each sealed arm's configuration with its verified outcome now
+/// One closed group: its task, selector kind, the selected configuration (if
+/// any) and each sealed arm's configuration with its verified outcome now
 /// (`not_launched` for an arm never bound).
-struct Closed { kind: String, selected: Option<String>, arms: Vec<(String, &'static str)> }
+struct Closed { task: String, kind: String, selected: Option<String>, arms: Vec<(String, &'static str)> }
 
 /// `(closed groups selected at or after since, open groups)`.
 fn closed_groups(project: &Path, since: Option<i64>) -> Result<Option<(Vec<Closed>, usize)>> {
@@ -245,16 +233,16 @@ fn closed_groups(project: &Path, since: Option<i64>) -> Result<Option<(Vec<Close
     if !exists(&db, "candidate_groups")? { return Ok(None); }
     let db = db.unchecked_transaction()?;
     let open: i64 = db.query_row("SELECT count(*) FROM candidate_groups g WHERE g.sealed_unix_ms IS NOT NULL AND NOT EXISTS(SELECT 1 FROM candidate_selections s WHERE s.group_id=g.group_id)", [], |r| r.get(0))?;
-    let rows: Vec<(String, String, Option<String>)> = db.prepare("SELECT s.group_id,s.selector_kind,a.configuration_id FROM candidate_selections s JOIN candidate_groups g ON g.group_id=s.group_id
+    let rows: Vec<(String, String, String, Option<String>)> = db.prepare("SELECT s.group_id,g.task_id,s.selector_kind,a.configuration_id FROM candidate_selections s JOIN candidate_groups g ON g.group_id=s.group_id
         LEFT JOIN candidate_group_arms a ON a.group_id=s.group_id AND a.arm=s.arm WHERE ?1 IS NULL OR s.selected_unix_ms>=?1 ORDER BY g.created_unix_ms,g.rowid")?
-        .query_map([since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+        .query_map([since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
     let mut closed = Vec::with_capacity(rows.len());
-    for (group, kind, selected) in rows {
+    for (group, task, kind, selected) in rows {
         let arms: Vec<(String, Option<String>)> = db.prepare("SELECT a.configuration_id,b.attempt_id FROM candidate_group_arms a LEFT JOIN candidate_arm_attempts b ON b.group_id=a.group_id AND b.arm=a.arm WHERE a.group_id=?1 ORDER BY a.arm")?
             .query_map([&group], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
-        let arms = arms.into_iter().map(|(configuration, attempt)| Ok((configuration, match attempt { Some(a) => arm_outcome(&db, &a)?.1, None => "not_launched" })))
+        let arms = arms.into_iter().map(|(configuration, attempt)| Ok((configuration, match attempt { Some(a) => arm_outcome(&db, &a)?.outcome, None => "not_launched" })))
             .collect::<Result<_>>()?;
-        closed.push(Closed { kind, selected, arms });
+        closed.push(Closed { task, kind, selected, arms });
     }
     Ok(Some((closed, open as usize)))
 }
@@ -293,10 +281,12 @@ fn win_rates(groups: &[&Closed], min: usize) -> Value {
 }
 
 /// M41 and M42 (plan doc 07 §5b), definitions `M41.v1` and `M42.v1`.
-pub fn paired_metrics(project: &Path, since: Option<i64>, min_groups: u32) -> Result<std::collections::BTreeMap<String, Value>> {
-    let min = min_groups as usize;
-    let base = |definition: &str, name: &str| json!({"definition": definition, "name": name, "min_groups": min_groups});
-    let (mut m41, mut m42) = (base("M41.v1", "candidate_win_rate"), base("M42.v1", "paired_acceptance_difference"));
+/// `min_groups` overrides the registry minimum of both.
+pub fn paired_metrics(project: &Path, since: Option<i64>, min_groups: Option<u32>) -> Result<std::collections::BTreeMap<String, Value>> {
+    let ((min41, sample41), (min42, sample42)) = (registry::min_sample_json("M41", min_groups), registry::min_sample_json("M42", min_groups));
+    let (min, min42) = (min41 as usize, min42 as usize);
+    let base = |definition: &str, name: &str, sample: Value| json!({"definition": definition, "name": name, "min_sample": sample});
+    let (mut m41, mut m42) = (base("M41.v1", "candidate_win_rate", sample41), base("M42.v1", "paired_acceptance_difference", sample42));
     let Some((closed, open)) = closed_groups(project, since)? else {
         m41["value"] = unavailable("candidate_groups_absent");
         m42["value"] = unavailable("candidate_groups_absent");
@@ -323,26 +313,82 @@ pub fn paired_metrics(project: &Path, since: Option<i64>, min_groups: u32) -> Re
     for &a in &configurations {
         for &b in configurations.iter().filter(|&&b| b != a) {
             let (mut groups, mut pending, mut counts) = (0usize, 0usize, [0usize; 4]);
+            // Per task: (sum of a - b acceptance, paired groups), the bootstrap's clusters.
+            let mut clusters = std::collections::BTreeMap::<&str, (i64, i64)>::new();
             for g in &closed {
                 let (Some(x), Some(y)) = (outcome(g, a), outcome(g, b)) else { continue };
                 groups += 1;
                 if x == "pending" || y == "pending" { pending += 1; continue; }
                 counts[usize::from(x == "accepted") * 2 + usize::from(y == "accepted")] += 1;
+                let cluster = clusters.entry(g.task.as_str()).or_default();
+                cluster.0 += i64::from(x == "accepted") - i64::from(y == "accepted");
+                cluster.1 += 1;
             }
             if groups == 0 { continue; }
             let [neither, b_only, a_only, both] = counts;
             let n = groups - pending;
-            let value = if n < min { unavailable("insufficient_data") } else {
+            let value = if n < min42 { unavailable("insufficient_data") } else {
                 json!(((a_only as f64 - b_only as f64) * 100.0 / n as f64 * 100.0).round() / 100.0)
             };
             if a < b && value.is_number() { summary.push(format!("{}-{}={}pp", short(a), short(b), value)); }
             pairs.push(json!({"a": a, "b": b, "groups": groups, "pending": pending, "n": n, "both_accepted": both, "a_only": a_only, "b_only": b_only, "neither": neither,
                 "difference": format!("{}/{n}", a_only as i64 - b_only as i64), "value": value, "unit": "percentage_points",
-                "uncertainty": unavailable("clustered_interval_not_computed")}));
+                "uncertainty": if n < min42 { unavailable("insufficient_data") } else { bootstrap(&clusters.into_values().collect::<Vec<_>>()) }}));
         }
     }
     m42["acceptance"] = json!("arm_outcome.v1 verified acceptance, not selection");
+    m42["estimator"] = json!({"method": registry::M42_BOOTSTRAP.method, "resample": "task", "task_family": unavailable("no_task_family_data")});
     m42["value"] = if closed.is_empty() { unavailable("no_closed_groups") } else if summary.is_empty() { unavailable("insufficient_data") } else { json!(summary.join(" ")) };
     m42["pairs"] = json!(pairs);
     Ok([("M41".to_owned(), m41), ("M42".to_owned(), m42)].into())
+}
+
+/// SplitMix64, the bootstrap's declared generator.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+    /// Uniform in `0..k` by rejection (no modulo bias).
+    fn below(&mut self, k: u64) -> u64 {
+        let limit = u64::MAX - u64::MAX % k;
+        loop { let x = self.next(); if x < limit { return x % k; } }
+    }
+}
+
+/// `n/d` percentage points to two decimals, rounded half away from zero, in
+/// integer arithmetic.
+fn points(n: i64, d: i64) -> String {
+    let hundredths = (2 * n.unsigned_abs() * 10_000 + d.unsigned_abs()) / (2 * d.unsigned_abs());
+    format!("{}{}.{:02}", if n < 0 && hundredths > 0 { "-" } else { "" }, hundredths / 100, hundredths % 100)
+}
+
+/// M42 interval (`percentile_bootstrap.v1`, contracts-quality.md §4) over
+/// `clusters`, one `(sum of a - b acceptance, paired groups)` per task in task
+/// ID order: each iteration draws as many tasks with replacement (SplitMix64
+/// from the registry seed, restarted per pair) and takes sum / count; the
+/// iterations are sorted exactly (as fractions) and the nearest-rank
+/// percentiles `ceil(B × 25/1000)` and `ceil(B × 975/1000)` are reported.
+fn bootstrap(clusters: &[(i64, i64)]) -> Value {
+    let spec = &registry::M42_BOOTSTRAP;
+    if clusters.len() < 2 { return unavailable("single_task"); }
+    let mut rng = SplitMix64(spec.seed);
+    let k = clusters.len() as u64;
+    let mut draws: Vec<(i64, i64)> = (0..spec.iterations).map(|_| (0..k).fold((0, 0), |(n, d), _| {
+        let (x, y) = clusters[rng.below(k) as usize];
+        (n + x, d + y)
+    })).collect();
+    draws.sort_by(|(n1, d1), (n2, d2)| (i128::from(*n1) * i128::from(*d2)).cmp(&(i128::from(*n2) * i128::from(*d1))).then(d1.cmp(d2)));
+    let tail = u64::from(1000 - spec.level_permille) / 2;
+    let rank = |permille: u64| (u64::from(spec.iterations) * permille).div_ceil(1000) as usize - 1;
+    let (lower, upper) = (draws[rank(tail)], draws[rank(1000 - tail)]);
+    json!({"method": spec.method, "resample": "task", "clusters": k, "iterations": spec.iterations, "seed": format!("{:#018x}", spec.seed),
+        "level": format!("0.{}", spec.level_permille / 10), "lower": points(lower.0, lower.1), "upper": points(upper.0, upper.1),
+        "lower_difference": format!("{}/{}", lower.0, lower.1), "upper_difference": format!("{}/{}", upper.0, upper.1), "unit": "percentage_points",
+        "task_family": unavailable("no_task_family_data"), "source": registry::VERSION})
 }

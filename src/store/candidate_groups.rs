@@ -36,15 +36,18 @@ pub struct CandidateSelection {
     pub selector_kind: String,
     pub selector_principal: String,
     pub reason: String,
-    /// Per bound arm, at selection time: `{arm, attempt_id, submission_id, verification}`.
+    /// Per bound arm, at selection time: `{arm, attempt_id, submission_id,
+    /// verification, arm_outcome}`, plus `rank` for a selected arm (every
+    /// selector) and `presented`, `judge_configuration_id` for a judge.
     pub evidence: serde_json::Value,
     pub selected_unix_ms: i64,
 }
 
 /// What an operator selects: one arm (its first candidate unless `submission`
-/// names another of its attempt's submissions), or no arm.
+/// names another of its attempt's submissions) with its runner-up arms in
+/// order (evidence `rank`), or no arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SelectionChoice { Arm { arm: u32, submission: Option<String> }, NoSelection }
+pub enum SelectionChoice { Arm { arm: u32, submission: Option<String>, runner_up: Vec<u32> }, NoSelection }
 
 fn invalid(message: String) -> StoreError { StoreError::Invalid(message) }
 
@@ -110,26 +113,40 @@ fn verification(tx: &Connection, submission: &str) -> Result<&'static str> {
     Ok(if states.iter().any(is("rejected")) { "rejected" } else if !states.is_empty() && states.iter().all(is("accepted")) { "accepted" } else { "pending" })
 }
 
-/// One bound arm at selection time. `outcome` is the arm's verified outcome
-/// (`arm_outcome.v1`, contracts-quality.md §4): `accepted` if any submission
-/// of its attempt is (`accepted` names the first such); else `pending` if any
-/// submission's verification is pending or the attempt is not terminal; else
-/// `rejected` with a submission, `no_candidate` without.
+/// The verified outcome of one bound arm's attempt now (`arm_outcome.v1`,
+/// contracts-quality.md §4), read-only: over its submissions by
+/// `(created_unix_ms, rowid)`, `accepted` if any is (`accepted` names the
+/// first such); else `pending` if any submission's verification is pending or
+/// the attempt is not terminal; else `rejected` with a submission,
+/// `no_candidate` without. `first` is the first candidate and
+/// `first_verification` its combined verification (`no_candidate` without).
+/// Shared by the selectors here and telemetry's reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArmOutcome { pub first: Option<String>, pub first_verification: &'static str, pub outcome: &'static str, pub accepted: Option<String> }
+
+/// [`ArmOutcome`] of `attempt`, read from `db` without writing.
+pub fn arm_outcome(db: &Connection, attempt: &str) -> Result<ArmOutcome> {
+    let state: Option<String> = db.query_row("SELECT state FROM attempts WHERE id=?1", [attempt], |r| r.get(0)).optional()?;
+    let submissions: Vec<String> = db.prepare("SELECT submission_id FROM result_submissions WHERE attempt_id=?1 ORDER BY created_unix_ms,rowid")?
+        .query_map([attempt], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    let states = submissions.iter().map(|s| verification(db, s)).collect::<Result<Vec<_>>>()?;
+    let accepted = submissions.iter().zip(&states).find(|(_, v)| **v == "accepted").map(|(s, _)| s.clone());
+    let terminal = state.as_deref().is_some_and(|s| TERMINAL_ATTEMPT.contains(&s));
+    let outcome = if accepted.is_some() { "accepted" } else if states.contains(&"pending") || !terminal { "pending" }
+        else if submissions.is_empty() { "no_candidate" } else { "rejected" };
+    Ok(ArmOutcome { first: submissions.first().cloned(), first_verification: states.first().copied().unwrap_or("no_candidate"), outcome, accepted })
+}
+
+/// One bound arm at selection time, with its [`ArmOutcome`].
 struct BoundArm { arm: i64, attempt: String, first: Option<String>, first_verification: &'static str, outcome: &'static str, accepted: Option<String> }
 
 fn bound_arms(tx: &Connection, group: &str) -> Result<Vec<BoundArm>> {
-    let bound: Vec<(i64, String, Option<String>)> = tx.prepare("SELECT b.arm,b.attempt_id,a.state FROM candidate_arm_attempts b LEFT JOIN attempts a ON a.id=b.attempt_id WHERE b.group_id=?1 ORDER BY b.arm")?
-        .query_map([group], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+    let bound: Vec<(i64, String)> = tx.prepare("SELECT arm,attempt_id FROM candidate_arm_attempts WHERE group_id=?1 ORDER BY arm")?
+        .query_map([group], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
     let mut arms = Vec::with_capacity(bound.len());
-    for (arm, attempt, state) in bound {
-        let submissions: Vec<String> = tx.prepare("SELECT submission_id FROM result_submissions WHERE attempt_id=?1 ORDER BY created_unix_ms,rowid")?
-            .query_map([&attempt], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-        let states = submissions.iter().map(|s| verification(tx, s)).collect::<Result<Vec<_>>>()?;
-        let accepted = submissions.iter().zip(&states).find(|(_, v)| **v == "accepted").map(|(s, _)| s.clone());
-        let terminal = state.as_deref().is_some_and(|s| TERMINAL_ATTEMPT.contains(&s));
-        let outcome = if accepted.is_some() { "accepted" } else if states.contains(&"pending") || !terminal { "pending" }
-            else if submissions.is_empty() { "no_candidate" } else { "rejected" };
-        arms.push(BoundArm { arm, attempt, first: submissions.first().cloned(), first_verification: states.first().copied().unwrap_or("no_candidate"), outcome, accepted });
+    for (arm, attempt) in bound {
+        let ArmOutcome { first, first_verification, outcome, accepted } = arm_outcome(tx, &attempt)?;
+        arms.push(BoundArm { arm, attempt, first, first_verification, outcome, accepted });
     }
     Ok(arms)
 }
@@ -150,6 +167,31 @@ fn presentation(group: &str, arms: &[BoundArm]) -> Vec<Option<usize>> {
 /// the first candidate and its combined verification, and the arm's outcome.
 fn evidence(arms: &[BoundArm]) -> Vec<serde_json::Value> {
     arms.iter().map(|a| serde_json::json!({"arm": a.arm, "attempt_id": a.attempt, "submission_id": a.first, "verification": a.first_verification, "arm_outcome": a.outcome})).collect()
+}
+
+/// Runner-up order of an operator or judge selection: `rank` 1 for the
+/// winner, 2, 3, ... for each runner-up in the order given, null for every
+/// other arm. Runner-ups must be bound arms, distinct, and not the winner.
+fn ranked(arms: &[BoundArm], evidence: Vec<serde_json::Value>, winner: i64, runner_up: &[i64]) -> Result<Vec<serde_json::Value>> {
+    for (i, arm) in runner_up.iter().enumerate() {
+        if *arm == winner { return Err(invalid(format!("runner-up arm {arm} is the selected arm"))); }
+        if runner_up[..i].contains(arm) { return Err(invalid(format!("runner-up arm {arm} is repeated"))); }
+        if !arms.iter().any(|a| a.arm == *arm) { return Err(invalid(format!("runner-up arm {arm} is not a bound arm"))); }
+    }
+    Ok(evidence.into_iter().zip(arms).map(|(mut e, a)| {
+        e["rank"] = if a.arm == winner { serde_json::json!(1) } else { runner_up.iter().position(|r| *r == a.arm).map_or(serde_json::Value::Null, |p| serde_json::json!(p + 2)) };
+        e
+    }).collect())
+}
+
+/// A judge configuration is a contracts §2 configuration ID (`sha256:` + 64
+/// lowercase hex), recorded by value.
+fn judge_configuration(configuration: Option<&str>) -> Result<serde_json::Value> {
+    match configuration {
+        None => Ok(serde_json::Value::Null),
+        Some(id) if id.strip_prefix("sha256:").is_some_and(|h| h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))) => Ok(serde_json::json!(id)),
+        Some(id) => Err(invalid(format!("judge configuration {id} is not a configuration ID (sha256: and 64 lowercase hex)"))),
+    }
 }
 
 /// The sealed group's arm count, if it has no selection yet.
@@ -225,12 +267,13 @@ impl SqliteStore {
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let arm_count = open_group(&tx, group)?;
         let arms = bound_arms(&tx, group)?;
+        let mut evidence = evidence(&arms);
         let picked = match choice {
             SelectionChoice::NoSelection => {
                 if !NO_SELECTION_REASONS.contains(&reason) { return Err(invalid(format!("unknown no-selection reason {reason}"))); }
                 None
             }
-            SelectionChoice::Arm { arm, submission } => {
+            SelectionChoice::Arm { arm, submission, runner_up } => {
                 if !SELECTED_REASONS.contains(&reason) { return Err(invalid(format!("unknown selection reason {reason}"))); }
                 if *arm == 0 || i64::from(*arm) > arm_count { return Err(invalid(format!("arm {arm} is not a member of {group}"))); }
                 let bound = arms.iter().find(|a| a.arm == i64::from(*arm)).ok_or_else(|| invalid(format!("arm {arm} has no attempt")))?;
@@ -239,10 +282,11 @@ impl SqliteStore {
                         .ok_or_else(|| invalid(format!("submission {id} is not a candidate of arm {arm}")))?,
                     None => bound.first.clone().ok_or_else(|| invalid(format!("arm {arm} has no candidate")))?,
                 };
+                evidence = ranked(&arms, evidence, bound.arm, &runner_up.iter().map(|r| i64::from(*r)).collect::<Vec<_>>())?;
                 Some((*arm, bound.attempt.clone(), submission))
             }
         };
-        insert_selection(tx, Decision { group, picked, kind: "operator", principal, reason, evidence: evidence(&arms), now })
+        insert_selection(tx, Decision { group, picked, kind: "operator", principal, reason, evidence, now })
     }
 
     /// Select by rule `first_accepted_in_launch_order.v1` (principal
@@ -280,18 +324,24 @@ impl SqliteStore {
     /// Record a judge's choice of one presented candidate (`judge_preference`,
     /// principal `judge:<judge>`). No model runs here: the judge saw each
     /// arm's first candidate in the blind [`PRESENTATION`] order, without arm,
-    /// attempt or configuration, and names a submission; evidence records every
-    /// arm's `presented` position (null when not presented).
-    pub fn select_candidate_by_judge(&mut self, group: &str, submission: &str, judge: &str, now: i64) -> Result<CandidateSelection> {
+    /// attempt or configuration, and names a submission, optionally with its
+    /// runner-up candidates in order (presented submissions); evidence records
+    /// every arm's `presented` position (null when not presented), `rank`, and
+    /// the judge's `judge_configuration_id` (null when not given).
+    pub fn select_candidate_by_judge(&mut self, group: &str, submission: &str, judge: &str, configuration: Option<&str>, runner_up: &[String], now: i64) -> Result<CandidateSelection> {
         if judge.is_empty() || judge.len() > 122 { return Err(invalid("invalid judge".into())); }
+        let judge_configuration = judge_configuration(configuration)?;
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         open_group(&tx, group)?;
         let arms = bound_arms(&tx, group)?;
         let positions = presentation(group, &arms);
-        let chosen = arms.iter().find(|a| a.first.as_deref() == Some(submission))
-            .ok_or_else(|| invalid(format!("submission {submission} is not a presented candidate of {group}")))?;
+        let presented = |submission: &str| arms.iter().find(|a| a.first.as_deref() == Some(submission))
+            .ok_or_else(|| invalid(format!("submission {submission} is not a presented candidate of {group}")));
+        let chosen = presented(submission)?;
+        let runner_up = runner_up.iter().map(|s| presented(s).map(|a| a.arm)).collect::<Result<Vec<_>>>()?;
         let picked = Some((chosen.arm as u32, chosen.attempt.clone(), submission.to_owned()));
-        let evidence = evidence(&arms).into_iter().zip(positions).map(|(mut e, p)| { e["presented"] = serde_json::json!(p); e }).collect();
+        let evidence = evidence(&arms).into_iter().zip(positions).map(|(mut e, p)| { e["presented"] = serde_json::json!(p); e["judge_configuration_id"] = judge_configuration.clone(); e }).collect();
+        let evidence = ranked(&arms, evidence, chosen.arm, &runner_up)?;
         let principal = format!("judge:{judge}");
         insert_selection(tx, Decision { group, picked, kind: "judge", principal: &principal, reason: "judge_preference", evidence, now })
     }

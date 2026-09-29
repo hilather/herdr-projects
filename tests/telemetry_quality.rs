@@ -338,12 +338,22 @@ fn group_arms_fixed_before_outcomes_and_losers_keep_cost() {
     let a2_usage = json!({"input_tokens": 1500, "cached_input_tokens": 500, "cache_write_input_tokens": 0, "output_tokens": 180, "reasoning_output_tokens": 100, "total_tokens": 1680, "records": 2});
     assert_eq!((usage(&a1), usage(&a2)), (a1_usage.clone(), a2_usage.clone()));
 
-    let selection = f.cli_args(&["quality", "groups", "select", &group, "--arm", "2", "--reason", "operator_judgment"]).0["selection"].clone();
+    // Runner-ups are bound arms, distinct and not the winner (arm 3 never launched).
+    for (args, message) in [(vec!["--runner-up", "2"], "runner-up arm 2 is the selected arm"), (vec!["--runner-up", "3"], "runner-up arm 3 is not a bound arm"),
+        (vec!["--runner-up", "1", "--runner-up", "1"], "runner-up arm 1 is repeated"), (vec!["--runner-up", "first"], "--runner-up first is not an arm number")] {
+        let mut command = vec!["quality", "groups", "select", &group, "--arm", "2"];
+        command.extend(args);
+        assert!(f.cli_fail(&command).contains(message), "{message}");
+    }
+    assert!(f.cli_fail(&["quality", "groups", "select", &group, "--none", "--runner-up", "1"]).contains("cannot be used with"));
+    assert_eq!(count("candidate_selections"), 0);
+    let selection = f.cli_args(&["quality", "groups", "select", &group, "--arm", "2", "--runner-up", "1", "--reason", "operator_judgment"]).0["selection"].clone();
     assert_eq!((&selection["outcome"], &selection["arm"], &selection["attempt_id"], &selection["submission_id"]), (&json!("selected"), &json!(2), &json!(a2), &json!(hex('2'))));
     assert_eq!((&selection["selector_kind"], &selection["selector_principal"], &selection["reason"]), (&json!("operator"), &json!("operator:cli"), &json!("operator_judgment")));
     // Arm 2's candidate is rejected but its attempt is still open (it may resubmit), so its arm outcome is pending.
-    assert_eq!(selection["evidence"], json!([{"arm": 1, "attempt_id": a1, "submission_id": hex('1'), "verification": "accepted", "arm_outcome": "accepted"},
-        {"arm": 2, "attempt_id": a2, "submission_id": hex('2'), "verification": "rejected", "arm_outcome": "pending"}]));
+    // The operator's order is recorded: the winner rank 1, the runner-up 2.
+    assert_eq!(selection["evidence"], json!([{"arm": 1, "attempt_id": a1, "submission_id": hex('1'), "verification": "accepted", "arm_outcome": "accepted", "rank": 2},
+        {"arm": 2, "attempt_id": a2, "submission_id": hex('2'), "verification": "rejected", "arm_outcome": "pending", "rank": 1}]));
     assert!(f.cli_fail(&["quality", "groups", "select", &group, "--none"]).contains("already has a selection"));
     assert!(sql().execute("DELETE FROM candidate_selections", []).is_err(), "a selection is immutable");
 
@@ -362,6 +372,64 @@ fn group_arms_fixed_before_outcomes_and_losers_keep_cost() {
     // Selection moved no cost and changed no outcome: the loser's usage and every attempt record are as before.
     assert_eq!(usage(&a1), a1_usage);
     assert_eq!(arms[0]["verification"], before["groups"][0]["arms"][0]["verification"]);
+}
+
+/// Groups planted through `quality groups create`, with the worker side of
+/// each arm (launch, result, pinned CI) written as the controller would.
+#[derive(Default)]
+struct Planted {
+    /// `task` (revision 1) or `task/r<revision>` -> group ID.
+    ids: std::collections::BTreeMap<String, String>,
+    /// Configuration IDs of the first group's arms.
+    configurations: Vec<String>,
+    /// `(key, arm)` -> submission ID.
+    subs: std::collections::BTreeMap<(String, i64), String>,
+    submission: u32,
+}
+
+impl Planted {
+    /// A group for `task`'s contract `revision`; arm outcomes are acc(epted),
+    /// rej(ected), none (terminal, no candidate), run(ning) or unb(ound).
+    fn group(&mut self, f: &Fixture, task: &str, revision: i64, profiles: &[&str], outcomes: &[&str]) {
+        let db_path = f.project.join(".state/state.db");
+        let sql = || { let db = rusqlite::Connection::open(&db_path).unwrap(); db.execute_batch("PRAGMA foreign_keys=OFF").unwrap(); db };
+        let key = if revision == 1 { task.to_owned() } else { format!("{task}/r{revision}") };
+        let db = sql();
+        if revision == 1 { db.execute("INSERT INTO tasks(id,revision,state,title) VALUES(?1,1,'running',?1)", [task]).unwrap(); }
+        db.execute("INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq)
+            VALUES(?1,?4,NULL,'store',0,'/repo',?2,'sha1',NULL,'verify_only',CAST(?1 AS BLOB),?3,(SELECT max(sequence) FROM events))",
+            rusqlite::params![task, "b".repeat(40), format!("{:x<64}", key), revision]).unwrap();
+        db.execute("INSERT INTO acceptance_policies(task_id,contract_revision,policy_id,body) VALUES(?1,?2,'ci','cargo test')", rusqlite::params![task, revision]).unwrap();
+        drop(db);
+        let mut args = vec!["quality", "groups", "create", task];
+        for profile in profiles { args.extend(["--arm", profile]); }
+        let group = f.cli_args(&args).0["group"].clone();
+        if self.configurations.is_empty() { self.configurations = group["arms"].as_array().unwrap().iter().map(|a| a["configuration_id"].as_str().unwrap().to_owned()).collect(); }
+        let id = group["group_id"].as_str().unwrap().to_owned();
+        let db = sql();
+        for (i, outcome) in outcomes.iter().enumerate().filter(|(_, o)| **o != "unb") {
+            let (arm, attempt) = (i as i64 + 1, if revision == 1 { format!("{task}-a{}", i + 1) } else { format!("{task}-r{revision}-a{}", i + 1) });
+            db.execute("INSERT INTO attempts(id,task_id,revision,state,reservation,termination_observed) VALUES(?1,?2,1,?3,?1,?4)",
+                rusqlite::params![attempt, task, if *outcome == "run" { "running" } else { "completed" }, i64::from(*outcome != "run")]).unwrap();
+            db.execute("INSERT INTO dispatch_decisions(attempt_id,task_id,task_revision,contract_revision,chosen_configuration_id,eligible,chooser_kind,chooser_principal,reason_codes,decided_unix_ms)
+                VALUES(?1,?2,1,?4,?3,'[\"x\"]','operator','operator:cli','[\"x\"]',1)", rusqlite::params![attempt, task, group["arms"][i]["configuration_id"].as_str().unwrap(), revision]).unwrap();
+            db.execute("INSERT INTO candidate_arm_attempts(group_id,arm,attempt_id,bound_unix_ms,source) VALUES(?1,?2,?3,1,'admit_prepared')", rusqlite::params![id, arm, attempt]).unwrap();
+            if matches!(*outcome, "none" | "run") { continue; }
+            self.submission += 1;
+            let submission = self.submission;
+            let sub = format!("{submission:064x}");
+            self.subs.insert((key.clone(), arm), sub.clone());
+            db.execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,artifact_manifest,claimed_checks,created_unix_ms)
+                VALUES(?1,'store',?1,?2,'{}',?3,?8,?2,?4,'/repo',?5,?6,'sha1','[]','[]',?7)", rusqlite::params![sub, "d".repeat(64), task, attempt, "b".repeat(40), format!("{submission:040x}"), i64::from(submission), revision]).unwrap();
+            let accepted = *outcome == "acc";
+            db.execute("INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,
+                commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms)
+                VALUES(?1,'store',?1,?2,?3,?4,?11,?2,?5,'ci',?2,?6,?6,'sha1',0,'linux-unshare-user-pid-mount-v1','[\"x\"]','[]',?7,?8,?9,?10,1,1,100)",
+                rusqlite::params![format!("{:064x}", 1000 + submission), "d".repeat(64), sub, task, attempt, format!("{submission:040x}"), if accepted { "accepted" } else { "rejected" },
+                    (!accepted).then_some("cargo test failed"), if accepted { 0 } else { 101 }, accepted.then(|| "8".repeat(64)), revision]).unwrap();
+        }
+        self.ids.insert(key, id);
+    }
 }
 
 /// TM3.8 selection and paired outcomes (contracts-quality.md §4). Arms are
@@ -397,7 +465,6 @@ fn win_rate_and_paired_difference_over_closed_groups() {
     fast.arguments_digest = "1".repeat(64);
     plant_profile(&db_path, fast);
     plant_profile(&db_path, codex_profile(&f.config, "claude", "claude", None));
-    let sql = || { let db = rusqlite::Connection::open(&db_path).unwrap(); db.execute_batch("PRAGMA foreign_keys=OFF").unwrap(); db };
 
     let empty = f.report()["metrics"].clone();
     assert_eq!((&empty["M41"]["value"], &empty["M42"]["value"]), (&json!({"status": "unavailable", "reason": "no_closed_groups"}), &json!({"status": "unavailable", "reason": "no_closed_groups"})));
@@ -408,48 +475,10 @@ fn win_rate_and_paired_difference_over_closed_groups() {
         ("g3", &["codex", "fast"], &["none", "rej"]), ("g4", &["codex", "fast"], &["acc", "acc"]), ("g5", &["codex", "fast"], &["rej", "rej"]),
         ("g6", &["codex", "fast", "claude"], &["rej", "rej", "acc"]), ("g7", &["codex", "fast", "claude"], &["acc", "acc", "run"]),
         ("g8", &["codex", "fast"], &["acc", "acc"]), ("g9", &["codex", "fast"], &["acc", "none"]), ("g10", &["codex", "fast"], &["run", "unb"])];
-    let mut ids = std::collections::BTreeMap::new();
-    let mut configurations = Vec::new();
-    let mut submission = 0;
-    let hex = |n: u32| format!("{n:064x}");
-    let mut subs = std::collections::BTreeMap::new();
-    for (task, profiles, outcomes) in groups {
-        let db = sql();
-        db.execute("INSERT INTO tasks(id,revision,state,title) VALUES(?1,1,'running',?1)", [task]).unwrap();
-        db.execute("INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq)
-            VALUES(?1,1,NULL,'store',0,'/repo',?2,'sha1',NULL,'verify_only',CAST(?1 AS BLOB),?3,(SELECT max(sequence) FROM events))",
-            rusqlite::params![task, "b".repeat(40), format!("{:x<64}", task)]).unwrap();
-        db.execute("INSERT INTO acceptance_policies(task_id,contract_revision,policy_id,body) VALUES(?1,1,'ci','cargo test')", [task]).unwrap();
-        drop(db);
-        let mut args = vec!["quality", "groups", "create", task];
-        for profile in profiles { args.extend(["--arm", profile]); }
-        let group = f.cli_args(&args).0["group"].clone();
-        if configurations.is_empty() { configurations = group["arms"].as_array().unwrap().iter().map(|a| a["configuration_id"].as_str().unwrap().to_owned()).collect(); }
-        let id = group["group_id"].as_str().unwrap().to_owned();
-        // The worker side of each arm, as launches, results and pinned CI would write it.
-        let db = sql();
-        for (i, outcome) in outcomes.iter().enumerate().filter(|(_, o)| **o != "unb") {
-            let (arm, attempt) = (i as i64 + 1, format!("{task}-a{}", i + 1));
-            db.execute("INSERT INTO attempts(id,task_id,revision,state,reservation,termination_observed) VALUES(?1,?2,1,?3,?1,?4)",
-                rusqlite::params![attempt, task, if *outcome == "run" { "running" } else { "completed" }, i64::from(*outcome != "run")]).unwrap();
-            db.execute("INSERT INTO dispatch_decisions(attempt_id,task_id,task_revision,contract_revision,chosen_configuration_id,eligible,chooser_kind,chooser_principal,reason_codes,decided_unix_ms)
-                VALUES(?1,?2,1,1,?3,'[\"x\"]','operator','operator:cli','[\"x\"]',1)", rusqlite::params![attempt, task, group["arms"][i]["configuration_id"].as_str().unwrap()]).unwrap();
-            db.execute("INSERT INTO candidate_arm_attempts(group_id,arm,attempt_id,bound_unix_ms,source) VALUES(?1,?2,?3,1,'admit_prepared')", rusqlite::params![id, arm, attempt]).unwrap();
-            if matches!(*outcome, "none" | "run") { continue; }
-            submission += 1;
-            let sub = hex(submission);
-            subs.insert((task, arm), sub.clone());
-            db.execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,artifact_manifest,claimed_checks,created_unix_ms)
-                VALUES(?1,'store',?1,?2,'{}',?3,1,?2,?4,'/repo',?5,?6,'sha1','[]','[]',?7)", rusqlite::params![sub, "d".repeat(64), task, attempt, "b".repeat(40), format!("{submission:040x}"), i64::from(submission)]).unwrap();
-            let accepted = *outcome == "acc";
-            db.execute("INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,
-                commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms)
-                VALUES(?1,'store',?1,?2,?3,?4,1,?2,?5,'ci',?2,?6,?6,'sha1',0,'linux-unshare-user-pid-mount-v1','[\"x\"]','[]',?7,?8,?9,?10,1,1,100)",
-                rusqlite::params![format!("{:064x}", 1000 + submission), "d".repeat(64), sub, task, attempt, format!("{submission:040x}"), if accepted { "accepted" } else { "rejected" },
-                    (!accepted).then_some("cargo test failed"), if accepted { 0 } else { 101 }, accepted.then(|| "8".repeat(64))]).unwrap();
-        }
-        ids.insert(task, id);
-    }
+    let mut planted = Planted::default();
+    for (task, profiles, outcomes) in groups { planted.group(&f, task, 1, profiles, outcomes); }
+    let Planted { ids, configurations, subs, .. } = planted;
+    let sub = |task: &str, arm: i64| subs[&(task.to_owned(), arm)].clone();
     let (a, b, c) = (configurations[0].clone(), configurations[1].clone(), configurations[2].clone());
     let select = |task: &str, args: &[&str]| {
         let mut command = vec!["quality", "groups", "select", &ids[task]];
@@ -464,12 +493,12 @@ fn win_rate_and_paired_difference_over_closed_groups() {
         ("g4", Some(1), Some(("g4", 1)), "first_passing_verification"), ("g5", None, None, "none_acceptable"), ("g6", Some(3), Some(("g6", 3)), "first_passing_verification")] {
         let s = select(task, &["--rule"]);
         assert_eq!((&s["selector_kind"], &s["selector_principal"], &s["reason"]), (&json!("rule"), &json!("rule:first_accepted_in_launch_order.v1"), &json!(reason)), "{task}");
-        assert_eq!((&s["arm"], &s["submission_id"]), (&json!(winner), &json!(submission.map(|k| subs[&k].clone()))), "{task}");
+        assert_eq!((&s["arm"], &s["submission_id"]), (&json!(winner), &json!(submission.map(|(t, a)| sub(t, a)))), "{task}");
     }
     // A tie goes to launch order; every accepted arm is ranked, the winner first.
     let g4 = f.cli_args(&["quality", "groups", "show"]).0["groups"][4]["selection"]["evidence"].clone();
-    assert_eq!(g4, json!([{"arm": 1, "attempt_id": "g4-a1", "submission_id": subs[&("g4", 1)], "verification": "accepted", "arm_outcome": "accepted", "rank": 1},
-        {"arm": 2, "attempt_id": "g4-a2", "submission_id": subs[&("g4", 2)], "verification": "accepted", "arm_outcome": "accepted", "rank": 2}]));
+    assert_eq!(g4, json!([{"arm": 1, "attempt_id": "g4-a1", "submission_id": sub("g4", 1), "verification": "accepted", "arm_outcome": "accepted", "rank": 1},
+        {"arm": 2, "attempt_id": "g4-a2", "submission_id": sub("g4", 2), "verification": "accepted", "arm_outcome": "accepted", "rank": 2}]));
 
     // Operator selections; g3 selects a rejected candidate: selection is not verification.
     select("g0", &["--arm", "1", "--reason", "operator_judgment"]);
@@ -484,15 +513,27 @@ fn win_rate_and_paired_difference_over_closed_groups() {
     let candidates = presented["candidates"].as_array().unwrap();
     assert_eq!(candidates.iter().map(|c| c["position"].as_i64().unwrap()).collect::<Vec<_>>(), [1, 2]);
     let position = |sub: &str| candidates.iter().find(|c| c["submission_id"] == sub).unwrap()["position"].clone();
-    let s = select("g8", &["--judge", "blind-1", "--submission", &subs[&("g8", 2)]]);
+    // The judge names its runner-up by presented submission and may record its own configuration.
+    let (s1, s2) = (sub("g8", 1), sub("g8", 2));
+    let base = ["quality", "groups", "select", &ids["g8"], "--judge", "blind-1", "--submission", &s2];
+    let judge_fail = |extra: &[&str]| f.cli_fail(&[&base[..], extra].concat());
+    assert!(judge_fail(&["--judge-configuration", "gpt-judge"]).contains("is not a configuration ID"));
+    assert!(judge_fail(&["--runner-up", &s2]).contains("runner-up arm 2 is the selected arm"));
+    assert!(judge_fail(&["--runner-up", &sub("g4", 1)]).contains("is not a presented candidate"));
+    assert!(f.cli_fail(&["quality", "groups", "select", &ids["g8"], "--arm", "1", "--judge-configuration", &c]).contains("--judge"));
+    let s = f.cli_args(&[&base[..], &["--runner-up", &s1, "--judge-configuration", &c]].concat()).0["selection"].clone();
     assert_eq!((&s["selector_kind"], &s["selector_principal"], &s["reason"], &s["arm"]), (&json!("judge"), &json!("judge:blind-1"), &json!("judge_preference"), &json!(2)));
-    assert_eq!((&s["evidence"][0]["presented"], &s["evidence"][1]["presented"]), (&position(&subs[&("g8", 1)]), &position(&subs[&("g8", 2)])));
+    assert_eq!(s["evidence"], json!([
+        {"arm": 1, "attempt_id": "g8-a1", "submission_id": s1, "verification": "accepted", "arm_outcome": "accepted", "presented": position(&s1), "judge_configuration_id": c, "rank": 2},
+        {"arm": 2, "attempt_id": "g8-a2", "submission_id": s2, "verification": "accepted", "arm_outcome": "accepted", "presented": position(&s2), "judge_configuration_id": c, "rank": 1}]));
     assert!(f.cli_fail(&["quality", "groups", "present", &ids["g8"]]).contains("already has a selection"));
 
     let report = f.cli_args(&["quality", "groups", "report"]).0;
-    assert_eq!(report["min_groups"], json!(10));
+    let registry = |unit: &str| json!({"value": 10, "unit": unit, "source": "registry.v1"});
+    assert_eq!(report["min_sample"], registry("closed_groups_containing_both"));
     let (m41, m42) = (&report["metrics"]["M41"], &report["metrics"]["M42"]);
     assert_eq!((&m41["closed_groups"], &m41["open_groups"], &m41["definition"]), (&json!(10), &json!(1), &json!("M41.v1")));
+    assert_eq!((&m41["min_sample"], &m42["min_sample"]), (&registry("closed_groups"), &registry("closed_groups_containing_both")));
     let cell = |m: &serde_json::Value, selector: &str, c: &str| m["by_selector"][selector]["configurations"].as_array().unwrap().iter().find(|x| x["configuration_id"] == c).unwrap().clone();
     let insufficient = json!({"status": "unavailable", "reason": "insufficient_data"});
     assert_eq!(cell(m41, "all", &a), json!({"configuration_id": a, "groups": 10, "selected": 4, "no_selection": 2, "other_selected": 4, "value": "4/10"}));
@@ -506,16 +547,24 @@ fn win_rate_and_paired_difference_over_closed_groups() {
     let mut shown = [(a.clone(), "4/10"), (b.clone(), "3/10")];
     shown.sort();
     assert_eq!(m41["value"], json!(shown.iter().map(|(c, v)| format!("{}={v}", short(c))).collect::<Vec<_>>().join(" ")));
+    // The interval resamples the ten tasks (g0..g9 in task order; per-task a - b: 0 +1 -1 0 0 0 0 0 0 +1) with
+    // the registry seed. Expected ranks 25 and 975 of 1000 draws are from an independent Python SplitMix64
+    // re-implementation of the contracts-quality.md §4 method (exact Fraction sort).
+    let interval = |lower: &str, upper: &str, lower_difference: &str, upper_difference: &str, clusters: u32| json!({"method": "percentile_bootstrap.v1", "resample": "task",
+        "clusters": clusters, "iterations": 1000, "seed": "0x4d34325f626f6f74", "level": "0.95", "lower": lower, "upper": upper, "lower_difference": lower_difference,
+        "upper_difference": upper_difference, "unit": "percentage_points", "task_family": {"status": "unavailable", "reason": "no_task_family_data"}, "source": "registry.v1"});
     assert_eq!(pair(&m42["pairs"], &a, &b), json!({"a": a, "b": b, "groups": 10, "pending": 0, "n": 10, "both_accepted": 4, "a_only": 2, "b_only": 1,
-        "neither": 3, "difference": "1/10", "value": 10.0, "unit": "percentage_points", "uncertainty": {"status": "unavailable", "reason": "clustered_interval_not_computed"}}));
-    assert_eq!(pair(&m42["pairs"], &b, &a)["value"], json!(-10.0));
+        "neither": 3, "difference": "1/10", "value": 10.0, "unit": "percentage_points", "uncertainty": interval("-20.00", "40.00", "-2/10", "4/10", 10)}));
+    assert_eq!((&pair(&m42["pairs"], &b, &a)["value"], &pair(&m42["pairs"], &b, &a)["uncertainty"]), (&json!(-10.0), &interval("-40.00", "20.00", "-4/10", "2/10", 10)));
+    assert_eq!(m42["estimator"], json!({"method": "percentile_bootstrap.v1", "resample": "task", "task_family": {"status": "unavailable", "reason": "no_task_family_data"}}));
     let ac = pair(&m42["pairs"], &a, &c);
-    assert_eq!((&ac["groups"], &ac["pending"], &ac["n"], &ac["a_only"], &ac["b_only"], &ac["value"]), (&json!(3), &json!(1), &json!(2), &json!(1), &json!(1), &insufficient));
+    assert_eq!((&ac["groups"], &ac["pending"], &ac["n"], &ac["a_only"], &ac["b_only"], &ac["value"], &ac["uncertainty"]), (&json!(3), &json!(1), &json!(2), &json!(1), &json!(1), &insufficient, &insufficient));
     let (lo, hi) = if a < b { (&a, &b) } else { (&b, &a) };
     assert_eq!(m42["value"], json!(format!("{}-{}={}pp", short(lo), short(hi), if lo == &a { "10.0" } else { "-10.0" })));
 
     // Selector type is a dimension; with a lower threshold every cell shows its rate.
     let low = f.cli_args(&["quality", "groups", "report", "--min-groups", "1"]).0["metrics"]["M41"].clone();
+    assert_eq!(low["min_sample"], json!({"value": 1, "unit": "closed_groups", "source": "override", "registry": {"value": 10, "source": "registry.v1"}}));
     let rates = |selector: &str| [&a, &b, &c].map(|x| low["by_selector"][selector]["configurations"].as_array().unwrap().iter().find(|y| y["configuration_id"] == *x).map(|y| y["value"].clone()));
     assert_eq!(rates("rule"), [Some(json!("2/5")), Some(json!("1/5")), Some(json!("1/1"))]);
     assert_eq!(rates("operator"), [Some(json!("2/4")), Some(json!("1/4")), Some(json!("0/2"))]);
@@ -528,4 +577,81 @@ fn win_rate_and_paired_difference_over_closed_groups() {
     let later = (unix_ms() + 86_400_000).to_string();
     let windowed = f.cli_args(&["quality", "groups", "report", "--since", &later]).0["metrics"].clone();
     assert_eq!((&windowed["M41"]["value"], &windowed["M42"]["closed_groups"]), (&json!({"status": "unavailable", "reason": "no_closed_groups"}), &json!(0)));
+}
+
+/// M42's interval resamples whole tasks (contracts-quality.md §4): task t1 has
+/// two groups (contract revisions 1 and 2), so its two paired groups move
+/// together. Arms A `codex`, B `fast`, C `claude`.
+///
+/// | group | arms | outcomes     | a - b | selection                           |
+/// |-------|------|--------------|-------|-------------------------------------|
+/// | t1/r1 | AB   | acc rej      | +1    | operator arm 1                      |
+/// | t1/r2 | AB   | acc rej      | +1    | rule -> A                           |
+/// | t2    | ABC  | rej acc acc  | -1    | operator arm 2, runner-ups 3 then 1 |
+/// | t3    | AB   | acc acc      | 0     | judge -> A, runner-up B             |
+/// | t4    | AB   | none none    | 0     | operator --none                     |
+///
+/// A-B: n = 5, difference (2 - 1)/5 = +20 points; clusters in task order
+/// t1 (2/2), t2 (-1/1), t3 (0/1), t4 (0/1). The registry minimum (10) hides
+/// the value and interval; `--min-groups 5` shows both, labelled `override`.
+/// Expected ranks 25 and 975 of 1000 draws come from an independent Python
+/// SplitMix64 re-implementation (exact Fraction sort): -3/4 and 6/7. Resampling
+/// the five groups instead would give -2/5 and 4/5.
+#[test]
+fn paired_interval_resamples_tasks_and_selections_record_runner_ups() {
+    let f = Fixture::new();
+    let db_path = f.project.join(".state/state.db");
+    let mut fast = codex_profile(&f.config, "codex", "fast", Some(&f.tmp.path().join("fast-home")));
+    fast.arguments_digest = "1".repeat(64);
+    plant_profile(&db_path, fast);
+    plant_profile(&db_path, codex_profile(&f.config, "claude", "claude", None));
+    let mut planted = Planted::default();
+    planted.group(&f, "t1", 1, &["codex", "fast"], &["acc", "rej"]);
+    planted.group(&f, "t1", 2, &["codex", "fast"], &["acc", "rej"]);
+    planted.group(&f, "t2", 1, &["codex", "fast", "claude"], &["rej", "acc", "acc"]);
+    planted.group(&f, "t3", 1, &["codex", "fast"], &["acc", "acc"]);
+    planted.group(&f, "t4", 1, &["codex", "fast"], &["none", "none"]);
+    let Planted { ids, configurations, subs, .. } = planted;
+    let (a, b) = (configurations[0].clone(), configurations[1].clone());
+    let select = |key: &str, args: &[&str]| {
+        let mut command = vec!["quality", "groups", "select", &ids[key]];
+        command.extend(args);
+        f.cli_args(&command).0["selection"].clone()
+    };
+    select("t1", &["--arm", "1"]);
+    assert_eq!(select("t1/r2", &["--rule"])["arm"], json!(1));
+    // Three arms, ranked by the operator: winner 2, then 3, then 1.
+    let t2 = select("t2", &["--arm", "2", "--runner-up", "3", "--runner-up", "1"]);
+    assert_eq!(t2["evidence"].as_array().unwrap().iter().map(|e| (e["arm"].clone(), e["rank"].clone())).collect::<Vec<_>>(),
+        [(json!(1), json!(3)), (json!(2), json!(1)), (json!(3), json!(2))]);
+    let t3 = select("t3", &["--judge", "blind-2", "--submission", &subs[&("t3".to_owned(), 1)], "--runner-up", &subs[&("t3".to_owned(), 2)]]);
+    assert_eq!((&t3["evidence"][0]["rank"], &t3["evidence"][1]["rank"], &t3["evidence"][0]["judge_configuration_id"]), (&json!(1), &json!(2), &json!(null)));
+    // No winner, no ranks: the operator's --none evidence is unchanged.
+    assert_eq!(select("t4", &["--none"])["evidence"], json!([
+        {"arm": 1, "attempt_id": "t4-a1", "submission_id": null, "verification": "no_candidate", "arm_outcome": "no_candidate"},
+        {"arm": 2, "attempt_id": "t4-a2", "submission_id": null, "verification": "no_candidate", "arm_outcome": "no_candidate"}]));
+
+    let pair = |min: Option<&str>, x: &str, y: &str| {
+        let mut args = vec!["quality", "groups", "report"];
+        if let Some(min) = min { args.extend(["--min-groups", min]); }
+        let report = f.cli_args(&args).0;
+        let p = report["metrics"]["M42"]["pairs"].as_array().unwrap().iter().find(|p| p["a"] == x && p["b"] == y).unwrap().clone();
+        (report["metrics"]["M42"]["min_sample"].clone(), p)
+    };
+    let insufficient = json!({"status": "unavailable", "reason": "insufficient_data"});
+    let (sample, ab) = pair(None, &a, &b);
+    assert_eq!(sample, json!({"value": 10, "unit": "closed_groups_containing_both", "source": "registry.v1"}));
+    assert_eq!((&ab["n"], &ab["difference"], &ab["value"], &ab["uncertainty"]), (&json!(5), &json!("1/5"), &insufficient, &insufficient), "5 groups: counts only");
+    let (_, ab6) = pair(Some("6"), &a, &b);
+    assert_eq!((&ab6["value"], &ab6["uncertainty"]), (&insufficient, &insufficient));
+    let (sample, ab) = pair(Some("5"), &a, &b);
+    assert_eq!(sample, json!({"value": 5, "unit": "closed_groups_containing_both", "source": "override", "registry": {"value": 10, "source": "registry.v1"}}));
+    let interval = |lower: &str, upper: &str, lower_difference: &str, upper_difference: &str| json!({"method": "percentile_bootstrap.v1", "resample": "task",
+        "clusters": 4, "iterations": 1000, "seed": "0x4d34325f626f6f74", "level": "0.95", "lower": lower, "upper": upper, "lower_difference": lower_difference,
+        "upper_difference": upper_difference, "unit": "percentage_points", "task_family": {"status": "unavailable", "reason": "no_task_family_data"}, "source": "registry.v1"});
+    assert_eq!((&ab["n"], &ab["a_only"], &ab["b_only"], &ab["value"]), (&json!(5), &json!(2), &json!(1), &json!(20.0)));
+    assert_eq!(ab["uncertainty"], interval("-75.00", "85.71", "-3/4", "6/7"));
+    assert_eq!(pair(Some("5"), &b, &a).1["uncertainty"], interval("-85.71", "75.00", "-6/7", "3/4"));
+    // Deterministic: the same rows and seed give the same interval.
+    assert_eq!(pair(Some("5"), &a, &b).1, ab);
 }

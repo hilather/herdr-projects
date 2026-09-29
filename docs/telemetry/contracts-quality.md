@@ -169,9 +169,12 @@ keeps its attempt's usage.
   `--arm` names a retained native profile (latest retained report of that
   name). Principal `operator:cli`. Writes through `SqliteStore` in one
   canonical transaction.
-- `select <group> (--arm N [--submission ID] | --none) [--reason CODE]`
-  records the selection (`selector_kind = 'operator'`, principal
-  `operator:cli`); the default submission is the arm's first candidate.
+- `select <group> (--arm N [--submission ID] [--runner-up ARM]... | --none)
+  [--reason CODE]` records the selection (`selector_kind = 'operator'`,
+  principal `operator:cli`); the default submission is the arm's first
+  candidate. With `--arm` evidence adds `rank`: the winner 1, each
+  `--runner-up` in the order given 2, 3, ..., any other arm null.
+  Runner-ups must be bound arms, distinct and not the winner (card C5).
   `--rule` and `--judge` are §4.
 - `show` (read-only, contracts §0 reads): per group `status`
   (`open`/`closed`), `selection`, and per arm `attempt_id`, `role`
@@ -199,7 +202,9 @@ Plan doc 06 §6c, doc 07 M41/M42 and §6, doc 10 §5a. No schema change: the
 each selection is written through the store in one canonical transaction
 (`src/store/candidate_groups.rs`). Selection is still not verification (§3).
 
-**Arm outcome** (`arm_outcome.v1`), the verified outcome of one arm now:
+**Arm outcome** (`arm_outcome.v1`), the verified outcome of one arm now
+(one read-only store helper, `store::arm_outcome`, used by the selectors
+and by every lane C report):
 unbound arm `not_launched`; else, over all of its attempt's submissions by
 `(created_unix_ms, rowid)` with the §3 combined verification, `accepted` if
 any is accepted; else `pending` if any is pending or the attempt is not
@@ -224,12 +229,19 @@ same answer.
 `{position, submission_id, repository, base_oid, candidate_oid}` — no arm,
 attempt, configuration or profile — ordered by
 `sha256("candidate_presentation.v1:" + group_id + ":" + submission_id)`.
-`select <group> --judge NAME --submission ID` records the judge's choice of a
+`select <group> --judge NAME --submission ID [--runner-up ID]...
+[--judge-configuration CONFIGURATION_ID]` records the judge's choice of a
 presented candidate: `selector_kind = 'judge'`, principal `judge:NAME`,
 reason `judge_preference`, evidence adds each arm's `presented` position
 (null when it had no candidate), so the blind order the judge saw is stored
-with the selection. Choosing a judge configuration from another provider
-family, and running it, is not built.
+with the selection. The judge names its runner-ups by presented submission
+(it never sees arms), in order; evidence `rank` is as for `--arm` (§3).
+`--judge-configuration` (a contracts §2 ID, `sha256:` + 64 lowercase hex,
+checked by format and recorded by value) is stored as
+`judge_configuration_id` on every evidence entry (null when not given). No
+schema change: `evidence` is JSON, and 0053 caps it at 8 array entries (one
+per arm), so selection-level facts ride on each arm entry. Choosing a judge
+configuration from another provider family, and running it, is not built.
 
 **Metrics** (`telemetry <slug> quality groups report [--since MS]
 [--min-groups N]`, read-only over `state.db`; also in `quality report`,
@@ -237,8 +249,9 @@ family, and running it, is not built.
 Cohort: closed groups (with a selection row), windowed by
 `selected_unix_ms`; `closed_groups` and `open_groups` are reported. Every
 sealed arm is a member, launched or not. A cell with fewer than `min_groups`
-(default 10, plan doc 07 §6) closed groups is `unavailable:
-insufficient_data` with its counts still shown; no closed groups is
+(the §5 registry minimum; `--min-groups N` overrides it for this report)
+closed groups is `unavailable: insufficient_data` with its counts still
+shown; each metric and the `groups report` carry `min_sample` (§5); no closed groups is
 `unavailable: no_closed_groups`, a store before 0053 `unavailable:
 candidate_groups_absent`. Never 0.
 
@@ -256,6 +269,44 @@ candidate_groups_absent`. Never 0.
   `rejected` arms are failures, not missing), never the selection.
   `value` = `(a_only − b_only) / n × 100` percentage points (rounded to
   0.01; `difference` is the exact `"(a_only − b_only)/n"`), with
-  `both_accepted`, `a_only`, `b_only`, `neither`. `uncertainty` is
-  `unavailable: clustered_interval_not_computed`: no bootstrap by task
-  family is computed. The top-level `value` lists shown pairs with `a < b`.
+  `both_accepted`, `a_only`, `b_only`, `neither`. The top-level `value`
+  lists shown pairs with `a < b`.
+- **M42 uncertainty** (`percentile_bootstrap.v1`, card C5; plan doc 07 §6),
+  per pair, unavailable (`insufficient_data`) exactly when the value is,
+  and `single_task` when all `n` groups are on one task. Clusters are whole
+  *tasks* (every paired group of a task, e.g. its groups for several
+  contract revisions, moves together), each `(D, N)` = (sum of a − b
+  acceptance, paired groups), in task ID byte order; `k` clusters. The
+  generator is SplitMix64 (`state += 0x9e3779b97f4a7c15; z = (z ^ z>>30) ×
+  0xbf58476d1ce4e5b9; z = (z ^ z>>27) × 0x94d049bb133111eb; z ^ z>>31`,
+  wrapping), seeded with the registry seed and restarted for every pair; an
+  index in `0..k` is `x mod k` after rejecting `x ≥ 2^64−1 − (2^64−1 mod k)`.
+  Each of `B` iterations draws `k` indices and yields `ΣD/ΣN`. The `B`
+  fractions are sorted exactly (cross-multiplied integers, ties by
+  denominator) and the nearest-rank percentiles `ceil(B × 25/1000)` and
+  `ceil(B × 975/1000)` are reported: `lower`/`upper` as percentage points to
+  two decimals (integer rounding half away from zero) and
+  `lower_difference`/`upper_difference` as the exact `"ΣD/ΣN"`, with
+  `method`, `resample: "task"`, `clusters`, `iterations`, `seed` (hex),
+  `level` `"0.95"` and `source: "registry.v1"`. No float enters the
+  interval. `task_family` is `unavailable: no_task_family_data`: no task
+  family is recorded, so tasks are the widest clusters. M42 also carries
+  `estimator` {`method`, `resample`, `task_family`}.
+
+## 5. Metric registry (`registry.v1`, card C5)
+
+One declared, read-only table (`src/telemetry/quality/registry.rs`); a
+change is a new registry version. Reports show each minimum as
+`min_sample: {value, unit, source: "registry.v1"}`; `quality groups report
+--min-groups N` shows `{value: N, unit, source: "override", registry:
+{value, source}}`. `telemetry <slug> report`, `quality report` and the fleet
+pane always use the registry.
+
+| metric | minimum | unit |
+|---|---|---|
+| M41 | 10 | closed groups (per configuration or pair cell) |
+| M42 | 10 | closed groups containing both arms, non-pending |
+
+M42 estimator: `percentile_bootstrap.v1`, `B = 1000`, seed
+`0x4d34325f626f6f74`, level 0.95 (§4). The other lane C metrics (M45–M48)
+declare no minimum.

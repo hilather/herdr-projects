@@ -10,6 +10,7 @@ use std::path::Path;
 mod groups;
 mod outcomes;
 mod proxy;
+mod registry;
 
 pub const STREAM: &str = "quality";
 /// `include_str!` of `migrations/telemetry/quality/`, in order; index + 1 is the stream version.
@@ -67,7 +68,7 @@ const COLLECT_INTEGRATIONS: usize = 16;
 
 fn lane_metrics(project: &Path, since: Option<i64>, horizon_days: u32) -> Result<BTreeMap<String, Value>> {
     let (m47, m48) = outcomes::metrics(project, since, horizon_days)?;
-    let mut paired = groups::paired_metrics(project, since, groups::MIN_GROUPS)?;
+    let mut paired = groups::paired_metrics(project, since, None)?;
     let unavailable = |definition: &str, name: &str, reason: &str| serde_json::json!({"definition": definition, "name": name, "proxy": true,
         "source_trust": "proxy_observed", "value": {"status": "unavailable", "reason": reason}});
     let mut metrics = BTreeMap::from([
