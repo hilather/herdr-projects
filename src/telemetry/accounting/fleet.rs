@@ -18,8 +18,10 @@ use std::path::Path;
 
 use super::unavailable;
 
-/// Activity window length: one hour, aligned to UTC hours.
-pub const WINDOW_MS: i64 = 3_600_000;
+/// Default activity window length in minutes (one hour, aligned to UTC hours);
+/// `accounting fleet --window-minutes` takes any divisor of a day.
+pub const DEFAULT_WINDOW_MINUTES: i64 = 60;
+const DAY_MINUTES: i64 = 1440;
 const HOUR_MS: i128 = 3_600_000;
 const TERMINAL: [&str; 4] = ["completed", "failed", "cancelled", "lost"];
 /// Comparability: each bucket's task mix (class/band share of active time) is
@@ -55,8 +57,9 @@ impl Ord for Q {
     fn cmp(&self, o: &Q) -> Ordering { (self.0 * o.1).cmp(&(o.0 * self.1)) }
 }
 
-/// A worker attempt's known active interval `[from, to)`.
-struct Run { attempt: String, from: i64, to: i64, mix: String }
+/// A worker attempt's known active interval `[from, to)`, with its task mix
+/// key and its dispatch decision's agent configuration.
+struct Run { attempt: String, from: i64, to: i64, mix: String, config: Option<String> }
 
 /// An integration operation of an attempt: (ref, state, reason, created, integrated).
 type Op = (String, String, Option<String>, i64, bool);
@@ -65,11 +68,15 @@ type Op = (String, String, Option<String>, i64, bool);
 struct Fleet {
     horizon: i64,
     runs: Vec<Run>,
-    /// Spans in which some attempt's activity is unknown (pre-log or end not marked).
-    unknown: Vec<(i64, i64)>,
+    /// Spans in which some attempt's activity is unknown (pre-log or end not
+    /// marked), with that attempt's configuration.
+    unknown: Vec<(i64, i64, Option<String>)>,
     coverage: BTreeMap<&'static str, usize>,
-    /// First acceptance evidence time per accepted task (contracts §6 `A`).
-    accepted: Vec<i64>,
+    /// First acceptance evidence time per accepted task (contracts §6 `A`),
+    /// with the configuration of the attempt that produced it.
+    accepted: Vec<(i64, Option<String>)>,
+    /// Display labels (`<kind> <agent_version>`) per configuration id.
+    labels: BTreeMap<String, String>,
     /// Integration operations per attempt, in creation order.
     operations: BTreeMap<String, Vec<Op>>,
 }
@@ -80,43 +87,63 @@ fn table(db: &Connection, name: &str) -> rusqlite::Result<bool> {
 
 fn load(db: &Connection, horizon: i64) -> Result<std::result::Result<Fleet, &'static str>> {
     if !table(db, "attempt_lifecycle")? { return Ok(Err("predates_lifecycle_log")); }
-    let mix = if table(db, "dispatch_decisions")? && table(db, "task_classifications")? {
+    let decisions = table(db, "dispatch_decisions")?;
+    let mix = if decisions && table(db, "task_classifications")? {
         "(SELECT c.class||'/'||c.band FROM dispatch_decisions d JOIN task_classifications c ON c.classification_id=d.classification_id WHERE d.attempt_id=a.id)"
     } else { "NULL" };
+    let config = if decisions { "(SELECT d.chosen_configuration_id FROM dispatch_decisions d WHERE d.attempt_id=a.id)" } else { "NULL" };
     let mark = |state: &str| format!("(SELECT l.unix_ms FROM attempt_lifecycle l WHERE l.attempt_id=a.id AND l.state='{state}')");
-    let sql = format!("SELECT a.id,a.state,{},{},(SELECT min(l.unix_ms) FROM attempt_lifecycle l WHERE l.attempt_id=a.id AND l.state IN ('completed','failed','cancelled','lost')),{mix}
+    let sql = format!("SELECT a.id,a.state,{},{},(SELECT min(l.unix_ms) FROM attempt_lifecycle l WHERE l.attempt_id=a.id AND l.state IN ('completed','failed','cancelled','lost')),{mix},{config}
         FROM attempts a ORDER BY a.rowid", mark("reserved"), mark("running"));
-    type Row = (String, String, Option<i64>, Option<i64>, Option<i64>, Option<String>);
-    let rows: Vec<Row> = db.prepare(&sql)?.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
+    type Row = (String, String, Option<i64>, Option<i64>, Option<i64>, Option<String>, Option<String>);
+    let rows: Vec<Row> = db.prepare(&sql)?.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?
         .collect::<rusqlite::Result<_>>()?;
+    let configs: BTreeMap<String, Option<String>> = rows.iter().map(|r| (r.0.clone(), r.6.clone())).collect();
     let log_start = rows.iter().filter_map(|r| r.2).min();
     let (mut runs, mut unknown, mut coverage) = (Vec::new(), Vec::new(), BTreeMap::new());
     for key in ["attempts", "running_intervals", "open_censored", "never_running", "predates_lifecycle_log", "end_unknown"] { coverage.insert(key, 0); }
     let mut count = |key: &'static str| *coverage.entry(key).or_default() += 1;
-    for (attempt, state, reserved, running, ended, class) in rows {
+    for (attempt, state, reserved, running, ended, class, config) in rows {
         count("attempts");
         let terminal = TERMINAL.contains(&state.as_str());
         match (reserved, running, ended) {
             // Predates the log: ended before it (terminal, no mark), else active at an unknown time.
             (None, _, _) => {
                 count("predates_lifecycle_log");
-                if !(terminal && ended.is_none()) { unknown.push((log_start.unwrap_or(i64::MIN), ended.unwrap_or(horizon))); }
+                if !(terminal && ended.is_none()) { unknown.push((log_start.unwrap_or(i64::MIN), ended.unwrap_or(horizon), config)); }
             }
             (Some(_), None, _) => count("never_running"),
-            (Some(_), Some(from), Some(to)) => { count("running_intervals"); runs.push(Run { attempt, from, to, mix: class.unwrap_or(UNCLASSIFIED.into()) }); }
+            (Some(_), Some(from), Some(to)) => { count("running_intervals"); runs.push(Run { attempt, from, to, mix: class.unwrap_or(UNCLASSIFIED.into()), config }); }
             (Some(_), Some(from), None) if !terminal => {
                 count("running_intervals");
                 count("open_censored");
-                runs.push(Run { attempt, from, to: horizon, mix: class.unwrap_or(UNCLASSIFIED.into()) });
+                runs.push(Run { attempt, from, to: horizon, mix: class.unwrap_or(UNCLASSIFIED.into()), config });
             }
-            (Some(_), Some(from), None) => { count("end_unknown"); unknown.push((from, horizon)); }
+            (Some(_), Some(from), None) => { count("end_unknown"); unknown.push((from, horizon, config)); }
         }
     }
-    let accepted: Vec<i64> = db.prepare("SELECT (SELECT min(CASE WHEN c.route='verify_only' THEN r.created_unix_ms ELSE
-            (SELECT min(k.created_unix_ms) FROM integration_operations i JOIN integrated_commits k ON k.operation_id=i.operation_id WHERE i.verified_result_id=r.result_id) END)
+    // Per task, its first acceptance evidence and the attempt whose result it is.
+    let mut first = BTreeMap::<String, (i64, String)>::new();
+    let mut stmt = db.prepare("SELECT c.task_id,CASE WHEN c.route='verify_only' THEN r.created_unix_ms ELSE
+            (SELECT min(k.created_unix_ms) FROM integration_operations i JOIN integrated_commits k ON k.operation_id=i.operation_id WHERE i.verified_result_id=r.result_id) END,
+            s.attempt_id
         FROM task_contracts c JOIN result_submissions s ON s.task_id=c.task_id AND s.contract_revision=c.contract_revision
-        JOIN verified_results r ON r.submission_id=s.submission_id WHERE c.task_id=t.id AND c.contract_revision=(SELECT max(contract_revision) FROM task_contracts WHERE task_id=t.id))
-        FROM tasks t ORDER BY t.id")?.query_map([], |r| r.get::<_, Option<i64>>(0))?.filter_map(|r| r.transpose()).collect::<rusqlite::Result<_>>()?;
+        JOIN verified_results r ON r.submission_id=s.submission_id
+        WHERE c.task_id IN (SELECT id FROM tasks) AND c.contract_revision=(SELECT max(contract_revision) FROM task_contracts WHERE task_id=c.task_id)")?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, String>(2)?)))? {
+        let (task, at, attempt) = row?;
+        let Some(at) = at else { continue };
+        let slot = first.entry(task).or_insert((at, attempt.clone()));
+        if (at, &attempt) < (slot.0, &slot.1) { *slot = (at, attempt); }
+    }
+    drop(stmt);
+    let accepted = first.into_values().map(|(at, attempt)| (at, configs.get(&attempt).cloned().flatten())).collect();
+    // `<kind> <agent_version>` (contracts §2): derived for display, never an identity.
+    let labels = if decisions && table(db, "agent_configurations")? {
+        db.prepare("SELECT configuration_id,json_extract(canonical_json,'$.kind')||' '||json_extract(canonical_json,'$.agent_version') FROM agent_configurations
+            WHERE json_valid(canonical_json)")?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?
+            .filter_map(|r| r.map(|(id, label)| label.map(|l| (id, l))).transpose()).collect::<rusqlite::Result<_>>()?
+    } else { BTreeMap::new() };
     let mut operations: BTreeMap<String, Vec<Op>> = BTreeMap::new();
     let mut stmt = db.prepare("SELECT s.attempt_id,o.ref_name,o.state,o.reason,o.created_unix_ms,
         o.state='integrated' OR EXISTS(SELECT 1 FROM integrated_commits k WHERE k.operation_id=o.operation_id)
@@ -126,7 +153,7 @@ fn load(db: &Connection, horizon: i64) -> Result<std::result::Result<Fleet, &'st
         let (attempt, op) = row?;
         operations.entry(attempt).or_default().push(op);
     }
-    Ok(Ok(Fleet { horizon, runs, unknown, coverage, accepted, operations }))
+    Ok(Ok(Fleet { horizon, runs, unknown, coverage, accepted, labels, operations }))
 }
 
 /// Round half up to the nearest whole number of agents.
@@ -148,28 +175,33 @@ fn tvd(a: &BTreeMap<String, Q>, b: &BTreeMap<String, Q>) -> Q {
     keys.into_iter().fold(zero, |sum, k| sum.add(a.get(k).copied().unwrap_or(zero).sub(b.get(k).copied().unwrap_or(zero)).abs())).mul(Q::new(1, 2))
 }
 
-/// Windows, buckets and M35.
-fn fan_out(f: &Fleet, since: Option<i64>) -> (Value, Value) {
+/// Windows, buckets and M35 over every worker attempt (`config` `None`) or
+/// over the attempts of one agent configuration: its active time, the
+/// acceptances of its attempts, and the unknown spans of its attempts or of
+/// attempts without a configuration.
+fn fan_out(f: &Fleet, since: Option<i64>, window_ms: i64, config: Option<&str>) -> (Value, Value) {
+    let mine = |c: &Option<String>| config.is_none_or(|config| c.as_deref() == Some(config));
+    let unknown: Vec<(i64, i64)> = f.unknown.iter().filter(|u| config.is_none() || u.2.is_none() || mine(&u.2)).map(|u| (u.0, u.1)).collect();
     let mut windows: BTreeMap<i64, (i128, i128, BTreeMap<String, i128>)> = BTreeMap::new();
-    for run in &f.runs {
+    for run in f.runs.iter().filter(|r| mine(&r.config)) {
         if run.to <= run.from { continue; }
-        for w in run.from.div_euclid(WINDOW_MS)..=(run.to - 1).div_euclid(WINDOW_MS) {
-            let ms = overlap((run.from, run.to), (w * WINDOW_MS, (w + 1) * WINDOW_MS)) as i128;
+        for w in run.from.div_euclid(window_ms)..=(run.to - 1).div_euclid(window_ms) {
+            let ms = overlap((run.from, run.to), (w * window_ms, (w + 1) * window_ms)) as i128;
             let entry = windows.entry(w).or_default();
             entry.0 += ms;
             *entry.2.entry(run.mix.clone()).or_default() += ms;
         }
     }
-    for at in &f.accepted { windows.entry(at.div_euclid(WINDOW_MS)).or_default().1 += 1; }
+    for (at, _) in f.accepted.iter().filter(|a| mine(&a.1)) { windows.entry(at.div_euclid(window_ms)).or_default().1 += 1; }
     let mut excluded: BTreeMap<&str, usize> = ["incomplete", "concurrency_unknown", "outside_window"].into_iter().map(|k| (k, 0)).collect();
     let mut buckets: BTreeMap<i64, Bucket> = BTreeMap::new();
     for (w, (active, accepted, mix)) in windows {
-        let span = (w * WINDOW_MS, (w + 1) * WINDOW_MS);
+        let span = (w * window_ms, (w + 1) * window_ms);
         let reason = if since.is_some_and(|since| span.0 < since) { "outside_window" } else if span.1 > f.horizon { "incomplete" }
-            else if f.unknown.iter().any(|u| overlap(*u, span) > 0) { "concurrency_unknown" } else {
-                let b = buckets.entry(level(active, WINDOW_MS as i128)).or_default();
+            else if unknown.iter().any(|u| overlap(*u, span) > 0) { "concurrency_unknown" } else {
+                let b = buckets.entry(level(active, window_ms as i128)).or_default();
                 b.windows += 1;
-                b.span_ms += WINDOW_MS as i128;
+                b.span_ms += window_ms as i128;
                 b.active_ms += active;
                 b.accepted += accepted;
                 for (k, ms) in mix { *b.mix.entry(k).or_default() += ms; }
@@ -216,7 +248,7 @@ fn fan_out(f: &Fleet, since: Option<i64>) -> (Value, Value) {
     if differs { reasons.push("task_mix_differs"); }
     let comparability = json!({"test": "class_band_active_time_tvd", "max_tvd": Q::new(MAX_TVD.0, MAX_TVD.1).show(), "reference": "reference bucket",
         "label": if reasons.is_empty() { "comparable" } else { "descriptive" }, "reasons": reasons});
-    let mut m35 = json!({"window_ms": WINDOW_MS, "level_rule": "round_half_up(time_weighted_active_attempts)", "scope": "worker_attempts",
+    let mut m35 = json!({"window_ms": window_ms, "window_minutes": window_ms / 60_000, "level_rule": "round_half_up(time_weighted_active_attempts)", "scope": "worker_attempts",
         "reference_level": reference.as_ref().map(|r| r.0), "level": top, "comparability": comparability.clone(), "label": comparability["label"].clone()});
     m35["value"] = match (&reference, top) {
         _ if buckets.is_empty() => unavailable("no_complete_window"),
@@ -229,16 +261,36 @@ fn fan_out(f: &Fleet, since: Option<i64>) -> (Value, Value) {
         m35["reference_per_agent_per_hour"] = json!(rthr.div(Q::int(*r as i128)).show());
         if *r != top { m35["marginal_per_added_agent_per_hour"] = rows.iter().find(|row| row["level"] == top).map_or(Value::Null, |row| row["marginal_per_added_agent_per_hour"].clone()); }
     }
-    let detail = json!({"window_ms": WINDOW_MS, "horizon_unix_ms": f.horizon, "coverage": f.coverage, "windows": {"bucketed": buckets.values().map(|b| b.windows).sum::<usize>(), "excluded": excluded},
-        "buckets": rows, "comparability": comparability});
+    let detail = json!({"window_ms": window_ms, "window_minutes": window_ms / 60_000, "horizon_unix_ms": f.horizon, "coverage": f.coverage,
+        "windows": {"bucketed": buckets.values().map(|b| b.windows).sum::<usize>(), "excluded": excluded}, "buckets": rows, "comparability": comparability});
     (detail, m35)
+}
+
+/// M35 per agent configuration (the dispatch decision's content-addressed
+/// arm, contracts §2), where one has active time or an acceptance: the same
+/// buckets, reference and comparability rule over its own attempts. Attempts
+/// and acceptances without a configuration are counted apart, never assigned.
+fn per_configuration(f: &Fleet, since: Option<i64>, window_ms: i64) -> (Value, Value) {
+    let ids: BTreeSet<&String> = f.runs.iter().filter_map(|r| r.config.as_ref()).chain(f.accepted.iter().filter_map(|a| a.1.as_ref())).collect();
+    let (mut detail, mut metric) = (serde_json::Map::new(), serde_json::Map::new());
+    for id in ids {
+        let (d, mut m) = fan_out(f, since, window_ms, Some(id));
+        let attempts: BTreeSet<&str> = f.runs.iter().filter(|r| r.config.as_ref() == Some(id)).map(|r| r.attempt.as_str()).collect();
+        let label = f.labels.get(id).map_or(Value::Null, |l| json!(l));
+        detail.insert(id.clone(), json!({"display_label": label, "attempts": attempts.len(), "windows": d["windows"], "buckets": d["buckets"], "comparability": d["comparability"]}));
+        if let Value::Object(o) = &mut m { for key in ["window_ms", "window_minutes", "level_rule", "scope", "comparability"] { o.remove(key); } }
+        m["display_label"] = label;
+        metric.insert(id.clone(), m);
+    }
+    let unconfigured = json!({"attempts": f.runs.iter().filter(|r| r.config.is_none()).count(), "accepted": f.accepted.iter().filter(|a| a.1.is_none()).count()});
+    (json!({"configurations": detail, "configuration_unknown": unconfigured}), json!({"configurations": metric, "configuration_unknown": unconfigured}))
 }
 
 /// The attempt's own concurrency level: time-weighted active attempts over its active interval.
 fn experienced(f: &Fleet, attempt: &str) -> Option<i64> {
     let run = f.runs.iter().find(|r| r.attempt == attempt && r.to > r.from)?;
     let span = (run.from, run.to);
-    if f.unknown.iter().any(|u| overlap(*u, span) > 0) { return None; }
+    if f.unknown.iter().any(|u| overlap((u.0, u.1), span) > 0) { return None; }
     let active: i128 = f.runs.iter().map(|r| overlap((r.from, r.to), span) as i128).sum();
     Some(level(active, (span.1 - span.0) as i128))
 }
@@ -317,11 +369,24 @@ fn named(id: &str, mut body: Value) -> Value {
 
 fn now() -> i64 { jiff::Timestamp::now().as_millisecond() }
 
-fn computed(project: &Path, since: Option<i64>) -> Result<(Value, BTreeMap<String, Value>)> {
+/// `--window-minutes`: a whole number of windows per UTC day, so windows align to UTC midnight.
+pub fn window_ms(minutes: i64) -> Result<i64> {
+    anyhow::ensure!((1..=DAY_MINUTES).contains(&minutes) && DAY_MINUTES % minutes == 0,
+        "--window-minutes must divide 1440 (a whole number of windows per UTC day), got {minutes}");
+    Ok(minutes * 60_000)
+}
+
+fn computed(project: &Path, since: Option<i64>, window_ms: i64) -> Result<(Value, BTreeMap<String, Value>)> {
     let path = project.join(".state/state.db");
     let loaded = if path.exists() { load(&*crate::telemetry::read_only(&path)?, now())? } else { Err("no_state_store") };
     let (detail, m35, m36) = match loaded {
-        Ok(f) => { let (detail, m35) = fan_out(&f, since); (detail, m35, conflicts(&f, since)) }
+        Ok(f) => {
+            let (mut detail, mut m35) = fan_out(&f, since, window_ms, None);
+            let (by_detail, by_metric) = per_configuration(&f, since, window_ms);
+            detail["by_configuration"] = by_detail;
+            m35["by_configuration"] = by_metric;
+            (detail, m35, conflicts(&f, since))
+        }
         Err(reason) => (unavailable(reason), json!({"value": unavailable(reason)}), json!({"value": unavailable(reason)})),
     };
     let metrics = BTreeMap::from([("M34".to_owned(), named("M34", m34())), ("M35".to_owned(), named("M35", m35)),
@@ -330,11 +395,14 @@ fn computed(project: &Path, since: Option<i64>) -> Result<(Value, BTreeMap<Strin
 }
 
 /// M34–M37 for `telemetry <slug> report`.
-pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> { Ok(computed(project, since)?.1) }
+pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> {
+    Ok(computed(project, since, window_ms(DEFAULT_WINDOW_MINUTES)?)?.1)
+}
 
-/// `accounting fleet`: windows, buckets, coverage and M34–M37.
-pub fn read(project: &Path) -> Result<Value> {
-    let (mut detail, metrics) = computed(project, None)?;
+/// `accounting fleet [--window-minutes N]`: windows, buckets, coverage, the
+/// per-configuration split and M34–M37.
+pub fn read(project: &Path, window_minutes: i64) -> Result<Value> {
+    let (mut detail, metrics) = computed(project, None, window_ms(window_minutes)?)?;
     if detail.get("status").is_some() { detail = json!({"status": "unavailable", "reason": detail["reason"].clone()}); }
     Ok(json!({"fleet": detail, "metrics": metrics}))
 }
@@ -362,6 +430,10 @@ pub fn text(value: &Value) -> String {
         let shown = match &m["value"] { Value::Null => format!("n/a ({})", m["reason"].as_str().unwrap_or("unknown")), v => show(v) };
         let label = m["label"].as_str().map(|l| format!(" ({l})")).unwrap_or_default();
         out += &format!("{id} {} {shown}{label}\n", m["name"].as_str().unwrap_or(""));
+        for (config, c) in m["by_configuration"]["configurations"].as_object().into_iter().flatten() {
+            let name = c["display_label"].as_str().map(|l| format!(" ({l})")).unwrap_or_default();
+            out += &format!("{id} configuration {config}{name} {} ({})\n", show(&c["value"]), c["label"].as_str().unwrap_or(""));
+        }
     }
     out
 }

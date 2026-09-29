@@ -24,7 +24,8 @@ pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/ac
     include_str!("../../../migrations/telemetry/accounting/0005_attention.sql"),
     include_str!("../../../migrations/telemetry/accounting/0006_a4_metadata.sql"),
     include_str!("../../../migrations/telemetry/accounting/0007_thread_lineage.sql"),
-    include_str!("../../../migrations/telemetry/accounting/0008_drop_superseded.sql")];
+    include_str!("../../../migrations/telemetry/accounting/0008_drop_superseded.sql"),
+    include_str!("../../../migrations/telemetry/accounting/0009_valuation_deltas.sql")];
 
 /// `herdr-projects telemetry <slug> accounting ...`
 #[derive(clap::Subcommand)]
@@ -79,11 +80,15 @@ pub enum Command {
         json: bool,
     },
     /// Fleet efficiency from canonical attempt lifecycle, acceptance and integration
-    /// rows: concurrency buckets and M35, integration conflicts (M36), M34/M37. Read-only.
+    /// rows: concurrency buckets and M35 (also per agent configuration), integration
+    /// conflicts (M36), M34/M37. Read-only.
     Fleet {
         /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
+        /// Activity window length in minutes; must divide 1440 (windows align to UTC days).
+        #[arg(long, default_value_t = fleet::DEFAULT_WINDOW_MINUTES)]
+        window_minutes: i64,
     },
 }
 
@@ -149,14 +154,14 @@ pub fn run(project: &Path, command: Command) -> Result<String> {
         }
         Command::Tools { json } => {
             let value = match super::sidecar::read(project)? {
-                Some(db) => tools::read(&db)?,
+                Some(db) => tools::read(project, &db)?,
                 None => unavailable("collection_not_run"),
             };
             if !json { return Ok(tools::text(&value)); }
             value
         }
-        Command::Fleet { json } => {
-            let value = fleet::read(project)?;
+        Command::Fleet { json, window_minutes } => {
+            let value = fleet::read(project, window_minutes)?;
             if !json { return Ok(fleet::text(&value)); }
             value
         }
@@ -177,9 +182,11 @@ fn with_availability(mut metrics: BTreeMap<String, Value>) -> BTreeMap<String, V
 }
 
 /// M08/M09 (below), M38/M39 (§5), M31–M33 (§6, replacing the central
-/// `attention_not_collected` entries), M16–M18 (§9) and M34–M37 (§10).
+/// `attention_not_collected` entries), M16–M18 (§9), M34–M37 (§10) and
+/// M12/M14 (§12).
 pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> {
     let mut metrics = usage_metrics(project, since)?;
+    metrics.extend(cost::metrics(project, since)?);
     metrics.extend(attention::metrics(project, since)?);
     metrics.extend(tools::metrics(project, since)?);
     metrics.extend(fleet::metrics(project, since)?);
@@ -233,11 +240,14 @@ fn usage_metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, 
 
 /// Ticker telemetry pass, after the Codex collect: one attention observation
 /// pass within the tick budget, then rebuild the ledger of an existing
-/// sidecar. Writes only the sidecar; never creates it.
+/// sidecar, then reprice it when a rate card exists and the rate cards or
+/// the ledger changed since the last reprice (§12), within the tick budget.
+/// Writes only the sidecar; never creates it.
 pub fn tick(project: &Path, budget: super::codex::Budget) -> Result<()> {
     if let Some(mut db) = super::sidecar::open(project, false)? {
         let observed = attention::observe(project, &mut db, budget);
         ledger::sync(&mut db)?;
+        cost::tick(&mut db, budget)?;
         observed?;
     }
     Ok(())

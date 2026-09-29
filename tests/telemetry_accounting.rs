@@ -371,7 +371,8 @@ fn repricing_uses_rate_effective_at_usage_time() {
     assert_eq!((&cards[0]["currency"], &cards[0]["rate_unit"], &cards[0]["models"], &cards[0]["includes"]),
         (&"USD".into(), &1_000_000.into(), &json!(["gpt-5.5"]), &json!({"discounts": false, "taxes": false, "fees": false})));
 
-    assert_eq!(f.cli_args(&["accounting", "reprice"]).0, json!({"revision": 1, "appended": true, "entries": 6}));
+    assert_eq!(f.report()["metrics"]["M12"]["value"], unavailable("not_priced"), "before the first reprice");
+    assert_eq!(f.cli_args(&["accounting", "reprice"]).0, json!({"revision": 1, "appended": true, "entries": 6, "stored": {"changed": 6, "removed": 0}}));
     assert_eq!(f.cli_args(&["accounting", "reprice"]).0, json!({"revision": 1, "appended": false, "entries": 6}), "an unchanged result appends nothing");
     let (cost, first) = f.cli_args(&["accounting", "cost", "--json"]);
     let priced = |card: &str, version: i64, currency: &str, amount: &str, components: serde_json::Value| json!({"status": "priced",
@@ -417,9 +418,30 @@ fn repricing_uses_rate_effective_at_usage_time() {
         assert!(text.lines().any(|l| l == line), "{line:?} in\n{text}");
     }
 
-    // A corrected version 3 (output 6) and a EUR card for gpt-5.5-mini append revision 2.
+    // M12/M14 through the report (§12): the same partial estimate, never the total; 2 of 6 entries priced.
+    let report = f.report();
+    let (m12, m14) = (&report["metrics"]["M12"], &report["metrics"]["M14"]);
+    let partial = json!({"status": "partial", "reason": "unpriced_entries", "currency": "USD", "priced_amount": "0.0081"});
+    assert_eq!((&m12["definition"], &m12["name"], &m12["value"], &m12["estimate"], &m12["basis"], &m12["rate_cards"], &m12["revision"], &m12["never_added_to"]),
+        (&json!("M12.cost-v1"), &json!("repriced_estimated_spend"), &partial, &partial, &json!("published_rate_estimate"), &json!("fixture_only"), &json!(1), &json!("M11")));
+    assert_eq!(m12["coverage"], json!({"entries": 6, "priced": 2, "unpriced": unpriced}));
+    assert_eq!((&m14["definition"], &m14["name"], &m14["value"], &m14["numerator"], &m14["denominator"], &m14["unpriced"], &m14["basis"], &m14["unit"]),
+        (&json!("M14.cost-v1"), &json!("cost_coverage"), &json!("2/6"), &json!(2), &json!(6), &unpriced, &json!("published_rate_estimate"), &json!("entries")));
+    assert!(f.text(&["report"]).lines().any(|l| l == "M14 cost_coverage 2/6"));
+
+    // As a binary before stream 9 left it (§12): revision 1 a full copy in `valuations`, no delta tables.
+    f.sidecar().execute_batch("INSERT INTO valuations SELECT revision,entry_id,session_id,role,attempt_id,model,usage_from_unix_ms,usage_to_unix_ms,
+            new_input_tokens,cache_read_tokens,cache_write_tokens,output_tokens,status,reason,card_id,card_version,currency,amount,components FROM valuation_deltas;
+        INSERT INTO valuation_bases SELECT revision,entry_id,usage_basis,provider_check FROM valuation_deltas;
+        DROP TABLE valuation_deltas; DROP TABLE valuation_delta_revisions; DROP TABLE valuation_inputs;
+        UPDATE telemetry_streams SET version=8 WHERE stream='accounting';").unwrap();
+    assert_eq!(f.cli_args(&["accounting", "cost", "--json", "--revision", "1"]).1, first, "a full copy reads back as the delta did");
+    assert_eq!(f.cli_args(&["accounting", "status"]).0, json!({"stream": "accounting", "version": 8}), "a read does not migrate");
+
+    // A corrected version 3 (output 6) and a EUR card for gpt-5.5-mini append revision 2,
+    // stored as the two changed valuations only.
     for name in ["rates-v3.json", "rates-eur.json"] { f.cli_args(&["accounting", "import-rate-card", &rate_card(&f, name, boundary)]); }
-    assert_eq!(f.cli_args(&["accounting", "reprice"]).0, json!({"revision": 2, "appended": true, "entries": 6}));
+    assert_eq!(f.cli_args(&["accounting", "reprice"]).0, json!({"revision": 2, "appended": true, "entries": 6, "stored": {"changed": 2, "removed": 0}}));
     let (cost, _) = f.cli_args(&["accounting", "cost", "--json"]);
     assert_eq!(cost["revision"], 2);
     assert_eq!(valuation(&cost, BEFORE, 1), priced("synthetic-codex", 1, "USD", "0.004", json!({"input": "0.002", "output": "0.002"})));
@@ -431,14 +453,85 @@ fn repricing_uses_rate_effective_at_usage_time() {
     assert_eq!(cost["attempts"][0]["estimate"], json!({"status": "unavailable", "reason": "mixed_currency", "priced_by_currency": {"EUR": "0.00021", "USD": "0.0075"}}),
         "USD 0.004 + 0.0035 and EUR 0.00021 are never added");
 
-    // Revision 1 is reproduced byte for byte; a re-sync and reprice append nothing;
+    // 3 of 6 priced now, in two currencies: M12 is unavailable, never a sum.
+    let report = f.report();
+    assert_eq!((&report["metrics"]["M12"]["value"], &report["metrics"]["M14"]["value"]),
+        (&json!({"status": "unavailable", "reason": "mixed_currency", "priced_by_currency": {"EUR": "0.00021", "USD": "0.0075"}}), &json!("3/6")));
+
+    // Revision 1 (the full copy) is reproduced byte for byte; a re-sync and reprice append nothing;
     // measured tokens never changed.
     assert_eq!(f.cli_args(&["accounting", "cost", "--json", "--revision", "1"]).1, first);
+    let (again, second) = f.cli_args(&["accounting", "cost", "--json"]);
+    assert_eq!(again["revision"], 2);
     f.cli("collect");
     f.cli_args(&["accounting", "sync"]);
     assert_eq!(f.cli_args(&["accounting", "reprice"]).0, json!({"revision": 2, "appended": false, "entries": 6}));
     assert_eq!(f.cli_args(&["accounting", "entries"]).1, measured);
-    assert_eq!((f.count("valuation_revisions"), f.count("valuations"), f.count("rate_cards")), (2, 12, 4));
+    assert_eq!(f.cli_args(&["accounting", "cost", "--json", "--revision", "2"]).1, second);
+    assert_eq!((f.count("valuation_revisions"), f.count("valuations"), f.count("valuation_deltas"), f.count("rate_cards")), (2, 6, 2, 4));
+}
+
+/// One ticker run over the fixture root: started, left until `done` holds
+/// (its first telemetry pass runs on its first tick), then stopped through its stop file.
+fn ticker_pass(f: &Fixture, done: &dyn Fn() -> bool) {
+    // The ticker serves the projects of its root that have a PROJECT.md; the
+    // store format marker makes it a canonical (state-store) project.
+    fs::write(f.project.join("PROJECT.md"), "ticker fixture").unwrap();
+    fs::write(f.project.join(".state/format.json"), "{}").unwrap();
+    let mut child = Command::new(BIN).env_clear().env("HOME", f.tmp.path().join("home")).env("PATH", "/usr/bin:/bin")
+        .args(["--root", f.root.to_str().unwrap(), "ticker", "run"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let end = std::time::Instant::now() + Duration::from_secs(60);
+    while !done() {
+        let exited = child.try_wait().unwrap();
+        assert!(std::time::Instant::now() < end && exited.is_none(), "{exited:?} {}", fs::read_to_string(f.root.join(".ticker.log")).unwrap_or_default());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    fs::write(f.root.join(".ticker.stop"), b"").unwrap();
+    child.wait().unwrap();
+    fs::remove_file(f.root.join(".ticker.stop")).unwrap();
+}
+
+/// §12: the ticker's accounting pass syncs the ledger and reprices it only
+/// when a rate card exists and the cards or the ledger changed. Version 1
+/// (input 2, output 4 per 10^6, effective until 2100) prices doc 10's 1,000
+/// input + 500 output at 0.004: M12 complete `0.004` USD, M14 `1/1`. A pass
+/// with nothing changed syncs again but does not reprice. Version 2 (input
+/// 2, cache read 0.5, output 8, effective from 0) → 1,000 × 2 + 500 × 8 =
+/// 0.006: revision 2, stored as the one changed valuation.
+#[test]
+fn ticker_reprices_only_when_inputs_change() {
+    let f = Fixture::new();
+    f.rollout(&f.home, "before", &[&format!("{ACCOUNTING}/priced-before.jsonl")], &f.worktree(), f.decided, "0.154.0");
+    f.cli("collect");
+    let synced = || f.sidecar().query_row("SELECT synced_unix_ms FROM usage_ledger", [], |r| r.get::<_, i64>(0)).ok();
+    let revisions = || f.count("valuation_revisions");
+    // No rate card yet: the pass syncs the ledger and appends no revision.
+    ticker_pass(&f, &|| synced().is_some());
+    assert_eq!((revisions(), f.report()["metrics"]["M12"]["value"].clone()), (0, json!({"status": "unavailable", "reason": "not_priced"})));
+
+    f.cli_args(&["accounting", "import-rate-card", &rate_card(&f, "rates-v1.json", 4_102_444_800_000)]);
+    ticker_pass(&f, &|| revisions() == 1);
+    let report = f.report();
+    let (m12, m14) = (&report["metrics"]["M12"], &report["metrics"]["M14"]);
+    assert_eq!((&m12["value"], &m12["currency"], &m12["estimate"], &m12["basis"]),
+        (&json!("0.004"), &json!("USD"), &json!({"status": "complete", "currency": "USD", "amount": "0.004"}), &json!("published_rate_estimate")));
+    assert_eq!((&m14["value"], &m14["unpriced"]), (&json!("1/1"), &json!({})));
+    assert!(f.text(&["report"]).lines().any(|l| l == "M12 repriced_estimated_spend 0.004"));
+    let recorded = || f.sidecar().query_row("SELECT digest,revision,recorded_unix_ms FROM valuation_inputs", [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))).unwrap();
+    let first = recorded();
+
+    // Nothing changed: the next pass syncs again but does not reprice.
+    let before = synced();
+    ticker_pass(&f, &|| synced() != before);
+    assert_eq!((revisions(), recorded()), (1, first.clone()));
+
+    // A new card version changes the inputs: revision 2, one changed valuation stored.
+    f.cli_args(&["accounting", "import-rate-card", &rate_card(&f, "rates-v2.toml", 0)]);
+    ticker_pass(&f, &|| revisions() == 2);
+    assert_eq!(f.report()["metrics"]["M12"]["value"], "0.006");
+    assert_eq!(f.sidecar().query_row("SELECT changed,removed FROM valuation_delta_revisions WHERE revision=2", [], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))).unwrap(), (1, 0));
+    assert_ne!(recorded().0, first.0);
+    assert_eq!(recorded().1, 2);
 }
 
 /// A fixture rollout whose rate-limit snapshots carry `@Tn@` (RFC 3339 observation
@@ -598,7 +691,7 @@ fn record_times_narrow_rate_card_interval() {
     f.cli_args(&["accounting", "sync"]);
     let measured = f.cli_args(&["accounting", "entries"]).1;
     for name in ["rates-v1.json", "rates-v2.toml"] { f.cli_args(&["accounting", "import-rate-card", &rate_card(&f, name, boundary)]); }
-    assert_eq!(f.cli_args(&["accounting", "reprice"]).0, json!({"revision": 1, "appended": true, "entries": 5}));
+    assert_eq!(f.cli_args(&["accounting", "reprice"]).0, json!({"revision": 1, "appended": true, "entries": 5, "stored": {"changed": 5, "removed": 0}}));
     assert_eq!(f.cli_args(&["accounting", "reprice"]).0, json!({"revision": 1, "appended": false, "entries": 5}));
     let (cost, first) = f.cli_args(&["accounting", "cost", "--json"]);
     assert_eq!(cost["policy"], POLICY);
@@ -630,7 +723,8 @@ fn record_times_narrow_rate_card_interval() {
 
     // Version 3 (output 6 from the boundary): 800 × 2 + 200 × 0.5 + 300 × 6 = 0.0035; 100 × 2 + 20 × 6 = 0.00032.
     f.cli_args(&["accounting", "import-rate-card", &rate_card(&f, "rates-v3.json", boundary)]);
-    assert_eq!(f.cli_args(&["accounting", "reprice"]).0, json!({"revision": 2, "appended": true, "entries": 5}));
+    // Stored as a delta: TIMED 2 and UNVERIFIED 1 changed card; the other three are unchanged.
+    assert_eq!(f.cli_args(&["accounting", "reprice"]).0, json!({"revision": 2, "appended": true, "entries": 5, "stored": {"changed": 2, "removed": 0}}));
     let (cost, _) = f.cli_args(&["accounting", "cost", "--json"]);
     assert_eq!(entry(&cost, TIMED, 1)["valuation"], priced(1, "0.004", json!({"input": "0.002", "output": "0.002"})));
     assert_eq!(entry(&cost, TIMED, 2)["valuation"], priced(3, "0.0035", json!({"input": "0.0016", "cache_read": "0.0001", "output": "0.0018"})));
@@ -641,7 +735,7 @@ fn record_times_narrow_rate_card_interval() {
     f.cli_args(&["accounting", "sync"]);
     assert_eq!(f.cli_args(&["accounting", "reprice"]).0, json!({"revision": 2, "appended": false, "entries": 5}));
     assert_eq!(f.cli_args(&["accounting", "entries"]).1, measured);
-    assert_eq!((f.count("valuation_revisions"), f.count("valuations")), (2, 10));
+    assert_eq!((f.count("valuation_revisions"), f.count("valuations"), f.count("valuation_deltas")), (2, 0, 7));
 }
 
 /// Contracts-collection A4 → B4: the snapshot's `secondary` window (10,080
@@ -826,7 +920,7 @@ fn attention_intervals_union_and_censor() {
         (serde_json::from_str(&text).unwrap_or(serde_json::Value::Null), text)
     };
     cli(&["collect"]);
-    assert_eq!(cli(&["accounting", "status"]).0, json!({"stream": "accounting", "version": 8}));
+    assert_eq!(cli(&["accounting", "status"]).0, json!({"stream": "accounting", "version": 9}));
     // Stream 8 dropped the superseded projections (v2, v4, v6); their replacements stay.
     let tables: Vec<String> = rusqlite::Connection::open(project.join(".state/telemetry.db")).unwrap()
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('session_graph','quota_observations','session_nodes','session_graph_nodes','quota_window_observations') ORDER BY name").unwrap()
@@ -973,7 +1067,9 @@ fn tool_volume_success_and_latency_are_honest() {
 
     let m16 = &tools["metrics"]["M16"];
     assert_eq!((&m16["definition"], &m16["name"]), (&json!("M16.tools-v1"), &json!("tool_call_volume")));
-    assert_eq!(m16["value"], json!({"issued": 5, "accepted": unavailable("approval_decision_not_exposed"), "executed": 6}));
+    // No attention sample and no guardian: no call is inferred accepted; all 5 stay unknown, never accepted.
+    assert_eq!(m16["value"], json!({"issued": 5, "accepted": {"status": "inferred", "count": 0, "unknown": 5}, "executed": 6}));
+    assert_eq!((&m16["accepted"]["label"], &m16["accepted"]["by_basis"], &m16["accepted"]["unknown"]), (&json!("inferred"), &json!({}), &json!(5)));
     let issued = &m16["issued"];
     assert_eq!((&issued["calls"], &issued["by_name"], &issued["name_unreported"], &issued["by_status"], &issued["status_unreported"],
         &issued["without_output"], &issued["outputs_without_call"]),
@@ -1002,6 +1098,10 @@ fn tool_volume_success_and_latency_are_honest() {
     assert_eq!(wall["by_name"], json!({"exec": {"samples": 3, "p50_ms": 1000, "p95_ms": 37010, "max_ms": 37010},
         "wait": {"samples": 1, "p50_ms": 2500, "p95_ms": 2500, "max_ms": 2500}}));
     assert_eq!(wall["name_unreported"], json!({"samples": 0, "p50_ms": null, "p95_ms": null, "max_ms": null}));
+    // Per host: both rollouts of the session lie under the one execution home.
+    assert_eq!((&wall["by_home"], &wall["home_ambiguous"], &wall["host_basis"]),
+        (&json!({digest(&f.home): {"samples": 4, "p50_ms": 1000, "p95_ms": 37010, "max_ms": 37010}}),
+         &json!({"samples": 0, "p50_ms": null, "p95_ms": null, "max_ms": null}), &json!("execution_home")));
 
     // The report takes the lane's M16–M18.
     let report = f.report();
@@ -1009,7 +1109,7 @@ fn tool_volume_success_and_latency_are_honest() {
     let text = f.text(&["accounting", "tools"]);
     for line in ["coverage 1 sessions: 1 observed, 0 pending_reread, 0 predates_collection; excluded unbound 1".to_owned(),
         format!("session {TOOLS_SID} attempts={}: issued 5 (1 without output, 1 outputs without call), executed 6 (5 inferred to a call, 1 unattributed), succeeded 3 failed 1 unknown 2", f.attempt),
-        "M16 tool_call_volume issued 5, accepted n/a (approval_decision_not_exposed), executed 6".to_owned(),
+        "M16 tool_call_volume issued 5, accepted 0 inferred (5 unknown), executed 6".to_owned(),
         "M17 tool_execution_success 3/4 (unknown 2 excluded, pending calls 1)".to_owned(),
         "M18 tool_latency_p95 n/a (execution_duration_not_exposed)".to_owned(),
         "call_to_output_ms p95 37010 of 4 calls (includes approval wait; not execution time)".to_owned()] {
@@ -1064,13 +1164,74 @@ fn tool_metrics_before_a6_or_reread_are_unavailable() {
     assert!(text.lines().any(|l| l == "M17 tool_execution_success n/a (pending_reread)"), "{text}");
 }
 
+/// 2030-01-01T00:00:00Z, the base of the tool rollouts' literal line times.
+const Y2030: i64 = 1_893_456_000_000;
+/// Session id written literally in `tools-guardian.jsonl`.
+const TOOLS_GUARDIAN: &str = "00000000-0000-4000-8000-0000000b5003";
+
+/// §9 follow-up: the accepted stage of M16 inferred, labelled `inferred`. The
+/// tool session of `tool_volume_success_and_latency_are_honest` (calls at
+/// seconds 10→47.01, 50→51, 52→54.5, 55→55.3 and 60 without output). A
+/// guardian session (live shape: `guardian_review`, naming the session by
+/// thread lineage) starting at 55.1 lies inside call-4 → `auto_review`. The
+/// attempt's attention samples (working 0 s, blocked 30 s, working 60 s) give
+/// one `blocked` wait 30–30 inside call-1 → `human_routed`. Calls 2, 3 (no
+/// wait, no guardian) and 5 (no output) stay unknown: accepted 2 of 5, never 5.
+#[test]
+fn accepted_stage_is_inferred_from_waits_and_guardians() {
+    let f = Fixture::new();
+    let at = f.decided + 1_000;
+    let part = |name: &str| format!("{ACCOUNTING}/{name}");
+    f.rollout(&f.home, "a", &[&part("tools.jsonl")], &f.worktree(), at, "0.154.0");
+    f.rollout(&f.home, "b", &[&part("tools.jsonl"), &part("tools-resume.jsonl")], &f.worktree(), at, "0.154.0");
+    f.rollout(&f.home, "g", &[&part("tools-guardian.jsonl")], &f.worktree(), Y2030 + 55_100, "0.154.0");
+    f.cli("collect");
+
+    // The guardian alone: call-4 is auto-reviewed, the other four unknown.
+    let (tools, _) = f.cli_args(&["accounting", "tools", "--json"]);
+    assert_eq!(tools["coverage"], json!({"sessions": 2, "observed": 2, "pending_reread": 0, "predates_collection": 0, "excluded": {}}));
+    assert_eq!(tools["metrics"]["M16"]["value"], json!({"issued": 5, "accepted": {"status": "inferred", "count": 1, "unknown": 4}, "executed": 6}));
+    assert_eq!(tools["metrics"]["M16"]["accepted"]["by_basis"], json!({"auto_review": 1}));
+
+    // The attempt's launch receipt (as its start records it) and three attention
+    // samples 30 s apart, planted as an observation pass would write them.
+    let state = rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap();
+    let receipt = json!({"version": 2, "attempt": f.attempt, "operation": "op-tools", "route": {"machine": "", "socket": "/nonexistent/herdr.sock",
+        "workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1", "cwd": f.worktree()}, "terminal": "term-1",
+        "session": {"device": 1, "inode": 2, "born_secs": 3, "born_nanos": 4}, "agent": {"kind": "codex", "name": "worker"}, "observed_unix_ms": Y2030});
+    state.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    state.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_started','op-tools',1,1,?1)", [receipt.to_string()]).unwrap();
+    for (ms, label) in [(0, "working"), (30_000, "blocked"), (60_000, "working")] {
+        f.sidecar().execute("INSERT INTO attention_samples(attempt_id,observed_unix_ms,state,gap,interval_ms,source) VALUES(?1,?2,?3,NULL,30000,'herdr-agent-list-v1')",
+            rusqlite::params![f.attempt, Y2030 + ms, label]).unwrap();
+    }
+    let (attention, _) = f.cli_args(&["accounting", "attention", "--json"]);
+    assert_eq!(attention["attempts"][0]["attention"]["intervals"][0]["opened_unix_ms"], Y2030 + 30_000);
+
+    let (tools, first) = f.cli_args(&["accounting", "tools", "--json"]);
+    let m16 = &tools["metrics"]["M16"];
+    assert_eq!(m16["value"], json!({"issued": 5, "accepted": {"status": "inferred", "count": 2, "unknown": 3}, "executed": 6}));
+    assert_eq!((&m16["accepted"]["label"], &m16["accepted"]["calls"], &m16["accepted"]["by_basis"], &m16["accepted"]["unknown"]),
+        (&json!("inferred"), &json!(2), &json!({"auto_review": 1, "human_routed": 1}), &json!(3)));
+    // Per host: every sample is of the one execution home.
+    assert_eq!(tools["metrics"]["M18"]["call_to_output_ms"]["by_home"], json!({digest(&f.home): {"samples": 4, "p50_ms": 1000, "p95_ms": 37010, "max_ms": 37010}}));
+    let report = f.report();
+    for id in ["M16", "M17", "M18"] { assert_eq!(report["metrics"][id], tools["metrics"][id], "{id}"); }
+    assert!(f.text(&["accounting", "tools"]).lines().any(|l| l == "M16 tool_call_volume issued 5, accepted 2 inferred (3 unknown), executed 6"));
+    // Read-only and replayable.
+    f.cli("collect");
+    assert_eq!(f.cli_args(&["accounting", "tools", "--json"]).1, first);
+    assert_eq!(TOOLS_GUARDIAN, tools["sessions"][1]["session_id"]);
+}
+
 /// Start of a UTC hour (November 2023): fleet windows are whole UTC hours.
 const HOUR0: i64 = 472_223 * 3_600_000;
 fn at(hours: i64, minutes: i64) -> i64 { HOUR0 + hours * 3_600_000 + minutes * 60_000 }
 
 /// Canonical rows of the fan-out fixture below in `project`; `class_of(attempt,
-/// code, docs)` picks each attempt's classification (`None`: unclassified).
-fn plant_fleet(project: &Path, class_of: &dyn Fn(&str, &str, &str) -> Option<String>) -> rusqlite::Connection {
+/// code, docs)` picks each attempt's classification (`None`: unclassified) and
+/// `config_of(attempt)` its dispatch decision's configuration id.
+fn plant_fleet(project: &Path, class_of: &dyn Fn(&str, &str, &str) -> Option<String>, config_of: &dyn Fn(&str) -> String) -> rusqlite::Connection {
     use herdr_projects::store::SqliteStore;
     fs::create_dir_all(project.join(".state")).unwrap();
     let db_path = project.join(".state/state.db");
@@ -1093,7 +1254,8 @@ fn plant_fleet(project: &Path, class_of: &dyn Fn(&str, &str, &str) -> Option<Str
         }
         if !marks.is_empty() {
             db.execute("INSERT INTO dispatch_decisions(attempt_id,task_id,task_revision,contract_revision,classification_id,chosen_configuration_id,eligible,chooser_kind,chooser_principal,reason_codes,decided_unix_ms)
-                VALUES(?1,?2,1,1,?3,'cfg',json_array('cfg'),'operator','owner','[\"operator_preference\"]',?4)", rusqlite::params![attempt, task, class_of(attempt, &code, &docs), marks[0].1]).unwrap();
+                VALUES(?1,?2,1,1,?3,?5,json_array(?5),'operator','owner','[\"operator_preference\"]',?4)",
+                rusqlite::params![attempt, task, class_of(attempt, &code, &docs), marks[0].1, config_of(attempt)]).unwrap();
         }
     };
     for n in 1..=4 { attempt(&format!("a{n}"), &format!("ta{n}"), "completed", &[("reserved", at(0, -1)), ("running", at(0, 0)), ("completed", at(1, 0))]); }
@@ -1161,7 +1323,7 @@ fn fan_out_buckets_and_integration_conflicts() {
     let (root, home) = (base.join("root"), base.join("home"));
     let project = root.join("demo");
     fs::create_dir_all(&home).unwrap();
-    let db = plant_fleet(&project, &|_, code, _| Some(code.to_owned()));
+    let db = plant_fleet(&project, &|_, code, _| Some(code.to_owned()), &|_| "cfg".to_owned());
     let cli_in = |slug: &str, args: &[&str]| -> String {
         let out = Command::new(BIN).env_clear().env("HOME", &home).env("PATH", "/usr/bin:/bin")
             .args(["--root", root.to_str().unwrap(), "telemetry", slug]).args(args).output().unwrap();
@@ -1185,9 +1347,13 @@ fn fan_out_buckets_and_integration_conflicts() {
         bucket(4, 14_400_000, 2, "2", "1/2", "1", serde_json::Value::Null, json!({"code/small": "1"}), "0"),
         bucket(8, 28_800_000, 3, "3", "3/8", "3/4", json!("1/4"), json!({"code/small": "1"}), "0")]));
     let comparable = json!({"test": "class_band_active_time_tvd", "max_tvd": "1/10", "reference": "reference bucket", "label": "comparable", "reasons": []});
-    let m35 = json!({"definition": "M35.fanout-v1", "name": "fan_out_efficiency", "window_ms": 3_600_000, "level_rule": "round_half_up(time_weighted_active_attempts)",
+    // One configuration (`cfg`, no display label planted): its split equals the fleet's.
+    let by_configuration = json!({"configurations": {"cfg": {"display_label": null, "reference_level": 4, "level": 8, "reference_per_agent_per_hour": "1/2",
+        "marginal_per_added_agent_per_hour": "1/4", "label": "comparable", "value": "3/4"}}, "configuration_unknown": {"attempts": 0, "accepted": 0}});
+    let m35 = json!({"definition": "M35.fanout-v1", "name": "fan_out_efficiency", "window_ms": 3_600_000, "window_minutes": 60,
+        "level_rule": "round_half_up(time_weighted_active_attempts)",
         "scope": "worker_attempts", "reference_level": 4, "level": 8, "reference_per_agent_per_hour": "1/2", "marginal_per_added_agent_per_hour": "1/4",
-        "comparability": comparable, "label": "comparable", "value": "3/4"});
+        "comparability": comparable, "label": "comparable", "value": "3/4", "by_configuration": by_configuration});
     assert_eq!(fleet["metrics"]["M35"], m35);
     let ratio = |n: i64, d: i64| json!({"numerator": n, "denominator": d, "value": format!("{n}/{d}")});
     let m36 = json!({"definition": "M36.integration-v1", "name": "integration_conflict_rate", "numerator": 3, "denominator": 4, "value": "3/4",
@@ -1213,14 +1379,60 @@ fn fan_out_buckets_and_integration_conflicts() {
     assert_eq!(windowed["metrics"]["M35"]["value"], json!({"status": "unavailable", "reason": "single_concurrency_level"}));
     assert_eq!((&windowed["metrics"]["M36"]["numerator"], &windowed["metrics"]["M36"]["denominator"]), (&json!(2), &json!(3)));
 
+    // A 120-minute window (recorded in the output): hour 0 is 23:00 UTC, so it
+    // shares its window 22:00–24:00 with nothing (4 agents × 1 h / 2 h → level
+    // 2, 2 accepted → 1/hour) and hour 1 opens 00:00–02:00 (8 × 1 / 2 → level
+    // 4, 3 accepted → 3/2 per hour). M35 = (3/2) / (4 × 1/2) = 3/4, marginal
+    // (3/2 − 1) / (4 − 2) = 1/4. A window that does not divide a day is refused.
+    let (wide, _) = cli(&["accounting", "fleet", "--json", "--window-minutes", "120"]);
+    assert_eq!((&wide["fleet"]["window_ms"], &wide["fleet"]["window_minutes"], &wide["metrics"]["M35"]["window_minutes"]),
+        (&json!(7_200_000), &json!(120), &json!(120)));
+    let levels: Vec<_> = wide["fleet"]["buckets"].as_array().unwrap().iter()
+        .map(|b| (b["level"].clone(), b["accepted"].clone(), b["accepted_per_hour"].clone(), b["per_agent_per_hour"].clone())).collect();
+    assert_eq!(levels, [(json!(2), json!(2), json!("1"), json!("1/2")), (json!(4), json!(3), json!("3/2"), json!("3/8"))]);
+    let m = &wide["metrics"]["M35"];
+    assert_eq!((&m["value"], &m["marginal_per_added_agent_per_hour"], &m["label"]), (&json!("3/4"), &json!("1/4"), &json!("comparable")));
+    for bad in ["7", "0", "2880"] {
+        let out = Command::new(BIN).env_clear().env("HOME", &home).env("PATH", "/usr/bin:/bin")
+            .args(["--root", root.to_str().unwrap(), "telemetry", "demo", "accounting", "fleet", "--window-minutes", bad]).output().unwrap();
+        assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("--window-minutes must divide 1440"), "{bad}");
+    }
+
+    // Two agent configurations, X (a1, a2, b1–b4) and Y (a3, a4, b5–b8), with
+    // display labels. X: level 2 with 2 accepted (reference, 1 per agent) and
+    // level 4 with 3 (tb1–tb3) → 3 / (4 × 1) = 3/4, marginal 1/2. Y: levels 2
+    // and 4 with nothing accepted → no_accepted_throughput. The fleet stays 3/4.
+    let (x, y) = (format!("sha256:{}", "a".repeat(64)), format!("sha256:{}", "b".repeat(64)));
+    let configured = plant_fleet(&root.join("configs"), &|_, code, _| Some(code.to_owned()),
+        &|a| if ["a1", "a2", "b1", "b2", "b3", "b4"].contains(&a) { x.clone() } else { y.clone() });
+    for (id, kind, version) in [(&x, "codex", "0.154.0"), (&y, "claude", "2.1.0")] {
+        configured.execute("INSERT INTO agent_configurations(configuration_id,canonical_json,first_decided_unix_ms) VALUES(?1,?2,0)",
+            rusqlite::params![id, json!({"kind": kind, "agent_version": version, "schema": "agent_configuration.v1"}).to_string()]).unwrap();
+    }
+    let fleet = serde_json::from_str::<serde_json::Value>(&cli_in("configs", &["accounting", "fleet", "--json"])).unwrap();
+    let m35 = &fleet["metrics"]["M35"];
+    assert_eq!((&m35["value"], &m35["label"]), (&json!("3/4"), &json!("comparable")));
+    assert_eq!(m35["by_configuration"], json!({"configurations": {
+        x.as_str(): {"display_label": "codex 0.154.0", "reference_level": 2, "level": 4, "reference_per_agent_per_hour": "1",
+            "marginal_per_added_agent_per_hour": "1/2", "label": "comparable", "value": "3/4"},
+        y.as_str(): {"display_label": "claude 2.1.0", "reference_level": null, "level": 4, "label": "comparable",
+            "value": {"status": "unavailable", "reason": "no_accepted_throughput"}}},
+        // c1 (the open attempt) is Y's; every attempt has a configuration.
+        "configuration_unknown": {"attempts": 0, "accepted": 0}}));
+    let split = &fleet["fleet"]["by_configuration"]["configurations"][x.as_str()];
+    assert_eq!((&split["attempts"], &split["windows"]), (&json!(6), &json!({"bucketed": 2, "excluded": {"incomplete": 0, "concurrency_unknown": 0, "outside_window": 0}})));
+    let text = cli_in("configs", &["accounting", "fleet"]);
+    assert!(text.lines().any(|l| l == format!("M35 configuration {x} (codex 0.154.0) 3/4 (comparable)")), "{text}");
+    assert!(text.lines().any(|l| l == format!("M35 configuration {y} (claude 2.1.0) n/a (no_accepted_throughput) (comparable)")), "{text}");
+
     // Mismatched task mix: the 8-agent hour worked on docs tasks. Same numbers, labelled descriptive.
-    plant_fleet(&root.join("mixed"), &|a, code, docs| Some(if a.starts_with('b') { docs } else { code }.to_owned()));
+    plant_fleet(&root.join("mixed"), &|a, code, docs| Some(if a.starts_with('b') { docs } else { code }.to_owned()), &|_| "cfg".to_owned());
     let fleet = serde_json::from_str::<serde_json::Value>(&cli_in("mixed", &["accounting", "fleet", "--json"])).unwrap();
     assert_eq!((&fleet["metrics"]["M35"]["value"], &fleet["metrics"]["M35"]["label"], &fleet["metrics"]["M35"]["comparability"]["reasons"]),
         (&json!("3/4"), &json!("descriptive"), &json!(["task_mix_differs"])));
     assert_eq!((&fleet["fleet"]["buckets"][1]["mix"], &fleet["fleet"]["buckets"][1]["mix_tvd"]), (&json!({"docs/small": "1"}), &json!("1")));
     // An attempt without a classification makes the mix unknown.
-    plant_fleet(&root.join("unknown"), &|a, code, docs| (a != "b8").then(|| if a.starts_with('b') { docs } else { code }.to_owned()));
+    plant_fleet(&root.join("unknown"), &|a, code, docs| (a != "b8").then(|| if a.starts_with('b') { docs } else { code }.to_owned()), &|_| "cfg".to_owned());
     let fleet = serde_json::from_str::<serde_json::Value>(&cli_in("unknown", &["accounting", "fleet", "--json"])).unwrap();
     assert_eq!(fleet["metrics"]["M35"]["comparability"]["reasons"], json!(["classification_unknown", "task_mix_differs"]));
 

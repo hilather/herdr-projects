@@ -278,6 +278,15 @@ fn derive_all(project: &Path, db: &Connection) -> Result<(Vec<Attention>, i64)> 
     Ok((out, orphans))
 }
 
+/// Per launched attempt, the span of each of its waits from its first to its
+/// last `blocked` sample (counted or not, closed or censored): observed
+/// evidence that the attempt waited on the human then (§9 accepted stage).
+pub fn blocked_spans(project: &Path, db: &Connection) -> Result<BTreeMap<String, Vec<(i64, i64)>>> {
+    if !collected(db)? { return Ok(BTreeMap::new()); }
+    let (all, _) = derive_all(project, db)?;
+    Ok(all.into_iter().filter_map(|(b, d)| d.map(|d| (b.attempt, d.intervals.iter().map(|i| (i.opened, i.last)).collect()))).collect())
+}
+
 /// The union of `[from, to)` spans (overlaps counted once), in ms.
 fn union_ms(mut spans: Vec<(i64, i64)>) -> i64 {
     spans.sort();

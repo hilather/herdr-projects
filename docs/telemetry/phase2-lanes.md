@@ -122,10 +122,10 @@ merges one PR at a time.
   as metadata. Certify their meaning in the planned small live run.
 - **Cache-write convention** (lane A/B): certify whether Codex cache writes
   overlap input. Until then, B3 leaves entries with cache writes unpriced.
-- **M12/M14** (lane B): report the repriced estimate and cost coverage
+- **Done (B10):** **M12/M14** (lane B): report the repriced estimate and cost coverage
   through the lane metrics hook.
-- **Delta revisions** (lane B): store valuation revisions as deltas before
-  the ticker runs `reprice` automatically.
+- **Done (B10, accounting 0009):** **Delta revisions** (lane B): store valuation revisions as deltas before
+  the ticker runs `reprice` automatically (the tick now reprices when cards or the ledger change).
 - **Extended M40** (steward): replace the central M40 with the per-window
   form from `accounting quota`. Update the exact assertions in
   `tests/telemetry.rs` and `tests/cli.rs`, and make the pane render a
@@ -191,17 +191,18 @@ merges one PR at a time.
   `quota_observations` (B7) and `session_nodes` (B9) are no longer read or
   written. Lanes have been told not to DROP TABLE; a single cleanup migration
   waits for the owner's decision.
-- **B5 follow-ups** (lane B): infer the M16 accepted stage from a call
+- **B5 follow-ups** (lane B): **done (B10):** infer the M16 accepted stage from a call
   overlapping a B6b `blocked` wait (human-routed) or a same-turn guardian
-  (auto-review), labelled inferred; per-host M18 breakdown. M18 stays
+  (auto-review), labelled inferred; per-host M18 breakdown. Open: M18 stays
   unavailable until Codex records an execution's real start and end. A live
   run should certify exec statuses other than `completed`, and
   `function_call.status`.
 - **B6a follow-ups** (lane B/steward): M34 needs a coordinator usage scope
   and a versioned allocation rule; M37 needs an accepted-supersession-reason
   producer; M36 does not see rebases a worker does in its own worktree. Also:
-  feed the F4.6/F5.4 scale-trial steps in as named concurrency levels,
-  per-configuration fan-out, and a configurable window (fixed at 1 h now).
+  feed the F4.6/F5.4 scale-trial steps in as named concurrency levels.
+  **Done (B10):** per-configuration fan-out and a configurable window
+  (`--window-minutes`, default 60).
 - **D6 follow-ups** (lane D/steward): a verified seeded result can still
   satisfy a dependent task's `verified_result` requirement (integration is
   guarded, the dependency path is not); findings linked to a seed probably

@@ -463,23 +463,29 @@ fn price<'a>(
     Ok((card, total, components))
 }
 
-/// Value every delta entry of the synced ledger; append a revision when the
-/// result differs from the latest one. Measured tokens are only read.
-pub fn reprice(db: &mut Connection) -> Result<Value> {
-    let tx = db.transaction()?;
-    let Some(synced) = tx
-        .query_row("SELECT synced_unix_ms FROM usage_ledger", [], |r| {
-            r.get::<_, i64>(0)
-        })
-        .optional()?
-    else {
-        return Ok(super::unavailable("ledger_not_synced"));
-    };
-    let cards = cards(&tx)?;
-    // Each delta entry with the rollout that stored it: its attempt, its A4
-    // record time (else the session start and the first observation) bound
-    // the usage time; its A4 model provider is checked against the card's.
-    let mut stmt = tx.prepare("SELECT e.entry_id,e.session_id,e.source,e.model,e.new_input_tokens,e.cache_read_tokens,e.cache_write_tokens,e.output_tokens,
+/// What a reprice reads for one delta entry of the synced ledger, with the
+/// rollout that stored it: its attempt, its A4 record time (else the session
+/// start and the first observation) and its A4 model provider. Its digest,
+/// with the rate card versions, is the input fingerprint (§12).
+#[derive(Serialize)]
+struct Input {
+    entry_id: String,
+    session_id: String,
+    source: String,
+    model: Option<String>,
+    /// `[new_input, cache_read, cache_write, output]` as normalized.
+    q: [Option<i64>; 4],
+    counted: bool,
+    role: String,
+    attempt_id: Option<String>,
+    start: Option<i64>,
+    observed: Option<i64>,
+    record: Option<i64>,
+    provider: Option<String>,
+}
+
+fn inputs(db: &Connection) -> Result<Vec<Input>> {
+    let mut stmt = db.prepare("SELECT e.entry_id,e.session_id,e.source,e.model,e.new_input_tokens,e.cache_read_tokens,e.cache_write_tokens,e.output_tokens,
         EXISTS(SELECT 1 FROM usage_dispositions d WHERE d.entry_id=e.entry_id AND d.disposition='accepted'),
         coalesce((SELECT g.role FROM session_graph_nodes g WHERE g.session_id=e.session_id LIMIT 1),'primary'),
         s.attempt_id,s.session_unix_ms,u.observed_unix_ms,t.record_unix_ms,m.model_provider
@@ -487,62 +493,84 @@ pub fn reprice(db: &mut Connection) -> Result<Value> {
         LEFT JOIN rollout_sources s ON s.path_digest=u.path_digest
         LEFT JOIN codex_usage_times t ON t.session_id=e.session_id AND t.ordinal=e.position
         LEFT JOIN rollout_metadata m ON m.path_digest=u.path_digest WHERE e.basis='delta' ORDER BY e.entry_id")?;
-    let mut rows = stmt.query([])?;
-    let mut out = Vec::new();
-    while let Some(r) = rows.next()? {
-        let (model, counted): (Option<String>, bool) = (r.get(3)?, r.get(8)?);
-        let q: [Option<i64>; 4] = [r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?];
-        let quantities = q
-            .iter()
-            .all(Option::is_some)
-            .then(|| q.map(Option::unwrap_or_default));
-        let (start, observed, record, provider): (Option<i64>, Option<i64>, Option<i64>, Option<String>) = (r.get(11)?, r.get(12)?, r.get(13)?, r.get(14)?);
-        let (usage, usage_basis) = match record {
-            Some(at) => (Some((at, at)), Some(RECORD_TIME)),
-            None => {
-                let usage = start.zip(observed).map(|(a, b)| (a.min(b), a.max(b)));
-                (usage, usage.map(|_| FALLBACK))
-            }
-        };
-        let mut row = Row {
-            entry_id: r.get(0)?,
-            session_id: r.get(1)?,
-            role: r.get(9)?,
-            attempt_id: r.get(10)?,
-            model: model.clone(),
-            usage,
-            usage_basis,
-            quantities,
-            reason: None,
-            card: None,
-            currency: None,
-            amount: None,
-            components: None,
-            provider_check: None,
-        };
-        let source: String = r.get(2)?;
-        let result = match (counted, quantities, model.as_deref(), usage) {
-            (false, ..) | (_, None, ..) => Err("usage_not_counted"),
-            (_, _, None, _) => Err("model_unknown"),
-            (_, _, _, None) => Err("usage_time_unknown"),
-            (true, Some(q), Some(model), Some(usage)) => price(&cards, &source, model, provider.as_deref(), usage, q),
-        };
-        match result {
-            Ok((card, amount, components)) => {
-                (row.card, row.currency, row.amount, row.components) = (
-                    Some((card.id.clone(), card.version)),
-                    Some(card.currency.clone()),
-                    Some(amount.to_string()),
-                    Some(components),
-                );
-                row.provider_check = Some(if provider.is_some() { "matched" } else { "provider_unverified" });
-            }
-            Err(reason) => row.reason = Some(reason.to_owned()),
+    let rows = stmt.query_map([], |r| Ok(Input { entry_id: r.get(0)?, session_id: r.get(1)?, source: r.get(2)?, model: r.get(3)?,
+        q: [r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?], counted: r.get(8)?, role: r.get(9)?, attempt_id: r.get(10)?, start: r.get(11)?,
+        observed: r.get(12)?, record: r.get(13)?, provider: r.get(14)? }))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Value one entry with the cards effective over its usage interval.
+fn value(cards: &[(String, BTreeSet<String>, Card)], input: &Input) -> Row {
+    let quantities = input.q.iter().all(Option::is_some).then(|| input.q.map(Option::unwrap_or_default));
+    let (usage, usage_basis) = match input.record {
+        Some(at) => (Some((at, at)), Some(RECORD_TIME)),
+        None => {
+            let usage = input.start.zip(input.observed).map(|(a, b)| (a.min(b), a.max(b)));
+            (usage, usage.map(|_| FALLBACK))
         }
-        out.push(row);
+    };
+    let mut row = Row {
+        entry_id: input.entry_id.clone(),
+        session_id: input.session_id.clone(),
+        role: input.role.clone(),
+        attempt_id: input.attempt_id.clone(),
+        model: input.model.clone(),
+        usage,
+        usage_basis,
+        quantities,
+        reason: None,
+        card: None,
+        currency: None,
+        amount: None,
+        components: None,
+        provider_check: None,
+    };
+    let result = match (input.counted, quantities, input.model.as_deref(), usage) {
+        (false, ..) | (_, None, ..) => Err("usage_not_counted"),
+        (_, _, None, _) => Err("model_unknown"),
+        (_, _, _, None) => Err("usage_time_unknown"),
+        (true, Some(q), Some(model), Some(usage)) => price(cards, &input.source, model, input.provider.as_deref(), usage, q),
+    };
+    match result {
+        Ok((card, amount, components)) => {
+            (row.card, row.currency, row.amount, row.components) =
+                (Some((card.id.clone(), card.version)), Some(card.currency.clone()), Some(amount.to_string()), Some(components));
+            row.provider_check = Some(if input.provider.is_some() { "matched" } else { "provider_unverified" });
+        }
+        Err(reason) => row.reason = Some(reason.to_owned()),
     }
-    drop(rows);
-    drop(stmt);
+    row
+}
+
+/// Value every delta entry of the synced ledger; append a revision when the
+/// result differs from the latest one. Measured tokens are only read.
+pub fn reprice(db: &mut Connection) -> Result<Value> { run(db, None) }
+
+/// The ticker's reprice (§12): only when a rate card has been imported and the
+/// input fingerprint (card versions and ledger rows) changed since the last
+/// reprice, and only when those inputs fit in the tick's byte budget.
+pub fn tick(db: &mut Connection, budget: crate::telemetry::codex::Budget) -> Result<Value> { run(db, Some(budget)) }
+
+fn run(db: &mut Connection, gate: Option<crate::telemetry::codex::Budget>) -> Result<Value> {
+    let tx = db.transaction()?;
+    let Some(synced) = tx.query_row("SELECT synced_unix_ms FROM usage_ledger", [], |r| r.get::<_, i64>(0)).optional()? else {
+        return Ok(super::unavailable("ledger_not_synced"));
+    };
+    let versions: Vec<(String, i64, String)> = tx.prepare("SELECT card_id,version,digest FROM rate_cards ORDER BY card_id,version")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+    if gate.is_some() && versions.is_empty() {
+        return Ok(json!({"skipped": "no_rate_cards"}));
+    }
+    let inputs = inputs(&tx)?;
+    let read = serde_json::to_string(&(POLICY, &versions, &inputs))?;
+    let fingerprint = digest(read.as_bytes());
+    if let Some(budget) = gate {
+        let last: Option<String> = tx.query_row("SELECT digest FROM valuation_inputs", [], |r| r.get(0)).optional()?;
+        if last.as_deref() == Some(fingerprint.as_str()) { return Ok(json!({"skipped": "unchanged"})); }
+        if read.len() as u64 > budget.bytes { return Ok(json!({"skipped": "budget_exhausted", "input_bytes": read.len()})); }
+    }
+    let cards = cards(&tx)?;
+    let out: Vec<Row> = inputs.iter().map(|input| value(&cards, input)).collect();
     let digest = digest(serde_json::to_string(&(POLICY, &out))?.as_bytes());
     let latest: Option<(i64, String, String)> = tx
         .query_row(
@@ -564,31 +592,160 @@ pub fn reprice(db: &mut Connection) -> Result<Value> {
         let rows: Vec<Row> = out.iter().map(|row| Row { usage_basis: None, provider_check: None, ..row.clone() }).collect();
         Ok(*stored == self::digest(serde_json::to_string(&(LEGACY_POLICY, &rows))?.as_bytes()))
     };
+    let now = jiff::Timestamp::now().as_millisecond();
+    let record = |tx: &rusqlite::Transaction, revision: i64| tx.execute("INSERT INTO valuation_inputs(singleton,digest,revision,recorded_unix_ms) VALUES(1,?1,?2,?3)
+        ON CONFLICT(singleton) DO UPDATE SET digest=excluded.digest,revision=excluded.revision,recorded_unix_ms=excluded.recorded_unix_ms",
+        params![fingerprint, revision, now]);
     if let Some(latest) = &latest
         && same(latest)?
     {
+        record(&tx, latest.0)?;
+        tx.commit()?;
         return Ok(json!({"revision": latest.0, "appended": false, "entries": out.len()}));
     }
+    // Stored as a delta against the previous revision as it reads back (§12).
+    let previous = match &latest { Some((revision, ..)) => stored_at(&tx, *revision)?, None => BTreeMap::new() };
+    let current: BTreeMap<String, Stored> = out.iter().map(|row| row.stored().map(|s| (s.entry_id.clone(), s))).collect::<Result<_>>()?;
+    let changed: Vec<&Stored> = current.values().filter(|s| previous.get(&s.entry_id) != Some(*s)).collect();
+    let removed: Vec<&String> = previous.keys().filter(|id| !current.contains_key(*id)).collect();
     let revision = latest.map_or(1, |l| l.0 + 1);
     tx.execute("INSERT INTO valuation_revisions(revision,basis,policy,ledger_synced_unix_ms,digest,computed_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",
-        params![revision, BASIS, POLICY, synced, digest, jiff::Timestamp::now().as_millisecond()])?;
-    for row in &out {
-        let q = row.quantities.map(|q| q.map(Some)).unwrap_or([None; 4]);
-        let components = row
-            .components
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
-        tx.execute("INSERT INTO valuations(revision,entry_id,session_id,role,attempt_id,model,usage_from_unix_ms,usage_to_unix_ms,new_input_tokens,cache_read_tokens,
-            cache_write_tokens,output_tokens,status,reason,card_id,card_version,currency,amount,components) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-            params![revision, row.entry_id, row.session_id, row.role, row.attempt_id, row.model, row.usage.map(|u| u.0), row.usage.map(|u| u.1),
-                q[0], q[1], q[2], q[3], if row.reason.is_none() { "priced" } else { "unavailable" }, row.reason, row.card.as_ref().map(|c| &c.0),
-                row.card.as_ref().map(|c| c.1), row.currency, row.amount, components])?;
-        tx.execute("INSERT INTO valuation_bases(revision,entry_id,usage_basis,provider_check) VALUES(?1,?2,?3,?4)",
-            params![revision, row.entry_id, row.usage_basis, row.provider_check])?;
+        params![revision, BASIS, POLICY, synced, digest, now])?;
+    tx.execute("INSERT INTO valuation_delta_revisions(revision,changed,removed) VALUES(?1,?2,?3)", params![revision, changed.len(), removed.len()])?;
+    for s in &changed {
+        tx.execute("INSERT INTO valuation_deltas(revision,entry_id,removed,session_id,role,attempt_id,model,usage_from_unix_ms,usage_to_unix_ms,new_input_tokens,
+            cache_read_tokens,cache_write_tokens,output_tokens,status,reason,card_id,card_version,currency,amount,components,usage_basis,provider_check)
+            VALUES(?1,?2,0,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+            params![revision, s.entry_id, s.session_id, s.role, s.attempt_id, s.model, s.from, s.to, s.q[0], s.q[1], s.q[2], s.q[3], s.status, s.reason,
+                s.card_id, s.card_version, s.currency, s.amount, s.components, s.usage_basis, s.provider_check])?;
     }
+    for id in &removed {
+        tx.execute("INSERT INTO valuation_deltas(revision,entry_id,removed) VALUES(?1,?2,1)", params![revision, id])?;
+    }
+    record(&tx, revision)?;
     tx.commit()?;
-    Ok(json!({"revision": revision, "appended": true, "entries": out.len()}))
+    Ok(json!({"revision": revision, "appended": true, "entries": out.len(), "stored": {"changed": changed.len(), "removed": removed.len()}}))
+}
+
+/// One valuation as stored and read back: a `valuations` row (with its
+/// `valuation_bases` row, if any) or a `valuation_deltas` row.
+#[derive(Clone, PartialEq)]
+struct Stored {
+    entry_id: String,
+    session_id: String,
+    role: String,
+    attempt_id: Option<String>,
+    model: Option<String>,
+    from: Option<i64>,
+    to: Option<i64>,
+    q: [Option<i64>; 4],
+    status: String,
+    reason: Option<String>,
+    card_id: Option<String>,
+    card_version: Option<i64>,
+    currency: Option<String>,
+    amount: Option<String>,
+    components: Option<String>,
+    usage_basis: Option<String>,
+    provider_check: Option<String>,
+}
+
+impl Row {
+    /// The row as it is stored (the same columns a full copy wrote).
+    fn stored(&self) -> Result<Stored> {
+        Ok(Stored {
+            entry_id: self.entry_id.clone(),
+            session_id: self.session_id.clone(),
+            role: self.role.clone(),
+            attempt_id: self.attempt_id.clone(),
+            model: self.model.clone(),
+            from: self.usage.map(|u| u.0),
+            to: self.usage.map(|u| u.1),
+            q: self.quantities.map(|q| q.map(Some)).unwrap_or([None; 4]),
+            status: if self.reason.is_none() { "priced" } else { "unavailable" }.to_owned(),
+            reason: self.reason.clone(),
+            card_id: self.card.as_ref().map(|c| c.0.clone()),
+            card_version: self.card.as_ref().map(|c| c.1),
+            currency: self.currency.clone(),
+            amount: self.amount.clone(),
+            components: self.components.as_ref().map(serde_json::to_string).transpose()?,
+            usage_basis: self.usage_basis.map(str::to_owned),
+            provider_check: self.provider_check.map(str::to_owned),
+        })
+    }
+}
+
+/// The stored columns from `entry_id` on, in `Stored` field order.
+const STORED: &str = "entry_id,session_id,role,attempt_id,model,usage_from_unix_ms,usage_to_unix_ms,new_input_tokens,cache_read_tokens,cache_write_tokens,
+    output_tokens,status,reason,card_id,card_version,currency,amount,components";
+
+fn stored(r: &rusqlite::Row) -> rusqlite::Result<Stored> {
+    Ok(Stored {
+        entry_id: r.get(0)?,
+        session_id: r.get(1)?,
+        role: r.get(2)?,
+        attempt_id: r.get(3)?,
+        model: r.get(4)?,
+        from: r.get(5)?,
+        to: r.get(6)?,
+        q: [r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?],
+        status: r.get(11)?,
+        reason: r.get(12)?,
+        card_id: r.get(13)?,
+        card_version: r.get(14)?,
+        currency: r.get(15)?,
+        amount: r.get(16)?,
+        components: r.get(17)?,
+        usage_basis: r.get(18)?,
+        provider_check: r.get(19)?,
+    })
+}
+
+/// Revision `revision` as stored: the latest full copy at or below it
+/// (written before stream version 9), then every delta above that copy up
+/// to it, in order. Keyed by entry.
+fn stored_at(db: &Connection, revision: i64) -> Result<BTreeMap<String, Stored>> {
+    let deltas: Vec<i64> = if table(db, "valuation_delta_revisions")? {
+        db.prepare("SELECT revision FROM valuation_delta_revisions WHERE revision<=?1 ORDER BY revision")?
+            .query_map([revision], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+    } else {
+        Vec::new()
+    };
+    let not_delta = if deltas.is_empty() { String::new() } else {
+        format!(" AND revision NOT IN ({})", deltas.iter().map(i64::to_string).collect::<Vec<_>>().join(","))
+    };
+    let full: Option<i64> = db.query_row(&format!("SELECT max(revision) FROM valuation_revisions WHERE revision<=?1{not_delta}"), [revision], |r| r.get(0))?;
+    let mut state = BTreeMap::new();
+    if let Some(full) = full {
+        // Stream version 6 records the A4 bases; a sidecar read before its upgrade has none.
+        let (extra, join) = if table(db, "valuation_bases")? {
+            ("b.usage_basis,b.provider_check", "LEFT JOIN valuation_bases b ON b.revision=v.revision AND b.entry_id=v.entry_id")
+        } else {
+            ("NULL,NULL", "")
+        };
+        let columns = STORED.split(',').map(|c| format!("v.{}", c.trim())).collect::<Vec<_>>().join(",");
+        let mut stmt = db.prepare(&format!("SELECT {columns},{extra} FROM valuations v {join} WHERE v.revision=?1"))?;
+        for row in stmt.query_map([full], stored)? {
+            let row = row?;
+            state.insert(row.entry_id.clone(), row);
+        }
+    }
+    let mut stmt = if deltas.is_empty() { None } else {
+        Some(db.prepare(&format!("SELECT {STORED},usage_basis,provider_check,removed FROM valuation_deltas WHERE revision=?1"))?)
+    };
+    for delta in deltas.iter().filter(|d| full.is_none_or(|full| **d > full)) {
+        let Some(stmt) = stmt.as_mut() else { break };
+        let mut rows = stmt.query([delta])?;
+        while let Some(r) = rows.next()? {
+            if r.get::<_, bool>(20)? {
+                state.remove(&r.get::<_, String>(0)?);
+            } else {
+                let row = stored(r)?;
+                state.insert(row.entry_id.clone(), row);
+            }
+        }
+    }
+    Ok(state)
 }
 
 /// The estimate over some valuations: complete only when every entry is
@@ -648,56 +805,57 @@ fn summarize(entries: &[&Value]) -> Result<(Value, Value)> {
     Ok((estimate, coverage))
 }
 
-/// A stored revision (the latest by default) per attempt and session, as JSON. Read-only.
-pub fn cost(db: &Connection, revision: Option<i64>) -> Result<Value> {
+/// A stored valuation as `cost` shows it.
+fn valuation(s: &Stored, basis: &str) -> Result<Value> {
+    Ok(if s.status == "priced" {
+        json!({"status": "priced", "basis": basis, "rate_card": {"card_id": s.card_id, "version": s.card_version},
+            "currency": s.currency, "amount": s.amount,
+            "components": serde_json::from_str::<Value>(s.components.as_deref().context("priced valuation without components")?)?})
+    } else {
+        super::unavailable(s.reason.as_deref().unwrap_or_default())
+    })
+}
+
+/// The latest revision number and its header, or `None` before any reprice.
+type Header = (i64, String, String, i64, i64);
+
+fn header(db: &Connection, revision: Option<i64>) -> Result<Option<Header>> {
     if !table(db, "valuation_revisions")? {
-        return Ok(super::unavailable("not_priced"));
+        return Ok(None);
     }
-    let latest: Option<i64> =
-        db.query_row("SELECT max(revision) FROM valuation_revisions", [], |r| {
-            r.get(0)
-        })?;
-    let Some(latest) = latest else {
-        return Ok(super::unavailable("not_priced"));
-    };
+    let latest: Option<i64> = db.query_row("SELECT max(revision) FROM valuation_revisions", [], |r| r.get(0))?;
+    let Some(latest) = latest else { return Ok(None) };
     let revision = revision.unwrap_or(latest);
     let Some((basis, policy, synced, computed)) = db.query_row("SELECT basis,policy,ledger_synced_unix_ms,computed_unix_ms FROM valuation_revisions WHERE revision=?1",
         [revision], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))).optional()? else {
         bail!("valuation revision {revision} does not exist (latest is {latest})");
     };
-    // Stream version 6 records the A4 bases; a sidecar read before its upgrade has none.
-    let (extra, join) = if table(db, "valuation_bases")? {
-        ("b.usage_basis,b.provider_check", "LEFT JOIN valuation_bases b ON b.revision=v.revision AND b.entry_id=v.entry_id")
-    } else {
-        ("NULL,NULL", "")
+    Ok(Some((revision, basis, policy, synced, computed)))
+}
+
+/// A stored revision (the latest by default) per attempt and session, as JSON.
+/// A delta revision is replayed onto the full copy below it, so every revision
+/// reads back byte-identical to when it was appended. Read-only.
+pub fn cost(db: &Connection, revision: Option<i64>) -> Result<Value> {
+    let Some((revision, basis, policy, synced, computed)) = header(db, revision)? else {
+        return Ok(super::unavailable("not_priced"));
     };
-    let mut stmt = db.prepare(&format!("SELECT v.entry_id,v.session_id,v.role,v.attempt_id,v.model,v.usage_from_unix_ms,v.usage_to_unix_ms,v.new_input_tokens,
-        v.cache_read_tokens,v.cache_write_tokens,v.output_tokens,v.status,v.reason,v.card_id,v.card_version,v.currency,v.amount,v.components,{extra}
-        FROM valuations v {join} WHERE v.revision=?1 ORDER BY v.session_id,v.entry_id"))?;
-    let mut rows = stmt.query([revision])?;
+    let mut rows: Vec<Stored> = stored_at(db, revision)?.into_values().collect();
+    rows.sort_by(|a, b| (&a.session_id, &a.entry_id).cmp(&(&b.session_id, &b.entry_id)));
     let mut sessions = BTreeMap::<String, (String, Option<String>, Vec<Value>)>::new();
-    while let Some(r) = rows.next()? {
-        let valuation = if r.get::<_, String>(11)? == "priced" {
-            json!({"status": "priced", "basis": basis, "rate_card": {"card_id": r.get::<_, String>(13)?, "version": r.get::<_, i64>(14)?},
-                "currency": r.get::<_, String>(15)?, "amount": r.get::<_, String>(16)?,
-                "components": serde_json::from_str::<Value>(&r.get::<_, String>(17)?)?})
-        } else {
-            super::unavailable(&r.get::<_, String>(12)?)
-        };
-        let from: Option<i64> = r.get(5)?;
-        let (usage_basis, provider_check): (Option<String>, Option<String>) = (r.get(18)?, r.get(19)?);
-        let mut interval = from.map(|from| Ok::<_, rusqlite::Error>(json!({"from_unix_ms": from, "to_unix_ms": r.get::<_, i64>(6)?}))).transpose()?;
+    for s in &rows {
+        let mut interval = s.from.map(|from| json!({"from_unix_ms": from, "to_unix_ms": s.to}));
         // A4 fields appear only on revisions that recorded them, so earlier ones read back unchanged.
-        if let (Some(interval), Some(basis)) = (interval.as_mut(), usage_basis) { interval["basis"] = json!(basis); }
-        let mut entry = json!({"entry_id": r.get::<_, String>(0)?, "model": r.get::<_, Option<String>>(4)?,
+        if let (Some(interval), Some(basis)) = (interval.as_mut(), &s.usage_basis) { interval["basis"] = json!(basis); }
+        let mut entry = json!({"entry_id": s.entry_id, "model": s.model,
             "usage_interval": interval,
-            "quantities": {"new_input_tokens": r.get::<_, Option<i64>>(7)?, "cache_read_tokens": r.get::<_, Option<i64>>(8)?,
-                "cache_write_tokens": r.get::<_, Option<i64>>(9)?, "output_tokens": r.get::<_, Option<i64>>(10)?},
-            "valuation": valuation});
-        if let Some(check) = provider_check { entry["provider_check"] = json!(check); }
+            "quantities": {"new_input_tokens": s.q[0], "cache_read_tokens": s.q[1],
+                "cache_write_tokens": s.q[2], "output_tokens": s.q[3]},
+            "valuation": valuation(s, &basis)?});
+        if let Some(check) = &s.provider_check { entry["provider_check"] = json!(check); }
         sessions
-            .entry(r.get(1)?)
-            .or_insert((r.get(2)?, r.get(3)?, Vec::new()))
+            .entry(s.session_id.clone())
+            .or_insert((s.role.clone(), s.attempt_id.clone(), Vec::new()))
             .2
             .push(entry);
     }
@@ -742,6 +900,57 @@ pub fn cost(db: &Connection, revision: Option<i64>) -> Result<Value> {
         json!({"revision": revision, "basis": basis, "policy": policy, "ledger_synced_unix_ms": synced,
         "computed_unix_ms": computed, "attempts": rollups, "sessions": out}),
     )
+}
+
+const NAMES: [(&str, &str); 2] = [("M12", "repriced_estimated_spend"), ("M14", "cost_coverage")];
+const FIXTURE_RATES: &str = "rate cards are fixture-only by owner decision: the only cards in the repository are invented synthetic test fixtures and no real \
+    prices ship, so an estimate is only as real as the cards imported; never a provider charge and never added to one (M11)";
+
+fn metric(id: &str, mut body: Value) -> Value {
+    body["definition"] = json!(format!("{id}.cost-v1"));
+    body["name"] = json!(NAMES.iter().find(|(n, _)| *n == id).map_or("", |(_, name)| *name));
+    body
+}
+
+fn unavailable_metrics(reason: &str) -> BTreeMap<String, Value> {
+    NAMES.iter().map(|(id, _)| (id.to_string(), metric(id, json!({"value": super::unavailable(reason), "basis": BASIS})))).collect()
+}
+
+/// M12 and M14 (§12) for `telemetry <slug> report`, from the latest stored
+/// revision: every valued delta entry of sessions started in the window. M12
+/// follows `cost`: complete only when every entry is priced in one currency,
+/// else `partial` (never the total) or `unavailable`; M14 counts priced entries
+/// of the entries valued. Unknown is never 0.
+pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> {
+    let Some(db) = crate::telemetry::sidecar::read(project)? else { return Ok(unavailable_metrics("collection_not_run")) };
+    let Some((revision, basis, policy, synced, _)) = header(&db, None)? else { return Ok(unavailable_metrics("not_priced")) };
+    let starts: BTreeMap<String, Option<i64>> = db.prepare("SELECT session_id,min(session_unix_ms) FROM rollout_sources GROUP BY session_id")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    let mut entries = Vec::new();
+    for s in stored_at(&db, revision)?.values() {
+        if since.is_some_and(|since| starts.get(&s.session_id).copied().flatten().is_none_or(|at| at < since)) { continue; }
+        entries.push(json!({"valuation": valuation(s, &basis)?}));
+    }
+    let (estimate, coverage) = summarize(&entries.iter().collect::<Vec<_>>())?;
+    let common = json!({"basis": basis, "revision": revision, "policy": policy, "ledger_synced_unix_ms": synced, "rate_cards": "fixture_only",
+        "caveat": FIXTURE_RATES, "scope": "every valued delta entry of the latest revision (sessions started in the window)"});
+    let mut m12 = common.clone();
+    m12["value"] = match estimate["status"].as_str() {
+        Some("complete") => { m12["currency"] = estimate["currency"].clone(); estimate["amount"].clone() }
+        _ => estimate.clone(),
+    };
+    m12["estimate"] = estimate;
+    m12["coverage"] = coverage.clone();
+    m12["never_added_to"] = json!("M11");
+    let (priced, total) = (coverage["priced"].as_u64().unwrap_or(0), coverage["entries"].as_u64().unwrap_or(0));
+    let mut m14 = common;
+    m14["numerator"] = json!(priced);
+    m14["denominator"] = json!(total);
+    if total == 0 { m14["value"] = Value::Null; m14["reason"] = json!("empty_denominator"); } else { m14["value"] = json!(format!("{priced}/{total}")); }
+    m14["unpriced"] = coverage["unpriced"].clone();
+    m14["unit"] = json!("entries");
+    m14["detail"] = json!("count coverage of valued invocations (delta entries), not a share of monetary value: an unpriced entry may be the expensive one");
+    Ok(BTreeMap::from([("M12".to_owned(), metric("M12", m12)), ("M14".to_owned(), metric("M14", m14))]))
 }
 
 fn text_estimate(estimate: &Value, coverage: &Value) -> String {

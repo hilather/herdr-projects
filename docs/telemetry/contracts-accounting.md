@@ -60,7 +60,8 @@ counted entries (delta, an `accepted` disposition) of certified sessions, with
 the §6 `coverage`. They are derived from the Codex tables at report time, so
 they need no prior sync. It also provides M38 and M39, both `unavailable`
 (§5), M31–M33 (§6), M16–M18 (§9, derived from A6 tool metadata at read
-time) and M34–M37 (§10, derived from canonical rows at read time).
+time), M34–M37 (§10, derived from canonical rows at read time) and M12/M14
+(§12, from the latest stored valuation revision).
 
 ## 3. Session graph and model segments (B2, TM2.2)
 
@@ -200,7 +201,8 @@ values every delta entry of the synced ledger (§1; `ledger_not_synced`
 before) and appends revision *n+1* only when the result's digest differs
 from revision *n* (so repeated reprices and re-syncs append nothing). Each
 row copies the quantities it priced, so later syncs never change an earlier
-revision, and repricing never changes measured tokens. Basis is always
+revision, and repricing never changes measured tokens. From stream version 9
+a revision stores only the rows that changed since the previous one (§12). Basis is always
 `published_rate_estimate`; there are no provider charges, and an estimate is
 never added to one.
 
@@ -249,7 +251,8 @@ nothing; anything else (a record time, a provider check, a session now
 
 **`accounting cost [--json] [--revision N]`** (read-only; `not_priced`
 before the first reprice) shows the latest revision or revision N, byte-
-identical to when it was appended. Per session and per attempt (bound
+identical to when it was appended (a delta revision is replayed onto the
+full copy below it, §12). Per session and per attempt (bound
 attempt of the storing rollout; every non-`primary` session, guardian,
 subagent or fork, linked or not, summed apart under the key
 `unlinked_children`, §3; the key predates A4 linking and is kept for
@@ -269,10 +272,14 @@ input 2, cache read 0.50, output 8) prices doc 05's 800 new + 200 cached +
 300 output at `0.0041`; gpt-5.5-mini (no card), a cache write, a cached read
 under version 1 and a session straddling the boundary are unavailable with
 their reasons, leaving the attempt `partial` at `0.0081` (the straddling
-record has no line time, so it keeps the fallback interval). A corrected
-version 3 (output 6 → `0.0035`) and a EUR card (`0.00021`) append revision 2
-(attempt `mixed_currency`: USD `0.0075`, EUR `0.00021`); revision 1 reads
-back byte-identical and the ledger is unchanged.
+record has no line time, so it keeps the fallback interval); the report's
+M12 is that `partial` and M14 `2/6` (§12). Revision 1 is then rewritten as
+a pre-version-9 binary left it (a full copy in `valuations`, no delta
+tables, stream 8) and reads back byte-identical. A corrected version 3
+(output 6 → `0.0035`) and a EUR card (`0.00021`) append revision 2 as a
+delta of the 2 changed rows (attempt and M12 `mixed_currency`: USD
+`0.0075`, EUR `0.00021`; M14 `3/6`); revision 1 (full copy) and 2 (delta)
+read back byte-identical and the ledger is unchanged.
 
 Test `record_times_narrow_rate_card_interval`: one session starting before a
 boundary and first observed after it; its record timed before the boundary
@@ -281,7 +288,8 @@ the one without a line time straddles (`rate_change_within_usage_interval`,
 basis `session_start..first_observed`). Provider `openai` against the
 `synthetic` cards is `provider_mismatch`; no provider prices at `0.00036`
 marked `provider_unverified`; attempt `partial` `0.00846`. Version 3 appends
-revision 2 (`0.00782`); revision 1 reads back byte-identical.
+revision 2 (`0.00782`) storing only its 2 changed rows (7 delta rows in
+all, none in `valuations`); revision 1 reads back byte-identical.
 
 ## 5. Quota windows (B4, TM2.7)
 
@@ -610,8 +618,21 @@ observed, pending_reread, predates_collection, excluded}`.
   (`function_call.status` certified `fixture` only), `without_output` (no
   output yet: open or lost) and `outputs_without_call` (an output whose call
   was not seen, not counted as issued).
-- `accepted`: `unavailable approval_decision_not_exposed`. There is no typed
-  decision; auto-approved and human-approved calls look the same.
+- `accepted`: **inferred** (`value.accepted {status: inferred, count,
+  unknown}`), never from a typed decision (Codex writes none). A recorded call
+  with both times reached the accepted stage when its call → output interval
+  `[called, output]` overlaps a B6b `blocked` wait of one of the session's
+  bound attempts, taken from its first to its last `blocked` sample (§6;
+  closed or censored, counted or not): `human_routed`. Or when a guardian
+  session names this session as its parent (native evidence only, §3/§8:
+  A5 `thread_source = guardian_review` or A4 `subagent_kind = review`,
+  parent in `subagent_parent_thread_id` else `rollout_threads.parent_thread_id`)
+  and its session start lies inside that interval (so in the call's turn):
+  `auto_review`. Both: `human_routed_and_auto_review`. Every other issued call
+  (neither, or no output yet) is `unknown`, never counted as accepted.
+  `accepted {label: inferred, calls, by_basis, unknown, basis, caveat}`;
+  caveat: a denied approval also ends the wait, so `accepted` means the
+  approval stage completed, not that it was approved.
 - `executed`: one `CommandExecution` item per execution instance (a repeated
   execution is another instance), `scope: command_execution` (other tools,
   e.g. `wait`, write no item), `by_source`. Attribution to a call is
@@ -643,19 +664,21 @@ read as run time. `queue_time` `unavailable approval_decision_not_exposed`,
 nearest-rank `p50_ms`, `p95_ms`, `max_ms`; `null` without samples), overall,
 `by_name` and `name_unreported`, with `negative_intervals` (excluded),
 `caveat: includes_approval_wait` (live: 36.9 s call → output against a
-37.8 s Herdr `blocked` wait).
+37.8 s Herdr `blocked` wait). Per host (`host_basis: execution_home`):
+`by_home` keys the same distribution by the `home_digest` of the session's
+rollouts; a session whose rollouts lie under several homes goes to
+`home_ambiguous`.
 
 **`accounting tools [--json]`** (read-only; `collection_not_run` without a
 sidecar): per in-scope session `{session_id, attempt_ids, tools}` with
 `tools` `{issued, without_output, outputs_without_call, executed,
 attributed, unattributed, succeeded, failed, unknown}` or `unavailable`;
 `coverage`; `metrics` M16–M18, identical to the report's (lane keys, §2).
-Text: a coverage line, one line per session and per metric, and the
-`call_to_output_ms` p95 line labelled as including approval waits.
+Text: a coverage line, one line per session and per metric (M16 `accepted N
+inferred (M unknown)`), and the `call_to_output_ms` p95 line labelled as
+including approval waits.
 
-Not derived (follow-ups): the accepted stage inferred from a call overlapping
-a B6b `blocked` wait (human-routed only) or a same-turn guardian session
-(auto-review); per-host (execution home) breakdown; controller intervals
+Not derived (follow-ups): controller intervals
 (TM2.5: Codex writes no typed tool or approval interval, and Herdr samples
 only agent state); MCP calls (shape unobserved, not collected); M18 once a
 Codex version records an execution end − start.
@@ -666,9 +689,14 @@ session. 5 issued (`exec` 4, `wait` 1; status unreported 1), 1 without
 output, 1 output without a call; 6 executions, 5 inferred to `exec` calls,
 1 unattributed; exit 0 ×3, exit 2, `NULL` exit, status `failed` → M17
 `3/4`, unknown 2; M18 unavailable, `call_to_output_ms` 37010, 1000, 2500,
-300 → p50 1000, p95 37010 (`exec` 3 samples, `wait` 2500); the report
-equals `accounting tools`; before any collect everything is
-`collection_not_run`. Test `tool_metrics_before_a6_or_reread_are_unavailable`:
+300 → p50 1000, p95 37010 (`exec` 3 samples, `wait` 2500; `by_home` the one
+home, 4 samples); accepted `0` with 5 unknown (no wait, no guardian); the
+report equals `accounting tools`; before any collect everything is
+`collection_not_run`. Test `accepted_stage_is_inferred_from_waits_and_guardians`:
+the same session (calls 10→47.01, 50→51, 52→54.5, 55→55.3 s, and 60 without
+output) with a live-shape guardian starting at 55.1 s → call-4
+`auto_review` (1 accepted, 4 unknown); attention samples working 0 s,
+blocked 30 s, working 60 s → call-1 `human_routed`: accepted 2, unknown 3. Test `tool_metrics_before_a6_or_reread_are_unavailable`:
 the A6 tables dropped (ingest 5) read as `predates_collection` without
 migrating; the next collect restores the output byte for byte; the resumed
 rollout gone before its re-read makes the session `pending_reread`.
@@ -702,8 +730,11 @@ never_running, predates_lifecycle_log, end_unknown}`:
 - A store without `attempt_lifecycle`: M35 and M36 `unavailable
   predates_lifecycle_log`. No `state.db`: `no_state_store`.
 
-**Windows and buckets.** Activity windows are whole UTC hours (`window_ms`
-3600000) that hold active time or an acceptance. A window's time-weighted
+**Windows and buckets.** Activity windows are fixed windows of
+`--window-minutes` (default 60, whole UTC hours; any divisor of 1440, so
+windows align to UTC days; anything else is refused), recorded as
+`window_ms` and `window_minutes` in `fleet` and M35, that hold active time
+or an acceptance. The report hook uses the default. A window's time-weighted
 active-attempt count is Σ overlap / `window_ms`. Its level `k` is that count
 rounded half up (`round_half_up(time_weighted_active_attempts)`). Some
 windows are not bucketed. They are counted in `windows.excluded` as
@@ -734,6 +765,22 @@ Otherwise it is `unavailable`:
 - `no_complete_window`: no bucketed window.
 - `no_accepted_throughput`: no reference level.
 - `single_concurrency_level`: the highest level is the reference.
+
+**Per configuration.** M35 is also computed per agent configuration (the
+dispatch decision's `chosen_configuration_id`, contracts §2) that has active
+time or an acceptance: the same windows, buckets, reference and
+comparability rule over that configuration's attempts only (their active
+time; the acceptances whose first evidence is a result of its attempt; the
+unknown spans of its attempts or of attempts without a decision).
+`fleet.by_configuration {configurations: {id: {display_label, attempts,
+windows, buckets, comparability}}, configuration_unknown {attempts,
+accepted}}` and `M35.by_configuration {configurations: {id: {display_label,
+value, level, reference_level, reference_per_agent_per_hour,
+marginal_per_added_agent_per_hour, label}}, configuration_unknown}`;
+`display_label` is `<kind> <agent_version>` from `agent_configurations`
+(display only, never an identity; `null` without a row). Attempts or
+acceptances without a configuration are counted apart, never assigned.
+Text: `M35 configuration <id> (<label>) <value> (<label>)`.
 
 **Comparability** (`class_band_active_time_tvd`). A bucket's task mix is the
 share of its active time per decision classification `class/band`
@@ -809,10 +856,17 @@ Test `fan_out_buckets_and_integration_conflicts`:
   unclassified attempt adds `classification_unknown`.
 - An open pre-log attempt makes both hours `concurrency_unknown`: M35 is
   `no_complete_window`, never 0, and M36's bucket is `unknown`.
+- `--window-minutes 120`: hour 0 (23:00 UTC) alone in 22:00–24:00 → level
+  2, `1`/hour; hour 1 in 00:00–02:00 → level 4, `3/2`/hour; M35 `3/4`,
+  marginal `1/4`. 7, 0 and 2880 are refused.
+- Two configurations X (a1, a2, b1–b4, `codex 0.154.0`) and Y (the rest,
+  `claude 2.1.0`): X level 2 (2 accepted, reference `1`/agent) and level 4
+  (3 accepted) → `3/4`, marginal `1/2`; Y `no_accepted_throughput`; the
+  fleet stays `3/4`.
 
 Follow-ups: coordinator usage scope and allocation rule (M34); a supersession
 reason producer (M37); worker-side rebase capture; the factory's scale-trial
-steps (F4.6/F5.4) as named concurrency steps; per-configuration fan-out.
+steps (F4.6/F5.4) as named concurrency steps.
 
 ## 11. Stream 8: superseded projections dropped
 
@@ -823,3 +877,62 @@ writes them. They were projections rebuilt on every sync, so no source data
 is lost. `DROP TABLE IF EXISTS` keeps the migration re-runnable when the
 streams table is lost and every migration runs again. Checked end to end in
 `attention_intervals_union_and_censor`.
+
+## 12. Delta revisions, ticker reprice and M12/M14 (B10)
+
+Stream `accounting` version 9 (`0009_valuation_deltas.sql`). Plan: doc 05
+§5 (valuations append-only, `as_of` reproduces earlier totals), doc 07 M12
+and M14.
+
+**Delta revisions.** `accounting reprice` appends a revision only when the
+result changed (§4, unchanged). From version 9 the appended revision is
+stored as a delta against the previous revision as it reads back:
+`valuation_delta_revisions(revision, changed, removed)` and
+`valuation_deltas` (the `valuations` columns plus `usage_basis` and
+`provider_check`, one row per entry added or different, and a `removed = 1`
+tombstone per entry that left the ledger). Reprice prints
+`stored {changed, removed}`. Revisions written before version 9 stay full
+copies in `valuations` + `valuation_bases`, never moved or dropped. Revision
+N reads as the latest full copy at or below N, then every delta above it up
+to N, in order; `cost --revision N` is byte-identical to the full-copy
+reading. A sidecar read before its upgrade (no delta tables) reads its full
+copies as before. All tables are append-only (triggers) and the migration is
+re-runnable (`IF NOT EXISTS`, no `ALTER`, nothing dropped).
+
+**Ticker reprice.** The lane `tick` (after attention observation and the
+ledger sync, §1, §6) reprices only when a rate card has been imported and
+the input fingerprint changed: the digest of the policy, every card
+`(card_id, version, digest)` and every ledger row a reprice reads
+(`valuation_inputs`, replaced by every reprice, CLI or tick). Inputs whose
+serialization exceeds the tick byte budget (8 MiB) are skipped
+(`budget_exhausted`) and left to `accounting reprice`. With no rate card it
+appends nothing, so M12 stays `not_priced` rather than a revision of
+`no_rate_card` rows.
+
+**M12 `repriced_estimated_spend`** (`M12.cost-v1`) and **M14
+`cost_coverage`** (`M14.cost-v1`), through the lane `metrics()` hook, from
+the latest revision: every valued delta entry (all sessions; with `--since`,
+sessions whose earliest rollout started in the window). Both carry `basis:
+published_rate_estimate`, `revision`, `policy`, `ledger_synced_unix_ms`,
+`rate_cards: fixture_only` and the caveat: rate cards are fixture-only by
+owner decision (§4), so an estimate is only as real as the cards imported,
+never a provider charge and never added to one (`never_added_to: M11`).
+- M12 follows `accounting cost` exactly: `value` is the exact decimal
+  `amount` (with `currency`) only when every entry is priced in one
+  currency; otherwise the `partial {currency, priced_amount}` (never the
+  total) or `unavailable` (`mixed_currency {priced_by_currency}`,
+  `no_priced_entries`) estimate object; `estimate` and `coverage` as in
+  `cost`.
+- M14: priced / valued entries, unreduced `"n/d"` (`null
+  empty_denominator` for none), `unpriced` by reason, `unit: entries`. It is
+  count coverage, not a share of money: an unpriced entry may be the
+  expensive one.
+- Before any reprice both are `unavailable not_priced`; without a sidecar
+  `collection_not_run`.
+
+Test `ticker_reprices_only_when_inputs_change` (the real `ticker run`): with
+no card the pass syncs and appends nothing (`not_priced`); card version 1
+→ revision 1, M12 `0.004` USD complete, M14 `1/1`; a pass with nothing
+changed syncs again but records no reprice; version 2 → revision 2 `0.006`,
+one changed row stored. M12/M14 partial and mixed-currency cases and the
+full-copy read-back are in `repricing_uses_rate_effective_at_usage_time`.

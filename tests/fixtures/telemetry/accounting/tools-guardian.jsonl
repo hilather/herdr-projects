@@ -1,0 +1,2 @@
+{"timestamp":"@TS@","type":"session_meta","payload":{"id":"00000000-0000-4000-8000-0000000b5003","session_id":"00000000-0000-4000-8000-0000000b5001","parent_thread_id":"00000000-0000-4000-8000-0000000b5001","thread_source":"guardian_review","timestamp":"@TS@","cwd":"@CWD@","originator":"codex_exec","cli_version":"@VERSION@","source":{"subagent":{"other":"guardian"}},"model_provider":"openai"}}
+{"timestamp":"@TS@","type":"turn_context","payload":{"turn_id":"turn-g1","model":"codex-auto-review","effort":"low"}}
