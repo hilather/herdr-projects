@@ -7,6 +7,20 @@ cards in [slice-cards.md](slice-cards.md). Plan IDs (M-numbers, payload names)
 follow `herdr-telemetry-plan-v1.1` docs 03 and 07. Changing any contract here
 needs a new reviewed revision, not a silent reinterpretation.
 
+## Index
+
+- §0–§8 below: the thin-slice contracts.
+- Sidecar streams (phase 2, card S0): `telemetry.db` is versioned per stream
+  in `telemetry_streams(stream, version)`: `codex` (§5, migrations under
+  `migrations/telemetry/`, also `user_version`), and one stream per lane under
+  `migrations/telemetry/<stream>/`: `ingest`, `accounting`, `quality`,
+  `review`. A reader refuses only a stream newer than it knows. Plan:
+  [phase2-lanes.md](phase2-lanes.md).
+- Lane contracts, each owned by its lane: collection
+  ([contracts-collection.md](contracts-collection.md)), accounting
+  ([contracts-accounting.md](contracts-accounting.md)), quality
+  ([contracts-quality.md](contracts-quality.md)).
+
 ## 0. Common rules
 
 - **Authority.** Telemetry never grants launch, changes budgets, accepts

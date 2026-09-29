@@ -853,6 +853,14 @@ enum TelemetryCommand {
     /// Metric report (M02, M07, M08, M09, M13, M15, M40; attention unavailable). Read-only.
     Report { #[arg(long, conflicts_with = "text")] json:bool, #[arg(long)] text:bool, /// Activity window start, Unix ms
         #[arg(long)] since:Option<i64> },
+    /// Lane A collectors (sidecar stream `ingest`).
+    Collectors { #[command(subcommand)] command:herdr_projects::telemetry::collectors::Command },
+    /// Lane B accounting (sidecar stream `accounting`).
+    Accounting { #[command(subcommand)] command:herdr_projects::telemetry::accounting::Command },
+    /// Lane C quality signals (sidecar stream `quality`).
+    Quality { #[command(subcommand)] command:herdr_projects::telemetry::quality::Command },
+    /// Lane D review capture (sidecar stream `review`).
+    Review { #[command(subcommand)] command:herdr_projects::telemetry::review::Command },
 }
 
 #[cfg(feature="state-store")]
@@ -1236,6 +1244,18 @@ pub fn run() -> Result<()> {
             let report=herdr_projects::telemetry::metrics::report(&ctx.root.join(slug),since)?;
             if json {println!("{}",serde_json::to_string_pretty(&report)?);} else {print!("{}",herdr_projects::telemetry::metrics::text(&report));}
             Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Telemetry{slug,command:lane@(TelemetryCommand::Collectors{..}|TelemetryCommand::Accounting{..}|TelemetryCommand::Quality{..}|TelemetryCommand::Review{..})}=>{
+            project::validate_slug(&slug)?;let dir=ctx.root.join(&slug);
+            use herdr_projects::telemetry::{accounting,collectors,quality,review};
+            print!("{}",match lane {
+                TelemetryCommand::Collectors{command}=>collectors::run(&dir,command)?,
+                TelemetryCommand::Accounting{command}=>accounting::run(&dir,command)?,
+                TelemetryCommand::Quality{command}=>quality::run(&dir,command)?,
+                TelemetryCommand::Review{command}=>review::run(&dir,command)?,
+                _=>unreachable!("matched above"),
+            });Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command}=>{

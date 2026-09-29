@@ -627,6 +627,9 @@ fn telemetry_pass(ctx:&Ctx,log:&Log,slug:&str) {
     last.insert(slug.to_owned(),Instant::now());drop(last);
     use herdr_projects::telemetry::codex;
     if let Err(error)=codex::collect(&ctx.root.join(slug),codex::Budget::TICK,false) {log.line(&format!("{slug}: telemetry collect: {error:#}"));}
+    for lane in &herdr_projects::telemetry::LANES {
+        if let Err(error)=(lane.tick)(&ctx.root.join(slug),codex::Budget::TICK) {log.line(&format!("{slug}: telemetry {} tick: {error:#}",lane.stream));}
+    }
 }
 /// Whole-store check off the ticker's pass: at most once per interval per
 /// project (default one hour, `HERDR_PROJECTS_INTEGRITY_CHECK_SECS`), on its

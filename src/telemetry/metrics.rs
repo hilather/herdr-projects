@@ -76,6 +76,9 @@ pub fn report(project: &Path, since: Option<i64>) -> Result<Value> {
     }
     metrics.insert("M40", metric("M40", json!({"decisions": decisions})));
     for (id, name) in NAMES { if let Some(m) = metrics.get_mut(id) { m["name"] = json!(name); } }
+    // Lane providers (`super::LANES`) add metrics; a lane key replaces a central one.
+    let mut metrics: BTreeMap<String, Value> = metrics.into_iter().map(|(id, m)| (id.to_owned(), m)).collect();
+    for lane in &super::LANES { metrics.extend((lane.metrics)(project, since)?); }
     Ok(json!({"metrics": metrics, "since_unix_ms": since,
         "tasks": {"accepted": accepted, "open": open, "succeeded_without_evidence": without_evidence, "terminal": terminal.len()}}))
 }

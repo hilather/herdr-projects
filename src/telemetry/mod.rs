@@ -1,10 +1,30 @@
 //! Telemetry analytics and read-only projections (docs/telemetry/contracts.md).
 //! Never grants launch, accepts results or changes budgets.
+pub mod accounting;
 pub mod codex;
+pub mod collectors;
 pub mod metrics;
 pub mod outcome;
 pub mod panel;
+pub mod quality;
+pub mod review;
 pub mod sidecar;
+
+/// One phase-2 lane's hooks (docs/telemetry/phase2-lanes.md), each defined in
+/// the lane's own module and registered only here: its sidecar stream and
+/// migrations, metrics merged into `metrics::report`, and ticker work.
+pub struct Lane {
+    pub stream: &'static str,
+    pub migrations: &'static [&'static str],
+    pub metrics: fn(&std::path::Path, Option<i64>) -> anyhow::Result<std::collections::BTreeMap<String, serde_json::Value>>,
+    pub tick: fn(&std::path::Path, codex::Budget) -> anyhow::Result<()>,
+}
+
+macro_rules! lane {
+    ($module:ident) => { Lane { stream: $module::STREAM, migrations: $module::MIGRATIONS, metrics: $module::metrics, tick: $module::tick } };
+}
+
+pub const LANES: [Lane; 4] = [lane!(collectors), lane!(accounting), lane!(quality), lane!(review)];
 
 /// A read-only connection that writes and creates nothing (contracts §0 "Reads").
 /// Fields drop in order: the connection closes before the lock is released.

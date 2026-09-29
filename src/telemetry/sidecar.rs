@@ -1,13 +1,39 @@
 //! `<project>/.state/telemetry.db`: analytics only, never read to grant launch.
-//! Own migration sequence under `migrations/telemetry/`; no cross-database
-//! transaction with the canonical store (contracts §0).
+//! Versioned per stream in `telemetry_streams`: `codex` (the migrations under
+//! `migrations/telemetry/`, whose history is also `user_version`) and one
+//! stream per lane (`super::LANES`, `migrations/telemetry/<stream>/`). No
+//! cross-database transaction with the canonical store (contracts §0).
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-const MIGRATIONS: &[&str] = &[include_str!("../../migrations/telemetry/0001_codex_usage.sql"), include_str!("../../migrations/telemetry/0002_reevaluation.sql")];
+const STREAMS_TABLE: &str = "CREATE TABLE IF NOT EXISTS telemetry_streams (stream TEXT PRIMARY KEY, version INTEGER NOT NULL CHECK (version >= 0)) STRICT;";
+const CODEX: &[&str] = &[include_str!("../../migrations/telemetry/0001_codex_usage.sql"), include_str!("../../migrations/telemetry/0002_reevaluation.sql")];
+
+/// Every stream and its migrations; index + 1 is the stream version.
+fn streams() -> impl Iterator<Item = (&'static str, &'static [&'static str])> {
+    std::iter::once(("codex", CODEX)).chain(super::LANES.iter().map(|lane| (lane.stream, lane.migrations)))
+}
+
+/// Stored stream versions. A sidecar from before streams has only `codex` = `user_version`.
+fn versions(db: &Connection) -> Result<BTreeMap<String, usize>> {
+    if !db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='telemetry_streams')", [], |r| r.get(0))? {
+        return Ok(BTreeMap::from([("codex".to_owned(), db.query_row("PRAGMA user_version", [], |r| r.get(0))?)]));
+    }
+    Ok(db.prepare("SELECT stream,version FROM telemetry_streams")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Refuse only a stream stored newer than this binary knows (an unknown stream knows 0).
+fn check(versions: &BTreeMap<String, usize>) -> Result<()> {
+    for (stream, &version) in versions {
+        let known = streams().find(|s| s.0 == stream).map_or(0, |s| s.1.len());
+        if version > known { bail!("telemetry sidecar stream {stream} version {version} is newer than this binary (knows {known})"); }
+    }
+    Ok(())
+}
 
 /// Whether a sidecar read without migrating has the 0002 `reevaluation` column.
 fn reevaluation_column(db: &Connection) -> rusqlite::Result<&'static str> {
@@ -37,15 +63,22 @@ pub fn open(project: &Path, create: bool) -> Result<Option<Connection>> {
     let mut db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
     db.busy_timeout(std::time::Duration::from_secs(5))?;
     db.pragma_update(None, "journal_mode", "WAL")?;
-    let version: usize = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version > MIGRATIONS.len() {
-        bail!("telemetry sidecar schema {version} is newer than this binary");
+    // One transaction: a pre-streams sidecar gains `telemetry_streams` with
+    // `codex` = `user_version`, then each stream migrates from its version.
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let versions = versions(&tx)?;
+    check(&versions)?;
+    tx.execute_batch(STREAMS_TABLE)?;
+    for (stream, migrations) in streams() {
+        let from = versions.get(stream).copied().unwrap_or(0);
+        if from > 0 { tx.execute("INSERT OR IGNORE INTO telemetry_streams(stream,version) VALUES(?1,?2)", rusqlite::params![stream, from])?; }
+        for (index, migration) in migrations.iter().enumerate().skip(from) {
+            tx.execute_batch(migration)?;
+            tx.execute("INSERT INTO telemetry_streams(stream,version) VALUES(?1,?2) ON CONFLICT(stream) DO UPDATE SET version=excluded.version",
+                rusqlite::params![stream, index + 1])?;
+        }
     }
-    for migration in &MIGRATIONS[version..] {
-        let tx = db.transaction()?;
-        tx.execute_batch(migration)?;
-        tx.commit()?;
-    }
+    tx.commit()?;
     Ok(Some(db))
 }
 
@@ -59,11 +92,21 @@ pub(crate) fn read(project: &Path) -> Result<Option<super::ReadOnly>> {
         Ok(_) => {}
     }
     let db = super::read_only(&path)?;
-    let version: usize = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version == 0 || version > MIGRATIONS.len() {
-        bail!("telemetry sidecar schema {version} is not readable by this binary");
+    let versions = versions(&db)?;
+    check(&versions)?;
+    if versions.get("codex").is_none_or(|&version| version == 0) {
+        bail!("telemetry sidecar schema 0 is not readable by this binary");
     }
     Ok(Some(db))
+}
+
+/// `telemetry <slug> <lane> status`: the stream's stored version. Read-only.
+pub fn status(project: &Path, stream: &str) -> Result<Value> {
+    let version = match read(project)? {
+        None => unavailable("collection_not_run"),
+        Some(db) => json!(versions(&db)?.get(stream).copied().unwrap_or(0)),
+    };
+    Ok(json!({"stream": stream, "version": version}))
 }
 
 /// Per-attempt usage (contracts §4 `usage`) and per-rollout metadata. Read-only.
