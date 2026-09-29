@@ -1820,6 +1820,7 @@ fn shadow_budget_bridge_matches_doc05_goldens() {
          &json!({"status": "complete", "currency": "USD", "amount": "70"}), &json!("published_rate_estimate")));
     assert_eq!(m04["coverage"], json!({"entries": 2, "priced": 2, "unpriced": {}, "attempts": 2, "attempts_without_usage": {}}));
     assert!(f.text(&["report"]).lines().any(|l| l == "M04 cost_per_accepted_task 70/1"));
+}
 
 /// Session id of the one record in `priced-before.jsonl` (1,000 input + 500 output, gpt-5.5).
 const PRICED_SID: &str = "00000000-0000-4000-8000-0000000b3001";
