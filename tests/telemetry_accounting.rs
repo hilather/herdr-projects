@@ -172,10 +172,11 @@ const ABSENT: &str = "00000000-0000-4000-8000-0000000b7fff";
 
 /// Contracts-collection A4 → B2: a spawned subagent (30) whose
 /// `parent_thread_id` names a collected parent (100) is linked under it with
-/// that basis, certified `fixture`, and kept in a separate `children`
-/// subtotal: the parent stays 100, never 130. A fork (40) of the same parent
-/// is linked by `forked_from_id`, but a fork may replay its parent's records,
-/// so its inclusion and the children subtotal are `fork_replay_not_certified`,
+/// that basis, certified `live` (run2 §2, B12), and kept in a separate
+/// `children` subtotal: the parent stays 100, never 130. A fork (40) of the
+/// same parent is linked by `forked_from_id` (`live`), but it names no
+/// `history_base` (not the live shape, which replays nothing), so its
+/// inclusion and the children subtotal stay `fork_replay_not_certified`,
 /// never a sum. A subagent naming a parent that was not collected (20) is
 /// `parent_not_collected`; a guardian (50) naming the parent by its thread
 /// lineage is linked with that basis, certified `live`, `separate`. Every
@@ -193,13 +194,13 @@ fn child_sessions_link_to_parent_without_double_count() {
     let (sessions, _) = f.cli_args(&["accounting", "sessions"]);
     let of = |sessions: &serde_json::Value, sid: &str| sessions["sessions"].as_array().unwrap().iter().find(|s| s["session_id"] == sid).cloned()
         .unwrap_or_else(|| panic!("{sid} in {sessions}"));
-    let spawned = json!({"session_id": SPAWNED, "role": "subagent", "link_basis": "parent_thread_id", "certified": "fixture", "total_tokens": 30, "inclusion": "separate"});
+    let spawned = json!({"session_id": SPAWNED, "role": "subagent", "link_basis": "parent_thread_id", "certified": "live", "total_tokens": 30, "inclusion": "separate"});
     let parent = of(&sessions, PARENT);
     assert_eq!((&parent["role"], &parent["linkage"], &parent["parent"], &parent["total_tokens"]), (&json!("primary"), &json!("root"), &json!(null), &json!(100)));
     assert_eq!(parent["children"], json!({"sessions": [spawned], "total_tokens": 30}));
     let child = of(&sessions, SPAWNED);
     assert_eq!((&child["role"], &child["linkage"], &child["parent"], &child["total_tokens"]), (&json!("subagent"), &json!("linked_child"),
-        &json!({"session_id": PARENT, "link_basis": "parent_thread_id", "certified": "fixture"}), &json!(30)));
+        &json!({"session_id": PARENT, "link_basis": "parent_thread_id", "certified": "live"}), &json!(30)));
     assert_eq!(child.get("children"), None);
     assert_eq!(sessions["rollup"], json!({"sessions": 100, "linked_children": 30, "unlinked_children": 0, "incomplete_sessions": 0}), "100 + 30 apart, never 130 in the parent");
     let report = f.report();
@@ -215,12 +216,12 @@ fn child_sessions_link_to_parent_without_double_count() {
     let not_certified = json!({"status": "unavailable", "reason": "fork_replay_not_certified"});
     assert_eq!(of(&sessions, PARENT)["total_tokens"], 100);
     assert_eq!(of(&sessions, PARENT)["children"], json!({"sessions": [spawned,
-        {"session_id": FORKED, "role": "fork", "link_basis": "forked_from_id", "certified": "fixture", "total_tokens": 40, "inclusion": not_certified},
+        {"session_id": FORKED, "role": "fork", "link_basis": "forked_from_id", "certified": "live", "total_tokens": 40, "inclusion": not_certified},
         {"session_id": GUARDIAN_SID, "role": "guardian", "link_basis": "thread_parent_thread_id", "certified": "live", "total_tokens": 50, "inclusion": "separate"}],
         "total_tokens": not_certified}));
     let fork = of(&sessions, FORKED);
     assert_eq!((&fork["role"], &fork["linkage"], &fork["parent"], &fork["total_tokens"]), (&json!("fork"), &json!("linked_child"),
-        &json!({"session_id": PARENT, "link_basis": "forked_from_id", "certified": "fixture"}), &json!(40)));
+        &json!({"session_id": PARENT, "link_basis": "forked_from_id", "certified": "live"}), &json!(40)));
     let orphan = of(&sessions, ORPHAN);
     assert_eq!((&orphan["role"], &orphan["linkage"], &orphan["parent"], &orphan["total_tokens"]), (&json!("subagent"), &json!("unlinked_child"),
         &json!({"status": "unavailable", "reason": "parent_not_collected", "session_id": ABSENT}), &json!(20)));
@@ -849,6 +850,70 @@ fn shared_window_across_homes_is_flagged_not_summed() {
     assert_eq!(f.cli_args(&["accounting", "quota", "--json"]).1, first);
 }
 
+/// Codex-live run 2 §6 (B12): the live `codex` primary window (10,080 min,
+/// 43%) reported `resets_at` R in most snapshots but R + 5 s in one, and
+/// `plan_type: null` in the `exec` sessions. Home A reads 43 (R, `pro`) → 43
+/// (R + 5 s, `pro`) → 44 (R − 5 s, `null`) → 45.5 (R, `null`): one window
+/// (`first_observation`, 4 trusted observations, increase 2.5, remaining
+/// 54.5, plan `pro`), never `reset_moved` or `window_regressed`. Home B's one
+/// snapshot at R + 5 s is the same provider window within the 60 s tolerance:
+/// one shared-window candidate (reset R, the earliest), never merged. A's
+/// headroom 54.5 is its own. Then A reads 46 at R + 120 s (beyond the
+/// tolerance, before R: `reset_moved`, a second window) and 47 back at R
+/// (`window_regressed`, no window): headroom 54 from the new window.
+#[test]
+fn resets_jitter_and_null_plan_stay_one_window() {
+    let f = Fixture::new();
+    let d = f.decided;
+    let other = fs::canonicalize(f.tmp.path()).unwrap().join("other-home");
+    let r = d / 1000 + 3_600;
+    quota_rollout(&f, "jitter", "quota-jitter.jsonl", d - 240_000, &[d - 240_000, d - 180_000, d - 120_000, d - 60_000], &[r, r + 5, r - 5, r]);
+    quota_rollout_in(&f, &other, "jitter-child", "quota-jitter-child.jsonl", d - 90_000, &[d - 90_000], &[r + 5]);
+    f.cli("collect");
+    assert_eq!(f.cli_args(&["accounting", "sync"]).0["quota_windows"], 2);
+    let (quota, _) = f.cli_args(&["accounting", "quota", "--json"]);
+    let (a, b) = (digest(&f.home), digest(&other));
+    let id = |account: &str, resets: i64| format!("codex:{account}:codex:primary:{}", resets * 1000);
+    let window = |account: &str, resets: i64, evidence: &str, (first, last): (i64, i64), [first_used, used, remaining, increase]: [&str; 4], plan: Option<&str>,
+        observations: i64| json!({"window_id": id(account, resets), "service": "codex", "account": account, "limit_id": "codex", "window_kind": "primary",
+            "unit": "percent", "window_minutes": 10_080, "window_start_unix_ms": resets * 1000 - 604_800_000, "resets_unix_ms": resets * 1000,
+            "start_evidence": evidence, "first_observed_unix_ms": first, "last_observed_unix_ms": last, "first_used": first_used, "used": used,
+            "remaining": remaining, "observed_increase": increase, "plan_type": plan, "observations": observations, "flagged": 0});
+    let of = |quota: &serde_json::Value, account: &str| quota["windows"].as_array().unwrap().iter().filter(|w| w["account"] == account).cloned().collect::<Vec<_>>();
+    let a_window = window(&a, r, "first_observation", (d - 240_000, d - 60_000), ["43", "45.5", "54.5", "2.5"], Some("pro"), 4);
+    assert_eq!(of(&quota, &a), std::slice::from_ref(&a_window));
+    assert_eq!(of(&quota, &b), [window(&b, r + 5, "first_observation", (d - 90_000, d - 90_000), ["43", "43", "57", "0"], Some("pro"), 1)]);
+    assert_eq!(quota["observations"], json!({"primary": {"trusted": 5}, "secondary": {"not_reported": 5}}));
+    // Every jittered snapshot of A is trusted in its one window, keeping its own reported reset.
+    let observed: Vec<(i64, String, String)> = f.sidecar().prepare("SELECT resets_unix_ms,trust,window_id FROM quota_window_observations
+        WHERE account=?1 AND window_kind='primary' ORDER BY observed_unix_ms").unwrap()
+        .query_map([&a], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().map(Result::unwrap).collect();
+    assert_eq!(observed, [r, r + 5, r - 5, r].map(|resets| (resets * 1000, "trusted".to_owned(), id(&a, r))));
+    let mut members = [(a.clone(), id(&a, r)), (b.clone(), id(&b, r + 5))];
+    members.sort();
+    assert_eq!(quota["shared_window_candidates"], json!([{"limit_id": "codex", "window_kind": "primary", "window_minutes": 10_080, "resets_unix_ms": r * 1000,
+        "accounts": members.clone().map(|m| m.0), "window_ids": members.clone().map(|m| m.1), "evidence": "same_limit_kind_minutes_resets", "merged": false}]));
+    let primary = headroom(&f)["windows"][0].clone();
+    assert_eq!(primary, json!({"limit_id": "codex", "window_kind": "primary", "unit": "percent", "window_id": id(&a, r), "window_minutes": 10_080,
+        "resets_unix_ms": r * 1000, "observed_unix_ms": d - 60_000, "age_ms": 60_000, "shared_window_candidates": members.clone().map(|m| m.0),
+        "value": "54.5", "used": "45.5", "freshness": "fresh"}));
+
+    // Beyond the tolerance: a moved reset opens a window; going back to R regresses.
+    quota_rollout(&f, "moved", "quota-moved.jsonl", d - 30_000, &[d - 30_000, d - 20_000], &[r + 120, r]);
+    f.cli("collect");
+    assert_eq!(f.cli_args(&["accounting", "sync"]).0["quota_windows"], 3);
+    let (quota, first) = f.cli_args(&["accounting", "quota", "--json"]);
+    assert_eq!(of(&quota, &a), [a_window, window(&a, r + 120, "reset_moved", (d - 30_000, d - 30_000), ["46", "46", "54", "0"], None, 1)]);
+    assert_eq!(quota["observations"], json!({"primary": {"trusted": 6, "window_regressed": 1}, "secondary": {"not_reported": 7}}));
+    let primary = headroom(&f)["windows"][0].clone();
+    assert_eq!((&primary["window_id"], &primary["value"], &primary["age_ms"], primary.get("shared_window_candidates")),
+        (&json!(id(&a, r + 120)), &json!("54"), &json!(30_000), None));
+    // Replay leaves everything byte-identical.
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "quota", "--json"]).1, first);
+}
+
 /// Herdr stand-in: logs every call with its socket, answers `agent list` from
 /// `$HOME/agents.json`, and exits without a reply when that file is absent
 /// (server not answering). Anything else is refused.
@@ -1036,8 +1101,8 @@ fn drop_a6_tables(f: &Fixture) {
 /// `wait`) whatever the replay; an output whose call was not seen (call-9) is
 /// counted apart; call-5 has no output. Six exec items are six execution
 /// instances: five are inferred to a call by turn and time, one (turn 3) is
-/// unattributed. Outcomes: exit 0 ×3 succeeded, exit 2 failed, a NULL exit
-/// code and a `failed` status (not certified) are unknown → M17 3/4. M18 has
+/// unattributed. Outcomes: exit 0 ×3 succeeded, exit 2 failed, `failed` with
+/// exit 1 failed (certified live, B12), a NULL exit code unknown → M17 3/5. M18 has
 /// no honest execution end − start; the call → output times 37010 (approval
 /// wait), 1000, 2500 and 300 ms are shown apart: nearest-rank p50 1000, p95
 /// 37010. The accepted stage is not exposed.
@@ -1063,12 +1128,13 @@ fn tool_volume_success_and_latency_are_honest() {
     let coverage = json!({"sessions": 1, "observed": 1, "pending_reread": 0, "predates_collection": 0, "excluded": {"unbound": 1}});
     assert_eq!(tools["coverage"], coverage);
     assert_eq!(tools["sessions"], json!([{"session_id": TOOLS_SID, "attempt_ids": [f.attempt], "tools": {"issued": 5, "without_output": 1,
-        "outputs_without_call": 1, "executed": 6, "attributed": 5, "unattributed": 1, "succeeded": 3, "failed": 1, "unknown": 2}}]));
+        "outputs_without_call": 1, "executed": 6, "attributed": 5, "unattributed": 1, "mcp_calls": 0, "succeeded": 3, "failed": 2, "unknown": 1,
+        "declined_or_aborted": 0}}]));
 
     let m16 = &tools["metrics"]["M16"];
     assert_eq!((&m16["definition"], &m16["name"]), (&json!("M16.tools-v1"), &json!("tool_call_volume")));
     // No attention sample and no guardian: no call is inferred accepted; all 5 stay unknown, never accepted.
-    assert_eq!(m16["value"], json!({"issued": 5, "accepted": {"status": "inferred", "count": 0, "unknown": 5}, "executed": 6}));
+    assert_eq!(m16["value"], json!({"issued": 5, "accepted": {"status": "inferred", "count": 0, "unknown": 5, "declined_or_aborted": 0}, "executed": 6}));
     assert_eq!((&m16["accepted"]["label"], &m16["accepted"]["by_basis"], &m16["accepted"]["unknown"]), (&json!("inferred"), &json!({}), &json!(5)));
     let issued = &m16["issued"];
     assert_eq!((&issued["calls"], &issued["by_name"], &issued["name_unreported"], &issued["by_status"], &issued["status_unreported"],
@@ -1076,16 +1142,17 @@ fn tool_volume_success_and_latency_are_honest() {
         (&json!(5), &json!({"exec": 4, "wait": 1}), &json!(0), &json!({"completed": 4}), &json!(1), &json!(1), &json!(1)));
     let executed = &m16["executed"];
     assert_eq!((&executed["executions"], &executed["scope"], &executed["by_source"], &executed["source_unreported"]),
-        (&json!(6), &json!("command_execution"), &json!({"unified_exec_startup": 6}), &json!(0)));
+        (&json!(6), &json!(["command_execution", "mcp"]), &json!({"unified_exec_startup": 6}), &json!(0)));
     let attribution = &executed["attribution"];
     assert_eq!((&attribution["basis"], &attribution["by_call_name"], &attribution["name_unreported"], &attribution["unattributed"]),
         (&json!("inferred"), &json!({"exec": 5}), &json!(0), &json!(1)));
-    assert_eq!((&m16["certified"]["mcp_calls"], &m16["coverage"]), (&json!("not_collected"), &coverage));
+    assert_eq!((&executed["by_scope"], &m16["mcp"]["calls"]), (&json!({"command_execution": 6, "mcp": 0}), &json!(0)));
+    assert_eq!((&m16["certified"]["mcp_calls"], &m16["coverage"]), (&json!("live"), &coverage));
 
     let m17 = &tools["metrics"]["M17"];
     assert_eq!((&m17["value"], &m17["numerator"], &m17["denominator"], &m17["succeeded"], &m17["failed"]),
-        (&json!("3/4"), &json!(3), &json!(4), &json!(3), &json!(1)));
-    assert_eq!(m17["unknown"], json!({"executions": 2, "by_reason": {"exit_code_unknown": 1, "status_not_certified": 1}}));
+        (&json!("3/5"), &json!(3), &json!(5), &json!(3), &json!(2)));
+    assert_eq!(m17["unknown"], json!({"executions": 1, "by_reason": {"exit_code_unknown": 1}}));
     assert_eq!((&m17["pending_calls"], &m17["cancelled"], &m17["timed_out"]),
         (&json!(1), &unavailable("cancellation_not_exposed"), &unavailable("timeout_not_exposed")));
 
@@ -1108,9 +1175,9 @@ fn tool_volume_success_and_latency_are_honest() {
     for id in ["M16", "M17", "M18"] { assert_eq!(report["metrics"][id], tools["metrics"][id], "{id}"); }
     let text = f.text(&["accounting", "tools"]);
     for line in ["coverage 1 sessions: 1 observed, 0 pending_reread, 0 predates_collection; excluded unbound 1".to_owned(),
-        format!("session {TOOLS_SID} attempts={}: issued 5 (1 without output, 1 outputs without call), executed 6 (5 inferred to a call, 1 unattributed), succeeded 3 failed 1 unknown 2", f.attempt),
+        format!("session {TOOLS_SID} attempts={}: issued 5 (1 without output, 1 outputs without call), executed 6 (5 inferred to a call, 1 unattributed), succeeded 3 failed 2 unknown 1", f.attempt),
         "M16 tool_call_volume issued 5, accepted 0 inferred (5 unknown), executed 6".to_owned(),
-        "M17 tool_execution_success 3/4 (unknown 2 excluded, pending calls 1)".to_owned(),
+        "M17 tool_execution_success 3/5 (unknown 1 excluded, pending calls 1)".to_owned(),
         "M18 tool_latency_p95 n/a (execution_duration_not_exposed)".to_owned(),
         "call_to_output_ms p95 37010 of 4 calls (includes approval wait; not execution time)".to_owned()] {
         assert!(text.lines().any(|l| l == line), "{line} in {text}");
@@ -1190,7 +1257,7 @@ fn accepted_stage_is_inferred_from_waits_and_guardians() {
     // The guardian alone: call-4 is auto-reviewed, the other four unknown.
     let (tools, _) = f.cli_args(&["accounting", "tools", "--json"]);
     assert_eq!(tools["coverage"], json!({"sessions": 2, "observed": 2, "pending_reread": 0, "predates_collection": 0, "excluded": {}}));
-    assert_eq!(tools["metrics"]["M16"]["value"], json!({"issued": 5, "accepted": {"status": "inferred", "count": 1, "unknown": 4}, "executed": 6}));
+    assert_eq!(tools["metrics"]["M16"]["value"], json!({"issued": 5, "accepted": {"status": "inferred", "count": 1, "unknown": 4, "declined_or_aborted": 0}, "executed": 6}));
     assert_eq!(tools["metrics"]["M16"]["accepted"]["by_basis"], json!({"auto_review": 1}));
 
     // The attempt's launch receipt (as its start records it) and three attention
@@ -1210,7 +1277,7 @@ fn accepted_stage_is_inferred_from_waits_and_guardians() {
 
     let (tools, first) = f.cli_args(&["accounting", "tools", "--json"]);
     let m16 = &tools["metrics"]["M16"];
-    assert_eq!(m16["value"], json!({"issued": 5, "accepted": {"status": "inferred", "count": 2, "unknown": 3}, "executed": 6}));
+    assert_eq!(m16["value"], json!({"issued": 5, "accepted": {"status": "inferred", "count": 2, "unknown": 3, "declined_or_aborted": 0}, "executed": 6}));
     assert_eq!((&m16["accepted"]["label"], &m16["accepted"]["calls"], &m16["accepted"]["by_basis"], &m16["accepted"]["unknown"]),
         (&json!("inferred"), &json!(2), &json!({"auto_review": 1, "human_routed": 1}), &json!(3)));
     // Per host: every sample is of the one execution home.
@@ -1222,6 +1289,200 @@ fn accepted_stage_is_inferred_from_waits_and_guardians() {
     f.cli("collect");
     assert_eq!(f.cli_args(&["accounting", "tools", "--json"]).1, first);
     assert_eq!(TOOLS_GUARDIAN, tools["sessions"][1]["session_id"]);
+}
+
+/// The live run 2 conformance fixtures (codex-live-0.154.0-run2.md): its tool
+/// session and its `codex exec fork`, with their session ids.
+const LIVE2_TOOLS: &str = "../codex-conformance/live2-tools.jsonl";
+const LIVE2_FORK: &str = "../codex-conformance/live2-fork.jsonl";
+const LIVE2_SID: &str = "00000000-0000-4000-8000-0000000b2001";
+const LIVE2_FORK_SID: &str = "00000000-0000-4000-8000-0000000b2002";
+
+/// Plant a live-2 conformance rollout as session `sid`, bound to the attempt;
+/// a fork's `@ORIGIN@` becomes `SID` and `@ORIGIN_END@` the planted origin's length.
+fn plant_live2(f: &Fixture, name: &str, fixture: &str, sid: &str, origin: Option<&Path>) -> std::path::PathBuf {
+    let mut text = fs::read_to_string(Path::new(FIXTURES).join(fixture)).unwrap().replace("@SID@", sid).replace("@ORIGIN@", SID);
+    if let Some(origin) = origin { text = text.replace("@ORIGIN_END@", &fs::metadata(origin).unwrap().len().to_string()); }
+    let path = f.tmp.path().join(format!("{name}.jsonl"));
+    fs::write(&path, text).unwrap();
+    f.rollout(&f.home, name, &[path.to_str().unwrap()], &f.worktree(), f.decided + 1_000, "0.154.0")
+}
+
+/// Live run 2 (§3–§4) → B12 over the `live2-tools` shapes: calls m1 (6.7 →
+/// 6.765 s, carrying MCP item exec-m1), s1 (12.673 → 15.733, `sleep`,
+/// completed exit 0), f1 (17.494 → 17.625, `failed` exit 2), spawn_agent c1
+/// (20 → 20.086) and wait_agent c2 (27 → 28.078) in namespace
+/// `collaboration`, then turn 2's d1 (71.5 → 80.243) whose declined approval
+/// aborted the turn at 80.248. M16: 6 issued (the MCP call once, with its
+/// exec call), accepted 0, unknown 5, d1 `declined_or_aborted`; executed 3
+/// (2 command executions, 1 MCP call). M17 `2/3`: command 1/2 (the `failed`
+/// item is a certified failure), MCP 1/1 (`is_error` false, completed). M18
+/// stays unavailable (the MCP duration is not run time); call → output 65,
+/// 3060, 131, 86, 1078, 8743 ms → p50 131, p95 8743; the MCP call's carrier
+/// 65 ms apart. A `blocked` wait inside d1 does not make it accepted, while
+/// one inside s1 does (`human_routed`). Without the A8 tables (read-only) or
+/// before a source's re-read, M16–M18 are unavailable, never partial.
+#[test]
+fn live_run2_failures_aborts_and_mcp_calls_count_once() {
+    let f = Fixture::new();
+    let unavailable = |reason: &str| json!({"status": "unavailable", "reason": reason});
+    plant_live2(&f, "live2-tools", LIVE2_TOOLS, LIVE2_SID, None);
+    f.cli("collect");
+    let (tools, fresh) = f.cli_args(&["accounting", "tools", "--json"]);
+    let coverage = json!({"sessions": 1, "observed": 1, "pending_reread": 0, "predates_collection": 0, "excluded": {}});
+    assert_eq!(tools["coverage"], coverage);
+    assert_eq!(tools["sessions"], json!([{"session_id": LIVE2_SID, "attempt_ids": [f.attempt], "tools": {"issued": 6, "without_output": 0,
+        "outputs_without_call": 0, "executed": 3, "attributed": 2, "unattributed": 0, "mcp_calls": 1, "succeeded": 2, "failed": 1, "unknown": 0,
+        "declined_or_aborted": 1}}]));
+
+    let m16 = &tools["metrics"]["M16"];
+    assert_eq!(m16["value"], json!({"issued": 6, "accepted": {"status": "inferred", "count": 0, "unknown": 5, "declined_or_aborted": 1}, "executed": 3}));
+    let issued = &m16["issued"];
+    assert_eq!((&issued["calls"], &issued["by_name"], &issued["by_status"], &issued["status_unreported"], &issued["by_namespace"], &issued["mcp_without_call"]),
+        (&json!(6), &json!({"exec": 4, "spawn_agent": 1, "wait_agent": 1}), &json!({"completed": 4}), &json!(2), &json!({"collaboration": 2}), &json!(0)));
+    assert_eq!(m16["accepted"]["declined_or_aborted"], json!({"calls": 1, "by_basis": {"last_output_before_abort": 1}}));
+    let executed = &m16["executed"];
+    assert_eq!((&executed["executions"], &executed["by_scope"], &executed["by_source"], &executed["attribution"]["by_call_name"], &executed["attribution"]["unattributed"]),
+        (&json!(3), &json!({"command_execution": 2, "mcp": 1}), &json!({"unified_exec_startup": 2}), &json!({"exec": 2}), &json!(0)));
+    assert_eq!((&m16["mcp"]["calls"], &m16["mcp"]["by_server"], &m16["mcp"]["server_or_tool_unreported"], &m16["mcp"]["carrier"]["matched"],
+        &m16["mcp"]["carrier"]["unmatched"], &m16["mcp"]["carrier"]["basis"]),
+        (&json!(1), &json!({"live2_stub_server": {"live2_noop_tool": 1}}), &json!(0), &json!(1), &json!(0), &json!("inferred")));
+    assert_eq!((&m16["collaboration"]["calls"], &m16["collaboration"]["spawned_threads"], &m16["collaboration"]["collab_items"]), (&json!(2), &json!(1), &json!(1)));
+    assert_eq!(m16["certified"], json!({"calls": "live", "call_status": "live for custom_tool_call, fixture for function_call", "exec_items": "live",
+        "mcp_calls": "live", "turn_aborts": "live", "namespaces": "live"}));
+
+    let m17 = &tools["metrics"]["M17"];
+    let none = json!({"executions": 0, "by_reason": {}});
+    assert_eq!((&m17["value"], &m17["numerator"], &m17["denominator"], &m17["unknown"], &m17["pending_calls"]),
+        (&json!("2/3"), &json!(2), &json!(3), &none, &json!(0)));
+    assert_eq!(m17["by_scope"], json!({"command_execution": {"succeeded": 1, "failed": 1, "unknown": none}, "mcp": {"succeeded": 1, "failed": 0, "unknown": none}}));
+
+    let m18 = &tools["metrics"]["M18"];
+    assert_eq!((&m18["value"], &m18["mcp_duration"]["value"]), (&unavailable("execution_duration_not_exposed"), &unavailable("execution_duration_not_exposed")));
+    let wall = &m18["call_to_output_ms"];
+    let dist = |samples: i64, p50: i64, p95: i64, max: i64| json!({"samples": samples, "p50_ms": p50, "p95_ms": p95, "max_ms": max});
+    assert_eq!((&wall["samples"], &wall["p50_ms"], &wall["p95_ms"], &wall["max_ms"]), (&json!(6), &json!(131), &json!(8743), &json!(8743)));
+    assert_eq!(wall["by_name"], json!({"exec": dist(4, 131, 8743, 8743), "spawn_agent": dist(1, 86, 86, 86), "wait_agent": dist(1, 1078, 1078, 1078)}));
+    let mcp = &wall["mcp"];
+    assert_eq!((&mcp["samples"], &mcp["p50_ms"], &mcp["p95_ms"], &mcp["max_ms"], &mcp["by_server"]),
+        (&json!(1), &json!(65), &json!(65), &json!(65), &json!({"live2_stub_server": {"live2_noop_tool": dist(1, 65, 65, 65)}})));
+    let report = f.report();
+    for id in ["M16", "M17", "M18"] { assert_eq!(report["metrics"][id], tools["metrics"][id], "{id}"); }
+    let text = f.text(&["accounting", "tools"]);
+    for line in ["M16 tool_call_volume issued 6, accepted 0 inferred (5 unknown), executed 3",
+        "M16 mcp_calls 1 [live2_stub_server/live2_noop_tool 1] (counted once with their exec call), declined_or_aborted 1",
+        "M17 tool_execution_success 2/3 (unknown 0 excluded, pending calls 0)",
+        "M17 by scope: command_execution 1 succeeded 1 failed 0 unknown; mcp 1 succeeded 0 failed 0 unknown"] {
+        assert!(text.lines().any(|l| l == line), "{line} in {text}");
+    }
+
+    // A `blocked` wait inside s1 (13–13 s) and one inside d1 (75–75 s), planted as an observation pass would.
+    let state = rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap();
+    let receipt = json!({"version": 2, "attempt": f.attempt, "operation": "op-live2", "route": {"machine": "", "socket": "/nonexistent/herdr.sock",
+        "workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1", "cwd": f.worktree()}, "terminal": "term-1",
+        "session": {"device": 1, "inode": 2, "born_secs": 3, "born_nanos": 4}, "agent": {"kind": "codex", "name": "worker"}, "observed_unix_ms": Y2030});
+    state.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    state.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_started','op-live2',1,1,?1)", [receipt.to_string()]).unwrap();
+    for (ms, label) in [(0, "working"), (13_000, "blocked"), (14_000, "working"), (75_000, "blocked"), (76_000, "working")] {
+        f.sidecar().execute("INSERT INTO attention_samples(attempt_id,observed_unix_ms,state,gap,interval_ms,source) VALUES(?1,?2,?3,NULL,30000,'herdr-agent-list-v1')",
+            rusqlite::params![f.attempt, Y2030 + ms, label]).unwrap();
+    }
+    let (tools, waited) = f.cli_args(&["accounting", "tools", "--json"]);
+    let m16 = &tools["metrics"]["M16"];
+    assert_eq!(m16["value"], json!({"issued": 6, "accepted": {"status": "inferred", "count": 1, "unknown": 4, "declined_or_aborted": 1}, "executed": 3}));
+    assert_eq!((&m16["accepted"]["by_basis"], &m16["accepted"]["declined_or_aborted"]["by_basis"]),
+        (&json!({"human_routed": 1}), &json!({"last_output_before_abort": 1})));
+
+    // A read-only sidecar without the A8 tables: unavailable, never a count without MCP calls or aborts.
+    f.sidecar().execute_batch("DROP TABLE rollout_forks; DROP TABLE rollout_turn_ends; DROP TABLE codex_turn_aborts; DROP TABLE codex_mcp_calls;
+        DROP TABLE codex_agent_items; DROP TABLE codex_tool_namespaces; DROP TABLE codex_fork_reconciliation;
+        UPDATE telemetry_streams SET version=7 WHERE stream='ingest';").unwrap();
+    let (tools, _) = f.cli_args(&["accounting", "tools", "--json"]);
+    let coverage = json!({"sessions": 1, "observed": 0, "pending_reread": 0, "predates_collection": 1, "excluded": {}});
+    assert_eq!((&tools["coverage"], &tools["sessions"][0]["tools"]), (&coverage, &unavailable("predates_collection")));
+    for id in ["M16", "M17", "M18"] { assert_eq!(tools["metrics"][id]["value"], unavailable("predates_collection"), "{id}"); }
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 7}), "a read does not migrate");
+    // The next collect migrates and re-reads the rollout: identical to before.
+    f.cli("collect");
+    assert_eq!(f.cli_args(&["accounting", "tools", "--json"]).1, waited);
+    // A source read before A8 (no `rollout_forks` row) waits for its re-read.
+    f.sidecar().execute_batch("DELETE FROM rollout_forks").unwrap();
+    let (tools, _) = f.cli_args(&["accounting", "tools", "--json"]);
+    assert_eq!((&tools["coverage"]["pending_reread"], &tools["metrics"]["M17"]["value"]), (&json!(1), &unavailable("pending_reread")));
+    f.cli("collect");
+    assert_eq!(f.cli_args(&["accounting", "tools", "--json"]).1, waited);
+    assert_ne!(waited, fresh);
+}
+
+/// Live run 2 §1 → B12: a `codex exec fork` (`live2-fork`, own record 320)
+/// of a collected origin (`complete`, 1680) names `history_base`, the live
+/// shape that replays no records, so it is a `linked_child` (`forked_from_id`,
+/// `live`) with inclusion `separate` and its reconciliation states: the
+/// origin stays 1680, children 320, rollup 1680 / 320 / 0, never 1680 + 2000
+/// (the fork's reported thread total, which includes the origin's). Before the
+/// origin is collected the fork is `parent_not_collected`. Without the A8
+/// tables (read-only) its inclusion, the children total and the linked rollup
+/// are `predates_collection`; before its re-read `pending_reread`.
+#[test]
+fn live_fork_is_separate_and_never_adds_its_reported_totals() {
+    let f = Fixture::new();
+    let origin = f.tmp.path().join("origin.jsonl");
+    let text: String = ["head.jsonl", "tail.jsonl"].iter().map(|p| fs::read_to_string(Path::new(FIXTURES).join(p)).unwrap()).collect();
+    fs::write(&origin, text).unwrap();
+    // The origin's length as it will be planted (same placeholders substituted), then held back.
+    let planted = f.rollout(&f.home, "complete", &[origin.to_str().unwrap()], &f.worktree(), f.decided + 1_000, "0.154.0");
+    let held = f.tmp.path().join("complete.held");
+    fs::rename(&planted, &held).unwrap();
+    plant_live2(&f, "live2-fork", LIVE2_FORK, LIVE2_FORK_SID, Some(&held));
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let (sessions, _) = f.cli_args(&["accounting", "sessions"]);
+    let of = |sessions: &serde_json::Value, sid: &str| sessions["sessions"].as_array().unwrap().iter().find(|s| s["session_id"] == sid).cloned()
+        .unwrap_or_else(|| panic!("{sid} in {sessions}"));
+    let fork = of(&sessions, LIVE2_FORK_SID);
+    assert_eq!((&fork["role"], &fork["linkage"], &fork["parent"], &fork["total_tokens"]), (&json!("fork"), &json!("unlinked_child"),
+        &json!({"status": "unavailable", "reason": "parent_not_collected", "session_id": SID}), &json!(320)));
+    assert_eq!(sessions["rollup"], json!({"sessions": 0, "linked_children": 0, "unlinked_children": 320, "incomplete_sessions": 0}));
+
+    fs::rename(&held, &planted).unwrap();
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let (sessions, linked) = f.cli_args(&["accounting", "sessions"]);
+    let parent = json!({"session_id": SID, "link_basis": "forked_from_id", "certified": "live"});
+    let fork = of(&sessions, LIVE2_FORK_SID);
+    assert_eq!((&fork["role"], &fork["linkage"], &fork["parent"], &fork["total_tokens"]), (&json!("fork"), &json!("linked_child"), &parent, &json!(320)));
+    let child = |inclusion: serde_json::Value, reconciliation: Option<serde_json::Value>| {
+        let mut c = json!({"session_id": LIVE2_FORK_SID, "role": "fork", "link_basis": "forked_from_id", "certified": "live", "total_tokens": 320, "inclusion": inclusion});
+        if let Some(r) = reconciliation { c["fork_reconciliation"] = r; }
+        c
+    };
+    let origin_node = of(&sessions, SID);
+    assert_eq!((&origin_node["role"], &origin_node["total_tokens"]), (&json!("primary"), &json!(1680)));
+    assert_eq!(origin_node["children"], json!({"sessions": [child(json!("separate"), Some(json!({"thread_total": "reconciled", "token_count_total": "reconciled"})))],
+        "total_tokens": 320}));
+    assert_eq!(sessions["rollup"], json!({"sessions": 1680, "linked_children": 320, "unlinked_children": 0, "incomplete_sessions": 0}), "never 1680 + 2000");
+    // Each record once: 1500 + 300 input, 180 + 20 output.
+    let report = f.report();
+    assert_eq!((&report["metrics"]["M08"]["value"], &report["metrics"]["M09"]["value"]), (&json!(1800), &json!(200)));
+
+    // A read-only sidecar without the A8 tables: the fork's inclusion is unknown, so no linked sum.
+    f.sidecar().execute_batch("DROP TABLE rollout_forks; DROP TABLE rollout_turn_ends; DROP TABLE codex_turn_aborts; DROP TABLE codex_mcp_calls;
+        DROP TABLE codex_agent_items; DROP TABLE codex_tool_namespaces; DROP TABLE codex_fork_reconciliation;
+        UPDATE telemetry_streams SET version=7 WHERE stream='ingest';").unwrap();
+    let predates = json!({"status": "unavailable", "reason": "predates_collection"});
+    let (sessions, _) = f.cli_args(&["accounting", "sessions"]);
+    assert_eq!(of(&sessions, SID)["children"], json!({"sessions": [child(predates.clone(), None)], "total_tokens": predates}));
+    assert_eq!(sessions["rollup"], json!({"sessions": 1680, "linked_children": predates, "unlinked_children": 0, "incomplete_sessions": 0}));
+    f.cli("collect");
+    assert_eq!(f.cli_args(&["accounting", "sessions"]).1, linked);
+    // The fork's source read before A8 (no `rollout_forks` row): pending its re-read.
+    f.sidecar().execute_batch("DELETE FROM rollout_forks").unwrap();
+    let pending = json!({"status": "unavailable", "reason": "pending_reread"});
+    let (sessions, _) = f.cli_args(&["accounting", "sessions"]);
+    assert_eq!(sessions["rollup"]["linked_children"], pending);
+    assert_eq!(of(&sessions, SID)["children"]["sessions"][0]["inclusion"], pending);
+    f.cli("collect");
+    assert_eq!(f.cli_args(&["accounting", "sessions"]).1, linked);
 }
 
 /// Start of a UTC hour (November 2023): fleet windows are whole UTC hours.

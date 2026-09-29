@@ -99,8 +99,11 @@ Links come only from native evidence:
   else `forked_from_id`, equal to a collected `rollout_sources.session_id` is
   a `linked_child` of that session, with `link_basis` `parent_thread_id` /
   `thread_parent_thread_id` / `forked_from_id`. `certified` is `live` for
-  `thread_parent_thread_id` (the live guardian's `parent_thread_id` is its
-  parent's `session_meta.id`) and `fixture` for the other two. A named parent
+  all three: `thread_parent_thread_id` (the live guardian's
+  `parent_thread_id` is its parent's `session_meta.id`), and since B12
+  (§15) `parent_thread_id` (a live `thread_spawn` child) and
+  `forked_from_id` (a live `codex exec fork`), codex-live-0.154.0-run2.md
+  §1–§2. A named parent
   that was not collected makes it `unlinked_child` with parent `unavailable:
   parent_not_collected` (and the named `session_id`); a guardian or subagent
   naming none is `unlinked_child` with `unavailable:
@@ -113,12 +116,21 @@ Links come only from native evidence:
   it under `children {sessions: [{session_id, role, link_basis, certified,
   total_tokens, inclusion}], total_tokens}`: `inclusion` is `separate` for a
   spawned subagent and a guardian (the live parent's thread total 29760
-  excluded its guardian's 7462, codex-live-0.154.0-a4.md §5), and `unavailable: fork_replay_not_certified` for a
-  session naming a `forked_from_id` (a fork may replay its parent's records,
-  `forked_from_ordinal_exclusive` is not collected, live probe step 3). The
-  children `total_tokens` is their sum only when every child total is known
-  (`unavailable: incomplete` otherwise) and none is a fork
-  (`fork_replay_not_certified`).
+  excluded its guardian's 7462, codex-live-0.154.0-a4.md §5; the live
+  `thread_spawn` parent's 43951 excluded its child's 15202, run2 §2). For a
+  session naming a `forked_from_id` it is read at read time from the root
+  rollout's A8 `rollout_forks` row (§15): `separate` when it names
+  `history_base.thread_id` (the live fork shape, which replays none of its
+  origin's records, run2 §1), with `fork_reconciliation` = the fork's
+  `codex_fork_reconciliation` states per reported total (`unavailable:
+  not_reconciled` without a row); `unavailable: fork_replay_not_certified`
+  when it names none (a shape never observed live); `unavailable:
+  predates_collection` without the A8 table; `unavailable: pending_reread`
+  while the source has no row. A fork's reported totals (which include its
+  origin's) are never added: its total is Σ its own entries. The children
+  `total_tokens` is their sum only when every child total is known
+  (`unavailable: incomplete` otherwise) and every inclusion is `separate`
+  (else the first child's inclusion reason).
 - `inclusive_total` = Σ normalized `total_tokens` of the delta entries the
   rollout observed (accepted or duplicate); `NULL` when it observed one that
   is not counted and normalized (session total `unavailable: incomplete`).
@@ -134,8 +146,8 @@ unallocated = the session total. The requested model is not recorded; the
 model is as reported by `turn_context`.
 
 The rollup sums root totals of `primary` sessions (`sessions`), of linked
-children (`linked_children`, `unavailable: fork_replay_not_certified` when
-one is a fork) and of unlinked children (`unlinked_children`) separately;
+children (`linked_children`, `unavailable` with the first linked child's
+inclusion reason when one is not `separate`) and of unlinked children (`unlinked_children`) separately;
 with any incomplete or unresolved session all three are `unavailable:
 incomplete_sessions`, never a partial sum. The three are never added
 together. M08/M09 (§2) count each record once per session regardless;
@@ -151,7 +163,8 @@ mixed 10) naming an uncollected parent thread is reported apart
 Test `child_sessions_link_to_parent_without_double_count`: a parent of 100
 and a spawned subagent of 30 naming it → the child is linked
 (`parent_thread_id`, `fixture`), the parent stays 100 with `children` 30,
-rollup 100 / 30 / 0. A fork of 40 (`forked_from_id`), a subagent of 20
+rollup 100 / 30 / 0 (`live` since B12). A fork of 40 (`forked_from_id`,
+`live`, but no `history_base`: `fork_replay_not_certified`), a subagent of 20
 naming an uncollected parent (`parent_not_collected`) and a live-shape
 guardian of 50 naming the parent by thread lineage (linked,
 `thread_parent_thread_id`, `live`, `separate`) join: `children` and
@@ -306,7 +319,12 @@ M38–M40. The live run observed the fields but certified no semantics
 `resets_at` **fixed within a window**: 21 snapshots over 3 h 50 min and two
 homes all reported the same `resets_at`, with no drift or jitter. The
 `reset_moved` evidence below stays as the fallback for a later reset seen
-before the earlier one elapsed; it was not observed live.
+before the earlier one elapsed; it was not observed live. The second live
+run ([codex-live-0.154.0-run2.md](codex-live-0.154.0-run2.md) §6) saw the
+first **jitter**: `resets_at` 1791049774 in 10 snapshots and 1791049779
+(+5 s) in one, within one window, and `plan_type: null` in the snapshots of
+`exec` sessions (`pro` elsewhere). Since B12 windows match within
+`RESETS_TOLERANCE_MS` = 60000 (below).
 
 **Observations** (`quota_window_observations` from stream version 6, §7;
 one per `codex_rate_limits` row and window kind):
@@ -330,6 +348,19 @@ strings (`42.0` → `42`); `plan_type`; `observed_unix_ms` (the line's
 | `trusted` | first snapshot (window `first_observation`); a later `resets_at` (new window: `reset_elapsed` if observed at or after the previous reset, else `reset_moved`); or same window and `used` ≥ its high-water mark | the window |
 | `window_regressed` | `resets_at` earlier than the current window's | none |
 | `window_conflict` | same `resets_at`, different `window_minutes` | none |
+
+**Same window (B12).** Observed before the current window's reset elapsed,
+a snapshot whose `resets_at` differs from the window's by at most
+`RESETS_TOLERANCE_MS` = 60000 ms (either way) is the **same window** (jitter),
+never `reset_moved` or `window_regressed`; it follows the same-window rows
+(`window_conflict`, `used_decreased_without_reset`, `trusted`). The window
+keeps its first `resets_at` (and its `window_id`); each observation keeps its
+own reported `resets_unix_ms`. Beyond the tolerance, or observed at or after
+the reset, the rows above apply. A real next window lies at least
+`window_minutes` later, and every observed window is ≥ 300 minutes. 60 s is
+12× the only jitter seen. `plan_type` is never part of a window's identity:
+a `null` plan (live: `exec` sessions) neither opens a window nor clears the
+window's latest non-null `plan_type`.
 | `used_decreased_without_reset` | same window, `used` below its high-water mark | the window (counted in `flagged`) |
 
 Trust is tracked per (account, limit, window kind): a secondary window has
@@ -351,8 +382,11 @@ copies of one login reported identical windows at overlapping times, so the
 provider window belongs to the login. Within one home, "one home = one
 login" held. Herdr does not merge such accounts. It names them: windows of
 different accounts with the same `limit_id`, `window_kind`,
-`window_minutes` and `resets_unix_ms` are a **shared-window candidate**
-(evidence `same_limit_kind_minutes_resets`, `merged: false`). The accounts
+`window_minutes` and `resets_unix_ms` (within `RESETS_TOLERANCE_MS` of the
+group's earliest reset, which the candidate shows, since B12) are a
+**shared-window candidate** (evidence `same_limit_kind_minutes_resets`,
+`merged: false`); M40's per-decision `shared_window_candidates` use the same
+tolerance around the decision's observation. The accounts
 may be one login. Two unrelated logins whose resets fall on the same second
 would also match, so this is a candidate, not proof. Values of different
 accounts are never summed, averaged or used for each other: each window
@@ -428,6 +462,15 @@ Test `secondary_window_is_tracked`: a 10,080-minute secondary window reads
 resets (20 → 30, then 5 → 6 in a new window); one `primary` reached type
 is evidence; M38 stays unavailable. With the A4 rows removed (as stored
 before A4), secondary is `not_collected`.
+
+Test `resets_jitter_and_null_plan_stay_one_window` (B12, run2 §6 shapes):
+a 10,080-minute window reads 43 (R, `pro`) → 43 (R + 5 s, `pro`) → 44
+(R − 5 s, `null`) → 45.5 (R, `null`): one window (`first_observation`, 4
+trusted, increase `2.5`, remaining `54.5`, plan `pro`), each observation
+keeping its own reset. Another home's one snapshot at R + 5 s makes one
+shared-window candidate (reset R), and A's headroom `54.5` names both. Then
+46 at R + 120 s opens a `reset_moved` window (remaining `54`, the new
+headroom) and 47 back at R is `window_regressed`.
 
 ## 6. Human attention intervals (B6b, TM1.8 remainder "S4")
 
@@ -605,7 +648,12 @@ earliest `session_unix_ms` is in the window. Per session, tool metadata is
 `unavailable: predates_collection` when the sidecar has no A6 tables (a
 read-only pre-A6 sidecar; nothing is migrated) and `unavailable:
 pending_reread` while any rollout of the session has no `codex_tool_sources`
-row. If any in-scope session is either, M16–M18 are all `unavailable` with
+row. Since B12 (§15) the same holds for lane A's A8 tables
+(`rollout_forks`, `codex_mcp_calls`, `codex_turn_aborts`,
+`codex_tool_namespaces`, `codex_agent_items`): none →
+`predates_collection`; a rollout of the session without a `rollout_forks`
+row (read before A8, re-read by the next collect) → `pending_reread`. If
+any in-scope session is either, M16–M18 are all `unavailable` with
 that reason (`predates_collection` first) and the `coverage`, never a
 partial count and never 0. No in-scope session: `unavailable
 no_bound_session`; no sidecar: `collection_not_run`. `coverage {sessions,
@@ -619,7 +667,13 @@ observed, pending_reread, predates_collection, excluded}`.
   `by_name`/`name_unreported`, `by_status`/`status_unreported`
   (`function_call.status` certified `fixture` only), `without_output` (no
   output yet: open or lost) and `outputs_without_call` (an output whose call
-  was not seen, not counted as issued).
+  was not seen, not counted as issued). Since B12: `by_namespace` (A8
+  `codex_tool_namespaces`; live: `collaboration` for `spawn_agent` /
+  `wait_agent`) and `mcp_without_call`. An MCP call is **one** call: in
+  0.154.0 it runs inside an `exec` `custom_tool_call` (code mode), which is
+  already issued; an MCP item whose carrying call is not matched (below) is
+  counted once more in `calls` as `mcp_without_call` (not in `by_name` or
+  `by_status`, stage unknown).
 - `accepted`: **inferred** (`value.accepted {status: inferred, count,
   unknown}`), never from a typed decision (Codex writes none). A recorded call
   with both times reached the accepted stage when its call → output interval
@@ -632,25 +686,56 @@ observed, pending_reread, predates_collection, excluded}`.
   and its session start lies inside that interval (so in the call's turn):
   `auto_review`. Both: `human_routed_and_auto_review`. Every other issued call
   (neither, or no output yet) is `unknown`, never counted as accepted.
-  `accepted {label: inferred, calls, by_basis, unknown, basis, caveat}`;
-  caveat: a denied approval also ends the wait, so `accepted` means the
-  approval stage completed, not that it was approved.
+  **Aborted (B12, run2 §4).** A call whose turn has a `codex_turn_aborts`
+  row with a line time is `declined_or_aborted`, neither accepted nor
+  unknown, when its output is the turn's last at or before the abort
+  (`last_output_before_abort`: live, a declined approval (`n`) aborts the
+  turn right after the call's string output) or it has no output and was
+  made at or before the abort (`no_output_before_abort`). This wins over a
+  `blocked` wait (live, that wait was the declined prompt). Other calls of an
+  aborted turn keep their stage. `value.accepted {status: inferred, count,
+  unknown, declined_or_aborted}`; `accepted {label: inferred, calls,
+  by_basis, unknown, declined_or_aborted {calls, by_basis}, basis, detail,
+  caveat}`; caveat: a denied approval that does not abort the turn also ends
+  the wait, so `accepted` means the approval stage completed, not that it was
+  approved.
 - `executed`: one `CommandExecution` item per execution instance (a repeated
-  execution is another instance), `scope: command_execution` (other tools,
-  e.g. `wait`, write no item), `by_source`. Attribution to a call is
-  `inferred` (no shared key): the latest recorded call of the same session
-  and turn at or before the item's `completed_unix_ms` whose output, if any,
-  is not before it; `by_call_name` and `unattributed`.
-- `certified {calls: live, call_status, exec_items: live, mcp_calls:
-  not_collected}`.
+  execution is another instance) and, since B12, one A8 `McpToolCall` item
+  per MCP call: `scope: [command_execution, mcp]`, `by_scope` (other tools,
+  e.g. `wait`, `spawn_agent`, write no item), `by_source` (command
+  executions). Attribution of a command execution to a call is `inferred`
+  (no shared key): the latest recorded call of the same session and turn at
+  or before the item's `completed_unix_ms` whose output, if any, is not
+  before it; `by_call_name` and `unattributed`.
+- `mcp` (B12): `{calls, by_server {server: {tool: n}},
+  server_or_tool_unreported, carrier {basis: inferred, rule, matched,
+  unmatched}, basis}`. The carrying call of an MCP item (its `exec-…` id is
+  no call id) is matched only by `(session_id, turn_id)` and line time: the
+  latest recorded `custom_tool_call` named `exec` of the same turn at or
+  before the item's `completed_unix_ms` whose output, if any, is not before
+  it, each call carrying at most one item (items in completion order).
+- `collaboration` (B12): `{calls, spawned_threads, collab_items, basis}`:
+  calls in namespace `collaboration`, the distinct `agent_thread_id`s of
+  `SubAgentActivity` items whose id equals such a call's id (the spawn), and
+  the `CollabAgentToolCall` items. Not tool executions.
+- `certified {calls: live, call_status, exec_items: live, mcp_calls: live,
+  turn_aborts: live, namespaces: live}` (`mcp_calls` was `not_collected`
+  before B12).
 
 **M17 `tool_execution_success`** (`M17.tools-v1`): succeeded / (succeeded +
-failed) of exec items, unreduced `"n/d"` (`null` `empty_denominator` when
-none is terminal). Status `completed` (the only status certified live) with
-`exit_code` 0 succeeded, non-zero failed. Unknown, excluded and counted in
-`unknown.by_reason`: `exit_code_unknown` (`NULL`, never a success),
-`status_unreported`, `status_not_certified` (any other status, e.g.
-`failed`: its meaning, including cancel or timeout, is not certified).
+failed) over both scopes, unreduced `"n/d"` (`null` `empty_denominator` when
+none is terminal), with `by_scope {command_execution, mcp}` each
+`{succeeded, failed, unknown {executions, by_reason}}` and the top-level
+`unknown` their sum. `command_execution`: status `completed` with
+`exit_code` 0 succeeded, non-zero failed; since B12 status `failed` with a
+non-zero `exit_code` failed (certified live, run2 §4: `ls` of a missing
+path, exit 2; `custom_tool_call.status` still says `completed`, it only says
+the call was made). Unknown, excluded and counted in `unknown.by_reason`:
+`exit_code_unknown` (`completed` with `NULL`, never a success),
+`status_unreported`, `status_not_certified` (`failed` with exit 0 or `NULL`,
+or any other status: cancel or timeout are not certified). `mcp` (B12):
+`is_error = 1` failed; `is_error = 0` with status `completed` succeeded;
+unknown: `is_error_unreported`, `status_unreported`, `status_not_certified`.
 `cancelled` and `timed_out` are `unavailable` (`cancellation_not_exposed`,
 `timeout_not_exposed`). An exec item is written only on completion, so a
 pending execution is not observable: `pending_calls` counts calls without
@@ -669,28 +754,39 @@ nearest-rank `p50_ms`, `p95_ms`, `max_ms`; `null` without samples), overall,
 37.8 s Herdr `blocked` wait). Per host (`host_basis: execution_home`):
 `by_home` keys the same distribution by the `home_digest` of the session's
 rollouts; a session whose rollouts lie under several homes goes to
-`home_ambiguous`.
+`home_ambiguous`. Since B12 `call_to_output_ms.mcp` is the same
+distribution over the carrying calls of matched MCP calls (also inside the
+overall and `by_name.exec` numbers), `by_server {server: {tool: …}}` and
+`server_or_tool_unreported`, labelled as not the MCP call's run time.
+`mcp_duration.value` is `unavailable execution_duration_not_exposed`: the
+MCP item's `duration` is measured like an exec item's
+(`startup_not_run_time`, certified for a local stub only) and is never read.
 
 **`accounting tools [--json]`** (read-only; `collection_not_run` without a
 sidecar): per in-scope session `{session_id, attempt_ids, tools}` with
 `tools` `{issued, without_output, outputs_without_call, executed,
-attributed, unattributed, succeeded, failed, unknown}` or `unavailable`;
+attributed, unattributed, mcp_calls, succeeded, failed, unknown,
+declined_or_aborted}` or `unavailable` (`executed`, `succeeded`, `failed`,
+`unknown` over both scopes; `attributed`/`unattributed` command executions);
 `coverage`; `metrics` M16–M18, identical to the report's (lane keys, §2).
 Text: a coverage line, one line per session and per metric (M16 `accepted N
-inferred (M unknown)`), and the `call_to_output_ms` p95 line labelled as
-including approval waits.
+inferred (M unknown)`), an `M16 mcp_calls N [server/tool n, …] (counted
+once with their exec call), declined_or_aborted K` line, an `M17 by scope:`
+line, and the `call_to_output_ms` p95 line labelled as including approval
+waits.
 
 Not derived (follow-ups): controller intervals
 (TM2.5: Codex writes no typed tool or approval interval, and Herdr samples
-only agent state); MCP calls (shape unobserved, not collected); M18 once a
-Codex version records an execution end − start.
+only agent state); M18 once a Codex version records an execution end −
+start.
 
 Test `tool_volume_success_and_latency_are_honest`: one bound session in two
 rollouts (the second resumes the first and adds turn 2) and one unbound
 session. 5 issued (`exec` 4, `wait` 1; status unreported 1), 1 without
 output, 1 output without a call; 6 executions, 5 inferred to `exec` calls,
-1 unattributed; exit 0 ×3, exit 2, `NULL` exit, status `failed` → M17
-`3/4`, unknown 2; M18 unavailable, `call_to_output_ms` 37010, 1000, 2500,
+1 unattributed; exit 0 ×3, exit 2, `NULL` exit, status `failed` exit 1 →
+M17 `3/5` (B12: `failed` with a non-zero exit is a failure; was `3/4`),
+unknown 1; M18 unavailable, `call_to_output_ms` 37010, 1000, 2500,
 300 → p50 1000, p95 37010 (`exec` 3 samples, `wait` 2500; `by_home` the one
 home, 4 samples); accepted `0` with 5 unknown (no wait, no guardian); the
 report equals `accounting tools`; before any collect everything is
@@ -702,6 +798,7 @@ blocked 30 s, working 60 s → call-1 `human_routed`: accepted 2, unknown 3. Tes
 the A6 tables dropped (ingest 5) read as `predates_collection` without
 migrating; the next collect restores the output byte for byte; the resumed
 rollout gone before its re-read makes the session `pending_reread`.
+Test `live_run2_failures_aborts_and_mcp_calls_count_once` (B12, §15).
 
 ## 10. Fleet efficiency (B6a, TM2.8; M34–M37)
 
@@ -1309,3 +1406,49 @@ TM2.6 reconciliation and an approved unknown-usage policy (doc 05 §6);
 per-task window consumption (quota) still needs a certified invocation
 scope; M34's coordinator allocation could reuse the §13 rule machinery once a
 coordinator usage scope exists.
+
+## 15. Live run 2 (B12): failures, aborted turns, MCP calls, forks, quota jitter
+
+Source: [codex-live-0.154.0-run2.md](codex-live-0.154.0-run2.md), the
+phase2-lanes card B12 and contracts-collection.md A8 ("Follow-ups for lane
+B"). Lane A's A8 tables (ingest 0008) are read by SQL only, at read time,
+joined on the rollout's own `session_id`; only ids, tags, flags and line
+times are read (never an MCP call's `arguments` or `result`, which are not
+stored). **No stream migration**: accounting stays at stream version 10;
+nothing new is stored, and `accounting sync` output is unchanged.
+
+- **M17** (§9): `codex_exec_items.status = 'failed'` with a non-zero
+  `exit_code` is a certified failure; other statuses stay excluded with
+  their counts. MCP calls (`codex_mcp_calls`): `is_error = 1` failed,
+  `is_error = 0` with status `completed` succeeded; labelled by scope
+  (`command_execution`, `mcp`). Live run 2's session A: `2/3`.
+- **M16** (§9): calls ended by `turn_aborted` (`codex_turn_aborts`) are
+  `declined_or_aborted` with their basis, never accepted or unknown. MCP
+  calls are counted by server and tool once, matched to their carrying
+  `exec` call only by turn and line time (`inferred`); `mcp_calls` is
+  `live`. `collaboration` calls and spawned agent threads are counted apart,
+  never as executions.
+- **M18** (§9): still `unavailable`; the MCP item's duration is not run
+  time. The carrying call's call → output time is shown apart under
+  `call_to_output_ms.mcp`.
+- **Session graph** (§3): spawned-subagent (`parent_thread_id`) and fork
+  (`forked_from_id`) links are certified `live`. A live-shape fork (A8
+  `rollout_forks.base_thread_id`) is `separate` with its reconciliation
+  states; a fork's reported totals are never added.
+- **Quota** (§5): `resets_at` within 60 s of the window's, before its reset
+  elapsed, is the same window (live: +5 s); `plan_type: null` is not another
+  window.
+- **Pre-A8 sidecars**: without the A8 tables every A8-dependent value is
+  `unavailable predates_collection`: M16–M18 (§9) and a fork's inclusion
+  (§3). A source not yet re-read (no `rollout_forks` row) makes them
+  `pending_reread`. They are never partial and never 0, and the next collect
+  restores the output byte for byte.
+
+Tests (tests/telemetry_accounting.rs, the live-2 conformance fixtures):
+
+| Property | Test |
+|---|---|
+| `live2-tools`: 6 issued (MCP once), accepted 0 / unknown 5 / `declined_or_aborted` 1 (`last_output_before_abort`); executed 3 (2 + 1 MCP); M17 `2/3` (command 1/2, MCP 1/1); call → output 65, 86, 131, 1078, 3060, 8743 ms → p50 131, p95 8743, MCP carrier 65; a `blocked` wait in s1 → `human_routed`, one in the aborted d1 stays `declined_or_aborted`; A8 tables dropped → `predates_collection` (no migration on read), a missing `rollout_forks` row → `pending_reread`, each restored by the next collect | `live_run2_failures_aborts_and_mcp_calls_count_once` |
+| `live2-fork` of `complete` (1680): `parent_not_collected` (320 unlinked) before the origin, then `linked_child` (`forked_from_id`, `live`), inclusion `separate`, reconciliation `reconciled` ×2, rollup 1680 / 320 / 0 (never 1680 + 2000), M08/M09 1800/200; without A8 `predates_collection`, then `pending_reread`, children and linked rollup never summed | `live_fork_is_separate_and_never_adds_its_reported_totals` |
+| Quota jitter ±5 s and `null` plans: one window; a shared-window candidate across homes within the tolerance; +120 s `reset_moved`, back to R `window_regressed` | `resets_jitter_and_null_plan_stay_one_window` |
+| Changed on purpose: spawned and fork links `live` (`child_sessions_link_to_parent_without_double_count`); M17 `3/5` with the `failed` exit-1 item a failure (`tool_volume_success_and_latency_are_honest`); `declined_or_aborted: 0` in every M16 value; the conformance M17 `2/3`, executed 3 (`live_run2_shapes_are_collected_without_content`) | as named |

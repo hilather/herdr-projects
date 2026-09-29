@@ -29,10 +29,35 @@ struct Metadata {
     thread_source: Option<String>,
 }
 
-/// How a link basis is certified: the A5 thread parent was observed live
-/// (codex-live-0.154.0-a4.md §5); spawned-subagent and fork links in fixtures only.
+/// How a link basis is certified: the A5 thread parent (codex-live-0.154.0-a4.md
+/// §5), the `thread_spawn` subagent parent and the fork origin
+/// (codex-live-0.154.0-run2.md §1–§2) were all observed live.
 fn certified(basis: Option<&str>) -> &'static str {
-    if basis == Some("thread_parent_thread_id") { "live" } else { "fixture" }
+    match basis { Some("thread_parent_thread_id" | "parent_thread_id" | "forked_from_id") => "live", _ => "fixture" }
+}
+
+/// A fork's inclusion (§3) from its root rollout's A8 `rollout_forks` row: a
+/// fork naming `history_base` is the live shape, which replays none of its
+/// origin's records (run2 §1), so it is `separate`; one without is a shape
+/// never observed live (`fork_replay_not_certified`). No A8 table:
+/// `predates_collection`; no row yet: `pending_reread`. Its reported totals
+/// (which include its origin's) are never added: the total is Σ its own entries.
+fn fork_inclusion(db: &Connection, a8: bool, path: &str) -> Result<Value> {
+    if !a8 { return Ok(super::unavailable("predates_collection")); }
+    let base: Option<Option<String>> = db.query_row("SELECT base_thread_id FROM rollout_forks WHERE path_digest=?1", [path], |r| r.get(0)).optional()?;
+    Ok(match base {
+        None => super::unavailable("pending_reread"),
+        Some(None) => super::unavailable("fork_replay_not_certified"),
+        Some(Some(_)) => json!("separate"),
+    })
+}
+
+/// A live-shape fork's reconciliation states (A8 `codex_fork_reconciliation`), per reported total.
+fn fork_reconciliation(db: &Connection, reconciliation: bool, session: &str) -> Result<Value> {
+    if !reconciliation { return Ok(super::unavailable("predates_collection")); }
+    let states: BTreeMap<String, String> = db.prepare("SELECT kind,state FROM codex_fork_reconciliation WHERE session_id=?1 ORDER BY kind")?
+        .query_map([session], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    Ok(if states.is_empty() { super::unavailable("not_reconciled") } else { json!(states) })
 }
 
 /// Rebuild `session_graph_nodes` and `model_segments` from `entries` (the ledger just
@@ -157,7 +182,7 @@ fn bucket(r: &rusqlite::Row) -> rusqlite::Result<Value> {
 /// The synced graph and segments per session, with the rollup of root totals.
 /// A session with an `unresolved` rollout has no total (`inclusion_unknown`).
 /// A linked child is listed under its parent (`children`) and never added to
-/// the parent's total; a fork's inclusion is `fork_replay_not_certified`.
+/// the parent's total; a fork's inclusion comes from `fork_inclusion`.
 /// Read-only; `ledger_not_synced` before the first sync of this stream version.
 pub fn read(db: &Connection) -> Result<Value> {
     let synced = db.query_row("SELECT count(*)=2 FROM sqlite_master WHERE type='table' AND name IN ('session_graph_nodes','usage_ledger')", [], |r| r.get::<_, bool>(0))?
@@ -168,20 +193,29 @@ pub fn read(db: &Connection) -> Result<Value> {
     let mut other = db.prepare(&format!("SELECT {COLUMNS} FROM model_segments WHERE session_id=?1 AND bucket=?2"))?;
     let mut nodes = db.prepare("SELECT path_digest,linkage,parent_path_digest,evidence,inclusive_total,attempt_id FROM session_graph_nodes WHERE session_id=?1 ORDER BY linkage='included',path_digest")?;
     let zero = json!({"first_position": null, "last_position": null, "entries": 0, "input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0, "total_tokens": 0});
-    let (mut rooted, mut linked, mut children, mut incomplete, mut linked_fork) = (0, 0, 0, 0, false);
+    let table = |name: &str| db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [name], |r| r.get::<_, bool>(0));
+    let (a8, reconciliation) = (table("rollout_forks")?, table("codex_fork_reconciliation")?);
+    // The first reason a linked child's inclusion is not `separate` (then linked children have no sum).
+    let (mut rooted, mut linked, mut children, mut incomplete, mut linked_unknown) = (0, 0, 0, 0, None::<Value>);
     let (mut out, mut under) = (Vec::new(), BTreeMap::<String, Vec<Value>>::new());
     let sessions: Vec<(String, String)> = db.prepare("SELECT DISTINCT session_id,role FROM session_graph_nodes ORDER BY session_id")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
     for (session, role) in sessions {
-        type Head = (String, Option<i64>, Option<String>, Option<String>, Option<String>, Option<String>, bool);
-        let (linkage, total, parent_session, basis, reason, claimed, forked): Head = db.query_row("SELECT linkage,inclusive_total,parent_session_id,link_basis,
-            parent_reason,claimed_parent_session_id,forked FROM session_graph_nodes WHERE session_id=?1 AND linkage<>'included'
-            ORDER BY linkage<>'unresolved',path_digest LIMIT 1", [&session], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?;
+        type Head = (String, Option<i64>, Option<String>, Option<String>, Option<String>, Option<String>, bool, String);
+        let (linkage, total, parent_session, basis, reason, claimed, forked, path): Head = db.query_row("SELECT linkage,inclusive_total,parent_session_id,link_basis,
+            parent_reason,claimed_parent_session_id,forked,path_digest FROM session_graph_nodes WHERE session_id=?1 AND linkage<>'included'
+            ORDER BY linkage<>'unresolved',path_digest LIMIT 1", [&session], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?,
+            r.get(7)?)))?;
+        let inclusion = if forked { fork_inclusion(db, a8, &path)? } else { json!("separate") };
         let total = match (linkage.as_str(), total) {
             ("unresolved", _) => { incomplete += 1; super::unavailable("inclusion_unknown") }
             (_, None) => { incomplete += 1; super::unavailable("incomplete") }
             ("root", Some(t)) => { rooted += t; json!(t) }
-            ("linked_child", Some(t)) => { linked += t; linked_fork |= forked; json!(t) }
+            ("linked_child", Some(t)) => {
+                linked += t;
+                if inclusion != "separate" && linked_unknown.is_none() { linked_unknown = Some(inclusion.clone()); }
+                json!(t)
+            }
             (_, Some(t)) => { children += t; json!(t) }
         };
         let parent = match (linkage.as_str(), &parent_session) {
@@ -195,9 +229,11 @@ pub fn read(db: &Connection) -> Result<Value> {
             _ => super::unavailable("inclusion_unknown"),
         };
         if let Some(id) = &parent_session {
-            let inclusion = if forked { super::unavailable("fork_replay_not_certified") } else { json!("separate") };
-            under.entry(id.clone()).or_default().push(json!({"session_id": session, "role": role, "link_basis": basis, "certified": certified(basis.as_deref()),
-                "total_tokens": total, "inclusion": inclusion}));
+            let mut child = json!({"session_id": session, "role": role, "link_basis": basis, "certified": certified(basis.as_deref()),
+                "total_tokens": total, "inclusion": inclusion});
+            // A live-shape fork: whether its own share of its reported totals reconciled (never added).
+            if forked && inclusion == "separate" { child["fork_reconciliation"] = fork_reconciliation(db, reconciliation, &session)?; }
+            under.entry(id.clone()).or_default().push(child);
         }
         let segments = model.query_map([&session], |r| { let mut b = bucket(r)?; b["segment"] = json!(r.get::<_, i64>(7)?); b["model"] = json!(r.get::<_, String>(8)?); Ok(b) })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -215,12 +251,12 @@ pub fn read(db: &Connection) -> Result<Value> {
     for session in &mut out {
         let Some(list) = session["session_id"].as_str().and_then(|id| under.remove(id)) else { continue };
         let total = if list.iter().any(|c| !c["total_tokens"].is_i64()) { super::unavailable("incomplete") }
-            else if list.iter().any(|c| c["inclusion"] != "separate") { super::unavailable("fork_replay_not_certified") }
+            else if let Some(c) = list.iter().find(|c| c["inclusion"] != "separate") { c["inclusion"].clone() }
             else { json!(list.iter().filter_map(|c| c["total_tokens"].as_i64()).sum::<i64>()) };
         session["children"] = json!({"sessions": list, "total_tokens": total});
     }
     // A partial sum is never shown as the total.
     let sum = |value: i64| if incomplete > 0 { super::unavailable("incomplete_sessions") } else { json!(value) };
-    let linked = if incomplete == 0 && linked_fork { super::unavailable("fork_replay_not_certified") } else { sum(linked) };
+    let linked = match linked_unknown { Some(reason) if incomplete == 0 => reason, _ => sum(linked) };
     Ok(json!({"sessions": out, "rollup": {"sessions": sum(rooted), "linked_children": linked, "unlinked_children": sum(children), "incomplete_sessions": incomplete}}))
 }

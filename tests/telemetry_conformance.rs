@@ -1219,7 +1219,7 @@ fn envelopes_of_a_version_certified_later_are_superseded_without_conflict() {
 /// reconcile once that is subtracted: `origin_not_collected` (no discrepancy)
 /// while the origin is not collected, `reconciled` once it is, and still
 /// `reconciled` after the origin grows past the fork point. Lane B's M16/M17
-/// still read the failed command as an uncertified status (B12). No sentinel
+/// (B12) count the failed command as a failure and the MCP call once. No sentinel
 /// (MCP arguments or result content included) leaks.
 #[test]
 fn live_run2_shapes_are_collected_without_content() {
@@ -1356,13 +1356,13 @@ fn live_run2_shapes_are_collected_without_content() {
     assert_eq!(f.cli_args(&["collectors", "sessions"]).0["sessions"].as_array().unwrap().iter().find(|s| s["session_id"] == LIVE2_SID).unwrap()["final_event"]["state"],
         "aborted");
 
-    // Lane B reads the failed command as an uncertified status until B12.
+    // Lane B (B12): the failed command is a failure; the MCP call is executed once, beside its exec call.
     let (tools_report, bytes) = f.cli_args(&["accounting", "tools", "--json"]);
     output.extend(bytes);
     let (m16, m17) = (&tools_report["metrics"]["M16"], &tools_report["metrics"]["M17"]);
     assert_eq!((&m16["issued"]["calls"], &m16["issued"]["by_name"], &m16["issued"]["status_unreported"], &m16["value"]["executed"]),
-        (&json!(6), &json!({"exec": 4, "spawn_agent": 1, "wait_agent": 1}), &json!(2), &json!(2)));
-    assert_eq!((&m17["value"], &m17["unknown"]["by_reason"]), (&json!("1/1"), &json!({"status_not_certified": 1})));
+        (&json!(6), &json!({"exec": 4, "spawn_agent": 1, "wait_agent": 1}), &json!(2), &json!(3)));
+    assert_eq!((&m17["value"], &m17["unknown"]["by_reason"]), (&json!("2/3"), &json!({})));
 
     for args in [&["usage", "--json"][..], &["report", "--json"], &["accounting", "sync"], &["accounting", "sessions"], &["accounting", "quota", "--json"]] {
         output.extend(f.cli_args(args).1);

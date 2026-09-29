@@ -1041,7 +1041,7 @@ sentinels in `receiver_agents` and `agents_states`.
 
 | Property | Test |
 |---|---|
-| MCP, subagent, collab, aborted-turn, namespace and fork rows and envelopes (exactly the allowlist per item type); `aborted` final event, also idle past the threshold; fork `origin_not_collected` with no discrepancy, `reconciled` against 1680 once the origin is collected, still after the origin grows past the fork point; lane B M16/M17 unchanged; no `LIVE2LEAK_*` sentinel in the sidecar (with WAL/SHM) or any output | `live_run2_shapes_are_collected_without_content` |
+| MCP, subagent, collab, aborted-turn, namespace and fork rows and envelopes (exactly the allowlist per item type); `aborted` final event, also idle past the threshold; fork `origin_not_collected` with no discrepancy, `reconciled` against 1680 once the origin is collected, still after the origin grows past the fork point; lane B (B12) M16 executed 3 (the MCP call once) and M17 `2/3` (the `failed` item a failure); no `LIVE2LEAK_*` sentinel in the sidecar (with WAL/SHM) or any output | `live_run2_shapes_are_collected_without_content` |
 | Upgrade of an A7 sidecar: `predates_collection` read-only, then a re-read equal to a fresh collect, stream 8, no conflict; a gone rollout `pending_reread` | `rollouts_read_before_a8_gain_their_live_run2_metadata_on_the_next_collect` |
 | Sentinels (MCP arguments and results, agent paths, collab agents and states), capabilities matching emitted fields (each new one valued), replay in any chunking | `planted_sentinels_never_leak`, `capabilities_match_emitted_fields`, `corpus_replays_identically_in_any_chunking` |
 

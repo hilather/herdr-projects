@@ -23,6 +23,12 @@ pub const ACCOUNT_BASIS: &str = "execution_home";
 /// Fixed-point places for native percent values (Codex prints at most a few).
 const PLACES: u32 = 12;
 const HUNDRED: i128 = 100 * 10i128.pow(PLACES);
+/// `resets_at` jitter within one window (codex-live-0.154.0-run2.md §6: one
+/// snapshot +5 s): before a window's reset elapsed, a snapshot whose reset
+/// differs from the window's by at most this many ms is the same window,
+/// neither `reset_moved` nor `window_regressed`. The same tolerance matches
+/// shared-window candidates across accounts.
+pub const RESETS_TOLERANCE_MS: i64 = 60_000;
 /// Window kinds of a Codex snapshot; `secondary` comes from A4 (ingest 0004), certified `fixture`.
 const KINDS: [&str; 2] = ["primary", "secondary"];
 
@@ -121,6 +127,16 @@ pub fn store(tx: &Connection) -> Result<usize> {
                                 current.insert(key, w);
                                 ("trusted", Some(id))
                             }
+                            // Within the tolerance of the window's reset, before it elapsed: the same window (jitter).
+                            Some(w) if (resets - w.resets).abs() <= RESETS_TOLERANCE_MS && observed < w.resets => {
+                                if minutes != w.minutes { ("window_conflict", None) }
+                                else if used < w.used { w.flagged += 1; ("used_decreased_without_reset", Some(w.id.clone())) }
+                                else {
+                                    (w.used, w.last_observed, w.observations) = (used, observed, w.observations + 1);
+                                    if plan.is_some() { w.plan = plan.clone(); }
+                                    ("trusted", Some(w.id.clone()))
+                                }
+                            }
                             Some(w) if resets > w.resets => {
                                 let evidence = if observed >= w.resets { "reset_elapsed" } else { "reset_moved" };
                                 let next = Window::open(&snapshot, evidence);
@@ -210,8 +226,8 @@ fn window(db: &Connection, account: &str, limit: &str, kind: &str, decided: i64)
     // Other homes that reported this very window (same limit, kind, length and reset) by the decision:
     // probably one login. Named, never merged; their values are not used here.
     let shared: Vec<String> = db.prepare("SELECT DISTINCT account FROM quota_window_observations WHERE limit_id=?1 AND window_kind=?2 AND window_minutes=?3
-        AND resets_unix_ms=?4 AND observed_unix_ms<=?5 AND trust='trusted' AND account IS NOT NULL ORDER BY account")?
-        .query_map(params![limit, kind, minutes, resets, decided], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        AND abs(resets_unix_ms-?4)<=?6 AND observed_unix_ms<=?5 AND trust='trusted' AND account IS NOT NULL ORDER BY account")?
+        .query_map(params![limit, kind, minutes, resets, decided, RESETS_TOLERANCE_MS], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
     if shared.iter().any(|a| a != account) { entry["shared_window_candidates"] = json!(shared); }
     if decided >= resets {
         // The window reset after the snapshot: its remaining value no longer applies, and the new window's is unknown.
@@ -254,14 +270,21 @@ pub fn read(project: &Path, db: &Connection) -> Result<Value> {
             "used": r.get::<_, String>(12)?, "remaining": r.get::<_, String>(13)?, "observed_increase": r.get::<_, String>(14)?,
             "plan_type": r.get::<_, Option<String>>(15)?, "observations": r.get::<_, i64>(16)?, "flagged": r.get::<_, i64>(17)?})))?
         .collect::<rusqlite::Result<_>>()?;
-    // Windows of different accounts with the same limit, kind, length and reset: one provider window seen from several homes.
+    // Windows of different accounts with the same limit, kind, length and reset (within the jitter
+    // tolerance of the group's earliest reset): one provider window seen from several homes.
     let mut groups = BTreeMap::<(String, String, i64, i64), Vec<(String, String)>>::new();
-    for w in &windows {
+    let mut ordered: Vec<&Value> = windows.iter().collect();
+    ordered.sort_by_key(|w| (w["limit_id"].as_str().unwrap_or("").to_owned(), w["window_kind"].as_str().unwrap_or("").to_owned(),
+        w["window_minutes"].as_i64().unwrap_or(0), w["resets_unix_ms"].as_i64().unwrap_or(0)));
+    for w in ordered {
         let text = |key: &str| w[key].as_str().unwrap_or("").to_owned();
-        groups.entry((text("limit_id"), text("window_kind"), w["window_minutes"].as_i64().unwrap_or(0), w["resets_unix_ms"].as_i64().unwrap_or(0)))
-            .or_default().push((text("account"), text("window_id")));
+        let (minutes, resets) = (w["window_minutes"].as_i64().unwrap_or(0), w["resets_unix_ms"].as_i64().unwrap_or(0));
+        let anchor = groups.keys().rev().find(|k| k.0 == text("limit_id") && k.1 == text("window_kind") && k.2 == minutes && resets - k.3 <= RESETS_TOLERANCE_MS)
+            .map_or(resets, |k| k.3);
+        groups.entry((text("limit_id"), text("window_kind"), minutes, anchor)).or_default().push((text("account"), text("window_id")));
     }
-    let shared: Vec<Value> = groups.into_iter().filter(|(_, members)| members.len() > 1).map(|((limit, kind, minutes, resets), members)| {
+    let shared: Vec<Value> = groups.into_iter().filter(|(_, members)| members.iter().any(|m| m.0 != members[0].0)).map(|((limit, kind, minutes, resets), mut members)| {
+        members.sort();
         let (accounts, ids): (Vec<String>, Vec<String>) = members.into_iter().unzip();
         json!({"limit_id": limit, "window_kind": kind, "window_minutes": minutes, "resets_unix_ms": resets, "accounts": accounts, "window_ids": ids,
             "evidence": "same_limit_kind_minutes_resets", "merged": false})

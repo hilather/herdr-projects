@@ -1,8 +1,12 @@
 //! Tool calls and executions (docs/telemetry/contracts-accounting.md §9; plan
 //! TM2.5, doc 07 M16–M18), derived at read time from lane A's A6 metadata
 //! (contracts-collection.md A6: `codex_tool_calls`, `codex_exec_items`,
-//! `codex_tool_sources`, read by SQL only; never any content). Nothing is
-//! stored. Codex 0.154.0 writes no approval decision and no execution run
+//! `codex_tool_sources`) and A8 metadata (`codex_mcp_calls`,
+//! `codex_turn_aborts`, `codex_tool_namespaces`, `codex_agent_items`,
+//! `rollout_forks` as the re-read marker), read by SQL only; never any
+//! content. Nothing is stored. An MCP call is one call (its carrying `exec`
+//! call is matched by turn and time, `inferred`); a call ended by
+//! `turn_aborted` is `declined_or_aborted`, never accepted. Codex 0.154.0 writes no approval decision and no execution run
 //! time: the accepted stage is only inferred (a B6b `blocked` wait or a
 //! guardian review around the call, labelled `inferred`; neither is unknown),
 //! M18 is `unavailable` with the reason, and the call → output wall time
@@ -17,13 +21,35 @@ use std::path::Path;
 
 use super::unavailable;
 
-/// The only exec item status certified live (codex-live-0.154.0-a4.md §4).
-const CERTIFIED_STATUS: &str = "completed";
+/// Exec item statuses certified live: `completed` (codex-live-0.154.0-a4.md §4)
+/// and `failed` with a non-zero exit code (codex-live-0.154.0-run2.md §4).
+const COMPLETED: &str = "completed";
+const FAILED: &str = "failed";
+/// The namespace of `spawn_agent` / `wait_agent` calls (run2 §2): not tool executions.
+const COLLABORATION: &str = "collaboration";
 const NAMES: [(&str, &str); 3] = [("M16", "tool_call_volume"), ("M17", "tool_execution_success"), ("M18", "tool_latency_p95")];
 
-struct Call { id: String, recorded: bool, name: Option<String>, status: Option<String>, turn: Option<String>, called: Option<i64>, output: Option<i64> }
+struct Call { id: String, recorded: bool, kind: Option<String>, name: Option<String>, status: Option<String>, turn: Option<String>, called: Option<i64>,
+    output: Option<i64> }
 
 struct Exec { turn: Option<String>, status: Option<String>, source: Option<String>, exit: Option<i64>, completed: Option<i64> }
+
+/// One `McpToolCall` item (A8): configuration names, status and error flag.
+struct Mcp { turn: Option<String>, server: Option<String>, tool: Option<String>, status: Option<String>, is_error: Option<i64>, completed: Option<i64> }
+
+/// A session's A6 and A8 metadata rows (never content: no such column exists).
+struct Rows {
+    calls: Vec<Call>,
+    items: Vec<Exec>,
+    mcp: Vec<Mcp>,
+    /// `turn_id` → `aborted_unix_ms` of each `turn_aborted` (`None`: no line time).
+    aborts: BTreeMap<String, Option<i64>>,
+    /// `call_id` → `function_call.namespace`.
+    namespaces: BTreeMap<String, String>,
+    /// `(item_id, agent_thread_id)` of the `SubAgentActivity` items, and the number of `CollabAgentToolCall` items.
+    activities: Vec<(String, Option<String>)>,
+    collab_items: usize,
+}
 
 /// A session with a bound rollout (the rollout's own `session_meta.id`), with
 /// the evidence the accepted stage is inferred from: the `blocked` wait spans
@@ -32,7 +58,7 @@ struct Exec { turn: Option<String>, status: Option<String>, source: Option<Strin
 struct Session {
     id: String,
     attempts: BTreeSet<String>,
-    tools: std::result::Result<(Vec<Call>, Vec<Exec>), &'static str>,
+    tools: std::result::Result<Rows, &'static str>,
     waits: Vec<(i64, i64)>,
     guardians: Vec<i64>,
     homes: BTreeSet<String>,
@@ -61,13 +87,65 @@ impl Session {
     fn home(&self) -> Option<&str> { if self.homes.len() == 1 { self.homes.first().map(String::as_str) } else { None } }
 }
 
-/// Outcome class of one exec item (M17).
+/// Outcome class of one exec item (M17): `completed` with an exit code
+/// (0 succeeded, else failed), `failed` with a non-zero exit code (failed).
 fn outcome(e: &Exec) -> std::result::Result<bool, &'static str> {
     match (e.status.as_deref(), e.exit) {
         (None, _) => Err("status_unreported"),
-        (Some(CERTIFIED_STATUS), Some(code)) => Ok(code == 0),
-        (Some(CERTIFIED_STATUS), None) => Err("exit_code_unknown"),
+        (Some(COMPLETED), Some(code)) => Ok(code == 0),
+        (Some(COMPLETED), None) => Err("exit_code_unknown"),
+        (Some(FAILED), Some(code)) if code != 0 => Ok(false),
         (Some(_), _) => Err("status_not_certified"),
+    }
+}
+
+/// Outcome class of one MCP call (M17): `is_error` 1 failed; `is_error` 0
+/// with status `completed` succeeded.
+fn mcp_outcome(m: &Mcp) -> std::result::Result<bool, &'static str> {
+    match (m.is_error, m.status.as_deref()) {
+        (Some(1), _) => Ok(false),
+        (None, _) => Err("is_error_unreported"),
+        (Some(_), Some(COMPLETED)) => Ok(true),
+        (Some(_), None) => Err("status_unreported"),
+        (Some(_), Some(_)) => Err("status_not_certified"),
+    }
+}
+
+/// The carrying `exec` call of each MCP item, in item order (`inferred`: the
+/// item id is not a call id): in the same session and turn, the latest
+/// recorded `custom_tool_call` named `exec` at or before the item's
+/// completion whose output, if any, is not before it, not already carrying
+/// an earlier item. Items are taken in completion order.
+fn carriers<'a>(calls: &'a [Call], mcp: &[Mcp]) -> Vec<Option<&'a Call>> {
+    let mut used = BTreeSet::<&str>::new();
+    let mut order: Vec<usize> = (0..mcp.len()).collect();
+    order.sort_by_key(|i| (mcp[*i].completed.is_none(), mcp[*i].completed));
+    let mut out = vec![None; mcp.len()];
+    for i in order {
+        let m = &mcp[i];
+        let (Some(turn), Some(at)) = (m.turn.as_ref(), m.completed) else { continue };
+        let carrier = calls.iter().filter(|c| c.recorded && c.kind.as_deref() == Some("custom_tool_call") && c.name.as_deref() == Some("exec")
+            && c.turn.as_ref() == Some(turn) && c.called.is_some_and(|c| c <= at) && c.output.is_none_or(|o| o >= at) && !used.contains(c.id.as_str()))
+            .max_by_key(|c| (c.called, c.id.as_str()));
+        if let Some(c) = carrier { used.insert(c.id.as_str()); }
+        out[i] = carrier;
+    }
+    out
+}
+
+/// Whether a call ended with its turn's `turn_aborted` (M16), with the basis:
+/// its output is the turn's last at or before the abort (the declined
+/// approval of run2 §4), or it has no output and was made at or before it.
+/// Other calls of an aborted turn keep their stage.
+fn aborted(rows: &Rows, c: &Call) -> Option<&'static str> {
+    let at = (*rows.aborts.get(c.turn.as_ref()?)?)?;
+    match (c.called, c.output) {
+        (Some(called), None) if called <= at => Some("no_output_before_abort"),
+        (_, Some(output)) if output <= at => {
+            let last = rows.calls.iter().filter(|o| o.recorded && o.turn == c.turn).filter_map(|o| o.output).filter(|o| *o <= at).max();
+            (last == Some(output)).then_some("last_output_before_abort")
+        }
+        _ => None,
     }
 }
 
@@ -80,6 +158,9 @@ fn attribute<'a>(calls: &'a [Call], e: &Exec) -> Option<&'a Call> {
         .max_by_key(|c| (c.called, c.id.as_str()))
 }
 
+/// Lane A's A8 tables (ingest 0008): without them the sidecar predates A8.
+const A8_TABLES: [&str; 5] = ["rollout_forks", "codex_mcp_calls", "codex_turn_aborts", "codex_tool_namespaces", "codex_agent_items"];
+
 fn exists(db: &Connection, table: &str) -> Result<bool> {
     Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [table], |r| r.get(0))?)
 }
@@ -88,11 +169,14 @@ fn exists(db: &Connection, table: &str) -> Result<bool> {
 /// why they are unavailable, and the sessions excluded (by reason).
 fn sessions(db: &Connection, since: Option<i64>, blocked: &BTreeMap<String, Vec<(i64, i64)>>) -> Result<(Vec<Session>, BTreeMap<String, usize>)> {
     let a6 = exists(db, "codex_tool_sources")? && exists(db, "codex_tool_calls")? && exists(db, "codex_exec_items")?;
+    let a8 = A8_TABLES.iter().try_fold(true, |all, t| Ok::<_, anyhow::Error>(all && exists(db, t)?))?;
     let read = if a6 { "EXISTS(SELECT 1 FROM codex_tool_sources c WHERE c.path_digest=s.path_digest)" } else { "0" };
-    type Source = (String, String, Option<String>, String, Option<i64>, bool, String);
-    let sources: Vec<Source> = db.prepare(&format!("SELECT s.session_id,s.binding,s.attempt_id,s.cli_version,s.session_unix_ms,{read},s.home_digest
+    // A source without a `rollout_forks` row was read before A8 and waits for its re-read.
+    let reread = if a8 { "EXISTS(SELECT 1 FROM rollout_forks k WHERE k.path_digest=s.path_digest)" } else { "0" };
+    type Source = (String, String, Option<String>, String, Option<i64>, bool, String, bool);
+    let sources: Vec<Source> = db.prepare(&format!("SELECT s.session_id,s.binding,s.attempt_id,s.cli_version,s.session_unix_ms,{read},s.home_digest,{reread}
         FROM rollout_sources s ORDER BY s.session_id,s.path_digest"))?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?.collect::<rusqlite::Result<_>>()?;
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?.collect::<rusqlite::Result<_>>()?;
     let guardians = guardians(db)?;
     let mut grouped = BTreeMap::<&str, Vec<&Source>>::new();
     for s in &sources { grouped.entry(s.0.as_str()).or_default().push(s); }
@@ -104,7 +188,8 @@ fn sessions(db: &Connection, since: Option<i64>, blocked: &BTreeMap<String, Vec<
         if bound.is_empty() { *excluded.entry(sources[0].1.clone()).or_default() += 1; continue; }
         if bound.iter().any(|s| !crate::telemetry::codex::certified(&s.3)) { *excluded.entry("cli_version_uncertified".to_owned()).or_default() += 1; continue; }
         let attempts: BTreeSet<String> = bound.iter().filter_map(|s| s.2.clone()).collect();
-        let tools = if !a6 { Err("predates_collection") } else if sources.iter().any(|s| !s.5) { Err("pending_reread") } else { Ok(rows(db, id)?) };
+        let tools = if !a6 { Err("predates_collection") } else if sources.iter().any(|s| !s.5) { Err("pending_reread") }
+            else if !a8 { Err("predates_collection") } else if sources.iter().any(|s| !s.7) { Err("pending_reread") } else { Ok(rows(db, id)?) };
         let waits = attempts.iter().filter_map(|a| blocked.get(a)).flatten().copied().collect();
         let guardians = guardians.get(id).cloned().unwrap_or_default();
         let homes = sources.iter().map(|s| s.6.clone()).collect();
@@ -137,17 +222,29 @@ fn guardians(db: &Connection) -> Result<BTreeMap<String, Vec<i64>>> {
     Ok(out)
 }
 
-/// The A6 metadata rows of one session (never content: no such column exists).
-fn rows(db: &Connection, session: &str) -> Result<(Vec<Call>, Vec<Exec>)> {
-    let calls = db.prepare("SELECT call_id,call_kind IS NOT NULL,name,status,turn_id,called_unix_ms,output_unix_ms FROM codex_tool_calls WHERE session_id=?1
+/// The A6 and A8 metadata rows of one session (never content: no such column exists).
+fn rows(db: &Connection, session: &str) -> Result<Rows> {
+    let calls = db.prepare("SELECT call_id,call_kind IS NOT NULL,call_kind,name,status,turn_id,called_unix_ms,output_unix_ms FROM codex_tool_calls WHERE session_id=?1
         ORDER BY called_unix_ms IS NULL,called_unix_ms,call_id")?
-        .query_map([session], |r| Ok(Call { id: r.get(0)?, recorded: r.get(1)?, name: r.get(2)?, status: r.get(3)?, turn: r.get(4)?, called: r.get(5)?, output: r.get(6)? }))?
+        .query_map([session], |r| Ok(Call { id: r.get(0)?, recorded: r.get(1)?, kind: r.get(2)?, name: r.get(3)?, status: r.get(4)?, turn: r.get(5)?,
+            called: r.get(6)?, output: r.get(7)? }))?
         .collect::<rusqlite::Result<_>>()?;
     let items = db.prepare("SELECT turn_id,status,source,exit_code,completed_unix_ms FROM codex_exec_items WHERE session_id=?1
         ORDER BY completed_unix_ms IS NULL,completed_unix_ms,item_id")?
         .query_map([session], |r| Ok(Exec { turn: r.get(0)?, status: r.get(1)?, source: r.get(2)?, exit: r.get(3)?, completed: r.get(4)? }))?
         .collect::<rusqlite::Result<_>>()?;
-    Ok((calls, items))
+    let mcp = db.prepare("SELECT turn_id,server,tool,status,is_error,completed_unix_ms FROM codex_mcp_calls WHERE session_id=?1
+        ORDER BY completed_unix_ms IS NULL,completed_unix_ms,item_id")?
+        .query_map([session], |r| Ok(Mcp { turn: r.get(0)?, server: r.get(1)?, tool: r.get(2)?, status: r.get(3)?, is_error: r.get(4)?, completed: r.get(5)? }))?
+        .collect::<rusqlite::Result<_>>()?;
+    let aborts = db.prepare("SELECT turn_id,aborted_unix_ms FROM codex_turn_aborts WHERE session_id=?1")?
+        .query_map([session], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    let namespaces = db.prepare("SELECT call_id,namespace FROM codex_tool_namespaces WHERE session_id=?1")?
+        .query_map([session], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    let activities = db.prepare("SELECT item_id,agent_thread_id FROM codex_agent_items WHERE session_id=?1 AND item_type='SubAgentActivity' ORDER BY item_id")?
+        .query_map([session], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    let collab_items = db.query_row("SELECT count(*) FROM codex_agent_items WHERE session_id=?1 AND item_type='CollabAgentToolCall'", [session], |r| r.get(0))?;
+    Ok(Rows { calls, items, mcp, aborts, namespaces, activities, collab_items })
 }
 
 /// Counts over observed sessions.
@@ -158,6 +255,7 @@ struct Tally {
     name_unreported: usize,
     by_status: BTreeMap<String, usize>,
     status_unreported: usize,
+    by_namespace: BTreeMap<String, usize>,
     without_output: usize,
     outputs_without_call: usize,
     executed: usize,
@@ -169,16 +267,35 @@ struct Tally {
     succeeded: usize,
     failed: usize,
     unknown: BTreeMap<&'static str, usize>,
+    /// MCP calls (A8): per server and tool, their carrying `exec` call, outcome.
+    mcp: usize,
+    mcp_by_server: BTreeMap<String, BTreeMap<String, usize>>,
+    mcp_unnamed: usize,
+    mcp_carried: usize,
+    mcp_without_call: usize,
+    mcp_succeeded: usize,
+    mcp_failed: usize,
+    mcp_unknown: BTreeMap<&'static str, usize>,
+    /// The carrying call's call → output wall time per MCP server and tool (`None`: unreported).
+    mcp_waits: Vec<(Option<String>, Option<String>, i64)>,
+    /// Collaboration calls (`spawn_agent`, `wait_agent`), the agent threads a
+    /// spawn call started (its `SubAgentActivity` item id is the call id) and
+    /// the `CollabAgentToolCall` items.
+    spawned: BTreeSet<String>,
+    collab_items: usize,
     /// call → output wall time per tool name (`None`: name unreported) and host (`None`: ambiguous).
     waits: Vec<(Option<String>, Option<String>, i64)>,
     negative: usize,
     /// Issued calls past `issued`, by inferred basis; the rest are unknown.
     accepted: BTreeMap<&'static str, usize>,
     accepted_unknown: usize,
+    /// Issued calls ended by their turn's `turn_aborted`, by basis: neither accepted nor unknown.
+    aborted: BTreeMap<&'static str, usize>,
 }
 
 impl Tally {
-    fn add(&mut self, s: &Session, calls: &[Call], items: &[Exec]) {
+    fn add(&mut self, s: &Session, rows: &Rows) {
+        let (calls, items) = (&rows.calls, &rows.items);
         let count = |map: &mut BTreeMap<String, usize>, missing: &mut usize, key: &Option<String>| match key {
             Some(key) => *map.entry(key.clone()).or_default() += 1,
             None => *missing += 1,
@@ -188,9 +305,11 @@ impl Tally {
             self.issued += 1;
             count(&mut self.by_name, &mut self.name_unreported, &c.name);
             count(&mut self.by_status, &mut self.status_unreported, &c.status);
-            match s.accepted(c) {
-                Some(basis) => *self.accepted.entry(basis).or_default() += 1,
-                None => self.accepted_unknown += 1,
+            if let Some(namespace) = rows.namespaces.get(&c.id) { *self.by_namespace.entry(namespace.clone()).or_default() += 1; }
+            match (aborted(rows, c), s.accepted(c)) {
+                (Some(basis), _) => *self.aborted.entry(basis).or_default() += 1,
+                (None, Some(basis)) => *self.accepted.entry(basis).or_default() += 1,
+                (None, None) => self.accepted_unknown += 1,
             }
             match (c.called, c.output) {
                 (_, None) => self.without_output += 1,
@@ -212,6 +331,32 @@ impl Tally {
                 Err(reason) => *self.unknown.entry(reason).or_default() += 1,
             }
         }
+        for (m, carrier) in rows.mcp.iter().zip(carriers(calls, &rows.mcp)) {
+            self.mcp += 1;
+            self.executed += 1;
+            match (&m.server, &m.tool) {
+                (Some(server), Some(tool)) => *self.mcp_by_server.entry(server.clone()).or_default().entry(tool.clone()).or_default() += 1,
+                _ => self.mcp_unnamed += 1,
+            }
+            match carrier {
+                Some(c) => {
+                    self.mcp_carried += 1;
+                    if let (Some(called), Some(output)) = (c.called, c.output) && output >= called {
+                        self.mcp_waits.push((m.server.clone(), m.tool.clone(), output - called));
+                    }
+                }
+                // The call itself was not matched: it is issued once, here, and its stage is unknown.
+                None => { self.mcp_without_call += 1; self.issued += 1; self.accepted_unknown += 1; }
+            }
+            match mcp_outcome(m) {
+                Ok(true) => self.mcp_succeeded += 1,
+                Ok(false) => self.mcp_failed += 1,
+                Err(reason) => *self.mcp_unknown.entry(reason).or_default() += 1,
+            }
+        }
+        let collaboration: BTreeSet<&str> = rows.namespaces.iter().filter(|(_, n)| *n == COLLABORATION).map(|(id, _)| id.as_str()).collect();
+        self.spawned.extend(rows.activities.iter().filter(|(id, _)| collaboration.contains(id.as_str())).filter_map(|(_, thread)| thread.clone()));
+        self.collab_items += rows.collab_items;
     }
 }
 
@@ -249,33 +394,62 @@ fn computed(list: &[Session], coverage: &Value) -> BTreeMap<String, Value> {
     }
     if list.is_empty() { return unavailable_metrics("no_bound_session", Some(coverage)); }
     let mut t = Tally::default();
-    for s in list { if let Ok((calls, items)) = &s.tools { t.add(s, calls, items); } }
+    for s in list { if let Ok(rows) = &s.tools { t.add(s, rows); } }
     let accepted: usize = t.accepted.values().sum();
-    let m16 = json!({"value": {"issued": t.issued, "accepted": {"status": "inferred", "count": accepted, "unknown": t.accepted_unknown}, "executed": t.executed},
+    let aborted: usize = t.aborted.values().sum();
+    let commands = t.executed - t.mcp;
+    let m16 = json!({"value": {"issued": t.issued, "accepted": {"status": "inferred", "count": accepted, "unknown": t.accepted_unknown,
+            "declined_or_aborted": aborted}, "executed": t.executed},
         "issued": {"calls": t.issued, "by_name": t.by_name, "name_unreported": t.name_unreported, "by_status": t.by_status, "status_unreported": t.status_unreported,
-            "without_output": t.without_output, "outputs_without_call": t.outputs_without_call,
-            "basis": "distinct (session, call_id) with a recorded call; a call replayed by a resumed rollout or a retried record is one logical call"},
+            "by_namespace": t.by_namespace, "without_output": t.without_output, "outputs_without_call": t.outputs_without_call, "mcp_without_call": t.mcp_without_call,
+            "basis": "distinct (session, call_id) with a recorded call; a call replayed by a resumed rollout or a retried record is one logical call; an MCP call \
+                is the exec call carrying it (counted once), or, when none was matched, one more call (`mcp_without_call`, not in by_name or by_status)"},
         "accepted": {"label": "inferred", "calls": accepted, "by_basis": t.accepted, "unknown": t.accepted_unknown,
+            "declined_or_aborted": {"calls": aborted, "by_basis": t.aborted},
             "basis": {"human_routed": "the call → output interval overlaps a B6b `blocked` wait (first to last blocked sample) of the same attempt",
                 "auto_review": "a guardian session naming this session as its parent (native evidence) started inside the call → output interval, in the call's turn",
-                "human_routed_and_auto_review": "both"},
+                "human_routed_and_auto_review": "both",
+                "last_output_before_abort": "declined_or_aborted: the call's turn ended in `turn_aborted` and its output is the turn's last at or before the abort \
+                    (live: a declined approval aborts the turn right after the call's output)",
+                "no_output_before_abort": "declined_or_aborted: the call's turn ended in `turn_aborted` after the call, which has no output"},
             "detail": "codex 0.154.0 writes no typed approval request or decision (codex-live-0.154.0-a4.md §3): the stage is inferred from a wait or a \
-                guardian review around the call, never from a decision; a call with neither (or without an output) stays unknown, never accepted",
-            "caveat": "a denied approval also ends the wait and yields an output: `accepted` means the approval stage completed, not that it was approved"},
-        "executed": {"executions": t.executed, "scope": "command_execution", "by_source": t.by_source, "source_unreported": t.source_unreported,
+                guardian review around the call, never from a decision; a call with neither (or without an output) stays unknown, never accepted; a call \
+                ended by its turn's abort is declined_or_aborted, neither accepted nor unknown; other calls of an aborted turn keep their stage",
+            "caveat": "a denied approval that does not abort the turn also ends the wait and yields an output: `accepted` means the approval stage completed, \
+                not that it was approved"},
+        "executed": {"executions": t.executed, "scope": ["command_execution", "mcp"], "by_scope": {"command_execution": commands, "mcp": t.mcp},
+            "by_source": t.by_source, "source_unreported": t.source_unreported,
             "attribution": {"basis": "inferred", "rule": "same session and turn, latest call at or before completion, output not before it",
                 "by_call_name": t.attributed, "name_unreported": t.attributed_name_unreported, "unattributed": t.unattributed},
-            "basis": "one CommandExecution item per execution instance; a repeated execution is another instance"},
-        "certified": {"calls": "live", "call_status": "live for custom_tool_call, fixture for function_call", "exec_items": "live", "mcp_calls": "not_collected"},
+            "basis": "one CommandExecution item per execution instance (a repeated execution is another instance) and one McpToolCall item per MCP call; \
+                collaboration calls (spawn_agent, wait_agent) write neither"},
+        "mcp": {"calls": t.mcp, "by_server": t.mcp_by_server, "server_or_tool_unreported": t.mcp_unnamed,
+            "carrier": {"basis": "inferred", "rule": "same session and turn, latest exec custom_tool_call at or before the item's completion, output not before \
+                it, one item per call", "matched": t.mcp_carried, "unmatched": t.mcp_without_call},
+            "basis": "one McpToolCall item per MCP call, counted once: in codex 0.154.0 an MCP call runs inside an exec custom_tool_call (code mode), which is \
+                the same logical call, never a second one"},
+        "collaboration": {"calls": t.by_namespace.get(COLLABORATION).copied().unwrap_or(0), "spawned_threads": t.spawned.len(), "collab_items": t.collab_items,
+            "basis": "function calls in namespace `collaboration` (spawn_agent, wait_agent) and the agent threads a spawn call started (its SubAgentActivity \
+                item id is the call id); not tool executions"},
+        "certified": {"calls": "live", "call_status": "live for custom_tool_call, fixture for function_call", "exec_items": "live", "mcp_calls": "live",
+            "turn_aborts": "live", "namespaces": "live"},
         "coverage": coverage});
-    let terminal = t.succeeded + t.failed;
-    let mut m17 = json!({"numerator": t.succeeded, "denominator": terminal, "succeeded": t.succeeded, "failed": t.failed,
-        "unknown": {"executions": t.unknown.values().sum::<usize>(), "by_reason": t.unknown}, "pending_calls": t.without_output,
+    let mut unknown = t.unknown.clone();
+    for (reason, n) in &t.mcp_unknown { *unknown.entry(reason).or_default() += n; }
+    let (succeeded, failed) = (t.succeeded + t.mcp_succeeded, t.failed + t.mcp_failed);
+    let terminal = succeeded + failed;
+    let scope = |succeeded: usize, failed: usize, unknown: &BTreeMap<&str, usize>| json!({"succeeded": succeeded, "failed": failed,
+        "unknown": {"executions": unknown.values().sum::<usize>(), "by_reason": unknown}});
+    let mut m17 = json!({"numerator": succeeded, "denominator": terminal, "succeeded": succeeded, "failed": failed,
+        "unknown": {"executions": unknown.values().sum::<usize>(), "by_reason": unknown}, "pending_calls": t.without_output,
+        "by_scope": {"command_execution": scope(t.succeeded, t.failed, &t.unknown), "mcp": scope(t.mcp_succeeded, t.mcp_failed, &t.mcp_unknown)},
         "cancelled": unavailable("cancellation_not_exposed"), "timed_out": unavailable("timeout_not_exposed"),
-        "basis": "CommandExecution items with status `completed` (the only status certified live): exit code 0 succeeded, non-zero failed; a NULL exit code \
-            or another status is unknown and excluded, never a success; a pending execution writes no item, so calls without an output are counted apart",
+        "basis": "command_execution: CommandExecution items with status `completed` and exit code 0 succeeded, `completed` with a non-zero exit code or \
+            `failed` with a non-zero exit code (both certified live) failed; a NULL exit code, `failed` without a non-zero exit code or another status is \
+            unknown and excluded, never a success. mcp: McpToolCall items with is_error 1 failed, is_error 0 with status `completed` succeeded, else \
+            unknown. A pending execution writes no item, so calls without an output are counted apart",
         "coverage": coverage});
-    if terminal == 0 { m17["value"] = Value::Null; m17["reason"] = json!("empty_denominator"); } else { m17["value"] = json!(format!("{}/{terminal}", t.succeeded)); }
+    if terminal == 0 { m17["value"] = Value::Null; m17["reason"] = json!("empty_denominator"); } else { m17["value"] = json!(format!("{succeeded}/{terminal}")); }
     let (mut by_name, mut by_home) = (BTreeMap::<String, Vec<i64>>::new(), BTreeMap::<String, Vec<i64>>::new());
     let (mut unnamed, mut ambiguous) = (Vec::new(), Vec::new());
     for (name, home, ms) in &t.waits {
@@ -287,6 +461,20 @@ fn computed(list: &[Session], coverage: &Value) -> BTreeMap<String, Value> {
     wall["name_unreported"] = distribution(unnamed);
     wall["by_home"] = json!(by_home.into_iter().map(|(home, values)| (home, distribution(values))).collect::<BTreeMap<_, _>>());
     wall["home_ambiguous"] = distribution(ambiguous);
+    // The carrying exec call's call → output of each matched MCP call, per server and tool (also inside the overall and `by_name` `exec`).
+    let (mut by_server, mut mcp_unnamed) = (BTreeMap::<String, BTreeMap<String, Vec<i64>>>::new(), Vec::new());
+    for (server, tool, ms) in &t.mcp_waits {
+        match (server, tool) {
+            (Some(server), Some(tool)) => by_server.entry(server.clone()).or_default().entry(tool.clone()).or_default().push(*ms),
+            _ => mcp_unnamed.push(*ms),
+        }
+    }
+    let mut mcp = distribution(t.mcp_waits.iter().map(|(_, _, ms)| *ms).collect());
+    mcp["by_server"] = json!(by_server.into_iter().map(|(server, tools)| (server, tools.into_iter().map(|(tool, v)| (tool, distribution(v)))
+        .collect::<BTreeMap<_, _>>())).collect::<BTreeMap<_, _>>());
+    mcp["server_or_tool_unreported"] = distribution(mcp_unnamed);
+    mcp["basis"] = json!("the carrying exec call's call → output (matched by turn and time, inferred); not the MCP call's run time");
+    wall["mcp"] = mcp;
     wall["host_basis"] = json!("execution_home");
     wall["negative_intervals"] = json!(t.negative);
     wall["method"] = json!("nearest_rank");
@@ -295,6 +483,8 @@ fn computed(list: &[Session], coverage: &Value) -> BTreeMap<String, Value> {
     let m18 = json!({"value": unavailable("execution_duration_not_exposed"),
         "detail": "codex 0.154.0 records no execution end − start: the CommandExecution duration and its start/completion times are the unified exec \
             startup (caveat startup_not_run_time), and the call → output time includes approval waits",
+        "mcp_duration": {"value": unavailable("execution_duration_not_exposed"), "detail": "the McpToolCall duration is measured like an exec item's \
+            (caveat startup_not_run_time, certified only for a local stub): never read as run time"},
         "queue_time": unavailable("approval_decision_not_exposed"), "pending_calls": t.without_output, "timed_out": unavailable("timeout_not_exposed"),
         "call_to_output_ms": wall, "coverage": coverage});
     BTreeMap::from([("M16".to_owned(), metric("M16", m16)), ("M17".to_owned(), metric("M17", m17)), ("M18".to_owned(), metric("M18", m18))])
@@ -314,12 +504,14 @@ pub fn read(project: &Path, db: &Connection) -> Result<Value> {
     let sessions: Vec<Value> = list.iter().map(|s| {
         let tools = match &s.tools {
             Err(reason) => unavailable(reason),
-            Ok((calls, items)) => {
+            Ok(rows) => {
                 let mut t = Tally::default();
-                t.add(s, calls, items);
+                t.add(s, rows);
+                // `attributed`/`unattributed`: command executions inferred to a call; MCP calls are counted in `mcp_calls`.
                 json!({"issued": t.issued, "without_output": t.without_output, "outputs_without_call": t.outputs_without_call, "executed": t.executed,
-                    "attributed": t.executed - t.unattributed, "unattributed": t.unattributed, "succeeded": t.succeeded, "failed": t.failed,
-                    "unknown": t.unknown.values().sum::<usize>()})
+                    "attributed": t.executed - t.mcp - t.unattributed, "unattributed": t.unattributed, "mcp_calls": t.mcp,
+                    "succeeded": t.succeeded + t.mcp_succeeded, "failed": t.failed + t.mcp_failed,
+                    "unknown": t.unknown.values().chain(t.mcp_unknown.values()).sum::<usize>(), "declined_or_aborted": t.aborted.values().sum::<usize>()})
             }
         };
         json!({"session_id": s.id, "attempt_ids": s.attempts, "tools": tools})
@@ -358,11 +550,21 @@ pub fn text(value: &Value) -> String {
             m16["value"]["accepted"]["unknown"], m16["value"]["executed"]),
         None => format!("M16 tool_call_volume {}\n", reason(&m16["value"])),
     };
+    if m16["mcp"].is_object() {
+        let servers: Vec<String> = m16["mcp"]["by_server"].as_object().into_iter().flatten()
+            .flat_map(|(server, tools)| tools.as_object().into_iter().flatten().map(move |(tool, n)| format!("{server}/{tool} {n}"))).collect();
+        out += &format!("M16 mcp_calls {}{} (counted once with their exec call), declined_or_aborted {}\n", m16["mcp"]["calls"],
+            if servers.is_empty() { String::new() } else { format!(" [{}]", servers.join(", ")) }, m16["value"]["accepted"]["declined_or_aborted"]);
+    }
     out += &match &m17["value"] {
         Value::String(v) => format!("M17 tool_execution_success {v} (unknown {} excluded, pending calls {})\n", m17["unknown"]["executions"], m17["pending_calls"]),
         Value::Null => format!("M17 tool_execution_success n/a ({})\n", m17["reason"].as_str().unwrap_or("unknown")),
         other => format!("M17 tool_execution_success {}\n", reason(other)),
     };
+    if m17["by_scope"].is_object() {
+        let scope = |name: &str| { let s = &m17["by_scope"][name]; format!("{name} {} succeeded {} failed {} unknown", s["succeeded"], s["failed"], s["unknown"]["executions"]) };
+        out += &format!("M17 by scope: {}; {}\n", scope("command_execution"), scope("mcp"));
+    }
     out += &format!("M18 tool_latency_p95 {}\n", reason(&m18["value"]));
     let wall = &m18["call_to_output_ms"];
     if wall["samples"].is_u64() {

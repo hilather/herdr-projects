@@ -294,7 +294,7 @@ Cards:
   turn). Reconcile a fork's thread and token_count totals against its
   origin's total at the fork point (today every fork records false
   discrepancies).
-- **B12** (lane B):
+- **Done (B12, no migration; contracts-accounting.md §15):** **B12** (lane B):
   - M17 counts `failed` with a non-zero exit as a failure.
   - M16 reports calls that ended in `turn_aborted` as declined or aborted.
   - Fork inclusion becomes `separate`, since a live fork replays no records.
