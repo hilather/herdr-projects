@@ -174,7 +174,7 @@ merges one PR at a time.
   `resets_at` from different homes as one account-window, or report
   `account_basis: execution_home` explicitly. `resets_at` was fixed within a
   window (no jitter observed).
-- **Unblocked (A6 collects it; B5 next):** **B5 tool metadata** (steward §7 review first): 0.154.0 has no
+- **Done (A6 + B5):** **B5 tool metadata** (steward §7 review first): 0.154.0 has no
   `exec_command_end`/`mcp_tool_call_end`. Tool metadata lives in
   `response_item` `custom_tool_call`/`function_call` (+ `*_output` by
   `call_id`) and `event_msg/item_completed` `CommandExecution` (id, status,
@@ -191,3 +191,9 @@ merges one PR at a time.
   `quota_observations` (B7) and `session_nodes` (B9) are no longer read or
   written. Lanes have been told not to DROP TABLE; a single cleanup migration
   waits for the owner's decision.
+- **B5 follow-ups** (lane B): infer the M16 accepted stage from a call
+  overlapping a B6b `blocked` wait (human-routed) or a same-turn guardian
+  (auto-review), labelled inferred; per-host M18 breakdown. M18 stays
+  unavailable until Codex records an execution's real start and end. A live
+  run should certify exec statuses other than `completed`, and
+  `function_call.status`.
