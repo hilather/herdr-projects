@@ -35,7 +35,7 @@ needs a new reviewed revision, not a silent reinterpretation.
   (RFC 8785 subset, as doc 03 §4). Digests are `sha256:` + lowercase hex.
 - **Time.** Unix milliseconds from the controller's `now` at the transition.
   Codex times are kept as reported and never reorder canonical events.
-- **Stores.** Canonical: `<project>/.state/state.db`, migrations 0049–0051.
+- **Stores.** Canonical: `<project>/.state/state.db`, migrations 0049–0053 (0052 collector bindings, contracts-collection.md; 0053 candidate groups, contracts-quality.md §3).
   Sidecar: `<project>/.state/telemetry.db`, own sequence under
   `migrations/telemetry/`, mode 0600, created on first collect. No
   cross-database transaction or foreign key; sidecar rows reference canonical
