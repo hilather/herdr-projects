@@ -197,3 +197,8 @@ merges one PR at a time.
   unavailable until Codex records an execution's real start and end. A live
   run should certify exec statuses other than `completed`, and
   `function_call.status`.
+- **B6a follow-ups** (lane B/steward): M34 needs a coordinator usage scope
+  and a versioned allocation rule; M37 needs an accepted-supersession-reason
+  producer; M36 does not see rebases a worker does in its own worktree. Also:
+  feed the F4.6/F5.4 scale-trial steps in as named concurrency levels,
+  per-configuration fan-out, and a configurable window (fixed at 1 h now).
