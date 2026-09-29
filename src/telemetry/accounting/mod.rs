@@ -9,6 +9,7 @@ use std::path::Path;
 
 pub mod attention;
 pub mod cost;
+pub mod fleet;
 pub mod graph;
 pub mod ledger;
 pub mod quota;
@@ -72,6 +73,13 @@ pub enum Command {
     /// Tool calls and command executions per bound session (A6 metadata only),
     /// with coverage and M16–M18. Derived at read time; read-only.
     Tools {
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fleet efficiency from canonical attempt lifecycle, acceptance and integration
+    /// rows: concurrency buckets and M35, integration conflicts (M36), M34/M37. Read-only.
+    Fleet {
         /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
@@ -146,6 +154,11 @@ pub fn run(project: &Path, command: Command) -> Result<String> {
             if !json { return Ok(tools::text(&value)); }
             value
         }
+        Command::Fleet { json } => {
+            let value = fleet::read(project)?;
+            if !json { return Ok(fleet::text(&value)); }
+            value
+        }
     };
     Ok(serde_json::to_string_pretty(&value)? + "\n")
 }
@@ -163,11 +176,12 @@ fn with_availability(mut metrics: BTreeMap<String, Value>) -> BTreeMap<String, V
 }
 
 /// M08/M09 (below), M38/M39 (§5), M31–M33 (§6, replacing the central
-/// `attention_not_collected` entries) and M16–M18 (§9).
+/// `attention_not_collected` entries), M16–M18 (§9) and M34–M37 (§10).
 pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> {
     let mut metrics = usage_metrics(project, since)?;
     metrics.extend(attention::metrics(project, since)?);
     metrics.extend(tools::metrics(project, since)?);
+    metrics.extend(fleet::metrics(project, since)?);
     Ok(metrics)
 }
 

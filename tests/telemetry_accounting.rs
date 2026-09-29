@@ -1058,3 +1058,172 @@ fn tool_metrics_before_a6_or_reread_are_unavailable() {
     assert!(text.lines().any(|l| l == "M16 tool_call_volume n/a (pending_reread)"), "{text}");
     assert!(text.lines().any(|l| l == "M17 tool_execution_success n/a (pending_reread)"), "{text}");
 }
+
+/// Start of a UTC hour (November 2023): fleet windows are whole UTC hours.
+const HOUR0: i64 = 472_223 * 3_600_000;
+fn at(hours: i64, minutes: i64) -> i64 { HOUR0 + hours * 3_600_000 + minutes * 60_000 }
+
+/// Canonical rows of the fan-out fixture below in `project`; `class_of(attempt,
+/// code, docs)` picks each attempt's classification (`None`: unclassified).
+fn plant_fleet(project: &Path, class_of: &dyn Fn(&str, &str, &str) -> Option<String>) -> rusqlite::Connection {
+    use herdr_projects::store::SqliteStore;
+    fs::create_dir_all(project.join(".state")).unwrap();
+    let db_path = project.join(".state/state.db");
+    drop(SqliteStore::create(&db_path).unwrap());
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    let id = |n: u32| format!("{n:064x}");
+    let oid = "a".repeat(40);
+    let (code, docs) = (format!("sha256:{}", "1".repeat(64)), format!("sha256:{}", "2".repeat(64)));
+    for (cls, class) in [(&code, "code"), (&docs, "docs")] {
+        db.execute("INSERT INTO task_classifications(classification_id,task_id,contract_revision,taxonomy,class,band,features,classifier,revision,reason,created_unix_ms)
+            VALUES(?1,?2,1,'v1',?2,'small','{}','fixture',1,NULL,0)", [cls.as_str(), class]).unwrap();
+    }
+    let attempt = |attempt: &str, task: &str, state: &str, marks: &[(&str, i64)]| {
+        db.execute("INSERT INTO tasks(id,revision,state,title) VALUES(?1,1,'running',?1)", [task]).unwrap();
+        db.execute("INSERT INTO attempts(id,task_id,revision,state,reservation,termination_observed) VALUES(?1,?2,2,?3,?1,?4)",
+            rusqlite::params![attempt, task, state, i64::from(state != "running")]).unwrap();
+        for (mark, unix_ms) in marks {
+            db.execute("INSERT INTO attempt_lifecycle(attempt_id,state,attempt_revision,unix_ms,source) VALUES(?1,?2,2,?3,'fixture')", rusqlite::params![attempt, mark, unix_ms]).unwrap();
+        }
+        if !marks.is_empty() {
+            db.execute("INSERT INTO dispatch_decisions(attempt_id,task_id,task_revision,contract_revision,classification_id,chosen_configuration_id,eligible,chooser_kind,chooser_principal,reason_codes,decided_unix_ms)
+                VALUES(?1,?2,1,1,?3,'cfg',json_array('cfg'),'operator','owner','[\"operator_preference\"]',?4)", rusqlite::params![attempt, task, class_of(attempt, &code, &docs), marks[0].1]).unwrap();
+        }
+    };
+    for n in 1..=4 { attempt(&format!("a{n}"), &format!("ta{n}"), "completed", &[("reserved", at(0, -1)), ("running", at(0, 0)), ("completed", at(1, 0))]); }
+    for n in 1..=8 { attempt(&format!("b{n}"), &format!("tb{n}"), "completed", &[("reserved", at(1, -1)), ("running", at(1, 0)), ("completed", at(2, 0))]); }
+    // Predates the lifecycle log and ended before it: no marks, ignored.
+    attempt("z1", "tz1", "completed", &[]);
+    // Open, running since the start of the current hour: only the incomplete window.
+    let now_hour = unix_ms().div_euclid(3_600_000) * 3_600_000;
+    attempt("c1", "tc1", "running", &[("reserved", now_hour), ("running", now_hour)]);
+
+    // Results: (task, attempt, route, verified at, operations (ref, state, reason, created, integrated)).
+    type Op = (&'static str, &'static str, Option<&'static str>, i64, bool);
+    let results: [(&str, &str, &str, i64, Vec<Op>); 7] = [
+        ("ta1", "a1", "verify_only", at(0, 50), vec![]),
+        ("ta2", "a2", "verify_then_integrate", at(0, 35), vec![("refs/heads/main", "blocked", Some("merge_conflict"), at(0, 40), false),
+            ("refs/heads/main", "integrated", None, at(0, 45), true)]),
+        ("tb1", "b1", "verify_only", at(1, 50), vec![]),
+        ("tb2", "b2", "verify_then_integrate", at(1, 25), vec![("refs/heads/main", "integrated", None, at(1, 30), true)]),
+        ("tb3", "b3", "verify_then_integrate", at(1, 15), vec![("refs/heads/main", "discarded", Some("stale_base"), at(1, 20), false),
+            ("refs/heads/main", "integrated", None, at(1, 40), true)]),
+        ("tb4", "b4", "verify_then_integrate", at(1, 50), vec![("refs/heads/release", "blocked", Some("merge_conflict"), at(1, 55), false)]),
+        // Verified but never integrated: reached integration only through tb4 above; tb5 has no operation.
+        ("tb5", "b5", "verify_then_integrate", at(1, 10), vec![]),
+    ];
+    let mut n = 100;
+    for (task, attempt, route, verified, ops) in results {
+        n += 1;
+        let (submission, result) = (id(n), id(n + 1000));
+        db.execute("INSERT INTO task_contracts(task_id,contract_revision,project_store,expected_head,repository,base_oid,object_format,route,raw_bytes,raw_digest,installed_seq)
+            VALUES(?1,1,'store',1,'/repo',?2,'sha1',?3,x'7b7d',?4,1)", rusqlite::params![task, oid, route, id(9)]).unwrap();
+        db.execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,artifact_manifest,claimed_checks,created_unix_ms)
+            VALUES(?1,'store',?1,?2,'{}',?3,1,?2,?4,'/repo',?5,?5,'sha1','[]','[]',?6)", rusqlite::params![submission, id(8), task, attempt, oid, verified - 60_000]).unwrap();
+        db.execute("INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms)
+            VALUES(?1,?1,?2,?3,?3,'sha1',?4,?4,'linux-unshare-user-pid-mount-v1',0,?5)", rusqlite::params![result, submission, oid, id(7), verified]).unwrap();
+        for (k, (target, state, reason, created, integrated)) in ops.into_iter().enumerate() {
+            let op = format!("op-{task}-{k}");
+            db.execute("INSERT INTO integration_operations(operation_id,project_store,idempotency_key,payload_digest,repository,ref_name,expected_old_oid,verified_result_id,candidate_id,state,generation,object_format,checks_passed,reason,created_unix_ms)
+                VALUES(?1,'store',?1,?2,'/repo',?3,?4,?5,NULL,?6,1,'sha1',?7,?8,?9)",
+                rusqlite::params![op, id(6), target, oid, result, state, i64::from(integrated), reason, created]).unwrap();
+            if integrated {
+                db.execute("INSERT INTO integrated_commits(integrated_id,candidate_id,operation_id,repository,ref_name,commit_oid,tree_oid,expected_old_oid,object_format,created_unix_ms)
+                    VALUES(?1,?2,?2,'/repo',?3,?4,?4,?4,'sha1',?5)", rusqlite::params![id(n + 2000 + k as u32), op, target, oid, created]).unwrap();
+            }
+        }
+    }
+
+    db
+}
+
+/// Doc 10 §5a "Fan-out" and M36 on canonical rows planted as the golden
+/// report test does. Hour 0: a1–a4 run the whole hour (4 active agents), 2
+/// tasks accepted → 2/hour. Hour 1: b1–b8 (8 agents), 3 accepted → 3/hour.
+/// M35 at k=8 against k=4 (1/2 per agent) = 3/(8 × 1/2) = 3/4, marginal
+/// (3 − 2)/(8 − 4) = 1/4 per added agent. Identical task mix is comparable;
+/// a different class for the 8-agent hour labels M35 descriptive. Integration:
+/// a2 conflicts then integrates, b2 integrates cleanly, b3 is discarded on a
+/// moved target then integrates, b4 conflicts on another branch → M36 3/4.
+/// An open attempt only touches the incomplete current hour (censored); a
+/// pre-log attempt that ended before the log is ignored, one still open
+/// makes every window's concurrency unknown.
+#[test]
+fn fan_out_buckets_and_integration_conflicts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(tmp.path()).unwrap();
+    let (root, home) = (base.join("root"), base.join("home"));
+    let project = root.join("demo");
+    fs::create_dir_all(&home).unwrap();
+    let db = plant_fleet(&project, &|_, code, _| Some(code.to_owned()));
+    let cli_in = |slug: &str, args: &[&str]| -> String {
+        let out = Command::new(BIN).env_clear().env("HOME", &home).env("PATH", "/usr/bin:/bin")
+            .args(["--root", root.to_str().unwrap(), "telemetry", slug]).args(args).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let cli = |args: &[&str]| -> (serde_json::Value, String) {
+        let text = cli_in("demo", args);
+        (serde_json::from_str(&text).unwrap_or(serde_json::Value::Null), text)
+    };
+    // Derived from canonical rows only: no sidecar is needed or created.
+    let (fleet, _) = cli(&["accounting", "fleet", "--json"]);
+    assert!(!project.join(".state/telemetry.db").exists());
+    let f = &fleet["fleet"];
+    assert_eq!(f["coverage"], json!({"attempts": 14, "running_intervals": 13, "open_censored": 1, "never_running": 0, "predates_lifecycle_log": 1, "end_unknown": 0}));
+    assert_eq!(f["windows"], json!({"bucketed": 2, "excluded": {"incomplete": 1, "concurrency_unknown": 0, "outside_window": 0}}));
+    let bucket = |level: i64, active: i64, accepted: i64, per_hour: &str, per_agent: &str, m35: &str, marginal: serde_json::Value, mix: serde_json::Value, tvd: &str|
+        json!({"level": level, "windows": 1, "window_ms": 3_600_000, "active_ms": active, "mean_active": level.to_string(), "accepted": accepted,
+            "accepted_per_hour": per_hour, "per_agent_per_hour": per_agent, "m35": m35, "marginal_per_added_agent_per_hour": marginal, "mix": mix, "mix_tvd": tvd});
+    assert_eq!(f["buckets"], json!([
+        bucket(4, 14_400_000, 2, "2", "1/2", "1", serde_json::Value::Null, json!({"code/small": "1"}), "0"),
+        bucket(8, 28_800_000, 3, "3", "3/8", "3/4", json!("1/4"), json!({"code/small": "1"}), "0")]));
+    let comparable = json!({"test": "class_band_active_time_tvd", "max_tvd": "1/10", "reference": "reference bucket", "label": "comparable", "reasons": []});
+    let m35 = json!({"definition": "M35.fanout-v1", "name": "fan_out_efficiency", "window_ms": 3_600_000, "level_rule": "round_half_up(time_weighted_active_attempts)",
+        "scope": "worker_attempts", "reference_level": 4, "level": 8, "reference_per_agent_per_hour": "1/2", "marginal_per_added_agent_per_hour": "1/4",
+        "comparability": comparable, "label": "comparable", "value": "3/4"});
+    assert_eq!(fleet["metrics"]["M35"], m35);
+    let ratio = |n: i64, d: i64| json!({"numerator": n, "denominator": d, "value": format!("{n}/{d}")});
+    let m36 = json!({"definition": "M36.integration-v1", "name": "integration_conflict_rate", "numerator": 3, "denominator": 4, "value": "3/4",
+        "events": {"merge_conflict": 2, "stale_base": 1},
+        "by_target": {"refs/heads/main": ratio(2, 3), "refs/heads/release": ratio(1, 1)},
+        "by_bucket": {"4": ratio(1, 1), "8": ratio(2, 3)},
+        "scope": "integrator_observed", "not_observed": ["worker_side_rebase"],
+        "event_rule": "blocked/merge_conflict or discarded/stale_base on an operation created no later than the attempt's first integrated operation"});
+    assert_eq!(fleet["metrics"]["M36"], m36);
+    assert_eq!((&fleet["metrics"]["M34"]["value"], &fleet["metrics"]["M37"]["value"]),
+        (&json!({"status": "unavailable", "reason": "coordinator_usage_not_attributed"}), &json!({"status": "unavailable", "reason": "supersession_reason_not_recorded"})));
+    // The report takes the lane's M34–M37 unchanged.
+    let report = cli(&["report", "--json"]).0;
+    for id in ["M34", "M35", "M36", "M37"] { assert_eq!(report["metrics"][id], fleet["metrics"][id], "{id}"); }
+    let (_, text) = cli(&["accounting", "fleet"]);
+    assert!(text.lines().any(|l| l == "bucket k=8 windows=1 accepted=3 per_hour=3 per_agent=3/8 m35=3/4 marginal=1/4"), "{text}");
+    assert!(text.lines().any(|l| l == "M35 fan_out_efficiency 3/4 (comparable)"), "{text}");
+    assert!(text.lines().any(|l| l == "M36 integration_conflict_rate 3/4"), "{text}");
+    assert!(text.lines().any(|l| l == "M34 coordinator_overhead n/a (coordinator_usage_not_attributed)"), "{text}");
+    // A window from hour 1: only the 8-agent level remains; b2–b4 reached integration in it.
+    let since = at(1, 0).to_string();
+    let windowed = cli(&["report", "--json", "--since", &since]).0;
+    assert_eq!(windowed["metrics"]["M35"]["value"], json!({"status": "unavailable", "reason": "single_concurrency_level"}));
+    assert_eq!((&windowed["metrics"]["M36"]["numerator"], &windowed["metrics"]["M36"]["denominator"]), (&json!(2), &json!(3)));
+
+    // Mismatched task mix: the 8-agent hour worked on docs tasks. Same numbers, labelled descriptive.
+    plant_fleet(&root.join("mixed"), &|a, code, docs| Some(if a.starts_with('b') { docs } else { code }.to_owned()));
+    let fleet = serde_json::from_str::<serde_json::Value>(&cli_in("mixed", &["accounting", "fleet", "--json"])).unwrap();
+    assert_eq!((&fleet["metrics"]["M35"]["value"], &fleet["metrics"]["M35"]["label"], &fleet["metrics"]["M35"]["comparability"]["reasons"]),
+        (&json!("3/4"), &json!("descriptive"), &json!(["task_mix_differs"])));
+    assert_eq!((&fleet["fleet"]["buckets"][1]["mix"], &fleet["fleet"]["buckets"][1]["mix_tvd"]), (&json!({"docs/small": "1"}), &json!("1")));
+    // An attempt without a classification makes the mix unknown.
+    plant_fleet(&root.join("unknown"), &|a, code, docs| (a != "b8").then(|| if a.starts_with('b') { docs } else { code }.to_owned()));
+    let fleet = serde_json::from_str::<serde_json::Value>(&cli_in("unknown", &["accounting", "fleet", "--json"])).unwrap();
+    assert_eq!(fleet["metrics"]["M35"]["comparability"]["reasons"], json!(["classification_unknown", "task_mix_differs"]));
+
+    // A pre-log attempt still open was active at an unknown time: no window can be bucketed, never 0.
+    db.execute("INSERT INTO tasks(id,revision,state,title) VALUES('tz2',1,'running','tz2')", []).unwrap();
+    db.execute("INSERT INTO attempts(id,task_id,revision,state,reservation,termination_observed) VALUES('z2','tz2',2,'running','z2',0)", []).unwrap();
+    let (fleet, _) = cli(&["accounting", "fleet", "--json"]);
+    assert_eq!(fleet["fleet"]["windows"], json!({"bucketed": 0, "excluded": {"incomplete": 1, "concurrency_unknown": 2, "outside_window": 0}}));
+    assert_eq!(fleet["metrics"]["M35"]["value"], json!({"status": "unavailable", "reason": "no_complete_window"}));
+    assert_eq!((&fleet["metrics"]["M36"]["value"], &fleet["metrics"]["M36"]["by_bucket"]), (&json!("3/4"), &json!({"unknown": ratio(3, 4)})));
+}

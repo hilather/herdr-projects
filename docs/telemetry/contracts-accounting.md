@@ -59,8 +59,8 @@ The lane provides M08 and M09 (contracts §6, `definition` still
 counted entries (delta, an `accepted` disposition) of certified sessions, with
 the §6 `coverage`. They are derived from the Codex tables at report time, so
 they need no prior sync. It also provides M38 and M39, both `unavailable`
-(§5), M31–M33 (§6) and M16–M18 (§9, derived from A6 tool metadata at read
-time).
+(§5), M31–M33 (§6), M16–M18 (§9, derived from A6 tool metadata at read
+time) and M34–M37 (§10, derived from canonical rows at read time).
 
 ## 3. Session graph and model segments (B2, TM2.2)
 
@@ -672,3 +672,144 @@ equals `accounting tools`; before any collect everything is
 the A6 tables dropped (ingest 5) read as `predates_collection` without
 migrating; the next collect restores the output byte for byte; the resumed
 rollout gone before its re-read makes the session `pending_reread`.
+
+## 10. Fleet efficiency (B6a, TM2.8; M34–M37)
+
+Plan: doc 07 M34–M37, doc 10 §5a "Fan-out", doc 12 TM2.8. **Derived at read
+time** from canonical `state.db` rows only, opened read-only
+(`telemetry::read_only`): no stream migration, nothing stored, no sidecar
+needed or created. Only worker attempts are counted. The coordinator has no
+canonical attempt, so its time and cost never enter a worker figure (M34
+below).
+
+**Active intervals.** An attempt is active from its `running` lifecycle mark
+to its terminal mark (contracts §4, the `active_ms` interval). Per attempt,
+counted in `coverage {attempts, running_intervals, open_censored,
+never_running, predates_lifecycle_log, end_unknown}`:
+- Running and terminal marks: a known interval.
+- Running mark, attempt open: active up to the read's horizon (now),
+  `open_censored`. Its outcome is not known yet. It touches only windows up to
+  the horizon, and the current window is never bucketed.
+- Logged (`reserved` mark) but never `running`: not active (`never_running`).
+- Running mark, terminal attempt without a terminal mark: the end is unknown
+  (`end_unknown`). Every window from `running` to the horizon has unknown
+  concurrency.
+- No `reserved` mark (predates the log, `predates_lifecycle_log`): if the
+  attempt is terminal without a terminal mark, it ended before the log and is
+  ignored. Otherwise it was active at an unknown time from the log's first
+  mark to its terminal mark (or the horizon), and those windows have unknown
+  concurrency.
+- A store without `attempt_lifecycle`: M35 and M36 `unavailable
+  predates_lifecycle_log`. No `state.db`: `no_state_store`.
+
+**Windows and buckets.** Activity windows are whole UTC hours (`window_ms`
+3600000) that hold active time or an acceptance. A window's time-weighted
+active-attempt count is Σ overlap / `window_ms`. Its level `k` is that count
+rounded half up (`round_half_up(time_weighted_active_attempts)`). Some
+windows are not bucketed. They are counted in `windows.excluded` as
+`incomplete` (ends after the horizon), `concurrency_unknown` (overlaps an
+unknown span) or `outside_window` (starts before `--since`). Accepted
+throughput counts each task of contracts §6 `A` once, at its first acceptance
+evidence: `verified_results.created_unix_ms` for `verify_only`, and
+`integrated_commits.created_unix_ms` for `verify_then_integrate`. The
+evidence lands in the window that contains that time. Per bucket:
+`{level, windows, window_ms, active_ms, mean_active, accepted,
+accepted_per_hour, per_agent_per_hour, m35, marginal_per_added_agent_per_hour,
+mix, mix_tvd}`.
+
+All quantities are exact reduced rationals as strings (`"3/4"`, `"2"`), never
+floats.
+- `accepted_per_hour` = accepted × 3600000 / bucket `window_ms`.
+- `per_agent_per_hour` = that / `k`.
+- The **reference** level is the lowest level ≥ 1 with an accepted task.
+- `m35(k)` = `accepted_per_hour(k)` / (`k` × the reference's per-agent rate).
+- Marginal = the difference in `accepted_per_hour` from the previous level ≥ 1
+  bucket, divided by the difference in levels (`null` for the first).
+- A level-0 bucket carries `unavailable level_zero` for these fields.
+
+**M35 `fan_out_efficiency`** (`M35.fanout-v1`): `value` = `m35` of the
+highest level, with `level`, `reference_level`,
+`reference_per_agent_per_hour` and `marginal_per_added_agent_per_hour`.
+Otherwise it is `unavailable`:
+- `no_complete_window`: no bucketed window.
+- `no_accepted_throughput`: no reference level.
+- `single_concurrency_level`: the highest level is the reference.
+
+**Comparability** (`class_band_active_time_tvd`). A bucket's task mix is the
+share of its active time per decision classification `class/band`
+(contracts §1/§3). An attempt without one counts as `unclassified`. M35 is
+`label: comparable` only when two conditions hold. First, no bucket at
+level ≥ 1 holds `unclassified` time (else reason `classification_unknown`).
+Second, each such bucket's total variation distance from the reference
+bucket's mix (`mix_tvd` = ½ Σ |share difference|) is at most `max_tvd`
+`1/10` (else `task_mix_differs`). Otherwise it is `label: descriptive`, and
+`value` is unchanged. The label is on the metric and in `comparability
+{test, max_tvd, reference, label, reasons}`.
+
+**M36 `integration_conflict_rate`** (`M36.integration-v1`). An attempt
+reaches integration when it has an `integration_operations` row, joined
+through `verified_results` to `result_submissions.attempt_id`.
+
+The integrator records two conflict/rebase events:
+- `blocked` / `merge_conflict`: the merge onto the target conflicted.
+- `discarded` / `stale_base`: the target moved after the candidate was
+  built, so the candidate must be rebuilt.
+
+An event counts when it is on an operation that did not integrate and was
+created no later than the attempt's first integrated operation (either state
+`integrated` or an `integrated_commits` row). The formula is attempts with at
+least one event / attempts reaching integration, as an unreduced `"n/d"`
+(`null empty_denominator` for none). It carries `events` (count per kind) and
+two splits:
+- `by_target`: per `ref_name`, over that ref's operations.
+- `by_bucket`: the attempt's own concurrency level, time-weighted active
+  attempts over its active interval, rounded as above. The bucket is
+  `unknown` without a known interval or when an unknown span overlaps it.
+
+`scope: integrator_observed`. A worker rebasing inside its worktree is not
+observed (`not_observed: [worker_side_rebase]`). `--since` keeps attempts
+whose first operation is at or after it.
+
+**M34 `coordinator_overhead`**: `unavailable
+coordinator_usage_not_attributed`, `missing: [coordinator_usage_scope,
+coordinator_allocation_rule]`. The coordinator has no canonical attempt. Its
+Codex rollouts are unbound (contracts §5 binding rule), so no usage is
+recorded under a `coordinator` role scope. No versioned allocation rule
+exists either, and costs are published-rate estimates only (§4). The doc 10
+fixture (coordinator $4, workers $16 → 20%) needs both producers. Until
+then, no worker or per-arm figure includes any coordinator cost.
+
+**M37 `overlap_waste_share`**: `unavailable supersession_reason_not_recorded`,
+`missing: [accepted_supersession_reason]`. No canonical record says an
+attempt was superseded or abandoned because a sibling changed the same area.
+Candidate selections (contracts-quality.md §3) name a winner, not why
+another attempt was superseded.
+
+**`accounting fleet [--json]`** (read-only) prints `{fleet: {window_ms,
+horizon_unix_ms, coverage, windows {bucketed, excluded}, buckets,
+comparability}, metrics: {M34, M35, M36, M37}}`. The metrics are identical to
+the ones `telemetry <slug> report` shows through the lane hook. The text form
+has a windows line, one line per bucket (`bucket k=8 windows=1 accepted=3
+per_hour=3 per_agent=3/8 m35=3/4 marginal=1/4`) and one line per metric (M35
+followed by its label).
+
+Test `fan_out_buckets_and_integration_conflicts`:
+- Hour 0: 4 agents, 2 accepted → `2`/hour. Hour 1: 8 agents, 3 accepted →
+  `3`/hour. Reference `1/2` per agent, M35 `3/4`, marginal `1/4`,
+  `comparable`.
+- An open attempt from the current hour is censored (`incomplete` 1).
+- A pre-log attempt that ended before the log is ignored.
+- M36 `3/4`: a merge conflict before integration, a clean integration, a
+  stale base before integration, and a conflict on `refs/heads/release`
+  that never integrated. By target main `2/3` and release `1/1`; by
+  bucket 4 `1/1` and 8 `2/3`. The report equals `accounting fleet`.
+- `--since` hour 1: M35 is `single_concurrency_level` and M36 is `2/3`.
+- The same rows with docs tasks in hour 1 give `descriptive`
+  (`task_mix_differs`, `mix_tvd` `1`), with the value unchanged. Adding an
+  unclassified attempt adds `classification_unknown`.
+- An open pre-log attempt makes both hours `concurrency_unknown`: M35 is
+  `no_complete_window`, never 0, and M36's bucket is `unknown`.
+
+Follow-ups: coordinator usage scope and allocation rule (M34); a supersession
+reason producer (M37); worker-side rebase capture; the factory's scale-trial
+steps (F4.6/F5.4) as named concurrency steps; per-configuration fan-out.
