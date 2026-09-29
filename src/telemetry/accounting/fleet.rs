@@ -478,7 +478,7 @@ struct Session { scope: Scope, start: Option<i64>, valued: bool, entries: Vec<En
 /// unattributed), the coordinator scope, or outside the project.
 fn sessions(project: &Path, attempts: &BTreeSet<String>) -> Result<std::result::Result<Vec<Session>, &'static str>> {
     let Some(db) = crate::telemetry::sidecar::read(project)? else { return Ok(Err("collection_not_run")) };
-    let cost = super::cost::cost(&db, None)?;
+    let cost = super::cost::cost(&db, None, None)?;
     if cost.get("status").is_some() { return Ok(Err("not_priced")); }
     let dir = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf()).to_string_lossy().into_owned();
     let roots = [crate::telemetry::sanitize::home_prefix(&dir), dir];
