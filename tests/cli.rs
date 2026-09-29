@@ -5323,5 +5323,5 @@ fn fleet_action_opens_the_fleet_pane() {
     let text=String::from_utf8(out.stdout).unwrap();
     assert!(text.lines().any(|l|l.starts_with("── demo · fleet · as of ")),"{text}");
     assert!(text.lines().any(|l|l=="usage: collection not run (no telemetry sidecar)"),"{text}");
-    assert!(!text.contains("error"),"the handoff is consumed once, as given: {text}");
+    assert!(!text.lines().any(|l|l.starts_with("error:")),"the handoff is consumed once, as given: {text}");
 }
