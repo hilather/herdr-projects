@@ -481,7 +481,7 @@ pub fn reprice(db: &mut Connection) -> Result<Value> {
     // the usage time; its A4 model provider is checked against the card's.
     let mut stmt = tx.prepare("SELECT e.entry_id,e.session_id,e.source,e.model,e.new_input_tokens,e.cache_read_tokens,e.cache_write_tokens,e.output_tokens,
         EXISTS(SELECT 1 FROM usage_dispositions d WHERE d.entry_id=e.entry_id AND d.disposition='accepted'),
-        coalesce((SELECT g.role FROM session_nodes g WHERE g.session_id=e.session_id LIMIT 1),'primary'),
+        coalesce((SELECT g.role FROM session_graph_nodes g WHERE g.session_id=e.session_id LIMIT 1),'primary'),
         s.attempt_id,s.session_unix_ms,u.observed_unix_ms,t.record_unix_ms,m.model_provider
         FROM usage_entries e LEFT JOIN codex_usage u ON u.session_id=e.session_id AND u.ordinal=e.position
         LEFT JOIN rollout_sources s ON s.path_digest=u.path_digest

@@ -99,10 +99,11 @@ fn normalized_totals_match_doc05_golden() {
 /// gpt-5.5-mini (150) is one session of 200 in two segments. Its first rollout
 /// (50), resumed by a second that observes the same record again, is covered
 /// by that inclusive parent: the root stays 200, not 250. A guardian
-/// (`codex-auto-review`, `source.subagent`) session of 50 carries no native
-/// parent id, so it is reported apart as an unlinked child and never added to
-/// the root; its record before any `turn_context` (10) is unallocated and its
-/// turn spanning two models (5 + 5) is mixed.
+/// (live shape: `guardian_review`, `codex-auto-review`) session of 50 names a
+/// parent thread that was not collected, so it is reported apart as an
+/// unlinked child (`parent_not_collected`) and never added to the root; its
+/// record before any `turn_context` (10) is unallocated and its turn spanning
+/// two models (5 + 5) is mixed.
 #[test]
 fn model_switch_splits_segments_not_task() {
     let f = Fixture::new();
@@ -131,7 +132,7 @@ fn model_switch_splits_segments_not_task() {
              "segments": [segment(1, "gpt-5.5", 1, [40, 10, 4, 50]), segment(2, "gpt-5.5-mini", 2, [120, 30, 6, 150])],
              "mixed": none, "unallocated": none},
             {"session_id": GUARDIAN_SID, "role": "guardian", "linkage": "unlinked_child",
-             "parent": {"status": "unavailable", "reason": "no_native_parent_evidence"}, "total_tokens": 50,
+             "parent": {"status": "unavailable", "reason": "parent_not_collected", "session_id": PARENT}, "total_tokens": 50,
              "rollouts": [{"path_digest": g, "linkage": "unlinked_child", "parent": null, "evidence": null, "inclusive_total": 50, "attempt_id": attempt}],
              "segments": [segment(1, "codex-auto-review", 2, [25, 5, 1, 30])],
              "mixed": bucket(3, 4, 2, [7, 3, 0, 10]), "unallocated": bucket(1, 1, 1, [8, 2, 0, 10])}],
@@ -146,7 +147,7 @@ fn model_switch_splits_segments_not_task() {
     f.cli("collect");
     f.cli_args(&["accounting", "sync"]);
     assert_eq!(f.cli_args(&["accounting", "sessions"]).1, first);
-    assert_eq!((f.count("session_nodes"), f.count("model_segments")), (3, 5));
+    assert_eq!((f.count("session_graph_nodes"), f.count("model_segments")), (3, 5));
 
     // A third rollout rewriting record 2 of the session quarantines it (contracts §5):
     // inclusion is unknown, so neither the session nor the rollup shows a total.
@@ -176,7 +177,8 @@ const ABSENT: &str = "00000000-0000-4000-8000-0000000b7fff";
 /// is linked by `forked_from_id`, but a fork may replay its parent's records,
 /// so its inclusion and the children subtotal are `fork_replay_not_certified`,
 /// never a sum. A subagent naming a parent that was not collected (20) is
-/// `parent_not_collected`; a `review` guardian (50) has no parent id. Every
+/// `parent_not_collected`; a guardian (50) naming the parent by its thread
+/// lineage is linked with that basis, certified `live`, `separate`. Every
 /// record still counts once in M08/M09.
 #[test]
 fn child_sessions_link_to_parent_without_double_count() {
@@ -213,7 +215,8 @@ fn child_sessions_link_to_parent_without_double_count() {
     let not_certified = json!({"status": "unavailable", "reason": "fork_replay_not_certified"});
     assert_eq!(of(&sessions, PARENT)["total_tokens"], 100);
     assert_eq!(of(&sessions, PARENT)["children"], json!({"sessions": [spawned,
-        {"session_id": FORKED, "role": "fork", "link_basis": "forked_from_id", "certified": "fixture", "total_tokens": 40, "inclusion": not_certified}],
+        {"session_id": FORKED, "role": "fork", "link_basis": "forked_from_id", "certified": "fixture", "total_tokens": 40, "inclusion": not_certified},
+        {"session_id": GUARDIAN_SID, "role": "guardian", "link_basis": "thread_parent_thread_id", "certified": "live", "total_tokens": 50, "inclusion": "separate"}],
         "total_tokens": not_certified}));
     let fork = of(&sessions, FORKED);
     assert_eq!((&fork["role"], &fork["linkage"], &fork["parent"], &fork["total_tokens"]), (&json!("fork"), &json!("linked_child"),
@@ -222,9 +225,9 @@ fn child_sessions_link_to_parent_without_double_count() {
     assert_eq!((&orphan["role"], &orphan["linkage"], &orphan["parent"], &orphan["total_tokens"]), (&json!("subagent"), &json!("unlinked_child"),
         &json!({"status": "unavailable", "reason": "parent_not_collected", "session_id": ABSENT}), &json!(20)));
     let guardian = of(&sessions, GUARDIAN_SID);
-    assert_eq!((&guardian["role"], &guardian["linkage"], &guardian["parent"], &guardian["total_tokens"]), (&json!("guardian"), &json!("unlinked_child"),
-        &json!({"status": "unavailable", "reason": "no_native_parent_evidence"}), &json!(50)));
-    assert_eq!(sessions["rollup"], json!({"sessions": 100, "linked_children": not_certified, "unlinked_children": 20 + 50, "incomplete_sessions": 0}));
+    assert_eq!((&guardian["role"], &guardian["linkage"], &guardian["parent"], &guardian["total_tokens"]), (&json!("guardian"), &json!("linked_child"),
+        &json!({"session_id": PARENT, "link_basis": "thread_parent_thread_id", "certified": "live"}), &json!(50)));
+    assert_eq!(sessions["rollup"], json!({"sessions": 100, "linked_children": not_certified, "unlinked_children": 20, "incomplete_sessions": 0}));
     // Each record counts once: 80 + 25 + 30 + 15 + 40 input, 20 + 5 + 10 + 5 + 10 output.
     let report = f.report();
     assert_eq!((&report["metrics"]["M08"]["value"], &report["metrics"]["M09"]["value"]), (&json!(190), &json!(50)));
@@ -234,6 +237,79 @@ fn child_sessions_link_to_parent_without_double_count() {
     f.cli("collect");
     f.cli_args(&["accounting", "sync"]);
     assert_eq!(f.cli_args(&["accounting", "sessions"]).1, first);
+}
+
+/// Session id written literally in `guardian-no-model.jsonl`.
+const LINEAGE_ONLY: &str = "00000000-0000-4000-8000-0000000b7005";
+
+/// Contracts-collection A5 → B9 (codex-live-0.154.0-a4.md §5): a live-shape
+/// guardian names its parent in `rollout_threads.parent_thread_id` (and its
+/// records report the parent's `session_id`, never used as a key). Two
+/// guardians of `PARENT`: one of 50 with `codex-auto-review` records and one
+/// of 12 whose only guardian evidence is `thread_source = guardian_review`
+/// (its `subagent_kind` is `other`). Without the parent collected both are
+/// `parent_not_collected` naming it; with it (100) both are linked
+/// (`thread_parent_thread_id`, `live`) and `separate`: the parent stays 100,
+/// children 50 + 12 = 62, and each record counts once (M08 80 + 40 + 10,
+/// M09 20 + 10 + 2). A sidecar from before A5 synced again reads as it did
+/// before A5 (no lineage: `no_native_parent_evidence`, the model-less one a
+/// plain `subagent`) until the next collect re-reads the lineage.
+#[test]
+fn guardian_links_to_parent_by_thread_lineage() {
+    let f = Fixture::new();
+    let at = f.decided + 1_000;
+    let part = |name: &str| format!("{ACCOUNTING}/{name}");
+    let plant = |name: &str| f.rollout(&f.home, name, &[&part(&format!("{name}.jsonl"))], &f.worktree(), at, "0.154.0");
+    plant("guardian");
+    plant("guardian-no-model");
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let head = |sessions: &serde_json::Value, sid: &str| {
+        let s = sessions["sessions"].as_array().unwrap().iter().find(|s| s["session_id"] == sid).cloned().unwrap_or_else(|| panic!("{sid} in {sessions}"));
+        (s["role"].clone(), s["linkage"].clone(), s["parent"].clone(), s["total_tokens"].clone())
+    };
+    let (sessions, _) = f.cli_args(&["accounting", "sessions"]);
+    let claimed = json!({"status": "unavailable", "reason": "parent_not_collected", "session_id": PARENT});
+    assert_eq!(head(&sessions, GUARDIAN_SID), (json!("guardian"), json!("unlinked_child"), claimed.clone(), json!(50)));
+    assert_eq!(head(&sessions, LINEAGE_ONLY), (json!("guardian"), json!("unlinked_child"), claimed, json!(12)));
+    assert_eq!(sessions["rollup"], json!({"sessions": 0, "linked_children": 0, "unlinked_children": 62, "incomplete_sessions": 0}));
+
+    // The parent is collected: both guardians link to it by thread lineage, apart from its total.
+    plant("parent");
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let (sessions, linked) = f.cli_args(&["accounting", "sessions"]);
+    let parent = json!({"session_id": PARENT, "link_basis": "thread_parent_thread_id", "certified": "live"});
+    assert_eq!(head(&sessions, PARENT), (json!("primary"), json!("root"), json!(null), json!(100)));
+    let child = |sid: &str, total: i64| json!({"session_id": sid, "role": "guardian", "link_basis": "thread_parent_thread_id", "certified": "live",
+        "total_tokens": total, "inclusion": "separate"});
+    let of_parent = sessions["sessions"].as_array().unwrap().iter().find(|s| s["session_id"] == PARENT).unwrap();
+    assert_eq!(of_parent["children"], json!({"sessions": [child(LINEAGE_ONLY, 12), child(GUARDIAN_SID, 50)], "total_tokens": 62}));
+    assert_eq!(head(&sessions, GUARDIAN_SID), (json!("guardian"), json!("linked_child"), parent.clone(), json!(50)));
+    assert_eq!(head(&sessions, LINEAGE_ONLY), (json!("guardian"), json!("linked_child"), parent, json!(12)));
+    assert_eq!(sessions["rollup"], json!({"sessions": 100, "linked_children": 62, "unlinked_children": 0, "incomplete_sessions": 0}), "100 + 62 apart, never 162");
+    // Usage stays with each guardian's own rollout, never under the parent id its records report.
+    let (entries, _) = f.cli_args(&["accounting", "entries"]);
+    let mut ids: Vec<String> = entries["entries"].as_array().unwrap().iter().map(|e| e["entry_id"].as_str().unwrap().to_owned()).collect();
+    ids.sort();
+    assert_eq!(ids, [format!("codex:{PARENT}:1"), format!("codex:{LINEAGE_ONLY}:1"), format!("codex:{GUARDIAN_SID}:1"),
+        format!("codex:{GUARDIAN_SID}:2"), format!("codex:{GUARDIAN_SID}:3"), format!("codex:{GUARDIAN_SID}:4")]);
+    let report = f.report();
+    assert_eq!((&report["metrics"]["M08"]["value"], &report["metrics"]["M09"]["value"]), (&json!(80 + 40 + 10), &json!(20 + 10 + 2)));
+    assert_eq!(report["metrics"]["M08"]["coverage"], json!({"certified_sessions": 3, "excluded": {}}));
+
+    // A sidecar from before A5 (no `rollout_threads`): synced again, it reads as before A5.
+    f.sidecar().execute_batch("DROP TABLE rollout_threads; UPDATE telemetry_streams SET version=4 WHERE stream='ingest';").unwrap();
+    f.cli_args(&["accounting", "sync"]);
+    let (sessions, _) = f.cli_args(&["accounting", "sessions"]);
+    let none = json!({"status": "unavailable", "reason": "no_native_parent_evidence"});
+    assert_eq!(head(&sessions, GUARDIAN_SID), (json!("guardian"), json!("unlinked_child"), none.clone(), json!(50)));
+    assert_eq!(head(&sessions, LINEAGE_ONLY), (json!("subagent"), json!("unlinked_child"), none, json!(12)));
+    assert_eq!(sessions["rollup"], json!({"sessions": 100, "linked_children": 0, "unlinked_children": 62, "incomplete_sessions": 0}));
+    // The next collect re-reads the lineage: the graph equals the linked one.
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "sessions"]).1, linked);
 }
 
 /// Rate card fixture `name` (invented synthetic rates) with its rate boundary
@@ -750,7 +826,7 @@ fn attention_intervals_union_and_censor() {
         (serde_json::from_str(&text).unwrap_or(serde_json::Value::Null), text)
     };
     cli(&["collect"]);
-    assert_eq!(cli(&["accounting", "status"]).0, json!({"stream": "accounting", "version": 6}));
+    assert_eq!(cli(&["accounting", "status"]).0, json!({"stream": "accounting", "version": 7}));
     // Before any pass nothing was collected: unavailable, never 0.
     let report = cli(&["report", "--json"]).0;
     for id in ["M31", "M32", "M33"] {

@@ -70,7 +70,8 @@ counts); migrating to 2 clears `usage_ledger`, so a ledger synced before reads
 read-only.
 
 `session_graph`, one node per rollout source (table `session_nodes` from
-stream version 6, §7; `session_graph` is no longer written).
+stream version 6, §7, and `session_graph_nodes` from version 7, §8; the
+earlier tables are no longer written).
 Links come only from native evidence:
 
 - Resume: rollouts of one `session_meta.id` form one session. The rollout with
@@ -81,26 +82,34 @@ Links come only from native evidence:
   stays 200. Any `conflict` in the session (quarantine), or an epoch the root
   does not cover, makes every such node `unresolved`: the session total and
   its parent are `unavailable: inclusion_unknown`.
-- Role, from the root rollout's A4 `rollout_metadata` (certified `fixture`)
-  first: `guardian` when `subagent_kind = review` or a record carries model
-  `codex-auto-review`; `subagent` for any other `subagent_kind` (or, without
-  A4 metadata, `source = subagent`); `fork` when the session names a
+- Role, from the root rollout's A4 `rollout_metadata` and A5
+  `rollout_threads` first: `guardian` when `subagent_kind = review`, when
+  `thread_source = guardian_review` (A5, `live`; the live guardian's
+  `subagent_kind` is `other`) or when a record carries model
+  `codex-auto-review`; guardian evidence always wins over the generic
+  subagent kind. `subagent` for any other `subagent_kind` (or, without A4
+  metadata, `source = subagent`); `fork` when the session names a
   `forked_from_id` and is no subagent; else `primary`.
-- Child link (A4, §7): a session whose root rollout names
-  `subagent_parent_thread_id` (else `forked_from_id`), other than itself,
-  equal to a collected `rollout_sources.session_id` is a `linked_child` of
-  that session, with `link_basis` `parent_thread_id` / `forked_from_id` and
-  `certified: fixture` (whether `parent_thread_id` equals the parent's
-  `session_meta.id` holds in fixtures only). A named parent that was not
-  collected makes it `unlinked_child` with parent `unavailable:
+- Child link (A4 §7, A5 §8): a session whose root rollout names, other than
+  itself, `subagent_parent_thread_id`, else `rollout_threads.parent_thread_id`,
+  else `forked_from_id`, equal to a collected `rollout_sources.session_id` is
+  a `linked_child` of that session, with `link_basis` `parent_thread_id` /
+  `thread_parent_thread_id` / `forked_from_id`. `certified` is `live` for
+  `thread_parent_thread_id` (the live guardian's `parent_thread_id` is its
+  parent's `session_meta.id`) and `fixture` for the other two. A named parent
+  that was not collected makes it `unlinked_child` with parent `unavailable:
   parent_not_collected` (and the named `session_id`); a guardian or subagent
-  naming none (a `review` guardian never does) is `unlinked_child` with
-  `unavailable: no_native_parent_evidence`. Never by inference (cwd,
-  attempt, time).
+  naming none is `unlinked_child` with `unavailable:
+  no_native_parent_evidence`. Never by inference (cwd, attempt, time), and
+  never by either `session_id` field (`session_meta.session_id`,
+  `token_usage_record.session_id`): a guardian reports its parent's id there,
+  and nodes and usage are keyed by the rollout's own `session_meta.id`
+  (contracts.md §5).
 - A linked child is **never** added to its parent's total. The parent lists
   it under `children {sessions: [{session_id, role, link_basis, certified,
   total_tokens, inclusion}], total_tokens}`: `inclusion` is `separate` for a
-  spawned subagent, and `unavailable: fork_replay_not_certified` for a
+  spawned subagent and a guardian (the live parent's thread total 29760
+  excluded its guardian's 7462, codex-live-0.154.0-a4.md §5), and `unavailable: fork_replay_not_certified` for a
   session naming a `forked_from_id` (a fork may replay its parent's records,
   `forked_from_ordinal_exclusive` is not collected, live probe step 3). The
   children `total_tokens` is their sum only when every child total is known
@@ -131,17 +140,30 @@ question.
 
 Test `model_switch_splits_segments_not_task`: gpt-5.5 50 then gpt-5.5-mini
 150 → two segments, total 200; the resumed epoch of 50 stays inside the root
-of 200; an unlinked guardian of 50 (unallocated 10, `codex-auto-review` 30,
-mixed 10) is reported apart; a rewritten record makes the session unresolved.
+of 200; a live-shape guardian of 50 (unallocated 10, `codex-auto-review` 30,
+mixed 10) naming an uncollected parent thread is reported apart
+(`parent_not_collected`); a rewritten record makes the session unresolved.
 
 Test `child_sessions_link_to_parent_without_double_count`: a parent of 100
 and a spawned subagent of 30 naming it → the child is linked
 (`parent_thread_id`, `fixture`), the parent stays 100 with `children` 30,
 rollup 100 / 30 / 0. A fork of 40 (`forked_from_id`), a subagent of 20
-naming an uncollected parent (`parent_not_collected`) and a `review`
-guardian of 50 (`no_native_parent_evidence`) join: `children` and
+naming an uncollected parent (`parent_not_collected`) and a live-shape
+guardian of 50 naming the parent by thread lineage (linked,
+`thread_parent_thread_id`, `live`, `separate`) join: `children` and
 `linked_children` become `fork_replay_not_certified`, `unlinked_children`
-70; M08/M09 stay 190/50 (each record once).
+20; M08/M09 stay 190/50 (each record once).
+
+Test `guardian_links_to_parent_by_thread_lineage` (§8): two guardians of one
+parent, 50 (`codex-auto-review` records) and 12 (only `thread_source =
+guardian_review`, `subagent_kind = other`): without the parent both are
+`parent_not_collected` naming it (rollup 0 / 0 / 62); with the parent (100)
+both are linked (`thread_parent_thread_id`, `live`, `separate`), parent 100
+with `children` 62, rollup 100 / 62 / 0; ledger entries stay under each
+rollout's own id (parent 1, guardians 1 and 4); M08/M09 130/32. A pre-A5
+sidecar (no `rollout_threads`) synced again reads as before A5 (both
+`no_native_parent_evidence`, the 12 a `subagent`), and the next collect
+restores the linked graph byte for byte.
 
 ## 4. Rate cards and published-rate estimates (B3, TM2.3)
 
@@ -526,3 +548,28 @@ every stream migration it is re-runnable (`IF NOT EXISTS`, no `ALTER`). The supe
 are left as they were (no longer written or read; nothing is dropped).
 Migrating to 6 clears `usage_ledger`, so everything reads
 `ledger_not_synced` until the next sync.
+
+## 8. A5 thread lineage (B9) and stream version 7
+
+Stream `accounting` version 7 (`0007_thread_lineage.sql`) consumes lane A's
+A5 `rollout_threads(path_digest, parent_thread_id, session_id,
+thread_source)` (ingest 0005, contracts-collection.md A5, certified `live`),
+read by SQL only with a `LEFT JOIN` on `path_digest` beside
+`rollout_metadata`. A sidecar without the table (before A5) reads with no
+lineage, exactly as version 6 did. `rollout_threads.session_id` is never
+read.
+
+- `parent_thread_id` is parent evidence when `subagent_parent_thread_id` is
+  `NULL` and it is not the session's own id (§3, `link_basis`
+  `thread_parent_thread_id`, `certified: live`).
+- `thread_source = guardian_review` is guardian role evidence (§3).
+- A linked guardian's inclusion is `separate`; it is never inside its
+  parent's total (live: parent 29760, guardian 7462, attempt 37222).
+
+`session_nodes`' `link_basis` CHECK cannot hold the new basis, so version 7
+adds `session_graph_nodes` (the same columns, `link_basis` also
+`thread_parent_thread_id`), written and read in its place (also by §4's
+role lookup). `session_nodes` is left as it was (no longer written or read;
+nothing is dropped). Re-runnable (`IF NOT EXISTS`, no `ALTER`). Migrating to
+7 clears `usage_ledger`, so everything reads `ledger_not_synced` until the
+next sync.
