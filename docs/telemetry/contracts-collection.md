@@ -1045,7 +1045,7 @@ sentinels in `receiver_agents` and `agents_states`.
 | Upgrade of an A7 sidecar: `predates_collection` read-only, then a re-read equal to a fresh collect, stream 8, no conflict; a gone rollout `pending_reread` | `rollouts_read_before_a8_gain_their_live_run2_metadata_on_the_next_collect` |
 | Sentinels (MCP arguments and results, agent paths, collab agents and states), capabilities matching emitted fields (each new one valued), replay in any chunking | `planted_sentinels_never_leak`, `capabilities_match_emitted_fields`, `corpus_replays_identically_in_any_chunking` |
 
-### Contracts.md §5/§7 revision (for the steward)
+### Contracts.md §5/§7 revision (applied by the steward)
 
 `contracts.md` is a steward file. The exact diff:
 
