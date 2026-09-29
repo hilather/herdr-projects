@@ -4,7 +4,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{fmt, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 
-pub const SCHEMA: u32 = 60;
+pub const SCHEMA: u32 = 61;
 const APPLICATION: u32 = 1_213_222_994;
 pub const MIN_SQLITE: i32 = 3_053_004;
 pub const MIN_SQLITE_VERSION: &str = "3.53.4";
@@ -122,6 +122,7 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../migrations/0058_seeded_defects.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0059_review_ledger.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0060_attempt_supersessions.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0061_reviewer_authority.sql"))?;
             tx.commit()?;
         }
         // Persist the initial directory entry as well as SQLite's own commit.
@@ -537,6 +538,8 @@ pub use seeded_defects::{EvaluationArm,EvaluationOpportunity,SeedSpec,SeedState,
 mod review_ledger;
 mod supersessions;
 pub use supersessions::{SupersessionRecord,SupersessionRequest,SUPERSESSION_OUTCOMES,SUPERSESSION_REASONS};
+mod review_authority;
+pub use review_authority::{PreparedReviewAcceptance,PreparedReviewAuthority,PreparedReviewRevocation,ReviewAcceptance,ReviewAuthorityInstall,review_authority_state};
 pub use delegation::DelegationReserve;
 
 #[cfg(target_os = "linux")]

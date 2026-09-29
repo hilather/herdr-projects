@@ -6,10 +6,12 @@ TM3.6), doc 07 §5/§5b (M20–M29, M43, M44), doc 10 §5. Canonical migrations
 `0054_review_capture.sql` (schema 54), `0055_finding_triage.sql` (schema 55,
 §5), `0056_fix_attribution.sql` (schema 56, §6) and
 `0057_review_protocols.sql` (schema 57, §7), `0058_seeded_defects.sql`
-(schema 58, §8) and `0059_review_ledger.sql` (schema 59, §9); store API
+(schema 58, §8), `0059_review_ledger.sql` (schema 59, §9) and
+`0061_reviewer_authority.sql` (schema 61, §10); store API
 `src/store/review_capture.rs`, `src/store/finding_triage.rs`,
 `src/store/fix_attribution.rs`, `src/store/review_protocols.rs`,
-`src/store/seeded_defects.rs` and `src/store/review_ledger.rs`; CLI
+`src/store/seeded_defects.rs`, `src/store/review_ledger.rs` and
+`src/store/review_authority.rs` (signature checks in `src/authority.rs`); CLI
 `telemetry <slug> review ...` (`src/telemetry/review/`). Sidecar stream
 `review` has no tables yet. Nothing about reviews comes from the Codex
 adapter (contracts-collection.md A3).
@@ -73,19 +75,13 @@ opportunity.
 ## 2. Proposal versus acceptance
 
 A completion (and anything a worker writes) is a proposal. Acceptance is the
-separate table `review_acceptances(session_id, decision, authority_principal,
-authority_ref, decided_unix_ms)`. No canonical reviewer-authority producer
-exists (the only delegated review action is `review_memory`), so acceptance
-is **inactive**: a trigger aborts every insert, and
-`SqliteStore::accept_review` / `review accept` refuse every caller, writing
-nothing. A worker principal (`worker:*`, the reviewing attempt or the
-authoring attempt) is refused as a worker before that. A receipt carrying an
-acceptance field (`accepted`, `trust`, ...) is refused as an unknown field.
-`show` reports `acceptance {active: false, reason:
-no_reviewer_authority_producer}` and each completion's `acceptance` as
-unavailable with that reason. Activating acceptance needs the authority
-producer (scoped grant, principal distinct from the proposer) and a new
-migration that replaces the trigger.
+separate table `review_acceptances`, a decision (`accepted` or `rejected`) by
+a delegated reviewer under an owner-signed `code_review` grant, and only that
+(§10). Before 0061 a trigger aborted every insert. A receipt carrying an
+acceptance field (`accepted`, `trust`, ...) is still refused as an unknown
+field, and a completion keeps `trust = proposal` after a decision. `show`
+reports `acceptance {active: true, authority: delegated_code_review.v1}` and
+each completion's `acceptance` (the decision, or `null` while undecided).
 
 ## 3. Blind cross-provider assignment (`blind_cross_provider.v1`)
 
@@ -138,11 +134,7 @@ never 0.
   §5.
 - **M21** (sum of discovery credit), **M25**–**M27** and **M29**: §6.
 - **M28** skeptical incremental yield: §7.
-  **M24** (M21 per review cost) is `unavailable: review_cost_unallocated`:
-  review lifecycle cost (reviewer sessions, zero-find and failed reviews,
-  triage) is not allocated to review opportunities, the accounting lane's
-  per-attempt estimates are published-rate estimates from fixture rate cards,
-  and non-Codex reviewers have no collector, so no honest cost of `Q` exists.
+- **M24** review discovery efficiency: §10.
 
 Also in `telemetry <slug> report` and the fleet pane through the lane metrics
 hook.
@@ -157,8 +149,9 @@ show|validate|reject|duplicate|reset|split|restore|merge|unmerge`.
 triage principal is `operator:cli`, the project owner at the CLI, recorded
 with authority `operator_owner.v1`. The owner already holds every project
 decision at the CLI (operator dispatch, operator candidate selection), so
-this needs no delegation. No delegated or scoped reviewer authority exists
-(§2); until one does, `SqliteStore` refuses every other principal, writing
+this needs no delegation. Delegated `code_review` authority (§10) decides
+review completions, never findings; `SqliteStore` refuses every other
+principal, writing
 nothing: a worker (`worker:*` or any attempt's identity, including the
 reviewing and authoring attempts), an import (`import:*`), or any other name.
 A trigger and CHECKs repeat the rule on raw rows. Review acceptance (§2)
@@ -246,8 +239,8 @@ watermark, and M22/M23 leave seed-linked claims out (§9).
 
 Not built here: conflict records between
 submissions, imports of third-party review comments (any such producer can
-only write submissions), and a scoped reviewer-authority grant that would let
-a principal other than the owner triage.
+only write submissions), and delegated triage (a `code_review` grant cannot
+permit it, §10).
 
 ## 6. Fix attribution, regressions and role credit (TM3.3, card D3)
 
@@ -417,7 +410,7 @@ not model ability.
 Not built: binding repair attempts at launch (needs launch/scheduler
 changes); finding occurrences as a separate record beyond reopenings;
 mixed-model segment splits within one attempt; artifact-only publication
-contracts; M24 (review cost). M28 is §7.
+contracts. M24 is §10, M28 §7.
 
 
 ## 7. Review protocols and experiments (TM3.4, card D4)
@@ -829,10 +822,157 @@ report` is not guarded.
 Not built (needs routing, launch or scheduler changes, or new authority):
 binding repair attempts or skeptical passes at launch; a scheduled or
 launch-time review; a reviewer brief builder and disclosure or blinding of
-an actual brief (§3, §7); review acceptance (§2, needs a reviewer-authority
-producer); a scoped reviewer-authority grant for triage; conflict records
-and third-party review imports (§5); finding occurrences beyond reopenings,
-mixed-model segment splits and M24 (§6); adjudicator blinding,
+an actual brief (§3, §7); delegated triage (§10); conflict records
+and third-party review imports (§5); finding occurrences beyond reopenings
+and mixed-model segment splits (§6); adjudicator blinding,
 task-clustered intervals and `fixed_horizon` enforcement (§7); seeding
 replay-suite tasks (TM4.6); sequencing opportunity creation and
 assignment.
+
+## 10. Delegated review authority, acceptance and review cost (card D8)
+
+Canonical migration `0061_reviewer_authority.sql` (schema 61); store API
+`src/store/review_authority.rs`; signature checks `src/authority.rs`
+(`import_review_authority`, `revoke_review_authority`, `accept_review`); CLI
+`telemetry <slug> review authority import|revoke|show` and `review accept`
+(`src/telemetry/review/acceptance.rs`). Factory plan F2.5 (docs 03, 05, 07):
+bounded delegated authority is its own signed policy with explicit
+revocation, derived through the established validator, and a delegate can
+never approve its own results, change requirements or widen permissions.
+
+**Grant** (`code_review_authority.v1`, signed by the owner's pinned key,
+namespace `code-review-authority@herdr-projects`, verified with
+`ssh-keygen -Y verify` exactly like approval, contract and delegation
+imports; parsed only after the signature check; unknown fields refused):
+
+```json
+{"schema": "code_review_authority.v1", "scope": "code_review", "issuer": "owner",
+ "subject": "reviewer:carol", "subject_public_key": "ssh-ed25519 AAAA...",
+ "subject_configurations": [], "project_store": "/abs/.state/state.db",
+ "repositories": ["/repo"], "tasks": [{"task_id": "work", "contract_revision": 1}],
+ "kinds": ["code"], "review_configurations": [],
+ "actions": ["accept_review_completion"], "max_decisions": 2,
+ "valid_from_unix_ms": 1790000000000, "expires_unix_ms": 1790003600000,
+ "prohibited_effects": ["alter_requirements", "approve_author_attempt",
+   "approve_own_work", "child_delegation", "increase_permissions"],
+ "authority": {"id": "owner-approval-policy", "revision": 1, "digest": "<hex64>"}}
+```
+
+- `subject` is a reviewer principal `reviewer:<token>`: never `worker:*`,
+  an import or the operator. Its key must not be the owner's (no
+  self-delegation). `subject_configurations` (0–16) are the agent
+  configurations the reviewer acts as, when it is an agent.
+- Scope: this project's store, 1–32 repositories (the submission's
+  `repository`), 1–128 task contract revisions, review kinds, and optionally
+  1–16 reviewer configurations whose sessions it may decide (empty: any). All
+  lists sorted and distinct; a listed review configuration may not be one of
+  the subject's own.
+- `actions` is exactly `["accept_review_completion"]`: triage, requirement
+  changes and permissions stay the owner's. `prohibited_effects` must list
+  the five effects above; the owner signs them explicitly. A grant is valid
+  for at most 366 days and decides at most `max_decisions` (1–1024)
+  completions. `authority` must be the current owner policy.
+- Import (`review authority import DOC SIG`) verifies the signature, the
+  policy and the owner configuration, refuses an expired grant or another
+  project's, and stores the exact bytes and signature
+  (`review_authority_grants`, append-only). The same bytes replay; a longer
+  or wider grant is a new document the owner signs. `grant_id` is
+  `sha256:` of the bytes.
+
+**Nothing else mints or extends a grant.** The planner, workers and the
+reviewer hold no owner key; a grant signed by any other key, under another
+namespace, or edited after signing is refused, and so is any `review`
+command (except `present`) inside a worker execution context (§9).
+
+**Decision** (`review accept SESSION --document D --signature S`): a
+`review_acceptance.v1` request `{schema, grant_id, subject, project_store,
+session_id, receipt_digest, decision, reason?}` signed with the grant
+subject's key (namespace `review-acceptance@herdr-projects`). The grant ID
+only selects the key: the stored grant's owner signature is verified again
+against the current owner policy (a changed policy refuses), then the
+request against the subject's key; the owner's key cannot stand in for it.
+`rejected` needs a reason (`evidence_missing`, `insufficient_coverage`,
+`protocol_violation`, `wrong_scope`). Refused, writing nothing, unless all
+hold at the decision time:
+
+- the grant is unrevoked and `valid_from ≤ now < expires`, and has decided
+  fewer than `max_decisions` completions;
+- the session's completion is `completed` (an incomplete review is already
+  closed), its receipt digest is the request's, and it precedes the decision;
+- the session's repository, task contract revision, kind and (when listed)
+  reviewer configuration are in scope;
+- independence: the subject is neither the reviewing attempt
+  (`reviewer:<attempt>`) nor the author attempt, the session is not
+  `same_attempt_as_author`, and neither the session's configuration nor the
+  author attempt's dispatch configuration is one of `subject_configurations`.
+
+One decision per session (`review_acceptances`, append-only); the same
+request replays, any other is refused. Each row keeps the request bytes,
+signature, `authority = delegated_code_review.v1`, the principal and grant.
+A trigger (`review_acceptances_authorized`) repeats every rule except the
+signatures on raw rows: raw SQL without a covering grant aborts.
+
+**Revocation** (`review authority revoke DOC SIG`):
+`code_review_revocation.v1 {schema, grant_id, project_store, reason,
+authority}`, owner-signed (namespace `code-review-revocation@herdr-projects`),
+reason `compromised`, `issued_in_error`, `reviewer_retired` or
+`scope_changed`. It stops later decisions (store and trigger); earlier
+decisions stay. The same revocation replays. `review authority show` lists
+each grant's scope, `decisions`, `status` (`active`, `exhausted`,
+`not_yet_valid`, `expired`, `revoked`) and revocation, and every decision.
+
+**Triage stays the owner's.** Delegated triage (`delegated_code_review.v1`
+on `finding_log`) is not built: `finding_log`'s CHECKs admit only
+`operator:cli`/`operator_owner.v1`, and widening them rebuilds the shared
+ledger. A decision never changes a finding.
+
+**Metrics.** Doc 07 computes M21–M23 from accepted triage decisions, which
+stay the owner's: their values are unchanged. Each carries
+`review_acceptance {accepted, rejected, undecided, authority}`: M22/M23 over
+the window's submissions by their session's decision, M21 over `F` by its
+discovery claim's session.
+
+**M24** `M24.v1` review discovery efficiency (`review report`, `telemetry
+<slug> report`): validated unique findings from `Q` / lifecycle review cost
+of `Q`, `unit` `findings/<currency>`, an exact reduced fraction.
+
+- Cohort: opportunities assigned in the window. `Q` = the closed ones: a
+  completed review with a delegated decision (`accepted` or `rejected`), or
+  every session ended without completing (`unsuccessful`).
+  `awaiting_acceptance` and `open` are outside `Q`. An accepted review with a
+  pending claim is `awaiting_adjudication` (outside `Q`) until the horizon
+  (`--horizon-days`, default 14) after its decision, then in `Q` with the
+  pending claims counted as not validated (`triage_partial`).
+- Numerator: validated finding groups (§5) whose discovery claim is from an
+  accepted review of `Q`; seed-linked ones are `seeded_evaluation`, those
+  from rejected reviews `excluded_rejected_review`.
+- Cost: every session of `Q` (restarts, failed, timed-out, rejected and
+  zero-find reviews), each its attempt's primary estimate in the latest
+  valuation revision (`accounting cost`, read-only). A session whose attempt
+  reviewed more than once or also authored is `shared_attempt_unallocated`;
+  one without bound usage (e.g. a non-Codex reviewer) `no_usage_bound`;
+  unpriced estimates keep their reason. Never 0: `sessions {total, priced,
+  partial, unavailable}` and `cost {status, currency, amount}` (exact).
+  Unlinked child sessions and the owner's triage time are `not_included`.
+- `value`: the fraction when every session is priced and no triage is
+  partial; else `{status: partial, value, reasons}`; `null`
+  (`empty_denominator`) without `Q`; unavailable `collection_not_run`,
+  `not_priced`, `review_cost_unavailable`, `mixed_currency` or `zero_cost`.
+  `basis: published_rate_estimate`, `rate_cards: fixture_only`,
+  `observational: true`.
+
+Test `review_cost_and_acceptance_metrics`: synthetic card (input 2, output 4
+per 10^6). Accepted O1 (finding a, 0.004) and O2 (none, 0.008), timed-out O3
+(0.002), rejected O4 (finding b, 0.004), undecided O5 (finding c): `Q` =
+O1–O4, cost 0.018 USD, numerator 1 (b excluded) → `500/9`. An accepted O6
+by a reviewer without bound usage leaves the cost at 0.018 and makes M24
+`partial` `500/9` (`no_usage_bound` 1). Drill-downs: M22/M23 accepted 1,
+rejected 1, undecided 1; M21 `"2"` with accepted 1, rejected 1.
+
+Not built (launch routing, outside this card): launching reviewer attempts
+from an assignment and recording the session at launch; the blind review
+brief builder; custody of the reviewer's key outside any worker (a trusted
+review service signing decisions, not the model); a request draft command;
+per-attempt usage for non-Codex reviewers (their cost stays
+`no_usage_bound`); sequencing decisions in the shared ledger (`--as-of`
+views show a decision at every watermark); delegated triage.

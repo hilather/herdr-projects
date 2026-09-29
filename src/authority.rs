@@ -527,6 +527,84 @@ pub fn reconcile_memory(project:&Path,document:&Path,signature:&Path,expected_he
     result
 }
 
+pub const REVIEW_AUTHORITY_SIGNATURE_NAMESPACE:&str="code-review-authority@herdr-projects";
+pub const REVIEW_REVOCATION_SIGNATURE_NAMESPACE:&str="code-review-revocation@herdr-projects";
+pub const REVIEW_ACCEPTANCE_SIGNATURE_NAMESPACE:&str="review-acceptance@herdr-projects";
+
+/// Verify a `code_review` grant with the pinned owner key. The subject key
+/// must not be the owner's (no self-delegation) and the grant names the
+/// current owner policy. Parsing happens only after the signature check.
+fn prepare_review_authority(owner:&Policy,payload:&[u8],signature:&[u8],runner:&dyn Runner)->Result<crate::store::PreparedReviewAuthority> {
+    verify_signature(owner,payload,signature,REVIEW_AUTHORITY_SIGNATURE_NAMESPACE,runner)?;
+    let prepared=crate::store::PreparedReviewAuthority::parse_verified(payload).map_err(anyhow::Error::msg)?;
+    ensure!(*prepared.authority()==owner.reference()?,"review authority names a different authority policy");
+    ensure!(prepared.subject_public_key()!=owner.approval_public_key,"review authority self-signature is forbidden: the reviewer key must not be the owner's");
+    Ok(prepared)
+}
+
+/// Install one owner-signed `code_review` grant (contracts-review.md §10).
+/// Nothing else can mint one: no planner, worker or reviewer holds the owner key.
+pub fn import_review_authority(project:&Path,document:&Path,signature:&Path)->Result<crate::store::ReviewAuthorityInstall> {
+    let result=(||{
+        let _guard=migration::runtime_mutation(project)?;
+        let mut db=migration::open_active(project)?;
+        let (owner,config)=policy(project)?;
+        ensure!(db.project_control()?.context("control schema upgrade required")?.config_digest==config.digest,"owner configuration is not acknowledged by project control");
+        let payload=migration::read_plan_file(document).map_err(|_|anyhow::anyhow!("review authority document unreadable"))?;
+        let signature=migration::read_plan_file(signature).map_err(|_|anyhow::anyhow!("review authority signature unreadable"))?;
+        let prepared=prepare_review_authority(&owner,&payload,&signature,&RealRunner)?;
+        ensure!(migration::config_reference(Path::new(&config.path))?==config,"owner configuration changed during verification");
+        Ok(db.install_review_authority(&prepared,&signature,jiff::Timestamp::now().as_millisecond())?)
+    })();
+    if let Err(error)=&result {record_cli_denial(project,"delegation","review-import",None,error);}
+    result
+}
+
+/// Record an owner-signed revocation of one grant. Stops later decisions only.
+pub fn revoke_review_authority(project:&Path,document:&Path,signature:&Path)->Result<serde_json::Value> {
+    let result=(||{
+        let _guard=migration::runtime_mutation(project)?;
+        let mut db=migration::open_active(project)?;
+        let (owner,config)=policy(project)?;
+        let payload=migration::read_plan_file(document).map_err(|_|anyhow::anyhow!("review authority revocation unreadable"))?;
+        let signature=migration::read_plan_file(signature).map_err(|_|anyhow::anyhow!("review authority revocation signature unreadable"))?;
+        verify_signature(&owner,&payload,&signature,REVIEW_REVOCATION_SIGNATURE_NAMESPACE,&RealRunner)?;
+        let prepared=crate::store::PreparedReviewRevocation::parse_verified(&payload).map_err(anyhow::Error::msg)?;
+        ensure!(*prepared.authority()==owner.reference()?,"revocation names a different authority policy");
+        ensure!(migration::config_reference(Path::new(&config.path))?==config,"owner configuration changed during verification");
+        Ok(db.revoke_review_authority(&prepared,&signature,jiff::Timestamp::now().as_millisecond())?)
+    })();
+    if let Err(error)=&result {record_cli_denial(project,"delegation","review-revoke",None,error);}
+    result
+}
+
+/// Decide one review completion under a grant. The request's grant ID only
+/// selects the grant; the grant's owner signature is verified again against
+/// the current owner policy (a changed policy refuses), and the request must
+/// verify with the grant subject's key. The owner key cannot stand in for it.
+pub fn accept_review(project:&Path,session:&str,document:&Path,signature:&Path)->Result<crate::store::ReviewAcceptance> {
+    let result=(||{
+        let _guard=migration::runtime_mutation(project)?;
+        let mut db=migration::open_active(project)?;
+        let payload=migration::read_plan_file(document).map_err(|_|anyhow::anyhow!("acceptance request unreadable"))?;
+        let signature=migration::read_plan_file(signature).map_err(|_|anyhow::anyhow!("acceptance request signature unreadable"))?;
+        // Parsing an unverified selector confers no authority.
+        let selector=crate::store::PreparedReviewAcceptance::parse_unverified(&payload).map_err(anyhow::Error::msg)?;
+        ensure!(selector.session_id()==session,"the acceptance request names another session");
+        let (stored,grant_signature)=db.review_authority_grant(selector.grant_id())?;
+        let (owner,config)=policy(project)?;
+        let grant=prepare_review_authority(&owner,&stored.raw,&grant_signature,&RealRunner).context("the stored grant does not verify under the current owner policy")?;
+        ensure!(selector.subject()==grant.subject,"the acceptance request names another reviewer than the grant");
+        let reviewer=Policy{version:1,revision:1,approval_public_key:grant.subject_public_key().to_owned()};
+        verify_signature(&reviewer,&payload,&signature,REVIEW_ACCEPTANCE_SIGNATURE_NAMESPACE,&RealRunner)
+            .map_err(|_|anyhow::anyhow!("acceptance request signature failed: it must be signed with the grant subject's key"))?;
+        ensure!(migration::config_reference(Path::new(&config.path))?==config,"owner configuration changed during verification");
+        Ok(db.accept_review(&grant,&selector,&signature,jiff::Timestamp::now().as_millisecond())?)
+    })();
+    if let Err(error)=&result {record_cli_denial(project,"delegation","review-accept",None,error);}
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

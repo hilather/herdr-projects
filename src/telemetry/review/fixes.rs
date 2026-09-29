@@ -1,7 +1,7 @@
 //! `telemetry <slug> review fixes ...` (contracts-review.md §6, plan TM3.3):
 //! repair opportunities, fix proposals, exact-candidate verification and
 //! integration links, reopenings, introduction decisions and role credit,
-//! plus the fix metrics (M21, M25, M26, M27, M29; M24 unavailable). Every
+//! plus the fix metrics (M21, M25, M26, M27, M29). Every
 //! write is the project owner's (`operator:cli`) through `SqliteStore`; `show`
 //! and the metrics read `state.db` strictly read-only.
 use anyhow::{Context, Result};
@@ -14,8 +14,6 @@ use crate::store::{CREDIT_UNIT, CreditShareSpec, DEFAULT_REPAIR_HORIZON_MS, FixS
 const OPERATOR: &str = "operator:cli";
 const TRIAGE_AUTHORITY: &str = "operator_owner.v1";
 const DAY_MS: i64 = 86_400_000;
-/// M24 needs the lifecycle cost of review opportunities, which nothing allocates.
-const NO_REVIEW_COST: &str = "review_cost_unallocated";
 
 /// `herdr-projects telemetry <slug> review fixes ...`
 #[derive(clap::Subcommand)]
@@ -198,7 +196,7 @@ fn credit_ratio(allocated: u64, eligible: u64) -> Value {
 
 /// Fix metrics at `now` over the head state: M21 discovery credit, M25/M26
 /// finding outcomes and initial-assignment cohorts, M27 reopen rate, M29
-/// attribution coverage; M24 unavailable.
+/// attribution coverage (M24 is `acceptance.rs`).
 pub(super) fn metrics(state: Option<&FixState>, now: i64, since: Option<i64>, horizon_ms: i64) -> BTreeMap<String, Value> {
     let head = |id: &str, name: &str| json!({"definition": format!("{id}.v1"), "name": name, "basis": "owner_attribution", "trust": TRIAGE_AUTHORITY});
     let mut m21 = head("M21", "validated_unique_findings");
@@ -206,10 +204,9 @@ pub(super) fn metrics(state: Option<&FixState>, now: i64, since: Option<i64>, ho
     let mut m26 = head("M26", "currently_resolved_rate");
     let mut m27 = head("M27", "reopen_rate");
     let mut m29 = head("M29", "quality_attribution_coverage");
-    let m24 = json!({"definition": "M24.v1", "name": "review_discovery_efficiency", "value": unavailable(NO_REVIEW_COST)});
     let Some(state) = state else {
         for m in [&mut m21, &mut m25, &mut m26, &mut m27, &mut m29] { m["value"] = unavailable("fix_attribution_absent"); }
-        return BTreeMap::from([("M21".into(), m21), ("M24".into(), m24), ("M25".into(), m25), ("M26".into(), m26), ("M27".into(), m27), ("M29".into(), m29)]);
+        return BTreeMap::from([("M21".into(), m21), ("M25".into(), m25), ("M26".into(), m26), ("M27".into(), m27), ("M29".into(), m29)]);
     };
     let unit = CREDIT_UNIT;
     // F: validated unique findings, windowed by their discovery's arrival;
@@ -307,7 +304,7 @@ pub(super) fn metrics(state: Option<&FixState>, now: i64, since: Option<i64>, ho
     m29["value"] = credit_ratio(all_allocated, all_eligible);
     if all_eligible == 0 { m29["reason"] = json!("empty_denominator"); }
     m29["by_role"] = Value::Object(roles);
-    BTreeMap::from([("M21".into(), m21), ("M24".into(), m24), ("M25".into(), m25), ("M26".into(), m26), ("M27".into(), m27), ("M29".into(), m29)])
+    BTreeMap::from([("M21".into(), m21), ("M25".into(), m25), ("M26".into(), m26), ("M27".into(), m27), ("M29".into(), m29)])
 }
 
 /// Default M27 horizon (days), as C2's integration outcomes.

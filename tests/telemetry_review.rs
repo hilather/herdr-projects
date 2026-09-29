@@ -61,9 +61,9 @@ fn empty_review_counts_and_wrong_candidate_receipt_fails() {
     let empty = f.cli_args(&["review", "report"]).0["metrics"].clone();
     assert_eq!((&empty["M20"]["value"], &empty["M20"]["reason"], &empty["M20"]["denominator"]), (&json!(null), &json!("empty_denominator"), &json!(0)));
     for id in ["M22", "M23"] { assert_eq!((&empty[id]["value"], &empty[id]["reason"], &empty[id]["pending"]), (&json!(null), &json!("empty_denominator"), &json!(0)), "{id}"); }
-    // No validated finding: discovery credit is an observed 0; review cost is not allocated.
+    // No validated finding: discovery credit is an observed 0; no closed review opportunity: M24 has no denominator.
     assert_eq!((&empty["M21"]["value"], &empty["M21"]["unallocated"]), (&json!("0"), &json!("0")));
-    assert_eq!(empty["M24"]["value"], unavailable("review_cost_unallocated"));
+    assert_eq!((&empty["M24"]["value"], &empty["M24"]["reason"]), (&json!(null), &json!("empty_denominator")));
     for id in ["M25", "M26", "M27", "M29"] { assert_eq!((&empty[id]["value"], &empty[id]["reason"]), (&json!(null), &json!("empty_denominator")), "{id}"); }
 
     // O1 binds S1's exact task, contract revision and candidate.
@@ -126,23 +126,23 @@ fn empty_review_counts_and_wrong_candidate_receipt_fails() {
     assert_eq!(completions(), 1);
     assert!(f.cli_fail(&["review", "start", &o1_id, "--attempt", "rev-a2"]).contains("already completed"));
 
-    // Acceptance is inactive: a worker principal is refused as a worker, the operator as inactive, raw rows by the trigger.
-    let mut store = SqliteStore::open(&db_path).unwrap();
-    for worker in ["worker:rev-a1", "rev-a1", f.attempt.as_str()] {
-        assert!(format!("{:?}", store.accept_review(&sid, worker).unwrap_err()).contains("a worker cannot accept"), "{worker}");
-    }
-    drop(store);
-    assert!(f.cli_fail(&["review", "accept", &sid]).contains("review acceptance is inactive: no_reviewer_authority_producer"));
-    let raw = rusqlite::Connection::open(&db_path).unwrap().execute("INSERT INTO review_acceptances VALUES(?1,'accepted','operator:cli','x',1)", [&sid]).unwrap_err();
-    assert!(raw.to_string().contains("review acceptance is inactive"), "{raw}");
+    // Acceptance needs a delegated code_review grant (§10): none is installed, so a request and a raw row are both refused.
+    let request = receipt("accept.json", json!({"schema": "review_acceptance.v1", "grant_id": format!("sha256:{}", hex('a')), "subject": "reviewer:carol",
+        "project_store": db_path.canonicalize().unwrap(), "session_id": sid, "receipt_digest": done["receipt_digest"], "decision": "accepted"}));
+    f.cli_fail(&["review", "accept", &sid, "--document", &request, "--signature", &request]);
+    let decided = || rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT count(*) FROM review_acceptances", [], |r| r.get::<_, i64>(0)).unwrap();
+    assert_eq!(decided(), 0);
+    let raw = rusqlite::Connection::open(&db_path).unwrap().execute("INSERT INTO review_acceptances(session_id,decision,authority_principal,authority_ref,authority,receipt_digest,request_digest,request_bytes,request_signature,decided_unix_ms)
+        VALUES(?1,'accepted','operator:cli',?2,'delegated_code_review.v1',?3,?2,x'61',x'61',?4)", rusqlite::params![sid, format!("sha256:{}", hex('a')), done["receipt_digest"].as_str().unwrap(), unix_ms()]).unwrap_err();
+    assert!(raw.to_string().contains("needs a valid, unexpired, unrevoked code_review grant"), "{raw}");
 
     let shown = f.cli_args(&["review", "show"]).0;
-    assert_eq!(shown["acceptance"], json!({"active": false, "reason": "no_reviewer_authority_producer"}));
+    assert_eq!(shown["acceptance"], json!({"active": true, "authority": "delegated_code_review.v1"}));
     let by_id = |id: &str| shown["opportunities"].as_array().unwrap().iter().find(|o| o["opportunity_id"] == id).unwrap().clone();
     assert_eq!((&by_id(&o1_id)["status"], &by_id(&o1_id)["findings_submitted"]), (&json!("completed"), &json!(0)));
     assert_eq!((&by_id(&o2_id)["status"], &by_id(&o2_id)["findings_submitted"]), (&json!("no_session"), &unavailable("no_session")));
     assert_eq!((&by_id(&o3_id)["status"], &by_id(&o3_id)["findings_submitted"]), (&json!("unassigned"), &unavailable("unassigned")));
-    assert_eq!(by_id(&o1_id)["sessions"][0]["completion"]["acceptance"], unavailable("no_reviewer_authority_producer"));
+    assert_eq!(by_id(&o1_id)["sessions"][0]["completion"]["acceptance"], json!(null), "undecided: still a proposal");
 
     let m20 = f.cli_args(&["review", "report"]).0["metrics"]["M20"].clone();
     assert_eq!((&m20["numerator"], &m20["denominator"], &m20["value"], &m20["unassigned"]), (&json!(1), &json!(2), &json!("1/2"), &json!(1)));
@@ -2064,7 +2064,7 @@ fn review_ledger_upgrade_backfills_sessions_in_completion_order() {
     assert_eq!((version(), f.cli_args(&["review", "findings", "show"]).0["findings"]["head_seq"].clone()), (58, json!(4)));
 
     SqliteStore::open(&db_path).unwrap().upgrade_v1().unwrap();
-    assert_eq!(version(), 60);
+    assert_eq!(version(), i64::from(herdr_projects::store::SCHEMA));
     let sessions: Vec<String> = raw.prepare("SELECT session_id FROM review_sessions ORDER BY started_unix_ms").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
     let events = || raw.prepare("SELECT e.seq,e.session_id,e.event,e.backfilled,l.kind,l.authority FROM review_session_events e JOIN review_log l ON l.seq=e.seq ORDER BY e.seq").unwrap()
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?)))
@@ -2090,4 +2090,365 @@ fn review_ledger_upgrade_backfills_sessions_in_completion_order() {
     assert_eq!(events()[4..], [row(10, &p2_session, "started", 0), row(11, &p2_session, "completed", 0)]);
     assert_eq!(status(10), ["completed", "in_progress"]);
     assert_eq!(status(11), ["completed", "completed"]);
+}
+
+// Delegated code-review authority (contracts-review.md §10, card D8).
+
+const GRANT_NS: &str = "code-review-authority@herdr-projects";
+const REVOKE_NS: &str = "code-review-revocation@herdr-projects";
+const ACCEPT_NS: &str = "review-acceptance@herdr-projects";
+const PROHIBITED: [&str; 5] = ["alter_requirements", "approve_author_attempt", "approve_own_work", "child_delegation", "increase_permissions"];
+
+/// A migrated project with the owner key (`IntegrationLab`) and a reviewer
+/// key `carol` generated here; tasks `work` and `other` (contract revision 1
+/// each); author attempt `author` (configuration `codex`) with submissions
+/// S1 (work, /repo, 1…1), S2 (other, /repo, 2…2) and S3 (work, /elsewhere,
+/// 3…3); reviewer attempts of `work` whose dispatch chose `fast`, the
+/// retained profile every review here is assigned to.
+struct AuthorityWorld { lab: IntegrationLab, carol: std::path::PathBuf, fast: String, author: String }
+
+impl AuthorityWorld {
+    fn new(reviewers: &[&str]) -> Self {
+        use herdr_projects::{domain::TaskId, runtime};
+        let lab = IntegrationLab::new();
+        let mut head = runtime::snapshot(&lab.project).unwrap().head;
+        for task in ["work", "other"] { head = runtime::add_task(&lab.project, TaskId::new(task).unwrap(), task.into(), head).unwrap(); }
+        let config = herdr_projects::migration::config_reference(&lab.home.path().join(".config/herdr-projects/config.toml")).unwrap();
+        let author_profile = codex_profile(&config, "codex", "codex", Some(&lab.home.path().join("codex-home")));
+        let mut fast_profile = codex_profile(&config, "codex", "fast", Some(&lab.home.path().join("fast-home")));
+        fast_profile.arguments_digest = "1".repeat(64);
+        let db = lab.db();
+        let mut ids = Vec::new();
+        for profile in [&author_profile, &fast_profile] {
+            let c = agent_configuration(profile);
+            db.execute("INSERT OR IGNORE INTO agent_configurations VALUES(?1,?2,1)", rusqlite::params![c.id, c.canonical_json]).unwrap();
+            ids.push(c.id);
+        }
+        let db_path = lab.project.join(".state/state.db");
+        plant_profile(&db_path, author_profile);
+        plant_profile(&db_path, fast_profile);
+        let decision = |attempt: &str, task: &str, configuration: &str| db.execute("INSERT INTO dispatch_decisions(attempt_id,task_id,task_revision,contract_revision,chosen_configuration_id,eligible,chooser_kind,chooser_principal,reason_codes,decided_unix_ms)
+            VALUES(?1,?2,1,1,?3,'[\"x\"]','operator','operator:cli','[\"x\"]',1)", rusqlite::params![attempt, task, configuration]).unwrap();
+        for task in ["work", "other"] {
+            db.execute("INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq)
+                VALUES(?1,1,NULL,'store',0,'/repo',?2,'sha1',NULL,'verify_only',x'61',?3,(SELECT max(sequence) FROM events))", rusqlite::params![task, "b".repeat(40), hex('c')]).unwrap();
+            let attempt = if task == "work" { "author" } else { "author-other" };
+            db.execute("INSERT INTO attempts(id,task_id,revision,state,reservation,termination_observed) VALUES(?1,?2,1,'completed',?1,1)", [attempt, task]).unwrap();
+            decision(attempt, task, &ids[0]);
+        }
+        for (sub, task, repository, attempt) in [(hex('1'), "work", "/repo", "author"), (hex('2'), "other", "/repo", "author-other"), (hex('3'), "work", "/elsewhere", "author")] {
+            db.execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,artifact_manifest,claimed_checks,created_unix_ms)
+                VALUES(?1,'store',?1,?2,'{}',?3,1,?2,?4,?5,?6,?7,'sha1','[]','[]',1000)",
+                rusqlite::params![sub, hex('d'), task, attempt, repository, "b".repeat(40), sub[..40].to_owned()]).unwrap();
+        }
+        for attempt in reviewers {
+            db.execute("INSERT INTO attempts(id,task_id,revision,state,reservation,termination_observed) VALUES(?1,'work',1,'completed',?1,1)", [attempt]).unwrap();
+            decision(attempt, "work", &ids[1]);
+        }
+        let carol = lab.home.path().join("carol");
+        assert!(std::process::Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&carol).output().unwrap().status.success());
+        let author = ids.remove(0);
+        AuthorityWorld { lab, carol, fast: ids.remove(0), author }
+    }
+    fn public(key: &std::path::Path) -> String {
+        fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ")
+    }
+    /// A `code_review` grant for `reviewer:carol` over task `work` revision 1,
+    /// repository /repo and kind `code`, valid for an hour, with `changes` merged in.
+    fn grant(&self, changes: serde_json::Value) -> serde_json::Value {
+        let mut grant = json!({"schema": "code_review_authority.v1", "scope": "code_review", "issuer": "owner", "subject": "reviewer:carol",
+            "subject_public_key": Self::public(&self.carol), "subject_configurations": [], "project_store": self.lab.store, "repositories": ["/repo"],
+            "tasks": [{"task_id": "work", "contract_revision": 1}], "kinds": ["code"], "review_configurations": [], "actions": ["accept_review_completion"],
+            "max_decisions": 2, "valid_from_unix_ms": unix_ms() - 60_000, "expires_unix_ms": unix_ms() + 3_600_000, "prohibited_effects": PROHIBITED,
+            "authority": herdr_projects::authority::policy_reference(&self.lab.project).unwrap()});
+        for (k, v) in changes.as_object().unwrap() { grant[k] = v.clone(); }
+        grant
+    }
+    /// Write `body` as `name` and sign its exact bytes with `key` under `namespace`; returns (document, signature, digest).
+    fn sign(&self, key: &std::path::Path, namespace: &str, name: &str, body: &serde_json::Value) -> (String, String, String) {
+        let doc = self.lab.home.path().join(name);
+        let bytes = serde_json::to_vec_pretty(body).unwrap();
+        fs::write(&doc, &bytes).unwrap();
+        let _ = fs::remove_file(doc.with_extension("json.sig"));
+        assert!(std::process::Command::new("/usr/bin/ssh-keygen").args(["-Y", "sign", "-f"]).arg(key).args(["-n", namespace]).arg(&doc).output().unwrap().status.success());
+        (doc.display().to_string(), doc.with_extension("json.sig").display().to_string(), format!("sha256:{:x}", Sha256::digest(&bytes)))
+    }
+    /// Install a grant signed by the owner; returns its id.
+    fn install(&self, name: &str, grant: &serde_json::Value) -> String {
+        let (doc, sig, digest) = self.sign(&self.lab.key, GRANT_NS, name, grant);
+        let installed = self.lab.telemetry(&["review", "authority", "import", &doc, &sig])["grant"].clone();
+        assert_eq!((&installed["grant_id"], &installed["installed"]), (&json!(digest), &json!(true)));
+        digest
+    }
+    /// Open, assign (`fast`), start by `attempt` and complete one review of `submission`; returns (session, receipt digest).
+    fn review(&self, submission: char, kind: &str, attempt: &str, outcome: &str, findings: serde_json::Value) -> (String, String) {
+        let sub = hex(submission);
+        let opportunity = self.lab.telemetry(&["review", "open", &sub, "--kind", kind, "--protocol", "review-protocol.v1"])["opportunity"]["opportunity_id"].as_str().unwrap().to_owned();
+        self.lab.telemetry(&["review", "assign", &opportunity, "--reviewer", "fast"]);
+        let session = self.lab.telemetry(&["review", "start", &opportunity, "--attempt", attempt])["session"]["session_id"].as_str().unwrap().to_owned();
+        let mut receipt = json!({"schema": "review_receipt.v1", "session_id": session, "submission_id": sub, "candidate_oid": sub[..40].to_owned(),
+            "outcome": outcome, "findings": findings, "evidence": []});
+        if outcome != "completed" { receipt["reason"] = json!("budget_exhausted"); }
+        let path = self.lab.home.path().join(format!("{attempt}-receipt.json"));
+        fs::write(&path, receipt.to_string()).unwrap();
+        let done = self.lab.telemetry(&["review", "complete", "--input-file", path.to_str().unwrap()])["completion"].clone();
+        (session, done["receipt_digest"].as_str().unwrap().to_owned())
+    }
+    /// A decision request on `session` under `grant` by `subject`.
+    fn request(&self, grant: &str, session: &(String, String), decision: &str, reason: Option<&str>) -> serde_json::Value {
+        let mut request = json!({"schema": "review_acceptance.v1", "grant_id": grant, "subject": "reviewer:carol", "project_store": self.lab.store,
+            "session_id": session.0, "receipt_digest": session.1, "decision": decision});
+        if let Some(reason) = reason { request["reason"] = json!(reason); }
+        request
+    }
+    /// `review accept` of `request` signed by `key`: Ok(acceptance) or Err(stderr).
+    fn accept(&self, key: &std::path::Path, name: &str, request: &serde_json::Value) -> Result<serde_json::Value, String> {
+        let (doc, sig, _) = self.sign(key, ACCEPT_NS, name, request);
+        let out = self.lab.hp(&["telemetry", "demo", "review", "accept", request["session_id"].as_str().unwrap(), "--document", &doc, "--signature", &sig]);
+        if out.status.success() { Ok(serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["acceptance"].clone()) } else { Err(String::from_utf8_lossy(&out.stderr).into_owned()) }
+    }
+    fn decisions(&self) -> i64 { self.lab.db().query_row("SELECT count(*) FROM review_acceptances", [], |r| r.get(0)).unwrap() }
+    fn grants(&self) -> serde_json::Value { self.lab.telemetry(&["review", "authority", "show"]) }
+}
+
+/// Owner-signed grant G1 for `reviewer:carol`: task `work` revision 1,
+/// repository /repo, kind `code`, at most 2 decisions. Carol accepts O1's
+/// completed review (her request signed with her key): one decision, recorded
+/// with `delegated_code_review.v1`; the same request replays, a second one
+/// (a rejection) is refused. Refused, writing nothing: her request signed by
+/// the owner's key; one naming another reviewer; review O2 of task `other`,
+/// O3 of kind `security`, O4 of repository /elsewhere (outside scope); O5,
+/// which timed out (only a completed review is decided). Grant G2 names
+/// `reviewer:rev-a6`, who cannot accept O6, its own review; grant G3 names
+/// the author's configuration, so it cannot accept O7, a review of the
+/// author's work. G1 then accepts O7 (2 of 2) and is refused O8 at its limit;
+/// a raw acceptance row for O2 under G1 aborts in the trigger.
+#[test]
+fn delegated_reviewer_accepts_within_scope_and_is_refused_outside() {
+    let w = AuthorityWorld::new(&["rev-a1", "rev-a2", "rev-a3", "rev-a4", "rev-a5", "rev-a6", "rev-a7", "rev-a8"]);
+    let grant = w.grant(json!({}));
+    let g1 = w.install("g1.json", &grant);
+    let (doc, sig, _) = w.sign(&w.lab.key, GRANT_NS, "g1.json", &grant);
+    assert_eq!(w.lab.telemetry(&["review", "authority", "import", &doc, &sig])["grant"]["installed"], json!(false), "the same grant replays");
+
+    let o1 = w.review('1', "code", "rev-a1", "completed", json!(["finding:x"]));
+    let request = w.request(&g1, &o1, "accepted", None);
+    let accepted = w.accept(&w.carol, "o1.json", &request).unwrap();
+    assert_eq!((&accepted["decision"], &accepted["authority_principal"], &accepted["grant_id"], &accepted["authority"], &accepted["receipt_digest"], &accepted["replayed"]),
+        (&json!("accepted"), &json!("reviewer:carol"), &json!(g1), &json!("delegated_code_review.v1"), &json!(o1.1), &json!(false)));
+    assert_eq!(w.accept(&w.carol, "o1.json", &request).unwrap()["replayed"], json!(true));
+    assert!(w.accept(&w.carol, "o1-again.json", &w.request(&g1, &o1, "rejected", Some("insufficient_coverage"))).unwrap_err().contains("already has a decision"));
+    let shown = w.lab.telemetry(&["review", "show"]);
+    let completion = shown["opportunities"][0]["sessions"][0]["completion"].clone();
+    assert_eq!((&completion["trust"], &completion["acceptance"]["decision"], &completion["acceptance"]["grant_id"]), (&json!("proposal"), &json!("accepted"), &json!(g1)));
+
+    // The owner's key cannot stand in for the reviewer's; a request names exactly its grant's reviewer.
+    let o7 = w.review('1', "code", "rev-a7", "completed", json!([]));
+    assert!(w.accept(&w.lab.key, "o7-owner.json", &w.request(&g1, &o7, "accepted", None)).unwrap_err().contains("signed with the grant subject's key"));
+    let mut dave = w.request(&g1, &o7, "accepted", None);
+    dave["subject"] = json!("reviewer:dave");
+    assert!(w.accept(&w.carol, "o7-dave.json", &dave).unwrap_err().contains("names another reviewer"));
+
+    // Outside the grant's scope: another task, another kind, another repository.
+    let o2 = w.review('2', "code", "rev-a2", "completed", json!([]));
+    assert!(w.accept(&w.carol, "o2.json", &w.request(&g1, &o2, "accepted", None)).unwrap_err().contains("outside the grant's scope: task contract revision"));
+    let o3 = w.review('1', "security", "rev-a3", "completed", json!([]));
+    assert!(w.accept(&w.carol, "o3.json", &w.request(&g1, &o3, "accepted", None)).unwrap_err().contains("outside the grant's scope: review kind"));
+    let o4 = w.review('3', "code", "rev-a4", "completed", json!([]));
+    assert!(w.accept(&w.carol, "o4.json", &w.request(&g1, &o4, "accepted", None)).unwrap_err().contains("outside the grant's scope: repository"));
+    let o5 = w.review('1', "code", "rev-a5", "timed_out", json!([]));
+    assert!(w.accept(&w.carol, "o5.json", &w.request(&g1, &o5, "accepted", None)).unwrap_err().contains("only a completed review is accepted or rejected"));
+
+    // Never its own review, never the author attempt's work.
+    let g2 = w.install("g2.json", &w.grant(json!({"subject": "reviewer:rev-a6"})));
+    let o6 = w.review('1', "code", "rev-a6", "completed", json!([]));
+    let mut own = w.request(&g2, &o6, "accepted", None);
+    own["subject"] = json!("reviewer:rev-a6");
+    assert!(w.accept(&w.carol, "o6.json", &own).unwrap_err().contains("cannot accept its own review"));
+    let g3 = w.install("g3.json", &w.grant(json!({"subject": "reviewer:erin", "subject_configurations": [w.author]})));
+    let mut erin = w.request(&g3, &o7, "accepted", None);
+    erin["subject"] = json!("reviewer:erin");
+    assert!(w.accept(&w.carol, "o7-erin.json", &erin).unwrap_err().contains("work by the author attempt"));
+    assert_eq!(w.decisions(), 1, "refused decisions write nothing");
+
+    // The limit: G1's second decision is its last.
+    assert_eq!(w.accept(&w.carol, "o7.json", &w.request(&g1, &o7, "accepted", None)).unwrap()["decision"], json!("accepted"));
+    let o8 = w.review('1', "code", "rev-a8", "completed", json!([]));
+    assert!(w.accept(&w.carol, "o8.json", &w.request(&g1, &o8, "rejected", Some("evidence_missing"))).unwrap_err().contains("decision limit (2) is reached"));
+    let g = w.grants()["grants"].as_array().unwrap().iter().find(|g| g["grant_id"] == g1.as_str()).unwrap().clone();
+    assert_eq!((&g["status"], &g["decisions"], &g["max_decisions"], &g["prohibited_effects"]), (&json!("exhausted"), &json!(2), &json!(2), &json!(PROHIBITED)));
+
+    // Raw SQL: a row for an out-of-scope session under a real grant still aborts.
+    let raw = w.lab.db().execute("INSERT INTO review_acceptances(session_id,decision,authority_principal,authority_ref,authority,receipt_digest,request_digest,request_bytes,request_signature,decided_unix_ms)
+        VALUES(?1,'accepted','reviewer:carol',?2,'delegated_code_review.v1',?3,?4,x'61',x'61',?5)", rusqlite::params![o2.0, g1, o2.1, format!("sha256:{}", hex('7')), unix_ms()]).unwrap_err();
+    assert!(raw.to_string().contains("needs a valid, unexpired, unrevoked code_review grant"), "{raw}");
+    assert_eq!(w.decisions(), 2);
+}
+
+/// Minting: a grant signed by the reviewer's own key, one signed under the
+/// delegation namespace, one whose reviewer key is the owner's, one naming a
+/// worker, one adding triage, one leaving out a prohibited effect, and a
+/// signed grant whose expiry was extended afterwards are all refused, as is
+/// any import or decision run inside a worker execution context (HOME = the
+/// retained `fast` profile's execution home): no grant is installed. Then G
+/// (4 decisions) accepts O1; the reviewer cannot revoke it, the owner does
+/// (replayed once); O2 is refused as revoked, a raw row too, and O1's
+/// decision stays. G_future (valid from an hour ahead) refuses O3. G_short
+/// (valid 6 s) accepts O3, then refuses O4 once expired; an expired grant no
+/// longer imports.
+#[test]
+fn revoked_or_expired_grant_cannot_accept_and_workers_cannot_mint() {
+    let w = AuthorityWorld::new(&["rev-a1", "rev-a2", "rev-a3", "rev-a4"]);
+    let refused = |name: &str, key: &std::path::Path, namespace: &str, body: &serde_json::Value| {
+        let (doc, sig, _) = w.sign(key, namespace, name, body);
+        w.lab.fail(&["telemetry", "demo", "review", "authority", "import", &doc, &sig])
+    };
+    let grant = w.grant(json!({"max_decisions": 4}));
+    assert!(refused("self.json", &w.carol, GRANT_NS, &grant).contains("signature verification failed"));
+    assert!(refused("delegation.json", &w.lab.key, "delegation@herdr-projects", &grant).contains("signature verification failed"));
+    let owner_key = AuthorityWorld::public(&w.lab.key);
+    assert!(refused("owner-subject.json", &w.lab.key, GRANT_NS, &w.grant(json!({"subject_public_key": owner_key}))).contains("self-signature is forbidden"));
+    assert!(refused("worker.json", &w.lab.key, GRANT_NS, &w.grant(json!({"subject": "worker:rev-a1"}))).contains("never a worker"));
+    assert!(refused("triage.json", &w.lab.key, GRANT_NS, &w.grant(json!({"actions": ["accept_review_completion", "triage_findings"]}))).contains("permits only"));
+    let mut fewer = PROHIBITED.to_vec();
+    fewer.retain(|e| *e != "increase_permissions");
+    assert!(refused("fewer.json", &w.lab.key, GRANT_NS, &w.grant(json!({"prohibited_effects": fewer}))).contains("prohibited_effects must list"));
+    let (doc, sig, _) = w.sign(&w.lab.key, GRANT_NS, "extended.json", &grant);
+    let extended = fs::read_to_string(&doc).unwrap().replace(&grant["expires_unix_ms"].to_string(), &(grant["expires_unix_ms"].as_i64().unwrap() + 86_400_000).to_string());
+    fs::write(&doc, extended).unwrap();
+    assert!(w.lab.fail(&["telemetry", "demo", "review", "authority", "import", &doc, &sig]).contains("signature verification failed"));
+    // Inside a worker execution context the review CLI refuses before reading anything.
+    let worker_home = w.lab.home.path().join("fast-home");
+    fs::create_dir_all(&worker_home).unwrap();
+    let (doc, sig, _) = w.sign(&w.lab.key, GRANT_NS, "g.json", &grant);
+    let in_worker = |args: &[&str]| std::process::Command::new(BIN).env_clear().env("HOME", &worker_home).env("PATH", "/usr/bin:/bin")
+        .args(["--root", w.lab.root.to_str().unwrap(), "telemetry", "demo", "review"]).args(args).output().unwrap();
+    let out = in_worker(&["authority", "import", &doc, &sig]);
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("worker execution context"));
+    assert_eq!(w.grants()["grants"], json!([]), "nothing minted a grant");
+
+    // Revocation stops later decisions and keeps earlier ones.
+    let g = w.install("g.json", &grant);
+    let o1 = w.review('1', "code", "rev-a1", "completed", json!([]));
+    let (request_doc, request_sig, _) = w.sign(&w.carol, ACCEPT_NS, "o1.json", &w.request(&g, &o1, "accepted", None));
+    let out = in_worker(&["accept", &o1.0, "--document", &request_doc, "--signature", &request_sig]);
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("worker execution context"));
+    assert_eq!(w.accept(&w.carol, "o1.json", &w.request(&g, &o1, "accepted", None)).unwrap()["decision"], json!("accepted"));
+    let revocation = json!({"schema": "code_review_revocation.v1", "grant_id": g, "project_store": w.lab.store, "reason": "reviewer_retired",
+        "authority": herdr_projects::authority::policy_reference(&w.lab.project).unwrap()});
+    let (doc, sig, _) = w.sign(&w.carol, REVOKE_NS, "revoke.json", &revocation);
+    assert!(w.lab.fail(&["telemetry", "demo", "review", "authority", "revoke", &doc, &sig]).contains("signature verification failed"));
+    let (doc, sig, _) = w.sign(&w.lab.key, REVOKE_NS, "revoke.json", &revocation);
+    let revoked = w.lab.telemetry(&["review", "authority", "revoke", &doc, &sig])["revocation"].clone();
+    assert_eq!((&revoked["grant_id"], &revoked["reason"], &revoked["replayed"], &revoked["undoes_earlier_decisions"]), (&json!(g), &json!("reviewer_retired"), &json!(false), &json!(false)));
+    assert_eq!(w.lab.telemetry(&["review", "authority", "revoke", &doc, &sig])["revocation"]["replayed"], json!(true));
+    let o2 = w.review('1', "code", "rev-a2", "completed", json!([]));
+    assert!(w.accept(&w.carol, "o2.json", &w.request(&g, &o2, "accepted", None)).unwrap_err().contains("grant is revoked"));
+    let raw = w.lab.db().execute("INSERT INTO review_acceptances(session_id,decision,authority_principal,authority_ref,authority,receipt_digest,request_digest,request_bytes,request_signature,decided_unix_ms)
+        VALUES(?1,'accepted','reviewer:carol',?2,'delegated_code_review.v1',?3,?4,x'61',x'61',?5)", rusqlite::params![o2.0, g, o2.1, format!("sha256:{}", hex('7')), unix_ms()]).unwrap_err();
+    assert!(raw.to_string().contains("needs a valid, unexpired, unrevoked code_review grant"), "{raw}");
+    let shown = w.grants();
+    assert_eq!((&shown["grants"][0]["status"], &shown["grants"][0]["decisions"], &shown["grants"][0]["revocation"]["reason"]), (&json!("revoked"), &json!(1), &json!("reviewer_retired")));
+    assert_eq!(shown["decisions"].as_array().unwrap().iter().map(|d| d["session_id"].clone()).collect::<Vec<_>>(), [json!(o1.0)], "the earlier decision stays");
+
+    // Validity: not before valid_from, not at or after expiry.
+    let future = w.install("future.json", &w.grant(json!({"valid_from_unix_ms": unix_ms() + 3_600_000, "expires_unix_ms": unix_ms() + 7_200_000})));
+    let o3 = w.review('1', "code", "rev-a3", "completed", json!([]));
+    assert!(w.accept(&w.carol, "o3-future.json", &w.request(&future, &o3, "accepted", None)).unwrap_err().contains("not valid yet"));
+    let expires = unix_ms() + 6_000;
+    let short = w.install("short.json", &w.grant(json!({"expires_unix_ms": expires})));
+    assert_eq!(w.accept(&w.carol, "o3.json", &w.request(&short, &o3, "accepted", None)).unwrap()["decision"], json!("accepted"));
+    let o4 = w.review('1', "code", "rev-a4", "completed", json!([]));
+    while unix_ms() <= expires { std::thread::sleep(std::time::Duration::from_millis(100)); }
+    assert!(w.accept(&w.carol, "o4.json", &w.request(&short, &o4, "accepted", None)).unwrap_err().contains("grant is expired"));
+    let status = |id: &str| w.grants()["grants"].as_array().unwrap().iter().find(|g| g["grant_id"] == id).unwrap()["status"].clone();
+    assert_eq!((status(&short), status(&future)), (json!("expired"), json!("not_yet_valid")));
+    assert!(refused("stale.json", &w.lab.key, GRANT_NS, &w.grant(json!({"expires_unix_ms": expires}))).contains("grant is expired"));
+    assert_eq!(w.decisions(), 2);
+}
+
+/// One Codex rollout for reviewer `attempt`: `input` new input and `output`
+/// output tokens of gpt-5.5 in its task worktree, under its execution home,
+/// with the attempt inputs and collector binding its launch would record.
+fn reviewer_usage(w: &AuthorityWorld, attempt: &str, n: u32, input: u64, output: u64) {
+    let home = w.lab.home.path().join(format!("{attempt}-home"));
+    let db = w.lab.db();
+    let operation = format!("op-{attempt}");
+    db.execute("INSERT INTO operations(id,task_id,kind,target,payload_version,payload,payload_hash,expected_revision,due_unix_ms,idempotency_key) VALUES(?1,'work','runtime.launch','binding',1,'{}',?2,1,0,?1)",
+        rusqlite::params![operation, format!("{:x}", Sha256::digest(b"{}"))]).unwrap();
+    let inputs = json!({"inputs": {"version": 2, "effective_profile": {"kind": "codex", "execution_home": home.display().to_string()}}}).to_string();
+    db.execute("INSERT INTO attempt_inputs(attempt_id,operation_id,payload,payload_hash) VALUES(?1,?2,?3,?4)", rusqlite::params![attempt, operation, inputs, format!("{:x}", Sha256::digest(inputs.as_bytes()))]).unwrap();
+    db.execute("INSERT INTO collector_bindings(attempt_id,revision,state,collector,execution_home,unix_ms,source) VALUES(?1,1,'active','codex',?2,1,'apply_launch_started')",
+        rusqlite::params![attempt, home.display().to_string()]).unwrap();
+    let dir = home.join(".codex/sessions/2026/09/28");
+    fs::create_dir_all(&dir).unwrap();
+    let cwd = format!("{}/.state/worktrees/{attempt}/repo-00", w.lab.project.canonicalize().unwrap().display());
+    let ts = jiff::Timestamp::from_millisecond(unix_ms()).unwrap().to_string();
+    let id = format!("00000000-0000-4000-8000-0000000d8c0{n}");
+    let lines = [json!({"timestamp": ts, "type": "session_meta", "payload": {"id": id, "timestamp": ts, "cwd": cwd, "originator": "codex_exec", "cli_version": "0.154.0", "source": "exec"}}),
+        json!({"timestamp": ts, "type": "turn_context", "payload": {"turn_id": "turn-1", "model": "gpt-5.5", "effort": "high"}}),
+        json!({"timestamp": ts, "type": "token_usage_record", "payload": {"turn_id": "turn-1", "response_id": "resp-1", "usage": {"input_tokens": input, "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0, "output_tokens": output, "reasoning_output_tokens": 0, "total_tokens": input + output}}})];
+    fs::write(dir.join(format!("rollout-2026-09-28T00-00-00-{attempt}.jsonl")), lines.iter().map(|l| l.to_string() + "\n").collect::<String>()).unwrap();
+}
+
+/// Review cost (M24) over closed opportunities, with the synthetic card
+/// (input 2, output 4 per 10^6 tokens, fixture only). O1 (rev-c1, 1000 in +
+/// 500 out = 0.004) completes with finding a, accepted; O2 (rev-c2, 2000 +
+/// 1000 = 0.008) completes with none, accepted; O3 (rev-c3, 500 + 250 =
+/// 0.002) times out: closed, unsuccessful; O4 (rev-c4, 0.004) completes with
+/// finding b, rejected (insufficient_coverage); O5 (rev-c5, 0.1) completes
+/// with finding c, undecided: not closed, outside Q. The owner validates a
+/// and b; c stays pending. Q = O1–O4, cost 0.004 + 0.008 + 0.002 + 0.004 =
+/// 0.018 USD; validated unique findings discovered in Q's accepted reviews =
+/// 1 (a; b's review was rejected: `excluded_rejected_review` 1). M24 = 1 /
+/// 0.018 = 500/9 findings per USD, complete. O6 (rev-c6, no usage bound)
+/// completes empty and is accepted: its session is `no_usage_bound`, the cost
+/// stays 0.018 and M24 becomes partial 500/9. Drill-downs: M22's window
+/// submissions by decision (a accepted, b rejected, c undecided); M21's F (a,
+/// b; credit "2", unchanged) accepted 1, rejected 1.
+#[test]
+fn review_cost_and_acceptance_metrics() {
+    let w = AuthorityWorld::new(&["rev-c1", "rev-c2", "rev-c3", "rev-c4", "rev-c5", "rev-c6"]);
+    for (n, (attempt, input, output)) in [("rev-c1", 1000, 500), ("rev-c2", 2000, 1000), ("rev-c3", 500, 250), ("rev-c4", 1000, 500), ("rev-c5", 25_000, 12_500)].into_iter().enumerate() {
+        reviewer_usage(&w, attempt, n as u32 + 1, input, output);
+    }
+    w.lab.telemetry(&["collect"]);
+    w.lab.telemetry(&["accounting", "sync"]);
+    let card = w.lab.home.path().join("rates-v1.json");
+    fs::write(&card, fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/telemetry/accounting/rates-v1.json")).unwrap().replace("@BOUNDARY@", "4102444800000")).unwrap();
+    w.lab.telemetry(&["accounting", "import-rate-card", card.to_str().unwrap()]);
+    assert_eq!(w.lab.telemetry(&["accounting", "reprice"])["revision"], json!(1));
+
+    let g = w.install("g.json", &w.grant(json!({"max_decisions": 8, "review_configurations": [w.fast]})));
+    let o1 = w.review('1', "code", "rev-c1", "completed", json!(["finding:a"]));
+    let o2 = w.review('1', "code", "rev-c2", "completed", json!([]));
+    w.review('1', "code", "rev-c3", "timed_out", json!([]));
+    let o4 = w.review('1', "code", "rev-c4", "completed", json!(["finding:b"]));
+    w.review('1', "code", "rev-c5", "completed", json!(["finding:c"]));
+    for (session, name, decision, reason) in [(&o1, "o1.json", "accepted", None), (&o2, "o2.json", "accepted", None), (&o4, "o4.json", "rejected", Some("insufficient_coverage"))] {
+        assert_eq!(w.accept(&w.carol, name, &w.request(&g, session, decision, reason)).unwrap()["decision"], json!(decision));
+    }
+    for claim in ["1", "2"] { w.lab.telemetry(&["review", "findings", "validate", claim, "--new", "--severity", "high", "--evidence", &evidence('e')]); }
+
+    let metrics = w.lab.telemetry(&["review", "report"])["metrics"].clone();
+    let m24 = &metrics["M24"];
+    assert_eq!((&m24["value"], &m24["unit"], &m24["numerator"], &m24["cost"]), (&json!("500/9"), &json!("findings/USD"), &json!(1),
+        &json!({"status": "complete", "currency": "USD", "amount": "0.018"})));
+    assert_eq!(m24["opportunities"], json!({"closed": 4, "accepted": 2, "rejected": 1, "unsuccessful": 1, "awaiting_acceptance": 1, "awaiting_adjudication": 0, "open": 0}));
+    assert_eq!(m24["sessions"], json!({"total": 4, "priced": 4, "partial": 0, "unavailable": {}}));
+    assert_eq!((&m24["excluded_rejected_review"], &m24["rate_cards"], &m24["acceptance_authority"], &m24["basis"]),
+        (&json!(1), &json!("fixture_only"), &json!("delegated_code_review.v1"), &json!("published_rate_estimate")));
+    let drill = json!({"accepted": 1, "rejected": 1, "undecided": 1, "authority": "delegated_code_review.v1"});
+    assert_eq!((&metrics["M22"]["review_acceptance"], &metrics["M23"]["review_acceptance"]), (&drill, &drill));
+    assert_eq!((&metrics["M21"]["value"], &metrics["M21"]["review_acceptance"]), (&json!("2"), &json!({"accepted": 1, "rejected": 1, "undecided": 0, "authority": "delegated_code_review.v1"})));
+
+    // A reviewer without bound usage: its cost is unknown, never 0, so M24 is partial.
+    let o6 = w.review('1', "code", "rev-c6", "completed", json!([]));
+    w.accept(&w.carol, "o6.json", &w.request(&g, &o6, "accepted", None)).unwrap();
+    let report = w.lab.telemetry(&["report", "--json"]);
+    let m24 = &report["metrics"]["M24"];
+    assert_eq!((&m24["value"], &m24["cost"]), (&json!({"status": "partial", "value": "500/9", "reasons": ["review_cost_partial"]}),
+        &json!({"status": "partial", "currency": "USD", "amount": "0.018"})));
+    assert_eq!(m24["sessions"], json!({"total": 5, "priced": 4, "partial": 0, "unavailable": {"no_usage_bound": 1}}));
 }

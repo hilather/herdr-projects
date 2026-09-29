@@ -2,9 +2,9 @@
 //! TM3.1). An opportunity binds one exact candidate submission; its
 //! assignment, the sessions that execute it and each session's completion are
 //! separate append-only rows. A completion is the reviewer's receipt, kept as a
-//! proposal with declared coverage. Privileged acceptance is inactive: no
-//! canonical reviewer-authority producer exists, so [`SqliteStore::accept_review`]
-//! refuses every caller. Nothing here launches, verifies, integrates or stores
+//! proposal with declared coverage. Acceptance is a separate decision under a
+//! delegated `code_review` grant (`review_authority.rs`, the reviewer-authority migration).
+//! Nothing here launches, verifies, integrates or stores
 //! review content; references are IDs and digests only.
 use super::*;
 use crate::domain::agent_configuration;
@@ -16,8 +16,6 @@ pub const SESSION_SCHEMA: &str = "review_session.v1";
 pub const RECEIPT_SCHEMA: &str = "review_receipt.v1";
 /// Deterministic blind cross-provider assignment policy (contracts-review.md §3).
 pub const BLIND_POLICY: &str = "blind_cross_provider.v1";
-/// Why acceptance is refused and accepted-quality features are inactive.
-pub const ACCEPTANCE_INACTIVE: &str = "no_reviewer_authority_producer";
 pub const SCOPES: [&str; 3] = ["candidate_diff", "candidate_tree", "contract_scope"];
 pub const KINDS: [&str; 5] = ["code", "skeptical", "security", "test", "architecture"];
 pub const ROLES: [&str; 3] = ["gate", "evaluation", "advisory"];
@@ -404,24 +402,5 @@ impl SqliteStore {
         Ok(ReviewCompletion { session_id: r.session_id, outcome: r.outcome, reason, submission_id: submission, candidate_oid: candidate, findings_submitted: findings.len(),
             finding_refs: findings, evidence_refs: evidence, coverage_basis: "declared".into(), trust: "proposal".into(), receipt_digest,
             recorder_principal: recorder, completed_unix_ms: completed_at, replayed, finding_submissions: submissions })
-    }
-
-    /// Privileged acceptance of a session's completion. Inactive: no canonical
-    /// reviewer-authority producer exists, so every call refuses and writes
-    /// nothing. A worker principal (`worker:*`, or the reviewing or authoring
-    /// attempt) is refused first: a worker cannot accept its own proposal.
-    pub fn accept_review(&mut self, session: &str, principal: &str) -> Result<()> {
-        principal_ok(principal)?;
-        let tx = self.connection.transaction()?;
-        schema_54(&tx)?;
-        let (attempt, opportunity): (String, String) = tx.query_row("SELECT r.attempt_id,r.opportunity_id FROM review_sessions r JOIN review_completions c ON c.session_id=r.session_id WHERE r.session_id=?1",
-            [session], |r| Ok((r.get(0)?, r.get(1)?))).optional()?
-            .ok_or_else(|| invalid(format!("review session {session} has no completion to accept")))?;
-        let (_, _, author) = opportunity_binding(&tx, &opportunity)?;
-        let bare = principal.strip_prefix("worker:").unwrap_or(principal);
-        if principal.starts_with("worker:") || bare == attempt || bare == author {
-            return Err(invalid("a worker cannot accept a review: acceptance needs reviewer authority distinct from the proposing worker".into()));
-        }
-        Err(invalid(format!("review acceptance is inactive: {ACCEPTANCE_INACTIVE}")))
     }
 }

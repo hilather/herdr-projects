@@ -230,6 +230,14 @@ merges one PR at a time.
   execution context (execution-home `HOME` or task-worktree cwd); D4 pass and
   exclusion retractions and `planned_units` enforcement. Still open: seeding
   replay-suite tasks (TM4.6) and a reviewer brief builder.
+- **D8 follow-ups** (lane D/steward): **done (D8, 0061,
+  contracts-review.md §10):** review acceptance is active through an
+  owner-signed `code_review` grant only (reviewer-signed decisions,
+  owner-signed revocation, covering-grant trigger); M24 is computed from
+  review sessions' valuations; M21–M23 carry acceptance drill-downs. Still
+  open: delegated triage (needs a `finding_log` rebuild); launch-time
+  reviewer routing, the blind brief builder and reviewer key custody;
+  non-Codex reviewer usage for M24.
 
 ### From the test CPU review (docs/reviews/2026-09-29-test-cpu.md)
 - **Lock-retry scheduling under load** (done, `fix/lock-retry-progress`):
