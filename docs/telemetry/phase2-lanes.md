@@ -113,3 +113,29 @@ D6 TM3.6 (0058, seeded-integration guard needs steward sign-off).
 S0 → {A1, B1, C1} → {A2, B2, C2} → A3 (+start D1) → {C3, B3, B4} → A4 → B5 →
 {B6a, B6b} → C4 → D2 → {D3, D4, D6}. Lanes rebase after every merge; the steward
 merges one PR at a time.
+
+## Follow-up cards (recorded by the steward from lane reports)
+- **A4+** (lane A, needs a contracts §5/§7 revision): collect per-record
+  `token_usage_record` timestamps (narrows B3 usage intervals), the session's
+  model provider, the parent session id (B2 child linking),
+  `rate_limits.secondary`, and possibly `rate_limit_reached_type`/`credits`
+  as metadata. Certify their meaning in the planned small live run.
+- **Cache-write convention** (lane A/B): certify whether Codex cache writes
+  overlap input. Until then, B3 leaves entries with cache writes unpriced.
+- **M12/M14** (lane B): report the repriced estimate and cost coverage
+  through the lane metrics hook.
+- **Delta revisions** (lane B): store valuation revisions as deltas before
+  the ticker runs `reprice` automatically.
+- **Extended M40** (steward): replace the central M40 with the per-window
+  form from `accounting quota`. Update the exact assertions in
+  `tests/telemetry.rs` and `tests/cli.rs`, and make the pane render a
+  `windows` array.
+- **Quota semantics** (live run): confirm `resets_at` behavior (fixed or
+  rolling, jitter), the 15-minute stale threshold, and one execution
+  home = one account.
+- **M38/M39** (lane A then B): add a `provider_availability` table once typed
+  error/throttle events are certified.
+- **Per-task window consumption** (lane B, with the TM2.4 shadow bridge): needs
+  a certified invocation scope; `observed_increase` is account-wide only.
+- **Provider charges, invoice allocation, dated currency conversion, time-based
+  `as_of`** (lane B, TM2.3 remainder).
