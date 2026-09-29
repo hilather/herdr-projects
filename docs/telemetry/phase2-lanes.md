@@ -221,3 +221,21 @@ merges one PR at a time.
   execution context (execution-home `HOME` or task-worktree cwd); D4 pass and
   exclusion retractions and `planned_units` enforcement. Still open: seeding
   replay-suite tasks (TM4.6) and a reviewer brief builder.
+
+### From the test CPU review (docs/reviews/2026-09-29-test-cpu.md)
+- **Lock-retry scheduling under load** (steward/scheduler): with a heavily
+  loaded machine the ticker's try-lock-and-retry services (`.state/effect.lock`,
+  `root/.execution.lock`, root maintenance) can make no progress, which fails
+  `a_proven_worker_end_keeps_the_project_admitted_but_an_unexplained_pane_loss_pauses_it`.
+  Needs fair or backoff scheduling, not larger test timeouts.
+- **Per-connection schema load** (steward): each fresh connection spends about
+  6.5 ms loading 889 schema objects (419 triggers). The ticker opens one per
+  project per read (observation head, canonical head, `wake_enabled`): about
+  0.8 s CPU per pass at 129 projects. Keep a connection per project in the
+  ticker, or consolidate the per-table immutability triggers in a migration.
+- **Wall-bound tests under ~3x oversubscription:** `local_reports` global cache
+  bound, two `artifacts::live` byte-budget tests,
+  `canonical_post_probe_sql_cannot_restart_its_budget`,
+  `canonical_worker_and_routine_admission_take_separate_project_turns`,
+  `coordinator_jobs::notification…seen_or_handled…` (effect.lock busy) and
+  `routine_jobs::…completed_ticket_must_be_drained…` (line 188).
