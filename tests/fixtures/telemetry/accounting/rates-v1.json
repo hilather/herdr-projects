@@ -1,0 +1,17 @@
+{
+  "card_id": "synthetic-codex",
+  "version": 1,
+  "provider": "synthetic",
+  "product": "codex",
+  "models": ["gpt-5.5"],
+  "currency": "USD",
+  "rate_unit": 1000000,
+  "effective_from_unix_ms": 0,
+  "effective_to_unix_ms": @BOUNDARY@,
+  "includes": {"discounts": false, "taxes": false, "fees": false},
+  "source": "INVENTED synthetic test rates (doc 10 golden); not a provider price",
+  "rates": [
+    {"category": "input", "rate": "2"},
+    {"category": "output", "rate": "4.00"}
+  ]
+}

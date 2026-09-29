@@ -108,3 +108,86 @@ Test `model_switch_splits_segments_not_task`: gpt-5.5 50 then gpt-5.5-mini
 150 → two segments, total 200; the resumed epoch of 50 stays inside the root
 of 200; an unlinked guardian of 50 (unallocated 10, `codex-auto-review` 30,
 mixed 10) is reported apart; a rewritten record makes the session unresolved.
+
+## 4. Rate cards and published-rate estimates (B3, TM2.3)
+
+Stream `accounting` version 3 (`0003_rate_cards.sql`). Plan: doc 05 §5,
+doc 07 M12, doc 09 corrections, doc 10 cost tests. The owner decided that no
+real prices ship: the only cards in the repo are invented synthetic test
+fixtures (`tests/fixtures/telemetry/accounting/rates-*`), marked as such.
+
+**Rate cards** (`rate_cards`, `rate_card_models`, `rate_card_rates`) are
+imported by `accounting import-rate-card <file>` from a local TOML (`.toml`)
+or JSON file: `card_id`, `version` (> 0), `provider`, `product` (the usage
+source it applies to, `codex`), `models` (exact reported model names),
+`currency` (ISO 4217), `rate_unit` (tokens per quoted rate, a power of ten
+1–10^9), half-open UTC-ms `[effective_from_unix_ms, effective_to_unix_ms)`
+(`to` absent = open), `includes {discounts, taxes, fees}`, `source`, and
+`rates [{category, cache_tier?, rate}]`. Categories are disjoint: `input`
+(new, uncached input), `cache_read`, `cache_write`, `output` (includes
+reasoning). A rate is a decimal *string* (≤ 18 digits, ≤ 12 places); a JSON or
+TOML number is refused, so no float touches money. The card is canonicalized
+(sorted, decimals trimmed: `"4.00"` → `"4"`) and digested. Cards are
+append-only (SQL triggers refuse UPDATE/DELETE): the same version with the
+same digest imports as a no-op, with a different digest it is refused; a
+changed price is a new version. `accounting rate-cards` lists them. The card
+`provider` is recorded as asserted by the card: Codex rows carry no model
+provider, so applicability is `product` + `model`.
+
+**Valuations** (`valuation_revisions`, `valuations`): `accounting reprice`
+values every delta entry of the synced ledger (§1; `ledger_not_synced`
+before) and appends revision *n+1* only when the result's digest differs
+from revision *n* (so repeated reprices and re-syncs append nothing). Each
+row copies the quantities it priced, so later syncs never change an earlier
+revision, and repricing never changes measured tokens. Basis is always
+`published_rate_estimate`; there are no provider charges, and an estimate is
+never added to one.
+
+Usage time: Codex rows carry no per-record timestamp, so an entry's usage
+interval is bounded by its storing rollout's session start
+(`rollout_sources.session_unix_ms`) and its first observation
+(`codex_usage.observed_unix_ms`), `[min, max]` of the two (policy
+`usage_interval=session_start..first_observed;split=none`). The card
+versions of the entry's product and model overlapping that interval are the
+candidates; the highest version must cover the whole interval. Unpriced
+reasons (the entry is `unavailable`, never 0):
+
+| Reason | When |
+| --- | --- |
+| `usage_not_counted` | not counted (no `accepted` disposition) or not normalized |
+| `model_unknown` | no reported model |
+| `usage_time_unknown` | no session start |
+| `cache_write_convention_unknown` | cache writes > 0 (codex-v1 does not certify their overlap with input) |
+| `no_rate_card` | no card for the product and model overlaps the interval |
+| `ambiguous_rate_cards` | cards of more than one `card_id` overlap it |
+| `rate_change_within_usage_interval` | the winning version does not cover the whole interval (no evidence to split) |
+| `<category>_rate_missing` | a category with tokens has no rate (e.g. cached input and no `cache_read` rate) |
+| `cache_tier_unknown` | several cache tiers for a category; Codex reports none |
+| `amount_overflow` | the exact sum exceeds fixed-point range (never wrapped) |
+
+Amount = Σ over categories with tokens of `tokens × rate / rate_unit`, exact
+(fixed-point `i128`, trimmed decimal string), with per-category components.
+
+**`accounting cost [--json] [--revision N]`** (read-only; `not_priced`
+before the first reprice) shows the latest revision or revision N, byte-
+identical to when it was appended. Per session and per attempt (bound
+attempt of the storing rollout; guardian/subagent sessions summed apart as
+`unlinked_children`, §3): `estimate` is `complete {currency, amount}` when
+every entry is priced in one currency; `partial {currency, priced_amount}`
+(labeled, never the total) when some are not; `unavailable mixed_currency
+{priced_by_currency}` when priced in several currencies (never added, no
+conversion); `unavailable no_priced_entries` when none is. `coverage` counts
+entries, priced, and unpriced by reason; sessions list `rate_cards` used.
+JSON amounts are exact; the text view is the only rounding (half-up, 6
+places).
+
+Test `repricing_uses_rate_effective_at_usage_time`: version 1 (before the
+boundary; input 2, output 4 per 10^6, no cache-read rate) prices doc 10's
+1,000 input + 500 output at exactly `0.004`; version 2 (from the boundary;
+input 2, cache read 0.50, output 8) prices doc 05's 800 new + 200 cached +
+300 output at `0.0041`; gpt-5.5-mini (no card), a cache write, a cached read
+under version 1 and a session straddling the boundary are unavailable with
+their reasons, leaving the attempt `partial` at `0.0081`. A corrected
+version 3 (output 6 → `0.0035`) and a EUR card (`0.00021`) append revision 2
+(attempt `mixed_currency`: USD `0.0075`, EUR `0.00021`); revision 1 reads
+back byte-identical and the ledger is unchanged.

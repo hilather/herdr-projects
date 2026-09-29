@@ -1,0 +1,17 @@
+{
+  "card_id": "synthetic-codex-eur",
+  "version": 1,
+  "provider": "synthetic",
+  "product": "codex",
+  "models": ["gpt-5.5-mini"],
+  "currency": "EUR",
+  "rate_unit": 1000000,
+  "effective_from_unix_ms": @BOUNDARY@,
+  "effective_to_unix_ms": null,
+  "includes": {"discounts": false, "taxes": false, "fees": false},
+  "source": "INVENTED synthetic test rates in a second currency; not a provider price",
+  "rates": [
+    {"category": "input", "rate": "1.5"},
+    {"category": "output", "rate": "3"}
+  ]
+}

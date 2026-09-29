@@ -7,13 +7,15 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+pub mod cost;
 pub mod graph;
 pub mod ledger;
 
 pub const STREAM: &str = "accounting";
 /// `include_str!` of `migrations/telemetry/accounting/`, in order; index + 1 is the stream version.
 pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/accounting/0001_usage_ledger.sql"),
-    include_str!("../../../migrations/telemetry/accounting/0002_session_graph.sql")];
+    include_str!("../../../migrations/telemetry/accounting/0002_session_graph.sql"),
+    include_str!("../../../migrations/telemetry/accounting/0003_rate_cards.sql")];
 
 /// `herdr-projects telemetry <slug> accounting ...`
 #[derive(clap::Subcommand)]
@@ -26,6 +28,23 @@ pub enum Command {
     Entries,
     /// The synced session graph and model segments per session, with the rollup. Read-only.
     Sessions,
+    /// Append a rate card version from a local TOML (`.toml`) or JSON file.
+    /// Rates are decimal strings; an existing version is never changed. Writes only the sidecar.
+    ImportRateCard { file: std::path::PathBuf },
+    /// Every imported rate card version. Read-only.
+    RateCards,
+    /// Value the synced ledger with the rate cards effective at usage time; appends a
+    /// calculation revision when the result changed. Writes only the sidecar.
+    Reprice,
+    /// Published-rate estimates per attempt and session, with basis, rate card and coverage. Read-only.
+    Cost {
+        /// Print JSON (exact decimals) instead of text (rounded to 6 places).
+        #[arg(long)]
+        json: bool,
+        /// Show this earlier calculation revision instead of the latest.
+        #[arg(long)]
+        revision: Option<i64>,
+    },
 }
 
 fn unavailable(reason: &str) -> Value {
@@ -48,6 +67,26 @@ pub fn run(project: &Path, command: Command) -> Result<String> {
             Some(db) => graph::read(&db)?,
             None => unavailable("collection_not_run"),
         },
+        Command::ImportRateCard { file } => match super::sidecar::open(project, false)? {
+            Some(mut db) => cost::import(&mut db, &file)?,
+            None => unavailable("collection_not_run"),
+        },
+        Command::RateCards => match super::sidecar::read(project)? {
+            Some(db) => cost::list(&db)?,
+            None => unavailable("collection_not_run"),
+        },
+        Command::Reprice => match super::sidecar::open(project, false)? {
+            Some(mut db) => cost::reprice(&mut db)?,
+            None => unavailable("collection_not_run"),
+        },
+        Command::Cost { json, revision } => {
+            let value = match super::sidecar::read(project)? {
+                Some(db) => cost::cost(&db, revision)?,
+                None => unavailable("collection_not_run"),
+            };
+            if !json { return Ok(cost::text(&value)); }
+            value
+        }
     };
     Ok(serde_json::to_string_pretty(&value)? + "\n")
 }

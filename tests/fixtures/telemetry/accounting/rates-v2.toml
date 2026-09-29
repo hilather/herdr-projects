@@ -1,0 +1,16 @@
+# INVENTED synthetic test rates (doc 05 §7 golden); not a provider price.
+card_id = "synthetic-codex"
+version = 2
+provider = "synthetic"
+product = "codex"
+models = ["gpt-5.5"]
+currency = "USD"
+rate_unit = 1000000
+effective_from_unix_ms = @BOUNDARY@
+source = "INVENTED synthetic test rates (doc 05 golden); not a provider price"
+includes = { discounts = false, taxes = false, fees = false }
+rates = [
+  { category = "input", rate = "2" },
+  { category = "cache_read", rate = "0.50" },
+  { category = "output", rate = "8" },
+]
