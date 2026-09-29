@@ -341,8 +341,9 @@ fn group_arms_fixed_before_outcomes_and_losers_keep_cost() {
     let selection = f.cli_args(&["quality", "groups", "select", &group, "--arm", "2", "--reason", "operator_judgment"]).0["selection"].clone();
     assert_eq!((&selection["outcome"], &selection["arm"], &selection["attempt_id"], &selection["submission_id"]), (&json!("selected"), &json!(2), &json!(a2), &json!(hex('2'))));
     assert_eq!((&selection["selector_kind"], &selection["selector_principal"], &selection["reason"]), (&json!("operator"), &json!("operator:cli"), &json!("operator_judgment")));
-    assert_eq!(selection["evidence"], json!([{"arm": 1, "attempt_id": a1, "submission_id": hex('1'), "verification": "accepted"},
-        {"arm": 2, "attempt_id": a2, "submission_id": hex('2'), "verification": "rejected"}]));
+    // Arm 2's candidate is rejected but its attempt is still open (it may resubmit), so its arm outcome is pending.
+    assert_eq!(selection["evidence"], json!([{"arm": 1, "attempt_id": a1, "submission_id": hex('1'), "verification": "accepted", "arm_outcome": "accepted"},
+        {"arm": 2, "attempt_id": a2, "submission_id": hex('2'), "verification": "rejected", "arm_outcome": "pending"}]));
     assert!(f.cli_fail(&["quality", "groups", "select", &group, "--none"]).contains("already has a selection"));
     assert!(sql().execute("DELETE FROM candidate_selections", []).is_err(), "a selection is immutable");
 
@@ -361,4 +362,170 @@ fn group_arms_fixed_before_outcomes_and_losers_keep_cost() {
     // Selection moved no cost and changed no outcome: the loser's usage and every attempt record are as before.
     assert_eq!(usage(&a1), a1_usage);
     assert_eq!(arms[0]["verification"], before["groups"][0]["arms"][0]["verification"]);
+}
+
+/// TM3.8 selection and paired outcomes (contracts-quality.md §4). Arms are
+/// configurations A `codex`, B `fast`, C `claude`; each group is on its own
+/// task. Arm outcomes: acc(epted), rej(ected), none (terminal, no candidate),
+/// run(ning, no candidate), unb(ound).
+///
+/// | group | arms | outcomes          | selection                       |
+/// |-------|------|-------------------|---------------------------------|
+/// | g0    | ABC  | acc acc unb       | operator arm 1 (A)              |
+/// | g1    | AB   | acc rej           | rule -> A                       |
+/// | g2    | AB   | rej acc           | rule -> B                       |
+/// | g3    | AB   | none rej          | operator arm 2 (B, rejected)    |
+/// | g4    | AB   | acc acc           | rule -> A (launch order), ranks |
+/// | g5    | AB   | rej rej           | rule -> no selection            |
+/// | g6    | ABC  | rej rej acc       | rule -> C                       |
+/// | g7    | ABC  | acc acc run       | operator arm 1 (A)              |
+/// | g8    | AB   | acc acc           | judge -> B                      |
+/// | g9    | AB   | acc none          | operator --none                 |
+/// | g10   | AB   | run unb           | open (the rule refuses)         |
+///
+/// M41 over the 10 closed groups: A selected in g0 g1 g4 g7 = 4/10, B in g2
+/// g3 g8 = 3/10, C 1 of 3 groups (below 10: insufficient data). A vs B: 4 wins,
+/// 3 losses, ties 2 no-selection + 1 other (g6) = 4/7. M42 A-B uses verified
+/// outcomes, not selections: both accepted g0 g4 g7 g8, A only g1 g9, B only
+/// g2, neither g3 g5 g6: (2 - 1)/10 = +10 points; A-C has 3 groups, g7
+/// pending, n = 2: insufficient data.
+#[test]
+fn win_rate_and_paired_difference_over_closed_groups() {
+    let f = Fixture::new();
+    let db_path = f.project.join(".state/state.db");
+    let mut fast = codex_profile(&f.config, "codex", "fast", Some(&f.tmp.path().join("fast-home")));
+    fast.arguments_digest = "1".repeat(64);
+    plant_profile(&db_path, fast);
+    plant_profile(&db_path, codex_profile(&f.config, "claude", "claude", None));
+    let sql = || { let db = rusqlite::Connection::open(&db_path).unwrap(); db.execute_batch("PRAGMA foreign_keys=OFF").unwrap(); db };
+
+    let empty = f.report()["metrics"].clone();
+    assert_eq!((&empty["M41"]["value"], &empty["M42"]["value"]), (&json!({"status": "unavailable", "reason": "no_closed_groups"}), &json!({"status": "unavailable", "reason": "no_closed_groups"})));
+
+    // (task, arm profiles, arm outcomes)
+    let groups: [(&str, &[&str], &[&str]); 11] = [
+        ("g0", &["codex", "fast", "claude"], &["acc", "acc", "unb"]), ("g1", &["codex", "fast"], &["acc", "rej"]), ("g2", &["codex", "fast"], &["rej", "acc"]),
+        ("g3", &["codex", "fast"], &["none", "rej"]), ("g4", &["codex", "fast"], &["acc", "acc"]), ("g5", &["codex", "fast"], &["rej", "rej"]),
+        ("g6", &["codex", "fast", "claude"], &["rej", "rej", "acc"]), ("g7", &["codex", "fast", "claude"], &["acc", "acc", "run"]),
+        ("g8", &["codex", "fast"], &["acc", "acc"]), ("g9", &["codex", "fast"], &["acc", "none"]), ("g10", &["codex", "fast"], &["run", "unb"])];
+    let mut ids = std::collections::BTreeMap::new();
+    let mut configurations = Vec::new();
+    let mut submission = 0;
+    let hex = |n: u32| format!("{n:064x}");
+    let mut subs = std::collections::BTreeMap::new();
+    for (task, profiles, outcomes) in groups {
+        let db = sql();
+        db.execute("INSERT INTO tasks(id,revision,state,title) VALUES(?1,1,'running',?1)", [task]).unwrap();
+        db.execute("INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq)
+            VALUES(?1,1,NULL,'store',0,'/repo',?2,'sha1',NULL,'verify_only',CAST(?1 AS BLOB),?3,(SELECT max(sequence) FROM events))",
+            rusqlite::params![task, "b".repeat(40), format!("{:x<64}", task)]).unwrap();
+        db.execute("INSERT INTO acceptance_policies(task_id,contract_revision,policy_id,body) VALUES(?1,1,'ci','cargo test')", [task]).unwrap();
+        drop(db);
+        let mut args = vec!["quality", "groups", "create", task];
+        for profile in profiles { args.extend(["--arm", profile]); }
+        let group = f.cli_args(&args).0["group"].clone();
+        if configurations.is_empty() { configurations = group["arms"].as_array().unwrap().iter().map(|a| a["configuration_id"].as_str().unwrap().to_owned()).collect(); }
+        let id = group["group_id"].as_str().unwrap().to_owned();
+        // The worker side of each arm, as launches, results and pinned CI would write it.
+        let db = sql();
+        for (i, outcome) in outcomes.iter().enumerate().filter(|(_, o)| **o != "unb") {
+            let (arm, attempt) = (i as i64 + 1, format!("{task}-a{}", i + 1));
+            db.execute("INSERT INTO attempts(id,task_id,revision,state,reservation,termination_observed) VALUES(?1,?2,1,?3,?1,?4)",
+                rusqlite::params![attempt, task, if *outcome == "run" { "running" } else { "completed" }, i64::from(*outcome != "run")]).unwrap();
+            db.execute("INSERT INTO dispatch_decisions(attempt_id,task_id,task_revision,contract_revision,chosen_configuration_id,eligible,chooser_kind,chooser_principal,reason_codes,decided_unix_ms)
+                VALUES(?1,?2,1,1,?3,'[\"x\"]','operator','operator:cli','[\"x\"]',1)", rusqlite::params![attempt, task, group["arms"][i]["configuration_id"].as_str().unwrap()]).unwrap();
+            db.execute("INSERT INTO candidate_arm_attempts(group_id,arm,attempt_id,bound_unix_ms,source) VALUES(?1,?2,?3,1,'admit_prepared')", rusqlite::params![id, arm, attempt]).unwrap();
+            if matches!(*outcome, "none" | "run") { continue; }
+            submission += 1;
+            let sub = hex(submission);
+            subs.insert((task, arm), sub.clone());
+            db.execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,artifact_manifest,claimed_checks,created_unix_ms)
+                VALUES(?1,'store',?1,?2,'{}',?3,1,?2,?4,'/repo',?5,?6,'sha1','[]','[]',?7)", rusqlite::params![sub, "d".repeat(64), task, attempt, "b".repeat(40), format!("{submission:040x}"), i64::from(submission)]).unwrap();
+            let accepted = *outcome == "acc";
+            db.execute("INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,
+                commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms)
+                VALUES(?1,'store',?1,?2,?3,?4,1,?2,?5,'ci',?2,?6,?6,'sha1',0,'linux-unshare-user-pid-mount-v1','[\"x\"]','[]',?7,?8,?9,?10,1,1,100)",
+                rusqlite::params![format!("{:064x}", 1000 + submission), "d".repeat(64), sub, task, attempt, format!("{submission:040x}"), if accepted { "accepted" } else { "rejected" },
+                    (!accepted).then_some("cargo test failed"), if accepted { 0 } else { 101 }, accepted.then(|| "8".repeat(64))]).unwrap();
+        }
+        ids.insert(task, id);
+    }
+    let (a, b, c) = (configurations[0].clone(), configurations[1].clone(), configurations[2].clone());
+    let select = |task: &str, args: &[&str]| {
+        let mut command = vec!["quality", "groups", "select", &ids[task]];
+        command.extend(args);
+        f.cli_args(&command).0["selection"].clone()
+    };
+
+    // The rule decides only on settled arms, in launch order: g10's arm 1 is still running.
+    assert!(f.cli_fail(&["quality", "groups", "select", &ids["g10"], "--rule"]).contains("arm 1 is pending"));
+    assert!(f.cli_fail(&["quality", "groups", "select", &ids["g1"], "--rule", "--reason", "operator_judgment"]).contains("cannot be used with"));
+    for (task, winner, submission, reason) in [("g1", Some(1), Some(("g1", 1)), "first_passing_verification"), ("g2", Some(2), Some(("g2", 2)), "first_passing_verification"),
+        ("g4", Some(1), Some(("g4", 1)), "first_passing_verification"), ("g5", None, None, "none_acceptable"), ("g6", Some(3), Some(("g6", 3)), "first_passing_verification")] {
+        let s = select(task, &["--rule"]);
+        assert_eq!((&s["selector_kind"], &s["selector_principal"], &s["reason"]), (&json!("rule"), &json!("rule:first_accepted_in_launch_order.v1"), &json!(reason)), "{task}");
+        assert_eq!((&s["arm"], &s["submission_id"]), (&json!(winner), &json!(submission.map(|k| subs[&k].clone()))), "{task}");
+    }
+    // A tie goes to launch order; every accepted arm is ranked, the winner first.
+    let g4 = f.cli_args(&["quality", "groups", "show"]).0["groups"][4]["selection"]["evidence"].clone();
+    assert_eq!(g4, json!([{"arm": 1, "attempt_id": "g4-a1", "submission_id": subs[&("g4", 1)], "verification": "accepted", "arm_outcome": "accepted", "rank": 1},
+        {"arm": 2, "attempt_id": "g4-a2", "submission_id": subs[&("g4", 2)], "verification": "accepted", "arm_outcome": "accepted", "rank": 2}]));
+
+    // Operator selections; g3 selects a rejected candidate: selection is not verification.
+    select("g0", &["--arm", "1", "--reason", "operator_judgment"]);
+    select("g3", &["--arm", "2"]);
+    select("g7", &["--arm", "1"]);
+    select("g9", &["--none", "--reason", "none_acceptable"]);
+
+    // A judge sees g8's candidates blind, in the recorded presentation order, and names one.
+    let presented = f.cli_args(&["quality", "groups", "present", &ids["g8"]]).0;
+    let text = presented.to_string();
+    for hidden in ["g8-a1", "g8-a2", &a, &b, "codex", "fast"] { assert!(!text.contains(hidden), "{hidden} is not shown to a judge"); }
+    let candidates = presented["candidates"].as_array().unwrap();
+    assert_eq!(candidates.iter().map(|c| c["position"].as_i64().unwrap()).collect::<Vec<_>>(), [1, 2]);
+    let position = |sub: &str| candidates.iter().find(|c| c["submission_id"] == sub).unwrap()["position"].clone();
+    let s = select("g8", &["--judge", "blind-1", "--submission", &subs[&("g8", 2)]]);
+    assert_eq!((&s["selector_kind"], &s["selector_principal"], &s["reason"], &s["arm"]), (&json!("judge"), &json!("judge:blind-1"), &json!("judge_preference"), &json!(2)));
+    assert_eq!((&s["evidence"][0]["presented"], &s["evidence"][1]["presented"]), (&position(&subs[&("g8", 1)]), &position(&subs[&("g8", 2)])));
+    assert!(f.cli_fail(&["quality", "groups", "present", &ids["g8"]]).contains("already has a selection"));
+
+    let report = f.cli_args(&["quality", "groups", "report"]).0;
+    assert_eq!(report["min_groups"], json!(10));
+    let (m41, m42) = (&report["metrics"]["M41"], &report["metrics"]["M42"]);
+    assert_eq!((&m41["closed_groups"], &m41["open_groups"], &m41["definition"]), (&json!(10), &json!(1), &json!("M41.v1")));
+    let cell = |m: &serde_json::Value, selector: &str, c: &str| m["by_selector"][selector]["configurations"].as_array().unwrap().iter().find(|x| x["configuration_id"] == c).unwrap().clone();
+    let insufficient = json!({"status": "unavailable", "reason": "insufficient_data"});
+    assert_eq!(cell(m41, "all", &a), json!({"configuration_id": a, "groups": 10, "selected": 4, "no_selection": 2, "other_selected": 4, "value": "4/10"}));
+    assert_eq!(cell(m41, "all", &b), json!({"configuration_id": b, "groups": 10, "selected": 3, "no_selection": 2, "other_selected": 5, "value": "3/10"}));
+    assert_eq!(cell(m41, "all", &c), json!({"configuration_id": c, "groups": 3, "selected": 1, "no_selection": 0, "other_selected": 2, "value": insufficient}), "3 groups: counts shown, never a rate");
+    let pair = |list: &serde_json::Value, x: &str, y: &str| list.as_array().unwrap().iter().find(|p| p["a"] == x && p["b"] == y).unwrap().clone();
+    assert_eq!(pair(&m41["by_selector"]["all"]["head_to_head"], &a, &b),
+        json!({"a": a, "b": b, "groups": 10, "wins": 4, "losses": 3, "ties": {"no_selection": 2, "other_selected": 1}, "value": "4/7"}));
+    assert_eq!(pair(&m41["by_selector"]["all"]["head_to_head"], &b, &a)["value"], json!("3/7"));
+    let short = |c: &str| c[..19].to_owned();
+    let mut shown = [(a.clone(), "4/10"), (b.clone(), "3/10")];
+    shown.sort();
+    assert_eq!(m41["value"], json!(shown.iter().map(|(c, v)| format!("{}={v}", short(c))).collect::<Vec<_>>().join(" ")));
+    assert_eq!(pair(&m42["pairs"], &a, &b), json!({"a": a, "b": b, "groups": 10, "pending": 0, "n": 10, "both_accepted": 4, "a_only": 2, "b_only": 1,
+        "neither": 3, "difference": "1/10", "value": 10.0, "unit": "percentage_points", "uncertainty": {"status": "unavailable", "reason": "clustered_interval_not_computed"}}));
+    assert_eq!(pair(&m42["pairs"], &b, &a)["value"], json!(-10.0));
+    let ac = pair(&m42["pairs"], &a, &c);
+    assert_eq!((&ac["groups"], &ac["pending"], &ac["n"], &ac["a_only"], &ac["b_only"], &ac["value"]), (&json!(3), &json!(1), &json!(2), &json!(1), &json!(1), &insufficient));
+    let (lo, hi) = if a < b { (&a, &b) } else { (&b, &a) };
+    assert_eq!(m42["value"], json!(format!("{}-{}={}pp", short(lo), short(hi), if lo == &a { "10.0" } else { "-10.0" })));
+
+    // Selector type is a dimension; with a lower threshold every cell shows its rate.
+    let low = f.cli_args(&["quality", "groups", "report", "--min-groups", "1"]).0["metrics"]["M41"].clone();
+    let rates = |selector: &str| [&a, &b, &c].map(|x| low["by_selector"][selector]["configurations"].as_array().unwrap().iter().find(|y| y["configuration_id"] == *x).map(|y| y["value"].clone()));
+    assert_eq!(rates("rule"), [Some(json!("2/5")), Some(json!("1/5")), Some(json!("1/1"))]);
+    assert_eq!(rates("operator"), [Some(json!("2/4")), Some(json!("1/4")), Some(json!("0/2"))]);
+    assert_eq!(rates("judge"), [Some(json!("0/1")), Some(json!("1/1")), None]);
+    assert_eq!(pair(&low["by_selector"]["rule"]["head_to_head"], &a, &b)["ties"], json!({"no_selection": 1, "other_selected": 1}));
+
+    // The fleet report carries both at the default threshold; a window with no selections is unavailable, never 0.
+    let fleet = f.report()["metrics"].clone();
+    assert_eq!((&fleet["M41"]["value"], &fleet["M42"]["value"]), (&m41["value"], &m42["value"]));
+    let later = (unix_ms() + 86_400_000).to_string();
+    let windowed = f.cli_args(&["quality", "groups", "report", "--since", &later]).0["metrics"].clone();
+    assert_eq!((&windowed["M41"]["value"], &windowed["M42"]["closed_groups"]), (&json!({"status": "unavailable", "reason": "no_closed_groups"}), &json!(0)));
 }

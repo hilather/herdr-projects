@@ -143,12 +143,16 @@ seal below; no cost column anywhere):
   bound arm, its attempt and one of that attempt's `result_submissions`
   (trigger-checked); `no_selection` names none. Reasons: selected
   `operator_judgment`, `first_passing_verification`, `unspecified`;
-  no selection `no_candidate`, `none_acceptable`, `unspecified`. `evidence`
-  is computed by the store at selection time, per bound arm:
-  `{arm, attempt_id, submission_id (first by created_unix_ms, rowid, or
-  null), verification}` with `verification` the latest run per policy
-  combined (`rejected` if any, `accepted` if all, else `pending`;
-  `no_candidate` without a submission). IDs and states only, no text.
+  no selection `no_candidate`, `none_acceptable`, `unspecified`; `rule` and
+  `judge` selections (§4) add `first_passing_verification` and
+  `judge_preference`. `evidence` is computed by the store at selection
+  time, per bound arm: `{arm, attempt_id, submission_id (first by
+  created_unix_ms, rowid, or null), verification, arm_outcome}` with
+  `verification` the first candidate's combined verification (each
+  acceptance policy of its task revision and each policy with a run,
+  decided by its latest run: `rejected` if any, `accepted` if all, else
+  `pending`; `no_candidate` without a submission) and `arm_outcome` as in
+  §4. IDs and states only, no text.
 
 **Selection is not verification.** Recording a selection verifies,
 integrates, completes or reassigns nothing; the winner still needs the
@@ -168,6 +172,7 @@ keeps its attempt's usage.
 - `select <group> (--arm N [--submission ID] | --none) [--reason CODE]`
   records the selection (`selector_kind = 'operator'`, principal
   `operator:cli`); the default submission is the arm's first candidate.
+  `--rule` and `--judge` are §4.
 - `show` (read-only, contracts §0 reads): per group `status`
   (`open`/`closed`), `selection`, and per arm `attempt_id`, `role`
   (`open`, `selected`, `not_selected`), `candidate`, `outcome` (`candidate`,
@@ -186,3 +191,71 @@ until a selection exists, which needs integration edits outside lane C
 is escalated, not built. Until then `show` reports `integration_hold:
 {enforced: false, integrated_without_selection: [...]}` listing arms whose
 candidate integrated without being the selection.
+
+## 4. Selectors and paired outcomes (TM3.8, card C4)
+
+Plan doc 06 §6c, doc 07 M41/M42 and §6, doc 10 §5a. No schema change: the
+0053 `selector_kind` check already allows `operator`, `rule` and `judge`, and
+each selection is written through the store in one canonical transaction
+(`src/store/candidate_groups.rs`). Selection is still not verification (§3).
+
+**Arm outcome** (`arm_outcome.v1`), the verified outcome of one arm now:
+unbound arm `not_launched`; else, over all of its attempt's submissions by
+`(created_unix_ms, rowid)` with the §3 combined verification, `accepted` if
+any is accepted; else `pending` if any is pending or the attempt is not
+terminal (`completed`, `failed`, `cancelled`, `lost`), since it may still
+submit; else `rejected` with a submission, `no_candidate` without.
+
+**Rule selector** `select <group> --rule`: rule
+`first_accepted_in_launch_order.v1`, principal
+`rule:first_accepted_in_launch_order.v1`. The first arm in launch order whose
+outcome is `accepted` wins with its first accepted submission, reason
+`first_passing_verification`; a tie between accepted arms goes to launch
+order. It refuses while any earlier arm is `pending`. With no accepted arm it
+closes the group with no selection (`none_acceptable`, or `no_candidate` when
+no arm submitted) only when every arm is bound and settled; otherwise it
+refuses and the operator can still `--none`. Evidence adds `rank` (the
+accepted arms in launch order, winner 1; null otherwise), so the runner-up
+order is recorded for rule selections. The same canonical rows always give the
+same answer.
+
+**Judge selector** (no model is called anywhere):
+`present <group>` (read-only) prints each bound arm's first candidate as
+`{position, submission_id, repository, base_oid, candidate_oid}` — no arm,
+attempt, configuration or profile — ordered by
+`sha256("candidate_presentation.v1:" + group_id + ":" + submission_id)`.
+`select <group> --judge NAME --submission ID` records the judge's choice of a
+presented candidate: `selector_kind = 'judge'`, principal `judge:NAME`,
+reason `judge_preference`, evidence adds each arm's `presented` position
+(null when it had no candidate), so the blind order the judge saw is stored
+with the selection. Choosing a judge configuration from another provider
+family, and running it, is not built.
+
+**Metrics** (`telemetry <slug> quality groups report [--since MS]
+[--min-groups N]`, read-only over `state.db`; also in `quality report`,
+`telemetry <slug> report` and the fleet pane at the default threshold).
+Cohort: closed groups (with a selection row), windowed by
+`selected_unix_ms`; `closed_groups` and `open_groups` are reported. Every
+sealed arm is a member, launched or not. A cell with fewer than `min_groups`
+(default 10, plan doc 07 §6) closed groups is `unavailable:
+insufficient_data` with its counts still shown; no closed groups is
+`unavailable: no_closed_groups`, a store before 0053 `unavailable:
+candidate_groups_absent`. Never 0.
+
+- **M41 candidate win rate** `M41.v1`, `by_selector` {`all`, `operator`,
+  `rule`, `judge`}: per configuration `selected / groups` (as `"n/d"`) with
+  `no_selection` and `other_selected`; `head_to_head` per ordered pair
+  `(a, b)`: `wins / (wins + losses)` over closed groups containing both, with
+  `ties` {`no_selection`, `other_selected`} (neither a nor b selected), or
+  `unavailable: no_decisive_groups`. The top-level `value` lists the shown
+  `all` cells as `sha256:<12 hex>=n/d`.
+- **M42 paired acceptance difference** `M42.v1`, per ordered pair
+  `(a, b)`: over closed groups containing both, groups where either arm is
+  `pending` are excluded (`pending`); over the remaining `n`, acceptance is
+  `arm_outcome = accepted` (1) or not (0; `not_launched`, `no_candidate` and
+  `rejected` arms are failures, not missing), never the selection.
+  `value` = `(a_only − b_only) / n × 100` percentage points (rounded to
+  0.01; `difference` is the exact `"(a_only − b_only)/n"`), with
+  `both_accepted`, `a_only`, `b_only`, `neither`. `uncertainty` is
+  `unavailable: clustered_interval_not_computed`: no bootstrap by task
+  family is computed. The top-level `value` lists shown pairs with `a < b`.

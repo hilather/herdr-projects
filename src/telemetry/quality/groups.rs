@@ -1,7 +1,8 @@
-//! Candidate groups (TM3.8, contracts-quality.md §3): `quality groups ...`.
-//! `create` and `select` write canonical rows through the store's own
-//! transactions (`SqliteStore`); `show` reads `state.db` and the sidecar
-//! strictly read-only. Arm cost is each arm attempt's own usage from
+//! Candidate groups (TM3.8, contracts-quality.md §3-4): `quality groups ...`.
+//! `create` and `select` (operator, rule, judge) write canonical rows through
+//! the store's own transactions (`SqliteStore`); `show`, `present` and
+//! `report` (M41, M42) read `state.db` (and `show` the sidecar) strictly
+//! read-only. Arm cost is each arm attempt's own usage from
 //! `telemetry attempts`; nothing is reassigned between arms.
 use anyhow::Result;
 use rusqlite::OptionalExtension;
@@ -25,21 +26,42 @@ pub enum Command {
         #[arg(long = "arm", required = true)]
         arms: Vec<String>,
     },
-    /// Record the group's one selection: an arm's candidate, or `--none`.
-    /// Selection is not verification and moves no cost.
+    /// Record the group's one selection: an arm's candidate, `--none`, the
+    /// deterministic `--rule`, or a `--judge`'s choice of a presented
+    /// `--submission`. Selection is not verification and moves no cost.
     Select {
         group: String,
-        #[arg(long, required_unless_present = "none", conflicts_with = "none")]
+        #[arg(long, conflicts_with_all = ["none", "rule", "judge"])]
         arm: Option<u32>,
-        /// A submission of the arm's attempt; default its first candidate.
-        #[arg(long, requires = "arm")]
+        /// With `--arm`: a submission of the arm's attempt (default its first
+        /// candidate). With `--judge`: the presented candidate chosen.
+        #[arg(long)]
         submission: Option<String>,
         /// Close the group with no winner.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["rule", "judge"])]
         none: bool,
-        /// Reason code (contracts-quality.md §3).
-        #[arg(long, default_value = "unspecified")]
-        reason: String,
+        /// Rule `first_accepted_in_launch_order.v1` (contracts-quality.md §4).
+        #[arg(long, conflicts_with_all = ["judge", "submission", "reason"])]
+        rule: bool,
+        /// Judge name, recorded as principal `judge:<name>`; requires `--submission`.
+        #[arg(long, requires = "submission", conflicts_with = "reason")]
+        judge: Option<String>,
+        /// Reason code for `--arm` or `--none` (contracts-quality.md §3).
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// An open group's candidates in blind presentation order for a judge:
+    /// no arm, attempt or configuration. Read-only.
+    Present { group: String },
+    /// M41 candidate win rate and M42 paired acceptance difference over
+    /// closed groups, as JSON. Read-only.
+    Report {
+        /// Window start (Unix ms), by the selection time.
+        #[arg(long)]
+        since: Option<i64>,
+        /// Closed groups a cell needs before its value is shown.
+        #[arg(long, default_value_t = MIN_GROUPS, value_parser = clap::value_parser!(u32).range(1..=10_000))]
+        min_groups: u32,
     },
     /// Groups with their arms, each arm's outcome and own cost, and the
     /// selection, as JSON. Read-only.
@@ -51,10 +73,22 @@ pub fn run(project: &Path, command: Command) -> Result<Value> {
     let open = || SqliteStore::open(&project.join(".state/state.db"));
     Ok(match command {
         Command::Create { task, arms } => json!({"group": open()?.create_candidate_group(&task, &arms, OPERATOR, now)?}),
-        Command::Select { group, arm, submission, none, reason } => {
-            let choice = match arm { Some(arm) if !none => SelectionChoice::Arm { arm, submission }, _ => SelectionChoice::NoSelection };
-            json!({"selection": open()?.select_candidate(&group, &choice, &reason, OPERATOR, now)?})
+        Command::Select { group, arm, submission, none, rule, judge, reason } => {
+            let mut store = open()?;
+            let selection = if rule { store.select_candidate_by_rule(&group, now)? }
+                else if let Some(judge) = judge { store.select_candidate_by_judge(&group, submission.as_deref().unwrap_or_default(), &judge, now)? }
+                else {
+                    let choice = match arm {
+                        Some(arm) => SelectionChoice::Arm { arm, submission },
+                        None if none && submission.is_none() => SelectionChoice::NoSelection,
+                        None => anyhow::bail!("select needs --arm, --none, --rule or --judge with --submission"),
+                    };
+                    store.select_candidate(&group, &choice, reason.as_deref().unwrap_or("unspecified"), OPERATOR, now)?
+                };
+            json!({"selection": selection})
         }
+        Command::Present { group } => present(project, &group)?,
+        Command::Report { since, min_groups } => json!({"metrics": paired_metrics(project, since, min_groups)?, "since_unix_ms": since, "min_groups": min_groups}),
         Command::Show => show(project)?,
     })
 }
@@ -141,4 +175,174 @@ fn show(project: &Path) -> Result<Value> {
             "integration_hold": {"enforced": false, "integrated_without_selection": premature}}));
     }
     Ok(json!({"groups": groups}))
+}
+
+/// Provisional minimum of closed groups per cell (plan doc 07 §6: 10 closed
+/// candidate groups containing both arms for paired metrics); below it a cell
+/// is `unavailable: insufficient_data` with its counts.
+pub const MIN_GROUPS: u32 = 10;
+const TERMINAL_ATTEMPT: [&str; 4] = ["completed", "failed", "cancelled", "lost"];
+/// Same key as the store's judge selection (`candidate_presentation.v1`).
+const PRESENTATION: &str = "candidate_presentation.v1";
+
+/// A bound arm's first candidate and verified outcome (`arm_outcome.v1`,
+/// contracts-quality.md §4, as the store computes it for selections).
+fn arm_outcome(db: &rusqlite::Connection, attempt: &str) -> Result<(Option<String>, &'static str)> {
+    let state: Option<String> = db.query_row("SELECT state FROM attempts WHERE id=?1", [attempt], |r| r.get(0)).optional()?;
+    let submissions: Vec<String> = db.prepare("SELECT submission_id FROM result_submissions WHERE attempt_id=?1 ORDER BY created_unix_ms,rowid")?
+        .query_map([attempt], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    let mut states = Vec::with_capacity(submissions.len());
+    for submission in &submissions {
+        let policies: Vec<Option<String>> = db.prepare("SELECT (SELECT v.state FROM verification_runs v WHERE v.submission_id=?1 AND v.policy_id=p.policy_id ORDER BY v.created_unix_ms DESC,v.rowid DESC LIMIT 1)
+            FROM (SELECT a.policy_id FROM acceptance_policies a JOIN result_submissions s ON s.task_id=a.task_id AND s.contract_revision=a.contract_revision WHERE s.submission_id=?1
+                UNION SELECT policy_id FROM verification_runs WHERE submission_id=?1) p")?
+            .query_map([submission], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let is = |state: &'static str| move |s: &Option<String>| s.as_deref() == Some(state);
+        states.push(if policies.iter().any(is("rejected")) { "rejected" } else if !policies.is_empty() && policies.iter().all(is("accepted")) { "accepted" } else { "pending" });
+    }
+    let terminal = state.as_deref().is_some_and(|s| TERMINAL_ATTEMPT.contains(&s));
+    let outcome = if states.contains(&"accepted") { "accepted" } else if states.contains(&"pending") || !terminal { "pending" }
+        else if submissions.is_empty() { "no_candidate" } else { "rejected" };
+    Ok((submissions.into_iter().next(), outcome))
+}
+
+/// `{"group_id", "candidates": [{position, submission_id, repository, base_oid,
+/// candidate_oid}]}`: each bound arm's first candidate, ordered by
+/// `sha256("candidate_presentation.v1:" + group + ":" + submission)`, the
+/// order `select --judge` records. No arm, attempt or configuration.
+fn present(project: &Path, group: &str) -> Result<Value> {
+    let db = super::super::read_only(&project.join(".state/state.db"))?;
+    crate::store::check_schema(&db)?;
+    if !exists(&db, "candidate_groups")? { anyhow::bail!("no candidate group {group}"); }
+    let db = db.unchecked_transaction()?;
+    let closed: Option<bool> = db.query_row("SELECT EXISTS(SELECT 1 FROM candidate_selections s WHERE s.group_id=g.group_id) FROM candidate_groups g WHERE g.group_id=?1 AND g.sealed_unix_ms IS NOT NULL",
+        [group], |r| r.get(0)).optional()?;
+    match closed { None => anyhow::bail!("no candidate group {group}"), Some(true) => anyhow::bail!("candidate group {group} already has a selection"), Some(false) => {} }
+    let attempts: Vec<String> = db.prepare("SELECT attempt_id FROM candidate_arm_attempts WHERE group_id=?1 ORDER BY arm")?
+        .query_map([group], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    let mut shown = Vec::new();
+    for attempt in attempts {
+        let Some(submission) = arm_outcome(&db, &attempt)?.0 else { continue };
+        let key = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(format!("{PRESENTATION}:{group}:{submission}").as_bytes()));
+        let (repository, base, candidate): (String, String, String) = db.query_row("SELECT repository,base_oid,candidate_oid FROM result_submissions WHERE submission_id=?1", [&submission],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        shown.push((key, json!({"submission_id": submission, "repository": repository, "base_oid": base, "candidate_oid": candidate})));
+    }
+    shown.sort_by(|a, b| a.0.cmp(&b.0));
+    let candidates: Vec<Value> = shown.into_iter().enumerate().map(|(i, (_, mut c))| { c["position"] = json!(i + 1); c }).collect();
+    Ok(json!({"group_id": group, "presentation": PRESENTATION, "candidates": candidates}))
+}
+
+/// One closed group: selector kind, the selected configuration (if any) and
+/// each sealed arm's configuration with its verified outcome now
+/// (`not_launched` for an arm never bound).
+struct Closed { kind: String, selected: Option<String>, arms: Vec<(String, &'static str)> }
+
+/// `(closed groups selected at or after since, open groups)`.
+fn closed_groups(project: &Path, since: Option<i64>) -> Result<Option<(Vec<Closed>, usize)>> {
+    let db = super::super::read_only(&project.join(".state/state.db"))?;
+    crate::store::check_schema(&db)?;
+    if !exists(&db, "candidate_groups")? { return Ok(None); }
+    let db = db.unchecked_transaction()?;
+    let open: i64 = db.query_row("SELECT count(*) FROM candidate_groups g WHERE g.sealed_unix_ms IS NOT NULL AND NOT EXISTS(SELECT 1 FROM candidate_selections s WHERE s.group_id=g.group_id)", [], |r| r.get(0))?;
+    let rows: Vec<(String, String, Option<String>)> = db.prepare("SELECT s.group_id,s.selector_kind,a.configuration_id FROM candidate_selections s JOIN candidate_groups g ON g.group_id=s.group_id
+        LEFT JOIN candidate_group_arms a ON a.group_id=s.group_id AND a.arm=s.arm WHERE ?1 IS NULL OR s.selected_unix_ms>=?1 ORDER BY g.created_unix_ms,g.rowid")?
+        .query_map([since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+    let mut closed = Vec::with_capacity(rows.len());
+    for (group, kind, selected) in rows {
+        let arms: Vec<(String, Option<String>)> = db.prepare("SELECT a.configuration_id,b.attempt_id FROM candidate_group_arms a LEFT JOIN candidate_arm_attempts b ON b.group_id=a.group_id AND b.arm=a.arm WHERE a.group_id=?1 ORDER BY a.arm")?
+            .query_map([&group], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        let arms = arms.into_iter().map(|(configuration, attempt)| Ok((configuration, match attempt { Some(a) => arm_outcome(&db, &a)?.1, None => "not_launched" })))
+            .collect::<Result<_>>()?;
+        closed.push(Closed { kind, selected, arms });
+    }
+    Ok(Some((closed, open as usize)))
+}
+
+fn unavailable(reason: &str) -> Value { json!({"status": "unavailable", "reason": reason}) }
+
+/// `sha256:` plus the first 12 hex digits, for summary lines.
+fn short(configuration: &str) -> &str { configuration.get(..19).unwrap_or(configuration) }
+
+/// M41 over `groups` for one selector dimension: per configuration and per
+/// ordered pair of configurations.
+fn win_rates(groups: &[&Closed], min: usize) -> Value {
+    let configurations: std::collections::BTreeSet<&str> = groups.iter().flat_map(|g| g.arms.iter().map(|(c, _)| c.as_str())).collect();
+    let contains = |g: &Closed, c: &str| g.arms.iter().any(|(a, _)| a == c);
+    let cells: Vec<Value> = configurations.iter().map(|&c| {
+        let with: Vec<&&Closed> = groups.iter().filter(|g| contains(g, c)).collect();
+        let selected = with.iter().filter(|g| g.selected.as_deref() == Some(c)).count();
+        let none = with.iter().filter(|g| g.selected.is_none()).count();
+        json!({"configuration_id": c, "groups": with.len(), "selected": selected, "no_selection": none, "other_selected": with.len() - selected - none,
+            "value": if with.len() < min { unavailable("insufficient_data") } else { json!(format!("{selected}/{}", with.len())) }})
+    }).collect();
+    let mut pairs = Vec::new();
+    for &a in &configurations {
+        for &b in configurations.iter().filter(|&&b| b != a) {
+            let both: Vec<&&Closed> = groups.iter().filter(|g| contains(g, a) && contains(g, b)).collect();
+            if both.is_empty() { continue; }
+            let wins = both.iter().filter(|g| g.selected.as_deref() == Some(a)).count();
+            let losses = both.iter().filter(|g| g.selected.as_deref() == Some(b)).count();
+            let none = both.iter().filter(|g| g.selected.is_none()).count();
+            let value = if both.len() < min { unavailable("insufficient_data") } else if wins + losses == 0 { unavailable("no_decisive_groups") } else { json!(format!("{wins}/{}", wins + losses)) };
+            pairs.push(json!({"a": a, "b": b, "groups": both.len(), "wins": wins, "losses": losses,
+                "ties": {"no_selection": none, "other_selected": both.len() - wins - losses - none}, "value": value}));
+        }
+    }
+    json!({"closed_groups": groups.len(), "configurations": cells, "head_to_head": pairs})
+}
+
+/// M41 and M42 (plan doc 07 §5b), definitions `M41.v1` and `M42.v1`.
+pub fn paired_metrics(project: &Path, since: Option<i64>, min_groups: u32) -> Result<std::collections::BTreeMap<String, Value>> {
+    let min = min_groups as usize;
+    let base = |definition: &str, name: &str| json!({"definition": definition, "name": name, "min_groups": min_groups});
+    let (mut m41, mut m42) = (base("M41.v1", "candidate_win_rate"), base("M42.v1", "paired_acceptance_difference"));
+    let Some((closed, open)) = closed_groups(project, since)? else {
+        m41["value"] = unavailable("candidate_groups_absent");
+        m42["value"] = unavailable("candidate_groups_absent");
+        return Ok([("M41".to_owned(), m41), ("M42".to_owned(), m42)].into());
+    };
+    for m in [&mut m41, &mut m42] { m["closed_groups"] = json!(closed.len()); m["open_groups"] = json!(open); }
+
+    // M41: selections, with the selector kind as a dimension.
+    let all: Vec<&Closed> = closed.iter().collect();
+    let mut by_selector = serde_json::Map::new();
+    by_selector.insert("all".into(), win_rates(&all, min));
+    for kind in ["operator", "rule", "judge"] {
+        by_selector.insert(kind.into(), win_rates(&closed.iter().filter(|g| g.kind == kind).collect::<Vec<_>>(), min));
+    }
+    let shown: Vec<String> = by_selector["all"]["configurations"].as_array().into_iter().flatten().filter_map(|c| c["value"].as_str().map(|v| format!("{}={v}", short(c["configuration_id"].as_str().unwrap_or_default())))).collect();
+    m41["value"] = if closed.is_empty() { unavailable("no_closed_groups") } else if shown.is_empty() { unavailable("insufficient_data") } else { json!(shown.join(" ")) };
+    m41["by_selector"] = Value::Object(by_selector);
+
+    // M42: verified acceptance (arm_outcome.v1), not selection; pending arms exclude their group.
+    let configurations: std::collections::BTreeSet<&str> = closed.iter().flat_map(|g| g.arms.iter().map(|(c, _)| c.as_str())).collect();
+    let outcome = |g: &Closed, c: &str| g.arms.iter().find(|(a, _)| a == c).map(|(_, o)| *o);
+    let mut pairs = Vec::new();
+    let mut summary = Vec::new();
+    for &a in &configurations {
+        for &b in configurations.iter().filter(|&&b| b != a) {
+            let (mut groups, mut pending, mut counts) = (0usize, 0usize, [0usize; 4]);
+            for g in &closed {
+                let (Some(x), Some(y)) = (outcome(g, a), outcome(g, b)) else { continue };
+                groups += 1;
+                if x == "pending" || y == "pending" { pending += 1; continue; }
+                counts[usize::from(x == "accepted") * 2 + usize::from(y == "accepted")] += 1;
+            }
+            if groups == 0 { continue; }
+            let [neither, b_only, a_only, both] = counts;
+            let n = groups - pending;
+            let value = if n < min { unavailable("insufficient_data") } else {
+                json!(((a_only as f64 - b_only as f64) * 100.0 / n as f64 * 100.0).round() / 100.0)
+            };
+            if a < b && value.is_number() { summary.push(format!("{}-{}={}pp", short(a), short(b), value)); }
+            pairs.push(json!({"a": a, "b": b, "groups": groups, "pending": pending, "n": n, "both_accepted": both, "a_only": a_only, "b_only": b_only, "neither": neither,
+                "difference": format!("{}/{n}", a_only as i64 - b_only as i64), "value": value, "unit": "percentage_points",
+                "uncertainty": unavailable("clustered_interval_not_computed")}));
+        }
+    }
+    m42["acceptance"] = json!("arm_outcome.v1 verified acceptance, not selection");
+    m42["value"] = if closed.is_empty() { unavailable("no_closed_groups") } else if summary.is_empty() { unavailable("insufficient_data") } else { json!(summary.join(" ")) };
+    m42["pairs"] = json!(pairs);
+    Ok([("M41".to_owned(), m41), ("M42".to_owned(), m42)].into())
 }

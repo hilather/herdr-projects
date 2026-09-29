@@ -31,7 +31,7 @@ pub enum Command {
         #[arg(long, default_value_t = outcomes::DEFAULT_HORIZON_DAYS, value_parser = clap::value_parser!(u32).range(1..=3650))]
         horizon_days: u32,
     },
-    /// Lane metrics (M45-M48, flaky tests) as JSON. Read-only.
+    /// Lane metrics (M41, M42, M45-M48, flaky tests) as JSON. Read-only.
     Report {
         /// Activity window start (Unix ms): by the first CI run (M45), by the integration (M47, M48).
         #[arg(long)]
@@ -67,15 +67,18 @@ const COLLECT_INTEGRATIONS: usize = 16;
 
 fn lane_metrics(project: &Path, since: Option<i64>, horizon_days: u32) -> Result<BTreeMap<String, Value>> {
     let (m47, m48) = outcomes::metrics(project, since, horizon_days)?;
+    let mut paired = groups::paired_metrics(project, since, groups::MIN_GROUPS)?;
     let unavailable = |definition: &str, name: &str, reason: &str| serde_json::json!({"definition": definition, "name": name, "proxy": true,
         "source_trust": "proxy_observed", "value": {"status": "unavailable", "reason": reason}});
-    Ok(BTreeMap::from([
+    let mut metrics = BTreeMap::from([
         ("M45".to_owned(), proxy::m45(project, since)?),
         ("M46".to_owned(), unavailable("M46.proxy-v1", "main_breakage_after_integration_proxy", "no_main_check_producer")),
         ("M47".to_owned(), m47),
         ("M48".to_owned(), m48),
         ("flaky_tests".to_owned(), unavailable("flaky_tests.proxy-v1", "newly_flaky_tests_proxy", "no_repeat_runs")),
-    ]))
+    ]);
+    metrics.append(&mut paired);
+    Ok(metrics)
 }
 
 /// Metrics merged into `telemetry <slug> report` (`super::metrics::report`),
