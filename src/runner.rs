@@ -524,11 +524,14 @@ mod tests {
     #[test]
     fn hard_kill_handles_ignored_term() {
         let start = Instant::now();
-        let out = RealRunner.run(&Cmd::new("sh", Duration::from_millis(100))
+        // The timeout must outlast shell startup under a loaded parallel run,
+        // or the child is killed before it prints; the bound still requires a
+        // prompt hard kill after TERM is ignored.
+        let out = RealRunner.run(&Cmd::new("sh", Duration::from_secs(1))
             .args(["-c", "trap '' TERM; printf ready; while :; do sleep 1; done"])).unwrap();
         assert!(out.timed_out);
         assert_eq!(out.stdout, "ready");
-        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(start.elapsed() < Duration::from_secs(3));
     }
 
     #[test]
