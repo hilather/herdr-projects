@@ -1,0 +1,44 @@
+{
+  "schema": "seed_set.v1",
+  "synthetic": true,
+  "note": "Synthetic starter seeds for tests only (contracts-review.md §8). Each seed rewrites src/lib.rs of a disposable test repository created by the test itself; nothing here is applied to a real project repository. The reproducer text never enters the store: only its sha256 reference is registered.",
+  "clean": "pub fn window(items: &[u32], start: usize, len: usize) -> &[u32] {\n    let end = start.saturating_add(len).min(items.len());\n    &items[start.min(end)..end]\n}\n",
+  "seeds": [
+    {
+      "id": "logic-inverted-guard",
+      "class": "logic",
+      "seeded": "pub fn window(items: &[u32], start: usize, len: usize) -> &[u32] {\n    let end = start.saturating_add(len).max(items.len());\n    &items[start.min(end)..end]\n}\n",
+      "reproducer": "window(&[1, 2, 3], 0, 1) must return [1]; the seeded min->max swap returns [1, 2, 3]"
+    },
+    {
+      "id": "boundary-off-by-one",
+      "class": "boundary",
+      "seeded": "pub fn window(items: &[u32], start: usize, len: usize) -> &[u32] {\n    let end = start.saturating_add(len + 1).min(items.len());\n    &items[start.min(end)..end]\n}\n",
+      "reproducer": "window(&[1, 2, 3], 0, 1) must return [1]; the seeded len + 1 returns [1, 2]"
+    },
+    {
+      "id": "concurrency-unsynchronized-counter",
+      "class": "concurrency",
+      "seeded": "static mut CALLS: u64 = 0;\npub fn window(items: &[u32], start: usize, len: usize) -> &[u32] {\n    unsafe { CALLS += 1; }\n    let end = start.saturating_add(len).min(items.len());\n    &items[start.min(end)..end]\n}\n",
+      "reproducer": "two threads calling window 10000 times each must count 20000 calls; the seeded static mut races"
+    },
+    {
+      "id": "security-unchecked-index",
+      "class": "security",
+      "seeded": "pub fn window(items: &[u32], start: usize, len: usize) -> &[u32] {\n    let end = start + len;\n    &items[start..end]\n}\n",
+      "reproducer": "window(&[1, 2, 3], 2, usize::MAX) must not panic; the seeded unchecked add overflows and indexes out of bounds"
+    },
+    {
+      "id": "test-weakening-ignored-case",
+      "class": "test_weakening",
+      "seeded": "pub fn window(items: &[u32], start: usize, len: usize) -> &[u32] {\n    let end = start.saturating_add(len).min(items.len());\n    &items[start.min(end)..end]\n}\n#[cfg(test)]\nmod tests {\n    #[test]\n    #[ignore]\n    fn empty_window_past_end() { assert!(super::window(&[1], 5, 1).is_empty()); }\n}\n",
+      "reproducer": "the past-the-end test must run; the seeded #[ignore] silently skips it"
+    },
+    {
+      "id": "requirement-omission-empty-input",
+      "class": "requirement_omission",
+      "seeded": "pub fn window(items: &[u32], start: usize, len: usize) -> &[u32] {\n    &items[start..start + len]\n}\n",
+      "reproducer": "window(&[], 0, 0) and any start past the end must return an empty slice; the seeded version drops the clamp the contract requires"
+    }
+  ]
+}

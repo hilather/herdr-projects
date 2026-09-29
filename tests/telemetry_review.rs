@@ -1056,3 +1056,350 @@ fn preregistered_assignment_frozen_before_outcomes_observational_is_descriptive(
     assert!(f.cli_fail(&["review", "experiments", "assign", "skeptical-matched.v1", &again]).contains("needs --block and --arm"));
     assert_eq!(f.cli_args(&["review", "experiments", "assign", "skeptical-matched.v1", &again, "--block", "pair-1", "--arm", "skeptical"]).0["event"]["subject"]["block"], json!("pair-1"));
 }
+
+/// The synthetic starter seed set (tests only): `(class, seeded source, reproducer)` by id.
+fn seed_set() -> serde_json::Value {
+    serde_json::from_str(&fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/telemetry/seeds/starter-seed-set.json")).unwrap()).unwrap()
+}
+fn seed_fixture(id: &str) -> serde_json::Value { seed_set()["seeds"].as_array().unwrap().iter().find(|s| s["id"] == id).unwrap().clone() }
+/// The registered reproducer reference: its sha256, never its text.
+fn reproducer_ref(seed: &serde_json::Value) -> String { format!("sha256:{:x}", Sha256::digest(seed["reproducer"].as_str().unwrap().as_bytes())) }
+
+/// A disposable real project for the integration path: an owner signing key,
+/// an active `demo` project, and a SHA-256 git repository whose base holds
+/// the starter set's clean source.
+struct IntegrationLab { home: tempfile::TempDir, root: std::path::PathBuf, project: std::path::PathBuf, key: std::path::PathBuf, repo: std::path::PathBuf, store: String, base: String }
+
+impl IntegrationLab {
+    fn new() -> Self {
+        use herdr_projects::{domain::ProjectState, migration, runtime};
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let lab = |args: &[&str]| std::process::Command::new(BIN).env_clear().env("HOME", home.path()).args(args).output().unwrap();
+        for action in ["new", "pause"] { assert!(lab(&["--root", root.to_str().unwrap(), action, "demo"]).status.success()); }
+        let key = home.path().join("owner");
+        assert!(std::process::Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).output().unwrap().status.success());
+        let public = fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+        let project = root.join("demo");
+        let config = home.path().join(".config/herdr-projects/config.toml");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[profiles.worker]\nkind='claude'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=60\nunknown_usage='allow_with_warning'\n")).unwrap();
+        let plan = migration::inspect_with_config(&project, &config).unwrap();
+        migration::apply(&project, &plan, true).unwrap();
+        let s = runtime::snapshot(&project).unwrap();
+        runtime::set_state(&project, s.head, s.control.unwrap().revision, ProjectState::Active, &config).unwrap();
+        let store = project.join(".state/state.db").canonicalize().unwrap().display().to_string();
+        let repo = home.path().join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let mut lab = IntegrationLab { home, root, project, key, repo, store, base: String::new() };
+        lab.git(&["init", "-q", "--object-format=sha256"]);
+        fs::write(lab.repo.join("src/base.txt"), "base\n").unwrap();
+        lab.git(&["add", "."]);
+        lab.git(&["commit", "-qm", "base"]);
+        lab.base = lab.git(&["rev-parse", "HEAD"]);
+        lab
+    }
+    fn hp(&self, args: &[&str]) -> std::process::Output {
+        let mut all = vec!["--root", self.root.to_str().unwrap()];
+        all.extend_from_slice(args);
+        std::process::Command::new(BIN).env_clear().env("HOME", self.home.path()).env("PATH", "/usr/bin:/bin").args(all).output().unwrap()
+    }
+    fn ok(&self, args: &[&str]) -> serde_json::Value {
+        let out = self.hp(args);
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+    fn fail(&self, args: &[&str]) -> String {
+        let out = self.hp(args);
+        assert!(!out.status.success(), "{args:?} succeeded: {}", String::from_utf8_lossy(&out.stdout));
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+    fn db(&self) -> rusqlite::Connection { rusqlite::Connection::open(self.project.join(".state/state.db")).unwrap() }
+    fn git(&self, args: &[&str]) -> String {
+        let out = std::process::Command::new("/usr/bin/git").env_clear().env("PATH", "/usr/bin:/bin").env("HOME", self.home.path()).env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "fixture").env("GIT_AUTHOR_EMAIL", "fixture@example.com").env("GIT_COMMITTER_NAME", "fixture").env("GIT_COMMITTER_EMAIL", "fixture@example.com")
+            .current_dir(&self.repo).args(args).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+    /// Test-only seed injection into this disposable repository: branch
+    /// `branch` from the base with `src/lib.rs` = `source`; returns the commit.
+    fn candidate(&self, branch: &str, source: &str) -> String {
+        self.git(&["checkout", "-qb", branch, &self.base]);
+        fs::write(self.repo.join("src/lib.rs"), source).unwrap();
+        self.git(&["add", "."]);
+        self.git(&["commit", "-qm", branch]);
+        self.git(&["rev-parse", "HEAD"])
+    }
+    /// Task `task` with a running attempt, a signed verify-then-integrate contract whose
+    /// policy runs `git diff --quiet`, and one submitted result at `candidate`.
+    fn submit(&self, task: &str, candidate: &str) -> String {
+        use herdr_projects::{authority::CONTRACT_SIGNATURE_NAMESPACE, domain::TaskId, runtime};
+        let head = runtime::add_task(&self.project, TaskId::new(task).unwrap(), "work".into(), runtime::snapshot(&self.project).unwrap().head).unwrap();
+        self.db().execute("INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) VALUES(?1,?2,1,'running',NULL,?1,0)", [format!("{task}-attempt"), task.to_owned()]).unwrap();
+        let repository = self.repo.canonicalize().unwrap().display().to_string();
+        let mut document = serde_json::to_vec_pretty(&json!({
+            "version": 3, "outputs": [{"path": "src/lib.rs", "kind": "git_file"}], "scope": {"paths": [{"path": "src/", "access": "write"}]},
+            "project_store": self.store, "expected_head": head, "task_id": task, "contract_revision": 1, "deliverable": "ship", "non_goals": "no launch",
+            "acceptance_policies": [{"id": "clean", "text": POLICY}], "repository": repository, "base_oid": self.base, "object_format": "sha256",
+            "dependencies": [], "capability_flags": [], "profile_kind": "codex", "retry_class": "none", "result_schema_id": "result-v1",
+            "route": "verify_then_integrate", "authority": herdr_projects::authority::policy_reference(&self.project).unwrap()})).unwrap();
+        document.push(b'\n');
+        let doc = self.home.path().join(format!("{task}-contract.json"));
+        fs::write(&doc, &document).unwrap();
+        assert!(std::process::Command::new("/usr/bin/ssh-keygen").args(["-Y", "sign", "-f"]).arg(&self.key).args(["-n", CONTRACT_SIGNATURE_NAMESPACE]).arg(&doc).status().unwrap().success());
+        let installed = self.ok(&["task", "demo", "contract", "put", "--input-file", doc.to_str().unwrap(), "--signature", doc.with_extension("json.sig").to_str().unwrap()]);
+        let objects: Vec<serde_json::Value> = self.git(&["rev-list", "--objects", "--all"]).lines()
+            .map(|line| { let oid = line.split_whitespace().next().unwrap(); json!({"oid": oid, "relative_path": format!("{}/{}", &oid[..2], &oid[2..])}) }).collect();
+        let result = self.home.path().join(format!("{task}-result.json"));
+        fs::write(&result, json!({"idempotency_key": format!("{task}-key"), "task_id": task, "contract_revision": 1, "contract_digest": installed["digest"],
+            "attempt_id": format!("{task}-attempt"), "repository": repository, "base_oid": self.base, "candidate_oid": candidate, "object_format": "sha256",
+            "artifact_manifest": [{"path": "src/lib.rs", "oid": candidate}], "claimed_checks": ["all checks passed"], "objects": objects}).to_string()).unwrap();
+        self.ok(&["result", "demo", "submit", "--input-file", result.to_str().unwrap()])["submission_id"].as_str().unwrap().to_owned()
+    }
+    /// Verify `submission` through the operator CLI; returns its verified result id.
+    fn verify(&self, submission: &str, key: &str) -> String {
+        let policy = self.home.path().join("policy.json");
+        fs::write(&policy, POLICY).unwrap();
+        let work = self.home.path().join(format!("{key}-work"));
+        let out = self.ok(&["result", "demo", "verify", submission, "--policy-id", "clean", "--policy-file", policy.to_str().unwrap(), "--idempotency-key", key,
+            "--work-dir", work.to_str().unwrap(), "--timeout-seconds", "30"]);
+        assert_eq!(out["state"], json!("accepted"));
+        out["receipt"]["result_id"].as_str().unwrap().to_owned()
+    }
+    fn telemetry(&self, args: &[&str]) -> serde_json::Value {
+        let mut all = vec!["telemetry", "demo"];
+        all.extend_from_slice(args);
+        self.ok(&all)
+    }
+}
+
+const POLICY: &str = r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#;
+
+/// TM3.6 guard and blindness over the real integration path. Seeded candidate
+/// X (starter seed `logic-inverted-guard`, injected into a disposable repo)
+/// and clean control C are registered before any review, then both pass
+/// verification. With automatic integration on, the producer's turn drops X
+/// from the pending projection and enqueues C only (1 job, C's submission).
+/// The operator's `result integrate` of X is refused by `begin_integration`
+/// before any write (no lease, no integration operation, target unchanged,
+/// scratch dir never created), and raw SQL cannot insert an integration job
+/// or operation for X. Reviewers' blind presentations of X and C have the
+/// same twelve fields and carry nothing about seeds.
+#[test]
+fn seeded_candidate_never_integrates_and_reviewers_stay_blind() {
+    let lab = IntegrationLab::new();
+    let seed = seed_fixture("logic-inverted-guard");
+    let seeded_oid = lab.candidate("seeded", seed["seeded"].as_str().unwrap());
+    let clean_oid = lab.candidate("clean", seed_set()["clean"].as_str().unwrap());
+    let x = lab.submit("task-x", &seeded_oid);
+    let c = lab.submit("task-c", &clean_oid);
+    let reproducer = reproducer_ref(&seed);
+    let registered = lab.telemetry(&["review", "seeds", "register", &x, "--seed", &format!("logic={reproducer}")])["event"].clone();
+    assert_eq!((&registered["seq"], &registered["kind"], &registered["authority"], &registered["subject"]["arm"], &registered["subject"]["candidate_oid"]),
+        (&json!(1), &json!("registered"), &json!("evaluation_owner.v1"), &json!("seeded"), &json!(seeded_oid)));
+    assert_eq!(lab.telemetry(&["review", "seeds", "register", &c, "--control"])["event"]["subject"]["arm"], json!("clean_control"));
+    let x_result = lab.verify(&x, "verify-x");
+    let c_result = lab.verify(&c, "verify-c");
+
+    lab.git(&["branch", "integration", &lab.base]);
+    lab.ok(&["result", "demo", "configure-integration", "--repository", lab.repo.to_str().unwrap(), "--reference", "refs/heads/integration"]);
+    let head = herdr_projects::runtime::snapshot(&lab.project).unwrap().head.to_string();
+    assert_eq!(lab.ok(&["result", "demo", "auto", "--integrate", "on", "--expected-head", &head])["integrate"], json!(true));
+    let pending = |db: &rusqlite::Connection| db.query_row("SELECT count(*) FROM pending_integration_work", [], |r| r.get::<_, i64>(0)).unwrap();
+    assert_eq!(pending(&lab.db()), 2, "both verified submissions enter the pending projection");
+    // The producer (the ticker's integration pass): X was submitted first, yet only C is enqueued.
+    let turn = herdr_projects::store::service_project_integration_jobs(&lab.project).unwrap();
+    assert_eq!((turn.enqueued, turn.pending), (1, false));
+    let db = lab.db();
+    let jobs: Vec<String> = db.prepare("SELECT json_extract(payload,'$.submission_id') FROM operations WHERE kind='integration.run'").unwrap()
+        .query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+    assert_eq!((jobs, pending(&db)), (vec![c.clone()], 0));
+    // A later turn re-adds nothing for X.
+    assert_eq!(herdr_projects::store::service_project_integration_jobs(&lab.project).unwrap().enqueued, 0);
+
+    // The operator path reaches begin_integration, which refuses before any write.
+    let target = lab.git(&["rev-parse", "refs/heads/integration"]);
+    let work = lab.home.path().join("integrate-x");
+    let refused = lab.fail(&["result", "demo", "integrate", &x_result, "--repository", lab.repo.to_str().unwrap(), "--idempotency-key", "integrate-x", "--work-dir", work.to_str().unwrap()]);
+    assert!(refused.contains("a seeded candidate never integrates"), "{refused}");
+    assert_eq!(lab.git(&["rev-parse", "refs/heads/integration"]), target);
+    assert!(!work.exists());
+    let count = |sql: &str| db.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+    assert_eq!((count("SELECT count(*) FROM integration_operations"), count("SELECT count(*) FROM operations WHERE kind='integration.lease'")), (0, 0));
+    // Raw SQL cannot create an integration job or operation for X either.
+    let job = db.execute("INSERT INTO operations(id,task_id,kind,target,payload_version,payload,payload_hash,expected_revision,due_unix_ms,idempotency_key)
+        VALUES('raw-job','task-x','integration.run','refs/heads/integration',1,?1,?2,1,0,'raw-job')", rusqlite::params![json!({"submission_id": x}).to_string(), hex('d')]).unwrap_err();
+    assert!(job.to_string().contains("a seeded candidate never integrates"), "{job}");
+    let lease = db.execute("INSERT INTO operations(id,task_id,kind,target,payload_version,payload,payload_hash,expected_revision,due_unix_ms,idempotency_key)
+        VALUES('raw-lease','task-x','integration.lease','refs/heads/integration',1,?1,?2,1,0,'raw-lease')", rusqlite::params![json!({"result_id": x_result}).to_string(), hex('d')]).unwrap_err();
+    assert!(lease.to_string().contains("a seeded candidate never integrates"), "{lease}");
+    let operation = db.execute("INSERT INTO integration_operations(operation_id,project_store,idempotency_key,payload_digest,repository,ref_name,expected_old_oid,verified_result_id,candidate_id,state,generation,object_format,checks_passed,reason,created_unix_ms)
+        VALUES('raw-op',?1,'raw-op',?2,?3,'refs/heads/integration',?4,?5,NULL,'effect_pending',1,'sha256',0,NULL,1)",
+        rusqlite::params![lab.store, hex('d'), lab.repo.canonicalize().unwrap().display().to_string(), lab.base, x_result]).unwrap_err();
+    assert!(operation.to_string().contains("a seeded candidate never integrates"), "{operation}");
+    // The registry cannot be rewritten to release it.
+    assert!(db.execute("UPDATE seeded_candidates SET arm='clean_control'", []).unwrap_err().to_string().contains("append-only"));
+    assert!(db.execute("DELETE FROM seeded_candidates", []).unwrap_err().to_string().contains("append-only"));
+    // The clean control's verified result stays integrable: the guard names X only.
+    assert!(db.query_row("SELECT EXISTS(SELECT 1 FROM verified_results WHERE result_id=?1)", [&c_result], |r| r.get::<_, bool>(0)).unwrap());
+    drop(db);
+
+    // Reviewers stay blind: identical field sets, nothing about seeds, arms or reproducers.
+    let open = |sub: &str| lab.telemetry(&["review", "open", sub, "--protocol", "review-protocol.v1"])["opportunity"]["opportunity_id"].as_str().unwrap().to_owned();
+    let (ox, oc) = (open(&x), open(&c));
+    let present = |o: &str| {
+        let out = lab.hp(&["telemetry", "demo", "review", "present", o]);
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let (px, pc) = (present(&ox), present(&oc));
+    let keys = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap()["presentation"].as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    assert_eq!(keys(&px), keys(&pc));
+    assert_eq!(keys(&px).len(), 12);
+    let hidden = [reproducer.as_str(), &reproducer[7..], "seed", "control", "logic", "evaluation_owner", "reveal"];
+    for text in [&px, &pc] { for word in hidden { assert!(!text.contains(word), "{word} in {text}"); } }
+    assert!(px.contains(&seeded_oid) && pc.contains(&clean_oid));
+    let shown = String::from_utf8(lab.hp(&["telemetry", "demo", "review", "show"]).stdout).unwrap();
+    for word in [&reproducer[7..], "seed", "clean_control"] { assert!(!shown.contains(word), "{word} in review show"); }
+    // The owner's view has the arm and the reference, never the seed's source.
+    let owner = lab.telemetry(&["review", "seeds", "show"])["seeds"].clone();
+    assert_eq!((&owner["candidates"][0]["arm"], &owner["candidates"][0]["seeds"][0]["reproducer_ref"]), (&json!("seeded"), &json!(reproducer)));
+    for file in ["state.db", "state.db-wal"] {
+        let bytes = fs::read(lab.project.join(".state").join(file)).unwrap_or_default();
+        assert!(!bytes.windows(20).any(|w| w == &seed["reproducer"].as_str().unwrap().as_bytes()[..20]), "reproducer text in {file}");
+    }
+}
+
+/// Doc 10 §5 seeded-review fixture. Seeded candidates S1–S4 (starter seeds
+/// logic, boundary, security, test_weakening; seeds 1–4) and clean controls
+/// C1, C2 are registered at seq 1–6. Configuration R (`fast`) reviews each
+/// once: S1 reports two findings (claims 1, 2; seq 7, 8), S2–S4, C1, C2 one
+/// each (claims 3–7; seq 9–13). A second review of S1 by Q (`claude`) times
+/// out: not completed, so no trial (`not_completed` 1), never a 0. Before
+/// triage every trial is pending: M43 and M44 are null (empty denominator)
+/// with pending 4 and 2. Seq 14–20 triage: claims 1–5 and 7 validated as new
+/// findings, claim 6 rejected. Seq 21–23 link claims 1, 3, 4 to seeds 1–3.
+/// By hand: M43 = 3/4 = 75.00 (S4's seed missed; its validated claim 5 is an
+/// ordinary finding), M44 = 1/2 = 50.00 (C1's rejected-only submission; C2's
+/// validated finding is not a false alarm), per configuration R the same;
+/// each seed class has 1 trial, below `--min-trials 2`, so suppressed with
+/// counts. M22 = 6/7: detection changes no triage. Seq 24 resets claim 1:
+/// seed 1 pending, M43 = 2/3. Seq 25 validates it again: 3/4. Seq 26
+/// retracts detection 23: 2/4; as of 25 still 3/4. Seq 27 re-links it: 3/4.
+/// Seq 28 reveals S1 (every review ended), seq 29 discards it.
+#[test]
+fn seeded_recall_and_clean_control_false_alarms_match_fixture() {
+    let f = Fixture::new();
+    let world = review_world(&f, &["rev-a1", "rev-a2", "rev-a3", "rev-a4", "rev-a5", "rev-a6", "rev-a7"]);
+    let db_path = f.project.join(".state/state.db");
+    let claude = codex_profile(&f.config, "claude", "claude", None);
+    let (r_id, q_id) = (agent_configuration(&fast_profile(&f)).id, agent_configuration(&claude).id);
+    plant_profile(&db_path, claude);
+    let factory = Factory::open(&f);
+    let subs: Vec<(String, String)> = std::iter::once(world.clone()).chain(['2', '3', '4', '5', '6', '7'].into_iter().map(|c| {
+        factory.submission(&hex(c), &f.attempt, &oid(c), 1_000);
+        (hex(c), oid(c))
+    })).collect();
+    let (s, c1, c2, unregistered) = (&subs[..4], &subs[4], &subs[5], &subs[6]);
+    let seeds = ["logic-inverted-guard", "boundary-off-by-one", "security-unchecked-index", "test-weakening-ignored-case"].map(seed_fixture);
+    let seeds_cmd = |args: &[&str]| { let mut all = vec!["review", "seeds"]; all.extend_from_slice(args); f.cli_args(&all).0 };
+    let seeds_fail = |args: &[&str]| { let mut all = vec!["review", "seeds"]; all.extend_from_slice(args); f.cli_fail(&all) };
+
+    // Only the evaluation authority registers; a reproducer is a reference, never the seed.
+    let mut store = SqliteStore::open(&db_path).unwrap();
+    let arm = herdr_projects::store::EvaluationArm::Seeded(vec![herdr_projects::store::SeedSpec { seed_class: "logic".into(), reproducer_ref: reproducer_ref(&seeds[0]) }]);
+    for worker in ["worker:rev-a1", "rev-a1", f.attempt.as_str()] {
+        assert!(format!("{:?}", store.register_evaluation_candidate(&s[0].0, &arm, None, worker, 1).unwrap_err()).contains("a worker cannot register"), "{worker}");
+    }
+    assert!(format!("{:?}", store.register_evaluation_candidate(&s[0].0, &arm, None, "import:x", 1).unwrap_err()).contains("an import cannot"));
+    drop(store);
+    assert!(seeds_fail(&["register", &s[0].0, "--seed", "logic=min became max in window"]).contains("never the seed itself"));
+    assert!(seeds_fail(&["register", &s[0].0, "--seed", &format!("typo={}", reproducer_ref(&seeds[0]))]).contains("unknown seed class"));
+    let raw = rusqlite::Connection::open(&db_path).unwrap().execute("INSERT INTO seed_log(seq,kind,principal,authority,recorded_unix_ms) VALUES(1,'registered','worker:rev-a1','evaluation_owner.v1',1)", []).unwrap_err();
+    assert!(raw.to_string().contains("CHECK constraint failed"), "{raw}");
+    for (i, (sub, seed)) in s.iter().zip(&seeds).enumerate() {
+        let event = seeds_cmd(&["register", &sub.0, "--seed", &format!("{}={}", seed["class"].as_str().unwrap(), reproducer_ref(seed))])["event"].clone();
+        assert_eq!((&event["seq"], &event["subject"]["seeds"]), (&json!(i + 1), &json!([i + 1])));
+    }
+    for sub in [c1, c2] { seeds_cmd(&["register", &sub.0, "--control"]); }
+    assert!(seeds_fail(&["register", &s[0].0, "--control"]).contains("already registered"));
+    // An arm is fixed before any review: a reviewed candidate cannot join the evaluation.
+    f.cli_args(&["review", "open", &unregistered.0, "--protocol", "review-protocol.v1"]);
+    assert!(seeds_fail(&["register", &unregistered.0, "--control"]).contains("before any review"));
+
+    // Reviews by R; S1 also by Q, whose session times out.
+    let findings = [json!(["finding:s1-a", "finding:s1-b"]), json!(["finding:s2"]), json!(["finding:s3"]), json!(["finding:s4"]), json!(["finding:c1"]), json!(["finding:c2"])];
+    for (i, (sub, found)) in s.iter().chain([c1, c2]).zip(findings).enumerate() { completed_review(&f, sub, "code", &format!("rev-a{}", i + 1), found); }
+    let q = f.cli_args(&["review", "open", &s[0].0, "--kind", "security", "--protocol", "review-protocol.v1"]).0["opportunity"]["opportunity_id"].as_str().unwrap().to_owned();
+    f.cli_args(&["review", "assign", &q, "--reviewer", "claude"]);
+    let session = f.cli_args(&["review", "start", &q, "--attempt", "rev-a7"]).0["session"]["session_id"].as_str().unwrap().to_owned();
+    assert!(seeds_fail(&["reveal", &s[0].0]).contains("has not ended"));
+    let path = f.tmp.path().join("q.json");
+    fs::write(&path, json!({"schema": "review_receipt.v1", "session_id": session, "submission_id": s[0].0, "candidate_oid": s[0].1, "outcome": "timed_out", "findings": [], "evidence": []}).to_string()).unwrap();
+    f.cli_args(&["review", "complete", "--input-file", path.to_str().unwrap()]);
+
+    let report = |extra: &[&str]| { let mut args = vec!["report", "--min-trials", "2"]; args.extend_from_slice(extra); seeds_cmd(&args)["metrics"].clone() };
+    let m = report(&[]);
+    assert_eq!((&m["M43"]["value"], &m["M43"]["reason"], &m["M43"]["trials"], &m["M43"]["pending"], &m["M43"]["not_completed"]), (&json!(null), &json!("empty_denominator"), &json!(0), &json!(4), &json!(1)));
+    assert_eq!((&m["M44"]["value"], &m["M44"]["controls"], &m["M44"]["pending"], &m["M44"]["not_completed"]), (&json!(null), &json!(0), &json!(2), &json!(0)));
+
+    // Detection only through accepted triage, on the seed's own candidate.
+    assert!(seeds_fail(&["detect", "1", "--claim", "1", "--evidence", &evidence('e')]).contains("claim 1 is pending"));
+    for claim in ["1", "2", "3", "4", "5", "7"] { f.cli_args(&["review", "findings", "validate", claim, "--new", "--severity", "high", "--evidence", &evidence('e')]); }
+    f.cli_args(&["review", "findings", "reject", "6", "--reason", "insufficient_evidence"]);
+    assert!(seeds_fail(&["detect", "4", "--claim", "6", "--evidence", &evidence('e')]).contains("another candidate"));
+    assert!(seeds_fail(&["detect", "1", "--claim", "3", "--evidence", &evidence('e')]).contains("another candidate"));
+    assert!(seeds_fail(&["detect", "1", "--claim", "1"]).contains("at least one evidence reference"));
+    for (seed, claim, seq) in [("1", "1", 21), ("2", "3", 22), ("3", "4", 23)] {
+        assert_eq!(seeds_cmd(&["detect", seed, "--claim", claim, "--evidence", &evidence('a')])["event"]["seq"], json!(seq));
+    }
+    assert!(seeds_fail(&["detect", "1", "--claim", "1", "--evidence", &evidence('a')]).contains("already detects a seed"));
+
+    let m = report(&[]);
+    let cell = |v: &serde_json::Value, n: &str, d: &str| (v[n].clone(), v[d].clone(), v["pending"].clone(), v["value"].clone(), v["percent"].clone());
+    assert_eq!(cell(&m["M43"], "detected", "trials"), (json!(3), json!(4), json!(0), json!("3/4"), json!("75.00")));
+    assert_eq!(cell(&m["M44"], "false_alarms", "controls"), (json!(1), json!(2), json!(0), json!("1/2"), json!("50.00")));
+    let r = &m["M43"]["by_configuration"][&r_id];
+    assert_eq!(cell(r, "detected", "trials"), (json!(3), json!(4), json!(0), json!("3/4"), json!("75.00")));
+    assert!(m["M43"]["by_configuration"].get(&q_id).is_none(), "Q completed no review: no trial, never 0");
+    let suppressed = json!({"status": "unavailable", "reason": "insufficient_data"});
+    assert_eq!(r["by_seed_class"]["test_weakening"], json!({"detected": 0, "trials": 1, "pending": 0, "value": suppressed, "percent": suppressed}));
+    assert_eq!(m["M43"]["by_seed_class"]["logic"], json!({"detected": 1, "trials": 1, "pending": 0, "value": suppressed, "percent": suppressed}));
+    assert_eq!(m["M43"]["by_kind_protocol"]["code/review-protocol.v1"]["value"], json!("3/4"));
+    assert_eq!(cell(&m["M44"]["by_configuration"][&r_id], "false_alarms", "controls"), (json!(1), json!(2), json!(0), json!("1/2"), json!("50.00")));
+    // At the default minimum (20) the rates are suppressed, counts still shown, also in the full report.
+    let full = f.report()["metrics"].clone();
+    assert_eq!(cell(&full["M43"], "detected", "trials"), (json!(3), json!(4), json!(0), suppressed.clone(), suppressed.clone()));
+    assert_eq!((&full["M44"]["false_alarms"], &full["M44"]["controls"], &full["M44"]["value"]), (&json!(1), &json!(2), &suppressed));
+    // Incidental real findings follow the ordinary path: M22 counts every submission.
+    assert_eq!(full["M22"]["value"], json!("6/7"));
+    let triage = f.cli_args(&["review", "findings", "show"]).0["findings"].clone();
+    assert_eq!(triage["unique_findings"], json!(6));
+
+    // Triage corrections and retractions replay through the one ordering.
+    f.cli_args(&["review", "findings", "reset", "1", "--reason", "decided_in_error"]);
+    assert_eq!(cell(&report(&[])["M43"], "detected", "trials"), (json!(2), json!(3), json!(1), json!("2/3"), json!("66.67")));
+    f.cli_args(&["review", "findings", "validate", "1", "--finding", "finding:canonical-14", "--severity", "high", "--evidence", &evidence('e')]);
+    assert_eq!(report(&[])["M43"]["value"], json!("3/4"));
+    assert_eq!(seeds_cmd(&["retract", "23"])["event"]["seq"], json!(26));
+    assert_eq!(report(&[])["M43"]["value"], json!("2/4"));
+    assert_eq!((&report(&["--as-of", "25"])["M43"]["value"], &report(&["--as-of", "25"])["M43"]["as_of_seq"]), (&json!("3/4"), &json!(25)));
+    seeds_cmd(&["detect", "3", "--claim", "4", "--evidence", &evidence('b')]);
+
+    // Reveal only after every review ended; nothing reviews it afterwards.
+    assert!(seeds_fail(&["dispose", &s[0].0, "--disposition", "discarded"]).contains("not revealed yet"));
+    assert_eq!(seeds_cmd(&["reveal", &s[0].0])["event"]["seq"], json!(28));
+    let again = f.cli_fail(&["review", "open", &s[0].0, "--protocol", "review-protocol.v1"]);
+    assert!(again.contains("not reviewed again"), "{again}");
+    assert_eq!(seeds_cmd(&["dispose", &s[0].0, "--disposition", "discarded"])["event"]["seq"], json!(29));
+    let m = report(&[]);
+    assert_eq!((&m["M43"]["value"], &m["M44"]["value"], &m["M43"]["as_of_seq"]), (&json!("3/4"), &json!("1/2"), &json!(29)));
+    let shown = seeds_cmd(&["show"])["seeds"].clone();
+    let s1 = &shown["candidates"][0];
+    assert_eq!((&s1["revealed_seq"], &s1["disposal"], &s1["seeds"][0]["reproducer_ref"], &s1["seeds"][0]["seed_class"]),
+        (&json!(28), &json!("discarded"), &json!(reproducer_ref(&seeds[0])), &json!("logic")));
+    let kinds: Vec<&str> = shown["history"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["registered", "registered", "registered", "registered", "registered", "registered", "detected", "detected", "detected", "retracted", "detected", "revealed", "disposed"]);
+    assert_eq!(shown["trials"].as_array().unwrap().iter().map(|t| t["status"].as_str().unwrap()).collect::<Vec<_>>(), ["detected", "detected", "detected", "missed"]);
+}

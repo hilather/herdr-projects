@@ -4,7 +4,9 @@
 //! metrics, tick work and `migrations/telemetry/review/NNNN_*.sql` here only.
 //! Writes go through the canonical store (`SqliteStore`, one `state.db`
 //! transaction each); `show`, `present`, `report`, `findings show`, `fixes show`,
-//! `protocols show`, `experiments show` and the metrics hook read `state.db` strictly read-only.
+//! `protocols show`, `experiments show`, `seeds show`, `seeds report` and the metrics
+//! hook read `state.db` strictly read-only. `present`, the reviewer-facing view, never
+//! reads seed state (§8).
 use anyhow::{Context, Result};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
@@ -13,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 mod fixes;
 mod protocols;
+mod seeds;
 
 use crate::store::{FindingSummary, FindingTarget, ReviewAssignmentChoice, ReviewOpportunitySpec, SqliteStore, TriageOutcome, TriageRequest, finding_state, fix_state, protocol_state};
 
@@ -93,7 +96,7 @@ pub enum Command {
         #[arg(long)]
         since: Option<i64>,
     },
-    /// Lane metrics (M20–M23, M25–M29; M24 unavailable) as JSON. Read-only.
+    /// Lane metrics (M20–M23, M25–M29, M43, M44; M24 unavailable) as JSON. Read-only.
     Report {
         /// Window start (Unix ms), by the assignment (unassigned: by creation;
         /// finding submissions: by arrival; findings: by their discovery's
@@ -117,6 +120,10 @@ pub enum Command {
     /// Preregistered review experiments: units, exclusions, crossover, estimates.
     #[command(subcommand)]
     Experiments(protocols::ExperimentsCommand),
+    /// Seeded-defect evaluation: registry, detections, reveal, disposal and
+    /// the M43/M44 report. Evaluation authority (the project owner) only.
+    #[command(subcommand)]
+    Seeds(seeds::SeedsCommand),
 }
 
 /// `herdr-projects telemetry <slug> review findings ...`. Every write is a
@@ -244,6 +251,7 @@ pub fn run(project: &Path, command: Command) -> Result<String> {
         Command::Findings(command) => findings(project, command, now)?,
         Command::Fixes(command) => fixes::run(project, command, now)?,
         Command::Protocols(command) => protocols::protocols(project, command, now)?,
+        Command::Seeds(command) => seeds::run(project, command, now)?,
         Command::Experiments(command) => protocols::experiments(project, command, now)?,
     };
     Ok(serde_json::to_string_pretty(&value)? + "\n")
@@ -296,8 +304,15 @@ fn present(project: &Path, opportunity: &str) -> Result<Value> {
             "repository": r.get::<_, String>(3)?, "base_oid": r.get::<_, String>(4)?, "candidate_oid": r.get::<_, String>(5)?, "object_format": r.get::<_, String>(6)?,
             "scope": r.get::<_, String>(7)?, "kind": r.get::<_, String>(8)?, "protocol": r.get::<_, String>(9)?,
             "prior_findings": serde_json::from_str::<Value>(&r.get::<_, String>(10)?).unwrap_or(Value::Null), "budget_ms": r.get::<_, Option<i64>>(11)?}))).optional()?;
-    row.map(|r| json!({"presentation": r})).with_context(|| format!("no review opportunity {opportunity}"))
+    let row = row.with_context(|| format!("no review opportunity {opportunity}"))?;
+    // Blindness check: a reviewer sees only these fields, never seed state,
+    // the evaluation arm, the author or its configuration (§3, §8).
+    anyhow::ensure!(row.as_object().is_some_and(|o| o.keys().all(|k| PRESENTED.contains(&k.as_str()))), "review presentation carries a field outside the blind view");
+    Ok(json!({"presentation": row}))
 }
+
+/// The only fields of the blind reviewer view (`review present`).
+const PRESENTED: [&str; 12] = ["opportunity_id", "task_id", "contract_revision", "repository", "base_oid", "candidate_oid", "object_format", "scope", "kind", "protocol", "prior_findings", "budget_ms"];
 
 /// One opportunity as `show` reports it, with its status for M20.
 struct Opportunity { record: Value, kind: String, protocol: String, assigned: Option<i64>, created: i64, status: &'static str, findings: Option<i64> }
@@ -428,6 +443,9 @@ fn lane_metrics(project: &Path, since: Option<i64>, horizon_days: i64) -> Result
     // M28 skeptical incremental yield: descriptive; experiments beside it (§7).
     let registry = match read(project)? { Some(db) => protocol_state(&db, None, now)?, None => None };
     out.insert("M28".to_owned(), protocols::metric(registry.as_ref(), since));
+    // M43/M44 over seeded evaluation candidates (§8), at the default minimum sample.
+    let seeded = match read(project)? { Some(db) => crate::store::seed_state(&db, None)?, None => None };
+    out.extend(seeds::metrics(seeded.as_ref(), since, seeds::DEFAULT_MIN_TRIALS));
     Ok(out)
 }
 

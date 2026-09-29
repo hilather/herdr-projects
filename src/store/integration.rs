@@ -349,6 +349,7 @@ impl SqliteStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         schema28(&tx)?;
         super::contract_binding::require_verified_result_barrier(&tx, &begin.verified.result_id, jiff::Timestamp::now().as_millisecond())?;
+        super::seeded_defects::refuse_seeded_integration(&tx, &begin.verified.result_id)?;
         let configured: Option<String> = tx
             .query_row(
                 "SELECT ref_name FROM integration_targets WHERE repository=?1",

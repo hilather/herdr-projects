@@ -250,6 +250,7 @@ impl SqliteStore {
         let (task, revision, candidate): (String, i64, String) = tx.query_row("SELECT task_id,contract_revision,candidate_oid FROM result_submissions WHERE submission_id=?1",
             [&spec.submission_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?
             .ok_or_else(|| invalid(format!("no result submission {}", spec.submission_id)))?;
+        super::seeded_defects::refuse_review_after_reveal(&tx, &spec.submission_id)?;
         let canonical_json = serde_json::json!({"budget_ms": budget, "candidate_oid": candidate, "contract_revision": revision, "created_unix_ms": now,
             "kind": spec.kind, "prior_findings": prior, "protocol": spec.protocol, "role": spec.role, "schema": OPPORTUNITY_SCHEMA,
             "scope": spec.scope, "submission_id": spec.submission_id, "task_id": task}).to_string();
@@ -325,7 +326,8 @@ impl SqliteStore {
         principal_ok(principal)?;
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         schema_54(&tx)?;
-        let (_, _, author) = opportunity_binding(&tx, opportunity)?;
+        let (submission, _, author) = opportunity_binding(&tx, opportunity)?;
+        super::seeded_defects::refuse_review_after_reveal(&tx, &submission)?;
         let assigned: Option<String> = tx.query_row("SELECT reviewer_configuration_id FROM review_assignments WHERE opportunity_id=?1", [opportunity], |r| r.get(0)).optional()?;
         let Some(assigned) = assigned else { return Err(invalid(format!("review opportunity {opportunity} is not assigned"))) };
         if !tx.query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE id=?1)", [attempt], |r| r.get::<_, bool>(0))? { return Err(invalid(format!("no attempt {attempt}"))); }

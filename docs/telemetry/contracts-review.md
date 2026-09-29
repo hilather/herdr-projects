@@ -1,13 +1,14 @@
 # Review capture contracts (lane D)
 
 Owned by lane D ([phase2-lanes.md](phase2-lanes.md)); common rules are
-[contracts.md](contracts.md) §0 and §7. Plan doc 06 §2–§6 (TM3.1–TM3.4),
-doc 07 §5 (M20–M29), doc 10 §5. Canonical migrations
+[contracts.md](contracts.md) §0 and §7. Plan doc 06 §2–§6a (TM3.1–TM3.4,
+TM3.6), doc 07 §5/§5b (M20–M29, M43, M44), doc 10 §5. Canonical migrations
 `0054_review_capture.sql` (schema 54), `0055_finding_triage.sql` (schema 55,
 §5), `0056_fix_attribution.sql` (schema 56, §6) and
-`0057_review_protocols.sql` (schema 57, §7); store API
-`src/store/review_capture.rs`, `src/store/finding_triage.rs`,
-`src/store/fix_attribution.rs` and `src/store/review_protocols.rs`; CLI
+`0057_review_protocols.sql` (schema 57, §7) and `0058_seeded_defects.sql`
+(schema 58, §8); store API `src/store/review_capture.rs`,
+`src/store/finding_triage.rs`, `src/store/fix_attribution.rs`,
+`src/store/review_protocols.rs` and `src/store/seeded_defects.rs`; CLI
 `telemetry <slug> review ...` (`src/telemetry/review/`). Sidecar stream
 `review` has no tables yet. Nothing about reviews comes from the Codex
 adapter (contracts-collection.md A3).
@@ -600,3 +601,118 @@ brief builder, §3); blinding adjudicators to arm; task-clustered intervals,
 sample-size planning and propensity weighting (TM4.4); retraction of a pass
 or an exclusion; experiment stopping enforcement (the stopping rule is
 recorded, not enforced).
+
+## 8. Seeded defects, recall and the integration guard (TM3.6, card D6)
+
+Canonical migration `0058_seeded_defects.sql` (schema 58); store API
+`src/store/seeded_defects.rs` (`seed_state`); CLI `telemetry <slug> review
+seeds show|register|detect|retract|reveal|dispose|report`
+(`src/telemetry/review/seeds.rs`).
+
+**Authority.** Only the evaluation authority writes: `operator:cli`, the
+project owner, recorded as `evaluation_owner.v1` on every `seed_log` row
+(CHECKs). `SqliteStore` refuses a worker (`worker:*` or any attempt's
+identity, so never a reviewer or the implementing worker), an import
+(`import:*`) and any other principal, writing nothing.
+
+**One ordering.** `seed_log(seq, kind, principal, authority, expected_seq,
+recorded_unix_ms)` shares the sequence of `finding_log`, `fix_log` and
+`protocol_log`: every new row of any ledger takes the common head + 1
+(`finding_triage::head` over all four), and triggers refuse a row that does
+not follow the others' head. `--expect-seq` and `--as-of` refer to that one
+head. Every table is append-only (every UPDATE/DELETE aborts), and each
+detail row needs its own `seed_log` row of the matching kind.
+
+**Records.**
+
+- **Evaluation candidate** `seeded_candidates(seq, submission_id UNIQUE,
+  candidate_oid, arm, reveal_policy)`, `register <submission> (--seed
+  CLASS=sha256:<hex64> ... | --control)`: the submission's exact candidate
+  (trigger) as `seeded` or `clean_control`, policy `reveal_after_close.v1`.
+  Registration is refused once any review opportunity exists on the
+  submission (the arm is fixed before review) or once any integration job
+  or operation names it (store and triggers).
+- **Seed** `seeded_defects(seed_id, seq, ordinal, seed_class,
+  reproducer_ref)`, 1–16 per seeded candidate, written with its
+  registration. Class ∈ `logic`, `boundary`, `concurrency`, `security`,
+  `test_weakening`, `requirement_omission` (plan doc 06 §6a). The minimal
+  reproducer is only a `sha256:<hex64>` reference to content held
+  elsewhere; a seed's source, patch or reproducer text is never stored or
+  shown.
+- **Detection** `seed_detections(seq, seed_id, claim_id, evidence_refs)`,
+  `detect <seed> --claim C --evidence ...`: the owner's accepted link of one
+  finding claim to one seed. The claim must be in a current claim set, its
+  current triage decision must be `validated` or `duplicate` (§5), and it
+  must come from a review of the seed's own candidate (store and trigger).
+  A claim links at most one seed at a time. `retract <seq>` reverses a
+  detection recorded in error.
+- **Reveal** `seed_reveals(seq, submission_id UNIQUE)`: only when the
+  candidate has at least one opportunity and every opportunity has
+  sessions, each with a completion (store and trigger). After a reveal no
+  opportunity or session on the candidate can be recorded (store and
+  triggers).
+- **Disposal** `seed_disposals(seq, submission_id UNIQUE, disposition)`:
+  `discarded` or `repaired` (a repair is another submission), only after a
+  reveal. Either way the seeded submission never integrates.
+
+**Integration guard.** A submission registered with arm `seeded` never
+reaches an integration target: the automatic producer's eligibility
+(`integration_jobs.rs` `ELIGIBLE` plus `NOT_SEEDED`) drops it from the
+pending projection, `begin_integration` refuses it before any write (`a
+seeded candidate never integrates`), and triggers refuse any
+`integration.run` or `integration.lease` operation and any
+`integration_operations` row for it, so raw SQL cannot either. The guard
+only removes eligibility; nothing else about integration changes. Clean
+controls are not guarded (plan doc 06 §6a guards seeded candidates only).
+
+**Blindness.** Reviewers never see seed state: `review present` reads no
+registry table and refuses to print any field outside its twelve blind
+fields; `review show` and blind assignment carry no seed state either.
+Only the owner's `seeds show`/`seeds report` read the registry.
+
+**Derived state** (`seeds show [--as-of SEQ]`), replayed with §5 triage to
+one watermark: candidates with seeds, detections (`active` = unretracted
+and the claim still `validated`/`duplicate` at the watermark), reveal and
+disposal; the review opportunities of registered candidates (assigned
+reviewer configuration, `completed` = some session completed, submission
+outcomes); and the M43 trials: one per seed per completed opportunity of
+its candidate, `detected` (an active detection by a claim of that
+opportunity), `pending` (not detected while a submission of the
+opportunity is pending), else `missed`. Review completions are not in the
+ledger, so `--as-of` replays triage and detections only.
+
+**Metrics** (`seeds report [--since MS] [--min-trials N] [--as-of SEQ]`;
+`review report` and `telemetry <slug> report` at the default `N` = 20, plan
+doc 07 §6; `basis: owner_triage`, `trust: evaluation_owner.v1`, `scope:
+seeded_work_only`; store before 0058: `unavailable:
+seeded_defects_absent`). Windowed by the opportunity's assignment. Every
+cell shows its counts and `pending` (outside the denominator); a zero
+denominator is `null` with `empty_denominator`; fewer than `N` is
+`unavailable: insufficient_data`; else `value` `"n/d"` and `percent` (two
+decimals, half up).
+
+- **M43** `M43.v1` seeded recall: `detected` / `trials`, overall,
+  `by_configuration` (the assigned reviewer configuration, each with
+  `by_seed_class`), `by_seed_class`, `by_kind_protocol`, and
+  `not_completed` opportunities on seeded candidates (no trial, never 0).
+  It says nothing about recall on unseeded, production defects.
+- **M44** `M44.v1` clean-control false-alarm rate: completed clean-control
+  opportunities with at least one `rejected_only` submission (§5) /
+  completed clean-control opportunities; `pending` when none is
+  rejected-only and one is pending. A validated incidental finding on a
+  control is not a false alarm.
+
+Incidental findings on seeded candidates follow the ordinary §5/§6 path:
+they are triaged, counted in M20–M29 and repaired like any finding;
+detection adds no triage row.
+
+**Starter seed set** (tests only): `tests/fixtures/telemetry/seeds/
+starter-seed-set.json`, one synthetic seed per class over a tiny clean
+source. Tests inject seeds only into disposable repositories they create;
+no tool here modifies a real project repository.
+
+Not built: excluding seed-linked findings from M21/M22 discovery and
+validation rates; guarding a seeded verified result from satisfying a
+dependent task's `verified_result` requirement (integration is guarded,
+dependency satisfaction is not); injection tooling for replay-suite tasks
+(TM4.6); a reviewer brief builder (§3).

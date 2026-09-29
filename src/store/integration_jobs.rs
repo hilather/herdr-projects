@@ -24,6 +24,8 @@ const ELIGIBLE: &str = "SELECT s.submission_id,s.project_store,s.task_id,t.revis
        AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.kind='integration.run' AND json_extract(o.payload,'$.submission_id')=s.submission_id
            AND NOT EXISTS(SELECT 1 FROM events e WHERE e.entity=o.id AND e.kind='integration.job_retired'))
        AND NOT EXISTS(SELECT 1 FROM verified_results r JOIN integration_operations i ON i.verified_result_id=r.result_id WHERE r.submission_id=s.submission_id)";
+/// Never a seeded candidate (contracts-review.md §8); appended once the registry exists.
+const NOT_SEEDED: &str = " AND NOT EXISTS(SELECT 1 FROM seeded_candidates x WHERE x.submission_id=s.submission_id AND x.arm='seeded')";
 const UNFINISHED: &str = "('effect_pending','candidate_prepared','validating','reconciliation_required')";
 
 #[derive(Debug, Default, Serialize)]
@@ -69,11 +71,12 @@ impl SqliteStore {
             ids
         };
         let more = stale || ids.len() > SCAN_LIMIT;
+        let eligible = if super::seeded_defects::registry_present(&tx)? { format!("{ELIGIBLE}{NOT_SEEDED}") } else { ELIGIBLE.to_owned() };
         let mut enqueued = 0;
         for submission_id in ids.iter().take(SCAN_LIMIT) {
             if enqueued == TURN_LIMIT { break; }
             budget.check()?;
-            let candidate = tx.query_row(ELIGIBLE, [submission_id], |row| Ok(Candidate { submission_id: row.get(0)?, project_store: row.get(1)?, task_id: row.get(2)?, task_revision: row.get(3)?,
+            let candidate = tx.query_row(&eligible, [submission_id], |row| Ok(Candidate { submission_id: row.get(0)?, project_store: row.get(1)?, task_id: row.get(2)?, task_revision: row.get(3)?,
                 repository: row.get(4)?, reference: row.get(5)?, result_id: row.get(6)? })).optional()?;
             let Some(candidate) = candidate else {
                 tx.execute("DELETE FROM pending_integration_work WHERE submission_id=?1", [submission_id])?;
