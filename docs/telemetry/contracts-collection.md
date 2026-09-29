@@ -687,7 +687,7 @@ object, a `passthrough`, `exit_code` or `duration` string) and
 | Capabilities match emitted fields, each new one valued somewhere in the corpus | `capabilities_match_emitted_fields` |
 | Replay of the whole corpus (with `tools`) into a fresh sidecar is identical | `corpus_replays_identically_in_any_chunking` |
 
-### Contracts.md §5/§7 revision (applied by the steward on merge)
+### Contracts.md §5/§7 revision (applied by the steward)
 
 `contracts.md` is a steward file. The exact diff:
 

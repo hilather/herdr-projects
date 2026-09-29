@@ -174,7 +174,7 @@ merges one PR at a time.
   `resets_at` from different homes as one account-window, or report
   `account_basis: execution_home` explicitly. `resets_at` was fixed within a
   window (no jitter observed).
-- **B5 tool metadata** (steward §7 review first): 0.154.0 has no
+- **Unblocked (A6 collects it; B5 next):** **B5 tool metadata** (steward §7 review first): 0.154.0 has no
   `exec_command_end`/`mcp_tool_call_end`. Tool metadata lives in
   `response_item` `custom_tool_call`/`function_call` (+ `*_output` by
   `call_id`) and `event_msg/item_completed` `CommandExecution` (id, status,

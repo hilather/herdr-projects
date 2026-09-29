@@ -285,8 +285,10 @@ S3 refinements:
 `<execution_home>/.codex/sessions/**/rollout-*.jsonl` for each Codex profile's
 `execution_home`. The collector reads only `session_meta`, `turn_context`,
 `token_usage_record`, `event_msg` of type `token_count`, `task_started`,
-`task_complete`. All other record types are skipped by type tag without
-retaining any field. Read only complete lines (ending `\n`); a partial last
+`task_complete`, `item_completed`, and `response_item` of type
+`custom_tool_call`, `function_call`, `custom_tool_call_output`,
+`function_call_output` (A6: tool metadata only, through a typed allowlist).
+All other record types are skipped by type tag without retaining any field. Read only complete lines (ending `\n`); a partial last
 line is left for the next pass and the file offset is not advanced past it.
 
 **Allowlisted fields.** `session_meta`: `id`, `timestamp`, `cwd`,
@@ -305,8 +307,19 @@ output_tokens, reasoning_output_tokens, total_tokens}`, final
 `rate_limits.{limit_id, primary.{used_percent, window_minutes, resets_at},
 secondary.{used_percent, window_minutes, resets_at}, rate_limit_reached_type,
 plan_type}` (secondary and reached type: A4) and `info.total_token_usage` (discrepancy only). `task_complete`:
-`turn_id`, `duration_ms`, `time_to_first_token_ms`. Never:
-`last_agent_message`, instructions, messages, tool calls/outputs, reasoning.
+`turn_id`, `duration_ms`, `time_to_first_token_ms`. Tool calls
+(`custom_tool_call`, `function_call`): `call_id`, `name`, `status`,
+`internal_chat_message_metadata_passthrough.turn_id` and the line
+`timestamp`; their outputs (`*_call_output`): `call_id` and the line
+`timestamp`; `item_completed`: `thread_id`, `turn_id`, `item.type`, and for
+a `CommandExecution` item `item.{id, status, source, exit_code,
+duration.{secs, nanos}}` (the exec startup, not the command's run time) and
+the line `timestamp` (A6, sidecar stream `ingest` 0006 `codex_tool_calls`,
+`codex_exec_items`, `codex_tool_sources`; lenient like A4). Never:
+`last_agent_message`, instructions, messages, reasoning, tool `input`,
+`arguments` and `output`, and an item's `command`, `cwd`, `parsed_cmd`,
+`stdout`, `stderr`, `aggregated_output`, `formatted_output`, `process_id`,
+`content`, `client_id` or `phase`.
 A4 metadata (sidecar stream `ingest` 0004: `rollout_metadata`,
 `codex_usage_times`, `codex_rate_limit_windows`) is read leniently: a value of
 another type is stored as `NULL` and never makes its record malformed. It is
@@ -485,7 +498,8 @@ S6 refinements:
 ## 7. Privacy allowlist and excerpts
 
 Default: metadata only (IDs, digests, enums, counters, timestamps, durations,
-provider and parent-session identifiers).
+provider and parent-session identifiers, tool call ids, tool names, call and
+exec statuses, exit codes and exec startup durations).
 Allowed free text is limited to **excerpts** of: verification/integration
 `reason` (≤128 already), operator dispatch `note`, finding titles when that
 producer exists. Excerpt rule, applied before any write or display:
@@ -501,7 +515,11 @@ producer exists. Excerpt rule, applied before any write or display:
 5. Truncate to 160 Unicode scalar values (append `…` within the limit).
 
 Never collected: prompts, briefs, transcripts, agent messages, tool
-arguments/output, diffs, file contents, reasoning text, environment values.
+input/arguments/output, commands and their working directories, parsed
+commands and output (stdout, stderr, aggregated or formatted), diffs, file
+contents, reasoning text, environment values. Tool metadata is read from
+`response_item` and `item_completed` only through a typed allowlist that
+never deserializes these fields.
 Paths in the sidecar are stored as digests except `cwd`, which is stored with
 rule 2 applied. Project opt-in for richer content is not built; until it is,
 no code path may read it.
@@ -521,6 +539,7 @@ Landed since phase 1 (see the lane contracts): collector bindings
 estimates (contracts-accounting.md §2–§4), proxy signals and integration
 outcomes, candidate groups and selection (contracts-quality.md §1–§4),
 attention intervals (contracts-accounting.md §6), Codex session metadata
-(contracts-collection.md A4), review opportunities, sessions and completions,
+(contracts-collection.md A4), Codex tool/exec metadata (contracts-collection.md
+A6), review opportunities, sessions and completions,
 finding triage, claims and duplicate merge/unmerge history
 (contracts-review.md).
