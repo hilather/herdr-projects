@@ -59,7 +59,8 @@ The lane provides M08 and M09 (contracts §6, `definition` still
 counted entries (delta, an `accepted` disposition) of certified sessions, with
 the §6 `coverage`. They are derived from the Codex tables at report time, so
 they need no prior sync. It also provides M38 and M39, both `unavailable`
-(§5).
+(§5), M31–M33 (§6) and M16–M18 (§9, derived from A6 tool metadata at read
+time).
 
 ## 3. Session graph and model segments (B2, TM2.2)
 
@@ -573,3 +574,101 @@ role lookup). `session_nodes` is left as it was (no longer written or read;
 nothing is dropped). Re-runnable (`IF NOT EXISTS`, no `ALTER`). Migrating to
 7 clears `usage_ledger`, so everything reads `ledger_not_synced` until the
 next sync.
+
+## 9. Tool calls and executions (B5, TM2.5; M16–M18)
+
+Plan: doc 07 M16–M18, doc 05/12 TM2.5. Consumes lane A's A6 metadata
+(contracts-collection.md A6; ingest 0006 `codex_tool_calls`,
+`codex_exec_items`, `codex_tool_sources`), read by SQL only and **derived at
+read time**: no stream migration, nothing stored, no sync needed. Only
+identifiers, tags, exit codes and line times are read; the tables hold no
+content. Codex 0.154.0 writes no approval request or decision and no
+execution run time (codex-live-0.154.0-a4.md §3–§4), so the design reports
+what those fields honestly give and names the rest `unavailable`.
+
+**Scope and coverage.** A session (the rollout's own `session_meta.id`) is
+in scope when one of its rollouts is `bound` (attempt ids listed); sessions
+without one are counted in `coverage.excluded` by binding (`unbound`, …),
+and a session with a bound rollout of an uncertified `cli_version` as
+`cli_version_uncertified`. The report hook's `--since` keeps sessions whose
+earliest `session_unix_ms` is in the window. Per session, tool metadata is
+`unavailable: predates_collection` when the sidecar has no A6 tables (a
+read-only pre-A6 sidecar; nothing is migrated) and `unavailable:
+pending_reread` while any rollout of the session has no `codex_tool_sources`
+row. If any in-scope session is either, M16–M18 are all `unavailable` with
+that reason (`predates_collection` first) and the `coverage`, never a
+partial count and never 0. No in-scope session: `unavailable
+no_bound_session`; no sidecar: `collection_not_run`. `coverage {sessions,
+observed, pending_reread, predates_collection, excluded}`.
+
+**M16 `tool_call_volume`** (`M16.tools-v1`), stages reported separately,
+`value {issued, accepted, executed}`:
+- `issued`: distinct `(session_id, call_id)` rows with a recorded call
+  (`call_kind` not `NULL`). A call replayed by a resumed rollout or a retried
+  record is the same key, so it is one logical call. `issued` also gives
+  `by_name`/`name_unreported`, `by_status`/`status_unreported`
+  (`function_call.status` certified `fixture` only), `without_output` (no
+  output yet: open or lost) and `outputs_without_call` (an output whose call
+  was not seen, not counted as issued).
+- `accepted`: `unavailable approval_decision_not_exposed`. There is no typed
+  decision; auto-approved and human-approved calls look the same.
+- `executed`: one `CommandExecution` item per execution instance (a repeated
+  execution is another instance), `scope: command_execution` (other tools,
+  e.g. `wait`, write no item), `by_source`. Attribution to a call is
+  `inferred` (no shared key): the latest recorded call of the same session
+  and turn at or before the item's `completed_unix_ms` whose output, if any,
+  is not before it; `by_call_name` and `unattributed`.
+- `certified {calls: live, call_status, exec_items: live, mcp_calls:
+  not_collected}`.
+
+**M17 `tool_execution_success`** (`M17.tools-v1`): succeeded / (succeeded +
+failed) of exec items, unreduced `"n/d"` (`null` `empty_denominator` when
+none is terminal). Status `completed` (the only status certified live) with
+`exit_code` 0 succeeded, non-zero failed. Unknown, excluded and counted in
+`unknown.by_reason`: `exit_code_unknown` (`NULL`, never a success),
+`status_unreported`, `status_not_certified` (any other status, e.g.
+`failed`: its meaning, including cancel or timeout, is not certified).
+`cancelled` and `timed_out` are `unavailable` (`cancellation_not_exposed`,
+`timeout_not_exposed`). An exec item is written only on completion, so a
+pending execution is not observable: `pending_calls` counts calls without
+an output.
+
+**M18 `tool_latency_p95`** (`M18.tools-v1`): `value` `unavailable
+execution_duration_not_exposed`. The exec item's `duration` and start/end
+times are the unified exec startup (`startup_not_run_time`) and are never
+read as run time. `queue_time` `unavailable approval_decision_not_exposed`,
+`timed_out` `unavailable timeout_not_exposed`, `pending_calls`. Shown apart,
+**never as M18's value**: `call_to_output_ms`, the distribution of
+`output_unix_ms − called_unix_ms` over calls with both times (`samples`,
+nearest-rank `p50_ms`, `p95_ms`, `max_ms`; `null` without samples), overall,
+`by_name` and `name_unreported`, with `negative_intervals` (excluded),
+`caveat: includes_approval_wait` (live: 36.9 s call → output against a
+37.8 s Herdr `blocked` wait).
+
+**`accounting tools [--json]`** (read-only; `collection_not_run` without a
+sidecar): per in-scope session `{session_id, attempt_ids, tools}` with
+`tools` `{issued, without_output, outputs_without_call, executed,
+attributed, unattributed, succeeded, failed, unknown}` or `unavailable`;
+`coverage`; `metrics` M16–M18, identical to the report's (lane keys, §2).
+Text: a coverage line, one line per session and per metric, and the
+`call_to_output_ms` p95 line labelled as including approval waits.
+
+Not derived (follow-ups): the accepted stage inferred from a call overlapping
+a B6b `blocked` wait (human-routed only) or a same-turn guardian session
+(auto-review); per-host (execution home) breakdown; controller intervals
+(TM2.5: Codex writes no typed tool or approval interval, and Herdr samples
+only agent state); MCP calls (shape unobserved, not collected); M18 once a
+Codex version records an execution end − start.
+
+Test `tool_volume_success_and_latency_are_honest`: one bound session in two
+rollouts (the second resumes the first and adds turn 2) and one unbound
+session. 5 issued (`exec` 4, `wait` 1; status unreported 1), 1 without
+output, 1 output without a call; 6 executions, 5 inferred to `exec` calls,
+1 unattributed; exit 0 ×3, exit 2, `NULL` exit, status `failed` → M17
+`3/4`, unknown 2; M18 unavailable, `call_to_output_ms` 37010, 1000, 2500,
+300 → p50 1000, p95 37010 (`exec` 3 samples, `wait` 2500); the report
+equals `accounting tools`; before any collect everything is
+`collection_not_run`. Test `tool_metrics_before_a6_or_reread_are_unavailable`:
+the A6 tables dropped (ingest 5) read as `predates_collection` without
+migrating; the next collect restores the output byte for byte; the resumed
+rollout gone before its re-read makes the session `pending_reread`.

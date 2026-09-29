@@ -921,3 +921,140 @@ fn attention_intervals_union_and_censor() {
     assert!(text.lines().any(|l| l == "attempt a3 ended n/a (not_observed)"), "{text}");
     assert!(text.lines().any(|l| l == "signal herdr-agent-list-v1 agent_status=blocked (certified: live for codex; fixture for other agent kinds; human_routed_waits)"), "{text}");
 }
+
+/// Session ids written literally in the tool rollouts.
+const TOOLS_SID: &str = "00000000-0000-4000-8000-0000000b5001";
+
+/// The sidecar as a pre-A6 binary left it: no A6 tables, ingest stream 5.
+fn drop_a6_tables(f: &Fixture) {
+    f.sidecar().execute_batch("DROP TABLE codex_tool_sources; DROP TABLE codex_tool_calls; DROP TABLE codex_exec_items;
+        UPDATE telemetry_streams SET version=5 WHERE stream='ingest';").unwrap();
+}
+
+/// TM2.5 / doc 07 M16–M18 over A6 tool metadata (contracts-accounting.md §9).
+/// One bound session, observed by two rollouts (the second resumes the first
+/// and adds turn 2), plus an unbound session. Five logical calls (4 `exec`, 1
+/// `wait`) whatever the replay; an output whose call was not seen (call-9) is
+/// counted apart; call-5 has no output. Six exec items are six execution
+/// instances: five are inferred to a call by turn and time, one (turn 3) is
+/// unattributed. Outcomes: exit 0 ×3 succeeded, exit 2 failed, a NULL exit
+/// code and a `failed` status (not certified) are unknown → M17 3/4. M18 has
+/// no honest execution end − start; the call → output times 37010 (approval
+/// wait), 1000, 2500 and 300 ms are shown apart: nearest-rank p50 1000, p95
+/// 37010. The accepted stage is not exposed.
+#[test]
+fn tool_volume_success_and_latency_are_honest() {
+    let f = Fixture::new();
+    let unavailable = |reason: &str| json!({"status": "unavailable", "reason": reason});
+    // Before any collect: no sidecar, so nothing is 0.
+    assert_eq!(f.cli_args(&["accounting", "tools", "--json"]).0, unavailable("collection_not_run"));
+    let report = f.report();
+    for id in ["M16", "M17", "M18"] {
+        assert_eq!((&report["metrics"][id]["value"], &report["metrics"][id]["definition"]), (&unavailable("collection_not_run"), &json!(format!("{id}.tools-v1"))));
+    }
+
+    let at = f.decided + 1_000;
+    let part = |name: &str| format!("{ACCOUNTING}/{name}");
+    f.rollout(&f.home, "a", &[&part("tools.jsonl")], &f.worktree(), at, "0.154.0");
+    f.rollout(&f.home, "b", &[&part("tools.jsonl"), &part("tools-resume.jsonl")], &f.worktree(), at, "0.154.0");
+    f.rollout(&f.home, "u", &[&part("tools-unbound.jsonl")], &format!("{}/repo", f.project.display()), at, "0.154.0");
+    f.cli("collect");
+
+    let (tools, first) = f.cli_args(&["accounting", "tools", "--json"]);
+    let coverage = json!({"sessions": 1, "observed": 1, "pending_reread": 0, "predates_collection": 0, "excluded": {"unbound": 1}});
+    assert_eq!(tools["coverage"], coverage);
+    assert_eq!(tools["sessions"], json!([{"session_id": TOOLS_SID, "attempt_ids": [f.attempt], "tools": {"issued": 5, "without_output": 1,
+        "outputs_without_call": 1, "executed": 6, "attributed": 5, "unattributed": 1, "succeeded": 3, "failed": 1, "unknown": 2}}]));
+
+    let m16 = &tools["metrics"]["M16"];
+    assert_eq!((&m16["definition"], &m16["name"]), (&json!("M16.tools-v1"), &json!("tool_call_volume")));
+    assert_eq!(m16["value"], json!({"issued": 5, "accepted": unavailable("approval_decision_not_exposed"), "executed": 6}));
+    let issued = &m16["issued"];
+    assert_eq!((&issued["calls"], &issued["by_name"], &issued["name_unreported"], &issued["by_status"], &issued["status_unreported"],
+        &issued["without_output"], &issued["outputs_without_call"]),
+        (&json!(5), &json!({"exec": 4, "wait": 1}), &json!(0), &json!({"completed": 4}), &json!(1), &json!(1), &json!(1)));
+    let executed = &m16["executed"];
+    assert_eq!((&executed["executions"], &executed["scope"], &executed["by_source"], &executed["source_unreported"]),
+        (&json!(6), &json!("command_execution"), &json!({"unified_exec_startup": 6}), &json!(0)));
+    let attribution = &executed["attribution"];
+    assert_eq!((&attribution["basis"], &attribution["by_call_name"], &attribution["name_unreported"], &attribution["unattributed"]),
+        (&json!("inferred"), &json!({"exec": 5}), &json!(0), &json!(1)));
+    assert_eq!((&m16["certified"]["mcp_calls"], &m16["coverage"]), (&json!("not_collected"), &coverage));
+
+    let m17 = &tools["metrics"]["M17"];
+    assert_eq!((&m17["value"], &m17["numerator"], &m17["denominator"], &m17["succeeded"], &m17["failed"]),
+        (&json!("3/4"), &json!(3), &json!(4), &json!(3), &json!(1)));
+    assert_eq!(m17["unknown"], json!({"executions": 2, "by_reason": {"exit_code_unknown": 1, "status_not_certified": 1}}));
+    assert_eq!((&m17["pending_calls"], &m17["cancelled"], &m17["timed_out"]),
+        (&json!(1), &unavailable("cancellation_not_exposed"), &unavailable("timeout_not_exposed")));
+
+    let m18 = &tools["metrics"]["M18"];
+    assert_eq!((&m18["value"], &m18["queue_time"], &m18["timed_out"], &m18["pending_calls"]),
+        (&unavailable("execution_duration_not_exposed"), &unavailable("approval_decision_not_exposed"), &unavailable("timeout_not_exposed"), &json!(1)));
+    let wall = &m18["call_to_output_ms"];
+    assert_eq!((&wall["samples"], &wall["p50_ms"], &wall["p95_ms"], &wall["max_ms"], &wall["negative_intervals"], &wall["method"], &wall["caveat"]),
+        (&json!(4), &json!(1000), &json!(37010), &json!(37010), &json!(0), &json!("nearest_rank"), &json!("includes_approval_wait")));
+    assert_eq!(wall["by_name"], json!({"exec": {"samples": 3, "p50_ms": 1000, "p95_ms": 37010, "max_ms": 37010},
+        "wait": {"samples": 1, "p50_ms": 2500, "p95_ms": 2500, "max_ms": 2500}}));
+    assert_eq!(wall["name_unreported"], json!({"samples": 0, "p50_ms": null, "p95_ms": null, "max_ms": null}));
+
+    // The report takes the lane's M16–M18.
+    let report = f.report();
+    for id in ["M16", "M17", "M18"] { assert_eq!(report["metrics"][id], tools["metrics"][id], "{id}"); }
+    let text = f.text(&["accounting", "tools"]);
+    for line in ["coverage 1 sessions: 1 observed, 0 pending_reread, 0 predates_collection; excluded unbound 1".to_owned(),
+        format!("session {TOOLS_SID} attempts={}: issued 5 (1 without output, 1 outputs without call), executed 6 (5 inferred to a call, 1 unattributed), succeeded 3 failed 1 unknown 2", f.attempt),
+        "M16 tool_call_volume issued 5, accepted n/a (approval_decision_not_exposed), executed 6".to_owned(),
+        "M17 tool_execution_success 3/4 (unknown 2 excluded, pending calls 1)".to_owned(),
+        "M18 tool_latency_p95 n/a (execution_duration_not_exposed)".to_owned(),
+        "call_to_output_ms p95 37010 of 4 calls (includes approval wait; not execution time)".to_owned()] {
+        assert!(text.lines().any(|l| l == line), "{line} in {text}");
+    }
+
+    // Read-only and replayable: a second collect changes nothing.
+    f.cli("collect");
+    assert_eq!(f.cli_args(&["accounting", "tools", "--json"]).1, first);
+}
+
+/// A sidecar without the A6 tables (read-only, before the collect that
+/// migrates it) and a session whose rollout waits for its re-read give
+/// M16–M18 `unavailable` with the reason, never 0 calls.
+#[test]
+fn tool_metrics_before_a6_or_reread_are_unavailable() {
+    let f = Fixture::new();
+    let unavailable = |reason: &str| json!({"status": "unavailable", "reason": reason});
+    let at = f.decided + 1_000;
+    let part = |name: &str| format!("{ACCOUNTING}/{name}");
+    f.rollout(&f.home, "a", &[&part("tools.jsonl")], &f.worktree(), at, "0.154.0");
+    let resumed = f.rollout(&f.home, "b", &[&part("tools.jsonl"), &part("tools-resume.jsonl")], &f.worktree(), at, "0.154.0");
+    f.cli("collect");
+    let (_, fresh) = f.cli_args(&["accounting", "tools", "--json"]);
+
+    drop_a6_tables(&f);
+    let (tools, _) = f.cli_args(&["accounting", "tools", "--json"]);
+    let coverage = json!({"sessions": 1, "observed": 0, "pending_reread": 0, "predates_collection": 1, "excluded": {}});
+    assert_eq!(tools["coverage"], coverage);
+    assert_eq!(tools["sessions"], json!([{"session_id": TOOLS_SID, "attempt_ids": [f.attempt], "tools": unavailable("predates_collection")}]));
+    let report = f.report();
+    for id in ["M16", "M17", "M18"] {
+        let expected = json!({"definition": format!("{id}.tools-v1"), "name": tools["metrics"][id]["name"], "value": unavailable("predates_collection"), "coverage": coverage});
+        assert_eq!((&tools["metrics"][id], &report["metrics"][id]), (&expected, &expected), "{id}");
+    }
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 5}), "a read does not migrate");
+    // The next collect migrates and reads both rollouts again: identical to a fresh collect.
+    f.cli("collect");
+    assert_eq!(f.cli_args(&["accounting", "tools", "--json"]).1, fresh);
+
+    // The resumed rollout is gone before its re-read: the session is pending, not partial.
+    drop_a6_tables(&f);
+    fs::remove_file(&resumed).unwrap();
+    f.cli("collect");
+    let (tools, _) = f.cli_args(&["accounting", "tools", "--json"]);
+    let coverage = json!({"sessions": 1, "observed": 0, "pending_reread": 1, "predates_collection": 0, "excluded": {}});
+    assert_eq!(tools["coverage"], coverage);
+    assert_eq!(tools["sessions"][0]["tools"], unavailable("pending_reread"));
+    for id in ["M16", "M17", "M18"] { assert_eq!((&tools["metrics"][id]["value"], &tools["metrics"][id]["coverage"]), (&unavailable("pending_reread"), &coverage)); }
+    let text = f.text(&["accounting", "tools"]);
+    assert!(text.lines().any(|l| l == "M16 tool_call_volume n/a (pending_reread)"), "{text}");
+    assert!(text.lines().any(|l| l == "M17 tool_execution_success n/a (pending_reread)"), "{text}");
+}

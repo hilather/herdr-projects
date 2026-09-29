@@ -12,6 +12,7 @@ pub mod cost;
 pub mod graph;
 pub mod ledger;
 pub mod quota;
+pub mod tools;
 
 pub const STREAM: &str = "accounting";
 /// `include_str!` of `migrations/telemetry/accounting/`, in order; index + 1 is the stream version.
@@ -64,6 +65,13 @@ pub enum Command {
     /// Human attention per launched attempt: waiting intervals (unioned, censored
     /// when unobserved), observation gaps, and M31–M33. Read-only.
     Attention {
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Tool calls and command executions per bound session (A6 metadata only),
+    /// with coverage and M16–M18. Derived at read time; read-only.
+    Tools {
         /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
@@ -130,6 +138,14 @@ pub fn run(project: &Path, command: Command) -> Result<String> {
             if !json { return Ok(attention::text(&value)); }
             value
         }
+        Command::Tools { json } => {
+            let value = match super::sidecar::read(project)? {
+                Some(db) => tools::read(&db)?,
+                None => unavailable("collection_not_run"),
+            };
+            if !json { return Ok(tools::text(&value)); }
+            value
+        }
     };
     Ok(serde_json::to_string_pretty(&value)? + "\n")
 }
@@ -146,11 +162,12 @@ fn with_availability(mut metrics: BTreeMap<String, Value>) -> BTreeMap<String, V
     metrics
 }
 
-/// M08/M09 (below), M38/M39 (§5) and M31–M33 (§6, replacing the central
-/// `attention_not_collected` entries).
+/// M08/M09 (below), M38/M39 (§5), M31–M33 (§6, replacing the central
+/// `attention_not_collected` entries) and M16–M18 (§9).
 pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> {
     let mut metrics = usage_metrics(project, since)?;
     metrics.extend(attention::metrics(project, since)?);
+    metrics.extend(tools::metrics(project, since)?);
     Ok(metrics)
 }
 
