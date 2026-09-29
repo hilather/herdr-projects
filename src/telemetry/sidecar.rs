@@ -180,6 +180,13 @@ pub(super) fn attempt_usage(db: &Connection, attempt: &str) -> Result<Value> {
         if let Some(detail) = bound.iter().filter(|s| !super::codex::certified(&s.1)).find_map(|s| s.3.clone()) { usage["detail"] = json!(detail); }
         return Ok(usage);
     }
+    // A record that failed validation keeps no counters: summing the rest
+    // would present an unknown total as known (contracts §0).
+    let rejected: bool = db.query_row(&format!("SELECT EXISTS(SELECT 1 FROM codex_usage WHERE accepted=0 AND session_id IN ({}))",
+        vec!["?"; bound.len()].join(",")), rusqlite::params_from_iter(bound.iter().map(|s| &s.0)), |r| r.get(0))?;
+    if rejected {
+        return Ok(unavailable("records_not_accepted"));
+    }
     let mut sums = [0i64; 6];
     let mut records = 0;
     for (session, ..) in &bound {

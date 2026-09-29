@@ -123,7 +123,8 @@ fn with_availability(mut metrics: BTreeMap<String, Value>) -> BTreeMap<String, V
 /// Contracts §6 M08/M09, replacing the central ones with the same numbers:
 /// counted ledger entries (derived from the Codex tables, so no sync is
 /// needed) of certified sessions, i.e. with a source bound to a known attempt,
-/// not quarantined, of a certified version, started in the window.
+/// not quarantined, of a certified version, with every record accepted,
+/// started in the window.
 pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> {
     let both = |m08: Value, m09: Value| with_availability(BTreeMap::from([("M08".to_owned(), metric("M08", "input_tokens", m08)),
         ("M09".to_owned(), metric("M09", "output_tokens", m09))]));
@@ -136,16 +137,18 @@ pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Va
         super::read_only(&state)?.prepare("SELECT id FROM attempts")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
     } else { BTreeSet::new() };
     // A source holding rows stored while its version was uncertified stays uncertified.
-    type Source = (String, String, Option<String>, String, bool, Option<i64>);
+    type Source = (String, String, Option<String>, String, bool, Option<i64>, bool);
     let sources: Vec<Source> = db.prepare("SELECT s.session_id,s.binding,s.attempt_id,
         CASE WHEN EXISTS(SELECT 1 FROM codex_usage u WHERE u.path_digest=s.path_digest AND u.reason='cli_version_uncertified') THEN '' ELSE s.cli_version END,
-        EXISTS(SELECT 1 FROM codex_quarantine q WHERE q.session_id=s.session_id),s.session_unix_ms FROM rollout_sources s ORDER BY s.path_digest")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?.collect::<rusqlite::Result<_>>()?;
+        EXISTS(SELECT 1 FROM codex_quarantine q WHERE q.session_id=s.session_id),s.session_unix_ms,
+        EXISTS(SELECT 1 FROM codex_usage u WHERE u.session_id=s.session_id AND u.reason='invariant_violation') FROM rollout_sources s ORDER BY s.path_digest")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?.collect::<rusqlite::Result<_>>()?;
     let (mut certified, mut excluded) = (BTreeSet::new(), BTreeMap::<&str, usize>::new());
-    for (session, binding, attempt, version, quarantined, at) in &sources {
+    for (session, binding, attempt, version, quarantined, at, rejected) in &sources {
         if since.is_some_and(|since| at.is_none_or(|at| at < since)) { continue; }
         let reason = if binding != "bound" { binding.as_str() } else if !attempt.as_ref().is_some_and(|a| known.contains(a)) { "orphan" }
             else if *quarantined { "quarantined" } else if !super::codex::certified(version) { "cli_version_uncertified" }
+            else if *rejected { "records_not_accepted" }
             else { certified.insert(session.as_str()); continue };
         *excluded.entry(reason).or_default() += 1;
     }

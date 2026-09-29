@@ -218,7 +218,7 @@ reads `unavailable: predates_lifecycle_log`.
 | `verification` | per acceptance policy of that submission, its latest `verification_runs` row: `rejected` (+ `reason` excerpt) if any policy's is, `accepted` only if every policy's is, else `pending`; `policies` lists each |
 | `integration` | route `verify_only` → `not_applicable`; else latest `integration_operations` state via `verified_results`; `integrated` needs an `integrated_commits` row |
 | `accepted` | `true` iff the task's acceptance rule (§6 `A`) is met by evidence produced from this attempt |
-| `usage` | §5 sums if a certified bound rollout exists, else `unavailable` with reason `adapter_absent` (non-Codex kind), `not_bound`, `cli_version_uncertified`, `quarantined`, `collection_not_run` |
+| `usage` | §5 sums if a certified bound rollout exists, else `unavailable` with reason `adapter_absent` (non-Codex kind), `not_bound`, `cli_version_uncertified`, `quarantined`, `records_not_accepted`, `collection_not_run` |
 | `attention` | always `unavailable`, reason `attention_not_collected` (S4 deferred) |
 
 S3 refinements:
@@ -360,8 +360,9 @@ S5 refinements:
   with `rate_limits`; `observed_ts` = the line's `timestamp`.
 - Attempt `usage`: `collection_not_run` without a sidecar, `adapter_absent`
   for non-Codex kinds, then `not_bound`, `quarantined`,
-  `cli_version_uncertified` (optional `detail: "rollout_unavailable"`), else
-  sums of accepted records plus `records`.
+  `cli_version_uncertified` (optional `detail: "rollout_unavailable"`),
+  `records_not_accepted` (any bound record failed validation), else sums of
+  accepted records plus `records`.
 - Certified: `0.154.0` (live run, [codex-live-0.154.0.md](codex-live-0.154.0.md)).
   Re-evaluation: every collect (CLI and ticker) re-reads from byte 0 each
   rollout whose `cli_version` is now certified and that holds rows stored
@@ -416,7 +417,8 @@ S6 refinements:
   `unavailable`. Ratios carry `numerator`, `denominator` and `value` as the
   unreduced string `"n/d"` (no floats). Sums (M08, M09) carry `value` and
   `coverage {certified_sessions, excluded}`, where `excluded` counts sources
-  by `unbound`, `ambiguous`, `orphan`, `quarantined`, `cli_version_uncertified`.
+  by `unbound`, `ambiguous`, `orphan`, `quarantined`, `cli_version_uncertified`,
+  `records_not_accepted`.
 - M02 `excluded {open, outside_window}`; M07 counts every attempt of tasks in
   `T` and flags `attempts_without_decision`.
 - Window (`--since`, absent = all): tasks with an attempt decided at or after

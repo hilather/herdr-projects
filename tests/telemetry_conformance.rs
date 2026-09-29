@@ -378,7 +378,6 @@ fn unknown_is_unavailable_never_zero() {
 /// unknown. Expected once fixed: `unavailable` with the M13 reason
 /// `records_not_accepted`, and the session excluded from M08 coverage.
 #[test]
-#[ignore = "contracts §0: needs the steward fix in src/telemetry/sidecar.rs and the M08 provider (contracts-collection.md A3)"]
 fn rejected_records_are_unavailable_not_zero() {
     let f = Fixture::new();
     let path = plant(&f, "complete");
