@@ -38,7 +38,10 @@ needs a new reviewed revision, not a silent reinterpretation.
   Codex times are kept as reported and never reorder canonical events.
 - **Stores.** Canonical: `<project>/.state/state.db`, migrations 0049–0058 (0052 collector bindings, contracts-collection.md; 0053 candidate groups, contracts-quality.md §3; 0054 review capture, contracts-review.md; 0055 finding triage and duplicate history, contracts-review.md §5; 0056 fix attribution, regressions and role credit, contracts-review.md §6; 0057 review protocols, passes and preregistered experiments, contracts-review.md §7; 0058 seeded defects, recall and the seeded-candidate integration guard, contracts-review.md §8).
   Sidecar: `<project>/.state/telemetry.db`, own sequence under
-  `migrations/telemetry/`, mode 0600, created on first collect. No
+  `migrations/telemetry/` (per-lane streams; see the lane contracts: e.g.
+  `ingest` 0006 tool/exec metadata, 0007 subagent detail, per-source ingest
+  state, envelope `measurement.certified` and `final_event_missing` gaps,
+  contracts-collection.md A6–A7), mode 0600, created on first collect. No
   cross-database transaction or foreign key; sidecar rows reference canonical
   IDs by value and record `orphan` when the canonical row is missing.
 - **Reads.** `attempts`, `usage`, `report`, the fleet pane, `doctor` and the
@@ -294,7 +297,9 @@ line is left for the next pass and the file offset is not advanced past it.
 **Allowlisted fields.** `session_meta`: `id`, `timestamp`, `cwd`,
 `cli_version`, `originator`, `source`, `model_provider`, `forked_from_id`,
 and from `source.subagent` its variant and, for `thread_spawn`,
-`parent_thread_id` and `depth` (A4); and the thread lineage
+`parent_thread_id` and `depth` (A4), and for the `other` variant its string
+tag as `subagent_detail` (A7, sidecar stream `ingest` 0007
+`rollout_subagents`; live: `guardian`); and the thread lineage
 `parent_thread_id`, `session_id` and `thread_source` of `session_meta`
 (A5, sidecar stream `ingest` 0005 `rollout_threads`). Usage is keyed by the
 rollout's own `session_meta.id`, never by a record's `session_id`, which a

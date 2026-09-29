@@ -900,7 +900,7 @@ a plain string).
 | Upgrade of an A6 sidecar: `predates_collection` read-only, then a re-read equal to a fresh collect, stream 7, no conflict; a gone rollout `pending_reread` | `rollouts_read_before_a7_gain_their_subagent_detail_and_turn_state_on_the_next_collect` |
 | Sentinels, capabilities matching emitted fields, replay in any chunking | `planted_sentinels_never_leak`, `capabilities_match_emitted_fields`, `corpus_replays_identically_in_any_chunking` |
 
-### Contracts.md §5 addition (for the steward)
+### Contracts.md §5 addition (applied by the steward)
 
 - §5 *Allowlisted fields*, after the A4 `source.subagent` text: "and, for
   the `other` variant, its string tag as `subagent_detail` (A7, sidecar
