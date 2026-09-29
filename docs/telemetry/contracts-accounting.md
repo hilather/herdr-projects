@@ -60,10 +60,10 @@ counted entries (delta, an `accepted` disposition) of certified sessions, with
 the §6 `coverage`. They are derived from the Codex tables at report time, so
 they need no prior sync. It also provides M38 and M39, both `unavailable`
 (§5), M31–M33 (§6), M16–M18 (§9, derived from A6 tool metadata at read
-time), M34–M37 (§10, derived from canonical rows at read time), M12/M14
-(§12, from the latest stored valuation revision), M11 (§13, from imported
-provider charges) and M04 (§14, from the latest valuation revision and
-canonical task evidence).
+time), M34–M37 (§10, derived at read time from canonical rows, the latest
+valuation revision and worktree reflogs), M12/M14 (§12, from the latest
+stored valuation revision), M11 (§13, from imported provider charges) and
+M04 (§14, from the latest valuation revision and canonical task evidence).
 
 ## 3. Session graph and model segments (B2, TM2.2)
 
@@ -705,12 +705,16 @@ rollout gone before its re-read makes the session `pending_reread`.
 
 ## 10. Fleet efficiency (B6a, TM2.8; M34–M37)
 
-Plan: doc 07 M34–M37, doc 10 §5a "Fan-out", doc 12 TM2.8. **Derived at read
-time** from canonical `state.db` rows only, opened read-only
-(`telemetry::read_only`): no stream migration, nothing stored, no sidecar
-needed or created. Only worker attempts are counted. The coordinator has no
-canonical attempt, so its time and cost never enter a worker figure (M34
-below).
+Plan: doc 07 M34–M37, doc 05 §5a, doc 10 §5a "Fan-out" and "Coordinator
+overhead", doc 12 TM2.8. **Derived at read time**: nothing is stored and no
+sidecar stream migration is needed. Inputs are canonical `state.db` rows
+opened read-only (`telemetry::read_only`); for M34 and M37 the latest
+valuation revision (§4) and `rollout_sources` of the sidecar, read-only (no
+sidecar is created); for M36's worker-observed scope the attempt worktrees'
+reflogs (a gated, read-only `git`). The one canonical write is the owner's
+supersession reason (migration 0060, below). Only worker attempts are
+counted in M35/M36. The coordinator has no canonical attempt, so its time
+and cost never enter a worker figure (M34 below).
 
 **Active intervals.** An attempt is active from its `running` lifecycle mark
 to its terminal mark (contracts §4, the `active_ms` interval). Per attempt,
@@ -815,24 +819,119 @@ two splits:
   attempts over its active interval, rounded as above. The bucket is
   `unknown` without a known interval or when an unknown span overlaps it.
 
-`scope: integrator_observed`. A worker rebasing inside its worktree is not
-observed (`not_observed: [worker_side_rebase]`). `--since` keeps attempts
-whose first operation is at or after it.
+`scope: integrator_observed`. `--since` keeps attempts whose first
+operation is at or after it.
 
-**M34 `coordinator_overhead`**: `unavailable
-coordinator_usage_not_attributed`, `missing: [coordinator_usage_scope,
-coordinator_allocation_rule]`. The coordinator has no canonical attempt. Its
-Codex rollouts are unbound (contracts §5 binding rule), so no usage is
-recorded under a `coordinator` role scope. No versioned allocation rule
-exists either, and costs are published-rate estimates only (§4). The doc 10
-fixture (coordinator $4, workers $16 → 20%) needs both producers. Until
-then, no worker or per-arm figure includes any coordinator cost.
+**Worker-observed scope** (`M36.worker_observed`, apart from the integrator's
+figure and never added to it): for each attempt reaching integration (at
+most 64 per read), the `HEAD` reflog of each of its worktrees
+`<project>/.state/worktrees/<attempt>/repo-NN` (at most 16), read by `git
+--no-optional-locks reflog show --date=unix --format=%gd%x09%gs -n 1000
+HEAD` through the spawn gate, with `GIT_DIR`-style variables removed. Only
+the entry's time and its action (the subject up to the first `:`) are
+used; the rest of the subject (a commit message) is dropped unread and
+nothing is stored. Kinds: `rebase` (`rebase… (start)`, `pull --rebase
+(start)`), `rebase_conflict_resolved` (`… (continue)`), `merge` (`merge
+<ref>`, a non-rebase `pull`), `merge_conflict_resolved` (`commit
+(merge)`). An event counts when recorded no later than the attempt's first
+integrated operation (any time if it never integrated). `worker_observed
+{scope: worker_observed, numerator, denominator, value, events, coverage,
+event_rule}`: attempts with an event / attempts whose worktree was read;
+`coverage` counts `observed`, `worktree_absent` (removed after cleanup),
+`reflog_unavailable`, `git_unavailable`, `read_limit`. Residual: a worker
+that rewrites or expires its reflog, or works outside the worktree, is not
+observed.
 
-**M37 `overlap_waste_share`**: `unavailable supersession_reason_not_recorded`,
-`missing: [accepted_supersession_reason]`. No canonical record says an
-attempt was superseded or abandoned because a sibling changed the same area.
-Candidate selections (contracts-quality.md §3) name a winner, not why
-another attempt was superseded.
+**Cost basis (M34, M37).** The latest valuation revision (§4,
+`published_rate_estimate`, fixture-only rate cards), per collected session
+(`rollout_sources`, current binding). A session is:
+- *worker*: a rollout bound to a known canonical attempt;
+- *unattributed*: in a task worktree (`cwd_attempt`), ambiguous, or bound to
+  an unknown attempt, but not bound to a known one;
+- *coordinator* (**`coordinator-scope-v1`**): Codex rollouts collected from
+  any scanned execution home (contracts §5), bound to no attempt and outside
+  every task worktree, whose `session_meta.cwd` (stored home-prefixed) is the
+  project directory: `coordinator.rs open` starts the coordinator agent in a
+  pane at `project.canonical_dir()`, and nothing else in the product runs an
+  agent there. Its guardian sessions (same cwd) are included;
+- otherwise *outside* the project (ignored).
+
+A priced amount is summed per currency (exact rationals, shown as exact
+decimals); currencies are never added (`mixed_currency`); an amount that would
+overflow is `amount_overflow`. What keeps an estimate from being complete
+(`gaps`): `entries_unpriced` (an entry `unavailable` in the revision),
+`usage_not_valued` (a session with records the revision has not valued:
+collected after the last sync or reprice), `usage_not_observed` (an attempt
+that ran, a known running interval, without any bound session: another agent
+kind, or not collected). Unknown is never 0: a share with gaps is `{status:
+partial, reasons, priced_share}`; with nothing priced `unavailable
+no_priced_entries`. An estimate is `complete {currency, amount}`, `partial
+{gaps, currency, priced_amount}` or `unavailable`. `--since` keeps sessions
+whose earliest rollout started at or after it (as M12) and attempts whose
+running interval starts at or after it. Without a sidecar both metrics are
+`unavailable collection_not_run`, before any reprice `not_priced`.
+
+**M34 `coordinator_overhead`** (`M34.fleet-v1`, `scope:
+coordinator-scope-v1`, `allocation_rule: coordinator-allocation-v1`,
+`excluded_from: [M35, per_arm_worker_figures]`). `value` = coordinator
+exclusive cost / total project lifecycle cost (coordinator + worker
+sessions), an exact rational. Reasons for `partial`: `coordinator_<gap>`,
+`worker_<gap>`, `unattributed_worker_usage`. With no session in the scope it
+is `unavailable coordinator_usage_not_observed`, never 0: a coordinator run
+by another agent kind (the default `coordinator_agent` is `claude`), or from
+an execution home that is not scanned, is not observed. Also:
+- `coordinator {sessions, estimate, coverage}` and
+  `total_project_lifecycle_cost {estimate, worker_attempts, worker_coverage,
+  unattributed_sessions}`;
+- `per_active_worker_thread_hour {value, currency, active_worker_thread_ms,
+  open_censored}`: coordinator cost × 3600000 / Σ known active worker time
+  (§10 intervals, open ones to now) in the window; `unavailable
+  active_time_unknown` when an unknown span touches the window,
+  `predates_lifecycle_log` without marks, `null empty_denominator` for none;
+  `partial {gaps, priced_value}` when the coordinator cost has gaps;
+- `allocation` under **`coordinator-allocation-v1`**: each priced coordinator
+  entry is split evenly across the tasks with an attempt running over its
+  usage interval (`[from, to]` against a run's `[from, to)`); none running:
+  `unallocated`; an unknown activity span over it (or no usage interval):
+  `allocation_unknown`. `{rule, rule_text, coordinator_total (the
+  unallocated coordinator estimate, always shown), unpriced_entries,
+  currency, by_task, unallocated, allocation_unknown}`. The allocation is a
+  view only: no worker, task or arm figure (M35, candidate-group arm cost,
+  `accounting cost` per attempt) includes coordinator cost.
+
+**M37 `overlap_waste_share`** (`M37.fleet-v1`). The producer is the owner's
+**accepted supersession reason**, canonical migration **0060**
+(`attempt_supersessions`, store schema 60): one append-only row per ended
+attempt (`completed`, `failed`, `cancelled`, `lost`; a trigger refuses any
+other, and UPDATE/DELETE), `{attempt_id, task_id, outcome (superseded |
+abandoned), reason (sibling_changed_same_area | duplicate_effort | other),
+sibling_attempt_id (required unless other; another attempt), evidence (1–16
+typed references <kind>:<id>, kind attempt | task | submission |
+verified_result | integration_operation | commit | candidate_group; never
+text), principal operator:cli, authority operator_owner.v1, canonical_json,
+recorded_unix_ms}`. Written only by `SqliteStore::record_attempt_supersession`
+in its own transaction: a worker (`worker:*` or an attempt id) and an import
+(`import:*`) are refused, as is any principal but `operator:cli`, and the
+schema CHECKs refuse a forged raw row. The same assertion again is a no-op
+(`recorded: false`); a different one for the same attempt is refused
+(append-only; corrections are a follow-up). CLI: `telemetry <slug>
+accounting supersede <attempt> --outcome <o> --reason <r> [--sibling <a>]
+--evidence <kind:id>...` prints `{supersession}`; it refuses to run in a
+worker execution context (the contracts-review.md §9 markers: cwd in a task
+worktree, or HOME a recorded worker execution home).
+
+`value` = lifecycle cost of attempts whose reason is
+`sibling_changed_same_area` / total worker lifecycle cost. The population is
+every attempt with a worker session in the window, plus every attempt that
+ran in it (without usage: `usage_not_observed`). Each attempt is in one
+bucket: its recorded reason (`sibling_changed_same_area`,
+`duplicate_effort`, `other`), else `unexplained_abandonment` when it is
+`cancelled` or `lost`, else `not_superseded`. `buckets {name: {attempts,
+estimate}}`, `records` (count per reason), `total_lifecycle_cost {attempts,
+estimate, coverage, unattributed_sessions}`. Only
+`sibling_changed_same_area` is overlap waste; unexplained abandonment is
+never counted as waste. Before 0060: `unavailable
+supersession_reason_not_recorded`, `missing: [accepted_supersession_reason]`.
 
 **`accounting fleet [--json]`** (read-only) prints `{fleet: {window_ms,
 horizon_unix_ms, coverage, windows {bucketed, excluded}, buckets,
@@ -866,9 +965,41 @@ Test `fan_out_buckets_and_integration_conflicts`:
   (3 accepted) → `3/4`, marginal `1/2`; Y `no_accepted_throughput`; the
   fleet stays `3/4`.
 
-Follow-ups: coordinator usage scope and allocation rule (M34); a supersession
-reason producer (M37); worker-side rebase capture; the factory's scale-trial
-steps (F4.6/F5.4) as named concurrency steps.
+Test `fan_out_buckets_and_integration_conflicts` also plants attempt
+worktrees with real Git history: a2 rebases (0:10) and resolves a
+conflicting merge (0:20) before integrating at 0:45 (its merge at 0:50 is
+not counted), b2 merges its target at 1:10, b3 only commits, b4 has no
+worktree → `worker_observed` `2/3`, events `rebase 1, merge 1,
+merge_conflict_resolved 1`, coverage `observed 3, worktree_absent 1`; the
+integrator figure stays `3/4`. Without a sidecar M34 and M37 are
+`collection_not_run`.
+
+Test `coordinator_overhead_and_overlap_waste_from_accepted_reasons`
+(invented rates: $4 per 1,000 + 500 record):
+- No coordinator session: M34 `coordinator_usage_not_observed`.
+- Doc 10 §5a: coordinator $4 (Codex at the project directory from another
+  scanned home), four worker sessions $16 → M34 `1/5`; the attempt ran 2 h →
+  `2` per worker-thread-hour; rule v1 gives task `work` `4`, unallocated `0`;
+  the attempt's `cost` estimate stays `16`. M37 `0` (not superseded).
+- The attempt is cancelled and the task re-run ($4): M34 `1/6`; M37 `0` with
+  the cancelled attempt in `unexplained_abandonment` ($16).
+- Workers, an attempt id and an import are refused by the store, a forged
+  row by the schema, a worker HOME by the CLI, a missing sibling and a text
+  evidence by validation; the owner's reason (`sibling_changed_same_area`,
+  sibling `s1`) → M37 `4/5` ($16 / $20); the same again is a no-op, another
+  refused, an UPDATE refused.
+- A coordinator record without a rate: M34 `partial` (`priced_share` `1/6`,
+  `coordinator_entries_unpriced`), per-hour `partial` `2`.
+- Doc 05 §5a: a second task running over the coordinator's record → `2` to
+  each task, total `4` still shown, `1` per worker-thread-hour; its usage is
+  not observed, so M34 adds `worker_usage_not_observed` and M37 is `partial`
+  `4/5` (`usage_not_observed`).
+
+Follow-ups: the factory's scale-trial steps (F4.6/F5.4) as named concurrency
+steps; a declared coordinator execution home (today a Codex coordinator is
+observed only from a scanned home) and a Claude coordinator adapter;
+corrections (retractions) of a supersession reason; allocation by coordinator
+turns that reference a task (a rule v2 needs task references in turn metadata).
 
 ## 11. Stream 8: superseded projections dropped
 

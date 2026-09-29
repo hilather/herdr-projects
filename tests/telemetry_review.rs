@@ -2064,7 +2064,7 @@ fn review_ledger_upgrade_backfills_sessions_in_completion_order() {
     assert_eq!((version(), f.cli_args(&["review", "findings", "show"]).0["findings"]["head_seq"].clone()), (58, json!(4)));
 
     SqliteStore::open(&db_path).unwrap().upgrade_v1().unwrap();
-    assert_eq!(version(), 59);
+    assert_eq!(version(), 60);
     let sessions: Vec<String> = raw.prepare("SELECT session_id FROM review_sessions ORDER BY started_unix_ms").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
     let events = || raw.prepare("SELECT e.seq,e.session_id,e.event,e.backfilled,l.kind,l.authority FROM review_session_events e JOIN review_log l ON l.seq=e.seq ORDER BY e.seq").unwrap()
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?)))

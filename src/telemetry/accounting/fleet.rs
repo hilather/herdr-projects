@@ -1,14 +1,18 @@
-//! Fleet efficiency (docs/telemetry/contracts-accounting.md §10; plan TM2.8,
-//! doc 07 M34–M37, doc 10 §5a "Fan-out"), derived at read time from
-//! canonical `state.db` rows only (read-only; nothing is stored): attempt
-//! lifecycle marks (contracts §4: an attempt is active from its `running`
-//! mark to its terminal mark), dispatch decisions with their task
-//! classification, acceptance evidence (contracts §6 `A`) and integration
-//! operations. M35 buckets fixed activity windows by their time-weighted
-//! active-attempt count; M36 counts integrator-observed conflict/rebase
-//! events. M34 and M37 have no canonical producer and are `unavailable`.
-//! Only worker attempts are counted: the coordinator has no canonical
-//! attempt, so its time and cost never enter a worker figure.
+//! Fleet efficiency (docs/telemetry/contracts-accounting.md §10; plan
+//! TM2.8, doc 07 M34–M37, doc 10 §5a "Fan-out" and "Coordinator overhead"),
+//! derived at read time (nothing is stored): attempt lifecycle marks
+//! (contracts §4: an attempt is active from its `running` mark to its terminal
+//! mark), dispatch decisions with their task classification, acceptance
+//! evidence (contracts §6 `A`), integration operations and the owner's
+//! supersession reasons from canonical `state.db` (read-only), the latest
+//! valuation revision from the sidecar, and attempt worktree reflogs (a gated,
+//! read-only `git`, counts only). M35 buckets fixed activity windows by their
+//! time-weighted active-attempt count; M36 counts integrator-observed and,
+//! apart, worker-observed conflict/rebase events; M34 prices the coordinator
+//! scope (`coordinator-scope-v1`) against the project's lifecycle cost and
+//! allocates it by rule `coordinator-allocation-v1`; M37 prices attempts
+//! superseded because a sibling changed the same area. The coordinator has no
+//! canonical attempt, so its time and cost never enter a worker figure.
 use anyhow::Result;
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -35,11 +39,39 @@ const NAMES: [(&str, &str, &str); 4] = [("M34", "coordinator_overhead", "M34.fle
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Q(i128, i128);
 
+fn gcd(a: i128, b: i128) -> i128 { if b == 0 { a.abs() } else { gcd(b, a % b) } }
+
 impl Q {
     fn new(n: i128, d: i128) -> Q {
-        fn gcd(a: i128, b: i128) -> i128 { if b == 0 { a.abs() } else { gcd(b, a % b) } }
         let g = gcd(n, d).max(1) * d.signum();
         Q(n / g, d / g)
+    }
+    /// Checked forms for money (decimal amounts): `None` on overflow, never wrapped.
+    fn try_add(self, o: Q) -> Option<Q> {
+        let l = (self.1 / gcd(self.1, o.1).max(1)).checked_mul(o.1)?;
+        Some(Q::new(self.0.checked_mul(l / self.1)?.checked_add(o.0.checked_mul(l / o.1)?)?, l))
+    }
+    fn try_mul(self, o: Q) -> Option<Q> {
+        let (g1, g2) = (gcd(self.0, o.1).max(1), gcd(o.0, self.1).max(1));
+        Some(Q::new((self.0 / g1).checked_mul(o.0 / g2)?, (self.1 / g2).checked_mul(o.1 / g1)?))
+    }
+    fn try_div(self, o: Q) -> Option<Q> { if o.0 == 0 { None } else { self.try_mul(Q::new(o.1, o.0)) } }
+    /// A plain non-negative decimal string (a stored amount).
+    fn decimal(text: &str) -> Option<Q> {
+        let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+        if whole.is_empty() || !whole.bytes().chain(fraction.bytes()).all(|b| b.is_ascii_digit()) || whole.len() + fraction.len() > 36 { return None; }
+        Some(Q::new(format!("{whole}{fraction}").parse().ok()?, 10i128.checked_pow(fraction.len() as u32)?))
+    }
+    /// Exact decimal when the denominator divides a power of ten, else `n/d`.
+    fn money(self) -> String {
+        let (mut d, mut twos, mut fives) = (self.1, 0u32, 0u32);
+        while d % 2 == 0 { d /= 2; twos += 1; }
+        while d % 5 == 0 { d /= 5; fives += 1; }
+        let scale = twos.max(fives);
+        let Some(m) = 10i128.checked_pow(scale).and_then(|p| self.0.checked_mul(p / self.1)).filter(|_| d == 1) else { return self.show() };
+        let digits = format!("{:0>width$}", m.abs(), width = scale as usize + 1);
+        let (int, frac) = digits.split_at(digits.len() - scale as usize);
+        format!("{}{int}{}{frac}", if m < 0 { "-" } else { "" }, if scale > 0 { "." } else { "" })
     }
     fn int(n: i128) -> Q { Q(n, 1) }
     fn add(self, o: Q) -> Q { Q::new(self.0 * o.1 + o.0 * self.1, self.1 * o.1) }
@@ -59,7 +91,7 @@ impl Ord for Q {
 
 /// A worker attempt's known active interval `[from, to)`, with its task mix
 /// key and its dispatch decision's agent configuration.
-struct Run { attempt: String, from: i64, to: i64, mix: String, config: Option<String> }
+struct Run { attempt: String, task: String, from: i64, to: i64, mix: String, config: Option<String> }
 
 /// An integration operation of an attempt: (ref, state, reason, created, integrated).
 type Op = (String, String, Option<String>, i64, bool);
@@ -93,17 +125,17 @@ fn load(db: &Connection, horizon: i64) -> Result<std::result::Result<Fleet, &'st
     } else { "NULL" };
     let config = if decisions { "(SELECT d.chosen_configuration_id FROM dispatch_decisions d WHERE d.attempt_id=a.id)" } else { "NULL" };
     let mark = |state: &str| format!("(SELECT l.unix_ms FROM attempt_lifecycle l WHERE l.attempt_id=a.id AND l.state='{state}')");
-    let sql = format!("SELECT a.id,a.state,{},{},(SELECT min(l.unix_ms) FROM attempt_lifecycle l WHERE l.attempt_id=a.id AND l.state IN ('completed','failed','cancelled','lost')),{mix},{config}
+    let sql = format!("SELECT a.id,a.state,{},{},(SELECT min(l.unix_ms) FROM attempt_lifecycle l WHERE l.attempt_id=a.id AND l.state IN ('completed','failed','cancelled','lost')),{mix},{config},a.task_id
         FROM attempts a ORDER BY a.rowid", mark("reserved"), mark("running"));
-    type Row = (String, String, Option<i64>, Option<i64>, Option<i64>, Option<String>, Option<String>);
-    let rows: Vec<Row> = db.prepare(&sql)?.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?
+    type Row = (String, String, Option<i64>, Option<i64>, Option<i64>, Option<String>, Option<String>, String);
+    let rows: Vec<Row> = db.prepare(&sql)?.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let configs: BTreeMap<String, Option<String>> = rows.iter().map(|r| (r.0.clone(), r.6.clone())).collect();
     let log_start = rows.iter().filter_map(|r| r.2).min();
     let (mut runs, mut unknown, mut coverage) = (Vec::new(), Vec::new(), BTreeMap::new());
     for key in ["attempts", "running_intervals", "open_censored", "never_running", "predates_lifecycle_log", "end_unknown"] { coverage.insert(key, 0); }
     let mut count = |key: &'static str| *coverage.entry(key).or_default() += 1;
-    for (attempt, state, reserved, running, ended, class, config) in rows {
+    for (attempt, state, reserved, running, ended, class, config, task) in rows {
         count("attempts");
         let terminal = TERMINAL.contains(&state.as_str());
         match (reserved, running, ended) {
@@ -113,11 +145,11 @@ fn load(db: &Connection, horizon: i64) -> Result<std::result::Result<Fleet, &'st
                 if !(terminal && ended.is_none()) { unknown.push((log_start.unwrap_or(i64::MIN), ended.unwrap_or(horizon), config)); }
             }
             (Some(_), None, _) => count("never_running"),
-            (Some(_), Some(from), Some(to)) => { count("running_intervals"); runs.push(Run { attempt, from, to, mix: class.unwrap_or(UNCLASSIFIED.into()), config }); }
+            (Some(_), Some(from), Some(to)) => { count("running_intervals"); runs.push(Run { attempt, task, from, to, mix: class.unwrap_or(UNCLASSIFIED.into()), config }); }
             (Some(_), Some(from), None) if !terminal => {
                 count("running_intervals");
                 count("open_censored");
-                runs.push(Run { attempt, from, to: horizon, mix: class.unwrap_or(UNCLASSIFIED.into()), config });
+                runs.push(Run { attempt, task, from, to: horizon, mix: class.unwrap_or(UNCLASSIFIED.into()), config });
             }
             (Some(_), Some(from), None) => { count("end_unknown"); unknown.push((from, horizon, config)); }
         }
@@ -311,9 +343,64 @@ fn event(state: &str, reason: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// Worker-observed scope of M36: at most this many attempt worktrees are read
+/// per report, and this many reflog entries per worktree.
+const WORKER_ATTEMPTS: usize = 64;
+const REFLOG_ENTRIES: &str = "1000";
+const WORKTREES_PER_ATTEMPT: usize = 16;
+
+/// The kind of a worktree `HEAD` reflog entry from its action (the subject up
+/// to the first `:`); the rest of the subject (a commit message) is dropped
+/// unread. `None` for anything that is not a rebase or merge.
+fn reflog_kind(subject: &str) -> Option<&'static str> {
+    let action = subject.split_once(':').map_or(subject, |a| a.0);
+    let rebase = action.starts_with("rebase") || action.starts_with("pull --rebase");
+    match action {
+        _ if rebase && action.ends_with("(start)") => Some("rebase"),
+        _ if rebase && action.ends_with("(continue)") => Some("rebase_conflict_resolved"),
+        "commit (merge)" => Some("merge_conflict_resolved"),
+        _ if action.starts_with("merge ") || (action.starts_with("pull") && !rebase) => Some("merge"),
+        _ => None,
+    }
+}
+
+/// Rebase and merge events a worker made in its own attempt worktrees
+/// (`<project>/.state/worktrees/<attempt>/repo-NN`) up to `until` (ms), read
+/// from each worktree's `HEAD` reflog with a gated, read-only `git`. Counts per
+/// kind only; or why nothing was observed.
+fn worker_events(project: &Path, attempt: &str, until: Option<i64>) -> std::result::Result<BTreeMap<&'static str, usize>, &'static str> {
+    use crate::execution_guard::GatedSpawn;
+    if attempt.is_empty() || attempt.starts_with('.') || attempt.contains(['/', '\\']) { return Err("worktree_absent"); }
+    let root = project.join(".state/worktrees").join(attempt);
+    let mut trees: Vec<std::path::PathBuf> = std::fs::read_dir(&root).map_err(|_| "worktree_absent")?.filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.len() == 7 && n.starts_with("repo-") && n[5..].bytes().all(|b| b.is_ascii_digit())))
+        .map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    trees.sort();
+    trees.truncate(WORKTREES_PER_ATTEMPT);
+    if trees.is_empty() { return Err("worktree_absent"); }
+    let mut events = BTreeMap::new();
+    for tree in trees {
+        let out = std::process::Command::new("git").current_dir(&tree)
+            .env_remove("GIT_DIR").env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE").env_remove("GIT_OBJECT_DIRECTORY").env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .args(["--no-optional-locks", "reflog", "show", "--date=unix", "--format=%gd%x09%gs", "-n", REFLOG_ENTRIES, "HEAD", "--"])
+            .output_gated().map_err(|_| "git_unavailable")?;
+        if !out.status.success() { return Err("reflog_unavailable"); }
+        for line in out.stdout.split(|b| *b == b'\n') {
+            let text = String::from_utf8_lossy(line);
+            let Some((selector, subject)) = text.split_once('\t') else { continue };
+            let Some(kind) = reflog_kind(subject) else { continue };
+            let seconds = selector.rsplit_once("@{").and_then(|(_, t)| t.strip_suffix('}')).and_then(|t| t.parse::<i64>().ok());
+            if until.is_some_and(|until| seconds.is_none_or(|s| s.saturating_mul(1000) > until)) { continue; }
+            *events.entry(kind).or_default() += 1;
+        }
+    }
+    Ok(events)
+}
+
 /// M36: attempts with a conflict/rebase event before their first integration / attempts reaching integration.
-fn conflicts(f: &Fleet, since: Option<i64>) -> Value {
+fn conflicts(f: &Fleet, project: &Path, since: Option<i64>) -> Value {
     let (mut reached, mut conflicted, mut events) = (0, 0, BTreeMap::<&str, usize>::new());
+    let (mut worker, mut worker_events_seen, mut worker_coverage) = ((0, 0), BTreeMap::<&str, usize>::new(), BTreeMap::<&str, usize>::new());
     let mut by_target: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     let mut by_bucket: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     for (attempt, ops) in &f.operations {
@@ -325,6 +412,18 @@ fn conflicts(f: &Fleet, since: Option<i64>) -> Value {
         let all: Vec<_> = ops.iter().collect();
         let found = before(&all);
         reached += 1;
+        // Worker-observed scope, apart from the integrator's: the attempt's own worktree reflog.
+        let until = ops.iter().filter(|o| o.4).map(|o| o.3).min();
+        let observed = if reached > WORKER_ATTEMPTS { Err("read_limit") } else { worker_events(project, attempt, until) };
+        match observed {
+            Ok(seen) => {
+                *worker_coverage.entry("observed").or_default() += 1;
+                worker.1 += 1;
+                if !seen.is_empty() { worker.0 += 1; }
+                for (kind, n) in seen { *worker_events_seen.entry(kind).or_default() += n; }
+            }
+            Err(reason) => *worker_coverage.entry(reason).or_default() += 1,
+        }
         if !found.is_empty() { conflicted += 1; }
         for e in &found { *events.entry(e).or_default() += 1; }
         let bucket = experienced(f, attempt).map_or("unknown".to_owned(), |k| k.to_string());
@@ -346,18 +445,285 @@ fn conflicts(f: &Fleet, since: Option<i64>) -> Value {
     body["by_bucket"] = json!(split(by_bucket));
     body["scope"] = json!("integrator_observed");
     body["event_rule"] = json!("blocked/merge_conflict or discarded/stale_base on an operation created no later than the attempt's first integrated operation");
-    body["not_observed"] = json!(["worker_side_rebase"]);
+    let mut worker_side = ratio(worker.0, worker.1);
+    worker_side["scope"] = json!("worker_observed");
+    worker_side["events"] = json!(worker_events_seen);
+    worker_side["coverage"] = json!(worker_coverage);
+    worker_side["event_rule"] = json!("a rebase, merge, or resolved rebase/merge conflict in the attempt worktree's HEAD reflog, recorded no later than its first integrated operation; counts only, the reflog subject is never kept");
+    body["worker_observed"] = worker_side;
     body
 }
 
-fn m34() -> Value {
-    json!({"value": unavailable("coordinator_usage_not_attributed"), "missing": ["coordinator_usage_scope", "coordinator_allocation_rule"],
-        "detail": "the coordinator has no canonical attempt: its Codex rollouts are unbound (no role `coordinator` scope) and no versioned allocation rule exists; worker figures never include it"})
+/// M34 coordinator usage scope, versioned (§10).
+pub const COORDINATOR_SCOPE: &str = "coordinator-scope-v1";
+const COORDINATOR_SCOPE_RULE: &str = "Codex rollouts collected from a scanned execution home, bound to no attempt and outside every task worktree, \
+    whose session_meta.cwd is the project directory (the coordinator pane's working directory)";
+/// M34 allocation of coordinator cost to tasks, versioned (§10; plan doc 05 §5a).
+pub const ALLOCATION_RULE: &str = "coordinator-allocation-v1";
+const ALLOCATION_RULE_TEXT: &str = "each priced coordinator entry is split evenly across the tasks with an attempt running over its usage interval; \
+    none running: unallocated; an unknown activity span over it: allocation_unknown";
+
+/// A valued ledger entry: its priced amount (`None`: unpriced) and usage interval.
+struct Entry { priced: Option<(String, Q)>, interval: Option<(i64, i64)> }
+
+#[derive(PartialEq)]
+enum Scope { Worker(String), Coordinator, Unattributed, Outside }
+
+/// A collected Codex session in the latest valuation revision (§4), or
+/// collected with records the revision has not valued yet (`valued` false).
+struct Session { scope: Scope, start: Option<i64>, valued: bool, entries: Vec<Entry> }
+
+/// Every collected session with its scope: bound to a known attempt (worker),
+/// in a task worktree but not bound (or bound to an unknown attempt:
+/// unattributed), the coordinator scope, or outside the project.
+fn sessions(project: &Path, attempts: &BTreeSet<String>) -> Result<std::result::Result<Vec<Session>, &'static str>> {
+    let Some(db) = crate::telemetry::sidecar::read(project)? else { return Ok(Err("collection_not_run")) };
+    let cost = super::cost::cost(&db, None)?;
+    if cost.get("status").is_some() { return Ok(Err("not_priced")); }
+    let dir = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf()).to_string_lossy().into_owned();
+    let roots = [crate::telemetry::sanitize::home_prefix(&dir), dir];
+    type Source = (Option<String>, bool, bool, Option<i64>, i64);
+    let mut sources: BTreeMap<String, Source> = BTreeMap::new();
+    let mut stmt = db.prepare("SELECT session_id,binding,attempt_id,cwd,cwd_attempt,session_unix_ms,records FROM rollout_sources ORDER BY path_digest")?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, String>(3)?,
+        r.get::<_, Option<String>>(4)?, r.get::<_, Option<i64>>(5)?, r.get::<_, i64>(6)?)))? {
+        let (session, binding, attempt, cwd, cwd_attempt, start, records) = row?;
+        let s = sources.entry(session).or_insert((None, false, false, None, 0));
+        if binding == "bound" { s.0 = s.0.take().or(attempt); }
+        s.1 |= cwd_attempt.is_some() || binding != "unbound";
+        s.2 |= roots.contains(&cwd);
+        s.3 = match (s.3, start) { (Some(a), Some(b)) => Some(a.min(b)), (a, b) => a.or(b) };
+        s.4 += records;
+    }
+    let mut valued: BTreeMap<String, Vec<Entry>> = BTreeMap::new();
+    for session in cost["sessions"].as_array().into_iter().flatten() {
+        let Some(id) = session["session_id"].as_str() else { continue };
+        let entries = valued.entry(id.to_owned()).or_default();
+        for e in session["entries"].as_array().into_iter().flatten() {
+            let v = &e["valuation"];
+            let priced = if v["status"] == "priced" { v["currency"].as_str().zip(v["amount"].as_str().and_then(Q::decimal)).map(|(c, a)| (c.to_owned(), a)) } else { None };
+            let i = &e["usage_interval"];
+            entries.push(Entry { priced, interval: i["from_unix_ms"].as_i64().zip(i["to_unix_ms"].as_i64()) });
+        }
+    }
+    Ok(Ok(sources.into_iter().map(|(id, (bound, worktree, root, start, records))| {
+        let scope = match bound {
+            Some(a) if attempts.contains(&a) => Scope::Worker(a),
+            Some(_) => Scope::Unattributed,
+            None if worktree => Scope::Unattributed,
+            None if root => Scope::Coordinator,
+            None => Scope::Outside,
+        };
+        let entries = valued.remove(&id);
+        Session { scope, start, valued: entries.is_some() || records == 0, entries: entries.unwrap_or_default() }
+    }).collect()))
 }
 
-fn m37() -> Value {
-    json!({"value": unavailable("supersession_reason_not_recorded"), "missing": ["accepted_supersession_reason"],
-        "detail": "no canonical record says an attempt was superseded or abandoned because a sibling changed the same area; candidate selections name a winner, not why another was superseded"})
+/// A published-rate estimate over entries (§4 rules): priced amounts per
+/// currency, never added across currencies, with what is missing.
+#[derive(Default, Clone)]
+struct Sum { by_currency: BTreeMap<String, Q>, entries: usize, unpriced: usize, not_valued: usize, not_observed: usize, overflow: bool }
+
+impl Sum {
+    fn priced(&mut self, currency: &str, amount: Q) {
+        let slot = self.by_currency.entry(currency.to_owned()).or_insert(Q::int(0));
+        match slot.try_add(amount) { Some(v) => *slot = v, None => self.overflow = true }
+    }
+    fn session(&mut self, s: &Session) {
+        if !s.valued { self.not_valued += 1; }
+        for e in &s.entries {
+            self.entries += 1;
+            match &e.priced { Some((c, a)) => self.priced(c, *a), None => self.unpriced += 1 }
+        }
+    }
+    fn merge(&mut self, o: &Sum) {
+        for (c, a) in &o.by_currency { self.priced(c, *a); }
+        self.entries += o.entries;
+        self.unpriced += o.unpriced;
+        self.not_valued += o.not_valued;
+        self.not_observed += o.not_observed;
+        self.overflow |= o.overflow;
+    }
+    /// What keeps the amount from being complete: unknown is never 0.
+    fn gaps(&self) -> Vec<&'static str> {
+        [(self.unpriced, "entries_unpriced"), (self.not_valued, "usage_not_valued"), (self.not_observed, "usage_not_observed")]
+            .into_iter().filter(|(n, _)| *n > 0).map(|(_, g)| g).collect()
+    }
+    fn coverage(&self) -> Value {
+        json!({"entries": self.entries, "priced": self.entries - self.unpriced, "unpriced": self.unpriced, "sessions_not_valued": self.not_valued,
+            "attempts_without_observed_usage": self.not_observed})
+    }
+    fn estimate(&self) -> Value {
+        let gaps = self.gaps();
+        if self.overflow { return unavailable("amount_overflow"); }
+        match self.by_currency.len() {
+            0 if gaps.is_empty() => json!({"status": "complete", "currency": null, "amount": "0"}),
+            0 => { let mut v = unavailable("no_priced_entries"); v["gaps"] = json!(gaps); v }
+            1 => {
+                let (currency, amount) = self.by_currency.iter().next().map(|(c, a)| (c.clone(), a.money())).unwrap_or_default();
+                if gaps.is_empty() { json!({"status": "complete", "currency": currency, "amount": amount}) }
+                else { json!({"status": "partial", "gaps": gaps, "currency": currency, "priced_amount": amount}) }
+            }
+            _ => json!({"status": "unavailable", "reason": "mixed_currency",
+                "priced_by_currency": self.by_currency.iter().map(|(c, a)| (c.clone(), a.money())).collect::<BTreeMap<_, _>>()}),
+        }
+    }
+    /// The single currency and priced amount, or why there is none.
+    fn single(&self) -> std::result::Result<Option<(&String, Q)>, &'static str> {
+        if self.overflow { return Err("amount_overflow"); }
+        match self.by_currency.len() { 0 => Ok(None), 1 => Ok(self.by_currency.iter().next().map(|(c, a)| (c, *a))), _ => Err("mixed_currency") }
+    }
+}
+
+/// `part / whole` of one currency as an exact rational; `partial` with the
+/// priced share when anything is missing (`reasons`). Returns the value and
+/// the metric's `reason` for a `null` value.
+fn share(part: &Sum, whole: &Sum, reasons: &[String]) -> (Value, Option<&'static str>) {
+    let (p, w) = match (part.single(), whole.single()) {
+        (Err(e), _) | (_, Err(e)) => return (unavailable(e), None),
+        (_, Ok(None)) if reasons.is_empty() => return (Value::Null, Some("empty_denominator")),
+        (_, Ok(None)) => return ({ let mut v = unavailable("no_priced_entries"); v["reasons"] = json!(reasons); v }, None),
+        (p, Ok(Some((c, w)))) => (p.ok().flatten().filter(|(pc, _)| *pc == c).map_or(Q::int(0), |(_, a)| a), w),
+    };
+    if w.0 == 0 { return (Value::Null, Some("empty_denominator")); }
+    let Some(ratio) = p.try_div(w) else { return (unavailable("amount_overflow"), None) };
+    if reasons.is_empty() { (json!(ratio.show()), None) } else { (json!({"status": "partial", "reasons": reasons, "priced_share": ratio.show()}), None) }
+}
+
+fn in_window(since: Option<i64>, start: Option<i64>) -> bool { since.is_none_or(|since| start.is_some_and(|t| t >= since)) }
+
+/// Attempts with a known running interval in the window.
+fn ran(f: Option<&Fleet>, since: Option<i64>) -> BTreeSet<&str> {
+    f.map(|f| f.runs.iter().filter(|r| since.is_none_or(|t| r.from >= t)).map(|r| r.attempt.as_str()).collect()).unwrap_or_default()
+}
+
+/// M34: coordinator exclusive cost / total project lifecycle cost (coordinator
+/// plus worker attempts), coordinator cost per active worker-thread-hour, and
+/// the allocation to tasks under rule v1. Never part of a worker figure.
+fn m34(f: Option<&Fleet>, usage: &std::result::Result<Vec<Session>, &'static str>, since: Option<i64>) -> Value {
+    let mut body = json!({"scope": COORDINATOR_SCOPE, "scope_rule": COORDINATOR_SCOPE_RULE, "allocation_rule": ALLOCATION_RULE,
+        "basis": super::cost::BASIS, "excluded_from": ["M35", "per_arm_worker_figures"]});
+    let sessions = match usage { Ok(s) => s, Err(reason) => { body["value"] = unavailable(reason); return body; } };
+    let coordinator: Vec<&Session> = sessions.iter().filter(|s| s.scope == Scope::Coordinator && in_window(since, s.start)).collect();
+    let (mut coord, mut workers, mut observed, mut unattributed) = (Sum::default(), Sum::default(), BTreeSet::new(), 0);
+    for s in &coordinator { coord.session(s); }
+    for s in sessions.iter().filter(|s| in_window(since, s.start)) {
+        match &s.scope {
+            Scope::Worker(a) => { workers.session(s); observed.insert(a.as_str()); }
+            Scope::Unattributed => unattributed += 1,
+            _ => {}
+        }
+    }
+    workers.not_observed = ran(f, since).difference(&observed).count();
+    body["coordinator"] = json!({"sessions": coordinator.len(), "estimate": coord.estimate(), "coverage": coord.coverage()});
+    if coordinator.is_empty() {
+        body["value"] = unavailable("coordinator_usage_not_observed");
+        body["detail"] = json!("no collected Codex session is in the coordinator scope: a coordinator run by another agent kind, or from an execution home that is not scanned, is not observed; never 0");
+        return body;
+    }
+    let mut total = coord.clone();
+    total.merge(&workers);
+    let mut reasons: Vec<String> = coord.gaps().iter().map(|g| format!("coordinator_{g}")).chain(workers.gaps().iter().map(|g| format!("worker_{g}"))).collect();
+    if unattributed > 0 { reasons.push("unattributed_worker_usage".into()); }
+    body["total_project_lifecycle_cost"] = json!({"estimate": total.estimate(), "worker_attempts": observed.len(), "worker_coverage": workers.coverage(),
+        "unattributed_sessions": unattributed});
+    let (value, reason) = share(&coord, &total, &reasons);
+    body["value"] = value;
+    if let Some(reason) = reason { body["reason"] = json!(reason); }
+    body["per_active_worker_thread_hour"] = thread_hour(f, &coord, since);
+    body["allocation"] = allocation(f, &coordinator, &coord);
+    body
+}
+
+/// Coordinator cost / active worker-thread-hours (Σ known active intervals in the window).
+fn thread_hour(f: Option<&Fleet>, coord: &Sum, since: Option<i64>) -> Value {
+    let Some(f) = f else { return json!({"value": unavailable("predates_lifecycle_log")}) };
+    if f.unknown.iter().any(|u| since.is_none_or(|t| u.1 > t)) { return json!({"value": unavailable("active_time_unknown")}); }
+    let active: i128 = f.runs.iter().map(|r| (r.to - r.from.max(since.unwrap_or(i64::MIN))).max(0) as i128).sum();
+    let mut body = json!({"active_worker_thread_ms": active as i64, "open_censored": f.coverage.get("open_censored")});
+    let (currency, amount) = match coord.single() { Err(e) => { body["value"] = unavailable(e); return body; } Ok(None) => { body["value"] = unavailable("no_priced_entries"); return body; } Ok(Some(c)) => c };
+    body["currency"] = json!(currency);
+    if active == 0 { body["value"] = Value::Null; body["reason"] = json!("empty_denominator"); return body; }
+    let Some(rate) = amount.try_mul(Q::int(HOUR_MS)).and_then(|a| a.try_div(Q::int(active))) else { body["value"] = unavailable("amount_overflow"); return body };
+    body["value"] = if coord.gaps().is_empty() { json!(rate.money()) } else { json!({"status": "partial", "gaps": coord.gaps(), "priced_value": rate.money()}) };
+    body
+}
+
+/// Rule v1: each priced coordinator entry split evenly across the tasks with
+/// an attempt running over its usage interval. The coordinator total is shown beside it.
+fn allocation(f: Option<&Fleet>, coordinator: &[&Session], coord: &Sum) -> Value {
+    let mut body = json!({"rule": ALLOCATION_RULE, "rule_text": ALLOCATION_RULE_TEXT, "coordinator_total": coord.estimate(), "unpriced_entries": coord.unpriced});
+    let Some(f) = f else { body["status"] = json!("unavailable"); body["reason"] = json!("predates_lifecycle_log"); return body };
+    let currency = match coord.single() { Err(e) => { body["status"] = json!("unavailable"); body["reason"] = json!(e); return body; } Ok(c) => c.map(|c| c.0.clone()) };
+    let (mut by_task, mut unallocated, mut unknown, mut overflow) = (BTreeMap::<&str, Q>::new(), Q::int(0), Q::int(0), false);
+    let mut add = |slot: &mut Q, amount: Q| match slot.try_add(amount) { Some(v) => *slot = v, None => overflow = true };
+    for entry in coordinator.iter().flat_map(|s| &s.entries) {
+        let Some((_, amount)) = &entry.priced else { continue };
+        let Some((from, to)) = entry.interval else { add(&mut unknown, *amount); continue };
+        if f.unknown.iter().any(|u| u.0 <= to && from < u.1) { add(&mut unknown, *amount); continue; }
+        let tasks: BTreeSet<&str> = f.runs.iter().filter(|r| r.from <= to && from < r.to).map(|r| r.task.as_str()).collect();
+        if tasks.is_empty() { add(&mut unallocated, *amount); continue; }
+        let each = amount.try_div(Q::int(tasks.len() as i128)).unwrap_or(Q::int(0));
+        for task in tasks { add(by_task.entry(task).or_insert(Q::int(0)), each); }
+    }
+    if overflow { body["status"] = json!("unavailable"); body["reason"] = json!("amount_overflow"); return body; }
+    body["currency"] = json!(currency);
+    body["by_task"] = json!(by_task.iter().map(|(t, a)| (t.to_string(), a.money())).collect::<BTreeMap<_, _>>());
+    body["unallocated"] = json!(unallocated.money());
+    body["allocation_unknown"] = json!(unknown.money());
+    body
+}
+
+/// Supersession buckets (§10): overlap waste (M37's numerator) and the rest.
+const BUCKETS: [&str; 5] = ["sibling_changed_same_area", "duplicate_effort", "other", "unexplained_abandonment", "not_superseded"];
+
+/// M37: lifecycle cost of attempts superseded or abandoned because a sibling
+/// changed the same area (an accepted supersession reason) / total worker
+/// lifecycle cost. Unexplained abandonment (cancelled or lost, no reason) is
+/// its own bucket; an attempt that ran without observed usage makes it partial.
+fn m37(db: &Connection, f: Option<&Fleet>, usage: &std::result::Result<Vec<Session>, &'static str>, since: Option<i64>) -> Result<Value> {
+    let mut body = json!({"reason_source": "attempt_supersessions (canonical 0060, owner-recorded)", "numerator_reason": "sibling_changed_same_area",
+        "basis": super::cost::BASIS});
+    if !table(db, "attempt_supersessions")? {
+        body["value"] = unavailable("supersession_reason_not_recorded");
+        body["missing"] = json!(["accepted_supersession_reason"]);
+        return Ok(body);
+    }
+    let reasons: BTreeMap<String, String> = db.prepare("SELECT attempt_id,reason FROM attempt_supersessions")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let states: BTreeMap<String, String> = db.prepare("SELECT id,state FROM attempts")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    let mut recorded = BTreeMap::<&str, usize>::new();
+    for reason in reasons.values() { *recorded.entry(reason.as_str()).or_default() += 1; }
+    body["records"] = json!(recorded);
+    let sessions = match usage { Ok(s) => s, Err(reason) => { body["value"] = unavailable(reason); return Ok(body); } };
+    let (mut per_attempt, mut unattributed) = (BTreeMap::<&str, Sum>::new(), 0);
+    for s in sessions.iter().filter(|s| in_window(since, s.start)) {
+        match &s.scope {
+            Scope::Worker(a) => per_attempt.entry(a.as_str()).or_default().session(s),
+            Scope::Unattributed => unattributed += 1,
+            _ => {}
+        }
+    }
+    for attempt in ran(f, since) { per_attempt.entry(attempt).or_insert_with(|| Sum { not_observed: 1, ..Sum::default() }); }
+    let mut buckets: BTreeMap<&str, (usize, Sum)> = BUCKETS.iter().map(|b| (*b, (0, Sum::default()))).collect();
+    let mut total = Sum::default();
+    for (attempt, sum) in &per_attempt {
+        let bucket = match (reasons.get(*attempt), states.get(*attempt).map(String::as_str)) {
+            (Some(reason), _) => reason.as_str(),
+            (None, Some("cancelled" | "lost")) => "unexplained_abandonment",
+            _ => "not_superseded",
+        };
+        if let Some(b) = buckets.get_mut(bucket) { b.0 += 1; b.1.merge(sum); }
+        total.merge(sum);
+    }
+    let mut gaps: Vec<String> = total.gaps().iter().map(|g| g.to_string()).collect();
+    if unattributed > 0 { gaps.push("unattributed_worker_usage".into()); }
+    let (value, reason) = share(&buckets["sibling_changed_same_area"].1, &total, &gaps);
+    body["value"] = value;
+    if let Some(reason) = reason { body["reason"] = json!(reason); }
+    body["buckets"] = json!(buckets.iter().map(|(b, (n, s))| (b.to_string(), json!({"attempts": n, "estimate": s.estimate()}))).collect::<BTreeMap<_, _>>());
+    body["total_lifecycle_cost"] = json!({"attempts": per_attempt.len(), "estimate": total.estimate(), "coverage": total.coverage(), "unattributed_sessions": unattributed});
+    Ok(body)
 }
 
 fn named(id: &str, mut body: Value) -> Value {
@@ -378,19 +744,29 @@ pub fn window_ms(minutes: i64) -> Result<i64> {
 
 fn computed(project: &Path, since: Option<i64>, window_ms: i64) -> Result<(Value, BTreeMap<String, Value>)> {
     let path = project.join(".state/state.db");
-    let loaded = if path.exists() { load(&*crate::telemetry::read_only(&path)?, now())? } else { Err("no_state_store") };
-    let (detail, m35, m36) = match loaded {
+    let db = if path.exists() { Some(crate::telemetry::read_only(&path)?) } else { None };
+    let loaded = match &db { Some(db) => load(db, now())?, None => Err("no_state_store") };
+    let (detail, m35, m36) = match &loaded {
         Ok(f) => {
-            let (mut detail, mut m35) = fan_out(&f, since, window_ms, None);
-            let (by_detail, by_metric) = per_configuration(&f, since, window_ms);
+            let (mut detail, mut m35) = fan_out(f, since, window_ms, None);
+            let (by_detail, by_metric) = per_configuration(f, since, window_ms);
             detail["by_configuration"] = by_detail;
             m35["by_configuration"] = by_metric;
-            (detail, m35, conflicts(&f, since))
+            (detail, m35, conflicts(f, project, since))
         }
         Err(reason) => (unavailable(reason), json!({"value": unavailable(reason)}), json!({"value": unavailable(reason)})),
     };
-    let metrics = BTreeMap::from([("M34".to_owned(), named("M34", m34())), ("M35".to_owned(), named("M35", m35)),
-        ("M36".to_owned(), named("M36", m36)), ("M37".to_owned(), named("M37", m37()))]);
+    let fleet = loaded.as_ref().ok();
+    let (m34, m37) = match &db {
+        Some(db) => {
+            let attempts: BTreeSet<String> = db.prepare("SELECT id FROM attempts")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            let usage = sessions(project, &attempts)?;
+            (m34(fleet, &usage, since), m37(db, fleet, &usage, since)?)
+        }
+        None => (json!({"value": unavailable("no_state_store")}), json!({"value": unavailable("no_state_store")})),
+    };
+    let metrics = BTreeMap::from([("M34".to_owned(), named("M34", m34)), ("M35".to_owned(), named("M35", m35)),
+        ("M36".to_owned(), named("M36", m36)), ("M37".to_owned(), named("M37", m37))]);
     Ok((detail, metrics))
 }
 
@@ -427,7 +803,12 @@ pub fn text(value: &Value) -> String {
         }
     }
     for (id, m) in value["metrics"].as_object().into_iter().flatten() {
-        let shown = match &m["value"] { Value::Null => format!("n/a ({})", m["reason"].as_str().unwrap_or("unknown")), v => show(v) };
+        let shown = match &m["value"] {
+            Value::Null => format!("n/a ({})", m["reason"].as_str().unwrap_or("unknown")),
+            v if v["status"] == "partial" => format!("partial {} ({})", show(&v["priced_share"]),
+                v["reasons"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")),
+            v => show(v),
+        };
         let label = m["label"].as_str().map(|l| format!(" ({l})")).unwrap_or_default();
         out += &format!("{id} {} {shown}{label}\n", m["name"].as_str().unwrap_or(""));
         for (config, c) in m["by_configuration"]["configurations"].as_object().into_iter().flatten() {
@@ -436,4 +817,39 @@ pub fn text(value: &Value) -> String {
         }
     }
     out
+}
+
+/// Refuse the owner's supersession CLI inside a worker execution context
+/// (contracts-review.md §9 markers): the working directory is a task worktree,
+/// or `HOME` is a recorded worker execution home. Markers, not authority: the
+/// store refuses every worker principal and the schema accepts only the owner.
+fn refuse_worker_context(project: &Path) -> Result<()> {
+    const REFUSED: &str = "`accounting supersede` records the project owner (operator:cli) and refuses to run inside a worker execution context";
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if let (Ok(cwd), Some(root)) = (std::env::current_dir(), project.parent())
+        && let Ok(rest) = canonical(&cwd).strip_prefix(canonical(root)) {
+        let parts: Vec<&std::ffi::OsStr> = rest.components().map(|c| c.as_os_str()).take(3).collect();
+        anyhow::ensure!(!(parts.len() == 3 && parts[1] == ".state" && parts[2] == "worktrees"), "{REFUSED}: the working directory is a task worktree");
+    }
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return Ok(()) };
+    let db = crate::telemetry::read_only(&project.join(".state/state.db"))?;
+    let mut homes: Vec<String> = db.prepare("SELECT json_extract(report,'$.preparation.profile.execution_home') FROM native_profiles
+        WHERE json_type(report,'$.preparation.profile.execution_home')='text'")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    if table(&db, "collector_bindings")? {
+        homes.extend(db.prepare("SELECT DISTINCT execution_home FROM collector_bindings WHERE execution_home IS NOT NULL")?.query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?);
+    }
+    let home = canonical(&home);
+    anyhow::ensure!(!homes.iter().any(|h| canonical(Path::new(h)) == home), "{REFUSED}: HOME is a worker execution home");
+    Ok(())
+}
+
+/// `accounting supersede`: the owner's accepted supersession reason for an
+/// ended attempt, written through the store's own transaction (§10).
+pub fn supersede(project: &Path, request: crate::store::SupersessionRequest) -> Result<Value> {
+    let path = project.join(".state/state.db");
+    anyhow::ensure!(path.is_file(), "no canonical store for this project");
+    refuse_worker_context(project)?;
+    let record = crate::store::SqliteStore::open(&path)?.record_attempt_supersession(&request, "operator:cli", now())?;
+    Ok(json!({"supersession": record}))
 }

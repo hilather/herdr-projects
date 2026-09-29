@@ -1305,6 +1305,62 @@ fn plant_fleet(project: &Path, class_of: &dyn Fn(&str, &str, &str) -> Option<Str
     db
 }
 
+/// Run `git` in `dir` with a fixed identity and reflog time `at` (ms).
+fn git_at(dir: &Path, home: &Path, at: i64, args: &[&str]) {
+    let date = format!("@{} +0000", at / 1000);
+    let out = Command::new("git").current_dir(dir).env_clear().env("HOME", home).env("PATH", "/usr/bin:/bin").env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "w").env("GIT_AUTHOR_EMAIL", "w@example.invalid").env("GIT_COMMITTER_NAME", "w").env("GIT_COMMITTER_EMAIL", "w@example.invalid")
+        .env("GIT_AUTHOR_DATE", &date).env("GIT_COMMITTER_DATE", &date).args(args).output().unwrap();
+    assert!(out.status.success() || args[0] == "merge", "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// Attempt worktrees of the fan-out fixture (`.state/worktrees/<attempt>/repo-00`)
+/// with worker-side history. a2 (integrated at 0:45) rebases onto its target
+/// at 0:10, resolves a conflicting merge at 0:20 and merges again at 0:50,
+/// after integrating. b2 (integrated at 1:30) merges its target cleanly at
+/// 1:10. b3 only commits. b4 has no worktree left.
+fn worker_worktrees(project: &Path, home: &Path) {
+    let commit = |dir: &Path, at: i64, file: &str, text: &str| {
+        fs::write(dir.join(file), text).unwrap();
+        git_at(dir, home, at, &["add", file]);
+        git_at(dir, home, at, &["commit", "-q", "-m", "a message that is never read"]);
+    };
+    let tree = |attempt: &str, at: i64| {
+        let dir = project.join(".state/worktrees").join(attempt).join("repo-00");
+        fs::create_dir_all(&dir).unwrap();
+        git_at(&dir, home, at, &["init", "-q", "-b", "main"]);
+        commit(&dir, at, "f", "base\n");
+        git_at(&dir, home, at, &["checkout", "-q", "-b", "work"]);
+        dir
+    };
+    let a2 = tree("a2", at(0, 1));
+    commit(&a2, at(0, 2), "w", "work\n");
+    git_at(&a2, home, at(0, 3), &["checkout", "-q", "main"]);
+    commit(&a2, at(0, 4), "m", "main\n");
+    git_at(&a2, home, at(0, 5), &["checkout", "-q", "work"]);
+    git_at(&a2, home, at(0, 10), &["rebase", "-q", "main"]);
+    commit(&a2, at(0, 11), "f", "worker\n");
+    git_at(&a2, home, at(0, 12), &["checkout", "-q", "main"]);
+    commit(&a2, at(0, 13), "f", "target\n");
+    git_at(&a2, home, at(0, 14), &["checkout", "-q", "work"]);
+    git_at(&a2, home, at(0, 15), &["merge", "-q", "main", "-m", "merge"]);
+    fs::write(a2.join("f"), "resolved\n").unwrap();
+    git_at(&a2, home, at(0, 20), &["add", "f"]);
+    git_at(&a2, home, at(0, 20), &["commit", "-q", "--no-edit"]);
+    git_at(&a2, home, at(0, 48), &["checkout", "-q", "main"]);
+    commit(&a2, at(0, 49), "n", "later\n");
+    git_at(&a2, home, at(0, 49), &["checkout", "-q", "work"]);
+    git_at(&a2, home, at(0, 50), &["merge", "-q", "--no-ff", "main", "-m", "merge"]);
+    let b2 = tree("b2", at(1, 1));
+    commit(&b2, at(1, 2), "w", "work\n");
+    git_at(&b2, home, at(1, 3), &["checkout", "-q", "main"]);
+    commit(&b2, at(1, 4), "m", "main\n");
+    git_at(&b2, home, at(1, 5), &["checkout", "-q", "work"]);
+    git_at(&b2, home, at(1, 10), &["merge", "-q", "--no-ff", "main", "-m", "merge"]);
+    let b3 = tree("b3", at(1, 1));
+    commit(&b3, at(1, 2), "w", "work\n");
+}
+
 /// Doc 10 §5a "Fan-out" and M36 on canonical rows planted as the golden
 /// report test does. Hour 0: a1–a4 run the whole hour (4 active agents), 2
 /// tasks accepted → 2/hour. Hour 1: b1–b8 (8 agents), 3 accepted → 3/hour.
@@ -1324,6 +1380,7 @@ fn fan_out_buckets_and_integration_conflicts() {
     let project = root.join("demo");
     fs::create_dir_all(&home).unwrap();
     let db = plant_fleet(&project, &|_, code, _| Some(code.to_owned()), &|_| "cfg".to_owned());
+    worker_worktrees(&project, &home);
     let cli_in = |slug: &str, args: &[&str]| -> String {
         let out = Command::new(BIN).env_clear().env("HOME", &home).env("PATH", "/usr/bin:/bin")
             .args(["--root", root.to_str().unwrap(), "telemetry", slug]).args(args).output().unwrap();
@@ -1360,11 +1417,18 @@ fn fan_out_buckets_and_integration_conflicts() {
         "events": {"merge_conflict": 2, "stale_base": 1},
         "by_target": {"refs/heads/main": ratio(2, 3), "refs/heads/release": ratio(1, 1)},
         "by_bucket": {"4": ratio(1, 1), "8": ratio(2, 3)},
-        "scope": "integrator_observed", "not_observed": ["worker_side_rebase"],
-        "event_rule": "blocked/merge_conflict or discarded/stale_base on an operation created no later than the attempt's first integrated operation"});
+        "scope": "integrator_observed",
+        "event_rule": "blocked/merge_conflict or discarded/stale_base on an operation created no later than the attempt's first integrated operation",
+        // Worker-observed, apart: a2 rebased and resolved a merge conflict before
+        // integrating (its merge after integration is not counted), b2 merged
+        // the target cleanly, b3 only committed; b4's worktree is gone.
+        "worker_observed": {"scope": "worker_observed", "numerator": 2, "denominator": 3, "value": "2/3",
+            "events": {"merge": 1, "merge_conflict_resolved": 1, "rebase": 1}, "coverage": {"observed": 3, "worktree_absent": 1},
+            "event_rule": "a rebase, merge, or resolved rebase/merge conflict in the attempt worktree's HEAD reflog, recorded no later than its first integrated operation; counts only, the reflog subject is never kept"}});
     assert_eq!(fleet["metrics"]["M36"], m36);
-    assert_eq!((&fleet["metrics"]["M34"]["value"], &fleet["metrics"]["M37"]["value"]),
-        (&json!({"status": "unavailable", "reason": "coordinator_usage_not_attributed"}), &json!({"status": "unavailable", "reason": "supersession_reason_not_recorded"})));
+    // Without a telemetry sidecar there is no cost: M34 and M37 are unavailable, never 0.
+    assert_eq!((&fleet["metrics"]["M34"]["value"], &fleet["metrics"]["M37"]["value"], &fleet["metrics"]["M37"]["records"]),
+        (&json!({"status": "unavailable", "reason": "collection_not_run"}), &json!({"status": "unavailable", "reason": "collection_not_run"}), &json!({})));
     // The report takes the lane's M34–M37 unchanged.
     let report = cli(&["report", "--json"]).0;
     for id in ["M34", "M35", "M36", "M37"] { assert_eq!(report["metrics"][id], fleet["metrics"][id], "{id}"); }
@@ -1372,7 +1436,7 @@ fn fan_out_buckets_and_integration_conflicts() {
     assert!(text.lines().any(|l| l == "bucket k=8 windows=1 accepted=3 per_hour=3 per_agent=3/8 m35=3/4 marginal=1/4"), "{text}");
     assert!(text.lines().any(|l| l == "M35 fan_out_efficiency 3/4 (comparable)"), "{text}");
     assert!(text.lines().any(|l| l == "M36 integration_conflict_rate 3/4"), "{text}");
-    assert!(text.lines().any(|l| l == "M34 coordinator_overhead n/a (coordinator_usage_not_attributed)"), "{text}");
+    assert!(text.lines().any(|l| l == "M34 coordinator_overhead n/a (collection_not_run)"), "{text}");
     // A window from hour 1: only the 8-agent level remains; b2–b4 reached integration in it.
     let since = at(1, 0).to_string();
     let windowed = cli(&["report", "--json", "--since", &since]).0;
@@ -1756,4 +1820,171 @@ fn shadow_budget_bridge_matches_doc05_goldens() {
          &json!({"status": "complete", "currency": "USD", "amount": "70"}), &json!("published_rate_estimate")));
     assert_eq!(m04["coverage"], json!({"entries": 2, "priced": 2, "unpriced": {}, "attempts": 2, "attempts_without_usage": {}}));
     assert!(f.text(&["report"]).lines().any(|l| l == "M04 cost_per_accepted_task 70/1"));
+
+/// Session id of the one record in `priced-before.jsonl` (1,000 input + 500 output, gpt-5.5).
+const PRICED_SID: &str = "00000000-0000-4000-8000-0000000b3001";
+
+/// Write `priced-before.jsonl` under `home` as session `sid` at `cwd`, its
+/// session and record time `ts`, reporting `model`.
+fn priced_rollout(home: &Path, name: &str, sid: &str, cwd: &str, ts: i64, model: &str) {
+    let dir = home.join(".codex/sessions/2026/09/28");
+    fs::create_dir_all(&dir).unwrap();
+    let text = fs::read_to_string(Path::new(ACCOUNTING).join("priced-before.jsonl")).unwrap();
+    let ts = jiff::Timestamp::from_millisecond(ts).unwrap().to_string();
+    fs::write(dir.join(format!("rollout-2026-09-28T00-00-00-{name}.jsonl")),
+        text.replace(PRICED_SID, sid).replace("@TS@", &ts).replace("@CWD@", cwd).replace("@VERSION@", "0.154.0").replace("\"gpt-5.5\"", &format!("\"{model}\""))).unwrap();
+}
+
+/// Collect, sync and reprice the fixture; returns `accounting fleet --json`,
+/// checking that the report shows the same M34 and M37.
+fn fleet_after_reprice(f: &Fixture) -> serde_json::Value {
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    f.cli_args(&["accounting", "reprice"]);
+    let fleet = f.cli_args(&["accounting", "fleet", "--json"]).0;
+    let report = f.report();
+    for id in ["M34", "M37"] { assert_eq!(report["metrics"][id], fleet["metrics"][id], "{id}"); }
+    fleet
+}
+
+/// Doc 10 §5a "Coordinator overhead" and doc 05 §5a, with invented synthetic
+/// rates (gpt-5.5: $2000 per 10^6 input, $4000 per 10^6 output, so each
+/// 1,000 + 500 record is exactly $4). Four worker sessions of the attempt
+/// ($16) and one coordinator session ($4: Codex at the project directory,
+/// bound to no attempt) → M34 = 4 / 20 = 1/5; the attempt ran 2 hours → $2 per
+/// active worker-thread-hour; rule v1 allocates the $4 to the only task
+/// running at its record time. A coordinator record without a rate makes M34
+/// partial; a second task running then splits the next allocation evenly
+/// ($2 each) and, having no observed usage, keeps the ratio partial.
+/// M37: the owner records that the cancelled attempt was superseded because a
+/// sibling changed the same area → $16 of $20 (4/5); before that it is
+/// unexplained abandonment in its own bucket. Workers cannot record reasons.
+#[test]
+fn coordinator_overhead_and_overlap_waste_from_accepted_reasons() {
+    let f = Fixture::new();
+    let other_home = f.home.parent().unwrap().join("other-home");
+    let state = f.project.join(".state/state.db");
+    let raw = rusqlite::Connection::open(&state).unwrap();
+    // Fixture only (no launch): the attempt ran for the two hours before its decision time.
+    for (mark, at) in [("running", f.decided - 7_200_000), ("completed", f.decided)] {
+        raw.execute("INSERT INTO attempt_lifecycle(attempt_id,state,attempt_revision,unix_ms,source) VALUES(?1,?2,1,?3,'fixture')",
+            rusqlite::params![f.attempt, mark, at]).unwrap();
+    }
+    for n in 1..=4 { priced_rollout(&f.home, &format!("w{n}"), &format!("00000000-0000-4000-8000-00000000f00{n}"), &f.worktree(), f.decided + n, "gpt-5.5"); }
+    let card = f.tmp.path().join("rates-fleet.json");
+    fs::write(&card, json!({"card_id": "synthetic-fleet", "version": 1, "provider": "synthetic", "product": "codex", "models": ["gpt-5.5"],
+        "currency": "USD", "rate_unit": 1_000_000, "effective_from_unix_ms": 0, "includes": {"discounts": false, "taxes": false, "fees": false},
+        "source": "INVENTED synthetic test rates (doc 10 §5a coordinator fixture); not a provider price",
+        "rates": [{"category": "input", "rate": "2000"}, {"category": "output", "rate": "4000"}]}).to_string()).unwrap();
+    f.cli("collect");
+    assert_eq!(f.cli_args(&["accounting", "import-rate-card", card.to_str().unwrap()]).0["imported"], true);
+
+    // No session in the coordinator scope: unknown, never 0.
+    let fleet = fleet_after_reprice(&f);
+    let m34 = &fleet["metrics"]["M34"];
+    assert_eq!((&m34["value"], &m34["scope"], &m34["allocation_rule"]),
+        (&json!({"status": "unavailable", "reason": "coordinator_usage_not_observed"}), &json!("coordinator-scope-v1"), &json!("coordinator-allocation-v1")));
+
+    // The coordinator: Codex at the project directory, from another scanned home, an hour into the run.
+    let coordinator_at = f.decided - 3_600_000;
+    priced_rollout(&other_home, "coordinator", "00000000-0000-4000-8000-00000000c001", &f.project.display().to_string(), coordinator_at, "gpt-5.5");
+    let fleet = fleet_after_reprice(&f);
+    let m34 = &fleet["metrics"]["M34"];
+    let usd = |amount: &str| json!({"status": "complete", "currency": "USD", "amount": amount});
+    assert_eq!(m34["value"], json!("1/5"), "coordinator $4 / (coordinator $4 + workers $16)");
+    assert_eq!(m34["coordinator"], json!({"sessions": 1, "estimate": usd("4"),
+        "coverage": {"entries": 1, "priced": 1, "unpriced": 0, "sessions_not_valued": 0, "attempts_without_observed_usage": 0}}));
+    assert_eq!((&m34["total_project_lifecycle_cost"]["estimate"], &m34["total_project_lifecycle_cost"]["worker_attempts"]), (&usd("20"), &json!(1)));
+    assert_eq!(m34["per_active_worker_thread_hour"], json!({"value": "2", "currency": "USD", "active_worker_thread_ms": 7_200_000, "open_censored": 0}));
+    assert_eq!(m34["allocation"], json!({"rule": "coordinator-allocation-v1", "rule_text": "each priced coordinator entry is split evenly across the tasks with an attempt running over its usage interval; none running: unallocated; an unknown activity span over it: allocation_unknown",
+        "coordinator_total": usd("4"), "unpriced_entries": 0, "currency": "USD", "by_task": {"work": "4"}, "unallocated": "0", "allocation_unknown": "0"}));
+    assert_eq!(m34["excluded_from"], json!(["M35", "per_arm_worker_figures"]));
+    assert!(f.text(&["accounting", "fleet"]).lines().any(|l| l == "M34 coordinator_overhead 1/5"));
+    // The coordinator's cost is in no attempt's estimate.
+    let cost = f.cli_args(&["accounting", "cost", "--json"]).0;
+    assert_eq!(cost["attempts"].as_array().unwrap().iter().find(|a| a["attempt_id"] == f.attempt.as_str()).unwrap()["estimate"], usd("16"));
+    // M37 before anything ended: the attempt is not superseded, 0 of $16.
+    let m37 = &fleet["metrics"]["M37"];
+    assert_eq!((&m37["value"], &m37["buckets"]["not_superseded"]), (&json!("0"), &json!({"attempts": 1, "estimate": usd("16")})));
+
+    // The owner cancels the attempt and runs the task again (a second attempt, $4).
+    f.readmit("codex");
+    let second: String = raw.query_row("SELECT id FROM attempts WHERE state='reserved'", [], |r| r.get(0)).unwrap();
+    let decided: i64 = raw.query_row("SELECT decided_unix_ms FROM dispatch_decisions WHERE attempt_id=?1", [&second], |r| r.get(0)).unwrap();
+    raw.execute("INSERT INTO collector_bindings(attempt_id,revision,state,collector,execution_home,unix_ms,source) VALUES(?1,1,'active','codex',?2,?3,'apply_launch_started')",
+        rusqlite::params![second, f.home.display().to_string(), decided]).unwrap();
+    priced_rollout(&f.home, "second", "00000000-0000-4000-8000-00000000f005", &format!("{}/.state/worktrees/{second}/repo-00", f.project.display()), decided + 1, "gpt-5.5");
+    let fleet = fleet_after_reprice(&f);
+    assert_eq!(fleet["metrics"]["M34"]["value"], json!("1/6"), "$4 / ($4 + $16 + $4)");
+    let m37 = &fleet["metrics"]["M37"];
+    assert_eq!((&m37["value"], &m37["buckets"]["unexplained_abandonment"], &m37["buckets"]["sibling_changed_same_area"]),
+        (&json!("0"), &json!({"attempts": 1, "estimate": usd("16")}), &json!({"attempts": 0, "estimate": {"status": "complete", "currency": null, "amount": "0"}})),
+        "a cancelled attempt without a reason is unexplained, never overlap waste");
+
+    // A sibling thread's attempt that changed the same area (planted: it has no usage and never ran here).
+    raw.execute_batch("INSERT INTO tasks(id,revision,state,title) VALUES('sibling',1,'succeeded','sibling');
+        INSERT INTO attempts(id,task_id,revision,state,reservation,termination_observed) VALUES('s1','sibling',2,'completed','s1',1);").unwrap();
+    let request = |attempt: &str, reason: &str, sibling: Option<&str>| herdr_projects::store::SupersessionRequest { attempt: attempt.into(), outcome: "superseded".into(),
+        reason: reason.into(), sibling: sibling.map(str::to_owned), evidence: vec!["attempt:s1".into(), "commit:0123abcd".into()] };
+    // Workers and imports are refused; so is a forged raw row and any edit.
+    let mut store = herdr_projects::store::SqliteStore::open(&state).unwrap();
+    for principal in ["worker:w1", f.attempt.as_str(), "import:report"] {
+        let err = format!("{:?}", store.record_attempt_supersession(&request(&f.attempt, "sibling_changed_same_area", Some("s1")), principal, 1).unwrap_err());
+        assert!(err.contains("cannot record a supersession reason"), "{principal}: {err}");
+    }
+    assert!(raw.execute("INSERT INTO attempt_supersessions(attempt_id,task_id,outcome,reason,sibling_attempt_id,evidence,principal,authority,canonical_json,recorded_unix_ms)
+        VALUES(?1,'work','superseded','sibling_changed_same_area','s1','[\"attempt:s1\"]','worker:w1','operator_owner.v1','{}',1)", [&f.attempt]).is_err());
+    let err = format!("{:?}", store.record_attempt_supersession(&request(&second, "duplicate_effort", Some("s1")), "operator:cli", 1).unwrap_err());
+    assert!(err.contains("only an ended attempt"), "{err}");
+    drop(store);
+    // On the CLI a worker execution context is refused before any write.
+    let out = Command::new(BIN).env_clear().env("HOME", &f.home).env("PATH", "/usr/bin:/bin")
+        .args(["--root", f.root.to_str().unwrap(), "telemetry", "demo", "accounting", "supersede", &f.attempt, "--outcome", "superseded",
+            "--reason", "sibling_changed_same_area", "--sibling", "s1", "--evidence", "attempt:s1"]).output().unwrap();
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("HOME is a worker execution home"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(f.cli_fail(&["accounting", "supersede", &f.attempt, "--outcome", "superseded", "--reason", "sibling_changed_same_area", "--evidence", "attempt:s1"])
+        .contains("names the sibling attempt"));
+    assert!(f.cli_fail(&["accounting", "supersede", &f.attempt, "--outcome", "superseded", "--reason", "other", "--evidence", "see the chat"])
+        .contains("is not a reference"));
+    let args = ["accounting", "supersede", &f.attempt, "--outcome", "superseded", "--reason", "sibling_changed_same_area", "--sibling", "s1",
+        "--evidence", "commit:0123abcd", "--evidence", "attempt:s1"];
+    let (recorded, _) = f.cli_args(&args);
+    assert_eq!(recorded["supersession"], json!({"attempt_id": f.attempt, "task_id": "work", "outcome": "superseded", "reason": "sibling_changed_same_area",
+        "sibling_attempt_id": "s1", "evidence": ["attempt:s1", "commit:0123abcd"], "principal": "operator:cli", "authority": "operator_owner.v1",
+        "recorded_unix_ms": recorded["supersession"]["recorded_unix_ms"], "recorded": true}));
+    assert_eq!(f.cli_args(&args).0["supersession"]["recorded"], false, "the same reason again is a no-op");
+    assert!(f.cli_fail(&["accounting", "supersede", &f.attempt, "--outcome", "abandoned", "--reason", "other", "--evidence", "attempt:s1"]).contains("append-only"));
+    assert!(raw.execute("UPDATE attempt_supersessions SET reason='other'", []).is_err());
+
+    let fleet = f.cli_args(&["accounting", "fleet", "--json"]).0;
+    let m37 = &fleet["metrics"]["M37"];
+    assert_eq!(m37["value"], json!("4/5"), "$16 superseded by a sibling's change of the same area / $20 lifecycle cost");
+    assert_eq!((&m37["records"], &m37["buckets"]["sibling_changed_same_area"], &m37["buckets"]["unexplained_abandonment"]["attempts"], &m37["buckets"]["not_superseded"]),
+        (&json!({"sibling_changed_same_area": 1}), &json!({"attempts": 1, "estimate": usd("16")}), &json!(0), &json!({"attempts": 1, "estimate": usd("4")})));
+    assert_eq!(m37["total_lifecycle_cost"]["estimate"], usd("20"));
+    assert_eq!(f.report()["metrics"]["M37"], m37.clone());
+
+    // A coordinator record without a rate (gpt-5.5-mini): unknown coordinator usage makes M34 partial.
+    priced_rollout(&other_home, "coordinator-mini", "00000000-0000-4000-8000-00000000c002", &f.project.display().to_string(), coordinator_at, "gpt-5.5-mini");
+    let fleet = fleet_after_reprice(&f);
+    let m34 = &fleet["metrics"]["M34"];
+    assert_eq!(m34["value"], json!({"status": "partial", "reasons": ["coordinator_entries_unpriced"], "priced_share": "1/6"}));
+    assert_eq!(m34["coordinator"]["estimate"], json!({"status": "partial", "gaps": ["entries_unpriced"], "currency": "USD", "priced_amount": "4"}));
+    assert_eq!(m34["per_active_worker_thread_hour"]["value"], json!({"status": "partial", "gaps": ["entries_unpriced"], "priced_value": "2"}));
+    assert!(f.text(&["accounting", "fleet"]).lines().any(|l| l == "M34 coordinator_overhead partial 1/6 (coordinator_entries_unpriced)"));
+
+    // Doc 05 §5a: a second task running over the coordinator's record → $2 to each task under
+    // rule v1, the $4 total still shown; 4 worker-thread-hours → $1 per hour. Its usage was
+    // not observed, so the ratios stay partial.
+    raw.execute_batch(&format!("INSERT INTO tasks(id,revision,state,title) VALUES('other',1,'running','other');
+        INSERT INTO attempts(id,task_id,revision,state,reservation,termination_observed) VALUES('o1','other',2,'completed','o1',1);
+        INSERT INTO attempt_lifecycle(attempt_id,state,attempt_revision,unix_ms,source) VALUES('o1','reserved',2,{r},'fixture'),('o1','running',2,{r},'fixture'),('o1','completed',2,{c},'fixture');",
+        r = f.decided - 7_200_000, c = f.decided)).unwrap();
+    let fleet = f.cli_args(&["accounting", "fleet", "--json"]).0;
+    let m34 = &fleet["metrics"]["M34"];
+    assert_eq!((&m34["allocation"]["by_task"], &m34["allocation"]["unallocated"], &m34["allocation"]["coordinator_total"]["priced_amount"]),
+        (&json!({"other": "2", "work": "2"}), &json!("0"), &json!("4")));
+    assert_eq!((&m34["per_active_worker_thread_hour"]["value"]["priced_value"], &m34["per_active_worker_thread_hour"]["active_worker_thread_ms"]), (&json!("1"), &json!(14_400_000)));
+    assert_eq!(m34["value"], json!({"status": "partial", "reasons": ["coordinator_entries_unpriced", "worker_usage_not_observed"], "priced_share": "1/6"}));
+    assert_eq!(fleet["metrics"]["M37"]["value"], json!({"status": "partial", "reasons": ["usage_not_observed"], "priced_share": "4/5"}));
 }

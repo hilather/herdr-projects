@@ -207,10 +207,17 @@ merges one PR at a time.
   unavailable until Codex records an execution's real start and end. A live
   run should certify exec statuses other than `completed`, and
   `function_call.status`.
-- **B6a follow-ups** (lane B/steward): M34 needs a coordinator usage scope
-  and a versioned allocation rule; M37 needs an accepted-supersession-reason
-  producer; M36 does not see rebases a worker does in its own worktree. Also:
-  feed the F4.6/F5.4 scale-trial steps in as named concurrency levels.
+- **B6a follow-ups** (lane B/steward): **done (S3):** M34 prices the
+  `coordinator-scope-v1` sessions (Codex at the project directory, bound to
+  no attempt) against the project's lifecycle cost, per active
+  worker-thread-hour, allocated by `coordinator-allocation-v1` (even split
+  across running tasks); M37 has its producer, the owner's accepted
+  supersession reason (canonical 0060, `accounting supersede`, workers
+  refused); M36 adds a `worker_observed` scope from attempt worktree reflogs
+  (counts only) beside the integrator's (contracts-accounting.md §10). Still
+  open: feed the F4.6/F5.4 scale-trial steps in as named concurrency levels;
+  a declared coordinator execution home and a Claude coordinator adapter;
+  supersession-reason corrections; a turn-reference allocation rule v2.
   **Done (B10):** per-configuration fan-out and a configurable window
   (`--window-minutes`, default 60).
 - **D6 follow-ups** (lane D/steward): **done (integration holds):** a

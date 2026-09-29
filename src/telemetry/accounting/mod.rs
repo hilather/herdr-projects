@@ -147,6 +147,24 @@ pub enum Command {
         #[arg(long, default_value_t = fleet::DEFAULT_WINDOW_MINUTES)]
         window_minutes: i64,
     },
+    /// Record the project owner's accepted reason why an ended attempt was superseded
+    /// or abandoned (M37). Append-only, once per attempt; writes only `state.db`.
+    Supersede {
+        attempt: String,
+        /// `superseded` or `abandoned`.
+        #[arg(long)]
+        outcome: String,
+        /// `sibling_changed_same_area`, `duplicate_effort` or `other`.
+        #[arg(long)]
+        reason: String,
+        /// The sibling attempt (required unless the reason is `other`).
+        #[arg(long)]
+        sibling: Option<String>,
+        /// Evidence reference `<kind>:<id>` (attempt, task, submission, verified_result,
+        /// integration_operation, commit, candidate_group), once per reference (1-16).
+        #[arg(long = "evidence", required = true)]
+        evidence: Vec<String>,
+    },
 }
 
 fn unavailable(reason: &str) -> Value {
@@ -243,6 +261,8 @@ pub fn run(project: &Path, command: Command) -> Result<String> {
             if !json { return Ok(fleet::text(&value)); }
             value
         }
+        Command::Supersede { attempt, outcome, reason, sibling, evidence } =>
+            fleet::supersede(project, crate::store::SupersessionRequest { attempt, outcome, reason, sibling, evidence })?,
     };
     Ok(serde_json::to_string_pretty(&value)? + "\n")
 }

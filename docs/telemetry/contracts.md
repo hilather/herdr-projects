@@ -36,7 +36,7 @@ needs a new reviewed revision, not a silent reinterpretation.
   (RFC 8785 subset, as doc 03 §4). Digests are `sha256:` + lowercase hex.
 - **Time.** Unix milliseconds from the controller's `now` at the transition.
   Codex times are kept as reported and never reorder canonical events.
-- **Stores.** Canonical: `<project>/.state/state.db`, migrations 0049–0059 (0052 collector bindings, contracts-collection.md; 0053 candidate groups, contracts-quality.md §3; 0054 review capture, contracts-review.md; 0055 finding triage and duplicate history, contracts-review.md §5; 0056 fix attribution, regressions and role credit, contracts-review.md §6; 0057 review protocols, passes and preregistered experiments, contracts-review.md §7; 0058 seeded defects, recall and the seeded-candidate integration guard, contracts-review.md §8; 0059 review ledger, contracts-review.md §9).
+- **Stores.** Canonical: `<project>/.state/state.db`, migrations 0049–0060 (0052 collector bindings, contracts-collection.md; 0053 candidate groups, contracts-quality.md §3; 0054 review capture, contracts-review.md; 0055 finding triage and duplicate history, contracts-review.md §5; 0056 fix attribution, regressions and role credit, contracts-review.md §6; 0057 review protocols, passes and preregistered experiments, contracts-review.md §7; 0058 seeded defects, recall and the seeded-candidate integration guard, contracts-review.md §8; 0059 review ledger, contracts-review.md §9; 0060 accepted supersession reasons, contracts-accounting.md §10).
   Sidecar: `<project>/.state/telemetry.db`, own sequence under
   `migrations/telemetry/` (per-lane streams; see the lane contracts: e.g.
   `ingest` 0006 tool/exec metadata, 0007 subagent detail, per-source ingest
@@ -555,4 +555,6 @@ versioned review protocols, second-review passes with incremental yield
 (M28, descriptive), preregistered randomized/matched review experiments
 with exclusions and crossover, the seeded-defect registry, clean controls,
 reveal/discard lifecycle, the seeded-candidate integration guard and
-M43/M44 (contracts-review.md §5–§8).
+M43/M44 (contracts-review.md §5–§8), fleet efficiency M34–M37 with the
+coordinator scope and allocation rule v1, owner-recorded supersession
+reasons (0060) and worker-observed rebases (contracts-accounting.md §10).
