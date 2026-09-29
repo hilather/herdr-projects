@@ -91,6 +91,14 @@ impl Ledger {
         quarantine(db, &self.source, sequence, "line_oversized", bytes, None, None, None, now)
     }
 
+    /// A complete line that yields no observation because it does not parse:
+    /// `line_malformed` (not a JSON object with a string `type`) or
+    /// `record_malformed` (a read kind whose typed fields do not parse).
+    /// Nothing of the line is kept.
+    pub fn malformed(&self, db: &Connection, sequence: u64, reason: &'static str, bytes: u64, now: i64) -> Result<()> {
+        quarantine(db, &self.source, sequence, reason, bytes, None, None, None, now)
+    }
+
     /// Advance the cursor to `offset`; gaps inside the range read this pass are recovered.
     pub fn finish(&self, db: &Connection, producer: Option<&str>, offset: u64, now: i64) -> Result<()> {
         db.execute("INSERT INTO source_cursors(source,producer_id,byte_offset,observations,updated_unix_ms)

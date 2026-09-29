@@ -199,6 +199,15 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Every line must be a JSON object with a string `type`; anything else is
+/// quarantined `line_malformed` (contracts-collection.md A3).
+#[derive(Deserialize)]
+struct LineTag {
+    #[serde(rename = "type")]
+    kind: String,
+}
+/// Top-level kinds the adapter reads (contracts §5); others are ignored unread.
+const KINDS: [&str; 4] = ["session_meta", "turn_context", "token_usage_record", "event_msg"];
 #[derive(Deserialize)]
 struct Tag {
     #[serde(rename = "type")]
@@ -371,11 +380,26 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
             continue;
         }
         read += n;
-        let Ok(tag) = serde_json::from_slice::<Tag>(&line) else { cursor.offset += n; continue };
-        let first_meta = cursor.session.is_none();
         let at = cursor.offset;
         cursor.offset += n;
-        record(&tx, &tag, &line, &key, home, worktrees, &mut cursor, now, done)?;
+        // Not an object with a string `type` (corrupt, truncated mid-file, blank): quarantined.
+        let object = line.trim_ascii_start().starts_with(b"{");
+        let Some(LineTag { kind }) = serde_json::from_slice::<LineTag>(&line).ok().filter(|_| object) else {
+            ledger.malformed(&tx, at, "line_malformed", n, now)?;
+            continue;
+        };
+        // Unknown kinds are skipped by type tag without reading further.
+        if !KINDS.contains(&kind.as_str()) { continue; }
+        let first_meta = cursor.session.is_none();
+        // A read kind whose typed fields do not parse yields no rows and no envelope.
+        let Ok(tag) = serde_json::from_slice::<Tag>(&line) else {
+            ledger.malformed(&tx, at, "record_malformed", n, now)?;
+            continue;
+        };
+        if !record(&tx, &tag, &line, &key, home, worktrees, &mut cursor, now, done)? {
+            ledger.malformed(&tx, at, "record_malformed", n, now)?;
+            continue;
+        }
         let kind = match (tag.kind.as_deref(), tag.payload.as_ref().and_then(|p| p.kind.as_deref())) {
             (Some("event_msg"), inner) => inner,
             (Some("session_meta"), _) if !first_meta => None,
@@ -403,12 +427,15 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
     Ok(pulled)
 }
 
+/// Store one read record. `false`: its kind is read but its typed fields do not
+/// parse (the caller quarantines it `record_malformed`); a malformed
+/// `turn_context` also makes the model and effort of later records unknown.
 #[allow(clippy::too_many_arguments)]
-fn record(tx: &Transaction, tag: &Tag, line: &[u8], key: &str, home: &str, worktrees: &str, cursor: &mut Cursor, now: i64, done: &mut Collected) -> Result<()> {
+fn record(tx: &Transaction, tag: &Tag, line: &[u8], key: &str, home: &str, worktrees: &str, cursor: &mut Cursor, now: i64, done: &mut Collected) -> Result<bool> {
     let inner = tag.payload.as_ref().and_then(|p| p.kind.as_deref());
     match (tag.kind.as_deref(), inner) {
         (Some("session_meta"), _) if cursor.session.is_none() => {
-            let Ok(Envelope { payload: meta }) = serde_json::from_slice::<Envelope<SessionMeta>>(line) else { return Ok(()) };
+            let Ok(Envelope { payload: meta }) = serde_json::from_slice::<Envelope<SessionMeta>>(line) else { return Ok(false) };
             let source = match meta.source {
                 Some(Value::String(s)) => Some(s),
                 Some(Value::Object(map)) => map.keys().next().cloned(),
@@ -421,14 +448,16 @@ fn record(tx: &Transaction, tag: &Tag, line: &[u8], key: &str, home: &str, workt
             cursor.session = Some((meta.id, meta.cli_version, at));
         }
         (Some("turn_context"), _) => {
-            if let Ok(Envelope { payload }) = serde_json::from_slice::<Envelope<TurnContext>>(line) {
-                (cursor.model, cursor.effort) = (payload.model, payload.effort);
-            }
+            let Ok(Envelope { payload }) = serde_json::from_slice::<Envelope<TurnContext>>(line) else {
+                (cursor.model, cursor.effort) = (None, None);
+                return Ok(false);
+            };
+            (cursor.model, cursor.effort) = (payload.model, payload.effort);
         }
         (Some("token_usage_record"), _) => {
-            let Ok(Envelope { payload: record }) = serde_json::from_slice::<Envelope<UsageRecord>>(line) else { return Ok(()) };
+            let Ok(Envelope { payload: record }) = serde_json::from_slice::<Envelope<UsageRecord>>(line) else { return Ok(false) };
             cursor.records += 1;
-            let Some((session, version, _)) = &cursor.session else { return Ok(()) };
+            let Some((session, version, _)) = &cursor.session else { return Ok(true) };
             let payload = json!({"response_id": record.response_id, "turn_id": record.turn_id, "model": cursor.model, "effort": cursor.effort, "usage": record.usage.json()});
             let payload_digest = digest(payload.to_string().as_bytes());
             let first: Option<(String, Option<String>)> = tx.query_row("SELECT payload_digest,reason FROM codex_usage WHERE session_id=?1 AND ordinal=?2",
@@ -461,8 +490,8 @@ fn record(tx: &Transaction, tag: &Tag, line: &[u8], key: &str, home: &str, workt
             }
         }
         (Some("event_msg"), Some("token_count")) => {
-            let Ok(Envelope { payload }) = serde_json::from_slice::<Envelope<TokenCount>>(line) else { return Ok(()) };
-            let Some((session, version, at)) = &cursor.session else { return Ok(()) };
+            let Ok(Envelope { payload }) = serde_json::from_slice::<Envelope<TokenCount>>(line) else { return Ok(false) };
+            let Some((session, version, at)) = &cursor.session else { return Ok(true) };
             if let Some(total) = payload.info.and_then(|i| i.total_token_usage).filter(|_| certified(version)) {
                 tx.execute("UPDATE rollout_sources SET token_count_usage=?2 WHERE path_digest=?1", params![key, total.json().to_string()])?;
             }
@@ -475,7 +504,7 @@ fn record(tx: &Transaction, tag: &Tag, line: &[u8], key: &str, home: &str, workt
             }
         }
         (Some("event_msg"), Some("task_complete")) => {
-            let Ok(Envelope { payload }) = serde_json::from_slice::<Envelope<TaskComplete>>(line) else { return Ok(()) };
+            let Ok(Envelope { payload }) = serde_json::from_slice::<Envelope<TaskComplete>>(line) else { return Ok(false) };
             if let (Some((session, ..)), Some(turn)) = (&cursor.session, payload.turn_id) {
                 tx.execute("INSERT OR IGNORE INTO codex_turns(session_id,turn_id,model,effort,duration_ms,time_to_first_token_ms) VALUES(?1,?2,?3,?4,?5,?6)",
                     params![session, turn, cursor.model, cursor.effort, payload.duration_ms, payload.time_to_first_token_ms])?;
@@ -483,7 +512,7 @@ fn record(tx: &Transaction, tag: &Tag, line: &[u8], key: &str, home: &str, workt
         }
         _ => {}
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Contracts §5 validation: `invariant_violation` before
