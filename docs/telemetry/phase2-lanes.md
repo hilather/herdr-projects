@@ -148,9 +148,9 @@ merges one PR at a time.
   recorded seed. **Min-sample registry** (TM4.1): replaces the constant 10.
   **Shared `arm_outcome` helper** (steward re-export). **Judge
   configuration id**. **Runner-up order for operator and judge selections**.
-- **Envelope counters of uncertified versions** (lane A): decide whether
+- **Done (A7):** **Envelope counters of uncertified versions** (lane A): decide whether
   `source_observations` should null them out before any reader appears.
-- **Lost final events** (lane A): record coverage for a rollout that is idle
+- **Done (A7):** **Lost final events** (lane A): record coverage for a rollout that is idle
   without `task_complete`.
 - **Herdr client in the lib** (steward): `src/herdr.rs` is binary-only.
   B6b re-runs `agent list` through the lib runner.

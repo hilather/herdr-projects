@@ -13,7 +13,8 @@ pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/in
     include_str!("../../../migrations/telemetry/ingest/0003_malformed_quarantine.sql"),
     include_str!("../../../migrations/telemetry/ingest/0004_codex_metadata.sql"),
     include_str!("../../../migrations/telemetry/ingest/0005_codex_threads.sql"),
-    include_str!("../../../migrations/telemetry/ingest/0006_codex_tool_metadata.sql")];
+    include_str!("../../../migrations/telemetry/ingest/0006_codex_tool_metadata.sql"),
+    include_str!("../../../migrations/telemetry/ingest/0007_codex_followups.sql")];
 
 /// `herdr-projects telemetry <slug> collectors ...`
 #[derive(clap::Subcommand)]
@@ -24,7 +25,9 @@ pub enum Command {
     Bindings,
     /// Per rollout: the A4 session metadata (model provider, fork and subagent
     /// parent ids), the A5 thread lineage (parent thread id, reported session
-    /// id, thread source) and the span of its usage record times. Read-only.
+    /// id, thread source), the span of its usage record times, and (A7) the
+    /// subagent detail and whether its last turn's final event was read,
+    /// is still open or is missing. Read-only.
     Sessions,
     /// Per session: the A6 tool call metadata (call id, tool name, status,
     /// turn, call and output times) and exec items (id, status, source, exit
@@ -118,6 +121,8 @@ fn codex_fields() -> Vec<Field> {
         field("session_meta", "model_provider", Live, None),
         field("session_meta", "forked_from_id", Fixture, Some("semantics_not_certified")),
         field("session_meta", "subagent_kind", Live, Some("from_source_subagent")),
+        // A7: the `other` variant's tag; the A4 live run saw only `guardian`.
+        field("session_meta", "subagent_detail", Live, Some("observed_guardian_only")),
         field("session_meta", "subagent_parent_thread_id", Fixture, Some("from_source_subagent")),
         field("session_meta", "subagent_depth", Fixture, Some("from_source_subagent")),
         // A5: the thread lineage outside `source`, live in the A4 run. Only the
@@ -296,16 +301,21 @@ fn bindings(project: &Path) -> Result<Value> {
 }
 
 /// `collectors sessions`: per rollout source, its A4 metadata, A5 thread
-/// lineage and usage record times. A field is `unavailable` with
-/// `predates_collection` when the sidecar has no table for it (ingest stream <
-/// 4, or < 5 for `thread`, read without migrating), and with `pending_reread`
-/// while a rollout read before it waits to be read again. `null` is a value
-/// the rollout did not report; `thread.session_id` is also `null` when it
-/// equals `session_id`. Read-only.
+/// lineage, usage record times and A7 subagent detail and final event. A
+/// field is `unavailable` with `predates_collection` when the sidecar has no
+/// table for it (ingest stream < 4, < 5 for `thread`, < 7 for
+/// `subagent.detail` and `final_event`, read without migrating), and with
+/// `pending_reread` while a rollout read before it waits to be read again.
+/// `null` is a value the rollout did not report; `thread.session_id` is also
+/// `null` when it equals `session_id`. `final_event.state`: `no_turn`,
+/// `complete` (the last turn's `task_complete` was read), `open` (not yet), or
+/// `missing` (a pending `final_event_missing` coverage gap: idle past the
+/// threshold without it). Read-only.
 fn sessions(project: &Path) -> Result<Value> {
     let Some(db) = super::sidecar::read(project)? else { return Ok(json!({"sessions": unavailable("collection_not_run")})) };
     let a4 = exists(&db, "rollout_metadata")?;
     let a5 = exists(&db, "rollout_threads")?;
+    let a7 = exists(&db, "rollout_ingest_state")?;
     let columns = if a4 {
         "m.model_provider,m.forked_from_id,m.subagent_kind,m.subagent_parent_thread_id,m.subagent_depth,
         (SELECT count(t.record_unix_ms) FROM codex_usage u JOIN codex_usage_times t USING(session_id,ordinal) WHERE u.path_digest=s.path_digest),
@@ -316,19 +326,36 @@ fn sessions(project: &Path) -> Result<Value> {
     let (threads, join) = if a5 { ("l.parent_thread_id,l.session_id,l.thread_source,l.path_digest IS NOT NULL", "LEFT JOIN rollout_threads l ON l.path_digest=s.path_digest") }
         else { ("NULL,NULL,NULL,0", "") };
     let join = if a4 { format!("LEFT JOIN rollout_metadata m ON m.path_digest=s.path_digest {join}") } else { join.to_owned() };
+    let (followups, join) = if a7 {
+        ("d.subagent_detail,d.path_digest IS NOT NULL,x.last_turn_offset,x.last_turn_id,x.last_turn_completed,x.path_digest IS NOT NULL,
+        EXISTS(SELECT 1 FROM coverage_gaps g WHERE g.source=s.path_digest AND g.start_offset=x.last_turn_offset AND g.reason='final_event_missing' AND g.recovery='pending')",
+            format!("{join} LEFT JOIN rollout_subagents d ON d.path_digest=s.path_digest LEFT JOIN rollout_ingest_state x ON x.path_digest=s.path_digest"))
+    } else { ("NULL,0,NULL,NULL,0,0,0", join) };
     let mut stmt = db.prepare(&format!("SELECT s.session_id,s.path_digest,s.binding,s.attempt_id,s.records,
-        (SELECT count(*) FROM codex_usage u WHERE u.path_digest=s.path_digest),{columns},{threads} FROM rollout_sources s {join} ORDER BY s.session_id,s.path_digest"))?;
+        (SELECT count(*) FROM codex_usage u WHERE u.path_digest=s.path_digest),{columns},{threads},{followups} FROM rollout_sources s {join}
+        ORDER BY s.session_id,s.path_digest"))?;
     let rows = stmt.query_map([], |r| {
-        let pending = |table: bool, read: usize| Ok::<_, rusqlite::Error>(match (table, r.get::<_, bool>(read)?) {
+        let waiting = |table: bool, read: usize| Ok::<_, rusqlite::Error>(match (table, r.get::<_, bool>(read)?) {
             (false, _) => Some("predates_collection"), (true, false) => Some("pending_reread"), _ => None });
-        let (pending, thread_pending) = (pending(a4, 14)?, pending(a5, 18)?);
+        let (pending, thread_pending) = (waiting(a4, 14)?, waiting(a5, 18)?);
+        let (detail_pending, final_pending) = (waiting(a7, 20)?, waiting(a7, 24)?);
         let known = |value: Value| pending.map_or(value, unavailable);
+        let detail = detail_pending.map_or(json!(r.get::<_, Option<String>>(19)?), unavailable);
+        let final_event = match final_pending {
+            Some(reason) => unavailable(reason),
+            None => {
+                let (opened, turn, completed, missing): (Option<i64>, Option<String>, bool, bool) = (r.get(21)?, r.get(22)?, r.get(23)?, r.get(25)?);
+                let state = match (opened, completed, missing) { (None, ..) => "no_turn", (_, true, _) => "complete", (_, _, true) => "missing", _ => "open" };
+                json!({"state": state, "turn_id": turn})
+            }
+        };
         let text = |i: usize| r.get::<_, Option<String>>(i).map(|v| known(json!(v)));
         let thread = json!({"parent_thread_id": r.get::<_, Option<String>>(15)?, "session_id": r.get::<_, Option<String>>(16)?,
             "source": r.get::<_, Option<String>>(17)?});
         Ok(json!({"session_id": r.get::<_, String>(0)?, "path_digest": r.get::<_, String>(1)?, "binding": r.get::<_, String>(2)?,
             "attempt_id": r.get::<_, Option<String>>(3)?, "records": r.get::<_, i64>(4)?, "model_provider": text(6)?, "forked_from_id": text(7)?,
-            "subagent": known(json!({"kind": r.get::<_, Option<String>>(8)?, "parent_thread_id": r.get::<_, Option<String>>(9)?, "depth": r.get::<_, Option<i64>>(10)?})),
+            "subagent": known(json!({"kind": r.get::<_, Option<String>>(8)?, "detail": detail, "parent_thread_id": r.get::<_, Option<String>>(9)?,
+                "depth": r.get::<_, Option<i64>>(10)?})), "final_event": final_event,
             "thread": thread_pending.map_or(thread, unavailable),
             "record_times": known(json!({"stored": r.get::<_, i64>(5)?, "timed": r.get::<_, i64>(11)?, "first_unix_ms": r.get::<_, Option<i64>>(12)?,
                 "last_unix_ms": r.get::<_, Option<i64>>(13)?}))}))

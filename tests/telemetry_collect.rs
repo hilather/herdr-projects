@@ -1,7 +1,8 @@
 //! Lane A ingest ledger end to end (docs/telemetry/contracts-collection.md,
 //! card A2): Codex rollouts collected on the CLI into sanitized source
 //! envelopes, replayed after a killed collect, with oversized lines quarantined
-//! and an unwritable sidecar recorded as a coverage gap.
+//! and an unwritable sidecar recorded as a coverage gap. A7: a rollout idle
+//! without its last turn's final event is a coverage gap until the event comes.
 
 #![cfg(all(feature = "state-store", target_os = "linux"))]
 #![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
@@ -36,7 +37,7 @@ fn ledger(f: &Fixture) -> Vec<String> {
     let mut out = Vec::new();
     for table in ["source_observations", "ingest_quarantine", "coverage_gaps", "source_cursors", "codex_usage", "codex_turns", "codex_rate_limits",
         "codex_quarantine", "codex_discrepancy", "collect_offsets", "rollout_sources", "rollout_metadata", "codex_usage_times", "codex_rate_limit_windows",
-        "rollout_threads"] {
+        "rollout_threads", "rollout_subagents", "rollout_ingest_state"] {
         let mut stmt = db.prepare(&format!("SELECT * FROM {table} ORDER BY 1,2")).unwrap();
         let names: Vec<String> = stmt.column_names().into_iter().map(str::to_owned).collect();
         let rows = stmt.query_map([], |r| Ok(names.iter().enumerate().filter(|(_, n)| !matches!(n.as_str(), "observed_unix_ms" | "updated_unix_ms"))
@@ -108,8 +109,9 @@ fn envelopes_replay_identically_after_interrupted_collect() {
         FROM source_observations WHERE producer_epoch=?1 AND producer_sequence=?2", rusqlite::params![source, starts[line - 1] as i64],
         |r| Ok((0..8).map(|i| r.get::<_, String>(i)).collect::<rusqlite::Result<Vec<_>>>()?)).unwrap();
     let provenance = r#"{"adapter":"codex","adapter_version":"0.154.0","interface":"rollout_jsonl","source_trust":"collector_observed"}"#;
-    // `token_count` widened its allowlist in A4: normalization version 2.
-    let measurement = |version: i64| format!(r#"{{"coverage":"complete","measurement_basis":"reported","normalization_version":{version}}}"#);
+    // `token_count` widened its allowlist in A4: normalization version 2. A7:
+    // `certified` says whether the adapter version was certified when read.
+    let measurement = |version: i64| format!(r#"{{"certified":true,"coverage":"complete","measurement_basis":"reported","normalization_version":{version}}}"#);
     let identity = format!(r#"{{"session_id":"{sid}"}}"#);
     for (line, kind, version, payload_digest) in [(5, "codex.token_usage_record.v1", 1, USAGE_DIGEST), (6, "codex.token_count.v1", 2, TOKEN_COUNT_DIGEST)] {
         assert_eq!(envelope(line), [format!("codex:{source}:{}", starts[line - 1]), format!("codex:{sid}"), source.clone(), kind.into(),
@@ -192,4 +194,75 @@ fn unwritable_sidecar_records_coverage_gap() {
     f.cli("collect");
     assert_eq!(gaps(&f), [(digest(&path), 0, end, "predates_ingest".to_owned(), "pending".to_owned())]);
     assert_eq!((f.count("codex_usage"), f.count("source_observations")), (2 + REPEATS as i64, 4));
+}
+
+/// Make `path` look unmodified for `secs` seconds.
+fn age(path: &Path, secs: u64) {
+    fs::File::options().write(true).open(path).unwrap().set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(secs)).unwrap();
+}
+
+/// A7 lost final event: a rollout read to its end whose last turn (opened by
+/// its `turn_context`) has no `task_complete` is `open` while it was modified
+/// within the idle threshold (600 s, twice the ticker pass), and a pending
+/// `final_event_missing` coverage gap from the turn's first line to the file's
+/// end once it has been idle longer, including when first read idle. Only the
+/// file's size and modification time decide, so a later write (here a partial
+/// line) widens the gap only once the file is idle again. The event arriving
+/// recovers the gap. Usage is unchanged throughout.
+#[test]
+fn idle_rollout_without_final_event_records_a_coverage_gap() {
+    let f = Fixture::new();
+    let path = f.rollout(&f.home, SID, &["head.jsonl"], &f.worktree(), f.decided + 1_000, "0.154.0");
+    let turn = fs::metadata(&path).unwrap().len() as i64;
+    // `tail.jsonl` without its last line, `task_complete` of turn-2.
+    let lines: Vec<String> = tail(&f, 1).replace("@SID@", SID).lines().map(|l| format!("{l}\n")).collect();
+    append(&path, &lines[..4].concat());
+    let end = fs::metadata(&path).unwrap().len() as i64;
+    let gaps = |f: &Fixture| f.sidecar().prepare("SELECT source,start_offset,end_offset,reason,recovery FROM coverage_gaps").unwrap()
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?))).unwrap()
+        .map(Result::unwrap).collect::<Vec<_>>();
+    let gap = |end: i64, recovery: &str| (digest(&path), turn, end, "final_event_missing".to_owned(), recovery.to_owned());
+    let final_event = |f: &Fixture| f.cli_args(&["collectors", "sessions"]).0["sessions"][0]["final_event"].clone();
+    // 1000 + 500 input, 1120 + 560 total: turn-2's usage record counts, missing event or not.
+    let usage = serde_json::json!({"input_tokens": 1500, "cached_input_tokens": 500, "cache_write_input_tokens": 0, "output_tokens": 180,
+        "reasoning_output_tokens": 100, "total_tokens": 1680, "records": 2});
+
+    // Just written: in progress.
+    let (report, _) = f.cli("collect");
+    assert_eq!(gaps(&f), []);
+    assert_eq!(final_event(&f), serde_json::json!({"state": "open", "turn_id": "turn-2"}));
+    assert_eq!(report["attempts"][0]["usage"], usage);
+    // Unmodified for 9 minutes: still open. For 11: missing, with nothing new to read.
+    age(&path, 540);
+    f.cli("collect");
+    assert_eq!(gaps(&f), []);
+    age(&path, 660);
+    for _ in 0..2 {
+        f.cli("collect");
+        assert_eq!(gaps(&f), [gap(end, "pending")]);
+        assert_eq!(final_event(&f), serde_json::json!({"state": "missing", "turn_id": "turn-2"}));
+    }
+    // The same gap when the idle rollout is first read.
+    remove_sidecar(&f);
+    let (report, _) = f.cli("collect");
+    assert_eq!(gaps(&f), [gap(end, "pending")]);
+    assert_eq!(report["attempts"][0]["usage"], usage);
+
+    // The writer resumes mid-line: the gap is unchanged until the file is idle again, then reaches the new end.
+    let complete = &lines[4];
+    append(&path, &complete[..40]);
+    f.cli("collect");
+    assert_eq!(gaps(&f), [gap(end, "pending")]);
+    age(&path, 660);
+    f.cli("collect");
+    assert_eq!(gaps(&f), [gap(end + 40, "pending")]);
+    // The final event arrives: recovered, and the turn is complete.
+    append(&path, &complete[40..]);
+    let (report, _) = f.cli("collect");
+    assert_eq!(gaps(&f), [gap(end + 40, "recovered")]);
+    assert_eq!(final_event(&f), serde_json::json!({"state": "complete", "turn_id": "turn-2"}));
+    assert_eq!(report["attempts"][0]["usage"], usage);
+    age(&path, 660);
+    f.cli("collect");
+    assert_eq!(gaps(&f), [gap(end + 40, "recovered")], "a completed turn is never missing");
 }

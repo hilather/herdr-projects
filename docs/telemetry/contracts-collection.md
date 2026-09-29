@@ -194,9 +194,9 @@ each with a value somewhere, and no unavailable field.
 
 **Envelopes of uncertified versions** keep the sanitized counters in
 `source_observations.payload`, as reported evidence. §5 rows keep none. Their
-`provenance.adapter_version` names the version, so a ledger reader must accept
-counters only when that version is in `certified_versions`. No reader of
-`source_observations` exists yet.
+`provenance.adapter_version` names the version, and since A7 their
+`measurement.certified` is `false` (see A7): a ledger reader accepts counters
+only from an envelope with `measurement.certified` `true`.
 
 **Contracts §0 finding (open, steward and lane B).** A bound certified
 session whose usage records all fail validation (`invariant_violation`) shows
@@ -212,8 +212,10 @@ session's record count tells them apart.
 **Gate items not covered by this suite:**
 - Ordinal resets and resume across files, nested (guardian) usage, and model
   switches inside a session: covered by A4 (below).
-- A lost final event that is never written. There is no signal for it beyond
-  the discrepancy between the thread total and the sum.
+- A lost final event that is never written. Before A7 there was no signal
+  for it beyond the discrepancy between the thread total and the sum. A7
+  records a rollout left idle without its last turn's `task_complete` as a
+  `final_event_missing` coverage gap.
 - Cross-surface overlap. Codex has one surface (`rollout_jsonl`).
 
 ## A4 (TM1.3 remainder): Codex metadata, child sessions, resume
@@ -359,7 +361,7 @@ output, MCP results, credits and guardian transcripts.
 | No `A4LEAK_*` sentinel in the sidecar (with WAL) or any output, including `collectors sessions` | `planted_sentinels_never_leak` |
 | Capabilities match emitted fields, each new one valued somewhere in the corpus | `capabilities_match_emitted_fields` |
 
-Not covered: a lost final event (no signal); compaction; whether a child or
+Not covered: a lost final event (no signal; A7 adds the idle-rollout gap); compaction; whether a child or
 forked rollout replays its parent's `token_usage_record`s (a double count
 if it does, see the live probe).
 
@@ -542,7 +544,7 @@ record's `session_id` = the edge session's id (`thread_id` its own,
   6. Update `tests/fixtures/telemetry/accounting/guardian.jsonl` (lane B) to
      the live shape and `tests/telemetry_accounting.rs` expectations
      (`unlinked_child`/`no_native_parent_evidence` becomes a link).
-- **Lane A (optional):** collect the `source.subagent.other` string (Tag,
+- **Done (A7):** **Lane A (optional):** collect the `source.subagent.other` string (Tag,
   `guardian`) as the kind's detail, if B2 wants it beyond `thread_source`.
 - **Steward:** apply the §5 text above and list ingest 0005 in the index.
 
@@ -774,3 +776,145 @@ object, a `passthrough`, `exit_code` or `duration` string) and
      `exec` and `wait` only.
 - **Steward:** apply the §5/§7 diff above, and list ingest 0006 in the
   index.
+
+## A7: collector follow-ups
+
+Three follow-ups from [phase2-lanes.md](phase2-lanes.md) and A5, in sidecar
+stream `ingest` 0007 (`migrations/telemetry/ingest/0007_codex_followups.sql`,
+re-runnable: `IF NOT EXISTS` tables and a `coverage_gaps` rebuild from a
+dropped scratch table, no `ALTER ... ADD COLUMN`).
+
+### Envelope counters of uncertified versions
+
+**Decision: keep the counters, mark the envelope.** Every envelope's
+`measurement` gains `certified`: whether its `provenance.adapter_version` was
+in `CERTIFIED` when the envelope was written. An envelope of an uncertified
+version keeps its sanitized counters in `payload` as reported evidence, with
+`measurement.certified` `false`. A ledger reader accepts counters only from an
+envelope with `measurement.certified` `true`. §5 rows are unchanged (still no
+counters for an uncertified version).
+
+Why not null the counters:
+- The payload stays what the source reported. Its `payload_digest` does not
+  depend on certification, so certifying a version later never changes a
+  digest and can never look like a `digest_conflict`. Nulled counters would
+  need a second payload shape per kind and a supersession of every payload.
+- The evidence survives. A version is certified by a later live run; with
+  nulled counters the rollout would have to still exist to recover them,
+  and a gone rollout would lose them. With the mark, only a flag flips.
+- The mark is on the envelope, so a reader cannot mistake the counters for
+  certified usage without ignoring a field it must read anyway, and no
+  reader needs `CERTIFIED` or the §5 tables to decide.
+
+**Supersession.** The pattern of the A4/A5 normalization versions, on the
+measurement instead of the payload:
+- An envelope whose `event_id` and `payload_digest` are stored but whose
+  `measurement` differs (another `certified`, or an envelope written before
+  A7 without the key) is superseded in place: `measurement`,
+  `envelope_bytes` and `observed_unix_ms` are rewritten. Never a
+  `digest_conflict`.
+- `rollout_ingest_state.uncertified_envelopes` (per rollout source) is `1`
+  once any envelope of the source was written uncertified, and stays `1`
+  until the source is read again from byte 0. Each collect re-reads from
+  byte 0 every source with the flag whose version is certified now, like the
+  §5 re-evaluation of uncertified usage rows (it may coincide with it). So a
+  rollout without usage records is re-read for its envelopes alone.
+- A source read before A7 (no `rollout_ingest_state` row) is re-read from
+  byte 0 by the A7 backfill, so every stored envelope gains the key.
+
+### Lost final events
+
+A rollout whose last turn never gets its `task_complete` (Codex killed, the
+event lost) had no signal. A7 tracks each source's **last turn**, after its
+first `session_meta`: a `turn_context` or `task_started` opens one unless it
+repeats the tracked turn's id; a `task_complete` of the tracked id (any
+`task_complete`, when the turn has no id) completes it. Stored in
+`rollout_ingest_state(last_turn_offset, last_turn_id, last_turn_completed)`,
+advanced in the rollout's transaction, and reset by a re-read from byte 0.
+
+**Idle.** After each pass over a source (also a pass with nothing new to
+read), the last turn is a **missing final event** when all hold:
+- it is not complete;
+- the pass read the file to its end (it did not stop at the byte budget); a
+  trailing partial line counts as the end;
+- the file's modification time is at least `FINAL_EVENT_IDLE_MS` = 600 000 ms
+  (twice the default 300 s ticker telemetry pass) before the collector's
+  `now`.
+
+Only the file's size and modification time and the cursor decide; no content
+is read for it. Then `coverage_gaps` holds a row `(source, start_offset =
+the byte offset of the line that opened the turn, end_offset = the file's
+end, reason = final_event_missing, recovery = pending)`, written again only
+when the end moves. A later write to the file does not clear it; the gap
+widens to the new end once the file is idle again.
+
+**Recovery.** Only the event recovers the gap: a `task_complete` whose turn
+id equals the `turn_id` of the envelope at the gap's start (or that completes
+the tracked turn) marks it `recovered`. Reading the gap's byte range again
+does not (the generic `finish` recovery skips this reason). A gap whose turn
+was followed by another turn stays `pending`: its event never came.
+
+**Outputs.** The gap is a `coverage_gaps` row like the A2 reasons. `collectors
+sessions` shows per rollout `final_event {state, turn_id}`: `no_turn`,
+`complete`, `open` (not complete, not idle yet), or `missing` (a pending
+gap at the last turn). A sidecar without ingest 0007 shows `final_event`
+`unavailable: predates_collection`, and a source waiting for its re-read
+`unavailable: pending_reread`, never a state. Usage, attempts, report and
+accounting outputs are unchanged: a missing final event does not change any
+sum (a lost `token_usage_record` still shows only as a thread-total
+discrepancy).
+
+### `source.subagent.other` (subagent detail)
+
+| Envelope field (`session_meta`) | Read from | Class (§7 rule) | Stored in | Certified (caveat) |
+|---|---|---|---|---|
+| `subagent_detail` | `source.subagent.other` (a string; any other type `null`) | Tag (excerpt rules 1–5) | `rollout_subagents.subagent_detail` | live (`observed_guardian_only`: the A4 live guardian's `{"subagent": {"other": "guardian"}}`) |
+
+An enum-like tag Codex writes about the session, never text a person or model
+wrote. It is `null` for every other `source` shape (`thread_spawn`, `review`,
+a plain string).
+
+- `rollout_subagents(path_digest PK, subagent_detail)` is written from the
+  file's first `session_meta` with `rollout_metadata`, as leniently.
+- `session_meta` envelopes carry `subagent_detail` with
+  `measurement.normalization_version` 4. An A5 envelope (version 3) is
+  superseded in place, not a `digest_conflict`.
+- **Upgrade.** A source with a `rollout_sources` row but no
+  `rollout_subagents` or `rollout_ingest_state` row was read before A7. Each
+  collect reads it again from byte 0 within its budget, like the A4–A6
+  backfill. Stored keys dedupe; `collected.records` counts nothing twice.
+- `collectors sessions` adds `subagent.detail`: the tag, `null`, or
+  `unavailable` (`predates_collection` without ingest 0007, `pending_reread`
+  while the source waits for its re-read). `capabilities` lists
+  `session_meta.subagent_detail` (`reported_excerpt`, `live`,
+  `observed_guardian_only`).
+
+### Conformance
+
+| Property | Test |
+|---|---|
+| Uncertified envelopes keep their counters with `measurement.certified` false; certified ones true | `uncertified_version_is_gated_everywhere` |
+| Certifying a version later: every envelope's measurement superseded in place, a rollout without usage re-read for its envelopes, no conflict, nothing counted twice, equal to a fresh collect | `envelopes_of_a_version_certified_later_are_superseded_without_conflict` |
+| Idle without the last turn's `task_complete`: `open`, then a pending `final_event_missing` gap (also on a first read), widened by a later partial write once idle again, recovered by the event; usage unchanged | `idle_rollout_without_final_event_records_a_coverage_gap` (`telemetry_collect.rs`) |
+| Guardian `subagent.detail` `guardian`, others `null`; `final_event` per rollout | `session_metadata_record_times_and_child_usage_are_collected` |
+| Upgrade of an A6 sidecar: `predates_collection` read-only, then a re-read equal to a fresh collect, stream 7, no conflict; a gone rollout `pending_reread` | `rollouts_read_before_a7_gain_their_subagent_detail_and_turn_state_on_the_next_collect` |
+| Sentinels, capabilities matching emitted fields, replay in any chunking | `planted_sentinels_never_leak`, `capabilities_match_emitted_fields`, `corpus_replays_identically_in_any_chunking` |
+
+### Contracts.md §5 addition (for the steward)
+
+- §5 *Allowlisted fields*, after the A4 `source.subagent` text: "and, for
+  the `other` variant, its string tag as `subagent_detail` (A7, sidecar
+  stream `ingest` 0007 `rollout_subagents`; live: `guardian`)".
+- Index / §0 Stores: "Sidecar stream `ingest` 0007: A7 subagent detail,
+  per-source ingest state, envelope `measurement.certified` and
+  `final_event_missing` coverage gaps (contracts-collection.md A7)."
+
+### Follow-ups
+
+- **Ledger readers** (any lane, when one appears): gate counters on
+  `measurement.certified`, never on `provenance.adapter_version` alone.
+- **B2** may use `subagent_detail = 'guardian'` as guardian evidence beside
+  `thread_source = 'guardian_review'` (both live).
+- A live run could certify how long Codex leaves a rollout unwritten inside
+  a healthy turn (a long tool call or approval wait); a turn idle past 600 s
+  is `missing` until its event arrives, then `recovered`.

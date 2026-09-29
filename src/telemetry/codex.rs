@@ -138,8 +138,10 @@ pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Co
     let mut remaining = budget.bytes;
     let reread = reread(&db)?;
     // Sources read before A4 (no `rollout_metadata`) are read again from byte 0
-    // too, so their rows gain the A4 metadata; stored keys dedupe.
-    let from_start: std::collections::BTreeSet<String> = reread.union(&backfill(&db)?).cloned().collect();
+    // too, so their rows gain the A4 metadata; stored keys dedupe. So are
+    // sources with envelopes written while their version was uncertified and
+    // that is certified now (A7): their measurement is superseded.
+    let from_start: std::collections::BTreeSet<String> = reread.iter().chain(&backfill(&db)?).chain(&recertify(&db)?).cloned().collect();
     let mut seen = std::collections::BTreeSet::new();
     let mut unwritable = false;
     for home in &homes {
@@ -188,15 +190,28 @@ fn reread(db: &Connection) -> Result<std::collections::BTreeSet<String>> {
 }
 
 /// Sources with a session read before the A4 metadata (ingest 0004), the A5
-/// thread lineage (ingest 0005) or the A6 tool metadata (ingest 0006)
-/// existed: no `rollout_metadata`, `rollout_threads` or `codex_tool_sources`
-/// row although their `session_meta` was stored.
+/// thread lineage (ingest 0005), the A6 tool metadata (ingest 0006) or the A7
+/// subagent detail and ingest state (ingest 0007) existed: no
+/// `rollout_metadata`, `rollout_threads`, `codex_tool_sources`,
+/// `rollout_subagents` or `rollout_ingest_state` row although their
+/// `session_meta` was stored.
 fn backfill(db: &Connection) -> Result<std::collections::BTreeSet<String>> {
     Ok(db.prepare("SELECT s.path_digest FROM rollout_sources s JOIN collect_offsets o ON o.path_digest=s.path_digest
         WHERE NOT EXISTS(SELECT 1 FROM rollout_metadata m WHERE m.path_digest=s.path_digest)
         OR NOT EXISTS(SELECT 1 FROM rollout_threads t WHERE t.path_digest=s.path_digest)
-        OR NOT EXISTS(SELECT 1 FROM codex_tool_sources c WHERE c.path_digest=s.path_digest)")?
+        OR NOT EXISTS(SELECT 1 FROM codex_tool_sources c WHERE c.path_digest=s.path_digest)
+        OR NOT EXISTS(SELECT 1 FROM rollout_subagents a WHERE a.path_digest=s.path_digest)
+        OR NOT EXISTS(SELECT 1 FROM rollout_ingest_state x WHERE x.path_digest=s.path_digest)")?
         .query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Sources holding envelopes written while their version was uncertified
+/// (`measurement.certified` false) whose version is certified now: read again
+/// from byte 0 so each envelope's measurement is superseded in place (A7).
+fn recertify(db: &Connection) -> Result<std::collections::BTreeSet<String>> {
+    let sources: Vec<(String, String)> = db.prepare("SELECT s.path_digest,s.cli_version FROM rollout_sources s JOIN rollout_ingest_state x ON x.path_digest=s.path_digest
+        WHERE x.uncertified_envelopes=1")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    Ok(sources.into_iter().filter(|(_, version)| certified(version)).map(|(key, _)| key).collect())
 }
 
 /// Regular `rollout-*.jsonl` files only; symlinks are never followed.
@@ -254,8 +269,17 @@ struct SessionMeta {
 }
 #[derive(Deserialize)]
 struct TurnContext {
+    /// A7 turn tracking, read leniently (another type is `null`).
+    #[serde(default)]
+    turn_id: Lax,
     model: Option<String>,
     effort: Option<String>,
+}
+/// `event_msg/task_started`: its turn id only, leniently (A7 turn tracking).
+#[derive(Deserialize)]
+struct TaskStarted {
+    #[serde(default)]
+    turn_id: Lax,
 }
 #[derive(Deserialize, Default)]
 struct Usage {
@@ -460,6 +484,44 @@ struct Cursor {
     model: Option<String>,
     effort: Option<String>,
     session: Option<(String, String, Option<i64>)>,
+    /// A7 (`rollout_ingest_state`): an envelope of this source was written
+    /// while its version was uncertified (sticky until a re-read from 0).
+    uncertified: bool,
+    /// A7: the last turn read after the first `session_meta`.
+    turn: Option<Turn>,
+}
+
+/// A turn, opened by a `turn_context` or `task_started` whose turn id differs
+/// from the tracked turn's, and completed by a `task_complete` of its id (any
+/// `task_complete`, for a turn without one).
+struct Turn {
+    offset: u64,
+    id: Option<String>,
+    completed: bool,
+}
+
+impl Cursor {
+    fn open_turn(&mut self, at: u64, id: Option<String>) {
+        if self.session.is_none() || self.turn.as_ref().is_some_and(|turn| turn.id.is_some() && turn.id == id) { return; }
+        self.turn = Some(Turn { offset: at, id, completed: false });
+    }
+}
+
+/// A turn id as its envelope keeps it (an Id, else `null`).
+fn turn_id(value: Value) -> Option<String> {
+    sanitize::field(&json!({"turn_id": value}), "turn_id", sanitize::Class::Id).as_str().map(str::to_owned)
+}
+
+/// A7 lost final event: the source's last turn is still open, the pass read
+/// the file to its end (`at_eof`), and the file has not been modified for
+/// [`ingest::FINAL_EVENT_IDLE_MS`] before `now`. Only the file's size and
+/// modification time are used, never its content. `true`: the gap was written.
+fn final_event(tx: &Transaction, ledger: &ingest::Ledger, cursor: &Cursor, at_eof: bool, meta: &std::fs::Metadata, now: i64) -> Result<bool> {
+    let Some(turn) = cursor.turn.as_ref().filter(|turn| !turn.completed) else { return Ok(false) };
+    let modified = meta.mtime() * 1000 + meta.mtime_nsec() / 1_000_000;
+    if !at_eof || now - modified < ingest::FINAL_EVENT_IDLE_MS { return Ok(false); }
+    ledger.final_event_missing(tx, turn.offset, meta.len().max(cursor.offset), now)?;
+    Ok(true)
 }
 
 /// Ingest complete lines of one rollout after its stored offset, with their
@@ -474,26 +536,33 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
     let stored = tx.query_row("SELECT device,inode,byte_offset,records,rate_limits,model,effort FROM collect_offsets WHERE path_digest=?1", [&key],
         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))).optional()?;
     let mut cursor = match stored {
-        Some((dev, ino, offset, records, rate_limits, model, effort)) if !reread.contains(&key) && dev as u64 == meta.dev() && ino as u64 == meta.ino() && offset as u64 <= meta.len() =>
-            Cursor { offset: offset as u64, records, rate_limits, model, effort, session: None },
+        Some((dev, ino, offset, records, rate_limits, model, effort)) if !reread.contains(&key) && dev as u64 == meta.dev() && ino as u64 == meta.ino() && offset as u64 <= meta.len() => {
+            let state: Option<(bool, Option<i64>, Option<String>, bool)> = tx.query_row("SELECT uncertified_envelopes,last_turn_offset,last_turn_id,last_turn_completed
+                FROM rollout_ingest_state WHERE path_digest=?1", [&key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
+            let (uncertified, turn) = state.map_or((false, None), |(uncertified, offset, id, completed)|
+                (uncertified, offset.map(|offset| Turn { offset: offset as u64, id, completed })));
+            Cursor { offset: offset as u64, records, rate_limits, model, effort, session: None, uncertified, turn }
+        }
         // New, replaced or re-read file: read from the start; existing keys
         // dedupe, re-evaluate or quarantine.
         _ => {
-            tx.execute("DELETE FROM rollout_sources WHERE path_digest=?1", [&key])?;
-            tx.execute("DELETE FROM rollout_metadata WHERE path_digest=?1", [&key])?;
-            tx.execute("DELETE FROM rollout_threads WHERE path_digest=?1", [&key])?;
-            tx.execute("DELETE FROM codex_tool_sources WHERE path_digest=?1", [&key])?;
-            Cursor { offset: 0, records: 0, rate_limits: 0, model: None, effort: None, session: None }
+            for table in ["rollout_sources", "rollout_metadata", "rollout_threads", "codex_tool_sources", "rollout_subagents", "rollout_ingest_state"] {
+                tx.execute(&format!("DELETE FROM {table} WHERE path_digest=?1"), [&key])?;
+            }
+            Cursor { offset: 0, records: 0, rate_limits: 0, model: None, effort: None, session: None, uncertified: false, turn: None }
         }
     };
     let now = jiff::Timestamp::now().as_millisecond();
     *span = (cursor.offset, meta.len());
     let ledger = ingest::Ledger::begin(&tx, &key, cursor.offset, now)?;
     if cursor.offset == meta.len() {
+        // Nothing new to read: only an idle open turn (never on a re-read,
+        // which tracks no turn yet) or a fresh cursor writes anything.
+        let idle = final_event(&tx, &ledger, &cursor, true, &meta, now)?;
         if ledger.fresh && cursor.offset > 0 {
             ledger.finish(&tx, None, cursor.offset, now)?;
-            tx.commit()?;
         }
+        if idle || (ledger.fresh && cursor.offset > 0) { tx.commit()?; }
         return Ok(0);
     }
     cursor.session = tx.query_row("SELECT session_id,cli_version,session_unix_ms FROM rollout_sources WHERE path_digest=?1", [&key],
@@ -541,7 +610,7 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
             continue;
         };
         let mut observed = None;
-        if !record(&tx, &tag, &line, &key, home, worktrees, &mut cursor, now, done, &mut observed)? {
+        if !record(&tx, &ledger, at, &tag, &line, &key, home, worktrees, &mut cursor, now, done, &mut observed)? {
             ledger.malformed(&tx, at, "record_malformed", n, now)?;
             continue;
         }
@@ -561,12 +630,18 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
                 None => None,
             };
             if let Some(payload) = payload {
-                ledger.observe(&tx, at, ingest::Record { kind, payload: &payload, occurred_unix_ms: ms(tag.timestamp.as_deref()), session, adapter_version: version }, now)?;
+                let certified = certified(version);
+                ledger.observe(&tx, at, ingest::Record { kind, payload: &payload, occurred_unix_ms: ms(tag.timestamp.as_deref()), session, adapter_version: version,
+                    certified }, now)?;
+                cursor.uncertified |= !certified;
             }
         }
     }
-    // Bytes pulled from disk, including a partial last line, count against the budget.
-    let pulled = allowance - reader.into_inner().limit();
+    // Bytes pulled from disk, including a partial last line, count against the
+    // budget. Allowance left over: the pass stopped at the file's end.
+    let rest = reader.into_inner();
+    let (pulled, at_eof) = (allowance - rest.limit(), rest.limit() > 0);
+    let after = rest.into_inner().metadata()?;
     if read > 0 { done.files += 1; }
     done.bytes += pulled;
     tx.execute("INSERT INTO collect_offsets(path_digest,device,inode,byte_offset,records,rate_limits,model,effort,updated_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
@@ -575,6 +650,12 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
         params![key, meta.dev() as i64, meta.ino() as i64, cursor.offset as i64, cursor.records, cursor.rate_limits, cursor.model, cursor.effort, now])?;
     tx.execute("UPDATE rollout_sources SET records=?2 WHERE path_digest=?1", params![key, cursor.records])?;
     ledger.finish(&tx, cursor.session.as_ref().map(|s| s.0.as_str()), cursor.offset, now)?;
+    if cursor.session.is_some() {
+        let turn = cursor.turn.as_ref();
+        tx.execute("INSERT OR REPLACE INTO rollout_ingest_state(path_digest,uncertified_envelopes,last_turn_offset,last_turn_id,last_turn_completed) VALUES(?1,?2,?3,?4,?5)",
+            params![key, cursor.uncertified, turn.map(|t| t.offset as i64), turn.and_then(|t| t.id.as_deref()), turn.is_some_and(|t| t.completed)])?;
+    }
+    final_event(&tx, &ledger, &cursor, at_eof, &after, now)?;
     if let Some((session, version, _)) = &cursor.session && certified(version) {
         reconcile(&tx, session, now)?;
     }
@@ -587,8 +668,8 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
 /// `turn_context` also makes the model and effort of later records unknown.
 /// `observed`: the envelope payload of an A6 kind, built from its typed allowlist.
 #[allow(clippy::too_many_arguments)]
-fn record(tx: &Transaction, tag: &Tag, line: &[u8], key: &str, home: &str, worktrees: &str, cursor: &mut Cursor, now: i64, done: &mut Collected,
-    observed: &mut Option<Value>) -> Result<bool> {
+fn record(tx: &Transaction, ledger: &ingest::Ledger, at: u64, tag: &Tag, line: &[u8], key: &str, home: &str, worktrees: &str, cursor: &mut Cursor, now: i64,
+    done: &mut Collected, observed: &mut Option<Value>) -> Result<bool> {
     let inner = tag.payload.as_ref().and_then(|p| p.kind.as_deref());
     match (tag.kind.as_deref(), inner) {
         (Some("session_meta"), _) if cursor.session.is_none() => {
@@ -618,6 +699,9 @@ fn record(tx: &Transaction, tag: &Tag, line: &[u8], key: &str, home: &str, workt
                     text("thread_source", sanitize::Class::Tag)])?;
             // A6: this source's tool metadata is read from byte 0 on.
             tx.execute("INSERT OR IGNORE INTO codex_tool_sources(path_digest) VALUES(?1)", [key])?;
+            // A7: the `other` subagent variant's tag (live: `guardian`), as leniently.
+            tx.execute("INSERT OR REPLACE INTO rollout_subagents(path_digest,subagent_detail) VALUES(?1,?2)",
+                params![key, text("subagent_detail", sanitize::Class::Text)])?;
             cursor.session = Some((meta.id, meta.cli_version, at));
         }
         (Some("turn_context"), _) => {
@@ -626,6 +710,12 @@ fn record(tx: &Transaction, tag: &Tag, line: &[u8], key: &str, home: &str, workt
                 return Ok(false);
             };
             (cursor.model, cursor.effort) = (payload.model, payload.effort);
+            cursor.open_turn(at, turn_id(payload.turn_id.0));
+        }
+        // A7 turn tracking only; never quarantined (its envelope is built whole, as before).
+        (Some("event_msg"), Some("task_started")) => {
+            let started = serde_json::from_slice::<Envelope<TaskStarted>>(line).ok().map(|envelope| envelope.payload.turn_id.0);
+            cursor.open_turn(at, started.and_then(turn_id));
         }
         // Keyed by the rollout's own `session_meta.id`, never the record's
         // `session_id`: a guardian's records report its parent's (A5).
@@ -695,6 +785,18 @@ fn record(tx: &Transaction, tag: &Tag, line: &[u8], key: &str, home: &str, workt
         }
         (Some("event_msg"), Some("task_complete")) => {
             let Ok(Envelope { payload }) = serde_json::from_slice::<Envelope<TaskComplete>>(line) else { return Ok(false) };
+            // A7: the final event of its turn, which recovers a gap recorded for it.
+            if cursor.session.is_some() {
+                let id = payload.turn_id.clone().and_then(|id| turn_id(Value::String(id)));
+                let opened = match cursor.turn.as_mut() {
+                    Some(turn) if !turn.completed && (turn.id.is_none() || turn.id == id) => {
+                        turn.completed = true;
+                        Some(turn.offset)
+                    }
+                    _ => None,
+                };
+                ledger.turn_completed(tx, id.as_deref(), opened, now)?;
+            }
             if let (Some((session, ..)), Some(turn)) = (&cursor.session, payload.turn_id) {
                 tx.execute("INSERT OR IGNORE INTO codex_turns(session_id,turn_id,model,effort,duration_ms,time_to_first_token_ms) VALUES(?1,?2,?3,?4,?5,?6)",
                     params![session, turn, cursor.model, cursor.effort, payload.duration_ms, payload.time_to_first_token_ms])?;

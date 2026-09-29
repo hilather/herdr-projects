@@ -11,7 +11,10 @@
 //! reports outside `source` and a guardian shaped like the live one, whose
 //! usage records report its parent's session id. A6 adds tool call and exec
 //! item metadata in the live 0.154.0 shape, with sentinels in every content
-//! field beside it.
+//! field beside it. A7 marks envelopes of an uncertified version and
+//! supersedes the mark on certification, records a rollout idle without its
+//! last turn's final event (tests/telemetry_collect.rs), and collects the
+//! guardian's `source.subagent.other` tag.
 
 #![cfg(all(feature = "state-store", target_os = "linux"))]
 #![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
@@ -115,7 +118,7 @@ fn ledger(f: &Fixture) -> Vec<String> {
     let mut out = Vec::new();
     for table in ["source_observations", "ingest_quarantine", "coverage_gaps", "source_cursors", "codex_usage", "codex_turns", "codex_rate_limits",
         "codex_quarantine", "codex_discrepancy", "collect_offsets", "rollout_sources", "source_bindings", "rollout_metadata", "codex_usage_times",
-        "codex_rate_limit_windows", "rollout_threads", "codex_tool_sources", "codex_tool_calls", "codex_exec_items"] {
+        "codex_rate_limit_windows", "rollout_threads", "codex_tool_sources", "codex_tool_calls", "codex_exec_items", "rollout_subagents", "rollout_ingest_state"] {
         let order = if table == "codex_tool_sources" { "1" } else { "1,2" };
         let mut stmt = db.prepare(&format!("SELECT * FROM {table} ORDER BY {order}")).unwrap();
         let names: Vec<String> = stmt.column_names().into_iter().map(str::to_owned).collect();
@@ -303,11 +306,13 @@ fn unbound_rollouts_are_never_attributed() {
 /// attempt's usage `cli_version_uncertified` rather than a partial sum of its
 /// certified sibling, is excluded from the usage metrics, still stores its
 /// metadata (turns, rate limits), and its envelopes name the version so a
-/// ledger reader can gate on it.
+/// ledger reader can gate on it. A7: each such envelope keeps the reported
+/// counters as evidence but says `measurement.certified` false; the certified
+/// sibling's say true.
 #[test]
 fn uncertified_version_is_gated_everywhere() {
     let f = Fixture::new();
-    plant(&f, "complete");
+    let complete = plant(&f, "complete");
     let old = plant(&f, "uncertified");
     let (report, _) = f.cli("collect");
     let gated = unavailable("cli_version_uncertified");
@@ -324,6 +329,12 @@ fn uncertified_version_is_gated_everywhere() {
     let versions: Vec<String> = f.sidecar().prepare("SELECT DISTINCT json_extract(provenance,'$.adapter_version') FROM source_observations WHERE producer_epoch=?1").unwrap()
         .query_map([source(&old)], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
     assert_eq!(versions, ["0.999.0"]);
+    let certified = |path: &Path| rows::<i64>(&f, &format!("SELECT json_extract(measurement,'$.certified'),count(*) FROM source_observations
+        WHERE producer_epoch='{}' GROUP BY 1", source(path)));
+    assert_eq!((certified(&old), certified(&complete)), (vec![vec![0, 10]], vec![vec![1, 10]]));
+    // Head line 5: the uncertified record's 1000 input tokens stay in its envelope, and nowhere in `codex_usage`.
+    assert_eq!(rows::<i64>(&f, &format!("SELECT json_extract(payload,'$.usage.input_tokens') FROM source_observations WHERE producer_epoch='{}'
+        AND event_kind='codex.token_usage_record.v1' ORDER BY producer_sequence", source(&old))), [vec![1000], vec![500]]);
     let (capabilities, _) = f.cli_args(&["collectors", "capabilities", "--json"]);
     assert_eq!((&capabilities["adapters"][0]["certified_versions"], &capabilities["adapters"][0]["uncertified_version"]),
         (&json!(["0.154.0"]), &json!("cli_version_uncertified")));
@@ -453,6 +464,7 @@ const CAPABILITIES: &str = "codex rollout_jsonl certified_versions=0.154.0
   session_meta.model_provider available=true basis=reported_excerpt certified=live
   session_meta.forked_from_id available=true basis=reported certified=fixture caveat=semantics_not_certified
   session_meta.subagent_kind available=true basis=reported_excerpt certified=live caveat=from_source_subagent
+  session_meta.subagent_detail available=true basis=reported_excerpt certified=live caveat=observed_guardian_only
   session_meta.subagent_parent_thread_id available=true basis=reported certified=fixture caveat=from_source_subagent
   session_meta.subagent_depth available=true basis=reported certified=fixture caveat=from_source_subagent
   session_meta.parent_thread_id available=true basis=reported certified=live caveat=observed_for_guardian_only
@@ -610,19 +622,21 @@ fn rows<T: rusqlite::types::FromSql>(f: &Fixture, sql: &str) -> Vec<Vec<T>> {
 }
 
 /// A4 session metadata and A5 thread lineage as collected, with the span of
-/// the usage record times.
+/// the usage record times, and the A7 final event of the rollout's last turn
+/// (each rollout here completes its last turn).
 #[allow(clippy::too_many_arguments)]
-fn session(f: &Fixture, sid: &str, path: &Path, records: i64, forked: Value, subagent: Value, thread: Value, times: [i64; 2]) -> Value {
+fn session(f: &Fixture, sid: &str, path: &Path, records: i64, forked: Value, subagent: Value, thread: Value, times: [i64; 2], last_turn: &str) -> Value {
     json!({"session_id": sid, "path_digest": source(path), "binding": "bound", "attempt_id": f.attempt, "records": records, "model_provider": "openai",
         "forked_from_id": forked, "subagent": subagent, "thread": thread,
-        "record_times": {"stored": records, "timed": records, "first_unix_ms": times[0], "last_unix_ms": times[1]}})
+        "record_times": {"stored": records, "timed": records, "first_unix_ms": times[0], "last_unix_ms": times[1]},
+        "final_event": {"state": "complete", "turn_id": last_turn}})
 }
 
 /// `head.jsonl` reports `thread_source` `user` and `session_id` = its `id`
 /// (shown `null`); `child.jsonl` reports neither.
 fn user_thread() -> Value { json!({"parent_thread_id": null, "session_id": null, "source": "user"}) }
 
-fn no_subagent() -> Value { json!({"kind": null, "parent_thread_id": null, "depth": null}) }
+fn no_subagent() -> Value { json!({"kind": null, "detail": null, "parent_thread_id": null, "depth": null}) }
 
 /// A4 on the CLI: the session's model provider, its fork and subagent parent
 /// ids (a `thread_spawn` child names the edge session in `source`; the
@@ -647,12 +661,13 @@ fn session_metadata_record_times_and_child_usage_are_collected() {
     let at = f.decided + 1_000;
     let (sessions, _) = f.cli_args(&["collectors", "sessions"]);
     assert_eq!(sessions, json!({"sessions": [
-        session(&f, SID, &complete, 2, Value::Null, no_subagent(), user_thread(), [at, at]),
-        session(&f, EDGE_SID, &edge, 3, Value::Null, no_subagent(), user_thread(), [at, at]),
-        session(&f, CHILD_SID, &child, 2, json!(EDGE_SID), json!({"kind": "thread_spawn", "parent_thread_id": EDGE_SID, "depth": 1}),
-            json!({"parent_thread_id": null, "session_id": null, "source": null}), [1_893_456_001_500, 1_893_456_003_000]),
-        session(&f, GUARDIAN_SID, &guardian, 1, Value::Null, json!({"kind": "other", "parent_thread_id": null, "depth": null}),
-            json!({"parent_thread_id": EDGE_SID, "session_id": EDGE_SID, "source": "guardian_review"}), [1_893_456_062_000, 1_893_456_062_000]),
+        session(&f, SID, &complete, 2, Value::Null, no_subagent(), user_thread(), [at, at], "turn-2"),
+        session(&f, EDGE_SID, &edge, 3, Value::Null, no_subagent(), user_thread(), [at, at], "turn-3"),
+        session(&f, CHILD_SID, &child, 2, json!(EDGE_SID), json!({"kind": "thread_spawn", "detail": null, "parent_thread_id": EDGE_SID, "depth": 1}),
+            json!({"parent_thread_id": null, "session_id": null, "source": null}), [1_893_456_001_500, 1_893_456_003_000], "turn-c2"),
+        // A7: the live guardian's `source.subagent.other` tag.
+        session(&f, GUARDIAN_SID, &guardian, 1, Value::Null, json!({"kind": "other", "detail": "guardian", "parent_thread_id": null, "depth": null}),
+            json!({"parent_thread_id": EDGE_SID, "session_id": EDGE_SID, "source": "guardian_review"}), [1_893_456_062_000, 1_893_456_062_000], "turn-g1"),
     ]}));
 
     // The child switches from gpt-5.5 to gpt-5.5-mini at its second turn.
@@ -741,7 +756,7 @@ fn rollouts_read_before_a4_gain_their_metadata_on_the_next_collect() {
     }
     let (upgraded, _) = f.cli("collect");
     assert_eq!(upgraded["collected"]["records"], 0, "the re-read counts nothing twice");
-    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 6}));
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 7}));
     assert!(fresh == ledger(&f), "the upgraded sidecar equals a fresh collect");
     assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage);
     assert_eq!(f.cli_args(&["collectors", "sessions"]).0, fresh_sessions);
@@ -788,7 +803,8 @@ fn guardian_usage_reporting_its_parent_session_stays_with_its_rollout() {
         WHERE producer_epoch=?1 AND event_kind=?2"), rusqlite::params![source(&guardian), kind], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).unwrap();
     let identity = format!(r#"{{"session_id":"{GUARDIAN_SID}"}}"#);
     assert_eq!(guardian_envelope("codex.token_usage_record.v1", "$.session_id"), (identity.clone(), EDGE_SID.to_owned()));
-    for (path, value) in [("$.parent_thread_id", EDGE_SID), ("$.session_id", EDGE_SID), ("$.thread_source", "guardian_review"), ("$.source", "subagent")] {
+    for (path, value) in [("$.parent_thread_id", EDGE_SID), ("$.session_id", EDGE_SID), ("$.thread_source", "guardian_review"), ("$.source", "subagent"),
+        ("$.subagent_detail", "guardian")] {
         assert_eq!(guardian_envelope("codex.session_meta.v1", path), (identity.clone(), value.to_owned()));
     }
 
@@ -837,7 +853,7 @@ fn rollouts_read_before_a5_gain_their_thread_lineage_on_the_next_collect() {
     assert_eq!(sessions[2]["subagent"]["kind"], "other");
     let (upgraded, _) = f.cli("collect");
     assert_eq!(upgraded["collected"]["records"], 0, "the re-read counts nothing twice");
-    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 6}));
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 7}));
     assert!(fresh == ledger(&f), "the upgraded sidecar equals a fresh collect");
     assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage);
     assert_eq!(f.cli_args(&["collectors", "sessions"]).0, fresh_sessions);
@@ -916,6 +932,7 @@ fn tool_and_exec_metadata_is_collected_without_content() {
 /// The sidecar as the A5 binary left it: no A6 tables, ingest stream 5, and
 /// no envelopes of the A6 kinds.
 fn downgrade_to_a5(f: &Fixture) {
+    downgrade_to_a6(f);
     f.sidecar().execute_batch("DROP TABLE codex_tool_sources; DROP TABLE codex_tool_calls; DROP TABLE codex_exec_items;
         UPDATE telemetry_streams SET version=5 WHERE stream='ingest';
         DELETE FROM source_observations WHERE event_kind IN ('codex.custom_tool_call.v1','codex.function_call.v1','codex.custom_tool_call_output.v1',
@@ -944,7 +961,7 @@ fn rollouts_read_before_a6_gain_their_tool_metadata_on_the_next_collect() {
     assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 5}), "a read does not migrate");
     let (upgraded, _) = f.cli("collect");
     assert_eq!(upgraded["collected"]["records"], 0, "the re-read counts nothing twice");
-    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 6}));
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 7}));
     assert!(fresh == ledger(&f), "the upgraded sidecar equals a fresh collect");
     assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage);
     assert_eq!(f.cli_args(&["collectors", "tools", "--json"]).0, fresh_tools);
@@ -958,4 +975,94 @@ fn rollouts_read_before_a6_gain_their_tool_metadata_on_the_next_collect() {
     assert_eq!((&row(TOOLS_SID)["tool_calls"], &row(TOOLS_SID)["exec_items"]), (&pending, &pending));
     assert_eq!(row(CHILD_SID)["tool_calls"], fresh_tools["sessions"].as_array().unwrap().iter().find(|s| s["session_id"] == CHILD_SID).unwrap()["tool_calls"]);
     assert_eq!(row(SID)["tool_calls"], json!([]), "an observed session without tool calls is empty, not unavailable");
+}
+
+/// The sidecar as the A6 binary left it: no A7 tables, ingest stream 6,
+/// envelopes without `measurement.certified`, and `session_meta` envelopes of
+/// the A5 allowlist (normalization 3, no `subagent_detail`).
+fn downgrade_to_a6(f: &Fixture) {
+    f.sidecar().execute_batch("DROP TABLE rollout_subagents; DROP TABLE rollout_ingest_state; UPDATE telemetry_streams SET version=6 WHERE stream='ingest';
+        UPDATE source_observations SET measurement=json_remove(measurement,'$.certified');
+        UPDATE source_observations SET payload=json_remove(payload,'$.subagent_detail'),payload_digest='sha256:a6',
+            measurement=json_set(measurement,'$.normalization_version',3) WHERE event_kind='codex.session_meta.v1';").unwrap();
+}
+
+/// Upgrade: a sidecar written before A7 is read (read-only) with the subagent
+/// detail and the final event `unavailable: predates_collection`, never `null`
+/// or a state. The next collect migrates it to ingest 7 and reads every
+/// rollout again: the detail and turn state appear, every envelope gains
+/// `measurement.certified` and the A5 `session_meta` envelopes are superseded,
+/// all without a digest conflict; nothing is counted twice, and the ledger
+/// equals a fresh collect. A rollout gone before it could be read again stays
+/// `pending_reread`.
+#[test]
+fn rollouts_read_before_a7_gain_their_subagent_detail_and_turn_state_on_the_next_collect() {
+    let f = Fixture::new();
+    let guardian = ["complete", "guardian", "tools"].map(|name| plant(&f, name))[1].clone();
+    f.cli("collect");
+    let (fresh, fresh_usage, fresh_sessions) = (ledger(&f), f.cli_args(&["usage", "--json"]).0, f.cli_args(&["collectors", "sessions"]).0);
+
+    downgrade_to_a6(&f);
+    let (before, _) = f.cli_args(&["collectors", "sessions"]);
+    let predates = unavailable("predates_collection");
+    let listed = before["sessions"].as_array().unwrap();
+    assert_eq!(listed.len(), 3);
+    assert!(listed.iter().all(|s| s["subagent"]["detail"] == predates && s["final_event"] == predates && s["model_provider"] == "openai"), "{before}");
+    let guardian_row = |sessions: &Value| sessions["sessions"].as_array().unwrap().iter().find(|s| s["session_id"] == GUARDIAN_SID).unwrap().clone();
+    assert_eq!(guardian_row(&before)["subagent"]["kind"], "other");
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 6}), "a read does not migrate");
+    let (upgraded, _) = f.cli("collect");
+    assert_eq!(upgraded["collected"]["records"], 0, "the re-read counts nothing twice");
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 7}));
+    assert!(fresh == ledger(&f), "the upgraded sidecar equals a fresh collect");
+    assert_eq!(f.count("ingest_quarantine"), 0, "no digest conflict");
+    assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage);
+    assert_eq!(f.cli_args(&["collectors", "sessions"]).0, fresh_sessions);
+
+    downgrade_to_a6(&f);
+    fs::remove_file(&guardian).unwrap();
+    f.cli("collect");
+    let (after, _) = f.cli_args(&["collectors", "sessions"]);
+    let pending = unavailable("pending_reread");
+    assert_eq!((&guardian_row(&after)["subagent"]["detail"], &guardian_row(&after)["final_event"]), (&pending, &pending));
+    assert_eq!(after["sessions"][0]["final_event"], json!({"state": "complete", "turn_id": "turn-2"}));
+    assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage, "the gone rollout's records still count");
+}
+
+/// A7: envelopes written while their version was uncertified (as a binary
+/// that did not yet certify 0.154.0 wrote them: `measurement.certified`
+/// false, NULL usage counters) are re-read once the version is certified.
+/// Each envelope's measurement is superseded in place with the same payload
+/// and digest, never a `digest_conflict`; a rollout without usage records
+/// (`tools`) is re-read for its envelopes alone; nothing is counted twice and
+/// the ledger equals a fresh collect.
+#[test]
+fn envelopes_of_a_version_certified_later_are_superseded_without_conflict() {
+    let f = Fixture::new();
+    let tools = ["complete", "guardian", "tools"].map(|name| plant(&f, name))[2].clone();
+    f.cli("collect");
+    let (fresh, fresh_usage) = (ledger(&f), f.cli_args(&["usage", "--json"]).0);
+    f.sidecar().execute_batch("UPDATE codex_usage SET accepted=0,reason='cli_version_uncertified',cache_write_input_tokens=NULL,cached_input_tokens=NULL,
+        input_tokens=NULL,output_tokens=NULL,reasoning_output_tokens=NULL,total_tokens=NULL;
+        UPDATE rollout_sources SET thread_usage=NULL,token_count_usage=NULL; DELETE FROM codex_discrepancy;
+        UPDATE source_observations SET measurement=json_set(measurement,'$.certified',json('false'));
+        UPDATE rollout_ingest_state SET uncertified_envelopes=1;").unwrap();
+    let flags = |f: &Fixture| rows::<i64>(f, "SELECT json_extract(measurement,'$.certified'),count(*) FROM source_observations GROUP BY 1");
+    // complete 10 + guardian 4 + tools 13 envelopes.
+    assert_eq!(flags(&f), [vec![0, 27]]);
+    assert_eq!(attempt_usage(&f.cli_args(&["usage", "--json"]).0), unavailable("cli_version_uncertified"), "a read re-reads nothing");
+
+    let (report, _) = f.cli("collect");
+    assert_eq!((&report["collected"]["records"], &report["collected"]["reevaluated"]), (&0.into(), &3.into()));
+    assert_eq!(flags(&f), [vec![1, 27]]);
+    assert_eq!(rows::<i64>(&f, &format!("SELECT count(*) FROM source_observations WHERE producer_epoch='{}' AND json_extract(measurement,'$.certified')=1",
+        source(&tools))), [vec![13]], "a rollout without usage records is re-read for its envelopes");
+    assert_eq!(f.count("ingest_quarantine"), 0, "no digest conflict");
+    assert!(fresh == ledger(&f), "the re-read sidecar equals a fresh collect");
+    // complete 1500/500/0/180/100/1680 + guardian 25/0/0/5/1/30.
+    assert_eq!(attempt_usage(&report), json!({"input_tokens": 1525, "cached_input_tokens": 500, "cache_write_input_tokens": 0, "output_tokens": 185,
+        "reasoning_output_tokens": 101, "total_tokens": 1710, "records": 3}));
+    assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage);
+    let (again, _) = f.cli("collect");
+    assert_eq!((&again["collected"]["bytes"], &again["collected"]["reevaluated"]), (&0.into(), &0.into()), "certified envelopes are not re-read again");
 }

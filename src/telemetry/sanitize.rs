@@ -30,7 +30,7 @@ pub fn codex_allowlist(kind: &str) -> Option<Vec<(String, Class)>> {
     let usage = |prefix: &'static str| USAGE.iter().map(move |f| (format!("{prefix}.{f}"), Number));
     Some(match kind {
         "session_meta" => fields(&[("id", Id), ("timestamp", Text), ("cwd", Path), ("cli_version", Text), ("originator", Text), ("source", Tag),
-            ("model_provider", Text), ("forked_from_id", Id), ("subagent_kind", Tag), ("subagent_parent_thread_id", Id), ("subagent_depth", Number),
+            ("model_provider", Text), ("forked_from_id", Id), ("subagent_kind", Tag), ("subagent_detail", Text), ("subagent_parent_thread_id", Id), ("subagent_depth", Number),
             ("parent_thread_id", Id), ("session_id", Id), ("thread_source", Tag)]),
         "turn_context" => fields(&[("turn_id", Id), ("model", Text), ("effort", Text)]),
         "token_usage_record" => fields(&[("session_id", Id), ("turn_id", Id), ("response_id", Id)]).into_iter()
@@ -56,10 +56,12 @@ pub fn codex_allowlist(kind: &str) -> Option<Vec<(String, Class)>> {
 /// Allowlisted envelope fields read from another place of the record: the
 /// Codex subagent source (`session_meta.source.subagent`, a string or a
 /// one-key object) is kept as flat fields beside the `source` tag
-/// (contracts-collection.md A4).
+/// (contracts-collection.md A4), with the `other` variant's string tag as
+/// `subagent_detail` (A7; any other type is `null`).
 fn source_path(path: &str) -> &str {
     match path {
         "subagent_kind" => "source.subagent",
+        "subagent_detail" => "source.subagent.other",
         "subagent_parent_thread_id" => "source.subagent.thread_spawn.parent_thread_id",
         "subagent_depth" => "source.subagent.thread_spawn.depth",
         other => other,

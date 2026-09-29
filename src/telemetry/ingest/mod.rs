@@ -14,12 +14,12 @@ const SCHEMA_VERSION: i64 = 1;
 const MAX_ENVELOPE: usize = 64 << 10;
 
 /// `measurement.normalization_version` of a Codex kind's envelope: raised when
-/// its allowlist grows (A4: `session_meta` and `token_count`; A5:
+/// its allowlist grows (A4: `session_meta` and `token_count`; A5 and A7:
 /// `session_meta`), so an envelope written under the smaller allowlist is
 /// superseded, not a digest conflict.
 fn normalization_version(kind: &str) -> i64 {
     match kind {
-        "session_meta" => 3,
+        "session_meta" => 4,
         "token_count" => 2,
         _ => 1,
     }
@@ -49,6 +49,10 @@ pub struct Record<'a> {
     pub occurred_unix_ms: Option<i64>,
     pub session: &'a str,
     pub adapter_version: &'a str,
+    /// Whether `adapter_version` is certified now: `measurement.certified`
+    /// (contracts-collection.md A7). The counters of an envelope with `false`
+    /// are reported evidence only, never certified usage.
+    pub certified: bool,
 }
 
 impl Ledger {
@@ -77,7 +81,8 @@ impl Ledger {
         let identity = canonical(&json!({"session_id": record.session}));
         let provenance = canonical(&json!({"adapter": "codex", "adapter_version": record.adapter_version, "interface": "rollout_jsonl", "source_trust": "collector_observed"}));
         let version = normalization_version(record.kind);
-        let measurement = canonical(&json!({"measurement_basis": "reported", "coverage": "complete", "normalization_version": version}));
+        let measurement = canonical(&json!({"measurement_basis": "reported", "coverage": "complete", "normalization_version": version,
+            "certified": record.certified}));
         let envelope = json!({"schema_version": SCHEMA_VERSION, "event_id": event_id, "producer_id": producer, "producer_epoch": self.source,
             "producer_sequence": sequence, "idempotency_key": event_id, "event_kind": kind, "occurred_unix_ms": record.occurred_unix_ms,
             "observed_unix_ms": now, "identity": identity, "provenance": provenance, "measurement": measurement, "payload": payload, "payload_digest": payload_digest});
@@ -85,18 +90,26 @@ impl Ledger {
         if bytes > MAX_ENVELOPE {
             return quarantine(db, &self.source, sequence, "envelope_oversized", bytes as u64, Some(&event_id), None, Some(&payload_digest), now);
         }
-        let first: Option<(String, i64)> = db.query_row("SELECT payload_digest,coalesce(json_extract(measurement,'$.normalization_version'),1) FROM source_observations WHERE event_id=?1",
-            [&event_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let first: Option<(String, i64, String)> = db.query_row("SELECT payload_digest,coalesce(json_extract(measurement,'$.normalization_version'),1),measurement
+            FROM source_observations WHERE event_id=?1", [&event_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
         match first {
-            Some((first, _)) if first == payload_digest => Ok(()),
+            Some((first, _, stored)) if first == payload_digest && stored == measurement => Ok(()),
+            // The same payload read under another certification of its version
+            // (A7: a version certified since, or an envelope written before
+            // `measurement.certified` existed): its measurement is superseded.
+            Some((first, _, _)) if first == payload_digest => {
+                db.execute("UPDATE source_observations SET observed_unix_ms=?2,measurement=?3,envelope_bytes=?4 WHERE event_id=?1",
+                    params![event_id, now, measurement, bytes as i64])?;
+                Ok(())
+            }
             // Written under an older allowlist of its kind: superseded in place.
-            Some((_, older)) if older < version => {
+            Some((_, older, _)) if older < version => {
                 db.execute("UPDATE source_observations SET event_kind=?2,occurred_unix_ms=?3,observed_unix_ms=?4,identity=?5,provenance=?6,measurement=?7,payload=?8,
                     payload_digest=?9,envelope_bytes=?10 WHERE event_id=?1",
                     params![event_id, kind, record.occurred_unix_ms, now, identity, provenance, measurement, payload_text, payload_digest, bytes as i64])?;
                 Ok(())
             }
-            Some((first, _)) => quarantine(db, &self.source, sequence, "digest_conflict", bytes as u64, Some(&event_id), Some(&first), Some(&payload_digest), now),
+            Some((first, _, _)) => quarantine(db, &self.source, sequence, "digest_conflict", bytes as u64, Some(&event_id), Some(&first), Some(&payload_digest), now),
             None => {
                 db.execute("INSERT INTO source_observations(event_id,schema_version,producer_id,producer_epoch,producer_sequence,event_kind,occurred_unix_ms,
                     observed_unix_ms,identity,provenance,measurement,payload,payload_digest,envelope_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
@@ -126,11 +139,41 @@ impl Ledger {
             VALUES(?1,?2,?3,(SELECT count(*) FROM source_observations WHERE producer_epoch=?1),?4)
             ON CONFLICT(source) DO UPDATE SET producer_id=excluded.producer_id,byte_offset=excluded.byte_offset,observations=excluded.observations,updated_unix_ms=excluded.updated_unix_ms",
             params![self.source, producer.map(|p| format!("codex:{p}")), offset as i64, now])?;
-        db.execute("UPDATE coverage_gaps SET recovery='recovered',observed_unix_ms=?4 WHERE source=?1 AND recovery='pending' AND start_offset>=?2 AND end_offset<=?3",
-            params![self.source, self.start as i64, offset as i64, now])?;
+        // A missing final event is recovered only by the event itself (`turn_completed`), not by reading its range.
+        db.execute("UPDATE coverage_gaps SET recovery='recovered',observed_unix_ms=?4 WHERE source=?1 AND recovery='pending' AND start_offset>=?2 AND end_offset<=?3
+            AND reason<>'final_event_missing'", params![self.source, self.start as i64, offset as i64, now])?;
+        Ok(())
+    }
+
+    /// A `task_complete` for turn `turn_id` (sanitized), or for the turn opened
+    /// at byte `opened` (the tracked last turn it completes): their pending
+    /// `final_event_missing` gaps are recovered. A gap's turn is the `turn_id` of
+    /// the envelope at its start.
+    pub fn turn_completed(&self, db: &Connection, turn_id: Option<&str>, opened: Option<u64>, now: i64) -> Result<()> {
+        db.execute("UPDATE coverage_gaps SET recovery='recovered',observed_unix_ms=?4 WHERE source=?1 AND reason='final_event_missing' AND recovery='pending'
+            AND (start_offset=?3 OR (?2 IS NOT NULL AND (SELECT json_extract(o.payload,'$.turn_id') FROM source_observations o
+                WHERE o.producer_epoch=?1 AND o.producer_sequence=coverage_gaps.start_offset)=?2))",
+            params![self.source, turn_id, opened.map(|o| o as i64), now])?;
+        Ok(())
+    }
+
+    /// The source's last turn, opened at byte `opened`, has no `task_complete`
+    /// although the rollout has been idle past [`FINAL_EVENT_IDLE_MS`]: a
+    /// pending `final_event_missing` gap over `[opened, end)`. Written again
+    /// only when the file's end moved.
+    pub fn final_event_missing(&self, db: &Connection, opened: u64, end: u64, now: i64) -> Result<()> {
+        db.execute("INSERT INTO coverage_gaps(source,start_offset,end_offset,reason,recovery,observed_unix_ms) VALUES(?1,?2,?3,'final_event_missing','pending',?4)
+            ON CONFLICT(source,start_offset,reason) DO UPDATE SET end_offset=excluded.end_offset,observed_unix_ms=excluded.observed_unix_ms
+            WHERE coverage_gaps.recovery='pending' AND coverage_gaps.end_offset<>excluded.end_offset",
+            params![self.source, opened as i64, end.max(opened) as i64, now])?;
         Ok(())
     }
 }
+
+/// How long a rollout must go unmodified, read to its end, before a last turn
+/// without `task_complete` counts as a lost final event: twice the default
+/// 300 s ticker telemetry pass (contracts §5), so one late pass never records it.
+pub const FINAL_EVENT_IDLE_MS: i64 = 600_000;
 
 #[allow(clippy::too_many_arguments)]
 fn quarantine(db: &Connection, source: &str, sequence: u64, reason: &str, bytes: u64, event: Option<&str>, first: Option<&str>, new: Option<&str>, now: i64) -> Result<()> {
