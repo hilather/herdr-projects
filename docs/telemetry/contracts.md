@@ -329,7 +329,8 @@ never guessed from PID, title or file time.
 
 S5 refinements:
 - CLI `telemetry <slug> collect` (creates the sidecar, then prints) and
-  `telemetry <slug> usage` (read-only); both print `{attempts, sessions}`,
+  `telemetry <slug> usage` (read-only; one text line per attempt and per
+  rollout unless `--json`); both print `{attempts, sessions}` as JSON,
   collect adds `collected{files, bytes, records, reevaluated, budget_exhausted}`. Budget:
   256 MiB per CLI collect, 8 MiB per ticker collect (once per 300 s per project,
   `HERDR_PROJECTS_TELEMETRY_COLLECT_SECS`, `0` off; no sidecar is created for a

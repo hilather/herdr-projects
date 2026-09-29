@@ -138,6 +138,28 @@ pub fn report(project: &Path) -> Result<Value> {
     Ok(json!({"attempts": out, "sessions": sessions}))
 }
 
+/// `report` for the terminal: one line per attempt, then one per rollout.
+pub fn text(report: &Value) -> String {
+    let word = |v: &Value| v.as_str().map_or_else(|| if v.is_null() { "-".to_owned() } else { v.to_string() }, str::to_owned);
+    let mut out = String::new();
+    for attempt in report["attempts"].as_array().into_iter().flatten() {
+        let usage = &attempt["usage"];
+        let shown = if usage.get("total_tokens").is_some() {
+            format!("in={} out={} total={} records={}", usage["input_tokens"], usage["output_tokens"], usage["total_tokens"], usage["records"])
+        } else {
+            format!("{}:{}", word(&usage["status"]), word(&usage["reason"]))
+        };
+        out += &format!("{} usage={shown}\n", word(&attempt["attempt_id"]));
+    }
+    for s in report["sessions"].as_array().into_iter().flatten() {
+        out += &format!("session {} binding={} attempt={} cli={} certified={} records={} accepted={} quarantined={}", word(&s["session_id"]), word(&s["binding"]),
+            word(&s["attempt_id"]), word(&s["cli_version"]), s["certified"], s["records"], s["accepted"], s["quarantined"]);
+        if !s["reevaluation"].is_null() { out += &format!(" reevaluation={}", word(&s["reevaluation"])); }
+        out += "\n";
+    }
+    out
+}
+
 pub(super) fn attempt_usage(db: &Connection, attempt: &str) -> Result<Value> {
     // Records collected before their version was certified keep NULL counters
     // until a collect re-reads their rollout, so the session stays uncertified

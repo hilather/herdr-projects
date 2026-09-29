@@ -849,7 +849,7 @@ enum TelemetryCommand {
     /// Read Codex rollouts under each Codex execution home into .state/telemetry.db, then print usage.
     Collect,
     /// Print per-attempt usage and rollout bindings from the sidecar. Writes nothing.
-    Usage,
+    Usage { #[arg(long)] json:bool },
     /// Metric report (M02, M07, M08, M09, M13, M15, M40; attention unavailable). Read-only.
     Report { #[arg(long, conflicts_with = "text")] json:bool, #[arg(long)] text:bool, /// Activity window start, Unix ms
         #[arg(long)] since:Option<i64> },
@@ -1268,7 +1268,8 @@ pub fn run() -> Result<()> {
             }
             let usage=sidecar::report(&dir)?;
             report["attempts"]=usage["attempts"].clone();report["sessions"]=usage["sessions"].clone();
-            println!("{}",serde_json::to_string_pretty(&report)?);Ok(())
+            if let TelemetryCommand::Usage{json:false}=command {print!("{}",sidecar::text(&report));} else {println!("{}",serde_json::to_string_pretty(&report)?);}
+            Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Factory{command}=>match command {

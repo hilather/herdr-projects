@@ -36,6 +36,9 @@ fn codex_usage_binds_and_sums_exactly() {
     let discrepancies = f.sidecar().prepare("SELECT kind,summed_total,reported_total FROM codex_discrepancy").unwrap()
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))).unwrap().map(Result::unwrap).collect::<Vec<_>>();
     assert_eq!(discrepancies, [("token_count_total".to_owned(), 1680, 900)]);
+    // The default `usage` output is one readable line per attempt and per rollout.
+    assert_eq!(f.text(&["usage"]), format!("{0} usage=in=1500 out=180 total=1680 records=2\n\
+        session {SID} binding=bound attempt={0} cli=0.154.0 certified=true records=2 accepted=2 quarantined=false\n", f.attempt));
 }
 
 #[test]
@@ -122,7 +125,7 @@ fn records_collected_before_certification_are_reread() {
     f.rollout(&f.home, SID, &["head.jsonl", "tail.jsonl"], &f.worktree(), f.decided + 1_000, "0.154.0");
     f.cli("collect");
     f.as_if_collected_uncertified();
-    assert_eq!(attempt_usage(&f.cli("usage").0), unavailable("cli_version_uncertified"), "a read re-reads nothing");
+    assert_eq!(attempt_usage(&f.cli_args(&["usage", "--json"]).0), unavailable("cli_version_uncertified"), "a read re-reads nothing");
     let (report, _) = f.cli("collect");
     assert_eq!((&report["collected"]["records"], &report["collected"]["reevaluated"]), (&0.into(), &2.into()));
     // 1000 + 500 input, 400 + 100 cached, 120 + 60 output, 80 + 20 reasoning, 1120 + 560 total.
@@ -221,7 +224,8 @@ fn content_never_persists() {
     let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
     std::io::Write::write_all(&mut file, tail.replace("@SID@", SID).replace("@CWD@", &f.worktree()).replace("@TS@", &ts).as_bytes()).unwrap();
     output.extend(f.cli("collect").1);
-    output.extend(f.cli("usage").1);
+    output.extend(f.cli_args(&["usage", "--json"]).1);
+    output.extend(f.text(&["usage"]).into_bytes());
     let state = f.project.join(".state");
     let wal = fs::read(state.join("telemetry.db-wal")).unwrap();
     assert!(!wal.is_empty(), "the second collect wrote through the WAL");
@@ -430,7 +434,7 @@ fn reads_leave_state_untouched() {
     let before = tree(&state);
     assert!(!before.iter().any(|(p, ..)| p.to_string_lossy().ends_with("-wal") || p.to_string_lossy().ends_with("-shm")), "{before:?}");
     f.cli_args(&["attempts", "--json"]);
-    f.cli("usage");
+    f.cli_args(&["usage", "--json"]);
     f.report();
     let pane = fleet_pane(&f);
     assert!(pane.contains("M08 input_tokens 1000\n"), "{pane}");
@@ -449,7 +453,7 @@ fn reads_leave_state_untouched() {
     assert!(live.iter().any(|p| p.ends_with("telemetry.db-wal")), "{live:?}");
     assert_eq!(metric(&f.report(), "M08")["value"], 1500, "the WAL's committed frames are read");
     f.cli_args(&["attempts", "--json"]);
-    f.cli("usage");
+    f.cli_args(&["usage", "--json"]);
     let pane = fleet_pane(&f);
     assert!(pane.contains("M08 input_tokens 1500\n"), "{pane}");
     assert_eq!(names(&state), live);
@@ -477,7 +481,7 @@ fn sidecar_streams_upgrade_v2_store() {
     assert_eq!(user_version(&f), 2);
     let state = f.project.join(".state");
     let before = tree(&state);
-    let (report, v2) = f.cli("usage");
+    let (report, v2) = f.cli_args(&["usage", "--json"]);
     assert_eq!(attempt_usage(&report), serde_json::json!({"input_tokens": 1000, "cached_input_tokens": 400, "cache_write_input_tokens": 0,
         "output_tokens": 120, "reasoning_output_tokens": 80, "total_tokens": 1120, "records": 1}));
     assert_eq!(metric(&f.report(), "M08")["value"], 1000);
@@ -496,7 +500,7 @@ fn sidecar_streams_upgrade_v2_store() {
     assert_eq!(streams(&f), expected(("codex", 2)));
     assert_eq!(user_version(&f), 2);
     let before = tree(&state);
-    assert_eq!(f.cli("usage").1, v2, "usage is byte-identical after the upgrade");
+    assert_eq!(f.cli_args(&["usage", "--json"]).1, v2, "usage is byte-identical after the upgrade");
     assert_eq!(metric(&f.report(), "M08")["value"], 1000);
     assert_eq!(f.cli_args(&["accounting", "status"]).0["stream"], "accounting");
     assert_eq!(tree(&state), before, "reads of an upgraded sidecar create no file");
