@@ -16,6 +16,10 @@ use super::unavailable;
 
 /// An observation older than this at a dispatch decision is labeled `stale` (its value is still shown).
 pub const STALE_AFTER_MS: i64 = 900_000;
+/// What `account` identifies: the execution home's digest, not the provider
+/// login (credentials are never read). Two homes holding one login appear as
+/// two accounts; `shared_window_candidates` names them, nothing is merged.
+pub const ACCOUNT_BASIS: &str = "execution_home";
 /// Fixed-point places for native percent values (Codex prints at most a few).
 const PLACES: u32 = 12;
 const HUNDRED: i128 = 100 * 10i128.pow(PLACES);
@@ -203,6 +207,12 @@ fn window(db: &Connection, account: &str, limit: &str, kind: &str, decided: i64)
     let age = decided - observed;
     let mut entry = json!({"limit_id": limit, "window_kind": kind, "unit": "percent", "window_id": window, "window_minutes": minutes,
         "resets_unix_ms": resets, "observed_unix_ms": observed, "age_ms": age});
+    // Other homes that reported this very window (same limit, kind, length and reset) by the decision:
+    // probably one login. Named, never merged; their values are not used here.
+    let shared: Vec<String> = db.prepare("SELECT DISTINCT account FROM quota_window_observations WHERE limit_id=?1 AND window_kind=?2 AND window_minutes=?3
+        AND resets_unix_ms=?4 AND observed_unix_ms<=?5 AND trust='trusted' AND account IS NOT NULL ORDER BY account")?
+        .query_map(params![limit, kind, minutes, resets, decided], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    if shared.iter().any(|a| a != account) { entry["shared_window_candidates"] = json!(shared); }
     if decided >= resets {
         // The window reset after the snapshot: its remaining value no longer applies, and the new window's is unknown.
         entry["value"] = unavailable("window_reset_since_observation");
@@ -219,15 +229,15 @@ fn window(db: &Connection, account: &str, limit: &str, kind: &str, decided: i64)
 pub(crate) fn headroom(db: &Connection, home: &str, decided: i64) -> Result<Value> {
     let account = format!("sha256:{:x}", <sha2::Sha256 as sha2::Digest>::digest(home.as_bytes()));
     let seen: i64 = db.query_row("SELECT count(*) FROM quota_window_observations WHERE account=?1 AND observed_unix_ms<=?2", params![account, decided], |r| r.get(0))?;
-    if seen == 0 { return Ok(json!({"account": account, "value": unavailable("no_observation")})); }
+    if seen == 0 { return Ok(json!({"account": account, "account_basis": ACCOUNT_BASIS, "value": unavailable("no_observation")})); }
     let limits: Vec<String> = db.prepare("SELECT DISTINCT limit_id FROM quota_window_observations WHERE account=?1 AND observed_unix_ms<=?2 AND trust='trusted' ORDER BY limit_id")?
         .query_map(params![account, decided], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-    if limits.is_empty() { return Ok(json!({"account": account, "value": unavailable("no_trusted_observation")})); }
+    if limits.is_empty() { return Ok(json!({"account": account, "account_basis": ACCOUNT_BASIS, "value": unavailable("no_trusted_observation")})); }
     let mut windows = Vec::new();
     for limit in limits {
         for kind in KINDS { windows.push(window(db, &account, &limit, kind, decided)?); }
     }
-    Ok(json!({"account": account, "windows": windows}))
+    Ok(json!({"account": account, "account_basis": ACCOUNT_BASIS, "windows": windows}))
 }
 
 /// `accounting quota`: synced windows, observation trust, M38/M39 and extended
@@ -244,6 +254,18 @@ pub fn read(project: &Path, db: &Connection) -> Result<Value> {
             "used": r.get::<_, String>(12)?, "remaining": r.get::<_, String>(13)?, "observed_increase": r.get::<_, String>(14)?,
             "plan_type": r.get::<_, Option<String>>(15)?, "observations": r.get::<_, i64>(16)?, "flagged": r.get::<_, i64>(17)?})))?
         .collect::<rusqlite::Result<_>>()?;
+    // Windows of different accounts with the same limit, kind, length and reset: one provider window seen from several homes.
+    let mut groups = BTreeMap::<(String, String, i64, i64), Vec<(String, String)>>::new();
+    for w in &windows {
+        let text = |key: &str| w[key].as_str().unwrap_or("").to_owned();
+        groups.entry((text("limit_id"), text("window_kind"), w["window_minutes"].as_i64().unwrap_or(0), w["resets_unix_ms"].as_i64().unwrap_or(0)))
+            .or_default().push((text("account"), text("window_id")));
+    }
+    let shared: Vec<Value> = groups.into_iter().filter(|(_, members)| members.len() > 1).map(|((limit, kind, minutes, resets), members)| {
+        let (accounts, ids): (Vec<String>, Vec<String>) = members.into_iter().unzip();
+        json!({"limit_id": limit, "window_kind": kind, "window_minutes": minutes, "resets_unix_ms": resets, "accounts": accounts, "window_ids": ids,
+            "evidence": "same_limit_kind_minutes_resets", "merged": false})
+    }).collect();
     let mut trust = BTreeMap::<String, BTreeMap<String, i64>>::new();
     for row in db.prepare("SELECT window_kind,trust,count(*) FROM quota_window_observations GROUP BY window_kind,trust")?
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))? {
@@ -274,7 +296,7 @@ pub fn read(project: &Path, db: &Connection) -> Result<Value> {
     let mut m40 = super::metric("M40", "quota_headroom_at_dispatch", json!({"decisions": list, "stale_after_ms": STALE_AFTER_MS}));
     m40["definition"] = json!("M40.quota-windows-v1");
     metrics.insert("M40".to_owned(), m40);
-    Ok(json!({"semantics": "not_certified", "windows": windows, "observations": trust,
+    Ok(json!({"semantics": "not_certified", "account_basis": ACCOUNT_BASIS, "windows": windows, "shared_window_candidates": shared, "observations": trust,
         "evidence": {"rate_limit_reached_type": {"snapshots": reached, "semantics": "not_certified", "certified": "fixture"}}, "metrics": metrics}))
 }
 
@@ -288,6 +310,11 @@ pub fn text(value: &Value) -> String {
             w["account"].as_str().unwrap_or(""), w["limit_id"].as_str().unwrap_or(""), w["window_kind"].as_str().unwrap_or(""), w["resets_unix_ms"],
             w["used"].as_str().unwrap_or(""), w["remaining"].as_str().unwrap_or(""), w["observed_increase"].as_str().unwrap_or(""),
             w["observations"], w["flagged"], w["start_evidence"].as_str().unwrap_or(""));
+    }
+    for c in value["shared_window_candidates"].as_array().into_iter().flatten() {
+        let accounts: Vec<&str> = c["accounts"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        out += &format!("shared window candidate {} {} reset {}: accounts {} (execution homes; not merged, never summed)\n",
+            c["limit_id"].as_str().unwrap_or(""), c["window_kind"].as_str().unwrap_or(""), c["resets_unix_ms"], accounts.join(", "));
     }
     for id in ["M38", "M39"] {
         let m = &value["metrics"][id];

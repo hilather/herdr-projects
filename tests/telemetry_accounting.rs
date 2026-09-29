@@ -368,12 +368,17 @@ fn repricing_uses_rate_effective_at_usage_time() {
 /// A fixture rollout whose rate-limit snapshots carry `@Tn@` (RFC 3339 observation
 /// times, from Unix ms) and `@Rn@` (reset times, Unix seconds), written beside the project.
 fn quota_rollout(f: &Fixture, name: &str, fixture: &str, start: i64, times: &[i64], resets: &[i64]) {
+    quota_rollout_in(f, &f.home, name, fixture, start, times, resets);
+}
+
+/// `quota_rollout` under another execution home.
+fn quota_rollout_in(f: &Fixture, home: &Path, name: &str, fixture: &str, start: i64, times: &[i64], resets: &[i64]) {
     let mut text = fs::read_to_string(Path::new(ACCOUNTING).join(fixture)).unwrap();
     for (n, t) in times.iter().enumerate() { text = text.replace(&format!("@T{}@", n + 1), &jiff::Timestamp::from_millisecond(*t).unwrap().to_string()); }
     for (n, r) in resets.iter().enumerate() { text = text.replace(&format!("@R{}@", n + 1), &r.to_string()); }
     let path = f.tmp.path().join(fixture);
     fs::write(&path, text).unwrap();
-    f.rollout(&f.home, name, &[path.to_str().unwrap()], &f.worktree(), start, "0.154.0");
+    f.rollout(home, name, &[path.to_str().unwrap()], &f.worktree(), start, "0.154.0");
 }
 
 /// M40 at the fixture's one dispatch decision, per window, from `accounting quota`.
@@ -430,7 +435,7 @@ fn window_reset_starts_new_window_not_negative() {
         ("50".to_owned(), "50".to_owned(), "used_decreased_without_reset".to_owned(), w1.clone()));
 
     // Headroom at dispatch: the latest trusted snapshot at or before the decision.
-    assert_eq!(headroom(&f), json!({"attempt_id": f.attempt, "decided_unix_ms": d, "service": "codex", "account": account, "windows": [
+    assert_eq!(headroom(&f), json!({"attempt_id": f.attempt, "decided_unix_ms": d, "service": "codex", "account": account, "account_basis": "execution_home", "windows": [
         {"limit_id": "codex", "window_kind": "primary", "unit": "percent", "window_id": w1, "window_minutes": 300, "resets_unix_ms": r1 * 1000,
          "observed_unix_ms": t4, "age_ms": 60_000, "value": "40", "used": "60", "freshness": "fresh"},
         {"limit_id": "codex", "window_kind": "secondary", "value": unavailable("not_reported")}]}));
@@ -618,6 +623,62 @@ fn secondary_window_is_tracked() {
     assert_eq!(headroom(&f)["windows"][1], json!({"limit_id": "codex", "window_kind": "secondary", "value": {"status": "unavailable", "reason": "not_collected"}}));
 }
 
+/// Live A4 run: two execution homes holding one login reported the same
+/// window. Home A (the attempt's) reads 37.5 one minute before dispatch; home B
+/// reads 37.5 two minutes before and 40 half a minute before it, for the same
+/// `codex` primary window (300 minutes, same `resets_at`), plus a secondary
+/// window A reports as `null`. Accounts are keyed by home (`account_basis:
+/// execution_home`): two primary windows (increases 0 and 2.5, remaining 62.5
+/// and 60), named together as one shared-window candidate, never merged or
+/// summed (not 37.5 + 40 = 77.5 used, not 2.5 attributed to A). A's headroom
+/// stays its own 62.5, not B's newer 60; the secondary window is not shared.
+#[test]
+fn shared_window_across_homes_is_flagged_not_summed() {
+    let f = Fixture::new();
+    let d = f.decided;
+    let other = fs::canonicalize(f.tmp.path()).unwrap().join("other-home");
+    let (r1, s1) = (d / 1000 + 3_600, d / 1000 + 86_400);
+    quota_rollout(&f, "home-a", "quota-single.jsonl", d - 60_000, &[d - 60_000], &[r1]);
+    quota_rollout_in(&f, &other, "home-b", "quota-shared.jsonl", d - 120_000, &[d - 120_000, d - 30_000], &[r1, s1]);
+    f.cli("collect");
+    assert_eq!(f.cli_args(&["accounting", "sync"]).0["quota_windows"], 3);
+    let (quota, first) = f.cli_args(&["accounting", "quota", "--json"]);
+    let (a, b) = (digest(&f.home), digest(&other));
+    let id = |account: &str, kind: &str, resets: i64| format!("codex:{account}:codex:{kind}:{}", resets * 1000);
+    let window = |account: &str, kind: &str, minutes: i64, resets: i64, (first, last): (i64, i64), [first_used, used, remaining, increase]: [&str; 4], observations: i64|
+        json!({"window_id": id(account, kind, resets), "service": "codex", "account": account, "limit_id": "codex", "window_kind": kind, "unit": "percent",
+            "window_minutes": minutes, "window_start_unix_ms": resets * 1000 - minutes * 60_000, "resets_unix_ms": resets * 1000, "start_evidence": "first_observation",
+            "first_observed_unix_ms": first, "last_observed_unix_ms": last, "first_used": first_used, "used": used, "remaining": remaining,
+            "observed_increase": increase, "plan_type": "pro", "observations": observations, "flagged": 0});
+    let a_windows = vec![window(&a, "primary", 300, r1, (d - 60_000, d - 60_000), ["37.5", "37.5", "62.5", "0"], 1)];
+    let b_windows = vec![window(&b, "primary", 300, r1, (d - 120_000, d - 30_000), ["37.5", "40", "60", "2.5"], 2),
+        window(&b, "secondary", 10_080, s1, (d - 30_000, d - 30_000), ["10", "10", "90", "0"], 1)];
+    // Windows are listed by account: the digests' order decides which home comes first.
+    let (windows, accounts) = if a < b { ([a_windows, b_windows].concat(), [&a, &b]) } else { ([b_windows, a_windows].concat(), [&b, &a]) };
+    assert_eq!(quota["account_basis"], "execution_home");
+    assert_eq!(quota["windows"], json!(windows));
+    assert_eq!(quota["shared_window_candidates"], json!([{"limit_id": "codex", "window_kind": "primary", "window_minutes": 300, "resets_unix_ms": r1 * 1000,
+        "accounts": accounts, "window_ids": accounts.map(|account| id(account, "primary", r1)), "evidence": "same_limit_kind_minutes_resets", "merged": false}]));
+    assert_eq!(quota["observations"], json!({"primary": {"trusted": 3}, "secondary": {"trusted": 1, "not_reported": 2}}));
+
+    // A's headroom is its own latest snapshot (62.5), with the candidate named; B's value is not used.
+    let expected = json!({"attempt_id": f.attempt, "decided_unix_ms": d, "service": "codex", "account": a, "account_basis": "execution_home", "windows": [
+        {"limit_id": "codex", "window_kind": "primary", "unit": "percent", "window_id": id(&a, "primary", r1), "window_minutes": 300, "resets_unix_ms": r1 * 1000,
+         "observed_unix_ms": d - 60_000, "age_ms": 60_000, "shared_window_candidates": accounts, "value": "62.5", "used": "37.5", "freshness": "fresh"},
+        {"limit_id": "codex", "window_kind": "secondary", "value": {"status": "unavailable", "reason": "not_reported"}}]});
+    assert_eq!(headroom(&f), expected);
+    assert_eq!(f.report()["metrics"]["M40"]["decisions"], json!([expected]));
+    let text = f.text(&["accounting", "quota"]);
+    let line = format!("shared window candidate codex primary reset {}: accounts {}, {} (execution homes; not merged, never summed)", r1 * 1000, accounts[0], accounts[1]);
+    assert!(text.lines().any(|l| l == line), "{line:?} in\n{text}");
+    assert!(text.lines().any(|l| l == format!("M40 {} codex primary remaining 62.5% age_ms=60000 fresh", f.attempt)), "{text}");
+
+    // Replay leaves everything byte-identical.
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "quota", "--json"]).1, first);
+}
+
 /// Herdr stand-in: logs every call with its socket, answers `agent list` from
 /// `$HOME/agents.json`, and exits without a reply when that file is absent
 /// (server not answering). Anything else is refused.
@@ -763,15 +824,18 @@ fn attention_intervals_union_and_censor() {
     // M32: (120000 + 240000) / (240000 + 420000); a3 unobserved is counted, not 0.
     // M33: Herdr's `blocked` has no typed reason.
     let m31 = json!({"definition": "M31.attention-v1", "name": "human_interventions_per_accepted_task", "reason_type": "blocked_untyped",
-        "source": "controller_observed", "coverage": {"attempts": 1, "complete": 1, "not_observed": 0, "with_gaps": 0}, "numerator": 2, "denominator": 1, "value": "2/1"});
-    let m32 = json!({"definition": "M32.attention-v1", "name": "waiting_on_you_share", "unit": "ms", "waiting_union_ms": 300_000,
+        "source": "controller_observed", "scope": "human_routed_waits", "coverage": {"attempts": 1, "complete": 1, "not_observed": 0, "with_gaps": 0}, "numerator": 2, "denominator": 1, "value": "2/1"});
+    let m32 = json!({"definition": "M32.attention-v1", "name": "waiting_on_you_share", "unit": "ms", "scope": "human_routed_waits", "waiting_union_ms": 300_000,
         "coverage": {"attempts": 3, "observed": 2, "not_observed": 1, "with_gaps": 1, "censored_intervals": 3},
         "numerator": 360_000, "denominator": 660_000, "value": "360000/660000"});
     let m33 = json!({"definition": "M33.attention-v1", "name": "permission_prompts_per_attempt",
         "value": {"status": "unavailable", "reason": "attention_reason_not_exposed"},
         "detail": "stock Herdr reports `blocked` without a typed reason: a permission prompt is not distinguishable from a question or trust dialog"});
     assert_eq!(attention["metrics"], json!({"M31": m31, "M32": m32, "M33": m33}));
-    assert_eq!(attention["signal"]["certified"], "fixture");
+    // Codex approval prompts were certified live (codex-live-0.154.0-a4.md §3); other kinds stay fixture.
+    assert_eq!((&attention["signal"]["certified"], &attention["signal"]["certified_by_agent_kind"], &attention["signal"]["other_agent_kinds"], &attention["signal"]["scope"]),
+        (&json!("live"), &json!({"codex": "live"}), &json!("fixture"), &json!("human_routed_waits")));
+    assert!(attention["attempts"].as_array().unwrap().iter().all(|a| a["certified"] == "live"), "{attention}");
     // The central report takes the lane's M31–M33.
     let report = cli(&["report", "--json"]).0;
     assert_eq!((&report["metrics"]["M31"], &report["metrics"]["M32"], &report["metrics"]["M33"]), (&m31, &m32, &m33));
@@ -779,4 +843,5 @@ fn attention_intervals_union_and_censor() {
     assert!(text.lines().any(|l| l == format!("  gap {}..open not_observed", minute(13.0))), "{text}");
     assert!(text.lines().any(|l| l == "M32 waiting_on_you_share 360000/660000"), "{text}");
     assert!(text.lines().any(|l| l == "attempt a3 ended n/a (not_observed)"), "{text}");
+    assert!(text.lines().any(|l| l == "signal herdr-agent-list-v1 agent_status=blocked (certified: live for codex; fixture for other agent kinds; human_routed_waits)"), "{text}");
 }

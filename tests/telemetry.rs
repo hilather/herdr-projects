@@ -372,7 +372,7 @@ fn quota_headroom_at_dispatch() {
     let account = digest(&f.home);
     let report = f.report();
     assert_eq!(metric(&report, "M40")["decisions"], serde_json::json!([{"attempt_id": f.attempt, "decided_unix_ms": f.decided, "service": "codex",
-        "account": account, "windows": [
+        "account": account, "account_basis": "execution_home", "windows": [
             {"limit_id": "codex", "window_kind": "primary", "unit": "percent", "window_id": format!("codex:{account}:codex:primary:{}", resets * 1000),
              "window_minutes": 300, "resets_unix_ms": resets * 1000, "observed_unix_ms": f.decided - 60_000, "age_ms": 60_000,
              "value": "62.5", "used": "37.5", "freshness": "fresh"},
@@ -410,7 +410,7 @@ fn quota_headroom_at_dispatch() {
     f.cli("collect");
     f.cli_args(&["accounting", "sync"]);
     assert_eq!(metric(&f.report(), "M40")["decisions"], serde_json::json!([{"attempt_id": f.attempt, "decided_unix_ms": f.decided, "service": "codex",
-        "account": digest(&f.home), "value": unavailable("no_observation")}]));
+        "account": digest(&f.home), "account_basis": "execution_home", "value": unavailable("no_observation")}]));
     assert!(f.text(&["report"]).lines().any(|l| l == format!("M40 quota_headroom_at_dispatch {} n/a (no_observation)", f.attempt)));
 }
 
@@ -751,7 +751,7 @@ fn attempts_show_attention_summary() {
     // Gaps: 2–4 `herdr_unreachable`, from 4 `not_observed`.
     assert_eq!(attention(), [(first, unavailable("not_launched")), (attempt.clone(), serde_json::json!({
         "interventions": 2, "uncertain_starts": 0, "waiting_ms": 60_000, "observed_ms": 120_000, "intervals": 2, "censored_intervals": 1,
-        "gaps": {"herdr_unreachable": 1, "not_observed": 1}, "reason_type": "blocked_untyped", "basis": "fixture", "source": "herdr-agent-list-v1"}))]);
+        "gaps": {"herdr_unreachable": 1, "not_observed": 1}, "reason_type": "blocked_untyped", "basis": "live", "source": "herdr-agent-list-v1"}))]);
     let text = cli(&["attempts"]);
     let line = text.lines().find(|l| l.starts_with(attempt.as_str())).unwrap();
     assert!(line.contains(" attention=waits=2 waiting_ms=60000 censored=1 gaps=2 usage="), "{line}");

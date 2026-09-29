@@ -289,9 +289,23 @@ fn union_ms(mut spans: Vec<(i64, i64)>) -> i64 {
     total
 }
 
+/// Agent kinds whose `blocked` label was certified live as waiting on a human
+/// approval prompt (docs/telemetry/codex-live-0.154.0-a4.md §3). Every other
+/// kind's approval prompt is still `fixture`.
+const LIVE_KINDS: [&str; 1] = ["codex"];
+/// What M31/M32 can see: approvals decided by Codex's automatic reviewer never show `blocked`.
+const SCOPE: &str = "human_routed_waits";
+
+/// The certification of the signal for one attempt's agent kind.
+fn certified(kind: &str) -> &'static str { if LIVE_KINDS.contains(&kind) { "live" } else { "fixture" } }
+
 pub fn signal() -> Value {
-    json!({"source": SOURCE, "field": "agent_status", "waiting_states": [WAITING], "reason_type": "blocked_untyped", "certified": "fixture",
-        "basis": "stock Herdr `agent list` agent_status; `blocked` was observed live (herdr 0.9.1) only for claude's trust dialog (docs/herdr-notes.md), not for codex approval prompts",
+    json!({"source": SOURCE, "field": "agent_status", "waiting_states": [WAITING], "reason_type": "blocked_untyped", "certified": "live",
+        "certified_by_agent_kind": LIVE_KINDS.iter().map(|k| (k.to_string(), json!("live"))).collect::<serde_json::Map<_, _>>(), "other_agent_kinds": "fixture",
+        "basis": "stock Herdr `agent list` agent_status; `blocked` was observed live (herdr 0.9.1) for a codex 0.154.0 approval prompt routed to the human \
+            (docs/telemetry/codex-live-0.154.0-a4.md) and for claude's trust dialog (docs/herdr-notes.md); other agent kinds' approval prompts are not certified live",
+        "scope": SCOPE,
+        "caveat": "approvals decided by codex's automatic reviewer (approvals_reviewer = auto_review) never show `blocked`: they are not waits and M31/M32 do not count them",
         "resolution": "sample"})
 }
 
@@ -324,7 +338,7 @@ pub fn read(project: &Path, db: &Connection) -> Result<Value> {
             interventions += d.interventions();
         }
         attempts.push(json!({"attempt_id": b.attempt, "task_id": b.task, "state": if b.open { "open" } else { "ended" }, "launched_unix_ms": b.launched,
-            "ended_unix_ms": b.ended, "attention": attention_json(b, d.as_ref())}));
+            "ended_unix_ms": b.ended, "certified": certified(&b.kind), "attention": attention_json(b, d.as_ref())}));
     }
     Ok(json!({"signal": signal(), "attempts": attempts, "orphan_samples": orphans,
         "fleet": {"waiting_union_ms": union_ms(spans), "waiting_sum_ms": sum, "interventions": interventions},
@@ -387,7 +401,7 @@ fn computed(project: &Path, all: &[Attention], since: Option<i64>) -> Result<BTr
     let counted: usize = t.iter().filter_map(|(_, d)| d.as_ref()).map(Derived::interventions).sum();
     let uncertain: usize = t.iter().filter_map(|(_, d)| d.as_ref()).map(Derived::uncertain).sum();
     let coverage = json!({"attempts": t.len(), "complete": complete, "not_observed": not_observed, "with_gaps": t.len() - complete - not_observed});
-    let base = json!({"reason_type": "blocked_untyped", "source": "controller_observed", "coverage": coverage});
+    let base = json!({"reason_type": "blocked_untyped", "source": "controller_observed", "scope": SCOPE, "coverage": coverage});
     let m31 = if complete < t.len() {
         let mut body = base;
         body["value"] = unavailable("incomplete_observation");
@@ -402,7 +416,7 @@ fn computed(project: &Path, all: &[Attention], since: Option<i64>) -> Result<BTr
     let spans = observed.iter().flat_map(|d| d.intervals.iter().filter_map(|i| i.duration().map(|n| (i.opened, i.opened + n)))).collect();
     let coverage = json!({"attempts": assigned.len(), "observed": observed.len(), "not_observed": assigned.len() - observed.len(),
         "with_gaps": observed.iter().filter(|d| !d.gaps.is_empty()).count(), "censored_intervals": observed.iter().map(|d| d.censored()).sum::<usize>()});
-    let base = json!({"unit": "ms", "coverage": coverage, "waiting_union_ms": union_ms(spans)});
+    let base = json!({"unit": "ms", "scope": SCOPE, "coverage": coverage, "waiting_union_ms": union_ms(spans)});
     let m32 = if observed.is_empty() {
         let mut body = base;
         body["value"] = unavailable("not_observed");
@@ -427,7 +441,9 @@ pub fn text(value: &Value) -> String {
     let reason = |v: &Value| format!("n/a ({})", v["reason"].as_str().unwrap_or("unknown"));
     if value["status"] == "unavailable" { return reason(value) + "\n"; }
     let s = &value["signal"];
-    let mut out = format!("signal {} {}={} (certified: {})\n", s["source"].as_str().unwrap_or(""), s["field"].as_str().unwrap_or(""), WAITING, s["certified"].as_str().unwrap_or(""));
+    let live = s["certified_by_agent_kind"].as_object().map(|kinds| kinds.keys().cloned().collect::<Vec<_>>().join(", ")).unwrap_or_default();
+    let mut out = format!("signal {} {}={} (certified: live for {live}; {} for other agent kinds; {})\n", s["source"].as_str().unwrap_or(""),
+        s["field"].as_str().unwrap_or(""), WAITING, s["other_agent_kinds"].as_str().unwrap_or(""), s["scope"].as_str().unwrap_or(""));
     let at = |v: &Value| v.as_i64().map_or("open".to_owned(), |n| n.to_string());
     for a in value["attempts"].as_array().into_iter().flatten() {
         let (id, state, attention) = (a["attempt_id"].as_str().unwrap_or(""), a["state"].as_str().unwrap_or(""), &a["attention"]);

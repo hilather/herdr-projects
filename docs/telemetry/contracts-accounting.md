@@ -268,12 +268,18 @@ sync adds a `quota_windows` count). Migrating to 4 clears `usage_ledger`
 (`ledger_not_synced` until the next sync). Plan: doc 05 §5b, doc 07
 M38–M40. The live run observed the fields but certified no semantics
 ([codex-live-0.154.0.md](codex-live-0.154.0.md)); every output says
-`semantics: not_certified`.
+`semantics: not_certified`. The A4 live run
+([codex-live-0.154.0-a4.md](codex-live-0.154.0-a4.md) §2) observed
+`resets_at` **fixed within a window**: 21 snapshots over 3 h 50 min and two
+homes all reported the same `resets_at`, with no drift or jitter. The
+`reset_moved` evidence below stays as the fallback for a later reset seen
+before the earlier one elapsed; it was not observed live.
 
 **Observations** (`quota_window_observations` from stream version 6, §7;
 one per `codex_rate_limits` row and window kind):
-service `codex`; account = the rollout's `home_digest` (one execution home is
-one login; a session seen under two homes is `account_ambiguous`); `limit_id`;
+service `codex`; account = the rollout's `home_digest`, and every output
+says `account_basis: execution_home` (a session seen under two homes is
+`account_ambiguous`); `limit_id`;
 `window_kind` `primary`, or `secondary` from the snapshot's A4
 `codex_rate_limit_windows` row (certified `fixture`; the live run saw
 `null`); unit `percent`; `window_minutes`; `resets_unix_ms` (`resets_at`
@@ -306,8 +312,26 @@ reset − `window_minutes`, first/last trusted observation, `first_used`,
 (account-wide: never attributed to a task, as the window's invocation scope
 is not certified), latest `plan_type`, trusted `observations` and `flagged`.
 
+**Account identity.** The account is the execution home, not the provider
+login: credentials are never read. In the A4 live run, two homes holding
+copies of one login reported identical windows at overlapping times, so the
+provider window belongs to the login. Within one home, "one home = one
+login" held. Herdr does not merge such accounts. It names them: windows of
+different accounts with the same `limit_id`, `window_kind`,
+`window_minutes` and `resets_unix_ms` are a **shared-window candidate**
+(evidence `same_limit_kind_minutes_resets`, `merged: false`). The accounts
+may be one login. Two unrelated logins whose resets fall on the same second
+would also match, so this is a candidate, not proof. Values of different
+accounts are never summed, averaged or used for each other: each window
+keeps its own `used`, `remaining` and `observed_increase`. Adding two homes'
+increases would count the same consumption twice.
+
 **`accounting quota [--json]`** (read-only; `collection_not_run` without a
-sidecar, `ledger_not_synced` before a sync): `windows`, `observations`
+sidecar, `ledger_not_synced` before a sync): `account_basis:
+execution_home`, `windows`, `shared_window_candidates` (per candidate
+`{limit_id, window_kind, window_minutes, resets_unix_ms, accounts,
+window_ids, evidence, merged: false}`, accounts in account order; text: one
+`shared window candidate …` line each), `observations`
 (count per window kind and trust), `evidence.rate_limit_reached_type`
 (`snapshots` per value, `semantics: not_certified`, `certified: fixture`),
 and `metrics`:
@@ -319,7 +343,9 @@ and `metrics`:
   typed provider error field is collected or certified; human-readable
   messages never become certified fields.
 - M40 extended (`M40.quota-windows-v1`): per dispatch decision (attempt
-  order), `{attempt_id, decided_unix_ms, service, account, windows}`; per
+  order), `{attempt_id, decided_unix_ms, service, account, account_basis:
+  execution_home, windows}` (`account_basis` also on the decision-level
+  `no_observation`/`no_trusted_observation` entries); per
   limit, `primary` = the latest trusted observation of the attempt's account
   with `observed ≤ decided` (ties: session, ordinal descending) with
   `window_id, window_minutes, resets_unix_ms, observed_unix_ms, age_ms`, then
@@ -327,6 +353,11 @@ and `metrics`:
   `age_ms > stale_after_ms` = 900000, value still shown); if the window reset
   at or before the decision, `value` is `unavailable
   window_reset_since_observation` (the new window's value is unknown).
+  When other accounts reported a trusted observation of the same window
+  (same limit, kind, minutes and reset) by the decision, the entry has
+  `shared_window_candidates` = every such account, the decision's included,
+  in account order. The value is still the decision account's own; a newer
+  value from another home is never substituted.
   `secondary` follows the same rules from the secondary observations; with
   no trusted one it is `unavailable not_reported` (the latest snapshot's
   window was `null`), `not_collected` (no snapshot carries the kind, e.g.
@@ -349,6 +380,15 @@ increase `7.25`, remaining `87.75`), never −55. A snapshot 20 minutes old is
 with `primary: null` is `incomplete` → `no_trusted_observation`, never 0.
 Its rollouts report `secondary: null`: `not_reported`.
 
+Test `shared_window_across_homes_is_flagged_not_summed`: home A reads
+37.5 one minute before dispatch; home B reads 37.5 then 40 (two minutes and
+half a minute before) for the same 300-minute window, and a secondary window
+that A reports as `null`. Three windows: A primary (increase `0`, remaining
+`62.5`), B primary (increase `2.5`, remaining `60`), B secondary (`10`). One
+candidate names A's and B's primary windows; the secondary is not shared.
+A's headroom is `62.5` (its own), not B's newer `60` and not
+100 − (37.5 + 40). The report's M40 equals `accounting quota`'s.
+
 Test `secondary_window_is_tracked`: a 10,080-minute secondary window reads
 10 → 12.5 before dispatch (headroom `87.5`, age 120000, increase `2.5`),
 11 afterwards (flagged), then `null` (`not_reported`) while the primary
@@ -367,9 +407,27 @@ exists.
 
 **Signal.** Stock Herdr's `agent list` (`result.agents[]`), field
 `agent_status`: the waiting state is `blocked`; `working`, `idle`, `done`
-are not waiting. Certification basis: `fixture`. `blocked` was observed live
-on herdr 0.9.1 only for claude's trust dialog (docs/herdr-notes.md, stages 2
-and 3); a Codex approval prompt showing as `blocked` is not certified live.
+are not waiting. Certification basis: **`live` for Codex**, `fixture` for
+every other agent kind. In the A4 live run
+([codex-live-0.154.0-a4.md](codex-live-0.154.0-a4.md) §3; herdr 0.9.1,
+codex 0.154.0), a Codex approval prompt routed to the human showed as
+`blocked` from the first sample after the prompt for 10 consecutive 4 s
+samples. It then went `working` after the approval key and `idle` after
+that. The product measured one closed wait of 37848 ms. For claude,
+`blocked` was observed live only for its trust dialog (docs/herdr-notes.md,
+stages 2 and 3), not for its approval prompts, so it stays `fixture`.
+**Caveat:** Codex's automatic reviewer (`approvals_reviewer =
+auto_review`, the guardian child session) decides an approval without the
+human, and such an attempt never shows `blocked` (the review appears as
+`working`). M31/M32 therefore cover **human-routed waits only**
+(`scope: human_routed_waits`); auto-reviewed approvals are not waits and are
+not counted. `signal` carries `certified: live` (the signal as certified),
+`certified_by_agent_kind {codex: live}`, `other_agent_kinds: fixture`,
+`scope` and `caveat`. Each attempt entry of `accounting attention` carries
+its own `certified` (`live` for kind `codex`, else `fixture`). The outcome
+record's `attention.basis` (contracts §4) reads `signal.certified`. It shows
+`live` for every attempt until the steward takes the attempt's own
+`certified`.
 Herdr gives no timestamp for a state change and no typed reason, so every
 interval has reason type `blocked_untyped` and sample resolution. The
 existing thread group rule (`blocked` ≥ 30 s → waiting-on-you) is finer than
@@ -418,7 +476,7 @@ censored waits is excluded). An attempt with no successful sample is
 
 **`accounting attention [--json]`** (read-only): `signal`, per launched
 attempt `{attempt_id, task_id, state: open|ended, launched_unix_ms,
-ended_unix_ms, attention}`, `orphan_samples`, `fleet {waiting_union_ms,
+ended_unix_ms, certified, attention}`, `orphan_samples`, `fleet {waiting_union_ms,
 waiting_sum_ms, interventions}` (overlapping waits of different attempts
 counted once in the union), and `metrics`:
 
@@ -427,12 +485,13 @@ counted once in the union), and `metrics`:
   same window rule). Needs every such attempt observed without gaps; else
   `unavailable incomplete_observation` with `observed_interventions` (a lower
   bound), `uncertain_starts` and `denominator`. `coverage {attempts, complete,
-  not_observed, with_gaps}`.
+  not_observed, with_gaps}`, `scope: human_routed_waits`.
 - M32 `waiting_on_you_share` (`M32.attention-v1`): Σ `waiting_ms` / Σ
   `observed_ms` over launched attempts decided in the window (all without
   `--since`), unit ms, unreduced `"n/d"`; `waiting_union_ms` shows the fleet
   union; `coverage {attempts, observed, not_observed, with_gaps,
-  censored_intervals}`. No observed attempt → `unavailable not_observed`.
+  censored_intervals}`, `scope: human_routed_waits`. No observed attempt →
+  `unavailable not_observed`.
 - M33 `permission_prompts_per_attempt`: `unavailable
   attention_reason_not_exposed` (`blocked` has no typed reason).
 - Before any sample exists (or without a sidecar) all three stay
@@ -444,13 +503,17 @@ ending at 4.5 → `attempt_ended`; a2 waits 2–6 (240000), at 7 (censored by a
 `herdr_unreachable` gap 7–9), at 9 (`after_gap`, not counted), then gaps
 10–13 and from 13 (`not_observed`); a3 cancelled before any pass is
 `not_observed`. Union 300000, sum 360000; M31 `2/1`; M32
-`360000/660000`; every Herdr call is `agent list`; no screen text stored.
+`360000/660000`; every Herdr call is `agent list`; no screen text stored;
+the signal is `live` for its Codex attempts.
 
 ## 7. A4 metadata (B7) and stream version 6
 
 Stream `accounting` version 6 (`0006_a4_metadata.sql`) consumes lane A's A4
-tables (ingest 0004, contracts-collection.md A4), read by SQL only, all
-certified `fixture` until the planned live run: `rollout_metadata`
+tables (ingest 0004, contracts-collection.md A4), read by SQL only (the
+A4 live run certified `model_provider`, `subagent_kind` and record line
+times `live`; `secondary` windows, `rate_limit_reached_type`,
+`forked_from_id` and spawned-subagent links stay `fixture`, see
+[codex-live-0.154.0-a4.md](codex-live-0.154.0-a4.md) §1): `rollout_metadata`
 (§3 roles and child links, §4 provider check), `codex_usage_times` (§4 usage
 interval) and `codex_rate_limit_windows` (§5 secondary window and reached
 type). It adds the derived tables `session_nodes` (replacing
