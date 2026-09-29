@@ -212,7 +212,7 @@ reads `unavailable: predates_lifecycle_log`.
 | `attempt_id`, `task_id`, `configuration_id`, `classification` | decision row |
 | `reserved/launching/running/terminal_unix_ms` | marks; absent later marks are `null` with `state: open` |
 | `terminal_state` | terminal mark, else `open` |
-| `active_ms` | `terminal − running`; open → `censored`; no running mark → `unavailable` |
+| `active_ms` | `terminal − running` wall time, idle time at the prompt included (not an activity signal; attention is S4); open → `censored`; no running mark → `unavailable`. The text form labels it `wall_ms` |
 | `queue_to_launch_ms` | `launching − reserved` |
 | `result` | earliest `result_submissions` for the attempt: `submission_id`, `candidate_oid`, `created_unix_ms`; none → `not_submitted` |
 | `verification` | per acceptance policy of that submission, its latest `verification_runs` row: `rejected` (+ `reason` excerpt) if any policy's is, `accepted` only if every policy's is, else `pending`; `policies` lists each |

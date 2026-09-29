@@ -136,7 +136,8 @@ fn verification(db: &Connection, submission: &str, home: Option<&str>) -> rusqli
     Ok(combined)
 }
 
-/// One line per attempt for the terminal.
+/// One line per attempt for the terminal. `active_ms` prints as `wall_ms`:
+/// it is wall time from the running mark to the terminal mark, idle included.
 pub fn text(report: &Value) -> String {
     let show = |v: &Value| match v {
         Value::Object(map) if map.contains_key("total_tokens") => format!("in={} out={} total={}", map["input_tokens"], map["output_tokens"], map["total_tokens"]),
@@ -146,7 +147,7 @@ pub fn text(report: &Value) -> String {
         }
         other => other.to_string(),
     };
-    report["attempts"].as_array().into_iter().flatten().map(|a| format!("{} task={} state={} active_ms={} result={} verification={} integration={} accepted={} usage={}\n",
+    report["attempts"].as_array().into_iter().flatten().map(|a| format!("{} task={} state={} wall_ms={} result={} verification={} integration={} accepted={} usage={}\n",
         a["attempt_id"].as_str().unwrap_or(""), a["task_id"].as_str().unwrap_or(""), a["terminal_state"].as_str().unwrap_or(""), show(&a["active_ms"]),
         show(&a["result"]), show(&a["verification"]), show(&a["integration"]), a["accepted"], show(&a["usage"]))).collect()
 }
