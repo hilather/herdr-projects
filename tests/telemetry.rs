@@ -485,9 +485,15 @@ fn sidecar_streams_upgrade_v2_store() {
 
     f.cli("collect");
     f.cli("collect");
-    // Only the codex stream's history is asserted here; each lane's stream is
-    // asserted by that lane's own tests, so adding a lane never edits this one.
-    assert_eq!(streams(&f).into_iter().find(|(stream, _)| stream == "codex"), Some(("codex".to_owned(), 2)));
+    // Every lane stream with migrations is at its latest version beside `codex`.
+    let expected = |extra: (&str, i64)| {
+        let mut streams: std::collections::BTreeMap<String, i64> = herdr_projects::telemetry::LANES.iter().filter(|l| !l.migrations.is_empty())
+            .map(|l| (l.stream.to_owned(), l.migrations.len() as i64)).collect();
+        streams.insert("codex".to_owned(), 2);
+        streams.insert(extra.0.to_owned(), extra.1);
+        streams.into_iter().collect::<Vec<_>>()
+    };
+    assert_eq!(streams(&f), expected(("codex", 2)));
     assert_eq!(user_version(&f), 2);
     let before = tree(&state);
     assert_eq!(f.cli("usage").1, v2, "usage is byte-identical after the upgrade");
@@ -500,7 +506,7 @@ fn sidecar_streams_upgrade_v2_store() {
         let error = f.cli_fail(args);
         assert!(error.contains("telemetry sidecar stream accounting version 99 is newer than this binary"), "{args:?}: {error}");
     }
-    assert_eq!(streams(&f), [("accounting".to_owned(), 99), ("codex".to_owned(), 2), ("ingest".to_owned(), 1)]);
+    assert_eq!(streams(&f), expected(("accounting", 99)));
 }
 
 /// Rollout `name` of session `sid` holding `head.jsonl` (one record: 1000 in, 120 out).
