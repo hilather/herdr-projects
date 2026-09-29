@@ -36,7 +36,7 @@ needs a new reviewed revision, not a silent reinterpretation.
   (RFC 8785 subset, as doc 03 §4). Digests are `sha256:` + lowercase hex.
 - **Time.** Unix milliseconds from the controller's `now` at the transition.
   Codex times are kept as reported and never reorder canonical events.
-- **Stores.** Canonical: `<project>/.state/state.db`, migrations 0049–0054 (0052 collector bindings, contracts-collection.md; 0053 candidate groups, contracts-quality.md §3; 0054 review capture, contracts-review.md).
+- **Stores.** Canonical: `<project>/.state/state.db`, migrations 0049–0054 (0052 collector bindings, contracts-collection.md; 0053 candidate groups, contracts-quality.md §3; 0054 review capture, contracts-review.md; 0055 finding triage and duplicate history, contracts-review.md §5).
   Sidecar: `<project>/.state/telemetry.db`, own sequence under
   `migrations/telemetry/`, mode 0600, created on first collect. No
   cross-database transaction or foreign key; sidecar rows reference canonical
@@ -517,5 +517,6 @@ Landed since phase 1 (see the lane contracts): collector bindings
 estimates (contracts-accounting.md §2–§4), proxy signals and integration
 outcomes, candidate groups and selection (contracts-quality.md §1–§4),
 attention intervals (contracts-accounting.md §6), Codex session metadata
-(contracts-collection.md A4), review opportunities, sessions and completions
+(contracts-collection.md A4), review opportunities, sessions and completions,
+finding triage, claims and duplicate merge/unmerge history
 (contracts-review.md).
