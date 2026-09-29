@@ -41,10 +41,8 @@ pub(super) fn read_published<T>(path:&Path,publication:&Publication,budget:&mut 
         }
     }
     let before=std::fs::symlink_metadata(path)?;ensure!(before.is_file()&&before.nlink()==1,"identity database must be a single-link regular file");
-    let mut db=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_ONLY|OpenFlags::SQLITE_OPEN_NO_MUTEX|OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
-    // SQLite also limits whole encoded rows, so allow headroom for a bounded
-    // 16 MiB provenance field plus its identity payload and metadata.
-    db.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,32*1024*1024)?;
+    let identity=reuse::Identity::of(&before);
+    let mut db=match reuse::take(path,&identity) {Some(db)=>db,None=>reuse::open(path)?};
     let deadline=budget.deadline;let cancellation=budget.cancellation.clone();
     db.progress_handler(1000,Some(move||cancellation.is_cancelled()||Instant::now()>=deadline));
     #[cfg(test)]
@@ -55,17 +53,112 @@ pub(super) fn read_published<T>(path:&Path,publication:&Publication,budget:&mut 
             cancellation.is_cancelled()||Instant::now()>=deadline
         }));
     }
-    db.busy_timeout(Duration::from_millis(10))?;
-    db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF;")?;
-    let tx=db.transaction()?;check_schema(&tx)?;
-    let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;ensure!(version>=5,"identity inventory requires schema v5");
-    let receipt:(String,u64,u64,u64)=tx.query_row("SELECT source_digest,source_count,task_count,operation_count FROM migration_receipt WHERE singleton=1 AND octet_length(source_digest)=64",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-    ensure!(receipt==(publication.digest.clone(),publication.sources,publication.tasks,publication.operations),"identity migration receipt mismatch");
-    let required=if version>=7 {tx.query_row("SELECT reconciliation_required FROM project_control WHERE singleton=1",[],|r|r.get::<_,bool>(0))?}else{true};
-    ensure!(required==publication.reconciliation_required,"identity control publication interrupted");
-    let value=read(&tx,budget)?;budget.check()?;
+    let value=(||->Result<T>{
+        let tx=db.transaction()?;check_schema(&tx)?;
+        let version:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;ensure!(version>=5,"identity inventory requires schema v5");
+        let receipt:(String,u64,u64,u64)=tx.query_row("SELECT source_digest,source_count,task_count,operation_count FROM migration_receipt WHERE singleton=1 AND octet_length(source_digest)=64",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+        ensure!(receipt==(publication.digest.clone(),publication.sources,publication.tasks,publication.operations),"identity migration receipt mismatch");
+        let required=if version>=7 {tx.query_row("SELECT reconciliation_required FROM project_control WHERE singleton=1",[],|r|r.get::<_,bool>(0))?}else{true};
+        ensure!(required==publication.reconciliation_required,"identity control publication interrupted");
+        // Dropping the transaction ends it: no read snapshot outlives this call.
+        let value=read(&tx,budget)?;budget.check()?;Ok(value)
+    })()?;
     let after=std::fs::symlink_metadata(path)?;ensure!(before.dev()==after.dev()&&before.ino()==after.ino()&&after.is_file()&&after.nlink()==1,"identity database replaced");
+    reuse::give(path,identity,db);
     Ok(value)
+}
+
+/// Reuse of read-only store connections inside one ticker pass and across
+/// passes, on the ticker's own thread only.
+///
+/// Opening a connection parses the whole schema (about 900 objects), which
+/// costs far more than the selected-row reads the ticker makes. Reuse is off
+/// unless the calling thread holds a [`reuse::Pass`], so every other caller
+/// (CLI commands, background jobs, tests) keeps a fresh connection per read.
+///
+/// A cached connection is returned to the cache only between reads: never
+/// with an open transaction, and with its progress handler removed. Each read
+/// starts a new read transaction, so it sees the latest committed state, and
+/// SQLite reloads the schema itself when another connection changes it. A
+/// connection is reused only while the path still names the same file with
+/// the same change time and size, so a replaced, restored or externally
+/// rewritten database is reopened. Every sidecar, publication, receipt and
+/// file-identity check still runs on each read. An idle WAL connection holds
+/// only SQLite's shared lock on the database file, which conflicts with no
+/// writer; it does keep other connections from deleting `-wal`/`-shm` on
+/// close, as any concurrently open reader already does.
+pub mod reuse {
+    use super::*;
+    use std::{cell::RefCell,collections::BTreeMap,os::unix::fs::MetadataExt,path::PathBuf};
+    #[derive(Clone,PartialEq,Eq,Debug)]
+    pub(crate) struct Identity {dev:u64,ino:u64,ctime:(i64,i64),size:u64}
+    impl Identity {
+        pub(crate) fn of(metadata:&std::fs::Metadata)->Self {Self{dev:metadata.dev(),ino:metadata.ino(),ctime:(metadata.ctime(),metadata.ctime_nsec()),size:metadata.len()}}
+    }
+    struct Entry {db:Connection,identity:Identity,used:bool,last:u64}
+    #[derive(Default)]
+    struct Cache {passes:usize,entries:BTreeMap<PathBuf,Entry>,clock:u64}
+    thread_local!{static CACHE:RefCell<Cache>=RefCell::new(Cache::default());}
+    /// Each cached WAL connection holds about three descriptors; stay well
+    /// inside the soft descriptor limit.
+    fn capacity()->usize {
+        let mut limit=libc::rlimit{rlim_cur:0,rlim_max:0};
+        // SAFETY: getrlimit writes only the provided struct.
+        let soft=if unsafe{libc::getrlimit(libc::RLIMIT_NOFILE,&mut limit)}==0 {limit.rlim_cur} else {1024};
+        usize::try_from(soft/8).unwrap_or(usize::MAX).clamp(16,256)
+    }
+    /// Enables reuse on this thread until dropped. On drop, connections that
+    /// the pass did not use are closed (for example a removed project).
+    pub struct Pass(std::marker::PhantomData<*const ()>);
+    pub fn pass()->Pass {
+        CACHE.with(|cache|{let mut cache=cache.borrow_mut();if cache.passes==0{for entry in cache.entries.values_mut(){entry.used=false;}}cache.passes+=1;});
+        Pass(std::marker::PhantomData)
+    }
+    impl Drop for Pass {
+        fn drop(&mut self) {
+            // Close outside the borrow: dropping a connection runs SQLite code only.
+            let _closed=CACHE.with(|cache|{let mut cache=cache.borrow_mut();cache.passes-=1;if cache.passes>0{return BTreeMap::new();}
+                let entries=std::mem::take(&mut cache.entries);let (keep,closed):(BTreeMap<_,_>,BTreeMap<_,_>)=entries.into_iter().partition(|(_,e)|e.used);cache.entries=keep;closed});
+        }
+    }
+    pub(crate) fn open(path:&Path)->Result<Connection> {
+        let db=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_ONLY|OpenFlags::SQLITE_OPEN_NO_MUTEX|OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
+        // SQLite also limits whole encoded rows, so allow headroom for a bounded
+        // 16 MiB provenance field plus its identity payload and metadata.
+        db.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,32*1024*1024)?;
+        db.busy_timeout(Duration::from_millis(10))?;
+        db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF;")?;
+        Ok(db)
+    }
+    /// The cached connection for `path`, if this thread is in a pass and the
+    /// path still names the same unchanged file. A mismatch closes it.
+    pub(crate) fn take(path:&Path,identity:&Identity)->Option<Connection> {
+        let entry=CACHE.with(|cache|{let mut cache=cache.borrow_mut();if cache.passes==0{return None;}cache.entries.remove(path)})?;
+        (entry.identity==*identity).then_some(entry.db)
+    }
+    /// Keeps `db` for the next read of `path` in this pass or the next one.
+    pub(crate) fn give(path:&Path,identity:Identity,db:Connection) {
+        db.progress_handler(0,None::<fn()->bool>);
+        if !db.is_autocommit() {return;}
+        let _evicted=CACHE.with(|cache|{
+            let mut cache=cache.borrow_mut();if cache.passes==0{return None;}
+            cache.clock+=1;let last=cache.clock;
+            // When full, give up the most recently used other entry: in a
+            // round-robin over more projects than fit, the rest stay reusable.
+            let evicted=if !cache.entries.contains_key(path)&&cache.entries.len()>=capacity() {
+                cache.entries.iter().max_by_key(|(_,e)|e.last).map(|(k,_)|k.clone()).and_then(|k|cache.entries.remove(&k))
+            }else{None};
+            cache.entries.insert(path.to_path_buf(),Entry{db,identity,used:true,last});evicted
+        });
+    }
+    /// A raw read-only probe (`wake_enabled`) may borrow the connection an
+    /// identity read of the same store left in this pass. It never opens one.
+    pub(crate) fn with_cached<T>(path:&Path,read:impl FnOnce(&Connection)->T)->Option<T> {
+        let metadata=std::fs::symlink_metadata(path).ok()?;
+        if !metadata.is_file()||metadata.nlink()!=1 {return None;}
+        let identity=Identity::of(&metadata);let db=take(path,&identity)?;
+        let value=read(&db);give(path,identity,db);Some(value)
+    }
 }
 
 /// Bounded publication-checked revision; no integrity scan or payload inventory.

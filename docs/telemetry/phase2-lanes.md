@@ -229,10 +229,22 @@ merges one PR at a time.
   `a_proven_worker_end_keeps_the_project_admitted_but_an_unexplained_pane_loss_pauses_it`.
   Needs fair or backoff scheduling, not larger test timeouts.
 - **Per-connection schema load** (steward): each fresh connection spends about
-  6.5 ms loading 889 schema objects (419 triggers). The ticker opens one per
-  project per read (observation head, canonical head, `wake_enabled`): about
-  0.8 s CPU per pass at 129 projects. Keep a connection per project in the
-  ticker, or consolidate the per-table immutability triggers in a migration.
+  6 ms loading the schema (about 900 objects, 434 triggers). Measured at 129
+  projects, a ticker pass opened 1,273 connections: per project 4 read-only
+  (observation head, `wake_enabled`, dispatch hint, routine hint) and 5
+  writable services (barrier stops, waits, replans, verification and
+  integration jobs), plus 7 per background observation job (16 per pass).
+  *Done (read-only half):* the ticker thread now reuses one read-only
+  connection per project within and across passes
+  (`store::identity_inventory::reuse`): 757 opens per pass, 0 read-only on
+  the ticker thread, main-thread CPU 8.5 s to 5.5 s per pass (debug build,
+  same load). Trigger consolidation was measured and not taken: removing all
+  triggers saves only about half of the load, and merging same-table,
+  same-event triggers would remove 78 of 434. *Still open:* the five
+  writable service opens per project (about 0.8 s CPU per pass each at 129
+  projects) could share one `open_active_scoped` connection per project and
+  pass; that touches the service locking order, so it belongs to the
+  scheduler work.
 - **Wall-bound tests under ~3x oversubscription:** `local_reports` global cache
   bound, two `artifacts::live` byte-budget tests,
   `canonical_post_probe_sql_cannot_restart_its_budget`,

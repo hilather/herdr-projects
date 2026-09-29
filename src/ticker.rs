@@ -463,6 +463,10 @@ pub(crate) fn background_memory(ctx:&Ctx)->Result<Memory> {
 /// project's session was reachable or canonical scheduled work remains. A failure in one project never stops the
 /// others.
 pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
+    // Per-project read-only store reads on this thread reuse one connection
+    // within and across passes instead of reloading the schema for each read.
+    #[cfg(feature="state-store")]
+    let _reads=herdr_projects::store::identity_inventory::reuse::pass();
     memory.tick += 1;
     if let Some(reads)=memory.local_reports.as_mut(){reads.begin_pass();}
     if let Some(reads)=memory.local_observations.as_mut(){reads.begin_pass();}

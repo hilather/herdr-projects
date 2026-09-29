@@ -124,6 +124,20 @@ impl Lab {
         assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
         serde_json::from_slice(&out.stdout).unwrap_or(Value::Null)
     }
+    /// `ok` against a running ticker. Its own writes can move the head, and its
+    /// project turns can hold the lock, so the arguments are rebuilt from the
+    /// current state and the command retried for a bounded time.
+    fn ok_live(&self, args: &dyn Fn() -> Vec<String>) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let args = args();
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let out = self.cli(&args);
+            if out.status.success() { return serde_json::from_slice(&out.stdout).unwrap_or(Value::Null); }
+            assert!(Instant::now() < deadline, "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
     /// A refused command writes nothing; returns its stderr.
     fn refused(&self, args: &[&str]) -> String {
         let before = self.state();
@@ -330,22 +344,25 @@ fn ticker_launches_and_briefs_once_then_stops_a_cancelled_worker_while_paused_an
 
     // Later passes observe the live worker without stopping or briefing it again.
     let observed = lab.state();
-    lab.run_for("agent.list", 2);
+    let listed = lab.count("agent.list");
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 60, &|| lab.count("agent.list") >= listed + 2);
     assert_eq!((lab.count("workspace.create_command"), lab.count("agent.prompt")), (1, 1));
     assert_eq!(lab.attempt(&attempt), running);
     assert!(lab.events("runtime.worker_terminated").is_empty());
     assert_eq!((lab.state().tasks, lab.state().deliveries), (observed.tasks, observed.deliveries));
     assert!(!herdr_projects::worker_supervision::SupervisorObservation::recover_exited(&supervisor).unwrap(), "the worker is running");
 
-    // The operator cancels the attempt, revokes its approval and pauses the project.
+    // The operator cancels the attempt, revokes its approval and pauses the
+    // project while that same ticker keeps running. The ticker keeps its store
+    // reads' connections across passes, and its next passes must still see
+    // these writes.
     let report = lab.project.join("REPORT.md");
     fs::write(&report, "retain this report").unwrap();
-    lab.ok(&["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &running.revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "operator stop"]);
-    lab.ok(&["approval", "demo", "revoke", &approval, "--expected-head", &lab.head().to_string(), "--reason", "stop execution"]);
-    let control = lab.state().control.unwrap().revision.to_string();
-    lab.ok(&["runtime", "demo", "state", "paused", "--expected-revision", &control, "--expected-head", &lab.head().to_string()]);
+    lab.ok_live(&|| ["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &running.revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "operator stop"].map(String::from).to_vec());
+    lab.ok_live(&|| ["approval", "demo", "revoke", &approval, "--expected-head", &lab.head().to_string(), "--reason", "stop execution"].map(String::from).to_vec());
+    lab.ok_live(&|| { let s = lab.state(); ["runtime", "demo", "state", "paused", "--expected-revision", &s.control.unwrap().revision.to_string(), "--expected-head", &s.head.to_string()].map(String::from).to_vec() });
     let before = lab.state();
-    let mut ticker = lab.spawn();
     lab.wait(&mut ticker, 60, &|| lab.attempt(&attempt).termination_observed);
     lab.stop(ticker);
     let after = lab.state();

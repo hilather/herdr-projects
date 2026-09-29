@@ -25,10 +25,19 @@ fn open_store(project: &Path) -> Result<SqliteStore> {
 pub fn wake_enabled(project: &Path) -> bool {
     if crate::watchdog::is_paused(project) { return false; }
     let Ok(path) = store_file(project) else { return false };
+    // Inside a ticker pass, reuse the connection the observation-head read
+    // left (its busy timeout is 10 ms; a busy read is "off" until next pass).
+    if let Some(enabled) = crate::store::identity_inventory::reuse::with_cached(&path, factory_admission_on) {
+        return enabled;
+    }
     let Ok(connection) = rusqlite::Connection::open_with_flags(
         &path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
     ) else { return false };
+    factory_admission_on(&connection)
+}
+
+fn factory_admission_on(connection: &rusqlite::Connection) -> bool {
     let Ok(version) = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0)) else { return false };
     if version < 30 { return false; }
     connection.query_row("SELECT factory_admission FROM project_control WHERE singleton=1", [], |row| row.get::<_, String>(0)).ok().as_deref() == Some("on")
