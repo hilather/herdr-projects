@@ -181,9 +181,13 @@ merges one PR at a time.
   exit_code). The exec item's `duration` is not the command's run time. The
   proposed allowlist is in the live doc; `response_item` is content-forbidden
   under §7 today. MCP shapes are still unobserved.
-- **B9 guardian linking** (lane B): read `rollout_threads` (LEFT JOIN,
+- **Done (B9):** **B9 guardian linking** (lane B): read `rollout_threads` (LEFT JOIN,
   tolerate a pre-A5 sidecar), use `parent_thread_id` as parent evidence with a
   new link basis, treat `thread_source = guardian_review` as the guardian role
   (live `subagent_kind` is `other`), keep guardian inclusion `separate`, never
   key nodes by either `session_id`, and update the accounting guardian fixture
   to the live shape.
+- **Superseded sidecar tables** (owner decision): `session_graph`,
+  `quota_observations` (B7) and `session_nodes` (B9) are no longer read or
+  written. Lanes have been told not to DROP TABLE; a single cleanup migration
+  waits for the owner's decision.
