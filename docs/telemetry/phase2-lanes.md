@@ -234,9 +234,17 @@ merges one PR at a time.
   contracts-review.md §10):** review acceptance is active through an
   owner-signed `code_review` grant only (reviewer-signed decisions,
   owner-signed revocation, covering-grant trigger); M24 is computed from
-  review sessions' valuations; M21–M23 carry acceptance drill-downs. Still
-  open: delegated triage (needs a `finding_log` rebuild); launch-time
-  reviewer routing, the blind brief builder and reviewer key custody;
+  review sessions' valuations; M21–M23 carry acceptance drill-downs.
+  **Done (D9, 0062, contracts-review.md §11):** a review assignment launches
+  as an ordinary canonical attempt of a review task through the existing
+  launch path, with a blind brief (`review_brief.v1`, bound to the task's
+  worker snapshot) and its session recorded by the reservation; the
+  reviewing worker submits a proposal receipt (`review session|submit`);
+  decisions are shared-ledger rows (`review show --as-of`); `review accept
+  draft` writes the request bytes to sign offline. Still open: delegated
+  triage (needs a `finding_log` rebuild); reviewer key custody (owner
+  decision; options in §11); a planner/scheduler that opens, assigns and
+  queues review tasks itself; review worktrees at the candidate commit;
   non-Codex reviewer usage for M24.
 
 ### From the test CPU review (docs/reviews/2026-09-29-test-cpu.md)

@@ -210,7 +210,9 @@ enum MemoryCommand {
         #[arg(long)] writers_stopped:bool,
     },
     AbortCutover { #[arg(long)] plan:PathBuf, #[arg(long)] writers_stopped:bool },
-    Snapshot { #[arg(long)] task:String, #[arg(long)] profile:String, #[arg(long)] input_file:PathBuf, #[arg(long)] worker:bool },
+    Snapshot { #[arg(long)] task:String, #[arg(long)] profile:String, #[arg(long)] input_file:PathBuf, #[arg(long)] worker:bool,
+        /// Review task: retain the assigned opportunity's blind review brief as the instructions (not PROJECT.md) and bind the snapshot to it
+        #[arg(long,requires="worker")] review_opportunity:Option<String> },
     Propose { #[arg(long)] input:PathBuf },
     Review { #[arg(long)] proposal:String, #[arg(long)] decision_file:PathBuf, #[arg(long)] signature:PathBuf, #[arg(long)] expected_head:u64 },
     Promote { #[arg(long)] proposal:String, #[arg(long)] decision:String },
@@ -1102,14 +1104,18 @@ pub fn run() -> Result<()> {
                     let plan:herdr_projects::memory::MemoryPlan=serde_json::from_slice(&herdr_projects::migration::read_plan_file(&plan)?)?;
                     serde_json::to_value(herdr_projects::memory::abort_cutover(&dir,&plan,writers_stopped)?)?
                 },
-                MemoryCommand::Snapshot{task,profile,input_file,worker}=>{
+                MemoryCommand::Snapshot{task,profile,input_file,worker,review_opportunity}=>{
                     let _guard=herdr_projects::memory::mutation_guard(&dir)?;
                     anyhow::ensure!(task!="coordinator","--task coordinator is reserved for the coordinator constructor");
                     let resolved=crate::agents::resolve::resolve(&profile,&ctx.config_dir.join("config.toml"),None)?;
                     let request:herdr_projects::domain::SnapshotRequest=serde_json::from_slice(&herdr_projects::migration::read_plan_file(&input_file)?).map_err(|_|anyhow::anyhow!("invalid snapshot scope JSON (contents withheld)"))?;
                     anyhow::ensure!(request.task_id==task,"scope task_id must match --task");
-                    let instructions=String::from_utf8(herdr_projects::migration::read_plan_file(&dir.join("PROJECT.md"))?)
-                        .map_err(|_|anyhow::anyhow!("project instructions are not UTF-8"))?;
+                    // A review task's instructions are its blind brief, never PROJECT.md (contracts-review.md §11).
+                    let instructions=match &review_opportunity {
+                        Some(opportunity)=>herdr_projects::telemetry::review::review_brief_instructions(&dir,opportunity)?,
+                        None=>String::from_utf8(herdr_projects::migration::read_plan_file(&dir.join("PROJECT.md"))?)
+                            .map_err(|_|anyhow::anyhow!("project instructions are not UTF-8"))?,
+                    };
                     let mut memory=herdr_projects::memory::MemoryStore::from_sqlite(herdr_projects::migration::open_active(&dir)?,dir.join(".state/objects"));
                     let now=jiff::Timestamp::now().as_millisecond();
                     let snapshot=if worker {
@@ -1117,7 +1123,12 @@ pub fn run() -> Result<()> {
                     } else {
                         memory.create_task_snapshot(request,&resolved.name,&resolved.definition_digest,Some(&resolved.config_digest),resolved.budget.soft_input_chars,&instructions,now,None)?
                     };
-                    serde_json::to_value(snapshot)?
+                    drop(memory);
+                    let mut value=serde_json::to_value(&snapshot)?;
+                    if let Some(opportunity)=review_opportunity {
+                        value["review_brief"]=herdr_projects::telemetry::review::bind_review_brief(&dir,&opportunity,&task,snapshot.id.as_str())?;
+                    }
+                    value
                 },
                 MemoryCommand::Propose{input}=>{
                     let _guard=herdr_projects::memory::mutation_guard(&dir)?;

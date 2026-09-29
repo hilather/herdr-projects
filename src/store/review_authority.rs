@@ -240,6 +240,9 @@ pub struct ReviewAcceptance {
     pub decided_unix_ms: i64,
     /// True when this exact request was already recorded.
     pub replayed: bool,
+    /// The decision's row in the shared review ledger (store schema 62 and
+    /// later; `None` before, or for a decision backfilled at the upgrade).
+    pub ledger_seq: Option<i64>,
 }
 
 /// Whether this store has the review authority tables (the reviewer-authority migration).
@@ -347,12 +350,15 @@ impl SqliteStore {
         if grant.project_store != store || request.project_store != store { return Err(invalid("review authority belongs to another project")); }
         let done: Option<(String, String, Option<String>, String, i64)> = tx.query_row("SELECT request_digest,decision,reason,receipt_digest,decided_unix_ms FROM review_acceptances WHERE session_id=?1",
             [&request.session_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).optional()?;
-        let result = |decision: String, reason: Option<String>, receipt: String, at: i64, replayed: bool| ReviewAcceptance { session_id: request.session_id.clone(),
+        let result = |decision: String, reason: Option<String>, receipt: String, at: i64, replayed: bool, ledger_seq: Option<i64>| ReviewAcceptance { session_id: request.session_id.clone(),
             decision, reason, authority_principal: grant.subject.clone(), grant_id: grant.grant_id.clone(), authority: AUTHORITY.into(),
-            receipt_digest: receipt, request_digest: request.digest.clone(), decided_unix_ms: at, replayed };
+            receipt_digest: receipt, request_digest: request.digest.clone(), decided_unix_ms: at, replayed, ledger_seq };
         if let Some((digest, decision, reason, receipt, at)) = done {
             // A replay reads back; any other request is a second decision.
-            if digest == request.digest { return Ok(result(decision, reason, receipt, at, true)); }
+            if digest == request.digest {
+                let seq = super::review_launch::decision_seq(&tx, &request.session_id)?;
+                return Ok(result(decision, reason, receipt, at, true, seq));
+            }
             return Err(invalid(format!("review session {} already has a decision", request.session_id)));
         }
         if tx.query_row("SELECT EXISTS(SELECT 1 FROM review_authority_revocations WHERE grant_id=?1)", [&grant.grant_id], |r| r.get::<_, bool>(0))? {
@@ -395,8 +401,44 @@ impl SqliteStore {
         tx.execute("INSERT INTO review_acceptances(session_id,decision,reason,authority_principal,authority_ref,authority,receipt_digest,request_digest,request_bytes,request_signature,decided_unix_ms)
             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![request.session_id, request.decision, request.reason, grant.subject, grant.grant_id, AUTHORITY, receipt, request.digest, request.raw, request_signature, now])?;
+        // The decision takes the next seq of the shared ledger (store schema 62 and later).
+        let seq = super::review_launch::record_decision(&tx, &request.session_id, &request.decision, &grant.subject, AUTHORITY, now)?;
         tx.commit()?;
-        Ok(result(request.decision.clone(), request.reason.clone(), receipt, now, false))
+        Ok(result(request.decision.clone(), request.reason.clone(), receipt, now, false, seq))
+    }
+}
+
+impl SqliteStore {
+    /// The exact canonical `review_acceptance.v1` request (contracts §0
+    /// canonical JSON: sorted keys, compact, `reason` null when accepted) for
+    /// the subject of `grant_id` to sign offline with its own key. A rejection
+    /// names `reason`. Signs nothing, writes nothing and grants nothing: the
+    /// decision is made only by `review accept` with the subject's signature,
+    /// which re-checks everything. Refused for a session without a completed
+    /// review or with a decision already.
+    pub fn draft_review_acceptance(&mut self, session: &str, grant_id: &str, reason: Option<&str>) -> Result<(Vec<u8>, PreparedReviewAcceptance)> {
+        let tx = self.connection.transaction()?;
+        require(&tx)?;
+        let (grant, _) = load_grant(&tx, grant_id)?;
+        let store = project_store(&tx)?;
+        if grant.project_store != store { return Err(invalid("review authority belongs to another project")); }
+        let completion: Option<(Option<String>, Option<String>)> = tx.query_row("SELECT c.outcome,c.receipt_digest FROM review_sessions r LEFT JOIN review_completions c ON c.session_id=r.session_id WHERE r.session_id=?1",
+            [session], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let receipt = match completion {
+            None => return Err(invalid(format!("no review session {session}"))),
+            Some((Some(outcome), Some(receipt))) if outcome == "completed" => receipt,
+            Some((None, _)) => return Err(invalid(format!("review session {session} has no completion to decide"))),
+            Some((Some(other), _)) => return Err(invalid(format!("only a completed review is accepted or rejected; this session ended {other}"))),
+        };
+        if tx.query_row("SELECT EXISTS(SELECT 1 FROM review_acceptances WHERE session_id=?1)", [session], |r| r.get::<_, bool>(0))? {
+            return Err(invalid(format!("review session {session} already has a decision")));
+        }
+        let decision = if reason.is_some() { "rejected" } else { "accepted" };
+        // Keys in sorted order, whatever the JSON map's ordering.
+        let bytes = serde_json::json!({"decision": decision, "grant_id": grant.grant_id, "project_store": store, "reason": reason, "receipt_digest": receipt,
+            "schema": ACCEPTANCE_SCHEMA, "session_id": session, "subject": grant.subject}).to_string().into_bytes();
+        let prepared = PreparedReviewAcceptance::parse_unverified(&bytes).map_err(invalid)?;
+        Ok((bytes, prepared))
     }
 }
 

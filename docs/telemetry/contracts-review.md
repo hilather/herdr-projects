@@ -6,12 +6,14 @@ TM3.6), doc 07 §5/§5b (M20–M29, M43, M44), doc 10 §5. Canonical migrations
 `0054_review_capture.sql` (schema 54), `0055_finding_triage.sql` (schema 55,
 §5), `0056_fix_attribution.sql` (schema 56, §6) and
 `0057_review_protocols.sql` (schema 57, §7), `0058_seeded_defects.sql`
-(schema 58, §8), `0059_review_ledger.sql` (schema 59, §9) and
-`0061_reviewer_authority.sql` (schema 61, §10); store API
+(schema 58, §8), `0059_review_ledger.sql` (schema 59, §9),
+`0061_reviewer_authority.sql` (schema 61, §10) and `0062_review_launch.sql`
+(schema 62, §11); store API
 `src/store/review_capture.rs`, `src/store/finding_triage.rs`,
 `src/store/fix_attribution.rs`, `src/store/review_protocols.rs`,
-`src/store/seeded_defects.rs`, `src/store/review_ledger.rs` and
-`src/store/review_authority.rs` (signature checks in `src/authority.rs`); CLI
+`src/store/seeded_defects.rs`, `src/store/review_ledger.rs`,
+`src/store/review_authority.rs` (signature checks in `src/authority.rs`) and
+`src/store/review_launch.rs`; CLI
 `telemetry <slug> review ...` (`src/telemetry/review/`). Sidecar stream
 `review` has no tables yet. Nothing about reviews comes from the Codex
 adapter (contracts-collection.md A3).
@@ -100,8 +102,8 @@ are known, else `null`; it is a covariate, and same-family reviews are
 excluded from blind comparisons unless an analysis names them. `blind` is
 `true`; `review present <opportunity>` is the blind view (exact candidate,
 repository, base, scope, kind, protocol, prior findings, budget; no author
-attempt or configuration). No review brief builder exists yet, so blindness
-of an actual brief is not enforced. `--reviewer P` records an operator
+attempt or configuration). Since 0062 a launched reviewer's brief is built
+from this view only (§11). `--reviewer P` records an operator
 assignment (`policy = operator`, `blind = false`, reason
 `operator_selected`), with the same covariates.
 
@@ -111,8 +113,10 @@ assignment (`policy = operator`, `blind = false`, reason
 `SqliteStore`, one `state.db` transaction each, principal `operator:cli`;
 nothing touches `telemetry.db`. Since 0059 `start` and `complete` also
 append one shared-ledger row each (§9), and every `review` command but
-`present` refuses to run in a worker execution context (§9). `show [--since MS]` (by creation), `present`
-and `report [--since MS]` read `state.db` with contracts §0 reads.
+`present` refuses to run in a worker execution context (§9); since 0062 the
+worker's `session` and `submit` are allowed there too (§11). `show [--since
+MS] [--as-of SEQ]` (by creation; `--as-of` since 0062, §11), `present` and
+`report [--since MS]` read `state.db` with contracts §0 reads.
 
 Per opportunity `status`: `unassigned`, `no_session`, `in_progress` (a
 session without completion), `completed` (some session `completed`),
@@ -600,8 +604,8 @@ lists each preregistered experiment's `estimate` (`randomized` or
 beside it, never merged into the descriptive value.
 
 Not built: assignment-cutoff binding at launch or by a scheduler (needs
-routing changes); disclosure of prior conclusions in a review brief (no
-brief builder, §3); blinding adjudicators to arm; task-clustered intervals,
+routing changes); disclosure of prior conclusions beyond the prior finding
+references a `disclosed` protocol shows in the brief (§11); blinding adjudicators to arm; task-clustered intervals,
 sample-size planning and propensity weighting (TM4.4); enforcement of the
 `fixed_horizon` stopping rule (recorded; `planned_units` is enforced, §9).
 
@@ -735,8 +739,8 @@ starter-seed-set.json`, one synthetic seed per class over a tiny clean
 source. Tests inject seeds only into disposable repositories they create;
 no tool here modifies a real project repository.
 
-Not built: injection tooling for replay-suite tasks (TM4.6); a reviewer
-brief builder (§3).
+Not built: injection tooling for replay-suite tasks (TM4.6). The reviewer
+brief (§11) reads no seed state.
 
 ## 9. Review ledger, seed-linked credit and the worker guard (card D7)
 
@@ -820,9 +824,9 @@ keeps refusing every worker principal. The aggregate `telemetry <slug>
 report` is not guarded.
 
 Not built (needs routing, launch or scheduler changes, or new authority):
-binding repair attempts or skeptical passes at launch; a scheduled or
-launch-time review; a reviewer brief builder and disclosure or blinding of
-an actual brief (§3, §7); delegated triage (§10); conflict records
+binding repair attempts or skeptical passes at launch; a scheduled review
+(a review task still needs its own queueing; launch-time sessions and the
+blind brief are §11); delegated triage (§10); conflict records
 and third-party review imports (§5); finding occurrences beyond reopenings
 and mixed-model segment splits (§6); adjudicator blinding,
 task-clustered intervals and `fixed_horizon` enforcement (§7); seeding
@@ -907,7 +911,8 @@ hold at the decision time:
   author attempt's dispatch configuration is one of `subject_configurations`.
 
 One decision per session (`review_acceptances`, append-only); the same
-request replays, any other is refused. Each row keeps the request bytes,
+request replays, any other is refused. Since 0062 each decision is also the
+next row of the shared ledger (`review_decision_log`, §11). Each row keeps the request bytes,
 signature, `authority = delegated_code_review.v1`, the principal and grant.
 A trigger (`review_acceptances_authorized`) repeats every rule except the
 signatures on raw rows: raw SQL without a covering grant aborts.
@@ -969,10 +974,202 @@ by a reviewer without bound usage leaves the cost at 0.018 and makes M24
 `partial` `500/9` (`no_usage_bound` 1). Drill-downs: M22/M23 accepted 1,
 rejected 1, undecided 1; M21 `"2"` with accepted 1, rejected 1.
 
-Not built (launch routing, outside this card): launching reviewer attempts
-from an assignment and recording the session at launch; the blind review
-brief builder; custody of the reviewer's key outside any worker (a trusted
-review service signing decisions, not the model); a request draft command;
+Built by D9 (§11): launching reviewer attempts from an assignment with the
+session recorded at launch, the blind brief, the worker receipt channel,
+decisions in the shared ledger and the request draft command. Not built:
+custody of the reviewer's key by the product (an open owner decision, §11);
 per-attempt usage for non-Codex reviewers (their cost stays
-`no_usage_bound`); sequencing decisions in the shared ledger (`--as-of`
-views show a decision at every watermark); delegated triage.
+`no_usage_bound`); delegated triage.
+
+## 11. Review launch, the blind brief and the worker receipt channel (card D9)
+
+Canonical migration `0062_review_launch.sql` (schema 62); store API
+`src/store/review_launch.rs`; CLI `memory <slug> snapshot --worker
+--review-opportunity O`, `telemetry <slug> review session|submit`, `review
+accept draft` and `review show --as-of`. Plan doc 06 §2 (the controller
+records assignment and session identity; the review brief omits the author's
+model or configuration and self-assessment) and factory doc 03 (one admission
+path; a runtime adapter validates and freezes the complete brief before
+reservation).
+
+**A review is an ordinary task attempt.** Nothing new schedules, ranks or
+reserves. The owner adds and queues a task (the *review task*) as for any
+work, binds its runtime binding, and makes it a review task with one worker
+snapshot:
+
+```
+herdr-projects memory <slug> snapshot --task R --profile P --input-file SCOPE --worker --review-opportunity O
+```
+
+The snapshot's retained instructions are then the blind brief of O instead of
+`PROJECT.md`, and the snapshot is bound to O (`review_briefs(snapshot_id,
+opportunity_id, task_id, brief_schema, brief_digest, prior_disclosure,
+principal, recorded_unix_ms)`). The ordinary `launch draft` → owner-signed
+approval → `launch reserve` (or automatic admission) launches it; `LaunchInputs`,
+the attempt and operation identities and approval scopes are unchanged (the
+brief is the knowledge the launch already freezes, contracts §3 unchanged).
+Binding is refused, writing nothing, unless all hold:
+
+- O is assigned (a review launches from an assignment), and the snapshot is
+  a worker snapshot (`char-count-worker-brief-v2`) of R made for the assigned
+  reviewer's profile (its definition digest is the assignment's
+  configuration's);
+- its retained instructions are byte-for-byte O's current brief;
+- it selects no task memory: an empty scope (no domains, paths or pinned
+  keys) and no optional entries. Mandatory project constraints stay: they are
+  the owner's rules for every worker;
+- its complete retained rendering (instructions, R's title, memory) contains
+  none of the author's identities recorded for O: the author attempt, its
+  assignment and dispatch configuration and dispatch profile digest
+  (identities shorter than 12 characters are not scanned, they would match
+  ordinary words). R's title is the owner's text and is scanned too;
+- R is not O's reviewed task, has run nothing but launched sessions of O,
+  and is bound to no other opportunity; O has no other review task (trigger).
+
+The same binding replays. A later snapshot of R (a restart needs one: a
+snapshot binds the task revision) is another row for the same R and O.
+
+**The blind brief** (`review_brief.v1`, the `Project instructions` of the
+worker prompt, digest `brief_digest`) is built only from the §3 blind view:
+opportunity, reviewed task and contract revision, repository, base and
+candidate commits, object format, scope, kind, protocol and budget, as JSON
+data; plus, when the protocol is registered (§7), its method fields
+(`challenges`, `failure_classes`, `permitted_tools`, `stopping_rule`,
+`evidence_min`, `prior_disclosure`, `outcome`, never its reviewer
+configuration). `prior_findings` appear only under a registered protocol with
+`prior_disclosure: disclosed`; otherwise (and for an unregistered protocol)
+they are withheld and the binding records `withheld`. The brief never names
+the author attempt, configuration or profile, prior reviewers or sessions,
+seed state (§8) or the submission id, and the builder refuses a brief that
+would contain an author identity. It ends with the receipt instructions
+(below) and states that the receipt is a proposal.
+
+**Session at launch.** Two version-gated calls in `admit_prepared`
+(`src/store/reservations.rs`), for every launch path (operator, delegated,
+automatic, and `launch draft`'s dry run):
+
+1. after the knowledge check, `review_launch::check`: for a review task,
+   refuse unless the preparation's knowledge snapshot is one bound to its
+   opportunity (`a review task launches only with its blind review brief
+   snapshot`), its effective profile's configuration is the assignment's
+   (`... with its assigned reviewer configuration`), and a session may start
+   now (§1 restart rule, not revealed, §8). It only refuses; it grants
+   nothing and is a no-op for any other task;
+2. after the attempt row, its dispatch decision and candidate-group binding,
+   `review_launch::start`: the session start (§1, recorder `service:launch`,
+   configuration from the dispatch decision, so `matches_assignment` is
+   true) and its shared-ledger `started` row (§9), plus
+   `review_session_launches(session_id, attempt_id UNIQUE, snapshot_id)`
+   (trigger: the session's attempt, launched with that brief). All in the
+   reservation's transaction: a reserved review attempt always has its
+   session, and nothing is recorded for a refused one.
+
+Automatic admission selects only a bound brief snapshot for a review task
+(`worker_knowledge_selection`, schema 62). An attempt that ends without a
+receipt leaves its session open; the owner records its end with `review
+complete` (e.g. `interrupted`) before a restart, per §1.
+
+**Worker receipt channel.** Like `result submit`, the reviewing worker uses
+the CLI; both commands are allowed in a worker execution context (§9):
+
+- `review session --attempt A` (read-only) prints A's launched session:
+  `session_id`, `opportunity_id`, `ordinal`, `submission_id`,
+  `candidate_oid`, `completed`, `receipt_schema` (never the author);
+- `review submit --input-file F` records a `review_receipt.v1` (§1, unchanged
+  schema and refusals) for a session recorded at launch while its attempt has
+  not ended (state `reserved`, `launching`, `running` or `awaiting_input`,
+  termination not observed), as principal `worker:<attempt>`. It is a
+  completion like any other: `trust: proposal`, `coverage_basis: declared`,
+  its findings pending submissions (§5), replayed or refused as §1. After the
+  attempt ends only the owner's `review complete` records it.
+
+The worker can never accept, reject or triage: a receipt with an acceptance
+field is refused (unknown field); `review accept`, `accept draft`,
+`complete`, findings triage and every other owner command refuse the worker
+context (§9); the worker holds no signing key; a decision needs a
+reviewer-signed request under an owner-signed grant (§10), whose subject can
+never be the reviewing or authoring attempt. Like `result submit`, the
+channel trusts the CLI caller's claim to be the worker (markers, §9, are not
+authority); what it records is only a proposal.
+
+**Decisions in the shared ledger.** `review_decision_log(seq, session_id
+UNIQUE, decision, principal, authority, recorded_unix_ms, backfilled)`: each
+§10 decision takes the next `seq` of the one ordering (`finding_triage::head`
+now over six ledgers; triggers on all six refuse a row that does not follow
+the others' head), in the decision's transaction; trigger: the row repeats
+its `review_acceptances` row. `review accept` returns `ledger_seq`.
+Decisions recorded before 0062 are sequenced after the head at upgrade (by
+decision time, then session) with `backfilled = 1` and are visible at every
+watermark, as §9's backfill. `review show --as-of SEQ` replays sessions (from
+their `started` row), completions (from their `completed` row) and decisions
+(from their decision row) to `SEQ`, recomputes each opportunity's status,
+shows each decision's `ledger_seq`, and reports `head_seq`/`as_of_seq`; `SEQ`
+beyond the head is refused. Opportunities and assignments carry no sequence
+(§9) and are listed at every watermark. M24's closed cohort still reads the
+current decisions.
+
+**Request draft.** `review accept draft SESSION --grant G [--reject REASON]
+--output FILE` writes (new file only) the exact canonical `review_acceptance.v1`
+request (contracts §0 canonical JSON: sorted keys, compact, `reason` null
+when accepted), e.g.
+
+```json
+{"decision":"accepted","grant_id":"sha256:…","project_store":"/abs/.state/state.db","reason":null,"receipt_digest":"sha256:…","schema":"review_acceptance.v1","session_id":"sha256:…","subject":"reviewer:carol"}
+```
+
+and prints `request_digest`, `signer` (the grant's subject) and the
+namespace `review-acceptance@herdr-projects`. It checks the grant is
+installed for this project and the session has a completed, undecided
+review; it signs nothing, writes nothing to the store and decides nothing.
+The reviewer signs the file's exact bytes offline (`ssh-keygen -Y sign -f KEY
+-n review-acceptance@herdr-projects FILE`) and submits them with `review
+accept SESSION --document FILE --signature FILE.sig` (§10, unchanged checks).
+
+**Reviewer key custody (open owner decision).** The product holds no
+reviewer private key and does not sign decisions. Options:
+
+1. *Reviewer-held key, offline signing* (built: `accept draft` + `accept`).
+   The human or agent-operator holding `reviewer:<name>` signs each request
+   outside the product, on a machine no worker can reach. Strongest
+   separation and simplest trust story; every decision needs a person or an
+   out-of-band signer, so decisions are slow and do not scale with review
+   volume.
+2. *Separate trusted signer process.* A long-running service outside every
+   worker sandbox holds the reviewer key and signs requests that pass its own
+   policy (e.g. accept completed reviews meeting evidence rules), audited per
+   decision. Scales and keeps the key out of the model's reach, but that
+   process becomes a new trust root: its host, policy and logs need the same
+   protection as the owner key, a compromise lets it accept anything in the
+   grant's scope until revoked (bounded by `max_decisions`, expiry and scope),
+   and "accept automatically" moves the judgment from a reviewer to code.
+3. *Owner-signed per decision.* The owner signs each decision with the owner
+   key (no reviewer key at all). Needs a schema change (§10 refuses the
+   owner's key standing in for the subject, by design) and collapses
+   delegated review into owner review: no delegation, and the owner becomes
+   the bottleneck; simplest custody (one key).
+4. *Hardware-backed reviewer key* (a variant of 1 or 2: `ssh-keygen -Y sign`
+   with an `-sk` key or an agent-held key). Non-exportable key, touch per
+   decision; same flow as 1, stronger against key theft, still manual.
+
+Whatever is chosen, grants stay short-lived and narrow (§10), and revocation
+stops later decisions without touching earlier ones.
+
+Test `review_assignment_launches_with_blind_brief_and_records_session`
+(`tests/canonical_worker.rs`, the real launch path on the Herdr stand-in):
+PROJECT.md, the authored task's title, the author attempt, its configuration
+and profile digest and a prior finding are planted; the delivered prompt is
+exactly the drafted brief, its view is the eleven blind fields of O, its
+digest is the binding's, and none of the sentinels appear; the session is
+`service:launch`, ordinal 1, `matches_assignment`, ledger seq 1; a PROJECT.md
+snapshot of the review task is refused at `launch draft`.
+`reviewer_worker_submits_proposal_receipt_but_cannot_accept` and
+`acceptance_decision_replays_in_the_ledger_as_of` (start 1, completion 2,
+finding 3, decision 4, owner triage 5; draft bytes compared literally).
+
+Not built: a planner or scheduler that opens, assigns and queues review
+tasks by itself (the owner still adds and queues R); worktrees checked out at
+the candidate (R's worktree is its ordinary base; the candidate commit is in
+the shared object store and named in the brief); session start at the
+worker's actual start rather than its reservation; a guard on raw SQL
+inserts of attempts for review tasks (store-enforced only); custody of a
+reviewer key by the product (above).

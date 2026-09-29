@@ -6,7 +6,8 @@
 //! transaction each); `show`, `present`, `report`, `findings show`, `fixes show`,
 //! `protocols show`, `experiments show`, `seeds show`, `seeds report` and the metrics
 //! hook read `state.db` strictly read-only. `present`, the reviewer-facing view, never
-//! reads seed state (§8).
+//! reads seed state (§8). A launched reviewer (§11) may also run `session` and
+//! `submit`, its receipt channel; the blind brief is built in `store::review_launch`.
 use anyhow::{Context, Result};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
@@ -18,7 +19,7 @@ mod fixes;
 mod protocols;
 mod seeds;
 
-use crate::store::{FindingSummary, FindingTarget, ReviewAssignmentChoice, ReviewOpportunitySpec, SqliteStore, TriageOutcome, TriageRequest, finding_state, fix_state, protocol_state};
+use crate::store::{FindingSummary, FindingTarget, ReviewAssignmentChoice, ReviewOpportunitySpec, ReviewVisibility, SqliteStore, TriageOutcome, TriageRequest, finding_state, fix_state, protocol_state, review_visibility};
 
 pub const STREAM: &str = "review";
 /// `include_str!` of `migrations/telemetry/review/`, in order; index + 1 is the stream version.
@@ -86,12 +87,30 @@ pub enum Command {
     /// A delegated reviewer's decision on a session's completion: a
     /// `review_acceptance.v1` request signed with a `code_review` grant
     /// subject's key (namespace `review-acceptance@herdr-projects`).
+    /// `accept draft SESSION` writes the exact request bytes to sign offline.
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Accept {
-        session: String,
+        #[command(subcommand)]
+        draft: Option<AcceptCommand>,
+        #[arg(required = true)]
+        session: Option<String>,
+        #[arg(long, required = true)]
+        document: Option<PathBuf>,
+        #[arg(long, required = true)]
+        signature: Option<PathBuf>,
+    },
+    /// The reviewing worker's channel: submit the `review_receipt.v1` of a
+    /// session recorded at launch while its attempt runs, as a proposal
+    /// (`worker:<attempt>`). Allowed in a worker execution context.
+    Submit {
         #[arg(long)]
-        document: PathBuf,
+        input_file: PathBuf,
+    },
+    /// The review session recorded when `--attempt` was launched: the ids its
+    /// receipt names, never the author. Read-only; allowed in a worker context.
+    Session {
         #[arg(long)]
-        signature: PathBuf,
+        attempt: String,
     },
     /// Delegated `code_review` authority: owner-signed grants and revocations.
     #[command(subcommand)]
@@ -104,6 +123,9 @@ pub enum Command {
         /// Window start (Unix ms), by the opportunity's creation.
         #[arg(long)]
         since: Option<i64>,
+        /// Replay sessions, completions and decisions to this ledger sequence.
+        #[arg(long)]
+        as_of: Option<i64>,
     },
     /// Lane metrics (M20–M29, M43, M44) as JSON. Read-only.
     Report {
@@ -133,6 +155,26 @@ pub enum Command {
     /// the M43/M44 report. Evaluation authority (the project owner) only.
     #[command(subcommand)]
     Seeds(seeds::SeedsCommand),
+}
+
+/// `herdr-projects telemetry <slug> review accept draft ...`
+#[derive(clap::Subcommand)]
+pub enum AcceptCommand {
+    /// Write the exact canonical `review_acceptance.v1` request for the
+    /// grant's subject to sign offline (`ssh-keygen -Y sign -n
+    /// review-acceptance@herdr-projects`). Signs and decides nothing.
+    Draft {
+        session: String,
+        /// The installed `code_review` grant the decision is made under.
+        #[arg(long)]
+        grant: String,
+        /// Draft a rejection with this reason instead of an acceptance.
+        #[arg(long)]
+        reject: Option<String>,
+        /// New file for the request bytes; must not exist.
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 /// `herdr-projects telemetry <slug> review findings ...`. Every write is a
@@ -261,10 +303,39 @@ fn refuse_worker_context(project: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Projects root and project name of `project`, as a brief's receipt commands name them.
+fn root_and_slug(project: &Path) -> Result<(String, String)> {
+    let project = std::fs::canonicalize(project).with_context(|| format!("project {} is unavailable", project.display()))?;
+    let root = project.parent().context("project has no root")?.to_str().context("projects root is not UTF-8")?.to_owned();
+    let slug = project.file_name().and_then(|n| n.to_str()).context("project name is not UTF-8")?.to_owned();
+    Ok((root, slug))
+}
+
+/// The blind review brief of an assigned opportunity (contracts-review.md
+/// §11): the retained instructions of its review task's worker snapshot,
+/// used by `memory <slug> snapshot --worker --review-opportunity`. Read-only.
+pub fn review_brief_instructions(project: &Path, opportunity: &str) -> Result<String> {
+    refuse_worker_context(project)?;
+    let (root, slug) = root_and_slug(project)?;
+    Ok(SqliteStore::open(&project.join(".state/state.db"))?.review_brief(opportunity, &root, &slug)?.text)
+}
+
+/// Bind review task `task`'s worker snapshot `snapshot` (built from
+/// `review_brief_instructions`) to `opportunity`, after checking its complete
+/// retained rendering for author identities. The owner's record (`operator:cli`).
+pub fn bind_review_brief(project: &Path, opportunity: &str, task: &str, snapshot: &str) -> Result<Value> {
+    refuse_worker_context(project)?;
+    let (root, slug) = root_and_slug(project)?;
+    let rendered = crate::memory::render_knowledge_snapshot(project, snapshot)?;
+    let text = rendered["text"].as_str().context("retained knowledge text missing")?;
+    let now = jiff::Timestamp::now().as_millisecond();
+    Ok(json!(SqliteStore::open(&project.join(".state/state.db"))?.bind_review_brief(opportunity, task, snapshot, text, &root, &slug, OPERATOR, now)?))
+}
+
 /// The command's stdout.
 pub fn run(project: &Path, command: Command) -> Result<String> {
-    // `present` is the blind reviewer view: the only command a worker may run.
-    if !matches!(command, Command::Present { .. }) { refuse_worker_context(project)?; }
+    // A worker may run only the blind reviewer view, its own session and the receipt channel.
+    if !matches!(command, Command::Present { .. } | Command::Session { .. } | Command::Submit { .. }) { refuse_worker_context(project)?; }
     let now = jiff::Timestamp::now().as_millisecond();
     let open = || SqliteStore::open(&project.join(".state/state.db"));
     let value = match command {
@@ -288,10 +359,21 @@ pub fn run(project: &Path, command: Command) -> Result<String> {
             let bytes = std::fs::read(&input_file).with_context(|| format!("read {}", input_file.display()))?;
             json!({"completion": open()?.complete_review_session(&bytes, OPERATOR, now)?})
         }
-        Command::Accept { session, document, signature } => acceptance::accept(project, &session, &document, &signature)?,
+        Command::Accept { draft: Some(AcceptCommand::Draft { session, grant, reject, output }), .. } => acceptance::draft(project, &session, &grant, reject.as_deref(), &output)?,
+        Command::Accept { draft: None, session, document, signature } => {
+            let (Some(session), Some(document), Some(signature)) = (session, document, signature) else { anyhow::bail!("accept needs SESSION --document --signature, or `accept draft`") };
+            acceptance::accept(project, &session, &document, &signature)?
+        }
+        Command::Submit { input_file } => {
+            let size = std::fs::metadata(&input_file).with_context(|| format!("read {}", input_file.display()))?.len();
+            anyhow::ensure!(size <= MAX_RECEIPT_BYTES, "review receipt exceeds {MAX_RECEIPT_BYTES} bytes");
+            let bytes = std::fs::read(&input_file).with_context(|| format!("read {}", input_file.display()))?;
+            json!({"completion": open()?.submit_review_receipt(&bytes, now)?})
+        }
+        Command::Session { attempt } => json!({"session": open()?.review_session_for_attempt(&attempt)?}),
         Command::Authority(command) => acceptance::authority(project, command)?,
         Command::Present { opportunity } => present(project, &opportunity)?,
-        Command::Show { since } => show(project, since)?,
+        Command::Show { since, as_of } => show(project, since, as_of)?,
         Command::Report { since, horizon_days } => json!({"metrics": lane_metrics(project, since, i64::from(horizon_days))?, "since_unix_ms": since}),
         Command::Findings(command) => findings(project, command, now)?,
         Command::Fixes(command) => fixes::run(project, command, now)?,
@@ -364,7 +446,10 @@ struct Opportunity { record: Value, kind: String, protocol: String, assigned: Op
     /// `(session_id, attempt_id, same_attempt_as_author)` in order, the completed session, the latest completion time.
     sessions: Vec<(String, String, bool)>, completed_session: Option<String>, ended: Option<i64> }
 
-fn opportunities(db: &rusqlite::Connection) -> Result<Vec<Opportunity>> {
+fn opportunities(db: &rusqlite::Connection) -> Result<Vec<Opportunity>> { opportunities_at(db, None) }
+
+/// As `opportunities`, with sessions and completions replayed to `at`.
+fn opportunities_at(db: &rusqlite::Connection, at: Option<&ReviewVisibility>) -> Result<Vec<Opportunity>> {
     let db = db.unchecked_transaction()?;
     let rows: Vec<(Value, String, String, i64)> = db.prepare("SELECT opportunity_id,submission_id,task_id,contract_revision,candidate_oid,scope,kind,role,protocol,prior_findings,budget_ms,creator_principal,created_unix_ms
         FROM review_opportunities ORDER BY created_unix_ms,rowid")?
@@ -400,6 +485,13 @@ fn opportunities(db: &rusqlite::Connection) -> Result<Vec<Opportunity>> {
                     "same_attempt_as_author": r.get::<_, bool>(5)?, "recorder_principal": r.get::<_, String>(6)?, "started_unix_ms": r.get::<_, i64>(7)?,
                     "completion": completion}))
             })?.collect::<rusqlite::Result<_>>()?;
+        let sessions: Vec<Value> = match at {
+            None => sessions,
+            Some(v) => sessions.into_iter().filter(|s| v.started(s["session_id"].as_str().unwrap_or_default())).map(|mut s| {
+                if !v.completed(s["session_id"].as_str().unwrap_or_default()) { s["completion"] = Value::Null; }
+                s
+            }).collect(),
+        };
         let completed = sessions.iter().find(|s| s["completion"]["outcome"] == "completed");
         let status = if assignment.is_none() { "unassigned" } else if sessions.is_empty() { "no_session" } else if completed.is_some() { "completed" }
             else if sessions.iter().any(|s| s["completion"].is_null()) { "in_progress" } else { "ended_without_completion" };
@@ -419,19 +511,29 @@ fn opportunities(db: &rusqlite::Connection) -> Result<Vec<Opportunity>> {
     Ok(out)
 }
 
-fn show(project: &Path, since: Option<i64>) -> Result<Value> {
-    let (listed, decided) = match read(project)? { Some(db) => (opportunities(&db)?, acceptance::decisions(&db)?), None => (Vec::new(), None) };
+fn show(project: &Path, since: Option<i64>, as_of: Option<i64>) -> Result<Value> {
+    let db = read(project)?;
+    // Replay to a watermark of the shared ledger: sessions, completions and decisions appear where they happened (§9, §11).
+    let visibility = match &db { Some(db) => Some(review_visibility(db, as_of)?), None => None };
+    let (listed, decided) = match &db { Some(db) => (opportunities_at(db, visibility.as_ref().filter(|_| as_of.is_some()))?, acceptance::decisions(db)?), None => (Vec::new(), None) };
     let mut records: Vec<Value> = listed.into_iter().filter(|o| since.is_none_or(|s| o.created >= s)).map(|o| o.record).collect();
     // Each completion's delegated decision: `null` while undecided (a proposal), unavailable before the authority tables.
     for record in &mut records {
         for session in record["sessions"].as_array_mut().into_iter().flatten() {
             if session["completion"].is_null() { continue; }
             let id = session["session_id"].as_str().unwrap_or_default().to_owned();
-            session["completion"]["acceptance"] = match &decided { None => unavailable(acceptance::ABSENT), Some(d) => d.get(&id).cloned().unwrap_or(Value::Null) };
+            let visible = |d: &Value| visibility.as_ref().is_none_or(|v| v.decided(&id)).then(|| {
+                let mut d = d.clone();
+                d["ledger_seq"] = json!(visibility.as_ref().and_then(|v| v.decision_seq(&id)));
+                d
+            });
+            session["completion"]["acceptance"] = match &decided { None => unavailable(acceptance::ABSENT), Some(d) => d.get(&id).and_then(visible).unwrap_or(Value::Null) };
         }
     }
     let active = match &decided { Some(_) => json!({"active": true, "authority": acceptance::AUTHORITY}), None => json!({"active": false, "reason": acceptance::ABSENT}) };
-    Ok(json!({"acceptance": active, "opportunities": records, "since_unix_ms": since}))
+    let mut out = json!({"acceptance": active, "opportunities": records, "since_unix_ms": since});
+    if let (Some(v), Some(_)) = (&visibility, as_of) { out["head_seq"] = json!(v.head_seq); out["as_of_seq"] = json!(v.as_of_seq); }
+    Ok(out)
 }
 
 fn ratio(numerator: usize, denominator: usize) -> Value {

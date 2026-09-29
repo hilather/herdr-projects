@@ -162,6 +162,8 @@ impl SqliteStore {
             }
             super::contract_binding::validate_with_budget(&tx,i,now,budget)?;
             super::worker_knowledge::validate(&tx,i,now)?;
+            // A review task (contracts-review.md §11) launches only with its blind brief and assigned reviewer; this only refuses.
+            if version>=62 {super::review_launch::check(&tx,i)?;}
             super::budget::check_with_budget(&tx,i.budget.as_ref(),false,budget)?;
             if !draft {super::approvals::validate_preparation_with_budget(&tx,i,now,budget)?;}
             if task.state!=TaskState::Queued||task.active_attempt.is_some()||queue.enqueued_unix_ms>now||attempts.iter().any(|a|a.task==task.id&&a.retains_capacity()) {return Err(invalid("task is not ready for reservation"));}
@@ -195,6 +197,8 @@ impl SqliteStore {
         tx.execute("INSERT INTO attempts VALUES(?1,?2,1,'reserved',?4,?3,0)",params![attempt_id.as_str(),attempt.task.as_str(),attempt.reservation,attempt.snapshot])?;
         if version>=50 {super::dispatch_log::record_decision(&tx,&record.inputs,&attempt_id,task_revision,classification.as_deref(),dispatch,delegated,now)?;}
         if version>=53 {super::candidate_groups::bind(&tx,&record.inputs,&attempt_id,now)?;}
+        // A reserved review attempt's session starts here (contracts-review.md §11).
+        if version>=62 {super::review_launch::start(&tx,&record.inputs,&attempt_id,now)?;}
         super::dispatch_log::mark(&tx,&attempt,now,"admit_prepared")?;
         tx.execute("UPDATE tasks SET revision=?2,state='running',active_attempt=?3 WHERE id=?1",params![attempt.task.as_str(),integer(task_revision)?,attempt_id.as_str()])?;
         tx.execute("INSERT INTO operations VALUES(?1,?2,'runtime.launch',?3,1,?4,?5,?6,?7,?1)",params![operation_id.as_str(),attempt.task.as_str(),record.inputs.binding,payload,digest,integer(task_revision)?,now])?;

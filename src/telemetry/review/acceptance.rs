@@ -44,6 +44,21 @@ pub(super) fn accept(project: &Path, session: &str, document: &Path, signature: 
     Ok(json!({"acceptance": crate::authority::accept_review(project, session, document, signature)?}))
 }
 
+/// `review accept draft`: write the exact request bytes (a new file) for the
+/// grant's reviewer to sign offline. The product holds no reviewer key and
+/// signs nothing; the decision is made only by `review accept`.
+pub(super) fn draft(project: &Path, session: &str, grant: &str, reject: Option<&str>, output: &Path) -> Result<Value> {
+    use sha2::Digest;
+    use std::io::Write;
+    let (bytes, _) = crate::store::SqliteStore::open(&project.join(".state/state.db"))?.draft_review_acceptance(session, grant, reject)?;
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(output).with_context(|| format!("create {}", output.display()))?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    let request: Value = serde_json::from_slice(&bytes)?;
+    Ok(json!({"draft": {"document": output, "request_digest": format!("sha256:{:x}", sha2::Sha256::digest(&bytes)), "signer": request["subject"],
+        "namespace": crate::authority::REVIEW_ACCEPTANCE_SIGNATURE_NAMESPACE, "request": request}}))
+}
+
 /// Whether the store has the authority tables.
 pub(super) fn present(db: &rusqlite::Connection) -> Result<bool> {
     Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_authority_grants')", [], |r| r.get(0))?)

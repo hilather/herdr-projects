@@ -150,11 +150,13 @@ impl SqliteStore {
     pub(crate) fn worker_knowledge_selection(&self, task: &Task, profile: &FrozenProfile, budget: Option<&read_budget::ReadBudget>) -> Result<Option<VersionedReference>> {
         let version: u32 = self.connection.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version < 24 { return Ok(None); }
+        // A review task's only launchable knowledge is a bound blind brief (contracts-review.md §11).
+        let review = if version >= 62 { " AND (NOT EXISTS(SELECT 1 FROM review_briefs b WHERE b.task_id=s.task_id) OR EXISTS(SELECT 1 FROM review_briefs b WHERE b.snapshot_id=s.id))" } else { "" };
         read_budget::optional(&self.connection,
-            "SELECT s.id,s.manifest_hash FROM memory_snapshots s WHERE s.task_id=?1 AND s.task_revision=?2
+            &format!("SELECT s.id,s.manifest_hash FROM memory_snapshots s WHERE s.task_id=?1 AND s.task_revision=?2
              AND s.profile_name=?3 AND s.profile_digest=?4 AND s.config_digest IS ?5 AND s.estimator=?6
-             AND EXISTS(SELECT 1 FROM memory_snapshot_inputs i WHERE i.snapshot_id=s.id)
-             ORDER BY s.sequence DESC, s.id LIMIT 1",
+             AND EXISTS(SELECT 1 FROM memory_snapshot_inputs i WHERE i.snapshot_id=s.id){review}
+             ORDER BY s.sequence DESC, s.id LIMIT 1"),
             params![task.id.as_str(), integer(task.revision)?, profile.name, profile.definition_digest, profile.config.digest, crate::memory::WORKER_BRIEF_ESTIMATOR],
             budget, &[], |r| Ok(VersionedReference { id: r.get(0)?, revision: 1, digest: r.get(1)? }))
     }

@@ -231,6 +231,41 @@ fn opportunity_binding(tx: &Connection, opportunity: &str) -> Result<(String, St
         .ok_or_else(|| invalid(format!("no review opportunity {opportunity}")))
 }
 
+/// Refuse a session of `opportunity` by `attempt` unless one may start now:
+/// assigned, not revealed, every earlier session ended without completing
+/// it, and `attempt` has none yet. Returns the assigned configuration and
+/// the author attempt. Writes nothing (a launch draft checks it too).
+pub(super) fn session_admissible(tx: &Connection, opportunity: &str, attempt: Option<&str>) -> Result<(String, String, i64)> {
+    let (submission, _, author) = opportunity_binding(tx, opportunity)?;
+    super::seeded_defects::refuse_review_after_reveal(tx, &submission)?;
+    let assigned: Option<String> = tx.query_row("SELECT reviewer_configuration_id FROM review_assignments WHERE opportunity_id=?1", [opportunity], |r| r.get(0)).optional()?;
+    let Some(assigned) = assigned else { return Err(invalid(format!("review opportunity {opportunity} is not assigned"))) };
+    let sessions: Vec<(String, String, Option<String>)> = tx.prepare("SELECT r.session_id,r.attempt_id,c.outcome FROM review_sessions r LEFT JOIN review_completions c ON c.session_id=r.session_id WHERE r.opportunity_id=?1 ORDER BY r.ordinal")?
+        .query_map([opportunity], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+    if let Some(open) = sessions.iter().find(|s| s.2.is_none()) { return Err(invalid(format!("review session {} has no completion yet", open.0))); }
+    if sessions.iter().any(|s| s.2.as_deref() == Some("completed")) { return Err(invalid(format!("review opportunity {opportunity} is already completed"))); }
+    if let Some(attempt) = attempt && sessions.iter().any(|s| s.1 == attempt) { return Err(invalid(format!("attempt {attempt} already has a session for this opportunity"))); }
+    Ok((assigned, author, sessions.len() as i64 + 1))
+}
+
+/// Record a session start in the caller's transaction (the CLI's own, or the
+/// reservation that launches the reviewing attempt).
+pub(super) fn start_session_in(tx: &Connection, opportunity: &str, attempt: &str, principal: &str, now: i64) -> Result<ReviewSession> {
+    principal_ok(principal)?;
+    let (assigned, author, ordinal) = session_admissible(tx, opportunity, Some(attempt))?;
+    if !tx.query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE id=?1)", [attempt], |r| r.get::<_, bool>(0))? { return Err(invalid(format!("no attempt {attempt}"))); }
+    let configuration: Option<String> = tx.query_row("SELECT chosen_configuration_id FROM dispatch_decisions WHERE attempt_id=?1", [attempt], |r| r.get(0)).optional()?;
+    let matches_assignment = configuration.as_ref().map(|c| *c == assigned);
+    let same_attempt_as_author = attempt == author;
+    let session_id = digest(&serde_json::json!({"attempt_id": attempt, "opportunity_id": opportunity, "ordinal": ordinal, "schema": SESSION_SCHEMA, "started_unix_ms": now}).to_string());
+    tx.execute("INSERT INTO review_sessions(session_id,opportunity_id,ordinal,attempt_id,configuration_id,matches_assignment,same_attempt_as_author,recorder_principal,started_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![session_id, opportunity, ordinal, attempt, configuration, matches_assignment, same_attempt_as_author, principal, now])?;
+    // The start takes the next seq of the shared ledger (store schema 59 and later).
+    super::review_ledger::record_session_event(tx, &session_id, "started", principal, now)?;
+    Ok(ReviewSession { session_id, opportunity_id: opportunity.to_owned(), ordinal, attempt_id: attempt.to_owned(), configuration_id: configuration,
+        matches_assignment, same_attempt_as_author, recorder_principal: principal.to_owned(), started_unix_ms: now })
+}
+
 impl SqliteStore {
     /// Open a review opportunity on `spec.submission_id`'s exact candidate,
     /// task and contract revision. Opening assigns and runs nothing.
@@ -324,28 +359,9 @@ impl SqliteStore {
         principal_ok(principal)?;
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         schema_54(&tx)?;
-        let (submission, _, author) = opportunity_binding(&tx, opportunity)?;
-        super::seeded_defects::refuse_review_after_reveal(&tx, &submission)?;
-        let assigned: Option<String> = tx.query_row("SELECT reviewer_configuration_id FROM review_assignments WHERE opportunity_id=?1", [opportunity], |r| r.get(0)).optional()?;
-        let Some(assigned) = assigned else { return Err(invalid(format!("review opportunity {opportunity} is not assigned"))) };
-        if !tx.query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE id=?1)", [attempt], |r| r.get::<_, bool>(0))? { return Err(invalid(format!("no attempt {attempt}"))); }
-        let sessions: Vec<(String, String, Option<String>)> = tx.prepare("SELECT r.session_id,r.attempt_id,c.outcome FROM review_sessions r LEFT JOIN review_completions c ON c.session_id=r.session_id WHERE r.opportunity_id=?1 ORDER BY r.ordinal")?
-            .query_map([opportunity], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
-        if let Some(open) = sessions.iter().find(|s| s.2.is_none()) { return Err(invalid(format!("review session {} has no completion yet", open.0))); }
-        if sessions.iter().any(|s| s.2.as_deref() == Some("completed")) { return Err(invalid(format!("review opportunity {opportunity} is already completed"))); }
-        if sessions.iter().any(|s| s.1 == attempt) { return Err(invalid(format!("attempt {attempt} already has a session for this opportunity"))); }
-        let ordinal = sessions.len() as i64 + 1;
-        let configuration: Option<String> = tx.query_row("SELECT chosen_configuration_id FROM dispatch_decisions WHERE attempt_id=?1", [attempt], |r| r.get(0)).optional()?;
-        let matches_assignment = configuration.as_ref().map(|c| *c == assigned);
-        let same_attempt_as_author = attempt == author;
-        let session_id = digest(&serde_json::json!({"attempt_id": attempt, "opportunity_id": opportunity, "ordinal": ordinal, "schema": SESSION_SCHEMA, "started_unix_ms": now}).to_string());
-        tx.execute("INSERT INTO review_sessions(session_id,opportunity_id,ordinal,attempt_id,configuration_id,matches_assignment,same_attempt_as_author,recorder_principal,started_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![session_id, opportunity, ordinal, attempt, configuration, matches_assignment, same_attempt_as_author, principal, now])?;
-        // The start takes the next seq of the shared ledger (store schema 59 and later).
-        super::review_ledger::record_session_event(&tx, &session_id, "started", principal, now)?;
+        let session = start_session_in(&tx, opportunity, attempt, principal, now)?;
         tx.commit()?;
-        Ok(ReviewSession { session_id, opportunity_id: opportunity.to_owned(), ordinal, attempt_id: attempt.to_owned(), configuration_id: configuration,
-            matches_assignment, same_attempt_as_author, recorder_principal: principal.to_owned(), started_unix_ms: now })
+        Ok(session)
     }
 
     /// Record a session's end from the reviewer's receipt (`review_receipt.v1`),
@@ -354,6 +370,20 @@ impl SqliteStore {
     /// findings is valid. An identical receipt replays; a different one refuses.
     pub fn complete_review_session(&mut self, receipt: &[u8], principal: &str, now: i64) -> Result<ReviewCompletion> {
         principal_ok(principal)?;
+        self.complete_as(receipt, Some(principal), now)
+    }
+
+    /// The reviewing worker's channel (contracts-review.md §11): the receipt of
+    /// a session the controller recorded at launch, while its attempt has not
+    /// ended, recorded as `worker:<attempt>`. Like any completion it is a
+    /// proposal with declared coverage; nothing a worker sends accepts,
+    /// rejects or triages a review.
+    pub fn submit_review_receipt(&mut self, receipt: &[u8], now: i64) -> Result<ReviewCompletion> {
+        self.complete_as(receipt, None, now)
+    }
+
+    /// `principal` `None`: the launched session's own worker.
+    fn complete_as(&mut self, receipt: &[u8], principal: Option<&str>, now: i64) -> Result<ReviewCompletion> {
         if receipt.len() > MAX_RECEIPT_BYTES { return Err(invalid(format!("review receipt exceeds {MAX_RECEIPT_BYTES} bytes"))); }
         let r: Receipt = serde_json::from_slice(receipt).map_err(|e| invalid(format!("invalid review receipt: {e}")))?;
         if r.schema != RECEIPT_SCHEMA { return Err(invalid(format!("review receipt schema must be {RECEIPT_SCHEMA}"))); }
@@ -370,8 +400,17 @@ impl SqliteStore {
         let evidence = refs(&r.evidence, evidence_ref, MAX_REFS, "evidence")?;
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         schema_54(&tx)?;
-        let opportunity: String = tx.query_row("SELECT opportunity_id FROM review_sessions WHERE session_id=?1", [&r.session_id], |row| row.get(0)).optional()?
+        let (opportunity, attempt): (String, String) = tx.query_row("SELECT opportunity_id,attempt_id FROM review_sessions WHERE session_id=?1", [&r.session_id], |row| Ok((row.get(0)?, row.get(1)?))).optional()?
             .ok_or_else(|| invalid(format!("no review session {}", r.session_id)))?;
+        let worker = format!("worker:{attempt}");
+        let principal = match principal {
+            Some(principal) => principal,
+            None => {
+                super::review_launch::worker_channel_open(&tx, &r.session_id, &attempt)?;
+                principal_ok(&worker)?;
+                worker.as_str()
+            }
+        };
         let (submission, candidate, _) = opportunity_binding(&tx, &opportunity)?;
         if r.submission_id != submission || r.candidate_oid != candidate {
             return Err(invalid(format!("review receipt names another candidate: session {} reviews submission {submission} at {candidate}", r.session_id)));
