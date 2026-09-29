@@ -388,14 +388,25 @@ pub(super) fn verify(
         locks: guard.inherit()?,
     };
     let token = format!("probe-{}", digest(lab.root.as_os_str().as_encoded_bytes()));
+    let cwd = lab.root.join("work");
+    let isolation = crate::worker_supervision::Isolation::for_agent(
+        &project,
+        execution_home,
+        &cwd,
+        Path::new(&profile.agent.path),
+        &[],
+        Some(Path::new(&profile.config.path)),
+        Some(&socket),
+        &crate::profile_config::frozen_isolation_hides(profile)?,
+    )?;
     let argv = crate::worker_supervision::isolated_gated_command(
         Path::new(&profile.agent.path),
         &definition.extra_args,
         wall,
         &token,
         execution_home,
+        &isolation,
     )?;
-    let cwd = lab.root.join("work");
     // Patched servers start argv directly; stock servers start the default shell,
     // which then execs the fixed launcher. Evidence records which was verified.
     let ping = api.call("ping", json!({}))?;

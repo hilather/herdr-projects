@@ -242,7 +242,7 @@ fn live_canonical_layout_launches_literal_argv() {
     let destination=lab.path().join("literal-result");
     let argv=herdr_projects::worker_supervision::isolated_gated_command(std::path::Path::new("/bin/sh"),&[
         "-c".into(),"printf '%s' \"$1\" > \"$2\"; exec /usr/bin/sleep 30".into(),
-        "fixture".into(),literal.into(),destination.display().to_string()],15,"release-live-fixture",&lab.path().join("home")).unwrap();
+        "fixture".into(),literal.into(),destination.display().to_string()],15,"release-live-fixture",&lab.path().join("home"),&isolation(lab.path(),std::path::Path::new("/bin/sh"))).unwrap();
     let request=serde_json::json!({"id":"literal-launch","method":"layout.apply","params":{
         "workspace_id":workspace,"tab_label":"Canonical argv fixture","focus":false,
         "root":{"type":"pane","cwd":lab.path(),"command":argv,"env":{}}}});
@@ -330,7 +330,7 @@ fn live_vendor_direct_exec_and_native_naming_contract() {
     // No inherited home, credentials, user configuration or task prompt. This
     // tests startup/naming/termination, never authenticated protocol capability.
     let args:Vec<String>=vec!["--no-alt-screen".into()];
-    let argv=herdr_projects::worker_supervision::isolated_gated_command(&agent,&args,45,"release-vendor-contract",&lab.path().join("home")).unwrap();
+    let argv=herdr_projects::worker_supervision::isolated_gated_command(&agent,&args,45,"release-vendor-contract",&lab.path().join("home"),&isolation(lab.path(),&agent)).unwrap();
     let created=request(&lab,"layout.apply",serde_json::json!({"workspace_id":workspace,"tab_label":"Vendor contract","focus":false,
         "root":{"type":"pane","cwd":lab.path(),"command":argv,"env":{}}}));
     let pane=created["layout"]["focused_pane_id"].as_str().unwrap();
@@ -452,7 +452,7 @@ fn live_workspace_command_starts_supervised_root_without_bootstrap_shell() {
         std::thread::sleep(Duration::from_millis(25));
     };
     lab.herdr(&["workspace","close",control["result"]["workspace"]["workspace_id"].as_str().unwrap()]);
-    let argv=herdr_projects::worker_supervision::isolated_gated_command(std::path::Path::new("/usr/bin/sleep"),&["30".into()],15,"release-root-fixture",&lab.path().join("home")).unwrap();
+    let argv=herdr_projects::worker_supervision::isolated_gated_command(std::path::Path::new("/usr/bin/sleep"),&["30".into()],15,"release-root-fixture",&lab.path().join("home"),&isolation(lab.path(),std::path::Path::new("/usr/bin/sleep"))).unwrap();
     let inventory=request(&lab,"workspace.list",serde_json::json!({}));
     for command in [serde_json::json!([]),serde_json::json!(["relative"]),serde_json::json!([lab.path().join("missing-executable")])] {
         let response=raw_request(&lab,"workspace.create_command",serde_json::json!({"cwd":lab.path(),"command":command}));
@@ -479,4 +479,13 @@ fn live_workspace_command_starts_supervised_root_without_bootstrap_shell() {
         assert!(Instant::now()<end,"supervised root survived workspace closure");
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// The canonical worker sandbox for a live fixture agent working in `lab`: a
+/// disposable projects root under the lab, no Herdr socket to hide.
+#[cfg(target_os="linux")]
+fn isolation(lab:&std::path::Path,agent:&std::path::Path)->herdr_projects::worker_supervision::Isolation {
+    let lab=lab.canonicalize().unwrap();let project=lab.join("isolation-root/project");
+    std::fs::create_dir_all(&project).unwrap();std::fs::write(lab.join("isolation-root/.execution.lock"),b"").unwrap();
+    herdr_projects::worker_supervision::Isolation::for_agent(&project,&lab.join("home"),&lab,agent,&[],None,None,&[]).unwrap()
 }

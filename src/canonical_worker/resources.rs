@@ -5,20 +5,38 @@ use super::*;
 #[cfg(test)]
 pub(super) use crate::profile_config::ProfileDefinition as Definition;
 
-fn command(
+/// The literal supervisor argv. Creation and gate release derive it from the
+/// same retained inputs (profile, project, route, approved repositories) and
+/// the controller's owner identity, so the released gate matches the created one.
+pub(super) fn command(
     profile: &FrozenProfile,
     operation: &OperationId,
     prompt_chars: u64,
+    project: &Path,
+    route: &RuntimeRoute,
+    inputs: &crate::domain::LaunchInputs,
 ) -> Result<Vec<String>> {
     let definition = crate::profile_config::frozen_definition(profile)?;
     let wall = definition.validate_gated_preparation(prompt_chars)?;
     if let Some(home) = &profile.execution_home {
+        let repositories = inputs.repositories.iter().map(|r| Path::new(r.repository.as_str())).collect::<Vec<_>>();
+        let isolation = crate::worker_supervision::Isolation::for_agent(
+            project,
+            Path::new(home),
+            Path::new(&route.cwd),
+            Path::new(&profile.agent.path),
+            &repositories,
+            Some(Path::new(&profile.config.path)),
+            Some(Path::new(&route.socket)),
+            &crate::profile_config::frozen_isolation_hides(profile)?,
+        )?;
         return crate::worker_supervision::isolated_gated_command(
             Path::new(&profile.agent.path),
             &definition.extra_args,
             wall,
             &release_token(operation),
             Path::new(home),
+            &isolation,
         );
     }
     crate::worker_supervision::gated_command(
@@ -295,7 +313,7 @@ fn create_resource_inner(
     // Refuse unusable retained knowledge before creating any external resource.
     let brief =
         db.render_attempt_brief(&project, record.attempt.as_str())?;
-    let argv = command(profile, operation, brief.prompt_chars)?;
+    let argv = command(profile, operation, brief.prompt_chars, &project, route, &record.inputs)?;
     executable(&profile.agent, deadline, &cancellation)?;
     let session = session_identity(Path::new(&route.socket))?;
     let mut api = Api {
@@ -1056,7 +1074,7 @@ pub fn release_gate(
     let brief =
         db.render_attempt_brief(&project, record.attempt.as_str())?;
     let worktrees=crate::worktree_preparation::verify_events_held(&project,&state.events,record,deadline,cancellation.clone(),guard.inherit()?)?;
-    let argv = command(profile, operation, brief.prompt_chars)?;
+    let argv = command(profile, operation, brief.prompt_chars, &project, &target.route, &record.inputs)?;
     executable(&profile.agent, deadline, &cancellation)?;
     let supervisor = crate::worker_supervision::SupervisorObservation::reconnect(
         target

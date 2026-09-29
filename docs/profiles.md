@@ -179,6 +179,27 @@ home remain readable for recovery but are refused by the native gate sender.
 The trusted CLI producer of this frozen environment remains part of dispatch
 preparation work; `profile resolve` does not grant it.
 
+### Filesystem isolation
+
+On Linux the gate also isolates the worker's filesystem view before the agent
+starts: the projects root is covered except the worker's own project, the
+owner's key and credential directories (`~/.ssh`, `~/.gnupg`, `~/.codex`,
+`~/.config/herdr-projects` including `review-signer/`, Herdr's sockets,
+`/run/user/UID` and others) are replaced by empty read-only mounts, and the
+agent runs in a nested user namespace that cannot unmount them. The execution
+home must therefore be a dedicated directory: a home that contains one of these
+locations (for example the owner's real HOME) is refused. Hide an owner signing
+key or other secret stored elsewhere by declaring it in the pinned owner
+configuration (at most 16 absolute or `~/` paths):
+
+```toml
+[worker_isolation]
+hide = ["~/keys/herdr-owner"]
+```
+
+See [the worker isolation review](reviews/2026-09-29-worker-isolation.md) for
+the full list, what stays visible and the residual risks.
+
 ## Project-bound preparation
 
 With the `state-store` build, prepare immutable installation inputs using the

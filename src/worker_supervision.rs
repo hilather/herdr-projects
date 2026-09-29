@@ -178,16 +178,274 @@ pub fn gated_command(
     command(Path::new("/bin/sh"), &args, max_wall_seconds)
 }
 
+/// Filesystem view of an isolated agent: what the sandbox hides and, when the
+/// projects root is covered, which paths under it stay visible. Built only by
+/// [`Isolation::for_agent`] so every launch path derives it the same way; it is
+/// part of the literal supervisor argv, not of any approval digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Isolation {
+    root: String,
+    expose: Vec<String>,
+    hide: Vec<String>,
+}
+
+/// Owner-home entries hidden from every isolated agent: signing and SSH keys,
+/// the owner's own agent credentials, the product configuration (owner policy
+/// and the reviewer-signer directory under it), Herdr's control sockets and
+/// common credential stores. A missing entry is skipped at setup time.
+const OWNER_SECRETS: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".codex",
+    ".claude/.credentials.json",
+    ".config/herdr-projects",
+    ".config/herdr",
+    ".config/gh",
+    ".aws",
+    ".docker",
+    ".kube",
+    ".password-store",
+    ".local/share/keyrings",
+    ".git-credentials",
+    ".netrc",
+];
+
+/// The sandbox's setup program, run by `/bin/sh` inside the supervisor's user
+/// and mount namespaces after gate release. As namespace root it covers the
+/// projects root with an empty tmpfs, binds back only the exposed paths (opened
+/// before the cover, so the bind reaches the real inodes and shared locks stay
+/// shared), then mounts an empty read-only tmpfs over every hidden directory
+/// and `/dev/null` over every hidden file, then over the owner's SSH agent and
+/// tmux socket directories in `/tmp` (enumerated at setup, so the argv stays
+/// fixed; a directory the owner does not own is left alone). It re-enters the working directory
+/// through the new mount tree and execs the agent in a nested user namespace:
+/// the agent keeps root there but holds no capability over the mount namespace
+/// that owns these mounts, so it cannot unmount, move or remount them, and a
+/// mount namespace it creates itself receives them locked. Any failure exits
+/// 125 before the agent runs.
+const SANDBOX: &str = concat!(
+    r#"set -u; fail() { printf 'herdr-projects: worker isolation refused: %s\n' "$1" >&2; exit 125; }; "#,
+    r#"root=$1; shift; cwd=$(pwd -P) || fail cwd; "#,
+    r#"if [ -n "$root" ]; then n=3; "#,
+    r#"for a in "$@"; do case $a in --) break;; expose:*) [ "$n" -le 9 ] || fail expose; p=${a#expose:}; "#,
+    r#"eval "exec $n<\"\$p\"" || fail "$p"; n=$((n+1));; esac; done; "#,
+    r#"/usr/bin/mount -t tmpfs -o nosuid,nodev,noexec,mode=0755,size=1m herdr-projects-root "$root" || fail "$root"; n=3; "#,
+    r#"for a in "$@"; do case $a in --) break;; expose:*) p=${a#expose:}; rel=${p#"$root"/}; "#,
+    r#"case $rel in */*) /usr/bin/mkdir -p -- "$root/${rel%/*}" || fail "$p";; esac; "#,
+    r#"if [ -d "/proc/self/fd/$n" ]; then /usr/bin/mkdir -- "$root/$rel" || fail "$p"; else : > "$root/$rel" || fail "$p"; fi; "#,
+    r#"/usr/bin/mount -c --bind "/proc/self/fd/$n" "$root/$rel" || fail "$p"; eval "exec $n<&-"; n=$((n+1));; esac; done; "#,
+    r#"/usr/bin/mount -o remount,bind,ro,nosuid,nodev,noexec "$root" || fail "$root"; fi; "#,
+    r#"for a in "$@"; do case $a in --) break;; hide:*) p=${a#hide:}; "#,
+    r#"if [ -d "$p" ]; then /usr/bin/mount -t tmpfs -o ro,nosuid,nodev,noexec,size=4k,mode=0555 herdr-projects-hidden "$p" || fail "$p"; "#,
+    r#"elif [ -e "$p" ]; then { /usr/bin/mount --bind /dev/null "$p" && /usr/bin/mount -o remount,bind,ro "$p"; } || fail "$p"; fi;; esac; done; "#,
+    r#"for p in /tmp/ssh-* /tmp/tmux-*; do if [ -d "$p" ] && [ -O "$p" ]; then "#,
+    r#"/usr/bin/mount -t tmpfs -o ro,nosuid,nodev,noexec,size=4k,mode=0555 herdr-projects-hidden "$p" || fail "$p"; fi; done; "#,
+    r#"cd -- "$cwd" || fail "$cwd"; while [ "$1" != -- ]; do shift; done; shift; "#,
+    r#"exec /usr/bin/unshare --user --map-root-user -- "$@""#,
+);
+
+/// Lexically normal absolute UTF-8 path, bounded and free of control
+/// characters, `.` and `..`; the sandbox receives it as a literal argument.
+fn normal(path: &Path) -> Result<String> {
+    use std::path::Component;
+    let text = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("isolation path is not UTF-8"))?;
+    ensure!(
+        path.is_absolute()
+            && text.len() <= 1024
+            && !text.chars().any(char::is_control)
+            && path
+                .components()
+                .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+            && path.components().count() > 1,
+        "invalid isolation path {text:?}"
+    );
+    Ok(path.components().collect::<std::path::PathBuf>().to_str().unwrap_or_default().to_owned())
+}
+
+/// The path and, when it exists, its canonical target: a check must hold for
+/// the name the sandbox mounts on and for the directory it really reaches.
+fn forms(path: &str) -> Vec<std::path::PathBuf> {
+    let mut forms = vec![std::path::PathBuf::from(path)];
+    if let Ok(real) = Path::new(path).canonicalize()
+        && real != forms[0]
+    {
+        forms.push(real);
+    }
+    forms
+}
+
+/// The owner's home directories: the account's passwd entry and, when it
+/// differs, the controller's `HOME`. Both are hidden-secret anchors.
+fn owner_homes() -> Result<Vec<String>> {
+    let mut homes = Vec::new();
+    let mut buffer = vec![0u8; 16384];
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found = std::ptr::null_mut();
+    // SAFETY: the buffer outlives every pointer getpwuid_r stores in `entry`.
+    let status = unsafe {
+        libc::getpwuid_r(libc::geteuid(), &mut entry, buffer.as_mut_ptr().cast(), buffer.len(), &mut found)
+    };
+    if status == 0 && !found.is_null() && !entry.pw_dir.is_null() {
+        // SAFETY: pw_dir points into `buffer`, NUL-terminated by getpwuid_r.
+        let dir = unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) };
+        if let Ok(dir) = dir.to_str()
+            && let Ok(dir) = normal(Path::new(dir))
+        {
+            homes.push(dir);
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME")
+        && let Ok(home) = normal(Path::new(&home))
+        && !homes.contains(&home)
+    {
+        homes.push(home);
+    }
+    ensure!(!homes.is_empty(), "owner home is unknown; worker isolation cannot hide its secrets");
+    Ok(homes)
+}
+
+impl Isolation {
+    /// The sandbox for one agent. `project` is its own project directory: the
+    /// projects root above it is covered and only `project` (plus the root's
+    /// shared execution lock and any needed path under the root) stays visible.
+    /// `socket` is the Herdr control socket that must be unreachable; `config`
+    /// the pinned owner configuration file; `extra` the owner-declared hidden
+    /// paths from it (absolute, or `~/` relative to each owner home). Refuses,
+    /// before any effect, when a hidden path would contain or cover a path the
+    /// agent needs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_agent(
+        project: &Path,
+        home: &Path,
+        cwd: &Path,
+        agent: &Path,
+        repositories: &[&Path],
+        config: Option<&Path>,
+        socket: Option<&Path>,
+        extra: &[String],
+    ) -> Result<Self> {
+        let project = normal(&project.canonicalize()?)?;
+        let root = normal(Path::new(&project).parent().ok_or_else(|| anyhow::anyhow!("project has no root"))?)?;
+        let home = normal(home)?;
+        let cwd = normal(cwd)?;
+        let agent = normal(agent)?;
+        let homes = owner_homes()?;
+        let mut hide = Vec::new();
+        for owner in &homes {
+            for entry in OWNER_SECRETS {
+                hide.push(format!("{owner}/{entry}"));
+            }
+        }
+        hide.push(format!("/run/user/{}", unsafe { libc::geteuid() }));
+        ensure!(extra.len() <= 16, "too many owner-declared hidden paths");
+        for path in extra {
+            match path.strip_prefix("~/") {
+                Some(relative) => {
+                    for owner in &homes {
+                        hide.push(normal(&Path::new(owner).join(relative))?);
+                    }
+                }
+                None => hide.push(normal(Path::new(path))?),
+            }
+        }
+        if let Some(config) = config {
+            let config = normal(config)?;
+            let parent = Path::new(&config).parent().map(normal).transpose()?;
+            hide.push(config);
+            if let Some(parent) = parent {
+                hide.push(format!("{parent}/review-signer"));
+            }
+        }
+        if let Some(socket) = socket {
+            let socket = normal(socket)?;
+            // A dedicated socket directory is hidden whole, so a socket the
+            // server recreates stays hidden; a shared one hides the file only.
+            let parent = Path::new(&socket).parent().map(normal).transpose()?;
+            let shared = |dir: &str| {
+                matches!(dir, "/tmp" | "/var/tmp" | "/run" | "/dev/shm")
+                    || dir.starts_with("/run/user/") && dir.matches('/').count() == 3
+                    || [&project, &home, &cwd, &root].iter().any(|n| Path::new(n.as_str()).starts_with(dir))
+                    || repositories.iter().any(|r| r.starts_with(dir))
+                    || homes.iter().any(|h| h == dir)
+            };
+            if let Some(parent) = parent.filter(|parent| !shared(parent)) {
+                hide.push(parent);
+            }
+            hide.push(socket);
+        }
+        hide.sort();
+        hide.dedup();
+        // Needed paths stay visible: under the root they are bound back.
+        let mut needed = vec![home.clone(), cwd.clone(), agent.clone(), project.clone()];
+        for repository in repositories {
+            needed.push(normal(repository)?);
+        }
+        for secret in &hide {
+            for secret in forms(secret) {
+                for need in &needed {
+                    for need in forms(need) {
+                        ensure!(
+                            !need.starts_with(&secret),
+                            "worker isolation would hide {} (inside {}); move it out of the owner's secret locations",
+                            need.display(),
+                            secret.display()
+                        );
+                    }
+                }
+                for dir in [&home, &project] {
+                    for dir in forms(dir) {
+                        ensure!(
+                            !secret.starts_with(&dir),
+                            "worker isolation refuses {}: it contains the owner's secret location {}; use a dedicated directory",
+                            dir.display(),
+                            secret.display()
+                        );
+                    }
+                }
+            }
+        }
+        for form in forms(&cwd) {
+            ensure!(
+                !form.starts_with(&root) || form.starts_with(&project),
+                "worker working directory must be inside its own project or outside the projects root"
+            );
+        }
+        let mut expose = vec![project.clone(), format!("{root}/.execution.lock")];
+        for need in [&home, &agent].into_iter().chain(needed[4..].iter()) {
+            if Path::new(need).starts_with(&root) && !Path::new(need).starts_with(&project) {
+                expose.push(need.clone());
+            }
+        }
+        expose.sort();
+        expose.dedup();
+        let nested = expose.clone();
+        expose.retain(|path| !nested.iter().any(|other| other != path && Path::new(path).starts_with(other)));
+        ensure!(expose.len() <= 7, "too many paths to expose under the projects root");
+        Ok(Self { root, expose, hide })
+    }
+
+    fn arguments(&self) -> Vec<String> {
+        let mut args = vec![self.root.clone()];
+        args.extend(self.expose.iter().map(|p| format!("expose:{p}")));
+        args.extend(self.hide.iter().map(|p| format!("hide:{p}")));
+        args
+    }
+}
+
 /// Explicit baseline environment for the agent. Only the credential-store home
 /// is variable; secrets and arbitrary inherited loader/config hooks are excluded.
 /// The waiting gate still runs in the native terminal's environment, but its
-/// eventual exec clears that environment before executing the approved agent.
+/// eventual exec clears that environment, applies `isolation` and executes the
+/// approved agent in a nested user namespace (see [`Isolation`]).
 pub fn isolated_gated_command(
     executable: &Path,
     arguments: &[String],
     wall: u64,
     token: &str,
     home: &Path,
+    isolation: &Isolation,
 ) -> Result<Vec<String>> {
     let home = home
         .to_str()
@@ -199,6 +457,16 @@ pub fn isolated_gated_command(
     command(executable, arguments, wall)?;
     let mut args = vec![
         "-i".into(),
+        "/bin/sh".into(),
+        "-c".into(),
+        SANDBOX.into(),
+        "herdr-projects-worker-sandbox".into(),
+    ];
+    args.extend(isolation.arguments());
+    args.extend([
+        "--".into(),
+        "/usr/bin/env".into(),
+        "-i".into(),
         format!("HOME={home}"),
         "PATH=/usr/bin:/bin".into(),
         "LANG=C.UTF-8".into(),
@@ -208,7 +476,7 @@ pub fn isolated_gated_command(
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("agent executable is not UTF-8"))?
             .into(),
-    ];
+    ]);
     args.extend_from_slice(arguments);
     gated_command(Path::new("/usr/bin/env"), &args, wall, token)
 }
@@ -243,16 +511,24 @@ mod tests {
             process::{Command, Stdio},
         };
         let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let project = root_path.join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(root_path.join(".execution.lock"), b"").unwrap();
+        let isolation = Isolation::for_agent(&project, home.path(), &project, Path::new("/usr/bin/env"), &[], None, None, &[]).unwrap();
         let argv = isolated_gated_command(
             Path::new("/usr/bin/env"),
             &[],
             5,
             "release-env",
             home.path(),
+            &isolation,
         )
         .unwrap();
         let mut child = Command::new(&argv[0])
             .args(&argv[1..])
+            .current_dir(&project)
             .env("UNAPPROVED_VARIABLE", "must-not-reach-agent")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

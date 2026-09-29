@@ -507,12 +507,16 @@ print(json.dumps({{'id':('wrong' if mode=='wrong-id' and r['method']=='agent.pro
         }
         let arguments=if signer.is_some(){vec![]}else{vec!["30".into()]};
         let argv = if let Some(home) = &profile.execution_home {
+            let repositories = reserved.record.inputs.repositories.iter().map(|r| Path::new(r.repository.as_str())).collect::<Vec<_>>();
             crate::worker_supervision::isolated_gated_command(
                 Path::new(&profile.agent.path),
                 &arguments,
                 20,
                 &format!("release-{}", reserved.record.operation.as_str()),
                 Path::new(home),
+                &crate::worker_supervision::Isolation::for_agent(&project, Path::new(home), Path::new(&route.cwd),
+                    Path::new(&profile.agent.path), &repositories, Some(Path::new(&profile.config.path)), Some(Path::new(&route.socket)),
+                    &crate::profile_config::frozen_isolation_hides(&profile).unwrap()).unwrap(),
             )
             .unwrap()
         } else if mode.starts_with("resource") {

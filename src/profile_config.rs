@@ -240,3 +240,40 @@ pub(crate) fn frozen_definition(profile: &crate::domain::FrozenProfile) -> anyho
     );
     Ok(definition)
 }
+
+/// Owner-declared extra paths hidden from isolated agents, read from the same
+/// digest-pinned configuration bytes as the frozen profile (`[worker_isolation]
+/// hide = [...]`): absolute paths, or `~/`-relative to each owner home. Use it
+/// for an owner signing key or other secret outside the fixed hidden set.
+#[cfg(feature = "state-store")]
+pub(crate) fn frozen_isolation_hides(profile: &crate::domain::FrozenProfile) -> anyhow::Result<Vec<String>> {
+    use anyhow::{Context, ensure};
+    use sha2::{Digest, Sha256};
+    use std::path::Path;
+    let bytes = crate::migration::read_plan_file(Path::new(&profile.config.path))?;
+    ensure!(
+        bytes.len() <= 1_048_576
+            && profile.config.digest.as_deref()
+                == Some(format!("{:x}", Sha256::digest(&bytes)).as_str()),
+        "worker profile configuration changed"
+    );
+    let config: toml::Value = toml::from_str(
+        std::str::from_utf8(&bytes).map_err(|_| anyhow::anyhow!("invalid worker configuration"))?,
+    )
+    .map_err(|_| anyhow::anyhow!("invalid worker configuration (contents withheld)"))?;
+    let Some(table) = config.get("worker_isolation") else { return Ok(vec![]) };
+    let table = table.as_table().context("invalid worker_isolation table")?;
+    ensure!(table.keys().all(|k| k == "hide"), "unknown worker_isolation setting");
+    let hide = table
+        .get("hide")
+        .map(|v| v.as_array().context("worker_isolation.hide must be a list of paths"))
+        .transpose()?
+        .map(|v| v.iter().map(|p| p.as_str().map(str::to_owned).context("worker_isolation.hide entries must be strings")).collect::<anyhow::Result<Vec<_>>>())
+        .transpose()?
+        .unwrap_or_default();
+    ensure!(
+        hide.len() <= 16 && hide.iter().all(|p| p.starts_with('/') || p.starts_with("~/")),
+        "worker_isolation.hide takes at most 16 absolute or ~/ paths"
+    );
+    Ok(hide)
+}

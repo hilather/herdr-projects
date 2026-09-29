@@ -1028,3 +1028,211 @@ fn acceptance_decision_replays_in_the_ledger_as_of() {
     assert_eq!(event["seq"], json!(5));
     assert_eq!(at(4)["opportunities"][0]["sessions"][0]["completion"]["acceptance"]["decision"], json!("accepted"));
 }
+
+/// A worker agent that probes its own filesystem view. It records every
+/// secret read, the projects root listing, a connection to the Herdr socket,
+/// direct `umount2`/`mount` calls on each hidden path, and the same attempts
+/// (plus a bind of a hidden path's parent) from a user and mount namespace it
+/// creates itself. It then does ordinary work: writes and commits a file in
+/// its worktree, publishes `probe-1.txt`, waits for the owner's `submit.json`
+/// and submits it through the product CLI, publishing `probe-2.txt`.
+const PROBE_AGENT: &str = r#"
+use std::{ffi::{CString, c_char, c_void}, fs, os::unix::net::UnixStream, path::Path, process::Command, time::Duration};
+extern "C" { fn umount2(target: *const c_char, flags: i32) -> i32; fn mount(source: *const c_char, target: *const c_char, kind: *const c_char, flags: u64, data: *const c_void) -> i32; }
+fn sys(result: i32) -> String { if result == 0 { "OK".into() } else { format!("ERR{}", std::io::Error::last_os_error().raw_os_error().unwrap_or(0)) } }
+fn publish(name: &str, text: &str) { fs::write(format!("{name}.tmp"), text).unwrap(); fs::rename(format!("{name}.tmp"), name).unwrap(); }
+fn run(program: &str, args: &[&str]) -> (bool, String) {
+    match Command::new(program).args(args).output() {
+        Ok(out) => (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)).replace('\n', "|")),
+        Err(error) => (false, error.to_string()),
+    }
+}
+fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--version") { println!("2.1.0 (Claude Code)"); return }
+    let mut report = String::new();
+    for secret in SECRETS {
+        report += &format!("read {secret} {}\n", match fs::read(secret) { Ok(bytes) => format!("OK:{}", String::from_utf8_lossy(&bytes).trim()), Err(error) => format!("ERR:{:?}", error.kind()) });
+    }
+    let list = |dir: &str| { let mut names: Vec<String> = fs::read_dir(dir).map(|d| d.filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default(); names.sort(); names.join(",") };
+    report += &format!("root {}\n", list(ROOT));
+    report += &format!("own {}\n", list(OWN));
+    report += &format!("socket {}\n", match UnixStream::connect(SOCKET) { Ok(_) => "OK".into(), Err(error) => format!("ERR:{:?}", error.kind()) });
+    let tmpfs = CString::new("tmpfs").unwrap();
+    for dir in HIDDEN {
+        let target = CString::new(*dir).unwrap();
+        report += &format!("unmount {dir} {} {}\n", sys(unsafe { umount2(target.as_ptr(), 0) }), sys(unsafe { umount2(target.as_ptr(), 2) }));
+        report += &format!("mount {dir} {}\n", sys(unsafe { mount(tmpfs.as_ptr(), target.as_ptr(), tmpfs.as_ptr(), 0, std::ptr::null()) }));
+    }
+    let (_, nested) = run("/usr/bin/unshare", &["--user", "--map-root-user", "--mount", "/bin/sh", "-c", NESTED]);
+    report += &format!("nested {nested}\n");
+    fs::write("work.txt", "worker change\n").unwrap();
+    let git = |args: &[&str]| run("/usr/bin/git", &[&["-c", "user.name=worker", "-c", "user.email=worker@example.invalid"], args].concat());
+    let (added, _) = git(&["add", "work.txt"]);
+    let (committed, output) = git(&["commit", "-qm", "worker change"]);
+    let (_, head) = git(&["rev-parse", "HEAD"]);
+    report += &format!("commit {} {}\nhead {}\n", added && committed, output, head.trim_end_matches('|'));
+    publish("probe-1.txt", &report);
+    while !Path::new("submit.json").exists() { std::thread::sleep(Duration::from_millis(50)); }
+    let mut last = (false, String::new());
+    for _ in 0..200 {
+        last = run(BIN, &["--root", ROOT, "result", "demo", "submit", "--input-file", "submit.json"]);
+        if last.0 { break }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    publish("probe-2.txt", &format!("submitted {} {}\n", last.0, last.1));
+    loop { std::thread::park() }
+}
+"#;
+
+impl Lab {
+    /// Replace the lab agent with `PROBE_AGENT`, its paths compiled in.
+    fn write_probe_agent(&self, secrets: &[PathBuf], hidden: &[PathBuf], nested: &str) {
+        let quoted = |paths: &[PathBuf]| paths.iter().map(|p| format!("{:?}", p.to_str().unwrap())).collect::<Vec<_>>().join(",");
+        let root = self.path("root").canonicalize().unwrap();
+        let source = format!("{PROBE_AGENT}\nconst SECRETS: &[&str] = &[{}];\nconst HIDDEN: &[&str] = &[{}];\nconst ROOT: &str = {:?};\nconst OWN: &str = {:?};\nconst SOCKET: &str = {:?};\nconst BIN: &str = {BIN:?};\nconst NESTED: &str = {nested:?};\n",
+            quoted(secrets), quoted(hidden), root.to_str().unwrap(), self.project.canonicalize().unwrap().join(".state").to_str().unwrap(), self.socket().to_str().unwrap());
+        let (agent, file) = (self.path("bin/claude"), self.path("bin/probe.rs"));
+        fs::write(&file, source).unwrap();
+        let built = Command::new("rustc").args(["--edition", "2021", "-o"]).arg(&agent).arg(&file).output().unwrap();
+        assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    /// Install an owner-signed contract for the queued task `work` whose one
+    /// output is `work.txt`; returns (contract digest, base commit).
+    fn install_work_contract(&self) -> (String, String) {
+        let base = self.git(&["rev-parse", "HEAD"]);
+        let store = self.project.join(".state/state.db").canonicalize().unwrap().display().to_string();
+        let mut document = serde_json::to_vec_pretty(&json!({
+            "version": 3, "outputs": [{"path": "work.txt", "kind": "git_file"}], "scope": {"paths": [{"path": "work.txt", "access": "write"}]},
+            "project_store": store, "expected_head": self.head(), "task_id": "work", "contract_revision": 1, "deliverable": "work", "non_goals": "none",
+            "acceptance_policies": [{"id": "clean", "text": r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#}],
+            "repository": self.repo.canonicalize().unwrap().display().to_string(), "base_oid": base,
+            "object_format": "sha256", "dependencies": [], "capability_flags": [], "profile_kind": "claude", "retry_class": "none", "result_schema_id": "result-v1",
+            "route": "verify_only", "authority": authority::policy_reference(&self.project).unwrap()})).unwrap();
+        document.push(b'\n');
+        let contract = self.path("work-contract.json");
+        fs::write(&contract, &document).unwrap();
+        assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y", "sign", "-f"]).arg(&self.key).args(["-n", authority::CONTRACT_SIGNATURE_NAMESPACE]).arg(&contract).output().unwrap().status.success());
+        let installed = self.ok(&["task", "demo", "contract", "put", "--input-file", contract.to_str().unwrap(), "--signature", self.path("work-contract.json.sig").to_str().unwrap()]);
+        (installed["digest"].as_str().unwrap().to_owned(), base)
+    }
+}
+
+/// Plant `text` at `path` as a private file in a private directory.
+fn plant(path: &std::path::Path, text: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(path, text).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// The owner decision "isolate workers first": a canonical worker launched
+/// through the real ticker path cannot read the owner's SSH/GnuPG keys, the
+/// owner's own Codex login, the product configuration (owner policy and the
+/// reviewer-signer directory), an owner signing key declared in
+/// `[worker_isolation]`, another project under the root, the Herdr stand-in's
+/// directory or its control socket, an SSH agent directory in `/tmp`, nor lift the hiding with `umount`/`mount`,
+/// directly or from a namespace of its own. Its own execution home, worktree
+/// commit and `result submit` into its own project still work.
+#[test]
+fn an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_commits_and_submits() {
+    let mut lab = Lab::new("unknown_usage='allow_with_warning'\n[worker_isolation]\nhide=['~/owner']");
+    let home = lab.home.path().canonicalize().unwrap();
+    lab.ok(&["new", "other"]);
+    let secrets = [
+        (home.join(".ssh/id_owner"), "SENTINEL-SSH-KEY"),
+        (home.join(".gnupg/private-keys-v1.d/key"), "SENTINEL-GNUPG"),
+        (home.join(".codex/auth.json"), "SENTINEL-OWNER-CODEX-AUTH"),
+        (home.join(".config/herdr-projects/review-signer/reviewer"), "SENTINEL-REVIEW-SIGNER"),
+        (home.join(".config/herdr-projects/notes"), "SENTINEL-CONFIG-DIR"),
+        (home.join("root/other/SECRET.txt"), "SENTINEL-OTHER-PROJECT"),
+        (home.join("lab/secret"), "SENTINEL-HERDR-DIR"),
+    ];
+    for (path, text) in &secrets { plant(path, text); }
+    // An SSH agent directory in /tmp, as ssh-agent creates it.
+    let agent_socket_dir = tempfile::Builder::new().prefix("ssh-").tempdir_in("/tmp").unwrap();
+    let agent_socket = agent_socket_dir.path().canonicalize().unwrap().join("agent.1");
+    plant(&agent_socket, "SENTINEL-SSH-AGENT");
+    plant(&home.join("agent-home/.codex/auth.json"), "WORKER-OWN-AUTH");
+    fs::set_permissions(home.join("agent-home"), fs::Permissions::from_mode(0o700)).unwrap();
+    let owner_key = fs::read_to_string(&lab.key).unwrap();
+    let mut reads: Vec<PathBuf> = secrets.iter().map(|(p, _)| p.clone()).collect();
+    reads.extend([agent_socket.clone(), lab.key.clone(), home.join(".config/herdr-projects/config.toml"), home.join("agent-home/.codex/auth.json")]);
+    let hidden = [home.join(".ssh"), home.join(".codex"), home.join(".config/herdr-projects"), home.join("lab"), home.join("root")];
+    let nested = format!("for d in {0}; do umount \"$d\" 2>/dev/null && echo LIFTED-$d; umount -l \"$d\" 2>/dev/null && echo LIFTED-$d; done; \
+        mkdir -p nested && mount --bind {1} nested 2>/dev/null && cat nested/.ssh/id_owner; mount --rbind {1} nested 2>/dev/null && cat nested/.ssh/id_owner nested/owner; \
+        cat {2} {3}; echo nested-done",
+        hidden.iter().map(|p| format!("'{}'", p.display())).collect::<Vec<_>>().join(" "), home.display(), home.join(".ssh/id_owner").display(), home.join("root/other/SECRET.txt").display());
+    lab.write_probe_agent(&reads, &hidden, &nested);
+    let (contract, base) = lab.install_work_contract();
+    let (_, attempt) = lab.reserve("Retained instructions");
+    let worktree = lab.planned_worktree(&attempt);
+    lab.serve();
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 120, &|| worktree.join("probe-1.txt").exists());
+    let report = fs::read_to_string(worktree.join("probe-1.txt")).unwrap();
+    // Nothing secret reached the worker, directly or through its own namespace.
+    for sentinel in secrets.iter().map(|(_, s)| *s).chain([owner_key.lines().nth(1).unwrap(), "SENTINEL-SSH-AGENT", "LIFTED"]) {
+        assert!(!report.contains(sentinel), "{sentinel} reached the worker:\n{report}");
+    }
+    // A hidden directory is an empty read-only tmpfs; a hidden file (the
+    // declared owner key) reads as `/dev/null`.
+    for path in reads.iter().filter(|p| **p != lab.key && !p.starts_with(home.join("agent-home"))) {
+        assert!(report.contains(&format!("read {} ERR:", path.display())), "{} was readable:\n{report}", path.display());
+    }
+    assert!(report.contains(&format!("read {} OK:\n", lab.key.display())), "{report}");
+    assert!(report.contains(&format!("read {} OK:WORKER-OWN-AUTH", home.join("agent-home/.codex/auth.json").display())), "{report}");
+    // Only its own project and the shared root lock remain under the root; the
+    // Herdr control socket is unreachable.
+    assert!(report.contains("\nroot .execution.lock,demo\n"), "{report}");
+    assert!(report.contains("\nown ") && report.contains("state.db"), "{report}");
+    assert!(report.contains("\nsocket ERR:"), "{report}");
+    // Every direct unmount/mount fails (EPERM) and the nested namespace
+    // neither unmounts the locked hiding nor binds around it.
+    for dir in &hidden {
+        assert!(report.contains(&format!("unmount {} ERR1 ERR1\n", dir.display())), "{}:\n{report}", dir.display());
+        assert!(report.contains(&format!("mount {} ERR1\n", dir.display())), "{}:\n{report}", dir.display());
+    }
+    assert!(report.contains("nested-done"), "{report}");
+    // Normal work: a commit on the attempt branch in the shared object store.
+    let candidate = report.lines().find_map(|l| l.strip_prefix("head ")).unwrap().to_owned();
+    assert!(report.contains("commit true"), "{report}");
+    assert_eq!(fs::read_to_string(worktree.join("work.txt")).unwrap(), "worker change\n");
+    assert_eq!(lab.git(&["cat-file", "-p", &format!("{candidate}:work.txt")]), "worker change");
+    // ... and `result submit` from inside the sandbox records a submission.
+    let objects: Vec<Value> = lab.git(&["rev-list", "--objects", "--all"]).lines()
+        .map(|line| { let oid = line.split_whitespace().next().unwrap(); json!({"oid": oid, "relative_path": format!("{}/{}", &oid[..2], &oid[2..])}) }).collect();
+    fs::write(worktree.join("submit.json.tmp"), json!({"idempotency_key": "isolated-worker", "task_id": "work", "contract_revision": 1, "contract_digest": contract,
+        "attempt_id": attempt.as_str(), "repository": lab.repo.canonicalize().unwrap().display().to_string(), "base_oid": base, "candidate_oid": candidate, "object_format": "sha256",
+        "artifact_manifest": [{"path": "work.txt", "oid": candidate}], "claimed_checks": [], "objects": objects}).to_string()).unwrap();
+    fs::rename(worktree.join("submit.json.tmp"), worktree.join("submit.json")).unwrap();
+    lab.wait(&mut ticker, 60, &|| worktree.join("probe-2.txt").exists());
+    let submitted = fs::read_to_string(worktree.join("probe-2.txt")).unwrap();
+    assert!(submitted.starts_with("submitted true"), "{submitted}");
+    let shown = lab.ok(&["result", "demo", "show"]);
+    assert_eq!(shown.as_array().map(|a| (a.len(), a[0]["candidate_oid"].clone(), a[0]["attempt_id"].clone())),
+        Some((1, json!(candidate), json!(attempt.as_str()))), "{shown}");
+
+    // The owner's files are untouched.
+    for (path, text) in &secrets { assert_eq!(&fs::read_to_string(path).unwrap(), text); }
+    let running = lab.attempt(&attempt);
+    lab.ok_live(&|| ["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &running.revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "probe done"].map(String::from).to_vec());
+    lab.wait(&mut ticker, 60, &|| lab.attempt(&attempt).termination_observed);
+    lab.stop(ticker);
+}
+
+/// Isolation fails closed: an owner-declared hidden path that would cover the
+/// profile's own execution home is refused before any worker is created.
+#[test]
+fn a_hidden_path_covering_the_execution_home_refuses_the_launch_before_creation() {
+    let mut lab = Lab::new("unknown_usage='allow_with_warning'\n[worker_isolation]\nhide=['~/agent-home']");
+    let (_, attempt) = lab.reserve("Retained instructions");
+    lab.serve();
+    let log = || fs::read_to_string(lab.path("root/.ticker.log")).unwrap_or_default();
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 90, &|| log().contains("worker isolation would hide"));
+    lab.stop(ticker);
+    assert_eq!(lab.count("workspace.create_command"), 0, "{:?}", lab.requests());
+    assert!(lab.events("runtime.launch_target").is_empty() && lab.events("runtime.launch_started").is_empty());
+    assert!(lab.attempt(&attempt).retains_capacity());
+}
