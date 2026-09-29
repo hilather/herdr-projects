@@ -506,7 +506,7 @@ record's `session_id` = the edge session's id (`thread_id` its own,
 | Upgrade of an A4 sidecar: `predates_collection` read-only, then a re-read that equals a fresh collect, no digest conflict, nothing counted twice | `rollouts_read_before_a5_gain_their_thread_lineage_on_the_next_collect` |
 | Sentinels, capabilities matching emitted fields (each new one valued) | `planted_sentinels_never_leak`, `capabilities_match_emitted_fields` |
 
-### Proposed contracts.md §5 addition (steward applies)
+### Contracts.md §5 addition (applied by the steward)
 
 - §5 *Allowlisted fields*, after the A4 `source.subagent` text: "and the
   thread lineage `parent_thread_id`, `session_id` and `thread_source` of

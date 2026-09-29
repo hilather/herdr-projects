@@ -161,7 +161,7 @@ merges one PR at a time.
   the 300 s telemetry pass; remote routes; declared intervals.
 
 ### From the live A4 certification run (codex-live-0.154.0-a4.md)
-- **A5** (lane A): collect the guardian's `session_meta.parent_thread_id`,
+- **Done (A5; B2 guardian linking still open):** **A5** (lane A): collect the guardian's `session_meta.parent_thread_id`,
   `session_meta.session_id` and `thread_source` (a guardian's usage records
   carry the parent's `session_id`). Then B2 can link guardians to their
   parent.
@@ -181,3 +181,9 @@ merges one PR at a time.
   exit_code). The exec item's `duration` is not the command's run time. The
   proposed allowlist is in the live doc; `response_item` is content-forbidden
   under §7 today. MCP shapes are still unobserved.
+- **B9 guardian linking** (lane B): read `rollout_threads` (LEFT JOIN,
+  tolerate a pre-A5 sidecar), use `parent_thread_id` as parent evidence with a
+  new link basis, treat `thread_source = guardian_review` as the guardian role
+  (live `subagent_kind` is `other`), keep guardian inclusion `separate`, never
+  key nodes by either `session_id`, and update the accounting guardian fixture
+  to the live shape.

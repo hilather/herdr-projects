@@ -292,7 +292,11 @@ line is left for the next pass and the file offset is not advanced past it.
 **Allowlisted fields.** `session_meta`: `id`, `timestamp`, `cwd`,
 `cli_version`, `originator`, `source`, `model_provider`, `forked_from_id`,
 and from `source.subagent` its variant and, for `thread_spawn`,
-`parent_thread_id` and `depth` (A4). `turn_context`: `turn_id`, `model`,
+`parent_thread_id` and `depth` (A4); and the thread lineage
+`parent_thread_id`, `session_id` and `thread_source` of `session_meta`
+(A5, sidecar stream `ingest` 0005 `rollout_threads`). Usage is keyed by the
+rollout's own `session_meta.id`, never by a record's `session_id`, which a
+guardian reports as its parent's. `turn_context`: `turn_id`, `model`,
 `effort`. `token_usage_record`: `session_id`, `turn_id`, `response_id`,
 `usage.{input_tokens, cached_input_tokens, cache_write_input_tokens,
 output_tokens, reasoning_output_tokens, total_tokens}`, final
