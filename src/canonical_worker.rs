@@ -350,8 +350,10 @@ pub fn deliver_brief(
     let deadline = deadline.min(Instant::now() + Duration::from_secs(45));
     check(deadline, &cancellation)?;
     let project = project.canonicalize()?;
-    let guard = crate::execution_guard::RootGuard::exclusive(
+    let guard = crate::execution_guard::RootGuard::exclusive_by(
         project.parent().context("project root missing")?,
+        deadline,
+        &cancellation,
     )?;
     let control = crate::store::controlled::ReadControl::new(deadline, cancellation.clone());
     let mut db = crate::migration::open_active_scoped(&project, control)?;
@@ -448,8 +450,10 @@ pub fn reconcile_termination(
     let stop_deadline=deadline.min(Instant::now()+Duration::from_secs(10));
     check(deadline, &cancellation)?;
     let project = project.canonicalize()?;
-    let _guard = crate::execution_guard::RootGuard::exclusive(
+    let _guard = crate::execution_guard::RootGuard::exclusive_by(
         project.parent().context("project root missing")?,
+        deadline,
+        &cancellation,
     )?;
     let control=crate::store::controlled::ReadControl::new(deadline,cancellation.clone());
     let mut db=crate::migration::open_active_scoped(&project,control)?;

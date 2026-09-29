@@ -93,27 +93,25 @@ fn finish_poll(ctx:&Ctx,path:&Path,turn:u64,reachable:bool,observation_error:Opt
     let scheduled=match background_plan {Some(active)=>Ok(herdr_projects::routines::ScheduleTurn{active,diagnostic:None}),None=>herdr_projects::routines::schedule_turn(path,turn)};
     let queued=effects.is_some();
     let mut errors=observation_error.into_iter().collect::<Vec<_>>();
-    let stop_work=match herdr_projects::store::service_project_barrier_stops(path) {
-        Ok(report)=>report.pending,
-        Err(error)=>{errors.push(format!("barrier stop service: {error:#}"));true},
+    // Each service below takes project ownership, which shares the root
+    // barrier. While a root-exclusive effect (launch, brief, termination) is
+    // admitted it owns the root until the next pass drains it: it takes the
+    // exclusive root at start and again between its stages, and a service
+    // sharing the root at that moment makes it fail and back off. Under load
+    // the next pass starts as soon as the effect is admitted, so every retry
+    // lost that race. Defer the services to the pass after the drain; they
+    // report pending work so the ticker stays awake.
+    let root_owned=effects.as_ref().is_some_and(|queue|queue.pending_exclusive_root());
+    let mut service=|name:&str,run:&dyn Fn(&Path)->anyhow::Result<bool>|->bool {
+        if root_owned {return true;}
+        match run(path) {Ok(pending)=>pending,Err(error)=>{errors.push(format!("{name}: {error:#}"));true}}
     };
+    let stop_work=service("barrier stop service",&|path|Ok(herdr_projects::store::service_project_barrier_stops(path)?.pending));
     let (admission_log,result)=process_next_with_launches(ctx,&path,turn,effects,launch_dispatch_enabled());
-    let wait_work=match herdr_projects::store::service_project_waits(path) {
-        Ok(report)=>report.pending,
-        Err(error)=>{errors.push(format!("wait service: {error:#}"));true},
-    };
-    let replan_work=match herdr_projects::store::service_project_replans(path) {
-        Ok(report)=>report.pending,
-        Err(error)=>{errors.push(format!("replan request service: {error:#}"));true},
-    };
-    let verification_work=match herdr_projects::store::service_project_verification_jobs(path) {
-        Ok(report)=>report.pending,
-        Err(error)=>{errors.push(format!("verification job service: {error:#}"));true},
-    };
-    let integration_work=match herdr_projects::store::service_project_integration_jobs(path) {
-        Ok(report)=>report.pending,
-        Err(error)=>{errors.push(format!("integration job service: {error:#}"));true},
-    };
+    let wait_work=service("wait service",&|path|Ok(herdr_projects::store::service_project_waits(path)?.pending));
+    let replan_work=service("replan request service",&|path|Ok(herdr_projects::store::service_project_replans(path)?.pending));
+    let verification_work=service("verification job service",&|path|Ok(herdr_projects::store::service_project_verification_jobs(path)?.pending));
+    let integration_work=service("integration job service",&|path|Ok(herdr_projects::store::service_project_integration_jobs(path)?.pending));
     let routine_work=match scheduled {Ok(report)=>{if let Some(error)=report.diagnostic {errors.push(format!("routine scheduling: {error}"));}report.active},Err(error)=>{errors.push(format!("routine scheduling: {error:#}"));false}};
     // An admission failure is diagnostic only. Already-prepared dispatch still runs.
     let (progress,unknown_effects)=match result {

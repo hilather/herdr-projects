@@ -223,11 +223,16 @@ merges one PR at a time.
   replay-suite tasks (TM4.6) and a reviewer brief builder.
 
 ### From the test CPU review (docs/reviews/2026-09-29-test-cpu.md)
-- **Lock-retry scheduling under load** (steward/scheduler): with a heavily
-  loaded machine the ticker's try-lock-and-retry services (`.state/effect.lock`,
-  `root/.execution.lock`, root maintenance) can make no progress, which fails
-  `a_proven_worker_end_keeps_the_project_admitted_but_an_unexplained_pane_loss_pauses_it`.
-  Needs fair or backoff scheduling, not larger test timeouts.
+- **Lock-retry scheduling under load** (done, `fix/lock-retry-progress`):
+  under load the next ticker pass began as soon as a launch was admitted.
+  That pass's controller services held the root shared, so the launch's
+  exclusive try-lock lost, both at start and between its stages, cycle after
+  cycle. Now the ticker defers those services, and memory-review delivery,
+  while a root-exclusive effect is admitted. Staged effects wait up to 2 s
+  (bounded by deadline and cancellation) for shared holders. The
+  retirement-step failure was the test stopping the ticker before the
+  admitted observation committed; the test now waits for the commit. Details
+  and pass counts are in the CPU review §3.
 - **Per-connection schema load** (steward): each fresh connection spends about
   6 ms loading the schema (about 900 objects, 434 triggers). Measured at 129
   projects, a ticker pass opened 1,273 connections: per project 4 read-only

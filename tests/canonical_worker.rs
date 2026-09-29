@@ -285,6 +285,24 @@ sys.stdout.buffer.write(json.dumps({'result':json.loads(reply)['result']}).encod
         }
         self.stop(ticker);
     }
+    /// Run a fresh ticker until `done` holds, failing if `passes` passes
+    /// complete first, then stop it. A pass publishes before the
+    /// background work it admitted (an observation) finishes, and stopping
+    /// the ticker cancels that work, so wait for its outcome, not a pass.
+    fn run_until(&self, passes: usize, done: &dyn Fn() -> bool) {
+        let metrics = self.path("root/.ticker-metrics.json");
+        let inode = || fs::metadata(&metrics).map(|m| m.ino()).ok();
+        let (mut last, mut seen) = (inode(), 0);
+        let mut ticker = self.spawn();
+        while !done() {
+            self.wait(&mut ticker, 60, &|| done() || inode() != last);
+            if inode() != last && !done() {
+                (last, seen) = (inode(), seen + 1);
+                assert!(seen < passes, "not done within {passes} passes: {}", fs::read_to_string(self.path("root/.ticker.log")).unwrap_or_default());
+            }
+        }
+        self.stop(ticker);
+    }
     /// Run a fresh ticker until the server has seen `passes` more `method`
     /// requests, then stop it.
     fn run_for(&self, method: &str, passes: usize) {
@@ -631,10 +649,13 @@ fn a_proven_worker_end_keeps_the_project_admitted_but_an_unexplained_pane_loss_p
     lab.wait(&mut ticker, 60, &|| lab.attempt(&attempt).termination_observed);
     lab.stop(ticker);
     // Herdr closes the ended worker's pane; a pass observes its absence and
-    // later passes no longer track the retired binding.
+    // later passes no longer track the retired binding. The observation a
+    // pass admits commits after the pass, so wait for each commit. A pass
+    // whose 100 ms observation-head read overruns (under load) offers none.
     fs::write(lab.path("lab/vanish"), b"").unwrap();
-    lab.run_for("pane.list", 1);
-    lab.run_passes(1);
+    lab.run_until(4, &|| !lab.events("runtime.relinquished").is_empty());
+    let observed = lab.events("runtime.observed").len();
+    lab.run_until(4, &|| lab.events("runtime.observed").len() > observed);
     let state = lab.state();
     let control = state.control.clone().unwrap();
     assert_eq!((control.state, control.reconciliation_required), (ProjectState::Active, false), "{:?}", lab.events("project.reconciliation_invalidated"));
@@ -663,4 +684,41 @@ fn a_proven_worker_end_keeps_the_project_admitted_but_an_unexplained_pane_loss_p
     assert!(lab.events("runtime.relinquished").is_empty());
     let live = lab.attempt(&attempt);
     assert!(live.retains_capacity() && !live.termination_observed);
+}
+
+/// Another holder of the shared root barrier (a store service, a CLI command)
+/// comes and goes while a worker launches. Launch and brief take the exclusive
+/// root afresh at each durable stage; each waits out the holder instead of
+/// failing the job and backing off, and while such an effect is admitted the
+/// ticker's own store services stay off the root. The worker still reaches
+/// Running, and no job or service lost the root to the contention.
+#[test]
+fn a_launch_reaches_running_while_another_holder_takes_the_shared_root_intermittently() {
+    use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
+    let mut lab = Lab::new("unknown_usage='allow_with_warning'");
+    let (_, attempt) = lab.reserve("Retained instructions");
+    lab.serve();
+    // Hold the root shared for 300 ms of every 400 ms, as a busy neighbour would.
+    let (stop, held) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)));
+    let holder = {
+        let (lock, stop, held) = (lab.path("root/.execution.lock"), stop.clone(), held.clone());
+        std::thread::spawn(move || while !stop.load(Ordering::SeqCst) {
+            let file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&lock).unwrap();
+            if file.try_lock_shared().is_ok() {
+                held.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(300));
+                file.unlock().unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        })
+    };
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 120, &|| lab.attempt(&attempt).state == AttemptState::Running);
+    lab.stop(ticker);
+    stop.store(true, Ordering::SeqCst);
+    holder.join().unwrap();
+    assert!(held.load(Ordering::SeqCst) >= 5, "the holder took the root {} times", held.load(Ordering::SeqCst));
+    let log = fs::read_to_string(lab.path("root/.ticker.log")).unwrap();
+    assert!(!log.contains(".execution.lock; retry"), "an effect lost the root: {log}");
+    assert!(!log.contains("root maintenance or exclusive external operation is active"), "a service contended with an admitted effect: {log}");
 }

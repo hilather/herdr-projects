@@ -580,13 +580,17 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
             if let Err(error) = crate::memory_review::ingest_all(&ctx.root.join(slug)) {
                 log.line(&format!("{slug}: memory-review ingest: {error:#}"));
             }
-            match crate::memory_review::deliver_migrated(&ctx.root.join(slug), slug) {
-                Ok(delivered) => {
-                    for (item, _) in delivered {
-                        log.line(&format!("{slug}: memory-review reminder delivered: {item}"));
+            // Delivery takes project ownership (the shared root); like the
+            // controller services it waits while a root-exclusive effect runs.
+            if !memory.copy_jobs.as_ref().is_some_and(|q|q.pending_exclusive_root()) {
+                match crate::memory_review::deliver_migrated(&ctx.root.join(slug), slug) {
+                    Ok(delivered) => {
+                        for (item, _) in delivered {
+                            log.line(&format!("{slug}: memory-review reminder delivered: {item}"));
+                        }
                     }
+                    Err(error) => log.line(&format!("{slug}: memory-review remind: {error:#}")),
                 }
-                Err(error) => log.line(&format!("{slug}: memory-review remind: {error:#}")),
             }
             integrity_pass(ctx,log,slug);
             telemetry_pass(ctx,log,slug);

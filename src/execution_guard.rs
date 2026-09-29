@@ -76,11 +76,22 @@ fn lock_file(path:&Path)->Result<File> {
     Ok(file)
 }
 fn held(file:File)->LockFile {LockFile{file:ManuallyDrop::new(file),transferred:AtomicBool::new(false)}}
-pub(crate) fn exclusive_file(path:&Path)->Result<LockFile> {
+pub(crate) fn exclusive_file(path:&Path)->Result<LockFile> {exclusive_file_until(path,std::time::Instant::now(),&|| false)}
+/// As [`exclusive_file`], retrying a lock held by others until `until`
+/// unless `cancelled`. Only contention is retried; any other failure returns at once.
+fn exclusive_file_until(path:&Path,until:std::time::Instant,cancelled:&dyn Fn()->bool)->Result<LockFile> {
     let file=lock_file(path)?;
-    file.try_lock().with_context(|| format!("another operation owns lock {}; retry", path.display()))?;
-    Ok(held(file))
+    loop {
+        match file.try_lock() {
+            Ok(())=>return Ok(held(file)),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now()<until&&!cancelled()=>std::thread::sleep(EXCLUSIVE_POLL),
+            Err(error)=>return Err(error).with_context(|| format!("another operation owns lock {}; retry", path.display())),
+        }
+    }
 }
+/// How long a root-exclusive effect waits for shared holders to finish.
+const EXCLUSIVE_WAIT:std::time::Duration=std::time::Duration::from_secs(2);
+const EXCLUSIVE_POLL:std::time::Duration=std::time::Duration::from_millis(10);
 fn shared_file(path:&Path,busy:&'static str)->Result<LockFile> {
     let file=lock_file(path)?;
     file.try_lock_shared().context(busy)?;
@@ -96,6 +107,18 @@ impl RootGuard {
     }
     pub fn exclusive(root:&Path)->Result<Self> {
         let file=exclusive_file(&root.join(".execution.lock"))?;
+        Ok(Self{_file:file})
+    }
+    /// Exclusive root ownership for a staged effect (launch, brief,
+    /// termination). The effect takes the root afresh at each durable stage;
+    /// a short shared holder (project ownership for a store service, a CLI
+    /// command) that lands between stages would otherwise fail the whole job
+    /// and cost it a retry cycle out of its lease. Wait up to two seconds,
+    /// never past `deadline` or cancellation, for shared holders to finish.
+    /// The lock is the same exclusive lock; only the wait for it is added.
+    pub fn exclusive_by(root:&Path,deadline:std::time::Instant,cancellation:&crate::runner::Cancellation)->Result<Self> {
+        let until=deadline.min(std::time::Instant::now()+EXCLUSIVE_WAIT);
+        let file=exclusive_file_until(&root.join(".execution.lock"),until,&|| cancellation.is_cancelled())?;
         Ok(Self{_file:file})
     }
     fn shared(root:&Path)->Result<Self> {

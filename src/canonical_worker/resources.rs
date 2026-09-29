@@ -163,7 +163,7 @@ pub fn create_resource(
     let deadline = deadline.min(Instant::now() + Duration::from_secs(45));
     check(deadline, &cancellation)?;
     let canonical = project.canonicalize()?;
-    let guard = crate::execution_guard::RootGuard::exclusive(canonical.parent().context("project root missing")?)?;
+    let guard = crate::execution_guard::RootGuard::exclusive_by(canonical.parent().context("project root missing")?, deadline, &cancellation)?;
     let control = crate::store::controlled::ReadControl::new(deadline, cancellation.clone());
     let mut db = crate::migration::open_active_scoped(project, control)?;
     let (record, initial) = db.launch_preparation_input(operation, expected_revision)?;
@@ -230,7 +230,7 @@ fn create_resource_inner(
     let (mut db, guard) = match selected_store {
         Some(selected) => selected,
         None => {
-            let guard = crate::execution_guard::RootGuard::exclusive(project.parent().context("project root missing")?)?;
+            let guard = crate::execution_guard::RootGuard::exclusive_by(project.parent().context("project root missing")?, deadline, &cancellation)?;
             let control = crate::store::controlled::ReadControl::new(deadline, cancellation.clone());
             (crate::migration::open_active_scoped(&project, control)?, guard)
         }
@@ -652,8 +652,10 @@ pub fn reconcile_resource(
     let deadline = deadline.min(Instant::now() + Duration::from_secs(45));
     check(deadline, &cancellation)?;
     let project = project.canonicalize()?;
-    let guard = crate::execution_guard::RootGuard::exclusive(
+    let guard = crate::execution_guard::RootGuard::exclusive_by(
         project.parent().context("project root missing")?,
+        deadline,
+        &cancellation,
     )?;
     let control = crate::store::controlled::ReadControl::new(deadline, cancellation.clone());
     let mut db = crate::migration::open_active_scoped(&project, control)?;
@@ -991,8 +993,10 @@ pub fn release_gate(
     let mut deadline = deadline.min(Instant::now() + Duration::from_secs(45));
     check(deadline, &cancellation)?;
     let project = project.canonicalize()?;
-    let guard = crate::execution_guard::RootGuard::exclusive(
+    let guard = crate::execution_guard::RootGuard::exclusive_by(
         project.parent().context("project root missing")?,
+        deadline,
+        &cancellation,
     )?;
     let control = crate::store::controlled::ReadControl::new(deadline, cancellation.clone());
     let mut db = crate::migration::open_active_scoped(&project, control)?;

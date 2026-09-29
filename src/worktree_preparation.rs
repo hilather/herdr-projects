@@ -374,8 +374,10 @@ pub fn prepare(
 ) -> Result<Vec<WorktreeReceipt>> {
     let deadline = deadline.min(Instant::now() + Duration::from_secs(45));
     let project = project.canonicalize()?;
-    let guard = crate::execution_guard::RootGuard::exclusive(
+    let guard = crate::execution_guard::RootGuard::exclusive_by(
         project.parent().context("project root missing")?,
+        deadline,
+        &cancellation,
     )?;
     let mut git = Git {
         deadline,
