@@ -483,7 +483,7 @@ fn sidecar_streams_upgrade_v2_store() {
 
     f.cli("collect");
     f.cli("collect");
-    assert_eq!(streams(&f), [("codex".to_owned(), 2)]);
+    assert_eq!(streams(&f), [("accounting".to_owned(), 1), ("codex".to_owned(), 2)]);
     assert_eq!(user_version(&f), 2);
     let before = tree(&state);
     assert_eq!(f.cli("usage").1, v2, "usage is byte-identical after the upgrade");
@@ -491,7 +491,7 @@ fn sidecar_streams_upgrade_v2_store() {
     assert_eq!(f.cli_args(&["accounting", "status"]).0["stream"], "accounting");
     assert_eq!(tree(&state), before, "reads of an upgraded sidecar create no file");
 
-    f.sidecar().execute("INSERT INTO telemetry_streams(stream,version) VALUES('accounting',99)", []).unwrap();
+    f.sidecar().execute("INSERT OR REPLACE INTO telemetry_streams(stream,version) VALUES('accounting',99)", []).unwrap();
     for args in [&["usage"][..], &["report", "--json"], &["collect"]] {
         let error = f.cli_fail(args);
         assert!(error.contains("telemetry sidecar stream accounting version 99 is newer than this binary"), "{args:?}: {error}");
