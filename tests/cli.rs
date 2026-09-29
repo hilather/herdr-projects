@@ -3186,6 +3186,10 @@ fn outcome_success_path() {
     assert_eq!(marks.iter().map(|(state,revision,_,source)|(state.as_str(),*revision,source.as_str())).collect::<Vec<_>>(),
         [("reserved",1,"admit_prepared"),("launching",2,"apply_launch_started"),("running",3,"apply_worker_brief"),("completed",5,"record_worker_termination_with_budget")]);
     assert!(marks.windows(2).all(|pair|pair[0].2<=pair[1].2),"{marks:?}");
+    // TM1.1: the launch transaction writes the attempt's collector binding, at the launching mark's time.
+    let binding=f.db().query_row("SELECT revision,state,collector,unix_ms,source FROM collector_bindings WHERE attempt_id=?1",[&attempt],
+        |r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?))).unwrap();
+    assert_eq!(binding,(1,"active".to_owned(),"claude".to_owned(),marks[1].2,"apply_launch_started".to_owned()));
     let (configuration,classification,submitted_ms):(String,String,i64)=f.db().query_row("SELECT d.chosen_configuration_id,d.classification_id,s.created_unix_ms
         FROM dispatch_decisions d JOIN result_submissions s ON s.attempt_id=d.attempt_id WHERE d.attempt_id=?1",[&attempt],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
     let report=cli(&["telemetry","demo","attempts","--json"]);

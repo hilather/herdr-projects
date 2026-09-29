@@ -1079,6 +1079,7 @@ impl SqliteStore {
             params![attempt.id.as_str(), integer(attempt.revision)?],
         )?;
         super::dispatch_log::mark(&tx, &attempt, now, "apply_launch_started")?;
+        super::collector_binding::bind(&tx, &attempt.id, profile, now)?;
         tx.execute(
             "DELETE FROM runtime_observations WHERE binding_id=?1",
             [&binding.id],

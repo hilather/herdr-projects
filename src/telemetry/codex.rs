@@ -49,6 +49,19 @@ pub struct CanonicalAttempt {
     kind: Option<String>,
     home: Option<String>,
     decided_unix_ms: Option<i64>,
+    binding: Binding,
+}
+
+/// The attempt's latest canonical collector binding revision (migration 0052).
+enum Binding {
+    /// Launched after 0052 without a binding, or never launched.
+    None,
+    /// Existed before 0052 (or the store predates it): contracts §5 rules 1-4.
+    Predates,
+    /// `execution_home` recorded at launch.
+    Active(Option<String>),
+    /// `execution_home` and the revocation time.
+    Revoked(Option<String>, i64),
 }
 
 impl CanonicalAttempt {
@@ -78,7 +91,18 @@ fn canonical(project: &Path) -> Result<(Vec<CanonicalAttempt>, Vec<String>)> {
             let (id, payload, decided_unix_ms) = row?;
             let inputs: Value = serde_json::from_str(&payload)?;
             let (kind, home) = profile(&inputs["inputs"]["effective_profile"]);
-            attempts.push(CanonicalAttempt { id, kind, home, decided_unix_ms });
+            attempts.push(CanonicalAttempt { id, kind, home, decided_unix_ms, binding: Binding::Predates });
+        }
+    }
+    if table("collector_bindings")? {
+        let mut stmt = db.prepare("SELECT b.attempt_id,b.state,b.execution_home,b.unix_ms FROM collector_bindings b
+            WHERE b.revision=(SELECT max(revision) FROM collector_bindings c WHERE c.attempt_id=b.attempt_id)")?;
+        let mut latest: std::collections::BTreeMap<String, Binding> = stmt.query_map([], |r| {
+            let (state, home, at): (String, Option<String>, i64) = (r.get(1)?, r.get(2)?, r.get(3)?);
+            Ok((r.get(0)?, match state.as_str() { "active" => Binding::Active(home), "revoked" => Binding::Revoked(home, at), _ => Binding::Predates }))
+        })?.collect::<rusqlite::Result<_>>()?;
+        for attempt in &mut attempts {
+            attempt.binding = latest.remove(&attempt.id).unwrap_or(Binding::None);
         }
     }
     let mut homes: Vec<String> = attempts.iter().filter(|a| a.codex()).filter_map(|a| a.home.clone()).collect();
@@ -468,21 +492,36 @@ fn reconcile(tx: &Transaction, session: &str, now: i64) -> Result<()> {
     Ok(())
 }
 
-/// Contracts §5 binding rule, recomputed on every collect.
+/// Contracts §5 binding rule through the canonical collector binding
+/// (contracts-collection.md), recomputed on every collect. Rules 2 and 3 select
+/// candidates; rule 1 uses the binding's `execution_home`. A revoked binding
+/// keeps rollouts that started before the revocation (their accepted usage is
+/// never erased) and binds none that start at or after it. Attempts that
+/// predate 0052 fall back to rules 1-4 on their retained inputs.
 fn bind(db: &Connection, attempts: &[CanonicalAttempt]) -> Result<()> {
     let sources: Vec<(String, String, Option<i64>, Option<String>)> = db.prepare("SELECT path_digest,home_digest,session_unix_ms,cwd_attempt FROM rollout_sources")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
     for (key, home, at, cwd_attempt) in sources {
-        let matches: Vec<&CanonicalAttempt> = attempts.iter().filter(|a| a.codex()
-            && a.home.as_ref().is_some_and(|h| digest(h.as_bytes()) == home)
-            && cwd_attempt.as_deref() == Some(a.id.as_str())
-            && matches!((at, a.decided_unix_ms), (Some(at), Some(decided)) if at >= decided)).collect();
-        let (binding, attempt) = match matches.as_slice() {
-            [] => ("unbound", None),
-            [one] => ("bound", Some(one.id.as_str())),
-            _ => ("ambiguous", None),
+        let rule1 = |h: &Option<String>| h.as_ref().is_some_and(|h| digest(h.as_bytes()) == home);
+        let (mut matches, mut refused) = (Vec::new(), None);
+        for a in attempts.iter().filter(|a| a.codex() && cwd_attempt.as_deref() == Some(a.id.as_str())) {
+            let Some(at) = at.filter(|at| a.decided_unix_ms.is_some_and(|decided| *at >= decided)) else { continue };
+            match &a.binding {
+                Binding::Predates if rule1(&a.home) => matches.push((a, "predates_binding")),
+                Binding::Active(h) if rule1(h) => matches.push((a, "collector_binding")),
+                Binding::Revoked(h, revoked) if rule1(h) && at < *revoked => matches.push((a, "collector_binding")),
+                Binding::Revoked(h, _) if rule1(h) => refused = refused.or(Some("binding_revoked")),
+                Binding::None => refused = refused.or(Some("no_binding")),
+                _ => {}
+            }
+        }
+        let (binding, attempt, basis) = match matches.as_slice() {
+            [] => ("unbound", None, refused.unwrap_or("no_match")),
+            [(one, basis)] => ("bound", Some(one.id.as_str()), *basis),
+            _ => ("ambiguous", None, "ambiguous"),
         };
         db.execute("UPDATE rollout_sources SET binding=?2,attempt_id=?3 WHERE path_digest=?1", params![key, binding, attempt])?;
+        db.execute("INSERT INTO source_bindings(path_digest,basis) VALUES(?1,?2) ON CONFLICT(path_digest) DO UPDATE SET basis=excluded.basis", params![key, basis])?;
     }
     Ok(())
 }

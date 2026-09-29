@@ -5,6 +5,8 @@
 #![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
 
 mod support;
+#[path = "../src/store/test_schema.rs"]
+mod test_schema;
 
 use herdr_projects::store::SqliteStore;
 use std::{fs, path::{Path, PathBuf}, process::Command};
@@ -498,5 +500,79 @@ fn sidecar_streams_upgrade_v2_store() {
         let error = f.cli_fail(args);
         assert!(error.contains("telemetry sidecar stream accounting version 99 is newer than this binary"), "{args:?}: {error}");
     }
-    assert_eq!(streams(&f), [("accounting".to_owned(), 99), ("codex".to_owned(), 2)]);
+    assert_eq!(streams(&f), [("accounting".to_owned(), 99), ("codex".to_owned(), 2), ("ingest".to_owned(), 1)]);
+}
+
+/// Rollout `name` of session `sid` holding `head.jsonl` (one record: 1000 in, 120 out).
+fn session(f: &Fixture, name: &str, sid: &str, cwd: &str, ts_ms: i64) {
+    let path = f.rollout(&f.home, name, &["head.jsonl"], cwd, ts_ms, "0.154.0");
+    fs::write(&path, fs::read_to_string(&path).unwrap().replace(SID, sid)).unwrap();
+}
+
+/// `(session_id, binding, attempt_id, basis)` per rollout source, from `collectors bindings`.
+fn sources(f: &Fixture) -> Vec<(String, String, Option<String>, String)> {
+    let (out, _) = f.cli_args(&["collectors", "bindings"]);
+    out["sources"].as_array().unwrap().iter().map(|s| (s["session_id"].as_str().unwrap().to_owned(), s["binding"].as_str().unwrap().to_owned(),
+        s["attempt_id"].as_str().map(str::to_owned), s["basis"].as_str().unwrap().to_owned())).collect()
+}
+
+/// Card A1 (TM1.1): a rollout binds only through the attempt's canonical
+/// collector binding, written when the attempt is launched (the real launch is
+/// checked in tests/cli.rs; here `Fixture::bind` plants it). A revocation keeps
+/// rollouts bound before it with their accepted usage and binds none started
+/// after it; a rollout from another project's worktree stays unbound; an
+/// attempt from before 0052 falls back to contracts §5 rules 1-4.
+#[test]
+fn rollout_binds_only_through_canonical_binding() {
+    const ELSEWHERE: &str = "00000000-0000-4000-8000-0000000000e1";
+    const LATER: &str = "00000000-0000-4000-8000-0000000000f1";
+    let one = serde_json::json!({"input_tokens": 1000, "cached_input_tokens": 400, "cache_write_input_tokens": 0,
+        "output_tokens": 120, "reasoning_output_tokens": 80, "total_tokens": 1120, "records": 1});
+    let f = Fixture::reserved();
+    let unbound = |sid: &str, basis: &str| (sid.to_owned(), "unbound".to_owned(), None, basis.to_owned());
+    let bound = |sid: &str, basis: &str| (sid.to_owned(), "bound".to_owned(), Some(f.attempt.clone()), basis.to_owned());
+    // Started 1 ms after the decision, before the revocation below.
+    f.rollout(&f.home, SID, &["head.jsonl"], &f.worktree(), f.decided + 1, "0.154.0");
+    // The same attempt id under another project's worktrees.
+    session(&f, "elsewhere", ELSEWHERE, &format!("{}/other/.state/worktrees/{}/repo-00", f.root.display(), f.attempt), f.decided + 1_000);
+    let (report, _) = f.cli("collect");
+    assert_eq!(attempt_usage(&report), unavailable("not_bound"), "reserved, never launched");
+    assert_eq!(sources(&f), [unbound(ELSEWHERE, "no_match"), unbound(SID, "no_binding")]);
+    assert_eq!(f.cli_args(&["collectors", "bindings"]).0["bindings"], serde_json::json!([]));
+
+    f.bind();
+    let bindings = f.cli_args(&["collectors", "bindings"]).0["bindings"].clone();
+    let launched = bindings[0]["unix_ms"].as_i64().unwrap();
+    assert!(launched >= f.decided);
+    assert_eq!(bindings, serde_json::json!([{"attempt_id": f.attempt, "revision": 1, "state": "active", "collector": "codex", "unix_ms": launched}]));
+    let (report, _) = f.cli("collect");
+    assert_eq!(attempt_usage(&report), one);
+    assert_eq!(sources(&f), [unbound(ELSEWHERE, "no_match"), bound(SID, "collector_binding")]);
+
+    let (revoked, _) = f.cli_args(&["collectors", "revoke", &f.attempt]);
+    let at = revoked["binding"]["unix_ms"].as_i64().unwrap();
+    assert!(at >= launched);
+    let expected = serde_json::json!({"attempt_id": f.attempt, "revision": 2, "state": "revoked", "collector": "codex", "unix_ms": at});
+    assert_eq!(revoked, serde_json::json!({"binding": expected, "written": true}));
+    assert_eq!(f.cli_args(&["collectors", "revoke", &f.attempt]).0, serde_json::json!({"binding": expected, "written": false}), "replay appends nothing");
+    assert_eq!(f.cli_args(&["collectors", "bindings"]).0["bindings"].as_array().unwrap().len(), 2);
+    session(&f, "later", LATER, &f.worktree(), at + 1_000);
+    let (report, _) = f.cli("collect");
+    assert_eq!(attempt_usage(&report), one, "accepted usage bound before the revocation is kept");
+    assert_eq!(sources(&f), [unbound(ELSEWHERE, "no_match"), unbound(LATER, "binding_revoked"), bound(SID, "collector_binding")]);
+    assert_eq!(f.usage().iter().filter(|r| r.2 == 1).count(), 3, "every record is accepted; binding only attributes");
+    assert!(f.cli_fail(&["collectors", "revoke", "no-such-attempt"]).contains("has no collector binding"));
+
+    // An attempt reserved before 0052 keeps rules 1-4 and cannot be revoked.
+    let g = Fixture::reserved();
+    let db_path = g.project.join(".state/state.db");
+    test_schema::historical(&rusqlite::Connection::open(&db_path).unwrap(), 51).unwrap();
+    SqliteStore::open(&db_path).unwrap().upgrade_v1().unwrap();
+    g.rollout(&g.home, SID, &["head.jsonl"], &g.worktree(), g.decided + 1_000, "0.154.0");
+    let (report, _) = g.cli("collect");
+    assert_eq!(attempt_usage(&report), one);
+    assert_eq!(sources(&g), [(SID.to_owned(), "bound".to_owned(), Some(g.attempt.clone()), "predates_binding".to_owned())]);
+    let bindings = g.cli_args(&["collectors", "bindings"]).0["bindings"].clone();
+    assert_eq!((&bindings[0]["revision"], &bindings[0]["state"], &bindings[0]["collector"]), (&1.into(), &"predates_binding".into(), &serde_json::Value::Null));
+    assert!(g.cli_fail(&["collectors", "revoke", &g.attempt]).contains("predates collector bindings"));
 }

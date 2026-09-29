@@ -20,8 +20,25 @@ pub struct Fixture { pub tmp: tempfile::TempDir, pub root: PathBuf, pub project:
 impl Fixture {
     /// Project `demo` with one attempt reserved by automatic admission on a Codex
     /// profile whose execution home is `codex-home`, and a second retained Codex
-    /// profile (`other-home`) that no attempt uses.
+    /// profile (`other-home`) that no attempt uses. The attempt has the active
+    /// collector binding its launch would write (`bind`), yet stays reserved so
+    /// it can be cancelled and readmitted.
     pub fn new() -> Self {
+        let f = Self::reserved();
+        f.bind();
+        f
+    }
+
+    /// The collector binding revision `apply_launch_started` writes for this
+    /// attempt (tests/cli.rs checks it on a real launch). Fixture only: no
+    /// launch happens here.
+    pub fn bind(&self) {
+        rusqlite::Connection::open(self.project.join(".state/state.db")).unwrap().execute("INSERT INTO collector_bindings(attempt_id,revision,state,collector,execution_home,unix_ms,source)
+            VALUES(?1,1,'active','codex',?2,?3,'apply_launch_started')", rusqlite::params![self.attempt, self.home.display().to_string(), unix_ms()]).unwrap();
+    }
+
+    /// Like `new`, without a collector binding: the attempt is only reserved.
+    pub fn reserved() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(tmp.path()).unwrap();
         let (root, home) = (base.join("root"), base.join("codex-home"));

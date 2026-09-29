@@ -1440,7 +1440,7 @@ fn pre_0051_attempt_reports_predates_lifecycle_log() {
     admit_ready(&project);
     assert_eq!(sql_count(&db_path, "SELECT count(*) FROM dispatch_decisions"), 1);
     SqliteStore::open(&db_path).unwrap().upgrade_v1().unwrap();
-    assert_eq!(sql_count(&db_path, "PRAGMA user_version"), 51);
+    assert_eq!(sql_count(&db_path, "PRAGMA user_version"), herdr_projects::store::SCHEMA as i64);
     let attempt = cancel_reserved(&db_path);
     let marks = lifecycle_marks(&db_path);
     assert_eq!(marks.iter().map(|(s, r, _, source)| (s.as_str(), *r, source.as_str())).collect::<Vec<_>>(),
