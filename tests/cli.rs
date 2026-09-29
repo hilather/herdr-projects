@@ -3211,7 +3211,7 @@ fn outcome_success_path() {
         "terminal_state":"completed",
         "terminal_unix_ms":marks[3].2,
         "usage":{"reason":"adapter_absent","status":"unavailable"},
-        "verification":{"state":"accepted"}
+        "verification":{"policies":[{"policy_id":"clean","state":"accepted"}],"state":"accepted"}
     }]}));
 }
 

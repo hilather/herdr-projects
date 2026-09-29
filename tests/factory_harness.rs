@@ -1415,14 +1415,16 @@ fn outcome_rejected_verification_reason_is_excerpted() {
     let report = telemetry_attempts(&project);
     let record = &report["attempts"][0];
     assert_eq!(record["result"], serde_json::json!({"candidate_oid": oid, "created_unix_ms": submitted_ms, "state": "submitted", "submission_id": submitted}));
-    assert_eq!(record["verification"], serde_json::json!({"reason": "policy_digest_mismatch", "state": "rejected"}));
+    assert_eq!(record["verification"], serde_json::json!({"reason": "policy_digest_mismatch", "state": "rejected",
+        "policies": [{"policy_id": "builds", "reason": "policy_digest_mismatch", "state": "rejected"}]}));
     assert_eq!((&record["integration"], &record["accepted"]), (&serde_json::json!({"state": "not_applicable"}), &serde_json::json!(false)));
     // Verifier reasons are fixed codes today; a free-text reason is still shown only as an excerpt.
     conn.execute("INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms)
         SELECT ?1,project_store,'verify-later',payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,'rejected',?2,exit_status,NULL,store_device,store_inode,created_unix_ms+1 FROM verification_runs",
         rusqlite::params!["f".repeat(64), "check failed in /home/alice/src/x.rs?token=abc123def\nsecond line is dropped"]).unwrap();
     let report = telemetry_attempts(&project);
-    assert_eq!(report["attempts"][0]["verification"], serde_json::json!({"reason": "check failed in ~/src/x.rs", "state": "rejected"}));
+    assert_eq!(report["attempts"][0]["verification"], serde_json::json!({"reason": "check failed in ~/src/x.rs", "state": "rejected",
+        "policies": [{"policy_id": "builds", "reason": "check failed in ~/src/x.rs", "state": "rejected"}]}));
 }
 
 #[cfg(target_os = "linux")]

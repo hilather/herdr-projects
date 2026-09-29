@@ -81,13 +81,7 @@ fn record(db: &Connection, version: u32, attempt: &str, task: &str, state: &str,
     let (result, verification, integration) = match &submission {
         None => (json!({"state": "not_submitted"}), json!({"state": "not_submitted"}), json!({"state": if integrates { "not_submitted" } else { "not_applicable" }})),
         Some((id, candidate, created, _)) => {
-            let run: Option<(String, Option<String>)> = db.query_row("SELECT state,reason FROM verification_runs WHERE submission_id=?1 ORDER BY created_unix_ms DESC,rowid DESC LIMIT 1",
-                [id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-            let verification = match run {
-                None => json!({"state": "pending"}),
-                Some((state, None)) => json!({"state": state}),
-                Some((state, Some(reason))) => json!({"reason": crate::domain::excerpt(&reason, home), "state": state}),
-            };
+            let verification = verification(db, id, home)?;
             let integration = if !integrates { "not_applicable".to_owned() } else {
                 db.query_row("SELECT i.state,EXISTS(SELECT 1 FROM integrated_commits c WHERE c.operation_id=i.operation_id) FROM integration_operations i
                     JOIN verified_results r ON r.result_id=i.verified_result_id WHERE r.submission_id=?1 ORDER BY i.created_unix_ms DESC,i.generation DESC LIMIT 1",
@@ -115,6 +109,30 @@ fn record(db: &Connection, version: u32, attempt: &str, task: &str, state: &str,
         "terminal_state": if terminal { state } else { "open" }, "terminal_unix_ms": at(terminal_ms, terminal),
         "usage": usage, "verification": verification,
     }))
+}
+
+/// Contracts §4 `verification` for one submission, combined over its
+/// acceptance policies (and any other policy that has a run): each policy's
+/// latest run decides it, `rejected` if any policy's does, `accepted` only
+/// when every policy's does, else `pending`. `policies` gives each one.
+fn verification(db: &Connection, submission: &str, home: Option<&str>) -> rusqlite::Result<Value> {
+    let runs = db.prepare("SELECT p.policy_id,(SELECT state FROM verification_runs v WHERE v.submission_id=?1 AND v.policy_id=p.policy_id ORDER BY created_unix_ms DESC,rowid DESC LIMIT 1),
+        (SELECT reason FROM verification_runs v WHERE v.submission_id=?1 AND v.policy_id=p.policy_id ORDER BY created_unix_ms DESC,rowid DESC LIMIT 1)
+        FROM (SELECT a.policy_id FROM acceptance_policies a JOIN result_submissions s ON s.task_id=a.task_id AND s.contract_revision=a.contract_revision WHERE s.submission_id=?1
+            UNION SELECT policy_id FROM verification_runs WHERE submission_id=?1) p ORDER BY p.policy_id")?
+        .query_map([submission], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let policies: Vec<Value> = runs.iter().map(|(policy, state, reason)| {
+        let mut entry = json!({"policy_id": policy, "state": state.as_deref().unwrap_or("pending")});
+        if let Some(reason) = reason { entry["reason"] = json!(crate::domain::excerpt(reason, home)); }
+        entry
+    }).collect();
+    let rejected = policies.iter().find(|p| p["state"] == "rejected");
+    let accepted = !policies.is_empty() && policies.iter().all(|p| p["state"] == "accepted");
+    let mut combined = json!({"state": if rejected.is_some() { "rejected" } else if accepted { "accepted" } else { "pending" }});
+    if let Some(reason) = rejected.and_then(|p| p.get("reason")) { combined["reason"] = reason.clone(); }
+    if !policies.is_empty() { combined["policies"] = json!(policies); }
+    Ok(combined)
 }
 
 /// One line per attempt for the terminal.

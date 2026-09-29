@@ -215,7 +215,7 @@ reads `unavailable: predates_lifecycle_log`.
 | `active_ms` | `terminal − running`; open → `censored`; no running mark → `unavailable` |
 | `queue_to_launch_ms` | `launching − reserved` |
 | `result` | earliest `result_submissions` for the attempt: `submission_id`, `candidate_oid`, `created_unix_ms`; none → `not_submitted` |
-| `verification` | latest `verification_runs` for that submission: `accepted`/`rejected` + `reason` excerpt; none → `pending` if submitted |
+| `verification` | per acceptance policy of that submission, its latest `verification_runs` row: `rejected` (+ `reason` excerpt) if any policy's is, `accepted` only if every policy's is, else `pending`; `policies` lists each |
 | `integration` | route `verify_only` → `not_applicable`; else latest `integration_operations` state via `verified_results`; `integrated` needs an `integrated_commits` row |
 | `accepted` | `true` iff the task's acceptance rule (§6 `A`) is met by evidence produced from this attempt |
 | `usage` | §5 sums if a certified bound rollout exists, else `unavailable` with reason `adapter_absent` (non-Codex kind), `not_bound`, `cli_version_uncertified`, `quarantined`, `collection_not_run` |
@@ -240,8 +240,13 @@ S3 refinements:
   reason `open` or the terminal state (e.g. `cancelled`).
 - Shapes: `result` `{state: submitted|not_submitted, submission_id,
   candidate_oid, created_unix_ms}`; `verification` `{state:
-  accepted|rejected|pending|not_submitted, reason?}` (latest run of the
-  earliest submission, reason excerpted with the reader's `HOME`);
+  accepted|rejected|pending|not_submitted, reason?, policies?}` for the
+  earliest submission, combined over its contract's acceptance policies and
+  any other policy with a run: each policy is decided by its latest run
+  (`{policy_id, state, reason?}`, `pending` without a run); the submission is
+  `rejected` if any policy is (reason of the first by `policy_id`),
+  `accepted` only if every policy is, else `pending`; reasons are excerpted
+  with the reader's `HOME`;
   `integration` `{state}` from the same submission: `not_applicable` unless the
   route is `verify_then_integrate`, then `not_submitted`, `pending` (no
   operation), the latest operation state, `integrated` (with an

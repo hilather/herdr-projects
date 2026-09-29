@@ -582,3 +582,43 @@ fn rollout_binds_only_through_canonical_binding() {
     assert_eq!((&bindings[0]["revision"], &bindings[0]["state"], &bindings[0]["collector"]), (&1.into(), &"predates_binding".into(), &serde_json::Value::Null));
     assert!(g.cli_fail(&["collectors", "revoke", &g.attempt]).contains("predates collector bindings"));
 }
+
+/// Demo finding: a submission rejected by one acceptance policy (`content`)
+/// and accepted by another (`clean`) later is rejected, not accepted because
+/// its latest run across all policies was; nothing will integrate it, and the
+/// text form has no dangling separators. Rows are planted as the verifier and
+/// cancellation leave them for a cancelled attempt.
+#[test]
+fn verification_combines_every_acceptance_policy() {
+    let f = Fixture::new();
+    f.cancel_reserved();
+    let db = rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap();
+    db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    let (oid, sub) = ("a".repeat(40), "1".repeat(64));
+    db.execute("INSERT INTO task_contracts(task_id,contract_revision,project_store,expected_head,repository,base_oid,object_format,route,raw_bytes,raw_digest,installed_seq)
+        VALUES('work',1,'store',1,'/repo',?1,'sha1','verify_then_integrate',x'7b7d',?2,1)", rusqlite::params![oid, "c".repeat(64)]).unwrap();
+    for policy in ["clean", "content"] {
+        db.execute("INSERT INTO acceptance_policies(task_id,contract_revision,policy_id,body) VALUES('work',1,?1,'policy')", [policy]).unwrap();
+    }
+    db.execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,artifact_manifest,claimed_checks,created_unix_ms)
+        VALUES(?1,'store','submit',?2,'{}','work',1,?2,?3,'/repo',?4,?4,'sha1','[]','[]',1000)", rusqlite::params![sub, "d".repeat(64), f.attempt, oid]).unwrap();
+    let run = |run: char, policy: &str, state: &str, reason: Option<&str>, created: i64| {
+        let accepted = state == "accepted";
+        db.execute("INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms)
+            VALUES(?1,'store',?1,?2,?3,'work',1,?2,?4,?5,?2,?6,?6,'sha1',0,'linux-unshare-user-pid-mount-v1','[\"check\"]','[]',?7,?8,?9,?10,1,1,?11)",
+            rusqlite::params![run.to_string().repeat(64), "e".repeat(64), sub, f.attempt, policy, oid, state, reason,
+                if accepted { Some(0) } else { Some(1) }, accepted.then(|| "f".repeat(64)), created]).unwrap();
+    };
+    run('2', "clean", "accepted", None, 3000);
+    let record = || f.cli_args(&["attempts", "--json"]).0["attempts"][0].clone();
+    let first = record();
+    assert_eq!(first["verification"], serde_json::json!({"state": "pending", "policies": [
+        {"policy_id": "clean", "state": "accepted"}, {"policy_id": "content", "state": "pending"}]}), "a policy without a run is pending");
+    assert_eq!(first["integration"], serde_json::json!({"state": "pending"}));
+
+    run('3', "content", "rejected", Some("checks_failed"), 2000);
+    let second = record();
+    assert_eq!(second["verification"], serde_json::json!({"state": "rejected", "reason": "checks_failed", "policies": [
+        {"policy_id": "clean", "state": "accepted"}, {"policy_id": "content", "state": "rejected", "reason": "checks_failed"}]}));
+    assert_eq!((&second["terminal_state"], &second["accepted"]), (&serde_json::json!("cancelled"), &serde_json::json!(false)));
+}
