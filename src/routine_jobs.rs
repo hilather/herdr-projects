@@ -265,7 +265,10 @@ mod tests {
     #[cfg(target_os="linux")]
     #[test]
     fn running_job_preserves_control_lane_and_cancellation_drains_without_certifying_cleanup() {
-        let(world,path,id)=fixture(b"touch started; setsid /bin/sh -c 'sleep 0.8; touch escaped' >/dev/null 2>&1 & sleep 10",10_000);
+        let(world,path,id)=fixture(b"touch started; setsid /bin/sh -c 'until [ -e release ]; do sleep 0.05; done; touch escaped' >/dev/null 2>&1 & sleep 10",10_000);
+        // The detached child waits for `release`, written only after cancellation,
+        // rather than a fixed 0.8 s: under load the steps below can outlast any
+        // fixed delay, and a child that survived cancellation must still write.
         let other=crate::project::create(&world.root,"other","",vec![]).unwrap();other.set_status(crate::project::Status::Paused).unwrap();
         let other=other.dir().canonicalize().unwrap();let config=world.ctx().config_dir.join("config.toml");
         let plan=herdr_projects::migration::inspect_with_config(&other,&config).unwrap();herdr_projects::migration::apply(&other,&plan,true).unwrap();
@@ -286,7 +289,7 @@ mod tests {
         assert!(pool.submit(control).unwrap().recv_timeout(Duration::from_secs(1)).unwrap().result.unwrap().success());
         assert!(pool.stop(Duration::from_secs(2)));assert!(ticket.recv_timeout(Duration::from_secs(1)).unwrap().result.is_ok());
         let after=runtime::snapshot(&path).unwrap();assert_eq!(after.deliveries[0].state,DeliveryState::Ambiguous);assert!(!after.routine_receipts[0].cleanup_verified);
-        std::thread::sleep(Duration::from_millis(900));assert!(!path.join("escaped").exists());
+        std::fs::write(path.join("release"),b"").unwrap();std::thread::sleep(Duration::from_millis(900));assert!(!path.join("escaped").exists());
     }
     #[cfg(target_os="linux")]
     #[test]

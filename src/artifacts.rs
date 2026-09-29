@@ -263,6 +263,11 @@ fn artifact_id(id:&str,canonical:bool)->Result<()> {
     else {thread::validate_id(id)}
 }
 enum ArtifactLock { Legacy{_lock:crate::project::ProjectLock}, #[cfg(feature="state-store")] Canonical{_file:File} }
+// The canonical variant holds the same `.state/lock` flock: unlock it
+// explicitly, as `ProjectLock` does, so a concurrently forked child cannot keep
+// it held after release.
+#[cfg(feature="state-store")]
+impl Drop for ArtifactLock {fn drop(&mut self){if let ArtifactLock::Canonical{_file}=self {let _=_file.unlock();}}}
 fn artifact_lock(project:&Project,canonical:bool)->Result<ArtifactLock> {
     if !canonical {return Ok(ArtifactLock::Legacy{_lock:project.lock()?});}
     #[cfg(feature="state-store")]

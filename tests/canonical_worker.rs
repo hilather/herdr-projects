@@ -239,10 +239,15 @@ sys.stdout.buffer.write(json.dumps({'result':json.loads(reply)['result']}).encod
     }
     fn wait(&self, ticker: &mut Ticker, seconds: u64, predicate: &dyn Fn() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(seconds);
+        // Predicates read `runtime::snapshot` (whole-store integrity check plus
+        // a full read); at a fixed 20 ms they competed with the ticker being
+        // waited on. Back off to 250 ms; the deadline is unchanged.
+        let mut pause = Duration::from_millis(20);
         while !predicate() {
             assert!(ticker.0.try_wait().unwrap().is_none(), "ticker exited");
             assert!(Instant::now() < deadline, "{}", fs::read_to_string(self.path("root/.ticker.log")).unwrap_or_default());
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(250));
         }
     }
     fn stop(&self, mut ticker: Ticker) {

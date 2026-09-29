@@ -233,6 +233,17 @@ pub struct ProjectLock {
     _file: File,
 }
 
+impl Drop for ProjectLock {
+    /// Unlock explicitly rather than by closing: a child forked by any other
+    /// thread shares the open file description until it execs, so a bare close
+    /// would leave the flock held for that window and a following
+    /// non-blocking `.state/lock` taker (migration, runtime) would fail with
+    /// "another operation owns lock". See `execution_guard::LockFile`.
+    fn drop(&mut self) {
+        let _ = self._file.unlock();
+    }
+}
+
 impl Project {
     /// An existing project. Validates the slug before building any path.
     pub fn load(root: &Path, slug: &str) -> Result<Project> {

@@ -8,10 +8,18 @@ use herdr_projects::{runtime,migration,execution_guard::ProjectGuard,reconcile::
 const JOB:&str="\0herdr-projects-canonical-observation";
 const BUDGET:Duration=Duration::from_secs(15);
 const LIMIT:usize=1024*1024;
+/// Wall-clock bound on one observation-head read (fresh read-only connection,
+/// schema load, one row). The ticker must not stall on a slow store, so an
+/// overrun is an `unknown` poll, retried next pass. Unit tests share 12 cores
+/// with every other test in the binary and assert rotation and fencing, not
+/// read latency: an oversubscribed runner can deschedule the reading thread
+/// past 100 ms (SQLITE_INTERRUPT, "interrupted"), and the queue-rotation test
+/// makes 3,096 such reads. Tests therefore bound the read by the budget cap.
+const HEAD_READ:Duration=if cfg!(test){Duration::from_secs(10)}else{Duration::from_millis(100)};
 
 fn sql_control(control:&Control)->herdr_projects::store::controlled::ReadControl {herdr_projects::store::controlled::ReadControl::new(control.deadline,control.cancellation.clone())}
 fn observation_head(path:&Path)->Result<u64> {
-    let mut budget=herdr_projects::store::identity_inventory::Budget::new(2*1024*1024,0,Instant::now()+Duration::from_millis(100),Default::default())?;
+    let mut budget=herdr_projects::store::identity_inventory::Budget::new(2*1024*1024,0,Instant::now()+HEAD_READ,Default::default())?;
     migration::read_observation_head(path,&mut budget)
 }
 
@@ -82,7 +90,7 @@ fn collect_with(input:&Input,control:&Control,observe:impl FnOnce(&Input,&Contro
         let db=migration::open_active_scoped(&input.project,sql_control(control))?;control.check()?;
         let state=db.project_control()?.context("canonical control missing")?;
         let active=state.state==herdr_projects::domain::ProjectState::Active&&!state.reconciliation_required;
-        let mut budget=herdr_projects::store::identity_inventory::Budget::new(2*1024*1024,0,control.deadline.min(Instant::now()+Duration::from_millis(100)),control.cancellation.clone())?;
+        let mut budget=herdr_projects::store::identity_inventory::Budget::new(2*1024*1024,0,control.deadline.min(Instant::now()+HEAD_READ),control.cancellation.clone())?;
         let head=migration::read_observation_head(&input.project,&mut budget)?;input.current(control)?;Ok((head,active))
     })();
     let head=match head {Ok((head,active))=>{if scheduled_work==Some(true)&&!active{scheduled_work=Some(false);}Some(head)},Err(error)=>{errors.push(format!("maintenance result: {error:#}"));None}};

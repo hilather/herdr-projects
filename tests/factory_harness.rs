@@ -1551,12 +1551,17 @@ fn worker_snapshots_for(project: &Path, only: Option<&str>) {
         .collect::<Vec<_>>();
     let tasks = conn.prepare("SELECT id,revision FROM tasks WHERE state='queued'").unwrap()
         .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    // One store for the whole pass. `SqliteStore::open` runs the whole-store
+    // `quick_check` + `foreign_key_check`; reopening it per (task, profile)
+    // pair re-read the entire database thousands of times (84 GB for the
+    // ten-worker gate). The integrity check still runs once per pass.
+    let mut memory = None;
     for (task, revision) in tasks {
         for profile in profiles.iter().filter(|profile| only.is_none_or(|name| profile.name == name)) {
             let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM memory_snapshots WHERE task_id=?1 AND task_revision=?2 AND profile_name=?3 AND profile_digest=?4)",
                 rusqlite::params![task, revision, profile.name, profile.definition_digest], |row| row.get(0)).unwrap();
             if exists { continue; }
-            let mut memory = herdr_projects::memory::MemoryStore::from_sqlite(SqliteStore::open(&db_path).unwrap(), project.join(".state/objects"));
+            let memory = memory.get_or_insert_with(|| herdr_projects::memory::MemoryStore::from_sqlite(SqliteStore::open(&db_path).unwrap(), project.join(".state/objects")));
             memory.create_worker_snapshot(SnapshotRequest { schema_version: 1, task_id: task.clone(), profile: profile.name.clone(), domains: vec![], paths: vec![], pinned_keys: vec![], sensitivity: "default".into() },
                 &profile.name, &profile.definition_digest, profile.config.digest.as_deref(), 32000, "Factory fixture instructions", unix_ms(), None).unwrap();
         }

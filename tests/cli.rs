@@ -2016,7 +2016,13 @@ impl VerifyFixture {
     }
     fn wait(&self,child:&mut Ticker,seconds:u64,predicate:&dyn Fn()->bool) {
         let deadline=std::time::Instant::now()+std::time::Duration::from_secs(seconds);
-        while !predicate(){assert!(child.0.try_wait().unwrap().is_none());assert!(std::time::Instant::now()<deadline,"{}\nverification jobs: {}",std::fs::read_to_string(self.root.join(".ticker.log")).unwrap_or_default(),String::from_utf8_lossy(&hp(self.home.path(),&["--root",self.r(),"result","demo","jobs"]).stdout));std::thread::sleep(std::time::Duration::from_millis(10));}
+        // Predicates usually read `runtime::snapshot`: a whole-store integrity
+        // check plus a full read. Polled every 10 ms across 15 s ticker passes
+        // they burned a core against the ticker being waited on (147 GB read by
+        // one test), so back off to 250 ms: far below a pass, and the predicate
+        // is still re-evaluated until the same deadline.
+        let mut pause=std::time::Duration::from_millis(10);
+        while !predicate(){assert!(child.0.try_wait().unwrap().is_none());assert!(std::time::Instant::now()<deadline,"{}\nverification jobs: {}",std::fs::read_to_string(self.root.join(".ticker.log")).unwrap_or_default(),String::from_utf8_lossy(&hp(self.home.path(),&["--root",self.r(),"result","demo","jobs"]).stdout));std::thread::sleep(pause);pause=(pause*2).min(std::time::Duration::from_millis(250));}
     }
     fn stop(&self,child:&mut Ticker) {
         std::fs::write(self.root.join(".ticker.stop"),b"").unwrap();let deadline=std::time::Instant::now()+std::time::Duration::from_secs(8);
