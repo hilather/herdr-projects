@@ -1,7 +1,8 @@
 //! Lane B accounting end to end (docs/telemetry/contracts-accounting.md): Codex
 //! rollouts collected on the CLI, the usage ledger synced by
 //! `telemetry <slug> accounting sync`, the metrics it provides, and
-//! published-rate estimates from synthetic rate cards.
+//! published-rate estimates from synthetic rate cards, and quota windows from
+//! synthetic Codex rate-limit snapshots.
 
 #![cfg(all(feature = "state-store", target_os = "linux"))]
 #![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
@@ -46,7 +47,7 @@ fn normalized_totals_match_doc05_golden() {
     assert_eq!(f.cli_args(&["accounting", "entries"]).0, json!({"status": "unavailable", "reason": "ledger_not_synced"}));
 
     let (synced, _) = f.cli_args(&["accounting", "sync"]);
-    assert_eq!(synced, json!({"entries": 4, "dispositions": {"accepted": 3, "duplicate": 1, "unresolved": 1}, "sessions": 1, "model_segments": 1}));
+    assert_eq!(synced, json!({"entries": 4, "dispositions": {"accepted": 3, "duplicate": 1, "unresolved": 1}, "sessions": 1, "model_segments": 1, "quota_windows": 0}));
     let (entries, first) = f.cli_args(&["accounting", "entries"]);
     let entry = |id: String| entries["entries"].as_array().unwrap().iter().find(|e| e["entry_id"] == id.as_str()).cloned()
         .unwrap_or_else(|| panic!("{id} in {entries}"));
@@ -110,7 +111,7 @@ fn model_switch_splits_segments_not_task() {
     f.cli("collect");
     assert_eq!(f.cli_args(&["accounting", "sessions"]).0, json!({"status": "unavailable", "reason": "ledger_not_synced"}));
     let (synced, _) = f.cli_args(&["accounting", "sync"]);
-    assert_eq!(synced, json!({"entries": 8, "dispositions": {"accepted": 8, "duplicate": 1}, "sessions": 2, "model_segments": 5}));
+    assert_eq!(synced, json!({"entries": 8, "dispositions": {"accepted": 8, "duplicate": 1}, "sessions": 2, "model_segments": 5, "quota_windows": 0}));
 
     let (sessions, first) = f.cli_args(&["accounting", "sessions"]);
     let segment = |n: i64, model: &str, at: i64, [input, output, reasoning, total]: [i64; 4]| json!({"segment": n, "model": model,
@@ -285,4 +286,128 @@ fn repricing_uses_rate_effective_at_usage_time() {
     assert_eq!(f.cli_args(&["accounting", "reprice"]).0, json!({"revision": 2, "appended": false, "entries": 6}));
     assert_eq!(f.cli_args(&["accounting", "entries"]).1, measured);
     assert_eq!((f.count("valuation_revisions"), f.count("valuations"), f.count("rate_cards")), (2, 12, 4));
+}
+
+/// A fixture rollout whose rate-limit snapshots carry `@Tn@` (RFC 3339 observation
+/// times, from Unix ms) and `@Rn@` (reset times, Unix seconds), written beside the project.
+fn quota_rollout(f: &Fixture, name: &str, fixture: &str, start: i64, times: &[i64], resets: &[i64]) {
+    let mut text = fs::read_to_string(Path::new(ACCOUNTING).join(fixture)).unwrap();
+    for (n, t) in times.iter().enumerate() { text = text.replace(&format!("@T{}@", n + 1), &jiff::Timestamp::from_millisecond(*t).unwrap().to_string()); }
+    for (n, r) in resets.iter().enumerate() { text = text.replace(&format!("@R{}@", n + 1), &r.to_string()); }
+    let path = f.tmp.path().join(fixture);
+    fs::write(&path, text).unwrap();
+    f.rollout(&f.home, name, &[path.to_str().unwrap()], &f.worktree(), start, "0.154.0");
+}
+
+/// M40 at the fixture's one dispatch decision, per window, from `accounting quota`.
+fn headroom(f: &Fixture) -> serde_json::Value {
+    let (quota, _) = f.cli_args(&["accounting", "quota", "--json"]);
+    let decisions = quota["metrics"]["M40"]["decisions"].as_array().unwrap().clone();
+    assert_eq!((decisions.len(), &decisions[0]["attempt_id"], &decisions[0]["decided_unix_ms"]), (1, &json!(f.attempt), &json!(f.decided)));
+    decisions[0].clone()
+}
+
+/// Doc 05 §5b / TM2.7: one 300-minute Codex `primary` window, in percent, of
+/// the attempt's execution home. Before the decision it reads 40 → 55.5, then
+/// 50 without a reset (flagged, not subtracted: the high-water mark stays
+/// 55.5), then 60, one minute before dispatch: headroom 100 − 60 = 40, age
+/// 60,000 ms, fresh; observed increase 60 − 40 = 20. After the reset time the
+/// window reports 5 then 12.25 under a later `resets_at`: a new window
+/// (increase 7.25, remaining 87.75), never a consumption of 5 − 60 = −55.
+/// `secondary` is not collected, so it is unavailable, not 0; M38/M39 have no
+/// certified Codex source.
+#[test]
+fn window_reset_starts_new_window_not_negative() {
+    let f = Fixture::new();
+    let d = f.decided;
+    let unavailable = |reason: &str| json!({"status": "unavailable", "reason": reason});
+    assert_eq!(f.cli_args(&["accounting", "quota", "--json"]).0, unavailable("collection_not_run"));
+    // Reset of the first window one hour after the decision (whole seconds), the next 300 minutes later.
+    let r1 = d / 1000 + 3_600;
+    let r2 = r1 + 18_000;
+    let (t5, t4) = (r1 * 1000 + 3_600_000, d - 60_000);
+    quota_rollout(&f, "quota", "quota-reset.jsonl", d - 10_800_000, &[d - 10_800_000, d - 7_200_000, d - 5_400_000, t4, t5, t5 + 600_000], &[r1, r2]);
+    f.cli("collect");
+    assert_eq!(f.count("codex_rate_limits"), 6);
+    assert_eq!(f.cli_args(&["accounting", "quota", "--json"]).0, unavailable("ledger_not_synced"));
+    let (synced, _) = f.cli_args(&["accounting", "sync"]);
+    assert_eq!(synced["quota_windows"], 2);
+
+    let (quota, first) = f.cli_args(&["accounting", "quota", "--json"]);
+    let account = digest(&f.home);
+    let (w1, w2) = (format!("codex:{account}:codex:primary:{}", r1 * 1000), format!("codex:{account}:codex:primary:{}", r2 * 1000));
+    assert_eq!(quota["semantics"], "not_certified");
+    assert_eq!(quota["windows"], json!([
+        {"window_id": w1, "service": "codex", "account": account, "limit_id": "codex", "window_kind": "primary", "unit": "percent", "window_minutes": 300,
+         "window_start_unix_ms": r1 * 1000 - 18_000_000, "resets_unix_ms": r1 * 1000, "start_evidence": "first_observation",
+         "first_observed_unix_ms": d - 10_800_000, "last_observed_unix_ms": t4, "first_used": "40", "used": "60", "remaining": "40",
+         "observed_increase": "20", "plan_type": "pro", "observations": 3, "flagged": 1},
+        {"window_id": w2, "service": "codex", "account": account, "limit_id": "codex", "window_kind": "primary", "unit": "percent", "window_minutes": 300,
+         "window_start_unix_ms": r2 * 1000 - 18_000_000, "resets_unix_ms": r2 * 1000, "start_evidence": "reset_elapsed",
+         "first_observed_unix_ms": t5, "last_observed_unix_ms": t5 + 600_000, "first_used": "5", "used": "12.25", "remaining": "87.75",
+         "observed_increase": "7.25", "plan_type": "pro", "observations": 2, "flagged": 0}]));
+    assert_eq!(quota["observations"], json!({"trusted": 5, "used_decreased_without_reset": 1}));
+    // The drop is kept as observed and flagged inside its window, never subtracted.
+    assert_eq!(f.sidecar().query_row("SELECT used,remaining,trust,window_id FROM quota_observations WHERE observed_unix_ms=?1", [d - 5_400_000],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?))).unwrap(),
+        ("50".to_owned(), "50".to_owned(), "used_decreased_without_reset".to_owned(), w1.clone()));
+
+    // Headroom at dispatch: the latest trusted snapshot at or before the decision.
+    assert_eq!(headroom(&f), json!({"attempt_id": f.attempt, "decided_unix_ms": d, "service": "codex", "account": account, "windows": [
+        {"limit_id": "codex", "window_kind": "primary", "unit": "percent", "window_id": w1, "window_minutes": 300, "resets_unix_ms": r1 * 1000,
+         "observed_unix_ms": t4, "age_ms": 60_000, "value": "40", "used": "60", "freshness": "fresh"},
+        {"limit_id": "codex", "window_kind": "secondary", "value": unavailable("not_collected")}]}));
+    assert_eq!((&quota["metrics"]["M40"]["definition"], &quota["metrics"]["M40"]["stale_after_ms"]), (&json!("M40.quota-windows-v1"), &json!(900_000)));
+    let text = f.text(&["accounting", "quota"]);
+    for line in [format!("M40 {} codex primary remaining 40% age_ms=60000 fresh", f.attempt), format!("M40 {} codex secondary n/a (not_collected)", f.attempt),
+        "M38 throttled_time_share n/a (throttling_not_certified)".to_owned()] {
+        assert!(text.lines().any(|l| l == line), "{line:?} in\n{text}");
+    }
+
+    // M38/M39 reach the report through the lane hook: unknown, never 0.
+    let report = f.report();
+    assert_eq!((&report["metrics"]["M38"]["value"], &report["metrics"]["M38"]["name"]), (&unavailable("throttling_not_certified"), &json!("throttled_time_share")));
+    assert_eq!((&report["metrics"]["M39"]["value"], &report["metrics"]["M39"]["name"]), (&unavailable("provider_errors_not_certified"), &json!("provider_error_rate")));
+    assert_eq!(quota["metrics"]["M38"], report["metrics"]["M38"]);
+
+    // Replay: a second collect and sync leave the windows byte-identical.
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "quota", "--json"]).1, first);
+    assert_eq!((f.count("quota_observations"), f.count("quota_windows")), (6, 2));
+
+    // A snapshot 20 minutes old at dispatch is stale (value kept with its age); one
+    // whose window reset before the decision no longer applies.
+    let f = Fixture::new();
+    let d = f.decided;
+    quota_rollout(&f, "stale", "quota-single.jsonl", d - 1_200_000, &[d - 1_200_000], &[d / 1000 + 3_600]);
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let primary = headroom(&f)["windows"][0].clone();
+    assert_eq!((&primary["value"], &primary["used"], &primary["age_ms"], &primary["freshness"]), (&json!("62.5"), &json!("37.5"), &json!(1_200_000), &json!("stale")));
+    assert!(f.text(&["accounting", "quota"]).lines().any(|l| l == format!("M40 {} codex primary remaining 62.5% age_ms=1200000 stale", f.attempt)));
+
+    let f = Fixture::new();
+    let d = f.decided;
+    quota_rollout(&f, "reset", "quota-single.jsonl", d - 7_200_000, &[d - 7_200_000], &[d / 1000 - 3_600]);
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let primary = headroom(&f)["windows"][0].clone();
+    assert_eq!((&primary["value"], &primary["age_ms"], primary.get("freshness")), (&unavailable("window_reset_since_observation"), &json!(7_200_000), None));
+
+    // Missing snapshots: none in the home → no_observation; one without a `primary`
+    // window → incomplete, no_trusted_observation. Never a headroom of 0.
+    let f = Fixture::new();
+    let d = f.decided;
+    f.rollout(&f.home, "record", &[RECORD], &f.worktree(), d + 1_000, "0.154.0");
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(headroom(&f)["value"], unavailable("no_observation"));
+    quota_rollout(&f, "no-primary", "quota-no-primary.jsonl", d - 60_000, &[d - 60_000], &[]);
+    f.cli("collect");
+    assert_eq!(f.cli_args(&["accounting", "sync"]).0["quota_windows"], 0);
+    let (quota, _) = f.cli_args(&["accounting", "quota", "--json"]);
+    assert_eq!((&quota["windows"], &quota["observations"]), (&json!([]), &json!({"incomplete": 1})));
+    assert_eq!(headroom(&f)["value"], unavailable("no_trusted_observation"));
+    assert!(f.text(&["accounting", "quota"]).lines().any(|l| l == format!("M40 {} n/a (no_trusted_observation)", f.attempt)));
 }

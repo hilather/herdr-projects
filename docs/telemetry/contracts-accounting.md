@@ -58,7 +58,8 @@ The lane provides M08 and M09 (contracts §6, `definition` still
 `input_tokens` / `output_tokens` (`reasoning_output_tokens` as a subset) of
 counted entries (delta, an `accepted` disposition) of certified sessions, with
 the §6 `coverage`. They are derived from the Codex tables at report time, so
-they need no prior sync.
+they need no prior sync. It also provides M38 and M39, both `unavailable`
+(§5).
 
 ## 3. Session graph and model segments (B2, TM2.2)
 
@@ -191,3 +192,79 @@ their reasons, leaving the attempt `partial` at `0.0081`. A corrected
 version 3 (output 6 → `0.0035`) and a EUR card (`0.00021`) append revision 2
 (attempt `mixed_currency`: USD `0.0075`, EUR `0.00021`); revision 1 reads
 back byte-identical and the ledger is unchanged.
+
+## 5. Quota windows (B4, TM2.7)
+
+Stream `accounting` version 4 (`0004_quota_windows.sql`), rebuilt whole by
+the same sync and transaction as §1–§3 from `codex_rate_limits` (SQL only;
+sync adds a `quota_windows` count). Migrating to 4 clears `usage_ledger`
+(`ledger_not_synced` until the next sync). Plan: doc 05 §5b, doc 07
+M38–M40. The live run observed the fields but certified no semantics
+([codex-live-0.154.0.md](codex-live-0.154.0.md)); every output says
+`semantics: not_certified`.
+
+**Observations** (`quota_observations`, one per `codex_rate_limits` row):
+service `codex`; account = the rollout's `home_digest` (one execution home is
+one login; a session seen under two homes is `account_ambiguous`); `limit_id`;
+`window_kind` `primary` (the collector allowlist, contracts §5, keeps only
+`primary`); unit `percent`; `window_minutes`; `resets_unix_ms` (`resets_at`
+seconds × 1000); `used` and `remaining = 100 − used` as exact trimmed decimal
+strings (`42.0` → `42`); `plan_type`; `observed_unix_ms` (the line's
+`timestamp`); `trust`; `window_id`. Per (account, limit), in
+`(observed, session, ordinal)` order against the current window:
+
+| Trust | When | Window |
+| --- | --- | --- |
+| `incomplete` | `limit_id`, `used_percent`, `window_minutes` or `resets_at` missing (e.g. `primary: null`) | none |
+| `unparseable` | `used` not a plain decimal in 0–100, or `window_minutes` ≤ 0 | none |
+| `account_ambiguous` | the session's rollouts lie under several homes | none |
+| `trusted` | first snapshot (window `first_observation`); a later `resets_at` (new window: `reset_elapsed` if observed at or after the previous reset, else `reset_moved`); or same window and `used` ≥ its high-water mark | the window |
+| `window_regressed` | `resets_at` earlier than the current window's | none |
+| `window_conflict` | same `resets_at`, different `window_minutes` | none |
+| `used_decreased_without_reset` | same window, `used` below its high-water mark | the window (counted in `flagged`) |
+
+A reset starts a new window identity; nothing is ever subtracted across one
+or within one. **Windows** (`quota_windows`): `window_id =
+codex:<account>:<limit_id>:primary:<resets_unix_ms>`, window start =
+reset − `window_minutes`, first/last trusted observation, `first_used`,
+`used` (high-water), `remaining`, `observed_increase = used − first_used`
+(account-wide: never attributed to a task, as the window's invocation scope
+is not certified), latest `plan_type`, trusted `observations` and `flagged`.
+
+**`accounting quota [--json]`** (read-only; `collection_not_run` without a
+sidecar, `ledger_not_synced` before a sync): `windows`, `observations`
+(count per trust), and `metrics`:
+
+- M38 `throttled_time_share`: `unavailable throttling_not_certified`. Codex
+  rollouts carry no throttled intervals; the allowlist keeps no availability
+  events (`rate_limit_reached_type` is a point flag, not collected).
+- M39 `provider_error_rate`: `unavailable provider_errors_not_certified`. No
+  typed provider error field is collected or certified; human-readable
+  messages never become certified fields.
+- M40 extended (`M40.quota-windows-v1`): per dispatch decision (attempt
+  order), `{attempt_id, decided_unix_ms, service, account, windows}`; per
+  limit, `primary` = the latest trusted observation of the attempt's account
+  with `observed ≤ decided` (ties: session, ordinal descending) with
+  `window_id, window_minutes, resets_unix_ms, observed_unix_ms, age_ms`, then
+  `value` = remaining percent, `used`, and `freshness` (`stale` when
+  `age_ms > stale_after_ms` = 900000, value still shown); if the window reset
+  at or before the decision, `value` is `unavailable
+  window_reset_since_observation` (the new window's value is unknown).
+  `secondary` is `unavailable not_collected`. Decision-level reasons:
+  `adapter_absent`, `execution_home_unknown`, `no_observation` (no snapshot
+  of the account by then), `no_trusted_observation`. Native units; never
+  summed or averaged across accounts, limits or services.
+
+M38 and M39 also reach `telemetry <slug> report` through the lane
+`metrics()` hook. The report's central M40 (contracts §6) is unchanged:
+replacing it with the extended form would change the report shape asserted
+by `tests/telemetry.rs` and `tests/cli.rs`, so that is a steward change.
+
+Test `window_reset_starts_new_window_not_negative`: a 300-minute `primary`
+window reads 40 → 55.5 → 50 (flagged, not subtracted) → 60 one minute before
+dispatch (headroom `40`, age 60000, fresh, increase `20`); after its reset,
+5 → 12.25 under a later `resets_at` open a second window (`reset_elapsed`,
+increase `7.25`, remaining `87.75`), never −55. A snapshot 20 minutes old is
+`stale` (`62.5`, age 1200000); one whose window reset before the decision is
+`window_reset_since_observation`; no snapshot is `no_observation` and one
+with `primary: null` is `incomplete` → `no_trusted_observation`, never 0.

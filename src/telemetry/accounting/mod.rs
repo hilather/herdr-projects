@@ -10,19 +10,21 @@ use std::path::Path;
 pub mod cost;
 pub mod graph;
 pub mod ledger;
+pub mod quota;
 
 pub const STREAM: &str = "accounting";
 /// `include_str!` of `migrations/telemetry/accounting/`, in order; index + 1 is the stream version.
 pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/accounting/0001_usage_ledger.sql"),
     include_str!("../../../migrations/telemetry/accounting/0002_session_graph.sql"),
-    include_str!("../../../migrations/telemetry/accounting/0003_rate_cards.sql")];
+    include_str!("../../../migrations/telemetry/accounting/0003_rate_cards.sql"),
+    include_str!("../../../migrations/telemetry/accounting/0004_quota_windows.sql")];
 
 /// `herdr-projects telemetry <slug> accounting ...`
 #[derive(clap::Subcommand)]
 pub enum Command {
     /// Stream version of this lane's sidecar tables. Read-only.
     Status,
-    /// Rebuild the usage ledger, session graph and model segments from the collected Codex rows. Writes only the sidecar.
+    /// Rebuild the usage ledger, session graph, model segments and quota windows from the collected Codex rows. Writes only the sidecar.
     Sync,
     /// The synced usage ledger: entries with their provenance. Read-only.
     Entries,
@@ -44,6 +46,13 @@ pub enum Command {
         /// Show this earlier calculation revision instead of the latest.
         #[arg(long)]
         revision: Option<i64>,
+    },
+    /// Synced quota windows (native units), observation trust, M38/M39 and
+    /// headroom per limit window at each dispatch decision (extended M40). Read-only.
+    Quota {
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -87,6 +96,14 @@ pub fn run(project: &Path, command: Command) -> Result<String> {
             if !json { return Ok(cost::text(&value)); }
             value
         }
+        Command::Quota { json } => {
+            let value = match super::sidecar::read(project)? {
+                Some(db) => quota::read(project, &db)?,
+                None => unavailable("collection_not_run"),
+            };
+            if !json { return Ok(quota::text(&value)); }
+            value
+        }
     };
     Ok(serde_json::to_string_pretty(&value)? + "\n")
 }
@@ -97,12 +114,19 @@ fn metric(id: &str, name: &str, mut body: Value) -> Value {
     body
 }
 
+/// M38/M39 (§5): no certified Codex source, so `unavailable` with the reason.
+fn with_availability(mut metrics: BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    for (id, name, body) in quota::availability_metrics() { metrics.insert(id.to_owned(), metric(id, name, body)); }
+    metrics
+}
+
 /// Contracts §6 M08/M09, replacing the central ones with the same numbers:
 /// counted ledger entries (derived from the Codex tables, so no sync is
 /// needed) of certified sessions, i.e. with a source bound to a known attempt,
 /// not quarantined, of a certified version, started in the window.
 pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> {
-    let both = |m08: Value, m09: Value| BTreeMap::from([("M08".to_owned(), metric("M08", "input_tokens", m08)), ("M09".to_owned(), metric("M09", "output_tokens", m09))]);
+    let both = |m08: Value, m09: Value| with_availability(BTreeMap::from([("M08".to_owned(), metric("M08", "input_tokens", m08)),
+        ("M09".to_owned(), metric("M09", "output_tokens", m09))]));
     let Some(db) = super::sidecar::read(project)? else {
         let body = json!({"value": unavailable("no_certified_source")});
         return Ok(both(body.clone(), body));

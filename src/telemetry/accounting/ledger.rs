@@ -96,8 +96,8 @@ pub fn derive(db: &Connection) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
-/// Rebuild the ledger, session graph and model segments (§3) from the Codex
-/// tables in one sidecar transaction; returns counts.
+/// Rebuild the ledger, session graph and model segments (§3) and quota
+/// windows (§5) from the Codex tables in one sidecar transaction; returns counts.
 pub fn sync(db: &mut Connection) -> Result<Value> {
     let tx = db.transaction()?;
     let entries = derive(&tx)?;
@@ -117,11 +117,12 @@ pub fn sync(db: &mut Connection) -> Result<Value> {
         }
     }
     let (sessions, segments) = super::graph::store(&tx, &entries)?;
+    let windows = super::quota::store(&tx)?;
     tx.execute("INSERT INTO usage_ledger(singleton,normalization_version,synced_unix_ms) VALUES(1,?1,?2)
         ON CONFLICT(singleton) DO UPDATE SET normalization_version=excluded.normalization_version,synced_unix_ms=excluded.synced_unix_ms",
         params![NORMALIZATION, jiff::Timestamp::now().as_millisecond()])?;
     tx.commit()?;
-    Ok(json!({"entries": entries.len(), "dispositions": counts, "sessions": sessions, "model_segments": segments}))
+    Ok(json!({"entries": entries.len(), "dispositions": counts, "sessions": sessions, "model_segments": segments, "quota_windows": windows}))
 }
 
 /// The synced ledger as JSON, read-only; `ledger_not_synced` before the first sync.
