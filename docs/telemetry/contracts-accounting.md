@@ -256,9 +256,8 @@ sidecar, `ledger_not_synced` before a sync): `windows`, `observations`
   summed or averaged across accounts, limits or services.
 
 M38 and M39 also reach `telemetry <slug> report` through the lane
-`metrics()` hook. The report's central M40 (contracts §6) is unchanged:
-replacing it with the extended form would change the report shape asserted
-by `tests/telemetry.rs` and `tests/cli.rs`, so that is a steward change.
+`metrics()` hook. The report's M40 (contracts §6) is this extended form: the
+report and `accounting quota` give identical per-decision entries.
 
 Test `window_reset_starts_new_window_not_negative`: a 300-minute `primary`
 window reads 40 → 55.5 → 50 (flagged, not subtracted) → 60 one minute before
@@ -275,7 +274,8 @@ Stream `accounting` version 5 (`0005_attention.sql`). Plan: doc 03
 `HumanAttentionInterval`, doc 07 §5a M31–M33, doc 10 §5a. Replaces the
 central `attention_not_collected` M31–M33 (contracts §6) through the lane
 `metrics()` hook once any sample exists; the outcome record's `attention`
-field (contracts §4) is unchanged.
+field (contracts §4) shows this lane's per-attempt summary once any sample
+exists.
 
 **Signal.** Stock Herdr's `agent list` (`result.agents[]`), field
 `agent_status`: the waiting state is `blocked`; `working`, `idle`, `done`

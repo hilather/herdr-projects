@@ -504,7 +504,7 @@ no code path may read it.
 
 ## 8. Deferred (explicit)
 
-Attention intervals and M31–M33 (S4); transactional outbox (TM0.4);
+M33 typed attention reasons; transactional outbox (TM0.4);
 spool; budget bridge and any change to `UnknownUsagePolicy` (TM2.4);
 provider charges, invoice allocation and currency conversion; M04/M11/M12;
 Claude and OTLP adapters; candidate-group selection and races; stochastic
