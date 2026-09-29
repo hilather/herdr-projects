@@ -41,34 +41,43 @@ fn load_verified(db: &Connection, result_id: &str) -> Result<Option<VerifiedRece
     .map_err(StoreError::from)
 }
 
-/// A verified receipt may replace the current row only when its attempt is the
-/// selected one and its contract is the predecessor's latest revision. An older
-/// run must not strand that row as invalid: revalidation is forbidden.
+/// The predecessor's current attempt, over `verification_runs r`: its active
+/// attempt, else its latest.
+const ATTEMPT_CURRENT: &str = "r.attempt_id=COALESCE((SELECT active_attempt FROM tasks WHERE id=r.task_id),
+    (SELECT id FROM attempts WHERE task_id=r.task_id ORDER BY rowid DESC LIMIT 1))";
+
+/// Whether verified result `v` (run `r`) is its predecessor's current result
+/// (contracts-quality.md §3). Once a candidate group of `r`'s task and
+/// contract revision has a `selected` outcome, exactly that selection's
+/// submission is current, whether or not its attempt is the latest: a later
+/// arm or retry of that revision never displaces the winner. Otherwise the
+/// attempt-currency rule ([`ATTEMPT_CURRENT`]) applies unchanged.
+fn current_clause(db: &Connection) -> Result<String> {
+    if !super::candidate_groups::groups_present(db)? { return Ok(ATTEMPT_CURRENT.to_owned()); }
+    let selected = "SELECT 1 FROM candidate_groups g JOIN candidate_selections x ON x.group_id=g.group_id
+        WHERE g.task_id=r.task_id AND g.contract_revision=r.contract_revision AND x.outcome='selected'";
+    Ok(format!("(CASE WHEN EXISTS({selected}) THEN EXISTS({selected} AND x.submission_id=v.submission_id) ELSE {ATTEMPT_CURRENT} END)"))
+}
+
+/// A verified receipt may replace the current row only when it is the
+/// predecessor's current result ([`current_clause`]) and its contract is the
+/// predecessor's latest revision. An older run must not strand that row as
+/// invalid: revalidation is forbidden.
 fn verified_result_may_replace(tx: &Connection, result_id: &str) -> Result<bool> {
+    let current = current_clause(tx)?;
     tx.query_row(
-        "SELECT EXISTS(
+        &format!("SELECT EXISTS(
             SELECT 1
             FROM verified_results v
             JOIN verification_runs r ON r.run_id=v.run_id
             JOIN attempts a ON a.id=r.attempt_id AND a.task_id=r.task_id
             JOIN tasks t ON t.id=a.task_id
             WHERE v.result_id=?1 AND r.state='accepted'
-              AND (
-                t.active_attempt=r.attempt_id
-                OR (
-                  t.active_attempt IS NULL
-                  AND r.attempt_id=(
-                    SELECT latest.id FROM attempts latest
-                    WHERE latest.task_id=r.task_id
-                    ORDER BY latest.rowid DESC
-                    LIMIT 1
-                  )
-                )
-              )
+              AND {current}
               AND r.contract_revision=(
                 SELECT MAX(c.contract_revision) FROM task_contracts c WHERE c.task_id=r.task_id
               )
-         )",
+         )"),
         [result_id],
         |row| row.get(0),
     )
@@ -207,6 +216,22 @@ pub(super) fn record_verified_result(tx: &Connection, result_id: &str) -> Result
     Ok(())
 }
 
+/// After a `selected` outcome for a candidate group of `predecessor`: move
+/// each `verified_result` consumer's edge to the winner's current result
+/// ([`current_clause`]), which may belong to an earlier attempt than the
+/// result the edge records. A revoked predecessor is left to a later attach.
+pub(super) fn attach_selected(tx: &Connection, predecessor: &str) -> Result<()> {
+    if !at_least_30(tx)? || predecessor_revoked(tx, predecessor)? { return Ok(()); }
+    read_budget::with_local_deadline(tx, |budget| {
+        for task_id in consumers(tx, predecessor, "verified_result")? {
+            if let Some(result) = current_verified(tx, &task_id, predecessor, budget)? {
+                insert_valid_with_budget(tx, &task_id, predecessor, "verified_result", &result, true, Some(budget))?;
+            }
+        }
+        budget.check()
+    })
+}
+
 fn integrated_predecessor(tx: &Connection, integrated_id: &str) -> Result<Option<String>> {
     tx.query_row(
         "SELECT r.task_id
@@ -246,15 +271,14 @@ pub(super) fn record_integrated_commit(tx: &Connection, integrated_id: &str) -> 
 /// Newest accepted result that may still replace, not merely the latest clock.
 /// A later run for an older attempt must not be the one attach records.
 fn current_verified(tx: &Connection, task_id: &str, predecessor: &str, budget: &read_budget::ReadBudget) -> Result<Option<String>> {
-    let mut stmt = tx.prepare(
+    let mut stmt = tx.prepare(&format!(
         "SELECT v.result_id
          FROM verification_runs r JOIN verified_results v ON v.run_id=r.run_id
          WHERE r.task_id=?1 AND r.state='accepted'
-           AND r.attempt_id=COALESCE((SELECT active_attempt FROM tasks WHERE id=?1),
-               (SELECT id FROM attempts WHERE task_id=?1 ORDER BY rowid DESC LIMIT 1))
+           AND {}
            AND r.contract_revision=(SELECT MAX(contract_revision) FROM task_contracts WHERE task_id=?1)
            AND v.memory_fence=r.memory_fence AND v.isolation='linux-unshare-user-pid-mount-v1'
-         ORDER BY v.created_unix_ms DESC, v.result_id DESC")?;
+         ORDER BY v.created_unix_ms DESC, v.result_id DESC", current_clause(tx)?))?;
     let mut rows = stmt.query([predecessor])?;
     while let Some(row) = rows.next()? {
         budget.row(row, &[])?;
@@ -353,8 +377,9 @@ fn verified_counts(db: &Connection, task_id: &str, predecessor: &str,budget:Opti
     if super::seeded_defects::seeded_result(db, &result)? || super::candidate_groups::held_result(db, &result)? { return Ok(false); }
     if !super::contract_binding::policy_matches_with_budget(db, task_id, predecessor, "verified_result", &result,budget)? { return Ok(false); }
     if !super::contract_binding::verified_result_barrier_current(db, &result, budget)? { return Ok(false); }
+    let current = current_clause(db)?;
     db.query_row(
-        "SELECT EXISTS(
+        &format!("SELECT EXISTS(
             SELECT 1
             FROM dependency_satisfactions s
             JOIN verified_results v ON v.result_id=s.evidence_id AND s.evidence_kind='verified_result'
@@ -363,18 +388,7 @@ fn verified_counts(db: &Connection, task_id: &str, predecessor: &str,budget:Opti
             JOIN tasks t ON t.id=a.task_id
             WHERE s.task_id=?1 AND s.predecessor_task=?2 AND s.requirement='verified_result' AND s.state='valid'
               AND r.state='accepted' AND v.memory_fence=r.memory_fence
-              AND (
-                t.active_attempt=r.attempt_id
-                OR (
-                  t.active_attempt IS NULL
-                  AND r.attempt_id=(
-                    SELECT latest.id FROM attempts latest
-                    WHERE latest.task_id=r.task_id
-                    ORDER BY latest.rowid DESC
-                    LIMIT 1
-                  )
-                )
-              )
+              AND {current}
               AND r.contract_revision=(
                 SELECT MAX(c.contract_revision) FROM task_contracts c WHERE c.task_id=r.task_id
               )
@@ -383,7 +397,7 @@ fn verified_counts(db: &Connection, task_id: &str, predecessor: &str,budget:Opti
                 WHERE (i.task_id=s.predecessor_task OR i.task_id IS NULL)
                   AND i.resolved_seq IS NULL AND i.severity!='informational'
               )
-         )",
+         )"),
         params![task_id, predecessor],
         |row| row.get(0),
     )

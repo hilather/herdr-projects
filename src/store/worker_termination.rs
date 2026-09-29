@@ -486,7 +486,7 @@ const ACCEPTED_SUBMISSION: &str = "SELECT s.submission_id FROM result_submission
           AND NOT EXISTS(SELECT 1 FROM verification_runs v JOIN verified_results r ON r.run_id=v.run_id
               JOIN verification_contract_checks k ON k.result_id=r.result_id AND k.version=2
               WHERE v.submission_id=s.submission_id AND v.policy_id=p.policy_id AND v.state='accepted'))
-    ORDER BY s.created_unix_ms,s.submission_id LIMIT 1";
+    ORDER BY s.created_unix_ms,s.submission_id";
 
 impl SqliteStore {
     /// Ask the controller to stop a task's started worker because its result
@@ -519,8 +519,17 @@ impl SqliteStore {
         }
         let started:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM attempt_inputs i JOIN events e ON e.entity=i.operation_id AND e.kind='runtime.launch_started' WHERE i.attempt_id=?1)",[active.as_str()],|row|row.get(0))?;
         if !started {return Err(StoreError::Invalid("worker has not started; cancel the attempt instead".into()));}
-        let submission:Option<String>=tx.query_row(ACCEPTED_SUBMISSION,params![task_id.as_str(),active.as_str()],|row|row.get(0)).optional()?;
-        let submission=submission.ok_or_else(||StoreError::Invalid("completion requires a submission of this attempt with accepted verification for every acceptance policy".into()))?;
+        let accepted:Vec<String>=tx.prepare(ACCEPTED_SUBMISSION)?.query_map(params![task_id.as_str(),active.as_str()],|row|row.get(0))?.collect::<rusqlite::Result<_>>()?;
+        if accepted.is_empty() {return Err(StoreError::Invalid("completion requires a submission of this attempt with accepted verification for every acceptance policy".into()));}
+        // A seeded candidate (contracts-review.md §8) or a held candidate-group
+        // submission (contracts-quality.md §3) never completes the task: that
+        // would end its remaining arms. The first other accepted one does.
+        let mut refusal=None;let mut submission=None;
+        for candidate in accepted {
+            let hold=if super::seeded_defects::seeded_submission(&tx,&candidate)? {Some("a seeded candidate never completes its task")} else {super::candidate_groups::completion_hold(&tx,&candidate)?};
+            match hold {None=>{submission=Some(candidate);break;} Some(reason)=>{refusal.get_or_insert(reason);}}
+        }
+        let submission=submission.ok_or_else(||StoreError::Invalid(format!("completion refused: {}",refusal.unwrap_or_default())))?;
         attempt.revision=attempt.revision.checked_add(1).ok_or(StoreError::Conflict)?;
         tx.execute("UPDATE attempts SET revision=?2 WHERE id=?1",params![active.as_str(),integer(attempt.revision)?])?;
         let payload=serde_json::json!({"version":1,"task":task_id,"attempt":active,"submission":submission,"requested_unix_ms":now}).to_string();

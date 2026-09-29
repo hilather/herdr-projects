@@ -212,16 +212,45 @@ winning arm) after a selection. A held submission:
 Recording a `selected` selection (operator, rule or judge) lifts the
 winner's hold and, in the same transaction, inserts it into
 `pending_integration_work` if it has a verified result and no integration
-job or operation, so automatic integration picks it up. Tasks outside a
-group are unchanged. Raw SQL is not guarded (no triggers: that would need
-a schema change). `show` reports `integration_hold: {enforced: true,
+job or operation, so automatic integration picks it up, and moves its
+task's `verified_result` edges to it (below). Tasks outside a group are
+unchanged. Raw SQL is not guarded (below). `show` reports `integration_hold: {enforced: true,
 integrated_without_selection: [...]}`, the list keeping any arm whose
 candidate integrated before the hold existed.
 
-A dependent's `verified_result` edge also still requires the predecessor's
-current attempt (its active attempt, else its latest); so a winner that is
-not the latest arm releases a `verified_result` dependent only through an
-`integrated_commit` edge (follow-up).
+**Selected winner and attempt currency.** A dependent's `verified_result`
+edge requires the predecessor's *current* result (`satisfaction.rs`
+`current_clause`, read by `verified_result_may_replace`, `current_verified`
+and `verified_counts`). Normally that is a result of its current attempt
+(active, else latest). Once a group of the predecessor's task and the
+result's contract revision has a `selected` outcome, the current result is
+exactly that selection's submission, whichever attempt it belongs to: a
+winning arm 1 counts after arm 2 ran later, and nothing else of that
+revision replaces it (a losing arm verified after the selection, another
+submission of the winning arm, or an unbound retry that is now the latest
+attempt). Recording the selection moves each consumer's edge to the
+winner's current result in the same transaction
+(`satisfaction::attach_selected`); a winner verified after the selection
+takes the edge when its result is stored. Every other rule is unchanged:
+latest contract revision, memory fence and invalidations, policy binding,
+barriers, and the seeded guard (a selected seeded candidate still never
+counts, contracts-review.md §8). Without a selection (open or
+`no_selection`) attempt currency is unchanged, and held arms never count.
+
+**Completion.** `task complete` (`request_completion`) marks the task
+succeeded from an accepted submission of its active attempt, which would
+end the task's remaining arms. It skips a seeded candidate (`a seeded
+candidate never completes its task`) and, when the task has a group for
+the submission's contract revision, any submission other than that group's
+`selected` one (`a candidate group's task completes only from its selected
+submission`, `candidate_groups::completion_hold`); it uses the first
+remaining accepted submission, or refuses before any write.
+
+**Raw SQL.** None of these holds is enforced by triggers: a raw
+`candidate_selections`, `dependency_satisfactions`, `pending_integration_work`
+or `operations` write can still integrate an arm, record a satisfaction or
+request completion. The holds live in the store's readers and writers;
+triggers would be a schema change (not made; follow-up).
 
 ## 4. Selectors and paired outcomes (TM3.8, card C4)
 

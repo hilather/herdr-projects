@@ -1176,11 +1176,35 @@ impl IntegrationLab {
         let objects: Vec<serde_json::Value> = self.git(&["rev-list", "--objects", "--all"]).lines()
             .map(|line| { let oid = line.split_whitespace().next().unwrap(); json!({"oid": oid, "relative_path": format!("{}/{}", &oid[..2], &oid[2..])}) }).collect();
         let key = if attempt == format!("{task}-attempt") { format!("{task}-key") } else { format!("{attempt}-key") };
+        // A later submission of the same attempt needs its own idempotency key.
+        let key = if self.db().query_row("SELECT EXISTS(SELECT 1 FROM result_submissions WHERE attempt_id=?1)", [attempt], |r| r.get(0)).unwrap() { format!("{key}-{}", &candidate[..12]) } else { key };
         let result = self.home.path().join(format!("{key}-result.json"));
         fs::write(&result, json!({"idempotency_key": key, "task_id": task, "contract_revision": 1, "contract_digest": contract_digest,
             "attempt_id": attempt, "repository": repository, "base_oid": self.base, "candidate_oid": candidate, "object_format": "sha256",
             "artifact_manifest": [{"path": "src/lib.rs", "oid": candidate}], "claimed_checks": ["all checks passed"], "objects": objects}).to_string()).unwrap();
         self.ok(&["result", "demo", "submit", "--input-file", result.to_str().unwrap()])["submission_id"].as_str().unwrap().to_owned()
+    }
+    /// Make `attempt` its task's active attempt with a started worker, as a
+    /// launch would record it (attempt inputs and `runtime.launch_started`).
+    fn started(&self, task: &str, attempt: &str) {
+        let db = self.db();
+        db.execute("UPDATE tasks SET active_attempt=?2 WHERE id=?1", [task, attempt]).unwrap();
+        let operation = format!("op-{attempt}");
+        db.execute("INSERT INTO operations(id,task_id,kind,target,payload_version,payload,payload_hash,expected_revision,due_unix_ms,idempotency_key) VALUES(?1,?2,'runtime.launch','binding',1,'{}',?3,1,0,?1)",
+            rusqlite::params![operation, task, format!("{:x}", Sha256::digest(b"{}"))]).unwrap();
+        let inputs = r#"{"inputs":{"version":2,"effective_profile":{}}}"#;
+        db.execute("INSERT INTO attempt_inputs(attempt_id,operation_id,payload,payload_hash) VALUES(?1,?2,?3,?4)", rusqlite::params![attempt, operation, inputs, format!("{:x}", Sha256::digest(inputs.as_bytes()))]).unwrap();
+        db.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_started',?1,1,1,'{}')", [&operation]).unwrap();
+    }
+    /// `task demo complete <task>` at the task's current revision.
+    fn complete(&self, task: &str) -> std::process::Output {
+        let revision: i64 = self.db().query_row("SELECT revision FROM tasks WHERE id=?1", [task], |r| r.get(0)).unwrap();
+        self.hp(&["task", "demo", "complete", task, "--expected-revision", &revision.to_string()])
+    }
+    /// The submissions named by `task`'s completion requests.
+    fn completion_requests(&self, task: &str) -> Vec<String> {
+        self.db().prepare("SELECT json_extract(e.payload,'$.submission') FROM events e JOIN attempts a ON a.id=e.entity WHERE e.kind='attempt.completion_requested' AND a.task_id=?1 ORDER BY e.sequence").unwrap()
+            .query_map([task], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
     }
     /// Retained native profiles `codex` and `fast` (distinct configurations,
     /// as `profile prepare` would retain them); returns their configuration ids.
@@ -1426,9 +1450,10 @@ fn unselected_arm_does_not_integrate_until_selection_and_winner_is_queued() {
 /// `admission_disabled:verified_result`); `bx` never does, though its
 /// satisfaction row names X's verified result. Neither group has a selection,
 /// so `bg` and `bh` stay blocked although each edge records its latest
-/// attempt's (arm 2's) result. The rule selects G's arm 1: arm 2 lost, so `bg`
-/// stays blocked (and arm 1 is not the latest attempt). The operator selects
-/// H's arm 2: `bh` counts.
+/// attempt's (arm 2's) result. The rule selects G's arm 1: the edge moves to
+/// arm 1's result and `bg` counts, though arm 1 is not the latest attempt
+/// (`selected_earlier_arm_releases_verified_result_dependents`). The operator
+/// selects H's arm 2: `bh` counts.
 #[test]
 fn seeded_or_unselected_result_never_releases_dependents() {
     let lab = IntegrationLab::new();
@@ -1469,11 +1494,143 @@ fn seeded_or_unselected_result_never_releases_dependents() {
 
     let g = lab.telemetry(&["quality", "groups", "select", &arms[&("g", 0)], "--rule"])["selection"].clone();
     assert_eq!((&g["arm"], &g["submission_id"]), (&json!(1), &json!(arms[&("g", 1)])));
-    assert_eq!(lab.blockers("bg"), missing("g"), "the losing arm 2 never releases");
+    assert_eq!((edge("bg"), lab.blockers("bg")), (results[&("g", 1)].clone(), counts.clone()), "the selected earlier arm releases; the losing arm 2 does not");
     let h = lab.telemetry(&["quality", "groups", "select", &arms[&("h", 0)], "--arm", "2", "--reason", "operator_judgment"])["selection"].clone();
     assert_eq!((&h["arm"], &h["submission_id"]), (&json!(2), &json!(arms[&("h", 2)])));
     assert_eq!(lab.blockers("bh"), counts, "the selected arm releases its group's dependent");
     assert_eq!((lab.blockers("bx"), lab.blockers("bc")), (missing("x"), counts.clone()));
+}
+
+/// Owner decision "integration held until a selection exists" on the
+/// dependency path (contracts-quality.md §3). Groups G (task `g`) and S (task
+/// `s`) each seal arms 1 `codex` and 2 `fast`, bound to attempts `*-a1` then
+/// `*-a2`; `bg` and `bs` are queued on their `verified_result`. G's arm 1
+/// verifies first, then arm 2 (the latest attempt): the edge records arm 2's
+/// result and `bg` is blocked. The rule selects arm 1: the selection moves the
+/// edge to arm 1's result and `bg` counts, though arm 1 is not the latest
+/// attempt. Arm 2 then verifies a second submission, and an unbound retry
+/// `g-a3` (now the latest attempt) verifies one too: neither displaces the
+/// winner; the edge history is arm 2 (invalid) then arm 1 (valid). S's arm 1
+/// is a registered seeded candidate: selected by the operator, its result is
+/// recorded on `bs`'s edge but `bs` stays blocked.
+#[test]
+fn selected_earlier_arm_releases_verified_result_dependents() {
+    let lab = IntegrationLab::new();
+    let (codex, fast) = lab.arm_profiles();
+    let seed = seed_fixture("logic-inverted-guard");
+    let clean = seed_set()["clean"].as_str().unwrap().to_owned();
+    let (mut digests, mut groups) = (std::collections::BTreeMap::new(), std::collections::BTreeMap::new());
+    for task in ["g", "s"] {
+        digests.insert(task, lab.contract(task));
+        groups.insert(task, lab.telemetry(&["quality", "groups", "create", task, "--arm", "codex", "--arm", "fast"])["group"]["group_id"].as_str().unwrap().to_owned());
+        lab.attempt(task, &format!("{task}-a1"), Some((&groups[task], 1, &codex)));
+        lab.attempt(task, &format!("{task}-a2"), Some((&groups[task], 2, &fast)));
+    }
+    lab.queue_dependent("bg", "g");
+    lab.queue_dependent("bs", "s");
+    let missing = |p: &str| vec![format!("verified_dependency_evidence_unavailable:{p}:verified_result")];
+    let counts = vec!["admission_disabled:verified_result".to_owned()];
+    let edge = |consumer: &str| lab.db().query_row("SELECT evidence_id FROM dependency_satisfactions WHERE task_id=?1 AND state='valid'", [consumer], |r| r.get::<_, String>(0)).unwrap();
+    let submit = |task: &str, attempt: &str, source: &str, branch: &str| lab.result(task, attempt, &digests[task], &lab.candidate(branch, source));
+
+    let g1 = submit("g", "g-a1", &format!("{clean}// g-a1\n"), "g-a1");
+    let g2 = submit("g", "g-a2", &format!("{clean}// g-a2\n"), "g-a2");
+    let r1 = lab.verify(&g1, "verify-g1");
+    let r2 = lab.verify(&g2, "verify-g2");
+    assert_eq!((edge("bg"), lab.blockers("bg")), (r2.clone(), missing("g")), "the edge records the latest arm, which is held");
+    let selection = lab.telemetry(&["quality", "groups", "select", &groups["g"], "--rule"])["selection"].clone();
+    assert_eq!((&selection["arm"], &selection["submission_id"]), (&json!(1), &json!(g1)));
+    assert_eq!((edge("bg"), lab.blockers("bg")), (r1.clone(), counts.clone()), "the selected earlier arm releases its dependent");
+
+    // Neither the losing arm nor a later retry of this revision displaces the winner.
+    let g2b = submit("g", "g-a2", &format!("{clean}// g-a2 again\n"), "g-a2-again");
+    lab.verify(&g2b, "verify-g2b");
+    assert_eq!((edge("bg"), lab.blockers("bg")), (r1.clone(), counts.clone()), "arm 2 verified after the selection");
+    lab.attempt("g", "g-a3", None);
+    let g3 = submit("g", "g-a3", &format!("{clean}// g-a3\n"), "g-a3");
+    lab.verify(&g3, "verify-g3");
+    assert_eq!((edge("bg"), lab.blockers("bg")), (r1.clone(), counts.clone()), "an unbound later attempt");
+    let history: Vec<(String, String)> = lab.db().prepare("SELECT evidence_id,state FROM dependency_satisfactions WHERE task_id='bg' ORDER BY rowid").unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<Result<_, _>>().unwrap();
+    assert_eq!(history, vec![(r2, "invalid".to_owned()), (r1, "valid".to_owned())]);
+
+    // A selected seeded candidate is still excluded (contracts-review.md §8).
+    let s1 = submit("s", "s-a1", seed["seeded"].as_str().unwrap(), "s-seeded");
+    let s2 = submit("s", "s-a2", &format!("{clean}// s-a2\n"), "s-a2");
+    lab.telemetry(&["review", "seeds", "register", &s1, "--seed", &format!("logic={}", reproducer_ref(&seed))]);
+    let rs1 = lab.verify(&s1, "verify-s1");
+    lab.verify(&s2, "verify-s2");
+    let selection = lab.telemetry(&["quality", "groups", "select", &groups["s"], "--arm", "1", "--reason", "operator_judgment"])["selection"].clone();
+    assert_eq!(selection["submission_id"], json!(s1));
+    assert_eq!((edge("bs"), lab.blockers("bs")), (rs1, missing("s")), "a selected seeded candidate never releases a dependent");
+    assert_eq!(lab.blockers("bg"), counts);
+}
+
+/// `task complete` never ends a task from a seeded candidate or a held arm
+/// (contracts-quality.md §3, contracts-review.md §8). Task `x`'s accepted
+/// submission is a registered seeded candidate: completion is refused and
+/// writes nothing, while clean control `c` completes. Group G (task `g`) binds
+/// arms 1 and 2; both verify and arm 2 is the active, started attempt: refused
+/// before any selection and again after the rule selects arm 1 (arm 2 lost).
+/// Group H (task `h`): arm 2's attempt verifies two submissions and the
+/// operator selects its second: completion is allowed and names that selected
+/// submission, not the arm's first.
+#[test]
+fn seeded_or_held_submission_cannot_complete_the_task() {
+    let lab = IntegrationLab::new();
+    let (codex, fast) = lab.arm_profiles();
+    let seed = seed_fixture("logic-inverted-guard");
+    let clean = seed_set()["clean"].as_str().unwrap().to_owned();
+    let refused = |task: &str, reason: &str| {
+        let head = || lab.db().query_row("SELECT max(sequence) FROM events", [], |r| r.get::<_, i64>(0)).unwrap();
+        let before = head();
+        let out = lab.complete(task);
+        assert!(!out.status.success(), "{task} completed");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(reason), "{stderr}");
+        assert_eq!((head(), lab.completion_requests(task)), (before, vec![]), "{task}: nothing written");
+    };
+    let completed = |task: &str| { let out = lab.complete(task); assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr)); };
+
+    let x = lab.submit("x", &lab.candidate("seeded", seed["seeded"].as_str().unwrap()));
+    let c = lab.submit("c", &lab.candidate("clean", &clean));
+    lab.telemetry(&["review", "seeds", "register", &x, "--seed", &format!("logic={}", reproducer_ref(&seed))]);
+    lab.telemetry(&["review", "seeds", "register", &c, "--control"]);
+    lab.verify(&x, "verify-x");
+    lab.verify(&c, "verify-c");
+    let mut groups = std::collections::BTreeMap::new();
+    let mut subs = std::collections::BTreeMap::new();
+    for task in ["g", "h"] {
+        let digest = lab.contract(task);
+        groups.insert(task, lab.telemetry(&["quality", "groups", "create", task, "--arm", "codex", "--arm", "fast"])["group"]["group_id"].as_str().unwrap().to_owned());
+        for (arm, configuration) in [(1, &codex), (2, &fast)] {
+            let attempt = format!("{task}-a{arm}");
+            lab.attempt(task, &attempt, Some((&groups[task], arm, configuration)));
+            let submission = lab.result(task, &attempt, &digest, &lab.candidate(&attempt, &format!("{clean}// {attempt}\n")));
+            lab.verify(&submission, &format!("verify-{attempt}"));
+            subs.insert((task, arm), submission);
+        }
+        if task == "h" {
+            let second = lab.result(task, "h-a2", &digest, &lab.candidate("h-a2-second", &format!("{clean}// h-a2 second\n")));
+            lab.verify(&second, "verify-h-a2-second");
+            subs.insert((task, 3), second);
+        }
+    }
+    // The fixture's launch records are minimal: nothing reads a snapshot after this.
+    for (task, attempt) in [("x", "x-attempt"), ("c", "c-attempt"), ("g", "g-a2"), ("h", "h-a2")] { lab.started(task, attempt); }
+    refused("x", "a seeded candidate never completes its task");
+    completed("c");
+    assert_eq!(lab.completion_requests("c"), vec![c]);
+    let held = "a candidate group's task completes only from its selected submission";
+    refused("g", held);
+    refused("h", held);
+    let g = lab.telemetry(&["quality", "groups", "select", &groups["g"], "--rule"])["selection"].clone();
+    assert_eq!(g["submission_id"], json!(subs[&("g", 1)]));
+    refused("g", held);
+    let h = lab.telemetry(&["quality", "groups", "select", &groups["h"], "--arm", "2", "--submission", &subs[&("h", 3)], "--reason", "operator_judgment"])["selection"].clone();
+    assert_eq!(h["submission_id"], json!(subs[&("h", 3)]));
+    completed("h");
+    assert_eq!(lab.completion_requests("h"), vec![subs[&("h", 3)].clone()], "completion names the selected submission, not the arm's first");
 }
 
 /// Doc 10 §5 seeded-review fixture. Seeded candidates S1–S4 (starter seeds

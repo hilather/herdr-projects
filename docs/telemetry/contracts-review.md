@@ -671,8 +671,17 @@ a dependent task's `verified_result` edge: `satisfaction.rs`
 blockers, reservation dependency evidence, dependency waits), returns
 false for it (`seeded_defects::seeded_result`). The satisfaction row may
 still be recorded when the result is verified, including before
-registration; it never counts. `integrated_commit` edges need an
-integration, which the integration guard already refuses.
+registration; it never counts, even when the seeded submission is its
+candidate group's selection (the selected-winner currency relaxation of
+contracts-quality.md §3 does not lift this guard). `integrated_commit`
+edges need an integration, which the integration guard already refuses.
+
+**Completion guard.** `task complete` never marks a task succeeded from a
+seeded candidate: `request_completion` skips it (`a seeded candidate never
+completes its task`) and refuses before any write when no other accepted
+submission of the active attempt remains. Clean controls complete
+normally. Like the dependency guard, this is enforced in the store, not
+by triggers.
 
 **Blindness.** Reviewers never see seed state: `review present` reads no
 registry table and refuses to print any field outside its twelve blind

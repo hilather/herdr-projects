@@ -50,6 +50,12 @@ pub(super) fn seeded_result(tx: &Connection, result_id: &str) -> Result<bool> {
         [result_id], |r| r.get(0))?)
 }
 
+/// Whether submission `submission` is a seeded candidate.
+pub(super) fn seeded_submission(tx: &Connection, submission: &str) -> Result<bool> {
+    if !registry_present(tx)? { return Ok(false); }
+    Ok(tx.query_row("SELECT EXISTS(SELECT 1 FROM seeded_candidates WHERE submission_id=?1 AND arm='seeded')", [submission], |r| r.get(0))?)
+}
+
 /// Refuse to begin integrating a verified result of a seeded candidate.
 pub(super) fn refuse_seeded_integration(tx: &Connection, result_id: &str) -> Result<()> {
     if seeded_result(tx, result_id)? { return Err(StoreError::Invalid("a seeded candidate never integrates".into())); }

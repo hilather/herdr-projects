@@ -72,6 +72,18 @@ pub(super) fn held_result(tx: &Connection, result_id: &str) -> Result<bool> {
         [result_id], |r| r.get(0))?)
 }
 
+/// Why submission `submission` may not complete its task
+/// (`request_completion`), if it may not: it is [`HELD_ARM`], or its task has
+/// a candidate group for its contract revision and it is not that group's
+/// selected submission. Ending the task early would end its remaining arms.
+pub(super) fn completion_hold(tx: &Connection, submission: &str) -> Result<Option<&'static str>> {
+    if !groups_present(tx)? { return Ok(None); }
+    let held: bool = tx.query_row(&format!("SELECT {HELD_ARM} OR EXISTS(SELECT 1 FROM candidate_groups g WHERE g.task_id=s.task_id AND g.contract_revision=s.contract_revision
+            AND NOT EXISTS(SELECT 1 FROM candidate_selections x WHERE x.group_id=g.group_id AND x.outcome='selected' AND x.submission_id=s.submission_id))
+        FROM result_submissions s WHERE s.submission_id=?1"), [submission], |r| r.get(0))?;
+    Ok(held.then_some("a candidate group's task completes only from its selected submission"))
+}
+
 /// Refuse to begin integrating a verified result of a held arm.
 pub(super) fn refuse_held_integration(tx: &Connection, result_id: &str) -> Result<()> {
     if held_result(tx, result_id)? { return Err(invalid("a candidate-group arm integrates only as its group's selection".into())); }
@@ -247,6 +259,12 @@ fn insert_selection(tx: rusqlite::Transaction<'_>, d: Decision<'_>) -> Result<Ca
         AND EXISTS(SELECT 1 FROM verified_results r WHERE r.submission_id=s.submission_id)
         AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.kind='integration.run' AND json_extract(o.payload,'$.submission_id')=s.submission_id)
         AND NOT EXISTS(SELECT 1 FROM verified_results r JOIN integration_operations i ON i.verified_result_id=r.result_id WHERE r.submission_id=s.submission_id)", [&submission])?;
+    // It may also release `verified_result` dependents now, though its attempt
+    // need not be the task's latest (satisfaction::current_clause).
+    if submission.is_some() {
+        let task: String = tx.query_row("SELECT task_id FROM candidate_groups WHERE group_id=?1", [d.group], |r| r.get(0))?;
+        super::satisfaction::attach_selected(&tx, &task)?;
+    }
     tx.commit()?;
     Ok(CandidateSelection { group_id: d.group.to_owned(), outcome: outcome.into(), arm, attempt_id: attempt, submission_id: submission, selector_kind: d.kind.into(),
         selector_principal: d.principal.to_owned(), reason: d.reason.to_owned(), evidence, selected_unix_ms: d.now })

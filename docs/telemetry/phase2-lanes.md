@@ -145,10 +145,13 @@ merges one PR at a time.
   and every selector queues a verified winner. `groups show` reports
   `integration_hold.enforced=true` and still lists candidates that
   integrated without a selection. An unselected arm also never releases a
-  `verified_result` dependent (contracts-quality.md §3). Still open: a
-  winner that is not the task's latest attempt cannot satisfy a
-  `verified_result` edge (attempt currency in `satisfaction.rs`), and raw
-  SQL is not guarded for arms (needs triggers, a schema change).
+  `verified_result` dependent (contracts-quality.md §3). **Done (H2):** a
+  selected winner that is not the task's latest attempt now satisfies a
+  `verified_result` edge (the selection is the current result of its
+  revision; nothing later displaces it; seeded stays excluded), and `task
+  complete` refuses a seeded or held submission. Still open: raw SQL is
+  not guarded for arms, selections, satisfactions or completion requests
+  (needs triggers, a schema change).
 - **Done (C5):** **C5 M42 uncertainty** (lane C): a group-level percentile bootstrap with a
   recorded seed. **Min-sample registry** (TM4.1): replaces the constant 10.
   **Shared `arm_outcome` helper** (steward re-export). **Judge
