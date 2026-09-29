@@ -42,7 +42,9 @@ pub fn run(project: &Path, command: Command) -> Result<String> {
 /// Metrics merged into `telemetry <slug> report` (`super::metrics::report`).
 /// Empty until `metrics::text` (steward) renders lane metrics: the fleet pane
 /// must show every reported metric. M45 is `quality report` meanwhile.
-pub fn metrics(_project: &Path, _since: Option<i64>) -> Result<BTreeMap<String, Value>> { Ok(BTreeMap::new()) }
+pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> {
+    Ok(BTreeMap::from([("M45".to_owned(), proxy::m45(project, since)?)]))
+}
 
 /// Ticker telemetry pass, after the Codex collect, within `budget`. Writes only
 /// an existing sidecar and runs at most `TICK_DIFFS` diffs per pass.

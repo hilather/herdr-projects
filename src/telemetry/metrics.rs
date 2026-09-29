@@ -175,8 +175,12 @@ pub fn text(report: &Value) -> String {
         other => other.to_string(),
     };
     let mut out = String::new();
-    for (id, name) in NAMES {
-        let m = &report["metrics"][id];
+    // Every metric in the report, in id order (central and lane-provided alike);
+    // a metric's own `name` wins, else the central name.
+    let Some(metrics) = report["metrics"].as_object() else { return out };
+    for (id, m) in metrics {
+        let id = id.as_str();
+        let name = m["name"].as_str().or_else(|| NAMES.iter().find(|(n, _)| *n == id).map(|(_, name)| *name)).unwrap_or("");
         match m["decisions"].as_array() {
             Some(list) if list.is_empty() => out += &format!("{id} {name} n/a (no_decisions)\n"),
             Some(list) => for d in list {
