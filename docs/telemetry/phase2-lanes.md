@@ -159,3 +159,25 @@ merges one PR at a time.
 - **Attention certification** (live run): Codex approval prompt shows as
   `blocked`; typed reasons would unlock M33. A finer attention sampler than
   the 300 s telemetry pass; remote routes; declared intervals.
+
+### From the live A4 certification run (codex-live-0.154.0-a4.md)
+- **A5** (lane A): collect the guardian's `session_meta.parent_thread_id`,
+  `session_meta.session_id` and `thread_source` (a guardian's usage records
+  carry the parent's `session_id`). Then B2 can link guardians to their
+  parent.
+- **Attention basis live** (lane B): the Codex approval prompt was observed
+  as Herdr `blocked`. Flip B6b's signal basis from `fixture` to `live`
+  (auto-reviewed approvals never show `blocked`; say so).
+- **Quota account identity** (lane B): two execution homes holding one login
+  report identical windows. B4 keys accounts by home digest, so one account
+  appears twice. Proposal: treat snapshots with the same limit, kind and
+  `resets_at` from different homes as one account-window, or report
+  `account_basis: execution_home` explicitly. `resets_at` was fixed within a
+  window (no jitter observed).
+- **B5 tool metadata** (steward §7 review first): 0.154.0 has no
+  `exec_command_end`/`mcp_tool_call_end`. Tool metadata lives in
+  `response_item` `custom_tool_call`/`function_call` (+ `*_output` by
+  `call_id`) and `event_msg/item_completed` `CommandExecution` (id, status,
+  exit_code). The exec item's `duration` is not the command's run time. The
+  proposed allowlist is in the live doc; `response_item` is content-forbidden
+  under §7 today. MCP shapes are still unobserved.
