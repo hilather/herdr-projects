@@ -463,10 +463,15 @@ no code path may read it.
 
 ## 8. Deferred (explicit)
 
-Attention intervals and M31–M33 (S4); transactional outbox and
-`CollectorBinding` process (TM0.4/TM1.1); spool; budget bridge and any
-change to `UnknownUsagePolicy` (TM2.4); cost, rate cards, M04/M11/M12;
-Claude and OTLP adapters; candidate groups and races; stochastic assignment
-policies; proxy signals; review/finding attribution; coordinator digest,
+Attention intervals and M31–M33 (S4); transactional outbox (TM0.4);
+spool; budget bridge and any change to `UnknownUsagePolicy` (TM2.4);
+provider charges, invoice allocation and currency conversion; M04/M11/M12;
+Claude and OTLP adapters; candidate-group selection and races; stochastic
+assignment policies; review/finding attribution; coordinator digest,
 sidebar suffix and inbox alerts; retention jobs and restore; configuration
 staleness (M50); resume/compaction reconciliation beyond quarantine.
+
+Landed since phase 1 (see the lane contracts): collector bindings
+(contracts-collection.md), usage ledger, session graph and rate-card
+estimates (contracts-accounting.md §2–§4), proxy signals and integration
+outcomes (contracts-quality.md §1–§2).
