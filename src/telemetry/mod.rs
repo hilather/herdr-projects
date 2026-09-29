@@ -3,11 +3,13 @@
 pub mod accounting;
 pub mod codex;
 pub mod collectors;
+pub mod ingest;
 pub mod metrics;
 pub mod outcome;
 pub mod panel;
 pub mod quality;
 pub mod review;
+pub mod sanitize;
 pub mod sidecar;
 
 /// One phase-2 lane's hooks (docs/telemetry/phase2-lanes.md), each defined in

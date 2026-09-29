@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use super::collectors::{ingest, sanitize};
+use super::{ingest, sanitize};
 
 /// Versions whose counters are accepted: each certified by a live run
 /// (`0.154.0`: docs/telemetry/codex-live-0.154.0.md).

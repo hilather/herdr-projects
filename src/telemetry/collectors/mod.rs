@@ -11,12 +11,6 @@ pub const STREAM: &str = "ingest";
 pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/ingest/0001_source_bindings.sql"),
     include_str!("../../../migrations/telemetry/ingest/0002_source_observations.sql")];
 
-// Lane A files outside this directory, declared here so `super::mod.rs` (steward) is unchanged.
-#[path = "../ingest/mod.rs"]
-pub mod ingest;
-#[path = "../sanitize.rs"]
-pub mod sanitize;
-
 /// `herdr-projects telemetry <slug> collectors ...`
 #[derive(clap::Subcommand)]
 pub enum Command {
