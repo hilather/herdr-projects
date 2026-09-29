@@ -1,0 +1,8 @@
+# INVENTED synthetic exchange rates for tests; not a market rate.
+synthetic = true
+table_id = "synthetic-fx"
+version = 2
+source = "INVENTED synthetic exchange rates for tests; not a market rate"
+rates = [
+  { from = "EUR", to = "USD", rate = "1.2", effective_from_unix_ms = @BOUNDARY@ },
+]

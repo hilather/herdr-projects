@@ -1,0 +1,9 @@
+{
+  "synthetic": true,
+  "source": "INVENTED synthetic provider charge correction for tests; not a provider export",
+  "provider": "synthetic",
+  "product": "codex",
+  "charges": [
+    {"charge_id": "ch-1", "revision": 2, "currency": "USD", "amount": "0.0080", "response_id": "resp-c1"}
+  ]
+}

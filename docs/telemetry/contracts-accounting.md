@@ -60,8 +60,10 @@ counted entries (delta, an `accepted` disposition) of certified sessions, with
 the §6 `coverage`. They are derived from the Codex tables at report time, so
 they need no prior sync. It also provides M38 and M39, both `unavailable`
 (§5), M31–M33 (§6), M16–M18 (§9, derived from A6 tool metadata at read
-time), M34–M37 (§10, derived from canonical rows at read time) and M12/M14
-(§12, from the latest stored valuation revision).
+time), M34–M37 (§10, derived from canonical rows at read time), M12/M14
+(§12, from the latest stored valuation revision), M11 (§13, from imported
+provider charges) and M04 (§14, from the latest valuation revision and
+canonical task evidence).
 
 ## 3. Session graph and model segments (B2, TM2.2)
 
@@ -203,8 +205,8 @@ from revision *n* (so repeated reprices and re-syncs append nothing). Each
 row copies the quantities it priced, so later syncs never change an earlier
 revision, and repricing never changes measured tokens. From stream version 9
 a revision stores only the rows that changed since the previous one (§12). Basis is always
-`published_rate_estimate`; there are no provider charges, and an estimate is
-never added to one.
+`published_rate_estimate`; provider charges and invoices are separate bases
+(§13), and an estimate is never added to one.
 
 Usage time: an entry's usage interval is its A4 record time
 (`codex_usage_times.record_unix_ms`, the `token_usage_record` line
@@ -936,3 +938,243 @@ no card the pass syncs and appends nothing (`not_priced`); card version 1
 changed syncs again but records no reprice; version 2 → revision 2 `0.006`,
 one changed row stored. M12/M14 partial and mixed-currency cases and the
 full-copy read-back are in `repricing_uses_rate_effective_at_usage_time`.
+
+## 13. Provider charges, invoice allocation, dated conversion and `as_of` (B11, TM2.3 remainder)
+
+Stream `accounting` version 10 (`0010_charges_fx.sql`). Plan: doc 05 §5
+(cost bases, corrections, `as_of`), doc 07 M11, doc 08 §3 (as-of), doc 10
+§3. Everything imported here is **fixture-only**, like the rate cards (§4):
+an import file must say `synthetic: true` and name its `source`, or it is
+refused; the only files in the repo are invented test values
+(`tests/fixtures/telemetry/accounting/charges-*`, `fx-*`). Outputs carry
+`fixture_only`.
+
+**Charges and invoices** (`provider_charges`, `provider_invoices`) are
+appended by `accounting import-charges <file>` (TOML by extension, else
+JSON): `provider`, `product`, `source`, `synthetic`, then `charges [{charge_id,
+revision, currency, amount, response_id?, session_id?, charged_unix_ms?}]`
+and `invoices [{invoice_id, revision, kind: usage|subscription, currency,
+amount, period_from_unix_ms, period_to_unix_ms}]` (half-open period).
+Amounts are decimal strings (≤ 18 digits, ≤ 12 places, canonicalized; a
+number is refused). Both are append-only (triggers): the same revision with
+the same digest is a no-op, with another digest refused, and a new revision
+must be the next one. A correction is the next revision: `history` lists
+every revision with its signed `adjustment` (doc 05 §7: 0.0100 → 0.0080 is
+`-0.002`; the current amount is 0.008).
+
+**`accounting charges [--as-of MS]`** (read-only, JSON): basis
+`provider_billed`. Each charge's latest revision imported by `as_of` (all
+without), reconciled against the valuation revision of that instant
+(§12; the latest computed by `as_of`):
+- Match: by the native `response_id` against the ledger's delta entries
+  (plus `session_id` when given): one entry `matched_by: response_id`; several
+  `ambiguous_match`; none `no_matching_usage`. A charge naming only a
+  `session_id` matches every entry of that session (`matched_by:
+  session_id`). Neither: `no_request_identity`. Two charges claiming one
+  entry are both `overlapping_charges` (never charged twice). Before any
+  reprice every charge is `not_priced`. Unmatched charges are listed with
+  their reason and counted in `reconciliation.unmatched`.
+- Matched: the `estimate` of the matched entries (as `cost`: complete,
+  partial or unavailable) and `difference` = charge − estimate (signed,
+  exact) only when the estimate is complete in the charge's currency; else
+  `unavailable` `estimate_partial`, `estimate_unavailable` or
+  `currency_differs` (no implicit conversion). A non-zero difference lists
+  the evidence that can explain it (`explanations`): what the rate cards
+  used exclude (`estimate_excludes_{discounts,taxes,fees}`) and
+  `rate_cards_fixture_only`. They are candidates, not proof.
+- `reconciliation.uncharged_estimates`: the estimate of the entries no charge
+  matched, apart. `provider_billed {currency: sum}`: the current amounts of
+  every charge, matched or not. An estimate is never added to a charge.
+- `invoices`: each invoice's latest revision with its history.
+
+**Invoice allocation** (`accounting allocate <invoice> [--rule R] [--as-of
+MS]`, read-only, JSON, basis `invoice_allocation`): derived at read time from
+the invoice revision and the valuation revision as of that instant, both
+append-only, so `--as-of` reproduces an earlier allocation. Rules are named
+and versioned; the one rule is `by_total_tokens.v1`: share = an attempt's
+Codex `total_tokens` (new + cached input + output, from the quantities the
+revision copied) of counted entries whose usage interval lies inside the
+period / all such tokens. Amounts are computed in units of 10^-12 of the
+invoice currency. Floors are taken first, then the remaining units go one each
+to the largest remainders (ties by key), so the allocations sum to the
+invoice exactly. Tokens of unbound sessions go to `unattributed` (a share, not
+an attempt). Entries outside the period are counted in
+`coverage.outside_period`. An entry in the period whose usage is not counted
+(`usage_not_counted`), without a usage time (`usage_time_unknown`) or
+straddling a period boundary (`usage_interval_straddles_period`) makes the
+allocation `partial` (`usage_unknown_in_period`): the known shares are
+labelled `bound: upper`, and the unknown usage is listed per attempt as
+`unavailable`, never 0. With no known tokens the allocation is `unavailable`
+(`no_usage_in_period` / `usage_unknown_in_period`). A subscription can be
+allocated the same way. The result is never added to estimates or charges.
+
+**Dated conversion** (`fx_tables`, `fx_rates`): `accounting import-fx <file>`
+appends an exchange-rate table version (`table_id`, `version`, `source`,
+`synthetic`, `rates [{from, to, rate, effective_from_unix_ms,
+effective_to_unix_ms?}]`, one unit of `from` in `to`, half-open, no overlaps
+per pair within a version; append-only like rate cards).
+`accounting fx --to CUR [--revision N | --as-of MS]` (read-only, JSON)
+converts the stored estimates of that valuation revision, using tables
+imported by `as_of`. It is a separate dated valuation (`valuation:
+dated_fx_conversion`), and the stored estimates keep their own currency. Per
+priced entry: the same currency is kept (`same_currency`). Otherwise the rate
+of `from → to` is the one effective over the entry's whole usage interval
+(`dated_by: usage_interval`): the highest version among the overlapping
+rates of one table. The result is `amount × rate`, exact, with `rate_id`
+(`<table>@<version>:<from>-><to>@<effective_from>`), the table, version and
+interval. No inverse or cross rate is inferred. The unavailable reasons are
+`no_fx_rate`, `ambiguous_fx_tables`, `fx_rate_change_within_usage_interval`
+and `usage_time_unknown`. Unpriced entries keep their reason. Per attempt the
+converted `estimate` is complete only when every entry is priced and
+converted, else partial or unavailable, as in `cost`.
+
+**Time-based `as_of`.** Valuation revisions carry `computed_unix_ms` (§4).
+`accounting cost --as-of MS` shows the latest revision computed at or before
+`MS`, byte-identical to `--revision N` of that revision (the two flags
+conflict). Before the first revision it shows `unavailable not_priced_as_of`
+(`not_priced` when nothing was ever priced). `charges`, `allocate`, `fx` and
+`budget-shadow` (§14) take `--as-of` the same way for the valuation revision
+and, for charges, invoices and exchange-rate tables, their
+`imported_unix_ms`. `as_of` fixes what the sidecar knew, not what producers
+had observed (doc 08 §3).
+
+**M11 `reported_spend_subtotal`** (`M11.charges-v1`, report hook): Σ of the
+latest revision of every provider charge per currency (corrections as
+adjustments), basis `provider_billed`, `charges: fixture_only`,
+`never_added_to: M12`, `invoices_separate` (count). One currency gives
+`value` + `currency`; several give `unavailable mixed_currency
+{by_currency}`; none `no_provider_charges`. With `--since`, charges with a
+`charged_unix_ms` before it are excluded, and any charge without one makes M11
+`unavailable charge_time_unknown`.
+
+Test `provider_charges_reconcile_allocate_and_convert`: card v2 (input 2,
+cache read 0.5, output 8 per 10^6) and a EUR card. Charges:
+- ch-1 USD 0.0100 on `resp-c1` (1,000 in + 500 out → estimate 0.006) differs
+  by 0.004, with the cards' exclusions as explanations.
+- ch-2 0.0041 equals its estimate.
+- ch-3 USD against a EUR estimate is `currency_differs`.
+- ch-4 (unknown response) and ch-5 (no identity) are unmatched.
+- Uncharged estimates are partial USD 0.0016. `provider_billed` and M11 are
+  0.5164.
+
+The correction to 0.0080 appends `-0.002` (0.5144), and `--as-of` the first
+import shows 0.01. Invoice inv-1 of 12 over 2,980 bound and 500 unbound tokens
+is allocated `10.275862068966` and `1.724137931034` (sum exactly 12).
+Subscription sub-1 of 7, whose period also holds an uncounted record, is
+partial: `5.994252873563` (upper bound), `1.005747126437` unattributed, and
+the unknown entry `usage_not_counted`. EUR 0.00021 × 1.1 = USD 0.000231 by
+table version 1: version 2's 1.2 starts after the record. The attempt is
+partial USD 0.010331, while `cost` stays `mixed_currency`. Before the tables
+were imported: `no_fx_rate`. After a version-3 card appends revision 2, `cost
+--as-of` each revision's instant is byte-identical to that revision. A time
+before revision 1 is `not_priced_as_of`. `charges --as-of` before revision 2
+reconciles against revision 1.
+
+## 14. Budget bridge in shadow mode (B11, TM2.4 shadow)
+
+Plan: doc 05 §6 and §7 (budget goldens), doc 12 TM2.4 ("deliver shadow
+evidence first"). Owner decision: **shadow only**. Nothing here is enforced.
+It writes no canonical row, and admission, scheduling and the budget store
+never read it. No stream migration.
+
+**`accounting budget-shadow [--policy FILE] [--as-of MS]`** (read-only,
+JSON) opens `state.db` only through `telemetry::read_only` (§0 Reads) and
+reports `mode: shadow`, `enforcement: none`, `canonical_writes: none`. It
+reads:
+- Canonical: the budget policy history (validated as the store does:
+  consecutive revisions, `sha256(payload) = payload_hash`; else `policy:
+  unavailable policy_record_invalid`); attempts with state, task, agent kind,
+  the budget revision their launch inputs pinned (`pinned_policy_revision`)
+  and whether the lifecycle log shows they never ran.
+- Consumption: the valuation revision (latest, or by `as_of`, §13), per
+  attempt over all its sessions: provider tokens = Σ Codex `total_tokens` of
+  counted entries; money = Σ priced amounts in the policy currency. This is
+  `published_rate_estimate` from fixture-only cards, never canonically
+  accepted usage (`consumption_basis`). Unknown parts are counted by reason:
+  `usage_not_counted`, unpriced reasons, `currency_differs`, `not_priced`
+  (no revision), and for a terminal attempt with no entries,
+  `no_usage_observed` (or `adapter_absent`; an attempt the log shows never
+  ran is known zero).
+
+The decision is admission's question (doc 05 §6): accepted consumption plus
+remaining reserved exposure plus the new request, against the limit, per
+unit. An open attempt's in-flight exposure is its reservation estimate minus
+its accepted consumption. Without an estimate it is `in_flight_usage_unknown`.
+Consumption above the estimate is `reservation_overrun`; it is unknown and
+never 0. A new request without a known size is `new_request_usage_unknown`.
+Then:
+- `would_block` `limit_exceeded`: exposure > limit.
+- `would_block` `projected_exposure_exceeds_limit`: exposure + a known request
+  > limit.
+- `would_block` `no_headroom`: exposure ≥ limit with a request of unknown
+  size.
+- Any unknown part follows `UnknownUsagePolicy`: `refuse` gives
+  `would_block provider_usage_unavailable`; `allow_incomplete` gives
+  `would_warn usage_incomplete`.
+- Otherwise `allow within_limit`.
+
+Known exposure over the limit blocks whatever is unknown. Each evaluation
+carries `limit, accepted, remaining_reserved, exposure, new_request,
+projected, unknown [{attempt_id, reason, entries}], unknown_usage, decision,
+reason, attempts [{attempt_id, task_id, state, accepted, in_flight}]` (tokens
+as integers, money as exact decimal strings with `currency`).
+
+- **Canonical policy** (the latest revision, `policy_source: canonical`):
+  `decision_today` repeats what admission decides now (`blockers`,
+  `incomplete`, `provider_tokens: unknown`). The shadow evaluates `attempts`
+  (count ≥ cap blocks, as admission) and `provider_tokens` (`max_provider_tokens`
+  with the policy's `unknown_usage`; the request is unknown unless the what-if
+  file sizes it). `differs_from_canonical` compares the two (`null` without a
+  policy). Canonical budgets are project-wide:
+  `task_budgets: unavailable no_canonical_task_budget`.
+- **What-if policy** (`--policy`, `policy_source: what_if`): a synthetic file
+  (`synthetic`, `policy_id`, `version`, `source`, `unknown_usage?` (default:
+  the canonical policy's, else `refuse`), `currency?`, `project {max_amount?,
+  max_provider_tokens?}`, `tasks {<task>: {...}}`, `reservations {<attempt>:
+  {amount?, tokens?}}`, `request {task?, amount?, tokens?}`). It is never
+  installed and grants nothing. It carries the monetary limits, task limits
+  and reservation sizes that canonical policy does not have. A task scope
+  covers every attempt of the task, cancelled ones included; the request
+  counts in the project scope and in its task's scope.
+- `decision {would_block, would_warn, reasons}` over all evaluations;
+  `provenance {state_db: read_only, valuation_revision,
+  valuation_computed_unix_ms, ledger_synced_unix_ms, sidecar, what_if_policy
+  {policy_id, version, digest, synthetic, source}}`.
+
+**M04 `cost_per_accepted_task`** (`M04.cost-v1`, report hook): contracts §6
+`T`/`A` (the central `task_evidence`, same window rule). The numerator is the
+estimate over every valued entry of every attempt of the tasks in `T`, which
+includes failed and cancelled attempts and child sessions. The denominator is
+`count(A)`. `value` is `"<amount>/<count(A)>"` with `currency` only when every
+such attempt has usage and all its entries are priced in one currency.
+Otherwise it is `unavailable lifecycle_cost_incomplete`, with the numerator
+estimate (partial or unavailable) and `coverage.attempts_without_usage`.
+`count(A) = 0` gives `null empty_denominator`. Open tasks are excluded and
+counted (`tasks.open_excluded`). Basis `published_rate_estimate`,
+`rate_cards: fixture_only`, `never_added_to: M11`.
+
+Test `shadow_budget_bridge_matches_doc05_goldens` uses a per-token synthetic
+card (input 0.05, output 0.02). The cancelled attempt a1 used 1,000 in and 500
+out, so $60 is accepted. a2 is reserved at $30 (what-if); the budget is $100
+and the request $15:
+- Accepted 60, remaining 30, exposure 90, projected 105: `would_block
+  projected_exposure_exceeds_limit`.
+- After $10 of covered usage on a2: accepted 70, remaining 20, exposure 90,
+  still 105. `--as-of` revision 1 reproduces 60. A $10 request gives
+  projected 100: `allow`.
+- Without a reservation: `refuse` gives `would_block
+  provider_usage_unavailable`, and `allow_incomplete` gives `would_warn`.
+- A task limit of 80 is `limit_exceeded` (90).
+- Canonical policy (planted, `allow_incomplete`): with 5,000 tokens, 1,850
+  known and a2 in flight give `would_warn`, the same as today. With 1,000
+  tokens it gives `would_block limit_exceeded` while admission allows:
+  `differs_from_canonical: true`.
+- `state.db` and the files beside it are unchanged by every shadow read.
+- M04: `null empty_denominator` while the task is open, then `70/1` USD once
+  task `work` has a verify-only verified result (both attempts included).
+
+Follow-ups: enforcement (TM2.4 proper) needs the canonical bridge command,
+TM2.6 reconciliation and an approved unknown-usage policy (doc 05 §6);
+per-task window consumption (quota) still needs a certified invocation
+scope; M34's coordinator allocation could reuse the §13 rule machinery once a
+coordinator usage scope exists.

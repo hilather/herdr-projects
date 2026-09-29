@@ -23,21 +23,22 @@ const CATEGORIES: [&str; 4] = ["input", "cache_read", "cache_write", "output"];
 /// Text view: amounts rounded half-up to this many decimal places.
 const TEXT_PLACES: u32 = 6;
 
-/// An exact non-negative decimal: `mantissa / 10^scale`.
+/// An exact decimal: `mantissa / 10^scale`. Parsed values are non-negative;
+/// only a difference (`sub`) can be negative.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Dec {
+pub(super) struct Dec {
     mantissa: i128,
     scale: u32,
 }
 
 impl Dec {
-    const ZERO: Dec = Dec {
+    pub(super) const ZERO: Dec = Dec {
         mantissa: 0,
         scale: 0,
     };
 
     /// Plain non-negative decimal notation (a stored amount), digits only.
-    fn parse(text: &str) -> Result<Dec> {
+    pub(super) fn parse(text: &str) -> Result<Dec> {
         let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
         ensure!(
             !whole.is_empty()
@@ -57,7 +58,7 @@ impl Dec {
     }
 
     /// A rate: at most 18 digits and 12 after the point, so any amount fits exactly.
-    fn rate(text: &str) -> Result<Dec> {
+    pub(super) fn rate(text: &str) -> Result<Dec> {
         let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
         ensure!(
             fraction.len() <= 12 && whole.len() + fraction.len() <= 18,
@@ -79,7 +80,7 @@ impl Dec {
     }
 
     /// Exact sum; an overflow is an error, never a wrapped amount.
-    fn add(self, other: Dec) -> Result<Dec> {
+    pub(super) fn add(self, other: Dec) -> Result<Dec> {
         let scale = self.scale.max(other.scale);
         let widen = |d: Dec| {
             10i128
@@ -102,8 +103,34 @@ impl Dec {
         .trim()
     }
 
-    /// Rounded half-up to `places`, for presentation only.
-    fn rounded(self, places: u32) -> String {
+    /// Exact difference `self − other` (negative when `other` is larger).
+    pub(super) fn sub(self, other: Dec) -> Result<Dec> {
+        self.add(Dec { mantissa: -other.mantissa, scale: other.scale })
+    }
+
+    /// Exact product; an overflow is an error, never a wrapped amount.
+    pub(super) fn mul(self, other: Dec) -> Result<Dec> {
+        let mantissa = self.mantissa.checked_mul(other.mantissa).context("amount overflows exact arithmetic")?;
+        let scale = self.scale + other.scale;
+        ensure!(scale <= 36, "amount overflows exact arithmetic");
+        Ok(Dec { mantissa, scale }.trim())
+    }
+
+    pub(super) fn is_negative(self) -> bool { self.mantissa < 0 }
+
+    /// The value in units of `10^-places`, when it has at most `places` decimals.
+    pub(super) fn units(self, places: u32) -> Option<i128> {
+        (self.scale <= places).then(|| 10i128.checked_pow(places - self.scale).and_then(|p| self.mantissa.checked_mul(p))).flatten()
+    }
+
+    /// `units × 10^-places`.
+    pub(super) fn from_units(units: i128, places: u32) -> Dec { Dec { mantissa: units, scale: places }.trim() }
+
+    /// Rounded half-up (away from zero) to `places`, for presentation only.
+    pub(super) fn rounded(self, places: u32) -> String {
+        if self.mantissa < 0 {
+            return format!("-{}", Dec { mantissa: -self.mantissa, scale: self.scale }.rounded(places));
+        }
         let value = if self.scale <= places {
             self.at(places)
         } else {
@@ -219,7 +246,7 @@ fn canonical(mut card: CardFile) -> Result<CardFile> {
     Ok(card)
 }
 
-fn digest(bytes: &[u8]) -> String {
+pub(super) fn digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
@@ -274,7 +301,7 @@ pub fn import(db: &mut Connection, file: &Path) -> Result<Value> {
     )
 }
 
-fn table(db: &Connection, name: &str) -> Result<bool> {
+pub(super) fn table(db: &Connection, name: &str) -> Result<bool> {
     Ok(db.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
         [name],
@@ -630,24 +657,35 @@ fn run(db: &mut Connection, gate: Option<crate::telemetry::codex::Budget>) -> Re
 /// One valuation as stored and read back: a `valuations` row (with its
 /// `valuation_bases` row, if any) or a `valuation_deltas` row.
 #[derive(Clone, PartialEq)]
-struct Stored {
-    entry_id: String,
-    session_id: String,
+pub(super) struct Stored {
+    pub(super) entry_id: String,
+    pub(super) session_id: String,
     role: String,
-    attempt_id: Option<String>,
+    pub(super) attempt_id: Option<String>,
     model: Option<String>,
-    from: Option<i64>,
-    to: Option<i64>,
-    q: [Option<i64>; 4],
-    status: String,
-    reason: Option<String>,
-    card_id: Option<String>,
-    card_version: Option<i64>,
-    currency: Option<String>,
-    amount: Option<String>,
+    pub(super) from: Option<i64>,
+    pub(super) to: Option<i64>,
+    /// `[new_input, cache_read, cache_write, output]`.
+    pub(super) q: [Option<i64>; 4],
+    pub(super) status: String,
+    pub(super) reason: Option<String>,
+    pub(super) card_id: Option<String>,
+    pub(super) card_version: Option<i64>,
+    pub(super) currency: Option<String>,
+    pub(super) amount: Option<String>,
     components: Option<String>,
     usage_basis: Option<String>,
     provider_check: Option<String>,
+}
+
+impl Stored {
+    /// Codex `total_tokens` (input incl. cache reads + output incl. reasoning)
+    /// of a counted, normalized entry; `None` when its usage is not counted.
+    pub(super) fn tokens(&self) -> Option<i64> {
+        if self.reason.as_deref() == Some("usage_not_counted") { return None; }
+        let [new, cached, _, output] = self.q;
+        Some(new? + cached? + output?)
+    }
 }
 
 impl Row {
@@ -704,7 +742,7 @@ fn stored(r: &rusqlite::Row) -> rusqlite::Result<Stored> {
 /// Revision `revision` as stored: the latest full copy at or below it
 /// (written before stream version 9), then every delta above that copy up
 /// to it, in order. Keyed by entry.
-fn stored_at(db: &Connection, revision: i64) -> Result<BTreeMap<String, Stored>> {
+pub(super) fn stored_at(db: &Connection, revision: i64) -> Result<BTreeMap<String, Stored>> {
     let deltas: Vec<i64> = if table(db, "valuation_delta_revisions")? {
         db.prepare("SELECT revision FROM valuation_delta_revisions WHERE revision<=?1 ORDER BY revision")?
             .query_map([revision], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
@@ -751,7 +789,7 @@ fn stored_at(db: &Connection, revision: i64) -> Result<BTreeMap<String, Stored>>
 /// The estimate over some valuations: complete only when every entry is
 /// priced in one currency; a priced subset is labeled partial; currencies
 /// are never added together; nothing priced is unavailable, never 0.
-fn summarize(entries: &[&Value]) -> Result<(Value, Value)> {
+pub(super) fn summarize(entries: &[&Value]) -> Result<(Value, Value)> {
     let (mut by_currency, mut unpriced) = (
         BTreeMap::<String, Dec>::new(),
         BTreeMap::<String, usize>::new(),
@@ -806,7 +844,7 @@ fn summarize(entries: &[&Value]) -> Result<(Value, Value)> {
 }
 
 /// A stored valuation as `cost` shows it.
-fn valuation(s: &Stored, basis: &str) -> Result<Value> {
+pub(super) fn valuation(s: &Stored, basis: &str) -> Result<Value> {
     Ok(if s.status == "priced" {
         json!({"status": "priced", "basis": basis, "rate_card": {"card_id": s.card_id, "version": s.card_version},
             "currency": s.currency, "amount": s.amount,
@@ -817,13 +855,19 @@ fn valuation(s: &Stored, basis: &str) -> Result<Value> {
 }
 
 /// The latest revision number and its header, or `None` before any reprice.
-type Header = (i64, String, String, i64, i64);
+pub(super) type Header = (i64, String, String, i64, i64);
 
-fn header(db: &Connection, revision: Option<i64>) -> Result<Option<Header>> {
+/// Revision `revision`, else the latest one computed at or before `as_of`
+/// (`computed_unix_ms`, §13), else the latest; `None` before any reprice (or
+/// before `as_of`).
+pub(super) fn header(db: &Connection, revision: Option<i64>, as_of: Option<i64>) -> Result<Option<Header>> {
     if !table(db, "valuation_revisions")? {
         return Ok(None);
     }
-    let latest: Option<i64> = db.query_row("SELECT max(revision) FROM valuation_revisions", [], |r| r.get(0))?;
+    let latest: Option<i64> = match as_of {
+        Some(as_of) => db.query_row("SELECT max(revision) FROM valuation_revisions WHERE computed_unix_ms<=?1", [as_of], |r| r.get(0))?,
+        None => db.query_row("SELECT max(revision) FROM valuation_revisions", [], |r| r.get(0))?,
+    };
     let Some(latest) = latest else { return Ok(None) };
     let revision = revision.unwrap_or(latest);
     let Some((basis, policy, synced, computed)) = db.query_row("SELECT basis,policy,ledger_synced_unix_ms,computed_unix_ms FROM valuation_revisions WHERE revision=?1",
@@ -836,9 +880,12 @@ fn header(db: &Connection, revision: Option<i64>) -> Result<Option<Header>> {
 /// A stored revision (the latest by default) per attempt and session, as JSON.
 /// A delta revision is replayed onto the full copy below it, so every revision
 /// reads back byte-identical to when it was appended. Read-only.
-pub fn cost(db: &Connection, revision: Option<i64>) -> Result<Value> {
-    let Some((revision, basis, policy, synced, computed)) = header(db, revision)? else {
-        return Ok(super::unavailable("not_priced"));
+///
+/// `as_of` (§13) selects the latest revision computed at or before that
+/// instant; the output is byte-identical to `--revision` of that revision.
+pub fn cost(db: &Connection, revision: Option<i64>, as_of: Option<i64>) -> Result<Value> {
+    let Some((revision, basis, policy, synced, computed)) = header(db, revision, as_of)? else {
+        return Ok(super::unavailable(if as_of.is_some() && header(db, None, None)?.is_some() { "not_priced_as_of" } else { "not_priced" }));
     };
     let mut rows: Vec<Stored> = stored_at(db, revision)?.into_values().collect();
     rows.sort_by(|a, b| (&a.session_id, &a.entry_id).cmp(&(&b.session_id, &b.entry_id)));
@@ -923,7 +970,7 @@ fn unavailable_metrics(reason: &str) -> BTreeMap<String, Value> {
 /// of the entries valued. Unknown is never 0.
 pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> {
     let Some(db) = crate::telemetry::sidecar::read(project)? else { return Ok(unavailable_metrics("collection_not_run")) };
-    let Some((revision, basis, policy, synced, _)) = header(&db, None)? else { return Ok(unavailable_metrics("not_priced")) };
+    let Some((revision, basis, policy, synced, _)) = header(&db, None, None)? else { return Ok(unavailable_metrics("not_priced")) };
     let starts: BTreeMap<String, Option<i64>> = db.prepare("SELECT session_id,min(session_unix_ms) FROM rollout_sources GROUP BY session_id")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
     let mut entries = Vec::new();

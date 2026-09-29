@@ -137,8 +137,10 @@ merges one PR at a time.
   error/throttle events are certified.
 - **Per-task window consumption** (lane B, with the TM2.4 shadow bridge): needs
   a certified invocation scope; `observed_increase` is account-wide only.
-- **Provider charges, invoice allocation, dated currency conversion, time-based
-  `as_of`** (lane B, TM2.3 remainder).
+- **Done (B11, accounting 0010):** **Provider charges, invoice allocation, dated currency conversion, time-based
+  `as_of`** (lane B, TM2.3 remainder), plus the TM2.4 budget bridge in shadow
+  mode and M04/M11 (contracts-accounting.md §13–§14). Still open: enforcement
+  (TM2.4 proper, owner-gated) and real provider charge imports (fixture-only).
 - **Done (integration holds):** **Integration hold for candidate groups**
   (steward + integration; approved by the owner): `integration_jobs.rs`
   `ELIGIBLE` and `begin_integration` skip a member of an unselected group,

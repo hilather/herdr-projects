@@ -1,0 +1,17 @@
+{
+  "card_id": "synthetic-budget",
+  "version": 1,
+  "provider": "synthetic",
+  "product": "codex",
+  "models": ["gpt-5.5"],
+  "currency": "USD",
+  "rate_unit": 1,
+  "effective_from_unix_ms": 0,
+  "effective_to_unix_ms": null,
+  "includes": {"discounts": false, "taxes": false, "fees": false},
+  "source": "INVENTED synthetic per-token rates sized for the doc 05 budget goldens ($60, $10); not a provider price",
+  "rates": [
+    {"category": "input", "rate": "0.05"},
+    {"category": "output", "rate": "0.02"}
+  ]
+}

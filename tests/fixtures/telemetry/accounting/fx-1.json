@@ -1,0 +1,9 @@
+{
+  "synthetic": true,
+  "table_id": "synthetic-fx",
+  "version": 1,
+  "source": "INVENTED synthetic exchange rates for tests; not a market rate",
+  "rates": [
+    {"from": "EUR", "to": "USD", "rate": "1.10", "effective_from_unix_ms": 0, "effective_to_unix_ms": null}
+  ]
+}

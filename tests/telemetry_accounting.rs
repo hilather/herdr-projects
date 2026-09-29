@@ -920,7 +920,7 @@ fn attention_intervals_union_and_censor() {
         (serde_json::from_str(&text).unwrap_or(serde_json::Value::Null), text)
     };
     cli(&["collect"]);
-    assert_eq!(cli(&["accounting", "status"]).0, json!({"stream": "accounting", "version": 9}));
+    assert_eq!(cli(&["accounting", "status"]).0, json!({"stream": "accounting", "version": 10}));
     // Stream 8 dropped the superseded projections (v2, v4, v6); their replacements stay.
     let tables: Vec<String> = rusqlite::Connection::open(project.join(".state/telemetry.db")).unwrap()
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('session_graph','quota_observations','session_nodes','session_graph_nodes','quota_window_observations') ORDER BY name").unwrap()
@@ -1443,4 +1443,317 @@ fn fan_out_buckets_and_integration_conflicts() {
     assert_eq!(fleet["fleet"]["windows"], json!({"bucketed": 0, "excluded": {"incomplete": 1, "concurrency_unknown": 2, "outside_window": 0}}));
     assert_eq!(fleet["metrics"]["M35"]["value"], json!({"status": "unavailable", "reason": "no_complete_window"}));
     assert_eq!((&fleet["metrics"]["M36"]["value"], &fleet["metrics"]["M36"]["by_bucket"]), (&json!("3/4"), &json!({"unknown": ratio(3, 4)})));
+}
+
+/// Session id written literally in `charged.jsonl`.
+const CHARGED: &str = "00000000-0000-4000-8000-0000000b1301";
+
+/// Wait until the clock has passed `t`, so the next recorded time is later.
+fn after(t: i64) { while unix_ms() <= t { std::thread::sleep(Duration::from_millis(1)); } }
+
+/// TM2.3 remainder (§13). Provider charges are their own basis
+/// (`provider_billed`), matched to the same usage by response id and never
+/// added to estimates: ch-1 USD 0.0100 against the 1,000 in + 500 out
+/// estimate of card v2 (2 and 8 per 10^6 → 0.006) differs by 0.004, with the
+/// cards' exclusions as evidence; ch-2 0.0041 equals its doc 05 estimate;
+/// ch-3 is USD against a EUR estimate (no implicit conversion); ch-4 names
+/// an unknown response and ch-5 no request at all (unmatched, apart). Doc 05
+/// §7 "accepted charge $0.0100 later corrected to $0.0080": the correction
+/// appends −0.002, the current total is 0.008 and `--as-of` the earlier
+/// import still shows 0.01. An invoice of 12 is allocated by
+/// `by_total_tokens.v1` (2,980 bound + 500 unbound tokens) exactly, and a
+/// subscription of 7 whose period also holds an uncounted record is partial
+/// (upper bounds), never 0. A dated EUR→USD rate converts the EUR estimate
+/// (0.00021 × 1.1 = 0.000231) in a separate view; `cost --as-of` reproduces
+/// each revision byte for byte.
+#[test]
+fn provider_charges_reconcile_allocate_and_convert() {
+    let f = Fixture::new();
+    let part = |name: &str| format!("{ACCOUNTING}/{name}");
+    let (ts, late) = (f.decided + 1_000, f.decided + 5_000);
+    f.rollout(&f.home, "charged", &[&part("charged.jsonl")], &f.worktree(), ts, "0.154.0");
+    f.rollout(&f.home, "unbound", &[&part("charged-unbound.jsonl")], &f.tmp.path().display().to_string(), ts, "0.154.0");
+    f.rollout(&f.home, "uncounted", &[&part("charged-uncounted.jsonl")], &f.worktree(), late, "0.154.0");
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    for (name, boundary) in [("rates-v2.toml", 0), ("rates-eur.json", 0)] { f.cli_args(&["accounting", "import-rate-card", &rate_card(&f, name, boundary)]); }
+    let unavailable = |reason: &str| json!({"status": "unavailable", "reason": reason});
+    assert_eq!(f.report()["metrics"]["M11"]["value"], unavailable("no_provider_charges"));
+    assert_eq!(f.cli_args(&["accounting", "reprice"]).0["revision"], 1);
+    let first_cost = f.cli_args(&["accounting", "cost", "--json"]).1;
+
+    // Imports: synthetic only, append-only, revisions in order.
+    let charges1 = rate_card(&f, "charges-1.json", late);
+    let (imported, _) = f.cli_args(&["accounting", "import-charges", &charges1]);
+    assert_eq!(imported["charges"].as_array().unwrap().iter().map(|c| (c["charge_id"].clone(), c["imported"].clone())).collect::<Vec<_>>(),
+        ["ch-1", "ch-2", "ch-3", "ch-4", "ch-5"].map(|c| (json!(c), json!(true))));
+    assert_eq!(imported["invoices"].as_array().unwrap().len(), 2);
+    assert_eq!(f.cli_args(&["accounting", "import-charges", &charges1]).0["charges"][0]["imported"], false, "the same revision again is a no-op");
+    let edited = f.tmp.path().join("edited.json");
+    fs::write(&edited, fs::read_to_string(&charges1).unwrap().replace("\"0.0100\"", "\"0.0200\"")).unwrap();
+    assert!(f.cli_fail(&["accounting", "import-charges", edited.to_str().unwrap()]).contains("append-only"));
+    fs::write(&edited, fs::read_to_string(Path::new(ACCOUNTING).join("charges-2.json")).unwrap().replace("\"revision\": 2", "\"revision\": 3")).unwrap();
+    assert!(f.cli_fail(&["accounting", "import-charges", edited.to_str().unwrap()]).contains("not the next revision"));
+    fs::write(&edited, fs::read_to_string(&charges1).unwrap().replace("\"synthetic\": true", "\"synthetic\": false")).unwrap();
+    assert!(f.cli_fail(&["accounting", "import-charges", edited.to_str().unwrap()]).contains("only synthetic fixture files"));
+
+    let (view, _) = f.cli_args(&["accounting", "charges"]);
+    let charge = |view: &serde_json::Value, id: &str| view["charges"].as_array().unwrap().iter().find(|c| c["charge_id"] == id).cloned().unwrap();
+    let first_import = charge(&view, "ch-1")["history"][0]["imported_unix_ms"].as_i64().unwrap();
+    assert_eq!((&view["basis"], &view["valuation_revision"], &view["provider_billed"]), (&json!("provider_billed"), &json!(1), &json!({"USD": "0.5164"})),
+        "0.01 + 0.0041 + 0.0003 + 0.002 + 0.5, matched or not; never an estimate");
+    let exclusions = json!(["estimate_excludes_discounts", "estimate_excludes_fees", "estimate_excludes_taxes", "rate_cards_fixture_only"]);
+    let ch1 = charge(&view, "ch-1");
+    assert_eq!((&ch1["amount"], &ch1["revision"]), (&json!("0.01"), &json!(1)));
+    assert_eq!(ch1["reconciliation"], json!({"status": "matched", "matched_by": "response_id", "entries": [format!("codex:{CHARGED}:1")],
+        "attempt_ids": [f.attempt], "estimate": {"status": "complete", "currency": "USD", "amount": "0.006"},
+        "coverage": {"entries": 1, "priced": 1, "unpriced": {}}, "difference": {"currency": "USD", "amount": "0.004"}, "explanations": exclusions}));
+    let ch2 = charge(&view, "ch-2")["reconciliation"].clone();
+    assert_eq!((&ch2["estimate"]["amount"], &ch2["difference"], &ch2["explanations"]), (&json!("0.0041"), &json!({"currency": "USD", "amount": "0"}), &json!([])));
+    assert_eq!(charge(&view, "ch-3")["reconciliation"]["difference"]["reason"], "currency_differs");
+    assert_eq!(charge(&view, "ch-3")["reconciliation"]["estimate"], json!({"status": "complete", "currency": "EUR", "amount": "0.00021"}));
+    assert_eq!(charge(&view, "ch-4")["reconciliation"], json!({"status": "unmatched", "reason": "no_matching_usage"}));
+    assert_eq!(charge(&view, "ch-5")["reconciliation"], json!({"status": "unmatched", "reason": "no_request_identity"}));
+    assert_eq!(view["reconciliation"]["matched"], 3);
+    assert_eq!(view["reconciliation"]["unmatched"], json!({"no_matching_usage": 1, "no_request_identity": 1}));
+    // The cache-write record, the unbound session and the uncounted record: estimates without a charge, apart.
+    assert_eq!((&view["reconciliation"]["uncharged_estimates"]["estimate"], &view["reconciliation"]["uncharged_estimates"]["coverage"]),
+        (&json!({"status": "partial", "reason": "unpriced_entries", "currency": "USD", "priced_amount": "0.0016"}),
+         &json!({"entries": 3, "priced": 1, "unpriced": {"cache_write_convention_unknown": 1, "usage_not_counted": 1}})));
+    let m11 = f.report()["metrics"]["M11"].clone();
+    assert_eq!((&m11["definition"], &m11["name"], &m11["value"], &m11["currency"], &m11["basis"], &m11["charges"], &m11["invoices_separate"]),
+        (&json!("M11.charges-v1"), &json!("reported_spend_subtotal"), &json!("0.5164"), &json!("USD"), &json!("provider_billed"), &json!("fixture_only"), &json!(2)));
+
+    // Doc 05 §7: the charge corrected from 0.0100 to 0.0080 appends −0.002; the earlier view remains.
+    after(first_import);
+    f.cli_args(&["accounting", "import-charges", &part("charges-2.json")]);
+    let (view, _) = f.cli_args(&["accounting", "charges"]);
+    let ch1 = charge(&view, "ch-1");
+    assert_eq!((&ch1["amount"], &ch1["revision"], &ch1["reconciliation"]["difference"]), (&json!("0.008"), &json!(2), &json!({"currency": "USD", "amount": "0.002"})));
+    assert_eq!(ch1["history"].as_array().unwrap().iter().map(|h| (h["revision"].clone(), h["amount"].clone(), h["adjustment"].clone())).collect::<Vec<_>>(),
+        [(json!(1), json!("0.01"), json!(null)), (json!(2), json!("0.008"), json!("-0.002"))]);
+    assert_eq!(view["provider_billed"], json!({"USD": "0.5144"}));
+    assert_eq!(f.report()["metrics"]["M11"]["value"], "0.5144");
+    let (earlier, _) = f.cli_args(&["accounting", "charges", "--as-of", &first_import.to_string()]);
+    assert_eq!((&charge(&earlier, "ch-1")["amount"], &earlier["provider_billed"]), (&json!("0.01"), &json!({"USD": "0.5164"})));
+    // Stream 10 re-runs harmlessly (streams table behind): every revision stays.
+    let current = f.cli_args(&["accounting", "charges"]).1;
+    f.sidecar().execute("UPDATE telemetry_streams SET version=9 WHERE stream='accounting'", []).unwrap();
+    assert_eq!(f.cli_args(&["accounting", "import-charges", &part("charges-2.json")]).0["charges"][0]["imported"], false);
+    assert_eq!((f.cli_args(&["accounting", "status"]).0["version"].clone(), f.cli_args(&["accounting", "charges"]).1), (json!(10), current));
+
+    // Invoice allocation by a named, versioned rule: 12 × 2980/3480 and 12 × 500/3480 in units
+    // of 10^-12; the one remaining unit goes to the larger remainder; the sum is exactly 12.
+    let (allocation, _) = f.cli_args(&["accounting", "allocate", "inv-1"]);
+    assert_eq!((&allocation["basis"], &allocation["rule"]["id"], &allocation["status"], &allocation["tokens"], &allocation["valuation_revision"]),
+        (&json!("invoice_allocation"), &json!("by_total_tokens.v1"), &json!("complete"), &json!(3480), &json!(1)));
+    assert_eq!(allocation["allocations"], json!([{"attempt_id": f.attempt, "tokens": 2980, "share": "2980/3480", "currency": "USD", "amount": "10.275862068966", "bound": null}]));
+    assert_eq!(allocation["unattributed"], json!({"attempt_id": null, "tokens": 500, "share": "500/3480", "currency": "USD", "amount": "1.724137931034", "bound": null}));
+    assert_eq!(allocation["coverage"], json!({"entries_in_period": 5, "unknown": 0, "outside_period": 1}), "the uncounted record lies after inv-1's period");
+    // The subscription's period holds the uncounted record: partial, known shares are upper bounds, the unknown never 0.
+    let (sub, _) = f.cli_args(&["accounting", "allocate", "sub-1"]);
+    assert_eq!((&sub["status"], &sub["reason"], &sub["invoice"]["kind"]), (&json!("partial"), &json!("usage_unknown_in_period"), &json!("subscription")));
+    assert_eq!(sub["allocations"][0]["amount"], "5.994252873563");
+    assert_eq!(sub["allocations"][0]["bound"], "upper");
+    assert_eq!(sub["unattributed"]["amount"], "1.005747126437");
+    assert_eq!(sub["unknown"], json!([{"attempt_id": f.attempt, "entries": 1, "allocation": unavailable("usage_not_counted")}]));
+    assert!(f.cli_fail(&["accounting", "allocate", "inv-1", "--rule", "evenly.v1"]).contains("unknown allocation rule"));
+    assert!(f.cli_fail(&["accounting", "allocate", "inv-9"]).contains("no invoice"));
+
+    // Dated conversion: a separate valuation recording its rate; the stored estimate stays EUR.
+    let converted_entry = |view: &serde_json::Value, n: i64| view["entries"].as_array().unwrap().iter()
+        .find(|e| e["entry_id"] == format!("codex:{CHARGED}:{n}")).unwrap()["converted"].clone();
+    let before_fx = unix_ms();
+    after(before_fx + 1);
+    f.cli_args(&["accounting", "import-fx", &part("fx-1.json")]);
+    f.cli_args(&["accounting", "import-fx", &rate_card(&f, "fx-2.toml", ts + 1)]);
+    let (fx, _) = f.cli_args(&["accounting", "fx", "--to", "USD"]);
+    assert_eq!(converted_entry(&fx, 3), json!({"status": "priced", "currency": "USD", "amount": "0.000231", "conversion": {"from_currency": "EUR", "rate": "1.1",
+        "rate_id": "synthetic-fx@1:EUR->USD@0", "table_id": "synthetic-fx", "version": 1, "effective_from_unix_ms": 0, "effective_to_unix_ms": null,
+        "dated_by": "usage_interval"}}), "version 2's 1.2 starts after the record: the rate of its date applies");
+    assert_eq!(converted_entry(&fx, 1)["conversion"], "same_currency");
+    let attempt_fx = |view: &serde_json::Value, a: serde_json::Value| view["attempts"].as_array().unwrap().iter().find(|r| r["attempt_id"] == a).cloned().unwrap();
+    assert_eq!(attempt_fx(&fx, json!(f.attempt)), json!({"attempt_id": f.attempt,
+        "estimate": {"status": "partial", "reason": "unpriced_entries", "currency": "USD", "priced_amount": "0.010331"},
+        "coverage": {"entries": 5, "priced": 3, "unpriced": {"cache_write_convention_unknown": 1, "usage_not_counted": 1}}}));
+    assert_eq!(attempt_fx(&fx, json!(null))["estimate"], json!({"status": "complete", "currency": "USD", "amount": "0.0016"}));
+    let (fx_before, _) = f.cli_args(&["accounting", "fx", "--to", "USD", "--as-of", &before_fx.to_string()]);
+    assert_eq!(converted_entry(&fx_before, 3), unavailable("no_fx_rate"), "no table imported by then");
+    let (jpy, _) = f.cli_args(&["accounting", "fx", "--to", "JPY"]);
+    assert_eq!(attempt_fx(&jpy, json!(f.attempt))["estimate"], unavailable("no_priced_entries"));
+    let cost = f.cli_args(&["accounting", "cost", "--json"]).0;
+    assert_eq!(cost["attempts"].as_array().unwrap().iter().find(|a| a["attempt_id"] == f.attempt.as_str()).unwrap()["estimate"],
+        json!({"status": "unavailable", "reason": "mixed_currency", "priced_by_currency": {"EUR": "0.00021", "USD": "0.0101"}}), "the stored view never adds currencies");
+
+    // `cost --as-of`: the latest revision computed by that instant, byte-identical to `--revision`.
+    let computed1 = cost["computed_unix_ms"].as_i64().unwrap();
+    let before_reprice = unix_ms();
+    after(before_reprice);
+    f.cli_args(&["accounting", "import-rate-card", &rate_card(&f, "rates-v3.json", 0)]);
+    assert_eq!(f.cli_args(&["accounting", "reprice"]).0["revision"], 2);
+    let (latest, latest_bytes) = f.cli_args(&["accounting", "cost", "--json"]);
+    assert_eq!(f.cli_args(&["accounting", "cost", "--json", "--as-of", &computed1.to_string()]).1, first_cost);
+    assert_eq!(f.cli_args(&["accounting", "cost", "--json", "--as-of", &latest["computed_unix_ms"].to_string()]).1, latest_bytes);
+    assert_eq!(f.cli_args(&["accounting", "cost", "--json", "--as-of", &(computed1 - 1).to_string()]).0, unavailable("not_priced_as_of"));
+    assert!(f.text(&["accounting", "cost", "--as-of", &computed1.to_string()]).starts_with("cost revision 1:"));
+    assert!(f.cli_fail(&["accounting", "cost", "--revision", "1", "--as-of", "1"]).contains("cannot be used with"));
+    // Charges reconcile against the valuation revision of their instant: 0.008 − 0.005 now, 0.008 − 0.006 then.
+    assert_eq!(charge(&f.cli_args(&["accounting", "charges"]).0, "ch-1")["reconciliation"]["difference"]["amount"], "0.003");
+    let (then, _) = f.cli_args(&["accounting", "charges", "--as-of", &before_reprice.to_string()]);
+    assert_eq!((&then["valuation_revision"], &charge(&then, "ch-1")["reconciliation"]["difference"]["amount"]), (&json!(1), &json!("0.002")));
+}
+
+/// Attempt id and decision time of the latest dispatch decision.
+fn latest_decision(f: &Fixture) -> (String, i64) {
+    rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap()
+        .query_row("SELECT attempt_id,decided_unix_ms FROM dispatch_decisions ORDER BY rowid DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+}
+
+/// Canonical budget policy `revision` with `limits`, planted as a signed
+/// import would store it (fixture only: the owner signature is not under test).
+fn plant_budget(f: &Fixture, revision: u64, limits: herdr_projects::domain::BudgetLimits) {
+    use herdr_projects::domain::{BudgetPolicy, VersionedReference};
+    let db_path = f.project.join(".state/state.db");
+    let policy = BudgetPolicy { version: 1, project_store: fs::canonicalize(&db_path).unwrap().display().to_string(), revision,
+        authority: VersionedReference { id: "owner".into(), revision: 1, digest: "a".repeat(64) }, limits };
+    let payload = serde_json::to_string(&policy).unwrap();
+    rusqlite::Connection::open(&db_path).unwrap().execute("INSERT INTO budget_policies(revision,payload,payload_hash) VALUES(?1,?2,?3)",
+        rusqlite::params![revision as i64, payload, format!("{:x}", Sha256::digest(payload.as_bytes()))]).unwrap();
+}
+
+/// TM2.4 in shadow mode (§14), on doc 05 §7's budget goldens with a synthetic
+/// per-token card (input 0.05, output 0.02): a cancelled attempt of 1,000 in
+/// and 500 out = $60 accepted and an open attempt reserved at $30 (what-if):
+/// with a budget of $100 a new request of $15 would be refused (projected
+/// $105). After $10 of covered usage arrives on the open attempt: accepted
+/// $70, remaining $20, exposure $90 (no false $100). An open attempt without
+/// a reservation is unknown exposure: `refuse` blocks, `allow_incomplete`
+/// warns. The canonical token policy (1,850 known tokens) is evaluated as
+/// admission would with the ledger: within 5,000 it warns like today; at
+/// 1,000 it would block where admission (`allow_incomplete`) does not. M04
+/// includes the cancelled attempt: $70 / 1 accepted task. `state.db` is
+/// never written.
+#[test]
+fn shadow_budget_bridge_matches_doc05_goldens() {
+    use herdr_projects::domain::{BudgetLimits, UnknownUsagePolicy};
+    let f = Fixture::new();
+    let part = |name: &str| format!("{ACCOUNTING}/{name}");
+    let a1 = f.attempt.clone();
+    f.rollout(&f.home, "budget-a", &[&part("budget-a.jsonl")], &f.worktree(), f.decided + 1_000, "0.154.0");
+    f.cli("collect");
+    f.readmit("codex");
+    let (a2, a2_decided) = latest_decision(&f);
+    let db_path = f.project.join(".state/state.db");
+    rusqlite::Connection::open(&db_path).unwrap().execute("INSERT INTO collector_bindings(attempt_id,revision,state,collector,execution_home,unix_ms,source)
+        VALUES(?1,1,'active','codex',?2,?3,'apply_launch_started')", rusqlite::params![a2, f.home.display().to_string(), unix_ms()]).unwrap();
+    f.cli_args(&["accounting", "sync"]);
+    f.cli_args(&["accounting", "import-rate-card", &part("rates-budget.json")]);
+    f.cli_args(&["accounting", "reprice"]);
+
+    let policy = |name: &str, body: serde_json::Value| {
+        let path = f.tmp.path().join(name);
+        let mut doc = json!({"synthetic": true, "policy_id": "synthetic-what-if", "version": 1, "currency": "USD",
+            "source": "INVENTED what-if limits for the doc 05 budget goldens; never installed"});
+        doc.as_object_mut().unwrap().extend(body.as_object().unwrap().clone());
+        fs::write(&path, doc.to_string()).unwrap();
+        path.display().to_string()
+    };
+    let golden = policy("golden.json", json!({"unknown_usage": "refuse", "project": {"max_amount": "100"},
+        "reservations": {a2.as_str(): {"amount": "30"}}, "request": {"task": "work", "amount": "15"}}));
+    let state = || fs::read(&db_path).unwrap();
+    let files = || { let mut names: Vec<_> = fs::read_dir(f.project.join(".state")).unwrap().map(|e| e.unwrap().file_name()).collect(); names.sort(); names };
+    let (before, listing) = (state(), files());
+    let shadow = |args: &[&str]| { let mut all = vec!["accounting", "budget-shadow"]; all.extend(args); f.cli_args(&all).0 };
+    let evaluation = |view: &serde_json::Value, source: &str, scope: &str, dimension: &str| view["evaluations"].as_array().unwrap().iter()
+        .find(|e| e["policy_source"] == source && e["scope"] == scope && e["dimension"] == dimension).cloned()
+        .unwrap_or_else(|| panic!("{source} {scope} {dimension} in {view}"));
+    let money = |e: &serde_json::Value| ["accepted", "remaining_reserved", "exposure", "new_request", "projected", "decision", "reason"].map(|k| e[k].clone());
+
+    let view = shadow(&["--policy", &golden]);
+    assert_eq!((&view["mode"], &view["enforcement"], &view["canonical_writes"]), (&json!("shadow"), &json!("none"), &json!("none")));
+    assert_eq!((&view["canonical"]["policy"], &view["canonical"]["reason"], &view["differs_from_canonical"]), (&json!(null), &json!("no_budget_policy"), &json!(null)));
+    let project = evaluation(&view, "what_if", "project", "amount");
+    assert_eq!(money(&project), [json!("60"), json!("30"), json!("90"), json!("15"), json!("105"), json!("would_block"), json!("projected_exposure_exceeds_limit")],
+        "doc 05: budget $100, accepted $60, remaining exposure $30, new request $15 → refuse, projected $105");
+    assert_eq!((&project["limit"], &project["currency"], &project["unknown"]), (&json!("100"), &json!("USD"), &json!([])));
+    assert_eq!(project["attempts"], json!([{"attempt_id": a1, "task_id": "work", "state": "cancelled", "accepted": "60", "in_flight": null},
+        {"attempt_id": a2, "task_id": "work", "state": "reserved", "accepted": "0", "in_flight": {"reservation": "30", "remaining": "30"}}]));
+    assert_eq!(view["decision"], json!({"would_block": true, "would_warn": false, "reasons": ["projected_exposure_exceeds_limit"]}));
+    assert_eq!(view["provenance"]["valuation_revision"], 1);
+    let computed1 = view["provenance"]["valuation_computed_unix_ms"].as_i64().unwrap();
+
+    // $10 of covered usage arrives on the reserved attempt.
+    f.rollout(&f.home, "budget-b", &[&part("budget-b.jsonl")], &format!("{}/.state/worktrees/{a2}/repo-00", f.project.display()), a2_decided + 1_000, "0.154.0");
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    after(computed1);
+    assert_eq!(f.cli_args(&["accounting", "reprice"]).0["revision"], 2);
+    let view = shadow(&["--policy", &golden]);
+    assert_eq!(money(&evaluation(&view, "what_if", "project", "amount")),
+        [json!("70"), json!("20"), json!("90"), json!("15"), json!("105"), json!("would_block"), json!("projected_exposure_exceeds_limit")],
+        "doc 05: accepted $70, remaining $20, combined exposure $90; no false $100");
+    // As of the first revision the shadow reproduces the earlier answer.
+    let earlier = shadow(&["--policy", &golden, "--as-of", &computed1.to_string()]);
+    assert_eq!((&evaluation(&earlier, "what_if", "project", "amount")["accepted"], &earlier["provenance"]["valuation_revision"]), (&json!("60"), &json!(1)));
+    // A request of $10 fits exactly.
+    let fits = policy("fits.json", json!({"project": {"max_amount": "100"}, "reservations": {a2.as_str(): {"amount": "30"}}, "request": {"amount": "10"}}));
+    assert_eq!(money(&evaluation(&shadow(&["--policy", &fits]), "what_if", "project", "amount")),
+        [json!("70"), json!("20"), json!("90"), json!("10"), json!("100"), json!("allow"), json!("within_limit")]);
+    // No reservation for the open attempt: its in-flight usage is unknown, never 0.
+    for (unknown_usage, decision, reason) in [("refuse", "would_block", "provider_usage_unavailable"), ("allow_incomplete", "would_warn", "usage_incomplete")] {
+        let open = policy("open.json", json!({"unknown_usage": unknown_usage, "project": {"max_amount": "100"}, "request": {"amount": "10"}}));
+        let e = evaluation(&shadow(&["--policy", &open]), "what_if", "project", "amount");
+        assert_eq!((&e["exposure"], &e["decision"], &e["reason"], &e["unknown"]), (&json!("70"), &json!(decision), &json!(reason),
+            &json!([{"attempt_id": a2, "reason": "in_flight_usage_unknown", "entries": 0}])));
+    }
+    // A task budget covers every attempt of the task, the cancelled one included.
+    let task = policy("task.json", json!({"tasks": {"work": {"max_amount": "80"}}, "reservations": {a2.as_str(): {"amount": "30"}}}));
+    let e = evaluation(&shadow(&["--policy", &task]), "what_if", "task:work", "amount");
+    assert_eq!((&e["exposure"], &e["decision"], &e["reason"], &e["new_request"]), (&json!("90"), &json!("would_block"), &json!("limit_exceeded"), &json!(null)));
+
+    assert_eq!((state(), files()), (before, listing), "no shadow read writes state.db or creates a file beside it");
+
+    // The canonical policy, as admission reads it today and as the bridge would with the ledger.
+    plant_budget(&f, 1, BudgetLimits { max_attempts: None, max_provider_tokens: Some(5_000), unknown_usage: UnknownUsagePolicy::AllowIncomplete });
+    let view = shadow(&[]);
+    assert_eq!(view["canonical"]["decision_today"], json!({"blockers": [], "incomplete": true, "provider_tokens": "unknown"}));
+    assert_eq!(view["canonical"]["task_budgets"], json!({"status": "unavailable", "reason": "no_canonical_task_budget"}));
+    let tokens = evaluation(&view, "canonical", "project", "provider_tokens");
+    assert_eq!((&tokens["policy_revision"], &tokens["accepted"], &tokens["exposure"], &tokens["new_request"], &tokens["decision"], &tokens["reason"]),
+        (&json!(1), &json!(1850), &json!(1850), &json!({"status": "unavailable", "reason": "new_request_usage_unknown"}), &json!("would_warn"), &json!("usage_incomplete")));
+    assert_eq!(tokens["unknown"], json!([{"attempt_id": a2, "reason": "in_flight_usage_unknown", "entries": 0},
+        {"attempt_id": null, "reason": "new_request_usage_unknown", "entries": 0}]));
+    assert_eq!(view["differs_from_canonical"], false);
+    assert_eq!(view["attempts"].as_array().unwrap().iter().map(|a| a["pinned_policy_revision"].clone()).collect::<Vec<_>>(), [json!(null), json!(null)],
+        "both attempts were admitted before any policy");
+    plant_budget(&f, 2, BudgetLimits { max_attempts: None, max_provider_tokens: Some(1_000), unknown_usage: UnknownUsagePolicy::AllowIncomplete });
+    let (before, listing) = (state(), files());
+    let view = shadow(&[]);
+    let tokens = evaluation(&view, "canonical", "project", "provider_tokens");
+    assert_eq!((&tokens["policy_revision"], &tokens["decision"], &tokens["reason"]), (&json!(2), &json!("would_block"), &json!("limit_exceeded")));
+    assert_eq!((&view["canonical"]["decision_today"]["blockers"], &view["differs_from_canonical"]), (&json!([]), &json!(true)),
+        "admission today allows with incomplete usage; the bridge would block");
+    // Nothing canonical was written by any shadow read.
+    assert_eq!((state(), files()), (before, listing));
+    assert_eq!(f.cli_args(&["accounting", "budget-shadow"]).0["mode"], "shadow");
+
+    // M04: no terminal task yet; then task `work` accepted: its cancelled and open attempts' $60 + $10.
+    let m04 = f.report()["metrics"]["M04"].clone();
+    assert_eq!((&m04["value"], &m04["reason"], &m04["denominator"]), (&json!(null), &json!("empty_denominator"), &json!(0)));
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    let hex = |c: char| c.to_string().repeat(64);
+    db.execute("INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq)
+        VALUES('work',1,NULL,'store',0,'/repo',?1,'sha1',NULL,'verify_only',x'61',?2,(SELECT max(sequence) FROM events))", rusqlite::params!["b".repeat(40), hex('c')]).unwrap();
+    db.execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,artifact_manifest,claimed_checks,created_unix_ms)
+        VALUES(?1,'store',?1,?2,'{}','work',1,?2,?3,'/repo',?4,?4,'sha1','[]','[]',1000)", rusqlite::params![hex('1'), hex('d'), a2, "b".repeat(40)]).unwrap();
+    db.execute("INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms)
+        VALUES(?1,?1,?2,?3,?3,'sha1',?4,?4,'linux-unshare-user-pid-mount-v1',0,2000)", rusqlite::params![hex('2'), hex('1'), "b".repeat(40), hex('7')]).unwrap();
+    drop(db);
+    let m04 = f.report()["metrics"]["M04"].clone();
+    assert_eq!((&m04["definition"], &m04["name"], &m04["value"], &m04["currency"], &m04["denominator"], &m04["numerator"], &m04["basis"]),
+        (&json!("M04.cost-v1"), &json!("cost_per_accepted_task"), &json!("70/1"), &json!("USD"), &json!(1),
+         &json!({"status": "complete", "currency": "USD", "amount": "70"}), &json!("published_rate_estimate")));
+    assert_eq!(m04["coverage"], json!({"entries": 2, "priced": 2, "unpriced": {}, "attempts": 2, "attempts_without_usage": {}}));
+    assert!(f.text(&["report"]).lines().any(|l| l == "M04 cost_per_accepted_task 70/1"));
 }

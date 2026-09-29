@@ -1,0 +1,17 @@
+{
+  "synthetic": true,
+  "source": "INVENTED synthetic provider charges and invoices for tests; not a provider export",
+  "provider": "synthetic",
+  "product": "codex",
+  "charges": [
+    {"charge_id": "ch-1", "revision": 1, "currency": "USD", "amount": "0.0100", "response_id": "resp-c1"},
+    {"charge_id": "ch-2", "revision": 1, "currency": "USD", "amount": "0.0041", "response_id": "resp-c2", "session_id": "00000000-0000-4000-8000-0000000b1301"},
+    {"charge_id": "ch-3", "revision": 1, "currency": "USD", "amount": "0.0003", "response_id": "resp-c3"},
+    {"charge_id": "ch-4", "revision": 1, "currency": "USD", "amount": "0.002", "response_id": "resp-unknown"},
+    {"charge_id": "ch-5", "revision": 1, "currency": "USD", "amount": "0.5"}
+  ],
+  "invoices": [
+    {"invoice_id": "inv-1", "revision": 1, "kind": "usage", "currency": "USD", "amount": "12", "period_from_unix_ms": 0, "period_to_unix_ms": @BOUNDARY@},
+    {"invoice_id": "sub-1", "revision": 1, "kind": "subscription", "currency": "USD", "amount": "7", "period_from_unix_ms": 0, "period_to_unix_ms": 4102444800000}
+  ]
+}

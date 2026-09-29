@@ -8,8 +8,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 pub mod attention;
+pub mod budget;
+pub mod charges;
 pub mod cost;
 pub mod fleet;
+pub mod fx;
 pub mod graph;
 pub mod ledger;
 pub mod quota;
@@ -25,7 +28,8 @@ pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/ac
     include_str!("../../../migrations/telemetry/accounting/0006_a4_metadata.sql"),
     include_str!("../../../migrations/telemetry/accounting/0007_thread_lineage.sql"),
     include_str!("../../../migrations/telemetry/accounting/0008_drop_superseded.sql"),
-    include_str!("../../../migrations/telemetry/accounting/0009_valuation_deltas.sql")];
+    include_str!("../../../migrations/telemetry/accounting/0009_valuation_deltas.sql"),
+    include_str!("../../../migrations/telemetry/accounting/0010_charges_fx.sql")];
 
 /// `herdr-projects telemetry <slug> accounting ...`
 #[derive(clap::Subcommand)]
@@ -52,8 +56,61 @@ pub enum Command {
         #[arg(long)]
         json: bool,
         /// Show this earlier calculation revision instead of the latest.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "as_of")]
         revision: Option<i64>,
+        /// Show the latest revision computed at or before this instant (Unix ms).
+        #[arg(long)]
+        as_of: Option<i64>,
+    },
+    /// Append provider charge and invoice revisions from a local TOML (`.toml`) or JSON
+    /// file marked synthetic (fixture-only). Amounts are decimal strings. Writes only the sidecar.
+    ImportCharges { file: std::path::PathBuf },
+    /// Provider-reported charges (basis provider_billed) with their corrections, reconciled
+    /// against the estimate of the same usage; unmatched charges and uncharged estimates
+    /// apart, never added. Prints JSON. Read-only.
+    Charges {
+        /// Charges imported and the valuation revision computed at or before this instant (Unix ms).
+        #[arg(long)]
+        as_of: Option<i64>,
+    },
+    /// Allocate an invoice or subscription bill to attempts by a named, versioned rule.
+    /// Prints JSON. Read-only.
+    Allocate {
+        invoice: String,
+        /// Allocation rule.
+        #[arg(long, default_value = "by_total_tokens.v1")]
+        rule: String,
+        /// Invoice revision and valuation revision as of this instant (Unix ms).
+        #[arg(long)]
+        as_of: Option<i64>,
+    },
+    /// Append a dated exchange-rate table version from a local TOML (`.toml`) or JSON file
+    /// marked synthetic (fixture-only). Rates are decimal strings. Writes only the sidecar.
+    ImportFx { file: std::path::PathBuf },
+    /// The stored estimates converted to one currency with the rate effective over each
+    /// entry's usage interval, as a separate dated valuation. Prints JSON. Read-only.
+    Fx {
+        /// Target currency (ISO 4217).
+        #[arg(long)]
+        to: String,
+        /// Convert this calculation revision instead of the latest.
+        #[arg(long, conflicts_with = "as_of")]
+        revision: Option<i64>,
+        /// The valuation revision and exchange-rate tables as of this instant (Unix ms).
+        #[arg(long)]
+        as_of: Option<i64>,
+    },
+    /// TM2.4 budget bridge in shadow mode: what the canonical budget policy (and an optional
+    /// synthetic what-if policy) would decide over the valued ledger. Never enforced; reads
+    /// state.db read-only. Prints JSON.
+    BudgetShadow {
+        /// A synthetic what-if policy file (TOML or JSON): limits per project and task,
+        /// in-flight reservation estimates and a new request.
+        #[arg(long)]
+        policy: Option<std::path::PathBuf>,
+        /// The valuation revision computed at or before this instant (Unix ms).
+        #[arg(long)]
+        as_of: Option<i64>,
     },
     /// Synced quota windows (native units), observation trust, M38/M39 and
     /// headroom per limit window at each dispatch decision (extended M40). Read-only.
@@ -124,14 +181,35 @@ pub fn run(project: &Path, command: Command) -> Result<String> {
             Some(mut db) => cost::reprice(&mut db)?,
             None => unavailable("collection_not_run"),
         },
-        Command::Cost { json, revision } => {
+        Command::Cost { json, revision, as_of } => {
             let value = match super::sidecar::read(project)? {
-                Some(db) => cost::cost(&db, revision)?,
+                Some(db) => cost::cost(&db, revision, as_of)?,
                 None => unavailable("collection_not_run"),
             };
             if !json { return Ok(cost::text(&value)); }
             value
         }
+        Command::ImportCharges { file } => match super::sidecar::open(project, false)? {
+            Some(mut db) => charges::import(&mut db, &file)?,
+            None => unavailable("collection_not_run"),
+        },
+        Command::Charges { as_of } => match super::sidecar::read(project)? {
+            Some(db) => charges::charges(&db, as_of)?,
+            None => unavailable("collection_not_run"),
+        },
+        Command::Allocate { invoice, rule, as_of } => match super::sidecar::read(project)? {
+            Some(db) => charges::allocate(&db, &invoice, &rule, as_of)?,
+            None => unavailable("collection_not_run"),
+        },
+        Command::ImportFx { file } => match super::sidecar::open(project, false)? {
+            Some(mut db) => fx::import(&mut db, &file)?,
+            None => unavailable("collection_not_run"),
+        },
+        Command::Fx { to, revision, as_of } => match super::sidecar::read(project)? {
+            Some(db) => fx::convert(&db, &to, revision, as_of)?,
+            None => unavailable("collection_not_run"),
+        },
+        Command::BudgetShadow { policy, as_of } => budget::shadow(project, policy.as_deref(), as_of)?,
         Command::Quota { json } => {
             let value = match super::sidecar::read(project)? {
                 Some(db) => quota::read(project, &db)?,
@@ -182,11 +260,13 @@ fn with_availability(mut metrics: BTreeMap<String, Value>) -> BTreeMap<String, V
 }
 
 /// M08/M09 (below), M38/M39 (§5), M31–M33 (§6, replacing the central
-/// `attention_not_collected` entries), M16–M18 (§9), M34–M37 (§10) and
-/// M12/M14 (§12).
+/// `attention_not_collected` entries), M16–M18 (§9), M34–M37 (§10),
+/// M12/M14 (§12), M11 (§13) and M04 (§14).
 pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> {
     let mut metrics = usage_metrics(project, since)?;
     metrics.extend(cost::metrics(project, since)?);
+    metrics.extend(charges::metrics(project, since)?);
+    metrics.extend(budget::metrics(project, since)?);
     metrics.extend(attention::metrics(project, since)?);
     metrics.extend(tools::metrics(project, since)?);
     metrics.extend(fleet::metrics(project, since)?);
