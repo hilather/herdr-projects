@@ -376,14 +376,14 @@ fn quota_headroom_at_dispatch() {
             {"limit_id": "codex", "window_kind": "primary", "unit": "percent", "window_id": format!("codex:{account}:codex:primary:{}", resets * 1000),
              "window_minutes": 300, "resets_unix_ms": resets * 1000, "observed_unix_ms": f.decided - 60_000, "age_ms": 60_000,
              "value": "62.5", "used": "37.5", "freshness": "fresh"},
-            {"limit_id": "codex", "window_kind": "secondary", "value": unavailable("not_collected")}]}]));
+            {"limit_id": "codex", "window_kind": "secondary", "value": unavailable("not_reported")}]}]));
     // The same decisions as `accounting quota`.
     assert_eq!(metric(&report, "M40")["decisions"], f.cli_args(&["accounting", "quota", "--json"]).0["metrics"]["M40"]["decisions"]);
     // Text (the fleet pane's body): one line per decision and limit window.
     let text = f.text(&["report"]);
     let m40: Vec<&str> = text.lines().filter(|l| l.starts_with("M40 ")).collect();
     assert_eq!(m40, [format!("M40 quota_headroom_at_dispatch {} codex primary remaining 62.5% age_ms=60000 fresh", f.attempt),
-        format!("M40 quota_headroom_at_dispatch {} codex secondary n/a (not_collected)", f.attempt)], "{text}");
+        format!("M40 quota_headroom_at_dispatch {} codex secondary n/a (not_reported)", f.attempt)], "{text}");
     fs::write(f.project.join("PROJECT.md"), "# demo\n").unwrap();
     let pane = Command::new(BIN).env_clear().env("HOME", f.tmp.path().join("home")).env("PATH", "/usr/bin:/bin")
         .args(["--root", f.root.to_str().unwrap(), "pane", "fleet"]).output().unwrap();
