@@ -165,10 +165,10 @@ merges one PR at a time.
   `session_meta.session_id` and `thread_source` (a guardian's usage records
   carry the parent's `session_id`). Then B2 can link guardians to their
   parent.
-- **Attention basis live** (lane B): the Codex approval prompt was observed
+- **Done (B8):** **Attention basis live** (lane B): the Codex approval prompt was observed
   as Herdr `blocked`. Flip B6b's signal basis from `fixture` to `live`
   (auto-reviewed approvals never show `blocked`; say so).
-- **Quota account identity** (lane B): two execution homes holding one login
+- **Done (B8):** **Quota account identity** (lane B): two execution homes holding one login
   report identical windows. B4 keys accounts by home digest, so one account
   appears twice. Proposal: treat snapshots with the same limit, kind and
   `resets_at` from different homes as one account-window, or report

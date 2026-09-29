@@ -43,25 +43,26 @@ pub fn attempts(project: &Path) -> anyhow::Result<Value> {
 /// Before any sample every record keeps `attention_not_collected`.
 fn attention(project: &Path, sidecar: &Connection, records: &mut [Value]) -> anyhow::Result<()> {
     let report = super::accounting::attention::read(project, sidecar)?;
-    let launched: BTreeMap<&str, &Value> = report["attempts"].as_array().into_iter().flatten()
-        .filter_map(|a| Some((a["attempt_id"].as_str()?, &a["attention"]))).collect();
+    // Each attempt carries its own certification (live for Codex, fixture for other kinds).
+    let launched: BTreeMap<&str, (&Value, &Value)> = report["attempts"].as_array().into_iter().flatten()
+        .filter_map(|a| Some((a["attempt_id"].as_str()?, (&a["attention"], &a["certified"])))).collect();
     if launched.is_empty() { return Ok(()); }
     let signal = &report["signal"];
     for record in records.iter_mut() {
-        let Some(a) = record["attempt_id"].as_str().and_then(|id| launched.get(id)) else {
+        let Some(&(a, certified)) = record["attempt_id"].as_str().and_then(|id| launched.get(id)) else {
             record["attention"] = status("unavailable", "not_launched");
             continue;
         };
         let mut gaps = BTreeMap::<&str, i64>::new();
         for gap in a["gaps"].as_array().into_iter().flatten() { *gaps.entry(gap["reason"].as_str().unwrap_or("unknown")).or_default() += 1; }
-        let mut summary = if a["status"] == "unavailable" { (*a).clone() } else {
+        let mut summary = if a["status"] == "unavailable" { a.clone() } else {
             let intervals = a["intervals"].as_array().map_or(0, Vec::len);
             let censored = a["intervals"].as_array().into_iter().flatten().filter(|i| i["duration_ms"].is_null()).count();
             json!({"interventions": a["interventions"], "uncertain_starts": a["uncertain_starts"], "waiting_ms": a["waiting_ms"],
                 "observed_ms": a["observed_ms"], "intervals": intervals, "censored_intervals": censored, "reason_type": signal["reason_type"]})
         };
         summary["gaps"] = json!(gaps);
-        summary["basis"] = signal["certified"].clone();
+        summary["basis"] = certified.clone();
         summary["source"] = signal["source"].clone();
         record["attention"] = summary;
     }
