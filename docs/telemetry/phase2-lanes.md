@@ -159,7 +159,7 @@ merges one PR at a time.
   without `task_complete`.
 - **Done (steward):** **Herdr client in the lib** (steward): `src/herdr.rs` is binary-only.
   B6b re-runs `agent list` through the lib runner.
-- **Outcome `attention`** (steward): show B6b's per-attempt summary in the
+- **Done (#123 + Herdr client card):** **Outcome `attention`** (steward): show B6b's per-attempt summary in the
   §4 outcome record, and share the M31 T/A cohort SQL from `metrics.rs`.
 - **Attention certification** (live run): Codex approval prompt shows as
   `blocked`; typed reasons would unlock M33. A finer attention sampler than
