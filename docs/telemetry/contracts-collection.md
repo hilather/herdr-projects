@@ -174,6 +174,14 @@ each with a value somewhere, and no unavailable field.
   `token_usage_record.{session_id, response_id}`,
   `task_complete.{duration_ms, time_to_first_token_ms}` and line timestamps.
   The live prerequisite is the planned small live run (owner decision 5).
+- *Moved to live by the A4 live run* ([codex-live-0.154.0-a4.md](codex-live-0.154.0-a4.md)):
+  line timestamps, `session_meta.{originator, source, model_provider,
+  subagent_kind}`, every `turn_id`, `token_usage_record.{session_id,
+  response_id}` (a guardian reports its parent's `session_id`: caveat
+  `guardian_reports_parent_session`) and `task_complete.{duration_ms,
+  time_to_first_token_ms}`. Still fixture (no value live):
+  `forked_from_id`, `subagent_parent_thread_id`, `subagent_depth`,
+  `rate_limits.secondary.*`, `rate_limit_reached_type`.
 - *Not collected:* `rate_limits.{credits, limit_name}`,
   `info.{last_token_usage, model_context_window}`, `turn_token_usage`,
   `thread_id`, `root_turn_id`, start and completion times, and tool/exec
@@ -221,10 +229,10 @@ session, never text a person or model wrote.
 
 | Envelope field (kind) | Read from | Class (§7 rule) | Stored in | Why it is not content | Certified |
 |---|---|---|---|---|---|
-| line `timestamp` (`token_usage_record`) | the line | time → Unix ms | `codex_usage_times.record_unix_ms` | when Codex wrote the record | fixture |
-| `model_provider` (`session_meta`) | `model_provider` | Text (excerpt rules 1–5) | `rollout_metadata.model_provider` | configured provider id (`openai`) | fixture |
+| line `timestamp` (`token_usage_record`) | the line | time → Unix ms | `codex_usage_times.record_unix_ms` | when Codex wrote the record | live |
+| `model_provider` (`session_meta`) | `model_provider` | Text (excerpt rules 1–5) | `rollout_metadata.model_provider` | configured provider id (`openai`) | live |
 | `forked_from_id` (`session_meta`) | `forked_from_id` | Id (≤128, no control chars) | `rollout_metadata.forked_from_id` | another session's UUID | fixture, semantics not certified |
-| `subagent_kind` (`session_meta`) | `source.subagent` (string, or first key of an object) | Tag | `rollout_metadata.subagent_kind` | enum variant (`review`, `compact`, `thread_spawn`, `memory_consolidation`, `other`) | fixture |
+| `subagent_kind` (`session_meta`) | `source.subagent` (string, or first key of an object) | Tag | `rollout_metadata.subagent_kind` | enum variant (`review`, `compact`, `thread_spawn`, `memory_consolidation`, `other`) | live (`other` for the guardian) |
 | `subagent_parent_thread_id` (`session_meta`) | `source.subagent.thread_spawn.parent_thread_id` | Id | `rollout_metadata.subagent_parent_thread_id` | parent thread UUID | fixture |
 | `subagent_depth` (`session_meta`) | `source.subagent.thread_spawn.depth` | Number | `rollout_metadata.subagent_depth` | nesting depth | fixture |
 | `rate_limits.secondary.{used_percent, window_minutes, resets_at}` (`token_count`) | same | Number (decimal text for `used_percent`) | `codex_rate_limit_windows.secondary_*` | quota counters, like `primary` | fixture (live saw `null`) |
@@ -285,6 +293,12 @@ of five: `parent_thread_id`, `depth`, `agent_path`, `agent_nickname`,
   (same attempt worktree), never linked to a parent session. Whether its
   `token_usage_record.session_id` differs from its own `session_meta.id`
   (envelopes keep that field) is a live-run question.
+  **Live (A4 run): the guardian does name its parent**, outside
+  `source`: `session_meta.parent_thread_id` and `session_meta.session_id`
+  both equal the parent's `session_meta.id`, `thread_source` is
+  `guardian_review`, and its `token_usage_record.session_id` is the parent's
+  (`thread_id` is its own). None of these is collected yet; see
+  [codex-live-0.154.0-a4.md](codex-live-0.154.0-a4.md).
 - Whether `parent_thread_id` equals the parent's `session_meta.id` holds in
   the fixtures only (thread id = session id in every 0.154.0 fixture).
 

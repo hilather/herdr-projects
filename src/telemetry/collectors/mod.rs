@@ -92,36 +92,36 @@ fn codex_fields() -> Vec<Field> {
     let usage = |kind: &'static str, prefix: &str, caveat: Option<&'static str>| USAGE.map(|name|
         field(kind, format!("{prefix}.{name}"), Live, if name == "cache_write_input_tokens" && caveat.is_none() { Some("overlap_with_input_not_certified") } else { caveat }));
     let mut fields = vec![
-        field("line", "timestamp", Fixture, Some("envelope_occurred_unix_ms")),
+        field("line", "timestamp", Live, Some("envelope_occurred_unix_ms")),
         field("session_meta", "id", Live, None),
         field("session_meta", "timestamp", Live, None),
         field("session_meta", "cwd", Live, None),
         field("session_meta", "cli_version", Live, None),
-        field("session_meta", "originator", Fixture, None),
-        field("session_meta", "source", Fixture, None),
-        // A4: metadata of the proposed §5/§7 revision (contracts-collection.md),
-        // fixture-certified until the planned live run.
-        field("session_meta", "model_provider", Fixture, None),
+        field("session_meta", "originator", Live, None),
+        field("session_meta", "source", Live, None),
+        // A4: metadata of the §5/§7 revision (contracts-collection.md). Live where
+        // the A4 live run (codex-live-0.154.0-a4.md) saw a value; else fixture.
+        field("session_meta", "model_provider", Live, None),
         field("session_meta", "forked_from_id", Fixture, Some("semantics_not_certified")),
-        field("session_meta", "subagent_kind", Fixture, Some("from_source_subagent")),
+        field("session_meta", "subagent_kind", Live, Some("from_source_subagent")),
         field("session_meta", "subagent_parent_thread_id", Fixture, Some("from_source_subagent")),
         field("session_meta", "subagent_depth", Fixture, Some("from_source_subagent")),
         absent("session_meta", "forked_from_ordinal_exclusive", "not_collected"),
         absent("session_meta", "agent_nickname", "not_collected"),
         absent("session_meta", "agent_role", "not_collected"),
         absent("session_meta", "base_instructions", "content_forbidden"),
-        field("turn_context", "turn_id", Fixture, None),
+        field("turn_context", "turn_id", Live, None),
         field("turn_context", "model", Live, None),
         field("turn_context", "effort", Live, None),
         absent("turn_context", "cwd", "not_collected"),
         absent("turn_context", "approval_policy", "not_collected"),
         absent("turn_context", "collaboration_mode", "content_forbidden"),
         absent("turn_context", "user_instructions", "content_forbidden"),
-        field("task_started", "turn_id", Fixture, None),
+        field("task_started", "turn_id", Live, None),
         absent("task_started", "started_at", "not_collected"),
-        field("token_usage_record", "session_id", Fixture, None),
-        field("token_usage_record", "turn_id", Fixture, None),
-        field("token_usage_record", "response_id", Fixture, None),
+        field("token_usage_record", "session_id", Live, Some("guardian_reports_parent_session")),
+        field("token_usage_record", "turn_id", Live, None),
+        field("token_usage_record", "response_id", Live, None),
     ];
     fields.extend(usage("token_usage_record", "usage", None));
     fields.extend(usage("token_usage_record", "thread_token_usage", Some("reconciliation_only")));
@@ -142,15 +142,16 @@ fn codex_fields() -> Vec<Field> {
         field("token_count", "rate_limits.secondary.resets_at", Fixture, Some("semantics_not_certified")),
         field("token_count", "rate_limits.rate_limit_reached_type", Fixture, Some("semantics_not_certified")),
         absent("token_count", "rate_limits.credits", "not_collected"),
-        field("task_complete", "turn_id", Fixture, None),
-        field("task_complete", "duration_ms", Fixture, None),
-        field("task_complete", "time_to_first_token_ms", Fixture, None),
+        field("task_complete", "turn_id", Live, None),
+        field("task_complete", "duration_ms", Live, None),
+        field("task_complete", "time_to_first_token_ms", Live, None),
         absent("task_complete", "started_at", "not_collected"),
         absent("task_complete", "completed_at", "not_collected"),
         absent("task_complete", "last_agent_message", "content_forbidden"),
         absent("response_item", "*", "content_forbidden"),
-        // Tool/exec metadata (call id, tool name, duration, exit status): proposed
-        // in the A4 revision, held until the live run shows its record shape.
+        // Tool/exec metadata (call id, tool name, duration, exit status): held. The
+        // A4 live run found no typed `*_end` events in 0.154.0 rollouts; the shape
+        // and a proposed allowlist are in codex-live-0.154.0-a4.md.
         absent("exec_command_end", "*", "not_collected"),
         absent("mcp_tool_call_end", "*", "not_collected"),
     ]);

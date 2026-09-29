@@ -420,34 +420,34 @@ fn leaves(value: &Value, prefix: &str, out: &mut BTreeSet<String>) {
 /// The capability table, hand-checked against contracts §5, the sanitizer
 /// allowlist and docs/telemetry/codex-live-0.154.0.md, printed as text.
 const CAPABILITIES: &str = "codex rollout_jsonl certified_versions=0.154.0
-  line.timestamp available=true basis=reported certified=fixture caveat=envelope_occurred_unix_ms
+  line.timestamp available=true basis=reported certified=live caveat=envelope_occurred_unix_ms
   session_meta.id available=true basis=reported certified=live
   session_meta.timestamp available=true basis=reported_excerpt certified=live
   session_meta.cwd available=true basis=reported_home_redacted certified=live
   session_meta.cli_version available=true basis=reported_excerpt certified=live
-  session_meta.originator available=true basis=reported_excerpt certified=fixture
-  session_meta.source available=true basis=reported_excerpt certified=fixture
-  session_meta.model_provider available=true basis=reported_excerpt certified=fixture
+  session_meta.originator available=true basis=reported_excerpt certified=live
+  session_meta.source available=true basis=reported_excerpt certified=live
+  session_meta.model_provider available=true basis=reported_excerpt certified=live
   session_meta.forked_from_id available=true basis=reported certified=fixture caveat=semantics_not_certified
-  session_meta.subagent_kind available=true basis=reported_excerpt certified=fixture caveat=from_source_subagent
+  session_meta.subagent_kind available=true basis=reported_excerpt certified=live caveat=from_source_subagent
   session_meta.subagent_parent_thread_id available=true basis=reported certified=fixture caveat=from_source_subagent
   session_meta.subagent_depth available=true basis=reported certified=fixture caveat=from_source_subagent
   session_meta.forked_from_ordinal_exclusive available=false basis=unavailable certified=none reason=not_collected
   session_meta.agent_nickname available=false basis=unavailable certified=none reason=not_collected
   session_meta.agent_role available=false basis=unavailable certified=none reason=not_collected
   session_meta.base_instructions available=false basis=unavailable certified=none reason=content_forbidden
-  turn_context.turn_id available=true basis=reported certified=fixture
+  turn_context.turn_id available=true basis=reported certified=live
   turn_context.model available=true basis=reported_excerpt certified=live
   turn_context.effort available=true basis=reported_excerpt certified=live
   turn_context.cwd available=false basis=unavailable certified=none reason=not_collected
   turn_context.approval_policy available=false basis=unavailable certified=none reason=not_collected
   turn_context.collaboration_mode available=false basis=unavailable certified=none reason=content_forbidden
   turn_context.user_instructions available=false basis=unavailable certified=none reason=content_forbidden
-  task_started.turn_id available=true basis=reported certified=fixture
+  task_started.turn_id available=true basis=reported certified=live
   task_started.started_at available=false basis=unavailable certified=none reason=not_collected
-  token_usage_record.session_id available=true basis=reported certified=fixture
-  token_usage_record.turn_id available=true basis=reported certified=fixture
-  token_usage_record.response_id available=true basis=reported certified=fixture
+  token_usage_record.session_id available=true basis=reported certified=live caveat=guardian_reports_parent_session
+  token_usage_record.turn_id available=true basis=reported certified=live
+  token_usage_record.response_id available=true basis=reported certified=live
   token_usage_record.usage.cache_write_input_tokens available=true basis=reported certified=live caveat=overlap_with_input_not_certified
   token_usage_record.usage.cached_input_tokens available=true basis=reported certified=live
   token_usage_record.usage.input_tokens available=true basis=reported certified=live
@@ -482,9 +482,9 @@ const CAPABILITIES: &str = "codex rollout_jsonl certified_versions=0.154.0
   token_count.rate_limits.secondary.resets_at available=true basis=reported certified=fixture caveat=semantics_not_certified
   token_count.rate_limits.rate_limit_reached_type available=true basis=reported_excerpt certified=fixture caveat=semantics_not_certified
   token_count.rate_limits.credits available=false basis=unavailable certified=none reason=not_collected
-  task_complete.turn_id available=true basis=reported certified=fixture
-  task_complete.duration_ms available=true basis=reported certified=fixture
-  task_complete.time_to_first_token_ms available=true basis=reported certified=fixture
+  task_complete.turn_id available=true basis=reported certified=live
+  task_complete.duration_ms available=true basis=reported certified=live
+  task_complete.time_to_first_token_ms available=true basis=reported certified=live
   task_complete.started_at available=false basis=unavailable certified=none reason=not_collected
   task_complete.completed_at available=false basis=unavailable certified=none reason=not_collected
   task_complete.last_agent_message available=false basis=unavailable certified=none reason=content_forbidden
