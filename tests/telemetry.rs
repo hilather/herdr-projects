@@ -620,5 +620,8 @@ fn verification_combines_every_acceptance_policy() {
     let second = record();
     assert_eq!(second["verification"], serde_json::json!({"state": "rejected", "reason": "checks_failed", "policies": [
         {"policy_id": "clean", "state": "accepted"}, {"policy_id": "content", "state": "rejected", "reason": "checks_failed"}]}));
+    assert_eq!(second["integration"], serde_json::json!({"state": "not_applicable", "reason": "verification_rejected"}));
     assert_eq!((&second["terminal_state"], &second["accepted"]), (&serde_json::json!("cancelled"), &serde_json::json!(false)));
+    assert_eq!(f.text(&["attempts"]), format!("{} task=work state=cancelled active_ms=unavailable:not_running result=submitted \
+        verification=rejected:checks_failed integration=not_applicable:verification_rejected accepted=false usage=unavailable:collection_not_run\n", f.attempt));
 }

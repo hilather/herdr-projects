@@ -82,14 +82,15 @@ fn record(db: &Connection, version: u32, attempt: &str, task: &str, state: &str,
         None => (json!({"state": "not_submitted"}), json!({"state": "not_submitted"}), json!({"state": if integrates { "not_submitted" } else { "not_applicable" }})),
         Some((id, candidate, created, _)) => {
             let verification = verification(db, id, home)?;
-            let integration = if !integrates { "not_applicable".to_owned() } else {
+            let integration = if !integrates { json!({"state": "not_applicable"}) } else {
                 db.query_row("SELECT i.state,EXISTS(SELECT 1 FROM integrated_commits c WHERE c.operation_id=i.operation_id) FROM integration_operations i
                     JOIN verified_results r ON r.result_id=i.verified_result_id WHERE r.submission_id=?1 ORDER BY i.created_unix_ms DESC,i.generation DESC LIMIT 1",
                     [id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))).optional()?
-                    .map(|(state, committed)| if committed { "integrated".to_owned() } else if state == "integrated" { "integrated_unconfirmed".to_owned() } else { state })
-                    .unwrap_or_else(|| "pending".to_owned())
+                    .map(|(state, committed)| json!({"state": if committed { "integrated" } else if state == "integrated" { "integrated_unconfirmed" } else { &state }}))
+                    // Without an operation a rejected submission is not eligible (every policy needs an accepted run).
+                    .unwrap_or_else(|| if verification["state"] == "rejected" { json!({"reason": "verification_rejected", "state": "not_applicable"}) } else { json!({"state": "pending"}) })
             };
-            (json!({"candidate_oid": candidate, "created_unix_ms": created, "state": "submitted", "submission_id": id}), verification, json!({"state": integration}))
+            (json!({"candidate_oid": candidate, "created_unix_ms": created, "state": "submitted", "submission_id": id}), verification, integration)
         }
     };
     // Contracts §6 `A`: evidence from any of this attempt's submissions for the current contract revision.
@@ -139,7 +140,10 @@ fn verification(db: &Connection, submission: &str, home: Option<&str>) -> rusqli
 pub fn text(report: &Value) -> String {
     let show = |v: &Value| match v {
         Value::Object(map) if map.contains_key("total_tokens") => format!("in={} out={} total={}", map["input_tokens"], map["output_tokens"], map["total_tokens"]),
-        Value::Object(map) => format!("{}:{}", map.get("status").or(map.get("state")).and_then(Value::as_str).unwrap_or("?"), map.get("reason").and_then(Value::as_str).unwrap_or("")),
+        Value::Object(map) => {
+            let state = map.get("status").or(map.get("state")).and_then(Value::as_str).unwrap_or("?");
+            map.get("reason").and_then(Value::as_str).map_or_else(|| state.to_owned(), |reason| format!("{state}:{reason}"))
+        }
         other => other.to_string(),
     };
     report["attempts"].as_array().into_iter().flatten().map(|a| format!("{} task={} state={} active_ms={} result={} verification={} integration={} accepted={} usage={}\n",

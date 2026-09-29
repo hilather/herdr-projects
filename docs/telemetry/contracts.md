@@ -249,7 +249,9 @@ S3 refinements:
   with the reader's `HOME`;
   `integration` `{state}` from the same submission: `not_applicable` unless the
   route is `verify_then_integrate`, then `not_submitted`, `pending` (no
-  operation), the latest operation state, `integrated` (with an
+  operation), `not_applicable` with reason `verification_rejected` (no
+  operation and the verification is rejected, so the submission is not
+  eligible), the latest operation state, `integrated` (with an
   `integrated_commits` row) or `integrated_unconfirmed` (state without a
   commit row); `classification` `{classification_id, class, band}`. A missing
   decision makes `configuration_id` and `classification` `unavailable:

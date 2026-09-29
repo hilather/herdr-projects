@@ -104,6 +104,14 @@ impl Fixture {
         (serde_json::from_slice(&out.stdout).unwrap(), bytes)
     }
 
+    /// Run a telemetry command in its text form; returns its stdout.
+    pub fn text(&self, args: &[&str]) -> String {
+        let out = Command::new(BIN).env_clear().env("HOME", self.tmp.path().join("home")).env("PATH", "/usr/bin:/bin")
+            .args(["--root", self.root.to_str().unwrap(), "telemetry", "demo"]).args(args).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    }
+
     /// Run a telemetry command that must fail; returns its stderr.
     pub fn cli_fail(&self, args: &[&str]) -> String {
         let out = Command::new(BIN).env_clear().env("HOME", self.tmp.path().join("home")).env("PATH", "/usr/bin:/bin")
