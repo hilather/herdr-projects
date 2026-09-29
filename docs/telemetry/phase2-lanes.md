@@ -202,3 +202,10 @@ merges one PR at a time.
   producer; M36 does not see rebases a worker does in its own worktree. Also:
   feed the F4.6/F5.4 scale-trial steps in as named concurrency levels,
   per-configuration fan-out, and a configurable window (fixed at 1 h now).
+- **D6 follow-ups** (lane D/steward): a verified seeded result can still
+  satisfy a dependent task's `verified_result` requirement (integration is
+  guarded, the dependency path is not); findings linked to a seed probably
+  belong outside M21/M22 credit; review completions are not in the shared
+  ledger, so `--as-of` replays triage and detections only; the seeds CLI
+  principal is always `operator:cli` (workers refused at the store API only);
+  seeding replay-suite tasks (TM4.6) and a reviewer brief builder.

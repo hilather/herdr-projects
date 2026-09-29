@@ -36,7 +36,7 @@ needs a new reviewed revision, not a silent reinterpretation.
   (RFC 8785 subset, as doc 03 §4). Digests are `sha256:` + lowercase hex.
 - **Time.** Unix milliseconds from the controller's `now` at the transition.
   Codex times are kept as reported and never reorder canonical events.
-- **Stores.** Canonical: `<project>/.state/state.db`, migrations 0049–0057 (0052 collector bindings, contracts-collection.md; 0053 candidate groups, contracts-quality.md §3; 0054 review capture, contracts-review.md; 0055 finding triage and duplicate history, contracts-review.md §5; 0056 fix attribution, regressions and role credit, contracts-review.md §6; 0057 review protocols, passes and preregistered experiments, contracts-review.md §7).
+- **Stores.** Canonical: `<project>/.state/state.db`, migrations 0049–0058 (0052 collector bindings, contracts-collection.md; 0053 candidate groups, contracts-quality.md §3; 0054 review capture, contracts-review.md; 0055 finding triage and duplicate history, contracts-review.md §5; 0056 fix attribution, regressions and role credit, contracts-review.md §6; 0057 review protocols, passes and preregistered experiments, contracts-review.md §7; 0058 seeded defects, recall and the seeded-candidate integration guard, contracts-review.md §8).
   Sidecar: `<project>/.state/telemetry.db`, own sequence under
   `migrations/telemetry/`, mode 0600, created on first collect. No
   cross-database transaction or foreign key; sidecar rows reference canonical
@@ -546,4 +546,6 @@ opportunities, exact-candidate fix verification and integration links,
 reopen lineage, causal introduction decisions and fractional role credit,
 versioned review protocols, second-review passes with incremental yield
 (M28, descriptive), preregistered randomized/matched review experiments
-with exclusions and crossover (contracts-review.md §5–§7).
+with exclusions and crossover, the seeded-defect registry, clean controls,
+reveal/discard lifecycle, the seeded-candidate integration guard and
+M43/M44 (contracts-review.md §5–§8).
