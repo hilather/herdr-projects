@@ -258,3 +258,33 @@ merges one PR at a time.
   `canonical_worker_and_routine_admission_take_separate_project_turns`,
   `coordinator_jobs::notification…seen_or_handled…` (effect.lock busy) and
   `routine_jobs::…completed_ticket_must_be_drained…` (line 188).
+
+### From live run 2 (codex-live-0.154.0-run2.md)
+Steward §7 decision on the proposed allowlist: approved, metadata only.
+- `McpToolCall`: `id`, `server` and `tool` (Tag, excerpt rules applied; they
+  are configuration names like tool names, no digest needed), `status`,
+  `readOnlyHint`, `result.isError`, `duration` (with a startup caveat). Never
+  `arguments` or `result.content`.
+- `failed` is a certified exec status.
+- `turn_aborted`: `reason` (Tag) and `duration_ms`.
+- `SubAgentActivity` and `CollabAgentToolCall`: item type, ids and status
+  only.
+- The fork's `history_base.{thread_id, end_ordinal_exclusive,
+  end_byte_offset}` and `forked_from_ordinal_exclusive`.
+- `function_call.namespace` (Tag).
+
+Cards:
+- **A8** (lane A): implement the allowlist above. Treat `turn_aborted` as a
+  final event (A7 now raises a false `final_event_missing` for an aborted
+  turn). Reconcile a fork's thread and token_count totals against its
+  origin's total at the fork point (today every fork records false
+  discrepancies).
+- **B12** (lane B):
+  - M17 counts `failed` with a non-zero exit as a failure.
+  - M16 reports calls that ended in `turn_aborted` as declined or aborted.
+  - Fork inclusion becomes `separate`, since a live fork replays no records.
+  - Quota window matching tolerates small `resets_at` jitter (+5 s seen).
+  - `plan_type: null` is not a different account.
+- Still unavailable: M18 (the exec item duration is run time minus a
+  startup window, not run time); M38/M39 (transport errors never reach
+  rollouts); the cache-write convention (always 0 live).
