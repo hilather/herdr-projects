@@ -29,12 +29,14 @@ pub fn codex_allowlist(kind: &str) -> Option<Vec<(String, Class)>> {
     let fields = |list: &[(&str, Class)]| list.iter().map(|(path, class)| (path.to_string(), *class)).collect::<Vec<_>>();
     let usage = |prefix: &'static str| USAGE.iter().map(move |f| (format!("{prefix}.{f}"), Number));
     Some(match kind {
-        "session_meta" => fields(&[("id", Id), ("timestamp", Text), ("cwd", Path), ("cli_version", Text), ("originator", Text), ("source", Tag)]),
+        "session_meta" => fields(&[("id", Id), ("timestamp", Text), ("cwd", Path), ("cli_version", Text), ("originator", Text), ("source", Tag),
+            ("model_provider", Text), ("forked_from_id", Id), ("subagent_kind", Tag), ("subagent_parent_thread_id", Id), ("subagent_depth", Number)]),
         "turn_context" => fields(&[("turn_id", Id), ("model", Text), ("effort", Text)]),
         "token_usage_record" => fields(&[("session_id", Id), ("turn_id", Id), ("response_id", Id)]).into_iter()
             .chain(usage("usage")).chain(usage("thread_token_usage")).collect(),
         "token_count" => fields(&[("rate_limits.limit_id", Text), ("rate_limits.plan_type", Text), ("rate_limits.primary.used_percent", Number),
-            ("rate_limits.primary.window_minutes", Number), ("rate_limits.primary.resets_at", Number)]).into_iter()
+            ("rate_limits.primary.window_minutes", Number), ("rate_limits.primary.resets_at", Number), ("rate_limits.secondary.used_percent", Number),
+            ("rate_limits.secondary.window_minutes", Number), ("rate_limits.secondary.resets_at", Number), ("rate_limits.rate_limit_reached_type", Text)]).into_iter()
             .chain(usage("info.total_token_usage")).collect(),
         "task_started" => fields(&[("turn_id", Id)]),
         "task_complete" => fields(&[("turn_id", Id), ("duration_ms", Number), ("time_to_first_token_ms", Number)]),
@@ -42,11 +44,30 @@ pub fn codex_allowlist(kind: &str) -> Option<Vec<(String, Class)>> {
     })
 }
 
+/// Allowlisted envelope fields read from another place of the record: the
+/// Codex subagent source (`session_meta.source.subagent`, a string or a
+/// one-key object) is kept as flat fields beside the `source` tag
+/// (contracts-collection.md A4).
+fn source_path(path: &str) -> &str {
+    match path {
+        "subagent_kind" => "source.subagent",
+        "subagent_parent_thread_id" => "source.subagent.thread_spawn.parent_thread_id",
+        "subagent_depth" => "source.subagent.thread_spawn.depth",
+        other => other,
+    }
+}
+
+/// The allowlisted field at envelope `path` of `raw`, sanitized by `class`;
+/// `null` when absent or not of its class.
+pub fn field(raw: &Value, path: &str, class: Class) -> Value {
+    source_path(path).split('.').try_fold(raw, |value, key| value.get(key)).map_or(Value::Null, |value| keep(value, class))
+}
+
 /// A new object holding only `fields` of `raw`, each sanitized by its class.
 pub fn payload(fields: &[(String, Class)], raw: &Value) -> Value {
     let mut out = Value::Object(Map::new());
     for (path, class) in fields {
-        let value = path.split('.').try_fold(raw, |value, key| value.get(key)).map_or(Value::Null, |value| keep(value, *class));
+        let value = field(raw, path, *class);
         let mut slot = &mut out;
         for key in path.split('.') {
             slot = slot.as_object_mut().expect("allowlist paths nest objects only").entry(key).or_insert_with(|| Value::Object(Map::new()));

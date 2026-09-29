@@ -13,9 +13,10 @@ use std::{fs, os::unix::process::CommandExt, path::Path, process::Command};
 use support::telemetry::*;
 
 /// sha256 of the sanitized canonical payloads of `head.jsonl` lines 5 and 6,
-/// computed with `sha256sum` outside the crate.
+/// computed with `sha256sum` outside the crate. Line 6 (`token_count`) carries
+/// the A4 fields `rate_limits.{secondary.*, rate_limit_reached_type}` as `null`.
 const USAGE_DIGEST: &str = "sha256:9768f3bc423b89bc5cf97404ab8900514dc7c98f82e53f06c13aa46fcd1986f8";
-const TOKEN_COUNT_DIGEST: &str = "sha256:75b89315857fa6d660a0fc1edfde66c3840c636e1c6abe4247db93c84dea1200";
+const TOKEN_COUNT_DIGEST: &str = "sha256:d6859cca51308b5f0006f990de8ff2f82d23ebe519be5ec4ef1a4da32384d654";
 
 fn digest(path: &Path) -> String { format!("sha256:{:x}", Sha256::digest(path.as_os_str().as_encoded_bytes())) }
 
@@ -34,7 +35,7 @@ fn ledger(f: &Fixture) -> Vec<String> {
     let db = f.sidecar();
     let mut out = Vec::new();
     for table in ["source_observations", "ingest_quarantine", "coverage_gaps", "source_cursors", "codex_usage", "codex_turns", "codex_rate_limits",
-        "codex_quarantine", "codex_discrepancy", "collect_offsets", "rollout_sources"] {
+        "codex_quarantine", "codex_discrepancy", "collect_offsets", "rollout_sources", "rollout_metadata", "codex_usage_times", "codex_rate_limit_windows"] {
         let mut stmt = db.prepare(&format!("SELECT * FROM {table} ORDER BY 1,2")).unwrap();
         let names: Vec<String> = stmt.column_names().into_iter().map(str::to_owned).collect();
         let rows = stmt.query_map([], |r| Ok(names.iter().enumerate().filter(|(_, n)| !matches!(n.as_str(), "observed_unix_ms" | "updated_unix_ms"))
@@ -106,11 +107,12 @@ fn envelopes_replay_identically_after_interrupted_collect() {
         FROM source_observations WHERE producer_epoch=?1 AND producer_sequence=?2", rusqlite::params![source, starts[line - 1] as i64],
         |r| Ok((0..8).map(|i| r.get::<_, String>(i)).collect::<rusqlite::Result<Vec<_>>>()?)).unwrap();
     let provenance = r#"{"adapter":"codex","adapter_version":"0.154.0","interface":"rollout_jsonl","source_trust":"collector_observed"}"#;
-    let measurement = r#"{"coverage":"complete","measurement_basis":"reported","normalization_version":1}"#;
+    // `token_count` widened its allowlist in A4: normalization version 2.
+    let measurement = |version: i64| format!(r#"{{"coverage":"complete","measurement_basis":"reported","normalization_version":{version}}}"#);
     let identity = format!(r#"{{"session_id":"{sid}"}}"#);
-    for (line, kind, payload_digest) in [(5, "codex.token_usage_record.v1", USAGE_DIGEST), (6, "codex.token_count.v1", TOKEN_COUNT_DIGEST)] {
+    for (line, kind, version, payload_digest) in [(5, "codex.token_usage_record.v1", 1, USAGE_DIGEST), (6, "codex.token_count.v1", 2, TOKEN_COUNT_DIGEST)] {
         assert_eq!(envelope(line), [format!("codex:{source}:{}", starts[line - 1]), format!("codex:{sid}"), source.clone(), kind.into(),
-            identity.clone(), provenance.into(), measurement.into(), payload_digest.into()]);
+            identity.clone(), provenance.into(), measurement(version), payload_digest.into()]);
     }
     // Line 4 (`response_item`) is not allowlisted: no envelope.
     assert_eq!(f.sidecar().query_row("SELECT count(*) FROM source_observations WHERE producer_epoch=?1 AND producer_sequence=?2",

@@ -174,12 +174,13 @@ each with a value somewhere, and no unavailable field.
   `token_usage_record.{session_id, response_id}`,
   `task_complete.{duration_ms, time_to_first_token_ms}` and line timestamps.
   The live prerequisite is the planned small live run (owner decision 5).
-- *Not collected:* `model_provider`, `rate_limits.{secondary, credits,
-  limit_name, rate_limit_reached_type}`, `info.{last_token_usage,
-  model_context_window}`, `turn_token_usage`, `thread_id`, `root_turn_id`,
-  start and completion times, tool/exec metadata, and parent/guardian session
-  linkage (A4). Content is never collected: instructions, messages,
-  reasoning, `last_agent_message` and `response_item`.
+- *Not collected:* `rate_limits.{credits, limit_name}`,
+  `info.{last_token_usage, model_context_window}`, `turn_token_usage`,
+  `thread_id`, `root_turn_id`, start and completion times, and tool/exec
+  metadata. (A4 below adds `model_provider`, per-record times,
+  `rate_limits.{secondary, rate_limit_reached_type}` and subagent/fork
+  parent ids, fixture-certified.) Content is never collected: instructions,
+  messages, reasoning, `last_agent_message` and `response_item`.
 - Nothing about reviews, findings or verification comes from the Codex
   adapter. Lane D captures those canonically, not from rollouts.
 
@@ -202,9 +203,214 @@ session's record count tells them apart.
 
 **Gate items not covered by this suite:**
 - Ordinal resets and resume across files, nested (guardian) usage, and model
-  switches inside a session. A resumed session that restarts ordinals is
-  quarantined (`rewritten_record_is_quarantined`), and B2 splits model
-  segments. The rest is A4.
+  switches inside a session: covered by A4 (below).
 - A lost final event that is never written. There is no signal for it beyond
   the discrepancy between the thread total and the sum.
 - Cross-surface overlap. Codex has one surface (`rollout_jsonl`).
+
+## A4 (TM1.3 remainder): Codex metadata, child sessions, resume
+
+### A4 proposed contracts.md §5/§7 revision
+
+**Status: proposed by lane A, awaiting steward review.** `contracts.md` is a
+steward file, so the revision is written here; the implementation below
+follows it and every new field is certified `fixture` until the planned small
+live run (owner decision 5). No field below is content: each is an
+identifier, an enum-like tag, a number or a time that Codex writes about the
+session, never text a person or model wrote.
+
+| Envelope field (kind) | Read from | Class (§7 rule) | Stored in | Why it is not content | Certified |
+|---|---|---|---|---|---|
+| line `timestamp` (`token_usage_record`) | the line | time → Unix ms | `codex_usage_times.record_unix_ms` | when Codex wrote the record | fixture |
+| `model_provider` (`session_meta`) | `model_provider` | Text (excerpt rules 1–5) | `rollout_metadata.model_provider` | configured provider id (`openai`) | fixture |
+| `forked_from_id` (`session_meta`) | `forked_from_id` | Id (≤128, no control chars) | `rollout_metadata.forked_from_id` | another session's UUID | fixture, semantics not certified |
+| `subagent_kind` (`session_meta`) | `source.subagent` (string, or first key of an object) | Tag | `rollout_metadata.subagent_kind` | enum variant (`review`, `compact`, `thread_spawn`, `memory_consolidation`, `other`) | fixture |
+| `subagent_parent_thread_id` (`session_meta`) | `source.subagent.thread_spawn.parent_thread_id` | Id | `rollout_metadata.subagent_parent_thread_id` | parent thread UUID | fixture |
+| `subagent_depth` (`session_meta`) | `source.subagent.thread_spawn.depth` | Number | `rollout_metadata.subagent_depth` | nesting depth | fixture |
+| `rate_limits.secondary.{used_percent, window_minutes, resets_at}` (`token_count`) | same | Number (decimal text for `used_percent`) | `codex_rate_limit_windows.secondary_*` | quota counters, like `primary` | fixture (live saw `null`) |
+| `rate_limits.rate_limit_reached_type` (`token_count`) | same | Text | `codex_rate_limit_windows.rate_limit_reached_type` | enum-like limit tag | fixture, semantics not certified |
+
+Proposed but **held** (not implemented; capability rows
+`exec_command_end.*` and `mcp_tool_call_end.*` are `not_collected`): tool and
+exec metadata for B5 (M16–M18): `call_id`, `turn_id` (Id), `exit_code`,
+`duration.{secs,nanos}` (Number), `status` (Text), and for MCP
+`invocation.{server, tool}` (Text). Never `command`, `cwd`, `parsed_cmd`,
+`stdout`, `stderr`, `aggregated_output`, `formatted_output`, `arguments` or
+`result`. Held because the record shapes in 0.154.0 rollouts are not
+observed: the live run saw `item_completed` records (one record mixing the
+command, its output and the metadata), not typed `exec_command_end`, and a
+parser for a guessed shape would certify only its own fixture. The live
+probe below records the shape first.
+
+Still not collected: `agent_nickname`, `agent_role`, `agent_path`
+(user-chosen names and a path), `forked_from_ordinal_exclusive` and
+`subagent_history_start_ordinal` (semantics unknown), `credits` (holds a
+balance string), `limit_name`, and all content (§7).
+
+**Proposed contracts.md text** (steward diff):
+- §5 *Allowlisted fields*: after `source` add "`model_provider`,
+  `forked_from_id`, and from `source.subagent` its variant and, for
+  `thread_spawn`, `parent_thread_id` and `depth`"; after
+  `primary.{…}` add "`secondary.{used_percent, window_minutes, resets_at}`,
+  `rate_limit_reached_type`"; and "the line `timestamp` of each
+  `token_usage_record`".
+- §5 new bullet: "A4 metadata (sidecar stream `ingest` 0004:
+  `rollout_metadata`, `codex_usage_times`, `codex_rate_limit_windows`) is
+  read leniently: a value of another type is stored as `NULL` and never
+  makes its record malformed. It is outside `payload_digest`; the first
+  stored value stays."
+- §7 *Default*: "metadata only (IDs, digests, enums, counters, timestamps,
+  durations, provider and parent-session identifiers)"; *Never collected*
+  unchanged. The held tool/exec fields would add "tool call ids, tool and
+  MCP server names, exit statuses and durations; never commands, arguments
+  or output" once reviewed and shape-certified.
+
+### Parent session id (Codex 0.154.0)
+
+Evidence, without reading `~/.codex` or running Codex: the serde names in the
+installed 0.154.0 binary (`strings`) show `SessionMeta` fields `id`,
+`forked_from_id`, `forked_from_ordinal_exclusive`, `timestamp`, `cwd`,
+`originator`, `cli_version`, `source`, `agent_nickname`, `agent_role`,
+`model_provider`, `base_instructions`, …, `subagent_history_start_ordinal`,
+and `SubAgentSource` variants `review`, `compact`, `thread_spawn` (a struct
+of five: `parent_thread_id`, `depth`, `agent_path`, `agent_nickname`,
+`agent_role`), `memory_consolidation`, `other`. So:
+- A **spawned subagent** (`source: {"subagent": {"thread_spawn": {…}}}`)
+  names its parent: collected as `subagent_parent_thread_id`.
+- A **fork** names its origin in `forked_from_id`: collected.
+- A **guardian / auto-review** session (`review` or `other`, model
+  `codex-auto-review`) carries **no parent id** in `session_meta`: not
+  available. Its variant is collected (`subagent_kind`), so it is
+  recognizable, but it can only be attributed through the binding rule
+  (same attempt worktree), never linked to a parent session. Whether its
+  `token_usage_record.session_id` differs from its own `session_meta.id`
+  (envelopes keep that field) is a live-run question.
+- Whether `parent_thread_id` equals the parent's `session_meta.id` holds in
+  the fixtures only (thread id = session id in every 0.154.0 fixture).
+
+### Collection rules
+
+- Tables in sidecar stream `ingest` 0004 (the `codex` stream, steward-owned,
+  is unchanged), keyed like the Codex rows and written in the same
+  transaction: `rollout_metadata(path_digest)` from the file's first
+  `session_meta`; `codex_usage_times(session_id, ordinal, record_unix_ms)`
+  for each stored or replayed usage record (not for a quarantined one);
+  `codex_rate_limit_windows(session_id, ordinal, …)` beside each
+  `codex_rate_limits` row. `CREATE TABLE IF NOT EXISTS`, so a sidecar whose
+  stream table was lost re-runs it.
+- Lenient: a new field of another type is `NULL`; the record keeps its §5
+  rows and is not quarantined (a live-certified `primary` is never lost to
+  an uncertified `secondary`).
+- The line time is not in `payload_digest`, so existing digests (and
+  `DIGEST_1`, `DIGEST_2`) are unchanged; the first stored time stays.
+- **Upgrade.** A source with a `rollout_sources` row but no
+  `rollout_metadata` row was read before A4. Each collect reads such sources
+  again from byte 0 within its budget (like certification re-reads): stored
+  keys dedupe, `collected.records` counts nothing twice, and the envelopes
+  of the widened kinds are replaced.
+- **Envelopes.** `session_meta` and `token_count` envelopes carry the new
+  fields (absent ones as `null`) with `measurement.normalization_version` 2;
+  other kinds stay at 1. An envelope with the same `event_id` and a lower
+  normalization version is superseded in place, not a `digest_conflict`.
+- `herdr-projects telemetry <slug> collectors sessions` (read-only, JSON):
+  per rollout source `{session_id, path_digest, binding, attempt_id,
+  records, model_provider, forked_from_id, subagent {kind,
+  parent_thread_id, depth}, record_times {stored, timed, first_unix_ms,
+  last_unix_ms}}`. `null` is a value the rollout did not report; a sidecar
+  without the A4 tables shows each A4 field `unavailable:
+  predates_collection`, and a source waiting for its re-read (for example
+  its rollout is gone) `unavailable: pending_reread`, never `null`.
+- Existing outputs (`usage`, `attempts`, `report`, `bindings`, accounting)
+  are unchanged. Changed on purpose: the `token_count` envelope payload
+  and digest, `session_meta`/`token_count` normalization version, the
+  capabilities table, and the first collect after the upgrade re-reads
+  bytes.
+
+### Conformance (tests/telemetry_conformance.rs)
+
+Corpus cases `child` (`codex-conformance/child.jsonl`: a `thread_spawn`
+subagent and fork of the edge session, a model switch, exec and MCP tool
+records, the secondary window and a reached type) and `guardian`
+(`guardian.jsonl`: `review` subagent, `codex-auto-review`) join `CASES`, with
+`A4LEAK_*` sentinels in agent names and paths, tool arguments, commands,
+output, MCP results, credits and guardian transcripts.
+
+| Property | Test |
+|---|---|
+| Model provider, fork and subagent parent ids, guardian without parent, per-record times, model switch within a session, secondary window and reached type; child and guardian usage counted once each in the bound attempt | `session_metadata_record_times_and_child_usage_are_collected` |
+| Resume across files: a file replaying the session's history dedupes and only its new record counts (thread total reconciles); a file restarting the ordinals is quarantined and usage is `unavailable: quarantined` | `resume_across_files_dedupes_history_and_quarantines_an_ordinal_restart` |
+| Upgrade of an A3 sidecar: `predates_collection` read-only, then a re-read that equals a fresh collect, no digest conflict, nothing counted twice; a gone rollout stays `pending_reread` | `rollouts_read_before_a4_gain_their_metadata_on_the_next_collect` |
+| No `A4LEAK_*` sentinel in the sidecar (with WAL) or any output, including `collectors sessions` | `planted_sentinels_never_leak` |
+| Capabilities match emitted fields, each new one valued somewhere in the corpus | `capabilities_match_emitted_fields` |
+
+Not covered: a lost final event (no signal); compaction; whether a child or
+forked rollout replays its parent's `token_usage_record`s (a double count
+if it does, see the live probe).
+
+### Live probe recipe (the owner's planned small run)
+
+Same harness and isolation as [codex-live-0.154.0.md](codex-live-0.154.0.md)
+(disposable project and execution home, private login copy, workers under
+`workspace-write`, `HP_LIVE_F1_KEEP=1`). The worker brief should make the
+session run one shell command and, where the profile allows, spawn one
+subagent and trigger one auto-review. Then, from the disposable root:
+
+1. `herdr-projects --root <d>/root telemetry demo collect`, then
+   `collectors sessions`, `usage --json`, `collectors capabilities`.
+2. A key census of every rollout, printing structure only (never values):
+
+   ```sh
+   python3 - <rollouts> <<'PY' | sort | uniq -c
+   import json, sys
+   def keys(v, p=""):
+       if isinstance(v, dict):
+           for n, x in v.items(): keys(x, f"{p}.{n}")
+       else:
+           print(p, type(v).__name__)
+   for f in sys.argv[1:]:
+       for line in open(f):
+           r = json.loads(line)
+           inner = r["payload"].get("type") if isinstance(r.get("payload"), dict) else None
+           keys(r, f"{r.get('type')}/{inner}")
+   PY
+   ```
+
+   Keys are structure, but some records key objects by data (for example
+   patch changes by file path): read the census before sharing it.
+
+3. Check and record: record times non-decreasing and within the session;
+   `model_provider`; `secondary` non-null and its window; the
+   `rate_limit_reached_type` values; the `source` shape of each child and
+   whether `parent_thread_id` equals the parent's `session_meta.id`; the
+   guardian's `source` variant and its `token_usage_record.session_id`; the
+   event types and key paths of tool and exec records (unblocks the held
+   B5 fields); and duplicated usage across sessions:
+   `SELECT response_id, count(DISTINCT session_id) FROM codex_usage GROUP BY 1
+   HAVING count(DISTINCT session_id) > 1` on `telemetry.db`.
+4. Run the canary as before, adding the child and guardian rollouts'
+   strings. Then flip the certified rows in `collectors::codex_fields`
+   from `Fixture` to `Live` (and literal `CAPABILITIES`) only for fields
+   observed with a value.
+
+### Follow-ups for other lanes
+
+- **B2 (session graph):** link a child whose
+  `rollout_metadata.subagent_parent_thread_id` (or `forked_from_id`) equals
+  a known `rollout_sources.session_id` instead of `unlinked_child`, with
+  evidence `thread_spawn_parent` / `forked_from`; use `subagent_kind` for
+  the role (`review` = guardian) alongside the model. A guardian stays
+  unlinked (`no_native_parent_evidence`). Before linking inclusively, rule
+  out replayed parent history in the child (live probe step 3).
+- **B3 (rate cards):** narrow the usage interval per entry to
+  `codex_usage_times.record_unix_ms` (join on `session_id, ordinal`),
+  falling back to session start → first observed when it is `NULL` or the
+  row is absent; check `rollout_metadata.model_provider` against the card's
+  provider. Both fixture-certified.
+- **B4 (quota):** read `codex_rate_limit_windows` as a second window per
+  snapshot (its own `window_minutes`/`resets_at`), and
+  `rate_limit_reached_type` as candidate throttle evidence for M38 once its
+  semantics are certified.
+- **B5:** tool/exec metadata stays held until the live census and a steward
+  review of the §7 wording above.
+- **Steward:** apply the §5/§7 text above to `contracts.md` and list ingest
+  0004 in its index.

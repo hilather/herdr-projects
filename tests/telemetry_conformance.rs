@@ -4,7 +4,10 @@
 //! not already prove: replay of the whole corpus in any chunking, unknown
 //! input ignored, malformed lines quarantined with reasons, binding required
 //! on every attributing output, version gating, planted sentinels, unknown as
-//! unavailable, and `collectors capabilities` matching what is emitted.
+//! unavailable, and `collectors capabilities` matching what is emitted. A4
+//! (TM1.3 remainder) adds session metadata, per-record times, subagent and
+//! guardian child sessions, model switches, resume across files and the
+//! upgrade of a sidecar read before A4.
 
 #![cfg(all(feature = "state-store", target_os = "linux"))]
 #![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
@@ -20,6 +23,14 @@ use support::telemetry::*;
 const EDGE: &str = "../codex-conformance/edge.jsonl";
 const EDGE_SID: &str = "00000000-0000-4000-8000-0000000a3ed6";
 const OLD_SID: &str = "00000000-0000-4000-8000-0000000a3001";
+/// A4 child sessions: a `thread_spawn` subagent of the edge session with a
+/// model switch, and a guardian (`review` subagent, `codex-auto-review`).
+const CHILD: &str = "../codex-conformance/child.jsonl";
+const CHILD_SID: &str = "00000000-0000-4000-8000-0000000a4c01";
+const GUARDIAN: &str = "../codex-conformance/guardian.jsonl";
+const GUARDIAN_SID: &str = "00000000-0000-4000-8000-0000000a4c02";
+/// One more turn of a session, appended after its replayed history.
+const RESUMED: &str = "../codex-conformance/resumed.jsonl";
 
 /// Where a corpus rollout is written, relative to the fixture's one attempt.
 #[derive(Clone, Copy)]
@@ -42,9 +53,9 @@ struct Case {
     place: Place,
 }
 
-/// The shared conformance corpus. `complete` and `edge` are certified and
-/// bound; `uncertified` is bound with a version no live run certified; the
-/// rest are certified but must stay unbound.
+/// The shared conformance corpus. `complete`, `edge`, `child` and `guardian`
+/// are certified and bound; `uncertified` is bound with a version no live run
+/// certified; the rest are certified but must stay unbound.
 const CASES: &[Case] = &[
     Case { name: "complete", sid: SID, parts: &["head.jsonl", "tail.jsonl"], version: "0.154.0", place: Place::Bound },
     Case { name: "edge", sid: EDGE_SID, parts: &["head.jsonl", EDGE], version: "0.154.0", place: Place::Bound },
@@ -52,6 +63,8 @@ const CASES: &[Case] = &[
     Case { name: "cwd-outside", sid: "00000000-0000-4000-8000-0000000a3002", parts: &["head.jsonl"], version: "0.154.0", place: Place::CwdOutside },
     Case { name: "other-home", sid: "00000000-0000-4000-8000-0000000a3003", parts: &["head.jsonl"], version: "0.154.0", place: Place::OtherHome },
     Case { name: "earlier", sid: "00000000-0000-4000-8000-0000000a3004", parts: &["head.jsonl"], version: "0.154.0", place: Place::BeforeDecision },
+    Case { name: "child", sid: CHILD_SID, parts: &[CHILD], version: "0.154.0", place: Place::Bound },
+    Case { name: "guardian", sid: GUARDIAN_SID, parts: &[GUARDIAN], version: "0.154.0", place: Place::Bound },
 ];
 
 fn case(name: &str) -> &'static Case { CASES.iter().find(|c| c.name == name).unwrap() }
@@ -87,7 +100,8 @@ fn ledger(f: &Fixture) -> Vec<String> {
     let db = f.sidecar();
     let mut out = Vec::new();
     for table in ["source_observations", "ingest_quarantine", "coverage_gaps", "source_cursors", "codex_usage", "codex_turns", "codex_rate_limits",
-        "codex_quarantine", "codex_discrepancy", "collect_offsets", "rollout_sources", "source_bindings"] {
+        "codex_quarantine", "codex_discrepancy", "collect_offsets", "rollout_sources", "source_bindings", "rollout_metadata", "codex_usage_times",
+        "codex_rate_limit_windows"] {
         let mut stmt = db.prepare(&format!("SELECT * FROM {table} ORDER BY 1,2")).unwrap();
         let names: Vec<String> = stmt.column_names().into_iter().map(str::to_owned).collect();
         let rows = stmt.query_map([], |r| Ok(names.iter().enumerate().filter(|(_, n)| !matches!(n.as_str(), "observed_unix_ms" | "updated_unix_ms"))
@@ -135,8 +149,8 @@ fn corpus_replays_identically_in_any_chunking() {
     let f = Fixture::new();
     let paths: Vec<PathBuf> = CASES.iter().map(|c| plant(&f, c.name)).collect();
     let (first, _) = f.cli("collect");
-    // complete 2 + edge 3 + uncertified 2 + three unbound heads.
-    assert_eq!(first["collected"]["records"], 10);
+    // complete 2 + edge 3 + uncertified 2 + three unbound heads + child 2 + guardian 1.
+    assert_eq!(first["collected"]["records"], 13);
     let once = ledger(&f);
     let (again, _) = f.cli("collect");
     assert_eq!((&again["collected"]["records"], &again["collected"]["bytes"]), (&0.into(), &0.into()));
@@ -187,7 +201,7 @@ fn unknown_kinds_and_fields_are_ignored() {
         + r#""cached_input_tokens":50,"input_tokens":200,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":230}}"#);
     assert_eq!(payload(15), r#"{"info":{"total_token_usage":{"cache_write_input_tokens":0,"cached_input_tokens":450,"input_tokens":1300,"output_tokens":160,"#.to_owned()
         + r#""reasoning_output_tokens":90,"total_tokens":1460}},"rate_limits":{"limit_id":"codex","plan_type":"pro","primary":{"resets_at":1790003600,"#
-        + r#""used_percent":50,"window_minutes":300}}}"#);
+        + r#""used_percent":50,"window_minutes":300},"rate_limit_reached_type":null,"secondary":{"resets_at":1790600000,"used_percent":"1.5","window_minutes":10080}}}"#);
     // No quarantine at an unknown kind (edge lines 1 and 2) or unknown field (3 and 4).
     let quarantined: BTreeSet<i64> = quarantine(&f, &key).into_iter().map(|q| q.0).collect();
     assert!((1..=4).all(|n| !quarantined.contains(&edge_line(n))), "{quarantined:?}");
@@ -302,7 +316,7 @@ fn uncertified_version_is_gated_everywhere() {
 
 fn contains_sentinel(bytes: &[u8]) -> Option<&'static str> {
     let lower = bytes.to_ascii_lowercase();
-    ["a3leak", "canary"].into_iter().find(|needle| lower.windows(needle.len()).any(|w| w == needle.as_bytes()))
+    ["a3leak", "a4leak", "canary"].into_iter().find(|needle| lower.windows(needle.len()).any(|w| w == needle.as_bytes()))
 }
 
 /// Privacy: sentinels planted in content fields, unknown kinds, unknown
@@ -315,7 +329,10 @@ fn planted_sentinels_never_leak() {
     let paths: Vec<PathBuf> = CASES.iter().map(|c| plant(&f, c.name)).collect();
     // Every sentinel is in the corpus (the test is not vacuous).
     let corpus: Vec<u8> = paths.iter().flat_map(|p| fs::read(p).unwrap()).collect();
-    for needle in ["A3LEAK_UNKNOWN_KIND", "A3LEAK_UNKNOWN_FIELD", "A3LEAK_TRUNCATED", "A3LEAK_BAD_RECORD", "A3LEAK_CREDITS", "A3LEAK_LIMIT_NAME", "CANARY_USER"] {
+    for needle in ["A3LEAK_UNKNOWN_KIND", "A3LEAK_UNKNOWN_FIELD", "A3LEAK_TRUNCATED", "A3LEAK_BAD_RECORD", "A3LEAK_CREDITS", "A3LEAK_LIMIT_NAME", "CANARY_USER",
+        // A4: subagent names and paths, tool arguments, commands and output, MCP results, guardian transcripts.
+        "A4LEAK_AGENT_PATH", "A4LEAK_NICKNAME", "A4LEAK_ROLE", "A4LEAK_ARGUMENTS", "A4LEAK_COMMAND", "A4LEAK_OUTPUT", "A4LEAK_STDERR",
+        "A4LEAK_MCP_ARGUMENTS", "A4LEAK_MCP_RESULT", "A4LEAK_CREDITS", "A4LEAK_GUARDIAN_TRANSCRIPT", "A4LEAK_GUARDIAN_VERDICT"] {
         assert!(corpus.windows(needle.len()).any(|w| w == needle.as_bytes()), "{needle}");
     }
     let mut output = f.cli("collect").1;
@@ -324,7 +341,7 @@ fn planted_sentinels_never_leak() {
     let _ = reader.query_row("SELECT count(*) FROM source_observations", [], |r| r.get::<_, i64>(0)).unwrap();
     remove_sidecar_rows(&f);
     output.extend(f.cli("collect").1);
-    for args in [&["usage", "--json"][..], &["attempts", "--json"], &["report", "--json"], &["collectors", "status"], &["collectors", "bindings"],
+    for args in [&["usage", "--json"][..], &["attempts", "--json"], &["report", "--json"], &["collectors", "status"], &["collectors", "bindings"], &["collectors", "sessions"],
         &["collectors", "capabilities", "--json"], &["accounting", "sync"], &["accounting", "entries"], &["accounting", "sessions"], &["accounting", "quota", "--json"]] {
         output.extend(f.cli_args(args).1);
     }
@@ -337,7 +354,8 @@ fn planted_sentinels_never_leak() {
         assert_eq!(contains_sentinel(&fs::read(state.join(name)).unwrap()), None, "{name}");
     }
     assert_eq!(contains_sentinel(&output), None, "{}", String::from_utf8_lossy(&output));
-    assert_eq!(f.count("source_observations"), 10 + 11 + 10 + 3 * 6, "the collects read the whole corpus");
+    // complete, edge, uncertified, three unbound heads, child 7 and guardian 4.
+    assert_eq!(f.count("source_observations"), 10 + 11 + 10 + 3 * 6 + 7 + 4, "the collects read the whole corpus");
     drop(reader);
 }
 
@@ -409,7 +427,14 @@ const CAPABILITIES: &str = "codex rollout_jsonl certified_versions=0.154.0
   session_meta.cli_version available=true basis=reported_excerpt certified=live
   session_meta.originator available=true basis=reported_excerpt certified=fixture
   session_meta.source available=true basis=reported_excerpt certified=fixture
-  session_meta.model_provider available=false basis=unavailable certified=none reason=not_collected
+  session_meta.model_provider available=true basis=reported_excerpt certified=fixture
+  session_meta.forked_from_id available=true basis=reported certified=fixture caveat=semantics_not_certified
+  session_meta.subagent_kind available=true basis=reported_excerpt certified=fixture caveat=from_source_subagent
+  session_meta.subagent_parent_thread_id available=true basis=reported certified=fixture caveat=from_source_subagent
+  session_meta.subagent_depth available=true basis=reported certified=fixture caveat=from_source_subagent
+  session_meta.forked_from_ordinal_exclusive available=false basis=unavailable certified=none reason=not_collected
+  session_meta.agent_nickname available=false basis=unavailable certified=none reason=not_collected
+  session_meta.agent_role available=false basis=unavailable certified=none reason=not_collected
   session_meta.base_instructions available=false basis=unavailable certified=none reason=content_forbidden
   turn_context.turn_id available=true basis=reported certified=fixture
   turn_context.model available=true basis=reported_excerpt certified=live
@@ -452,9 +477,11 @@ const CAPABILITIES: &str = "codex rollout_jsonl certified_versions=0.154.0
   token_count.info.last_token_usage available=false basis=unavailable certified=none reason=not_collected
   token_count.info.model_context_window available=false basis=unavailable certified=none reason=not_collected
   token_count.rate_limits.limit_name available=false basis=unavailable certified=none reason=not_collected
-  token_count.rate_limits.secondary available=false basis=unavailable certified=none reason=not_collected
+  token_count.rate_limits.secondary.used_percent available=true basis=reported certified=fixture caveat=semantics_not_certified
+  token_count.rate_limits.secondary.window_minutes available=true basis=reported certified=fixture caveat=semantics_not_certified
+  token_count.rate_limits.secondary.resets_at available=true basis=reported certified=fixture caveat=semantics_not_certified
+  token_count.rate_limits.rate_limit_reached_type available=true basis=reported_excerpt certified=fixture caveat=semantics_not_certified
   token_count.rate_limits.credits available=false basis=unavailable certified=none reason=not_collected
-  token_count.rate_limits.rate_limit_reached_type available=false basis=unavailable certified=none reason=not_collected
   task_complete.turn_id available=true basis=reported certified=fixture
   task_complete.duration_ms available=true basis=reported certified=fixture
   task_complete.time_to_first_token_ms available=true basis=reported certified=fixture
@@ -462,6 +489,8 @@ const CAPABILITIES: &str = "codex rollout_jsonl certified_versions=0.154.0
   task_complete.completed_at available=false basis=unavailable certified=none reason=not_collected
   task_complete.last_agent_message available=false basis=unavailable certified=none reason=content_forbidden
   response_item.* available=false basis=unavailable certified=none reason=content_forbidden
+  exec_command_end.* available=false basis=unavailable certified=none reason=not_collected
+  mcp_tool_call_end.* available=false basis=unavailable certified=none reason=not_collected
 ";
 
 /// `collectors capabilities` cannot drift from the adapter: over the whole
@@ -503,5 +532,150 @@ fn capabilities_match_emitted_fields() {
     assert_eq!(valued, emitted, "every available field has fixture evidence");
     let unavailable = declared(false);
     assert!(emitted.iter().all(|path| !unavailable.iter().any(|u| path == u || path.starts_with(&format!("{u}.")))));
-    assert_eq!(rows.len(), 10 + 11 + 10 + 3 * 6);
+    assert_eq!(rows.len(), 10 + 11 + 10 + 3 * 6 + 7 + 4);
+}
+
+fn rows<T: rusqlite::types::FromSql>(f: &Fixture, sql: &str) -> Vec<Vec<T>> {
+    let db = f.sidecar();
+    let mut stmt = db.prepare(sql).unwrap();
+    let n = stmt.column_count();
+    stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect()).unwrap().map(Result::unwrap).collect()
+}
+
+/// A4 session metadata as collected, with the span of the usage record times.
+fn session(f: &Fixture, sid: &str, path: &Path, records: i64, forked: Value, subagent: Value, times: [i64; 2]) -> Value {
+    json!({"session_id": sid, "path_digest": source(path), "binding": "bound", "attempt_id": f.attempt, "records": records, "model_provider": "openai",
+        "forked_from_id": forked, "subagent": subagent, "record_times": {"stored": records, "timed": records, "first_unix_ms": times[0], "last_unix_ms": times[1]}})
+}
+
+fn no_subagent() -> Value { json!({"kind": null, "parent_thread_id": null, "depth": null}) }
+
+/// A4 on the CLI: the session's model provider, its fork and subagent parent
+/// ids (a `thread_spawn` child names the edge session; a guardian `review`
+/// child names none), each usage record's line time, a model switch inside a
+/// session, and the secondary rate-limit window with the reached type. Child
+/// and guardian rollouts bound to the attempt count in its usage once each.
+#[test]
+fn session_metadata_record_times_and_child_usage_are_collected() {
+    let f = Fixture::new();
+    let [complete, edge, child, guardian] = ["complete", "edge", "child", "guardian"].map(|name| plant(&f, name));
+    let (report, _) = f.cli("collect");
+    // complete 1500/500/0/180/100/1680 + edge 1300/450/0/160/90/1460 + child 30/5/0/9/1/39 + guardian 25/0/0/5/1/30.
+    let sums = json!({"input_tokens": 2855, "cached_input_tokens": 955, "cache_write_input_tokens": 0, "output_tokens": 354,
+        "reasoning_output_tokens": 192, "total_tokens": 3209, "records": 8});
+    assert_eq!(attempt_usage(&report), sums);
+    assert_eq!(f.report()["metrics"]["M08"]["value"], 2855);
+
+    // Head lines carry the fixture time (decision + 1 s); the child and guardian
+    // lines carry literal times from 2030-01-01T00:00:00Z = 1_893_456_000_000 ms.
+    let at = f.decided + 1_000;
+    let (sessions, _) = f.cli_args(&["collectors", "sessions"]);
+    assert_eq!(sessions, json!({"sessions": [
+        session(&f, SID, &complete, 2, Value::Null, no_subagent(), [at, at]),
+        session(&f, EDGE_SID, &edge, 3, Value::Null, no_subagent(), [at, at]),
+        session(&f, CHILD_SID, &child, 2, json!(EDGE_SID), json!({"kind": "thread_spawn", "parent_thread_id": EDGE_SID, "depth": 1}),
+            [1_893_456_001_500, 1_893_456_003_000]),
+        session(&f, GUARDIAN_SID, &guardian, 1, Value::Null, json!({"kind": "review", "parent_thread_id": null, "depth": null}),
+            [1_893_456_062_000, 1_893_456_062_000]),
+    ]}));
+
+    // The child switches from gpt-5.5 to gpt-5.5-mini at its second turn.
+    let usage: Vec<Vec<rusqlite::types::Value>> = rows(&f, &format!("SELECT ordinal,turn_id,model,record_unix_ms FROM codex_usage JOIN codex_usage_times USING(session_id,ordinal)
+        WHERE session_id='{CHILD_SID}' ORDER BY ordinal"));
+    use rusqlite::types::Value::{Integer as I, Null as N, Text as T};
+    assert_eq!(usage, [vec![I(1), T("turn-c1".into()), T("gpt-5.5".into()), I(1_893_456_001_500)],
+        vec![I(2), T("turn-c2".into()), T("gpt-5.5-mini".into()), I(1_893_456_003_000)]]);
+    assert_eq!(rows::<String>(&f, &format!("SELECT model FROM codex_usage WHERE session_id='{GUARDIAN_SID}'")), [vec!["codex-auto-review".to_owned()]]);
+
+    // Primary and secondary windows per snapshot: head lines 6 (and tail 11)
+    // report no secondary; edge line 15 reports one; edge line 12 did not parse.
+    let limits: Vec<Vec<rusqlite::types::Value>> = rows(&f, "SELECT session_id,used_percent,secondary_used_percent,secondary_window_minutes,secondary_resets_at,
+        rate_limit_reached_type FROM codex_rate_limits JOIN codex_rate_limit_windows USING(session_id,ordinal) ORDER BY session_id,ordinal");
+    let none = |sid: &str, used: &str| vec![T(sid.into()), T(used.into()), N, N, N, N];
+    assert_eq!(limits, [none(SID, "37.5"), none(SID, "42.5"), none(EDGE_SID, "37.5"),
+        vec![T(EDGE_SID.into()), T("50".into()), T("1.5".into()), I(10080), I(1_790_600_000), N],
+        vec![T(CHILD_SID.into()), T("12.5".into()), T("3".into()), I(10080), I(1_790_600_000), T("primary".into())]]);
+    // Each child's reported totals equal its records: no discrepancy.
+    assert_eq!(rows::<i64>(&f, &format!("SELECT count(*) FROM codex_discrepancy WHERE session_id IN ('{CHILD_SID}','{GUARDIAN_SID}')")), [vec![0]]);
+}
+
+/// Resume across files: a second rollout of the same session that replays
+/// its history dedupes by `(session, ordinal)` and payload digest, so only
+/// its new record counts and the reported thread total still reconciles. A
+/// third that restarts the ordinals with other records is quarantined, and
+/// the session's usage becomes unavailable rather than a sum.
+#[test]
+fn resume_across_files_dedupes_history_and_quarantines_an_ordinal_restart() {
+    let f = Fixture::new();
+    let complete = plant(&f, "complete");
+    let resumed = f.rollout(&f.home, "resumed", &["head.jsonl", "tail.jsonl", RESUMED], &f.worktree(), f.decided + 1_000, "0.154.0");
+    let (report, _) = f.cli("collect");
+    assert_eq!(report["collected"]["records"], 3, "the replayed history stores nothing");
+    // 1500/500/0/180/100/1680 once, plus the resumed record 7/0/0/3/0/10.
+    assert_eq!(attempt_usage(&report), json!({"input_tokens": 1507, "cached_input_tokens": 500, "cache_write_input_tokens": 0, "output_tokens": 183,
+        "reasoning_output_tokens": 100, "total_tokens": 1690, "records": 3}));
+    use rusqlite::types::Value::{Integer as I, Text as T};
+    let at = f.decided + 1_000;
+    assert_eq!(rows::<rusqlite::types::Value>(&f, "SELECT ordinal,path_digest,response_id,record_unix_ms FROM codex_usage JOIN codex_usage_times USING(session_id,ordinal) ORDER BY ordinal"),
+        [vec![I(1), T(source(&complete)), T("resp-1".into()), I(at)], vec![I(2), T(source(&complete)), T("resp-2".into()), I(at)],
+            vec![I(3), T(source(&resumed)), T("resp-r".into()), I(1_893_456_121_000)]]);
+    assert_eq!(rows::<i64>(&f, "SELECT count(*) FROM codex_discrepancy WHERE kind='thread_total'"), [vec![0]]);
+    assert_eq!(f.count("codex_quarantine"), 0);
+
+    // A new file of the same session with only its session_meta and the resumed turn.
+    let text = fs::read_to_string(&resumed).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    fs::write(resumed.with_file_name("rollout-2026-09-28T00-00-00-restarted.jsonl"), format!("{}\n{}\n{}\n", lines[0], lines[12], lines[13])).unwrap();
+    let (report, _) = f.cli("collect");
+    assert_eq!(attempt_usage(&report), unavailable("quarantined"));
+    // Its first record takes ordinal 1: resp-r (payload hashed with sha256sum outside the crate) against resp-1.
+    assert_eq!(rows::<rusqlite::types::Value>(&f, "SELECT session_id,ordinal,first_digest,new_digest FROM codex_quarantine"),
+        [vec![T(SID.into()), I(1), T(DIGEST_1.into()), T("sha256:924252b6d27afbe340fd147fd3747364940dd51917cf08c3ca05be4ad9d394b4".into())]]);
+}
+
+/// The sidecar as the A3 binary left it: no A4 tables, ingest stream 3, and
+/// envelopes of the narrower `session_meta`/`token_count` allowlist.
+fn downgrade_to_a3(f: &Fixture) {
+    f.sidecar().execute_batch("DROP TABLE rollout_metadata; DROP TABLE codex_usage_times; DROP TABLE codex_rate_limit_windows;
+        UPDATE telemetry_streams SET version=3 WHERE stream='ingest';
+        UPDATE source_observations SET payload='{}',payload_digest='sha256:a3',
+            measurement='{\"coverage\":\"complete\",\"measurement_basis\":\"reported\",\"normalization_version\":1}'
+            WHERE event_kind IN ('codex.session_meta.v1','codex.token_count.v1');").unwrap();
+}
+
+/// Upgrade: a sidecar written before A4 is read (read-only) with its A4
+/// metadata `unavailable: predates_collection`, never `null`. The next
+/// collect migrates it and reads every rollout again: the A4 columns are
+/// filled, the narrower envelopes are superseded without a digest conflict,
+/// nothing is counted twice, and the ledger equals a fresh collect. A rollout
+/// gone before it could be read again stays `pending_reread`.
+#[test]
+fn rollouts_read_before_a4_gain_their_metadata_on_the_next_collect() {
+    let f = Fixture::new();
+    let child = ["complete", "edge", "child"].map(|name| plant(&f, name))[2].clone();
+    f.cli("collect");
+    let (fresh, fresh_usage, fresh_sessions) = (ledger(&f), f.cli_args(&["usage", "--json"]).0, f.cli_args(&["collectors", "sessions"]).0);
+
+    downgrade_to_a3(&f);
+    let (before, _) = f.cli_args(&["collectors", "sessions"]);
+    let predates = unavailable("predates_collection");
+    for s in before["sessions"].as_array().unwrap() {
+        assert_eq!([&s["model_provider"], &s["forked_from_id"], &s["subagent"], &s["record_times"]], [&predates; 4], "{s}");
+    }
+    let (upgraded, _) = f.cli("collect");
+    assert_eq!(upgraded["collected"]["records"], 0, "the re-read counts nothing twice");
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 4}));
+    assert!(fresh == ledger(&f), "the upgraded sidecar equals a fresh collect");
+    assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage);
+    assert_eq!(f.cli_args(&["collectors", "sessions"]).0, fresh_sessions);
+
+    downgrade_to_a3(&f);
+    fs::remove_file(&child).unwrap();
+    f.cli("collect");
+    let (sessions, _) = f.cli_args(&["collectors", "sessions"]);
+    let pending = unavailable("pending_reread");
+    let child_row = sessions["sessions"].as_array().unwrap().iter().find(|s| s["session_id"] == CHILD_SID).unwrap();
+    assert_eq!([&child_row["model_provider"], &child_row["forked_from_id"], &child_row["subagent"], &child_row["record_times"]], [&pending; 4]);
+    assert_eq!(sessions["sessions"][0]["model_provider"], "openai");
+    assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage, "the gone rollout's records still count");
 }

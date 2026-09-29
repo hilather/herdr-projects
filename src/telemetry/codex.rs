@@ -137,6 +137,9 @@ pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Co
     let mut done = Collected::default();
     let mut remaining = budget.bytes;
     let reread = reread(&db)?;
+    // Sources read before A4 (no `rollout_metadata`) are read again from byte 0
+    // too, so their rows gain the A4 metadata; stored keys dedupe.
+    let from_start: std::collections::BTreeSet<String> = reread.union(&backfill(&db)?).cloned().collect();
     let mut seen = std::collections::BTreeSet::new();
     let mut unwritable = false;
     for home in &homes {
@@ -150,7 +153,7 @@ pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Co
                 break;
             }
             let mut span = (0, 0);
-            let read = match tail(&mut db, &file, &digest(home.as_bytes()), &worktrees, remaining, &reread, &mut done, &mut span) {
+            let read = match tail(&mut db, &file, &digest(home.as_bytes()), &worktrees, remaining, &from_start, &mut done, &mut span) {
                 Ok(read) => read,
                 // The pass rolled back: its range is a coverage gap and later
                 // sources wait for the next collect (contracts-collection.md A2).
@@ -182,6 +185,14 @@ fn reread(db: &Connection) -> Result<std::collections::BTreeSet<String>> {
         WHERE EXISTS(SELECT 1 FROM codex_usage u WHERE u.path_digest=s.path_digest AND u.reason='cli_version_uncertified' AND u.ordinal<=o.records)")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
     Ok(sources.into_iter().filter(|(_, version)| certified(version)).map(|(key, _)| key).collect())
+}
+
+/// Sources with a session read before the A4 metadata existed (ingest 0004):
+/// no `rollout_metadata` row although their `session_meta` was stored.
+fn backfill(db: &Connection) -> Result<std::collections::BTreeSet<String>> {
+    Ok(db.prepare("SELECT s.path_digest FROM rollout_sources s JOIN collect_offsets o ON o.path_digest=s.path_digest
+        WHERE NOT EXISTS(SELECT 1 FROM rollout_metadata m WHERE m.path_digest=s.path_digest)")?
+        .query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Regular `rollout-*.jsonl` files only; symlinks are never followed.
@@ -341,6 +352,7 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
         // dedupe, re-evaluate or quarantine.
         _ => {
             tx.execute("DELETE FROM rollout_sources WHERE path_digest=?1", [&key])?;
+            tx.execute("DELETE FROM rollout_metadata WHERE path_digest=?1", [&key])?;
             Cursor { offset: 0, records: 0, rate_limits: 0, model: None, effort: None, session: None }
         }
     };
@@ -442,9 +454,17 @@ fn record(tx: &Transaction, tag: &Tag, line: &[u8], key: &str, home: &str, workt
                 _ => None,
             };
             let at = ms(meta.timestamp.as_deref());
+            let Ok(Envelope { payload: raw }) = serde_json::from_slice::<Envelope<Value>>(line) else { return Ok(false) };
             tx.execute("INSERT INTO rollout_sources(path_digest,home_digest,session_id,session_unix_ms,cwd,cwd_attempt,cli_version,originator,source,records,binding,observed_unix_ms)
                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,0,'unbound',?10)",
                 params![key, home, meta.id, at, sanitize::home_prefix(&meta.cwd), cwd_attempt(&meta.cwd, worktrees), meta.cli_version, meta.originator, source, now])?;
+            // A4 metadata (contracts-collection.md), read leniently: a field of
+            // another type is NULL and never makes the session record malformed.
+            let text = |path: &str, class| sanitize::field(&raw, path, class).as_str().map(str::to_owned);
+            tx.execute("INSERT OR REPLACE INTO rollout_metadata(path_digest,model_provider,forked_from_id,subagent_kind,subagent_parent_thread_id,subagent_depth)
+                VALUES(?1,?2,?3,?4,?5,?6)", params![key, text("model_provider", sanitize::Class::Text), text("forked_from_id", sanitize::Class::Id),
+                    text("subagent_kind", sanitize::Class::Tag), text("subagent_parent_thread_id", sanitize::Class::Id),
+                    sanitize::field(&raw, "subagent_depth", sanitize::Class::Number).as_i64()])?;
             cursor.session = Some((meta.id, meta.cli_version, at));
         }
         (Some("turn_context"), _) => {
@@ -462,6 +482,12 @@ fn record(tx: &Transaction, tag: &Tag, line: &[u8], key: &str, home: &str, workt
             let payload_digest = digest(payload.to_string().as_bytes());
             let first: Option<(String, Option<String>)> = tx.query_row("SELECT payload_digest,reason FROM codex_usage WHERE session_id=?1 AND ordinal=?2",
                 params![session, cursor.records], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+            // A4: the line time, outside the payload digest. The first stays; a
+            // row stored before A4 gains it when its line is read again.
+            if first.as_ref().is_none_or(|(first, _)| *first == payload_digest) {
+                tx.execute("INSERT OR IGNORE INTO codex_usage_times(session_id,ordinal,record_unix_ms) VALUES(?1,?2,?3)",
+                    params![session, cursor.records, ms(tag.timestamp.as_deref())])?;
+            }
             match first {
                 // Stored while uncertified, now certified: the same record, evaluated again.
                 Some((first, Some(reason))) if first == payload_digest && reason == "cli_version_uncertified" && certified(version) => {
@@ -491,6 +517,7 @@ fn record(tx: &Transaction, tag: &Tag, line: &[u8], key: &str, home: &str, workt
         }
         (Some("event_msg"), Some("token_count")) => {
             let Ok(Envelope { payload }) = serde_json::from_slice::<Envelope<TokenCount>>(line) else { return Ok(false) };
+            let Ok(Envelope { payload: raw }) = serde_json::from_slice::<Envelope<Value>>(line) else { return Ok(false) };
             let Some((session, version, at)) = &cursor.session else { return Ok(true) };
             if let Some(total) = payload.info.and_then(|i| i.total_token_usage).filter(|_| certified(version)) {
                 tx.execute("UPDATE rollout_sources SET token_count_usage=?2 WHERE path_digest=?1", params![key, total.json().to_string()])?;
@@ -501,6 +528,14 @@ fn record(tx: &Transaction, tag: &Tag, line: &[u8], key: &str, home: &str, workt
                 tx.execute("INSERT OR IGNORE INTO codex_rate_limits(session_id,ordinal,limit_id,used_percent,window_minutes,resets_at,plan_type,observed_ts) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
                     params![session, cursor.rate_limits, limits.limit_id, window.as_ref().and_then(|w| w.used_percent.as_ref()).map(Number::to_string),
                         window.as_ref().and_then(|w| w.window_minutes), window.as_ref().and_then(|w| w.resets_at), limits.plan_type, observed])?;
+                // A4: the secondary window and the reached type, read leniently
+                // (another type is NULL, never a malformed record); the first stays.
+                let number = |path: &str| sanitize::field(&raw, path, sanitize::Class::Number);
+                let percent = match number("rate_limits.secondary.used_percent") { Value::Number(n) => Some(n.to_string()), Value::String(s) => Some(s), _ => None };
+                tx.execute("INSERT OR IGNORE INTO codex_rate_limit_windows(session_id,ordinal,secondary_used_percent,secondary_window_minutes,secondary_resets_at,
+                    rate_limit_reached_type) VALUES(?1,?2,?3,?4,?5,?6)", params![session, cursor.rate_limits, percent, number("rate_limits.secondary.window_minutes").as_i64(),
+                    number("rate_limits.secondary.resets_at").as_i64(),
+                    sanitize::field(&raw, "rate_limits.rate_limit_reached_type", sanitize::Class::Text).as_str()])?;
             }
         }
         (Some("event_msg"), Some("task_complete")) => {

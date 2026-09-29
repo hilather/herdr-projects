@@ -10,7 +10,8 @@ pub const STREAM: &str = "ingest";
 /// `include_str!` of `migrations/telemetry/ingest/`, in order; index + 1 is the stream version.
 pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/ingest/0001_source_bindings.sql"),
     include_str!("../../../migrations/telemetry/ingest/0002_source_observations.sql"),
-    include_str!("../../../migrations/telemetry/ingest/0003_malformed_quarantine.sql")];
+    include_str!("../../../migrations/telemetry/ingest/0003_malformed_quarantine.sql"),
+    include_str!("../../../migrations/telemetry/ingest/0004_codex_metadata.sql")];
 
 /// `herdr-projects telemetry <slug> collectors ...`
 #[derive(clap::Subcommand)]
@@ -19,6 +20,9 @@ pub enum Command {
     Status,
     /// Canonical collector binding revisions and why each rollout is bound or not. Read-only.
     Bindings,
+    /// Per rollout: the A4 session metadata (model provider, fork and subagent
+    /// parent ids) and the span of its usage record times. Read-only.
+    Sessions,
     /// Append a `revoked` revision to the attempt's active collector binding:
     /// rollouts that start from now on are not bound to it (contracts-collection.md).
     Revoke { attempt: String },
@@ -36,6 +40,7 @@ pub fn run(project: &Path, command: Command) -> Result<String> {
     let value = match command {
         Command::Status => super::sidecar::status(project, STREAM)?,
         Command::Bindings => bindings(project)?,
+        Command::Sessions => sessions(project)?,
         Command::Capabilities { json: false } => return Ok(capabilities_text(&capabilities()?)),
         Command::Capabilities { json: true } => capabilities()?,
         Command::Revoke { attempt } => {
@@ -94,7 +99,16 @@ fn codex_fields() -> Vec<Field> {
         field("session_meta", "cli_version", Live, None),
         field("session_meta", "originator", Fixture, None),
         field("session_meta", "source", Fixture, None),
-        absent("session_meta", "model_provider", "not_collected"),
+        // A4: metadata of the proposed §5/§7 revision (contracts-collection.md),
+        // fixture-certified until the planned live run.
+        field("session_meta", "model_provider", Fixture, None),
+        field("session_meta", "forked_from_id", Fixture, Some("semantics_not_certified")),
+        field("session_meta", "subagent_kind", Fixture, Some("from_source_subagent")),
+        field("session_meta", "subagent_parent_thread_id", Fixture, Some("from_source_subagent")),
+        field("session_meta", "subagent_depth", Fixture, Some("from_source_subagent")),
+        absent("session_meta", "forked_from_ordinal_exclusive", "not_collected"),
+        absent("session_meta", "agent_nickname", "not_collected"),
+        absent("session_meta", "agent_role", "not_collected"),
         absent("session_meta", "base_instructions", "content_forbidden"),
         field("turn_context", "turn_id", Fixture, None),
         field("turn_context", "model", Live, None),
@@ -123,9 +137,11 @@ fn codex_fields() -> Vec<Field> {
         absent("token_count", "info.last_token_usage", "not_collected"),
         absent("token_count", "info.model_context_window", "not_collected"),
         absent("token_count", "rate_limits.limit_name", "not_collected"),
-        absent("token_count", "rate_limits.secondary", "not_collected"),
+        field("token_count", "rate_limits.secondary.used_percent", Fixture, Some("semantics_not_certified")),
+        field("token_count", "rate_limits.secondary.window_minutes", Fixture, Some("semantics_not_certified")),
+        field("token_count", "rate_limits.secondary.resets_at", Fixture, Some("semantics_not_certified")),
+        field("token_count", "rate_limits.rate_limit_reached_type", Fixture, Some("semantics_not_certified")),
         absent("token_count", "rate_limits.credits", "not_collected"),
-        absent("token_count", "rate_limits.rate_limit_reached_type", "not_collected"),
         field("task_complete", "turn_id", Fixture, None),
         field("task_complete", "duration_ms", Fixture, None),
         field("task_complete", "time_to_first_token_ms", Fixture, None),
@@ -133,6 +149,10 @@ fn codex_fields() -> Vec<Field> {
         absent("task_complete", "completed_at", "not_collected"),
         absent("task_complete", "last_agent_message", "content_forbidden"),
         absent("response_item", "*", "content_forbidden"),
+        // Tool/exec metadata (call id, tool name, duration, exit status): proposed
+        // in the A4 revision, held until the live run shows its record shape.
+        absent("exec_command_end", "*", "not_collected"),
+        absent("mcp_tool_call_end", "*", "not_collected"),
     ]);
     fields
 }
@@ -209,6 +229,40 @@ fn bindings(project: &Path) -> Result<Value> {
             "attempt_id": r.get::<_, Option<String>>(2)?, "basis": r.get::<_, Option<String>>(3)?})))? { sources.push(row?); }
     }
     Ok(json!({"bindings": bindings, "sources": sources}))
+}
+
+/// `collectors sessions`: per rollout source, its A4 metadata and usage record
+/// times. A field is `unavailable` with `predates_collection` when the sidecar
+/// has no A4 tables (ingest stream < 4, read without migrating), and with
+/// `pending_reread` while a rollout read before A4 waits to be read again.
+/// `null` is a value the rollout did not report. Read-only.
+fn sessions(project: &Path) -> Result<Value> {
+    let Some(db) = super::sidecar::read(project)? else { return Ok(json!({"sessions": unavailable("collection_not_run")})) };
+    let a4 = exists(&db, "rollout_metadata")?;
+    let columns = if a4 {
+        "m.model_provider,m.forked_from_id,m.subagent_kind,m.subagent_parent_thread_id,m.subagent_depth,
+        (SELECT count(t.record_unix_ms) FROM codex_usage u JOIN codex_usage_times t USING(session_id,ordinal) WHERE u.path_digest=s.path_digest),
+        (SELECT min(t.record_unix_ms) FROM codex_usage u JOIN codex_usage_times t USING(session_id,ordinal) WHERE u.path_digest=s.path_digest),
+        (SELECT max(t.record_unix_ms) FROM codex_usage u JOIN codex_usage_times t USING(session_id,ordinal) WHERE u.path_digest=s.path_digest),
+        m.path_digest IS NOT NULL FROM rollout_sources s LEFT JOIN rollout_metadata m ON m.path_digest=s.path_digest"
+    } else { "NULL,NULL,NULL,NULL,NULL,0,NULL,NULL,0 FROM rollout_sources s" };
+    let mut stmt = db.prepare(&format!("SELECT s.session_id,s.path_digest,s.binding,s.attempt_id,s.records,
+        (SELECT count(*) FROM codex_usage u WHERE u.path_digest=s.path_digest),{columns} ORDER BY s.session_id,s.path_digest"))?;
+    let rows = stmt.query_map([], |r| {
+        let pending = match (a4, r.get::<_, bool>(14)?) { (false, _) => Some("predates_collection"), (true, false) => Some("pending_reread"), _ => None };
+        let known = |value: Value| pending.map_or(value, unavailable);
+        let text = |i: usize| r.get::<_, Option<String>>(i).map(|v| known(json!(v)));
+        Ok(json!({"session_id": r.get::<_, String>(0)?, "path_digest": r.get::<_, String>(1)?, "binding": r.get::<_, String>(2)?,
+            "attempt_id": r.get::<_, Option<String>>(3)?, "records": r.get::<_, i64>(4)?, "model_provider": text(6)?, "forked_from_id": text(7)?,
+            "subagent": known(json!({"kind": r.get::<_, Option<String>>(8)?, "parent_thread_id": r.get::<_, Option<String>>(9)?, "depth": r.get::<_, Option<i64>>(10)?})),
+            "record_times": known(json!({"stored": r.get::<_, i64>(5)?, "timed": r.get::<_, i64>(11)?, "first_unix_ms": r.get::<_, Option<i64>>(12)?,
+                "last_unix_ms": r.get::<_, Option<i64>>(13)?}))}))
+    })?;
+    Ok(json!({"sessions": rows.collect::<rusqlite::Result<Vec<_>>>()?}))
+}
+
+fn unavailable(reason: &str) -> Value {
+    json!({"status": "unavailable", "reason": reason})
 }
 
 /// Metrics merged into `telemetry <slug> report` (`super::metrics::report`).
