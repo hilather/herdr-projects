@@ -14,7 +14,8 @@
 //! field beside it. A7 marks envelopes of an uncertified version and
 //! supersedes the mark on certification, records a rollout idle without its
 //! last turn's final event (tests/telemetry_collect.rs), and collects the
-//! guardian's `source.subagent.other` tag.
+//! guardian's `source.subagent.other` tag. The second live run adds the MCP,
+//! failed-command, subagent, aborted-turn and fork shapes it observed.
 
 #![cfg(all(feature = "state-store", target_os = "linux"))]
 #![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
@@ -452,7 +453,7 @@ fn leaves(value: &Value, prefix: &str, out: &mut BTreeSet<String>) {
 }
 
 /// The capability table, hand-checked against contracts §5, the sanitizer
-/// allowlist and docs/telemetry/codex-live-0.154.0.md, printed as text.
+/// allowlist and the live docs (docs/telemetry/codex-live-0.154.0*.md), printed as text.
 const CAPABILITIES: &str = "codex rollout_jsonl certified_versions=0.154.0
   line.timestamp available=true basis=reported certified=live caveat=envelope_occurred_unix_ms
   session_meta.id available=true basis=reported certified=live
@@ -462,14 +463,14 @@ const CAPABILITIES: &str = "codex rollout_jsonl certified_versions=0.154.0
   session_meta.originator available=true basis=reported_excerpt certified=live
   session_meta.source available=true basis=reported_excerpt certified=live
   session_meta.model_provider available=true basis=reported_excerpt certified=live
-  session_meta.forked_from_id available=true basis=reported certified=fixture caveat=semantics_not_certified
+  session_meta.forked_from_id available=true basis=reported certified=live caveat=fork_thread_total_includes_origin
   session_meta.subagent_kind available=true basis=reported_excerpt certified=live caveat=from_source_subagent
   session_meta.subagent_detail available=true basis=reported_excerpt certified=live caveat=observed_guardian_only
-  session_meta.subagent_parent_thread_id available=true basis=reported certified=fixture caveat=from_source_subagent
-  session_meta.subagent_depth available=true basis=reported certified=fixture caveat=from_source_subagent
-  session_meta.parent_thread_id available=true basis=reported certified=live caveat=observed_for_guardian_only
-  session_meta.session_id available=true basis=reported certified=live caveat=guardian_reports_parent_session
-  session_meta.thread_source available=true basis=reported_excerpt certified=live caveat=observed_user_and_guardian_review_only
+  session_meta.subagent_parent_thread_id available=true basis=reported certified=live caveat=from_source_subagent
+  session_meta.subagent_depth available=true basis=reported certified=live caveat=from_source_subagent
+  session_meta.parent_thread_id available=true basis=reported certified=live caveat=observed_guardian_and_thread_spawn
+  session_meta.session_id available=true basis=reported certified=live caveat=child_reports_parent_session
+  session_meta.thread_source available=true basis=reported_excerpt certified=live caveat=observed_user_guardian_review_subagent
   session_meta.forked_from_ordinal_exclusive available=false basis=unavailable certified=none reason=not_collected
   session_meta.agent_nickname available=false basis=unavailable certified=none reason=not_collected
   session_meta.agent_role available=false basis=unavailable certified=none reason=not_collected
@@ -483,7 +484,7 @@ const CAPABILITIES: &str = "codex rollout_jsonl certified_versions=0.154.0
   turn_context.user_instructions available=false basis=unavailable certified=none reason=content_forbidden
   task_started.turn_id available=true basis=reported certified=live
   task_started.started_at available=false basis=unavailable certified=none reason=not_collected
-  token_usage_record.session_id available=true basis=reported certified=live caveat=guardian_reports_parent_session
+  token_usage_record.session_id available=true basis=reported certified=live caveat=child_reports_parent_session
   token_usage_record.turn_id available=true basis=reported certified=live
   token_usage_record.response_id available=true basis=reported certified=live
   token_usage_record.usage.cache_write_input_tokens available=true basis=reported certified=live caveat=overlap_with_input_not_certified
@@ -569,7 +570,11 @@ const CAPABILITIES: &str = "codex rollout_jsonl certified_versions=0.154.0
   item_completed.item.aggregated_output available=false basis=unavailable certified=none reason=content_forbidden
   item_completed.item.formatted_output available=false basis=unavailable certified=none reason=content_forbidden
   item_completed.item.content available=false basis=unavailable certified=none reason=content_forbidden
-  mcp_tool_call.* available=false basis=unavailable certified=none reason=not_collected
+  item_completed.item.server available=false basis=unavailable certified=none reason=not_collected
+  item_completed.item.tool available=false basis=unavailable certified=none reason=not_collected
+  item_completed.item.readOnlyHint available=false basis=unavailable certified=none reason=not_collected
+  item_completed.item.arguments available=false basis=unavailable certified=none reason=content_forbidden
+  item_completed.item.result available=false basis=unavailable certified=none reason=content_forbidden
 ";
 
 /// `collectors capabilities` cannot drift from the adapter: over the whole
@@ -1065,4 +1070,129 @@ fn envelopes_of_a_version_certified_later_are_superseded_without_conflict() {
     assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage);
     let (again, _) = f.cli("collect");
     assert_eq!((&again["collected"]["bytes"], &again["collected"]["reevaluated"]), (&0.into(), &0.into()), "certified envelopes are not re-read again");
+}
+
+/// Second live run (docs/telemetry/codex-live-0.154.0-run2.md): record shapes
+/// Codex 0.154.0 wrote that the corpus above lacks, hand-written with
+/// `LIVE2LEAK_*` sentinels in every content field. `live2-tools.jsonl`: an MCP
+/// call (an `exec` custom tool call whose only item is an `McpToolCall`), a
+/// command that runs about 3 s, a failed command (`status` `failed`, exit 2),
+/// a spawned subagent and a wait (`function_call`s with a `namespace` and no
+/// `status`, `SubAgentActivity` and `CollabAgentToolCall` items), then a
+/// second turn whose declined approval ended in `turn_aborted`.
+/// `live2-fork.jsonl`: a `codex exec fork` of `complete`, which replays none
+/// of its origin's records but reports thread totals that include them.
+const LIVE2_TOOLS: &str = "../codex-conformance/live2-tools.jsonl";
+const LIVE2_SID: &str = "00000000-0000-4000-8000-0000000b2001";
+const LIVE2_FORK: &str = "../codex-conformance/live2-fork.jsonl";
+const LIVE2_FORK_SID: &str = "00000000-0000-4000-8000-0000000b2002";
+
+/// Plant a live-2 fixture bound to the attempt, as session `sid`; `@ORIGIN@`
+/// becomes the `complete` case's session id.
+fn plant_live2(f: &Fixture, name: &str, part: &str, sid: &str) -> PathBuf {
+    let path = f.rollout(&f.home, name, &[part], &f.worktree(), f.decided + 1_000, "0.154.0");
+    fs::write(&path, fs::read_to_string(&path).unwrap().replace(SID, sid).replace("@ORIGIN@", SID)).unwrap();
+    path
+}
+
+/// The live-2 shapes on the CLI as the collector reads them today. The MCP,
+/// subagent and collab items keep only their type (their other fields are
+/// not collected: the run2 doc proposes a §7 revision). The failed command is
+/// an exec row with status `failed` and exit code 2, which M17 still counts
+/// `status_not_certified` (lane B follow-up). A `turn_aborted` is not a final
+/// event yet, so the aborted turn stays `open` (lane A follow-up). The fork
+/// counts only its own record, and its reported totals, which include its
+/// origin's, show as `thread_total` and `token_count_total` discrepancies
+/// (lane A follow-up). No sentinel, MCP server or MCP tool name leaks.
+#[test]
+fn live_run2_shapes_are_collected_without_content() {
+    let f = Fixture::new();
+    let complete = plant(&f, "complete");
+    let tools = plant_live2(&f, "live2-tools", LIVE2_TOOLS, LIVE2_SID);
+    let fork = plant_live2(&f, "live2-fork", LIVE2_FORK, LIVE2_FORK_SID);
+    let corpus: Vec<u8> = [&tools, &fork].iter().flat_map(|p| fs::read(p).unwrap()).collect();
+    for needle in ["LIVE2LEAK_ARGUMENT", "LIVE2LEAK_MCP_RESULT", "LIVE2LEAK_STDERR_2", "LIVE2LEAK_SPAWN_ARGUMENTS", "LIVE2LEAK_AGENT_PATH",
+        "LIVE2LEAK_DECLINED_OUTPUT", "LIVE2LEAK_SETTINGS_PATH", "LIVE2LEAK_MULTI_AGENT", "live2_stub_server", "live2_noop_tool"] {
+        assert!(corpus.windows(needle.len()).any(|w| w == needle.as_bytes()), "{needle}");
+    }
+    let (report, mut output) = f.cli("collect");
+    for path in [&complete, &tools, &fork] { assert_eq!(quarantine(&f, &source(path)), [], "no new shape is malformed"); }
+    // complete 1500/500/0/180/100/1680 + the fork's own record 300/100/0/20/0/320:
+    // the fork's reported thread total (2000), never added.
+    assert_eq!(attempt_usage(&report), json!({"input_tokens": 1800, "cached_input_tokens": 600, "cache_write_input_tokens": 0, "output_tokens": 200,
+        "reasoning_output_tokens": 100, "total_tokens": 2000, "records": 3}));
+    let discrepancies: Vec<Vec<rusqlite::types::Value>> = rows(&f, &format!("SELECT kind,summed_total,reported_total,fields FROM codex_discrepancy
+        WHERE session_id='{LIVE2_FORK_SID}' ORDER BY kind"));
+    use rusqlite::types::Value::{Integer as I, Text as T};
+    let fields = T(r#"["cached_input_tokens","input_tokens","output_tokens","reasoning_output_tokens","total_tokens"]"#.into());
+    assert_eq!(discrepancies, [vec![T("thread_total".into()), I(320), I(2000), fields.clone()], vec![T("token_count_total".into()), I(320), I(2000), fields]]);
+    assert_eq!(rows::<i64>(&f, &format!("SELECT count(*) FROM codex_discrepancy WHERE session_id='{LIVE2_SID}'")), [vec![0]]);
+
+    let t = |ms: i64| Some(1_893_456_000_000 + ms);
+    let (listed, bytes) = f.cli_args(&["collectors", "tools", "--json"]);
+    output.extend(bytes);
+    let session = listed["sessions"].as_array().unwrap().iter().find(|s| s["session_id"] == LIVE2_SID).unwrap().clone();
+    let exec = Some("exec");
+    assert_eq!(session, json!({"session_id": LIVE2_SID, "attempt_ids": [f.attempt], "tool_calls": [
+            call("call-m1", Some("custom_tool_call"), exec, Some("completed"), Some("turn-l1"), t(6_700), Some("custom_tool_call_output"), t(6_765)),
+            call("call-s1", Some("custom_tool_call"), exec, Some("completed"), Some("turn-l1"), t(12_673), Some("custom_tool_call_output"), t(15_733)),
+            call("call-f1", Some("custom_tool_call"), exec, Some("completed"), Some("turn-l1"), t(17_494), Some("custom_tool_call_output"), t(17_625)),
+            call("call-c1", Some("function_call"), Some("spawn_agent"), None, Some("turn-l1"), t(20_000), Some("function_call_output"), t(20_086)),
+            call("call-c2", Some("function_call"), Some("wait_agent"), None, Some("turn-l1"), t(27_000), Some("function_call_output"), t(28_078)),
+            call("call-d1", Some("custom_tool_call"), exec, Some("completed"), Some("turn-l2"), t(71_500), Some("custom_tool_call_output"), t(80_243))],
+        "exec_items": [
+            {"item_id": "exec-s1", "thread_id": LIVE2_SID, "turn_id": "turn-l1", "status": "completed", "source": "unified_exec_startup", "exit_code": 0,
+                "startup_duration": {"secs": 2, "nanos": 879_307_435}, "completed_unix_ms": t(15_729)},
+            {"item_id": "exec-f1", "thread_id": LIVE2_SID, "turn_id": "turn-l1", "status": "failed", "source": "unified_exec_startup", "exit_code": 2,
+                "startup_duration": {"secs": 0, "nanos": 3610}, "completed_unix_ms": t(17_565)}]}));
+    assert!(listed["sessions"].as_array().unwrap().iter().filter(|s| s["session_id"] != LIVE2_SID).all(|s| s["tool_calls"] == json!([]) && s["exec_items"] == json!([])));
+
+    // Envelopes: `thread_settings_applied` and `turn_aborted` have none; the
+    // new item types keep only their type; `namespace` is dropped.
+    let at = line_starts(&tools);
+    let key = source(&tools);
+    let envelope = |line: usize| envelopes(&f, &key).into_iter().find(|e| e.0 == at[line - 1]).map(|e| (e.1, e.2)).unwrap();
+    let kinds: Vec<String> = envelopes(&f, &key).into_iter().map(|e| e.1).collect();
+    let tool = ["custom_tool_call", "item_completed", "custom_tool_call_output"];
+    let collab = ["function_call", "item_completed", "function_call_output"];
+    let expected: Vec<String> = [&["session_meta", "task_started", "turn_context"][..], &tool, &tool, &tool, &collab, &["function_call", "item_completed", "item_completed", "function_call_output"],
+        &["task_complete", "task_started", "turn_context", "custom_tool_call", "custom_tool_call_output"]].concat().into_iter().map(|k| format!("codex.{k}.v1")).collect();
+    assert_eq!(kinds, expected);
+    let typed_only = |kind: &str| format!(r#"{{"item":{{"duration":{{"nanos":null,"secs":null}},"exit_code":null,"id":null,"source":null,"status":null,"type":"{kind}"}},"#)
+        + &format!(r#""thread_id":"{LIVE2_SID}","turn_id":"turn-l1"}}"#);
+    assert_eq!((envelope(5).1, envelope(14).1, envelope(18).1), (typed_only("McpToolCall"), typed_only("SubAgentActivity"), typed_only("CollabAgentToolCall")));
+    assert_eq!(envelope(11).1, r#"{"item":{"duration":{"nanos":3610,"secs":0},"exit_code":2,"id":"exec-f1","source":"unified_exec_startup","#.to_owned()
+        + &format!(r#""status":"failed","type":"CommandExecution"}},"thread_id":"{LIVE2_SID}","turn_id":"turn-l1"}}"#));
+    assert_eq!(envelope(13).1, r#"{"call_id":"call-c1","internal_chat_message_metadata_passthrough":{"turn_id":"turn-l1"},"name":"spawn_agent","status":null}"#);
+    let fork_kinds: Vec<String> = envelopes(&f, &source(&fork)).into_iter().map(|e| e.1).collect();
+    assert_eq!(fork_kinds, ["session_meta", "task_started", "turn_context", "token_usage_record", "token_count", "task_complete"].map(|k| format!("codex.{k}.v1")));
+
+    // Sessions: the fork names its origin; the aborted turn stays open.
+    let (sessions, bytes) = f.cli_args(&["collectors", "sessions"]);
+    output.extend(bytes);
+    let by_id = |sid: &str| sessions["sessions"].as_array().unwrap().iter().find(|s| s["session_id"] == sid).unwrap().clone();
+    assert_eq!((&by_id(LIVE2_SID)["final_event"], &by_id(LIVE2_SID)["records"]), (&json!({"state": "open", "turn_id": "turn-l2"}), &json!(0)));
+    let fork_session = by_id(LIVE2_FORK_SID);
+    assert_eq!((&fork_session["forked_from_id"], &fork_session["records"], &fork_session["final_event"]),
+        (&json!(SID), &json!(1), &json!({"state": "complete", "turn_id": "turn-k1"})));
+
+    // Accounting reads the failed command as an uncertified status today.
+    let (tools_report, bytes) = f.cli_args(&["accounting", "tools", "--json"]);
+    output.extend(bytes);
+    let (m16, m17) = (&tools_report["metrics"]["M16"], &tools_report["metrics"]["M17"]);
+    assert_eq!((&m16["issued"]["calls"], &m16["issued"]["by_name"], &m16["issued"]["status_unreported"], &m16["value"]["executed"]),
+        (&json!(6), &json!({"exec": 4, "spawn_agent": 1, "wait_agent": 1}), &json!(2), &json!(2)));
+    assert_eq!((&m17["value"], &m17["unknown"]["by_reason"]), (&json!("1/1"), &json!({"status_not_certified": 1})));
+
+    for args in [&["usage", "--json"][..], &["report", "--json"], &["accounting", "sync"], &["accounting", "sessions"], &["accounting", "quota", "--json"]] {
+        output.extend(f.cli_args(args).1);
+    }
+    output.extend(f.text(&["collectors", "tools"]).into_bytes());
+    let state = f.project.join(".state");
+    let leaks = |bytes: &[u8]| ["live2leak", "live2_stub_server", "live2_noop_tool"].into_iter()
+        .find(|needle| bytes.to_ascii_lowercase().windows(needle.len()).any(|w| w == needle.as_bytes()));
+    for name in ["telemetry.db", "telemetry.db-wal", "telemetry.db-shm"] {
+        if let Ok(bytes) = fs::read(state.join(name)) { assert_eq!(leaks(&bytes), None, "{name}"); }
+    }
+    assert_eq!(leaks(&output), None, "{}", String::from_utf8_lossy(&output));
 }

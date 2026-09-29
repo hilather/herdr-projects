@@ -117,19 +117,24 @@ fn codex_fields() -> Vec<Field> {
         field("session_meta", "originator", Live, None),
         field("session_meta", "source", Live, None),
         // A4: metadata of the §5/§7 revision (contracts-collection.md). Live where
-        // the A4 live run (codex-live-0.154.0-a4.md) saw a value; else fixture.
+        // the A4 live run (codex-live-0.154.0-a4.md) or the second live run
+        // (codex-live-0.154.0-run2.md: a `codex exec fork`, a spawned subagent)
+        // saw a value; else fixture.
         field("session_meta", "model_provider", Live, None),
-        field("session_meta", "forked_from_id", Fixture, Some("semantics_not_certified")),
+        // run2: the fork names its origin and replays none of its records, but its
+        // reported thread totals include the origin's (a `thread_total` discrepancy).
+        field("session_meta", "forked_from_id", Live, Some("fork_thread_total_includes_origin")),
         field("session_meta", "subagent_kind", Live, Some("from_source_subagent")),
         // A7: the `other` variant's tag; the A4 live run saw only `guardian`.
         field("session_meta", "subagent_detail", Live, Some("observed_guardian_only")),
-        field("session_meta", "subagent_parent_thread_id", Fixture, Some("from_source_subagent")),
-        field("session_meta", "subagent_depth", Fixture, Some("from_source_subagent")),
-        // A5: the thread lineage outside `source`, live in the A4 run. Only the
-        // guardian reported a parent, and its `session_id` is its parent's.
-        field("session_meta", "parent_thread_id", Live, Some("observed_for_guardian_only")),
-        field("session_meta", "session_id", Live, Some("guardian_reports_parent_session")),
-        field("session_meta", "thread_source", Live, Some("observed_user_and_guardian_review_only")),
+        field("session_meta", "subagent_parent_thread_id", Live, Some("from_source_subagent")),
+        field("session_meta", "subagent_depth", Live, Some("from_source_subagent")),
+        // A5: the thread lineage outside `source`, live in the A4 run (guardian)
+        // and run2 (a `thread_spawn` subagent). Both children report their
+        // parent's `session_id`.
+        field("session_meta", "parent_thread_id", Live, Some("observed_guardian_and_thread_spawn")),
+        field("session_meta", "session_id", Live, Some("child_reports_parent_session")),
+        field("session_meta", "thread_source", Live, Some("observed_user_guardian_review_subagent")),
         absent("session_meta", "forked_from_ordinal_exclusive", "not_collected"),
         absent("session_meta", "agent_nickname", "not_collected"),
         absent("session_meta", "agent_role", "not_collected"),
@@ -143,7 +148,7 @@ fn codex_fields() -> Vec<Field> {
         absent("turn_context", "user_instructions", "content_forbidden"),
         field("task_started", "turn_id", Live, None),
         absent("task_started", "started_at", "not_collected"),
-        field("token_usage_record", "session_id", Live, Some("guardian_reports_parent_session")),
+        field("token_usage_record", "session_id", Live, Some("child_reports_parent_session")),
         field("token_usage_record", "turn_id", Live, None),
         field("token_usage_record", "response_id", Live, None),
     ];
@@ -186,7 +191,8 @@ fn codex_fields() -> Vec<Field> {
         absent("custom_tool_call", "input", "content_forbidden"),
         field("function_call", "call_id", Live, None),
         field("function_call", "name", Live, None),
-        // The live `function_call` (`wait`) carried no status.
+        // The live `function_call`s (`wait`; run2 `spawn_agent`, `wait_agent`)
+        // carried no status.
         field("function_call", "status", Fixture, None),
         field("function_call", "internal_chat_message_metadata_passthrough.turn_id", Live, None),
         absent("function_call", "id", "not_collected"),
@@ -219,8 +225,14 @@ fn codex_fields() -> Vec<Field> {
         absent("item_completed", "item.aggregated_output", "content_forbidden"),
         absent("item_completed", "item.formatted_output", "content_forbidden"),
         absent("item_completed", "item.content", "content_forbidden"),
-        // No MCP tool was called live: its 0.154.0 shape is unobserved.
-        absent("mcp_tool_call", "*", "not_collected"),
+        // run2: an MCP call is an `exec` custom tool call plus an `McpToolCall`
+        // item; the item's own fields are not collected (a §7 revision is
+        // proposed in codex-live-0.154.0-run2.md). No typed MCP event exists.
+        absent("item_completed", "item.server", "not_collected"),
+        absent("item_completed", "item.tool", "not_collected"),
+        absent("item_completed", "item.readOnlyHint", "not_collected"),
+        absent("item_completed", "item.arguments", "content_forbidden"),
+        absent("item_completed", "item.result", "content_forbidden"),
     ]);
     fields
 }

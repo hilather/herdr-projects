@@ -182,6 +182,15 @@ each with a value somewhere, and no unavailable field.
   time_to_first_token_ms}`. Still fixture (no value live):
   `forked_from_id`, `subagent_parent_thread_id`, `subagent_depth`,
   `rate_limits.secondary.*`, `rate_limit_reached_type`.
+- *Moved to live by the second live run* ([codex-live-0.154.0-run2.md](codex-live-0.154.0-run2.md)):
+  `forked_from_id` (a `codex exec fork`; caveat
+  `fork_thread_total_includes_origin`: the fork replays no records, but its
+  reported totals include its origin's, so `thread_total` flags a false
+  discrepancy), `subagent_parent_thread_id` and `subagent_depth` (a
+  `thread_spawn` subagent). Still fixture: `function_call.status`,
+  `rate_limits.secondary.*`, `rate_limit_reached_type`. MCP calls are
+  `McpToolCall` `item_completed` items whose fields stay uncollected
+  (proposal in that doc).
 - *Not collected:* `rate_limits.{credits, limit_name}`,
   `info.{last_token_usage, model_context_window}`, `turn_token_usage`,
   `thread_id`, `root_turn_id`, start and completion times, and tool/exec
