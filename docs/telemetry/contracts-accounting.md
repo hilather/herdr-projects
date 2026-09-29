@@ -59,3 +59,52 @@ The lane provides M08 and M09 (contracts §6, `definition` still
 counted entries (delta, an `accepted` disposition) of certified sessions, with
 the §6 `coverage`. They are derived from the Codex tables at report time, so
 they need no prior sync.
+
+## 3. Session graph and model segments (B2, TM2.2)
+
+Stream `accounting` version 2 (`0002_session_graph.sql`), rebuilt by the same
+sync and transaction as the ledger (sync adds `sessions` and `model_segments`
+counts); migrating to 2 clears `usage_ledger`, so a ledger synced before reads
+`ledger_not_synced` until the next sync. `accounting sessions` prints it
+read-only.
+
+`session_graph`, one node per rollout source. Links come only from native
+evidence:
+
+- Resume: rollouts of one `session_meta.id` form one session. The rollout with
+  the most `records` (then lowest `path_digest`) is the root; every other is
+  `included` under it (`evidence = same_session_prefix`) when the root observed
+  each delta entry it did (same key and payload, §1). Its `inclusive_total` is
+  covered by the root and never added: a root of 200 over an epoch of 50
+  stays 200. Any `conflict` in the session (quarantine), or an epoch the root
+  does not cover, makes every such node `unresolved`: the session total and
+  its parent are `unavailable: inclusion_unknown`.
+- Role: `guardian` when a record carries model `codex-auto-review`,
+  `subagent` when `source = subagent`, else `primary`. The Codex tables keep no
+  parent id (`source` stores only its first key), so a guardian or subagent
+  root is `unlinked_child` with parent `unavailable:
+  no_native_parent_evidence`: reported apart and never added to any other
+  session. Linking needs a native parent id captured by lane A (A4).
+- `inclusive_total` = Σ normalized `total_tokens` of the delta entries the
+  rollout observed (accepted or duplicate); `NULL` when it observed one that
+  is not counted and normalized (session total `unavailable: incomplete`).
+
+`model_segments` over a session's counted delta entries by position: the
+model is the latest preceding `turn_context` (`codex_usage.model`); a model
+switch opens the next `model` segment (1, 2, ...). Records of a turn whose
+records or completion (`codex_turns`) carry more than one model go to the
+`mixed` bucket; records without model evidence to `unallocated` (segment 0).
+Buckets do not break a segment. Each row keeps entries, first/last position
+and Σ input, output, reasoning (subset) and total, so segments + mixed +
+unallocated = the session total. The requested model is not recorded; the
+model is as reported by `turn_context`.
+
+The rollup sums root totals of `primary` sessions (`sessions`) and of
+unlinked children (`unlinked_children`) separately; with any incomplete or
+unresolved session both are `unavailable: incomplete_sessions`, never a
+partial sum.
+
+Test `model_switch_splits_segments_not_task`: gpt-5.5 50 then gpt-5.5-mini
+150 → two segments, total 200; the resumed epoch of 50 stays inside the root
+of 200; an unlinked guardian of 50 (unallocated 10, `codex-auto-review` 30,
+mixed 10) is reported apart; a rewritten record makes the session unresolved.

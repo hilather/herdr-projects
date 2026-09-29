@@ -18,14 +18,14 @@ pub struct Entry {
     pub basis: &'static str,
     scope: &'static str,
     precedence: i64,
-    position: i64,
+    pub position: i64,
     response_id: Option<String>,
-    model: Option<String>,
+    pub model: Option<String>,
     native: [Option<i64>; 6],
     /// `NORMALIZED` order; `None` when the native fields do not satisfy `codex-v1`.
     pub normalized: Option<[i64; 7]>,
     /// `(path_digest, disposition, reason)`, first observation first.
-    provenance: Vec<(String, &'static str, Option<String>)>,
+    pub provenance: Vec<(String, &'static str, Option<String>)>,
 }
 
 impl Entry {
@@ -96,7 +96,8 @@ pub fn derive(db: &Connection) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
-/// Rebuild the ledger from the Codex tables in one sidecar transaction; returns counts.
+/// Rebuild the ledger, session graph and model segments (§3) from the Codex
+/// tables in one sidecar transaction; returns counts.
 pub fn sync(db: &mut Connection) -> Result<Value> {
     let tx = db.transaction()?;
     let entries = derive(&tx)?;
@@ -115,11 +116,12 @@ pub fn sync(db: &mut Connection) -> Result<Value> {
             *counts.entry(disposition).or_default() += 1;
         }
     }
+    let (sessions, segments) = super::graph::store(&tx, &entries)?;
     tx.execute("INSERT INTO usage_ledger(singleton,normalization_version,synced_unix_ms) VALUES(1,?1,?2)
         ON CONFLICT(singleton) DO UPDATE SET normalization_version=excluded.normalization_version,synced_unix_ms=excluded.synced_unix_ms",
         params![NORMALIZATION, jiff::Timestamp::now().as_millisecond()])?;
     tx.commit()?;
-    Ok(json!({"entries": entries.len(), "dispositions": counts}))
+    Ok(json!({"entries": entries.len(), "dispositions": counts, "sessions": sessions, "model_segments": segments}))
 }
 
 /// The synced ledger as JSON, read-only; `ledger_not_synced` before the first sync.

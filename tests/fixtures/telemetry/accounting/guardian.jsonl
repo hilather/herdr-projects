@@ -1,0 +1,8 @@
+{"timestamp":"@TS@","type":"session_meta","payload":{"id":"00000000-0000-4000-8000-0000000c0de9","timestamp":"@TS@","cwd":"@CWD@","originator":"codex_exec","cli_version":"@VERSION@","source":{"subagent":"review"}}}
+{"timestamp":"@TS@","type":"token_usage_record","payload":{"turn_id":"turn-g0","response_id":"resp-g0","usage":{"input_tokens":8,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0,"total_tokens":10}}}
+{"timestamp":"@TS@","type":"turn_context","payload":{"turn_id":"turn-g1","model":"codex-auto-review","effort":"low"}}
+{"timestamp":"@TS@","type":"token_usage_record","payload":{"turn_id":"turn-g1","response_id":"resp-g1","usage":{"input_tokens":25,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":1,"total_tokens":30}}}
+{"timestamp":"@TS@","type":"turn_context","payload":{"turn_id":"turn-g2","model":"codex-auto-review","effort":"low"}}
+{"timestamp":"@TS@","type":"token_usage_record","payload":{"turn_id":"turn-g2","response_id":"resp-g2","usage":{"input_tokens":4,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":5}}}
+{"timestamp":"@TS@","type":"turn_context","payload":{"turn_id":"turn-g2","model":"gpt-5.5","effort":"low"}}
+{"timestamp":"@TS@","type":"token_usage_record","payload":{"turn_id":"turn-g2","response_id":"resp-g3","usage":{"input_tokens":3,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0,"total_tokens":5}}}

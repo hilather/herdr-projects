@@ -7,21 +7,25 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+pub mod graph;
 pub mod ledger;
 
 pub const STREAM: &str = "accounting";
 /// `include_str!` of `migrations/telemetry/accounting/`, in order; index + 1 is the stream version.
-pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/accounting/0001_usage_ledger.sql")];
+pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/accounting/0001_usage_ledger.sql"),
+    include_str!("../../../migrations/telemetry/accounting/0002_session_graph.sql")];
 
 /// `herdr-projects telemetry <slug> accounting ...`
 #[derive(clap::Subcommand)]
 pub enum Command {
     /// Stream version of this lane's sidecar tables. Read-only.
     Status,
-    /// Rebuild the usage ledger from the collected Codex rows. Writes only the sidecar.
+    /// Rebuild the usage ledger, session graph and model segments from the collected Codex rows. Writes only the sidecar.
     Sync,
     /// The synced usage ledger: entries with their provenance. Read-only.
     Entries,
+    /// The synced session graph and model segments per session, with the rollup. Read-only.
+    Sessions,
 }
 
 fn unavailable(reason: &str) -> Value {
@@ -38,6 +42,10 @@ pub fn run(project: &Path, command: Command) -> Result<String> {
         },
         Command::Entries => match super::sidecar::read(project)? {
             Some(db) => ledger::read(&db)?,
+            None => unavailable("collection_not_run"),
+        },
+        Command::Sessions => match super::sidecar::read(project)? {
+            Some(db) => graph::read(&db)?,
             None => unavailable("collection_not_run"),
         },
     };
