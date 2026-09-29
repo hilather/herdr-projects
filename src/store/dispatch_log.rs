@@ -53,7 +53,7 @@ pub(super) fn record_decision(tx:&Connection,inputs:&LaunchInputs,attempt:&Attem
 }
 
 /// Content-addressed and immutable: an existing ID must carry identical bytes.
-fn insert_configuration(tx:&Connection,configuration:&AgentConfiguration,now:i64)->Result<()> {
+pub(super) fn insert_configuration(tx:&Connection,configuration:&AgentConfiguration,now:i64)->Result<()> {
     tx.execute("INSERT INTO agent_configurations VALUES(?1,?2,?3) ON CONFLICT(configuration_id) DO NOTHING",params![configuration.id,configuration.canonical_json,now])?;
     let stored:String=tx.query_row("SELECT canonical_json FROM agent_configurations WHERE configuration_id=?1",[&configuration.id],|r|r.get(0))?;
     if stored!=configuration.canonical_json {return Err(StoreError::Corrupt("agent configuration bytes differ".into()));}

@@ -220,3 +220,145 @@ fn revert_within_horizon_counts_recent_censored() {
         assert!(!bytes.windows(4).any(|w| w == b"src/"), "{name}: counts only, no path is stored");
     }
 }
+
+/// Write the fixture rollout `parts` as session `sid` under `home`, in `cwd`, at `ts_ms`.
+fn rollout(home: &Path, sid: &str, parts: &[&str], cwd: &str, ts_ms: i64) {
+    let dir = home.join(".codex/sessions/2026/09/28");
+    fs::create_dir_all(&dir).unwrap();
+    let text = parts.iter().map(|part| fs::read_to_string(Path::new(FIXTURES).join(part)).unwrap()).collect::<String>();
+    let ts = jiff::Timestamp::from_millisecond(ts_ms).unwrap().to_string();
+    fs::write(dir.join(format!("rollout-2026-09-28T00-00-00-{sid}.jsonl")),
+        text.replace("@SID@", sid).replace("@CWD@", cwd).replace("@TS@", &ts).replace("@VERSION@", "0.154.0")).unwrap();
+}
+
+/// TM3.8 sequential arms (contracts-quality.md §3). Group G on task `work`
+/// seals arms 1 `codex`, 2 `fast` (codex with other arguments) and 3 `claude`
+/// while attempt A0 (reserved before G) runs, so A0 is no arm. A reservation
+/// on `fast` before arm 1 binds nothing (launch order is fixed); A1 on `codex`
+/// becomes arm 1 and A2 on `fast` arm 2; arm 3 never launches. A1's candidate
+/// passes verification and A2's fails, yet the operator selects arm 2:
+/// selection is not verification. Losers keep their cost: A1 used 1 record
+/// (1000 in, 400 cached, 120 out, 80 reasoning, 1120 total) and A2 2 records
+/// (1500, 500, 180, 100, 1680), so the arms' total is 2500 in, 900 cached,
+/// 300 out, 180 reasoning, 2800 total over 3 records; arm 3 is a failure
+/// with no cost of its own, and the winner's 1680 is only a drill-down.
+#[test]
+fn group_arms_fixed_before_outcomes_and_losers_keep_cost() {
+    let f = Fixture::new();
+    let db_path = f.project.join(".state/state.db");
+    let fast_home = f.tmp.path().join("fast-home");
+    let mut fast = codex_profile(&f.config, "codex", "fast", Some(&fast_home));
+    fast.arguments_digest = "1".repeat(64);
+    plant_profile(&db_path, fast);
+    plant_profile(&db_path, codex_profile(&f.config, "claude", "claude", None));
+    {
+        let mut db = herdr_projects::store::SqliteStore::open(&db_path).unwrap();
+        let snapshot = db.read_snapshot(None).unwrap();
+        db.set_scheduler_policy(snapshot.head, snapshot.scheduler.unwrap().policy.revision, 1, 5).unwrap();
+    }
+    let sql = || rusqlite::Connection::open(&db_path).unwrap();
+    let count = |table: &str| sql().query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get::<_, i64>(0)).unwrap();
+
+    // `other` differs from `codex` only by name and execution home: the same configuration, refused, nothing written.
+    assert!(f.cli_fail(&["quality", "groups", "create", "work", "--arm", "codex", "--arm", "other"]).contains("arm 2 repeats the configuration of an earlier arm"));
+    assert_eq!(count("candidate_groups"), 0);
+    let created = f.cli_args(&["quality", "groups", "create", "work", "--arm", "codex", "--arm", "fast", "--arm", "claude"]).0["group"].clone();
+    let group = created["group_id"].as_str().unwrap().to_owned();
+    assert!(group.starts_with("sha256:") && group.len() == 71, "{group}");
+    assert_eq!((&created["task_id"], &created["contract_revision"], &created["creator_principal"]), (&json!("work"), &json!(null), &json!("operator:cli")));
+    assert_eq!(created["arms"].as_array().unwrap().iter().map(|a| a["arm"].as_i64().unwrap()).collect::<Vec<_>>(), [1, 2, 3]);
+    let a0_configuration: String = sql().query_row("SELECT chosen_configuration_id FROM dispatch_decisions WHERE attempt_id=?1", [&f.attempt], |r| r.get(0)).unwrap();
+    assert_eq!(created["arms"][0]["configuration_id"], json!(a0_configuration), "arm 1 is the codex configuration");
+    assert!(f.cli_fail(&["quality", "groups", "create", "work", "--arm", "fast", "--arm", "claude"]).contains("already has a candidate group"));
+
+    let latest = || sql().query_row("SELECT attempt_id,decided_unix_ms FROM dispatch_decisions ORDER BY rowid DESC LIMIT 1", [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))).unwrap();
+    let bound = || sql().prepare("SELECT arm,attempt_id FROM candidate_arm_attempts ORDER BY arm").unwrap()
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))).unwrap().map(Result::unwrap).collect::<Vec<_>>();
+    // Arms are ordinary attempts through the existing launch path, bound in their reservation transaction, in launch order.
+    f.readmit("fast");
+    let (early, _) = latest();
+    assert_eq!(bound(), [], "arm 1 comes first: a `fast` reservation now is no arm, and A0 predates the group");
+    f.readmit("codex");
+    let (a1, a1_decided) = latest();
+    f.readmit("fast");
+    let (a2, a2_decided) = latest();
+    assert_eq!(bound(), [(1, a1.clone()), (2, a2.clone())]);
+    assert_eq!(f.cli_args(&["quality", "groups", "show"]).0["groups"][0]["status"], json!("open"));
+
+    // The worker side, as launches and results would write it: collector bindings, rollouts, candidates and pinned CI.
+    let worktree = |attempt: &str| format!("{}/.state/worktrees/{attempt}/repo-00", f.project.display());
+    for (attempt, home) in [(&a1, &f.home), (&a2, &fast_home)] {
+        sql().execute("INSERT INTO collector_bindings(attempt_id,revision,state,collector,execution_home,unix_ms,source) VALUES(?1,1,'active','codex',?2,?3,'apply_launch_started')",
+            rusqlite::params![attempt, home.display().to_string(), unix_ms()]).unwrap();
+    }
+    rollout(&f.home, "00000000-0000-4000-8000-0000000000a1", &["head.jsonl"], &worktree(&a1), a1_decided + 1_000);
+    rollout(&fast_home, "00000000-0000-4000-8000-0000000000a2", &["head.jsonl", "tail.jsonl"], &worktree(&a2), a2_decided + 1_000);
+    let hex = |c: char| c.to_string().repeat(64);
+    let db = sql();
+    db.execute("INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq)
+        VALUES('work',1,NULL,'store',0,'/repo',?1,'sha1',NULL,'verify_only',x'61',?2,(SELECT max(sequence) FROM events))", rusqlite::params!["b".repeat(40), hex('c')]).unwrap();
+    db.execute("INSERT INTO acceptance_policies(task_id,contract_revision,policy_id,body) VALUES('work',1,'ci','cargo test')", []).unwrap();
+    for (sub, attempt, oid, at) in [('1', &a1, "1".repeat(40), 1_000), ('2', &a2, "2".repeat(40), 2_000)] {
+        db.execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,artifact_manifest,claimed_checks,created_unix_ms)
+            VALUES(?1,'store',?1,?2,'{}','work',1,?2,?3,'/repo',?4,?5,'sha1','[]','[]',?6)", rusqlite::params![hex(sub), hex('d'), attempt, "b".repeat(40), oid, at]).unwrap();
+    }
+    for (run, sub, attempt, oid, accepted) in [('a', '1', &a1, "1".repeat(40), true), ('b', '2', &a2, "2".repeat(40), false)] {
+        db.execute("INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,
+            commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms)
+            VALUES(?1,'store',?1,?2,?3,'work',1,?2,?4,'ci',?2,?5,?5,'sha1',0,'linux-unshare-user-pid-mount-v1','[\"x\"]','[]',?6,?7,?8,?9,1,1,3000)",
+            rusqlite::params![hex(run), hex('d'), hex(sub), attempt, oid, if accepted { "accepted" } else { "rejected" }, (!accepted).then_some("cargo test failed"),
+                if accepted { 0 } else { 101 }, accepted.then(|| hex('8'))]).unwrap();
+    }
+    sql().execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,artifact_manifest,claimed_checks,created_unix_ms)
+        VALUES(?1,'store',?1,?2,'{}','work',1,?2,?3,'/repo',?4,?4,'sha1','[]','[]',500)", rusqlite::params![hex('0'), hex('d'), early, "b".repeat(40)]).unwrap();
+    drop(db);
+
+    // Arms are fixed: once sealed, and with outcomes in, no arm can be added, changed, removed or rebound.
+    for statement in ["INSERT INTO candidate_group_arms(group_id,arm,configuration_id,profile_digest) SELECT group_id,4,configuration_id,profile_digest FROM candidate_group_arms WHERE arm=1",
+        "DELETE FROM candidate_group_arms WHERE arm=3", "UPDATE candidate_group_arms SET arm=4 WHERE arm=3",
+        "DELETE FROM candidate_arm_attempts WHERE arm=1", "UPDATE candidate_groups SET arm_count=2"] {
+        assert!(sql().execute(statement, []).is_err(), "{statement}");
+    }
+    let before = f.cli_args(&["quality", "groups", "show"]).0;
+    assert_eq!(before["groups"][0]["arms"].as_array().unwrap().len(), 3);
+
+    // A selection names a member's candidate only.
+    for (args, message) in [(vec!["--arm", "4"], "arm 4 is not a member"), (vec!["--arm", "3"], "arm 3 has no attempt"),
+        (vec!["--arm", "1", "--submission", &hex('2')], "is not a candidate of arm 1"), (vec!["--arm", "1", "--submission", &hex('0')], "is not a candidate of arm 1"),
+        (vec!["--arm", "2", "--reason", "cheapest"], "unknown selection reason")] {
+        let mut command = vec!["quality", "groups", "select", &group];
+        command.extend(args);
+        assert!(f.cli_fail(&command).contains(message), "{message}");
+    }
+    assert_eq!(count("candidate_selections"), 0);
+
+    f.cli("collect");
+    let usage = |attempt: &str| f.cli_args(&["attempts", "--json"]).0["attempts"].as_array().unwrap().iter().find(|a| a["attempt_id"] == attempt).unwrap()["usage"].clone();
+    let a1_usage = json!({"input_tokens": 1000, "cached_input_tokens": 400, "cache_write_input_tokens": 0, "output_tokens": 120, "reasoning_output_tokens": 80, "total_tokens": 1120, "records": 1});
+    let a2_usage = json!({"input_tokens": 1500, "cached_input_tokens": 500, "cache_write_input_tokens": 0, "output_tokens": 180, "reasoning_output_tokens": 100, "total_tokens": 1680, "records": 2});
+    assert_eq!((usage(&a1), usage(&a2)), (a1_usage.clone(), a2_usage.clone()));
+
+    let selection = f.cli_args(&["quality", "groups", "select", &group, "--arm", "2", "--reason", "operator_judgment"]).0["selection"].clone();
+    assert_eq!((&selection["outcome"], &selection["arm"], &selection["attempt_id"], &selection["submission_id"]), (&json!("selected"), &json!(2), &json!(a2), &json!(hex('2'))));
+    assert_eq!((&selection["selector_kind"], &selection["selector_principal"], &selection["reason"]), (&json!("operator"), &json!("operator:cli"), &json!("operator_judgment")));
+    assert_eq!(selection["evidence"], json!([{"arm": 1, "attempt_id": a1, "submission_id": hex('1'), "verification": "accepted"},
+        {"arm": 2, "attempt_id": a2, "submission_id": hex('2'), "verification": "rejected"}]));
+    assert!(f.cli_fail(&["quality", "groups", "select", &group, "--none"]).contains("already has a selection"));
+    assert!(sql().execute("DELETE FROM candidate_selections", []).is_err(), "a selection is immutable");
+
+    let shown = f.cli_args(&["quality", "groups", "show"]).0["groups"][0].clone();
+    assert_eq!((&shown["group_id"], &shown["status"], &shown["selection"]["arm"]), (&json!(group), &json!("closed"), &json!(2)));
+    let arms = shown["arms"].as_array().unwrap();
+    let summary = arms.iter().map(|a| (a["arm"].clone(), a["attempt_id"].clone(), a["role"].clone(), a["outcome"].clone(), a["candidate"].clone(), a["verification"]["state"].clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(summary, [(json!(1), json!(a1), json!("not_selected"), json!("candidate"), json!(hex('1')), json!("accepted")),
+        (json!(2), json!(a2), json!("selected"), json!("candidate"), json!(hex('2')), json!("rejected")),
+        (json!(3), json!(null), json!("not_selected"), json!("failure_no_candidate"), json!(null), json!(null))]);
+    assert_eq!((&arms[0]["usage"], &arms[1]["usage"], &arms[2]["usage"]), (&a1_usage, &a2_usage, &json!(null)), "each arm keeps its own attempt's cost");
+    assert_eq!(shown["cost"], json!({"arms_launched": 2, "arms_not_launched": 1, "winner_usage": a2_usage,
+        "arms_total": {"input_tokens": 2500, "cached_input_tokens": 900, "cache_write_input_tokens": 0, "output_tokens": 300, "reasoning_output_tokens": 180, "total_tokens": 2800, "records": 3}}));
+    assert_eq!(shown["integration_hold"], json!({"enforced": false, "integrated_without_selection": []}));
+    // Selection moved no cost and changed no outcome: the loser's usage and every attempt record are as before.
+    assert_eq!(usage(&a1), a1_usage);
+    assert_eq!(arms[0]["verification"], before["groups"][0]["arms"][0]["verification"]);
+}

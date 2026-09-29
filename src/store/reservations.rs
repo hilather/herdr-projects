@@ -194,6 +194,7 @@ impl SqliteStore {
         let digest=format!("{:x}",Sha256::digest(payload.as_bytes()));let attempt=Attempt{id:attempt_id.clone(),task:record.inputs.task.clone(),revision:1,state:AttemptState::Reserved,snapshot:record.inputs.memory.as_ref().map(|r|r.id.clone()),reservation:format!("worker:{}",attempt_id.as_str()),termination_observed:false};
         tx.execute("INSERT INTO attempts VALUES(?1,?2,1,'reserved',?4,?3,0)",params![attempt_id.as_str(),attempt.task.as_str(),attempt.reservation,attempt.snapshot])?;
         if version>=50 {super::dispatch_log::record_decision(&tx,&record.inputs,&attempt_id,task_revision,classification.as_deref(),dispatch,delegated,now)?;}
+        if version>=53 {super::candidate_groups::bind(&tx,&record.inputs,&attempt_id,now)?;}
         super::dispatch_log::mark(&tx,&attempt,now,"admit_prepared")?;
         tx.execute("UPDATE tasks SET revision=?2,state='running',active_attempt=?3 WHERE id=?1",params![attempt.task.as_str(),integer(task_revision)?,attempt_id.as_str()])?;
         tx.execute("INSERT INTO operations VALUES(?1,?2,'runtime.launch',?3,1,?4,?5,?6,?7,?1)",params![operation_id.as_str(),attempt.task.as_str(),record.inputs.binding,payload,digest,integer(task_revision)?,now])?;

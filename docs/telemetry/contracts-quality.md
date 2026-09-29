@@ -100,3 +100,89 @@ collection_not_run`, an empty denominator `null` with `empty_denominator`.
   lines, with `area_churn` {`added_lines`, `deleted_lines`} beside it.
 - **M46 main breakage** is `unavailable: no_main_check_producer`;
   **`flaky_tests`** (newly flaky tests) is `unavailable: no_repeat_runs`.
+
+## 3. Candidate groups (TM3.8, card C3)
+
+Plan doc 05 §5a, doc 06 §6c, doc 03 `CandidateGroup`/`CandidateSelection`.
+Owner decision 1 ([phase2-lanes.md](phase2-lanes.md)): arms are
+**sequential**; each arm is an ordinary attempt of the group's task, reserved
+through the existing launch path. `tasks.active_attempt`, the scheduler and
+integration are unchanged. Canonical migration `0053_candidate_groups.sql`
+(schema 53); store API `src/store/candidate_groups.rs`.
+
+**Tables** (canonical, append-only: every UPDATE/DELETE aborts except the one
+seal below; no cost column anywhere):
+
+- `candidate_groups(group_id, task_id, contract_revision, arm_count,
+  creator_principal, canonical_json, created_unix_ms, sealed_unix_ms)`.
+  `group_id` = `sha256:` over `canonical_json` = canonical JSON
+  `{arms:[{arm, configuration_id, profile_digest}], contract_revision,
+  created_unix_ms, schema:"candidate_group.v1", task_id}`. One group per
+  `(task_id, contract_revision)` (NULL revision: task without a contract);
+  `contract_revision` is the task's latest at creation. 2–8 arms.
+- `candidate_group_arms(group_id, arm, configuration_id, profile_digest)`:
+  `arm` 1..`arm_count` is the launch order; configurations are distinct
+  (contracts §2 IDs, inserted into `agent_configurations`). *Seal*: the group
+  row, all its arms and `sealed_unix_ms` are written in one transaction; a
+  trigger allows the seal only once and only with exactly `arm_count` arms, and
+  refuses any arm insert into a sealed group. Per-arm budgets are not recorded.
+- `candidate_arm_attempts(group_id, arm, attempt_id UNIQUE, bound_unix_ms,
+  source)`: written in the `admit_prepared` reservation transaction, right
+  after the attempt's dispatch decision (`source = 'admit_prepared'`). The
+  attempt binds the *next* arm (lowest unbound arm of the task's sealed,
+  unselected group for the attempt's contract revision) only when its chosen
+  configuration is that arm's; otherwise nothing is written and the
+  reservation proceeds unchanged (a group never grants or refuses launch).
+  A trigger also refuses a bind into an unsealed or selected group, to an
+  attempt of another task, revision or configuration, or to an attempt that
+  already has a result. Attempts reserved before the seal, out of order, or
+  after the selection are not arms. Drafts and delegated replays bind nothing.
+- `candidate_selections(group_id PK, outcome, arm, attempt_id, submission_id,
+  selector_kind, selector_principal, reason, evidence, selected_unix_ms)`: at
+  most one per group; it closes the group. `outcome = 'selected'` names a
+  bound arm, its attempt and one of that attempt's `result_submissions`
+  (trigger-checked); `no_selection` names none. Reasons: selected
+  `operator_judgment`, `first_passing_verification`, `unspecified`;
+  no selection `no_candidate`, `none_acceptable`, `unspecified`. `evidence`
+  is computed by the store at selection time, per bound arm:
+  `{arm, attempt_id, submission_id (first by created_unix_ms, rowid, or
+  null), verification}` with `verification` the latest run per policy
+  combined (`rejected` if any, `accepted` if all, else `pending`;
+  `no_candidate` without a submission). IDs and states only, no text.
+
+**Selection is not verification.** Recording a selection verifies,
+integrates, completes or reassigns nothing; the winner still needs the
+ordinary verification and integration path, and a loser keeps its own
+outcome.
+
+**Cost** is owned once by each attempt (contracts §4 `usage`). A group
+stores no cost and never moves it: a losing, cancelled or unfinished arm
+keeps its attempt's usage.
+
+**Commands** (`telemetry <slug> quality groups ...`, JSON):
+
+- `create <task> --arm <profile> --arm <profile> ...` seals a group; each
+  `--arm` names a retained native profile (latest retained report of that
+  name). Principal `operator:cli`. Writes through `SqliteStore` in one
+  canonical transaction.
+- `select <group> (--arm N [--submission ID] | --none) [--reason CODE]`
+  records the selection (`selector_kind = 'operator'`, principal
+  `operator:cli`); the default submission is the arm's first candidate.
+- `show` (read-only, contracts §0 reads): per group `status`
+  (`open`/`closed`), `selection`, and per arm `attempt_id`, `role`
+  (`open`, `selected`, `not_selected`), `candidate`, `outcome` (`candidate`,
+  `running`, `failure_no_candidate`; an unbound arm is `not_launched` while
+  open and `failure_no_candidate` once closed), and the attempt's
+  `terminal_state`, `verification`, `integration`, `accepted` and `usage`
+  exactly as `telemetry attempts` reports them. `cost.arms_total` sums
+  every launched arm's usage field by field, or is `unavailable:
+  arm_usage_unavailable` (listing each arm's reason) when any launched arm's
+  usage is unknown; `arms_launched`, `arms_not_launched` (no attempt, so no
+  consumption of its own) and `winner_usage` (drill-down only).
+
+**Integration is not held by C3.** Owner decision 1 wants integration held
+until a selection exists, which needs integration edits outside lane C
+(`src/store/integration_jobs.rs` eligibility and `begin_integration`), so it
+is escalated, not built. Until then `show` reports `integration_hold:
+{enforced: false, integrated_without_selection: [...]}` listing arms whose
+candidate integrated without being the selection.

@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+mod groups;
 mod outcomes;
 mod proxy;
 
@@ -39,6 +40,11 @@ pub enum Command {
         #[arg(long, default_value_t = outcomes::DEFAULT_HORIZON_DAYS, value_parser = clap::value_parser!(u32).range(1..=3650))]
         horizon_days: u32,
     },
+    /// TM3.8 candidate groups: sealed arms, selection and per-arm outcome and cost.
+    Groups {
+        #[command(subcommand)]
+        command: groups::Command,
+    },
 }
 
 /// The command's stdout.
@@ -49,6 +55,7 @@ pub fn run(project: &Path, command: Command) -> Result<String> {
             "proxy_signals": proxy::collect(project, true, usize::MAX)?,
             "integration_outcomes": outcomes::collect(project, true, horizon_days, COLLECT_INTEGRATIONS * outcomes::CALLS_PER_INTEGRATION)?,
         }),
+        Command::Groups { command } => groups::run(project, command)?,
         Command::Report { since, horizon_days } => serde_json::json!({"metrics": lane_metrics(project, since, horizon_days)?, "since_unix_ms": since, "horizon_days": horizon_days}),
     };
     Ok(serde_json::to_string_pretty(&value)? + "\n")

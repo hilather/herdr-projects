@@ -4,7 +4,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{fmt, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 
-pub const SCHEMA: u32 = 52;
+pub const SCHEMA: u32 = 53;
 const APPLICATION: u32 = 1_213_222_994;
 pub const MIN_SQLITE: i32 = 3_053_004;
 pub const MIN_SQLITE_VERSION: &str = "3.53.4";
@@ -114,6 +114,7 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../migrations/0050_dispatch_decisions.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0051_attempt_lifecycle.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0052_collector_bindings.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0053_candidate_groups.sql"))?;
             tx.commit()?;
         }
         // Persist the initial directory entry as well as SQLite's own commit.
@@ -513,6 +514,8 @@ mod capabilities;
 mod delegation;
 mod delegated_reservation;
 mod dispatch_log;
+mod candidate_groups;
+pub use candidate_groups::{CandidateArm,CandidateGroup,CandidateSelection,SelectionChoice,NO_SELECTION_REASONS,SELECTED_REASONS};
 pub use delegation::DelegationReserve;
 
 #[cfg(target_os = "linux")]
