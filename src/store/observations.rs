@@ -69,6 +69,7 @@ mod tests {
 impl SqliteStore {
     /// Commit a complete collector batch against the exact state it observed.
     /// No external commands run here and no capacity/lifecycle state is changed.
+    /// A claim whose worker's end is already proven is retired, not a pause.
     pub fn record_observations(&mut self,expected_head:u64,observations:&[RuntimeObservation])->Result<u64> {
         self.record_observations_with_budget(expected_head,observations,None)
     }
@@ -121,16 +122,31 @@ impl SqliteStore {
         let schema:u32=tx.query_row("PRAGMA user_version",[],|r|r.get(0))?;
         if schema>=9&&super::control::read(&tx)?.state==ProjectState::Active {
             let mut changed=false;
+            let mut ended=Vec::new();
             for owned in super::ownership::read_all_with_budget(&tx,budget)? {
                 if schema>=41 && !bindings.contains_key(owned.binding.as_str()) {changed=true;continue;}
                 if let Some(binding)=bindings.get(owned.binding.as_str()).filter(|binding|binding.revision==owned.binding_revision) {
                     let valid=match by_binding.get(binding.id.as_str()) {Some(o)=>super::ownership::observed(binding,binding.task.as_ref().and_then(|id|tasks.get(id).copied()),o,o.observed_unix_ms,o.config_digest.as_deref())&&super::ownership::matches(&owned,binding,o)?,None=>false};
-                    if !valid{changed=true;}
+                    if valid {continue;}
+                    // A pane and agent gone after their worker's proven end are expected.
+                    match by_binding.get(binding.id.as_str()).map(|o|super::worker_termination::proven_end(&tx,&owned,binding,o,budget)).transpose()?.flatten() {
+                        Some(receipt)=>ended.push((owned,receipt)),
+                        None=>changed=true,
+                    }
                 } else {
                     // A claim from another binding generation cannot certify
                     // the current inventory, even if the endpoint looks live.
                     changed=true;
                 }
+            }
+            // Retire each ended claim as audited relinquishment would, retaining
+            // the binding and its resource references; nothing external changes.
+            for (owned,receipt) in ended {
+                tx.execute("DELETE FROM runtime_ownership WHERE binding_id=?1",[&owned.binding])?;
+                tx.execute("DELETE FROM runtime_observations WHERE binding_id=?1",[&owned.binding])?;
+                super::active_work::invalidate(&tx)?;
+                let payload=serde_json::json!({"ownership":owned,"reason":"worker termination proven; its pane and agent are absent","resources_removed":false,"termination":receipt});
+                tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.relinquished',?1,?2,1,?3)",params![owned.binding,integer(owned.revision)?,payload.to_string()])?;
             }
             if changed {super::control::invalidate(&tx)?;}
         }

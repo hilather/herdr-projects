@@ -123,8 +123,20 @@ requesting active control. Matching repeated adoption is idempotent.
 
 Recorded evidence of replacement or lost ownership pauses active control without
 releasing capacity. Pane absence or idle status is never termination evidence.
-Adopted resources do not grant destructive cleanup authority. Termination evidence remains to be implemented; retained worker attempts block
+Adopted resources do not grant destructive cleanup authority. Retained worker attempts block
 relinquishment and rebinding. Conflict protection covers projects in this root only.
+
+A launched worker's end is proven only by its recorded termination receipt
+(`runtime.worker_terminated`), which releases the attempt but retains the claim and
+resources. When a later recorded observation shows that claim's pane absent or
+without its agent, the store checks that receipt: the attempt must be terminated
+and released, and the receipt must name the exact claim generation, binding
+revision and retained resource identity, with the claimed worktree still present.
+Only then is the disappearance expected: the claim is retired in the same
+transaction as an audited `runtime.relinquished` event carrying the receipt, the
+binding and its resource references are retained, and control stays active.
+Unknown/unreachable evidence, a changed worktree, or any disappearance without
+such a receipt still pauses control and requires reconciliation.
 
 ## Audited relinquishment
 

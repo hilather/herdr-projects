@@ -15,13 +15,15 @@ const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
 /// A Herdr server on `argv[1]` that runs `workspace.create_command` for real
 /// and logs each request to `requests` beside the socket. `ping.json` there
 /// replaces the ping reply; `lose-create` runs the command but drops the reply;
-/// `drop-release` drops gate-release input unsent and unanswered.
+/// `drop-release` drops gate-release input unsent and unanswered; `vanish`
+/// closes the worker's workspace, pane and agent without touching its process.
 const SERVER: &str = r#"
 import json,os,sys,socket,subprocess
 path=sys.argv[1];root=os.path.dirname(path);s={}
 server=socket.socket(socket.AF_UNIX);server.bind(path);server.listen()
 while True:
  c,_=server.accept();f=c.makefile('rw');r=json.loads(f.readline());m=r['method'];p=r.get('params') or {}
+ live='pid' in s and not os.path.exists(os.path.join(root,'vanish'))
  with open(os.path.join(root,'requests'),'a') as log:log.write(json.dumps({'method':m,'params':p})+'\n')
  pane={'pane_id':'w1:p1','workspace_id':'w1','tab_id':'w1:t1','terminal_id':'term1','cwd':s.get('cwd')}
  agent=dict(pane,agent='claude',interactive_ready=True,agent_status='idle',**({'name':s['name']} if 'name' in s else {}))
@@ -34,14 +36,14 @@ while True:
   child=subprocess.Popen(p['command'],cwd=p['cwd'],stdin=fd,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,env={'PATH':'/usr/bin:/bin'})
   s.update(pid=child.pid,argv=p['command'],cwd=p['cwd'],label=p['label'],fifo=fifo)
   if not os.path.exists(os.path.join(root,'lose-create')):res={'type':'workspace_created','workspace':{'workspace_id':'w1'},'root_pane':{'pane_id':'w1:p1'}}
- elif m=='workspace.list':res={'type':'workspace_list','workspaces':[{'workspace_id':'w1','label':s['label'],'pane_count':1,'tab_count':1}] if 'pid' in s else []}
- elif m=='pane.list':res={'panes':[pane] if 'pid' in s else []}
+ elif m=='workspace.list':res={'type':'workspace_list','workspaces':[{'workspace_id':'w1','label':s['label'],'pane_count':1,'tab_count':1}] if live else []}
+ elif m=='pane.list':res={'panes':[pane] if live else []}
  elif m=='pane.get':res={'pane':pane}
- elif m=='pane.process_info':res={'process_info':{'pane_id':'w1:p1','foreground_processes':[{'pid':s['pid'],'argv':s['argv']}] if 'pid' in s else []}}
+ elif m=='pane.process_info':res={'process_info':{'pane_id':'w1:p1','foreground_processes':[{'pid':s['pid'],'argv':s['argv']}] if live else []}}
  elif m=='pane.send_input' and os.path.exists(os.path.join(root,'drop-release')):pass
  elif m=='pane.send_input':
   fd=os.open(s['fifo'],os.O_WRONLY);os.write(fd,p['text'].encode());os.close(fd);s['released']=True;res={'type':'ok'}
- elif m=='agent.list':res={'type':'agent_list','agents':[agent] if s.get('released') else []}
+ elif m=='agent.list':res={'type':'agent_list','agents':[agent] if live and s.get('released') else []}
  elif m=='agent.rename':s['name']=agent['name']=p['name'];res={'type':'agent_info','agent':agent}
  elif m=='agent.explain':res={'type':'agent_explain','explain':{'agent':'claude','state':'idle','manifest_source':'bundled','manifest_version':'2026.09.14.1',
   'matched_rule':{'id':'prompt','state':'idle'},'visible_idle':True,'visible_blocker':False,'visible_working':False,'screen_detection_skipped':False,
@@ -99,16 +101,15 @@ impl Lab {
         lab.write_binaries();
         lab
     }
-    /// Record a fresh observation of the binding and set the project active.
+    /// Record a fresh observation of every (resource-free) binding and set the project active.
     fn resume(&self) {
         let state = self.state();
-        let binding = state.runtime_bindings.iter().find(|b| b.id == self.binding).unwrap();
-        let task = state.tasks.iter().find(|t| t.id.as_str() == "work").unwrap();
         let config = self.path(".config/herdr-projects/config.toml");
-        let observation = herdr_projects::reconcile::RuntimeObservation { binding: binding.id.clone(), binding_revision: binding.revision,
-            task_revision: Some(task.revision), observed_unix_ms: jiff::Timestamp::now().as_millisecond(), collector: "herdr-git-v2".into(),
-            config_digest: migration::config_reference(&config).unwrap().digest, ..Default::default() };
-        migration::open_active(&self.project).unwrap().record_observations(state.head, &[observation]).unwrap();
+        let observations = state.runtime_bindings.iter().map(|binding| herdr_projects::reconcile::RuntimeObservation { binding: binding.id.clone(), binding_revision: binding.revision,
+            task_revision: binding.task.as_ref().map(|id| state.tasks.iter().find(|t| &t.id == id).unwrap().revision),
+            observed_unix_ms: jiff::Timestamp::now().as_millisecond(), collector: "herdr-git-v2".into(),
+            config_digest: migration::config_reference(&config).unwrap().digest.clone(), ..Default::default() }).collect::<Vec<_>>();
+        migration::open_active(&self.project).unwrap().record_observations(state.head, &observations).unwrap();
         let control = self.state().control.unwrap().revision.to_string();
         self.ok(&["runtime", "demo", "state", "active", "--expected-revision", &control, "--expected-head", &self.head().to_string()]);
     }
@@ -195,13 +196,15 @@ sys.stdout.buffer.write(json.dumps({'result':json.loads(reply)['result']}).encod
         self.profile = reference;
     }
     /// Retain `instructions` as worker knowledge and write the launch selection.
-    fn selection(&self, instructions: &str) -> PathBuf {
+    fn selection(&self, instructions: &str) -> PathBuf { self.selection_for("work", &self.binding, instructions) }
+    /// As `selection`, for `task` on `binding`.
+    fn selection_for(&self, task: &str, binding: &str, instructions: &str) -> PathBuf {
         fs::write(self.project.join("PROJECT.md"), instructions).unwrap();
         let scope = self.path("scope.json");
-        fs::write(&scope, r#"{"schema_version":1,"task_id":"work","profile":"worker","domains":[],"paths":[],"pinned_keys":[],"sensitivity":"default"}"#).unwrap();
-        let snapshot = self.ok(&["memory", "demo", "snapshot", "--task", "work", "--profile", "worker", "--input-file", scope.to_str().unwrap(), "--worker"]);
+        fs::write(&scope, json!({"schema_version":1,"task_id":task,"profile":"worker","domains":[],"paths":[],"pinned_keys":[],"sensitivity":"default"}).to_string()).unwrap();
+        let snapshot = self.ok(&["memory", "demo", "snapshot", "--task", task, "--profile", "worker", "--input-file", scope.to_str().unwrap(), "--worker"]);
         let selection = self.path("selection.json");
-        fs::write(&selection, json!({"task":"work","binding":self.binding,"profile":self.profile,
+        fs::write(&selection, json!({"task":task,"binding":binding,"profile":self.profile,
             "knowledge":{"id":snapshot["id"],"revision":1,"digest":snapshot["manifest_hash"]},"repositories":[self.repo.canonicalize().unwrap()]}).to_string()).unwrap();
         selection
     }
@@ -576,4 +579,66 @@ fn a_worker_wall_deadline_outside_one_second_to_seven_days_is_refused() {
     fs::write(&config, original.replace("max_wall_seconds=600", "max_wall_seconds=604800")).unwrap();
     lab.ok(&["profile", "prepare", "demo", "worker", "--herdr-executable", lab.herdr.to_str().unwrap(),
         "--agent-executable", lab.path("bin/claude").to_str().unwrap(), "--execution-home", lab.path("agent-home").to_str().unwrap()]);
+}
+
+/// A worker whose end is proven (here: a cancelled attempt the ticker stops
+/// while the project is active) leaves the project admitted after its pane
+/// closes: the ownership claim is retired with an audit event and the next
+/// task can be drafted. A pane that vanishes under a live worker, with no
+/// termination evidence, still pauses the project and keeps the claim.
+#[test]
+fn a_proven_worker_end_keeps_the_project_admitted_but_an_unexplained_pane_loss_pauses_it() {
+    let mut lab = Lab::new("unknown_usage='allow_with_warning'");
+    // A second queued task on its own resource-free binding.
+    lab.ok(&["task", "demo", "add", "next", "--title", "next", "--expected-head", &lab.head().to_string()]);
+    let request = lab.path("queue.json");
+    lab.ok(&["task", "demo", "queue", "next", "--input-file", request.to_str().unwrap(), "--expected-revision", "1", "--expected-head", &lab.head().to_string()]);
+    let id = TaskId::new("next").unwrap();
+    let revision = lab.state().tasks.into_iter().find(|t| t.id == id).unwrap().revision;
+    let route = RuntimeRoute { socket: lab.socket().display().to_string(), cwd: lab.repo.canonicalize().unwrap().display().to_string(), ..Default::default() };
+    let next = runtime::create_binding(&lab.project, Some(&id), Some(revision), lab.head(), &route).unwrap().binding.id;
+    lab.resume();
+    let (_, attempt) = lab.reserve("Retained instructions");
+    lab.serve();
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 120, &|| lab.attempt(&attempt).state == AttemptState::Running);
+    lab.stop(ticker);
+    let running = lab.attempt(&attempt);
+    lab.ok(&["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &running.revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "operator stop"]);
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 60, &|| lab.attempt(&attempt).termination_observed);
+    lab.stop(ticker);
+    // Herdr closes the ended worker's pane; a pass observes its absence and
+    // later passes no longer track the retired binding.
+    fs::write(lab.path("lab/vanish"), b"").unwrap();
+    lab.run_for("pane.list", 1);
+    lab.run_passes(1);
+    let state = lab.state();
+    let control = state.control.clone().unwrap();
+    assert_eq!((control.state, control.reconciliation_required), (ProjectState::Active, false), "{:?}", lab.events("project.reconciliation_invalidated"));
+    assert!(state.ownership.iter().all(|o| o.binding != lab.binding), "{:?}", state.ownership);
+    let retired = lab.events("runtime.relinquished");
+    assert_eq!(retired.len(), 1);
+    assert_eq!((retired[0].entity.as_str(), &retired[0].payload["termination"]["attempt"]), (lab.binding.as_str(), &json!(attempt.as_str())));
+    // The binding and its resource references are retained.
+    assert_eq!(state.runtime_bindings.iter().find(|b| b.id == lab.binding).unwrap().identity.pane_id, "w1:p1");
+    let selection = lab.selection_for("next", &next, "Next instructions");
+    lab.ok(&["launch", "demo", "draft", "--selection", selection.to_str().unwrap(), "--expected-head", &lab.head().to_string()]);
+
+    // Without termination evidence the same disappearance is unexplained.
+    let mut lab = Lab::new("unknown_usage='allow_with_warning'");
+    let (_, attempt) = lab.reserve("Retained instructions");
+    lab.serve();
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 120, &|| lab.attempt(&attempt).state == AttemptState::Running);
+    lab.stop(ticker);
+    fs::write(lab.path("lab/vanish"), b"").unwrap();
+    lab.run_for("pane.list", 2);
+    let state = lab.state();
+    let control = state.control.clone().unwrap();
+    assert_eq!((control.state, control.reconciliation_required), (ProjectState::Paused, true));
+    assert!(state.ownership.iter().any(|o| o.binding == lab.binding && o.attempt.as_ref() == Some(&attempt)));
+    assert!(lab.events("runtime.relinquished").is_empty());
+    let live = lab.attempt(&attempt);
+    assert!(live.retains_capacity() && !live.termination_observed);
 }

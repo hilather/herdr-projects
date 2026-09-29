@@ -447,6 +447,30 @@ impl SqliteStore {
     }
 }
 
+/// Durable proof that the launched worker holding `owned` already ended, so a
+/// later observation of its pane and agent as absent is expected rather than a
+/// lost claim. The attempt must be released by its recorded termination
+/// receipt, and that receipt must name this exact claim generation, binding
+/// revision and retained resources; its worktree must still be the claimed one.
+/// Anything less keeps the fail-safe pause.
+pub(super) fn proven_end(db:&Connection,owned:&RuntimeOwnership,binding:&RuntimeBinding,observation:&crate::reconcile::RuntimeObservation,budget:Option<&read_budget::ReadBudget>)->Result<Option<WorkerTerminationReceipt>> {
+    let Some(id)=owned.attempt.as_ref().filter(|_|owned.origin=="launched") else {return Ok(None);};
+    // The collector reports a claimed pane whose agent is gone as a mismatch.
+    // Unreachable (unknown) evidence and a changed worktree stay unexplained.
+    use crate::reconcile::ResourceState as S;
+    let tree=if binding.identity.worktree_path.is_empty() {S::Unrecorded} else {S::Present};
+    if !matches!(observation.pane,S::Absent|S::Mismatch) || observation.agent_present || observation.agent_identity.is_some()
+        || observation.worktree!=tree || observation.worktree_identity!=owned.worktree {return Ok(None);}
+    let attempt=read_attempt_with_budget(db,id,budget)?;
+    if !attempt.termination_observed || attempt.retains_capacity() || binding.task.as_ref()!=Some(&attempt.task) {return Ok(None);}
+    let Some(payload)=read_budget::optional(db,"SELECT payload FROM events WHERE kind='runtime.worker_terminated' AND entity=?1 ORDER BY sequence DESC LIMIT 1",[id.as_str()],budget,&[(0,1)],|row|row.get::<_,String>(0))? else {return Ok(None);};
+    let receipt:WorkerTerminationReceipt=serde_json::from_str(&payload).map_err(|_|StoreError::Corrupt("invalid worker termination receipt".into()))?;
+    let exact=receipt.attempt==*id && receipt.binding==binding.id && receipt.binding_revision==binding.revision
+        && owned.binding_revision==binding.revision && receipt.ownership_revision==owned.revision
+        && receipt.retained_resources==binding.identity && owned.identity_digest==super::ownership::identity_digest(binding)?;
+    Ok(exact.then_some(receipt))
+}
+
 fn completion_requested(db:&Connection,attempt:&AttemptId)->Result<bool> {
     Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE kind='attempt.completion_requested' AND entity=?1)",[attempt.as_str()],|row|row.get(0))?)
 }
