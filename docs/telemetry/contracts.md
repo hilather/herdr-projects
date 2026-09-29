@@ -36,7 +36,7 @@ needs a new reviewed revision, not a silent reinterpretation.
   (RFC 8785 subset, as doc 03 §4). Digests are `sha256:` + lowercase hex.
 - **Time.** Unix milliseconds from the controller's `now` at the transition.
   Codex times are kept as reported and never reorder canonical events.
-- **Stores.** Canonical: `<project>/.state/state.db`, migrations 0049–0054 (0052 collector bindings, contracts-collection.md; 0053 candidate groups, contracts-quality.md §3; 0054 review capture, contracts-review.md; 0055 finding triage and duplicate history, contracts-review.md §5).
+- **Stores.** Canonical: `<project>/.state/state.db`, migrations 0049–0056 (0052 collector bindings, contracts-collection.md; 0053 candidate groups, contracts-quality.md §3; 0054 review capture, contracts-review.md; 0055 finding triage and duplicate history, contracts-review.md §5; 0056 fix attribution, regressions and role credit, contracts-review.md §6).
   Sidecar: `<project>/.state/telemetry.db`, own sequence under
   `migrations/telemetry/`, mode 0600, created on first collect. No
   cross-database transaction or foreign key; sidecar rows reference canonical
@@ -530,7 +530,7 @@ M33 typed attention reasons; transactional outbox (TM0.4);
 spool; budget bridge and any change to `UnknownUsagePolicy` (TM2.4);
 provider charges, invoice allocation and currency conversion; M04/M11/M12;
 Claude and OTLP adapters; candidate-group selection and races; stochastic
-assignment policies; review/finding attribution; coordinator digest,
+assignment policies; coordinator digest,
 sidebar suffix and inbox alerts; retention jobs and restore; configuration
 staleness (M50); resume/compaction reconciliation beyond quarantine.
 
@@ -541,5 +541,7 @@ outcomes, candidate groups and selection (contracts-quality.md §1–§4),
 attention intervals (contracts-accounting.md §6), Codex session metadata
 (contracts-collection.md A4), Codex tool/exec metadata (contracts-collection.md
 A6), review opportunities, sessions and completions,
-finding triage, claims and duplicate merge/unmerge history
-(contracts-review.md).
+finding triage, claims and duplicate merge/unmerge history, repair
+opportunities, exact-candidate fix verification and integration links,
+reopen lineage, causal introduction decisions and fractional role credit
+(contracts-review.md §5–§6).
