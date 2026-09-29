@@ -411,3 +411,166 @@ fn window_reset_starts_new_window_not_negative() {
     assert_eq!(headroom(&f)["value"], unavailable("no_trusted_observation"));
     assert!(f.text(&["accounting", "quota"]).lines().any(|l| l == format!("M40 {} n/a (no_trusted_observation)", f.attempt)));
 }
+
+/// Herdr stand-in: logs every call with its socket, answers `agent list` from
+/// `$HOME/agents.json`, and exits without a reply when that file is absent
+/// (server not answering). Anything else is refused.
+const FAKE_HERDR: &str = "#!/bin/sh\nprintf '%s|%s\\n' \"$*\" \"$HERDR_SOCKET_PATH\" >> \"$HOME/calls\"\ncase \"$*\" in\n\
+'agent list') [ -f \"$HOME/agents.json\" ] || exit 1; cat \"$HOME/agents.json\";;\n*) echo '{\"error\":{\"code\":\"refused\",\"message\":\"unexpected\"}}'; exit 2;;\nesac\n";
+
+/// Minute `m` after the fixed start (November 2023, so any real "now" is far past the last sample).
+const T0: i64 = 1_700_000_000_000;
+fn minute(m: f64) -> i64 { T0 + (m * 60_000.0) as i64 }
+
+/// Doc 10 §5a attention golden on two attempts: a1 waits 1–3 and a2 waits
+/// 2–6 (minutes) → union 5 minutes, sum 6, observed by the ticker's sampling
+/// pass through a Herdr stand-in. a1 waits again at 4 and ends at 4.5: that
+/// interval is censored `attempt_ended`, never closed at a guess. a2 waits at
+/// 7, Herdr stops answering at 8 (a `herdr_unreachable` gap censors the
+/// wait), waits at 9 (after the gap: kept, not counted), works at 10; the
+/// ticker is not running 10–13 and not since 13 (`not_observed` gaps). a3
+/// was launched and cancelled before any pass: `not_observed`, never 0.
+#[test]
+fn attention_intervals_union_and_censor() {
+    use herdr_projects::store::SqliteStore;
+    let tmp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(tmp.path()).unwrap();
+    let (root, home) = (base.join("root"), base.join("home"));
+    let project = root.join("demo");
+    fs::create_dir_all(project.join(".state")).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let herdr = base.join("herdr");
+    fs::write(&herdr, FAKE_HERDR).unwrap();
+    fs::set_permissions(&herdr, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let socket = base.join("herdr.sock");
+    let _server = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let socket = socket.to_str().unwrap().to_owned();
+
+    // Canonical rows, planted as the golden report test does: t1 accepted
+    // (verify_only, verified), t2 and t3 open. Each attempt has the launch
+    // receipt its start would record, one minute before the first pass.
+    let db_path = project.join(".state/state.db");
+    drop(SqliteStore::create(&db_path).unwrap());
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    let hex = |c: char| c.to_string().repeat(64);
+    let oid = "a".repeat(40);
+    for (task, task_state, attempt, attempt_state, ended) in [("t1", "running", "a1", "running", 0), ("t2", "running", "a2", "running", 0), ("t3", "blocked", "a3", "cancelled", 1)] {
+        db.execute("INSERT INTO tasks(id,revision,state,title) VALUES(?1,1,?2,?1)", [task, task_state]).unwrap();
+        db.execute("INSERT INTO attempts(id,task_id,revision,state,reservation,termination_observed) VALUES(?1,?2,2,?3,?1,?4)",
+            rusqlite::params![attempt, task, attempt_state, ended]).unwrap();
+        let n = &attempt[1..];
+        let receipt = json!({"version": 2, "attempt": attempt, "operation": format!("op-{attempt}"),
+            "route": {"machine": "", "socket": socket, "workspace_id": "w1", "tab_id": "w1:t1", "pane_id": format!("w1:p{n}"), "cwd": format!("/work/{attempt}")},
+            "terminal": format!("term-{n}"), "session": {"device": 1, "inode": 2, "born_secs": 3, "born_nanos": 4},
+            "agent": {"kind": "codex", "name": format!("worker-{attempt}")}, "observed_unix_ms": minute(-1.0)});
+        db.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_started',?1,1,1,?2)",
+            rusqlite::params![format!("op-{attempt}"), receipt.to_string()]).unwrap();
+    }
+    db.execute("INSERT INTO attempt_lifecycle(attempt_id,state,attempt_revision,unix_ms,source) VALUES('a3','cancelled',2,?1,'fixture')", [minute(-0.5)]).unwrap();
+    db.execute("INSERT INTO task_contracts(task_id,contract_revision,project_store,expected_head,repository,base_oid,object_format,route,raw_bytes,raw_digest,installed_seq)
+        VALUES('t1',1,'store',1,'/repo',?1,'sha1','verify_only',x'7b7d',?2,1)", rusqlite::params![oid, hex('c')]).unwrap();
+    db.execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,artifact_manifest,claimed_checks,created_unix_ms)
+        VALUES(?1,'store',?1,?2,'{}','t1',1,?2,'a1','/repo',?3,?3,'sha1','[]','[]',1000)", rusqlite::params![hex('1'), hex('d'), oid]).unwrap();
+    db.execute("INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms)
+        VALUES(?1,?1,?2,?3,?3,'sha1',?4,?4,'linux-unshare-user-pid-mount-v1',0,2000)", rusqlite::params![hex('4'), hex('1'), oid, hex('e')]).unwrap();
+
+    let cli = |args: &[&str]| -> (serde_json::Value, String) {
+        let out = Command::new(BIN).env_clear().env("HOME", &home).env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", &herdr)
+            .env("HERDR_PROJECTS_TELEMETRY_COLLECT_SECS", "60").args(["--root", root.to_str().unwrap(), "telemetry", "demo"]).args(args).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let text = String::from_utf8(out.stdout).unwrap();
+        (serde_json::from_str(&text).unwrap_or(serde_json::Value::Null), text)
+    };
+    cli(&["collect"]);
+    assert_eq!(cli(&["accounting", "status"]).0, json!({"stream": "accounting", "version": 5}));
+    // Before any pass nothing was collected: unavailable, never 0.
+    let report = cli(&["report", "--json"]).0;
+    for id in ["M31", "M32", "M33"] {
+        assert_eq!(report["metrics"][id]["value"], json!({"status": "unavailable", "reason": "attention_not_collected"}), "{id}");
+    }
+
+    // Each pass sees the agent list below; the terminal title is screen text that must never be stored.
+    let agent = |attempt: &str, status: &str| json!({"pane_id": format!("w1:p{}", &attempt[1..]), "workspace_id": "w1", "tab_id": "w1:t1",
+        "cwd": format!("/work/{attempt}"), "agent": "codex", "name": format!("worker-{attempt}"), "agent_status": status, "terminal_title": "SECRET screen text"});
+    let pass = |agents: Option<Vec<serde_json::Value>>| {
+        match agents {
+            Some(agents) => fs::write(home.join("agents.json"), json!({"result": {"agents": agents}}).to_string()).unwrap(),
+            None => { let _ = fs::remove_file(home.join("agents.json")); }
+        }
+        cli(&["accounting", "observe-attention"]).0
+    };
+    let both = |a1: &str, a2: &str| Some(vec![agent("a1", a1), agent("a2", a2)]);
+    assert_eq!(pass(both("working", "working")), json!({"attempts": 2, "states": 2, "gaps": {}}));
+    pass(both("blocked", "working"));
+    pass(both("blocked", "blocked"));
+    pass(both("working", "blocked"));
+    pass(both("blocked", "blocked"));
+    // a1 completes at minute 4.5 (its terminal mark); later passes no longer sample it.
+    db.execute("UPDATE attempts SET state='completed',termination_observed=1 WHERE id='a1'", []).unwrap();
+    db.execute("UPDATE tasks SET state='succeeded' WHERE id='t1'", []).unwrap();
+    db.execute("INSERT INTO attempt_lifecycle(attempt_id,state,attempt_revision,unix_ms,source) VALUES('a1','completed',2,?1,'fixture')", [minute(4.5)]).unwrap();
+    for a2 in ["blocked", "working", "blocked"] { pass(Some(vec![agent("a2", a2)])); }
+    assert_eq!(pass(None), json!({"attempts": 1, "states": 0, "gaps": {"herdr_unreachable": 1}}));
+    for a2 in ["blocked", "working", "working"] { pass(Some(vec![agent("a2", a2)])); }
+
+    // Read-only: one `agent list` per pass on the recorded socket, nothing else sent to Herdr.
+    let calls = fs::read_to_string(home.join("calls")).unwrap();
+    assert_eq!(calls.lines().collect::<Vec<_>>(), vec![format!("agent list|{socket}"); 12]);
+    // Labels and timestamps only: no screen text, cwd or agent name reaches the sidecar.
+    let sidecar = rusqlite::Connection::open(project.join(".state/telemetry.db")).unwrap();
+    let dump: Vec<String> = sidecar.prepare("SELECT quote(attempt_id)||quote(observed_unix_ms)||quote(state)||quote(gap)||quote(interval_ms)||quote(source) FROM attention_samples").unwrap()
+        .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    assert_eq!(dump.len(), 5 * 2 + 7);
+    assert!(dump.iter().all(|row| !row.contains("SECRET") && !row.contains("/work") && !row.contains("worker-")), "{dump:?}");
+    // Fixture only: the passes ran milliseconds apart; re-time pass k to its planned minute.
+    let times: Vec<i64> = sidecar.prepare("SELECT DISTINCT observed_unix_ms FROM attention_samples ORDER BY 1").unwrap()
+        .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    for (old, m) in times.iter().zip([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 13.0]) {
+        sidecar.execute("UPDATE attention_samples SET observed_unix_ms=?1 WHERE observed_unix_ms=?2", [minute(m), *old]).unwrap();
+    }
+    drop(sidecar);
+
+    let (attention, _) = cli(&["accounting", "attention", "--json"]);
+    let of = |id: &str| attention["attempts"].as_array().unwrap().iter().find(|a| a["attempt_id"] == id).unwrap()["attention"].clone();
+    let interval = |opened: f64, start: &str, last: f64, closed: Option<f64>, end: &str, gap: Option<&str>, duration: Option<i64>, counted: bool|
+        json!({"opened_unix_ms": minute(opened), "start": start, "last_observed_unix_ms": minute(last), "closed_unix_ms": closed.map(minute), "end": end,
+            "gap_reason": gap, "duration_ms": duration, "counted": counted});
+    let gap = |from: f64, to: Option<f64>, reason: &str| json!({"from_unix_ms": minute(from), "to_unix_ms": to.map(minute), "reason": reason});
+    // a1: observed 0–4 (4 min resolved); waiting 1–3 = 120000; the wait open at its end is censored.
+    assert_eq!(of("a1"), json!({"intervals": [
+        interval(1.0, "observed_transition", 2.0, Some(3.0), "closed", None, Some(120_000), true),
+        interval(4.0, "observed_transition", 4.0, None, "attempt_ended", None, None, true)],
+        "gaps": [], "interventions": 2, "uncertain_starts": 0, "waiting_ms": 120_000, "observed_ms": 240_000}));
+    // a2: resolved 0–7 (7 min); waiting 2–6 = 240000; 7 censored by the gap; 9–10 has no observed start.
+    assert_eq!(of("a2"), json!({"intervals": [
+        interval(2.0, "observed_transition", 5.0, Some(6.0), "closed", None, Some(240_000), true),
+        interval(7.0, "observed_transition", 7.0, None, "observation_gap", Some("herdr_unreachable"), None, true),
+        interval(9.0, "after_gap", 9.0, Some(10.0), "closed", None, None, false)],
+        "gaps": [gap(7.0, Some(9.0), "herdr_unreachable"), gap(10.0, Some(13.0), "not_observed"), gap(13.0, None, "not_observed")],
+        "interventions": 2, "uncertain_starts": 1, "waiting_ms": 240_000, "observed_ms": 420_000}));
+    assert_eq!(of("a3"), json!({"status": "unavailable", "reason": "not_observed", "gaps": [gap(-1.0, Some(-0.5), "not_observed")]}));
+    // Union of 1–3 and 2–6 is 5 minutes; the sum is 6.
+    assert_eq!(attention["fleet"], json!({"waiting_union_ms": 300_000, "waiting_sum_ms": 360_000, "interventions": 4}));
+
+    // M31: T = {t1} (A = {t1}), a1 fully observed with 2 interventions → 2/1.
+    // M32: (120000 + 240000) / (240000 + 420000); a3 unobserved is counted, not 0.
+    // M33: Herdr's `blocked` has no typed reason.
+    let m31 = json!({"definition": "M31.attention-v1", "name": "human_interventions_per_accepted_task", "reason_type": "blocked_untyped",
+        "source": "controller_observed", "coverage": {"attempts": 1, "complete": 1, "not_observed": 0, "with_gaps": 0}, "numerator": 2, "denominator": 1, "value": "2/1"});
+    let m32 = json!({"definition": "M32.attention-v1", "name": "waiting_on_you_share", "unit": "ms", "waiting_union_ms": 300_000,
+        "coverage": {"attempts": 3, "observed": 2, "not_observed": 1, "with_gaps": 1, "censored_intervals": 3},
+        "numerator": 360_000, "denominator": 660_000, "value": "360000/660000"});
+    let m33 = json!({"definition": "M33.attention-v1", "name": "permission_prompts_per_attempt",
+        "value": {"status": "unavailable", "reason": "attention_reason_not_exposed"},
+        "detail": "stock Herdr reports `blocked` without a typed reason: a permission prompt is not distinguishable from a question or trust dialog"});
+    assert_eq!(attention["metrics"], json!({"M31": m31, "M32": m32, "M33": m33}));
+    assert_eq!(attention["signal"]["certified"], "fixture");
+    // The central report takes the lane's M31–M33.
+    let report = cli(&["report", "--json"]).0;
+    assert_eq!((&report["metrics"]["M31"], &report["metrics"]["M32"], &report["metrics"]["M33"]), (&m31, &m32, &m33));
+    let (_, text) = cli(&["accounting", "attention"]);
+    assert!(text.lines().any(|l| l == format!("  gap {}..open not_observed", minute(13.0))), "{text}");
+    assert!(text.lines().any(|l| l == "M32 waiting_on_you_share 360000/660000"), "{text}");
+    assert!(text.lines().any(|l| l == "attempt a3 ended n/a (not_observed)"), "{text}");
+}

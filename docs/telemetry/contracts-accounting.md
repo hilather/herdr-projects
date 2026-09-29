@@ -268,3 +268,92 @@ increase `7.25`, remaining `87.75`), never −55. A snapshot 20 minutes old is
 `stale` (`62.5`, age 1200000); one whose window reset before the decision is
 `window_reset_since_observation`; no snapshot is `no_observation` and one
 with `primary: null` is `incomplete` → `no_trusted_observation`, never 0.
+
+## 6. Human attention intervals (B6b, TM1.8 remainder "S4")
+
+Stream `accounting` version 5 (`0005_attention.sql`). Plan: doc 03
+`HumanAttentionInterval`, doc 07 §5a M31–M33, doc 10 §5a. Replaces the
+central `attention_not_collected` M31–M33 (contracts §6) through the lane
+`metrics()` hook once any sample exists; the outcome record's `attention`
+field (contracts §4) is unchanged.
+
+**Signal.** Stock Herdr's `agent list` (`result.agents[]`), field
+`agent_status`: the waiting state is `blocked`; `working`, `idle`, `done`
+are not waiting. Certification basis: `fixture`. `blocked` was observed live
+on herdr 0.9.1 only for claude's trust dialog (docs/herdr-notes.md, stages 2
+and 3); a Codex approval prompt showing as `blocked` is not certified live.
+Herdr gives no timestamp for a state change and no typed reason, so every
+interval has reason type `blocked_untyped` and sample resolution. The
+existing thread group rule (`blocked` ≥ 30 s → waiting-on-you) is finer than
+the sampling interval and is not applied.
+
+**Observation** (`accounting observe-attention`, and the ticker pass through
+the lane `tick` hook before the ledger sync, at the telemetry pass interval
+`HERDR_PROJECTS_TELEMETRY_COLLECT_SECS`, default 300 s). The canonical binding
+of an attempt is its latest `runtime.launch_started` receipt (route socket,
+workspace, tab, pane, cwd; agent kind and name). Every attempt with a receipt
+that is not terminated and is `launching`, `running` or `awaiting_input` gets
+one `attention_samples` row per pass: the label, or a gap reason. Herdr is
+queried read-only, one `herdr agent list` per distinct socket
+(`HERDR_BIN_PATH` else `herdr`; `HERDR_SOCKET_PATH` set, `HERDR_SESSION`
+removed, as the CLI's client), through the gated runner, 5 s timeout, at most
+4 sockets per pass and each reply ≤ min(1 MiB, remaining budget). Nothing is
+ever sent to an agent or pane. The agent must be the only one on the recorded
+pane and match the receipt's workspace, tab, cwd, kind and name. Gap reasons:
+`herdr_unreachable` (socket missing, no reply, timeout), `herdr_error`,
+`herdr_reply_invalid`, `agent_absent`, `identity_mismatch`, `state_unknown`
+(`unknown` or empty), `state_unrecognized`, `remote_route` (a machine route
+is not observed), `route_unrecorded`, `budget_exhausted`. Only labels, gap
+codes, timestamps and the sampling interval are stored; never pane text,
+titles, cwd or names. A pass needs an existing sidecar (`collection_not_run`).
+
+**Intervals** (derived at read time, per attempt, samples in time order; a
+label holds until the next sample). Consecutive successful samples are
+continuous when no failed sample lies between them and they are at most
+twice the sampling interval apart; otherwise the span is a gap (the first
+failure's reason, else `not_observed`, e.g. the ticker not running), and so
+are launch → first sample and last sample → terminal mark when longer. An
+open attempt whose last sample is older than twice the interval has a gap
+`not_observed` with `to_unix_ms: null`. A wait opens at the first `blocked`
+sample: `start` is `observed_transition` (after a continuous non-waiting
+sample), `first_observation`, or `after_gap`. It ends `closed` at the next
+continuous non-waiting sample, or is censored: `observation_gap` (with
+`gap_reason`), `attempt_ended` (still waiting at the last sample before the
+terminal mark), `open_at_horizon`. Only `observed_transition` + `closed`
+has a `duration_ms`; censored waits are listed and counted apart, never
+closed at a guessed time. An `after_gap` wait following a wait censored by
+that gap may be the same wait: kept, `counted: false`
+(`uncertain_starts`). Per attempt: `waiting_ms` = Σ durations;
+`observed_ms` = continuous non-waiting time + `waiting_ms` (time inside
+censored waits is excluded). An attempt with no successful sample is
+`unavailable not_observed` with its gaps, never 0.
+
+**`accounting attention [--json]`** (read-only): `signal`, per launched
+attempt `{attempt_id, task_id, state: open|ended, launched_unix_ms,
+ended_unix_ms, attention}`, `orphan_samples`, `fleet {waiting_union_ms,
+waiting_sum_ms, interventions}` (overlapping waits of different attempts
+counted once in the union), and `metrics`:
+
+- M31 `human_interventions_per_accepted_task` (`M31.attention-v1`): counted
+  wait starts of launched attempts of `T` / `count(A)` (contracts §6 cohort,
+  same window rule). Needs every such attempt observed without gaps; else
+  `unavailable incomplete_observation` with `observed_interventions` (a lower
+  bound), `uncertain_starts` and `denominator`. `coverage {attempts, complete,
+  not_observed, with_gaps}`.
+- M32 `waiting_on_you_share` (`M32.attention-v1`): Σ `waiting_ms` / Σ
+  `observed_ms` over launched attempts decided in the window (all without
+  `--since`), unit ms, unreduced `"n/d"`; `waiting_union_ms` shows the fleet
+  union; `coverage {attempts, observed, not_observed, with_gaps,
+  censored_intervals}`. No observed attempt → `unavailable not_observed`.
+- M33 `permission_prompts_per_attempt`: `unavailable
+  attention_reason_not_exposed` (`blocked` has no typed reason).
+- Before any sample exists (or without a sidecar) all three stay
+  `unavailable attention_not_collected`.
+
+Test `attention_intervals_union_and_censor` (Herdr stand-in, 60 s interval,
+passes re-timed to fixed minutes): a1 waits 1–3 (120000) and again at 4,
+ending at 4.5 → `attempt_ended`; a2 waits 2–6 (240000), at 7 (censored by a
+`herdr_unreachable` gap 7–9), at 9 (`after_gap`, not counted), then gaps
+10–13 and from 13 (`not_observed`); a3 cancelled before any pass is
+`not_observed`. Union 300000, sum 360000; M31 `2/1`; M32
+`360000/660000`; every Herdr call is `agent list`; no screen text stored.

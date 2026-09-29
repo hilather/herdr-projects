@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+pub mod attention;
 pub mod cost;
 pub mod graph;
 pub mod ledger;
@@ -17,7 +18,8 @@ pub const STREAM: &str = "accounting";
 pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/accounting/0001_usage_ledger.sql"),
     include_str!("../../../migrations/telemetry/accounting/0002_session_graph.sql"),
     include_str!("../../../migrations/telemetry/accounting/0003_rate_cards.sql"),
-    include_str!("../../../migrations/telemetry/accounting/0004_quota_windows.sql")];
+    include_str!("../../../migrations/telemetry/accounting/0004_quota_windows.sql"),
+    include_str!("../../../migrations/telemetry/accounting/0005_attention.sql")];
 
 /// `herdr-projects telemetry <slug> accounting ...`
 #[derive(clap::Subcommand)]
@@ -50,6 +52,16 @@ pub enum Command {
     /// Synced quota windows (native units), observation trust, M38/M39 and
     /// headroom per limit window at each dispatch decision (extended M40). Read-only.
     Quota {
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// One attention observation pass: read-only `herdr agent list` per recorded
+    /// socket, one sample per launched, unterminated attempt. Writes only the sidecar.
+    ObserveAttention,
+    /// Human attention per launched attempt: waiting intervals (unioned, censored
+    /// when unobserved), observation gaps, and M31–M33. Read-only.
+    Attention {
         /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
@@ -104,6 +116,18 @@ pub fn run(project: &Path, command: Command) -> Result<String> {
             if !json { return Ok(quota::text(&value)); }
             value
         }
+        Command::ObserveAttention => match super::sidecar::open(project, false)? {
+            Some(mut db) => attention::observe(project, &mut db, super::codex::Budget::CLI)?,
+            None => unavailable("collection_not_run"),
+        },
+        Command::Attention { json } => {
+            let value = match super::sidecar::read(project)? {
+                Some(db) => attention::read(project, &db)?,
+                None => unavailable("collection_not_run"),
+            };
+            if !json { return Ok(attention::text(&value)); }
+            value
+        }
     };
     Ok(serde_json::to_string_pretty(&value)? + "\n")
 }
@@ -120,12 +144,20 @@ fn with_availability(mut metrics: BTreeMap<String, Value>) -> BTreeMap<String, V
     metrics
 }
 
+/// M08/M09 (below), M38/M39 (§5) and M31–M33 (§6, replacing the central
+/// `attention_not_collected` entries).
+pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> {
+    let mut metrics = usage_metrics(project, since)?;
+    metrics.extend(attention::metrics(project, since)?);
+    Ok(metrics)
+}
+
 /// Contracts §6 M08/M09, replacing the central ones with the same numbers:
 /// counted ledger entries (derived from the Codex tables, so no sync is
 /// needed) of certified sessions, i.e. with a source bound to a known attempt,
 /// not quarantined, of a certified version, with every record accepted,
 /// started in the window.
-pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> {
+fn usage_metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> {
     let both = |m08: Value, m09: Value| with_availability(BTreeMap::from([("M08".to_owned(), metric("M08", "input_tokens", m08)),
         ("M09".to_owned(), metric("M09", "output_tokens", m09))]));
     let Some(db) = super::sidecar::read(project)? else {
@@ -165,9 +197,14 @@ pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Va
     Ok(both(json!({"value": input, "coverage": coverage}), json!({"value": output, "reasoning_output_tokens": reasoning, "coverage": coverage})))
 }
 
-/// Ticker telemetry pass, after the Codex collect: rebuild the ledger of an
-/// existing sidecar. Writes only the sidecar; never creates it.
-pub fn tick(project: &Path, _budget: super::codex::Budget) -> Result<()> {
-    if let Some(mut db) = super::sidecar::open(project, false)? { ledger::sync(&mut db)?; }
+/// Ticker telemetry pass, after the Codex collect: one attention observation
+/// pass within the tick budget, then rebuild the ledger of an existing
+/// sidecar. Writes only the sidecar; never creates it.
+pub fn tick(project: &Path, budget: super::codex::Budget) -> Result<()> {
+    if let Some(mut db) = super::sidecar::open(project, false)? {
+        let observed = attention::observe(project, &mut db, budget);
+        ledger::sync(&mut db)?;
+        observed?;
+    }
     Ok(())
 }
