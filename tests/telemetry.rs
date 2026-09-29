@@ -483,7 +483,9 @@ fn sidecar_streams_upgrade_v2_store() {
 
     f.cli("collect");
     f.cli("collect");
-    assert_eq!(streams(&f), [("accounting".to_owned(), 1), ("codex".to_owned(), 2)]);
+    // Only the codex stream's history is asserted here; each lane's stream is
+    // asserted by that lane's own tests, so adding a lane never edits this one.
+    assert_eq!(streams(&f).into_iter().find(|(stream, _)| stream == "codex"), Some(("codex".to_owned(), 2)));
     assert_eq!(user_version(&f), 2);
     let before = tree(&state);
     assert_eq!(f.cli("usage").1, v2, "usage is byte-identical after the upgrade");
