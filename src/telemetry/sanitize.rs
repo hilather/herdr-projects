@@ -41,6 +41,14 @@ pub fn codex_allowlist(kind: &str) -> Option<Vec<(String, Class)>> {
             .chain(usage("info.total_token_usage")).collect(),
         "task_started" => fields(&[("turn_id", Id)]),
         "task_complete" => fields(&[("turn_id", Id), ("duration_ms", Number), ("time_to_first_token_ms", Number)]),
+        // A6 tool/exec metadata (contracts-collection.md A6): `response_item`
+        // tool calls and outputs by their payload type, never `input`,
+        // `arguments` or `output`; `item_completed` never the command or its output.
+        "custom_tool_call" | "function_call" => fields(&[("call_id", Id), ("name", Tag), ("status", Tag),
+            ("internal_chat_message_metadata_passthrough.turn_id", Id)]),
+        "custom_tool_call_output" | "function_call_output" => fields(&[("call_id", Id)]),
+        "item_completed" => fields(&[("thread_id", Id), ("turn_id", Id), ("item.type", Tag), ("item.id", Id), ("item.status", Tag), ("item.source", Tag),
+            ("item.exit_code", Number), ("item.duration.secs", Number), ("item.duration.nanos", Number)]),
         _ => return None,
     })
 }

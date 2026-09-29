@@ -187,13 +187,15 @@ fn reread(db: &Connection) -> Result<std::collections::BTreeSet<String>> {
     Ok(sources.into_iter().filter(|(_, version)| certified(version)).map(|(key, _)| key).collect())
 }
 
-/// Sources with a session read before the A4 metadata (ingest 0004) or the A5
-/// thread lineage (ingest 0005) existed: no `rollout_metadata` or no
-/// `rollout_threads` row although their `session_meta` was stored.
+/// Sources with a session read before the A4 metadata (ingest 0004), the A5
+/// thread lineage (ingest 0005) or the A6 tool metadata (ingest 0006)
+/// existed: no `rollout_metadata`, `rollout_threads` or `codex_tool_sources`
+/// row although their `session_meta` was stored.
 fn backfill(db: &Connection) -> Result<std::collections::BTreeSet<String>> {
     Ok(db.prepare("SELECT s.path_digest FROM rollout_sources s JOIN collect_offsets o ON o.path_digest=s.path_digest
         WHERE NOT EXISTS(SELECT 1 FROM rollout_metadata m WHERE m.path_digest=s.path_digest)
-        OR NOT EXISTS(SELECT 1 FROM rollout_threads t WHERE t.path_digest=s.path_digest)")?
+        OR NOT EXISTS(SELECT 1 FROM rollout_threads t WHERE t.path_digest=s.path_digest)
+        OR NOT EXISTS(SELECT 1 FROM codex_tool_sources c WHERE c.path_digest=s.path_digest)")?
         .query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)
 }
 
@@ -219,8 +221,12 @@ struct LineTag {
     #[serde(rename = "type")]
     kind: String,
 }
-/// Top-level kinds the adapter reads (contracts §5); others are ignored unread.
-const KINDS: [&str; 4] = ["session_meta", "turn_context", "token_usage_record", "event_msg"];
+/// Top-level kinds the adapter reads (contracts §5; `response_item` for its
+/// A6 tool call metadata only); others are ignored unread.
+const KINDS: [&str; 5] = ["session_meta", "turn_context", "token_usage_record", "event_msg", "response_item"];
+/// A6 kinds (`response_item` and `event_msg` payload types) read through
+/// typed allowlist structs only: never deserialized as a whole `Value`.
+const TYPED: [&str; 5] = ["custom_tool_call", "function_call", "custom_tool_call_output", "function_call_output", "item_completed"];
 #[derive(Deserialize)]
 struct Tag {
     #[serde(rename = "type")]
@@ -296,6 +302,126 @@ struct TaskComplete {
     time_to_first_token_ms: Option<i64>,
 }
 
+/// An A6 allowlisted leaf, kept only as a JSON scalar. An array or object in
+/// its place is skipped by serde without being retained and becomes `null`,
+/// so a wrongly typed field never makes its record malformed.
+#[derive(Default)]
+struct Lax(Value);
+
+/// An A6 allowlisted object read field by field into `T` (whose fields are
+/// `Lax`); any other value in its place is skipped unretained (`None`).
+struct LaxObj<T>(Option<T>);
+
+impl<T> Default for LaxObj<T> {
+    fn default() -> Self { Self(None) }
+}
+
+/// Scalars as `Value`s; an object through `object`; arrays drained unretained.
+trait Shape<'de>: Sized + Default {
+    fn scalar(value: Value) -> Self;
+    fn object<A: serde::de::MapAccess<'de>>(map: A) -> std::result::Result<Self, A::Error>;
+}
+
+struct Visit<T>(std::marker::PhantomData<T>);
+
+impl<'de, T: Shape<'de>> serde::de::Visitor<'de> for Visit<T> {
+    type Value = T;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("any JSON value") }
+    fn visit_bool<E>(self, v: bool) -> std::result::Result<T, E> { Ok(T::scalar(Value::Bool(v))) }
+    fn visit_i64<E>(self, v: i64) -> std::result::Result<T, E> { Ok(T::scalar(v.into())) }
+    fn visit_u64<E>(self, v: u64) -> std::result::Result<T, E> { Ok(T::scalar(v.into())) }
+    fn visit_f64<E>(self, v: f64) -> std::result::Result<T, E> { Ok(T::scalar(Number::from_f64(v).map_or(Value::Null, Value::Number))) }
+    fn visit_str<E>(self, v: &str) -> std::result::Result<T, E> { Ok(T::scalar(v.into())) }
+    fn visit_unit<E>(self) -> std::result::Result<T, E> { Ok(T::default()) }
+    fn visit_none<E>(self) -> std::result::Result<T, E> { Ok(T::default()) }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<T, A::Error> {
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(T::default())
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> std::result::Result<T, A::Error> { T::object(map) }
+}
+
+impl<'de> Shape<'de> for Lax {
+    fn scalar(value: Value) -> Self { Self(value) }
+    fn object<A: serde::de::MapAccess<'de>>(mut map: A) -> std::result::Result<Self, A::Error> {
+        while map.next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?.is_some() {}
+        Ok(Self::default())
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Shape<'de> for LaxObj<T> {
+    fn scalar(_: Value) -> Self { Self(None) }
+    fn object<A: serde::de::MapAccess<'de>>(map: A) -> std::result::Result<Self, A::Error> {
+        T::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(|t| Self(Some(t)))
+    }
+}
+
+impl<'de> Deserialize<'de> for Lax {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> { d.deserialize_any(Visit(std::marker::PhantomData)) }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for LaxObj<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> { d.deserialize_any(Visit(std::marker::PhantomData)) }
+}
+
+/// `response_item` `custom_tool_call` / `function_call`: never `input`, `arguments` or `id`.
+#[derive(Deserialize)]
+struct ToolCall {
+    #[serde(default)]
+    call_id: Lax,
+    #[serde(default)]
+    name: Lax,
+    #[serde(default)]
+    status: Lax,
+    #[serde(default)]
+    internal_chat_message_metadata_passthrough: LaxObj<Passthrough>,
+}
+/// Never `create_time`.
+#[derive(Deserialize)]
+struct Passthrough {
+    #[serde(default)]
+    turn_id: Lax,
+}
+/// `response_item` `*_call_output`: never `output`.
+#[derive(Deserialize)]
+struct ToolOutput {
+    #[serde(default)]
+    call_id: Lax,
+}
+/// `event_msg/item_completed`: never the item's command, cwd, parsed command,
+/// output, process id, content, client id or phase.
+#[derive(Deserialize)]
+struct ItemCompleted {
+    #[serde(default)]
+    thread_id: Lax,
+    #[serde(default)]
+    turn_id: Lax,
+    #[serde(default)]
+    item: LaxObj<Item>,
+}
+#[derive(Deserialize)]
+struct Item {
+    #[serde(rename = "type", default)]
+    kind: Lax,
+    #[serde(default)]
+    id: Lax,
+    #[serde(default)]
+    status: Lax,
+    #[serde(default)]
+    source: Lax,
+    #[serde(default)]
+    exit_code: Lax,
+    #[serde(default)]
+    duration: LaxObj<Duration>,
+}
+#[derive(Deserialize)]
+struct Duration {
+    #[serde(default)]
+    secs: Lax,
+    #[serde(default)]
+    nanos: Lax,
+}
+
 impl Usage {
     fn fields(&self) -> [(&'static str, &Option<Number>); 6] {
         [("cache_write_input_tokens", &self.cache_write_input_tokens), ("cached_input_tokens", &self.cached_input_tokens),
@@ -356,6 +482,7 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
             tx.execute("DELETE FROM rollout_sources WHERE path_digest=?1", [&key])?;
             tx.execute("DELETE FROM rollout_metadata WHERE path_digest=?1", [&key])?;
             tx.execute("DELETE FROM rollout_threads WHERE path_digest=?1", [&key])?;
+            tx.execute("DELETE FROM codex_tool_sources WHERE path_digest=?1", [&key])?;
             Cursor { offset: 0, records: 0, rate_limits: 0, model: None, effort: None, session: None }
         }
     };
@@ -408,21 +535,34 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
         let first_meta = cursor.session.is_none();
         // A read kind whose typed fields do not parse yields no rows and no envelope.
         let Ok(tag) = serde_json::from_slice::<Tag>(&line) else {
-            ledger.malformed(&tx, at, "record_malformed", n, now)?;
+            // A6: a `response_item` is read for its tool call kinds only; one
+            // whose tag does not parse is ignored unread, as before A6.
+            if kind != "response_item" { ledger.malformed(&tx, at, "record_malformed", n, now)?; }
             continue;
         };
-        if !record(&tx, &tag, &line, &key, home, worktrees, &mut cursor, now, done)? {
+        let mut observed = None;
+        if !record(&tx, &tag, &line, &key, home, worktrees, &mut cursor, now, done, &mut observed)? {
             ledger.malformed(&tx, at, "record_malformed", n, now)?;
             continue;
         }
         let kind = match (tag.kind.as_deref(), tag.payload.as_ref().and_then(|p| p.kind.as_deref())) {
-            (Some("event_msg"), inner) => inner,
+            (Some("event_msg" | "response_item"), inner) => inner,
             (Some("session_meta"), _) if !first_meta => None,
             (kind, _) => kind,
         };
-        if let (Some(kind), Some((session, version, _))) = (kind, &cursor.session)
-            && let Ok(Envelope { payload }) = serde_json::from_slice::<Envelope<Value>>(&line) {
-            ledger.observe(&tx, at, ingest::Record { kind, payload: &payload, occurred_unix_ms: ms(tag.timestamp.as_deref()), session, adapter_version: version }, now)?;
+        if let (Some(kind), Some((session, version, _))) = (kind, &cursor.session) {
+            // A6 kinds bring the payload `record` built from their typed
+            // allowlist; other allowlisted kinds are read whole, then
+            // sanitized; a kind without an allowlist is never read whole.
+            let payload = match observed {
+                Some(payload) => Some(payload),
+                None if !TYPED.contains(&kind) && sanitize::codex_allowlist(kind).is_some() =>
+                    serde_json::from_slice::<Envelope<Value>>(&line).ok().map(|envelope| envelope.payload),
+                None => None,
+            };
+            if let Some(payload) = payload {
+                ledger.observe(&tx, at, ingest::Record { kind, payload: &payload, occurred_unix_ms: ms(tag.timestamp.as_deref()), session, adapter_version: version }, now)?;
+            }
         }
     }
     // Bytes pulled from disk, including a partial last line, count against the budget.
@@ -445,8 +585,10 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
 /// Store one read record. `false`: its kind is read but its typed fields do not
 /// parse (the caller quarantines it `record_malformed`); a malformed
 /// `turn_context` also makes the model and effort of later records unknown.
+/// `observed`: the envelope payload of an A6 kind, built from its typed allowlist.
 #[allow(clippy::too_many_arguments)]
-fn record(tx: &Transaction, tag: &Tag, line: &[u8], key: &str, home: &str, worktrees: &str, cursor: &mut Cursor, now: i64, done: &mut Collected) -> Result<bool> {
+fn record(tx: &Transaction, tag: &Tag, line: &[u8], key: &str, home: &str, worktrees: &str, cursor: &mut Cursor, now: i64, done: &mut Collected,
+    observed: &mut Option<Value>) -> Result<bool> {
     let inner = tag.payload.as_ref().and_then(|p| p.kind.as_deref());
     match (tag.kind.as_deref(), inner) {
         (Some("session_meta"), _) if cursor.session.is_none() => {
@@ -474,6 +616,8 @@ fn record(tx: &Transaction, tag: &Tag, line: &[u8], key: &str, home: &str, workt
             tx.execute("INSERT OR REPLACE INTO rollout_threads(path_digest,parent_thread_id,session_id,thread_source) VALUES(?1,?2,?3,?4)",
                 params![key, text("parent_thread_id", sanitize::Class::Id), text("session_id", sanitize::Class::Id).filter(|id| *id != meta.id),
                     text("thread_source", sanitize::Class::Tag)])?;
+            // A6: this source's tool metadata is read from byte 0 on.
+            tx.execute("INSERT OR IGNORE INTO codex_tool_sources(path_digest) VALUES(?1)", [key])?;
             cursor.session = Some((meta.id, meta.cli_version, at));
         }
         (Some("turn_context"), _) => {
@@ -555,6 +699,59 @@ fn record(tx: &Transaction, tag: &Tag, line: &[u8], key: &str, home: &str, workt
                 tx.execute("INSERT OR IGNORE INTO codex_turns(session_id,turn_id,model,effort,duration_ms,time_to_first_token_ms) VALUES(?1,?2,?3,?4,?5,?6)",
                     params![session, turn, cursor.model, cursor.effort, payload.duration_ms, payload.time_to_first_token_ms])?;
             }
+        }
+        // A6 tool and exec metadata (contracts-collection.md A6), read through
+        // typed allowlist structs and leniently: a field of another type is
+        // `null`, never a malformed record. Stored for every version (metadata).
+        (Some("response_item"), Some(kind @ ("custom_tool_call" | "function_call"))) => {
+            let Ok(Envelope { payload: call }) = serde_json::from_slice::<Envelope<ToolCall>>(line) else { return Ok(false) };
+            let turn = call.internal_chat_message_metadata_passthrough.0.map_or(Value::Null, |p| p.turn_id.0);
+            let raw = json!({"call_id": call.call_id.0, "name": call.name.0, "status": call.status.0,
+                "internal_chat_message_metadata_passthrough": {"turn_id": turn}});
+            let kept = |path: &str, class| sanitize::field(&raw, path, class).as_str().map(str::to_owned);
+            if let (Some((session, ..)), Some(call_id)) = (&cursor.session, kept("call_id", sanitize::Class::Id)) {
+                // The first call of an id stays; an output seen first keeps its columns.
+                tx.execute("INSERT INTO codex_tool_calls(session_id,call_id,call_kind,name,status,turn_id,called_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)
+                    ON CONFLICT(session_id,call_id) DO UPDATE SET call_kind=excluded.call_kind,name=excluded.name,status=excluded.status,turn_id=excluded.turn_id,
+                    called_unix_ms=excluded.called_unix_ms WHERE codex_tool_calls.call_kind IS NULL",
+                    params![session, call_id, kind, kept("name", sanitize::Class::Tag), kept("status", sanitize::Class::Tag),
+                        kept("internal_chat_message_metadata_passthrough.turn_id", sanitize::Class::Id), ms(tag.timestamp.as_deref())])?;
+            }
+            *observed = Some(raw);
+        }
+        (Some("response_item"), Some(kind @ ("custom_tool_call_output" | "function_call_output"))) => {
+            let Ok(Envelope { payload: output }) = serde_json::from_slice::<Envelope<ToolOutput>>(line) else { return Ok(false) };
+            let raw = json!({"call_id": output.call_id.0});
+            if let (Some((session, ..)), Some(call_id)) = (&cursor.session, sanitize::field(&raw, "call_id", sanitize::Class::Id).as_str()) {
+                tx.execute("INSERT INTO codex_tool_calls(session_id,call_id,output_kind,output_unix_ms) VALUES(?1,?2,?3,?4)
+                    ON CONFLICT(session_id,call_id) DO UPDATE SET output_kind=excluded.output_kind,output_unix_ms=excluded.output_unix_ms
+                    WHERE codex_tool_calls.output_kind IS NULL", params![session, call_id, kind, ms(tag.timestamp.as_deref())])?;
+            }
+            *observed = Some(raw);
+        }
+        (Some("event_msg"), Some("item_completed")) => {
+            let Ok(Envelope { payload: completed }) = serde_json::from_slice::<Envelope<ItemCompleted>>(line) else { return Ok(false) };
+            let item = completed.item.0;
+            let kind = item.as_ref().map_or(Value::Null, |i| i.kind.0.clone());
+            // Only a `CommandExecution` item keeps more than its type.
+            let raw = match item.filter(|_| kind == "CommandExecution") {
+                Some(item) => {
+                    let duration = item.duration.0.map_or(json!({"secs": null, "nanos": null}), |d| json!({"secs": d.secs.0, "nanos": d.nanos.0}));
+                    json!({"thread_id": completed.thread_id.0, "turn_id": completed.turn_id.0, "item": {"type": kind, "id": item.id.0, "status": item.status.0,
+                        "source": item.source.0, "exit_code": item.exit_code.0, "duration": duration}})
+                }
+                None => json!({"thread_id": completed.thread_id.0, "turn_id": completed.turn_id.0, "item": {"type": kind}}),
+            };
+            let kept = |path: &str, class| sanitize::field(&raw, path, class);
+            let text = |path: &str, class| kept(path, class).as_str().map(str::to_owned);
+            if let (Some((session, ..)), Some(item_id)) = (&cursor.session, text("item.id", sanitize::Class::Id)) {
+                let number = |path: &str| kept(path, sanitize::Class::Number).as_i64();
+                tx.execute("INSERT OR IGNORE INTO codex_exec_items(session_id,item_id,thread_id,turn_id,status,source,exit_code,startup_duration_secs,startup_duration_nanos,
+                    completed_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![session, item_id, text("thread_id", sanitize::Class::Id),
+                    text("turn_id", sanitize::Class::Id), text("item.status", sanitize::Class::Tag), text("item.source", sanitize::Class::Tag),
+                    number("item.exit_code"), number("item.duration.secs"), number("item.duration.nanos"), ms(tag.timestamp.as_deref())])?;
+            }
+            *observed = Some(raw);
         }
         _ => {}
     }

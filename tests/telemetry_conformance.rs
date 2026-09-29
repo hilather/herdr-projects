@@ -9,7 +9,9 @@
 //! guardian child sessions, model switches, resume across files and the
 //! upgrade of a sidecar read before A4. A5 adds the thread lineage a rollout
 //! reports outside `source` and a guardian shaped like the live one, whose
-//! usage records report its parent's session id.
+//! usage records report its parent's session id. A6 adds tool call and exec
+//! item metadata in the live 0.154.0 shape, with sentinels in every content
+//! field beside it.
 
 #![cfg(all(feature = "state-store", target_os = "linux"))]
 #![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
@@ -33,6 +35,13 @@ const CHILD: &str = "../codex-conformance/child.jsonl";
 const CHILD_SID: &str = "00000000-0000-4000-8000-0000000a4c01";
 const GUARDIAN: &str = "../codex-conformance/guardian.jsonl";
 const GUARDIAN_SID: &str = "00000000-0000-4000-8000-0000000a4c02";
+/// A6: a session with an approved `exec` tool call, a `wait` call, their
+/// outputs, `item_completed` items (a `CommandExecution`, an agent and a user
+/// message), wrongly typed metadata and an output without a call, shaped like
+/// the live census (codex-live-0.154.0-a4.md §4); `A6LEAK_*` in every
+/// content field.
+const TOOLS: &str = "../codex-conformance/tools.jsonl";
+const TOOLS_SID: &str = "00000000-0000-4000-8000-0000000a6001";
 /// One more turn of a session, appended after its replayed history.
 const RESUMED: &str = "../codex-conformance/resumed.jsonl";
 
@@ -57,8 +66,8 @@ struct Case {
     place: Place,
 }
 
-/// The shared conformance corpus. `complete`, `edge`, `child` and `guardian`
-/// are certified and bound; `uncertified` is bound with a version no live run
+/// The shared conformance corpus. `complete`, `edge`, `child`, `guardian`
+/// and `tools` are certified and bound; `uncertified` is bound with a version no live run
 /// certified; the rest are certified but must stay unbound.
 const CASES: &[Case] = &[
     Case { name: "complete", sid: SID, parts: &["head.jsonl", "tail.jsonl"], version: "0.154.0", place: Place::Bound },
@@ -69,6 +78,7 @@ const CASES: &[Case] = &[
     Case { name: "earlier", sid: "00000000-0000-4000-8000-0000000a3004", parts: &["head.jsonl"], version: "0.154.0", place: Place::BeforeDecision },
     Case { name: "child", sid: CHILD_SID, parts: &[CHILD], version: "0.154.0", place: Place::Bound },
     Case { name: "guardian", sid: GUARDIAN_SID, parts: &[GUARDIAN], version: "0.154.0", place: Place::Bound },
+    Case { name: "tools", sid: TOOLS_SID, parts: &[TOOLS], version: "0.154.0", place: Place::Bound },
 ];
 
 fn case(name: &str) -> &'static Case { CASES.iter().find(|c| c.name == name).unwrap() }
@@ -105,8 +115,9 @@ fn ledger(f: &Fixture) -> Vec<String> {
     let mut out = Vec::new();
     for table in ["source_observations", "ingest_quarantine", "coverage_gaps", "source_cursors", "codex_usage", "codex_turns", "codex_rate_limits",
         "codex_quarantine", "codex_discrepancy", "collect_offsets", "rollout_sources", "source_bindings", "rollout_metadata", "codex_usage_times",
-        "codex_rate_limit_windows", "rollout_threads"] {
-        let mut stmt = db.prepare(&format!("SELECT * FROM {table} ORDER BY 1,2")).unwrap();
+        "codex_rate_limit_windows", "rollout_threads", "codex_tool_sources", "codex_tool_calls", "codex_exec_items"] {
+        let order = if table == "codex_tool_sources" { "1" } else { "1,2" };
+        let mut stmt = db.prepare(&format!("SELECT * FROM {table} ORDER BY {order}")).unwrap();
         let names: Vec<String> = stmt.column_names().into_iter().map(str::to_owned).collect();
         let rows = stmt.query_map([], |r| Ok(names.iter().enumerate().filter(|(_, n)| !matches!(n.as_str(), "observed_unix_ms" | "updated_unix_ms"))
             .map(|(i, n)| format!("{n}={:?}", r.get_ref(i).unwrap())).collect::<Vec<_>>().join(" "))).unwrap();
@@ -153,7 +164,7 @@ fn corpus_replays_identically_in_any_chunking() {
     let f = Fixture::new();
     let paths: Vec<PathBuf> = CASES.iter().map(|c| plant(&f, c.name)).collect();
     let (first, _) = f.cli("collect");
-    // complete 2 + edge 3 + uncertified 2 + three unbound heads + child 2 + guardian 1.
+    // complete 2 + edge 3 + uncertified 2 + three unbound heads + child 2 + guardian 1 (tools has none).
     assert_eq!(first["collected"]["records"], 13);
     let once = ledger(&f);
     let (again, _) = f.cli("collect");
@@ -320,7 +331,7 @@ fn uncertified_version_is_gated_everywhere() {
 
 fn contains_sentinel(bytes: &[u8]) -> Option<&'static str> {
     let lower = bytes.to_ascii_lowercase();
-    ["a3leak", "a4leak", "a5leak", "canary"].into_iter().find(|needle| lower.windows(needle.len()).any(|w| w == needle.as_bytes()))
+    ["a3leak", "a4leak", "a5leak", "a6leak", "canary"].into_iter().find(|needle| lower.windows(needle.len()).any(|w| w == needle.as_bytes()))
 }
 
 /// Privacy: sentinels planted in content fields, unknown kinds, unknown
@@ -338,7 +349,12 @@ fn planted_sentinels_never_leak() {
         "A4LEAK_AGENT_PATH", "A4LEAK_NICKNAME", "A4LEAK_ROLE", "A4LEAK_ARGUMENTS", "A4LEAK_COMMAND", "A4LEAK_OUTPUT", "A4LEAK_STDERR",
         "A4LEAK_MCP_ARGUMENTS", "A4LEAK_MCP_RESULT", "A4LEAK_CREDITS", "A4LEAK_GUARDIAN_TRANSCRIPT", "A4LEAK_GUARDIAN_VERDICT",
         // A5: the uncollected `multi_agent_version` beside the collected lineage.
-        "A5LEAK_MULTI_AGENT"] {
+        "A5LEAK_MULTI_AGENT",
+        // A6: every content field beside the collected tool/exec metadata, and wrongly typed metadata.
+        "A6LEAK_INPUT", "A6LEAK_ARGUMENTS", "A6LEAK_OUTPUT_ARRAY", "A6LEAK_OUTPUT_STRING", "A6LEAK_ORPHAN_OUTPUT", "A6LEAK_COMMAND", "A6LEAK_CWD",
+        "A6LEAK_PARSED_CMD", "A6LEAK_STDOUT", "A6LEAK_STDERR", "A6LEAK_AGGREGATED_OUTPUT", "A6LEAK_FORMATTED_OUTPUT", "A6LEAK_AGENT_CONTENT",
+        "A6LEAK_USER_CONTENT", "A6LEAK_PHASE", "A6LEAK_CLIENT_ID", "A6LEAK_PROCESS_ID", "A6LEAK_CALL_ITEM_ID", "A6LEAK_MESSAGE_ID", "A6LEAK_NAME_KEY",
+        "A6LEAK_STATUS", "A6LEAK_PASSTHROUGH", "A6LEAK_EXIT_CODE", "A6LEAK_DURATION", "A6LEAK_LAST_MESSAGE"] {
         assert!(corpus.windows(needle.len()).any(|w| w == needle.as_bytes()), "{needle}");
     }
     let mut output = f.cli("collect").1;
@@ -348,10 +364,10 @@ fn planted_sentinels_never_leak() {
     remove_sidecar_rows(&f);
     output.extend(f.cli("collect").1);
     for args in [&["usage", "--json"][..], &["attempts", "--json"], &["report", "--json"], &["collectors", "status"], &["collectors", "bindings"], &["collectors", "sessions"],
-        &["collectors", "capabilities", "--json"], &["accounting", "sync"], &["accounting", "entries"], &["accounting", "sessions"], &["accounting", "quota", "--json"]] {
+        &["collectors", "tools", "--json"], &["collectors", "capabilities", "--json"], &["accounting", "sync"], &["accounting", "entries"], &["accounting", "sessions"], &["accounting", "quota", "--json"]] {
         output.extend(f.cli_args(args).1);
     }
-    for args in [&["usage"][..], &["report"], &["collectors", "capabilities"]] {
+    for args in [&["usage"][..], &["report"], &["collectors", "capabilities"], &["collectors", "tools"]] {
         output.extend(f.text(args).into_bytes());
     }
     let state = f.project.join(".state");
@@ -360,8 +376,9 @@ fn planted_sentinels_never_leak() {
         assert_eq!(contains_sentinel(&fs::read(state.join(name)).unwrap()), None, "{name}");
     }
     assert_eq!(contains_sentinel(&output), None, "{}", String::from_utf8_lossy(&output));
-    // complete, edge, uncertified, three unbound heads, child 7 and guardian 4.
-    assert_eq!(f.count("source_observations"), 10 + 11 + 10 + 3 * 6 + 7 + 4, "the collects read the whole corpus");
+    // complete, edge, uncertified, three unbound heads, child 8 (A6: its
+    // function_call), guardian 4 and tools 13 (every line).
+    assert_eq!(f.count("source_observations"), 10 + 11 + 10 + 3 * 6 + 8 + 4 + 13, "the collects read the whole corpus");
     drop(reader);
 }
 
@@ -497,9 +514,50 @@ const CAPABILITIES: &str = "codex rollout_jsonl certified_versions=0.154.0
   task_complete.started_at available=false basis=unavailable certified=none reason=not_collected
   task_complete.completed_at available=false basis=unavailable certified=none reason=not_collected
   task_complete.last_agent_message available=false basis=unavailable certified=none reason=content_forbidden
-  response_item.* available=false basis=unavailable certified=none reason=content_forbidden
-  exec_command_end.* available=false basis=unavailable certified=none reason=not_collected
-  mcp_tool_call_end.* available=false basis=unavailable certified=none reason=not_collected
+  response_item.message available=false basis=unavailable certified=none reason=content_forbidden
+  response_item.reasoning available=false basis=unavailable certified=none reason=content_forbidden
+  custom_tool_call.call_id available=true basis=reported certified=live
+  custom_tool_call.name available=true basis=reported_excerpt certified=live
+  custom_tool_call.status available=true basis=reported_excerpt certified=live
+  custom_tool_call.internal_chat_message_metadata_passthrough.turn_id available=true basis=reported certified=live
+  custom_tool_call.id available=false basis=unavailable certified=none reason=not_collected
+  custom_tool_call.internal_chat_message_metadata_passthrough.create_time available=false basis=unavailable certified=none reason=not_collected
+  custom_tool_call.input available=false basis=unavailable certified=none reason=content_forbidden
+  function_call.call_id available=true basis=reported certified=live
+  function_call.name available=true basis=reported_excerpt certified=live
+  function_call.status available=true basis=reported_excerpt certified=fixture
+  function_call.internal_chat_message_metadata_passthrough.turn_id available=true basis=reported certified=live
+  function_call.id available=false basis=unavailable certified=none reason=not_collected
+  function_call.arguments available=false basis=unavailable certified=none reason=content_forbidden
+  custom_tool_call_output.call_id available=true basis=reported certified=live
+  custom_tool_call_output.id available=false basis=unavailable certified=none reason=not_collected
+  custom_tool_call_output.output available=false basis=unavailable certified=none reason=content_forbidden
+  function_call_output.call_id available=true basis=reported certified=live
+  function_call_output.id available=false basis=unavailable certified=none reason=not_collected
+  function_call_output.output available=false basis=unavailable certified=none reason=content_forbidden
+  item_completed.thread_id available=true basis=reported certified=live
+  item_completed.turn_id available=true basis=reported certified=live
+  item_completed.item.type available=true basis=reported_excerpt certified=live
+  item_completed.item.id available=true basis=reported certified=live caveat=command_execution_only
+  item_completed.item.status available=true basis=reported_excerpt certified=live caveat=command_execution_only
+  item_completed.item.source available=true basis=reported_excerpt certified=live caveat=command_execution_only
+  item_completed.item.exit_code available=true basis=reported certified=live caveat=command_execution_only
+  item_completed.item.duration.secs available=true basis=reported certified=live caveat=startup_not_run_time
+  item_completed.item.duration.nanos available=true basis=reported certified=live caveat=startup_not_run_time
+  item_completed.started_at_ms available=false basis=unavailable certified=none reason=not_collected
+  item_completed.completed_at_ms available=false basis=unavailable certified=none reason=not_collected
+  item_completed.item.process_id available=false basis=unavailable certified=none reason=not_collected
+  item_completed.item.cwd available=false basis=unavailable certified=none reason=not_collected
+  item_completed.item.client_id available=false basis=unavailable certified=none reason=not_collected
+  item_completed.item.phase available=false basis=unavailable certified=none reason=not_collected
+  item_completed.item.command available=false basis=unavailable certified=none reason=content_forbidden
+  item_completed.item.parsed_cmd available=false basis=unavailable certified=none reason=content_forbidden
+  item_completed.item.stdout available=false basis=unavailable certified=none reason=content_forbidden
+  item_completed.item.stderr available=false basis=unavailable certified=none reason=content_forbidden
+  item_completed.item.aggregated_output available=false basis=unavailable certified=none reason=content_forbidden
+  item_completed.item.formatted_output available=false basis=unavailable certified=none reason=content_forbidden
+  item_completed.item.content available=false basis=unavailable certified=none reason=content_forbidden
+  mcp_tool_call.* available=false basis=unavailable certified=none reason=not_collected
 ";
 
 /// `collectors capabilities` cannot drift from the adapter: over the whole
@@ -541,7 +599,7 @@ fn capabilities_match_emitted_fields() {
     assert_eq!(valued, emitted, "every available field has fixture evidence");
     let unavailable = declared(false);
     assert!(emitted.iter().all(|path| !unavailable.iter().any(|u| path == u || path.starts_with(&format!("{u}.")))));
-    assert_eq!(rows.len(), 10 + 11 + 10 + 3 * 6 + 7 + 4);
+    assert_eq!(rows.len(), 10 + 11 + 10 + 3 * 6 + 8 + 4 + 13);
 }
 
 fn rows<T: rusqlite::types::FromSql>(f: &Fixture, sql: &str) -> Vec<Vec<T>> {
@@ -651,9 +709,10 @@ fn resume_across_files_dedupes_history_and_quarantines_an_ordinal_restart() {
         [vec![T(SID.into()), I(1), T(DIGEST_1.into()), T("sha256:924252b6d27afbe340fd147fd3747364940dd51917cf08c3ca05be4ad9d394b4".into())]]);
 }
 
-/// The sidecar as the A3 binary left it: no A4 (or A5) tables, ingest stream
+/// The sidecar as the A3 binary left it: no A4 (or A5, A6) tables, ingest stream
 /// 3, and envelopes of the narrower `session_meta`/`token_count` allowlist.
 fn downgrade_to_a3(f: &Fixture) {
+    downgrade_to_a5(f);
     f.sidecar().execute_batch("DROP TABLE rollout_metadata; DROP TABLE codex_usage_times; DROP TABLE codex_rate_limit_windows; DROP TABLE rollout_threads;
         UPDATE telemetry_streams SET version=3 WHERE stream='ingest';
         UPDATE source_observations SET payload='{}',payload_digest='sha256:a3',
@@ -682,7 +741,7 @@ fn rollouts_read_before_a4_gain_their_metadata_on_the_next_collect() {
     }
     let (upgraded, _) = f.cli("collect");
     assert_eq!(upgraded["collected"]["records"], 0, "the re-read counts nothing twice");
-    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 5}));
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 6}));
     assert!(fresh == ledger(&f), "the upgraded sidecar equals a fresh collect");
     assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage);
     assert_eq!(f.cli_args(&["collectors", "sessions"]).0, fresh_sessions);
@@ -749,9 +808,10 @@ fn guardian_usage_reporting_its_parent_session_stays_with_its_rollout() {
     assert_eq!((f.count("codex_quarantine"), f.count("codex_discrepancy")), (0, 0));
 }
 
-/// The sidecar as the A4 binary left it: no `rollout_threads`, ingest stream
+/// The sidecar as the A4 binary left it: no `rollout_threads` (or A6 tables), ingest stream
 /// 4, and `session_meta` envelopes of the A4 allowlist (normalization 2).
 fn downgrade_to_a4(f: &Fixture) {
+    downgrade_to_a5(f);
     f.sidecar().execute_batch("DROP TABLE rollout_threads; UPDATE telemetry_streams SET version=4 WHERE stream='ingest';
         UPDATE source_observations SET payload=json_remove(payload,'$.parent_thread_id','$.session_id','$.thread_source'),payload_digest='sha256:a4',
             measurement='{\"coverage\":\"complete\",\"measurement_basis\":\"reported\",\"normalization_version\":2}'
@@ -777,8 +837,125 @@ fn rollouts_read_before_a5_gain_their_thread_lineage_on_the_next_collect() {
     assert_eq!(sessions[2]["subagent"]["kind"], "other");
     let (upgraded, _) = f.cli("collect");
     assert_eq!(upgraded["collected"]["records"], 0, "the re-read counts nothing twice");
-    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 5}));
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 6}));
     assert!(fresh == ledger(&f), "the upgraded sidecar equals a fresh collect");
     assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage);
     assert_eq!(f.cli_args(&["collectors", "sessions"]).0, fresh_sessions);
+}
+
+/// A6 tool call metadata as `collectors tools` prints it: `(call_id,
+/// call_kind, name, status, turn_id, called, output_kind, output)`.
+#[allow(clippy::too_many_arguments)]
+fn call(id: &str, kind: Option<&str>, name: Option<&str>, status: Option<&str>, turn: Option<&str>, called: Option<i64>, output_kind: Option<&str>, output: Option<i64>) -> Value {
+    json!({"call_id": id, "call_kind": kind, "name": name, "status": status, "turn_id": turn, "called_unix_ms": called, "output_kind": output_kind,
+        "output_unix_ms": output, "call_to_output_ms": called.zip(output).map(|(c, o)| o - c)})
+}
+
+/// A6 on the CLI, in the live 0.154.0 shape (codex-live-0.154.0-a4.md §4):
+/// each tool call's id, tool name, status and turn with its call and output
+/// line times (the call → output gap measures the call, approval wait
+/// included), and each `CommandExecution` item's id, status, source, exit code
+/// and startup duration, keyed by the rollout's own session. Wrongly typed
+/// metadata is `null` and never quarantines its record; an output without a
+/// call keeps its own row; agent and user message items keep only their type.
+/// The envelopes carry exactly the allowlist. The child's older-shaped
+/// `function_call` counts too; its guessed `exec_command_end` and
+/// `mcp_tool_call_end` events stay unread.
+#[test]
+fn tool_and_exec_metadata_is_collected_without_content() {
+    let f = Fixture::new();
+    let [tools, child] = ["tools", "child"].map(|name| plant(&f, name));
+    f.cli("collect");
+    assert_eq!(quarantine(&f, &source(&tools)), [], "wrongly typed metadata is null, never a malformed record");
+
+    // 2030-01-01T00:00:00Z = 1_893_456_000_000 ms; call-t1 waited 47.410 - 10.500 s.
+    let t = |ms: i64| Some(1_893_456_000_000 + ms);
+    let (listed, _) = f.cli_args(&["collectors", "tools", "--json"]);
+    assert_eq!(listed, json!({"sessions": [
+        {"session_id": CHILD_SID, "attempt_ids": [f.attempt], "exec_items": [],
+            "tool_calls": [call("call-c1", Some("function_call"), Some("shell"), None, None, t(500), None, None)]},
+        {"session_id": TOOLS_SID, "attempt_ids": [f.attempt], "tool_calls": [
+            call("call-t1", Some("custom_tool_call"), Some("exec"), Some("completed"), Some("turn-t1"), t(10_500), Some("custom_tool_call_output"), t(47_410)),
+            call("call-t2", Some("function_call"), Some("wait"), Some("completed"), Some("turn-t1"), t(48_000), Some("function_call_output"), t(49_250)),
+            call("call-t3", Some("custom_tool_call"), None, None, None, t(50_000), None, None),
+            call("call-t9", None, None, None, None, None, Some("function_call_output"), t(51_000))],
+         "exec_items": [
+            {"item_id": "exec-t1", "thread_id": TOOLS_SID, "turn_id": "turn-t1", "status": "completed", "source": "unified_exec_startup", "exit_code": 0,
+                "startup_duration": {"secs": 0, "nanos": 2125}, "completed_unix_ms": t(47_400)},
+            {"item_id": "exec-t2", "thread_id": TOOLS_SID, "turn_id": "turn-t1", "status": null, "source": null, "exit_code": null,
+                "startup_duration": {"secs": null, "nanos": null}, "completed_unix_ms": t(50_500)}]},
+    ]}));
+    assert_eq!(f.cli_args(&["collectors", "tools", "--json"]).0, listed, "a second read is identical");
+    let text = f.text(&["collectors", "tools"]);
+    assert!(text.contains(&format!("{TOOLS_SID} attempts={}\n", f.attempt)), "{text}");
+    assert!(text.contains("  call call-t1 custom_tool_call name=exec status=completed turn=turn-t1 called=1893456010500 output=1893456047410 call_to_output_ms=36910\n"), "{text}");
+    assert!(text.contains("  exec exec-t1 status=completed source=unified_exec_startup exit_code=0 turn=turn-t1 completed=1893456047400\n"), "{text}");
+
+    // Envelopes: one per tool line (and none for the child's guessed `*_end`
+    // events), each exactly the allowlist.
+    let at = line_starts(&tools);
+    let key = source(&tools);
+    let envelope = |line: usize| envelopes(&f, &key).into_iter().find(|e| e.0 == at[line - 1]).map(|e| (e.1, e.2)).unwrap();
+    let kinds: Vec<String> = envelopes(&f, &key).into_iter().map(|e| e.1).collect();
+    assert_eq!(kinds, ["session_meta", "turn_context", "custom_tool_call", "item_completed", "custom_tool_call_output", "function_call", "function_call_output",
+        "item_completed", "item_completed", "custom_tool_call", "item_completed", "function_call_output", "task_complete"].map(|k| format!("codex.{k}.v1")));
+    assert_eq!(envelope(3).1, r#"{"call_id":"call-t1","internal_chat_message_metadata_passthrough":{"turn_id":"turn-t1"},"name":"exec","status":"completed"}"#);
+    assert_eq!(envelope(4).1, r#"{"item":{"duration":{"nanos":2125,"secs":0},"exit_code":0,"id":"exec-t1","source":"unified_exec_startup","#.to_owned()
+        + &format!(r#""status":"completed","type":"CommandExecution"}},"thread_id":"{TOOLS_SID}","turn_id":"turn-t1"}}"#));
+    assert_eq!(envelope(5).1, r#"{"call_id":"call-t1"}"#);
+    let message = |kind: &str| format!(r#"{{"item":{{"duration":{{"nanos":null,"secs":null}},"exit_code":null,"id":null,"source":null,"status":null,"type":"{kind}"}},"#)
+        + &format!(r#""thread_id":"{TOOLS_SID}","turn_id":"turn-t1"}}"#);
+    assert_eq!((envelope(8).1, envelope(9).1), (message("AgentMessage"), message("UserMessage")));
+    assert_eq!(envelope(10).1, r#"{"call_id":"call-t3","internal_chat_message_metadata_passthrough":{"turn_id":null},"name":null,"status":null}"#);
+    assert_eq!(envelope(11).1, r#"{"item":{"duration":{"nanos":null,"secs":null},"exit_code":null,"id":"exec-t2","source":null,"status":null,"#.to_owned()
+        + &format!(r#""type":"CommandExecution"}},"thread_id":"{TOOLS_SID}","turn_id":"turn-t1"}}"#));
+    let child_kinds: Vec<String> = envelopes(&f, &source(&child)).into_iter().map(|e| e.1).collect();
+    assert!(child_kinds.contains(&"codex.function_call.v1".to_owned()) && !child_kinds.iter().any(|k| k.contains("_end")), "{child_kinds:?}");
+}
+
+/// The sidecar as the A5 binary left it: no A6 tables, ingest stream 5, and
+/// no envelopes of the A6 kinds.
+fn downgrade_to_a5(f: &Fixture) {
+    f.sidecar().execute_batch("DROP TABLE codex_tool_sources; DROP TABLE codex_tool_calls; DROP TABLE codex_exec_items;
+        UPDATE telemetry_streams SET version=5 WHERE stream='ingest';
+        DELETE FROM source_observations WHERE event_kind IN ('codex.custom_tool_call.v1','codex.function_call.v1','codex.custom_tool_call_output.v1',
+            'codex.function_call_output.v1','codex.item_completed.v1');").unwrap();
+}
+
+/// Upgrade: a sidecar written before A6 is read (read-only) with its tool
+/// metadata `unavailable: predates_collection`, never `[]`. The next collect
+/// migrates it to ingest 6 and reads every rollout again: the tool rows and
+/// the A6 envelopes appear, nothing is counted twice, and the ledger equals a
+/// fresh collect. A session whose rollout is gone before it could be read
+/// again stays `pending_reread`.
+#[test]
+fn rollouts_read_before_a6_gain_their_tool_metadata_on_the_next_collect() {
+    let f = Fixture::new();
+    let tools = ["complete", "child", "tools"].map(|name| plant(&f, name))[2].clone();
+    f.cli("collect");
+    let (fresh, fresh_usage, fresh_tools) = (ledger(&f), f.cli_args(&["usage", "--json"]).0, f.cli_args(&["collectors", "tools", "--json"]).0);
+
+    downgrade_to_a5(&f);
+    let (before, _) = f.cli_args(&["collectors", "tools", "--json"]);
+    let predates = unavailable("predates_collection");
+    let listed = before["sessions"].as_array().unwrap();
+    assert_eq!(listed.len(), 3);
+    assert!(listed.iter().all(|s| s["tool_calls"] == predates && s["exec_items"] == predates), "{before}");
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 5}), "a read does not migrate");
+    let (upgraded, _) = f.cli("collect");
+    assert_eq!(upgraded["collected"]["records"], 0, "the re-read counts nothing twice");
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 6}));
+    assert!(fresh == ledger(&f), "the upgraded sidecar equals a fresh collect");
+    assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage);
+    assert_eq!(f.cli_args(&["collectors", "tools", "--json"]).0, fresh_tools);
+
+    downgrade_to_a5(&f);
+    fs::remove_file(&tools).unwrap();
+    f.cli("collect");
+    let (after, _) = f.cli_args(&["collectors", "tools", "--json"]);
+    let pending = unavailable("pending_reread");
+    let row = |sid: &str| after["sessions"].as_array().unwrap().iter().find(|s| s["session_id"] == sid).unwrap().clone();
+    assert_eq!((&row(TOOLS_SID)["tool_calls"], &row(TOOLS_SID)["exec_items"]), (&pending, &pending));
+    assert_eq!(row(CHILD_SID)["tool_calls"], fresh_tools["sessions"].as_array().unwrap().iter().find(|s| s["session_id"] == CHILD_SID).unwrap()["tool_calls"]);
+    assert_eq!(row(SID)["tool_calls"], json!([]), "an observed session without tool calls is empty, not unavailable");
 }

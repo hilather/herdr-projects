@@ -185,7 +185,7 @@ each with a value somewhere, and no unavailable field.
 - *Not collected:* `rate_limits.{credits, limit_name}`,
   `info.{last_token_usage, model_context_window}`, `turn_token_usage`,
   `thread_id`, `root_turn_id`, start and completion times, and tool/exec
-  metadata. (A4 below adds `model_provider`, per-record times,
+  metadata (A6 below collects tool/exec metadata). (A4 below adds `model_provider`, per-record times,
   `rate_limits.{secondary, rate_limit_reached_type}` and subagent/fork
   parent ids, fixture-certified.) Content is never collected: instructions,
   messages, reasoning, `last_agent_message` and `response_item`.
@@ -238,7 +238,8 @@ session, never text a person or model wrote.
 | `rate_limits.secondary.{used_percent, window_minutes, resets_at}` (`token_count`) | same | Number (decimal text for `used_percent`) | `codex_rate_limit_windows.secondary_*` | quota counters, like `primary` | fixture (live saw `null`) |
 | `rate_limits.rate_limit_reached_type` (`token_count`) | same | Text | `codex_rate_limit_windows.rate_limit_reached_type` | enum-like limit tag | fixture, semantics not certified |
 
-Proposed but **held** (not implemented; capability rows
+(Superseded by A6 below, which collects tool/exec metadata in the shape the
+live run observed.) Proposed but **held** (not implemented; capability rows
 `exec_command_end.*` and `mcp_tool_call_end.*` are `not_collected`): tool and
 exec metadata for B5 (M16–M18): `call_id`, `turn_id` (Id), `exit_code`,
 `duration.{secs,nanos}` (Number), `status` (Text), and for MCP
@@ -544,3 +545,232 @@ record's `session_id` = the edge session's id (`thread_id` its own,
 - **Lane A (optional):** collect the `source.subagent.other` string (Tag,
   `guardian`) as the kind's detail, if B2 wants it beyond `thread_source`.
 - **Steward:** apply the §5 text above and list ingest 0005 in the index.
+
+## A6: Codex tool and exec metadata (never content)
+
+Source: the key census of the live A4 run
+([codex-live-0.154.0-a4.md](codex-live-0.154.0-a4.md) §4) and its
+proposed allowlist, which the steward reviewed and approved as a §7
+revision (metadata only). Codex 0.154.0 writes no `exec_command_end`,
+`exec_command_begin` or `mcp_tool_call_end` event. Tool activity is in
+`response_item` tool calls and outputs and in `event_msg/item_completed`.
+
+### Fields
+
+Every field is an identifier, an enum-like tag, a number or a line time
+that Codex writes about a call. None is text a person, a model or a command
+wrote. The census showed tag values `exec`/`wait` (`name`), `completed`
+(`status`), `unified_exec_startup` (`source`) and `CommandExecution`,
+`UserMessage`, `AgentMessage` (`item.type`). No allowlisted field carried
+free text, so none was dropped.
+
+| Envelope kind (`event_kind`) | Field | Class (§7 rule) | Stored in | Certified (caveat) |
+|---|---|---|---|---|
+| `custom_tool_call`, `function_call` (`response_item`) | `call_id` | Id | `codex_tool_calls.call_id` | live |
+| same | `name` | Tag (excerpt) | `.name` | live (`exec`, `wait`) |
+| same | `status` | Tag (excerpt) | `.status` | live for `custom_tool_call`; **fixture** for `function_call` (the live `wait` had none) |
+| same | `internal_chat_message_metadata_passthrough.turn_id` | Id | `.turn_id` | live |
+| same | line `timestamp` | time → Unix ms | `.called_unix_ms` | live |
+| `custom_tool_call_output`, `function_call_output` | `call_id` | Id | `.call_id` (joins its call) | live |
+| same | line `timestamp` | time → Unix ms | `.output_unix_ms` | live |
+| `item_completed` (`event_msg`) | `thread_id`, `turn_id` | Id | `codex_exec_items.thread_id`, `.turn_id` | live |
+| same | `item.type` | Tag | envelope only (rows for `CommandExecution` only) | live |
+| same, `CommandExecution` only | `item.id` | Id | `codex_exec_items.item_id` | live (`command_execution_only`) |
+| same | `item.status`, `item.source` | Tag | `.status`, `.source` | live (`command_execution_only`) |
+| same | `item.exit_code` | Number | `.exit_code` | live (`command_execution_only`) |
+| same | `item.duration.{secs, nanos}` | Number | `.startup_duration_{secs,nanos}` | live (`startup_not_run_time`) |
+| same | line `timestamp` | time → Unix ms | `.completed_unix_ms` | live |
+
+**Never read into a row or envelope:** `input`, `arguments`, `output` (string
+or `output[].text`), the tool items' `id` and `create_time`; the item's
+`command`, `cwd`, `parsed_cmd`, `stdout`, `stderr`, `aggregated_output`,
+`formatted_output`, `process_id`, `content`, `client_id` and `phase`, and
+`started_at_ms`/`completed_at_ms` (not the run time). `capabilities` lists
+the content fields `content_forbidden`, the others `not_collected`. An
+`AgentMessage` or `UserMessage` item keeps only its type, turn and thread.
+Other `response_item` types (`message`, `reasoning`) stay unread,
+`content_forbidden`. MCP shapes are unobserved (no MCP tool was called
+live), so the row `mcp_tool_call.*` is `not_collected`. The stale guessed
+rows `exec_command_end.*` and `mcp_tool_call_end.*` are removed, and so is
+`response_item.*`. `response_item.message` and `response_item.reasoning`
+replace it.
+
+**What the metadata means (and does not).**
+- A call and its output share `call_id`. The gap from call to output
+  (`collectors tools` `call_to_output_ms`) measures the call, including any
+  approval wait. Live A: 36.9 s against Herdr's 37.8 s `blocked`.
+- An exec item and its tool call share **no key**. The exec `item.id`
+  (`exec-…`) is neither the `call_id` nor derived from it. They match only on
+  `(session_id, turn_id)` and line-time order.
+- `item.duration` and the item's own start and completion times are the
+  unified exec **startup** (about 2 µs live), not the command's run time.
+
+### Collection rules
+
+- **Typed allowlist parse.** The four `response_item` types and
+  `item_completed` are deserialized into structs that name only the
+  allowlisted fields. serde skips every other field (the content ones
+  included) without retaining it. The line is never parsed as a whole
+  `serde_json::Value`. The envelope payload is built from the struct and
+  then sanitized like every other kind. The adapter also no longer parses
+  an `event_msg` or `response_item` without an allowlist (for example
+  `agent_message`) into a `Value` at all.
+- **Lenient.** An allowlisted leaf of another JSON type (an object, an
+  array, a string exit code, a numeric source) is `null`, and so is an
+  allowlisted object of another type (`duration` as a string, `passthrough`
+  as a string). The record keeps its other fields and is never quarantined.
+  Only a record serde cannot read at all (a duplicated allowlisted key) is
+  `record_malformed`. A `response_item` whose `type` tag does not parse is
+  ignored unread, as before A6.
+- **Storage.** Sidecar stream `ingest` 0006 (`CREATE TABLE IF NOT EXISTS`),
+  written in the rollout's transaction, keyed by the rollout's own
+  `session_meta.id`. Tool rows are stored for every `cli_version`
+  (metadata, like turns).
+  - `codex_tool_calls(session_id, call_id, call_kind, name, status, turn_id,
+    called_unix_ms, output_kind, output_unix_ms)`. A call fills the call
+    columns, and its output fills the output columns of the same row. The
+    first call and the first output of an id stay. An output without a call
+    keeps a row with `call_kind` `NULL`. A record without a usable
+    `call_id` stores no row (its envelope has `call_id: null`).
+  - `codex_exec_items(session_id, item_id, thread_id, turn_id, status,
+    source, exit_code, startup_duration_secs, startup_duration_nanos,
+    completed_unix_ms)`, one per `CommandExecution` item. The first stays.
+  - `codex_tool_sources(path_digest)`: sources whose tool metadata was read
+    from byte 0 (written with the first `session_meta`).
+- **Upgrade.** A source with a `rollout_sources` row but no
+  `codex_tool_sources` row was read before A6. Each collect reads it again
+  from byte 0 within its budget, like the A4/A5 backfill. Stored keys
+  dedupe, and `collected.records` counts nothing twice. The A6 envelopes are
+  new `event_id`s (normalization version 1).
+- **Envelopes.** `event_kind` `codex.<payload type>.v1`, as for
+  `event_msg`: `codex.custom_tool_call.v1`, `codex.function_call.v1`,
+  `codex.custom_tool_call_output.v1`, `codex.function_call_output.v1` and
+  `codex.item_completed.v1`. An `item_completed` payload always holds every
+  allowlisted path, `null` outside `CommandExecution`.
+- `herdr-projects telemetry <slug> collectors tools [--json]` (read-only):
+  per session `{session_id, attempt_ids (bound), tool_calls: [{call_id,
+  call_kind, name, status, turn_id, called_unix_ms, output_kind,
+  output_unix_ms, call_to_output_ms}], exec_items: [{item_id, thread_id,
+  turn_id, status, source, exit_code, startup_duration {secs, nanos},
+  completed_unix_ms}]}`. `[]` means an observed session with no tool activity.
+  A sidecar without the A6 tables shows both lists as `unavailable:
+  predates_collection`. A session with a rollout still waiting for its
+  re-read shows `unavailable: pending_reread`. Without a sidecar, the
+  result is `collection_not_run`. The text form prints one line per
+  session, call and exec item.
+- Existing outputs (`usage`, `attempts`, `report`, `bindings`, `sessions`,
+  accounting) are unchanged. Changed on purpose: new envelopes for the A6
+  kinds (a rollout with an older-shaped `function_call`, like the child
+  fixture, gains one), the capabilities table, and the first collect after
+  the upgrade re-reads bytes.
+
+### Conformance (tests/telemetry_conformance.rs)
+
+`codex-conformance/tools.jsonl` joins `CASES` (bound, certified, no usage
+record). It has the live shape: an approved `exec` `custom_tool_call`, its
+`CommandExecution` item and array output, a `wait` `function_call` with a
+string output, `AgentMessage` and `UserMessage` items, a tool call and an
+exec item with wrongly typed metadata, and an output without a call.
+`A6LEAK_*` sentinels sit in every forbidden field: `input`, `arguments`,
+both `output` forms, `command`, `cwd`, `parsed_cmd`, `stdout`, `stderr`,
+`aggregated_output`, `formatted_output`, `content` (agent and user),
+`phase`, `client_id`, `process_id`, the tool items' `id`, and in the
+wrongly typed values (an object key under `name`, a `status` array or
+object, a `passthrough`, `exit_code` or `duration` string) and
+`last_agent_message`.
+
+| Property | Test |
+|---|---|
+| `collectors tools --json` (hand-computed rows, `call_to_output_ms` 36910 and 1250), text lines, one exactly-allowlisted envelope per tool line, wrongly typed → `null` without quarantine, output-only row, message items typed only; the child's older-shaped `function_call` collected and its guessed `*_end` events unread | `tool_and_exec_metadata_is_collected_without_content` |
+| Upgrade of an A5 sidecar: `predates_collection` read-only (no migration), then a re-read equal to a fresh collect, stream 6, nothing counted twice; a gone rollout's session `pending_reread`; a session without calls `[]` | `rollouts_read_before_a6_gain_their_tool_metadata_on_the_next_collect` |
+| No `A6LEAK_*` sentinel in `telemetry.db`, `-wal`, `-shm` or any output (collect, usage, report, collectors incl. `tools` text and JSON, accounting) | `planted_sentinels_never_leak` |
+| Capabilities match emitted fields, each new one valued somewhere in the corpus | `capabilities_match_emitted_fields` |
+| Replay of the whole corpus (with `tools`) into a fresh sidecar is identical | `corpus_replays_identically_in_any_chunking` |
+
+### Contracts.md §5/§7 revision (applied by the steward on merge)
+
+`contracts.md` is a steward file. The exact diff:
+
+```diff
+@@ §5 Codex usage (sidecar), **Source.**
+-`<execution_home>/.codex/sessions/**/rollout-*.jsonl` for each Codex profile's
+-`execution_home`. The collector reads only `session_meta`, `turn_context`,
+-`token_usage_record`, `event_msg` of type `token_count`, `task_started`,
+-`task_complete`. All other record types are skipped by type tag without
+-retaining any field.
++`<execution_home>/.codex/sessions/**/rollout-*.jsonl` for each Codex profile's
++`execution_home`. The collector reads only `session_meta`, `turn_context`,
++`token_usage_record`, `event_msg` of type `token_count`, `task_started`,
++`task_complete`, `item_completed`, and `response_item` of type
++`custom_tool_call`, `function_call`, `custom_tool_call_output`,
++`function_call_output` (A6: tool metadata only, through a typed allowlist).
++All other record types are skipped by type tag without retaining any field.
+@@ §5 **Allowlisted fields.**, after the `task_complete` fields
+-`turn_id`, `duration_ms`, `time_to_first_token_ms`. Never:
+-`last_agent_message`, instructions, messages, tool calls/outputs, reasoning.
++`turn_id`, `duration_ms`, `time_to_first_token_ms`. Tool calls
++(`custom_tool_call`, `function_call`): `call_id`, `name`, `status`,
++`internal_chat_message_metadata_passthrough.turn_id` and the line
++`timestamp`; their outputs (`*_call_output`): `call_id` and the line
++`timestamp`; `item_completed`: `thread_id`, `turn_id`, `item.type`, and for
++a `CommandExecution` item `item.{id, status, source, exit_code,
++duration.{secs, nanos}}` (the exec startup, not the command's run time) and
++the line `timestamp` (A6, sidecar stream `ingest` 0006 `codex_tool_calls`,
++`codex_exec_items`, `codex_tool_sources`; lenient like A4). Never:
++`last_agent_message`, instructions, messages, reasoning, tool `input`,
++`arguments` and `output`, and an item's `command`, `cwd`, `parsed_cmd`,
++`stdout`, `stderr`, `aggregated_output`, `formatted_output`, `process_id`,
++`content`, `client_id` or `phase`.
+@@ §7 Privacy allowlist and excerpts
+-Default: metadata only (IDs, digests, enums, counters, timestamps, durations,
+-provider and parent-session identifiers).
++Default: metadata only (IDs, digests, enums, counters, timestamps, durations,
++provider and parent-session identifiers, tool call ids, tool names, call and
++exec statuses, exit codes and exec startup durations).
+@@ §7 **Never collected**
+-Never collected: prompts, briefs, transcripts, agent messages, tool
+-arguments/output, diffs, file contents, reasoning text, environment values.
++Never collected: prompts, briefs, transcripts, agent messages, tool
++input/arguments/output, commands and their working directories, parsed
++commands and output (stdout, stderr, aggregated or formatted), diffs, file
++contents, reasoning text, environment values. Tool metadata is read from
++`response_item` and `item_completed` only through a typed allowlist that
++never deserializes these fields.
+@@ Index / §0 Stores
++Sidecar stream `ingest` 0006: A6 tool/exec metadata (contracts-collection.md A6).
+@@ §8 Landed since phase 1
+-(contracts-collection.md A4), review opportunities, sessions and completions,
++(contracts-collection.md A4), Codex tool/exec metadata (contracts-collection.md
++A6), review opportunities, sessions and completions,
+```
+
+### Follow-ups for other lanes
+
+- **B5 (M16–M18, tool decisions and executions)** needs, read-only:
+  1. `codex_tool_calls` joined to `rollout_sources` on `session_id` for the
+     attempt (`binding = 'bound'`). Count calls per `name`, with
+     `status`. Read `call_to_output = output_unix_ms − called_unix_ms` as the
+     call's wall interval, approval wait included. `output_kind IS NULL`
+     means no output yet (open or lost), and `call_kind IS NULL` means an
+     output whose call was not seen. Neither is 0.
+  2. `codex_exec_items` for executions: `exit_code` (non-zero = failed
+     command; `NULL` = unknown, never success), `status`, `source`. Never
+     use `startup_duration_*` as run time (caveat `startup_not_run_time`).
+     Attribute an item to a call only by `(session_id, turn_id)` and line
+     time (the latest call at or before `completed_unix_ms`, with the
+     output after it). There is no shared key, so report such a join as
+     `inferred`.
+  3. Coverage: a session whose rollout lacks `codex_tool_sources` is
+     `pending_reread`, and a sidecar without the tables is
+     `predates_collection`. Both are `unavailable`, never 0 calls. Tolerate
+     the tables missing on a read-only pre-A6 sidecar.
+  4. Decisions: 0.154.0 writes no typed approval request or decision
+     (codex-live-0.154.0-a4.md §3). An approval can only be inferred: from a
+     call whose interval overlaps a B6b `blocked` wait (human), or from a
+     guardian session in the same turn (auto-review). Typed decision
+     reasons stay unavailable.
+  5. Certification: `function_call.status` is fixture only. MCP calls are
+     not collected (unobserved shape). The `name` values seen live were
+     `exec` and `wait` only.
+- **Steward:** apply the §5/§7 diff above, and list ingest 0006 in the
+  index.

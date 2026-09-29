@@ -12,7 +12,8 @@ pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/in
     include_str!("../../../migrations/telemetry/ingest/0002_source_observations.sql"),
     include_str!("../../../migrations/telemetry/ingest/0003_malformed_quarantine.sql"),
     include_str!("../../../migrations/telemetry/ingest/0004_codex_metadata.sql"),
-    include_str!("../../../migrations/telemetry/ingest/0005_codex_threads.sql")];
+    include_str!("../../../migrations/telemetry/ingest/0005_codex_threads.sql"),
+    include_str!("../../../migrations/telemetry/ingest/0006_codex_tool_metadata.sql")];
 
 /// `herdr-projects telemetry <slug> collectors ...`
 #[derive(clap::Subcommand)]
@@ -25,6 +26,15 @@ pub enum Command {
     /// parent ids), the A5 thread lineage (parent thread id, reported session
     /// id, thread source) and the span of its usage record times. Read-only.
     Sessions,
+    /// Per session: the A6 tool call metadata (call id, tool name, status,
+    /// turn, call and output times) and exec items (id, status, source, exit
+    /// code, startup duration). Metadata only, never a tool's input, arguments,
+    /// output or command. Read-only.
+    Tools {
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Append a `revoked` revision to the attempt's active collector binding:
     /// rollouts that start from now on are not bound to it (contracts-collection.md).
     Revoke { attempt: String },
@@ -43,6 +53,8 @@ pub fn run(project: &Path, command: Command) -> Result<String> {
         Command::Status => super::sidecar::status(project, STREAM)?,
         Command::Bindings => bindings(project)?,
         Command::Sessions => sessions(project)?,
+        Command::Tools { json: false } => return Ok(tools_text(&tools(project)?)),
+        Command::Tools { json: true } => tools(project)?,
         Command::Capabilities { json: false } => return Ok(capabilities_text(&capabilities()?)),
         Command::Capabilities { json: true } => capabilities()?,
         Command::Revoke { attempt } => {
@@ -155,12 +167,55 @@ fn codex_fields() -> Vec<Field> {
         absent("task_complete", "started_at", "not_collected"),
         absent("task_complete", "completed_at", "not_collected"),
         absent("task_complete", "last_agent_message", "content_forbidden"),
-        absent("response_item", "*", "content_forbidden"),
-        // Tool/exec metadata (call id, tool name, duration, exit status): held. The
-        // A4 live run found no typed `*_end` events in 0.154.0 rollouts; the shape
-        // and a proposed allowlist are in codex-live-0.154.0-a4.md.
-        absent("exec_command_end", "*", "not_collected"),
-        absent("mcp_tool_call_end", "*", "not_collected"),
+        absent("response_item", "message", "content_forbidden"),
+        absent("response_item", "reasoning", "content_forbidden"),
+        // A6 tool/exec metadata (contracts-collection.md A6), the allowlist of
+        // codex-live-0.154.0-a4.md §4. Live where the A4 live run saw a value
+        // (exec and wait calls, CommandExecution items); else fixture.
+        field("custom_tool_call", "call_id", Live, None),
+        field("custom_tool_call", "name", Live, None),
+        field("custom_tool_call", "status", Live, None),
+        field("custom_tool_call", "internal_chat_message_metadata_passthrough.turn_id", Live, None),
+        absent("custom_tool_call", "id", "not_collected"),
+        absent("custom_tool_call", "internal_chat_message_metadata_passthrough.create_time", "not_collected"),
+        absent("custom_tool_call", "input", "content_forbidden"),
+        field("function_call", "call_id", Live, None),
+        field("function_call", "name", Live, None),
+        // The live `function_call` (`wait`) carried no status.
+        field("function_call", "status", Fixture, None),
+        field("function_call", "internal_chat_message_metadata_passthrough.turn_id", Live, None),
+        absent("function_call", "id", "not_collected"),
+        absent("function_call", "arguments", "content_forbidden"),
+        field("custom_tool_call_output", "call_id", Live, None),
+        absent("custom_tool_call_output", "id", "not_collected"),
+        absent("custom_tool_call_output", "output", "content_forbidden"),
+        field("function_call_output", "call_id", Live, None),
+        absent("function_call_output", "id", "not_collected"),
+        absent("function_call_output", "output", "content_forbidden"),
+        field("item_completed", "thread_id", Live, None),
+        field("item_completed", "turn_id", Live, None),
+        field("item_completed", "item.type", Live, None),
+        field("item_completed", "item.id", Live, Some("command_execution_only")),
+        field("item_completed", "item.status", Live, Some("command_execution_only")),
+        field("item_completed", "item.source", Live, Some("command_execution_only")),
+        field("item_completed", "item.exit_code", Live, Some("command_execution_only")),
+        field("item_completed", "item.duration.secs", Live, Some("startup_not_run_time")),
+        field("item_completed", "item.duration.nanos", Live, Some("startup_not_run_time")),
+        absent("item_completed", "started_at_ms", "not_collected"),
+        absent("item_completed", "completed_at_ms", "not_collected"),
+        absent("item_completed", "item.process_id", "not_collected"),
+        absent("item_completed", "item.cwd", "not_collected"),
+        absent("item_completed", "item.client_id", "not_collected"),
+        absent("item_completed", "item.phase", "not_collected"),
+        absent("item_completed", "item.command", "content_forbidden"),
+        absent("item_completed", "item.parsed_cmd", "content_forbidden"),
+        absent("item_completed", "item.stdout", "content_forbidden"),
+        absent("item_completed", "item.stderr", "content_forbidden"),
+        absent("item_completed", "item.aggregated_output", "content_forbidden"),
+        absent("item_completed", "item.formatted_output", "content_forbidden"),
+        absent("item_completed", "item.content", "content_forbidden"),
+        // No MCP tool was called live: its 0.154.0 shape is unobserved.
+        absent("mcp_tool_call", "*", "not_collected"),
     ]);
     fields
 }
@@ -188,7 +243,8 @@ fn capabilities() -> Result<Value> {
         let certified = match f.certified { Certified::Live => "live", Certified::Fixture => "fixture", Certified::None => "none" };
         out.push(json!({"kind": f.kind, "field": f.field, "available": collected, "basis": basis, "certified": certified, "caveat": f.caveat, "reason": f.reason}));
     }
-    for kind in ["session_meta", "turn_context", "task_started", "token_usage_record", "token_count", "task_complete"] {
+    for kind in ["session_meta", "turn_context", "task_started", "token_usage_record", "token_count", "task_complete", "custom_tool_call", "function_call",
+        "custom_tool_call_output", "function_call_output", "item_completed"] {
         for (path, _) in codex_allowlist(kind).unwrap_or_default() {
             anyhow::ensure!(declared.iter().any(|f| f.kind == kind && f.field == path), "codex {kind}.{path} is collected but not declared");
         }
@@ -278,6 +334,75 @@ fn sessions(project: &Path) -> Result<Value> {
                 "last_unix_ms": r.get::<_, Option<i64>>(13)?}))}))
     })?;
     Ok(json!({"sessions": rows.collect::<rusqlite::Result<Vec<_>>>()?}))
+}
+
+/// `collectors tools`: per session (the rollout's own `session_meta.id`), its
+/// bound attempts, A6 tool calls and exec items, metadata only. `tool_calls`
+/// and `exec_items` are `unavailable` with `predates_collection` when the
+/// sidecar has no A6 tables (ingest stream < 6, read without migrating), and
+/// with `pending_reread` while a rollout of the session read before A6 waits
+/// to be read again. `[]` is an observed session without tool activity.
+/// Read-only.
+fn tools(project: &Path) -> Result<Value> {
+    let Some(db) = super::sidecar::read(project)? else { return Ok(json!({"sessions": unavailable("collection_not_run")})) };
+    let a6 = exists(&db, "codex_tool_sources")?;
+    let pending = if a6 { "EXISTS(SELECT 1 FROM rollout_sources p WHERE p.session_id=s.session_id AND p.path_digest NOT IN (SELECT path_digest FROM codex_tool_sources))" } else { "1" };
+    let mut stmt = db.prepare(&format!("SELECT s.session_id,{pending},(SELECT json_group_array(DISTINCT a.attempt_id) FROM (SELECT attempt_id FROM rollout_sources b
+        WHERE b.session_id=s.session_id AND b.binding='bound' ORDER BY attempt_id) a) FROM (SELECT DISTINCT session_id FROM rollout_sources) s ORDER BY s.session_id"))?;
+    let sessions: Vec<(String, bool, String)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+    let mut out = Vec::new();
+    for (session, waiting, attempts) in sessions {
+        let reason = if !a6 { Some("predates_collection") } else if waiting { Some("pending_reread") } else { None };
+        let (calls, items) = match reason {
+            Some(reason) => (unavailable(reason), unavailable(reason)),
+            None => {
+                let calls = db.prepare("SELECT call_id,call_kind,name,status,turn_id,called_unix_ms,output_kind,output_unix_ms FROM codex_tool_calls
+                    WHERE session_id=?1 ORDER BY called_unix_ms IS NULL,called_unix_ms,call_id")?
+                    .query_map([&session], |r| {
+                        let (called, output): (Option<i64>, Option<i64>) = (r.get(5)?, r.get(7)?);
+                        Ok(json!({"call_id": r.get::<_, String>(0)?, "call_kind": r.get::<_, Option<String>>(1)?, "name": r.get::<_, Option<String>>(2)?,
+                            "status": r.get::<_, Option<String>>(3)?, "turn_id": r.get::<_, Option<String>>(4)?, "called_unix_ms": called,
+                            "output_kind": r.get::<_, Option<String>>(6)?, "output_unix_ms": output,
+                            "call_to_output_ms": called.zip(output).map(|(c, o)| o - c)}))
+                    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+                let items = db.prepare("SELECT item_id,thread_id,turn_id,status,source,exit_code,startup_duration_secs,startup_duration_nanos,completed_unix_ms
+                    FROM codex_exec_items WHERE session_id=?1 ORDER BY completed_unix_ms IS NULL,completed_unix_ms,item_id")?
+                    .query_map([&session], |r| Ok(json!({"item_id": r.get::<_, String>(0)?, "thread_id": r.get::<_, Option<String>>(1)?,
+                        "turn_id": r.get::<_, Option<String>>(2)?, "status": r.get::<_, Option<String>>(3)?, "source": r.get::<_, Option<String>>(4)?,
+                        "exit_code": r.get::<_, Option<i64>>(5)?, "startup_duration": {"secs": r.get::<_, Option<i64>>(6)?, "nanos": r.get::<_, Option<i64>>(7)?},
+                        "completed_unix_ms": r.get::<_, Option<i64>>(8)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                (json!(calls), json!(items))
+            }
+        };
+        let attempts: Value = serde_json::from_str(&attempts)?;
+        out.push(json!({"session_id": session, "attempt_ids": attempts, "tool_calls": calls, "exec_items": items}));
+    }
+    Ok(json!({"sessions": out}))
+}
+
+fn tools_text(value: &Value) -> String {
+    let Some(sessions) = value["sessions"].as_array() else { return format!("tools {}\n", value["sessions"]["reason"].as_str().unwrap_or("-")) };
+    let word = |v: &Value| match v { Value::String(s) => s.clone(), Value::Null => "-".into(), other => other.to_string() };
+    let mut out = String::new();
+    for s in sessions {
+        let attempts: Vec<String> = s["attempt_ids"].as_array().into_iter().flatten().map(word).collect();
+        out += &format!("{} attempts={}\n", word(&s["session_id"]), if attempts.is_empty() { "-".into() } else { attempts.join(",") });
+        for (key, label) in [("tool_calls", "call"), ("exec_items", "exec")] {
+            let Some(rows) = s[key].as_array() else {
+                out += &format!("  {key} unavailable {}\n", word(&s[key]["reason"]));
+                continue;
+            };
+            for r in rows {
+                out += &match label {
+                    "call" => format!("  call {} {} name={} status={} turn={} called={} output={} call_to_output_ms={}\n", word(&r["call_id"]), word(&r["call_kind"]),
+                        word(&r["name"]), word(&r["status"]), word(&r["turn_id"]), word(&r["called_unix_ms"]), word(&r["output_unix_ms"]), word(&r["call_to_output_ms"])),
+                    _ => format!("  exec {} status={} source={} exit_code={} turn={} completed={}\n", word(&r["item_id"]), word(&r["status"]), word(&r["source"]),
+                        word(&r["exit_code"]), word(&r["turn_id"]), word(&r["completed_unix_ms"])),
+                };
+            }
+        }
+    }
+    out
 }
 
 fn unavailable(reason: &str) -> Value {
