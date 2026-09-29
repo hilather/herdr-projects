@@ -187,7 +187,7 @@ merges one PR at a time.
   (live `subagent_kind` is `other`), keep guardian inclusion `separate`, never
   key nodes by either `session_id`, and update the accounting guardian fixture
   to the live shape.
-- **Superseded sidecar tables** (owner decision): `session_graph`,
+- **Done (accounting 0008):** **Superseded sidecar tables** (owner decision): `session_graph`,
   `quota_observations` (B7) and `session_nodes` (B9) are no longer read or
   written. Lanes have been told not to DROP TABLE; a single cleanup migration
   waits for the owner's decision.

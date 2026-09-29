@@ -813,3 +813,13 @@ Test `fan_out_buckets_and_integration_conflicts`:
 Follow-ups: coordinator usage scope and allocation rule (M34); a supersession
 reason producer (M37); worker-side rebase capture; the factory's scale-trial
 steps (F4.6/F5.4) as named concurrency steps; per-configuration fan-out.
+
+## 11. Stream 8: superseded projections dropped
+
+Accounting stream 8 (`0008_drop_superseded.sql`) drops `session_graph` (v2),
+`quota_observations` (v4) and `session_nodes` (v6). Later versions replaced
+them (`session_graph_nodes`, `quota_window_observations`) and nothing reads or
+writes them. They were projections rebuilt on every sync, so no source data
+is lost. `DROP TABLE IF EXISTS` keeps the migration re-runnable when the
+streams table is lost and every migration runs again. Checked end to end in
+`attention_intervals_union_and_censor`.
