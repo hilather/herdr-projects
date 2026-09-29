@@ -8,7 +8,14 @@ use std::path::Path;
 
 pub const STREAM: &str = "ingest";
 /// `include_str!` of `migrations/telemetry/ingest/`, in order; index + 1 is the stream version.
-pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/ingest/0001_source_bindings.sql")];
+pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/ingest/0001_source_bindings.sql"),
+    include_str!("../../../migrations/telemetry/ingest/0002_source_observations.sql")];
+
+// Lane A files outside this directory, declared here so `super::mod.rs` (steward) is unchanged.
+#[path = "../ingest/mod.rs"]
+pub mod ingest;
+#[path = "../sanitize.rs"]
+pub mod sanitize;
 
 /// `herdr-projects telemetry <slug> collectors ...`
 #[derive(clap::Subcommand)]

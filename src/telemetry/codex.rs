@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use super::collectors::{ingest, sanitize};
 
 /// Versions whose counters are accepted: each certified by a live run
 /// (`0.154.0`: docs/telemetry/codex-live-0.154.0.md).
@@ -137,17 +138,30 @@ pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Co
     let mut remaining = budget.bytes;
     let reread = reread(&db)?;
     let mut seen = std::collections::BTreeSet::new();
+    let mut unwritable = false;
     for home in &homes {
         let mut files = Vec::new();
         walk(&Path::new(home).join(".codex/sessions"), 0, &mut files);
         files.sort();
         seen.extend(files.iter().map(|file| digest(file.as_os_str().as_encoded_bytes())));
         for file in files {
-            if remaining == 0 {
-                done.budget_exhausted = true;
+            if remaining == 0 || unwritable {
+                done.budget_exhausted |= remaining == 0;
                 break;
             }
-            let read = tail(&mut db, &file, &digest(home.as_bytes()), &worktrees, remaining, &reread, &mut done)?;
+            let mut span = (0, 0);
+            let read = match tail(&mut db, &file, &digest(home.as_bytes()), &worktrees, remaining, &reread, &mut done, &mut span) {
+                Ok(read) => read,
+                // The pass rolled back: its range is a coverage gap and later
+                // sources wait for the next collect (contracts-collection.md A2).
+                Err(error) if ingest::unwritable(&error) => {
+                    let key = digest(file.as_os_str().as_encoded_bytes());
+                    if ingest::gap(&db, &key, span.0, span.1, "sidecar_write_failed", jiff::Timestamp::now().as_millisecond()).is_err() { return Err(error); }
+                    unwritable = true;
+                    0
+                }
+                Err(error) => return Err(error),
+            };
             remaining -= read.min(remaining);
         }
     }
@@ -283,19 +297,6 @@ fn ms(text: Option<&str>) -> Option<i64> {
     text?.parse::<jiff::Timestamp>().ok().map(|t| t.as_millisecond())
 }
 
-/// Contracts §7 rule 2 for the stored `cwd`: the home prefix becomes `~`.
-fn tilde(cwd: &str) -> String {
-    if let Some(home) = std::env::var("HOME").ok().map(|h| h.trim_end_matches('/').to_owned()).filter(|h| h.len() > 1) {
-        if let Some(rest) = cwd.strip_prefix(&home).filter(|rest| rest.is_empty() || rest.starts_with('/')) { return format!("~{rest}"); }
-    }
-    for root in ["/home/", "/Users/"] {
-        if let Some(user) = cwd.strip_prefix(root) {
-            return format!("~{}", &user[user.find('/').unwrap_or(user.len())..]);
-        }
-    }
-    cwd.to_owned()
-}
-
 /// The attempt whose worktree contains `cwd`, compared textually; `..` and `.` refuse.
 fn cwd_attempt(cwd: &str, worktrees: &str) -> Option<String> {
     if cwd.split('/').any(|part| part == ".." || part == ".") { return None; }
@@ -313,8 +314,11 @@ struct Cursor {
     session: Option<(String, String, Option<i64>)>,
 }
 
-/// Ingest complete lines of one rollout after its stored offset, in one sidecar transaction.
-fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance: u64, reread: &std::collections::BTreeSet<String>, done: &mut Collected) -> Result<u64> {
+/// Ingest complete lines of one rollout after its stored offset, with their
+/// envelopes, in one sidecar transaction. `span`: the byte range this pass covers.
+#[allow(clippy::too_many_arguments)]
+fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance: u64, reread: &std::collections::BTreeSet<String>, done: &mut Collected,
+    span: &mut (u64, u64)) -> Result<u64> {
     let key = digest(file.as_os_str().as_encoded_bytes());
     let Ok(mut handle) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(file) else { return Ok(0) };
     let meta = handle.metadata()?;
@@ -331,14 +335,21 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
             Cursor { offset: 0, records: 0, rate_limits: 0, model: None, effort: None, session: None }
         }
     };
+    let now = jiff::Timestamp::now().as_millisecond();
+    *span = (cursor.offset, meta.len());
+    let ledger = ingest::Ledger::begin(&tx, &key, cursor.offset, now)?;
     if cursor.offset == meta.len() {
+        if ledger.fresh && cursor.offset > 0 {
+            ledger.finish(&tx, None, cursor.offset, now)?;
+            tx.commit()?;
+        }
         return Ok(0);
     }
     cursor.session = tx.query_row("SELECT session_id,cli_version,session_unix_ms FROM rollout_sources WHERE path_digest=?1", [&key],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
     handle.seek(SeekFrom::Start(cursor.offset))?;
     let mut reader = BufReader::new(handle.take(allowance));
-    let (mut line, mut read, now) = (Vec::new(), 0u64, jiff::Timestamp::now().as_millisecond());
+    let (mut line, mut read) = (Vec::new(), 0u64);
     loop {
         line.clear();
         let n = reader.by_ref().take(MAX_LINE).read_until(b'\n', &mut line)? as u64;
@@ -354,13 +365,26 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
                 if more == 0 || line.last() == Some(&b'\n') { break; }
             }
             if line.last() != Some(&b'\n') { break; }
+            ledger.oversized_line(&tx, cursor.offset, skipped, now)?;
             read += skipped;
             cursor.offset += skipped;
             continue;
         }
         read += n;
+        let Ok(tag) = serde_json::from_slice::<Tag>(&line) else { cursor.offset += n; continue };
+        let first_meta = cursor.session.is_none();
+        let at = cursor.offset;
         cursor.offset += n;
-        ingest(&tx, &line, &key, home, worktrees, &mut cursor, now, done)?;
+        record(&tx, &tag, &line, &key, home, worktrees, &mut cursor, now, done)?;
+        let kind = match (tag.kind.as_deref(), tag.payload.as_ref().and_then(|p| p.kind.as_deref())) {
+            (Some("event_msg"), inner) => inner,
+            (Some("session_meta"), _) if !first_meta => None,
+            (kind, _) => kind,
+        };
+        if let (Some(kind), Some((session, version, _))) = (kind, &cursor.session)
+            && let Ok(Envelope { payload }) = serde_json::from_slice::<Envelope<Value>>(&line) {
+            ledger.observe(&tx, at, ingest::Record { kind, payload: &payload, occurred_unix_ms: ms(tag.timestamp.as_deref()), session, adapter_version: version }, now)?;
+        }
     }
     // Bytes pulled from disk, including a partial last line, count against the budget.
     let pulled = allowance - reader.into_inner().limit();
@@ -371,6 +395,7 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
         rate_limits=excluded.rate_limits,model=excluded.model,effort=excluded.effort,updated_unix_ms=excluded.updated_unix_ms",
         params![key, meta.dev() as i64, meta.ino() as i64, cursor.offset as i64, cursor.records, cursor.rate_limits, cursor.model, cursor.effort, now])?;
     tx.execute("UPDATE rollout_sources SET records=?2 WHERE path_digest=?1", params![key, cursor.records])?;
+    ledger.finish(&tx, cursor.session.as_ref().map(|s| s.0.as_str()), cursor.offset, now)?;
     if let Some((session, version, _)) = &cursor.session && certified(version) {
         reconcile(&tx, session, now)?;
     }
@@ -379,8 +404,7 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
 }
 
 #[allow(clippy::too_many_arguments)]
-fn ingest(tx: &Transaction, line: &[u8], key: &str, home: &str, worktrees: &str, cursor: &mut Cursor, now: i64, done: &mut Collected) -> Result<()> {
-    let Ok(tag) = serde_json::from_slice::<Tag>(line) else { return Ok(()) };
+fn record(tx: &Transaction, tag: &Tag, line: &[u8], key: &str, home: &str, worktrees: &str, cursor: &mut Cursor, now: i64, done: &mut Collected) -> Result<()> {
     let inner = tag.payload.as_ref().and_then(|p| p.kind.as_deref());
     match (tag.kind.as_deref(), inner) {
         (Some("session_meta"), _) if cursor.session.is_none() => {
@@ -393,7 +417,7 @@ fn ingest(tx: &Transaction, line: &[u8], key: &str, home: &str, worktrees: &str,
             let at = ms(meta.timestamp.as_deref());
             tx.execute("INSERT INTO rollout_sources(path_digest,home_digest,session_id,session_unix_ms,cwd,cwd_attempt,cli_version,originator,source,records,binding,observed_unix_ms)
                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,0,'unbound',?10)",
-                params![key, home, meta.id, at, tilde(&meta.cwd), cwd_attempt(&meta.cwd, worktrees), meta.cli_version, meta.originator, source, now])?;
+                params![key, home, meta.id, at, sanitize::home_prefix(&meta.cwd), cwd_attempt(&meta.cwd, worktrees), meta.cli_version, meta.originator, source, now])?;
             cursor.session = Some((meta.id, meta.cli_version, at));
         }
         (Some("turn_context"), _) => {
