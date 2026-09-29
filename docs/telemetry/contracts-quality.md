@@ -106,8 +106,9 @@ collection_not_run`, an empty denominator `null` with `empty_denominator`.
 Plan doc 05 §5a, doc 06 §6c, doc 03 `CandidateGroup`/`CandidateSelection`.
 Owner decision 1 ([phase2-lanes.md](phase2-lanes.md)): arms are
 **sequential**; each arm is an ordinary attempt of the group's task, reserved
-through the existing launch path. `tasks.active_attempt`, the scheduler and
-integration are unchanged. Canonical migration `0053_candidate_groups.sql`
+through the existing launch path. `tasks.active_attempt` and the scheduler
+are unchanged; integration and dependency release hold an arm until it is
+the selection (below). Canonical migration `0053_candidate_groups.sql`
 (schema 53); store API `src/store/candidate_groups.rs`.
 
 **Tables** (canonical, append-only: every UPDATE/DELETE aborts except the one
@@ -156,8 +157,8 @@ seal below; no cost column anywhere):
 
 **Selection is not verification.** Recording a selection verifies,
 integrates, completes or reassigns nothing; the winner still needs the
-ordinary verification and integration path, and a loser keeps its own
-outcome.
+ordinary verification and integration path (it is only released from the
+hold below and queued), and a loser keeps its own outcome.
 
 **Cost** is owned once by each attempt (contracts §4 `usage`). A group
 stores no cost and never moves it: a losing, cancelled or unfinished arm
@@ -188,12 +189,39 @@ keeps its attempt's usage.
   usage is unknown; `arms_launched`, `arms_not_launched` (no attempt, so no
   consumption of its own) and `winner_usage` (drill-down only).
 
-**Integration is not held by C3.** Owner decision 1 wants integration held
-until a selection exists, which needs integration edits outside lane C
-(`src/store/integration_jobs.rs` eligibility and `begin_integration`), so it
-is escalated, not built. Until then `show` reports `integration_hold:
-{enforced: false, integrated_without_selection: [...]}` listing arms whose
-candidate integrated without being the selection.
+**Integration and dependency hold** (owner decision 1; no schema change).
+A submission whose attempt is bound to an arm of a candidate group and that
+is not its group's selected submission is *held* (`candidate_groups.rs`
+`HELD_ARM`): every arm while the group has no selection, every arm forever
+after `no_selection`, and every loser (and any other submission of the
+winning arm) after a selection. A held submission:
+
+- is not eligible for automatic integration: the producer's eligibility
+  (`integration_jobs.rs` `ELIGIBLE` + `NOT_SEEDED` + `AND NOT HELD_ARM`,
+  the last only when the 0053 tables exist) drops it from the pending
+  projection;
+- is refused by `begin_integration` before any write (`a candidate-group
+  arm integrates only as its group's selection`), so `result integrate`
+  fails with no lease, no integration operation and no work directory;
+- never satisfies a dependent's `verified_result` edge
+  (`satisfaction.rs` `verified_counts`, which every release reads:
+  `scheduler inspect` blockers, reservation evidence, waits). The
+  satisfaction row may still be recorded; it counts only once the
+  submission is the selection.
+
+Recording a `selected` selection (operator, rule or judge) lifts the
+winner's hold and, in the same transaction, inserts it into
+`pending_integration_work` if it has a verified result and no integration
+job or operation, so automatic integration picks it up. Tasks outside a
+group are unchanged. Raw SQL is not guarded (no triggers: that would need
+a schema change). `show` reports `integration_hold: {enforced: true,
+integrated_without_selection: [...]}`, the list keeping any arm whose
+candidate integrated before the hold existed.
+
+A dependent's `verified_result` edge also still requires the predecessor's
+current attempt (its active attempt, else its latest); so a winner that is
+not the latest arm releases a `verified_result` dependent only through an
+`integrated_commit` edge (follow-up).
 
 ## 4. Selectors and paired outcomes (TM3.8, card C4)
 

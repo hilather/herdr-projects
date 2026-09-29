@@ -8,7 +8,9 @@
 //! finding on it is an ordinary finding. A candidate is revealed only after
 //! every review of it has ended, and is never reviewed afterwards. A seeded
 //! candidate never integrates ([`refuse_seeded_integration`], the
-//! `integration_jobs` eligibility predicate and the migration's triggers). `seed_log` shares the finding and fix
+//! `integration_jobs` eligibility predicate and the migration's triggers), and
+//! its verified result never satisfies a dependent's `verified_result` edge
+//! (`satisfaction.rs` `verified_counts`). `seed_log` shares the finding and fix
 //! history's one ordering, so [`seed_state`] replays detections against triage
 //! to one watermark. Reviewer-facing views never read these tables.
 use super::*;
@@ -41,12 +43,16 @@ pub(super) fn refuse_review_after_reveal(tx: &Connection, submission: &str) -> R
     Ok(())
 }
 
+/// Whether verified result `result_id` is of a seeded candidate.
+pub(super) fn seeded_result(tx: &Connection, result_id: &str) -> Result<bool> {
+    if !registry_present(tx)? { return Ok(false); }
+    Ok(tx.query_row("SELECT EXISTS(SELECT 1 FROM verified_results r JOIN seeded_candidates x ON x.submission_id=r.submission_id WHERE r.result_id=?1 AND x.arm='seeded')",
+        [result_id], |r| r.get(0))?)
+}
+
 /// Refuse to begin integrating a verified result of a seeded candidate.
 pub(super) fn refuse_seeded_integration(tx: &Connection, result_id: &str) -> Result<()> {
-    if !registry_present(tx)? { return Ok(()); }
-    let seeded: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM verified_results r JOIN seeded_candidates x ON x.submission_id=r.submission_id WHERE r.result_id=?1 AND x.arm='seeded')",
-        [result_id], |r| r.get(0))?;
-    if seeded { return Err(StoreError::Invalid("a seeded candidate never integrates".into())); }
+    if seeded_result(tx, result_id)? { return Err(StoreError::Invalid("a seeded candidate never integrates".into())); }
     Ok(())
 }
 

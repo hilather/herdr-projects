@@ -139,11 +139,16 @@ merges one PR at a time.
   a certified invocation scope; `observed_increase` is account-wide only.
 - **Provider charges, invoice allocation, dated currency conversion, time-based
   `as_of`** (lane B, TM2.3 remainder).
-- **Integration hold for candidate groups** (steward + integration; waits on
-  the owner): `integration_jobs.rs` `ELIGIBLE` and `begin_integration` skip a
-  member of an unselected group, and `select_candidate` queues the winner.
-  Until then, `groups show` reports `integration_hold.enforced=false` and
-  lists candidates that integrated without a selection.
+- **Done (integration holds):** **Integration hold for candidate groups**
+  (steward + integration; approved by the owner): `integration_jobs.rs`
+  `ELIGIBLE` and `begin_integration` skip a member of an unselected group,
+  and every selector queues a verified winner. `groups show` reports
+  `integration_hold.enforced=true` and still lists candidates that
+  integrated without a selection. An unselected arm also never releases a
+  `verified_result` dependent (contracts-quality.md §3). Still open: a
+  winner that is not the task's latest attempt cannot satisfy a
+  `verified_result` edge (attempt currency in `satisfaction.rs`), and raw
+  SQL is not guarded for arms (needs triggers, a schema change).
 - **Done (C5):** **C5 M42 uncertainty** (lane C): a group-level percentile bootstrap with a
   recorded seed. **Min-sample registry** (TM4.1): replaces the constant 10.
   **Shared `arm_outcome` helper** (steward re-export). **Judge
@@ -203,9 +208,10 @@ merges one PR at a time.
   feed the F4.6/F5.4 scale-trial steps in as named concurrency levels.
   **Done (B10):** per-configuration fan-out and a configurable window
   (`--window-minutes`, default 60).
-- **D6 follow-ups** (lane D/steward): a verified seeded result can still
-  satisfy a dependent task's `verified_result` requirement (integration is
-  guarded, the dependency path is not); findings linked to a seed probably
+- **D6 follow-ups** (lane D/steward): **done (integration holds):** a
+  verified seeded result no longer satisfies a dependent task's
+  `verified_result` requirement (`satisfaction.rs` `verified_counts`,
+  contracts-review.md §8). Still open: findings linked to a seed probably
   belong outside M21/M22 credit; review completions are not in the shared
   ledger, so `--as-of` replays triage and detections only; the seeds CLI
   principal is always `operator:cli` (workers refused at the store API only);

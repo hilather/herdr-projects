@@ -185,8 +185,9 @@ fn show(project: &Path) -> Result<Value> {
             "status": if selection.is_some() { "closed" } else { "open" }, "arms": records, "selection": selection,
             // Every launched arm's own usage; the winner's is a drill-down, never the group's cost.
             "cost": {"arms_total": arms_total, "arms_launched": launched.len() + unknown.len(), "arms_not_launched": not_launched, "winner_usage": winner_usage},
-            // C3 records groups only; integration is not held (contracts-quality.md §3).
-            "integration_hold": {"enforced": false, "integrated_without_selection": premature}}));
+            // Integration is held until selection (contracts-quality.md §3); the list keeps
+            // any arm integrated before the hold existed.
+            "integration_hold": {"enforced": true, "integrated_without_selection": premature}}));
     }
     Ok(json!({"groups": groups}))
 }

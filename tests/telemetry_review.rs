@@ -1134,9 +1134,16 @@ impl IntegrationLab {
     /// Task `task` with a running attempt, a signed verify-then-integrate contract whose
     /// policy runs `git diff --quiet`, and one submitted result at `candidate`.
     fn submit(&self, task: &str, candidate: &str) -> String {
+        let digest = self.contract(task);
+        let attempt = format!("{task}-attempt");
+        self.attempt(task, &attempt, None);
+        self.result(task, &attempt, &digest, candidate)
+    }
+    /// Task `task` with its signed verify-then-integrate contract (revision 1);
+    /// returns the contract digest.
+    fn contract(&self, task: &str) -> String {
         use herdr_projects::{authority::CONTRACT_SIGNATURE_NAMESPACE, domain::TaskId, runtime};
         let head = runtime::add_task(&self.project, TaskId::new(task).unwrap(), "work".into(), runtime::snapshot(&self.project).unwrap().head).unwrap();
-        self.db().execute("INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) VALUES(?1,?2,1,'running',NULL,?1,0)", [format!("{task}-attempt"), task.to_owned()]).unwrap();
         let repository = self.repo.canonicalize().unwrap().display().to_string();
         let mut document = serde_json::to_vec_pretty(&json!({
             "version": 3, "outputs": [{"path": "src/lib.rs", "kind": "git_file"}], "scope": {"paths": [{"path": "src/", "access": "write"}]},
@@ -1149,13 +1156,61 @@ impl IntegrationLab {
         fs::write(&doc, &document).unwrap();
         assert!(std::process::Command::new("/usr/bin/ssh-keygen").args(["-Y", "sign", "-f"]).arg(&self.key).args(["-n", CONTRACT_SIGNATURE_NAMESPACE]).arg(&doc).status().unwrap().success());
         let installed = self.ok(&["task", "demo", "contract", "put", "--input-file", doc.to_str().unwrap(), "--signature", doc.with_extension("json.sig").to_str().unwrap()]);
+        installed["digest"].as_str().unwrap().to_owned()
+    }
+    /// A running attempt of `task`, as a launch would write it. With a
+    /// `(group, arm, configuration)`, its reservation chose that arm's
+    /// configuration and bound it to the arm (candidate_groups::bind).
+    fn attempt(&self, task: &str, attempt: &str, arm: Option<(&str, u32, &str)>) {
+        let db = self.db();
+        db.execute("INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) VALUES(?1,?2,1,'running',NULL,?1,0)", [attempt, task]).unwrap();
+        if let Some((group, arm, configuration)) = arm {
+            db.execute("INSERT INTO dispatch_decisions(attempt_id,task_id,task_revision,contract_revision,chosen_configuration_id,eligible,chooser_kind,chooser_principal,reason_codes,decided_unix_ms)
+                VALUES(?1,?2,1,1,?3,'[\"x\"]','operator','operator:cli','[\"x\"]',1)", rusqlite::params![attempt, task, configuration]).unwrap();
+            db.execute("INSERT INTO candidate_arm_attempts(group_id,arm,attempt_id,bound_unix_ms,source) VALUES(?1,?2,?3,1,'admit_prepared')", rusqlite::params![group, arm, attempt]).unwrap();
+        }
+    }
+    /// Submit `attempt`'s result at `candidate` through `result submit`; returns the submission id.
+    fn result(&self, task: &str, attempt: &str, contract_digest: &str, candidate: &str) -> String {
+        let repository = self.repo.canonicalize().unwrap().display().to_string();
         let objects: Vec<serde_json::Value> = self.git(&["rev-list", "--objects", "--all"]).lines()
             .map(|line| { let oid = line.split_whitespace().next().unwrap(); json!({"oid": oid, "relative_path": format!("{}/{}", &oid[..2], &oid[2..])}) }).collect();
-        let result = self.home.path().join(format!("{task}-result.json"));
-        fs::write(&result, json!({"idempotency_key": format!("{task}-key"), "task_id": task, "contract_revision": 1, "contract_digest": installed["digest"],
-            "attempt_id": format!("{task}-attempt"), "repository": repository, "base_oid": self.base, "candidate_oid": candidate, "object_format": "sha256",
+        let key = if attempt == format!("{task}-attempt") { format!("{task}-key") } else { format!("{attempt}-key") };
+        let result = self.home.path().join(format!("{key}-result.json"));
+        fs::write(&result, json!({"idempotency_key": key, "task_id": task, "contract_revision": 1, "contract_digest": contract_digest,
+            "attempt_id": attempt, "repository": repository, "base_oid": self.base, "candidate_oid": candidate, "object_format": "sha256",
             "artifact_manifest": [{"path": "src/lib.rs", "oid": candidate}], "claimed_checks": ["all checks passed"], "objects": objects}).to_string()).unwrap();
         self.ok(&["result", "demo", "submit", "--input-file", result.to_str().unwrap()])["submission_id"].as_str().unwrap().to_owned()
+    }
+    /// Retained native profiles `codex` and `fast` (distinct configurations,
+    /// as `profile prepare` would retain them); returns their configuration ids.
+    fn arm_profiles(&self) -> (String, String) {
+        let config = herdr_projects::migration::config_reference(&self.home.path().join(".config/herdr-projects/config.toml")).unwrap();
+        let db_path = self.project.join(".state/state.db");
+        let codex = codex_profile(&config, "codex", "codex", Some(&self.home.path().join("codex-home")));
+        let mut fast = codex_profile(&config, "codex", "fast", Some(&self.home.path().join("fast-home")));
+        fast.arguments_digest = "1".repeat(64);
+        let ids = (agent_configuration(&codex).id, agent_configuration(&fast).id);
+        plant_profile(&db_path, codex);
+        plant_profile(&db_path, fast);
+        ids
+    }
+    /// Queue `consumer` behind `predecessor`'s `verified_result` through `task queue`.
+    fn queue_dependent(&self, consumer: &str, predecessor: &str) {
+        use herdr_projects::{domain::TaskId, runtime};
+        let head = runtime::add_task(&self.project, TaskId::new(consumer).unwrap(), format!("consumer {consumer}"), runtime::snapshot(&self.project).unwrap().head).unwrap();
+        let request = self.home.path().join(format!("{consumer}-queue.json"));
+        fs::write(&request, json!({"priority": 0, "dependencies": [{"predecessor": predecessor, "requirement": "verified_result"}]}).to_string()).unwrap();
+        self.ok(&["task", "demo", "queue", consumer, "--input-file", request.to_str().unwrap(), "--expected-revision", "1", "--expected-head", &head.to_string()]);
+    }
+    /// `consumer`'s dependency blockers in `scheduler inspect`. Factory
+    /// admission stays off (the default), so an edge whose evidence counts
+    /// reports only `admission_disabled:<edge>`.
+    fn blockers(&self, consumer: &str) -> Vec<String> {
+        let report = self.ok(&["scheduler", "demo", "inspect"]);
+        let entry = report["entries"].as_array().unwrap().iter().find(|e| e["task"] == consumer).unwrap().clone();
+        entry["blockers"].as_array().unwrap().iter().map(|b| b.as_str().unwrap().to_owned())
+            .filter(|b| ["verified_dependency_evidence_unavailable:", "predecessor_failed:", "admission_disabled:"].iter().any(|p| b.starts_with(p))).collect()
     }
     /// Verify `submission` through the operator CLI; returns its verified result id.
     fn verify(&self, submission: &str, key: &str) -> String {
@@ -1269,6 +1324,156 @@ fn seeded_candidate_never_integrates_and_reviewers_stay_blind() {
         let bytes = fs::read(lab.project.join(".state").join(file)).unwrap_or_default();
         assert!(!bytes.windows(20).any(|w| w == &seed["reproducer"].as_str().unwrap().as_bytes()[..20]), "reproducer text in {file}");
     }
+}
+
+/// Integration hold for candidate groups (contracts-quality.md §3, owner
+/// decision 1) over the real integration path. Group G on task `g` seals arms
+/// 1 `codex` and 2 `fast`; attempts g-a1 and g-a2 bind to them and both
+/// candidates pass verification. Group N on task `n` (same arms) has one
+/// verified arm and is closed with no selection. With automatic integration
+/// on, the 3 verified submissions enter the pending projection; the
+/// producer's turn enqueues 0 jobs and drops all 3 (no selection names any of
+/// them). The operator's `result integrate` of g-a1 is refused by
+/// `begin_integration` before any write. The rule then selects arm 1 (first
+/// accepted in launch order); that transaction queues g-a1's submission (the
+/// projection is exactly it) and the next turn enqueues 1 job, for it. The
+/// losing arm 2 and N's arm stay refused; the winner integrates.
+#[test]
+fn unselected_arm_does_not_integrate_until_selection_and_winner_is_queued() {
+    let lab = IntegrationLab::new();
+    let (codex, fast) = lab.arm_profiles();
+    let clean = seed_set()["clean"].as_str().unwrap().to_owned();
+    let group = |task: &str| lab.telemetry(&["quality", "groups", "create", task, "--arm", "codex", "--arm", "fast"])["group"]["group_id"].as_str().unwrap().to_owned();
+    let g_digest = lab.contract("g");
+    let g = group("g");
+    lab.attempt("g", "g-a1", Some((&g, 1, &codex)));
+    lab.attempt("g", "g-a2", Some((&g, 2, &fast)));
+    let g1_oid = lab.candidate("g-arm-1", &format!("{clean}// arm 1\n"));
+    let s1 = lab.result("g", "g-a1", &g_digest, &g1_oid);
+    let s2 = lab.result("g", "g-a2", &g_digest, &lab.candidate("g-arm-2", &format!("{clean}// arm 2\n")));
+    let n_digest = lab.contract("n");
+    let n = group("n");
+    lab.attempt("n", "n-a1", Some((&n, 1, &codex)));
+    let s3 = lab.result("n", "n-a1", &n_digest, &lab.candidate("n-arm-1", &format!("{clean}// n arm 1\n")));
+    let (r1, r2, r3) = (lab.verify(&s1, "verify-1"), lab.verify(&s2, "verify-2"), lab.verify(&s3, "verify-3"));
+    assert_eq!(lab.telemetry(&["quality", "groups", "select", &n, "--none", "--reason", "none_acceptable"])["selection"]["outcome"], json!("no_selection"));
+
+    lab.git(&["branch", "integration", &lab.base]);
+    lab.ok(&["result", "demo", "configure-integration", "--repository", lab.repo.to_str().unwrap(), "--reference", "refs/heads/integration"]);
+    let head = herdr_projects::runtime::snapshot(&lab.project).unwrap().head.to_string();
+    assert_eq!(lab.ok(&["result", "demo", "auto", "--integrate", "on", "--expected-head", &head])["integrate"], json!(true));
+    let sorted = |mut v: Vec<String>| { v.sort(); v };
+    let pending = || sorted(lab.db().prepare("SELECT submission_id FROM pending_integration_work").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap());
+    let jobs = || lab.db().prepare("SELECT json_extract(payload,'$.submission_id') FROM operations WHERE kind='integration.run'").unwrap()
+        .query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<String>, _>>().unwrap();
+    assert_eq!(pending(), sorted(vec![s1.clone(), s2.clone(), s3.clone()]), "every verified arm enters the pending projection");
+    let turn = herdr_projects::store::service_project_integration_jobs(&lab.project).unwrap();
+    assert_eq!((turn.enqueued, turn.pending), (0, false));
+    assert_eq!((jobs(), pending()), (vec![], vec![]), "no arm is eligible before its group's selection names it");
+
+    // The operator path reaches begin_integration, which refuses before any write.
+    let target = lab.git(&["rev-parse", "refs/heads/integration"]);
+    let count = |sql: &str| lab.db().query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+    let integrate = |result: &str, key: &str| {
+        let work = lab.home.path().join(key);
+        (lab.hp(&["result", "demo", "integrate", result, "--repository", lab.repo.to_str().unwrap(), "--idempotency-key", key, "--work-dir", work.to_str().unwrap()]), work)
+    };
+    let refused = |result: &str, key: &str| {
+        let (out, work) = integrate(result, key);
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("a candidate-group arm integrates only as its group's selection"), "{stderr}");
+        assert!(!work.exists());
+    };
+    refused(&r1, "integrate-1-early");
+    assert_eq!(lab.git(&["rev-parse", "refs/heads/integration"]), target);
+    assert_eq!((count("SELECT count(*) FROM integration_operations"), count("SELECT count(*) FROM operations WHERE kind='integration.lease'")), (0, 0));
+    let show = |group: &str| lab.telemetry(&["quality", "groups", "show"])["groups"].as_array().unwrap().iter().find(|x| x["group_id"] == group).unwrap().clone();
+    let hold = json!({"enforced": true, "integrated_without_selection": []});
+    assert_eq!((&show(&g)["status"], &show(&g)["integration_hold"]), (&json!("open"), &hold));
+
+    // Selection lifts the winner's hold and queues it in the same transaction.
+    let selection = lab.telemetry(&["quality", "groups", "select", &g, "--rule"])["selection"].clone();
+    assert_eq!((&selection["arm"], &selection["submission_id"], &selection["reason"]), (&json!(1), &json!(s1), &json!("first_passing_verification")));
+    assert_eq!(pending(), vec![s1.clone()]);
+    let turn = herdr_projects::store::service_project_integration_jobs(&lab.project).unwrap();
+    assert_eq!((turn.enqueued, turn.pending), (1, false));
+    assert_eq!((jobs(), pending()), (vec![s1.clone()], vec![]));
+    assert_eq!(herdr_projects::store::service_project_integration_jobs(&lab.project).unwrap().enqueued, 0, "the loser is never re-added");
+
+    // Losers never integrate: G's arm 2, and N's only arm (closed with no selection).
+    refused(&r2, "integrate-2");
+    refused(&r3, "integrate-3");
+    assert_eq!((count("SELECT count(*) FROM integration_operations"), lab.git(&["rev-parse", "refs/heads/integration"])), (0, target.clone()));
+    // The winner passes begin_integration and lands on the target.
+    let (out, _) = integrate(&r1, "integrate-1");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let integrated: Vec<String> = lab.db().prepare("SELECT o.verified_result_id FROM integrated_commits i JOIN integration_operations o ON o.operation_id=i.operation_id").unwrap()
+        .query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+    assert_eq!(integrated, vec![r1.clone()]);
+    let tip = lab.git(&["rev-parse", "refs/heads/integration"]);
+    assert_ne!(tip, target);
+    lab.git(&["merge-base", "--is-ancestor", &g1_oid, &tip]);
+    assert_eq!((&show(&g)["status"], &show(&g)["integration_hold"]), (&json!("closed"), &hold));
+    assert_eq!(show(&n)["integration_hold"], hold);
+}
+
+/// D6 follow-up and the group hold on the dependency path. Dependents `bx`,
+/// `bc`, `bg`, `bh` are queued on the `verified_result` of seeded candidate X
+/// (task `x`), clean control C (`c`), and groups G (task `g`) and H (task
+/// `h`), each with arms 1 `codex` and 2 `fast`, before any verification. All
+/// six submissions pass verification. `bc` then counts (only
+/// `admission_disabled:verified_result`); `bx` never does, though its
+/// satisfaction row names X's verified result. Neither group has a selection,
+/// so `bg` and `bh` stay blocked although each edge records its latest
+/// attempt's (arm 2's) result. The rule selects G's arm 1: arm 2 lost, so `bg`
+/// stays blocked (and arm 1 is not the latest attempt). The operator selects
+/// H's arm 2: `bh` counts.
+#[test]
+fn seeded_or_unselected_result_never_releases_dependents() {
+    let lab = IntegrationLab::new();
+    let (codex, fast) = lab.arm_profiles();
+    let seed = seed_fixture("logic-inverted-guard");
+    let clean = seed_set()["clean"].as_str().unwrap().to_owned();
+    let x = lab.submit("x", &lab.candidate("seeded", seed["seeded"].as_str().unwrap()));
+    let c = lab.submit("c", &lab.candidate("clean", &clean));
+    lab.telemetry(&["review", "seeds", "register", &x, "--seed", &format!("logic={}", reproducer_ref(&seed))]);
+    lab.telemetry(&["review", "seeds", "register", &c, "--control"]);
+    let mut arms = std::collections::BTreeMap::new();
+    for task in ["g", "h"] {
+        let digest = lab.contract(task);
+        let group = lab.telemetry(&["quality", "groups", "create", task, "--arm", "codex", "--arm", "fast"])["group"]["group_id"].as_str().unwrap().to_owned();
+        for (arm, configuration) in [(1, &codex), (2, &fast)] {
+            let attempt = format!("{task}-a{arm}");
+            lab.attempt(task, &attempt, Some((&group, arm, configuration)));
+            let submission = lab.result(task, &attempt, &digest, &lab.candidate(&attempt, &format!("{clean}// {attempt}\n")));
+            arms.insert((task, arm), submission);
+        }
+        arms.insert((task, 0), group);
+    }
+    for (consumer, predecessor) in [("bx", "x"), ("bc", "c"), ("bg", "g"), ("bh", "h")] { lab.queue_dependent(consumer, predecessor); }
+    let missing = |p: &str| vec![format!("verified_dependency_evidence_unavailable:{p}:verified_result")];
+    let counts = vec!["admission_disabled:verified_result".to_owned()];
+    for (consumer, predecessor) in [("bx", "x"), ("bc", "c"), ("bg", "g"), ("bh", "h")] { assert_eq!(lab.blockers(consumer), missing(predecessor), "{consumer}"); }
+
+    let x_result = lab.verify(&x, "verify-x");
+    lab.verify(&c, "verify-c");
+    let mut results = std::collections::BTreeMap::new();
+    for key in [("g", 1), ("g", 2), ("h", 1), ("h", 2)] { results.insert(key, lab.verify(&arms[&key], &format!("verify-{}-{}", key.0, key.1))); }
+    let edge = |consumer: &str| lab.db().query_row("SELECT evidence_id FROM dependency_satisfactions WHERE task_id=?1 AND state='valid'", [consumer], |r| r.get::<_, String>(0)).unwrap();
+    assert_eq!(lab.blockers("bc"), counts, "the clean control's verified result releases its dependent");
+    assert_eq!(edge("bx"), x_result, "the seeded result is recorded on the edge");
+    assert_eq!(lab.blockers("bx"), missing("x"), "a seeded candidate never releases a dependent");
+    assert_eq!((edge("bg"), edge("bh")), (results[&("g", 2)].clone(), results[&("h", 2)].clone()), "each edge records its latest attempt's result");
+    assert_eq!((lab.blockers("bg"), lab.blockers("bh")), (missing("g"), missing("h")), "no arm releases before its group's selection");
+
+    let g = lab.telemetry(&["quality", "groups", "select", &arms[&("g", 0)], "--rule"])["selection"].clone();
+    assert_eq!((&g["arm"], &g["submission_id"]), (&json!(1), &json!(arms[&("g", 1)])));
+    assert_eq!(lab.blockers("bg"), missing("g"), "the losing arm 2 never releases");
+    let h = lab.telemetry(&["quality", "groups", "select", &arms[&("h", 0)], "--arm", "2", "--reason", "operator_judgment"])["selection"].clone();
+    assert_eq!((&h["arm"], &h["submission_id"]), (&json!(2), &json!(arms[&("h", 2)])));
+    assert_eq!(lab.blockers("bh"), counts, "the selected arm releases its group's dependent");
+    assert_eq!((lab.blockers("bx"), lab.blockers("bc")), (missing("x"), counts.clone()));
 }
 
 /// Doc 10 §5 seeded-review fixture. Seeded candidates S1–S4 (starter seeds

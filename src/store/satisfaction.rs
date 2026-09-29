@@ -346,6 +346,11 @@ fn verified_counts(db: &Connection, task_id: &str, predecessor: &str,budget:Opti
     }
     let result: Option<String> = db.query_row("SELECT evidence_id FROM dependency_satisfactions WHERE task_id=?1 AND predecessor_task=?2 AND requirement='verified_result' AND state='valid'", params![task_id, predecessor], |r| r.get(0)).optional()?;
     let Some(result) = result else { return Ok(false) };
+    // A seeded candidate (contracts-review.md §8) or a candidate-group arm that
+    // is not its group's selection (contracts-quality.md §3) never releases a
+    // dependent. Checked here, where every release reads the edge, so a row
+    // recorded before registration or selection stays held until it counts.
+    if super::seeded_defects::seeded_result(db, &result)? || super::candidate_groups::held_result(db, &result)? { return Ok(false); }
     if !super::contract_binding::policy_matches_with_budget(db, task_id, predecessor, "verified_result", &result,budget)? { return Ok(false); }
     if !super::contract_binding::verified_result_barrier_current(db, &result, budget)? { return Ok(false); }
     db.query_row(

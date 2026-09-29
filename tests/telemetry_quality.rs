@@ -368,7 +368,7 @@ fn group_arms_fixed_before_outcomes_and_losers_keep_cost() {
     assert_eq!((&arms[0]["usage"], &arms[1]["usage"], &arms[2]["usage"]), (&a1_usage, &a2_usage, &json!(null)), "each arm keeps its own attempt's cost");
     assert_eq!(shown["cost"], json!({"arms_launched": 2, "arms_not_launched": 1, "winner_usage": a2_usage,
         "arms_total": {"input_tokens": 2500, "cached_input_tokens": 900, "cache_write_input_tokens": 0, "output_tokens": 300, "reasoning_output_tokens": 180, "total_tokens": 2800, "records": 3}}));
-    assert_eq!(shown["integration_hold"], json!({"enforced": false, "integrated_without_selection": []}));
+    assert_eq!(shown["integration_hold"], json!({"enforced": true, "integrated_without_selection": []}));
     // Selection moved no cost and changed no outcome: the loser's usage and every attempt record are as before.
     assert_eq!(usage(&a1), a1_usage);
     assert_eq!(arms[0]["verification"], before["groups"][0]["arms"][0]["verification"]);

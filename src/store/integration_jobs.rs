@@ -50,9 +50,10 @@ impl SqliteStore {
     /// Eligible: every acceptance policy of the submission has an accepted run
     /// with a fresh (version 2) contract check, the contract routes to
     /// integration, its repository has a configured target, and nothing has
-    /// integrated the submission yet. At most `TURN_LIMIT` new jobs per turn and
-    /// at most one unfinished job or integration per (repository, ref),
-    /// checked in this same transaction.
+    /// integrated the submission yet; never a seeded candidate, and a
+    /// candidate-group arm only as its group's selection (`HELD_ARM`). At most
+    /// `TURN_LIMIT` new jobs per turn and at most one unfinished job or
+    /// integration per (repository, ref), checked in this same transaction.
     pub(crate) fn service_integration_jobs(&mut self, budget: &read_budget::ReadBudget) -> Result<IntegrationJobTurn> {
         budget.check()?;
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;check_schema(&tx)?;
@@ -71,7 +72,8 @@ impl SqliteStore {
             ids
         };
         let more = stale || ids.len() > SCAN_LIMIT;
-        let eligible = if super::seeded_defects::registry_present(&tx)? { format!("{ELIGIBLE}{NOT_SEEDED}") } else { ELIGIBLE.to_owned() };
+        let mut eligible = if super::seeded_defects::registry_present(&tx)? { format!("{ELIGIBLE}{NOT_SEEDED}") } else { ELIGIBLE.to_owned() };
+        if super::candidate_groups::groups_present(&tx)? { eligible = format!("{eligible} AND NOT {}", super::candidate_groups::HELD_ARM); }
         let mut enqueued = 0;
         for submission_id in ids.iter().take(SCAN_LIMIT) {
             if enqueued == TURN_LIMIT { break; }

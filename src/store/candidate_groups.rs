@@ -2,7 +2,8 @@
 //! Sequential arms only: an arm is an ordinary attempt of the group's task,
 //! reserved through the existing launch path and bound to its arm inside that
 //! reservation transaction. Nothing here launches, verifies, integrates or
-//! stores cost; every row is append-only.
+//! stores cost; every row is append-only. An arm is held from integration and
+//! from releasing dependents until it is its group's selection ([`HELD_ARM`]).
 use super::*;
 use crate::domain::agent_configuration;
 use serde::Serialize;
@@ -50,6 +51,32 @@ pub struct CandidateSelection {
 pub enum SelectionChoice { Arm { arm: u32, submission: Option<String>, runner_up: Vec<u32> }, NoSelection }
 
 fn invalid(message: String) -> StoreError { StoreError::Invalid(message) }
+
+/// Integration and dependency hold (contracts-quality.md §3), over a
+/// `result_submissions s` row: its attempt is bound to an arm of a (sealed)
+/// candidate group and it is not that group's selected submission. Holds
+/// every arm while the group has no selection, forever after `no_selection`,
+/// and every loser (and any other submission of the winning arm) after one.
+pub(super) const HELD_ARM: &str = "EXISTS(SELECT 1 FROM candidate_arm_attempts b WHERE b.attempt_id=s.attempt_id
+    AND NOT EXISTS(SELECT 1 FROM candidate_selections x WHERE x.group_id=b.group_id AND x.submission_id=s.submission_id))";
+
+/// Whether the candidate-group tables (migration 0053) exist.
+pub(super) fn groups_present(tx: &Connection) -> Result<bool> {
+    Ok(tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='candidate_arm_attempts')", [], |r| r.get(0))?)
+}
+
+/// Whether verified result `result_id` belongs to a [`HELD_ARM`] submission.
+pub(super) fn held_result(tx: &Connection, result_id: &str) -> Result<bool> {
+    if !groups_present(tx)? { return Ok(false); }
+    Ok(tx.query_row(&format!("SELECT EXISTS(SELECT 1 FROM verified_results r JOIN result_submissions s ON s.submission_id=r.submission_id WHERE r.result_id=?1 AND {HELD_ARM})"),
+        [result_id], |r| r.get(0))?)
+}
+
+/// Refuse to begin integrating a verified result of a held arm.
+pub(super) fn refuse_held_integration(tx: &Connection, result_id: &str) -> Result<()> {
+    if held_result(tx, result_id)? { return Err(invalid("a candidate-group arm integrates only as its group's selection".into())); }
+    Ok(())
+}
 
 fn schema_53(tx: &Connection) -> Result<()> {
     check_schema(tx)?;
@@ -214,6 +241,12 @@ fn insert_selection(tx: rusqlite::Transaction<'_>, d: Decision<'_>) -> Result<Ca
     let outcome = if arm.is_some() { "selected" } else { "no_selection" };
     tx.execute("INSERT INTO candidate_selections(group_id,outcome,arm,attempt_id,submission_id,selector_kind,selector_principal,reason,evidence,selected_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
         params![d.group, outcome, arm, attempt, submission, d.kind, d.principal, d.reason, evidence.to_string(), d.now])?;
+    // The winner is no longer held: queue it for automatic integration if it
+    // is verified and not yet integrating (the producer rechecks eligibility).
+    tx.execute("INSERT OR IGNORE INTO pending_integration_work SELECT s.submission_id,s.created_unix_ms FROM result_submissions s WHERE s.submission_id=?1
+        AND EXISTS(SELECT 1 FROM verified_results r WHERE r.submission_id=s.submission_id)
+        AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.kind='integration.run' AND json_extract(o.payload,'$.submission_id')=s.submission_id)
+        AND NOT EXISTS(SELECT 1 FROM verified_results r JOIN integration_operations i ON i.verified_result_id=r.result_id WHERE r.submission_id=s.submission_id)", [&submission])?;
     tx.commit()?;
     Ok(CandidateSelection { group_id: d.group.to_owned(), outcome: outcome.into(), arm, attempt_id: attempt, submission_id: submission, selector_kind: d.kind.into(),
         selector_principal: d.principal.to_owned(), reason: d.reason.to_owned(), evidence, selected_unix_ms: d.now })
@@ -261,7 +294,9 @@ impl SqliteStore {
 
     /// Record the group's one selection. A selected arm must be bound and have
     /// a candidate (a submission of its attempt). Selection is not
-    /// verification: it verifies, integrates and reassigns nothing.
+    /// verification: it verifies, integrates and reassigns nothing; it only
+    /// lifts the winner's hold and queues a verified winner for automatic
+    /// integration in the same transaction (every selector, `insert_selection`).
     pub fn select_candidate(&mut self, group: &str, choice: &SelectionChoice, reason: &str, principal: &str, now: i64) -> Result<CandidateSelection> {
         if principal.is_empty() || principal.len() > 128 { return Err(invalid("invalid selector principal".into())); }
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;

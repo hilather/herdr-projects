@@ -665,6 +665,15 @@ seeded candidate never integrates`), and triggers refuse any
 only removes eligibility; nothing else about integration changes. Clean
 controls are not guarded (plan doc 06 §6a guards seeded candidates only).
 
+**Dependency guard.** A seeded candidate's verified result never satisfies
+a dependent task's `verified_result` edge: `satisfaction.rs`
+`verified_counts`, the one check every release reads (`scheduler inspect`
+blockers, reservation dependency evidence, dependency waits), returns
+false for it (`seeded_defects::seeded_result`). The satisfaction row may
+still be recorded when the result is verified, including before
+registration; it never counts. `integrated_commit` edges need an
+integration, which the integration guard already refuses.
+
 **Blindness.** Reviewers never see seed state: `review present` reads no
 registry table and refuses to print any field outside its twelve blind
 fields; `review show` and blind assignment carry no seed state either.
@@ -712,7 +721,5 @@ source. Tests inject seeds only into disposable repositories they create;
 no tool here modifies a real project repository.
 
 Not built: excluding seed-linked findings from M21/M22 discovery and
-validation rates; guarding a seeded verified result from satisfying a
-dependent task's `verified_result` requirement (integration is guarded,
-dependency satisfaction is not); injection tooling for replay-suite tasks
-(TM4.6); a reviewer brief builder (§3).
+validation rates; injection tooling for replay-suite tasks (TM4.6); a
+reviewer brief builder (§3).
