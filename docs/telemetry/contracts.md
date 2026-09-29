@@ -275,15 +275,24 @@ retaining any field. Read only complete lines (ending `\n`); a partial last
 line is left for the next pass and the file offset is not advanced past it.
 
 **Allowlisted fields.** `session_meta`: `id`, `timestamp`, `cwd`,
-`cli_version`, `originator`, `source`. `turn_context`: `turn_id`, `model`,
+`cli_version`, `originator`, `source`, `model_provider`, `forked_from_id`,
+and from `source.subagent` its variant and, for `thread_spawn`,
+`parent_thread_id` and `depth` (A4). `turn_context`: `turn_id`, `model`,
 `effort`. `token_usage_record`: `session_id`, `turn_id`, `response_id`,
 `usage.{input_tokens, cached_input_tokens, cache_write_input_tokens,
 output_tokens, reasoning_output_tokens, total_tokens}`, final
-`thread_token_usage` (for reconciliation only). `token_count`:
+`thread_token_usage` (for reconciliation only), and the line `timestamp`
+(A4). `token_count`:
 `rate_limits.{limit_id, primary.{used_percent, window_minutes, resets_at},
-plan_type}` and `info.total_token_usage` (discrepancy only). `task_complete`:
+secondary.{used_percent, window_minutes, resets_at}, rate_limit_reached_type,
+plan_type}` (secondary and reached type: A4) and `info.total_token_usage` (discrepancy only). `task_complete`:
 `turn_id`, `duration_ms`, `time_to_first_token_ms`. Never:
 `last_agent_message`, instructions, messages, tool calls/outputs, reasoning.
+A4 metadata (sidecar stream `ingest` 0004: `rollout_metadata`,
+`codex_usage_times`, `codex_rate_limit_windows`) is read leniently: a value of
+another type is stored as `NULL` and never makes its record malformed. It is
+outside `payload_digest`; the first stored value stays. All A4 fields are
+certified `fixture` until a live run (contracts-collection.md A4).
 
 **Usage record** (`codex_usage`): key `(session_id, ordinal)` where
 `session_id` = `session_meta.id` and `ordinal` = 1-based position of the
@@ -442,7 +451,8 @@ S6 refinements:
 
 ## 7. Privacy allowlist and excerpts
 
-Default: metadata only (IDs, digests, enums, counters, timestamps, durations).
+Default: metadata only (IDs, digests, enums, counters, timestamps, durations,
+provider and parent-session identifiers).
 Allowed free text is limited to **excerpts** of: verification/integration
 `reason` (≤128 already), operator dispatch `note`, finding titles when that
 producer exists. Excerpt rule, applied before any write or display:

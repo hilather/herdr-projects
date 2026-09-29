@@ -212,7 +212,7 @@ session's record count tells them apart.
 
 ### A4 proposed contracts.md §5/§7 revision
 
-**Status: proposed by lane A, awaiting steward review.** `contracts.md` is a
+**Status: reviewed and applied to contracts.md §5/§7 by the steward (tool/exec metadata still held).** `contracts.md` is a
 steward file, so the revision is written here; the implementation below
 follows it and every new field is certified `fixture` until the planned small
 live run (owner decision 5). No field below is content: each is an
