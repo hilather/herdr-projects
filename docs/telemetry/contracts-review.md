@@ -1,10 +1,12 @@
 # Review capture contracts (lane D)
 
 Owned by lane D ([phase2-lanes.md](phase2-lanes.md)); common rules are
-[contracts.md](contracts.md) §0 and §7. Plan doc 06 §2 (TM3.1), doc 07 §5
-(M20–M24), doc 10 §5. Canonical migrations `0054_review_capture.sql` (schema
-54) and `0055_finding_triage.sql` (schema 55, §5); store API
-`src/store/review_capture.rs` and `src/store/finding_triage.rs`; CLI
+[contracts.md](contracts.md) §0 and §7. Plan doc 06 §2–§5 (TM3.1–TM3.3),
+doc 07 §5 (M20–M29), doc 10 §5. Canonical migrations
+`0054_review_capture.sql` (schema 54), `0055_finding_triage.sql` (schema 55,
+§5) and `0056_fix_attribution.sql` (schema 56, §6); store API
+`src/store/review_capture.rs`, `src/store/finding_triage.rs` and
+`src/store/fix_attribution.rs`; CLI
 `telemetry <slug> review ...` (`src/telemetry/review/`). Sidecar stream
 `review` has no tables yet. Nothing about reviews comes from the Codex
 adapter (contracts-collection.md A3).
@@ -129,10 +131,12 @@ never 0.
 - **M22 proposal validation rate** and **M23 duplicate-report share**
   (`M22.v1`, `M23.v1`, `basis: owner_triage`, `trust: operator_owner.v1`):
   §5.
-- **M21** (sum of discovery credit) and **M24** (M21 per review cost) are
-  `unavailable: discovery_credit_unallocated`: no role-specific credit
-  allocation (TM3.3) or review lifecycle cost exists. M21 carries a labeled
-  `drilldown.validated_unique_findings` count, never as its value.
+- **M21** (sum of discovery credit), **M25**–**M27** and **M29**: §6.
+  **M24** (M21 per review cost) is `unavailable: review_cost_unallocated`:
+  review lifecycle cost (reviewer sessions, zero-find and failed reviews,
+  triage) is not allocated to review opportunities, the accounting lane's
+  per-attempt estimates are published-rate estimates from fixture rate cards,
+  and non-Codex reviewers have no collector, so no honest cost of `Q` exists.
 
 Also in `telemetry <slug> report` and the fleet pane through the lane metrics
 hook.
@@ -226,8 +230,180 @@ empty denominator is `null` with `empty_denominator`, and a store before
 0055 gives `unavailable: finding_triage_absent`. Merge, unmerge, split and
 restore recompute the buckets without changing the number of submissions.
 
-Not built: finding occurrences on later artifacts and reopen lineage (TM3.3),
-discovery or other role credit (M21/M24), conflict records between
+0056 extends this ledger's ordering (§6): `fix_log` rows take the next
+`seq` of the same sequence, so `--expect-seq`, `--as-of` and `head_seq` of
+`findings show` refer to the one ledger head, and `history` here still lists
+only `finding_log` rows.
+
+Not built here: conflict records between
 submissions, imports of third-party review comments (any such producer can
 only write submissions), and a scoped reviewer-authority grant that would let
 a principal other than the owner triage.
+
+## 6. Fix attribution, regressions and role credit (TM3.3, card D3)
+
+Canonical migration `0056_fix_attribution.sql` (schema 56); store API
+`src/store/fix_attribution.rs` (`fix_state`); CLI `telemetry <slug> review
+fixes show|open|bind|propose|verify|integrate|close|reopen|introduce|credit|retract`.
+
+**One ordering.** `fix_log(seq, kind, principal, authority, expected_seq,
+recorded_unix_ms)` shares its sequence with `finding_log` (§5): every new row
+of either ledger takes `head + 1`, where the head is the larger of the two,
+and a trigger on each refuses a row that does not follow the other's head.
+`fix_state(db, as_of)` / `fixes show [--as-of SEQ]` replays both ledgers to
+one watermark, so a triage correction and an attribution decision are
+ordered, and every earlier view is reproduced exactly (reads are contracts
+§0 reads). Every table is append-only (every UPDATE/DELETE aborts).
+
+**Authority.** As §5: every `fix_log` row is `operator:cli` with
+`operator_owner.v1` (CHECKs), and `SqliteStore` refuses workers (`worker:*`
+or any attempt's identity), imports (`import:*`) and any other principal
+before writing. Each detail row needs its own `fix_log` row of the matching
+kind (triggers).
+
+**Records** (each row's `seq` is its `fix_log` row):
+
+- **Repair opportunity** `repair_opportunities(seq, finding_id, assignment,
+  configuration_id, profile_digest, policy, horizon_ms)`, `open <finding>
+  (--assign PROFILE | --unassigned) [--horizon-days N]` (default 14). The
+  finding must be a validated group root (§5) that is not currently resolved,
+  with no other open opportunity. The initial assignment group (a retained
+  profile's contracts §2 configuration, or explicitly `unassigned`, policy
+  `repair_assignment.v1`) and horizon are frozen before any repair runs.
+- **Attempt binding** `repair_attempts(seq, repair_seq, attempt_id UNIQUE,
+  ordinal, configuration_id)`, `bind <repair> --attempt A`: only before the
+  attempt's outcome is known (store: the attempt is not `completed`,
+  `failed`, `cancelled` or `lost`; store and trigger: it has no
+  `result_submissions` row) and only into an open opportunity. Ordinal 1 is
+  the initial attempt; later ones are reassignments (`reassignment: true`),
+  provenance only: the opportunity never leaves its initial group. The
+  configuration is the attempt's dispatch decision (null if it predates it).
+  Binding at launch would need launch/scheduler changes and is not built;
+  it is recorded explicitly.
+- **Fix proposal** `fix_proposals(seq, repair_seq, submission_id UNIQUE,
+  attempt_id, candidate_oid)`, `propose <repair> --submission S`: a result
+  submission of an attempt bound to that opportunity, at its exact candidate
+  (trigger).
+- **Verified fix** `fix_verifications(seq, proposal_seq UNIQUE, run_id,
+  result_id, commit_oid, assurance, evidence_refs)`, `verify <proposal>
+  --run R --assurance regression_reproduced|approved_alternative --evidence
+  ...`: the owner's decision that an accepted native `verification_runs` row
+  **of the proposal's own submission at its candidate commit**, with its
+  `verified_results` row, repairs the finding (≥1 evidence reference, §1
+  forms). A run of another submission or commit, a rejected run, or a run
+  without a verified result refuses (store and trigger): passing checks on
+  one commit never verifies another, and worker claims are never evidence.
+- **Integration** `fix_integrations(seq, proposal_seq UNIQUE,
+  verification_seq, integrated_id UNIQUE, commit_oid, integrated_unix_ms)`,
+  `integrate <proposal> --integrated ID`: only a verified proposal, and only
+  an `integrated_commits` row whose operation integrated a verified result of
+  the same submission and candidate and whose integration candidate's
+  `parent_verified` is that candidate (store and trigger). A fix verified
+  only on its branch is not integrated.
+- **Closure** `repair_closures(seq, repair_seq UNIQUE, outcome)`: `fixed`
+  (needs a verified fix), `no_fix` or `cancelled` (need none). A closed
+  opportunity takes no more attempts, proposals or verifications, and stays
+  in its cohort.
+- **Reopening** `fix_reopenings(seq, finding_id, integration_seq, reason,
+  observed_oid, evidence_refs)`, `reopen <finding> --reason
+  regression|reverted --observed OID --evidence ...`: an accepted occurrence
+  at an exact revision (the defect remains or returned, or the revert
+  commit) of a currently resolved finding. It ends the current resolution
+  (`ended_by: reopened`) and deletes nothing: the fix's proposal,
+  verification and integration stay. C2's proxy revert observation
+  (contracts-quality.md §2) is never read by this path; the owner may cite
+  it as evidence. A new repair cycle is a new opportunity.
+- **Introduction** `introduction_decisions(seq, finding_id, status, method,
+  introducing_oid, evidence_refs)` + `credit_shares`, `introduce <finding>
+  (--commit OID --method M [--contributor ATTEMPT=N/D]... |
+  --unattributable) --evidence ...`. Without a decision a finding is
+  `unattributed` (unknown, never exoneration). `method` is
+  `controlled_reproducer`, `reliable_bisect` or `minimized_patch`; `blame`,
+  `last_editor`, `temporal_proximity` and `fixer` are refused as inference. A
+  contributor must be an attempt with a result submission at exactly the
+  introducing commit, and never through its own fix proposal for this
+  finding: the fixer is not charged with introducing what it repaired.
+  `detection_oid` (shown) is the candidate the discovering review examined.
+- **Credit allocation** `credit_allocations(seq, finding_id, role,
+  proposal_seq, policy, evidence_refs)` + `credit_shares(seq, attempt_id,
+  share_num, share_den)`, `credit <finding> --role discovery|implementation
+  [--proposal P] --share ATTEMPT=N/D ... --evidence ...` (policy
+  `owner_allocation.v1`). Shares are exact fractions with denominators 1–16;
+  one allocation sums to at most 1 (store exactly; trigger exactly in units
+  of 1/720720); the remainder stays unallocated. Discovery contributors are
+  reporters of the finding's validated or duplicate claims; implementation
+  contributors are attempts bound to the verified fix's opportunity. The
+  latest unretracted allocation of a (finding, role, proposal) applies.
+- **Retraction** `fix_retractions(seq, reverses UNIQUE)`, `retract <seq>`:
+  reverses one credit allocation, reopening or introduction decision recorded
+  in error (not a reopening followed by a later integration of the finding).
+
+**Derived state** (`fixes show`), per canonical finding at the watermark:
+`status` (§5), `remediation` (`resolved`, `fix_verified`, `fix_proposed`,
+`reopened`, `repair_open`, `unrepaired`; the fix states count only after the
+last reopening), `verified` and `integrated` (ever: historical),
+`currently_resolved`, `resolutions` (one interval per integration, ended by
+`reopened` or `superseded` by a later integrated fix), `reopenings` (with
+`retracted_seq`), `repairs`. Per repair: assignment, attempts,
+proposals with verification and integration, `closure` and `outcome`
+(`currently_resolved`, `integrated`, `verified`, `proposed`,
+`no_candidate`). Fixes stay with the finding they were recorded on: a merge
+or unmerge never copies a fix onto another finding.
+
+**Role credit** (validated roots only; merged and unvalidated findings have
+none). Each role is `{policy, source_seq, shares[{contributor, attempt_id,
+configuration_id, share}], allocated, unallocated, unallocated_reason}`,
+contributors `attempt:<id>`, `principal:<name>` or `service:<name>`; one
+role of one finding never exceeds 1.
+
+- discovery: `earliest_validated.v1` (§5's discovery claim's reporter, 1)
+  unless the owner allocated shares (reason for a remainder
+  `shared_discovery_unallocated`).
+- validation: `triage_decision.v1`, the validating decision's principal.
+- implementation, of the fix resolving the finding now, else its latest
+  verified fix: `sole_attempt.v1` gives 1 to the submitting attempt only when
+  it is the only attempt bound before the proposal; otherwise nothing is
+  allocated (`mixed_contribution_unallocated`) until the owner allocates.
+- verification `service:native_verifier` (`native_verifier.v1`) and
+  integration `service:integrator` (`integrator.v1`): services, never the
+  implementer's model.
+- introduction: as above; `unattributed` or `unattributable` leave 1
+  unallocated.
+
+**Metrics** (`review report [--since MS] [--horizon-days N]`, `telemetry
+<slug> report`; `basis: owner_attribution`, `trust: operator_owner.v1`;
+store before 0056: `unavailable: fix_attribution_absent`). `F` = validated
+unique findings, windowed by their discovery submission's arrival; exact
+credit sums are reduced fractions (`"3/2"`).
+
+- **M21** `M21.v1`: sum of discovery credit over `F` (`"0"` with no
+  finding), `unallocated`, `by_configuration` (reporter attempts' dispatch
+  configurations, `unknown` without one), `participation` (shares, never
+  counted as discoveries), `drilldown.validated_unique_findings`,
+  `observational: true`.
+- **M25** `M25.v1` verified-fix rate and **M26** `M26.v1` currently resolved
+  rate: `value` / `findings` are finding outcomes over `F` (ever verified;
+  currently resolved). `by_assignment` are the initial-assignment cohorts
+  `R_g` (repairs windowed by opening; group = frozen configuration or
+  `unassigned`): a repair is eligible once closed or past its horizon, else
+  `censored`; numerator: a verification (M25) or a current resolution
+  integrated (M26) recorded within the horizon. Failed, no-fix, cancelled and
+  reassigned repairs stay in their initial group (`not_achieved`,
+  `reassigned`); a configuration that only appears as a reassigned attempt's
+  gets `value: null` with `no_assigned_opportunities`. The two denominators
+  are never combined.
+- **M27** `M27.v1` reopen rate: integrations (windowed by integration)
+  reopened within the horizon (default 14 days) of `integrated_unix_ms` /
+  integrations reopened within it or observed for the whole horizon;
+  `censored` the rest.
+- **M29** `M29.v1` attribution coverage: allocated / eligible role credit per
+  role (`by_role`: eligible = findings of `F` with that role) and overall, as
+  exact reduced fractions.
+
+Doc 07 labels these observational: assignment is not randomized, and M21 is
+not model ability.
+
+Not built: binding repair attempts at launch (needs launch/scheduler
+changes); finding occurrences as a separate record beyond reopenings;
+mixed-model segment splits within one attempt; artifact-only publication
+contracts; M28 (TM3.4) and M24 (review cost).

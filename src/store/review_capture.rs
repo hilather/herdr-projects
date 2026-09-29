@@ -212,7 +212,7 @@ fn kind_family(kind: &str) -> Option<&'static str> {
 }
 
 /// The latest retained native profile named `name`, as `(profile_digest, profile)`.
-fn retained_profile(tx: &Connection, name: &str) -> Result<(String, FrozenProfile)> {
+pub(super) fn retained_profile(tx: &Connection, name: &str) -> Result<(String, FrozenProfile)> {
     let mut stmt = tx.prepare("SELECT profile_digest,report,report_digest FROM native_profiles ORDER BY sequence DESC LIMIT 256")?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {

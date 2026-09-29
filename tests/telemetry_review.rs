@@ -8,7 +8,7 @@
 
 mod support;
 
-use herdr_projects::{domain::agent_configuration, store::{FindingTarget, SqliteStore, TriageOutcome, TriageRequest}};
+use herdr_projects::{domain::agent_configuration, store::{FindingTarget, RepairAssignment, SqliteStore, TriageOutcome, TriageRequest}};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -61,7 +61,10 @@ fn empty_review_counts_and_wrong_candidate_receipt_fails() {
     let empty = f.cli_args(&["review", "report"]).0["metrics"].clone();
     assert_eq!((&empty["M20"]["value"], &empty["M20"]["reason"], &empty["M20"]["denominator"]), (&json!(null), &json!("empty_denominator"), &json!(0)));
     for id in ["M22", "M23"] { assert_eq!((&empty[id]["value"], &empty[id]["reason"], &empty[id]["pending"]), (&json!(null), &json!("empty_denominator"), &json!(0)), "{id}"); }
-    for id in ["M21", "M24"] { assert_eq!(empty[id]["value"], unavailable("discovery_credit_unallocated"), "{id}"); }
+    // No validated finding: discovery credit is an observed 0; review cost is not allocated.
+    assert_eq!((&empty["M21"]["value"], &empty["M21"]["unallocated"]), (&json!("0"), &json!("0")));
+    assert_eq!(empty["M24"]["value"], unavailable("review_cost_unallocated"));
+    for id in ["M25", "M26", "M27", "M29"] { assert_eq!((&empty[id]["value"], &empty[id]["reason"]), (&json!(null), &json!("empty_denominator")), "{id}"); }
 
     // O1 binds S1's exact task, contract revision and candidate.
     let o1 = f.cli_args(&["review", "open", &s1, "--kind", "code", "--protocol", "review-protocol.v1", "--prior-finding", "finding:known-1"]).0["opportunity"].clone();
@@ -285,7 +288,9 @@ fn duplicate_titles_one_finding_split_claims_no_inflation() {
     assert_eq!((&metrics["M22"]["numerator"], &metrics["M22"]["denominator"], &metrics["M22"]["value"], &metrics["M22"]["basis"]), (&json!(2), &json!(3), &json!("2/3"), &json!("owner_triage")));
     assert_eq!((&metrics["M23"]["value"], &metrics["M23"]["pending"]), (&json!("1/3"), &json!(0)));
     assert_eq!(metrics["M22"]["buckets"], json!({"validated_only": 1, "rejected_only": 0, "duplicate_only": 1, "mixed": 1}));
-    assert_eq!((&metrics["M21"]["value"], &metrics["M21"]["drilldown"]), (&unavailable("discovery_credit_unallocated"), &json!({"validated_unique_findings": 3})));
+    // Discovery credit: one per unique finding, to its earliest validated reporter (none has a dispatch decision).
+    assert_eq!((&metrics["M21"]["value"], &metrics["M21"]["drilldown"], &metrics["M21"]["by_configuration"], &metrics["M21"]["participation"]),
+        (&json!("3"), &json!({"validated_unique_findings": 3}), &json!({"unknown": "3"}), &json!(3)));
     assert_eq!(metrics["M20"]["value"], json!("3/3"));
     // The full report carries the same lane metrics.
     assert_eq!(f.report()["metrics"]["M23"]["value"], json!("1/3"));
@@ -400,4 +405,332 @@ fn triage_replay_as_of_and_worker_cannot_validate() {
     assert!(head["history"].as_array().unwrap()[3..].iter().all(|e| e["principal"] == "operator:cli" && e["authority"] == "operator_owner.v1"));
     assert!(head["history"].as_array().unwrap()[..3].iter().all(|e| e["authority"] == "proposal"));
     assert!(f.cli_fail(&["review", "findings", "show", "--as-of", "14"]).contains("outside the finding history"));
+}
+
+/// The factory side of repairs, planted as the launch, result, verification
+/// and integration producers would write them.
+struct Factory(rusqlite::Connection);
+
+impl Factory {
+    fn open(f: &Fixture) -> Self {
+        let db = rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap();
+        db.execute_batch("INSERT OR IGNORE INTO acceptance_policies(task_id,contract_revision,policy_id,body) VALUES('work',1,'ci','cargo test');
+            INSERT OR IGNORE INTO integration_targets(repository,ref_name,created_unix_ms) VALUES('/repo','refs/heads/main',1);
+            INSERT OR IGNORE INTO integration_target_leases(repository,ref_name,operation_id,generation) VALUES('/repo','refs/heads/main',NULL,0);").unwrap();
+        Factory(db)
+    }
+    fn configuration(&self, profile: &herdr_projects::domain::FrozenProfile) -> String {
+        let c = agent_configuration(profile);
+        self.0.execute("INSERT OR IGNORE INTO agent_configurations VALUES(?1,?2,1)", rusqlite::params![c.id, c.canonical_json]).unwrap();
+        c.id
+    }
+    /// A launched attempt of `work` that has no result yet, and its dispatch decision.
+    fn attempt(&self, id: &str, configuration: &str) {
+        self.0.execute("INSERT INTO attempts(id,task_id,revision,state,reservation,termination_observed) VALUES(?1,'work',1,'running',?1,0)", [id]).unwrap();
+        self.decision(id, configuration);
+    }
+    fn decision(&self, attempt: &str, configuration: &str) {
+        self.0.execute("INSERT INTO dispatch_decisions(attempt_id,task_id,task_revision,contract_revision,chosen_configuration_id,eligible,chooser_kind,chooser_principal,reason_codes,decided_unix_ms)
+            VALUES(?1,'work',1,1,?2,'[\"x\"]','operator','operator:cli','[\"x\"]',1)", [attempt, configuration]).unwrap();
+    }
+    fn submission(&self, id: &str, attempt: &str, candidate: &str, at: i64) {
+        self.0.execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,artifact_manifest,claimed_checks,created_unix_ms)
+            VALUES(?1,'store',?1,?2,'{}','work',1,?2,?3,'/repo',?4,?5,'sha1','[]','[]',?6)", rusqlite::params![id, hex('d'), attempt, "b".repeat(40), candidate, at]).unwrap();
+    }
+    /// Verification run `run` of `submission` at `commit`; an accepted run also gets verified result `result`.
+    fn run(&self, run: &str, submission: &str, attempt: &str, commit: &str, result: Option<&str>) {
+        let accepted = result.is_some();
+        self.0.execute("INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,
+            commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms)
+            VALUES(?1,'store',?1,?2,?3,'work',1,?2,?4,'ci',?5,?6,?6,'sha1',0,'linux-unshare-user-pid-mount-v1','[\"x\"]','[]',?7,?8,?9,?10,1,1,7000)",
+            rusqlite::params![run, hex('d'), submission, attempt, hex('9'), commit, if accepted { "accepted" } else { "rejected" }, (!accepted).then_some("cargo test failed"),
+                if accepted { 0 } else { 101 }, accepted.then(|| hex('8'))]).unwrap();
+        if let Some(result) = result {
+            self.0.execute("INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms)
+                VALUES(?1,?2,?3,?4,?4,'sha1',?5,?6,'linux-unshare-user-pid-mount-v1',0,7000)", rusqlite::params![result, run, submission, commit, hex('9'), hex('8')]).unwrap();
+        }
+    }
+    /// Integration `id` of verified result `result` whose candidate merged `parent` as merge commit `commit`.
+    fn integration(&self, id: &str, result: &str, parent: &str, commit: &str, at: i64) {
+        self.0.execute("INSERT INTO operations(id,task_id,kind,target,payload_version,payload,payload_hash,expected_revision,due_unix_ms,idempotency_key)
+            VALUES(?1,'work','integration.run','refs/heads/main',1,'{}',?2,1,0,?1)", rusqlite::params![id, hex('d')]).unwrap();
+        self.0.execute("INSERT INTO integration_operations(operation_id,project_store,idempotency_key,payload_digest,repository,ref_name,expected_old_oid,verified_result_id,candidate_id,state,generation,object_format,checks_passed,reason,created_unix_ms)
+            VALUES(?1,'store',?1,?2,'/repo','refs/heads/main',?3,?4,?1,'integrated',1,'sha1',1,NULL,?5)", rusqlite::params![id, hex('d'), "b".repeat(40), result, at]).unwrap();
+        self.0.execute("INSERT INTO integration_candidates(candidate_id,operation_id,commit_oid,tree_oid,parent_base,parent_verified,strategy,object_format,state,created_unix_ms)
+            VALUES(?1,?1,?2,?2,?3,?4,'ort','sha1','published',?5)", rusqlite::params![id, commit, "b".repeat(40), parent, at]).unwrap();
+        self.0.execute("INSERT INTO integrated_commits(integrated_id,candidate_id,operation_id,repository,ref_name,commit_oid,tree_oid,expected_old_oid,object_format,created_unix_ms)
+            VALUES(?1,?1,?1,'/repo','refs/heads/main',?2,?2,?3,'sha1',?4)", rusqlite::params![id, commit, "b".repeat(40), at]).unwrap();
+    }
+}
+
+fn hex(c: char) -> String { c.to_string().repeat(64) }
+fn oid(c: char) -> String { c.to_string().repeat(40) }
+
+/// The retained `fast` profile `review_world` plants (configuration A).
+fn fast_profile(f: &Fixture) -> herdr_projects::domain::FrozenProfile {
+    let mut fast = codex_profile(&f.config, "codex", "fast", Some(&f.tmp.path().join("fast-home")));
+    fast.arguments_digest = "1".repeat(64);
+    fast
+}
+
+fn fixes_show(f: &Fixture, as_of: Option<i64>) -> serde_json::Value {
+    let seq = as_of.map(|s| s.to_string());
+    let mut args = vec!["review", "fixes", "show"];
+    if let Some(seq) = &seq { args.extend(["--as-of", seq.as_str()]); }
+    f.cli_args(&args).0["fixes"].clone()
+}
+
+/// (contributor, configuration, share) of a role credit.
+fn credit(role: &serde_json::Value) -> Vec<(String, serde_json::Value, String)> {
+    role["shares"].as_array().unwrap().iter().map(|s| (s["contributor"].as_str().unwrap().to_owned(), s["configuration_id"].clone(), s["share"].as_str().unwrap().to_owned())).collect()
+}
+
+/// Doc 10 §5 exact-candidate and reopen golden. History by hand: seq 1
+/// rev-a1's submission; 2 validates it as F = `finding:canonical-2`; 3 opens
+/// repair 3 assigned to `fast` (A); 4 binds fix-a1 (A, no result yet). fix-a1
+/// then submits SF1 (3…3, which run `a` verifies) and, after changing its
+/// branch, SF2 (4…4). 5 proposes SF2: run `a` (SF1's commit) and the rejected
+/// run `c` cannot verify it; 6 verifies it with run `d` on 4…4; an integration
+/// of SF1's verified result is not its integration; 7 links integration IG
+/// (merge 5…5); 8 closes repair 3 `fixed`. Now M25 = M26 = 1/1 (finding and
+/// A's cohort), M27 has no observed integration (1 censored, horizon 14 d),
+/// M29 = 5/6 (introduction unattributed). 9 attributes introduction to the
+/// author of 1…1 by bisect (blame and the fixer are refused); 10 reopens F
+/// after the fix was reverted: M26 = 0/1, M25 stays 1/1, M27 = 1/1; the
+/// as-of-9 view still shows the resolution. 11 opens a new unassigned repair,
+/// censored within its horizon.
+#[test]
+fn fix_credit_requires_exact_candidate_and_reopen_removes_current_credit() {
+    let f = Fixture::new();
+    let world = review_world(&f, &["rev-a1"]);
+    let db_path = f.project.join(".state/state.db");
+    let fast_id = agent_configuration(&fast_profile(&f)).id;
+    let author_id = agent_configuration(&codex_profile(&f.config, "codex", "codex", Some(&f.home))).id;
+    completed_review(&f, &world, "code", "rev-a1", json!(["finding:crash"]));
+    f.cli_args(&["review", "findings", "validate", "1", "--new", "--severity", "high", "--evidence", &evidence('e')]);
+    let finding = "finding:canonical-2";
+    let fixes = |args: &[&str]| { let mut all = vec!["review", "fixes"]; all.extend(args); f.cli_args(&all).0["event"].clone() };
+    let refused = |args: &[&str], text: &str| { let mut all = vec!["review", "fixes"]; all.extend(args); let e = f.cli_fail(&all); assert!(e.contains(text), "{e}"); };
+
+    // Only the owner attributes: workers and imports are refused and write nothing.
+    let mut store = SqliteStore::open(&db_path).unwrap();
+    for principal in ["worker:fix-a1", "rev-a1", f.attempt.as_str()] {
+        let err = store.open_repair(finding, &RepairAssignment::Unassigned, 86_400_000, None, principal, 1).unwrap_err();
+        assert!(format!("{err:?}").contains("a worker cannot triage findings"), "{principal}");
+    }
+    assert!(format!("{:?}", store.open_repair(finding, &RepairAssignment::Unassigned, 86_400_000, None, "import:github", 1).unwrap_err()).contains("an untrusted import"));
+    drop(store);
+    assert_eq!(fixes_show(&f, None)["head_seq"], json!(2));
+
+    // Repair 3 is assigned to A before any repair runs.
+    let opened = fixes(&["open", finding, "--assign", "fast"]);
+    assert_eq!((&opened["seq"], &opened["subject"]["assignment"], &opened["subject"]["configuration_id"], &opened["subject"]["horizon_ms"]),
+        (&json!(3), &json!("configuration"), &json!(fast_id), &json!(14 * 86_400_000_i64)));
+    refused(&["open", finding, "--unassigned"], "already has open repair opportunity 3");
+    refused(&["open", "finding:canonical-9", "--unassigned"], "no canonical finding");
+
+    // Attempts bind before their outcome: a finished attempt or one with a result is refused.
+    let factory = Factory::open(&f);
+    factory.attempt("fix-a1", &fast_id);
+    refused(&["bind", "3", "--attempt", "rev-a1"], "is already completed");
+    refused(&["bind", "3", "--attempt", &f.attempt], "already has a result");
+    assert_eq!(fixes(&["bind", "3", "--attempt", "fix-a1"])["subject"], json!({"repair_seq": 3, "attempt_id": "fix-a1", "ordinal": 1, "configuration_id": fast_id}));
+    let (sf1, sf2) = (hex('3'), hex('4'));
+    factory.submission(&sf1, "fix-a1", &oid('3'), 5_000);
+    factory.run(&hex('a'), &sf1, "fix-a1", &oid('3'), Some(&hex('b')));
+    factory.submission(&sf2, "fix-a1", &oid('4'), 6_000);
+    factory.run(&hex('c'), &sf2, "fix-a1", &oid('4'), None);
+    factory.run(&hex('d'), &sf2, "fix-a1", &oid('4'), Some(&hex('f')));
+    let now = unix_ms();
+    factory.integration(&hex('6'), &hex('b'), &oid('3'), &oid('8'), now - 2_000);
+    factory.integration(&hex('7'), &hex('f'), &oid('4'), &oid('5'), now - 1_000);
+    refused(&["propose", "3", "--submission", &world.0], "is not bound to repair opportunity 3");
+    assert_eq!(fixes(&["propose", "3", "--submission", &sf2])["subject"]["candidate_oid"], json!(oid('4')));
+
+    // Passing checks on one commit cannot verify another; a rejected run verifies nothing.
+    refused(&["verify", "5", "--run", &hex('a'), "--assurance", "regression_reproduced", "--evidence", &evidence('a')], "passing checks on one commit cannot verify another");
+    refused(&["verify", "5", "--run", &hex('c'), "--assurance", "regression_reproduced", "--evidence", &evidence('a')], "was rejected");
+    refused(&["verify", "5", "--run", &hex('d'), "--assurance", "regression_reproduced"], "needs at least one evidence reference");
+    {
+        // Raw rows cannot forge it either: the trigger checks the exact candidate.
+        let mut db = rusqlite::Connection::open(&db_path).unwrap();
+        let tx = db.transaction().unwrap();
+        tx.execute("INSERT INTO fix_log(seq,kind,principal,authority,recorded_unix_ms) VALUES(6,'verified','operator:cli','operator_owner.v1',1)", []).unwrap();
+        let forged = tx.execute("INSERT INTO fix_verifications(seq,proposal_seq,run_id,result_id,commit_oid,assurance,evidence_refs) VALUES(6,5,?1,?2,?3,'regression_reproduced','[\"x\"]')",
+            rusqlite::params![hex('a'), hex('b'), oid('4')]).unwrap_err();
+        assert!(forged.to_string().contains("verified only by an accepted verification of its exact candidate"), "{forged}");
+        let worker = tx.execute("INSERT INTO fix_log(seq,kind,principal,authority,recorded_unix_ms) VALUES(7,'credited','worker:fix-a1','operator_owner.v1',1)", []).unwrap_err();
+        assert!(worker.to_string().contains("CHECK constraint failed"), "{worker}");
+    }
+    refused(&["integrate", "5", "--integrated", &hex('7')], "is not verified");
+    assert_eq!(fixes(&["verify", "5", "--run", &hex('d'), "--assurance", "regression_reproduced", "--evidence", &evidence('a')])["subject"]["result_id"], json!(hex('f')));
+    refused(&["close", "3", "--outcome", "no_fix"], "has a verified fix");
+    // An integration of SF1's verified result is not an integration of this fix.
+    refused(&["integrate", "5", "--integrated", &hex('6')], "did not integrate the fix's exact verified candidate");
+    assert_eq!(fixes(&["integrate", "5", "--integrated", &hex('7')])["subject"]["commit_oid"], json!(oid('5')));
+    fixes(&["close", "3", "--outcome", "fixed"]);
+
+    let at8 = fixes_show(&f, None);
+    let finding8 = &at8["findings"][0];
+    assert_eq!((&finding8["remediation"], &finding8["verified"], &finding8["integrated"], &finding8["currently_resolved"]), (&json!("resolved"), &json!(true), &json!(true), &json!(true)));
+    assert_eq!(finding8["resolutions"], json!([{"integration_seq": 7, "proposal_seq": 5, "repair_seq": 3, "integrated_id": hex('7'), "commit_oid": oid('5'),
+        "integrated_unix_ms": now - 1_000, "ended_seq": null, "ended_by": null}]));
+    // Separate roles: discovery, validation, implementation, verification, integration; introduction unattributed.
+    assert_eq!((&finding8["discovery"]["policy"], credit(&finding8["discovery"])), (&json!("earliest_validated.v1"), vec![("attempt:rev-a1".into(), json!(null), "1".into())]));
+    assert_eq!(credit(&finding8["validation"]), [("principal:operator:cli".to_owned(), json!(null), "1".to_owned())]);
+    assert_eq!((&finding8["implementation"]["policy"], credit(&finding8["implementation"])), (&json!("sole_attempt.v1"), vec![("attempt:fix-a1".into(), json!(fast_id), "1".into())]));
+    assert_eq!((credit(&finding8["verification"]), &finding8["verification"]["source_seq"]), (vec![("service:native_verifier".into(), json!(null), "1".into())], &json!(6)));
+    assert_eq!(credit(&finding8["integration"]), [("service:integrator".to_owned(), json!(null), "1".to_owned())]);
+    assert_eq!((&finding8["introduction"]["status"], &finding8["introduction"]["detection_oid"], &finding8["introduction"]["credit"]["unallocated"], &finding8["introduction"]["credit"]["unallocated_reason"]),
+        (&json!("unattributed"), &json!(oid('1')), &json!("1"), &json!("unattributed")));
+    assert_eq!((&at8["repairs"][0]["outcome"], &at8["repairs"][0]["closure"]), (&json!("currently_resolved"), &json!("fixed")));
+
+    let m = f.cli_args(&["review", "report"]).0["metrics"].clone();
+    assert_eq!((&m["M21"]["value"], &m["M25"]["value"], &m["M26"]["value"]), (&json!("1"), &json!("1/1"), &json!("1/1")));
+    assert_eq!(m["M25"]["by_assignment"], json!({fast_id.as_str(): {"numerator": 1, "denominator": 1, "value": "1/1", "not_achieved": 0, "reassigned": 0, "censored": 0}}));
+    assert_eq!((&m["M27"]["value"], &m["M27"]["censored"], &m["M27"]["reason"]), (&json!(null), &json!(1), &json!("empty_denominator")));
+    assert_eq!((&m["M29"]["value"], &m["M29"]["by_role"]["introduction"]), (&json!("5/6"), &json!({"allocated": "0", "eligible": 1, "value": "0/1"})));
+
+    // Introduction needs causal evidence: blame is refused, and so is charging the fixer through its fix.
+    refused(&["introduce", finding, "--commit", &oid('1'), "--method", "blame", "--contributor", &format!("{}=1", f.attempt), "--evidence", &evidence('c')], "is inference, not causal evidence");
+    refused(&["introduce", finding, "--commit", &oid('4'), "--method", "reliable_bisect", "--contributor", "fix-a1=1", "--evidence", &evidence('c')], "the fixer is not charged");
+    refused(&["introduce", finding, "--commit", &oid('1'), "--method", "reliable_bisect", "--contributor", "rev-a1=1", "--evidence", &evidence('c')], "has no candidate at the introducing commit");
+    fixes(&["introduce", finding, "--commit", &oid('1'), "--method", "reliable_bisect", "--contributor", &format!("{}=1", f.attempt), "--evidence", &evidence('c')]);
+    let at9 = fixes_show(&f, None);
+    assert_eq!((&at9["findings"][0]["introduction"]["status"], credit(&at9["findings"][0]["introduction"]["credit"])),
+        (&json!("attributed"), vec![(format!("attempt:{}", f.attempt), json!(author_id), "1".into())]));
+
+    // A revert reopens F: history stays, current-resolution credit goes.
+    refused(&["reopen", finding, "--reason", "reverted", "--observed", &oid('6')], "needs at least one evidence reference");
+    assert_eq!(fixes(&["reopen", finding, "--reason", "reverted", "--observed", &oid('6'), "--evidence", &evidence('d')])["subject"]["integration_seq"], json!(7));
+    refused(&["reopen", finding, "--reason", "regression", "--observed", &oid('6'), "--evidence", &evidence('d')], "is not currently resolved");
+    let at10 = fixes_show(&f, None);
+    let finding10 = &at10["findings"][0];
+    assert_eq!((&finding10["remediation"], &finding10["verified"], &finding10["integrated"], &finding10["currently_resolved"]), (&json!("reopened"), &json!(true), &json!(true), &json!(false)));
+    assert_eq!((&finding10["resolutions"][0]["ended_seq"], &finding10["resolutions"][0]["ended_by"], &finding10["reopenings"][0]["reason"]), (&json!(10), &json!("reopened"), &json!("reverted")));
+    assert_eq!(at10["repairs"][0]["outcome"], json!("integrated"));
+    let m = f.cli_args(&["review", "report"]).0["metrics"].clone();
+    assert_eq!((&m["M25"]["value"], &m["M26"]["value"], &m["M26"]["by_assignment"][fast_id.as_str()]["value"]), (&json!("1/1"), &json!("0/1"), &json!("0/1")));
+    assert_eq!((&m["M27"]["value"], &m["M27"]["censored"]), (&json!("1/1"), &json!(0)));
+
+    // Replay: the as-of-9 view still has the resolution, byte for byte; one ordering with the triage history.
+    let replayed = fixes_show(&f, Some(9));
+    for key in ["findings", "repairs", "history", "as_of_seq"] { assert_eq!(replayed[key], at9[key], "{key}"); }
+    assert_eq!((&replayed["head_seq"], &replayed["findings"][0]["currently_resolved"]), (&json!(10), &json!(true)));
+    assert_eq!(fixes_show(&f, Some(8))["findings"][0]["introduction"]["status"], json!("unattributed"));
+    assert_eq!(f.cli_args(&["review", "findings", "show", "--as-of", "10"]).0["findings"]["head_seq"], json!(10));
+
+    // A new repair cycle is its own opportunity, censored until closed or past its horizon.
+    fixes(&["open", finding, "--unassigned", "--horizon-days", "7"]);
+    let m25 = f.cli_args(&["review", "report"]).0["metrics"]["M25"].clone();
+    assert_eq!((&m25["censored"], &m25["by_assignment"]["unassigned"]), (&json!(1), &json!({"numerator": 0, "denominator": 0, "value": null, "not_achieved": 0,
+        "reassigned": 0, "censored": 1, "reason": "empty_denominator"})));
+    let head = fixes_show(&f, None);
+    let kinds: Vec<&str> = head["history"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["repair_opened", "attempt_bound", "proposed", "verified", "integrated", "repair_closed", "introduced", "reopened", "repair_opened"]);
+    assert!(head["history"].as_array().unwrap().iter().all(|e| e["principal"] == "operator:cli" && e["authority"] == "operator_owner.v1"));
+    let rewrite = rusqlite::Connection::open(&db_path).unwrap().execute("UPDATE fix_verifications SET assurance='approved_alternative'", []).unwrap_err();
+    assert!(rewrite.to_string().contains("append-only"), "{rewrite}");
+}
+
+/// Doc 10 §5 assignment and mixed-credit golden. rev-a1 (A) reports P (seq
+/// 1); rev-a2 (B) reports Q and P again (seq 2, 3). Seq 4 validates P =
+/// `finding:canonical-4`, 5 validates Q = `finding:canonical-5`, 6 links
+/// rev-a2's P report (a duplicate discovery). Both repairs are assigned to A:
+/// 7 for P, 8 for Q. 9 binds a1 (A) to repair 7, which fails; 10 closes it
+/// `no_fix`. 11 binds a2 (A) to repair 8, which fails; 12 reassigns it to b1
+/// (B), whose candidate is proposed (13), verified (14), integrated (15);
+/// 16 closes it `fixed`. By hand: A's M25 = M26 = 1/2 (the failed repair
+/// stays), B has no assigned opportunity (null, not 1/1); findings 1/2.
+/// Implementation credit of Q's fix is mixed and unallocated until 17 splits
+/// it b1 2/3, a2 1/3. M21 = 2 (A 1, B 1); 18 shares P's discovery 1/2 + 1/2
+/// (A 1/2, B 3/2, still 2 in total); 19 retracts that. M29: 6/9 = 2/3 before
+/// 17, 7/9 after. 20 records P's introduction as unattributable.
+#[test]
+fn failed_repairs_stay_in_denominator_and_mixed_credit_is_split() {
+    let f = Fixture::new();
+    let world = review_world(&f, &["rev-a1", "rev-a2"]);
+    let factory = Factory::open(&f);
+    let a = factory.configuration(&fast_profile(&f));
+    let mut slow = codex_profile(&f.config, "codex", "slow", Some(&f.tmp.path().join("slow-home")));
+    slow.arguments_digest = "2".repeat(64);
+    let b = factory.configuration(&slow);
+    factory.decision("rev-a1", &a);
+    factory.decision("rev-a2", &b);
+    completed_review(&f, &world, "code", "rev-a1", json!(["finding:p"]));
+    completed_review(&f, &world, "security", "rev-a2", json!(["finding:q", "finding:p-again"]));
+    f.cli_args(&["review", "findings", "validate", "1", "--new", "--severity", "high", "--evidence", &evidence('e')]);
+    f.cli_args(&["review", "findings", "validate", "2", "--new", "--severity", "medium", "--evidence", &evidence('e')]);
+    f.cli_args(&["review", "findings", "validate", "3", "--finding", "finding:canonical-4", "--severity", "high", "--evidence", &evidence('f')]);
+    let (p, q) = ("finding:canonical-4", "finding:canonical-5");
+    let fixes = |args: &[&str]| { let mut all = vec!["review", "fixes"]; all.extend(args); f.cli_args(&all).0["event"].clone() };
+    let refused = |args: &[&str], text: &str| { let mut all = vec!["review", "fixes"]; all.extend(args); let e = f.cli_fail(&all); assert!(e.contains(text), "{e}"); };
+    let metrics = || f.cli_args(&["review", "report"]).0["metrics"].clone();
+
+    assert_eq!(fixes(&["open", p, "--assign", "fast"])["seq"], json!(7));
+    assert_eq!(fixes(&["open", q, "--assign", "fast"])["seq"], json!(8));
+    for (attempt, configuration) in [("a1", &a), ("a2", &a), ("b1", &b)] { factory.attempt(attempt, configuration); }
+    fixes(&["bind", "7", "--attempt", "a1"]);
+    refused(&["close", "7", "--outcome", "fixed"], "has no verified fix");
+    fixes(&["close", "7", "--outcome", "no_fix"]);
+    refused(&["bind", "7", "--attempt", "a2"], "repair opportunity 7 is closed");
+    fixes(&["bind", "8", "--attempt", "a2"]);
+    assert_eq!(fixes(&["bind", "8", "--attempt", "b1"])["subject"], json!({"repair_seq": 8, "attempt_id": "b1", "ordinal": 2, "configuration_id": b}));
+    factory.submission(&hex('5'), "b1", &oid('7'), 5_000);
+    factory.run(&hex('a'), &hex('5'), "b1", &oid('7'), Some(&hex('b')));
+    factory.integration(&hex('6'), &hex('b'), &oid('7'), &oid('9'), unix_ms() - 1_000);
+    fixes(&["propose", "8", "--submission", &hex('5')]);
+    fixes(&["verify", "13", "--run", &hex('a'), "--assurance", "approved_alternative", "--evidence", &evidence('a')]);
+    fixes(&["integrate", "13", "--integrated", &hex('6')]);
+    assert_eq!(fixes(&["close", "8", "--outcome", "fixed"])["seq"], json!(16));
+
+    let at16 = fixes_show(&f, None);
+    let attempts: Vec<_> = at16["repairs"][1]["attempts"].as_array().unwrap().iter()
+        .map(|t| (t["attempt_id"].clone(), t["ordinal"].clone(), t["configuration_id"].clone(), t["reassignment"].clone())).collect();
+    assert_eq!(attempts, [(json!("a2"), json!(1), json!(a), json!(false)), (json!("b1"), json!(2), json!(b), json!(true))]);
+    assert_eq!((&at16["repairs"][0]["outcome"], &at16["repairs"][0]["closure"], &at16["repairs"][1]["outcome"]), (&json!("no_candidate"), &json!("no_fix"), &json!("currently_resolved")));
+    let q16 = &at16["findings"][1];
+    assert_eq!((&q16["implementation"]["shares"], &q16["implementation"]["allocated"], &q16["implementation"]["unallocated"], &q16["implementation"]["unallocated_reason"]),
+        (&json!([]), &json!("0"), &json!("1"), &json!("mixed_contribution_unallocated")));
+    assert_eq!((&at16["findings"][0]["remediation"], &at16["findings"][0]["implementation"]), (&json!("unrepaired"), &json!(null)));
+
+    let m = metrics();
+    assert_eq!((&m["M25"]["value"], &m["M25"]["findings"]), (&json!("1/2"), &json!({"label": "finding_outcomes", "numerator": 1, "denominator": 2})));
+    let by = json!({a.as_str(): {"numerator": 1, "denominator": 2, "value": "1/2", "not_achieved": 1, "reassigned": 1, "censored": 0},
+        b.as_str(): {"numerator": 0, "denominator": 0, "value": null, "not_achieved": 0, "reassigned": 0, "censored": 0, "reason": "no_assigned_opportunities"}});
+    assert_eq!((&m["M25"]["by_assignment"], &m["M26"]["by_assignment"], &m["M26"]["value"]), (&by, &by, &json!("1/2")));
+    assert_eq!((&m["M21"]["value"], &m["M21"]["by_configuration"], &m["M21"]["participation"]), (&json!("2"), &json!({a.as_str(): "1", b.as_str(): "1"}), &json!(2)));
+    assert_eq!((&m["M29"]["value"], &m["M29"]["by_role"]["implementation"]), (&json!("2/3"), &json!({"allocated": "0", "eligible": 1, "value": "0/1"})));
+
+    // Mixed contributions are split, never full credit each.
+    refused(&["credit", q, "--role", "implementation", "--proposal", "13", "--share", "b1=2/3", "--share", "a2=2/3", "--evidence", &evidence('c')], "sum to more than 1");
+    refused(&["credit", q, "--role", "implementation", "--proposal", "13", "--share", "a1=1/3", "--evidence", &evidence('c')], "did not contribute");
+    refused(&["credit", q, "--role", "implementation", "--proposal", "13", "--share", "b1=2/3", "--share", "a2=1/3"], "needs at least one evidence reference");
+    assert_eq!(fixes(&["credit", q, "--role", "implementation", "--proposal", "13", "--share", "b1=2/3", "--share", "a2=1/3", "--evidence", &evidence('c')])["seq"], json!(17));
+    let q17 = fixes_show(&f, None)["findings"][1]["implementation"].clone();
+    assert_eq!((&q17["policy"], credit(&q17), &q17["allocated"], &q17["unallocated"]),
+        (&json!("owner_allocation.v1"), vec![("attempt:a2".into(), json!(a), "1/3".into()), ("attempt:b1".into(), json!(b), "2/3".into())], &json!("1"), &json!("0")));
+    assert_eq!(metrics()["M29"]["value"], json!("7/9"));
+
+    // Shared discovery: two reporters of P, half each; the total stays one finding each.
+    refused(&["credit", p, "--role", "discovery", "--share", "rev-a1=1", "--share", "rev-a2=1/2", "--evidence", &evidence('c')], "sum to more than 1");
+    refused(&["credit", q, "--role", "discovery", "--share", "rev-a1=1", "--evidence", &evidence('c')], "did not contribute");
+    fixes(&["credit", p, "--role", "discovery", "--share", "rev-a1=1/2", "--share", "rev-a2=1/2", "--evidence", &evidence('c')]);
+    let m21 = metrics()["M21"].clone();
+    assert_eq!((&m21["value"], &m21["unallocated"], &m21["by_configuration"], &m21["participation"]), (&json!("2"), &json!("0"), &json!({a.as_str(): "1/2", b.as_str(): "3/2"}), &json!(3)));
+    // Retraction restores the policy's credit; the allocation stays in the as-of view.
+    refused(&["retract", "16"], "only a credit allocation, reopening or introduction");
+    fixes(&["retract", "18"]);
+    refused(&["retract", "18"], "already retracted");
+    assert_eq!(metrics()["M21"]["by_configuration"], json!({a.as_str(): "1", b.as_str(): "1"}));
+    assert_eq!((&fixes_show(&f, Some(18))["findings"][0]["discovery"]["policy"], &fixes_show(&f, None)["findings"][0]["discovery"]["policy"]),
+        (&json!("owner_allocation.v1"), &json!("earliest_validated.v1")));
+
+    // Unattributable introduction is explicit, not an exoneration and not a charge.
+    refused(&["introduce", p, "--unattributable"], "needs at least one evidence reference");
+    fixes(&["introduce", p, "--unattributable", "--evidence", &evidence('d')]);
+    let intro = fixes_show(&f, None)["findings"][0]["introduction"].clone();
+    assert_eq!((&intro["status"], &intro["credit"]["shares"], &intro["credit"]["unallocated"], &intro["credit"]["unallocated_reason"]),
+        (&json!("unattributable"), &json!([]), &json!("1"), &json!("unattributable")));
+    assert_eq!(fixes_show(&f, None)["head_seq"], json!(20));
 }

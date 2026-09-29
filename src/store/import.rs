@@ -84,6 +84,7 @@ impl SqliteStore {
         if version<=52 {tx.execute_batch(include_str!("../../migrations/0053_candidate_groups.sql"))?;}
         if version<=53 {tx.execute_batch(include_str!("../../migrations/0054_review_capture.sql"))?;}
         if version<=54 {tx.execute_batch(include_str!("../../migrations/0055_finding_triage.sql"))?;}
+        if version<=55 {tx.execute_batch(include_str!("../../migrations/0056_fix_attribution.sql"))?;}
         tx.commit()?;
         Ok(())
     }

@@ -166,10 +166,10 @@ fn schema_55(tx: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn hex64(value: &str) -> bool { value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) }
+pub(super) fn hex64(value: &str) -> bool { value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) }
 fn evidence_ref(value: &str) -> bool { value.strip_prefix("sha256:").or_else(|| value.strip_prefix("verification_run:")).is_some_and(hex64) }
 
-fn evidence(values: &[String]) -> Result<Vec<String>> {
+pub(super) fn evidence(values: &[String]) -> Result<Vec<String>> {
     if values.len() > MAX_EVIDENCE { return Err(invalid(format!("at most {MAX_EVIDENCE} evidence references"))); }
     let mut sorted = values.to_vec();
     sorted.sort();
@@ -187,7 +187,7 @@ pub(super) fn title_excerpt(text: &str) -> Option<String> {
 
 /// Refuse every principal but the triage authority. A worker (`worker:*` or
 /// any attempt's identity) and an import (`import:*`) can only propose.
-fn triage_authority(tx: &Connection, principal: &str) -> Result<()> {
+pub(super) fn triage_authority(tx: &Connection, principal: &str) -> Result<()> {
     if principal.is_empty() || principal.len() > 128 { return Err(invalid("invalid principal".into())); }
     let bare = principal.strip_prefix("worker:").unwrap_or(principal);
     if principal.starts_with("worker:") || tx.query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE id=?1)", [bare], |r| r.get::<_, bool>(0))? {
@@ -200,7 +200,13 @@ fn triage_authority(tx: &Connection, principal: &str) -> Result<()> {
     Ok(())
 }
 
-fn head(tx: &Connection) -> Result<i64> { Ok(tx.query_row("SELECT coalesce(max(seq),0) FROM finding_log", [], |r| r.get(0))?) }
+/// Head of the one ordering of `finding_log` and, from migration 0056,
+/// `fix_log` (contracts-review.md §6): the replay watermark of both.
+pub(super) fn head(tx: &Connection) -> Result<i64> {
+    let fixes: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='fix_log')", [], |r| r.get(0))?;
+    let sql = if fixes { "SELECT max(coalesce((SELECT max(seq) FROM finding_log),0), coalesce((SELECT max(seq) FROM fix_log),0))" } else { "SELECT coalesce(max(seq),0) FROM finding_log" };
+    Ok(tx.query_row(sql, [], |r| r.get(0))?)
+}
 
 /// Append the owner's history row after the authority and expected-head checks.
 fn log(tx: &Connection, kind: &str, principal: &str, expected: Option<i64>, now: i64) -> Result<i64> {
@@ -209,8 +215,9 @@ fn log(tx: &Connection, kind: &str, principal: &str, expected: Option<i64>, now:
         let head = head(tx)?;
         if head != expected { return Err(invalid(format!("finding history moved: head is {head}, expected {expected}"))); }
     }
-    tx.execute("INSERT INTO finding_log(kind,principal,authority,expected_seq,recorded_unix_ms) VALUES(?1,?2,?3,?4,?5)", params![kind, principal, TRIAGE_AUTHORITY, expected, now])?;
-    Ok(tx.last_insert_rowid())
+    let seq = head(tx)? + 1;
+    tx.execute("INSERT INTO finding_log(seq,kind,principal,authority,expected_seq,recorded_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)", params![seq, kind, principal, TRIAGE_AUTHORITY, expected, now])?;
+    Ok(seq)
 }
 
 fn event(tx: &Connection, seq: i64, subject: serde_json::Value) -> Result<FindingEvent> {
@@ -223,8 +230,8 @@ fn event(tx: &Connection, seq: i64, subject: serde_json::Value) -> Result<Findin
 pub(super) fn record_submissions(tx: &Connection, session: &str, refs: &[String], titles: &BTreeMap<String, String>, principal: &str, now: i64) -> Result<Vec<i64>> {
     let mut ids = Vec::with_capacity(refs.len());
     for finding in refs {
-        tx.execute("INSERT INTO finding_log(kind,principal,authority,expected_seq,recorded_unix_ms) VALUES('submitted',?1,'proposal',NULL,?2)", params![principal, now])?;
-        let seq = tx.last_insert_rowid();
+        let seq = head(tx)? + 1;
+        tx.execute("INSERT INTO finding_log(seq,kind,principal,authority,expected_seq,recorded_unix_ms) VALUES(?1,'submitted',?2,'proposal',NULL,?3)", params![seq, principal, now])?;
         tx.execute("INSERT INTO finding_submissions(seq,session_id,finding_ref,title,source,trust) VALUES(?1,?2,?3,?4,'review_receipt','proposal')",
             params![seq, session, finding, titles.get(finding)])?;
         let submission = tx.last_insert_rowid();
@@ -254,7 +261,7 @@ fn finding_exists(tx: &Connection, finding: &str) -> Result<()> {
 }
 
 /// Active merge edges `source -> target` up to `as_of`.
-fn merges(tx: &Connection, as_of: i64) -> Result<BTreeMap<String, (String, i64)>> {
+pub(super) fn merges(tx: &Connection, as_of: i64) -> Result<BTreeMap<String, (String, i64)>> {
     let mut active = BTreeMap::new();
     let rows: Vec<(i64, String, String, String, Option<i64>)> = tx.prepare("SELECT seq,kind,source_finding,target_finding,reverses FROM finding_relationships WHERE seq<=?1 ORDER BY seq")?
         .query_map([as_of], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<rusqlite::Result<_>>()?;
@@ -264,7 +271,7 @@ fn merges(tx: &Connection, as_of: i64) -> Result<BTreeMap<String, (String, i64)>
     Ok(active)
 }
 
-fn root(edges: &BTreeMap<String, (String, i64)>, finding: &str) -> String {
+pub(super) fn root(edges: &BTreeMap<String, (String, i64)>, finding: &str) -> String {
     let mut at = finding.to_owned();
     let mut steps = 0;
     while let Some((next, _)) = edges.get(&at) {

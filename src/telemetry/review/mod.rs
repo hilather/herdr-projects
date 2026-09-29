@@ -3,15 +3,17 @@
 //! Hooks registered centrally in `super::LANES`; this lane adds subcommands,
 //! metrics, tick work and `migrations/telemetry/review/NNNN_*.sql` here only.
 //! Writes go through the canonical store (`SqliteStore`, one `state.db`
-//! transaction each); `show`, `present`, `report`, `findings show` and the metrics hook read
-//! `state.db` strictly read-only.
+//! transaction each); `show`, `present`, `report`, `findings show`, `fixes show` and the
+//! metrics hook read `state.db` strictly read-only.
 use anyhow::{Context, Result};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::store::{FindingSummary, FindingTarget, ReviewAssignmentChoice, ReviewOpportunitySpec, SqliteStore, TriageOutcome, TriageRequest, finding_state};
+mod fixes;
+
+use crate::store::{FindingSummary, FindingTarget, ReviewAssignmentChoice, ReviewOpportunitySpec, SqliteStore, TriageOutcome, TriageRequest, finding_state, fix_state};
 
 pub const STREAM: &str = "review";
 /// `include_str!` of `migrations/telemetry/review/`, in order; index + 1 is the stream version.
@@ -24,8 +26,6 @@ const INACTIVE: &str = "no_reviewer_authority_producer";
 const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
 /// Recorded on the owner's finding triage (contracts-review.md §5).
 const TRIAGE_AUTHORITY: &str = "operator_owner.v1";
-/// M21 and M24 need role-specific discovery credit allocations (TM3.3), and M24 review cost.
-const NO_CREDIT: &str = "discovery_credit_unallocated";
 
 /// `herdr-projects telemetry <slug> review ...`
 #[derive(clap::Subcommand)]
@@ -92,16 +92,23 @@ pub enum Command {
         #[arg(long)]
         since: Option<i64>,
     },
-    /// Lane metrics (M20, M22, M23; M21 and M24 unavailable) as JSON. Read-only.
+    /// Lane metrics (M20–M23, M25–M27, M29; M24 unavailable) as JSON. Read-only.
     Report {
         /// Window start (Unix ms), by the assignment (unassigned: by creation;
-        /// finding submissions: by arrival).
+        /// finding submissions: by arrival; findings: by their discovery's
+        /// arrival; repairs: by opening; integrations: by integration).
         #[arg(long)]
         since: Option<i64>,
+        /// M27 reopen horizon in days.
+        #[arg(long, default_value_t = 14, value_parser = clap::value_parser!(u32).range(1..=3650))]
+        horizon_days: u32,
     },
     /// Finding submissions, claims, triage and duplicate history.
     #[command(subcommand)]
     Findings(FindingsCommand),
+    /// Repair opportunities, fixes, reopenings, introduction and role credit.
+    #[command(subcommand)]
+    Fixes(fixes::FixesCommand),
 }
 
 /// `herdr-projects telemetry <slug> review findings ...`. Every write is a
@@ -225,8 +232,9 @@ pub fn run(project: &Path, command: Command) -> Result<String> {
         Command::Accept { session } => { open()?.accept_review(&session, OPERATOR)?; json!({}) }
         Command::Present { opportunity } => present(project, &opportunity)?,
         Command::Show { since } => show(project, since)?,
-        Command::Report { since } => json!({"metrics": metrics(project, since)?, "since_unix_ms": since}),
+        Command::Report { since, horizon_days } => json!({"metrics": lane_metrics(project, since, i64::from(horizon_days))?, "since_unix_ms": since}),
         Command::Findings(command) => findings(project, command, now)?,
+        Command::Fixes(command) => fixes::run(project, command, now)?,
     };
     Ok(serde_json::to_string_pretty(&value)? + "\n")
 }
@@ -263,7 +271,7 @@ fn findings(project: &Path, command: FindingsCommand, now: i64) -> Result<Value>
 fn unavailable(reason: &str) -> Value { json!({"status": "unavailable", "reason": reason}) }
 
 /// `state.db` read-only, or `None` before migration 0054.
-fn read(project: &Path) -> Result<Option<super::ReadOnly>> {
+pub(super) fn read(project: &Path) -> Result<Option<super::ReadOnly>> {
     let db = super::read_only(&project.join(".state/state.db"))?;
     crate::store::check_schema(&db)?;
     let present: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_opportunities')", [], |r| r.get(0))?;
@@ -348,8 +356,11 @@ fn ratio(numerator: usize, denominator: usize) -> Value {
 
 /// Metrics merged into `telemetry <slug> report` (`super::metrics::report`).
 /// M20 review completion over assigned opportunities (declared coverage);
-/// M22/M23 over fully triaged submissions; M21/M24 need discovery credit.
-pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> {
+/// M22/M23 over fully triaged submissions; M21, M25–M27 and M29 from fix
+/// attribution (§6); M24 needs review lifecycle cost.
+pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> { lane_metrics(project, since, fixes::DEFAULT_HORIZON_DAYS) }
+
+fn lane_metrics(project: &Path, since: Option<i64>, horizon_days: i64) -> Result<BTreeMap<String, Value>> {
     let mut m20 = json!({"definition": "M20.v1", "name": "review_completion", "basis": "declared", "trust": "proposal"});
     match read(project)? {
         None => m20["value"] = unavailable("review_capture_absent"),
@@ -380,7 +391,6 @@ pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Va
     let triage = match read(project)? { Some(db) => finding_state(&db, None)?, None => None };
     let mut m22 = json!({"definition": "M22.v1", "name": "proposal_validation_rate", "basis": "owner_triage", "trust": TRIAGE_AUTHORITY});
     let mut m23 = json!({"definition": "M23.v1", "name": "duplicate_report_share", "basis": "owner_triage", "trust": TRIAGE_AUTHORITY});
-    let mut unique = unavailable("finding_triage_absent");
     match &triage {
         None => for m in [&mut m22, &mut m23] { m["value"] = unavailable("finding_triage_absent"); },
         Some(state) => {
@@ -396,15 +406,13 @@ pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Va
                 m["claim_drilldown"] = json!(s.claims);
                 m["as_of_seq"] = json!(state.as_of_seq);
             }
-            unique = json!(state.unique_findings);
         }
     }
     out.insert("M22".to_owned(), m22);
     out.insert("M23".to_owned(), m23);
-    // M21 sums discovery credit, and M24 divides it by review cost: neither is allocated yet.
-    out.insert("M21".to_owned(), json!({"definition": "M21.v1", "name": "validated_unique_findings", "value": unavailable(NO_CREDIT),
-        "drilldown": {"validated_unique_findings": unique}}));
-    out.insert("M24".to_owned(), json!({"definition": "M24.v1", "name": "review_discovery_efficiency", "value": unavailable(NO_CREDIT)}));
+    // M21 sums discovery credit; M25–M27 and M29 follow repairs; M24 needs review cost (§6).
+    let attribution = match read(project)? { Some(db) => fix_state(&db, None)?, None => None };
+    out.extend(fixes::metrics(attribution.as_ref(), jiff::Timestamp::now().as_millisecond(), since, horizon_days * 86_400_000));
     Ok(out)
 }
 
