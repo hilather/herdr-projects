@@ -140,7 +140,7 @@ pub fn store(tx: &Connection) -> Result<usize> {
     Ok(done.len())
 }
 
-fn synced(db: &Connection) -> Result<bool> {
+pub(crate) fn synced(db: &Connection) -> Result<bool> {
     let table = |name: &str| db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [name], |r| r.get::<_, bool>(0));
     Ok(table("usage_ledger")? && table("quota_windows")? && db.query_row("SELECT 1 FROM usage_ledger", [], |_| Ok(())).optional()?.is_some())
 }
@@ -173,7 +173,7 @@ fn decisions(project: &Path) -> Result<Vec<Decision>> {
 /// Extended M40 for one decision: per limit and window kind, the latest
 /// trusted remaining value of the attempt's account observed at or before the
 /// decision, with its age. Native percent; never summed across accounts or services.
-fn headroom(db: &Connection, home: &str, decided: i64) -> Result<Value> {
+pub(crate) fn headroom(db: &Connection, home: &str, decided: i64) -> Result<Value> {
     let account = format!("sha256:{:x}", <sha2::Sha256 as sha2::Digest>::digest(home.as_bytes()));
     let seen: i64 = db.query_row("SELECT count(*) FROM quota_observations WHERE account=?1 AND observed_unix_ms<=?2", params![account, decided], |r| r.get(0))?;
     if seen == 0 { return Ok(json!({"account": account, "value": unavailable("no_observation")})); }

@@ -2,7 +2,7 @@
 //! sidecar. Unknown is never 0: a ratio with an empty denominator is `null`
 //! with `empty_denominator`; a value without a source is `unavailable`.
 use anyhow::Result;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -62,19 +62,7 @@ pub fn report(project: &Path, since: Option<i64>) -> Result<Value> {
     let sidecar = super::sidecar::read(project)?;
     usage_metrics(sidecar.as_deref(), &attempts, since, &in_window, &mut metrics)?;
     for id in ["M31", "M32", "M33"] { metrics.insert(id, metric(id, json!({"value": unavailable("attention_not_collected")}))); }
-    let mut decisions = Vec::new();
-    for a in attempts.iter().filter(|a| a.decided.is_some() && in_window(a)) {
-        let decided = a.decided.unwrap_or_default();
-        let mut entry = json!({"attempt_id": a.id, "decided_unix_ms": decided});
-        match (&sidecar, a.kind.as_deref(), &a.home) {
-            (_, Some(kind), _) if kind != "codex" => entry["value"] = unavailable("adapter_absent"),
-            (None, ..) => entry["value"] = unavailable("collection_not_run"),
-            (Some(db), _, Some(home)) => headroom(db, home, decided, &mut entry)?,
-            _ => entry["value"] = unavailable("no_observation"),
-        }
-        decisions.push(entry);
-    }
-    metrics.insert("M40", metric("M40", json!({"decisions": decisions})));
+    metrics.insert("M40", headroom(sidecar.as_deref(), &attempts, &in_window)?);
     for (id, name) in NAMES { if let Some(m) = metrics.get_mut(id) { m["name"] = json!(name); } }
     // Lane providers (`super::LANES`) add metrics; a lane key replaces a central one.
     let mut metrics: BTreeMap<String, Value> = metrics.into_iter().map(|(id, m)| (id.to_owned(), m)).collect();
@@ -141,32 +129,35 @@ fn usage_metrics(sidecar: Option<&Connection>, attempts: &[Attempt], since: Opti
     Ok(())
 }
 
-/// M40: `100 − used_percent` of the latest rate-limit row from the attempt's
-/// execution home observed at or before the decision, exact decimal arithmetic.
-fn headroom(db: &Connection, home: &str, decided: i64, entry: &mut Value) -> Result<()> {
-    let home = format!("sha256:{:x}", <sha2::Sha256 as sha2::Digest>::digest(home.as_bytes()));
-    let row: Option<(Option<String>, i64, Option<String>, Option<i64>)> = db.query_row("SELECT l.used_percent,l.observed_ts,l.limit_id,l.window_minutes FROM codex_rate_limits l
-        WHERE l.observed_ts<=?2 AND EXISTS(SELECT 1 FROM rollout_sources s WHERE s.session_id=l.session_id AND s.home_digest=?1)
-        ORDER BY l.observed_ts DESC,l.ordinal DESC LIMIT 1", rusqlite::params![home, decided], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
-    let Some((used, observed, limit, window)) = row else { entry["value"] = unavailable("no_observation"); return Ok(()) };
-    match used.as_deref().and_then(subtract_from_100) {
-        None => entry["value"] = unavailable("unparseable_observation"),
-        Some(value) => { entry["value"] = json!(value); entry["age_ms"] = json!(decided - observed); entry["limit_id"] = json!(limit); entry["window_minutes"] = json!(window); }
+/// Extended M40 (contracts-accounting §5, `M40.quota-windows-v1`): per
+/// decision in the window and per limit window, the latest trusted remaining
+/// value from the quota tables the last `accounting sync` built, never summed
+/// across accounts, limits or services. Each entry equals the one `accounting
+/// quota` prints; before a sync every Codex decision is `ledger_not_synced`.
+fn headroom(sidecar: Option<&Connection>, attempts: &[Attempt], in_window: &dyn Fn(&Attempt) -> bool) -> Result<Value> {
+    use super::accounting::quota;
+    let synced = match sidecar { Some(db) => quota::synced(db)?, None => false };
+    let mut decisions = Vec::new();
+    for a in attempts.iter().filter(|a| in_window(a)) {
+        let Some(decided) = a.decided else { continue };
+        let mut entry = match (a.kind.as_deref(), &a.home, sidecar) {
+            (Some(kind), ..) if kind != "codex" => json!({"value": unavailable("adapter_absent")}),
+            (_, None, _) => json!({"value": unavailable("execution_home_unknown")}),
+            (.., None) => json!({"value": unavailable("collection_not_run")}),
+            _ if !synced => json!({"value": unavailable("ledger_not_synced")}),
+            (_, Some(home), Some(db)) => quota::headroom(db, home, decided)?,
+        };
+        entry["attempt_id"] = json!(a.id);
+        entry["decided_unix_ms"] = json!(decided);
+        entry["service"] = json!("codex");
+        decisions.push(entry);
     }
-    Ok(())
+    let mut m40 = metric("M40", json!({"decisions": decisions, "stale_after_ms": quota::STALE_AFTER_MS}));
+    m40["definition"] = json!("M40.quota-windows-v1");
+    Ok(m40)
 }
 
-fn subtract_from_100(used: &str) -> Option<String> {
-    let (int, frac) = used.split_once('.').unwrap_or((used, ""));
-    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
-    if int.is_empty() || int.len() > 6 || frac.len() > 12 || !digits(int) || !digits(frac) || used.ends_with('.') { return None; }
-    let scale = 10i64.pow(frac.len() as u32);
-    let left = 100 * scale - (int.parse::<i64>().ok()? * scale + if frac.is_empty() { 0 } else { frac.parse::<i64>().ok()? });
-    let (sign, abs) = if left < 0 { ("-", -left) } else { ("", left) };
-    Some(if frac.is_empty() { format!("{sign}{abs}") } else { format!("{sign}{}.{:0w$}", abs / scale, abs % scale, w = frac.len()) })
-}
-
-/// One line per metric (M40: one per decision); anything unknown reads `n/a`, never 0.
+/// One line per metric (M40: one per decision and limit window); anything unknown reads `n/a`, never 0.
 pub fn text(report: &Value) -> String {
     let show = |m: &Value| match &m["value"] {
         Value::Null => format!("n/a ({})", m["reason"].as_str().unwrap_or("unknown")),
@@ -183,9 +174,18 @@ pub fn text(report: &Value) -> String {
         let name = m["name"].as_str().or_else(|| NAMES.iter().find(|(n, _)| *n == id).map(|(_, name)| *name)).unwrap_or("");
         match m["decisions"].as_array() {
             Some(list) if list.is_empty() => out += &format!("{id} {name} n/a (no_decisions)\n"),
+            // M40: one line per decision and limit window, or per decision without windows.
             Some(list) => for d in list {
-                let age = d["age_ms"].as_i64().map(|age| format!(" age_ms={age}")).unwrap_or_default();
-                out += &format!("{id} {name} {} {}{age}\n", d["attempt_id"].as_str().unwrap_or(""), show(d));
+                let attempt = d["attempt_id"].as_str().unwrap_or("");
+                let Some(windows) = d["windows"].as_array() else { out += &format!("{id} {name} {attempt} {}\n", show(d)); continue };
+                for w in windows {
+                    let age = w["age_ms"].as_i64().map(|age| format!(" age_ms={age}")).unwrap_or_default();
+                    let value = match w["value"].as_str() {
+                        Some(remaining) => format!("remaining {remaining}%{age} {}", w["freshness"].as_str().unwrap_or("")),
+                        None => format!("{}{age}", show(w)),
+                    };
+                    out += &format!("{id} {name} {attempt} {} {} {value}\n", w["limit_id"].as_str().unwrap_or(""), w["window_kind"].as_str().unwrap_or(""));
+                }
             },
             None => out += &format!("{id} {name} {}\n", show(m)),
         }

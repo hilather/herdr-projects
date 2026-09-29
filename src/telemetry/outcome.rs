@@ -32,8 +32,40 @@ pub fn attempts(project: &Path) -> anyhow::Result<Value> {
         for record in records.iter_mut().filter(|r| r["usage"]["reason"] == "collection_not_run") {
             record["usage"] = super::sidecar::attempt_usage(&sidecar, record["attempt_id"].as_str().unwrap_or_default())?;
         }
+        attention(project, &sidecar, &mut records)?;
     }
     Ok(json!({"attempts": records}))
+}
+
+/// Contracts §4 `attention`: once any attention sample exists, each launched
+/// attempt's summary of `accounting attention` (contracts-accounting §6), or
+/// `not_observed`; an attempt without a launch receipt is `not_launched`.
+/// Before any sample every record keeps `attention_not_collected`.
+fn attention(project: &Path, sidecar: &Connection, records: &mut [Value]) -> anyhow::Result<()> {
+    let report = super::accounting::attention::read(project, sidecar)?;
+    let launched: BTreeMap<&str, &Value> = report["attempts"].as_array().into_iter().flatten()
+        .filter_map(|a| Some((a["attempt_id"].as_str()?, &a["attention"]))).collect();
+    if launched.is_empty() { return Ok(()); }
+    let signal = &report["signal"];
+    for record in records.iter_mut() {
+        let Some(a) = record["attempt_id"].as_str().and_then(|id| launched.get(id)) else {
+            record["attention"] = status("unavailable", "not_launched");
+            continue;
+        };
+        let mut gaps = BTreeMap::<&str, i64>::new();
+        for gap in a["gaps"].as_array().into_iter().flatten() { *gaps.entry(gap["reason"].as_str().unwrap_or("unknown")).or_default() += 1; }
+        let mut summary = if a["status"] == "unavailable" { (*a).clone() } else {
+            let intervals = a["intervals"].as_array().map_or(0, Vec::len);
+            let censored = a["intervals"].as_array().into_iter().flatten().filter(|i| i["duration_ms"].is_null()).count();
+            json!({"interventions": a["interventions"], "uncertain_starts": a["uncertain_starts"], "waiting_ms": a["waiting_ms"],
+                "observed_ms": a["observed_ms"], "intervals": intervals, "censored_intervals": censored, "reason_type": signal["reason_type"]})
+        };
+        summary["gaps"] = json!(gaps);
+        summary["basis"] = signal["certified"].clone();
+        summary["source"] = signal["source"].clone();
+        record["attention"] = summary;
+    }
+    Ok(())
 }
 
 fn record(db: &Connection, version: u32, attempt: &str, task: &str, state: &str, kind: Option<&str>, home: Option<&str>) -> rusqlite::Result<Value> {
@@ -147,7 +179,11 @@ pub fn text(report: &Value) -> String {
         }
         other => other.to_string(),
     };
-    report["attempts"].as_array().into_iter().flatten().map(|a| format!("{} task={} state={} wall_ms={} result={} verification={} integration={} accepted={} usage={}\n",
+    let attention = |v: &Value| if v.get("waiting_ms").is_some() {
+        format!("waits={} waiting_ms={} censored={} gaps={}", v["interventions"], v["waiting_ms"], v["censored_intervals"],
+            v["gaps"].as_object().map_or(0, |g| g.values().filter_map(Value::as_i64).sum::<i64>()))
+    } else { show(v) };
+    report["attempts"].as_array().into_iter().flatten().map(|a| format!("{} task={} state={} wall_ms={} result={} verification={} integration={} accepted={} attention={} usage={}\n",
         a["attempt_id"].as_str().unwrap_or(""), a["task_id"].as_str().unwrap_or(""), a["terminal_state"].as_str().unwrap_or(""), show(&a["active_ms"]),
-        show(&a["result"]), show(&a["verification"]), show(&a["integration"]), a["accepted"], show(&a["usage"]))).collect()
+        show(&a["result"]), show(&a["verification"]), show(&a["integration"]), a["accepted"], attention(&a["attention"]), show(&a["usage"]))).collect()
 }

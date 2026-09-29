@@ -220,7 +220,7 @@ reads `unavailable: predates_lifecycle_log`.
 | `integration` | route `verify_only` → `not_applicable`; else latest `integration_operations` state via `verified_results`; `integrated` needs an `integrated_commits` row |
 | `accepted` | `true` iff the task's acceptance rule (§6 `A`) is met by evidence produced from this attempt |
 | `usage` | §5 sums if a certified bound rollout exists, else `unavailable` with reason `adapter_absent` (non-Codex kind), `not_bound`, `cli_version_uncertified`, `quarantined`, `records_not_accepted`, `collection_not_run` |
-| `attention` | always `unavailable`, reason `attention_not_collected` (S4 deferred) |
+| `attention` | B6b's per-attempt summary (contracts-accounting.md §6) once any attention sample exists; before that `unavailable`, reason `attention_not_collected` |
 
 S3 refinements:
 - Marks cover canonical attempts only (an `attempt_inputs` row). Adopted
@@ -264,6 +264,20 @@ S3 refinements:
   `telemetry usage` prints), read without creating or migrating the sidecar.
 - Verifier reasons are fixed codes today; the excerpt test adds a later run
   with a free-text reason to show display-time redaction.
+- `attention` (read from the sidecar's `attention_samples`, never written by
+  `attempts`): without a sidecar or before any sample exists every record is
+  `unavailable: attention_not_collected`. Afterwards an attempt without a
+  `runtime.launch_started` receipt is `unavailable: not_launched`; a launched
+  attempt with no successful sample is `unavailable: not_observed` with
+  `gaps`; otherwise `{interventions, uncertain_starts, waiting_ms,
+  observed_ms, intervals, censored_intervals, gaps, reason_type}`, the
+  counters of its `accounting attention` entry (counted waits, Σ closed wait
+  durations, observed time, waits without a duration). Every non-default value
+  carries `gaps` (count per gap reason, `{}` when none), `basis` (the signal's
+  certification, `fixture` today) and `source` (`herdr-agent-list-v1`). The
+  text form prints `attention=waits=<n> waiting_ms=<n> censored=<n>
+  gaps=<total>` or `attention=unavailable:<reason>`. Test
+  `attempts_show_attention_summary`.
 
 ## 5. Codex usage (sidecar)
 
@@ -321,7 +335,7 @@ latest preceding `turn_context`, `null` if none); `payload_digest` over it.
   compaction; informational, never used for sums).
 - Rate limits: `codex_rate_limits(session_id, ordinal, limit_id,
   used_percent` as decimal string, `window_minutes, resets_at, plan_type,
-  observed_ts)`; used for M40 only; no semantics certified beyond storage.
+  observed_ts)`; read only by the quota windows behind M40 (contracts-accounting.md §5); no semantics certified beyond storage.
 - Turns: `codex_turns(session_id, turn_id, model, effort, duration_ms,
   time_to_first_token_ms)`.
 
@@ -411,8 +425,8 @@ separately. `succeeded` without evidence stays in `T \ A` and is counted as
 | M09 Output consumption | Σ accepted `output_tokens`; `reasoning_output_tokens` shown as subset, not added | same as M08 |
 | M13 Usage coverage (adapted: attempt-level) | terminated Codex attempts with complete usage / terminated Codex attempts in window | complete = ≥1 bound session, none quarantined/ambiguous, all records accepted, certified version. Non-Codex attempts reported as `adapter_absent` count, not in denominator |
 | M15 Effective-model coverage | accepted records with a non-null reported `model` / accepted records | requested model (null) never qualifies |
-| M31–M33 | deferred | `unavailable: attention_not_collected` |
-| M40 Quota headroom at dispatch | per decision: `100 − used_percent` of the latest `codex_rate_limits` row from the same execution home with `observed_ts ≤ decided_unix_ms`, plus age ms | none → `unavailable: no_observation`; percent of the native window; never summed or averaged across services |
+| M31–M33 | lane B attention (contracts-accounting.md §6) | before any sample `unavailable: attention_not_collected` |
+| M40 Quota headroom at dispatch (extended, `M40.quota-windows-v1`) | per decision and limit window: remaining percent of the latest trusted quota observation of the attempt's account with `observed ≤ decided_unix_ms` (contracts-accounting.md §5), with age and freshness | decision- or window-level `unavailable` with a reason; native units; never summed or averaged across accounts, limits or services |
 
 Worked M02/M07 example (golden E2E): tasks t1 (verify_only, verified), t2
 (verify_then_integrate, verified and integrated), t3 (verify_then_integrate,
@@ -441,14 +455,28 @@ S6 refinements:
   `adapter_absent` (terminated non-Codex) and `incomplete` by first failing
   reason: `not_bound`, `quarantined`, `cli_version_uncertified`,
   `records_not_accepted` (a source's `records` ≠ its accepted rows).
-- M40: `decisions` in decision order, each `{attempt_id, decided_unix_ms,
-  value}`; with an observation `value` is the exact decimal string plus
-  `age_ms`, `limit_id`, `window_minutes`. Same home = the rollout's
-  `home_digest` equals the digest of the attempt's `execution_home`; ties on
-  `observed_ts` take the higher ordinal. Unavailable reasons: `adapter_absent`,
-  `collection_not_run`, `no_observation`, `unparseable_observation`.
-- `--text` prints one line per metric (M40 one per decision); unknown is `n/a
-  (<reason>)`. Text is the default; `--json` prints the object above.
+- M40 is the extended form of `accounting quota` (contracts-accounting.md
+  §5): `definition` `M40.quota-windows-v1`, `stale_after_ms` 900000,
+  `decisions` in attempt order, each `{attempt_id, decided_unix_ms, service,
+  account?, windows | value}`. Each window entry is `{limit_id, window_kind,
+  unit, window_id, window_minutes, resets_unix_ms, observed_unix_ms, age_ms,
+  value, used, freshness}` (`value` = remaining, exact decimal string;
+  `freshness` `fresh|stale`), or `value: unavailable
+  window_reset_since_observation` (with its age), or `secondary`
+  `unavailable not_collected`. Decision-level reasons, first match:
+  `adapter_absent` (non-Codex kind), `execution_home_unknown`,
+  `collection_not_run` (no sidecar), `ledger_not_synced`, `no_observation`,
+  `no_trusted_observation`. The report reads the quota tables built by the
+  last `accounting sync` (the ticker syncs on every telemetry pass); it never
+  derives or writes them, so before the first sync every Codex decision is
+  `unavailable: ledger_not_synced`, and rate-limit rows collected after the
+  last sync appear after the next one. With a sync, each decision equals the
+  one `accounting quota --json` prints.
+- `--text` prints one line per metric; M40 one per decision and limit window
+  (`M40 quota_headroom_at_dispatch <attempt> <limit> <kind> remaining <v>%
+  age_ms=<n> <freshness>`, or `... <limit> <kind> n/a (<reason>)`), or one per
+  decision without windows (`... <attempt> n/a (<reason>)`); the fleet pane
+  shows the same lines. Unknown is `n/a (<reason>)`. Text is the default; `--json` prints the object above.
 
 ## 7. Privacy allowlist and excerpts
 

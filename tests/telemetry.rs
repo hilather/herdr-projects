@@ -344,22 +344,74 @@ fn no_source_is_unavailable_not_zero() {
     assert!(!project.join(".state/telemetry.db").exists(), "the report writes nothing");
 }
 
+const ACCOUNTING: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/telemetry/accounting");
+
+fn digest(path: &Path) -> String { format!("sha256:{:x}", <sha2::Sha256 as sha2::Digest>::digest(path.as_os_str().as_encoded_bytes())) }
+
+/// Extended M40 in the report (contracts §6, contracts-accounting §5): per
+/// decision and limit window, the remaining value `accounting quota` shows,
+/// once `accounting sync` built the quota tables.
 #[test]
 fn quota_headroom_at_dispatch() {
+    // `quota-single.jsonl`: used 37.5% of the 300-minute `codex` window, one minute
+    // before dispatch; the window resets an hour after it → remaining 100 − 37.5 = 62.5, fresh.
+    let f = Fixture::new();
+    let resets = f.decided / 1000 + 3_600;
+    let text = fs::read_to_string(Path::new(ACCOUNTING).join("quota-single.jsonl")).unwrap()
+        .replace("@T1@", &jiff::Timestamp::from_millisecond(f.decided - 60_000).unwrap().to_string()).replace("@R1@", &resets.to_string());
+    let fixture = f.tmp.path().join("quota-single.jsonl");
+    fs::write(&fixture, text).unwrap();
+    f.rollout(&f.home, "quota", &[fixture.to_str().unwrap()], &f.worktree(), f.decided - 60_000, "0.154.0");
+    f.cli("collect");
+    // Before a sync the quota tables do not exist yet: unavailable, never 0.
+    let m40 = metric(&f.report(), "M40");
+    assert_eq!((&m40["definition"], &m40["name"], &m40["stale_after_ms"]), (&"M40.quota-windows-v1".into(), &"quota_headroom_at_dispatch".into(), &900_000.into()));
+    assert_eq!(m40["decisions"], serde_json::json!([{"attempt_id": f.attempt, "decided_unix_ms": f.decided, "service": "codex",
+        "value": unavailable("ledger_not_synced")}]));
+    f.cli_args(&["accounting", "sync"]);
+    let account = digest(&f.home);
+    let report = f.report();
+    assert_eq!(metric(&report, "M40")["decisions"], serde_json::json!([{"attempt_id": f.attempt, "decided_unix_ms": f.decided, "service": "codex",
+        "account": account, "windows": [
+            {"limit_id": "codex", "window_kind": "primary", "unit": "percent", "window_id": format!("codex:{account}:codex:primary:{}", resets * 1000),
+             "window_minutes": 300, "resets_unix_ms": resets * 1000, "observed_unix_ms": f.decided - 60_000, "age_ms": 60_000,
+             "value": "62.5", "used": "37.5", "freshness": "fresh"},
+            {"limit_id": "codex", "window_kind": "secondary", "value": unavailable("not_collected")}]}]));
+    // The same decisions as `accounting quota`.
+    assert_eq!(metric(&report, "M40")["decisions"], f.cli_args(&["accounting", "quota", "--json"]).0["metrics"]["M40"]["decisions"]);
+    // Text (the fleet pane's body): one line per decision and limit window.
+    let text = f.text(&["report"]);
+    let m40: Vec<&str> = text.lines().filter(|l| l.starts_with("M40 ")).collect();
+    assert_eq!(m40, [format!("M40 quota_headroom_at_dispatch {} codex primary remaining 62.5% age_ms=60000 fresh", f.attempt),
+        format!("M40 quota_headroom_at_dispatch {} codex secondary n/a (not_collected)", f.attempt)], "{text}");
+    fs::write(f.project.join("PROJECT.md"), "# demo\n").unwrap();
+    let pane = Command::new(BIN).env_clear().env("HOME", f.tmp.path().join("home")).env("PATH", "/usr/bin:/bin")
+        .args(["--root", f.root.to_str().unwrap(), "pane", "fleet"]).output().unwrap();
+    assert!(pane.status.success(), "{}", String::from_utf8_lossy(&pane.stderr));
+    let pane = String::from_utf8(pane.stdout).unwrap();
+    assert_eq!(pane.lines().filter(|l| l.starts_with("M40 ")).collect::<Vec<_>>(), m40, "{pane}");
+
+    // `head.jsonl` reports a window that reset at 1790003600 s (September 2026),
+    // before any decision made now: its remaining value no longer applies.
     let f = Fixture::new();
     f.rollout(&f.home, SID, &["head.jsonl"], &f.worktree(), f.decided - 60_000, "0.154.0");
     f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
     let report = f.report();
-    assert_eq!(metric(&report, "M40")["decisions"], serde_json::json!([{"age_ms": 60000, "attempt_id": f.attempt, "decided_unix_ms": f.decided,
-        "limit_id": "codex", "value": "62.5", "window_minutes": 300}]));
+    let primary = metric(&report, "M40")["decisions"][0]["windows"][0].clone();
+    assert_eq!((&primary["value"], &primary["age_ms"], &primary["resets_unix_ms"], primary.get("freshness")),
+        (&unavailable("window_reset_since_observation"), &60_000.into(), &1_790_003_600_000i64.into(), None));
+    assert!(f.text(&["report"]).lines().any(|l| l == format!("M40 quota_headroom_at_dispatch {} codex primary n/a (window_reset_since_observation) age_ms=60000", f.attempt)));
     // Rate limits are metadata, kept for an uncertified version; counters are not.
     assert_eq!(metric(&report, "M08")["value"], unavailable("no_certified_source"));
 
     let f = Fixture::new();
     f.rollout(&f.home, SID, &["head.jsonl"], &f.worktree(), f.decided + 1_000, "0.154.0");
     f.cli("collect");
-    assert_eq!(metric(&f.report(), "M40")["decisions"], serde_json::json!([{"attempt_id": f.attempt, "decided_unix_ms": f.decided,
-        "value": unavailable("no_observation")}]));
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(metric(&f.report(), "M40")["decisions"], serde_json::json!([{"attempt_id": f.attempt, "decided_unix_ms": f.decided, "service": "codex",
+        "account": digest(&f.home), "value": unavailable("no_observation")}]));
+    assert!(f.text(&["report"]).lines().any(|l| l == format!("M40 quota_headroom_at_dispatch {} n/a (no_observation)", f.attempt)));
 }
 
 fn outcome_usage(f: &Fixture) -> serde_json::Value { f.cli_args(&["attempts", "--json"]).0["attempts"][0]["usage"].clone() }
@@ -627,5 +679,80 @@ fn verification_combines_every_acceptance_policy() {
     assert_eq!(second["integration"], serde_json::json!({"state": "not_applicable", "reason": "verification_rejected"}));
     assert_eq!((&second["terminal_state"], &second["accepted"]), (&serde_json::json!("cancelled"), &serde_json::json!(false)));
     assert_eq!(f.text(&["attempts"]), format!("{} task=work state=cancelled wall_ms=unavailable:not_running result=submitted \
-        verification=rejected:checks_failed integration=not_applicable:verification_rejected accepted=false usage=unavailable:collection_not_run\n", f.attempt));
+        verification=rejected:checks_failed integration=not_applicable:verification_rejected accepted=false attention=unavailable:attention_not_collected usage=unavailable:collection_not_run\n", f.attempt));
+}
+
+/// Herdr stand-in (as tests/telemetry_accounting.rs): answers `agent list` from
+/// `$HOME/agents.json` and exits without a reply when that file is absent.
+const FAKE_HERDR: &str = "#!/bin/sh\ncase \"$*\" in\n'agent list') [ -f \"$HOME/agents.json\" ] || exit 1; cat \"$HOME/agents.json\";;\n*) exit 2;;\nesac\n";
+
+/// Contracts §4 `attention`: B6b's per-attempt summary in the outcome record.
+/// The first attempt is cancelled before any launch (`not_launched` once samples
+/// exist); the readmitted one runs and is sampled each minute: working at 0,
+/// waiting at 1, working at 2 (one closed wait of 60000 ms), Herdr unreachable
+/// at 3, waiting at 4 (after the gap), then no pass since (the wait is censored
+/// by a `not_observed` gap). Observed = working 0–1 + waiting 1–2 = 120000 ms.
+#[test]
+fn attempts_show_attention_summary() {
+    let f = Fixture::new();
+    let first = f.attempt.clone();
+    f.readmit("codex");
+    let db_path = f.project.join(".state/state.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    let attempt: String = db.query_row("SELECT id FROM attempts WHERE state='reserved'", [], |r| r.get(0)).unwrap();
+    let base = fs::canonicalize(f.tmp.path()).unwrap();
+    let herdr = base.join("herdr");
+    fs::write(&herdr, FAKE_HERDR).unwrap();
+    fs::set_permissions(&herdr, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let socket = base.join("herdr.sock");
+    let _server = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let home = f.tmp.path().join("home");
+    let cli = |args: &[&str]| -> String {
+        let out = Command::new(BIN).env_clear().env("HOME", &home).env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", &herdr)
+            .env("HERDR_PROJECTS_TELEMETRY_COLLECT_SECS", "60").args(["--root", f.root.to_str().unwrap(), "telemetry", "demo"]).args(args).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let attention = || {
+        let report: serde_json::Value = serde_json::from_str(&cli(&["attempts", "--json"])).unwrap();
+        report["attempts"].as_array().unwrap().iter().map(|a| (a["attempt_id"].as_str().unwrap().to_owned(), a["attention"].clone())).collect::<Vec<_>>()
+    };
+    f.cli("collect");
+    // No sample yet: every record keeps `attention_not_collected`.
+    assert_eq!(attention(), [(first.clone(), unavailable("attention_not_collected")), (attempt.clone(), unavailable("attention_not_collected"))]);
+
+    // Fixture only: the launch receipt `apply_launch_started` records, one minute before the first pass, and a running attempt.
+    let minute = |m: f64| 1_700_000_000_000 + (m * 60_000.0) as i64;
+    let receipt = serde_json::json!({"version": 2, "attempt": attempt, "operation": "op-launch",
+        "route": {"machine": "", "socket": socket, "workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1", "cwd": "/work"},
+        "terminal": "term-1", "session": {"device": 1, "inode": 2, "born_secs": 3, "born_nanos": 4},
+        "agent": {"kind": "codex", "name": "worker"}, "observed_unix_ms": minute(-1.0)});
+    db.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.launch_started','op-launch',1,1,?1)", [receipt.to_string()]).unwrap();
+    db.execute("UPDATE attempts SET state='running' WHERE id=?1", [&attempt]).unwrap();
+    for status in [Some("working"), Some("blocked"), Some("working"), None, Some("blocked")] {
+        match status {
+            Some(status) => fs::write(home.join("agents.json"), serde_json::json!({"result": {"agents": [{"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1",
+                "cwd": "/work", "agent": "codex", "name": "worker", "agent_status": status}]}}).to_string()).unwrap(),
+            None => fs::remove_file(home.join("agents.json")).unwrap(),
+        }
+        cli(&["accounting", "observe-attention"]);
+    }
+    // Fixture only: the passes ran milliseconds apart; re-time pass k to minute k.
+    let sidecar = f.sidecar();
+    let times: Vec<i64> = sidecar.prepare("SELECT DISTINCT observed_unix_ms FROM attention_samples ORDER BY 1").unwrap()
+        .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    assert_eq!(times.len(), 5);
+    for (k, old) in times.iter().enumerate() {
+        sidecar.execute("UPDATE attention_samples SET observed_unix_ms=?1 WHERE observed_unix_ms=?2", [minute(k as f64), *old]).unwrap();
+    }
+    drop(sidecar);
+
+    // Waits: 1–2 closed (60000 ms, counted) and 4 (after the gap, censored) → 2 counted, 1 censored.
+    // Gaps: 2–4 `herdr_unreachable`, from 4 `not_observed`.
+    assert_eq!(attention(), [(first, unavailable("not_launched")), (attempt.clone(), serde_json::json!({
+        "interventions": 2, "uncertain_starts": 0, "waiting_ms": 60_000, "observed_ms": 120_000, "intervals": 2, "censored_intervals": 1,
+        "gaps": {"herdr_unreachable": 1, "not_observed": 1}, "reason_type": "blocked_untyped", "basis": "fixture", "source": "herdr-agent-list-v1"}))]);
+    let text = cli(&["attempts"]);
+    let line = text.lines().find(|l| l.starts_with(attempt.as_str())).unwrap();
+    assert!(line.contains(" attention=waits=2 waiting_ms=60000 censored=1 gaps=2 usage="), "{line}");
 }
