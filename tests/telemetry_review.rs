@@ -734,3 +734,325 @@ fn failed_repairs_stay_in_denominator_and_mixed_credit_is_split() {
         (&json!("unattributable"), &json!([]), &json!("1"), &json!("unattributable")));
     assert_eq!(fixes_show(&f, None)["head_seq"], json!(20));
 }
+
+/// The factory side of a protocol world: task `work`, one result submission
+/// per `c` in `artifacts` (id `c…c`, candidate `c…c`) by the author attempt,
+/// reviewer attempts `rev-*` and the retained Codex profile `fast`.
+fn artifact_world(f: &Fixture, artifacts: &[char], reviewers: &[&str]) {
+    let db_path = f.project.join(".state/state.db");
+    plant_profile(&db_path, fast_profile(f));
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute("INSERT INTO task_contracts(task_id,contract_revision,plan_revision,project_store,expected_head,repository,base_oid,object_format,memory_snapshot_id,route,raw_bytes,raw_digest,installed_seq)
+        VALUES('work',1,NULL,'store',0,'/repo',?1,'sha1',NULL,'verify_only',x'61',?2,(SELECT max(sequence) FROM events))", rusqlite::params![oid('b'), hex('c')]).unwrap();
+    for (i, c) in artifacts.iter().enumerate() {
+        db.execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,artifact_manifest,claimed_checks,created_unix_ms)
+            VALUES(?1,'store',?1,?2,'{}','work',1,?2,?3,'/repo',?4,?5,'sha1','[]','[]',?6)", rusqlite::params![hex(*c), hex('d'), f.attempt, oid('b'), oid(*c), 1000 + i as i64]).unwrap();
+    }
+    for attempt in reviewers {
+        db.execute("INSERT INTO attempts(id,task_id,revision,state,reservation,termination_observed) VALUES(?1,'work',1,'completed',?1,1)", [attempt]).unwrap();
+    }
+}
+
+const SKEPTICAL: &str = "skeptical-challenge.v1";
+const BUDGET: &str = "1800000";
+
+/// The example skeptical protocol of contracts-review.md §7.
+fn skeptical_protocol() -> serde_json::Value {
+    json!({"schema": "review_protocol.v1", "protocol": SKEPTICAL, "kind": "skeptical", "scope": "candidate_diff", "role": "evaluation",
+        "challenges": ["unsupported_claims", "missed_edge_cases", "unsafe_concurrency", "missing_acceptance_criteria", "evidence_gaps"],
+        "failure_classes": ["logic", "boundary", "concurrency", "security", "test_weakening", "requirement_omission"],
+        "permitted_tools": ["read", "test"], "budget_ms": 1_800_000, "evidence_min": 1, "stopping_rule": "checklist_complete",
+        "prior_disclosure": "withheld", "reviewer_profile": null,
+        "outcome": {"primary": "new_validated_unique_findings.v1", "adjudication": "owner_triage.v1", "severity_policy": "finding_severity.v1", "min_severity": "low"}})
+}
+
+fn input(f: &Fixture, name: &str, body: &serde_json::Value) -> String {
+    let path = f.tmp.path().join(name);
+    fs::write(&path, body.to_string()).unwrap();
+    path.to_str().unwrap().to_owned()
+}
+
+/// Open a review of artifact `c` (method `kind`, `protocol`, optional budget); returns its id.
+fn open_review(f: &Fixture, c: char, kind: &str, protocol: &str, budget: Option<&str>) -> String {
+    let sub = hex(c);
+    let mut args = vec!["review", "open", sub.as_str(), "--kind", kind, "--protocol", protocol];
+    if let Some(budget) = budget { args.extend(["--budget-ms", budget]); }
+    f.cli_args(&args).0["opportunity"]["opportunity_id"].as_str().unwrap().to_owned()
+}
+
+/// Assign `fast`, start `attempt`'s session and complete it on artifact `c` with `findings` and `evidence`.
+fn run_review(f: &Fixture, opportunity: &str, c: char, attempt: &str, findings: serde_json::Value, evidence: serde_json::Value) -> serde_json::Value {
+    f.cli_args(&["review", "assign", opportunity, "--reviewer", "fast"]);
+    let session = f.cli_args(&["review", "start", opportunity, "--attempt", attempt]).0["session"]["session_id"].as_str().unwrap().to_owned();
+    let receipt = json!({"schema": "review_receipt.v1", "session_id": session, "submission_id": hex(c), "candidate_oid": oid(c), "outcome": "completed",
+        "findings": findings, "evidence": evidence});
+    f.cli_args(&["review", "complete", "--input-file", &input(f, &format!("{attempt}.json"), &receipt)]).0["completion"].clone()
+}
+
+fn protocols_show(f: &Fixture, as_of: Option<i64>) -> serde_json::Value {
+    let seq = as_of.map(|s| s.to_string());
+    let mut args = vec!["review", "protocols", "show"];
+    if let Some(seq) = &seq { args.extend(["--as-of", seq.as_str()]); }
+    f.cli_args(&args).0["protocols"].clone()
+}
+
+/// TM3.4 incremental yield golden. History by hand: seq 1 registers
+/// `skeptical-challenge.v1`; 2 is ordinary review O1's (code, S1) submission
+/// `null-deref`; 3 validates it as K = `finding:canonical-3`. 4 binds the
+/// skeptical pass P1 (S1, prior O1): same artifact, prior coverage complete,
+/// cutoff 3, so K is known. P1 reports `alias`, `leak`, `reworded` and
+/// `style` (submissions 2–5 at seq 5–8, claims 2–5). 9 marks `reworded` a
+/// duplicate of K; 10 validates `alias` as new A = `finding:canonical-10`;
+/// 11 validates `leak` as L = `finding:canonical-11`; 12 rejects `style`.
+/// Then P1 yields A and L: M28 = 2/1 (one rediscovery). 13 merges A into K
+/// (same root cause, reworded): only L is new, M28 = 1/1, 2 rediscoveries;
+/// as of 12 it is still 2. 14 binds P2 on S2 (a later candidate) after O1:
+/// `changed_artifact`, its own opportunity; its finding (15, validated at 16)
+/// is never incremental. 17 binds P3 on S1 after O2, which never ran:
+/// `incomplete_prior_coverage`. Final M28 = 1/1, excluded 1 + 1.
+#[test]
+fn reworded_duplicates_add_no_incremental_discovery_and_new_artifact_is_new_opportunity() {
+    let f = Fixture::new();
+    artifact_world(&f, &['1', '2'], &["rev-a1", "rev-k1", "rev-k2", "rev-kz"]);
+    let db_path = f.project.join(".state/state.db");
+    let protocol = input(&f, "protocol.json", &skeptical_protocol());
+
+    // No protocol store rows yet: M28's denominator is empty, never 0.
+    let m28 = f.cli_args(&["review", "report"]).0["metrics"]["M28"].clone();
+    assert_eq!((&m28["value"], &m28["reason"], &m28["estimate"]), (&json!(null), &json!("empty_denominator"), &json!("descriptive")));
+
+    // Only the owner registers; a protocol is immutable and carries tokens, never prose.
+    let mut store = SqliteStore::open(&db_path).unwrap();
+    for principal in ["worker:rev-k1", "rev-k1"] {
+        let err = store.register_review_protocol(skeptical_protocol().to_string().as_bytes(), None, principal, 1).unwrap_err();
+        assert!(format!("{err:?}").contains("a worker cannot"), "{principal}");
+    }
+    drop(store);
+    let mut prose = skeptical_protocol();
+    prose["prompt"] = json!("Challenge every claim the author makes");
+    assert!(f.cli_fail(&["review", "protocols", "register", "--input-file", &input(&f, "prose.json", &prose)]).contains("unknown field `prompt`"));
+    let mut sentence = skeptical_protocol();
+    sentence["challenges"] = json!(["Look for missing edge cases"]);
+    assert!(f.cli_fail(&["review", "protocols", "register", "--input-file", &input(&f, "sentence.json", &sentence)]).contains("is not a lowercase identifier"));
+    let registered = f.cli_args(&["review", "protocols", "register", "--input-file", &protocol]).0["event"].clone();
+    assert_eq!((&registered["seq"], &registered["kind"], &registered["subject"]["protocol"], &registered["authority"]),
+        (&json!(1), &json!("protocol_registered"), &json!(SKEPTICAL), &json!("operator_owner.v1")));
+    assert!(f.cli_fail(&["review", "protocols", "register", "--input-file", &protocol]).contains("needs a new versioned identifier"));
+
+    // Ordinary review O1 of S1 finds K.
+    let o1 = open_review(&f, '1', "code", "review-protocol.v1", None);
+    run_review(&f, &o1, '1', "rev-a1", json!(["finding:null-deref"]), json!([]));
+    f.cli_args(&["review", "findings", "validate", "1", "--new", "--severity", "high", "--evidence", &evidence('e')]);
+
+    // A pass runs under its protocol's scope, role and assigned budget, and is bound before it starts.
+    let no_budget = open_review(&f, '1', "skeptical", SKEPTICAL, None);
+    assert!(f.cli_fail(&["review", "protocols", "bind", &no_budget, "--prior", &o1]).contains("assigned budget"));
+    let started = open_review(&f, '1', "skeptical", SKEPTICAL, Some("1800000"));
+    f.cli_args(&["review", "assign", &started, "--reviewer", "fast"]);
+    f.cli_args(&["review", "start", &started, "--attempt", "rev-kz"]);
+    assert!(f.cli_fail(&["review", "protocols", "bind", &started, "--prior", &o1]).contains("a pass is bound before its review starts"));
+    let p1 = open_review(&f, '1', "skeptical", SKEPTICAL, Some(BUDGET));
+    let bound = f.cli_args(&["review", "protocols", "bind", &p1, "--prior", &o1]).0["event"].clone();
+    assert_eq!((&bound["seq"], &bound["subject"]["cutoff_seq"], &bound["subject"]["comparability"], &bound["subject"]["prior_coverage"]),
+        (&json!(4), &json!(3), &json!("same_artifact"), &json!("complete")));
+    assert!(f.cli_fail(&["review", "protocols", "bind", &p1, "--prior", &o1]).contains("already a bound pass"));
+
+    // The skeptical session reports four findings; two are rewordings of K.
+    let done = run_review(&f, &p1, '1', "rev-k1", json!([{"ref": "finding:reworded", "title": "Loader dereferences null when the config file is absent"},
+        {"ref": "finding:alias", "title": "Missing config file crashes startup"}, "finding:leak", "finding:style"]), json!([evidence('a')]));
+    assert_eq!(done["finding_submissions"], json!([2, 3, 4, 5]));
+    f.cli_args(&["review", "findings", "duplicate", "4", "--of", "finding:canonical-3"]);
+    f.cli_args(&["review", "findings", "validate", "2", "--new", "--severity", "high", "--evidence", &evidence('b')]);
+    f.cli_args(&["review", "findings", "validate", "3", "--new", "--severity", "medium", "--evidence", &evidence('c')]);
+    f.cli_args(&["review", "findings", "reject", "5", "--reason", "out_of_scope"]);
+    let pass = protocols_show(&f, None)["passes"][0].clone();
+    assert_eq!((&pass["opportunity_id"], &pass["known_findings"], &pass["new_unique_findings"], &pass["rediscovered"], &pass["eligible"]),
+        (&json!(p1), &json!(["finding:canonical-3"]), &json!(["finding:canonical-10", "finding:canonical-11"]), &json!(1), &json!(true)));
+    assert_eq!(pass["claims"].as_array().unwrap().iter().map(|c| (c["claim_id"].as_i64().unwrap(), c["incremental"].as_str().unwrap())).collect::<Vec<_>>(),
+        [(2, "new"), (3, "new"), (4, "rediscovered"), (5, "rejected")]);
+    let m28 = f.cli_args(&["review", "report"]).0["metrics"]["M28"].clone();
+    assert_eq!((&m28["numerator"], &m28["denominator"], &m28["value"], &m28["rediscovered"]), (&json!(2), &json!(1), &json!("2/1"), &json!(1)));
+
+    // The owner merges the reworded A into K: A was never a new discovery.
+    assert_eq!(f.cli_args(&["review", "findings", "merge", "finding:canonical-10", "--into", "finding:canonical-3"]).0["event"]["seq"], json!(13));
+    let pass = protocols_show(&f, None)["passes"][0].clone();
+    assert_eq!((&pass["new_unique_findings"], &pass["rediscovered"]), (&json!(["finding:canonical-11"]), &json!(2)));
+    assert_eq!(protocols_show(&f, Some(12))["passes"][0]["new_unique_findings"], json!(["finding:canonical-10", "finding:canonical-11"]));
+
+    // A later candidate is another artifact: its pass is its own opportunity, labelled changed.
+    let p2 = open_review(&f, '2', "skeptical", SKEPTICAL, Some(BUDGET));
+    assert_ne!(p2, p1);
+    assert_eq!(f.cli_args(&["review", "protocols", "bind", &p2, "--prior", &o1]).0["event"]["subject"]["comparability"], json!("changed_artifact"));
+    f.cli_args(&["review", "assign", &p2, "--reviewer", "fast"]);
+    let session = f.cli_args(&["review", "start", &p2, "--attempt", "rev-k2"]).0["session"]["session_id"].as_str().unwrap().to_owned();
+    // It cannot report on S1's candidate as if it were the same review.
+    let masquerade = json!({"schema": "review_receipt.v1", "session_id": session, "submission_id": hex('1'), "candidate_oid": oid('1'), "outcome": "completed",
+        "findings": ["finding:s2-bug"], "evidence": [evidence('a')]});
+    assert!(f.cli_fail(&["review", "complete", "--input-file", &input(&f, "masquerade.json", &masquerade)]).contains("names another candidate"));
+    let honest = json!({"schema": "review_receipt.v1", "session_id": session, "submission_id": hex('2'), "candidate_oid": oid('2'), "outcome": "completed",
+        "findings": ["finding:s2-bug"], "evidence": [evidence('a')]});
+    assert_eq!(f.cli_args(&["review", "complete", "--input-file", &input(&f, "honest.json", &honest)]).0["completion"]["finding_submissions"], json!([6]));
+    f.cli_args(&["review", "findings", "validate", "6", "--new", "--severity", "high", "--evidence", &evidence('d')]);
+
+    // A pass after a prior that never ran has incomplete prior coverage.
+    let o2 = open_review(&f, '1', "code", "review-protocol.v1", None);
+    let p3 = open_review(&f, '1', "skeptical", SKEPTICAL, Some(BUDGET));
+    let bound = f.cli_args(&["review", "protocols", "bind", &p3, "--prior", &o2]).0["event"].clone();
+    assert_eq!((&bound["seq"], &bound["subject"]["prior_coverage"], &bound["subject"]["priors"][0]["status"]), (&json!(17), &json!("incomplete"), &json!("unassigned")));
+
+    let shown = protocols_show(&f, None);
+    let by = |id: &str| shown["passes"].as_array().unwrap().iter().find(|p| p["opportunity_id"] == id).unwrap().clone();
+    let changed = by(&p2);
+    assert_eq!((&changed["candidate_oid"], &changed["priors"][0]["artifact"], &changed["new_unique_findings"], &changed["eligible"], &changed["exclusion"]),
+        (&json!(oid('2')), &json!("changed_artifact"), &json!(["finding:canonical-16"]), &json!(false), &json!("changed_artifact")));
+    assert_eq!(by(&p3)["exclusion"], json!("incomplete_prior_coverage"));
+    assert_eq!(shown["history"].as_array().unwrap().iter().map(|e| (e["seq"].as_i64().unwrap(), e["kind"].as_str().unwrap())).collect::<Vec<_>>(),
+        [(1, "protocol_registered"), (4, "pass_bound"), (14, "pass_bound"), (17, "pass_bound")]);
+
+    let m28 = f.report()["metrics"]["M28"].clone();
+    assert_eq!((&m28["numerator"], &m28["denominator"], &m28["value"], &m28["rediscovered"]), (&json!(1), &json!(1), &json!("1/1"), &json!(2)));
+    assert_eq!((&m28["excluded"], &m28["by_protocol"]), (&json!({"changed_artifact": 1, "incomplete_prior_coverage": 1}),
+        &json!({SKEPTICAL: {"value": "1/1", "prior_disclosure": "withheld"}})));
+    assert_eq!((&m28["estimate"], &m28["observational"], &m28["causal"]), (&json!("descriptive"), &json!(true), &unavailable("not_randomized")));
+    // The triage view still counts every submission once.
+    assert_eq!(f.cli_args(&["review", "findings", "show"]).0["findings"]["summary"]["submissions"], json!(6));
+}
+
+fn experiments_show(f: &Fixture, as_of: Option<i64>) -> serde_json::Value {
+    let seq = as_of.map(|s| s.to_string());
+    let mut args = vec!["review", "experiments", "show"];
+    if let Some(seq) = &seq { args.extend(["--as-of", seq.as_str()]); }
+    f.cli_args(&args).0["experiments"]["experiments"][0].clone()
+}
+
+/// TM3.4 preregistration golden. Seq 1 registers the skeptical protocol, 2
+/// preregisters the randomized experiment E (seed a…a, reference arm
+/// `standard`, `skeptical` adds a pass, min 2 units per arm). A code review X
+/// of S1 already completed, so it cannot be assigned. 3–6 assign the base
+/// reviews B1–B4 (S1–S4); the seed gives, by
+/// `sha256("review_experiment.v1:" + seed + ":" + submission)` mod 2:
+/// standard, skeptical, standard, skeptical. Base submissions: B1 `b1` (seq
+/// 7), B2 `b2` (8), B3 none, B4 `b4` (9). 10 and 11 bind passes P2 (after B2)
+/// and P4 (after B4); P2 reports `k2-new` (12) and `k2-reworded` (13), P4
+/// `k4-reworded` (14). 15–18 validate b1, b2, b4 and k2-new as new; 19 and 20
+/// mark the rewordings duplicates. Outcomes: S1 1, S2 2 (b2 + k2-new), S3 0,
+/// S4 1 (the reworded report adds nothing). Means 1/2 and 3/2: difference
+/// 3/2 − 1/2 = 1. As of 14 only S3 is analyzable. The descriptive M28 over
+/// P2 and P4 is 1/2. 21 excludes S3: standard has 1 analyzable unit, so the
+/// difference is unavailable. 22 binds a pass after B1 (standard):
+/// crossover, still analyzed as assigned.
+#[test]
+fn preregistered_assignment_frozen_before_outcomes_observational_is_descriptive() {
+    let f = Fixture::new();
+    artifact_world(&f, &['1', '2', '3', '4'], &["rev-x", "rev-b1", "rev-b2", "rev-b3", "rev-b4", "rev-k2", "rev-k4"]);
+    let db_path = f.project.join(".state/state.db");
+    f.cli_args(&["review", "protocols", "register", "--input-file", &input(&f, "protocol.json", &skeptical_protocol())]);
+    let experiment = json!({"schema": "review_experiment.v1", "experiment": "skeptical-vs-standard.v1", "design": "randomized", "seed": hex('a'),
+        "eligibility": {"kind": "code", "scope": "candidate_diff", "role": "evaluation", "protocol": "review-protocol.v1"},
+        "arms": [{"arm": "standard", "protocol": null}, {"arm": "skeptical", "protocol": SKEPTICAL}],
+        "primary_outcome": "validated_unique_findings.v1", "adjudication": "owner_triage.v1", "horizon_days": 14, "min_units": 2, "stopping_rule": "fixed_horizon", "planned_units": 4});
+
+    // Preregistration: owner only, never withholding a gate, arms under registered protocols, a recorded seed.
+    let mut store = SqliteStore::open(&db_path).unwrap();
+    let err = store.register_review_experiment(experiment.to_string().as_bytes(), None, "worker:rev-b1", 1).unwrap_err();
+    assert!(format!("{err:?}").contains("a worker cannot"), "{err:?}");
+    drop(store);
+    let variant = |name: &str, path: &str, value: serde_json::Value| {
+        let mut body = experiment.clone();
+        body.pointer_mut(path).map(|v| *v = value).unwrap();
+        f.cli_fail(&["review", "experiments", "register", "--input-file", &input(&f, name, &body)])
+    };
+    assert!(variant("gate.json", "/eligibility/role", json!("gate")).contains("never withheld"));
+    assert!(variant("seedless.json", "/seed", json!(null)).contains("records its seed"));
+    assert!(variant("unregistered.json", "/arms/1/protocol", json!("skeptical-challenge.v9")).contains("is not registered"));
+    let registered = f.cli_args(&["review", "experiments", "register", "--input-file", &input(&f, "experiment.json", &experiment)]).0["event"].clone();
+    assert_eq!((&registered["seq"], &registered["subject"]["design"]), (&json!(2), &json!("randomized")));
+    // Frozen: a raw rewrite of the preregistration aborts.
+    let raw = rusqlite::Connection::open(&db_path).unwrap().execute("UPDATE review_experiments SET min_units=1", []).unwrap_err();
+    assert!(raw.to_string().contains("append-only"), "{raw}");
+
+    // Assignment precedes outcomes: a review that already completed cannot be enrolled (store and trigger).
+    let x = open_review(&f, '1', "code", "review-protocol.v1", None);
+    run_review(&f, &x, '1', "rev-x", json!([]), json!([]));
+    assert!(f.cli_fail(&["review", "experiments", "assign", "skeptical-vs-standard.v1", &x]).contains("assignment is frozen before outcomes"));
+    {
+        let mut db = rusqlite::Connection::open(&db_path).unwrap();
+        let tx = db.transaction().unwrap();
+        tx.execute("INSERT INTO protocol_log(seq,kind,principal,authority,expected_seq,recorded_unix_ms) VALUES(3,'unit_assigned','operator:cli','operator_owner.v1',NULL,1)", []).unwrap();
+        let raw = tx.execute("INSERT INTO experiment_units(seq,experiment_seq,opportunity_id,submission_id,arm,block) VALUES(3,2,?1,?2,'standard',NULL)", [&x, &hex('1')]).unwrap_err();
+        assert!(raw.to_string().contains("before any outcome"), "{raw}");
+    }
+    let ineligible = open_review(&f, '1', "security", "review-protocol.v1", None);
+    assert!(f.cli_fail(&["review", "experiments", "assign", "skeptical-vs-standard.v1", &ineligible]).contains("kind security, the preregistration requires code"));
+
+    let base: Vec<String> = ['1', '2', '3', '4'].into_iter().map(|c| open_review(&f, c, "code", "review-protocol.v1", None)).collect();
+    assert!(f.cli_fail(&["review", "experiments", "assign", "skeptical-vs-standard.v1", &base[0], "--block", "b", "--arm", "skeptical"]).contains("from its recorded seed"));
+    let arms: Vec<(i64, String)> = base.iter().map(|b| {
+        let e = f.cli_args(&["review", "experiments", "assign", "skeptical-vs-standard.v1", b]).0["event"].clone();
+        (e["seq"].as_i64().unwrap(), e["subject"]["arm"].as_str().unwrap().to_owned())
+    }).collect();
+    assert_eq!(arms, [(3, "standard".into()), (4, "skeptical".into()), (5, "standard".into()), (6, "skeptical".into())]);
+    let again = open_review(&f, '1', "code", "review-protocol.v1", None);
+    assert!(f.cli_fail(&["review", "experiments", "assign", "skeptical-vs-standard.v1", &again]).contains("is already a unit"));
+
+    // Base reviews, then the treatment arm's passes.
+    run_review(&f, &base[0], '1', "rev-b1", json!(["finding:b1"]), json!([]));
+    run_review(&f, &base[1], '2', "rev-b2", json!(["finding:b2"]), json!([]));
+    run_review(&f, &base[2], '3', "rev-b3", json!([]), json!([]));
+    run_review(&f, &base[3], '4', "rev-b4", json!(["finding:b4"]), json!([]));
+    let p2 = open_review(&f, '2', "skeptical", SKEPTICAL, Some(BUDGET));
+    let p4 = open_review(&f, '4', "skeptical", SKEPTICAL, Some(BUDGET));
+    assert_eq!(f.cli_args(&["review", "protocols", "bind", &p2, "--prior", &base[1]]).0["event"]["seq"], json!(10));
+    assert_eq!(f.cli_args(&["review", "protocols", "bind", &p4, "--prior", &base[3]]).0["event"]["seq"], json!(11));
+    assert_eq!(run_review(&f, &p2, '2', "rev-k2", json!(["finding:k2-new", "finding:k2-reworded"]), json!([evidence('a')]))["finding_submissions"], json!([4, 5]));
+    assert_eq!(run_review(&f, &p4, '4', "rev-k4", json!(["finding:k4-reworded"]), json!([evidence('a')]))["finding_submissions"], json!([6]));
+    for claim in ["1", "2", "3", "4"] { f.cli_args(&["review", "findings", "validate", claim, "--new", "--severity", "medium", "--evidence", &evidence('e')]); }
+    f.cli_args(&["review", "findings", "duplicate", "5", "--of", "finding:canonical-16"]);
+    f.cli_args(&["review", "findings", "duplicate", "6", "--of", "finding:canonical-17"]);
+
+    let e = experiments_show(&f, None);
+    assert_eq!(e["units"].as_array().unwrap().iter().map(|u| (u["arm"].as_str().unwrap(), u["status"].as_str().unwrap(), u["outcome"].as_i64().unwrap(), u["treatment_received"].clone()))
+        .collect::<Vec<_>>(), [("standard", "analyzable", 1, json!(null)), ("skeptical", "analyzable", 2, json!(true)), ("standard", "analyzable", 0, json!(null)), ("skeptical", "analyzable", 1, json!(true))]);
+    assert_eq!(e["units"][1]["new_unique_findings"], json!(["finding:canonical-16", "finding:canonical-18"]));
+    let est = &e["estimate"];
+    assert_eq!((&est["estimate"], &est["analysis"], &est["reference_arm"], &est["uncertainty"]),
+        (&json!("randomized"), &json!("intention_to_treat"), &json!("standard"), &unavailable("interval_not_computed")));
+    assert_eq!((&est["arms"]["standard"]["mean"], &est["arms"]["skeptical"]["mean"], &est["arms"]["skeptical"]["outcome_total"]), (&json!("1/2"), &json!("3/2"), &json!(3)));
+    assert_eq!(est["differences"], json!({"skeptical": {"value": "1", "analyzable": [2, 2]}}));
+    // Replay: before any triage only S3 (no findings) was settled.
+    let early = experiments_show(&f, Some(14));
+    assert_eq!(early["units"].as_array().unwrap().iter().map(|u| u["status"].as_str().unwrap()).collect::<Vec<_>>(), ["pending", "pending", "analyzable", "pending"]);
+    assert_eq!(early["estimate"]["differences"]["skeptical"], json!({"value": unavailable("insufficient_data"), "analyzable": [1, 0]}));
+
+    // Observational M28 over the same passes stays descriptive; the experiment's estimate sits beside it.
+    let m28 = f.report()["metrics"]["M28"].clone();
+    assert_eq!((&m28["value"], &m28["estimate"], &m28["observational"], &m28["causal"], &m28["rediscovered"], &m28["control_opportunities"]),
+        (&json!("1/2"), &json!("descriptive"), &json!(true), &unavailable("not_randomized"), &json!(2), &json!(2)));
+    assert_eq!(m28["experiments"]["skeptical-vs-standard.v1"]["differences"]["skeptical"]["value"], json!("1"));
+    assert_eq!(m28["experiments"]["skeptical-vs-standard.v1"]["estimate"], json!("randomized"));
+
+    // An exclusion stays listed; below the preregistered minimum there is no estimate.
+    assert!(f.cli_fail(&["review", "experiments", "exclude", "skeptical-vs-standard.v1", &base[2], "--reason", "changed_my_mind"]).contains("unknown exclusion reason"));
+    assert_eq!(f.cli_args(&["review", "experiments", "exclude", "skeptical-vs-standard.v1", &base[2], "--reason", "operator_error"]).0["event"]["seq"], json!(21));
+    let e = experiments_show(&f, None);
+    assert_eq!((&e["units"][2]["status"], &e["units"][2]["arm"], &e["units"][2]["exclusion"]), (&json!("excluded"), &json!("standard"), &json!({"seq": 21, "reason": "operator_error"})));
+    assert_eq!((&e["estimate"]["arms"]["standard"]["excluded"], &e["estimate"]["differences"]["skeptical"]),
+        (&json!({"operator_error": 1}), &json!({"value": unavailable("insufficient_data"), "analyzable": [1, 2]})));
+
+    // Crossover: a pass after a standard unit is recorded and the unit stays in its assigned arm.
+    let p1 = open_review(&f, '1', "skeptical", SKEPTICAL, Some(BUDGET));
+    assert_eq!(f.cli_args(&["review", "protocols", "bind", &p1, "--prior", &base[0]]).0["event"]["seq"], json!(22));
+    let e = experiments_show(&f, None);
+    assert_eq!((&e["units"][0]["arm"], &e["units"][0]["crossover"], &e["units"][0]["status"], &e["units"][0]["passes"]), (&json!("standard"), &json!(true), &json!("pending"), &json!([p1])));
+    assert_eq!(e["estimate"]["arms"]["standard"]["crossover"], json!(1));
+
+    // A matched design takes the owner's block and arm, never a seed.
+    let mut matched = experiment.clone();
+    matched["experiment"] = json!("skeptical-matched.v1");
+    matched["design"] = json!("matched");
+    matched["seed"] = json!(null);
+    matched["match_on"] = json!(["task_class", "repository"]);
+    f.cli_args(&["review", "experiments", "register", "--input-file", &input(&f, "matched.json", &matched)]);
+    assert!(f.cli_fail(&["review", "experiments", "assign", "skeptical-matched.v1", &again]).contains("needs --block and --arm"));
+    assert_eq!(f.cli_args(&["review", "experiments", "assign", "skeptical-matched.v1", &again, "--block", "pair-1", "--arm", "skeptical"]).0["event"]["subject"]["block"], json!("pair-1"));
+}

@@ -4,7 +4,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{fmt, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 
-pub const SCHEMA: u32 = 56;
+pub const SCHEMA: u32 = 57;
 const APPLICATION: u32 = 1_213_222_994;
 pub const MIN_SQLITE: i32 = 3_053_004;
 pub const MIN_SQLITE_VERSION: &str = "3.53.4";
@@ -118,6 +118,7 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../migrations/0054_review_capture.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0055_finding_triage.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0056_fix_attribution.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0057_review_protocols.sql"))?;
             tx.commit()?;
         }
         // Persist the initial directory entry as well as SQLite's own commit.
@@ -525,6 +526,8 @@ mod finding_triage;
 pub use finding_triage::{FindingEvent,FindingState,FindingSummary,FindingTarget,TriageOutcome,TriageRequest,finding_state};
 mod fix_attribution;
 pub use fix_attribution::{CREDIT_UNIT,CreditShareSpec,DEFAULT_REPAIR_HORIZON_MS,FixState,IntroductionRequest,RepairAssignment,credit_text,fix_state};
+mod review_protocols;
+pub use review_protocols::{ProtocolState,protocol_state};
 pub use delegation::DelegationReserve;
 
 #[cfg(target_os = "linux")]

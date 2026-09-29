@@ -200,11 +200,14 @@ pub(super) fn triage_authority(tx: &Connection, principal: &str) -> Result<()> {
     Ok(())
 }
 
-/// Head of the one ordering of `finding_log` and, from migration 0056,
-/// `fix_log` (contracts-review.md §6): the replay watermark of both.
+/// Head of the one ordering of `finding_log`, from migration 0056 `fix_log`
+/// (contracts-review.md §6) and from 0057 `protocol_log` (§7): the replay
+/// watermark of all of them.
 pub(super) fn head(tx: &Connection) -> Result<i64> {
-    let fixes: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='fix_log')", [], |r| r.get(0))?;
-    let sql = if fixes { "SELECT max(coalesce((SELECT max(seq) FROM finding_log),0), coalesce((SELECT max(seq) FROM fix_log),0))" } else { "SELECT coalesce(max(seq),0) FROM finding_log" };
+    let table = |name: &str| -> Result<bool> { Ok(tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [name], |r| r.get(0))?) };
+    let sql = if table("protocol_log")? {
+        "SELECT max(coalesce((SELECT max(seq) FROM finding_log),0), coalesce((SELECT max(seq) FROM fix_log),0), coalesce((SELECT max(seq) FROM protocol_log),0))"
+    } else if table("fix_log")? { "SELECT max(coalesce((SELECT max(seq) FROM finding_log),0), coalesce((SELECT max(seq) FROM fix_log),0))" } else { "SELECT coalesce(max(seq),0) FROM finding_log" };
     Ok(tx.query_row(sql, [], |r| r.get(0))?)
 }
 

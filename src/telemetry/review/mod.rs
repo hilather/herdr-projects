@@ -3,8 +3,8 @@
 //! Hooks registered centrally in `super::LANES`; this lane adds subcommands,
 //! metrics, tick work and `migrations/telemetry/review/NNNN_*.sql` here only.
 //! Writes go through the canonical store (`SqliteStore`, one `state.db`
-//! transaction each); `show`, `present`, `report`, `findings show`, `fixes show` and the
-//! metrics hook read `state.db` strictly read-only.
+//! transaction each); `show`, `present`, `report`, `findings show`, `fixes show`,
+//! `protocols show`, `experiments show` and the metrics hook read `state.db` strictly read-only.
 use anyhow::{Context, Result};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
@@ -12,8 +12,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 mod fixes;
+mod protocols;
 
-use crate::store::{FindingSummary, FindingTarget, ReviewAssignmentChoice, ReviewOpportunitySpec, SqliteStore, TriageOutcome, TriageRequest, finding_state, fix_state};
+use crate::store::{FindingSummary, FindingTarget, ReviewAssignmentChoice, ReviewOpportunitySpec, SqliteStore, TriageOutcome, TriageRequest, finding_state, fix_state, protocol_state};
 
 pub const STREAM: &str = "review";
 /// `include_str!` of `migrations/telemetry/review/`, in order; index + 1 is the stream version.
@@ -92,11 +93,12 @@ pub enum Command {
         #[arg(long)]
         since: Option<i64>,
     },
-    /// Lane metrics (M20–M23, M25–M27, M29; M24 unavailable) as JSON. Read-only.
+    /// Lane metrics (M20–M23, M25–M29; M24 unavailable) as JSON. Read-only.
     Report {
         /// Window start (Unix ms), by the assignment (unassigned: by creation;
         /// finding submissions: by arrival; findings: by their discovery's
-        /// arrival; repairs: by opening; integrations: by integration).
+        /// arrival; repairs: by opening; integrations: by integration;
+        /// passes: by binding).
         #[arg(long)]
         since: Option<i64>,
         /// M27 reopen horizon in days.
@@ -109,6 +111,12 @@ pub enum Command {
     /// Repair opportunities, fixes, reopenings, introduction and role credit.
     #[command(subcommand)]
     Fixes(fixes::FixesCommand),
+    /// Versioned review protocols and second-review passes (incremental yield).
+    #[command(subcommand)]
+    Protocols(protocols::ProtocolsCommand),
+    /// Preregistered review experiments: units, exclusions, crossover, estimates.
+    #[command(subcommand)]
+    Experiments(protocols::ExperimentsCommand),
 }
 
 /// `herdr-projects telemetry <slug> review findings ...`. Every write is a
@@ -235,6 +243,8 @@ pub fn run(project: &Path, command: Command) -> Result<String> {
         Command::Report { since, horizon_days } => json!({"metrics": lane_metrics(project, since, i64::from(horizon_days))?, "since_unix_ms": since}),
         Command::Findings(command) => findings(project, command, now)?,
         Command::Fixes(command) => fixes::run(project, command, now)?,
+        Command::Protocols(command) => protocols::protocols(project, command, now)?,
+        Command::Experiments(command) => protocols::experiments(project, command, now)?,
     };
     Ok(serde_json::to_string_pretty(&value)? + "\n")
 }
@@ -357,7 +367,8 @@ fn ratio(numerator: usize, denominator: usize) -> Value {
 /// Metrics merged into `telemetry <slug> report` (`super::metrics::report`).
 /// M20 review completion over assigned opportunities (declared coverage);
 /// M22/M23 over fully triaged submissions; M21, M25–M27 and M29 from fix
-/// attribution (§6); M24 needs review lifecycle cost.
+/// attribution (§6); M28 from review protocols (§7); M24 needs review
+/// lifecycle cost.
 pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> { lane_metrics(project, since, fixes::DEFAULT_HORIZON_DAYS) }
 
 fn lane_metrics(project: &Path, since: Option<i64>, horizon_days: i64) -> Result<BTreeMap<String, Value>> {
@@ -412,7 +423,11 @@ fn lane_metrics(project: &Path, since: Option<i64>, horizon_days: i64) -> Result
     out.insert("M23".to_owned(), m23);
     // M21 sums discovery credit; M25–M27 and M29 follow repairs; M24 needs review cost (§6).
     let attribution = match read(project)? { Some(db) => fix_state(&db, None)?, None => None };
-    out.extend(fixes::metrics(attribution.as_ref(), jiff::Timestamp::now().as_millisecond(), since, horizon_days * 86_400_000));
+    let now = jiff::Timestamp::now().as_millisecond();
+    out.extend(fixes::metrics(attribution.as_ref(), now, since, horizon_days * 86_400_000));
+    // M28 skeptical incremental yield: descriptive; experiments beside it (§7).
+    let registry = match read(project)? { Some(db) => protocol_state(&db, None, now)?, None => None };
+    out.insert("M28".to_owned(), protocols::metric(registry.as_ref(), since));
     Ok(out)
 }
 

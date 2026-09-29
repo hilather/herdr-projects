@@ -1,12 +1,13 @@
 # Review capture contracts (lane D)
 
 Owned by lane D ([phase2-lanes.md](phase2-lanes.md)); common rules are
-[contracts.md](contracts.md) §0 and §7. Plan doc 06 §2–§5 (TM3.1–TM3.3),
+[contracts.md](contracts.md) §0 and §7. Plan doc 06 §2–§6 (TM3.1–TM3.4),
 doc 07 §5 (M20–M29), doc 10 §5. Canonical migrations
 `0054_review_capture.sql` (schema 54), `0055_finding_triage.sql` (schema 55,
-§5) and `0056_fix_attribution.sql` (schema 56, §6); store API
-`src/store/review_capture.rs`, `src/store/finding_triage.rs` and
-`src/store/fix_attribution.rs`; CLI
+§5), `0056_fix_attribution.sql` (schema 56, §6) and
+`0057_review_protocols.sql` (schema 57, §7); store API
+`src/store/review_capture.rs`, `src/store/finding_triage.rs`,
+`src/store/fix_attribution.rs` and `src/store/review_protocols.rs`; CLI
 `telemetry <slug> review ...` (`src/telemetry/review/`). Sidecar stream
 `review` has no tables yet. Nothing about reviews comes from the Codex
 adapter (contracts-collection.md A3).
@@ -132,6 +133,7 @@ never 0.
   (`M22.v1`, `M23.v1`, `basis: owner_triage`, `trust: operator_owner.v1`):
   §5.
 - **M21** (sum of discovery credit), **M25**–**M27** and **M29**: §6.
+- **M28** skeptical incremental yield: §7.
   **M24** (M21 per review cost) is `unavailable: review_cost_unallocated`:
   review lifecycle cost (reviewer sessions, zero-find and failed reviews,
   triage) is not allocated to review opportunities, the accounting lane's
@@ -406,4 +408,195 @@ not model ability.
 Not built: binding repair attempts at launch (needs launch/scheduler
 changes); finding occurrences as a separate record beyond reopenings;
 mixed-model segment splits within one attempt; artifact-only publication
-contracts; M28 (TM3.4) and M24 (review cost).
+contracts; M24 (review cost). M28 is §7.
+
+
+## 7. Review protocols and experiments (TM3.4, card D4)
+
+Canonical migration `0057_review_protocols.sql` (schema 57); store API
+`src/store/review_protocols.rs` (`protocol_state`); CLI `telemetry <slug>
+review protocols register|bind|show` and `review experiments
+register|assign|exclude|show`.
+
+**One ordering.** `protocol_log(seq, kind, principal, authority, expected_seq,
+recorded_unix_ms)` takes the next `seq` of the §5/§6 sequence (triggers on all
+three ledgers refuse a row that does not follow the others' head), so
+`--expect-seq`, `--as-of` and `head_seq` of `findings show`, `fixes show`,
+`protocols show` and `experiments show` refer to one head. Every table is
+append-only. Every row is `operator:cli` with `operator_owner.v1` (CHECKs);
+`SqliteStore` refuses workers (`worker:*` or any attempt's identity), imports
+and any other principal before writing, as §5.
+
+**No routing.** Nothing here opens, assigns, starts or launches a review, or
+changes a budget. An experiment arm is a label on an opportunity the owner
+opened; the owner still opens and runs any second review with the D1
+commands. No metric here is read by dispatch, and none claims a causal effect
+unless it comes from a preregistered comparison (below).
+
+**Protocol** `review_protocols` (`protocols register --input-file F`, JSON
+`review_protocol.v1`, unknown fields refused, ≤8 KiB). Tokens, enums and
+numbers only: no prompt, brief or prose. A registered protocol never changes;
+a changed method is a new versioned identifier. Example (the one the tests
+register):
+
+```json
+{"schema": "review_protocol.v1", "protocol": "skeptical-challenge.v1",
+ "kind": "skeptical", "scope": "candidate_diff", "role": "evaluation",
+ "challenges": ["unsupported_claims", "missed_edge_cases", "unsafe_concurrency",
+                "missing_acceptance_criteria", "evidence_gaps"],
+ "failure_classes": ["logic", "boundary", "concurrency", "security",
+                     "test_weakening", "requirement_omission"],
+ "permitted_tools": ["read", "test"], "budget_ms": 1800000, "evidence_min": 1,
+ "stopping_rule": "checklist_complete", "prior_disclosure": "withheld",
+ "reviewer_profile": null,
+ "outcome": {"primary": "new_validated_unique_findings.v1",
+             "adjudication": "owner_triage.v1",
+             "severity_policy": "finding_severity.v1", "min_severity": "low"}}
+```
+
+`kind`, `scope` and `role` are §1's enums; `challenges` (1–16) and
+`failure_classes` (1–16) and `permitted_tools` (0–16) are lowercase
+identifiers; `stopping_rule` ∈ `budget_exhausted`, `checklist_complete`,
+`first_blocking_finding`; `prior_disclosure` ∈ `withheld`, `disclosed`
+(whether the reviewer sees prior conclusions; disclosure changes the task, so
+M28 reports it per protocol); `reviewer_profile` (optional) is a retained
+profile whose contracts §2 configuration the pass's reviewer must be.
+Stored canonically (sorted, the profile resolved to `reviewer_configuration_id`)
+with `definition_digest`. A second example, same method with the prior
+conclusions shown, is a different protocol:
+`{"protocol": "skeptical-challenge-disclosed.v1", "prior_disclosure":
+"disclosed", ...}`.
+
+**Pass** `skeptical_passes` (`protocols bind <opportunity> --prior O ...`):
+a D1 opportunity run under a registered protocol, declared as the second
+review after 1–16 ordinary review opportunities of the same task. Refused
+unless the opportunity's `protocol` is registered and its `kind`, `scope`,
+`role` and `budget_ms` equal the protocol's (store and trigger), it was
+opened after the protocol was registered, it has no session yet (store and
+trigger: the cutoff precedes the review), and it is not already a pass.
+Frozen at binding: `cutoff_seq` (the ledger head: every finding validated by
+then, and the opportunity's declared `prior_findings`, is **known**); per
+prior `{opportunity_id, submission_id, candidate_oid, scope, artifact,
+status}`, with `artifact` `same_artifact` (same submission and candidate, same
+scope), `changed_artifact` (another submission or candidate) or
+`different_scope`; `comparability` (the worst of those); `prior_coverage`
+`complete` only when every prior's §4 status was `completed`.
+
+**Exact candidate.** A pass is an opportunity, whose identity includes its
+exact candidate (§1). A later artifact therefore always has another
+opportunity id, and its receipt cannot name the earlier candidate (§1
+refusal); binding it after reviews of the earlier artifact labels it
+`changed_artifact`, which M28 excludes.
+
+**Incremental yield** (`protocols show [--as-of SEQ]`, per pass at the
+watermark). Over the claims of the pass's completed session, by their §5
+derived outcome, `incremental` is:
+
+- `new`: the claim is its group's discovery (§5 `validated`), the group root
+  was not known at the cutoff (known findings are re-rooted at the
+  watermark), and its severity is at least the protocol's `min_severity`;
+- `rediscovered`: a derived `duplicate`, including a reworded report the owner
+  marked duplicate, or validated as new and later merged into an earlier
+  finding. It shows reproducibility and is never a new discovery;
+- `known` (validated into a group known at the cutoff), `below_severity_floor`,
+  `rejected`, `pending`.
+
+`new_unique_findings` are the distinct roots of `new` claims. A pass is
+eligible for M28 unless (first failing rule is the `exclusion`):
+`changed_artifact` / `different_scope`; `incomplete_prior_coverage`;
+`not_completed` (no completed session: a timed-out pass has no yield);
+`reviewer_mismatch` (the protocol names a reviewer configuration the
+assignment does not match); `evidence_requirement_unmet` (the completion cites
+fewer than `evidence_min` evidence references); `pending_triage` (a claim is
+still pending). Review session statuses are the stored ones (sessions carry
+no ledger sequence); findings, decisions and bindings replay to the
+watermark.
+
+**Experiment** `review_experiments` (`experiments register --input-file F`,
+JSON `review_experiment.v1`), preregistered and frozen (no update path;
+UPDATE/DELETE abort). Example:
+
+```json
+{"schema": "review_experiment.v1", "experiment": "skeptical-vs-standard.v1",
+ "design": "randomized", "seed": "<64 lowercase hex>",
+ "eligibility": {"kind": "code", "scope": "candidate_diff",
+                 "role": "evaluation", "protocol": "review-protocol.v1"},
+ "arms": [{"arm": "standard", "protocol": null},
+          {"arm": "skeptical", "protocol": "skeptical-challenge.v1"}],
+ "primary_outcome": "validated_unique_findings.v1",
+ "adjudication": "owner_triage.v1", "horizon_days": 14, "min_units": 10,
+ "stopping_rule": "fixed_horizon", "planned_units": 40}
+```
+
+A matched study sets `"design": "matched"`, no seed, and `"match_on"`
+(1–16 identifiers the blocks are matched on, e.g. `["task_class",
+"repository"]`). Rules: 2–4 arms, distinct names and protocols, arm protocols
+registered, the first arm is the reference (typically the standard-only
+control, protocol `null`); eligibility role is `evaluation` or `advisory`,
+never `gate` (a required gate review is never withheld); `min_units` ≥ 2
+(default 10, plan doc 07 §6), frozen before any outcome so it cannot be tuned
+afterwards; `horizon_days` 1–3650.
+
+**Unit** `experiment_units` (`experiments assign <experiment> <opportunity>
+[--block B --arm A]`): one base review opportunity per exact artifact
+(unique submission per experiment). **Exact eligibility**: the opportunity's
+`kind`, `scope`, `role` and `protocol` equal the preregistration's (store and
+trigger). **Before outcomes**: refused once any session of the opportunity has
+a completion (store and trigger), so the unit's `seq` precedes every finding
+submission of it. Randomized: the arm is `arms[u64(first 16 hex of
+sha256("review_experiment.v1:" + seed + ":" + submission_id)) mod n]`
+(reproducible from the recorded seed; `--block`/`--arm` refused). Matched:
+the owner names `--block` and `--arm`; a block holds at most one unit per arm.
+
+**Exclusion** `experiment_exclusions` (`experiments exclude <experiment>
+<opportunity> --reason R`, R ∈ `ineligible_discovered`, `artifact_withdrawn`,
+`protocol_violation`, `operator_error`): once per unit; the unit stays listed
+in its arm with the exclusion, and leaves only the estimate.
+
+**Crossover** is derived, never rewritten: a unit's passes are the passes
+naming its opportunity as a prior. `treatment_received` (arms with a
+protocol): a pass under the arm's protocol exists; `crossover`: a pass under
+another protocol, or any pass in an arm without one. Analysis is by
+intention to treat: a unit is always analyzed in its assigned arm.
+
+**Unit outcome** (`experiments show [--as-of SEQ]`): the distinct §5
+discoveries (derived `validated` claims) among the submissions of the unit's
+base opportunity and its passes (all sessions), whose root was not known at
+the unit's assignment. Status: `excluded`; `analyzable` when the base and
+every pass have ended (`completed` or `ended_without_completion`), no claim
+of theirs is pending, and a treatment arm's pass exists or the horizon has
+passed; otherwise `pending`, or `censored` after the horizon. Pending and
+censored units are outside the estimate, never 0.
+
+**Estimate** (preregistered comparisons only): per arm `assigned`,
+`analyzable`, `pending`, `censored`, `excluded` (by reason), `crossover`,
+`treatment_not_received`, `outcome_total`, `mean` (exact `"y/n"`).
+Randomized: each arm's difference from the reference, `y₁/n₁ − y₀/n₀` as an
+exact reduced fraction, only when both arms have at least `min_units`
+analyzable units. Matched: over complete blocks (one analyzable unit per
+arm), the mean within-block difference, only with at least `min_units`
+complete blocks. Otherwise `unavailable: insufficient_data` with the counts.
+`uncertainty` is `unavailable: interval_not_computed` (no task-clustered
+bootstrap yet, TM4.4).
+
+**M28** `M28.v1` skeptical incremental yield (`review report [--since MS]`,
+`telemetry <slug> report`; `basis: owner_triage`, `trust:
+operator_owner.v1`; store before 0057: `unavailable:
+review_protocols_absent`): over eligible passes bound in the window, `value`
+= Σ `new_unique_findings` / eligible passes as `"n/d"` (findings per
+opportunity; empty: `null`, `empty_denominator`), with `rediscovered`,
+`excluded` (by reason), `by_protocol` (`value`, `prior_disclosure`),
+`control_opportunities` (unexcluded units of arms without a protocol) and
+`as_of_seq`. It is always `estimate: descriptive`, `observational: true`,
+`causal: unavailable: not_randomized`: sequential reviews without a control
+support descriptive yield, not an improvement percentage. `experiments`
+lists each preregistered experiment's `estimate` (`randomized` or
+`matched`), `analysis`, `reference_arm`, `differences` and `uncertainty`
+beside it, never merged into the descriptive value.
+
+Not built: assignment-cutoff binding at launch or by a scheduler (needs
+routing changes); disclosure of prior conclusions in a review brief (no
+brief builder, §3); blinding adjudicators to arm; task-clustered intervals,
+sample-size planning and propensity weighting (TM4.4); retraction of a pass
+or an exclusion; experiment stopping enforcement (the stopping rule is
+recorded, not enforced).
