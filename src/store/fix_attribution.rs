@@ -144,6 +144,10 @@ pub struct FindingFixState {
     pub verification: Option<RoleCredit>,
     pub integration: Option<RoleCredit>,
     pub introduction: Option<Introduction>,
+    /// A validated finding whose discovery claim the evaluation authority
+    /// linked to a seed (§8), unretracted at the watermark: an evaluation
+    /// artefact, outside the validated unique findings `F` (§9).
+    pub seeded_evaluation: bool,
     /// Arrival of the discovery submission (windowing).
     #[serde(skip)]
     pub discovered_unix_ms: Option<i64>,
@@ -662,6 +666,7 @@ pub fn fix_state(db: &Connection, as_of: Option<i64>) -> Result<Option<FixState>
         if !retracted.contains_key(&seq) { introductions.insert(finding, (seq, status, method, introducing, evidence)); }
     }
 
+    let seed_linked = super::review_ledger::seed_linked_claims(db, at)?;
     let mut findings = Vec::with_capacity(triage.findings.len());
     for group in &triage.findings {
         let id = &group.finding_id;
@@ -719,7 +724,8 @@ pub fn fix_state(db: &Connection, as_of: Option<i64>) -> Result<Option<FixState>
         }).transpose()?;
         findings.push(FindingFixState { finding_id: id.clone(), status: group.status.clone(), root: group.root.clone(), remediation: remediation.into(),
             verified: proposals().any(|(_, p)| p.verification.is_some()), integrated: !intervals.is_empty(), currently_resolved, resolutions: intervals, reopenings: reopen,
-            repairs: own.iter().map(|r| r.repair_seq).collect(), discovery, validation, implementation, verification, integration, introduction, discovered_unix_ms: discovered });
+            repairs: own.iter().map(|r| r.repair_seq).collect(), discovery, validation, implementation, verification, integration, introduction,
+            seeded_evaluation: validated && group.discovery_claim.is_some_and(|c| seed_linked.contains(&c)), discovered_unix_ms: discovered });
     }
 
     let history = history(db, at)?;

@@ -5,10 +5,11 @@ Owned by lane D ([phase2-lanes.md](phase2-lanes.md)); common rules are
 TM3.6), doc 07 §5/§5b (M20–M29, M43, M44), doc 10 §5. Canonical migrations
 `0054_review_capture.sql` (schema 54), `0055_finding_triage.sql` (schema 55,
 §5), `0056_fix_attribution.sql` (schema 56, §6) and
-`0057_review_protocols.sql` (schema 57, §7) and `0058_seeded_defects.sql`
-(schema 58, §8); store API `src/store/review_capture.rs`,
-`src/store/finding_triage.rs`, `src/store/fix_attribution.rs`,
-`src/store/review_protocols.rs` and `src/store/seeded_defects.rs`; CLI
+`0057_review_protocols.sql` (schema 57, §7), `0058_seeded_defects.sql`
+(schema 58, §8) and `0059_review_ledger.sql` (schema 59, §9); store API
+`src/store/review_capture.rs`, `src/store/finding_triage.rs`,
+`src/store/fix_attribution.rs`, `src/store/review_protocols.rs`,
+`src/store/seeded_defects.rs` and `src/store/review_ledger.rs`; CLI
 `telemetry <slug> review ...` (`src/telemetry/review/`). Sidecar stream
 `review` has no tables yet. Nothing about reviews comes from the Codex
 adapter (contracts-collection.md A3).
@@ -112,7 +113,9 @@ assignment (`policy = operator`, `blind = false`, reason
 
 `telemetry <slug> review open|assign|start|complete|accept` write through
 `SqliteStore`, one `state.db` transaction each, principal `operator:cli`;
-nothing touches `telemetry.db`. `show [--since MS]` (by creation), `present`
+nothing touches `telemetry.db`. Since 0059 `start` and `complete` also
+append one shared-ledger row each (§9), and every `review` command but
+`present` refuses to run in a worker execution context (§9). `show [--since MS]` (by creation), `present`
 and `report [--since MS]` read `state.db` with contracts §0 reads.
 
 Per opportunity `status`: `unassigned`, `no_session`, `in_progress` (a
@@ -236,7 +239,10 @@ restore recompute the buckets without changing the number of submissions.
 0056 extends this ledger's ordering (§6): `fix_log` rows take the next
 `seq` of the same sequence, so `--expect-seq`, `--as-of` and `head_seq` of
 `findings show` refer to the one ledger head, and `history` here still lists
-only `finding_log` rows.
+only `finding_log` rows. Since 0059 a review session's start and its
+completion are rows of the same sequence (§9): a completion's row precedes
+the submissions written with it. Each claim also shows `seed_linked` at the
+watermark, and M22/M23 leave seed-linked claims out (§9).
 
 Not built here: conflict records between
 submissions, imports of third-party review comments (any such producer can
@@ -379,6 +385,8 @@ store before 0056: `unavailable: fix_attribution_absent`). `F` = validated
 unique findings, windowed by their discovery submission's arrival; exact
 credit sums are reduced fractions (`"3/2"`).
 
+- `F` leaves out seed-linked findings (§9); M21, M25, M26 and M29 report
+  them as `seeded_evaluation`.
 - **M21** `M21.v1`: sum of discovery credit over `F` (`"0"` with no
   finding), `unallocated`, `by_configuration` (reporter attempts' dispatch
   configurations, `unknown` without one), `participation` (shares, never
@@ -416,8 +424,8 @@ contracts; M24 (review cost). M28 is §7.
 
 Canonical migration `0057_review_protocols.sql` (schema 57); store API
 `src/store/review_protocols.rs` (`protocol_state`); CLI `telemetry <slug>
-review protocols register|bind|show` and `review experiments
-register|assign|exclude|show`.
+review protocols register|bind|retract|show` and `review experiments
+register|assign|exclude|retract|show`.
 
 **One ordering.** `protocol_log(seq, kind, principal, authority, expected_seq,
 recorded_unix_ms)` takes the next `seq` of the §5/§6 sequence (triggers on all
@@ -505,13 +513,14 @@ derived outcome, `incremental` is:
 `new_unique_findings` are the distinct roots of `new` claims. A pass is
 eligible for M28 unless (first failing rule is the `exclusion`):
 `changed_artifact` / `different_scope`; `incomplete_prior_coverage`;
-`not_completed` (no completed session: a timed-out pass has no yield);
+`retracted` (the owner retracted the binding, §9); `not_completed` (no
+completed session: a timed-out pass has no yield);
 `reviewer_mismatch` (the protocol names a reviewer configuration the
 assignment does not match); `evidence_requirement_unmet` (the completion cites
 fewer than `evidence_min` evidence references); `pending_triage` (a claim is
-still pending). Review session statuses are the stored ones (sessions carry
-no ledger sequence); findings, decisions and bindings replay to the
-watermark.
+still pending). Review session statuses, findings, decisions, bindings and
+retractions all replay to the watermark (sessions and completions are ledger
+rows since 0059, §9).
 
 **Experiment** `review_experiments` (`experiments register --input-file F`,
 JSON `review_experiment.v1`), preregistered and frozen (no update path;
@@ -552,7 +561,9 @@ the owner names `--block` and `--arm`; a block holds at most one unit per arm.
 **Exclusion** `experiment_exclusions` (`experiments exclude <experiment>
 <opportunity> --reason R`, R ∈ `ineligible_discovered`, `artifact_withdrawn`,
 `protocol_violation`, `operator_error`): once per unit; the unit stays listed
-in its arm with the exclusion, and leaves only the estimate.
+in its arm with the exclusion, and leaves only the estimate. The exclusion
+(`{seq, reason, retracted_seq}`) can be retracted (§9); a retracted
+exclusion is not recorded again for the same unit.
 
 **Crossover** is derived, never rewritten: a unit's passes are the passes
 naming its opportunity as a prior. `treatment_received` (arms with a
@@ -598,9 +609,8 @@ beside it, never merged into the descriptive value.
 Not built: assignment-cutoff binding at launch or by a scheduler (needs
 routing changes); disclosure of prior conclusions in a review brief (no
 brief builder, §3); blinding adjudicators to arm; task-clustered intervals,
-sample-size planning and propensity weighting (TM4.4); retraction of a pass
-or an exclusion; experiment stopping enforcement (the stopping rule is
-recorded, not enforced).
+sample-size planning and propensity weighting (TM4.4); enforcement of the
+`fixed_horizon` stopping rule (recorded; `planned_units` is enforced, §9).
 
 ## 8. Seeded defects, recall and the integration guard (TM3.6, card D6)
 
@@ -696,8 +706,10 @@ reviewer configuration, `completed` = some session completed, submission
 outcomes); and the M43 trials: one per seed per completed opportunity of
 its candidate, `detected` (an active detection by a claim of that
 opportunity), `pending` (not detected while a submission of the
-opportunity is pending), else `missed`. Review completions are not in the
-ledger, so `--as-of` replays triage and detections only.
+opportunity is pending), else `missed`. Since 0059 `--as-of` replays review
+completions too (§9); opportunities and assignments carry no sequence, so
+`not_completed` at an earlier watermark also counts opportunities opened
+later.
 
 **Metrics** (`seeds report [--since MS] [--min-trials N] [--as-of SEQ]`;
 `review report` and `telemetry <slug> report` at the default `N` = 20, plan
@@ -722,13 +734,105 @@ decimals, half up).
 
 Incidental findings on seeded candidates follow the ordinary §5/§6 path:
 they are triaged, counted in M20–M29 and repaired like any finding;
-detection adds no triage row.
+detection adds no triage row. A claim linked to a seed is an evaluation
+artefact and leaves discovery and validation credit (§9).
 
 **Starter seed set** (tests only): `tests/fixtures/telemetry/seeds/
 starter-seed-set.json`, one synthetic seed per class over a tiny clean
 source. Tests inject seeds only into disposable repositories they create;
 no tool here modifies a real project repository.
 
-Not built: excluding seed-linked findings from M21/M22 discovery and
-validation rates; injection tooling for replay-suite tasks (TM4.6); a
-reviewer brief builder (§3).
+Not built: injection tooling for replay-suite tasks (TM4.6); a reviewer
+brief builder (§3).
+
+## 9. Review ledger, seed-linked credit and the worker guard (card D7)
+
+Canonical migration `0059_review_ledger.sql` (schema 59); store API
+`src/store/review_ledger.rs`; CLI `telemetry <slug> review protocols
+retract` and `review experiments retract`.
+
+**Review lifecycle in the one ordering.** `review_log(seq, kind, principal,
+authority, expected_seq, recorded_unix_ms)` takes the next `seq` of the
+sequence shared with `finding_log`, `fix_log`, `protocol_log` and
+`seed_log` (`finding_triage::head` over all five; triggers on each refuse a
+row that does not follow the others' head). `kind` `started` and
+`completed` are review capture's own records (`authority =
+review_capture.v1`, the recorder's principal); `pass_retracted` and
+`exclusion_retracted` are the owner's (`operator:cli`, `operator_owner.v1`,
+CHECKs). `review_session_events(seq, session_id, event, backfilled)`:
+`review start` appends `started` in the session's transaction and `review
+complete` appends `completed` before the completion's finding submissions
+(a completion follows its start: trigger). Views replay review status to
+the watermark (`Lifecycle`): a session is present from its `started` row,
+its completion from its `completed` row, so a restart, a timed-out session
+and a completion show exactly where they happened relative to triage,
+bindings and detections: §4 status in `protocols show`, `experiments show`
+(unit settlement) and `seeds show`/`seeds report` (trials). Opportunities
+and assignments carry no sequence (an assignment always precedes its
+sessions). Every table is append-only.
+
+Every review now adds two rows to the sequence before its submissions, so
+sequence numbers and `finding:canonical-<seq>` identities of a store's later
+history differ from what the same history gave before 0059; rows recorded
+before the upgrade keep theirs.
+
+**Upgrade.** Sessions and completions recorded before 0059 are sequenced
+after the ledger head at upgrade, in start/completion order (by time, a
+start before its completion, then session id), with `backfilled = 1`. Their
+true place among earlier rows is unknown, so replay keeps them visible at
+every watermark, which is the pre-0059 stored-status view; a trigger
+refuses any later `backfilled` row.
+
+**Seed-linked claims.** A claim with a detection (§8) recorded by the
+watermark and not retracted by it is `seed_linked` (`findings show`). Such
+claims are evaluation artefacts, not discoveries:
+
+- M22/M23 derive each submission's outcome again from its other claims; a
+  submission whose every current claim is linked leaves the denominator.
+  `seeded_evaluation: {submissions, claims}` counts what was left out.
+- `F` (§6) leaves out a validated finding whose §5 discovery claim is
+  linked (`fixes show` `seeded_evaluation`), so M21, M25, M26 and M29 do
+  too; each reports `seeded_evaluation` (findings). A linked duplicate claim
+  of a real finding does not remove that finding.
+- Incidental (unlinked) findings on seeded candidates stay ordinary.
+
+A retraction (§8 `seeds retract`) returns the claim to ordinary credit from
+its `seq` on; earlier views keep the link.
+
+**Retractions** `protocol_retractions(seq, reverses UNIQUE)`: `protocols
+retract <seq>` reverses a `pass_bound` row, `experiments retract <seq>` a
+`unit_excluded` row, each recorded in error (trigger: the log kind matches
+the reversed row's). A retracted pass stays listed with `retracted_seq` and
+exclusion `retracted` (outside M28, counted in its `excluded`), and no
+longer counts as a unit's pass (treatment, crossover, outcome). A retracted
+exclusion stays listed (`retracted_seq`) and the unit returns to its
+status and the estimate. Owner only (`SqliteStore` refuses workers, imports
+and other principals); nothing is deleted.
+
+**Stopping rule.** An experiment whose `stopping_rule` is `planned_units`
+must name `planned_units`; assignment is refused once that many units exist
+(store and trigger). `fixed_horizon` stays recorded, not enforced.
+
+**Worker guard.** The review CLI records every row as `operator:cli`, so
+the store cannot tell a worker at the CLI from the owner. Every `review`
+command except `present` (the blind reviewer view) therefore refuses to
+run when either marker the product sets for a canonical worker is present:
+`HOME` is an execution home recorded in the project's retained native
+profiles or collector bindings (canonical launch always runs the agent with
+`HOME` set to its profile's execution home, `isolated_gated_command`), or
+the working directory is inside `<root>/<project>/.state/worktrees/` (a
+worker's task worktree). They are markers, not authority: a process that
+rewrites its own environment and directory evades them, and `SqliteStore`
+keeps refusing every worker principal. The aggregate `telemetry <slug>
+report` is not guarded.
+
+Not built (needs routing, launch or scheduler changes, or new authority):
+binding repair attempts or skeptical passes at launch; a scheduled or
+launch-time review; a reviewer brief builder and disclosure or blinding of
+an actual brief (§3, §7); review acceptance (§2, needs a reviewer-authority
+producer); a scoped reviewer-authority grant for triage; conflict records
+and third-party review imports (§5); finding occurrences beyond reopenings,
+mixed-model segment splits and M24 (§6); adjudicator blinding,
+task-clustered intervals and `fixed_horizon` enforcement (§7); seeding
+replay-suite tasks (TM4.6); sequencing opportunity creation and
+assignment.

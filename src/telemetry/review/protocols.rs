@@ -36,6 +36,13 @@ pub enum ProtocolsCommand {
         #[arg(long)]
         expect_seq: Option<i64>,
     },
+    /// Reverse the pass binding recorded at history sequence SEQ (in error):
+    /// it stops counting as a pass from the retraction on.
+    Retract {
+        seq: i64,
+        #[arg(long)]
+        expect_seq: Option<i64>,
+    },
     /// Protocols, passes with their incremental yield and the protocol
     /// history, replayed to a history sequence, as JSON. Read-only.
     Show {
@@ -76,6 +83,13 @@ pub enum ExperimentsCommand {
         #[arg(long)]
         expect_seq: Option<i64>,
     },
+    /// Reverse the unit exclusion recorded at history sequence SEQ (in error):
+    /// the unit returns to the estimate from the retraction on.
+    Retract {
+        seq: i64,
+        #[arg(long)]
+        expect_seq: Option<i64>,
+    },
     /// Experiments with units, exclusions, crossover and the preregistered
     /// estimate, replayed to a history sequence, as JSON. Read-only.
     Show {
@@ -100,6 +114,7 @@ pub(super) fn protocols(project: &Path, command: ProtocolsCommand, now: i64) -> 
     Ok(match command {
         ProtocolsCommand::Register { input_file, expect_seq } => json!({"event": open()?.register_review_protocol(&definition(&input_file)?, expect_seq, OPERATOR, now)?}),
         ProtocolsCommand::Bind { opportunity, priors, expect_seq } => json!({"event": open()?.bind_review_pass(&opportunity, &priors, expect_seq, OPERATOR, now)?}),
+        ProtocolsCommand::Retract { seq, expect_seq } => json!({"event": open()?.retract_protocol_record(seq, "pass_bound", expect_seq, OPERATOR, now)?}),
         ProtocolsCommand::Show { as_of } => {
             let s = state(project, as_of)?;
             json!({"protocols": {"head_seq": s.head_seq, "as_of_seq": s.as_of_seq, "protocols": s.protocols, "passes": s.passes, "history": s.history}})
@@ -115,6 +130,7 @@ pub(super) fn experiments(project: &Path, command: ExperimentsCommand, now: i64)
             json!({"event": open()?.assign_experiment_unit(&experiment, &opportunity, block.as_deref(), arm.as_deref(), expect_seq, OPERATOR, now)?}),
         ExperimentsCommand::Exclude { experiment, opportunity, reason, expect_seq } =>
             json!({"event": open()?.exclude_experiment_unit(&experiment, &opportunity, &reason, expect_seq, OPERATOR, now)?}),
+        ExperimentsCommand::Retract { seq, expect_seq } => json!({"event": open()?.retract_protocol_record(seq, "unit_excluded", expect_seq, OPERATOR, now)?}),
         ExperimentsCommand::Show { as_of } => {
             let s = state(project, as_of)?;
             json!({"experiments": {"head_seq": s.head_seq, "as_of_seq": s.as_of_seq, "experiments": s.experiments}})
@@ -150,7 +166,7 @@ pub(super) fn metric(state: Option<&ProtocolState>, since: Option<i64>) -> Value
     }
     m["by_protocol"] = by.into_iter().map(|(k, (n, d, disclosure))| (k.to_owned(), json!({"value": format!("{n}/{d}"), "prior_disclosure": disclosure}))).collect();
     // Control opportunities: units of experiment arms without a protocol.
-    m["control_opportunities"] = json!(state.experiments.iter().map(|e| e.units.iter().filter(|u| u.treatment_received.is_none() && u.exclusion.is_none()).count()).sum::<usize>());
+    m["control_opportunities"] = json!(state.experiments.iter().map(|e| e.units.iter().filter(|u| u.treatment_received.is_none() && u.status != "excluded").count()).sum::<usize>());
     m["experiments"] = state.experiments.iter().map(|e| (e.experiment.clone(), json!({"estimate": e.estimate["estimate"], "analysis": e.estimate["analysis"],
         "reference_arm": e.reference_arm, "differences": e.estimate["differences"], "uncertainty": e.estimate["uncertainty"]}))).collect();
     m["as_of_seq"] = json!(state.as_of_seq);

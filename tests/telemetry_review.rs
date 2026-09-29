@@ -211,12 +211,15 @@ fn submissions(state: &serde_json::Value) -> Vec<(String, bool, Vec<i64>)> {
 }
 
 /// Two reviews report one defect under different titles; a third reports one
-/// broad submission that triage splits into three claims. By hand: submissions
-/// 1 (claim 1), 2 (claim 2), 3 (claim 3). Claim 1 mints canonical finding
-/// `finding:canonical-4` (history seq 4); claim 2 is validated as the same
-/// finding, so it is a duplicate: one unique finding for two titles.
-/// Submission 3 splits (seq 6) into claims 4, 5, 6: 4 and 5 mint findings at
-/// seq 7 and 8, 6 is rejected. Buckets: validated_only 1 (sub 1),
+/// broad submission that triage splits into three claims. By hand: each
+/// review's session start and completion take one history seq each, then its
+/// submission: submissions 1 (claim 1, seq 3), 2 (claim 2, seq 6), 3 (claim 3,
+/// seq 9; the refused receipt's session started at seq 7, its completion is
+/// seq 8). Claim 1 mints canonical finding `finding:canonical-10` (history
+/// seq 10); claim 2 is validated as the same finding (seq 11), so it is a
+/// duplicate: one unique finding for two titles. Submission 3 splits (seq 12)
+/// into claims 4, 5, 6: 4 and 5 mint findings at seq 13 and 14, 6 is
+/// rejected. Buckets: validated_only 1 (sub 1),
 /// duplicate_only 1 (sub 2), mixed 1 (sub 3); M22 = 2/3 (sub 3 counts once
 /// despite two validated claims), M23 = 1/3; unique findings 3; claim
 /// drill-down validated 3, duplicate 1, rejected 1, pending 0; 3 submissions,
@@ -252,7 +255,7 @@ fn duplicate_titles_one_finding_split_claims_no_inflation() {
 
     // Arrival alone decides nothing: three pending proposals.
     let state = f.cli_args(&["review", "findings", "show"]).0["findings"].clone();
-    assert_eq!((&state["head_seq"], &state["unique_findings"], &state["summary"]["pending"]), (&json!(3), &json!(0), &json!(3)));
+    assert_eq!((&state["head_seq"], &state["unique_findings"], &state["summary"]["pending"]), (&json!(9), &json!(0), &json!(3)));
     assert_eq!(state["submissions"][1]["title"], json!("Loader crashes on missing ~/app.toml"));
     assert_eq!((&state["submissions"][0]["trust"], &state["submissions"][0]["finding_ref"], &state["submissions"][0]["reporter_attempt_id"]),
         (&json!("proposal"), &json!("finding:null-deref"), &json!("rev-a1")));
@@ -260,12 +263,12 @@ fn duplicate_titles_one_finding_split_claims_no_inflation() {
     // Two titles, one defect.
     let minted = f.cli_args(&["review", "findings", "validate", "1", "--new", "--title", "Missing config crashes the loader", "--severity", "high", "--evidence", &evidence('e')]).0["event"].clone();
     assert_eq!((&minted["seq"], &minted["subject"]["finding_id"], &minted["authority"], &minted["principal"]),
-        (&json!(4), &json!("finding:canonical-4"), &json!("operator_owner.v1"), &json!("operator:cli")));
+        (&json!(10), &json!("finding:canonical-10"), &json!("operator_owner.v1"), &json!("operator:cli")));
     assert!(f.cli_fail(&["review", "findings", "validate", "2", "--new", "--severity", "high"]).contains("needs at least one evidence reference"));
-    f.cli_args(&["review", "findings", "validate", "2", "--finding", "finding:canonical-4", "--severity", "high", "--evidence", &evidence('f')]);
+    f.cli_args(&["review", "findings", "validate", "2", "--finding", "finding:canonical-10", "--severity", "high", "--evidence", &evidence('f')]);
     // The broad report becomes three claims beneath the same submission.
     let split = f.cli_args(&["review", "findings", "split", "3", "--claim", "Loader ignores XDG_CONFIG_HOME", "--claim", "Loader leaks a file handle", "--claim", "Prefer TOML over INI"]).0["event"].clone();
-    assert_eq!((&split["seq"], &split["subject"]), (&json!(6), &json!({"submission_id": 3, "revision": 2, "claims": [4, 5, 6]})));
+    assert_eq!((&split["seq"], &split["subject"]), (&json!(12), &json!({"submission_id": 3, "revision": 2, "claims": [4, 5, 6]})));
     assert!(f.cli_fail(&["review", "findings", "reject", "3", "--reason", "out_of_scope"]).contains("not in submission 3's current claim set"));
     f.cli_args(&["review", "findings", "validate", "4", "--new", "--severity", "medium", "--evidence", &evidence('a')]);
     f.cli_args(&["review", "findings", "validate", "5", "--new", "--severity", "low", "--evidence", &evidence('b')]);
@@ -278,11 +281,11 @@ fn duplicate_titles_one_finding_split_claims_no_inflation() {
     assert_eq!(state["unique_findings"], json!(3));
     let group = state["findings"][0].clone();
     assert_eq!((&group["finding_id"], &group["title"], &group["status"], &group["discovery_claim"], &group["validated_claims"], &group["duplicate_claims"]),
-        (&json!("finding:canonical-4"), &json!("Missing config crashes the loader"), &json!("validated"), &json!(1), &json!([1]), &json!([2])));
+        (&json!("finding:canonical-10"), &json!("Missing config crashes the loader"), &json!("validated"), &json!(1), &json!([1]), &json!([2])));
     let claim2 = &state["submissions"][1]["claims"][0];
-    assert_eq!((&claim2["decided"], &claim2["outcome"], &claim2["canonical_finding"]), (&json!("validated"), &json!("duplicate"), &json!("finding:canonical-4")));
+    assert_eq!((&claim2["decided"], &claim2["outcome"], &claim2["canonical_finding"]), (&json!("validated"), &json!("duplicate"), &json!("finding:canonical-10")));
     assert_eq!(state["findings"].as_array().unwrap().iter().map(|g| g["finding_id"].as_str().unwrap()).collect::<Vec<_>>(),
-        ["finding:canonical-4", "finding:canonical-7", "finding:canonical-8"]);
+        ["finding:canonical-10", "finding:canonical-13", "finding:canonical-14"]);
 
     let metrics = f.cli_args(&["review", "report"]).0["metrics"].clone();
     assert_eq!((&metrics["M22"]["numerator"], &metrics["M22"]["denominator"], &metrics["M22"]["value"], &metrics["M22"]["basis"]), (&json!(2), &json!(3), &json!("2/3"), &json!("owner_triage")));
@@ -303,17 +306,19 @@ fn duplicate_titles_one_finding_split_claims_no_inflation() {
 }
 
 /// Doc 10 §5 denominator/correction golden. Submissions: 1 (rev-a1, claim 1),
-/// 2 (rev-a2, claim 2), 3 (rev-a3, claim 3). Seq 4 validates claim 1 as new
-/// finding P = `finding:canonical-4`; seq 5 splits submission 2 into claims 4,
-/// 5; seq 6 validates claim 4 as new N = `finding:canonical-6`; seq 7 marks
-/// claim 5 a duplicate of P; seq 8 rejects claim 3. By hand: validated_only 1,
-/// mixed 1, rejected_only 1: M22 = 2/3, M23 = 0/3. Seq 9 merges N into P:
-/// submission 2 becomes duplicate_only: M22 = 1/3, M23 = 1/3, unique 1. Seq 10
-/// unmerges: 2/3 and 0/3 again, unique 2; as-of 9 still shows the merge.
-/// Seq 11 reopens claim 3: pending 1, M22 = 2/2. Seq 12 restores submission
-/// 2's unsplit revision 1 (claim 2, never decided): pending 2, M22 = 1/1.
-/// Seq 13 restores revision 2: claims 4, 5 and their decisions return. As
-/// of seq 5 only submission 1 is adjudicated (pending 2).
+/// 2 (rev-a2, claim 2), 3 (rev-a3, claim 3) at seq 3, 6, 9 (each review's
+/// session start and completion take the two seqs before its submission).
+/// Seq 10 validates claim 1 as new finding P = `finding:canonical-10`; seq 11
+/// splits submission 2 into claims 4, 5; seq 12 validates claim 4 as new N =
+/// `finding:canonical-12`; seq 13 marks claim 5 a duplicate of P; seq 14
+/// rejects claim 3. By hand: validated_only 1, mixed 1, rejected_only 1: M22 =
+/// 2/3, M23 = 0/3. Seq 15 merges N into P: submission 2 becomes
+/// duplicate_only: M22 = 1/3, M23 = 1/3, unique 1. Seq 16 unmerges: 2/3 and
+/// 0/3 again, unique 2; as-of 15 still shows the merge. Seq 17 reopens claim
+/// 3: pending 1, M22 = 2/2. Seq 18 restores submission 2's unsplit revision 1
+/// (claim 2, never decided): pending 2, M22 = 1/1. Seq 19 restores revision
+/// 2: claims 4, 5 and their decisions return. As of seq 11 only submission 1
+/// is adjudicated (pending 2).
 #[test]
 fn triage_replay_as_of_and_worker_cannot_validate() {
     let f = Fixture::new();
@@ -353,30 +358,30 @@ fn triage_replay_as_of_and_worker_cannot_validate() {
         let rewrite = db.execute("UPDATE finding_submissions SET trust='proposal'", []).unwrap_err();
         assert!(rewrite.to_string().contains("append-only"), "{rewrite}");
     }
-    assert_eq!(show(None)["head_seq"], json!(3));
+    assert_eq!(show(None)["head_seq"], json!(9));
 
-    f.cli_args(&["review", "findings", "validate", "1", "--new", "--severity", "high", "--evidence", &evidence('e'), "--expect-seq", "3"]);
-    assert!(f.cli_fail(&["review", "findings", "split", "2", "--claim", "a", "--claim", "b", "--expect-seq", "3"]).contains("finding history moved: head is 4, expected 3"));
+    f.cli_args(&["review", "findings", "validate", "1", "--new", "--severity", "high", "--evidence", &evidence('e'), "--expect-seq", "9"]);
+    assert!(f.cli_fail(&["review", "findings", "split", "2", "--claim", "a", "--claim", "b", "--expect-seq", "9"]).contains("finding history moved: head is 10, expected 9"));
     f.cli_args(&["review", "findings", "split", "2", "--claim", "Retry loop never ends", "--claim", "Loader crash, as reported before"]);
-    let at5 = show(None);
+    let at11 = show(None);
     f.cli_args(&["review", "findings", "validate", "4", "--new", "--severity", "medium", "--evidence", &evidence('a')]);
-    f.cli_args(&["review", "findings", "duplicate", "5", "--of", "finding:canonical-4"]);
+    f.cli_args(&["review", "findings", "duplicate", "5", "--of", "finding:canonical-10"]);
     f.cli_args(&["review", "findings", "reject", "3", "--reason", "insufficient_evidence"]);
-    let at8 = show(None);
-    assert_eq!(submissions(&at8), [("validated_only".to_owned(), true, vec![1]), ("mixed".to_owned(), true, vec![4, 5]), ("rejected_only".to_owned(), false, vec![3])]);
+    let at14 = show(None);
+    assert_eq!(submissions(&at14), [("validated_only".to_owned(), true, vec![1]), ("mixed".to_owned(), true, vec![4, 5]), ("rejected_only".to_owned(), false, vec![3])]);
     assert_eq!(rates(), (json!("2/3"), json!("0/3"), json!(0)));
-    assert_eq!(at8["unique_findings"], json!(2));
+    assert_eq!(at14["unique_findings"], json!(2));
 
     // Merge N into P: submission 2's validated claim becomes a duplicate of the earlier discovery.
-    let merge = f.cli_args(&["review", "findings", "merge", "finding:canonical-6", "--into", "finding:canonical-4"]).0["event"].clone();
-    assert_eq!(merge["seq"], json!(9));
-    assert!(f.cli_fail(&["review", "findings", "merge", "finding:canonical-4", "--into", "finding:canonical-6"]).contains("already one group"));
-    let at9 = show(None);
-    assert_eq!(submissions(&at9)[1], ("duplicate_only".to_owned(), false, vec![4, 5]));
-    assert_eq!((&at9["unique_findings"], &at9["findings"][1]["status"], &at9["findings"][1]["merged_into"]), (&json!(1), &json!("merged"), &json!("finding:canonical-4")));
+    let merge = f.cli_args(&["review", "findings", "merge", "finding:canonical-12", "--into", "finding:canonical-10"]).0["event"].clone();
+    assert_eq!(merge["seq"], json!(15));
+    assert!(f.cli_fail(&["review", "findings", "merge", "finding:canonical-10", "--into", "finding:canonical-12"]).contains("already one group"));
+    let at15 = show(None);
+    assert_eq!(submissions(&at15)[1], ("duplicate_only".to_owned(), false, vec![4, 5]));
+    assert_eq!((&at15["unique_findings"], &at15["findings"][1]["status"], &at15["findings"][1]["merged_into"]), (&json!(1), &json!("merged"), &json!("finding:canonical-10")));
     assert_eq!(rates(), (json!("1/3"), json!("1/3"), json!(0)));
-    f.cli_args(&["review", "findings", "unmerge", "9"]);
-    assert!(f.cli_fail(&["review", "findings", "unmerge", "9"]).contains("is not active"));
+    f.cli_args(&["review", "findings", "unmerge", "15"]);
+    assert!(f.cli_fail(&["review", "findings", "unmerge", "15"]).contains("is not active"));
     assert_eq!(rates(), (json!("2/3"), json!("0/3"), json!(0)));
     assert_eq!(show(None)["unique_findings"], json!(2));
 
@@ -384,27 +389,27 @@ fn triage_replay_as_of_and_worker_cannot_validate() {
     f.cli_args(&["review", "findings", "reset", "3", "--reason", "reopened"]);
     assert_eq!(rates(), (json!("2/2"), json!("0/2"), json!(1)));
     f.cli_args(&["review", "findings", "restore", "2", "--revision", "1"]);
-    let at12 = show(None);
-    assert_eq!(submissions(&at12)[1], ("pending".to_owned(), false, vec![2]));
+    let at18 = show(None);
+    assert_eq!(submissions(&at18)[1], ("pending".to_owned(), false, vec![2]));
     assert_eq!(rates(), (json!("1/1"), json!("0/1"), json!(2)));
     f.cli_args(&["review", "findings", "restore", "2", "--revision", "2"]);
     let head = show(None);
-    assert_eq!((&head["head_seq"], &submissions(&head)[1]), (&json!(13), &("mixed".to_owned(), true, vec![4, 5])));
+    assert_eq!((&head["head_seq"], &submissions(&head)[1]), (&json!(19), &("mixed".to_owned(), true, vec![4, 5])));
 
     // Replay: every earlier view is reproduced exactly at its sequence; the history keeps every row.
-    for (seq, view) in [(5, &at5), (8, &at8), (9, &at9), (12, &at12)] {
+    for (seq, view) in [(11, &at11), (14, &at14), (15, &at15), (18, &at18)] {
         let replayed = show(Some(seq));
         for key in ["as_of_seq", "unique_findings", "summary", "submissions", "findings", "history"] { assert_eq!(replayed[key], view[key], "seq {seq} {key}"); }
-        assert_eq!(replayed["head_seq"], json!(13));
+        assert_eq!(replayed["head_seq"], json!(19));
     }
-    assert_eq!(submissions(&at5)[1], ("pending".to_owned(), false, vec![4, 5]));
-    assert_eq!((&at5["summary"]["adjudicated"], &at5["summary"]["pending"]), (&json!(1), &json!(2)));
+    assert_eq!(submissions(&at11)[1], ("pending".to_owned(), false, vec![4, 5]));
+    assert_eq!((&at11["summary"]["adjudicated"], &at11["summary"]["pending"]), (&json!(1), &json!(2)));
     let kinds: Vec<String> = head["history"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap().to_owned()).collect();
     assert_eq!(kinds, ["submitted", "submitted", "submitted", "decided", "split", "decided", "decided", "decided", "merged", "unmerged", "decided", "restored", "restored"]);
-    assert_eq!((&head["history"][9]["subject"]["reverses"], &head["history"][10]["subject"]["supersedes"]), (&json!(9), &json!(8)));
+    assert_eq!((&head["history"][9]["subject"]["reverses"], &head["history"][10]["subject"]["supersedes"]), (&json!(15), &json!(14)));
     assert!(head["history"].as_array().unwrap()[3..].iter().all(|e| e["principal"] == "operator:cli" && e["authority"] == "operator_owner.v1"));
     assert!(head["history"].as_array().unwrap()[..3].iter().all(|e| e["authority"] == "proposal"));
-    assert!(f.cli_fail(&["review", "findings", "show", "--as-of", "14"]).contains("outside the finding history"));
+    assert!(f.cli_fail(&["review", "findings", "show", "--as-of", "20"]).contains("outside the finding history"));
 }
 
 /// The factory side of repairs, planted as the launch, result, verification
@@ -485,20 +490,21 @@ fn credit(role: &serde_json::Value) -> Vec<(String, serde_json::Value, String)> 
     role["shares"].as_array().unwrap().iter().map(|s| (s["contributor"].as_str().unwrap().to_owned(), s["configuration_id"].clone(), s["share"].as_str().unwrap().to_owned())).collect()
 }
 
-/// Doc 10 §5 exact-candidate and reopen golden. History by hand: seq 1
-/// rev-a1's submission; 2 validates it as F = `finding:canonical-2`; 3 opens
-/// repair 3 assigned to `fast` (A); 4 binds fix-a1 (A, no result yet). fix-a1
-/// then submits SF1 (3…3, which run `a` verifies) and, after changing its
-/// branch, SF2 (4…4). 5 proposes SF2: run `a` (SF1's commit) and the rejected
-/// run `c` cannot verify it; 6 verifies it with run `d` on 4…4; an integration
-/// of SF1's verified result is not its integration; 7 links integration IG
-/// (merge 5…5); 8 closes repair 3 `fixed`. Now M25 = M26 = 1/1 (finding and
-/// A's cohort), M27 has no observed integration (1 censored, horizon 14 d),
-/// M29 = 5/6 (introduction unattributed). 9 attributes introduction to the
-/// author of 1…1 by bisect (blame and the fixer are refused); 10 reopens F
-/// after the fix was reverted: M26 = 0/1, M25 stays 1/1, M27 = 1/1; the
-/// as-of-9 view still shows the resolution. 11 opens a new unassigned repair,
-/// censored within its horizon.
+/// Doc 10 §5 exact-candidate and reopen golden. History by hand: seq 1 and 2
+/// are rev-a1's review session start and completion, 3 its submission; 4
+/// validates it as F = `finding:canonical-4`; 5 opens repair 5 assigned to
+/// `fast` (A); 6 binds fix-a1 (A, no result yet). fix-a1 then submits SF1
+/// (3…3, which run `a` verifies) and, after changing its branch, SF2 (4…4). 7
+/// proposes SF2: run `a` (SF1's commit) and the rejected run `c` cannot verify
+/// it; 8 verifies it with run `d` on 4…4; an integration of SF1's verified
+/// result is not its integration; 9 links integration IG (merge 5…5); 10
+/// closes repair 5 `fixed`. Now M25 = M26 = 1/1 (finding and A's cohort), M27
+/// has no observed integration (1 censored, horizon 14 d), M29 = 5/6
+/// (introduction unattributed). 11 attributes introduction to the author of
+/// 1…1 by bisect (blame and the fixer are refused); 12 reopens F after the fix
+/// was reverted: M26 = 0/1, M25 stays 1/1, M27 = 1/1; the as-of-11 view still
+/// shows the resolution. 13 opens a new unassigned repair, censored within its
+/// horizon.
 #[test]
 fn fix_credit_requires_exact_candidate_and_reopen_removes_current_credit() {
     let f = Fixture::new();
@@ -508,7 +514,7 @@ fn fix_credit_requires_exact_candidate_and_reopen_removes_current_credit() {
     let author_id = agent_configuration(&codex_profile(&f.config, "codex", "codex", Some(&f.home))).id;
     completed_review(&f, &world, "code", "rev-a1", json!(["finding:crash"]));
     f.cli_args(&["review", "findings", "validate", "1", "--new", "--severity", "high", "--evidence", &evidence('e')]);
-    let finding = "finding:canonical-2";
+    let finding = "finding:canonical-4";
     let fixes = |args: &[&str]| { let mut all = vec!["review", "fixes"]; all.extend(args); f.cli_args(&all).0["event"].clone() };
     let refused = |args: &[&str], text: &str| { let mut all = vec!["review", "fixes"]; all.extend(args); let e = f.cli_fail(&all); assert!(e.contains(text), "{e}"); };
 
@@ -520,21 +526,21 @@ fn fix_credit_requires_exact_candidate_and_reopen_removes_current_credit() {
     }
     assert!(format!("{:?}", store.open_repair(finding, &RepairAssignment::Unassigned, 86_400_000, None, "import:github", 1).unwrap_err()).contains("an untrusted import"));
     drop(store);
-    assert_eq!(fixes_show(&f, None)["head_seq"], json!(2));
+    assert_eq!(fixes_show(&f, None)["head_seq"], json!(4));
 
-    // Repair 3 is assigned to A before any repair runs.
+    // Repair 5 is assigned to A before any repair runs.
     let opened = fixes(&["open", finding, "--assign", "fast"]);
     assert_eq!((&opened["seq"], &opened["subject"]["assignment"], &opened["subject"]["configuration_id"], &opened["subject"]["horizon_ms"]),
-        (&json!(3), &json!("configuration"), &json!(fast_id), &json!(14 * 86_400_000_i64)));
-    refused(&["open", finding, "--unassigned"], "already has open repair opportunity 3");
+        (&json!(5), &json!("configuration"), &json!(fast_id), &json!(14 * 86_400_000_i64)));
+    refused(&["open", finding, "--unassigned"], "already has open repair opportunity 5");
     refused(&["open", "finding:canonical-9", "--unassigned"], "no canonical finding");
 
     // Attempts bind before their outcome: a finished attempt or one with a result is refused.
     let factory = Factory::open(&f);
     factory.attempt("fix-a1", &fast_id);
-    refused(&["bind", "3", "--attempt", "rev-a1"], "is already completed");
-    refused(&["bind", "3", "--attempt", &f.attempt], "already has a result");
-    assert_eq!(fixes(&["bind", "3", "--attempt", "fix-a1"])["subject"], json!({"repair_seq": 3, "attempt_id": "fix-a1", "ordinal": 1, "configuration_id": fast_id}));
+    refused(&["bind", "5", "--attempt", "rev-a1"], "is already completed");
+    refused(&["bind", "5", "--attempt", &f.attempt], "already has a result");
+    assert_eq!(fixes(&["bind", "5", "--attempt", "fix-a1"])["subject"], json!({"repair_seq": 5, "attempt_id": "fix-a1", "ordinal": 1, "configuration_id": fast_id}));
     let (sf1, sf2) = (hex('3'), hex('4'));
     factory.submission(&sf1, "fix-a1", &oid('3'), 5_000);
     factory.run(&hex('a'), &sf1, "fix-a1", &oid('3'), Some(&hex('b')));
@@ -544,46 +550,46 @@ fn fix_credit_requires_exact_candidate_and_reopen_removes_current_credit() {
     let now = unix_ms();
     factory.integration(&hex('6'), &hex('b'), &oid('3'), &oid('8'), now - 2_000);
     factory.integration(&hex('7'), &hex('f'), &oid('4'), &oid('5'), now - 1_000);
-    refused(&["propose", "3", "--submission", &world.0], "is not bound to repair opportunity 3");
-    assert_eq!(fixes(&["propose", "3", "--submission", &sf2])["subject"]["candidate_oid"], json!(oid('4')));
+    refused(&["propose", "5", "--submission", &world.0], "is not bound to repair opportunity 5");
+    assert_eq!(fixes(&["propose", "5", "--submission", &sf2])["subject"]["candidate_oid"], json!(oid('4')));
 
     // Passing checks on one commit cannot verify another; a rejected run verifies nothing.
-    refused(&["verify", "5", "--run", &hex('a'), "--assurance", "regression_reproduced", "--evidence", &evidence('a')], "passing checks on one commit cannot verify another");
-    refused(&["verify", "5", "--run", &hex('c'), "--assurance", "regression_reproduced", "--evidence", &evidence('a')], "was rejected");
-    refused(&["verify", "5", "--run", &hex('d'), "--assurance", "regression_reproduced"], "needs at least one evidence reference");
+    refused(&["verify", "7", "--run", &hex('a'), "--assurance", "regression_reproduced", "--evidence", &evidence('a')], "passing checks on one commit cannot verify another");
+    refused(&["verify", "7", "--run", &hex('c'), "--assurance", "regression_reproduced", "--evidence", &evidence('a')], "was rejected");
+    refused(&["verify", "7", "--run", &hex('d'), "--assurance", "regression_reproduced"], "needs at least one evidence reference");
     {
         // Raw rows cannot forge it either: the trigger checks the exact candidate.
         let mut db = rusqlite::Connection::open(&db_path).unwrap();
         let tx = db.transaction().unwrap();
-        tx.execute("INSERT INTO fix_log(seq,kind,principal,authority,recorded_unix_ms) VALUES(6,'verified','operator:cli','operator_owner.v1',1)", []).unwrap();
-        let forged = tx.execute("INSERT INTO fix_verifications(seq,proposal_seq,run_id,result_id,commit_oid,assurance,evidence_refs) VALUES(6,5,?1,?2,?3,'regression_reproduced','[\"x\"]')",
+        tx.execute("INSERT INTO fix_log(seq,kind,principal,authority,recorded_unix_ms) VALUES(8,'verified','operator:cli','operator_owner.v1',1)", []).unwrap();
+        let forged = tx.execute("INSERT INTO fix_verifications(seq,proposal_seq,run_id,result_id,commit_oid,assurance,evidence_refs) VALUES(8,7,?1,?2,?3,'regression_reproduced','[\"x\"]')",
             rusqlite::params![hex('a'), hex('b'), oid('4')]).unwrap_err();
         assert!(forged.to_string().contains("verified only by an accepted verification of its exact candidate"), "{forged}");
-        let worker = tx.execute("INSERT INTO fix_log(seq,kind,principal,authority,recorded_unix_ms) VALUES(7,'credited','worker:fix-a1','operator_owner.v1',1)", []).unwrap_err();
+        let worker = tx.execute("INSERT INTO fix_log(seq,kind,principal,authority,recorded_unix_ms) VALUES(9,'credited','worker:fix-a1','operator_owner.v1',1)", []).unwrap_err();
         assert!(worker.to_string().contains("CHECK constraint failed"), "{worker}");
     }
-    refused(&["integrate", "5", "--integrated", &hex('7')], "is not verified");
-    assert_eq!(fixes(&["verify", "5", "--run", &hex('d'), "--assurance", "regression_reproduced", "--evidence", &evidence('a')])["subject"]["result_id"], json!(hex('f')));
-    refused(&["close", "3", "--outcome", "no_fix"], "has a verified fix");
+    refused(&["integrate", "7", "--integrated", &hex('7')], "is not verified");
+    assert_eq!(fixes(&["verify", "7", "--run", &hex('d'), "--assurance", "regression_reproduced", "--evidence", &evidence('a')])["subject"]["result_id"], json!(hex('f')));
+    refused(&["close", "5", "--outcome", "no_fix"], "has a verified fix");
     // An integration of SF1's verified result is not an integration of this fix.
-    refused(&["integrate", "5", "--integrated", &hex('6')], "did not integrate the fix's exact verified candidate");
-    assert_eq!(fixes(&["integrate", "5", "--integrated", &hex('7')])["subject"]["commit_oid"], json!(oid('5')));
-    fixes(&["close", "3", "--outcome", "fixed"]);
+    refused(&["integrate", "7", "--integrated", &hex('6')], "did not integrate the fix's exact verified candidate");
+    assert_eq!(fixes(&["integrate", "7", "--integrated", &hex('7')])["subject"]["commit_oid"], json!(oid('5')));
+    fixes(&["close", "5", "--outcome", "fixed"]);
 
-    let at8 = fixes_show(&f, None);
-    let finding8 = &at8["findings"][0];
-    assert_eq!((&finding8["remediation"], &finding8["verified"], &finding8["integrated"], &finding8["currently_resolved"]), (&json!("resolved"), &json!(true), &json!(true), &json!(true)));
-    assert_eq!(finding8["resolutions"], json!([{"integration_seq": 7, "proposal_seq": 5, "repair_seq": 3, "integrated_id": hex('7'), "commit_oid": oid('5'),
+    let at10 = fixes_show(&f, None);
+    let finding10 = &at10["findings"][0];
+    assert_eq!((&finding10["remediation"], &finding10["verified"], &finding10["integrated"], &finding10["currently_resolved"]), (&json!("resolved"), &json!(true), &json!(true), &json!(true)));
+    assert_eq!(finding10["resolutions"], json!([{"integration_seq": 9, "proposal_seq": 7, "repair_seq": 5, "integrated_id": hex('7'), "commit_oid": oid('5'),
         "integrated_unix_ms": now - 1_000, "ended_seq": null, "ended_by": null}]));
     // Separate roles: discovery, validation, implementation, verification, integration; introduction unattributed.
-    assert_eq!((&finding8["discovery"]["policy"], credit(&finding8["discovery"])), (&json!("earliest_validated.v1"), vec![("attempt:rev-a1".into(), json!(null), "1".into())]));
-    assert_eq!(credit(&finding8["validation"]), [("principal:operator:cli".to_owned(), json!(null), "1".to_owned())]);
-    assert_eq!((&finding8["implementation"]["policy"], credit(&finding8["implementation"])), (&json!("sole_attempt.v1"), vec![("attempt:fix-a1".into(), json!(fast_id), "1".into())]));
-    assert_eq!((credit(&finding8["verification"]), &finding8["verification"]["source_seq"]), (vec![("service:native_verifier".into(), json!(null), "1".into())], &json!(6)));
-    assert_eq!(credit(&finding8["integration"]), [("service:integrator".to_owned(), json!(null), "1".to_owned())]);
-    assert_eq!((&finding8["introduction"]["status"], &finding8["introduction"]["detection_oid"], &finding8["introduction"]["credit"]["unallocated"], &finding8["introduction"]["credit"]["unallocated_reason"]),
+    assert_eq!((&finding10["discovery"]["policy"], credit(&finding10["discovery"])), (&json!("earliest_validated.v1"), vec![("attempt:rev-a1".into(), json!(null), "1".into())]));
+    assert_eq!(credit(&finding10["validation"]), [("principal:operator:cli".to_owned(), json!(null), "1".to_owned())]);
+    assert_eq!((&finding10["implementation"]["policy"], credit(&finding10["implementation"])), (&json!("sole_attempt.v1"), vec![("attempt:fix-a1".into(), json!(fast_id), "1".into())]));
+    assert_eq!((credit(&finding10["verification"]), &finding10["verification"]["source_seq"]), (vec![("service:native_verifier".into(), json!(null), "1".into())], &json!(8)));
+    assert_eq!(credit(&finding10["integration"]), [("service:integrator".to_owned(), json!(null), "1".to_owned())]);
+    assert_eq!((&finding10["introduction"]["status"], &finding10["introduction"]["detection_oid"], &finding10["introduction"]["credit"]["unallocated"], &finding10["introduction"]["credit"]["unallocated_reason"]),
         (&json!("unattributed"), &json!(oid('1')), &json!("1"), &json!("unattributed")));
-    assert_eq!((&at8["repairs"][0]["outcome"], &at8["repairs"][0]["closure"]), (&json!("currently_resolved"), &json!("fixed")));
+    assert_eq!((&at10["repairs"][0]["outcome"], &at10["repairs"][0]["closure"]), (&json!("currently_resolved"), &json!("fixed")));
 
     let m = f.cli_args(&["review", "report"]).0["metrics"].clone();
     assert_eq!((&m["M21"]["value"], &m["M25"]["value"], &m["M26"]["value"]), (&json!("1"), &json!("1/1"), &json!("1/1")));
@@ -596,29 +602,29 @@ fn fix_credit_requires_exact_candidate_and_reopen_removes_current_credit() {
     refused(&["introduce", finding, "--commit", &oid('4'), "--method", "reliable_bisect", "--contributor", "fix-a1=1", "--evidence", &evidence('c')], "the fixer is not charged");
     refused(&["introduce", finding, "--commit", &oid('1'), "--method", "reliable_bisect", "--contributor", "rev-a1=1", "--evidence", &evidence('c')], "has no candidate at the introducing commit");
     fixes(&["introduce", finding, "--commit", &oid('1'), "--method", "reliable_bisect", "--contributor", &format!("{}=1", f.attempt), "--evidence", &evidence('c')]);
-    let at9 = fixes_show(&f, None);
-    assert_eq!((&at9["findings"][0]["introduction"]["status"], credit(&at9["findings"][0]["introduction"]["credit"])),
+    let at11 = fixes_show(&f, None);
+    assert_eq!((&at11["findings"][0]["introduction"]["status"], credit(&at11["findings"][0]["introduction"]["credit"])),
         (&json!("attributed"), vec![(format!("attempt:{}", f.attempt), json!(author_id), "1".into())]));
 
     // A revert reopens F: history stays, current-resolution credit goes.
     refused(&["reopen", finding, "--reason", "reverted", "--observed", &oid('6')], "needs at least one evidence reference");
-    assert_eq!(fixes(&["reopen", finding, "--reason", "reverted", "--observed", &oid('6'), "--evidence", &evidence('d')])["subject"]["integration_seq"], json!(7));
+    assert_eq!(fixes(&["reopen", finding, "--reason", "reverted", "--observed", &oid('6'), "--evidence", &evidence('d')])["subject"]["integration_seq"], json!(9));
     refused(&["reopen", finding, "--reason", "regression", "--observed", &oid('6'), "--evidence", &evidence('d')], "is not currently resolved");
-    let at10 = fixes_show(&f, None);
-    let finding10 = &at10["findings"][0];
-    assert_eq!((&finding10["remediation"], &finding10["verified"], &finding10["integrated"], &finding10["currently_resolved"]), (&json!("reopened"), &json!(true), &json!(true), &json!(false)));
-    assert_eq!((&finding10["resolutions"][0]["ended_seq"], &finding10["resolutions"][0]["ended_by"], &finding10["reopenings"][0]["reason"]), (&json!(10), &json!("reopened"), &json!("reverted")));
-    assert_eq!(at10["repairs"][0]["outcome"], json!("integrated"));
+    let at12 = fixes_show(&f, None);
+    let finding12 = &at12["findings"][0];
+    assert_eq!((&finding12["remediation"], &finding12["verified"], &finding12["integrated"], &finding12["currently_resolved"]), (&json!("reopened"), &json!(true), &json!(true), &json!(false)));
+    assert_eq!((&finding12["resolutions"][0]["ended_seq"], &finding12["resolutions"][0]["ended_by"], &finding12["reopenings"][0]["reason"]), (&json!(12), &json!("reopened"), &json!("reverted")));
+    assert_eq!(at12["repairs"][0]["outcome"], json!("integrated"));
     let m = f.cli_args(&["review", "report"]).0["metrics"].clone();
     assert_eq!((&m["M25"]["value"], &m["M26"]["value"], &m["M26"]["by_assignment"][fast_id.as_str()]["value"]), (&json!("1/1"), &json!("0/1"), &json!("0/1")));
     assert_eq!((&m["M27"]["value"], &m["M27"]["censored"]), (&json!("1/1"), &json!(0)));
 
-    // Replay: the as-of-9 view still has the resolution, byte for byte; one ordering with the triage history.
-    let replayed = fixes_show(&f, Some(9));
-    for key in ["findings", "repairs", "history", "as_of_seq"] { assert_eq!(replayed[key], at9[key], "{key}"); }
-    assert_eq!((&replayed["head_seq"], &replayed["findings"][0]["currently_resolved"]), (&json!(10), &json!(true)));
-    assert_eq!(fixes_show(&f, Some(8))["findings"][0]["introduction"]["status"], json!("unattributed"));
-    assert_eq!(f.cli_args(&["review", "findings", "show", "--as-of", "10"]).0["findings"]["head_seq"], json!(10));
+    // Replay: the as-of-11 view still has the resolution, byte for byte; one ordering with the triage history.
+    let replayed = fixes_show(&f, Some(11));
+    for key in ["findings", "repairs", "history", "as_of_seq"] { assert_eq!(replayed[key], at11[key], "{key}"); }
+    assert_eq!((&replayed["head_seq"], &replayed["findings"][0]["currently_resolved"]), (&json!(12), &json!(true)));
+    assert_eq!(fixes_show(&f, Some(10))["findings"][0]["introduction"]["status"], json!("unattributed"));
+    assert_eq!(f.cli_args(&["review", "findings", "show", "--as-of", "12"]).0["findings"]["head_seq"], json!(12));
 
     // A new repair cycle is its own opportunity, censored until closed or past its horizon.
     fixes(&["open", finding, "--unassigned", "--horizon-days", "7"]);
@@ -633,19 +639,20 @@ fn fix_credit_requires_exact_candidate_and_reopen_removes_current_credit() {
     assert!(rewrite.to_string().contains("append-only"), "{rewrite}");
 }
 
-/// Doc 10 §5 assignment and mixed-credit golden. rev-a1 (A) reports P (seq
-/// 1); rev-a2 (B) reports Q and P again (seq 2, 3). Seq 4 validates P =
-/// `finding:canonical-4`, 5 validates Q = `finding:canonical-5`, 6 links
+/// Doc 10 §5 assignment and mixed-credit golden. rev-a1 (A) reports P (session
+/// start 1, completion 2, submission seq 3); rev-a2 (B) reports Q and P again
+/// (start 4, completion 5, submissions seq 6, 7). Seq 8 validates P =
+/// `finding:canonical-8`, 9 validates Q = `finding:canonical-9`, 10 links
 /// rev-a2's P report (a duplicate discovery). Both repairs are assigned to A:
-/// 7 for P, 8 for Q. 9 binds a1 (A) to repair 7, which fails; 10 closes it
-/// `no_fix`. 11 binds a2 (A) to repair 8, which fails; 12 reassigns it to b1
-/// (B), whose candidate is proposed (13), verified (14), integrated (15);
-/// 16 closes it `fixed`. By hand: A's M25 = M26 = 1/2 (the failed repair
+/// 11 for P, 12 for Q. 13 binds a1 (A) to repair 11, which fails; 14 closes
+/// it `no_fix`. 15 binds a2 (A) to repair 12, which fails; 16 reassigns it to
+/// b1 (B), whose candidate is proposed (17), verified (18), integrated (19);
+/// 20 closes it `fixed`. By hand: A's M25 = M26 = 1/2 (the failed repair
 /// stays), B has no assigned opportunity (null, not 1/1); findings 1/2.
-/// Implementation credit of Q's fix is mixed and unallocated until 17 splits
-/// it b1 2/3, a2 1/3. M21 = 2 (A 1, B 1); 18 shares P's discovery 1/2 + 1/2
-/// (A 1/2, B 3/2, still 2 in total); 19 retracts that. M29: 6/9 = 2/3 before
-/// 17, 7/9 after. 20 records P's introduction as unattributable.
+/// Implementation credit of Q's fix is mixed and unallocated until 21 splits
+/// it b1 2/3, a2 1/3. M21 = 2 (A 1, B 1); 22 shares P's discovery 1/2 + 1/2
+/// (A 1/2, B 3/2, still 2 in total); 23 retracts that. M29: 6/9 = 2/3 before
+/// 21, 7/9 after. 24 records P's introduction as unattributable.
 #[test]
 fn failed_repairs_stay_in_denominator_and_mixed_credit_is_split() {
     let f = Fixture::new();
@@ -661,38 +668,38 @@ fn failed_repairs_stay_in_denominator_and_mixed_credit_is_split() {
     completed_review(&f, &world, "security", "rev-a2", json!(["finding:q", "finding:p-again"]));
     f.cli_args(&["review", "findings", "validate", "1", "--new", "--severity", "high", "--evidence", &evidence('e')]);
     f.cli_args(&["review", "findings", "validate", "2", "--new", "--severity", "medium", "--evidence", &evidence('e')]);
-    f.cli_args(&["review", "findings", "validate", "3", "--finding", "finding:canonical-4", "--severity", "high", "--evidence", &evidence('f')]);
-    let (p, q) = ("finding:canonical-4", "finding:canonical-5");
+    f.cli_args(&["review", "findings", "validate", "3", "--finding", "finding:canonical-8", "--severity", "high", "--evidence", &evidence('f')]);
+    let (p, q) = ("finding:canonical-8", "finding:canonical-9");
     let fixes = |args: &[&str]| { let mut all = vec!["review", "fixes"]; all.extend(args); f.cli_args(&all).0["event"].clone() };
     let refused = |args: &[&str], text: &str| { let mut all = vec!["review", "fixes"]; all.extend(args); let e = f.cli_fail(&all); assert!(e.contains(text), "{e}"); };
     let metrics = || f.cli_args(&["review", "report"]).0["metrics"].clone();
 
-    assert_eq!(fixes(&["open", p, "--assign", "fast"])["seq"], json!(7));
-    assert_eq!(fixes(&["open", q, "--assign", "fast"])["seq"], json!(8));
+    assert_eq!(fixes(&["open", p, "--assign", "fast"])["seq"], json!(11));
+    assert_eq!(fixes(&["open", q, "--assign", "fast"])["seq"], json!(12));
     for (attempt, configuration) in [("a1", &a), ("a2", &a), ("b1", &b)] { factory.attempt(attempt, configuration); }
-    fixes(&["bind", "7", "--attempt", "a1"]);
-    refused(&["close", "7", "--outcome", "fixed"], "has no verified fix");
-    fixes(&["close", "7", "--outcome", "no_fix"]);
-    refused(&["bind", "7", "--attempt", "a2"], "repair opportunity 7 is closed");
-    fixes(&["bind", "8", "--attempt", "a2"]);
-    assert_eq!(fixes(&["bind", "8", "--attempt", "b1"])["subject"], json!({"repair_seq": 8, "attempt_id": "b1", "ordinal": 2, "configuration_id": b}));
+    fixes(&["bind", "11", "--attempt", "a1"]);
+    refused(&["close", "11", "--outcome", "fixed"], "has no verified fix");
+    fixes(&["close", "11", "--outcome", "no_fix"]);
+    refused(&["bind", "11", "--attempt", "a2"], "repair opportunity 11 is closed");
+    fixes(&["bind", "12", "--attempt", "a2"]);
+    assert_eq!(fixes(&["bind", "12", "--attempt", "b1"])["subject"], json!({"repair_seq": 12, "attempt_id": "b1", "ordinal": 2, "configuration_id": b}));
     factory.submission(&hex('5'), "b1", &oid('7'), 5_000);
     factory.run(&hex('a'), &hex('5'), "b1", &oid('7'), Some(&hex('b')));
     factory.integration(&hex('6'), &hex('b'), &oid('7'), &oid('9'), unix_ms() - 1_000);
-    fixes(&["propose", "8", "--submission", &hex('5')]);
-    fixes(&["verify", "13", "--run", &hex('a'), "--assurance", "approved_alternative", "--evidence", &evidence('a')]);
-    fixes(&["integrate", "13", "--integrated", &hex('6')]);
-    assert_eq!(fixes(&["close", "8", "--outcome", "fixed"])["seq"], json!(16));
+    fixes(&["propose", "12", "--submission", &hex('5')]);
+    fixes(&["verify", "17", "--run", &hex('a'), "--assurance", "approved_alternative", "--evidence", &evidence('a')]);
+    fixes(&["integrate", "17", "--integrated", &hex('6')]);
+    assert_eq!(fixes(&["close", "12", "--outcome", "fixed"])["seq"], json!(20));
 
-    let at16 = fixes_show(&f, None);
-    let attempts: Vec<_> = at16["repairs"][1]["attempts"].as_array().unwrap().iter()
+    let at20 = fixes_show(&f, None);
+    let attempts: Vec<_> = at20["repairs"][1]["attempts"].as_array().unwrap().iter()
         .map(|t| (t["attempt_id"].clone(), t["ordinal"].clone(), t["configuration_id"].clone(), t["reassignment"].clone())).collect();
     assert_eq!(attempts, [(json!("a2"), json!(1), json!(a), json!(false)), (json!("b1"), json!(2), json!(b), json!(true))]);
-    assert_eq!((&at16["repairs"][0]["outcome"], &at16["repairs"][0]["closure"], &at16["repairs"][1]["outcome"]), (&json!("no_candidate"), &json!("no_fix"), &json!("currently_resolved")));
-    let q16 = &at16["findings"][1];
-    assert_eq!((&q16["implementation"]["shares"], &q16["implementation"]["allocated"], &q16["implementation"]["unallocated"], &q16["implementation"]["unallocated_reason"]),
+    assert_eq!((&at20["repairs"][0]["outcome"], &at20["repairs"][0]["closure"], &at20["repairs"][1]["outcome"]), (&json!("no_candidate"), &json!("no_fix"), &json!("currently_resolved")));
+    let q20 = &at20["findings"][1];
+    assert_eq!((&q20["implementation"]["shares"], &q20["implementation"]["allocated"], &q20["implementation"]["unallocated"], &q20["implementation"]["unallocated_reason"]),
         (&json!([]), &json!("0"), &json!("1"), &json!("mixed_contribution_unallocated")));
-    assert_eq!((&at16["findings"][0]["remediation"], &at16["findings"][0]["implementation"]), (&json!("unrepaired"), &json!(null)));
+    assert_eq!((&at20["findings"][0]["remediation"], &at20["findings"][0]["implementation"]), (&json!("unrepaired"), &json!(null)));
 
     let m = metrics();
     assert_eq!((&m["M25"]["value"], &m["M25"]["findings"]), (&json!("1/2"), &json!({"label": "finding_outcomes", "numerator": 1, "denominator": 2})));
@@ -703,12 +710,12 @@ fn failed_repairs_stay_in_denominator_and_mixed_credit_is_split() {
     assert_eq!((&m["M29"]["value"], &m["M29"]["by_role"]["implementation"]), (&json!("2/3"), &json!({"allocated": "0", "eligible": 1, "value": "0/1"})));
 
     // Mixed contributions are split, never full credit each.
-    refused(&["credit", q, "--role", "implementation", "--proposal", "13", "--share", "b1=2/3", "--share", "a2=2/3", "--evidence", &evidence('c')], "sum to more than 1");
-    refused(&["credit", q, "--role", "implementation", "--proposal", "13", "--share", "a1=1/3", "--evidence", &evidence('c')], "did not contribute");
-    refused(&["credit", q, "--role", "implementation", "--proposal", "13", "--share", "b1=2/3", "--share", "a2=1/3"], "needs at least one evidence reference");
-    assert_eq!(fixes(&["credit", q, "--role", "implementation", "--proposal", "13", "--share", "b1=2/3", "--share", "a2=1/3", "--evidence", &evidence('c')])["seq"], json!(17));
-    let q17 = fixes_show(&f, None)["findings"][1]["implementation"].clone();
-    assert_eq!((&q17["policy"], credit(&q17), &q17["allocated"], &q17["unallocated"]),
+    refused(&["credit", q, "--role", "implementation", "--proposal", "17", "--share", "b1=2/3", "--share", "a2=2/3", "--evidence", &evidence('c')], "sum to more than 1");
+    refused(&["credit", q, "--role", "implementation", "--proposal", "17", "--share", "a1=1/3", "--evidence", &evidence('c')], "did not contribute");
+    refused(&["credit", q, "--role", "implementation", "--proposal", "17", "--share", "b1=2/3", "--share", "a2=1/3"], "needs at least one evidence reference");
+    assert_eq!(fixes(&["credit", q, "--role", "implementation", "--proposal", "17", "--share", "b1=2/3", "--share", "a2=1/3", "--evidence", &evidence('c')])["seq"], json!(21));
+    let q21 = fixes_show(&f, None)["findings"][1]["implementation"].clone();
+    assert_eq!((&q21["policy"], credit(&q21), &q21["allocated"], &q21["unallocated"]),
         (&json!("owner_allocation.v1"), vec![("attempt:a2".into(), json!(a), "1/3".into()), ("attempt:b1".into(), json!(b), "2/3".into())], &json!("1"), &json!("0")));
     assert_eq!(metrics()["M29"]["value"], json!("7/9"));
 
@@ -719,11 +726,11 @@ fn failed_repairs_stay_in_denominator_and_mixed_credit_is_split() {
     let m21 = metrics()["M21"].clone();
     assert_eq!((&m21["value"], &m21["unallocated"], &m21["by_configuration"], &m21["participation"]), (&json!("2"), &json!("0"), &json!({a.as_str(): "1/2", b.as_str(): "3/2"}), &json!(3)));
     // Retraction restores the policy's credit; the allocation stays in the as-of view.
-    refused(&["retract", "16"], "only a credit allocation, reopening or introduction");
-    fixes(&["retract", "18"]);
-    refused(&["retract", "18"], "already retracted");
+    refused(&["retract", "20"], "only a credit allocation, reopening or introduction");
+    fixes(&["retract", "22"]);
+    refused(&["retract", "22"], "already retracted");
     assert_eq!(metrics()["M21"]["by_configuration"], json!({a.as_str(): "1", b.as_str(): "1"}));
-    assert_eq!((&fixes_show(&f, Some(18))["findings"][0]["discovery"]["policy"], &fixes_show(&f, None)["findings"][0]["discovery"]["policy"]),
+    assert_eq!((&fixes_show(&f, Some(22))["findings"][0]["discovery"]["policy"], &fixes_show(&f, None)["findings"][0]["discovery"]["policy"]),
         (&json!("owner_allocation.v1"), &json!("earliest_validated.v1")));
 
     // Unattributable introduction is explicit, not an exoneration and not a charge.
@@ -732,7 +739,7 @@ fn failed_repairs_stay_in_denominator_and_mixed_credit_is_split() {
     let intro = fixes_show(&f, None)["findings"][0]["introduction"].clone();
     assert_eq!((&intro["status"], &intro["credit"]["shares"], &intro["credit"]["unallocated"], &intro["credit"]["unallocated_reason"]),
         (&json!("unattributable"), &json!([]), &json!("1"), &json!("unattributable")));
-    assert_eq!(fixes_show(&f, None)["head_seq"], json!(20));
+    assert_eq!(fixes_show(&f, None)["head_seq"], json!(24));
 }
 
 /// The factory side of a protocol world: task `work`, one result submission
@@ -797,19 +804,22 @@ fn protocols_show(f: &Fixture, as_of: Option<i64>) -> serde_json::Value {
 }
 
 /// TM3.4 incremental yield golden. History by hand: seq 1 registers
-/// `skeptical-challenge.v1`; 2 is ordinary review O1's (code, S1) submission
-/// `null-deref`; 3 validates it as K = `finding:canonical-3`. 4 binds the
-/// skeptical pass P1 (S1, prior O1): same artifact, prior coverage complete,
-/// cutoff 3, so K is known. P1 reports `alias`, `leak`, `reworded` and
-/// `style` (submissions 2–5 at seq 5–8, claims 2–5). 9 marks `reworded` a
-/// duplicate of K; 10 validates `alias` as new A = `finding:canonical-10`;
-/// 11 validates `leak` as L = `finding:canonical-11`; 12 rejects `style`.
-/// Then P1 yields A and L: M28 = 2/1 (one rediscovery). 13 merges A into K
-/// (same root cause, reworded): only L is new, M28 = 1/1, 2 rediscoveries;
-/// as of 12 it is still 2. 14 binds P2 on S2 (a later candidate) after O1:
-/// `changed_artifact`, its own opportunity; its finding (15, validated at 16)
-/// is never incremental. 17 binds P3 on S1 after O2, which never ran:
-/// `incomplete_prior_coverage`. Final M28 = 1/1, excluded 1 + 1.
+/// `skeptical-challenge.v1`; 2 and 3 are ordinary review O1's (code, S1)
+/// session start and completion, 4 its submission `null-deref`; 5 validates it
+/// as K = `finding:canonical-5`. 6 is the start of a review that began before
+/// any binding (so it cannot be bound). 7 binds the skeptical pass P1 (S1,
+/// prior O1): same artifact, prior coverage complete, cutoff 6, so K is known.
+/// P1's session starts (8) and completes (9) reporting `alias`, `leak`,
+/// `reworded` and `style` (submissions 2–5 at seq 10–13, claims 2–5). 14 marks
+/// `reworded` a duplicate of K; 15 validates `alias` as new A =
+/// `finding:canonical-15`; 16 validates `leak` as L = `finding:canonical-16`;
+/// 17 rejects `style`. Then P1 yields A and L: M28 = 2/1 (one rediscovery).
+/// 18 merges A into K (same root cause, reworded): only L is new, M28 = 1/1,
+/// 2 rediscoveries; as of 17 it is still 2. 19 binds P2 on S2 (a later
+/// candidate) after O1: `changed_artifact`, its own opportunity; its session
+/// (20, 21) reports one finding (22, validated at 23), never incremental. 24
+/// binds P3 on S1 after O2, which never ran: `incomplete_prior_coverage`.
+/// Final M28 = 1/1, excluded 1 + 1.
 #[test]
 fn reworded_duplicates_add_no_incremental_discovery_and_new_artifact_is_new_opportunity() {
     let f = Fixture::new();
@@ -854,30 +864,30 @@ fn reworded_duplicates_add_no_incremental_discovery_and_new_artifact_is_new_oppo
     let p1 = open_review(&f, '1', "skeptical", SKEPTICAL, Some(BUDGET));
     let bound = f.cli_args(&["review", "protocols", "bind", &p1, "--prior", &o1]).0["event"].clone();
     assert_eq!((&bound["seq"], &bound["subject"]["cutoff_seq"], &bound["subject"]["comparability"], &bound["subject"]["prior_coverage"]),
-        (&json!(4), &json!(3), &json!("same_artifact"), &json!("complete")));
+        (&json!(7), &json!(6), &json!("same_artifact"), &json!("complete")));
     assert!(f.cli_fail(&["review", "protocols", "bind", &p1, "--prior", &o1]).contains("already a bound pass"));
 
     // The skeptical session reports four findings; two are rewordings of K.
     let done = run_review(&f, &p1, '1', "rev-k1", json!([{"ref": "finding:reworded", "title": "Loader dereferences null when the config file is absent"},
         {"ref": "finding:alias", "title": "Missing config file crashes startup"}, "finding:leak", "finding:style"]), json!([evidence('a')]));
     assert_eq!(done["finding_submissions"], json!([2, 3, 4, 5]));
-    f.cli_args(&["review", "findings", "duplicate", "4", "--of", "finding:canonical-3"]);
+    f.cli_args(&["review", "findings", "duplicate", "4", "--of", "finding:canonical-5"]);
     f.cli_args(&["review", "findings", "validate", "2", "--new", "--severity", "high", "--evidence", &evidence('b')]);
     f.cli_args(&["review", "findings", "validate", "3", "--new", "--severity", "medium", "--evidence", &evidence('c')]);
     f.cli_args(&["review", "findings", "reject", "5", "--reason", "out_of_scope"]);
     let pass = protocols_show(&f, None)["passes"][0].clone();
     assert_eq!((&pass["opportunity_id"], &pass["known_findings"], &pass["new_unique_findings"], &pass["rediscovered"], &pass["eligible"]),
-        (&json!(p1), &json!(["finding:canonical-3"]), &json!(["finding:canonical-10", "finding:canonical-11"]), &json!(1), &json!(true)));
+        (&json!(p1), &json!(["finding:canonical-5"]), &json!(["finding:canonical-15", "finding:canonical-16"]), &json!(1), &json!(true)));
     assert_eq!(pass["claims"].as_array().unwrap().iter().map(|c| (c["claim_id"].as_i64().unwrap(), c["incremental"].as_str().unwrap())).collect::<Vec<_>>(),
         [(2, "new"), (3, "new"), (4, "rediscovered"), (5, "rejected")]);
     let m28 = f.cli_args(&["review", "report"]).0["metrics"]["M28"].clone();
     assert_eq!((&m28["numerator"], &m28["denominator"], &m28["value"], &m28["rediscovered"]), (&json!(2), &json!(1), &json!("2/1"), &json!(1)));
 
     // The owner merges the reworded A into K: A was never a new discovery.
-    assert_eq!(f.cli_args(&["review", "findings", "merge", "finding:canonical-10", "--into", "finding:canonical-3"]).0["event"]["seq"], json!(13));
+    assert_eq!(f.cli_args(&["review", "findings", "merge", "finding:canonical-15", "--into", "finding:canonical-5"]).0["event"]["seq"], json!(18));
     let pass = protocols_show(&f, None)["passes"][0].clone();
-    assert_eq!((&pass["new_unique_findings"], &pass["rediscovered"]), (&json!(["finding:canonical-11"]), &json!(2)));
-    assert_eq!(protocols_show(&f, Some(12))["passes"][0]["new_unique_findings"], json!(["finding:canonical-10", "finding:canonical-11"]));
+    assert_eq!((&pass["new_unique_findings"], &pass["rediscovered"]), (&json!(["finding:canonical-16"]), &json!(2)));
+    assert_eq!(protocols_show(&f, Some(17))["passes"][0]["new_unique_findings"], json!(["finding:canonical-15", "finding:canonical-16"]));
 
     // A later candidate is another artifact: its pass is its own opportunity, labelled changed.
     let p2 = open_review(&f, '2', "skeptical", SKEPTICAL, Some(BUDGET));
@@ -898,16 +908,16 @@ fn reworded_duplicates_add_no_incremental_discovery_and_new_artifact_is_new_oppo
     let o2 = open_review(&f, '1', "code", "review-protocol.v1", None);
     let p3 = open_review(&f, '1', "skeptical", SKEPTICAL, Some(BUDGET));
     let bound = f.cli_args(&["review", "protocols", "bind", &p3, "--prior", &o2]).0["event"].clone();
-    assert_eq!((&bound["seq"], &bound["subject"]["prior_coverage"], &bound["subject"]["priors"][0]["status"]), (&json!(17), &json!("incomplete"), &json!("unassigned")));
+    assert_eq!((&bound["seq"], &bound["subject"]["prior_coverage"], &bound["subject"]["priors"][0]["status"]), (&json!(24), &json!("incomplete"), &json!("unassigned")));
 
     let shown = protocols_show(&f, None);
     let by = |id: &str| shown["passes"].as_array().unwrap().iter().find(|p| p["opportunity_id"] == id).unwrap().clone();
     let changed = by(&p2);
     assert_eq!((&changed["candidate_oid"], &changed["priors"][0]["artifact"], &changed["new_unique_findings"], &changed["eligible"], &changed["exclusion"]),
-        (&json!(oid('2')), &json!("changed_artifact"), &json!(["finding:canonical-16"]), &json!(false), &json!("changed_artifact")));
+        (&json!(oid('2')), &json!("changed_artifact"), &json!(["finding:canonical-23"]), &json!(false), &json!("changed_artifact")));
     assert_eq!(by(&p3)["exclusion"], json!("incomplete_prior_coverage"));
     assert_eq!(shown["history"].as_array().unwrap().iter().map(|e| (e["seq"].as_i64().unwrap(), e["kind"].as_str().unwrap())).collect::<Vec<_>>(),
-        [(1, "protocol_registered"), (4, "pass_bound"), (14, "pass_bound"), (17, "pass_bound")]);
+        [(1, "protocol_registered"), (7, "pass_bound"), (19, "pass_bound"), (24, "pass_bound")]);
 
     let m28 = f.report()["metrics"]["M28"].clone();
     assert_eq!((&m28["numerator"], &m28["denominator"], &m28["value"], &m28["rediscovered"]), (&json!(1), &json!(1), &json!("1/1"), &json!(2)));
@@ -928,19 +938,20 @@ fn experiments_show(f: &Fixture, as_of: Option<i64>) -> serde_json::Value {
 /// TM3.4 preregistration golden. Seq 1 registers the skeptical protocol, 2
 /// preregisters the randomized experiment E (seed a…a, reference arm
 /// `standard`, `skeptical` adds a pass, min 2 units per arm). A code review X
-/// of S1 already completed, so it cannot be assigned. 3–6 assign the base
-/// reviews B1–B4 (S1–S4); the seed gives, by
+/// of S1 already completed (session start 3, completion 4), so it cannot be
+/// assigned. 5–8 assign the base reviews B1–B4 (S1–S4); the seed gives, by
 /// `sha256("review_experiment.v1:" + seed + ":" + submission)` mod 2:
-/// standard, skeptical, standard, skeptical. Base submissions: B1 `b1` (seq
-/// 7), B2 `b2` (8), B3 none, B4 `b4` (9). 10 and 11 bind passes P2 (after B2)
-/// and P4 (after B4); P2 reports `k2-new` (12) and `k2-reworded` (13), P4
-/// `k4-reworded` (14). 15–18 validate b1, b2, b4 and k2-new as new; 19 and 20
-/// mark the rewordings duplicates. Outcomes: S1 1, S2 2 (b2 + k2-new), S3 0,
-/// S4 1 (the reworded report adds nothing). Means 1/2 and 3/2: difference
-/// 3/2 − 1/2 = 1. As of 14 only S3 is analyzable. The descriptive M28 over
-/// P2 and P4 is 1/2. 21 excludes S3: standard has 1 analyzable unit, so the
-/// difference is unavailable. 22 binds a pass after B1 (standard):
-/// crossover, still analyzed as assigned.
+/// standard, skeptical, standard, skeptical. Each review's session start and
+/// completion precede its submissions: B1 9, 10, `b1` (11); B2 12, 13, `b2`
+/// (14); B3 15, 16, none; B4 17, 18, `b4` (19). 20 and 21 bind passes P2
+/// (after B2) and P4 (after B4); P2 (22, 23) reports `k2-new` (24) and
+/// `k2-reworded` (25), P4 (26, 27) `k4-reworded` (28). 29–32 validate b1, b2,
+/// b4 and k2-new as new; 33 and 34 mark the rewordings duplicates. Outcomes:
+/// S1 1, S2 2 (b2 + k2-new), S3 0, S4 1 (the reworded report adds nothing).
+/// Means 1/2 and 3/2: difference 3/2 − 1/2 = 1. As of 28 only S3 is
+/// analyzable. The descriptive M28 over P2 and P4 is 1/2. 35 excludes S3:
+/// standard has 1 analyzable unit, so the difference is unavailable. 36 binds
+/// a pass after B1 (standard): crossover, still analyzed as assigned.
 #[test]
 fn preregistered_assignment_frozen_before_outcomes_observational_is_descriptive() {
     let f = Fixture::new();
@@ -978,8 +989,8 @@ fn preregistered_assignment_frozen_before_outcomes_observational_is_descriptive(
     {
         let mut db = rusqlite::Connection::open(&db_path).unwrap();
         let tx = db.transaction().unwrap();
-        tx.execute("INSERT INTO protocol_log(seq,kind,principal,authority,expected_seq,recorded_unix_ms) VALUES(3,'unit_assigned','operator:cli','operator_owner.v1',NULL,1)", []).unwrap();
-        let raw = tx.execute("INSERT INTO experiment_units(seq,experiment_seq,opportunity_id,submission_id,arm,block) VALUES(3,2,?1,?2,'standard',NULL)", [&x, &hex('1')]).unwrap_err();
+        tx.execute("INSERT INTO protocol_log(seq,kind,principal,authority,expected_seq,recorded_unix_ms) VALUES(5,'unit_assigned','operator:cli','operator_owner.v1',NULL,1)", []).unwrap();
+        let raw = tx.execute("INSERT INTO experiment_units(seq,experiment_seq,opportunity_id,submission_id,arm,block) VALUES(5,2,?1,?2,'standard',NULL)", [&x, &hex('1')]).unwrap_err();
         assert!(raw.to_string().contains("before any outcome"), "{raw}");
     }
     let ineligible = open_review(&f, '1', "security", "review-protocol.v1", None);
@@ -991,7 +1002,7 @@ fn preregistered_assignment_frozen_before_outcomes_observational_is_descriptive(
         let e = f.cli_args(&["review", "experiments", "assign", "skeptical-vs-standard.v1", b]).0["event"].clone();
         (e["seq"].as_i64().unwrap(), e["subject"]["arm"].as_str().unwrap().to_owned())
     }).collect();
-    assert_eq!(arms, [(3, "standard".into()), (4, "skeptical".into()), (5, "standard".into()), (6, "skeptical".into())]);
+    assert_eq!(arms, [(5, "standard".into()), (6, "skeptical".into()), (7, "standard".into()), (8, "skeptical".into())]);
     let again = open_review(&f, '1', "code", "review-protocol.v1", None);
     assert!(f.cli_fail(&["review", "experiments", "assign", "skeptical-vs-standard.v1", &again]).contains("is already a unit"));
 
@@ -1002,25 +1013,25 @@ fn preregistered_assignment_frozen_before_outcomes_observational_is_descriptive(
     run_review(&f, &base[3], '4', "rev-b4", json!(["finding:b4"]), json!([]));
     let p2 = open_review(&f, '2', "skeptical", SKEPTICAL, Some(BUDGET));
     let p4 = open_review(&f, '4', "skeptical", SKEPTICAL, Some(BUDGET));
-    assert_eq!(f.cli_args(&["review", "protocols", "bind", &p2, "--prior", &base[1]]).0["event"]["seq"], json!(10));
-    assert_eq!(f.cli_args(&["review", "protocols", "bind", &p4, "--prior", &base[3]]).0["event"]["seq"], json!(11));
+    assert_eq!(f.cli_args(&["review", "protocols", "bind", &p2, "--prior", &base[1]]).0["event"]["seq"], json!(20));
+    assert_eq!(f.cli_args(&["review", "protocols", "bind", &p4, "--prior", &base[3]]).0["event"]["seq"], json!(21));
     assert_eq!(run_review(&f, &p2, '2', "rev-k2", json!(["finding:k2-new", "finding:k2-reworded"]), json!([evidence('a')]))["finding_submissions"], json!([4, 5]));
     assert_eq!(run_review(&f, &p4, '4', "rev-k4", json!(["finding:k4-reworded"]), json!([evidence('a')]))["finding_submissions"], json!([6]));
     for claim in ["1", "2", "3", "4"] { f.cli_args(&["review", "findings", "validate", claim, "--new", "--severity", "medium", "--evidence", &evidence('e')]); }
-    f.cli_args(&["review", "findings", "duplicate", "5", "--of", "finding:canonical-16"]);
-    f.cli_args(&["review", "findings", "duplicate", "6", "--of", "finding:canonical-17"]);
+    f.cli_args(&["review", "findings", "duplicate", "5", "--of", "finding:canonical-30"]);
+    f.cli_args(&["review", "findings", "duplicate", "6", "--of", "finding:canonical-31"]);
 
     let e = experiments_show(&f, None);
     assert_eq!(e["units"].as_array().unwrap().iter().map(|u| (u["arm"].as_str().unwrap(), u["status"].as_str().unwrap(), u["outcome"].as_i64().unwrap(), u["treatment_received"].clone()))
         .collect::<Vec<_>>(), [("standard", "analyzable", 1, json!(null)), ("skeptical", "analyzable", 2, json!(true)), ("standard", "analyzable", 0, json!(null)), ("skeptical", "analyzable", 1, json!(true))]);
-    assert_eq!(e["units"][1]["new_unique_findings"], json!(["finding:canonical-16", "finding:canonical-18"]));
+    assert_eq!(e["units"][1]["new_unique_findings"], json!(["finding:canonical-30", "finding:canonical-32"]));
     let est = &e["estimate"];
     assert_eq!((&est["estimate"], &est["analysis"], &est["reference_arm"], &est["uncertainty"]),
         (&json!("randomized"), &json!("intention_to_treat"), &json!("standard"), &unavailable("interval_not_computed")));
     assert_eq!((&est["arms"]["standard"]["mean"], &est["arms"]["skeptical"]["mean"], &est["arms"]["skeptical"]["outcome_total"]), (&json!("1/2"), &json!("3/2"), &json!(3)));
     assert_eq!(est["differences"], json!({"skeptical": {"value": "1", "analyzable": [2, 2]}}));
     // Replay: before any triage only S3 (no findings) was settled.
-    let early = experiments_show(&f, Some(14));
+    let early = experiments_show(&f, Some(28));
     assert_eq!(early["units"].as_array().unwrap().iter().map(|u| u["status"].as_str().unwrap()).collect::<Vec<_>>(), ["pending", "pending", "analyzable", "pending"]);
     assert_eq!(early["estimate"]["differences"]["skeptical"], json!({"value": unavailable("insufficient_data"), "analyzable": [1, 0]}));
 
@@ -1033,15 +1044,15 @@ fn preregistered_assignment_frozen_before_outcomes_observational_is_descriptive(
 
     // An exclusion stays listed; below the preregistered minimum there is no estimate.
     assert!(f.cli_fail(&["review", "experiments", "exclude", "skeptical-vs-standard.v1", &base[2], "--reason", "changed_my_mind"]).contains("unknown exclusion reason"));
-    assert_eq!(f.cli_args(&["review", "experiments", "exclude", "skeptical-vs-standard.v1", &base[2], "--reason", "operator_error"]).0["event"]["seq"], json!(21));
+    assert_eq!(f.cli_args(&["review", "experiments", "exclude", "skeptical-vs-standard.v1", &base[2], "--reason", "operator_error"]).0["event"]["seq"], json!(35));
     let e = experiments_show(&f, None);
-    assert_eq!((&e["units"][2]["status"], &e["units"][2]["arm"], &e["units"][2]["exclusion"]), (&json!("excluded"), &json!("standard"), &json!({"seq": 21, "reason": "operator_error"})));
+    assert_eq!((&e["units"][2]["status"], &e["units"][2]["arm"], &e["units"][2]["exclusion"]), (&json!("excluded"), &json!("standard"), &json!({"seq": 35, "reason": "operator_error", "retracted_seq": null})));
     assert_eq!((&e["estimate"]["arms"]["standard"]["excluded"], &e["estimate"]["differences"]["skeptical"]),
         (&json!({"operator_error": 1}), &json!({"value": unavailable("insufficient_data"), "analyzable": [1, 2]})));
 
     // Crossover: a pass after a standard unit is recorded and the unit stays in its assigned arm.
     let p1 = open_review(&f, '1', "skeptical", SKEPTICAL, Some(BUDGET));
-    assert_eq!(f.cli_args(&["review", "protocols", "bind", &p1, "--prior", &base[0]]).0["event"]["seq"], json!(22));
+    assert_eq!(f.cli_args(&["review", "protocols", "bind", &p1, "--prior", &base[0]]).0["event"]["seq"], json!(36));
     let e = experiments_show(&f, None);
     assert_eq!((&e["units"][0]["arm"], &e["units"][0]["crossover"], &e["units"][0]["status"], &e["units"][0]["passes"]), (&json!("standard"), &json!(true), &json!("pending"), &json!([p1])));
     assert_eq!(e["estimate"]["arms"]["standard"]["crossover"], json!(1));
@@ -1636,20 +1647,24 @@ fn seeded_or_held_submission_cannot_complete_the_task() {
 /// Doc 10 §5 seeded-review fixture. Seeded candidates S1–S4 (starter seeds
 /// logic, boundary, security, test_weakening; seeds 1–4) and clean controls
 /// C1, C2 are registered at seq 1–6. Configuration R (`fast`) reviews each
-/// once: S1 reports two findings (claims 1, 2; seq 7, 8), S2–S4, C1, C2 one
-/// each (claims 3–7; seq 9–13). A second review of S1 by Q (`claude`) times
-/// out: not completed, so no trial (`not_completed` 1), never a 0. Before
-/// triage every trial is pending: M43 and M44 are null (empty denominator)
-/// with pending 4 and 2. Seq 14–20 triage: claims 1–5 and 7 validated as new
-/// findings, claim 6 rejected. Seq 21–23 link claims 1, 3, 4 to seeds 1–3.
-/// By hand: M43 = 3/4 = 75.00 (S4's seed missed; its validated claim 5 is an
-/// ordinary finding), M44 = 1/2 = 50.00 (C1's rejected-only submission; C2's
-/// validated finding is not a false alarm), per configuration R the same;
-/// each seed class has 1 trial, below `--min-trials 2`, so suppressed with
-/// counts. M22 = 6/7: detection changes no triage. Seq 24 resets claim 1:
-/// seed 1 pending, M43 = 2/3. Seq 25 validates it again: 3/4. Seq 26
-/// retracts detection 23: 2/4; as of 25 still 3/4. Seq 27 re-links it: 3/4.
-/// Seq 28 reveals S1 (every review ended), seq 29 discards it.
+/// once; each review's session start and completion take the two seqs before
+/// its submissions: S1 (7, 8) reports two findings (claims 1, 2; seq 9, 10),
+/// S2–S4, C1, C2 one each (claims 3–7; seq 13, 16, 19, 22, 25). A second
+/// review of S1 by Q (`claude`) starts (26) and times out (27): not
+/// completed, so no trial (`not_completed` 1), never a 0. Before triage every
+/// trial is pending: M43 and M44 are null (empty denominator) with pending 4
+/// and 2. Seq 28–34 triage: claims 1–5 and 7 validated as new findings, claim
+/// 6 rejected. Seq 35–37 link claims 1, 3, 4 to seeds 1–3. By hand: M43 = 3/4
+/// = 75.00 (S4's seed missed; its validated claim 5 is an ordinary finding),
+/// M44 = 1/2 = 50.00 (C1's rejected-only submission; C2's validated finding
+/// is not a false alarm), per configuration R the same; each seed class has 1
+/// trial, below `--min-trials 2`, so suppressed with counts. Detection adds
+/// no triage (6 unique findings), but the three seed-linked submissions are
+/// evaluation artefacts outside M22 and M21 (§9): M22 = 3/4 (claims 2, 5, 7
+/// validated, 6 rejected), M21 = 3 of the 6 findings. Seq 38 resets claim 1:
+/// seed 1 pending, M43 = 2/3. Seq 39 validates it again: 3/4. Seq 40 retracts
+/// detection 37: 2/4; as of 39 still 3/4. Seq 41 re-links it: 3/4. Seq 42
+/// reveals S1 (every review ended), seq 43 discards it.
 #[test]
 fn seeded_recall_and_clean_control_false_alarms_match_fixture() {
     let f = Fixture::new();
@@ -1713,7 +1728,7 @@ fn seeded_recall_and_clean_control_false_alarms_match_fixture() {
     assert!(seeds_fail(&["detect", "4", "--claim", "6", "--evidence", &evidence('e')]).contains("another candidate"));
     assert!(seeds_fail(&["detect", "1", "--claim", "3", "--evidence", &evidence('e')]).contains("another candidate"));
     assert!(seeds_fail(&["detect", "1", "--claim", "1"]).contains("at least one evidence reference"));
-    for (seed, claim, seq) in [("1", "1", 21), ("2", "3", 22), ("3", "4", 23)] {
+    for (seed, claim, seq) in [("1", "1", 35), ("2", "3", 36), ("3", "4", 37)] {
         assert_eq!(seeds_cmd(&["detect", seed, "--claim", claim, "--evidence", &evidence('a')])["event"]["seq"], json!(seq));
     }
     assert!(seeds_fail(&["detect", "1", "--claim", "1", "--evidence", &evidence('a')]).contains("already detects a seed"));
@@ -1734,34 +1749,345 @@ fn seeded_recall_and_clean_control_false_alarms_match_fixture() {
     let full = f.report()["metrics"].clone();
     assert_eq!(cell(&full["M43"], "detected", "trials"), (json!(3), json!(4), json!(0), suppressed.clone(), suppressed.clone()));
     assert_eq!((&full["M44"]["false_alarms"], &full["M44"]["controls"], &full["M44"]["value"]), (&json!(1), &json!(2), &suppressed));
-    // Incidental real findings follow the ordinary path: M22 counts every submission.
-    assert_eq!(full["M22"]["value"], json!("6/7"));
+    // Seed-linked submissions are evaluation artefacts (§9); incidental real findings stay ordinary.
+    assert_eq!((&full["M22"]["value"], &full["M22"]["seeded_evaluation"]), (&json!("3/4"), &json!({"submissions": 3, "claims": 3})));
+    assert_eq!((&full["M21"]["value"], &full["M21"]["seeded_evaluation"]), (&json!("3"), &json!(3)));
     let triage = f.cli_args(&["review", "findings", "show"]).0["findings"].clone();
     assert_eq!(triage["unique_findings"], json!(6));
 
     // Triage corrections and retractions replay through the one ordering.
     f.cli_args(&["review", "findings", "reset", "1", "--reason", "decided_in_error"]);
     assert_eq!(cell(&report(&[])["M43"], "detected", "trials"), (json!(2), json!(3), json!(1), json!("2/3"), json!("66.67")));
-    f.cli_args(&["review", "findings", "validate", "1", "--finding", "finding:canonical-14", "--severity", "high", "--evidence", &evidence('e')]);
+    f.cli_args(&["review", "findings", "validate", "1", "--finding", "finding:canonical-28", "--severity", "high", "--evidence", &evidence('e')]);
     assert_eq!(report(&[])["M43"]["value"], json!("3/4"));
-    assert_eq!(seeds_cmd(&["retract", "23"])["event"]["seq"], json!(26));
+    assert_eq!(seeds_cmd(&["retract", "37"])["event"]["seq"], json!(40));
     assert_eq!(report(&[])["M43"]["value"], json!("2/4"));
-    assert_eq!((&report(&["--as-of", "25"])["M43"]["value"], &report(&["--as-of", "25"])["M43"]["as_of_seq"]), (&json!("3/4"), &json!(25)));
+    assert_eq!((&report(&["--as-of", "39"])["M43"]["value"], &report(&["--as-of", "39"])["M43"]["as_of_seq"]), (&json!("3/4"), &json!(39)));
     seeds_cmd(&["detect", "3", "--claim", "4", "--evidence", &evidence('b')]);
 
     // Reveal only after every review ended; nothing reviews it afterwards.
     assert!(seeds_fail(&["dispose", &s[0].0, "--disposition", "discarded"]).contains("not revealed yet"));
-    assert_eq!(seeds_cmd(&["reveal", &s[0].0])["event"]["seq"], json!(28));
+    assert_eq!(seeds_cmd(&["reveal", &s[0].0])["event"]["seq"], json!(42));
     let again = f.cli_fail(&["review", "open", &s[0].0, "--protocol", "review-protocol.v1"]);
     assert!(again.contains("not reviewed again"), "{again}");
-    assert_eq!(seeds_cmd(&["dispose", &s[0].0, "--disposition", "discarded"])["event"]["seq"], json!(29));
+    assert_eq!(seeds_cmd(&["dispose", &s[0].0, "--disposition", "discarded"])["event"]["seq"], json!(43));
     let m = report(&[]);
-    assert_eq!((&m["M43"]["value"], &m["M44"]["value"], &m["M43"]["as_of_seq"]), (&json!("3/4"), &json!("1/2"), &json!(29)));
+    assert_eq!((&m["M43"]["value"], &m["M44"]["value"], &m["M43"]["as_of_seq"]), (&json!("3/4"), &json!("1/2"), &json!(43)));
     let shown = seeds_cmd(&["show"])["seeds"].clone();
     let s1 = &shown["candidates"][0];
     assert_eq!((&s1["revealed_seq"], &s1["disposal"], &s1["seeds"][0]["reproducer_ref"], &s1["seeds"][0]["seed_class"]),
-        (&json!(28), &json!("discarded"), &json!(reproducer_ref(&seeds[0])), &json!("logic")));
+        (&json!(42), &json!("discarded"), &json!(reproducer_ref(&seeds[0])), &json!("logic")));
     let kinds: Vec<&str> = shown["history"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap()).collect();
     assert_eq!(kinds, ["registered", "registered", "registered", "registered", "registered", "registered", "detected", "detected", "detected", "retracted", "detected", "revealed", "disposed"]);
     assert_eq!(shown["trials"].as_array().unwrap().iter().map(|t| t["status"].as_str().unwrap()).collect::<Vec<_>>(), ["detected", "detected", "detected", "missed"]);
+}
+
+// ---- Card D7: review lifecycle in the shared ledger, seed-linked credit,
+// protocol retractions and the worker guard (contracts-review.md §9).
+
+#[path = "../src/store/test_schema.rs"]
+mod test_schema;
+
+/// Start `attempt`'s session of an assigned opportunity; returns its id.
+fn start_session(f: &Fixture, opportunity: &str, attempt: &str) -> String {
+    f.cli_args(&["review", "start", opportunity, "--attempt", attempt]).0["session"]["session_id"].as_str().unwrap().to_owned()
+}
+
+/// Complete `session` on artifact `c` with `outcome`, `findings` and `evidence`.
+fn complete_session(f: &Fixture, session: &str, c: char, outcome: &str, findings: serde_json::Value, evidence: serde_json::Value) -> serde_json::Value {
+    let mut receipt = json!({"schema": "review_receipt.v1", "session_id": session, "submission_id": hex(c), "candidate_oid": oid(c), "outcome": outcome,
+        "findings": findings, "evidence": evidence});
+    if outcome != "completed" { receipt["reason"] = json!("budget_exhausted"); }
+    f.cli_args(&["review", "complete", "--input-file", &input(f, &format!("{}.json", &session[7..19]), &receipt)]).0["completion"].clone()
+}
+
+/// §9 golden: review status replays with the ledger; owner retractions.
+/// History by hand: 1 registers the skeptical protocol; 2 preregisters E
+/// (randomized, seed a…a, min 2 units, stopping rule `planned_units` = 2);
+/// 3 and 4 assign B1 (S1, `standard`) and B2 (S2, `skeptical`); B3 (S3) is
+/// refused: E reached its 2 planned units. B1's first session starts (5) and
+/// times out (6); a restart starts (7) and completes (8) with `b1`
+/// (submission 1, seq 9), validated at 10 as `finding:canonical-10`. B2's
+/// session starts (11) and completes with nothing (12). 13 binds pass P2 (S2,
+/// after B2); P2 starts (14) and completes (15) with `k2` (submission 2, seq
+/// 16), validated at 17 as `finding:canonical-17`. By hand, unit S1 is
+/// `pending` as of 4 (no session yet) and 7 (restart in progress),
+/// `analyzable` with outcome 0 as of 6 (its only session ended without
+/// completion), `pending` as of 9 (b1 untriaged) and `analyzable` with outcome
+/// 1 at the head; the stored status would call it ended at every watermark.
+/// P2 is `in_progress` (`not_completed`) as of 14, `completed` but
+/// `pending_triage` as of 16, and eligible with one new finding at 17: M28 =
+/// 1/1. 18 retracts P2's binding: M28 null (excluded `retracted` 1), unit S2
+/// has no treatment (pending); as of 17 the pass still counts. 19 excludes
+/// unit S1, 20 retracts that exclusion: S1 is analyzable again, excluded as
+/// of 19.
+#[test]
+fn review_status_replays_with_the_ledger_and_owner_retracts_protocol_records() {
+    let f = Fixture::new();
+    artifact_world(&f, &['1', '2', '3'], &["rev-b1", "rev-b1b", "rev-b2", "rev-k2"]);
+    let db_path = f.project.join(".state/state.db");
+    f.cli_args(&["review", "protocols", "register", "--input-file", &input(&f, "protocol.json", &skeptical_protocol())]);
+    let experiment = json!({"schema": "review_experiment.v1", "experiment": "planned.v1", "design": "randomized", "seed": hex('a'),
+        "eligibility": {"kind": "code", "scope": "candidate_diff", "role": "evaluation", "protocol": "review-protocol.v1"},
+        "arms": [{"arm": "standard", "protocol": null}, {"arm": "skeptical", "protocol": SKEPTICAL}],
+        "primary_outcome": "validated_unique_findings.v1", "adjudication": "owner_triage.v1", "horizon_days": 14, "min_units": 2, "stopping_rule": "planned_units", "planned_units": 2});
+    let mut unplanned = experiment.clone();
+    unplanned["planned_units"] = json!(null);
+    assert!(f.cli_fail(&["review", "experiments", "register", "--input-file", &input(&f, "unplanned.json", &unplanned)]).contains("needs planned_units"));
+    assert_eq!(f.cli_args(&["review", "experiments", "register", "--input-file", &input(&f, "planned.json", &experiment)]).0["event"]["seq"], json!(2));
+    let base: Vec<String> = ['1', '2', '3'].into_iter().map(|c| open_review(&f, c, "code", "review-protocol.v1", None)).collect();
+    for (b, seq, arm) in [(&base[0], 3, "standard"), (&base[1], 4, "skeptical")] {
+        let e = f.cli_args(&["review", "experiments", "assign", "planned.v1", b]).0["event"].clone();
+        assert_eq!((&e["seq"], &e["subject"]["arm"]), (&json!(seq), &json!(arm)));
+    }
+    // The stopping rule ends assignment at the planned units (store and trigger).
+    assert!(f.cli_fail(&["review", "experiments", "assign", "planned.v1", &base[2]]).contains("reached its 2 planned units"));
+    {
+        let mut db = rusqlite::Connection::open(&db_path).unwrap();
+        let tx = db.transaction().unwrap();
+        tx.execute("INSERT INTO protocol_log(seq,kind,principal,authority,expected_seq,recorded_unix_ms) VALUES(5,'unit_assigned','operator:cli','operator_owner.v1',NULL,1)", []).unwrap();
+        let raw = tx.execute("INSERT INTO experiment_units(seq,experiment_seq,opportunity_id,submission_id,arm,block) VALUES(5,2,?1,?2,'standard',NULL)", [&base[2], &hex('3')]).unwrap_err();
+        assert!(raw.to_string().contains("reached its planned units"), "{raw}");
+    }
+
+    // B1 times out, then a restart completes with one finding.
+    f.cli_args(&["review", "assign", &base[0], "--reviewer", "fast"]);
+    let first = start_session(&f, &base[0], "rev-b1");
+    complete_session(&f, &first, '1', "timed_out", json!([]), json!([]));
+    let restart = start_session(&f, &base[0], "rev-b1b");
+    assert_eq!(complete_session(&f, &restart, '1', "completed", json!(["finding:b1"]), json!([]))["finding_submissions"], json!([1]));
+    assert_eq!(f.cli_args(&["review", "findings", "show"]).0["findings"]["submissions"][0]["seq"], json!(9));
+    f.cli_args(&["review", "findings", "validate", "1", "--new", "--severity", "high", "--evidence", &evidence('e')]);
+    let s1 = |as_of: Option<i64>| {
+        let unit = experiments_show(&f, as_of)["units"][0].clone();
+        (unit["status"].as_str().unwrap().to_owned(), unit["outcome"].clone())
+    };
+    assert_eq!(s1(Some(4)), ("pending".to_owned(), json!(null)));
+    assert_eq!(s1(Some(6)), ("analyzable".to_owned(), json!(0)));
+    assert_eq!(s1(Some(7)), ("pending".to_owned(), json!(null)));
+    assert_eq!(s1(Some(9)), ("pending".to_owned(), json!(null)));
+    assert_eq!(s1(None), ("analyzable".to_owned(), json!(1)));
+    assert_eq!(experiments_show(&f, None)["units"][0]["new_unique_findings"], json!(["finding:canonical-10"]));
+
+    // B2, then pass P2 after it.
+    f.cli_args(&["review", "assign", &base[1], "--reviewer", "fast"]);
+    let b2 = start_session(&f, &base[1], "rev-b2");
+    complete_session(&f, &b2, '2', "completed", json!([]), json!([]));
+    let p2 = open_review(&f, '2', "skeptical", SKEPTICAL, Some(BUDGET));
+    let bound = f.cli_args(&["review", "protocols", "bind", &p2, "--prior", &base[1]]).0["event"].clone();
+    assert_eq!((&bound["seq"], &bound["subject"]["cutoff_seq"], &bound["subject"]["prior_coverage"]), (&json!(13), &json!(12), &json!("complete")));
+    f.cli_args(&["review", "assign", &p2, "--reviewer", "fast"]);
+    let k2 = start_session(&f, &p2, "rev-k2");
+    complete_session(&f, &k2, '2', "completed", json!(["finding:k2"]), json!([evidence('a')]));
+    f.cli_args(&["review", "findings", "validate", "2", "--new", "--severity", "medium", "--evidence", &evidence('e')]);
+    let pass = |as_of: Option<i64>| {
+        let p = protocols_show(&f, as_of)["passes"][0].clone();
+        (p["status"].clone(), p["exclusion"].clone(), p["new_unique_findings"].clone(), p["retracted_seq"].clone())
+    };
+    assert_eq!(pass(Some(14)), (json!("in_progress"), json!("not_completed"), json!([]), json!(null)));
+    assert_eq!(pass(Some(16)), (json!("completed"), json!("pending_triage"), json!([]), json!(null)));
+    assert_eq!(pass(None), (json!("completed"), json!(null), json!(["finding:canonical-17"]), json!(null)));
+    assert_eq!(f.cli_args(&["review", "report"]).0["metrics"]["M28"]["value"], json!("1/1"));
+    let unit2 = experiments_show(&f, None)["units"][1].clone();
+    assert_eq!((&unit2["status"], &unit2["outcome"], &unit2["treatment_received"]), (&json!("analyzable"), &json!(1), &json!(true)));
+
+    // Retracting the pass binding: owner only, once, and only a pass binding.
+    let mut store = SqliteStore::open(&db_path).unwrap();
+    for worker in ["worker:rev-k2", "rev-k2"] {
+        assert!(format!("{:?}", store.retract_protocol_record(13, "pass_bound", None, worker, 1).unwrap_err()).contains("a worker cannot"), "{worker}");
+    }
+    drop(store);
+    assert!(f.cli_fail(&["review", "protocols", "retract", "3"]).contains("no pass binding at seq 3"));
+    assert!(f.cli_fail(&["review", "experiments", "retract", "13"]).contains("no unit exclusion at seq 13"));
+    let retracted = f.cli_args(&["review", "protocols", "retract", "13"]).0["event"].clone();
+    assert_eq!((&retracted["seq"], &retracted["kind"], &retracted["principal"], &retracted["authority"], &retracted["subject"]),
+        (&json!(18), &json!("pass_retracted"), &json!("operator:cli"), &json!("operator_owner.v1"), &json!({"reverses": 13})));
+    assert!(f.cli_fail(&["review", "protocols", "retract", "13"]).contains("already retracted"));
+    assert_eq!(pass(None), (json!("completed"), json!("retracted"), json!(["finding:canonical-17"]), json!(18)));
+    assert_eq!(pass(Some(17)), (json!("completed"), json!(null), json!(["finding:canonical-17"]), json!(null)));
+    let m28 = f.cli_args(&["review", "report"]).0["metrics"]["M28"].clone();
+    assert_eq!((&m28["value"], &m28["reason"], &m28["excluded"]), (&json!(null), &json!("empty_denominator"), &json!({"retracted": 1})));
+    let unit2 = experiments_show(&f, None)["units"][1].clone();
+    assert_eq!((&unit2["status"], &unit2["passes"], &unit2["treatment_received"]), (&json!("pending"), &json!([]), &json!(false)));
+
+    // Retracting an exclusion returns the unit to the estimate; the exclusion stays listed.
+    assert_eq!(f.cli_args(&["review", "experiments", "exclude", "planned.v1", &base[0], "--reason", "operator_error"]).0["event"]["seq"], json!(19));
+    assert_eq!(f.cli_args(&["review", "experiments", "retract", "19"]).0["event"]["kind"], json!("exclusion_retracted"));
+    assert!(f.cli_fail(&["review", "experiments", "exclude", "planned.v1", &base[0], "--reason", "operator_error"]).contains("a retracted exclusion is not recorded again"));
+    let e = experiments_show(&f, None);
+    assert_eq!((&e["units"][0]["status"], &e["units"][0]["exclusion"], &e["estimate"]["arms"]["standard"]["excluded"]),
+        (&json!("analyzable"), &json!({"seq": 19, "reason": "operator_error", "retracted_seq": 20}), &json!({})));
+    let then = experiments_show(&f, Some(19));
+    assert_eq!((&then["units"][0]["status"], &then["units"][0]["exclusion"], &then["estimate"]["arms"]["standard"]["excluded"]),
+        (&json!("excluded"), &json!({"seq": 19, "reason": "operator_error", "retracted_seq": null}), &json!({"operator_error": 1})));
+    assert_eq!(f.cli_args(&["review", "findings", "show"]).0["findings"]["head_seq"], json!(20));
+
+    // Raw rows cannot forge the owner's correction or break the one ordering.
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    let forged = db.execute("INSERT INTO review_log(seq,kind,principal,authority,recorded_unix_ms) VALUES(21,'pass_retracted','worker:rev-k2','operator_owner.v1',1)", []).unwrap_err();
+    assert!(forged.to_string().contains("CHECK constraint failed"), "{forged}");
+    let early = db.execute("INSERT INTO review_log(seq,kind,principal,authority,recorded_unix_ms) VALUES(10,'started','operator:cli','review_capture.v1',1)", []).unwrap_err();
+    assert!(early.to_string().contains("one ordering"), "{early}");
+    let rewrite = db.execute("UPDATE review_session_events SET seq=seq", []).unwrap_err();
+    assert!(rewrite.to_string().contains("append-only"), "{rewrite}");
+}
+
+/// §9 seed-linked credit golden. Seq 1 registers S (1…1) as seeded (seed 1,
+/// logic). Review R1 starts (2) and completes (3) with `incidental`
+/// (submission 1, claim 1, seq 4) and `seed-report` (submission 2, claim 2,
+/// seq 5); R2 starts (6) and completes (7) with `seed-again` (submission 3,
+/// claim 3, seq 8). 9 validates claim 2 as X = `finding:canonical-9`, 10
+/// claim 1 as I = `finding:canonical-10`, 11 marks claim 3 a duplicate of X.
+/// By hand: M22 = 2/3, M23 = 1/3, M21 = 2. 12 links claim 2 to seed 1:
+/// submission 2 is an evaluation artefact, M22 = 1/2 (1 validated, 1
+/// duplicate-only), M23 = 1/2, seeded 1 submission; X's discovery is linked,
+/// so M21 = 1 (I only; seeded 1) and M25 = 0/1. 13 also links claim 3:
+/// M22 = 1/1, M23 = 0/1, seeded 2. 14 retracts detection 12: claim 2 is an
+/// ordinary discovery again, M22 = 2/2, M23 = 0/2, seeded 1 submission, M21
+/// = 2. As-of views replay the links: claim 2 is linked as of 12 and 13, not
+/// as of 11 or 14; X is an evaluation finding as of 12, not at the head.
+#[test]
+fn seed_linked_findings_stay_outside_discovery_and_validation_credit() {
+    let f = Fixture::new();
+    let world = review_world(&f, &["rev-a1", "rev-a2"]);
+    let seed = seed_fixture("logic-inverted-guard");
+    assert_eq!(f.cli_args(&["review", "seeds", "register", &world.0, "--seed", &format!("logic={}", reproducer_ref(&seed))]).0["event"]["seq"], json!(1));
+    assert_eq!(completed_review(&f, &world, "code", "rev-a1", json!(["finding:seed-report", "finding:incidental"]))["finding_submissions"], json!([1, 2]));
+    completed_review(&f, &world, "security", "rev-a2", json!(["finding:seed-again"]));
+    let triage = f.cli_args(&["review", "findings", "show"]).0["findings"].clone();
+    assert_eq!(triage["submissions"].as_array().unwrap().iter().map(|s| (s["seq"].as_i64().unwrap(), s["finding_ref"].as_str().unwrap().to_owned())).collect::<Vec<_>>(),
+        [(4, "finding:incidental".to_owned()), (5, "finding:seed-report".to_owned()), (8, "finding:seed-again".to_owned())]);
+    f.cli_args(&["review", "findings", "validate", "2", "--new", "--severity", "high", "--evidence", &evidence('e')]);
+    f.cli_args(&["review", "findings", "validate", "1", "--new", "--severity", "medium", "--evidence", &evidence('e')]);
+    f.cli_args(&["review", "findings", "duplicate", "3", "--of", "finding:canonical-9"]);
+    let credit_now = || {
+        let m = f.cli_args(&["review", "report"]).0["metrics"].clone();
+        (m["M22"]["value"].clone(), m["M23"]["value"].clone(), m["M22"]["seeded_evaluation"].clone(), m["M21"]["value"].clone(), m["M21"]["seeded_evaluation"].clone())
+    };
+    assert_eq!(credit_now(), (json!("2/3"), json!("1/3"), json!({"submissions": 0, "claims": 0}), json!("2"), json!(0)));
+
+    let detect = |claim: &str| f.cli_args(&["review", "seeds", "detect", "1", "--claim", claim, "--evidence", &evidence('a')]).0["event"]["seq"].clone();
+    assert_eq!(detect("2"), json!(12));
+    assert_eq!(credit_now(), (json!("1/2"), json!("1/2"), json!({"submissions": 1, "claims": 1}), json!("1"), json!(1)));
+    let m = f.cli_args(&["review", "report"]).0["metrics"].clone();
+    assert_eq!((&m["M21"]["drilldown"], &m["M21"]["by_configuration"], &m["M25"]["value"], &m["M25"]["seeded_evaluation"]),
+        (&json!({"validated_unique_findings": 1}), &json!({"unknown": "1"}), &json!("0/1"), &json!(1)));
+    // Detection changes no triage: two unique findings, the same claim outcomes.
+    assert_eq!(f.cli_args(&["review", "findings", "show"]).0["findings"]["unique_findings"], json!(2));
+    assert_eq!(detect("3"), json!(13));
+    assert_eq!(credit_now(), (json!("1/1"), json!("0/1"), json!({"submissions": 2, "claims": 2}), json!("1"), json!(1)));
+    assert_eq!(f.cli_args(&["review", "seeds", "retract", "12"]).0["event"]["seq"], json!(14));
+    assert_eq!(credit_now(), (json!("2/2"), json!("0/2"), json!({"submissions": 1, "claims": 1}), json!("2"), json!(0)));
+
+    // As-of views replay each link and its retraction.
+    let linked = |as_of: i64| {
+        let state = f.cli_args(&["review", "findings", "show", "--as-of", &as_of.to_string()]).0["findings"].clone();
+        state["submissions"].as_array().unwrap().iter().map(|s| s["claims"][0]["seed_linked"].as_bool().unwrap()).collect::<Vec<_>>()
+    };
+    assert_eq!(linked(11), [false, false, false]);
+    assert_eq!(linked(12), [false, true, false]);
+    assert_eq!(linked(13), [false, true, true]);
+    assert_eq!(linked(14), [false, false, true]);
+    let seeded = |as_of: Option<i64>| fixes_show(&f, as_of)["findings"].as_array().unwrap().iter()
+        .map(|x| (x["finding_id"].as_str().unwrap().to_owned(), x["seeded_evaluation"].as_bool().unwrap())).collect::<Vec<_>>();
+    assert_eq!(seeded(Some(12)), [("finding:canonical-9".to_owned(), true), ("finding:canonical-10".to_owned(), false)]);
+    assert_eq!(seeded(None), [("finding:canonical-9".to_owned(), false), ("finding:canonical-10".to_owned(), false)]);
+}
+
+/// The owner's review CLI refuses a worker execution context: HOME set to a
+/// retained profile's execution home (the author's `codex-home`, also its
+/// collector binding's, or `fast`'s) or a working directory inside a task
+/// worktree. Refusals write nothing; the blind `present` view stays open to
+/// reviewers, and the owner's own context is unaffected.
+#[test]
+fn review_cli_refuses_worker_execution_context() {
+    let f = Fixture::new();
+    let world = review_world(&f, &["rev-a1"]);
+    let db_path = f.project.join(".state/state.db");
+    let opportunity = open_review(&f, '1', "code", "review-protocol.v1", None);
+    let worktree = std::path::PathBuf::from(f.worktree());
+    fs::create_dir_all(&worktree).unwrap();
+    let owner_home = f.tmp.path().join("home");
+    let run = |home: &std::path::Path, cwd: &std::path::Path, args: &[&str]| {
+        std::process::Command::new(BIN).env_clear().env("HOME", home).env("PATH", "/usr/bin:/bin").current_dir(cwd)
+            .args(["--root", f.root.to_str().unwrap(), "telemetry", "demo", "review"]).args(args).output().unwrap()
+    };
+    // A second, unreviewed submission the owner can still register.
+    Factory::open(&f).submission(&hex('2'), &f.attempt, &oid('2'), 2_000);
+    let control = hex('2');
+    let register = ["seeds", "register", control.as_str(), "--control"];
+    let seed_rows = || rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT count(*) FROM seed_log", [], |r| r.get::<_, i64>(0)).unwrap();
+    for (home, cwd, marker) in [(f.home.clone(), f.tmp.path().to_path_buf(), "HOME is a worker execution home"),
+        (f.tmp.path().join("fast-home"), f.tmp.path().to_path_buf(), "HOME is a worker execution home"),
+        (owner_home.clone(), worktree.clone(), "the working directory is a task worktree")] {
+        for args in [&register[..], &["seeds", "show"], &["findings", "show"], &["report"], &["open", world.0.as_str(), "--protocol", "review-protocol.v1"]] {
+            let out = run(&home, &cwd, args);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success() && stderr.contains("refuses to run inside a worker execution context") && stderr.contains(marker), "{args:?} {home:?}: {stderr}");
+        }
+        let presented = run(&home, &cwd, &["present", &opportunity]);
+        assert!(presented.status.success(), "{}", String::from_utf8_lossy(&presented.stderr));
+    }
+    assert_eq!(seed_rows(), 0, "refused commands write nothing");
+    let owner = run(&owner_home, f.tmp.path(), &register);
+    assert!(owner.status.success(), "{}", String::from_utf8_lossy(&owner.stderr));
+    assert_eq!(seed_rows(), 1);
+}
+
+/// 0059 upgrade golden: review history recorded on a schema-58 store, whose
+/// ledger held no review status. Seq 1 registers the skeptical protocol; O1's
+/// submission is seq 2 and its validation (K = `finding:canonical-3`) seq 3;
+/// 4 binds pass P1 after O1, which then completes with no finding. The
+/// upgrade sequences the four session events after the head, in
+/// start/completion order: O1 start 5, completion 6, P1 start 7, completion
+/// 8, each `backfilled`, so replay keeps them at every watermark (P1 is
+/// `completed` as of 4, as the stored status said). After the upgrade, pass
+/// P2 (S2) is bound at 9 and its review starts (10) and completes (11)
+/// normally: `in_progress` as of 10, `completed` as of 11.
+#[test]
+fn review_ledger_upgrade_backfills_sessions_in_completion_order() {
+    let f = Fixture::new();
+    artifact_world(&f, &['1', '2'], &["rev-a1", "rev-k1", "rev-k2"]);
+    let db_path = f.project.join(".state/state.db");
+    test_schema::historical(&rusqlite::Connection::open(&db_path).unwrap(), 58).unwrap();
+    let raw = rusqlite::Connection::open(&db_path).unwrap();
+    let version = || raw.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap();
+    assert_eq!(version(), 58);
+    f.cli_args(&["review", "protocols", "register", "--input-file", &input(&f, "protocol.json", &skeptical_protocol())]);
+    let o1 = open_review(&f, '1', "code", "review-protocol.v1", None);
+    assert_eq!(run_review(&f, &o1, '1', "rev-a1", json!(["finding:k"]), json!([]))["finding_submissions"], json!([1]));
+    assert_eq!(f.cli_args(&["review", "findings", "validate", "1", "--new", "--severity", "high", "--evidence", &evidence('e')]).0["event"]["subject"]["finding_id"],
+        json!("finding:canonical-3"));
+    let p1 = open_review(&f, '1', "skeptical", SKEPTICAL, Some(BUDGET));
+    assert_eq!(f.cli_args(&["review", "protocols", "bind", &p1, "--prior", &o1]).0["event"]["seq"], json!(4));
+    run_review(&f, &p1, '1', "rev-k1", json!([]), json!([evidence('a')]));
+    assert_eq!((version(), f.cli_args(&["review", "findings", "show"]).0["findings"]["head_seq"].clone()), (58, json!(4)));
+
+    SqliteStore::open(&db_path).unwrap().upgrade_v1().unwrap();
+    assert_eq!(version(), 59);
+    let sessions: Vec<String> = raw.prepare("SELECT session_id FROM review_sessions ORDER BY started_unix_ms").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    let events = || raw.prepare("SELECT e.seq,e.session_id,e.event,e.backfilled,l.kind,l.authority FROM review_session_events e JOIN review_log l ON l.seq=e.seq ORDER BY e.seq").unwrap()
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?)))
+        .unwrap().map(Result::unwrap).collect::<Vec<_>>();
+    let row = |seq: i64, session: &str, event: &str, backfilled: i64| (seq, session.to_owned(), event.to_owned(), backfilled, event.to_owned(), "review_capture.v1".to_owned());
+    assert_eq!(events(), [row(5, &sessions[0], "started", 1), row(6, &sessions[0], "completed", 1), row(7, &sessions[1], "started", 1), row(8, &sessions[1], "completed", 1)]);
+    let status = |as_of: i64| protocols_show(&f, Some(as_of))["passes"].as_array().unwrap().iter().map(|p| p["status"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+    assert_eq!((status(4), status(8)), (vec!["completed".to_owned()], vec!["completed".to_owned()]));
+    {
+        // Only the upgrade backfills.
+        let mut db = rusqlite::Connection::open(&db_path).unwrap();
+        let tx = db.transaction().unwrap();
+        tx.execute("INSERT INTO review_log(seq,kind,principal,authority,recorded_unix_ms) VALUES(9,'started','operator:cli','review_capture.v1',1)", []).unwrap();
+        let forged = tx.execute("INSERT INTO review_session_events(seq,session_id,event,backfilled) VALUES(9,?1,'started',1)", [&sessions[0]]).unwrap_err();
+        assert!(forged.to_string().contains("only the 0059 upgrade backfills"), "{forged}");
+    }
+
+    // After the upgrade every review event takes the next seq.
+    let p2 = open_review(&f, '2', "skeptical", SKEPTICAL, Some(BUDGET));
+    assert_eq!(f.cli_args(&["review", "protocols", "bind", &p2, "--prior", &o1]).0["event"]["seq"], json!(9));
+    run_review(&f, &p2, '2', "rev-k2", json!([]), json!([evidence('a')]));
+    let p2_session: String = raw.query_row("SELECT session_id FROM review_sessions WHERE opportunity_id=?1", [&p2], |r| r.get(0)).unwrap();
+    assert_eq!(events()[4..], [row(10, &p2_session, "started", 0), row(11, &p2_session, "completed", 0)]);
+    assert_eq!(status(10), ["completed", "in_progress"]);
+    assert_eq!(status(11), ["completed", "completed"]);
 }

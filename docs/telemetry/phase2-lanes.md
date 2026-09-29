@@ -214,8 +214,10 @@ merges one PR at a time.
 - **D6 follow-ups** (lane D/steward): **done (integration holds):** a
   verified seeded result no longer satisfies a dependent task's
   `verified_result` requirement (`satisfaction.rs` `verified_counts`,
-  contracts-review.md §8). Still open: findings linked to a seed probably
-  belong outside M21/M22 credit; review completions are not in the shared
-  ledger, so `--as-of` replays triage and detections only; the seeds CLI
-  principal is always `operator:cli` (workers refused at the store API only);
-  seeding replay-suite tasks (TM4.6) and a reviewer brief builder.
+  contracts-review.md §8). **Done (D7, 0059, contracts-review.md §9):**
+  seed-linked findings are outside M21/M22/M23 credit (`seeded_evaluation`);
+  review session starts and completions are shared-ledger rows, so `--as-of`
+  replays review status; the review CLI (seeds included) refuses a worker
+  execution context (execution-home `HOME` or task-worktree cwd); D4 pass and
+  exclusion retractions and `planned_units` enforcement. Still open: seeding
+  replay-suite tasks (TM4.6) and a reviewer brief builder.

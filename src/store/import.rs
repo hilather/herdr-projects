@@ -87,6 +87,7 @@ impl SqliteStore {
         if version<=55 {tx.execute_batch(include_str!("../../migrations/0056_fix_attribution.sql"))?;}
         if version<=56 {tx.execute_batch(include_str!("../../migrations/0057_review_protocols.sql"))?;}
         if version<=57 {tx.execute_batch(include_str!("../../migrations/0058_seeded_defects.sql"))?;}
+        if version<=58 {tx.execute_batch(include_str!("../../migrations/0059_review_ledger.sql"))?;}
         tx.commit()?;
         Ok(())
     }

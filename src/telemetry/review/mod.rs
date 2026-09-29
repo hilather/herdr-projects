@@ -219,8 +219,43 @@ pub struct DecisionArgs {
     expect_seq: Option<i64>,
 }
 
+/// Refuse the owner's review CLI inside a worker execution context. Every row
+/// it writes is recorded as `operator:cli` (the project owner), and seed state
+/// is the owner's alone (§8), so a worker must not reach them through the CLI
+/// (contracts-review.md §9). Two markers the product sets for every canonical
+/// worker: its `HOME` is its profile's execution home
+/// (`worker_supervision::isolated_gated_command`; launch refuses a profile
+/// without one), recorded in this project's retained native profiles and
+/// collector bindings; its working directory is its task worktree under
+/// `<root>/<project>/.state/worktrees/`. They are markers, not authority: a
+/// process that rewrites its own environment evades them, and the store API
+/// still refuses every worker principal.
+fn refuse_worker_context(project: &Path) -> Result<()> {
+    const REFUSED: &str = "the review CLI records the project owner (operator:cli) and refuses to run inside a worker execution context";
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if let (Ok(cwd), Some(root)) = (std::env::current_dir(), project.parent())
+        && let Ok(rest) = canonical(&cwd).strip_prefix(canonical(root)) {
+        let parts: Vec<&std::ffi::OsStr> = rest.components().map(|c| c.as_os_str()).take(3).collect();
+        anyhow::ensure!(!(parts.len() == 3 && parts[1] == ".state" && parts[2] == "worktrees"), "{REFUSED}: the working directory is a task worktree");
+    }
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return Ok(()) };
+    if !project.join(".state/state.db").is_file() { return Ok(()); }
+    let db = super::read_only(&project.join(".state/state.db"))?;
+    let mut homes: Vec<String> = db.prepare("SELECT json_extract(report,'$.preparation.profile.execution_home') FROM native_profiles
+        WHERE json_type(report,'$.preparation.profile.execution_home')='text'")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    if db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='collector_bindings')", [], |r| r.get::<_, bool>(0))? {
+        homes.extend(db.prepare("SELECT DISTINCT execution_home FROM collector_bindings WHERE execution_home IS NOT NULL")?.query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?);
+    }
+    let home = canonical(&home);
+    anyhow::ensure!(!homes.iter().any(|h| canonical(Path::new(h)) == home), "{REFUSED}: HOME is a worker execution home");
+    Ok(())
+}
+
 /// The command's stdout.
 pub fn run(project: &Path, command: Command) -> Result<String> {
+    // `present` is the blind reviewer view: the only command a worker may run.
+    if !matches!(command, Command::Present { .. }) { refuse_worker_context(project)?; }
     let now = jiff::Timestamp::now().as_millisecond();
     let open = || SqliteStore::open(&project.join(".state/state.db"));
     let value = match command {
@@ -413,14 +448,15 @@ fn lane_metrics(project: &Path, since: Option<i64>, horizon_days: i64) -> Result
         }
     }
     let mut out = BTreeMap::from([("M20".to_owned(), m20)]);
-    // M22/M23 over original submissions, from the owner's triage (contracts-review.md §5).
+    // M22/M23 over original submissions, from the owner's triage (contracts-review.md §5),
+    // without seed-linked claims: evaluation artefacts, counted apart (§9).
     let triage = match read(project)? { Some(db) => finding_state(&db, None)?, None => None };
     let mut m22 = json!({"definition": "M22.v1", "name": "proposal_validation_rate", "basis": "owner_triage", "trust": TRIAGE_AUTHORITY});
     let mut m23 = json!({"definition": "M23.v1", "name": "duplicate_report_share", "basis": "owner_triage", "trust": TRIAGE_AUTHORITY});
     match &triage {
         None => for m in [&mut m22, &mut m23] { m["value"] = unavailable("finding_triage_absent"); },
         Some(state) => {
-            let s = FindingSummary::of(state.submissions.iter().filter(|x| since.is_none_or(|at| x.recorded_unix_ms >= at)));
+            let (s, seeded_submissions, seeded_claims) = FindingSummary::without_seed_links(state.submissions.iter().filter(|x| since.is_none_or(|at| x.recorded_unix_ms >= at)));
             let buckets = json!({"validated_only": s.validated_only, "rejected_only": s.rejected_only, "duplicate_only": s.duplicate_only, "mixed": s.mixed});
             for (m, numerator) in [(&mut m22, s.has_validated_claim), (&mut m23, s.duplicate_only)] {
                 m["numerator"] = json!(numerator);
@@ -430,6 +466,7 @@ fn lane_metrics(project: &Path, since: Option<i64>, horizon_days: i64) -> Result
                 m["buckets"] = buckets.clone();
                 m["pending"] = json!(s.pending);
                 m["claim_drilldown"] = json!(s.claims);
+                m["seeded_evaluation"] = json!({"submissions": seeded_submissions, "claims": seeded_claims});
                 m["as_of_seq"] = json!(state.as_of_seq);
             }
         }

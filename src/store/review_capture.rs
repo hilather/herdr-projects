@@ -343,6 +343,8 @@ impl SqliteStore {
         let session_id = digest(&serde_json::json!({"attempt_id": attempt, "opportunity_id": opportunity, "ordinal": ordinal, "schema": SESSION_SCHEMA, "started_unix_ms": now}).to_string());
         tx.execute("INSERT INTO review_sessions(session_id,opportunity_id,ordinal,attempt_id,configuration_id,matches_assignment,same_attempt_as_author,recorder_principal,started_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![session_id, opportunity, ordinal, attempt, configuration, matches_assignment, same_attempt_as_author, principal, now])?;
+        // The start takes the next seq of the shared ledger (store schema 59 and later).
+        super::review_ledger::record_session_event(&tx, &session_id, "started", principal, now)?;
         tx.commit()?;
         Ok(ReviewSession { session_id, opportunity_id: opportunity.to_owned(), ordinal, attempt_id: attempt.to_owned(), configuration_id: configuration,
             matches_assignment, same_attempt_as_author, recorder_principal: principal.to_owned(), started_unix_ms: now })
@@ -390,6 +392,8 @@ impl SqliteStore {
                 tx.execute("INSERT INTO review_completions(session_id,outcome,reason,submission_id,candidate_oid,findings_submitted,finding_refs,evidence_refs,coverage_basis,trust,receipt_digest,recorder_principal,completed_unix_ms)
                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'declared','proposal',?9,?10,?11)",
                     params![r.session_id, r.outcome, reason, submission, candidate, findings.len() as i64, serde_json::json!(findings).to_string(), serde_json::json!(evidence).to_string(), receipt_digest, principal, now])?;
+                // The completion takes the next seq, before its finding submissions (store schema 59 and later).
+                super::review_ledger::record_session_event(&tx, &r.session_id, "completed", principal, now)?;
                 // Each finding reference becomes a submission (a proposal) once the store has finding triage.
                 let version: u32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
                 let submissions = if version >= 55 { super::finding_triage::record_submissions(&tx, &r.session_id, &findings, &titles, principal, now)? } else { Vec::new() };

@@ -352,7 +352,7 @@ pub fn seed_state(db: &Connection, as_of: Option<i64>) -> Result<Option<SeedStat
             disposed_seq: disposal.as_ref().map(|d| d.0), disposal: disposal.map(|d| d.1), seeds });
     }
 
-    let opportunities = evaluation_opportunities(db, &candidates, &triage)?;
+    let opportunities = evaluation_opportunities(db, &candidates, &triage, &super::review_ledger::Lifecycle::at(db, Some(at))?)?;
     let mut trials = Vec::new();
     for c in candidates.iter().filter(|c| c.arm == "seeded") {
         for o in opportunities.iter().filter(|o| o.completed && o.submission_id == c.submission_id) {
@@ -370,16 +370,17 @@ pub fn seed_state(db: &Connection, as_of: Option<i64>) -> Result<Option<SeedStat
 }
 
 /// Review opportunities of registered candidates, with their assigned
-/// reviewer configuration, completion and submission outcomes at the watermark.
-fn evaluation_opportunities(db: &Connection, candidates: &[EvaluationCandidate], triage: &FindingState) -> Result<Vec<EvaluationOpportunity>> {
+/// reviewer configuration, completion (replayed with the review lifecycle,
+/// 0059) and submission outcomes at the watermark.
+fn evaluation_opportunities(db: &Connection, candidates: &[EvaluationCandidate], triage: &FindingState, lifecycle: &super::review_ledger::Lifecycle) -> Result<Vec<EvaluationOpportunity>> {
     let mut out = Vec::new();
     for c in candidates {
-        type Row = (String, String, String, Option<String>, Option<i64>, bool);
-        let rows: Vec<Row> = db.prepare("SELECT o.opportunity_id,o.kind,o.protocol,a.reviewer_configuration_id,a.assigned_unix_ms,
-                EXISTS(SELECT 1 FROM review_sessions r JOIN review_completions k ON k.session_id=r.session_id WHERE r.opportunity_id=o.opportunity_id AND k.outcome='completed')
+        type Row = (String, String, String, Option<String>, Option<i64>);
+        let rows: Vec<Row> = db.prepare("SELECT o.opportunity_id,o.kind,o.protocol,a.reviewer_configuration_id,a.assigned_unix_ms
             FROM review_opportunities o LEFT JOIN review_assignments a ON a.opportunity_id=o.opportunity_id WHERE o.submission_id=?1 ORDER BY o.created_unix_ms,o.rowid")?
-            .query_map([&c.submission_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?.collect::<rusqlite::Result<_>>()?;
-        for (opportunity_id, kind, protocol, configuration_id, assigned_unix_ms, completed) in rows {
+            .query_map([&c.submission_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<rusqlite::Result<_>>()?;
+        for (opportunity_id, kind, protocol, configuration_id, assigned_unix_ms) in rows {
+            let completed = super::review_ledger::opportunity_status(db, &opportunity_id, lifecycle)?.0 == "completed";
             let mut submissions: BTreeMap<String, usize> = ["pending", "validated_only", "rejected_only", "duplicate_only", "mixed"].into_iter().map(|k| (k.to_owned(), 0)).collect();
             for s in triage.submissions.iter().filter(|s| s.opportunity_id == opportunity_id) { *submissions.entry(s.outcome.clone()).or_default() += 1; }
             out.push(EvaluationOpportunity { opportunity_id, submission_id: c.submission_id.clone(), arm: c.arm.clone(), kind, protocol, configuration_id, assigned_unix_ms, completed, submissions });

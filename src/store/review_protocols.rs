@@ -18,6 +18,7 @@
 //! `finding_log` and `fix_log`; [`protocol_state`] replays it to any
 //! sequence. Only the triage authority (the project owner at the CLI) writes.
 use super::finding_triage::{self, FindingEvent, FindingState, SEVERITIES, TRIAGE_AUTHORITY};
+use super::review_ledger;
 use super::*;
 use crate::domain::agent_configuration;
 use rusqlite::OptionalExtension;
@@ -143,6 +144,8 @@ pub struct PassState {
     pub eligible: bool,
     /// Why the pass is outside M28 (first failing rule), when it is.
     pub exclusion: Option<String>,
+    /// The retraction that reversed this binding (recorded in error), by the watermark.
+    pub retracted_seq: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -247,17 +250,6 @@ fn done(tx: rusqlite::Transaction<'_>, seq: i64, subject: serde_json::Value) -> 
     Ok(out)
 }
 
-/// An opportunity's review status (contracts-review.md §4) and its completed session.
-fn opportunity_status(db: &Connection, opportunity: &str) -> Result<(&'static str, Option<String>)> {
-    let assigned: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM review_assignments WHERE opportunity_id=?1)", [opportunity], |r| r.get(0))?;
-    if !assigned { return Ok(("unassigned", None)); }
-    let sessions: Vec<(String, Option<String>)> = db.prepare("SELECT r.session_id,c.outcome FROM review_sessions r LEFT JOIN review_completions c ON c.session_id=r.session_id WHERE r.opportunity_id=?1 ORDER BY r.ordinal")?
-        .query_map([opportunity], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
-    if sessions.is_empty() { return Ok(("no_session", None)); }
-    if let Some(done) = sessions.iter().find(|s| s.1.as_deref() == Some("completed")) { return Ok(("completed", Some(done.0.clone()))); }
-    Ok((if sessions.iter().any(|s| s.1.is_none()) { "in_progress" } else { "ended_without_completion" }, None))
-}
-
 /// `(submission_id, task_id, candidate_oid, scope, kind, role, protocol, budget_ms, created_unix_ms)` of an opportunity.
 type OpportunityRow = (String, String, String, String, String, String, String, Option<i64>, i64);
 fn opportunity(db: &Connection, id: &str) -> Result<OpportunityRow> {
@@ -350,12 +342,13 @@ impl SqliteStore {
             return Err(invalid(format!("opportunity {opportunity_id} is already a bound pass")));
         }
         let mut records = Vec::with_capacity(sorted.len());
+        let lifecycle = review_ledger::Lifecycle::at(&tx, None)?;
         for prior in &sorted {
             if prior == opportunity_id { return Err(invalid("a pass cannot be its own prior review".into())); }
             let (p_submission, p_task, p_candidate, p_scope, ..) = opportunity(&tx, prior)?;
             if p_task != task { return Err(invalid(format!("prior opportunity {prior} reviews another task"))); }
             let artifact = if p_submission != submission || p_candidate != candidate { "changed_artifact" } else if p_scope != scope { "different_scope" } else { "same_artifact" };
-            let (status, _) = opportunity_status(&tx, prior)?;
+            let (status, _) = review_ledger::opportunity_status(&tx, prior, &lifecycle)?;
             records.push(serde_json::json!({"opportunity_id": prior, "submission_id": p_submission, "candidate_oid": p_candidate, "scope": p_scope, "artifact": artifact, "status": status}));
         }
         let label = |a: &str| records.iter().any(|r| r["artifact"] == a);
@@ -406,6 +399,7 @@ impl SqliteStore {
         let min_units = d.min_units.unwrap_or(DEFAULT_MIN_UNITS);
         if min_units < 2 { return Err(invalid("min_units is at least 2".into())); }
         if d.planned_units == Some(0) { return Err(invalid("planned_units must be positive".into())); }
+        if d.stopping_rule == "planned_units" && d.planned_units.is_none() { return Err(invalid("the planned_units stopping rule needs planned_units".into())); }
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         schema_57(&tx)?;
         finding_triage::triage_authority(&tx, principal)?;
@@ -443,6 +437,12 @@ impl SqliteStore {
             "SELECT seq,design,seed,eligible_kind,eligible_scope,eligible_role,eligible_protocol,arms FROM review_experiments WHERE experiment=?1", [experiment],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))).optional()?;
         let Some((experiment_seq, design, seed, e_kind, e_scope, e_role, e_protocol, arms)) = row else { return Err(invalid(format!("no experiment {experiment}"))) };
+        // A `planned_units` experiment stops assigning at its planned number of units (the 0059 trigger repeats it).
+        let (rule, planned, assigned): (Option<String>, Option<i64>, i64) = tx.query_row("SELECT json_extract(e.canonical_json,'$.stopping_rule'),json_extract(e.canonical_json,'$.planned_units'),
+                (SELECT count(*) FROM experiment_units u WHERE u.experiment_seq=e.seq) FROM review_experiments e WHERE e.seq=?1", [experiment_seq], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        if let (Some("planned_units"), Some(planned)) = (rule.as_deref(), planned) && assigned >= planned {
+            return Err(invalid(format!("experiment {experiment} reached its {planned} planned units: its stopping rule ends assignment")));
+        }
         let arms: Vec<String> = serde_json::from_str::<Vec<serde_json::Value>>(&arms).map_err(|_| StoreError::Corrupt("invalid experiment arms".into()))?
             .iter().filter_map(|a| a["arm"].as_str().map(str::to_owned)).collect();
         let (submission, _, _, scope, kind, role, protocol, ..) = opportunity(&tx, opportunity_id)?;
@@ -485,11 +485,32 @@ impl SqliteStore {
             params![experiment, opportunity_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
         let Some((unit_seq, arm)) = unit else { return Err(invalid(format!("opportunity {opportunity_id} is not a unit of {experiment}"))) };
         if tx.query_row("SELECT EXISTS(SELECT 1 FROM experiment_exclusions WHERE unit_seq=?1)", [unit_seq], |r| r.get::<_, bool>(0))? {
-            return Err(invalid(format!("unit {opportunity_id} is already excluded")));
+            return Err(invalid(format!("unit {opportunity_id} is already excluded (a retracted exclusion is not recorded again)")));
         }
         let seq = log(&tx, "unit_excluded", principal, expected_seq, now)?;
         tx.execute("INSERT INTO experiment_exclusions(seq,unit_seq,reason) VALUES(?1,?2,?3)", params![seq, unit_seq, reason])?;
         done(tx, seq, serde_json::json!({"experiment": experiment, "opportunity_id": opportunity_id, "unit_seq": unit_seq, "arm": arm, "reason": reason}))
+    }
+
+    /// Reverse one pass binding (`kind` `pass_bound`) or one unit exclusion
+    /// (`unit_excluded`) recorded in error at history sequence `target`. The
+    /// retraction is a `review_log` row (store schema 59); nothing is deleted.
+    pub fn retract_protocol_record(&mut self, target: i64, kind: &str, expected_seq: Option<i64>, principal: &str, now: i64) -> Result<FindingEvent> {
+        let retraction = match kind { "pass_bound" => "pass_retracted", "unit_excluded" => "exclusion_retracted", _ => return Err(invalid(format!("only a pass binding or a unit exclusion is retracted, not {kind}"))) };
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        schema_57(&tx)?;
+        finding_triage::triage_authority(&tx, principal)?;
+        let recorded: Option<String> = tx.query_row("SELECT kind FROM protocol_log WHERE seq=?1", [target], |r| r.get(0)).optional()?;
+        if recorded.as_deref() != Some(kind) {
+            let what = if kind == "pass_bound" { "pass binding" } else { "unit exclusion" };
+            return Err(invalid(format!("no {what} at seq {target}")));
+        }
+        if review_ledger::present(&tx)? && tx.query_row("SELECT EXISTS(SELECT 1 FROM protocol_retractions WHERE reverses=?1)", [target], |r| r.get::<_, bool>(0))? {
+            return Err(invalid(format!("the record at seq {target} is already retracted")));
+        }
+        let event = review_ledger::record_retraction(&tx, retraction, target, principal, expected_seq, now)?;
+        tx.commit()?;
+        Ok(event)
     }
 }
 
@@ -518,14 +539,18 @@ fn known_at(db: &Connection, cutoff: i64, declared: &[String], triage: &FindingS
 
 /// Replay the protocol, pass and experiment history (with findings) up to
 /// `as_of` (default: the head) on any connection, read-only; `now` decides
-/// experiment horizons. `None` before migration 0057. Review statuses are the
-/// stored sessions' (they carry no ledger sequence).
+/// experiment horizons. `None` before migration 0057. Review statuses replay
+/// to the same watermark (sessions and completions are ledger rows since
+/// 0059); a retracted pass or exclusion stops counting at its retraction.
 pub fn protocol_state(db: &Connection, as_of: Option<i64>, now: i64) -> Result<Option<ProtocolState>> {
     let present: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='protocol_log')", [], |r| r.get(0))?;
     if !present { return Ok(None); }
     let Some(triage) = finding_triage::finding_state(db, as_of)? else { return Ok(None) };
     let at = triage.as_of_seq;
     let mut cache = BTreeMap::new();
+    // Review status replays with the ledger (0059); retracted bindings and exclusions by the watermark.
+    let lifecycle = review_ledger::Lifecycle::at(db, Some(at))?;
+    let retracted = review_ledger::protocol_retractions(db, at)?;
 
     let protocols: Vec<ReviewProtocol> = db.prepare("SELECT p.seq,p.protocol,p.definition_digest,p.canonical_json,l.recorded_unix_ms FROM review_protocols p JOIN protocol_log l ON l.seq=p.seq WHERE p.seq<=?1 ORDER BY p.seq")?
         .query_map([at], |r| Ok(ReviewProtocol { seq: r.get(0)?, protocol: r.get(1)?, definition_digest: r.get(2)?,
@@ -544,7 +569,8 @@ pub fn protocol_state(db: &Connection, as_of: Option<i64>, now: i64) -> Result<O
         let declared: Vec<String> = db.query_row("SELECT prior_findings FROM review_opportunities WHERE opportunity_id=?1", [&opportunity_id], |r| r.get::<_, String>(0))
             .map(|t| serde_json::from_str(&t).unwrap_or_default())?;
         let known = known_at(db, cutoff_seq, &declared, &triage, &mut cache)?;
-        let (status, completed) = opportunity_status(db, &opportunity_id)?;
+        let (status, completed) = review_ledger::opportunity_status(db, &opportunity_id, &lifecycle)?;
+        let retracted_seq = retracted.get(&seq).copied();
         let mut claims = Vec::new();
         for sub in triage.submissions.iter().filter(|s| completed.as_ref() == Some(&s.session_id)) {
             for c in &sub.claims {
@@ -566,7 +592,8 @@ pub fn protocol_state(db: &Connection, as_of: Option<i64>, now: i64) -> Result<O
             Some(session) => db.query_row("SELECT json_array_length(evidence_refs) FROM review_completions WHERE session_id=?1", [session], |r| r.get(0))?,
             None => 0,
         };
-        let exclusion = if comparability != "same_artifact" { Some(comparability.clone()) }
+        let exclusion = if retracted_seq.is_some() { Some("retracted".to_owned()) }
+            else if comparability != "same_artifact" { Some(comparability.clone()) }
             else if prior_coverage != "complete" { Some("incomplete_prior_coverage".to_owned()) }
             else if status != "completed" { Some("not_completed".to_owned()) }
             else if reviewer.is_some() && assigned != reviewer { Some("reviewer_mismatch".to_owned()) }
@@ -575,7 +602,7 @@ pub fn protocol_state(db: &Connection, as_of: Option<i64>, now: i64) -> Result<O
             else { None };
         passes.push(PassState { seq, opportunity_id, protocol, submission_id, candidate_oid, bound_unix_ms: bound, cutoff_seq,
             priors: serde_json::from_str(&priors).unwrap_or(serde_json::Value::Null), comparability, prior_coverage, prior_disclosure, status: status.to_owned(),
-            known_findings: known.into_iter().collect(), claims, new_unique_findings, rediscovered, eligible: exclusion.is_none(), exclusion });
+            known_findings: known.into_iter().collect(), claims, new_unique_findings, rediscovered, eligible: exclusion.is_none(), exclusion, retracted_seq });
     }
 
     // Experiments, their units and the preregistered estimate.
@@ -594,7 +621,7 @@ pub fn protocol_state(db: &Connection, as_of: Option<i64>, now: i64) -> Result<O
         let mut units = Vec::with_capacity(unit_rows.len());
         for (unit_seq, opportunity_id, submission_id, arm, block, assigned, excluded_seq, reason) in unit_rows {
             let arm_protocol = arms.iter().find(|a| a.0 == arm).and_then(|a| a.1.clone());
-            let own: Vec<&PassState> = passes.iter().filter(|p| p.priors.as_array().is_some_and(|ps| ps.iter().any(|x| x["opportunity_id"] == opportunity_id.as_str()))).collect();
+            let own: Vec<&PassState> = passes.iter().filter(|p| p.retracted_seq.is_none() && p.priors.as_array().is_some_and(|ps| ps.iter().any(|x| x["opportunity_id"] == opportunity_id.as_str()))).collect();
             let treatment_received = arm_protocol.as_ref().map(|p| own.iter().any(|x| &x.protocol == p));
             let crossover = own.iter().any(|x| Some(&x.protocol) != arm_protocol.as_ref());
             let members: BTreeSet<&str> = std::iter::once(opportunity_id.as_str()).chain(own.iter().map(|p| p.opportunity_id.as_str())).collect();
@@ -606,15 +633,16 @@ pub fn protocol_state(db: &Connection, as_of: Option<i64>, now: i64) -> Result<O
                 .filter_map(|c| c.canonical_finding.clone()).filter(|r| !known.contains(r)).collect();
             let mut settled = !subs.iter().any(|s| s.claims.iter().any(|c| c.outcome == "pending"));
             for member in &members {
-                if !matches!(opportunity_status(db, member)?.0, "completed" | "ended_without_completion") { settled = false; }
+                if !matches!(review_ledger::opportunity_status(db, member, &lifecycle)?.0, "completed" | "ended_without_completion") { settled = false; }
             }
             let horizon_passed = now >= assigned + horizon_ms;
             // A treatment not yet received may still come until the horizon.
             if treatment_received == Some(false) && !horizon_passed { settled = false; }
-            let status = if excluded_seq.is_some() { "excluded" } else if settled { "analyzable" } else if horizon_passed { "censored" } else { "pending" };
+            let exclusion_retracted = excluded_seq.and_then(|x| retracted.get(&x).copied());
+            let status = if excluded_seq.is_some() && exclusion_retracted.is_none() { "excluded" } else if settled { "analyzable" } else if horizon_passed { "censored" } else { "pending" };
             units.push(UnitState { seq: unit_seq, opportunity_id, submission_id, arm, block, assigned_unix_ms: assigned, cutoff_seq: cutoff,
                 passes: own.iter().map(|p| p.opportunity_id.clone()).collect(), treatment_received, crossover,
-                exclusion: excluded_seq.map(|s| serde_json::json!({"seq": s, "reason": reason})), status: status.to_owned(),
+                exclusion: excluded_seq.map(|s| serde_json::json!({"seq": s, "reason": reason, "retracted_seq": exclusion_retracted})), status: status.to_owned(),
                 outcome: (status == "analyzable").then_some(found.len()), new_unique_findings: if status == "analyzable" { found.into_iter().collect() } else { Vec::new() } });
         }
         let estimate = estimate(&design, &arms, &units, min_units);
@@ -653,7 +681,7 @@ fn estimate(design: &str, arms: &[(String, Option<String>)], units: &[UnitState]
         let (n, y) = (analyzable.len() as i64, analyzable.iter().map(|u| u.outcome.unwrap_or(0) as i64).sum::<i64>());
         stats.insert(arm, (n, y));
         let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
-        for u in &mine { if let Some(x) = &u.exclusion { *reasons.entry(x["reason"].as_str().unwrap_or_default().to_owned()).or_default() += 1; } }
+        for u in mine.iter().filter(|u| u.status == "excluded") { if let Some(x) = &u.exclusion { *reasons.entry(x["reason"].as_str().unwrap_or_default().to_owned()).or_default() += 1; } }
         per_arm.insert(arm.clone(), serde_json::json!({"protocol": protocol, "assigned": mine.len(), "analyzable": n, "pending": count("pending"), "censored": count("censored"),
             "excluded": reasons, "crossover": mine.iter().filter(|u| u.crossover).count(),
             "treatment_not_received": mine.iter().filter(|u| u.treatment_received == Some(false)).count(),

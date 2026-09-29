@@ -76,6 +76,9 @@ pub struct ClaimState {
     pub severity: Option<String>,
     pub reason: Option<String>,
     pub evidence_refs: Vec<String>,
+    /// Linked to a seed (§8) at the watermark: an evaluation artefact, outside
+    /// discovery and validation credit (contracts-review.md §9).
+    pub seed_linked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -157,6 +160,35 @@ impl FindingSummary {
     }
 }
 
+impl FindingSummary {
+    /// Buckets of `submissions` without their seed-linked claims (evaluation
+    /// artefacts, contracts-review.md §9): each submission's outcome is derived
+    /// again from its other claims; a submission with no other claim leaves the
+    /// buckets. Also returns `(submissions left out, claims left out)`.
+    pub fn without_seed_links<'a>(submissions: impl IntoIterator<Item = &'a SubmissionState>) -> (Self, usize, usize) {
+        let (mut kept, mut left_out, mut claims) = (Vec::new(), 0, 0);
+        for sub in submissions {
+            let before = sub.claims.len();
+            let mut rest = sub.clone();
+            rest.claims.retain(|c| !c.seed_linked);
+            claims += before - rest.claims.len();
+            if rest.claims.is_empty() { left_out += 1; continue; }
+            derive_outcome(&mut rest);
+            kept.push(rest);
+        }
+        (Self::of(&kept), left_out, claims)
+    }
+}
+
+/// A submission's exclusive outcome from its claims' derived outcomes.
+fn derive_outcome(sub: &mut SubmissionState) {
+    let has = |o: &str| sub.claims.iter().any(|c| c.outcome == o);
+    let all = |o: &str| sub.claims.iter().all(|c| c.outcome == o);
+    sub.has_validated_claim = has("validated");
+    sub.outcome = if has("pending") { "pending" } else if all("validated") { "validated_only" } else if all("rejected") { "rejected_only" }
+        else if all("duplicate") { "duplicate_only" } else { "mixed" }.to_owned();
+}
+
 fn invalid(message: String) -> StoreError { StoreError::Invalid(message) }
 
 fn schema_55(tx: &Connection) -> Result<()> {
@@ -201,9 +233,9 @@ pub(super) fn triage_authority(tx: &Connection, principal: &str) -> Result<()> {
 }
 
 /// Ledgers sharing the one ordering, each once its migration has run:
-/// `finding_log`, `fix_log` (contracts-review.md §6), `protocol_log` (0057) and `seed_log`
-/// (seeded defects, 0058).
-const LEDGERS: [&str; 4] = ["finding_log", "fix_log", "protocol_log", "seed_log"];
+/// `finding_log`, `fix_log` (contracts-review.md §6), `protocol_log` (0057), `seed_log`
+/// (seeded defects, 0058) and `review_log` (review lifecycle, 0059).
+const LEDGERS: [&str; 5] = ["finding_log", "fix_log", "protocol_log", "seed_log", "review_log"];
 
 /// Head of the one ordering of the ledgers present: the replay watermark of all.
 pub(super) fn head(tx: &Connection) -> Result<i64> {
@@ -429,6 +461,7 @@ pub fn finding_state(db: &Connection, as_of: Option<i64>) -> Result<Option<Findi
     let at = as_of.unwrap_or(head);
     if at < 0 || at > head { return Err(invalid(format!("as-of seq {at} is outside the finding history 0..={head}"))); }
     let edges = merges(db, at)?;
+    let seed_linked = super::review_ledger::seed_linked_claims(db, at)?;
     // Latest decision per claim at the watermark: (seq, outcome, finding, reason, severity, evidence).
     type Decision = (i64, String, Option<String>, Option<String>, Option<String>, String);
     let mut decisions: BTreeMap<i64, Decision> = BTreeMap::new();
@@ -456,7 +489,7 @@ pub fn finding_state(db: &Connection, as_of: Option<i64>) -> Result<Option<Findi
             if decided == "validated" && let Some(r) = &canonical { groups.entry(r.clone()).or_default().insert((seq, ordinal, claim_id)); }
             ClaimState { claim_id, ordinal, title: claim_title.or_else(|| title.clone()), decision_seq: d.map(|d| d.0), outcome: decided.clone(), decided, finding_id,
                 canonical_finding: canonical, severity: d.and_then(|d| d.4.clone()), reason: d.and_then(|d| d.3.clone()),
-                evidence_refs: d.map(|d| serde_json::from_str(&d.5).unwrap_or_default()).unwrap_or_default() }
+                evidence_refs: d.map(|d| serde_json::from_str(&d.5).unwrap_or_default()).unwrap_or_default(), seed_linked: seed_linked.contains(&claim_id) }
         }).collect();
         submissions.push(SubmissionState { submission_id, seq, session_id, finding_ref, opportunity_id, reporter_attempt_id: reporter, title, recorded_unix_ms: recorded, trust,
             claim_revision: revision, claims, outcome: String::new(), has_validated_claim: false });
@@ -467,11 +500,7 @@ pub fn finding_state(db: &Connection, as_of: Option<i64>) -> Result<Option<Findi
         for claim in &mut sub.claims {
             if claim.decided == "validated" && claim.canonical_finding.as_ref().and_then(|r| discovery.get(r)) != Some(&claim.claim_id) { claim.outcome = "duplicate".into(); }
         }
-        let has = |o: &str| sub.claims.iter().any(|c| c.outcome == o);
-        let all = |o: &str| sub.claims.iter().all(|c| c.outcome == o);
-        sub.has_validated_claim = has("validated");
-        sub.outcome = if has("pending") { "pending" } else if all("validated") { "validated_only" } else if all("rejected") { "rejected_only" }
-            else if all("duplicate") { "duplicate_only" } else { "mixed" }.to_owned();
+        derive_outcome(sub);
     }
     let minted: Vec<(String, i64, Option<String>)> = db.prepare("SELECT finding_id,seq,title FROM canonical_findings WHERE seq<=?1 ORDER BY seq")?
         .query_map([at], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;

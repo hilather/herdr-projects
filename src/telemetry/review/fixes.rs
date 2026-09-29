@@ -212,8 +212,12 @@ pub(super) fn metrics(state: Option<&FixState>, now: i64, since: Option<i64>, ho
         return BTreeMap::from([("M21".into(), m21), ("M24".into(), m24), ("M25".into(), m25), ("M26".into(), m26), ("M27".into(), m27), ("M29".into(), m29)]);
     };
     let unit = CREDIT_UNIT;
-    // F: validated unique findings, windowed by their discovery's arrival.
-    let cohort: Vec<_> = state.findings.iter().filter(|f| f.status == "validated" && since.is_none_or(|s| f.discovered_unix_ms.is_some_and(|at| at >= s))).collect();
+    // F: validated unique findings, windowed by their discovery's arrival;
+    // seed-linked findings are evaluation artefacts, counted apart (§9).
+    let window: Vec<_> = state.findings.iter().filter(|f| f.status == "validated" && since.is_none_or(|s| f.discovered_unix_ms.is_some_and(|at| at >= s))).collect();
+    let seeded = window.iter().filter(|f| f.seeded_evaluation).count();
+    let cohort: Vec<_> = window.into_iter().filter(|f| !f.seeded_evaluation).collect();
+    for m in [&mut m21, &mut m25, &mut m26, &mut m29] { m["seeded_evaluation"] = json!(seeded); }
 
     // M21: discovery credit, never a count of every contributor.
     let mut by_configuration: BTreeMap<String, u64> = BTreeMap::new();
