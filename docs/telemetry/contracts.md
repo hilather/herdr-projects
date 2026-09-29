@@ -532,8 +532,9 @@ no code path may read it.
 ## 8. Deferred (explicit)
 
 M33 typed attention reasons; transactional outbox (TM0.4);
-spool; budget bridge and any change to `UnknownUsagePolicy` (TM2.4);
-provider charges, invoice allocation and currency conversion; M04/M11/M12;
+spool; budget bridge enforcement and any change to `UnknownUsagePolicy` (TM2.4;
+the shadow bridge landed, contracts-accounting.md §14);
+
 Claude and OTLP adapters; candidate-group selection and races; stochastic
 assignment policies; coordinator digest,
 sidebar suffix and inbox alerts; retention jobs and restore; configuration
@@ -543,7 +544,9 @@ Landed since phase 1 (see the lane contracts): collector bindings
 (contracts-collection.md), usage ledger, session graph and rate-card
 estimates (contracts-accounting.md §2–§4), proxy signals and integration
 outcomes, candidate groups and selection (contracts-quality.md §1–§4),
-attention intervals (contracts-accounting.md §6), Codex session metadata
+attention intervals (contracts-accounting.md §6), provider charges, invoice
+allocation, dated currency conversion, `as_of`, the shadow budget bridge and
+M04/M11/M12 (contracts-accounting.md §12–§14), Codex session metadata
 (contracts-collection.md A4), Codex tool/exec metadata (contracts-collection.md
 A6), review opportunities, sessions and completions,
 finding triage, claims and duplicate merge/unmerge history, repair
