@@ -15,12 +15,13 @@ const MAX_ENVELOPE: usize = 64 << 10;
 
 /// `measurement.normalization_version` of a Codex kind's envelope: raised when
 /// its allowlist grows (A4: `session_meta` and `token_count`; A5 and A7:
-/// `session_meta`), so an envelope written under the smaller allowlist is
-/// superseded, not a digest conflict.
+/// `session_meta`; A8: `session_meta`, `function_call` and `item_completed`),
+/// so an envelope written under the smaller allowlist is superseded, not a
+/// digest conflict.
 fn normalization_version(kind: &str) -> i64 {
     match kind {
-        "session_meta" => 4,
-        "token_count" => 2,
+        "session_meta" => 5,
+        "token_count" | "function_call" | "item_completed" => 2,
         _ => 1,
     }
 }

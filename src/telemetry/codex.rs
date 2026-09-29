@@ -171,6 +171,7 @@ pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Co
         }
     }
     done.budget_exhausted |= remaining == 0;
+    if !unwritable { reconcile_forks(&mut db)?; }
     for key in reread.difference(&seen) {
         db.execute("UPDATE rollout_sources SET reevaluation='rollout_unavailable' WHERE path_digest=?1", [key])?;
     }
@@ -190,18 +191,21 @@ fn reread(db: &Connection) -> Result<std::collections::BTreeSet<String>> {
 }
 
 /// Sources with a session read before the A4 metadata (ingest 0004), the A5
-/// thread lineage (ingest 0005), the A6 tool metadata (ingest 0006) or the A7
-/// subagent detail and ingest state (ingest 0007) existed: no
-/// `rollout_metadata`, `rollout_threads`, `codex_tool_sources`,
-/// `rollout_subagents` or `rollout_ingest_state` row although their
-/// `session_meta` was stored.
+/// thread lineage (ingest 0005), the A6 tool metadata (ingest 0006), the A7
+/// subagent detail and ingest state (ingest 0007) or the A8 fork point and
+/// turn end (ingest 0008) existed: no `rollout_metadata`, `rollout_threads`,
+/// `codex_tool_sources`, `rollout_subagents`, `rollout_ingest_state`,
+/// `rollout_forks` or `rollout_turn_ends` row although their `session_meta`
+/// was stored.
 fn backfill(db: &Connection) -> Result<std::collections::BTreeSet<String>> {
     Ok(db.prepare("SELECT s.path_digest FROM rollout_sources s JOIN collect_offsets o ON o.path_digest=s.path_digest
         WHERE NOT EXISTS(SELECT 1 FROM rollout_metadata m WHERE m.path_digest=s.path_digest)
         OR NOT EXISTS(SELECT 1 FROM rollout_threads t WHERE t.path_digest=s.path_digest)
         OR NOT EXISTS(SELECT 1 FROM codex_tool_sources c WHERE c.path_digest=s.path_digest)
         OR NOT EXISTS(SELECT 1 FROM rollout_subagents a WHERE a.path_digest=s.path_digest)
-        OR NOT EXISTS(SELECT 1 FROM rollout_ingest_state x WHERE x.path_digest=s.path_digest)")?
+        OR NOT EXISTS(SELECT 1 FROM rollout_ingest_state x WHERE x.path_digest=s.path_digest)
+        OR NOT EXISTS(SELECT 1 FROM rollout_forks k WHERE k.path_digest=s.path_digest)
+        OR NOT EXISTS(SELECT 1 FROM rollout_turn_ends e WHERE e.path_digest=s.path_digest)")?
         .query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)
 }
 
@@ -239,9 +243,10 @@ struct LineTag {
 /// Top-level kinds the adapter reads (contracts §5; `response_item` for its
 /// A6 tool call metadata only); others are ignored unread.
 const KINDS: [&str; 5] = ["session_meta", "turn_context", "token_usage_record", "event_msg", "response_item"];
-/// A6 kinds (`response_item` and `event_msg` payload types) read through
-/// typed allowlist structs only: never deserialized as a whole `Value`.
-const TYPED: [&str; 5] = ["custom_tool_call", "function_call", "custom_tool_call_output", "function_call_output", "item_completed"];
+/// A6 kinds (`response_item` and `event_msg` payload types), and A8's
+/// `turn_aborted`, read through typed allowlist structs only: never
+/// deserialized as a whole `Value`.
+const TYPED: [&str; 6] = ["custom_tool_call", "function_call", "custom_tool_call_output", "function_call_output", "item_completed", "turn_aborted"];
 #[derive(Deserialize)]
 struct Tag {
     #[serde(rename = "type")]
@@ -388,6 +393,39 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for LaxObj<T> {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> { d.deserialize_any(Visit(std::marker::PhantomData)) }
 }
 
+/// A8: an allowlisted array of scalars (`receiver_thread_ids`). Its elements
+/// are kept as `Lax` (an object or array element is `null`, unretained); any
+/// other value in its place is skipped unretained (`null`).
+#[derive(Default)]
+struct LaxList(Value);
+
+impl<'de> Deserialize<'de> for LaxList {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct List;
+        impl<'de> serde::de::Visitor<'de> for List {
+            type Value = LaxList;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("any JSON value") }
+            fn visit_bool<E>(self, _: bool) -> std::result::Result<LaxList, E> { Ok(LaxList::default()) }
+            fn visit_i64<E>(self, _: i64) -> std::result::Result<LaxList, E> { Ok(LaxList::default()) }
+            fn visit_u64<E>(self, _: u64) -> std::result::Result<LaxList, E> { Ok(LaxList::default()) }
+            fn visit_f64<E>(self, _: f64) -> std::result::Result<LaxList, E> { Ok(LaxList::default()) }
+            fn visit_str<E>(self, _: &str) -> std::result::Result<LaxList, E> { Ok(LaxList::default()) }
+            fn visit_unit<E>(self) -> std::result::Result<LaxList, E> { Ok(LaxList::default()) }
+            fn visit_none<E>(self) -> std::result::Result<LaxList, E> { Ok(LaxList::default()) }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<LaxList, A::Error> {
+                let mut out = Vec::new();
+                while let Some(Lax(value)) = seq.next_element::<Lax>()? { out.push(value); }
+                Ok(LaxList(Value::Array(out)))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> std::result::Result<LaxList, A::Error> {
+                while map.next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?.is_some() {}
+                Ok(LaxList::default())
+            }
+        }
+        d.deserialize_any(List)
+    }
+}
+
 /// `response_item` `custom_tool_call` / `function_call`: never `input`, `arguments` or `id`.
 #[derive(Deserialize)]
 struct ToolCall {
@@ -395,6 +433,9 @@ struct ToolCall {
     call_id: Lax,
     #[serde(default)]
     name: Lax,
+    /// A8, `function_call` only (live: `collaboration`).
+    #[serde(default)]
+    namespace: Lax,
     #[serde(default)]
     status: Lax,
     #[serde(default)]
@@ -413,7 +454,9 @@ struct ToolOutput {
     call_id: Lax,
 }
 /// `event_msg/item_completed`: never the item's command, cwd, parsed command,
-/// output, process id, content, client id or phase.
+/// output, process id, content, client id or phase; never an MCP call's
+/// `arguments` or `result.content`, a subagent's `agent_path`, or a collab
+/// call's `receiver_agents` or `agents_states` (A8).
 #[derive(Deserialize)]
 struct ItemCompleted {
     #[serde(default)]
@@ -437,6 +480,38 @@ struct Item {
     exit_code: Lax,
     #[serde(default)]
     duration: LaxObj<Duration>,
+    /// A8 `McpToolCall`: configuration names and flags.
+    #[serde(default)]
+    server: Lax,
+    #[serde(default)]
+    tool: Lax,
+    #[serde(rename = "readOnlyHint", default)]
+    read_only_hint: Lax,
+    #[serde(default)]
+    result: LaxObj<McpResult>,
+    /// A8 `SubAgentActivity` / `CollabAgentToolCall`: thread ids.
+    #[serde(default)]
+    agent_thread_id: Lax,
+    #[serde(default)]
+    sender_thread_id: Lax,
+    #[serde(default)]
+    receiver_thread_ids: LaxList,
+}
+/// An MCP call's result: its error flag only, never `content`.
+#[derive(Deserialize)]
+struct McpResult {
+    #[serde(rename = "isError", default)]
+    is_error: Lax,
+}
+/// A8 `event_msg/turn_aborted`: never `started_at` or `completed_at`.
+#[derive(Deserialize)]
+struct TurnAborted {
+    #[serde(default)]
+    turn_id: Lax,
+    #[serde(default)]
+    reason: Lax,
+    #[serde(default)]
+    duration_ms: Lax,
 }
 #[derive(Deserialize)]
 struct Duration {
@@ -491,19 +566,38 @@ struct Cursor {
     turn: Option<Turn>,
 }
 
+/// A source's stored ingest state: uncertified envelopes, and the last turn's
+/// offset, id, completion and (A8) abort.
+type TurnState = (bool, Option<i64>, Option<String>, bool, bool);
+
 /// A turn, opened by a `turn_context` or `task_started` whose turn id differs
 /// from the tracked turn's, and completed by a `task_complete` of its id (any
-/// `task_complete`, for a turn without one).
+/// `task_complete`, for a turn without one), or (A8) by a `turn_aborted` of
+/// its id: an aborted turn is complete, with `aborted` set.
 struct Turn {
     offset: u64,
     id: Option<String>,
     completed: bool,
+    aborted: bool,
 }
 
 impl Cursor {
     fn open_turn(&mut self, at: u64, id: Option<String>) {
         if self.session.is_none() || self.turn.as_ref().is_some_and(|turn| turn.id.is_some() && turn.id == id) { return; }
-        self.turn = Some(Turn { offset: at, id, completed: false });
+        self.turn = Some(Turn { offset: at, id, completed: false, aborted: false });
+    }
+
+    /// The tracked turn's final event (`task_complete`, or with `aborted` a
+    /// `turn_aborted`) for turn `id`: the byte offset that opened the turn it
+    /// completes, if it completes one.
+    fn end_turn(&mut self, id: &Option<String>, aborted: bool) -> Option<u64> {
+        match self.turn.as_mut() {
+            Some(turn) if !turn.completed && (turn.id.is_none() || turn.id == *id) => {
+                (turn.completed, turn.aborted) = (true, aborted);
+                Some(turn.offset)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -537,16 +631,18 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))).optional()?;
     let mut cursor = match stored {
         Some((dev, ino, offset, records, rate_limits, model, effort)) if !reread.contains(&key) && dev as u64 == meta.dev() && ino as u64 == meta.ino() && offset as u64 <= meta.len() => {
-            let state: Option<(bool, Option<i64>, Option<String>, bool)> = tx.query_row("SELECT uncertified_envelopes,last_turn_offset,last_turn_id,last_turn_completed
-                FROM rollout_ingest_state WHERE path_digest=?1", [&key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
-            let (uncertified, turn) = state.map_or((false, None), |(uncertified, offset, id, completed)|
-                (uncertified, offset.map(|offset| Turn { offset: offset as u64, id, completed })));
+            let state: Option<TurnState> = tx.query_row("SELECT x.uncertified_envelopes,x.last_turn_offset,x.last_turn_id,
+                x.last_turn_completed,coalesce(e.last_turn_aborted,0) FROM rollout_ingest_state x LEFT JOIN rollout_turn_ends e ON e.path_digest=x.path_digest
+                WHERE x.path_digest=?1", [&key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).optional()?;
+            let (uncertified, turn) = state.map_or((false, None), |(uncertified, offset, id, completed, aborted)|
+                (uncertified, offset.map(|offset| Turn { offset: offset as u64, id, completed, aborted })));
             Cursor { offset: offset as u64, records, rate_limits, model, effort, session: None, uncertified, turn }
         }
         // New, replaced or re-read file: read from the start; existing keys
         // dedupe, re-evaluate or quarantine.
         _ => {
-            for table in ["rollout_sources", "rollout_metadata", "rollout_threads", "codex_tool_sources", "rollout_subagents", "rollout_ingest_state"] {
+            for table in ["rollout_sources", "rollout_metadata", "rollout_threads", "codex_tool_sources", "rollout_subagents", "rollout_ingest_state", "rollout_forks",
+                "rollout_turn_ends"] {
                 tx.execute(&format!("DELETE FROM {table} WHERE path_digest=?1"), [&key])?;
             }
             Cursor { offset: 0, records: 0, rate_limits: 0, model: None, effort: None, session: None, uncertified: false, turn: None }
@@ -654,6 +750,7 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
         let turn = cursor.turn.as_ref();
         tx.execute("INSERT OR REPLACE INTO rollout_ingest_state(path_digest,uncertified_envelopes,last_turn_offset,last_turn_id,last_turn_completed) VALUES(?1,?2,?3,?4,?5)",
             params![key, cursor.uncertified, turn.map(|t| t.offset as i64), turn.and_then(|t| t.id.as_deref()), turn.is_some_and(|t| t.completed)])?;
+        tx.execute("INSERT OR REPLACE INTO rollout_turn_ends(path_digest,last_turn_aborted) VALUES(?1,?2)", params![key, turn.is_some_and(|t| t.aborted)])?;
     }
     final_event(&tx, &ledger, &cursor, at_eof, &after, now)?;
     if let Some((session, version, _)) = &cursor.session && certified(version) {
@@ -702,6 +799,12 @@ fn record(tx: &Transaction, ledger: &ingest::Ledger, at: u64, tag: &Tag, line: &
             // A7: the `other` subagent variant's tag (live: `guardian`), as leniently.
             tx.execute("INSERT OR REPLACE INTO rollout_subagents(path_digest,subagent_detail) VALUES(?1,?2)",
                 params![key, text("subagent_detail", sanitize::Class::Text)])?;
+            // A8: the fork point (`NULL` for a rollout that is not a fork), as
+            // leniently. Written for every source: the A8 re-read marker.
+            let number = |path: &str| sanitize::field(&raw, path, sanitize::Class::Number).as_i64();
+            tx.execute("INSERT OR REPLACE INTO rollout_forks(path_digest,forked_from_ordinal_exclusive,base_thread_id,base_end_ordinal_exclusive,base_end_byte_offset)
+                VALUES(?1,?2,?3,?4,?5)", params![key, number("forked_from_ordinal_exclusive"), text("history_base.thread_id", sanitize::Class::Id),
+                    number("history_base.end_ordinal_exclusive"), number("history_base.end_byte_offset")])?;
             cursor.session = Some((meta.id, meta.cli_version, at));
         }
         (Some("turn_context"), _) => {
@@ -788,13 +891,7 @@ fn record(tx: &Transaction, ledger: &ingest::Ledger, at: u64, tag: &Tag, line: &
             // A7: the final event of its turn, which recovers a gap recorded for it.
             if cursor.session.is_some() {
                 let id = payload.turn_id.clone().and_then(|id| turn_id(Value::String(id)));
-                let opened = match cursor.turn.as_mut() {
-                    Some(turn) if !turn.completed && (turn.id.is_none() || turn.id == id) => {
-                        turn.completed = true;
-                        Some(turn.offset)
-                    }
-                    _ => None,
-                };
+                let opened = cursor.end_turn(&id, false);
                 ledger.turn_completed(tx, id.as_deref(), opened, now)?;
             }
             if let (Some((session, ..)), Some(turn)) = (&cursor.session, payload.turn_id) {
@@ -808,8 +905,10 @@ fn record(tx: &Transaction, ledger: &ingest::Ledger, at: u64, tag: &Tag, line: &
         (Some("response_item"), Some(kind @ ("custom_tool_call" | "function_call"))) => {
             let Ok(Envelope { payload: call }) = serde_json::from_slice::<Envelope<ToolCall>>(line) else { return Ok(false) };
             let turn = call.internal_chat_message_metadata_passthrough.0.map_or(Value::Null, |p| p.turn_id.0);
-            let raw = json!({"call_id": call.call_id.0, "name": call.name.0, "status": call.status.0,
+            let mut raw = json!({"call_id": call.call_id.0, "name": call.name.0, "status": call.status.0,
                 "internal_chat_message_metadata_passthrough": {"turn_id": turn}});
+            // A8: a `function_call`'s namespace; a `custom_tool_call` has none in its allowlist.
+            if kind == "function_call" { raw["namespace"] = call.namespace.0; }
             let kept = |path: &str, class| sanitize::field(&raw, path, class).as_str().map(str::to_owned);
             if let (Some((session, ..)), Some(call_id)) = (&cursor.session, kept("call_id", sanitize::Class::Id)) {
                 // The first call of an id stays; an output seen first keeps its columns.
@@ -818,6 +917,9 @@ fn record(tx: &Transaction, ledger: &ingest::Ledger, at: u64, tag: &Tag, line: &
                     called_unix_ms=excluded.called_unix_ms WHERE codex_tool_calls.call_kind IS NULL",
                     params![session, call_id, kind, kept("name", sanitize::Class::Tag), kept("status", sanitize::Class::Tag),
                         kept("internal_chat_message_metadata_passthrough.turn_id", sanitize::Class::Id), ms(tag.timestamp.as_deref())])?;
+                if let Some(namespace) = kept("namespace", sanitize::Class::Tag) {
+                    tx.execute("INSERT OR IGNORE INTO codex_tool_namespaces(session_id,call_id,namespace) VALUES(?1,?2,?3)", params![session, call_id, namespace])?;
+                }
             }
             *observed = Some(raw);
         }
@@ -835,23 +937,69 @@ fn record(tx: &Transaction, ledger: &ingest::Ledger, at: u64, tag: &Tag, line: &
             let Ok(Envelope { payload: completed }) = serde_json::from_slice::<Envelope<ItemCompleted>>(line) else { return Ok(false) };
             let item = completed.item.0;
             let kind = item.as_ref().map_or(Value::Null, |i| i.kind.0.clone());
-            // Only a `CommandExecution` item keeps more than its type.
-            let raw = match item.filter(|_| kind == "CommandExecution") {
-                Some(item) => {
+            // Each typed item keeps its own allowlisted fields; any other item only its type.
+            let fields = match (item, kind.as_str()) {
+                (Some(item), Some(typed @ ("CommandExecution" | "McpToolCall" | "SubAgentActivity" | "CollabAgentToolCall"))) => {
                     let duration = item.duration.0.map_or(json!({"secs": null, "nanos": null}), |d| json!({"secs": d.secs.0, "nanos": d.nanos.0}));
-                    json!({"thread_id": completed.thread_id.0, "turn_id": completed.turn_id.0, "item": {"type": kind, "id": item.id.0, "status": item.status.0,
-                        "source": item.source.0, "exit_code": item.exit_code.0, "duration": duration}})
+                    match typed {
+                        "CommandExecution" => json!({"type": kind, "id": item.id.0, "status": item.status.0, "source": item.source.0, "exit_code": item.exit_code.0,
+                            "duration": duration}),
+                        "McpToolCall" => json!({"type": kind, "id": item.id.0, "server": item.server.0, "tool": item.tool.0, "status": item.status.0,
+                            "readOnlyHint": item.read_only_hint.0, "result": {"isError": item.result.0.map_or(Value::Null, |r| r.is_error.0)}, "duration": duration}),
+                        "SubAgentActivity" => json!({"type": kind, "id": item.id.0, "agent_thread_id": item.agent_thread_id.0}),
+                        _ => json!({"type": kind, "id": item.id.0, "status": item.status.0, "sender_thread_id": item.sender_thread_id.0,
+                            "receiver_thread_ids": item.receiver_thread_ids.0}),
+                    }
                 }
-                None => json!({"thread_id": completed.thread_id.0, "turn_id": completed.turn_id.0, "item": {"type": kind}}),
+                _ => json!({"type": kind}),
             };
+            let raw = json!({"thread_id": completed.thread_id.0, "turn_id": completed.turn_id.0, "item": fields});
             let kept = |path: &str, class| sanitize::field(&raw, path, class);
             let text = |path: &str, class| kept(path, class).as_str().map(str::to_owned);
+            let number = |path: &str| kept(path, sanitize::Class::Number).as_i64();
+            let flag = |path: &str| kept(path, sanitize::Class::Bool).as_bool();
             if let (Some((session, ..)), Some(item_id)) = (&cursor.session, text("item.id", sanitize::Class::Id)) {
-                let number = |path: &str| kept(path, sanitize::Class::Number).as_i64();
-                tx.execute("INSERT OR IGNORE INTO codex_exec_items(session_id,item_id,thread_id,turn_id,status,source,exit_code,startup_duration_secs,startup_duration_nanos,
-                    completed_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![session, item_id, text("thread_id", sanitize::Class::Id),
-                    text("turn_id", sanitize::Class::Id), text("item.status", sanitize::Class::Tag), text("item.source", sanitize::Class::Tag),
-                    number("item.exit_code"), number("item.duration.secs"), number("item.duration.nanos"), ms(tag.timestamp.as_deref())])?;
+                let (thread, turn, at) = (text("thread_id", sanitize::Class::Id), text("turn_id", sanitize::Class::Id), ms(tag.timestamp.as_deref()));
+                match kind.as_str() {
+                    Some("CommandExecution") => {
+                        tx.execute("INSERT OR IGNORE INTO codex_exec_items(session_id,item_id,thread_id,turn_id,status,source,exit_code,startup_duration_secs,
+                            startup_duration_nanos,completed_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![session, item_id, thread, turn,
+                            text("item.status", sanitize::Class::Tag), text("item.source", sanitize::Class::Tag), number("item.exit_code"),
+                            number("item.duration.secs"), number("item.duration.nanos"), at])?;
+                    }
+                    // A8 (contracts-collection.md A8): an MCP call's metadata, never its arguments or result content.
+                    Some("McpToolCall") => {
+                        tx.execute("INSERT OR IGNORE INTO codex_mcp_calls(session_id,item_id,thread_id,turn_id,server,tool,status,read_only_hint,is_error,duration_secs,
+                            duration_nanos,completed_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)", params![session, item_id, thread, turn,
+                            text("item.server", sanitize::Class::Tag), text("item.tool", sanitize::Class::Tag), text("item.status", sanitize::Class::Tag),
+                            flag("item.readOnlyHint"), flag("item.result.isError"), number("item.duration.secs"), number("item.duration.nanos"), at])?;
+                    }
+                    Some(typed @ ("SubAgentActivity" | "CollabAgentToolCall")) => {
+                        let receivers = kept("item.receiver_thread_ids", sanitize::Class::IdList);
+                        tx.execute("INSERT OR IGNORE INTO codex_agent_items(session_id,item_type,item_id,thread_id,turn_id,status,agent_thread_id,sender_thread_id,
+                            receiver_thread_ids,completed_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![session, typed, item_id, thread, turn,
+                            text("item.status", sanitize::Class::Tag), text("item.agent_thread_id", sanitize::Class::Id),
+                            text("item.sender_thread_id", sanitize::Class::Id), (!receivers.is_null()).then(|| receivers.to_string()), at])?;
+                    }
+                    _ => {}
+                }
+            }
+            *observed = Some(raw);
+        }
+        // A8: an aborted turn's final event (an aborted turn is complete, never
+        // a lost final event), read through its typed allowlist and leniently.
+        (Some("event_msg"), Some("turn_aborted")) => {
+            let Ok(Envelope { payload: aborted }) = serde_json::from_slice::<Envelope<TurnAborted>>(line) else { return Ok(false) };
+            let raw = json!({"turn_id": aborted.turn_id.0, "reason": aborted.reason.0, "duration_ms": aborted.duration_ms.0});
+            if cursor.session.is_some() {
+                let id = turn_id(raw["turn_id"].clone());
+                let opened = cursor.end_turn(&id, true);
+                ledger.turn_completed(tx, id.as_deref(), opened, now)?;
+                if let (Some((session, ..)), Some(id)) = (&cursor.session, id) {
+                    tx.execute("INSERT OR IGNORE INTO codex_turn_aborts(session_id,turn_id,reason,duration_ms,aborted_unix_ms) VALUES(?1,?2,?3,?4,?5)",
+                        params![session, id, sanitize::field(&raw, "reason", sanitize::Class::Tag).as_str(),
+                            sanitize::field(&raw, "duration_ms", sanitize::Class::Number).as_i64(), ms(tag.timestamp.as_deref())])?;
+                }
             }
             *observed = Some(raw);
         }
@@ -868,16 +1016,44 @@ fn evaluate(usage: &Usage, version: &str) -> (Option<&'static str>, [Option<i64>
     (reason, valid.filter(|_| reason.is_none()).map(|c| c.map(Some)).unwrap_or([None; 6]))
 }
 
-/// Σ accepted usage vs the last reported `thread_token_usage` and `token_count` totals.
+const FIELDS: [&str; 6] = ["cache_write_input_tokens", "cached_input_tokens", "input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens"];
+
+/// Σ accepted usage vs the last reported `thread_token_usage` and `token_count`
+/// totals. A8: a fork (a rollout naming `history_base.thread_id`) reports
+/// both totals including its origin's thread total at the fork point
+/// ([`fork_origin`]), which is subtracted first; an origin not collected that
+/// far claims no discrepancy (`codex_fork_reconciliation`).
 fn reconcile(tx: &Transaction, session: &str, now: i64) -> Result<()> {
-    const FIELDS: [&str; 6] = ["cache_write_input_tokens", "cached_input_tokens", "input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens"];
     let sums: Vec<i64> = tx.query_row(&format!("SELECT {} FROM codex_usage WHERE session_id=?1 AND accepted=1",
         FIELDS.map(|f| format!("coalesce(sum({f}),0)")).join(",")), [session], |r| (0..6).map(|i| r.get(i)).collect())?;
     let reported: Vec<(Option<String>, Option<String>)> = tx.prepare("SELECT thread_usage,token_count_usage FROM rollout_sources WHERE session_id=?1")?
         .query_map([session], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    let base: Option<(String, Option<i64>)> = tx.query_row("SELECT k.base_thread_id,k.base_end_byte_offset FROM rollout_forks k JOIN rollout_sources s ON s.path_digest=k.path_digest
+        WHERE s.session_id=?1 AND k.base_thread_id IS NOT NULL ORDER BY s.session_unix_ms,s.path_digest LIMIT 1", [session], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+    let fork = match &base {
+        Some((origin, end)) => Some(fork_origin(tx, origin, *end)?),
+        None => None,
+    };
     for (kind, value) in [("thread_total", reported.iter().rev().find_map(|r| r.0.clone())), ("token_count_total", reported.iter().rev().find_map(|r| r.1.clone()))] {
         let Some(value) = value else { continue };
-        let value: Value = serde_json::from_str(&value)?;
+        let mut value: Value = serde_json::from_str(&value)?;
+        let mut origin_total = None;
+        if let Some(fork) = &fork {
+            match fork {
+                Ok(origin) => {
+                    for field in FIELDS {
+                        value[field] = value[field].as_i64().zip(origin[field].as_i64()).map_or(Value::Null, |(fork, origin)| json!(fork - origin));
+                    }
+                    origin_total = origin["total_tokens"].as_i64();
+                }
+                // Not a discrepancy: the fork's own share is unknown.
+                &Err(state) => {
+                    tx.execute("DELETE FROM codex_discrepancy WHERE session_id=?1 AND kind=?2", params![session, kind])?;
+                    fork_state(tx, session, kind, state, None, now)?;
+                    continue;
+                }
+            }
+        }
         let differing: Vec<&str> = FIELDS.iter().zip(&sums).filter(|(f, sum)| value[**f].as_i64() != Some(**sum)).map(|(f, _)| *f).collect();
         if differing.is_empty() {
             tx.execute("DELETE FROM codex_discrepancy WHERE session_id=?1 AND kind=?2", params![session, kind])?;
@@ -886,6 +1062,58 @@ fn reconcile(tx: &Transaction, session: &str, now: i64) -> Result<()> {
                 ON CONFLICT(session_id,kind) DO UPDATE SET summed_total=excluded.summed_total,reported_total=excluded.reported_total,fields=excluded.fields,observed_unix_ms=excluded.observed_unix_ms",
                 params![session, kind, sums[5], value["total_tokens"].as_i64().unwrap_or(-1), json!(differing).to_string(), now])?;
         }
+        if fork.is_some() {
+            fork_state(tx, session, kind, if differing.is_empty() { "reconciled" } else { "discrepancy" }, origin_total, now)?;
+        }
+    }
+    Ok(())
+}
+
+/// A fork's reconciliation state per reported total; rewritten only when it changes.
+fn fork_state(tx: &Transaction, session: &str, kind: &str, state: &str, origin_total: Option<i64>, now: i64) -> Result<()> {
+    tx.execute("INSERT INTO codex_fork_reconciliation(session_id,kind,state,origin_total,observed_unix_ms) VALUES(?1,?2,?3,?4,?5)
+        ON CONFLICT(session_id,kind) DO UPDATE SET state=excluded.state,origin_total=excluded.origin_total,observed_unix_ms=excluded.observed_unix_ms
+        WHERE codex_fork_reconciliation.state<>excluded.state OR codex_fork_reconciliation.origin_total IS NOT excluded.origin_total",
+        params![session, kind, state, origin_total, now])?;
+    Ok(())
+}
+
+/// The origin's thread total at the fork point: the six `thread_token_usage`
+/// counters of the last certified `token_usage_record` envelope of the
+/// origin's rollout (session `history_base.thread_id`) that reports one and
+/// starts before `history_base.end_byte_offset` (the origin's file length when
+/// it was forked), or zeros if none does. `Err`: `fork_point_unknown` without
+/// a usable offset; `origin_not_collected` when no certified rollout of the
+/// origin has been read up to the fork point.
+fn fork_origin(tx: &Transaction, origin: &str, end: Option<i64>) -> Result<std::result::Result<Value, &'static str>> {
+    let Some(end) = end.filter(|end| *end >= 0) else { return Ok(Err("fork_point_unknown")) };
+    let sources: Vec<(String, String)> = tx.prepare("SELECT s.path_digest,s.cli_version FROM rollout_sources s JOIN collect_offsets o ON o.path_digest=s.path_digest
+        WHERE s.session_id=?1 AND o.byte_offset>=?2 ORDER BY s.session_unix_ms DESC,s.path_digest")?
+        .query_map(params![origin, end], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    let Some((source, _)) = sources.into_iter().find(|(_, version)| certified(version)) else { return Ok(Err("origin_not_collected")) };
+    let total: Option<String> = tx.query_row("SELECT json_extract(payload,'$.thread_token_usage') FROM source_observations WHERE producer_epoch=?1
+        AND event_kind='codex.token_usage_record.v1' AND producer_sequence<?2 AND json_extract(measurement,'$.certified')=1
+        AND json_type(payload,'$.thread_token_usage.total_tokens')='integer' ORDER BY producer_sequence DESC LIMIT 1", params![source, end], |r| r.get(0)).optional()?;
+    Ok(Ok(match total {
+        Some(total) => serde_json::from_str(&total)?,
+        None => Value::Object(FIELDS.iter().map(|f| (f.to_string(), json!(0))).collect()),
+    }))
+}
+
+/// A8: forks read before their origin was collected up to the fork point (or
+/// not yet reconciled) are reconciled again once every rollout of this collect
+/// was read, so the order in which rollouts are read never matters.
+fn reconcile_forks(db: &mut Connection) -> Result<()> {
+    let sessions: Vec<(String, String)> = db.prepare("SELECT DISTINCT s.session_id,s.cli_version FROM rollout_forks k JOIN rollout_sources s ON s.path_digest=k.path_digest
+        WHERE k.base_thread_id IS NOT NULL AND (s.thread_usage IS NOT NULL OR s.token_count_usage IS NOT NULL)
+        AND (NOT EXISTS(SELECT 1 FROM codex_fork_reconciliation r WHERE r.session_id=s.session_id)
+            OR EXISTS(SELECT 1 FROM codex_fork_reconciliation r WHERE r.session_id=s.session_id AND r.state='origin_not_collected'))")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    let now = jiff::Timestamp::now().as_millisecond();
+    for (session, _) in sessions.into_iter().filter(|(_, version)| certified(version)) {
+        let tx = db.transaction()?;
+        reconcile(&tx, &session, now)?;
+        tx.commit()?;
     }
     Ok(())
 }

@@ -189,8 +189,9 @@ each with a value somewhere, and no unavailable field.
   discrepancy), `subagent_parent_thread_id` and `subagent_depth` (a
   `thread_spawn` subagent). Still fixture: `function_call.status`,
   `rate_limits.secondary.*`, `rate_limit_reached_type`. MCP calls are
-  `McpToolCall` `item_completed` items whose fields stay uncollected
-  (proposal in that doc).
+  `McpToolCall` `item_completed` items; A8 (below) collects their metadata,
+  the subagent and collab items, `turn_aborted`, `function_call.namespace`
+  and the fork point, all live.
 - *Not collected:* `rate_limits.{credits, limit_name}`,
   `info.{last_token_usage, model_context_window}`, `turn_token_usage`,
   `thread_id`, `root_turn_id`, start and completion times, and tool/exec
@@ -927,3 +928,255 @@ a plain string).
 - A live run could certify how long Codex leaves a rollout unwritten inside
   a healthy turn (a long tool call or approval wait); a turn idle past 600 s
   is `missing` until its event arrives, then `recovered`.
+
+## A8: the second live run's shapes (MCP, subagents, aborted turns, forks)
+
+Source: [codex-live-0.154.0-run2.md](codex-live-0.154.0-run2.md) and the
+steward's §7 decision in [phase2-lanes.md](phase2-lanes.md) ("From live run
+2"): approved, metadata only. Sidecar stream `ingest` 0008
+(`migrations/telemetry/ingest/0008_codex_live_run2.sql`, re-runnable: `IF NOT
+EXISTS` tables only, no `ALTER ... ADD COLUMN`).
+
+### Fields
+
+Every field is an identifier, an enum-like tag, a boolean, a number or a line
+time that Codex writes about a call, a turn or a session. MCP server and tool
+names are configuration names chosen by the operator (like tool names, no
+digest; §7 excerpt rules applied).
+
+| Envelope kind | Field | Class (§7 rule) | Stored in | Certified (caveat) |
+|---|---|---|---|---|
+| `item_completed`, `McpToolCall` | `item.id` | Id | `codex_mcp_calls.item_id` | live (`typed_items_only`) |
+| same | `item.server`, `item.tool` | Tag (excerpt) | `.server`, `.tool` | live (`mcp_tool_call_only`) |
+| same | `item.status` | Tag | `.status` | live (`observed_completed_failed`) |
+| same | `item.readOnlyHint`, `item.result.isError` | Bool | `.read_only_hint`, `.is_error` (0/1) | live (`mcp_tool_call_only`) |
+| same | `item.duration.{secs, nanos}` | Number | `.duration_{secs,nanos}` | live (`startup_not_run_time`: like an exec item's, not the run time) |
+| `item_completed`, `SubAgentActivity` | `item.id`, `item.agent_thread_id` | Id | `codex_agent_items.item_id`, `.agent_thread_id` | live (`subagent_activity_only`) |
+| `item_completed`, `CollabAgentToolCall` | `item.id`, `item.status`, `item.sender_thread_id`, `item.receiver_thread_ids[]` | Id, Tag, Id, IdList | `codex_agent_items.{item_id, status, sender_thread_id, receiver_thread_ids}` (JSON array) | live (`collab_agent_tool_call_only`) |
+| `item_completed`, `CommandExecution` | `item.status` value `failed` (exit ≠ 0) | Tag | `codex_exec_items.status` | live: certified exec statuses `completed` (exit 0) and `failed` (exit ≠ 0) |
+| `turn_aborted` (`event_msg`) | `turn_id`, `reason`, `duration_ms`, line time | Id, Tag, Number, time | `codex_turn_aborts(session_id, turn_id, reason, duration_ms, aborted_unix_ms)` | live (`interrupted`) |
+| `function_call` (`response_item`) | `namespace` | Tag | `codex_tool_namespaces(session_id, call_id, namespace)` | live (`collaboration`) |
+| `session_meta` | `forked_from_ordinal_exclusive`, `history_base.{thread_id, end_ordinal_exclusive, end_byte_offset}` | Number, Id, Number, Number | `rollout_forks(path_digest, forked_from_ordinal_exclusive, base_thread_id, base_end_ordinal_exclusive, base_end_byte_offset)` | live (`end_byte_offset`: `origin_file_length_at_fork`) |
+
+**Never read into a row or envelope:** an MCP call's `arguments` (keyed by
+data) and `result.content` (and any other `result` field); a subagent's
+`kind` (not approved: type, ids and status only) and `agent_path`; a collab
+call's `tool`, `receiver_agents` and `agents_states`; `turn_aborted.
+{started_at, completed_at}`. The typed structs name only the allowlisted
+fields, so serde skips the others without retaining them, as in A6.
+`capabilities` lists `item.arguments`, `item.result.content`,
+`item.agent_path` and `item.receiver_agents` as `content_forbidden`, and
+`item.kind`, `item.agents_states` and `turn_aborted.{started_at,
+completed_at}` as `not_collected`. The capability row `item.result` becomes
+`item.result.content`.
+
+### Collection rules
+
+- **Typed and lenient**, as A6: a wrongly typed leaf is `null`, never a
+  malformed record. `receiver_thread_ids` keeps an array of Ids (a non-Id
+  element is `null`); any other value is `null`. Rows are stored for every
+  `cli_version` (metadata); the first row of a key stays.
+- **Envelopes.** `item_completed` payloads hold every allowlisted path,
+  `null` outside the item type that reports it (a `CommandExecution` never
+  carries `server`, an `McpToolCall` never `exit_code`). `turn_aborted` is a
+  new kind (`codex.turn_aborted.v1`, normalization 1). Normalization versions
+  rise so older envelopes are superseded in place, never a `digest_conflict`:
+  `session_meta` 5, `function_call` 2, `item_completed` 2 (`custom_tool_call`
+  keeps its allowlist and version 1).
+- **Aborted turns are final events.** A `turn_aborted` whose `turn_id` is
+  the tracked last turn's (or any, for a turn without an id) completes it
+  like `task_complete`, with `rollout_turn_ends.last_turn_aborted = 1`. It
+  recovers a pending `final_event_missing` gap for its turn, and an aborted
+  turn left idle past `FINAL_EVENT_IDLE_MS` is never `final_event_missing`.
+  `collectors sessions` shows `final_event.state = aborted`.
+- **Fork reconciliation.** A fork (`history_base.thread_id` present) replays
+  no records, but its `thread_token_usage` and `token_count` totals include
+  its origin's thread total at the fork point (run2 §1). Its reconciliation
+  subtracts, per counter, the origin's reported `thread_token_usage` of its
+  last certified `token_usage_record` envelope whose byte offset is below
+  `history_base.end_byte_offset` (zeros if there is none) from both reported
+  totals, then compares with Σ accepted as in §5. The fork point is located
+  in bytes because every stored record is keyed by its byte offset;
+  `end_ordinal_exclusive` (the origin's line count) is stored and shown but
+  line ordinals are not collected. States per session and total, in
+  `codex_fork_reconciliation`: `reconciled`, `discrepancy` (then the
+  `codex_discrepancy` row holds the fork's own share as `reported_total`),
+  `origin_not_collected` (no certified rollout of the origin read up to the
+  fork point: no `codex_discrepancy` row, never a false alarm) and
+  `fork_point_unknown` (no usable `end_byte_offset`). After every rollout of
+  a collect is read, forks still `origin_not_collected` (or not yet
+  reconciled) are reconciled again, so read order never matters. A fork
+  without `history_base` (the fixture-only `child`) reconciles as before.
+- **Upgrade.** A source with a `rollout_sources` row but no `rollout_forks`
+  or `rollout_turn_ends` row was read before A8. Each collect reads it again
+  from byte 0 within its budget, like A4–A7. Stored keys dedupe;
+  `collected.records` counts nothing twice.
+- `collectors sessions` adds `fork`: `null` for a rollout that names no fork
+  point, else `{forked_from_ordinal_exclusive, history_base {thread_id,
+  end_ordinal_exclusive, end_byte_offset} | null, reconciliation
+  {thread_total, token_count_total} | null}`. `final_event` needs ingest
+  0008 too. Both are `unavailable` `predates_collection` without ingest 0008
+  and `pending_reread` while the source waits for its re-read.
+- `collectors tools` adds per session `mcp_calls` (`{item_id, thread_id,
+  turn_id, server, tool, status, read_only_hint, is_error, duration {secs,
+  nanos}, completed_unix_ms}`), `agent_items` (`{item_id, type, thread_id,
+  turn_id, status, agent_thread_id, sender_thread_id, receiver_thread_ids,
+  completed_unix_ms}`), `turn_aborts` (`{turn_id, reason, duration_ms,
+  aborted_unix_ms}`) and each tool call's `namespace`, with the same
+  `predates_collection` / `pending_reread` rules for ingest 0008. The text
+  form adds `mcp`, `agent` and `abort` lines and ` namespace=` on a call
+  that reports one.
+- Unchanged: usage, attempts, report, bindings and accounting outputs (lane
+  B still reads only the A6 tables). Changed on purpose: the envelopes above,
+  the capabilities table, fork `codex_discrepancy` rows (a false discrepancy
+  disappears), and the first collect after the upgrade re-reads bytes.
+
+### Conformance (tests/telemetry_conformance.rs)
+
+`live2-tools` and `live2-fork` join `CASES` (bound, certified; the fork's
+`@ORIGIN@` is `complete` and `history_base.end_byte_offset` its planted
+length). `live2-tools`' collab item now names its receiver (the live census
+listed `receiver_thread_ids[]` with elements) and carries `LIVE2LEAK_*`
+sentinels in `receiver_agents` and `agents_states`.
+
+| Property | Test |
+|---|---|
+| MCP, subagent, collab, aborted-turn, namespace and fork rows and envelopes (exactly the allowlist per item type); `aborted` final event, also idle past the threshold; fork `origin_not_collected` with no discrepancy, `reconciled` against 1680 once the origin is collected, still after the origin grows past the fork point; lane B M16/M17 unchanged; no `LIVE2LEAK_*` sentinel in the sidecar (with WAL/SHM) or any output | `live_run2_shapes_are_collected_without_content` |
+| Upgrade of an A7 sidecar: `predates_collection` read-only, then a re-read equal to a fresh collect, stream 8, no conflict; a gone rollout `pending_reread` | `rollouts_read_before_a8_gain_their_live_run2_metadata_on_the_next_collect` |
+| Sentinels (MCP arguments and results, agent paths, collab agents and states), capabilities matching emitted fields (each new one valued), replay in any chunking | `planted_sentinels_never_leak`, `capabilities_match_emitted_fields`, `corpus_replays_identically_in_any_chunking` |
+
+### Contracts.md §5/§7 revision (for the steward)
+
+`contracts.md` is a steward file. The exact diff:
+
+```diff
+@@ §5 Codex usage (sidecar), **Source.**
+-`task_complete`, `item_completed`, and `response_item` of type
+-`custom_tool_call`, `function_call`, `custom_tool_call_output`,
+-`function_call_output` (A6: tool metadata only, through a typed allowlist).
++`task_complete`, `turn_aborted` (A8), `item_completed`, and `response_item`
++of type `custom_tool_call`, `function_call`, `custom_tool_call_output`,
++`function_call_output` (A6: tool metadata only, through a typed allowlist).
+@@ §5 **Allowlisted fields.**, after "(A5, sidecar stream `ingest` 0005 `rollout_threads`)."
++A fork's `forked_from_ordinal_exclusive` and `history_base.{thread_id,
++end_ordinal_exclusive, end_byte_offset}` (A8, sidecar stream `ingest` 0008
++`rollout_forks`).
+@@ §5 **Allowlisted fields.**, after "`task_complete`: `turn_id`, `duration_ms`, `time_to_first_token_ms`."
++`turn_aborted`: `turn_id`, `reason`, `duration_ms` and the line `timestamp`
++(A8: the aborted turn's final event).
+@@ §5 **Allowlisted fields.**, tool calls
+-(`custom_tool_call`, `function_call`): `call_id`, `name`, `status`,
+-`internal_chat_message_metadata_passthrough.turn_id` and the line
+-`timestamp`;
++(`custom_tool_call`, `function_call`): `call_id`, `name`, `status`,
++`internal_chat_message_metadata_passthrough.turn_id`, the line `timestamp`,
++and for a `function_call` its `namespace` (A8);
+@@ §5 **Allowlisted fields.**, `item_completed`
+-a `CommandExecution` item `item.{id, status, source, exit_code,
+-duration.{secs, nanos}}` (the exec startup, not the command's run time) and
+-the line `timestamp` (A6, sidecar stream `ingest` 0006 `codex_tool_calls`,
+-`codex_exec_items`, `codex_tool_sources`; lenient like A4). Never:
++a `CommandExecution` item `item.{id, status, source, exit_code,
++duration.{secs, nanos}}` (the exec startup, not the command's run time;
++certified statuses `completed` and `failed`) and the line `timestamp` (A6,
++sidecar stream `ingest` 0006 `codex_tool_calls`, `codex_exec_items`,
++`codex_tool_sources`; lenient like A4); for an `McpToolCall` item
++`item.{id, server, tool, status, readOnlyHint, result.isError,
++duration.{secs, nanos}}`; for a `SubAgentActivity` item `item.{id,
++agent_thread_id}`; for a `CollabAgentToolCall` item `item.{id, status,
++sender_thread_id, receiver_thread_ids[]}` (A8, sidecar stream `ingest` 0008
++`codex_mcp_calls`, `codex_agent_items`, `codex_turn_aborts`,
++`codex_tool_namespaces`, `rollout_turn_ends`). Never:
+@@ §5 **Allowlisted fields.**, the "Never" list
+-`stdout`, `stderr`, `aggregated_output`, `formatted_output`, `process_id`,
+-`content`, `client_id` or `phase`.
++`stdout`, `stderr`, `aggregated_output`, `formatted_output`, `process_id`,
++`content`, `client_id` or `phase`, an MCP call's `arguments` or `result`
++content, a subagent's `agent_path`, or a collab call's `receiver_agents` or
++`agents_states`.
+@@ §5 **Usage record**, Reconciliation bullet
+ - Reconciliation: Σ accepted `usage` per session vs the last
+   `thread_token_usage`; any difference → `codex_discrepancy(kind =
+   'thread_total')`. Last `token_count.total_token_usage` differing from Σ →
+   `codex_discrepancy(kind = 'token_count_total')` (expected after
+   compaction; informational, never used for sums).
++  A fork (`history_base.thread_id`) reports both totals including its
++  origin's thread total at the fork point: that total (the origin's last
++  certified `thread_token_usage` before `history_base.end_byte_offset`) is
++  subtracted first. An origin not collected up to the fork point records
++  `codex_fork_reconciliation.state = 'origin_not_collected'` and no
++  discrepancy (A8, sidecar stream `ingest` 0008).
+@@ §7 Privacy allowlist and excerpts
+-provider and parent-session identifiers, tool call ids, tool names, call and
+-exec statuses, exit codes and exec startup durations).
++provider and parent-session identifiers, tool call ids, tool names and
++namespaces, call and exec statuses, exit codes and exec startup durations,
++MCP server and tool names with their read-only and error flags and
++durations, subagent and collab item ids and statuses, turn abort reasons,
++and fork points).
+@@ §7 **Never collected**
+-Never collected: prompts, briefs, transcripts, agent messages, tool
+-input/arguments/output, commands and their working directories, parsed
++Never collected: prompts, briefs, transcripts, agent messages, tool
++input/arguments/output (MCP `arguments` and `result` content included),
++subagent paths and collab agent records, commands and their working directories, parsed
+@@ Index / §0 Stores
+-  `ingest` 0006 tool/exec metadata, 0007 subagent detail, per-source ingest
+-  state, envelope `measurement.certified` and `final_event_missing` gaps,
+-  contracts-collection.md A6–A7), mode 0600, created on first collect. No
++  `ingest` 0006 tool/exec metadata, 0007 subagent detail, per-source ingest
++  state, envelope `measurement.certified` and `final_event_missing` gaps,
++  0008 MCP calls, subagent and collab items, aborted turns, function call
++  namespaces, fork points and fork reconciliation,
++  contracts-collection.md A6–A8), mode 0600, created on first collect. No
+@@ §8 Landed since phase 1
+-(contracts-collection.md A4), Codex tool/exec metadata (contracts-collection.md
+-A6), review opportunities, sessions and completions,
++(contracts-collection.md A4), Codex tool/exec metadata (contracts-collection.md
++A6), Codex MCP, subagent, aborted-turn and fork metadata and fork
++reconciliation (contracts-collection.md A8), review opportunities, sessions
++and completions,
+```
+
+§0 check: no content field is read into a typed struct, a row or an
+envelope (the sentinels prove it end to end); every new value is metadata
+(§7 default above); unknown stays `unavailable` (`predates_collection`,
+`pending_reread`, `origin_not_collected`), never 0 or `null`.
+
+### Follow-ups for lane B (B12)
+
+All read-only, joined on the rollout's own `session_id` (bound sources only),
+tolerating the A8 tables missing on a read-only pre-A8 sidecar
+(`predates_collection`) and a session with a source lacking `rollout_forks`
+(`pending_reread`); both `unavailable`, never 0.
+
+1. **M17 (`failed`).** `codex_exec_items.status = 'failed'` with a non-zero
+   `exit_code` is a certified failed execution (run2: `2/3`, not `2/2`).
+   `completed` with exit 0 is success. Any other status, or `failed` with
+   exit 0 or `NULL`, stays `status_not_certified`. `custom_tool_call.status`
+   only says the call was made.
+2. **M16 (aborted).** `codex_turn_aborts(session_id, turn_id, reason,
+   duration_ms, aborted_unix_ms)`: a call whose `codex_tool_calls.turn_id` is
+   an aborted turn and whose output is the turn's last before
+   `aborted_unix_ms` (run2: `reason = 'interrupted'` right after a declined
+   approval) is `declined_or_aborted`, not `human_routed` accepted. Other
+   calls of an aborted turn keep their decision. `collectors sessions`
+   `final_event.state = 'aborted'` marks the rollout's last turn.
+3. **MCP calls (M16–M18).** `codex_mcp_calls(session_id, item_id, thread_id,
+   turn_id, server, tool, status, read_only_hint, is_error, duration_secs,
+   duration_nanos, completed_unix_ms)`: count by `server` and `tool` and set
+   `accounting` `mcp_calls` to `live`. An MCP call is also an `exec`
+   `custom_tool_call` (code mode): it counts once, as the MCP call; the item
+   `id` (`exec-…`) is not the call's `call_id`, so match the carrying
+   `exec` call only by `(session_id, turn_id)` and line time (`inferred`).
+   `is_error = 1` is a failed MCP call; `status` values seen: `completed`.
+   Never use the duration as run time (M18 stays `unavailable`).
+4. **Fork inclusion.** A fork replays no records and its links are live, so
+   fork inclusion becomes `separate`, not `unavailable:
+   fork_replay_not_certified`. Never add a fork's reported totals: its
+   `codex_fork_reconciliation` states say whether its own share reconciled.
+5. **Collab and subagents.** `codex_tool_namespaces.namespace =
+   'collaboration'` marks `spawn_agent` / `wait_agent` calls (not tool
+   executions); `codex_agent_items` gives the spawned child's thread id
+   (`SubAgentActivity.agent_thread_id`, whose `started` item id equals the
+   spawn `call_id`) and a wait's receivers.

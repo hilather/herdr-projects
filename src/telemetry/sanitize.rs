@@ -17,6 +17,11 @@ pub enum Class {
     Path,
     /// An integer stays an integer; any other number becomes its decimal text.
     Number,
+    /// A JSON boolean, kept as is (A8: MCP `readOnlyHint`, `result.isError`).
+    Bool,
+    /// An array of identifiers, each kept as `Id` (`null` if not one); any
+    /// other value is `null` (A8: `receiver_thread_ids`).
+    IdList,
 }
 
 const USAGE: [&str; 6] = ["cache_write_input_tokens", "cached_input_tokens", "input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens"];
@@ -31,7 +36,10 @@ pub fn codex_allowlist(kind: &str) -> Option<Vec<(String, Class)>> {
     Some(match kind {
         "session_meta" => fields(&[("id", Id), ("timestamp", Text), ("cwd", Path), ("cli_version", Text), ("originator", Text), ("source", Tag),
             ("model_provider", Text), ("forked_from_id", Id), ("subagent_kind", Tag), ("subagent_detail", Text), ("subagent_parent_thread_id", Id), ("subagent_depth", Number),
-            ("parent_thread_id", Id), ("session_id", Id), ("thread_source", Tag)]),
+            ("parent_thread_id", Id), ("session_id", Id), ("thread_source", Tag),
+            // A8: the fork point a `codex exec fork` names (contracts-collection.md A8).
+            ("forked_from_ordinal_exclusive", Number), ("history_base.thread_id", Id), ("history_base.end_ordinal_exclusive", Number),
+            ("history_base.end_byte_offset", Number)]),
         "turn_context" => fields(&[("turn_id", Id), ("model", Text), ("effort", Text)]),
         "token_usage_record" => fields(&[("session_id", Id), ("turn_id", Id), ("response_id", Id)]).into_iter()
             .chain(usage("usage")).chain(usage("thread_token_usage")).collect(),
@@ -44,11 +52,20 @@ pub fn codex_allowlist(kind: &str) -> Option<Vec<(String, Class)>> {
         // A6 tool/exec metadata (contracts-collection.md A6): `response_item`
         // tool calls and outputs by their payload type, never `input`,
         // `arguments` or `output`; `item_completed` never the command or its output.
-        "custom_tool_call" | "function_call" => fields(&[("call_id", Id), ("name", Tag), ("status", Tag),
-            ("internal_chat_message_metadata_passthrough.turn_id", Id)]),
+        "custom_tool_call" => fields(&[("call_id", Id), ("name", Tag), ("status", Tag), ("internal_chat_message_metadata_passthrough.turn_id", Id)]),
+        // A8: `namespace` (live: `collaboration`).
+        "function_call" => fields(&[("call_id", Id), ("name", Tag), ("namespace", Tag), ("status", Tag), ("internal_chat_message_metadata_passthrough.turn_id", Id)]),
         "custom_tool_call_output" | "function_call_output" => fields(&[("call_id", Id)]),
         "item_completed" => fields(&[("thread_id", Id), ("turn_id", Id), ("item.type", Tag), ("item.id", Id), ("item.status", Tag), ("item.source", Tag),
-            ("item.exit_code", Number), ("item.duration.secs", Number), ("item.duration.nanos", Number)]),
+            ("item.exit_code", Number), ("item.duration.secs", Number), ("item.duration.nanos", Number),
+            // A8 (contracts-collection.md A8): `McpToolCall` server and tool
+            // names, hint and error flag (never `arguments` or `result.content`);
+            // `SubAgentActivity` and `CollabAgentToolCall` ids (never
+            // `agent_path`, `receiver_agents` or `agents_states`).
+            ("item.server", Tag), ("item.tool", Tag), ("item.readOnlyHint", Bool), ("item.result.isError", Bool),
+            ("item.agent_thread_id", Id), ("item.sender_thread_id", Id), ("item.receiver_thread_ids", IdList)]),
+        // A8: an aborted turn's final event.
+        "turn_aborted" => fields(&[("turn_id", Id), ("reason", Tag), ("duration_ms", Number)]),
         _ => return None,
     })
 }
@@ -103,6 +120,8 @@ fn keep(value: &Value, class: Class) -> Value {
             Value::Number(n) => Value::String(n.to_string()),
             _ => Value::Null,
         },
+        Class::Bool => value.as_bool().map_or(Value::Null, Value::Bool),
+        Class::IdList => value.as_array().map_or(Value::Null, |ids| Value::Array(ids.iter().map(|id| keep(id, Class::Id)).collect())),
     }
 }
 
