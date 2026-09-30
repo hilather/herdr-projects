@@ -117,7 +117,7 @@ fn usage_metrics(sidecar: Option<&Connection>, attempts: &[Attempt], since: Opti
         let mut sums = [0i64; 5];
         for session in &certified {
             let row: [i64; 5] = db.query_row("SELECT coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(reasoning_output_tokens),0),count(*),count(model)
-                FROM codex_usage WHERE session_id=?1 AND accepted=1", [session], |r| Ok([r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?]))?;
+                FROM codex_usage WHERE session_id=?1 AND accepted=1 AND NOT EXISTS(SELECT 1 FROM codex_usage e WHERE e.session_id=codex_usage.session_id AND e.accepted=1 AND e.response_id IS NOT NULL AND e.response_id=codex_usage.response_id AND e.payload_digest=codex_usage.payload_digest AND e.ordinal<codex_usage.ordinal)", [session], |r| Ok([r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?]))?;
             for (sum, value) in sums.iter_mut().zip(row) { *sum += value; }
         }
         metrics.insert("M08", metric("M08", json!({"value": sums[0], "coverage": coverage})));

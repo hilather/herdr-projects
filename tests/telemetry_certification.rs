@@ -260,6 +260,10 @@ fn repeated_response_in_one_rollout_is_not_counted_twice() {
         .done(t + 3, "turn-1").text());
     let entries = sync(&f);
     assert_eq!(m08_m09(&f), (json!(160), json!(35)), "the repeated response adds nothing");
+    // Attempt usage (`usage`, `attempts`) skips the repeat too (certificate R3).
+    let usage = f.cli_args(&["usage", "--json"]).0;
+    let mine = usage["attempts"].as_array().unwrap().iter().find(|a| a["attempt_id"] == f.attempt.as_str()).cloned().unwrap();
+    assert_eq!((&mine["usage"]["input_tokens"], &mine["usage"]["output_tokens"], &mine["usage"]["records"]), (&json!(160), &json!(35), &json!(2)));
     assert_eq!(dispositions(&entry(&entries, &format!("codex:{s1}:3"))), [("duplicate".to_owned(), Some("response_repeated".to_owned()))],
         "accounted for diagnostically, not counted");
     assert_eq!(dispositions(&entry(&entries, &format!("codex:{s1}:2"))), [("accepted".to_owned(), None)]);

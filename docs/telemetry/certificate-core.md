@@ -189,7 +189,10 @@ These are restrictions, not passes. Each names what is missing.
 - **R2: no provider billing source.** Charges, invoices and FX tables are
   synthetic imports (`synthetic: true` is required). There is no invoice
   reconciliation claim. Prerequisite: an authorized provider export.
-- **R3: steward sums do not yet drop a repeated response (D1).** The Codex
+- **R3: resolved by the steward in this PR.** `telemetry usage`, `attempts`
+  (and so `arms_total`) and the central M15 now skip a repeated response with the
+  clause below; `repeated_response_in_one_rollout_is_not_counted_twice` asserts
+  attempt usage 160/35 with 2 records. Original finding (D1): the Codex
   row stays `accepted`. So `telemetry usage`, `attempts` (and the candidate
   group's `arms_total`, which reads them) and the central M15 count still
   include such a record twice. The lane M08/M09, the ledger, estimates,
