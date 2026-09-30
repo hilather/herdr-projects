@@ -317,7 +317,7 @@ fn execute(input: &Input, control: &Control, memory: &Arc<Mutex<Hints>>) -> Resu
         .and_then(|s| s.to_str())
         .context("attempt token slug missing")?;
     let fleet = herdr_projects::telemetry::workspace::snapshot(&input.project, slug);
-    let active = fleet["active"].as_array().and_then(|a| {
+    let active = fleet["active"]["attempts"].as_array().and_then(|a| {
         a.iter()
             .find(|a| a["attempt_id"] == input.started.attempt.as_str())
     });

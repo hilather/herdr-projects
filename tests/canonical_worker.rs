@@ -29,7 +29,8 @@ while True:
  pane={'pane_id':'w1:p1','workspace_id':'w1','tab_id':'w1:t1','terminal_id':'term1','cwd':s.get('cwd')}
  if os.path.exists(os.path.join(root,'changed-terminal')):pane['terminal_id']='replacement-terminal'
  kind=open(os.path.join(root,'agent-kind')).read() if os.path.exists(os.path.join(root,'agent-kind')) else 'claude'
- agent=dict(pane,agent=kind,interactive_ready=True,agent_status='idle',**({'name':s['name']} if 'name' in s else {}))
+ status=open(os.path.join(root,'agent-status')).read() if os.path.exists(os.path.join(root,'agent-status')) else 'idle'
+ agent=dict(pane,agent=kind,interactive_ready=True,agent_status=status,**({'name':s['name']} if 'name' in s else {}))
  res=None
  if m=='ping':
   override=os.path.join(root,'ping.json')
@@ -1932,17 +1933,15 @@ fn canonical_attempt_sidebar_uses_collected_usage_and_observed_waiting() {
     let mut ticker = lab.spawn();
     lab.wait(&mut ticker, 90, &|| has_token("codex ●"));
     lab.stop(ticker);
-    // Deterministic local telemetry fixture, as in telemetry_workspace's live_fleet.
-    let opened = jiff::Timestamp::now().as_millisecond();
-    std::thread::sleep(Duration::from_secs(6));
-    let sidecar = herdr_projects::telemetry::sidecar::open(&lab.project, true).unwrap().unwrap();
-    for ms in [opened, opened + 6000] {
-        sidecar.execute("INSERT INTO attention_samples(attempt_id,observed_unix_ms,state,gap,interval_ms,source) VALUES(?1,?2,'blocked',NULL,30000,'herdr-agent-list-v1')",
-            rusqlite::params![attempt.as_str(), ms]).unwrap();
-    }
-    drop(sidecar);
+    // The agent now waits on the human: the ticker's own attention sampler
+    // (stock Herdr `agent_status`) opens the wait, and the suffix shows how
+    // long it has been observed open, never extrapolated to now.
+    fs::write(lab.path("lab/agent-status"), "blocked").unwrap();
+    let waiting = || lab.requests().iter().any(|(m, p)| m == "pane.report_metadata" && p["tokens"]["telemetry"].as_str()
+        .and_then(|t| t.strip_prefix("codex ● ")).is_some_and(|w| !w.is_empty() && w.ends_with(['s', 'm'])));
     let mut ticker = lab.spawn();
-    lab.wait(&mut ticker, 60, &|| has_token("codex ● 6s"));
+    lab.wait(&mut ticker, 150, &waiting);
+    fs::write(lab.path("lab/agent-status"), "idle").unwrap();
     assert_eq!((lab.count("workspace.create_command"), lab.count("agent.prompt")), (1, 1));
     // Collector revocation keeps historical counters but clears the decoration
     // while the worker and its runtime ownership remain live.
