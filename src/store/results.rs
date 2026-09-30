@@ -148,10 +148,11 @@ fn parse_submission(raw: &[u8]) -> Result<ParsedSubmission> {
     {
         return Err(invalid("invalid result repository or oid"));
     }
-    if let Some(snapshot) = &document.memory_snapshot_id
-        && !plain(snapshot, 128)
-    {
-        return Err(invalid("invalid result snapshot"));
+    #[allow(clippy::collapsible_if)] // Preserve the existing submission parser layout.
+    if let Some(snapshot) = &document.memory_snapshot_id {
+        if !plain(snapshot, 128) {
+            return Err(invalid("invalid result snapshot"));
+        }
     }
     if document.objects.is_empty()
         || document.objects.len() > 64
@@ -448,6 +449,33 @@ fn read_packed_object(
     format: ObjectFormat,
 ) -> Result<Vec<u8>> {
     use crate::runner::{Cmd, RealRunner, Runner};
+    // Resolve storage without invoking worker-controlled Git configuration.
+    let verified_objects = (|| -> Result<PathBuf> {
+        let objects = git_objects(repository)?;
+        let common = objects
+            .parent()
+            .ok_or_else(|| invalid("missing object"))?
+            .canonicalize()
+            .map_err(|_| invalid("missing object"))?;
+        let resolved = objects
+            .canonicalize()
+            .map_err(|_| invalid("missing object"))?;
+        if !resolved.starts_with(&common) {
+            return Err(invalid("missing object"));
+        }
+        match fs::symlink_metadata(objects.join("pack")) {
+            Ok(meta) if meta.file_type().is_symlink() => return Err(invalid("missing object")),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(invalid("missing object")),
+        }
+        match fs::symlink_metadata(objects.join("info/alternates")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err(invalid("missing object")),
+        }
+        Ok(resolved)
+    })()
+    .map_err(|_| invalid("missing object"))?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     // This read-only source operation owns no transfer resources. RealRunner
     // supplies the GatedSpawn gate, process-group cleanup and capture bounds.
@@ -489,6 +517,15 @@ fn read_packed_object(
         .into_iter()
         .map(|(k, v)| (k.into(), v.into()))
         .collect();
+        if path == repository {
+            cmd.env.push((
+                "GIT_OBJECT_DIRECTORY".into(),
+                verified_objects
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("invalid object directory"))?
+                    .into(),
+            ));
+        }
         cmd.deadline = Some(deadline);
         cmd.stdin = stdin;
         cmd.capture_limit = limit;

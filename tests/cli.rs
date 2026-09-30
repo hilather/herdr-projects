@@ -3782,6 +3782,27 @@ fn task_contract_put_and_result_submit_keep_worker_bytes_untrusted() {
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("missing object"));
     assert_eq!(runtime::snapshot(&project).unwrap(), before_submit);
+    // The candidate exists only in another repository, exposed via alternates.
+    let other = home.path().join("alternate-repository");
+    std::fs::create_dir(&other).unwrap();
+    assert!(Command::new("/usr/bin/git").args(["init", "-q", "--bare", "--object-format=sha256"])
+        .arg(&other).status().unwrap().success());
+    let candidate_path = repo.join(".git/objects").join(&candidate[..2]).join(&candidate[2..]);
+    let alternate_path = other.join("objects").join(&candidate[..2]).join(&candidate[2..]);
+    std::fs::create_dir_all(alternate_path.parent().unwrap()).unwrap();
+    std::fs::rename(&candidate_path, &alternate_path).unwrap();
+    let alternates = repo.join(".git/objects/info/alternates");
+    std::fs::write(&alternates, format!("{}\n", other.join("objects").display())).unwrap();
+    assert_eq!(git(&["cat-file", "-t", &candidate]), "commit");
+    let refused = hp(home.path(), &["--root", root_arg, "result", "demo", "submit", "--input-file", submission.to_str().unwrap()]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("missing object"));
+    assert!(refused.stdout.is_empty(), "refused submission returned a receipt");
+    assert_eq!(runtime::snapshot(&project).unwrap(), before_submit);
+    assert_eq!(rusqlite::Connection::open(&db_path).unwrap().query_row(
+        "SELECT count(*) FROM result_submissions", [], |row| row.get::<_,u64>(0)).unwrap(), 0);
+    std::fs::remove_file(alternates).unwrap();
+    std::fs::rename(alternate_path, candidate_path).unwrap();
     let listed = objects();
     let loose_bytes: Vec<_> = listed.iter().map(|object| std::fs::read(repo.join(".git/objects").join(object["relative_path"].as_str().unwrap())).unwrap()).collect();
     git(&["repack", "-a", "-d"]);
