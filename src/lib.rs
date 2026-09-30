@@ -98,3 +98,5 @@ pub mod submission_spool;
 
 #[cfg(all(feature = "state-store", target_os = "linux"))]
 pub mod integration;
+#[cfg(all(feature = "state-store", target_os = "linux"))]
+pub(crate) mod git_quarantine;

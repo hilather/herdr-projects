@@ -163,6 +163,9 @@ fn checks_lease_ms(policies: usize) -> i64 {
     (policies as u64 * POLICY_TIMEOUT.as_millis() as u64 + 30_000) as i64
 }
 
+/// Budget for importing a live worker's verified candidate from its Git quarantine.
+const QUARANTINE_IMPORT: Duration = Duration::from_secs(60);
+
 /// How long an operator integration waits to regain ownership after its checks.
 const REGAIN: Duration = Duration::from_secs(60);
 
@@ -276,6 +279,13 @@ fn integrate_unlisted(store: &mut SqliteStore, request: &IntegrateRequest, expec
     }
     if base.len() != oid_len(&verified.object_format)? {
         bail!("integration ref oid does not match object format");
+    }
+    if !repo.has_object(&verified.commit_oid)? {
+        // A sandboxed worker's commits stay in its Git quarantine until it
+        // ends; import the verified candidate (re-hashed and fsck-checked).
+        let (project, receipts) = store.verified_result_worktrees(&verified.result_id)?;
+        crate::git_quarantine::import_commit(&project, &receipts, &verified.repository, &verified.commit_oid,
+            std::time::Instant::now() + QUARANTINE_IMPORT)?;
     }
     let operation_id = store.begin_integration(&IntegrationBegin {
         repository: repo.identity.clone(),

@@ -19,6 +19,12 @@ builds the spool designed by the write-isolation card: the worker's project
 reach the store only through the ticker
 ([Submission spool](#submission-spool-follow-up-card)).
 
+Follow-up card: "git quarantine", branch `security/git-quarantine`. Workers'
+Git writes go to a per-attempt quarantine overlaid on the repository's Git
+directory; the controller imports only verified objects reachable from the
+attempt's own branch ([Git quarantine](#git-quarantine-follow-up-card)). It
+closes residual risks 2(a)-(c).
+
 ## Finding (before this change)
 
 Canonical workers run as the owner's own uid. The supervisor argv was
@@ -255,12 +261,12 @@ between covering the projects root and hiding:
 | `<project>/.state/worker-output/<attempt>` (this attempt's output directory) | writable (spool card) |
 | The attempt's own worktrees | writable |
 | `<worktree>/.git` (gitdir pointer) | read-only |
-| Git common directory (`config`, `hooks/`, `info/`, `packed-refs`, other refs, `HEAD`) | read-only |
-| `<common>/objects`, `refs/heads`, `logs/refs/heads`, `reftable` | writable |
-| `<common>/objects/pack`, `objects/info` (alternates) | read-only |
-| `<common>/worktrees/<id>` (index, HEAD, per-worktree logs, `COMMIT_EDITMSG`) | writable |
-| `<common>/worktrees/<id>/{commondir,gitdir,locked}` | read-only |
+| Git common directory | *superseded by the Git quarantine card:* an overlay whose only writable layer is the attempt's quarantine |
 | Execution home, `<root>/.execution.lock` | writable |
+
+(Before the Git quarantine card the common directory was read-only except
+`objects`, `refs/heads`, `logs/refs/heads`, `reftable` and `worktrees/<id>`,
+which left residual risks 2(a)-(c).)
 
 The worker (in the nested user namespace U2) cannot remount any of these
 writable: the mounts belong to M1, owned by U1.
@@ -496,6 +502,149 @@ work.
 - `an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_commits_and_submits`
   keeps passing: its `result submit` now goes through the spool.
 
+## Git quarantine (follow-up card)
+
+Goal: a worker can create commits only for its own attempt and cannot alter
+any other ref or any existing object of the shared repository (residual risks
+2(a)-(c) of the write-isolation card).
+
+### Options evaluated (Git 2.55, Linux 7.2, scratch repositories)
+
+| Option | Verdict |
+|---|---|
+| Bind only `refs/heads/<attempt branch>` writable, the rest of `refs/` read-only | **Fails.** The files backend updates a ref through `<ref>.lock` created in the ref's directory and renamed over it, so the directory must be writable; all attempt branches (`hp-<64 hex>`, fixed by `LaunchInputs`) share `refs/heads/`. Scratch: `fatal: cannot lock ref 'HEAD': Unable to create '.../refs/heads/hp-x.lock': Read-only file system`, commit exit 128. |
+| Reftable backend | **No per-ref scope.** Every update writes a new table and rewrites `reftable/tables.list` for all refs. |
+| `GIT_OBJECT_DIRECTORY` = quarantine + `GIT_ALTERNATE_OBJECT_DIRECTORIES` = shared (receive-pack style), objects read-only | Solves objects only. The variables apply to every repository the worker's Git touches (a clone in `/tmp` would land in the quarantine), the worker controls its environment, `result submit` reads candidate loose files under `<common>/objects` and would not find them, and refs remain shared. |
+| **Overlay on the Git common directory** (chosen) | One mount per repository: lower layer the shared common directory (read-only by construction), upper layer a per-attempt quarantine. Git in the worker reads everything and every write (loose objects, packs, refs, packed-refs, reflogs, `config`, `config.worktree`, `hooks/`, the worktree's index and `HEAD`) is a private copy-up. |
+
+Scratch evidence for the overlay (unprivileged user and mount namespace,
+`userxattr`, lower opened by descriptor, as the sandbox does it):
+
+```
+== inside the worker's namespace
+git commit                     -> ok (new objects in upper/objects/xx)
+git branch -f other HEAD       -> moved-other      (upper/refs/heads/other)
+git pack-refs --all            -> packed           (upper/packed-refs; loose refs become whiteouts, c 0,0)
+git stash                      -> stashed
+git config core.hooksPath /evil-> configwritten    (upper/config)
+git gc                         -> gc-ok            (upper/objects/pack, loose objects whited out)
+== host
+refs/heads: att master other   (unchanged), git log --all: base only
+git fsck                       -> ok; grep -c evil .git/config -> 0
+```
+
+### Mechanism
+
+- **Location.** `<project>/.git-quarantine/<attempt>/repo-NN`
+  (`worker_supervision::git_quarantine`): the worktree's path below
+  `.state/worktrees`, beside `.state` in the project directory, which is
+  read-only to every worker (it is outside `.state`), so no worker, including
+  this one, can write it except through its own overlay.
+- **Sandbox step** (new, between the private scratch directories and the
+  read-only plan): for each worktree, `mkdir -m 0700` the quarantine and its
+  `upper/`, `work/` (an existing quarantine refuses the launch, exit 125),
+  open the common directory and the quarantine on fds 3/4 and
+  `mount -t overlay -o lowerdir=/proc/self/fd/3,upperdir=/proc/self/fd/4/upper,workdir=/proc/self/fd/4/work,userxattr,index=off,metacopy=off,redirect_dir=off herdr-projects-git <common>`.
+  Descriptors avoid any option escaping of repository paths. The plan then
+  binds `<common>` writable (`rw:`) on top of the read-only anchor that
+  contains it (the repository or an owner home), exactly like the other
+  writable exposures; the per-path Git entries of the write-isolation card
+  (`objects`, `refs/heads`, `logs/refs/heads`, `reftable`, `worktrees/<id>`,
+  their read-only sub-paths) are gone. The worker (nested user namespace) can
+  neither unmount nor remount the overlay.
+- **What the worker sees.** Its commits land on its branch as usual, and
+  `result submit` inside the sandbox reads the candidate's loose objects
+  through the overlay unchanged. Moving `master`, another attempt's branch or
+  the integration target, overwriting an existing loose object, writing
+  `config`, `hooks/`, `info/exclude`, `packed-refs` or `config.worktree` all
+  succeed *in its view only*.
+- **Import** (`src/git_quarantine.rs`), through the supervised, bounded Git
+  runner (`worktree_preparation::Git`, 20 s per command inside the caller's
+  deadline, local transports only: `protocol.allow=never`,
+  `protocol.file.allow=always`), under an exclusive `import.lock` in the
+  quarantine:
+  1. target: the branch tip as the worker left it (`upper/refs/heads/<branch>`,
+     else its line in a rewritten `upper/packed-refs`; absent means unchanged;
+     `upper/reftable` refuses), or a verified candidate commit;
+  2. copy regular loose objects (names checked) and `*.pack` files from
+     `upper/objects` into a private bare repository `copied` (alternate: the
+     shared store), with `O_NOFOLLOW|O_NONBLOCK`, never a link, FIFO, device
+     or whiteout, at most 100 000 files and 1 GiB; each copied pack is indexed
+     afresh (the worker's `.idx` is ignored);
+  3. `git fetch` the commit from `copied` into a second private repository
+     `verified` with `fetch.fsckObjects=true` and `fetch.fsck.hasDotgit=error`:
+     the receiver names each object by the hash of its content, runs fsck and
+     checks connectivity against `verified` plus the shared store;
+  4. require the commit to descend from the attempt's approved base;
+  5. only then fetch it from `verified` into the shared repository
+     (`fetch.unpackLimit=1000000`: loose objects, the layout a direct commit
+     had; Git never overwrites an object it has) and, for the branch,
+     `update-ref <branch> <tip> <current>` only if `<current>` is an ancestor
+     of the tip (fast-forward compare-and-swap of the attempt's own branch).
+  Objects the commit does not reach (a stash, an amended commit, a blob staged
+  and re-staged, anything planted) are never imported; they stay in the
+  quarantine. A content failure is a `refused` verdict and changes nothing
+  shared; deadline, lock or I/O failures are errors and are retried.
+- **When.** (a) After proven worker termination, before repository
+  preservation (`preserve_terminated_repositories`, both the started and the
+  staged-release paths): the branch tip is imported and the verdict written to
+  `<quarantine>/import.json` (`{"state":"imported","commit":...}`,
+  `"unchanged"` or `{"state":"refused","reason":...}`); the overlay's `work/`
+  directory is removed. A refusal does not block termination. (b) Before a
+  new integration (operator `result integrate` or the automatic job), if the
+  shared repository lacks the verified candidate: the candidate commit (not
+  the branch) is imported from its attempt's quarantine (found through the
+  submission's attempt and its retained `runtime.worktrees_ready` receipts),
+  so integrating while the worker still runs works; a refusal fails the
+  integration before any build. Verification is unchanged: it materializes the
+  submission's retained objects, never the repository.
+- **`config.worktree`.** The product does not use it. The worker's
+  `worktrees/<id>/` is inside the overlay, so the real file is never written
+  and the controller's Git in the worktree never reads a worker-written one.
+- **Identity impact.** As before, only the supervisor argv (the per-launch
+  `command_digest`) changes; `LaunchInputs`, `FrozenProfile`, approval
+  digests and IDs are unchanged. A launch created by the previous binary and
+  released by this one fails closed at gate release (argv mismatch).
+- **Needs** Linux 5.11+ (unprivileged overlayfs with `userxattr`) and a
+  project filesystem with user extended attributes (ext4, btrfs, xfs; tmpfs
+  from 6.6). Otherwise the sandbox exits 125 before the agent runs.
+
+### Evidence
+
+- `an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_commits_and_submits`
+  (`tests/canonical_worker.rs`, full ticker path) now also: the owner creates
+  `hp-other` (another attempt's branch), `integration` and a loose object
+  `owner object`; the probe commits `work.txt`, writes a stray object it never
+  commits, moves `master`, `hp-other` and `integration` to its commit with
+  `git update-ref`, and appends to the owner's loose object, `config`,
+  `hooks/pre-commit`, `info/exclude`, `packed-refs` and its
+  `worktrees/repo-00/config.worktree`. Every write succeeds in its view; on the
+  host every branch still points at the base, the files are byte-identical,
+  no `config.worktree` exists, and neither the commit nor the stray object is
+  in the shared store. `result submit` inside the sandbox records the
+  submission; `result verify` accepts it; with the worker still running,
+  `result integrate` imports the candidate and integrates it (`integration^2`
+  is the worker's commit) while the attempt branch stays at the base. After
+  cancellation and proven termination `import.json` reads
+  `{"state":"imported","commit":<candidate>}`, the attempt branch (and only
+  it) points at the candidate, `integration` at the merge, `master` and
+  `hp-other` at the base, the stray object is absent and
+  `git fsck --strict` passes.
+- `a_worker_branch_reaching_a_corrupt_quarantined_object_is_refused`: the
+  agent commits, then replaces its committed blob's loose file with another
+  valid object's bytes. After termination `import.json` is
+  `refused` ("objects reachable from <head> fail re-hashing, fsck or
+  connectivity"), the attempt branch is at the base, neither the commit nor
+  the blob is in the shared store and `git fsck --strict` passes.
+- Scratch runs of the verification step (`copied` → `verified`):
+
+  ```
+  [clean]        fetch=0
+  [swapped-blob] fatal: did not receive expected object 1279...; fatal: index-pack failed   fetch=128
+  [garbage]      remote: aborting due to possible repository corruption on the remote side  fetch=128
+  [missing]      remote: aborting due to possible repository corruption on the remote side  fetch=128
+  ```
+
 ## Designed, not built
 
 ### Coordinator and legacy thread agents (residual risk 7)
@@ -560,21 +709,19 @@ Status after the follow-up card in brackets.
    `packed-refs`, `objects/info/alternates` and `objects/pack`, the worktree's
    `.git` pointer and `commondir`/`gitdir`/`locked`, and a private `/tmp`,
    `/var/tmp`, `/dev/shm`. Remaining:
-   (a) *shared refs*: `refs/heads/` must be writable for the branch update, so
-   a worker can move or create any local branch of the source repository
-   (e.g. point `main` at its own commit); the owner's next checkout/build of
-   that branch runs worker-chosen code. (b) *loose objects*: `objects/xx/`
-   must be writable, so a worker can replace an existing loose object's file
-   with different bytes (Git does not re-hash on every read). Design for (a)
-   and (b): commit into a quarantine object directory
-   (`GIT_OBJECT_DIRECTORY` + read-only alternates, like receive-pack
-   quarantine) and a per-attempt ref namespace, with the ticker migrating
-   verified objects (`index-pack`/re-hash) and moving only the attempt branch
-   after the worker ends; this changes where commits become visible and is a
-   separate card. (c) If the owner enabled `extensions.worktreeConfig`, the
-   worker can write `worktrees/<id>/config.worktree`, which applies to Git run
-   inside its worktree (the product's own Git runs override `core.fsmonitor`
-   and `core.hooksPath`, not every exec-capable key). (d) Owner-writable
+   (a) **[Closed by the Git quarantine card]** *shared refs*: `refs/heads/`
+   had to be writable for the branch update, so a worker could move or create
+   any local branch of the source repository (e.g. point `main` at its own
+   commit). Now every ref write lands in its quarantine; only its own branch is
+   imported, by fast-forward CAS, after verification.
+   (b) **[Closed by the Git quarantine card]** *loose objects*: `objects/xx/`
+   had to be writable, so a worker could replace an existing loose object's
+   file. Now the shared object store is the overlay's read-only lower layer;
+   imported objects are re-hashed and fsck-checked and Git never overwrites an
+   object it has.
+   (c) **[Closed by the Git quarantine card]** `worktrees/<id>/config.worktree`
+   (with `extensions.worktreeConfig`) is written, if at all, in the quarantine
+   only; the controller's Git never reads it. (d) Owner-writable
    locations outside HOME and the scratch directories (e.g. removable media
    under `/run/media/<user>`, owner-owned directories elsewhere) are not in
    the plan. Original text: hiding stops reads, not writes. With the owner's
@@ -625,6 +772,35 @@ Status after the follow-up card in brackets.
 9. **[Open] Owner homes are anchors.** Hiding uses the passwd home and the
    controller's `HOME`; a secret under a third home-like path needs
    `[worker_isolation]`.
+10. **[Open; Git quarantine card] Where commits become visible.** A worker's
+    commits reach the shared repository only when it ends or when its
+    verified candidate is integrated. The owner, a reviewer worker or any
+    host-side reader of the repository does not see them earlier (a review
+    opened on a still-running author's candidate cannot read it from the
+    repository). The submission spool card's host-side ingest reads loose
+    objects from the shared repository: it must import the candidate first
+    (`git_quarantine::import_commit`, the same call integration makes) or read
+    the quarantine; until then the in-sandbox `result submit` reads them
+    through the overlay.
+11. **[Open; Git quarantine card] What is not carried over.** Only the
+    attempt branch's closure is imported. The worker's index, other branches,
+    stash, reflogs and uncommitted Git state stay in the quarantine, so
+    termination preservation records the host's (creation-time) index with the
+    imported branch and the working files. An import is refused, and the
+    branch left at its previous tip, when the tip does not descend from the
+    attempt's base, when the branch moved outside the worker (e.g. a
+    controller `result capture` commit it does not extend), when the
+    quarantine uses the reftable backend, or when it exceeds 100 000 files or
+    1 GiB. The verdict is recorded only in `<quarantine>/import.json`, not in
+    the store or the termination receipt.
+12. **[Open; Git quarantine card] Quarantine lifetime and size.** Quarantines
+    are never removed by the product (like the attempt worktrees); a worker
+    that runs `git gc` copies the whole repository's objects into its upper
+    layer. A deterministic failure of the final fetch into the shared
+    repository (e.g. a full disk) makes
+    termination retry instead of completing. Another mount of the same
+    repository outside the read-only anchors (write-isolation residual 2(d))
+    would bypass the overlay.
 
 ## Tests run
 
@@ -681,4 +857,16 @@ Host under heavy unrelated load throughout (load average 15–22 on 12 cores).
   (was `..._preserves_an_empty_directory`) to the pre-created output
   directory contract.
 - Default features, `--test cli --bin herdr-projects`: 30 and 284 pass.
+- No new clippy warnings in changed files.
+
+### Tests run (Git quarantine card)
+
+- `cargo test --features state-store --test canonical_worker --test cli
+  --test factory_harness --test scheduling --test recovery --test ticker_jobs
+  --bin herdr-projects --lib --no-fail-fast`: all pass (lib 612, bin 365,
+  canonical_worker 19, cli 81, factory_harness 16, recovery 5, scheduling 7,
+  ticker_jobs 8). `canonical_worker` passed again on a second run
+  (the extended isolation test takes about a minute: operator verification
+  and integration against the running ticker, then termination).
+- Default features, `--test cli --bin herdr-projects`: pass (30, 284).
 - No new clippy warnings in changed files.

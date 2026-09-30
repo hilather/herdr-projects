@@ -189,6 +189,9 @@ pub struct Isolation {
     /// Private tmpfs directories and, for each, the needed entries in it that
     /// are bound back (in [`PRIVATE_DIRS`] order).
     private: Vec<(String, Vec<String>)>,
+    /// Git quarantines: (quarantine directory, Git common directory) of each
+    /// attempt worktree; the common directory is overlaid (see [`SANDBOX`]).
+    git: Vec<(String, String)>,
     /// Read-only anchors (`false`) and writable exposures (`true`), parents
     /// first: each later entry is mounted on top of the earlier ones.
     plan: Vec<(String, bool)>,
@@ -211,16 +214,24 @@ pub const SUBMISSION_SPOOL_ENV: &str = "HERDR_PROJECTS_SUBMISSION_SPOOL";
 /// files the owner later uses. Needed paths inside are bound back.
 const PRIVATE_DIRS: &[&str] = &["/tmp", "/var/tmp", "/dev/shm"];
 
-/// The paths of a repository's Git common directory that a commit on a linked
-/// worktree's branch writes: new loose objects, the branch ref (`refs/heads`,
-/// or the `reftable` stack) and its reflog. Everything else in the common
-/// directory (`config`, `hooks/`, `info/`, `packed-refs`, other refs) stays
-/// read-only, as do `objects/pack` and `objects/info` (alternates) inside.
-const GIT_WRITABLE: &[&str] = &["objects", "refs/heads", "logs/refs/heads", "reftable"];
-const GIT_READ_ONLY: &[&str] = &["objects/pack", "objects/info"];
-/// Files of the worktree's own Git directory that tie it to the repository
-/// and its creation lock; the rest (index, HEAD, per-worktree logs) is written.
-const WORKTREE_READ_ONLY: &[&str] = &["commondir", "gitdir", "locked"];
+/// Directory, beside the project's `.state`, that holds each attempt
+/// worktree's Git quarantine (see [`git_quarantine`]).
+pub const GIT_QUARANTINE_DIR: &str = ".git-quarantine";
+
+/// The Git quarantine of one attempt worktree: `<project>/.git-quarantine/`
+/// followed by the worktree's path below `<project>/.state/worktrees`. The
+/// sandbox creates it and mounts `upper/` (with `work/`) as the writable layer
+/// of an overlay over the repository's Git common directory, so every Git
+/// write of the worker (objects, refs, config, index, hooks) lands there and
+/// none reaches the shared directory. The worker cannot write the directory
+/// itself (the project outside `.state` is read-only to it); the controller
+/// imports only verified objects reachable from the attempt's own branch.
+pub fn git_quarantine(project: &Path, worktree: &Path) -> Option<std::path::PathBuf> {
+    let relative = worktree.strip_prefix(project.join(".state/worktrees")).ok()?;
+    (relative.components().count() > 0
+        && relative.components().all(|c| matches!(c, std::path::Component::Normal(_))))
+    .then(|| project.join(GIT_QUARANTINE_DIR).join(relative))
+}
 
 /// Owner-home entries hidden from every isolated agent: signing and SSH keys,
 /// the owner's own agent credentials, the product configuration (owner policy
@@ -252,14 +263,23 @@ const OWNER_SECRETS: &[&str] = &[
 /// 2. replaces each private scratch directory (`/tmp`, `/var/tmp`, `/dev/shm`)
 ///    with an empty tmpfs, recursively binding back only the needed entries
 ///    (opened before the cover); a missing or symlinked directory is skipped;
-/// 3. walks the read-only/writable plan, parents first: a read-only anchor
-///    (owner homes, source repositories and their Git common directories, the
-///    own project) is bound onto itself recursively read-only (`ro=recursive`,
-///    applied by libmount with mount_setattr), a writable exposure (execution
-///    home, its own worktrees, the Git paths a worktree commit writes, and the
-///    attempt's submission spool and output directory under the otherwise
-///    read-only project `.state`) is bound onto itself on top, writable;
-/// 4. mounts an empty read-only tmpfs over every hidden directory and
+/// 3. for each attempt worktree, creates its fresh Git quarantine (refusing an
+///    existing one) and mounts an overlay on the repository's Git common
+///    directory: the shared directory (by descriptor) is the read-only lower
+///    layer and the quarantine's `upper/` the writable one (`userxattr`, as
+///    the user namespace requires). Git in the worker then reads everything
+///    and writes only the quarantine: new objects, refs (including its own
+///    branch), config, `config.worktree`, index and hooks. No shared file,
+///    loose object or ref can change, and a file the worker "modifies" is a
+///    private copy;
+/// 4. walks the read-only/writable plan, parents first: a read-only anchor
+///    (owner homes, source repositories, the own project) is bound onto
+///    itself recursively read-only (`ro=recursive`, applied by libmount with
+///    mount_setattr), a writable exposure (execution home, its own worktrees,
+///    the overlaid Git common directories, and the attempt's submission spool
+///    and output directory under the otherwise read-only project `.state`) is
+///    bound onto itself on top, writable;
+/// 5. mounts an empty read-only tmpfs over every hidden directory and
 ///    `/dev/null` over every hidden file, then over the owner's SSH agent and
 ///    tmux socket directories in `/tmp` (enumerated at setup, so the argv
 ///    stays fixed; a directory the owner does not own is left alone).
@@ -290,6 +310,11 @@ const SANDBOX: &str = concat!(
     r#"/usr/bin/mkdir -- "$p" && /usr/bin/mount -c --rbind "/proc/self/fd/$n" "$p" || fail "$p"; "#,
     r#"else : > "$p" && /usr/bin/mount -c --bind "/proc/self/fd/$n" "$p" || fail "$p"; fi; "#,
     r#"eval "exec $n<&-"; n=$((n+1));; esac; done; fi;; esac; done; "#,
+    r#"for a in "$@"; do case $a in --) break;; quarantine:*) q=${a#quarantine:};; overlay:*) c=${a#overlay:}; "#,
+    r#"{ /usr/bin/mkdir -p -m 0700 -- "${q%/*}" && /usr/bin/mkdir -m 0700 -- "$q" "$q/upper" "$q/work"; } || fail "$q"; "#,
+    r#"{ exec 3<"$c" 4<"$q"; } || fail "$c"; /usr/bin/mount -t overlay -o "#,
+    r#"lowerdir=/proc/self/fd/3,upperdir=/proc/self/fd/4/upper,workdir=/proc/self/fd/4/work,userxattr,index=off,metacopy=off,redirect_dir=off "#,
+    r#"herdr-projects-git "$c" || fail "$c"; exec 3<&- 4<&-;; esac; done; "#,
     r#"for a in "$@"; do case $a in --) break;; "#,
     r#"ro:*) p=${a#ro:}; if [ -e "$p" ]; then /usr/bin/mount --rbind -o ro=recursive "$p" "$p" || fail "$p"; fi;; "#,
     r#"rw:*) p=${a#rw:}; if [ -e "$p" ]; then /usr/bin/mount --rbind -o rw "$p" "$p" || fail "$p"; fi;; "#,
@@ -374,10 +399,10 @@ impl Isolation {
     /// paths from it (absolute, or `~/` relative to each owner home).
     /// `worktrees` are the retained (worktree, Git directory, common directory)
     /// triples of the attempt's linked worktrees: the worktree is writable
-    /// except its `.git` pointer, and of the Git directories only the paths a
-    /// commit on its branch writes. The owner homes, `repositories` and their
-    /// common directories are otherwise read-only, as is `project` with its
-    /// whole `.state` (store, locks, objects, other attempts' worktrees and
+    /// except its `.git` pointer, and each common directory is overlaid by the
+    /// worktree's Git quarantine, so Git writes reach only the quarantine. The
+    /// owner homes and `repositories` are otherwise read-only, as is `project`
+    /// with its whole `.state` (store, locks, objects, other attempts' worktrees and
     /// outputs; [`Self::with_submission_spool`] adds the attempt's own spool
     /// and output directory); `home` stays writable. Refuses, before any effect, when a
     /// hidden path would contain or cover a path the agent needs.
@@ -511,13 +536,19 @@ impl Isolation {
         // The whole project, `.state` included, is read-only: the store is
         // written only by the ticker, which ingests the submission spool.
         plan.push((project.clone(), false));
-        for (worktree, directory, common) in &git {
-            plan.extend([(worktree.clone(), true), (format!("{worktree}/.git"), false)]);
-            plan.push((common.clone(), false));
-            plan.extend(GIT_WRITABLE.iter().map(|p| (format!("{common}/{p}"), true)));
-            plan.extend(GIT_READ_ONLY.iter().map(|p| (format!("{common}/{p}"), false)));
-            plan.push((directory.clone(), true));
-            plan.extend(WORKTREE_READ_ONLY.iter().map(|p| (format!("{directory}/{p}"), false)));
+        let mut quarantines = Vec::new();
+        for (worktree, _, common) in &git {
+            // The overlay on the common directory is bound writable on top of
+            // any read-only anchor that contains it; its worktree's `.git`
+            // pointer stays read-only.
+            plan.extend([(worktree.clone(), true), (format!("{worktree}/.git"), false), (common.clone(), true)]);
+            let quarantine = git_quarantine(Path::new(&project), Path::new(worktree))
+                .ok_or_else(|| anyhow::anyhow!("worktree {worktree} has no Git quarantine"))?;
+            ensure!(
+                !quarantines.iter().any(|(_, c)| c == common),
+                "two attempt worktrees share the Git common directory {common}"
+            );
+            quarantines.push((normal(&quarantine)?, common.clone()));
         }
         plan.extend([(home.clone(), true), (format!("{root}/.execution.lock"), true)]);
         // Parents first; an exposure the agent needs wins over an equal anchor.
@@ -555,7 +586,7 @@ impl Isolation {
             ensure!(keep.len() <= 7, "too many agent paths directly under {dir}");
             private.push(((*dir).to_owned(), keep));
         }
-        Ok(Self { root, expose, private, plan, hide, project, spool: None })
+        Ok(Self { root, expose, private, git: quarantines, plan, hide, project, spool: None })
     }
 
     /// Give a canonical attempt its two writable places under the read-only
@@ -589,6 +620,9 @@ impl Isolation {
         for (dir, keep) in &self.private {
             args.extend(keep.iter().map(|p| format!("keep:{p}")));
             args.push(format!("private:{dir}"));
+        }
+        for (quarantine, common) in &self.git {
+            args.extend([format!("quarantine:{quarantine}"), format!("overlay:{common}")]);
         }
         args.extend(self.plan.iter().map(|(p, writable)| format!("{}:{p}", if *writable { "rw" } else { "ro" })));
         args.extend(self.hide.iter().map(|p| format!("hide:{p}")));

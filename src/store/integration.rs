@@ -338,6 +338,26 @@ impl SqliteStore {
         })
     }
 
+    /// The project directory and the retained worktree receipts of the
+    /// attempt that submitted `result_id` (empty when it had no worktrees):
+    /// where its Git quarantine lies.
+    pub(crate) fn verified_result_worktrees(&mut self, result_id: &str) -> Result<(std::path::PathBuf, Vec<crate::domain::WorktreeReceipt>)> {
+        let store = project_store(&self.connection)?;
+        let project = std::path::Path::new(&store).parent().and_then(std::path::Path::parent)
+            .ok_or_else(|| invalid("store path missing"))?.to_path_buf();
+        let payload: Option<String> = self.connection.query_row(
+            "SELECT e.payload FROM verified_results r JOIN result_submissions s ON s.submission_id=r.submission_id
+             JOIN attempt_inputs i ON i.attempt_id=s.attempt_id
+             JOIN events e ON e.entity=i.operation_id AND e.kind='runtime.worktrees_ready'
+             WHERE r.result_id=?1 ORDER BY e.sequence LIMIT 1",
+            [result_id], |row| row.get(0)).optional()?;
+        let receipts = match payload {
+            Some(payload) => serde_json::from_str(&payload).map_err(|_| StoreError::Corrupt("invalid worktree receipts".into()))?,
+            None => vec![],
+        };
+        Ok((project, receipts))
+    }
+
     /// One lease operation per ref generation. The caller claims it before git runs.
     pub(crate) fn begin_integration(&mut self, begin: &IntegrationBegin) -> Result<String> {
         if !valid_ref_name(&begin.ref_name) {

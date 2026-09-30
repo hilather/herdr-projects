@@ -1072,12 +1072,35 @@ fn main() {
     }
     let (_, nested) = run("/usr/bin/unshare", &["--user", "--map-root-user", "--mount", "/bin/sh", "-c", NESTED]);
     report += &format!("nested {nested}\n");
-    fs::write("work.txt", "worker change\n").unwrap();
     let git = |args: &[&str]| run("/usr/bin/git", &[&["-c", "user.name=worker", "-c", "user.email=worker@example.invalid"], args].concat());
+    let line = |args: &[&str]| git(args).1.trim_end_matches('|').to_owned();
+    fs::write("stray.txt", "unreachable worker object\n").unwrap();
+    report += &format!("stray {}\n", line(&["hash-object", "-w", "stray.txt"]));
+    fs::remove_file("stray.txt").unwrap();
+    fs::write("work.txt", "worker change\n").unwrap();
     let (added, _) = git(&["add", "work.txt"]);
     let (committed, output) = git(&["commit", "-qm", "worker change"]);
-    let (_, head) = git(&["rev-parse", "HEAD"]);
-    report += &format!("commit {} {}\nhead {}\n", added && committed, output, head.trim_end_matches('|'));
+    let head = line(&["rev-parse", "HEAD"]);
+    report += &format!("commit {} {}\nhead {head}\n", added && committed, output);
+    for branch in ["master", "hp-other", "integration"] {
+        report += &format!("move {branch} {}\n", git(&["update-ref", &format!("refs/heads/{branch}"), &head]).0);
+    }
+    report += &format!("objects {}\n", line(&["rev-list", "--objects", &head]).split('|').map(|l| l.split(' ').next().unwrap()).collect::<Vec<_>>().join(","));
+    // Git writes outside its own branch, valid for Git: they may succeed in
+    // the worker's quarantined view but must never reach the shared
+    // repository. The owner's loose object holds `owner object`.
+    let common = line(&["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    fs::write("owner.txt", "owner object\n").unwrap();
+    let owned = line(&["hash-object", "owner.txt"]);
+    fs::remove_file("owner.txt").unwrap();
+    let base = line(&["rev-parse", "HEAD~"]);
+    let wt_config = format!("{}/config.worktree", line(&["rev-parse", "--absolute-git-dir"]));
+    for (target, text) in [(format!("{common}/objects/{}/{}", &owned[..2], &owned[2..]), "WORKER-WROTE\n".to_owned()), (wt_config, "[core]\n\tfsmonitor = /bin/false\n".into()),
+        (format!("{common}/config"), "[core]\n\thooksPath = /tmp\n".into()), (format!("{common}/hooks/pre-commit"), "exit 0\n".into()),
+        (format!("{common}/info/exclude"), "work.txt\n".into()), (format!("{common}/packed-refs"), format!("{base} refs/heads/worker-planted\n"))] {
+        let written = fs::OpenOptions::new().create(true).append(true).open(&target).and_then(|mut file| std::io::Write::write_all(&mut file, text.as_bytes()));
+        report += &format!("gitwrite {target} {}\n", match written { Ok(()) => "OK".into(), Err(error) => format!("ERR:{:?}", error.kind()) });
+    }
     publish("probe-1.txt", &report);
     while !Path::new("submit.json").exists() { std::thread::sleep(Duration::from_millis(50)); }
     let mut last = (false, String::new());
@@ -1098,6 +1121,10 @@ impl Lab {
         let root = self.path("root").canonicalize().unwrap();
         let source = format!("{PROBE_AGENT}\nconst WRITES: &[&str] = &[{}];\nconst TMP_WRITE: &str = {:?};\nconst SECRETS: &[&str] = &[{}];\nconst HIDDEN: &[&str] = &[{}];\nconst ROOT: &str = {:?};\nconst OWN: &str = {:?};\nconst SOCKET: &str = {:?};\nconst BIN: &str = {BIN:?};\nconst NESTED: &str = {nested:?};\n",
             quoted(writes), tmp.to_str().unwrap(), quoted(secrets), quoted(hidden), root.to_str().unwrap(), self.project.canonicalize().unwrap().join(".state").to_str().unwrap(), self.socket().to_str().unwrap());
+        self.build_agent(&source);
+    }
+    /// Replace the lab agent with the Rust program `source`.
+    fn build_agent(&self, source: &str) {
         let (agent, file) = (self.path("bin/claude"), self.path("bin/probe.rs"));
         fs::write(&file, source).unwrap();
         let built = Command::new("rustc").args(["--edition", "2021", "-o"]).arg(&agent).arg(&file).output().unwrap();
@@ -1105,23 +1132,42 @@ impl Lab {
         fs::set_permissions(&agent, fs::Permissions::from_mode(0o700)).unwrap();
     }
     /// Install an owner-signed contract for the queued task `work` whose one
-    /// output is `work.txt`; returns (contract digest, base commit).
-    fn install_work_contract(&self) -> (String, String) {
+    /// output is `work.txt`, routed `route`; returns (contract digest, base commit).
+    fn install_work_contract(&self, route: &str) -> (String, String) {
         let base = self.git(&["rev-parse", "HEAD"]);
         let store = self.project.join(".state/state.db").canonicalize().unwrap().display().to_string();
         let mut document = serde_json::to_vec_pretty(&json!({
             "version": 3, "outputs": [{"path": "work.txt", "kind": "git_file"}], "scope": {"paths": [{"path": "work.txt", "access": "write"}]},
             "project_store": store, "expected_head": self.head(), "task_id": "work", "contract_revision": 1, "deliverable": "work", "non_goals": "none",
-            "acceptance_policies": [{"id": "clean", "text": r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#}],
+            "acceptance_policies": [{"id": "clean", "text": WORK_POLICY}],
             "repository": self.repo.canonicalize().unwrap().display().to_string(), "base_oid": base,
             "object_format": "sha256", "dependencies": [], "capability_flags": [], "profile_kind": "claude", "retry_class": "none", "result_schema_id": "result-v1",
-            "route": "verify_only", "authority": authority::policy_reference(&self.project).unwrap()})).unwrap();
+            "route": route, "authority": authority::policy_reference(&self.project).unwrap()})).unwrap();
         document.push(b'\n');
         let contract = self.path("work-contract.json");
         fs::write(&contract, &document).unwrap();
         assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y", "sign", "-f"]).arg(&self.key).args(["-n", authority::CONTRACT_SIGNATURE_NAMESPACE]).arg(&contract).output().unwrap().status.success());
         let installed = self.ok(&["task", "demo", "contract", "put", "--input-file", contract.to_str().unwrap(), "--signature", self.path("work-contract.json.sig").to_str().unwrap()]);
         (installed["digest"].as_str().unwrap().to_owned(), base)
+    }
+}
+
+/// The `work` contract's one acceptance policy.
+const WORK_POLICY: &str = r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#;
+
+impl Lab {
+    /// Whether `git args` succeeds in the lab repository.
+    fn git_ok(&self, args: &[&str]) -> bool {
+        Command::new("/usr/bin/git").env_clear().env("PATH", "/usr/bin:/bin").env("HOME", self.home.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null").current_dir(&self.repo).args(args)
+            .output().unwrap().status.success()
+    }
+    /// The attempt branch `launch draft` planned for `attempt`.
+    fn attempt_branch(attempt: &AttemptId) -> String { format!("hp-{}", attempt.as_str().strip_prefix("attempt-").unwrap()) }
+    /// Where the sandbox keeps the Git quarantine of `worktree`.
+    fn quarantine(&self, worktree: &std::path::Path) -> PathBuf {
+        let project = self.project.canonicalize().unwrap();
+        project.join(".git-quarantine").join(worktree.strip_prefix(project.join(".state/worktrees")).unwrap())
     }
 }
 
@@ -1142,6 +1188,15 @@ fn plant(path: &std::path::Path, text: &str) {
 /// directly or from a namespace of its own. Its own execution home, worktree
 /// commit and `result submit` into its own project (through its submission
 /// spool: the project store is read-only to it) still work.
+///
+/// Git quarantine: the worker's Git writes (loose objects, refs, config,
+/// `config.worktree`, hooks) land in its per-attempt quarantine, never in the
+/// shared repository: moving `master`, another attempt's branch or the
+/// integration target, and overwriting an existing loose object, change
+/// nothing there, and its commit stays invisible to the owner until imported.
+/// The verified candidate is imported (re-hashed, fsck-checked) for
+/// integration while the worker runs, and its branch after it ends; an
+/// object the branch does not reach is never imported.
 #[test]
 fn an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_commits_and_submits() {
     let mut lab = Lab::new("unknown_usage='allow_with_warning'\n[worker_isolation]\nhide=['~/owner']");
@@ -1171,9 +1226,19 @@ fn an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_com
     let repo_git = lab.repo.canonicalize().unwrap().join(".git");
     fs::write(home.join(".bashrc"), "OWNER-BASHRC\n").unwrap();
     for dir in [".local/bin", ".config/systemd/user"] { fs::create_dir_all(home.join(dir)).unwrap(); }
-    let writes = [home.join(".bashrc"), home.join(".local/bin/x"), home.join(".config/systemd/user/x.service"), repo_git.join("hooks/pre-commit"),
-        repo_git.join("config"), repo_git.join("info/exclude"), repo_git.join("packed-refs"), lab.repo.canonicalize().unwrap().join("README")];
-    let owner_files = || writes.iter().map(|p| fs::read(p).ok()).collect::<Vec<_>>();
+    let writes = [home.join(".bashrc"), home.join(".local/bin/x"), home.join(".config/systemd/user/x.service"), lab.repo.canonicalize().unwrap().join("README")];
+    // Shared Git files the worker writes through its quarantined view; the
+    // base commit is a loose object, `hp-other` stands for another attempt's
+    // branch and `integration` is the integration target.
+    let base_commit = lab.git(&["rev-parse", "HEAD"]);
+    lab.git(&["branch", "hp-other"]);
+    lab.git(&["branch", "integration"]);
+    fs::write(lab.repo.join("owner.txt"), "owner object\n").unwrap();
+    let owned = lab.git(&["hash-object", "-w", "owner.txt"]);
+    fs::remove_file(lab.repo.join("owner.txt")).unwrap();
+    let git_files = [repo_git.join("hooks/pre-commit"), repo_git.join("config"), repo_git.join("info/exclude"), repo_git.join("packed-refs"),
+        repo_git.join(format!("objects/{}/{}", &owned[..2], &owned[2..]))];
+    let owner_files = || writes.iter().chain(&git_files).map(|p| fs::read(p).ok()).collect::<Vec<_>>();
     let before = owner_files();
     // The worker's /tmp is private: a host file there is invisible and a file
     // the worker writes there never reaches the host.
@@ -1190,7 +1255,7 @@ fn an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_com
     // pointer (relative to the worker's working directory, its worktree).
     let project_writes = [lab.project.canonicalize().unwrap().join("PROJECT.md"), PathBuf::from(".git")];
     lab.write_probe_agent(&reads, &[&writes[..], &project_writes[..]].concat(), &worker_tmp, &hidden, &nested);
-    let (contract, base) = lab.install_work_contract();
+    let (contract, base) = lab.install_work_contract("verify_then_integrate");
     let (_, attempt) = lab.reserve("Retained instructions");
     let worktree = lab.planned_worktree(&attempt);
     lab.serve();
@@ -1235,15 +1300,28 @@ fn an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_com
         assert!(report.contains(&format!("mount {} ERR1\n", dir.display())), "{}:\n{report}", dir.display());
     }
     assert!(report.contains("nested-done"), "{report}");
-    // Normal work: a commit on the attempt branch in the shared object store.
+    // Normal work: a commit on the attempt branch, in the worker's quarantine.
     let candidate = report.lines().find_map(|l| l.strip_prefix("head ")).unwrap().to_owned();
+    let stray = report.lines().find_map(|l| l.strip_prefix("stray ")).unwrap().to_owned();
     assert!(report.contains("commit true"), "{report}");
     assert_eq!(fs::read_to_string(worktree.join("work.txt")).unwrap(), "worker change\n");
-    assert_eq!(lab.git(&["cat-file", "-p", &format!("{candidate}:work.txt")]), "worker change");
-    // ... and `result submit` from inside the sandbox records a submission
-    // (the ticker ingests it from the attempt's spool).
-    let objects: Vec<Value> = lab.git(&["rev-list", "--objects", "--all"]).lines()
-        .map(|line| { let oid = line.split_whitespace().next().unwrap(); json!({"oid": oid, "relative_path": format!("{}/{}", &oid[..2], &oid[2..])}) }).collect();
+    // Every other Git write stayed in the quarantine: the shared files, the
+    // loose base object and every other branch are unchanged, no
+    // `config.worktree` appeared, and the commit is not shared yet.
+    let branch = Lab::attempt_branch(&attempt);
+    let refs = || ["master", "hp-other", "integration", branch.as_str()].map(|b| lab.git(&["rev-parse", &format!("refs/heads/{b}")]));
+    for moved in ["master", "hp-other", "integration"] { assert!(report.contains(&format!("move {moved} true")), "{report}"); }
+    for path in &git_files { assert!(report.contains(&format!("gitwrite {} OK", path.display())), "{report}"); }
+    assert_eq!(refs(), [base_commit.clone(), base_commit.clone(), base_commit.clone(), base_commit.clone()]);
+    let worktree_config = repo_git.join("worktrees").join(worktree.file_name().unwrap()).join("config.worktree");
+    assert!(report.contains(&format!("gitwrite {} OK", worktree_config.display())) && !worktree_config.exists(), "{report}");
+    assert_eq!(owner_files(), before);
+    assert!(!lab.git_ok(&["cat-file", "-e", &candidate]) && !lab.git_ok(&["cat-file", "-e", &stray]));
+    // ... and `result submit` from inside the sandbox records a submission of
+    // the objects the worker sees (the ticker ingests it from the attempt's
+    // spool, importing the candidate from the quarantine first).
+    let objects: Vec<Value> = report.lines().find_map(|l| l.strip_prefix("objects ")).unwrap().split(',')
+        .map(|oid| json!({"oid": oid, "relative_path": format!("{}/{}", &oid[..2], &oid[2..])})).collect();
     fs::write(worktree.join("submit.json.tmp"), json!({"idempotency_key": "isolated-worker", "task_id": "work", "contract_revision": 1, "contract_digest": contract,
         "attempt_id": attempt.as_str(), "repository": lab.repo.canonicalize().unwrap().display().to_string(), "base_oid": base, "candidate_oid": candidate, "object_format": "sha256",
         "artifact_manifest": [{"path": "work.txt", "oid": candidate}], "claimed_checks": [], "objects": objects}).to_string()).unwrap();
@@ -1258,6 +1336,27 @@ fn an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_com
     // The owner's files are untouched, before and after the submission.
     for (path, text) in &secrets { assert_eq!(&fs::read_to_string(path).unwrap(), text); }
     assert_eq!(owner_files(), before);
+    // Verification runs on the submitted objects. Integration, with the worker
+    // still running, imports the verified candidate from its quarantine and
+    // merges it; the attempt branch itself does not move yet.
+    let submission = shown[0]["submission_id"].as_str().unwrap().to_owned();
+    let policy = lab.path("policy.json");
+    fs::write(&policy, WORK_POLICY).unwrap();
+    let tries = std::cell::Cell::new(0);
+    let fresh = |name: &str| { tries.set(tries.get() + 1); lab.path(&format!("{name}-{}", tries.get())).display().to_string() };
+    let verified = lab.ok_live(&|| ["result", "demo", "verify", &submission, "--policy-id", "clean", "--policy-file", policy.to_str().unwrap(),
+        "--idempotency-key", "isolated-verify", "--work-dir", &fresh("verify")].map(String::from).to_vec());
+    assert_eq!(verified["state"], "accepted", "{verified}");
+    let repository = lab.repo.canonicalize().unwrap().display().to_string();
+    lab.ok_live(&|| ["result", "demo", "configure-integration", "--repository", &repository, "--reference", "refs/heads/integration"].map(String::from).to_vec());
+    assert!(!lab.git_ok(&["cat-file", "-e", &candidate]));
+    let result = verified["receipt"]["result_id"].as_str().unwrap().to_owned();
+    let integrated = lab.ok_live(&|| ["result", "demo", "integrate", &result, "--repository", &repository, "--idempotency-key", "isolated-integrate",
+        "--work-dir", &fresh("integrate")].map(String::from).to_vec());
+    assert_eq!(integrated["state"], "integrated", "{integrated}");
+    assert_eq!(lab.git(&["rev-parse", "integration^2"]), candidate);
+    assert_eq!(lab.git(&["cat-file", "-p", &format!("{candidate}:work.txt")]), "worker change");
+    assert_eq!(lab.git(&["rev-parse", &format!("refs/heads/{branch}")]), base_commit);
     // The released agent can finish before the ticker records its brief and
     // moves the attempt to Running (a new revision): cancel only from there,
     // with the attempt's current revision on every retry.
@@ -1265,6 +1364,74 @@ fn an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_com
     lab.ok_live(&|| ["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &lab.attempt(&attempt).revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "probe done"].map(String::from).to_vec());
     lab.wait(&mut ticker, 60, &|| lab.attempt(&attempt).termination_observed);
     lab.stop(ticker);
+    // Once the worker ended, its attempt branch (and only it) was imported;
+    // the stray object it never committed was not.
+    let imported: Value = serde_json::from_slice(&fs::read(lab.quarantine(&worktree).join("import.json")).unwrap()).unwrap();
+    assert_eq!(imported, json!({"state": "imported", "commit": candidate}));
+    let merge = lab.git(&["rev-parse", "integration"]);
+    assert_eq!(refs(), [base_commit.clone(), base_commit.clone(), merge, candidate.clone()]);
+    assert!(!lab.git_ok(&["cat-file", "-e", &stray]));
+    assert_eq!(owner_files(), before);
+    assert!(!worktree_config.exists());
+    lab.git(&["fsck", "--strict", "--no-dangling"]);
+}
+
+/// A worker agent that commits `work.txt` and then, in its quarantined view,
+/// replaces the committed blob's loose object with the bytes of another
+/// valid object (`tampered`), so the branch it leaves names content that does
+/// not hash to it. It publishes `probe-1.txt` (`head`, `blob`) and waits.
+const TAMPERING_AGENT: &str = r#"
+use std::{fs, process::Command};
+fn git(args: &[&str]) -> String {
+    let out = Command::new("/usr/bin/git").args(["-c", "user.name=worker", "-c", "user.email=worker@example.invalid"]).args(args).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--version") { println!("2.1.0 (Claude Code)"); return }
+    fs::write("work.txt", "worker change\n").unwrap();
+    git(&["add", "work.txt"]);
+    git(&["commit", "-qm", "worker change"]);
+    let (head, blob) = (git(&["rev-parse", "HEAD"]), git(&["rev-parse", "HEAD:work.txt"]));
+    fs::write("tampered.txt", "tampered\n").unwrap();
+    let tampered = git(&["hash-object", "-w", "tampered.txt"]);
+    fs::remove_file("tampered.txt").unwrap();
+    let objects = git(&["rev-parse", "--path-format=absolute", "--git-path", "objects"]);
+    let path = |oid: &str| format!("{objects}/{}/{}", &oid[..2], &oid[2..]);
+    fs::remove_file(path(&blob)).unwrap();
+    fs::copy(path(&tampered), path(&blob)).unwrap();
+    fs::write("probe-1.tmp", format!("head {head}\nblob {blob}\n")).unwrap();
+    fs::rename("probe-1.tmp", "probe-1.txt").unwrap();
+    loop { std::thread::park() }
+}
+"#;
+
+/// A quarantine whose branch reaches a corrupt object is refused when the
+/// worker ends: nothing is imported, the attempt branch stays at its base and
+/// the refusal is recorded beside the quarantine.
+#[test]
+fn a_worker_branch_reaching_a_corrupt_quarantined_object_is_refused() {
+    let mut lab = Lab::new("unknown_usage='allow_with_warning'\n");
+    lab.build_agent(TAMPERING_AGENT);
+    let base = lab.git(&["rev-parse", "HEAD"]);
+    let (_, attempt) = lab.reserve("Retained instructions");
+    let worktree = lab.planned_worktree(&attempt);
+    lab.serve();
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 120, &|| worktree.join("probe-1.txt").exists());
+    let report = fs::read_to_string(worktree.join("probe-1.txt")).unwrap();
+    let head = report.lines().find_map(|l| l.strip_prefix("head ")).unwrap().to_owned();
+    let blob = report.lines().find_map(|l| l.strip_prefix("blob ")).unwrap().to_owned();
+    lab.wait(&mut ticker, 60, &|| lab.attempt(&attempt).state == AttemptState::Running);
+    lab.ok_live(&|| ["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &lab.attempt(&attempt).revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "probe done"].map(String::from).to_vec());
+    lab.wait(&mut ticker, 60, &|| lab.attempt(&attempt).termination_observed);
+    lab.stop(ticker);
+    let outcome: Value = serde_json::from_slice(&fs::read(lab.quarantine(&worktree).join("import.json")).unwrap()).unwrap();
+    assert_eq!(outcome["state"], "refused", "{outcome}");
+    assert!(outcome["reason"].as_str().unwrap().contains(&format!("reachable from {head}")), "{outcome}");
+    assert_eq!(lab.git(&["rev-parse", &format!("refs/heads/{}", Lab::attempt_branch(&attempt))]), base);
+    assert!(!lab.git_ok(&["cat-file", "-e", &head]) && !lab.git_ok(&["cat-file", "-e", &blob]));
+    lab.git(&["fsck", "--strict", "--no-dangling"]);
 }
 
 /// Probe for the submission spool: reports which `.state` paths it can
@@ -1386,7 +1553,7 @@ fn an_isolated_worker_submits_only_through_its_own_spool() {
     fs::write(home.join(".bashrc"), "OWNER-BASHRC\n").unwrap();
     lab.write_agent(SPOOL_PROBE, &[("ROOT", lab.path("root").canonicalize().unwrap().display().to_string()), ("BIN", BIN.into()),
         ("STATE", state.display().to_string()), ("OTHER", "other-attempt".into())]);
-    let (contract, base) = lab.install_work_contract();
+    let (contract, base) = lab.install_work_contract("verify_only");
     let (_, attempt) = lab.reserve("Retained instructions");
     let worktree = lab.planned_worktree(&attempt);
     let spool = state.join("spool").join(attempt.as_str());
