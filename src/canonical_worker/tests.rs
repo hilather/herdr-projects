@@ -508,6 +508,14 @@ print(json.dumps({{'id':('wrong' if mode=='wrong-id' and r['method']=='agent.pro
         let arguments=if signer.is_some(){vec![]}else{vec!["30".into()]};
         let argv = if let Some(home) = &profile.execution_home {
             let repositories = reserved.record.inputs.repositories.iter().map(|r| Path::new(r.repository.as_str())).collect::<Vec<_>>();
+            // The receipts `git worktree add` will retain: Git names each
+            // worktree's directory in the common directory after its basename.
+            let git = crate::domain::worktree_plans(&reserved.record.inputs, &reserved.record.attempt).unwrap().into_iter().map(|plan| {
+                let common = Path::new(&plan.source.repository).join(".git").canonicalize().unwrap();
+                let directory = common.join("worktrees").join(Path::new(&plan.path).file_name().unwrap());
+                (plan.path, directory.display().to_string(), common.display().to_string())
+            }).collect::<Vec<_>>();
+            let worktrees = git.iter().map(|(w, d, c)| (Path::new(w.as_str()), Path::new(d.as_str()), Path::new(c.as_str()))).collect::<Vec<_>>();
             crate::worker_supervision::isolated_gated_command(
                 Path::new(&profile.agent.path),
                 &arguments,
@@ -515,7 +523,7 @@ print(json.dumps({{'id':('wrong' if mode=='wrong-id' and r['method']=='agent.pro
                 &format!("release-{}", reserved.record.operation.as_str()),
                 Path::new(home),
                 &crate::worker_supervision::Isolation::for_agent(&project, Path::new(home), Path::new(&route.cwd),
-                    Path::new(&profile.agent.path), &repositories, Some(Path::new(&profile.config.path)), Some(Path::new(&route.socket)),
+                    Path::new(&profile.agent.path), &repositories, &worktrees, Some(Path::new(&profile.config.path)), Some(Path::new(&route.socket)),
                     &crate::profile_config::frozen_isolation_hides(&profile).unwrap()).unwrap(),
             )
             .unwrap()
@@ -2912,7 +2920,10 @@ fn launch_advancement_recovers_each_boundary_then_delivers_brief_and_stops() {
         let mut input = f._worker.0.stdin.take().unwrap();
         let initial = runtime::snapshot(&f.project).unwrap();
         let attempt = initial.attempts[0].id.clone();
-        let deadline = Instant::now() + Duration::from_secs(15);
+        // One budget covers launch (including the worker's filesystem
+        // isolation setup, dozens of mount execs that slow under host load),
+        // brief, stop and preservation.
+        let deadline = Instant::now() + Duration::from_secs(30);
         if lost=="historical_workspace" {
             resources::create_legacy_resource(&f.project,&f.operation.id,1,deadline,Default::default()).unwrap();
         }

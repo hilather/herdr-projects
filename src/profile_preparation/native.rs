@@ -395,6 +395,7 @@ pub(super) fn verify(
         &cwd,
         Path::new(&profile.agent.path),
         &[],
+        &[],
         Some(Path::new(&profile.config.path)),
         Some(&socket),
         &crate::profile_config::frozen_isolation_hides(profile)?,

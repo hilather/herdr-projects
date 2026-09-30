@@ -15,17 +15,21 @@ pub(super) fn command(
     project: &Path,
     route: &RuntimeRoute,
     inputs: &crate::domain::LaunchInputs,
+    events: &[Event],
 ) -> Result<Vec<String>> {
     let definition = crate::profile_config::frozen_definition(profile)?;
     let wall = definition.validate_gated_preparation(prompt_chars)?;
     if let Some(home) = &profile.execution_home {
         let repositories = inputs.repositories.iter().map(|r| Path::new(r.repository.as_str())).collect::<Vec<_>>();
+        let git = crate::worktree_preparation::retained_git_directories(events, operation)?;
+        let worktrees = git.iter().map(|(w, d, c)| (Path::new(w.as_str()), Path::new(d.as_str()), Path::new(c.as_str()))).collect::<Vec<_>>();
         let isolation = crate::worker_supervision::Isolation::for_agent(
             project,
             Path::new(home),
             Path::new(&route.cwd),
             Path::new(&profile.agent.path),
             &repositories,
+            &worktrees,
             Some(Path::new(&profile.config.path)),
             Some(Path::new(&route.socket)),
             &crate::profile_config::frozen_isolation_hides(profile)?,
@@ -313,7 +317,7 @@ fn create_resource_inner(
     // Refuse unusable retained knowledge before creating any external resource.
     let brief =
         db.render_attempt_brief(&project, record.attempt.as_str())?;
-    let argv = command(profile, operation, brief.prompt_chars, &project, route, &record.inputs)?;
+    let argv = command(profile, operation, brief.prompt_chars, &project, route, &record.inputs, &state.events)?;
     executable(&profile.agent, deadline, &cancellation)?;
     let session = session_identity(Path::new(&route.socket))?;
     let mut api = Api {
@@ -1074,7 +1078,7 @@ pub fn release_gate(
     let brief =
         db.render_attempt_brief(&project, record.attempt.as_str())?;
     let worktrees=crate::worktree_preparation::verify_events_held(&project,&state.events,record,deadline,cancellation.clone(),guard.inherit()?)?;
-    let argv = command(profile, operation, brief.prompt_chars, &project, &target.route, &record.inputs)?;
+    let argv = command(profile, operation, brief.prompt_chars, &project, &target.route, &record.inputs, &state.events)?;
     executable(&profile.agent, deadline, &cancellation)?;
     let supervisor = crate::worker_supervision::SupervisorObservation::reconnect(
         target

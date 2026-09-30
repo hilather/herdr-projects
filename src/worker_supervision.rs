@@ -186,8 +186,30 @@ pub fn gated_command(
 pub struct Isolation {
     root: String,
     expose: Vec<String>,
+    /// Private tmpfs directories and, for each, the needed entries in it that
+    /// are bound back (in [`PRIVATE_DIRS`] order).
+    private: Vec<(String, Vec<String>)>,
+    /// Read-only anchors (`false`) and writable exposures (`true`), parents
+    /// first: each later entry is mounted on top of the earlier ones.
+    plan: Vec<(String, bool)>,
     hide: Vec<String>,
 }
+
+/// Owner-writable scratch directories replaced by a private empty tmpfs, so
+/// the worker neither reads the owner's temporary files and sockets nor plants
+/// files the owner later uses. Needed paths inside are bound back.
+const PRIVATE_DIRS: &[&str] = &["/tmp", "/var/tmp", "/dev/shm"];
+
+/// The paths of a repository's Git common directory that a commit on a linked
+/// worktree's branch writes: new loose objects, the branch ref (`refs/heads`,
+/// or the `reftable` stack) and its reflog. Everything else in the common
+/// directory (`config`, `hooks/`, `info/`, `packed-refs`, other refs) stays
+/// read-only, as do `objects/pack` and `objects/info` (alternates) inside.
+const GIT_WRITABLE: &[&str] = &["objects", "refs/heads", "logs/refs/heads", "reftable"];
+const GIT_READ_ONLY: &[&str] = &["objects/pack", "objects/info"];
+/// Files of the worktree's own Git directory that tie it to the repository
+/// and its creation lock; the rest (index, HEAD, per-worktree logs) is written.
+const WORKTREE_READ_ONLY: &[&str] = &["commondir", "gitdir", "locked"];
 
 /// Owner-home entries hidden from every isolated agent: signing and SSH keys,
 /// the owner's own agent credentials, the product configuration (owner policy
@@ -211,18 +233,31 @@ const OWNER_SECRETS: &[&str] = &[
 ];
 
 /// The sandbox's setup program, run by `/bin/sh` inside the supervisor's user
-/// and mount namespaces after gate release. As namespace root it covers the
-/// projects root with an empty tmpfs, binds back only the exposed paths (opened
-/// before the cover, so the bind reaches the real inodes and shared locks stay
-/// shared), then mounts an empty read-only tmpfs over every hidden directory
-/// and `/dev/null` over every hidden file, then over the owner's SSH agent and
-/// tmux socket directories in `/tmp` (enumerated at setup, so the argv stays
-/// fixed; a directory the owner does not own is left alone). It re-enters the working directory
-/// through the new mount tree and execs the agent in a nested user namespace:
-/// the agent keeps root there but holds no capability over the mount namespace
-/// that owns these mounts, so it cannot unmount, move or remount them, and a
-/// mount namespace it creates itself receives them locked. Any failure exits
-/// 125 before the agent runs.
+/// and mount namespaces after gate release. As namespace root it:
+///
+/// 1. covers the projects root with an empty tmpfs and binds back only the
+///    exposed paths (opened before the cover, so the bind reaches the real
+///    inodes and shared locks stay shared);
+/// 2. replaces each private scratch directory (`/tmp`, `/var/tmp`, `/dev/shm`)
+///    with an empty tmpfs, recursively binding back only the needed entries
+///    (opened before the cover); a missing or symlinked directory is skipped;
+/// 3. walks the read-only/writable plan, parents first: a read-only anchor
+///    (owner homes, source repositories and their Git common directories, the
+///    own project) is bound onto itself recursively read-only (`ro=recursive`,
+///    applied by libmount with mount_setattr), a writable exposure (execution
+///    home, the project's `.state`, its own worktrees, the Git paths a
+///    worktree commit writes) is bound onto itself on top, writable;
+/// 4. mounts an empty read-only tmpfs over every hidden directory and
+///    `/dev/null` over every hidden file, then over the owner's SSH agent and
+///    tmux socket directories in `/tmp` (enumerated at setup, so the argv
+///    stays fixed; a directory the owner does not own is left alone).
+///
+/// It re-enters the working directory through the new mount tree and execs
+/// the agent in a nested user namespace: the agent keeps root there but holds
+/// no capability over the mount namespace that owns these mounts, so it cannot
+/// unmount, move or remount them (nor remount a read-only one writable), and
+/// a mount namespace it creates itself receives them locked. Any failure
+/// exits 125 before the agent runs.
 const SANDBOX: &str = concat!(
     r#"set -u; fail() { printf 'herdr-projects: worker isolation refused: %s\n' "$1" >&2; exit 125; }; "#,
     r#"root=$1; shift; cwd=$(pwd -P) || fail cwd; "#,
@@ -235,6 +270,18 @@ const SANDBOX: &str = concat!(
     r#"if [ -d "/proc/self/fd/$n" ]; then /usr/bin/mkdir -- "$root/$rel" || fail "$p"; else : > "$root/$rel" || fail "$p"; fi; "#,
     r#"/usr/bin/mount -c --bind "/proc/self/fd/$n" "$root/$rel" || fail "$p"; eval "exec $n<&-"; n=$((n+1));; esac; done; "#,
     r#"/usr/bin/mount -o remount,bind,ro,nosuid,nodev,noexec "$root" || fail "$root"; fi; "#,
+    r#"for d in "$@"; do case $d in --) break;; private:*) d=${d#private:}; if [ -d "$d" ] && [ ! -L "$d" ]; then n=3; "#,
+    r#"for a in "$@"; do case $a in --) break;; keep:"$d"/*) [ "$n" -le 9 ] || fail keep; p=${a#keep:}; "#,
+    r#"eval "exec $n<\"\$p\"" || fail "$p"; n=$((n+1));; esac; done; "#,
+    r#"/usr/bin/mount -t tmpfs -o nosuid,nodev,mode=1777 herdr-projects-private "$d" || fail "$d"; n=3; "#,
+    r#"for a in "$@"; do case $a in --) break;; keep:"$d"/*) p=${a#keep:}; if [ -d "/proc/self/fd/$n" ]; then "#,
+    r#"/usr/bin/mkdir -- "$p" && /usr/bin/mount -c --rbind "/proc/self/fd/$n" "$p" || fail "$p"; "#,
+    r#"else : > "$p" && /usr/bin/mount -c --bind "/proc/self/fd/$n" "$p" || fail "$p"; fi; "#,
+    r#"eval "exec $n<&-"; n=$((n+1));; esac; done; fi;; esac; done; "#,
+    r#"for a in "$@"; do case $a in --) break;; "#,
+    r#"ro:*) p=${a#ro:}; if [ -e "$p" ]; then /usr/bin/mount --rbind -o ro=recursive "$p" "$p" || fail "$p"; fi;; "#,
+    r#"rw:*) p=${a#rw:}; if [ -e "$p" ]; then /usr/bin/mount --rbind -o rw "$p" "$p" || fail "$p"; fi;; "#,
+    r#"esac; done; "#,
     r#"for a in "$@"; do case $a in --) break;; hide:*) p=${a#hide:}; "#,
     r#"if [ -d "$p" ]; then /usr/bin/mount -t tmpfs -o ro,nosuid,nodev,noexec,size=4k,mode=0555 herdr-projects-hidden "$p" || fail "$p"; "#,
     r#"elif [ -e "$p" ]; then { /usr/bin/mount --bind /dev/null "$p" && /usr/bin/mount -o remount,bind,ro "$p"; } || fail "$p"; fi;; esac; done; "#,
@@ -312,9 +359,15 @@ impl Isolation {
     /// shared execution lock and any needed path under the root) stays visible.
     /// `socket` is the Herdr control socket that must be unreachable; `config`
     /// the pinned owner configuration file; `extra` the owner-declared hidden
-    /// paths from it (absolute, or `~/` relative to each owner home). Refuses,
-    /// before any effect, when a hidden path would contain or cover a path the
-    /// agent needs.
+    /// paths from it (absolute, or `~/` relative to each owner home).
+    /// `worktrees` are the retained (worktree, Git directory, common directory)
+    /// triples of the attempt's linked worktrees: the worktree is writable
+    /// except its `.git` pointer, and of the Git directories only the paths a
+    /// commit on its branch writes. The owner homes, `repositories` and their
+    /// common directories are otherwise read-only, as is `project` except its
+    /// `.state` (store, locks, worker outputs) outside other attempts'
+    /// worktrees; `home` stays writable. Refuses, before any effect, when a
+    /// hidden path would contain or cover a path the agent needs.
     #[allow(clippy::too_many_arguments)]
     pub fn for_agent(
         project: &Path,
@@ -322,6 +375,7 @@ impl Isolation {
         cwd: &Path,
         agent: &Path,
         repositories: &[&Path],
+        worktrees: &[(&Path, &Path, &Path)],
         config: Option<&Path>,
         socket: Option<&Path>,
         extra: &[String],
@@ -382,6 +436,21 @@ impl Isolation {
         for repository in repositories {
             needed.push(normal(repository)?);
         }
+        let mut git = Vec::new();
+        for (worktree, directory, common) in worktrees {
+            let (worktree, directory, common) = (normal(worktree)?, normal(directory)?, normal(common)?);
+            ensure!(
+                Path::new(&directory).parent() == Some(Path::new(&common).join("worktrees").as_path())
+                    && Path::new(&worktree).starts_with(Path::new(&project).join(".state/worktrees"))
+                    && Path::new(&worktree) != Path::new(&project).join(".state/worktrees"),
+                "worktree {worktree} or its Git directory {directory} is outside its project or common directory {common}"
+            );
+            git.push((worktree, directory, common));
+        }
+        let repositories_end = needed.len();
+        for (_, directory, common) in &git {
+            needed.extend([directory.clone(), common.clone()]);
+        }
         for secret in &hide {
             for secret in forms(secret) {
                 for need in &needed {
@@ -413,7 +482,7 @@ impl Isolation {
             );
         }
         let mut expose = vec![project.clone(), format!("{root}/.execution.lock")];
-        for need in [&home, &agent].into_iter().chain(needed[4..].iter()) {
+        for need in [&home, &agent].into_iter().chain(needed[4..repositories_end].iter()) {
             if Path::new(need).starts_with(&root) && !Path::new(need).starts_with(&project) {
                 expose.push(need.clone());
             }
@@ -423,12 +492,66 @@ impl Isolation {
         let nested = expose.clone();
         expose.retain(|path| !nested.iter().any(|other| other != path && Path::new(path).starts_with(other)));
         ensure!(expose.len() <= 7, "too many paths to expose under the projects root");
-        Ok(Self { root, expose, hide })
+        // Read-only anchors and the writable exposures on top of them.
+        let mut plan: Vec<(String, bool)> = homes.iter().map(|h| (h.clone(), false)).collect();
+        plan.extend(needed[4..repositories_end].iter().map(|r| (r.clone(), false)));
+        let state = format!("{project}/.state");
+        plan.extend([(project.clone(), false), (state.clone(), true), (format!("{state}/worktrees"), false)]);
+        for (worktree, directory, common) in &git {
+            plan.extend([(worktree.clone(), true), (format!("{worktree}/.git"), false)]);
+            plan.push((common.clone(), false));
+            plan.extend(GIT_WRITABLE.iter().map(|p| (format!("{common}/{p}"), true)));
+            plan.extend(GIT_READ_ONLY.iter().map(|p| (format!("{common}/{p}"), false)));
+            plan.push((directory.clone(), true));
+            plan.extend(WORKTREE_READ_ONLY.iter().map(|p| (format!("{directory}/{p}"), false)));
+        }
+        plan.extend([(home.clone(), true), (format!("{root}/.execution.lock"), true)]);
+        // Parents first; an exposure the agent needs wins over an equal anchor.
+        plan.sort_by(|a, b| Path::new(&a.0).cmp(Path::new(&b.0)).then(a.1.cmp(&b.1)));
+        plan.reverse();
+        plan.dedup_by(|later, earlier| later.0 == earlier.0);
+        plan.reverse();
+        // An entry inside one of the same mode adds nothing: every submount
+        // already exists when the plan runs, and read-only is recursive.
+        let mut kept: Vec<(String, bool)> = Vec::new();
+        for entry in plan {
+            let enclosing = kept.iter().rev().find(|(p, _)| Path::new(&entry.0).starts_with(p));
+            if enclosing.is_none_or(|(_, writable)| *writable != entry.1) {
+                kept.push(entry);
+            }
+        }
+        let plan = kept;
+        // Private scratch directories keep only the entries needed paths
+        // (named or real) lie in.
+        let mut private = Vec::new();
+        for dir in PRIVATE_DIRS {
+            let mut keep = Vec::new();
+            for need in needed.iter().chain(std::iter::once(&root)) {
+                for form in forms(need) {
+                    if let Ok(rest) = form.strip_prefix(dir) {
+                        let first = rest.components().next().ok_or_else(|| {
+                            anyhow::anyhow!("worker isolation cannot keep {} private: an agent path is {dir} itself", need)
+                        })?;
+                        keep.push(format!("{dir}/{}", first.as_os_str().to_str().unwrap_or_default()));
+                    }
+                }
+            }
+            keep.sort();
+            keep.dedup();
+            ensure!(keep.len() <= 7, "too many agent paths directly under {dir}");
+            private.push(((*dir).to_owned(), keep));
+        }
+        Ok(Self { root, expose, private, plan, hide })
     }
 
     fn arguments(&self) -> Vec<String> {
         let mut args = vec![self.root.clone()];
         args.extend(self.expose.iter().map(|p| format!("expose:{p}")));
+        for (dir, keep) in &self.private {
+            args.extend(keep.iter().map(|p| format!("keep:{p}")));
+            args.push(format!("private:{dir}"));
+        }
+        args.extend(self.plan.iter().map(|(p, writable)| format!("{}:{p}", if *writable { "rw" } else { "ro" })));
         args.extend(self.hide.iter().map(|p| format!("hide:{p}")));
         args
     }
@@ -516,7 +639,7 @@ mod tests {
         let project = root_path.join("project");
         std::fs::create_dir(&project).unwrap();
         std::fs::write(root_path.join(".execution.lock"), b"").unwrap();
-        let isolation = Isolation::for_agent(&project, home.path(), &project, Path::new("/usr/bin/env"), &[], None, None, &[]).unwrap();
+        let isolation = Isolation::for_agent(&project, home.path(), &project, Path::new("/usr/bin/env"), &[], &[], None, None, &[]).unwrap();
         let argv = isolated_gated_command(
             Path::new("/usr/bin/env"),
             &[],

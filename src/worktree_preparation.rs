@@ -754,6 +754,16 @@ impl WorktreeProof {
         Ok(())
     }
 }
+/// The (worktree, Git directory, common directory) triples of the launch's
+/// retained worktree receipts: durable, so worker isolation derives the same
+/// writable paths at creation, gate release and any later recomputation.
+pub(crate) fn retained_git_directories(events: &[Event], operation: &OperationId) -> Result<Vec<(String, String, String)>> {
+    let Some(ready) = events.iter().find(|e| e.kind == "runtime.worktrees_ready" && e.entity == operation.as_str()) else {
+        return Ok(vec![]);
+    };
+    let receipts: Vec<WorktreeReceipt> = serde_json::from_value(ready.payload.clone())?;
+    Ok(receipts.into_iter().map(|r| (r.plan.path, r.git_directory, r.common_directory)).collect())
+}
 pub(crate) fn verify_events_held(
     project: &Path, events: &[Event], record: &AttemptInputRecord,
     deadline: Instant, cancellation: Cancellation, locks: Vec<InheritedLock>,

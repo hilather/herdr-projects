@@ -1030,7 +1030,8 @@ fn acceptance_decision_replays_in_the_ledger_as_of() {
 }
 
 /// A worker agent that probes its own filesystem view. It records every
-/// secret read, the projects root listing, a connection to the Herdr socket,
+/// secret read, an append to each owner file in `WRITES`, a write and read
+/// back of `TMP_WRITE` and the `/tmp` listing, the projects root listing, a connection to the Herdr socket,
 /// direct `umount2`/`mount` calls on each hidden path, and the same attempts
 /// (plus a bind of a hidden path's parent) from a user and mount namespace it
 /// creates itself. It then does ordinary work: writes and commits a file in
@@ -1053,8 +1054,14 @@ fn main() {
     for secret in SECRETS {
         report += &format!("read {secret} {}\n", match fs::read(secret) { Ok(bytes) => format!("OK:{}", String::from_utf8_lossy(&bytes).trim()), Err(error) => format!("ERR:{:?}", error.kind()) });
     }
+    for target in WRITES {
+        let written = fs::OpenOptions::new().create(true).append(true).open(target).and_then(|mut file| std::io::Write::write_all(&mut file, b"WORKER-WROTE\n"));
+        report += &format!("write {target} {}\n", match written { Ok(()) => "OK".into(), Err(error) => format!("ERR:{:?}", error.kind()) });
+    }
+    report += &format!("tmp {} {}\n", fs::write(TMP_WRITE, "private").is_ok(), fs::read_to_string(TMP_WRITE).unwrap_or_default());
     let list = |dir: &str| { let mut names: Vec<String> = fs::read_dir(dir).map(|d| d.filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default(); names.sort(); names.join(",") };
     report += &format!("root {}\n", list(ROOT));
+    report += &format!("tmp-list {}\n", list("/tmp"));
     report += &format!("own {}\n", list(OWN));
     report += &format!("socket {}\n", match UnixStream::connect(SOCKET) { Ok(_) => "OK".into(), Err(error) => format!("ERR:{:?}", error.kind()) });
     let tmpfs = CString::new("tmpfs").unwrap();
@@ -1086,11 +1093,11 @@ fn main() {
 
 impl Lab {
     /// Replace the lab agent with `PROBE_AGENT`, its paths compiled in.
-    fn write_probe_agent(&self, secrets: &[PathBuf], hidden: &[PathBuf], nested: &str) {
+    fn write_probe_agent(&self, secrets: &[PathBuf], writes: &[PathBuf], tmp: &std::path::Path, hidden: &[PathBuf], nested: &str) {
         let quoted = |paths: &[PathBuf]| paths.iter().map(|p| format!("{:?}", p.to_str().unwrap())).collect::<Vec<_>>().join(",");
         let root = self.path("root").canonicalize().unwrap();
-        let source = format!("{PROBE_AGENT}\nconst SECRETS: &[&str] = &[{}];\nconst HIDDEN: &[&str] = &[{}];\nconst ROOT: &str = {:?};\nconst OWN: &str = {:?};\nconst SOCKET: &str = {:?};\nconst BIN: &str = {BIN:?};\nconst NESTED: &str = {nested:?};\n",
-            quoted(secrets), quoted(hidden), root.to_str().unwrap(), self.project.canonicalize().unwrap().join(".state").to_str().unwrap(), self.socket().to_str().unwrap());
+        let source = format!("{PROBE_AGENT}\nconst WRITES: &[&str] = &[{}];\nconst TMP_WRITE: &str = {:?};\nconst SECRETS: &[&str] = &[{}];\nconst HIDDEN: &[&str] = &[{}];\nconst ROOT: &str = {:?};\nconst OWN: &str = {:?};\nconst SOCKET: &str = {:?};\nconst BIN: &str = {BIN:?};\nconst NESTED: &str = {nested:?};\n",
+            quoted(writes), tmp.to_str().unwrap(), quoted(secrets), quoted(hidden), root.to_str().unwrap(), self.project.canonicalize().unwrap().join(".state").to_str().unwrap(), self.socket().to_str().unwrap());
         let (agent, file) = (self.path("bin/claude"), self.path("bin/probe.rs"));
         fs::write(&file, source).unwrap();
         let built = Command::new("rustc").args(["--edition", "2021", "-o"]).arg(&agent).arg(&file).output().unwrap();
@@ -1158,12 +1165,30 @@ fn an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_com
     let owner_key = fs::read_to_string(&lab.key).unwrap();
     let mut reads: Vec<PathBuf> = secrets.iter().map(|(p, _)| p.clone()).collect();
     reads.extend([agent_socket.clone(), lab.key.clone(), home.join(".config/herdr-projects/config.toml"), home.join("agent-home/.codex/auth.json")]);
+    // Files the owner's shell, systemd or Git later run, and the repository's
+    // working tree: none may change from inside the worker.
+    let repo_git = lab.repo.canonicalize().unwrap().join(".git");
+    fs::write(home.join(".bashrc"), "OWNER-BASHRC\n").unwrap();
+    for dir in [".local/bin", ".config/systemd/user"] { fs::create_dir_all(home.join(dir)).unwrap(); }
+    let writes = [home.join(".bashrc"), home.join(".local/bin/x"), home.join(".config/systemd/user/x.service"), repo_git.join("hooks/pre-commit"),
+        repo_git.join("config"), repo_git.join("info/exclude"), repo_git.join("packed-refs"), lab.repo.canonicalize().unwrap().join("README")];
+    let owner_files = || writes.iter().map(|p| fs::read(p).ok()).collect::<Vec<_>>();
+    let before = owner_files();
+    // The worker's /tmp is private: a host file there is invisible and a file
+    // the worker writes there never reaches the host.
+    let host_tmp = tempfile::Builder::new().prefix("herdr-projects-host-").tempdir_in("/tmp").unwrap();
+    plant(&host_tmp.path().join("secret"), "SENTINEL-HOST-TMP");
+    reads.push(host_tmp.path().join("secret"));
+    let worker_tmp = PathBuf::from(format!("{}-worker", host_tmp.path().display()));
     let hidden = [home.join(".ssh"), home.join(".codex"), home.join(".config/herdr-projects"), home.join("lab"), home.join("root")];
     let nested = format!("for d in {0}; do umount \"$d\" 2>/dev/null && echo LIFTED-$d; umount -l \"$d\" 2>/dev/null && echo LIFTED-$d; done; \
         mkdir -p nested && mount --bind {1} nested 2>/dev/null && cat nested/.ssh/id_owner; mount --rbind {1} nested 2>/dev/null && cat nested/.ssh/id_owner nested/owner; \
         cat {2} {3}; echo nested-done",
         hidden.iter().map(|p| format!("'{}'", p.display())).collect::<Vec<_>>().join(" "), home.display(), home.join(".ssh/id_owner").display(), home.join("root/other/SECRET.txt").display());
-    lab.write_probe_agent(&reads, &hidden, &nested);
+    // Also the project's retained knowledge and the worktree's own `.git`
+    // pointer (relative to the worker's working directory, its worktree).
+    let project_writes = [lab.project.canonicalize().unwrap().join("PROJECT.md"), PathBuf::from(".git")];
+    lab.write_probe_agent(&reads, &[&writes[..], &project_writes[..]].concat(), &worker_tmp, &hidden, &nested);
     let (contract, base) = lab.install_work_contract();
     let (_, attempt) = lab.reserve("Retained instructions");
     let worktree = lab.planned_worktree(&attempt);
@@ -1172,7 +1197,7 @@ fn an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_com
     lab.wait(&mut ticker, 120, &|| worktree.join("probe-1.txt").exists());
     let report = fs::read_to_string(worktree.join("probe-1.txt")).unwrap();
     // Nothing secret reached the worker, directly or through its own namespace.
-    for sentinel in secrets.iter().map(|(_, s)| *s).chain([owner_key.lines().nth(1).unwrap(), "SENTINEL-SSH-AGENT", "LIFTED"]) {
+    for sentinel in secrets.iter().map(|(_, s)| *s).chain([owner_key.lines().nth(1).unwrap(), "SENTINEL-SSH-AGENT", "SENTINEL-HOST-TMP", "LIFTED"]) {
         assert!(!report.contains(sentinel), "{sentinel} reached the worker:\n{report}");
     }
     // A hidden directory is an empty read-only tmpfs; a hidden file (the
@@ -1182,6 +1207,21 @@ fn an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_com
     }
     assert!(report.contains(&format!("read {} OK:\n", lab.key.display())), "{report}");
     assert!(report.contains(&format!("read {} OK:WORKER-OWN-AUTH", home.join("agent-home/.codex/auth.json").display())), "{report}");
+    // Every owner write failed and changed nothing; /tmp is private.
+    for path in &writes {
+        assert!(report.contains(&format!("write {} ERR:", path.display())), "{} was writable:\n{report}", path.display());
+    }
+    for path in &project_writes {
+        assert!(report.contains(&format!("write {} ERR:", path.display())), "{} was writable:\n{report}", path.display());
+    }
+    assert_eq!(owner_files(), before);
+    assert_eq!(fs::read_to_string(lab.project.join("PROJECT.md")).unwrap(), "Retained instructions");
+    assert!(!fs::read_to_string(worktree.join(".git")).unwrap().contains("WORKER-WROTE"));
+    assert!(report.contains("\ntmp true private\n") && !worker_tmp.exists(), "{report}");
+    let listed = report.lines().find_map(|l| l.strip_prefix("tmp-list ")).unwrap();
+    for name in [host_tmp.path(), agent_socket_dir.path()].map(|p| p.file_name().unwrap().to_str().unwrap()) {
+        assert!(!listed.split(',').any(|n| n == name), "{name} visible in the worker's /tmp: {listed}");
+    }
     // Only its own project and the shared root lock remain under the root; the
     // Herdr control socket is unreachable.
     assert!(report.contains("\nroot .execution.lock,demo\n"), "{report}");
@@ -1213,10 +1253,14 @@ fn an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_com
     assert_eq!(shown.as_array().map(|a| (a.len(), a[0]["candidate_oid"].clone(), a[0]["attempt_id"].clone())),
         Some((1, json!(candidate), json!(attempt.as_str()))), "{shown}");
 
-    // The owner's files are untouched.
+    // The owner's files are untouched, before and after the submission.
     for (path, text) in &secrets { assert_eq!(&fs::read_to_string(path).unwrap(), text); }
-    let running = lab.attempt(&attempt);
-    lab.ok_live(&|| ["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &running.revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "probe done"].map(String::from).to_vec());
+    assert_eq!(owner_files(), before);
+    // The released agent can finish before the ticker records its brief and
+    // moves the attempt to Running (a new revision): cancel only from there,
+    // with the attempt's current revision on every retry.
+    lab.wait(&mut ticker, 60, &|| lab.attempt(&attempt).state == AttemptState::Running);
+    lab.ok_live(&|| ["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &lab.attempt(&attempt).revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "probe done"].map(String::from).to_vec());
     lab.wait(&mut ticker, 60, &|| lab.attempt(&attempt).termination_observed);
     lab.stop(ticker);
 }

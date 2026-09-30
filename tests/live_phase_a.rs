@@ -487,5 +487,5 @@ fn live_workspace_command_starts_supervised_root_without_bootstrap_shell() {
 fn isolation(lab:&std::path::Path,agent:&std::path::Path)->herdr_projects::worker_supervision::Isolation {
     let lab=lab.canonicalize().unwrap();let project=lab.join("isolation-root/project");
     std::fs::create_dir_all(&project).unwrap();std::fs::write(lab.join("isolation-root/.execution.lock"),b"").unwrap();
-    herdr_projects::worker_supervision::Isolation::for_agent(&project,&lab.join("home"),&lab,agent,&[],None,None,&[]).unwrap()
+    herdr_projects::worker_supervision::Isolation::for_agent(&project,&lab.join("home"),&lab,agent,&[],&[],None,None,&[]).unwrap()
 }

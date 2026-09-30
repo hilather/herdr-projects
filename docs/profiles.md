@@ -197,6 +197,26 @@ configuration (at most 16 absolute or `~/` paths):
 hide = ["~/keys/herdr-owner"]
 ```
 
+The worker also cannot write where the owner later runs code. The owner's home,
+the approved source repositories (working tree and Git common directory,
+including `config`, `hooks/` and `info/`) and the worker's own project are
+read-only inside the sandbox. Writable are only the execution home, the
+project's `.state` (store, locks, worker outputs) outside other attempts'
+worktrees, the attempt's own worktrees (except their `.git` pointer file), and
+in each common directory the paths a commit on the attempt branch writes:
+`objects/` (not `objects/pack` or `objects/info`), `refs/heads/`,
+`logs/refs/heads/`, `reftable/` and the worktree's own `worktrees/<id>/`
+(except `commondir`, `gitdir`, `locked`). `/tmp`, `/var/tmp` and `/dev/shm` are
+private empty directories, apart from entries holding a path the agent needs.
+Inside a worktree, commits, amends, soft resets and new branches work; `git
+stash`, branch deletion, `fetch` into the shared pack directory and `gc` fail,
+and Git 2.55 prints a harmless `Unable to create '.../packed-refs.lock'` after a
+commit (it cannot delete the per-worktree `AUTO_MERGE` pseudo-ref). A binding
+without repositories keeps its working directory read-only when it lies in a
+read-only anchor; such workers write to their output directory. Recursive
+read-only binds need util-linux 2.38 and Linux 5.12 or later; otherwise the
+worker exits 125 before the agent runs.
+
 See [the worker isolation review](reviews/2026-09-29-worker-isolation.md) for
 the full list, what stays visible and the residual risks.
 

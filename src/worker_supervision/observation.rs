@@ -284,6 +284,25 @@ impl SupervisorObservation {
         Ok(observation)
     }
 
+    /// True while the namespace init's sole child is a released gate still
+    /// on its way to the agent: the isolation sandbox (`sh` named
+    /// `herdr-projects-worker-sandbox`) or one of the `env -i`/`unshare` execs
+    /// around it. False for a gate still waiting for its release, no child, or
+    /// any other process. Evidence for a bounded wait, never authority.
+    pub fn agent_setup_pending(&self) -> Result<bool> {
+        let children = read_bounded(
+            &format!("/proc/{0}/task/{0}/children", self.identity.init.pid),
+            4096,
+        )?;
+        let children = std::str::from_utf8(&children)?.split_whitespace().collect::<Vec<_>>();
+        let [pid] = children[..] else { return Ok(false) };
+        let Ok(bytes) = read_bounded(&format!("/proc/{pid}/cmdline"), 65536) else { return Ok(false) };
+        let words: Vec<&[u8]> = bytes.strip_suffix(&[0]).unwrap_or(&bytes).split(|b| *b == 0).collect();
+        Ok(words.get(3) == Some(&&b"herdr-projects-worker-sandbox"[..])
+            || words.first() == Some(&&b"/usr/bin/unshare"[..])
+            || (words.first() == Some(&&b"/usr/bin/env"[..]) && words.get(1) == Some(&&b"-i"[..])))
+    }
+
     pub fn agent_process(
         &self,
         executable: &Path,
