@@ -9,6 +9,7 @@ pub mod ingest;
 pub mod metrics;
 pub mod outcome;
 pub mod panel;
+pub mod views;
 pub mod quality;
 pub mod review;
 pub mod sanitize;

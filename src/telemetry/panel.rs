@@ -65,3 +65,7 @@ pub fn render(project: &Path, now_ms: i64) -> Result<String> {
     }
     Ok(out)
 }
+
+/// TM4.2: the view sections under the report, one per operator view, each row
+/// exactly as `telemetry <slug> view <name>` prints it (docs/telemetry/operator-views.md).
+pub fn views(project: &Path, slug: &str) -> Result<String> { super::views::pane(project, slug) }

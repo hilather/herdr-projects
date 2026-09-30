@@ -871,6 +871,9 @@ enum TelemetryCommand {
     Analytics { #[command(subcommand)] command:herdr_projects::telemetry::analytics::Command },
     /// TM4.3 portable export (`export.v1`, JSON or CSV) through the query service. Read-only unless --out/--external.
     Export(herdr_projects::telemetry::export::Args),
+
+    /// TM4.2 operator views (project, models, reviews, cost, health) through the query service. Read-only.
+    View(herdr_projects::telemetry::views::Args),
 }
 
 #[cfg(feature="state-store")]
@@ -1278,6 +1281,11 @@ pub fn run() -> Result<()> {
         Command::Telemetry{slug,command:TelemetryCommand::Export(args)}=>{
             project::validate_slug(&slug)?;
             print!("{}",herdr_projects::telemetry::export::run(&ctx.root.join(&slug),&ctx.config_dir,&slug,&args)?);Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Telemetry{slug,command:TelemetryCommand::View(args)}=>{
+            project::validate_slug(&slug)?;
+            print!("{}",herdr_projects::telemetry::views::run(&ctx.root,&slug,&ctx.config_dir,&args)?);Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Analytics{command}}=>{

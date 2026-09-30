@@ -30,6 +30,9 @@ pub struct Handoff {
     pub workspace_label: String,
     pub workspace_cwd: String,
     pub socket: String,
+    /// `fleet`: identity (`device:inode`) of the named project's canonical
+    /// store when the action ran, so the popup reads that project and no other.
+    pub store: String,
 }
 
 /// The originating pane and workspace, from the action's own environment or
@@ -74,7 +77,11 @@ pub fn run_action(ctx: &Ctx, id: &str) -> Result<()> {
         "new" => open_pane(ctx, "new", &base),
         "overview" => open_pane(ctx, "overview", &Handoff { slug: current_slug(ctx).unwrap_or_default(), ..base }),
         // The read-only fleet popup, scoped to the invoking workspace's project if any.
-        "fleet" => open_pane(ctx, "fleet", &Handoff { slug: current_slug(ctx).unwrap_or_default(), ..base }),
+        "fleet" => {
+            let slug = current_slug(ctx).unwrap_or_default();
+            let store = fleet_store(ctx, &slug);
+            open_pane(ctx, "fleet", &Handoff { slug, store, ..base })
+        }
         "open" | "pause" | "resume" => match current_slug(ctx) {
             Some(slug) => run_on_slug(ctx, id, &slug),
             None => open_pane(ctx, "pick", &Handoff { command: id.to_string(), ..base }),
@@ -181,29 +188,66 @@ pub fn run_pane(ctx: &Ctx, id: &str) -> Result<()> {
     result
 }
 
-/// Read-only fleet view (telemetry S7): the project of the invoking workspace
-/// (or of an optional handoff), else every project with a canonical store.
-/// Writes nothing: a handoff is consumed only when one was passed.
+/// The store identity a `fleet` handoff binds for `slug` (empty without a project).
+#[cfg(feature = "state-store")]
+fn fleet_store(ctx: &Ctx, slug: &str) -> String {
+    use herdr_projects::telemetry::views;
+    if slug.is_empty() { return String::new(); }
+    views::scope(&ctx.root, slug).and_then(|scope| views::store_identity(&scope)).unwrap_or_default()
+}
+
+#[cfg(not(feature = "state-store"))]
+fn fleet_store(_ctx: &Ctx, _slug: &str) -> String { String::new() }
+
+/// A `fleet` handoff reads only the project it was issued for (TM4.2): its
+/// slug must resolve inside the root to the store the action saw, and, when
+/// the popup can tell its own workspace's project, name that project.
+#[cfg(feature = "state-store")]
+fn check_fleet_handoff(ctx: &Ctx, handoff: &Handoff) -> Result<()> {
+    use herdr_projects::telemetry::views;
+    let scope = views::scope(&ctx.root, &handoff.slug)?;
+    anyhow::ensure!(!handoff.store.is_empty() && views::store_identity(&scope)? == handoff.store,
+        "the handoff names project `{}` but was not issued for its store", handoff.slug);
+    if let Some(own) = current_slug(ctx) && own != handoff.slug {
+        bail!("the handoff names project `{}` but this workspace belongs to `{own}`", handoff.slug);
+    }
+    Ok(())
+}
+
+/// Read-only fleet view (telemetry S7, TM4.2 views): the project of the
+/// invoking workspace (or of an optional handoff), else every project with a
+/// canonical store. Writes nothing: a handoff is consumed only when one was
+/// passed. `[telemetry] views = false` in config.toml turns it off.
 fn fleet(ctx: &Ctx) {
     #[cfg(not(feature = "state-store"))]
     { let _ = ctx; println!("fleet panel unavailable: this build lacks the `state-store` feature; rebuild with `cargo build --release --locked --features state-store`"); }
     #[cfg(feature = "state-store")]
     {
+        use herdr_projects::telemetry::{panel, views};
         let handoff = ctx.env.var(handoff::ENV).map(|_| handoff::consume(ctx, "fleet"));
         let slug = match handoff {
             Some(Err(error)) => { println!("error: {error:#}"); return; }
-            Some(Ok(handoff)) if !handoff.slug.is_empty() => Some(handoff.slug),
+            Some(Ok(handoff)) if !handoff.slug.is_empty() => match check_fleet_handoff(ctx, &handoff) {
+                Ok(()) => Some(handoff.slug),
+                Err(error) => { println!("error: fleet handoff refused: {error:#}"); return; }
+            },
             _ => current_slug(ctx),
         };
+        match views::enabled(&ctx.config_dir) {
+            Ok(true) => {}
+            Ok(false) => { println!("{}", views::disabled_message(&ctx.config_dir)); return; }
+            Err(error) => { println!("error: {error:#}"); return; }
+        }
         let now = jiff::Timestamp::now();
         for slug in slug.map_or_else(|| project::list_slugs(&ctx.root), |slug| vec![slug]) {
-            let dir = ctx.root.join(&slug);
             println!("── {slug} · fleet · as of {} ──", now.strftime("%Y-%m-%d %H:%M:%S UTC"));
-            if !dir.join(".state/state.db").is_file() {
+            if !ctx.root.join(&slug).join(".state/state.db").is_file() {
                 println!("no canonical store; telemetry n/a\n");
                 continue;
             }
-            match herdr_projects::telemetry::panel::render(&dir, now.as_millisecond()) {
+            // Each section reads its own project only (root-confined, no symlinked store).
+            let scope = match views::scope(&ctx.root, &slug) { Ok(scope) => scope, Err(error) => { println!("error: {error:#}\n"); continue; } };
+            match panel::render(&scope.dir, now.as_millisecond()).and_then(|text| Ok(text + "\n" + &panel::views(&scope.dir, &slug)?)) {
                 Ok(text) => println!("{text}"),
                 Err(error) => println!("error: {error:#}\n"),
             }
