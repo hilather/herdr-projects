@@ -430,8 +430,14 @@ stream-version expectations (§9).
 | F5 | `accounting` `ledger::sync`, `graph::store`, `quota::store` | every session filtered every entry; every insert re-compiled its SQL | entries grouped by session once; cached insert statements |
 | F6 | `outcome.rs` `record`, `sidecar.rs` `attempt_usage`, `quota.rs` `headroom` | statements re-compiled once per attempt or decision (10,000 each) | cached statements |
 | F7 | `health/rules.rs` `accounting_conflict`, `ledger::open_dispositions` | the rule built the whole ledger as JSON to count two dispositions: 2.17 GB peak RSS at 1M events | a grouped SQL count |
-| F8 | `ticker.rs` `telemetry_pass` | the pass (collect and every lane tick) ran inline in the ticker's pass, so its whole duration delayed every later project's controller poll | its own thread, one project at a time; the ticker never waits for it (the integrity check's pattern) |
+| F8 | `ticker.rs` `telemetry_pass` | the pass (collect and every lane tick) ran inline in the ticker's pass, so its whole duration delayed every later project's controller poll | its own thread, one project at a time; controller polling never waits for it (the integrity check's pattern); orderly shutdown waits for a running pass up to 60 s |
 | F9 | `main.rs` | with the pass on a thread (F8), SQLite's memory statistics made every allocation of both threads take one process-wide mutex | statistics off in every build of the binary, as the crate's tests already do; nothing reads them |
+
+F8 preserves graceful shutdown of the whole pass: stop-file and idle exits poll
+the running telemetry thread for up to 60 s (`TELEMETRY_SHUTDOWN_WAIT`), logging
+“waiting for telemetry pass” once. If it is still running at the bound, the
+ticker logs “telemetry pass still running at shutdown; exiting (the pass is
+crash-safe)” and exits. Forced or abnormal exits do not wait.
 
 Before and after on the 100,000-event dataset (10,000 bindings, 64 active;
 before at load 4.8–11, after at load 2–7; single CLI runs before, p50 of

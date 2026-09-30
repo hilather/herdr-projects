@@ -661,6 +661,30 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     }
 
 }
+#[cfg(feature="state-store")]
+static TELEMETRY_RUNNING:std::sync::Mutex<Option<std::thread::JoinHandle<()>>>=std::sync::Mutex::new(None);
+// Graceful shutdown preserves a whole telemetry pass, but crash-safe work must
+// not keep the ticker alive indefinitely if a lane stalls.
+#[cfg(feature="state-store")]
+const TELEMETRY_SHUTDOWN_WAIT:Duration=Duration::from_secs(60);
+
+#[cfg(feature="state-store")]
+fn drain_telemetry(log:&Log) {
+    let Ok(mut running)=TELEMETRY_RUNNING.lock() else {return};
+    let Some(pass)=running.as_ref() else {return};
+    let deadline=Instant::now()+TELEMETRY_SHUTDOWN_WAIT;
+    if !pass.is_finished() {log.line("waiting for telemetry pass");}
+    while !pass.is_finished() {
+        let remaining=deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            log.line("telemetry pass still running at shutdown; exiting (the pass is crash-safe)");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50).min(remaining));
+    }
+    if let Some(pass)=running.take() {let _=pass.join();}
+}
+
 /// Codex usage collect off the poll path: at most once per interval per project
 /// (default 300 s, `HERDR_PROJECTS_TELEMETRY_COLLECT_SECS`, 0 disables), within
 /// the tick byte budget. Writes only the sidecar; never blocks canonical work.
@@ -671,10 +695,9 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
 #[cfg(feature="state-store")]
 fn telemetry_pass(ctx:&Ctx,log:&Log,slug:&str) {
     static LAST:std::sync::Mutex<std::collections::BTreeMap<String,Instant>>=std::sync::Mutex::new(std::collections::BTreeMap::new());
-    static RUNNING:std::sync::Mutex<Option<std::thread::JoinHandle<()>>>=std::sync::Mutex::new(None);
     let secs=ctx.env.var("HERDR_PROJECTS_TELEMETRY_COLLECT_SECS").and_then(|v|v.parse().ok()).unwrap_or(300u64);
     if secs==0 {return;}
-    let Ok(mut running)=RUNNING.lock() else {return};
+    let Ok(mut running)=TELEMETRY_RUNNING.lock() else {return};
     if running.as_ref().is_some_and(|pass|!pass.is_finished()) {return;}
     let Ok(mut last)=LAST.lock() else {return};
     if last.get(slug).is_some_and(|at|at.elapsed()<Duration::from_secs(secs)) {return;}
@@ -721,6 +744,8 @@ fn integrity_pass(ctx:&Ctx,log:&Log,slug:&str) {
 fn drain_executor(root:&Path,log:&Log,memory:&mut Memory)->Result<()> {
     let result=memory.pr_reads.as_mut().expect("ticker shared executor").stop();
     publish_executor_metrics(root,log,memory);
+    #[cfg(feature="state-store")]
+    if result.is_ok() {drain_telemetry(log);}
     result
 }
 /// Drain happens only at tick entry. Even a completed ticket holds its turn until
