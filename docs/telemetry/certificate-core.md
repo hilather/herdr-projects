@@ -78,7 +78,7 @@ All tests are in `tests/telemetry_certification.rs`.
 | §3 `terminal_cohort` $4 + $3 + $1, 1 accepted, open $5 | M04 = $8/accepted task | `terminal_cohort_coordinator_budget_race_and_rebuild` (M04 `8/1`, open excluded 2, M02 1/3, M07 3/1) | pass |
 | §5a Coordinator $4, workers $16 | M34 = 20%; unknown coordinator → partial | same (`1/5`, then `partial`) | pass |
 | §4 Budget race (two admissions vs shadow budget) | in-flight exposure counted; unknown is never 0 | same (limit $30: accepted 16 + reserved 12 → request $2 allowed, $3 blocked, unsized admission `provider_usage_unavailable`; state.db byte-identical) | pass (shadow only, R5) |
-| §4 Analytics rebuild | same view, no double spend, no refund | same, and `killed_collectors_partial_lines_and_outages_replay_identically` (ledger, graph and usage byte-identical; estimates, budget consumption and metrics equal) | pass (R4) |
+| §4 Analytics rebuild | same view, no double spend, no refund | same, and `killed_collectors_partial_lines_and_outages_replay_identically` (ledger, graph and usage byte-identical; estimates, budget consumption and metrics equal); M34 allocation also in `coordinator_overhead_and_overlap_waste_from_accepted_reasons` | **intermittent, fixed** (§4 D3); pass (R4) |
 | §4 Collector killed mid-collect | byte-identical after resume | `killed_collectors_partial_lines_and_outages_replay_identically` (SIGKILL at growing delays; only whole rollouts ever commit; a kill landed mid-pass) | pass |
 | §4 Partial line, outage during active work, lost final event | wait; collect on return; explicit gap | same (partial line waits; `final_event` `missing` → `complete`, gap `recovered`; sums unchanged) | pass |
 | §5a Quota 40 → 55 | 15 units, monetary unknown; message text is diagnostic only | `quota_window_consumption_is_native_units_only` (percent, increase 15, remaining 45, no amount, the `error` line is no observation, M38 unavailable) | pass |
@@ -149,6 +149,33 @@ Regression: 6 racing collects and 4 racing syncs in
 `replayed_observations_are_accepted_once`, 4 racing reprices appending one
 revision in `cost_golden_corrections_and_as_of_views`, and
 `first_collectors_racing_to_create_the_sidecar`.
+
+**D3: M34's coordinator allocation changed between reads and across a
+rebuild (product wrong, fixed).** Doc 10 §4 "Analytics rebuild" requires the
+same view. `terminal_cohort_coordinator_budget_race_and_rebuild` failed
+intermittently at `assert_eq!(rebuilt.5, original.5)`. The same $4 moved
+between `allocation_unknown` and `unallocated`.
+
+Cause: rule `coordinator-allocation-v1` cut every span without a terminal
+mark at the read's horizon (now). The pre-log open attempt `c-open` has the
+unknown span `[log start, now)`. The coordinator record is at decision
++ 1 s, and a fast run read the original view before that instant.
+Reproduced by moving the record to decision + 1.8 s: 3 of 4 runs failed.
+The record has a line time, so its interval is `record_time` and identical
+across the rebuild. A second, latent cause was the fallback interval
+(`session_start..first_observed`): a rebuild moves its end.
+
+Fix: rule `coordinator-allocation-v2` (`src/telemetry/accounting/fleet.rs`)
+treats a span without a terminal mark as open-ended. It reads only record
+times; with none the entry is `allocation_unknown` (`usage_time_unknown`).
+Contract: contracts-accounting.md §10. The §4 fallback's rebuild behavior is
+documented there.
+
+Regression: the certification test asserts the v2 allocation
+(`activity_unknown` 1, $4) and passed 10 of 10 bounded reruns.
+`coordinator_overhead_and_overlap_waste_from_accepted_reasons` adds a
+coordinator record without a line time (`usage_time_unknown`) and rebuilds
+the sidecar: allocation and M34 identical.
 
 **No other disagreement.** Every other plan value in §2 matched on the first
 run. Where the plan's fixture assumes a producer that does not exist, the
@@ -223,8 +250,9 @@ These are restrictions, not passes. Each names what is missing.
   approved unknown-usage policy.
 - **R6: the coordinator is observed only as Codex from a scanned home.**
   The default `coordinator_agent` is `claude`, which has no collector, and
-  gives `coordinator_usage_not_observed`. Allocation rule v1 is an even
-  split.
+  gives `coordinator_usage_not_observed`. Allocation rule v2 is an even
+  split at the record time. A record without a line time is not allocated
+  (`usage_time_unknown`).
 - **R7: a quota account is an execution home.** Two homes holding one login
   are two accounts (flagged as shared-window candidates, never summed).
   Window consumption is account-wide and is never attributed to a task.
@@ -258,7 +286,7 @@ These are restrictions, not passes. Each names what is missing.
 The accounting families M04, M08/M09, M11–M14, M34–M37 and M40, and the
 execution families M16/M17 and M31/M32, meet doc 10's fixture answers
 exactly, with reproducible as-of views and one acceptance per logical
-record. Two product defects found here were fixed (D1, D2). M18, M33, M38
+record. Three product defects found here were fixed (D1, D2, D3). M18, M33, M38
 and M39 stay unavailable by design. The core contracts are fit for F4.5
 adoption under restrictions R1–R12. None of these restrictions is a
 fictitious pass.

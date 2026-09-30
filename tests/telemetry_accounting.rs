@@ -2145,7 +2145,7 @@ fn coordinator_overhead_and_overlap_waste_from_accepted_reasons() {
     let fleet = fleet_after_reprice(&f);
     let m34 = &fleet["metrics"]["M34"];
     assert_eq!((&m34["value"], &m34["scope"], &m34["allocation_rule"]),
-        (&json!({"status": "unavailable", "reason": "coordinator_usage_not_observed"}), &json!("coordinator-scope-v1"), &json!("coordinator-allocation-v1")));
+        (&json!({"status": "unavailable", "reason": "coordinator_usage_not_observed"}), &json!("coordinator-scope-v1"), &json!("coordinator-allocation-v2")));
 
     // The coordinator: Codex at the project directory, from another scanned home, an hour into the run.
     let coordinator_at = f.decided - 3_600_000;
@@ -2158,8 +2158,9 @@ fn coordinator_overhead_and_overlap_waste_from_accepted_reasons() {
         "coverage": {"entries": 1, "priced": 1, "unpriced": 0, "sessions_not_valued": 0, "attempts_without_observed_usage": 0}}));
     assert_eq!((&m34["total_project_lifecycle_cost"]["estimate"], &m34["total_project_lifecycle_cost"]["worker_attempts"]), (&usd("20"), &json!(1)));
     assert_eq!(m34["per_active_worker_thread_hour"], json!({"value": "2", "currency": "USD", "active_worker_thread_ms": 7_200_000, "open_censored": 0}));
-    assert_eq!(m34["allocation"], json!({"rule": "coordinator-allocation-v1", "rule_text": "each priced coordinator entry is split evenly across the tasks with an attempt running over its usage interval; none running: unallocated; an unknown activity span over it: allocation_unknown",
-        "coordinator_total": usd("4"), "unpriced_entries": 0, "currency": "USD", "by_task": {"work": "4"}, "unallocated": "0", "allocation_unknown": "0"}));
+    assert_eq!(m34["allocation"], json!({"rule": "coordinator-allocation-v2", "rule_text": "each priced coordinator entry is split evenly across the tasks with an attempt running at its record time (an attempt without a terminal mark runs on, open-ended); none running: unallocated; an unknown activity span over it, or no record time: allocation_unknown",
+        "coordinator_total": usd("4"), "unpriced_entries": 0, "currency": "USD", "by_task": {"work": "4"}, "unallocated": "0", "allocation_unknown": "0",
+        "allocation_unknown_entries": {}}));
     assert_eq!(m34["excluded_from"], json!(["M35", "per_arm_worker_figures"]));
     assert!(f.text(&["accounting", "fleet"]).lines().any(|l| l == "M34 coordinator_overhead 1/5"));
     // The coordinator's cost is in no attempt's estimate.
@@ -2249,4 +2250,31 @@ fn coordinator_overhead_and_overlap_waste_from_accepted_reasons() {
     assert_eq!((&m34["per_active_worker_thread_hour"]["value"]["priced_value"], &m34["per_active_worker_thread_hour"]["active_worker_thread_ms"]), (&json!("1"), &json!(14_400_000)));
     assert_eq!(m34["value"], json!({"status": "partial", "reasons": ["coordinator_entries_unpriced", "worker_usage_not_observed"], "priced_share": "1/6"}));
     assert_eq!(fleet["metrics"]["M37"]["value"], json!({"status": "partial", "reasons": ["usage_not_observed"], "priced_share": "4/5"}));
+
+    // Rule v2 reads only reproducible facts: a coordinator record without a line
+    // time (its fallback interval ends at its first observation, which a rebuild
+    // moves) is allocation_unknown, never placed by when it was collected.
+    let dir = other_home.join(".codex/sessions/2026/09/28");
+    let untimed = dir.join("rollout-2026-09-28T00-00-00-coordinator-untimed.jsonl");
+    priced_rollout(&other_home, "coordinator-untimed", "00000000-0000-4000-8000-00000000c003", &f.project.display().to_string(), coordinator_at, "gpt-5.5");
+    let text: String = fs::read_to_string(&untimed).unwrap().lines().map(|l| {
+        let mut v: serde_json::Value = serde_json::from_str(l).unwrap();
+        if v["type"] == "token_usage_record" { v.as_object_mut().unwrap().remove("timestamp"); }
+        format!("{v}\n")
+    }).collect();
+    fs::write(&untimed, text).unwrap();
+    let fleet = fleet_after_reprice(&f);
+    let allocation = &fleet["metrics"]["M34"]["allocation"];
+    assert_eq!((&allocation["by_task"], &allocation["unallocated"], &allocation["allocation_unknown"], &allocation["allocation_unknown_entries"]),
+        (&json!({"other": "2", "work": "2"}), &json!("0"), &json!("4"), &json!({"usage_time_unknown": 1})));
+
+    // Rebuild: delete the sidecar, collect, sync, re-import the same card and
+    // reprice. The allocation (and all of M34) is identical.
+    let original = fleet["metrics"]["M34"].clone();
+    for name in ["telemetry.db", "telemetry.db-wal", "telemetry.db-shm"] { let _ = fs::remove_file(f.project.join(".state").join(name)); }
+    f.cli("collect");
+    assert_eq!(f.cli_args(&["accounting", "import-rate-card", card.to_str().unwrap()]).0["imported"], true);
+    let rebuilt = fleet_after_reprice(&f);
+    assert_eq!(rebuilt["metrics"]["M34"]["allocation"], original["allocation"], "rebuild: the same allocation");
+    assert_eq!(rebuilt["metrics"]["M34"], original, "rebuild: the same M34");
 }

@@ -715,6 +715,13 @@ fn terminal_cohort_coordinator_budget_race_and_rebuild() {
     assert_eq!(rebuilt.3, original.3, "the same estimates");
     assert_eq!(rebuilt.4, original.4, "the same consumption: nothing spent twice, nothing refunded");
     assert_eq!(rebuilt.5, original.5);
+    // The coordinator's record (t + 1) is in c-open's unknown activity span: c-open
+    // predates the lifecycle log and has no terminal mark, so under rule v2 the span
+    // is open-ended whatever the read time (v1 ended it at "now", and a read before
+    // t + 1 made the same $4 unallocated).
+    let allocation = &original.5[5]["allocation"];
+    assert_eq!((&allocation["rule"], &allocation["unallocated"], &allocation["allocation_unknown"], &allocation["allocation_unknown_entries"]),
+        (&json!("coordinator-allocation-v2"), &json!("0"), &json!("4"), &json!({"activity_unknown": 1})));
     assert_eq!(fs::read(&state).unwrap(), before, "no canonical write by a rebuild");
 
     // Unknown coordinator usage (a model without a rate) → M34 partial, never a ratio of the priced part.

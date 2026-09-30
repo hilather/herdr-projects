@@ -267,6 +267,21 @@ reasons (the entry is `unavailable`, never 0):
 Amount = Σ over categories with tokens of `tokens × rate / rate_unit`, exact
 (fixed-point `i128`, trimmed decimal string), with per-category components.
 
+Reproducibility across a sidecar rebuild: a `record_time` interval is the
+line's own time, so a rebuilt sidecar reprices it identically. The fallback
+interval is **not** rebuild-stable: its end is the first observation, and a
+rebuild observes every record again (later). For an entry without a line
+time a reprice after a rebuild can therefore append different revision
+content: `usage_interval.to_unix_ms` changes. The valuation can change too,
+when a card boundary (`effective_from`/`effective_to`) falls between the old
+and the new observation (`rate_change_within_usage_interval` appears or
+disappears). Live Codex lines carry `timestamp` (certified live, A4), and a
+rebuild re-reads every line, so a rebuilt sidecar uses the fallback only for
+a line with no parsable `timestamp`. The rebuild certificate
+(certificate-core §2, "Analytics rebuild") covers `record_time` entries
+only. Derived views that must survive a rebuild never read the fallback
+interval: M34's allocation (§10, v2) treats it as `usage_time_unknown`.
+
 Reproducibility across the A4 change: stream version 6 records each new
 valuation's `usage_basis` and `provider_check` in the append-only side table
 `valuation_bases` (not new `valuations` columns, so the migration can re-run);
@@ -983,7 +998,7 @@ running interval starts at or after it. Without a sidecar both metrics are
 `unavailable collection_not_run`, before any reprice `not_priced`.
 
 **M34 `coordinator_overhead`** (`M34.fleet-v1`, `scope:
-coordinator-scope-v1`, `allocation_rule: coordinator-allocation-v1`,
+coordinator-scope-v1`, `allocation_rule: coordinator-allocation-v2`,
 `excluded_from: [M35, per_arm_worker_figures]`). `value` = coordinator
 exclusive cost / total project lifecycle cost (coordinator + worker
 sessions), an exact rational. Reasons for `partial`: `coordinator_<gap>`,
@@ -1000,15 +1015,40 @@ an execution home that is not scanned, is not observed. Also:
   active_time_unknown` when an unknown span touches the window,
   `predates_lifecycle_log` without marks, `null empty_denominator` for none;
   `partial {gaps, priced_value}` when the coordinator cost has gaps;
-- `allocation` under **`coordinator-allocation-v1`**: each priced coordinator
-  entry is split evenly across the tasks with an attempt running over its
-  usage interval (`[from, to]` against a run's `[from, to)`); none running:
-  `unallocated`; an unknown activity span over it (or no usage interval):
-  `allocation_unknown`. `{rule, rule_text, coordinator_total (the
-  unallocated coordinator estimate, always shown), unpriced_entries,
-  currency, by_task, unallocated, allocation_unknown}`. The allocation is a
-  view only: no worker, task or arm figure (M35, candidate-group arm cost,
-  `accounting cost` per attempt) includes coordinator cost.
+- `allocation` under **`coordinator-allocation-v2`**: each priced coordinator
+  entry is split evenly across the tasks with an attempt running at its
+  record time (`[t, t]`, basis `record_time`, §4, against a run's
+  `[from, to)`); none running: `unallocated`; an unknown activity span over
+  it: `allocation_unknown` (`activity_unknown`); no record time (basis
+  `session_start..first_observed`, a revision without a basis, or no usage
+  interval): `allocation_unknown` (`usage_time_unknown`). A run or unknown
+  span without a terminal mark (`open_censored`, `end_unknown`, or a
+  pre-log attempt still open) is **open-ended** here, not cut at the read's
+  horizon. `{rule, rule_text, coordinator_total (the unallocated
+  coordinator estimate, always shown), unpriced_entries, currency, by_task,
+  unallocated, allocation_unknown, allocation_unknown_entries (entry count
+  per reason, nonzero only)}`. The allocation is a view only: no worker,
+  task or arm figure (M35, candidate-group arm cost, `accounting cost` per
+  attempt) includes coordinator cost.
+
+  **Reproducibility (why v2).** The allocation is derived at read time, so
+  it must be the same for the same canonical rows and collected sources,
+  whenever it is read and after the sidecar is deleted and rebuilt. Rule
+  **v1** (`coordinator-allocation-v1`, TM2.8) broke this in two ways. (1) It
+  cut open spans at the read's horizon (now). An entry recorded after an
+  earlier read's "now" was `unallocated` then and `allocation_unknown` (or
+  allocated) later. That is the certification failure (`assert_eq!(rebuilt.5,
+  original.5)`): the fixture's coordinator record is at decision + 1 s, and
+  a fast run read the original view before that instant. (2) It placed an
+  entry by its fallback interval, whose end is the record's first
+  observation. A rebuild re-observes every record, so the entry could move
+  in or out of a running interval. v2 reads neither: only line times and
+  lifecycle marks. v1 was never stored (the view is derived at read time),
+  so only the label changes. M34's `value`, `coordinator`,
+  `total_project_lifecycle_cost` and definition `M34.fleet-v1` are
+  unchanged. `per_active_worker_thread_hour` still counts open runs up to
+  now (by definition active time so far), so it grows with the read time
+  while an attempt is open.
 
 **M37 `overlap_waste_share`** (`M37.fleet-v1`). The producer is the owner's
 **accepted supersession reason**, canonical migration **0060**

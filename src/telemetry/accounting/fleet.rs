@@ -10,7 +10,7 @@
 //! time-weighted active-attempt count; M36 counts integrator-observed and,
 //! apart, worker-observed conflict/rebase events; M34 prices the coordinator
 //! scope (`coordinator-scope-v1`) against the project's lifecycle cost and
-//! allocates it by rule `coordinator-allocation-v1`; M37 prices attempts
+//! allocates it by rule `coordinator-allocation-v2`; M37 prices attempts
 //! superseded because a sibling changed the same area. The coordinator has no
 //! canonical attempt, so its time and cost never enter a worker figure.
 use anyhow::Result;
@@ -91,7 +91,8 @@ impl Ord for Q {
 
 /// A worker attempt's known active interval `[from, to)`, with its task mix
 /// key and its dispatch decision's agent configuration.
-struct Run { attempt: String, task: String, from: i64, to: i64, mix: String, config: Option<String> }
+/// `open`: no terminal mark yet, so `to` is the read's horizon (now), not an end.
+struct Run { attempt: String, task: String, from: i64, to: i64, mix: String, config: Option<String>, open: bool }
 
 /// An integration operation of an attempt: (ref, state, reason, created, integrated).
 type Op = (String, String, Option<String>, i64, bool);
@@ -101,8 +102,9 @@ struct Fleet {
     horizon: i64,
     runs: Vec<Run>,
     /// Spans in which some attempt's activity is unknown (pre-log or end not
-    /// marked), with that attempt's configuration.
-    unknown: Vec<(i64, i64, Option<String>)>,
+    /// marked), with that attempt's configuration and whether the span ends at
+    /// the horizon (no terminal mark) rather than at a marked end.
+    unknown: Vec<(i64, i64, Option<String>, bool)>,
     coverage: BTreeMap<&'static str, usize>,
     /// First acceptance evidence time per accepted task (contracts §6 `A`),
     /// with the configuration of the attempt that produced it.
@@ -142,16 +144,16 @@ fn load(db: &Connection, horizon: i64) -> Result<std::result::Result<Fleet, &'st
             // Predates the log: ended before it (terminal, no mark), else active at an unknown time.
             (None, _, _) => {
                 count("predates_lifecycle_log");
-                if !(terminal && ended.is_none()) { unknown.push((log_start.unwrap_or(i64::MIN), ended.unwrap_or(horizon), config)); }
+                if !(terminal && ended.is_none()) { unknown.push((log_start.unwrap_or(i64::MIN), ended.unwrap_or(horizon), config, ended.is_none())); }
             }
             (Some(_), None, _) => count("never_running"),
-            (Some(_), Some(from), Some(to)) => { count("running_intervals"); runs.push(Run { attempt, task, from, to, mix: class.unwrap_or(UNCLASSIFIED.into()), config }); }
+            (Some(_), Some(from), Some(to)) => { count("running_intervals"); runs.push(Run { attempt, task, from, to, mix: class.unwrap_or(UNCLASSIFIED.into()), config, open: false }); }
             (Some(_), Some(from), None) if !terminal => {
                 count("running_intervals");
                 count("open_censored");
-                runs.push(Run { attempt, task, from, to: horizon, mix: class.unwrap_or(UNCLASSIFIED.into()), config });
+                runs.push(Run { attempt, task, from, to: horizon, mix: class.unwrap_or(UNCLASSIFIED.into()), config, open: true });
             }
-            (Some(_), Some(from), None) => { count("end_unknown"); unknown.push((from, horizon, config)); }
+            (Some(_), Some(from), None) => { count("end_unknown"); unknown.push((from, horizon, config, true)); }
         }
     }
     // Per task, its first acceptance evidence and the attempt whose result it is.
@@ -458,13 +460,18 @@ fn conflicts(f: &Fleet, project: &Path, since: Option<i64>) -> Value {
 pub const COORDINATOR_SCOPE: &str = "coordinator-scope-v1";
 const COORDINATOR_SCOPE_RULE: &str = "Codex rollouts collected from a scanned execution home, bound to no attempt and outside every task worktree, \
     whose session_meta.cwd is the project directory (the coordinator pane's working directory)";
-/// M34 allocation of coordinator cost to tasks, versioned (§10; plan doc 05 §5a).
-pub const ALLOCATION_RULE: &str = "coordinator-allocation-v1";
-const ALLOCATION_RULE_TEXT: &str = "each priced coordinator entry is split evenly across the tasks with an attempt running over its usage interval; \
-    none running: unallocated; an unknown activity span over it: allocation_unknown";
+/// M34 allocation of coordinator cost to tasks, versioned (§10; plan doc 05
+/// §5a). v2 (v1 read the horizon and first-observation times, so a rebuilt
+/// sidecar or a later read could move an entry): only reproducible facts.
+pub const ALLOCATION_RULE: &str = "coordinator-allocation-v2";
+const ALLOCATION_RULE_TEXT: &str = "each priced coordinator entry is split evenly across the tasks with an attempt running at its record time \
+    (an attempt without a terminal mark runs on, open-ended); none running: unallocated; an unknown activity span over it, \
+    or no record time: allocation_unknown";
 
-/// A valued ledger entry: its priced amount (`None`: unpriced) and usage interval.
-struct Entry { priced: Option<(String, Q)>, interval: Option<(i64, i64)> }
+/// A valued ledger entry: its priced amount (`None`: unpriced), usage
+/// interval, and whether that interval is its record time (basis
+/// `record_time`) rather than the observation-dependent fallback.
+struct Entry { priced: Option<(String, Q)>, interval: Option<(i64, i64)>, record_time: bool }
 
 #[derive(PartialEq)]
 enum Scope { Worker(String), Coordinator, Unattributed, Outside }
@@ -503,7 +510,7 @@ fn sessions(project: &Path, attempts: &BTreeSet<String>) -> Result<std::result::
             let v = &e["valuation"];
             let priced = if v["status"] == "priced" { v["currency"].as_str().zip(v["amount"].as_str().and_then(Q::decimal)).map(|(c, a)| (c.to_owned(), a)) } else { None };
             let i = &e["usage_interval"];
-            entries.push(Entry { priced, interval: i["from_unix_ms"].as_i64().zip(i["to_unix_ms"].as_i64()) });
+            entries.push(Entry { priced, interval: i["from_unix_ms"].as_i64().zip(i["to_unix_ms"].as_i64()), record_time: i["basis"] == "record_time" });
         }
     }
     Ok(Ok(sources.into_iter().map(|(id, (bound, worktree, root, start, records))| {
@@ -599,7 +606,7 @@ fn ran(f: Option<&Fleet>, since: Option<i64>) -> BTreeSet<&str> {
 
 /// M34: coordinator exclusive cost / total project lifecycle cost (coordinator
 /// plus worker attempts), coordinator cost per active worker-thread-hour, and
-/// the allocation to tasks under rule v1. Never part of a worker figure.
+/// the allocation to tasks under rule v2. Never part of a worker figure.
 fn m34(f: Option<&Fleet>, usage: &std::result::Result<Vec<Session>, &'static str>, since: Option<i64>) -> Value {
     let mut body = json!({"scope": COORDINATOR_SCOPE, "scope_rule": COORDINATOR_SCOPE_RULE, "allocation_rule": ALLOCATION_RULE,
         "basis": super::cost::BASIS, "excluded_from": ["M35", "per_arm_worker_figures"]});
@@ -649,19 +656,32 @@ fn thread_hour(f: Option<&Fleet>, coord: &Sum, since: Option<i64>) -> Value {
     body
 }
 
-/// Rule v1: each priced coordinator entry split evenly across the tasks with
-/// an attempt running over its usage interval. The coordinator total is shown beside it.
+/// Rule v2: each priced coordinator entry split evenly across the tasks with
+/// an attempt running at its record time. The coordinator total is shown
+/// beside it. Reproducible: it reads no observation time (a rebuilt sidecar
+/// re-observes every record) and no horizon (a span without a terminal mark
+/// is open-ended, so a later read never moves an entry).
 fn allocation(f: Option<&Fleet>, coordinator: &[&Session], coord: &Sum) -> Value {
     let mut body = json!({"rule": ALLOCATION_RULE, "rule_text": ALLOCATION_RULE_TEXT, "coordinator_total": coord.estimate(), "unpriced_entries": coord.unpriced});
     let Some(f) = f else { body["status"] = json!("unavailable"); body["reason"] = json!("predates_lifecycle_log"); return body };
     let currency = match coord.single() { Err(e) => { body["status"] = json!("unavailable"); body["reason"] = json!(e); return body; } Ok(c) => c.map(|c| c.0.clone()) };
     let (mut by_task, mut unallocated, mut unknown, mut overflow) = (BTreeMap::<&str, Q>::new(), Q::int(0), Q::int(0), false);
+    let mut unknown_entries = BTreeMap::<&str, usize>::new();
     let mut add = |slot: &mut Q, amount: Q| match slot.try_add(amount) { Some(v) => *slot = v, None => overflow = true };
+    let end = |to: i64, open: bool| if open { i64::MAX } else { to };
     for entry in coordinator.iter().flat_map(|s| &s.entries) {
         let Some((_, amount)) = &entry.priced else { continue };
-        let Some((from, to)) = entry.interval else { add(&mut unknown, *amount); continue };
-        if f.unknown.iter().any(|u| u.0 <= to && from < u.1) { add(&mut unknown, *amount); continue; }
-        let tasks: BTreeSet<&str> = f.runs.iter().filter(|r| r.from <= to && from < r.to).map(|r| r.task.as_str()).collect();
+        let Some((from, to)) = entry.interval.filter(|_| entry.record_time) else {
+            add(&mut unknown, *amount);
+            *unknown_entries.entry("usage_time_unknown").or_default() += 1;
+            continue;
+        };
+        if f.unknown.iter().any(|u| u.0 <= to && from < end(u.1, u.3)) {
+            add(&mut unknown, *amount);
+            *unknown_entries.entry("activity_unknown").or_default() += 1;
+            continue;
+        }
+        let tasks: BTreeSet<&str> = f.runs.iter().filter(|r| r.from <= to && from < end(r.to, r.open)).map(|r| r.task.as_str()).collect();
         if tasks.is_empty() { add(&mut unallocated, *amount); continue; }
         let each = amount.try_div(Q::int(tasks.len() as i128)).unwrap_or(Q::int(0));
         for task in tasks { add(by_task.entry(task).or_insert(Q::int(0)), each); }
@@ -671,6 +691,7 @@ fn allocation(f: Option<&Fleet>, coordinator: &[&Session], coord: &Sum) -> Value
     body["by_task"] = json!(by_task.iter().map(|(t, a)| (t.to_string(), a.money())).collect::<BTreeMap<_, _>>());
     body["unallocated"] = json!(unallocated.money());
     body["allocation_unknown"] = json!(unknown.money());
+    body["allocation_unknown_entries"] = json!(unknown_entries);
     body
 }
 
