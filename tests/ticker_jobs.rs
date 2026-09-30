@@ -13,7 +13,8 @@ const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
 /// `NAME.panes` (`NAME@MACHINE.*` through `--machine`; saved machines are
 /// `machines.json`), and fails every call while `NAME.down` exists. Bridge
 /// requests follow `NAME.reply`: `ack`, `null` (a start acknowledged without
-/// an agent kind), `lost` (no reply) or `unsupported` (no bridge at all).
+/// an agent kind), `lost` (no reply), `hang` (no reply until killed) or
+/// `unsupported` (no bridge at all).
 /// A notification is always shown.
 /// Every call is logged to `calls` as `TIME NAME ARGS [METHOD]`, and every
 /// token refresh's parameters to `tokens`.
@@ -47,6 +48,7 @@ elif request is not None and request['method']=='pane.report_metadata':
     print(json.dumps({'id':request['id'],'result':{'type':'ok'}}))
 elif request is not None:
     if mode=='lost':sys.exit(1)
+    if mode=='hang':time.sleep(120);sys.exit(1)
     params=request['params']
     if request['method']=='agent.prompt':agent=next(a for a in read('agents') if a['pane_id']==params['target'])
     else:agent=dict(next(p for p in read('panes') if p['pane_id']==params['pane_id']),name=params['name'],launch_pending=True,agent_status='unknown',agent=None if mode=='null' else 'claude')
@@ -175,29 +177,34 @@ fn gaps(times: &[f64]) -> Vec<f64> { times.windows(2).map(|w| w[1] - w[0]).colle
 /// Replaces `open_retains_launch_history_and_queues_a_new_request_without_starting`
 /// and `plain_open_cannot_turn_a_missing_agent_observation_into_another_launch_request`.
 ///
-/// The ticker starts a coordinator once: the reply is lost (the claim ends
-/// uncertain) or acknowledged without an agent kind (confirmed), and no agent
-/// appears. A plain `open` then refuses and writes nothing; `open --reprime`
-/// only queues a new prime request, keeping the launch history. Neither
-/// starts or prompts anything.
+/// The ticker starts a coordinator once: the reply is lost, or never comes
+/// before the ticker is stopped mid-call (either way the claim ends
+/// uncertain), or the start is acknowledged without an agent kind (confirmed),
+/// and no agent appears. A restarted ticker never starts it again. A plain
+/// `open` then refuses and writes nothing; `open --reprime` only queues a new
+/// prime request, keeping the launch history. Neither starts or prompts
+/// anything.
 #[test]
 fn open_after_a_coordinator_start_keeps_its_claim_and_never_starts_again() {
-    for reply in ["lost", "null"] {
+    for reply in ["lost", "hang", "null"] {
         let mut lab = Lab::new();
         let project = lab.project_in_session("demo", json!({}));
         lab.session("demo", &[], &[pane_at("p", &project)]);
         lab.set("demo.reply", Some(reply));
         let phase = || lab.coordinator("demo")["launch_claim"]["phase"].as_str().unwrap_or_default().to_owned();
+        let starts = || lab.times("demo", "agent.start").len();
         let mut ticker = lab.run_ticker(&[]);
-        ticker.wait_for("the start claim", 30, || phase() == if reply == "lost" { "pending" } else { "confirmed" });
+        // The claim is pending before the start is sent: wait for the call
+        // itself too, or a stop can cancel the start before it goes out.
+        ticker.wait_for("the start claim and call", 30, || starts() == 1 && phase() == if reply == "null" { "confirmed" } else { "pending" });
         ticker.stop();
-        if reply == "lost" {
+        if reply != "null" {
             let mut ticker = lab.run_ticker(&[]);
             ticker.wait_for("the uncertain start notice", 30, || lab.coordinator("demo")["launch_claim"]["notified"] == true);
+            ticker.next_pass();
             ticker.stop();
             assert_eq!(phase(), "uncertain");
         }
-        let starts = || lab.times("demo", "agent.start").len();
         assert_eq!(starts(), 1, "{reply}");
 
         let record = lab.project("demo").join(".state/coordinator.json");
