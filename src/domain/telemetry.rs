@@ -92,7 +92,8 @@ pub fn agent_configuration(profile: &super::FrozenProfile) -> AgentConfiguration
 }
 
 /// One profile weighed for a dispatch, in evaluation order. `status` is one of
-/// `chosen`, `no_knowledge`, `no_approval`, `not_evaluated`.
+/// `chosen`, `no_knowledge`, `no_approval`, `not_evaluated`, and (policy
+/// assignment only) `eligible`: approved, weighed by the policy, not chosen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EligibleProfile {
     pub configuration: AgentConfiguration,
@@ -110,6 +111,9 @@ pub enum DispatchContext {
     Automatic { eligible: Vec<EligibleProfile> },
     /// A reservation under a delegated grant; the grant is read from the request.
     Delegated,
+    /// Automatic admission whose profile an enabled assignment policy chose
+    /// among the approved profiles (TM4.7), with its per-entry probabilities.
+    Assigned { eligible: Vec<EligibleProfile>, assignment: super::PolicyAssignment },
 }
 
 impl DispatchContext {

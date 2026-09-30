@@ -131,7 +131,7 @@ pub fn admission_log_line_observed(reason: &str, task_id: Option<&str>, duration
     sql: Option<crate::store::controlled::SqlWorkMetrics>) -> String {
     let reason = match reason {
         "disk_full" | "database_busy" | "admission_paused" | "admission_off" | "idle" | "reserved"
-        | "authority_missing" | "scan_incomplete" | "verification_backlog" | "integration_backlog" | "capacity_full" | "error" => reason,
+        | "authority_missing" | "scan_incomplete" | "policy_abstained" | "verification_backlog" | "integration_backlog" | "capacity_full" | "error" => reason,
         _ => "error",
     };
     let task_id = task_id.filter(|id| {

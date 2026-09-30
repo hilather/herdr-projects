@@ -32,6 +32,8 @@ mod barrier_reference;
 pub use barrier_reference::*;
 mod telemetry;
 pub use telemetry::*;
+mod assignment_policy;
+pub use assignment_policy::*;
 
 macro_rules! identifier {
     ($($name:ident),+) => { $(

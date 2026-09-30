@@ -107,8 +107,8 @@ fractions differ, compared exactly), `cost_partial`, `mixed_model_allocation`,
   common multiple of the arm's probabilities in ppm, exact integers), with
   `effective_sample_size = (Σw)²/Σw²`. Otherwise the cell's `propensity` is
   `unavailable`: `deterministic_assignment` (every decision chose its arm
-  with probability 1 — today's only policy, contracts §3; TM4.7 produces
-  positive propensities) or `positivity_violated`. Weighted estimates stay
+  with probability 1 — the rule's, contracts §3; a policy assigning under
+  §9 logs positive propensities) or `positivity_violated`. Weighted estimates stay
   `observational`.
 - **Paired analysis** `paired`: lane C's M42 (`percentile_bootstrap.v1`
   over tasks, its own minimum of 10 closed groups, `registry.v1`) from the
@@ -222,11 +222,99 @@ interval_not_computed`; the interval lives in this report.
   paired and cost metrics are compared through their lanes (M42 is carried
   in `paired`). Registering another comparable metric is a new
   `analytics-comparison` version.
-- No logged positive propensities exist until TM4.7; the weighted path is
-  exercised only by planted decisions in the tests.
+- Positive propensities are logged only by decisions a policy assigned
+  (§9, operator switch on and an owner grant); rule, operator and delegated
+  decisions log probability 1 for their choice.
 - Arms are not matched on role, repository or tool versions beyond the
   configuration identity and task class; difficulty mismatch blocks a
   ranking, the other covariates are shown, not adjusted.
 - No M50 (evidence freshness): it is per recommendation, and recommendations
   are TM4.5.
 - Reports are computed live; no revisioned projection is stored.
+
+## 9. Assignment policies (TM4.7, `assignment-policy.v1`)
+
+Code: `src/domain/assignment_policy.rs` (pure policies),
+`src/store/assignment_policy.rs` (switch, grants, assignment record,
+canonical migration 0065), `src/admission.rs` (`decide_held`, `weigh`,
+`assign`, `policy_suggestion`), `src/telemetry/policies.rs` (inputs, shadow
+stream `policies`, CLI). A policy never builds launch inputs, approvals,
+contracts or review/verification policy: it only picks one of the profiles
+automatic admission already sealed and found approved for the task, and the
+reservation then runs every ordinary check (budget, capacity, contract,
+knowledge, review launch).
+
+**Policies** (versioned; a spec is canonical JSON with defaults filled, its
+identity `sha256:` of those bytes). Input: the approved arms in evaluation
+order, each with quota headroom, decisions under the current settings
+revision (caps) and recorded outcomes in the task's class; a seed. Output:
+per-arm `probability_ppm` (exact integers summing to 1000000) and the choice.
+- Constraints first: an arm whose `arm_caps` entry is reached
+  (`arm_cap_reached`) or whose known remaining quota is at or below
+  `min_headroom_percent` (default 0; `quota_exhausted`) has probability 0.
+  Unknown headroom never excludes. No arm left: `abstained:
+  no_arm_within_constraints`, no choice.
+- `deterministic.v1`: the first allowed arm, 1000000.
+- `uniform.v1`: `1000000 / k` each, the remainder one ppm each to the first arms.
+- `epsilon.v1 {epsilon_ppm}`: `epsilon_ppm` split as uniform, plus
+  `1000000 − epsilon_ppm` to the greedy arm (highest posterior mean
+  `(s+1)/(s+f+2)`, exact, earliest on ties).
+- `thompson.v1 {prior [α, β] (default 1/1), floor_ppm (default 10000)}`:
+  1000 seeded posterior draws per decision; a Beta(a, b) draw with integer
+  parameters is the a-th smallest of a+b−1 uniform u64s (integer-only);
+  counts above 200 outcomes are scaled to 200. Each allowed arm gets
+  `floor_ppm` plus a largest-remainder share of the rest by wins.
+- Seed: first 8 bytes (big-endian) of
+  `sha256("assignment-seed.v1\0<policy digest>\0<task>\0<task revision>")`;
+  the draw is SplitMix64's first output mod 1000000; the choice is the first
+  arm whose cumulative probability exceeds the draw, so the logged
+  probabilities are exactly the ones the choice was made with.
+- Outcomes: the query service's lifecycle tasks (`lifecycle::load`); a task
+  counts for the one configuration all its attempts were dispatched on
+  (mixed/unknown arms skipped), accepted = success, other terminal
+  dispositions = failure, open tasks not counted. Quota headroom: the
+  smallest fresh remaining percent of the arm's execution home at the
+  decision (contracts-accounting.md §5 M40), else unknown.
+
+**Switch** (`assignment_policy_settings`, append-only; no row = `off`):
+`telemetry <slug> policies configure --mode off|shadow|suggest|assign
+[--policy SPEC]... [--grant ID]`. The first policy is primary.
+- `shadow`/`suggest`: admission weighs every matched profile, but the
+  canonical decision is byte-for-byte the rule's (first approved chosen,
+  later profiles `not_evaluated`); each configured policy's evaluation is
+  appended to sidecar `policy_shadow_decisions` after the commit.
+- `assign`: requires an installed owner-signed grant, re-verified at
+  enablement, permitting the primary policy now. Admission evaluates the
+  primary with effective caps = min(spec cap, grant cap) (an arm the grant
+  does not list: cap 0), logs its probabilities on the decision
+  (`DispatchContext::Assigned`) and writes `dispatch_policy_assignments`
+  (policy, digest, spec, seed, draw, grant, constraints). The reservation
+  transaction re-checks: settings revision still current `assign` with the
+  same grant and primary; grant valid and permitting; chosen arm within its
+  cap (decisions choosing it since the settings revision ≤ cap); a trigger
+  requires the logged probabilities to sum to 1000000 with the chosen entry
+  positive. When the primary abstains or the grant no longer permits, the
+  candidate is not reserved (`policy_abstained`); switching `off` returns
+  to the rule.
+
+**Authority** (`randomized_assignment_authority.v1`, namespace
+`randomized-assignment@herdr-projects`, factory F2.5): `{schema, scope:
+randomized_assignment, issuer: owner, project_store, policies (sorted),
+max_exploration_ppm (bounds epsilon_ppm), arm_caps {configuration_id: 1–100000}
+(1–16 arms), valid_from_unix_ms, expires_unix_ms (≤ 366 days),
+prohibited_effects [alter_review_policy, alter_verification_policy,
+choose_outside_eligible_set, exceed_budget, increase_permissions],
+authority}`. `policies authority import DOC SIG` verifies the owner
+signature first; it enables nothing.
+
+**Reports** (read-only): `policies show` (switch, history, grants,
+assigned count); `policies simulate --input FILE [--seed N] [--sweep K]`
+(what-if on stated arms; a sweep counts choices and `outside_eligible`);
+`policies suggest --task T [--json]` (`assignment-policy-suggestion.v1`:
+the task's weighed profiles and each policy's evaluation;
+`default_suggestion` in `suggest`/`assign`); `policies shadow [--json]`
+(`assignment-policy-shadow.v1`: per policy decisions, agreements,
+disagreements, abstentions, `disagreement_rate` `"d/n"` over non-abstained
+decisions, per class; canonical decisions by chooser as `shadowed`,
+`single_profile_chooser` (operator/delegated), `policy_assigned` or
+`policies_off`).

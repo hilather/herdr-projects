@@ -258,30 +258,50 @@ pub(crate) fn decide_held(project: &Path, db: &mut SqliteStore, read_control: &R
         read_control.check()?;return Ok(AdmissionDecision{block:None,reason:"idle",task_id:None});
     }
     let profiles = db.admission_profiles_with_budget(header.control.config_digest.as_deref(),Some(budget))?;
+    // TM4.7: the operator switch. Off (the default, and before schema 65) is today's rule exactly.
+    let settings = db.assignment_settings()?.filter(|s| s.mode != "off");
+    let mut evidence = None;
     let mut denied = None;
     let mut missing = None;
+    let mut abstained = None;
     let cursor = db.admission_cursor_with_budget(&header,Some(budget))?;
     let (candidates, next) = ranked_page(db, &header, now, cursor.as_ref(), read_control,budget)?;
     for candidate in candidates.iter().filter(|candidate| candidate.blocker.is_none()) {
-        let mut sealed = None;
-        let (mut matched, mut knowledge) = (false, false);
         // Telemetry: the status each matched profile reached, in evaluation order. Never consulted to choose.
         let matches = binding_profiles(&db, &profiles, &header.control, candidate, now,budget)?;
-        let mut eligible = Vec::with_capacity(matches.len());
-        for profile in &matches {
-            matched = true;
-            let Some(inputs) = seal(db, project_store, &header, candidate, profile, placeholder_approval(), budget)? else { eligible.push(arm(profile, "no_knowledge")?); continue };
-            knowledge = true;
-            if let Some(reference) = db.matching_launch_approval(&inputs, now,Some(budget))? {
-                let mut inputs = inputs;
-                inputs.approval = reference;
-                sealed = Some(inputs);
-                eligible.push(arm(profile, "chosen")?);
-                break;
-            }
-            eligible.push(arm(profile, "no_approval")?);
+        let weighed = weigh(db, project_store, &header, candidate, &matches, now, budget, settings.is_some())?;
+        if let (Some(settings), false) = (&settings, weighed.approved.is_empty()) {
+            let (class, arms, names) = policy_arms(project, db, settings, candidate, &weighed, now, &mut evidence)?;
+            let task = &weighed.approved[0].2;
+            let mut evaluations: Vec<(PolicySpec, PolicyEvaluation)> = settings.policies.iter()
+                .map(|spec| (spec.clone(), spec.evaluate(&arms, policy_seed(&spec.digest(), task.task.as_str(), task.task_revision)))).collect();
+            let (context, inputs) = if settings.mode == "assign" {
+                let Some((context, inputs, effective)) = assign(db, settings, &weighed, &arms, now)? else {
+                    abstained.get_or_insert_with(|| candidate.task.id.as_str().to_string());
+                    continue;
+                };
+                // The primary's shadow row is the evaluation that assigned (grant caps applied).
+                evaluations[0].1 = effective;
+                (context, inputs)
+            } else {
+                // Shadow and suggest: the canonical decision is exactly the rule's.
+                let (first, _, inputs) = &weighed.approved[0];
+                let mut eligible = weighed.eligible[..=*first].to_vec();
+                eligible[*first].status = "chosen";
+                for profile in &matches[eligible.len()..] { eligible.push(arm(profile, "not_evaluated")?); }
+                (DispatchContext::Automatic { eligible }, inputs.clone())
+            };
+            let actual = agent_configuration(inputs.effective_profile.as_ref().context("admission inputs lack a profile")?).id;
+            let reservation = db.reserve_prepared_controlled(&[PreparedLaunch { inputs }], head, now, read_control,budget,&context)?;
+            // Analytics only, after the canonical commit: a sidecar failure never undoes or blocks the reservation.
+            let _ = crate::telemetry::policies::record_shadow(project, &crate::telemetry::policies::ShadowRecord { attempt: reservation.record.attempt.as_str(),
+                task: candidate.task.id.as_str(), class: &class, settings_revision: settings.revision, mode: &settings.mode, arms: &names,
+                evaluations: &evaluations, actual: &actual, now });
+            return Ok(AdmissionDecision { block: None, reason: "reserved", task_id: Some(candidate.task.id.as_str().to_string()) });
         }
-        if let Some(inputs) = sealed {
+        let Weighed { mut eligible, approved, matched, knowledge } = weighed;
+        if let Some((index, _, inputs)) = approved.into_iter().next() {
+            eligible[index].status = "chosen";
             for profile in &matches[eligible.len()..] { eligible.push(arm(profile, "not_evaluated")?); }
             // Head was read before this write. A later mutation conflicts instead of reserving a stale snapshot.
             db.reserve_prepared_controlled(&[PreparedLaunch { inputs }], head, now, read_control,budget,&DispatchContext::Automatic { eligible })?;
@@ -300,9 +320,125 @@ pub(crate) fn decide_held(project: &Path, db: &mut SqliteStore, read_control: &R
     db.advance_admission_cursor(&header,next.as_ref())?;
     Ok(AdmissionDecision {
         block: None,
-        reason: if next.is_some() { "scan_incomplete" } else if denied.is_some() { "authority_missing" } else if missing.is_some() { "knowledge_missing" } else { "idle" },
-        task_id: denied.or(missing),
+        reason: if next.is_some() { "scan_incomplete" } else if denied.is_some() { "authority_missing" } else if abstained.is_some() { "policy_abstained" }
+            else if missing.is_some() { "knowledge_missing" } else { "idle" },
+        task_id: denied.or(abstained).or(missing),
     })
+}
+
+/// A candidate's matched profiles in evaluation order: the status each
+/// reached (`eligible` when approved; the caller marks its choice) and the
+/// approved ones with their sealed inputs. Without `all`, evaluation stops
+/// at the first approved profile, as the rule always has.
+struct Weighed<'a> { eligible: Vec<EligibleProfile>, approved: Vec<(usize, &'a FrozenProfile, LaunchInputs)>, matched: bool, knowledge: bool }
+
+#[allow(clippy::too_many_arguments)]
+fn weigh<'a>(db: &SqliteStore, project_store: &str, header: &Header, candidate: &Candidate, matches: &[&'a FrozenProfile], now: i64, budget: &ReadBudget, all: bool) -> Result<Weighed<'a>> {
+    let mut weighed = Weighed { eligible: Vec::with_capacity(matches.len()), approved: Vec::new(), matched: false, knowledge: false };
+    for profile in matches {
+        weighed.matched = true;
+        let Some(inputs) = seal(db, project_store, header, candidate, profile, placeholder_approval(), budget)? else { weighed.eligible.push(arm(profile, "no_knowledge")?); continue };
+        weighed.knowledge = true;
+        if let Some(reference) = db.matching_launch_approval(&inputs, now,Some(budget))? {
+            let mut inputs = inputs;
+            inputs.approval = reference;
+            weighed.approved.push((weighed.eligible.len(), *profile, inputs));
+            weighed.eligible.push(arm(profile, "eligible")?);
+            if !all { break; }
+            continue;
+        }
+        weighed.eligible.push(arm(profile, "no_approval")?);
+    }
+    Ok(weighed)
+}
+
+/// Policy inputs for the approved arms (TM4.7): the task class, then per arm
+/// its quota headroom, decisions under this settings revision (caps) and, when
+/// a policy reads them, recorded outcomes in the class. Also the arms' configuration IDs.
+fn policy_arms(project: &Path, db: &SqliteStore, settings: &crate::store::AssignmentSettings, candidate: &Candidate, weighed: &Weighed, now: i64,
+    evidence: &mut Option<crate::telemetry::policies::Evidence>) -> Result<(String, Vec<ArmInput>, Vec<String>)> {
+    let class = db.task_class_preview(&weighed.approved[0].2, candidate.dependencies.len(), now)?;
+    if evidence.is_none() && crate::telemetry::policies::needs_outcomes(&settings.policies) {
+        *evidence = Some(crate::telemetry::policies::Evidence::load(project)?);
+    }
+    let mut arms = Vec::with_capacity(weighed.approved.len());
+    for (_, profile, _) in &weighed.approved {
+        let configuration = agent_configuration(profile).id;
+        let (successes, failures) = evidence.as_ref().map_or((0, 0), |e| e.posterior(&class, &configuration));
+        arms.push(ArmInput { headroom_milli: crate::telemetry::policies::headroom(project, profile, now), assigned: db.arm_decisions_since(&configuration, settings.set_unix_ms)?,
+            successes, failures, configuration_id: configuration });
+    }
+    let names = arms.iter().map(|a| a.configuration_id.clone()).collect();
+    Ok((class, arms, names))
+}
+
+/// Assignment mode: the primary policy chooses among the approved arms
+/// under the grant (an arm the grant does not list has cap 0). `None` when
+/// the grant does not permit it now or every arm is held at probability 0:
+/// the candidate is not reserved. The reservation transaction checks the
+/// switch, grant and cap again.
+fn assign(db: &SqliteStore, settings: &crate::store::AssignmentSettings, weighed: &Weighed, arms: &[ArmInput], now: i64)
+    -> Result<Option<(DispatchContext, LaunchInputs, PolicyEvaluation)>> {
+    let (Some(grant_id), Some(primary)) = (settings.grant_id.as_deref(), settings.policies.first()) else { return Ok(None) };
+    let (grant, _) = db.assignment_authority_grant(grant_id)?;
+    if grant.permits(primary, now).is_err() { return Ok(None); }
+    let mut effective = primary.clone();
+    effective.arm_caps = grant.effective_caps(primary);
+    for arm in arms { effective.arm_caps.entry(arm.configuration_id.clone()).or_insert(0); }
+    let task = &weighed.approved[0].2;
+    let evaluation = effective.evaluate(arms, policy_seed(&primary.digest(), task.task.as_str(), task.task_revision));
+    let Some(pick) = evaluation.chosen else { return Ok(None) };
+    let mut eligible = weighed.eligible.clone();
+    let mut probabilities = vec![0; eligible.len()];
+    for (position, (index, _, _)) in weighed.approved.iter().enumerate() { probabilities[*index] = evaluation.probabilities[position]; }
+    eligible[weighed.approved[pick].0].status = "chosen";
+    let constraints = evaluation.excluded.iter().map(|(i, reason)| (arms[*i].configuration_id.clone(), *reason)).collect();
+    let assignment = PolicyAssignment { settings_revision: settings.revision, spec: primary.clone(), grant_id: grant_id.to_owned(), seed: evaluation.seed,
+        draw_ppm: evaluation.draw_ppm, probabilities, constraints };
+    Ok(Some((DispatchContext::Assigned { eligible, assignment }, weighed.approved[pick].2.clone(), evaluation)))
+}
+
+/// `telemetry <slug> policies suggest --task T` (TM4.7): what the configured
+/// policies would choose for one ready task among its approved profiles,
+/// exactly as admission would weigh it now. Reads only.
+pub fn policy_suggestion(project: &Path, task: &str) -> Result<serde_json::Value> {
+    let deadline = std::time::Instant::now()+std::time::Duration::from_secs(10);
+    let control = ReadControl::new(deadline,crate::runner::Cancellation::default());
+    let budget = ReadBudget::new(ReadControl::new(deadline,crate::runner::Cancellation::default()));
+    let db = SqliteStore::open(&store_file(project)?)?;
+    let settings = db.assignment_settings()?.filter(|s| s.mode != "off").context("assignment policies are off: configure --mode shadow, suggest or assign first")?;
+    let now = jiff::Timestamp::now().as_millisecond();
+    let project_store = store_file(project)?;
+    let project_store = project_store.to_str().context("project store is not UTF-8")?;
+    let mut db = db;
+    let header = db.admission_header_with_budget(Some(&budget))?;
+    let profiles = db.admission_profiles_with_budget(header.control.config_digest.as_deref(),Some(&budget))?;
+    let mut cursor = None;
+    loop {
+        let (candidates, next) = ranked_page(&mut db, &header, now, cursor.as_ref(), &control, &budget)?;
+        if let Some(candidate) = candidates.iter().find(|c| c.task.id.as_str() == task) {
+            let matches = binding_profiles(&db, &profiles, &header.control, candidate, now, &budget)?;
+            let weighed = weigh(&db, project_store, &header, candidate, &matches, now, &budget, true)?;
+            let eligible: Vec<serde_json::Value> = weighed.eligible.iter().map(|e| serde_json::json!({"configuration_id": e.configuration.id, "profile_digest": e.profile_digest,
+                "status": e.status})).collect();
+            let mut report = serde_json::json!({"schema": crate::telemetry::policies::SUGGESTION_SCHEMA, "task_id": task, "mode": settings.mode, "settings_revision": settings.revision,
+                "default_suggestion": matches!(settings.mode.as_str(), "suggest" | "assign"), "read_only": true, "blocker": candidate.blocker, "eligible": eligible});
+            if weighed.approved.is_empty() {
+                report["suggestion"] = serde_json::json!({"status": "unavailable", "reason": "no_approved_profile"});
+                return Ok(report);
+            }
+            let (class, arms, names) = policy_arms(project, &db, &settings, candidate, &weighed, now, &mut None)?;
+            let inputs = &weighed.approved[0].2;
+            let evaluations: Vec<serde_json::Value> = settings.policies.iter().map(|spec| crate::telemetry::policies::evaluation_json(spec,
+                &spec.evaluate(&arms, policy_seed(&spec.digest(), inputs.task.as_str(), inputs.task_revision)), &names)).collect();
+            report["task_class"] = serde_json::json!(class);
+            report["suggestion"] = evaluations[0].clone();
+            report["policies"] = serde_json::json!(evaluations);
+            return Ok(report);
+        }
+        cursor = next;
+        if cursor.is_none() { anyhow::bail!("task {task} is not a ready admission candidate"); }
+    }
 }
 
 #[cfg(test)]

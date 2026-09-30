@@ -93,6 +93,7 @@ impl SqliteStore {
         if version<=61 {tx.execute_batch(include_str!("../../migrations/0062_review_launch.sql"))?;}
         if version<=62 {tx.execute_batch(include_str!("../../migrations/0063_review_opportunity_ledger.sql"))?;}
         if version<=63 {tx.execute_batch(include_str!("../../migrations/0064_replay_suite.sql"))?;}
+        if version<=64 {tx.execute_batch(include_str!("../../migrations/0065_assignment_policies.sql"))?;}
         tx.commit()?;
         Ok(())
     }

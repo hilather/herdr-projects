@@ -1,7 +1,7 @@
 //! Telemetry rows written inside the reservation transaction (contracts §1–§3).
 //! Reads are keyed by primary key and bounded; nothing here reads outcomes.
 use super::*;
-use crate::domain::{agent_configuration, classify_task, excerpt, AgentConfiguration, ContractScope, DispatchContext, EligibleProfile, OPERATOR_REASONS, PreparedDelegatedReservation, TASK_TAXONOMY};
+use crate::domain::{agent_configuration, classify_task, excerpt, AgentConfiguration, ContractScope, DispatchContext, EligibleProfile, OPERATOR_REASONS, PPM, PreparedDelegatedReservation, TASK_TAXONOMY};
 
 fn invalid(message:&str)->StoreError {StoreError::Invalid(message.into())}
 
@@ -39,6 +39,29 @@ pub(super) fn record_decision(tx:&Connection,inputs:&LaunchInputs,attempt:&Attem
             ("automatic_admission","rule:automatic-admission.v1".to_owned(),vec!["first_matching_approval"],None,eligible.clone())
         }
         (DispatchContext::Delegated,Some(delegated))=>("delegated",format!("grant:{}",delegated.request.grant_id),vec!["delegated_grant"],None,only()),
+        (DispatchContext::Assigned{eligible,assignment},None)=>{
+            // TM4.7: the policy chose among approved entries only; its probabilities are logged as evaluated.
+            let mut picked=eligible.iter().filter(|e|e.status=="chosen");
+            let valid=eligible.len()<=256&&assignment.probabilities.len()==eligible.len()&&eligible.iter().all(|e|matches!(e.status,"chosen"|"eligible"|"no_knowledge"|"no_approval"))
+                &&eligible.iter().zip(&assignment.probabilities).all(|(e,p)|*p==0||matches!(e.status,"chosen"|"eligible"))
+                &&eligible.iter().zip(&assignment.probabilities).any(|(e,p)|e.status=="chosen"&&*p>0)
+                &&assignment.probabilities.iter().map(|p|u64::from(*p)).sum::<u64>()==u64::from(PPM);
+            if !valid||!matches!((picked.next(),picked.next()),(Some(e),None) if e.configuration==chosen&&e.profile_digest==inputs.profile.digest) {
+                return Err(invalid("policy assignment differs from the reserved profile or its eligible set"));
+            }
+            let reason=if assignment.spec.stochastic() {"exploration"} else {"recommended"};
+            let approved=eligible.iter().filter(|e|matches!(e.status,"chosen"|"eligible")).count();
+            let mut reasons=vec![reason];if approved==1 {reasons.push("only_eligible");}
+            reasons.sort_unstable();
+            for entry in eligible.iter() {insert_configuration(tx,&entry.configuration,now)?;}
+            let logged=serde_json::Value::Array(eligible.iter().zip(&assignment.probabilities).map(|(e,p)|serde_json::json!({"configuration_id":e.configuration.id,
+                "probability_ppm":p,"profile_digest":e.profile_digest,"status":e.status})).collect()).to_string();
+            let principal=format!("policy:{}@{}",assignment.spec.policy,assignment.settings_revision);
+            let contract=inputs.task_contract.as_ref().map(|c|integer(c.revision)).transpose()?;
+            tx.execute("INSERT INTO dispatch_decisions VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,NULL,NULL,NULL,?11)",params![attempt.as_str(),inputs.task.as_str(),integer(task_revision)?,contract,
+                classification,chosen.id,logged,"automatic_admission",principal,serde_json::json!(reasons).to_string(),now])?;
+            return super::assignment_policy::record(tx,attempt,&chosen.id,assignment,now);
+        }
         _=>return Err(invalid("dispatch context differs from the reservation path")),
     };
     if kind!="operator"&&eligible.len()==1 {reasons.push("only_eligible");}
@@ -50,6 +73,24 @@ pub(super) fn record_decision(tx:&Connection,inputs:&LaunchInputs,attempt:&Attem
     tx.execute("INSERT INTO dispatch_decisions VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,NULL,?12)",params![attempt.as_str(),inputs.task.as_str(),integer(task_revision)?,contract,
         classification,chosen.id,eligible,kind,principal,serde_json::json!(reasons).to_string(),note,now])?;
     Ok(())
+}
+
+/// The task's revision-1 class for `inputs` without writing: the stored row's
+/// class, else the class `classify_in_transaction` would write now.
+pub(super) fn class_preview(db:&Connection,inputs:&LaunchInputs,dependencies:usize,now:i64)->Result<String> {
+    let task=inputs.task.as_str();let revision=inputs.task_contract.as_ref().map(|c|integer(c.revision)).transpose()?;
+    let existing:Option<String>=match revision {
+        Some(revision)=>db.query_row("SELECT class FROM task_classifications WHERE task_id=?1 AND contract_revision=?2 AND taxonomy=?3 AND revision=1",params![task,revision,TASK_TAXONOMY],|r|r.get(0)),
+        None=>db.query_row("SELECT class FROM task_classifications WHERE task_id=?1 AND contract_revision IS NULL AND taxonomy=?2 AND revision=1",params![task,TASK_TAXONOMY],|r|r.get(0)),
+    }.optional()?;
+    if let Some(class)=existing {return Ok(class);}
+    let scope=match revision {Some(revision)=>Some(contract_scope(db,task,revision,None)?),None=>None};
+    Ok(classify_task(task,scope.as_ref(),dependencies,inputs.repositories.len(),now).class.to_owned())
+}
+
+impl SqliteStore {
+    /// Read-only `class_preview` (TM4.7 policy inputs).
+    pub(crate) fn task_class_preview(&self,inputs:&LaunchInputs,dependencies:usize,now:i64)->Result<String> {class_preview(&self.connection,inputs,dependencies,now)}
 }
 
 /// Content-addressed and immutable: an existing ID must carry identical bytes.

@@ -616,6 +616,61 @@ pub fn accept_review(project:&Path,session:&str,document:&Path,signature:&Path)-
     result
 }
 
+pub const ASSIGNMENT_AUTHORITY_SIGNATURE_NAMESPACE:&str="randomized-assignment@herdr-projects";
+
+/// Verify a `randomized_assignment` grant (factory F2.5) with the pinned
+/// owner key; it must name the current owner policy. Parsing happens only
+/// after the signature check.
+fn prepare_assignment_authority(owner:&Policy,payload:&[u8],signature:&[u8],runner:&dyn Runner)->Result<crate::store::PreparedAssignmentAuthority> {
+    verify_signature(owner,payload,signature,ASSIGNMENT_AUTHORITY_SIGNATURE_NAMESPACE,runner)?;
+    let prepared=crate::store::PreparedAssignmentAuthority::parse_verified(payload).map_err(anyhow::Error::msg)?;
+    ensure!(*prepared.authority()==owner.reference()?,"assignment authority names a different authority policy");
+    Ok(prepared)
+}
+
+/// Install one owner-signed `randomized_assignment` grant (TM4.7,
+/// contracts-evaluation.md §9). It enables nothing by itself: the operator
+/// switch (`telemetry <slug> policies configure --mode assign --grant`) does.
+pub fn import_assignment_authority(project:&Path,document:&Path,signature:&Path)->Result<serde_json::Value> {
+    let result=(||{
+        let _guard=migration::runtime_mutation(project)?;
+        let mut db=migration::open_active(project)?;
+        let (owner,config)=policy(project)?;
+        ensure!(db.project_control()?.context("control schema upgrade required")?.config_digest==config.digest,"owner configuration is not acknowledged by project control");
+        let payload=migration::read_plan_file(document).map_err(|_|anyhow::anyhow!("assignment authority document unreadable"))?;
+        let signature=migration::read_plan_file(signature).map_err(|_|anyhow::anyhow!("assignment authority signature unreadable"))?;
+        let prepared=prepare_assignment_authority(&owner,&payload,&signature,&RealRunner)?;
+        ensure!(migration::config_reference(Path::new(&config.path))?==config,"owner configuration changed during verification");
+        Ok(db.install_assignment_authority(&prepared,&signature,jiff::Timestamp::now().as_millisecond())?)
+    })();
+    if let Err(error)=&result {record_cli_denial(project,"delegation","assignment-import",None,error);}
+    result
+}
+
+/// The operator switch for assignment policies (defaults off). `assign`
+/// re-verifies the named grant's owner signature against the current owner
+/// policy before it is recorded; `off`, `shadow` and `suggest` change no
+/// assignment and need no grant.
+pub fn configure_assignment(project:&Path,mode:&str,policies:&[crate::domain::PolicySpec],grant:Option<&str>)->Result<crate::store::AssignmentSettings> {
+    let result=(||{
+        let _guard=migration::runtime_mutation(project)?;
+        let mut db=migration::open_active(project)?;
+        let verified=match grant {
+            Some(id)=>{
+                let (stored,signature)=db.assignment_authority_grant(id)?;
+                let (owner,config)=policy(project)?;
+                let grant=prepare_assignment_authority(&owner,stored.raw(),&signature,&RealRunner).context("the stored grant does not verify under the current owner policy")?;
+                ensure!(migration::config_reference(Path::new(&config.path))?==config,"owner configuration changed during verification");
+                Some(grant)
+            }
+            None=>None,
+        };
+        Ok(db.set_assignment_settings(mode,policies,verified.as_ref(),jiff::Timestamp::now().as_millisecond())?)
+    })();
+    if let Err(error)=&result {record_cli_denial(project,"delegation","assignment-configure",None,error);}
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -882,6 +882,8 @@ enum TelemetryCommand {
     Compare(herdr_projects::telemetry::analytics::compare::Args),
     /// TM4.4 experiment sample-size planning and preregistered experiment reports. Read-only.
     Experiments { #[command(subcommand)] command:herdr_projects::telemetry::analytics::experiments::Command },
+    /// TM4.7 assignment policies: operator switch (default off), owner-signed randomized-assignment grants, what-if simulation, suggestions and shadow disagreement.
+    Policies { #[command(subcommand)] command:herdr_projects::telemetry::policies::Command },
 }
 
 #[cfg(feature="state-store")]
@@ -1309,6 +1311,11 @@ pub fn run() -> Result<()> {
         Command::Telemetry{slug,command:TelemetryCommand::Compare(args)}=>{
             project::validate_slug(&slug)?;
             print!("{}",herdr_projects::telemetry::analytics::run_compare(&ctx.root.join(slug),&args)?);Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Telemetry{slug,command:TelemetryCommand::Policies{command}}=>{
+            project::validate_slug(&slug)?;
+            print!("{}",herdr_projects::telemetry::policies::run(&ctx.root.join(slug),command)?);Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Experiments{command}}=>{
