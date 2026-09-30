@@ -7,10 +7,12 @@
 //! `<config_dir>/telemetry-cursor.key` (owner-only 0600, 64 hex digits,
 //! generated on first use, never exported). `project` is a digest of the
 //! canonical project path (never the path itself), `kid` the key's
-//! fingerprint. Opening checks, in order: well-formed, key present and
-//! matching `kid` (else `cursor_revoked`: deleting the key file revokes every
-//! cursor), MAC (`invalid_cursor`), expiry (`cursor_expired`), project scope
+//! fingerprint. Opening checks, in order: well-formed encoding, key present,
+//! MAC over raw bytes, JSON and matching `kid`, expiry (`cursor_expired`), project scope
 //! (`cursor_foreign_project`) and kind.
+//! A missing or rotated key yields `cursor_revoked`; a failed MAC otherwise
+//! yields `invalid_cursor`. On MAC failure, size-capped JSON is parsed only
+//! to diagnose a rotated key.
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -140,11 +142,18 @@ impl Keyring {
         if prefix != PREFIX || body.len() > 2 * MAX_PAYLOAD || mac.len() != 64 { return Err(invalid()); }
         let bytes = unhex(body).ok_or_else(invalid)?;
         let mac = unhex(mac).ok_or_else(invalid)?;
-        let payload: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
         let revoked = || ("cursor_revoked", json!({"detail": "the cursor key was rotated or removed; start again without --cursor"}));
         let (key, kid) = match self.key(false) { Ok(Some(k)) => k, Ok(None) => return Err(revoked()), Err(e) => return Err(("cursor_key_unusable", json!({"detail": format!("{e:#}")}))) };
+        if !equal(&hmac(key, &bytes), &mac) {
+            // The size-capped, unauthenticated payload is used only to diagnose
+            // revocation; no cursor claims are consumed before authentication.
+            if serde_json::from_slice::<Value>(&bytes).ok().is_some_and(|p| p["kid"].as_str().is_some_and(|id| id != kid)) {
+                return Err(revoked());
+            }
+            return Err(invalid());
+        }
+        let payload: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
         if payload["kid"] != kid.as_str() { return Err(revoked()); }
-        if !equal(&hmac(key, &bytes), &mac) { return Err(invalid()); }
         let exp = payload["exp"].as_i64().ok_or_else(invalid)?;
         if now >= exp { return Err(("cursor_expired", json!({"expired_unix_ms": exp, "detail": "start again without --cursor"}))); }
         if payload["project"] != project { return Err(("cursor_foreign_project", json!({"detail": "a cursor is valid only for the project that issued it"}))); }

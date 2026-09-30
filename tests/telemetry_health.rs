@@ -151,6 +151,70 @@ fn quota_window(sidecar: &rusqlite::Connection, remaining: &str, resets: i64, la
 
 // Outages and missing data: unknown with a reason, never ok, never a zero
 
+/// Drive complete foreground ticker passes over a temporary canonical project.
+/// Age only the operator evaluation fixture to exercise the 300 s boundary.
+#[test]
+fn ticker_health_requires_operator_opt_in_obeys_interval_and_never_notifies() {
+    use std::time::{Duration, Instant};
+    let p = Planted::new();
+    p.sidecar_created();
+    fs::write(p.project.join("PROJECT.md"), "ticker health fixture").unwrap();
+    fs::write(p.project.join(".state/format.json"), "{}").unwrap();
+    let inbox = || dump(&p.project.join(".state/state.db")).into_iter().find(|(table, _)| table == "inbox_items").unwrap().1;
+    let before_inbox = inbox();
+    assert!(before_inbox.is_empty());
+    let evaluations = || p.sidecar().query_row("SELECT count(*),count(CASE WHEN source='cli' THEN 1 END),count(CASE WHEN source='tick' THEN 1 END) FROM health_evaluations",
+        [], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))).unwrap();
+    let synced = || p.sidecar().query_row("SELECT synced_unix_ms FROM usage_ledger", [], |r| r.get::<_, i64>(0)).ok();
+    let pass = || {
+        let before = synced();
+        let mut child = Command::new(BIN).env_clear().env("HOME", p.tmp.path().join("home")).env("PATH", "/usr/bin:/bin")
+            .args(["--root", p.root.to_str().unwrap(), "ticker", "run"])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while synced() == before {
+            let exited = child.try_wait().unwrap();
+            if exited.is_some() || Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("ticker did not complete accounting: {exited:?} {}", fs::read_to_string(p.root.join(".ticker.log")).unwrap_or_default());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Accounting precedes health. Graceful stop waits for the whole pass.
+        fs::write(p.root.join(".ticker.stop"), b"").unwrap();
+        assert!(child.wait().unwrap().success());
+        fs::remove_file(p.root.join(".ticker.stop")).unwrap();
+        assert_eq!(inbox(), before_inbox);
+    };
+
+    pass();
+    assert_eq!(evaluations(), (0, 0, 0));
+    assert_eq!(p.alerts()["last_evaluated_unix_ms"], Value::Null);
+
+    // A 20-minute-old collection is above the 15-minute warning threshold, below one hour.
+    let now = unix_ms();
+    p.sidecar().execute("INSERT INTO collect_offsets(path_digest,device,inode,byte_offset,records,rate_limits,model,effort,updated_unix_ms) VALUES('ticker-source',1,1,0,0,0,NULL,NULL,?1)", [now - 20 * MINUTE]).unwrap();
+    assert_eq!(p.evaluate()["recorded"], true);
+    assert_eq!(evaluations(), (1, 1, 0));
+    assert_eq!(open_alert(&p.alerts(), "collector_stale").unwrap()["occurrences"], 1);
+    // No health interval override exists. Seed an elapsed operator evaluation,
+    // without waiting five minutes or changing the production clock.
+    p.sidecar().execute("UPDATE health_evaluations SET evaluated_unix_ms=?1", [now - 300_001]).unwrap();
+    pass();
+    assert_eq!(evaluations(), (2, 1, 1));
+    let first_tick = p.alerts();
+    assert!(first_tick["last_evaluated_unix_ms"].as_i64().unwrap() >= now);
+    let alert = open_alert(&first_tick, "collector_stale").unwrap();
+    assert_eq!((&alert["state"], &alert["occurrences"], &alert["notified_unix_ms"]), (&json!("warn"), &json!(2), &Value::Null));
+
+    pass();
+    assert!(unix_ms() - first_tick["last_evaluated_unix_ms"].as_i64().unwrap() < 300_000);
+    assert_eq!(evaluations(), (2, 1, 1));
+    assert_eq!(p.alerts(), first_tick);
+    assert_eq!(inbox(), before_inbox);
+}
+
 /// No sidecar: every sidecar-backed rule is `unknown collection_not_run` with
 /// an unavailable value (never 0) and `health evaluate` records nothing and
 /// creates no sidecar. With a sidecar but no collect, the collector is

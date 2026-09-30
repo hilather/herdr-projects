@@ -393,6 +393,31 @@ fn tohex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).coll
 /// Cursors are keyed (MAC), scoped to the project, expiring and revocable;
 /// the query service's drill-down shares them.
 #[test]
+fn malformed_tampering_is_invalid_and_deleted_cursor_keys_are_revoked() {
+    let p = Planted::new();
+    worked_example(&p);
+    let args = ["export", "--metric", "M07", "--drill", "numerator", "--page-size", "2"];
+    let first = p.json(&args);
+    let cursor = first["manifest"]["page"]["next_cursor"].as_str().unwrap();
+    let parts: Vec<&str> = cursor.split('.').collect();
+    // Replace the JSON with an unterminated object, retaining the original MAC.
+    let tampered = format!("c2.7b.{}", parts[2]);
+    let refusal = |token: &str| {
+        let mut request = args.to_vec();
+        request.extend(["--cursor", token]);
+        p.fail(&request)
+    };
+    assert!(refusal(&tampered).contains("\"code\":\"invalid_cursor\""));
+    fs::remove_file(p.config().join("telemetry-cursor.key")).unwrap();
+    assert!(refusal(cursor).contains("\"code\":\"cursor_revoked\""));
+    // Issue a replacement key too: the old, well-formed payload still diagnoses revocation.
+    let fresh = p.json(&args);
+    assert_ne!(fresh["manifest"]["page"]["next_cursor"], cursor);
+    assert!(refusal(cursor).contains("\"code\":\"cursor_revoked\""));
+    assert!(refusal(&tampered).contains("\"code\":\"invalid_cursor\""));
+}
+
+#[test]
 fn cursors_are_authenticated_scoped_and_expiring() {
     let p = Planted::new();
     worked_example(&p);
