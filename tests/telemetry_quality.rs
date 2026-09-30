@@ -655,3 +655,44 @@ fn paired_interval_resamples_tasks_and_selections_record_runner_ups() {
     // Deterministic: the same rows and seed give the same interval.
     assert_eq!(pair(Some("5"), &a, &b).1, ab);
 }
+
+/// TM3.5 regression: an arm's worker cannot elevate its own candidate. The
+/// store refuses a `worker:*` principal, an attempt's identity and an import
+/// as creator or selector (a judge named after an attempt too), and `quality
+/// groups create|select` refuse a worker execution context (`HOME` is a
+/// retained profile's execution home), writing nothing; the owner then selects.
+#[test]
+fn a_worker_cannot_create_a_group_or_select_its_own_arm() {
+    let f = Fixture::new();
+    let db_path = f.project.join(".state/state.db");
+    let mut fast = codex_profile(&f.config, "codex", "fast", Some(&f.tmp.path().join("fast-home")));
+    fast.arguments_digest = "1".repeat(64);
+    plant_profile(&db_path, fast);
+    let mut planted = Planted::default();
+    planted.group(&f, "g", 1, &["codex", "fast"], &["rej", "acc"]);
+    let group = planted.ids["g"].clone();
+    let mut store = herdr_projects::store::SqliteStore::open(&db_path).unwrap();
+    let choice = herdr_projects::store::SelectionChoice::Arm { arm: 1, submission: None, runner_up: vec![] };
+    for principal in ["worker:g-a1", "g-a1", "import:bot"] {
+        let err = format!("{:?}", store.select_candidate(&group, &choice, "operator_judgment", principal, unix_ms()).unwrap_err());
+        assert!(err.contains("cannot select a candidate"), "{principal}: {err}");
+        let err = format!("{:?}", store.create_candidate_group("work", &["codex".into(), "fast".into()], principal, unix_ms()).unwrap_err());
+        assert!(err.contains("cannot create a candidate group"), "{principal}: {err}");
+    }
+    let sub = planted.subs[&("g".to_owned(), 1)].clone();
+    assert!(format!("{:?}", store.select_candidate_by_judge(&group, &sub, "g-a1", None, &[], unix_ms()).unwrap_err()).contains("cannot select a candidate"));
+    drop(store);
+    let as_worker = |args: &[&str]| Command::new(BIN).env_clear().env("HOME", f.tmp.path().join("fast-home")).env("PATH", "/usr/bin:/bin")
+        .args(["--root", f.root.to_str().unwrap(), "telemetry", "demo", "quality", "groups"]).args(args).output().unwrap();
+    for args in [vec!["select", group.as_str(), "--arm", "1"], vec!["create", "work", "--arm", "codex", "--arm", "fast"]] {
+        let out = as_worker(&args);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && err.contains("`quality groups` records the project owner (operator:cli) and refuses to run inside a worker execution context: HOME is a worker execution home"), "{args:?}: {err}");
+    }
+    let selections = || rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT count(*) FROM candidate_selections", [], |r| r.get::<_, i64>(0)).unwrap();
+    assert_eq!(selections(), 0);
+    // `show` stays readable anywhere; the owner selects.
+    assert!(as_worker(&["show"]).status.success());
+    assert_eq!(f.cli_args(&["quality", "groups", "select", &group, "--rule"]).0["selection"]["arm"], json!(2));
+    assert_eq!(selections(), 1);
+}

@@ -287,19 +287,23 @@ pub struct DecisionArgs {
 /// `<root>/<project>/.state/worktrees/`. They are markers, not authority: a
 /// process that rewrites its own environment evades them, and the store API
 /// still refuses every worker principal.
-fn refuse_worker_context(project: &Path) -> Result<()> {
-    const REFUSED: &str = "the review CLI records the project owner (operator:cli) and refuses to run inside a worker execution context";
+fn refuse_worker_context(project: &Path) -> Result<()> { refuse_owner_cli_in_worker_context(project, "the review CLI") }
+
+/// [`refuse_worker_context`]'s markers for another owner CLI named `cli`
+/// (`quality groups create|select`, contracts-quality.md §3).
+pub(crate) fn refuse_owner_cli_in_worker_context(project: &Path, cli: &str) -> Result<()> {
+    let refused = format!("{cli} records the project owner (operator:cli) and refuses to run inside a worker execution context");
     let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     if let (Ok(cwd), Some(root)) = (std::env::current_dir(), project.parent())
         && let Ok(rest) = canonical(&cwd).strip_prefix(canonical(root)) {
         let parts: Vec<&std::ffi::OsStr> = rest.components().map(|c| c.as_os_str()).take(3).collect();
-        anyhow::ensure!(!(parts.len() == 3 && parts[1] == ".state" && parts[2] == "worktrees"), "{REFUSED}: the working directory is a task worktree");
+        anyhow::ensure!(!(parts.len() == 3 && parts[1] == ".state" && parts[2] == "worktrees"), "{refused}: the working directory is a task worktree");
     }
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return Ok(()) };
     if !project.join(".state/state.db").is_file() { return Ok(()); }
     let homes = execution_homes(&*super::read_only(&project.join(".state/state.db"))?)?;
     let home = canonical(&home);
-    anyhow::ensure!(!homes.iter().any(|h| canonical(Path::new(h)) == home), "{REFUSED}: HOME is a worker execution home");
+    anyhow::ensure!(!homes.iter().any(|h| canonical(Path::new(h)) == home), "{refused}: HOME is a worker execution home");
     Ok(())
 }
 

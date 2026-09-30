@@ -164,7 +164,13 @@ hold below and queued), and a loser keeps its own outcome.
 stores no cost and never moves it: a losing, cancelled or unfinished arm
 keeps its attempt's usage.
 
-**Commands** (`telemetry <slug> quality groups ...`, JSON):
+**Commands** (`telemetry <slug> quality groups ...`, JSON). `create` and
+`select` are the owner's: they refuse a worker execution context (the
+contracts-review.md §9 markers), and `SqliteStore` refuses a `worker:*`
+principal, any attempt's identity and an `import:*` principal as creator or
+selector (a judge named after an attempt too), writing nothing, so an arm's
+worker cannot select its own candidate and lift its hold (TM3.5,
+certificate-quality.md):
 
 - `create <task> --arm <profile> --arm <profile> ...` seals a group; each
   `--arm` names a retained native profile (latest retained report of that

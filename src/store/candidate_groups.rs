@@ -52,6 +52,20 @@ pub enum SelectionChoice { Arm { arm: u32, submission: Option<String>, runner_up
 
 fn invalid(message: String) -> StoreError { StoreError::Invalid(message) }
 
+/// A worker (`worker:*` or any attempt's identity) or an import never seals a
+/// group or selects a candidate: a selection lifts the integration and
+/// dependency hold, so an arm's worker could otherwise elevate its own
+/// candidate (TM3.5). Groups and selections are the owner's, a rule's or a
+/// judge's.
+fn selector_authority(tx: &Connection, principal: &str, what: &str) -> Result<()> {
+    let bare = principal.strip_prefix("worker:").unwrap_or(principal);
+    if principal.starts_with("worker:") || principal.starts_with("import:")
+        || tx.query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE id=?1)", [bare], |r| r.get::<_, bool>(0))? {
+        return Err(invalid(format!("{principal} cannot {what}: a worker's candidate is a proposal, and only the owner, a rule or a judge selects")));
+    }
+    Ok(())
+}
+
 /// Integration and dependency hold (contracts-quality.md §3), over a
 /// `result_submissions s` row: its attempt is bound to an arm of a (sealed)
 /// candidate group and it is not that group's selected submission. Holds
@@ -279,6 +293,7 @@ impl SqliteStore {
         if principal.is_empty() || principal.len() > 128 { return Err(invalid("invalid creator principal".into())); }
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         schema_53(&tx)?;
+        selector_authority(&tx, principal, "create a candidate group")?;
         let state: String = tx.query_row("SELECT state FROM tasks WHERE id=?1", [task], |r| r.get(0)).optional()?
             .ok_or_else(|| invalid(format!("no task {task}")))?;
         if matches!(state.as_str(), "succeeded" | "cancelled") { return Err(invalid(format!("task {task} is {state}"))); }
@@ -318,6 +333,7 @@ impl SqliteStore {
     pub fn select_candidate(&mut self, group: &str, choice: &SelectionChoice, reason: &str, principal: &str, now: i64) -> Result<CandidateSelection> {
         if principal.is_empty() || principal.len() > 128 { return Err(invalid("invalid selector principal".into())); }
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        selector_authority(&tx, principal, "select a candidate")?;
         let arm_count = open_group(&tx, group)?;
         let arms = bound_arms(&tx, group)?;
         let mut evidence = evidence(&arms);
@@ -385,6 +401,7 @@ impl SqliteStore {
         if judge.is_empty() || judge.len() > 122 { return Err(invalid("invalid judge".into())); }
         let judge_configuration = judge_configuration(configuration)?;
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        selector_authority(&tx, judge, "select a candidate")?;
         open_group(&tx, group)?;
         let arms = bound_arms(&tx, group)?;
         let positions = presentation(group, &arms);

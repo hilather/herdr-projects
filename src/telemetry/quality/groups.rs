@@ -80,6 +80,11 @@ pub enum Command {
 pub fn run(project: &Path, command: Command) -> Result<Value> {
     let now = jiff::Timestamp::now().as_millisecond();
     let open = || SqliteStore::open(&project.join(".state/state.db"));
+    // Groups and selections are the owner's (principal operator:cli): a worker
+    // must not seal a group or select its own arm through this CLI (TM3.5).
+    if matches!(command, Command::Create { .. } | Command::Select { .. }) {
+        super::super::review::refuse_owner_cli_in_worker_context(project, "`quality groups`")?;
+    }
     Ok(match command {
         Command::Create { task, arms } => json!({"group": open()?.create_candidate_group(&task, &arms, OPERATOR, now)?}),
         Command::Select { group, arm, submission, none, rule, judge, judge_configuration, runner_up, reason } => {
