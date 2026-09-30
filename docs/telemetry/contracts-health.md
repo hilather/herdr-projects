@@ -163,11 +163,18 @@ freshness}`.
   Evidence for the new configuration starts empty; old evidence stays
   queryable under its own arm.
 - **Advisory only.** `recommend` opens `state.db` only through
-  `telemetry::read_only` and the sidecar read-only, writes nothing (tested:
-  every file under `.state` byte-identical), and names no store, admission,
-  launch-preparation, profile-configuration or budget API (tested by source
-  inspection); no dispatch or admission source reads the health lane.
-  Adoption goes through the ordinary `thread start` path (doc 15 §6).
+  `telemetry::read_only` and the sidecar read-only and writes nothing
+  (tested: every file under `.state` byte-identical). End to end
+  (`recommendations_and_notices_change_no_canonical_state_and_no_dispatch`):
+  on a migrated project with a signed budget policy, an owner-signed
+  approval and contract, two retained worker profiles and a candidate group,
+  every canonical table is identical row for row after `recommend`,
+  `health evaluate`, `health notify` and `health notify --external` except
+  the inbox (exactly one new notice and its `inbox.delivered` event); the
+  launch draft and automatic admission's prepared inputs answer the same
+  before and after, and the next task is admitted on its own profile's
+  configuration, not the recommended one. Adoption goes through the
+  ordinary `thread start` path (doc 15 §6).
 
 `query --metric M50` answers `unavailable: per_recommendation`; the health
 view's M50 row reads `n/a (per_recommendation)`.

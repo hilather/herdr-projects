@@ -661,40 +661,395 @@ fn no_recommendation_when_the_comparison_refuses_to_rank() {
     assert!(p.fail(&["recommend", "--role", "code", "--metric", "M13"]).contains("comparison_unsupported"));
 }
 
-/// The recommendation and health code has no path to launch authority,
-/// profiles, model access, budgets or acceptance: the recommendation module
-/// opens nothing writable and names no store, admission, launch or profile
-/// API, and no dispatch or admission source reads the health lane.
+// A recommendation never changes canonical state or dispatch
+
+/// The disposable migrated project of tests/reservations.rs (its `Factory`):
+/// an owner key, a SHA-256 repository, queued tasks with runtime bindings and
+/// a launchable `worker` profile over fake binaries; launches are drafted,
+/// owner-signed and imported through the CLI.
+mod world {
+    #![allow(dead_code)]
+    use herdr_projects::{authority, domain::*, migration, runtime};
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
+    use std::{collections::BTreeMap, fs, os::unix::fs::{MetadataExt, PermissionsExt}, path::{Path, PathBuf}, process::{Command, Output}};
+
+    const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+    fn now() -> i64 { jiff::Timestamp::now().as_millisecond() }
+
+    pub struct World {
+        pub home: tempfile::TempDir, pub project: PathBuf, key: PathBuf, pub repo: PathBuf, pub store: String, pub base: String,
+        pub profile: VersionedReference, pub bindings: BTreeMap<String, String>, _socket: std::os::unix::net::UnixListener,
+    }
+
+    impl World {
+        /// An active project with an owner key, a SHA-256 repository, the plain
+        /// tasks `plain` and the queued tasks `queued` (each with its dependency
+        /// edges), a local runtime binding per queued task and a launchable
+        /// `worker` profile over fake Herdr and agent binaries.
+        pub fn new(max_workers: u32, plain: &[&str], queued: &[(&str, Value)]) -> Self {
+            let home = tempfile::tempdir().unwrap();
+            let key = home.path().join("owner");
+            assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).output().unwrap().status.success());
+            let public = fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+            let config = home.path().join(".config/herdr-projects/config.toml");
+            fs::create_dir_all(config.parent().unwrap()).unwrap();
+            fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[profiles.worker]\nkind='codex'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=60\nunknown_usage='allow_with_warning'\n")).unwrap();
+            let repo = home.path().join("repo");
+            fs::create_dir(&repo).unwrap();
+            let socket = std::os::unix::net::UnixListener::bind(home.path().join("native.sock")).unwrap();
+            let mut f = World { project: home.path().join("root/demo"), key, repo, store: String::new(), base: String::new(),
+                profile: VersionedReference { id: String::new(), revision: 1, digest: String::new() }, bindings: BTreeMap::new(), _socket: socket, home };
+            for command in ["new", "pause"] { f.ok(&[command, "demo"]); }
+            migration::apply(&f.project, &migration::inspect_with_config(&f.project, &config).unwrap(), true).unwrap();
+            f.store = f.project.join(".state/state.db").canonicalize().unwrap().display().to_string();
+            f.git(&["init", "-q", "--object-format=sha256"]);
+            f.git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+            f.base = f.git(&["rev-parse", "HEAD"]);
+            for task in plain { f.ok(&["task", "demo", "add", task, "--title", task, "--expected-head", &f.head().to_string()]); }
+            for (task, dependencies) in queued {
+                f.ok(&["task", "demo", "add", task, "--title", task, "--expected-head", &f.head().to_string()]);
+                let request = f.path(&format!("{task}-queue.json"));
+                fs::write(&request, json!({"priority":0,"dependencies":dependencies}).to_string()).unwrap();
+                f.ok(&["task", "demo", "queue", task, "--input-file", request.to_str().unwrap(), "--expected-revision", "1", "--expected-head", &f.head().to_string()]);
+            }
+            let policy = runtime::snapshot(&f.project).unwrap().scheduler.unwrap().policy.revision.to_string();
+            f.ok(&["scheduler", "demo", "policy", "--max-active-workers", &max_workers.to_string(), "--max-attempts-per-task", "3", "--expected-revision", &policy, "--expected-head", &f.head().to_string()]);
+            let route = RuntimeRoute { socket: f.path("native.sock").display().to_string(), cwd: f.repo.canonicalize().unwrap().display().to_string(), ..Default::default() };
+            let mut observations = Vec::new();
+            for (task, _) in queued {
+                let id = TaskId::new(*task).unwrap();
+                let revision = runtime::snapshot(&f.project).unwrap().tasks.into_iter().find(|t| t.id == id).unwrap().revision;
+                let change = runtime::create_binding(&f.project, Some(&id), Some(revision), f.head(), &route).unwrap();
+                observations.push(herdr_projects::reconcile::RuntimeObservation { binding: change.binding.id.clone(), binding_revision: change.binding.revision,
+                    task_revision: change.task_revision, observed_unix_ms: now(), collector: "herdr-git-v2".into(),
+                    config_digest: migration::config_reference(&config).unwrap().digest, ..Default::default() });
+                f.bindings.insert(task.to_string(), change.binding.id);
+            }
+            migration::open_active(&f.project).unwrap().record_observations(f.head(), &observations).unwrap();
+            let snapshot = runtime::snapshot(&f.project).unwrap();
+            runtime::set_state(&f.project, snapshot.head, snapshot.control.unwrap().revision, ProjectState::Active, &config).unwrap();
+            f.profile = f.launchable_profile();
+            f
+        }
+        pub fn cli(&self, args: &[&str]) -> Output {
+            Command::new(BIN).env_clear().env("HOME", self.home.path()).env("PATH", "/usr/bin:/bin")
+                .args(["--root", self.home.path().join("root").to_str().unwrap()]).args(args).output().unwrap()
+        }
+        pub fn ok(&self, args: &[&str]) -> Value {
+            let out = self.cli(args);
+            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            serde_json::from_slice(&out.stdout).unwrap_or(Value::Null)
+        }
+        /// A refused command writes nothing; returns its stderr.
+        pub fn refused(&self, args: &[&str]) -> String {
+            let before = runtime::snapshot(&self.project).unwrap();
+            let out = self.cli(args);
+            assert!(!out.status.success(), "{args:?} accepted: {}", String::from_utf8_lossy(&out.stdout));
+            assert_eq!(runtime::snapshot(&self.project).unwrap(), before, "{args:?} was refused but wrote");
+            String::from_utf8_lossy(&out.stderr).into_owned()
+        }
+        pub fn head(&self) -> u64 { runtime::snapshot(&self.project).unwrap().head }
+        pub fn path(&self, name: &str) -> PathBuf { self.home.path().join(name) }
+        pub fn attempts(&self) -> Vec<Attempt> { runtime::snapshot(&self.project).unwrap().attempts }
+        pub fn git(&self, args: &[&str]) -> String {
+            let out = Command::new("/usr/bin/git").env_clear().env("PATH", "/usr/bin:/bin").env("HOME", self.home.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "fixture").env("GIT_AUTHOR_EMAIL", "fixture@example.com")
+                .env("GIT_COMMITTER_NAME", "fixture").env("GIT_COMMITTER_EMAIL", "fixture@example.com")
+                .current_dir(&self.repo).args(args).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        }
+        /// Owner-sign `bytes` written to `name`; returns (document, signature).
+        pub fn sign(&self, name: &str, bytes: &[u8], namespace: &str) -> (String, String) {
+            let path = self.path(name);
+            fs::write(&path, bytes).unwrap();
+            let signature = format!("{}.sig", path.display());
+            let _ = fs::remove_file(&signature);
+            assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y", "sign", "-f"]).arg(&self.key).args(["-n", namespace]).arg(&path).output().unwrap().status.success());
+            (path.display().to_string(), signature)
+        }
+        /// Prepare `worker` over fake binaries; only the native interaction
+        /// evidence, which needs a real agent session, is planted.
+        pub fn launchable_profile(&self) -> VersionedReference {
+            use herdr_projects::worker_supervision::{ProcessIncarnation, SupervisorIdentity};
+            let bin = self.path("bin");
+            let agent_home = self.path("agent-home");
+            fs::create_dir_all(&bin).unwrap();
+            fs::create_dir_all(&agent_home).unwrap();
+            let (herdr, agent) = (bin.join("herdr"), bin.join("codex"));
+            fs::write(&herdr, "#!/usr/bin/python3\nimport sys,json\nif sys.argv[1:]==['--version']:print('herdr 0.9.1');sys.exit(0)\nr=json.loads(sys.stdin.readline())\nprint(json.dumps({'id':r['id'],'result':{'type':'pong','version':'0.9.1','capabilities':{'workspace_create_command':True}}}))\n").unwrap();
+            fs::write(&agent, "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 2\nprintf '%s\\n' 'codex-cli 0.154.0'\n").unwrap();
+            for path in [&herdr, &agent] { fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap(); }
+            let prepared = self.ok(&["profile", "prepare", "demo", "worker", "--herdr-executable", herdr.to_str().unwrap(),
+                "--agent-executable", agent.to_str().unwrap(), "--execution-home", agent_home.to_str().unwrap()]);
+            let mut profile: FrozenProfile = serde_json::from_value(prepared["profile"].clone()).unwrap();
+            #[derive(serde::Serialize)] struct Interaction { session: ResourceIdentity, terminal: &'static str, readiness_manifest: &'static str, prompt_digest: String, acknowledged_unix_ms: i64 }
+            #[derive(serde::Serialize)] struct Evidence { version: u32, prepared_profile: VersionedReference, supervisor: SupervisorIdentity, native_kind: String, observed_unix_ms: i64, stopped_unix_ms: i64, interaction: Interaction }
+            let evidence = Evidence { version: 2, prepared_profile: profile.reference().unwrap(), native_kind: profile.kind.clone(), observed_unix_ms: 1000, stopped_unix_ms: 1001,
+                supervisor: SupervisorIdentity { version: 1, boot_id: "00000000-0000-0000-0000-000000000001".into(), host_id: None, observer_namespace: (1, 2), worker_namespace: (1, 3),
+                    outer: ProcessIncarnation { pid: 20, device: 1, inode: 4 }, init: ProcessIncarnation { pid: 21, device: 1, inode: 5 } },
+                interaction: Interaction { session: ResourceIdentity { device: 1, inode: 2, born_secs: 1, born_nanos: 0 }, terminal: "fixture-terminal", readiness_manifest: "fixture-manifest", prompt_digest: "a".repeat(64), acknowledged_unix_ms: 999 } };
+            let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&evidence).unwrap()));
+            let supported = CapabilityEvidence::Supported { evidence: VersionedReference { id: format!("native-transport-{hash}"), revision: 1, digest: hash } };
+            let c = &mut profile.capabilities;
+            (c.launch, c.stop, c.readiness_observation, c.prompt_submission) = (supported.clone(), supported.clone(), supported.clone(), supported);
+            let reference = profile.reference().unwrap();
+            let metadata = fs::metadata(&self.store).unwrap();
+            let report = json!({"preparation":{"profile":profile,"reference":reference,"launchable":true,"protocol_capable":false,"certified":false},
+                "evidence":evidence,"source_store":[self.store,metadata.dev(),metadata.ino()]}).to_string();
+            rusqlite::Connection::open(&self.store).unwrap().execute("INSERT INTO native_profiles(profile_digest,report,report_digest,sequence) VALUES(?1,?2,?3,(SELECT max(sequence) FROM events))",
+                rusqlite::params![reference.digest, report, format!("{:x}", Sha256::digest(report.as_bytes()))]).unwrap();
+            reference
+        }
+        /// Retain worker knowledge for `task` and write its launch selection.
+        pub fn selection(&self, task: &str) -> PathBuf {
+            let scope = self.path(&format!("{task}-scope.json"));
+            fs::write(&scope, json!({"schema_version":1,"task_id":task,"profile":"worker","domains":[],"paths":[],"pinned_keys":[],"sensitivity":"default"}).to_string()).unwrap();
+            let snapshot = self.ok(&["memory", "demo", "snapshot", "--task", task, "--profile", "worker", "--input-file", scope.to_str().unwrap(), "--worker"]);
+            let selection = self.path(&format!("{task}-selection.json"));
+            fs::write(&selection, json!({"task":task,"binding":self.bindings[task],"profile":self.profile,
+                "knowledge":{"id":snapshot["id"],"revision":1,"digest":snapshot["manifest_hash"]},"repositories":[self.repo.canonicalize().unwrap()]}).to_string()).unwrap();
+            selection
+        }
+        pub fn draft_args(&self, selection: &Path) -> Vec<String> {
+            ["launch", "demo", "draft", "--selection", selection.to_str().unwrap(), "--expected-head", &self.head().to_string()].map(String::from).to_vec()
+        }
+        /// Draft and owner-sign the launch; returns (draft, installed approval digest).
+        pub fn approve(&self, selection: &Path) -> (Value, String) {
+            let drafted = self.ok(&self.draft_args(selection).iter().map(String::as_str).collect::<Vec<_>>());
+            let (doc, sig) = self.sign("approval.json", &serde_json::to_vec_pretty(&drafted["approval"]).unwrap(), authority::SIGNATURE_NAMESPACE);
+            let approval = self.ok(&["approval", "demo", "import", &doc, &sig, "--expected-head", &self.head().to_string()]);
+            (drafted, approval["digest"].as_str().unwrap().to_owned())
+        }
+        /// Owner-sign and import budget policy `revision`.
+        pub fn budget(&self, revision: u64, limits: BudgetLimits) -> Value {
+            let policy = BudgetPolicy { version: 1, project_store: self.store.clone(), revision, authority: authority::policy_reference(&self.project).unwrap(), limits };
+            let (doc, sig) = self.sign("budget.json", &serde_json::to_vec(&policy).unwrap(), authority::BUDGET_SIGNATURE_NAMESPACE);
+            self.ok(&["budget", "demo", "import", &doc, &sig, "--expected-head", &self.head().to_string()]);
+            self.ok(&["budget", "demo", "inspect"])
+        }
+    }
+}
+
+/// Every canonical table, row for row in a stable order (`sqlite_master`
+/// order, then every column): `(table, rows)`.
+fn dump(store: &Path) -> Vec<(String, Vec<String>)> {
+    let db = rusqlite::Connection::open(store).unwrap();
+    let tables: Vec<String> = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").unwrap()
+        .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    tables.into_iter().map(|table| {
+        let columns: Vec<String> = db.prepare(&format!("SELECT name FROM pragma_table_info('{table}')")).unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        let row = columns.iter().map(|c| format!("quote(\"{c}\")")).collect::<Vec<_>>().join("||'|'||");
+        let order = columns.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(",");
+        let rows: Vec<String> = db.prepare(&format!("SELECT {row} FROM \"{table}\" ORDER BY {order}")).unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        (table, rows)
+    }).collect()
+}
+
+/// A launch draft as an answer: without the clock-derived approval window,
+/// the attempt id and worktree branches derived from it (and the prompt
+/// digest over text naming them) and the expected head.
+fn draft_answer(draft: &Value) -> Value {
+    let attempt = draft["brief"]["attempt_id"].as_str().unwrap().to_owned();
+    let mut text = draft.to_string().replace(&attempt, "<attempt>");
+    // Worktree branches are named from the attempt id.
+    for w in draft["worktrees"].as_array().into_iter().flatten() { text = text.replace(w["branch"].as_str().unwrap(), "<attempt branch>"); }
+    let mut d: Value = serde_json::from_str(&text).unwrap();
+    for (a, b) in [("approval", "issued_unix_ms"), ("approval", "expires_unix_ms"), ("inputs", "approval"), ("inputs", "expected_head"), ("brief", "prompt_digest")] {
+        d[a][b] = Value::Null;
+    }
+    d["head"] = Value::Null;
+    d
+}
+
+/// JSON paths where `a` and `b` differ, with both values.
+fn differences(a: &Value, b: &Value, path: String, out: &mut Vec<String>) {
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => for key in x.keys().chain(y.keys().filter(|k| !x.contains_key(*k))) {
+            differences(x.get(key).unwrap_or(&Value::Null), y.get(key).unwrap_or(&Value::Null), format!("{path}.{key}"), out);
+        },
+        (Value::Array(x), Value::Array(y)) if x.len() == y.len() => for (i, (p, q)) in x.iter().zip(y).enumerate() { differences(p, q, format!("{path}[{i}]"), out); },
+        (Value::String(x), Value::String(y)) if x != y => {
+            let lines = |t: &str| t.lines().map(str::to_owned).collect::<Vec<_>>();
+            let (p, q) = (lines(x), lines(y));
+            out.push(format!("{path}: {:?} != {:?}", p.iter().filter(|l| !q.contains(l)).collect::<Vec<_>>(), q.iter().filter(|l| !p.contains(l)).collect::<Vec<_>>()));
+        }
+        _ if a != b => out.push(format!("{path}: {a} != {b}")),
+        _ => {}
+    }
+}
+
+/// A project with a signed budget policy, owner-signed approval for a queued
+/// task with an owner-signed contract, two retained worker profiles and a
+/// candidate group; 20 terminal `code` tasks accepted on the `fast`
+/// configuration and 20 failed on `worker`'s, so `recommend --role code`
+/// recommends `fast`. Every canonical table is dumped before and after
+/// `recommend`, `health evaluate`, `health notify` and `health notify
+/// --external` (enabled, to a temporary directory): only the inbox and its
+/// `inbox.*` events differ, by exactly the one expected notice (the quota
+/// alert). The launch draft for the queued task and automatic admission's
+/// prepared inputs are the same before and after the recommendation exists,
+/// and so is the configuration dispatched: `worker`, never the recommended
+/// `fast`. The budget rule reads the signed policy (1000 attempts, 41 used): ok.
 #[test]
-fn recommendations_have_no_path_to_grants_profiles_budgets_or_gates() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let code = |path: &str| fs::read_to_string(root.join(path)).unwrap().lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
-    let recommend = code("src/telemetry/health/recommend.rs");
-    for forbidden in ["crate::store", "SqliteStore", "crate::admission", "launch_preparation", "profile_config", "accounting::budget", "sidecar::open",
-        "Connection::open", ".execute(", "transaction", "crate::migration", "grant", "reserve"] {
-        assert!(!recommend.contains(forbidden), "recommend.rs mentions {forbidden}");
-    }
-    assert!(recommend.contains("crate::telemetry::read_only"), "the dispatch log is read strictly read-only");
-    for rules in ["src/telemetry/health/rules.rs", "src/telemetry/health/store.rs", "src/telemetry/health/mod.rs"] {
-        let text = code(rules);
-        for forbidden in ["SqliteStore", "crate::admission", "launch_preparation", "profile_config", "crate::migration"] {
-            assert!(!text.contains(forbidden), "{rules} mentions {forbidden}");
+fn recommendations_and_notices_change_no_canonical_state_and_no_dispatch() {
+    use herdr_projects::domain::{BudgetLimits, UnknownUsagePolicy};
+    let w = world::World::new(2, &[], &[("next", json!([]))]);
+    let store = w.project.join(".state/state.db");
+    let config = w.path(".config/herdr-projects/config.toml");
+    let config_ref = herdr_projects::migration::config_reference(&config).unwrap();
+    // Owner-signed contract for the queued task.
+    let contract = json!({"version":1,"project_store":w.store,"expected_head":w.head(),"task_id":"next","contract_revision":1,
+        "deliverable":"next","non_goals":"no worker launch","acceptance_policies":[{"id":"builds","text":"{\"version\":1,\"checks\":[\"/usr/bin/git\",\"diff\",\"--quiet\"]}"}],
+        "repository":w.repo.canonicalize().unwrap(),"base_oid":w.base,"object_format":"sha256","dependencies":[],"scope":{"paths":[],"named_resources":[]},
+        "capability_flags":[],"profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_only",
+        "authority":herdr_projects::authority::policy_reference(&w.project).unwrap()});
+    let (doc, sig) = w.sign("contract.json", &serde_json::to_vec(&contract).unwrap(), herdr_projects::authority::CONTRACT_SIGNATURE_NAMESPACE);
+    w.ok(&["task", "demo", "contract", "put", "--input-file", &doc, "--signature", &sig]);
+    // Signed budget policy.
+    let budget = w.budget(1, BudgetLimits { max_attempts: Some(1000), max_provider_tokens: None, unknown_usage: UnknownUsagePolicy::AllowIncomplete });
+    assert!(!budget.is_null());
+    // A second retained worker profile.
+    let fast = codex_profile(&config_ref, "claude", "fast", Some(&w.path("fast-home")));
+    plant_profile(&store, fast.clone());
+    let fast_config = herdr_projects::domain::agent_configuration(&fast);
+    let worker_profile: herdr_projects::domain::FrozenProfile = {
+        let db = rusqlite::Connection::open(&store).unwrap();
+        let report: String = db.query_row("SELECT report FROM native_profiles WHERE profile_digest=?1", [&w.profile.digest], |r| r.get(0)).unwrap();
+        serde_json::from_value(serde_json::from_str::<Value>(&report).unwrap()["preparation"]["profile"].clone()).unwrap()
+    };
+    let worker_config = herdr_projects::domain::agent_configuration(&worker_profile);
+    // Comparison evidence: FK-valid terminal tasks on both configurations.
+    {
+        let db = rusqlite::Connection::open(&store).unwrap();
+        for c in [&fast_config, &worker_config] {
+            db.execute("INSERT OR IGNORE INTO agent_configurations(configuration_id,canonical_json,first_decided_unix_ms) VALUES(?1,?2,1)", [&c.id, &c.canonical_json]).unwrap();
         }
-    }
-    // The only canonical write of the lane: inbox notices through the store's inbox delivery.
-    let notify = code("src/telemetry/health/notify.rs");
-    let store_calls: Vec<&str> = notify.lines().filter(|l| l.contains("store.") || l.contains("SqliteStore")).collect();
-    assert!(store_calls.iter().all(|l| l.contains("SqliteStore::open") || l.contains("deliver_telemetry_notice") || l.contains("current_head")), "{store_calls:?}");
-    let mut dispatch = vec!["src/admission.rs".to_owned(), "src/launch_preparation.rs".to_owned(), "src/fair_admission.rs".to_owned(), "src/profile_config.rs".to_owned()];
-    for dir in ["src/store", "src/scheduling"] {
-        if let Ok(entries) = fs::read_dir(root.join(dir)) {
-            dispatch.extend(entries.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "rs")).map(|e| format!("{dir}/{}", e.file_name().to_string_lossy())));
+        for i in 0..40 {
+            let (id, configuration, accepted) = if i < 20 { (format!("f{i:02}"), &worker_config.id, false) } else { (format!("g{i:02}"), &fast_config.id, true) };
+            let (attempt, t0) = (format!("{id}-a0"), 1_000 + i as i64 * 1_000);
+            db.execute("INSERT INTO tasks(id,revision,state,title) VALUES(?1,1,?2,?1)", [id.as_str(), if accepted { "succeeded" } else { "failed" }]).unwrap();
+            db.execute("INSERT INTO task_contracts(task_id,contract_revision,project_store,expected_head,repository,base_oid,object_format,route,raw_bytes,raw_digest,installed_seq)
+                VALUES(?1,1,'store',1,'/repo',?2,'sha1','verify_only',x'7b7d',?3,(SELECT max(sequence) FROM events))", rusqlite::params![id, OID, hex(&format!("contract-{id}"))]).unwrap();
+            db.execute("INSERT INTO acceptance_policies(task_id,contract_revision,policy_id,body) VALUES(?1,1,'ci','cargo test')", [&id]).unwrap();
+            let classification = format!("sha256:{}", hex(&format!("class-{id}")));
+            db.execute("INSERT INTO task_classifications(classification_id,task_id,contract_revision,taxonomy,class,band,features,classifier,revision,reason,created_unix_ms)
+                VALUES(?1,?2,1,'taxonomy.v1','code','small','{}','rule:fixture',1,NULL,?3)", rusqlite::params![classification, id, t0]).unwrap();
+            db.execute("INSERT INTO attempts(id,task_id,revision,state,reservation,termination_observed) VALUES(?1,?2,2,?3,?1,1)",
+                rusqlite::params![attempt, id, if accepted { "completed" } else { "failed" }]).unwrap();
+            db.execute("INSERT INTO attempt_lifecycle(attempt_id,state,attempt_revision,unix_ms,source) VALUES(?1,'reserved',1,?2,'fixture')", rusqlite::params![attempt, t0]).unwrap();
+            db.execute("INSERT INTO attempt_lifecycle(attempt_id,state,attempt_revision,unix_ms,source) VALUES(?1,?2,2,?3,'fixture')",
+                rusqlite::params![attempt, if accepted { "completed" } else { "failed" }, t0 + 5]).unwrap();
+            let eligible = json!([{"configuration_id": configuration, "profile_digest": "0".repeat(64), "status": "chosen", "probability_ppm": 1_000_000}]).to_string();
+            db.execute("INSERT INTO dispatch_decisions(attempt_id,task_id,task_revision,contract_revision,classification_id,chosen_configuration_id,eligible,chooser_kind,chooser_principal,reason_codes,note,policy,seed,decided_unix_ms)
+                VALUES(?1,?2,1,1,?3,?4,?5,'operator','approval:fixture','[\"unspecified\"]',NULL,NULL,NULL,?6)", rusqlite::params![attempt, id, classification, configuration, eligible, t0]).unwrap();
+            if accepted {
+                let (submission, result) = (hex(&format!("submission-{id}")), hex(&format!("result-{id}")));
+                db.execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,artifact_manifest,claimed_checks,created_unix_ms)
+                    VALUES(?1,'store',?1,?2,'{}',?3,1,?2,?4,'/repo',?5,?5,'sha1','[]','[]',?6)", rusqlite::params![submission, hex("d"), id, attempt, OID, t0 + 90]).unwrap();
+                db.execute("INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,
+                    commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms)
+                    VALUES(?1,'store',?1,?2,?3,?4,1,?2,?5,'ci',?2,?6,?6,'sha1',0,'linux-unshare-user-pid-mount-v1','[\"x\"]','[]','accepted',NULL,0,?7,1,1,?8)",
+                    rusqlite::params![result, hex("d"), submission, id, attempt, OID, hex("r"), t0 + 95]).unwrap();
+                db.execute("INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms)
+                    VALUES(?1,?1,?2,?3,?3,'sha1',?4,?5,'linux-unshare-user-pid-mount-v1',0,?6)", rusqlite::params![result, submission, OID, hex("d"), hex("r"), t0 + 100]).unwrap();
+            }
         }
+        // A task with a contract for the candidate group.
+        db.execute("INSERT INTO tasks(id,revision,state,title) VALUES('race',1,'running','race')", []).unwrap();
+        db.execute("INSERT INTO task_contracts(task_id,contract_revision,project_store,expected_head,repository,base_oid,object_format,route,raw_bytes,raw_digest,installed_seq)
+            VALUES('race',1,'store',1,'/repo',?1,'sha1','verify_only',x'7b7d',?2,(SELECT max(sequence) FROM events))", rusqlite::params![OID, hex("contract-race")]).unwrap();
+        let violations: i64 = db.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get(0)).unwrap();
+        assert_eq!(violations, 0, "the planted evidence is foreign-key valid");
     }
-    for file in dispatch.iter().filter(|f| root.join(f).is_file()) {
-        let text = fs::read_to_string(root.join(file)).unwrap();
-        assert!(!text.contains("telemetry::health") && !text.contains("recommend::"), "{file} reads the health lane");
-    }
+    let telemetry = |args: &[&str]| { let mut all = vec!["telemetry", "demo"]; all.extend_from_slice(args); w.ok(&all) };
+    let group = telemetry(&["quality", "groups", "create", "race", "--arm", "worker", "--arm", "fast"]);
+    assert_eq!(group["group"]["arms"].as_array().unwrap().len(), 2, "{group}");
+    // Owner-signed approval for the queued task and automatic admission on (fixture only, as tests/reservations.rs).
+    let selection = w.selection("next");
+    let (draft_before, _approval) = w.approve(&selection);
+    rusqlite::Connection::open(&store).unwrap().execute("UPDATE project_control SET factory_admission='on' WHERE singleton=1", []).unwrap();
+    let admission_before = serde_json::to_value(herdr_projects::admission::prepared_admission_inputs(&w.project).unwrap().expect("a ready candidate")).unwrap();
+    // A health condition to notify: a current quota window with 12.5 % left.
+    telemetry(&["collect"]);
+    let now = unix_ms();
+    quota_window(&rusqlite::Connection::open(w.project.join(".state/telemetry.db")).unwrap(), "12.5", now + HOUR, now - MINUTE);
+    let outbox = w.path("outbox");
+    fs::create_dir_all(&outbox).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&outbox, fs::Permissions::from_mode(0o700)).unwrap();
+    let alerts_config = w.path(".config/herdr-projects/telemetry-alerts.toml");
+    fs::write(&alerts_config, format!("schema = \"telemetry-alerts-config.v1\"\n[external]\nenabled = true\ndestination = \"directory\"\ndirectory = \"{}\"\n", outbox.display())).unwrap();
+    fs::set_permissions(&alerts_config, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let before = dump(&store);
+    let head_before = w.head();
+    let rec = telemetry(&["recommend", "--role", "code", "--json"]);
+    assert_eq!((&rec["status"], &rec["recommendation"]["configuration_id"], &rec["recommendation"]["label"]),
+        (&json!("recommended"), &json!(fast_config.id), &json!("claude 0.154.0")), "{rec}");
+    assert_eq!(telemetry(&["recommend", "--role", "docs", "--json"])["status"], "no_recommendation");
+    let evaluated = telemetry(&["health", "evaluate", "--json"]);
+    let budget_state = state(&evaluated, "budget_exposure");
+    assert_eq!((&budget_state["state"], codes(budget_state)), (&json!("ok"), vec!["within_limit".to_owned()]), "{budget_state}");
+    assert_eq!(budget_state["evidence"]["evaluations"], json!([{"dimension": "attempts", "policy_source": "canonical", "policy_revision": 1, "scope": "project",
+        "limit": 1000, "admitted": 40, "decision": "allow", "reason": "within_limit"}]));
+    assert_eq!(state(&evaluated, "recommendation_stale")["state"], "ok");
+    assert!(dump(&store) == before, "recommend and health evaluate write no canonical row");
+    let open: Vec<Value> = telemetry(&["health", "alerts", "--json"])["open"].as_array().unwrap().clone();
+    assert_eq!(open.iter().map(|a| a["rule"].as_str().unwrap()).collect::<Vec<_>>(), ["quota_headroom"]);
+    let notice = format!("telemetry-health-{}-{}", open[0]["alert_id"], open[0]["opened_unix_ms"]);
+    telemetry(&["health", "notify"]);
+    telemetry(&["health", "notify"]);
+    let external = telemetry(&["health", "notify", "--external"]);
+    assert_eq!(external["written"].as_array().unwrap().len(), 1);
+
+    // Only the inbox (and its `inbox.*` events) changed, by exactly the one notice.
+    let after = dump(&store);
+    let without_inbox = |tables: &[(String, Vec<String>)]| -> Vec<(String, Vec<String>)> {
+        tables.iter().filter(|(t, _)| t != "inbox_items").map(|(t, rows)| (t.clone(), match t.as_str() {
+            "events" => rows.iter().filter(|r| !r.contains("'inbox.")).cloned().collect(),
+            // The events sequence counter: it moves with the inbox event, checked below.
+            "sqlite_sequence" => rows.iter().filter(|r| !r.starts_with("'events'|")).cloned().collect(),
+            _ => rows.clone(),
+        })).collect()
+    };
+    let changed: Vec<(String, Vec<String>, Vec<String>)> = without_inbox(&after).into_iter().zip(without_inbox(&before))
+        .filter(|(a, b)| a != b).map(|((t, a), (_, b))| (t, b.iter().filter(|r| !a.contains(r)).cloned().collect(), a.iter().filter(|r| !b.contains(r)).cloned().collect())).collect();
+    assert!(changed.is_empty(), "every table but the inbox is identical row for row; changed (table, removed, added): {changed:?}");
+    assert_eq!(without_inbox(&after).len(), without_inbox(&before).len());
+    let rows = |tables: &[(String, Vec<String>)], name: &str| tables.iter().find(|(t, _)| t == name).unwrap().1.clone();
+    let new_items: Vec<String> = rows(&after, "inbox_items").into_iter().filter(|r| !rows(&before, "inbox_items").contains(r)).collect();
+    assert_eq!(new_items.len(), 1, "{new_items:?}");
+    assert!(new_items[0].starts_with(&format!("'{notice}'|")), "{new_items:?}");
+    let new_events: Vec<String> = rows(&after, "events").into_iter().filter(|r| !rows(&before, "events").contains(r)).collect();
+    assert_eq!(new_events.len(), 1);
+    assert!(new_events[0].contains("'inbox.delivered'") && new_events[0].contains(&notice), "{new_events:?}");
+    assert_eq!(w.head(), head_before + 1);
+    let counter = |tables: &[(String, Vec<String>)]| rows(tables, "sqlite_sequence").into_iter().find(|r| r.starts_with("'events'|")).unwrap();
+    assert_eq!((counter(&before), counter(&after)), (format!("'events'|{head_before}"), format!("'events'|{}", head_before + 1)));
+
+    // Dispatch answers the same with a recommendation in place.
+    let draft_after = w.ok(&w.draft_args(&selection).iter().map(String::as_str).collect::<Vec<_>>());
+    // Drafted before the approval import (one event) and after the notice (one event).
+    assert_eq!((&draft_before["head"], &draft_after["head"]), (&json!(head_before - 1), &json!(head_before + 1)));
+    let mut diff = Vec::new();
+    differences(&draft_answer(&draft_after), &draft_answer(&draft_before), String::new(), &mut diff);
+    assert!(diff.is_empty(), "the launch draft is the same answer: {diff:?}");
+    let admission_after = serde_json::to_value(herdr_projects::admission::prepared_admission_inputs(&w.project).unwrap().expect("a ready candidate")).unwrap();
+    assert_eq!(serde_json::to_vec(&admission_after).unwrap(), serde_json::to_vec(&admission_before).unwrap(), "admission prepares the same bytes");
+    let chosen = |inputs: &Value| herdr_projects::domain::agent_configuration(&serde_json::from_value(inputs["effective_profile"].clone()).unwrap()).id;
+    assert_eq!(chosen(&admission_after), worker_config.id);
+    assert_eq!(chosen(&draft_after["inputs"]), worker_config.id);
+    assert_ne!(worker_config.id, fast_config.id);
+    // The next task is admitted on `worker`, not on the recommended `fast`.
+    let (_, _) = w.approve(&selection);
+    herdr_projects::admission::admit_once(&w.project).unwrap();
+    let (chosen_id, reasons): (String, String) = rusqlite::Connection::open(&store).unwrap()
+        .query_row("SELECT chosen_configuration_id,reason_codes FROM dispatch_decisions WHERE task_id='next'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(chosen_id, worker_config.id);
+    assert!(!reasons.contains("recommended"), "{reasons}");
 }
 
 /// The rule table is declared and bounded; `health` text names every rule.
