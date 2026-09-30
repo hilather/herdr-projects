@@ -515,12 +515,14 @@ none of it changes this certificate's measurements.
   `an_isolated_codex_worker_commits_through_codex_workspace_write_sandbox`
   (the real-Codex part runs with `HP_CODEX_SANDBOX_BIN`). Still open: a live
   run of a Codex TUI author under `workspace-write` with the override.
-- **F3 (lane A/B): flagged, not moved.** `collectors sessions` reports
+- **F3 (lane A/B): fixed; flagged, not moved.** `collectors sessions` reports
   `after_termination {terminated_unix_ms, records, first_unix_ms}` per
   rollout bound to a terminated attempt: usage records whose line time is
   after the termination receipt (contracts-collection.md A9). The records
-  still count in the attempt's usage and M08 (L2 stands); surfacing the flag
-  in `usage`, `report` or a health rule is open.
+  still count in the attempt's usage and M08 (L2 stands). `usage` exposes
+  the per-attempt flag; `report` identifies affected attempts as still counted
+  in M08; `usage_after_termination` warns and resolves when none remain
+  (health-rules.v2). E2E: `post_termination_usage_is_visible_without_changing_accounting`.
 - **F4 (lane A): fixed.** A bound rollout's last turn that was open when the
   product ended the attempt (receipt cause `cancellation` or `completion`)
   is `final_event.state = ended_by_termination`, with the receipt's cause

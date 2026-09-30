@@ -1,4 +1,4 @@
-//! The declared health-rule table `health-rules.v1`
+//! The declared health-rule table `health-rules.v2`
 //! (docs/telemetry/contracts-health.md §2). Each rule reads only through the
 //! TM4.1 query service (`analytics::query`) or a lane's own read path
 //! (`accounting quota|attention|entries|budget-shadow`, TM4.4 `compare`), and
@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-pub const VERSION: &str = "health-rules.v1";
+pub const VERSION: &str = "health-rules.v2";
 const MINUTE: i64 = 60_000;
 const HOUR: i64 = 60 * MINUTE;
 const DAY: i64 = 24 * HOUR;
@@ -44,6 +44,8 @@ pub enum Eval {
     Coverage(&'static str),
     /// Lane B ledger dispositions: `unresolved` warns, `conflict` is critical.
     Conflicts,
+    /// Bound usage records observed after an attempt termination receipt.
+    AfterTermination,
     /// Lane B shadow budget bridge over the canonical policy.
     Exposure,
     /// A count (the metric's numerator) in the look-back window.
@@ -85,6 +87,9 @@ pub struct Rule {
 }
 
 pub const RULES: &[Rule] = &[
+    Rule { name: "usage_after_termination", family: "consumption", service: Some("codex"), source: "lane:usage after_termination", eval: Eval::AfterTermination,
+        direction: Direction::Above, warn: 1, critical: i64::MAX, unit: "records", window_ms: None, cooldown_ms: HOUR,
+        detail: "bound usage after termination warns; records remain counted in M08" },
     Rule { name: "collector_stale", family: "collection", service: Some("codex"), source: "query:source_watermarks.sidecar.last_collect_unix_ms",
         eval: Eval::Collector, direction: Direction::Above, warn: 15 * MINUTE, critical: HOUR, unit: "ms", window_ms: None, cooldown_ms: HOUR,
         detail: "time since the last Codex collect; no sidecar or no collect recorded is unknown" },
@@ -298,6 +303,20 @@ fn evaluate_rule(ctx: &mut Ctx, rule: &'static Rule) -> Result<Vec<Outcome>> {
             let Some((n, d)) = ratio(&r["value"]) else { return Ok(vec![unknown(rule, "value_not_ratio", metric, window)]) };
             let state = grade(rule, |_| false, |t| n * 1000 < i128::from(t) * d);
             outcome(rule, state, vec![json!({"code": if state == State::Ok { "coverage_complete" } else { "coverage_loss" }, "value": r["value"]})], metric, window, evidence)
+        }
+        Eval::AfterTermination => {
+            let metric = lane_metric(rule.source);
+            let v = crate::telemetry::sidecar::report(ctx.project)?;
+            let attempts: Vec<&Value> = v["attempts"].as_array().into_iter().flatten().collect();
+            let records: i64 = attempts.iter().filter_map(|a| a["after_termination"]["records"].as_i64()).sum();
+            let affected = attempts.iter().filter(|a| a["after_termination"]["records"].as_i64().is_some_and(|n| n > 0)).count();
+            let missing = attempts.iter().find(|a| a["after_termination"]["status"] == "unavailable");
+            if records == 0 {
+                if let Some(a) = missing { return Ok(vec![unknown(rule, a["after_termination"]["reason"].as_str().unwrap_or("unavailable"), metric, unbounded(now))]); }
+                if crate::telemetry::sidecar::read(ctx.project)?.is_none() { return Ok(vec![unknown(rule, "collection_not_run", metric, unbounded(now))]); }
+            }
+            outcome(rule, if records > 0 { State::Warn } else { State::Ok }, vec![code(if records > 0 { "usage_after_termination" } else { "none_observed" })],
+                metric, unbounded(now), json!({"records": records, "attempts": affected, "accounting": "still counted in M08", "partial_observation": missing.is_some()}))
         }
         Eval::Conflicts => {
             let metric = lane_metric(rule.source);

@@ -37,7 +37,7 @@ fn codex_usage_binds_and_sums_exactly() {
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))).unwrap().map(Result::unwrap).collect::<Vec<_>>();
     assert_eq!(discrepancies, [("token_count_total".to_owned(), 1680, 900)]);
     // The default `usage` output is one readable line per attempt and per rollout.
-    assert_eq!(f.text(&["usage"]), format!("{0} usage=in=1500 out=180 total=1680 records=2\n\
+    assert_eq!(f.text(&["usage"]), format!("{0} usage=in=1500 out=180 total=1680 records=2 after_termination=null\n\
         session {SID} binding=bound attempt={0} cli=0.154.0 certified=true records=2 accepted=2 quarantined=false\n", f.attempt));
 }
 
@@ -196,7 +196,8 @@ fn invariant_violation_is_not_accepted() {
 
 #[test]
 fn rollout_before_decision_or_elsewhere_is_unbound() {
-    let cases: [(&str, fn(&Fixture) -> (PathBuf, String, i64)); 3] = [
+    type RolloutCase = (&'static str, fn(&Fixture) -> (PathBuf, String, i64));
+    let cases: [RolloutCase; 3] = [
         ("earlier", |f| (f.home.clone(), f.worktree(), f.decided - 60_000)),
         ("cwd-outside", |f| (f.home.clone(), format!("{}/repo", f.project.display()), f.decided + 1_000)),
         ("other-home", |f| (f.tmp.path().canonicalize().unwrap().join("other-home"), f.worktree(), f.decided + 1_000)),

@@ -221,6 +221,10 @@ pub fn text(report: &Value) -> String {
             None => out += &format!("{id} {name} {}\n", show(m)),
         }
     }
+    for a in report["after_termination"].as_array().into_iter().flatten() {
+        out += &format!("attempt {} after_termination records={} first_unix_ms={} terminated_unix_ms={}; still counted in M08\n",
+            a["attempt_id"].as_str().unwrap_or("-"), a["after_termination"]["records"], a["after_termination"]["first_unix_ms"], a["after_termination"]["terminated_unix_ms"]);
+    }
     let t = &report["tasks"];
     out + &format!("tasks terminal={} accepted={} open={} succeeded_without_evidence={}\n", t["terminal"], t["accepted"], t["open"], t["succeeded_without_evidence"])
 }

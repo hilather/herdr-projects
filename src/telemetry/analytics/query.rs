@@ -25,7 +25,13 @@ const PRICED: [&str; 6] = ["M04", "M12", "M14", "M24", "M34", "M37"];
 pub fn report(project: &Path, since: Option<i64>) -> Result<Value> {
     let (mut metrics, tasks) = crate::telemetry::metrics::central(project, since)?;
     for lane in &crate::telemetry::LANES { metrics.extend((lane.metrics)(project, since)?); }
-    Ok(json!({"metrics": metrics, "since_unix_ms": since, "tasks": tasks}))
+    let usage = crate::telemetry::sidecar::report(project)?;
+    let after: Vec<Value> = usage["attempts"].as_array().into_iter().flatten()
+        .filter(|a| a["after_termination"]["records"].as_i64().is_some_and(|n| n > 0))
+        .map(|a| json!({"attempt_id": a["attempt_id"], "after_termination": a["after_termination"], "accounting": "still counted in M08"})).collect();
+    let mut report = json!({"metrics": metrics, "since_unix_ms": since, "tasks": tasks});
+    if !after.is_empty() { report["after_termination"] = json!(after); }
+    Ok(report)
 }
 
 /// `telemetry <slug> query ...`

@@ -121,7 +121,7 @@ pub fn status(project: &Path, stream: &str) -> Result<Value> {
 pub fn report(project: &Path) -> Result<Value> {
     let attempts = super::codex::canonical_attempts(project)?;
     let Some(db) = read(project)? else {
-        let attempts = attempts.iter().map(|a| json!({"attempt_id": a.id, "usage": unavailable(if a.codex() { "collection_not_run" } else { "adapter_absent" })}));
+        let attempts = attempts.iter().map(|a| json!({"attempt_id": a.id, "after_termination": if a.terminated_unix_ms().is_some() { unavailable("collection_not_run") } else { Value::Null }, "usage": unavailable(if a.codex() { "collection_not_run" } else { "adapter_absent" })}));
         return Ok(json!({"attempts": attempts.collect::<Vec<_>>(), "sessions": []}));
     };
     let mut sessions = Vec::new();
@@ -141,7 +141,8 @@ pub fn report(project: &Path) -> Result<Value> {
     let mut out = Vec::new();
     for attempt in &attempts {
         let usage = if attempt.codex() { attempt_usage(&db, &attempt.id)? } else { unavailable("adapter_absent") };
-        out.push(json!({"attempt_id": attempt.id, "usage": usage}));
+        let after_termination = after_termination(&db, &attempt.id, attempt.terminated_unix_ms())?;
+        out.push(json!({"attempt_id": attempt.id, "usage": usage, "after_termination": after_termination}));
     }
     Ok(json!({"attempts": out, "sessions": sessions}))
 }
@@ -157,7 +158,7 @@ pub fn text(report: &Value) -> String {
         } else {
             format!("{}:{}", word(&usage["status"]), word(&usage["reason"]))
         };
-        out += &format!("{} usage={shown}\n", word(&attempt["attempt_id"]));
+        out += &format!("{} usage={shown} after_termination={}\n", word(&attempt["attempt_id"]), attempt["after_termination"]);
     }
     for s in report["sessions"].as_array().into_iter().flatten() {
         out += &format!("session {} binding={} attempt={} cli={} certified={} records={} accepted={} quarantined={}", word(&s["session_id"]), word(&s["binding"]),
@@ -166,6 +167,17 @@ pub fn text(report: &Value) -> String {
         out += "\n";
     }
     out
+}
+
+/// Diagnostic only: every usage record on a bound rollout remains in M08.
+pub(super) fn after_termination(db: &Connection, attempt: &str, terminated: Option<i64>) -> Result<Value> {
+    let Some(at) = terminated else { return Ok(Value::Null) };
+    let timed: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='codex_usage_times')", [], |r| r.get(0))?;
+    if !timed { return Ok(unavailable("predates_collection")); }
+    let (records, first): (i64, Option<i64>) = db.query_row("SELECT count(*),min(t.record_unix_ms) FROM codex_usage u JOIN codex_usage_times t USING(session_id,ordinal)
+        WHERE t.record_unix_ms>?2 AND EXISTS(SELECT 1 FROM rollout_sources s WHERE s.path_digest=u.path_digest AND s.binding='bound' AND s.attempt_id=?1)",
+        rusqlite::params![attempt, at], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(if records == 0 { Value::Null } else { json!({"records": records, "first_unix_ms": first, "terminated_unix_ms": at}) })
 }
 
 pub(super) fn attempt_usage(db: &Connection, attempt: &str) -> Result<Value> {

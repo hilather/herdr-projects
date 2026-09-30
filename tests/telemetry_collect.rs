@@ -107,7 +107,7 @@ fn envelopes_replay_identically_after_interrupted_collect() {
     let sid = SID;
     let envelope = |line: usize| f.sidecar().query_row("SELECT event_id,producer_id,producer_epoch,event_kind,identity,provenance,measurement,payload_digest
         FROM source_observations WHERE producer_epoch=?1 AND producer_sequence=?2", rusqlite::params![source, starts[line - 1] as i64],
-        |r| Ok((0..8).map(|i| r.get::<_, String>(i)).collect::<rusqlite::Result<Vec<_>>>()?)).unwrap();
+        |r| (0..8).map(|i| r.get::<_, String>(i)).collect::<rusqlite::Result<Vec<_>>>()).unwrap();
     let provenance = r#"{"adapter":"codex","adapter_version":"0.154.0","interface":"rollout_jsonl","source_trust":"collector_observed"}"#;
     // `token_count` widened its allowlist in A4: normalization version 2. A7:
     // `certified` says whether the adapter version was certified when read.
@@ -318,4 +318,60 @@ fn a_turn_the_product_ended_is_ended_by_termination_not_a_missing_final_event() 
     assert_eq!(final_event(&f), serde_json::json!({"state": "missing", "turn_id": "turn-3"}));
     assert_eq!(pending(&f), 1);
     assert_eq!(after(&f), serde_json::json!({"terminated_unix_ms": terminated, "records": 1, "first_unix_ms": f.decided + 10_000}));
+}
+
+/// Timing flags and alerts leave the hand-computed 1000 + 500 + 500 M08 unchanged.
+#[test]
+fn post_termination_usage_is_visible_without_changing_accounting() {
+    let f = Fixture::new();
+    let path = f.rollout(&f.home, SID, &["head.jsonl"], &f.worktree(), f.decided + 1_000, "0.154.0");
+    let first = f.decided + 10_000;
+    let original = jiff::Timestamp::from_millisecond(f.decided + 1_000).unwrap().to_string();
+    let later = jiff::Timestamp::from_millisecond(first).unwrap().to_string();
+    let tail = tail(&f, 1).replace("@SID@", SID).replace(&original, &later);
+    append(&path, &tail);
+    append(&path, &tail.replace("turn-2", "turn-3").replace("resp-2", "resp-3")
+        .replace("\"ordinal\":8", "\"ordinal\":13").replace("\"ordinal\":9", "\"ordinal\":14")
+        .replace("\"ordinal\":10", "\"ordinal\":15").replace("\"ordinal\":11", "\"ordinal\":16").replace("\"ordinal\":12", "\"ordinal\":17"));
+    let db = rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap();
+    let terminated = f.decided + 5_000;
+    db.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.worker_terminated',?1,2,1,?2)",
+        rusqlite::params![f.attempt, serde_json::json!({"version": 1, "attempt": f.attempt, "cause": "cancellation", "observed_unix_ms": terminated}).to_string()]).unwrap();
+    f.cli("collect");
+    let usage = f.cli_args(&["usage", "--json"]).0;
+    assert_eq!(usage["attempts"][0]["after_termination"], serde_json::json!({"records": 2, "first_unix_ms": first, "terminated_unix_ms": terminated}));
+    assert!(f.text(&["usage"]).contains("after_termination={"));
+    let report = f.report();
+    assert_eq!(report["metrics"]["M08"]["value"], 2000);
+    assert_eq!(report["after_termination"][0]["accounting"], "still counted in M08");
+    let line = format!("attempt {} after_termination records=2 first_unix_ms={first} terminated_unix_ms={terminated}; still counted in M08", f.attempt);
+    assert!(f.text(&["report", "--text"]).contains(&line));
+    f.cli_args(&["health", "evaluate", "--json"]);
+    let alerts = f.cli_args(&["health", "alerts", "--json"]).0;
+    let alert = alerts["open"].as_array().unwrap().iter().find(|a| a["rule"] == "usage_after_termination").unwrap();
+    assert_eq!(alert["state"], "warn");
+    assert_eq!(alert["labels"], serde_json::json!({"project": "demo", "family": "consumption", "rule": "usage_after_termination", "service": "codex"}));
+    assert_eq!(alert["evidence"]["records"], 2);
+
+    // Same records, receipt after all of them: no post-termination usage.
+    db.execute("UPDATE events SET payload=?1 WHERE kind='runtime.worker_terminated'", [serde_json::json!({"version": 1, "attempt": f.attempt, "cause": "cancellation", "observed_unix_ms": first + 1}).to_string()]).unwrap();
+    f.cli("collect");
+    assert_eq!(f.cli_args(&["usage", "--json"]).0["attempts"][0]["after_termination"], serde_json::Value::Null);
+    let report = f.report();
+    assert_eq!(report["metrics"]["M08"]["value"], 2000);
+    assert!(report.get("after_termination").is_none());
+    assert!(!f.text(&["report", "--text"]).contains("after_termination"));
+    let evaluated = f.cli_args(&["health", "evaluate", "--json"]).0;
+    assert!(evaluated["resolved"].as_array().unwrap().iter().any(|a| a["rule"] == "usage_after_termination"), "{evaluated}");
+    assert!(!f.cli_args(&["health", "alerts", "--json"]).0["open"].as_array().unwrap().iter().any(|a| a["rule"] == "usage_after_termination"));
+    // Legacy ingest has usage but no record timestamps: unavailable, never zero.
+    f.sidecar().execute_batch("DROP TABLE codex_usage_times; UPDATE telemetry_streams SET version=3 WHERE stream='ingest';").unwrap();
+    assert_eq!(f.cli_args(&["usage", "--json"]).0["attempts"][0]["after_termination"],
+        serde_json::json!({"status": "unavailable", "reason": "predates_collection"}));
+    let health = f.cli_args(&["health", "--json"]).0;
+    let state = health["states"].as_array().unwrap().iter().find(|s| s["rule"] == "usage_after_termination").unwrap();
+    assert_eq!(state["state"], "unknown");
+    assert_eq!(state["reasons"][0]["code"], "predates_collection");
+    assert_eq!(f.report()["metrics"]["M08"]["value"], 2000);
+
 }

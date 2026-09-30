@@ -1218,6 +1218,19 @@ the receipt; `null` otherwise; `unavailable: predates_collection` without
 record times (ingest < 4). The records stay in the attempt's usage and M08:
 this flags them, it does not move them.
 
+`usage` JSON and text add `after_termination` per attempt, aggregated over
+bound rollouts: `{records, first_unix_ms, terminated_unix_ms}` when records
+exist, `null` otherwise, or `{status: unavailable, reason: predates_collection}`
+when ingest < 4 lacks record times. `report` adds an `after_termination` array
+only for affected attempts, each with the flag and `accounting: still counted
+in M08`; text prints one equivalent line per attempt. This diagnostic is
+unwindowed, including with `report --since`; metric windows and values stay
+unchanged. Health rule `usage_after_termination` (health-rules.v2) warns for
+any bound post-termination record, with bounded consumption/Codex labels;
+missing timing is unknown, never zero. E2E:
+`post_termination_usage_is_visible_without_changing_accounting` proves two
+post-termination records, resolution with none, and unchanged M08 = 2000.
+
 ### Conformance
 
 | Behaviour | Test |
