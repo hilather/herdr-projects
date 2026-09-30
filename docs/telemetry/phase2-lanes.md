@@ -241,9 +241,15 @@ merges one PR at a time.
   worker snapshot) and its session recorded by the reservation; the
   reviewing worker submits a proposal receipt (`review session|submit`);
   decisions are shared-ledger rows (`review show --as-of`); `review accept
-  draft` writes the request bytes to sign offline. Still open: delegated
-  triage (needs a `finding_log` rebuild); reviewer key custody (owner
-  decision; options in §11); a planner/scheduler that opens, assigns and
+  draft` writes the request bytes to sign offline. **Done (D10,
+  contracts-review.md §12):** the trusted reviewer-signer process (`review
+  signer init|run|status`): the operator holds the reviewer key under the
+  owner config directory (hidden from isolated workers), decides completed
+  reviews in an owner-signed grant's scope by a versioned mechanical policy,
+  signs and submits through the D8 accept path, with an append-only audit;
+  the coordinator stays trusted by owner decision, bounded by the grant.
+  Still open: delegated triage (needs a `finding_log` rebuild); a
+  planner/scheduler that opens, assigns and
   queues review tasks itself; review worktrees at the candidate commit;
   non-Codex reviewer usage for M24.
 

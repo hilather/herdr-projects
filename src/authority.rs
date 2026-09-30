@@ -578,6 +578,17 @@ pub fn revoke_review_authority(project:&Path,document:&Path,signature:&Path)->Re
     result
 }
 
+/// Verify an installed grant's owner signature against the current owner
+/// policy, as `accept_review` does. The trusted review signer (§12) calls it
+/// before signing anything under a grant, so it never signs a request for a
+/// grant row the owner did not sign. Grants nothing.
+pub(crate) fn verify_installed_review_grant(project:&Path,grant_id:&str)->Result<crate::store::PreparedReviewAuthority> {
+    let db=migration::open_active(project)?;
+    let (stored,signature)=db.review_authority_grant(grant_id)?;
+    let (owner,_)=policy(project)?;
+    prepare_review_authority(&owner,&stored.raw,&signature,&RealRunner).context("the stored grant does not verify under the current owner policy")
+}
+
 /// Decide one review completion under a grant. The request's grant ID only
 /// selects the grant; the grant's owner signature is verified again against
 /// the current owner policy (a changed policy refuses), and the request must

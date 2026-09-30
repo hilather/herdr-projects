@@ -976,9 +976,8 @@ rejected 1, undecided 1; M21 `"2"` with accepted 1, rejected 1.
 
 Built by D9 (§11): launching reviewer attempts from an assignment with the
 session recorded at launch, the blind brief, the worker receipt channel,
-decisions in the shared ledger and the request draft command. Not built:
-custody of the reviewer's key by the product (an open owner decision, §11);
-per-attempt usage for non-Codex reviewers (their cost stays
+decisions in the shared ledger and the request draft command. Built by
+D10 (§12): the trusted reviewer-signer process. Not built: per-attempt usage for non-Codex reviewers (their cost stays
 `no_usage_bound`); delegated triage.
 
 ## 11. Review launch, the blind brief and the worker receipt channel (card D9)
@@ -1125,8 +1124,8 @@ The reviewer signs the file's exact bytes offline (`ssh-keygen -Y sign -f KEY
 -n review-acceptance@herdr-projects FILE`) and submits them with `review
 accept SESSION --document FILE --signature FILE.sig` (§10, unchanged checks).
 
-**Reviewer key custody (open owner decision).** The product holds no
-reviewer private key and does not sign decisions. Options:
+**Reviewer key custody (owner decision: option 2, built by D10, §12).**
+Offline signing (option 1) stays available. Options considered:
 
 1. *Reviewer-held key, offline signing* (built: `accept draft` + `accept`).
    The human or agent-operator holding `reviewer:<name>` signs each request
@@ -1171,5 +1170,177 @@ tasks by itself (the owner still adds and queues R); worktrees checked out at
 the candidate (R's worktree is its ordinary base; the candidate commit is in
 the shared object store and named in the brief); session start at the
 worker's actual start rather than its reservation; a guard on raw SQL
-inserts of attempts for review tasks (store-enforced only); custody of a
-reviewer key by the product (above).
+inserts of attempts for review tasks (store-enforced only). Custody of a
+reviewer key by the product: built by D10 (§12).
+
+## 12. Trusted reviewer-signer process (card D10)
+
+Owner decision on §11's key custody: option 2, a *trusted signer process*.
+No migration (schema 62 unchanged). CLI `telemetry <slug> review signer
+init|run|status` (`src/telemetry/review/signer.rs`); candidate list
+`SqliteStore::review_signer_candidates` (`src/store/review_authority.rs`,
+sharing the scope and independence check with `accept_review`); grant check
+`authority::verify_installed_review_grant`. The signer is a CLI the owner
+runs or schedules as the operator (not a ticker job).
+
+**Custody.** One signer per reviewer principal, in
+`<config_dir>/review-signer/<token>/` (`config_dir` is
+`~/.config/herdr-projects`, the directory of the pinned owner
+configuration): `id_ed25519` (0600), `id_ed25519.pub`, `policy.json` (0600),
+`audit.jsonl` (0600, append-only) and a transient `work/` for the request
+being signed. `review-signer/` and the signer directory are 0700. The signer
+never sees the owner key and cannot mint, widen, extend or revoke a grant:
+it only signs `review_acceptance.v1` requests, which count only under an
+installed grant the owner signed for exactly its public key.
+
+**Init** (`signer init --subject reviewer:<token> --repository R... --task
+T:REV... [--kind K...] [--max-decisions N] [--valid-days D] --output FILE`)
+refuses a worker execution context, an existing signer (a key is never
+replaced in place) and an existing output file; checks the draft's scope
+(`code_review_authority.v1` shape, §10) before any key exists; creates the
+directories (0700) and the key (`ssh-keygen -t ed25519`, through the gated
+runner); writes the default policy (below); and writes the draft grant
+(`subject_public_key` the new key, `project_store` this store, the current
+owner policy reference, `valid_from` now, `expires` now + D days (default 7),
+`max_decisions` default 16, the five prohibited effects). It prints the
+public key, the policy version and the draft's `grant_id`. The owner signs
+the draft's exact bytes offline (`ssh-keygen -Y sign -f OWNER_KEY -n
+code-review-authority@herdr-projects FILE`) and imports it with `review
+authority import` (§10); until then the signer decides nothing.
+
+**Decision policy** (`review_signer_policy.v1`, owner-edited, versioned):
+
+```json
+{
+  "schema": "review_signer_policy.v1",
+  "revision": 1,
+  "require_worker_receipt": true,
+  "min_evidence_refs": 0,
+  "on_failure": "reject"
+}
+```
+
+Unknown fields refuse; `revision` ≥ 1, `min_evidence_refs` 0–64,
+`on_failure` `reject` or `leave_undecided`. Its version is `{schema,
+revision, digest}` with `digest` the sha256 of the file's bytes, recorded on
+every decision. Rules are mechanical, over stored facts only (never a
+finding, title or the candidate's content), in order; the first that fails
+decides (`reject`: that reason code; `leave_undecided`: no request):
+
+| rule | passes when | reason |
+|---|---|---|
+| `well_formed_receipt` | completion `trust: proposal`, `coverage_basis: declared`, findings count = references, receipt digest `sha256:<hex64>` | `protocol_violation` |
+| `exact_candidate` | the receipt's submission and candidate are the opportunity's | `wrong_scope` |
+| `launched_to_assigned_reviewer` | the session was recorded at launch (§11: `review_session_launches` row for its attempt, recorder `service:launch`, `matches_assignment`, configuration = the assignment's) | `protocol_violation` |
+| `receipt_from_reviewer_worker` | when required: the receipt was recorded by `worker:<attempt>` (the launched reviewer itself) | `protocol_violation` |
+| `min_evidence_refs` | at least that many evidence references | `evidence_missing` |
+
+All pass: `accepted` (rule `all_rules_passed`). The completion is always
+`completed` (only completed reviews are candidates, §10).
+
+**Run** (`signer run --subject S [--once] [--max N] [--interval-secs I]`):
+each pass checks the key (below) and the policy, then lists this subject's
+installed grants. A grant naming another public key is `other_key`; an
+active grant whose owner signature does not verify under the current owner
+policy is `unverified`; neither is used. For each active grant (installation
+order), the candidates are the completed, undecided sessions it may decide
+now (the §10 scope and independence rules, the grant unrevoked, valid and
+under `max_decisions`), oldest completion first. For each, the policy
+decides; the signer drafts the exact D9 canonical request (`review accept
+draft` bytes), checks the key again, signs the bytes (`ssh-keygen -Y sign -n
+review-acceptance@herdr-projects`, environment cleared, no agent) and
+submits them through `review accept`'s path (`authority::accept_review`),
+which verifies the grant's owner signature and the request's signature again
+and records the decision and its ledger row (§10, §11). At most `--max`
+(default 16, at most 128) decisions per pass and never past the grant's
+remaining decisions. Idempotent: a decided session is no longer a candidate
+and the same request replays. `--once` prints the pass; otherwise a pass
+runs every I seconds (default 60) and each prints one JSON line (a refused
+pass prints its error and decides nothing).
+
+**Safety checks, before every use** (`run` per pass and again before each
+signature, `status`): `review-signer/` and the signer directory are real
+directories (not symlinks) owned by this user, mode 0700; the key is a
+regular file (not a symlink), owned by this user, one link, mode exactly
+0600; the public key is a regular file not group/world writable; the policy
+is a regular owner-only file of at most 4 KiB; the directory is under the
+pinned owner configuration's directory (so the worker sandbox's
+`<config dir>/review-signer` hide covers it whatever `HOME` the controller
+has), not inside the projects root (any project or task worktree), and
+neither inside nor containing any execution home retained by any project
+under the root. Every signer command refuses a worker execution context
+(§9's markers, plus `HOME` under the projects root).
+
+**Audit.** `audit.jsonl` (opened append-only, `O_NOFOLLOW`, owner-only, one
+link, fsynced per line): `review_signer_audit.v1` lines with `subject`,
+`recorded_unix_ms` and `event` `init` (public key, policy version, draft
+grant id) or `decision` (grant, session, decision, reason, rule, policy
+version, the facts it read (`checks`), and `result` `recorded` with
+`request_digest` and `ledger_seq`, or `refused` with the error). A decision
+is also the §10 `review_acceptances` row (request bytes and signature) and
+the §11 `review_decision_log` row; the ledger row is unchanged (no policy
+column): the audit line joins it by session, `request_digest` and
+`ledger_seq`. `leave_undecided` outcomes are reported in the pass, not
+audited.
+
+**Status** (`signer status --subject S [--last N]`, read-only): directory,
+public key, `key_check` (`ok` or the refusal), policy version, this
+subject's grants (`status` including `other_key`/`unverified`,
+`max_decisions`, `decisions`, `remaining`, validity, revocation) and the
+last N audited decisions.
+
+**Trust boundaries.**
+
+- *Canonical and reviewer workers cannot reach the key.* They run in the
+  isolated sandbox (`worker_supervision::Isolation`,
+  docs/reviews/2026-09-29-worker-isolation.md): `~/.config/herdr-projects`
+  of every owner home and `<pinned config dir>/review-signer` are empty
+  read-only mounts they cannot lift, so the key, policy and audit log are
+  unreadable; the signer CLI also refuses their context. The signer
+  requires its directory under the pinned configuration's directory, so
+  this holds even if the controller's `HOME` differs from the operator's.
+- *The coordinator stays trusted (owner decision, accepted).* The
+  coordinator agent and legacy thread agents run from Herdr `agent.start`
+  with the owner's full view (isolation review, residual risk 7): they can
+  read the signer key and could sign decisions. The owner accepts this. It
+  is bounded by the grant: only sessions in its scope (store, repositories,
+  task contract revisions, kinds, reviewer configurations), never the
+  reviewer's own or the author attempt's work, at most `max_decisions`,
+  only between `valid_from` and `expires` (at most 366 days; the draft
+  defaults to 7), and stopped at once by an owner-signed revocation (§10);
+  a decision never triages, changes a requirement or permission, or mints
+  a grant, and every decision is attributable (`reviewer:<token>`, grant,
+  request bytes and signature, ledger row).
+- *Facts come from the project store.* Until the write-isolation card
+  lands, a worker can write its own project's `state.db` (isolation review,
+  residual risk 1), e.g. raw review rows the policy then reads. Triggers
+  repeat the session/launch/completion bindings on raw rows, and an
+  unsigned grant row is never used (`unverified`), so this can at most
+  steer a decision within an owner-signed grant's bounds above, never
+  create authority.
+- *Automatic acceptance moves judgement to code* (§11 option 2): the policy
+  checks provenance and form, not review quality. Keep grants short and
+  narrow and `max_decisions` small; use `on_failure: leave_undecided` to
+  keep doubtful reviews for the owner.
+
+Tests (`tests/review_signer.rs`, real `ssh-keygen` keys in temporary homes,
+the real D9 launch path, `launch draft` → owner approval → `launch
+reserve`): `signer_accepts_in_scope_reviews_under_policy_and_audits` (S1
+launched with the reviewer's own receipt accepted at ledger 7 under policy
+revision 1, digest `sha256:e35de0ca…d4f6`; S2 owner-started rejected
+`protocol_violation` by `launched_to_assigned_reviewer` at ledger 8 under
+revision 2; S3 `security`, outside the grant, never decided; `--max 1`
+bounds a pass, the third pass decides nothing; request digests and audit
+lines compared to hand-built literals),
+`signer_refuses_bad_key_permissions_worker_context_and_revoked_grants`
+(key 0644, directory 0755, symlinked key, group-readable policy, worker
+`HOME` for `run`/`status`/`init`, `other_key` and unsigned `unverified`
+grants, a revoked grant, an execution home inside the signer directory:
+nothing signed or decided), `isolated_worker_cannot_read_the_signer_key`
+(the launch service's sandbox argv from the retained profile, route and
+pinned configuration: key, policy and audit log unreadable, the directory
+absent, `signer status`/`run` refused; the same probe outside reads the
+key).
+
+Not built: a ticker hook (by owner decision the owner runs or schedules the
+CLI); hardware-backed signer keys (§11 option 4); isolating the coordinator.

@@ -18,6 +18,7 @@ mod acceptance;
 mod fixes;
 mod protocols;
 mod seeds;
+mod signer;
 
 use crate::store::{FindingSummary, FindingTarget, ReviewAssignmentChoice, ReviewOpportunitySpec, ReviewVisibility, SqliteStore, TriageOutcome, TriageRequest, finding_state, fix_state, protocol_state, review_visibility};
 
@@ -115,6 +116,11 @@ pub enum Command {
     /// Delegated `code_review` authority: owner-signed grants and revocations.
     #[command(subcommand)]
     Authority(acceptance::AuthorityCommand),
+    /// The trusted reviewer-signer process (contracts-review.md §12): the
+    /// operator's signer key for one `reviewer:<token>`, outside every worker,
+    /// deciding completed reviews under the owner's grant by a mechanical policy.
+    #[command(subcommand)]
+    Signer(signer::SignerCommand),
     /// What a blind reviewer may see of an opportunity: the exact candidate,
     /// scope and protocol, never the author attempt or configuration. Read-only.
     Present { opportunity: String },
@@ -291,16 +297,23 @@ fn refuse_worker_context(project: &Path) -> Result<()> {
     }
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return Ok(()) };
     if !project.join(".state/state.db").is_file() { return Ok(()); }
-    let db = super::read_only(&project.join(".state/state.db"))?;
+    let homes = execution_homes(&*super::read_only(&project.join(".state/state.db"))?)?;
+    let home = canonical(&home);
+    anyhow::ensure!(!homes.iter().any(|h| canonical(Path::new(h)) == home), "{REFUSED}: HOME is a worker execution home");
+    Ok(())
+}
+
+/// The execution homes recorded in this project's retained native profiles
+/// and collector bindings: the worker-context marker (§9) and the places the
+/// review signer's key may never be (§12).
+fn execution_homes(db: &rusqlite::Connection) -> Result<Vec<String>> {
     let mut homes: Vec<String> = db.prepare("SELECT json_extract(report,'$.preparation.profile.execution_home') FROM native_profiles
         WHERE json_type(report,'$.preparation.profile.execution_home')='text'")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
     if db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='collector_bindings')", [], |r| r.get::<_, bool>(0))? {
         homes.extend(db.prepare("SELECT DISTINCT execution_home FROM collector_bindings WHERE execution_home IS NOT NULL")?.query_map([], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?);
     }
-    let home = canonical(&home);
-    anyhow::ensure!(!homes.iter().any(|h| canonical(Path::new(h)) == home), "{REFUSED}: HOME is a worker execution home");
-    Ok(())
+    Ok(homes)
 }
 
 /// Projects root and project name of `project`, as a brief's receipt commands name them.
@@ -332,8 +345,9 @@ pub fn bind_review_brief(project: &Path, opportunity: &str, task: &str, snapshot
     Ok(json!(SqliteStore::open(&project.join(".state/state.db"))?.bind_review_brief(opportunity, task, snapshot, text, &root, &slug, OPERATOR, now)?))
 }
 
-/// The command's stdout.
-pub fn run(project: &Path, command: Command) -> Result<String> {
+/// The command's stdout. `config_dir` is the product configuration
+/// directory (`~/.config/herdr-projects`), where the review signer lives.
+pub fn run(project: &Path, config_dir: &Path, command: Command) -> Result<String> {
     // A worker may run only the blind reviewer view, its own session and the receipt channel.
     if !matches!(command, Command::Present { .. } | Command::Session { .. } | Command::Submit { .. }) { refuse_worker_context(project)?; }
     let now = jiff::Timestamp::now().as_millisecond();
@@ -372,6 +386,7 @@ pub fn run(project: &Path, command: Command) -> Result<String> {
         }
         Command::Session { attempt } => json!({"session": open()?.review_session_for_attempt(&attempt)?}),
         Command::Authority(command) => acceptance::authority(project, command)?,
+        Command::Signer(command) => signer::run(project, config_dir, command)?,
         Command::Present { opportunity } => present(project, &opportunity)?,
         Command::Show { since, as_of } => show(project, since, as_of)?,
         Command::Report { since, horizon_days } => json!({"metrics": lane_metrics(project, since, i64::from(horizon_days))?, "since_unix_ms": since}),

@@ -573,7 +573,10 @@ attention intervals (contracts-accounting.md §6), provider charges, invoice
 allocation, dated currency conversion, `as_of`, the shadow budget bridge and
 M04/M11/M12 (contracts-accounting.md §12–§14),
 delegated code_review authority, reviewer-signed acceptance decisions and
-M24 review discovery efficiency (contracts-review.md §10), Codex session metadata
+M24 review discovery efficiency (contracts-review.md §10), review launch
+from an assignment with the blind brief and the worker receipt channel
+(contracts-review.md §11), the trusted reviewer-signer process
+(contracts-review.md §12, no migration), Codex session metadata
 (contracts-collection.md A4), Codex tool/exec metadata (contracts-collection.md
 A6), Codex MCP, subagent, aborted-turn and fork metadata and fork
 reconciliation (contracts-collection.md A8), review opportunities, sessions

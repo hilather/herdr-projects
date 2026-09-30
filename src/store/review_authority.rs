@@ -277,6 +277,44 @@ fn load_grant(db: &Connection, grant_id: &str) -> Result<(PreparedReviewAuthorit
 /// author attempt and opportunity.
 type SessionScope = (String, Option<String>, bool, Option<String>, String, i64, String, String, i64, String, String, String);
 
+/// The completed session's `(receipt digest, completion time)` when `grant`
+/// may decide it: completed, and its repository, task contract revision,
+/// kind and reviewer configuration in scope, and independent of the grant's
+/// subject (never its own review, never the author attempt's work). Shared by
+/// `accept_review` and the trusted signer's candidate list (§12), so the
+/// signer never proposes a session the decision path would refuse.
+fn session_in_scope(tx: &Connection, grant: &PreparedReviewAuthority, session: &str) -> Result<(String, i64)> {
+    let row: Option<SessionScope> = tx.query_row(
+        "SELECT r.attempt_id,r.configuration_id,r.same_attempt_as_author,c.outcome,c.receipt_digest,c.completed_unix_ms,o.task_id,o.kind,o.contract_revision,s.repository,s.attempt_id,o.opportunity_id
+         FROM review_sessions r LEFT JOIN review_completions c ON c.session_id=r.session_id JOIN review_opportunities o ON o.opportunity_id=r.opportunity_id
+         JOIN result_submissions s ON s.submission_id=o.submission_id WHERE r.session_id=?1", [session],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get::<_, Option<String>>(4)?.unwrap_or_default(), r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+            r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?))).optional()?;
+    let Some((reviewer, configuration, same_attempt, outcome, receipt, completed, task, kind, revision, repository, author, _)) = row else {
+        return Err(invalid(format!("no review session {session}")));
+    };
+    match outcome.as_deref() {
+        None => return Err(invalid(format!("review session {session} has no completion to decide"))),
+        Some("completed") => {}
+        Some(other) => return Err(invalid(format!("only a completed review is accepted or rejected; this session ended {other}"))),
+    }
+    // Independence: never the reviewer's own review, never the author attempt's work.
+    let bare = grant.subject.trim_start_matches("reviewer:");
+    let author_configuration: Option<String> = tx.query_row("SELECT chosen_configuration_id FROM dispatch_decisions WHERE attempt_id=?1", [&author], |r| r.get(0)).optional()?;
+    let own = bare == reviewer || configuration.as_ref().is_some_and(|c| grant.subject_configurations.contains(c));
+    let authors = same_attempt || bare == author || author_configuration.as_ref().is_some_and(|c| grant.subject_configurations.contains(c));
+    if own || authors {
+        return Err(invalid("a reviewer cannot accept its own review or a review of work by the author attempt or its own configuration"));
+    }
+    let scope = |ok: bool, what: &str| if ok { Ok(()) } else { Err(invalid(format!("the session is outside the grant's scope: {what}"))) };
+    scope(grant.actions.iter().any(|a| a == ACCEPT_ACTION), "action")?;
+    scope(grant.repositories.contains(&repository), "repository")?;
+    scope(grant.tasks.contains(&TaskScope { task_id: task, contract_revision: revision }), "task contract revision")?;
+    scope(grant.kinds.contains(&kind), "review kind")?;
+    scope(grant.review_configurations.is_empty() || configuration.as_ref().is_some_and(|c| grant.review_configurations.contains(c)), "reviewer configuration")?;
+    Ok((receipt, completed))
+}
+
 impl SqliteStore {
     /// Install one verified grant. The same bytes replay; an expired grant or
     /// one for another project is refused. A grant never changes: a wider or
@@ -366,36 +404,10 @@ impl SqliteStore {
         }
         if now < grant.valid_from_unix_ms { return Err(invalid("review authority grant is not valid yet")); }
         if now >= grant.expires_unix_ms { return Err(invalid("review authority grant is expired")); }
-        let row: Option<SessionScope> = tx.query_row(
-            "SELECT r.attempt_id,r.configuration_id,r.same_attempt_as_author,c.outcome,c.receipt_digest,c.completed_unix_ms,o.task_id,o.kind,o.contract_revision,s.repository,s.attempt_id,o.opportunity_id
-             FROM review_sessions r LEFT JOIN review_completions c ON c.session_id=r.session_id JOIN review_opportunities o ON o.opportunity_id=r.opportunity_id
-             JOIN result_submissions s ON s.submission_id=o.submission_id WHERE r.session_id=?1", [&request.session_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get::<_, Option<String>>(4)?.unwrap_or_default(), r.get::<_, Option<i64>>(5)?.unwrap_or(0),
-                r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?))).optional()?;
-        let Some((reviewer, configuration, same_attempt, outcome, receipt, completed, task, kind, revision, repository, author, _)) = row else {
-            return Err(invalid(format!("no review session {}", request.session_id)));
-        };
-        match outcome.as_deref() {
-            None => return Err(invalid(format!("review session {} has no completion to decide", request.session_id))),
-            Some("completed") => {}
-            Some(other) => return Err(invalid(format!("only a completed review is accepted or rejected; this session ended {other}"))),
-        }
-        if receipt != request.receipt_digest { return Err(invalid("the acceptance request names another receipt than the session's completion")); }
-        if now < completed { return Err(invalid("a decision cannot precede the completion")); }
-        // Independence: never the reviewer's own review, never the author attempt's work.
-        let bare = grant.subject.trim_start_matches("reviewer:");
-        let author_configuration: Option<String> = tx.query_row("SELECT chosen_configuration_id FROM dispatch_decisions WHERE attempt_id=?1", [&author], |r| r.get(0)).optional()?;
-        let own = bare == reviewer || configuration.as_ref().is_some_and(|c| grant.subject_configurations.contains(c));
-        let authors = same_attempt || bare == author || author_configuration.as_ref().is_some_and(|c| grant.subject_configurations.contains(c));
-        if own || authors {
-            return Err(invalid("a reviewer cannot accept its own review or a review of work by the author attempt or its own configuration"));
-        }
-        let scope = |ok: bool, what: &str| if ok { Ok(()) } else { Err(invalid(format!("the session is outside the grant's scope: {what}"))) };
-        scope(grant.actions.iter().any(|a| a == ACCEPT_ACTION), "action")?;
-        scope(grant.repositories.contains(&repository), "repository")?;
-        scope(grant.tasks.contains(&TaskScope { task_id: task, contract_revision: revision }), "task contract revision")?;
-        scope(grant.kinds.contains(&kind), "review kind")?;
-        scope(grant.review_configurations.is_empty() || configuration.as_ref().is_some_and(|c| grant.review_configurations.contains(c)), "reviewer configuration")?;
+        let receipt = session_in_scope(&tx, grant, &request.session_id)?;
+        if receipt.0 != request.receipt_digest { return Err(invalid("the acceptance request names another receipt than the session's completion")); }
+        if now < receipt.1 { return Err(invalid("a decision cannot precede the completion")); }
+        let receipt = receipt.0;
         let used: i64 = tx.query_row("SELECT count(*) FROM review_acceptances WHERE authority_ref=?1", [&grant.grant_id], |r| r.get(0))?;
         if used >= i64::from(grant.max_decisions) { return Err(invalid(format!("the grant's decision limit ({}) is reached", grant.max_decisions))); }
         tx.execute("INSERT INTO review_acceptances(session_id,decision,reason,authority_principal,authority_ref,authority,receipt_digest,request_digest,request_bytes,request_signature,decided_unix_ms)
@@ -439,6 +451,53 @@ impl SqliteStore {
             "schema": ACCEPTANCE_SCHEMA, "session_id": session, "subject": grant.subject}).to_string().into_bytes();
         let prepared = PreparedReviewAcceptance::parse_unverified(&bytes).map_err(invalid)?;
         Ok((bytes, prepared))
+    }
+}
+
+impl SqliteStore {
+    /// The trusted signer's work list (contracts-review.md §12): every
+    /// completed, undecided session that `grant_id` may decide now, oldest
+    /// completion first, with the stored facts its mechanical decision policy
+    /// reads (never the review's content). Read-only; decides nothing: the
+    /// signer's signed request still goes through `accept_review`, which
+    /// re-checks all of it. Empty for a revoked, not yet valid, expired or
+    /// exhausted grant.
+    pub fn review_signer_candidates(&self, grant_id: &str, now: i64) -> Result<Vec<serde_json::Value>> {
+        require(&self.connection)?;
+        let db = &self.connection;
+        let (grant, _) = load_grant(db, grant_id)?;
+        let revoked = db.query_row("SELECT EXISTS(SELECT 1 FROM review_authority_revocations WHERE grant_id=?1)", [grant_id], |r| r.get::<_, bool>(0))?;
+        let used: i64 = db.query_row("SELECT count(*) FROM review_acceptances WHERE authority_ref=?1", [grant_id], |r| r.get(0))?;
+        if revoked || now < grant.valid_from_unix_ms || now >= grant.expires_unix_ms || used >= i64::from(grant.max_decisions) { return Ok(Vec::new()); }
+        let launches = super::review_launch::present(db)?;
+        let sessions: Vec<String> = db.prepare("SELECT c.session_id FROM review_completions c WHERE c.outcome='completed'
+            AND NOT EXISTS (SELECT 1 FROM review_acceptances a WHERE a.session_id=c.session_id) ORDER BY c.completed_unix_ms,c.session_id")?
+            .query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let mut out = Vec::new();
+        for session in sessions {
+            match session_in_scope(db, &grant, &session) {
+                Ok((_, completed)) if completed <= now => {}
+                Ok(_) => continue,
+                Err(StoreError::Invalid(_)) => continue,
+                Err(e) => return Err(e),
+            }
+            let launched = launches && db.query_row("SELECT EXISTS(SELECT 1 FROM review_session_launches l JOIN review_sessions r ON r.session_id=l.session_id
+                WHERE l.session_id=?1 AND l.attempt_id=r.attempt_id)", [&session], |r| r.get::<_, bool>(0))?;
+            let facts = db.query_row("SELECT r.opportunity_id,r.attempt_id,r.recorder_principal,r.matches_assignment,c.recorder_principal,c.submission_id,c.candidate_oid,
+                    o.submission_id,o.candidate_oid,c.trust,c.coverage_basis,c.findings_submitted,json_array_length(c.finding_refs),json_array_length(c.evidence_refs),c.receipt_digest,c.completed_unix_ms,
+                    r.configuration_id,a.reviewer_configuration_id
+                FROM review_sessions r JOIN review_completions c ON c.session_id=r.session_id JOIN review_opportunities o ON o.opportunity_id=r.opportunity_id
+                JOIN review_assignments a ON a.opportunity_id=r.opportunity_id WHERE r.session_id=?1", [&session],
+                |r| Ok(serde_json::json!({"session_id": session, "opportunity_id": r.get::<_, String>(0)?, "attempt_id": r.get::<_, String>(1)?,
+                    "session_recorder": r.get::<_, String>(2)?, "matches_assignment": r.get::<_, Option<i64>>(3)?.map(|v| v == 1),
+                    "receipt_recorder": r.get::<_, String>(4)?, "receipt_submission_id": r.get::<_, String>(5)?, "receipt_candidate_oid": r.get::<_, String>(6)?,
+                    "submission_id": r.get::<_, String>(7)?, "candidate_oid": r.get::<_, String>(8)?, "trust": r.get::<_, String>(9)?,
+                    "coverage_basis": r.get::<_, String>(10)?, "findings_submitted": r.get::<_, i64>(11)?, "finding_refs": r.get::<_, i64>(12)?,
+                    "evidence_refs": r.get::<_, i64>(13)?, "receipt_digest": r.get::<_, String>(14)?, "completed_unix_ms": r.get::<_, i64>(15)?,
+                    "session_configuration_id": r.get::<_, Option<String>>(16)?, "assigned_configuration_id": r.get::<_, String>(17)?, "launched": launched})))?;
+            out.push(facts);
+        }
+        Ok(out)
     }
 }
 

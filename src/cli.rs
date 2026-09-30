@@ -1264,7 +1264,7 @@ pub fn run() -> Result<()> {
                 TelemetryCommand::Collectors{command}=>collectors::run(&dir,command)?,
                 TelemetryCommand::Accounting{command}=>accounting::run(&dir,command)?,
                 TelemetryCommand::Quality{command}=>quality::run(&dir,command)?,
-                TelemetryCommand::Review{command}=>review::run(&dir,command)?,
+                TelemetryCommand::Review{command}=>review::run(&dir,&ctx.config_dir,command)?,
                 _=>unreachable!("matched above"),
             });Ok(())
         },
