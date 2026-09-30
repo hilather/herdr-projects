@@ -810,7 +810,8 @@ fn preflight_refuses_fifo_and_oversized_external_config_without_hanging() {
         let output=std::fs::File::create(home.path().join("preflight.json")).unwrap();
         let mut child=Command::new(BIN).env_clear().env("HOME",home.path()).args(["--root",root_arg,"migration","demo","preflight"]).stdout(output).stderr(Stdio::inherit()).spawn().unwrap();
         let deadline=Instant::now()+Duration::from_secs(5);
-        loop {if let Some(status)=child.try_wait().unwrap(){assert!(status.success());break;}if Instant::now()>deadline{let _=child.kill();let _=child.wait();panic!("preflight blocked on config");}std::thread::sleep(Duration::from_millis(10));}
+        loop {if let Some(status)=child.try_wait().unwrap(){assert!(status.success());break;}
+        if Instant::now()>deadline{let _=child.kill();let _=child.wait();panic!("preflight blocked on config");}std::thread::sleep(Duration::from_millis(10));}
         let report:serde_json::Value=serde_json::from_slice(&std::fs::read(home.path().join("preflight.json")).unwrap()).unwrap();assert!(report["blockers"].as_array().unwrap().iter().any(|v|v.as_str().unwrap().contains("config.toml")));
         std::fs::remove_file(&config).unwrap();
     }
@@ -849,7 +850,8 @@ fn root_config_special_files_fail_promptly_without_an_explicit_root() {
         } else {std::fs::File::create(&config).unwrap().set_len(16*1024*1024+1).unwrap();}
         let mut child=Command::new(BIN).env_clear().env("HOME",home.path()).arg("list").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
         let deadline=Instant::now()+Duration::from_secs(5);
-        loop {if let Some(status)=child.try_wait().unwrap(){assert!(!status.success());break;}if Instant::now()>deadline{let _=child.kill();let _=child.wait();panic!("root resolution blocked on config");}std::thread::sleep(Duration::from_millis(10));}
+        loop {if let Some(status)=child.try_wait().unwrap(){assert!(!status.success());break;}
+        if Instant::now()>deadline{let _=child.kill();let _=child.wait();panic!("root resolution blocked on config");}std::thread::sleep(Duration::from_millis(10));}
         std::fs::remove_file(&config).unwrap();
     }
 }
@@ -3771,6 +3773,21 @@ fn task_contract_put_and_result_submit_keep_worker_bytes_untrusted() {
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("required output"));
     assert_eq!(runtime::snapshot(&project).unwrap(), before_submit);
+    // A real listed object absent from both storage forms refuses without a row.
+    let mut absent: serde_json::Value = serde_json::from_slice(&std::fs::read(&submission).unwrap()).unwrap();
+    absent["objects"].as_array_mut().unwrap().push(serde_json::json!({"oid":"0".repeat(64),"relative_path":format!("00/{}", "0".repeat(62))}));
+    let absent_path = home.path().join("absent-object.json");
+    std::fs::write(&absent_path, serde_json::to_vec(&absent).unwrap()).unwrap();
+    let refused = hp(home.path(), &["--root", root_arg, "result", "demo", "submit", "--input-file", absent_path.to_str().unwrap()]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("missing object"));
+    assert_eq!(runtime::snapshot(&project).unwrap(), before_submit);
+    let listed = objects();
+    let loose_bytes: Vec<_> = listed.iter().map(|object| std::fs::read(repo.join(".git/objects").join(object["relative_path"].as_str().unwrap())).unwrap()).collect();
+    git(&["repack", "-a", "-d"]);
+    for object in &listed {
+        assert!(!repo.join(".git/objects").join(object["relative_path"].as_str().unwrap()).exists());
+    }
     let submitted = hp(home.path(), &["--root", root_arg, "result", "demo", "submit", "--input-file", submission.to_str().unwrap()]);
     assert!(submitted.status.success(), "{}", String::from_utf8_lossy(&submitted.stderr));
     let again = hp(home.path(), &["--root", root_arg, "result", "demo", "submit", "--input-file", submission.to_str().unwrap()]);
@@ -3785,6 +3802,16 @@ fn task_contract_put_and_result_submit_keep_worker_bytes_untrusted() {
     assert_eq!(shown.as_array().unwrap().len(), 1);
     assert!(shown[0].get("verified").is_none());
     assert_eq!(shown[0]["claimed_checks"], serde_json::json!(["cargo test"]));
+    for (object, bytes) in listed.iter().zip(&loose_bytes) {
+        use sha2::{Digest, Sha256};
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let retained = shown[0]["objects"].as_array().unwrap().iter().find(|entry| entry["oid"] == object["oid"]).unwrap();
+        assert_eq!(retained["byte_sha256"], digest);
+        assert_eq!(retained["size"], bytes.len() as u64);
+        let stage = db_path.parent().unwrap().join("factory-objects/staging");
+        let captured = std::fs::read_dir(stage).unwrap().filter_map(Result::ok).find_map(|entry| std::fs::read(entry.path().join(&digest)).ok()).unwrap();
+        assert_eq!(&captured, bytes);
+    }
     let raw=rusqlite::Connection::open(&db_path).unwrap();
     for table in ["verification_runs","verified_results","dependency_satisfactions","feedback_items"] {
         assert_eq!(raw.query_row(&format!("SELECT count(*) FROM {table}"),[],|row|row.get::<_,u64>(0)).unwrap(),0,"result submission manufactured {table}");
@@ -3881,7 +3908,7 @@ fn task_contract_put_and_result_submit_keep_worker_bytes_untrusted() {
     raw.execute_batch("CREATE TRIGGER refuse_integration_checks BEFORE UPDATE OF checks_passed ON integration_operations WHEN NEW.checks_passed=1 BEGIN SELECT RAISE(ABORT,'injected checks write failure'); END;").unwrap();
     let incomplete = integrate(result_id); assert!(!incomplete.status.success());
     assert_eq!(raw.query_row("SELECT state FROM integration_operations WHERE idempotency_key='integrate-scope'",[],|r|r.get::<_,String>(0)).unwrap(), "candidate_prepared", "{}", String::from_utf8_lossy(&incomplete.stderr));
-    assert_eq!(raw.query_row("SELECT checks_passed FROM integration_operations WHERE idempotency_key='integrate-scope'",[],|r|r.get::<_,bool>(0)).unwrap(), false);
+    assert!(!raw.query_row("SELECT checks_passed FROM integration_operations WHERE idempotency_key='integrate-scope'",[],|r|r.get::<_,bool>(0)).unwrap());
     assert_eq!(git(&["rev-parse","refs/heads/factory-integration"]), target_before);
     assert!(!integration_work.exists());
     raw.execute_batch("DROP TRIGGER refuse_integration_checks; CREATE TRIGGER refuse_integration_receipt BEFORE INSERT ON integrated_commits BEGIN SELECT RAISE(ABORT,'injected receipt write failure'); END;").unwrap();
@@ -4475,7 +4502,7 @@ fn factory_status_cli_redacts_history_preserves_capacity_and_refuses_unknown_sch
                     id: TaskId::new(format!("retired-{index:02}")).unwrap(),
                     revision: 1,
                     state: TaskState::Succeeded,
-                    title: format!("SECRET_TOKEN_DO_NOT_LEAK-{index}").into(),
+                    title: format!("SECRET_TOKEN_DO_NOT_LEAK-{index}"),
                     active_attempt: None,
                 },
             });
@@ -4515,7 +4542,7 @@ fn factory_status_cli_redacts_history_preserves_capacity_and_refuses_unknown_sch
     let output=hp(home.path(),&command);assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
     let cold:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();forbid(&cold);
     assert_eq!(cold["counters"]["retained_slots"],1);assert_eq!(cold["counters"]["active_inventory_page_rows"],active_rows);
-    assert_eq!(raw.query_row("SELECT termination_observed FROM attempts WHERE id='attempt-kept'",[],|row|row.get::<_,bool>(0)).unwrap(),false);
+    assert!(!raw.query_row("SELECT termination_observed FROM attempts WHERE id='attempt-kept'",[],|row|row.get::<_,bool>(0)).unwrap());
     raw.execute("DELETE FROM tasks WHERE id='retired/invalid'",[]).unwrap();
     for (version,message) in [(SCHEMA+1,"store schema is newer than this binary"),(0,"unsupported_schema")] {
         raw.pragma_update(None,"user_version",version).unwrap();

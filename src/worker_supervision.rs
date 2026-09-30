@@ -918,6 +918,13 @@ pub fn isolated_gated_command(
         "LANG=C.UTF-8".into(),
         "LC_ALL=C.UTF-8".into(),
         "TERM=xterm-256color".into(),
+        "GIT_CONFIG_COUNT=3".into(),
+        "GIT_CONFIG_KEY_0=gc.auto".into(),
+        "GIT_CONFIG_VALUE_0=0".into(),
+        "GIT_CONFIG_KEY_1=gc.autoDetach".into(),
+        "GIT_CONFIG_VALUE_1=false".into(),
+        "GIT_CONFIG_KEY_2=maintenance.auto".into(),
+        "GIT_CONFIG_VALUE_2=false".into(),
     ]);
     if let Some(spool) = &isolation.spool {
         args.push(format!("{SUBMISSION_SPOOL_ENV}={spool}"));
@@ -1008,7 +1015,14 @@ mod tests {
                 ("PATH", path.as_str()),
                 ("LANG", "C.UTF-8"),
                 ("LC_ALL", "C.UTF-8"),
-                ("TERM", "xterm-256color")
+                ("TERM", "xterm-256color"),
+                ("GIT_CONFIG_COUNT", "3"),
+                ("GIT_CONFIG_KEY_0", "gc.auto"),
+                ("GIT_CONFIG_VALUE_0", "0"),
+                ("GIT_CONFIG_KEY_1", "gc.autoDetach"),
+                ("GIT_CONFIG_VALUE_1", "false"),
+                ("GIT_CONFIG_KEY_2", "maintenance.auto"),
+                ("GIT_CONFIG_VALUE_2", "false")
             ]
             .into_iter()
             .collect()

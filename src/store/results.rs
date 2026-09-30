@@ -148,10 +148,10 @@ fn parse_submission(raw: &[u8]) -> Result<ParsedSubmission> {
     {
         return Err(invalid("invalid result repository or oid"));
     }
-    if let Some(snapshot) = &document.memory_snapshot_id {
-        if !plain(snapshot, 128) {
-            return Err(invalid("invalid result snapshot"));
-        }
+    if let Some(snapshot) = &document.memory_snapshot_id
+        && !plain(snapshot, 128)
+    {
+        return Err(invalid("invalid result snapshot"));
     }
     if document.objects.is_empty()
         || document.objects.len() > 64
@@ -439,6 +439,134 @@ fn read_object_file(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Reconstruct a loose object using Git's own encoder, in a private repository.
+/// Re-hashing the exact binary content refuses forged pack indexes and replace refs.
+fn read_packed_object(
+    repository: &Path,
+    scratch: &Path,
+    oid: &str,
+    format: ObjectFormat,
+) -> Result<Vec<u8>> {
+    use crate::runner::{Cmd, RealRunner, Runner};
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    // This read-only source operation owns no transfer resources. RealRunner
+    // supplies the GatedSpawn gate, process-group cleanup and capture bounds.
+    let git = |path: &Path,
+               args: &[&str],
+               stdin: Option<String>,
+               limit: usize|
+     -> anyhow::Result<Vec<u8>> {
+        let mut cmd = Cmd::new("/usr/bin/git", std::time::Duration::from_secs(20))
+            .args([
+                "--no-pager",
+                "--no-optional-locks",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "gc.auto=0",
+                "-c",
+                "maintenance.auto=false",
+            ])
+            .args(args.iter().copied());
+        cmd.cwd = Some(
+            path.to_str()
+                .ok_or_else(|| anyhow::anyhow!("invalid Git path"))?
+                .into(),
+        );
+        cmd.env_clear = true;
+        cmd.env = [
+            ("PATH", "/usr/bin:/bin"),
+            ("LANG", "C"),
+            ("LC_ALL", "C"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GIT_NO_LAZY_FETCH", "1"),
+            ("GIT_NO_REPLACE_OBJECTS", "1"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect();
+        cmd.deadline = Some(deadline);
+        cmd.stdin = stdin;
+        cmd.capture_limit = limit;
+        let output = RealRunner.run(&cmd)?;
+        anyhow::ensure!(
+            output.success(),
+            "object Git read failed or exceeded bounds"
+        );
+        Ok(output.stdout_bytes)
+    };
+    let read = || -> anyhow::Result<Vec<u8>> {
+        let output = git(
+            repository,
+            &["cat-file", "--batch"],
+            Some(format!("{oid}\n")),
+            OBJECT_LIMIT as usize + 256,
+        )?;
+        let newline = output
+            .iter()
+            .position(|b| *b == b'\n')
+            .ok_or_else(|| anyhow::anyhow!("missing header"))?;
+        let header = std::str::from_utf8(&output[..newline])?;
+        let fields: Vec<_> = header.split(' ').collect();
+        anyhow::ensure!(fields.len() == 3 && fields[0] == oid, "missing object");
+        anyhow::ensure!(
+            ["blob", "tree", "commit", "tag"].contains(&fields[1]),
+            "invalid object type"
+        );
+        let size: usize = fields[2].parse()?;
+        anyhow::ensure!(
+            size <= OBJECT_LIMIT as usize
+                && output.len() == newline + size + 2
+                && output.last() == Some(&b'\n'),
+            "invalid object size"
+        );
+        if !scratch.exists() {
+            fs::create_dir(scratch)?;
+            git(
+                scratch,
+                &[
+                    "init",
+                    "--bare",
+                    &format!("--object-format={}", format.as_str()),
+                ],
+                None,
+                8192,
+            )?;
+        }
+        let content = scratch.join("content");
+        write_file(&content, &output[newline + 1..newline + 1 + size])
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let hashed = git(
+            scratch,
+            &[
+                "hash-object",
+                "--literally",
+                "-w",
+                "-t",
+                fields[1],
+                "--",
+                content
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("invalid scratch path"))?,
+            ],
+            None,
+            8192,
+        );
+        fs::remove_file(content)?;
+        anyhow::ensure!(
+            hashed? == format!("{oid}\n").as_bytes(),
+            "object identity mismatch"
+        );
+        read_object_file(&scratch.join("objects").join(&oid[..2]).join(&oid[2..]))
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    };
+    read().map_err(|_| invalid("missing object"))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct StagedObject {
     oid: String,
@@ -524,7 +652,13 @@ fn stage_objects(
     for object in &submission.objects {
         let source_path =
             crate::migration::safe_join(&source, &object.relative_path).map_err(map_join)?;
-        let bytes = read_object_file(&source_path)?;
+        let bytes = match read_object_file(&source_path) {
+            Ok(bytes) => bytes,
+            Err(StoreError::Invalid(message)) if message == "missing object" && !source_path.exists() => {
+                read_packed_object(Path::new(&submission.repository), &dir.join("packed-reconstruction"), &object.oid, submission.object_format)?
+            }
+            Err(error) => return Err(error),
+        };
         let byte_sha256 = sha256_hex(&bytes);
         let dest = dir.join(&byte_sha256);
         if dest.is_file() {
@@ -541,6 +675,10 @@ fn stage_objects(
             byte_sha256,
             size: bytes.len() as u64,
         });
+    }
+    let scratch = dir.join("packed-reconstruction");
+    if scratch.exists() {
+        fs::remove_dir_all(scratch).map_err(|error| StoreError::Io(error.to_string()))?;
     }
     let manifest = StageManifest {
         payload_digest: payload_digest.to_string(),

@@ -1067,6 +1067,12 @@ fn run(program: &str, args: &[&str]) -> (bool, String) {
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("--version") { println!("2.1.0 (Claude Code)"); return }
     let mut report = String::new();
+    for key in ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_1", "GIT_CONFIG_KEY_2", "GIT_CONFIG_VALUE_2"] {
+        report += &format!("env {key} {}\n", std::env::var(key).unwrap_or_default());
+    }
+    for key in ["gc.auto", "gc.autoDetach", "maintenance.auto"] {
+        report += &format!("gitconfig {key} {}\n", run("/usr/bin/git", &["config", "--get", key]).1);
+    }
     for secret in SECRETS {
         report += &format!("read {secret} {}\n", match fs::read(secret) { Ok(bytes) => format!("OK:{}", String::from_utf8_lossy(&bytes).trim()), Err(error) => format!("ERR:{:?}", error.kind()) });
     }
@@ -1360,6 +1366,12 @@ fn an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_com
     let mut ticker = lab.spawn();
     lab.wait(&mut ticker, 120, &|| worktree.join("probe-1.txt").exists());
     let report = fs::read_to_string(worktree.join("probe-1.txt")).unwrap();
+    for expected in ["GIT_CONFIG_COUNT 3", "GIT_CONFIG_KEY_0 gc.auto", "GIT_CONFIG_VALUE_0 0", "GIT_CONFIG_KEY_1 gc.autoDetach", "GIT_CONFIG_VALUE_1 false", "GIT_CONFIG_KEY_2 maintenance.auto", "GIT_CONFIG_VALUE_2 false"] {
+        assert!(report.contains(&format!("env {expected}\n")), "{report}");
+    }
+    for expected in ["gc.auto 0", "gc.autoDetach false", "maintenance.auto false"] {
+        assert!(report.contains(&format!("gitconfig {expected}|\n")), "{report}");
+    }
     // Nothing secret reached the worker, directly or through its own namespace.
     for sentinel in secrets.iter().map(|(_, s)| *s).chain([owner_key.lines().nth(1).unwrap(), "SENTINEL-SSH-AGENT", "SENTINEL-HOST-TMP", "LIFTED"]) {
         assert!(!report.contains(sentinel), "{sentinel} reached the worker:\n{report}");

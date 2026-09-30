@@ -83,6 +83,12 @@ config. It prints `candidate_oid`. Capturing again without changes returns the
 same OID with `captured: false`; later edits become a new commit on top. The
 worktree's index is reset to the branch tip; its files are not touched.
 
+The isolated baseline pins `gc.auto=0`, `gc.autoDetach=false` and
+`maintenance.auto=false` through Git environment configuration for ordinary
+worker commands. Submission also accepts listed packed objects, reconstructing
+and verifying their OIDs before retaining loose-format bytes. Legacy submitters
+use the same verified fallback.
+
 Submit that OID as usual with `result submit`; the submission format is
 unchanged. Inside the worker sandbox the project store is read-only: `result
 submit` writes the document into the attempt's submission spool and prints
