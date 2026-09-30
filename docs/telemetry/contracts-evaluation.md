@@ -237,7 +237,7 @@ interval_not_computed`; the interval lives in this report.
 
 Code: `src/domain/assignment_policy.rs` (pure policies),
 `src/store/assignment_policy.rs` (switch, grants, assignment record,
-canonical migration 0065), `src/admission.rs` (`decide_held`, `weigh`,
+canonical migration 0065; grant revocations, migration 0066), `src/admission.rs` (`decide_held`, `weigh`,
 `assign`, `policy_suggestion`), `src/telemetry/policies.rs` (inputs, shadow
 stream `policies`, CLI). A policy never builds launch inputs, approvals,
 contracts or review/verification policy: it only picks one of the profiles
@@ -291,12 +291,12 @@ per-arm `probability_ppm` (exact integers summing to 1000000) and the choice.
   (`DispatchContext::Assigned`) and writes `dispatch_policy_assignments`
   (policy, digest, spec, seed, draw, grant, constraints). The reservation
   transaction re-checks: settings revision still current `assign` with the
-  same grant and primary; grant valid and permitting; chosen arm within its
+  same grant and primary; grant unrevoked, valid and permitting; chosen arm within its
   cap (decisions choosing it since the settings revision ≤ cap); a trigger
   requires the logged probabilities to sum to 1000000 with the chosen entry
-  positive. When the primary abstains or the grant no longer permits, the
-  candidate is not reserved (`policy_abstained`); switching `off` returns
-  to the rule.
+  positive. When the primary abstains or the grant no longer permits (expired
+  or revoked), the candidate is not reserved (`policy_abstained`); switching
+  `off` returns to the rule.
 
 **Authority** (`randomized_assignment_authority.v1`, namespace
 `randomized-assignment@herdr-projects`, factory F2.5): `{schema, scope:
@@ -307,6 +307,25 @@ prohibited_effects [alter_review_policy, alter_verification_policy,
 choose_outside_eligible_set, exceed_budget, increase_permissions],
 authority}`. `policies authority import DOC SIG` verifies the owner
 signature first; it enables nothing.
+
+**Revocation** (`policies authority revoke DOC SIG`, migration
+`0066_assignment_revocations.sql`, schema 66; the pattern of
+contracts-review.md §10): `randomized_assignment_revocation.v1 {schema,
+grant_id, project_store, reason, authority}`, owner-signed under its own
+namespace `randomized-assignment-revocation@herdr-projects` (a grant-namespace
+signature, or any other key, is refused), reason `compromised`,
+`experiment_ended`, `issued_in_error` or `scope_changed`, `authority` the
+current owner policy. Stored append-only (`assignment_authority_revocations`,
+exact bytes and signature, one per grant); the same revocation replays, a
+different one for a revoked grant is refused. It stops assignment under the
+grant from its commit on: admission's evaluation abstains, the reservation
+transaction re-checks it like expiry (`randomized_assignment grant is
+revoked`), a trigger refuses a raw `dispatch_policy_assignments` row naming
+it, and `configure --mode assign --grant` refuses it (store and trigger).
+Earlier decisions and their policy records stay. `policies show` lists each
+grant's `status` (`active`, `not_yet_valid`, `expired`, `revoked`),
+`assigned_decisions` and `revocation {reason, revoked_unix_ms}`. Test
+`a_revoked_grant_stops_assignment_immediately_and_keeps_earlier_decisions`.
 
 **Reports** (read-only): `policies show` (switch, history, grants,
 assigned count); `policies simulate --input FILE [--seed N] [--sweep K]`

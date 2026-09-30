@@ -2,7 +2,9 @@
 //! contracts-analytics.md §3): fixed terminal and assignment cohorts over the
 //! canonical store, read strictly read-only. Failed, cancelled and
 //! succeeded-without-evidence tasks stay in `T`; open tasks are an explicit
-//! exclusion; nothing unknown is placed in a window by guess.
+//! exclusion; nothing unknown is placed in a window by guess. Replay
+//! candidates (TM4.6) are evaluation artefacts measured by M49 only: every
+//! lifecycle cohort excludes them as `replay_candidate`.
 use super::registry::Cohort;
 use anyhow::Result;
 use rusqlite::Connection;
@@ -20,6 +22,8 @@ pub struct Task {
     pub route: Option<String>,
     pub class: Option<String>,
     pub attempts: Vec<Attempt>,
+    /// A replay candidate (`replay_candidates`): outside every lifecycle cohort.
+    pub replay: bool,
 }
 
 impl Task {
@@ -78,6 +82,9 @@ pub fn queries(db: &Connection) -> Result<Vec<(&'static str, String)>> {
             LEFT JOIN integration_operations i ON i.verified_result_id=r.result_id LEFT JOIN integrated_commits k ON k.operation_id=i.operation_id
             WHERE c.contract_revision=(SELECT max(contract_revision) FROM task_contracts x WHERE x.task_id=c.task_id) GROUP BY c.task_id".to_owned()),
     ];
+    if table(db, "replay_candidates")? {
+        out.push(("lifecycle_replay_candidates", "SELECT task_id FROM replay_candidates".to_owned()));
+    }
     if table(db, "task_classifications")? {
         out.push(("lifecycle_classes", "SELECT task_id,class FROM task_classifications ORDER BY task_id,created_unix_ms,revision".to_owned()));
     }
@@ -101,17 +108,26 @@ pub fn load(project: &Path) -> Result<Vec<Task>> {
     if let Some(sql) = sql("lifecycle_classes") {
         for row in db.prepare(&sql)?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? { let (task, class) = row?; classes.insert(task, class); }
     }
+    let replay: BTreeSet<String> = match sql("lifecycle_replay_candidates") {
+        Some(sql) => db.prepare(&sql)?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?,
+        None => BTreeSet::new(),
+    };
     Ok(evidence.into_iter().map(|(id, state, accepted)| {
         let route = routes.get(&id).cloned();
         let accepted_at = accepted.then(|| times.get(&id).and_then(|(verified, integrated)| if route.as_deref() == Some("verify_only") { *verified } else { *integrated })).flatten();
-        Task { attempts: attempts.remove(&id).unwrap_or_default(), class: classes.get(&id).cloned(), route, accepted, accepted_at, state, id }
+        Task { attempts: attempts.remove(&id).unwrap_or_default(), class: classes.get(&id).cloned(), route, accepted, accepted_at, replay: replay.contains(&id), state, id }
     }).collect())
 }
 
 /// Canonical input digest of the extracted rows: the lifecycle source watermark.
 pub fn digest(tasks: &[Task]) -> String {
-    let rows: Vec<Value> = tasks.iter().map(|t| json!([t.id, t.state, t.accepted, t.accepted_at, t.route, t.class,
-        t.attempts.iter().map(|a| json!([a.id, a.state, a.decided, a.reserved, a.ended, a.kind])).collect::<Vec<_>>()])).collect();
+    // The replay mark is appended only when set, so a project without replay keeps its digest.
+    let rows: Vec<Value> = tasks.iter().map(|t| {
+        let mut row = json!([t.id, t.state, t.accepted, t.accepted_at, t.route, t.class,
+            t.attempts.iter().map(|a| json!([a.id, a.state, a.decided, a.reserved, a.ended, a.kind])).collect::<Vec<_>>()]);
+        if t.replay && let Value::Array(row) = &mut row { row.push(json!("replay_candidate")); }
+        row
+    }).collect();
     super::sha256(serde_json::to_string(&rows).unwrap_or_default().as_bytes())
 }
 
@@ -135,6 +151,8 @@ fn cohort<'a>(tasks: &'a [Task], r: &Request) -> (Vec<Member<'a>>, BTreeMap<&'st
     let inside = |at: i64| r.from.is_none_or(|from| at >= from) && r.to.is_none_or(|to| at < to);
     let (mut members, mut excluded, mut cutoff) = (Vec::new(), BTreeMap::<&'static str, Vec<&Task>>::new(), None::<i64>);
     for task in tasks {
+        // Evaluation artefacts: measured by M49, never in a lifecycle cohort.
+        if task.replay { excluded.entry("replay_candidate").or_default().push(task); continue; }
         let disposition = task.disposition();
         match r.cohort {
             Cohort::Terminal => {

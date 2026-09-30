@@ -328,6 +328,14 @@ impl SqliteStore {
 
     /// Register the fresh task `task` as the run's replay candidate for `case`.
     #[allow(clippy::too_many_arguments)]
+    /// The source repository of `task`'s replay case, `None` when `task` is
+    /// not a replay candidate. Its sandbox hides it (contracts-replay.md §4).
+    pub fn replay_source_repository(&self, task: &str) -> Result<Option<String>> {
+        if !registry_present(&self.connection)? { return Ok(None); }
+        Ok(self.connection.query_row("SELECT c.repository FROM replay_candidates k JOIN replay_cases c ON c.suite_version=k.suite_version AND c.case_id=k.case_id
+            WHERE k.task_id=?1", [task], |r| r.get(0)).optional()?)
+    }
+
     pub fn register_replay_candidate(&mut self, task: &str, run_id: &str, suite: &str, case: &str, repository: &str, principal: &str, now: i64) -> Result<()> {
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         schema_replay(&tx)?;

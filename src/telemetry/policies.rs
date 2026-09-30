@@ -31,7 +31,8 @@ pub fn needs_outcomes(specs: &[PolicySpec]) -> bool { specs.iter().any(|s| s.pol
 /// Terminal task outcomes per `(task class, configuration)` from the query
 /// service's lifecycle rows: a task counts for the one configuration all its
 /// attempts were dispatched on (mixed or unknown arms are skipped); accepted
-/// is a success, every other terminal disposition a failure; open tasks do not count.
+/// is a success, every other terminal disposition a failure; open tasks and
+/// replay candidates (measured by M49 only) do not count.
 #[derive(Debug, Default)]
 pub struct Evidence { outcomes: BTreeMap<(String, String), (u64, u64)> }
 
@@ -50,7 +51,7 @@ impl Evidence {
         let mut outcomes = BTreeMap::new();
         for task in &tasks {
             let disposition = task.disposition();
-            if disposition == "open" || task.attempts.is_empty() { continue; }
+            if disposition == "open" || task.attempts.is_empty() || task.replay { continue; }
             let chosen: Option<Vec<&String>> = task.attempts.iter().map(|a| arms.get(&a.id)).collect();
             let Some(chosen) = chosen else { continue };
             if chosen.iter().any(|c| *c != chosen[0]) { continue; }
@@ -316,6 +317,10 @@ pub enum Command {
 pub enum AuthorityCommand {
     /// Install an owner-signed grant; enables nothing by itself.
     Import { document: PathBuf, signature: PathBuf },
+    /// Record an owner-signed `randomized_assignment_revocation.v1` (namespace
+    /// `randomized-assignment-revocation@herdr-projects`): assignment under the
+    /// grant stops now; earlier decisions stay.
+    Revoke { document: PathBuf, signature: PathBuf },
 }
 
 pub fn run(project: &Path, command: Command) -> Result<String> {
@@ -332,6 +337,7 @@ pub fn run(project: &Path, command: Command) -> Result<String> {
                 "policies": settings.policies.iter().map(|p| json!({"policy": p.policy, "policy_digest": p.digest()})).collect::<Vec<_>>()}}))
         }
         Command::Authority(AuthorityCommand::Import { document, signature }) => pretty(json!({"grant": crate::authority::import_assignment_authority(project, &document, &signature)?})),
+        Command::Authority(AuthorityCommand::Revoke { document, signature }) => pretty(json!({"revocation": crate::authority::revoke_assignment_authority(project, &document, &signature)?})),
         Command::Simulate { input, seed, sweep } => pretty(simulate(&input, seed, sweep)?),
         Command::Suggest { task, json } => {
             let report = crate::admission::policy_suggestion(project, &task)?;

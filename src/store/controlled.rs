@@ -179,6 +179,11 @@ impl ControlledStore {
         })();
         selected.map_err(|e|self.error(e))
     }
+    /// See [`SqliteStore::replay_source_repository`].
+    pub(crate) fn replay_source_repository(&mut self,task:&str)->Result<Option<String>> {
+        self.control.check()?;
+        self.store.replay_source_repository(task).map_err(|e|self.error(e))
+    }
     pub(crate) fn render_attempt_brief(&mut self,project:&Path,attempt:&str)->anyhow::Result<crate::memory::WorkerBrief> {
         self.control.check()?;
         anyhow::ensure!(project.join(".state/state.db").canonicalize()?.to_str()==self.store.connection.path(),"knowledge store belongs to another project");

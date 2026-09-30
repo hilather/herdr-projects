@@ -58,9 +58,14 @@ pub(crate) fn central(project: &Path, since: Option<i64>) -> Result<(BTreeMap<St
     let in_window = |a: &Attempt| since.is_none_or(|since| a.decided.is_some_and(|at| at >= since));
 
     // Contracts §6 `T` and `A`: evidence for the task's current contract revision.
+    // Replay candidates are evaluation artefacts (M49 only), never in `T`.
     let tasks = task_evidence(&db)?;
-    let (mut terminal, mut accepted, mut open, mut without_evidence, mut outside) = (BTreeSet::new(), 0, 0, 0, 0);
+    let replay: BTreeSet<String> = if table("replay_candidates")? {
+        db.prepare("SELECT task_id FROM replay_candidates")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+    } else { BTreeSet::new() };
+    let (mut terminal, mut accepted, mut open, mut without_evidence, mut outside, mut replayed) = (BTreeSet::new(), 0, 0, 0, 0, 0);
     for (task, state, evidence) in &tasks {
+        if replay.contains(task) { replayed += 1; continue; }
         if since.is_some() && !attempts.iter().any(|a| &a.task == task && in_window(a)) { outside += 1; continue; }
         if *evidence || ["succeeded", "failed", "cancelled"].contains(&state.as_str()) {
             terminal.insert(task.as_str());
@@ -69,8 +74,9 @@ pub(crate) fn central(project: &Path, since: Option<i64>) -> Result<(BTreeMap<St
     }
     let cohort: Vec<&Attempt> = attempts.iter().filter(|a| terminal.contains(a.task.as_str())).collect();
     let mut metrics = BTreeMap::new();
-    metrics.insert("M02", ratio("M02", accepted, terminal.len(), json!({"excluded": {"open": open, "outside_window": outside}})));
-    metrics.insert("M07", ratio("M07", cohort.len(), accepted, json!({"attempts_without_decision": cohort.iter().filter(|a| a.decided.is_none()).count()})));
+    metrics.insert("M02", ratio("M02", accepted, terminal.len(), json!({"excluded": {"open": open, "outside_window": outside, "replay_candidate": replayed}})));
+    metrics.insert("M07", ratio("M07", cohort.len(), accepted, json!({"attempts_without_decision": cohort.iter().filter(|a| a.decided.is_none()).count(),
+        "excluded": {"replay_candidate": replayed}})));
 
     let sidecar = super::sidecar::read(project)?;
     usage_metrics(sidecar.as_deref(), &attempts, since, &in_window, &mut metrics)?;
@@ -80,7 +86,7 @@ pub(crate) fn central(project: &Path, since: Option<i64>) -> Result<(BTreeMap<St
     metrics.insert("M49", crate::replay::m49(&db, since)?);
     for (id, name) in NAMES { if let Some(m) = metrics.get_mut(id) { m["name"] = json!(name); } }
     let metrics: BTreeMap<String, Value> = metrics.into_iter().map(|(id, m)| (id.to_owned(), m)).collect();
-    Ok((metrics, json!({"accepted": accepted, "open": open, "succeeded_without_evidence": without_evidence, "terminal": terminal.len()})))
+    Ok((metrics, json!({"accepted": accepted, "open": open, "succeeded_without_evidence": without_evidence, "terminal": terminal.len(), "replay_candidates": replayed})))
 }
 
 /// M08, M09, M15 over certified bound sessions (activity window by session

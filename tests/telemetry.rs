@@ -283,7 +283,7 @@ fn golden_acceptance_and_amplification() {
         .args(["--root", tmp.path().join("root").to_str().unwrap(), "telemetry", "demo", "report", "--json"]).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(report["tasks"], serde_json::json!({"accepted": 2, "open": 2, "succeeded_without_evidence": 0, "terminal": 3}));
+    assert_eq!(report["tasks"], serde_json::json!({"accepted": 2, "open": 2, "succeeded_without_evidence": 0, "terminal": 3, "replay_candidates": 0}));
     let m02 = metric(&report, "M02");
     assert_eq!((&m02["definition"], &m02["numerator"], &m02["denominator"], &m02["value"]), (&"M02.slice-v1".into(), &2.into(), &3.into(), &"2/3".into()));
     let m07 = metric(&report, "M07");

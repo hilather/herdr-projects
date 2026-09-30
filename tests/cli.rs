@@ -5240,7 +5240,7 @@ fn fleet_text_matches_report_json() {
     assert!(hp(home.path(),&["--root",&r,"telemetry","demo","collect"]).status.success());
     let out=hp(home.path(),&["--root",&r,"telemetry","demo","report","--json"]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
     let report:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(report["tasks"],serde_json::json!({"accepted":0,"open":2,"succeeded_without_evidence":0,"terminal":1}));
+    assert_eq!(report["tasks"],serde_json::json!({"accepted":0,"open":2,"succeeded_without_evidence":0,"terminal":1,"replay_candidates":0}));
     assert_eq!((&report["metrics"]["M02"]["value"],&report["metrics"]["M07"]["reason"],&report["metrics"]["M13"]["reason"]),(&"0/1".into(),&"empty_denominator".into(),&"empty_denominator".into()));
     // Extended M40: no attempt inputs record the execution home, so no account to read; unavailable, never 0.
     assert_eq!(report["metrics"]["M40"]["decisions"],serde_json::json!([{"attempt_id":"t2-a1","decided_unix_ms":decided,"service":"codex","value":{"reason":"execution_home_unknown","status":"unavailable"}}]));

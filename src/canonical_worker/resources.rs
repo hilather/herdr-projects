@@ -8,7 +8,8 @@ pub(super) use crate::profile_config::ProfileDefinition as Definition;
 /// The literal supervisor argv. Creation and gate release derive it from the
 /// same retained inputs (profile, project, route, approved repositories) and
 /// the controller's owner identity, so the released gate matches the created one.
-/// An isolated attempt also names its submission spool (`attempt`).
+/// An isolated attempt also names its submission spool (`attempt`) and hides
+/// `launch_hides` (see [`launch_hides`]).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn command(
     profile: &FrozenProfile,
@@ -19,6 +20,7 @@ pub(super) fn command(
     route: &RuntimeRoute,
     inputs: &crate::domain::LaunchInputs,
     events: &[Event],
+    launch_hides: &[String],
 ) -> Result<Vec<String>> {
     let definition = crate::profile_config::frozen_definition(profile)?;
     let wall = definition.validate_gated_preparation(prompt_chars)?;
@@ -26,7 +28,7 @@ pub(super) fn command(
         let repositories = inputs.repositories.iter().map(|r| Path::new(r.repository.as_str())).collect::<Vec<_>>();
         let git = crate::worktree_preparation::retained_git_directories(events, operation)?;
         let worktrees = git.iter().map(|(w, d, c)| (Path::new(w.as_str()), Path::new(d.as_str()), Path::new(c.as_str()))).collect::<Vec<_>>();
-        let isolation = crate::worker_supervision::Isolation::for_agent(
+        let isolation = crate::worker_supervision::Isolation::for_launch(
             project,
             Path::new(home),
             Path::new(&route.cwd),
@@ -36,6 +38,7 @@ pub(super) fn command(
             Some(Path::new(&profile.config.path)),
             Some(Path::new(&route.socket)),
             &crate::profile_config::frozen_isolation_hides(profile)?,
+            launch_hides,
         )?
         .with_submission_spool(attempt.as_str())?;
         return crate::worker_supervision::isolated_gated_command(
@@ -53,6 +56,20 @@ pub(super) fn command(
         wall,
         &release_token(operation),
     )
+}
+/// Paths hidden from this launch only (TM4.6, contracts-replay.md §4): a
+/// replay candidate's sandbox hides its case's source repository (it holds
+/// the accepted change and its tests) and the project's hidden-check store
+/// `<projects root>/.replay/<slug>/checks`. Derived from the append-only
+/// replay registry, so resource creation and gate release derive the same
+/// argv (the command digest fences it); any other task hides nothing extra,
+/// and ordinary launches on the source repository are unaffected.
+pub(super) fn launch_hides(db: &mut crate::store::controlled::ControlledStore, project: &Path, task: &crate::domain::TaskId) -> Result<Vec<String>> {
+    let Some(repository) = db.replay_source_repository(task.as_str())? else { return Ok(Vec::new()) };
+    let project = project.canonicalize()?;
+    let slug = project.file_name().and_then(|n| n.to_str()).context("project has no name")?;
+    let checks = project.parent().context("project has no root")?.join(".replay").join(slug).join("checks");
+    Ok(vec![repository, checks.to_str().context("check store path is not UTF-8")?.to_owned()])
 }
 fn release_token(operation: &OperationId) -> String {
     format!("release-{}", operation.as_str())
@@ -321,7 +338,8 @@ fn create_resource_inner(
     // Refuse unusable retained knowledge before creating any external resource.
     let brief =
         db.render_attempt_brief(&project, record.attempt.as_str())?;
-    let argv = command(profile, operation, &record.attempt, brief.prompt_chars, &project, route, &record.inputs, &state.events)?;
+    let hides = launch_hides(&mut db, &project, &record.inputs.task)?;
+    let argv = command(profile, operation, &record.attempt, brief.prompt_chars, &project, route, &record.inputs, &state.events, &hides)?;
     executable(&profile.agent, deadline, &cancellation)?;
     let session = session_identity(Path::new(&route.socket))?;
     let mut api = Api {
@@ -1082,7 +1100,8 @@ pub fn release_gate(
     let brief =
         db.render_attempt_brief(&project, record.attempt.as_str())?;
     let worktrees=crate::worktree_preparation::verify_events_held(&project,&state.events,record,deadline,cancellation.clone(),guard.inherit()?)?;
-    let argv = command(profile, operation, &record.attempt, brief.prompt_chars, &project, &target.route, &record.inputs, &state.events)?;
+    let hides = launch_hides(&mut db, &project, &record.inputs.task)?;
+    let argv = command(profile, operation, &record.attempt, brief.prompt_chars, &project, &target.route, &record.inputs, &state.events, &hides)?;
     // The sandbox binds the attempt's spool and output directory writable
     // only when they exist, so they are created (owner-only) before release.
     crate::submission_spool::prepare(&project, &record.attempt)?;

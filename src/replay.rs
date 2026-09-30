@@ -304,17 +304,6 @@ fn show(project: &Path, suite: &str) -> Result<Value> {
     Ok(json!({"suite": record, "cases": cases, "retired": retired, "runs": runs}))
 }
 
-/// `[worker_isolation] hide` of the pinned owner configuration, expanded.
-fn isolation_hides(project: &Path) -> Result<Vec<PathBuf>> {
-    let config = migration::status(project)?.plan.config.context("migration has no pinned owner config path")?;
-    let text = fs::read_to_string(&config.path).context("owner configuration unavailable")?;
-    let value: toml::Value = toml::from_str(&text).map_err(|_| anyhow::anyhow!("invalid owner configuration (contents withheld)"))?;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    Ok(value.get("worker_isolation").and_then(|t| t.get("hide")).and_then(|h| h.as_array()).into_iter().flatten().filter_map(|p| p.as_str())
-        .filter_map(|p| match p.strip_prefix("~/") { Some(rest) => home.as_ref().map(|h| h.join(rest)), None => Some(PathBuf::from(p)) })
-        .map(|p| p.canonicalize().unwrap_or(p)).collect())
-}
-
 /// A replay repository at `base`: only the base commit's history, so no later
 /// change (the accepted solution and its tests included) is reachable.
 fn replay_repository(source: &Path, dest: &Path, format: &str, base: &str) -> Result<PathBuf> {
@@ -350,14 +339,12 @@ fn run_suite(project: &Path, suite: &str, configuration: &str, subset: &str, see
     let chosen = select(suite, &cases, n, seed)?;
     ensure!(!chosen.is_empty(), "replay suite {suite} has no eligible case");
     let chosen_cases: Vec<&ReplayCaseRecord> = chosen.iter().map(|id| cases.iter().find(|c| &c.case_id == id).unwrap()).collect();
-    // The source repository holds the accepted change and its tests: a
-    // replay worker must not see it. Only the owner's pinned isolation can hide it.
-    let hides = isolation_hides(project)?;
+    // The source repository holds the accepted change and its tests: each
+    // candidate's own sandbox hides it (and the check store) at launch,
+    // derived from this registry (`canonical_worker::resources::launch_hides`),
+    // so ordinary launches on that repository are unaffected.
     for case in &chosen_cases {
-        let repository = Path::new(&case.repository).canonicalize().with_context(|| format!("source repository of case {} is unavailable", case.case_id))?;
-        ensure!(hides.iter().any(|h| repository.starts_with(h)),
-            "replay run refused: worker isolation does not hide source repository {} of case {}; add it to [worker_isolation] hide in the owner configuration",
-            repository.display(), case.case_id);
+        Path::new(&case.repository).canonicalize().with_context(|| format!("source repository of case {} is unavailable", case.case_id))?;
         for check in case.hidden_checks.as_array().into_iter().flatten() {
             let sha = check["sha256"].as_str().unwrap_or_default();
             ensure!(crate::verification::hidden_digest(&check_path(project, sha)?).as_deref() == Some(sha),

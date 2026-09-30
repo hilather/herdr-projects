@@ -617,6 +617,7 @@ pub fn accept_review(project:&Path,session:&str,document:&Path,signature:&Path)-
 }
 
 pub const ASSIGNMENT_AUTHORITY_SIGNATURE_NAMESPACE:&str="randomized-assignment@herdr-projects";
+pub const ASSIGNMENT_REVOCATION_SIGNATURE_NAMESPACE:&str="randomized-assignment-revocation@herdr-projects";
 
 /// Verify a `randomized_assignment` grant (factory F2.5) with the pinned
 /// owner key; it must name the current owner policy. Parsing happens only
@@ -644,6 +645,26 @@ pub fn import_assignment_authority(project:&Path,document:&Path,signature:&Path)
         Ok(db.install_assignment_authority(&prepared,&signature,jiff::Timestamp::now().as_millisecond())?)
     })();
     if let Err(error)=&result {record_cli_denial(project,"delegation","assignment-import",None,error);}
+    result
+}
+
+/// Record an owner-signed revocation of one `randomized_assignment` grant
+/// (`randomized_assignment_revocation.v1`, its own namespace). Assignment
+/// under the grant stops from its commit on; earlier decisions stay.
+pub fn revoke_assignment_authority(project:&Path,document:&Path,signature:&Path)->Result<serde_json::Value> {
+    let result=(||{
+        let _guard=migration::runtime_mutation(project)?;
+        let mut db=migration::open_active(project)?;
+        let (owner,config)=policy(project)?;
+        let payload=migration::read_plan_file(document).map_err(|_|anyhow::anyhow!("assignment authority revocation unreadable"))?;
+        let signature=migration::read_plan_file(signature).map_err(|_|anyhow::anyhow!("assignment authority revocation signature unreadable"))?;
+        verify_signature(&owner,&payload,&signature,ASSIGNMENT_REVOCATION_SIGNATURE_NAMESPACE,&RealRunner)?;
+        let prepared=crate::store::PreparedAssignmentRevocation::parse_verified(&payload).map_err(anyhow::Error::msg)?;
+        ensure!(*prepared.authority()==owner.reference()?,"revocation names a different authority policy");
+        ensure!(migration::config_reference(Path::new(&config.path))?==config,"owner configuration changed during verification");
+        Ok(db.revoke_assignment_authority(&prepared,&signature,jiff::Timestamp::now().as_millisecond())?)
+    })();
+    if let Err(error)=&result {record_cli_denial(project,"delegation","assignment-revoke",None,error);}
     result
 }
 

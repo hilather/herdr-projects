@@ -111,6 +111,12 @@ Plan doc 07 §1. `T`/`A` evidence is exactly contracts §6 (`metrics::task_evide
   now): an outcome after the horizon, or an open task, is `unfinished`
   (`censored.unfinished`, `provisional: true`), counted in the denominator.
   Tasks never assigned are `not_assigned`.
+- **Replay candidates** (TM4.6 `replay_candidates`) are evaluation
+  artefacts measured by M49: every native cohort excludes them first, as
+  `replay_candidate` (in `exclusions` and the drill bucket
+  `excluded.replay_candidate`, shown when non-zero). The central report's
+  M02 `excluded` and M07 `excluded` carry `replay_candidate` always, and its
+  `tasks` summary counts them as `replay_candidates` outside `T`.
 - **`activity_window`**: events in the window; lane definitions only
   (`since_only`: `--from` is the lane's `--since`).
 - Dimensions for native definitions: `route`, `task_class` (latest
@@ -206,7 +212,7 @@ lane adds no report keys.
 | query | store | verdict | owner and proposed index |
 |---|---|---|---|
 | as-of by sequence / time, latest, next, lineage page, buckets | telemetry.db | indexed (`analytics_revisions_cell`, `analytics_revisions_cell_recorded`, lineage primary key) | analytics (this stream) |
-| `lifecycle_attempts`, `lifecycle_contracts`, `lifecycle_classes` | state.db | one pass over the aggregated table; every correlated lookup an index search | canonical |
+| `lifecycle_attempts`, `lifecycle_contracts`, `lifecycle_classes`, `lifecycle_replay_candidates` | state.db | one pass over the aggregated table; every correlated lookup an index search | canonical |
 | `lifecycle_acceptance_times` | state.db | `verified_results` by `submission_id` uses an automatic index | canonical steward: `CREATE INDEX verified_results_by_submission ON verified_results(submission_id)` (not added: no canonical schema change in TM4.1) |
 | central M08/M13/M15 source scan | telemetry.db | `codex_usage` scanned per source by `path_digest` | codex stream steward: `CREATE INDEX codex_usage_by_path ON codex_usage(path_digest, accepted, reason)` |
 | usage by session | telemetry.db | indexed (primary key) | codex |

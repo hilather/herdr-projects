@@ -497,6 +497,27 @@ impl Isolation {
         socket: Option<&Path>,
         extra: &[String],
     ) -> Result<Self> {
+        Self::for_launch(project, home, cwd, agent, repositories, worktrees, config, socket, extra, &[])
+    }
+
+    /// As [`Self::for_agent`], also hiding `launch`: absolute paths derived for
+    /// this one launch (at most 8), such as a replay candidate's source
+    /// repository and hidden-check store (TM4.6). They enter only the literal
+    /// argv, never an approval digest, and are refused like any hidden path
+    /// when they would cover a path the agent needs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_launch(
+        project: &Path,
+        home: &Path,
+        cwd: &Path,
+        agent: &Path,
+        repositories: &[&Path],
+        worktrees: &[(&Path, &Path, &Path)],
+        config: Option<&Path>,
+        socket: Option<&Path>,
+        extra: &[String],
+        launch: &[String],
+    ) -> Result<Self> {
         let project = normal(&project.canonicalize()?)?;
         let root = normal(Path::new(&project).parent().ok_or_else(|| anyhow::anyhow!("project has no root"))?)?;
         let home = normal(home)?;
@@ -520,6 +541,10 @@ impl Isolation {
                 }
                 None => hide.push(normal(Path::new(path))?),
             }
+        }
+        ensure!(launch.len() <= 8, "too many per-launch hidden paths");
+        for path in launch {
+            hide.push(normal(Path::new(path))?);
         }
         if let Some(config) = config {
             let config = normal(config)?;

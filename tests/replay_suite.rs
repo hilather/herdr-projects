@@ -19,8 +19,6 @@ const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
 const HISTORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/replay/sample-history.json");
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/replay/suite-v1.golden.json");
 const CLEAN: &str = r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#;
-/// The source repository holds every accepted change: replay workers must not see it.
-const HIDE_SOURCE: &str = "\n[worker_isolation]\nhide=['~/repo']";
 
 /// The Herdr stand-in of tests/canonical_worker.rs: runs `workspace.create_command`
 /// for real and logs each request beside the socket.
@@ -80,8 +78,8 @@ fn sign(key: &Path, namespace: &str, document: &Path) {
 impl Lab {
     /// An active project `demo` with an owner key, a SHA-256 repository `~/repo`,
     /// the queued task `work` bound to the lab server, and a `worker` profile
-    /// whose budget table is `budget` (the owner configuration hides `~/repo`
-    /// from workers).
+    /// whose budget table is `budget`. The owner configuration hides nothing
+    /// extra: a replay candidate's own sandbox hides `~/repo` at launch.
     fn new(budget: &str) -> Self {
         let home = tempfile::tempdir().unwrap();
         let key = home.path().join("owner");
@@ -89,7 +87,7 @@ impl Lab {
         let public = fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
         let config = home.path().join(".config/herdr-projects/config.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
-        fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[profiles.worker]\nkind='claude'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=600\n{budget}{HIDE_SOURCE}\n")).unwrap();
+        fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[profiles.worker]\nkind='claude'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=600\n{budget}\n")).unwrap();
         for dir in ["repo", "bin", "agent-home", "lab"] { fs::create_dir(home.path().join(dir)).unwrap(); }
         let lab = Lab { project: home.path().join("root/demo"), key, repo: home.path().join("repo"), herdr: home.path().join("bin/herdr"),
             profile: VersionedReference { id: String::new(), revision: 1, digest: String::new() }, server: None, history: History::default(), home };
@@ -418,8 +416,8 @@ fn contains(haystack: &[u8], needle: &str) -> bool { haystack.windows(needle.len
 /// Extraction is deterministic (a second suite version records the same
 /// cases), a suite version is immutable, the stratified subset is
 /// reproducible and covers both strata, and a retired case leaves the draw.
-/// A run is refused while the owner configuration does not hide the source
-/// repository from workers.
+/// A run needs no owner-wide `[worker_isolation] hide` of the source
+/// repository: each candidate's sandbox hides it per launch.
 #[test]
 fn extraction_golden_contamination_counts_and_reproducible_subset() {
     let mut lab = Lab::new("unknown_usage='allow_with_warning'");
@@ -470,16 +468,10 @@ fn extraction_golden_contamination_counts_and_reproducible_subset() {
         assert!(db.execute(sql, []).unwrap_err().to_string().contains("append-only"), "{sql}");
     }
     drop(db);
-    // Without the owner hiding the source repository from workers, no run starts and nothing is written.
-    let config = lab.path(".config/herdr-projects/config.toml");
-    let pinned = fs::read_to_string(&config).unwrap();
-    fs::write(&config, pinned.replace(HIDE_SOURCE, "")).unwrap();
-    let before = lab.state();
-    let refused = lab.fail(&["replay", "demo", "run", "--suite", "v1", "--configuration", "alpha", "--subset", "stratified:1", "--seed", "alpha", "--expected-head", &lab.head().to_string()]);
-    assert!(refused.contains("does not hide source repository"), "{refused}");
-    assert_eq!(lab.state(), before);
-    assert_eq!(lab.db().query_row("SELECT count(*) FROM replay_runs", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
-    fs::write(&config, pinned).unwrap();
+    // The owner configuration hides nothing extra (no `[worker_isolation]`), yet the run starts.
+    assert!(!fs::read_to_string(lab.path(".config/herdr-projects/config.toml")).unwrap().contains("worker_isolation"));
+    lab.replay(&["run", "--suite", "v1", "--configuration", "alpha", "--subset", "stratified:1", "--seed", "alpha", "--expected-head", &lab.head().to_string()]);
+    assert_eq!(lab.db().query_row("SELECT count(*) FROM replay_runs", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
 }
 
 /// Run one replay of v1 and install its drafted contract: the task is an
@@ -683,6 +675,8 @@ fn main() {
 /// and submits through its spool; the hidden check then passes in the
 /// isolated verifier, and the report counts it for the profile's
 /// configuration (dispatched by the operator with reason `replay`) under suite v1.
+/// The owner configuration hides nothing extra: the candidate's own supervisor
+/// argv hides the source repository and the check store.
 #[test]
 fn launched_replay_candidate_cannot_read_hidden_checks_and_is_verified_by_them() {
     let mut lab = Lab::new("unknown_usage='allow_with_warning'");
@@ -757,6 +751,58 @@ fn launched_replay_candidate_cannot_read_hidden_checks_and_is_verified_by_them()
     // Never integrated: the source repository and the replay repository are unchanged.
     assert_eq!(lab.git_in(&repository, &["rev-parse", "refs/heads/main"]), base);
     assert_eq!(lab.db().query_row("SELECT count(*) FROM integrated_commits", [], |r| r.get::<_, i64>(0)).unwrap(), 5);
+    // The hides were this launch's own: its supervisor argv names the source repository and the check store.
+    let argv = launched_commands(&lab);
+    assert_eq!(argv.len(), 1);
+    for hide in [format!("hide:{}", home.join("repo").display()), format!("hide:{}", checks.display())] { assert!(argv[0].contains(&hide), "{hide}: {:?}", argv[0]); }
+}
+
+/// The supervisor argv of every worker the Herdr stand-in created, in order.
+fn launched_commands(lab: &Lab) -> Vec<Vec<String>> {
+    fs::read_to_string(lab.path("lab/requests")).unwrap().lines().map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|r| r["method"] == "workspace.create_command").map(|r| serde_json::from_value(r["params"]["command"].clone()).unwrap()).collect()
+}
+
+/// The replay hide is per launch. With a replay run registered on the source
+/// repository `~/repo` and no owner-wide hide, the ordinary task `work` on
+/// that repository launches through the ticker: its supervisor argv hides
+/// neither the source repository nor the check store, and the probe inside
+/// its sandbox reads the repository (an owner-wide hide of `~/repo` would
+/// refuse this launch, since the repository it needs would be hidden) while
+/// the hidden check, under the covered projects root, stays unreadable.
+#[test]
+fn ordinary_task_on_the_source_repository_still_launches_without_replay_hides() {
+    let mut lab = Lab::new("unknown_usage='allow_with_warning'");
+    let (run, _, _, _) = replay_one(&mut lab, "probe", "delta", None);
+    let case = run["cases"][0].as_str().unwrap().to_owned();
+    let record = lab.replay(&["show", "--suite", "v1"])["cases"].as_array().unwrap().iter().find(|c| c["case_id"] == case.as_str()).unwrap().clone();
+    let checks = lab.root().canonicalize().unwrap().join(".replay/demo/checks");
+    let hidden = checks.join(record["hidden_checks"][0]["sha256"].as_str().unwrap());
+    let home = lab.home.path().canonicalize().unwrap();
+    let source = home.join("repo");
+    let reads = [hidden.clone(), source.join(".git/HEAD")];
+    let quoted = |paths: &[PathBuf]| paths.iter().map(|p| format!("{:?}", p.to_str().unwrap())).collect::<Vec<_>>().join(",");
+    lab.build_agent(&format!("{PROBE_AGENT}\nconst READS: &[&str] = &[{}];\nconst LISTS: &[&str] = &[{}];\nconst SEARCH: &[&str] = &[{:?}];\nconst SENTINEL: &str = {:?};\n\
+        const REFERENCE: &str = {:?};\nconst SOLUTION: &[(&str, &str)] = &[];\nconst ROOT: &str = {:?};\nconst BIN: &str = {BIN:?};\n",
+        quoted(&reads), quoted(std::slice::from_ref(&checks)), lab.project.canonicalize().unwrap().to_str().unwrap(), fs::read_to_string(&hidden).unwrap(),
+        record["reference_oid"].as_str().unwrap(), lab.root().canonicalize().unwrap().to_str().unwrap()));
+    lab.prepare_profile();
+    let binding = lab.state().runtime_bindings.iter().find(|b| b.task.as_ref().is_some_and(|t| t.as_str() == "work")).unwrap().id.clone();
+    let attempt = lab.reserve(&lab.selection("work", &binding, &source, None));
+    let worktree = PathBuf::from(lab.ok(&["memory", "demo", "attempt-input", "--attempt", attempt.as_str()])["worktrees"][0]["path"].as_str().unwrap());
+    lab.serve();
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 180, &|| worktree.join("probe-1.txt").exists());
+    let report = fs::read_to_string(worktree.join("probe-1.txt")).unwrap();
+    assert!(report.contains(&format!("read {} OK", source.join(".git/HEAD").display())), "{report}");
+    assert!(report.contains(&format!("read {} ERR:", hidden.display())), "{report}");
+    let argv = launched_commands(&lab);
+    assert_eq!(argv.len(), 1);
+    for hide in [format!("hide:{}", source.display()), format!("hide:{}", checks.display())] { assert!(!argv[0].contains(&hide), "{hide}: {:?}", argv[0]); }
+    lab.ok_live(&|| ["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &lab.state().attempts.iter().find(|a| a.id == attempt).unwrap().revision.to_string(),
+        "--expected-head", &lab.head().to_string(), "--reason", "probe done"].map(String::from).to_vec());
+    lab.wait(&mut ticker, 60, &|| lab.state().attempts.iter().find(|a| a.id == attempt).unwrap().termination_observed);
+    lab.stop(ticker);
 }
 
 /// Budget and authority are those of ordinary work. `replay run` writes
@@ -862,4 +908,26 @@ fn report_compares_two_configurations_with_suite_version() {
     let query = lab.ok(&["telemetry", "demo", "query", "--metric", "M49", "--json"]);
     let text = query.to_string();
     assert!(text.contains(r#""value":"3/6""#) && text.contains(&configurations["alpha"]) && text.contains(r#""suite_version":"v1""#), "{query}");
+    // Lifecycle metrics leave replay candidates to M49. By hand: the five source tasks are accepted (integrated),
+    // each with one attempt; `work` is open; the six replay candidates (alpha's three verified, beta's three
+    // rejected) are excluded. Terminal cohort: M01 = 5, M02 = 5/5, M07 = 5 attempts / 5 accepted.
+    let lifecycle = |metric: &str| lab.ok(&["telemetry", "demo", "query", "--metric", metric, "--json"])["results"][0].clone();
+    let exclusions = json!({"open": 1, "replay_candidate": 6});
+    for (metric, numerator, denominator, value) in [("M01", json!(5), Value::Null, json!(5)), ("M02", json!(5), json!(5), json!("5/5")), ("M07", json!(5), json!(5), json!("5/5"))] {
+        let m = lifecycle(metric);
+        assert_eq!((&m["numerator"], &m["denominator"], &m["value"], &m["exclusions"]), (&numerator, &denominator, &value, &exclusions), "{metric}: {m}");
+    }
+    // M06 has no replay sample either (the source attempts carry no admission time).
+    assert_eq!(lifecycle("M06")["exclusions"], exclusions);
+    let drill = lab.ok(&["telemetry", "demo", "query", "--metric", "M02", "--json", "--drill", "excluded.replay_candidate"])["drill"]["rows"].clone();
+    let mut ids: Vec<&str> = drill.as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+    ids.sort();
+    assert_eq!(ids, ["replay-v1-2-1", "replay-v1-2-2", "replay-v1-2-3", "replay-v1-3-1", "replay-v1-3-2", "replay-v1-3-3"]);
+    // The central report's T/A slice agrees.
+    let report = lab.ok(&["telemetry", "demo", "report", "--json"]);
+    assert_eq!(report["tasks"], json!({"accepted": 5, "open": 1, "succeeded_without_evidence": 0, "terminal": 5, "replay_candidates": 6}));
+    let (m02, m07) = (&report["metrics"]["M02"], &report["metrics"]["M07"]);
+    assert_eq!((&m02["value"], &m02["excluded"]), (&json!("5/5"), &json!({"open": 1, "outside_window": 0, "replay_candidate": 6})));
+    assert_eq!((&m07["value"], &m07["excluded"]), (&json!("5/5"), &json!({"replay_candidate": 6})));
+    assert_eq!(report["metrics"]["M49"]["value"], json!("3/6"));
 }

@@ -374,14 +374,14 @@ fn policy_arms(project: &Path, db: &SqliteStore, settings: &crate::store::Assign
 
 /// Assignment mode: the primary policy chooses among the approved arms
 /// under the grant (an arm the grant does not list has cap 0). `None` when
-/// the grant does not permit it now or every arm is held at probability 0:
+/// the grant is revoked or does not permit it now, or every arm is held at probability 0:
 /// the candidate is not reserved. The reservation transaction checks the
 /// switch, grant and cap again.
 fn assign(db: &SqliteStore, settings: &crate::store::AssignmentSettings, weighed: &Weighed, arms: &[ArmInput], now: i64)
     -> Result<Option<(DispatchContext, LaunchInputs, PolicyEvaluation)>> {
     let (Some(grant_id), Some(primary)) = (settings.grant_id.as_deref(), settings.policies.first()) else { return Ok(None) };
     let (grant, _) = db.assignment_authority_grant(grant_id)?;
-    if grant.permits(primary, now).is_err() { return Ok(None); }
+    if db.assignment_authority_revoked(grant_id)? || grant.permits(primary, now).is_err() { return Ok(None); }
     let mut effective = primary.clone();
     effective.arm_caps = grant.effective_caps(primary);
     for arm in arms { effective.arm_caps.entry(arm.configuration_id.clone()).or_insert(0); }

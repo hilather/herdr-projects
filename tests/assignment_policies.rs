@@ -12,6 +12,7 @@ use std::{fs, path::{Path, PathBuf}, process::Command};
 
 const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
 const GRANT_NS: &str = "randomized-assignment@herdr-projects";
+const REVOKE_NS: &str = "randomized-assignment-revocation@herdr-projects";
 const PROHIBITED: [&str; 5] = ["alter_review_policy", "alter_verification_policy", "choose_outside_eligible_set", "exceed_budget", "increase_permissions"];
 const POLICY: &str = "{\"version\":1,\"checks\":[\"/usr/bin/git\",\"diff\",\"--quiet\"]}";
 
@@ -230,11 +231,12 @@ impl World {
             |r| Ok((r.get(0)?, serde_json::from_str(&r.get::<_, String>(1)?).unwrap(), r.get(2)?, r.get(3)?, r.get(4)?))).unwrap()
     }
 
-    fn sign(&self, key: &Path, name: &str, body: &Value) -> (String, String, String) {
+    fn sign(&self, key: &Path, name: &str, body: &Value) -> (String, String, String) { self.sign_as(key, GRANT_NS, name, body) }
+    fn sign_as(&self, key: &Path, namespace: &str, name: &str, body: &Value) -> (String, String, String) {
         let doc = self.home.path().join(name);
         let bytes = serde_json::to_vec_pretty(body).unwrap();
         fs::write(&doc, &bytes).unwrap();
-        assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y", "sign", "-f"]).arg(key).args(["-n", GRANT_NS]).arg(&doc).output().unwrap().status.success());
+        assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y", "sign", "-f"]).arg(key).args(["-n", namespace]).arg(&doc).output().unwrap().status.success());
         (doc.display().to_string(), doc.with_extension("json.sig").display().to_string(), format!("sha256:{:x}", Sha256::digest(&bytes)))
     }
     /// A `randomized_assignment` grant for this project, valid for an hour, with `changes` merged in.
@@ -468,6 +470,79 @@ fn assignment_needs_the_switch_and_an_owner_signed_grant_and_respects_caps() {
     assert_eq!(w.admit(), "reserved");
     assert_eq!((w.decision("p4").0, w.decision("p4").3), (a.clone(), "rule:automatic-admission.v1".to_owned()));
     assert_eq!(w.count("SELECT count(*) FROM dispatch_policy_assignments"), 4);
+}
+
+/// F2.5 revocation, D8's pattern: an owner-signed
+/// `randomized_assignment_revocation.v1` under its own namespace stops
+/// assignment under the grant from its commit on. Admission holds the next
+/// task back (`policy_abstained`) although the switch still says `assign`;
+/// the grant cannot be switched on again; the decision made before stays,
+/// with its logged probabilities. Signed by another key or under the grant's
+/// namespace it is refused; the same revocation replays, another is refused;
+/// raw rows cannot assign under the revoked grant.
+#[test]
+fn a_revoked_grant_stops_assignment_immediately_and_keeps_earlier_decisions() {
+    let w = World::new(&["r0", "r1"]);
+    let grant = w.install("uniform.json", &w.grant(json!({})));
+    w.policies(&["configure", "--mode", "assign", "--policy", "uniform.v1", "--grant", &grant]);
+    assert_eq!(w.run_task("r0"), "reserved");
+    let before: (String, Value) = { let d = w.decision("r0"); (d.0, d.1) };
+    let revocation = json!({"schema": "randomized_assignment_revocation.v1", "grant_id": grant, "project_store": fs::canonicalize(&w.db_path).unwrap().display().to_string(),
+        "reason": "experiment_ended", "authority": herdr_projects::authority::policy_reference(&w.project).unwrap()});
+    // Another key, or the grant's own namespace: refused, nothing recorded.
+    let other = w.home.path().join("other");
+    assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&other).output().unwrap().status.success());
+    let (doc, sig, _) = w.sign_as(&other, REVOKE_NS, "forged-revocation.json", &revocation);
+    assert!(w.policies_fail(&["authority", "revoke", &doc, &sig]).contains("signature verification failed"));
+    let (doc, sig, _) = w.sign_as(&w.key, GRANT_NS, "wrong-namespace.json", &revocation);
+    assert!(w.policies_fail(&["authority", "revoke", &doc, &sig]).contains("signature verification failed"));
+    assert_eq!(w.count("SELECT count(*) FROM assignment_authority_revocations"), 0);
+    let mut bad = revocation.clone();
+    bad["reason"] = json!("bored");
+    let (doc, sig, _) = w.sign_as(&w.key, REVOKE_NS, "bad-reason.json", &bad);
+    assert!(w.policies_fail(&["authority", "revoke", &doc, &sig]).contains("revocation reason is one of compromised, experiment_ended, issued_in_error, scope_changed"));
+
+    let (doc, sig, digest) = w.sign_as(&w.key, REVOKE_NS, "revocation.json", &revocation);
+    let revoked = w.policies(&["authority", "revoke", &doc, &sig])["revocation"].clone();
+    assert_eq!((&revoked["grant_id"], &revoked["reason"], &revoked["replayed"], &revoked["stops"], &revoked["undoes_earlier_decisions"]),
+        (&json!(grant), &json!("experiment_ended"), &json!(false), &json!("later_assignments"), &json!(false)));
+    let at = revoked["revoked_unix_ms"].clone();
+    let replayed = w.policies(&["authority", "revoke", &doc, &sig])["revocation"].clone();
+    assert_eq!((&replayed["replayed"], &replayed["revoked_unix_ms"]), (&json!(true), &at));
+    let mut other_reason = revocation.clone();
+    other_reason["reason"] = json!("compromised");
+    let (doc2, sig2, _) = w.sign_as(&w.key, REVOKE_NS, "revocation-2.json", &other_reason);
+    assert!(w.policies_fail(&["authority", "revoke", &doc2, &sig2]).contains("is already revoked"));
+    assert_eq!(w.db().query_row("SELECT revocation_digest FROM assignment_authority_revocations", [], |r| r.get::<_, String>(0)).unwrap(), digest);
+
+    // The switch still names the grant, but the next task is not assigned (nor reserved by the rule).
+    assert_eq!(w.policies(&["show"])["mode"], json!("assign"));
+    assert_eq!(w.run_task("r1"), "policy_abstained");
+    assert_eq!(w.count("SELECT count(*) FROM attempts WHERE task_id='r1'"), 0);
+    // Cannot be switched on again.
+    assert!(w.policies_fail(&["configure", "--mode", "assign", "--policy", "uniform.v1", "--grant", &grant]).contains("randomized_assignment grant is revoked"));
+    // The earlier decision and its policy record stay exactly as logged.
+    let after = w.decision("r0");
+    assert_eq!((after.0, after.1), before);
+    assert_eq!(w.count("SELECT count(*) FROM dispatch_policy_assignments"), 1);
+    let shown = w.policies(&["show"]);
+    let listed = shown["grants"].as_array().unwrap().iter().find(|g| g["grant_id"] == json!(grant)).unwrap().clone();
+    assert_eq!((&listed["status"], &listed["assigned_decisions"], &listed["revocation"]),
+        (&json!("revoked"), &json!(1), &json!({"reason": "experiment_ended", "revoked_unix_ms": at})));
+    // Raw rows cannot assign under it, and the revocation is immutable.
+    let db = w.db();
+    let attempt: String = db.query_row("SELECT attempt_id FROM dispatch_policy_assignments", [], |r| r.get(0)).unwrap();
+    let error = db.execute("INSERT INTO dispatch_policy_assignments(attempt_id,settings_revision,policy,policy_digest,spec,seed,draw_ppm,grant_id,constraints,assigned_unix_ms)
+        SELECT 'raw',settings_revision,policy,policy_digest,spec,seed,draw_ppm,grant_id,constraints,assigned_unix_ms FROM dispatch_policy_assignments WHERE attempt_id=?1", [&attempt]).unwrap_err();
+    assert!(error.to_string().contains("randomized_assignment grant is revoked"), "{error}");
+    for sql in ["DELETE FROM assignment_authority_revocations", "UPDATE assignment_authority_revocations SET reason='compromised'"] {
+        assert!(db.execute(sql, []).unwrap_err().to_string().contains("immutable"), "{sql}");
+    }
+    drop(db);
+    // Off returns admission to the rule.
+    w.policies(&["configure", "--mode", "off"]);
+    assert_eq!(w.admit(), "reserved");
+    assert_eq!(w.decision("r1").3, "rule:automatic-admission.v1");
 }
 
 #[test]

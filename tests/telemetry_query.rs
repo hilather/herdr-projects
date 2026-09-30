@@ -481,7 +481,7 @@ fn hot_queries_use_indexes() {
         let plan = all.iter().find(|q| q["name"] == name).unwrap_or_else(|| panic!("{name}: {plans}"));
         assert_eq!((&plan["verdict"], &plan["scans"]), (&json!("indexed"), &json!([])), "{plan}");
     }
-    for name in ["lifecycle_attempts", "lifecycle_contracts", "lifecycle_classes"] {
+    for name in ["lifecycle_attempts", "lifecycle_contracts", "lifecycle_classes", "lifecycle_replay_candidates"] {
         let plan = all.iter().find(|q| q["name"] == name).unwrap();
         assert_eq!((&plan["verdict"], &plan["unexpected_scans"]), (&json!("full_scan_inherent"), &json!([])), "{plan}");
     }

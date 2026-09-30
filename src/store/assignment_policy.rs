@@ -5,7 +5,9 @@
 //! `assign` additionally names an installed, unexpired owner grant that
 //! permits the first policy. Signatures are verified by `crate::authority`
 //! before any value here is constructed; the store keeps the exact signed
-//! bytes and re-derives every field from them.
+//! bytes and re-derives every field from them. An owner-signed
+//! `randomized_assignment_revocation.v1` (migration 0066) stops assignment
+//! under a grant from its commit on; earlier decisions stay.
 use super::*;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,6 +16,8 @@ pub const GRANT_SCHEMA: &str = "randomized_assignment_authority.v1";
 pub const SCOPE: &str = "randomized_assignment";
 /// Effects a grant never confers; the owner signs the full list.
 pub const PROHIBITED_EFFECTS: [&str; 5] = ["alter_review_policy", "alter_verification_policy", "choose_outside_eligible_set", "exceed_budget", "increase_permissions"];
+pub const REVOCATION_SCHEMA: &str = "randomized_assignment_revocation.v1";
+pub const REVOCATION_REASONS: [&str; 4] = ["compromised", "experiment_ended", "issued_in_error", "scope_changed"];
 pub const MODES: [&str; 4] = ["off", "shadow", "suggest", "assign"];
 const MAX_VALIDITY_MS: i64 = 366 * 86_400_000;
 const MAX_BYTES: usize = 65_536;
@@ -101,6 +105,49 @@ impl PreparedAssignmentAuthority {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevocationDocument { schema: String, grant_id: String, project_store: String, reason: String, authority: VersionedReference }
+
+/// An owner-signed revocation of one `randomized_assignment` grant.
+/// Constructed only from bytes whose owner signature `crate::authority` has
+/// verified under the revocation namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedAssignmentRevocation {
+    pub(crate) raw: Vec<u8>,
+    pub(crate) digest: String,
+    pub(crate) grant_id: String,
+    pub(crate) project_store: String,
+    pub(crate) reason: String,
+    pub(crate) authority: VersionedReference,
+}
+
+impl PreparedAssignmentRevocation {
+    pub(crate) fn parse_verified(raw: &[u8]) -> std::result::Result<Self, String> {
+        if raw.len() > MAX_BYTES { return Err("assignment authority revocation exceeds 65536 bytes".into()); }
+        let d: RevocationDocument = serde_json::from_slice(raw).map_err(|_| "invalid assignment authority revocation".to_string())?;
+        if d.schema != REVOCATION_SCHEMA { return Err(format!("a revocation is schema {REVOCATION_SCHEMA}")); }
+        if !sha_ref(&d.grant_id) || !d.project_store.starts_with('/') || d.project_store.len() > 4096
+            || d.authority.id.is_empty() || d.authority.revision == 0 || !hex64(&d.authority.digest) {
+            return Err("invalid assignment authority revocation".into());
+        }
+        if !REVOCATION_REASONS.contains(&d.reason.as_str()) { return Err(format!("revocation reason is one of {}", REVOCATION_REASONS.join(", "))); }
+        Ok(Self { digest: digest(raw), raw: raw.to_vec(), grant_id: d.grant_id, project_store: d.project_store, reason: d.reason, authority: d.authority })
+    }
+    pub(crate) fn authority(&self) -> &VersionedReference { &self.authority }
+}
+
+/// Whether the store has the revocation table (migration 0066).
+fn revocations_present(db: &Connection) -> Result<bool> {
+    Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='assignment_authority_revocations')", [], |r| r.get(0))?)
+}
+
+/// `(reason, revoked_unix_ms)` of the grant's revocation, if any.
+pub(crate) fn revocation(db: &Connection, grant_id: &str) -> Result<Option<(String, i64)>> {
+    if !revocations_present(db)? { return Ok(None); }
+    Ok(db.query_row("SELECT reason,revoked_unix_ms FROM assignment_authority_revocations WHERE grant_id=?1", [grant_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)
+}
+
 /// The current operator switch and policies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssignmentSettings {
@@ -166,6 +213,7 @@ pub(super) fn record(tx: &Connection, attempt: &AttemptId, chosen: &str, assignm
     }
     let (grant, _) = load_grant(tx, &assignment.grant_id)?;
     if grant.project_store != project_store(tx)? { return Err(invalid("randomized_assignment grant belongs to another project")); }
+    if revocation(tx, &grant.grant_id)?.is_some() { return Err(invalid("randomized_assignment grant is revoked")); }
     grant.permits(&assignment.spec, now).map_err(invalid)?;
     let cap = grant.effective_caps(&assignment.spec).get(chosen).copied().unwrap_or(0);
     // This decision's row is already written: at most `cap` decisions for the arm.
@@ -185,9 +233,12 @@ pub fn assignment_state(db: &Connection, now: i64) -> Result<Option<serde_json::
     let ids: Vec<String> = db.prepare("SELECT grant_id FROM assignment_authority_grants ORDER BY installed_unix_ms,grant_id")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
     for id in ids {
         let (g, _) = load_grant(db, &id)?;
-        let status = if now < g.valid_from_unix_ms { "not_yet_valid" } else if now >= g.expires_unix_ms { "expired" } else { "active" };
+        let revoked = revocation(db, &id)?;
+        let status = if revoked.is_some() { "revoked" } else if now < g.valid_from_unix_ms { "not_yet_valid" } else if now >= g.expires_unix_ms { "expired" } else { "active" };
+        let decisions: i64 = db.query_row("SELECT count(*) FROM dispatch_policy_assignments WHERE grant_id=?1", [&id], |r| r.get(0))?;
         grants.push(serde_json::json!({"grant_id": g.grant_id, "status": status, "policies": g.policies, "max_exploration_ppm": g.max_exploration_ppm,
-            "arm_caps": g.arm_caps, "valid_from_unix_ms": g.valid_from_unix_ms, "expires_unix_ms": g.expires_unix_ms, "prohibited_effects": PROHIBITED_EFFECTS}));
+            "arm_caps": g.arm_caps, "valid_from_unix_ms": g.valid_from_unix_ms, "expires_unix_ms": g.expires_unix_ms, "prohibited_effects": PROHIBITED_EFFECTS,
+            "assigned_decisions": decisions, "revocation": revoked.map(|(reason, at)| serde_json::json!({"reason": reason, "revoked_unix_ms": at}))}));
     }
     let history: Vec<serde_json::Value> = db.prepare("SELECT revision,mode,grant_id,set_unix_ms FROM assignment_policy_settings ORDER BY revision")?
         .query_map([], |r| Ok(serde_json::json!({"revision": r.get::<_, i64>(0)?, "mode": r.get::<_, String>(1)?, "grant_id": r.get::<_, Option<String>>(2)?,
@@ -237,6 +288,37 @@ impl SqliteStore {
     /// The stored grant, re-derived from its bytes: `(grant, owner signature)`.
     pub fn assignment_authority_grant(&self, grant_id: &str) -> Result<(PreparedAssignmentAuthority, Vec<u8>)> { load_grant(&self.connection, grant_id) }
 
+    /// Whether the grant is revoked (admission stops assigning under it).
+    pub(crate) fn assignment_authority_revoked(&self, grant_id: &str) -> Result<bool> { Ok(revocation(&self.connection, grant_id)?.is_some()) }
+
+    /// Record an owner-signed revocation. Assignment under the grant stops
+    /// from this commit on (the reservation transaction and a trigger
+    /// re-check it); earlier decisions stay. The same revocation replays.
+    pub fn revoke_assignment_authority(&mut self, revocation: &PreparedAssignmentRevocation, signature: &[u8], now: i64) -> Result<serde_json::Value> {
+        let reparsed = PreparedAssignmentRevocation::parse_verified(&revocation.raw).map_err(invalid)?;
+        if reparsed != *revocation { return Err(invalid("changed revocation bytes")); }
+        if signature.is_empty() || signature.len() > 8192 { return Err(invalid("invalid assignment authority revocation signature")); }
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require(&tx)?;
+        if !revocations_present(&tx)? { return Err(StoreError::UnsupportedSchema(tx.query_row("PRAGMA user_version", [], |r| r.get(0))?)); }
+        if revocation.project_store != project_store(&tx)? { return Err(invalid("assignment authority revocation belongs to another project")); }
+        load_grant(&tx, &revocation.grant_id)?;
+        let existing: Option<(String, i64)> = tx.query_row("SELECT revocation_digest,revoked_unix_ms FROM assignment_authority_revocations WHERE grant_id=?1",
+            [&revocation.grant_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let (revoked, replayed) = match existing {
+            Some((stored, _)) if stored != revocation.digest => return Err(invalid(format!("randomized_assignment grant {} is already revoked", revocation.grant_id))),
+            Some((_, at)) => (at, true),
+            None => {
+                tx.execute("INSERT INTO assignment_authority_revocations(grant_id,raw_bytes,signature,revocation_digest,reason,revoked_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![revocation.grant_id, revocation.raw, signature, revocation.digest, revocation.reason, now])?;
+                (now, false)
+            }
+        };
+        tx.commit()?;
+        Ok(serde_json::json!({"grant_id": revocation.grant_id, "reason": revocation.reason, "revoked_unix_ms": revoked, "replayed": replayed,
+            "stops": "later_assignments", "undoes_earlier_decisions": false}))
+    }
+
     /// Append a settings revision (the operator switch). `assign` requires
     /// `grant`, re-verified by the caller, that permits the first policy now.
     pub fn set_assignment_settings(&mut self, mode: &str, policies: &[PolicySpec], grant: Option<&PreparedAssignmentAuthority>, now: i64) -> Result<AssignmentSettings> {
@@ -256,6 +338,7 @@ impl SqliteStore {
                 let (stored, _) = load_grant(&tx, &grant.grant_id)?;
                 if stored != *grant { return Err(invalid("changed assignment authority bytes")); }
                 if grant.project_store != project_store(&tx)? { return Err(invalid("randomized_assignment grant belongs to another project")); }
+                if revocation(&tx, &grant.grant_id)?.is_some() { return Err(invalid("randomized_assignment grant is revoked")); }
                 grant.permits(&policies[0], now).map_err(invalid)?;
                 Some(grant.grant_id.clone())
             }

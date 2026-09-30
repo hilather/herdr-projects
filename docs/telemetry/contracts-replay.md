@@ -59,12 +59,11 @@ records under any suite version. A suite version is immutable.
 The draw orders each stratum by `sha256(seed, suite, case)` and takes one
 case per stratum in turn (strata in name order) until N; the same inputs give
 the same subset (`replay subset` previews it). Before writing anything the
-run refuses when:
-
-- the pinned owner configuration's `[worker_isolation] hide` does not cover
-  each drawn case's source repository (it holds the accepted change and its
-  tests; this stops ordinary launches on that repository while it holds);
-- a hidden check file is missing or no longer has its digest (retire the case).
+run refuses when a drawn case's source repository is unavailable, or a
+hidden check file is missing or no longer has its digest (retire the case).
+No owner-wide `[worker_isolation] hide` is needed: each candidate's own
+sandbox hides the source repository at launch (§4), so ordinary launches on
+that repository are unaffected.
 
 Per drawn case it creates a replay repository
 `<projects root>/.replay/<slug>/repos/<suite>/<run seq>/<case>` that holds
@@ -103,10 +102,19 @@ binds no hidden input (a replay candidate never integrates).
 
 What the candidate can read: the contract and the store (paths and digests
 only), its own project, its worktree and the replay repository. The check
-store and the source repository are outside its sandbox view (the projects
-root is covered except its own project; the source repository by the owner's
-hide list). `tests/replay_suite.rs` probes this from inside a launched
-worker. Residual: a source attempt's retained worktree or quarantine inside
+store and the source repository are outside its sandbox view: the projects
+root is covered except its own project, and the candidate's launch hides
+its case's source repository and the check store
+`<projects root>/.replay/<slug>/checks` (`canonical_worker::resources::launch_hides`).
+These per-launch hides are derived from the append-only replay registry
+(`replay_candidates` → `replay_cases.repository`) at resource creation and
+again at gate release, so both derive the same supervisor argv, which the
+launch's `command_digest` fences; they enter no approval, `LaunchInputs` or
+id. Any other task's launch hides nothing extra, so an ordinary task on the
+source repository still launches and reads it. `tests/replay_suite.rs`
+probes both from inside launched workers
+(`launched_replay_candidate_cannot_read_hidden_checks_and_is_verified_by_them`,
+`ordinary_task_on_the_source_repository_still_launches_without_replay_hides`). Residual: a source attempt's retained worktree or quarantine inside
 the project would be readable, so the scan flags it as contamination.
 
 ## 5. Guard: a replay candidate is an evaluation artefact
@@ -140,5 +148,8 @@ launched, retired or outside the window. Uncertainty: raw rates with n
 M49 (`M49.v1`, central provider, family `replay`, active at TM4.6,
 certification `fixture`): the latest suite version's report, with the pooled
 numerator/denominator on top and the per-configuration cells beside it.
-Replay candidates are ordinary tasks, so they also appear in the lifecycle
-metrics (M02/M07); excluding them there is a follow-up.
+Replay candidates are measured by M49 only: the lifecycle metrics
+(M01/M02/M06/M07, every cohort of the query service, and the central
+report's M02/M07 and `tasks` summary) exclude them with an explicit
+`replay_candidate` exclusion count (contracts-analytics.md §3); assignment
+policy outcomes skip them too.
