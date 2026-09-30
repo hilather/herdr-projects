@@ -37,8 +37,10 @@ impl Cohort {
 /// Who evaluates a definition. `Native`: the query service itself, with
 /// half-open windows, dimensions and drill-down lineage. `Central` / `Lane`:
 /// the body `telemetry report` prints, windowed only from `since` (= `from`).
+/// `Recommendation`: evaluated per advisory recommendation (TM4.5 `recommend`),
+/// never as a project aggregate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Provider { Native, Central, Lane(&'static str), Absent(&'static str) }
+pub enum Provider { Native, Central, Lane(&'static str), Absent(&'static str), Recommendation }
 
 impl Provider {
     pub fn as_json(self) -> Value {
@@ -47,6 +49,7 @@ impl Provider {
             Provider::Central => json!({"kind": "central_report"}),
             Provider::Lane(stream) => json!({"kind": "lane", "stream": stream}),
             Provider::Absent(reason) => json!({"kind": "absent", "reason": reason}),
+            Provider::Recommendation => json!({"kind": "per_recommendation", "command": "telemetry <slug> recommend --role <task class>"}),
         }
     }
 }
@@ -80,7 +83,8 @@ impl Family {
                 None => Err("awaiting_quality_certificate"),
             },
             Family::Replay => Ok(json!({"card": "TM4.6", "suite": "replay-suite.v1", "evidence": REPLAY})),
-            Family::Freshness => Err("awaiting_configuration_evidence"),
+            // TM4.5: M50 is evaluated per advisory recommendation (`recommend`), never as an aggregate.
+            Family::Freshness => Ok(json!({"card": "TM4.5", "scope": "per_recommendation"})),
         }
     }
 
@@ -201,7 +205,9 @@ pub const METRICS: &[Metric] = &[
     m!("M47", "code_survival_proxy", Proxy, "ratio", [lane("quality", "M47.proxy-v1", A, "integration")], "restricted", QUALITY, Some("censoring only")),
     m!("M48", "revert_rate_proxy", Proxy, "ratio", [lane("quality", "M48.proxy-v1", A, "integration")], "restricted", QUALITY, Some("censoring only")),
     m!("M49", "replay_suite_pass_rate", Replay, "ratio", [central("M49.v1", A, "replay_attempt_decided")], "fixture", REPLAY, Some("fixture suite v1 only; raw rates with n")),
-    m!("M50", "evidence_freshness", Freshness, "ratio", [absent("M50.v1", A, "no_producer")], "absent", "no producer (TM4.4)", None),
+    m!("M50", "evidence_freshness", Freshness, "ratio", [Version { definition: "M50.recommendation-v1", provider: Provider::Recommendation, cohorts: T,
+        window: Window::HalfOpen, time_basis: "task_terminal_time", dimensions: &[] }, absent("M50.v1", A, "no_producer")], "fixture",
+        "tests/telemetry_health.rs (TM4.5 fixtures)", Some("per recommendation only; lineage by profile name, else agent kind")),
     m!("flaky_tests", "newly_flaky_tests_proxy", Proxy, "tests", [lane("quality", "flaky_tests.proxy-v1", A, "ci_run")], "unavailable", QUALITY, Some("no_repeat_runs")),
 ];
 
@@ -234,6 +240,21 @@ pub const COMPARISON: Comparison = Comparison {
     propensity: "hajek_ipw.v1",
     paired: "M42.v1",
 };
+
+/// TM4.5 evidence freshness (M50, plan doc 07 §5b and §6 "Configuration
+/// staleness"): the share of a recommendation's supporting observations (the
+/// recommended arm's tasks in the role's cell) produced under the configuration
+/// its lineage (profile name, else agent kind) currently dispatches. Below
+/// `stale_below` the recommendation is `stale`.
+pub struct Freshness { pub definition: &'static str, pub stale_below: (i64, i64) }
+
+pub const FRESHNESS: Freshness = Freshness { definition: "M50.recommendation-v1", stale_below: (1, 2) };
+
+pub fn freshness_json() -> Value {
+    json!({"definition": FRESHNESS.definition, "stale_below": format!("{}/{}", FRESHNESS.stale_below.0, FRESHNESS.stale_below.1),
+        "supporting_observations": "the recommended arm's tasks in the role's (task class) comparison cell",
+        "current_identity": "the chosen configuration of the latest dispatch decision of the recommended configuration's lineage (profile name, else agent kind)"})
+}
 
 pub fn comparison_json() -> Value {
     let c = &COMPARISON;
@@ -270,7 +291,7 @@ pub fn json() -> Value {
     }).collect();
     json!({"registry": VERSION, "quality_certificate": QUALITY_CERTIFICATE, "cohorts": ["activity_window", "terminal_cohort", "assignment_cohort"],
         "rejected_cohorts": {"completed_task": "ambiguous_cohort"}, "high_cardinality_identities": HIGH_CARDINALITY, "metrics": metrics,
-        "comparison": comparison_json()})
+        "comparison": comparison_json(), "freshness": freshness_json()})
 }
 
 pub fn text() -> String {
@@ -279,7 +300,8 @@ pub fn text() -> String {
         let state = match m.family.activation() { Ok(_) => "active".to_owned(), Err(reason) => format!("unavailable({reason})") };
         let v = &m.versions[0];
         out += &format!("{} {} {} {} family={} cohorts={} unit={} certification={} {state}\n", m.id, m.name, v.definition,
-            match v.provider { Provider::Native => "native", Provider::Central => "central", Provider::Lane(s) => s, Provider::Absent(_) => "absent" },
+            match v.provider { Provider::Native => "native", Provider::Central => "central", Provider::Lane(s) => s, Provider::Absent(_) => "absent",
+                Provider::Recommendation => "per_recommendation" },
             m.family.as_str(), v.cohorts.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(","), m.unit, m.certification);
     }
     out

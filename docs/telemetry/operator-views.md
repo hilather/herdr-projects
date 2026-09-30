@@ -219,6 +219,9 @@ prints `bucket denominator rows 3-3 of 3` and `task t4 failed`.
 
 - The views read what the query service serves: a metric without a producer
   or an inactive family is `n/a` with the registry's reason.
+- M50 is evaluated per recommendation (TM4.5): its health-view row reads
+  `n/a (per_recommendation)` with basis `per_recommendation`; the value is in
+  `telemetry <slug> recommend --role <class>` ([contracts-health.md](contracts-health.md)).
 - Requested model *names* and per-model usage are not in the query service
   (`not_in_query_service`); TM4.4 comparisons own configuration-level evidence.
 - The pane is a popup snapshot, not a refreshing split pane (doc 15 §3's

@@ -27,7 +27,7 @@ fn tracked(db: &Connection) -> Result<Vec<String>> {
 /// The default tracked set: every active metric's current definition, its
 /// default cohort, the unbounded window.
 fn defaults() -> Vec<Cell> {
-    registry::METRICS.iter().filter(|m| m.family.activation().is_ok() && !matches!(m.versions[0].provider, Provider::Absent(_))).map(Cell::default_for).collect()
+    registry::METRICS.iter().filter(|m| m.family.activation().is_ok() && !matches!(m.versions[0].provider, Provider::Absent(_) | Provider::Recommendation)).map(Cell::default_for).collect()
 }
 
 struct Evaluated { key: String, cell: Cell, core: Value, lineage: Lineage, digest: String }

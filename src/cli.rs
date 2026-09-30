@@ -884,6 +884,11 @@ enum TelemetryCommand {
     Experiments { #[command(subcommand)] command:herdr_projects::telemetry::analytics::experiments::Command },
     /// TM4.7 assignment policies: operator switch (default off), owner-signed randomized-assignment grants, what-if simulation, suggestions and shadow disagreement.
     Policies { #[command(subcommand)] command:herdr_projects::telemetry::policies::Command },
+
+    /// TM4.5 health rules, states and deduplicated alerts (sidecar stream `health`); `notify` writes inbox notices.
+    Health(herdr_projects::telemetry::health::Args),
+    /// TM4.5 advisory recommendation for a role (task class) with M50 evidence freshness. Read-only; never read by dispatch.
+    Recommend(herdr_projects::telemetry::health::recommend::Args),
 }
 
 #[cfg(feature="state-store")]
@@ -1321,6 +1326,16 @@ pub fn run() -> Result<()> {
         Command::Telemetry{slug,command:TelemetryCommand::Experiments{command}}=>{
             project::validate_slug(&slug)?;
             print!("{}",herdr_projects::telemetry::analytics::run_experiments(&ctx.root.join(slug),command)?);Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Telemetry{slug,command:TelemetryCommand::Health(args)}=>{
+            project::validate_slug(&slug)?;
+            print!("{}",herdr_projects::telemetry::health::run(&ctx.root.join(slug),&ctx.config_dir,args)?);Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Telemetry{slug,command:TelemetryCommand::Recommend(args)}=>{
+            project::validate_slug(&slug)?;
+            print!("{}",herdr_projects::telemetry::health::run_recommend(&ctx.root.join(slug),&args)?);Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:lane@(TelemetryCommand::Collectors{..}|TelemetryCommand::Accounting{..}|TelemetryCommand::Quality{..}|TelemetryCommand::Review{..})}=>{

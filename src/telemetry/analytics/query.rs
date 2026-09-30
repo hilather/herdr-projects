@@ -115,6 +115,9 @@ impl Cell {
     fn unsupported(&self) -> Option<(&'static str, Value)> {
         if let Err(reason) = self.metric.family.activation() { return Some((reason, json!({"family": self.metric.family.as_str()}))); }
         if let Provider::Absent(reason) = self.version.provider { return Some((reason, json!({"producer": null}))); }
+        if self.version.provider == Provider::Recommendation {
+            return Some(("per_recommendation", json!({"detail": "evaluated per advisory recommendation: `telemetry <slug> recommend --role <task class>`"})));
+        }
         if !self.version.cohorts.contains(&self.cohort) {
             return Some(("cohort_unsupported", json!({"supported": self.version.cohorts.iter().map(|c| c.as_str()).collect::<Vec<_>>()})));
         }

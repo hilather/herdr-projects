@@ -50,6 +50,7 @@ fn basis(r: &Value) -> String {
     match provider(r) {
         Some(Provider::Native) => "canonical_lifecycle".into(),
         Some(Provider::Absent(_)) => "no_producer".into(),
+        Some(Provider::Recommendation) => "per_recommendation".into(),
         Some(Provider::Central) => detail["basis"].as_str().unwrap_or("central_report").into(),
         Some(Provider::Lane(stream)) => ["basis", "source_trust", "trust"].iter().find_map(|k| detail[*k].as_str()).map_or_else(|| format!("lane_{stream}"), str::to_owned),
         None => "unknown".into(),

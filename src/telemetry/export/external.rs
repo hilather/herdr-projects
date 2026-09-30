@@ -31,30 +31,42 @@ fn euid() -> u32 { unsafe { libc::geteuid() } }
 
 /// The enabled destination, or the refusal `(code, detail)`.
 pub fn load(config_dir: &Path) -> Result<std::result::Result<Destination, (&'static str, String)>> {
-    let path = config_dir.join(CONFIG_FILE);
+    load_setting(config_dir, &Setting { file: CONFIG_FILE, schema: CONFIG_SCHEMA, what: "export", disabled: "external_export_disabled" })
+}
+
+/// One external-destination deployment setting: its file under the config
+/// directory, schema, what it sends, and the refusal code while
+/// disabled. Shared by exports and TM4.5 alert notices.
+#[derive(Clone, Copy)]
+pub struct Setting { pub file: &'static str, pub schema: &'static str, pub what: &'static str, pub disabled: &'static str }
+
+/// The enabled destination of `setting`, or the refusal `(code, detail)`.
+pub fn load_setting(config_dir: &Path, setting: &Setting) -> Result<std::result::Result<Destination, (&'static str, String)>> {
+    let Setting { file, schema, what, disabled } = *setting;
+    let path = config_dir.join(file);
     let m = match fs::symlink_metadata(&path) {
         Ok(m) => m,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Err(("external_export_disabled", format!("no {CONFIG_FILE}: external export is off by default")))),
-        Err(e) => return Err(e).context("read the external export configuration"),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Err((disabled, format!("no {file}: external {what} is off by default")))),
+        Err(e) => return Err(e).with_context(|| format!("read the external {what} configuration")),
     };
     ensure!(m.file_type().is_file() && m.uid() == euid() && m.mode() & 0o022 == 0 && m.len() <= 16 * 1024,
-        "{CONFIG_FILE} must be a regular file owned by this user, not group/world writable, at most 16 KiB");
-    let config: Config = toml::from_str(&fs::read_to_string(&path)?).map_err(|e| anyhow::anyhow!("invalid {CONFIG_FILE}: {e}"))?;
-    ensure!(config.schema == CONFIG_SCHEMA, "{CONFIG_FILE} schema must be {CONFIG_SCHEMA}");
+        "{file} must be a regular file owned by this user, not group/world writable, at most 16 KiB");
+    let config: Config = toml::from_str(&fs::read_to_string(&path)?).map_err(|e| anyhow::anyhow!("invalid {file}: {e}"))?;
+    ensure!(config.schema == schema, "{file} schema must be {schema}");
     let Some(external) = config.external.filter(|e| e.enabled) else {
-        return Ok(Err(("external_export_disabled", format!("[external] enabled is not true in {CONFIG_FILE}"))));
+        return Ok(Err((disabled, format!("[external] enabled is not true in {file}"))));
     };
     Ok(Ok(match external.destination.as_str() {
         "stdout" => { ensure!(external.directory.is_none(), "`directory` applies to destination = \"directory\" only"); Destination::Stdout }
         "directory" => {
             let dir = external.directory.context("destination = \"directory\" needs `directory`")?;
-            ensure!(dir.is_absolute(), "the external export directory must be an absolute path");
-            let m = fs::symlink_metadata(&dir).context("the external export directory is unavailable")?;
+            ensure!(dir.is_absolute(), "the external {what} directory must be an absolute path");
+            let m = fs::symlink_metadata(&dir).with_context(|| format!("the external {what} directory is unavailable"))?;
             ensure!(m.file_type().is_dir() && m.uid() == euid() && m.mode() & 0o022 == 0,
-                "the external export directory must be a real directory owned by this user, not group/world writable");
+                "the external {what} directory must be a real directory owned by this user, not group/world writable");
             Destination::Directory(dir)
         }
-        other => anyhow::bail!("unknown external export destination `{other}` (directory or stdout)"),
+        other => anyhow::bail!("unknown external {what} destination `{other}` (directory or stdout)"),
     }))
 }
 

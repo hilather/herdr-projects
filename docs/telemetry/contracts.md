@@ -14,7 +14,8 @@ needs a new reviewed revision, not a silent reinterpretation.
   in `telemetry_streams(stream, version)`: `codex` (§5, migrations under
   `migrations/telemetry/`, also `user_version`), and one stream per lane under
   `migrations/telemetry/<stream>/`: `ingest`, `accounting`, `quality`,
-  `review`, `analytics` (TM4.1 aggregate revisions). A reader refuses only a
+  `review`, `analytics` (TM4.1 aggregate revisions), `health` (TM4.5 alert
+  state). A reader refuses only a
   stream newer than it knows. Plan:
   [phase2-lanes.md](phase2-lanes.md).
 - Lane contracts, each owned by its lane: collection
@@ -27,6 +28,9 @@ needs a new reviewed revision, not a silent reinterpretation.
   [contracts-analytics.md](contracts-analytics.md).
 - Portable JSON/CSV exports, authenticated page cursors and the optional
   external export setting (TM4.3): [contracts-export.md](contracts-export.md).
+- Health rules, deduplicated alerts, inbox notices and advisory
+  recommendations with M50 evidence freshness (TM4.5):
+  [contracts-health.md](contracts-health.md).
 
 ## 0. Common rules
 

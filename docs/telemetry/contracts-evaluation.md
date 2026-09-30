@@ -228,8 +228,9 @@ interval_not_computed`; the interval lives in this report.
 - Arms are not matched on role, repository or tool versions beyond the
   configuration identity and task class; difficulty mismatch blocks a
   ranking, the other covariates are shown, not adjusted.
-- No M50 (evidence freshness): it is per recommendation, and recommendations
-  are TM4.5.
+- M50 (evidence freshness) is per recommendation: TM4.5's `recommend`
+  ([contracts-health.md](contracts-health.md) §5) reads a ranking from this
+  report and adds it; this report itself stays free of recommendations.
 - Reports are computed live; no revisioned projection is stored.
 
 ## 9. Assignment policies (TM4.7, `assignment-policy.v1`)

@@ -96,12 +96,27 @@ impl SqliteStore {
     /// `memory-review-` prefix, and the body must be empty (the summary is a
     /// pointer; Remember text never lands in the DB inbox).
     pub fn deliver_memory_review_reminder(&mut self,expected_head:u64,content:&InboxContent,now:i64)->Result<crate::domain::ReminderOutcome> {
-        use crate::domain::ReminderOutcome;
         super::delivery::now_check(now)?;
         content.validate().map_err(StoreError::Invalid)?;
         if content.kind!="memory-review"||!content.id.starts_with("memory-review-")||!content.body.is_empty()||content.subject.is_empty()||content.summary.is_empty() {
             return Err(StoreError::Invalid("memory-review reminder requires kind memory-review, a memory-review- id, a subject, a summary, and an empty body".into()));
         }
+        self.deliver_stable_notice(expected_head,content,now)
+    }
+    /// TM4.5 health alert notice (docs/telemetry/contracts-health.md §6): the
+    /// same stable-id, deduplicated delivery as memory-review reminders, for
+    /// kind `telemetry-health` under a `telemetry-health-` id. Advisory text only.
+    pub fn deliver_telemetry_notice(&mut self,expected_head:u64,content:&InboxContent,now:i64)->Result<crate::domain::ReminderOutcome> {
+        super::delivery::now_check(now)?;
+        content.validate().map_err(StoreError::Invalid)?;
+        if content.kind!="telemetry-health"||!content.id.starts_with("telemetry-health-")||!content.body.is_empty()||content.subject.is_empty()||content.summary.is_empty() {
+            return Err(StoreError::Invalid("telemetry notice requires kind telemetry-health, a telemetry-health- id, a subject, a summary, and an empty body".into()));
+        }
+        self.deliver_stable_notice(expected_head,content,now)
+    }
+    /// Insert one stable-id notice, or recognize its committed row.
+    fn deliver_stable_notice(&mut self,expected_head:u64,content:&InboxContent,now:i64)->Result<crate::domain::ReminderOutcome> {
+        use crate::domain::ReminderOutcome;
         let mut content=content.clone();
         content.summary=content.summary.chars().map(|c|if c.is_control(){' '}else{c}).collect();
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;check_schema(&tx)?;
