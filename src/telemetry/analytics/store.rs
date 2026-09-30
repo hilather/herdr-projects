@@ -30,7 +30,12 @@ fn defaults() -> Vec<Cell> {
     registry::METRICS.iter().filter(|m| m.family.activation().is_ok() && !matches!(m.versions[0].provider, Provider::Absent(_) | Provider::Recommendation)).map(Cell::default_for).collect()
 }
 
-struct Evaluated { key: String, cell: Cell, core: Value, lineage: Lineage, digest: String }
+type SerializedLineage = BTreeMap<String, Vec<(&'static str, String, String)>>;
+
+struct Evaluated {
+    key: String, cell: Cell, core: String, projection: Option<String>,
+    lineage: SerializedLineage, digest: String,
+}
 
 fn evaluate_all(project: &Path, cells: &[Cell]) -> Result<(Vec<Evaluated>, Value)> {
     let mut sources = Sources::new(project)?;
@@ -38,7 +43,14 @@ fn evaluate_all(project: &Path, cells: &[Cell]) -> Result<(Vec<Evaluated>, Value
     let mut out = Vec::new();
     for cell in cells {
         let (core, lineage) = query::evaluate(&mut sources, cell)?;
-        out.push(Evaluated { key: cell.key(), digest: query::content_digest(&core, &lineage), cell: cell.clone(), core, lineage });
+        let digest = query::content_digest(&core, &lineage);
+        let projection = workspace_body(cell.metric.id, &core)?;
+        let core = serde_json::to_string(&core)?;
+        let lineage = lineage.into_iter().map(|(bucket, rows)| {
+            let rows = rows.into_iter().map(|(kind, id, attrs)| Ok((kind, id, serde_json::to_string(&attrs)?))).collect::<Result<Vec<_>>>()?;
+            Ok((bucket, rows))
+        }).collect::<Result<SerializedLineage>>()?;
+        out.push(Evaluated { key: cell.key(), digest, cell: cell.clone(), core, projection, lineage });
     }
     Ok((out, watermarks))
 }
@@ -60,39 +72,48 @@ fn append(project: &Path, evaluated: &[Evaluated], watermarks: &Value, now: i64)
     // Comparison is supplemental presentation evidence, not a metric cell:
     // recording it must not change tracked cells, metric digests or lineage.
     let comparison = crate::telemetry::workspace::comparison(project)?;
-    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let body = serde_json::to_string(&comparison)?;
+    let watermarks = serde_json::to_string(watermarks)?;
+    // Evaluated bodies, lineage and rendering projections are already serialized.
+    // Only the latest-revision decisions and their writes need the writer lock.
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let previous: Option<String> = tx.query_row("SELECT body FROM analytics_workspace_comparisons ORDER BY revision DESC LIMIT 1", [], |r| r.get(0)).optional()?;
     if previous.as_deref() != Some(body.as_str()) {
         tx.execute("INSERT INTO analytics_workspace_comparisons(body,recorded_unix_ms) VALUES(?1,?2)", rusqlite::params![body, now])?;
     }
     let (mut appended, mut unchanged) = (Vec::new(), 0);
     for e in evaluated {
-        tx.execute("INSERT OR IGNORE INTO analytics_cells(cell,metric,definition,cohort,window_from_unix_ms,window_to_unix_ms,horizon_ms,dimension,tracked_unix_ms)
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", rusqlite::params![e.key, e.cell.metric.id, e.cell.version.definition, e.cell.cohort.as_str(), e.cell.from, e.cell.to,
+        tx.prepare_cached("INSERT OR IGNORE INTO analytics_cells(cell,metric,definition,cohort,window_from_unix_ms,window_to_unix_ms,horizon_ms,dimension,tracked_unix_ms)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)")?.execute(rusqlite::params![e.key, e.cell.metric.id, e.cell.version.definition, e.cell.cohort.as_str(), e.cell.from, e.cell.to,
             e.cell.horizon, e.cell.by, now])?;
-        let latest: Option<(i64, String)> = tx.query_row("SELECT revision,content_digest FROM analytics_revisions WHERE cell=?1 ORDER BY revision DESC LIMIT 1", [&e.key],
+        let latest: Option<(i64, String)> = tx.prepare_cached("SELECT revision,content_digest FROM analytics_revisions WHERE cell=?1 ORDER BY revision DESC LIMIT 1")?.query_row([&e.key],
             |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
         if latest.as_ref().is_some_and(|(_, digest)| *digest == e.digest) {
-            tx.execute("UPDATE analytics_cells SET checked_unix_ms=?2 WHERE cell=?1", rusqlite::params![e.key, now])?;
-            workspace_metric(&tx, e, latest.as_ref().unwrap().0)?;
+            tx.prepare_cached("UPDATE analytics_cells SET checked_unix_ms=?2 WHERE cell=?1")?.execute(rusqlite::params![e.key, now])?;
+            // Normally this row already exists. Refresh also repairs missing
+            // disposable projections without restating the authoritative cell.
+            let revision = latest.as_ref().unwrap().0;
+            if let Some(body) = &e.projection {
+                let exists: bool = tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM analytics_workspace_metrics WHERE revision=?1)")?.query_row([revision], |r| r.get(0))?;
+                if !exists { insert_workspace_body(&tx, revision, body)?; }
+            }
             unchanged += 1;
             continue;
         }
         let supersedes = latest.map(|(revision, _)| revision);
         let kind = if supersedes.is_some() { "restatement" } else { "initial" };
-        tx.execute("INSERT INTO analytics_revisions(cell,kind,supersedes,body,content_digest,watermarks,registry,recorded_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            rusqlite::params![e.key, kind, supersedes, serde_json::to_string(&e.core)?, e.digest, serde_json::to_string(watermarks)?, registry::VERSION, now])?;
+        tx.prepare_cached("INSERT INTO analytics_revisions(cell,kind,supersedes,body,content_digest,watermarks,registry,recorded_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)")?.execute(
+            rusqlite::params![e.key, kind, supersedes, e.core, e.digest, watermarks, registry::VERSION, now])?;
         let revision = tx.last_insert_rowid();
-        workspace_metric(&tx, e, revision)?;
-        let mut insert = tx.prepare("INSERT INTO analytics_lineage(revision,bucket,ordinal,entity_kind,entity_id,attrs) VALUES(?1,?2,?3,?4,?5,?6)")?;
+        if let Some(body) = &e.projection { insert_workspace_body(&tx, revision, body)?; }
+        let mut insert = tx.prepare_cached("INSERT INTO analytics_lineage(revision,bucket,ordinal,entity_kind,entity_id,attrs) VALUES(?1,?2,?3,?4,?5,?6)")?;
         for (bucket, rows) in &e.lineage {
             for (ordinal, (kind, id, attrs)) in rows.iter().enumerate() {
-                insert.execute(rusqlite::params![revision, bucket, ordinal as i64, kind, id, serde_json::to_string(attrs)?])?;
+                insert.execute(rusqlite::params![revision, bucket, ordinal as i64, kind, id, attrs])?;
             }
         }
         drop(insert);
-        tx.execute("UPDATE analytics_cells SET checked_unix_ms=?2 WHERE cell=?1", rusqlite::params![e.key, now])?;
+        tx.prepare_cached("UPDATE analytics_cells SET checked_unix_ms=?2 WHERE cell=?1")?.execute(rusqlite::params![e.key, now])?;
         appended.push(json!({"cell": serde_json::from_str::<Value>(&e.key)?, "revision": revision, "kind": kind, "supersedes": supersedes, "content_digest": e.digest}));
     }
     tx.commit()?;
@@ -101,12 +122,8 @@ fn append(project: &Path, evaluated: &[Evaluated], watermarks: &Value, now: i64)
 
 /// A bounded, disposable rendering projection of an immutable metric body.
 /// The authoritative analytics body, digest and lineage remain untouched.
-fn workspace_metric(db: &Connection, e: &Evaluated, revision: i64) -> Result<()> {
-    workspace_metric_body(db, e.cell.metric.id, &e.core, revision)
-}
-
-fn workspace_metric_body(db: &Connection, metric: &str, core: &Value, revision: i64) -> Result<()> {
-    if !crate::telemetry::workspace::METRICS.contains(&metric) { return Ok(()); }
+fn workspace_body(metric: &str, core: &Value) -> Result<Option<String>> {
+    if !crate::telemetry::workspace::METRICS.contains(&metric) { return Ok(None); }
     let mut body = match core.as_object() {
         Some(core) => Value::Object(core.iter().filter(|(key, _)| key.as_str() != "detail").map(|(key, value)| (key.clone(), value.clone())).collect()),
         None => core.clone(),
@@ -122,7 +139,16 @@ fn workspace_metric_body(db: &Connection, metric: &str, core: &Value, revision: 
         }
         body["detail"] = json!({"decisions": quota});
     }
-    db.execute("INSERT OR IGNORE INTO analytics_workspace_metrics(revision,body) VALUES(?1,?2)", rusqlite::params![revision, serde_json::to_string(&body)?])?;
+    Ok(Some(serde_json::to_string(&body)?))
+}
+
+fn insert_workspace_body(db: &Connection, revision: i64, body: &str) -> Result<()> {
+    db.prepare_cached("INSERT OR IGNORE INTO analytics_workspace_metrics(revision,body) VALUES(?1,?2)")?.execute(rusqlite::params![revision, body])?;
+    Ok(())
+}
+
+fn workspace_metric_body(db: &Connection, metric: &str, core: &Value, revision: i64) -> Result<()> {
+    if let Some(body) = workspace_body(metric, core)? { insert_workspace_body(db, revision, &body)?; }
     Ok(())
 }
 

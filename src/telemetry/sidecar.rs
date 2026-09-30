@@ -64,8 +64,16 @@ pub fn open(project: &Path, create: bool) -> Result<Option<Connection>> {
             if !create {
                 return Ok(None);
             }
-            std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW).open(&path).context("create telemetry sidecar")?;
+            match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW).open(&path) {
+                Ok(_) => {},
+                // Another first collector won creation after our metadata read.
+                // Join its store; retain the regular-file and no-follow checks.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if !std::fs::symlink_metadata(&path)?.is_file() { bail!("telemetry sidecar is not a regular file"); }
+                }
+                Err(error) => return Err(error).context("create telemetry sidecar"),
+            }
         }
         Err(error) => return Err(error.into()),
     }
@@ -78,6 +86,12 @@ pub fn open(project: &Path, create: bool) -> Result<Option<Connection>> {
 
 /// Upgrade a writable sidecar, including a private backup copy before retention.
 pub(crate) fn migrate(db: &mut Connection) -> Result<()> {
+    // Current stores need no write lock. An upgrade still rechecks versions
+    // under IMMEDIATE so concurrent openers cannot apply a migration twice.
+    let current = stream_versions(db)?;
+    if streams().all(|(stream, migrations)| current.get(stream).copied().unwrap_or(0) == migrations.len()) {
+        return Ok(());
+    }
     // One transaction: a pre-streams sidecar gains `telemetry_streams` with
     // `codex` = `user_version`, then each stream migrates from its version.
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;

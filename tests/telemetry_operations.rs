@@ -247,6 +247,23 @@ fn pane_recorded(mut pane: Value) -> Value {
 }
 
 #[test]
+fn current_sidecar_opens_while_a_collector_holds_the_write_lock() {
+    let f = collected();
+    let mut writer = f.sidecar();
+    let tx = writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+    // The public writable-open path must not request a migration write lock
+    // on an already current store. The collector retains its lock throughout.
+    let opened = herdr_projects::telemetry::sidecar::open(&f.project, false).unwrap().unwrap();
+    let totals: (i64, i64) = opened.query_row("SELECT sum(input_tokens),sum(output_tokens) FROM usage_entries WHERE basis='delta'", [],
+        |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(totals, (1500, 180));
+    drop(opened);
+    tx.rollback().unwrap();
+    f.cli("collect");
+    assert_eq!(f.usage().len(), 2, "opening beside a writer preserves collected records");
+}
+
+#[test]
 fn attention_health_and_analytics_expire_without_losing_current_views() {
     let f = collected();
     let now = unix_ms();
@@ -323,6 +340,19 @@ fn attention_health_and_analytics_expire_without_losing_current_views() {
     assert_eq!(orphaned, 0);
     let projected = f.count("analytics_workspace_metrics");
     assert!(projected > 0);
+    // Reject redundant inserts even when INSERT OR IGNORE would hide them.
+    // A public refresh must keep existing rendering rows and their as-of.
+    f.sidecar().execute_batch("CREATE TRIGGER reject_redundant_workspace_projection BEFORE INSERT ON analytics_workspace_metrics
+        WHEN EXISTS(SELECT 1 FROM analytics_workspace_metrics WHERE revision=NEW.revision)
+        BEGIN SELECT RAISE(ABORT,'redundant workspace projection'); END;").unwrap();
+    f.cli_args(&["analytics", "refresh"]);
+    f.sidecar().execute_batch("DROP TRIGGER reject_redundant_workspace_projection").unwrap();
+    assert_eq!(pane_recorded(json_of(&f, &["workspace", "show", "--json"])), pane);
+    f.sidecar().execute("DELETE FROM analytics_workspace_metrics", []).unwrap();
+    // Unchanged current cells still repair a missing rendering on refresh.
+    f.cli_args(&["analytics", "refresh"]);
+    assert_eq!(f.count("analytics_workspace_metrics"), projected);
+    assert_eq!(pane_recorded(json_of(&f, &["workspace", "show", "--json"])), pane);
     f.sidecar().execute("DELETE FROM analytics_workspace_metrics", []).unwrap();
     f.cli_args(&["analytics", "rebuild"]);
     assert_eq!(f.count("analytics_workspace_metrics"), projected);

@@ -625,6 +625,141 @@ public revision query, and recovery of both disposable projections through
 `analytics rebuild`.
 
 
+### 4.9 P3c: snapshot writer contention (100k only)
+
+Branch `perf/workspace-snapshot`, 2026-09-30. **Pending the steward's serial
+1M certification.** The branch initially forked from P6 `29daf9f`; it was
+rebased onto current main `d1314c7` before the final comparison, preserving
+P1's incremental accounting and retention invalidation. Before is the
+rebased P3b code; after adds P3c. Main is `d1314c7`. Earlier experiments on
+the old accounting base and the intermediate migration check are excluded.
+
+The same generated disk dataset contains 100,000 requested / 99,926 rollout
+events, 64 active attempts, 10,000 bindings and P6's quality/attention facts.
+All datasets, private homes and fixture projects lived under `$PWD/bench-data/`.
+Release builds used §1's locked/offline `-j 3` command. Phases 0/1 prepared
+the dataset; phase 2 ran with `SCALE_REPEATS=3 SCALE_PER_ROUND=1` and
+`SCALE_TAG=p3c-rebased-before|p3c-rebased-after`. Before and after the writer
+comparison, the same SQLite seed was restored; schema/source identity and
+accounting were settled before saving that seed. Main's private measurement
+copy was marked analytics stream 1, leaving the extra rendering tables inert.
+One bench process at a time, no concurrent build during final measurements,
+no 1M run. The gate's five racing writers plus appender bound busy work to six.
+
+Temporary source timers and a local SQLite interposer measured lock holds
+from successful `BEGIN IMMEDIATE` through successful commit or rollback.
+The interposer writes each record atomically, including idle collector
+rollbacks; waits to acquire the lock are excluded. SQL/body contents, return
+codes and the unchanged gate oracle are untouched. No instrumentation or
+benchmark wrapper is committed. The tables below use the final SQLite trace;
+processes killed during fault injection have no completed interval.
+
+Three serial rounds of `collect`, `accounting sync`, `analytics refresh`,
+`health evaluate` through the real CLI; milliseconds, p50 / maximum:
+
+| IMMEDIATE scope | Main | Before P3c | After P3c |
+| --- | --- | --- | --- |
+| collect (2,973 scopes each, including idle rollbacks) | 0.077 / 9.706 | 0.081 / 8.330 | 0.073 / 6.751 |
+| accounting sync (n=3) | 21.923 / 28.339 | 29.112 / 412.359 | 23.587 / 28.100 |
+| analytics append (n=3) | 13.090 / 15.461 | 36.171 / 61.958 | 13.697 / 14.959 |
+| health evaluate (n=3) | 8.188 / 12.460 | 28.912 / 48.830 | 7.805 / 8.594 |
+| current-store migration transactions per 12 opens | 12 | 12 | 0 |
+
+`results-traced-writers-main|before|after.json` loads (1 / 5 / 15 minutes):
+main **8.30 / 11.34 / 9.86 → 8.47 / 10.92 / 9.81**;
+before **17.10 / 11.94 / 9.36 → 17.57 / 13.60 / 10.17**;
+after **5.09 / 8.38 / 9.88 → 9.40 / 9.30 / 10.11**.
+The before run was substantially busier. Accounting and health algorithms
+are unchanged by P3c; their variation is not an accounting/health speedup
+claim. Analytics' after maximum is below main's maximum in this sample;
+the small median difference from main is inconclusive on this host.
+
+The unchanged `scale_gates_hold_under_load` also ran once per release build
+with transaction tracing. Its ordinary small fixture is additional
+correctness/contended-lock evidence, not another scale certification:
+
+| Completed scope, p50 / maximum ms | Main | Before P3c | After P3c |
+| --- | --- | --- | --- |
+| analytics (n=12 / 8 / 11) | 8.391 / 24.309 | 16.442 / 33.541 | 4.324 / 22.815 |
+| accounting sync (n=74 / 16 / 78) | 5.751 / 248.031 | 81.617 / 287.760 | 5.238 / 157.052 |
+| collect (n=1,864 / 512 / 2,314) | 0.092 / 106.115 | 16.243 / 243.390 | 0.085 / 115.106 |
+
+`results-traced-gate-main|before|after.json` loads:
+main **8.47 / 10.92 / 9.81 → 8.65 / 10.84 / 9.80**;
+before **8.65 / 10.84 / 9.80 → 10.66 / 11.16 / 9.93**;
+after **9.40 / 9.30 / 10.11 → 9.16 / 9.25 / 10.08**.
+All three gates passed every exact-total, single-acceptance, pinned as-of,
+byte-identical rebuild and canonical-digest assertion. Interleaving changes
+batch sizes and scope counts; the collector's slightly higher maximum than
+main is not evidence of added collector work (its write path is unchanged).
+One post-fault sidecar creation/upgrade remained in the after gate (32.097 ms);
+current-store opens take no migration transaction.
+
+P3 previously rebuilt rendering bodies (notably M40's whole decision scan)
+inside the writer transaction even for unchanged revisions, and serialized
+metric bodies/lineage there. P3c serializes bodies, watermarks, lineage attrs
+and comparison/projection JSON before the write lock, retains the original
+bucket/ordinal order, caches repeated SQL statements, and inserts a rendering
+only for a new revision or a missing disposable row. Latest digests, comparison
+bodies and supersession decisions are still rechecked under the same atomic
+IMMEDIATE transaction. Migration validates versions read-only first (missing
+zero-migration review stream means version zero), then rechecks under
+IMMEDIATE only when an upgrade is needed. The five-second busy timeout remains.
+
+No evaluator, metric definition, arithmetic, coverage rule, authoritative body,
+digest, lineage or as-of selection rule changes. E2E coverage opens the public
+sidecar API beside a held collector write lock and checks real persisted usage;
+the existing operations workflow rejects redundant projection inserts, repairs
+missing rows with refresh, and preserves exact recorded pane values/as-of.
+No new unit or source-text tests. The scale gate and all existing golden values
+are unchanged from rebased main/P3b.
+
+The initial full correctness run also exposed the pre-existing first-creation
+race (`create_new` lost to another collector and returned `File exists`).
+Writable open now joins that collector's newly created regular file, rechecking
+its type and retaining `SQLITE_OPEN_NOFOLLOW`. The existing four-collector
+certification E2E passes with exact 100/20 usage and no failure. This cold-file
+handling does not change the measured current-store transaction paths.
+
+Workspace reads are unchanged. Three phase-2 samples, p50 / p95 milliseconds:
+
+| surface | Before | After |
+| --- | --- | --- |
+| pane, in process | 77.78 / 159.34 | 109.71 / 142.98 |
+| digest, in process | 75.95 / 106.31 | 106.98 / 151.42 |
+| workspace show, fresh process | 141.76 / 212.36 | 77.70 / 166.71 |
+| workspace digest, fresh process | 114.35 / 199.69 | 76.78 / 112.44 |
+
+`results-queries-p3c-rebased-before.json` loads:
+**15.52 / 13.34 / 10.14 → 9.21 / 11.88 / 9.98**;
+after **9.16 / 9.25 / 10.08 → 8.34 / 8.83 / 9.84**.
+Pane round-p50 CV is 37.31% → 20.20%; digest 16.64% → 33.19%.
+These noisy, small read samples are inconclusive for a read-path speedup.
+The pane meets 250 ms p95; the digest exceeds 100 ms in both runs. P3c fixes
+the snapshot write-lock regression, not L5's remaining certification limit.
+
+Final P3c verification used `--locked --offline -j 3 --features state-store`
+and `RUST_TEST_THREADS=1`. All 15 requested suites ran: **175 passed,
+10 ignored, four socket-only failures** (`Operation not permitted`):
+
+- `telemetry::attempts_show_attention_summary`
+- `telemetry_accounting::attention_intervals_union_and_censor`
+- `telemetry_health::recommendations_and_notices_change_no_canonical_state_and_no_dispatch`
+- `telemetry_workspace::thread_start_records_the_dispatch_reason_and_the_sidebar_suffix`
+
+The exact three-suite command (`--no-fail-fast --test telemetry_scale --test
+telemetry_workspace --test telemetry_operations`) ran ten times serially.
+**All ten unchanged scale gates passed; no racing process or other correctness
+failure occurred.** Each unfiltered command exited 101 solely for the workspace
+socket test above; the sandbox cannot establish ten entirely green commands.
+No test was skipped or assertion weakened to hide that failure. The repetition
+results' load averages (1 / 5 / 15 minutes) ranged from **3.22 / 7.64 / 9.72**
+at the first start to **5.87 / 6.89 / 7.49** at the final end (one-minute
+start/end observations ranged 3.19–8.17).
+Clippy completed with zero warnings in changed lines; existing unrelated
+warnings remain. Temporary instrumentation, wrappers and all `bench-data/`
+datasets were removed before the final commit.
+
 ## 5. Inefficiencies found and fixed
 
 The first measurement (same generator, same host) missed the query and
@@ -646,6 +781,7 @@ stream-version expectations (§9).
 | F8 | `ticker.rs` `telemetry_pass` | the pass (collect and every lane tick) ran inline in the ticker's pass, so its whole duration delayed every later project's controller poll | its own thread, one project at a time; controller polling never waits for it (the integrity check's pattern); orderly shutdown waits for a running pass up to 60 s |
 | F9 | `main.rs` | with the pass on a thread (F8), SQLite's memory statistics made every allocation of both threads take one process-wide mutex | statistics off in every build of the binary, as the crate's tests already do; nothing reads them |
 | F10 (P3) | `workspace`, attempt/attention reads, analytics rendering projections | whole-history reports and repeated rich projections on every pane/digest read | one targeted shared projection, recorded history with `as_of`, bounded digest reads; 100k results in §4.6, pending steward 1M certification |
+| F11 (P3c) | analytics append, sidecar migration | whole-history serialization/rendering and redundant projection/migration work while holding the writer lock | pre-serialized bodies/lineage, cached SQL, changed/missing rendering rows only, read-first version check; §4.9 has 100k lock timings, pending steward 1M certification |
 
 F8 preserves graceful shutdown of the whole pass: stop-file and idle exits poll
 the running telemetry thread for up to 60 s (`TELEMETRY_SHUTDOWN_WAIT`), logging
@@ -761,6 +897,11 @@ owner. None is hidden by loosening the target.
   P3b's lifecycle correction retains the targets (§4.7): fresh 100k pane
   p95 75.03 → 53.62 ms, digest p95 70.23 → 53.44 ms, at recorded
   1-minute loads 5.39 → 1.91; pending the steward's serial 1M certification.
+  P3c addresses the snapshot writer regression (§4.9): 100k analytics lock
+  p50/max 36.17/61.96 → 13.70/14.96 ms, at 1-minute loads
+  17.10 → 17.57 before / 5.09 → 9.40 after; current-store migration
+  transactions 12 → 0. Pending the steward's 1M certification. The noisy
+  P3c digest read still misses 100 ms; this does not close all of L5.
   Original 1M measurements above remain the last certified ones.
   Owners: TM4.8, TM1.8, TM4.1.
 - **L6: sidecar size.** The sidecar is 2.7–3.1 times the rollout bytes it
