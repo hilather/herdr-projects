@@ -28,11 +28,8 @@ for either. This is not a certification of an OTLP transport.
 | Item | Value |
 | --- | --- |
 | Source | branch `telemetry/tm51-scale-certification` from `main` `20a763f`, plus the fixes in §5 |
-| Stores | canonical `SCHEMA = 67`; sidecar streams `codex` 3, `ingest` 8, `accounting` 12, `quality` 2, `analytics` 1, `health` 1, `policies` 1 |
 | Build | `cargo test --release --locked --offline -j 3 --features state-store --test telemetry_scale --no-run` (rustc 1.98.0), system SQLite 3.53.4 |
-
-| Stores | canonical `SCHEMA = 67`; sidecar streams `codex` 3, `ingest` 8, `accounting` 11, `quality` 2, `analytics` 2, `health` 1, `policies` 1 |
-| Build | `cargo test --release --features state-store --test telemetry_scale` (rustc 1.98.0), system SQLite 3.53.4 |
+| Stores | canonical `SCHEMA = 67`; sidecar streams `codex` 3, `ingest` 9, `accounting` 12, `quality` 2, `analytics` 2, `health` 1, `policies` 1 |
 | CPU / memory | Intel Core i7-8750H, 6 cores / 12 threads, 62 GiB RAM, zram swap |
 | Disk | Intel SSDPEKNW010T8 NVMe, LUKS, btrfs (`compress=zstd:3`). Every dataset lived under `bench-data/` on this disk, never on the RAM-backed `/tmp` |
 | OS | Linux 7.2.3-arch1-3 |
@@ -574,7 +571,7 @@ unchanged. The E2E suite compares all displayed history values with their
 existing public reads and checks current sections over retained cancellations
 and terminal candidate arms; no new unit or source-text tests were added.
 
-### 4.7 P3b: rendering projection lifecycle (100k only)
+### 4.8 P3b: rendering projection lifecycle (100k only)
 
 Branch `perf/workspace-snapshot`, 2026-09-30. **Pending the steward's serial
 1M certification.** Analytics stream 2 adopts the two workspace tables through
