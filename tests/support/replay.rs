@@ -95,6 +95,12 @@ impl Lab {
         for command in ["new", "pause"] { lab.ok(&[command, "demo"]); }
         migration::apply(&lab.project, &migration::inspect_with_config(&lab.project, &config).unwrap(), true).unwrap();
         lab.git(&["init", "-q", "--object-format=sha256", "-b", "master"]);
+        // `commit` can detach automatic maintenance, whose `repack -d` removes
+        // loose files between submit's object inventory/copy and the CLI's read.
+        // Keep fixture object storage stable for the whole submission workflow.
+        for (key, value) in [("gc.auto", "0"), ("gc.autoDetach", "false"), ("maintenance.auto", "false")] {
+            lab.git(&["config", "--local", key, value]);
+        }
         lab.git(&["commit", "-q", "--allow-empty", "-m", "empty"]);
         lab.ok(&["task", "demo", "add", "work", "--title", "work", "--expected-head", &lab.head().to_string()]);
         let request = lab.path("queue.json");
@@ -294,7 +300,7 @@ sys.stdout.buffer.write(json.dumps({'result':json.loads(reply)['result']}).encod
     pub(crate) fn submit(&self, task: &str, attempt: &str, digest: &str, repository: &Path, base: &str, candidate: &str, outputs: &[&str], key: &str) -> String {
         let objects: Vec<Value> = self.git_in(repository, &["rev-list", "--objects", candidate]).lines()
             .map(|line| { let oid = line.split_whitespace().next().unwrap(); json!({"oid": oid, "relative_path": format!("{}/{}", &oid[..2], &oid[2..])}) }).collect();
-        // Integrations may make ancestors reachable through packs/alternates.
+        // Explicitly packed repositories or alternates may supply ancestors.
         // The submission API requires real loose files for the listed objects.
         let loose = self.path(&format!("{key}-loose"));
         fs::create_dir_all(&loose).unwrap();
