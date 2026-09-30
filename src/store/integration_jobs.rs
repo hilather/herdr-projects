@@ -74,6 +74,7 @@ impl SqliteStore {
         let more = stale || ids.len() > SCAN_LIMIT;
         let mut eligible = if super::seeded_defects::registry_present(&tx)? { format!("{ELIGIBLE}{NOT_SEEDED}") } else { ELIGIBLE.to_owned() };
         if super::candidate_groups::groups_present(&tx)? { eligible = format!("{eligible} AND NOT {}", super::candidate_groups::HELD_ARM); }
+        if super::replay_cases::registry_present(&tx)? { eligible.push_str(super::replay_cases::NOT_REPLAY); }
         let mut enqueued = 0;
         for submission_id in ids.iter().take(SCAN_LIMIT) {
             if enqueued == TURN_LIMIT { break; }

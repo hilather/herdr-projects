@@ -100,3 +100,6 @@ pub mod submission_spool;
 pub mod integration;
 #[cfg(all(feature = "state-store", target_os = "linux"))]
 pub(crate) mod git_quarantine;
+/// Replay evaluation suite (TM4.6): versioned cases from accepted history, hidden checks, M49.
+#[cfg(all(feature = "state-store", target_os = "linux"))]
+pub mod replay;

@@ -22,14 +22,14 @@ an edit in place of a published definition. Per metric:
 | `versions[]` | every servable definition: `provider` (`native`, `central_report`, `lane` + stream, `absent` + reason), `cohorts` (first = default), `window` (`half_open` or `since_only`), `time_basis`, `dimensions` |
 | `family` | `lifecycle`, `consumption`, `cost`, `tools`, `attention`, `fleet`, `services`, `review_quality`, `paired_quality`, `seeded_quality`, `proxy`, `replay`, `freshness`; `proxy: true` for the proxy family, which never stands in for a validated-quality metric |
 | `certification` | `{status, evidence, restriction}` from [certificate-core.md](certificate-core.md) §5 and [certificate-quality.md](certificate-quality.md) §2: `certified-live`, `certified-fixture`, `restricted`, `unavailable`, `fixture` (TM4.1's own fixtures only) or `absent` (no producer) |
-| `active`, `activation` | families activate independently: lifecycle/accounting/operational at TM2.6 (core certificate); proxy at TM3.7; validated quality at TM3.5 (`QUALITY_CERTIFICATE`, now `certificate-quality.md`, a fixture certificate: `activation.production` names the producer certificate production quality still waits for); replay (M49) and freshness (M50) inactive (`awaiting_replay_suite`, `awaiting_configuration_evidence`). Without the quality certificate the quality families answer `unavailable: awaiting_quality_certificate` |
+| `active`, `activation` | families activate independently: lifecycle/accounting/operational at TM2.6 (core certificate); proxy at TM3.7; validated quality at TM3.5 (`QUALITY_CERTIFICATE`, now `certificate-quality.md`, a fixture certificate: `activation.production` names the producer certificate production quality still waits for); replay (M49) at TM4.6 (fixture suite v1, [contracts-replay.md](contracts-replay.md)); freshness (M50) inactive (`awaiting_configuration_evidence`). Without the quality certificate the quality families answer `unavailable: awaiting_quality_certificate` |
 
 Native definitions added by TM4.1 (the certified `slice-v1` ones stay
 servable by name): `M01.cohort-v1` accepted tasks, `M02.cohort-v1`
 acceptance rate, `M06.cohort-v1` lead-time p95 (nearest rank, ms, accepted
 tasks with both times; failed/open counted, never given a time),
 `M07.cohort-v1` attempt amplification. Absent producers: M03, M05, M10, M19,
-M30, M49, M50.
+M30, M50. M49 (`M49.v1`, central provider) is produced by the replay suite ([contracts-replay.md](contracts-replay.md)).
 
 ## 2. Query service (`analytics-query.v1`)
 

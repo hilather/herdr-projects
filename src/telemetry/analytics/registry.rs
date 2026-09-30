@@ -79,7 +79,7 @@ impl Family {
                 Some(certificate) => Ok(json!({"card": "TM3.5", "certificate": certificate, "production": PRODUCTION_GATE})),
                 None => Err("awaiting_quality_certificate"),
             },
-            Family::Replay => Err("awaiting_replay_suite"),
+            Family::Replay => Ok(json!({"card": "TM4.6", "suite": "replay-suite.v1", "evidence": REPLAY})),
             Family::Freshness => Err("awaiting_configuration_evidence"),
         }
     }
@@ -140,6 +140,7 @@ const fn absent(definition: &'static str, cohorts: &'static [Cohort], reason: &'
 
 const CORE: &str = "docs/telemetry/certificate-core.md §5";
 const QUALITY: &str = "docs/telemetry/certificate-quality.md §2";
+const REPLAY: &str = "tests/replay_suite.rs (TM4.6 fixture suite v1)";
 const QUERY: &str = "tests/telemetry_query.rs (TM4.1 fixtures; the same A/T evidence as the certified slice-v1)";
 
 macro_rules! m {
@@ -199,7 +200,7 @@ pub const METRICS: &[Metric] = &[
     m!("M46", "main_breakage_after_integration_proxy", Proxy, "ratio", [lane("quality", "M46.proxy-v1", A, "integration")], "unavailable", QUALITY, Some("no_main_check_producer")),
     m!("M47", "code_survival_proxy", Proxy, "ratio", [lane("quality", "M47.proxy-v1", A, "integration")], "restricted", QUALITY, Some("censoring only")),
     m!("M48", "revert_rate_proxy", Proxy, "ratio", [lane("quality", "M48.proxy-v1", A, "integration")], "restricted", QUALITY, Some("censoring only")),
-    m!("M49", "replay_suite_pass_rate", Replay, "ratio", [absent("M49.v1", A, "no_producer")], "absent", "no producer (TM4.6)", None),
+    m!("M49", "replay_suite_pass_rate", Replay, "ratio", [central("M49.v1", A, "replay_attempt_decided")], "fixture", REPLAY, Some("fixture suite v1 only; raw rates with n")),
     m!("M50", "evidence_freshness", Freshness, "ratio", [absent("M50.v1", A, "no_producer")], "absent", "no producer (TM4.4)", None),
     m!("flaky_tests", "newly_flaky_tests_proxy", Proxy, "tests", [lane("quality", "flaky_tests.proxy-v1", A, "ci_run")], "unavailable", QUALITY, Some("no_repeat_runs")),
 ];

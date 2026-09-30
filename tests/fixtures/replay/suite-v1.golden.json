@@ -1,0 +1,205 @@
+{
+  "cases": [
+    {
+      "base_oid": "<usage-docs integrated>",
+      "case_id": "farewell.r1",
+      "classification": {
+        "band": "medium",
+        "class": "code",
+        "classifier": "rule:task-taxonomy.v1",
+        "source": "derived_from_contract"
+      },
+      "contamination": {
+        "distinctive_lines": 1,
+        "hits": [],
+        "scanned": {
+          "memory_objects": 0,
+          "project_md": 1,
+          "source_contract": 1,
+          "worker_briefs": 0
+        },
+        "scanner": "distinctive-lines.v1",
+        "state": "clean"
+      },
+      "contract_digest": "<farewell contract>",
+      "contract_revision": 1,
+      "hidden_check_ref": "sha256:5dd77dd0ad5e2dba7bb1a3b8cb7f99d1cb41cf465fcf03e56f2795cd9ad94201",
+      "hidden_checks": [
+        {
+          "bytes": 46,
+          "policy_id": "hidden-1",
+          "sha256": "4c89c3c44c7f1d2cd48d81a2e7d40b8cf589ffbb92dcc7c02ec360be2086a9c8",
+          "target": "src/farewell.txt"
+        }
+      ],
+      "integrated_oid": "<farewell integrated>",
+      "object_format": "sha256",
+      "ordinal": 1,
+      "reference_oid": "<farewell candidate>",
+      "repository": "<source repository>",
+      "solution_paths": [
+        "src/farewell.txt"
+      ],
+      "source_result_id": "<farewell result>",
+      "source_submission_id": "<farewell submission>",
+      "source_task_id": "farewell",
+      "status": "eligible",
+      "stratum": "code"
+    },
+    {
+      "base_oid": "<base>",
+      "case_id": "greet-name.r1",
+      "classification": {
+        "band": "medium",
+        "class": "code",
+        "classifier": "rule:task-taxonomy.v1",
+        "source": "derived_from_contract"
+      },
+      "contamination": {
+        "distinctive_lines": 1,
+        "hits": [],
+        "scanned": {
+          "memory_objects": 0,
+          "project_md": 1,
+          "source_contract": 1,
+          "worker_briefs": 0
+        },
+        "scanner": "distinctive-lines.v1",
+        "state": "clean"
+      },
+      "contract_digest": "<greet-name contract>",
+      "contract_revision": 1,
+      "hidden_check_ref": "sha256:48c4edc227cad0f22b1c8483338ceac82da12c971f6b620e76a37c2b469d2993",
+      "hidden_checks": [
+        {
+          "bytes": 33,
+          "policy_id": "hidden-1",
+          "sha256": "b031d8c2cbbd8d1100b8bcd4710ab281385c3a61310c9be44f8de15dcdc19bbd",
+          "target": "src/greet.txt"
+        }
+      ],
+      "integrated_oid": "<greet-name integrated>",
+      "object_format": "sha256",
+      "ordinal": 2,
+      "reference_oid": "<greet-name candidate>",
+      "repository": "<source repository>",
+      "solution_paths": [
+        "src/greet.txt"
+      ],
+      "source_result_id": "<greet-name result>",
+      "source_submission_id": "<greet-name submission>",
+      "source_task_id": "greet-name",
+      "status": "eligible",
+      "stratum": "code"
+    },
+    {
+      "base_oid": "<readme-typo integrated>",
+      "case_id": "secret-flag.r1",
+      "classification": {
+        "band": "medium",
+        "class": "code",
+        "classifier": "rule:task-taxonomy.v1",
+        "source": "derived_from_contract"
+      },
+      "contamination": {
+        "distinctive_lines": 1,
+        "hits": [
+          {
+            "id": "PROJECT.md",
+            "lines": 1,
+            "source": "project_md"
+          }
+        ],
+        "scanned": {
+          "memory_objects": 0,
+          "project_md": 1,
+          "source_contract": 1,
+          "worker_briefs": 0
+        },
+        "scanner": "distinctive-lines.v1",
+        "state": "contaminated"
+      },
+      "contract_digest": "<secret-flag contract>",
+      "contract_revision": 1,
+      "hidden_check_ref": "sha256:50232578f7c9be4aeee80832cac858f49ffd0b9e08c8eae696157d61038fe78d",
+      "hidden_checks": [
+        {
+          "bytes": 39,
+          "policy_id": "hidden-1",
+          "sha256": "482ab4d9e96033b3dbb1f671be71578a35372e73afc4a735588c2a570de518e3",
+          "target": "src/flag.txt"
+        }
+      ],
+      "integrated_oid": "<secret-flag integrated>",
+      "object_format": "sha256",
+      "ordinal": 3,
+      "reference_oid": "<secret-flag candidate>",
+      "repository": "<source repository>",
+      "solution_paths": [
+        "src/flag.txt"
+      ],
+      "source_result_id": "<secret-flag result>",
+      "source_submission_id": "<secret-flag submission>",
+      "source_task_id": "secret-flag",
+      "status": "contaminated",
+      "stratum": "code"
+    },
+    {
+      "base_oid": "<greet-name integrated>",
+      "case_id": "usage-docs.r1",
+      "classification": {
+        "band": "medium",
+        "class": "docs",
+        "classifier": "rule:task-taxonomy.v1",
+        "source": "derived_from_contract"
+      },
+      "contamination": {
+        "distinctive_lines": 1,
+        "hits": [],
+        "scanned": {
+          "memory_objects": 0,
+          "project_md": 1,
+          "source_contract": 1,
+          "worker_briefs": 0
+        },
+        "scanner": "distinctive-lines.v1",
+        "state": "clean"
+      },
+      "contract_digest": "<usage-docs contract>",
+      "contract_revision": 1,
+      "hidden_check_ref": "sha256:d0675d46cdbb789a3d76cd18ac9a0ca2c5f230f70cbd5c4ea2f3de9f3da0a4ea",
+      "hidden_checks": [
+        {
+          "bytes": 64,
+          "policy_id": "hidden-1",
+          "sha256": "9abe05f14e454ced06818b94006a438c0ceeabd8650b9d057976a7c1546ca742",
+          "target": "docs/usage.md"
+        }
+      ],
+      "integrated_oid": "<usage-docs integrated>",
+      "object_format": "sha256",
+      "ordinal": 4,
+      "reference_oid": "<usage-docs candidate>",
+      "repository": "<source repository>",
+      "solution_paths": [
+        "docs/usage.md"
+      ],
+      "source_result_id": "<usage-docs result>",
+      "source_submission_id": "<usage-docs submission>",
+      "source_task_id": "usage-docs",
+      "status": "eligible",
+      "stratum": "docs"
+    }
+  ],
+  "suite": {
+    "exclusions": {
+      "contaminated": 1,
+      "hidden_check_too_large": 0,
+      "no_hidden_check": 1,
+      "no_solution_paths": 0,
+      "sources": 5
+    },
+    "extractor": "accepted-history.expected-output.v1",
+    "suite_version": "v1"
+  }
+}

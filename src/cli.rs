@@ -263,6 +263,9 @@ enum Command {
     /// Telemetry: read-only projections and the usage sidecar; never grants launch, accepts results or changes budgets
     #[cfg(feature="state-store")]
     Telemetry { slug:String, #[command(subcommand)] command:TelemetryCommand },
+    /// Replay evaluation suite (owner): versioned cases from accepted tasks, hidden checks, replay runs as ordinary tasks, M49 report
+    #[cfg(all(feature="state-store", target_os="linux"))]
+    Replay { slug:String, #[command(subcommand)] command:herdr_projects::replay::Command },
     /// Read-only factory counters. Does not launch, admit, or print environment values.
     #[cfg(feature="state-store")]
     Factory { #[command(subcommand)] command:FactoryCommand },
@@ -1271,6 +1274,11 @@ pub fn run() -> Result<()> {
             let report=herdr_projects::telemetry::analytics::query::report(&ctx.root.join(slug),since)?;
             if json {println!("{}",serde_json::to_string_pretty(&report)?);} else {print!("{}",herdr_projects::telemetry::metrics::text(&report));}
             Ok(())
+        },
+        #[cfg(all(feature="state-store", target_os="linux"))]
+        Command::Replay{slug,command}=>{
+            project::validate_slug(&slug)?;
+            println!("{}",serde_json::to_string_pretty(&herdr_projects::replay::run(&ctx.root.join(slug),command)?)?);Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Metrics{command}}=>{

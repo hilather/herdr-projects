@@ -873,6 +873,8 @@ fn check_passes(
         commit: commit.to_string(),
         tree: tree.to_string(),
         policy_digest,
+        // Hidden replay inputs are never bound here: a replay candidate never integrates.
+        hidden: Vec::new(),
     });
     let Ok(launch) = launch else {
         return Ok(false);

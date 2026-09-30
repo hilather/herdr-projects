@@ -76,6 +76,8 @@ pub(crate) fn central(project: &Path, since: Option<i64>) -> Result<(BTreeMap<St
     usage_metrics(sidecar.as_deref(), &attempts, since, &in_window, &mut metrics)?;
     for id in ["M31", "M32", "M33"] { metrics.insert(id, metric(id, json!({"value": unavailable("attention_not_collected")}))); }
     metrics.insert("M40", headroom(sidecar.as_deref(), &attempts, &in_window)?);
+    #[cfg(target_os = "linux")]
+    metrics.insert("M49", crate::replay::m49(&db, since)?);
     for (id, name) in NAMES { if let Some(m) = metrics.get_mut(id) { m["name"] = json!(name); } }
     let metrics: BTreeMap<String, Value> = metrics.into_iter().map(|(id, m)| (id.to_owned(), m)).collect();
     Ok((metrics, json!({"accepted": accepted, "open": open, "succeeded_without_evidence": without_evidence, "terminal": terminal.len()})))

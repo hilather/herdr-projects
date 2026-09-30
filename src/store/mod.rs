@@ -4,7 +4,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{fmt, fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 
-pub const SCHEMA: u32 = 63;
+pub const SCHEMA: u32 = 64;
 const APPLICATION: u32 = 1_213_222_994;
 pub const MIN_SQLITE: i32 = 3_053_004;
 pub const MIN_SQLITE_VERSION: &str = "3.53.4";
@@ -125,6 +125,7 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../migrations/0061_reviewer_authority.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0062_review_launch.sql"))?;
             tx.execute_batch(include_str!("../../migrations/0063_review_opportunity_ledger.sql"))?;
+            tx.execute_batch(include_str!("../../migrations/0064_replay_suite.sql"))?;
             tx.commit()?;
         }
         // Persist the initial directory entry as well as SQLite's own commit.
@@ -538,6 +539,8 @@ mod review_protocols;
 pub use review_protocols::{ProtocolState,protocol_state};
 mod seeded_defects;
 pub use seeded_defects::{EvaluationArm,EvaluationOpportunity,SeedSpec,SeedState,seed_state};
+mod replay_cases;
+pub use replay_cases::{REPLAY_PRINCIPAL,ReplayCaseRecord,ReplayCandidateStatus,ReplaySource,ReplaySuiteRecord,replay_brief_payloads,replay_candidate,replay_candidate_statuses,replay_contract_raw,replay_retirements,replay_runs,replay_sources,replay_suite};
 mod review_ledger;
 mod supersessions;
 pub use supersessions::{SupersessionRecord,SupersessionRequest,SUPERSESSION_OUTCOMES,SUPERSESSION_REASONS};

@@ -19,6 +19,8 @@ pub struct Spec {
     pub commit: String,
     pub tree: String,
     pub policy_digest: String,
+    /// Hidden check inputs, bound read-only at the same paths (replay suite).
+    pub hidden: Vec<PathBuf>,
 }
 
 pub struct Launch {
@@ -64,8 +66,11 @@ pub fn launch(spec: &Spec) -> Result<Launch> {
         spec.policy.display().to_string(),
         "--git".into(),
         "/usr/bin/git".into(),
-        "--".into(),
     ];
+    for hidden in &spec.hidden {
+        args.extend(["--hidden".into(), hidden.display().to_string()]);
+    }
+    args.push("--".into());
     args.extend(spec.checks.iter().cloned());
     let mut argv = vec![spec.unshare_program.display().to_string()];
     argv.extend(args.iter().cloned());

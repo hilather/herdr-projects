@@ -182,6 +182,64 @@ pub struct VerifyOutcome {
 struct PolicyDocument {
     version: u32,
     checks: Vec<String>,
+    /// Hidden check inputs (replay suite, TM4.6): owner-held files the
+    /// candidate never sees, bound read-only into the isolated root at the
+    /// same path and pinned by digest. Absent in ordinary policies.
+    #[serde(default)]
+    hidden: Vec<HiddenInput>,
+}
+
+/// One hidden check input: an absolute path under the project's replay
+/// check store (`<projects root>/.replay/<slug>/checks/`) and its sha256.
+#[derive(serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HiddenInput {
+    pub(crate) path: String,
+    pub(crate) sha256: String,
+}
+
+const MAX_HIDDEN: usize = 8;
+const MAX_HIDDEN_BYTES: u64 = 65_536;
+
+/// The policy's hidden inputs, bounded: absolute normal paths, hex digests, unique.
+pub(crate) fn parse_hidden(bytes: &[u8]) -> Result<Vec<HiddenInput>> {
+    let document: PolicyDocument = serde_json::from_slice(bytes).context("policy document is invalid")?;
+    if document.hidden.len() > MAX_HIDDEN { bail!("policy hidden inputs exceed bounds"); }
+    let mut seen = std::collections::BTreeSet::new();
+    for input in &document.hidden {
+        let path = Path::new(&input.path);
+        if input.path.len() > 1024 || input.path.contains('\0') || !path.is_absolute()
+            || path.components().any(|c| !matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_)))
+            || input.sha256.len() != 64 || !input.sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || !seen.insert(input.path.clone()) {
+            bail!("policy hidden input is invalid");
+        }
+    }
+    Ok(document.hidden)
+}
+
+/// sha256 of a regular, non-symlink hidden file of at most 64 KiB.
+pub(crate) fn hidden_digest(path: &Path) -> Option<String> {
+    use std::{io::Read, os::unix::fs::OpenOptionsExt};
+    let file = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_HIDDEN_BYTES { return None; }
+    let mut bytes = Vec::new();
+    file.take(MAX_HIDDEN_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_HIDDEN_BYTES { return None; }
+    Some(format!("{:x}", Sha256::digest(&bytes)))
+}
+
+/// Every hidden input lies in the project's own replay check store, is
+/// canonical and still has its pinned digest.
+fn hidden_inputs_ok(project_store: &Path, hidden: &[HiddenInput]) -> bool {
+    let Some(project) = project_store.parent().and_then(Path::parent) else { return false };
+    let (Some(root), Some(slug)) = (project.parent(), project.file_name()) else { return false };
+    let Ok(store) = root.join(".replay").join(slug).join("checks").canonicalize() else { return false };
+    hidden.iter().all(|input| {
+        let path = Path::new(&input.path);
+        path.canonicalize().is_ok_and(|c| c == path && c.starts_with(&store)) && hidden_digest(path).as_deref() == Some(input.sha256.as_str())
+    })
 }
 
 pub(crate) fn parse_checks(bytes: &[u8]) -> Result<Vec<String>> {
@@ -438,6 +496,10 @@ fn verify_owned(store: &mut SqliteStore, request: &VerifyRequest, ownership: Opt
         );
     }
     let checks = parse_checks(&policy_bytes)?;
+    let hidden = parse_hidden(&policy_bytes)?;
+    if !hidden.is_empty() && !hidden_inputs_ok(Path::new(&target.project_store), &hidden) {
+        return persist(store, &target, request, payload_digest, Vec::new(), Vec::new(), None, Some("hidden_check_unavailable"), None, String::new(), None);
+    }
     let checkout = checkout::materialize(
         &request.work_dir,
         Path::new(&target.project_store),
@@ -549,6 +611,7 @@ fn verify_owned(store: &mut SqliteStore, request: &VerifyRequest, ownership: Opt
         commit: checkout.commit.clone(),
         tree: checkout.tree.clone(),
         policy_digest: target.policy_digest.clone(),
+        hidden: hidden.iter().map(|input| PathBuf::from(&input.path)).collect(),
     })?;
     if !unshare_ready(&request.unshare_program) {
         return persist(

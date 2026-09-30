@@ -150,12 +150,12 @@ fn registry_declares_every_metric_and_gates_families() {
         assert_eq!((&m["active"], &m["family"], &m["proxy"], &m["certification"]["status"]), (&json!(true), &json!("proxy"), &json!(true), &json!(status)), "{id}");
     }
     assert_eq!((&get("M30")["certification"]["status"], &get("M30")["versions"][0]["provider"]["reason"]), (&json!("absent"), &json!("no_producer")));
-    assert_eq!((&get("M49")["active"], &get("M49")["activation"]["reason"]), (&json!(false), &json!("awaiting_replay_suite")));
+    assert_eq!((&get("M49")["active"], &get("M49")["activation"]["card"]), (&json!(true), &json!("TM4.6")));
     // Text form: one line per metric.
     let text = String::from_utf8(p.raw(&["metrics", "registry"])).unwrap();
     assert_eq!(text.lines().count(), 52, "{text}");
     assert!(text.contains("M20 review_completion M20.v1 review family=review_quality cohorts=assignment_cohort unit=ratio certification=certified-fixture active"), "{text}");
-    assert!(text.contains("M49 replay_suite_pass_rate M49.v1 absent family=replay cohorts=activity_window unit=ratio certification=absent unavailable(awaiting_replay_suite)"), "{text}");
+    assert!(text.contains("M49 replay_suite_pass_rate M49.v1 central family=replay cohorts=activity_window unit=ratio certification=fixture active"), "{text}");
 
     // The query service honours the gates: an inactive family or an absent
     // producer is unavailable with its reason, never a value; an active one
@@ -166,8 +166,8 @@ fn registry_declares_every_metric_and_gates_families() {
     assert_eq!((&q["results"][0]["detail"]["definition"], &q["results"][0]["certification"]["status"]), (&json!("M20.v1"), &json!("certified-fixture")));
     assert_eq!(reason(1), (json!("unavailable"), json!("collection_not_run")), "the proxy lane's own reason: no sidecar");
     assert_eq!((&q["results"][1]["proxy"], &q["results"][1]["detail"]["source_trust"]), (&json!(true), &json!("proxy_observed")));
-    assert_eq!(reason(2), (json!("unavailable"), json!("awaiting_replay_suite")));
-    assert_eq!(q["results"][2]["value"], json!({"status": "unavailable", "reason": "awaiting_replay_suite"}));
+    assert_eq!(reason(2), (json!("unavailable"), json!("no_replay_suite")), "the replay producer's own reason: no suite recorded");
+    assert_eq!(q["results"][2]["value"], json!({"status": "unavailable", "reason": "no_replay_suite"}));
     assert_eq!(reason(3), (json!("unavailable"), json!("operating_hours_not_recorded")));
 }
 

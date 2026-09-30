@@ -10,7 +10,7 @@ use std::{
     process::Command,
 };
 
-use crate::verification::{parse_checks, program_allowed};
+use crate::verification::{hidden_digest, parse_checks, parse_hidden, program_allowed};
 
 const EXIT_SAME_NS: i32 = 71;
 const EXIT_SETUP: i32 = 72;
@@ -50,6 +50,7 @@ struct Args {
     checkout: PathBuf,
     policy: PathBuf,
     git: PathBuf,
+    hidden: Vec<PathBuf>,
     checks: Vec<String>,
 }
 
@@ -59,6 +60,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut checkout = None;
     let mut policy = None;
     let mut git = None;
+    let mut hidden = Vec::new();
     let mut checks = Vec::new();
     let mut index = start;
     while index < args.len() {
@@ -73,6 +75,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
             "--checkout" => checkout = Some(PathBuf::from(value)),
             "--policy" => policy = Some(PathBuf::from(value)),
             "--git" => git = Some(PathBuf::from(value)),
+            "--hidden" => hidden.push(PathBuf::from(value)),
             _ => return None,
         }
         index += 2;
@@ -82,6 +85,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         checkout: checkout?,
         policy: policy?,
         git: git?,
+        hidden,
         checks,
     })
 }
@@ -121,6 +125,13 @@ fn enter(parsed: &Args) -> i32 {
         Ok(_) => return EXIT_CHECKS,
         Err(_) => return EXIT_POLICY,
     };
+    // Hidden inputs: exactly the policy's, bound read-only, each still at its pinned digest.
+    match parse_hidden(&bytes) {
+        Ok(hidden) if hidden.len() == parsed.hidden.len()
+            && hidden.iter().zip(&parsed.hidden).all(|(input, path)| Path::new(&input.path) == path
+                && hidden_digest(path).as_deref() == Some(input.sha256.as_str())) => {}
+        _ => return EXIT_POLICY,
+    }
     let seen_commit = match git_line(&parsed.git, &parsed.checkout, &["rev-parse", "HEAD"]) {
         Some(value) => value,
         None => return fail("rev-parse", 0),
@@ -275,6 +286,9 @@ fn switch_root(scratch: &Path, parsed: &Args, libraries: &[PathBuf]) -> Result<(
         bind_ro(scratch, library)?;
     }
     bind_ro(scratch, &parsed.policy)?;
+    for hidden in &parsed.hidden {
+        bind_ro(scratch, hidden)?;
+    }
     // A private copy, not a bind of the live host directory. Host writes cannot land after the check.
     copy_checkout(scratch, &parsed.checkout)?;
     let put_old = scratch.join("old");

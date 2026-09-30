@@ -103,6 +103,7 @@ fn queue_task_on(tx:&Connection,id:&TaskId,revision:u64,head_expected:u64,reques
         let record=QueueRecord{task:id.clone(),priority:request.priority,enqueued_unix_ms:previous.as_ref().map(|p|p.enqueued_unix_ms).unwrap_or(now),enqueue_sequence:previous.as_ref().map(|p|p.enqueue_sequence).unwrap_or(head_expected.checked_add(1).ok_or_else(||invalid("sequence exhausted"))?),dependencies};
         identities.insert(id.clone());
         for edge in &record.dependencies {budget.check()?;if tx.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1)",[edge.predecessor.as_str()],|row|row.get::<_,bool>(0))? {identities.insert(edge.predecessor.clone());}}
+        for edge in &record.dependencies {super::replay_cases::refuse_replay_predecessor(tx,edge.predecessor.as_str())?;}
         queue.retain(|q|&q.task!=id);queue.push(record.clone());graph_ids(&identities,&queue,Some(budget))?;
         task.revision=revision.checked_add(1).ok_or_else(||invalid("task revision exhausted"))?;task.state=TaskState::Queued;
         tx.execute("UPDATE tasks SET revision=?2,state='queued' WHERE id=?1",params![id.as_str(),integer(task.revision)?])?;

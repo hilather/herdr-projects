@@ -1,0 +1,61 @@
+{
+  "schema": "replay-sample-history.v1",
+  "note": "Deterministic sample repository and accepted history for replay suite v1 (tests/replay_suite.rs). Each change is accepted through contract, submission, verification and integration; tests/expected/<path> files are the accepted change's tests.",
+  "base": {
+    "README.md": "Sample greeter repository for the replay suite fixtures.\n",
+    "src/greet.txt": "hello\n",
+    "docs/index.md": "# Greeter\n"
+  },
+  "changes": [
+    {
+      "task": "greet-name",
+      "title": "Greet the world by name",
+      "scope": ["src/", "tests/"],
+      "outputs": ["src/greet.txt"],
+      "files": {
+        "src/greet.txt": "hello, world from the greeter v2\n",
+        "tests/expected/src/greet.txt": "hello, world from the greeter v2\n"
+      }
+    },
+    {
+      "task": "usage-docs",
+      "title": "Document usage",
+      "scope": ["docs/", "tests/expected/docs/usage.md"],
+      "outputs": ["docs/usage.md"],
+      "files": {
+        "docs/usage.md": "Run the greeter with the --name option to choose whom to greet.\n",
+        "tests/expected/docs/usage.md": "Run the greeter with the --name option to choose whom to greet.\n"
+      }
+    },
+    {
+      "task": "farewell",
+      "title": "Add a farewell",
+      "scope": ["src/", "tests/"],
+      "outputs": ["src/farewell.txt"],
+      "files": {
+        "src/farewell.txt": "goodbye, world, until the greeter meets again\n",
+        "tests/expected/src/farewell.txt": "goodbye, world, until the greeter meets again\n"
+      }
+    },
+    {
+      "task": "readme-typo",
+      "title": "Fix a README typo",
+      "scope": ["README.md"],
+      "outputs": ["README.md"],
+      "files": {
+        "README.md": "Sample greeter repository for the replay-suite fixtures.\n"
+      }
+    },
+    {
+      "task": "secret-flag",
+      "title": "Add the answer flag",
+      "scope": ["src/", "tests/"],
+      "outputs": ["src/flag.txt"],
+      "files": {
+        "src/flag.txt": "the leaked answer is forty-two exactly\n",
+        "tests/expected/src/flag.txt": "the leaked answer is forty-two exactly\n"
+      }
+    }
+  ],
+  "project_md": "Project notes for the greeter.\nKnown answer, pasted from a review: the leaked answer is forty-two exactly\n"
+}
