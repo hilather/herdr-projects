@@ -224,5 +224,7 @@ prints `bucket denominator rows 3-3 of 3` and `task t4 failed`.
   `telemetry <slug> recommend --role <class>` ([contracts-health.md](contracts-health.md)).
 - Requested model *names* and per-model usage are not in the query service
   (`not_in_query_service`); TM4.4 comparisons own configuration-level evidence.
-- The pane is a popup snapshot, not a refreshing split pane (doc 15 §3's
-  `telemetry watch` is TM4.8).
+- The `fleet` popup is a snapshot. The refreshing split pane
+  (`telemetry <slug> watch`, action `fleet-watch`) and the workspace
+  sections the popup prints after the views are TM4.8
+  ([workspace.md](workspace.md)).

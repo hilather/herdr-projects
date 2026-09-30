@@ -239,7 +239,7 @@ fn report_review_ack_and_resolve_copy_home() {
     assert_eq!(resolved["status"].as_str(), Some("resolved"));
     assert_eq!(lab.list()["t-0001"], ("Resolved".to_string(), "manual".to_string()));
     // Resolving takes the thread's labels off its pane.
-    let clear = "pane report-metadata w0:p2 --source herdr-projects --clear-token project --clear-token thread --clear-token review --clear-token rank";
+    let clear = "pane report-metadata w0:p2 --source herdr-projects --clear-token project --clear-token thread --clear-token review --clear-token rank --clear-token telemetry";
     assert!(lab.calls().lines().any(|l| l == clear), "{}", lab.calls());
 }
 
@@ -316,7 +316,9 @@ fn start_restart_and_adopt_write_briefs_branches_and_launch_line() {
     // Placement labels the pane for the sidebar: this project, this thread, working.
     let calls = lab.calls();
     for (pane, id) in [("w1:p1", "t-0001"), ("w2:p1", "t-0002")] {
-        let line = format!("pane report-metadata {pane} --source herdr-projects --ttl-ms 300000 --token project=demo --token thread={id} --token review=working --token rank=3");
+        // TM4.8: the sidebar suffix names the agent and unavailable usage coverage, never a number.
+        let agent = lab.record(id)["agent"].as_str().unwrap().to_owned();
+        let line = format!("pane report-metadata {pane} --source herdr-projects --ttl-ms 300000 --token project=demo --token thread={id} --token review=working --token rank=3 --token telemetry={agent} ○");
         assert!(calls.lines().any(|l| l == line), "{line}\n{calls}");
     }
 

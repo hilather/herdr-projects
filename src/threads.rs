@@ -58,7 +58,45 @@ pub fn thread_tokens(thread: &Thread, slug: &str, group: Group) -> Vec<(String, 
         ("thread".into(), thread.id.clone()),
         ("review".into(), group.token().to_string()),
         ("rank".into(), group.rank().to_string()),
+        ("telemetry".into(), telemetry_suffix(thread, group, jiff::Timestamp::now())),
     ]
+}
+
+/// The sidebar's telemetry suffix (TM4.8, doc 15 §4), token `telemetry`: the
+/// thread's agent label, its usage-coverage glyph and, while it waits on you,
+/// how long. A thread has no telemetry collector binding, so its coverage is
+/// `○` (unavailable), never a number; the suffix never shows a ranking or a
+/// cost. Herdr shows it only where the user's sidebar format names the token.
+pub fn telemetry_suffix(thread: &Thread, group: Group, now: jiff::Timestamp) -> String {
+    let label = if thread.agent.is_empty() { "n/a" } else { thread.agent.as_str() };
+    let wait = (group == Group::WaitingOnYou).then(|| thread.last_state_change.parse::<jiff::Timestamp>().ok()).flatten()
+        .map(|since| {
+            let s = (now.as_second() - since.as_second()).max(0);
+            match (s / 3600, s / 60 % 60, s % 60) { (0, 0, s) => format!(" {s}s"), (0, m, _) => format!(" {m}m"), (h, m, _) => format!(" {h}h{m:02}m") }
+        })
+        .unwrap_or_default();
+    format!("{label} ○{wait}")
+}
+
+/// Dispatch reason codes `thread start --reason` accepts (doc 15 §6): the
+/// canonical dispatch log's operator reasons.
+#[cfg(feature = "state-store")]
+const DISPATCH_REASONS: &[&str] = &herdr_projects::domain::OPERATOR_REASONS;
+#[cfg(not(feature = "state-store"))]
+const DISPATCH_REASONS: &[&str] = &["operator_selected", "recommended", "operator_preference", "availability", "exploration", "replay", "continuation", "unspecified"];
+const MAX_NOTE: usize = 160;
+
+/// `--reason` and `--note`, checked before anything is created.
+fn dispatch_reason(reason: Option<&str>, note: Option<&str>) -> Result<(String, String)> {
+    let reason = reason.unwrap_or("unspecified");
+    if !DISPATCH_REASONS.contains(&reason) {
+        bail!("--reason `{reason}` is not a dispatch reason code; use one of: {}", DISPATCH_REASONS.join(", "));
+    }
+    let note = note.unwrap_or("").trim();
+    if note.chars().count() > MAX_NOTE || note.chars().any(char::is_control) {
+        bail!("--note must be one line of at most {MAX_NOTE} characters");
+    }
+    Ok((reason.to_owned(), note.to_owned()))
 }
 
 pub fn report_thread_tokens(herdr: &Herdr, thread: &Thread, slug: &str, group: Group) {
@@ -73,7 +111,7 @@ fn clear_thread_tokens(herdr: &Herdr, thread: &Thread) {
     if !thread.pane_id.is_empty() {
         let _ = herdr
             .on_machine(&thread.machine)
-            .pane_clear_tokens(&thread.pane_id, &["project", "thread", "review", "rank"]);
+            .pane_clear_tokens(&thread.pane_id, &["project", "thread", "review", "rank", "telemetry"]);
     }
 }
 
@@ -84,6 +122,9 @@ pub struct StartArgs {
     pub agent: Option<String>,
     pub base: Option<String>,
     pub task: String,
+    /// Dispatch reason code (doc 15 §6); `unspecified` when omitted.
+    pub reason: Option<String>,
+    pub note: Option<String>,
 }
 
 /// Creates the workspace or tab, the thread directory and the brief, then
@@ -101,6 +142,7 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     if args.task.trim().is_empty() {
         bail!("the task is empty");
     }
+    let (reason, note) = dispatch_reason(args.reason.as_deref(), args.note.as_deref())?;
     let (settings, _) = project.read_project_md()?;
     let agent_kind = args.agent.clone().unwrap_or_else(|| settings.thread_agent.clone());
     project.safety(&ctx.config_dir)?.worker_arguments(&agent_kind)?;
@@ -145,6 +187,8 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         t.machine = machine.clone();
         t.agent = agent_kind.clone();
         t.base = args.base.clone().unwrap_or_default();
+        t.dispatch_reason = reason.clone();
+        t.dispatch_note = note.clone();
     })?;
     let id = record.id.clone();
     {

@@ -378,6 +378,11 @@ pub fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
     for b in &broken {
         let _ = writeln!(out, "- config-error: {}: {}", b.file, b.error);
     }
+    // TM4.8 (doc 15 §5): bounded, advisory fleet evidence when the project has a canonical store.
+    #[cfg(feature = "state-store")]
+    if let Some(section) = herdr_projects::telemetry::workspace::context_section(&project.dir(), slug, &ctx.config_dir) {
+        let _ = write!(out, "\n{section}");
+    }
     let shown = items.into_iter().map(|i| i.id).collect();
     Ok((out, shown))
 }

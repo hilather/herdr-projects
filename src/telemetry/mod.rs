@@ -12,6 +12,7 @@ pub mod outcome;
 pub mod panel;
 pub mod policies;
 pub mod views;
+pub mod workspace;
 pub mod quality;
 pub mod review;
 pub mod sanitize;

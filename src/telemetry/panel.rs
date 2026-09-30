@@ -12,7 +12,7 @@ fn table(db: &Connection, name: &str) -> rusqlite::Result<bool> {
 }
 
 /// `1h02m`, `1m30s`, `45s`.
-fn elapsed(ms: i64) -> String {
+pub(crate) fn elapsed(ms: i64) -> String {
     let s = ms.max(0) / 1000;
     match (s / 3600, s / 60 % 60, s % 60) {
         (0, 0, s) => format!("{s}s"),

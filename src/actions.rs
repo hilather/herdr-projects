@@ -77,10 +77,12 @@ pub fn run_action(ctx: &Ctx, id: &str) -> Result<()> {
         "new" => open_pane(ctx, "new", &base),
         "overview" => open_pane(ctx, "overview", &Handoff { slug: current_slug(ctx).unwrap_or_default(), ..base }),
         // The read-only fleet popup, scoped to the invoking workspace's project if any.
-        "fleet" => {
+        // TM4.8: the refreshing fleet pane and the three owner popups, each bound
+        // to the invoking workspace's project (store identity) like `fleet`.
+        "fleet" | "fleet-watch" | "fleet-race" | "fleet-select" | "fleet-replay" => {
             let slug = current_slug(ctx).unwrap_or_default();
             let store = fleet_store(ctx, &slug);
-            open_pane(ctx, "fleet", &Handoff { slug, store, ..base })
+            open_pane(ctx, id, &Handoff { slug, store, ..base })
         }
         "open" | "pause" | "resume" => match current_slug(ctx) {
             Some(slug) => run_on_slug(ctx, id, &slug),
@@ -146,6 +148,9 @@ pub fn run_pane(ctx: &Ctx, id: &str) -> Result<()> {
         hold_open();
         return Ok(());
     }
+    if id == "fleet-watch" {
+        return fleet_watch(ctx);
+    }
     let handoff = match handoff::consume(ctx, id) {
         Ok(handoff) => handoff,
         Err(error) => { println!("error: {error:#}"); hold_open(); return Err(error); }
@@ -179,6 +184,7 @@ pub fn run_pane(ctx: &Ctx, id: &str) -> Result<()> {
                 &AdoptWorkspace { name, goal: String::new(), pane: handoff.pane_id.clone(), workspace_cwd: handoff.workspace_cwd.clone(), session: SessionFlags { session: None, socket: Some(PathBuf::from(socket(ctx)?)) } },
             )
         })(),
+        "fleet-race" | "fleet-select" | "fleet-replay" => owner_popup(ctx, id, &handoff),
         other => bail!("unknown pane `{other}`"),
     };
     if let Err(error) = &result {
@@ -223,7 +229,7 @@ fn fleet(ctx: &Ctx) {
     { let _ = ctx; println!("fleet panel unavailable: this build lacks the `state-store` feature; rebuild with `cargo build --release --locked --features state-store`"); }
     #[cfg(feature = "state-store")]
     {
-        use herdr_projects::telemetry::{panel, views};
+        use herdr_projects::telemetry::{panel, views, workspace};
         let handoff = ctx.env.var(handoff::ENV).map(|_| handoff::consume(ctx, "fleet"));
         let slug = match handoff {
             Some(Err(error)) => { println!("error: {error:#}"); return; }
@@ -247,11 +253,120 @@ fn fleet(ctx: &Ctx) {
             }
             // Each section reads its own project only (root-confined, no symlinked store).
             let scope = match views::scope(&ctx.root, &slug) { Ok(scope) => scope, Err(error) => { println!("error: {error:#}\n"); continue; } };
+            // TM4.8: one workspace snapshot; when the query service cannot answer the
+            // project shows `unavailable` and no number at all.
+            let snapshot = workspace::snapshot(&scope.dir, &slug);
+            if snapshot["status"] != "available" {
+                println!("{}", workspace::text(&snapshot));
+                continue;
+            }
             match panel::render(&scope.dir, now.as_millisecond()).and_then(|text| Ok(text + "\n" + &panel::views(&scope.dir, &slug)?)) {
-                Ok(text) => println!("{text}"),
+                Ok(text) => println!("{text}\n{}", workspace::text(&snapshot)),
                 Err(error) => println!("error: {error:#}\n"),
             }
         }
+    }
+}
+
+/// The project a TM4.8 pane acts on: the handoff's (bound to its store and to
+/// the invoking workspace's project, as `fleet`), else the operator's answer.
+#[cfg(feature = "state-store")]
+fn workspace_scope(ctx: &Ctx, handoff: &Handoff) -> Result<herdr_projects::telemetry::views::Scope> {
+    use herdr_projects::telemetry::views;
+    if !handoff.slug.is_empty() {
+        check_fleet_handoff(ctx, handoff).context("fleet handoff refused")?;
+        return views::scope(&ctx.root, &handoff.slug);
+    }
+    let slug = ask("Project", "")?;
+    views::scope(&ctx.root, &slug)
+}
+
+/// `fleet-watch` (split pane): `telemetry <slug> watch` for the handed-off
+/// project until the pane is closed. Read-only.
+fn fleet_watch(ctx: &Ctx) -> Result<()> {
+    #[cfg(not(feature = "state-store"))]
+    { let _ = ctx; println!("fleet pane unavailable: this build lacks the `state-store` feature"); hold_open(); Ok(()) }
+    #[cfg(feature = "state-store")]
+    {
+        use herdr_projects::telemetry::workspace;
+        let scope = handoff::consume(ctx, "fleet-watch").and_then(|handoff| workspace_scope(ctx, &handoff));
+        let scope = match scope { Ok(scope) => scope, Err(error) => { println!("error: {error:#}"); hold_open(); return Err(error); } };
+        let interval = ctx.env.var("HERDR_PROJECTS_FLEET_INTERVAL").and_then(|s| s.parse().ok()).filter(|s| (1..=workspace::WATCH_MAX_SECS).contains(s))
+            .unwrap_or(workspace::WATCH_DEFAULT_SECS);
+        let iterations = ctx.env.var("HERDR_PROJECTS_FLEET_ITERATIONS").and_then(|s| s.parse().ok());
+        workspace::watch(&ctx.root, &scope.slug, &ctx.config_dir, &workspace::WatchArgs { interval_secs: interval, iterations })
+    }
+}
+
+/// `fleet-race`, `fleet-select`, `fleet-replay` (TM4.8): a proposal built from
+/// the operator's answers, shown with the exact owner command, and run only on
+/// an explicit `y`. The owner command is the only writer and keeps its own
+/// checks: it refuses a worker execution context and worker principals.
+fn owner_popup(ctx: &Ctx, id: &str, handoff: &Handoff) -> Result<()> {
+    #[cfg(not(feature = "state-store"))]
+    { let _ = (ctx, id, handoff); bail!("candidate groups and the replay suite need the `state-store` feature") }
+    #[cfg(feature = "state-store")]
+    {
+        use herdr_projects::telemetry::workspace::owner::{self, Owner};
+        let scope = workspace_scope(ctx, handoff)?;
+        let slug = scope.slug.as_str();
+        let owner = match id {
+            "fleet-race" => {
+                println!("Propose a candidate group (race) on `{slug}`: nothing is written until you confirm.\n");
+                let task = ask("Task id", "")?;
+                let arms = ask("Arms: retained worker profile names, comma-separated (2-8)", "")?;
+                let mut args = vec!["groups".to_string(), "create".into(), task];
+                for arm in arms.split(',').map(str::trim).filter(|a| !a.is_empty()) { args.push("--arm".into()); args.push(arm.into()); }
+                println!("\nEach arm is an ordinary attempt of the task, reserved through the launch path under its own profile's budget; the group grants no launch.");
+                Owner::Quality(args)
+            }
+            "fleet-select" => {
+                println!("Record a candidate-group selection on `{slug}`: nothing is written until you confirm.\n");
+                let shown = owner::run(&scope.dir, &Owner::Quality(vec!["groups".into(), "show".into()]))?;
+                let groups: serde_json::Value = serde_json::from_str(&shown)?;
+                let groups = groups["groups"].as_array().cloned().unwrap_or_default();
+                for (i, g) in groups.iter().enumerate().filter(|(_, g)| g["status"] == "open") {
+                    let arms: Vec<String> = g["arms"].as_array().into_iter().flatten().map(|a| format!("arm {} {}", a["arm"], a["outcome"].as_str().unwrap_or("?"))).collect();
+                    println!("  race#{} {} task {}: {}", i + 1, g["group_id"].as_str().unwrap_or("?"), g["task_id"].as_str().unwrap_or("?"), arms.join(" · "));
+                }
+                let chosen = ask("Group (race#N or group id)", "")?;
+                let group = match chosen.strip_prefix("race#").and_then(|n| n.parse::<usize>().ok()) {
+                    Some(n) => groups.get(n.wrapping_sub(1)).and_then(|g| g["group_id"].as_str()).map(str::to_owned).with_context(|| format!("no candidate group {chosen}"))?,
+                    None => chosen,
+                };
+                let arm = ask("Winning arm number, or `none`", "")?;
+                let reason = ask("Reason code", "unspecified")?;
+                let mut args = vec!["groups".to_string(), "select".into(), group];
+                if arm == "none" { args.push("--none".into()); } else { args.push("--arm".into()); args.push(arm); }
+                args.push("--reason".into());
+                args.push(reason);
+                println!("\nA selection verifies, integrates and moves nothing: the winner still takes the ordinary verification and integration path.");
+                Owner::Quality(args)
+            }
+            _ => {
+                println!("Launch a replay-suite run on `{slug}`: replay tasks are created only when you confirm; each still needs its own signed contract and launch approval.\n");
+                let suite = ask("Suite version", "")?;
+                let configuration = ask("Configuration label", "")?;
+                let subset = ask("Subset", "stratified:4")?;
+                let seed = ask("Seed", "")?;
+                let preview = Owner::Replay(vec!["subset".into(), "--suite".into(), suite.clone(), "--subset".into(), subset.clone(), "--seed".into(), seed.clone()]);
+                println!("\nPreview: {}", preview.command_line(slug));
+                print!("{}", owner::run(&scope.dir, &preview)?);
+                #[cfg(target_os = "linux")]
+                let head = herdr_projects::runtime::snapshot(&scope.dir)?.head.to_string();
+                #[cfg(not(target_os = "linux"))]
+                let head = String::from("0");
+                Owner::Replay(vec!["run".into(), "--suite".into(), suite, "--configuration".into(), configuration, "--subset".into(), subset, "--seed".into(), seed,
+                    "--expected-head".into(), head])
+            }
+        };
+        println!("Runs: {}", owner.command_line(slug));
+        if ask("Confirm (y/N)", "N")? != "y" {
+            println!("nothing written");
+            return Ok(());
+        }
+        print!("{}", owner::run(&scope.dir, &owner)?);
+        Ok(())
     }
 }
 

@@ -106,6 +106,11 @@ pub struct Thread {
     /// Content-addressed local preservation receipt; empty for legacy/live copies.
     pub artifact_snapshot: String,
     pub removal: Option<crate::cleanup::Removal>,
+    /// TM4.8 (doc 15 §6): the dispatch reason code given to `thread start --reason`
+    /// (`unspecified` when none was given); empty for threads started before it.
+    pub dispatch_reason: String,
+    /// Optional short note given with `--note`, at most 160 characters.
+    pub dispatch_note: String,
 }
 
 impl Thread {

@@ -288,6 +288,11 @@ fn report(
                         Ok(line) => check(&mut out, Some(true), &label, format!("telemetry: {line}")),
                         Err(error) => check(&mut out, None, &label, format!("telemetry: sidecar unreadable: {error:#}")),
                     }
+                    // TM4.8 (doc 15 §9): query service, ingestion lag, collector coverage,
+                    // digest section size and health alerts. Advisory: never FAIL.
+                    for (mark, detail) in herdr_projects::telemetry::workspace::doctor_checks(&dir, &slug, config_dir) {
+                        check(&mut out, mark, &label, detail);
+                    }
                 }
                 if memory == "sqlite-v1" {
                     // A prohibition ("do not edit MEMORY.md") is correct guidance,

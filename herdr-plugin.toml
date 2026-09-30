@@ -66,6 +66,30 @@ contexts = ["workspace"]
 command = ["target/release/herdr-projects", "action", "fleet"]
 
 [[actions]]
+id = "fleet-watch"
+title = "Projects: fleet pane (refreshing)"
+contexts = ["workspace"]
+command = ["target/release/herdr-projects", "action", "fleet-watch"]
+
+[[actions]]
+id = "fleet-race"
+title = "Projects: propose a candidate group (race)"
+contexts = ["workspace"]
+command = ["target/release/herdr-projects", "action", "fleet-race"]
+
+[[actions]]
+id = "fleet-select"
+title = "Projects: select candidate"
+contexts = ["workspace"]
+command = ["target/release/herdr-projects", "action", "fleet-select"]
+
+[[actions]]
+id = "fleet-replay"
+title = "Projects: launch a replay-suite run"
+contexts = ["workspace"]
+command = ["target/release/herdr-projects", "action", "fleet-replay"]
+
+[[actions]]
 id = "doctor"
 title = "Projects: check setup"
 contexts = ["workspace"]
@@ -100,3 +124,27 @@ id = "fleet"
 title = "Projects: fleet"
 placement = "popup"
 command = ["target/release/herdr-projects", "pane", "fleet"]
+
+[[panes]]
+id = "fleet-watch"
+title = "Projects: fleet"
+placement = "split"
+command = ["target/release/herdr-projects", "pane", "fleet-watch"]
+
+[[panes]]
+id = "fleet-race"
+title = "Propose a candidate group"
+placement = "popup"
+command = ["target/release/herdr-projects", "pane", "fleet-race"]
+
+[[panes]]
+id = "fleet-select"
+title = "Select a candidate"
+placement = "popup"
+command = ["target/release/herdr-projects", "pane", "fleet-select"]
+
+[[panes]]
+id = "fleet-replay"
+title = "Launch a replay-suite run"
+placement = "popup"
+command = ["target/release/herdr-projects", "pane", "fleet-replay"]

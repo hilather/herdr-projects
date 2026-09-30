@@ -571,6 +571,12 @@ enum ThreadCommand {
         /// The task; `-` reads standard input
         #[arg(long, value_name = "FILE")]
         task_file: String,
+        /// Dispatch reason code (default `unspecified`): operator_selected, recommended, operator_preference, availability, exploration, replay, continuation
+        #[arg(long, value_name = "CODE")]
+        reason: Option<String>,
+        /// Optional one-line note on the dispatch (at most 160 characters)
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
     },
     /// Bring back a thread whose pane is gone or whose start failed
     Restart { slug: String, id: String },
@@ -889,6 +895,10 @@ enum TelemetryCommand {
     Health(herdr_projects::telemetry::health::Args),
     /// TM4.5 advisory recommendation for a role (task class) with M50 evidence freshness. Read-only; never read by dispatch.
     Recommend(herdr_projects::telemetry::health::recommend::Args),
+    /// TM4.8 Herdr workspace: the fleet snapshot behind the pane, popup and digest section. Read-only.
+    Workspace { #[command(subcommand)] command:herdr_projects::telemetry::workspace::Command },
+    /// TM4.8 fleet pane: the workspace snapshot, refreshed on an interval. Read-only.
+    Watch(herdr_projects::telemetry::workspace::WatchArgs),
 }
 
 #[cfg(feature="state-store")]
@@ -1323,6 +1333,16 @@ pub fn run() -> Result<()> {
             print!("{}",herdr_projects::telemetry::policies::run(&ctx.root.join(slug),command)?);Ok(())
         },
         #[cfg(feature="state-store")]
+        Command::Telemetry{slug,command:TelemetryCommand::Workspace{command}}=>{
+            project::validate_slug(&slug)?;
+            print!("{}",herdr_projects::telemetry::workspace::run(&ctx.root,&slug,&ctx.config_dir,&command)?);Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Telemetry{slug,command:TelemetryCommand::Watch(args)}=>{
+            project::validate_slug(&slug)?;
+            herdr_projects::telemetry::workspace::watch(&ctx.root,&slug,&ctx.config_dir,&args)
+        },
+        #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Experiments{command}}=>{
             project::validate_slug(&slug)?;
             print!("{}",herdr_projects::telemetry::analytics::run_experiments(&ctx.root.join(slug),command)?);Ok(())
@@ -1699,6 +1719,8 @@ pub fn run() -> Result<()> {
                     let result=herdr_projects::runtime::coordinator_context(&dir,&herdr_session,&profile,&instructions)
                         .context("legacy runtime is disabled; migrated context could not be read")?;
                     println!("{}",result.text);
+                    // TM4.8 (doc 15 §5): the bounded, advisory fleet section after the checkpointed context.
+                    if let Some(section)=herdr_projects::telemetry::workspace::context_section(&dir,&slug,&ctx.config_dir) {print!("\n{section}");}
                     if !peek&&!result.unseen.is_empty(){herdr_projects::runtime::update_inbox(&dir,result.head,&result.unseen,false)?;}
                     return Ok(());
                 }
@@ -1813,10 +1835,10 @@ pub fn run() -> Result<()> {
             }
         }
         Command::Thread { command } => match command {
-            ThreadCommand::Start { slug, title, repo, machine, agent, base, task_file } => {
+            ThreadCommand::Start { slug, title, repo, machine, agent, base, task_file, reason, note } => {
                 let task = read_text(&task_file)?;
-                let thread = threads::start(&ctx, &slug, StartArgs { title, repo, machine, agent, base, task })?;
-                println!("{}", serde_json::json!({ "id": thread.id, "kind": thread.kind, "branch": thread.branch, "pane_id": thread.pane_id }));
+                let thread = threads::start(&ctx, &slug, StartArgs { title, repo, machine, agent, base, task, reason, note })?;
+                println!("{}", serde_json::json!({ "id": thread.id, "kind": thread.kind, "branch": thread.branch, "pane_id": thread.pane_id, "dispatch_reason": thread.dispatch_reason }));
                 Ok(())
             }
             ThreadCommand::Restart { slug, id } => {
