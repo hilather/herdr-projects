@@ -19,7 +19,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-// Bound each private pack snapshot (both pack data and indexes) to 1 GiB.
+// Bound the total pack/index snapshot bytes per submission, copied lazily once.
 const PACK_COPY_LIMIT: u64 = 1024 * 1024 * 1024;
 const OBJECT_LIMIT: u64 = 16 * 1024 * 1024;
 const SUBMISSION_LIMIT: usize = 256 * 1024;
@@ -540,7 +540,7 @@ fn read_packed_object(
     })()
     .map_err(|_| invalid("missing object"))?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    // This read-only source operation owns no transfer resources. RealRunner
+    // These private-repository operations own no transfer resources. RealRunner
     // supplies the GatedSpawn gate, process-group cleanup and capture bounds.
     let git = |path: &Path,
                args: &[&str],
@@ -580,10 +580,10 @@ fn read_packed_object(
         .into_iter()
         .map(|(k, v)| (k.into(), v.into()))
         .collect();
-        if scratch.join("objects").is_dir() {
+        if path.join("objects").is_dir() {
             cmd.env.push((
                 "GIT_OBJECT_DIRECTORY".into(),
-                scratch.join("objects")
+                path.join("objects")
                     .to_str()
                     .ok_or_else(|| anyhow::anyhow!("invalid object directory"))?
                     .into(),
@@ -612,8 +612,20 @@ fn read_packed_object(
                 None,
                 8192,
             )?;
+            copy_private_packs(&verified_objects, &scratch.join("objects/pack"))?;
+            let encoder = scratch.join("encoder");
+            fs::create_dir(&encoder)?;
+            git(
+                &encoder,
+                &[
+                    "init",
+                    "--bare",
+                    &format!("--object-format={}", format.as_str()),
+                ],
+                None,
+                8192,
+            )?;
         }
-        copy_private_packs(&verified_objects, &scratch.join("objects/pack"))?;
         anyhow::ensure!(
             matches!(fs::symlink_metadata(scratch.join("objects/info/alternates")),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound),
@@ -643,15 +655,14 @@ fn read_packed_object(
                 && output.last() == Some(&b'\n'),
             "invalid object size"
         );
-        // Remove the private pack snapshot so hash-object writes loose bytes.
-        for entry in fs::read_dir(scratch.join("objects/pack"))? {
-            fs::remove_file(entry?.path())?;
-        }
+        // Keep the submission's pack snapshot intact. A separate repository
+        // without packs forces hash-object to write the verified loose bytes.
+        let encoder = scratch.join("encoder");
         let content = scratch.join("content");
         write_file(&content, &output[newline + 1..newline + 1 + size])
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let hashed = git(
-            scratch,
+            &encoder,
             &[
                 "hash-object",
                 "--literally",
@@ -671,18 +682,10 @@ fn read_packed_object(
             hashed? == format!("{oid}\n").as_bytes(),
             "object identity mismatch"
         );
-        read_object_file(&scratch.join("objects").join(&oid[..2]).join(&oid[2..]))
+        read_object_file(&encoder.join("objects").join(&oid[..2]).join(&oid[2..]))
             .map_err(|e| anyhow::anyhow!("{e}"))
     };
-    let result = read();
-    // Discard the private snapshot on both refusal and success.
-    let cleanup = if scratch.exists() {
-        fs::remove_dir_all(scratch)
-    } else {
-        Ok(())
-    };
-    cleanup.map_err(|_| invalid("missing object"))?;
-    result.map_err(|_| invalid("missing object"))
+    read().map_err(|_| invalid("missing object"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -766,38 +769,53 @@ fn stage_objects(
         return Ok(existing);
     }
     fs::create_dir_all(&dir).map_err(|error| StoreError::Io(error.to_string()))?;
-    let mut staged = Vec::new();
-    for object in &submission.objects {
-        let source_path =
-            crate::migration::safe_join(&source, &object.relative_path).map_err(map_join)?;
-        let bytes = match read_object_file(&source_path) {
-            Ok(bytes) => bytes,
-            Err(StoreError::Invalid(message)) if message == "missing object" && !source_path.exists() => {
-                read_packed_object(Path::new(&submission.repository), &dir.join("packed-reconstruction"), &object.oid, submission.object_format)?
-            }
-            Err(error) => return Err(error),
-        };
-        let byte_sha256 = sha256_hex(&bytes);
-        let dest = dir.join(&byte_sha256);
-        if dest.is_file() {
-            let (hash, size) = hash_staged(&dest)?;
-            if hash != byte_sha256 || size != bytes.len() as u64 {
-                return Err(invalid("staged object bytes changed"));
-            }
-        } else {
-            write_file(&dest, &bytes)?;
-        }
-        staged.push(StagedObject {
-            oid: object.oid.clone(),
-            relative_path: object.relative_path.clone(),
-            byte_sha256,
-            size: bytes.len() as u64,
-        });
-    }
     let scratch = dir.join("packed-reconstruction");
-    if scratch.exists() {
-        fs::remove_dir_all(scratch).map_err(|error| StoreError::Io(error.to_string()))?;
-    }
+    // A single exit from reconstruction ensures cleanup on every refusal, too.
+    let reconstruction = (|| -> Result<Vec<StagedObject>> {
+        let mut staged = Vec::new();
+        for object in &submission.objects {
+            let source_path =
+                crate::migration::safe_join(&source, &object.relative_path).map_err(map_join)?;
+            let bytes = match read_object_file(&source_path) {
+                Ok(bytes) => bytes,
+                Err(StoreError::Invalid(message))
+                    if message == "missing object" && !source_path.exists() =>
+                {
+                    read_packed_object(
+                        Path::new(&submission.repository),
+                        &scratch,
+                        &object.oid,
+                        submission.object_format,
+                    )?
+                }
+                Err(error) => return Err(error),
+            };
+            let byte_sha256 = sha256_hex(&bytes);
+            let dest = dir.join(&byte_sha256);
+            if dest.is_file() {
+                let (hash, size) = hash_staged(&dest)?;
+                if hash != byte_sha256 || size != bytes.len() as u64 {
+                    return Err(invalid("staged object bytes changed"));
+                }
+            } else {
+                write_file(&dest, &bytes)?;
+            }
+            staged.push(StagedObject {
+                oid: object.oid.clone(),
+                relative_path: object.relative_path.clone(),
+                byte_sha256,
+                size: bytes.len() as u64,
+            });
+        }
+        Ok(staged)
+    })();
+    let cleanup = if scratch.exists() {
+        fs::remove_dir_all(&scratch).map_err(|_| invalid("missing object"))
+    } else {
+        Ok(())
+    };
+    cleanup?;
+    let staged = reconstruction?;
     let manifest = StageManifest {
         payload_digest: payload_digest.to_string(),
         objects: staged.clone(),

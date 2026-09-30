@@ -3824,6 +3824,7 @@ fn task_contract_put_and_result_submit_keep_worker_bytes_untrusted() {
         "SELECT count(*) FROM result_submissions", [], |row| row.get::<_,u64>(0)).unwrap(), 0);
     std::fs::remove_file(&pack_path).unwrap();
     std::fs::rename(external_pack, pack_path).unwrap();
+    assert!(listed.len() >= 3, "submission exercises multiple packed objects");
     let submitted = hp(home.path(), &["--root", root_arg, "result", "demo", "submit", "--input-file", submission.to_str().unwrap()]);
     assert!(submitted.status.success(), "{}", String::from_utf8_lossy(&submitted.stderr));
     let again = hp(home.path(), &["--root", root_arg, "result", "demo", "submit", "--input-file", submission.to_str().unwrap()]);
