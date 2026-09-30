@@ -3809,6 +3809,21 @@ fn task_contract_put_and_result_submit_keep_worker_bytes_untrusted() {
     for object in &listed {
         assert!(!repo.join(".git/objects").join(object["relative_path"].as_str().unwrap()).exists());
     }
+    // A symlinked pack file must never expose owner-readable external bytes.
+    let pack_path = std::fs::read_dir(repo.join(".git/objects/pack")).unwrap()
+        .map(|entry| entry.unwrap().path()).find(|path| path.extension().is_some_and(|ext| ext == "pack")).unwrap();
+    let external_pack = home.path().join("external.pack");
+    std::fs::rename(&pack_path, &external_pack).unwrap();
+    std::os::unix::fs::symlink(&external_pack, &pack_path).unwrap();
+    let refused = hp(home.path(), &["--root", root_arg, "result", "demo", "submit", "--input-file", submission.to_str().unwrap()]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("missing object"));
+    assert!(refused.stdout.is_empty());
+    assert_eq!(runtime::snapshot(&project).unwrap(), before_submit);
+    assert_eq!(rusqlite::Connection::open(&db_path).unwrap().query_row(
+        "SELECT count(*) FROM result_submissions", [], |row| row.get::<_,u64>(0)).unwrap(), 0);
+    std::fs::remove_file(&pack_path).unwrap();
+    std::fs::rename(external_pack, pack_path).unwrap();
     let submitted = hp(home.path(), &["--root", root_arg, "result", "demo", "submit", "--input-file", submission.to_str().unwrap()]);
     assert!(submitted.status.success(), "{}", String::from_utf8_lossy(&submitted.stderr));
     let again = hp(home.path(), &["--root", root_arg, "result", "demo", "submit", "--input-file", submission.to_str().unwrap()]);

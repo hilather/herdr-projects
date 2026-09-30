@@ -12,10 +12,15 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+    },
     path::{Component, Path, PathBuf},
 };
 
+// Bound each private pack snapshot (both pack data and indexes) to 1 GiB.
+const PACK_COPY_LIMIT: u64 = 1024 * 1024 * 1024;
 const OBJECT_LIMIT: u64 = 16 * 1024 * 1024;
 const SUBMISSION_LIMIT: usize = 256 * 1024;
 const SCHEMA_VERSION: u32 = 26;
@@ -439,6 +444,65 @@ fn read_object_file(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Pin the source directories and copy only regular pack/index pairs from open
+/// descriptors. Git never sees this worker-controlled storage or its alternates.
+fn copy_private_packs(objects: &Path, destination: &Path) -> anyhow::Result<()> {
+    let objects = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(objects)?;
+    let open_at = |directory: &File, name: &std::ffi::OsStr, flags| -> std::io::Result<File> {
+        let name = std::ffi::CString::new(name.as_bytes())?;
+        // SAFETY: the directory descriptor and NUL-terminated name remain valid
+        // through openat; a successful descriptor is owned by the returned File.
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    };
+    let pack = open_at(
+        &objects,
+        std::ffi::OsStr::new("pack"),
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?;
+    let mut total = 0;
+    // /proc exposes the pinned directory for enumeration only. File contents
+    // are opened relative to its descriptor, never by re-resolving source paths.
+    for entry in fs::read_dir(format!("/proc/self/fd/{}", pack.as_raw_fd()))? {
+        let name = entry?.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(stem) = name
+            .strip_prefix("pack-")
+            .and_then(|s| s.strip_suffix(".pack"))
+        else {
+            continue;
+        };
+        for name in [format!("pack-{stem}.pack"), format!("pack-{stem}.idx")] {
+            let source = open_at(
+                &pack,
+                std::ffi::OsStr::new(&name),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )?;
+            let metadata = source.metadata()?;
+            anyhow::ensure!(metadata.is_file(), "non-regular pack file");
+            anyhow::ensure!(
+                metadata.len() <= PACK_COPY_LIMIT - total,
+                "pack snapshot exceeds 1 GiB"
+            );
+            let mut target = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(destination.join(name))?;
+            let copied = std::io::copy(&mut source.take(PACK_COPY_LIMIT - total + 1), &mut target)?;
+            total += copied;
+            anyhow::ensure!(total <= PACK_COPY_LIMIT, "pack snapshot exceeds 1 GiB");
+        }
+    }
+    Ok(())
+}
+
 /// Reconstruct a loose object using Git's own encoder, in a private repository.
 /// Re-hashing the exact binary content refuses forged pack indexes and replace refs.
 fn read_packed_object(
@@ -516,10 +580,10 @@ fn read_packed_object(
         .into_iter()
         .map(|(k, v)| (k.into(), v.into()))
         .collect();
-        if path == repository {
+        if scratch.join("objects").is_dir() {
             cmd.env.push((
                 "GIT_OBJECT_DIRECTORY".into(),
-                verified_objects
+                scratch.join("objects")
                     .to_str()
                     .ok_or_else(|| anyhow::anyhow!("invalid object directory"))?
                     .into(),
@@ -536,8 +600,27 @@ fn read_packed_object(
         Ok(output.stdout_bytes)
     };
     let read = || -> anyhow::Result<Vec<u8>> {
+        if !scratch.exists() {
+            fs::create_dir(scratch)?;
+            git(
+                scratch,
+                &[
+                    "init",
+                    "--bare",
+                    &format!("--object-format={}", format.as_str()),
+                ],
+                None,
+                8192,
+            )?;
+        }
+        copy_private_packs(&verified_objects, &scratch.join("objects/pack"))?;
+        anyhow::ensure!(
+            matches!(fs::symlink_metadata(scratch.join("objects/info/alternates")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+            "private repository has alternates"
+        );
         let output = git(
-            repository,
+            scratch,
             &["cat-file", "--batch"],
             Some(format!("{oid}\n")),
             OBJECT_LIMIT as usize + 256,
@@ -560,18 +643,9 @@ fn read_packed_object(
                 && output.last() == Some(&b'\n'),
             "invalid object size"
         );
-        if !scratch.exists() {
-            fs::create_dir(scratch)?;
-            git(
-                scratch,
-                &[
-                    "init",
-                    "--bare",
-                    &format!("--object-format={}", format.as_str()),
-                ],
-                None,
-                8192,
-            )?;
+        // Remove the private pack snapshot so hash-object writes loose bytes.
+        for entry in fs::read_dir(scratch.join("objects/pack"))? {
+            fs::remove_file(entry?.path())?;
         }
         let content = scratch.join("content");
         write_file(&content, &output[newline + 1..newline + 1 + size])
@@ -600,7 +674,15 @@ fn read_packed_object(
         read_object_file(&scratch.join("objects").join(&oid[..2]).join(&oid[2..]))
             .map_err(|e| anyhow::anyhow!("{e}"))
     };
-    read().map_err(|_| invalid("missing object"))
+    let result = read();
+    // Discard the private snapshot on both refusal and success.
+    let cleanup = if scratch.exists() {
+        fs::remove_dir_all(scratch)
+    } else {
+        Ok(())
+    };
+    cleanup.map_err(|_| invalid("missing object"))?;
+    result.map_err(|_| invalid("missing object"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
