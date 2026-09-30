@@ -466,20 +466,36 @@ fn isolated_worker_cannot_read_the_signer_key() {
     let secret = fs::read_to_string(&key).unwrap();
     let body = secret.lines().nth(1).unwrap().to_owned();
     let root = lab.path("root").canonicalize().unwrap();
-    let probe = format!("for p in {key:?} {policy:?} {audit:?}; do if [ -s \"$p\" ] && cat \"$p\" >/dev/null 2>&1; then echo \"READ $p\"; cat \"$p\"; else echo \"DENIED $p\"; fi; done; \
+    // The product binary the worker runs, named through a link in its own
+    // directory under /tmp (the sandbox's private scratch directory) beside
+    // an owner secret: the binary is exposed as the file itself, read-only,
+    // and the sibling stays hidden.
+    let bin_tmp = tempfile::Builder::new().prefix("herdr-projects-bin-").tempdir_in("/tmp").unwrap();
+    let bin_dir = bin_tmp.path().canonicalize().unwrap();
+    let bin = bin_dir.join("herdr-projects");
+    std::os::unix::fs::symlink(Path::new(BIN).canonicalize().unwrap(), &bin).unwrap();
+    let sibling = bin_dir.join("owner-secret");
+    fs::write(&sibling, "SENTINEL-BIN-SIBLING\n").unwrap();
+    let probe = format!("for p in {key:?} {policy:?} {audit:?} {sibling:?}; do if [ -s \"$p\" ] && cat \"$p\" >/dev/null 2>&1; then echo \"READ $p\"; cat \"$p\"; else echo \"DENIED $p\"; fi; done; \
         echo LIST $(ls -A {dir:?} 2>&1); \
-        {BIN:?} --root {root:?} telemetry demo review signer status --subject reviewer:carol; echo status-exit $?; \
-        {BIN:?} --root {root:?} telemetry demo review signer run --subject reviewer:carol --once; echo run-exit $?",
+        echo BINLIST $(ls -A {bin_dir:?} 2>&1); [ -w {bin:?} ] && echo BIN-WRITABLE; \
+        {bin:?} --root {root:?} telemetry demo review signer status --subject reviewer:carol; echo status-exit $?; \
+        {bin:?} --root {root:?} telemetry demo review signer run --subject reviewer:carol --once; echo run-exit $?",
         policy = dir.join("policy.json"), audit = dir.join("audit.jsonl"));
     // Control: the owner's own process reads it.
     let owner = Command::new("/bin/sh").args(["-c", &probe]).env_clear().env("HOME", lab.home.path()).env("PATH", "/usr/bin:/bin").output().unwrap();
     let owner = String::from_utf8_lossy(&owner.stdout).into_owned();
     assert!(owner.contains(&format!("READ {}", key.display())) && owner.contains(&body), "{owner}");
+    assert!(owner.contains(&format!("READ {}", sibling.display())) && owner.contains("BINLIST herdr-projects owner-secret"), "{owner}");
+    assert!(owner.contains("BIN-WRITABLE"), "the owner's control writes its binary:\n{owner}");
 
     let home = lab.path("agent-home").canonicalize().unwrap();
     let cwd = lab.repo.canonicalize().unwrap();
     let config = lab.path(".config/herdr-projects/config.toml");
-    let isolation = Isolation::for_agent(&lab.project, &home, &cwd, Path::new("/bin/sh"), &[cwd.as_path()], &[], Some(&config), Some(&lab.path("lab/native.sock")), &[]).unwrap();
+    // This test's own binary is not the product binary: name it, as the
+    // controller's `current_exe` is named in production.
+    let isolation = Isolation::for_agent(&lab.project, &home, &cwd, Path::new("/bin/sh"), &[cwd.as_path()], &[], Some(&config), Some(&lab.path("lab/native.sock")), &[])
+        .unwrap().with_executable(&bin).unwrap();
     let argv = isolated_gated_command(Path::new("/bin/sh"), &["-c".into(), probe.clone()], 60, "release-signer-probe", &home, &isolation).unwrap();
     let mut child = Command::new(&argv[0]).args(&argv[1..]).current_dir(&cwd).env_clear().env("HOME", lab.home.path()).env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
@@ -487,7 +503,9 @@ fn isolated_worker_cannot_read_the_signer_key() {
     let out = child.wait_with_output().unwrap();
     let report = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(!report.contains(&body) && !report.contains("PRIVATE KEY"), "the signer key reached the worker:\n{report}");
-    for path in [&key, &dir.join("policy.json"), &dir.join("audit.jsonl")] {
+    assert!(!report.contains("SENTINEL-BIN-SIBLING") && !report.contains("BIN-WRITABLE"), "{report}");
+    assert!(report.contains("\nBINLIST herdr-projects\n"), "only the binary is visible in its directory:\n{report}");
+    for path in [&key, &dir.join("policy.json"), &dir.join("audit.jsonl"), &sibling] {
         assert!(report.contains(&format!("DENIED {}", path.display())), "{} was readable:\n{report}", path.display());
     }
     assert!(report.contains("LIST ls: cannot access"), "{report}");

@@ -262,7 +262,11 @@ const OWNER_SECRETS: &[&str] = &[
 ///    inodes and shared locks stay shared);
 /// 2. replaces each private scratch directory (`/tmp`, `/var/tmp`, `/dev/shm`)
 ///    with an empty tmpfs, recursively binding back only the needed entries
-///    (opened before the cover); a missing or symlinked directory is skipped;
+///    (opened before the cover); a missing or symlinked directory is skipped.
+///    A needed directory is kept by its first component; an executable (see
+///    [`Isolation::with_executable`]) is kept as the file itself, at any
+///    depth, on parents created in the private tmpfs, so its siblings stay
+///    hidden (never below a kept directory, whose parents are the owner's);
 /// 3. for each attempt worktree, creates its fresh Git quarantine (refusing an
 ///    existing one) and mounts an overlay on the repository's Git common
 ///    directory: the shared directory (by descriptor) is the read-only lower
@@ -278,7 +282,8 @@ const OWNER_SECRETS: &[&str] = &[
 ///    mount_setattr), a writable exposure (execution home, its own worktrees,
 ///    the overlaid Git common directories, and the attempt's submission spool
 ///    and output directory under the otherwise read-only project `.state`) is
-///    bound onto itself on top, writable;
+///    bound onto itself on top, writable; every executable the worker runs
+///    from outside a read-only anchor is bound read-only onto itself;
 /// 5. mounts an empty read-only tmpfs over every hidden directory and
 ///    `/dev/null` over every hidden file, then over the owner's SSH agent and
 ///    tmux socket directories in `/tmp` (enumerated at setup, so the argv
@@ -308,7 +313,8 @@ const SANDBOX: &str = concat!(
     r#"/usr/bin/mount -t tmpfs -o nosuid,nodev,mode=1777 herdr-projects-private "$d" || fail "$d"; n=3; "#,
     r#"for a in "$@"; do case $a in --) break;; keep:"$d"/*) p=${a#keep:}; if [ -d "/proc/self/fd/$n" ]; then "#,
     r#"/usr/bin/mkdir -- "$p" && /usr/bin/mount -c --rbind "/proc/self/fd/$n" "$p" || fail "$p"; "#,
-    r#"else : > "$p" && /usr/bin/mount -c --bind "/proc/self/fd/$n" "$p" || fail "$p"; fi; "#,
+    r#"else { case ${p#"$d"/} in */*) /usr/bin/mkdir -p -- "${p%/*}";; esac && : > "$p" && "#,
+    r#"/usr/bin/mount -c --bind "/proc/self/fd/$n" "$p"; } || fail "$p"; fi; "#,
     r#"eval "exec $n<&-"; n=$((n+1));; esac; done; fi;; esac; done; "#,
     r#"for a in "$@"; do case $a in --) break;; quarantine:*) q=${a#quarantine:};; overlay:*) c=${a#overlay:}; "#,
     r#"{ /usr/bin/mkdir -p -m 0700 -- "${q%/*}" && /usr/bin/mkdir -m 0700 -- "$q" "$q/upper" "$q/work"; } || fail "$q"; "#,
@@ -358,6 +364,79 @@ fn forms(path: &str) -> Vec<std::path::PathBuf> {
         forms.push(real);
     }
     forms
+}
+
+/// What loading `executable` opens besides itself: a script's `#!`
+/// interpreter, or an ELF file's loader (`PT_INTERP`) and each `DT_NEEDED`
+/// library found in its `DT_RPATH`/`DT_RUNPATH` directories (`$ORIGIN`
+/// expanded). The sandboxed agent's environment carries no loader variables,
+/// so the default library directories need nothing. Only 64-bit
+/// little-endian ELF is read; anything unreadable yields nothing.
+fn executable_dependencies(executable: &Path) -> Vec<std::path::PathBuf> {
+    use std::os::unix::fs::FileExt;
+    let Ok(file) = std::fs::File::open(executable) else { return Vec::new() };
+    let read = |offset: u64, length: usize| {
+        let mut buffer = vec![0u8; length];
+        file.read_exact_at(&mut buffer, offset).ok().map(|()| buffer)
+    };
+    let text = |offset: u64| {
+        let bytes = read(offset, 4096).or_else(|| read(offset, 256))?;
+        let end = bytes.iter().position(|b| *b == 0)?;
+        String::from_utf8(bytes[..end].to_vec()).ok()
+    };
+    let Some(head) = read(0, 64).or_else(|| read(0, 2)) else { return Vec::new() };
+    if head.starts_with(b"#!") {
+        let line = read(0, 256).unwrap_or(head);
+        let line = line[2..].split(|b| *b == b'\n').next().unwrap_or_default();
+        let interpreter = String::from_utf8_lossy(line).split_whitespace().next().map(std::path::PathBuf::from);
+        return interpreter.filter(|p| p.is_absolute()).into_iter().collect();
+    }
+    if head.len() < 64 || !head.starts_with(b"\x7fELF") || head[4] != 2 || head[5] != 1 {
+        return Vec::new();
+    }
+    let word = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap_or_default());
+    let (phoff, phentsize, phnum) = (word(&head, 0x20), u16::from_le_bytes([head[0x36], head[0x37]]), u16::from_le_bytes([head[0x38], head[0x39]]));
+    if phentsize < 56 || phnum > 256 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let (mut loads, mut dynamic) = (Vec::new(), None);
+    for index in 0..u64::from(phnum) {
+        let Some(header) = read(phoff.saturating_add(index * u64::from(phentsize)), 56) else { return out };
+        let kind = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let (offset, address, size) = (word(&header, 8), word(&header, 0x10), word(&header, 0x20));
+        match kind {
+            1 => loads.push((address, offset, size)),
+            2 => dynamic = Some((offset, size.min(64 * 1024))),
+            3 => out.extend(text(offset).map(std::path::PathBuf::from).filter(|p| p.is_absolute())),
+            _ => {}
+        }
+    }
+    let Some(entries) = dynamic.and_then(|(offset, size)| read(offset, size as usize)) else { return out };
+    let (mut needed, mut paths, mut strings) = (Vec::new(), Vec::new(), None);
+    for entry in entries.as_chunks::<16>().0 {
+        let (tag, value) = (word(entry, 0), word(entry, 8));
+        match tag {
+            0 => break,
+            1 => needed.push(value),
+            5 => strings = loads.iter().find(|(a, _, s)| value >= *a && value - a < *s).map(|(a, o, _)| (value - a).saturating_add(*o)),
+            15 | 29 => paths.push(value),
+            _ => {}
+        }
+    }
+    let Some(strings) = strings else { return out };
+    let origin = executable.parent().and_then(Path::to_str).unwrap_or_default();
+    let directories: Vec<String> = paths.iter().filter_map(|p| text(strings.saturating_add(*p))).flat_map(|p| {
+        p.split(':').map(|d| d.replace("${ORIGIN}", origin).replace("$ORIGIN", origin)).collect::<Vec<_>>()
+    }).collect();
+    for name in needed.iter().take(64).filter_map(|n| text(strings.saturating_add(*n))) {
+        if name.contains('/') {
+            out.extend(Some(std::path::PathBuf::from(&name)).filter(|p| p.is_absolute()));
+        } else if let Some(found) = directories.iter().map(|d| Path::new(d).join(&name)).find(|p| p.is_absolute() && p.is_file()) {
+            out.push(found);
+        }
+    }
+    out
 }
 
 /// The owner's home directories: the account's passwd entry and, when it
@@ -567,11 +646,12 @@ impl Isolation {
         }
         let plan = kept;
         // Private scratch directories keep only the entries needed paths
-        // (named or real) lie in.
+        // (named or real) lie in. The agent is an executable: it is kept as
+        // the file itself below, not by its directory.
         let mut private = Vec::new();
         for dir in PRIVATE_DIRS {
             let mut keep = Vec::new();
-            for need in needed.iter().chain(std::iter::once(&root)) {
+            for need in needed.iter().filter(|n| **n != agent).chain(std::iter::once(&root)) {
                 for form in forms(need) {
                     if let Ok(rest) = form.strip_prefix(dir) {
                         let first = rest.components().next().ok_or_else(|| {
@@ -586,7 +666,99 @@ impl Isolation {
             ensure!(keep.len() <= 7, "too many agent paths directly under {dir}");
             private.push(((*dir).to_owned(), keep));
         }
-        Ok(Self { root, expose, private, git: quarantines, plan, hide, project, spool: None })
+        let mut isolation = Self { root, expose, private, git: quarantines, plan, hide, project, spool: None };
+        // Every executable the worker runs: the agent, and the product binary
+        // it invokes for `result submit` and the review worker channel (the
+        // controller deriving this sandbox is that binary).
+        isolation.add_executable(Path::new(&agent), true)?;
+        if let Ok(product) = std::env::current_exe() {
+            isolation.add_executable(&product, false)?;
+        }
+        Ok(isolation)
+    }
+
+    /// Also expose `executable` to the agent, read-only: for a caller whose
+    /// own binary is not the product binary the worker runs. See
+    /// [`Self::add_executable`].
+    pub fn with_executable(mut self, executable: &Path) -> Result<Self> {
+        self.add_executable(executable, false)?;
+        Ok(self)
+    }
+
+    /// Keep an executable the worker runs visible and read-only, with its
+    /// script interpreter and the ELF loader and `RPATH`/`RUNPATH` libraries
+    /// it needs (transitively, bounded). Each form (named and real) under a
+    /// private scratch directory is bound back as the file itself, never its
+    /// directory, so a sibling stays hidden; one under the projects root
+    /// outside the project is exposed as the file. A missing file is
+    /// skipped (the worker then fails to run it); one inside a hidden
+    /// location is refused, so a secret is never exposed to run it. The
+    /// agent itself keeps the mode of the view it lies in, unless it is
+    /// bound from a scratch directory.
+    fn add_executable(&mut self, executable: &Path, agent: bool) -> Result<()> {
+        // Kind: 0 the agent, 1 a product executable, 2 a dependency.
+        let mut pending = vec![(normal(executable)?, if agent { 0u8 } else { 1 })];
+        let mut seen = Vec::new();
+        while let Some((path, kind)) = pending.pop() {
+            if seen.contains(&path) {
+                continue;
+            }
+            ensure!(seen.len() < 16, "too many executables for the worker sandbox");
+            seen.push(path.clone());
+            let mut real = None;
+            for form in forms(&path) {
+                let form = normal(&form)?;
+                for secret in &self.hide {
+                    for secret in forms(secret) {
+                        ensure!(
+                            !Path::new(&form).starts_with(&secret),
+                            "worker isolation would hide the executable {form} (inside {}); move it out of the owner's secret locations",
+                            secret.display()
+                        );
+                    }
+                }
+                if !std::fs::metadata(&form).is_ok_and(|m| m.is_file()) {
+                    continue;
+                }
+                real = Some(form.clone());
+                let mut bound = false;
+                if Path::new(&form).starts_with(&self.root)
+                    && !Path::new(&form).starts_with(&self.project)
+                    && !self.expose.iter().any(|e| Path::new(&form).starts_with(e))
+                {
+                    self.expose.push(form.clone());
+                    self.expose.sort();
+                    ensure!(self.expose.len() <= 7, "too many paths to expose under the projects root");
+                    bound = true;
+                }
+                for (dir, keep) in &mut self.private {
+                    if Path::new(&form).starts_with(dir.as_str()) && !keep.iter().any(|k| Path::new(&form).starts_with(k)) {
+                        keep.push(form.clone());
+                        keep.sort();
+                        ensure!(keep.len() <= 7, "too many agent paths directly under {dir}");
+                        bound = true;
+                    }
+                }
+                // Read-only unless a read-only entry already encloses it: a
+                // bound file, one inside a writable exposure, and a product
+                // executable anywhere (a dependency elsewhere, such as the
+                // system loader, is left to the host's view).
+                let enclosing = self.plan.iter().filter(|(p, _)| Path::new(&form).starts_with(p)).max_by_key(|(p, _)| p.len());
+                let protect = match enclosing {
+                    Some((_, writable)) => *writable && (bound || kind != 0),
+                    None => bound || kind == 1,
+                };
+                if protect {
+                    self.plan.push((form, false));
+                }
+            }
+            if let Some(real) = real {
+                pending.extend(executable_dependencies(Path::new(&real)).into_iter().filter_map(|p| normal(&p).ok()).map(|p| (p, 2)));
+            }
+        }
+        // Parents first, as `for_agent` orders the plan.
+        self.plan.sort_by(|a, b| Path::new(&a.0).cmp(Path::new(&b.0)).then(a.1.cmp(&b.1)));
+        Ok(())
     }
 
     /// Give a canonical attempt its two writable places under the read-only

@@ -153,7 +153,10 @@ extra list is as immutable as the profile.
 
 System directories, tool binaries, the execution home (with its own auth copy),
 the working directory/worktree, the approved source repositories and their git
-common directories, the product binary, and the worker's own project directory
+common directories, the product binary (read-only, as the file itself when it
+lies in a private scratch directory; see
+[Executables in private scratch directories](#executables-in-private-scratch-directories-follow-up-card)),
+and the worker's own project directory
 (read-only since the spool card: `result submit`/`review submit` no longer
 open `<project>/.state/state.db` inside the worker, they write to the
 attempt's spool). Since the write-isolation card most of this is read-only
@@ -664,6 +667,75 @@ git fsck                       -> ok; grep -c evil .git/config -> 0
   [missing]      remote: aborting due to possible repository corruption on the remote side  fetch=128
   ```
 
+## Executables in private scratch directories (follow-up card)
+
+### Finding
+
+The private-`/tmp` step keeps only the first path component under `/tmp`,
+`/var/tmp` and `/dev/shm` of each *needed* path (execution home, cwd,
+repositories, Git directories, the agent). The product binary the worker runs
+for `result submit` and the review worker channel was not a needed path: it
+was visible only because it usually lies in the owner's home. With the binary
+under `/tmp` (a `CARGO_TARGET_DIR` there, or an install in a temporary
+directory) the worker saw `/bin/sh: .../debug/herdr-projects: No such file or
+directory`; four `canonical_worker` isolation tests and
+`review_signer::isolated_worker_cannot_read_the_signer_key` failed with such a
+target (the secrets stayed hidden; only the binary was missing). The agent
+itself had the opposite defect: an agent under `/tmp` kept its whole
+top-level directory there, writable, siblings included.
+
+### Mechanism
+
+- `Isolation::for_agent` ends with `add_executable` for the agent and for the
+  controller's own `std::env::current_exe()`: every launch path derives the
+  sandbox inside the product binary (ticker, launch service, profile probe),
+  and that is the binary a worker invokes (by the absolute path it was given,
+  or by name through `PATH=/usr/bin:/bin`, which is outside every scratch
+  directory). `Isolation::with_executable` adds one explicitly for a caller
+  that is not the product binary (the `review_signer` test harness).
+- For each executable, `add_executable` takes both forms (name and canonical
+  target) and follows, transitively and bounded (16 files), a script's `#!`
+  interpreter and an ELF file's loader (`PT_INTERP`) and `DT_NEEDED` libraries
+  found through `DT_RPATH`/`DT_RUNPATH` (`$ORIGIN` expanded). The agent's
+  environment carries no loader variables, so default library directories
+  need nothing. Only 64-bit little-endian ELF is parsed; reads are bounded and
+  anything malformed yields no dependency.
+- A form under a private scratch directory is kept as the **file itself**:
+  opened before the tmpfs cover, then bound by descriptor onto an empty file
+  whose parents the sandbox creates in the private tmpfs (the new
+  `mkdir -p` in the keep step's file branch). Siblings in the same directory
+  are not in the worker's view. A form already inside a kept directory is not
+  bound again (so parents are never created in an owner directory). A form
+  under the projects root outside the project is exposed as the file, as the
+  agent already was. A symlinked name is bound as a file showing its target.
+- Each bound form, and a product executable wherever it lies unless a
+  read-only anchor already covers it, gets a `ro:` plan entry: bound onto
+  itself `ro=recursive`, so the worker cannot rewrite the binary the owner's
+  ticker runs. The agent otherwise keeps the mode of the view it lies in (an
+  agent in its writable execution home stays as before); a system dependency
+  (the loader in `/usr/lib`) is left to the host view.
+- The agent is no longer a needed path for the directory keep, so an agent
+  under `/tmp` exposes only itself.
+- Fails closed: an executable (either form) inside a hidden location is
+  refused before any effect, so a secret is never exposed to run it; more than
+  seven keeps per scratch directory or exposures under the root is refused; a
+  missing executable is skipped (the worker then fails to run it).
+- `LaunchInputs`, IDs and approval digests are unchanged. The sandbox argv (the
+  per-launch `command_digest` fence) changes only when an executable lies in a
+  scratch directory, under the root, or outside a read-only anchor.
+
+### Evidence
+
+- The five failing tests pass with `CARGO_TARGET_DIR` under `/tmp` and under
+  `~/git`.
+- `review_signer::isolated_worker_cannot_read_the_signer_key` now runs the
+  product binary through a link in its own `/tmp` directory, beside a planted
+  `owner-secret`: in the sandbox the directory lists only `herdr-projects`,
+  the sibling is `DENIED` and its sentinel never appears, the binary is not
+  writable (`[ -w ]` fails), and `review signer status`/`run` still run and
+  refuse the worker context; the owner's control run reads the sibling and
+  can write the binary.
+
 ## Designed, not built
 
 ### Coordinator and legacy thread agents (residual risk 7)
@@ -897,4 +969,22 @@ Host under heavy unrelated load throughout (load average 15–22 on 12 cores).
   a 300 ms deadline under load, unrelated code), which passed alone three
   times and in a full `--lib` re-run (612).
 - Default features, `--test cli --bin herdr-projects`: 30 and 284 pass.
+- No new clippy warnings in changed files.
+
+### Tests run (executables in private scratch directories)
+
+- `CARGO_TARGET_DIR` under `/tmp`: `cargo test --features state-store
+  --no-fail-fast --test canonical_worker --test review_signer --test
+  quality_certification`: canonical_worker 21, review_signer 3,
+  quality_certification 8 pass (before the fix, four `canonical_worker`
+  isolation tests and `isolated_worker_cannot_read_the_signer_key` failed
+  with such a target).
+- `CARGO_TARGET_DIR` under `~/git`: the same plus `--test cli --bin
+  herdr-projects`: canonical_worker 21, review_signer 3,
+  quality_certification 8 pass; cli 80 of 81 and bin 363 of 365 in that run
+  (`ticker_canonical_finalization_preserves_once_and_recovers_receipt_after_restart`,
+  `artifacts::live::tests::live_section_limits_do_not_expand_the_combined_preservation_limit`,
+  `cleanup::tests::retained_branch_reopens_and_git_refusal_keeps_source`,
+  none of which runs the sandbox, while another suite loaded the machine);
+  all three pass alone.
 - No new clippy warnings in changed files.
