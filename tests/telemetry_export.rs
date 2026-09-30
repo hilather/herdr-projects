@@ -182,8 +182,8 @@ fn export_reconciles_with_query_and_round_trips() {
     let m01 = metric(&doc, "M01");
     assert_eq!((&m01["value"], &m01["value_type"], &m01["denominator"], &m01["missing"]), (&json!(2), &json!("integer"), &Value::Null, &json!({"denominator": "not_applicable:no_denominator"})));
     let m49 = metric(&doc, "M49");
-    assert_eq!((&m49["status"], &m49["value"], &m49["value_status"]), (&json!("unavailable"), &Value::Null, &json!("unavailable:awaiting_replay_suite")));
-    assert_eq!(m49["missing"], json!({"value": "unavailable:awaiting_replay_suite", "numerator": "unavailable:awaiting_replay_suite", "denominator": "unavailable:awaiting_replay_suite"}));
+    assert_eq!((&m49["status"], &m49["value"], &m49["value_status"]), (&json!("unavailable"), &Value::Null, &json!("unavailable:no_replay_suite")));
+    assert_eq!(m49["missing"], json!({"value": "unavailable:no_replay_suite", "numerator": "unavailable:no_replay_suite", "denominator": "unavailable:no_replay_suite"}));
 
     // Reconcile with the query service, field for field.
     let q = p.json(&["query", "--json", "--metric", "M01,M02,M07,M49"]);
@@ -214,7 +214,7 @@ fn export_reconciles_with_query_and_round_trips() {
     assert_eq!(m02["content_digest"], metric(&doc, "M02")["projection"]["content_digest"].as_str().unwrap());
     assert_eq!((row("M01")["value"].as_str(), row("M01")["denominator"].as_str()), ("2", "not_applicable:no_denominator"));
     assert_eq!((row("M49")["value"].as_str(), row("M49")["value_status"].as_str(), row("M49")["numerator"].as_str(), row("M49")["event_cutoff"].as_str()),
-        ("unavailable:awaiting_replay_suite", "unavailable:awaiting_replay_suite", "unavailable:awaiting_replay_suite", "unavailable:no_event_in_cohort"));
+        ("unavailable:no_replay_suite", "unavailable:no_replay_suite", "unavailable:no_replay_suite", "unavailable:no_event_in_cohort"));
     let page = rows.last().unwrap();
     assert_eq!((page["page_offset"].as_str(), page["page_total"].as_str(), page["next_cursor"].as_str()), ("0", "not_applicable:no_records", "none:last_page"));
     // Round trip: every CSV metric row parses back to the JSON export's values.

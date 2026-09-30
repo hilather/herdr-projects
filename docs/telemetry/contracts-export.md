@@ -274,7 +274,7 @@ Its `M49` entry (an absent producer: typed missing values, never 0):
   },
   "coverage": {
     "reasons": {
-      "awaiting_replay_suite": null
+      "no_replay_suite": null
     },
     "state": "unavailable"
   },
@@ -290,9 +290,9 @@ Its `M49` entry (an absent producer: typed missing values, never 0):
   "lag_reason": "collection_not_run",
   "metric_id": "M49",
   "missing": {
-    "denominator": "unavailable:awaiting_replay_suite",
-    "numerator": "unavailable:awaiting_replay_suite",
-    "value": "unavailable:awaiting_replay_suite"
+    "denominator": "unavailable:no_replay_suite",
+    "numerator": "unavailable:no_replay_suite",
+    "value": "unavailable:no_replay_suite"
   },
   "name": "replay_suite_pass_rate",
   "numerator": null,
@@ -303,7 +303,7 @@ Its `M49` entry (an absent producer: typed missing values, never 0):
     "revision": null
   },
   "proxy": false,
-  "reason": "awaiting_replay_suite",
+  "reason": "no_replay_suite",
   "registry": "analytics-registry.v1",
   "source_watermarks": {
     "canonical": {
@@ -317,7 +317,7 @@ Its `M49` entry (an absent producer: typed missing values, never 0):
   "time_basis": "none",
   "unit": "ratio",
   "value": null,
-  "value_status": "unavailable:awaiting_replay_suite",
+  "value_status": "unavailable:no_replay_suite",
   "value_type": "missing",
   "window": {
     "from_unix_ms": null,
@@ -339,7 +339,7 @@ metric,M02,M02.cohort-v1,terminal_cohort,unbounded,unbounded,,,,,,available,2/3,
 cell,M02,M02.cohort-v1,terminal_cohort,unbounded,unbounded,route,none,,,,available,0/1,ratio,ratio,0,1,,,,,,live,none:live,none:live,sha256:27e09cb91d16e790752ac949b106d0b8c0842ff4a998858710db64445b7d7c1e,live,,,,,,
 cell,M02,M02.cohort-v1,terminal_cohort,unbounded,unbounded,route,verify_only,,,,available,1/1,ratio,ratio,1,1,,,,,,live,none:live,none:live,sha256:27e09cb91d16e790752ac949b106d0b8c0842ff4a998858710db64445b7d7c1e,live,,,,,,
 cell,M02,M02.cohort-v1,terminal_cohort,unbounded,unbounded,route,verify_then_integrate,,,,available,1/1,ratio,ratio,1,1,,,,,,live,none:live,none:live,sha256:27e09cb91d16e790752ac949b106d0b8c0842ff4a998858710db64445b7d7c1e,live,,,,,,
-metric,M49,M49.v1,activity_window,unbounded,unbounded,,,,,,unavailable:awaiting_replay_suite,unavailable:awaiting_replay_suite,missing,ratio,unavailable:awaiting_replay_suite,unavailable:awaiting_replay_suite,{},unavailable,unknown:coverage_unavailable,unknown:coverage_unavailable,not_applicable:not_a_cost_metric,live,none:live,none:live,sha256:0392b968194aadadc3046e7d5b134a90e21d86666424040e3f2506a0ea9d4db4,live,unavailable:no_event_in_cohort,2026-09-30T11:12:11.11Z,,,,
+metric,M49,M49.v1,activity_window,unbounded,unbounded,,,,,,unavailable:no_replay_suite,unavailable:no_replay_suite,missing,ratio,unavailable:no_replay_suite,unavailable:no_replay_suite,{},unavailable,unknown:coverage_unavailable,unknown:coverage_unavailable,not_applicable:not_a_cost_metric,live,none:live,none:live,sha256:0392b968194aadadc3046e7d5b134a90e21d86666424040e3f2506a0ea9d4db4,live,unavailable:no_event_in_cohort,2026-09-30T11:12:11.11Z,,,,
 page,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,0,not_applicable:no_records,none:last_page
 ```
 

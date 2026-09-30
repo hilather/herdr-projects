@@ -187,7 +187,7 @@ and after a verified, integrated, then reverted fix
 ```text
 demo · health view · window [-inf, +inf) · live
   M40 quota headroom at dispatch: n/a (no_decisions) · basis central_report · coverage unknown · n=0 · lag n/a (collection_not_run) · live
-  M49 replay suite pass rate: n/a (awaiting_replay_suite) · basis no_producer · coverage unavailable · n=n/a · lag n/a (collection_not_run) · live
+  M49 replay suite pass rate: n/a (no_replay_suite) · basis central_report · coverage unavailable · n=n/a · lag n/a (collection_not_run) · live
   sources canonical: events_head=0 last_event=3100
   sources sidecar: n/a (collection_not_run)
   family services: 3 metrics, 2 unavailable, lag n/a (collection_not_run)
