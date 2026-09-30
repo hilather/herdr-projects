@@ -351,10 +351,47 @@ Cards (gaps that stop those questions being answered):
 - **DG3 M03 accepted throughput** lacks operating hours
   (`operating_hours_not_recorded`). Record the ticker's active intervals per
   project (it already publishes pass metrics) as the denominator.
-- **DG4 Claude adapter (owner decision).** Deferred in contracts.md §8.
-  Without it a Claude-versus-Codex comparison has no Claude side. It needs a
-  scope decision: collection surface, privacy class, and whether Claude may
-  run as a product worker. Standing policy is Codex only for product runs.
+- **DG4 Harness coverage (owner decision, 2026-09-30).** "Codex only"
+  governs our build and test work, not product scope. The telemetry must
+  support all the common agent harnesses. Approach: a generic OTLP receiver
+  first, then native session-file adapters for exact, certified data. Every
+  adapter follows the Codex adapter's rules:
+  - sanitizer allowlist (metadata plus short redacted excerpts; never prompts,
+    transcripts or code);
+  - capability table with `live`/`fixture`/`none` basis;
+  - binding to canonical attempts;
+  - conformance fixtures;
+  - live certification per harness version before its fields count as
+    certified. Live runs spend that tool's usage, so ask the owner first.
+
+  Launch support is separate: the product knows only `codex` and `claude`
+  worker kinds (`profile_config::observed_version`). Each new harness needs a
+  worker kind (version probe, launch arguments, isolation profile) before it
+  can run as a product worker. Its telemetry can be collected before that,
+  from sessions run outside the product.
+  - **DG4a OTLP receiver** (deferred in contracts.md §8). A local
+    OpenTelemetry logs/metrics endpoint in the collector lane. It maps each
+    harness's documented OTel usage, tool and error events onto the existing
+    usage ledger and tool tables, with a per-harness mapping table and source
+    trust `collector_observed`. It binds to attempts through the same
+    execution-home/cwd/time rules as rollouts. It covers every OTel-capable
+    harness at once: Claude Code, Gemini CLI, Codex, and others where
+    supported.
+  - **DG4b Claude Code native adapter.** Reads Claude Code session
+    transcripts (`~/.claude/projects/<project>/<session>.jsonl`) for per-turn
+    usage (input/output/cache tokens), model, tool calls and results
+    (metadata only), subagents and compaction. Claude Code is already a
+    product worker kind, so this is first among the native adapters.
+  - **DG4c Gemini CLI native adapter.** Local session logs, plus its OTel
+    export through DG4a.
+  - **DG4d OpenCode native adapter.** Local session storage; multi-provider,
+    so the model/provider fields matter for M15.
+  - **DG4e Grok.** The owner uses it (first wave). First step: confirm which
+    Grok CLI harness the owner runs and what it records locally or over OTel.
+    Then the OTLP mapping or a native adapter.
+  - **DG4f second wave:** Cursor (`cursor-agent`), GitHub Copilot CLI, Amp,
+    Aider. OTLP mapping where the harness supports it; otherwise a native
+    adapter if its local records are stable enough to certify.
 - **DG5 cost M04/M12 (external).** Needs real rate cards and provider charges
   imported by the owner (contracts-accounting.md). Still blocked.
 - **DG6 verification flake signal.** Nothing distinguishes "passes alone,

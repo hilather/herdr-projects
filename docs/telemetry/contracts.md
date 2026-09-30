@@ -579,8 +579,10 @@ no code path may read it.
 M33 typed attention reasons; transactional outbox (TM0.4);
 budget bridge enforcement and any change to `UnknownUsagePolicy` (TM2.4;
 the shadow bridge landed, contracts-accounting.md §14);
-Claude and OTLP adapters; candidate-group races; resume/compaction
+candidate-group races; resume/compaction
 reconciliation beyond quarantine.
+
+Planned, no longer deferred (owner decision 2026-09-30): harness coverage beyond Codex: an OTLP receiver first, then native adapters for Claude Code, Gemini CLI, OpenCode and Grok, and a second wave (Cursor, GitHub Copilot CLI, Amp, Aider). Cards DG4a–DG4f in [phase2-lanes.md](phase2-lanes.md).
 
 Landed since this list was first written: the worker submission spool and
 Git quarantine (docs/reviews/2026-09-29-worker-isolation.md), randomized
