@@ -51,7 +51,41 @@ impl From<rusqlite::Error> for StoreError {
 type Result<T> = std::result::Result<T, StoreError>;
 
 pub struct SqliteStore { connection: Connection }
+// Replay recording composes existing services under one outer transaction.
+enum MutationTransaction<'a> {
+    Transaction(rusqlite::Transaction<'a>),
+    Savepoint(rusqlite::Savepoint<'a>),
+}
+impl std::ops::Deref for MutationTransaction<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection { match self { Self::Transaction(tx) => tx, Self::Savepoint(tx) => tx } }
+}
+impl MutationTransaction<'_> {
+    fn commit(self) -> rusqlite::Result<()> { match self { Self::Transaction(tx) => tx.commit(), Self::Savepoint(tx) => tx.commit() } }
+}
+fn mutation_transaction(connection: &mut Connection) -> rusqlite::Result<MutationTransaction<'_>> {
+    if connection.is_autocommit() {
+        Ok(MutationTransaction::Transaction(connection.transaction_with_behavior(TransactionBehavior::Immediate)?))
+    } else {
+        Ok(MutationTransaction::Savepoint(connection.savepoint()?))
+    }
+}
 impl SqliteStore {
+    /// Internal composition of store operations only; no external effects.
+    pub(crate) fn atomic_replay<T>(&mut self, record: impl FnOnce(&mut Self) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = record(self);
+        match result {
+            Ok(value) => {
+                if let Err(error) = self.connection.execute_batch("COMMIT") {
+                    let _ = self.connection.execute_batch("ROLLBACK");
+                    return Err(error.into());
+                }
+                Ok(value)
+            }
+            Err(error) => { self.connection.execute_batch("ROLLBACK")?; Err(error) }
+        }
+    }
     /// Explicit initialization only. Parent must already exist on local storage.
     /// Never replaces an existing database or switches legacy project authority.
     pub fn create(path: &Path) -> Result<Self> {
@@ -174,7 +208,11 @@ impl SqliteStore {
         self.read_snapshot_with_budget(at, None)
     }
     fn read_snapshot_with_budget(&mut self, at: Option<u64>, budget: Option<&read_budget::ReadBudget>) -> Result<Snapshot> {
-        let tx = self.connection.transaction()?;
+        let tx = if self.connection.is_autocommit() {
+            MutationTransaction::Transaction(self.connection.transaction()?)
+        } else {
+            MutationTransaction::Savepoint(self.connection.savepoint()?)
+        };
         check_schema(&tx)?;
         let head = head(&tx)?;
         if let Some(at) = at { if at != head { return Err(StoreError::HistoryUnavailable(at)); } }
@@ -232,7 +270,7 @@ impl SqliteStore {
             if batch_bytes > 16 * MAX_RECORD_BYTES { return Err(StoreError::Invalid("batch exceeds 16 MiB".into())); }
             encoded.push(value);
         }
-        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = mutation_transaction(&mut self.connection)?;
         check_schema(&tx)?;
         if head(&tx)? != commit.expected_head { return Err(StoreError::Conflict); }
         let now = jiff::Timestamp::now().as_millisecond();

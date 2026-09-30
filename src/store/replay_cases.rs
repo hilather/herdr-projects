@@ -311,7 +311,7 @@ impl SqliteStore {
     /// Record one replay run over `cases` (eligible, unretired cases of `suite`).
     #[allow(clippy::too_many_arguments)]
     pub fn record_replay_run(&mut self, run_id: &str, suite: &str, configuration: &str, subset: &str, seed: &str, cases: &[String], principal: &str, now: i64) -> Result<i64> {
-        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = super::mutation_transaction(&mut self.connection)?;
         schema_replay(&tx)?;
         replay_authority(&tx, principal)?;
         for case in cases {
@@ -337,7 +337,7 @@ impl SqliteStore {
     }
 
     pub fn register_replay_candidate(&mut self, task: &str, run_id: &str, suite: &str, case: &str, repository: &str, principal: &str, now: i64) -> Result<()> {
-        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = super::mutation_transaction(&mut self.connection)?;
         schema_replay(&tx)?;
         replay_authority(&tx, principal)?;
         tx.execute("INSERT INTO replay_candidates(task_id,run_id,suite_version,case_id,repository,registered_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",

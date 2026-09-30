@@ -133,7 +133,7 @@ impl SqliteStore {
         let result=head(&tx)?;if let Some(budget)=budget {budget.check()?;}tx.commit()?;Ok(result)
     }
     pub fn queue_task(&mut self,id:&TaskId,revision:u64,head_expected:u64,request:&QueueRequest,now:i64)->Result<u64> {
-        let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx=super::mutation_transaction(&mut self.connection)?;
         let result=read_budget::with_local_deadline(&tx, |budget| queue_task_on(&tx,id,revision,head_expected,request,now,budget))?;
         tx.commit()?;Ok(result)
     }

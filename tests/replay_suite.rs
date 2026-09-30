@@ -75,6 +75,44 @@ fn extraction_golden_contamination_counts_and_reproducible_subset() {
     assert_eq!(lab.db().query_row("SELECT count(*) FROM replay_runs", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
 }
 
+/// A stale CLI head is checked after staging and leaves neither repositories
+/// nor a partially recorded run or queued candidate.
+#[test]
+fn stale_run_head_cleans_staged_repositories_without_recording() {
+    let mut lab = Lab::new("unknown_usage='allow_with_warning'");
+    lab.build_history();
+    lab.replay(&["extract", "--suite", "v1"]);
+    let old_head = lab.head();
+    lab.ok(&["task", "demo", "add", "unrelated", "--title", "unrelated", "--expected-head", &old_head.to_string()]);
+    let before = lab.state();
+    let error = lab.fail(&["replay", "demo", "run", "--suite", "v1", "--configuration", "manual", "--subset", "stratified:3", "--seed", "alpha", "--expected-head", &old_head.to_string()]);
+    assert!(error.contains(&format!("project head is {}, expected {old_head}", before.head)), "{error}");
+    assert_eq!(lab.replay(&["show", "--suite", "v1"])["runs"], json!([]));
+    let after = lab.state();
+    assert_eq!(after.head, before.head);
+    assert_eq!(after.tasks, before.tasks);
+    assert_eq!(after.scheduler.unwrap().queue, before.scheduler.unwrap().queue);
+    let repos = lab.root().join(".replay/demo/repos/v1");
+    assert_eq!(fs::read_dir(repos).unwrap().count(), 0);
+}
+
+/// A late store error rolls back even the run and earlier candidates.
+#[test]
+fn failed_run_store_step_rolls_back_and_cleans_repositories() {
+    let mut lab = Lab::new("unknown_usage='allow_with_warning'");
+    lab.build_history();
+    lab.replay(&["extract", "--suite", "v1"]);
+    lab.db().execute_batch("CREATE TRIGGER refuse_replay_candidate BEFORE INSERT ON replay_candidates BEGIN SELECT RAISE(ABORT, 'fixture store failure'); END").unwrap();
+    let before = lab.state();
+    lab.fail(&["replay", "demo", "run", "--suite", "v1", "--configuration", "manual", "--subset", "stratified:3", "--seed", "alpha", "--expected-head", &before.head.to_string()]);
+    assert_eq!(lab.replay(&["show", "--suite", "v1"])["runs"], json!([]));
+    let after = lab.state();
+    assert_eq!(after.head, before.head);
+    assert_eq!(after.tasks, before.tasks);
+    assert_eq!(after.scheduler.unwrap().queue, before.scheduler.unwrap().queue);
+    assert_eq!(fs::read_dir(lab.root().join(".replay/demo/repos/v1")).unwrap().count(), 0);
+}
+
 /// Run one replay of v1 and install its drafted contract: the task is an
 /// ordinary queued task whose contract is verify-only over a replay
 /// repository at the case's base, with one hidden-check policy.

@@ -348,26 +348,63 @@ fn replay_repository(source: &Path, dest: &Path, format: &str, base: &str, contr
     Ok(dest.canonicalize()?)
 }
 
+struct RunStaging { path: PathBuf, retained: bool }
+impl RunStaging {
+    fn new(parent: &Path) -> Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        loop {
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = parent.join(format!(".run-{}-{id}", std::process::id()));
+            match fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => return Ok(Self { path, retained: false }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
+impl Drop for RunStaging {
+    fn drop(&mut self) { if !self.retained { let _ = fs::remove_dir_all(&self.path); } }
+}
+
 fn run_suite(project: &Path, suite: &str, configuration: &str, subset: &str, seed: &str, expected_head: u64) -> Result<Value> {
-    let _guard = migration::runtime_mutation(project)?;
-    let mut db = migration::open_active(project)?;
-    // The operator's run holds project mutation ownership while it builds the
-    // replay repositories, so it is bounded; generously, since packing a
-    // case's base history scales with the repository.
     let control = crate::store::controlled::ReadControl::new(std::time::Instant::now() + std::time::Duration::from_secs(600), Default::default());
-    run_suite_owned(project, &mut db, suite, configuration, subset, seed, expected_head, &control, &[])
+    let cases = draw_run(project, suite, configuration, subset, seed, &control)?;
+    let repos = replay_dir(project)?.join("repos").join(suite);
+    private_dir(&repos)?;
+    // Atomic directory creation keeps simultaneous draws independent. Drop
+    // removes all repositories on Git, lock, head-check or store failure.
+    let mut staging = RunStaging::new(&repos)?;
+    let repositories = cases.iter().map(|case| replay_repository(Path::new(&case.repository), &staging.path.join(&case.case_id), &case.object_format, &case.base_oid, &control, &[])).collect::<Result<Vec<_>>>()?;
+    let result = {
+        let _guard = migration::runtime_mutation(project)?;
+        let mut db = migration::open_active(project)?;
+        db.atomic_replay(|db| record_run(db, suite, configuration, subset, seed, expected_head, &cases, &control,
+            |index, _, _| Ok(repositories[index].clone())))?
+    };
+    staging.retained = true;
+    Ok(result)
 }
 
 /// Caller must hold project mutation ownership (signed routine execution).
 #[allow(clippy::too_many_arguments)] // Mirrors the replay CLI plus owned store and execution budget.
 pub(crate) fn run_suite_owned(project: &Path, db: &mut crate::store::SqliteStore, suite: &str, configuration: &str, subset: &str, seed: &str, expected_head: u64, control: &crate::store::controlled::ReadControl, locks: &[crate::runner::InheritedLock]) -> Result<Value> {
+    let cases = draw_run(project, suite, configuration, subset, seed, control)?;
+    let repos = replay_dir(project)?.join("repos").join(suite);
+    record_run(db, suite, configuration, subset, seed, expected_head, &cases, control, |_, seq, case| {
+        replay_repository(Path::new(&case.repository), &repos.join(seq.to_string()).join(&case.case_id), &case.object_format, &case.base_oid, control, locks)
+    })
+}
+
+fn draw_run(project: &Path, suite: &str, configuration: &str, subset: &str, seed: &str, control: &crate::store::controlled::ReadControl) -> Result<Vec<ReplayCaseRecord>> {
     control.check()?;
     label(configuration, "configuration label")?;
     let n = parse_subset(subset)?;
     let (cases, _) = eligible(&*read(project)?, suite)?;
     let chosen = select(suite, &cases, n, seed)?;
     ensure!(!chosen.is_empty(), "replay suite {suite} has no eligible case");
-    let chosen_cases: Vec<&ReplayCaseRecord> = chosen.iter().map(|id| cases.iter().find(|c| &c.case_id == id).unwrap()).collect();
+    let chosen_cases: Vec<ReplayCaseRecord> = chosen.iter().map(|id| cases.iter().find(|c| &c.case_id == id).unwrap().clone()).collect();
     // The source repository holds the accepted change and its tests: each
     // candidate's own sandbox hides it (and the check store) at launch,
     // derived from this registry (`canonical_worker::resources::launch_hides`),
@@ -381,18 +418,24 @@ pub(crate) fn run_suite_owned(project: &Path, db: &mut crate::store::SqliteStore
                 "hidden check {sha} of case {} no longer applies: retire the case", case.case_id);
         }
     }
+    Ok(chosen_cases)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_run(db: &mut crate::store::SqliteStore, suite: &str, configuration: &str, subset: &str, seed: &str, expected_head: u64, chosen_cases: &[ReplayCaseRecord], control: &crate::store::controlled::ReadControl,
+    mut repository_for: impl FnMut(usize, i64, &ReplayCaseRecord) -> Result<PathBuf>) -> Result<Value> {
+    let chosen: Vec<String> = chosen_cases.iter().map(|case| case.case_id.clone()).collect();
     let head = db.read_snapshot(None)?.head;
     ensure!(head == expected_head, "project head is {head}, expected {expected_head}");
     let run_id = format!("sha256:{}", hex(json!({"suite": suite, "configuration": configuration, "subset": subset, "seed": seed, "cases": chosen, "head": head}).to_string().as_bytes()));
     control.check()?;
     let seq = db.record_replay_run(&run_id, suite, configuration, subset, seed, &chosen, REPLAY_PRINCIPAL, now())?;
-    let repos = replay_dir(project)?.join("repos").join(suite);
     let mut head = head;
     let mut tasks = Vec::new();
     for (index, case) in chosen_cases.iter().enumerate() {
         control.check()?;
         // One repository per run and case: a candidate imported by one run is never visible to another.
-        let repository = replay_repository(Path::new(&case.repository), &repos.join(seq.to_string()).join(&case.case_id), &case.object_format, &case.base_oid, control, locks)?;
+        let repository = repository_for(index, seq, case)?;
         let task = TaskId::new(format!("replay-{suite}-{seq}-{}", index + 1)).map_err(anyhow::Error::msg)?;
         head = db.commit(crate::domain::Commit { expected_head: head, mutations: vec![crate::domain::Mutation::Task { expected: None, next: crate::domain::Task { id: task.clone(), revision: 1, state: crate::domain::TaskState::Draft, title: format!("Replay {suite} {} ({configuration})", case.case_id), active_attempt: None } }] })?;
         db.register_replay_candidate(task.as_str(), &run_id, suite, &case.case_id, &repository.display().to_string(), REPLAY_PRINCIPAL, now())?;
