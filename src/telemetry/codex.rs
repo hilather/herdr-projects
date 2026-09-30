@@ -2,7 +2,7 @@
 //! `<execution_home>/.codex/sessions/**/rollout-*.jsonl`, allowlisted typed
 //! fields only, idempotent by `(session_id, ordinal)`, bound by cwd and time.
 use anyhow::Result;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Deserialize;
 use serde_json::{Number, Value, json};
 use sha2::{Digest, Sha256};
@@ -626,7 +626,9 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
     let key = digest(file.as_os_str().as_encoded_bytes());
     let Ok(mut handle) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(file) else { return Ok(0) };
     let meta = handle.metadata()?;
-    let tx = db.transaction()?;
+    // Immediate: a concurrent collector (the ticker's and the CLI's) waits for
+    // the write lock (busy timeout) instead of failing on a stale read snapshot.
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let stored = tx.query_row("SELECT device,inode,byte_offset,records,rate_limits,model,effort FROM collect_offsets WHERE path_digest=?1", [&key],
         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))).optional()?;
     let mut cursor = match stored {
@@ -1111,7 +1113,7 @@ fn reconcile_forks(db: &mut Connection) -> Result<()> {
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
     let now = jiff::Timestamp::now().as_millisecond();
     for (session, _) in sessions.into_iter().filter(|(_, version)| certified(version)) {
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         reconcile(&tx, &session, now)?;
         tx.commit()?;
     }

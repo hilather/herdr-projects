@@ -98,7 +98,8 @@ pub fn store(tx: &Connection, entries: &[Entry]) -> Result<(usize, usize)> {
                 conflict |= *disposition == "conflict";
                 let node = observed.entry(path.as_str()).or_insert((BTreeSet::new(), Some(0)));
                 node.0.insert(entry.id.as_str());
-                node.1 = node.1.zip(counters(entry)).map(|(sum, c)| sum + c[3]);
+                // A repeated response is observed but adds nothing (ledger `REPEATED`).
+                if !entry.repeated() { node.1 = node.1.zip(counters(entry)).map(|(sum, c)| sum + c[3]); }
             }
         }
         let empty = (BTreeSet::new(), Some(0));

@@ -42,6 +42,20 @@ output`, `total = input + output`; then `input_tokens` (inclusive),
   high-water total: first or higher `accepted`; equal `duplicate`; lower
   `unresolved` / `regression_without_reset` (Codex reports no reset evidence);
   counters failing `codex-v1` `unresolved` / `invariant_violation`.
+- Delta, repeated response (TM2.6, [certificate-core.md](certificate-core.md)):
+  an otherwise `accepted` record whose session already holds an accepted
+  record with the same native `response_id` and the same `payload_digest`
+  at an earlier ordinal is `duplicate` / `response_repeated`: one response
+  written twice (doc 10 §3 "Replay"). It is not counted (M08/M09), never
+  valued (§4, so an estimate stays complete) and adds nothing to its
+  rollout's `inclusive_total` (§3). The same `response_id` with another
+  payload, or in another session, is another invocation. The Codex row
+  itself stays accepted, so the steward's `usage`/`attempts` sums still
+  include it (certificate restriction R3).
+
+Sync, the collector's per-rollout pass and reprice take the sidecar write
+lock up front (immediate transactions), so a ticker pass and a CLI command
+racing on one project wait for each other (busy timeout) instead of failing.
 
 `usage_ledger(singleton, normalization_version, synced_unix_ms)` records the
 last sync.

@@ -2,7 +2,7 @@
 //! normalized from the Codex sidecar tables, read by SQL only, with one
 //! disposition per entry and rollout that observed it.
 use anyhow::Result;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -11,6 +11,10 @@ pub const NORMALIZATION: &str = "codex-v1";
 const MAX_SAFE: i64 = 1 << 53;
 const NATIVE: [&str; 6] = ["input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens"];
 const NORMALIZED: [&str; 7] = ["input_tokens", "cache_read_tokens", "new_input_tokens", "cache_write_tokens", "output_tokens", "reasoning_tokens", "total_tokens"];
+/// Disposition reason of a delta record that repeats an earlier accepted record
+/// of its session: the same native `response_id` and the same payload digest
+/// (§1). It is one invocation observed twice, never counted again.
+pub const REPEATED: &str = "response_repeated";
 
 pub struct Entry {
     pub id: String,
@@ -33,6 +37,11 @@ impl Entry {
     pub fn counted(&self) -> bool {
         self.basis == "delta" && self.provenance.iter().any(|p| p.1 == "accepted")
     }
+
+    /// A delta record repeating an earlier accepted record of its session (`REPEATED`).
+    pub fn repeated(&self) -> bool {
+        self.provenance.first().is_some_and(|p| p.2.as_deref() == Some(REPEATED))
+    }
 }
 
 /// `codex-v1`: all six native counters present, non-negative and ≤ 2^53, with
@@ -51,16 +60,24 @@ pub fn derive(db: &Connection) -> Result<Vec<Entry>> {
     let mut others = db.prepare("SELECT path_digest FROM rollout_sources WHERE session_id=?1 AND path_digest<>?2 AND records>=?3 ORDER BY path_digest")?;
     let mut stmt = db.prepare("SELECT u.session_id,u.ordinal,u.path_digest,u.response_id,u.model,u.accepted,u.reason,u.input_tokens,u.cached_input_tokens,
         u.cache_write_input_tokens,u.output_tokens,u.reasoning_output_tokens,u.total_tokens,
-        EXISTS(SELECT 1 FROM codex_quarantine q WHERE q.session_id=u.session_id AND q.ordinal=u.ordinal) FROM codex_usage u ORDER BY u.session_id,u.ordinal")?;
+        EXISTS(SELECT 1 FROM codex_quarantine q WHERE q.session_id=u.session_id AND q.ordinal=u.ordinal),u.payload_digest FROM codex_usage u ORDER BY u.session_id,u.ordinal")?;
     let mut rows = stmt.query([])?;
+    // Accepted `(session, response_id)` → payload digest, first ordinal first.
+    let mut responses = BTreeMap::<(String, String), String>::new();
     while let Some(r) = rows.next()? {
         let (session, ordinal, first): (String, i64, String) = (r.get(0)?, r.get(1)?, r.get(2)?);
         let (accepted, reason, quarantined): (bool, Option<String>, bool) = (r.get(5)?, r.get(6)?, r.get(13)?);
         let native = [r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?];
         let normalized = normalize(native);
+        let (response, digest): (Option<String>, String) = (r.get(3)?, r.get(14)?);
         let (disposition, reason) = match (quarantined, accepted, normalized) {
             (true, ..) => ("conflict", Some("payload_digest_mismatch".to_owned())),
-            (false, true, Some(_)) => ("accepted", None),
+            (false, true, Some(_)) => match response.map(|response| responses.entry((session.clone(), response))) {
+                // The same response, recorded again with the same payload: a replay, not usage.
+                Some(std::collections::btree_map::Entry::Occupied(first)) if *first.get() == digest => ("duplicate", Some(REPEATED.to_owned())),
+                Some(std::collections::btree_map::Entry::Vacant(slot)) => { slot.insert(digest); ("accepted", None) }
+                _ => ("accepted", None),
+            },
             (false, true, None) => ("unresolved", Some("normalization_refused".to_owned())),
             (false, false, _) => ("unresolved", reason),
         };
@@ -99,7 +116,8 @@ pub fn derive(db: &Connection) -> Result<Vec<Entry>> {
 /// Rebuild the ledger, session graph and model segments (§3) and quota
 /// windows (§5) from the Codex tables in one sidecar transaction; returns counts.
 pub fn sync(db: &mut Connection) -> Result<Value> {
-    let tx = db.transaction()?;
+    // Immediate: racing syncs (ticker and CLI) serialize on the write lock.
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let entries = derive(&tx)?;
     tx.execute_batch("DELETE FROM usage_dispositions; DELETE FROM usage_entries;")?;
     let mut counts = BTreeMap::<&str, usize>::new();

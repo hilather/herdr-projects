@@ -3,7 +3,7 @@
 //! files, valuations appended as calculation revisions over the synced ledger.
 //! Amounts are exact decimals; rounding happens only in the text view.
 use anyhow::{Context, Result, bail, ensure};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -519,8 +519,10 @@ fn inputs(db: &Connection) -> Result<Vec<Input>> {
         FROM usage_entries e LEFT JOIN codex_usage u ON u.session_id=e.session_id AND u.ordinal=e.position
         LEFT JOIN rollout_sources s ON s.path_digest=u.path_digest
         LEFT JOIN codex_usage_times t ON t.session_id=e.session_id AND t.ordinal=e.position
-        LEFT JOIN rollout_metadata m ON m.path_digest=u.path_digest WHERE e.basis='delta' ORDER BY e.entry_id")?;
-    let rows = stmt.query_map([], |r| Ok(Input { entry_id: r.get(0)?, session_id: r.get(1)?, source: r.get(2)?, model: r.get(3)?,
+        LEFT JOIN rollout_metadata m ON m.path_digest=u.path_digest WHERE e.basis='delta'
+        AND NOT EXISTS(SELECT 1 FROM usage_dispositions d WHERE d.entry_id=e.entry_id AND d.reason=?1) ORDER BY e.entry_id")?;
+    // A repeated response (ledger `REPEATED`) is not usage: it is never valued.
+    let rows = stmt.query_map([super::ledger::REPEATED], |r| Ok(Input { entry_id: r.get(0)?, session_id: r.get(1)?, source: r.get(2)?, model: r.get(3)?,
         q: [r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?], counted: r.get(8)?, role: r.get(9)?, attempt_id: r.get(10)?, start: r.get(11)?,
         observed: r.get(12)?, record: r.get(13)?, provider: r.get(14)? }))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -579,7 +581,8 @@ pub fn reprice(db: &mut Connection) -> Result<Value> { run(db, None) }
 pub fn tick(db: &mut Connection, budget: crate::telemetry::codex::Budget) -> Result<Value> { run(db, Some(budget)) }
 
 fn run(db: &mut Connection, gate: Option<crate::telemetry::codex::Budget>) -> Result<Value> {
-    let tx = db.transaction()?;
+    // Immediate: racing reprices serialize, so the second sees the first's revision.
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let Some(synced) = tx.query_row("SELECT synced_unix_ms FROM usage_ledger", [], |r| r.get::<_, i64>(0)).optional()? else {
         return Ok(super::unavailable("ledger_not_synced"));
     };
