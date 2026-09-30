@@ -85,3 +85,27 @@ fn path_like_task_ids_and_out_of_range_revisions_are_refused() {
     p.refused(&["task", "demo", "rename", "t-1", "--title", "overflow", "--expected-revision", &(u64::MAX - 1).to_string(), "--expected-head", &p.head().to_string()]);
     assert!(runtime::snapshot(&p.project()).unwrap().tasks.iter().all(|t| t.id.as_str() == "t-1"));
 }
+
+/// The advisory public read ignores unrelated damaged historical event bodies.
+/// Administrative snapshots still diagnose the injected corruption.
+#[test]
+fn scoped_attempt_token_inventory_ignores_unrelated_corrupt_history() {
+    let p = Project::new();
+    let out = p.cli(&["task", "demo", "add", "retired", "--title", "Retired task", "--expected-head", &p.head().to_string()]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(p.show("retired")["title"], "Retired task");
+    // Establish the scoped-open schema check before injecting a data fault,
+    // as the ticker does before a store page is damaged during normal use.
+    let control = herdr_projects::store::controlled::ReadControl::new(std::time::Instant::now() + std::time::Duration::from_secs(10), Default::default());
+    drop(migration::open_active_scoped(&p.project(), control).unwrap());
+    let raw = rusqlite::Connection::open(p.project().join(".state/state.db")).unwrap();
+    raw.execute_batch("PRAGMA ignore_check_constraints=ON").unwrap();
+    assert!(raw.execute("UPDATE events SET payload='{' WHERE entity='retired'", []).unwrap() > 0);
+    drop(raw);
+    assert!(runtime::snapshot(&p.project()).is_err());
+    let control = herdr_projects::store::controlled::ReadControl::new(std::time::Instant::now() + std::time::Duration::from_secs(10), Default::default());
+    let mut store = migration::open_active_scoped(&p.project(), control).unwrap();
+    assert!(store.attempt_tokens(None, jiff::Timestamp::now().as_millisecond() - 300_000).unwrap().entries.is_empty());
+    let out = p.cli(&["scheduler", "demo", "inspect"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}

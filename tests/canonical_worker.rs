@@ -25,6 +25,7 @@ while True:
  c,_=server.accept();f=c.makefile('rw');r=json.loads(f.readline());m=r['method'];p=r.get('params') or {}
  live='pid' in s and not os.path.exists(os.path.join(root,'vanish'))
  with open(os.path.join(root,'requests'),'a') as log:log.write(json.dumps({'method':m,'params':p})+'\n')
+ with open(os.path.join(root,'request-ids'),'a') as log:log.write(str(r['id'])+'\n')
  pane={'pane_id':'w1:p1','workspace_id':'w1','tab_id':'w1:t1','terminal_id':'term1','cwd':s.get('cwd')}
  if os.path.exists(os.path.join(root,'changed-terminal')):pane['terminal_id']='replacement-terminal'
  kind=open(os.path.join(root,'agent-kind')).read() if os.path.exists(os.path.join(root,'agent-kind')) else 'claude'
@@ -1978,4 +1979,34 @@ fn canonical_attempt_sidebar_clears_after_termination_in_an_active_project() {
     assert_eq!(lab.attempt(&attempt).state, AttemptState::Cancelled);
     let last = lab.requests().into_iter().rev().find(|(m, _)| m == "pane.report_metadata").unwrap().1;
     assert_eq!((last["pane_id"].clone(), last["tokens"].clone()), (json!("w1:p1"), json!({"telemetry":null})));
+}
+
+/// A real launched/cancelled worker with an aged termination observation must
+/// not enter the decoration queue, even when its retained pane is still present.
+#[test]
+fn canonical_attempt_sidebar_expired_termination_offers_no_job_or_native_request() {
+    let mut lab = Lab::new("unknown_usage='allow_with_warning'");
+    let (_, attempt) = lab.reserve("Retained instructions");
+    lab.serve();
+    lab.run_until(120, &|| lab.requests().iter().any(|(m, p)| m == "pane.report_metadata" && p["tokens"]["telemetry"] == "claude ○"));
+    let running = lab.attempt(&attempt);
+    lab.ok(&["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &running.revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "expired sidebar fixture"]);
+    lab.run_until(90, &|| lab.attempt(&attempt).termination_observed);
+    // Deterministic clock fixture: age the retained observation rather than
+    // sleeping for five minutes. Launch, stop, ownership and routes are real.
+    let old = jiff::Timestamp::now().as_millisecond() - 301_000;
+    let db = rusqlite::Connection::open(lab.project.join(".state/state.db")).unwrap();
+    assert_eq!(db.execute("UPDATE events SET payload=json_set(payload,'$.observed_unix_ms',?1) WHERE kind='runtime.worker_terminated' AND entity=?2", rusqlite::params![old, attempt.as_str()]).unwrap(), 1);
+    drop(db);
+    let control = herdr_projects::store::controlled::ReadControl::new(Instant::now() + Duration::from_secs(10), Default::default());
+    let mut store = migration::open_active_scoped(&lab.project, control).unwrap();
+    assert!(store.attempt_tokens(None, jiff::Timestamp::now().as_millisecond() - 300_000).unwrap().entries.is_empty());
+    drop(store);
+    fs::write(lab.path("lab/requests"), "").unwrap();
+    fs::write(lab.path("lab/request-ids"), "").unwrap();
+    lab.run_passes(4);
+    let ids = fs::read_to_string(lab.path("lab/request-ids")).unwrap();
+    assert!(!ids.lines().any(|id| id.starts_with("attempt-tokens-")), "{ids}");
+    assert_eq!(lab.count("pane.report_metadata"), 0, "{:?}", lab.requests());
+    assert_eq!(lab.attempt(&attempt).state, AttemptState::Cancelled);
 }

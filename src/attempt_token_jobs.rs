@@ -1,16 +1,17 @@
 //! Advisory canonical pane decoration. No operation, claim or receipt is written.
 use crate::{
-    runner::{Cmd, InheritedLock, Output, Runner},
+    runner::{Cmd, Output, RealRunner, Runner},
     source_tree::Control,
 };
 use anyhow::{Context, Result, ensure};
-use herdr_projects::{domain::*, execution_guard::ProjectGuard, runtime};
+use herdr_projects::{domain::*, execution_guard::ProjectGuard};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 const JOB: &str = "\0herdr-projects-attempt-tokens";
@@ -26,21 +27,41 @@ struct Input {
     executable: ExecutableIdentity,
     config: herdr_projects::migration::ConfigReference,
 }
-fn snapshot(path: &Path, control: &Control) -> Result<Snapshot> {
+fn rows(
+    path: &Path,
+    binding: Option<&str>,
+    control: &Control,
+) -> Result<herdr_projects::store::attempt_tokens::Rows> {
     control.check()?;
-    runtime::snapshot_controlled(
+    herdr_projects::migration::open_active_scoped(
         path,
-        &herdr_projects::store::controlled::ReadControl::new(
+        herdr_projects::store::controlled::ReadControl::new(
             control.deadline,
             control.cancellation.clone(),
         ),
+    )?
+    .attempt_tokens(
+        binding,
+        jiff::Timestamp::now().as_millisecond() - crate::coordinator::TOKEN_TTL.as_millis() as i64,
     )
+    .map_err(Into::into)
+}
+// Volatile scheduling hints only: bounded by project/attempt inventory and TTL.
+#[derive(Default)]
+struct Hints {
+    cursors: BTreeMap<PathBuf, (String, Instant)>,
+    sent: BTreeMap<String, (String, Instant)>,
+}
+fn hints() -> &'static Mutex<Hints> {
+    static HINTS: OnceLock<Mutex<Hints>> = OnceLock::new();
+    HINTS.get_or_init(|| Mutex::new(Hints::default()))
 }
 impl Input {
     // A revoked claim permits only erasure on the unchanged retained route.
     // A replacement claim or binding forbids even erasure: that pane is no
     // longer ours. The native TTL bounds any decoration on an unreachable route.
-    fn current(&self, guard: &ProjectGuard, control: &Control) -> Result<bool> {
+    fn current(&self, control: &Control) -> Result<Option<bool>> {
+        let guard = ProjectGuard::acquire(&self.project)?;
         guard.check_project(&self.project)?;
         let m = std::fs::metadata(&self.project)?;
         ensure!(
@@ -65,70 +86,41 @@ impl Input {
             control.deadline,
             control.cancellation.clone(),
         )?;
-        let state = snapshot(&self.project, control)?;
+        let state = rows(&self.project, Some(&self.binding.id), control)?;
+        let entry = state
+            .entries
+            .first()
+            .context("attempt token binding missing")?;
         ensure!(
-            state
-                .runtime_bindings
-                .iter()
-                .find(|b| b.id == self.binding.id)
-                == Some(&self.binding),
+            entry.binding == self.binding,
             "attempt token binding changed"
         );
         ensure!(
-            !state
-                .runtime_bindings
-                .iter()
-                .any(|b| b.id != self.binding.id
-                    && b.identity.socket == self.binding.identity.socket
-                    && b.identity.machine == self.binding.identity.machine
-                    && b.identity.pane_id == self.binding.identity.pane_id),
-            "attempt token pane is shared"
-        );
-        let owner = state
-            .ownership
-            .iter()
-            .find(|o| o.binding == self.binding.id);
-        ensure!(
-            owner.is_none() || owner == Some(&self.ownership),
+            entry.retained == self.ownership
+                && (entry.owner.is_none() || entry.owner.as_ref() == Some(&self.ownership)),
             "attempt token ownership changed"
         );
-        let attempt = state
-            .attempts
-            .iter()
-            .find(|a| a.id == self.started.attempt)
-            .context("attempt token attempt missing")?;
-        let collector_revoked = herdr_projects::telemetry::collectors::binding_revoked(
-            &self.project,
-            self.started.attempt.as_str(),
-        )?;
+        ensure!(
+            entry.started == self.started,
+            "attempt token launch changed"
+        );
         control.check()?;
-        Ok(!collector_revoked
-            && owner.is_some()
-            && matches!(
-                attempt.state,
-                AttemptState::Running | AttemptState::AwaitingInput
-            )
-            && !attempt.termination_observed
-            && state
-                .control
-                .as_ref()
-                .is_some_and(|c| c.state == ProjectState::Active && !c.reconciliation_required))
+        Ok((entry.publishing
+            || entry.cleanup_ms.is_some_and(|ms| {
+                jiff::Timestamp::now().as_millisecond() - ms
+                    < crate::coordinator::TOKEN_TTL.as_millis() as i64
+            }))
+        .then_some(entry.publishing))
     }
-    fn call(
-        &self,
-        method: &str,
-        params: Value,
-        control: &Control,
-        locks: &[InheritedLock],
-    ) -> Result<Value> {
-        self.call_checked(method, params, control, locks, || Ok(()))
+
+    fn call(&self, method: &str, params: Value, control: &Control) -> Result<Value> {
+        self.call_checked(method, params, control, || Ok(()))
     }
     fn call_checked(
         &self,
         method: &str,
         params: Value,
         control: &Control,
-        locks: &[InheritedLock],
         preflight: impl FnOnce() -> Result<()>,
     ) -> Result<Value> {
         control.check()?;
@@ -154,12 +146,11 @@ impl Input {
             ))? == self.started.session,
             "attempt token session changed before request"
         );
-        let out = herdr_projects::supervision::run(
-            cmd,
-            control.deadline,
-            control.cancellation.clone(),
-            locks,
-        )?;
+        // Advisory bridge requests use the normal bounded process runner,
+        // whose spawns pass through GatedSpawn. They transfer no effect locks.
+        cmd.deadline = Some(control.deadline);
+        cmd.cancellation = Some(control.cancellation.clone());
+        let out = RealRunner.run(&cmd)?;
         control.check()?;
         ensure!(
             herdr_projects::canonical_worker::session_identity(Path::new(
@@ -178,8 +169,8 @@ impl Input {
             .cloned()
             .context("attempt token result missing")
     }
-    fn observe(&self, control: &Control, locks: &[InheritedLock], publishing: bool) -> Result<()> {
-        let panes = self.call("pane.list", json!({}), control, locks)?;
+    fn observe(&self, control: &Control, publishing: bool) -> Result<bool> {
+        let panes = self.call("pane.list", json!({}), control)?;
         let panes = panes["panes"]
             .as_array()
             .context("attempt token pane inventory missing")?;
@@ -191,6 +182,9 @@ impl Input {
             .iter()
             .filter(|p| p["pane_id"] == self.binding.identity.pane_id)
             .collect();
+        if matched.is_empty() && !publishing {
+            return Ok(false);
+        }
         ensure!(matched.len() == 1, "attempt token pane absent or ambiguous");
         let pane = matched[0];
         for (key, expected) in [
@@ -204,7 +198,7 @@ impl Input {
                 "attempt token pane identity changed"
             );
         }
-        let agents = self.call("agent.list", json!({}), control, locks)?;
+        let agents = self.call("agent.list", json!({}), control)?;
         let agents = agents["agents"]
             .as_array()
             .context("attempt token agent inventory missing")?;
@@ -230,26 +224,24 @@ impl Input {
                 "attempt token agent changed"
             );
         }
-        Ok(())
+        Ok(true)
     }
 }
 pub fn requests(path: &Path, control: &Control) -> Result<Vec<crate::executor::Request>> {
-    let state = snapshot(path, control)?;
+    let state = rows(path, None, control)?;
     let project = path.canonicalize()?;
     let m = std::fs::metadata(&project)?;
     let mut requests = Vec::new();
-    // Retained launched ownership also permits cleanup after relinquishment and
-    // across ticker restarts. Never substitute a newer binding's pane.
-    for binding in &state.runtime_bindings {
-        let Some(event) = state
-            .events
-            .iter()
-            .rev()
-            .find(|e| e.kind == "runtime.launched" && e.entity == binding.id)
-        else {
+    for entry in state.entries {
+        let binding = entry.binding;
+        let ownership = entry.retained;
+        if entry
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner != &ownership)
+        {
             continue;
-        };
-        let ownership: RuntimeOwnership = serde_json::from_value(event.payload.clone())?;
+        }
         if ownership.binding_revision != binding.revision
             || ownership.identity_digest
                 != crate::thread::sha256_hex(&serde_json::to_vec(&binding.identity)?)
@@ -257,33 +249,9 @@ pub fn requests(path: &Path, control: &Control) -> Result<Vec<crate::executor::R
         {
             continue;
         }
-        let Some(attempt) = ownership.attempt.clone() else {
-            continue;
-        };
-        // There is no suffix to erase before the first running observation.
-        if state
-            .control
-            .as_ref()
-            .is_some_and(|c| c.state == ProjectState::Active)
-            && state.attempts.iter().any(|a| {
-                a.id == attempt
-                    && matches!(a.state, AttemptState::Reserved | AttemptState::Launching)
-            })
-            && state.ownership.iter().any(|o| o == &ownership)
-        {
-            continue;
-        }
-        let Some(record) = state.attempt_inputs.iter().find(|r| r.attempt == attempt) else {
-            continue;
-        };
-        let Some(event) = state
-            .events
-            .iter()
-            .find(|e| e.kind == "runtime.launch_started" && e.entity == record.operation.as_str())
-        else {
-            continue;
-        };
-        let started: LaunchStartedReceipt = serde_json::from_value(event.payload.clone())?;
+        let attempt = entry.attempt.id;
+        let record = entry.input;
+        let started = entry.started;
         ensure!(
             started.attempt == attempt
                 && RuntimeRoute::from_identity(&binding.identity) == started.route
@@ -318,6 +286,24 @@ pub fn requests(path: &Path, control: &Control) -> Result<Vec<crate::executor::R
             command,
         });
     }
+    requests.sort_by(|a, b| a.identity.operation.cmp(&b.identity.operation));
+    let mut hints = hints().lock().unwrap_or_else(|e| e.into_inner());
+    hints
+        .cursors
+        .retain(|_, (_, at)| at.elapsed() < crate::coordinator::TOKEN_TTL);
+    if let Some((last, _)) = hints.cursors.get(&project) {
+        let offset = requests.partition_point(|r| r.identity.operation <= *last);
+        let len = requests.len();
+        if len > 0 {
+            requests.rotate_left(offset % len);
+        }
+    }
+    requests.truncate(16);
+    if let Some(last) = requests.last() {
+        hints
+            .cursors
+            .insert(project, (last.identity.operation.clone(), Instant::now()));
+    }
     Ok(requests)
 }
 fn execute(input: &Input, control: &Control) -> Result<()> {
@@ -325,10 +311,9 @@ fn execute(input: &Input, control: &Control) -> Result<()> {
         input.project.is_absolute() && input.ownership.origin == "launched",
         "invalid attempt token input"
     );
-    let guard = ProjectGuard::acquire(&input.project)?;
-    let locks = guard.inherit_transfer()?;
-    let publishing = input.current(&guard, control)?;
-    input.observe(control, &locks, publishing)?;
+    if input.current(control)?.is_none() {
+        return Ok(());
+    }
     let slug = input
         .project
         .file_name()
@@ -348,26 +333,69 @@ fn execute(input: &Input, control: &Control) -> Result<()> {
             .map(|ms| ms.max(0) / 1000),
     );
     control.check()?;
-    // The project guard spans all observations and the effect; store mutations
-    // and route replacements cannot interleave with the final authority check.
-    let publishing = input.current(&guard, control)?;
-    input.observe(control, &locks, publishing)?;
-    let publishing = input.current(&guard, control)?;
+    let Some(publishing) = input.current(control)? else {
+        return Ok(());
+    };
+    let key = crate::thread::sha256_hex(&serde_json::to_vec(input)?);
+    let decoration = if publishing {
+        suffix.clone()
+    } else {
+        String::new()
+    };
+    {
+        let mut hints = hints().lock().unwrap_or_else(|e| e.into_inner());
+        hints
+            .sent
+            .retain(|_, (_, at)| at.elapsed() < crate::coordinator::TOKEN_TTL);
+        if hints.sent.get(&key).is_some_and(|(sent, at)| {
+            sent == &decoration && at.elapsed() < crate::coordinator::TOKEN_TTL / 3
+        }) {
+            return Ok(());
+        }
+    }
+    if !input.observe(control, publishing)? {
+        hints()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sent
+            .insert(key, (decoration, Instant::now()));
+        return Ok(());
+    }
+    let publishing_now = input.current(control)?;
+    ensure!(
+        publishing_now == Some(publishing),
+        "attempt token lifecycle changed during observation"
+    );
+    // Short guarded checks fence store generations, but no effect lock spans
+    // native I/O. A lifecycle/route change can race the send after the last
+    // check. This advisory suffix grants no authority, records no success, and
+    // expires within TOKEN_TTL; the post-send check detects the race. Native
+    // route/session observations also reject replacements before each send.
     let tokens = if publishing {
         json!({"telemetry":suffix})
     } else {
         json!({"telemetry":null})
     };
-    let result = input.call_checked("pane.report_metadata", json!({"pane_id":input.binding.identity.pane_id,"source":crate::herdr::SOURCE,"ttl_ms":crate::coordinator::TOKEN_TTL.as_millis() as u64,"tokens":tokens}), control, &locks, || {
-        ensure!(input.current(&guard, control)? == publishing, "attempt token lifecycle changed before send");
+    let result = input.call_checked("pane.report_metadata", json!({"pane_id":input.binding.identity.pane_id,"source":crate::herdr::SOURCE,"ttl_ms":crate::coordinator::TOKEN_TTL.as_millis() as u64,"tokens":tokens}), control, || {
+        ensure!(input.current(control)? == Some(publishing), "attempt token lifecycle changed before send");
         Ok(())
     })?;
     ensure!(
         result["type"] == "ok",
         "attempt token response has wrong type"
     );
-    let publishing = input.current(&guard, control)?;
-    input.observe(control, &locks, publishing)?;
+    // This is only a volatile cadence hint, even if the following checks fail
+    // or the native endpoint ignored the update. A changed suffix bypasses it.
+    hints()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .sent
+        .insert(key, (decoration, Instant::now()));
+    ensure!(
+        input.current(control)? == Some(publishing),
+        "attempt token lifecycle changed during send"
+    );
+    input.observe(control, publishing)?;
     Ok(())
 }
 pub struct JobRunner {
@@ -401,7 +429,16 @@ impl Runner for JobRunner {
                 .clone()
                 .context("attempt token cancellation missing")?,
         };
-        execute(&serde_json::from_str(text)?, &control)?;
+        if let Err(error) = execute(&serde_json::from_str(text)?, &control) {
+            // The canonical controller owns priority. A nonblocking guard
+            // conflict is a skipped decoration tick, not a native failure.
+            if !matches!(
+                error.downcast_ref::<std::fs::TryLockError>(),
+                Some(std::fs::TryLockError::WouldBlock)
+            ) {
+                return Err(error);
+            }
+        }
         Ok(Output {
             code: Some(0),
             elapsed: entered.elapsed(),

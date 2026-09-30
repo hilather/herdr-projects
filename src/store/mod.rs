@@ -30,6 +30,7 @@ pub enum StoreError {
     Io(String),
 }
 pub mod controlled;
+pub mod attempt_tokens;
 pub mod integrity;
 pub(crate) mod read_budget;
 impl fmt::Display for StoreError {

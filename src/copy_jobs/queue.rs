@@ -158,12 +158,16 @@ impl Queue {
         self.prune();let key=(work.identity.project.clone(),work.identity.operation.clone());
         if self.held(&key){return Ok(());}
         if !self.entries.contains_key(&key)&&self.entries.len()>=LIMIT {
+            // Advisory attempt tokens must never evict durable-work offers or
+            // other decorations. Drop a saturated offer and rotate next tick.
+            if work.identity.operation.starts_with("tokens:attempt:") {return Ok(());}
+
             // Offers are volatile hints, not recovery authority. Rotating a full
             // inventory must not let refreshed failures exclude every new key.
             let now=Instant::now();
             let priority=|key:&Key| {let entry=&self.entries[key];(entry.work.is_none(),entry.not_before>now)};
-            let victim=self.entries.keys().filter(|key|!self.held(key)).max_by(|a,b|priority(a).cmp(&priority(b)).then_with(||self.compare(a,b))).cloned().context("copy inventory has no evictable offer")?;
-            if priority(&victim)==(false,false)&&self.compare(&key,&victim)!=std::cmp::Ordering::Less {return Ok(());}
+            let victim=self.entries.keys().filter(|key|!self.held(key)).max_by(|a,b|a.1.starts_with("tokens:attempt:").cmp(&b.1.starts_with("tokens:attempt:")).then_with(||priority(a).cmp(&priority(b))).then_with(||self.compare(a,b))).cloned().context("copy inventory has no evictable offer")?;
+            if !victim.1.starts_with("tokens:attempt:")&&priority(&victim)==(false,false)&&self.compare(&key,&victim)!=std::cmp::Ordering::Less {return Ok(());}
             self.entries.remove(&victim);
         }
         let now=Instant::now();let entry=self.entries.entry(key).or_insert(Entry{work:None,resources:Vec::new(),not_before:now,touched:now,last:0,needed:true});
@@ -191,7 +195,9 @@ impl Queue {
         let now=Instant::now();
         // Recovery/termination observations may find no new evidence. Poll them
         // at idle cadence instead of competing with every launch stage.
-        if let Some(entry)=self.entries.get_mut(&pending.key) {entry.not_before=now+if result.is_err()||pending.identity.operation=="notification"||pending.identity.operation.starts_with("tokens:"){failure_delay(&pending.identity)}else if pending.identity.operation.starts_with("canonical-worker:terminate-")||pending.identity.operation.starts_with("canonical-worker:recover:"){Duration::from_secs(15)}else{Duration::ZERO};entry.touched=now;entry.needed=result.is_err();}
+        // Attempt-token workers own suffix cadence; a change can publish on
+        // the next tick instead of waiting for thread-token cooldown.
+        if let Some(entry)=self.entries.get_mut(&pending.key) {entry.not_before=now+if result.is_err()||pending.identity.operation=="notification"||(pending.identity.operation.starts_with("tokens:")&&!pending.identity.operation.starts_with("tokens:attempt:")){failure_delay(&pending.identity)}else if pending.identity.operation.starts_with("canonical-worker:terminate-")||pending.identity.operation.starts_with("canonical-worker:recover:"){Duration::from_secs(15)}else{Duration::ZERO};entry.touched=now;entry.needed=result.is_err();}
         result.err().map(|e|format!("{} {}: background queue: {e:#}",pending.key.0,pending.key.1)).into_iter().collect()
     }
     #[cfg(any(test,not(feature="state-store")))]

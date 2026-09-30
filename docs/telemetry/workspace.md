@@ -173,6 +173,27 @@ update; native token expiry bounds decoration on a gone or changed pane.
 These metadata jobs are advisory and create no launch, reservation, approval
 or budget effect.
 
+Canonical token admission and rechecks read only selected runtime bindings,
+launch receipts, ownership, collector binding and lifecycle observations; they
+never read the whole store snapshot. Live Running/AwaitingInput attempts may
+publish. Cleanup is offered only within 300 seconds of termination,
+relinquishment, collector revocation or project pause; a missing pane during
+cleanup is already clear. Native expiry handles older observations. Each
+project offers at most 16 attempt jobs per tick, rotating through attempts;
+these offers never evict other queue entries. An unchanged suffix refreshes
+at most once per 100 seconds per ticker process, while changes publish promptly.
+
+The effect guard is acquired nonblockingly for short store and identity checks
+and released before native I/O. A busy guard skips that decoration tick.
+Binding/ownership generations, project/configuration identity and socket
+incarnation are checked immediately before and after metadata publication;
+native pane and agent identities are observed around it. A pause, revocation,
+route replacement or native terminal replacement can occur between the final
+check and the send. The post-send checks detect those changes; they cannot
+undo an already delivered suffix. This is safe for advisory metadata because
+it grants no execution authority, records no durable success and expires
+within 300 seconds even if the old route cannot be reached for cleanup.
+
 **Reasons.** `thread start --reason CODE` accepts the canonical dispatch
 log's operator reasons: `operator_selected`, `recommended`,
 `operator_preference`, `availability`, `exploration`, `replay`,

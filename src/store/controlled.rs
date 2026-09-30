@@ -406,6 +406,11 @@ impl ControlledStore {
     pub(crate) fn integrity_schema(&self)->Result<u32> {self.read(super::integrity::schema)}
     pub(crate) fn integrity_tables(&self)->Result<Vec<String>> {self.read(super::integrity::tables)}
     pub(crate) fn integrity_check_table(&self,table:&str)->Result<()> {self.read(|s|super::integrity::check_table(s,table))}
+    /// Scoped advisory decoration rows; never reads the historical snapshot.
+    pub fn attempt_tokens(&mut self, binding: Option<&str>, since: i64) -> Result<super::attempt_tokens::Rows> {
+        self.control.check()?;
+        self.store.attempt_token_rows(binding, since, &self.work_budget).map_err(|e| self.error(e))
+    }
     pub fn project_control(&self)->Result<Option<ProjectControl>> {self.read(SqliteStore::project_control)}
     pub fn import_operation_count(&self)->Result<u64> {self.read(SqliteStore::import_operation_count)}
     pub fn import_receipt(&self)->Result<(String,u64,u64)> {self.read(SqliteStore::import_receipt)}
