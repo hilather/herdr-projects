@@ -18,8 +18,10 @@ called. The 32 and 64 "active attempts" are planted rows with rollouts that a
 generator appends to. They certify nothing about 32 or 64 live workers, about
 the factory's 5/10/20/40 ramp, or about any adapter other than Codex
 0.154.0's rollout files (doc 10 §8: a 64-worker simulation is never
-extrapolated into live support). Quality producers, OTLP and traces, proxy
-signals and memory timing are not part of the generated workload (§2).
+extrapolated into live support). The P6 follow-up adds planted quality/proxy observations, integration outcomes
+and real waiting-state attention samples (§2, §4.6). Memory timing and sampled
+traces remain explicitly not produced: this product has no telemetry producer
+for either. This is not a certification of an OTLP transport.
 
 ## 1. Source, host and commands
 
@@ -27,7 +29,7 @@ signals and memory timing are not part of the generated workload (§2).
 | --- | --- |
 | Source | branch `telemetry/tm51-scale-certification` from `main` `20a763f`, plus the fixes in §5 |
 | Stores | canonical `SCHEMA = 67`; sidecar streams `codex` 3, `ingest` 8, `accounting` 11, `quality` 2, `analytics` 1, `health` 1, `policies` 1 |
-| Build | `cargo test --release --features state-store --test telemetry_scale` (rustc 1.98.0), system SQLite 3.53.4 |
+| Build | `cargo test --release --locked --offline -j 3 --features state-store --test telemetry_scale --no-run` (rustc 1.98.0), system SQLite 3.53.4 |
 | CPU / memory | Intel Core i7-8750H, 6 cores / 12 threads, 62 GiB RAM, zram swap |
 | Disk | Intel SSDPEKNW010T8 NVMe, LUKS, btrfs (`compress=zstd:3`). Every dataset lived under `bench-data/` on this disk, never on the RAM-backed `/tmp` |
 | OS | Linux 7.2.3-arch1-3 |
@@ -49,7 +51,7 @@ Phases: `scale_0_generate`, `scale_1_ingest`, `scale_2_queries`
 (`SCALE_REPEATS`, `SCALE_PER_ROUND`), `scale_3_controller` (`SCALE_REPEATS`,
 `SCALE_BLOCK_S`, `SCALE_CADENCE_MS`, `SCALE_READER_MS`,
 `SCALE_SQLITE_MEMSTATUS`), `scale_4_freshness_burst` (`SCALE_CADENCE_MS`),
-`scale_5_faults`. Each writes `results-<phase>[-<tag>].json` in the dataset
+`scale_5_faults`, `scale_6_fairness` and `scale_7_late_slow`. Each writes `results-<phase>[-<tag>].json` in the dataset
 directory. The gate test (§3) runs in the ordinary suite:
 `cargo test --features state-store --test telemetry_scale`.
 
@@ -96,9 +98,69 @@ One project, 10,000 retained identity bindings, 32 or 64 active attempts,
 
   Live appends follow the same cycle: 100 events/s steady, 1,000 events/s
   for the 60 s fault burst (doc 10's 10× normal ingress).
-- **Not generated**: quality producers (reviews, fixes, integrations), proxy
-  signals from git diffs, memory timing, OTLP spans and sampled traces,
-  multiple projects, non-Codex adapters. Their lanes ran on empty inputs.
+- **P6 quality and attention mix** (seed 5100, 100k/64): in addition to the
+  original 99,926 rollout lines / 53,714,279 B, plant the following bounded
+  observations into the product's real sidecar tables. They are simulated
+  observations, not evidence from a live reviewer or repository. Each proxy
+  references an existing first submission and pinned verification run; each
+  integration has a complete canonical operation/candidate/commit chain with
+  zero foreign-key violations. The ordinary load gate's body is unchanged;
+  its shared oracle now checks these observations through public CLI reports.
+
+  | producer | records | logical JSON bytes | mean bytes |
+  | --- | --- | --- | --- |
+  | quality `first_candidate_ci` | 5,942 | 4,160,565 | 700 |
+  | quality `integration_outcome` (14-day horizon) | 329 | 155,477 | 473 |
+  | attention `sample` | 320 | 43,328 | 135 |
+
+  The CI proxies describe the generator's accepted candidates: 4,777 clear
+  passes and 1,165 flagged net test removals (excluded from M45, never from
+  canonical acceptance). Mature integration outcomes include 108 trailer
+  reverts; 19,529 of 38,900 added lines survive, with bounded churn counts.
+  Young integrations remain censored. Five samples per active attempt use
+  source `herdr-agent-list-v1`, interval 60 s, and states `working`, `blocked`,
+  `blocked`, `working`, `idle`: a closed 120 s wait and one intervention per
+  attempt, 7,680,000 ms summed waiting. The real sampler still records genuine
+  unreachable gaps after these planted historical intervals; no server is
+  contacted. Exec timing already uses the collector's real
+  `event_msg.item_completed` / `CommandExecution` lines plus matched tool
+  call/output lines: startup timing and inferred call-to-output time, **not**
+  a claimed execution runtime.
+
+  Total mix: 106,517 observations / 58,073,649 logical B. Rollout bytes are
+  actual JSONL bytes; planted-row bytes are the serialized full column
+  payloads (no content or diff text), not fictitious collector input. The
+  ingest throughput denominator counts only rollout bytes/events, and the
+  results separately record SQLite file sizes.
+- **Late arrival and slow collection**: `scale_7_late_slow` pins an already
+  refreshed M08 window, then appends twenty real rollout lines per chunk,
+  sleeping 100 ms between chunks and collecting/syncing each bounded chunk.
+  Event times are historical active-window timestamps, separate from arrival
+  times (active-window start plus five minutes, before the pinned refresh). Each repeat
+  must append an M08 restatement superseding the pinned revision, preserve
+  its full as-of answer, match the generator's exact new counters, and pass
+  `analytics rebuild --verify`. A small public-CLI workflow also deletes and
+  recreates the sidecar, replays the producer facts, checks identical ledger
+  bytes and quality reports, and checks the canonical digest.
+- **Separate fairness workload**: `scale_6_fairness` retains the 100k/64 hot
+  project and adds three isolated 1k-event, 200-binding, four-active projects.
+  One ticker-like controller loop visits all four projects, one telemetry
+  worker processes projects sequentially, one throttled appender writes
+  100 events/s hot and 10 events/s per light project, and one reader requests
+  each project's panel and coordinator digest every configured 5 s. Telemetry
+  cadence is configurable (1 s for this stress measurement); the controller
+  never waits for telemetry or surfaces. Overdue work runs at the next
+  opportunity, without overlapping readers or unbounded threads. Three
+  15 s rounds record admission/reconcile latency, append-to-ledger freshness,
+  pass duration, panel and digest time **per project**; all usage/quality gates
+  run after draining. Fixed before measurement: each light project must have
+  observed usage and p95 freshness ≤5 s in **every** round. Results are written
+  before asserting this criterion; a miss is not hidden or retargeted.
+- **Not produced**: memory timing and sampled traces. Memory operations have
+  no telemetry timing producer; the telemetry lanes expose no trace sampler,
+  span storage or trace-export producer. No timings or traces are invented to
+  fill that gap. OTLP transport, non-Codex adapters, and live review/fix
+  receipts remain outside this simulated certificate.
 
 The generator keeps its own sum of every usage counter it writes. That sum,
 never a production aggregate, is the expected value for the gates.
@@ -262,6 +324,94 @@ the pane 340 MB (1M).
 | sidecar after cold ingest | 169 MB (3.1× the 53.7 MB of rollouts) | 1.44 GB (2.7× the 538 MB) |
 | `state.db` | 39 MB, unchanged by telemetry | 39 MB, unchanged by telemetry |
 
+### 4.6 P6 workload completeness follow-up (100k only)
+
+**Pending the steward's serial 1M certification.** Branch
+`perf/workload-completeness`; release build with `--locked --offline -j 3`,
+`SCALE_EVENTS=100000 SCALE_ACTIVE=64 SCALE_REPEATS=3`, one bench process at a
+time, every dataset under `$PWD/bench-data/`. No production metric or
+coverage semantics changed. The old dataset was extended in place by a
+second `scale_0_generate`: original rollout files and usage counters were
+preserved, only declared quality/integration/attention facts were added.
+`scale_2_queries` used three rounds of one sample (`SCALE_PER_ROUND=1`),
+before any late/live appends. This compares workload cost, not an optimization.
+
+| surface | before p50 / p95 (ms) | complete mix p50 / p95 (ms) |
+| --- | --- | --- |
+| M02 terminal cohort | 713.31 / 724.40 | 499.13 / 668.46 |
+| M08 usage | 775.41 / 1,559.92 | 1,313.38 / 2,814.97 |
+| M13 coverage | 2,604.30 / 2,875.52 | 2,447.13 / 2,551.79 |
+| report | 2,468.93 / 4,502.92 | 3,831.98 / 6,414.57 |
+| panel refresh in process | 6,514.45 / 10,612.85 | 10,665.83 / 17,840.93 |
+| digest section in process | 8,944.75 / 10,626.29 | 7,404.74 / 9,976.89 |
+
+Before `results-queries-before.json` recorded loadavg
+`6.09 6.81 5.47` for both fields: the old harness sampled both at phase end;
+P6 fixes the start sample. After `results-queries-after.json`: start
+`8.21 7.74 8.34`, end `7.70 8.12 8.37` (1/5/15-minute averages).
+Per-round p50 CV is 14–37% before and 22–45% after for these surfaces:
+**inconclusive for a performance improvement/regression**, with the larger
+workload and a noisy shared host. Baseline cold collection took 26.98 s
+(3,703 rollout events/s, 1.90 MiB/s); ingest results recorded 1-minute load
+5.92 → 6.01. A fresh derived store over the identical original rollout files
+with the complete planted mix took 27.51 s (3,632 rollout events/s,
+1.86 MiB/s), at load 8.77 → 8.74. These are single cold-cursor runs, with
+no page-cache eviction. Sync was 1.20 → 1.95 s, analytics refresh
+4.65 → 7.60 s, and health evaluation 5.92 → 12.57 s. Collector peak RSS
+was 59,380 → 59,280 KiB. The complete-mix ingest reported zero violations
+and an unchanged canonical digest.
+
+`scale_7_late_slow`, three repeats of ten 20-line chunks (600 appended lines,
+120 usage records): zero usage/quality/attention violations; each M08
+restatement superseded its prior revision; all pinned answers and analytics
+rebuilds identical; canonical digest unchanged. Loadavg from
+`results-late-slow.json`: start `9.00 8.33 8.42`, end `5.40 7.45 8.11`.
+
+| repeat | collect p50 / p95 (ms), n=10 | post-pin workflow (s) | new input tokens |
+| --- | --- | --- | --- |
+| 1 | 574.95 / 739.14 | 32.41 | 409,905 |
+| 2 | 533.91 / 614.22 | 33.37 | 423,180 |
+| 3 | 424.60 / 461.26 | 22.86 | 408,174 |
+
+`scale_6_fairness`: all projects received controller service, all appended
+usage became visible, and every usage/quality/attention oracle held after
+drain. **The fixed 5 s light-project freshness criterion failed in round 1**:
+a hot-project pass took 11.52 s when analytics was due, delaying the same
+worker's light projects. Rounds 2 and 3 met it. This is a performance miss,
+not a correctness exception; the test writes `fair: false` and then fails,
+so a certification cannot silently pass. No target was relaxed and no L2
+optimization was attempted. Loadavg from `results-fairness.json`: start
+`4.88 7.27 8.04`, end `7.30 7.25 7.96`; round-end 1-minute loads
+4.57 / 4.59 / 5.01. Reader cadence 5 s, telemetry cadence 1 s, three 15 s
+rounds. Light freshness n=29 / 28 / 32 per project, hot n=306 per round;
+controller n=38 per project per round; surface n=1 / 1 / 2 per project.
+Panel/digest requests run at their configured cadence when the preceding
+request finishes, so expensive hot surfaces can overrun that cadence.
+
+| project | freshness p95, rounds 1 / 2 / 3 (ms) | admission p95 max (ms) | reconcile p95 max (ms) | panel p95 max (ms) | digest p95 max (ms) |
+| --- | --- | --- | --- | --- | --- |
+| hot, 100k/64 | 12,596 / 4,068 / 5,978 | 21.49 | 14.58 | 9,258.88 | 9,776.97 |
+| light 1 | 9,333 / 2,421 / 2,706 | 21.82 | 13.72 | 372.44 | 516.33 |
+| light 2 | 9,424 / 2,556 / 2,799 | 21.12 | 13.26 | 384.40 | 484.64 |
+| light 3 | 9,517 / 2,596 / 2,899 | 21.69 | 13.90 | 874.64 | 427.23 |
+
+Latency/surface columns take the worst **per-round** p95, not a pooled
+percentile. The fairness scenario now exposes the shared worker's delay;
+meeting the 5 s criterion belongs with incremental/bounded pass work (L2).
+The digest in the complete-mix query phase stayed at 13 lines / 1,307 B.
+
+Reproduction, after the build in §1 (same prepared dataset, serial phases):
+
+```
+env PATH=/usr/bin:/bin HERDR_BIN_PATH=/bin/false TMPDIR=$PWD/bench-data/tmp \
+    SCALE_DATA=$PWD/bench-data/p6 SCALE_EVENTS=100000 SCALE_ACTIVE=64 SCALE_REPEATS=3 \
+    target/release/deps/telemetry_scale-* --exact scale_7_late_slow --ignored --test-threads=1 --nocapture
+env PATH=/usr/bin:/bin HERDR_BIN_PATH=/bin/false TMPDIR=$PWD/bench-data/tmp \
+    SCALE_DATA=$PWD/bench-data/p6 SCALE_EVENTS=100000 SCALE_ACTIVE=64 SCALE_REPEATS=3 \
+    SCALE_CADENCE_MS=1000 SCALE_READER_MS=5000 SCALE_FAIRNESS_S=15 \
+    target/release/deps/telemetry_scale-* --exact scale_6_fairness --ignored --test-threads=1 --nocapture
+```
+
 ## 5. Inefficiencies found and fixed
 
 The first measurement (same generator, same host) missed the query and
@@ -381,15 +531,18 @@ owner. None is hidden by loosening the target.
 - **L6: sidecar size.** The sidecar is 2.7–3.1 times the rollout bytes it
   reads (1.44 GB for 1M events) and grows without retention in this build.
   Retention and backup belong to TM5.3.
-- **L7: what the workload leaves out.** One project only (no multi-project
-  fairness scenario); no quality, proxy, memory, OTLP or trace producers; the
-  attention sampler records gaps only (no Herdr); one host, shared with the
-  owner's applications and other agent sessions (load 1.5–13 during runs,
-  quoted per phase in the results files). Busy periods widened the 100k/64
-  query rounds' noise to 14–46 % and the controller's on-block noise to
-  26–45 %; the quieter 100k/32 and 1M runs (2–17 % for queries) are the ones
-  the query verdict rests on. Controller changes of a few percent are below
-  this host's noise; the ones reported in L1 are not.
+- **L7: workload gaps — addressed for produced signals at 100k by P6;
+  pending the steward's 1M certification.** §2 declares the added 5,942 CI
+  quality/proxy observations, 329 integration outcomes and 320 waiting-state
+  samples with byte sizes. §4.6 records the same-dataset before/after surface
+  costs, the slow/late collector and four-project fairness scenario. Memory
+  timing and traces are honestly not produced because the product has no
+  producer; live review/fix receipts, other adapters and another host remain
+  outside scope. The new fairness gate fails its unchanged 5 s target in the first
+  round (light p95 9.33–9.52 s), while later rounds are 2.42–2.90 s;
+  shared-worker pass latency remains an L2 performance limitation. The shared workstation remains noisy;
+  the 100k query comparison is inconclusive for performance changes, and this
+  card makes no claim to fix L1–L6 or to certify live capacity.
 - **L8: simulated capacity is not live capacity.** See the opening. Planted
   attempts and generated rollouts certify the telemetry path's behaviour at
   these volumes on this host, nothing about live workers or providers.
@@ -435,3 +588,21 @@ Suite results (`--features state-store`, debug build, `-j 3`,
 bench phases ignored). The first run failed once, on the accounting stream
 version expectation above; after that change every suite passed. No new
 clippy warning in the changed files.
+
+P6 validation: the required fifteen telemetry test targets ran with all
+pre-existing expected values unchanged (`--locked --offline -j 3`, one test thread): 166 passed, five failed, nine
+bench tests ignored. Four failures are sandbox-only Unix-socket bind denials
+(`Operation not permitted`): `telemetry::attempts_show_attention_summary`,
+`telemetry_accounting::attention_intervals_union_and_censor`,
+`telemetry_health::recommendations_and_notices_change_no_canonical_state_and_no_dispatch`,
+and `telemetry_workspace::thread_start_records_the_dispatch_reason_and_the_sidebar_suffix`.
+The fifth, `telemetry_health::ticker_health_requires_operator_opt_in_obeys_interval_and_never_notifies`,
+missed an asynchronous health evaluation in the full run and passed alone
+in 2.14 s without changes. Both scale workflows passed (49.46 s combined
+in debug, below the 60 s gate budget); after settling prior unavailable
+producer observations was covered, both passed again in 37.24 s combined.
+Clippy (`cargo clippy --locked --offline -j 3 --features state-store --test
+telemetry_scale`) reported no warning in changed lines; existing library and
+shared-support warnings remain. No expected value in another telemetry suite
+was edited. The ignored fairness phase fails only its documented performance
+criterion; its correctness oracles and the late/slow phase pass.

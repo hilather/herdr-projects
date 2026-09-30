@@ -205,7 +205,7 @@ fn configuration(db: &rusqlite::Connection, variant: usize) -> String {
 /// The dataset: canonical rows, rollouts and the generator's state, kept in
 /// `manifest.json` so later phases continue the same sessions.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct Dataset { base: PathBuf, root: PathBuf, project: PathBuf, attempt: String, config_digest: Option<String>, binding: (String, u64, Option<u64>), scale: Scale, totals: Totals, mix: Mix, active: Vec<Session>, generated_ms: f64 }
+struct Dataset { base: PathBuf, root: PathBuf, project: PathBuf, attempt: String, config_digest: Option<String>, binding: (String, u64, Option<u64>), scale: Scale, totals: Totals, mix: Mix, active: Vec<Session>, generated_ms: f64, #[serde(default)] producers: Producers }
 
 impl Dataset {
     fn manifest(dir: &Path) -> PathBuf { dir.join("manifest.json") }
@@ -240,6 +240,7 @@ fn generate(f: Fixture, scale: Scale) -> Dataset {
     let history = sessions - scale.active;
     let mut rng = Rng(scale.seed);
     let mut plan = Vec::new();
+    let mut producers = Producers::default();
     for i in 0..scale.attempts {
         let active = i >= terminal;
         let (task, attempt, op) = (format!("st{i:05}"), format!("s{i:05}"), format!("op-s{i:05}"));
@@ -293,6 +294,9 @@ fn generate(f: Fixture, scale: Scale) -> Dataset {
                     rusqlite::params![result, &result[..32], hex("d"), submission, task, attempt, hex("e"), "a".repeat(40), end - 1_000]).unwrap();
                 db.execute("INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms)
                     VALUES(?1,?1,?2,?3,?3,'sha1',?4,?4,'linux-unshare-user-pid-mount-v1',0,?5)", rusqlite::params![result, submission, "a".repeat(40), hex("e"), end]).unwrap();
+                let flagged = i.is_multiple_of(5);
+                producers.proxies.push(Proxy { task: task.clone(), attempt: attempt.clone(), submission: submission.clone(), run: result.clone(), at: end - 1_000, flagged });
+                if i.is_multiple_of(10) && let Some(outcome) = plant_integration(&db, &task, &op, &result, end, i, now) { producers.outcomes.push(outcome); }
             }
         }
         // History rollouts evenly spaced over the terminal attempts (every home gets some).
@@ -324,9 +328,105 @@ fn generate(f: Fixture, scale: Scale) -> Dataset {
         fs::write(&s.path, out).unwrap();
         if is_active { active.push(s); }
     }
+    for i in terminal..scale.attempts {
+        producers.attention.push((format!("s{i:05}"), now - 3_600_000 + (i - terminal) as i64 * 1_000 + 1_000));
+    }
+    record_producer_mix(&mut mix, &producers);
     let Fixture { tmp, root, project, attempt, config, .. } = f;
     let base = tmp.keep();
-    Dataset { base, root, project, attempt, config_digest: config.digest, binding: observed, scale, totals, mix, active, generated_ms: started.elapsed().as_secs_f64() * 1e3 }
+    let d = Dataset { base, root, project, attempt, config_digest: config.digest, binding: observed, scale, totals, mix, active, generated_ms: started.elapsed().as_secs_f64() * 1e3, producers };
+    plant_producers(&d);
+    d
+}
+
+/// Declared simulated quality facts, copied by value into the real quality lane.
+/// These are fixture observations, never claims of live verification or git evidence.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Producers { proxies: Vec<Proxy>, outcomes: Vec<Outcome>, attention: Vec<(String, i64)> }
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Proxy { task: String, attempt: String, submission: String, run: String, at: i64, flagged: bool }
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Outcome { id: String, at: i64, reverted: bool, added: i64 }
+
+fn plant_integration(db: &rusqlite::Connection, task: &str, op: &str, result: &str, end: i64, i: usize, now: i64) -> Option<Outcome> {
+    let id = hex(&format!("integration-{task}"));
+    let oid = "a".repeat(40);
+    db.execute("INSERT OR IGNORE INTO integration_targets VALUES('/repo','refs/heads/scale',1)", []).unwrap();
+    db.execute("INSERT OR IGNORE INTO integration_target_leases VALUES('/repo','refs/heads/scale',NULL,1)", []).unwrap();
+    db.execute("INSERT INTO integration_operations(operation_id,project_store,idempotency_key,payload_digest,repository,ref_name,expected_old_oid,verified_result_id,state,generation,object_format,checks_passed,created_unix_ms) VALUES(?1,'store',?1,?2,'/repo','refs/heads/scale',?3,?4,'integrated',1,'sha1',1,?5)", rusqlite::params![op, id, oid, result, end]).unwrap();
+    db.execute("INSERT INTO integration_candidates VALUES(?1,?2,?3,?3,?3,?3,'ort','sha1','published',?4)", rusqlite::params![id, op, oid, end]).unwrap();
+    db.execute("INSERT INTO integrated_commits VALUES(?1,?1,?2,'/repo','refs/heads/scale',?3,?3,?3,'sha1',?4)", rusqlite::params![id, op, oid, end]).unwrap();
+    (end < now - 14 * 86_400_000).then_some(Outcome { id, at: end, reverted: i.is_multiple_of(30), added: 40 + (i % 160) as i64 })
+}
+
+fn record_producer_mix(mix: &mut Mix, producers: &Producers) {
+    for row in &producers.proxies {
+        let payload = json!({"kind": "first_candidate_ci", "task_id": row.task, "submission_id": row.submission, "attempt_id": row.attempt,
+            "run_id": row.run, "policy_digest": hex("e"), "base_oid": "a".repeat(40), "candidate_oid": "a".repeat(40), "ci_state": "accepted",
+            "verified_unix_ms": row.at, "tests_added_lines": if row.flagged { 0 } else { 12 }, "tests_deleted_lines": if row.flagged { 8 } else { 2 },
+            "tests_binary_files": 0, "weakening": if row.flagged { "flagged" } else { "clear" }, "weakening_reason": null,
+            "weakening_rule": "tests-net-removal.v1", "source_trust": "proxy_observed", "observed_unix_ms": row.at + 1_000});
+        mix.add("quality.first_candidate_ci", serde_json::to_vec(&payload).unwrap().len());
+    }
+    for row in &producers.outcomes {
+        let payload = json!({"integrated_id": row.id, "horizon_ms": 1_209_600_000, "commit_oid": "a".repeat(40), "integrated_unix_ms": row.at,
+            "horizon_oid": "a".repeat(40), "reverted": if row.reverted { "trailer" } else { "none" }, "added_lines": row.added,
+            "surviving_lines": if row.reverted { 0 } else { row.added * 3 / 4 }, "churn_added_lines": 24, "churn_deleted_lines": 8,
+            "unavailable_reason": null, "rule": "outcomes.v1", "source_trust": "proxy_observed", "observed_unix_ms": row.at + 14 * 86_400_000});
+        mix.add("quality.integration_outcome", serde_json::to_vec(&payload).unwrap().len());
+    }
+    for (attempt, at) in &producers.attention {
+        for (n, state) in ["working", "blocked", "blocked", "working", "idle"].iter().enumerate() {
+            mix.add("attention.sample", serde_json::to_vec(&json!({"attempt_id": attempt, "observed_unix_ms": at + n as i64 * 60_000, "state": state, "gap": null, "interval_ms": 60_000, "source": "herdr-agent-list-v1"})).unwrap().len());
+        }
+    }
+}
+
+fn plant_producers(d: &Dataset) {
+    let mut db = telemetry::sidecar::open(&d.project, true).unwrap().unwrap();
+    let tx = db.transaction().unwrap();
+    for p in &d.producers.proxies {
+        tx.execute("INSERT INTO proxy_signals VALUES('first_candidate_ci',?1,?2,?3,?4,?5,?6,?6,'accepted',?7,?8,?9,0,?10,NULL,'tests-net-removal.v1','proxy_observed',?11)
+            ON CONFLICT(kind,task_id) DO UPDATE SET tests_added_lines=excluded.tests_added_lines,tests_deleted_lines=excluded.tests_deleted_lines,
+            tests_binary_files=excluded.tests_binary_files,weakening=excluded.weakening,weakening_reason=excluded.weakening_reason,
+            observed_unix_ms=excluded.observed_unix_ms WHERE proxy_signals.weakening='unavailable' ",
+            rusqlite::params![p.task, p.submission, p.attempt, p.run, hex("e"), "a".repeat(40), p.at, if p.flagged { 0 } else { 12 }, if p.flagged { 8 } else { 2 }, if p.flagged { "flagged" } else { "clear" }, p.at + 1_000]).unwrap();
+    }
+    for o in &d.producers.outcomes {
+        tx.execute("INSERT OR IGNORE INTO integration_outcomes VALUES(?1,1209600000,?2,?3,?2,?4,?5,?6,24,8,NULL,'outcomes.v1','proxy_observed',?7)",
+            rusqlite::params![o.id, "a".repeat(40), o.at, if o.reverted { "trailer" } else { "none" }, o.added, if o.reverted { 0 } else { o.added * 3 / 4 }, o.at + 14 * 86_400_000]).unwrap();
+    }
+    for (attempt, at) in &d.producers.attention {
+        for (n, state) in ["working", "blocked", "blocked", "working", "idle"].iter().enumerate() {
+            let at = at + n as i64 * 60_000;
+            tx.execute("INSERT INTO attention_samples SELECT ?1,?2,?3,NULL,60000,'herdr-agent-list-v1' WHERE NOT EXISTS(SELECT 1 FROM attention_samples WHERE attempt_id=?1 AND observed_unix_ms=?2 AND state=?3)", rusqlite::params![attempt, at, state]).unwrap();
+        }
+    }
+    tx.commit().unwrap();
+}
+
+/// Check public projections against independently declared fixture facts, not
+/// SQL aggregates of those facts. Includes exclusions and exact waiting duration.
+fn producer_gates(d: &Dataset, violations: &mut Vec<String>) {
+    if d.producers.proxies.is_empty() { return; }
+    let quality = telemetry(d, &["quality", "report"]).ok().json();
+    let metrics = &quality["metrics"];
+    let flagged = d.producers.proxies.iter().filter(|p| p.flagged).count();
+    let clear = d.producers.proxies.len() - flagged;
+    let added: i64 = d.producers.outcomes.iter().map(|o| o.added).sum();
+    let surviving: i64 = d.producers.outcomes.iter().map(|o| if o.reverted { 0 } else { o.added * 3 / 4 }).sum();
+    let reverted = d.producers.outcomes.iter().filter(|o| o.reverted).count();
+    for (metric, key, expected) in [("M45", "numerator", json!(clear)), ("M45", "denominator", json!(clear)),
+        ("M47", "numerator", json!(surviving)), ("M47", "denominator", json!(added)),
+        ("M48", "numerator", json!(reverted)), ("M48", "denominator", json!(d.producers.outcomes.len()))] {
+        if metrics[metric][key] != expected { violations.push(format!("{metric}.{key}: {} != {expected}", metrics[metric][key])); }
+    }
+    if metrics["M45"]["excluded"]["test_weakening"] != json!(flagged) { violations.push("quality weakening exclusions differ".into()); }
+    let attention = telemetry(d, &["accounting", "attention", "--json"]).ok().json();
+    let n = d.producers.attention.len();
+    if attention["fleet"]["waiting_sum_ms"] != json!(n as i64 * 120_000) || attention["fleet"]["interventions"] != json!(n) || attention["orphan_samples"] != json!(0) {
+        violations.push(format!("attention durations/interventions differ: {}", attention["fleet"]));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -483,6 +583,7 @@ fn usage_gates(d: &Dataset) -> Vec<String> {
     if report["metrics"]["M08"]["value"] != json!(input) || report["metrics"]["M09"]["value"] != json!(output) {
         v.push(format!("report M08/M09 {} / {} != {input} / {output}", report["metrics"]["M08"]["value"], report["metrics"]["M09"]["value"]));
     }
+    producer_gates(d, &mut v);
     v
 }
 
@@ -712,6 +813,36 @@ fn host() -> Value {
 #[ignore]
 fn scale_0_generate() {
     let dir = data_dir();
+    if Dataset::manifest(&dir).exists() {
+        let mut d = Dataset::load(&dir);
+        if !d.producers.proxies.is_empty() {
+            plant_producers(&d);
+            println!("replayed the existing producer facts");
+            return;
+        }
+        let db = rusqlite::Connection::open(d.state()).unwrap();
+        db.execute_batch("PRAGMA foreign_keys=OFF; BEGIN").unwrap();
+        let rows: Vec<(String, String, String, String, i64)> = db.prepare("SELECT s.task_id,s.attempt_id,s.submission_id,v.result_id,v.created_unix_ms FROM result_submissions s JOIN verified_results v ON v.submission_id=s.submission_id ORDER BY s.task_id").unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).unwrap().map(Result::unwrap).collect();
+        for (task, attempt, submission, run, end) in rows {
+            let i: usize = task.strip_prefix("st").unwrap().parse().unwrap();
+            d.producers.proxies.push(Proxy { task: task.clone(), attempt, submission, run: run.clone(), at: end - 1_000, flagged: i.is_multiple_of(5) });
+            if i.is_multiple_of(10) && let Some(o) = plant_integration(&db, &task, &format!("op-s{i:05}"), &run, end, i, unix_ms()) { d.producers.outcomes.push(o); }
+        }
+        for i in d.scale.attempts - d.scale.active..d.scale.attempts {
+            let at: i64 = db.query_row("SELECT unix_ms+500 FROM attempt_lifecycle WHERE attempt_id=?1 AND state='running'", [format!("s{i:05}")], |r| r.get(0)).unwrap();
+            d.producers.attention.push((format!("s{i:05}"), at));
+        }
+        db.execute_batch("COMMIT").unwrap();
+        assert_eq!(db.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        drop(db);
+        record_producer_mix(&mut d.mix, &d.producers);
+        plant_producers(&d);
+        d.save(&dir);
+        fs::write(dir.join("canonical.digest"), canonical_digest(&d)).unwrap();
+        println!("extended the same dataset: {} events, {} logical bytes", d.mix.events(), d.mix.total_bytes());
+        return;
+    }
     let scale = Scale { attempts: env_usize("SCALE_ATTEMPTS", 10_000), active: env_usize("SCALE_ACTIVE", 64), events: env_usize("SCALE_EVENTS", 100_000), homes: 8, seed: 5_100 };
     let d = generate(Fixture::new(), scale);
     d.save(&dir);
@@ -753,8 +884,9 @@ fn scale_1_ingest() {
     // libtest prints the test's name on the same line as its first output.
     let child = String::from_utf8_lossy(&pass.stdout).lines().find_map(|l| l.split_once("pass: ").map(|(_, v)| v.to_owned())).unwrap_or_default();
     let events = d.mix.events();
-    let out = json!({"host": host, "scale": d.scale, "generated_ms": d.generated_ms, "events": events, "rollout_bytes": d.mix.total_bytes(), "mix": d.mix,
-        "totals": d.totals, "collect_runs": collects, "ingest": {"wall_ms": wall, "events_per_s": events as f64 / wall * 1e3, "mib_per_s": d.mix.total_bytes() as f64 / 1048576.0 / wall * 1e3},
+    let rollout_bytes: u64 = d.mix.bytes.iter().filter(|(k, _)| !k.starts_with("quality.") && !k.starts_with("attention.")).map(|(_, bytes)| bytes).sum();
+    let out = json!({"host": host, "scale": d.scale, "generated_ms": d.generated_ms, "events": events, "rollout_bytes": rollout_bytes, "logical_event_bytes": d.mix.total_bytes(), "mix": d.mix,
+        "totals": d.totals, "collect_runs": collects, "ingest": {"wall_ms": wall, "rollout_events_per_s": d.mix.counts.iter().filter(|(k, _)| !k.starts_with("quality.") && !k.starts_with("attention.")).map(|(_, n)| n).sum::<u64>() as f64 / wall * 1e3, "mib_per_s": rollout_bytes as f64 / 1048576.0 / wall * 1e3},
         "sync": sync, "analytics_refresh": refresh, "health_evaluate": health, "sidecar_bytes": sidecar_bytes(&d),
         "pass_process": {"wall_ms": pass.wall_ms, "user_ms": pass.user_ms, "sys_ms": pass.sys_ms, "maxrss_kib": pass.maxrss_kib, "steps": serde_json::from_str::<Value>(&child).unwrap_or(Value::Null)},
         "state_bytes": file_size(&d.state()), "canonical_unchanged": canonical_digest(&d) == canonical, "violations": violations, "plans": plans, "loadavg_end": load_average()});
@@ -785,6 +917,7 @@ fn scale_pass_child() {
 #[ignore]
 fn scale_2_queries() {
     let dir = data_dir();
+    let load0 = load_average();
     let d = Dataset::load(&dir);
     let repeats = env_usize("SCALE_REPEATS", 5);
     let per = env_usize("SCALE_PER_ROUND", 4);
@@ -867,7 +1000,7 @@ fn scale_2_queries() {
         "round_p50_noise": noise(&rounds[name]),
     }))).collect::<serde_json::Map<_, _>>().into();
     let startup: Vec<f64> = (0..repeats * per).map(|_| cli(&d, &["--version"]).wall_ms).collect();
-    let out = json!({"scale": d.scale, "query_set": set, "loadavg_start": host()["loadavg_start"], "results": results, "process_startup_ms": dist(&startup),
+    let out = json!({"scale": d.scale, "query_set": set, "loadavg_start": load0, "results": results, "process_startup_ms": dist(&startup),
         "digest_section": {"lines": digest_lines, "bytes": digest_bytes}, "context_peek": context, "context_available": context_works, "loadavg_end": load_average()});
     write_results(&dir, &format!("queries-{}", std::env::var("SCALE_TAG").unwrap_or_default()), &out);
 }
@@ -1233,4 +1366,236 @@ fn scale_5_faults() {
     write_results(&dir, &format!("faults-{}", std::env::var("SCALE_TAG").unwrap_or_default()), &out);
     assert_eq!(out["violations"], json!([]));
     assert!(identical, "{verify}");
+}
+
+/// Old event-time records arrive in an already refreshed window, via a slow
+/// appender (one bounded chunk per 100 ms). Wall-clock arrival is separate from
+/// event time. Existing session/response identities and counter semantics hold.
+fn late_slow(d: &mut Dataset, chunks: usize) -> Value {
+    telemetry(d, &["analytics", "refresh"]).ok();
+    let revisions = telemetry(d, &["analytics", "revisions", "--metric", "M08"]).ok().json();
+    let seq = revisions["revisions"].as_array().unwrap().last().unwrap()["revision"].as_i64().unwrap();
+    let pinned = |d: &Dataset| {
+        let mut v = telemetry(d, &["query", "--metric", "M08", "--as-of-seq", &seq.to_string(), "--json"]).ok().json();
+        v.as_object_mut().unwrap().remove("query_unix_ms");
+        for k in ["current_revision", "restated", "superseded_by"] { v["results"][0]["projection"].as_object_mut().unwrap().remove(k); }
+        v
+    };
+    let before = pinned(d);
+    let input = d.totals.input;
+    let started = Instant::now();
+    let event_ms = d.producers.attention[0].1 + 300_000;
+    let mut collected = Vec::new();
+    for chunk in 0..chunks {
+        let s = &mut d.active[chunk % d.scale.active];
+        let mut lines = String::new();
+        for n in 0..20 {
+            lines += &s.line(event_ms + n * 500, &mut d.totals, &mut d.mix);
+            lines.push('\n');
+        }
+        fs::OpenOptions::new().append(true).open(&s.path).unwrap().write_all(lines.as_bytes()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let run = telemetry(d, &["collect"]).ok();
+        collected.push(run.wall_ms);
+        telemetry(d, &["accounting", "sync"]).ok();
+    }
+    let refresh = telemetry(d, &["analytics", "refresh"]).ok().json();
+    assert!(refresh["appended"].as_array().unwrap().iter().any(|a| a["cell"]["metric"] == "M08" && a["kind"] == "restatement" && a["supersedes"] == seq), "{refresh}");
+    assert_eq!(pinned(d), before, "late arrivals changed a pinned as-of revision");
+    let current = telemetry(d, &["query", "--metric", "M08", "--json"]).ok().json();
+    assert_eq!(current["results"][0]["value"], json!(d.totals.input), "{current}");
+    assert!(d.totals.input > input);
+    assert_eq!(usage_gates(d), Vec::<String>::new());
+    let verify = telemetry(d, &["analytics", "rebuild", "--verify"]).ok().json();
+    assert!(verify["cells"].as_array().unwrap().iter().all(|c| c["identical"] == true && c["stored_intact"] == true), "{verify}");
+    json!({"chunks": chunks, "event_unix_ms": event_ms, "arrival_unix_ms": unix_ms(), "appender_sleep_ms": 100,
+        "late_input_tokens": d.totals.input - input, "collect_ms": dist(&collected), "wall_ms": started.elapsed().as_secs_f64() * 1e3,
+        "as_of_unchanged": true, "rebuild_identical": true})
+}
+
+#[test]
+fn scale_producers_restate_and_replay() {
+    let mut d = generate(Fixture::new(), Scale { attempts: 60, active: 4, events: 1_000, homes: 2, seed: 51 });
+    let _cleanup = Cleanup(d.base.clone());
+    let canonical = canonical_digest(&d);
+    telemetry(&d, &["collect"]).ok();
+    telemetry(&d, &["accounting", "sync"]).ok();
+    // A real quality pass first records an unavailable repository observation.
+    // The declared simulated observation must settle that prior row, just as
+    // the quality producer settles unavailable observations after recovery.
+    rusqlite::Connection::open(d.sidecar()).unwrap().execute("DELETE FROM proxy_signals WHERE task_id=?1", [&d.producers.proxies[0].task]).unwrap();
+    telemetry(&d, &["quality", "collect"]).ok();
+    assert_eq!(telemetry(&d, &["quality", "report"]).ok().json()["metrics"]["M45"]["excluded"]["weakening_unavailable"], json!(1));
+    plant_producers(&d);
+    assert_eq!(usage_gates(&d), Vec::<String>::new());
+    late_slow(&mut d, 2);
+    let rows = ledger_rows(&d.sidecar());
+    let quality = telemetry(&d, &["quality", "report"]).ok().json();
+    for suffix in ["", "-wal", "-shm"] { fs::remove_file(format!("{}{suffix}", d.sidecar().display())).ok(); }
+    plant_producers(&d);
+    telemetry(&d, &["collect"]).ok();
+    telemetry(&d, &["accounting", "sync"]).ok();
+    assert_eq!(usage_gates(&d), Vec::<String>::new());
+    assert_eq!(telemetry(&d, &["quality", "report"]).ok().json(), quality);
+    assert_eq!(ledger_rows(&d.sidecar()), rows);
+    assert_eq!(canonical_digest(&d), canonical);
+}
+
+#[test]
+#[ignore]
+fn scale_7_late_slow() {
+    let dir = data_dir();
+    let mut d = Dataset::load(&dir);
+    let canonical = canonical_digest(&d);
+    let load = load_average();
+    let repeats: Vec<_> = (0..env_usize("SCALE_REPEATS", 3)).map(|_| late_slow(&mut d, 10)).collect();
+    d.save(&dir);
+    assert_eq!(canonical_digest(&d), canonical);
+    write_results(&dir, "late-slow", &json!({"scale": d.scale, "runs": repeats, "loadavg_start": load, "loadavg_end": load_average()}));
+}
+
+
+/// Four projects share one non-blocking controller loop, one sequential
+/// telemetry worker and one operator reader, like the ticker. No per-project
+/// telemetry threads: the hot project competes for the same worker as lights.
+#[test]
+#[ignore]
+fn scale_6_fairness() {
+    let dir = data_dir();
+    let load = load_average();
+    let mut datasets = vec![Dataset::load(&dir)];
+    for i in 1..4 {
+        let sub = dir.join(format!("light-{i}"));
+        fs::create_dir_all(&sub).unwrap();
+        let d = if Dataset::manifest(&sub).exists() { Dataset::load(&sub) } else {
+            let d = generate(Fixture::new(), Scale { attempts: 200, active: 4, events: 1_000, homes: 2, seed: 5_100 + i });
+            d.save(&sub);
+            d
+        };
+        datasets.push(d);
+    }
+    for d in &datasets { telemetry(d, &["collect"]).ok(); telemetry(d, &["accounting", "sync"]).ok(); }
+    let sids: Vec<Vec<String>> = datasets.iter().map(|d| d.active.iter().map(|s| s.sid.clone()).collect()).collect();
+    let projects: Vec<PathBuf> = datasets.iter().map(|d| d.project.clone()).collect();
+    let state = Arc::new(Mutex::new(datasets.iter_mut().map(|d| (std::mem::take(&mut d.active), d.totals, d.mix.clone())).collect::<Vec<_>>()));
+    let mut stores: Vec<_> = datasets.iter().map(|d| herdr_projects::store::SqliteStore::open(&d.state()).unwrap()).collect();
+    let cadence = Duration::from_millis(env_usize("SCALE_CADENCE_MS", 1_000) as u64);
+    let reader_every = Duration::from_millis(env_usize("SCALE_READER_MS", 5_000) as u64);
+    let length = Duration::from_secs(env_usize("SCALE_FAIRNESS_S", 15) as u64);
+    let mut rounds = Vec::new();
+    for round in 0..env_usize("SCALE_REPEATS", 3) {
+        let base: Vec<_> = projects.iter().zip(&sids).map(|(p, ids)| delta_counts(p, ids)).collect();
+        let stop = Arc::new(AtomicBool::new(false));
+        let log = Arc::new(Mutex::new(vec![Vec::<(i64, String)>::new(); 4]));
+        let writer = {
+            let (state, stop, log) = (state.clone(), stop.clone(), log.clone());
+            std::thread::spawn(move || {
+                let mut cursor = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    let started = Instant::now();
+                    let mut state = state.lock().unwrap();
+                    let mut log = log.lock().unwrap();
+                    for (i, (sessions, totals, mix)) in state.iter_mut().enumerate() {
+                        let index = cursor % sessions.len();
+                        let s = &mut sessions[index];
+                        let sid = s.sid.clone();
+                        for at in s.append(if i == 0 { 10 } else { 1 }, totals, mix) { log[i].push((at, sid.clone())); }
+                    }
+                    cursor += 1;
+                    drop(log);
+                    drop(state);
+                    std::thread::sleep(Duration::from_millis(100).saturating_sub(started.elapsed()));
+                }
+            })
+        };
+        let worker = {
+            let (projects, sids, stop) = (projects.clone(), sids.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut views = vec![Vec::new(); 4];
+                let mut passes = vec![Vec::new(); 4];
+                while !stop.load(Ordering::Relaxed) {
+                    let started = Instant::now();
+                    for (i, project) in projects.iter().enumerate() {
+                        let (ms, _, errors) = telemetry_pass(project);
+                        assert!(errors.is_empty(), "{errors:?}");
+                        passes[i].push(ms);
+                        views[i].push((unix_ms(), delta_counts(project, &sids[i])));
+                    }
+                    std::thread::sleep(cadence.saturating_sub(started.elapsed()));
+                }
+                (views, passes)
+            })
+        };
+        let reader = {
+            let (stop, dirs) = (stop.clone(), datasets.iter().map(|d| d.base.clone()).collect::<Vec<_>>());
+            // The hot manifest is under SCALE_DATA, while light manifests are
+            // saved under their fixture bases for isolated CLI environments.
+            for d in &datasets { d.save(&d.base); }
+            std::thread::spawn(move || {
+                let datasets: Vec<_> = dirs.iter().map(|p| Dataset::load(p)).collect();
+                let mut panel = vec![Vec::new(); 4];
+                let mut digest = vec![Vec::new(); 4];
+                while !stop.load(Ordering::Relaxed) {
+                    let started = Instant::now();
+                    for (i, d) in datasets.iter().enumerate() {
+                        panel[i].push(telemetry(d, &["workspace", "show", "--json"]).ok().wall_ms);
+                        digest[i].push(telemetry(d, &["workspace", "digest"]).ok().wall_ms);
+                    }
+                    std::thread::sleep(reader_every.saturating_sub(started.elapsed()));
+                }
+                (panel, digest)
+            })
+        };
+        let until = Instant::now() + length;
+        let mut admission = vec![Vec::new(); 4];
+        let mut reconcile = vec![Vec::new(); 4];
+        while Instant::now() < until {
+            for (i, d) in datasets.iter().enumerate() {
+                let (a, r) = controller(d, &mut stores[i], &stop, Instant::now() + Duration::from_millis(1));
+                admission[i].extend(a);
+                reconcile[i].extend(r);
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        let (mut views, passes) = worker.join().unwrap();
+        let mut results = Vec::new();
+        for i in 0..4 {
+            // Drain, but retain the true append-to-first-visible duration.
+            for _ in 0..200 {
+                let (_, c, errors) = telemetry_pass(&projects[i]);
+                assert!(errors.is_empty(), "{errors:?}");
+                views[i].push((unix_ms(), delta_counts(&projects[i], &sids[i])));
+                if c.is_some_and(|c| !c.budget_exhausted) { break; }
+            }
+            let (fresh, unseen) = freshness(&log.lock().unwrap()[i], &base[i], &views[i]);
+            assert_eq!(unseen, 0);
+            results.push(json!({"project": i, "hot": i == 0, "admission_ms": dist(&admission[i]), "reconcile_ms": dist(&reconcile[i]),
+                "freshness_ms": dist(&fresh), "pass_ms": dist(&passes[i]),
+                "appended_usage": fresh.len(), "unseen": unseen}));
+        }
+        // Drain before joining a slow surface reader: its last query must not
+        // artificially delay our observation of already collectable records.
+        let (panel, digest) = reader.join().unwrap();
+        for i in 0..4 {
+            results[i]["panel_ms"] = dist(&panel[i]);
+            results[i]["digest_ms"] = dist(&digest[i]);
+        }
+        rounds.push(json!({"round": round, "projects": results, "loadavg": load_average()}));
+    }
+    let state = Arc::try_unwrap(state).ok().unwrap().into_inner().unwrap();
+    for (i, (d, (active, totals, mix))) in datasets.iter_mut().zip(state).enumerate() {
+        (d.active, d.totals, d.mix) = (active, totals, mix);
+        d.save(&if i == 0 { dir.clone() } else { dir.join(format!("light-{i}")) });
+        assert_eq!(usage_gates(d), Vec::<String>::new());
+    }
+    // Fixed before measurement: light p95 <= doc 10's 5 s freshness target.
+    // Report misses before asserting; a failed target is certification evidence.
+    let fair = rounds.iter().all(|r| r["projects"].as_array().unwrap().iter().skip(1).all(|p|
+        p["freshness_ms"]["n"].as_u64().unwrap() > 0 && p["freshness_ms"]["p95"].as_f64().unwrap() <= 5_000.0));
+    write_results(&dir, "fairness", &json!({"hot_scale": datasets[0].scale, "light_events": 1_000, "projects": 4,
+        "cadence_ms": cadence.as_millis(), "reader_ms": reader_every.as_millis(), "round_seconds": length.as_secs(),
+        "criterion": "each light project has observed usage and p95 append-to-ledger freshness <= 5000 ms in every round", "fair": fair,
+        "rounds": rounds, "loadavg_start": load, "loadavg_end": load_average()}));
+    assert!(fair, "light-project freshness exceeds the fixed 5 s fairness criterion; see results-fairness.json");
 }
