@@ -172,16 +172,30 @@ fn ticker_health_requires_operator_opt_in_obeys_interval_and_never_notifies() {
             .args(["--root", p.root.to_str().unwrap(), "ticker", "run"])
             .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while synced() == before {
+        // Accounting is only the second lane on the detached telemetry thread.
+        // Even graceful ticker shutdown does not join it. Wait for that thread
+        // to exit after its accounting write, including when health is a no-op
+        // (no operator opt-in, or the interval has not elapsed).
+        let tasks = PathBuf::from(format!("/proc/{}/task", child.id()));
+        let telemetry_running = || {
+            fs::read_dir(&tasks).unwrap().map(|entry| {
+                let path = entry.unwrap().path().join("comm");
+                match fs::read_to_string(&path) {
+                    Ok(name) => name.trim() == "telemetry-pass",
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => panic!("{}: {error}", path.display()),
+                }
+            }).any(|running| running)
+        };
+        while synced() == before || telemetry_running() {
             let exited = child.try_wait().unwrap();
             if exited.is_some() || Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("ticker did not complete accounting: {exited:?} {}", fs::read_to_string(p.root.join(".ticker.log")).unwrap_or_default());
+                panic!("ticker did not complete telemetry: {exited:?} {}", fs::read_to_string(p.root.join(".ticker.log")).unwrap_or_default());
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        // Accounting precedes health. Graceful stop waits for the whole pass.
         fs::write(p.root.join(".ticker.stop"), b"").unwrap();
         assert!(child.wait().unwrap().success());
         fs::remove_file(p.root.join(".ticker.stop")).unwrap();
