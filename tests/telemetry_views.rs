@@ -380,21 +380,24 @@ fn reviews_view_separates_verified_integrated_and_resolved() {
     fs::write(&receipt, json!({"schema": "review_receipt.v1", "session_id": session, "submission_id": sub, "candidate_oid": candidate, "outcome": "completed",
         "findings": ["finding:crash"], "evidence": []}).to_string()).unwrap();
     f.cli_args(&["review", "complete", "--input-file", receipt.to_str().unwrap()]);
-    f.cli_args(&["review", "findings", "validate", "1", "--new", "--severity", "high", "--evidence", &evidence('e')]);
-    let finding = "finding:canonical-4";
-    let fixes = |args: &[&str]| { let mut all = vec!["review", "fixes"]; all.extend(args); f.cli_args(&all); };
-    fixes(&["open", finding, "--assign", "fast"]);
+    let validated = f.cli_args(&["review", "findings", "validate", "1", "--new", "--severity", "high", "--evidence", &evidence('e')]).0;
+    let finding = validated["event"]["subject"]["finding_id"].as_str().unwrap().to_owned();
+    let finding = finding.as_str();
+    let fixes = |args: &[&str]| { let mut all = vec!["review", "fixes"]; all.extend(args); f.cli_args(&all).0 };
+    let opened = fixes(&["open", finding, "--assign", "fast"]);
+    let repair = opened["event"]["subject"]["repair_seq"].as_i64().unwrap().to_string();
     let factory = Factory::open(&f);
     let fast_id = herdr_projects::domain::agent_configuration(&fast).id;
     factory.attempt("fix-a1", &fast_id);
-    fixes(&["bind", "5", "--attempt", "fix-a1"]);
+    fixes(&["bind", &repair, "--attempt", "fix-a1"]);
     factory.submission(&rep('4'), "fix-a1", &oid('4'), 6_000);
     factory.run(&rep('d'), &rep('4'), "fix-a1", &oid('4'), &rep('f'));
     factory.integration(&rep('7'), &rep('f'), &oid('4'), &oid('5'), unix_ms() - 1_000);
-    fixes(&["propose", "5", "--submission", &rep('4')]);
-    fixes(&["verify", "7", "--run", &rep('d'), "--assurance", "regression_reproduced", "--evidence", &evidence('a')]);
-    fixes(&["integrate", "7", "--integrated", &rep('7')]);
-    fixes(&["close", "5", "--outcome", "fixed"]);
+    let proposed = fixes(&["propose", &repair, "--submission", &rep('4')]);
+    let proposal = proposed["event"]["seq"].as_i64().unwrap().to_string();
+    fixes(&["verify", &proposal, "--run", &rep('d'), "--assurance", "regression_reproduced", "--evidence", &evidence('a')]);
+    fixes(&["integrate", &proposal, "--integrated", &rep('7')]);
+    fixes(&["close", &repair, "--outcome", "fixed"]);
 
     let check = |verified: &str, integrated: &str, resolved: &str, reopen: &str| {
         let view: Value = serde_json::from_str(&f.text(&["view", "reviews", "--json"])).unwrap();
