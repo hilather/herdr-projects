@@ -81,6 +81,10 @@ pub fn store(tx: &Connection, entries: &[Entry]) -> Result<(usize, usize)> {
             thread_parent: r.get(4)?, thread_source: r.get(5)? })))?
         .collect::<rusqlite::Result<_>>()?;
     let delta: Vec<&Entry> = entries.iter().filter(|e| e.basis == "delta").collect();
+    // Each session's entries, looked up once per session rather than filtered
+    // from every entry (quadratic in retained history; certificate-scale.md §5).
+    let mut by_session = BTreeMap::<&str, Vec<&Entry>>::new();
+    for entry in &delta { by_session.entry(entry.session.as_str()).or_default().push(entry); }
 
     // Rollouts of one session, the one with the most records first.
     type Source = (String, String, Option<String>, Option<String>);
@@ -93,7 +97,7 @@ pub fn store(tx: &Connection, entries: &[Entry]) -> Result<(usize, usize)> {
         // (`None` when it observed an entry that is not counted and normalized).
         let mut observed = BTreeMap::<&str, (BTreeSet<&str>, Option<i64>)>::new();
         let mut conflict = false;
-        for entry in delta.iter().filter(|e| e.session == *session) {
+        for entry in by_session.get(session).into_iter().flatten() {
             for (path, disposition, _) in &entry.provenance {
                 conflict |= *disposition == "conflict";
                 let node = observed.entry(path.as_str()).or_insert((BTreeSet::new(), Some(0)));
@@ -141,9 +145,9 @@ pub fn store(tx: &Connection, entries: &[Entry]) -> Result<(usize, usize)> {
                     None => { reason = Some("no_native_parent_evidence"); "unlinked_child" }
                 },
             };
-            tx.execute("INSERT INTO session_graph_nodes(path_digest,session_id,role,linkage,parent_path_digest,evidence,attempt_id,inclusive_total,
-                parent_session_id,link_basis,parent_reason,claimed_parent_session_id,forked) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-                params![rollout.0, session, role, linkage, parent, parent.map(|_| "same_session_prefix"), rollout.3, total,
+            tx.prepare_cached("INSERT INTO session_graph_nodes(path_digest,session_id,role,linkage,parent_path_digest,evidence,attempt_id,inclusive_total,
+                parent_session_id,link_basis,parent_reason,claimed_parent_session_id,forked) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)")?
+                    .execute(params![rollout.0, session, role, linkage, parent, parent.map(|_| "same_session_prefix"), rollout.3, total,
                     linked.map(|l| l.0), linked.map(|l| l.1), reason, claimed, forked.is_some()])?;
         }
     }
@@ -168,8 +172,9 @@ pub fn store(tx: &Connection, entries: &[Entry]) -> Result<(usize, usize)> {
         for (sum, v) in bucket.4.iter_mut().zip(c) { *sum += v; }
     }
     for ((session, bucket, segment), (model, first, last, count, c)) in &buckets {
-        tx.execute("INSERT INTO model_segments(session_id,bucket,segment,model,first_position,last_position,entries,input_tokens,output_tokens,reasoning_tokens,total_tokens)
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![session, bucket, segment, model, first, last, count, c[0], c[1], c[2], c[3]])?;
+        tx.prepare_cached("INSERT INTO model_segments(session_id,bucket,segment,model,first_position,last_position,entries,input_tokens,output_tokens,reasoning_tokens,total_tokens)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)")?
+                .execute(params![session, bucket, segment, model, first, last, count, c[0], c[1], c[2], c[3]])?;
         segments += 1;
     }
     Ok((sessions.len(), segments))

@@ -124,13 +124,14 @@ pub fn sync(db: &mut Connection) -> Result<Value> {
     for e in &entries {
         let n = e.normalized.map(|n| n.map(Some)).unwrap_or([None; 7]);
         let native = Value::Object(NATIVE.iter().zip(e.native).map(|(k, v)| ((*k).to_owned(), json!(v))).collect());
-        tx.execute("INSERT INTO usage_entries(entry_id,source,session_id,basis,scope,normalization_version,precedence,position,response_id,model,native,
+        tx.prepare_cached("INSERT INTO usage_entries(entry_id,source,session_id,basis,scope,normalization_version,precedence,position,response_id,model,native,
             input_tokens,cache_read_tokens,new_input_tokens,cache_write_tokens,output_tokens,reasoning_tokens,total_tokens)
-            VALUES(?1,'codex',?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
-            params![e.id, e.session, e.basis, e.scope, NORMALIZATION, e.precedence, e.position, e.response_id, e.model, native.to_string(),
+            VALUES(?1,'codex',?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)")?
+                .execute(params![e.id, e.session, e.basis, e.scope, NORMALIZATION, e.precedence, e.position, e.response_id, e.model, native.to_string(),
                 n[0], n[1], n[2], n[3], n[4], n[5], n[6]])?;
         for (path, disposition, reason) in &e.provenance {
-            tx.execute("INSERT INTO usage_dispositions(entry_id,path_digest,disposition,reason) VALUES(?1,?2,?3,?4)", params![e.id, path, disposition, reason])?;
+            tx.prepare_cached("INSERT INTO usage_dispositions(entry_id,path_digest,disposition,reason) VALUES(?1,?2,?3,?4)")?
+                .execute(params![e.id, path, disposition, reason])?;
             *counts.entry(disposition).or_default() += 1;
         }
     }
@@ -143,11 +144,28 @@ pub fn sync(db: &mut Connection) -> Result<Value> {
     Ok(json!({"entries": entries.len(), "dispositions": counts, "sessions": sessions, "model_segments": segments, "quota_windows": windows}))
 }
 
+fn synced(db: &Connection) -> Result<bool> {
+    Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='usage_ledger')", [], |r| r.get::<_, bool>(0))?
+        && db.query_row("SELECT 1 FROM usage_ledger", [], |_| Ok(())).optional()?.is_some())
+}
+
+/// `(disposition, reason, count)`: see `open_dispositions`.
+pub type OpenDisposition = (String, Option<String>, i64);
+
+/// `(disposition, reason, count)` of the synced ledger's `conflict` and
+/// `unresolved` dispositions, read-only; `None` before the first sync. The
+/// counts `read` would give, without building every entry (TM4.5's
+/// `accounting_conflict` rule; certificate-scale.md §5).
+pub fn open_dispositions(db: &Connection) -> Result<Option<Vec<OpenDisposition>>> {
+    if !synced(db)? { return Ok(None); }
+    Ok(Some(db.prepare("SELECT p.disposition,p.reason,count(*) FROM usage_dispositions p JOIN usage_entries e ON e.entry_id=p.entry_id
+        WHERE p.disposition IN ('conflict','unresolved') GROUP BY p.disposition,p.reason ORDER BY p.disposition,p.reason")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?))
+}
+
 /// The synced ledger as JSON, read-only; `ledger_not_synced` before the first sync.
 pub fn read(db: &Connection) -> Result<Value> {
-    let synced = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='usage_ledger')", [], |r| r.get::<_, bool>(0))?
-        && db.query_row("SELECT 1 FROM usage_ledger", [], |_| Ok(())).optional()?.is_some();
-    if !synced { return Ok(super::unavailable("ledger_not_synced")); }
+    if !synced(db)? { return Ok(super::unavailable("ledger_not_synced")); }
     let mut provenance = BTreeMap::<String, Vec<Value>>::new();
     let mut stmt = db.prepare("SELECT entry_id,path_digest,disposition,reason FROM usage_dispositions ORDER BY entry_id,path_digest")?;
     for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?)))? {

@@ -12,7 +12,8 @@ needs a new reviewed revision, not a silent reinterpretation.
 - §0–§8 below: the thin-slice contracts.
 - Sidecar streams (phase 2, card S0): `telemetry.db` is versioned per stream
   in `telemetry_streams(stream, version)`: `codex` (§5, migrations under
-  `migrations/telemetry/`, also `user_version`), and one stream per lane under
+  `migrations/telemetry/`, also `user_version`; 3 adds TM5.1's read indexes,
+  certificate-scale.md §5), and one stream per lane under
   `migrations/telemetry/<stream>/`: `ingest`, `accounting`, `quality`,
   `review`, `analytics` (TM4.1 aggregate revisions), `health` (TM4.5 alert
   state). A reader refuses only a
@@ -51,7 +52,7 @@ needs a new reviewed revision, not a silent reinterpretation.
   (RFC 8785 subset, as doc 03 §4). Digests are `sha256:` + lowercase hex.
 - **Time.** Unix milliseconds from the controller's `now` at the transition.
   Codex times are kept as reported and never reorder canonical events.
-- **Stores.** Canonical: `<project>/.state/state.db`, migrations 0049–0066 (0052 collector bindings, contracts-collection.md; 0053 candidate groups, contracts-quality.md §3; 0054 review capture, contracts-review.md; 0055 finding triage and duplicate history, contracts-review.md §5; 0056 fix attribution, regressions and role credit, contracts-review.md §6; 0057 review protocols, passes and preregistered experiments, contracts-review.md §7; 0058 seeded defects, recall and the seeded-candidate integration guard, contracts-review.md §8; 0059 review ledger, contracts-review.md §9; 0060 accepted supersession reasons, contracts-accounting.md §10; 0061 delegated code_review authority, review acceptance decisions and revocations, contracts-review.md §10; 0062 review launch: blind review briefs bound to review tasks, review sessions recorded by the reservation that launches them, and delegated decisions in the shared review ledger, contracts-review.md §11; 0063 review opportunity openings and assignments in the shared review ledger, so every `--as-of` review, seed and protocol view replays them, contracts-review.md §9; 0065 assignment-policy settings, owner-signed `randomized_assignment` grants and the policy record of assigned decisions, contracts-evaluation.md §9; 0064 replay suite registry, hidden checks and replay candidates, contracts-replay.md; 0066 owner-signed revocations of randomized-assignment grants, contracts-evaluation.md §9).
+- **Stores.** Canonical: `<project>/.state/state.db`, migrations 0049–0067 (0052 collector bindings, contracts-collection.md; 0053 candidate groups, contracts-quality.md §3; 0054 review capture, contracts-review.md; 0055 finding triage and duplicate history, contracts-review.md §5; 0056 fix attribution, regressions and role credit, contracts-review.md §6; 0057 review protocols, passes and preregistered experiments, contracts-review.md §7; 0058 seeded defects, recall and the seeded-candidate integration guard, contracts-review.md §8; 0059 review ledger, contracts-review.md §9; 0060 accepted supersession reasons, contracts-accounting.md §10; 0061 delegated code_review authority, review acceptance decisions and revocations, contracts-review.md §10; 0062 review launch: blind review briefs bound to review tasks, review sessions recorded by the reservation that launches them, and delegated decisions in the shared review ledger, contracts-review.md §11; 0063 review opportunity openings and assignments in the shared review ledger, so every `--as-of` review, seed and protocol view replays them, contracts-review.md §9; 0065 assignment-policy settings, owner-signed `randomized_assignment` grants and the policy record of assigned decisions, contracts-evaluation.md §9; 0064 replay suite registry, hidden checks and replay candidates, contracts-replay.md; 0066 owner-signed revocations of randomized-assignment grants, contracts-evaluation.md §9; 0067 read indexes for the telemetry projections, `verified_results(submission_id)` and `result_submissions(attempt_id)`, certificate-scale.md §5).
   Sidecar: `<project>/.state/telemetry.db`, own sequence under
   `migrations/telemetry/` (per-lane streams; see the lane contracts: e.g.
     `ingest` 0006 tool/exec metadata, 0007 subagent detail, per-source ingest
@@ -417,7 +418,10 @@ S5 refinements:
   collect adds `collected{files, bytes, records, reevaluated, budget_exhausted}`. Budget:
   256 MiB per CLI collect, 8 MiB per ticker collect (once per 300 s per project,
   `HERDR_PROJECTS_TELEMETRY_COLLECT_SECS`, `0` off; no sidecar is created for a
-  project without a Codex home). Lines over 16 MiB are skipped whole.
+  project without a Codex home). Lines over 16 MiB are skipped whole. The
+  ticker's telemetry pass (collect, then every lane's tick) runs on its own
+  thread, one project at a time; the ticker's pass never waits for it
+  (certificate-scale.md §5).
 - Homes scanned = `execution_home` of Codex `effective_profile`s in
   `attempt_inputs` plus Codex `native_profiles`; symlinks are not followed,
   depth ≤ 4. Paths are stored as `sha256:` digests (`path_digest`,

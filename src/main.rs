@@ -1,12 +1,16 @@
-/// Test harness only, as in the library: SQLite's memory statistics serialize
-/// every allocation of every parallel test on one process-wide mutex.
-#[cfg(all(test, feature = "state-store"))]
+/// SQLite's memory statistics serialize every allocation of every thread on
+/// one process-wide mutex. Off in every build of the binary (as in the
+/// library's tests): the ticker runs its telemetry pass on a thread beside the
+/// controller, and with statistics on a continuous pass doubled the
+/// controller's admission decision time (docs/telemetry/certificate-scale.md
+/// §5). Nothing here reads the statistics or sets a heap limit.
+#[cfg(feature = "state-store")]
 #[used]
 #[unsafe(link_section = ".init_array")]
-static SQLITE_TEST_MEMSTATUS_HOOK: unsafe extern "C" fn() = disable_sqlite_test_memstatus;
+static SQLITE_MEMSTATUS_HOOK: unsafe extern "C" fn() = disable_sqlite_memstatus;
 
-#[cfg(all(test, feature = "state-store"))]
-unsafe extern "C" fn disable_sqlite_test_memstatus() {
+#[cfg(feature = "state-store")]
+unsafe extern "C" fn disable_sqlite_memstatus() {
     // SAFETY: runs from .init_array before main and before any SQLite use.
     unsafe { rusqlite::ffi::sqlite3_config(rusqlite::ffi::SQLITE_CONFIG_MEMSTATUS, 0) };
 }

@@ -520,14 +520,17 @@ fn contains_canary(bytes: &[u8]) -> bool {
 
 /// Card S0: a sidecar written before streams existed (`user_version` 2, no
 /// `telemetry_streams`) reads unchanged and is not upgraded by a read; the next
-/// collect upgrades it in place, idempotently, to stream `codex=2` with
-/// byte-identical `usage`; a stream newer than this binary is refused.
+/// collect upgrades it in place, idempotently, to the current stream `codex`
+/// (3: TM5.1's read indexes) with byte-identical `usage`; a stream newer than
+/// this binary is refused.
 #[test]
 fn sidecar_streams_upgrade_v2_store() {
     let f = Fixture::new();
     f.rollout(&f.home, SID, &["head.jsonl"], &f.worktree(), f.decided + 1_000, "0.154.0");
     f.cli("collect");
-    f.sidecar().execute_batch("DROP TABLE telemetry_streams").unwrap();
+    // Back to a v2 sidecar: no streams table, no codex 0003 indexes.
+    f.sidecar().execute_batch("DROP TABLE telemetry_streams; DROP INDEX codex_usage_by_path; DROP INDEX rollout_sources_by_attempt;
+        DROP INDEX codex_usage_by_turn; DROP INDEX codex_usage_by_response; PRAGMA user_version = 2").unwrap();
     let streams = |f: &Fixture| f.sidecar().prepare("SELECT stream,version FROM telemetry_streams ORDER BY stream").unwrap()
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))).unwrap().map(Result::unwrap).collect::<Vec<_>>();
     let user_version = |f: &Fixture| f.sidecar().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap();
@@ -546,12 +549,12 @@ fn sidecar_streams_upgrade_v2_store() {
     let expected = |extra: (&str, i64)| {
         let mut streams: std::collections::BTreeMap<String, i64> = herdr_projects::telemetry::LANES.iter().filter(|l| !l.migrations.is_empty())
             .map(|l| (l.stream.to_owned(), l.migrations.len() as i64)).collect();
-        streams.insert("codex".to_owned(), 2);
+        streams.insert("codex".to_owned(), 3);
         streams.insert(extra.0.to_owned(), extra.1);
         streams.into_iter().collect::<Vec<_>>()
     };
-    assert_eq!(streams(&f), expected(("codex", 2)));
-    assert_eq!(user_version(&f), 2);
+    assert_eq!(streams(&f), expected(("codex", 3)));
+    assert_eq!(user_version(&f), 3);
     let before = tree(&state);
     assert_eq!(f.cli_args(&["usage", "--json"]).1, v2, "usage is byte-identical after the upgrade");
     assert_eq!(metric(&f.report(), "M08")["value"], 1000);

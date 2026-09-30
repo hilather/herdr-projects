@@ -276,7 +276,7 @@ pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Co
     for key in reread.difference(&seen) {
         db.execute("UPDATE rollout_sources SET reevaluation='rollout_unavailable' WHERE path_digest=?1", [key])?;
     }
-    bind(&db, &attempts)?;
+    bind(&mut db, &attempts)?;
     terminated_turns(&db, &attempts)?;
     super::maintenance::enforce(&mut db, &tombstones)?;
     Ok(Some(done))
@@ -1270,13 +1270,22 @@ fn terminated_turns(db: &Connection, attempts: &[CanonicalAttempt]) -> Result<()
 /// keeps rollouts that started before the revocation (their accepted usage is
 /// never erased) and binds none that start at or after it. Attempts that
 /// predate 0052 fall back to rules 1-4 on their retained inputs.
-fn bind(db: &Connection, attempts: &[CanonicalAttempt]) -> Result<()> {
-    let sources: Vec<(String, String, Option<i64>, Option<String>)> = db.prepare("SELECT path_digest,home_digest,session_unix_ms,cwd_attempt FROM rollout_sources")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
-    for (key, home, at, cwd_attempt) in sources {
+///
+/// One transaction that writes only the sources whose result changed, with
+/// the attempts looked up by id: per source and one commit each, a large
+/// history made every collect quadratic and fsync-bound (certificate-scale.md §5).
+fn bind(db: &mut Connection, attempts: &[CanonicalAttempt]) -> Result<()> {
+    let mut by_id = std::collections::BTreeMap::<&str, Vec<&CanonicalAttempt>>::new();
+    for a in attempts.iter().filter(|a| a.codex()) { by_id.entry(a.id.as_str()).or_default().push(a); }
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    type Row = (String, String, Option<i64>, Option<String>, String, Option<String>, Option<String>);
+    let sources: Vec<Row> = tx.prepare("SELECT s.path_digest,s.home_digest,s.session_unix_ms,s.cwd_attempt,s.binding,s.attempt_id,b.basis
+        FROM rollout_sources s LEFT JOIN source_bindings b ON b.path_digest=s.path_digest")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?.collect::<rusqlite::Result<_>>()?;
+    for (key, home, at, cwd_attempt, stored, stored_attempt, stored_basis) in sources {
         let rule1 = |h: &Option<String>| h.as_ref().is_some_and(|h| digest(h.as_bytes()) == home);
         let (mut matches, mut refused) = (Vec::new(), None);
-        for a in attempts.iter().filter(|a| a.codex() && cwd_attempt.as_deref() == Some(a.id.as_str())) {
+        for a in cwd_attempt.as_deref().and_then(|id| by_id.get(id)).into_iter().flatten().copied() {
             let Some(at) = at.filter(|at| a.decided_unix_ms.is_some_and(|decided| *at >= decided)) else { continue };
             match &a.binding {
                 Binding::Predates if rule1(&a.home) => matches.push((a, "predates_binding")),
@@ -1292,8 +1301,13 @@ fn bind(db: &Connection, attempts: &[CanonicalAttempt]) -> Result<()> {
             [(one, basis)] => ("bound", Some(one.id.as_str()), *basis),
             _ => ("ambiguous", None, "ambiguous"),
         };
-        db.execute("UPDATE rollout_sources SET binding=?2,attempt_id=?3 WHERE path_digest=?1", params![key, binding, attempt])?;
-        db.execute("INSERT INTO source_bindings(path_digest,basis) VALUES(?1,?2) ON CONFLICT(path_digest) DO UPDATE SET basis=excluded.basis", params![key, basis])?;
+        if stored != binding || stored_attempt.as_deref() != attempt {
+            tx.execute("UPDATE rollout_sources SET binding=?2,attempt_id=?3 WHERE path_digest=?1", params![key, binding, attempt])?;
+        }
+        if stored_basis.as_deref() != Some(basis) {
+            tx.execute("INSERT INTO source_bindings(path_digest,basis) VALUES(?1,?2) ON CONFLICT(path_digest) DO UPDATE SET basis=excluded.basis", params![key, basis])?;
+        }
     }
+    tx.commit()?;
     Ok(())
 }

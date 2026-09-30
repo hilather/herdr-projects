@@ -158,18 +158,18 @@ pub fn store(tx: &Connection) -> Result<usize> {
                 },
                 _ => ("incomplete", None),
             };
-            tx.execute("INSERT INTO quota_window_observations(session_id,ordinal,service,account,limit_id,window_kind,unit,window_minutes,resets_unix_ms,used,remaining,
-                plan_type,observed_unix_ms,trust,window_id,rate_limit_reached_type) VALUES(?1,?2,'codex',?3,?4,?5,'percent',?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-                params![session, ordinal, account.as_ref().filter(|_| homes == 1), limit, kind, minutes, resets, used.map(show), used.map(|u| show(HUNDRED - u)),
+            tx.prepare_cached("INSERT INTO quota_window_observations(session_id,ordinal,service,account,limit_id,window_kind,unit,window_minutes,resets_unix_ms,used,remaining,
+                plan_type,observed_unix_ms,trust,window_id,rate_limit_reached_type) VALUES(?1,?2,'codex',?3,?4,?5,'percent',?6,?7,?8,?9,?10,?11,?12,?13,?14)")?
+                    .execute(params![session, ordinal, account.as_ref().filter(|_| homes == 1), limit, kind, minutes, resets, used.map(show), used.map(|u| show(HUNDRED - u)),
                     plan, observed, trust, window_id, reached])?;
         }
     }
     done.extend(current.into_values());
     for w in &done {
-        tx.execute("INSERT INTO quota_windows(window_id,service,account,limit_id,window_kind,unit,window_minutes,window_start_unix_ms,resets_unix_ms,start_evidence,
+        tx.prepare_cached("INSERT INTO quota_windows(window_id,service,account,limit_id,window_kind,unit,window_minutes,window_start_unix_ms,resets_unix_ms,start_evidence,
             first_observed_unix_ms,last_observed_unix_ms,first_used,used,remaining,observed_increase,plan_type,observations,flagged)
-            VALUES(?1,'codex',?2,?3,?4,'percent',?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
-            params![w.id, w.account, w.limit, w.kind, w.minutes, w.resets - w.minutes * 60_000, w.resets, w.evidence, w.first_observed, w.last_observed,
+            VALUES(?1,'codex',?2,?3,?4,'percent',?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)")?
+                .execute(params![w.id, w.account, w.limit, w.kind, w.minutes, w.resets - w.minutes * 60_000, w.resets, w.evidence, w.first_observed, w.last_observed,
                 show(w.first_used), show(w.used), show(HUNDRED - w.used), show(w.used - w.first_used), w.plan, w.observations, w.flagged])?;
     }
     Ok(done.len())
@@ -210,13 +210,14 @@ fn decisions(project: &Path) -> Result<Vec<Decision>> {
 /// `not_reported` (the latest snapshot's window was `null`), `not_collected`
 /// (no snapshot carries the kind, e.g. read before A4), else `no_trusted_observation`.
 fn window(db: &Connection, account: &str, limit: &str, kind: &str, decided: i64) -> Result<Value> {
-    let trusted = db.query_row("SELECT window_id,observed_unix_ms,resets_unix_ms,window_minutes,used,remaining FROM quota_window_observations
+    let trusted = db.prepare_cached("SELECT window_id,observed_unix_ms,resets_unix_ms,window_minutes,used,remaining FROM quota_window_observations
         WHERE account=?1 AND limit_id=?2 AND window_kind=?3 AND observed_unix_ms<=?4 AND trust='trusted'
-        ORDER BY observed_unix_ms DESC,session_id DESC,ordinal DESC LIMIT 1", params![account, limit, kind, decided],
+        ORDER BY observed_unix_ms DESC,session_id DESC,ordinal DESC LIMIT 1")?.query_row(params![account, limit, kind, decided],
         |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?))).optional()?;
     let Some((window, observed, resets, minutes, used, remaining)) = trusted else {
-        let latest: Option<String> = db.query_row("SELECT trust FROM quota_window_observations WHERE account=?1 AND limit_id=?2 AND window_kind=?3 AND observed_unix_ms<=?4
-            ORDER BY observed_unix_ms DESC,session_id DESC,ordinal DESC LIMIT 1", params![account, limit, kind, decided], |r| r.get(0)).optional()?;
+        let latest: Option<String> = db.prepare_cached("SELECT trust FROM quota_window_observations WHERE account=?1 AND limit_id=?2 AND window_kind=?3 AND observed_unix_ms<=?4
+            ORDER BY observed_unix_ms DESC,session_id DESC,ordinal DESC LIMIT 1")?
+                .query_row(params![account, limit, kind, decided], |r| r.get(0)).optional()?;
         let reason = match latest.as_deref() { Some("not_reported") => "not_reported", None => "not_collected", Some(_) => "no_trusted_observation" };
         return Ok(json!({"limit_id": limit, "window_kind": kind, "value": unavailable(reason)}));
     };
@@ -225,8 +226,8 @@ fn window(db: &Connection, account: &str, limit: &str, kind: &str, decided: i64)
         "resets_unix_ms": resets, "observed_unix_ms": observed, "age_ms": age});
     // Other homes that reported this very window (same limit, kind, length and reset) by the decision:
     // probably one login. Named, never merged; their values are not used here.
-    let shared: Vec<String> = db.prepare("SELECT DISTINCT account FROM quota_window_observations WHERE limit_id=?1 AND window_kind=?2 AND window_minutes=?3
-        AND abs(resets_unix_ms-?4)<=?6 AND observed_unix_ms<=?5 AND trust='trusted' AND account IS NOT NULL ORDER BY account")?
+    let shared: Vec<String> = db.prepare_cached("SELECT DISTINCT account FROM quota_window_observations WHERE limit_id=?1 AND window_kind=?2 AND window_minutes=?3
+        AND resets_unix_ms BETWEEN ?4-?6 AND ?4+?6 AND observed_unix_ms<=?5 AND trust='trusted' AND account IS NOT NULL ORDER BY account")?
         .query_map(params![limit, kind, minutes, resets, decided, RESETS_TOLERANCE_MS], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
     if shared.iter().any(|a| a != account) { entry["shared_window_candidates"] = json!(shared); }
     if decided >= resets {
@@ -244,9 +245,16 @@ fn window(db: &Connection, account: &str, limit: &str, kind: &str, decided: i64)
 /// Native percent; never summed across accounts, limits, kinds or services.
 pub(crate) fn headroom(db: &Connection, home: &str, decided: i64) -> Result<Value> {
     let account = format!("sha256:{:x}", <sha2::Sha256 as sha2::Digest>::digest(home.as_bytes()));
-    let seen: i64 = db.query_row("SELECT count(*) FROM quota_window_observations WHERE account=?1 AND observed_unix_ms<=?2", params![account, decided], |r| r.get(0))?;
-    if seen == 0 { return Ok(json!({"account": account, "account_basis": ACCOUNT_BASIS, "value": unavailable("no_observation")})); }
-    let limits: Vec<String> = db.prepare("SELECT DISTINCT limit_id FROM quota_window_observations WHERE account=?1 AND observed_unix_ms<=?2 AND trust='trusted' ORDER BY limit_id")?
+    // Both lookups run once per dispatch decision: an existence test, and the
+    // account's few limit ids walked through the index (a plain DISTINCT read
+    // every observation of the account each time; certificate-scale.md §5).
+    let seen: bool = db.prepare_cached("SELECT EXISTS(SELECT 1 FROM quota_window_observations WHERE account=?1 AND observed_unix_ms<=?2)")?
+        .query_row(params![account, decided], |r| r.get(0))?;
+    if !seen { return Ok(json!({"account": account, "account_basis": ACCOUNT_BASIS, "value": unavailable("no_observation")})); }
+    let limits: Vec<String> = db.prepare_cached("WITH RECURSIVE ids(id) AS (SELECT min(limit_id) FROM quota_window_observations WHERE account=?1
+        UNION ALL SELECT (SELECT min(limit_id) FROM quota_window_observations WHERE account=?1 AND limit_id>ids.id) FROM ids WHERE ids.id IS NOT NULL)
+        SELECT id FROM ids WHERE id IS NOT NULL AND EXISTS(SELECT 1 FROM quota_window_observations q WHERE q.account=?1 AND q.limit_id=ids.id
+        AND q.observed_unix_ms<=?2 AND q.trust='trusted') ORDER BY id")?
         .query_map(params![account, decided], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
     if limits.is_empty() { return Ok(json!({"account": account, "account_basis": ACCOUNT_BASIS, "value": unavailable("no_trusted_observation")})); }
     let mut windows = Vec::new();

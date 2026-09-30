@@ -11,7 +11,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 const STREAMS_TABLE: &str = "CREATE TABLE IF NOT EXISTS telemetry_streams (stream TEXT PRIMARY KEY, version INTEGER NOT NULL CHECK (version >= 0)) STRICT;";
-const CODEX: &[&str] = &[include_str!("../../migrations/telemetry/0001_codex_usage.sql"), include_str!("../../migrations/telemetry/0002_reevaluation.sql")];
+const CODEX: &[&str] = &[include_str!("../../migrations/telemetry/0001_codex_usage.sql"), include_str!("../../migrations/telemetry/0002_reevaluation.sql"),
+    include_str!("../../migrations/telemetry/0003_read_indexes.sql")];
 
 /// Every stream and its migrations; index + 1 is the stream version.
 fn streams() -> impl Iterator<Item = (&'static str, &'static [&'static str])> {
@@ -184,7 +185,7 @@ pub(super) fn attempt_usage(db: &Connection, attempt: &str) -> Result<Value> {
     // Records collected before their version was certified keep NULL counters
     // until a collect re-reads their rollout, so the session stays uncertified
     // rather than summing to 0; `detail` says when that rollout is gone.
-    let bound: Vec<(String, String, bool, Option<String>)> = db.prepare(&format!("SELECT DISTINCT session_id,
+    let bound: Vec<(String, String, bool, Option<String>)> = db.prepare_cached(&format!("SELECT DISTINCT session_id,
         CASE WHEN EXISTS(SELECT 1 FROM codex_usage u WHERE u.session_id=s.session_id AND u.reason='cli_version_uncertified') THEN '' ELSE cli_version END,
         EXISTS(SELECT 1 FROM codex_quarantine q WHERE q.session_id=s.session_id),{}
         FROM rollout_sources s WHERE binding='bound' AND attempt_id=?1", reevaluation_column(db)?))?
@@ -210,8 +211,8 @@ pub(super) fn attempt_usage(db: &Connection, attempt: &str) -> Result<Value> {
     let mut sums = [0i64; 6];
     let mut records = 0;
     for (session, ..) in &bound {
-        let row: Option<[i64; 7]> = db.query_row("SELECT count(*),sum(input_tokens),sum(cached_input_tokens),sum(cache_write_input_tokens),
-            sum(output_tokens),sum(reasoning_output_tokens),sum(total_tokens) FROM codex_usage WHERE session_id=?1 AND accepted=1 AND NOT EXISTS(SELECT 1 FROM codex_usage e WHERE e.session_id=codex_usage.session_id AND e.accepted=1 AND e.response_id IS NOT NULL AND e.response_id=codex_usage.response_id AND e.payload_digest=codex_usage.payload_digest AND e.ordinal<codex_usage.ordinal)", [session],
+        let row: Option<[i64; 7]> = db.prepare_cached("SELECT count(*),sum(input_tokens),sum(cached_input_tokens),sum(cache_write_input_tokens),
+            sum(output_tokens),sum(reasoning_output_tokens),sum(total_tokens) FROM codex_usage WHERE session_id=?1 AND accepted=1 AND NOT EXISTS(SELECT 1 FROM codex_usage e WHERE e.session_id=codex_usage.session_id AND e.accepted=1 AND e.response_id IS NOT NULL AND e.response_id=codex_usage.response_id AND e.payload_digest=codex_usage.payload_digest AND e.ordinal<codex_usage.ordinal)")?.query_row([session],
             |r| Ok([r.get(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0), r.get::<_, Option<i64>>(2)?.unwrap_or(0), r.get::<_, Option<i64>>(3)?.unwrap_or(0),
                 r.get::<_, Option<i64>>(4)?.unwrap_or(0), r.get::<_, Option<i64>>(5)?.unwrap_or(0), r.get::<_, Option<i64>>(6)?.unwrap_or(0)])).optional()?;
         if let Some(row) = row {

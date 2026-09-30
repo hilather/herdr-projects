@@ -1506,3 +1506,21 @@ Tests (tests/telemetry_accounting.rs, the live-2 conformance fixtures):
 | `live2-fork` of `complete` (1680): `parent_not_collected` (320 unlinked) before the origin, then `linked_child` (`forked_from_id`, `live`), inclusion `separate`, reconciliation `reconciled` ×2, rollup 1680 / 320 / 0 (never 1680 + 2000), M08/M09 1800/200; without A8 `predates_collection`, then `pending_reread`, children and linked rollup never summed | `live_fork_is_separate_and_never_adds_its_reported_totals` |
 | Quota jitter ±5 s and `null` plans: one window; a shared-window candidate across homes within the tolerance; +120 s `reset_moved`, back to R `window_regressed` | `resets_jitter_and_null_plan_stay_one_window` |
 | Changed on purpose: spawned and fork links `live` (`child_sessions_link_to_parent_without_double_count`); M17 `3/5` with the `failed` exit-1 item a failure (`tool_volume_success_and_latency_are_honest`); `declined_or_aborted: 0` in every M16 value; the conformance M17 `2/3`, executed 3 (`live_run2_shapes_are_collected_without_content`) | as named |
+
+## 16. Stream 11: quota window lookups (TM5.1)
+
+Stream `accounting` version 11 (`0011_quota_window_lookup.sql`) adds two
+indexes and changes no row or answer. M40 reads, for each dispatch decision,
+each window kind's latest trusted observation and the other homes that
+reported the same window. A kind with no trusted observation (Codex reports
+no secondary window) and the shared-window lookup each scanned the account's
+observations, or all of them, once per decision. `quota_window_observations_trusted`
+(account, limit, kind, trust, observed) and `quota_window_observations_window`
+(limit, kind, length, reset) serve them; the reset tolerance is read as a
+`BETWEEN` range, and the account's limit ids are walked through the index
+instead of a `DISTINCT` over every observation. The sync's session graph now
+groups entries by session once, and the sync reuses its insert statements.
+`ledger::open_dispositions` counts the synced ledger's `conflict` and
+`unresolved` dispositions in SQL; TM4.5's `accounting_conflict` rule reads it
+instead of the whole ledger as JSON (same counts). Measurements:
+[certificate-scale.md](certificate-scale.md) §5.

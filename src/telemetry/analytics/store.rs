@@ -203,7 +203,10 @@ pub fn plans(project: &Path) -> Result<Value> {
     let state = crate::telemetry::read_only(&project.join(".state/state.db"))?;
     let mut out = Vec::new();
     for (name, sql) in super::lifecycle::queries(&state)? {
-        let inherent: &'static [&'static str] = match name { "lifecycle_attempts" => &["a"], "lifecycle_classes" => &["task_classifications"], "lifecycle_replay_candidates" => &["replay_candidates"], _ => &["c"] };
+        // Acceptance times join every verified result once: with the canonical
+        // `verified_results_by_submission` index (0067) SQLite may drive the join from `r`.
+        let inherent: &'static [&'static str] = match name { "lifecycle_attempts" => &["a"], "lifecycle_classes" => &["task_classifications"], "lifecycle_replay_candidates" => &["replay_candidates"],
+            "lifecycle_acceptance_times" => &["c", "r"], _ => &["c"] };
         let proposed = (name == "lifecycle_acceptance_times").then_some("CREATE INDEX verified_results_by_submission ON verified_results(submission_id)");
         out.push(explain(&state, &Plan { name, store: "state.db", owner: "canonical (steward; read-only here)", sql, inherent, proposed })?);
     }

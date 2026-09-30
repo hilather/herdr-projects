@@ -321,14 +321,13 @@ fn evaluate_rule(ctx: &mut Ctx, rule: &'static Rule) -> Result<Vec<Outcome>> {
         Eval::Conflicts => {
             let metric = lane_metric(rule.source);
             let Some(db) = crate::telemetry::sidecar::read(ctx.project)? else { return Ok(vec![unknown(rule, "collection_not_run", metric, unbounded(now))]) };
-            let ledger = crate::telemetry::accounting::ledger::read(&db)?;
-            if ledger["status"] == "unavailable" { return Ok(vec![unknown(rule, ledger["reason"].as_str().unwrap_or("unavailable"), metric, unbounded(now))]); }
+            // Counted in SQL: the whole ledger as JSON took gigabytes at a million events.
+            let Some(open) = crate::telemetry::accounting::ledger::open_dispositions(&db)? else {
+                return Ok(vec![unknown(rule, "ledger_not_synced", metric, unbounded(now))]);
+            };
             let mut counts = BTreeMap::<String, BTreeMap<String, i64>>::new();
-            for p in ledger["entries"].as_array().into_iter().flatten().flat_map(|e| e["provenance"].as_array().into_iter().flatten()) {
-                let disposition = p["disposition"].as_str().unwrap_or_default();
-                if disposition == "conflict" || disposition == "unresolved" {
-                    *counts.entry(disposition.to_owned()).or_default().entry(p["reason"].as_str().unwrap_or("unspecified").to_owned()).or_default() += 1;
-                }
+            for (disposition, reason, n) in open {
+                *counts.entry(disposition).or_default().entry(reason.unwrap_or_else(|| "unspecified".to_owned())).or_default() += n;
             }
             let total = |d: &str| counts.get(d).map_or(0, |m| m.values().sum::<i64>());
             let (conflicts, unresolved) = (total("conflict"), total("unresolved"));

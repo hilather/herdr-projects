@@ -664,18 +664,32 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
 /// Codex usage collect off the poll path: at most once per interval per project
 /// (default 300 s, `HERDR_PROJECTS_TELEMETRY_COLLECT_SECS`, 0 disables), within
 /// the tick byte budget. Writes only the sidecar; never blocks canonical work.
+/// It runs on its own thread, one project at a time, so the pass never waits
+/// for it: its cost grows with retained history (docs/telemetry/certificate-scale.md
+/// §5). A project whose turn comes while another project's pass runs waits for
+/// a later ticker pass.
 #[cfg(feature="state-store")]
 fn telemetry_pass(ctx:&Ctx,log:&Log,slug:&str) {
     static LAST:std::sync::Mutex<std::collections::BTreeMap<String,Instant>>=std::sync::Mutex::new(std::collections::BTreeMap::new());
+    static RUNNING:std::sync::Mutex<Option<std::thread::JoinHandle<()>>>=std::sync::Mutex::new(None);
     let secs=ctx.env.var("HERDR_PROJECTS_TELEMETRY_COLLECT_SECS").and_then(|v|v.parse().ok()).unwrap_or(300u64);
     if secs==0 {return;}
+    let Ok(mut running)=RUNNING.lock() else {return};
+    if running.as_ref().is_some_and(|pass|!pass.is_finished()) {return;}
     let Ok(mut last)=LAST.lock() else {return};
     if last.get(slug).is_some_and(|at|at.elapsed()<Duration::from_secs(secs)) {return;}
     last.insert(slug.to_owned(),Instant::now());drop(last);
-    use herdr_projects::telemetry::codex;
-    if let Err(error)=codex::collect(&ctx.root.join(slug),codex::Budget::TICK,false) {log.line(&format!("{slug}: telemetry collect: {error:#}"));}
-    for lane in &herdr_projects::telemetry::LANES {
-        if let Err(error)=(lane.tick)(&ctx.root.join(slug),codex::Budget::TICK) {log.line(&format!("{slug}: telemetry {} tick: {error:#}",lane.stream));}
+    let (line,slug,project)=(log.clone(),slug.to_owned(),ctx.root.join(slug));
+    let pass=std::thread::Builder::new().name("telemetry-pass".into()).spawn(move||{
+        use herdr_projects::telemetry::codex;
+        if let Err(error)=codex::collect(&project,codex::Budget::TICK,false) {line.line(&format!("{slug}: telemetry collect: {error:#}"));}
+        for lane in &herdr_projects::telemetry::LANES {
+            if let Err(error)=(lane.tick)(&project,codex::Budget::TICK) {line.line(&format!("{slug}: telemetry {} tick: {error:#}",lane.stream));}
+        }
+    });
+    match pass {
+        Ok(pass)=>*running=Some(pass),
+        Err(error)=>log.line(&format!("telemetry pass thread: {error}")),
     }
 }
 /// Whole-store check off the ticker's pass: at most once per interval per

@@ -315,6 +315,11 @@ demo · fleet · unavailable (query_service_down): nothing numeric is shown
 - Services come from M38/M39, which are uncertified (`n/a`), and from M40,
   which is quota at dispatch rather than live headroom. Live window headroom
   is TM4.5's `quota_headroom` rule, and it appears here as an alert.
+- Scale: a snapshot recomputes the whole attempt projection and the reports
+  it reads. With 10,000 retained attempts it takes about 5 s (100,000
+  events) to 15 s (1,000,000), far above doc 10's 250 ms pane and 100 ms
+  digest targets, and `context` pays the same for its section
+  ([certificate-scale.md](certificate-scale.md) §4.4, L5).
 - Weekly report and replay routines use the existing signed routine path
   (§10).
 

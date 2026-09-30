@@ -213,8 +213,8 @@ lane adds no report keys.
 |---|---|---|---|
 | as-of by sequence / time, latest, next, lineage page, buckets | telemetry.db | indexed (`analytics_revisions_cell`, `analytics_revisions_cell_recorded`, lineage primary key) | analytics (this stream) |
 | `lifecycle_attempts`, `lifecycle_contracts`, `lifecycle_classes`, `lifecycle_replay_candidates` | state.db | one pass over the aggregated table; every correlated lookup an index search | canonical |
-| `lifecycle_acceptance_times` | state.db | `verified_results` by `submission_id` uses an automatic index | canonical steward: `CREATE INDEX verified_results_by_submission ON verified_results(submission_id)` (not added: no canonical schema change in TM4.1) |
-| central M08/M13/M15 source scan | telemetry.db | `codex_usage` scanned per source by `path_digest` | codex stream steward: `CREATE INDEX codex_usage_by_path ON codex_usage(path_digest, accepted, reason)` |
+| `lifecycle_acceptance_times` | state.db | one pass over `verified_results` or the contracts it joins (either may drive the join), every other lookup an index search | canonical: `verified_results_by_submission` added by migration 0067 (TM5.1, certificate-scale.md §5); before it, an automatic index per run |
+| central M08/M13/M15 source scan | telemetry.db | one pass over `rollout_sources`; `codex_usage` searched per source by `path_digest` | codex stream 3: `codex_usage_by_path` (TM5.1); before it, `codex_usage` was scanned once per source |
 | usage by session | telemetry.db | indexed (primary key) | codex |
 
 ## 7. Comparisons and experiments (TM4.4)
