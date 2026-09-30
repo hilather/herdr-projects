@@ -317,3 +317,55 @@ Cards:
 - Still unavailable: M18 (the exec item duration is run time minus a
   startup window, not run time); M38/M39 (transport errors never reach
   rollouts); the cache-write convention (always 0 live).
+
+## Dogfooding: measuring workers with herdr-projects itself (DG cards)
+
+On 2026-09-30 the steward kept a hand log of Codex dev workers (gpt-6.1-sol,
+low reasoning) across 11 tasks: time per pass, send-backs, what review caught,
+and tokens. Five tasks were clean on the first pass. Six needed a send-back,
+for a load-only flaky test, a security hole, a resource amplification,
+ticker-wide effects, or a workaround in place of the real fix. None reached
+`main`. The owner's direction: this is what the product should measure once
+it is done. Most of the log already maps to registry metrics:
+
+| Hand-logged | Metric |
+| --- | --- |
+| Send-backs per card | M07 attempt amplification |
+| Accepted first time | M02 acceptance rate; M45 first-candidate CI proxy |
+| What review caught | M21, M22, M28 |
+| Whether fixes held | M25, M27, M48 |
+| Wall time per card | M06 lead time p95 |
+| Tokens | M08, M09 |
+| Steward effort | M31, M32 |
+| Worker A vs worker B | `compare --by configuration`; head to head via M41/M42 candidate groups |
+
+Cards (gaps that stop those questions being answered):
+- **DG1 M30 first-candidate verification rate** has no producer (registry:
+  `absent`). Produce it from the first submission's verification run per
+  task: verified-accepted on the first candidate or not. It is the direct
+  "clean on the first pass" measure.
+- **DG2 M10 cache-read share** has no producer. Codex rollouts already report
+  `cached_input_tokens` (collected in `codex_usage`), so this is a
+  lane-accounting metric definition over existing data. The steward computed
+  91–99 % by hand.
+- **DG3 M03 accepted throughput** lacks operating hours
+  (`operating_hours_not_recorded`). Record the ticker's active intervals per
+  project (it already publishes pass metrics) as the denominator.
+- **DG4 Claude adapter (owner decision).** Deferred in contracts.md §8.
+  Without it a Claude-versus-Codex comparison has no Claude side. It needs a
+  scope decision: collection surface, privacy class, and whether Claude may
+  run as a product worker. Standing policy is Codex only for product runs.
+- **DG5 cost M04/M12 (external).** Needs real rate cards and provider charges
+  imported by the owner (contracts-accounting.md). Still blocked.
+- **DG6 verification flake signal.** Nothing distinguishes "passes alone,
+  fails under concurrent load" (cx2, P3 in the 2026-09-30 log). Candidate:
+  when the same tree gets differing verification verdicts across runs,
+  record a flip rate per policy and as a health rule. It needs a metric
+  definition and registry entry first.
+- **DG7 dogfood the dev loop (after TM5.4).** Run dev cards as herdr-projects
+  tasks instead of the steward's scratchpad runner:
+  - Each worker model and reasoning level is its own configuration, so
+    `compare --by configuration` works.
+  - The steward's review findings go through the review lane (M21/M22/M28).
+  - Send-backs are new attempts on the same task (M07).
+  - It depends on TM5.4 and on DG1.
