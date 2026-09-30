@@ -293,6 +293,10 @@ fn report(
                     for (mark, detail) in herdr_projects::telemetry::workspace::doctor_checks(&dir, &slug, config_dir) {
                         check(&mut out, mark, &label, detail);
                     }
+                    // L1/F6: a retained Codex profile on an uncertified or drifting agent version.
+                    for (mark, detail) in herdr_projects::telemetry::codex::doctor_checks(&dir) {
+                        check(&mut out, mark, &label, detail);
+                    }
                 }
                 if memory == "sqlite-v1" {
                     // A prohibition ("do not edit MEMORY.md") is correct guidance,

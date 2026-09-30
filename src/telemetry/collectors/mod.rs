@@ -15,7 +15,8 @@ pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/in
     include_str!("../../../migrations/telemetry/ingest/0005_codex_threads.sql"),
     include_str!("../../../migrations/telemetry/ingest/0006_codex_tool_metadata.sql"),
     include_str!("../../../migrations/telemetry/ingest/0007_codex_followups.sql"),
-    include_str!("../../../migrations/telemetry/ingest/0008_codex_live_run2.sql")];
+    include_str!("../../../migrations/telemetry/ingest/0008_codex_live_run2.sql"),
+    include_str!("../../../migrations/telemetry/ingest/0009_turn_terminations.sql")];
 
 /// `herdr-projects telemetry <slug> collectors ...`
 #[derive(clap::Subcommand)]
@@ -28,7 +29,8 @@ pub enum Command {
     /// parent ids), the A5 thread lineage (parent thread id, reported session
     /// id, thread source), the span of its usage record times, and (A7) the
     /// subagent detail and whether its last turn's final event was read,
-    /// is still open or is missing, and (A8) whether it was aborted, and a
+    /// is still open, ended by the product's termination (F4) or is missing,
+    /// and (A8) whether it was aborted, and a
     /// fork's fork point and how its reported totals were reconciled. Read-only.
     Sessions,
     /// Per session: the A6 tool call metadata (call id, tool name, status,
@@ -46,7 +48,9 @@ pub enum Command {
     /// rollouts that start from now on are not bound to it (contracts-collection.md).
     Revoke { attempt: String },
     /// Per adapter and source field: whether it is collected, its basis and
-    /// what certifies it (`live`, `fixture` or `none`). Static; reads nothing.
+    /// what certifies it (`live`, `fixture` or `none`); then the project's
+    /// retained Codex profiles with their recorded agent version and a warning
+    /// when it is uncertified or can drift. Read-only.
     Capabilities {
         /// Print JSON instead of text.
         #[arg(long)]
@@ -62,8 +66,8 @@ pub fn run(project: &Path, command: Command) -> Result<String> {
         Command::Sessions => sessions(project)?,
         Command::Tools { json: false } => return Ok(tools_text(&tools(project)?)),
         Command::Tools { json: true } => tools(project)?,
-        Command::Capabilities { json: false } => return Ok(capabilities_text(&capabilities()?)),
-        Command::Capabilities { json: true } => capabilities()?,
+        Command::Capabilities { json: false } => return Ok(capabilities_text(&capabilities(project)?)),
+        Command::Capabilities { json: true } => capabilities(project)?,
         Command::Revoke { attempt } => {
             let mut store = crate::store::SqliteStore::open(&project.join(".state/state.db"))?;
             let (binding, written) = store.revoke_collector_binding(&attempt, jiff::Timestamp::now().as_millisecond())?;
@@ -271,7 +275,7 @@ fn codex_fields() -> Vec<Field> {
 /// `collectors capabilities --json`: the declared table with each collected
 /// field's basis from its sanitizer class. Fails if the table and the
 /// sanitizer allowlist disagree.
-fn capabilities() -> Result<Value> {
+fn capabilities(project: &Path) -> Result<Value> {
     use super::sanitize::{Class, codex_allowlist};
     let declared = codex_fields();
     let mut out = Vec::new();
@@ -298,7 +302,7 @@ fn capabilities() -> Result<Value> {
         }
     }
     Ok(json!({"adapters": [{"adapter": "codex", "interface": "rollout_jsonl", "certified_versions": super::codex::CERTIFIED,
-        "uncertified_version": "cli_version_uncertified", "fields": out}]}))
+        "uncertified_version": "cli_version_uncertified", "fields": out, "profiles": super::codex::profile_versions(project)?}]}))
 }
 
 fn capabilities_text(value: &Value) -> String {
@@ -311,6 +315,14 @@ fn capabilities_text(value: &Value) -> String {
             out += &format!("  {}.{} available={} basis={} certified={}", word("kind"), word("field"), f["available"], word("basis"), word("certified"));
             for key in ["caveat", "reason"] { if let Some(text) = f[key].as_str() { out += &format!(" {key}={text}"); } }
             out += "\n";
+        }
+        for p in adapter["profiles"].as_array().into_iter().flatten() {
+            let word = |key: &str| p[key].as_str().unwrap_or("-").to_owned();
+            out += &format!("profile {} agent {} version {} certified={}\n", word("profile"), word("agent"), word("version"), p["certified"]);
+            for w in p["warnings"].as_array().into_iter().flatten() {
+                out += &format!("  WARNING {}: {}\n", w["code"].as_str().unwrap_or("-"), w["detail"].as_str().unwrap_or(""));
+            }
+            if p["warnings"].as_array().is_some_and(|w| !w.is_empty()) { out += &format!("  to fix: {}\n", super::codex::PIN_ADVICE); }
         }
     }
     out
@@ -352,20 +364,30 @@ fn bindings(project: &Path) -> Result<Value> {
 /// `null` is a value the rollout did not report; `thread.session_id` is also
 /// `null` when it equals `session_id`. `final_event.state`: `no_turn`,
 /// `complete` (the last turn's `task_complete` was read), `aborted` (A8: it
-/// ended with `turn_aborted`), `open` (not yet), or `missing` (a pending
-/// `final_event_missing` coverage gap: idle past the threshold without it);
-/// it needs ingest 0008 too. `fork` (A8, ingest 0008): `null` for a rollout
+/// ended with `turn_aborted`), `ended_by_termination` (F4, ingest 0009: the
+/// product ended the bound attempt while the turn was open; `termination`
+/// then names the receipt's cause and time), `open` (not yet), or `missing`
+/// (a pending `final_event_missing` coverage gap: idle past the threshold
+/// without it); it needs ingest 0008 too. `fork` (A8, ingest 0008): `null` for a rollout
 /// that names no fork point, else `{forked_from_ordinal_exclusive,
 /// history_base {thread_id, end_ordinal_exclusive, end_byte_offset},
 /// reconciliation {thread_total, token_count_total}}`, a
 /// `codex_fork_reconciliation` state per reported total (`null` before one is
-/// reconciled or without `history_base.thread_id`). Read-only.
+/// reconciled or without `history_base.thread_id`). `after_termination` (F3):
+/// for a rollout bound to an attempt with a termination receipt,
+/// `{terminated_unix_ms, records, first_unix_ms}` counts its usage records
+/// whose line time is after the receipt (a later `codex exec resume` of the
+/// ended attempt's session, still charged to it), else `null`; `unavailable`
+/// without record times (ingest < 4). Read-only (the canonical store too).
 fn sessions(project: &Path) -> Result<Value> {
     let Some(db) = super::sidecar::read(project)? else { return Ok(json!({"sessions": unavailable("collection_not_run")})) };
+    let terminated_at: BTreeMap<String, i64> = super::codex::canonical_attempts(project)?.iter()
+        .filter_map(|a| a.terminated_unix_ms().map(|at| (a.id().to_owned(), at))).collect();
     let a4 = exists(&db, "rollout_metadata")?;
     let a5 = exists(&db, "rollout_threads")?;
     let a7 = exists(&db, "rollout_ingest_state")?;
     let a8 = exists(&db, "rollout_forks")?;
+    let terminations = exists(&db, "rollout_turn_terminations")?;
     let columns = if a4 {
         "m.model_provider,m.forked_from_id,m.subagent_kind,m.subagent_parent_thread_id,m.subagent_depth,
         (SELECT count(t.record_unix_ms) FROM codex_usage u JOIN codex_usage_times t USING(session_id,ordinal) WHERE u.path_digest=s.path_digest),
@@ -388,8 +410,11 @@ fn sessions(project: &Path) -> Result<Value> {
         (SELECT state FROM codex_fork_reconciliation r WHERE r.session_id=s.session_id AND r.kind='token_count_total')",
             format!("{join} LEFT JOIN rollout_forks k ON k.path_digest=s.path_digest LEFT JOIN rollout_turn_ends e ON e.path_digest=s.path_digest"))
     } else { ("NULL,NULL,NULL,NULL,0,0,0,NULL,NULL", join) };
+    let (ended, join) = if terminations && a7 {
+        ("t.cause,t.terminated_unix_ms", format!("{join} LEFT JOIN rollout_turn_terminations t ON t.path_digest=s.path_digest AND t.turn_offset=x.last_turn_offset"))
+    } else { ("NULL,NULL", join) };
     let mut stmt = db.prepare(&format!("SELECT s.session_id,s.path_digest,s.binding,s.attempt_id,s.records,
-        (SELECT count(*) FROM codex_usage u WHERE u.path_digest=s.path_digest),{columns},{threads},{followups},{live2} FROM rollout_sources s {join}
+        (SELECT count(*) FROM codex_usage u WHERE u.path_digest=s.path_digest),{columns},{threads},{followups},{live2},{ended} FROM rollout_sources s {join}
         ORDER BY s.session_id,s.path_digest"))?;
     let rows = stmt.query_map([], |r| {
         let waiting = |table: bool, read: usize| Ok::<_, rusqlite::Error>(match (table, r.get::<_, bool>(read)?) {
@@ -409,14 +434,20 @@ fn sessions(project: &Path) -> Result<Value> {
             None => {
                 let (opened, turn, completed, missing): (Option<i64>, Option<String>, bool, bool) = (r.get(21)?, r.get(22)?, r.get(23)?, r.get(25)?);
                 let aborted: bool = r.get(31)?;
+                let ended: (Option<String>, Option<i64>) = (r.get(35)?, r.get(36)?);
                 let state = match (opened, completed, missing) {
                     (None, ..) => "no_turn",
                     (_, true, _) if aborted => "aborted",
                     (_, true, _) => "complete",
+                    _ if ended.0.is_some() => "ended_by_termination",
                     (_, _, true) => "missing",
                     _ => "open",
                 };
-                json!({"state": state, "turn_id": turn})
+                match ended {
+                    (Some(cause), at) if state == "ended_by_termination" =>
+                        json!({"state": state, "turn_id": turn, "termination": {"cause": cause, "observed_unix_ms": at}}),
+                    _ => json!({"state": state, "turn_id": turn}),
+                }
             }
         };
         let text = |i: usize| r.get::<_, Option<String>>(i).map(|v| known(json!(v)));
@@ -436,7 +467,17 @@ fn sessions(project: &Path) -> Result<Value> {
         };
         let thread = json!({"parent_thread_id": r.get::<_, Option<String>>(15)?, "session_id": r.get::<_, Option<String>>(16)?,
             "source": r.get::<_, Option<String>>(17)?});
+        let after_termination = match r.get::<_, Option<String>>(3)?.and_then(|attempt| terminated_at.get(&attempt).copied()) {
+            None => Value::Null,
+            Some(_) if !a4 => unavailable("predates_collection"),
+            Some(at) => {
+                let (records, first): (i64, Option<i64>) = db.query_row("SELECT count(*),min(t.record_unix_ms) FROM codex_usage u JOIN codex_usage_times t USING(session_id,ordinal)
+                    WHERE u.path_digest=?1 AND t.record_unix_ms>?2", rusqlite::params![r.get::<_, String>(1)?, at], |q| Ok((q.get(0)?, q.get(1)?)))?;
+                json!({"terminated_unix_ms": at, "records": records, "first_unix_ms": first})
+            }
+        };
         Ok(json!({"session_id": r.get::<_, String>(0)?, "path_digest": r.get::<_, String>(1)?, "binding": r.get::<_, String>(2)?,
+            "after_termination": after_termination,
             "attempt_id": r.get::<_, Option<String>>(3)?, "records": r.get::<_, i64>(4)?, "model_provider": text(6)?, "forked_from_id": text(7)?,
             "subagent": known(json!({"kind": r.get::<_, Option<String>>(8)?, "detail": detail, "parent_thread_id": r.get::<_, Option<String>>(9)?,
                 "depth": r.get::<_, Option<i64>>(10)?})), "final_event": final_event, "fork": fork,

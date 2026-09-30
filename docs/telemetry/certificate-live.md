@@ -133,7 +133,20 @@ Reproductions without a model call, using `codex sandbox`:
 
 So the refusal comes from how Codex 0.154.0 resolves its own sandbox policy
 for a linked worktree's gitdir. The product sandbox is not the cause. The
-exact trigger inside Codex was not isolated.
+exact trigger inside Codex was not isolated in this run.
+
+**Root cause, found after the run (F2, fixed):** Codex binds its writable
+roots with bubblewrap, shallowest first, each followed by its protections,
+and it protects the Git directory a linked worktree's `.git` pointer names
+(`<common>/worktrees/<id>`) read-only unless that path is itself a writable
+root. The attempt worktree lies deeper than the common directory, so the
+read-only administrative directory is bound on top of the writable common
+directory. The nested-namespace imitation above used a worktree at the same
+depth as the repository, which hides the order dependence; the "config file
+only" row failed because `codex sandbox` ignores `sandbox_mode` from the
+file. The product now names the administrative directory as a Codex writable
+root for every isolated Codex attempt. Evidence and the regression test are
+in [the worker isolation review](../reviews/2026-09-29-worker-isolation.md#codexs-own-sandbox-inside-the-worker-sandbox-live-run-card-f-commit).
 
 Run B kept the product sandbox unchanged and set Codex to
 `danger-full-access`. The commit then landed in the quarantine as designed
@@ -155,7 +168,9 @@ its projects root under `$HOME` depends on the spool being in
 - **L-iso-2:** the product sandbox cannot constrain Codex's sandbox choice.
   With Codex `workspace-write`, a Codex worker cannot commit in an attempt
   worktree (§2.2). With `danger-full-access`, Codex relies on the product
-  sandbox alone.
+  sandbox alone. *Since fixed for the commit (F2):* with the product's
+  writable-roots override, `workspace-write` commits; the mode itself stays
+  the deployment's choice.
 
 ### 2.4 Product gap: the reviewer brief names a bare `herdr-projects`
 
@@ -479,23 +494,53 @@ them. Uncollected kinds seen live: `world_state`,
 
 ## 10. Follow-ups
 
-- **F1 (worker brief):** have the D9 review brief, and any worker
-  instruction that runs the product CLI, name the product binary by
-  absolute path, or give the sandboxed worker a `PATH` that contains it.
-  Today the brief's bare `herdr-projects` works only with a deployment-side
-  `PATH` (§2.4).
-- **F2 (Codex sandbox):** document the supported Codex sandbox mode for
-  isolated workers. With `workspace-write`, 0.154.0 refuses worktree
-  commits (§2.2). Either certify `danger-full-access` inside the product
-  sandbox (run B) or find a Codex permission profile that grants the
-  linked gitdir, then re-verify.
-- **F3 (lane A/B):** flag usage records whose line time is after the bound
-  attempt's observed termination (for example `after_termination`), so a
-  later resume is not silently charged to the ended attempt.
-- **F4 (lane A):** when the product cancels an attempt, close its open turn
-  as `terminated_by_operator` instead of `final_event_missing` after 600 s.
-  Codex writes no `turn_aborted` on termination.
-- **F5 (views):** render M16's JSON value (`issued`, `executed`) in
-  `report --text` and the `query` text form instead of `n/a (unknown)`.
-- **F6 (certification):** run a bounded live certification of Codex 0.158.0
-  before any profile uses it, since it is the installed default.
+Status as of the live-run findings card (branch `fix/live-run-findings`).
+Everything marked fixed is covered by end-to-end tests without model calls;
+none of it changes this certificate's measurements.
+
+- **F1 (worker brief): fixed.** The isolated agent's `PATH` is
+  `<product binary directory>:/usr/bin:/bin`, so the D9 brief's and a
+  worker's bare `herdr-projects` resolves to the product binary the sandbox
+  exposes read-only, for `result submit` and the review channel alike. No
+  deployment `shell_environment_policy` is needed. Test:
+  `an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_commits_and_submits`
+  submits by the bare name.
+- **F2 (Codex sandbox): fixed; root cause in §2.2.** Isolated Codex
+  attempts get `-c sandbox_workspace_write.writable_roots=[common dir,
+  <common>/worktrees/<id>, spool, output]` before the profile's arguments;
+  the recommended mode is `workspace-write`, and `danger-full-access` is not
+  needed. Verified with the real Codex 0.154.0 `codex sandbox` (no model
+  call) inside the product sandbox: EROFS with the run's configuration, a
+  quarantined commit with the product's. Test:
+  `an_isolated_codex_worker_commits_through_codex_workspace_write_sandbox`
+  (the real-Codex part runs with `HP_CODEX_SANDBOX_BIN`). Still open: a live
+  run of a Codex TUI author under `workspace-write` with the override.
+- **F3 (lane A/B): flagged, not moved.** `collectors sessions` reports
+  `after_termination {terminated_unix_ms, records, first_unix_ms}` per
+  rollout bound to a terminated attempt: usage records whose line time is
+  after the termination receipt (contracts-collection.md A9). The records
+  still count in the attempt's usage and M08 (L2 stands); surfacing the flag
+  in `usage`, `report` or a health rule is open.
+- **F4 (lane A): fixed.** A bound rollout's last turn that was open when the
+  product ended the attempt (receipt cause `cancellation` or `completion`)
+  is `final_event.state = ended_by_termination`, with the receipt's cause
+  and time, never a `final_event_missing` gap (ingest 0009); health never
+  alerts on it. Test:
+  `a_turn_the_product_ended_is_ended_by_termination_not_a_missing_final_event`.
+- **F5 (views): fixed.** `report --text`, the `query` text form and the
+  views print M16 as `issued N, accepted K inferred (U unknown), executed E`.
+  Test: `tool_volume_success_and_latency_are_honest`.
+- **F6 (certification): open, with a guard.** Certifying 0.158.0 needs its
+  own bounded live run. Meanwhile `doctor` warns (never fails) and
+  `collectors capabilities` lists each retained Codex profile with a
+  warning when its recorded agent version is uncertified, when its agent
+  path is a launcher such as the mise shim, or when the path resolves to an
+  install of another version, and says how to pin: prepare the profile with
+  the resolved binary, for example
+  `~/.local/share/mise/installs/codex/0.154.0/bin/codex`. Nothing is
+  certified automatically. Test:
+  `doctor_and_capabilities_warn_on_an_uncertified_or_drifting_codex_profile`.
+- **Still open, not code:** L-iso-1 (a lab under `/tmp` keeps its first-level
+  directory visible; use a deployment root under `$HOME`), L3 (review tasks
+  in lifecycle cohorts; filter with `--task-class`), and the §8.2 blocked
+  families, which need live evidence.

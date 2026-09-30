@@ -1182,6 +1182,12 @@ fn tool_volume_success_and_latency_are_honest() {
         "call_to_output_ms p95 37010 of 4 calls (includes approval wait; not execution time)".to_owned()] {
         assert!(text.lines().any(|l| l == line), "{line} in {text}");
     }
+    // F5 (certificate-live.md §5): the report's and the query's text forms
+    // print M16's counts as the JSON has them, never `n/a (unknown)`.
+    let report = f.text(&["report", "--text"]);
+    assert!(report.lines().any(|l| l == "M16 tool_call_volume issued 5, accepted 0 inferred (5 unknown), executed 6"), "{report}");
+    let query = f.text(&["query", "--metric", "M16"]);
+    assert!(query.starts_with("M16 tool_call_volume M16.tools-v1 activity_window issued 5, accepted 0 inferred (5 unknown), executed 6 "), "{query}");
 
     // Read-only and replayable: a second collect changes nothing.
     f.cli("collect");

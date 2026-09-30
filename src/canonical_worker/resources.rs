@@ -43,7 +43,7 @@ pub(super) fn command(
         .with_submission_spool(attempt.as_str())?;
         return crate::worker_supervision::isolated_gated_command(
             Path::new(&profile.agent.path),
-            &definition.extra_args,
+            &agent_arguments(profile, &definition, project, attempt, events, operation)?,
             wall,
             &release_token(operation),
             Path::new(home),
@@ -57,6 +57,51 @@ pub(super) fn command(
         &release_token(operation),
     )
 }
+/// The agent's own arguments: the profile's `extra_args` (whose digest the
+/// profile retains), after a prefix the product derives for an isolated
+/// Codex attempt. That prefix, `-c sandbox_workspace_write.writable_roots=[..]`,
+/// grants Codex's own `workspace-write` sandbox exactly the places the worker
+/// sandbox already makes writable outside the worktree
+/// ([`crate::worker_supervision::agent_writable_roots`]); it replaces a
+/// `writable_roots` list in the execution home's Codex configuration and
+/// leaves the Codex sandbox mode to that configuration. Creation, gate release
+/// and start observation derive it from the same retained events.
+pub(super) fn agent_arguments(
+    profile: &FrozenProfile,
+    definition: &crate::profile_config::ProfileDefinition,
+    project: &Path,
+    attempt: &AttemptId,
+    events: &[Event],
+    operation: &OperationId,
+) -> Result<Vec<String>> {
+    let mut arguments = Vec::new();
+    if profile.execution_home.is_some() && profile.kind == "codex" {
+        let git = crate::worktree_preparation::retained_git_directories(events, operation)?;
+        let worktrees = git.iter().map(|(w, d, c)| (Path::new(w.as_str()), Path::new(d.as_str()), Path::new(c.as_str()))).collect::<Vec<_>>();
+        let roots = crate::worker_supervision::agent_writable_roots(project, &worktrees, attempt.as_str())?;
+        arguments.extend(["-c".to_owned(), format!("sandbox_workspace_write.writable_roots={}", serde_json::to_string(&roots)?)]);
+    }
+    arguments.extend(definition.extra_args.iter().cloned());
+    Ok(arguments)
+}
+
+/// The digest of [`agent_arguments`], as the start observation matches the
+/// agent process: the profile's own `arguments_digest` when nothing is added.
+pub(super) fn agent_arguments_digest(
+    profile: &FrozenProfile,
+    project: &Path,
+    attempt: &AttemptId,
+    events: &[Event],
+    operation: &OperationId,
+) -> Result<String> {
+    if profile.execution_home.is_none() || profile.kind != "codex" {
+        return Ok(profile.arguments_digest.clone());
+    }
+    let definition = crate::profile_config::frozen_definition(profile)?;
+    let arguments = agent_arguments(profile, &definition, project, attempt, events, operation)?;
+    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&arguments)?)))
+}
+
 /// Paths hidden from this launch only (TM4.6, contracts-replay.md §4): a
 /// replay candidate's sandbox hides its case's source repository (it holds
 /// the accepted change and its tests) and the project's hidden-check store

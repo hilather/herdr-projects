@@ -92,7 +92,7 @@ fn display(r: &Value) -> String {
         Value::Object(o) => match (o.get("status").and_then(Value::as_str), o.get("priced_amount").and_then(Value::as_str)) {
             (Some("partial"), Some(amount)) => format!("{tag}{} {amount} observed portion (partial: {})", currency.unwrap_or("?"),
                 o.get("reason").and_then(Value::as_str).unwrap_or("unknown")),
-            _ => na(o.get("reason").and_then(Value::as_str)),
+            _ => crate::telemetry::metrics::structured_text(&r["value"]).unwrap_or_else(|| na(o.get("reason").and_then(Value::as_str))),
         },
         Value::String(s) => match currency {
             Some(currency) => format!("{tag}{currency} {s}"),

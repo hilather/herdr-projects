@@ -26,7 +26,8 @@ while True:
  live='pid' in s and not os.path.exists(os.path.join(root,'vanish'))
  with open(os.path.join(root,'requests'),'a') as log:log.write(json.dumps({'method':m,'params':p})+'\n')
  pane={'pane_id':'w1:p1','workspace_id':'w1','tab_id':'w1:t1','terminal_id':'term1','cwd':s.get('cwd')}
- agent=dict(pane,agent='claude',interactive_ready=True,agent_status='idle',**({'name':s['name']} if 'name' in s else {}))
+ kind=open(os.path.join(root,'agent-kind')).read() if os.path.exists(os.path.join(root,'agent-kind')) else 'claude'
+ agent=dict(pane,agent=kind,interactive_ready=True,agent_status='idle',**({'name':s['name']} if 'name' in s else {}))
  res=None
  if m=='ping':
   override=os.path.join(root,'ping.json')
@@ -45,7 +46,7 @@ while True:
   fd=os.open(s['fifo'],os.O_WRONLY);os.write(fd,p['text'].encode());os.close(fd);s['released']=True;res={'type':'ok'}
  elif m=='agent.list':res={'type':'agent_list','agents':[agent] if live and s.get('released') else []}
  elif m=='agent.rename':s['name']=agent['name']=p['name'];res={'type':'agent_info','agent':agent}
- elif m=='agent.explain':res={'type':'agent_explain','explain':{'agent':'claude','state':'idle','manifest_source':'bundled','manifest_version':'2026.09.14.1',
+ elif m=='agent.explain':res={'type':'agent_explain','explain':{'agent':kind,'state':'idle','manifest_source':'bundled','manifest_version':'2026.09.14.1',
   'matched_rule':{'id':'prompt','state':'idle'},'visible_idle':True,'visible_blocker':False,'visible_working':False,'screen_detection_skipped':False,
   'skip_state_update':False,'local_override_shadowing_remote':False,'fallback_reason':None,'warning':None}}
  elif m=='agent.prompt':res={'type':'agent_prompted','agent':agent}
@@ -53,7 +54,9 @@ while True:
  c.close()
 "#;
 
-struct Lab { home: tempfile::TempDir, project: PathBuf, key: PathBuf, repo: PathBuf, herdr: PathBuf, profile: VersionedReference, binding: String, server: Option<Child> }
+struct Lab { home: tempfile::TempDir, project: PathBuf, key: PathBuf, repo: PathBuf, herdr: PathBuf, profile: VersionedReference, binding: String, server: Option<Child>,
+    /// The `worker` profile's kind and its agent `bin/<kind>`.
+    kind: &'static str }
 
 impl Drop for Lab {
     fn drop(&mut self) {
@@ -71,17 +74,20 @@ impl Lab {
     /// budget table is `budget`. The server runs only once `serve` is called.
     fn new(budget: &str) -> Self { Self::bound(budget, |repo| repo.to_owned()) }
     /// As `new`, with the binding's working directory `cwd(repository)`.
-    fn bound(budget: &str, cwd: impl Fn(&std::path::Path) -> PathBuf) -> Self {
+    fn bound(budget: &str, cwd: impl Fn(&std::path::Path) -> PathBuf) -> Self { Self::of_kind("claude", budget, cwd) }
+    /// As `bound`, with a `worker` profile of `kind` (`claude` or `codex`).
+    fn of_kind(kind: &'static str, budget: &str, cwd: impl Fn(&std::path::Path) -> PathBuf) -> Self {
         let home = tempfile::tempdir().unwrap();
         let key = home.path().join("owner");
         assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).output().unwrap().status.success());
         let public = fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
         let config = home.path().join(".config/herdr-projects/config.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
-        fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[profiles.worker]\nkind='claude'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=600\n{budget}\n")).unwrap();
+        fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[profiles.worker]\nkind='{kind}'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=600\n{budget}\n")).unwrap();
         for dir in ["repo", "bin", "agent-home", "lab"] { fs::create_dir(home.path().join(dir)).unwrap(); }
         let mut lab = Lab { project: home.path().join("root/demo"), key, repo: home.path().join("repo"), herdr: home.path().join("bin/herdr"),
-            profile: VersionedReference { id: String::new(), revision: 1, digest: String::new() }, binding: String::new(), server: None, home };
+            profile: VersionedReference { id: String::new(), revision: 1, digest: String::new() }, binding: String::new(), server: None, home, kind };
+        fs::write(lab.path("lab/agent-kind"), kind).unwrap();
         for command in ["new", "pause"] { lab.ok(&[command, "demo"]); }
         migration::apply(&lab.project, &migration::inspect_with_config(&lab.project, &config).unwrap(), true).unwrap();
         lab.git(&["init", "-q", "--object-format=sha256"]);
@@ -115,6 +121,10 @@ impl Lab {
     }
     fn path(&self, name: &str) -> PathBuf { self.home.path().join(name) }
     fn socket(&self) -> PathBuf { self.path("lab/native.sock") }
+    /// The lab agent executable, `bin/<kind>`.
+    fn agent(&self) -> PathBuf { self.path(&format!("bin/{}", self.kind)) }
+    /// What the lab agent prints for `--version`.
+    fn version(&self) -> &'static str { if self.kind == "codex" { "codex-cli 0.154.0" } else { "2.1.0 (Claude Code)" } }
     fn cli(&self, args: &[&str]) -> Output {
         Command::new(BIN).env_clear().env("HOME", self.home.path()).env("PATH", "/usr/bin:/bin")
             .args(["--root", self.path("root").to_str().unwrap()]).args(args).output().unwrap()
@@ -178,8 +188,8 @@ probe={('pane','list'):'pane.list',('agent','list'):'agent.list'}.get(tuple(sys.
 line=json.dumps({'id':'probe','method':probe}).encode()+b'\\n' if probe else sys.stdin.buffer.readline()\n\
 c=socket.socket(socket.AF_UNIX);c.connect(os.environ['HERDR_SOCKET_PATH']);c.sendall(line)\nreply=c.makefile('rb').readline()\nif not reply:sys.exit(1)\n\
 sys.stdout.buffer.write(json.dumps({'result':json.loads(reply)['result']}).encode() if probe else reply)\n").unwrap();
-        let (agent, source) = (self.path("bin/claude"), self.path("bin/claude.rs"));
-        fs::write(&source, "fn main(){if std::env::args().nth(1).as_deref()==Some(\"--version\"){println!(\"2.1.0 (Claude Code)\");return}loop{std::thread::park()}}").unwrap();
+        let (agent, source) = (self.agent(), self.path("bin/agent.rs"));
+        fs::write(&source, format!("fn main(){{if std::env::args().nth(1).as_deref()==Some(\"--version\"){{println!({:?});return}}loop{{std::thread::park()}}}}", self.version())).unwrap();
         assert!(Command::new("rustc").args(["--edition", "2021", "-o"]).arg(&agent).arg(&source).status().unwrap().success());
         for path in [&self.herdr, &agent] { fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap(); }
     }
@@ -188,7 +198,7 @@ sys.stdout.buffer.write(json.dumps({'result':json.loads(reply)['result']}).encod
     fn prepare_profile(&mut self) {
         use herdr_projects::worker_supervision::{ProcessIncarnation, SupervisorIdentity};
         let prepared = self.ok(&["profile", "prepare", "demo", "worker", "--herdr-executable", self.herdr.to_str().unwrap(),
-            "--agent-executable", self.path("bin/claude").to_str().unwrap(), "--execution-home", self.path("agent-home").to_str().unwrap()]);
+            "--agent-executable", self.agent().to_str().unwrap(), "--execution-home", self.path("agent-home").to_str().unwrap()]);
         let mut profile: FrozenProfile = serde_json::from_value(prepared["profile"].clone()).unwrap();
         #[derive(serde::Serialize)] struct Interaction { session: ResourceIdentity, terminal: &'static str, readiness_manifest: &'static str, prompt_digest: String, acknowledged_unix_ms: i64 }
         #[derive(serde::Serialize)] struct Evidence { version: u32, prepared_profile: VersionedReference, supervisor: SupervisorIdentity, native_kind: String, observed_unix_ms: i64, stopped_unix_ms: i64, interaction: Interaction }
@@ -1111,7 +1121,8 @@ fn main() {
     while !Path::new("submit.json").exists() { std::thread::sleep(Duration::from_millis(50)); }
     let mut last = (false, String::new());
     for _ in 0..200 {
-        last = run(BIN, &["--root", ROOT, "result", "demo", "submit", "--input-file", "submit.json"]);
+        // Bare: the sandbox puts the product binary first on the agent's PATH.
+        last = run("herdr-projects", &["--root", ROOT, "result", "demo", "submit", "--input-file", "submit.json"]);
         if last.0 { break }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -1125,13 +1136,13 @@ impl Lab {
     fn write_probe_agent(&self, secrets: &[PathBuf], writes: &[PathBuf], tmp: &std::path::Path, hidden: &[PathBuf], nested: &str) {
         let quoted = |paths: &[PathBuf]| paths.iter().map(|p| format!("{:?}", p.to_str().unwrap())).collect::<Vec<_>>().join(",");
         let root = self.path("root").canonicalize().unwrap();
-        let source = format!("{PROBE_AGENT}\nconst WRITES: &[&str] = &[{}];\nconst TMP_WRITE: &str = {:?};\nconst SECRETS: &[&str] = &[{}];\nconst HIDDEN: &[&str] = &[{}];\nconst ROOT: &str = {:?};\nconst OWN: &str = {:?};\nconst SOCKET: &str = {:?};\nconst BIN: &str = {BIN:?};\nconst NESTED: &str = {nested:?};\n",
+        let source = format!("{PROBE_AGENT}\nconst WRITES: &[&str] = &[{}];\nconst TMP_WRITE: &str = {:?};\nconst SECRETS: &[&str] = &[{}];\nconst HIDDEN: &[&str] = &[{}];\nconst ROOT: &str = {:?};\nconst OWN: &str = {:?};\nconst SOCKET: &str = {:?};\nconst NESTED: &str = {nested:?};\n",
             quoted(writes), tmp.to_str().unwrap(), quoted(secrets), quoted(hidden), root.to_str().unwrap(), self.project.canonicalize().unwrap().join(".state").to_str().unwrap(), self.socket().to_str().unwrap());
         self.build_agent(&source);
     }
     /// Replace the lab agent with the Rust program `source`.
     fn build_agent(&self, source: &str) {
-        let (agent, file) = (self.path("bin/claude"), self.path("bin/probe.rs"));
+        let (agent, file) = (self.agent(), self.path("bin/probe.rs"));
         fs::write(&file, source).unwrap();
         let built = Command::new("rustc").args(["--edition", "2021", "-o"]).arg(&agent).arg(&file).output().unwrap();
         assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
@@ -1183,6 +1194,86 @@ fn plant(path: &std::path::Path, text: &str) {
     fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(path, text).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// A Codex worker stand-in. It records its arguments, then, when `REAL_CODEX`
+/// names a real Codex binary, commits in its worktree through Codex's own
+/// `workspace-write` sandbox (`codex sandbox`, no model call) twice: once
+/// with only the Git common directory as a writable root (`CONTROL`, the live
+/// run's configuration) and once with the `-c` overrides the product passed.
+/// It publishes `codex-probe.txt` in its worktree and stays up.
+const CODEX_AGENT: &str = r#"
+use std::{fs, process::Command};
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--version") { println!("codex-cli 0.154.0"); return }
+    let mut report: String = args.iter().map(|a| format!("arg {a}\n")).collect();
+    let mut overrides = Vec::new();
+    let mut i = 0;
+    while i + 1 < args.len() && args[i] == "-c" { overrides.push(args[i + 1].clone()); i += 2; }
+    report += &format!("path {}\n", std::env::var("PATH").unwrap_or_default());
+    if !REAL_CODEX.is_empty() {
+        for (name, set) in [("control", vec![CONTROL.to_owned()]), ("product", overrides.clone())] {
+            fs::write(name, "x\n").unwrap();
+            let mut command = Command::new(REAL_CODEX);
+            command.args(["sandbox", "-c", "sandbox_mode=\"workspace-write\""]);
+            for o in &set { command.args(["-c", o]); }
+            command.args(["--", "/bin/sh", "-c", &format!("git add {name} && git -c user.name=w -c user.email=w@example.invalid commit -qm {name} && echo COMMITTED")]);
+            let out = match command.output() { Ok(out) => format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)), Err(e) => e.to_string() };
+            let out: Vec<&str> = out.lines().filter(|l| !l.contains("WARNING")).collect();
+            report += &format!("commit {name} {}\n", out.join("|"));
+        }
+    }
+    fs::write("codex-probe.txt.tmp", report).unwrap();
+    fs::rename("codex-probe.txt.tmp", "codex-probe.txt").unwrap();
+    loop { std::thread::park() }
+}
+"#;
+
+/// F-commit (certificate-live.md §2.2): an isolated Codex attempt gets, before
+/// its profile's own arguments, one `-c sandbox_workspace_write.writable_roots`
+/// override naming the Git common directory, the worktree's administrative
+/// directory `<common>/worktrees/<id>` (Codex binds a linked worktree's gitdir
+/// read-only unless it is a writable root itself), its spool and its output
+/// directory; the start observation still identifies the agent (it runs), and
+/// the product binary's directory leads the agent's PATH.
+///
+/// With `HP_CODEX_SANDBOX_BIN` naming a real Codex 0.154.0 binary, the worker
+/// also commits through Codex's own `workspace-write` sandbox inside the
+/// product sandbox, no model call: with only the common directory writable
+/// (the live run's configuration) Git fails on the administrative
+/// directory's `index.lock` (read-only file system); with the product's
+/// override the commit succeeds and lands in the attempt's Git quarantine,
+/// never in the shared repository.
+#[test]
+fn an_isolated_codex_worker_commits_through_codex_workspace_write_sandbox() {
+    let mut lab = Lab::of_kind("codex", "unknown_usage='allow_with_warning'", |repo| repo.to_owned());
+    let real = std::env::var("HP_CODEX_SANDBOX_BIN").unwrap_or_default();
+    let common = lab.repo.canonicalize().unwrap().join(".git");
+    let control = format!("sandbox_workspace_write.writable_roots=[{:?}]", common.to_str().unwrap());
+    lab.build_agent(&format!("{CODEX_AGENT}\nconst REAL_CODEX: &str = {real:?};\nconst CONTROL: &str = {control:?};\n"));
+    let base = lab.git(&["rev-parse", "HEAD"]);
+    let (_, attempt) = lab.reserve("Retained instructions");
+    let worktree = lab.planned_worktree(&attempt);
+    lab.serve();
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 120, &|| worktree.join("codex-probe.txt").exists() && lab.attempt(&attempt).state == AttemptState::Running);
+    let report = fs::read_to_string(worktree.join("codex-probe.txt")).unwrap();
+    lab.stop(ticker);
+    let gitdir = fs::read_to_string(worktree.join(".git")).unwrap().trim().strip_prefix("gitdir: ").unwrap().to_owned();
+    assert_eq!(std::path::Path::new(&gitdir).parent().unwrap(), common.join("worktrees"));
+    let project = lab.project.canonicalize().unwrap();
+    let roots = [common.display().to_string(), gitdir.clone(), format!("{}/.state/spool/{}", project.display(), attempt.as_str()),
+        format!("{}/.state/worker-output/{}", project.display(), attempt.as_str())];
+    let args: Vec<&str> = report.lines().filter_map(|l| l.strip_prefix("arg ")).collect();
+    assert_eq!(args, ["-c".to_owned(), format!("sandbox_workspace_write.writable_roots={}", serde_json::to_string(&roots).unwrap())], "{report}");
+    let product = std::path::Path::new(BIN).canonicalize().unwrap();
+    assert!(report.contains(&format!("\npath {}:/usr/bin:/bin\n", product.parent().unwrap().display())), "{report}");
+    if real.is_empty() { return; }
+    assert!(report.contains("commit control ") && report.contains("index.lock': Read-only file system"), "{report}");
+    assert!(report.contains("commit product COMMITTED\n"), "{report}");
+    // The commit landed in the attempt's quarantine only.
+    assert_eq!(lab.git(&["rev-parse", &format!("refs/heads/{}", Lab::attempt_branch(&attempt))]), base);
 }
 
 /// The owner decision "isolate workers first": a canonical worker launched

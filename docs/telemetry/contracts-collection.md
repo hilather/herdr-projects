@@ -1180,3 +1180,46 @@ tolerating the A8 tables missing on a read-only pre-A8 sidecar
    executions); `codex_agent_items` gives the spawned child's thread id
    (`SubAgentActivity.agent_thread_id`, whose `started` item id equals the
    spawn `call_id`) and a wait's receivers.
+
+## A9: the third live run's follow-ups (terminated turns, usage after termination)
+
+Source: [certificate-live.md](certificate-live.md) §5 and §3.1 (F4, F3).
+Ingest 0009 (`migrations/telemetry/ingest/0009_turn_terminations.sql`,
+re-runnable: `IF NOT EXISTS`).
+
+### Turns the product ended (F4)
+
+Codex 0.154.0 writes neither `task_complete` nor `turn_aborted` for a turn
+whose worker the product stops. The collector reads the canonical
+`runtime.worker_terminated` receipt of each attempt (read-only, its first
+receipt: `attempt`, `cause`, `observed_unix_ms`). On every collect, before
+reading rollouts and again after the binding, a bound rollout whose last turn
+is still open gets one `rollout_turn_terminations(path_digest, turn_offset,
+attempt_id, cause, terminated_unix_ms)` row when:
+
+- the bound attempt's receipt cause is `cancellation` or `completion` (the
+  product ended it; `process_exit`, the agent ending itself, does not count);
+- the turn was opened at or before the receipt (the line time of the
+  envelope that opened it, or an unknown time).
+
+Such a turn is never `final_event_missing`: no pending gap is written for
+it, and one written earlier is recovered. `collectors sessions` shows
+`final_event {state: ended_by_termination, turn_id, termination {cause,
+observed_unix_ms}}`. A later turn (a resume after termination) is judged on
+its own and can be `missing`. Health reads no coverage gap, so it never
+alerted on this; the conformance test asserts no open alert.
+
+### Usage after termination (F3)
+
+`collectors sessions` adds `after_termination` per rollout: for one bound to
+an attempt with a termination receipt (any cause), `{terminated_unix_ms,
+records, first_unix_ms}` counts its usage records whose line time is after
+the receipt; `null` otherwise; `unavailable: predates_collection` without
+record times (ingest < 4). The records stay in the attempt's usage and M08:
+this flags them, it does not move them.
+
+### Conformance
+
+| Behaviour | Test |
+| --- | --- |
+| A turn open when the product cancelled the attempt: `ended_by_termination` with the receipt's cause and time, even idle past the threshold; no pending gap, no health alert; a turn opened after the receipt and left idle is `missing`, and its usage record is counted `after_termination` | `a_turn_the_product_ended_is_ended_by_termination_not_a_missing_final_event` (`telemetry_collect.rs`) |

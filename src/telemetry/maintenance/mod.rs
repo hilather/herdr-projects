@@ -137,7 +137,7 @@ fn class(id: &str) -> Option<&'static Class> { CLASSES.iter().find(|c| c.id == i
 /// deletion scope). A sidecar table with a `session_id` or `path_digest`
 /// column outside these lists refuses `apply`: it would escape deletion.
 const BY_PATH: &[&str] = &["collect_offsets", "rollout_sources", "rollout_metadata", "rollout_threads", "rollout_subagents", "rollout_ingest_state", "rollout_forks",
-    "rollout_turn_ends", "codex_tool_sources", "source_bindings", "session_graph_nodes", "usage_dispositions"];
+    "rollout_turn_ends", "rollout_turn_terminations", "codex_tool_sources", "source_bindings", "session_graph_nodes", "usage_dispositions"];
 const BY_SESSION: &[&str] = &["codex_usage", "codex_usage_times", "codex_quarantine", "codex_discrepancy", "codex_rate_limits", "codex_rate_limit_windows", "codex_turns",
     "codex_tool_calls", "codex_tool_namespaces", "codex_exec_items", "codex_mcp_calls", "codex_agent_items", "codex_turn_aborts", "codex_fork_reconciliation", "usage_entries",
     "model_segments", "quota_window_observations", "session_graph_nodes"];

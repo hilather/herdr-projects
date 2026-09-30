@@ -641,12 +641,14 @@ const CAPABILITIES: &str = "codex rollout_jsonl certified_versions=0.154.0
 /// `collectors capabilities` cannot drift from the adapter: over the whole
 /// corpus the envelopes carry exactly the fields it lists as available, each
 /// with a value in at least one envelope (the fixture evidence), and never a
-/// field it lists as unavailable. It reads nothing, so it works on a project
-/// that has never collected and creates no sidecar.
+/// field it lists as unavailable. It reads no rollout (only the retained
+/// profiles, listed after the fields), so it works on a project that has
+/// never collected and creates no sidecar.
 #[test]
 fn capabilities_match_emitted_fields() {
     let f = Fixture::new();
-    assert_eq!(f.text(&["collectors", "capabilities"]), CAPABILITIES);
+    let text = f.text(&["collectors", "capabilities"]);
+    assert_eq!(format!("{}\n", text.split("\nprofile ").next().unwrap()), CAPABILITIES);
     let (capabilities, _) = f.cli_args(&["collectors", "capabilities", "--json"]);
     assert!(!f.project.join(".state/telemetry.db").exists());
     let adapter = &capabilities["adapters"][0];
@@ -689,13 +691,14 @@ fn rows<T: rusqlite::types::FromSql>(f: &Fixture, sql: &str) -> Vec<Vec<T>> {
 
 /// A4 session metadata and A5 thread lineage as collected, with the span of
 /// the usage record times, and the A7 final event of the rollout's last turn
-/// (each rollout here completes its last turn); A8 `fork` `null` (no fork point).
+/// (each rollout here completes its last turn); A8 `fork` `null` (no fork
+/// point); F3 `after_termination` `null` (the attempt was never terminated).
 #[allow(clippy::too_many_arguments)]
 fn session(f: &Fixture, sid: &str, path: &Path, records: i64, forked: Value, subagent: Value, thread: Value, times: [i64; 2], last_turn: &str) -> Value {
     json!({"session_id": sid, "path_digest": source(path), "binding": "bound", "attempt_id": f.attempt, "records": records, "model_provider": "openai",
         "forked_from_id": forked, "subagent": subagent, "thread": thread,
         "record_times": {"stored": records, "timed": records, "first_unix_ms": times[0], "last_unix_ms": times[1]},
-        "final_event": {"state": "complete", "turn_id": last_turn}, "fork": null})
+        "final_event": {"state": "complete", "turn_id": last_turn}, "fork": null, "after_termination": null})
 }
 
 /// `head.jsonl` reports `thread_source` `user` and `session_id` = its `id`
@@ -825,7 +828,7 @@ fn rollouts_read_before_a4_gain_their_metadata_on_the_next_collect() {
     }
     let (upgraded, _) = f.cli("collect");
     assert_eq!(upgraded["collected"]["records"], 0, "the re-read counts nothing twice");
-    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 8}));
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 9}));
     assert!(fresh == ledger(&f), "the upgraded sidecar equals a fresh collect");
     assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage);
     assert_eq!(f.cli_args(&["collectors", "sessions"]).0, fresh_sessions);
@@ -922,7 +925,7 @@ fn rollouts_read_before_a5_gain_their_thread_lineage_on_the_next_collect() {
     assert_eq!(sessions[2]["subagent"]["kind"], "other");
     let (upgraded, _) = f.cli("collect");
     assert_eq!(upgraded["collected"]["records"], 0, "the re-read counts nothing twice");
-    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 8}));
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 9}));
     assert!(fresh == ledger(&f), "the upgraded sidecar equals a fresh collect");
     assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage);
     assert_eq!(f.cli_args(&["collectors", "sessions"]).0, fresh_sessions);
@@ -1042,7 +1045,7 @@ fn rollouts_read_before_a6_gain_their_tool_metadata_on_the_next_collect() {
     assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 5}), "a read does not migrate");
     let (upgraded, _) = f.cli("collect");
     assert_eq!(upgraded["collected"]["records"], 0, "the re-read counts nothing twice");
-    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 8}));
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 9}));
     assert!(fresh == ledger(&f), "the upgraded sidecar equals a fresh collect");
     assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage);
     assert_eq!(f.cli_args(&["collectors", "tools", "--json"]).0, fresh_tools);
@@ -1078,7 +1081,7 @@ fn downgrade_to_a7(f: &Fixture) {
 /// Upgrade: a sidecar written before A8 is read (read-only) with the fork
 /// point, the final event and the A8 tool lists `unavailable:
 /// predates_collection`, never `null`, a state or `[]`; the A7 metadata stays.
-/// The next collect migrates it to ingest 8 and reads every rollout again: the
+/// The next collect migrates it to the current ingest version and reads every rollout again: the
 /// aborted turn and the MCP, agent and namespace rows appear, the fork
 /// reconciles against its origin, the narrower envelopes are superseded
 /// without a digest conflict, nothing is counted twice, and the ledger equals
@@ -1106,7 +1109,7 @@ fn rollouts_read_before_a8_gain_their_live_run2_metadata_on_the_next_collect() {
     assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 7}), "a read does not migrate");
     let (upgraded, _) = f.cli("collect");
     assert_eq!(upgraded["collected"]["records"], 0, "the re-read counts nothing twice");
-    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 8}));
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 9}));
     assert!(fresh == ledger(&f), "the upgraded sidecar equals a fresh collect");
     assert_eq!(f.count("ingest_quarantine"), 0, "no digest conflict");
     assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage);
@@ -1164,7 +1167,7 @@ fn rollouts_read_before_a7_gain_their_subagent_detail_and_turn_state_on_the_next
     assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 6}), "a read does not migrate");
     let (upgraded, _) = f.cli("collect");
     assert_eq!(upgraded["collected"]["records"], 0, "the re-read counts nothing twice");
-    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 8}));
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 9}));
     assert!(fresh == ledger(&f), "the upgraded sidecar equals a fresh collect");
     assert_eq!(f.count("ingest_quarantine"), 0, "no digest conflict");
     assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage);

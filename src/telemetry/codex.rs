@@ -51,6 +51,10 @@ pub struct CanonicalAttempt {
     home: Option<String>,
     decided_unix_ms: Option<i64>,
     binding: Binding,
+    /// The attempt's first `runtime.worker_terminated` receipt: its cause
+    /// (`cancellation`, `completion` or `process_exit`) and observation time.
+    /// Read-only from the canonical store.
+    terminated: Option<(String, i64)>,
 }
 
 /// The attempt's latest canonical collector binding revision (migration 0052).
@@ -68,6 +72,15 @@ enum Binding {
 impl CanonicalAttempt {
     pub fn codex(&self) -> bool {
         self.kind.as_deref() == Some("codex")
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// When the attempt's termination receipt was observed, whatever its cause.
+    pub fn terminated_unix_ms(&self) -> Option<i64> {
+        self.terminated.as_ref().map(|(_, at)| *at)
     }
 }
 
@@ -92,7 +105,16 @@ fn canonical(project: &Path) -> Result<(Vec<CanonicalAttempt>, Vec<String>)> {
             let (id, payload, decided_unix_ms) = row?;
             let inputs: Value = serde_json::from_str(&payload)?;
             let (kind, home) = profile(&inputs["inputs"]["effective_profile"]);
-            attempts.push(CanonicalAttempt { id, kind, home, decided_unix_ms, binding: Binding::Predates });
+            attempts.push(CanonicalAttempt { id, kind, home, decided_unix_ms, binding: Binding::Predates, terminated: None });
+        }
+    }
+    if table("events")? {
+        let mut stmt = db.prepare("SELECT json_extract(payload,'$.attempt'),json_extract(payload,'$.cause'),json_extract(payload,'$.observed_unix_ms')
+            FROM events WHERE kind='runtime.worker_terminated' AND json_valid(payload) ORDER BY sequence")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<i64>>(2)?)))?;
+        for row in rows {
+            let (Some(attempt), Some(cause), Some(at)) = row? else { continue };
+            if let Some(a) = attempts.iter_mut().find(|a| a.id == attempt) && a.terminated.is_none() { a.terminated = Some((cause, at)); }
         }
     }
     if table("collector_bindings")? {
@@ -117,6 +139,77 @@ fn canonical(project: &Path) -> Result<(Vec<CanonicalAttempt>, Vec<String>)> {
     homes.sort();
     homes.dedup();
     Ok((attempts, homes))
+}
+
+/// F6 / L1 (certificate-live.md §7): per retained Codex profile (its latest
+/// native preparation report), the agent version it recorded and whether that
+/// version is certified, and whether its agent path can now resolve to
+/// another version without the product noticing. Read-only; never runs the
+/// agent and never certifies anything. `warnings` (each `{code, detail}`):
+/// `version_uncertified` (the recorded version is not in [`CERTIFIED`]: its
+/// usage is gated `cli_version_uncertified`), `agent_missing`,
+/// `agent_is_a_launcher` (the path resolves to an executable not named
+/// `codex`, such as a version manager shim whose target can change), and
+/// `resolved_version_differs` (the resolved path names another version,
+/// e.g. `.../codex/0.158.0/bin/codex`).
+pub fn profile_versions(project: &Path) -> Result<Vec<Value>> {
+    let path = project.join(".state/state.db");
+    if !path.exists() { return Ok(Vec::new()); }
+    let db = super::read_only(&path)?;
+    if !db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_profiles')", [], |r| r.get::<_, bool>(0))? {
+        return Ok(Vec::new());
+    }
+    let reports: Vec<String> = db.prepare("SELECT report FROM native_profiles ORDER BY sequence DESC")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for report in reports {
+        let report: Value = serde_json::from_str(&report)?;
+        let profile = &report["preparation"]["profile"];
+        let (Some("codex"), Some(name)) = (profile["kind"].as_str(), profile["name"].as_str()) else { continue };
+        if !seen.insert(name.to_owned()) { continue; }
+        let agent = profile["agent"]["path"].as_str().unwrap_or("");
+        let version = profile["agent"]["version"].as_str().unwrap_or("");
+        let mut warnings = Vec::new();
+        let mut warn = |code: &str, detail: String| warnings.push(json!({"code": code, "detail": detail}));
+        if !certified(version) {
+            warn("version_uncertified", format!("Codex {version} is not certified (certified: {}); its usage is gated `cli_version_uncertified` and excluded from M08", CERTIFIED.join(", ")));
+        }
+        let resolved = std::fs::canonicalize(agent).ok();
+        match &resolved {
+            None => warn("agent_missing", format!("{agent} does not resolve to a file")),
+            Some(real) => {
+                let file = real.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if !file.starts_with("codex") {
+                    warn("agent_is_a_launcher", format!("{agent} resolves to `{file}`, a launcher whose Codex version can change without a new preparation"));
+                }
+                let named = real.components().filter_map(|c| c.as_os_str().to_str())
+                    .find(|c| c.split('.').count() == 3 && c.split('.').all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())));
+                if let Some(named) = named && named != version {
+                    warn("resolved_version_differs", format!("{agent} resolves to {}, installed as Codex {named}, not the recorded {version}", real.display()));
+                }
+            }
+        }
+        out.push(json!({"profile": name, "kind": "codex", "agent": agent, "resolved": resolved.map(|r| r.display().to_string()), "version": version,
+            "certified": certified(version), "warnings": warnings}));
+    }
+    out.sort_by(|a, b| a["profile"].as_str().cmp(&b["profile"].as_str()));
+    Ok(out)
+}
+
+/// How to pin a profile to a certified Codex binary, for the warnings above.
+pub const PIN_ADVICE: &str = "pin the profile to a certified Codex binary by its resolved path, not a version manager shim (e.g. `profile prepare <slug> <profile> --agent-executable ~/.local/share/mise/installs/codex/0.154.0/bin/codex ...`); a new version needs its own live certification first";
+
+/// `doctor` lines for [`profile_versions`]: `ok` for a certified, pinned
+/// profile, `warn` otherwise. Advisory: never FAIL.
+pub fn doctor_checks(project: &Path) -> Vec<(Option<bool>, String)> {
+    match profile_versions(project) {
+        Err(error) => vec![(None, format!("codex profiles: unreadable: {error:#}"))],
+        Ok(profiles) => profiles.iter().map(|p| {
+            let head = format!("codex profile `{}`: agent {} at {}", p["profile"].as_str().unwrap_or(""), p["version"].as_str().unwrap_or("?"), p["agent"].as_str().unwrap_or("?"));
+            let warnings: Vec<&str> = p["warnings"].as_array().into_iter().flatten().filter_map(|w| w["detail"].as_str()).collect();
+            if warnings.is_empty() { (Some(true), format!("{head} (certified)")) } else { (None, format!("{head}: {}; {PIN_ADVICE}", warnings.join("; "))) }
+        }).collect(),
+    }
 }
 
 pub fn canonical_attempts(project: &Path) -> Result<Vec<CanonicalAttempt>> {
@@ -148,6 +241,9 @@ pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Co
     let from_start: std::collections::BTreeSet<String> = reread.iter().chain(&backfill(&db)?).chain(&recertify(&db)?).cloned().collect();
     let mut seen = std::collections::BTreeSet::new();
     let mut unwritable = false;
+    // A termination observed since the last collect ends its open turn before
+    // this pass could record it missing; the binding is the last collect's.
+    terminated_turns(&db, &attempts)?;
     for home in &homes {
         let mut files = Vec::new();
         walk(&Path::new(home).join(".codex/sessions"), 0, &mut files);
@@ -181,6 +277,7 @@ pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Co
         db.execute("UPDATE rollout_sources SET reevaluation='rollout_unavailable' WHERE path_digest=?1", [key])?;
     }
     bind(&db, &attempts)?;
+    terminated_turns(&db, &attempts)?;
     super::maintenance::enforce(&mut db, &tombstones)?;
     Ok(Some(done))
 }
@@ -616,8 +713,13 @@ fn turn_id(value: Value) -> Option<String> {
 /// the file to its end (`at_eof`), and the file has not been modified for
 /// [`ingest::FINAL_EVENT_IDLE_MS`] before `now`. Only the file's size and
 /// modification time are used, never its content. `true`: the gap was written.
-fn final_event(tx: &Transaction, ledger: &ingest::Ledger, cursor: &Cursor, at_eof: bool, meta: &std::fs::Metadata, now: i64) -> Result<bool> {
+/// A turn the product ended ([`terminated_turns`]) is never missing.
+#[allow(clippy::too_many_arguments)]
+fn final_event(tx: &Transaction, ledger: &ingest::Ledger, key: &str, cursor: &Cursor, at_eof: bool, meta: &std::fs::Metadata, now: i64) -> Result<bool> {
     let Some(turn) = cursor.turn.as_ref().filter(|turn| !turn.completed) else { return Ok(false) };
+    if tx.query_row("SELECT EXISTS(SELECT 1 FROM rollout_turn_terminations WHERE path_digest=?1 AND turn_offset=?2)", params![key, turn.offset as i64], |r| r.get::<_, bool>(0))? {
+        return Ok(false);
+    }
     let modified = meta.mtime() * 1000 + meta.mtime_nsec() / 1_000_000;
     if !at_eof || now - modified < ingest::FINAL_EVENT_IDLE_MS { return Ok(false); }
     ledger.final_event_missing(tx, turn.offset, meta.len().max(cursor.offset), now)?;
@@ -650,7 +752,7 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
         // dedupe, re-evaluate or quarantine.
         _ => {
             for table in ["rollout_sources", "rollout_metadata", "rollout_threads", "codex_tool_sources", "rollout_subagents", "rollout_ingest_state", "rollout_forks",
-                "rollout_turn_ends"] {
+                "rollout_turn_ends", "rollout_turn_terminations"] {
                 tx.execute(&format!("DELETE FROM {table} WHERE path_digest=?1"), [&key])?;
             }
             Cursor { offset: 0, records: 0, rate_limits: 0, model: None, effort: None, session: None, uncertified: false, turn: None }
@@ -662,7 +764,7 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
     if cursor.offset == meta.len() {
         // Nothing new to read: only an idle open turn (never on a re-read,
         // which tracks no turn yet) or a fresh cursor writes anything.
-        let idle = final_event(&tx, &ledger, &cursor, true, &meta, now)?;
+        let idle = final_event(&tx, &ledger, &key, &cursor, true, &meta, now)?;
         if ledger.fresh && cursor.offset > 0 {
             ledger.finish(&tx, None, cursor.offset, now)?;
         }
@@ -765,7 +867,7 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
             params![key, cursor.uncertified, turn.map(|t| t.offset as i64), turn.and_then(|t| t.id.as_deref()), turn.is_some_and(|t| t.completed)])?;
         tx.execute("INSERT OR REPLACE INTO rollout_turn_ends(path_digest,last_turn_aborted) VALUES(?1,?2)", params![key, turn.is_some_and(|t| t.aborted)])?;
     }
-    final_event(&tx, &ledger, &cursor, at_eof, &after, now)?;
+    final_event(&tx, &ledger, &key, &cursor, at_eof, &after, now)?;
     if let Some((session, version, _)) = &cursor.session && certified(version) {
         reconcile(&tx, session, now)?;
     }
@@ -1128,6 +1230,37 @@ fn reconcile_forks(db: &mut Connection) -> Result<()> {
         reconcile(&tx, &session, now)?;
         tx.commit()?;
     }
+    Ok(())
+}
+
+/// F4 (certificate-live.md §5): Codex writes no final event for a turn the
+/// product ends, so a bound rollout whose last turn is still open when its
+/// attempt's termination receipt (`cancellation` or `completion`) is observed,
+/// and was opened at or before that receipt (or at an unknown time), is
+/// `ended_by_termination`: one `rollout_turn_terminations` row, and its
+/// `final_event_missing` gap, if one was written, recovered. Recomputed on
+/// every collect (before reading, and after the binding), so a later turn (a
+/// resume) is judged on its own; a turn the agent ended itself
+/// (`process_exit`) stays missing.
+fn terminated_turns(db: &Connection, attempts: &[CanonicalAttempt]) -> Result<()> {
+    let now = jiff::Timestamp::now().as_millisecond();
+    let open: Vec<(String, String, i64, Option<i64>)> = db.prepare("SELECT s.path_digest,s.attempt_id,x.last_turn_offset,
+        (SELECT o.occurred_unix_ms FROM source_observations o WHERE o.producer_epoch=s.path_digest AND o.producer_sequence=x.last_turn_offset)
+        FROM rollout_sources s JOIN rollout_ingest_state x ON x.path_digest=s.path_digest
+        WHERE s.binding='bound' AND s.attempt_id IS NOT NULL AND x.last_turn_offset IS NOT NULL AND x.last_turn_completed=0")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
+    let tx = db.unchecked_transaction()?;
+    tx.execute("DELETE FROM rollout_turn_terminations", [])?;
+    for (key, attempt, offset, opened) in open {
+        let Some((cause, at)) = attempts.iter().find(|a| a.id == attempt).and_then(|a| a.terminated.as_ref())
+            .filter(|(cause, _)| matches!(cause.as_str(), "cancellation" | "completion")) else { continue };
+        if opened.is_some_and(|opened| opened > *at) { continue; }
+        tx.execute("INSERT INTO rollout_turn_terminations(path_digest,turn_offset,attempt_id,cause,terminated_unix_ms) VALUES(?1,?2,?3,?4,?5)",
+            params![key, offset, attempt, cause, at])?;
+        tx.execute("UPDATE coverage_gaps SET recovery='recovered',observed_unix_ms=?3 WHERE source=?1 AND start_offset=?2 AND reason='final_event_missing' AND recovery='pending'",
+            params![key, offset, now])?;
+    }
+    tx.commit()?;
     Ok(())
 }
 

@@ -266,3 +266,56 @@ fn idle_rollout_without_final_event_records_a_coverage_gap() {
     f.cli("collect");
     assert_eq!(gaps(&f), [gap(end + 40, "recovered")], "a completed turn is never missing");
 }
+
+/// F4 (certificate-live.md §5): the product cancelled the bound attempt while
+/// its rollout's last turn was open, and Codex wrote no final event. Once the
+/// attempt's termination receipt (`runtime.worker_terminated`, cause
+/// `cancellation`) exists, the turn is `ended_by_termination` with the
+/// receipt's cause and time, even idle past the threshold: no pending
+/// `final_event_missing` gap, and `health evaluate` opens no alert for it.
+/// A turn opened after the termination (a later resume) is judged on its own:
+/// idle without its final event, it is `missing` again, and (F3) its usage
+/// record, written after the receipt, is flagged `after_termination`; the
+/// record before it is not. Usage is unchanged until then.
+#[test]
+fn a_turn_the_product_ended_is_ended_by_termination_not_a_missing_final_event() {
+    let f = Fixture::new();
+    let path = f.rollout(&f.home, SID, &["head.jsonl"], &f.worktree(), f.decided + 1_000, "0.154.0");
+    let lines: Vec<String> = tail(&f, 1).replace("@SID@", SID).lines().map(|l| format!("{l}\n")).collect();
+    append(&path, &lines[..4].concat());
+    let final_event = |f: &Fixture| f.cli_args(&["collectors", "sessions"]).0["sessions"][0]["final_event"].clone();
+    let pending = |f: &Fixture| f.sidecar().query_row("SELECT count(*) FROM coverage_gaps WHERE reason='final_event_missing' AND recovery='pending'", [], |r| r.get::<_, i64>(0)).unwrap();
+    let (report, _) = f.cli("collect");
+    let usage = report["attempts"][0]["usage"].clone();
+    assert_eq!(final_event(&f), serde_json::json!({"state": "open", "turn_id": "turn-2"}));
+
+    // Fixture only: the receipt the controller records when it stops a
+    // cancelled worker (tests/canonical_worker.rs covers that writer).
+    let terminated = f.decided + 5_000;
+    rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap().execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.worker_terminated',?1,2,1,?2)",
+        rusqlite::params![f.attempt, serde_json::json!({"version": 1, "attempt": f.attempt, "cause": "cancellation", "observed_unix_ms": terminated}).to_string()]).unwrap();
+    age(&path, 660);
+    for _ in 0..2 {
+        let (report, _) = f.cli("collect");
+        assert_eq!(final_event(&f), serde_json::json!({"state": "ended_by_termination", "turn_id": "turn-2",
+            "termination": {"cause": "cancellation", "observed_unix_ms": terminated}}));
+        assert_eq!(pending(&f), 0);
+        assert_eq!(report["attempts"][0]["usage"], usage);
+    }
+    let after = |f: &Fixture| f.cli_args(&["collectors", "sessions"]).0["sessions"][0]["after_termination"].clone();
+    assert_eq!(after(&f), serde_json::json!({"terminated_unix_ms": terminated, "records": 0, "first_unix_ms": null}));
+    let evaluated = f.cli_args(&["health", "evaluate", "--json"]).0;
+    assert!(!evaluated.to_string().contains("final_event"), "{evaluated}");
+    assert_eq!(f.cli_args(&["health", "alerts", "--json"]).0["open"], serde_json::json!([]));
+
+    // A later turn, opened after the termination, left open and idle: missing.
+    let later = jiff::Timestamp::from_millisecond(f.decided + 10_000).unwrap().to_string();
+    let original = jiff::Timestamp::from_millisecond(f.decided + 1_000).unwrap().to_string();
+    append(&path, &lines[0].replace("turn-2", "turn-3").replace("\"ordinal\":8", "\"ordinal\":13").replace(&original, &later));
+    append(&path, &lines[2].replace("turn-2", "turn-3").replace("resp-2", "resp-3").replace("\"ordinal\":10", "\"ordinal\":14").replace(&original, &later));
+    age(&path, 660);
+    f.cli("collect");
+    assert_eq!(final_event(&f), serde_json::json!({"state": "missing", "turn_id": "turn-3"}));
+    assert_eq!(pending(&f), 1);
+    assert_eq!(after(&f), serde_json::json!({"terminated_unix_ms": terminated, "records": 1, "first_unix_ms": f.decided + 10_000}));
+}

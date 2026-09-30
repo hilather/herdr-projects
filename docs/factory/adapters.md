@@ -41,11 +41,34 @@ effort, and environment mappings stay refused for Codex as well.
 
 ## Worker sandbox and commits
 
-Workers never commit. Run Codex workers with `sandbox_mode = 'workspace-write'`:
-that sandbox makes Git metadata read-only, including a linked worktree's gitdir,
-and the worker only edits files in its worktree. Do not widen the sandbox to the
-repository's common `.git`; that would let a worker rewrite any branch of the
-real repository. `danger-full-access` is not needed for results.
+Run Codex workers with `sandbox_mode = 'workspace-write'`. Without worker
+isolation, that sandbox makes Git metadata read-only, including a linked
+worktree's gitdir, and the worker only edits files in its worktree: do not
+widen it to the repository's common `.git`, which would let a worker rewrite
+any branch of the real repository.
+
+An isolated worker (a profile with an execution home) sees the common `.git`
+through its attempt's Git quarantine overlay, so its Git writes never reach
+the shared repository. For a `codex` profile the launch passes
+`-c sandbox_workspace_write.writable_roots=[...]` before the profile's own
+arguments: the common directory, the worktree's administrative directory
+`<common>/worktrees/<id>`, the submission spool and the output directory,
+all already writable inside the worker sandbox. The administrative directory
+must be named on its own: Codex 0.154.0 binds a linked worktree's gitdir
+read-only after the (shallower) common directory otherwise, and `git commit`
+fails with EROFS on `index.lock`. With that, the worker can commit under
+`workspace-write`; `danger-full-access` is not needed. The override replaces
+a `writable_roots` list in the execution home's `config.toml`; the sandbox
+mode stays that file's choice. See
+[the worker isolation review](../reviews/2026-09-29-worker-isolation.md#codexs-own-sandbox-inside-the-worker-sandbox-live-run-card-f-commit).
+The isolated agent's `PATH` starts with the product binary's directory, so
+`herdr-projects` resolves by name for `result submit` and the review channel.
+
+Pin a Codex profile to a certified binary by its resolved path (for example
+`~/.local/share/mise/installs/codex/0.154.0/bin/codex`), not a version
+manager shim: `doctor` and `telemetry SLUG collectors capabilities` warn when a
+retained profile's agent version is uncertified or its path can resolve to
+another version. They never certify a version; that needs a live run.
 
 The controller commits on the worker's behalf with
 `herdr-projects result SLUG capture ATTEMPT [--message TEXT]`

@@ -175,11 +175,24 @@ fn headroom(sidecar: Option<&Connection>, attempts: &[Attempt], in_window: &dyn 
     Ok(m40)
 }
 
+/// A structured metric value as one line of text, or `None` when it is not
+/// one (an unavailable value carries a `reason`). M16 (`M16.tools-v1`):
+/// `issued N, accepted K <status> (U unknown), executed E`, as `accounting
+/// tools` prints it, never `n/a` while the counts are known.
+pub fn structured_text(value: &Value) -> Option<String> {
+    let o = value.as_object()?;
+    if o.contains_key("reason") { return None; }
+    let issued = o.get("issued")?.as_u64()?;
+    let accepted = &value["accepted"];
+    Some(format!("issued {issued}, accepted {} {} ({} unknown), executed {}", accepted["count"], accepted["status"].as_str().unwrap_or("unknown"),
+        accepted["unknown"], value["executed"]))
+}
+
 /// One line per metric (M40: one per decision and limit window); anything unknown reads `n/a`, never 0.
 pub fn text(report: &Value) -> String {
     let show = |m: &Value| match &m["value"] {
         Value::Null => format!("n/a ({})", m["reason"].as_str().unwrap_or("unknown")),
-        Value::Object(o) => format!("n/a ({})", o.get("reason").and_then(Value::as_str).unwrap_or("unknown")),
+        Value::Object(o) => structured_text(&m["value"]).unwrap_or_else(|| format!("n/a ({})", o.get("reason").and_then(Value::as_str).unwrap_or("unknown"))),
         Value::String(s) => s.clone(),
         other => other.to_string(),
     };

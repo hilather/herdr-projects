@@ -488,7 +488,8 @@ pub fn text(out: &Value) -> String {
     for r in out["results"].as_array().into_iter().flatten() {
         let value = match &r["value"] {
             Value::Null => format!("n/a ({})", r["reason"].as_str().unwrap_or("unknown")),
-            Value::Object(o) => format!("n/a ({})", o.get("reason").and_then(Value::as_str).unwrap_or("unknown")),
+            Value::Object(o) => crate::telemetry::metrics::structured_text(&r["value"])
+                .unwrap_or_else(|| format!("n/a ({})", o.get("reason").and_then(Value::as_str).unwrap_or("unknown"))),
             Value::String(s) => s.clone(),
             other => other.to_string(),
         };

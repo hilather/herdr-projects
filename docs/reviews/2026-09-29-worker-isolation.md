@@ -690,8 +690,8 @@ top-level directory there, writable, siblings included.
   controller's own `std::env::current_exe()`: every launch path derives the
   sandbox inside the product binary (ticker, launch service, profile probe),
   and that is the binary a worker invokes (by the absolute path it was given,
-  or by name through `PATH=/usr/bin:/bin`, which is outside every scratch
-  directory). `Isolation::with_executable` adds one explicitly for a caller
+  or by name: since the live-run card below, the agent's `PATH` starts with
+  that binary's directory). `Isolation::with_executable` adds one explicitly for a caller
   that is not the product binary (the `review_signer` test harness).
 - For each executable, `add_executable` takes both forms (name and canonical
   target) and follows, transitively and bounded (16 files), a script's `#!`
@@ -735,6 +735,106 @@ top-level directory there, writable, siblings included.
   writable (`[ -w ]` fails), and `review signer status`/`run` still run and
   refuse the worker context; the owner's control run reads the sibling and
   can write the binary.
+
+## Codex's own sandbox inside the worker sandbox (live-run card, F-commit)
+
+### Finding
+
+The third live run (docs/telemetry/certificate-live.md §2.2, run A) ran a
+Codex 0.154.0 author with Codex's own `workspace-write` sandbox inside this
+sandbox, the repository's Git common directory listed as a Codex writable
+root. `git commit` in the attempt worktree failed with EROFS on
+`<repo>/.git/worktrees/repo-00/index.lock`. Run B had to set Codex to
+`danger-full-access`, leaving this sandbox as the only layer. The run's own
+reproductions put the cause inside Codex but did not isolate it.
+
+### Root cause (reproduced without a model call)
+
+Codex 0.154.0 on Linux sandboxes a command with bubblewrap (its bundled
+`codex-resources/bwrap`), not Landlock. `codex sandbox -c ... -- /bin/sh -c
+'cat /proc/self/mountinfo; git commit ...'` shows the mount plan:
+
+1. `/` read-only, then each writable root bound read-write, **shallowest
+   path first**, each followed by its protections: `<root>/.git`,
+   `<root>/.agents` and `<root>/.codex` read-only.
+2. For a writable root whose `.git` is a *pointer file* (a linked worktree,
+   and the worktree is always a writable root: it is the cwd), Codex also
+   protects the Git directory the pointer names,
+   `<common>/worktrees/<id>`, by binding it read-only.
+3. A protected path that is itself a writable root is not protected.
+
+In the product layout the attempt worktree
+(`<project>/.state/worktrees/<attempt>/repo-00`) lies deeper than the
+repository's common directory (`<repo>/.git`). So the common directory is
+bound read-write first, and the worktree's protections, including the
+read-only `<repo>/.git/worktrees/repo-00`, land on top of it: every write
+Git makes there (`index.lock`, `HEAD`, logs) fails with EROFS, while objects
+and refs in the common directory stay writable.
+
+Evidence on the host, with no product sandbox at all (scratch repositories,
+a scratch `CODEX_HOME` without a login):
+
+| Layout | Codex writable roots | mountinfo (order) | Commit |
+| --- | --- | --- | --- |
+| worktree beside the repository (same depth) | `repo/.git` | `wt` rw, `repo/.git/worktrees/wt` ro, `repo/.git` rw (covers it) | works |
+| worktree deeper than the common directory (the product layout) | `repo/.git` | `repo/.git` rw, worktree rw, `repo/.git/worktrees/repo-00` ro on top | EROFS on `index.lock` |
+| the same, deeper | `repo/.git`, `repo/.git/worktrees/repo-00` | no read-only bind of the administrative directory | works |
+
+This also explains the run's reproduction table. Its nested-namespace
+imitation used a worktree at the same depth as the repository, so it could
+not trigger the order dependence. (`codex sandbox` also ignored
+`sandbox_mode` from the configuration file and ran read-only; only `-c
+sandbox_mode=...` applied it. That is why "configuration file only" failed
+on the host in that table: a separate `codex sandbox` quirk, not the cause.)
+
+### Fix
+
+- `worker_supervision::agent_writable_roots` derives, for an isolated
+  canonical attempt, what it writes outside its worktree: per linked
+  worktree the common directory (the quarantine overlay) and, separately,
+  its administrative directory `<common>/worktrees/<id>`, then the
+  submission spool and output directory. Every path is already writable in
+  this sandbox, so nothing is widened.
+- For a `codex` profile with an execution home, the launch prefixes the
+  agent's own arguments with `-c
+  sandbox_workspace_write.writable_roots=[...]` (those paths)
+  (`canonical_worker::resources::agent_arguments`). It replaces a
+  `writable_roots` list in the execution home's Codex configuration. The
+  sandbox mode stays the deployment's choice (`workspace-write` recommended;
+  `danger-full-access` is no longer needed for commits).
+- Creation, gate release and the start observation derive the prefix from
+  the same retained `runtime.worktrees_ready` receipt. The start observation
+  matches the agent process by the digest of these full arguments, which is
+  the profile's own `arguments_digest` whenever nothing is added (every
+  non-Codex profile and every Codex profile without isolation). Approval
+  digests, `LaunchInputs` and the profile are unchanged; like the sandbox
+  argv, the prefix lives only in the literal supervisor argv (fenced by the
+  per-launch `command_digest`).
+- F1 (same run, §2.4): the agent's `PATH` is now `<product binary
+  directory>:/usr/bin:/bin`, so the D9 review brief's and a worker's bare
+  `herdr-projects` resolves to the product binary the sandbox already
+  exposes read-only (`result submit`, `review session`, `review submit`). A
+  directory that contains `:` or is `/usr/bin` or `/bin` is not added.
+
+### Evidence
+
+- `canonical_worker::an_isolated_codex_worker_commits_through_codex_workspace_write_sandbox`:
+  a `codex` profile is launched through the real ticker path into this
+  sandbox. The agent receives exactly `-c
+  sandbox_workspace_write.writable_roots=[common, <common>/worktrees/<id>,
+  spool, output]` before its own arguments, reaches `Running` (so the start
+  observation identifies it), and sees the product binary's directory first
+  on `PATH`.
+- The same test with `HP_CODEX_SANDBOX_BIN` naming the real Codex 0.154.0
+  binary (run for this card; no model call, no login) also commits inside
+  this sandbox through `codex sandbox`, Codex `workspace-write`:
+  - with only the common directory writable (the live run's
+    configuration): `Unable to create '.../worktrees/<id>/index.lock':
+    Read-only file system`;
+  - with the product's override: the commit succeeds, it lands in the
+    attempt's Git quarantine, and the shared attempt branch is unchanged.
+- `an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_commits_and_submits`
+  now runs `result submit` by the bare name `herdr-projects`.
 
 ## Designed, not built
 
@@ -988,3 +1088,11 @@ Host under heavy unrelated load throughout (load average 15–22 on 12 cores).
   none of which runs the sandbox, while another suite loaded the machine);
   all three pass alone.
 - No new clippy warnings in changed files.
+
+### Tests run (live-run findings card)
+
+- `HP_CODEX_SANDBOX_BIN=~/.local/share/mise/installs/codex/0.154.0/bin/codex
+  cargo test --features state-store --test canonical_worker
+  an_isolated_codex_worker`: passes (the real Codex sandbox commits only with
+  the product's override).
+- See the card's commit for the full suite run.

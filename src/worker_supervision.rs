@@ -201,6 +201,12 @@ pub struct Isolation {
     /// The attempt's submission spool, when the agent is a canonical attempt
     /// (see [`Isolation::with_submission_spool`]).
     spool: Option<String>,
+    /// The directory of the product binary the worker runs for `result
+    /// submit` and the review worker channel, first on the agent's `PATH` so
+    /// a brief's bare `herdr-projects` resolves to it (it stays visible and
+    /// read-only in the sandbox, see [`Isolation::add_executable`]). `None`
+    /// when the binary is unknown or its directory cannot be a `PATH` entry.
+    product: Option<String>,
 }
 
 /// Names the agent's submission spool directory in its baseline environment.
@@ -231,6 +237,47 @@ pub fn git_quarantine(project: &Path, worktree: &Path) -> Option<std::path::Path
     (relative.components().count() > 0
         && relative.components().all(|c| matches!(c, std::path::Component::Normal(_))))
     .then(|| project.join(GIT_QUARANTINE_DIR).join(relative))
+}
+
+/// What an isolated canonical attempt writes outside its worktree, for an
+/// agent that runs its own sandbox inside this one (Codex `workspace-write`
+/// grants writes only under its writable roots): for each linked worktree its
+/// Git common directory (the quarantine overlay) and, named separately, the
+/// worktree's administrative directory `<common>/worktrees/<id>`; then the
+/// attempt's submission spool and output directory (see
+/// [`Isolation::with_submission_spool`]). Paths are canonical and absolute.
+///
+/// The administrative directory must be its own root. Codex (0.154.0, Linux,
+/// bubblewrap) protects the Git directory a writable root's `.git` pointer
+/// names by binding it read-only, and binds writable roots shallowest first
+/// with each root's protections right after it. An attempt worktree lies
+/// deeper than the common directory, so the read-only administrative
+/// directory lands on top of the writable common directory and `git commit`
+/// fails on its `index.lock` with EROFS. A protected path that is itself a
+/// writable root is not protected, so naming it restores the commit without
+/// widening this sandbox: every path here is already writable in it.
+pub fn agent_writable_roots(project: &Path, worktrees: &[(&Path, &Path, &Path)], attempt: &str) -> Result<Vec<String>> {
+    ensure!(
+        !attempt.is_empty()
+            && attempt.len() <= 128
+            && attempt.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+            && !attempt.starts_with('.'),
+        "invalid attempt for the agent's writable roots"
+    );
+    let project = normal(&project.canonicalize()?)?;
+    let mut roots = Vec::new();
+    for (worktree, directory, common) in worktrees {
+        let (worktree, directory, common) = (normal(worktree)?, normal(directory)?, normal(common)?);
+        ensure!(
+            Path::new(&directory).parent() == Some(Path::new(&common).join("worktrees").as_path())
+                && Path::new(&worktree).starts_with(Path::new(&project).join(".state/worktrees")),
+            "worktree {worktree} or its Git directory {directory} is outside its project or common directory {common}"
+        );
+        roots.extend([common, directory]);
+    }
+    roots.extend([format!("{project}/.state/spool/{attempt}"), format!("{project}/.state/worker-output/{attempt}")]);
+    roots.dedup();
+    Ok(roots)
 }
 
 /// Owner-home entries hidden from every isolated agent: signing and SSH keys,
@@ -691,13 +738,15 @@ impl Isolation {
             ensure!(keep.len() <= 7, "too many agent paths directly under {dir}");
             private.push(((*dir).to_owned(), keep));
         }
-        let mut isolation = Self { root, expose, private, git: quarantines, plan, hide, project, spool: None };
+        let mut isolation = Self { root, expose, private, git: quarantines, plan, hide, project, spool: None, product: None };
         // Every executable the worker runs: the agent, and the product binary
         // it invokes for `result submit` and the review worker channel (the
         // controller deriving this sandbox is that binary).
         isolation.add_executable(Path::new(&agent), true)?;
         if let Ok(product) = std::env::current_exe() {
             isolation.add_executable(&product, false)?;
+            isolation.product = product.canonicalize().ok().and_then(|p| p.parent().and_then(|d| normal(d).ok()))
+                .filter(|dir| !dir.contains(':') && dir != "/usr/bin" && dir != "/bin");
         }
         Ok(isolation)
     }
@@ -828,7 +877,8 @@ impl Isolation {
 }
 
 /// Explicit baseline environment for the agent. Only the credential-store home
-/// is variable; secrets and arbitrary inherited loader/config hooks are excluded.
+/// and the product binary's directory on `PATH` (before `/usr/bin:/bin`) are
+/// variable; secrets and arbitrary inherited loader/config hooks are excluded.
 /// The waiting gate still runs in the native terminal's environment, but its
 /// eventual exec clears that environment, applies `isolation` and executes the
 /// approved agent in a nested user namespace (see [`Isolation`]).
@@ -861,7 +911,10 @@ pub fn isolated_gated_command(
         "/usr/bin/env".into(),
         "-i".into(),
         format!("HOME={home}"),
-        "PATH=/usr/bin:/bin".into(),
+        match &isolation.product {
+            Some(dir) => format!("PATH={dir}:/usr/bin:/bin"),
+            None => "PATH=/usr/bin:/bin".into(),
+        },
         "LANG=C.UTF-8".into(),
         "LC_ALL=C.UTF-8".into(),
         "TERM=xterm-256color".into(),
@@ -940,6 +993,9 @@ mod tests {
             .unwrap();
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
+        // The product binary (here the test binary) resolves first on PATH.
+        let product = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let path = format!("{}:/usr/bin:/bin", product.parent().unwrap().display());
         let actual: std::collections::BTreeMap<_, _> = std::str::from_utf8(&output.stdout)
             .unwrap()
             .lines()
@@ -949,7 +1005,7 @@ mod tests {
             actual,
             [
                 ("HOME", home.path().to_str().unwrap()),
-                ("PATH", "/usr/bin:/bin"),
+                ("PATH", path.as_str()),
                 ("LANG", "C.UTF-8"),
                 ("LC_ALL", "C.UTF-8"),
                 ("TERM", "xterm-256color")

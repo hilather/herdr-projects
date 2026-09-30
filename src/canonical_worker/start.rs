@@ -130,12 +130,13 @@ fn finish_start(
         .context("retained supervisor missing")?;
     let supervisor = crate::worker_supervision::SupervisorObservation::reconnect(identity)?;
     executable(&profile.agent, deadline, &cancellation)?;
+    let arguments_digest = super::resources::agent_arguments_digest(profile, &project, &record.attempt, &state.events, operation)?;
     // After release the gate still sets up the worker's filesystem view before
     // it execs the agent; wait (bounded) while that setup is observed, instead
     // of racing it. A gate still waiting for release fails at once as before.
     let settle = Instant::now() + Duration::from_secs(10);
     let process = loop {
-        match supervisor.agent_process(Path::new(&profile.agent.path), &profile.arguments_digest) {
+        match supervisor.agent_process(Path::new(&profile.agent.path), &arguments_digest) {
             Ok(process) => break process,
             Err(error) if Instant::now() >= settle || !supervisor.agent_setup_pending()? => return Err(error),
             Err(_) => {
