@@ -573,12 +573,19 @@ no code path may read it.
 ## 8. Deferred (explicit)
 
 M33 typed attention reasons; transactional outbox (TM0.4);
-spool; budget bridge enforcement and any change to `UnknownUsagePolicy` (TM2.4;
+budget bridge enforcement and any change to `UnknownUsagePolicy` (TM2.4;
 the shadow bridge landed, contracts-accounting.md §14);
-Claude and OTLP adapters; candidate-group selection and races; stochastic
-assignment policies; coordinator digest,
-sidebar suffix and inbox alerts; configuration
-staleness (M50); resume/compaction reconciliation beyond quarantine.
+Claude and OTLP adapters; candidate-group races; resume/compaction
+reconciliation beyond quarantine.
+
+Landed since this list was first written: the worker submission spool and
+Git quarantine (docs/reviews/2026-09-29-worker-isolation.md), randomized
+assignment policies (`deterministic.v1`, uniform, epsilon-greedy, Thompson;
+contracts-evaluation.md §9, migrations 0065–0066), configuration staleness
+(M50) with health rules and alerts (contracts-health.md), and the TM4.8
+workspace: coordinator digest, inbox alerts, the fleet pane, the signed
+weekly-report and replay routines, and the `telemetry` sidebar suffix for
+legacy threads and canonical attempt panes (workspace.md §6, §10).
 
 Landed since phase 1 (see the lane contracts): retention, holds,
 tombstoned deletion, backup and restore (TM5.3,
