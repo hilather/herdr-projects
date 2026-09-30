@@ -453,7 +453,7 @@ Build: `cargo test --release --locked --offline -j 3 --features state-store
 --test telemetry_scale --no-run`. Use §1's environment with
 `SCALE_EVENTS=100000 SCALE_ACTIVE=64 SCALE_REPEATS=3`. Freshness uses
 `scale_4_freshness_burst`, `SCALE_CADENCE_MS=1000` (120 s steady, 60 s burst,
-30 s drain). Additional isolated phase: `scale_6_accounting_pass`; it warms
+30 s drain). Additional isolated phase: `scale_8_accounting_pass`; it warms
 sync, then appends 16 real events per active rollout (1,024 lines), collects
 and measures the accounting CLI's wall time and `VmHWM` three times. Set
 `SCALE_ACCOUNTING_BIN=$PWD/bench-data/baseline-cli` only for its before run

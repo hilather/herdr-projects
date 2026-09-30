@@ -1598,13 +1598,14 @@ fn scale_6_fairness() {
         "criterion": "each light project has observed usage and p95 append-to-ledger freshness <= 5000 ms in every round", "fair": fair,
         "rounds": rounds, "loadavg_start": load, "loadavg_end": load_average()}));
     assert!(fair, "light-project freshness exceeds the fixed 5 s fairness criterion; see results-fairness.json");
+}
 
 /// Isolate accounting RSS and latency after a bounded fleet append. The optional
 /// executable override compares a preserved pre-change CLI on the same dataset;
 /// the normal gate and every answer still use the public CLI surfaces.
 #[test]
 #[ignore = "100k accounting pass resource measurement; on-disk SCALE_DATA required"]
-fn scale_6_accounting_pass() {
+fn scale_8_accounting_pass() {
     let dir = data_dir();
     let mut d = Dataset::load(&dir);
     let canonical = canonical_digest(&d);
