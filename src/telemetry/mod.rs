@@ -4,6 +4,7 @@ pub mod accounting;
 pub mod analytics;
 pub mod codex;
 pub mod collectors;
+pub mod export;
 pub mod ingest;
 pub mod metrics;
 pub mod outcome;

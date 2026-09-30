@@ -4,6 +4,7 @@
 //! and the sidecar strictly read-only and never writes a revision.
 use super::lifecycle::{self, Lineage, Task};
 use super::registry::{self, Cohort, Metric, Provider, Version, Window};
+use crate::telemetry::export::cursor::Keyring;
 use anyhow::Result;
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
@@ -368,27 +369,16 @@ fn envelope(cell: &Cell, core: Value, projection: Value, watermarks: &Value, obs
     out
 }
 
-/// Cursor: opaque hex of `{request, snapshot, revision, bucket, next}` plus a
-/// checksum. It binds the normalized request and the frozen snapshot.
-fn encode_cursor(value: &Value) -> String {
-    let text = serde_json::to_string(value).unwrap_or_default();
-    let check = &super::sha256(text.as_bytes())[7..23];
-    format!("{}{}", text.bytes().map(|b| format!("{b:02x}")).collect::<String>(), check)
-}
+/// Cursor kind of drill-down pages (`export::cursor`): keyed MAC, project
+/// scope and expiry; the position binds `{request, snapshot, revision, bucket, next}`.
+const CURSOR_KIND: &str = "analytics-drill";
 
-fn decode_cursor(cursor: &str) -> Result<Value> {
-    let bad = || reject("invalid_cursor", json!({}));
-    if cursor.len() < 16 || !cursor.is_ascii() { return Err(bad()); }
-    let (hex, check) = cursor.split_at(cursor.len() - 16);
-    if hex.len() % 2 != 0 { return Err(bad()); }
-    let bytes: Option<Vec<u8>> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok()).collect();
-    let text = String::from_utf8(bytes.ok_or_else(bad)?).map_err(|_| bad())?;
-    if &super::sha256(text.as_bytes())[7..23] != check { return Err(bad()); }
-    serde_json::from_str(&text).map_err(|_| bad())
-}
+/// `telemetry <slug> query`: the read contract (JSON). Drill-down cursors use
+/// the key under `$HOME/.config/herdr-projects` (`run_with` names it).
+pub fn run(project: &Path, request: &Request) -> Result<Value> { run_with(project, request, &Keyring::from_home()) }
 
-/// `telemetry <slug> query`: the read contract (JSON).
-pub fn run(project: &Path, request: &Request) -> Result<Value> {
+/// As `run`, with drill-down cursors sealed and opened by `keys`.
+pub fn run_with(project: &Path, request: &Request, keys: &Keyring) -> Result<Value> {
     let now = jiff::Timestamp::now().as_millisecond();
     let mut sources = Sources::new(project)?;
     let watermarks = sources.watermarks()?;
@@ -424,7 +414,8 @@ pub fn run(project: &Path, request: &Request) -> Result<Value> {
             (envelope(cell, core, projection, &watermarks, now), Some(Ok((lineage, digest, matched))))
         };
         if let (Some(bucket), Some(source)) = (&request.drill, lineage_source) {
-            drill = drill_page(sidecar.as_deref(), cell, &result, source, bucket, request, &request_digest)?;
+            let auth = Auth { keys, project: crate::telemetry::export::cursor::project_scope(project)?, now };
+            drill = drill_page(sidecar.as_deref(), cell, &result, source, bucket, request, &request_digest, &auth)?;
         } else if request.drill.is_some() {
             drill = json!({"status": "unavailable", "reason": "no_revision_as_of"});
         }
@@ -438,12 +429,19 @@ pub fn run(project: &Path, request: &Request) -> Result<Value> {
 /// One bounded drill-down page. A live snapshot that matches a stored
 /// revision is pinned to it, so later pages survive new arrivals; an
 /// unpinned live snapshot that changed is `restart_required`, never mixed.
+/// Who may continue a drill-down: the cursor key, the project scope and the time.
+struct Auth<'a> { keys: &'a Keyring, project: String, now: i64 }
+
+#[allow(clippy::too_many_arguments)]
 fn drill_page(db: Option<&rusqlite::Connection>, cell: &Cell, result: &Value, source: std::result::Result<(Lineage, String, Option<i64>), i64>, bucket: &str,
-    request: &Request, request_digest: &str) -> Result<Value> {
+    request: &Request, request_digest: &str, auth: &Auth) -> Result<Value> {
     if cell.version.provider != Provider::Native || result["status"] == "unavailable" {
         return Ok(json!({"status": "unavailable", "reason": "drill_unsupported", "detail": "lane metrics drill down through their lane's ledger commands"}));
     }
-    let cursor = request.cursor.as_deref().map(decode_cursor).transpose()?;
+    let cursor = match request.cursor.as_deref() {
+        None => None,
+        Some(token) => Some(auth.keys.open(CURSOR_KIND, &auth.project, auth.now, token).map_err(|(code, detail)| reject(code, detail))?),
+    };
     if let Some(c) = &cursor && (c["request"] != request_digest || c["bucket"] != bucket) {
         return Err(reject("cursor_mismatch", json!({"detail": "a cursor continues only the request that issued it"})));
     }
@@ -473,9 +471,12 @@ fn drill_page(db: Option<&rusqlite::Connection>, cell: &Cell, result: &Value, so
         }
     };
     let next = offset + rows.len() as i64;
-    let next_cursor = (next < total).then(|| encode_cursor(&json!({"v": 1, "request": request_digest, "snapshot": snapshot, "revision": revision, "bucket": bucket, "next": next})));
+    let (next_cursor, expires) = if next < total {
+        let (token, exp) = auth.keys.seal(CURSOR_KIND, &auth.project, auth.now, json!({"request": request_digest, "snapshot": snapshot, "revision": revision, "bucket": bucket, "next": next}))?;
+        (Some(token), Some(exp))
+    } else { (None, None) };
     Ok(json!({"metric_id": cell.metric.id, "definition": cell.version.definition, "bucket": bucket, "buckets": buckets, "rows": rows, "offset": offset,
-        "page_size": request.page_size, "total": total, "next_cursor": next_cursor, "snapshot": {"content_digest": snapshot, "revision": revision}}))
+        "page_size": request.page_size, "total": total, "next_cursor": next_cursor, "next_cursor_expires_unix_ms": expires, "snapshot": {"content_digest": snapshot, "revision": revision}}))
 }
 
 /// Text form: one line per metric, then drill rows.

@@ -78,9 +78,10 @@ pub fn run_metrics(command: MetricsCommand) -> Result<String> {
     }
 }
 
-pub fn run_query(project: &Path, args: &query::Args) -> Result<String> {
+/// `config_dir` holds the drill-down cursor key (`export::cursor`).
+pub fn run_query(project: &Path, config_dir: &Path, args: &query::Args) -> Result<String> {
     let request = query::request(args)?;
-    let out = query::run(project, &request)?;
+    let out = query::run_with(project, &request, &crate::telemetry::export::cursor::Keyring::new(config_dir))?;
     Ok(if args.json { serde_json::to_string_pretty(&out)? + "\n" } else { query::text(&out) })
 }
 

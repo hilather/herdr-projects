@@ -869,6 +869,8 @@ enum TelemetryCommand {
     Query(herdr_projects::telemetry::analytics::query::Args),
     /// TM4.1 aggregate revisions (sidecar stream `analytics`).
     Analytics { #[command(subcommand)] command:herdr_projects::telemetry::analytics::Command },
+    /// TM4.3 portable export (`export.v1`, JSON or CSV) through the query service. Read-only unless --out/--external.
+    Export(herdr_projects::telemetry::export::Args),
 }
 
 #[cfg(feature="state-store")]
@@ -1270,7 +1272,12 @@ pub fn run() -> Result<()> {
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Query(args)}=>{
             project::validate_slug(&slug)?;
-            print!("{}",herdr_projects::telemetry::analytics::run_query(&ctx.root.join(slug),&args)?);Ok(())
+            print!("{}",herdr_projects::telemetry::analytics::run_query(&ctx.root.join(slug),&ctx.config_dir,&args)?);Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Telemetry{slug,command:TelemetryCommand::Export(args)}=>{
+            project::validate_slug(&slug)?;
+            print!("{}",herdr_projects::telemetry::export::run(&ctx.root.join(&slug),&ctx.config_dir,&slug,&args)?);Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Analytics{command}}=>{

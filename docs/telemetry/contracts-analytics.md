@@ -39,7 +39,7 @@ telemetry <slug> query --metric M..[,M..] [--cohort activity_window|terminal_coh
     [--drill BUCKET --page-size N --cursor C] [--json]
 ```
 
-Read-only (opens both stores strictly read-only, creates no file). `--metric`
+Read-only (opens both stores strictly read-only, creates no file in the project; a multi-page drill-down creates the per-user cursor key under the config directory on first use, [contracts-export.md](contracts-export.md) §4). `--metric`
 takes a registry id (current definition) or an explicit definition
 (`M02.slice-v1`).
 
@@ -48,8 +48,10 @@ takes a registry id (current definition) or an explicit definition
 diagnostic lists the accepted enums), `unknown_cohort`, `unknown_metric`,
 `unknown_definition` (with the known ones), `empty_window` (`from >= to`),
 `page_size_out_of_range` (1–500), `horizon_out_of_range`,
-`drill_needs_one_metric`, `invalid_cursor`, `cursor_mismatch`,
-`restart_required`.
+`drill_needs_one_metric`, `invalid_cursor`, `cursor_expired`,
+`cursor_foreign_project`, `cursor_revoked`, `cursor_key_unusable`,
+`cursor_mismatch`, `restart_required` (cursor codes:
+[contracts-export.md](contracts-export.md) §4).
 
 **Per-metric diagnostics** (the result's `status: unavailable` with `reason`
 and `diagnostic`): the family's inactive reason; the absent producer's reason;
@@ -164,15 +166,17 @@ refreshed by then (`no_revision_as_of` otherwise).
 `excluded.<reason>`; rows `{entity, id, ...attrs}` (tasks: disposition,
 terminal and assignment times, attempts, route, agent kind, task class;
 attempts: task, state, decision time), ordered by id. `--page-size` 1–500
-(default 100); `next_cursor` is null on the last page. The cursor is opaque
-(hex JSON plus checksum) and binds the normalized request, the snapshot's
+(default 100); `next_cursor` is null on the last page,
+`next_cursor_expires_unix_ms` its expiry. The cursor (TM4.3,
+[contracts-export.md](contracts-export.md) §4) is authenticated with a keyed
+MAC (per-user key under the config directory), scoped to the project and
+expires after 30 minutes; it binds the normalized request, the snapshot's
 `content_digest`, the pinned revision, the bucket and the position. A first
 page whose live content matches a stored revision is pinned to it: later
 pages read that revision's lineage and neither duplicate nor skip rows while
 new data arrives. An unpinned live snapshot that changed answers
-`restart_required`, never a mixed page. The cursor is not authenticated and
-has no expiry (local CLI, one user); an exported or remote read interface
-(TM4.3) must add a keyed MAC, authorization scope and expiry. High-cardinality
+`restart_required`, never a mixed page. Exports (`telemetry export --drill`)
+page through this same cursor. High-cardinality
 identities appear only in drill rows, never as metric labels or dimension
 values. Lane definitions answer `drill_unsupported` and drill through their
 lane's ledger commands.

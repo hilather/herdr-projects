@@ -25,6 +25,8 @@ needs a new reviewed revision, not a silent reinterpretation.
 - Metric registry, query service and the read contract shared by
   `telemetry report`, the fleet pane, views and exports (TM4.1):
   [contracts-analytics.md](contracts-analytics.md).
+- Portable JSON/CSV exports, authenticated page cursors and the optional
+  external export setting (TM4.3): [contracts-export.md](contracts-export.md).
 
 ## 0. Common rules
 
