@@ -19,7 +19,8 @@ pub mod store;
 
 pub const STREAM: &str = "analytics";
 /// `include_str!` of `migrations/telemetry/analytics/`, in order; index + 1 is the stream version.
-pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/analytics/0001_aggregate_revisions.sql")];
+pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/analytics/0001_aggregate_revisions.sql"),
+    include_str!("../../../migrations/telemetry/analytics/0002_workspace_projections.sql")];
 
 pub(crate) fn sha256(bytes: &[u8]) -> String {
     format!("sha256:{:x}", <sha2::Sha256 as sha2::Digest>::digest(bytes))

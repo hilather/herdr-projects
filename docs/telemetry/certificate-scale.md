@@ -30,6 +30,9 @@ for either. This is not a certification of an OTLP transport.
 | Source | branch `telemetry/tm51-scale-certification` from `main` `20a763f`, plus the fixes in §5 |
 | Stores | canonical `SCHEMA = 67`; sidecar streams `codex` 3, `ingest` 8, `accounting` 12, `quality` 2, `analytics` 1, `health` 1, `policies` 1 |
 | Build | `cargo test --release --locked --offline -j 3 --features state-store --test telemetry_scale --no-run` (rustc 1.98.0), system SQLite 3.53.4 |
+
+| Stores | canonical `SCHEMA = 67`; sidecar streams `codex` 3, `ingest` 8, `accounting` 11, `quality` 2, `analytics` 2, `health` 1, `policies` 1 |
+| Build | `cargo test --release --features state-store --test telemetry_scale` (rustc 1.98.0), system SQLite 3.53.4 |
 | CPU / memory | Intel Core i7-8750H, 6 cores / 12 threads, 62 GiB RAM, zram swap |
 | Disk | Intel SSDPEKNW010T8 NVMe, LUKS, btrfs (`compress=zstd:3`). Every dataset lived under `bench-data/` on this disk, never on the RAM-backed `/tmp` |
 | OS | Linux 7.2.3-arch1-3 |
@@ -558,9 +561,11 @@ using the existing interval algorithm. Historical metric fields come from
 immutable analytics revisions; their compact rendering bodies keep the
 original fields and M40's exact latest-per-service/tie/encounter-order rule.
 Configuration cells are recorded on analytics refresh using the same
-comparison estimators, ordering, pooling, suppression and seed. Optional
-analytics-owned rendering tables leave tracked metric cells, authoritative
-bodies, digests, lineage and stream versions unchanged. Each history section
+comparison estimators, ordering, pooling, suppression and seed. Analytics-owned
+rendering tables leave tracked metric cells, authoritative bodies, digests and
+lineage unchanged. P3b adopts them through analytics
+stream migration 2 and the retention/backup/rebuild lifecycle. Each history
+section
 adds `as_of` (its own revision and recording time); missing revisions remain
 `unavailable (no_revision_as_of)`, with no live fallback. Digest reads bound
 comparison cells/arms, pending selections and alerts to the printed top-N,
@@ -568,6 +573,60 @@ with exact omitted counts. Refresh also left the dataset's canonical bytes
 unchanged. The E2E suite compares all displayed history values with their
 existing public reads and checks current sections over retained cancellations
 and terminal candidate arms; no new unit or source-text tests were added.
+
+### 4.7 P3b: rendering projection lifecycle (100k only)
+
+Branch `perf/workspace-snapshot`, 2026-09-30. **Pending the steward's serial
+1M certification.** Analytics stream 2 adopts the two workspace tables through
+`0002_workspace_projections.sql`, removes the legacy update/delete guards,
+and creates them on new sidecars through the stream migration. Refresh no
+longer performs schema DDL. Metric renderings are deleted in the same
+transaction as their superseded revisions. Comparison renderings retain the
+latest row plus the ANALYTICS window (365 days by default); holds and durable
+tombstones apply. Both tables are included in backup/restore row inventories
+(the online backup already copies the entire database). Restore migrates its
+private copy before enforcing tombstones, including backups with the legacy
+guards. Non-verifying rebuild recreates metric renderings from surviving
+revision bodies and the current comparison through the unchanged estimator.
+Read-only legacy/missing-history behavior remains unchanged.
+
+The same fresh, generated disk dataset was measured before and after this
+storage correction: 100,000 requested events, 99,926 generated events,
+53,714,282 rollout bytes, 64 active attempts and 10,000 retained bindings.
+Both release builds used the §4.6 locked/offline command with `-j 3`.
+Before: phases 0, 1 and 2; after: `analytics refresh` then phase 2, with
+`SCALE_REPEATS=3 SCALE_PER_ROUND=2` and `SCALE_TAG=p3b-before|p3b-after`.
+One bench process at a time, no concurrent build during query measurement;
+all data and temporary bench projects under `$PWD/bench-data/`, removed
+before commit. No 1M run. Six samples per distribution, milliseconds:
+
+| Surface | Before p50 / p95 / max | After p50 / p95 / max |
+| --- | --- | --- |
+| Pane refresh, in process | 55.84 / 75.03 / 75.03 | 47.76 / 53.62 / 53.62 |
+| Digest section, in process | 54.88 / 70.23 / 70.23 | 48.03 / 53.44 / 53.44 |
+| `workspace show`, fresh process | 63.69 / 71.62 / 71.62 | 53.07 / 55.65 / 55.65 |
+| `workspace digest`, fresh process | 65.82 / 107.06 / 107.06 | 52.78 / 56.83 / 56.83 |
+
+`results-queries-p3b-before.json` records load averages (1 / 5 / 15 minutes)
+**5.39 / 6.99 / 7.91**; `results-queries-p3b-after.json` records
+**1.91 / 5.29 / 7.03**. As in §4.6, the harness samples both load fields at
+phase end. Pane round-p50 noise is 10.86% before / 5.28% after; digest noise
+6.86% / 3.30%. The quieter after run prevents attributing the lower times to
+this lifecycle correction. The 100k pane and digest targets remain met in
+these samples; 1M remains pending. Digest size stays 14 lines / 1,406 bytes.
+
+Correctness: rendering uses the identical projection algorithm, including
+M40's latest-per-service, tie and encounter-order rule. No metric evaluator,
+coverage rule, authoritative body, digest or lineage definition changes.
+Retention deletes only superseded metric renderings and non-latest expired
+comparisons; current recorded values and their `as_of` survive. CLI E2E
+coverage extends the existing operations workflow with three changing
+refreshes, legacy live-sidecar upgrade, workspace foreign-key/orphan checks,
+retention apply, legacy-backup restore with identical recorded pane output
+(excluding observation-clock fields), exact M40 value/as-of against the
+public revision query, and recovery of both disposable projections through
+`analytics rebuild`.
+
 
 ## 5. Inefficiencies found and fixed
 
@@ -702,6 +761,9 @@ owner. None is hidden by loosening the target.
   6,643/9,426 → 63.69/96.56 ms; digest 5,589/10,323 → 63.88/94.36 ms,
   with recorded 1-minute loads 14.70 before / 3.86 after. Both 100k
   targets met in this run; pending the steward's 1M certification.**
+  P3b's lifecycle correction retains the targets (§4.7): fresh 100k pane
+  p95 75.03 → 53.62 ms, digest p95 70.23 → 53.44 ms, at recorded
+  1-minute loads 5.39 → 1.91; pending the steward's serial 1M certification.
   Original 1M measurements above remain the last certified ones.
   Owners: TM4.8, TM1.8, TM4.1.
 - **L6: sidecar size.** The sidecar is 2.7–3.1 times the rollout bytes it
@@ -807,3 +869,14 @@ New CLI/store E2E coverage checks 31 retained cancelled attempts (the public
 until refresh, missing revisions, and terminal candidate arms in both pane
 and digest. Clippy reports zero warnings in changed lines (existing unrelated
 warnings remain). Datasets were removed before committing.
+
+P3b verification: all 15 requested suites ran with `--locked --offline -j 3
+--features state-store --no-fail-fast` and three test threads. The unchanged
+`scale_gates_hold_under_load` passed twice. The final full run plus focused
+reruns establishes 169 passing tests, seven ignored scale phases, and the
+same four socket-only failures listed above. The first run's collector-create
+race (`File exists`) passed in the final full run. The ticker-health timing
+check failed in both full runs and passed in isolation; it is recorded as a
+flaky result, not a socket failure. The new operations fixture's intermediate
+assertions were corrected; its final complete suite passes all 12 tests.
+Clippy has no warnings in changed lines; unrelated existing warnings remain.

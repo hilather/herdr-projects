@@ -123,7 +123,7 @@ Plan doc 07 §1. `T`/`A` evidence is exactly contracts §6 (`metrics::task_evide
   classification, else `unclassified`), `agent_kind` (the attempts' effective
   profile kind, `mixed`, `unknown` or `unassigned`). At most 64 cells.
 
-## 4. Aggregate revisions (stream `analytics`, version 1)
+## 4. Aggregate revisions (stream `analytics`, version 2)
 
 `migrations/telemetry/analytics/0001_aggregate_revisions.sql`:
 
@@ -228,3 +228,8 @@ The registry's `metrics registry --json` gains one additive key,
 bootstrap method, seed and level, the 20-task cell minimum, the
 `beta_binomial_eb.v1` pooling prior, `hajek_ipw.v1` and the paired M42
 reference); the text form and every metric entry are unchanged.
+
+Analytics stream 2 adds disposable `analytics_workspace_metrics` and
+`analytics_workspace_comparisons` rendering projections. Metrics follow their
+revision deletion; comparisons retain the latest row and the analytics retention
+window. Rebuild recreates metric projections from recorded revision bodies.

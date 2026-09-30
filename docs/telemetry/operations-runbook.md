@@ -52,7 +52,7 @@ column named in `age_from`).
 | `sidecar.normalized_sessions` | `telemetry.db`, per Codex session: `codex_*`, `rollout_*`, `collect_offsets`, `codex_tool_sources`, `source_bindings`, `source_observations`, `ingest_quarantine`, `coverage_gaps`, `source_cursors`, `usage_entries`, `usage_dispositions`, `model_segments`, `quota_window_observations`, `session_graph_nodes` | 90 d | derivable from the native rollout (tombstoned: never again) | prune, destructive |
 | `sidecar.attention_samples` | `attention_samples` | 90 d | source of truth (sampled live, R4) | prune, destructive |
 | `sidecar.health_evaluations` | `health_evaluations` | 90 d | derivable | prune |
-| `sidecar.analytics_revisions` | superseded `analytics_revisions` and their `analytics_lineage` | 365 d | derivable | prune (the current revision of every cell is kept) |
+| `sidecar.analytics_revisions` | superseded `analytics_revisions`, their `analytics_lineage` and `analytics_workspace_metrics`; `analytics_workspace_comparisons` outside the window (latest kept) | 365 d | derivable | prune (the current revision of every cell is kept) |
 | `sidecar.derived_projections` | ledger, graph, quota windows, proxy signals, integration outcomes, policy shadow, health states and alerts, analytics cells | — | derivable | follows its sources |
 | `sidecar.accounting_imports` | rate cards, charges, invoices, FX tables | — | source of truth (R4: re-import needs the files) | retain |
 | `sidecar.valuation_history` | valuation revisions, deltas, bases, inputs | — | source of truth (as-of views) | retain |
@@ -400,6 +400,8 @@ $ herdr-projects telemetry demo backup restore --from <tmp>/backup-2026-09-30
   "restored_unix_ms": <unix_ms>,
   "rows": {
     "analytics_revisions": 0,
+    "analytics_workspace_comparisons": 0,
+    "analytics_workspace_metrics": 0,
     "attention_samples": 0,
     "codex_usage": 0,
     "fx_tables": 0,

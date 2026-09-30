@@ -50,9 +50,15 @@ projections in its existing transaction. `analytics_workspace_metrics` holds
 compact bodies keyed by the authoritative metric revision (M40 keeps the latest
 decision per service, with the original tie and encounter-order rules).
 `analytics_workspace_comparisons` appends only when the exact displayed
-comparison changes. These optional tables are created on refresh, including
-for an older sidecar; reading never creates them. They do not change the
-analytics stream version, tracked cells, metric bodies, digests or lineage.
+comparison changes. Analytics stream migration 2 creates these disposable tables and removes the
+legacy immutability guards; reading an older sidecar never creates them.
+Metric rows are pruned in the same transaction as their superseded revisions.
+Comparison rows keep the latest plus the analytics retention window (365 days
+by default), respecting analytics holds. Backup/restore includes both tables;
+restore migrates an old private copy before applying tombstones. Non-verifying
+`analytics rebuild` recreates metric renderings from surviving revision bodies
+and the current comparison through the existing estimator. Tracked cells,
+metric bodies, digests and lineage retain their definitions and values.
 
 **Degrading.** If the query service or the attempt projection cannot answer,
 for example because `state.db` or the telemetry sidecar is unreadable, the

@@ -99,9 +99,9 @@ pub const CLASSES: &[Class] = &[
         age_from: "observed_unix_ms", requires: "attempt terminal" },
     Class { id: HEALTH, store: "telemetry.db", scope: "health_evaluations", default_days: Some(90), basis: "derivable", destructive: false, action: Action::Prune,
         age_from: "evaluated_unix_ms", requires: "none (the newest 1000 are also capped by the health lane)" },
-    Class { id: ANALYTICS, store: "telemetry.db", scope: "analytics_revisions and their analytics_lineage (superseded revisions only)", default_days: Some(365), basis: "derivable",
-        destructive: false, action: Action::Prune, age_from: "recorded_unix_ms", requires: "a later revision of the same cell exists (the current revision is kept)" },
-    Class { id: "sidecar.derived_projections", store: "telemetry.db", scope: "usage_ledger, model_segments, session_graph_nodes, quota_windows, proxy_signals, integration_outcomes, policy_shadow_decisions, health_rule_states, health_alerts, analytics_cells, source_bindings",
+    Class { id: ANALYTICS, store: "telemetry.db", scope: "analytics_revisions and their analytics_lineage and analytics_workspace_metrics (superseded revisions only), analytics_workspace_comparisons (latest kept)", default_days: Some(365), basis: "derivable",
+        destructive: false, action: Action::Prune, age_from: "recorded_unix_ms", requires: "a later revision of the same cell exists; comparison rows are outside the window and not latest" },
+    Class { id: "sidecar.derived_projections", store: "telemetry.db", scope: "usage_ledger, model_segments, session_graph_nodes, quota_windows, proxy_signals, integration_outcomes, policy_shadow_decisions, health_rule_states, health_alerts, analytics_cells, analytics_workspace_metrics, analytics_workspace_comparisons, source_bindings",
         default_days: None, basis: "derivable", destructive: false, action: Action::FollowsSources, age_from: "-", requires: "rebuilt by collect, sync and lane ticks from surviving sources" },
     Class { id: "sidecar.accounting_imports", store: "telemetry.db", scope: "rate_cards, rate_card_models, rate_card_rates, provider_charges, provider_invoices, fx_tables, fx_rates",
         default_days: None, basis: "source_of_truth", destructive: true, action: Action::Retain, age_from: "-", requires: "kept; re-import needs the original files (certificate-core R4)" },
@@ -298,6 +298,7 @@ enum Target {
     Attention { attempt: String, before: i64 },
     Health { before: i64 },
     Revision { revision: i64 },
+    Comparison { revision: i64 },
     Tree(PathBuf),
     Backup { id: String, location: PathBuf, files: Vec<String>, missing: bool },
     File(Vec<PathBuf>),
@@ -489,6 +490,15 @@ fn analytics(ctx: &Ctx, db: &Connection) -> Result<Found> {
         let item = Item { class: ANALYTICS, key: format!("revision:{revision}"), tombs: vec![(Some(format!("revision:{revision}:{digest}")), None)],
             target: Target::Revision { revision }, detail: json!({"content_digest": digest}), reason: "retention_expired" };
         found.offer(ctx, item, &[]);
+    }
+    if table(db, "analytics_workspace_comparisons")? {
+        let rows: Vec<(i64, i64)> = db.prepare("SELECT revision,recorded_unix_ms FROM analytics_workspace_comparisons WHERE recorded_unix_ms<?1 AND revision<(SELECT max(revision) FROM analytics_workspace_comparisons) ORDER BY revision")?
+            .query_map([ctx.cutoff(ANALYTICS)], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        for (revision, at) in rows {
+            found.offer(ctx, Item { class: ANALYTICS, key: format!("comparison:{revision}"),
+                tombs: vec![(Some(format!("comparison:{revision}:{at}")), None)], target: Target::Comparison { revision },
+                detail: json!({"recorded_unix_ms": at}), reason: "retention_expired" }, &[]);
+        }
     }
     Ok(found)
 }
@@ -711,6 +721,7 @@ fn delete_revisions(tx: &Connection, revisions: &[i64]) -> Result<usize> {
     tx.execute_batch("DROP TRIGGER IF EXISTS analytics_revisions_no_delete; DROP TRIGGER IF EXISTS analytics_lineage_no_delete;")?;
     let mut rows = 0;
     for revision in revisions {
+        if table(tx, "analytics_workspace_metrics")? { rows += tx.execute("DELETE FROM analytics_workspace_metrics WHERE revision=?1", [revision])?; }
         rows += tx.execute("DELETE FROM analytics_lineage WHERE revision=?1", [revision])?;
         rows += tx.execute("DELETE FROM analytics_revisions WHERE revision=?1", [revision])?;
     }
@@ -766,6 +777,15 @@ pub fn enforce(db: &mut Connection, tombstones: &Tombstones) -> Result<BTreeMap<
         let rows: Vec<(i64, String)> = tx.prepare("SELECT revision,content_digest FROM analytics_revisions")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
         let doomed: Vec<i64> = rows.into_iter().filter(|(r, d)| tombstones.key(ANALYTICS, &format!("revision:{r}:{d}")).is_some()).map(|(r, _)| r).collect();
         if !doomed.is_empty() { delete_revisions(&tx, &doomed)?; out.insert(ANALYTICS, doomed.len()); }
+    }
+    if table(&tx, "analytics_workspace_comparisons")? {
+        let rows: Vec<(i64, i64)> = tx.prepare("SELECT revision,recorded_unix_ms FROM analytics_workspace_comparisons")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        for (revision, at) in rows {
+            if tombstones.key(ANALYTICS, &format!("comparison:{revision}:{at}")).is_some() {
+                tx.execute("DELETE FROM analytics_workspace_comparisons WHERE revision=?1", [revision])?;
+            }
+        }
     }
     if !out.is_empty() { super::accounting::ledger::invalidate(&tx, "retention_enforcement")?; }
     tx.commit()?;
@@ -846,6 +866,7 @@ pub fn apply(project: &Path, config_dir: &Path, confirm: Option<&str>, dry_run: 
                 delete_revisions(&tx, &[*revision])?;
                 tx.commit()?;
             }
+            Target::Comparison { revision } => { sidecar.as_ref().context("the sidecar disappeared")?.execute("DELETE FROM analytics_workspace_comparisons WHERE revision=?1", [revision])?; }
             Target::Tree(path) => remove_tree(path)?,
             Target::Backup { id, location, files, missing } => {
                 if !missing {

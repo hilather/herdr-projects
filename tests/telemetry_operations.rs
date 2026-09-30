@@ -230,6 +230,22 @@ fn accounting_intents_stay_until_their_disposition() {
     assert_eq!(g.count("codex_usage"), 0);
 }
 
+// Remove only observation-clock fields; all recorded values and as_of stay exact.
+fn pane_recorded(mut pane: Value) -> Value {
+    fn clocks(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                for key in ["query_unix_ms", "lag_ms", "elapsed_ms"] { object.remove(key); }
+                for value in object.values_mut() { clocks(value); }
+            }
+            Value::Array(values) => for value in values { clocks(value); },
+            _ => {}
+        }
+    }
+    clocks(&mut pane);
+    pane
+}
+
 #[test]
 fn attention_health_and_analytics_expire_without_losing_current_views() {
     let f = collected();
@@ -241,7 +257,12 @@ fn attention_health_and_analytics_expire_without_losing_current_views() {
     f.cli_args(&["health", "evaluate", "--json"]);
     f.cli_args(&["health", "evaluate", "--json"]);
     f.sidecar().execute("UPDATE health_evaluations SET evaluated_unix_ms=evaluated_unix_ms-?1 WHERE evaluation=(SELECT min(evaluation) FROM health_evaluations)", [91 * DAY]).unwrap();
+    // The previous binary's ad-hoc tables were guarded despite being disposable.
+    f.sidecar().execute_batch("UPDATE telemetry_streams SET version=1 WHERE stream='analytics';
+        CREATE TRIGGER analytics_workspace_metrics_no_delete BEFORE DELETE ON analytics_workspace_metrics BEGIN SELECT RAISE(ABORT,'legacy immutable'); END;
+        CREATE TRIGGER analytics_workspace_comparisons_no_delete BEFORE DELETE ON analytics_workspace_comparisons BEGIN SELECT RAISE(ABORT,'legacy immutable'); END;").unwrap();
     f.cli_args(&["analytics", "refresh"]);
+    assert_eq!(json_of(&f, &["analytics", "status"])["version"], 2);
     let due = plan(&f);
     assert_eq!(class(&due, "sidecar.attention_samples")["eligible"], json!([{"key": "attempt:gone-attempt", "samples": 2}]));
     assert_eq!(class(&due, "sidecar.attention_samples")["blocked"], json!([{"key": format!("attempt:{}", f.attempt), "reason": "attempt_not_terminal"}]));
@@ -259,22 +280,63 @@ fn attention_health_and_analytics_expire_without_losing_current_views() {
     f.cli("collect");
     f.cli_args(&["accounting", "sync"]);
     f.cli_args(&["analytics", "refresh"]);
-    let restated: i64 = f.sidecar().query_row("SELECT count(*) FROM analytics_revisions WHERE kind='restatement'", [], |r| r.get(0)).unwrap();
+    f.cancel_reserved();
+    rollout_as(&f, "00000000-0000-4000-8000-0000000000b3", &["head.jsonl"]);
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    f.cli_args(&["analytics", "refresh"]);
+    let restated: i64 = f.sidecar().query_row("SELECT count(*) FROM analytics_revisions r WHERE EXISTS(SELECT 1 FROM analytics_revisions n WHERE n.cell=r.cell AND n.revision>r.revision)", [], |r| r.get(0)).unwrap();
     assert!(restated > 0, "the second rollout restates some cells");
+    let comparisons = f.count("analytics_workspace_comparisons");
+    assert!(comparisons > 1, "cancelling changes the recorded comparison");
     let cells: i64 = f.sidecar().query_row("SELECT count(DISTINCT cell) FROM analytics_revisions", [], |r| r.get(0)).unwrap();
+    let pane = pane_recorded(json_of(&f, &["workspace", "show", "--json"]));
+    let revisions = json_of(&f, &["analytics", "revisions", "--metric", "M40"]);
+    let latest = revisions["revisions"].as_array().unwrap().last().unwrap();
+    assert_eq!(pane["services"]["M40"]["as_of"], json!({"seq": latest["revision"], "unix_ms": latest["recorded_unix_ms"]}));
+    let pinned = json_of(&f, &["query", "--metric", "M40", "--as-of-seq", &latest["revision"].to_string(), "--json"]);
+    assert_eq!(pane["services"]["M40"]["value"], pinned["results"][0]["value"]);
     let m08 = f.report()["metrics"]["M08"].clone();
     let backup = f.tmp.path().join("before-expiry");
+    // Back up a legacy sidecar: restore must migrate the private copy before
+    // applying revision/comparison tombstones through its old delete guards.
+    f.sidecar().execute_batch("UPDATE telemetry_streams SET version=1 WHERE stream='analytics';
+        CREATE TRIGGER analytics_workspace_metrics_no_delete BEFORE DELETE ON analytics_workspace_metrics BEGIN SELECT RAISE(ABORT,'legacy immutable'); END;
+        CREATE TRIGGER analytics_workspace_comparisons_no_delete BEFORE DELETE ON analytics_workspace_comparisons BEGIN SELECT RAISE(ABORT,'legacy immutable'); END;").unwrap();
     json_of(&f, &["backup", "create", "--out", backup.to_str().unwrap()]);
+    f.cli_args(&["analytics", "refresh"]);
     std::thread::sleep(std::time::Duration::from_millis(5));
     let due = plan(&f);
-    assert_eq!(class(&due, "sidecar.analytics_revisions")["eligible_count"], restated, "exactly the superseded revisions");
-    json_of(&f, &["maintenance", "apply", "--json"]);
+    assert_eq!(class(&due, "sidecar.analytics_revisions")["eligible_count"], restated + comparisons - 1, "superseded revisions and comparisons");
+    json_of(&f, &["maintenance", "apply", "--confirm", due["plan_digest"].as_str().unwrap(), "--json"]);
     assert_eq!(f.count("analytics_revisions"), cells, "one current revision per cell");
+    assert_eq!(f.count("analytics_workspace_comparisons"), 1);
+    assert!(!f.sidecar().prepare("PRAGMA foreign_key_check(analytics_workspace_metrics)").unwrap().exists([]).unwrap());
+    assert_eq!(pane_recorded(json_of(&f, &["workspace", "show", "--json"])), pane);
     assert_eq!(f.report()["metrics"]["M08"], m08, "current views unchanged");
     // A restore of the earlier backup reapplies the revision tombstones.
     let report = json_of(&f, &["backup", "restore", "--from", backup.to_str().unwrap(), "--force"]);
     assert_eq!(report["tombstones"]["reapplied"]["sidecar.analytics_revisions"], restated);
     assert_eq!(f.count("analytics_revisions"), cells);
+    assert_eq!(pane_recorded(json_of(&f, &["workspace", "show", "--json"])), pane);
+    let orphaned: i64 = f.sidecar().query_row("SELECT count(*) FROM analytics_workspace_metrics w LEFT JOIN analytics_revisions r ON r.revision=w.revision WHERE r.revision IS NULL", [], |r| r.get(0)).unwrap();
+    assert_eq!(orphaned, 0);
+    let projected = f.count("analytics_workspace_metrics");
+    assert!(projected > 0);
+    f.sidecar().execute("DELETE FROM analytics_workspace_metrics", []).unwrap();
+    f.cli_args(&["analytics", "rebuild"]);
+    assert_eq!(f.count("analytics_workspace_metrics"), projected);
+    assert_eq!(pane_recorded(json_of(&f, &["workspace", "show", "--json"])), pane);
+    // Both disposable tables can be lost and recovered through the public rebuild.
+    let mut comparison = pane["configurations"].clone();
+    comparison.as_object_mut().unwrap().remove("as_of");
+    f.sidecar().execute("DELETE FROM analytics_workspace_comparisons", []).unwrap();
+    f.cli_args(&["analytics", "rebuild"]);
+    let rebuilt = json_of(&f, &["workspace", "show", "--json"]);
+    assert!(rebuilt["configurations"]["as_of"]["unix_ms"].as_i64().unwrap() >= pane["configurations"]["as_of"]["unix_ms"].as_i64().unwrap());
+    let mut rebuilt_comparison = rebuilt["configurations"].clone();
+    rebuilt_comparison.as_object_mut().unwrap().remove("as_of");
+    assert_eq!(rebuilt_comparison, comparison);
     // The immutability guard is back in place.
     assert!(f.sidecar().execute("DELETE FROM analytics_revisions", []).is_err());
 }
