@@ -874,6 +874,11 @@ enum TelemetryCommand {
 
     /// TM4.2 operator views (project, models, reviews, cost, health) through the query service. Read-only.
     View(herdr_projects::telemetry::views::Args),
+
+    /// TM4.4 configuration comparison: raw, interval, pooled and propensity estimates per task class; observational, never a universal ranking. Read-only.
+    Compare(herdr_projects::telemetry::analytics::compare::Args),
+    /// TM4.4 experiment sample-size planning and preregistered experiment reports. Read-only.
+    Experiments { #[command(subcommand)] command:herdr_projects::telemetry::analytics::experiments::Command },
 }
 
 #[cfg(feature="state-store")]
@@ -1291,6 +1296,16 @@ pub fn run() -> Result<()> {
         Command::Telemetry{slug,command:TelemetryCommand::Analytics{command}}=>{
             project::validate_slug(&slug)?;
             print!("{}",herdr_projects::telemetry::analytics::run(&ctx.root.join(slug),command)?);Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Telemetry{slug,command:TelemetryCommand::Compare(args)}=>{
+            project::validate_slug(&slug)?;
+            print!("{}",herdr_projects::telemetry::analytics::run_compare(&ctx.root.join(slug),&args)?);Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Telemetry{slug,command:TelemetryCommand::Experiments{command}}=>{
+            project::validate_slug(&slug)?;
+            print!("{}",herdr_projects::telemetry::analytics::run_experiments(&ctx.root.join(slug),command)?);Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:lane@(TelemetryCommand::Collectors{..}|TelemetryCommand::Accounting{..}|TelemetryCommand::Quality{..}|TelemetryCommand::Review{..})}=>{

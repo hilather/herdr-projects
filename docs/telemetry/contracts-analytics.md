@@ -203,3 +203,15 @@ lane adds no report keys.
 | `lifecycle_acceptance_times` | state.db | `verified_results` by `submission_id` uses an automatic index | canonical steward: `CREATE INDEX verified_results_by_submission ON verified_results(submission_id)` (not added: no canonical schema change in TM4.1) |
 | central M08/M13/M15 source scan | telemetry.db | `codex_usage` scanned per source by `path_digest` | codex stream steward: `CREATE INDEX codex_usage_by_path ON codex_usage(path_digest, accepted, reason)` |
 | usage by session | telemetry.db | indexed (primary key) | codex |
+
+## 7. Comparisons and experiments (TM4.4)
+
+`telemetry <slug> compare` and `experiments plan|report` are specified in
+[contracts-evaluation.md](contracts-evaluation.md). They read cohorts
+through this service's lifecycle evaluation (the same membership and
+lineage as `query`), add no metric and no sidecar stream, and never write.
+The registry's `metrics registry --json` gains one additive key,
+`comparison` (`analytics-comparison.v1`: comparable definitions M02/M07,
+bootstrap method, seed and level, the 20-task cell minimum, the
+`beta_binomial_eb.v1` pooling prior, `hajek_ipw.v1` and the paired M42
+reference); the text form and every metric entry are unchanged.

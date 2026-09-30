@@ -9,6 +9,9 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+pub mod compare;
+pub mod estimators;
+pub mod experiments;
 pub mod lifecycle;
 pub mod query;
 pub mod registry;
@@ -83,6 +86,22 @@ pub fn run_query(project: &Path, config_dir: &Path, args: &query::Args) -> Resul
     let request = query::request(args)?;
     let out = query::run_with(project, &request, &crate::telemetry::export::cursor::Keyring::new(config_dir))?;
     Ok(if args.json { serde_json::to_string_pretty(&out)? + "\n" } else { query::text(&out) })
+}
+
+/// TM4.4 `telemetry <slug> compare` (contracts-evaluation.md). Read-only.
+pub fn run_compare(project: &Path, args: &compare::Args) -> Result<String> {
+    let report = compare::run(project, args)?;
+    Ok(if args.json { serde_json::to_string_pretty(&report)? + "\n" } else { compare::text(&report) })
+}
+
+/// TM4.4 `telemetry <slug> experiments plan|report` (contracts-evaluation.md). Read-only.
+pub fn run_experiments(project: &Path, command: experiments::Command) -> Result<String> {
+    let (value, json, text): (Value, bool, fn(&Value) -> String) = match command {
+        experiments::Command::Plan { metric, baseline_rate, min_detectable_effect, alpha, power, discordance, cluster_size, icc, json } =>
+            (experiments::plan(&metric, &baseline_rate, &min_detectable_effect, &alpha, &power, discordance.as_deref(), cluster_size.zip(icc.as_deref()))?, json, experiments::plan_text),
+        experiments::Command::Report { as_of, json } => (experiments::report(project, as_of)?, json, experiments::report_text),
+    };
+    Ok(if json { serde_json::to_string_pretty(&value)? + "\n" } else { text(&value) })
 }
 
 pub fn run(project: &Path, command: Command) -> Result<String> {

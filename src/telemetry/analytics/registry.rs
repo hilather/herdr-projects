@@ -204,6 +204,46 @@ pub const METRICS: &[Metric] = &[
     m!("flaky_tests", "newly_flaky_tests_proxy", Proxy, "tests", [lane("quality", "flaky_tests.proxy-v1", A, "ci_run")], "unavailable", QUALITY, Some("no_repeat_runs")),
 ];
 
+/// TM4.4 comparison estimators (`analytics-comparison.v1`,
+/// docs/telemetry/contracts-evaluation.md §2): the registry's declared
+/// statistical methods for configuration comparisons. Not metrics: a change
+/// here is a new comparison version.
+pub struct Comparison {
+    pub version: &'static str,
+    /// Comparable native definitions and whether a higher value is better.
+    pub metrics: &'static [(&'static str, &'static str, bool)],
+    pub bootstrap: super::estimators::Bootstrap,
+    /// Minimum terminal tasks per configuration × task-class cell (plan doc 07 §6).
+    pub min_tasks: u32,
+    /// `beta_binomial_eb.v1`: prior mean = the arm's own all-class rate, prior strength in pseudo-tasks.
+    pub pooling: &'static str,
+    pub prior_strength: i64,
+    pub propensity: &'static str,
+    /// Paired candidate-group analysis: lane C's M42 (its own minimum, `registry.v1`).
+    pub paired: &'static str,
+}
+
+pub const COMPARISON: Comparison = Comparison {
+    version: "analytics-comparison.v1",
+    metrics: &[("M02", "M02.cohort-v1", true), ("M07", "M07.cohort-v1", false)],
+    bootstrap: super::estimators::Bootstrap { method: "percentile_bootstrap.v1", iterations: 1000, seed: 0x544d_345f_636d_7072, level_permille: 950 },
+    min_tasks: 20,
+    pooling: "beta_binomial_eb.v1",
+    prior_strength: 10,
+    propensity: "hajek_ipw.v1",
+    paired: "M42.v1",
+};
+
+pub fn comparison_json() -> Value {
+    let c = &COMPARISON;
+    json!({"version": c.version, "metrics": c.metrics.iter().map(|(id, definition, higher)| json!({"id": id, "definition": definition, "higher_is_better": higher})).collect::<Vec<_>>(),
+        "bootstrap": {"method": c.bootstrap.method, "resample": "task", "iterations": c.bootstrap.iterations, "seed": c.bootstrap.seed_hex(), "level": c.bootstrap.level()},
+        "min_sample": {"value": c.min_tasks, "unit": "terminal_tasks_per_configuration_class_cell"},
+        "pooling": {"model": c.pooling, "prior_mean": "arm_all_class_rate", "prior_strength": c.prior_strength, "metrics": ["M02"]},
+        "propensity": {"method": c.propensity, "requires": "positive logged probability_ppm for every compared arm on every decision in the cell"},
+        "paired": {"definition": c.paired, "min_sample": "registry.v1 (lane C)"}})
+}
+
 pub fn find(id: &str) -> Option<&'static Metric> { METRICS.iter().find(|m| m.id == id) }
 
 /// `M02` (current definition) or an explicit definition `M02.slice-v1`.
@@ -228,7 +268,8 @@ pub fn json() -> Value {
             "active": active, "activation": activation})
     }).collect();
     json!({"registry": VERSION, "quality_certificate": QUALITY_CERTIFICATE, "cohorts": ["activity_window", "terminal_cohort", "assignment_cohort"],
-        "rejected_cohorts": {"completed_task": "ambiguous_cohort"}, "high_cardinality_identities": HIGH_CARDINALITY, "metrics": metrics})
+        "rejected_cohorts": {"completed_task": "ambiguous_cohort"}, "high_cardinality_identities": HIGH_CARDINALITY, "metrics": metrics,
+        "comparison": comparison_json()})
 }
 
 pub fn text() -> String {
