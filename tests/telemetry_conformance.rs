@@ -66,6 +66,15 @@ const LIVE2_TOOLS: &str = "../codex-conformance/live2-tools.jsonl";
 const LIVE2_SID: &str = "00000000-0000-4000-8000-0000000b2001";
 const LIVE2_FORK: &str = "../codex-conformance/live2-fork.jsonl";
 const LIVE2_FORK_SID: &str = "00000000-0000-4000-8000-0000000b2002";
+/// Third live run (docs/telemetry/certificate-live.md §3): `codex exec resume
+/// -m <another model>` of a TUI worker's ended thread appends to the same
+/// rollout (no new file or `session_meta`, ordinals continue, thread totals
+/// continue as the running sum, no replay), after `thread_settings_applied`,
+/// a second `world_state` and a new `turn_context` naming the other model.
+/// Hand-written with `LIVE3LEAK_*` sentinels; kept out of `CASES`.
+const LIVE3_RESUME: &str = "../codex-conformance/live3-resume.jsonl";
+const LIVE3_SID: &str = "00000000-0000-4000-8000-0000000b3001";
+static LIVE3_CASE: Case = Case { name: "live3-resume", sid: LIVE3_SID, parts: &[LIVE3_RESUME], version: "0.154.0", place: Place::Bound };
 
 /// Where a corpus rollout is written, relative to the fixture's one attempt.
 #[derive(Clone, Copy)]
@@ -106,7 +115,7 @@ const CASES: &[Case] = &[
     Case { name: "live2-fork", sid: LIVE2_FORK_SID, parts: &[LIVE2_FORK], version: "0.154.0", place: Place::Bound },
 ];
 
-fn case(name: &str) -> &'static Case { CASES.iter().find(|c| c.name == name).unwrap() }
+fn case(name: &str) -> &'static Case { CASES.iter().chain([&LIVE3_CASE]).find(|c| c.name == name).unwrap() }
 
 /// Write corpus case `name` into the fixture; returns the rollout path. A
 /// fork's `@ORIGIN@` becomes the `complete` case's session id and
@@ -1375,3 +1384,51 @@ fn live_run2_shapes_are_collected_without_content() {
     assert_eq!(leaks(&output), None, "{}", String::from_utf8_lossy(&output));
 }
 
+/// Third live run (certificate-live.md §3), same-file resume with a model
+/// switch: turn 1 (`gpt-6-astra`) 100 + 120 input, 40 + 80 cached, 10 + 5
+/// output, 2 + 0 reasoning; the resumed turn 2 (`gpt-5.6-luna`) 200/0/7/0.
+/// Each record counts once (420/120/22/2, total 442, 3 records), the file's
+/// reported thread totals (442) reconcile with no discrepancy, nothing is
+/// quarantined, the last turn is complete, and the session has two model
+/// segments (235 then 207). A second collect counts nothing again. No
+/// sentinel reaches the sidecar or any output.
+#[test]
+fn live_run3_same_file_resume_with_a_model_switch_counts_each_record_once() {
+    let f = Fixture::new();
+    let path = plant(&f, "live3-resume");
+    let corpus = fs::read(&path).unwrap();
+    for needle in ["LIVE3LEAK_BASE_INSTRUCTIONS", "LIVE3LEAK_WORLD_STATE_2", "LIVE3LEAK_SETTINGS_CWD", "LIVE3LEAK_RESUME_PROMPT", "LIVE3LEAK_LAST_MESSAGE_2", "LIVE3LEAK_CREDITS"] {
+        assert!(corpus.windows(needle.len()).any(|w| w == needle.as_bytes()), "{needle}");
+    }
+    let (report, mut output) = f.cli("collect");
+    assert_eq!(quarantine(&f, &source(&path)), []);
+    let sums = json!({"input_tokens": 420, "cached_input_tokens": 120, "cache_write_input_tokens": 0, "output_tokens": 22,
+        "reasoning_output_tokens": 2, "total_tokens": 442, "records": 3});
+    assert_eq!(attempt_usage(&report), sums);
+    assert_eq!(rows::<i64>(&f, &format!("SELECT count(*) FROM codex_discrepancy WHERE session_id='{LIVE3_SID}'")), [vec![0]]);
+    let (sessions, bytes) = f.cli_args(&["collectors", "sessions"]);
+    output.extend(bytes);
+    let session = sessions["sessions"].as_array().unwrap().iter().find(|s| s["session_id"] == LIVE3_SID).unwrap().clone();
+    assert_eq!((&session["records"], &session["final_event"], &session["fork"], &session["forked_from_id"]),
+        (&json!(3), &json!({"state": "complete", "turn_id": "turn-r2"}), &Value::Null, &Value::Null));
+    output.extend(f.cli_args(&["accounting", "sync"]).1);
+    let (accounting, bytes) = f.cli_args(&["accounting", "sessions"]);
+    output.extend(bytes);
+    let row = accounting["sessions"].as_array().unwrap().iter().find(|s| s["session_id"] == LIVE3_SID).unwrap();
+    let segments: Vec<(Value, Value, Value)> = row["segments"].as_array().unwrap().iter()
+        .map(|s| (s["model"].clone(), s["entries"].clone(), s["total_tokens"].clone())).collect();
+    assert_eq!(segments, [(json!("gpt-6-astra"), json!(2), json!(235)), (json!("gpt-5.6-luna"), json!(1), json!(207))]);
+    assert_eq!(row["total_tokens"], json!(442));
+    let (again, bytes) = f.cli("collect");
+    output.extend(bytes);
+    assert_eq!((&again["collected"]["records"], &attempt_usage(&again)), (&json!(0), &sums), "a re-read counts nothing twice");
+    for args in [&["usage", "--json"][..], &["report", "--json"], &["collectors", "tools", "--json"], &["accounting", "quota", "--json"]] {
+        output.extend(f.cli_args(args).1);
+    }
+    let state = f.project.join(".state");
+    let leaks = |bytes: &[u8]| ["live3leak"].into_iter().find(|needle| bytes.to_ascii_lowercase().windows(needle.len()).any(|w| w == needle.as_bytes()));
+    for name in ["telemetry.db", "telemetry.db-wal", "telemetry.db-shm"] {
+        if let Ok(bytes) = fs::read(state.join(name)) { assert_eq!(leaks(&bytes), None, "{name}"); }
+    }
+    assert_eq!(leaks(&output), None, "{}", String::from_utf8_lossy(&output));
+}
