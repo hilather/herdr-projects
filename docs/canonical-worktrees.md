@@ -166,7 +166,9 @@ job, including capture, uses at most the original 45-second admission budget and
 never extends a shorter caller deadline. Current controller jobs use that budget.
 The same transaction requires output evidence: a verified snapshot of the attempt
 output directory, including partial report/library files, or an explicit absent
-source observation. Empty directories are captured distinctly. Output capture
+source observation. Empty directories inside it are captured distinctly; an
+empty output directory itself (gate release pre-creates it) is recorded as
+absent. Output capture
 failure retains capacity just like repository capture failure.
 
 Worktree-only preparation retirement uses the same repository/output capture

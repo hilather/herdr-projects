@@ -501,6 +501,7 @@ mod native_profiles;
 
 mod results;
 pub use results::{show_results, submit_untrusted_result};
+pub(crate) use results::{record_spool_denial, submit_untrusted_result_bytes};
 
 mod feedback;
 pub use feedback::{claim_feedback, show_feedback};

@@ -933,6 +933,40 @@ pub fn submit_untrusted_result(project: &Path, document: &Path) -> Result<Result
     db.submit_result(&bytes)
 }
 
+/// `submit_untrusted_result` for document bytes the ticker read from a
+/// worker's submission spool, under the runtime guard (`_held`) the ticker
+/// already holds: the same store and idempotent insert.
+pub(crate) fn submit_untrusted_result_bytes(_held: &crate::migration::Maintenance, project: &Path, bytes: &[u8]) -> Result<ResultReceipt> {
+    let mut db =
+        crate::migration::open_active(project).map_err(|error| invalid(&error.to_string()))?;
+    db.submit_result(bytes)
+}
+
+/// Record one refused submission-spool request as a `spool.request_denied`
+/// event of `attempt` (revision = its denial ordinal). At most `cap` are
+/// recorded per attempt, so a worker cannot grow the store without bound;
+/// returns whether this one was recorded.
+pub(crate) fn record_spool_denial(_held: &crate::migration::Maintenance, project: &Path, attempt: &str, request: &str, kind: Option<&str>, reason: &str, cap: u64) -> Result<bool> {
+    let mut db = crate::migration::open_active_unchecked(project)
+        .map_err(|error| invalid(&error.to_string()))?;
+    let tx = db.connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let count: u64 = tx.query_row(
+        "SELECT count(*) FROM events WHERE kind='spool.request_denied' AND entity=?1",
+        [attempt],
+        |row| row.get(0),
+    )?;
+    if count >= cap {
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('spool.request_denied',?1,?2,1,?3)",
+        params![attempt, integer(count + 1)?, serde_json::json!({"attempt_id": attempt, "request_sha256": request, "kind": kind,
+            "reason": reason, "recorded_unix_ms": jiff::Timestamp::now().as_millisecond()}).to_string()],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
 pub fn show_results(project: &Path, id: Option<&str>) -> Result<Vec<ResultView>> {
     let mut db =
         crate::migration::open_active(project).map_err(|error| invalid(&error.to_string()))?;

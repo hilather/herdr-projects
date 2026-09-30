@@ -193,7 +193,18 @@ pub struct Isolation {
     /// first: each later entry is mounted on top of the earlier ones.
     plan: Vec<(String, bool)>,
     hide: Vec<String>,
+    /// The worker's own project directory (canonical).
+    project: String,
+    /// The attempt's submission spool, when the agent is a canonical attempt
+    /// (see [`Isolation::with_submission_spool`]).
+    spool: Option<String>,
 }
+
+/// Names the agent's submission spool directory in its baseline environment.
+/// `result submit` and the `review` worker channel write a request there and
+/// wait for the ticker's receipt instead of opening the project store, which
+/// the sandbox leaves read-only (`crate::submission_spool`).
+pub const SUBMISSION_SPOOL_ENV: &str = "HERDR_PROJECTS_SUBMISSION_SPOOL";
 
 /// Owner-writable scratch directories replaced by a private empty tmpfs, so
 /// the worker neither reads the owner's temporary files and sockets nor plants
@@ -245,8 +256,9 @@ const OWNER_SECRETS: &[&str] = &[
 ///    (owner homes, source repositories and their Git common directories, the
 ///    own project) is bound onto itself recursively read-only (`ro=recursive`,
 ///    applied by libmount with mount_setattr), a writable exposure (execution
-///    home, the project's `.state`, its own worktrees, the Git paths a
-///    worktree commit writes) is bound onto itself on top, writable;
+///    home, its own worktrees, the Git paths a worktree commit writes, and the
+///    attempt's submission spool and output directory under the otherwise
+///    read-only project `.state`) is bound onto itself on top, writable;
 /// 4. mounts an empty read-only tmpfs over every hidden directory and
 ///    `/dev/null` over every hidden file, then over the owner's SSH agent and
 ///    tmux socket directories in `/tmp` (enumerated at setup, so the argv
@@ -364,9 +376,10 @@ impl Isolation {
     /// triples of the attempt's linked worktrees: the worktree is writable
     /// except its `.git` pointer, and of the Git directories only the paths a
     /// commit on its branch writes. The owner homes, `repositories` and their
-    /// common directories are otherwise read-only, as is `project` except its
-    /// `.state` (store, locks, worker outputs) outside other attempts'
-    /// worktrees; `home` stays writable. Refuses, before any effect, when a
+    /// common directories are otherwise read-only, as is `project` with its
+    /// whole `.state` (store, locks, objects, other attempts' worktrees and
+    /// outputs; [`Self::with_submission_spool`] adds the attempt's own spool
+    /// and output directory); `home` stays writable. Refuses, before any effect, when a
     /// hidden path would contain or cover a path the agent needs.
     #[allow(clippy::too_many_arguments)]
     pub fn for_agent(
@@ -495,8 +508,9 @@ impl Isolation {
         // Read-only anchors and the writable exposures on top of them.
         let mut plan: Vec<(String, bool)> = homes.iter().map(|h| (h.clone(), false)).collect();
         plan.extend(needed[4..repositories_end].iter().map(|r| (r.clone(), false)));
-        let state = format!("{project}/.state");
-        plan.extend([(project.clone(), false), (state.clone(), true), (format!("{state}/worktrees"), false)]);
+        // The whole project, `.state` included, is read-only: the store is
+        // written only by the ticker, which ingests the submission spool.
+        plan.push((project.clone(), false));
         for (worktree, directory, common) in &git {
             plan.extend([(worktree.clone(), true), (format!("{worktree}/.git"), false)]);
             plan.push((common.clone(), false));
@@ -541,7 +555,32 @@ impl Isolation {
             ensure!(keep.len() <= 7, "too many agent paths directly under {dir}");
             private.push(((*dir).to_owned(), keep));
         }
-        Ok(Self { root, expose, private, plan, hide })
+        Ok(Self { root, expose, private, plan, hide, project, spool: None })
+    }
+
+    /// Give a canonical attempt its two writable places under the read-only
+    /// project `.state`: the submission spool `.state/spool/<attempt>` (named
+    /// to the agent in [`SUBMISSION_SPOOL_ENV`]) and its output directory
+    /// `.state/worker-output/<attempt>`. Both are created by gate release
+    /// before the sandbox runs; a missing one stays read-only (the sandbox
+    /// skips missing paths), so submission fails closed. No other attempt's
+    /// spool or output is writable to this agent.
+    pub fn with_submission_spool(mut self, attempt: &str) -> Result<Self> {
+        ensure!(
+            !attempt.is_empty()
+                && attempt.len() <= 128
+                && attempt.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+                && !attempt.starts_with('.'),
+            "invalid attempt for the submission spool"
+        );
+        let spool = format!("{}/.state/spool/{attempt}", self.project);
+        let output = format!("{}/.state/worker-output/{attempt}", self.project);
+        self.plan.extend([(spool.clone(), true), (output, true)]);
+        // Parents first, as `for_agent` orders the plan: both are leaves under
+        // the read-only project, mounted after it.
+        self.plan.sort_by(|a, b| Path::new(&a.0).cmp(Path::new(&b.0)).then(a.1.cmp(&b.1)));
+        self.spool = Some(spool);
+        Ok(self)
     }
 
     fn arguments(&self) -> Vec<String> {
@@ -595,11 +634,16 @@ pub fn isolated_gated_command(
         "LANG=C.UTF-8".into(),
         "LC_ALL=C.UTF-8".into(),
         "TERM=xterm-256color".into(),
+    ]);
+    if let Some(spool) = &isolation.spool {
+        args.push(format!("{SUBMISSION_SPOOL_ENV}={spool}"));
+    }
+    args.push(
         executable
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("agent executable is not UTF-8"))?
             .into(),
-    ]);
+    );
     args.extend_from_slice(arguments);
     gated_command(Path::new("/usr/bin/env"), &args, wall, token)
 }

@@ -1091,6 +1091,23 @@ never be the reviewing or authoring attempt. Like `result submit`, the
 channel trusts the CLI caller's claim to be the worker (markers, §9, are not
 authority); what it records is only a proposal.
 
+**Inside the worker sandbox: the submission spool.** An isolated worker sees
+its project's `.state` read-only (docs/reviews/2026-09-29-worker-isolation.md,
+"Submission spool"). With `HERDR_PROJECTS_SUBMISSION_SPOOL` in its
+environment, `review session`, `review present` and `review submit` do not
+open the store: each writes one canonical request into the attempt's spool
+`.state/spool/<attempt>/` and prints the receipt the ticker writes back, which
+carries exactly the stdout or error of the same command run outside the
+sandbox (`telemetry::review::worker_session|worker_present|worker_submit`).
+The ticker answers a spooled request only while the attempt is live, and only
+for the attempt's own work: `review session` for that attempt, `review
+present` for the opportunity it reviews, `review submit` for a session
+launched for it. Anything else is refused (`submission spool refused the
+request: …`) and recorded as a `spool.request_denied` event. Receipts,
+replays and refusals of the store are unchanged (`replayed: true` for the
+same receipt). Test
+`a_sandboxed_reviewer_uses_its_worker_channel_through_the_spool`.
+
 **Decisions in the shared ledger.** `review_decision_log(seq, session_id
 UNIQUE, decision, principal, authority, recorded_unix_ms, backfilled)`: each
 §10 decision takes the next `seq` of the one ordering (`finding_triage::head`

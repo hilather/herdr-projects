@@ -1348,7 +1348,12 @@ pub fn run() -> Result<()> {
                 #[cfg(target_os="linux")]
                 ResultCommand::Capture{attempt,message}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::result_capture::capture_project(&dir,&attempt,message.as_deref())?)?),
                 #[cfg(target_os="linux")]
-                ResultCommand::Submit{input_file}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::submit_untrusted_result(&dir,&input_file)?)?),
+                // Inside the worker sandbox the store is read-only: the ticker
+                // ingests the request from the attempt's submission spool.
+                ResultCommand::Submit{input_file}=>match herdr_projects::submission_spool::worker_spool() {
+                    Some(spool)=>print!("{}",herdr_projects::submission_spool::submit_result(&spool,&input_file)?),
+                    None=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::submit_untrusted_result(&dir,&input_file)?)?),
+                },
                 #[cfg(target_os="linux")]
                 ResultCommand::Verify{submission,policy_id,policy_file,idempotency_key,work_dir,timeout_seconds}=> {
                     let request=herdr_projects::verification::VerifyRequest::new(submission,policy_id,policy_file,idempotency_key,std::time::Duration::from_secs(timeout_seconds),work_dir);

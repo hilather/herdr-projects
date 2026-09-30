@@ -524,7 +524,8 @@ print(json.dumps({{'id':('wrong' if mode=='wrong-id' and r['method']=='agent.pro
                 Path::new(home),
                 &crate::worker_supervision::Isolation::for_agent(&project, Path::new(home), Path::new(&route.cwd),
                     Path::new(&profile.agent.path), &repositories, &worktrees, Some(Path::new(&profile.config.path)), Some(Path::new(&route.socket)),
-                    &crate::profile_config::frozen_isolation_hides(&profile).unwrap()).unwrap(),
+                    &crate::profile_config::frozen_isolation_hides(&profile).unwrap()).unwrap()
+                    .with_submission_spool(reserved.record.attempt.as_str()).unwrap(),
             )
             .unwrap()
         } else if mode.starts_with("resource") {
@@ -3281,7 +3282,7 @@ fn staged_repository_stop_requires_and_records_preserved_partial_files() {
 }
 
 #[test]
-fn staged_stop_requires_output_evidence_and_preserves_an_empty_directory() {
+fn staged_stop_requires_output_evidence_and_records_an_empty_directory_as_absent() {
     let f=Fixture::new("resource-release");let deadline=Instant::now()+Duration::from_secs(10);
     let target=create_resource(&f.project,&f.operation.id,1,deadline,Default::default()).unwrap();
     let mut db=migration::open_active(&f.project).unwrap();let state=db.read_snapshot(None).unwrap();
@@ -3296,10 +3297,9 @@ fn staged_stop_requires_output_evidence_and_preserves_an_empty_directory() {
     reconcile_termination(&f.project,&target.attempt,before.attempts[0].revision,deadline,Default::default()).unwrap().unwrap();
     let state=db.read_snapshot(None).unwrap();
     let receipt:LaunchStoppedReceipt=serde_json::from_value(state.events.iter().find(|e|e.kind=="runtime.launch_stopped").unwrap().payload.clone()).unwrap();
-    let evidence=receipt.output_snapshot.unwrap();assert_eq!(evidence.source,source);
-    let manifest=f.project.join(".state/worker-output-snapshots").join(target.attempt.as_str()).join(evidence.digest.unwrap()).join("manifest.json");
-    let manifest:crate::worktree_preservation::OutputManifest=serde_json::from_slice(&fs::read(manifest).unwrap()).unwrap();
-    assert!(manifest.entries.is_empty());assert!(Path::new(&source).is_dir());
+    // Gate release pre-creates the output directory: left empty, it is recorded as absent.
+    let evidence=receipt.output_snapshot.unwrap();assert_eq!((evidence.source.as_str(),evidence.digest),(source.as_str(),None));
+    assert!(!f.project.join(".state/worker-output-snapshots").join(target.attempt.as_str()).exists());assert!(Path::new(&source).is_dir());
 }
 
 #[test]

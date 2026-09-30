@@ -200,9 +200,11 @@ hide = ["~/keys/herdr-owner"]
 The worker also cannot write where the owner later runs code. The owner's home,
 the approved source repositories (working tree and Git common directory,
 including `config`, `hooks/` and `info/`) and the worker's own project are
-read-only inside the sandbox. Writable are only the execution home, the
-project's `.state` (store, locks, worker outputs) outside other attempts'
-worktrees, the attempt's own worktrees (except their `.git` pointer file), and
+read-only inside the sandbox, the project's `.state` (store, locks, objects,
+other attempts' files) included. Writable are only the execution home, the
+attempt's submission spool `.state/spool/<attempt>` and output directory
+`.state/worker-output/<attempt>`, the attempt's own worktrees (except their
+`.git` pointer file), and
 in each common directory the paths a commit on the attempt branch writes:
 `objects/` (not `objects/pack` or `objects/info`), `refs/heads/`,
 `logs/refs/heads/`, `reftable/` and the worktree's own `worktrees/<id>/`
@@ -215,7 +217,9 @@ commit (it cannot delete the per-worktree `AUTO_MERGE` pseudo-ref). A binding
 without repositories keeps its working directory read-only when it lies in a
 read-only anchor; such workers write to their output directory. Recursive
 read-only binds need util-linux 2.38 and Linux 5.12 or later; otherwise the
-worker exits 125 before the agent runs.
+worker exits 125 before the agent runs. Inside the sandbox `result submit`
+and the review worker channel go through the submission spool: the ticker
+ingests the request and writes back the receipt the command prints.
 
 See [the worker isolation review](reviews/2026-09-29-worker-isolation.md) for
 the full list, what stays visible and the residual risks.

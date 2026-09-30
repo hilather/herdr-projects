@@ -563,8 +563,10 @@ an absent pane or process list is not accepted as termination evidence.
 ### Attempt output and preservation contract
 
 Version 2 worker briefs include `output_directory`, deterministically derived as
-`<project>/.state/worker-output/<attempt-id>`. Workers create that directory when
-needed, write `report.md` there, and place supporting files under `library/`.
+`<project>/.state/worker-output/<attempt-id>`. Gate release creates that directory
+(owner-only) before the sandbox binds it writable, since the rest of `.state` is
+read-only to the worker; workers write `report.md` there, and place supporting
+files under `library/`.
 This keeps reports separate across concurrent attempts and from repository source
 files. Start records the same directory in the runtime binding's artifact source.
 The preview and retained rendering use the same path and include it in prompt
@@ -588,8 +590,9 @@ attempt nonterminal and capacity reserved, while retry observes the already
 stopped worker and reuses verified snapshots. The same boundary now captures the
 attempt output directory into `.state/worker-output-snapshots/<attempt>/<digest>`.
 The stop receipt records either its manifest digest or an explicit observation
-that the source directory was absent. An existing empty directory has a manifest;
-it is distinct from an absent source. Partial reports, binary library files,
+that the source directory was absent. Because gate release pre-creates the
+directory, an existing empty directory is recorded as absent too; a directory
+with any entry (an empty subdirectory included) has a manifest. Partial reports, binary library files,
 ordinary `.git` output data, executable bits and empty directories are retained.
 
 Output capture uses bounded descriptor-based traversal, two byte scans, durable

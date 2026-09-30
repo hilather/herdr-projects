@@ -350,6 +350,18 @@ pub fn bind_review_brief(project: &Path, opportunity: &str, task: &str, snapshot
 pub fn run(project: &Path, config_dir: &Path, command: Command) -> Result<String> {
     // A worker may run only the blind reviewer view, its own session and the receipt channel.
     if !matches!(command, Command::Present { .. } | Command::Session { .. } | Command::Submit { .. }) { refuse_worker_context(project)?; }
+    // Inside the sandbox the store is read-only: the channel goes through the
+    // attempt's submission spool and prints the ticker's answer.
+    #[cfg(target_os = "linux")]
+    if let Some(spool) = crate::submission_spool::worker_spool() {
+        use crate::submission_spool::{Kind, exchange};
+        match &command {
+            Command::Submit { input_file } => return exchange(&spool, Kind::ReviewSubmit, Some(receipt_bytes(input_file)?), None),
+            Command::Session { attempt } => return exchange(&spool, Kind::ReviewSession, None, Some(attempt.clone())),
+            Command::Present { opportunity } => return exchange(&spool, Kind::ReviewPresent, None, Some(opportunity.clone())),
+            _ => {}
+        }
+    }
     let now = jiff::Timestamp::now().as_millisecond();
     let open = || SqliteStore::open(&project.join(".state/state.db"));
     let value = match command {
@@ -378,16 +390,11 @@ pub fn run(project: &Path, config_dir: &Path, command: Command) -> Result<String
             let (Some(session), Some(document), Some(signature)) = (session, document, signature) else { anyhow::bail!("accept needs SESSION --document --signature, or `accept draft`") };
             acceptance::accept(project, &session, &document, &signature)?
         }
-        Command::Submit { input_file } => {
-            let size = std::fs::metadata(&input_file).with_context(|| format!("read {}", input_file.display()))?.len();
-            anyhow::ensure!(size <= MAX_RECEIPT_BYTES, "review receipt exceeds {MAX_RECEIPT_BYTES} bytes");
-            let bytes = std::fs::read(&input_file).with_context(|| format!("read {}", input_file.display()))?;
-            json!({"completion": open()?.submit_review_receipt(&bytes, now)?})
-        }
-        Command::Session { attempt } => json!({"session": open()?.review_session_for_attempt(&attempt)?}),
+        Command::Submit { input_file } => return worker_submit(project, &receipt_bytes(&input_file)?),
+        Command::Session { attempt } => return worker_session(project, &attempt),
         Command::Authority(command) => acceptance::authority(project, command)?,
         Command::Signer(command) => signer::run(project, config_dir, command)?,
-        Command::Present { opportunity } => present(project, &opportunity)?,
+        Command::Present { opportunity } => return worker_present(project, &opportunity),
         Command::Show { since, as_of } => show(project, since, as_of)?,
         Command::Report { since, horizon_days } => json!({"metrics": lane_metrics(project, since, i64::from(horizon_days))?, "since_unix_ms": since}),
         Command::Findings(command) => findings(project, command, now)?,
@@ -397,6 +404,32 @@ pub fn run(project: &Path, config_dir: &Path, command: Command) -> Result<String
         Command::Experiments(command) => protocols::experiments(project, command, now)?,
     };
     Ok(serde_json::to_string_pretty(&value)? + "\n")
+}
+
+/// A worker's review receipt file, bounded as the store bounds it.
+fn receipt_bytes(input_file: &Path) -> Result<Vec<u8>> {
+    let size = std::fs::metadata(input_file).with_context(|| format!("read {}", input_file.display()))?.len();
+    anyhow::ensure!(size <= MAX_RECEIPT_BYTES, "review receipt exceeds {MAX_RECEIPT_BYTES} bytes");
+    std::fs::read(input_file).with_context(|| format!("read {}", input_file.display()))
+}
+
+/// `review submit`'s stdout for receipt `bytes` (the worker channel, §11):
+/// run by the CLI outside a sandbox, or by the ticker for a spooled request.
+pub fn worker_submit(project: &Path, bytes: &[u8]) -> Result<String> {
+    let now = jiff::Timestamp::now().as_millisecond();
+    let completion = SqliteStore::open(&project.join(".state/state.db"))?.submit_review_receipt(bytes, now)?;
+    Ok(serde_json::to_string_pretty(&json!({"completion": completion}))? + "\n")
+}
+
+/// `review session --attempt`'s stdout. Read-only.
+pub fn worker_session(project: &Path, attempt: &str) -> Result<String> {
+    let session = SqliteStore::open(&project.join(".state/state.db"))?.review_session_for_attempt(attempt)?;
+    Ok(serde_json::to_string_pretty(&json!({"session": session}))? + "\n")
+}
+
+/// `review present`'s stdout. Read-only.
+pub fn worker_present(project: &Path, opportunity: &str) -> Result<String> {
+    Ok(serde_json::to_string_pretty(&present(project, opportunity)?)? + "\n")
 }
 
 fn findings(project: &Path, command: FindingsCommand, now: i64) -> Result<Value> {

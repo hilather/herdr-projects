@@ -13,6 +13,12 @@ project exposure, designs the submission spool and coordinator wrapping, and
 fixes the isolation test's flake. Residual risks below carry their current
 status.
 
+Follow-up card: "submission spool", branch `security/submission-spool`. It
+builds the spool designed by the write-isolation card: the worker's project
+`.state` becomes read-only, and `result submit` and the review worker channel
+reach the store only through the ticker
+([Submission spool](#submission-spool-follow-up-card)).
+
 ## Finding (before this change)
 
 Canonical workers run as the owner's own uid. The supervisor argv was
@@ -142,10 +148,11 @@ extra list is as immutable as the profile.
 System directories, tool binaries, the execution home (with its own auth copy),
 the working directory/worktree, the approved source repositories and their git
 common directories, the product binary, and the worker's own project directory
-(needed by `result submit`/`review submit`, which open
-`<project>/.state/state.db`, `factory-objects/` and the project locks). Since
-the follow-up card most of this is read-only and `/tmp` is private; see
-[Write isolation](#write-isolation-follow-up-card).
+(read-only since the spool card: `result submit`/`review submit` no longer
+open `<project>/.state/state.db` inside the worker, they write to the
+attempt's spool). Since the write-isolation card most of this is read-only
+and `/tmp` is private; see [Write isolation](#write-isolation-follow-up-card)
+and [Submission spool](#submission-spool-follow-up-card).
 
 ### Fails closed
 
@@ -242,8 +249,10 @@ between covering the projects root and hiding:
 | Each owner home (passwd and controller `HOME`) | read-only |
 | Each approved source repository (its working tree) | read-only |
 | The worker's project directory (`PROJECT.md`, anything outside `.state`) | read-only |
-| `<project>/.state` (store, WAL, locks, `factory-objects/`, `worker-output/`) | writable |
+| `<project>/.state` (store, WAL, locks, `factory-objects/`, other attempts' outputs and spools) | read-only (writable before the spool card) |
 | `<project>/.state/worktrees` (other attempts' worktrees) | read-only |
+| `<project>/.state/spool/<attempt>` (this attempt's submission spool) | writable (spool card) |
+| `<project>/.state/worker-output/<attempt>` (this attempt's output directory) | writable (spool card) |
 | The attempt's own worktrees | writable |
 | `<worktree>/.git` (gitdir pointer) | read-only |
 | Git common directory (`config`, `hooks/`, `info/`, `packed-refs`, other refs, `HEAD`) | read-only |
@@ -346,43 +355,148 @@ deterministically, once the probe finished before the brief. Fix: wait for
 retry. With the fix the test passed in every later run (two full
 `canonical_worker` suites under host load).
 
+## Submission spool (follow-up card)
+
+Owner decision: build the designed spool. Residual risk 1 was that the
+worker could write its own project's `.state/state.db` directly, because
+`result submit` ran the product binary inside the sandbox.
+
+### Design
+
+- **Exposure.** `Isolation::for_agent` binds the whole project, `.state`
+  included, read-only. `Isolation::with_submission_spool(attempt)` (called by
+  the canonical launch service, `canonical_worker/resources.rs::command`) adds
+  exactly two writable binds under it: `.state/spool/<attempt>` and
+  `.state/worker-output/<attempt>`, and puts
+  `HERDR_PROJECTS_SUBMISSION_SPOOL=<project>/.state/spool/<attempt>` in the
+  agent's baseline environment. Gate release (`release_gate`) creates both
+  directories (0700, no link followed: `source_tree::Directory`) before the
+  release line is sent; the sandbox binds only existing paths, so a missing
+  one stays read-only and submission fails closed. Another attempt's spool
+  and outputs are read-only to this worker (it sees `.state` read-only).
+- **Worker side** (`src/submission_spool.rs`, `exchange`). With the variable
+  set, `result submit`, `review submit`, `review session` and `review
+  present` do not open the store. They read the input as today (same bounds
+  and errors), build one canonical request
+  `{"version":1,"kind":…,"attempt_id":<spool's attempt>,"document"|"argument":…}`
+  (exact `serde_json` bytes), write it to a temporary created
+  `O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600, and rename it to
+  `<sha256(bytes)>.request`. They remove a stale `<sha256>.receipt` first (so
+  a rerun asks again and the store replays), then poll, bounded (180 s), for
+  the receipt, read it `O_NOFOLLOW` (regular file, 1 MiB cap), and print its
+  `stdout` verbatim or fail with its `error`, exactly as the command prints
+  without a sandbox. A timeout leaves the request queued; rerunning waits
+  again. The worker may forge its own receipt: that changes only what it
+  prints to itself. Outside the sandbox (variable unset) nothing changes.
+- **Ticker side** (`submission_spool::ingest`). In every canonical project
+  pass (after the controller poll) and, between passes, whenever a cheap
+  directory scan (`pending`) finds a request with nothing at its receipt name
+  (so a waiting worker is answered within about half a second), the ticker:
+  opens `.state/spool` and each attempt directory `O_DIRECTORY|O_NOFOLLOW`
+  and reaches entries only relative to that descriptor; reads the attempt's
+  state from a read-only store view; takes the project runtime guard that
+  `result submit` takes (if an effect or maintenance holds the project, the
+  requests stay queued for a later pass); and for each request without a
+  regular single-link receipt (at most 8 per attempt and pass, at most 256
+  entries per spool) checks, in order: regular single-link file opened
+  `O_NOFOLLOW|O_NONBLOCK`, at most 1 MiB; the name is the SHA-256 of the
+  content; strict parse (`deny_unknown_fields`) whose re-serialisation equals
+  the bytes; `attempt_id` equals the directory; the attempt is live
+  (`reserved|launching|running|awaiting_input`, termination not observed);
+  the document is the attempt's own (result `attempt_id`; review receipt's
+  session launched for this attempt; `review session` asks for this attempt;
+  `review present` asks for the opportunity this attempt reviews). Then it
+  runs the same code the CLI runs: `SqliteStore::submit_result` through
+  `store::submit_untrusted_result_bytes` (idempotency key/digest replay,
+  object staging, all refusals unchanged) or the review worker channel
+  (`telemetry::review::worker_submit|worker_session|worker_present`, the same
+  functions `review submit|session|present` call). The receipt carries the
+  command's stdout or its error text; it is written to an exclusive
+  `O_CREAT|O_EXCL|O_NOFOLLOW` temporary in the spool directory, fsynced and
+  `renameat` over `<sha256>.receipt`, so any entry the worker left there (a
+  symbolic link or hard link included) is replaced, never followed or
+  truncated; a directory there is removed first, or the request waits.
+- **Denials.** A request refused by the spool checks (not a store refusal,
+  which is an ordinary answer as today) is answered with `submission spool
+  refused the request: <reason>`, logged, and recorded as a
+  `spool.request_denied` event of the attempt (payload: request digest, kind,
+  reason, time; revision = ordinal). At most 16 are recorded per attempt, so
+  a worker cannot grow the store or move the head without bound; later ones
+  are logged only.
+- **Crash and replay.** The receipt is written after the store commit. A
+  crash in between leaves the request without a receipt; the next pass runs
+  it again and the store replays it (`replayed: true`, same
+  `submission_id`). A request whose attempt ended before it was answered is
+  refused (`the attempt is not live`). Once the attempt's termination is
+  observed, the ticker removes its spool entries (unlinking, never following)
+  and the directory; spools of attempts the store does not know are refused
+  and left in place.
+- **Output directory.** Gate release now pre-creates
+  `.state/worker-output/<attempt>`, so output capture
+  (`worktree_preservation/outputs.rs`) records an empty directory as absent
+  (`digest: None`), as the design required; a directory with any entry is
+  captured as before.
+- **Identity.** `LaunchInputs`, `FrozenProfile`, approval digests and all IDs
+  are unchanged. Only the supervisor argv changes (one more `rw:` bind pair
+  and the environment entry), which is the per-launch `command_digest` fence:
+  a launch created by the previous binary and released by this one fails
+  closed at gate release (argv mismatch); terminate and relaunch it.
+
+### What else writes `.state` (checked)
+
+Nothing the worker legitimately runs needs `.state` writable any more:
+
+- worktree preparation, gate release, brief delivery, memory snapshots and
+  worker-brief rendering, output capture and snapshots, repository capture
+  (`result capture`), verification and integration all run in the ticker or
+  the owner's CLI, outside the sandbox;
+- the worker's own worktree lies under `.state/worktrees/` and keeps its
+  existing writable bind (unchanged by this card); its Git writes go to the
+  source repository's common directory (unchanged);
+- the root lock `<root>/.execution.lock` stays writable (outside `.state`);
+  the spooled commands take no lock inside the sandbox.
+
+Exceptions, documented: the worker's own `.state/spool/<attempt>` and
+`.state/worker-output/<attempt>` are writable; its worktree under
+`.state/worktrees/` is writable as before. Other product commands that
+write the store now fail inside the sandbox; they were already refused in a
+worker context (§9 of contracts-review.md) or are owner commands. Store
+readers that open `state.db` read-write (`SqliteStore::open`) fail on a
+read-only mount whenever SQLite's `-wal`/`-shm` files are absent (verified:
+`unable to open database file`), which is why `review session` and `review
+present` go through the spool as well; readers built on
+`telemetry::read_only` (shared lock, `immutable` when no side files) still
+work.
+
+### Evidence
+
+- `an_isolated_worker_submits_only_through_its_own_spool`
+  (`tests/canonical_worker.rs`, real ticker, Herdr stand-in, compiled probe
+  agent): inside the sandbox, opening `state.db` for writing, creating files
+  in `.state`, `.state/factory-objects/`, another attempt's spool and another
+  attempt's output directory all fail with `ReadOnlyFilesystem`; its own
+  output directory and spool are writable (the report reaches the host).
+  The probe plants requests by hand in its own spool: a malformed one, an
+  oversized one (1 MiB + 1), a canonical request naming another attempt, a
+  request whose result names another attempt, a request that is a symbolic
+  link, and a symbolic link at the malformed request's receipt name pointing
+  at the owner's `~/.bashrc`. Each gets a regular-file receipt with its
+  refusal, each reason is recorded as `spool.request_denied`, and `~/.bashrc`
+  is unchanged. `result submit` run twice inside the sandbox prints the
+  store's receipt (`replayed: false`, then `true` with the same
+  `submission_id` and `payload_digest`, which is the SHA-256 of the document
+  bytes); `result show` lists one submission. After cancel and termination
+  the ticker removes the attempt's spool.
+- `a_sandboxed_reviewer_uses_its_worker_channel_through_the_spool` (real
+  review launch, blind brief, sandboxed probe): `review session` for its own
+  attempt prints its session; for the author's attempt it is refused and
+  recorded; `review present` prints its opportunity's blind view; `review
+  submit` records a `proposal` as `worker:<attempt>` and the same receipt
+  replays (`replayed: true`, same `receipt_digest`).
+- `an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_commits_and_submits`
+  keeps passing: its `result submit` now goes through the spool.
+
 ## Designed, not built
-
-### Submission spool (closes residual risk 1)
-
-Goal: the worker needs no write access to its project's `.state`, whose SQLite
-rows it can currently forge (raw rows are not authority-proof).
-
-- **Layout.** `<project>/.state/spool/<attempt>/` created by the ticker at
-  gate release (mode 0700), exposed writable to that attempt only; the rest of
-  `.state` bound read-only, `worker-output/<attempt>` pre-created and exposed
-  writable (today the brief says "create the output directory if needed", and
-  an absent directory is recorded as `None`; pre-creation needs that record to
-  treat an empty directory as absent).
-- **Worker side.** The sandbox adds `HERDR_PROJECTS_SUBMISSION_SPOOL=<dir>` to
-  the agent's baseline environment. `result submit`/`review submit` with that
-  variable set parse and validate the document exactly as today (read-only
-  store open: the WAL `-shm`/`-wal` files must stay readable; SQLite opens a
-  WAL database read-only when both exist), write `<sha256(bytes)>.json`
-  atomically (temporary + rename) and wait, bounded, for
-  `<sha256>.receipt.json`. The printed receipt is the one the ticker wrote,
-  so `idempotency_key`, `payload_digest`, `submission_id` and `replayed` are
-  byte-identical to a direct submission.
-- **Ticker side.** Each pass, for each attempt with live resources, open the
-  spool directory by its retained inode (`O_DIRECTORY|O_NOFOLLOW`), read
-  regular files only via `openat(O_NOFOLLOW)` with a size bound, require the
-  document's `attempt_id` to equal the spool's attempt, and call the existing
-  `submit_result`/review ingest under the project's own locks. Write the
-  receipt with `openat(O_CREAT|O_EXCL|O_NOFOLLOW)` in the same directory (the
-  worker controls the directory, so never follow or truncate). Idempotency is
-  the store's existing key/digest replay, so a crash between insert and
-  receipt write converges.
-- **Why not built here:** it changes the CLI contract for worker-run commands,
-  adds a ticker ingest job with its own recovery, needs the output-directory
-  record change above, and every worker CLI command that reads the store must
-  be proven to work on a read-only store. Making `.state` read-only without it
-  breaks submission, so this card only narrows the project exposure (project
-  read-only outside `.state`, other attempts' worktrees read-only).
 
 ### Coordinator and legacy thread agents (residual risk 7)
 
@@ -422,12 +536,13 @@ Not built: covering them safely does not fit this card.
 
 Status after the follow-up card in brackets.
 
-1. **[Narrowed, open] Writes to the worker's own project store.** The worker's
-   project is now read-only outside `.state`, and other attempts' worktrees
-   are read-only; `.state` itself (store, `factory-objects/`, locks,
-   `worker-output/`) stays writable until the submission spool is built (see
-   [Designed, not built](#submission-spool-closes-residual-risk-1)). Original
-   text: the project directory is
+1. **[Closed by the spool card] Writes to the worker's own project store.**
+   The worker's project, `.state` included, is read-only; only its own
+   spool and output directory (and its worktree, as before) are writable,
+   and the ticker ingests spooled submissions through the store's own path
+   ([Submission spool](#submission-spool-follow-up-card)). Remaining: the
+   worker still *reads* `.state` (the store, other attempts' spools, outputs
+   and snapshots), as it did before. Original text: the project directory is
    exposed read-write because `result submit`/`review submit` run inside the
    worker and open `state.db`. A worker can therefore write its own project's
    SQLite store, objects and other attempts' worktrees/outputs directly,
@@ -500,9 +615,10 @@ Status after the follow-up card in brackets.
    keys, the reviewer-signer directory and `/run/user`), and retire or wrap
    legacy thread launches the same way. Stock `agent.start` cannot carry the
    wrapper.
-8. **[Narrowed] Same-project neighbours.** Other attempts' worktrees and
-   `PROJECT.md` are now read-only; their `worker-output/` directories and
-   snapshots under `.state` are not (closed with the spool). Original text:
+8. **[Closed for writes by the spool card; reads open] Same-project
+   neighbours.** Other attempts' worktrees, `PROJECT.md`, `worker-output/`
+   directories, spools and snapshots under `.state` are read-only; they stay
+   readable. Original text:
    other attempts of the worker's own project
    (worktrees, outputs, snapshots, `PROJECT.md`) remain readable/writable
    (closed by the spool proposal in 1).
@@ -547,4 +663,22 @@ Host under heavy unrelated load throughout (load average 15–22 on 12 cores).
 - Default features, `--test cli --bin herdr-projects`: pass (30, 284). One run
   hit `local_reports::tests::retained_unconsumed_hashes_have_a_global_cache_bound`
   (`Instant::now() < deadline`; unrelated code), which passed on two re-runs.
+- No new clippy warnings in changed files.
+
+### Tests run (spool card)
+
+- `cargo test --features state-store --no-fail-fast --test canonical_worker
+  --test cli --test factory_harness --test scheduling --test recovery --test
+  ticker_jobs --test telemetry_review --test review_signer`: canonical_worker
+  20 (two new), cli 81, factory_harness 16, recovery 5, review_signer 3,
+  scheduling 7, telemetry_review 20 pass; ticker_jobs 7 of 8 in that run
+  (`open_after_a_coordinator_start_keeps_its_claim_and_never_starts_again`,
+  a legacy-coordinator timing assertion on a project without a spool), then 8
+  of 8 on re-run together with canonical_worker (20) on the final code.
+- `--features state-store --bin herdr-projects`: 365 pass.
+- `--features state-store --lib`: 612 pass after updating
+  `staged_stop_requires_output_evidence_and_records_an_empty_directory_as_absent`
+  (was `..._preserves_an_empty_directory`) to the pre-created output
+  directory contract.
+- Default features, `--test cli --bin herdr-projects`: 30 and 284 pass.
 - No new clippy warnings in changed files.

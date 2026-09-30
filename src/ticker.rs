@@ -407,6 +407,16 @@ pub fn run(ctx: &Ctx) -> Result<()> {
             if stop_path(root).exists() {
                 break;
             }
+            // A worker waits on its spooled submission: answer it now.
+            #[cfg(all(feature="state-store",target_os="linux"))]
+            for slug in project::list_slugs(root) {
+                let dir=root.join(&slug);
+                if !herdr_projects::submission_spool::pending(&dir) {continue;}
+                match herdr_projects::submission_spool::ingest(&dir) {
+                    Ok(lines)=>for line in lines {log.line(&format!("{slug}: {line}"));},
+                    Err(error)=>log.line(&format!("{slug}: submission spool: {error:#}")),
+                }
+            }
             std::thread::sleep(Duration::from_millis(500).min(wake.saturating_duration_since(Instant::now())));
         }
     }
@@ -572,6 +582,13 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
                     }
                     memory.canonical_effects_unknown=true;log.line(&format!("{slug}: canonical controller: {error:#}"));
                 }
+            }
+            // Isolated workers submit through their attempt's spool: ingest
+            // each pending request through the store's own submission path.
+            #[cfg(target_os="linux")]
+            match herdr_projects::submission_spool::ingest(&ctx.root.join(slug)) {
+                Ok(lines)=>for line in lines {log.line(&format!("{slug}: {line}"));},
+                Err(error)=>log.line(&format!("{slug}: submission spool: {error:#}")),
             }
             // Migrated projects ingest Remember obligations and deliver due
             // reminders as stable rows into the SQLite inbox (never legacy

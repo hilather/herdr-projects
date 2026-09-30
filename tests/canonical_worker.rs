@@ -1140,7 +1140,8 @@ fn plant(path: &std::path::Path, text: &str) {
 /// `[worker_isolation]`, another project under the root, the Herdr stand-in's
 /// directory or its control socket, an SSH agent directory in `/tmp`, nor lift the hiding with `umount`/`mount`,
 /// directly or from a namespace of its own. Its own execution home, worktree
-/// commit and `result submit` into its own project still work.
+/// commit and `result submit` into its own project (through its submission
+/// spool: the project store is read-only to it) still work.
 #[test]
 fn an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_commits_and_submits() {
     let mut lab = Lab::new("unknown_usage='allow_with_warning'\n[worker_isolation]\nhide=['~/owner']");
@@ -1239,7 +1240,8 @@ fn an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_com
     assert!(report.contains("commit true"), "{report}");
     assert_eq!(fs::read_to_string(worktree.join("work.txt")).unwrap(), "worker change\n");
     assert_eq!(lab.git(&["cat-file", "-p", &format!("{candidate}:work.txt")]), "worker change");
-    // ... and `result submit` from inside the sandbox records a submission.
+    // ... and `result submit` from inside the sandbox records a submission
+    // (the ticker ingests it from the attempt's spool).
     let objects: Vec<Value> = lab.git(&["rev-list", "--objects", "--all"]).lines()
         .map(|line| { let oid = line.split_whitespace().next().unwrap(); json!({"oid": oid, "relative_path": format!("{}/{}", &oid[..2], &oid[2..])}) }).collect();
     fs::write(worktree.join("submit.json.tmp"), json!({"idempotency_key": "isolated-worker", "task_id": "work", "contract_revision": 1, "contract_digest": contract,
@@ -1263,6 +1265,250 @@ fn an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_com
     lab.ok_live(&|| ["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &lab.attempt(&attempt).revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "probe done"].map(String::from).to_vec());
     lab.wait(&mut ticker, 60, &|| lab.attempt(&attempt).termination_observed);
     lab.stop(ticker);
+}
+
+/// Probe for the submission spool: reports which `.state` paths it can
+/// write, copies the host's planted requests (and links) into its own spool
+/// as `plan.txt` lists them, then runs `result submit` twice.
+const SPOOL_PROBE: &str = r##"
+use std::{fs, os::unix::fs::symlink, path::Path, process::Command, time::Duration};
+fn publish(name: &str, text: &str) { fs::write(format!("{name}.tmp"), text).unwrap(); fs::rename(format!("{name}.tmp"), name).unwrap(); }
+fn create(path: &str) -> String { match fs::OpenOptions::new().create(true).write(true).open(path) { Ok(_) => "OK".into(), Err(e) => format!("ERR:{:?}", e.kind()) } }
+fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--version") { println!("2.1.0 (Claude Code)"); return }
+    let spool = std::env::var("HERDR_PROJECTS_SUBMISSION_SPOOL").unwrap_or_default();
+    let own = Path::new(&spool).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut report = format!("spool {spool}\n");
+    report += &format!("store-write {}\n", match fs::OpenOptions::new().write(true).open(format!("{STATE}/state.db")) { Ok(_) => "OK".into(), Err(e) => format!("ERR:{:?}", e.kind()) });
+    for (label, path) in [("state", format!("{STATE}/planted")), ("objects", format!("{STATE}/factory-objects/planted")),
+        ("other-spool", format!("{STATE}/spool/{OTHER}/planted")), ("other-output", format!("{STATE}/worker-output/{OTHER}/planted")),
+        ("own-output", format!("{STATE}/worker-output/{own}/report.md")), ("own-spool", format!("{spool}/.probe"))] {
+        report += &format!("write {label} {}\n", create(&path));
+    }
+    publish("probe-1.txt", &report);
+    while !Path::new("plan.txt").exists() { std::thread::sleep(Duration::from_millis(50)); }
+    for line in fs::read_to_string("plan.txt").unwrap().lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        let target = format!("{spool}/{}", parts[2]);
+        if parts[0] == "link" { symlink(parts[1], &target).unwrap(); continue }
+        fs::copy(parts[1], format!("{spool}/.copy")).unwrap();
+        fs::rename(format!("{spool}/.copy"), &target).unwrap();
+    }
+    while !Path::new("submit.json").exists() { std::thread::sleep(Duration::from_millis(50)); }
+    for n in 1..=2 {
+        let mut last = String::new();
+        for _ in 0..60 {
+            let out = Command::new(BIN).args(["--root", ROOT, "result", "demo", "submit", "--input-file", "submit.json"]).output().unwrap();
+            last = format!("{}\n{}{}", out.status.success(), String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            if out.status.success() { break }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        publish(&format!("submit-{n}.txt"), &last);
+    }
+    loop { std::thread::park() }
+}
+"##;
+
+/// Probe for the reviewer's worker channel through the spool: its own
+/// session, another attempt's session, its opportunity's blind view, and
+/// the same receipt submitted twice.
+const REVIEW_PROBE: &str = r##"
+use std::{fs, path::Path, process::Command};
+fn publish(name: &str, text: &str) { fs::write(format!("{name}.tmp"), text).unwrap(); fs::rename(format!("{name}.tmp"), name).unwrap(); }
+fn field(json: &str, key: &str) -> String {
+    let marker = format!("\"{key}\": \"");
+    json.find(&marker).map(|i| json[i + marker.len()..].split('"').next().unwrap().to_owned()).unwrap_or_default()
+}
+fn review(args: &[&str]) -> String {
+    let out = Command::new(BIN).args(["--root", ROOT, "telemetry", "demo", "review"]).args(args).output().unwrap();
+    format!("{}\n{}{}", out.status.success(), String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+}
+fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--version") { println!("2.1.0 (Claude Code)"); return }
+    let spool = std::env::var("HERDR_PROJECTS_SUBMISSION_SPOOL").unwrap_or_default();
+    let attempt = Path::new(&spool).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let session = review(&["session", "--attempt", &attempt]);
+    publish("session.txt", &session);
+    publish("foreign.txt", &review(&["session", "--attempt", FOREIGN]));
+    publish("present.txt", &review(&["present", &field(&session, "opportunity_id")]));
+    fs::write("receipt.json", format!("{{\"schema\":\"review_receipt.v1\",\"session_id\":\"{}\",\"submission_id\":\"{}\",\"candidate_oid\":\"{}\",\"outcome\":\"completed\",\"findings\":[\"finding:w1\"],\"evidence\":[]}}",
+        field(&session, "session_id"), field(&session, "submission_id"), field(&session, "candidate_oid"))).unwrap();
+    publish("submit-1.txt", &review(&["submit", "--input-file", "receipt.json"]));
+    publish("submit-2.txt", &review(&["submit", "--input-file", "receipt.json"]));
+    loop { std::thread::park() }
+}
+"##;
+
+impl Lab {
+    /// Compile `source` (a probe above) as the lab agent, with `consts` appended.
+    fn write_agent(&self, source: &str, consts: &[(&str, String)]) {
+        let mut text = source.to_owned();
+        for (name, value) in consts { text += &format!("const {name}: &str = {value:?};\n"); }
+        let (agent, file) = (self.path("bin/claude"), self.path("bin/probe.rs"));
+        fs::write(&file, text).unwrap();
+        let built = Command::new("rustc").args(["--edition", "2021", "-o"]).arg(&agent).arg(&file).output().unwrap();
+        assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    /// The `spool.request_denied` reasons recorded for `attempt`.
+    fn spool_denials(&self, attempt: &str) -> Vec<String> {
+        self.events("spool.request_denied").into_iter().filter(|e| e.entity == attempt).map(|e| e.payload["reason"].as_str().unwrap().to_owned()).collect()
+    }
+}
+
+/// A spool request exactly as the worker's CLI writes it (canonical field
+/// order), and its content-addressed name.
+fn spool_request(kind: &str, attempt: &str, document: &str) -> (String, Vec<u8>) {
+    let bytes = format!(r#"{{"version":1,"kind":"{kind}","attempt_id":"{attempt}","document":{}}}"#, serde_json::to_string(document).unwrap()).into_bytes();
+    (format!("{:x}", Sha256::digest(&bytes)), bytes)
+}
+
+/// Residual risk 1 closed: the isolated worker's project `.state` is
+/// read-only (it cannot open `state.db` for writing, add objects, or write
+/// another attempt's spool or outputs); only its own spool and output
+/// directory are writable. `result submit` inside the sandbox goes through
+/// the spool: the ticker ingests it through the store's submission path, so
+/// the receipt is the one a direct submission prints and the same document
+/// replays (`replayed: true`, same submission). Requests the worker plants
+/// by hand are refused, answered and recorded (`spool.request_denied`): a
+/// malformed one, an oversized one, one naming another attempt, one whose
+/// result names another attempt, and a request that is a symbolic link. A
+/// symbolic link planted at a receipt name is replaced, never followed: its
+/// target (the owner's `~/.bashrc`) is unchanged. After the attempt ends the
+/// ticker removes its spool.
+#[test]
+fn an_isolated_worker_submits_only_through_its_own_spool() {
+    let mut lab = Lab::new("unknown_usage='allow_with_warning'");
+    let home = lab.home.path().canonicalize().unwrap();
+    let state = lab.project.canonicalize().unwrap().join(".state");
+    // Another attempt's spool and outputs, as gate release creates them.
+    for dir in ["spool/other-attempt", "worker-output/other-attempt", "factory-objects"] { fs::create_dir_all(state.join(dir)).unwrap(); }
+    fs::write(home.join(".bashrc"), "OWNER-BASHRC\n").unwrap();
+    lab.write_agent(SPOOL_PROBE, &[("ROOT", lab.path("root").canonicalize().unwrap().display().to_string()), ("BIN", BIN.into()),
+        ("STATE", state.display().to_string()), ("OTHER", "other-attempt".into())]);
+    let (contract, base) = lab.install_work_contract();
+    let (_, attempt) = lab.reserve("Retained instructions");
+    let worktree = lab.planned_worktree(&attempt);
+    let spool = state.join("spool").join(attempt.as_str());
+    lab.serve();
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 120, &|| worktree.join("probe-1.txt").exists());
+    let report = fs::read_to_string(worktree.join("probe-1.txt")).unwrap();
+    assert!(report.starts_with(&format!("spool {}\n", spool.display())), "{report}");
+    for label in ["store-write", "write state", "write objects", "write other-spool", "write other-output"] {
+        assert!(report.contains(&format!("\n{label} ERR:ReadOnlyFilesystem\n")), "{label}:\n{report}");
+    }
+    assert!(report.contains("\nwrite own-output OK\n") && report.contains("\nwrite own-spool OK\n"), "{report}");
+    assert!(state.join("worker-output").join(attempt.as_str()).join("report.md").is_file());
+    assert!(!state.join("planted").exists() && !state.join("spool/other-attempt/planted").exists());
+
+    // Requests the worker plants by hand in its own spool.
+    let plan = worktree.join("plan");
+    fs::create_dir(&plan).unwrap();
+    let mut lines = Vec::new();
+    let mut plant = |label: &str, name: String, bytes: &[u8]| -> String {
+        fs::write(plan.join(label), bytes).unwrap();
+        lines.push(format!("copy\t{}\t{name}.request", plan.join(label).display()));
+        name
+    };
+    let malformed = plant("malformed", format!("{:x}", Sha256::digest(b"not a request\n")), b"not a request\n");
+    let big = vec![b'x'; 1024 * 1024 + 1];
+    let oversized = plant("oversized", format!("{:x}", Sha256::digest(&big)), &big);
+    let (name, bytes) = spool_request("result_submit", "other-attempt", "{}");
+    let other_spool = plant("other-spool", name, &bytes);
+    let (name, bytes) = spool_request("result_submit", attempt.as_str(), &json!({"attempt_id": "other-attempt"}).to_string());
+    let other_result = plant("other-result", name, &bytes);
+    let linked = format!("{:x}", Sha256::digest(b"linked"));
+    // The receipt name of the malformed request is a link to the owner's file.
+    let mut plan_text = format!("link\t{}\t{malformed}.receipt\nlink\t{}\t{linked}.request\n", home.join(".bashrc").display(), home.join(".bashrc").display());
+    plan_text += &(lines.join("\n") + "\n");
+    fs::write(worktree.join("plan.txt.tmp"), plan_text).unwrap();
+    fs::rename(worktree.join("plan.txt.tmp"), worktree.join("plan.txt")).unwrap();
+    let answered = |digest: &str| fs::symlink_metadata(spool.join(format!("{digest}.receipt"))).is_ok_and(|m| m.is_file());
+    lab.wait(&mut ticker, 120, &|| [&malformed, &oversized, &other_spool, &other_result, &linked].iter().all(|d| answered(d)));
+    let receipt = |digest: &str| -> Value { serde_json::from_slice(&fs::read(spool.join(format!("{digest}.receipt"))).unwrap()).unwrap() };
+    for (digest, reason) in [(&malformed, "the request is not a canonical spool request"), (&oversized, "the request exceeds 1048576 bytes"),
+        (&other_spool, "the request names another attempt than its spool"), (&other_result, "the result submission names attempt other-attempt, not this spool's attempt"),
+        (&linked, "the request is a symbolic link")] {
+        assert_eq!(receipt(digest)["error"], json!(format!("submission spool refused the request: {reason}")), "{digest}");
+        assert!(lab.spool_denials(attempt.as_str()).iter().any(|r| r == reason), "{reason}: {:?}", lab.spool_denials(attempt.as_str()));
+    }
+    assert_eq!(fs::read_to_string(home.join(".bashrc")).unwrap(), "OWNER-BASHRC\n", "the planted receipt link was followed");
+    assert!(lab.state().attempts.iter().all(|a| a.id.as_str() != "other-attempt"));
+
+    // An ordinary `result submit` goes through the spool and replays.
+    lab.wait(&mut ticker, 60, &|| lab.attempt(&attempt).state == AttemptState::Running);
+    let objects: Vec<Value> = lab.git(&["rev-list", "--objects", "--all"]).lines()
+        .map(|line| { let oid = line.split_whitespace().next().unwrap(); json!({"oid": oid, "relative_path": format!("{}/{}", &oid[..2], &oid[2..])}) }).collect();
+    fs::write(worktree.join("submit.json.tmp"), json!({"idempotency_key": "spooled", "task_id": "work", "contract_revision": 1, "contract_digest": contract,
+        "attempt_id": attempt.as_str(), "repository": lab.repo.canonicalize().unwrap().display().to_string(), "base_oid": base, "candidate_oid": base, "object_format": "sha256",
+        "artifact_manifest": [{"path": "work.txt", "oid": base}], "claimed_checks": [], "objects": objects}).to_string()).unwrap();
+    fs::rename(worktree.join("submit.json.tmp"), worktree.join("submit.json")).unwrap();
+    lab.wait(&mut ticker, 120, &|| worktree.join("submit-2.txt").exists());
+    let parse = |n: u32| -> Value {
+        let text = fs::read_to_string(worktree.join(format!("submit-{n}.txt"))).unwrap();
+        let (status, stdout) = text.split_once('\n').unwrap();
+        assert_eq!(status, "true", "{text}");
+        serde_json::from_str(stdout).unwrap()
+    };
+    let (first, second) = (parse(1), parse(2));
+    let shown = lab.ok(&["result", "demo", "show"]);
+    assert_eq!(shown.as_array().map(|a| (a.len(), a[0]["submission_id"].clone(), a[0]["attempt_id"].clone())),
+        Some((1, first["submission_id"].clone(), json!(attempt.as_str()))), "{shown}");
+    assert_eq!((&first["idempotency_key"], &first["replayed"], &second["replayed"]), (&json!("spooled"), &json!(false), &json!(true)));
+    assert_eq!((&second["submission_id"], &second["payload_digest"]), (&first["submission_id"], &first["payload_digest"]));
+    assert_eq!(first["payload_digest"], json!(format!("{:x}", Sha256::digest(fs::read(worktree.join("submit.json")).unwrap()))));
+
+    lab.ok_live(&|| ["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &lab.attempt(&attempt).revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "probe done"].map(String::from).to_vec());
+    lab.wait(&mut ticker, 90, &|| lab.attempt(&attempt).termination_observed && !spool.exists());
+    lab.stop(ticker);
+    assert!(state.join("spool/other-attempt").is_dir(), "an unknown attempt's spool is not removed");
+}
+
+/// D9's worker channel through the spool: a sandboxed reviewing worker (the
+/// ticker launched it; its project store is read-only) prints its own
+/// session and its opportunity's blind view, and submits its receipt: a
+/// proposal recorded as `worker:<attempt>`, the same receipt replaying.
+/// Asking for another attempt's session is refused and recorded.
+#[test]
+fn a_sandboxed_reviewer_uses_its_worker_channel_through_the_spool() {
+    let mut lab = Lab::new("unknown_usage='allow_with_warning'");
+    lab.write_agent(REVIEW_PROBE, &[("ROOT", lab.path("root").canonicalize().unwrap().display().to_string()), ("BIN", BIN.into()), ("FOREIGN", AUTHOR_ATTEMPT.into())]);
+    let world = lab.review_world();
+    let (_, attempt) = lab.reserve_selection(&world.selection);
+    let worktree = lab.planned_worktree(&attempt);
+    lab.serve();
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 180, &|| worktree.join("submit-2.txt").exists());
+    lab.stop(ticker);
+    let read = |name: &str| -> (String, String) {
+        let text = fs::read_to_string(worktree.join(name)).unwrap();
+        let (status, rest) = text.split_once('\n').unwrap();
+        (status.to_owned(), rest.to_owned())
+    };
+    let (status, session) = read("session.txt");
+    assert_eq!(status, "true", "{session}");
+    let session: Value = serde_json::from_str(&session).unwrap();
+    assert_eq!((&session["session"]["opportunity_id"], &session["session"]["submission_id"], &session["session"]["candidate_oid"], &session["session"]["completed"]),
+        (&json!(world.opportunity), &json!(world.submission), &json!(world.candidate), &json!(false)));
+    let (status, foreign) = read("foreign.txt");
+    assert_eq!(status, "false");
+    assert!(foreign.contains("submission spool refused the request: review session asks for another attempt's session"), "{foreign}");
+    assert_eq!(lab.spool_denials(attempt.as_str()), vec!["review session asks for another attempt's session".to_owned()],
+        "{}", fs::read_to_string(lab.path("root/.ticker.log")).unwrap_or_default());
+    let (status, present) = read("present.txt");
+    assert_eq!(status, "true", "{present}");
+    assert_eq!(serde_json::from_str::<Value>(&present).unwrap()["presentation"]["opportunity_id"], json!(world.opportunity));
+    let submitted = |n: u32| -> Value {
+        let (status, out) = read(&format!("submit-{n}.txt"));
+        assert_eq!(status, "true", "{out}");
+        serde_json::from_str::<Value>(&out).unwrap()["completion"].clone()
+    };
+    let (first, second) = (submitted(1), submitted(2));
+    assert_eq!((&first["trust"], &first["recorder_principal"], &first["replayed"], &second["replayed"], &second["receipt_digest"]),
+        (&json!("proposal"), &json!(format!("worker:{}", attempt.as_str())), &json!(false), &json!(true), &first["receipt_digest"]));
+    let completion = lab.review_show(None)["opportunities"][0]["sessions"][0]["completion"].clone();
+    assert_eq!((&completion["trust"], &completion["recorder_principal"]), (&json!("proposal"), &json!(format!("worker:{}", attempt.as_str()))));
 }
 
 /// Isolation fails closed: an owner-declared hidden path that would cover the

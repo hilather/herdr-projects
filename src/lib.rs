@@ -92,5 +92,9 @@ pub mod verification;
 #[cfg(all(feature = "state-store", target_os = "linux"))]
 pub mod result_capture;
 
+/// The isolated worker's submission spool and the ticker's ingestion of it.
+#[cfg(all(feature = "state-store", target_os = "linux"))]
+pub mod submission_spool;
+
 #[cfg(all(feature = "state-store", target_os = "linux"))]
 pub mod integration;

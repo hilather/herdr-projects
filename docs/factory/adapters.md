@@ -61,6 +61,10 @@ same OID with `captured: false`; later edits become a new commit on top. The
 worktree's index is reset to the branch tip; its files are not touched.
 
 Submit that OID as usual with `result submit`; the submission format is
-unchanged. The captured commit is still an untrusted candidate, and only
+unchanged. Inside the worker sandbox the project store is read-only: `result
+submit` writes the document into the attempt's submission spool and prints
+the receipt the ticker writes back after ingesting it through the same
+idempotent store path (see
+[the worker isolation review](../reviews/2026-09-29-worker-isolation.md#submission-spool-follow-up-card)). The captured commit is still an untrusted candidate, and only
 verification evidence releases anything. The F1.7 harness
 (`scripts/test-live-f1`) follows this flow: `workspace-write`, capture, submit.

@@ -8,9 +8,12 @@ pub(super) use crate::profile_config::ProfileDefinition as Definition;
 /// The literal supervisor argv. Creation and gate release derive it from the
 /// same retained inputs (profile, project, route, approved repositories) and
 /// the controller's owner identity, so the released gate matches the created one.
+/// An isolated attempt also names its submission spool (`attempt`).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn command(
     profile: &FrozenProfile,
     operation: &OperationId,
+    attempt: &AttemptId,
     prompt_chars: u64,
     project: &Path,
     route: &RuntimeRoute,
@@ -33,7 +36,8 @@ pub(super) fn command(
             Some(Path::new(&profile.config.path)),
             Some(Path::new(&route.socket)),
             &crate::profile_config::frozen_isolation_hides(profile)?,
-        )?;
+        )?
+        .with_submission_spool(attempt.as_str())?;
         return crate::worker_supervision::isolated_gated_command(
             Path::new(&profile.agent.path),
             &definition.extra_args,
@@ -317,7 +321,7 @@ fn create_resource_inner(
     // Refuse unusable retained knowledge before creating any external resource.
     let brief =
         db.render_attempt_brief(&project, record.attempt.as_str())?;
-    let argv = command(profile, operation, brief.prompt_chars, &project, route, &record.inputs, &state.events)?;
+    let argv = command(profile, operation, &record.attempt, brief.prompt_chars, &project, route, &record.inputs, &state.events)?;
     executable(&profile.agent, deadline, &cancellation)?;
     let session = session_identity(Path::new(&route.socket))?;
     let mut api = Api {
@@ -1078,7 +1082,10 @@ pub fn release_gate(
     let brief =
         db.render_attempt_brief(&project, record.attempt.as_str())?;
     let worktrees=crate::worktree_preparation::verify_events_held(&project,&state.events,record,deadline,cancellation.clone(),guard.inherit()?)?;
-    let argv = command(profile, operation, brief.prompt_chars, &project, &target.route, &record.inputs, &state.events)?;
+    let argv = command(profile, operation, &record.attempt, brief.prompt_chars, &project, &target.route, &record.inputs, &state.events)?;
+    // The sandbox binds the attempt's spool and output directory writable
+    // only when they exist, so they are created (owner-only) before release.
+    crate::submission_spool::prepare(&project, &record.attempt)?;
     executable(&profile.agent, deadline, &cancellation)?;
     let supervisor = crate::worker_supervision::SupervisorObservation::reconnect(
         target

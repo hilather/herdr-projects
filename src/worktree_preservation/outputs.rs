@@ -33,6 +33,9 @@ pub(crate) fn capture_outputs_held(project:&Path,record:&AttemptInputRecord,cont
     scan(&source,Path::new(""),&mut control.budget(),&mut repeated,&mut BTreeMap::new(),0,false)?;
     ensure!(entries==repeated,"worker outputs changed during preservation");
     source.matches_path(Path::new(&path))?;
+    // Gate release pre-creates the directory (the sandbox binds only existing
+    // paths writable); an attempt that wrote nothing into it produced no outputs.
+    if entries.is_empty() {state.matches_path(&project.join(".state"))?;control.check()?;return Ok(absent());}
     let manifest=OutputManifest{version:1,attempt:record.attempt.clone(),source:path.clone(),entries};
     let bytes=serde_json::to_vec(&manifest)?;ensure!(bytes.len()<=4*1024*1024,"worker output manifest exceeds bounds");
     let digest=hash(&bytes);
