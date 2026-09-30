@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-mod groups;
+pub(crate) mod groups;
 mod outcomes;
 mod proxy;
 mod registry;

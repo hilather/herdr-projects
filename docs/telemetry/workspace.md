@@ -25,14 +25,34 @@ read path and never recomputed:
 
 | section | source (the command that prints the same values) |
 |---|---|
-| `coverage`, `services.M38/M39/M40`, `replay` | the TM4.1 query service, one request for M13, M38, M39, M40 and M49 (`telemetry <slug> query --metric M13,M38,M39,M40,M49 --json`): `definition`, `status`, `value`, `reason`, `numerator`, `denominator`, `coverage.state`, `lag_ms`, `lag_reason` verbatim |
+| `coverage`, `services.M38/M39/M40`, `replay` | the TM4.1 recorded revisions for M13, M38, M39, M40 and M49 (`telemetry <slug> query --metric M13,M38,M39,M40,M49 --as-of-seq <revision> --json`): `definition`, `status`, `value`, `reason`, `numerator`, `denominator`, `coverage.state`, `lag_ms`, `lag_reason` verbatim |
 | `services.quota_at_last_dispatch` | M40's latest decision per service, verbatim (`detail.decisions[]`: windows, remaining %, freshness) |
 | `active` | the TM1.8 attempt projection (`telemetry <slug> attempts --json`): each record whose `terminal_state` is `open`, with its `usage` and `attention` verbatim. `state` is `running` when the record has a running mark, `launching` when it has a launching mark, else `reserved`. `configuration_label` is `"<kind> <agent_version>"` of the dispatched configuration, the same label `compare` uses. `coverage` is `complete` when usage is bound, else `unavailable` |
 | `active[].waiting` | the projection's closed waiting time (`waiting_ms`), plus the open wait from the attention lane (`telemetry <slug> accounting attention --json`), taken from the interval that ends `open_at_horizon` of an attempt the lane sees as open. `open_since_unix_ms` is when the wait opened. `open_observed_ms` is last observation − opened: observed only, never extrapolated to now |
-| `configurations` | the TM4.4 comparison `telemetry <slug> compare --metric M02 --json`, per task class: each arm's `tasks`, `status` (`shown`, `suppressed`, `empty`), `value`, `decimal`, `interval`, `pooled`, `min_sample` verbatim. Cells below 20 tasks stay suppressed. The pane prints no ranking |
+| `configurations` | the TM4.4 comparison `telemetry <slug> compare --metric M02 --json`, recorded by `analytics refresh`, per task class: each arm's `tasks`, `status` (`shown`, `suppressed`, `empty`), `value`, `decimal`, `interval`, `pooled`, `min_sample` verbatim. Cells below 20 tasks stay suppressed. The pane prints no ranking |
 | `candidate_groups` | `telemetry <slug> quality groups show`: groups are tagged `race#1`, `race#2`, … in creation order, and each arm has its `outcome`. `awaiting_selection` is set when the group is open and every arm is `candidate` or `failure_no_candidate` |
 | `alerts` | the TM4.5 recorded open alerts (`telemetry <slug> health alerts --json` → `open`): id, rule, labels, state, reason codes, opened, occurrences and notice id. The inbox notices are that lane's own `health notify` |
 | `needs_you` | derived from the sections above, most urgent first: open alerts (critical, then warn, then unknown), attempts waiting on you now (longest observed wait first), and candidate groups awaiting selection |
+
+History fields add `as_of: {seq, unix_ms}`: the immutable revision number
+and its recording time, distinct from the snapshot's `query_unix_ms`. Metric
+sequences belong to `analytics_revisions`; the comparison sequence belongs to
+`analytics_workspace_comparisons`. The pane and digest print these as
+`History as_of (revision@Unix ms)`. Values, coverage, exclusions, intervals,
+suppression and pooling are copied unchanged from those recorded bodies.
+Metric `lag_ms` uses the revision's observation cutoff, as the as-of query does.
+No revision means `unavailable (no_revision_as_of)`; run `analytics refresh`.
+There is no live history fallback. Active attempts, waits, candidate outcomes
+and recorded alerts still reflect the current read.
+
+`analytics refresh` records two supplementary analytics-owned rendering
+projections in its existing transaction. `analytics_workspace_metrics` holds
+compact bodies keyed by the authoritative metric revision (M40 keeps the latest
+decision per service, with the original tie and encounter-order rules).
+`analytics_workspace_comparisons` appends only when the exact displayed
+comparison changes. These optional tables are created on refresh, including
+for an older sidecar; reading never creates them. They do not change the
+analytics stream version, tracked cells, metric bodies, digests or lineage.
 
 **Degrading.** If the query service or the attempt projection cannot answer,
 for example because `state.db` or the telemetry sidecar is unreadable, the
@@ -243,7 +263,11 @@ below. The fixture's fleet is:
 - one sealed race with no arm launched yet.
 
 Identifiers that differ per run are shown as fixed placeholders. The query
-time and each attempt's elapsed time are measured at each read.
+time and each attempt's elapsed time are measured at each read. The fixture
+now runs `analytics refresh` after recording its data, so the values in these
+captures remain identical. The extra history provenance line contains the
+fixture's revision numbers and recording times and is omitted from the static
+captures.
 
 <!-- capture: workspace show -->
 ```text
@@ -315,11 +339,12 @@ demo · fleet · unavailable (query_service_down): nothing numeric is shown
 - Services come from M38/M39, which are uncertified (`n/a`), and from M40,
   which is quota at dispatch rather than live headroom. Live window headroom
   is TM4.5's `quota_headroom` rule, and it appears here as an alert.
-- Scale: a snapshot recomputes the whole attempt projection and the reports
-  it reads. With 10,000 retained attempts it takes about 5 s (100,000
-  events) to 15 s (1,000,000), far above doc 10's 250 ms pane and 100 ms
-  digest targets, and `context` pays the same for its section
-  ([certificate-scale.md](certificate-scale.md) §4.4, L5).
+- Scale: the rich projection is built once over open attempts and candidate
+  arms, sharing its attention read with the waiting section. Historical reports
+  are recorded by analytics refresh. Digest reads restrict comparison cells
+  and arms, pending groups and alerts to their printed top-N, preserving the
+  omitted counts. The 100k follow-up measurements and pending steward 1M
+  certification are in [certificate-scale.md](certificate-scale.md) L5.
 - Weekly report and replay routines use the existing signed routine path
   (§10).
 

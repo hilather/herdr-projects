@@ -337,7 +337,13 @@ fn model_allocation(sidecar: Option<&rusqlite::Connection>, units: &[&Unit]) -> 
 }
 
 /// `telemetry <slug> compare`: the full JSON report.
-pub fn run(project: &Path, args: &Args) -> Result<Value> {
+pub fn run(project: &Path, args: &Args) -> Result<Value> { run_report(project, args, false) }
+
+/// Same cells and labels, without cost/model diagnostics the workspace does
+/// not consume. Called only while recording a workspace history revision.
+pub(crate) fn workspace(project: &Path, args: &Args) -> Result<Value> { run_report(project, args, true) }
+
+fn run_report(project: &Path, args: &Args, workspace: bool) -> Result<Value> {
     let r = request(args)?;
     let sources = load(project)?;
     let sidecar = crate::telemetry::sidecar::read(project)?;
@@ -378,7 +384,7 @@ pub fn run(project: &Path, args: &Args) -> Result<Value> {
         entry["attempt_states"] = json!(counts(members.iter().flat_map(|u| u.task.attempts.iter().map(|a| a.state.as_str()))));
         entry["task_classes"] = json!(counts(members.iter().map(|u| u.class.as_str())));
         entry["difficulty"] = json!({"proxy": "task_classifications.band (preassignment rubric)", "bands": counts(members.iter().map(|u| u.band.as_str()))});
-        entry["cost"] = cost(sidecar.as_deref(), members)?;
+        entry["cost"] = if workspace { Value::Null } else { cost(sidecar.as_deref(), members)? };
         if entry["cost"]["state"] != "complete" { partial_cost.push(json!({"configuration_id": configuration, "state": entry["cost"]["state"], "missing": entry["cost"]["missing"]})); }
         entry["review_coverage"] = match &sources.reviewed {
             None => unavailable("review_capture_absent"),
@@ -388,7 +394,7 @@ pub fn run(project: &Path, args: &Args) -> Result<Value> {
                 json!({"reviewed_tasks": n, "tasks": members.len(), "value": format!("{n}/{}", members.len())})
             }
         };
-        entry["model_allocation"] = model_allocation(sidecar.as_deref(), members)?;
+        entry["model_allocation"] = if workspace { Value::Null } else { model_allocation(sidecar.as_deref(), members)? };
         if entry["model_allocation"]["mixed_model_allocation"] == true { mixed_model.push(json!({"configuration_id": configuration, "tasks": entry["model_allocation"]["mixed_model_tasks"]})); }
         configurations.push(entry);
     }
@@ -437,7 +443,7 @@ pub fn run(project: &Path, args: &Args) -> Result<Value> {
     }
 
     // Paired analysis for candidate groups: lane C's M42 (same read path as `telemetry report`), restricted to these arms.
-    let paired = match crate::telemetry::quality::metrics(project, r.from)?.remove("M42") {
+    let paired = if workspace { Value::Null } else { match crate::telemetry::quality::metrics(project, r.from)?.remove("M42") {
         None => unavailable("paired_metric_absent"),
         Some(m42) => {
             let pairs: Vec<Value> = m42["pairs"].as_array().into_iter().flatten()
@@ -445,7 +451,7 @@ pub fn run(project: &Path, args: &Args) -> Result<Value> {
             json!({"definition": m42["definition"], "value": m42["value"], "closed_groups": m42["closed_groups"], "min_sample": m42["min_sample"],
                 "estimator": m42["estimator"], "acceptance": m42["acceptance"], "pairs": pairs, "window": "selected at or after --from"})
         }
-    };
+    } };
 
     Ok(json!({"schema_version": SCHEMA_VERSION, "contract": COMPARISON.version, "registry": registry::VERSION,
         "request": {"metrics": r.metrics.iter().map(|m| m.1).collect::<Vec<_>>(), "by": "configuration", "cohort": r.cohort.as_str(), "from": r.from, "to": r.to,
@@ -458,7 +464,7 @@ pub fn run(project: &Path, args: &Args) -> Result<Value> {
         "population": {"cohort": r.cohort.as_str(), "members": units.len(), "allocated": units.len() - unallocated.values().sum::<usize>(), "unallocated": unallocated,
             "exclusions": exclusions, "coverage": body["coverage"], "censored": body.get("censored").cloned().unwrap_or(Value::Null)},
         "configurations": configurations, "results": results, "paired": paired, "notes": notes,
-        "source_watermarks": {"canonical": {"lifecycle_digest": lifecycle::digest(&sources.tasks), "decisions": sources.decisions.len(),
+        "source_watermarks": {"canonical": {"lifecycle_digest": if workspace { String::new() } else { lifecycle::digest(&sources.tasks) }, "decisions": sources.decisions.len(),
             "configurations": sources.configurations.len()}, "sidecar": sidecar.is_some()}}))
 }
 

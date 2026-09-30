@@ -90,6 +90,24 @@ fn quota_line(q: &Value) -> String {
     format!("{} quota at last dispatch ({}): {}", word(&q["service"]), short(word(&q["attempt_id"])), windows.join(" · "))
 }
 
+/// Provenance is separate from the read time: recorded history can be stale
+/// while active attempts and alerts are read now.
+fn history(s: &Value) -> String {
+    let mut revisions: Vec<String> = [("M13", &s["coverage"]), ("M38", &s["services"]["M38"]), ("M39", &s["services"]["M39"]),
+        ("M40", &s["services"]["M40"]), ("M49", &s["replay"]), ("M02 comparison", &s["configurations"])].into_iter().map(|(name, field)| {
+        match (field["as_of"]["seq"].as_i64(), field["as_of"]["unix_ms"].as_i64()) {
+            (Some(seq), Some(at)) => format!("{name}={seq}@{at}"),
+            _ => format!("{name}=unavailable (no_revision_as_of)"),
+        }
+    }).collect();
+    revisions.insert(0, "History as_of (revision@Unix ms):".into());
+    revisions.join(" ")
+}
+
+fn missing_quota(services: &Value) -> String {
+    if services["M40"]["reason"] == "no_revision_as_of" { value(&services["M40"]) } else { "n/a (no_decisions)".into() }
+}
+
 /// The pane body (also `telemetry <slug> workspace show` and `watch`).
 pub fn text(s: &Value) -> String {
     let slug = s["project"].as_str().unwrap_or("?");
@@ -100,6 +118,8 @@ pub fn text(s: &Value) -> String {
     let at = s["query_unix_ms"].as_i64().and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
         .map_or_else(|| "n/a".into(), |t| t.strftime("%Y-%m-%d %H:%M:%S UTC").to_string());
     let _ = writeln!(out, "{slug} · fleet · query {at} · usage coverage {} · advisory, read-only", s["coverage"].as_object().map_or("n/a".into(), |_| value(&s["coverage"])));
+
+    let _ = writeln!(out, "{}", history(s));
 
     let needs = s["needs_you"].as_array().cloned().unwrap_or_default();
     let _ = writeln!(out, "─ NEEDS YOU ({})", needs.len());
@@ -125,7 +145,7 @@ pub fn text(s: &Value) -> String {
     let _ = writeln!(out, "  M38 throttled time share: {}", value(&services["M38"]));
     let _ = writeln!(out, "  M39 provider error rate: {}", value(&services["M39"]));
     let quota = services["quota_at_last_dispatch"].as_array().cloned().unwrap_or_default();
-    if quota.is_empty() { let _ = writeln!(out, "  M40 quota headroom at dispatch: n/a (no_decisions)"); }
+    if quota.is_empty() { let _ = writeln!(out, "  M40 quota headroom at dispatch: {}", missing_quota(services)); }
     for q in &quota { let _ = writeln!(out, "  {}", quota_line(q)); }
 
     let c = &s["configurations"];
@@ -184,6 +204,7 @@ pub fn digest_section(s: &Value) -> String {
         .map_or_else(|| "n/a".into(), |t| t.strftime("%H:%M UTC").to_string());
     lines.push(format!("## Fleet (advisory · as of {at} · {})", super::CONTRACT));
 
+    lines.push(history(s));
     let active = s["active"]["attempts"].as_array().cloned().unwrap_or_default();
     let count = |state: &str| active.iter().filter(|a| a["state"] == state).count();
     let covered = active.iter().filter(|a| a["coverage"] == "complete").count();
@@ -203,7 +224,7 @@ pub fn digest_section(s: &Value) -> String {
     let services = &s["services"];
     let quota: Vec<String> = services["quota_at_last_dispatch"].as_array().into_iter().flatten().map(quota_line).collect();
     lines.push(format!("Services: throttled {}; errors {}; {}", value(&services["M38"]), value(&services["M39"]),
-        if quota.is_empty() { "quota n/a (no_decisions)".to_owned() } else { quota.join("; ") }));
+        if quota.is_empty() { format!("quota {}", missing_quota(services)) } else { quota.join("; ") }));
 
     let c = &s["configurations"];
     if c["status"] == "unavailable" {
@@ -219,24 +240,28 @@ pub fn digest_section(s: &Value) -> String {
                 Some("suppressed") => format!("{} insufficient (n={})", word(&a["label"]), a["tasks"]),
                 _ => format!("{} {} n={}", word(&a["label"]), value(a), a["tasks"]),
             }).collect();
-            if arms.len() > DIGEST_ARMS { parts.push(format!("+{} more", arms.len() - DIGEST_ARMS)); }
+            let arm_count = cell["arm_count"].as_u64().map_or(arms.len(), |n| n as usize);
+            if arm_count > DIGEST_ARMS { parts.push(format!("+{} more", arm_count - DIGEST_ARMS)); }
             lines.push(format!("  {}: {}", word(&cell["task_class"]), parts.join("; ")));
         }
-        if cells.len() > DIGEST_CLASSES { lines.push(format!("  +{} more task classes (`telemetry {} compare --metric M02`)", cells.len() - DIGEST_CLASSES, word(&s["project"]))); }
+        let cell_count = c["cell_count"].as_u64().map_or(cells.len(), |n| n as usize);
+        if cell_count > DIGEST_CLASSES { lines.push(format!("  +{} more task classes (`telemetry {} compare --metric M02`)", cell_count - DIGEST_CLASSES, word(&s["project"]))); }
     }
 
     let pending: Vec<&Value> = s["needs_you"].as_array().into_iter().flatten().filter(|n| n["kind"] == "selection_pending").collect();
     if !pending.is_empty() {
         let mut shown: Vec<String> = pending.iter().take(DIGEST_GROUPS).map(|n| format!("{} task {}", word(&n["group"]), word(&n["task_id"]))).collect();
-        if pending.len() > DIGEST_GROUPS { shown.push(format!("+{} more", pending.len() - DIGEST_GROUPS)); }
+        let count = s["digest_counts"]["pending"].as_u64().map_or(pending.len(), |n| n as usize);
+        if count > DIGEST_GROUPS { shown.push(format!("+{} more", count - DIGEST_GROUPS)); }
         lines.push(format!("Candidate groups awaiting the operator's selection: {}", shown.join("; ")));
     }
     match s["alerts"]["open"].as_array() {
         Some(open) => {
             let alerts: Vec<&Value> = s["needs_you"].as_array().into_iter().flatten().filter(|n| n["kind"] == "alert").collect();
             let mut shown: Vec<String> = alerts.iter().take(DIGEST_ALERTS).map(|a| format!("{} {} [{}] {}", word(&a["state"]), word(&a["rule"]), scope(&a["labels"]), codes(&a["reasons"]))).collect();
-            if alerts.len() > DIGEST_ALERTS { shown.push(format!("+{} more", alerts.len() - DIGEST_ALERTS)); }
-            lines.push(if open.is_empty() { "Health alerts: none open".into() } else { format!("Health alerts ({} open): {}", open.len(), shown.join("; ")) });
+            let count = s["digest_counts"]["alerts"].as_u64().map_or(alerts.len(), |n| n as usize);
+            if count > DIGEST_ALERTS { shown.push(format!("+{} more", count - DIGEST_ALERTS)); }
+            lines.push(if open.is_empty() { "Health alerts: none open".into() } else { format!("Health alerts ({} open): {}", count, shown.join("; ")) });
         }
         None => lines.push(format!("Health alerts: n/a ({})", word(&s["alerts"]["reason"]))),
     }

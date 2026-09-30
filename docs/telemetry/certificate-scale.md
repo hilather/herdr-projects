@@ -515,6 +515,60 @@ Files: `migrations/telemetry/accounting/0012_incremental_sync.sql`;
 `src/telemetry/maintenance/{mod,backup}.rs`;
 `tests/{telemetry_accounting,telemetry_scale}.rs`; this certificate.
 
+### 4.7 P3 / L5 follow-up: workspace history revisions (100k only)
+
+Branch `perf/workspace-snapshot`, 2026-09-30. **Pending the steward's serial
+1M certification.** Same generated on-disk dataset before and after:
+`SCALE_EVENTS=100000 SCALE_ACTIVE=64 SCALE_REPEATS=3 SCALE_PER_ROUND=2`,
+10,000 retained attempts, 99,926 generated events / 53,714,281 rollout bytes.
+Release builds used `cargo test --release --locked --offline -j 3 --features
+state-store --test telemetry_scale --no-run`; phases 0, 1 and 2 before,
+then `analytics refresh` and phase 2 after, with `SCALE_TAG=before|after`.
+No 1M run. No concurrent bench or build during either query phase.
+
+The existing `scale_2_queries` already measures `workspace show`,
+`workspace digest`, in-process pane/digest and `context --peek`, so the
+harness and its correctness oracle needed no change. Each distribution
+below contains six samples (three rounds of two), in milliseconds:
+
+| Surface | Before p50 / p95 / max | After p50 / p95 / max | 100k target |
+| --- | --- | --- | --- |
+| Pane refresh, in process | 6,643.09 / 9,425.82 / 9,425.82 | 63.69 / 96.56 / 96.56 | p95 ≤250 ms: met |
+| Digest section, in process | 5,589.32 / 10,322.62 / 10,322.62 | 63.88 / 94.36 / 94.36 | ≤100 ms: met in all six samples |
+| `workspace show --json`, fresh process | 7,123.33 / 10,402.54 / 10,402.54 | 69.60 / 96.63 / 96.63 | — |
+| `workspace digest`, fresh process | 9,342.27 / 10,792.63 / 10,792.63 | 65.45 / 78.19 / 78.19 | — |
+| `context --peek`, views on | 6,760.44 / 11,352.31 / 11,352.31 | 69.32 / 71.27 / 71.27 | whole command, including digest |
+| `context --peek`, views off | 4.25 / 4.43 / 4.43 | 3.93 / 4.37 / 4.37 | startup/control |
+| `context --peek`, views on again | 9,086.63 / 21,454.52 / 21,454.52 | 68.28 / 77.10 / 77.10 | whole command |
+
+Results files `results-queries-before.json` / `results-queries-after.json`
+record load averages (1 / 5 / 15 minutes) **14.70 / 9.30 / 6.52** before,
+**3.86 / 7.64 / 9.02** after. Their `loadavg_start` and `loadavg_end` are
+identical: this existing query harness samples both at the phase's end,
+so these are end-of-phase host loads, not measured starting loads. Pane
+round-p50 noise was 12.16% before / 23.91% after; digest noise 14.02% /
+27.44%. The shared host and six samples limit certification strength;
+these observations do not replace the steward's 1M run. Digest size changed
+from 13 lines / 1,237 bytes to 14 lines / 1,406 bytes solely by adding the
+history provenance line, within the unchanged 40-line / 4,096-byte caps.
+
+The snapshot builds the rich attempt projection once for open attempts and
+candidate arms, shares it with groups, and derives selected attention once
+using the existing interval algorithm. Historical metric fields come from
+immutable analytics revisions; their compact rendering bodies keep the
+original fields and M40's exact latest-per-service/tie/encounter-order rule.
+Configuration cells are recorded on analytics refresh using the same
+comparison estimators, ordering, pooling, suppression and seed. Optional
+analytics-owned rendering tables leave tracked metric cells, authoritative
+bodies, digests, lineage and stream versions unchanged. Each history section
+adds `as_of` (its own revision and recording time); missing revisions remain
+`unavailable (no_revision_as_of)`, with no live fallback. Digest reads bound
+comparison cells/arms, pending selections and alerts to the printed top-N,
+with exact omitted counts. Refresh also left the dataset's canonical bytes
+unchanged. The E2E suite compares all displayed history values with their
+existing public reads and checks current sections over retained cancellations
+and terminal candidate arms; no new unit or source-text tests were added.
+
 ## 5. Inefficiencies found and fixed
 
 The first measurement (same generator, same host) missed the query and
@@ -535,6 +589,7 @@ stream-version expectations (§9).
 | F7 | `health/rules.rs` `accounting_conflict`, `ledger::open_dispositions` | the rule built the whole ledger as JSON to count two dispositions: 2.17 GB peak RSS at 1M events | a grouped SQL count |
 | F8 | `ticker.rs` `telemetry_pass` | the pass (collect and every lane tick) ran inline in the ticker's pass, so its whole duration delayed every later project's controller poll | its own thread, one project at a time; controller polling never waits for it (the integrity check's pattern); orderly shutdown waits for a running pass up to 60 s |
 | F9 | `main.rs` | with the pass on a thread (F8), SQLite's memory statistics made every allocation of both threads take one process-wide mutex | statistics off in every build of the binary, as the crate's tests already do; nothing reads them |
+| F10 (P3) | `workspace`, attempt/attention reads, analytics rendering projections | whole-history reports and repeated rich projections on every pane/digest read | one targeted shared projection, recorded history with `as_of`, bounded digest reads; 100k results in §4.6, pending steward 1M certification |
 
 F8 preserves graceful shutdown of the whole pass: stop-file and idle exits poll
 the running telemetry thread for up to 60 s (`TELEMETRY_SHUTDOWN_WAIT`), logging
@@ -643,7 +698,12 @@ owner. None is hidden by loosening the target.
   with `[telemetry] views = false`). The digest stays bounded in size (13
   lines). Remedy: a snapshot over open attempts only, one projection shared
   by the three sections, and the recorded analytics revisions for the
-  metrics. Owners: TM4.8, TM1.8, TM4.1.
+  metrics. **P3 implements this remedy at 100k (§4.6): pane p50/p95
+  6,643/9,426 → 63.69/96.56 ms; digest 5,589/10,323 → 63.88/94.36 ms,
+  with recorded 1-minute loads 14.70 before / 3.86 after. Both 100k
+  targets met in this run; pending the steward's 1M certification.**
+  Original 1M measurements above remain the last certified ones.
+  Owners: TM4.8, TM1.8, TM4.1.
 - **L6: sidecar size.** The sidecar is 2.7–3.1 times the rollout bytes it
   reads (1.44 GB for 1M events) and grows without retention in this build.
   Retention and backup belong to TM5.3.
@@ -668,8 +728,10 @@ owner. None is hidden by loosening the target.
 Correctness holds at every scale and under every fault tried: exact totals,
 one acceptance per record, reproducible as-of answers, byte-identical
 rebuilds and no canonical write. Nine inefficiencies were fixed (§5), which
-moved the surfaces from minutes to seconds. The controller-overhead,
-freshness, pane/digest and lane-tick memory targets are still missed; each
+moved the surfaces from minutes to seconds. P3's subsequent 100k follow-up
+(§4.6) meets the pane/digest targets; its 1M certification is pending.
+At the original certified scales, the controller-overhead, freshness,
+pane/digest and lane-tick memory targets were missed; each
 is a reviewed limitation (L1–L5) with a named remedy and owner, and none of
 them is a correctness or authority problem. The native, revision and export
 read paths, the collector's own resources and byte caps, replay integrity
@@ -722,3 +784,26 @@ telemetry_scale`) reported no warning in changed lines; existing library and
 shared-support warnings remain. No expected value in another telemetry suite
 was edited. The ignored fairness phase fails only its documented performance
 criterion; its correctness oracles and the late/slow phase pass.
+
+P3 follow-up verification: all 15 requested telemetry suites were run with
+`--locked --offline -j 3 --features state-store --no-fail-fast` and three
+test threads. After correcting the new fixture's retry limit and hand-counted
+coverage alert, 169 tests pass, seven scale phases remain ignored, and only
+these four existing tests fail because their Unix socket bind returns
+`Operation not permitted` in the hard sandbox (no workaround):
+
+- `telemetry::attempts_show_attention_summary`
+- `telemetry_accounting::attention_intervals_union_and_censor`
+- `telemetry_health::recommendations_and_notices_change_no_canonical_state_and_no_dispatch`
+- `telemetry_workspace::thread_start_records_the_dispatch_reason_and_the_sidebar_suffix`
+
+`scale_gates_hold_under_load` passes unchanged, including its exact totals,
+one acceptance per record, pinned as-of answer, byte-identical rebuild and
+canonical digest. Existing metric suites keep their expected values.
+Workspace fixtures now refresh analytics to record the history used by the
+same golden values; only `as_of` fields and the provenance line are added.
+New CLI/store E2E coverage checks 31 retained cancelled attempts (the public
+32-attempt-per-task limit), exact live waits/needs-you ordering, pinned history
+until refresh, missing revisions, and terminal candidate arms in both pane
+and digest. Clippy reports zero warnings in changed lines (existing unrelated
+warnings remain). Datasets were removed before committing.

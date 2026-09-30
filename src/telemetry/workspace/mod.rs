@@ -72,7 +72,7 @@ fn down(slug: &str, reason: &str, error: &anyhow::Error) -> Value {
 fn metric_fields(result: &Value) -> Value {
     json!({"metric_id": result["metric_id"], "name": result["name"], "definition": result["definition"], "status": result["status"],
         "value": result["value"], "reason": result["reason"], "numerator": result["numerator"], "denominator": result["denominator"],
-        "coverage": result["coverage"]["state"], "lag_ms": result["lag_ms"], "lag_reason": result["lag_reason"]})
+        "coverage": result["coverage"]["state"], "lag_ms": result["lag_ms"], "lag_reason": result["lag_reason"], "as_of": result["as_of"]})
 }
 
 fn result<'a>(out: &'a Value, metric: &str) -> Option<&'a Value> {
@@ -89,15 +89,37 @@ fn labels(project: &Path) -> Result<std::collections::BTreeMap<String, String>> 
     Ok(rows)
 }
 
+/// Copy exactly the comparison fields used by workspace surfaces.
+pub(crate) fn comparison(project: &Path) -> Result<Value> {
+    let compared = compare::workspace(project, &compare::Args { metrics: vec!["M02".into()], by: "configuration".into(), cohort: None, from: None, to: None,
+        horizon_ms: None, task_class: None, seed: None, json: true });
+    Ok(match compared {
+        Ok(report) => {
+            let arm_label = |id: &Value| report["configurations"].as_array().into_iter().flatten().find(|c| &c["configuration_id"] == id).map(|c| c["label"].clone())
+                .unwrap_or(Value::Null);
+            let cells: Vec<Value> = report["results"][0]["cells"].as_array().into_iter().flatten().map(|c| json!({"task_class": c["task_class"],
+                "ranking": c["ranking"]["status"], "arms": c["arms"].as_array().into_iter().flatten().map(|a| json!({"configuration_id": a["configuration_id"],
+                    "label": arm_label(&a["configuration_id"]), "tasks": a["tasks"], "status": a["status"], "value": a["value"], "decimal": a["decimal"],
+                    "interval": a["interval"], "pooled": a["pooled"], "min_sample": a["min_sample"]})).collect::<Vec<_>>()})).collect();
+            json!({"metric": "M02", "definition": report["results"][0]["definition"], "cohort": report["request"]["cohort"],
+                "analysis": report["analysis"]["kind"], "level": report["estimators"]["uncertainty"]["level"], "min_tasks": report["estimators"]["min_sample"]["value"],
+                "unallocated": report["population"]["unallocated"], "cells": cells})
+        }
+        Err(error) => { let mut v = unavailable("comparison_unavailable"); v["error"] = json!(format!("{error:#}").chars().take(200).collect::<String>()); v }
+    })
+}
+
 /// The fleet snapshot of one project (`telemetry-workspace.v1`).
-pub fn snapshot(project: &Path, slug: &str) -> Value {
+pub fn snapshot(project: &Path, slug: &str) -> Value { snapshot_for(project, slug, false) }
+
+fn snapshot_for(project: &Path, slug: &str, digest: bool) -> Value {
     let args = query::Args { metrics: METRICS.iter().map(|m| (*m).to_owned()).collect(), cohort: None, from: None, to: None, as_of: None, as_of_seq: None,
         by: None, horizon_ms: None, drill: None, page_size: query::DEFAULT_PAGE, cursor: None, json: true };
-    let answer = match query::request(&args).and_then(|request| query::run(project, &request)) {
+    let answer = match query::request(&args).and_then(|request| query::recorded(project, &request)) {
         Ok(answer) => answer,
         Err(error) => return down(slug, "query_service_down", &error),
     };
-    let attempts = match super::outcome::attempts(project) {
+    let attempts = match super::outcome::workspace_attempts(project, !digest) {
         Ok(attempts) => attempts,
         Err(error) => return down(slug, "attempt_projection_down", &error),
     };
@@ -107,9 +129,11 @@ pub fn snapshot(project: &Path, slug: &str) -> Value {
 
     // Candidate groups (TM3.8), tagged race#1.. in creation order; a group
     // whose every arm finished is awaiting the owner's selection.
-    let groups = super::quality::run(project, owner::groups_show())
-        .and_then(|text| Ok(serde_json::from_str::<Value>(&text)?));
+    let groups = if digest { super::quality::groups::digest_pending(project) }
+        else { super::quality::groups::show_with_attempts(project, Some(&attempts)) };
+    let pending_count = groups.as_ref().ok().map(|g| g["pending_count"].clone()).unwrap_or(Value::Null);
     let groups: Value = match groups {
+        Ok(out) if digest => out["groups"].clone(),
         Ok(out) => Value::Array(out["groups"].as_array().into_iter().flatten().enumerate().map(|(i, g)| {
             let arms: Vec<Value> = g["arms"].as_array().into_iter().flatten().map(|a| json!({"arm": a["arm"], "configuration_id": a["configuration_id"],
                 "label": label(&a["configuration_id"]), "attempt_id": a["attempt_id"], "outcome": a["outcome"], "role": a["role"]})).collect();
@@ -125,14 +149,12 @@ pub fn snapshot(project: &Path, slug: &str) -> Value {
     // The open (censored) wait of each attempt, from the attention lane read
     // the projection summarizes (`accounting attention`): since when, and how
     // long it was observed so far. Never extrapolated to now.
-    let open_waits: std::collections::BTreeMap<String, (Value, i64)> = super::sidecar::read(project).ok().flatten()
-        .and_then(|db| super::accounting::attention::read(project, &db).ok())
-        .map(|lane| lane["attempts"].as_array().into_iter().flatten().filter_map(|a| {
+    let open_waits: std::collections::BTreeMap<String, (Value, i64)> = attempts["attention_lane"]["attempts"].as_array().into_iter().flatten().filter_map(|a| {
             if a["state"] != "open" { return None; }
             let open = a["attention"]["intervals"].as_array()?.iter().find(|i| i["end"] == "open_at_horizon")?;
             let (opened, last) = (open["opened_unix_ms"].as_i64()?, open["last_observed_unix_ms"].as_i64()?);
             Some((a["attempt_id"].as_str()?.to_owned(), (json!(opened), last - opened)))
-        }).collect()).unwrap_or_default();
+        }).collect();
 
     // Active attempts (TM1.8 projection): every open attempt.
     let active: Vec<Value> = attempts["attempts"].as_array().into_iter().flatten().filter(|a| a["terminal_state"] == "open").map(|a| {
@@ -166,26 +188,17 @@ pub fn snapshot(project: &Path, slug: &str) -> Value {
         "M40": m40.map(metric_fields), "quota_at_last_dispatch": quota});
 
     // Configuration comparison (TM4.4): M02 per task class, suppression and intervals as computed there.
-    let compared = compare::run(project, &compare::Args { metrics: vec!["M02".into()], by: "configuration".into(), cohort: None, from: None, to: None,
-        horizon_ms: None, task_class: None, seed: None, json: true });
-    let configurations = match compared {
-        Ok(report) => {
-            let arm_label = |id: &Value| report["configurations"].as_array().into_iter().flatten().find(|c| &c["configuration_id"] == id).map(|c| c["label"].clone())
-                .unwrap_or(Value::Null);
-            let cells: Vec<Value> = report["results"][0]["cells"].as_array().into_iter().flatten().map(|c| json!({"task_class": c["task_class"],
-                "ranking": c["ranking"]["status"], "arms": c["arms"].as_array().into_iter().flatten().map(|a| json!({"configuration_id": a["configuration_id"],
-                    "label": arm_label(&a["configuration_id"]), "tasks": a["tasks"], "status": a["status"], "value": a["value"], "decimal": a["decimal"],
-                    "interval": a["interval"], "pooled": a["pooled"], "min_sample": a["min_sample"]})).collect::<Vec<_>>()})).collect();
-            json!({"metric": "M02", "definition": report["results"][0]["definition"], "cohort": report["request"]["cohort"],
-                "analysis": report["analysis"]["kind"], "level": report["estimators"]["uncertainty"]["level"], "min_tasks": report["estimators"]["min_sample"]["value"],
-                "unallocated": report["population"]["unallocated"], "cells": cells})
-        }
-        Err(error) => { let mut v = unavailable("comparison_unavailable"); v["error"] = json!(format!("{error:#}").chars().take(200).collect::<String>()); v }
+    let configurations = match super::analytics::store::workspace_comparison(project, digest) {
+        Ok(Some(report)) => report,
+        Ok(None) => unavailable("no_revision_as_of"),
+        Err(_) => unavailable("comparison_unavailable"),
     };
 
     // TM4.5 health alerts as recorded (`telemetry <slug> health alerts`): the
     // inbox notices are that lane's own `health notify`.
-    let alerts = match super::health::store::alerts(project, None) {
+    let alert_read = if digest { super::health::store::digest_alerts(project) } else { super::health::store::alerts(project, None) };
+    let open_count = alert_read.as_ref().ok().map(|a| a["open_count"].clone()).unwrap_or(Value::Null);
+    let alerts = match alert_read {
         Ok(out) if out["status"] == "unavailable" => out,
         Ok(out) => json!({"status": "available", "last_evaluated_unix_ms": out["last_evaluated_unix_ms"],
             "open": out["open"].as_array().into_iter().flatten().map(|a| json!({"alert_id": a["alert_id"], "rule": a["rule"], "labels": a["labels"],
@@ -206,19 +219,21 @@ pub fn snapshot(project: &Path, slug: &str) -> Value {
     needs.extend(groups.as_array().into_iter().flatten().filter(|g| g["awaiting_selection"] == true)
         .map(|g| json!({"kind": "selection_pending", "group": g["tag"], "group_id": g["group_id"], "task_id": g["task_id"]})));
 
-    json!({"schema_version": SCHEMA_VERSION, "contract": CONTRACT, "project": slug, "status": "available",
+    let mut out = json!({"schema_version": SCHEMA_VERSION, "contract": CONTRACT, "project": slug, "status": "available",
         "query_unix_ms": answer["query_unix_ms"], "advisory": {"authority": "none", "writes": "none"},
         "coverage": result(&answer, "M13").map(metric_fields),
         "needs_you": needs, "active": {"count": active.len(), "attempts": active}, "services": services,
         "configurations": configurations, "candidate_groups": groups,
-        "replay": result(&answer, "M49").map(metric_fields), "alerts": alerts})
+        "replay": result(&answer, "M49").map(metric_fields), "alerts": alerts});
+    if digest { out["digest_counts"] = json!({"pending": pending_count, "alerts": open_count}); }
+    out
 }
 
 /// `telemetry <slug> workspace ...`: the switch, the project's own scope, one read.
 pub fn run(root: &Path, slug: &str, config_dir: &Path, command: &Command) -> Result<String> {
     if !super::views::enabled(config_dir)? { anyhow::bail!("{}", super::views::disabled_message(config_dir)); }
     let scope = super::views::scope(root, slug)?;
-    let snapshot = snapshot(&scope.dir, slug);
+    let snapshot = snapshot_for(&scope.dir, slug, matches!(command, Command::Digest));
     Ok(match command {
         Command::Show { json: true } => serde_json::to_string_pretty(&snapshot)? + "\n",
         Command::Show { json: false } => text(&snapshot),
@@ -231,7 +246,7 @@ pub fn run(root: &Path, slug: &str, config_dir: &Path, command: &Command) -> Res
 pub fn context_section(project: &Path, slug: &str, config_dir: &Path) -> Option<String> {
     if !project.join(".state/state.db").is_file() || !super::views::enabled(config_dir).unwrap_or(false) { return None; }
     let scope = super::views::scope(project.parent()?, slug).ok()?;
-    Some(digest_section(&snapshot(&scope.dir, slug)))
+    Some(digest_section(&snapshot_for(&scope.dir, slug, true)))
 }
 
 /// `telemetry <slug> watch`: render, sleep, repeat. On a terminal each render

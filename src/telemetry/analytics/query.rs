@@ -378,6 +378,49 @@ fn envelope(cell: &Cell, core: Value, projection: Value, watermarks: &Value, obs
     out
 }
 
+/// Latest recorded metric bodies for operator surfaces. No live sources or
+/// lineage are loaded. Missing revisions remain unavailable.
+pub(crate) fn recorded(project: &Path, request: &Request) -> Result<Value> {
+    let now = jiff::Timestamp::now().as_millisecond();
+    let sidecar = crate::telemetry::sidecar::read(project)?;
+    let mut results = Vec::new();
+    for cell in &request.cells {
+        let stored = sidecar.as_deref().map(|db| -> Result<Option<Stored>> {
+            if !analytics_tables(db)? { return Ok(None); }
+            let compact: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='analytics_workspace_metrics')", [], |r| r.get(0))?;
+            if compact {
+                return Ok(db.query_row("SELECT r.revision,r.kind,r.supersedes,coalesce(w.body,r.body),r.content_digest,r.watermarks,r.recorded_unix_ms
+                    FROM analytics_revisions r LEFT JOIN analytics_workspace_metrics w ON w.revision=r.revision
+                    WHERE r.cell=?1 ORDER BY r.revision DESC LIMIT 1", [cell.key()], stored_row).optional()?);
+            }
+            if cell.metric.id != "M40" { return latest(db, &cell.key()); }
+            // Extract top-per-service in SQLite before decoding the large M40
+            // body. Ties and service order match first encounter in the source.
+            Ok(db.query_row("WITH latest AS (SELECT * FROM analytics_revisions WHERE cell=?1 ORDER BY revision DESC LIMIT 1),
+                decisions AS (SELECT j.value, CAST(j.key AS INTEGER) AS ordinal,
+                    min(CAST(j.key AS INTEGER)) OVER (PARTITION BY json_extract(j.value,'$.service')) AS first_ordinal,
+                    row_number() OVER (PARTITION BY json_extract(j.value,'$.service') ORDER BY json_extract(j.value,'$.decided_unix_ms') DESC, CAST(j.key AS INTEGER)) AS rank
+                    FROM latest, json_each(latest.body,'$.detail.decisions') j)
+                SELECT revision,kind,supersedes,
+                    CASE WHEN json_type(body,'$.detail')='object' THEN json_set(body,'$.detail.decisions',
+                        json(coalesce((SELECT json_group_array(json(value)) FROM (SELECT value FROM decisions WHERE rank=1 ORDER BY first_ordinal)), '[]')))
+                        ELSE body END,
+                    content_digest,watermarks,recorded_unix_ms FROM latest", [cell.key()], stored_row).optional()?)
+        }).transpose()?.flatten();
+        let out = match stored {
+            Some(stored) => {
+                let mut out = envelope(cell, stored.body, json!({"mode": "revision", "revision": stored.revision}), &stored.watermarks, stored.recorded);
+                out["as_of"] = json!({"seq": stored.revision, "unix_ms": stored.recorded});
+                out
+            }
+            None => envelope(cell, unavailable_core("no_revision_as_of", Value::Null), json!({"mode": "revision", "revision": null}),
+                &json!({"canonical": null, "sidecar": null}), now),
+        };
+        results.push(out);
+    }
+    Ok(json!({"query_unix_ms": now, "results": results}))
+}
+
 /// Cursor kind of drill-down pages (`export::cursor`): keyed MAC, project
 /// scope and expiry; the position binds `{request, snapshot, revision, bucket, next}`.
 const CURSOR_KIND: &str = "analytics-drill";

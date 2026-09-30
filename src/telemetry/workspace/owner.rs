@@ -19,11 +19,6 @@ struct Quality { #[command(subcommand)] command: super::super::quality::Command 
 #[command(no_binary_name = true)]
 struct Replay { #[command(subcommand)] command: crate::replay::Command }
 
-/// `quality groups show`, read-only (the snapshot's candidate groups).
-pub(super) fn groups_show() -> super::super::quality::Command {
-    Quality::try_parse_from(["groups", "show"]).expect("static arguments").command
-}
-
 /// An owner command a popup may run, as its CLI arguments after `telemetry <slug>` (quality) or `replay <slug>`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Owner {

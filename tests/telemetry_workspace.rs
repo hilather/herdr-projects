@@ -159,6 +159,7 @@ fn live_fleet(f: &Fixture) -> (String, String) {
     for i in 0..3 { terminal_task(&db, &format!("cb{i}"), false, "code", &b, 2_000 + 10 * i); }
     // TM4.5 records its alerts: the open 6-minute wait is at least 5 minutes → `waiting_on_you` warn.
     f.cli_args(&["health", "evaluate", "--json"]);
+    f.cli_args(&["analytics", "refresh"]);
     (a, b)
 }
 
@@ -179,6 +180,8 @@ fn every_surface_shows_the_same_values_as_the_query_service() {
         let r = result(id);
         for key in ["definition", "status", "value", "reason", "numerator", "denominator", "lag_reason"] { assert_eq!(field[key], r[key], "{id} {key}"); }
         assert_eq!(field["coverage"], r["coverage"]["state"], "{id}");
+        assert!(field["as_of"]["seq"].as_i64().unwrap() > 0);
+        assert!(field["as_of"]["unix_ms"].as_i64().unwrap() > 0);
     }
     let quota = &snap["services"]["quota_at_last_dispatch"][0];
     assert_eq!(quota, &result("M40")["detail"]["decisions"][0]);
@@ -284,6 +287,97 @@ fn every_surface_shows_the_same_values_as_the_query_service() {
     assert!(digest.len() <= 4096 && digest.lines().count() <= 40);
 }
 
+/// Retained cancelled attempts are created through the public store/admission
+/// workflow. The CLI snapshot must still contain only the one live attempt,
+/// its hand-computed open wait, and the recorded history revision.
+#[test]
+fn retained_terminal_attempts_do_not_change_live_sections_or_recorded_history() {
+    let mut f = Fixture::new();
+    {
+        let mut store = SqliteStore::open(&f.project.join(".state/state.db")).unwrap();
+        let snapshot = store.read_snapshot(None).unwrap();
+        store.set_scheduler_policy(snapshot.head, snapshot.scheduler.unwrap().policy.revision, 1, 32).unwrap();
+    }
+    for _ in 0..31 { f.readmit("codex"); }
+    let db = state_db(&f);
+    assert_eq!(db.query_row("SELECT count(*) FROM attempts WHERE state='cancelled'", [], |r| r.get::<_, i64>(0)).unwrap(), 31);
+    (f.attempt, f.decided) = db.query_row("SELECT attempt_id,decided_unix_ms FROM dispatch_decisions WHERE attempt_id=(SELECT id FROM attempts WHERE state='reserved')", [],
+        |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    drop(db);
+    f.bind();
+    live_fleet(&f);
+    let snap = f.cli_args(&["workspace", "show", "--json"]).0;
+    assert_eq!(snap["active"]["count"], 1);
+    let active = &snap["active"]["attempts"][0];
+    assert_eq!((&active["attempt_id"], &active["task_id"], &active["state"]), (&json!(f.attempt), &json!("work"), &json!("running")));
+    assert_eq!(active["waiting"], json!({"waiting_ms": 0, "open": true, "open_since_unix_ms": f.decided - 370_000, "open_observed_ms": 360_000}));
+    let needs = snap["needs_you"].as_array().unwrap();
+    // Retained attempts without usage also raise the recorded critical
+    // coverage-loss alert; it precedes the warning and the live wait.
+    assert_eq!(needs.len(), 3, "{needs:?}");
+    assert_eq!(needs[0], json!({"kind": "alert", "alert_id": 1, "rule": "usage_coverage", "state": "critical",
+        "labels": {"family": "consumption", "project": "demo", "rule": "usage_coverage", "service": "codex"}, "reasons": ["coverage_loss"]}));
+    assert_eq!((&needs[1]["kind"], &needs[1]["rule"], &needs[1]["state"]), (&json!("alert"), &json!("waiting_on_you"), &json!("warn")));
+    assert_eq!(needs[2], json!({"kind": "waiting_on_you", "attempt_id": f.attempt, "task_id": "work", "since_unix_ms": f.decided - 370_000, "observed_ms": 360_000}));
+    let revisions = f.cli_args(&["analytics", "revisions", "--metric", "M40"]).0;
+    let revision = revisions["revisions"].as_array().unwrap().last().unwrap();
+    assert_eq!(snap["services"]["M40"]["as_of"], json!({"seq": revision["revision"], "unix_ms": revision["recorded_unix_ms"]}));
+    let seq = revision["revision"].to_string();
+    let stored = f.cli_args(&["query", "--metric", "M40", "--as-of-seq", &seq, "--json"]).0;
+    assert_eq!(snap["services"]["M40"]["value"], stored["results"][0]["value"]);
+    // Changing history does not silently restate the recorded pane values.
+    let db = state_db(&f);
+    let config = configuration(&db, "later", "3.0");
+    terminal_task(&db, "later-terminal", false, "tests", &config, 3_000);
+    drop(db);
+    let later = f.cli_args(&["workspace", "show", "--json"]).0;
+    assert_eq!(later["configurations"], snap["configurations"]);
+    assert_eq!(later["services"], snap["services"]);
+    assert_eq!(later["needs_you"], snap["needs_you"]);
+    f.cli_args(&["analytics", "refresh"]);
+    let refreshed = f.cli_args(&["workspace", "show", "--json"]).0;
+    assert!(refreshed["configurations"]["as_of"]["seq"].as_i64() > snap["configurations"]["as_of"]["seq"].as_i64());
+    assert_eq!(refreshed["active"]["count"], 1);
+}
+
+/// Both bound candidate arms have finished without a submission. Their
+/// terminal records remain in the shared projection, and both digest paths
+/// show the same pending owner selection.
+#[test]
+fn terminal_candidate_arms_remain_visible_in_pane_and_bounded_digest() {
+    let f = Fixture::new();
+    fast_profile(&f);
+    f.cli_args(&["quality", "groups", "create", "work", "--arm", "codex", "--arm", "fast"]);
+    f.readmit("codex");
+    f.readmit("fast");
+    f.cancel_reserved();
+    f.cli("collect");
+    f.cli_args(&["analytics", "refresh"]);
+    let snap = f.cli_args(&["workspace", "show", "--json"]).0;
+    assert_eq!(snap["active"]["count"], 0);
+    let group = &snap["candidate_groups"][0];
+    assert_eq!(group["awaiting_selection"], true);
+    assert_eq!(group["arms"].as_array().unwrap().iter().map(|a| a["outcome"].as_str().unwrap()).collect::<Vec<_>>(), ["failure_no_candidate", "failure_no_candidate"]);
+    assert_eq!(snap["needs_you"], json!([{"kind": "selection_pending", "group": "race#1", "group_id": group["group_id"], "task_id": "work"}]));
+    let digest = f.text(&["workspace", "digest"]);
+    assert!(digest.lines().any(|l| l == "Candidate groups awaiting the operator's selection: race#1 task work"));
+    fs::write(f.project.join("PROJECT.md"), "# demo\n").unwrap();
+    let context = ok(run(&f.tmp.path().join("home"), &f.root, &["context", "demo", "--peek"], &[], ""));
+    assert_eq!(context[context.find("## Fleet (advisory").unwrap()..].lines().skip(1).collect::<Vec<_>>(), digest.lines().skip(1).collect::<Vec<_>>());
+}
+
+#[test]
+fn missing_history_revision_is_unavailable_without_a_live_fallback() {
+    let f = Fixture::new();
+    f.cli("collect");
+    let snap = f.cli_args(&["workspace", "show", "--json"]).0;
+    assert_eq!(snap["active"]["count"], 1);
+    for metric in [&snap["coverage"], &snap["services"]["M40"], &snap["replay"]] {
+        assert_eq!((&metric["status"], &metric["reason"], &metric["as_of"]), (&json!("unavailable"), &json!("no_revision_as_of"), &Value::Null));
+    }
+    assert_eq!(snap["configurations"]["reason"], "no_revision_as_of");
+}
+
 // ---------------------------------------------------------------------------
 // Degrading to unavailable
 
@@ -367,6 +461,7 @@ fn the_digest_section_stays_bounded_with_many_projects_attempts_and_alerts() {
         }
         db.execute_batch("COMMIT").unwrap();
         ok(run(&home, &root, &["telemetry", slug, "collect"], &[], ""));
+        ok(run(&home, &root, &["telemetry", slug, "analytics", "refresh"], &[], ""));
         let sidecar = rusqlite::Connection::open(project.join(".state/telemetry.db")).unwrap();
         sidecar.execute_batch(include_str!("../migrations/telemetry/health/0001_health_alerts.sql")).unwrap();
         for i in 0..200 {

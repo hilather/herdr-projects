@@ -137,7 +137,9 @@ type GroupRow = (String, String, Option<i64>, i64, Option<Value>, Vec<ArmRow>);
 
 /// `{"groups": [...]}` in creation order. Each arm carries its attempt's
 /// outcome and usage exactly as `telemetry attempts` reports them.
-fn show(project: &Path) -> Result<Value> {
+fn show(project: &Path) -> Result<Value> { show_with_attempts(project, None) }
+
+pub(crate) fn show_with_attempts(project: &Path, shared: Option<&Value>) -> Result<Value> {
     let rows: Vec<GroupRow> = {
         let db = super::super::read_only(&project.join(".state/state.db"))?;
         crate::store::check_schema(&db)?;
@@ -157,8 +159,11 @@ fn show(project: &Path) -> Result<Value> {
         }
         rows
     };
-    let attempts = crate::telemetry::outcome::attempts(project)?;
-    let outcome = |attempt: &str| attempts["attempts"].as_array().into_iter().flatten().find(|a| a["attempt_id"] == attempt).cloned();
+    let owned;
+    let attempts = match shared { Some(attempts) => attempts, None => { owned = crate::telemetry::outcome::attempts(project)?; &owned } };
+    let by_id: std::collections::BTreeMap<&str, &Value> = attempts["attempts"].as_array().into_iter().flatten()
+        .filter_map(|a| Some((a["attempt_id"].as_str()?, a))).collect();
+    let outcome = |attempt: &str| by_id.get(attempt).copied().cloned();
     let mut groups = Vec::with_capacity(rows.len());
     for (group, task, revision, sealed, selection, arms) in rows {
         let winner = selection.as_ref().and_then(|s| s["arm"].as_i64());
@@ -196,6 +201,27 @@ fn show(project: &Path) -> Result<Value> {
             "integration_hold": {"enforced": true, "integrated_without_selection": premature}}));
     }
     Ok(json!({"groups": groups}))
+}
+
+/// Digest needs only the first five pending selections and their count.
+/// Outcomes use the same first-submission/terminal rules as `show`.
+pub(crate) fn digest_pending(project: &Path) -> Result<Value> {
+    let db = crate::telemetry::read_only(&project.join(".state/state.db"))?;
+    if !exists(&db, "candidate_groups")? { return Ok(json!({"groups": [], "pending_count": 0})); }
+    let rows: Vec<Value> = db.prepare("WITH tagged AS (
+        SELECT g.group_id,g.task_id,row_number() OVER (ORDER BY g.created_unix_ms,g.rowid) AS tag
+        FROM candidate_groups g WHERE g.sealed_unix_ms IS NOT NULL), pending AS (
+        SELECT * FROM tagged g WHERE NOT EXISTS(SELECT 1 FROM candidate_selections s WHERE s.group_id=g.group_id)
+        AND NOT EXISTS(SELECT 1 FROM candidate_group_arms arm
+            LEFT JOIN candidate_arm_attempts b ON b.group_id=arm.group_id AND b.arm=arm.arm
+            LEFT JOIN attempts a ON a.id=b.attempt_id LEFT JOIN attempt_inputs i ON i.attempt_id=a.id
+            WHERE arm.group_id=g.group_id AND (i.attempt_id IS NULL OR
+                (a.state NOT IN ('completed','failed','cancelled','lost') AND NOT EXISTS(SELECT 1 FROM result_submissions r WHERE r.attempt_id=a.id)))))
+        SELECT group_id,task_id,tag,count(*) OVER () FROM pending ORDER BY tag LIMIT 5")?
+        .query_map([], |r| Ok(json!({"group_id": r.get::<_, String>(0)?, "task_id": r.get::<_, String>(1)?,
+            "tag": format!("race#{}", r.get::<_, i64>(2)?), "awaiting_selection": true, "pending_count": r.get::<_, i64>(3)?})))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(json!({"pending_count": rows.first().map_or(0, |r| r["pending_count"].as_i64().unwrap_or(0)), "groups": rows}))
 }
 
 /// Same key as the store's judge selection (`candidate_presentation.v1`).

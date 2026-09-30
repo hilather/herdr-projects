@@ -54,6 +54,17 @@ pub fn alerts(project: &Path, since: Option<i64>) -> Result<Value> {
     Ok(json!({"open": open, "recent": recent, "since_unix_ms": since, "last_evaluated_unix_ms": last}))
 }
 
+/// Top digest alerts, in exactly the needs-you priority order, plus count.
+pub(crate) fn digest_alerts(project: &Path) -> Result<Value> {
+    let Some(db) = crate::telemetry::sidecar::read(project)? else { return Ok(unavailable("collection_not_run")); };
+    if !tables(&db)? { return Ok(json!({"open": [], "open_count": 0})); }
+    let count: i64 = db.query_row("SELECT count(*) FROM health_alerts WHERE resolved_unix_ms IS NULL", [], |r| r.get(0))?;
+    let open: Vec<Value> = db.prepare(&format!("SELECT {ALERT_COLUMNS} FROM health_alerts WHERE resolved_unix_ms IS NULL
+        ORDER BY CASE state WHEN 'critical' THEN 0 WHEN 'warn' THEN 1 ELSE 2 END,alert_id LIMIT 5"))?
+        .query_map([], alert_json)?.collect::<rusqlite::Result<_>>()?;
+    Ok(json!({"open": open, "open_count": count}))
+}
+
 fn summary(outcomes: &[Outcome]) -> Value {
     let mut counts = BTreeMap::from([("ok", 0), ("warn", 0), ("critical", 0), ("unknown", 0)]);
     for o in outcomes { *counts.entry(o.state.as_str()).or_default() += 1; }

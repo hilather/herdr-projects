@@ -15,14 +15,30 @@ fn status(status: &str, reason: &str) -> Value {
 /// `{"attempts": [...]}` in reservation order.
 /// Opened strictly read-only (contracts §0 "Reads"), in one read transaction.
 pub fn attempts(project: &Path) -> anyhow::Result<Value> {
+    project_attempts(project, None)
+}
+
+/// The workspace needs open attempts and candidate arms, in the full
+/// projection's reservation order. Terminal non-arm records cannot appear.
+pub(crate) fn workspace_attempts(project: &Path, include_arms: bool) -> anyhow::Result<Value> {
+    let db = super::read_only(&project.join(".state/state.db"))?;
+    let groups: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='candidate_arm_attempts')", [], |r| r.get(0))?;
+    let arms = if groups && include_arms { " OR a.id IN (SELECT attempt_id FROM candidate_arm_attempts)" } else { "" };
+    let ids: std::collections::BTreeSet<String> = db.prepare(&format!("SELECT a.id FROM attempts a WHERE a.state NOT IN ('completed','failed','cancelled','lost'){arms}"))?
+        .query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    project_attempts(project, Some(&ids))
+}
+
+fn project_attempts(project: &Path, selected: Option<&std::collections::BTreeSet<String>>) -> anyhow::Result<Value> {
     let store = super::read_only(&project.join(".state/state.db"))?;
     crate::store::check_schema(&store)?;
     let home = std::env::var("HOME").ok();
     let records = {
         let db = store.unchecked_transaction()?;
         let version: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        let rows = db.prepare("SELECT i.attempt_id,a.task_id,a.state,json_extract(i.payload,'$.inputs.effective_profile.kind') FROM attempt_inputs i JOIN attempts a ON a.id=i.attempt_id ORDER BY i.rowid")?
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?)))?
+        let filter = if selected.is_some() { " WHERE i.attempt_id IN (SELECT value FROM json_each(?1))" } else { " WHERE ?1 IS NULL" };
+        let rows = db.prepare(&format!("SELECT i.attempt_id,a.task_id,a.state,json_extract(i.payload,'$.inputs.effective_profile.kind') FROM attempt_inputs i JOIN attempts a ON a.id=i.attempt_id{filter} ORDER BY i.rowid"))?
+            .query_map([selected.map(serde_json::to_string).transpose()?], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows.into_iter().map(|(attempt, task, state, kind)| record(&db, version, &attempt, &task, &state, kind.as_deref(), home.as_deref())).collect::<rusqlite::Result<Vec<_>>>()?
     };
@@ -32,7 +48,12 @@ pub fn attempts(project: &Path) -> anyhow::Result<Value> {
         for record in records.iter_mut().filter(|r| r["usage"]["reason"] == "collection_not_run") {
             record["usage"] = super::sidecar::attempt_usage(&sidecar, record["attempt_id"].as_str().unwrap_or_default())?;
         }
-        attention(project, &sidecar, &mut records)?;
+        let lane = match selected {
+            Some(ids) => super::accounting::attention::read_selected(project, &sidecar, ids)?,
+            None => super::accounting::attention::read(project, &sidecar)?,
+        };
+        attention(&lane, &mut records)?;
+        if selected.is_some() { return Ok(json!({"attempts": records, "attention_lane": lane})); }
     }
     Ok(json!({"attempts": records}))
 }
@@ -41,12 +62,11 @@ pub fn attempts(project: &Path) -> anyhow::Result<Value> {
 /// attempt's summary of `accounting attention` (contracts-accounting §6), or
 /// `not_observed`; an attempt without a launch receipt is `not_launched`.
 /// Before any sample every record keeps `attention_not_collected`.
-fn attention(project: &Path, sidecar: &Connection, records: &mut [Value]) -> anyhow::Result<()> {
-    let report = super::accounting::attention::read(project, sidecar)?;
+fn attention(report: &Value, records: &mut [Value]) -> anyhow::Result<()> {
     // Each attempt carries its own certification (live for Codex, fixture for other kinds).
     let launched: BTreeMap<&str, (&Value, &Value)> = report["attempts"].as_array().into_iter().flatten()
         .filter_map(|a| Some((a["attempt_id"].as_str()?, (&a["attention"], &a["certified"])))).collect();
-    if launched.is_empty() { return Ok(()); }
+    if launched.is_empty() && report["has_launches"] != true { return Ok(()); }
     let signal = &report["signal"];
     for record in records.iter_mut() {
         let Some(&(a, certified)) = record["attempt_id"].as_str().and_then(|id| launched.get(id)) else {

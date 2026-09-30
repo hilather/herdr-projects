@@ -57,7 +57,27 @@ fn cells(project: &Path, extra: Option<Cell>) -> Result<Option<Vec<Cell>>> {
 /// Append a revision for each changed cell, in one immediate transaction.
 fn append(project: &Path, evaluated: &[Evaluated], watermarks: &Value, now: i64) -> Result<Value> {
     let Some(mut db) = crate::telemetry::sidecar::open(project, false)? else { return Ok(unavailable("collection_not_run")) };
+    // Comparison is supplemental presentation evidence, not a metric cell:
+    // recording it must not change tracked cells, metric digests or lineage.
+    let comparison = crate::telemetry::workspace::comparison(project)?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS analytics_workspace_comparisons (
+        revision INTEGER PRIMARY KEY CHECK(revision > 0), body TEXT NOT NULL CHECK(json_valid(body)), recorded_unix_ms INTEGER NOT NULL) STRICT;
+        CREATE TRIGGER IF NOT EXISTS analytics_workspace_comparisons_no_update BEFORE UPDATE ON analytics_workspace_comparisons
+        BEGIN SELECT RAISE(ABORT, 'workspace revision is immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS analytics_workspace_comparisons_no_delete BEFORE DELETE ON analytics_workspace_comparisons
+        BEGIN SELECT RAISE(ABORT, 'workspace revision is immutable'); END;
+        CREATE TABLE IF NOT EXISTS analytics_workspace_metrics (
+            revision INTEGER PRIMARY KEY REFERENCES analytics_revisions(revision), body TEXT NOT NULL CHECK(json_valid(body))) STRICT;
+        CREATE TRIGGER IF NOT EXISTS analytics_workspace_metrics_no_update BEFORE UPDATE ON analytics_workspace_metrics
+        BEGIN SELECT RAISE(ABORT, 'workspace metric is immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS analytics_workspace_metrics_no_delete BEFORE DELETE ON analytics_workspace_metrics
+        BEGIN SELECT RAISE(ABORT, 'workspace metric is immutable'); END;")?;
+    let body = serde_json::to_string(&comparison)?;
+    let previous: Option<String> = tx.query_row("SELECT body FROM analytics_workspace_comparisons ORDER BY revision DESC LIMIT 1", [], |r| r.get(0)).optional()?;
+    if previous.as_deref() != Some(body.as_str()) {
+        tx.execute("INSERT INTO analytics_workspace_comparisons(body,recorded_unix_ms) VALUES(?1,?2)", rusqlite::params![body, now])?;
+    }
     let (mut appended, mut unchanged) = (Vec::new(), 0);
     for e in evaluated {
         tx.execute("INSERT OR IGNORE INTO analytics_cells(cell,metric,definition,cohort,window_from_unix_ms,window_to_unix_ms,horizon_ms,dimension,tracked_unix_ms)
@@ -67,6 +87,7 @@ fn append(project: &Path, evaluated: &[Evaluated], watermarks: &Value, now: i64)
             |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
         if latest.as_ref().is_some_and(|(_, digest)| *digest == e.digest) {
             tx.execute("UPDATE analytics_cells SET checked_unix_ms=?2 WHERE cell=?1", rusqlite::params![e.key, now])?;
+            workspace_metric(&tx, e, latest.as_ref().unwrap().0)?;
             unchanged += 1;
             continue;
         }
@@ -75,6 +96,7 @@ fn append(project: &Path, evaluated: &[Evaluated], watermarks: &Value, now: i64)
         tx.execute("INSERT INTO analytics_revisions(cell,kind,supersedes,body,content_digest,watermarks,registry,recorded_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
             rusqlite::params![e.key, kind, supersedes, serde_json::to_string(&e.core)?, e.digest, serde_json::to_string(watermarks)?, registry::VERSION, now])?;
         let revision = tx.last_insert_rowid();
+        workspace_metric(&tx, e, revision)?;
         let mut insert = tx.prepare("INSERT INTO analytics_lineage(revision,bucket,ordinal,entity_kind,entity_id,attrs) VALUES(?1,?2,?3,?4,?5,?6)")?;
         for (bucket, rows) in &e.lineage {
             for (ordinal, (kind, id, attrs)) in rows.iter().enumerate() {
@@ -87,6 +109,29 @@ fn append(project: &Path, evaluated: &[Evaluated], watermarks: &Value, now: i64)
     }
     tx.commit()?;
     Ok(json!({"appended": appended, "unchanged": unchanged, "cells": evaluated.len(), "recorded_unix_ms": now}))
+}
+
+/// A bounded, disposable rendering projection of an immutable metric body.
+/// The authoritative analytics body, digest and lineage remain untouched.
+fn workspace_metric(db: &Connection, e: &Evaluated, revision: i64) -> Result<()> {
+    if !crate::telemetry::workspace::METRICS.contains(&e.cell.metric.id) { return Ok(()); }
+    let mut body = match e.core.as_object() {
+        Some(core) => Value::Object(core.iter().filter(|(key, _)| key.as_str() != "detail").map(|(key, value)| (key.clone(), value.clone())).collect()),
+        None => e.core.clone(),
+    };
+    if e.cell.metric.id == "M40" {
+        let mut quota: Vec<Value> = Vec::new();
+        for decision in e.core["detail"]["decisions"].as_array().into_iter().flatten() {
+            match quota.iter_mut().find(|q| q["service"] == decision["service"]) {
+                Some(q) if q["decided_unix_ms"].as_i64() >= decision["decided_unix_ms"].as_i64() => {},
+                Some(q) => *q = decision.clone(),
+                None => quota.push(decision.clone()),
+            }
+        }
+        body["detail"] = json!({"decisions": quota});
+    }
+    db.execute("INSERT OR IGNORE INTO analytics_workspace_metrics(revision,body) VALUES(?1,?2)", rusqlite::params![revision, serde_json::to_string(&body)?])?;
+    Ok(())
 }
 
 /// `telemetry <slug> analytics refresh`: writes only the sidecar's analytics tables.
@@ -133,6 +178,29 @@ pub fn rebuild(project: &Path, verify: bool) -> Result<Value> {
     let identical = report.iter().all(|r| r["identical"] == true);
     let appended = if verify || identical { json!([]) } else { append(project, &evaluated, &watermarks, jiff::Timestamp::now().as_millisecond())?["appended"].clone() };
     Ok(json!({"verify": verify, "identical": identical, "cells": report, "appended": appended}))
+}
+
+/// Recorded comparison for the pane. Old sidecars need an analytics refresh;
+/// a read never creates tables or falls back to a whole-history computation.
+pub(crate) fn workspace_comparison(project: &Path, digest: bool) -> Result<Option<Value>> {
+    let Some(db) = crate::telemetry::sidecar::read(project)? else { return Ok(None); };
+    let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='analytics_workspace_comparisons')", [], |r| r.get(0))?;
+    if !exists { return Ok(None); }
+    let sql = if digest {
+        "WITH latest AS (SELECT * FROM analytics_workspace_comparisons ORDER BY revision DESC LIMIT 1)
+        SELECT revision, CASE WHEN json_type(body,'$.cells')='array' THEN json_set(body,
+            '$.cell_count',json_array_length(body,'$.cells'), '$.cells',json(coalesce((SELECT json_group_array(json(value)) FROM (
+                SELECT json_set(c.value,'$.arm_count',json_array_length(c.value,'$.arms'),'$.arms',json(coalesce((
+                    SELECT json_group_array(json(value)) FROM (SELECT value FROM json_each(c.value,'$.arms') LIMIT 4)), '[]'))) AS value
+                FROM json_each(latest.body,'$.cells') c LIMIT 4)), '[]'))) ELSE body END, recorded_unix_ms FROM latest"
+    } else { "SELECT revision,body,recorded_unix_ms FROM analytics_workspace_comparisons ORDER BY revision DESC LIMIT 1" };
+    let row: Option<(i64, String, i64)> = db.query_row(sql, [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
+    row.map(|(seq, body, at)| {
+        let mut report: Value = serde_json::from_str(&body)?;
+        report["as_of"] = json!({"seq": seq, "unix_ms": at});
+        Ok(report)
+    }).transpose()
 }
 
 /// `analytics snapshot`: the latest content of every tracked cell, without

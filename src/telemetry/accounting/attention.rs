@@ -51,7 +51,9 @@ struct Bound {
 }
 
 /// Attempts with a `runtime.launch_started` receipt (the latest per attempt), in attempt order.
-fn bindings(project: &Path) -> Result<Vec<Bound>> {
+fn bindings(project: &Path) -> Result<Vec<Bound>> { bindings_selected(project, None) }
+
+fn bindings_selected(project: &Path, selected: Option<&BTreeSet<String>>) -> Result<Vec<Bound>> {
     let path = project.join(".state/state.db");
     if !path.exists() { return Ok(Vec::new()); }
     let db = crate::telemetry::read_only(&path)?;
@@ -60,13 +62,14 @@ fn bindings(project: &Path) -> Result<Vec<Bound>> {
         "(SELECT min(l.unix_ms) FROM attempt_lifecycle l WHERE l.attempt_id=a.id AND l.state IN ('completed','failed','cancelled','lost'))"
     } else { "NULL" };
     let decided = if table("dispatch_decisions")? { "(SELECT d.decided_unix_ms FROM dispatch_decisions d WHERE d.attempt_id=a.id)" } else { "NULL" };
+    let filter = if selected.is_some() { " WHERE a.id IN (SELECT value FROM json_each(?1))" } else { " WHERE ?1 IS NULL" };
     let sql = format!("WITH started AS (SELECT json_extract(payload,'$.attempt') AS attempt,max(sequence) AS sequence FROM events
         WHERE kind='runtime.launch_started' GROUP BY 1)
         SELECT a.id,a.task_id,a.state,a.termination_observed,e.payload,{ended},{decided} FROM started s JOIN events e ON e.sequence=s.sequence
-        JOIN attempts a ON a.id=s.attempt ORDER BY a.rowid");
+        JOIN attempts a ON a.id=s.attempt{filter} ORDER BY a.rowid");
     type Row = (String, String, String, bool, String, Option<i64>, Option<i64>);
     let rows: Vec<Row> = db.prepare(&sql)?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?.collect::<rusqlite::Result<_>>()?;
+        .query_map([selected.map(serde_json::to_string).transpose()?], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?.collect::<rusqlite::Result<_>>()?;
     Ok(rows.into_iter().map(|(attempt, task, state, terminated, payload, ended, decided)| {
         let receipt: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
         let text = |value: &Value| value.as_str().unwrap_or("").to_owned();
@@ -276,6 +279,29 @@ fn derive_all(project: &Path, db: &Connection) -> Result<(Vec<Attention>, i64)> 
         out.push((b, derived));
     }
     Ok((out, orphans))
+}
+
+/// Attention for a selected projection. Uses the same interval derivation as
+/// the full lane, without computing historical fleet metrics.
+pub(crate) fn read_selected(project: &Path, db: &Connection, ids: &BTreeSet<String>) -> Result<Value> {
+    if !collected(db)? { return Ok(json!({"signal": signal(), "attempts": []})); }
+    let now = jiff::Timestamp::now().as_millisecond();
+    let mut stmt = db.prepare("SELECT observed_unix_ms,state,gap,interval_ms FROM attention_samples WHERE attempt_id=?1 ORDER BY observed_unix_ms,rowid")?;
+    let mut attempts = Vec::new();
+    let canonical = crate::telemetry::read_only(&project.join(".state/state.db"))?;
+    let has_launches: bool = canonical.query_row("SELECT EXISTS(SELECT 1 FROM events e JOIN attempts a ON a.id=json_extract(e.payload,'$.attempt') WHERE e.kind='runtime.launch_started')", [], |r| r.get(0))?;
+    for b in bindings_selected(project, Some(ids))? {
+        let samples = stmt.query_map([&b.attempt], |r| {
+            let state = match r.get::<_, Option<String>>(1)? {
+                Some(state) => Ok(state), None => Err(r.get::<_, Option<String>>(2)?.unwrap_or_default()),
+            };
+            Ok(Sample { at: r.get(0)?, state, interval: r.get(3)? })
+        })?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let d = (!samples.is_empty()).then(|| derive(&b, &samples, now));
+        attempts.push(json!({"attempt_id": b.attempt, "task_id": b.task, "state": if b.open { "open" } else { "ended" },
+            "certified": certified(&b.kind), "attention": attention_json(&b, d.as_ref())}));
+    }
+    Ok(json!({"signal": signal(), "attempts": attempts, "has_launches": has_launches}))
 }
 
 /// Per launched attempt, the span of each of its waits from its first to its
