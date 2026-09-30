@@ -148,7 +148,6 @@ fn parse_submission(raw: &[u8]) -> Result<ParsedSubmission> {
     {
         return Err(invalid("invalid result repository or oid"));
     }
-    #[allow(clippy::collapsible_if)] // Preserve the existing submission parser layout.
     if let Some(snapshot) = &document.memory_snapshot_id {
         if !plain(snapshot, 128) {
             return Err(invalid("invalid result snapshot"));
