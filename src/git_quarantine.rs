@@ -368,10 +368,17 @@ pub(crate) fn import_terminated(project: &Path, events: &[Event], attempt: &Atte
 pub(crate) fn import_commit(project: &Path, receipts: &[WorktreeReceipt], repository: &str, commit: &str, deadline: Instant) -> Result<()> {
     let receipt = receipts.iter().find(|r| r.plan.source.repository == repository)
         .context("the candidate's attempt has no worktree of this repository")?;
-    let git = Git { deadline, cancellation: Cancellation::default(), locks: vec![] };
-    match import(&git, project, receipt, Target::Commit(commit))? {
+    match import_candidate(project, receipt, commit, deadline)? {
         Outcome::Imported { .. } => Ok(()),
         Outcome::Unchanged => bail!("candidate {commit} is not in the repository and its attempt left no Git quarantine"),
         Outcome::Refused { reason } => bail!("candidate {commit} was refused from its attempt's Git quarantine: {reason}"),
     }
+}
+
+/// Import `commit` from the quarantine of `receipt`'s worktree, without
+/// moving the attempt branch. `Imported` also when the shared repository
+/// already has it; `Unchanged` when the worktree has no quarantine.
+pub(crate) fn import_candidate(project: &Path, receipt: &WorktreeReceipt, commit: &str, deadline: Instant) -> Result<Outcome> {
+    let git = Git { deadline, cancellation: Cancellation::default(), locks: vec![] };
+    import(&git, project, receipt, Target::Commit(commit))
 }

@@ -1194,9 +1194,10 @@ fn plant(path: &std::path::Path, text: &str) {
 /// shared repository: moving `master`, another attempt's branch or the
 /// integration target, and overwriting an existing loose object, change
 /// nothing there, and its commit stays invisible to the owner until imported.
-/// The verified candidate is imported (re-hashed, fsck-checked) for
-/// integration while the worker runs, and its branch after it ends; an
-/// object the branch does not reach is never imported.
+/// The candidate is imported (re-hashed, fsck-checked) when the ticker
+/// ingests the spooled submission, so verification and integration work while
+/// the worker runs, and its branch after it ends; an object the branch does
+/// not reach is never imported.
 #[test]
 fn an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_commits_and_submits() {
     let mut lab = Lab::new("unknown_usage='allow_with_warning'\n[worker_isolation]\nhide=['~/owner']");
@@ -1332,13 +1333,19 @@ fn an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_com
     let shown = lab.ok(&["result", "demo", "show"]);
     assert_eq!(shown.as_array().map(|a| (a.len(), a[0]["candidate_oid"].clone(), a[0]["attempt_id"].clone())),
         Some((1, json!(candidate), json!(attempt.as_str()))), "{shown}");
+    // To record it, the ticker imported the candidate from the quarantine
+    // (re-hashed, fsck-checked): only its closure, never the stray object,
+    // and no branch moved.
+    assert_eq!(lab.git(&["cat-file", "-p", &format!("{candidate}:work.txt")]), "worker change");
+    assert!(!lab.git_ok(&["cat-file", "-e", &stray]));
+    assert_eq!(refs(), [base_commit.clone(), base_commit.clone(), base_commit.clone(), base_commit.clone()]);
 
     // The owner's files are untouched, before and after the submission.
     for (path, text) in &secrets { assert_eq!(&fs::read_to_string(path).unwrap(), text); }
     assert_eq!(owner_files(), before);
-    // Verification runs on the submitted objects. Integration, with the worker
-    // still running, imports the verified candidate from its quarantine and
-    // merges it; the attempt branch itself does not move yet.
+    // Verification runs on the submitted objects; integration, with the worker
+    // still running, merges the imported candidate. The attempt branch itself
+    // does not move yet.
     let submission = shown[0]["submission_id"].as_str().unwrap().to_owned();
     let policy = lab.path("policy.json");
     fs::write(&policy, WORK_POLICY).unwrap();
@@ -1349,7 +1356,6 @@ fn an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_com
     assert_eq!(verified["state"], "accepted", "{verified}");
     let repository = lab.repo.canonicalize().unwrap().display().to_string();
     lab.ok_live(&|| ["result", "demo", "configure-integration", "--repository", &repository, "--reference", "refs/heads/integration"].map(String::from).to_vec());
-    assert!(!lab.git_ok(&["cat-file", "-e", &candidate]));
     let result = verified["receipt"]["result_id"].as_str().unwrap().to_owned();
     let integrated = lab.ok_live(&|| ["result", "demo", "integrate", &result, "--repository", &repository, "--idempotency-key", "isolated-integrate",
         "--work-dir", &fresh("integrate")].map(String::from).to_vec());
@@ -1379,9 +1385,11 @@ fn an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_com
 /// A worker agent that commits `work.txt` and then, in its quarantined view,
 /// replaces the committed blob's loose object with the bytes of another
 /// valid object (`tampered`), so the branch it leaves names content that does
-/// not hash to it. It publishes `probe-1.txt` (`head`, `blob`) and waits.
+/// not hash to it. It publishes `probe-1.txt` (`head`, `blob`, `objects`),
+/// submits the owner's `submit.json` through its spool (`submit-1.txt`:
+/// success, then output) and waits.
 const TAMPERING_AGENT: &str = r#"
-use std::{fs, process::Command};
+use std::{fs, path::Path, process::Command, time::Duration};
 fn git(args: &[&str]) -> String {
     let out = Command::new("/usr/bin/git").args(["-c", "user.name=worker", "-c", "user.email=worker@example.invalid"]).args(args).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -1393,6 +1401,7 @@ fn main() {
     git(&["add", "work.txt"]);
     git(&["commit", "-qm", "worker change"]);
     let (head, blob) = (git(&["rev-parse", "HEAD"]), git(&["rev-parse", "HEAD:work.txt"]));
+    let objects = git(&["rev-list", "--objects", "HEAD"]).lines().map(|l| l.split(' ').next().unwrap().to_owned()).collect::<Vec<_>>().join(",");
     fs::write("tampered.txt", "tampered\n").unwrap();
     let tampered = git(&["hash-object", "-w", "tampered.txt"]);
     fs::remove_file("tampered.txt").unwrap();
@@ -1400,20 +1409,26 @@ fn main() {
     let path = |oid: &str| format!("{objects}/{}/{}", &oid[..2], &oid[2..]);
     fs::remove_file(path(&blob)).unwrap();
     fs::copy(path(&tampered), path(&blob)).unwrap();
-    fs::write("probe-1.tmp", format!("head {head}\nblob {blob}\n")).unwrap();
+    fs::write("probe-1.tmp", format!("head {head}\nblob {blob}\nobjects {objects}\n")).unwrap();
     fs::rename("probe-1.tmp", "probe-1.txt").unwrap();
+    while !Path::new("submit.json").exists() { std::thread::sleep(Duration::from_millis(50)); }
+    let out = Command::new(BIN).args(["--root", ROOT, "result", "demo", "submit", "--input-file", "submit.json"]).output().unwrap();
+    fs::write("submit-1.tmp", format!("{}\n{}{}", out.status.success(), String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))).unwrap();
+    fs::rename("submit-1.tmp", "submit-1.txt").unwrap();
     loop { std::thread::park() }
 }
 "#;
 
-/// A quarantine whose branch reaches a corrupt object is refused when the
-/// worker ends: nothing is imported, the attempt branch stays at its base and
-/// the refusal is recorded beside the quarantine.
+/// A quarantine whose commit reaches a corrupt object is refused: a spooled
+/// `result submit` naming that commit is answered with the refusal (and the
+/// denial recorded) without any submission, and when the worker ends nothing
+/// is imported, the attempt branch stays at its base and the refusal is
+/// recorded beside the quarantine.
 #[test]
 fn a_worker_branch_reaching_a_corrupt_quarantined_object_is_refused() {
     let mut lab = Lab::new("unknown_usage='allow_with_warning'\n");
-    lab.build_agent(TAMPERING_AGENT);
-    let base = lab.git(&["rev-parse", "HEAD"]);
+    lab.write_agent(TAMPERING_AGENT, &[("ROOT", lab.path("root").canonicalize().unwrap().display().to_string()), ("BIN", BIN.into())]);
+    let (contract, base) = lab.install_work_contract("verify_only");
     let (_, attempt) = lab.reserve("Retained instructions");
     let worktree = lab.planned_worktree(&attempt);
     lab.serve();
@@ -1422,7 +1437,20 @@ fn a_worker_branch_reaching_a_corrupt_quarantined_object_is_refused() {
     let report = fs::read_to_string(worktree.join("probe-1.txt")).unwrap();
     let head = report.lines().find_map(|l| l.strip_prefix("head ")).unwrap().to_owned();
     let blob = report.lines().find_map(|l| l.strip_prefix("blob ")).unwrap().to_owned();
+    let objects: Vec<Value> = report.lines().find_map(|l| l.strip_prefix("objects ")).unwrap().split(',')
+        .map(|oid| json!({"oid": oid, "relative_path": format!("{}/{}", &oid[..2], &oid[2..])})).collect();
     lab.wait(&mut ticker, 60, &|| lab.attempt(&attempt).state == AttemptState::Running);
+    fs::write(worktree.join("submit.json.tmp"), json!({"idempotency_key": "tampered", "task_id": "work", "contract_revision": 1, "contract_digest": contract,
+        "attempt_id": attempt.as_str(), "repository": lab.repo.canonicalize().unwrap().display().to_string(), "base_oid": base, "candidate_oid": head, "object_format": "sha256",
+        "artifact_manifest": [{"path": "work.txt", "oid": head}], "claimed_checks": [], "objects": objects}).to_string()).unwrap();
+    fs::rename(worktree.join("submit.json.tmp"), worktree.join("submit.json")).unwrap();
+    lab.wait(&mut ticker, 120, &|| worktree.join("submit-1.txt").exists());
+    let submitted = fs::read_to_string(worktree.join("submit-1.txt")).unwrap();
+    let refusal = format!("the candidate's Git quarantine was refused: objects reachable from {head} fail re-hashing, fsck or connectivity");
+    assert!(submitted.starts_with("false\n") && submitted.contains(&format!("submission spool refused the request: {refusal}")), "{submitted}");
+    assert_eq!(lab.spool_denials(attempt.as_str()), vec![refusal]);
+    assert_eq!(lab.ok(&["result", "demo", "show"]), json!([]));
+    assert!(!lab.git_ok(&["cat-file", "-e", &head]) && !lab.git_ok(&["cat-file", "-e", &blob]));
     lab.ok_live(&|| ["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &lab.attempt(&attempt).revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "probe done"].map(String::from).to_vec());
     lab.wait(&mut ticker, 60, &|| lab.attempt(&attempt).termination_observed);
     lab.stop(ticker);

@@ -585,7 +585,16 @@ git fsck                       -> ok; grep -c evil .git/config -> 0
   and re-staged, anything planted) are never imported; they stay in the
   quarantine. A content failure is a `refused` verdict and changes nothing
   shared; deadline, lock or I/O failures are errors and are retried.
-- **When.** (a) After proven worker termination, before repository
+- **When.** (0) When the ticker ingests a spooled `result submit`
+  (`submission_spool::handle`, under the ingest's project guard, 30 s): the
+  submission's candidate commit (not the branch) is imported from the
+  attempt's quarantine of the named repository before `submit_result` reads
+  its loose objects from the shared repository. A refusal answers the request
+  with the spool's usual error receipt (`submission spool refused the request:
+  the candidate's Git quarantine was refused: <reason>`) and records a
+  `spool.request_denied` event; an operational failure leaves the request
+  queued for the next pass. The receipt contract is unchanged.
+  (a) After proven worker termination, before repository
   preservation (`preserve_terminated_repositories`, both the started and the
   staged-release paths): the branch tip is imported and the verdict written to
   `<quarantine>/import.json` (`{"state":"imported","commit":...}`,
@@ -595,8 +604,8 @@ git fsck                       -> ok; grep -c evil .git/config -> 0
   shared repository lacks the verified candidate: the candidate commit (not
   the branch) is imported from its attempt's quarantine (found through the
   submission's attempt and its retained `runtime.worktrees_ready` receipts),
-  so integrating while the worker still runs works; a refusal fails the
-  integration before any build. Verification is unchanged: it materializes the
+  a fallback (after (0) the candidate is normally present already); a refusal
+  fails the integration before any build. Verification is unchanged: it materializes the
   submission's retained objects, never the repository.
 - **`config.worktree`.** The product does not use it. The worker's
   `worktrees/<id>/` is inside the overlay, so the real file is never written
@@ -630,9 +639,19 @@ git fsck                       -> ok; grep -c evil .git/config -> 0
   it) points at the candidate, `integration` at the merge, `master` and
   `hp-other` at the base, the stray object is absent and
   `git fsck --strict` passes.
+- After the rebase onto the spool card, the isolation test's `result submit`
+  goes through the spool: before it the commit is absent from the shared
+  store; once the ticker records the submission the candidate (and not the
+  stray object) is in the shared store while every branch, the attempt
+  branch included, still points at the base; `result verify` and
+  `result integrate` then run with the worker still up.
 - `a_worker_branch_reaching_a_corrupt_quarantined_object_is_refused`: the
   agent commits, then replaces its committed blob's loose file with another
-  valid object's bytes. After termination `import.json` is
+  valid object's bytes, and submits a result naming that commit through its
+  spool. The spool receipt refuses it (`submission spool refused the request:
+  the candidate's Git quarantine was refused: objects reachable from <head>
+  fail re-hashing, fsck or connectivity`), a `spool.request_denied` is
+  recorded and no submission exists. After termination `import.json` is
   `refused` ("objects reachable from <head> fail re-hashing, fsck or
   connectivity"), the attempt branch is at the base, neither the commit nor
   the blob is in the shared store and `git fsck --strict` passes.
@@ -773,15 +792,10 @@ Status after the follow-up card in brackets.
    controller's `HOME`; a secret under a third home-like path needs
    `[worker_isolation]`.
 10. **[Open; Git quarantine card] Where commits become visible.** A worker's
-    commits reach the shared repository only when it ends or when its
-    verified candidate is integrated. The owner, a reviewer worker or any
-    host-side reader of the repository does not see them earlier (a review
-    opened on a still-running author's candidate cannot read it from the
-    repository). The submission spool card's host-side ingest reads loose
-    objects from the shared repository: it must import the candidate first
-    (`git_quarantine::import_commit`, the same call integration makes) or read
-    the quarantine; until then the in-sandbox `result submit` reads them
-    through the overlay.
+    commits reach the shared repository only when a submission names them
+    (the spool ingest imports the candidate), when a verified candidate is
+    integrated, or when the worker ends (its branch). The owner, a reviewer
+    worker or any host-side reader does not see unsubmitted commits earlier.
 11. **[Open; Git quarantine card] What is not carried over.** Only the
     attempt branch's closure is imported. The worker's index, other branches,
     stash, reflogs and uncommitted Git state stay in the quarantine, so
@@ -869,4 +883,18 @@ Host under heavy unrelated load throughout (load average 15–22 on 12 cores).
   (the extended isolation test takes about a minute: operator verification
   and integration against the running ticker, then termination).
 - Default features, `--test cli --bin herdr-projects`: pass (30, 284).
+- No new clippy warnings in changed files.
+
+### Tests run (Git quarantine card, after rebasing onto the spool card)
+
+- `cargo test --features state-store --no-fail-fast --test canonical_worker
+  --test cli --test factory_harness --test recovery --test scheduling --test
+  ticker_jobs --test telemetry_review --test review_signer --bin
+  herdr-projects --lib`: canonical_worker 21, cli 81, factory_harness 16,
+  recovery 5, review_signer 3, scheduling 7, telemetry_review 20,
+  ticker_jobs 8, bin 365 pass; lib 611 of 612 in that run
+  (`runtime::controlled_tests::expiry_sql_is_interrupted_without_undoing_published_observations`,
+  a 300 ms deadline under load, unrelated code), which passed alone three
+  times and in a full `--lib` re-run (612).
+- Default features, `--test cli --bin herdr-projects`: 30 and 284 pass.
 - No new clippy warnings in changed files.

@@ -411,6 +411,29 @@ fn run(at: &At<'_>, request: &Request) -> std::result::Result<String, String> {
     result.map_err(|error| format!("{error:#}"))
 }
 
+/// Budget for importing one submission's candidate from its Git quarantine.
+const IMPORT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Import a result submission's candidate from the attempt's Git quarantine
+/// of the named repository. `Some(reason)` refuses the request; a document
+/// that does not parse, or names a repository the attempt has no worktree of,
+/// is left to the store to judge.
+fn import_candidate(at: &At<'_>, attempt: &str, request: &Request) -> Result<Option<String>> {
+    let Some(document) = request.document.as_deref().and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok()) else { return Ok(None) };
+    let (Some(repository), Some(candidate)) = (document.get("repository").and_then(|v| v.as_str()), document.get("candidate_oid").and_then(|v| v.as_str())) else { return Ok(None) };
+    let receipts: Option<String> = read(at.project, |db| {
+        use rusqlite::OptionalExtension;
+        Ok(db.query_row("SELECT e.payload FROM attempt_inputs i JOIN events e ON e.entity=i.operation_id AND e.kind='runtime.worktrees_ready'
+            WHERE i.attempt_id=?1 ORDER BY e.sequence LIMIT 1", [attempt], |row| row.get(0)).optional()?)
+    })?;
+    let receipts: Vec<crate::domain::WorktreeReceipt> = match receipts { Some(payload) => serde_json::from_str(&payload)?, None => return Ok(None) };
+    let Some(receipt) = receipts.iter().find(|r| r.plan.source.repository == repository) else { return Ok(None) };
+    Ok(match crate::git_quarantine::import_candidate(at.project, receipt, candidate, std::time::Instant::now() + IMPORT_BUDGET)? {
+        crate::git_quarantine::Outcome::Refused { reason } => Some(format!("the candidate's Git quarantine was refused: {reason}")),
+        _ => None,
+    })
+}
+
 fn is_digest(name: &str) -> bool {
     name.len() == 64 && name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
@@ -550,6 +573,16 @@ fn handle(at: &At<'_>, dir: &Dir, attempt: &str, status: &Liveness, digest: &str
             if mode == libc::S_IFDIR && dir.unlink(&receipt, true).is_err() {
                 return;
             }
+        }
+    }
+    if request.kind == Kind::ResultSubmit {
+        // The worker committed in its Git quarantine: import the candidate
+        // (re-hashed, fsck-checked) before the store reads its objects from
+        // the shared repository.
+        match import_candidate(at, attempt, &request) {
+            Ok(None) => {}
+            Ok(Some(reason)) => return deny(at, dir, attempt, Some(digest), kind, &reason, lines),
+            Err(error) => return lines.push(format!("spool {attempt}: {digest}: Git quarantine import: {error:#}; retried next pass")),
         }
     }
     let answer = run(at, &request);
