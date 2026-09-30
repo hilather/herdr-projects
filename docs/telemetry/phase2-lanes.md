@@ -394,11 +394,33 @@ Cards (gaps that stop those questions being answered):
     adapter if its local records are stable enough to certify.
 - **DG5 cost M04/M12 (external).** Needs real rate cards and provider charges
   imported by the owner (contracts-accounting.md). Still blocked.
-- **DG6 verification flake signal.** Nothing distinguishes "passes alone,
-  fails under concurrent load" (cx2, P3 in the 2026-09-30 log). Candidate:
-  when the same tree gets differing verification verdicts across runs,
-  record a flip rate per policy and as a health rule. It needs a metric
-  definition and registry entry first.
+- **DG6 flakes under concurrent load (owner-approved design, 2026-09-30).**
+  A change can pass alone and fail when other work runs alongside it. In the
+  2026-09-30 log, cx2 was a racy test and P3 a real lock-hold regression, so
+  a flake is a signal, never noise to hide.
+  - **DG6a verdict flip rate (telemetry).** When the same tree and
+    verification policy get differing verdicts across runs, record a flip.
+    Add a metric (flip rate per policy and project) and a health rule.
+    Passive; it sees only flakes that happen to be re-run.
+  - **DG6b load context per verification run (telemetry).** Record the host
+    load average, concurrent verifications and CPU/IO pressure with each run,
+    so failures can be correlated with contention (e.g. "fails 12 % above
+    load 8, 0 % below").
+  - **DG6c per-test results (telemetry).** Capture the runner's structured
+    test outcomes (test names and pass/fail: metadata, within the privacy
+    default) so a flake is attributed to a specific test, not a whole
+    verdict.
+  - **DG6d stress verification (policy, opt-in).** A verification step that
+    runs the declared suites under controlled concurrent load: the steward's
+    six-run concurrent-load loop as a product feature. It applies to change
+    classes that touch write paths, transactions, locks, migrations or the
+    ticker. It caught P3's lock regression before merge.
+  - **DG6e honest re-run on failure (policy).** A failed check may be re-run.
+    A re-run that passes is recorded as a flake with its evidence and raises
+    the flip metric. It is never recorded as a clean pass.
+  - **Not planned:** a known-flaky quarantine that stops tests blocking. It
+    would have hidden P3's real regression. It needs an explicit owner
+    decision.
 - **DG7 dogfood the dev loop (after TM5.4).** Run dev cards as herdr-projects
   tasks instead of the steward's scratchpad runner:
   - Each worker model and reasoning level is its own configuration, so
