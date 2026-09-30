@@ -40,7 +40,8 @@ pub fn collection(project: &Path, now_ms: i64) -> Result<String> {
 /// The popup body for one project with a canonical store.
 pub fn render(project: &Path, now_ms: i64) -> Result<String> {
     let mut out = format!("usage: {}\n\n", collection(project, now_ms)?);
-    out += &super::metrics::text(&super::metrics::report(project, None)?);
+    // Through the query service's read path (contracts-analytics.md §5), as `telemetry report`.
+    out += &super::metrics::text(&super::analytics::query::report(project, None)?);
     let db = read_only(&project.join(".state/state.db"))?;
     let label = if table(&db, "dispatch_decisions")? {
         "(SELECT json_extract(c.canonical_json,'$.kind')||' '||json_extract(c.canonical_json,'$.agent_version') FROM dispatch_decisions d

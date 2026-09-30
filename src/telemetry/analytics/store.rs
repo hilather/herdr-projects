@@ -1,0 +1,230 @@
+//! Incremental aggregate revisions in sidecar stream `analytics`
+//! (contracts-analytics.md §4). A refresh evaluates every tracked cell from
+//! the sources and appends a revision only for a cell whose content changed:
+//! the first is `initial`, each later one a `restatement` superseding the
+//! previous. Nothing here writes `state.db` or another stream's tables.
+use super::lifecycle::{Lineage, Row};
+use super::query::{self, Cell, Sources};
+use super::registry::{self, Provider};
+use anyhow::Result;
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::path::Path;
+
+fn unavailable(reason: &str) -> Value { json!({"status": "unavailable", "reason": reason}) }
+
+fn analytics_tables(db: &Connection) -> rusqlite::Result<bool> {
+    db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='analytics_cells')", [], |r| r.get(0))
+}
+
+/// Tracked cells (canonical keys, sorted). Read-only.
+fn tracked(db: &Connection) -> Result<Vec<String>> {
+    if !analytics_tables(db)? { return Ok(Vec::new()); }
+    Ok(db.prepare("SELECT cell FROM analytics_cells ORDER BY cell")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)
+}
+
+/// The default tracked set: every active metric's current definition, its
+/// default cohort, the unbounded window.
+fn defaults() -> Vec<Cell> {
+    registry::METRICS.iter().filter(|m| m.family.activation().is_ok() && !matches!(m.versions[0].provider, Provider::Absent(_))).map(Cell::default_for).collect()
+}
+
+struct Evaluated { key: String, cell: Cell, core: Value, lineage: Lineage, digest: String }
+
+fn evaluate_all(project: &Path, cells: &[Cell]) -> Result<(Vec<Evaluated>, Value)> {
+    let mut sources = Sources::new(project)?;
+    let watermarks = sources.watermarks()?;
+    let mut out = Vec::new();
+    for cell in cells {
+        let (core, lineage) = query::evaluate(&mut sources, cell)?;
+        out.push(Evaluated { key: cell.key(), digest: query::content_digest(&core, &lineage), cell: cell.clone(), core, lineage });
+    }
+    Ok((out, watermarks))
+}
+
+/// The cells a refresh or rebuild covers: tracked ones (or the defaults when
+/// none is tracked yet) plus `extra`.
+fn cells(project: &Path, extra: Option<Cell>) -> Result<Option<Vec<Cell>>> {
+    let Some(db) = crate::telemetry::sidecar::read(project)? else { return Ok(None) };
+    let mut cells: Vec<Cell> = tracked(&db)?.iter().filter_map(|key| Cell::parse(key)).collect();
+    if cells.is_empty() { cells = defaults(); }
+    if let Some(extra) = extra && !cells.iter().any(|c| c.key() == extra.key()) { cells.push(extra); }
+    cells.sort_by_key(Cell::key);
+    Ok(Some(cells))
+}
+
+/// Append a revision for each changed cell, in one immediate transaction.
+fn append(project: &Path, evaluated: &[Evaluated], watermarks: &Value, now: i64) -> Result<Value> {
+    let Some(mut db) = crate::telemetry::sidecar::open(project, false)? else { return Ok(unavailable("collection_not_run")) };
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (mut appended, mut unchanged) = (Vec::new(), 0);
+    for e in evaluated {
+        tx.execute("INSERT OR IGNORE INTO analytics_cells(cell,metric,definition,cohort,window_from_unix_ms,window_to_unix_ms,horizon_ms,dimension,tracked_unix_ms)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", rusqlite::params![e.key, e.cell.metric.id, e.cell.version.definition, e.cell.cohort.as_str(), e.cell.from, e.cell.to,
+            e.cell.horizon, e.cell.by, now])?;
+        let latest: Option<(i64, String)> = tx.query_row("SELECT revision,content_digest FROM analytics_revisions WHERE cell=?1 ORDER BY revision DESC LIMIT 1", [&e.key],
+            |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        if latest.as_ref().is_some_and(|(_, digest)| *digest == e.digest) {
+            tx.execute("UPDATE analytics_cells SET checked_unix_ms=?2 WHERE cell=?1", rusqlite::params![e.key, now])?;
+            unchanged += 1;
+            continue;
+        }
+        let supersedes = latest.map(|(revision, _)| revision);
+        let kind = if supersedes.is_some() { "restatement" } else { "initial" };
+        tx.execute("INSERT INTO analytics_revisions(cell,kind,supersedes,body,content_digest,watermarks,registry,recorded_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            rusqlite::params![e.key, kind, supersedes, serde_json::to_string(&e.core)?, e.digest, serde_json::to_string(watermarks)?, registry::VERSION, now])?;
+        let revision = tx.last_insert_rowid();
+        let mut insert = tx.prepare("INSERT INTO analytics_lineage(revision,bucket,ordinal,entity_kind,entity_id,attrs) VALUES(?1,?2,?3,?4,?5,?6)")?;
+        for (bucket, rows) in &e.lineage {
+            for (ordinal, (kind, id, attrs)) in rows.iter().enumerate() {
+                insert.execute(rusqlite::params![revision, bucket, ordinal as i64, kind, id, serde_json::to_string(attrs)?])?;
+            }
+        }
+        drop(insert);
+        tx.execute("UPDATE analytics_cells SET checked_unix_ms=?2 WHERE cell=?1", rusqlite::params![e.key, now])?;
+        appended.push(json!({"cell": serde_json::from_str::<Value>(&e.key)?, "revision": revision, "kind": kind, "supersedes": supersedes, "content_digest": e.digest}));
+    }
+    tx.commit()?;
+    Ok(json!({"appended": appended, "unchanged": unchanged, "cells": evaluated.len(), "recorded_unix_ms": now}))
+}
+
+/// `telemetry <slug> analytics refresh`: writes only the sidecar's analytics tables.
+pub fn refresh(project: &Path, extra: Option<Cell>) -> Result<Value> {
+    let Some(cells) = cells(project, extra)? else { return Ok(unavailable("collection_not_run")) };
+    let (evaluated, watermarks) = evaluate_all(project, &cells)?;
+    append(project, &evaluated, &watermarks, jiff::Timestamp::now().as_millisecond())
+}
+
+/// A stored revision's lineage, as evaluation produced it.
+fn stored_lineage(db: &Connection, revision: i64) -> Result<Lineage> {
+    let mut lineage = Lineage::new();
+    let mut stmt = db.prepare("SELECT bucket,entity_kind,entity_id,attrs FROM analytics_lineage WHERE revision=?1 ORDER BY bucket,ordinal")?;
+    let rows = stmt.query_map([revision], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))?;
+    for row in rows {
+        let (bucket, kind, id, attrs) = row?;
+        let kind: &'static str = if kind == "attempt" { "attempt" } else { "task" };
+        let row: Row = (kind, id, serde_json::from_str(&attrs)?);
+        lineage.entry(bucket).or_default().push(row);
+    }
+    Ok(lineage)
+}
+
+/// `analytics rebuild [--verify]`: recompute every tracked cell from the
+/// sources, ignoring nothing cached, and compare it byte for byte with the
+/// latest stored revision (whose own bytes are re-digested: `stored_intact`).
+/// Without `--verify` a differing cell gets a restatement.
+pub fn rebuild(project: &Path, verify: bool) -> Result<Value> {
+    let Some(cells) = cells(project, None)? else { return Ok(unavailable("collection_not_run")) };
+    let (evaluated, watermarks) = evaluate_all(project, &cells)?;
+    let mut report = Vec::new();
+    {
+        let db = crate::telemetry::sidecar::read(project)?;
+        for e in &evaluated {
+            let stored = match db.as_deref() { Some(db) => query::latest(db, &e.key)?, None => None };
+            let (revision, stored_digest, intact) = match (&stored, db.as_deref()) {
+                (Some(s), Some(db)) => (Some(s.revision), Some(s.digest.clone()), Some(query::content_digest(&s.body, &stored_lineage(db, s.revision)?) == s.digest)),
+                _ => (None, None, None),
+            };
+            report.push(json!({"cell": serde_json::from_str::<Value>(&e.key)?, "revision": revision, "stored_digest": stored_digest, "rebuilt_digest": e.digest,
+                "identical": stored_digest.as_deref() == Some(e.digest.as_str()), "stored_intact": intact}));
+        }
+    }
+    let identical = report.iter().all(|r| r["identical"] == true);
+    let appended = if verify || identical { json!([]) } else { append(project, &evaluated, &watermarks, jiff::Timestamp::now().as_millisecond())?["appended"].clone() };
+    Ok(json!({"verify": verify, "identical": identical, "cells": report, "appended": appended}))
+}
+
+/// `analytics snapshot`: the latest content of every tracked cell, without
+/// revision numbers or times, so two rebuilds from the same sources compare byte for byte.
+pub fn snapshot(project: &Path) -> Result<Value> {
+    let Some(db) = crate::telemetry::sidecar::read(project)? else { return Ok(unavailable("collection_not_run")) };
+    let mut cells = Vec::new();
+    for key in tracked(&db)? {
+        let Some(stored) = query::latest(&db, &key)? else { continue };
+        let lineage: BTreeMap<String, Vec<Value>> = stored_lineage(&db, stored.revision)?.into_iter()
+            .map(|(bucket, rows)| (bucket, rows.into_iter().map(|(kind, id, attrs)| json!([kind, id, attrs])).collect())).collect();
+        cells.push(json!({"cell": serde_json::from_str::<Value>(&key)?, "content_digest": stored.digest, "body": stored.body, "lineage": lineage}));
+    }
+    Ok(json!({"registry": registry::VERSION, "cells": cells}))
+}
+
+/// `analytics revisions [--metric M]`: revision history with provenance.
+pub fn revisions(project: &Path, metric: Option<&str>) -> Result<Value> {
+    let Some(db) = crate::telemetry::sidecar::read(project)? else { return Ok(unavailable("collection_not_run")) };
+    if !analytics_tables(&db)? { return Ok(json!({"revisions": []})); }
+    let mut stmt = db.prepare("SELECT r.revision,r.cell,r.kind,r.supersedes,r.content_digest,r.watermarks,r.recorded_unix_ms FROM analytics_revisions r
+        JOIN analytics_cells c ON c.cell=r.cell WHERE ?1 IS NULL OR c.metric=?1 ORDER BY r.revision")?;
+    let rows: Vec<Value> = stmt.query_map([metric], |r| {
+        let (cell, watermarks): (String, String) = (r.get(1)?, r.get(5)?);
+        Ok(json!({"revision": r.get::<_, i64>(0)?, "cell": serde_json::from_str::<Value>(&cell).unwrap_or(Value::Null), "kind": r.get::<_, String>(2)?,
+            "supersedes": r.get::<_, Option<i64>>(3)?, "content_digest": r.get::<_, String>(4)?, "watermarks": serde_json::from_str::<Value>(&watermarks).unwrap_or(Value::Null),
+            "recorded_unix_ms": r.get::<_, i64>(6)?}))
+    })?.collect::<rusqlite::Result<_>>()?;
+    Ok(json!({"revisions": rows}))
+}
+
+/// Ticker: refresh tracked cells at most once per `TICK_INTERVAL_MS`, only once
+/// an operator has run `analytics refresh` (a tracked cell exists).
+pub const TICK_INTERVAL_MS: i64 = 60_000;
+
+pub fn tick(project: &Path) -> Result<()> {
+    let Some(db) = crate::telemetry::sidecar::read(project)? else { return Ok(()) };
+    if !analytics_tables(&db)? { return Ok(()); }
+    let last: Option<i64> = db.query_row("SELECT max(checked_unix_ms) FROM analytics_cells", [], |r| r.get(0))?;
+    drop(db);
+    match last {
+        Some(at) if jiff::Timestamp::now().as_millisecond() - at >= TICK_INTERVAL_MS => refresh(project, None).map(drop),
+        _ => Ok(()),
+    }
+}
+
+/// One `EXPLAIN QUERY PLAN` check. `inherent`: tables (or aliases) the query
+/// must read in full because it aggregates every row; any other `SCAN` is a
+/// missing index. `proposed`: the index its owning stream should add.
+struct Plan { name: &'static str, store: &'static str, owner: &'static str, sql: String, inherent: &'static [&'static str], proposed: Option<&'static str> }
+
+fn explain(db: &Connection, plan: &Plan) -> Result<Value> {
+    let mut stmt = db.prepare(&format!("EXPLAIN QUERY PLAN {}", plan.sql))?;
+    let nulls = vec![rusqlite::types::Null; stmt.parameter_count()];
+    let details: Vec<String> = stmt.query_map(rusqlite::params_from_iter(nulls), |r| r.get::<_, String>(3))?.collect::<rusqlite::Result<_>>()?;
+    let scans: Vec<String> = details.iter().filter_map(|d| d.strip_prefix("SCAN ").map(|rest| rest.split_whitespace().next().unwrap_or("").to_owned())).collect();
+    let unexpected: Vec<&String> = scans.iter().filter(|s| !plan.inherent.contains(&s.as_str())).collect();
+    // An automatic index is built for every run of the query: a persistent one is missing.
+    let automatic: Vec<&String> = details.iter().filter(|d| d.contains("AUTOMATIC")).collect();
+    let verdict = if !unexpected.is_empty() || !automatic.is_empty() { "needs_index" } else if scans.is_empty() { "indexed" } else { "full_scan_inherent" };
+    Ok(json!({"name": plan.name, "store": plan.store, "owner": plan.owner, "plan": details, "scans": scans, "unexpected_scans": unexpected,
+        "automatic_indexes": automatic, "verdict": verdict,
+        "proposed_index": if verdict == "needs_index" { json!(plan.proposed) } else { Value::Null }}))
+}
+
+/// `analytics plans`: the hot queries' plans on this project's stores. Read-only.
+pub fn plans(project: &Path) -> Result<Value> {
+    let state = crate::telemetry::read_only(&project.join(".state/state.db"))?;
+    let mut out = Vec::new();
+    for (name, sql) in super::lifecycle::queries(&state)? {
+        let inherent: &'static [&'static str] = match name { "lifecycle_attempts" => &["a"], "lifecycle_classes" => &["task_classifications"], _ => &["c"] };
+        let proposed = (name == "lifecycle_acceptance_times").then_some("CREATE INDEX verified_results_by_submission ON verified_results(submission_id)");
+        out.push(explain(&state, &Plan { name, store: "state.db", owner: "canonical (steward; read-only here)", sql, inherent, proposed })?);
+    }
+    out.push(explain(&state, &Plan { name: "canonical_head", store: "state.db", owner: "canonical (steward; read-only here)", sql: "SELECT coalesce(max(sequence),0) FROM events".into(), inherent: &[], proposed: None })?);
+    drop(state);
+    if let Some(db) = crate::telemetry::sidecar::read(project)? {
+        if analytics_tables(&db)? {
+            for (name, sql) in [("as_of_seq", query::AS_OF_SEQ), ("as_of_time", query::AS_OF_TIME), ("latest_revision", query::LATEST), ("next_revision", query::NEXT),
+                ("lineage_page", query::PAGE), ("lineage_buckets", query::BUCKETS)] {
+                out.push(explain(&db, &Plan { name, store: "telemetry.db", owner: "analytics", sql: sql.into(), inherent: &[], proposed: None })?);
+            }
+        }
+        // Other streams' hot reads (central M08/M15/M13 source scan): described, never migrated here.
+        out.push(explain(&db, &Plan { name: "codex_usage_by_source", store: "telemetry.db", owner: "codex (steward)",
+            sql: "SELECT s.session_id,EXISTS(SELECT 1 FROM codex_usage u WHERE u.path_digest=s.path_digest AND u.reason='cli_version_uncertified'),
+                (SELECT count(*) FROM codex_usage u WHERE u.path_digest=s.path_digest AND u.accepted=1) FROM rollout_sources s ORDER BY s.path_digest".into(),
+            inherent: &["s"], proposed: Some("CREATE INDEX codex_usage_by_path ON codex_usage(path_digest, accepted, reason)") })?);
+        out.push(explain(&db, &Plan { name: "codex_usage_by_session", store: "telemetry.db", owner: "codex (steward)",
+            sql: "SELECT count(*),sum(input_tokens) FROM codex_usage WHERE session_id=?1 AND accepted=1".into(), inherent: &[], proposed: None })?);
+    }
+    let needs: Vec<&Value> = out.iter().filter(|p| p["verdict"] == "needs_index").collect();
+    let summary = json!({"needs_index": needs.iter().map(|p| json!({"name": p["name"], "owner": p["owner"], "proposed_index": p["proposed_index"]})).collect::<Vec<_>>()});
+    Ok(json!({"plans": out, "summary": summary}))
+}

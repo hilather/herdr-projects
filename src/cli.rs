@@ -863,6 +863,12 @@ enum TelemetryCommand {
     Quality { #[command(subcommand)] command:herdr_projects::telemetry::quality::Command },
     /// Lane D review capture (sidecar stream `review`).
     Review { #[command(subcommand)] command:herdr_projects::telemetry::review::Command },
+    /// TM4.1 metric registry.
+    Metrics { #[command(subcommand)] command:herdr_projects::telemetry::analytics::MetricsCommand },
+    /// TM4.1 query service: numerator, denominator, exclusions, coverage, projection revision and watermarks. Read-only.
+    Query(herdr_projects::telemetry::analytics::query::Args),
+    /// TM4.1 aggregate revisions (sidecar stream `analytics`).
+    Analytics { #[command(subcommand)] command:herdr_projects::telemetry::analytics::Command },
 }
 
 #[cfg(feature="state-store")]
@@ -1252,9 +1258,24 @@ pub fn run() -> Result<()> {
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Report{json,text:_,since}}=>{
             project::validate_slug(&slug)?;
-            let report=herdr_projects::telemetry::metrics::report(&ctx.root.join(slug),since)?;
+            let report=herdr_projects::telemetry::analytics::query::report(&ctx.root.join(slug),since)?;
             if json {println!("{}",serde_json::to_string_pretty(&report)?);} else {print!("{}",herdr_projects::telemetry::metrics::text(&report));}
             Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Telemetry{slug,command:TelemetryCommand::Metrics{command}}=>{
+            project::validate_slug(&slug)?;
+            print!("{}",herdr_projects::telemetry::analytics::run_metrics(command)?);Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Telemetry{slug,command:TelemetryCommand::Query(args)}=>{
+            project::validate_slug(&slug)?;
+            print!("{}",herdr_projects::telemetry::analytics::run_query(&ctx.root.join(slug),&args)?);Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Telemetry{slug,command:TelemetryCommand::Analytics{command}}=>{
+            project::validate_slug(&slug)?;
+            print!("{}",herdr_projects::telemetry::analytics::run(&ctx.root.join(slug),command)?);Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:lane@(TelemetryCommand::Collectors{..}|TelemetryCommand::Accounting{..}|TelemetryCommand::Quality{..}|TelemetryCommand::Review{..})}=>{

@@ -40,7 +40,13 @@ pub(crate) fn task_evidence(db: &Connection) -> Result<Vec<(String, String, bool
 }
 
 /// `herdr-projects telemetry <slug> report`. `since` bounds the activity window (Unix ms).
-pub fn report(project: &Path, since: Option<i64>) -> Result<Value> {
+/// Assembled by the query service (`super::analytics::query::report`), the one
+/// read path shared with `telemetry query`, the fleet pane and exports.
+pub fn report(project: &Path, since: Option<i64>) -> Result<Value> { super::analytics::query::report(project, since) }
+
+/// The central slice metrics (contracts §6) and the `tasks` summary, before
+/// the lane providers (`super::LANES`) add theirs.
+pub(crate) fn central(project: &Path, since: Option<i64>) -> Result<(BTreeMap<String, Value>, Value)> {
     let path = project.join(".state/state.db");
     let db = super::read_only(&path)?;
     let table = |name: &str| db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [name], |r| r.get::<_, bool>(0));
@@ -71,11 +77,8 @@ pub fn report(project: &Path, since: Option<i64>) -> Result<Value> {
     for id in ["M31", "M32", "M33"] { metrics.insert(id, metric(id, json!({"value": unavailable("attention_not_collected")}))); }
     metrics.insert("M40", headroom(sidecar.as_deref(), &attempts, &in_window)?);
     for (id, name) in NAMES { if let Some(m) = metrics.get_mut(id) { m["name"] = json!(name); } }
-    // Lane providers (`super::LANES`) add metrics; a lane key replaces a central one.
-    let mut metrics: BTreeMap<String, Value> = metrics.into_iter().map(|(id, m)| (id.to_owned(), m)).collect();
-    for lane in &super::LANES { metrics.extend((lane.metrics)(project, since)?); }
-    Ok(json!({"metrics": metrics, "since_unix_ms": since,
-        "tasks": {"accepted": accepted, "open": open, "succeeded_without_evidence": without_evidence, "terminal": terminal.len()}}))
+    let metrics: BTreeMap<String, Value> = metrics.into_iter().map(|(id, m)| (id.to_owned(), m)).collect();
+    Ok((metrics, json!({"accepted": accepted, "open": open, "succeeded_without_evidence": without_evidence, "terminal": terminal.len()})))
 }
 
 /// M08, M09, M15 over certified bound sessions (activity window by session

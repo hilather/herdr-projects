@@ -14,13 +14,17 @@ needs a new reviewed revision, not a silent reinterpretation.
   in `telemetry_streams(stream, version)`: `codex` (§5, migrations under
   `migrations/telemetry/`, also `user_version`), and one stream per lane under
   `migrations/telemetry/<stream>/`: `ingest`, `accounting`, `quality`,
-  `review`. A reader refuses only a stream newer than it knows. Plan:
+  `review`, `analytics` (TM4.1 aggregate revisions). A reader refuses only a
+  stream newer than it knows. Plan:
   [phase2-lanes.md](phase2-lanes.md).
 - Lane contracts, each owned by its lane: collection
   ([contracts-collection.md](contracts-collection.md)), accounting
   ([contracts-accounting.md](contracts-accounting.md)), quality
   ([contracts-quality.md](contracts-quality.md)), review
   ([contracts-review.md](contracts-review.md)).
+- Metric registry, query service and the read contract shared by
+  `telemetry report`, the fleet pane, views and exports (TM4.1):
+  [contracts-analytics.md](contracts-analytics.md).
 
 ## 0. Common rules
 

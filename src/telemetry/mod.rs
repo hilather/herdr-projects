@@ -1,6 +1,7 @@
 //! Telemetry analytics and read-only projections (docs/telemetry/contracts.md).
 //! Never grants launch, accepts results or changes budgets.
 pub mod accounting;
+pub mod analytics;
 pub mod codex;
 pub mod collectors;
 pub mod ingest;
@@ -14,7 +15,9 @@ pub mod sidecar;
 
 /// One phase-2 lane's hooks (docs/telemetry/phase2-lanes.md), each defined in
 /// the lane's own module and registered only here: its sidecar stream and
-/// migrations, metrics merged into `metrics::report`, and ticker work.
+/// migrations, metrics merged into `metrics::report`, and ticker work. The
+/// `analytics` lane (TM4.1) holds the query service's aggregate revisions and
+/// adds no report keys; it is last so its migration runs after every stream it reads.
 pub struct Lane {
     pub stream: &'static str,
     pub migrations: &'static [&'static str],
@@ -26,7 +29,7 @@ macro_rules! lane {
     ($module:ident) => { Lane { stream: $module::STREAM, migrations: $module::MIGRATIONS, metrics: $module::metrics, tick: $module::tick } };
 }
 
-pub const LANES: [Lane; 4] = [lane!(collectors), lane!(accounting), lane!(quality), lane!(review)];
+pub const LANES: [Lane; 5] = [lane!(collectors), lane!(accounting), lane!(quality), lane!(review), lane!(analytics)];
 
 /// A read-only connection that writes and creates nothing (contracts §0 "Reads").
 /// Fields drop in order: the connection closes before the lock is released.
