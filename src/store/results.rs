@@ -770,6 +770,10 @@ fn stage_objects(
     }
     fs::create_dir_all(&dir).map_err(|error| StoreError::Io(error.to_string()))?;
     let scratch = dir.join("packed-reconstruction");
+    // A snapshot left by an interrupted earlier staging is never reused.
+    if scratch.exists() {
+        fs::remove_dir_all(&scratch).map_err(|error| StoreError::Io(error.to_string()))?;
+    }
     // A single exit from reconstruction ensures cleanup on every refusal, too.
     let reconstruction = (|| -> Result<Vec<StagedObject>> {
         let mut staged = Vec::new();
