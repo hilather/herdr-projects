@@ -139,6 +139,10 @@ pub struct Memory {
     pub local_observations:Option<crate::local_observations::Reads>,
     pub prefer_copy:bool,
     #[cfg(feature="state-store")]
+    pub attempt_tokens:std::sync::Arc<std::sync::Mutex<crate::attempt_token_jobs::Hints>>,
+    #[cfg(feature="state-store")]
+    pub attempt_token_tickets:Vec<crate::executor::Ticket>,
+    #[cfg(feature="state-store")]
     pub routine_jobs:Option<crate::routine_jobs::Queue>,
     #[cfg(feature="state-store")]
     pub canonical_observations:Option<crate::canonical_controller::observations::Reads>,
@@ -164,6 +168,10 @@ impl Memory {
             local_reports:None,
             local_observations:None,
             prefer_copy:true,
+            #[cfg(feature="state-store")]
+            attempt_tokens:Default::default(),
+            #[cfg(feature="state-store")]
+            attempt_token_tickets:Vec::new(),
             #[cfg(feature="state-store")]
             routine_jobs: None,
             #[cfg(feature="state-store")]

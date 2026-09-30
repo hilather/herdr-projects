@@ -105,7 +105,7 @@ fn scoped_attempt_token_inventory_ignores_unrelated_corrupt_history() {
     assert!(runtime::snapshot(&p.project()).is_err());
     let control = herdr_projects::store::controlled::ReadControl::new(std::time::Instant::now() + std::time::Duration::from_secs(10), Default::default());
     let mut store = migration::open_active_scoped(&p.project(), control).unwrap();
-    assert!(store.attempt_tokens(None, jiff::Timestamp::now().as_millisecond() - 300_000).unwrap().entries.is_empty());
+    assert!(store.attempt_tokens(&[]).unwrap().entries.is_empty());
     let out = p.cli(&["scheduler", "demo", "inspect"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 }

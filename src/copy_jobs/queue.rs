@@ -108,10 +108,7 @@ impl Queue {
         let (work,resources)=super::request_final_parts(ctx,project,t,target,purpose,operation)?;self.offer_scoped(work,resources)
     }
     #[cfg(feature="state-store")]
-    pub fn offer_attempt_tokens(&mut self,path:&Path,control:&crate::source_tree::Control)->Result<()> {
-        for request in crate::attempt_token_jobs::requests(path,control)? {self.offer_request(request)?;}
-        Ok(())
-    }
+    pub fn submit_advisory(&self, request: Request)->Result<crate::executor::Ticket> { self.executor.submit(request) }
     pub fn offer_tokens(&mut self,ctx:&Ctx,project:&Project,t:Option<&Thread>,route:Option<&crate::remote_api::Route>)->Result<()> {
         self.offer_request(crate::token_jobs::request(ctx,project,t,route)?)
     }

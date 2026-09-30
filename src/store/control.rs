@@ -1,5 +1,4 @@
 use super::*;
-use rusqlite::OptionalExtension;
 use crate::{operations::DeliveryState,reconcile::ResourceState};
 
 pub(super) fn read(db:&Connection)->Result<ProjectControl> {read_with_budget(db,None)}
@@ -26,15 +25,9 @@ fn schema(db:&Connection)->Result<()> {
     if version<7{return Err(StoreError::UnsupportedSchema(version));}Ok(())
 }
 fn increment(n:u64)->Result<u64>{n.checked_add(1).filter(|n|*n<=i64::MAX as u64).ok_or_else(||StoreError::Invalid("control counter exhausted".into()))}
-fn write(db:&Connection,control:&ProjectControl,kind:&str,now:i64)->Result<()> {
-    // Revisions while already paused must not restart advisory cleanup's TTL.
-    let observed = if read(db)?.state != ProjectState::Active && control.state != ProjectState::Active {
-        db.query_row("SELECT json_extract(payload,'$.observed_unix_ms') FROM events WHERE entity='project' AND kind IN ('project.control_changed','project.reconciliation_invalidated') ORDER BY sequence DESC LIMIT 1", [], |r| r.get::<_,Option<i64>>(0)).optional()?.flatten().unwrap_or(now)
-    } else { now };
+fn write(db:&Connection,control:&ProjectControl,kind:&str)->Result<()> {
     db.execute("UPDATE project_control SET revision=?1,epoch=?2,state=?3,reconciliation_required=?4,config_digest=?5 WHERE singleton=1",params![integer(control.revision)?,integer(control.epoch)?,control.state.as_str(),control.reconciliation_required,control.config_digest])?;
-    let mut payload=serde_json::to_value(control).map_err(|e|StoreError::Invalid(e.to_string()))?;
-    payload["observed_unix_ms"]=serde_json::json!(observed);
-    db.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?1,'project',?2,1,?3)",params![kind,integer(control.revision)?,payload.to_string()])?;Ok(())
+    db.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES(?1,'project',?2,1,?3)",params![kind,integer(control.revision)?,serde_json::to_string(control).map_err(|e|StoreError::Invalid(e.to_string()))?])?;Ok(())
 }
 fn blockers(db:&Connection,now:i64,config:Option<&str>)->Result<Vec<String>> {
     super::delivery::now_check(now)?;
@@ -94,7 +87,7 @@ impl SqliteStore {
         let required=state!=ProjectState::Active;
         let digest=if required{None}else{config.map(String::from)};
         if control.state!=state||control.reconciliation_required!=required||control.config_digest!=digest {
-            control.state=state;control.reconciliation_required=required;control.config_digest=digest;control.revision=increment(control.revision)?;control.epoch=increment(control.epoch)?;write(&tx,&control,"project.control_changed",now)?;
+            control.state=state;control.reconciliation_required=required;control.config_digest=digest;control.revision=increment(control.revision)?;control.epoch=increment(control.epoch)?;write(&tx,&control,"project.control_changed")?;
         }
         let result=ControlChange{head:head(&tx)?,control};tx.commit()?;Ok(result)
     }
@@ -113,7 +106,7 @@ pub(super) fn invalidate(db:&Connection)->Result<()> {
         let mut control=read(db)?;
         control.reconciliation_required=true;control.config_digest=None;
         if control.state==ProjectState::Active{control.state=ProjectState::Paused;}
-        control.revision=increment(control.revision)?;control.epoch=increment(control.epoch)?;write(db,&control,"project.reconciliation_invalidated",jiff::Timestamp::now().as_millisecond())?;
+        control.revision=increment(control.revision)?;control.epoch=increment(control.epoch)?;write(db,&control,"project.reconciliation_invalidated")?;
     }
     Ok(())
 }

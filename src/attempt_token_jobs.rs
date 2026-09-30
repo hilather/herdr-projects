@@ -11,7 +11,7 @@ use std::{
     collections::BTreeMap,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 const JOB: &str = "\0herdr-projects-attempt-tokens";
@@ -40,21 +40,15 @@ fn rows(
             control.cancellation.clone(),
         ),
     )?
-    .attempt_tokens(
-        binding,
-        jiff::Timestamp::now().as_millisecond() - crate::coordinator::TOKEN_TTL.as_millis() as i64,
-    )
+    .attempt_tokens(&binding.map(|id| vec![id.to_owned()]).unwrap_or_default())
     .map_err(Into::into)
 }
 // Volatile scheduling hints only: bounded by project/attempt inventory and TTL.
 #[derive(Default)]
-struct Hints {
+pub struct Hints {
     cursors: BTreeMap<PathBuf, (String, Instant)>,
     sent: BTreeMap<String, (String, Instant)>,
-}
-fn hints() -> &'static Mutex<Hints> {
-    static HINTS: OnceLock<Mutex<Hints>> = OnceLock::new();
-    HINTS.get_or_init(|| Mutex::new(Hints::default()))
+    published: BTreeMap<(PathBuf, String), Instant>,
 }
 impl Input {
     // A revoked claim permits only erasure on the unchanged retained route.
@@ -105,12 +99,7 @@ impl Input {
             "attempt token launch changed"
         );
         control.check()?;
-        Ok((entry.publishing
-            || entry.cleanup_ms.is_some_and(|ms| {
-                jiff::Timestamp::now().as_millisecond() - ms
-                    < crate::coordinator::TOKEN_TTL.as_millis() as i64
-            }))
-        .then_some(entry.publishing))
+        Ok(Some(entry.publishing))
     }
 
     fn call(&self, method: &str, params: Value, control: &Control) -> Result<Value> {
@@ -227,8 +216,16 @@ impl Input {
         Ok(true)
     }
 }
-pub fn requests(path: &Path, control: &Control) -> Result<Vec<crate::executor::Request>> {
-    let state = rows(path, None, control)?;
+pub fn requests(path: &Path, control: &Control, memory: &Arc<Mutex<Hints>>) -> Result<Vec<crate::executor::Request>> {
+    let project = path.canonicalize()?;
+    let selected: Vec<String> = {
+        let mut hints = memory.lock().unwrap_or_else(|e| e.into_inner());
+        hints.published.retain(|_, at| at.elapsed() < crate::coordinator::TOKEN_TTL);
+        hints.published.keys().filter(|(p, _)| p == &project).map(|(_, id)| id.clone()).collect()
+    };
+    let state = herdr_projects::migration::open_active_scoped(path,
+        herdr_projects::store::controlled::ReadControl::new(control.deadline, control.cancellation.clone()))?
+        .attempt_tokens(&selected)?;
     let project = path.canonicalize()?;
     let m = std::fs::metadata(&project)?;
     let mut requests = Vec::new();
@@ -281,13 +278,13 @@ pub fn requests(path: &Path, control: &Control) -> Result<Vec<crate::executor::R
                 machine: format!("brief-root:{}", project.parent().unwrap().display()),
                 terminal: Some(binding.identity.pane_id.clone()),
             },
-            lane: crate::executor::Lane::Control,
+            lane: crate::executor::Lane::Advisory,
             deadline,
             command,
         });
     }
     requests.sort_by(|a, b| a.identity.operation.cmp(&b.identity.operation));
-    let mut hints = hints().lock().unwrap_or_else(|e| e.into_inner());
+    let mut hints = memory.lock().unwrap_or_else(|e| e.into_inner());
     hints
         .cursors
         .retain(|_, (_, at)| at.elapsed() < crate::coordinator::TOKEN_TTL);
@@ -306,7 +303,7 @@ pub fn requests(path: &Path, control: &Control) -> Result<Vec<crate::executor::R
     }
     Ok(requests)
 }
-fn execute(input: &Input, control: &Control) -> Result<()> {
+fn execute(input: &Input, control: &Control, memory: &Arc<Mutex<Hints>>) -> Result<()> {
     ensure!(
         input.project.is_absolute() && input.ownership.origin == "launched",
         "invalid attempt token input"
@@ -336,6 +333,9 @@ fn execute(input: &Input, control: &Control) -> Result<()> {
     let Some(publishing) = input.current(control)? else {
         return Ok(());
     };
+    let binding_key = (input.project.clone(), input.binding.id.clone());
+    if !publishing && !memory.lock().unwrap_or_else(|e| e.into_inner()).published.get(&binding_key)
+        .is_some_and(|at| at.elapsed() < crate::coordinator::TOKEN_TTL) { return Ok(()); }
     let key = crate::thread::sha256_hex(&serde_json::to_vec(input)?);
     let decoration = if publishing {
         suffix.clone()
@@ -343,7 +343,7 @@ fn execute(input: &Input, control: &Control) -> Result<()> {
         String::new()
     };
     {
-        let mut hints = hints().lock().unwrap_or_else(|e| e.into_inner());
+        let mut hints = memory.lock().unwrap_or_else(|e| e.into_inner());
         hints
             .sent
             .retain(|_, (_, at)| at.elapsed() < crate::coordinator::TOKEN_TTL);
@@ -354,11 +354,7 @@ fn execute(input: &Input, control: &Control) -> Result<()> {
         }
     }
     if !input.observe(control, publishing)? {
-        hints()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .sent
-            .insert(key, (decoration, Instant::now()));
+        memory.lock().unwrap_or_else(|e| e.into_inner()).published.remove(&binding_key);
         return Ok(());
     }
     let publishing_now = input.current(control)?;
@@ -384,9 +380,19 @@ fn execute(input: &Input, control: &Control) -> Result<()> {
         result["type"] == "ok",
         "attempt token response has wrong type"
     );
+    {
+        let mut hints = memory.lock().unwrap_or_else(|e| e.into_inner());
+        if publishing {
+            hints.published.insert(binding_key, Instant::now());
+            while hints.published.len() > 256 {
+                let oldest = hints.published.iter().min_by_key(|(_, at)| **at).map(|(key, _)| key.clone()).unwrap();
+                hints.published.remove(&oldest);
+            }
+        } else { hints.published.remove(&binding_key); }
+    }
     // This is only a volatile cadence hint, even if the following checks fail
     // or the native endpoint ignored the update. A changed suffix bypasses it.
-    hints()
+    memory
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .sent
@@ -400,6 +406,7 @@ fn execute(input: &Input, control: &Control) -> Result<()> {
 }
 pub struct JobRunner {
     pub inner: Arc<dyn Runner + Send + Sync>,
+    pub memory: Arc<Mutex<Hints>>,
 }
 impl Runner for JobRunner {
     fn run(&self, cmd: &Cmd) -> Result<Output> {
@@ -429,7 +436,7 @@ impl Runner for JobRunner {
                 .clone()
                 .context("attempt token cancellation missing")?,
         };
-        if let Err(error) = execute(&serde_json::from_str(text)?, &control) {
+        if let Err(error) = execute(&serde_json::from_str(text)?, &control, &self.memory) {
             // The canonical controller owns priority. A nonblocking guard
             // conflict is a skipped decoration tick, not a native failure.
             if !matches!(

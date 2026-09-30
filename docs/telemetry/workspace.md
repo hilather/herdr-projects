@@ -176,11 +176,16 @@ or budget effect.
 Canonical token admission and rechecks read only selected runtime bindings,
 launch receipts, ownership, collector binding and lifecycle observations; they
 never read the whole store snapshot. Live Running/AwaitingInput attempts may
-publish. Cleanup is offered only within 300 seconds of termination,
-relinquishment, collector revocation or project pause; a missing pane during
-cleanup is already clear. Native expiry handles older observations. Each
+publish. Cleanup is offered only for this ticker's successfully published
+bindings, until 300 seconds after their last publish. The in-process map holds
+at most 256 bindings, evicting the oldest publish. Successful erase or an absent
+pane removes the entry. After restart this map is empty: leftover decorations
+expire by native TTL, the accepted residual also used for unreachable panes. Each
 project offers at most 16 attempt jobs per tick, rotating through attempts;
-these offers never evict other queue entries. An unchanged suffix refreshes
+these offers never evict other queue entries. Advisory jobs share bounded
+Transfer workers, run only after Control and Transfer work drains, and are
+cancelled when new canonical work arrives. They do not hold the effect queue's
+single ticket or prevent observation admission. An unchanged suffix refreshes
 at most once per 100 seconds per ticker process, while changes publish promptly.
 
 The effect guard is acquired nonblockingly for short store and identity checks

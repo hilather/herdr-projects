@@ -1852,25 +1852,24 @@ fn canonical_attempt_sidebar_refreshes_and_clears_on_pause_and_termination() {
     lab.wait(&mut ticker, 90, &|| metadata().iter().any(|p| p["tokens"] == json!({"telemetry":null})));
     assert_eq!(lab.attempt(&attempt).state, AttemptState::Running);
     lab.stop(ticker);
-    // Cancellation is a separate real public workflow; remove old requests so
-    // a prior pause deletion cannot satisfy the termination assertion.
+    // Cleanup removed the process-local publish entry. A fresh ticker must
+    // not issue another erase for the already cleared paused attempt.
     fs::write(lab.path("lab/requests"), "").unwrap();
     let running = lab.attempt(&attempt);
     lab.ok(&["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &running.revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "sidebar lifecycle"]);
     let mut ticker = lab.spawn();
     lab.wait(&mut ticker, 90, &|| lab.attempt(&attempt).termination_observed);
-    lab.wait(&mut ticker, 90, &|| metadata().iter().any(|p| p["tokens"] == json!({"telemetry":null})));
     lab.stop(ticker);
     assert_eq!(lab.attempt(&attempt).state, AttemptState::Cancelled);
-    assert!(metadata().iter().all(|p| p["tokens"] == json!({"telemetry":null})), "{:?}", metadata());
+    assert_eq!(metadata().len(), 0, "{:?}", metadata());
     assert_eq!((lab.count("workspace.create_command"), lab.count("agent.prompt")), (0, 0));
-    // Explicit relinquishment retains the route and still permits erasure.
+    // Relinquishment after restart must not discover historical cleanup work.
     let state = lab.state();
     let owner = state.ownership.iter().find(|o| o.binding == lab.binding).unwrap();
     runtime::relinquish(&lab.project, &lab.binding, owner.revision, state.head, "sidebar relinquishment").unwrap();
     fs::write(lab.path("lab/requests"), "").unwrap();
-    lab.run_until(20, &|| lab.count("pane.report_metadata") > 0);
-    assert!(metadata().iter().all(|p| p["tokens"] == json!({"telemetry":null})), "{:?}", metadata());
+    lab.run_passes(4);
+    assert_eq!(metadata().len(), 0, "{:?}", metadata());
     // A public route edit advances the binding generation. Neither the old
     // pane nor the replacement may receive metadata from the retired attempt.
     let state = lab.state();
@@ -1944,18 +1943,17 @@ fn canonical_attempt_sidebar_uses_collected_usage_and_observed_waiting() {
     drop(sidecar);
     let mut ticker = lab.spawn();
     lab.wait(&mut ticker, 60, &|| has_token("codex ● 6s"));
-    lab.stop(ticker);
     assert_eq!((lab.count("workspace.create_command"), lab.count("agent.prompt")), (1, 1));
     // Collector revocation keeps historical counters but clears the decoration
     // while the worker and its runtime ownership remain live.
     fs::write(lab.path("lab/requests"), "").unwrap();
-    lab.ok(&["telemetry", "demo", "collectors", "revoke", attempt.as_str()]);
-    lab.run_until(20, &|| lab.requests().iter().any(|(m, p)| m == "pane.report_metadata" && p["tokens"] == json!({"telemetry":null})));
+    lab.ok_live(&|| ["telemetry", "demo", "collectors", "revoke", attempt.as_str()].map(String::from).to_vec());
+    lab.wait(&mut ticker, 90, &|| lab.requests().iter().any(|(m, p)| m == "pane.report_metadata" && p["tokens"] == json!({"telemetry":null})));
     assert_eq!(lab.attempt(&attempt).state, AttemptState::Running);
     let running = lab.attempt(&attempt);
-    fs::write(lab.path("lab/requests"), "").unwrap();
+    lab.stop(ticker);
     lab.ok(&["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &running.revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "fixture cleanup"]);
-    lab.run_until(20, &|| lab.attempt(&attempt).termination_observed && lab.requests().iter().any(|(m, p)| m == "pane.report_metadata" && p["tokens"] == json!({"telemetry":null})));
+    lab.run_until(20, &|| lab.attempt(&attempt).termination_observed);
     let last = lab.requests().into_iter().rev().find(|(m, _)| m == "pane.report_metadata").unwrap().1;
     assert_eq!(last["tokens"], json!({"telemetry":null}));
     assert_eq!(lab.attempt(&attempt).state, AttemptState::Cancelled);
@@ -1970,21 +1968,20 @@ fn canonical_attempt_sidebar_clears_after_termination_in_an_active_project() {
     lab.serve();
     let mut ticker = lab.spawn();
     lab.wait(&mut ticker, 120, &|| lab.requests().iter().any(|(m, p)| m == "pane.report_metadata" && p["tokens"] == json!({"telemetry":"claude ○"})));
-    lab.stop(ticker);
     fs::write(lab.path("lab/requests"), "").unwrap();
-    let running = lab.attempt(&attempt);
-    lab.ok(&["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &running.revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "sidebar termination"]);
-    lab.run_until(20, &|| lab.attempt(&attempt).termination_observed && lab.requests().iter().any(|(m, p)| m == "pane.report_metadata" && p["tokens"] == json!({"telemetry":null})));
+    lab.ok_live(&|| {let running=lab.attempt(&attempt); ["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &running.revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "sidebar termination"].map(String::from).to_vec()});
+    lab.wait(&mut ticker, 90, &|| lab.attempt(&attempt).termination_observed && lab.requests().iter().any(|(m, p)| m == "pane.report_metadata" && p["tokens"] == json!({"telemetry":null})));
     assert_eq!(lab.state().control.unwrap().state, ProjectState::Active);
     assert_eq!(lab.attempt(&attempt).state, AttemptState::Cancelled);
     let last = lab.requests().into_iter().rev().find(|(m, _)| m == "pane.report_metadata").unwrap().1;
     assert_eq!((last["pane_id"].clone(), last["tokens"].clone()), (json!("w1:p1"), json!({"telemetry":null})));
+    lab.stop(ticker);
 }
 
-/// A real launched/cancelled worker with an aged termination observation must
-/// not enter the decoration queue, even when its retained pane is still present.
+/// A restarted ticker must not discover historical cleanup work, even when
+/// a cancelled worker's retained pane is still present.
 #[test]
-fn canonical_attempt_sidebar_expired_termination_offers_no_job_or_native_request() {
+fn canonical_attempt_sidebar_restart_offers_no_historical_cleanup_or_native_request() {
     let mut lab = Lab::new("unknown_usage='allow_with_warning'");
     let (_, attempt) = lab.reserve("Retained instructions");
     lab.serve();
@@ -1992,15 +1989,12 @@ fn canonical_attempt_sidebar_expired_termination_offers_no_job_or_native_request
     let running = lab.attempt(&attempt);
     lab.ok(&["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &running.revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "expired sidebar fixture"]);
     lab.run_until(90, &|| lab.attempt(&attempt).termination_observed);
-    // Deterministic clock fixture: age the retained observation rather than
-    // sleeping for five minutes. Launch, stop, ownership and routes are real.
-    let old = jiff::Timestamp::now().as_millisecond() - 301_000;
-    let db = rusqlite::Connection::open(lab.project.join(".state/state.db")).unwrap();
-    assert_eq!(db.execute("UPDATE events SET payload=json_set(payload,'$.observed_unix_ms',?1) WHERE kind='runtime.worker_terminated' AND entity=?2", rusqlite::params![old, attempt.as_str()]).unwrap(), 1);
-    drop(db);
     let control = herdr_projects::store::controlled::ReadControl::new(Instant::now() + Duration::from_secs(10), Default::default());
     let mut store = migration::open_active_scoped(&lab.project, control).unwrap();
-    assert!(store.attempt_tokens(None, jiff::Timestamp::now().as_millisecond() - 300_000).unwrap().entries.is_empty());
+    assert!(store.attempt_tokens(&[]).unwrap().entries.is_empty());
+    let cleanup = store.attempt_tokens(std::slice::from_ref(&lab.binding)).unwrap();
+    assert_eq!(cleanup.entries.len(), 1);
+    assert!(!cleanup.entries[0].publishing);
     drop(store);
     fs::write(lab.path("lab/requests"), "").unwrap();
     fs::write(lab.path("lab/request-ids"), "").unwrap();

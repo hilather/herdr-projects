@@ -442,7 +442,7 @@ pub(crate) fn background_memory(ctx:&Ctx)->Result<Memory> {
     #[cfg(feature="state-store")]
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::canonical_notification_jobs::JobRunner{inner:runner});
     #[cfg(feature="state-store")]
-    let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::attempt_token_jobs::JobRunner{inner:runner});
+    let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::attempt_token_jobs::JobRunner{inner:runner,memory:memory.attempt_tokens.clone()});
     #[cfg(feature="state-store")]
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::canonical_finalization_jobs::JobRunner{inner:runner});
     #[cfg(feature="state-store")]
@@ -568,10 +568,6 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         let mut any_reachable=any_reachable;
         if !canonical.is_empty() {let first=(memory.tick.saturating_sub(1)%canonical.len() as u64) as usize;canonical.rotate_left(first);}
         for slug in &canonical {
-            if let Some(queue)=memory.copy_jobs.as_mut() {
-                let control=crate::source_tree::Control{deadline:Instant::now()+Duration::from_secs(5),cancellation:crate::runner::Cancellation::default()};
-                if let Err(error)=queue.offer_attempt_tokens(&ctx.root.join(slug),&control){log.line(&format!("{slug}: attempt token admission: {error:#}"));}
-            }
             let result=if let Some(reads)=memory.canonical_observations.as_mut(){crate::canonical_controller::poll_queued_effects(ctx,&ctx.root.join(slug),memory.tick.saturating_sub(1),reads,memory.copy_jobs.as_mut())}else{crate::canonical_controller::poll(ctx,&ctx.root.join(slug),memory.tick.saturating_sub(1))};
             match result {
                 Ok(result)=>{
@@ -618,7 +614,7 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
             integrity_pass(ctx,log,slug);
             telemetry_pass(ctx,log,slug);
         }
-        admit_background(ctx,log,memory,canonical.into_iter().map(|slug|ctx.root.join(slug)).collect());
+        admit_background(ctx,log,memory,canonical.iter().map(|slug|ctx.root.join(slug)).collect());
         if let Some(reads)=memory.local_reports.as_mut(){for error in reads.admit(){log.line(&error);}}
         if let Some(reads)=memory.local_observations.as_mut(){for error in reads.admit(){log.line(&error);}}
         if let Some(reads)=memory.canonical_observations.as_mut(){
@@ -627,6 +623,26 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
             // A completed exclusive effect gives maintenance the next batch.
             let blocked=memory.copy_jobs.as_ref().is_some_and(|q|q.pending_exclusive_root()||(!memory.canonical_maintenance_turn&&q.offered_exclusive_root()));
             for error in reads.admit_where(|project|!blocked&&!memory.copy_jobs.as_ref().is_some_and(|q|q.pending_project(project))&&!memory.routine_jobs.as_ref().is_some_and(|q|q.pending_project(project))){log.line(&error);}
+        }
+        // Advisory tickets never occupy an effect/observation turn. The executor
+        // holds them until the just-admitted canonical batch has fully drained.
+        memory.attempt_token_tickets.retain(|ticket| match ticket.try_recv() {
+            Ok(None) => true,
+            Ok(Some(completion)) => { if let Err(error)=completion.result {log.line(&format!("attempt token: {error:#}"));} false },
+            Err(error) => {log.line(&format!("attempt token: {error:#}"));false}
+        });
+        if !memory.copy_jobs.as_ref().is_some_and(|q|q.pending()||q.canonical_work_pending())
+            && !memory.routine_jobs.as_ref().is_some_and(|q|q.pending())
+            && memory.attempt_token_tickets.is_empty() {
+            for slug in &canonical {
+                let control=crate::source_tree::Control{deadline:Instant::now()+Duration::from_secs(5),cancellation:Default::default()};
+                match crate::attempt_token_jobs::requests(&ctx.root.join(slug),&control,&memory.attempt_tokens) {
+                    Ok(requests)=>if let Some(queue)=memory.copy_jobs.as_ref() {for request in requests {
+                        match queue.submit_advisory(request) {Ok(ticket)=>memory.attempt_token_tickets.push(ticket),Err(error) if error.to_string().contains("executor queue is full")=>{},Err(error)=>log.line(&format!("{slug}: attempt token admission: {error:#}"))}
+                    }},
+                    Err(error)=>log.line(&format!("{slug}: attempt token admission: {error:#}"))
+                }
+            }
         }
         memory.canonical_maintenance_turn=false;
         any_reachable|=memory.routine_jobs.as_ref().is_some_and(|q|q.pending());

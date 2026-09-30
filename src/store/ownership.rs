@@ -108,7 +108,7 @@ impl SqliteStore {
         tx.execute("DELETE FROM runtime_ownership WHERE binding_id=?1",[id])?;
         super::active_work::invalidate(&tx)?;
         tx.execute("DELETE FROM runtime_observations WHERE binding_id=?1",[id])?;
-        let payload=serde_json::json!({"ownership":owned,"reason":reason,"resources_removed":false,"observed_unix_ms":jiff::Timestamp::now().as_millisecond()});
+        let payload=serde_json::json!({"ownership":owned,"reason":reason,"resources_removed":false});
         tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.relinquished',?1,?2,1,?3)",params![id,integer(expected_revision)?,payload.to_string()])?;
         super::control::invalidate(&tx)?;let head=head(&tx)?;tx.commit()?;Ok(head)
     }
