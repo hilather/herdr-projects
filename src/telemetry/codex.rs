@@ -132,6 +132,10 @@ fn digest(bytes: &[u8]) -> String {
 pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Collected>> {
     let (attempts, homes) = canonical(project)?;
     let Some(mut db) = super::sidecar::open(project, create || !homes.is_empty())? else { return Ok(None) };
+    // TM5.3: tombstoned sessions are never collected again (maintenance holds
+    // the lock exclusively while it tombstones and deletes).
+    let _maintenance = super::maintenance::lock(project, false)?;
+    let tombstones = super::maintenance::Tombstones::of(project)?;
     let project = std::fs::canonicalize(project)?;
     let worktrees = format!("{}/.state/worktrees/", project.display());
     let mut done = Collected::default();
@@ -150,12 +154,13 @@ pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Co
         files.sort();
         seen.extend(files.iter().map(|file| digest(file.as_os_str().as_encoded_bytes())));
         for file in files {
+            if tombstones.key(super::maintenance::SESSIONS, &format!("path:{}", digest(file.as_os_str().as_encoded_bytes()))).is_some() { continue; }
             if remaining == 0 || unwritable {
                 done.budget_exhausted |= remaining == 0;
                 break;
             }
             let mut span = (0, 0);
-            let read = match tail(&mut db, &file, &digest(home.as_bytes()), &worktrees, remaining, &from_start, &mut done, &mut span) {
+            let read = match tail(&mut db, &file, &digest(home.as_bytes()), &worktrees, remaining, &from_start, &tombstones, &mut done, &mut span) {
                 Ok(read) => read,
                 // The pass rolled back: its range is a coverage gap and later
                 // sources wait for the next collect (contracts-collection.md A2).
@@ -176,6 +181,7 @@ pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Co
         db.execute("UPDATE rollout_sources SET reevaluation='rollout_unavailable' WHERE path_digest=?1", [key])?;
     }
     bind(&db, &attempts)?;
+    super::maintenance::enforce(&mut db, &tombstones)?;
     Ok(Some(done))
 }
 
@@ -621,8 +627,8 @@ fn final_event(tx: &Transaction, ledger: &ingest::Ledger, cursor: &Cursor, at_eo
 /// Ingest complete lines of one rollout after its stored offset, with their
 /// envelopes, in one sidecar transaction. `span`: the byte range this pass covers.
 #[allow(clippy::too_many_arguments)]
-fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance: u64, reread: &std::collections::BTreeSet<String>, done: &mut Collected,
-    span: &mut (u64, u64)) -> Result<u64> {
+fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance: u64, reread: &std::collections::BTreeSet<String>,
+    tombstones: &super::maintenance::Tombstones, done: &mut Collected, span: &mut (u64, u64)) -> Result<u64> {
     let key = digest(file.as_os_str().as_encoded_bytes());
     let Ok(mut handle) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(file) else { return Ok(0) };
     let meta = handle.metadata()?;
@@ -711,6 +717,11 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
         if !record(&tx, &ledger, at, &tag, &line, &key, home, worktrees, &mut cursor, now, done, &mut observed)? {
             ledger.malformed(&tx, at, "record_malformed", n, now)?;
             continue;
+        }
+        // A copy of a tombstoned session: nothing of this pass is kept.
+        if first_meta && let Some((session, _, _)) = &cursor.session
+            && tombstones.key(super::maintenance::SESSIONS, &format!("session:{session}")).is_some() {
+            return Ok(0);
         }
         let kind = match (tag.kind.as_deref(), tag.payload.as_ref().and_then(|p| p.kind.as_deref())) {
             (Some("event_msg" | "response_item"), inner) => inner,

@@ -70,7 +70,11 @@ with pinned records). One entry per query result:
 **Corrections.** A late correction appends a restatement (contracts-analytics
 §4); an export `--as-of-seq` of the earlier revision reproduces its totals and
 carries `projection.restated: true`, `superseded_by` and `current_revision`.
-Analytics keeps no tombstones: nothing is deleted, only superseded.
+Analytics itself deletes nothing, only supersedes; under `retention.v1`
+(TM5.3, [operations-runbook.md](operations-runbook.md)) the owner's
+`maintenance apply` may expire superseded revisions older than 365 days,
+with a tombstone each, after which an `--as-of-seq` of such a revision is
+unavailable. The current revision of every cell is kept.
 
 **Records** (with `--drill`): `{metric_id, definition, bucket, buckets,
 snapshot {revision, content_digest}, offset, page_size, total, rows}`, rows as

@@ -184,6 +184,11 @@ pub fn exchange(spool: &Path, kind: Kind, document: Option<Vec<u8>>, argument: O
                 _ => bail!("invalid submission spool receipt {}", receipt.display()),
             };
         }
+        // Retired before the ticker answered (TM5.3): the request is gone and
+        // nothing records it, so say so instead of waiting for a receipt.
+        if matches!(std::fs::symlink_metadata(spool.join(format!("{digest}.request"))), Err(error) if error.kind() == io::ErrorKind::NotFound) {
+            bail!("the submission spool {} lost request {digest} before the ticker answered it: nothing was submitted; run the command again once the spool is back", spool.display());
+        }
         ensure!(
             Instant::now() < deadline,
             "no receipt from the ticker within {} s for spooled request {digest}; it stays queued, and the same command waits again",

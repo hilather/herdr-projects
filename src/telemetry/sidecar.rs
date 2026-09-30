@@ -35,6 +35,14 @@ fn check(versions: &BTreeMap<String, usize>) -> Result<()> {
     Ok(())
 }
 
+/// Stored stream versions, refused when any is newer than this binary knows
+/// (TM5.3 backup and restore check a copy with it before exposing it).
+pub(crate) fn stream_versions(db: &Connection) -> Result<BTreeMap<String, usize>> {
+    let versions = versions(db)?;
+    check(&versions)?;
+    Ok(versions)
+}
+
 /// Whether a sidecar read without migrating has the 0002 `reevaluation` column.
 fn reevaluation_column(db: &Connection) -> rusqlite::Result<&'static str> {
     let present: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('rollout_sources') WHERE name='reevaluation')", [], |r| r.get(0))?;

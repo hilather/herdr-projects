@@ -31,6 +31,11 @@ needs a new reviewed revision, not a silent reinterpretation.
 - Health rules, deduplicated alerts, inbox notices and advisory
   recommendations with M50 evidence freshness (TM4.5):
   [contracts-health.md](contracts-health.md).
+- Retention classes (`retention.v1`), holds, tombstoned deletion, sidecar
+  backup and restore (TM5.3): the operations store
+  `<project>/.state/telemetry-ops.db` (tombstones, holds, runs, backup
+  inventory, restore reports; not a sidecar stream) and
+  [operations-runbook.md](operations-runbook.md).
 
 ## 0. Common rules
 
@@ -572,10 +577,12 @@ spool; budget bridge enforcement and any change to `UnknownUsagePolicy` (TM2.4;
 the shadow bridge landed, contracts-accounting.md §14);
 Claude and OTLP adapters; candidate-group selection and races; stochastic
 assignment policies; coordinator digest,
-sidebar suffix and inbox alerts; retention jobs and restore; configuration
+sidebar suffix and inbox alerts; configuration
 staleness (M50); resume/compaction reconciliation beyond quarantine.
 
-Landed since phase 1 (see the lane contracts): collector bindings
+Landed since phase 1 (see the lane contracts): retention, holds,
+tombstoned deletion, backup and restore (TM5.3,
+[operations-runbook.md](operations-runbook.md)), collector bindings
 (contracts-collection.md), usage ledger, session graph and rate-card
 estimates (contracts-accounting.md §2–§4), proxy signals and integration
 outcomes, candidate groups and selection (contracts-quality.md §1–§4),

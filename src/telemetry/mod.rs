@@ -7,6 +7,7 @@ pub mod collectors;
 pub mod export;
 pub mod health;
 pub mod ingest;
+pub mod maintenance;
 pub mod metrics;
 pub mod outcome;
 pub mod panel;

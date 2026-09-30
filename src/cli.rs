@@ -899,6 +899,10 @@ enum TelemetryCommand {
     Workspace { #[command(subcommand)] command:herdr_projects::telemetry::workspace::Command },
     /// TM4.8 fleet pane: the workspace snapshot, refreshed on an interval. Read-only.
     Watch(herdr_projects::telemetry::workspace::WatchArgs),
+    /// TM5.3 retention classes, holds and tombstoned deletion (`retention.v1`); `apply` is the owner's and destructive items need --confirm.
+    Maintenance { #[command(subcommand)] command:herdr_projects::telemetry::maintenance::Command },
+    /// TM5.3 sidecar backup (online, digest manifest, optional age encryption) and offline restore that reapplies tombstones. Never writes state.db.
+    Backup { #[command(subcommand)] command:herdr_projects::telemetry::maintenance::backup::Command },
 }
 
 #[cfg(feature="state-store")]
@@ -1356,6 +1360,16 @@ pub fn run() -> Result<()> {
         Command::Telemetry{slug,command:TelemetryCommand::Recommend(args)}=>{
             project::validate_slug(&slug)?;
             print!("{}",herdr_projects::telemetry::health::run_recommend(&ctx.root.join(slug),&args)?);Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Telemetry{slug,command:TelemetryCommand::Maintenance{command}}=>{
+            project::validate_slug(&slug)?;
+            print!("{}",herdr_projects::telemetry::maintenance::run(&ctx.root.join(slug),&ctx.config_dir,command)?);Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Telemetry{slug,command:TelemetryCommand::Backup{command}}=>{
+            project::validate_slug(&slug)?;
+            print!("{}",herdr_projects::telemetry::maintenance::backup::run(&ctx.root.join(slug),command)?);Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:lane@(TelemetryCommand::Collectors{..}|TelemetryCommand::Accounting{..}|TelemetryCommand::Quality{..}|TelemetryCommand::Review{..})}=>{
