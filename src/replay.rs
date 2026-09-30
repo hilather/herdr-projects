@@ -351,7 +351,10 @@ fn replay_repository(source: &Path, dest: &Path, format: &str, base: &str, contr
 fn run_suite(project: &Path, suite: &str, configuration: &str, subset: &str, seed: &str, expected_head: u64) -> Result<Value> {
     let _guard = migration::runtime_mutation(project)?;
     let mut db = migration::open_active(project)?;
-    let control = crate::store::controlled::ReadControl::new(std::time::Instant::now() + std::time::Duration::from_secs(60), Default::default());
+    // The operator's run holds project mutation ownership while it builds the
+    // replay repositories, so it is bounded; generously, since packing a
+    // case's base history scales with the repository.
+    let control = crate::store::controlled::ReadControl::new(std::time::Instant::now() + std::time::Duration::from_secs(600), Default::default());
     run_suite_owned(project, &mut db, suite, configuration, subset, seed, expected_head, &control, &[])
 }
 
