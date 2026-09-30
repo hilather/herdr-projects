@@ -478,7 +478,7 @@ fn isolated_worker_cannot_read_the_signer_key() {
     let home = lab.path("agent-home").canonicalize().unwrap();
     let cwd = lab.repo.canonicalize().unwrap();
     let config = lab.path(".config/herdr-projects/config.toml");
-    let isolation = Isolation::for_agent(&lab.project, &home, &cwd, Path::new("/bin/sh"), &[cwd.as_path()], Some(&config), Some(&lab.path("lab/native.sock")), &[]).unwrap();
+    let isolation = Isolation::for_agent(&lab.project, &home, &cwd, Path::new("/bin/sh"), &[cwd.as_path()], &[], Some(&config), Some(&lab.path("lab/native.sock")), &[]).unwrap();
     let argv = isolated_gated_command(Path::new("/bin/sh"), &["-c".into(), probe.clone()], 60, "release-signer-probe", &home, &isolation).unwrap();
     let mut child = Command::new(&argv[0]).args(&argv[1..]).current_dir(&cwd).env_clear().env("HOME", lab.home.path()).env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
