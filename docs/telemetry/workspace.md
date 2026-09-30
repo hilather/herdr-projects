@@ -161,6 +161,18 @@ cost. Herdr shows the token only where your sidebar format names it, so
 leaving it out of the format disables the suffix. Resolving or pausing a
 thread clears the token with the others.
 
+Running canonical attempts report the same suffix to the pane named by their
+retained runtime binding. Their glyph comes from the attempt telemetry read
+path: `●` for complete usage coverage, `◐` for partial, and `○` for unavailable
+or unknown. An open wait adds its observed duration, without extrapolating
+beyond the last attention observation. There is no ranking or cost. Refreshes
+check the binding and ownership revisions, recorded socket incarnation and
+native pane/agent identities. Termination, runtime ownership or usage collector
+binding revocation, and project pause clear the token on the unchanged route. A replaced binding receives no
+update; native token expiry bounds decoration on a gone or changed pane.
+These metadata jobs are advisory and create no launch, reservation, approval
+or budget effect.
+
 **Reasons.** `thread start --reason CODE` accepts the canonical dispatch
 log's operator reasons: `operator_selected`, `recommended`,
 `operator_preference`, `availability`, `exploration`, `replay`,
@@ -277,14 +289,6 @@ demo · fleet · unavailable (query_service_down): nothing numeric is shown
 - Services come from M38/M39, which are uncertified (`n/a`), and from M40,
   which is quota at dispatch rather than live headroom. Live window headroom
   is TM4.5's `quota_headroom` rule, and it appears here as an alert.
-- The sidebar suffix covers legacy threads. Canonical attempts have no
-  per-pane status-line publisher: `token_jobs::Target` and `Current` support
-  only `Thread` and `Coordinator`, and `ticker` schedules those token jobs.
-  Canonical worker supervision publishes launch/readiness/brief observations,
-  not `pane.report_metadata` tokens; its native route may also be socket-only.
-  Adding an attempt token would require a new route/ownership-fenced metadata
-  job and lifecycle cleanup, rather than extending an existing status line.
-  Canonical telemetry remains visible in the fleet pane; this suffix is skipped.
 - Weekly report and replay routines use the existing signed routine path
   (§10).
 

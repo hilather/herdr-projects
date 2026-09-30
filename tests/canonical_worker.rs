@@ -26,6 +26,7 @@ while True:
  live='pid' in s and not os.path.exists(os.path.join(root,'vanish'))
  with open(os.path.join(root,'requests'),'a') as log:log.write(json.dumps({'method':m,'params':p})+'\n')
  pane={'pane_id':'w1:p1','workspace_id':'w1','tab_id':'w1:t1','terminal_id':'term1','cwd':s.get('cwd')}
+ if os.path.exists(os.path.join(root,'changed-terminal')):pane['terminal_id']='replacement-terminal'
  kind=open(os.path.join(root,'agent-kind')).read() if os.path.exists(os.path.join(root,'agent-kind')) else 'claude'
  agent=dict(pane,agent=kind,interactive_ready=True,agent_status='idle',**({'name':s['name']} if 'name' in s else {}))
  res=None
@@ -40,6 +41,7 @@ while True:
  elif m=='workspace.list':res={'type':'workspace_list','workspaces':[{'workspace_id':'w1','label':s['label'],'pane_count':1,'tab_count':1}] if live else []}
  elif m=='pane.list':res={'panes':[pane] if live else []}
  elif m=='pane.get':res={'pane':pane}
+ elif m=='pane.report_metadata':res={'type':'ok'}
  elif m=='pane.process_info':res={'process_info':{'pane_id':'w1:p1','foreground_processes':[{'pid':s['pid'],'argv':s['argv']}] if live else []}}
  elif m=='pane.send_input' and os.path.exists(os.path.join(root,'drop-release')):pass
  elif m=='pane.send_input':
@@ -1829,4 +1831,151 @@ fn a_hidden_path_covering_the_execution_home_refuses_the_launch_before_creation(
     assert_eq!(lab.count("workspace.create_command"), 0, "{:?}", lab.requests());
     assert!(lab.events("runtime.launch_target").is_empty() && lab.events("runtime.launch_started").is_empty());
     assert!(lab.attempt(&attempt).retains_capacity());
+}
+
+
+/// Running, paused and terminated attempts use the retained pane, with explicit
+/// deletion on lifecycle changes. Claude usage is unavailable: unknown ○.
+#[test]
+fn canonical_attempt_sidebar_refreshes_and_clears_on_pause_and_termination() {
+    let mut lab = Lab::new("unknown_usage='allow_with_warning'");
+    let (_, attempt) = lab.reserve("Retained instructions");
+    lab.serve();
+    let metadata = || lab.requests().into_iter().filter(|(m, _)| m == "pane.report_metadata").map(|(_, p)| p).collect::<Vec<_>>();
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 120, &|| metadata().iter().any(|p| p["tokens"]["telemetry"] == "claude ○"));
+    let published = metadata();
+    assert!(published.iter().all(|p| p["pane_id"] == "w1:p1" && p["source"] == "herdr-projects" && p["tokens"] == json!({"telemetry":"claude ○"})), "{published:?}");
+    assert_eq!(lab.attempt(&attempt).state, AttemptState::Running);
+    lab.ok_live(&|| { let s = lab.state(); ["runtime", "demo", "state", "paused", "--expected-revision", &s.control.unwrap().revision.to_string(), "--expected-head", &s.head.to_string()].map(String::from).to_vec() });
+    lab.wait(&mut ticker, 90, &|| metadata().iter().any(|p| p["tokens"] == json!({"telemetry":null})));
+    assert_eq!(lab.attempt(&attempt).state, AttemptState::Running);
+    lab.stop(ticker);
+    // Cancellation is a separate real public workflow; remove old requests so
+    // a prior pause deletion cannot satisfy the termination assertion.
+    fs::write(lab.path("lab/requests"), "").unwrap();
+    let running = lab.attempt(&attempt);
+    lab.ok(&["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &running.revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "sidebar lifecycle"]);
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 90, &|| lab.attempt(&attempt).termination_observed);
+    lab.wait(&mut ticker, 90, &|| metadata().iter().any(|p| p["tokens"] == json!({"telemetry":null})));
+    lab.stop(ticker);
+    assert_eq!(lab.attempt(&attempt).state, AttemptState::Cancelled);
+    assert!(metadata().iter().all(|p| p["tokens"] == json!({"telemetry":null})), "{:?}", metadata());
+    assert_eq!((lab.count("workspace.create_command"), lab.count("agent.prompt")), (0, 0));
+    // Explicit relinquishment retains the route and still permits erasure.
+    let state = lab.state();
+    let owner = state.ownership.iter().find(|o| o.binding == lab.binding).unwrap();
+    runtime::relinquish(&lab.project, &lab.binding, owner.revision, state.head, "sidebar relinquishment").unwrap();
+    fs::write(lab.path("lab/requests"), "").unwrap();
+    lab.run_until(20, &|| lab.count("pane.report_metadata") > 0);
+    assert!(metadata().iter().all(|p| p["tokens"] == json!({"telemetry":null})), "{:?}", metadata());
+    // A public route edit advances the binding generation. Neither the old
+    // pane nor the replacement may receive metadata from the retired attempt.
+    let state = lab.state();
+    let binding = state.runtime_bindings.iter().find(|b| b.id == lab.binding).unwrap();
+    let mut route = RuntimeRoute::from_identity(&binding.identity);
+    route.pane_id = "w1:p2".into();
+    runtime::rebind(&lab.project, &binding.id, binding.revision, state.head, &route).unwrap();
+    fs::write(lab.path("lab/requests"), "").unwrap();
+    lab.run_passes(4);
+    assert_eq!(lab.count("pane.report_metadata"), 0, "{:?}", lab.requests());
+}
+
+/// A native terminal replacement at the same pane ID must receive no metadata,
+/// including cleanup. The old suffix expires via its native TTL.
+#[test]
+fn canonical_attempt_sidebar_does_not_publish_to_a_replaced_terminal() {
+    let mut lab = Lab::new("unknown_usage='allow_with_warning'");
+    let (_, attempt) = lab.reserve("Retained instructions");
+    lab.serve();
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 120, &|| lab.count("pane.report_metadata") > 0);
+    lab.stop(ticker);
+    fs::write(lab.path("lab/changed-terminal"), "").unwrap();
+    fs::write(lab.path("lab/requests"), "").unwrap();
+    lab.run_passes(4);
+    assert_eq!(lab.count("pane.report_metadata"), 0, "{:?}", lab.requests());
+    // Stop only this fixture's worker through the normal public workflow.
+    fs::remove_file(lab.path("lab/changed-terminal")).unwrap();
+    let running = lab.attempt(&attempt);
+    lab.ok(&["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &running.revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "fixture cleanup"]);
+    lab.run_until(20, &|| lab.attempt(&attempt).termination_observed);
+}
+
+
+/// The real Codex collector binds the fixture rollout to the launched attempt:
+/// 1000 input + 120 output = 1120 tokens, hence complete ●, with no cost.
+/// Two persisted blocked observations six seconds apart add exactly `6s`.
+#[test]
+fn canonical_attempt_sidebar_uses_collected_usage_and_observed_waiting() {
+    let mut lab = Lab::of_kind("codex", "unknown_usage='allow_with_warning'", |repo| repo.to_owned());
+    let (_, attempt) = lab.reserve("Retained instructions");
+    lab.serve();
+    let has_token = |token: &str| lab.requests().iter().any(|(m, p)| m == "pane.report_metadata" && p["tokens"] == json!({"telemetry":token}));
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 120, &|| has_token("codex ○"));
+    lab.stop(ticker);
+    let state = lab.state();
+    let binding = state.runtime_bindings.iter().find(|b| b.id == lab.binding).unwrap();
+    let start = jiff::Timestamp::now();
+    let rollout = lab.path("agent-home/.codex/sessions/2026/09/30/rollout-sidebar.jsonl");
+    fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/telemetry/codex-0.154.0/head.jsonl");
+    let text = fs::read_to_string(fixture).unwrap().replace("@SID@", "12345678-1234-1234-1234-123456789abc")
+        .replace("@CWD@", &binding.identity.cwd).replace("@TS@", &start.to_string()).replace("@VERSION@", "0.154.0");
+    fs::write(rollout, text).unwrap();
+    lab.ok(&["telemetry", "demo", "collect"]);
+    let projection = lab.ok(&["telemetry", "demo", "attempts", "--json"]);
+    let record = projection["attempts"].as_array().unwrap().iter().find(|a| a["attempt_id"] == attempt.as_str()).unwrap();
+    assert_eq!(record["usage"]["total_tokens"], 1120, "{record}");
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 90, &|| has_token("codex ●"));
+    lab.stop(ticker);
+    // Deterministic local telemetry fixture, as in telemetry_workspace's live_fleet.
+    let opened = jiff::Timestamp::now().as_millisecond();
+    std::thread::sleep(Duration::from_secs(6));
+    let sidecar = herdr_projects::telemetry::sidecar::open(&lab.project, true).unwrap().unwrap();
+    for ms in [opened, opened + 6000] {
+        sidecar.execute("INSERT INTO attention_samples(attempt_id,observed_unix_ms,state,gap,interval_ms,source) VALUES(?1,?2,'blocked',NULL,30000,'herdr-agent-list-v1')",
+            rusqlite::params![attempt.as_str(), ms]).unwrap();
+    }
+    drop(sidecar);
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 60, &|| has_token("codex ● 6s"));
+    lab.stop(ticker);
+    assert_eq!((lab.count("workspace.create_command"), lab.count("agent.prompt")), (1, 1));
+    // Collector revocation keeps historical counters but clears the decoration
+    // while the worker and its runtime ownership remain live.
+    fs::write(lab.path("lab/requests"), "").unwrap();
+    lab.ok(&["telemetry", "demo", "collectors", "revoke", attempt.as_str()]);
+    lab.run_until(20, &|| lab.requests().iter().any(|(m, p)| m == "pane.report_metadata" && p["tokens"] == json!({"telemetry":null})));
+    assert_eq!(lab.attempt(&attempt).state, AttemptState::Running);
+    let running = lab.attempt(&attempt);
+    fs::write(lab.path("lab/requests"), "").unwrap();
+    lab.ok(&["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &running.revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "fixture cleanup"]);
+    lab.run_until(20, &|| lab.attempt(&attempt).termination_observed && lab.requests().iter().any(|(m, p)| m == "pane.report_metadata" && p["tokens"] == json!({"telemetry":null})));
+    let last = lab.requests().into_iter().rev().find(|(m, _)| m == "pane.report_metadata").unwrap().1;
+    assert_eq!(last["tokens"], json!({"telemetry":null}));
+    assert_eq!(lab.attempt(&attempt).state, AttemptState::Cancelled);
+}
+
+
+/// Termination clears a published suffix independently of pause or revocation.
+#[test]
+fn canonical_attempt_sidebar_clears_after_termination_in_an_active_project() {
+    let mut lab = Lab::new("unknown_usage='allow_with_warning'");
+    let (_, attempt) = lab.reserve("Retained instructions");
+    lab.serve();
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 120, &|| lab.requests().iter().any(|(m, p)| m == "pane.report_metadata" && p["tokens"] == json!({"telemetry":"claude ○"})));
+    lab.stop(ticker);
+    fs::write(lab.path("lab/requests"), "").unwrap();
+    let running = lab.attempt(&attempt);
+    lab.ok(&["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &running.revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "sidebar termination"]);
+    lab.run_until(20, &|| lab.attempt(&attempt).termination_observed && lab.requests().iter().any(|(m, p)| m == "pane.report_metadata" && p["tokens"] == json!({"telemetry":null})));
+    assert_eq!(lab.state().control.unwrap().state, ProjectState::Active);
+    assert_eq!(lab.attempt(&attempt).state, AttemptState::Cancelled);
+    let last = lab.requests().into_iter().rev().find(|(m, _)| m == "pane.report_metadata").unwrap().1;
+    assert_eq!((last["pane_id"].clone(), last["tokens"].clone()), (json!("w1:p1"), json!({"telemetry":null})));
 }

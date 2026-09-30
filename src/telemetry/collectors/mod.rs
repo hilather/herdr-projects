@@ -332,6 +332,16 @@ fn exists(db: &rusqlite::Connection, table: &str) -> Result<bool> {
     Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [table], |r| r.get(0))?)
 }
 
+/// Whether an attempt's latest usage collector binding was explicitly revoked.
+/// Advisory readers keep historical usage, but stop decorating a live pane.
+pub fn binding_revoked(project: &Path, attempt: &str) -> Result<bool> {
+    use rusqlite::OptionalExtension;
+    let db = super::read_only(&project.join(".state/state.db"))?;
+    if !exists(&db, "collector_bindings")? { return Ok(false); }
+    let state: Option<String> = db.query_row("SELECT state FROM collector_bindings WHERE attempt_id=?1 ORDER BY revision DESC LIMIT 1", [attempt], |r| r.get(0)).optional()?;
+    Ok(state.as_deref() == Some("revoked"))
+}
+
 /// `{bindings, sources}`: every canonical revision, and each rollout source's
 /// binding with its `basis` (`null` until a collect of this binary). Read-only.
 fn bindings(project: &Path) -> Result<Value> {

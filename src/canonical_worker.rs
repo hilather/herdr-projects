@@ -32,6 +32,12 @@ pub use start::{name_started_agent, reconcile_launch, reconcile_start};
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
 
+/// Advisory metadata uses the worker's conservative cross-project pane alias
+/// inventory, including retained launch targets and legacy thread routes.
+pub fn check_advisory_pane_aliases(project: &Path, binding: &str, route: &RuntimeRoute, deadline: Instant, cancellation: Cancellation) -> Result<()> {
+    inventory::check(project, binding, route, deadline, cancellation)
+}
+
 pub(crate) fn now() -> i64 {
     jiff::Timestamp::now().as_millisecond()
 }
@@ -45,7 +51,8 @@ pub(crate) fn validate_preparation_inputs(profile:&FrozenProfile,project:&Path,p
     executable(&profile.herdr,deadline,cancellation)
 }
 
-pub(crate) fn session_identity(path: &Path) -> Result<ResourceIdentity> {
+/// Read the retained local socket incarnation for advisory and worker effects.
+pub fn session_identity(path: &Path) -> Result<ResourceIdentity> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     ensure!(
         path.is_absolute() && path.canonicalize()? == path,
@@ -73,7 +80,8 @@ fn check(deadline: Instant, cancellation: &Cancellation) -> Result<()> {
     Ok(())
 }
 
-fn executable(
+/// Revalidate a frozen executable without launching it.
+pub fn executable(
     identity: &ExecutableIdentity,
     deadline: Instant,
     cancellation: &Cancellation,

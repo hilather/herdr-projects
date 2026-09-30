@@ -68,14 +68,20 @@ pub fn thread_tokens(thread: &Thread, slug: &str, group: Group) -> Vec<(String, 
 /// `○` (unavailable), never a number; the suffix never shows a ranking or a
 /// cost. Herdr shows it only where the user's sidebar format names the token.
 pub fn telemetry_suffix(thread: &Thread, group: Group, now: jiff::Timestamp) -> String {
-    let label = if thread.agent.is_empty() { "n/a" } else { thread.agent.as_str() };
     let wait = (group == Group::WaitingOnYou).then(|| thread.last_state_change.parse::<jiff::Timestamp>().ok()).flatten()
-        .map(|since| {
-            let s = (now.as_second() - since.as_second()).max(0);
-            match (s / 3600, s / 60 % 60, s % 60) { (0, 0, s) => format!(" {s}s"), (0, m, _) => format!(" {m}m"), (h, m, _) => format!(" {h}h{m:02}m") }
-        })
-        .unwrap_or_default();
-    format!("{label} ○{wait}")
+        .map(|since| (now.as_second() - since.as_second()).max(0));
+    sidebar_suffix(&thread.agent, None, wait)
+}
+
+/// Shared sidebar coverage glyphs and duration formatting; never rank or cost.
+pub fn sidebar_suffix(label: &str, coverage: Option<&str>, wait_secs: Option<i64>) -> String {
+    let label = if label.is_empty() { "n/a" } else { label };
+    let glyph = match coverage { Some("complete") => "●", Some("partial") => "◐", _ => "○" };
+    let wait = wait_secs.map(|s| {
+        let s = s.max(0);
+        match (s / 3600, s / 60 % 60, s % 60) { (0, 0, s) => format!(" {s}s"), (0, m, _) => format!(" {m}m"), (h, m, _) => format!(" {h}h{m:02}m") }
+    }).unwrap_or_default();
+    format!("{label} {glyph}{wait}")
 }
 
 /// Dispatch reason codes `thread start --reason` accepts (doc 15 §6): the

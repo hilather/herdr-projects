@@ -442,6 +442,8 @@ pub(crate) fn background_memory(ctx:&Ctx)->Result<Memory> {
     #[cfg(feature="state-store")]
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::canonical_notification_jobs::JobRunner{inner:runner});
     #[cfg(feature="state-store")]
+    let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::attempt_token_jobs::JobRunner{inner:runner});
+    #[cfg(feature="state-store")]
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::canonical_finalization_jobs::JobRunner{inner:runner});
     #[cfg(feature="state-store")]
     let runner:std::sync::Arc<dyn crate::runner::Runner+Send+Sync>=std::sync::Arc::new(crate::canonical_brief_jobs::JobRunner{inner:runner});
@@ -566,6 +568,10 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         let mut any_reachable=any_reachable;
         if !canonical.is_empty() {let first=(memory.tick.saturating_sub(1)%canonical.len() as u64) as usize;canonical.rotate_left(first);}
         for slug in &canonical {
+            if let Some(queue)=memory.copy_jobs.as_mut() {
+                let control=crate::source_tree::Control{deadline:Instant::now()+Duration::from_secs(5),cancellation:crate::runner::Cancellation::default()};
+                if let Err(error)=queue.offer_attempt_tokens(&ctx.root.join(slug),&control){log.line(&format!("{slug}: attempt token admission: {error:#}"));}
+            }
             let result=if let Some(reads)=memory.canonical_observations.as_mut(){crate::canonical_controller::poll_queued_effects(ctx,&ctx.root.join(slug),memory.tick.saturating_sub(1),reads,memory.copy_jobs.as_mut())}else{crate::canonical_controller::poll(ctx,&ctx.root.join(slug),memory.tick.saturating_sub(1))};
             match result {
                 Ok(result)=>{
