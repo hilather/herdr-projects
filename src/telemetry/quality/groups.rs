@@ -41,7 +41,8 @@ pub enum Command {
         /// Close the group with no winner.
         #[arg(long, conflicts_with_all = ["rule", "judge"])]
         none: bool,
-        /// Rule `first_accepted_in_launch_order.v1` (contracts-quality.md §4).
+        /// Rule `first_accepted_in_launch_order.v2` (contracts-quality.md §4):
+        /// the first accepted arm in launch order, skipping seeded candidates.
         #[arg(long, conflicts_with_all = ["judge", "submission", "reason"])]
         rule: bool,
         /// Judge name, recorded as principal `judge:<name>`; requires `--submission`.

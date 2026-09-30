@@ -201,8 +201,8 @@ pub(super) fn decision_seq(db: &Connection, session: &str) -> Result<Option<i64>
 }
 
 /// What of the review lifecycle is visible at a watermark of the one
-/// ordering: session starts and completions (0059) and delegated decisions
-/// (0062). Backfilled rows are visible at every watermark; a store without a
+/// ordering: session starts and completions (0059), delegated decisions
+/// (0062), and opportunity openings and assignments (0063). Backfilled rows are visible at every watermark; a store without a
 /// ledger shows everything.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReviewVisibility {
@@ -214,6 +214,8 @@ pub struct ReviewVisibility {
     completed: Option<BTreeSet<String>>,
     #[serde(skip)]
     decided: Option<BTreeMap<String, Option<i64>>>,
+    #[serde(skip)]
+    opportunities: super::review_ledger::OpportunityEvents,
 }
 
 impl ReviewVisibility {
@@ -222,6 +224,14 @@ impl ReviewVisibility {
     pub fn decided(&self, session: &str) -> bool { self.decided.as_ref().is_none_or(|s| s.contains_key(session)) }
     /// The decision's ledger `seq` (`None` when backfilled or unsequenced).
     pub fn decision_seq(&self, session: &str) -> Option<i64> { self.decided.as_ref().and_then(|s| s.get(session).copied().flatten()) }
+    /// Whether the opportunity is opened at the watermark (0063; always before it).
+    pub fn opened(&self, opportunity: &str) -> bool { self.opportunities.as_ref().is_none_or(|o| o.0.contains_key(opportunity)) }
+    /// Whether the opportunity's assignment is recorded at the watermark.
+    pub fn assigned(&self, opportunity: &str) -> bool { self.opportunities.as_ref().is_none_or(|o| o.1.contains_key(opportunity)) }
+    /// The opening's ledger `seq` (`None` when backfilled or unsequenced).
+    pub fn opened_seq(&self, opportunity: &str) -> Option<i64> { self.opportunities.as_ref().and_then(|o| o.0.get(opportunity).copied().flatten()) }
+    /// The assignment's ledger `seq` (`None` when backfilled or unsequenced).
+    pub fn assigned_seq(&self, opportunity: &str) -> Option<i64> { self.opportunities.as_ref().and_then(|o| o.1.get(opportunity).copied().flatten()) }
 }
 
 /// Replay visibility at `as_of` (default: the head; refused beyond it).
@@ -243,7 +253,8 @@ pub fn review_visibility(db: &Connection, as_of: Option<i64>) -> Result<ReviewVi
         Some(db.prepare("SELECT session_id,CASE WHEN backfilled=1 THEN NULL ELSE seq END FROM review_decision_log WHERE seq<=?1 OR backfilled=1")?
             .query_map([at], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)))?.collect::<rusqlite::Result<_>>()?)
     } else { None };
-    Ok(ReviewVisibility { head_seq: head, as_of_seq: at, started, completed, decided })
+    let opportunities = super::review_ledger::opportunity_events(db, at)?;
+    Ok(ReviewVisibility { head_seq: head, as_of_seq: at, started, completed, decided, opportunities })
 }
 
 impl SqliteStore {

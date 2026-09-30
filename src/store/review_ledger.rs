@@ -5,7 +5,10 @@
 //! status to the same watermark as triage. The owner's corrections of the
 //! protocol registry (retracting a pass binding or a unit exclusion) are rows
 //! of the same log. Also the seed links (§8) that make a claim an evaluation
-//! artefact at a watermark, outside discovery and validation credit.
+//! artefact at a watermark, outside discovery and validation credit. Since
+//! 0063 an opportunity's opening and its assignment are ledger rows too
+//! (`review_opportunity_log`), so replay lists an opportunity only from its
+//! opening and its assignment only from its assignment.
 use super::*;
 use super::finding_triage::{self, FindingEvent};
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,6 +31,34 @@ pub(super) fn record_session_event(tx: &Connection, session: &str, event: &str, 
     tx.execute("INSERT INTO review_log(seq,kind,principal,authority,expected_seq,recorded_unix_ms) VALUES(?1,?2,?3,?4,NULL,?5)", params![seq, event, principal, CAPTURE_AUTHORITY, now])?;
     tx.execute("INSERT INTO review_session_events(seq,session_id,event,backfilled) VALUES(?1,?2,?3,0)", params![seq, session, event])?;
     Ok(Some(seq))
+}
+
+/// Whether migration 0063 has run.
+pub(super) fn opportunities_sequenced(db: &Connection) -> Result<bool> { table(db, "review_opportunity_log") }
+
+/// Append an opportunity's `opened` or `assigned` row at the next `seq`, in
+/// the opening's or assignment's transaction. A no-op before 0063.
+pub(super) fn record_opportunity_event(tx: &Connection, opportunity: &str, event: &str, principal: &str, now: i64) -> Result<Option<i64>> {
+    if !opportunities_sequenced(tx)? { return Ok(None); }
+    let seq = finding_triage::head(tx)? + 1;
+    tx.execute("INSERT INTO review_opportunity_log(seq,opportunity_id,event,principal,authority,recorded_unix_ms,backfilled) VALUES(?1,?2,?3,?4,?5,?6,0)",
+        params![seq, opportunity, event, principal, CAPTURE_AUTHORITY, now])?;
+    Ok(Some(seq))
+}
+
+/// Opportunities opened and assigned at `at`: opportunity -> ledger seq
+/// (`None` when backfilled, visible at every watermark). `None` before 0063,
+/// when every stored opportunity and assignment is visible.
+pub(super) type OpportunityEvents = Option<(BTreeMap<String, Option<i64>>, BTreeMap<String, Option<i64>>)>;
+pub(super) fn opportunity_events(db: &Connection, at: i64) -> Result<OpportunityEvents> {
+    if !opportunities_sequenced(db)? { return Ok(None); }
+    let (mut opened, mut assigned) = (BTreeMap::new(), BTreeMap::new());
+    for row in db.prepare("SELECT opportunity_id,event,CASE WHEN backfilled=1 THEN NULL ELSE seq END FROM review_opportunity_log WHERE seq<=?1 OR backfilled=1")?
+        .query_map([at], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<i64>>(2)?)))? {
+        let (opportunity, event, seq) = row?;
+        if event == "opened" { opened.insert(opportunity, seq); } else { assigned.insert(opportunity, seq); }
+    }
+    Ok(Some((opened, assigned)))
 }
 
 /// Append the owner's correction row (`pass_retracted`, `exclusion_retracted`)
@@ -54,29 +85,35 @@ pub(super) fn protocol_retractions(db: &Connection, at: i64) -> Result<BTreeMap<
 
 /// Review sessions started and completed at a watermark. Before 0059 (no
 /// sequence) every stored session and completion is visible; backfilled rows
-/// (recorded before 0059) are visible at every watermark.
-pub(super) struct Lifecycle { visible: Option<(BTreeSet<String>, BTreeSet<String>)> }
+/// (recorded before 0059) are visible at every watermark. Likewise
+/// opportunities and assignments with 0063.
+pub(super) struct Lifecycle { visible: Option<(BTreeSet<String>, BTreeSet<String>)>, opportunities: OpportunityEvents }
 
 impl Lifecycle {
     pub(super) fn at(db: &Connection, at: Option<i64>) -> Result<Self> {
-        if !present(db)? { return Ok(Self { visible: None }); }
+        let opportunities = opportunity_events(db, at.unwrap_or(i64::MAX))?;
+        if !present(db)? { return Ok(Self { visible: None, opportunities }); }
         let (mut started, mut completed) = (BTreeSet::new(), BTreeSet::new());
         for row in db.prepare("SELECT session_id,event FROM review_session_events WHERE seq<=?1 OR backfilled=1")?
             .query_map([at.unwrap_or(i64::MAX)], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
             let (session, event) = row?;
             if event == "started" { started.insert(session); } else { completed.insert(session); }
         }
-        Ok(Self { visible: Some((started, completed)) })
+        Ok(Self { visible: Some((started, completed)), opportunities })
     }
+    /// Whether the opportunity is opened at the watermark.
+    pub(super) fn opened(&self, opportunity: &str) -> bool { self.opportunities.as_ref().is_none_or(|o| o.0.contains_key(opportunity)) }
+    /// Whether its assignment is recorded at the watermark (it must also be stored).
+    pub(super) fn assignment_visible(&self, opportunity: &str) -> bool { self.opportunities.as_ref().is_none_or(|o| o.1.contains_key(opportunity)) }
     fn started(&self, session: &str) -> bool { self.visible.as_ref().is_none_or(|v| v.0.contains(session)) }
     fn completed(&self, session: &str) -> bool { self.visible.as_ref().is_none_or(|v| v.1.contains(session)) }
 }
 
 /// An opportunity's review status (§4) at the lifecycle's watermark, and its
-/// completed session. Assignments carry no sequence: an assignment is always
-/// recorded before any session of its opportunity.
+/// completed session. The assignment replays with its ledger row (0063).
 pub(super) fn opportunity_status(db: &Connection, opportunity: &str, lifecycle: &Lifecycle) -> Result<(&'static str, Option<String>)> {
-    let assigned: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM review_assignments WHERE opportunity_id=?1)", [opportunity], |r| r.get(0))?;
+    let assigned: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM review_assignments WHERE opportunity_id=?1)", [opportunity], |r| r.get(0))?
+        && lifecycle.assignment_visible(opportunity);
     if !assigned { return Ok(("unassigned", None)); }
     let rows: Vec<(String, Option<String>)> = db.prepare("SELECT r.session_id,c.outcome FROM review_sessions r LEFT JOIN review_completions c ON c.session_id=r.session_id WHERE r.opportunity_id=?1 ORDER BY r.ordinal")?
         .query_map([opportunity], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;

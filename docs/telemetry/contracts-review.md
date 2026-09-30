@@ -114,9 +114,14 @@ assignment (`policy = operator`, `blind = false`, reason
 nothing touches `telemetry.db`. Since 0059 `start` and `complete` also
 append one shared-ledger row each (§9), and every `review` command but
 `present` refuses to run in a worker execution context (§9); since 0062 the
-worker's `session` and `submit` are allowed there too (§11). `show [--since
-MS] [--as-of SEQ]` (by creation; `--as-of` since 0062, §11), `present` and
-`report [--since MS]` read `state.db` with contracts §0 reads.
+worker's `session` and `submit` are allowed there too (§11); since 0063
+`open` and `assign` append one shared-ledger row each too (§9). `show
+[--since MS] [--as-of SEQ]` (by creation; `--as-of` since 0062, §11),
+`present` and `report [--since MS]` read `state.db` with contracts §0
+reads. `report` reads every metric in one read transaction, so the whole
+report is at one watermark of the shared ledger, stated as its top-level
+`as_of_seq` (also on M20, M22, M23, M24, M28, M43 and M44); a concurrent
+write lands wholly before or after it (card D11).
 
 Per opportunity `status`: `unassigned`, `no_session`, `in_progress` (a
 session without completion), `completed` (some session `completed`),
@@ -680,7 +685,11 @@ false for it (`seeded_defects::seeded_result`). The satisfaction row may
 still be recorded when the result is verified, including before
 registration; it never counts, even when the seeded submission is its
 candidate group's selection (the selected-winner currency relaxation of
-contracts-quality.md §3 does not lift this guard). `integrated_commit`
+contracts-quality.md §3 does not lift this guard). Since card D11 a seeded
+candidate cannot become a group's selection at all: the operator's and a
+judge's selection of it are refused and the rule skips it
+(contracts-quality.md §3–§4); this guard stays for selections recorded
+before. `integrated_commit`
 edges need an integration, which the integration guard already refuses.
 
 **Completion guard.** `task complete` never marks a task succeeded from a
@@ -704,9 +713,10 @@ outcomes); and the M43 trials: one per seed per completed opportunity of
 its candidate, `detected` (an active detection by a claim of that
 opportunity), `pending` (not detected while a submission of the
 opportunity is pending), else `missed`. Since 0059 `--as-of` replays review
-completions too (§9); opportunities and assignments carry no sequence, so
-`not_completed` at an earlier watermark also counts opportunities opened
-later.
+completions too (§9), and since 0063 opportunities (listed from their
+opening) and assignments (reviewer configuration and window from their
+assignment row), so `not_completed` at an earlier watermark counts exactly
+the opportunities open and not completed then.
 
 **Metrics** (`seeds report [--since MS] [--min-trials N] [--as-of SEQ]`;
 `review report` and `telemetry <slug> report` at the default `N` = 20, plan
@@ -764,9 +774,9 @@ the watermark (`Lifecycle`): a session is present from its `started` row,
 its completion from its `completed` row, so a restart, a timed-out session
 and a completion show exactly where they happened relative to triage,
 bindings and detections: §4 status in `protocols show`, `experiments show`
-(unit settlement) and `seeds show`/`seeds report` (trials). Opportunities
-and assignments carry no sequence (an assignment always precedes its
-sessions). Every table is append-only.
+(unit settlement) and `seeds show`/`seeds report` (trials). Since 0063
+opportunities and assignments are ledger rows too (below). Every table is
+append-only.
 
 Every review now adds two rows to the sequence before its submissions, so
 sequence numbers and `finding:canonical-<seq>` identities of a store's later
@@ -830,8 +840,45 @@ blind brief are §11); delegated triage (§10); conflict records
 and third-party review imports (§5); finding occurrences beyond reopenings
 and mixed-model segment splits (§6); adjudicator blinding,
 task-clustered intervals and `fixed_horizon` enforcement (§7); seeding
-replay-suite tasks (TM4.6); sequencing opportunity creation and
-assignment.
+replay-suite tasks (TM4.6).
+
+**Opportunities and assignments in the one ordering (card D11).**
+Canonical migration `0063_review_opportunity_ledger.sql` (schema 63).
+`review_opportunity_log(seq, opportunity_id, event, principal, authority,
+recorded_unix_ms, backfilled, UNIQUE(opportunity_id, event))`: `review open`
+appends `opened` and `review assign` appends `assigned`, each at the next
+`seq` of the one ordering in the opening's or assignment's transaction
+(`authority = review_capture.v1`, the recorder's principal).
+`finding_triage::head` is now over seven ledgers (`finding_log`, `fix_log`,
+`protocol_log`, `seed_log`, `review_log`, `review_decision_log`,
+`review_opportunity_log`); triggers on all seven refuse a row that does not
+follow the others' head. Triggers: a row repeats its recorded opening or
+assignment (principal and time), an assignment follows its opening, and a
+new session's `started` row follows its opportunity's `assigned` row.
+Append-only. Every `--as-of` view replays them (`Lifecycle`,
+`review_visibility`): `review show` lists an opportunity from its `opened`
+row (`opened_seq`) and its assignment from its `assigned` row
+(`assignment.assigned_seq`), so its status is `unassigned` before then;
+`seeds show`/`seeds report` list a registered candidate's opportunities and
+their reviewer configuration the same way (M43/M44 `not_completed`);
+`protocols show` and `experiments show` recompute §4 status with the
+assignment's row. The rebuild checks of `tests/quality_certification.rs`
+replay `review show`, `seeds show` and `seeds report` exactly at every
+captured watermark.
+
+Every review now adds two more rows (opening, assignment) before its
+session, so sequence numbers and `finding:canonical-<seq>` identities of a
+store's later history differ from what the same history gave before 0063;
+rows recorded before the upgrade keep theirs.
+
+*Upgrade.* Opportunities and assignments recorded before 0063 are
+sequenced after the ledger head at upgrade (after 0059's and 0062's
+backfills) in time order (by time, an opening before an assignment, then
+opportunity id; an assignment never before its own opening) with
+`backfilled = 1` and `opened_seq`/`assigned_seq` null. Their true place is
+unknown, so replay shows them at every watermark (the pre-0063 view); a
+trigger refuses any later `backfilled` row. Test
+`review_ledger_upgrade_backfills_sessions_in_completion_order`.
 
 ## 10. Delegated review authority, acceptance and review cost (card D8)
 
@@ -1111,8 +1158,8 @@ same receipt). Test
 **Decisions in the shared ledger.** `review_decision_log(seq, session_id
 UNIQUE, decision, principal, authority, recorded_unix_ms, backfilled)`: each
 §10 decision takes the next `seq` of the one ordering (`finding_triage::head`
-now over six ledgers; triggers on all six refuse a row that does not follow
-the others' head), in the decision's transaction; trigger: the row repeats
+now over six ledgers, seven since 0063 (§9); triggers on all of them refuse a
+row that does not follow the others' head), in the decision's transaction; trigger: the row repeats
 its `review_acceptances` row. `review accept` returns `ledger_seq`.
 Decisions recorded before 0062 are sequenced after the head at upgrade (by
 decision time, then session) with `backfilled = 1` and are visible at every
@@ -1120,9 +1167,9 @@ watermark, as §9's backfill. `review show --as-of SEQ` replays sessions (from
 their `started` row), completions (from their `completed` row) and decisions
 (from their decision row) to `SEQ`, recomputes each opportunity's status,
 shows each decision's `ledger_seq`, and reports `head_seq`/`as_of_seq`; `SEQ`
-beyond the head is refused. Opportunities and assignments carry no sequence
-(§9) and are listed at every watermark. M24's closed cohort still reads the
-current decisions.
+beyond the head is refused. Since 0063 it also lists an opportunity only
+from its opening and shows its assignment only from its assignment row (§9).
+M24's closed cohort still reads the current decisions.
 
 **Request draft.** `review accept draft SESSION --grant G [--reject REASON]
 --output FILE` writes (new file only) the exact canonical `review_acceptance.v1`

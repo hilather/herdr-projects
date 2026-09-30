@@ -400,7 +400,10 @@ pub fn run(project: &Path, config_dir: &Path, command: Command) -> Result<String
         Command::Signer(command) => signer::run(project, config_dir, command)?,
         Command::Present { opportunity } => return worker_present(project, &opportunity),
         Command::Show { since, as_of } => show(project, since, as_of)?,
-        Command::Report { since, horizon_days } => json!({"metrics": lane_metrics(project, since, i64::from(horizon_days))?, "since_unix_ms": since}),
+        Command::Report { since, horizon_days } => {
+            let (metrics, as_of) = lane_metrics(project, since, i64::from(horizon_days))?;
+            json!({"metrics": metrics, "since_unix_ms": since, "as_of_seq": as_of})
+        }
         Command::Findings(command) => findings(project, command, now)?,
         Command::Fixes(command) => fixes::run(project, command, now)?,
         Command::Protocols(command) => protocols::protocols(project, command, now)?,
@@ -498,11 +501,14 @@ struct Opportunity { record: Value, kind: String, protocol: String, assigned: Op
     /// `(session_id, attempt_id, same_attempt_as_author)` in order, the completed session, the latest completion time.
     sessions: Vec<(String, String, bool)>, completed_session: Option<String>, ended: Option<i64> }
 
-fn opportunities(db: &rusqlite::Connection) -> Result<Vec<Opportunity>> { opportunities_at(db, None) }
-
-/// As `opportunities`, with sessions and completions replayed to `at`.
-fn opportunities_at(db: &rusqlite::Connection, at: Option<&ReviewVisibility>) -> Result<Vec<Opportunity>> {
-    let db = db.unchecked_transaction()?;
+/// Opportunities, assignments, sessions and completions replayed to `at`'s
+/// watermark (§9): an opportunity is listed from its opening, its assignment
+/// from its assignment row, a session from its start and a completion from
+/// its completion row. `opened_seq` and the assignment's `assigned_seq` are
+/// their ledger rows (null when backfilled). Read in the caller's read
+/// transaction when it has one.
+fn opportunities_at(db: &rusqlite::Connection, at: &ReviewVisibility) -> Result<Vec<Opportunity>> {
+    let _snapshot = if db.is_autocommit() { Some(db.unchecked_transaction()?) } else { None };
     let rows: Vec<(Value, String, String, i64)> = db.prepare("SELECT opportunity_id,submission_id,task_id,contract_revision,candidate_oid,scope,kind,role,protocol,prior_findings,budget_ms,creator_principal,created_unix_ms
         FROM review_opportunities ORDER BY created_unix_ms,rowid")?
         .query_map([], |r| Ok((json!({"opportunity_id": r.get::<_, String>(0)?, "submission_id": r.get::<_, String>(1)?, "task_id": r.get::<_, String>(2)?,
@@ -513,13 +519,15 @@ fn opportunities_at(db: &rusqlite::Connection, at: Option<&ReviewVisibility>) ->
     let mut out = Vec::with_capacity(rows.len());
     for (mut record, kind, protocol, created) in rows {
         let id = record["opportunity_id"].as_str().unwrap_or_default().to_owned();
+        if !at.opened(&id) { continue; }
         let assignment = db.query_row("SELECT policy,reviewer_configuration_id,reviewer_profile_digest,reviewer_family,author_attempt_id,author_configuration_id,author_family,same_family,blind,reason,eligible,assigner_principal,assigned_unix_ms
             FROM review_assignments WHERE opportunity_id=?1", [&id],
             |r| Ok(json!({"policy": r.get::<_, String>(0)?, "reviewer_configuration_id": r.get::<_, String>(1)?, "reviewer_profile_digest": r.get::<_, String>(2)?,
                 "reviewer_family": r.get::<_, Option<String>>(3)?, "author_attempt_id": r.get::<_, String>(4)?, "author_configuration_id": r.get::<_, Option<String>>(5)?,
                 "author_family": r.get::<_, Option<String>>(6)?, "same_family": r.get::<_, Option<bool>>(7)?, "blind": r.get::<_, bool>(8)?, "reason": r.get::<_, String>(9)?,
                 "eligible": serde_json::from_str::<Value>(&r.get::<_, String>(10)?).unwrap_or(Value::Null), "assigner_principal": r.get::<_, String>(11)?,
-                "assigned_unix_ms": r.get::<_, i64>(12)?}))).optional()?;
+                "assigned_unix_ms": r.get::<_, i64>(12)?}))).optional()?
+            .filter(|_| at.assigned(&id)).map(|mut a| { a["assigned_seq"] = json!(at.assigned_seq(&id)); a });
         let sessions: Vec<Value> = db.prepare("SELECT r.session_id,r.ordinal,r.attempt_id,r.configuration_id,r.matches_assignment,r.same_attempt_as_author,r.recorder_principal,r.started_unix_ms,
                 c.outcome,c.reason,c.findings_submitted,c.finding_refs,c.evidence_refs,c.coverage_basis,c.trust,c.receipt_digest,c.recorder_principal,c.completed_unix_ms
             FROM review_sessions r LEFT JOIN review_completions c ON c.session_id=r.session_id WHERE r.opportunity_id=?1 ORDER BY r.ordinal")?
@@ -537,13 +545,10 @@ fn opportunities_at(db: &rusqlite::Connection, at: Option<&ReviewVisibility>) ->
                     "same_attempt_as_author": r.get::<_, bool>(5)?, "recorder_principal": r.get::<_, String>(6)?, "started_unix_ms": r.get::<_, i64>(7)?,
                     "completion": completion}))
             })?.collect::<rusqlite::Result<_>>()?;
-        let sessions: Vec<Value> = match at {
-            None => sessions,
-            Some(v) => sessions.into_iter().filter(|s| v.started(s["session_id"].as_str().unwrap_or_default())).map(|mut s| {
-                if !v.completed(s["session_id"].as_str().unwrap_or_default()) { s["completion"] = Value::Null; }
-                s
-            }).collect(),
-        };
+        let sessions: Vec<Value> = sessions.into_iter().filter(|s| at.started(s["session_id"].as_str().unwrap_or_default())).map(|mut s| {
+            if !at.completed(s["session_id"].as_str().unwrap_or_default()) { s["completion"] = Value::Null; }
+            s
+        }).collect();
         let completed = sessions.iter().find(|s| s["completion"]["outcome"] == "completed");
         let status = if assignment.is_none() { "unassigned" } else if sessions.is_empty() { "no_session" } else if completed.is_some() { "completed" }
             else if sessions.iter().any(|s| s["completion"].is_null()) { "in_progress" } else { "ended_without_completion" };
@@ -553,6 +558,7 @@ fn opportunities_at(db: &rusqlite::Connection, at: Option<&ReviewVisibility>) ->
         let session_list = sessions.iter().map(|s| (s["session_id"].as_str().unwrap_or_default().to_owned(), s["attempt_id"].as_str().unwrap_or_default().to_owned(),
             s["same_attempt_as_author"].as_bool().unwrap_or(false))).collect();
         let assigned = assignment.as_ref().and_then(|a| a["assigned_unix_ms"].as_i64());
+        record["opened_seq"] = json!(at.opened_seq(&id));
         record["status"] = json!(status);
         // Unknown is not zero: only a completed review has a findings count.
         record["findings_submitted"] = findings.map_or_else(|| unavailable(status), |n| json!(n));
@@ -565,9 +571,11 @@ fn opportunities_at(db: &rusqlite::Connection, at: Option<&ReviewVisibility>) ->
 
 fn show(project: &Path, since: Option<i64>, as_of: Option<i64>) -> Result<Value> {
     let db = read(project)?;
-    // Replay to a watermark of the shared ledger: sessions, completions and decisions appear where they happened (§9, §11).
+    // One read transaction: every part of the view is at one watermark.
+    let _snapshot = match &db { Some(db) => Some(db.unchecked_transaction()?), None => None };
+    // Replay to a watermark of the shared ledger: opportunities, assignments, sessions, completions and decisions appear where they happened (§9, §11).
     let visibility = match &db { Some(db) => Some(review_visibility(db, as_of)?), None => None };
-    let (listed, decided) = match &db { Some(db) => (opportunities_at(db, visibility.as_ref().filter(|_| as_of.is_some()))?, acceptance::decisions(db)?), None => (Vec::new(), None) };
+    let (listed, decided) = match (&db, &visibility) { (Some(db), Some(v)) => (opportunities_at(db, v)?, acceptance::decisions(db)?), _ => (Vec::new(), None) };
     let mut records: Vec<Value> = listed.into_iter().filter(|o| since.is_none_or(|s| o.created >= s)).map(|o| o.record).collect();
     // Each completion's delegated decision: `null` while undecided (a proposal), unavailable before the authority tables.
     for record in &mut records {
@@ -597,14 +605,21 @@ fn ratio(numerator: usize, denominator: usize) -> Value {
 /// M22/M23 over fully triaged submissions; M21, M25–M27 and M29 from fix
 /// attribution (§6); M28 from review protocols (§7); M24 needs review
 /// lifecycle cost.
-pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> { lane_metrics(project, since, fixes::DEFAULT_HORIZON_DAYS) }
+pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> { Ok(lane_metrics(project, since, fixes::DEFAULT_HORIZON_DAYS)?.0) }
 
-fn lane_metrics(project: &Path, since: Option<i64>, horizon_days: i64) -> Result<BTreeMap<String, Value>> {
+/// Every review metric from one read transaction of `state.db`, so the whole
+/// report is at one watermark of the shared ledger, returned beside the
+/// metrics (`None` before review capture). A concurrent write lands wholly
+/// before or after the report.
+fn lane_metrics(project: &Path, since: Option<i64>, horizon_days: i64) -> Result<(BTreeMap<String, Value>, Option<i64>)> {
+    let db = read(project)?;
+    let _snapshot = match &db { Some(db) => Some(db.unchecked_transaction()?), None => None };
+    let db = db.as_deref();
+    let visibility = match db { Some(db) => Some(review_visibility(db, None)?), None => None };
     let mut m20 = json!({"definition": "M20.v1", "name": "review_completion", "basis": "declared", "trust": "proposal"});
-    match read(project)? {
-        None => m20["value"] = unavailable("review_capture_absent"),
-        Some(db) => {
-            let all = opportunities(&db)?;
+    match (db, &visibility) {
+        (Some(db), Some(v)) => {
+            let all = opportunities_at(db, v)?;
             let unassigned = all.iter().filter(|o| o.assigned.is_none() && since.is_none_or(|s| o.created >= s)).count();
             let cohort: Vec<&Opportunity> = all.iter().filter(|o| o.assigned.is_some_and(|at| since.is_none_or(|s| at >= s))).collect();
             let completed = cohort.iter().filter(|o| o.status == "completed").count();
@@ -623,13 +638,15 @@ fn lane_metrics(project: &Path, since: Option<i64>, horizon_days: i64) -> Result
                 "ended_without_completion": count("ended_without_completion"), "in_progress": count("in_progress"), "no_session": count("no_session")});
             m20["unassigned"] = json!(unassigned);
             m20["by_kind_protocol"] = by.into_iter().map(|(k, (n, d))| (k, ratio(n, d))).collect();
+            m20["as_of_seq"] = json!(v.as_of_seq);
         }
+        _ => m20["value"] = unavailable("review_capture_absent"),
     }
     let mut out = BTreeMap::from([("M20".to_owned(), m20)]);
     // M22/M23 over original submissions, from the owner's triage (contracts-review.md §5),
     // without seed-linked claims: evaluation artefacts, counted apart (§9).
-    let triage = match read(project)? { Some(db) => finding_state(&db, None)?, None => None };
-    let decided = match read(project)? { Some(db) => acceptance::decisions(&db)?, None => None };
+    let triage = match db { Some(db) => finding_state(db, None)?, None => None };
+    let decided = match db { Some(db) => acceptance::decisions(db)?, None => None };
     let mut m22 = json!({"definition": "M22.v1", "name": "proposal_validation_rate", "basis": "owner_triage", "trust": TRIAGE_AUTHORITY});
     let mut m23 = json!({"definition": "M23.v1", "name": "duplicate_report_share", "basis": "owner_triage", "trust": TRIAGE_AUTHORITY});
     match &triage {
@@ -657,7 +674,7 @@ fn lane_metrics(project: &Path, since: Option<i64>, horizon_days: i64) -> Result
     out.insert("M22".to_owned(), m22);
     out.insert("M23".to_owned(), m23);
     // M21 sums discovery credit; M25–M27 and M29 follow repairs; M24 needs review cost (§6).
-    let attribution = match read(project)? { Some(db) => fix_state(&db, None)?, None => None };
+    let attribution = match db { Some(db) => fix_state(db, None)?, None => None };
     let now = jiff::Timestamp::now().as_millisecond();
     out.extend(fixes::metrics(attribution.as_ref(), now, since, horizon_days * 86_400_000));
     // M21 drill-down: F by its discovery review's delegated decision (credit is unchanged).
@@ -669,27 +686,29 @@ fn lane_metrics(project: &Path, since: Option<i64>, horizon_days: i64) -> Result
         m21["review_acceptance"] = acceptance::acceptance_counts(d, sessions);
     }
     // M24 over closed opportunities assigned in the window, costed from the accounting sidecar (§10).
-    let m24 = match read(project)? {
-        None => json!({"definition": "M24.v1", "name": "review_discovery_efficiency", "value": unavailable("review_capture_absent")}),
-        Some(db) => {
-            let all = opportunities(&db)?;
+    let m24 = match (db, &visibility) {
+        (Some(db), Some(v)) => {
+            let all = opportunities_at(db, v)?;
             let mut attempts = BTreeMap::<String, usize>::new();
             for o in &all { for s in &o.sessions { *attempts.entry(s.1.clone()).or_default() += 1; } }
             let authors: std::collections::BTreeSet<String> = db.prepare("SELECT DISTINCT attempt_id FROM result_submissions")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
             let cohort: Vec<acceptance::ReviewOpportunityCost> = all.iter().filter(|o| o.assigned.is_some_and(|at| since.is_none_or(|s| at >= s)))
                 .map(|o| acceptance::ReviewOpportunityCost { status: o.status, completed_session: o.completed_session.as_deref(), ended_unix_ms: o.ended,
                     sessions: o.sessions.iter().map(|s| acceptance::ReviewSessionCost { attempt_id: &s.1, same_attempt_as_author: s.2 }).collect() }).collect();
-            acceptance::m24(project, &cohort, &attempts, &authors, decided.as_ref(), triage.as_ref(), horizon_days * 86_400_000, now)?
+            let mut m24 = acceptance::m24(project, &cohort, &attempts, &authors, decided.as_ref(), triage.as_ref(), horizon_days * 86_400_000, now)?;
+            m24["as_of_seq"] = json!(v.as_of_seq);
+            m24
         }
+        _ => json!({"definition": "M24.v1", "name": "review_discovery_efficiency", "value": unavailable("review_capture_absent")}),
     };
     out.insert("M24".to_owned(), m24);
     // M28 skeptical incremental yield: descriptive; experiments beside it (§7).
-    let registry = match read(project)? { Some(db) => protocol_state(&db, None, now)?, None => None };
+    let registry = match db { Some(db) => protocol_state(db, None, now)?, None => None };
     out.insert("M28".to_owned(), protocols::metric(registry.as_ref(), since));
     // M43/M44 over seeded evaluation candidates (§8), at the default minimum sample.
-    let seeded = match read(project)? { Some(db) => crate::store::seed_state(&db, None)?, None => None };
+    let seeded = match db { Some(db) => crate::store::seed_state(db, None)?, None => None };
     out.extend(seeds::metrics(seeded.as_ref(), since, seeds::DEFAULT_MIN_TRIALS));
-    Ok(out)
+    Ok((out, visibility.map(|v| v.as_of_seq)))
 }
 
 /// Ticker telemetry pass, after the Codex collect, within `budget`. Writes only the sidecar.

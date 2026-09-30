@@ -146,9 +146,27 @@ pub(super) fn bind(tx: &Connection, inputs: &LaunchInputs, attempt: &AttemptId, 
     Ok(())
 }
 
-/// Principal of the deterministic selection rule (contracts-quality.md §4):
-/// the first arm in launch order whose verified outcome is `accepted`.
-pub const RULE_SELECTOR: &str = "rule:first_accepted_in_launch_order.v1";
+/// Principal of the deterministic selection rule `--rule` records
+/// (contracts-quality.md §4): the first arm in launch order whose verified
+/// outcome is `accepted` and whose accepted candidate is not a registered
+/// seeded candidate (skipped arms carry `rule_skip` [`SKIP_SEEDED`]).
+pub const RULE_SELECTOR: &str = "rule:first_accepted_in_launch_order.v2";
+// The first version, `rule:first_accepted_in_launch_order.v1`, could select a
+// seeded arm (TM3.5 finding 3). It is no longer recorded; its historical
+// selections stay rows like any other and read as before.
+/// Evidence `rule_skip` of an accepted arm the v2 rule passed over: its
+/// accepted candidate is a registered seeded candidate (contracts-review.md §8).
+pub const SKIP_SEEDED: &str = "seeded_candidate";
+
+/// Refuse a seeded candidate as a group's winner: a seeded arm is an
+/// evaluation artefact that never integrates, so selecting it would hold the
+/// group's other arms forever (TM3.5 finding 3).
+fn refuse_seeded_winner(tx: &Connection, arm: i64, submission: &str) -> Result<()> {
+    if super::seeded_defects::seeded_submission(tx, submission)? {
+        return Err(invalid(format!("arm {arm}'s candidate {submission} is a seeded candidate: a seeded arm is an evaluation artefact and never a group's winner")));
+    }
+    Ok(())
+}
 /// Blind presentation order for a judge (contracts-quality.md §4).
 pub const PRESENTATION: &str = "candidate_presentation.v1";
 const TERMINAL_ATTEMPT: [&str; 4] = ["completed", "failed", "cancelled", "lost"];
@@ -351,6 +369,7 @@ impl SqliteStore {
                         .ok_or_else(|| invalid(format!("submission {id} is not a candidate of arm {arm}")))?,
                     None => bound.first.clone().ok_or_else(|| invalid(format!("arm {arm} has no candidate")))?,
                 };
+                refuse_seeded_winner(&tx, bound.arm, &submission)?;
                 evidence = ranked(&arms, evidence, bound.arm, &runner_up.iter().map(|r| i64::from(*r)).collect::<Vec<_>>())?;
                 Some((*arm, bound.attempt.clone(), submission))
             }
@@ -358,19 +377,27 @@ impl SqliteStore {
         insert_selection(tx, Decision { group, picked, kind: "operator", principal, reason, evidence, now })
     }
 
-    /// Select by rule `first_accepted_in_launch_order.v1` (principal
+    /// Select by rule `first_accepted_in_launch_order.v2` (principal
     /// [`RULE_SELECTOR`]): the first arm in launch order whose verified
-    /// outcome is `accepted`, with its first accepted submission, reason
+    /// outcome is `accepted` and whose accepted submission is not a registered
+    /// seeded candidate, with that submission, reason
     /// `first_passing_verification`; every earlier arm must be settled (not
-    /// `pending`). With no accepted arm it closes the group with no selection
-    /// (`none_acceptable`, or `no_candidate` if no arm submitted) only when every
-    /// arm is bound and settled. Evidence ranks the accepted arms in launch
-    /// order (`rank`, winner 1). The same rows always give the same answer.
+    /// `pending`). An accepted seeded arm is skipped (evidence `rule_skip`
+    /// [`SKIP_SEEDED`], no rank). With no eligible accepted arm it closes the
+    /// group with no selection (`none_acceptable`, or `no_candidate` if no arm
+    /// submitted) only when every arm is bound and settled. Evidence ranks the
+    /// eligible accepted arms in launch order (`rank`, winner 1). The same
+    /// rows always give the same answer.
     pub fn select_candidate_by_rule(&mut self, group: &str, now: i64) -> Result<CandidateSelection> {
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let arm_count = open_group(&tx, group)?;
         let arms = bound_arms(&tx, group)?;
-        let winner = arms.iter().position(|a| a.outcome == "accepted");
+        let mut skipped = Vec::with_capacity(arms.len());
+        for a in &arms {
+            skipped.push(match &a.accepted { Some(s) if a.outcome == "accepted" => super::seeded_defects::seeded_submission(&tx, s)?, _ => false });
+        }
+        let eligible = |i: usize| arms[i].outcome == "accepted" && !skipped[i];
+        let winner = (0..arms.len()).find(|&i| eligible(i));
         if let Some(pending) = arms[..winner.unwrap_or(arms.len())].iter().find(|a| a.outcome == "pending") {
             return Err(invalid(format!("arm {} is pending: the rule decides only when every earlier arm is settled", pending.arm)));
         }
@@ -378,8 +405,9 @@ impl SqliteStore {
             return Err(invalid(format!("arm {} has not launched: the rule closes a group without a winner only when every arm is settled", arms.len() + 1)));
         }
         let mut rank = 0;
-        let evidence = evidence(&arms).into_iter().zip(&arms).map(|(mut e, a)| {
-            e["rank"] = if a.outcome == "accepted" { rank += 1; serde_json::json!(rank) } else { serde_json::Value::Null };
+        let evidence = evidence(&arms).into_iter().enumerate().map(|(i, mut e)| {
+            e["rank"] = if eligible(i) { rank += 1; serde_json::json!(rank) } else { serde_json::Value::Null };
+            if skipped[i] { e["rule_skip"] = serde_json::json!(SKIP_SEEDED); }
             e
         }).collect();
         let (picked, reason) = match winner {
@@ -408,6 +436,7 @@ impl SqliteStore {
         let presented = |submission: &str| arms.iter().find(|a| a.first.as_deref() == Some(submission))
             .ok_or_else(|| invalid(format!("submission {submission} is not a presented candidate of {group}")));
         let chosen = presented(submission)?;
+        refuse_seeded_winner(&tx, chosen.arm, submission)?;
         let runner_up = runner_up.iter().map(|s| presented(s).map(|a| a.arm)).collect::<Result<Vec<_>>>()?;
         let picked = Some((chosen.arm as u32, chosen.attempt.clone(), submission.to_owned()));
         let evidence = evidence(&arms).into_iter().zip(positions).map(|(mut e, p)| { e["presented"] = serde_json::json!(p); e["judge_configuration_id"] = judge_configuration.clone(); e }).collect();

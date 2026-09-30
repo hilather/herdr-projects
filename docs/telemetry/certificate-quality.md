@@ -16,6 +16,10 @@ and production-quality activation waits for it (§4).
 
 - Source: branch `telemetry/tm35-quality-gate` from `main` at `3a8bb3e`, plus
   the fix in §3.1. Canonical schema 62, sidecar stream `quality`.
+  Follow-ups (card D11, branch `telemetry/d11-quality-followups`, canonical
+  schema 63): §3.2 lifted, §3.3 fixed, §3.5 fixed; the suite re-run green
+  with the literals recomputed by hand for the two new ledger rows per
+  review.
 - Metric registry `registry.v1` (contracts-quality.md §5); review metric
   definitions `M20.v1`–`M29.v1`, `M43.v1`, `M44.v1`; lane C `M41.v1`,
   `M42.v1`, `M45.proxy-v1`–`M48.proxy-v1`.
@@ -69,7 +73,7 @@ Suite `tests/quality_certification.rs` (8 tests), run with `cargo test
 | `split_merge_and_unmerge_corrections_recompute_denominators_and_keep_history` | §5 first denominator fixture (mixed 1 / rejected-only 1 → M22 50 %, M23 0 %; merge → 0 %/50 %; unmerge restores under a new as-of); three validated claims in one report = one validated submission; a verified fix never copied to split or merged findings; restore reverses a split; rebuild at 9 watermarks |
 | `repair_cohorts_keep_failed_cancelled_and_reassigned_opportunities` | §5 second denominator fixture (A 1/2, B null not 100 %), cancelled and censored opportunities, effective-model history, earned credit never moving eligibility |
 | `worker_assertions_and_self_approval_never_become_accepted_outcomes` | §5 forged verifier receipt kept as an assertion; forged receipt fields; worker, reviewer, author and import principals; delegated acceptance scope (kind), subject key, self- and author-approval |
-| `seeded_recall_and_the_seeded_candidate_guard_end_to_end` | §5a seeded review (M43 75 %, M44 50 %) with the starter seeds; seeded candidate never integrates, releases or completes, also as a group's selected winner; as-of replay of the seed ledger |
+| `seeded_recall_and_the_seeded_candidate_guard_end_to_end` | §5a seeded review (M43 75 %, M44 50 %) with the starter seeds; seeded candidate never integrates, releases or completes; a seeded group arm is never selected (operator and judge refused, rule v2 picks the clean arm, which integrates and releases); exact as-of replay of seeds, seed report and review views, opportunities included (D11) |
 | `selection_that_disagrees_with_verification_verifies_and_releases_nothing` | card: candidate group where selection and verification disagree; M41 counts selections, M42 verified outcomes; a worker selecting its own arm (§3.1) |
 | `skeptical_yield_counts_only_new_findings_on_the_same_artifact` | §5 skeptical review against prior coverage of the exact artifact; changed artifact, timed-out pass, severity floor, retraction |
 | `a_sandboxed_worker_cannot_elevate_its_own_report` | card: malicious worker elevating its own report, through the real isolated wrapper and spool |
@@ -131,35 +135,55 @@ acceptance view.
    (`tests/telemetry_quality.rs`) and
    `selection_that_disagrees_with_verification_verifies_and_releases_nothing`;
    documented in contracts-quality.md §3.
-2. **Restriction: opportunities and assignments carry no sequence.** As-of
-   views (`review show --as-of`, `seeds show --as-of`, `seeds report --as-of`)
-   list opportunities opened after the watermark (never completed there), so a
-   historical M43 `not_completed` can include later opportunities. Every
-   sequenced fact (sessions, completions, triage, fixes, seeds, detections,
-   decisions) replays exactly; the test asserts both. Documented as not built
-   in contracts-review.md §9; closing it needs a canonical migration
-   (sequence opportunity creation and assignment). Until then no historical
-   claim may be made from as-of opportunity counts.
-3. **Finding (not fixed, owner decision needed): the rule selector can select
-   a seeded arm.** `first_accepted_in_launch_order.v1` picks the first
-   accepted arm; a registered seeded arm that passed verification wins, can
-   never integrate (seeded guard), and the verified clean arm becomes a held
-   loser forever (checked on the real integration path: both `result
-   integrate` calls are refused). Safety holds (no seeded candidate
-   integrates or releases); liveness of the group's task is lost. A fix
-   changes the rule's definition (a new registry/rule version, TM3.8's owner).
-   Operators should not register group arms as seeded candidates meanwhile.
+2. **Restriction (lifted by card D11): opportunities and assignments carried
+   no sequence.** As-of views (`review show --as-of`, `seeds show --as-of`,
+   `seeds report --as-of`) listed opportunities opened after the watermark
+   (never completed there), so a historical M43 `not_completed` could
+   include later opportunities. *Resolution* (canonical migration 0063,
+   schema 63, contracts-review.md §9): `review open` and `review assign`
+   each take the next `seq` of the shared review ledger
+   (`review_opportunity_log`, `backfilled` at upgrade and then visible at
+   every watermark, like 0059's sessions), and every `--as-of` review, seed
+   and protocol view lists an opportunity from its opening and its
+   assignment from its assignment row. The certification test now asserts
+   exact replay instead of the restriction: `seeds show`, `seeds report`
+   and `review show` replayed at 6, 9, 12, 37, 44 and 47 equal the views
+   captured there, with M43/M44 `(trials, pending, not_completed)` by hand
+   (as of 9, S1's opportunity alone, open: M43 `not_completed` 1 where the
+   restricted view counted 4), and `assert_rebuilds` replays `review show`
+   exactly at every watermark of the lifecycle and denominator fixtures.
+3. **Finding (fixed by card D11): the rule selector could select a seeded
+   arm.** `first_accepted_in_launch_order.v1` picked the first accepted
+   arm; a registered seeded arm that passed verification won, could never
+   integrate (seeded guard), and the verified clean arm became a held loser
+   forever (checked on the real integration path: both `result integrate`
+   calls were refused). Safety held; liveness of the group's task was lost.
+   *Resolution* (contracts-quality.md §3–§4): rule version
+   `first_accepted_in_launch_order.v2`, the one `--rule` now records, skips
+   an accepted arm whose candidate is a registered seeded candidate
+   (evidence `rule_skip: "seeded_candidate"`, no rank); v1 selections stay
+   readable as recorded. An operator's or judge's selection of a seeded arm
+   is refused before any write (a seeded arm is an evaluation artefact,
+   never a winner). Test `seeded_recall_and_the_seeded_candidate_guard_end_to_end`:
+   arm 1 seeded and verified, arm 2 clean and verified; `--arm 1` and a
+   judge's choice of arm 1 are refused with nothing written; v2 selects
+   arm 2 (rank 1; arm 1 skipped), which releases the dependent
+   (`admission_disabled:verified_result` only) and integrates on the real
+   integration branch, while arm 1's `result integrate` is still refused.
 4. **Observation: a merge never carries a fix.** Merging a finding with a
    verified fix into another leaves the fix on the merged source, so the
    group root counts as unverified (M25 fell from 1/5 to 0/4 in the fixture)
    until the owner records a fix on the root. This is contracts-review.md §6
    by design and matches doc 06 §3 (no copying without coverage validation);
    the repair opportunity stays visible in its cohort.
-5. **Observation: `review report` reads each ledger view on its own
-   read-only connection.** Every metric states its `as_of_seq`, but a write
-   between the reads can give one report two watermarks. The rebuild check
-   ran with no concurrent writer. Low severity; a single read snapshot is a
-   follow-up for lane D.
+5. **Observation (fixed by card D11): `review report` read each ledger view
+   on its own read-only connection**, so a write between the reads could
+   give one report two watermarks. `review report` (and the lane metrics
+   hook of `telemetry <slug> report`) now reads every review metric in one
+   read transaction and states its one watermark as the top-level
+   `as_of_seq` (also on M20, M22–M24, M28, M43, M44); every captured report
+   of the certification suite asserts `as_of_seq` = the ledger head it was
+   captured at, on M20 and M22 alike.
 
 No disagreement was found in M20–M29, M41–M45 or M43/M44 values: every
 hand-computed value matched, and every captured view rebuilt identically.
@@ -188,10 +212,12 @@ shown with their `basis`/`trust` labels, and missing producers stay
    20 trials) and the observational labels (M21, M25–M29) kept on every
    surface; M28 stays descriptive without a preregistered randomized
    experiment.
-5. **As-of history**: §3.2 closed (sequenced opportunities and assignments)
-   before any historical opportunity count is published.
-6. **Seeded groups**: §3.3 decided before candidate groups and seeded
-   evaluation are combined.
+5. **As-of history**: met on fixtures by card D11 (§3.2, schema 63).
+   Opportunities and assignments recorded before 0063 are backfilled and
+   visible at every watermark, so historical opportunity counts are exact
+   only for history recorded at schema 63 or later.
+6. **Seeded groups**: decided by card D11 (§3.3): a seeded arm is never a
+   winner (rule v2 skips it; operator and judge selections are refused).
 7. **Worker isolation**: canonical workers run isolated (read-only store,
    spool-only writes); the coordinator and legacy thread agents stay trusted
    by owner decision (contracts-review.md §12) and are outside this

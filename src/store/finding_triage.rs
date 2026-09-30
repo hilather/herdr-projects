@@ -235,8 +235,9 @@ pub(super) fn triage_authority(tx: &Connection, principal: &str) -> Result<()> {
 /// Ledgers sharing the one ordering, each once its migration has run:
 /// `finding_log`, `fix_log` (contracts-review.md §6), `protocol_log` (0057), `seed_log`
 /// (seeded defects, 0058), `review_log` (review lifecycle, 0059) and
-/// `review_decision_log` (delegated review decisions, 0062).
-const LEDGERS: [&str; 6] = ["finding_log", "fix_log", "protocol_log", "seed_log", "review_log", "review_decision_log"];
+/// `review_decision_log` (delegated review decisions, 0062) and
+/// `review_opportunity_log` (opportunity openings and assignments, 0063).
+const LEDGERS: [&str; 7] = ["finding_log", "fix_log", "protocol_log", "seed_log", "review_log", "review_decision_log", "review_opportunity_log"];
 
 /// Head of the one ordering of the ledgers present: the replay watermark of all.
 pub(super) fn head(tx: &Connection) -> Result<i64> {

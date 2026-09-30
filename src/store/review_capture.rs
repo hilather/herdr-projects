@@ -294,6 +294,8 @@ impl SqliteStore {
         tx.execute("INSERT INTO review_opportunities(opportunity_id,submission_id,task_id,contract_revision,candidate_oid,scope,kind,role,protocol,prior_findings,budget_ms,creator_principal,canonical_json,created_unix_ms)
             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![opportunity_id, spec.submission_id, task, revision, candidate, spec.scope, spec.kind, spec.role, spec.protocol, serde_json::json!(prior).to_string(), budget, principal, canonical_json, now])?;
+        // The opening takes the next seq of the shared ledger (store schema 63 and later).
+        super::review_ledger::record_opportunity_event(&tx, &opportunity_id, "opened", principal, now)?;
         tx.commit()?;
         Ok(ReviewOpportunity { opportunity_id, submission_id: spec.submission_id.clone(), task_id: task, contract_revision: revision, candidate_oid: candidate,
             scope: spec.scope.clone(), kind: spec.kind.clone(), role: spec.role.clone(), protocol: spec.protocol.clone(), prior_findings: prior,
@@ -345,6 +347,8 @@ impl SqliteStore {
         tx.execute("INSERT INTO review_assignments(opportunity_id,policy,reviewer_configuration_id,reviewer_profile_digest,reviewer_family,author_attempt_id,author_configuration_id,author_family,same_family,blind,reason,eligible,assigner_principal,assigned_unix_ms)
             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![opportunity, policy, configuration, profile_digest, reviewer_family, author, author_configuration, author_family, same_family, blind, reason, eligible.to_string(), principal, now])?;
+        // So does the assignment (store schema 63 and later).
+        super::review_ledger::record_opportunity_event(&tx, opportunity, "assigned", principal, now)?;
         tx.commit()?;
         Ok(ReviewAssignment { opportunity_id: opportunity.to_owned(), policy: policy.to_owned(), reviewer_configuration_id: configuration, reviewer_profile_digest: profile_digest,
             reviewer_family, author_attempt_id: author, author_configuration_id: author_configuration, author_family, same_family, blind, reason: reason.to_owned(),

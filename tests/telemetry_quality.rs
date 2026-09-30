@@ -492,7 +492,7 @@ fn win_rate_and_paired_difference_over_closed_groups() {
     for (task, winner, submission, reason) in [("g1", Some(1), Some(("g1", 1)), "first_passing_verification"), ("g2", Some(2), Some(("g2", 2)), "first_passing_verification"),
         ("g4", Some(1), Some(("g4", 1)), "first_passing_verification"), ("g5", None, None, "none_acceptable"), ("g6", Some(3), Some(("g6", 3)), "first_passing_verification")] {
         let s = select(task, &["--rule"]);
-        assert_eq!((&s["selector_kind"], &s["selector_principal"], &s["reason"]), (&json!("rule"), &json!("rule:first_accepted_in_launch_order.v1"), &json!(reason)), "{task}");
+        assert_eq!((&s["selector_kind"], &s["selector_principal"], &s["reason"]), (&json!("rule"), &json!("rule:first_accepted_in_launch_order.v2"), &json!(reason)), "{task}");
         assert_eq!((&s["arm"], &s["submission_id"]), (&json!(winner), &json!(submission.map(|(t, a)| sub(t, a)))), "{task}");
     }
     // A tie goes to launch order; every accepted arm is ranked, the winner first.

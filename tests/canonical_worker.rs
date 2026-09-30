@@ -835,7 +835,8 @@ fn instructions(prompt: &str) -> &str {
 /// the same task cannot launch it. The ordinary `launch draft`/approval/
 /// `launch reserve` path reserves the review attempt, and that reservation
 /// records the session: recorder `service:launch`, the assigned
-/// configuration, ledger `started` at seq 1. The ticker then launches and
+/// configuration, ledger `started` at seq 3 (after O's opening at 1 and its
+/// assignment at 2). The ticker then launches and
 /// briefs the worker on the Herdr stand-in; the delivered prompt is the
 /// drafted brief, names O's exact candidate, and carries none of the planted
 /// author identities (attempt, configuration, profile digest, the authored
@@ -865,9 +866,13 @@ fn review_assignment_launches_with_blind_brief_and_records_session() {
     let configuration = shown["opportunities"][0]["assignment"]["reviewer_configuration_id"].clone();
     assert_eq!((&session["ordinal"], &session["attempt_id"], &session["recorder_principal"], &session["configuration_id"], &session["matches_assignment"], &session["same_attempt_as_author"], &session["completion"]),
         (&json!(1), &json!(attempt.as_str()), &json!("service:launch"), &configuration, &json!(true), &json!(false), &Value::Null));
-    // The start is the first row of the shared ledger, in the reservation's transaction.
-    assert_eq!(lab.review_show(Some(0))["opportunities"][0]["sessions"], json!([]));
-    assert_eq!(lab.review_show(Some(1))["opportunities"][0]["sessions"][0]["session_id"], session["session_id"]);
+    // O's opening (1) and assignment (2) are ledger rows; the start follows them, in the reservation's transaction.
+    assert_eq!(lab.review_show(Some(0))["opportunities"], json!([]));
+    let at1 = lab.review_show(Some(1))["opportunities"][0].clone();
+    assert_eq!((&at1["opened_seq"], &at1["status"], &at1["assignment"]), (&json!(1), &json!("unassigned"), &Value::Null));
+    let at2 = lab.review_show(Some(2))["opportunities"][0].clone();
+    assert_eq!((&at2["assignment"]["assigned_seq"], &at2["status"], &at2["sessions"]), (&json!(2), &json!("no_session"), &json!([])));
+    assert_eq!(lab.review_show(Some(3))["opportunities"][0]["sessions"][0]["session_id"], session["session_id"]);
     let db = rusqlite::Connection::open(lab.project.join(".state/state.db")).unwrap();
     let launched: (String, String) = db.query_row("SELECT l.attempt_id,l.snapshot_id FROM review_session_launches l WHERE l.session_id=?1", [session["session_id"].as_str().unwrap()], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
     assert_eq!((launched.0.as_str(), launched.1.as_str()), (attempt.as_str(), world.snapshot["id"].as_str().unwrap()));
@@ -962,12 +967,13 @@ fn reviewer_worker_submits_proposal_receipt_but_cannot_accept() {
 }
 
 /// Owner-signed grant G makes `reviewer:carol` a delegated reviewer of task
-/// `authored`. After the launched session (seq 1) and the worker's receipt
-/// (completion seq 2, its finding seq 3), `review accept draft` writes the
-/// exact canonical request, byte for byte; carol signs it offline with her
-/// own key and `review accept` records the decision at seq 4 of the shared
-/// ledger. `review show --as-of` places it: undecided at 3, accepted from 4
-/// (`ledger_seq` 4); the owner's later triage takes seq 5, after it.
+/// `authored`. After the opportunity's opening (seq 1) and assignment (2),
+/// the launched session (seq 3) and the worker's receipt (completion seq 4,
+/// its finding seq 5), `review accept draft` writes the exact canonical
+/// request, byte for byte; carol signs it offline with her own key and
+/// `review accept` records the decision at seq 6 of the shared ledger.
+/// `review show --as-of` places it: undecided at 5, accepted from 6
+/// (`ledger_seq` 6); the owner's later triage takes seq 7, after it.
 #[test]
 fn acceptance_decision_replays_in_the_ledger_as_of() {
     let mut lab = Lab::new("unknown_usage='allow_with_warning'");
@@ -979,7 +985,7 @@ fn acceptance_decision_replays_in_the_ledger_as_of() {
     let out = lab.worker_cli(&["telemetry", "demo", "review", "submit", "--input-file", &receipt_file(&lab, "receipt.json", &receipt)]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let receipt_digest = serde_json::from_slice::<Value>(&out.stdout).unwrap()["completion"]["receipt_digest"].as_str().unwrap().to_owned();
-    assert_eq!(lab.ok(&["telemetry", "demo", "review", "findings", "show"])["findings"]["head_seq"], json!(3));
+    assert_eq!(lab.ok(&["telemetry", "demo", "review", "findings", "show"])["findings"]["head_seq"], json!(5));
 
     let carol = lab.path("carol");
     assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&carol).output().unwrap().status.success());
@@ -1004,29 +1010,29 @@ fn acceptance_decision_replays_in_the_ledger_as_of() {
     assert_eq!((&drafted["request_digest"], &drafted["signer"], &drafted["namespace"]),
         (&json!(format!("sha256:{:x}", Sha256::digest(expected.as_bytes()))), &json!("reviewer:carol"), &json!("review-acceptance@herdr-projects")));
     assert!(!lab.cli(&["telemetry", "demo", "review", "accept", "draft", &session, "--grant", &grant_id, "--output", request.to_str().unwrap()]).status.success(), "the draft never overwrites");
-    assert_eq!(lab.ok(&["telemetry", "demo", "review", "findings", "show"])["findings"]["head_seq"], json!(3), "a draft writes nothing");
+    assert_eq!(lab.ok(&["telemetry", "demo", "review", "findings", "show"])["findings"]["head_seq"], json!(5), "a draft writes nothing");
 
     assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y", "sign", "-f"]).arg(&carol).args(["-n", "review-acceptance@herdr-projects"]).arg(&request).output().unwrap().status.success());
     let accepted = lab.ok(&["telemetry", "demo", "review", "accept", &session, "--document", request.to_str().unwrap(), "--signature", lab.path("request.json.sig").to_str().unwrap()])["acceptance"].clone();
     assert_eq!((&accepted["decision"], &accepted["authority_principal"], &accepted["ledger_seq"], &accepted["receipt_digest"], &accepted["replayed"]),
-        (&json!("accepted"), &json!("reviewer:carol"), &json!(4), &json!(receipt_digest), &json!(false)));
+        (&json!("accepted"), &json!("reviewer:carol"), &json!(6), &json!(receipt_digest), &json!(false)));
 
     let at = |seq: i64| lab.review_show(Some(seq));
-    let s1 = at(1);
-    assert_eq!((&s1["head_seq"], &s1["as_of_seq"], &s1["opportunities"][0]["status"], &s1["opportunities"][0]["sessions"][0]["attempt_id"], &s1["opportunities"][0]["sessions"][0]["completion"]),
-        (&json!(4), &json!(1), &json!("in_progress"), &json!(attempt.as_str()), &Value::Null));
-    let s3 = at(3)["opportunities"][0]["sessions"][0]["completion"].clone();
-    assert_eq!((&s3["outcome"], &s3["acceptance"]), (&json!("completed"), &Value::Null));
-    let s4 = at(4)["opportunities"][0]["sessions"][0]["completion"]["acceptance"].clone();
-    assert_eq!((&s4["decision"], &s4["grant_id"], &s4["ledger_seq"], &s4["authority"]), (&json!("accepted"), &json!(grant_id), &json!(4), &json!("delegated_code_review.v1")));
-    let err = String::from_utf8_lossy(&lab.cli(&["telemetry", "demo", "review", "show", "--as-of", "5"]).stderr).into_owned();
-    assert!(err.contains("as-of seq 5 is outside the review history 0..=4"), "{err}");
+    let s3 = at(3);
+    assert_eq!((&s3["head_seq"], &s3["as_of_seq"], &s3["opportunities"][0]["status"], &s3["opportunities"][0]["sessions"][0]["attempt_id"], &s3["opportunities"][0]["sessions"][0]["completion"]),
+        (&json!(6), &json!(3), &json!("in_progress"), &json!(attempt.as_str()), &Value::Null));
+    let s5 = at(5)["opportunities"][0]["sessions"][0]["completion"].clone();
+    assert_eq!((&s5["outcome"], &s5["acceptance"]), (&json!("completed"), &Value::Null));
+    let s6 = at(6)["opportunities"][0]["sessions"][0]["completion"]["acceptance"].clone();
+    assert_eq!((&s6["decision"], &s6["grant_id"], &s6["ledger_seq"], &s6["authority"]), (&json!("accepted"), &json!(grant_id), &json!(6), &json!("delegated_code_review.v1")));
+    let err = String::from_utf8_lossy(&lab.cli(&["telemetry", "demo", "review", "show", "--as-of", "7"]).stderr).into_owned();
+    assert!(err.contains("as-of seq 7 is outside the review history 0..=6"), "{err}");
 
     // The owner's triage follows the decision in the one ordering.
     let claim = lab.ok(&["telemetry", "demo", "review", "findings", "show"])["findings"]["submissions"][0]["claims"][0]["claim_id"].as_i64().unwrap();
     let event = lab.ok(&["telemetry", "demo", "review", "findings", "reject", &claim.to_string(), "--reason", "intended_behavior"])["event"].clone();
-    assert_eq!(event["seq"], json!(5));
-    assert_eq!(at(4)["opportunities"][0]["sessions"][0]["completion"]["acceptance"]["decision"], json!("accepted"));
+    assert_eq!(event["seq"], json!(7));
+    assert_eq!(at(6)["opportunities"][0]["sessions"][0]["completion"]["acceptance"]["decision"], json!("accepted"));
 }
 
 /// A worker agent that probes its own filesystem view. It records every

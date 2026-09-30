@@ -369,9 +369,10 @@ pub fn seed_state(db: &Connection, as_of: Option<i64>) -> Result<Option<SeedStat
     Ok(Some(SeedState { head_seq: triage.head_seq, as_of_seq: at, candidates, opportunities, trials, history }))
 }
 
-/// Review opportunities of registered candidates, with their assigned
-/// reviewer configuration, completion (replayed with the review lifecycle,
-/// 0059) and submission outcomes at the watermark.
+/// Review opportunities of registered candidates opened by the watermark,
+/// with their assigned reviewer configuration (from the assignment's row,
+/// 0063), completion (replayed with the review lifecycle, 0059) and
+/// submission outcomes at the watermark.
 fn evaluation_opportunities(db: &Connection, candidates: &[EvaluationCandidate], triage: &FindingState, lifecycle: &super::review_ledger::Lifecycle) -> Result<Vec<EvaluationOpportunity>> {
     let mut out = Vec::new();
     for c in candidates {
@@ -380,6 +381,9 @@ fn evaluation_opportunities(db: &Connection, candidates: &[EvaluationCandidate],
             FROM review_opportunities o LEFT JOIN review_assignments a ON a.opportunity_id=o.opportunity_id WHERE o.submission_id=?1 ORDER BY o.created_unix_ms,o.rowid")?
             .query_map([&c.submission_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<rusqlite::Result<_>>()?;
         for (opportunity_id, kind, protocol, configuration_id, assigned_unix_ms) in rows {
+            // Listed from its opening, its reviewer from its assignment (0063).
+            if !lifecycle.opened(&opportunity_id) { continue; }
+            let (configuration_id, assigned_unix_ms) = if lifecycle.assignment_visible(&opportunity_id) { (configuration_id, assigned_unix_ms) } else { (None, None) };
             let completed = super::review_ledger::opportunity_status(db, &opportunity_id, lifecycle)?.0 == "completed";
             let mut submissions: BTreeMap<String, usize> = ["pending", "validated_only", "rejected_only", "duplicate_only", "mixed"].into_iter().map(|k| (k.to_owned(), 0)).collect();
             for s in triage.submissions.iter().filter(|s| s.opportunity_id == opportunity_id) { *submissions.entry(s.outcome.clone()).or_default() += 1; }

@@ -264,10 +264,11 @@ fn audit(lab: &Lab, token: &str) -> Vec<Value> {
 /// owner signs offline and imports. Reviews: S1, launched from the
 /// assignment (D9) with the reviewer's own receipt; S2, an owner-started
 /// `code` review with an owner-recorded receipt; S3, a `security` review
-/// (outside the grant). Ledger: S1 start 1, completion 2; S2 3, 4; S3 5, 6.
-/// Pass 1 (`--max 1`) accepts only S1 (rule `all_rules_passed`, ledger 7);
+/// (outside the grant). Ledger: each review's opening, assignment, start and
+/// completion: S1 1–4; S2 5–8; S3 9–12.
+/// Pass 1 (`--max 1`) accepts only S1 (rule `all_rules_passed`, ledger 13);
 /// the owner then raises the policy to revision 2; pass 2 rejects S2
-/// (`protocol_violation`, rule `launched_to_assigned_reviewer`, ledger 8)
+/// (`protocol_violation`, rule `launched_to_assigned_reviewer`, ledger 14)
 /// and the grant is exhausted; pass 3 decides nothing. S3 is never a
 /// candidate. Each decision is audited with its policy version and exact
 /// request digest; the recorded decisions carry carol's principal and grant.
@@ -307,13 +308,13 @@ fn signer_accepts_in_scope_reviews_under_policy_and_audits() {
     let digest = |text: String| format!("sha256:{:x}", Sha256::digest(text.as_bytes()));
     let pass1 = lab.signer(&["run", "--subject", "reviewer:carol", "--once", "--max", "1"]);
     assert_eq!(pass1["decided"], json!([{"session_id": s1.0, "grant_id": grant_id, "decision": "accepted", "reason": null, "rule": "all_rules_passed",
-        "request_digest": digest(request(&s1, "accepted", "null")), "ledger_seq": 7, "replayed": false}]));
+        "request_digest": digest(request(&s1, "accepted", "null")), "ledger_seq": 13, "replayed": false}]));
     assert_eq!((&pass1["grants"][0]["status"], &pass1["grants"][0]["remaining"]), (&json!("active"), &json!(1)));
 
     fs::write(dir.join("policy.json"), POLICY_2).unwrap();
     let pass2 = lab.signer(&["run", "--subject", "reviewer:carol", "--once", "--max", "5"]);
     assert_eq!(pass2["decided"], json!([{"session_id": s2.0, "grant_id": grant_id, "decision": "rejected", "reason": "protocol_violation", "rule": "launched_to_assigned_reviewer",
-        "request_digest": digest(request(&s2, "rejected", "\"protocol_violation\"")), "ledger_seq": 8, "replayed": false}]));
+        "request_digest": digest(request(&s2, "rejected", "\"protocol_violation\"")), "ledger_seq": 14, "replayed": false}]));
     assert_eq!((&pass2["grants"][0]["status"], &pass2["grants"][0]["remaining"]), (&json!("exhausted"), &json!(0)));
     let pass3 = lab.signer(&["run", "--subject", "reviewer:carol", "--once"]);
     assert_eq!((&pass3["decided"], &pass3["refused"]), (&json!([]), &json!([])), "idempotent: nothing left to decide");
@@ -327,7 +328,7 @@ fn signer_accepts_in_scope_reviews_under_policy_and_audits() {
     assert_eq!(lab.db().query_row("SELECT count(*) FROM review_acceptances WHERE session_id=?1", [&s3.0], |r| r.get::<_, i64>(0)).unwrap(), 0, "S3 is outside the grant");
     let seqs: Vec<(i64, String)> = lab.db().prepare("SELECT seq,session_id FROM review_decision_log ORDER BY seq").unwrap()
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect();
-    assert_eq!(seqs, [(7, s1.0.clone()), (8, s2.0.clone())]);
+    assert_eq!(seqs, [(13, s1.0.clone()), (14, s2.0.clone())]);
 
     // The append-only audit: init, then one line per decision with the policy version it was made under.
     let lines = audit(&lab, "carol");
@@ -335,7 +336,7 @@ fn signer_accepts_in_scope_reviews_under_policy_and_audits() {
     assert_eq!(lines.iter().map(|l| l["event"].clone()).collect::<Vec<_>>(), [json!("init"), json!("decision"), json!("decision")]);
     assert_eq!((&lines[0]["public_key"], &lines[0]["policy"], &lines[0]["draft_grant_digest"]), (&json!(public), &policy_1, &json!(grant_id)));
     let policy_2 = json!({"schema": "review_signer_policy.v1", "revision": 2, "digest": POLICY_2_DIGEST});
-    for (line, session, decision, policy, seq) in [(&lines[1], &s1, "accepted", &policy_1, 7), (&lines[2], &s2, "rejected", &policy_2, 8)] {
+    for (line, session, decision, policy, seq) in [(&lines[1], &s1, "accepted", &policy_1, 13), (&lines[2], &s2, "rejected", &policy_2, 14)] {
         assert_eq!((&line["schema"], &line["subject"], &line["session_id"], &line["decision"], &line["policy"], &line["result"], &line["ledger_seq"]),
             (&json!("review_signer_audit.v1"), &json!("reviewer:carol"), &json!(session.0), &json!(decision), policy, &json!("recorded"), &json!(seq)));
     }

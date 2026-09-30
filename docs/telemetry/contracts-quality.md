@@ -182,7 +182,14 @@ certificate-quality.md):
   candidate. With `--arm` evidence adds `rank`: the winner 1, each
   `--runner-up` in the order given 2, 3, ..., any other arm null.
   Runner-ups must be bound arms, distinct and not the winner (card C5).
-  `--rule` and `--judge` are §4.
+  `--rule` and `--judge` are §4. Selecting an arm whose chosen submission
+  is a registered seeded candidate (contracts-review.md §8) is refused
+  before any write (`arm N's candidate … is a seeded candidate: a seeded
+  arm is an evaluation artefact and never a group's winner`,
+  `candidate_groups::refuse_seeded_winner`): a seeded candidate never
+  integrates, so as the winner it would hold every other arm forever
+  (TM3.5 finding 3, card D11). The same refusal applies to `--judge`; the
+  rule skips such an arm (§4).
 - `show` (read-only, contracts §0 reads): per group `status`
   (`open`/`closed`), `selection`, and per arm `attempt_id`, `role`
   (`open`, `selected`, `not_selected`), `candidate`, `outcome` (`candidate`,
@@ -275,17 +282,32 @@ terminal (`completed`, `failed`, `cancelled`, `lost`), since it may still
 submit; else `rejected` with a submission, `no_candidate` without.
 
 **Rule selector** `select <group> --rule`: rule
-`first_accepted_in_launch_order.v1`, principal
-`rule:first_accepted_in_launch_order.v1`. The first arm in launch order whose
-outcome is `accepted` wins with its first accepted submission, reason
-`first_passing_verification`; a tie between accepted arms goes to launch
-order. It refuses while any earlier arm is `pending`. With no accepted arm it
-closes the group with no selection (`none_acceptable`, or `no_candidate` when
-no arm submitted) only when every arm is bound and settled; otherwise it
-refuses and the operator can still `--none`. Evidence adds `rank` (the
-accepted arms in launch order, winner 1; null otherwise), so the runner-up
-order is recorded for rule selections. The same canonical rows always give the
-same answer.
+`first_accepted_in_launch_order.v2` (card D11), principal
+`rule:first_accepted_in_launch_order.v2`. An arm is *eligible* when its
+outcome is `accepted` and its first accepted submission is not a registered
+seeded candidate (contracts-review.md §8); an accepted arm whose candidate
+is seeded is skipped, with evidence `rule_skip: "seeded_candidate"` and
+rank null. The first eligible arm in launch order wins with that
+submission, reason `first_passing_verification`; a tie between eligible
+arms goes to launch order. It refuses while any arm before the winner
+(skipped arms included) is `pending`. With no eligible arm it closes the
+group with no selection (`none_acceptable`, or `no_candidate` when no arm
+submitted) only when every arm is bound and settled; otherwise it refuses
+and the operator can still `--none`. Evidence adds `rank` (the eligible
+arms in launch order, winner 1; null otherwise), so the runner-up order is
+recorded for rule selections. The same canonical rows always give the same
+answer.
+
+Version `first_accepted_in_launch_order.v1` (principal
+`rule:first_accepted_in_launch_order.v1`) was the same rule without the
+seeded skip: it could select a seeded arm that passed verification, which
+never integrates while the clean verified arm stays a held loser (TM3.5
+finding 3). `--rule` no longer records v1; selections recorded under it
+keep their principal and read, count (M41, M42) and hold exactly as before.
+Test: `seeded_recall_and_the_seeded_candidate_guard_end_to_end`
+(`tests/quality_certification.rs`): arm 1 seeded and verified, arm 2 clean
+and verified; the operator's and a judge's selection of arm 1 are refused,
+v2 selects arm 2, which releases the dependent and integrates.
 
 **Judge selector** (no model is called anywhere):
 `present <group>` (read-only) prints each bound arm's first candidate as
