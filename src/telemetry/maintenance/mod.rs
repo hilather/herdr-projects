@@ -140,7 +140,7 @@ const BY_PATH: &[&str] = &["collect_offsets", "rollout_sources", "rollout_metada
     "rollout_turn_ends", "rollout_turn_terminations", "codex_tool_sources", "source_bindings", "session_graph_nodes", "usage_dispositions"];
 const BY_SESSION: &[&str] = &["codex_usage", "codex_usage_times", "codex_quarantine", "codex_discrepancy", "codex_rate_limits", "codex_rate_limit_windows", "codex_turns",
     "codex_tool_calls", "codex_tool_namespaces", "codex_exec_items", "codex_mcp_calls", "codex_agent_items", "codex_turn_aborts", "codex_fork_reconciliation", "usage_entries",
-    "model_segments", "quota_window_observations", "session_graph_nodes"];
+    "model_segments", "quota_window_observations", "session_graph_nodes", "accounting_dirty_sessions"];
 /// `(table, column)` holding the source's path digest.
 const BY_SOURCE: &[(&str, &str)] = &[("source_observations", "producer_epoch"), ("ingest_quarantine", "source"), ("coverage_gaps", "source"), ("source_cursors", "source")];
 /// Priced history that keeps a session id as a reference (R4).
@@ -699,6 +699,8 @@ pub fn purge_session(tx: &Connection, session: &str, paths: &[String]) -> Result
         for name in BY_PATH { if table(tx, name)? { rows += tx.execute(&format!("DELETE FROM {name} WHERE path_digest=?1"), [path])?; } }
         for (name, column) in BY_SOURCE { if table(tx, name)? { rows += tx.execute(&format!("DELETE FROM {name} WHERE {column}=?1"), [path])?; } }
     }
+    if table(tx, "accounting_dirty_sessions")? { tx.execute("DELETE FROM accounting_dirty_sessions WHERE session_id=?1", [session])?; }
+    super::accounting::ledger::invalidate(tx, "retention_enforcement")?;
     Ok(rows)
 }
 
@@ -723,6 +725,9 @@ pub fn enforce(db: &mut Connection, tombstones: &Tombstones) -> Result<BTreeMap<
     let mut out = BTreeMap::new();
     if tombstones.is_empty() { return Ok(out); }
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if table(&tx, "accounting_stream")? {
+        tx.execute("UPDATE accounting_stream SET tombstones=?1,invalidated='retention_enforcement' WHERE tombstones<>?1", [tombstones.count as i64])?;
+    }
     if table(&tx, "rollout_sources")? {
         let rows: Vec<(String, String)> = tx.prepare("SELECT session_id,path_digest FROM rollout_sources")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
         let mut sessions: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -762,6 +767,7 @@ pub fn enforce(db: &mut Connection, tombstones: &Tombstones) -> Result<BTreeMap<
         let doomed: Vec<i64> = rows.into_iter().filter(|(r, d)| tombstones.key(ANALYTICS, &format!("revision:{r}:{d}")).is_some()).map(|(r, _)| r).collect();
         if !doomed.is_empty() { delete_revisions(&tx, &doomed)?; out.insert(ANALYTICS, doomed.len()); }
     }
+    if !out.is_empty() { super::accounting::ledger::invalidate(&tx, "retention_enforcement")?; }
     tx.commit()?;
     Ok(out)
 }

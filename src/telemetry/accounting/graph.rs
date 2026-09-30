@@ -63,11 +63,19 @@ fn fork_reconciliation(db: &Connection, reconciliation: bool, session: &str) -> 
 /// Rebuild `session_graph_nodes` and `model_segments` from `entries` (the ledger just
 /// derived in the same transaction); returns `(sessions, model_segments)` counts.
 pub fn store(tx: &Connection, entries: &[Entry]) -> Result<(usize, usize)> {
-    tx.execute_batch("DELETE FROM session_graph_nodes; DELETE FROM model_segments;")?;
-    let guardian: BTreeSet<String> = tx.prepare("SELECT DISTINCT session_id FROM codex_usage WHERE model=?1")?
+    tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS accounting_selected(session_id TEXT PRIMARY KEY); DELETE FROM accounting_selected;
+        INSERT INTO accounting_selected SELECT session_id FROM rollout_sources UNION SELECT session_id FROM codex_usage;")?;
+    store_scoped(tx, entries, true)
+}
+
+pub(crate) fn store_scoped(tx: &Connection, entries: &[Entry], full: bool) -> Result<(usize, usize)> {
+    if full { tx.execute_batch("DELETE FROM session_graph_nodes; DELETE FROM model_segments;")?; }
+    else { tx.execute_batch("DELETE FROM session_graph_nodes WHERE session_id IN (SELECT session_id FROM accounting_selected);
+        DELETE FROM model_segments WHERE session_id IN (SELECT session_id FROM accounting_selected);")?; }
+    let guardian: BTreeSet<String> = tx.prepare("SELECT DISTINCT session_id FROM codex_usage WHERE session_id IN (SELECT session_id FROM accounting_selected) AND model=?1")?
         .query_map([GUARDIAN_MODEL], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
     // A turn is mixed when its records (or its completion) carry more than one model.
-    let mixed: BTreeSet<(String, i64)> = tx.prepare("SELECT u.session_id,u.ordinal FROM codex_usage u WHERE u.turn_id IS NOT NULL AND
+    let mixed: BTreeSet<(String, i64)> = tx.prepare("SELECT u.session_id,u.ordinal FROM codex_usage u WHERE u.session_id IN (SELECT session_id FROM accounting_selected) AND u.turn_id IS NOT NULL AND
         (SELECT count(DISTINCT m) FROM (SELECT v.model m FROM codex_usage v WHERE v.session_id=u.session_id AND v.turn_id=u.turn_id
          UNION SELECT t.model FROM codex_turns t WHERE t.session_id=u.session_id AND t.turn_id=u.turn_id)) > 1")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
@@ -76,7 +84,7 @@ pub fn store(tx: &Connection, entries: &[Entry]) -> Result<(usize, usize)> {
     let (columns, join) = if threads { ("t.parent_thread_id,t.thread_source", "LEFT JOIN rollout_threads t ON t.path_digest=m.path_digest") }
         else { ("NULL,NULL", "") };
     let metadata: BTreeMap<String, Metadata> = tx.prepare(&format!("SELECT m.path_digest,m.forked_from_id,m.subagent_kind,m.subagent_parent_thread_id,{columns}
-        FROM rollout_metadata m {join}"))?
+        FROM rollout_metadata m {join} WHERE m.path_digest IN (SELECT path_digest FROM rollout_sources WHERE session_id IN (SELECT session_id FROM accounting_selected))"))?
         .query_map([], |r| Ok((r.get(0)?, Metadata { forked_from: r.get(1)?, subagent_kind: r.get(2)?, parent_thread: r.get(3)?,
             thread_parent: r.get(4)?, thread_source: r.get(5)? })))?
         .collect::<rusqlite::Result<_>>()?;
@@ -88,7 +96,7 @@ pub fn store(tx: &Connection, entries: &[Entry]) -> Result<(usize, usize)> {
 
     // Rollouts of one session, the one with the most records first.
     type Source = (String, String, Option<String>, Option<String>);
-    let sources: Vec<Source> = tx.prepare("SELECT path_digest,session_id,source,attempt_id FROM rollout_sources ORDER BY session_id,records DESC,path_digest")?
+    let sources: Vec<Source> = tx.prepare("SELECT path_digest,session_id,source,attempt_id FROM rollout_sources WHERE session_id IN (SELECT session_id FROM accounting_selected) ORDER BY session_id,records DESC,path_digest")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
     let mut sessions = BTreeMap::<&str, Vec<&Source>>::new();
     for source in &sources { sessions.entry(source.1.as_str()).or_default().push(source); }
@@ -139,7 +147,7 @@ pub fn store(tx: &Connection, entries: &[Entry]) -> Result<(usize, usize)> {
                 (_, false) => "unresolved",
                 (false, true) => { parent = Some(root.0.as_str()); "included" }
                 (true, true) => match &link {
-                    Some((id, basis)) if sessions.contains_key(id.as_str()) => { linked = Some((id.as_str(), *basis)); "linked_child" }
+                    Some((id, basis)) if tx.query_row("SELECT EXISTS(SELECT 1 FROM rollout_sources WHERE session_id=?1)", [id], |r| r.get::<_, bool>(0))? => { linked = Some((id.as_str(), *basis)); "linked_child" }
                     Some((id, _)) => { (reason, claimed) = (Some("parent_not_collected"), Some(id.as_str())); "unlinked_child" }
                     None if role == "primary" => "root",
                     None => { reason = Some("no_native_parent_evidence"); "unlinked_child" }
@@ -153,7 +161,6 @@ pub fn store(tx: &Connection, entries: &[Entry]) -> Result<(usize, usize)> {
     }
 
     // Model segments over counted entries by position; buckets do not break a segment.
-    let mut segments = 0;
     let mut buckets = BTreeMap::<(&str, &str, i64), (Option<&str>, i64, i64, i64, [i64; 4])>::new();
     let mut last: Option<(&str, &str, i64)> = None;
     for entry in &delta {
@@ -175,9 +182,9 @@ pub fn store(tx: &Connection, entries: &[Entry]) -> Result<(usize, usize)> {
         tx.prepare_cached("INSERT INTO model_segments(session_id,bucket,segment,model,first_position,last_position,entries,input_tokens,output_tokens,reasoning_tokens,total_tokens)
             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)")?
                 .execute(params![session, bucket, segment, model, first, last, count, c[0], c[1], c[2], c[3]])?;
-        segments += 1;
     }
-    Ok((sessions.len(), segments))
+    Ok((tx.query_row("SELECT count(DISTINCT session_id) FROM session_graph_nodes", [], |r| r.get(0))?,
+        tx.query_row("SELECT count(*) FROM model_segments", [], |r| r.get(0))?))
 }
 
 fn bucket(r: &rusqlite::Row) -> rusqlite::Result<Value> {

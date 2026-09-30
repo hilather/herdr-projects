@@ -755,6 +755,19 @@ fn secondary_window_is_tracked() {
     let r2 = r1 + 18_000;
     let (t3, t2) = (r1 * 1000 + 60_000, d - 120_000);
     quota_rollout(&f, "secondary", "quota-secondary.jsonl", d - 7_200_000, &[d - 7_200_000, t2, t3, t3 + 60_000], &[r1, r2, s1]);
+    let path = f.home.join(".codex/sessions/2026/09/28/rollout-2026-09-28T00-00-00-secondary.jsonl");
+    let text = fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    fs::write(&path, lines[..3].join("\n") + "\n").unwrap();
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    // Each ordered snapshot extends the windows from the preceding pass.
+    for line in &lines[3..] {
+        use std::io::Write;
+        writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{line}").unwrap();
+        f.cli("collect");
+        f.cli_args(&["accounting", "sync"]);
+    }
     f.cli("collect");
     assert_eq!(f.cli_args(&["accounting", "sync"]).0["quota_windows"], 3);
     let (quota, first) = f.cli_args(&["accounting", "quota", "--json"]);
@@ -786,12 +799,26 @@ fn secondary_window_is_tracked() {
     assert_eq!(f.cli_args(&["accounting", "quota", "--json"]).1, first);
     assert_eq!((f.count("quota_window_observations"), f.count("quota_windows")), (8, 3));
 
+    f.sidecar().execute("DELETE FROM usage_ledger", []).unwrap();
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "quota", "--json"]).1, first, "ordered incremental windows equal a full replay");
     // Fixture only: snapshots stored before A4 have no secondary row.
     f.sidecar().execute_batch("DELETE FROM codex_rate_limit_windows").unwrap();
     f.cli_args(&["accounting", "sync"]);
     let (quota, _) = f.cli_args(&["accounting", "quota", "--json"]);
     assert_eq!(quota["observations"], json!({"primary": {"trusted": 4}}));
     assert_eq!(headroom(&f)["windows"][1], json!({"limit_id": "codex", "window_kind": "secondary", "value": {"status": "unavailable", "reason": "not_collected"}}));
+    use std::io::Write;
+    let late = lines[3].replace(&jiff::Timestamp::from_millisecond(t2).unwrap().to_string(),
+        &jiff::Timestamp::from_millisecond(d - 3_600_000).unwrap().to_string());
+    writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{late}").unwrap();
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let late_view = f.cli_args(&["accounting", "quota", "--json"]).1;
+    f.sidecar().execute("DELETE FROM usage_ledger", []).unwrap();
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "quota", "--json"]).1, late_view, "late quota observations replay in native order");
+
 }
 
 /// Live A4 run: two execution homes holding one login reported the same
@@ -985,7 +1012,7 @@ fn attention_intervals_union_and_censor() {
         (serde_json::from_str(&text).unwrap_or(serde_json::Value::Null), text)
     };
     cli(&["collect"]);
-    assert_eq!(cli(&["accounting", "status"]).0, json!({"stream": "accounting", "version": 11}));
+    assert_eq!(cli(&["accounting", "status"]).0, json!({"stream": "accounting", "version": 12}));
     // Stream 8 dropped the superseded projections (v2, v4, v6); their replacements stay.
     let tables: Vec<String> = rusqlite::Connection::open(project.join(".state/telemetry.db")).unwrap()
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('session_graph','quota_observations','session_nodes','session_graph_nodes','quota_window_observations') ORDER BY name").unwrap()
@@ -1871,7 +1898,7 @@ fn provider_charges_reconcile_allocate_and_convert() {
     let current = f.cli_args(&["accounting", "charges"]).1;
     f.sidecar().execute("UPDATE telemetry_streams SET version=9 WHERE stream='accounting'", []).unwrap();
     assert_eq!(f.cli_args(&["accounting", "import-charges", &part("charges-2.json")]).0["charges"][0]["imported"], false);
-    assert_eq!((f.cli_args(&["accounting", "status"]).0["version"].clone(), f.cli_args(&["accounting", "charges"]).1), (json!(11), current));
+    assert_eq!((f.cli_args(&["accounting", "status"]).0["version"].clone(), f.cli_args(&["accounting", "charges"]).1), (json!(12), current));
 
     // Invoice allocation by a named, versioned rule: 12 × 2980/3480 and 12 × 500/3480 in units
     // of 10^-12; the one remaining unit goes to the larger remainder; the sum is exactly 12.
@@ -2283,4 +2310,153 @@ fn coordinator_overhead_and_overlap_waste_from_accepted_reasons() {
     let rebuilt = fleet_after_reprice(&f);
     assert_eq!(rebuilt["metrics"]["M34"]["allocation"], original["allocation"], "rebuild: the same allocation");
     assert_eq!(rebuilt["metrics"]["M34"], original, "rebuild: the same M34");
+}
+
+/// Collect in stages, including an older session and repeated responses, then
+/// compare the public projections with a forced rebuild of the same evidence.
+#[test]
+fn incremental_accounting_matches_full_rebuild_after_late_and_corrected_records() {
+    use std::io::Write;
+    let f = Fixture::new();
+    let path = f.rollout(&f.home, "incremental", &[RECORD], &f.worktree(), f.decided + 10_000, "0.154.0");
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let original = f.cli_args(&["accounting", "entries"]).1;
+    let line = fs::read_to_string(&path).unwrap().lines().last().unwrap().to_owned();
+    // Same native response/payload at a later ordinal is still excluded.
+    writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{line}").unwrap();
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "status"]).0["sync"]["mode"], "incremental");
+    let entries = f.cli_args(&["accounting", "entries"]).0;
+    assert!(entries["entries"].as_array().unwrap().iter().any(|e| e["provenance"][0]["reason"] == "response_repeated"));
+    // The next unique response arrives out of event-time order in this session.
+    let early = jiff::Timestamp::from_millisecond(f.decided + 500).unwrap().to_string();
+    let late = line.replace("resp-1", "late-response").replace(
+        &jiff::Timestamp::from_millisecond(f.decided + 10_000).unwrap().to_string(), &early);
+    writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{late}").unwrap();
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    // A session arriving later has an earlier native record time.
+    let older = f.rollout(&f.home, "older", &[RECORD], &f.worktree(), f.decided + 1_000, "0.154.0");
+    fs::write(&older, fs::read_to_string(&older).unwrap().replace(SID, "00000000-0000-4000-8000-00000000c0df")).unwrap();
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.report()["metrics"]["M08"]["value"], 3000);
+    assert_eq!(f.report()["metrics"]["M09"]["value"], 900);
+    let before = (f.cli_args(&["accounting", "entries"]).1, f.cli_args(&["accounting", "sessions"]).1);
+    assert_ne!(before.0, original);
+    f.sidecar().execute("DELETE FROM usage_ledger", []).unwrap();
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!((f.cli_args(&["accounting", "entries"]).1, f.cli_args(&["accounting", "sessions"]).1), before);
+    // Replacing a native identity with a contradictory payload quarantines it;
+    // a source replacement re-reads byte zero and supersedes its projection.
+    fs::write(&path, fs::read_to_string(&path).unwrap().replace("1000", "1100").replace("1300", "1400")).unwrap();
+    f.sidecar().execute("UPDATE collect_offsets SET byte_offset=0", []).unwrap();
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let corrected = f.cli_args(&["accounting", "entries"]).1;
+    f.sidecar().execute("DELETE FROM usage_ledger", []).unwrap();
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "entries"]).1, corrected);
+}
+
+#[test]
+fn accounting_reread_and_retention_record_full_rebuild_reasons() {
+    let f = Fixture::new();
+    f.rollout(&f.home, "reread", &[RECORD], &f.worktree(), f.decided + 1_000, "0.154.0");
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let first = f.cli_args(&["accounting", "entries"]).1;
+    // Removing the collected metadata requests the collector's real backfill
+    // path, which resets the source and reads again from byte zero.
+    f.sidecar().execute("DELETE FROM rollout_metadata", []).unwrap();
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let status = f.cli_args(&["accounting", "status"]).0;
+    assert_eq!(status["sync"]["mode"], "full_rebuild");
+    assert_eq!(status["sync"]["rebuild_reason"], "source_reread_from_zero");
+    assert_eq!(f.cli_args(&["accounting", "entries"]).1, first);
+    f.cancel_reserved();
+    let plan = f.cli_args(&["maintenance", "plan", "--forget-session", SID, "--json"]).0;
+    f.cli_args(&["maintenance", "apply", "--forget-session", SID, "--confirm", plan["plan_digest"].as_str().unwrap(), "--json"]);
+    f.cli_args(&["accounting", "sync"]);
+    let status = f.cli_args(&["accounting", "status"]).0;
+    assert_eq!(status["sync"]["mode"], "full_rebuild");
+    assert_eq!(status["sync"]["rebuild_reason"], "retention_enforcement");
+    assert_eq!(f.cli_args(&["accounting", "entries"]).0, json!({"entries": []}));
+}
+
+#[test]
+fn killed_incremental_accounting_sync_resumes_atomically() {
+    use std::io::Write;
+    let f = Fixture::new();
+    let path = f.rollout(&f.home, "crash", &[RECORD], &f.worktree(), f.decided + 1_000, "0.154.0");
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let first = f.cli_args(&["accounting", "entries"]).1;
+    let line = fs::read_to_string(&path).unwrap().lines().last().unwrap().to_owned();
+    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    for n in 0..8_000 { writeln!(file, "{}", line.replace("resp-1", &format!("crash-{n}")).replace("turn-1", &format!("crash-turn-{n}"))).unwrap(); }
+    drop(file);
+    f.cli("collect");
+    let mark: i64 = f.sidecar().query_row("SELECT watermark FROM accounting_stream", [], |r| r.get(0)).unwrap();
+    let mut child = Command::new(BIN).env_clear().env("HOME", f.tmp.path().join("home")).env("PATH", "/usr/bin:/bin")
+        .args(["--root", f.root.to_str().unwrap(), "telemetry", "demo", "accounting", "sync"])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let probe = f.sidecar();
+    probe.busy_timeout(Duration::ZERO).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(child.try_wait().unwrap().is_none(), "sync completed before fault injection");
+        match probe.execute_batch("BEGIN IMMEDIATE") {
+            Ok(()) => { probe.execute_batch("ROLLBACK").unwrap(); }
+            Err(e) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) => break,
+            Err(e) => panic!("{e}"),
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // The writer holds the sync transaction. Give it time to replace rows,
+    // then kill before its large session has finished deriving/storing.
+    std::thread::sleep(Duration::from_millis(30));
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+    assert_eq!(f.cli_args(&["accounting", "entries"]).1, first);
+    assert_eq!(f.sidecar().query_row("SELECT watermark FROM accounting_stream", [], |r| r.get::<_, i64>(0)).unwrap(), mark);
+    f.cli_args(&["accounting", "sync"]);
+    let resumed = (f.cli_args(&["accounting", "entries"]).1, f.cli_args(&["accounting", "sessions"]).1);
+    f.sidecar().execute("DELETE FROM usage_ledger", []).unwrap();
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!((f.cli_args(&["accounting", "entries"]).1, f.cli_args(&["accounting", "sessions"]).1), resumed);
+}
+
+#[test]
+fn restored_accounting_frontier_requires_a_full_rebuild() {
+    let f = Fixture::new();
+    f.rollout(&f.home, "backup", &[RECORD], &f.worktree(), f.decided + 1_000, "0.154.0");
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let first = f.cli_args(&["accounting", "entries"]).1;
+    let backup = f.tmp.path().join("accounting-backup");
+    f.cli_args(&["backup", "create", "--out", backup.to_str().unwrap()]);
+    f.cli_args(&["backup", "restore", "--from", backup.to_str().unwrap(), "--force"]);
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "status"]).0["sync"]["rebuild_reason"], "sidecar_restore");
+    assert_eq!(f.cli_args(&["accounting", "entries"]).1, first);
+    f.sidecar().execute("UPDATE accounting_stream SET watermark=sequence+1", []).unwrap();
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "status"]).0["sync"]["rebuild_reason"], "watermark_inconsistent");
+    assert_eq!(f.cli_args(&["accounting", "entries"]).1, first);
+    // A backup from accounting 11 has no frontier. Restoring it upgrades the
+    // sidecar and still records restore as the reason for the first rebuild.
+    f.sidecar().execute_batch("UPDATE telemetry_streams SET version=11 WHERE stream='accounting';
+        DROP TABLE accounting_dirty_sessions; DROP TABLE accounting_stream;").unwrap();
+    let legacy = f.tmp.path().join("legacy-accounting-backup");
+    f.cli_args(&["backup", "create", "--out", legacy.to_str().unwrap()]);
+    f.cli_args(&["backup", "restore", "--from", legacy.to_str().unwrap(), "--force"]);
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "status"]).0["sync"]["rebuild_reason"], "sidecar_restore");
+    assert_eq!(f.cli_args(&["accounting", "entries"]).1, first);
+
 }

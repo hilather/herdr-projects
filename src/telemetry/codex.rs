@@ -739,8 +739,10 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let stored = tx.query_row("SELECT device,inode,byte_offset,records,rate_limits,model,effort FROM collect_offsets WHERE path_digest=?1", [&key],
         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))).optional()?;
+    let reread_zero = stored.as_ref().is_some_and(|cursor| cursor.2 == 0)
+        && tx.query_row("SELECT EXISTS(SELECT 1 FROM rollout_sources WHERE path_digest=?1)", [&key], |r| r.get::<_, bool>(0))?;
     let mut cursor = match stored {
-        Some((dev, ino, offset, records, rate_limits, model, effort)) if !reread.contains(&key) && dev as u64 == meta.dev() && ino as u64 == meta.ino() && offset as u64 <= meta.len() => {
+        Some((dev, ino, offset, records, rate_limits, model, effort)) if !reread_zero && !reread.contains(&key) && dev as u64 == meta.dev() && ino as u64 == meta.ino() && offset as u64 <= meta.len() => {
             let state: Option<TurnState> = tx.query_row("SELECT x.uncertified_envelopes,x.last_turn_offset,x.last_turn_id,
                 x.last_turn_completed,coalesce(e.last_turn_aborted,0) FROM rollout_ingest_state x LEFT JOIN rollout_turn_ends e ON e.path_digest=x.path_digest
                 WHERE x.path_digest=?1", [&key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).optional()?;
@@ -751,6 +753,7 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
         // New, replaced or re-read file: read from the start; existing keys
         // dedupe, re-evaluate or quarantine.
         _ => {
+            if stored.is_some() { super::accounting::ledger::invalidate(&tx, "source_reread_from_zero")?; }
             for table in ["rollout_sources", "rollout_metadata", "rollout_threads", "codex_tool_sources", "rollout_subagents", "rollout_ingest_state", "rollout_forks",
                 "rollout_turn_ends", "rollout_turn_terminations"] {
                 tx.execute(&format!("DELETE FROM {table} WHERE path_digest=?1"), [&key])?;

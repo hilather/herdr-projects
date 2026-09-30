@@ -2,7 +2,7 @@
 //! Codex rate-limit snapshots (`codex_rate_limits` and, from A4, the secondary
 //! window in `codex_rate_limit_windows`, read by SQL only) become
 //! observations with a trust level and the provider windows they identify,
-//! rebuilt whole by each sync. A reset starts a new window, so nothing is ever
+//! replayed in order for affected accounts by each sync. A reset starts a new window, so nothing is ever
 //! subtracted across one; a `used` below the window's high-water mark without
 //! a reset is flagged, never subtracted. Extended M40 reads them per dispatch
 //! decision; M38/M39 have no certified Codex source.
@@ -89,20 +89,62 @@ impl Window {
 /// One window of a snapshot as collected: `used_percent` text, `window_minutes`, `resets_at` seconds.
 type Fields = (Option<String>, Option<i64>, Option<i64>);
 
+/// Resume the last window of a key from its exact persisted fixed-point fields.
+fn current_window(tx: &Connection, account: &str, limit: &str, kind: &'static str) -> Result<Option<Window>> {
+    Ok(tx.prepare_cached("SELECT window_id,window_minutes,resets_unix_ms,start_evidence,first_observed_unix_ms,last_observed_unix_ms,
+        first_used,used,plan_type,observations,flagged FROM quota_windows WHERE account=?1 AND limit_id=?2 AND window_kind=?3
+        ORDER BY resets_unix_ms DESC LIMIT 1")?.query_row(params![account, limit, kind], |r| {
+        let evidence: String = r.get(3)?;
+        let first: String = r.get(6)?;
+        let used: String = r.get(7)?;
+        Ok(Window { id: r.get(0)?, account: account.to_owned(), limit: limit.to_owned(), kind, minutes: r.get(1)?, resets: r.get(2)?,
+            evidence: match evidence.as_str() { "reset_elapsed" => "reset_elapsed", "reset_moved" => "reset_moved", "first_observation" => "first_observation", _ => return Err(rusqlite::Error::InvalidQuery) },
+            first_observed: r.get(4)?, last_observed: r.get(5)?, first_used: percent(&first).ok_or(rusqlite::Error::InvalidQuery)?, used: percent(&used).ok_or(rusqlite::Error::InvalidQuery)?,
+            plan: r.get(8)?, observations: r.get(9)?, flagged: r.get(10)? })
+    }).optional()?)
+}
+
 /// Rebuild `quota_window_observations` and `quota_windows` inside the sync
 /// transaction; returns the number of windows. Per account (execution home),
 /// limit and window kind, snapshots are taken in `(observed, session, ordinal)`
 /// order. The secondary window (A4) follows the same rules; a snapshot whose
 /// A4 row is absent (read before A4) has no secondary observation.
 pub fn store(tx: &Connection) -> Result<usize> {
-    tx.execute_batch("DELETE FROM quota_window_observations; DELETE FROM quota_windows;")?;
+    tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS accounting_selected(session_id TEXT PRIMARY KEY); DELETE FROM accounting_selected;
+        INSERT INTO accounting_selected SELECT session_id FROM rollout_sources UNION SELECT session_id FROM codex_rate_limits;")?;
+    store_scoped(tx, true)
+}
+
+pub(crate) fn store_scoped(tx: &Connection, full: bool) -> Result<usize> {
+    tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS accounting_accounts(account TEXT PRIMARY KEY); DELETE FROM accounting_accounts;
+        INSERT OR IGNORE INTO accounting_accounts SELECT home_digest FROM rollout_sources WHERE session_id IN (SELECT session_id FROM accounting_selected);
+        INSERT OR IGNORE INTO accounting_accounts SELECT account FROM quota_window_observations WHERE session_id IN (SELECT session_id FROM accounting_selected) AND account IS NOT NULL;
+        CREATE TEMP TABLE IF NOT EXISTS accounting_quota_sessions(session_id TEXT PRIMARY KEY); DELETE FROM accounting_quota_sessions;
+        INSERT INTO accounting_quota_sessions SELECT session_id FROM accounting_selected UNION SELECT session_id FROM rollout_sources WHERE home_digest IN (SELECT account FROM accounting_accounts);")?;
+    type Order = (i64, String, i64);
+    let first_new: Option<Order> = tx.query_row("SELECT l.observed_ts,l.session_id,l.ordinal FROM codex_rate_limits l
+        WHERE l.session_id IN (SELECT session_id FROM accounting_selected) AND NOT EXISTS(SELECT 1 FROM quota_window_observations o
+        WHERE o.session_id=l.session_id AND o.ordinal=l.ordinal AND o.window_kind='primary') ORDER BY l.observed_ts,l.session_id,l.ordinal LIMIT 1",
+        [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
+    let last: Option<Order> = tx.query_row("SELECT observed_unix_ms,session_id,ordinal FROM quota_window_observations
+        ORDER BY observed_unix_ms DESC,session_id DESC,ordinal DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
+    let correction: bool = tx.query_row("SELECT quota_rebuild FROM accounting_stream", [], |r| r.get(0))?;
+    // A late snapshot can change every later trust decision of its account.
+    // Ordered new rows extend the exact saved state; all other changes replay.
+    let append = !full && !correction && first_new.as_ref().is_none_or(|first| last.as_ref().is_none_or(|last| first > last));
+    if full { tx.execute_batch("DELETE FROM quota_window_observations; DELETE FROM quota_windows;")?; }
+    else if !append { tx.execute_batch("DELETE FROM quota_window_observations WHERE session_id IN (SELECT session_id FROM accounting_quota_sessions);
+        DELETE FROM quota_windows WHERE account IN (SELECT account FROM accounting_accounts);")?; }
+    let filter = if append { " WHERE l.session_id IN (SELECT session_id FROM accounting_selected) AND NOT EXISTS(SELECT 1 FROM quota_window_observations o
+        WHERE o.session_id=l.session_id AND o.ordinal=l.ordinal AND o.window_kind='primary')" }
+        else if full { "" } else { " WHERE l.session_id IN (SELECT session_id FROM accounting_quota_sessions)" };
     type Row = (String, i64, Option<String>, Fields, Option<String>, i64, Option<String>, i64, Option<Fields>, Option<String>);
-    let rows: Vec<Row> = tx.prepare("SELECT l.session_id,l.ordinal,l.limit_id,l.used_percent,l.window_minutes,l.resets_at,l.plan_type,l.observed_ts,
+    let rows: Vec<Row> = tx.prepare(&format!("SELECT l.session_id,l.ordinal,l.limit_id,l.used_percent,l.window_minutes,l.resets_at,l.plan_type,l.observed_ts,
         (SELECT min(s.home_digest) FROM rollout_sources s WHERE s.session_id=l.session_id),
         (SELECT count(DISTINCT s.home_digest) FROM rollout_sources s WHERE s.session_id=l.session_id),
         w.session_id IS NOT NULL,w.secondary_used_percent,w.secondary_window_minutes,w.secondary_resets_at,w.rate_limit_reached_type
         FROM codex_rate_limits l LEFT JOIN codex_rate_limit_windows w ON w.session_id=l.session_id AND w.ordinal=l.ordinal
-        ORDER BY l.observed_ts,l.session_id,l.ordinal")?
+        {filter} ORDER BY l.observed_ts,l.session_id,l.ordinal"))?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, (r.get(3)?, r.get(4)?, r.get(5)?), r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?,
             r.get::<_, bool>(10)?.then(|| Ok::<_, rusqlite::Error>((r.get(11)?, r.get(12)?, r.get(13)?))).transpose()?, r.get(14)?)))?
         .collect::<rusqlite::Result<_>>()?;
@@ -120,6 +162,9 @@ pub fn store(tx: &Connection) -> Result<usize> {
                     Some(used) if minutes > 0 && minutes.checked_mul(60_000).is_some_and(|w| resets.checked_sub(w).is_some()) => {
                         let key = (account.clone(), limit.clone(), kind);
                         let snapshot = Snapshot { account, limit, kind, minutes, resets, observed, used, plan: &plan };
+                        if append && !current.contains_key(&key) && let Some(window) = current_window(tx, account, limit, kind)? {
+                            current.insert(key.clone(), window);
+                        }
                         match current.get_mut(&key) {
                             None => {
                                 let w = Window::open(&snapshot, "first_observation");
@@ -166,13 +211,14 @@ pub fn store(tx: &Connection) -> Result<usize> {
     }
     done.extend(current.into_values());
     for w in &done {
-        tx.prepare_cached("INSERT INTO quota_windows(window_id,service,account,limit_id,window_kind,unit,window_minutes,window_start_unix_ms,resets_unix_ms,start_evidence,
+        tx.prepare_cached("INSERT OR REPLACE INTO quota_windows(window_id,service,account,limit_id,window_kind,unit,window_minutes,window_start_unix_ms,resets_unix_ms,start_evidence,
             first_observed_unix_ms,last_observed_unix_ms,first_used,used,remaining,observed_increase,plan_type,observations,flagged)
             VALUES(?1,'codex',?2,?3,?4,'percent',?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)")?
                 .execute(params![w.id, w.account, w.limit, w.kind, w.minutes, w.resets - w.minutes * 60_000, w.resets, w.evidence, w.first_observed, w.last_observed,
                 show(w.first_used), show(w.used), show(HUNDRED - w.used), show(w.used - w.first_used), w.plan, w.observations, w.flagged])?;
     }
-    Ok(done.len())
+    tx.execute("UPDATE accounting_stream SET quota_rebuild=0", [])?;
+    Ok(tx.query_row("SELECT count(*) FROM quota_windows", [], |r| r.get(0))?)
 }
 
 pub(crate) fn synced(db: &Connection) -> Result<bool> {

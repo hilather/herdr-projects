@@ -78,15 +78,18 @@ pub fn open(project: &Path, create: bool) -> Result<Option<Connection>> {
     let versions = versions(&tx)?;
     check(&versions)?;
     tx.execute_batch(STREAMS_TABLE)?;
+    let mut upgraded = false;
     for (stream, migrations) in streams() {
         let from = versions.get(stream).copied().unwrap_or(0);
         if from > 0 { tx.execute("INSERT OR IGNORE INTO telemetry_streams(stream,version) VALUES(?1,?2)", rusqlite::params![stream, from])?; }
         for (index, migration) in migrations.iter().enumerate().skip(from) {
+            upgraded = true;
             tx.execute_batch(migration)?;
             tx.execute("INSERT INTO telemetry_streams(stream,version) VALUES(?1,?2) ON CONFLICT(stream) DO UPDATE SET version=excluded.version",
                 rusqlite::params![stream, index + 1])?;
         }
     }
+    if upgraded { super::accounting::ledger::invalidate(&tx, "schema_upgrade")?; }
     tx.commit()?;
     Ok(Some(db))
 }

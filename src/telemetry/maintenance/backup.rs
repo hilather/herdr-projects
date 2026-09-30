@@ -293,6 +293,7 @@ pub fn restore(project: &Path, from: &Path, force: bool, identity: Option<&Path>
     }
     let tombstones = super::Tombstones::load(&ops)?;
     let reapplied = super::enforce(&mut copy, &tombstones)?;
+    super::super::accounting::ledger::invalidate(&copy, "sidecar_restore")?;
     let rows = counts(&copy)?;
     let orphans = orphans(project, &copy)?;
     drop(copy);
@@ -308,7 +309,10 @@ pub fn restore(project: &Path, from: &Path, force: bool, identity: Option<&Path>
         rusqlite::backup::Backup::new(&source, &mut target)?.run_to_completion(256, std::time::Duration::ZERO, None)?;
         target.pragma_update(None, "journal_mode", "WAL")?;
     }
-    drop(super::super::sidecar::open(project, false)?);
+    if let Some(db) = super::super::sidecar::open(project, false)? {
+        // Backups predating the frontier acquire it during this upgrade too.
+        super::super::accounting::ledger::invalidate(&db, "sidecar_restore")?;
+    }
     let restored = store::now();
     let backup_id = manifest["backup_id"].as_str().unwrap_or_default().to_owned();
     let restore_id = store::sha256(format!("{backup_id}:{restored}").as_bytes());

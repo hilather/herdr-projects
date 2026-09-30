@@ -1598,4 +1598,40 @@ fn scale_6_fairness() {
         "criterion": "each light project has observed usage and p95 append-to-ledger freshness <= 5000 ms in every round", "fair": fair,
         "rounds": rounds, "loadavg_start": load, "loadavg_end": load_average()}));
     assert!(fair, "light-project freshness exceeds the fixed 5 s fairness criterion; see results-fairness.json");
+
+/// Isolate accounting RSS and latency after a bounded fleet append. The optional
+/// executable override compares a preserved pre-change CLI on the same dataset;
+/// the normal gate and every answer still use the public CLI surfaces.
+#[test]
+#[ignore = "100k accounting pass resource measurement; on-disk SCALE_DATA required"]
+fn scale_6_accounting_pass() {
+    let dir = data_dir();
+    let mut d = Dataset::load(&dir);
+    let canonical = canonical_digest(&d);
+    let run_cli = |d: &Dataset, args: &[&str]| match std::env::var_os("SCALE_ACCOUNTING_BIN") {
+        None => telemetry(d, args),
+        Some(bin) => measure({
+            let mut c = Command::new(bin);
+            c.env_clear().env("HOME", d.home()).env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", "/bin/false")
+                .args(["--root", d.root.to_str().unwrap(), "telemetry", "demo"]).args(args);
+            c
+        }),
+    }.ok();
+    run_cli(&d, &["accounting", "sync"]);
+    let load0 = load_average();
+    let mut runs = Vec::new();
+    for _ in 0..env_usize("SCALE_REPEATS", 3) {
+        for session in &mut d.active { session.append(16, &mut d.totals, &mut d.mix); }
+        run_cli(&d, &["collect"]);
+        runs.push(run_cli(&d, &["accounting", "sync"]));
+    }
+    d.save(&dir);
+    let violations = usage_gates(&d);
+    write_results(&dir, &format!("accounting-pass-{}", std::env::var("SCALE_TAG").unwrap_or_default()), &json!({
+        "scale": d.scale, "loadavg_start": load0, "loadavg_end": load_average(),
+        "sync_ms": dist(&runs.iter().map(|r| r.wall_ms).collect::<Vec<_>>()),
+        "maxrss_kib": runs.iter().map(|r| r.maxrss_kib).max(), "runs": runs, "violations": violations,
+        "canonical_unchanged": canonical_digest(&d) == canonical}));
+    assert!(violations.is_empty(), "{violations:?}");
+    assert_eq!(canonical_digest(&d), canonical);
 }

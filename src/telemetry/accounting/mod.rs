@@ -30,14 +30,15 @@ pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/ac
     include_str!("../../../migrations/telemetry/accounting/0008_drop_superseded.sql"),
     include_str!("../../../migrations/telemetry/accounting/0009_valuation_deltas.sql"),
     include_str!("../../../migrations/telemetry/accounting/0010_charges_fx.sql"),
-    include_str!("../../../migrations/telemetry/accounting/0011_quota_window_lookup.sql")];
+    include_str!("../../../migrations/telemetry/accounting/0011_quota_window_lookup.sql"),
+    include_str!("../../../migrations/telemetry/accounting/0012_incremental_sync.sql")];
 
 /// `herdr-projects telemetry <slug> accounting ...`
 #[derive(clap::Subcommand)]
 pub enum Command {
     /// Stream version of this lane's sidecar tables. Read-only.
     Status,
-    /// Rebuild the usage ledger, session graph, model segments and quota windows from the collected Codex rows. Writes only the sidecar.
+    /// Sync changed sessions and quota accounts; rebuild after invalidation. Writes only the sidecar.
     Sync,
     /// The synced usage ledger: entries with their provenance. Read-only.
     Entries,
@@ -175,7 +176,13 @@ fn unavailable(reason: &str) -> Value {
 /// The command's stdout.
 pub fn run(project: &Path, command: Command) -> Result<String> {
     let value = match command {
-        Command::Status => super::sidecar::status(project, STREAM)?,
+        Command::Status => {
+            let mut value = super::sidecar::status(project, STREAM)?;
+            if value["version"] == MIGRATIONS.len() && let Some(db) = super::sidecar::read(project)? && let Some(status) = ledger::status(&db)? {
+                value["sync"] = status;
+            }
+            value
+        },
         Command::Sync => match super::sidecar::open(project, false)? {
             Some(mut db) => ledger::sync(&mut db)?,
             None => unavailable("collection_not_run"),
@@ -340,7 +347,7 @@ fn usage_metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, 
 }
 
 /// Ticker telemetry pass, after the Codex collect: one attention observation
-/// pass within the tick budget, then rebuild the ledger of an existing
+/// pass within the tick budget, then sync the ledger of an existing
 /// sidecar, then reprice it when a rate card exists and the rate cards or
 /// the ledger changed since the last reprice (§12), within the tick budget.
 /// Writes only the sidecar; never creates it.

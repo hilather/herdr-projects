@@ -28,7 +28,7 @@ for either. This is not a certification of an OTLP transport.
 | Item | Value |
 | --- | --- |
 | Source | branch `telemetry/tm51-scale-certification` from `main` `20a763f`, plus the fixes in §5 |
-| Stores | canonical `SCHEMA = 67`; sidecar streams `codex` 3, `ingest` 8, `accounting` 11, `quality` 2, `analytics` 1, `health` 1, `policies` 1 |
+| Stores | canonical `SCHEMA = 67`; sidecar streams `codex` 3, `ingest` 8, `accounting` 12, `quality` 2, `analytics` 1, `health` 1, `policies` 1 |
 | Build | `cargo test --release --locked --offline -j 3 --features state-store --test telemetry_scale --no-run` (rustc 1.98.0), system SQLite 3.53.4 |
 | CPU / memory | Intel Core i7-8750H, 6 cores / 12 threads, 62 GiB RAM, zram swap |
 | Disk | Intel SSDPEKNW010T8 NVMe, LUKS, btrfs (`compress=zstd:3`). Every dataset lived under `bench-data/` on this disk, never on the RAM-backed `/tmp` |
@@ -412,6 +412,109 @@ env PATH=/usr/bin:/bin HERDR_BIN_PATH=/bin/false TMPDIR=$PWD/bench-data/tmp \
     target/release/deps/telemetry_scale-* --exact scale_6_fairness --ignored --test-threads=1 --nocapture
 ```
 
+## 4.6 P1 incremental accounting follow-up (pending steward's 1M certification)
+
+Branch `perf/incremental-ledger`, accounting stream **12**. This follow-up
+addresses accounting's contribution to L2 and L4; it does not certify the
+other lanes or promote the complete ticker pass. No 1M run was performed.
+The original measurements above remain the TM5.1 baseline.
+
+`accounting_stream` holds a durable source-mutation sequence, committed
+watermark, invalidation reason and last sync mode. SQLite triggers queue
+sessions in the same transactions that change the native inputs. Sync
+replays only affected sessions, including children whose missing parent has
+arrived, in the original ordinal order. This dependency boundary preserves
+repeated-response exclusion, quarantine, cumulative reconciliation and
+model segmentation even for late records and corrections. Unaffected
+sessions retain their projections. Ordered new quota snapshots resume the
+exact persisted fixed-point window state; late snapshots, corrections and
+account reassignment replay affected accounts in observation order.
+
+Schema upgrades, source re-reads from byte zero, source deletions, retention
+tombstones/enforcement, backup restores (including pre-frontier backups),
+missing projections and inconsistent watermarks force a full rebuild.
+`accounting status` reports the committed mode, sequence/watermark and
+rebuild reason. Projection writes, watermark advancement and queue removal
+share one immediate transaction: a kill rolls them all back while leaving
+committed collector inputs queued. Public sync counts still describe the
+whole projection; normalization and metric/read/as-of semantics are unchanged.
+
+Both versions used the same on-disk 100k/64 dataset (10,000 bindings,
+seed 5100). Its initial source bytes, canonical store and generator state
+were restored before each comparison. After copying the project tree, a
+full CLI collect settled changed file inodes **before** timing; its
+`budget_exhausted` was false. Otherwise the 8 MiB ticker warm pass leaves a
+cold re-read backlog: an exploratory after run exhausted five steady passes
+and is excluded from the live-load comparison. The baseline freshness run
+used the original ingested tree and had no such backlog. Builds and benches
+were serialized; one bench process, at most four bench threads.
+
+Build: `cargo test --release --locked --offline -j 3 --features state-store
+--test telemetry_scale --no-run`. Use §1's environment with
+`SCALE_EVENTS=100000 SCALE_ACTIVE=64 SCALE_REPEATS=3`. Freshness uses
+`scale_4_freshness_burst`, `SCALE_CADENCE_MS=1000` (120 s steady, 60 s burst,
+30 s drain). Additional isolated phase: `scale_6_accounting_pass`; it warms
+sync, then appends 16 real events per active rollout (1,024 lines), collects
+and measures the accounting CLI's wall time and `VmHWM` three times. Set
+`SCALE_ACCOUNTING_BIN=$PWD/bench-data/baseline-cli` only for its before run
+(the preserved pre-change CLI also performs collect); omit it for after.
+`SCALE_TAG=before|after` names the results. Source-identity warm collects
+are outside the timed samples. Every dataset remained under `bench-data/`.
+
+| 100k/64 measurement | Before | After |
+| --- | --- | --- |
+| Accounting sync p50 / p95, n = 3 | 708.91 / 848.46 ms | 71.72 / 108.50 ms |
+| Accounting sync peak RSS, three appended-data passes | 41,392 KiB (40.4 MiB) | 18,896 KiB (18.5 MiB) |
+| Accounting tick p50 / p95 during steady freshness | 1,385.97 / 2,052.73 ms | 109.60 / 1,000.84 ms |
+| Accounting comparison 1-minute load, start → end | 6.55 → 6.19 | 1.64 → 1.59 |
+| Freshness p95, steady / burst / drain | 9.037 / 9.660 / 13.024 s | 4.964 / 7.302 / 6.335 s |
+| Freshness 1-minute load, start → steady end → burst end → drain end → finish | 5.90 → 6.59 → 9.33 → 7.79 → 7.79 | 1.03 → 4.47 → 6.08 → 5.38 → 5.67 |
+
+The sync RSS is the isolated accounting process, not the entire pass. A
+separate exploratory forced source re-read/full rebuild reached 41,176 KiB
+(40.2 MiB); it is retained as a fallback observation, not an incremental
+sample. Both are well below 256 MiB at 100k. Active session histories are
+still replayed, so this does not claim arbitrary constant per-event work or
+bound a full rebuild at 1M. Host load differs: timings are provisional,
+not an authoritative speedup certification. The steady 100/s target is narrowly met at 100k (4.964 s ≤ 5 s);
+burst and drain p95 remain above 5 s. Analytics alone reached 5.62–6.07 s
+in these passes, so the whole-pass freshness target is not closed by
+accounting alone. No valid phase exhausted its byte cap or reported an
+error. The first after snapshot experiment included a re-read backlog and
+is not a comparable steady-load sample.
+
+Both accounting comparisons and the valid freshness phases reported zero
+violations; canonical digests stayed unchanged. The unchanged
+`scale_gates_hold_under_load` passed in debug and release, retaining exact
+totals, one acceptance, as-of reproducibility and byte-identical rebuild.
+The requested 15 suites had **170 passed, four socket-only failures**
+(`Operation not permitted` at Unix socket bind):
+`telemetry::attempts_show_attention_summary`,
+`telemetry_accounting::attention_intervals_union_and_censor`,
+`telemetry_health::recommendations_and_notices_change_no_canonical_state_and_no_dispatch`,
+`telemetry_workspace::thread_start_records_the_dispatch_reason_and_the_sidebar_suffix`.
+Affected suites were rerun after the final re-read/restore compatibility
+changes; all 12 operations tests passed and accounting's only failure was
+its socket bind. Clippy (`--locked --offline -j 3 --features state-store
+--test telemetry_accounting --test telemetry_scale`) found no warning in
+changed lines; existing warnings remain elsewhere.
+
+New accounting E2E workflows cover staged late/out-of-order/repeated and
+corrected records versus a forced rebuild; a process killed while holding
+the sync write transaction (ledger and watermark roll back, resume equals
+full rebuild); byte-zero re-read and retention reasons; current and
+pre-frontier backup restores; inconsistent watermarks. The existing
+secondary-window golden now collects successive snapshots across syncs,
+compares with a full replay and adds a late-snapshot replay comparison,
+without changing its golden values. Only two stream-version expectations
+advance from 11 to 12. No unit or source-text tests were added.
+
+Files: `migrations/telemetry/accounting/0012_incremental_sync.sql`;
+`src/telemetry/accounting/{ledger,graph,quota,mod}.rs`;
+`src/telemetry/{codex,sidecar}.rs`;
+`src/telemetry/maintenance/{mod,backup}.rs`;
+`tests/{telemetry_accounting,telemetry_scale}.rs`; this certificate.
+
 ## 5. Inefficiencies found and fixed
 
 The first measurement (same generator, same host) missed the query and
@@ -506,9 +609,12 @@ owner. None is hidden by loosening the target.
   project, so a derived view is up to five minutes old by design. Even with
   a pass every second, p95 was 5.5–7.8 s at 100k and 34.5 s at 1M, because each
   pass rebuilds the ledger, session graph and quota windows from every
-  collected record (`ledger::sync` is a full rebuild). Remedy: an
-  incremental sync keyed on the collector's new records. Owner: accounting
-  lane.
+  collected record (the original `ledger::sync` was a full rebuild).
+  **P1 follow-up: 100k/64 steady p95 9.037 → 4.964 s (burst 9.660 →
+  7.302 s, drain 13.024 → 6.335 s); pending the steward's 1M certification**
+  (§4.6). Sync now uses a durable collector-change frontier, affected-session
+  replay and ordered quota-window extension. The default 300 s cadence and
+  other lanes' work remain. Owner: accounting lane.
 - **L3: lane and central metrics are not indexed aggregates.** Native cohort
   queries, as-of reads of stored revisions and paged exports meet 500 ms at
   1M. The lane metrics (M08/M09 derive the ledger again on every read, the
@@ -523,7 +629,11 @@ owner. None is hidden by loosening the target.
   244 MB, `analytics refresh` 301 MB, `health evaluate` 227 MB (2.17 GB
   before F7), one pass process 294 MB at 1M. Doc 10 says an overrun blocks
   promotion to release: this blocks promoting the lane ticks at this scale,
-  not collection. Remedy: incremental sync and refresh (L2).
+  not collection. **Accounting P1 follow-up: 40.4 → 18.5 MiB peak RSS
+  over three 100k/64 incremental-pass samples, pending the steward's 1M
+  certification** (§4.6; load before 6.55–6.19, after 1.64–1.59). Full
+  invalidation rebuilds remain; analytics/health and whole-pass RSS are not
+  certified by this change. Remaining remedy: incremental refresh (L2).
 - **L5: the fleet pane and the digest section take seconds, not 250 ms / 100
   ms.** At 64 active attempts with 10,000 retained ones, one snapshot builds
   the full attempt projection three times (the active list, `compare`,

@@ -56,11 +56,16 @@ fn normalize(native: [Option<i64>; 6]) -> Option<[i64; 7]> {
 
 /// Every entry derivable from the Codex tables, in `(session, basis, position)` order.
 pub fn derive(db: &Connection) -> Result<Vec<Entry>> {
+    derive_scoped(db, false)
+}
+
+fn derive_scoped(db: &Connection, scoped: bool) -> Result<Vec<Entry>> {
     let mut entries = Vec::new();
     let mut others = db.prepare("SELECT path_digest FROM rollout_sources WHERE session_id=?1 AND path_digest<>?2 AND records>=?3 ORDER BY path_digest")?;
-    let mut stmt = db.prepare("SELECT u.session_id,u.ordinal,u.path_digest,u.response_id,u.model,u.accepted,u.reason,u.input_tokens,u.cached_input_tokens,
+    let filter = if scoped { " WHERE u.session_id IN (SELECT session_id FROM accounting_selected)" } else { "" };
+    let mut stmt = db.prepare(&format!("SELECT u.session_id,u.ordinal,u.path_digest,u.response_id,u.model,u.accepted,u.reason,u.input_tokens,u.cached_input_tokens,
         u.cache_write_input_tokens,u.output_tokens,u.reasoning_output_tokens,u.total_tokens,
-        EXISTS(SELECT 1 FROM codex_quarantine q WHERE q.session_id=u.session_id AND q.ordinal=u.ordinal),u.payload_digest FROM codex_usage u ORDER BY u.session_id,u.ordinal")?;
+        EXISTS(SELECT 1 FROM codex_quarantine q WHERE q.session_id=u.session_id AND q.ordinal=u.ordinal),u.payload_digest FROM codex_usage u{filter} ORDER BY u.session_id,u.ordinal"))?;
     let mut rows = stmt.query([])?;
     // Accepted `(session, response_id)` → payload digest, first ordinal first.
     let mut responses = BTreeMap::<(String, String), String>::new();
@@ -92,7 +97,8 @@ pub fn derive(db: &Connection) -> Result<Vec<Entry>> {
     // Cumulative thread totals (secondary basis, reconciliation only): per
     // session by position, a total above the high-water mark is accepted, an
     // equal one duplicates it, a lower one is a regression without reset evidence.
-    let mut stmt = db.prepare("SELECT session_id,path_digest,records,thread_usage FROM rollout_sources WHERE thread_usage IS NOT NULL ORDER BY session_id,records,path_digest")?;
+    let filter = if scoped { " AND session_id IN (SELECT session_id FROM accounting_selected)" } else { "" };
+    let mut stmt = db.prepare(&format!("SELECT session_id,path_digest,records,thread_usage FROM rollout_sources WHERE thread_usage IS NOT NULL{filter} ORDER BY session_id,records,path_digest"))?;
     let mut rows = stmt.query([])?;
     let mut high: Option<(String, i64)> = None;
     while let Some(r) = rows.next()? {
@@ -113,13 +119,32 @@ pub fn derive(db: &Connection) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
-/// Rebuild the ledger, session graph and model segments (§3) and quota
-/// windows (§5) from the Codex tables in one sidecar transaction; returns counts.
+/// Replay changed sessions and affected quota accounts in their original order.
+/// Source triggers advance a durable frontier; projection and frontier commit
+/// together. Invalidated bases replay the complete history. Counts describe the
+/// whole projection, as before incremental sync.
 pub fn sync(db: &mut Connection) -> Result<Value> {
     // Immediate: racing syncs (ticker and CLI) serialize on the write lock.
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let entries = derive(&tx)?;
-    tx.execute_batch("DELETE FROM usage_dispositions; DELETE FROM usage_entries;")?;
+    let (sequence, watermark, invalidated): (i64, i64, Option<String>) = tx.query_row(
+        "SELECT sequence,watermark,invalidated FROM accounting_stream WHERE singleton=1", [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    let dirty: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM accounting_dirty_sessions)", [], |r| r.get(0))?;
+    let reason = invalidated.or_else(|| (watermark < 0 || watermark > sequence || (watermark != sequence && !dirty)).then(|| "watermark_inconsistent".to_owned()));
+    let reason = reason.or(if synced(&tx)? { None } else { Some("ledger_missing".to_owned()) });
+    let full = reason.is_some();
+    tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS accounting_selected(session_id TEXT PRIMARY KEY); DELETE FROM accounting_selected;")?;
+    if full {
+        tx.execute_batch("INSERT INTO accounting_selected SELECT session_id FROM rollout_sources UNION SELECT session_id FROM codex_usage;")?;
+    } else {
+        tx.execute_batch("INSERT INTO accounting_selected SELECT session_id FROM accounting_dirty_sessions;")?;
+        // A newly collected parent changes previously unlinked children too.
+        tx.execute_batch("INSERT OR IGNORE INTO accounting_selected SELECT session_id FROM session_graph_nodes WHERE claimed_parent_session_id IN (SELECT session_id FROM accounting_dirty_sessions);")?;
+    }
+    let entries = derive_scoped(&tx, true)?;
+    if full { tx.execute_batch("DELETE FROM usage_dispositions; DELETE FROM usage_entries;")?; }
+    else { tx.execute_batch("DELETE FROM usage_dispositions WHERE entry_id IN (SELECT entry_id FROM usage_entries WHERE session_id IN (SELECT session_id FROM accounting_selected));
+        DELETE FROM usage_entries WHERE session_id IN (SELECT session_id FROM accounting_selected);")?; }
     let mut counts = BTreeMap::<&str, usize>::new();
     for e in &entries {
         let n = e.normalized.map(|n| n.map(Some)).unwrap_or([None; 7]);
@@ -135,13 +160,24 @@ pub fn sync(db: &mut Connection) -> Result<Value> {
             *counts.entry(disposition).or_default() += 1;
         }
     }
-    let (sessions, segments) = super::graph::store(&tx, &entries)?;
-    let windows = super::quota::store(&tx)?;
+    let (sessions, segments) = super::graph::store_scoped(&tx, &entries, full)?;
+    let windows = super::quota::store_scoped(&tx, full)?;
     tx.execute("INSERT INTO usage_ledger(singleton,normalization_version,synced_unix_ms) VALUES(1,?1,?2)
         ON CONFLICT(singleton) DO UPDATE SET normalization_version=excluded.normalization_version,synced_unix_ms=excluded.synced_unix_ms",
         params![NORMALIZATION, jiff::Timestamp::now().as_millisecond()])?;
+    tx.execute("UPDATE accounting_stream SET watermark=?1,invalidated=NULL,last_mode=?2,last_reason=?3 WHERE singleton=1",
+        params![sequence, if full { "full_rebuild" } else { "incremental" }, reason])?;
+    tx.execute_batch("DELETE FROM accounting_dirty_sessions;")?;
+    // Preserve the public sync counts: they describe the entire stored projection.
+    let entry_count: i64 = tx.query_row("SELECT count(*) FROM usage_entries", [], |r| r.get(0))?;
+    counts.clear();
+    for row in tx.prepare("SELECT disposition,count(*) FROM usage_dispositions GROUP BY disposition")?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, usize>(1)?)))? {
+        let (kind, count) = row?;
+        let key = match kind.as_str() { "accepted" => "accepted", "duplicate" => "duplicate", "conflict" => "conflict", _ => "unresolved" };
+        counts.insert(key, count);
+    }
     tx.commit()?;
-    Ok(json!({"entries": entries.len(), "dispositions": counts, "sessions": sessions, "model_segments": segments, "quota_windows": windows}))
+    Ok(json!({"entries": entry_count, "dispositions": counts, "sessions": sessions, "model_segments": segments, "quota_windows": windows}))
 }
 
 fn synced(db: &Connection) -> Result<bool> {
@@ -188,4 +224,19 @@ pub fn read(db: &Connection) -> Result<Value> {
             "provenance": provenance.remove(&id).unwrap_or_default()}));
     }
     Ok(json!({"entries": entries}))
+}
+
+/// Invalidation is part of the caller's source/maintenance transaction.
+pub(crate) fn invalidate(db: &Connection, reason: &str) -> Result<()> {
+    if db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='accounting_stream')", [], |r| r.get::<_, bool>(0))? {
+        db.execute("UPDATE accounting_stream SET invalidated=?1 WHERE singleton=1", [reason])?;
+    }
+    Ok(())
+}
+
+pub(crate) fn status(db: &Connection) -> Result<Option<Value>> {
+    if !db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='accounting_stream')", [], |r| r.get::<_, bool>(0))? { return Ok(None); }
+    Ok(db.query_row("SELECT sequence,watermark,invalidated,last_mode,last_reason FROM accounting_stream WHERE singleton=1 AND last_mode IS NOT NULL", [], |r|
+        Ok(json!({"sequence": r.get::<_, i64>(0)?, "watermark": r.get::<_, i64>(1)?, "invalidated": r.get::<_, Option<String>>(2)?,
+            "mode": r.get::<_, Option<String>>(3)?, "rebuild_reason": r.get::<_, Option<String>>(4)?}))).optional()?)
 }
