@@ -153,3 +153,12 @@ Replay candidates are measured by M49 only: the lifecycle metrics
 report's M02/M07 and `tasks` summary) exclude them with an explicit
 `replay_candidate` exclusion count (contracts-analytics.md §3); assignment
 policy outcomes skip them too.
+
+## 8. Scheduled replay runs (TM4.8)
+
+The owner-signed replay template in [workspace.md](workspace.md#10-owner-signed-telemetry-routines)
+uses this same run path under the routine execution lock, with the current
+head as its expected head. It requires a named profile in the signed owner
+configuration, an existing suite, and 1–16 stratified cases. It grants no
+launch authority; every resulting task still needs the contracts, owner
+approvals and ordinary profile budget checks described in §3.

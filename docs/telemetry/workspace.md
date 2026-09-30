@@ -11,9 +11,10 @@ project), the checks in `src/doctor.rs`. Tests:
 `tests/telemetry_workspace.rs`.
 
 Every surface here is advisory. None can launch, reserve, select, change a
-budget, accept a finding or write project memory. The only writes are the
+budget, accept a finding or write project memory. Interactive writes are the
 three owner popups, and they only run an existing owner command after an
-explicit `y`. That command keeps its own authority checks.
+explicit `y`. That command keeps its own authority checks. The signed routines in §10
+also write operator reports or queue replay tasks under existing routine authority.
 
 ## 1. One snapshot, every surface
 
@@ -277,6 +278,80 @@ demo · fleet · unavailable (query_service_down): nothing numeric is shown
   which is quota at dispatch rather than live headroom. Live window headroom
   is TM4.5's `quota_headroom` rule, and it appears here as an alert.
 - The sidebar suffix covers legacy threads. Canonical attempts have no
-  sidebar line of their own, so the pane is where they appear.
-- Weekly report and replay routines (doc 15 §10) are not built. A routine
-  can already run `telemetry <slug> workspace show` as a command routine.
+  per-pane status-line publisher: `token_jobs::Target` and `Current` support
+  only `Thread` and `Coordinator`, and `ticker` schedules those token jobs.
+  Canonical worker supervision publishes launch/readiness/brief observations,
+  not `pane.report_metadata` tokens; its native route may also be socket-only.
+  Adding an attempt token would require a new route/ownership-fenced metadata
+  job and lifecycle cleanup, rather than extending an existing status line.
+  Canonical telemetry remains visible in the fleet pane; this suffix is skipped.
+- Weekly report and replay routines use the existing signed routine path
+  (§10).
+
+## 10. Owner-signed telemetry routines
+
+The existing `routine-store import`, `schedule`, `execute` and ticker path
+accept two typed command templates. The script file starts with exactly
+`# herdr-telemetry-routine.v1` followed by a newline and one JSON object:
+
+```text
+# herdr-telemetry-routine.v1
+{"kind":"weekly_report"}
+```
+
+```text
+# herdr-telemetry-routine.v1
+{"kind":"replay","suite":"v1","configuration":"worker","subset":"stratified:2","seed":"weekly"}
+```
+
+These files are inputs to the existing signed `RoutineDefinition`, not
+standalone shell scripts. Set `script` to the absolute template path,
+`script_sha256` to its exact bytes' SHA-256, `cwd` to the project, and an
+existing schedule such as `every 168h`, timezone `UTC`, `deadline_ms` at most
+60000, and the usual output cap. Sign the definition with the owner's key
+in namespace `routine@herdr-projects`, then install with
+`routine-store <slug> import DOCUMENT SIGNATURE --expected-head H`.
+The configured owner must enable `routine_commands` for this project.
+The existing signature, script digest, config identity, enabled state,
+overlap, missed-run, claim and receipt checks all apply. Editing the
+JSON withdraws its approval. No new scheduler or signer exists.
+
+**Weekly report.** Reads the workspace snapshot (refuses a whole-snapshot
+outage or disabled views) and the existing JSON export service for M01,
+M02, M13, M38, M39, M40 and M49. The Markdown copies each export value,
+cohort/time basis, coverage and denominator as sample size; a value or
+sample size that does not exist is `n/a (reason)`. This is an all-time
+fleet evidence report generated weekly, not a new weekly cohort estimator.
+The companion is the exact `export.v1` manifest with a `report` extension
+containing the Markdown filename, byte length and SHA-256 digest.
+No external export is sent. Only `library/` receives report artifacts;
+no project memory is written.
+
+Names use the UTC ISO week at execution: `library/fleet-YYYY-Www.md` and
+`library/fleet-YYYY-Www.manifest.json`. A second successful execution in
+the same week chooses `-v2`, then `-v3`, up to 1000. Neither file is ever
+replaced. Each file is synced and atomically published with the export
+writer; the manifest is published first, so an interruption can leave an
+orphan manifest, whose version is skipped on retry. A symlink `library/`
+is refused. Worker briefs render immutable selected instructions and scoped
+memory objects plus worktree/output framing (`memory/worker_brief.rs`);
+they do not scan `library/`. The E2E test retains new worker knowledge and
+reserves an approved attempt after the report is written, then verifies
+its public rendered brief contains no report content or report filename.
+
+**Replay.** `configuration` must name a profile in the signed owner config;
+the suite must exist and `subset` must be `stratified:N`, N from 1 to 16.
+These checks precede the execution claim. The template uses the ordinary
+replay run implementation with the current head under the routine's existing
+exclusive project ownership (equivalent to passing that head as
+`--expected-head`). Git repository creation checks the absolute routine
+deadline and cancellation and kills/reaps a child that exceeds it.
+The routine creates/queues only the selected replay tasks. It installs no
+contract, approval, attempt or reservation and does not enable admission.
+The owner still signs the contracts and launch approvals, and ordinary
+profile budgets apply at launch. As for explicit replay runs, a failure
+partway through repository/task creation can leave recorded partial work;
+a claimed occurrence is never automatically replayed.
+
+E2E evidence: `tests/telemetry_routines.rs`, using the shared signed replay
+workflow fixture in `tests/support/replay.rs`.

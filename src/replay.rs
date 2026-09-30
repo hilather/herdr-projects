@@ -25,7 +25,7 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::{BTreeMap, BTreeSet}, fs, path::{Path, PathBuf}, process::{Command as Process, Stdio}};
+use std::{collections::{BTreeMap, BTreeSet}, fs, path::{Path, PathBuf}, process::Command as Process};
 
 use crate::{domain::{ContractScope, TaskId, TASK_CLASSIFIER, classify_task}, execution_guard::GatedSpawn, migration,
     store::{REPLAY_PRINCIPAL, ReplayCaseRecord, ReplaySource, ReplaySuiteRecord}};
@@ -115,7 +115,6 @@ fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     ensure!(out.status.success(), "git {} failed: {}", args.first().copied().unwrap_or_default(), String::from_utf8_lossy(&out.stderr).trim());
     Ok(out.stdout)
 }
-fn git_text(repo: &Path, args: &[&str]) -> Result<String> { Ok(String::from_utf8(git(repo, args)?)?.trim().to_owned()) }
 
 /// `(status, path)` of every change from `base` to `reference`.
 fn changes(repo: &Path, base: &str, reference: &str) -> Result<Vec<(char, String)>> {
@@ -304,35 +303,62 @@ fn show(project: &Path, suite: &str) -> Result<Value> {
     Ok(json!({"suite": record, "cases": cases, "retired": retired, "runs": runs}))
 }
 
+/// Concrete bounded runner: inherited routine ownership survives owner death
+/// until Git exits; timeout/cancellation kills and reaps its process group.
+fn repository_git(repo: &Path, args: &[&str], input: Option<&Path>, output: Option<&Path>, control: &crate::store::controlled::ReadControl, locks: &[crate::runner::InheritedLock]) -> Result<()> {
+    use crate::runner::{Cmd, RealRunner, Runner};
+    control.check()?;
+    let timeout = control.deadline().saturating_duration_since(std::time::Instant::now());
+    let mut command = if let Some(input) = input {
+        Cmd::new("/bin/sh", timeout).args(["-c", "input=$1; shift; exec /usr/bin/git \"$@\" < \"$input\"", "replay-git", input.to_str().context("input path")?])
+    } else { Cmd::new("/usr/bin/git", timeout) };
+    command = command.args(["-c", "core.hooksPath=/dev/null", "-C", repo.to_str().context("repository path")?]).args(args.iter().copied())
+        .env("PATH", "/usr/bin:/bin").env("HOME", "/").env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_TERMINAL_PROMPT", "0");
+    command.env_clear = true;
+    command.deadline = Some(control.deadline());
+    command.cancellation = Some(control.cancellation());
+    command.inherited_locks = locks.to_vec();
+    command.capture_limit = 4096;
+    if let Some(output) = output { command.stdout_file = Some((output.to_owned(), 128 * 1024 * 1024)); }
+    let result = RealRunner.run(&command)?;
+    ensure!(result.success(), "replay repository Git failed or exceeded execution budget");
+    control.check()?;
+    Ok(())
+}
+
 /// A replay repository at `base`: only the base commit's history, so no later
 /// change (the accepted solution and its tests included) is reachable.
-fn replay_repository(source: &Path, dest: &Path, format: &str, base: &str) -> Result<PathBuf> {
-    if dest.exists() {
-        ensure!(git_text(dest, &["rev-parse", "refs/heads/main"])? == base, "replay repository {} is not at its base", dest.display());
-        return Ok(dest.canonicalize()?);
-    }
+fn replay_repository(source: &Path, dest: &Path, format: &str, base: &str, control: &crate::store::controlled::ReadControl, locks: &[crate::runner::InheritedLock]) -> Result<PathBuf> {
+    ensure!(!dest.exists(), "replay repository already exists");
     let parent = dest.parent().context("replay repository has no parent")?;
     private_dir(parent)?;
     let staging = parent.join(format!(".{}.staging", dest.file_name().and_then(|n| n.to_str()).unwrap_or("repo")));
     if staging.exists() { fs::remove_dir_all(&staging)?; }
-    git(parent, &["init", "-q", &format!("--object-format={format}"), "-b", "main", staging.to_str().context("path")?])?;
+    repository_git(parent, &["init", "-q", &format!("--object-format={format}"), "-b", "main", staging.to_str().context("path")?], None, None, control, locks)?;
     let wanted = staging.join(".git/replay-wanted");
     fs::write(&wanted, format!("{base}\n"))?;
     let pack = staging.join(".git/replay.pack");
-    let status = git_command(source).args(["pack-objects", "--revs", "--stdout", "-q"]).stdin(Stdio::from(fs::File::open(&wanted)?))
-        .stdout(Stdio::from(fs::File::create(&pack)?)).stderr(Stdio::null()).status_gated()?;
-    ensure!(status.success(), "could not pack the base history");
-    let status = git_command(&staging).args(["unpack-objects", "-q"]).stdin(Stdio::from(fs::File::open(&pack)?)).stdout(Stdio::null()).stderr(Stdio::null()).status_gated()?;
-    ensure!(status.success(), "could not unpack the base history");
+    repository_git(source, &["pack-objects", "--revs", "--stdout", "-q"], Some(&wanted), Some(&pack), control, locks)?;
+    repository_git(&staging, &["unpack-objects", "-q"], Some(&pack), None, control, locks)?;
     fs::remove_file(&pack)?;
     fs::remove_file(&wanted)?;
-    git(&staging, &["update-ref", "refs/heads/main", base])?;
-    git(&staging, &["reset", "-q", "--hard", "main"])?;
+    repository_git(&staging, &["update-ref", "refs/heads/main", base], None, None, control, locks)?;
+    repository_git(&staging, &["reset", "-q", "--hard", "main"], None, None, control, locks)?;
     fs::rename(&staging, dest)?;
     Ok(dest.canonicalize()?)
 }
 
 fn run_suite(project: &Path, suite: &str, configuration: &str, subset: &str, seed: &str, expected_head: u64) -> Result<Value> {
+    let _guard = migration::runtime_mutation(project)?;
+    let mut db = migration::open_active(project)?;
+    let control = crate::store::controlled::ReadControl::new(std::time::Instant::now() + std::time::Duration::from_secs(60), Default::default());
+    run_suite_owned(project, &mut db, suite, configuration, subset, seed, expected_head, &control, &[])
+}
+
+/// Caller must hold project mutation ownership (signed routine execution).
+#[allow(clippy::too_many_arguments)] // Mirrors the replay CLI plus owned store and execution budget.
+pub(crate) fn run_suite_owned(project: &Path, db: &mut crate::store::SqliteStore, suite: &str, configuration: &str, subset: &str, seed: &str, expected_head: u64, control: &crate::store::controlled::ReadControl, locks: &[crate::runner::InheritedLock]) -> Result<Value> {
+    control.check()?;
     label(configuration, "configuration label")?;
     let n = parse_subset(subset)?;
     let (cases, _) = eligible(&*read(project)?, suite)?;
@@ -344,6 +370,7 @@ fn run_suite(project: &Path, suite: &str, configuration: &str, subset: &str, see
     // derived from this registry (`canonical_worker::resources::launch_hides`),
     // so ordinary launches on that repository are unaffected.
     for case in &chosen_cases {
+        control.check()?;
         Path::new(&case.repository).canonicalize().with_context(|| format!("source repository of case {} is unavailable", case.case_id))?;
         for check in case.hidden_checks.as_array().into_iter().flatten() {
             let sha = check["sha256"].as_str().unwrap_or_default();
@@ -351,27 +378,23 @@ fn run_suite(project: &Path, suite: &str, configuration: &str, subset: &str, see
                 "hidden check {sha} of case {} no longer applies: retire the case", case.case_id);
         }
     }
-    let head = crate::runtime::snapshot(project)?.head;
+    let head = db.read_snapshot(None)?.head;
     ensure!(head == expected_head, "project head is {head}, expected {expected_head}");
     let run_id = format!("sha256:{}", hex(json!({"suite": suite, "configuration": configuration, "subset": subset, "seed": seed, "cases": chosen, "head": head}).to_string().as_bytes()));
-    let seq = {
-        let _guard = migration::runtime_mutation(project)?;
-        migration::open_active(project)?.record_replay_run(&run_id, suite, configuration, subset, seed, &chosen, REPLAY_PRINCIPAL, now())?
-    };
+    control.check()?;
+    let seq = db.record_replay_run(&run_id, suite, configuration, subset, seed, &chosen, REPLAY_PRINCIPAL, now())?;
     let repos = replay_dir(project)?.join("repos").join(suite);
     let mut head = head;
     let mut tasks = Vec::new();
     for (index, case) in chosen_cases.iter().enumerate() {
+        control.check()?;
         // One repository per run and case: a candidate imported by one run is never visible to another.
-        let repository = replay_repository(Path::new(&case.repository), &repos.join(seq.to_string()).join(&case.case_id), &case.object_format, &case.base_oid)?;
+        let repository = replay_repository(Path::new(&case.repository), &repos.join(seq.to_string()).join(&case.case_id), &case.object_format, &case.base_oid, control, locks)?;
         let task = TaskId::new(format!("replay-{suite}-{seq}-{}", index + 1)).map_err(anyhow::Error::msg)?;
-        head = crate::runtime::add_task(project, task.clone(), format!("Replay {suite} {} ({configuration})", case.case_id), head)?;
-        {
-            let _guard = migration::runtime_mutation(project)?;
-            migration::open_active(project)?.register_replay_candidate(task.as_str(), &run_id, suite, &case.case_id, &repository.display().to_string(), REPLAY_PRINCIPAL, now())?;
-        }
+        head = db.commit(crate::domain::Commit { expected_head: head, mutations: vec![crate::domain::Mutation::Task { expected: None, next: crate::domain::Task { id: task.clone(), revision: 1, state: crate::domain::TaskState::Draft, title: format!("Replay {suite} {} ({configuration})", case.case_id), active_attempt: None } }] })?;
+        db.register_replay_candidate(task.as_str(), &run_id, suite, &case.case_id, &repository.display().to_string(), REPLAY_PRINCIPAL, now())?;
         let request: crate::domain::QueueRequest = serde_json::from_value(json!({"priority": 0, "dependencies": []}))?;
-        head = crate::runtime::queue_task(project, &task, 1, head, &request)?;
+        head = db.queue_task(&task, 1, head, &request, now())?;
         tasks.push(json!({"task_id": task.as_str(), "case_id": case.case_id, "stratum": case.stratum, "repository": repository, "base_oid": case.base_oid}));
     }
     Ok(json!({"seq": seq, "run_id": run_id, "suite_version": suite, "configuration": configuration, "subset": subset, "seed": seed, "cases": chosen, "tasks": tasks, "head": head}))

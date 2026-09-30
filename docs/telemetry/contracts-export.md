@@ -419,3 +419,13 @@ page,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,0,5,c2.7b226275636b6574223a2…14c87c8d6e9a
   its first page (`records.total` equals the drilled bucket's count).
 - Cursor expiry and revocation are per user and key; there is no remote read
   interface in this card.
+
+## 9. Weekly report companion (TM4.8)
+
+The existing signed weekly report template ([workspace.md](workspace.md#10-owner-signed-telemetry-routines))
+reads the JSON export service without an external destination. Its companion
+keeps the `export.v1` manifest and adds `report {file, bytes, digest}` for the
+Markdown bytes. The digest is SHA-256, prefixed `sha256:`. ISO-week filenames
+are versioned on every rerun; reports and manifests never replace an existing
+file. The report is all-time evidence generated weekly, with each metric’s
+cohort/time basis, coverage and denominator, and typed unknown reasons.

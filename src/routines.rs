@@ -6,6 +6,7 @@ use crate::{domain::{RoutineDefinition,RoutineOccurrence,PreparedRoutineTick},mi
 
 mod execution;
 mod planning;
+mod telemetry;
 pub use planning::{PlannedRoutine, schedule_next_guarded};
 
 /// Sealed in-process result. Serialized output cannot be submitted as proof.
@@ -41,13 +42,26 @@ fn execute_owned(project:&Path,operation:&crate::domain::OperationId,expected_he
     ensure!(expected_revision.is_none_or(|revision|delivery.revision==revision),"routine delivery revision changed in queue");
     let script=load_current(definition)?.context("routine is disabled")?;
     execution::preflight(&script,definition.deadline_ms,definition.output_cap_bytes)?;
+    let template = telemetry::parse(&script)?;
+    if let Some(template) = &template { template.validate(project, definition)?; }
     ensure!(!cancellation.is_cancelled(),"routine cancelled before claim");
     ensure!(deadline.is_none_or(|end|end.saturating_duration_since(std::time::Instant::now())>=std::time::Duration::from_millis(definition.deadline_ms+7_000)),"insufficient routine execution and cleanup budget after queueing");
     let inherited_locks=_guard.inherit_routine_execution()?;
     let now=jiff::Timestamp::now().as_millisecond();
     let claim=db.claim_operation(operation,delivery.revision,"routine-linux-namespace-v1",now,definition.deadline_ms as i64+30_000)?;
     db.validate_claim(&claim,jiff::Timestamp::now().as_millisecond())?;
-    let completion=execution::run_until(&script,Path::new(&definition.cwd),definition.deadline_ms,definition.output_cap_bytes,cancellation,deadline,inherited_locks.clone());
+    let completion = if let Some(template) = template {
+        let entered = std::time::Instant::now();
+        let end = deadline.unwrap_or(entered + std::time::Duration::from_millis(definition.deadline_ms))
+            .min(entered + std::time::Duration::from_millis(definition.deadline_ms));
+        let control = crate::store::controlled::ReadControl::new(end, cancellation.clone());
+        let result = template.run(project, &mut db, definition, &control, &inherited_locks);
+        let (stdout, stderr, succeeded) = match result {
+            Ok(value) => (serde_json::to_vec(&value)?, Vec::new(), true),
+            Err(error) => (Vec::new(), format!("{error:#}").into_bytes(), false),
+        };
+        Ok(execution::Completion { output: crate::runner::Output { stdout_total_bytes: stdout.len() as u64, stderr_total_bytes: stderr.len() as u64, stdout_truncated: stdout.len() > definition.output_cap_bytes as usize, stderr_truncated: stderr.len() > definition.output_cap_bytes as usize, stdout_bytes: stdout.into_iter().take(definition.output_cap_bytes as usize).collect(), stderr_bytes: stderr.into_iter().take(definition.output_cap_bytes as usize).collect(), elapsed: entered.elapsed(), ..Default::default() }, cleanup_verified: true, succeeded })
+    } else { execution::run_until(&script,Path::new(&definition.cwd),definition.deadline_ms,definition.output_cap_bytes,cancellation,deadline,inherited_locks.clone()) };
     let (output,cleanup_verified,succeeded)=match completion {
         Ok(c)=>(c.output,c.cleanup_verified,c.succeeded),
         // An I/O error after spawn cannot certify cleanup. Diagnostics never
