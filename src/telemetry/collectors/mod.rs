@@ -303,6 +303,7 @@ fn capabilities(project: &Path) -> Result<Value> {
         }
     }
     let mut adapters = super::otlp::capabilities();
+    adapters.push(super::gemini::capabilities());
     adapters.insert(0, super::codex::claude::capabilities());
     adapters.insert(0, json!({"adapter": "codex", "interface": "rollout_jsonl", "certified_versions": super::codex::CERTIFIED,
         "uncertified_version": "cli_version_uncertified", "fields": out, "profiles": super::codex::profile_versions(project)?}));

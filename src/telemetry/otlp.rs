@@ -14,7 +14,7 @@ use std::{
 pub const STREAM: &str = "otlp";
 pub const MIGRATIONS: &[&str] = &[include_str!(
     "../../migrations/telemetry/otlp/0001_records.sql"
-)];
+), include_str!("../../migrations/telemetry/otlp/0002_file_cursors.sql")];
 pub const MAX_BODY: usize = 4 * 1024 * 1024;
 const MAX_RECORDS: usize = 4096;
 

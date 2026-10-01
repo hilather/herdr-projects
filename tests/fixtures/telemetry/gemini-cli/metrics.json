@@ -1,0 +1,111 @@
+{
+  "resource": {
+    "_rawAttributes": [
+      [
+        "service.name",
+        "gemini-cli"
+      ]
+    ]
+  },
+  "scopeMetrics": [
+    {
+      "scope": {
+        "name": "gemini-cli"
+      },
+      "metrics": [
+        {
+          "descriptor": {
+            "name": "gemini_cli.token.usage",
+            "unit": "",
+            "valueType": 1
+          },
+          "dataPointType": 3,
+          "aggregationTemporality": 1,
+          "isMonotonic": true,
+          "dataPoints": [
+            {
+              "attributes": {
+                "type": "input",
+                "model": "gemini-2.5-pro",
+                "prompt": "GEMINI_SECRET_METRIC"
+              },
+              "startTime": [
+                @SEC@,
+                0
+              ],
+              "endTime": [
+                @SEC@,
+                @NANO@
+              ],
+              "value": 19
+            },
+            {
+              "attributes": {
+                "type": "output",
+                "model": "gemini-2.5-pro",
+                "prompt": "GEMINI_SECRET_METRIC"
+              },
+              "startTime": [
+                @SEC@,
+                0
+              ],
+              "endTime": [
+                @SEC@,
+                @NANO@
+              ],
+              "value": 5
+            },
+            {
+              "attributes": {
+                "type": "cache",
+                "model": "gemini-2.5-pro",
+                "prompt": "GEMINI_SECRET_METRIC"
+              },
+              "startTime": [
+                @SEC@,
+                0
+              ],
+              "endTime": [
+                @SEC@,
+                @NANO@
+              ],
+              "value": 4
+            },
+            {
+              "attributes": {
+                "type": "thought",
+                "model": "gemini-2.5-pro",
+                "prompt": "GEMINI_SECRET_METRIC"
+              },
+              "startTime": [
+                @SEC@,
+                0
+              ],
+              "endTime": [
+                @SEC@,
+                @NANO@
+              ],
+              "value": 2
+            },
+            {
+              "attributes": {
+                "type": "tool",
+                "model": "gemini-2.5-pro",
+                "prompt": "GEMINI_SECRET_METRIC"
+              },
+              "startTime": [
+                @SEC@,
+                0
+              ],
+              "endTime": [
+                @SEC@,
+                @NANO@
+              ],
+              "value": 1
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

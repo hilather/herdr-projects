@@ -13,6 +13,8 @@ use super::{ingest, sanitize};
 
 #[path = "claude.rs"]
 pub(crate) mod claude;
+#[path = "gemini_native.rs"]
+pub(crate) mod gemini;
 
 /// Codex versions certified by a live run (docs/telemetry/codex-live-0.154.0.md).
 pub const CERTIFIED: &[&str] = &["0.154.0"];
@@ -55,6 +57,7 @@ pub struct Collected {
 pub struct CanonicalAttempt {
     pub id: String,
     kind: Option<String>,
+    version: Option<String>,
     home: Option<String>,
     decided_unix_ms: Option<i64>,
     binding: Binding,
@@ -81,7 +84,22 @@ impl CanonicalAttempt {
         self.kind.as_deref() == Some("codex")
     }
 
-    pub fn supported(&self) -> bool { self.codex() || self.kind.as_deref() == Some("claude") }
+    pub fn supported(&self) -> bool { self.codex() || matches!(self.kind.as_deref(), Some("claude" | "gemini")) }
+
+    pub(super) fn gemini_home(&self) -> Option<&str> {
+        (self.kind.as_deref() == Some("gemini") && self.version.as_deref() == Some("0.62.0")).then_some(self.home.as_deref()).flatten()
+    }
+
+    pub(super) fn binds_gemini(&self, home: &str, at: i64) -> bool {
+        self.gemini_home() == Some(home)
+            && self.decided_unix_ms.is_some_and(|decided| at >= decided)
+            && match &self.binding {
+                Binding::Active(Some(bound)) => bound == home,
+                Binding::Revoked(Some(bound), revoked) => bound == home && at < *revoked,
+                Binding::Predates => true,
+                _ => false,
+            }
+    }
 
     pub fn id(&self) -> &str {
         &self.id
@@ -114,7 +132,8 @@ fn canonical(project: &Path) -> Result<(Vec<CanonicalAttempt>, Vec<String>)> {
             let (id, payload, decided_unix_ms) = row?;
             let inputs: Value = serde_json::from_str(&payload)?;
             let (kind, home) = profile(&inputs["inputs"]["effective_profile"]);
-            attempts.push(CanonicalAttempt { id, kind, home, decided_unix_ms, binding: Binding::Predates, terminated: None });
+            let version = inputs["inputs"]["effective_profile"]["agent"]["version"].as_str().map(str::to_owned);
+            attempts.push(CanonicalAttempt { id, kind, version, home, decided_unix_ms, binding: Binding::Predates, terminated: None });
         }
     }
     if table("events")? {
@@ -233,6 +252,7 @@ fn digest(bytes: &[u8]) -> String {
 /// `create` false: a project without Codex homes gets no sidecar.
 pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Collected>> {
     let (attempts, homes) = canonical(project)?;
+    super::gemini::collect(project, budget, &attempts)?;
     let Some(mut db) = super::sidecar::open(project, create || !homes.is_empty())? else { return Ok(None) };
     // TM5.3: tombstoned sessions are never collected again (maintenance holds
     // the lock exclusively while it tombstones and deletes).
@@ -255,12 +275,14 @@ pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Co
     terminated_turns(&db, &attempts)?;
     for home in &homes {
         let mut files = Vec::new();
-        if !attempts.iter().any(|a| a.kind.as_deref() == Some("claude") && a.home.as_ref() == Some(home)) || attempts.iter().any(|a| a.codex() && a.home.as_ref() == Some(home)) {
+        if !attempts.iter().any(|a| matches!(a.kind.as_deref(), Some("claude" | "gemini")) && a.home.as_ref() == Some(home)) || attempts.iter().any(|a| a.codex() && a.home.as_ref() == Some(home)) {
             walk(&Path::new(home).join(".codex/sessions"), 0, &mut files);
         }
         if attempts.iter().any(|a| a.kind.as_deref() == Some("claude") && a.home.as_ref() == Some(home)) {
             claude::walk(&Path::new(home).join(".claude/projects"), &mut files);
         }
+        let native = gemini::discover(home, &attempts, &worktrees);
+        files.extend(native.keys().cloned());
         files.sort();
         seen.extend(files.iter().map(|file| digest(file.as_os_str().as_encoded_bytes())));
         for file in files {
@@ -270,7 +292,7 @@ pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Co
                 break;
             }
             let mut span = (0, 0);
-            let read = match tail(&mut db, &file, &digest(home.as_bytes()), &worktrees, remaining, budget.bytes <= Budget::TICK.bytes, &from_start, &tombstones, &mut done, &mut span, file.starts_with(Path::new(home).join(".claude/projects"))) {
+            let read = match tail(&mut db, &file, &digest(home.as_bytes()), &worktrees, remaining, budget.bytes <= Budget::TICK.bytes, &from_start, &tombstones, &mut done, &mut span, file.starts_with(Path::new(home).join(".claude/projects")), native.get(&file)) {
                 Ok(read) => read,
                 // The pass rolled back: its range is a coverage gap and later
                 // sources wait for the next collect (contracts-collection.md A2).
@@ -745,13 +767,13 @@ fn final_event(tx: &Transaction, ledger: &ingest::Ledger, key: &str, cursor: &Cu
 /// pass resumes at the last committed prefix, with the same native identities.
 #[allow(clippy::too_many_arguments)]
 fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance: u64, bounded: bool, reread: &std::collections::BTreeSet<String>,
-    tombstones: &super::maintenance::Tombstones, done: &mut Collected, span: &mut (u64, u64), claude: bool) -> Result<u64> {
+    tombstones: &super::maintenance::Tombstones, done: &mut Collected, span: &mut (u64, u64), claude: bool, gemini: Option<&gemini::Source>) -> Result<u64> {
     let mut observed = None;
     let (mut pulled, files) = (0, done.files);
     let empty = std::collections::BTreeSet::new();
     loop {
         let (read, more) = tail_batch(db, file, home, worktrees, allowance - pulled, bounded,
-            if pulled == 0 { reread } else { &empty }, tombstones, done, span, &mut observed, claude)?;
+            if pulled == 0 { reread } else { &empty }, tombstones, done, span, &mut observed, claude, gemini)?;
         pulled += read;
         // Public collect counts files, not transaction batches.
         if done.files > files { done.files = files + 1; }
@@ -765,7 +787,7 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
 /// Keeping a line atomic preserves malformed/oversized/partial-line semantics.
 #[allow(clippy::too_many_arguments)]
 fn tail_batch(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance: u64, bounded: bool, reread: &std::collections::BTreeSet<String>,
-    tombstones: &super::maintenance::Tombstones, done: &mut Collected, span: &mut (u64, u64), observed: &mut Option<i64>, claude: bool) -> Result<(u64, bool)> {
+    tombstones: &super::maintenance::Tombstones, done: &mut Collected, span: &mut (u64, u64), observed: &mut Option<i64>, claude: bool, gemini: Option<&gemini::Source>) -> Result<(u64, bool)> {
     let key = digest(file.as_os_str().as_encoded_bytes());
     let Ok(mut handle) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(file) else { return Ok((0, false)) };
     let meta = handle.metadata()?;
@@ -847,6 +869,16 @@ fn tail_batch(db: &mut Connection, file: &Path, home: &str, worktrees: &str, all
         read += n;
         let at = cursor.offset;
         cursor.offset += n;
+        if let Some(source) = gemini {
+            if !gemini::record_line(&tx, &ledger, at, &line, source, &key, home, worktrees, &mut cursor, now, done)? {
+                ledger.malformed(&tx, at, "record_malformed", n, now)?;
+            }
+            if let Some((session, _, _)) = &cursor.session
+                && tombstones.key(super::maintenance::SESSIONS, &format!("session:{session}")).is_some() {
+                return Ok((0, false));
+            }
+            continue;
+        }
         // Not an object with a string `type` (corrupt, truncated mid-file, blank): quarantined.
         let object = line.trim_ascii_start().starts_with(b"{");
         let Some(LineTag { kind }) = serde_json::from_slice::<LineTag>(&line).ok().filter(|_| object) else {
@@ -1353,7 +1385,8 @@ fn bind(db: &mut Connection, attempts: &[CanonicalAttempt]) -> Result<()> {
             let rule1 = |h: &Option<String>| h.as_ref().is_some_and(|h| digest(h.as_bytes()) == home);
             let (mut matches, mut refused) = (Vec::new(), None);
             for a in cwd_attempt.as_deref().and_then(|id| by_id.get(id)).into_iter().flatten().copied() {
-                if (originator.as_deref() == Some("claude-code")) != (a.kind.as_deref() == Some("claude")) { continue; }
+                let source_kind = match originator.as_deref() { Some("claude-code") => "claude", Some("gemini-cli") => "gemini", _ => "codex" };
+                if a.kind.as_deref() != Some(source_kind) { continue; }
                 let Some(at) = at.filter(|at| a.decided_unix_ms.is_some_and(|decided| *at >= decided)) else { continue };
                 match &a.binding {
                     Binding::Predates if rule1(&a.home) => matches.push((a, "predates_binding")),

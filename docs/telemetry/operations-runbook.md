@@ -411,6 +411,7 @@ $ herdr-projects telemetry demo backup restore --from <tmp>/backup-2026-09-30
     "claude_tool_results": 0,
     "codex_usage": 0,
     "fx_tables": 0,
+    "gemini_file_cursors": 0,
     "health_evaluations": 0,
     "otlp_records": 0,
     "provider_charges": 0,

@@ -12,6 +12,7 @@ pub mod maintenance;
 pub mod metrics;
 pub mod outcome;
 pub mod otlp;
+mod gemini;
 pub mod panel;
 pub mod policies;
 pub mod views;

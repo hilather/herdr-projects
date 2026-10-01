@@ -76,8 +76,8 @@ impl Ledger {
         let payload = sanitize::payload(&fields, record.payload);
         let payload_text = canonical(&payload);
         let payload_digest = digest(&payload_text);
-        let adapter = if record.kind == "claude_line" { "claude-code" } else { "codex" };
-        let event_id = format!("{adapter}:{}:{sequence}", self.source);
+        let adapter = if record.session.starts_with("gemini-cli:") { "gemini-cli" } else { match record.kind { "claude_line" => "claude-code", "gemini_line" => "gemini-cli", _ => "codex" } };
+        let event_id = if adapter == "gemini-cli" && record.kind == "session_meta" { format!("{adapter}:{}:{sequence}:metadata", self.source) } else { format!("{adapter}:{}:{sequence}", self.source) };
         let producer = format!("{adapter}:{}", record.session);
         let kind = format!("{adapter}.{}.v1", record.kind);
         let identity = canonical(&json!({"session_id": record.session}));
@@ -85,7 +85,7 @@ impl Ledger {
         let version = normalization_version(record.kind);
         let mut measured = json!({"measurement_basis": "reported", "coverage": "complete", "normalization_version": version,
             "certified": record.certified});
-        if adapter == "claude-code" { measured["certification"] = json!(if record.certified { "fixture" } else { "none" }); }
+        if adapter != "codex" { measured["certification"] = json!(if record.certified { "fixture" } else { "none" }); }
         let measurement = canonical(&measured);
         let envelope = json!({"schema_version": SCHEMA_VERSION, "event_id": event_id, "producer_id": producer, "producer_epoch": self.source,
             "producer_sequence": sequence, "idempotency_key": event_id, "event_kind": kind, "occurred_unix_ms": record.occurred_unix_ms,
@@ -146,7 +146,7 @@ impl Ledger {
         db.execute("INSERT INTO source_cursors(source,producer_id,byte_offset,observations,updated_unix_ms)
             VALUES(?1,?2,?3,(SELECT count(*) FROM source_observations WHERE producer_epoch=?1),?4)
             ON CONFLICT(source) DO UPDATE SET producer_id=excluded.producer_id,byte_offset=excluded.byte_offset,observations=excluded.observations,updated_unix_ms=excluded.updated_unix_ms",
-            params![self.source, producer.map(|p| format!("{}:{p}", if p.starts_with("claude-code:") { "claude-code" } else { "codex" })), offset as i64, now])?;
+            params![self.source, producer.map(|p| format!("{}:{p}", if p.starts_with("claude-code:") { "claude-code" } else if p.starts_with("gemini-cli:") { "gemini-cli" } else { "codex" })), offset as i64, now])?;
         // A missing final event is recovered only by the event itself (`turn_completed`), not by reading its range.
         db.execute("UPDATE coverage_gaps SET recovery='recovered',observed_unix_ms=?4 WHERE source=?1 AND recovery='pending' AND (start_offset>=?2 OR reason='sidecar_write_failed') AND end_offset<=?3
             AND reason<>'final_event_missing'", params![self.source, self.start as i64, offset as i64, now])?;

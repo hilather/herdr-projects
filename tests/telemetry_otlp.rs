@@ -413,7 +413,7 @@ fn sidecar_migration_retention_and_backup_preserve_otlp_evidence() {
                 |r| r.get::<_, i64>(0)
             )
             .unwrap(),
-        1
+        2
     );
     let (classes, _) = f.cli_args(&["maintenance", "classes", "--json"]);
     let class = classes["classes"]

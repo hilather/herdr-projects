@@ -1,0 +1,5 @@
+{"sessionId":"native-gemini-session","projectHash":"@HASH@","startTime":"@TS@","lastUpdated":"@TS@","summary":"GEMINI_SECRET_SUMMARY","kind":"main"}
+{"id":"user-1","timestamp":"@TS@","type":"user","content":"GEMINI_SECRET_USER"}
+{"id":"message-1","timestamp":"@TS@","type":"gemini","model":"gemini-2.5-pro","content":"GEMINI_SECRET_NATIVE_RESPONSE","thoughts":[{"subject":"GEMINI_SECRET_THOUGHT","description":"GEMINI_SECRET_THOUGHT_TEXT"}]}
+{"id":"message-1","timestamp":"@TS@","type":"gemini","model":"gemini-2.5-pro","content":"GEMINI_SECRET_NATIVE_RESPONSE","tokens":{"input":19,"output":5,"cached":4,"thoughts":2,"tool":1,"total":26},"toolCalls":[{"id":"native-call-1","name":"read_file","status":"error","timestamp":"@TS@","args":{"path":"GEMINI_SECRET_NATIVE_ARGS"},"result":[{"text":"GEMINI_SECRET_RESULT"}],"resultDisplay":"GEMINI_SECRET_DISPLAY","description":"GEMINI_SECRET_DESCRIPTION"}]}
+{"$set":{"lastUpdated":"@TS@","summary":"GEMINI_SECRET_UPDATE_SUMMARY","memoryScratchpad":"GEMINI_SECRET_MEMORY"}}

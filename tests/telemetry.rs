@@ -529,7 +529,7 @@ fn sidecar_streams_upgrade_v2_store() {
     f.rollout(&f.home, SID, &["head.jsonl"], &f.worktree(), f.decided + 1_000, "0.154.0");
     f.cli("collect");
     // Back to a v2 sidecar: no streams table, no codex 0003 indexes.
-    f.sidecar().execute_batch("DROP TABLE telemetry_streams; DROP TABLE otlp_records; DROP INDEX codex_usage_by_path; DROP INDEX rollout_sources_by_attempt;
+    f.sidecar().execute_batch("DROP TABLE telemetry_streams; DROP TABLE otlp_records; DROP TABLE gemini_file_cursors; DROP INDEX codex_usage_by_path; DROP INDEX rollout_sources_by_attempt;
         DROP INDEX codex_usage_by_turn; DROP INDEX codex_usage_by_response; PRAGMA user_version = 2").unwrap();
     let streams = |f: &Fixture| f.sidecar().prepare("SELECT stream,version FROM telemetry_streams ORDER BY stream").unwrap()
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))).unwrap().map(Result::unwrap).collect::<Vec<_>>();

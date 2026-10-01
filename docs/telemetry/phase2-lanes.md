@@ -386,8 +386,14 @@ Cards (gaps that stop those questions being answered):
     product worker kind, so this is first among the native adapters.
     Metadata-only synthetic conformance covers 2.1.3 (`fixture`); live
     certification remains a separate owner-gated step (contracts-collection.md DG4b).
-  - **DG4c Gemini CLI native adapter.** Local session logs, plus its OTel
-    export through DG4a.
+  - **Done (DG4c; OTLP 0002): Gemini CLI local files.** Fixture-certified
+    0.62.0 SDK outfile conversion through DG4a, bounded incremental cursors,
+    digest replay, exact canonical home/time binding, and native chat JSONL
+    metadata updates (model, counters, tool names/status; never content).
+    Native updates and OTel remain separate; native accounting promotion,
+    live certification and Gemini worker launch support are separate cards.
+    Synthetic privacy, replay, binding, upgrade, backup and retention E2E
+    coverage: contracts-collection.md DG4c.
   - **DG4d OpenCode native adapter.** Local session storage; multi-provider,
     so the model/provider fields matter for M15.
   - **DG4e Grok.** The owner uses it (first wave). First step: confirm which

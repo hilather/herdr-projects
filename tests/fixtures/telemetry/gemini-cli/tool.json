@@ -1,0 +1,26 @@
+{
+  "hrTime": [
+    @SEC@,
+    @NANO@
+  ],
+  "resource": {
+    "_rawAttributes": [
+      [
+        "service.name",
+        "gemini-cli"
+      ]
+    ]
+  },
+  "attributes": {
+    "event.name": "gemini_cli.tool_call",
+    "function_name": "read_file",
+    "success": false,
+    "duration_ms": 12,
+    "function_args": "GEMINI_SECRET_ARGS",
+    "tool_output": "GEMINI_SECRET_OUTPUT"
+  },
+  "_body": "GEMINI_SECRET_BODY",
+  "instrumentationScope": {
+    "name": "gemini-cli"
+  }
+}

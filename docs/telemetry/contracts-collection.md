@@ -1454,3 +1454,161 @@ uncertified versions and unchanged Codex totals alongside Claude. It also
 proves the v12 accounting upgrade preserves a populated Codex ledger and
 Claude identity/outcome rows survive backup/restore and follow retention
 and tombstones through a later restore.
+
+## DG4c: Gemini CLI local files and native chat metadata (fixture certification)
+
+`gemini-cli` describes the local SDK file and native JSONL sources; **0.62.0
+is fixture-only**, with no live certificate. Local telemetry observations use
+**`otlp:gemini-cli`** as their durable adapter id: they pass through DG4a's
+exact sanitizing mapper and share its sanitized-record digest algorithm.
+Identical sanitized envelopes dedupe; exporter key diagnostics can differ,
+so local and network observations are never summed.
+No launch kind, executable/version probe, live export or owner-home discovery
+is added. Gemini worker launch/isolation support is a separate card.
+
+**Source and format evidence.** Only read-only installed program files were
+consulted, under
+`/home/brewerm/.local/share/mise/installs/npm-google-gemini-cli/0.62.0/node_modules/.mise/@google+gemini-cli@0.62.0/node_modules/@google/gemini-cli`.
+The references below are relative to that package, not captured user files.
+
+| Fields / behavior | Installed 0.62.0 source of truth |
+| --- | --- |
+| enabled, target local, outfile, logPrompts and their `GEMINI_TELEMETRY_*` overrides | `bundle/docs/cli/telemetry.md`, Configuration table |
+| append mode, pretty-printed SDK objects followed by newline; log objects and metric batches share one file | `bundle/chunk-2DHAEQE2.js:285528`, `FileExporter`, `FileLogExporter`, `FileMetricExporter` (`packages/core/src/telemetry/file-exporters.ts`); `safeJsonStringify` at 273947 |
+| log `hrTime` (seconds/nanoseconds), `attributes`, `_body` | same bundle: `LogRecordImpl` at 74304 |
+| metric `scopeMetrics[].metrics[].descriptor`, `dataPoints`, `startTime`, `endTime`, `value` and numeric SDK SUM=3 | same bundle: SDK `SumAggregator.toMetricData` at 69672 and `DataPointType` at 68294 |
+| SDK cumulative temporality=1, converted to wire cumulative=2; file exporter prefers cumulative | same bundle: `AggregationTemporality` at 68268, `FileMetricExporter` at 285574 |
+| model, input/output/cached/thought/tool/total token counts, duration_ms, native event name `gemini_cli.api_response` | same bundle: `ApiResponseEvent.toLogRecord` at 277390 and `logApiResponse` at 289272; telemetry doc Logs section |
+| function_name, success, duration_ms; token counter type/model | same bundle: `logToolCall` at 289136, `recordCustomTokenUsageMetrics` at 276082; telemetry doc Logs/Metrics sections |
+| execution-home override and Linux runtime root | same bundle: `homedir` at 252013 (`GEMINI_CLI_HOME`), `Storage.getGlobalGeminiDir/getGlobalRuntimeDir` at 253201–253240 |
+| saved chat location, token statistics, conversation and tool contents | `bundle/docs/cli/session-management.md`, Automatic saving |
+| current native `.jsonl` initial sessionId/projectHash/startTime, message id/timestamp/type/model, `$set` updates, repeated message id updates | same bundle: `ChatRecordingService.initialize`, `appendRecord`, `pushMessage` at 286675–286884 |
+| native `tokens.input/output/cached/thoughts/tool/total` | same bundle: `recordMessageTokens` at 286941 |
+| native `toolCalls.id/name/status`; arguments, results and descriptions forbidden | same bundle: `recordCompletedToolCalls` at 335610, `recordToolCalls` at 286968 |
+| projectHash = SHA-256 of project root; actual temp directory is a registry short id in 0.62.0, migrating the former hash location | same bundle: `getProjectHash` at 252205; `Storage.getProjectTempDir`, `initialize`, `performMigration` at 253338–253405 |
+
+`checkpointing.md` describes restore snapshots containing history, not an
+additional usage source. `headless.md` describes stdout output modes, which
+this collector does not capture. `settings.md` describes session retention,
+not an alternative telemetry file format. No agent executable was run.
+
+**Local telemetry configuration and binding.** The future product launcher
+must configure `GEMINI_TELEMETRY_ENABLED=true`,
+`GEMINI_TELEMETRY_TARGET=local`,
+`GEMINI_CLI_HOME=<execution_home>`,
+`GEMINI_TELEMETRY_OUTFILE=<execution_home>/gemini-telemetry.json`, and
+`GEMINI_TELEMETRY_LOG_PROMPTS=false`. The docs allow an arbitrary outfile;
+the path above is Herdr's explicit convention, not a claimed Gemini default.
+The collector reads that one file only for retained kind `gemini`, agent
+version `0.62.0` attempts. It does not read settings or follow an arbitrary
+outfile path. Paths must be absolute, with no symlink components; the final
+file is opened with `O_NOFOLLOW` and must be regular. There is no network
+listener or process spawn on this path.
+
+Each event/point binds only when its timestamp is at or after the canonical
+decision, its execution home agrees with the latest binding, and exactly one
+attempt qualifies. Active and pre-0052 bindings qualify; revoked bindings
+qualify only for pre-revocation records. No binding, ambiguous home ownership
+or an early timestamp yields `unbound`. Native exporter resource attempt ids
+are ignored, and no file content can confer launch authority. The local path
+is a product-configured, per-attempt source; it does not guess a worktree from
+log text. Network OTLP's existing resource-id behavior remains unchanged.
+
+**Reader and privacy allowlist.** The SDK conversion accepts the reviewed API
+response/tool-call events and token SUM counters only. Traces, histograms,
+semantic duplicate events and other SDK objects are consumed without storing
+content. Seconds/nanoseconds are checked and converted to nanosecond strings;
+SDK temporality is explicitly translated, never assumed to be wire numbering.
+All durable attributes, numeric validation, model/tool excerpt sanitizing,
+unknown-key diagnostics and digest dedupe are DG4a's. Prompt, response, body,
+function arguments, tool output and SDK resource values are never retained or
+hashed. The converter synthesizes service and canonical attempt resource
+fields; these are binding metadata rather than reported SDK resources.
+
+Reads are byte-offset incremental, bounded by the caller's byte budget and a
+4 MiB SDK buffer per home per pass. Pretty-printed JSON objects require their
+final newline; an incomplete last object/line waits without advancing its
+cursor. Device/inode changes or truncation replay from zero. Records commit
+before the cursor; a crash between them replays safely through DG4a digests.
+Malformed or oversized objects stop that file at its last accepted offset,
+without persisting error text. SDK file appends are not assumed atomic across
+exporters; malformed interleaving is a coverage limitation. The existing
+collector's native-file budget is separate from this SDK-file budget.
+
+**Native chat source.** Reads only
+`<execution_home>/.gemini/tmp/<project-id>/chats/*.jsonl`, without consulting
+the registry or owner data. Current JSONL and migrated hash directory names
+both work; legacy whole-file `.json`, nested subagent chats and checkpoint
+snapshots are not collected. The macOS `SANDBOX=sandbox-exec` alternate
+`.cache/.gemini` runtime root is outside this Linux source convention.
+The common DG4b/Codex tail handles byte budgets,
+maximum lines, transactional offsets/envelopes, incomplete last lines,
+truncation/inode replay, write-failure gaps, retention and tombstones.
+Session ids are namespaced `gemini-cli:<sessionId>` and versions
+`gemini-cli/<retained-agent-version>`; originator is `gemini-cli`.
+
+Binding compares the metadata's full projectHash with SHA-256 of existing
+canonical attempt worktree directory paths, then applies DG4b's home,
+decision-time, kind and binding-revision rules. A missing/unrecognized hash
+retains an unbound source with an empty cwd; project directory names and
+content are never used to infer a match. Version comes from retained attempt
+inputs: SDK resource service.version is **Node's process.version**, not the
+Gemini package version. Mixed retained versions in one home stay uncertified.
+
+The `gemini-cli.gemini_line.v1` allowlist stores session/message ids, timestamp,
+line type, model, the six reported native counters, bounded tool id/name lists
+and reviewed status tags (`success`, `error`, `cancelled`, `pending`). These
+are **update observations**, not additive request deltas. The writer appends
+the same message id again when tokens or tools arrive. Repeated collection is
+idempotent by source/offset and sanitized payload digest; a metadata update
+without counters remains metadata. Prompts, model text, thought text, args,
+results, descriptions, display output, summary and memory scratchpad are
+never traversed, persisted or hashed. `$set` retains only its line-type count.
+Unsupported versions retain native metadata with certification `none`.
+
+Native counters and tool statuses are available in the ingest observations,
+not promoted to M08/M09/M16/M17 or the accounting ledger. Certification of a
+latest-message projection and native token overlap/total semantics is needed
+before that promotion; no cross-surface sum with OTel is allowed. This is an
+explicit capability limitation, not measured zero usage. The local OTel
+source provides the reviewed usage/tool observations even without network
+export. Existing Codex and Claude accounting projections remain unchanged.
+
+**Schema, retention and backup.** OTLP migration **0002** adds only
+`gemini_file_cursors` (path digest, device, inode, byte offset). It shares
+`sidecar.otlp`'s retained source-of-truth classification with `otlp_records`;
+full sidecar backups include both and inventory their rows. Native chat
+metadata uses existing normalized-session and ingest tables, follows
+`sidecar.normalized_sessions`' 90-day terminal-attempt retention and persistent
+session/source tombstones, and participates in existing backup/restore.
+No canonical schema or accounting schema change is required. Raw source files
+and credentials are never included in telemetry backups.
+
+**Synthetic E2E certification.** `tests/telemetry_gemini.rs` plants the
+not-yet-launchable Gemini attempt only inside a temporary admitted project,
+then drives public collect/capabilities/maintenance/backup CLI workflows and
+the public OTLP store reader. Fixtures under
+`tests/fixtures/telemetry/gemini-cli/` are synthetic 0.62.0 SDK envelopes and
+native chat records, not captured sessions. Coverage checks exact token/tool
+rows, cumulative temporality conversion, secret-free DB/WAL/SHM, partial
+objects/lines, final-newline waits, replay/truncation, unbound/early/revoked
+records, unsupported SDK versions, native message updates and hash binding,
+OTLP v1 upgrade, backups and native retention/tombstones. The existing
+certification rule continues to prohibit live fields on every non-Codex
+adapter, including `gemini-cli`. All existing telemetry suites remain required.
+
+Validation on 2026-09-30 used `TMPDIR=$PWD/target/tmp` and the requested
+`cargo test --locked --offline -j 3 --features state-store --no-fail-fast`
+command selecting every `tests/telemetry*.rs` suite: **197 passed, 11 existing
+scale tests ignored, six socket-only failures across 19 suites**. All seven
+Gemini E2Es and all seven Claude E2Es passed. Sandbox `Operation not permitted`
+prevented Unix socket binds in `attempts_show_attention_summary`,
+`attention_intervals_union_and_censor`,
+`recommendations_and_notices_change_no_canonical_state_and_no_dispatch`, and
+`thread_start_records_the_dispatch_reason_and_the_sidebar_suffix`; it also
+prevented TCP loopback binds in `http_auth_limits_malformed_and_replay` and
+`http_request_rate_is_bounded`. No socket workaround was attempted; the
+steward must run these outside the sandbox. The requested
+`cargo clippy --locked --offline -j 3 --features state-store --all-targets`
+completed successfully with no warnings on changed lines (existing warnings
+elsewhere remain).

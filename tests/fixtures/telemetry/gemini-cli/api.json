@@ -1,0 +1,31 @@
+{
+  "hrTime": [
+    @SEC@,
+    @NANO@
+  ],
+  "resource": {
+    "_rawAttributes": [
+      [
+        "service.name",
+        "gemini-cli"
+      ]
+    ]
+  },
+  "attributes": {
+    "event.name": "gemini_cli.api_response",
+    "model": "gemini-2.5-pro",
+    "input_token_count": 19,
+    "output_token_count": 5,
+    "cached_content_token_count": 4,
+    "thoughts_token_count": 2,
+    "tool_token_count": 1,
+    "total_token_count": 31,
+    "duration_ms": 90,
+    "prompt": "GEMINI_SECRET_PROMPT",
+    "response_text": "GEMINI_SECRET_RESPONSE"
+  },
+  "_body": "GEMINI_SECRET_BODY",
+  "instrumentationScope": {
+    "name": "gemini-cli"
+  }
+}

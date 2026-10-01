@@ -17,7 +17,8 @@ needs a new reviewed revision, not a silent reinterpretation.
   `migrations/telemetry/<stream>/`: `ingest`, `accounting`, `quality`,
   `review`, `analytics` (TM4.1 aggregate revisions), `health` (TM4.5 alert
   state), `otlp` (DG4a sanitized native records, migration 0001;
-  contracts-collection.md DG4a). A reader refuses only a
+  DG4c Gemini SDK file cursors, migration 0002;
+  contracts-collection.md DG4a/DG4c). A reader refuses only a
   stream newer than it knows. Plan:
   [phase2-lanes.md](phase2-lanes.md).
 - Lane contracts, each owned by its lane: collection
