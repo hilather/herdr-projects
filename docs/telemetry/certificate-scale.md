@@ -1053,6 +1053,141 @@ also passed in 12.26 s. Clippy (`--locked --offline
 changed from `origin/main`. Existing unrelated warnings remain. No unit or
 source-text tests were added; only the stream-version expectation advances.
 
+### 4.12 P2c: collector no-op scopes and validated ledger replay (100k only)
+
+**Pending the steward's serial 1M certification.** This follows the P4/DG4a
+rebase on `perf/incremental-analytics`. No busy timeout, scheduling policy,
+metric, coverage rule or existing expected value changes. No 1M run.
+
+The requested debug reproduction used `TMPDIR=$PWD/target/tmp`, one test
+thread, ten `scale_gates_hold_under_load` commands beside a second cargo
+process looping the complete `telemetry_operations` suite ten times. Both
+cargo commands used `--locked --offline -j 3 --features state-store`; the
+five gate racers plus the operations subprocess allow at most six CLI children;
+the appender sleeps between one-second bursts.
+Each loop finished within ten minutes. Before: **2/10 gates failed** (run 2:
+accounting/analytics BUSY; run 8: the reported racing collect BUSY). After:
+**10/10 gates and 10/10 operations suites passed**, without changing the gate.
+
+Temporary SQLite step tracing measures successful BEGIN IMMEDIATE through
+successful COMMIT/ROLLBACK, excluding acquisition waits and incomplete killed
+transactions. Before samples cover the latter eight gates and their concurrent
+operations (the first two CLI environments cleared the initial interposer);
+after samples cover all ten. Counts therefore differ. The no-op scopes removed
+by this fix also change the collector distribution's population. All values
+are milliseconds, nearest-rank p50 / maximum:
+
+| Writer under the reproduction load | Before (n) | After (n) |
+| --- | --- | --- |
+| Collect batches/bindings | 16.283 / 700.830 (4,649) | 27.687 / 765.933 (4,102) |
+| Accounting sync, including aggregate maintenance and source-trigger effects | 99.813 / 1,536.294 (228) | 73.847 / 1,023.329 (348) |
+| Analytics short writer scopes | 13.337 / 217.370 (4,137) | 9.306 / 1,549.387 (5,551) |
+| Health evaluation | 8.857 / 26.275 (24) | 7.275 / 35.126 (30) |
+
+Reproduction results files recorded loadavg (1/5/15 minutes): before
+`6.42 6.11 7.74` → `6.06 7.72 8.15`; after
+`5.32 4.76 6.20` → `3.68 4.91 5.95`. The traced failing collect run did not
+show a completed individual IMMEDIATE hold over five seconds. Repeated writer
+acquisitions can exhaust a waiter's timeout without one such hold; the trace
+supports that explanation, not a universal upper bound. Collector/analytics/
+health maxima are not improved in these noisy samples. DEFERRED termination
+receipt writes are outside this IMMEDIATE-scope table.
+
+Stage timers in the baseline gate measured ledger derivation, entry writes,
+session graph, quota replay and usage summaries separately; on an isolated
+follow-up gate their maxima were 20.90/154.25/15.17/125.89/7.39 ms. In the loaded
+baseline, dispatch/tools/fleet/cost/canonical/termination aggregate stages had
+maxima 112.11/68.86/48.25/0.23/49.44/49.40 ms. These observations did not justify
+splitting the ledger/aggregate commit or weakening its atomicity.
+
+Completed, unchanged rollout prefixes now check device, inode, end offset,
+ingest cursor and completed/no-open-turn evidence in one read statement.
+Explicit replays, replacements, missing ingest cursors and unfinished turns
+still use the original writer path, preserving gap recovery and idle detection.
+Binding batches compare the same rules outside the lock and re-read changing
+batches under IMMEDIATE. Ledger replay/normalization uses a DEFERRED snapshot;
+IMMEDIATE validates the accounting frontier (including invalidation, quota
+rebuild and tombstones) and all analytics input generations before writing.
+A changed source or racing sync discards the plan and recomputes it. Ledger,
+graph, quota, summaries, watermark and dirty-queue removal still commit together.
+An aggregate cannot become visible separately from its ledger rows. No trigger
+coverage is removed, and no BUSY retry/timeout increase masks a writer failure.
+
+The final release comparison restored the same generated 100k/64 seed, original
+manifest, rollouts, SQLite stores and complete producer facts at the same
+absolute paths before **both** runs. A collect/sync/refresh settled source/file
+identities and cached canonical identities outside measurement. Both builds used
+§1's exact release/no-run command. Run `scale_8_accounting_pass`,
+`scale_9_analytics_refresh`, `scale_9_health_evaluate` serially with §1's
+environment, `SCALE_EVENTS=100000 SCALE_ACTIVE=64 SCALE_REPEATS=3` and
+`SCALE_TAG=p2c-before|p2c-after`. Their `SCALE_*_BIN` overrides select a temporary
+tracing wrapper around the preserved before CLI or final CLI. No build or other
+bench overlapped these final measurements; every dataset and seed was on disk
+under `$PWD/bench-data/`. Earlier exploratory before samples are excluded.
+
+| 100k/64 IMMEDIATE scope, p50 / max ms | Before | After |
+| --- | --- | --- |
+| Collect batches/bindings, three identical appended-data passes | 0.045 / 18.164 (2,976 scopes) | 5.568 / 37.742 (192 scopes) |
+| Accounting sync, warm-up plus three changed-input passes (n=4) | 227.223 / 257.491 | 222.456 / 284.230 |
+| Analytics refresh (95 scopes each) | 7.379 / 111.343 | 8.503 / 138.157 |
+| Health evaluate (n=3) | 10.063 / 10.080 | 7.376 / 58.399 |
+
+The collector removes **93.5% of these acquisitions**; its after distribution
+contains actual/open-turn work rather than completed no-op scopes. This is an
+acquisition reduction, not a per-scope latency claim. Sync's local contended
+maximum drops (§4.12 above), but the serial 100k maximum and other writers'
+maxima are not improved. No universal lock-duration bound is claimed.
+
+| Phase wall p50 / p95 ms, n=3 | Before | After |
+| --- | --- | --- |
+| Accounting sync | 271.87 / 277.71 | 304.03 / 315.73 |
+| Analytics refresh | 947.76 / 1,638.36 | 1,004.35 / 1,887.83 |
+| Health evaluate | 2,468.60 / 2,537.04 | 3,385.33 / 4,505.57 |
+
+Loadavg start → end (1/5/15 minutes), from the corresponding results JSON:
+
+| Phase | Before | After |
+| --- | --- | --- |
+| Accounting pass | `1.59 3.55 4.87` → `1.70 3.54 4.86` | `7.04 5.65 5.31` → `6.87 5.64 5.31` |
+| Analytics refresh | `1.70 3.54 4.86` → `1.65 3.50 4.84` | `6.87 5.64 5.31` → `6.64 5.61 5.30` |
+| Health evaluate | `1.65 3.50 4.84` → `1.63 3.43 4.80` | `6.64 5.61 5.30` → `6.33 5.60 5.30` |
+
+The much busier after host prevents a wall-time improvement/regression claim.
+Accounting peak RSS is 29,756 → 30,524 KiB; no memory improvement is claimed.
+All six measured phases report zero violations and an unchanged canonical
+digest. These 100k observations do not certify 1M or close L1/L2/L4.
+
+
+The existing completed-turn CLI workflow now repeats no-op collection and
+checks persisted ledger bytes, usage and recovered coverage, then replaces the
+producer file with identical bytes and checks forced replay and identical
+accounting entries. Existing late/corrected-record, kill/resume and full-rebuild
+workflows exercise the validated replay path. No unit/source-text tests.
+
+The required fifteen uninstrumented telemetry suites ran with the preamble's
+exact locked/offline command, `TMPDIR=$PWD/target/tmp` and one test thread:
+**176 passed, 12 ignored, five failed**. Four failures are exclusively the
+sandbox Unix-socket bind denial (`Operation not permitted`):
+
+- `telemetry::attempts_show_attention_summary`
+- `telemetry_accounting::attention_intervals_union_and_censor`
+- `telemetry_health::recommendations_and_notices_change_no_canonical_state_and_no_dispatch`
+- `telemetry_workspace::thread_start_records_the_dispatch_reason_and_the_sidebar_suffix`
+
+The fifth, `telemetry_certification::accounting_fields_match_the_adapter_certificate`,
+is an inherited DG4a expectation mismatch: its unchanged assertion expects
+only `codex`, while the preserved before CLI already returns `codex`,
+`otlp:claude-code`, `otlp:gemini-cli`, `otlp:codex`. It is not classified as a
+socket failure or hidden by editing its expectation. The uninstrumented scale
+suite passes all three workflows; the final release gate also passes unchanged
+in 21.44 s. They retain the exact totals, single acceptance,
+pinned as-of, byte-identical rebuild and canonical digest oracles. Clippy with
+`--locked --offline -j 3 --features state-store` and the scale/accounting/collect/
+operations targets reports no warning in changed lines; unrelated warnings
+remain. No new crate or source process spawn. Temporary instrumentation and all
+`bench-data/` datasets are removed before committing.
+
+
 ## 5. Inefficiencies found and fixed
 
 The first measurement (same generator, same host) missed the query and
@@ -1156,6 +1291,12 @@ owner. None is hidden by loosening the target.
   analytics watermark/revision transactions remain atomic. Remaining
   remedies: incremental lane work (L4), cheaper operator surfaces (L5, P3),
   or a separate sidecar device.
+  **P2c follow-up: the P4/P2 concurrent-collect regression is resolved in
+  the local ten-run workload (2/10 failures → 0/10). At 100k/64, three
+  changed-input collects take 2,976 → 192 IMMEDIATE scopes; sync lock
+  p50/max 227.22/257.49 → 222.46/284.23 ms (§4.12), at accounting-phase
+  loads 1.59 → 1.70 before / 7.04 → 6.87 after. Pending the steward's 1M
+  certification; no controller-latency target is closed.**
   Owners: accounting and analytics lanes, TM4.8, ticker steward.
 - **L2: freshness.** By default the ticker collects once per 300 s per
   project, so a derived view is up to five minutes old by design. Even with

@@ -265,6 +265,31 @@ fn idle_rollout_without_final_event_records_a_coverage_gap() {
     age(&path, 660);
     f.cli("collect");
     assert_eq!(gaps(&f), [gap(end + 40, "recovered")], "a completed turn is never missing");
+
+    // Completed prefixes can be observed without a writer scope. Repeated
+    // public collection preserves every persisted record and the recovered gap.
+    let persisted = ledger(&f);
+    f.cli_args(&["accounting", "sync"]);
+    let entries = f.cli_args(&["accounting", "entries"]).1;
+    for _ in 0..3 {
+        let (report, _) = f.cli("collect");
+        assert_eq!(report["collected"]["files"], 0);
+        assert_eq!(report["collected"]["bytes"], 0);
+        assert_eq!(report["attempts"][0]["usage"], usage);
+        assert_eq!(ledger(&f), persisted);
+    }
+    // A producer replacing the file with identical bytes must still replay
+    // from zero: the fast path requires the original device and inode.
+    let replacement = path.with_extension("replacement");
+    fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
+    fs::rename(&replacement, &path).unwrap();
+    let (report, _) = f.cli("collect");
+    assert_eq!(report["collected"]["files"], 1);
+    assert_eq!(report["attempts"][0]["usage"], usage);
+    assert_eq!(gaps(&f), [gap(end + 40, "recovered")]);
+    assert_eq!(final_event(&f), serde_json::json!({"state": "complete", "turn_id": "turn-2"}));
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "entries"]).1, entries);
 }
 
 /// F4 (certificate-live.md §5): the product cancelled the bound attempt while

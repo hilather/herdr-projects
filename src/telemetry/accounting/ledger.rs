@@ -119,19 +119,12 @@ fn derive_scoped(db: &Connection, scoped: bool) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
-/// Replay changed sessions and affected quota accounts in their original order.
-/// Source triggers advance a durable frontier; projection and frontier commit
-/// together. Invalidated bases replay the complete history. Counts describe the
-/// whole projection, as before incremental sync.
-pub fn sync(db: &mut Connection) -> Result<Value> {
-    let project = db.path().map(std::path::Path::new).and_then(std::path::Path::parent)
-        .and_then(std::path::Path::parent).filter(|project| project.join(".state/state.db").is_file()).map(std::path::Path::to_path_buf);
-
-    // Immediate: racing syncs (ticker and CLI) serialize on the write lock.
-    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let (sequence, watermark, invalidated): (i64, i64, Option<String>) = tx.query_row(
-        "SELECT sequence,watermark,invalidated FROM accounting_stream WHERE singleton=1", [],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+/// A pinned source/projection snapshot. TEMP selection rows survive its commit,
+/// but no sidecar write lock is held while replaying and normalizing records.
+fn prepare_sync(db: &Connection) -> Result<SyncPlan> {
+    let tx = db.unchecked_transaction()?;
+    let frontier = sync_frontier(&tx)?;
+    let (sequence, watermark, invalidated, ..) = frontier.clone();
     let dirty: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM accounting_dirty_sessions)", [], |r| r.get(0))?;
     let reason = invalidated.or_else(|| (watermark < 0 || watermark > sequence || (watermark != sequence && !dirty)).then(|| "watermark_inconsistent".to_owned()));
     let reason = reason.or(if synced(&tx)? { None } else { Some("ledger_missing".to_owned()) });
@@ -145,6 +138,48 @@ pub fn sync(db: &mut Connection) -> Result<Value> {
         tx.execute_batch("INSERT OR IGNORE INTO accounting_selected SELECT session_id FROM session_graph_nodes WHERE claimed_parent_session_id IN (SELECT session_id FROM accounting_dirty_sessions);")?;
     }
     let entries = derive_scoped(&tx, true)?;
+    let generations = crate::telemetry::analytics::inputs::generations(&tx)?;
+    tx.commit()?;
+    Ok(SyncPlan { entries, sequence, reason, full, frontier, generations })
+}
+
+type SyncFrontier = (i64, i64, Option<String>, i64, i64);
+fn sync_frontier(db: &Connection) -> Result<SyncFrontier> {
+    Ok(db.query_row("SELECT sequence,watermark,invalidated,quota_rebuild,tombstones FROM accounting_stream WHERE singleton=1",
+        [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?)
+}
+
+struct SyncPlan {
+    entries: Vec<Entry>,
+    sequence: i64,
+    reason: Option<String>,
+    full: bool,
+    frontier: SyncFrontier,
+    generations: Option<BTreeMap<String, i64>>,
+}
+
+/// Replay changed sessions and affected quota accounts in their original order.
+/// Source triggers advance a durable frontier; projection and frontier commit
+/// together. Invalidated bases replay the complete history. Counts describe the
+/// whole projection, as before incremental sync.
+pub fn sync(db: &mut Connection) -> Result<Value> {
+    let project = db.path().map(std::path::Path::new).and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent).filter(|project| project.join(".state/state.db").is_file()).map(std::path::Path::to_path_buf);
+
+    // Replay before taking the writer lock. Under IMMEDIATE, validate both
+    // source frontier and projection generations: a collector, correction or
+    // racing sync invalidates the plan, and the next read snapshot recomputes it.
+    // All ledger, graph, quota, aggregate and watermark writes remain atomic.
+    let (tx, plan) = loop {
+        let plan = prepare_sync(db)?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if sync_frontier(&tx)? == plan.frontier
+            && crate::telemetry::analytics::inputs::generations(&tx)? == plan.generations {
+            break (tx, plan);
+        }
+        tx.rollback()?;
+    };
+    let SyncPlan { entries, sequence, reason, full, .. } = plan;
     if full { tx.execute_batch("DELETE FROM usage_dispositions; DELETE FROM usage_entries;")?; }
     else { tx.execute_batch("DELETE FROM usage_dispositions WHERE entry_id IN (SELECT entry_id FROM usage_entries WHERE session_id IN (SELECT session_id FROM accounting_selected));
         DELETE FROM usage_entries WHERE session_id IN (SELECT session_id FROM accounting_selected);")?; }

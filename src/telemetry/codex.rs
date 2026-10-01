@@ -797,11 +797,25 @@ fn tail_batch(db: &mut Connection, file: &Path, home: &str, worktrees: &str, all
     let key = digest(file.as_os_str().as_encoded_bytes());
     let Ok(mut handle) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(file) else { return Ok((0, false)) };
     let meta = handle.metadata()?;
+    // Completed, unchanged prefixes have no write work. Observe all cursor
+    // evidence in one read statement; replacement, explicit replay, old ingest
+    // cursors and open turns still take the original atomic writer path.
+    // The file metadata is the same observation used by that path: an append
+    // after this observation is collected on the next pass in either case.
+    if !reread.contains(&key) && meta.len() > 0 {
+        let unchanged: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM collect_offsets c
+            JOIN source_cursors i ON i.source=c.path_digest
+            JOIN rollout_ingest_state x ON x.path_digest=c.path_digest
+            WHERE c.path_digest=?1 AND c.device=?2 AND c.inode=?3 AND c.byte_offset=?4
+            AND (x.last_turn_offset IS NULL OR x.last_turn_completed=1))",
+            params![key, meta.dev() as i64, meta.ino() as i64, meta.len() as i64], |r| r.get(0))?;
+        if unchanged { *span = (meta.len(), meta.len()); return Ok((0, false)); }
+    }
     // Immediate: a concurrent collector (the ticker's and the CLI's) waits for
     // the write lock (busy timeout) instead of failing on a stale read snapshot.
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let stored = tx.query_row("SELECT device,inode,byte_offset,records,rate_limits,model,effort FROM collect_offsets WHERE path_digest=?1", [&key],
-        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))).optional()?;
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))).optional()?;
     let reread_zero = stored.as_ref().is_some_and(|cursor| cursor.2 == 0)
         && tx.query_row("SELECT EXISTS(SELECT 1 FROM rollout_sources WHERE path_digest=?1)", [&key], |r| r.get::<_, bool>(0))?;
     // A byte-zero replay must cover predates-ingest gaps atomically: those
@@ -1377,45 +1391,64 @@ fn terminated_turns(db: &Connection, attempts: &[CanonicalAttempt]) -> Result<()
 fn bind(db: &mut Connection, attempts: &[CanonicalAttempt]) -> Result<()> {
     let mut by_id = std::collections::BTreeMap::<&str, Vec<&CanonicalAttempt>>::new();
     for a in attempts.iter().filter(|a| a.supported()) { by_id.entry(a.id.as_str()).or_default().push(a); }
-    let mut after = String::new();
-    loop {
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        type Row = (String, String, Option<i64>, Option<String>, String, Option<String>, Option<String>, Option<String>);
-        let sources: Vec<Row> = tx.prepare("SELECT s.path_digest,s.home_digest,s.session_unix_ms,s.cwd_attempt,s.binding,s.attempt_id,b.basis,s.originator
-            FROM rollout_sources s LEFT JOIN source_bindings b ON b.path_digest=s.path_digest
-            WHERE s.path_digest>?1 ORDER BY s.path_digest LIMIT 1000")?
-            .query_map([&after], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?.collect::<rusqlite::Result<_>>()?;
-        if sources.is_empty() { break; }
-        after = sources.last().expect("nonempty batch").0.clone();
-        for (key, home, at, cwd_attempt, stored, stored_attempt, stored_basis, originator) in sources {
-            let rule1 = |h: &Option<String>| h.as_ref().is_some_and(|h| digest(h.as_bytes()) == home);
-            let (mut matches, mut refused) = (Vec::new(), None);
-            for a in cwd_attempt.as_deref().and_then(|id| by_id.get(id)).into_iter().flatten().copied() {
-                let source_kind = match originator.as_deref() { Some("claude-code") => "claude", Some("gemini-cli") => "gemini", Some("opencode") => "opencode", _ => "codex" };
-                if a.kind.as_deref() != Some(source_kind) { continue; }
-                let Some(at) = at.filter(|at| a.decided_unix_ms.is_some_and(|decided| *at >= decided)) else { continue };
-                match &a.binding {
-                    Binding::Predates if rule1(&a.home) => matches.push((a, "predates_binding")),
-                    Binding::Active(h) if rule1(h) => matches.push((a, "collector_binding")),
-                    Binding::Revoked(h, revoked) if rule1(h) && at < *revoked => matches.push((a, "collector_binding")),
-                    Binding::Revoked(h, _) if rule1(h) => refused = refused.or(Some("binding_revoked")),
-                    Binding::None => refused = refused.or(Some("no_binding")),
-                    _ => {}
-                }
-            }
-            let (binding, attempt, basis) = match matches.as_slice() {
-                [] => ("unbound", None, refused.unwrap_or("no_match")),
-                [(one, basis)] => ("bound", Some(one.id.as_str()), *basis),
-                _ => ("ambiguous", None, "ambiguous"),
-            };
-            if stored != binding || stored_attempt.as_deref() != attempt {
-                tx.execute("UPDATE rollout_sources SET binding=?2,attempt_id=?3 WHERE path_digest=?1", params![key, binding, attempt])?;
-            }
-            if stored_basis.as_deref() != Some(basis) {
-                tx.execute("INSERT INTO source_bindings(path_digest,basis) VALUES(?1,?2) ON CONFLICT(path_digest) DO UPDATE SET basis=excluded.basis", params![key, basis])?;
+    type Row = (String, String, Option<i64>, Option<String>, String, Option<String>, Option<String>, Option<String>);
+    let decision = |row: &Row| {
+        let (_, home, at, cwd_attempt, _, _, _, originator) = row;
+        let rule1 = |h: &Option<String>| h.as_ref().is_some_and(|h| digest(h.as_bytes()) == *home);
+        let (mut matches, mut refused) = (Vec::new(), None);
+        for a in cwd_attempt.as_deref().and_then(|id| by_id.get(id)).into_iter().flatten().copied() {
+            let source_kind = match originator.as_deref() { Some("claude-code") => "claude", Some("gemini-cli") => "gemini", Some("opencode") => "opencode", _ => "codex" };
+            if a.kind.as_deref().unwrap_or("codex") != source_kind { continue; }
+            let Some(at) = at.filter(|at| a.decided_unix_ms.is_some_and(|decided| *at >= decided)) else { continue };
+            match &a.binding {
+                Binding::Predates if rule1(&a.home) => matches.push((a, "predates_binding")),
+                Binding::Active(h) if rule1(h) => matches.push((a, "collector_binding")),
+                Binding::Revoked(h, revoked) if rule1(h) && at < *revoked => matches.push((a, "collector_binding")),
+                Binding::Revoked(h, _) if rule1(h) => refused = refused.or(Some("binding_revoked")),
+                Binding::None => refused = refused.or(Some("no_binding")),
+                _ => {}
+
             }
         }
-        tx.commit()?;
+        match matches.as_slice() {
+            [] => ("unbound", None, refused.unwrap_or("no_match")),
+            [(one, basis)] => ("bound", Some(one.id.as_str()), *basis),
+            _ => ("ambiguous", None, "ambiguous"),
+        }
+    };
+    let sources = |db: &Connection, after: &str| -> Result<Vec<Row>> {
+        Ok(db.prepare("SELECT s.path_digest,s.home_digest,s.session_unix_ms,s.cwd_attempt,s.binding,s.attempt_id,b.basis,s.originator
+            FROM rollout_sources s LEFT JOIN source_bindings b ON b.path_digest=s.path_digest
+            WHERE s.path_digest>?1 ORDER BY s.path_digest LIMIT 1000")?
+            .query_map([after], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?.collect::<rusqlite::Result<_>>()?)
+    };
+    let mut after = String::new();
+    loop {
+        let observed = sources(db, &after)?;
+        let Some(last) = observed.last() else { break; };
+        let mut next = last.0.clone();
+        // Most batches are unchanged. Avoid a writer scope for their comparison;
+        // a changing batch is re-read and decided under the original write lock.
+        let changed = observed.iter().any(|row| {
+            let (binding, attempt, basis) = decision(row);
+            row.4 != binding || row.5.as_deref() != attempt || row.6.as_deref() != Some(basis)
+        });
+        if changed {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current = sources(&tx, &after)?;
+            if let Some(last) = current.last() { next = last.0.clone(); }
+            for row in current {
+                let (binding, attempt, basis) = decision(&row);
+                if row.4 != binding || row.5.as_deref() != attempt {
+                    tx.execute("UPDATE rollout_sources SET binding=?2,attempt_id=?3 WHERE path_digest=?1", params![row.0, binding, attempt])?;
+                }
+                if row.6.as_deref() != Some(basis) {
+                    tx.execute("INSERT INTO source_bindings(path_digest,basis) VALUES(?1,?2) ON CONFLICT(path_digest) DO UPDATE SET basis=excluded.basis", params![row.0, basis])?;
+                }
+            }
+            tx.commit()?;
+        }
+        after = next;
     }
     Ok(())
 }
