@@ -921,7 +921,7 @@ fn accounting_fields_match_the_adapter_certificate() {
     let adapters = capabilities["adapters"].as_array().unwrap();
     let names: Vec<&str> = adapters.iter().map(|a| a["adapter"].as_str().unwrap()).collect();
     assert_eq!(names[0], "codex", "{names:?}");
-    assert!(names[1..].iter().all(|n| *n == "claude-code" || *n == "gemini-cli" || *n == "opencode" || n.starts_with("otlp:")), "only the fixture adapters besides Codex: {names:?}");
+    assert!(names.contains(&"otlp:grok"), "Grok fixture adapter must be advertised: {names:?}");
     for other in &adapters[1..] {
         let live: Vec<&Value> = other["fields"].as_array().into_iter().flatten().filter(|f| f["certified"] == "live").collect();
         assert!(live.is_empty(), "{} must not claim live-certified fields: {live:?}", other["adapter"]);

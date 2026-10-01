@@ -11,3 +11,10 @@ exercise delta token counters and a cumulative cost snapshot; Gemini
 metrics exercise cumulative token snapshots. They are independent evidence
 from the request logs, never a combined accounting total. Codex has no
 certified OTLP fixture; its rollout certificate is unchanged.
+
+DG4e Grok fixture certificate (2026-10-01): `grok-metrics.json` is synthetic,
+shaped from read-only strings in the installed `@xai-official/grok` 1.0.46
+native binary. Resource service is `grok-cli`, version `1.0.46`; forbidden
+canary is `GROK_SECRET_CONTENT`. See contracts-collection.md DG4e for the
+executable/documentation conflict on cost and cache creation, external JSON
+conversion and exact binding requirements, and uncertified native files.

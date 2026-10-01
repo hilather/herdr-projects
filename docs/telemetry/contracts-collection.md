@@ -1287,8 +1287,8 @@ The receiver spawns no processes; the controller never waits for requests.
 
 The single reviewed mapping declaration in `telemetry::otlp` also generates
 `collectors capabilities`. Adapter IDs are `otlp:claude-code`,
-`otlp:gemini-cli`, `otlp:codex` and `otlp:unknown`. Every available field is
-**fixture**, never live. No version or live compatibility is certified. Names
+`otlp:gemini-cli`, `otlp:grok`, `otlp:codex` and `otlp:unknown`. Every available field is
+**fixture**, never live. Grok is fixture-certified only for 1.0.46 (DG4e); no live compatibility is certified. Names
 come from [Claude Code monitoring](https://code.claude.com/docs/en/monitoring-usage)
 and [Gemini CLI telemetry](https://geminicli.com/docs/cli/telemetry/);
 fixtures under `tests/fixtures/telemetry/otlp` are synthetic OTLP JSON, not
@@ -1771,3 +1771,124 @@ The requested `cargo clippy --locked --offline -j 3 --features state-store
 there are no diagnostics in changed lines. Live certification, custom XDG/
 channel database paths and an OpenCode DG4a log/metric mapping remain outside
 this fixture-certified adapter's supported surface.
+
+## DG4e: Grok Build CLI OTLP counters (fixture certification)
+
+Identified harness: xAI official **Grok Build CLI**, npm
+`@xai-official/grok` **1.0.46 alpha**. Adapter `otlp:grok` is fixture-only
+for that version; no agent CLI or live session was used. Only read-only
+`strings -n 8` extraction from the installed binary
+`/home/brewerm/.local/share/mise/installs/node/26.7.0/lib/node_modules/@xai-official/grok/bin/grok-native`
+was consulted. No owner data directory was listed or opened.
+
+### Installed evidence and exporter configuration
+
+Line references below are line numbers of that binary's `strings -n 8`
+output, not source files or captured session data. Relevant literal fragments:
+
+| Evidence | Fragment |
+| --- | --- |
+| 44687–44691, resource table | `service.name` = `grok-cli`; `service.version`, `client.version`; `grok_code.schema.version` = `v1` |
+| 44703–44710, metric table | `grok_code.session.count` `{session}`; `grok_code.token.usage` `{token}`; `type` = `input` / `output` / `reasoning` / `cache_read`; `model`; `grok_code.turn.count` `{turn}` `outcome`; `grok_code.tool.usage` `{call}` `tool_name`, `outcome`; `grok_code.error.count` `{error}` `error_category`, `model` |
+| 56682–56683, executable string pool | `inputoutputreasoningcache_readcache_creation`; `grok_code.token.usage{token}grok_code.cost.usageUSDgrok_code.turn.count{turn}` |
+| 44738, embedded documentation conflict | `There is no` `cost.usage` `metric` — executable pool includes it; cost and cache creation are fixture acceptance only, not proof of emission |
+| 44548–44565, exporter switches | `GROK_EXTERNAL_OTEL=1`; `OTEL_METRICS_EXPORTER=otlp`; `OTEL_LOGS_EXPORTER=otlp`; `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` (or `grpc`) |
+| 44568–44585, transport | `OTEL_EXPORTER_OTLP_ENDPOINT`; signal-specific logs/metrics endpoint and protocol overrides; `OTEL_EXPORTER_OTLP_HEADERS` and signal variants; certificate/client certificate/client key paths; timeout; metric/log intervals; temporality preference `delta` / `cumulative` |
+| 44605–44606, binding limitation | `OTEL_RESOURCE_ATTRIBUTES` `is deliberately ignored: the resource is built` `from a fixed, audited attribute set.` |
+| 44588–44592, content gates | `OTEL_LOG_USER_PROMPTS`, `OTEL_LOG_ASSISTANT_RESPONSES`, `OTEL_LOG_TOOL_DETAILS`, `OTEL_LOG_TOOL_CONTENT` |
+| 44620 onward, config peers | `[telemetry]`, `otel_enabled`, `otel_metrics_exporter`, `otel_logs_exporter`, `otel_endpoint`, `otel_protocol`; env vars win |
+| 42934–42950, local paths | `GROK_HOME`; `~/.grok/sessions/<encoded-cwd>/<session-id>/`; `summary.json`, `updates.jsonl`, `chat_history.jsonl`, `signals.json` (`session signals (token usage, tool/turn counters)`) |
+
+Startup timing and tool-decision instruments also exist, including
+`grok_code.turn.ttft`, `grok_code.turn.ttfm`, `grok_code.tool.decision`,
+`grok_code.startup.total`, `grok_code.startup.interactive` and timeout/phase
+instruments. They remain unmapped; no histogram or timing semantics are
+certified here. Identity keys (`user.id`, `user.email`, organization/team/
+deployment ids, `session.id`) are discarded, never used for binding.
+
+The exporter supports protobuf HTTP or gRPC, while DG4a accepts JSON only.
+An external converter must supply OTLP JSON and the resource
+`herdr.attempt_id`; the stock CLI ignores `OTEL_RESOURCE_ATTRIBUTES`, so
+launch-env wiring alone cannot supply it. This card adds neither a converter
+nor launch configuration and makes no direct-export compatibility claim.
+
+### Mapping, privacy and binding
+
+The reviewed mapping declaration generates version-aware capabilities:
+`fixture_versions` and `accepted_versions` are `["1.0.46"]`, and
+`certified_versions` is empty. Resource `service.name` must be `grok-cli`
+and `service.version` must be exactly `1.0.46`. Missing/other versions retain
+only unmapped diagnostics with `cli_version_uncertified`; arbitrary version
+values are dropped. The durable stream's `certified=fixture` denotes its
+synthetic sanitizer certificate; these diagnostics explicitly carry
+`mapping_certified=none` and no usage value.
+
+| Metric | Stored kind | Allowlisted attributes / unit |
+| --- | --- | --- |
+| `grok_code.token.usage` | usage | `type`: input/output/reasoning/cache_read/cache_creation; `model`; `{token}` |
+| `grok_code.cost.usage` | usage | `model`; numeric value in USD |
+| `grok_code.session.count` | usage | no attributes; `{session}` |
+| `grok_code.turn.count` | usage | `model`, `outcome`: completed/cancelled/error; `{turn}` |
+| `grok_code.tool.usage` | tool | `tool_name`, reported excerpt `outcome`; `{call}` |
+| `grok_code.error.count` | tool | `error_category`, `model`; `{error}` |
+
+Counters retain nonnegative value, start/end timestamps, explicit delta or
+cumulative temporality, and reviewed units. They are independent reported
+observations, not additions to accounting totals or estimated cost. Unknown
+token categories stay unmapped; unknown attribute/resource keys are retained
+only as keys. Model/tool/error/outcome identifiers use bounded sanitized excerpts.
+Prompts, responses, arguments, outputs, commands, file contents and identity
+values are never stored or hashed. Exact resource `herdr.attempt_id` is the
+only binding authority: no session-id, cwd, home, time or model inference.
+Missing binding stays unbound; unknown attempt values are dropped.
+
+### Native source, retention and backup
+
+Native source is **none**, reason `local_usage_schema_not_established`.
+The embedded guide identifies stable session paths and a `signals.json`
+usage-bearing candidate, but does not establish its token field schema,
+version envelope, timestamp/identity or replay semantics. The documented
+headless stdout usage examples are not a local-file schema. Implementing
+native collection from those fragments would guess persisted fields. No
+execution-home traversal or operator-home fallback is added.
+
+No schema change or new table is needed. Sanitized rows share existing
+`otlp_records` and stream migration version 0002. DG4a digest dedupe, atomic
+writes and resource binding remain unchanged. Retention class
+`sidecar.otlp` remains source-of-truth **retain**; full sidecar backups include
+these rows and stream version, with exporter tokens external to backups.
+
+### Synthetic fixtures and end-to-end coverage
+
+`tests/fixtures/telemetry/otlp/grok-metrics.json` is synthetic OTLP JSON with
+literal extracted names, units and attributes, independent token buckets,
+a numeric cost, session/turn/tool/error counts, and planted forbidden values.
+`tests/telemetry_otlp.rs` uses public ingest/store and CLI entry points in an
+isolated admitted project. It asserts hand-computed values, exact binding,
+replay dedupe, unbound records, rejected version mapping, key-only diagnostics,
+fixture-only capabilities and zero secret hits in rows and SQLite/WAL/SHM.
+The existing Claude/Gemini assertions, transport tests and retention/backup
+workflow run alongside it. Certification requires every non-Codex adapter to
+have no live fields and explicitly requires `otlp:grok` to be advertised.
+
+### DG4e sandbox validation
+
+All 20 `tests/telemetry*.rs` suites ran with `TMPDIR=$PWD/target/tmp` and
+`cargo test --locked --offline -j 3 --features state-store --no-fail-fast`
+with explicit `--test` targets. The Grok E2E, Grok-inclusive backup/restore,
+certification and Claude/Gemini/OpenCode suites passed. The concurrency scale
+test initially encountered `database is locked`; its focused rerun passed.
+The 12 existing opt-in scale benchmarks stayed ignored. The final all-target
+clippy command (`cargo clippy --locked --offline -j 3 --features state-store
+--all-targets`) completed with existing unrelated warnings and no warnings
+in changed files. `git diff --check` passed.
+
+The following tests failed solely because the sandbox denied socket binds
+with `Operation not permitted`; the steward must run them outside it:
+
+- `telemetry::attempts_show_attention_summary` (Unix socket)
+- `telemetry_accounting::attention_intervals_union_and_censor` (Unix socket)
+- `telemetry_health::recommendations_and_notices_change_no_canonical_state_and_no_dispatch` (Unix socket)
+- `telemetry_workspace::thread_start_records_the_dispatch_reason_and_the_sidebar_suffix` (Unix socket)
+- `telemetry_otlp::http_auth_limits_malformed_and_replay` (TCP loopback)
+- `telemetry_otlp::http_request_rate_is_bounded` (TCP loopback)

@@ -1,0 +1,912 @@
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "grok-cli"
+            }
+          },
+          {
+            "key": "service.version",
+            "value": {
+              "stringValue": "1.0.46"
+            }
+          },
+          {
+            "key": "herdr.attempt_id",
+            "value": {
+              "stringValue": "@ATTEMPT@"
+            }
+          },
+          {
+            "key": "user.id",
+            "value": {
+              "stringValue": "GROK_SECRET_CONTENT"
+            }
+          }
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "metrics": [
+            {
+              "name": "grok_code.token.usage",
+              "unit": "{token}",
+              "sum": {
+                "aggregationTemporality": 1,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1700000000000000000",
+                    "startTimeUnixNano": "1700000000000000000",
+                    "asInt": "31",
+                    "attributes": [
+                      {
+                        "key": "type",
+                        "value": {
+                          "stringValue": "input"
+                        }
+                      },
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "grok-4.6"
+                        }
+                      },
+                      {
+                        "key": "prompt",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "response",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_input",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_output",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "full_command",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "error_message",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_parameters",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "file_contents",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "user.email",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "session.id",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "grok_code.token.usage",
+              "unit": "{token}",
+              "sum": {
+                "aggregationTemporality": 1,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1700000000000000001",
+                    "startTimeUnixNano": "1700000000000000000",
+                    "asInt": "11",
+                    "attributes": [
+                      {
+                        "key": "type",
+                        "value": {
+                          "stringValue": "output"
+                        }
+                      },
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "grok-4.6"
+                        }
+                      },
+                      {
+                        "key": "prompt",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "response",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_input",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_output",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "full_command",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "error_message",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_parameters",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "file_contents",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "user.email",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "session.id",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "grok_code.token.usage",
+              "unit": "{token}",
+              "sum": {
+                "aggregationTemporality": 1,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1700000000000000002",
+                    "startTimeUnixNano": "1700000000000000000",
+                    "asInt": "7",
+                    "attributes": [
+                      {
+                        "key": "type",
+                        "value": {
+                          "stringValue": "cache_read"
+                        }
+                      },
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "grok-4.6"
+                        }
+                      },
+                      {
+                        "key": "prompt",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "response",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_input",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_output",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "full_command",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "error_message",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_parameters",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "file_contents",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "user.email",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "session.id",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "grok_code.token.usage",
+              "unit": "{token}",
+              "sum": {
+                "aggregationTemporality": 1,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1700000000000000003",
+                    "startTimeUnixNano": "1700000000000000000",
+                    "asInt": "3",
+                    "attributes": [
+                      {
+                        "key": "type",
+                        "value": {
+                          "stringValue": "cache_creation"
+                        }
+                      },
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "grok-4.6"
+                        }
+                      },
+                      {
+                        "key": "prompt",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "response",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_input",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_output",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "full_command",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "error_message",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_parameters",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "file_contents",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "user.email",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "session.id",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "grok_code.token.usage",
+              "unit": "{token}",
+              "sum": {
+                "aggregationTemporality": 1,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1700000000000000004",
+                    "startTimeUnixNano": "1700000000000000000",
+                    "asInt": "5",
+                    "attributes": [
+                      {
+                        "key": "type",
+                        "value": {
+                          "stringValue": "reasoning"
+                        }
+                      },
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "grok-4.6"
+                        }
+                      },
+                      {
+                        "key": "prompt",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "response",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_input",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_output",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "full_command",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "error_message",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_parameters",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "file_contents",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "user.email",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "session.id",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "grok_code.cost.usage",
+              "unit": "USD",
+              "sum": {
+                "aggregationTemporality": 1,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1700000000000000005",
+                    "startTimeUnixNano": "1700000000000000000",
+                    "asDouble": 0.0127,
+                    "attributes": [
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "grok-4.6"
+                        }
+                      },
+                      {
+                        "key": "prompt",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "response",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_input",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_output",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "full_command",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "error_message",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_parameters",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "file_contents",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "user.email",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "session.id",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "grok_code.session.count",
+              "unit": "{session}",
+              "sum": {
+                "aggregationTemporality": 1,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1700000000000000006",
+                    "startTimeUnixNano": "1700000000000000000",
+                    "asInt": "1",
+                    "attributes": [
+                      {
+                        "key": "prompt",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "response",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_input",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_output",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "full_command",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "error_message",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_parameters",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "file_contents",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "user.email",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "session.id",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "grok_code.turn.count",
+              "unit": "{turn}",
+              "sum": {
+                "aggregationTemporality": 1,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1700000000000000007",
+                    "startTimeUnixNano": "1700000000000000000",
+                    "asInt": "2",
+                    "attributes": [
+                      {
+                        "key": "outcome",
+                        "value": {
+                          "stringValue": "completed"
+                        }
+                      },
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "grok-4.6"
+                        }
+                      },
+                      {
+                        "key": "prompt",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "response",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_input",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_output",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "full_command",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "error_message",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_parameters",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "file_contents",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "user.email",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "session.id",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "grok_code.tool.usage",
+              "unit": "{call}",
+              "sum": {
+                "aggregationTemporality": 1,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1700000000000000008",
+                    "startTimeUnixNano": "1700000000000000000",
+                    "asInt": "4",
+                    "attributes": [
+                      {
+                        "key": "tool_name",
+                        "value": {
+                          "stringValue": "read_file"
+                        }
+                      },
+                      {
+                        "key": "outcome",
+                        "value": {
+                          "stringValue": "success"
+                        }
+                      },
+                      {
+                        "key": "prompt",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "response",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_input",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_output",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "full_command",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "error_message",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_parameters",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "file_contents",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "user.email",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "session.id",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "grok_code.error.count",
+              "unit": "{error}",
+              "sum": {
+                "aggregationTemporality": 1,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1700000000000000009",
+                    "startTimeUnixNano": "1700000000000000000",
+                    "asInt": "2",
+                    "attributes": [
+                      {
+                        "key": "error_category",
+                        "value": {
+                          "stringValue": "invalid_tool"
+                        }
+                      },
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "grok-4.6"
+                        }
+                      },
+                      {
+                        "key": "prompt",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "response",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_input",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_output",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "full_command",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "error_message",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "tool_parameters",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "file_contents",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "user.email",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      },
+                      {
+                        "key": "session.id",
+                        "value": {
+                          "stringValue": "GROK_SECRET_CONTENT"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

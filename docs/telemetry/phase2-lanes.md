@@ -404,10 +404,13 @@ Cards (gaps that stop those questions being answered):
     ledger usage, numeric reported costs and session retention/backup.
     OTel spans exist but DG4a log/metric mapping is none. Multi-provider, so
     the model/provider fields matter for M15.
-  - **DG4e Grok.** The owner uses it (first wave). Identified 2026-10-01: xAI's
+  - **Done (DG4e): Grok OTLP mapping.** The owner uses it (first wave). Identified 2026-10-01: xAI's
     official Grok Build CLI (`@xai-official/grok` 1.0.46 alpha, a native binary in
-    an npm package). Next: establish what it records locally or over OTel.
-    Then the OTLP mapping or a native adapter.
+    an npm package). `otlp:grok` is fixture-only for 1.0.46, with exact
+    resource attempt binding and metadata-only counters. Native source is none:
+    local paths are evident but the usage-file schema is not established.
+    Export requires protobuf/gRPC conversion and injected binding; see
+    contracts-collection.md DG4e.
   - **DG4f second wave:** Cursor (`cursor-agent`), GitHub Copilot CLI, Amp,
     Aider. OTLP mapping where the harness supports it; otherwise a native
     adapter if its local records are stable enough to certify.

@@ -404,6 +404,7 @@ fn http_request_rate_is_bounded() {
 fn sidecar_migration_retention_and_backup_preserve_otlp_evidence() {
     let f = Fixture::reserved();
     otlp::ingest(&f.project, "/v1/logs", &payload(&f, "claude-logs")).unwrap();
+    otlp::ingest(&f.project, "/v1/metrics", &payload(&f, "grok-metrics")).unwrap();
     let before = otlp::records(&f.project).unwrap();
     assert_eq!(
         f.sidecar()
@@ -436,7 +437,7 @@ fn sidecar_migration_retention_and_backup_preserve_otlp_evidence() {
         copy.query_row("SELECT count(*) FROM otlp_records", [], |r| r
             .get::<_, i64>(0))
             .unwrap(),
-        2
+        12
     );
     drop(copy);
     f.cli_args(&["backup", "verify", "--from", backup.to_str().unwrap()]);
@@ -506,4 +507,65 @@ fn unsupported_names_categories_and_missing_service_are_unmapped() {
             .any(|r| r["binding"] == "unbound" && r["attempt_id"].is_null())
     );
     assert!(!rows.to_string().contains("unknown-token-category-secret"));
+}
+
+#[test]
+fn grok_1046_metrics_are_versioned_bound_and_content_free() {
+    let f = Fixture::reserved();
+    let bytes = payload(&f, "grok-metrics");
+    assert_eq!(otlp::ingest(&f.project, "/v1/metrics", &bytes).unwrap(), 10);
+    assert_eq!(otlp::ingest(&f.project, "/v1/metrics", &bytes).unwrap(), 0);
+    let (rows, _) = f.cli_args(&["otlp", "records"]);
+    let rows = rows.as_array().unwrap();
+    for row in rows {
+        assert_eq!(row["adapter"], "otlp:grok");
+        assert_eq!(row["attempt_id"], f.attempt);
+        assert_eq!(row["binding"], "exact");
+        assert_eq!(row["cli_version"], "1.0.46");
+        assert_eq!(row["aggregationTemporality"], 1);
+        assert_eq!(row["unmapped_attribute_keys"].as_array().unwrap().len(), 10);
+    }
+    let mut tokens: Vec<_> = rows.iter().filter(|r| r["native_name"] == "grok_code.token.usage")
+        .map(|r| (r["attributes"]["type"].as_str().unwrap(), r["value"].as_i64().unwrap())).collect();
+    tokens.sort();
+    assert_eq!(tokens, vec![("cache_creation", 3), ("cache_read", 7), ("input", 31), ("output", 11), ("reasoning", 5)]);
+    for (name, value, unit) in [("cost.usage", json!(0.0127), "USD"), ("session.count", json!(1), "{session}"),
+        ("turn.count", json!(2), "{turn}"), ("tool.usage", json!(4), "{call}"), ("error.count", json!(2), "{error}")] {
+        let r = rows.iter().find(|r| r["native_name"] == format!("grok_code.{name}")).unwrap();
+        assert_eq!(r["value"], value);
+        assert_eq!(r["unit"], unit);
+    }
+    let changed = String::from_utf8(bytes.clone()).unwrap().replace("GROK_SECRET_CONTENT", "GROK_OTHER_SECRET");
+    assert_eq!(otlp::ingest(&f.project, "/v1/metrics", changed.as_bytes()).unwrap(), 0);
+    let mut v: Value = serde_json::from_slice(&bytes).unwrap();
+    v["resourceMetrics"][0]["resource"]["attributes"].as_array_mut().unwrap().retain(|a| a["key"] != "herdr.attempt_id");
+    otlp::ingest(&f.project, "/v1/metrics", &serde_json::to_vec(&v).unwrap()).unwrap();
+    v["resourceMetrics"][0]["resource"]["attributes"][1]["value"]["stringValue"] = json!("1.0.47");
+    otlp::ingest(&f.project, "/v1/metrics", &serde_json::to_vec(&v).unwrap()).unwrap();
+    let all = otlp::records(&f.project).unwrap();
+    assert_eq!(all.as_array().unwrap().iter().filter(|r| r["binding"] == "unbound").count(), 20);
+    assert_eq!(all.as_array().unwrap().iter().filter(|r| r["reason"] == "cli_version_uncertified" && r["kind"] == "unmapped").count(), 10);
+    assert!(!all.to_string().contains("GROK_SECRET_CONTENT"));
+    let mut unknown: Value = serde_json::from_slice(&bytes).unwrap();
+    unknown["resourceMetrics"][0]["scopeMetrics"][0]["metrics"].as_array_mut().unwrap().truncate(1);
+    unknown["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["sum"]["dataPoints"][0]["attributes"][0]["value"]["stringValue"] = json!("GROK_SECRET_UNKNOWN_TYPE");
+    unknown["resourceMetrics"][0]["resource"]["attributes"][2]["value"]["stringValue"] = json!("GROK_SECRET_UNKNOWN_ATTEMPT");
+    assert_eq!(otlp::ingest(&f.project, "/v1/metrics", &serde_json::to_vec(&unknown).unwrap()).unwrap(), 1);
+    let diagnostics = otlp::records(&f.project).unwrap();
+    let diagnostic = diagnostics.as_array().unwrap().iter().find(|r| r["binding"] == "unknown_attempt").unwrap();
+    assert_eq!(diagnostic["kind"], "unmapped");
+    assert!(diagnostic["attempt_id"].is_null());
+    assert!(diagnostic["value"].is_null());
+    assert!(!diagnostics.to_string().contains("GROK_SECRET_UNKNOWN"));
+    for suffix in ["", "-wal", "-shm"] {
+        if let Ok(bytes) = fs::read(f.project.join(format!(".state/telemetry.db{suffix}"))) {
+            assert!(!bytes.windows(19).any(|w| w == b"GROK_SECRET_CONTENT"));
+        }
+    }
+    let (cap, _) = f.cli_args(&["collectors", "capabilities", "--json"]);
+    let grok = cap["adapters"].as_array().unwrap().iter().find(|a| a["adapter"] == "otlp:grok").unwrap();
+    assert_eq!(grok["fixture_versions"], json!(["1.0.46"]));
+    assert_eq!(grok["certified_versions"], json!([]));
+    assert_eq!(grok["native_source"]["certified"], "none");
+    assert!(grok["fields"].as_array().unwrap().iter().filter(|f| f["available"] == true).all(|f| f["certified"] == "fixture"));
 }
