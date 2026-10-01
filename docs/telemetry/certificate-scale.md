@@ -2449,6 +2449,22 @@ Files: `src/telemetry/analytics/{compare,inputs,store}.rs`,
 `tests/telemetry_{compare,scale}.rs`, this certificate. No new crate, source
 process spawn, unit test or source-text assertion.
 
+**Steward 1M certification (2026-10-01, 14:20–14:31, serial, load 1.7–7.3).**
+Release build of this branch, `SCALE_EVENTS=1000000 SCALE_ACTIVE=64`, seed 5100.
+Query phase with `SCALE_QUERY_SET=p8 SCALE_REPEATS=3 SCALE_PER_ROUND=1`;
+every gate held, with no violations and the canonical store unchanged.
+
+| 1M/64 | main `628b59f` (§4.22) | this branch |
+| --- | --- | --- |
+| `compare --metric M02` p50 / p95 | 13,213 / 13,771 ms | **12.6 / 12.8 ms** |
+| `health` (live states) p50 / p95 | 13,881 / 14,029 ms | **870 / 936 ms** |
+| `health evaluate` p50 / p95 | 13,640 / 15,990 ms | **911 / 968 ms** |
+| `analytics refresh`, warm, p50 / p95 | 905 / 2,085 ms | 912 / 943 ms (maintaining the comparison adds no measurable cost) |
+| first cold `analytics refresh` after ingest | 3,468 ms, 240 MiB | 4,686 ms, 233 MiB (builds the maintained comparison once) |
+
+L3 verdict: `compare` meets 500 ms. Live `health` and `health evaluate` are ~15×
+faster but still above 500 ms.
+
 ## 5. Inefficiencies found and fixed
 
 The first measurement (same generator, same host) missed the query and
