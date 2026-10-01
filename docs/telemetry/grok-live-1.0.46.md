@@ -47,7 +47,10 @@ excludes cache reads, so the harness adds them before comparing.
 `input_tokens`, `output_tokens`, `reasoning_tokens`, `cache_read_tokens` and
 `cache_creation_tokens`. Everything else stays fixture-certified.
 
-**Known gap:** addressed by DG4j, pending the steward's live rerun.
+**Ledger (DG4j): addressed and live-verified 2026-10-01.** A second owner-approved
+two-turn run on branch `telemetry/dg4j-otlp-ledger` reconciled the ledger itself:
+31,225 input (incl. cache) / 5,248 cache read / 75 output / 73 reasoning, equal
+to Grok's own totals on every counter; bound; privacy 0 hits.
 Certified, bound API-request OTLP usage now feeds the accounting ledger,
 M08/M09, attempt usage and ledger-based cost. The updated live harness derives
 `ledger_totals` from counted ledger entries and compares them against Grok's
