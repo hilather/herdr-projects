@@ -763,7 +763,7 @@ Clippy completed with zero warnings in changed lines; existing unrelated
 warnings remain. Temporary instrumentation, wrappers and all `bench-data/`
 datasets were removed before the final commit.
 
-### 4.7 P4 controller and health follow-up (100k only)
+### 4.10 P4 controller and health follow-up (100k only)
 
 **Pending the steward's serial 1M certification. L1 remains open.** Branch
 `perf/controller-overhead`, same host and release build command as §1,
