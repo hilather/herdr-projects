@@ -273,7 +273,7 @@ reasons (the entry is `unavailable`, never 0):
 | `usage_not_counted` | not counted (no `accepted` disposition) or not normalized |
 | `model_unknown` | no reported model |
 | `usage_time_unknown` | no record time and no session start |
-| `cache_write_convention_unknown` | cache writes > 0 (codex-v1 does not certify their overlap with input) |
+| `cache_write_convention_unknown` | cache writes > 0 and the card has no `cache_write` rate (DG5: with one, they are priced) |
 | `no_rate_card` | no card for the product and model overlaps the interval |
 | `provider_mismatch` | the rollout reports a model provider and no overlapping card is of that provider |
 | `ambiguous_rate_cards` | cards of more than one `card_id` overlap it |
@@ -284,6 +284,27 @@ reasons (the entry is `unavailable`, never 0):
 
 Amount = Σ over categories with tokens of `tokens × rate / rate_unit`, exact
 (fixed-point `i128`, trimmed decimal string), with per-category components.
+
+**DG5: every certified source is priced from published-rate cards.** The
+quantities priced are the ledger's disjoint normalized
+`new_input_tokens`, `cache_read_tokens`, `cache_write_tokens` and
+`output_tokens` (the `usage_entries` CHECK makes `new_input = input −
+cache_read − cache_write` for `claude-code`, `opencode`, `muse` and the OTLP
+sources; Codex reports no cache writes), so nothing is counted twice. Cache
+writes are priced at the card's single `cache_write` rate (component
+`cache_write`); a card without one keeps the entry `unavailable` with
+`cache_write_convention_unknown`. A card applies to an entry when its
+`product` equals the entry `source` exactly: `codex`, `claude-code`,
+`opencode`, `muse`, `otlp:grok`, `otlp:claude-code`, `otlp:muse` (a card
+for `claude-code` does not price `otlp:claude-code`). The provider check
+runs for every source: a source that stores a model provider (Claude:
+`anthropic`, Gemini: `google`) only matches cards of that provider, so a
+card's `provider` must equal it; a source that reports none (Muse, OTLP) is
+priced and marked `provider_unverified`. A model with no applicable card is
+`unavailable` (`no_rate_card`), never 0, and M04/M12/M14 report
+priced versus unpriced entries as `coverage` (§12). The repository ships no
+real prices: real cards are imported by the owner; tests use INVENTED
+synthetic cards.
 
 Reproducibility across a sidecar rebuild: a `record_time` interval is the
 line's own time, so a rebuilt sidecar reprices it identically. The fallback

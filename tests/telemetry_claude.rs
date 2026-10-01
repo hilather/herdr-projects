@@ -474,3 +474,50 @@ fn accepted_otlp_cannot_hide_an_uncertified_native_surface() {
     assert_eq!(f.cli_args(&["accounting", "entries"]).0, ledger);
     no_secrets(&f);
 }
+
+/// DG5: Claude cache writes are priced at the card's `cache_write` rate and
+/// refused when the card has none; both stay explicit, never 0. The cards are
+/// INVENTED synthetic rates (not provider prices) with product `claude-code`.
+#[test]
+fn claude_cache_writes_are_priced_by_a_cache_write_rate_or_refused() {
+    let f = claude();
+    transcript(&f, SID, &f.worktree(), "2.1.3", f.decided + 1000);
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let card = |id: &str, model: &str, write: bool| {
+        let mut rates = vec![json!({"category":"input","rate":"3"}), json!({"category":"cache_read","rate":"0.30"}), json!({"category":"output","rate":"15"})];
+        if write { rates.push(json!({"category":"cache_write","rate":"3.75"})); }
+        let path = f.tmp.path().join(format!("{id}.json"));
+        fs::write(&path, serde_json::to_vec(&json!({"card_id":id,"version":1,"provider":"anthropic","product":"claude-code","models":[model],
+            "currency":"USD","rate_unit":1000000,"effective_from_unix_ms":0,"effective_to_unix_ms":null,
+            "includes":{"discounts":false,"taxes":false,"fees":false},"source":"INVENTED synthetic test rates; not a provider price","rates":rates})).unwrap()).unwrap();
+        f.cli_args(&["accounting", "import-rate-card", path.to_str().unwrap()]);
+    };
+    card("synthetic-claude-sonnet", "claude-fixture-sonnet", true);
+    card("synthetic-claude-haiku", "claude-fixture-haiku", false);
+    f.cli_args(&["accounting", "reprice"]);
+    let cost = f.cli_args(&["accounting", "cost", "--json"]).0;
+    let entries: Vec<Value> = cost["sessions"].as_array().unwrap().iter().flat_map(|s| s["entries"].as_array().unwrap().clone()).collect();
+    assert_eq!(entries.len(), 2);
+    let by_model = |model: &str| entries.iter().filter(|e| e["model"] == model).map(|e| e["valuation"].clone()).collect::<Vec<_>>();
+    // 100 × 3 + 200 × 0.30 + 30 × 3.75 + 20 × 15 per 10^6, disjoint quantities.
+    let priced = json!({"status":"priced","basis":"published_rate_estimate","rate_card":{"card_id":"synthetic-claude-sonnet","version":1},
+        "currency":"USD","amount":"0.0007725","provider_check":"matched",
+        "components":{"input":"0.0003","cache_read":"0.00006","cache_write":"0.0001125","output":"0.0003"}});
+    let sonnet = by_model("claude-fixture-sonnet");
+    assert_eq!(sonnet.len(), 1);
+    for v in &sonnet {
+        for key in ["status", "basis", "rate_card", "currency", "amount", "components"] { assert_eq!(v[key], priced[key], "{v}"); }
+    }
+    for v in by_model("claude-fixture-haiku") {
+        assert_eq!((&v["status"], &v["reason"]), (&json!("unavailable"), &json!("cache_write_convention_unknown")), "{v}");
+    }
+    let session = &cost["sessions"][0];
+    assert_eq!(session["coverage"], json!({"entries": 2, "priced": 1, "unpriced": {"cache_write_convention_unknown": 1}}));
+    assert_eq!(session["estimate"], json!({"status":"partial","reason":"unpriced_entries","currency":"USD","priced_amount":"0.0007725"}));
+    let m12 = f.report()["metrics"]["M12"].clone();
+    assert_eq!(m12["coverage"], json!({"entries": 2, "priced": 1, "unpriced": {"cache_write_convention_unknown": 1}}), "{m12}");
+    let again = f.cli_args(&["accounting", "reprice"]).0;
+    assert_eq!(again["appended"], false, "repricing is idempotent: {again}");
+    assert_eq!(f.cli_args(&["accounting", "cost", "--json"]).0, cost);
+}

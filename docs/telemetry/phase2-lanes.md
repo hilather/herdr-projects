@@ -477,8 +477,14 @@ Cards (gaps that stop those questions being answered):
     GitHub Copilot CLI, Amp and Aider: **not built: not installed; build when
     installed**. Copilot's wrapper only installs on first use and was not run.
     No code is added for these three harnesses.
-- **DG5 cost M04/M12 (external).** Needs real rate cards and provider charges
-  imported by the owner (contracts-accounting.md). Still blocked.
+- **DG5 cost M04/M12.** Owner approved estimates at published API list prices
+  (USD). **Built:** cache writes are priced at a card's `cache_write` rate
+  (refused with `cache_write_convention_unknown` when the card has none), so
+  Claude usage is priceable; each certified source is priced by a card whose
+  `product` equals its ledger `source` (contracts-accounting.md §4). The
+  repository ships no real prices: the owner imports the steward's cards, and
+  provider charges (§13) stay a separate basis. Unpriced models stay
+  `unavailable` with a reason; M12/M14 report the coverage.
 - **DG6 flakes under concurrent load (owner-approved design, 2026-09-30).**
   A change can pass alone and fail when other work runs alongside it. In the
   2026-09-30 log, cx2 was a racy test and P3 a real lock-hold regression, so

@@ -442,9 +442,6 @@ fn price<'a>(
     (from, to): (i64, i64),
     q: [i64; 4],
 ) -> std::result::Result<(&'a Card, Dec, BTreeMap<String, String>), &'static str> {
-    if q[2] > 0 {
-        return Err("cache_write_convention_unknown");
-    }
     let mut overlapping: Vec<&Card> = cards
         .iter()
         .filter(|(p, models, c)| {
@@ -468,7 +465,7 @@ fn price<'a>(
         return Err("rate_change_within_usage_interval");
     }
     let (mut total, mut components) = (Dec::ZERO, BTreeMap::new());
-    for (category, tokens) in [("input", q[0]), ("cache_read", q[1]), ("output", q[3])] {
+    for (category, tokens) in [("input", q[0]), ("cache_read", q[1]), ("cache_write", q[2]), ("output", q[3])] {
         if tokens == 0 {
             continue;
         }
@@ -477,6 +474,7 @@ fn price<'a>(
                 return Err(match category {
                     "input" => "input_rate_missing",
                     "cache_read" => "cache_read_rate_missing",
+                    "cache_write" => "cache_write_convention_unknown",
                     _ => "output_rate_missing",
                 });
             }

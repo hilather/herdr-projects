@@ -190,7 +190,7 @@ fn opencode_maintained_reads_match_full_derivation() {
     for table in ["accounting_usage_totals", "accounting_native_totals", "accounting_source_summary", "accounting_tool_summary"] {
         assert_eq!(f.count(table), 1, "OpenCode populates {table}");
     }
-    assert_eq!(f.report()["metrics"]["M14"]["value"], "0/1");
+    assert_eq!(f.report()["metrics"]["M14"]["value"], "1/1");
     let native_cost: f64 = f.sidecar().query_row("SELECT sum(cost) FROM opencode_messages", [], |r| r.get(0)).unwrap();
     assert_eq!(native_cost, 0.125);
     // Correct a tool outcome with no new usage; cached reads must invalidate.
@@ -200,8 +200,8 @@ fn opencode_maintained_reads_match_full_derivation() {
     f.cli_args(&["analytics", "refresh"]);
     assert_eq!(f.cli_args(&["analytics", "rebuild", "--verify"]).0["identical"], true);
     verify_aggregate_replay(&f, &corrected);
-    // Include an independently priceable invocation while preserving main's
-    // refusal to estimate entries with an unknown cache-write convention.
+    // A second invocation without cache writes; the card has a cache-write
+    // rate (DG5), so both entries are priced.
     message(&db, SID, "msg-priced", false, true, terminated + 3);
     db.execute("UPDATE message SET data=json_set(data,'$.tokens.cache.write',0) WHERE id='msg-priced'", []).unwrap();
     f.cli("collect");
@@ -210,7 +210,7 @@ fn opencode_maintained_reads_match_full_derivation() {
     assert_eq!(appended["metrics"][1]["value"], 50);
     verify_aggregate_replay(&f, &appended);
     let metrics = f.report()["metrics"].clone();
-    assert_eq!(metrics["M12"]["estimate"]["priced_amount"], "0.000365");
-    assert_eq!(metrics["M14"]["value"], "1/2");
+    assert_eq!(metrics["M12"]["estimate"], json!({"status": "complete", "currency": "USD", "amount": "0.00076"}));
+    assert_eq!(metrics["M14"]["value"], "2/2");
     privacy(&f);
 }

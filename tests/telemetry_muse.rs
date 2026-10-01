@@ -380,3 +380,30 @@ fn otlp_explicit_usage_yields_to_native_muse_children() {
     assert_eq!(f.cli_args(&["accounting", "entries"]).0, entries);
     no_secrets(&f);
 }
+
+/// DG5: Muse usage is priced by a card whose product equals its source
+/// (`muse`). Muse reports no model provider, so a priced entry is
+/// `provider_unverified`. INVENTED synthetic rates, one unit per token.
+#[test]
+fn muse_usage_is_priced_by_a_muse_card() {
+    let f = muse();
+    plant(&f, &f.worktree(), f.decided + 1000);
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let card = f.tmp.path().join("muse-rates.json");
+    fs::write(&card, serde_json::to_vec(&json!({"card_id":"synthetic-muse","version":1,"provider":"synthetic","product":"muse",
+        "models":["muse-spark-1.3-contributor"],"currency":"USD","rate_unit":1,"effective_from_unix_ms":0,"effective_to_unix_ms":null,
+        "includes":{"discounts":false,"taxes":false,"fees":false},"source":"INVENTED synthetic test rates; not a provider price",
+        "rates":[{"category":"input","rate":"1"},{"category":"cache_read","rate":"1"},{"category":"cache_write","rate":"1"},{"category":"output","rate":"1"}]})).unwrap()).unwrap();
+    f.cli_args(&["accounting", "import-rate-card", card.to_str().unwrap()]);
+    f.cli_args(&["accounting", "reprice"]);
+    let cost = f.cli_args(&["accounting", "cost", "--json"]).0;
+    let entries: Vec<Value> = cost["sessions"].as_array().unwrap().iter().flat_map(|s| s["entries"].as_array().unwrap().clone()).collect();
+    assert_eq!(entries.len(), 4);
+    for e in &entries {
+        assert_eq!((&e["valuation"]["status"], &e["provider_check"]), (&json!("priced"), &json!("provider_unverified")), "{e}");
+    }
+    assert_eq!(cost["attempts"][0]["estimate"]["amount"], "47662", "{cost}");
+    assert_eq!(cost["attempts"][0]["coverage"], json!({"entries": 4, "priced": 4, "unpriced": {}}));
+    assert_eq!(f.cli_args(&["accounting", "reprice"]).0["appended"], false);
+}
