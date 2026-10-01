@@ -310,6 +310,47 @@ pub(crate) fn headroom(db: &Connection, home: &str, decided: i64) -> Result<Valu
     Ok(json!({"account": account, "account_basis": ACCOUNT_BASIS, "windows": windows}))
 }
 
+/// Keep historical decision answers alongside the quota projection. Ordered
+/// snapshots later than a decision cannot change it. Earlier corrections can
+/// also change shared-window candidates, so all homes at/after the earliest
+/// affected observation are reconsidered.
+pub(crate) fn store_dispatch(project: &Path, db: &Connection, full: bool, floor: Option<i64>) -> Result<()> {
+    let canonical = serde_json::to_string(&crate::telemetry::analytics::inputs::canonical(project)?)?;
+    let previous: Option<String> = db.query_row("SELECT canonical FROM accounting_dispatch_frontier WHERE singleton=1", [], |r| r.get(0)).optional()?;
+    let all = full || previous.as_deref() != Some(canonical.as_str());
+    if all { db.execute_batch("DELETE FROM accounting_dispatch_headroom;")?; }
+    if all || floor.is_some() {
+        let mut insert = db.prepare_cached("INSERT INTO accounting_dispatch_headroom(attempt_id,home_digest,decided_unix_ms,body) VALUES(?1,?2,?3,?4)
+            ON CONFLICT(attempt_id) DO UPDATE SET home_digest=excluded.home_digest,decided_unix_ms=excluded.decided_unix_ms,body=excluded.body")?;
+        for (attempt, kind, home, decided) in decisions(project)? {
+            if kind.as_deref().is_some_and(|k| k != "codex") || !all && floor.is_some_and(|at| decided < at) { continue; }
+            let Some(home) = home else { continue; };
+            let body = headroom(db, &home, decided)?;
+            insert.execute(params![attempt, body["account"].as_str().unwrap_or_default(), decided, serde_json::to_string(&body)?])?;
+        }
+    }
+    db.execute("INSERT INTO accounting_dispatch_frontier(singleton,canonical) VALUES(1,?1)
+        ON CONFLICT(singleton) DO UPDATE SET canonical=excluded.canonical", [canonical])?;
+    Ok(())
+}
+
+pub(crate) fn dispatch_current(project: &Path, db: &Connection) -> Result<bool> {
+    // M40 has always read the last synced quota projection, even if the next
+    // collect has pending rows. A maintenance invalidation requires fallback.
+    if !db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='accounting_dispatch_frontier')", [], |r| r.get::<_, bool>(0))? { return Ok(false); }
+    let canonical = serde_json::to_string(&crate::telemetry::analytics::inputs::canonical(project)?)?;
+    let valid: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM accounting_dispatch_frontier WHERE canonical=?1)
+        AND EXISTS(SELECT 1 FROM accounting_stream WHERE invalidated IS NULL)", [&canonical], |r| r.get(0))?;
+    Ok(valid)
+}
+
+pub(crate) fn stored_headroom(db: &Connection, attempt: &str, home: &str, decided: i64) -> Result<Option<Value>> {
+    let account = format!("sha256:{:x}", <sha2::Sha256 as sha2::Digest>::digest(home.as_bytes()));
+    let body: Option<String> = db.prepare_cached("SELECT body FROM accounting_dispatch_headroom WHERE attempt_id=?1 AND home_digest=?2 AND decided_unix_ms=?3")?
+        .query_row(params![attempt, account, decided], |r| r.get(0)).optional()?;
+    body.map(|b| serde_json::from_str(&b).map_err(Into::into)).transpose()
+}
+
 /// `accounting quota`: synced windows, observation trust, M38/M39 and extended
 /// M40 per dispatch decision. Read-only; `ledger_not_synced` before a sync.
 pub fn read(project: &Path, db: &Connection) -> Result<Value> {

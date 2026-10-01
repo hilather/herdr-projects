@@ -29,7 +29,7 @@ for either. This is not a certification of an OTLP transport.
 | --- | --- |
 | Source | branch `telemetry/tm51-scale-certification` from `main` `20a763f`, plus the fixes in §5 |
 | Build | `cargo test --release --locked --offline -j 3 --features state-store --test telemetry_scale --no-run` (rustc 1.98.0), system SQLite 3.53.4 |
-| Stores | canonical `SCHEMA = 67`; sidecar streams `codex` 3, `ingest` 9, `accounting` 12, `quality` 2, `analytics` 2, `health` 1, `policies` 1 |
+| Stores | canonical `SCHEMA = 67`; sidecar streams `codex` 3, `ingest` 9, `accounting` 12, `quality` 2, `analytics` 3, `health` 1, `policies` 1 |
 | CPU / memory | Intel Core i7-8750H, 6 cores / 12 threads, 62 GiB RAM, zram swap |
 | Disk | Intel SSDPEKNW010T8 NVMe, LUKS, btrfs (`compress=zstd:3`). Every dataset lived under `bench-data/` on this disk, never on the RAM-backed `/tmp` |
 | OS | Linux 7.2.3-arch1-3 |
@@ -762,6 +762,100 @@ start/end observations ranged 3.19–8.17).
 Clippy completed with zero warnings in changed lines; existing unrelated
 warnings remain. Temporary instrumentation, wrappers and all `bench-data/`
 datasets were removed before the final commit.
+## 4.10 P2 aggregate reads and incremental analytics (pending steward's 1M certification)
+
+Branch `perf/incremental-analytics`, accounting stream **13**, analytics
+stream **3**. This addresses L3 and analytics' portion of L4. Only the
+100k/64 dataset was measured; no 1M run was performed.
+
+Accounting sync maintains exact normalized usage totals, separate native
+usage/model totals, source certification summaries and serialized session
+tool tallies in P1's transaction. Tool tallies retain the complete observed
+wait samples, so percentiles and inferred outcomes use the original
+arithmetic. Historical M40 headroom is indexed by attempt and recomputed
+when its canonical decision or an earlier quota observation changes.
+Default cost bodies are indexed by valuation revision. Canonical lifecycle
+watermarks and after-termination diagnostics are separately maintained and
+validated, avoiding full lifecycle loads for a lane-only read. Fleet
+caches hold lifecycle inputs; open ends are still supplied from the clock at read time.
+Stale/missing frontiers use the original derivation. Retention and restore
+invalidate these projections and preserve P1's recorded rebuild reasons.
+Reads check validity and consume totals within one SQLite snapshot.
+The complete report uses three bounded readers for accounting, the other
+lanes, and central metrics/attention/diagnostics, then merges in registry
+order so lane overrides and output order are unchanged. Cached JSON objects are
+moved into the metric map directly, avoiding a second recursive allocation
+pass over the M40 decision tree.
+
+Analytics tracks durable per-table mutation generations (including updates
+and deletes), the accounting frontier/dirty inputs, collector inputs and
+the canonical head/file identity. A refresh evaluates only changed cells;
+clock-dependent attention, fleet, quality and review cells always evaluate.
+Unchanged cells advance `checked_unix_ms` without changing their revisions.
+Evaluated cells are appended and released one at a time rather than keeping
+all cells' lineage in memory. Dependency capture, revisions and saved
+provider bodies share one immediate transaction. Rebuild bypasses all
+aggregate shortcuts and replays original sources; digest, lineage,
+restatement and stored as-of semantics are unchanged.
+
+Both CLIs used the same on-disk dataset under `bench-data/` (seed 5100,
+100,000 configured events, 64 active, 10,000 bindings). After the separate
+late-arrival fault phase, restore the original rollout bytes and expected
+totals/mix, recreate the sidecar through CLI collects, and replay the same
+producer facts and original 384 attention samples. The canonical store
+stayed unchanged. Preserve the before CLI before rebuilding. Run
+§1's release build and environment, `SCALE_REPEATS=3`, then
+`scale_2_queries` with `SCALE_PER_ROUND=1 SCALE_TAG=before|after`.
+`scale_9_analytics_refresh` repeats refresh without changing its inputs;
+set `SCALE_ANALYTICS_BIN=$PWD/bench-data/baseline-bin` for before only.
+Accounting sync installs/fills the new aggregates before the after phases.
+The final refresh starts without P2 checked-input/provider cache metadata,
+then repeats twice with unchanged inputs. One bench process ran at a time;
+cargo used three jobs. These shared-host
+measurements are provisional, pending the steward's serial 1M certification.
+
+| 100k/64 read, n = 3; wall p50 / p95 | Before | After |
+| --- | --- | --- |
+| M08 lane usage | 959.32 / 1,073.07 ms | 26.58 / 27.91 ms |
+| M13 central coverage | 1,669.41 / 2,542.99 ms | 40.99 / 46.54 ms |
+| Complete report (including M40 decisions) | 2,356.08 / 2,443.80 ms | 278.46 / 308.27 ms |
+| Cost view | 750.45 / 752.10 ms | 109.08 / 133.76 ms |
+| Query 1-minute load, start → end | 5.52 → 4.25 | 5.33 → 3.37 |
+
+All four measured lane/central read surfaces meet 500 ms at 100k. This is
+pending the steward's 1M certification, not a certification of other
+operator surfaces. Earlier after variants, before removing recursive
+JSON-map deserialization, had report p95 532.83 and 903.83 ms (loads
+3.26 → 4.96 and 3.33 → 4.61); those are retained here as exploratory
+observations, not the final after samples.
+
+| Analytics refresh, n = 3 | Before | After |
+| --- | --- | --- |
+| Wall p50 / p95 | 3,669.20 / 8,291.27 ms | 332.01 / 2,292.04 ms |
+| Peak RSS | 283,000 KiB (276.4 MiB) | 184,284 KiB (180.0 MiB) |
+| 1-minute load, start → end | 10.44 → 10.24 | 5.18 → 5.33 |
+
+The after maximum includes the first refresh of legacy tracked cells;
+subsequent unchanged-input refreshes took 332.01 and 296.29 ms and peaked
+at 35,920 and 36,044 KiB (35.1/35.2 MiB). Even the cache-initialization refresh is below
+256 MiB at 100k. This does not certify full invalidation/rebuild memory,
+health, whole-pass memory or 1M. Both refresh phases reported zero usage
+gate violations and unchanged canonical digests.
+
+E2E coverage extends real collect/sync/query/refresh workflows: hand-computed
+M08/M09 and tools values equal replayed answers, late usage restates the
+cell while old as-of results remain reproducible, incremental snapshots
+equal a full rebuild byte for byte, and retention/restore retain the exact
+answers or unavailable coverage with a recorded full-rebuild reason.
+The existing first-collector race E2E exposed a file-creation race: losing
+`create_new` returned `AlreadyExists` before reaching SQLite migration
+serialization. The loser now verifies the winning path is a regular file
+and proceeds with the same no-follow SQLite open and migration lock.
+The unchanged load gate passed in debug and release. The 100k late-arrival
+phase passed all three repeats, with pinned as-of results and byte-identical
+rebuilds. The requested 15 suites had **171 passed,
+four socket-only failures**, the same four Unix-bind failures listed in
+§4.6. Clippy found no warnings in changed lines; existing warnings remain.
 
 ### 4.10 P4 controller and health follow-up (100k only)
 
@@ -975,6 +1069,12 @@ owner. None is hidden by loosening the target.
   tools and cost views, the central report with its per-decision M40) scan
   the history on each read: 2.3–8.4 s at 1M. Reading them from the
   analytics revisions (`--as-of-seq`, 159 ms) is the bounded path today.
+  **P2 follow-up: 100k/64 M08 p95 1,073.07 → 27.91 ms, M13
+  2,542.99 → 46.54 ms, report 2,443.80 → 308.27 ms and cost view
+  752.10 → 133.76 ms; pending the steward's 1M certification** (§4.7).
+  Maintained session/attempt/valuation summaries and validated provider
+  bodies replace history replay on these reads. Full derivation remains the
+  live fallback for missing/stale projections and the rebuild verifier.
   Owners: accounting lane, analytics (TM4.1).
 - **L4: the ticker's telemetry pass exceeds the 256 MiB envelope at 10,000
   bindings.** The collector itself stays within it (58–115 MB) and its byte
@@ -993,6 +1093,15 @@ owner. None is hidden by loosening the target.
   before `6.93 11.95 11.30` → `6.61 11.38 11.13`, after
   `5.88 10.98 11.01` → `5.59 10.50 10.85`. Neither change certifies
   whole-pass memory. Remaining remedy: incremental refresh (L2).
+
+  invalidation rebuilds remain; analytics/health and whole-pass RSS are not
+  certified by P1. **Analytics P2 follow-up: 276.4 → 180.0 MiB peak
+  RSS across three 100k/64 refreshes including cache initialization; wall
+  p50/p95 3,669.20/8,291.27 → 332.01/2,292.04 ms; pending the
+  steward's 1M certification** (§4.7; load before 10.44–10.24, after
+  5.18–5.33). Subsequent unchanged-input refreshes use 35.1–35.2 MiB.
+  Health, whole-pass RSS and full invalidation/rebuild memory remain
+  uncertified by P2.
 - **L5: the fleet pane and the digest section take seconds, not 250 ms / 100
   ms.** At 64 active attempts with 10,000 retained ones, one snapshot builds
   the full attempt projection three times (the active list, `compare`,

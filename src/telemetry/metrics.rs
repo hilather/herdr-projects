@@ -47,6 +47,20 @@ pub fn report(project: &Path, since: Option<i64>) -> Result<Value> { super::anal
 /// The central slice metrics (contracts §6) and the `tasks` summary, before
 /// the lane providers (`super::LANES`) add theirs.
 pub(crate) fn central(project: &Path, since: Option<i64>) -> Result<(BTreeMap<String, Value>, Value)> {
+    if let Some(db) = super::sidecar::read(project)? && let Some(generations) = super::analytics::inputs::generations(&db)? {
+        let stamp = super::analytics::inputs::stamp("central", &super::analytics::inputs::canonical(project)?, &generations);
+        if let Some(body) = super::analytics::inputs::cached(&db, "central", since, &stamp)? {
+            let mut metrics: BTreeMap<String, Value> = match body {
+                Value::Object(values) => values.into_iter().collect(),
+                body => serde_json::from_value(body)?,
+            };
+            if let Some(tasks) = metrics.remove("_tasks") { return Ok((metrics, tasks)); }
+        }
+    }
+    central_uncached(project, since, true)
+}
+
+pub(crate) fn central_uncached(project: &Path, since: Option<i64>, aggregates: bool) -> Result<(BTreeMap<String, Value>, Value)> {
     let path = project.join(".state/state.db");
     let db = super::read_only(&path)?;
     let table = |name: &str| db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [name], |r| r.get::<_, bool>(0));
@@ -79,9 +93,10 @@ pub(crate) fn central(project: &Path, since: Option<i64>) -> Result<(BTreeMap<St
         "excluded": {"replay_candidate": replayed}})));
 
     let sidecar = super::sidecar::read(project)?;
-    usage_metrics(sidecar.as_deref(), &attempts, since, &in_window, &mut metrics)?;
+    let _snapshot = sidecar.as_deref().map(|db| db.unchecked_transaction()).transpose()?;
+    usage_metrics(sidecar.as_deref(), &attempts, since, &in_window, &mut metrics, aggregates)?;
     for id in ["M31", "M32", "M33"] { metrics.insert(id, metric(id, json!({"value": unavailable("attention_not_collected")}))); }
-    metrics.insert("M40", headroom(sidecar.as_deref(), &attempts, &in_window)?);
+    metrics.insert("M40", headroom(project, sidecar.as_deref(), &attempts, &in_window, aggregates)?);
     #[cfg(target_os = "linux")]
     metrics.insert("M49", crate::replay::m49(&db, since)?);
     for (id, name) in NAMES { if let Some(m) = metrics.get_mut(id) { m["name"] = json!(name); } }
@@ -91,7 +106,7 @@ pub(crate) fn central(project: &Path, since: Option<i64>) -> Result<(BTreeMap<St
 
 /// M08, M09, M15 over certified bound sessions (activity window by session
 /// start) and M13 over terminated attempts decided in the window.
-fn usage_metrics(sidecar: Option<&Connection>, attempts: &[Attempt], since: Option<i64>, in_window: &dyn Fn(&Attempt) -> bool, metrics: &mut BTreeMap<&str, Value>) -> Result<()> {
+fn usage_metrics(sidecar: Option<&Connection>, attempts: &[Attempt], since: Option<i64>, in_window: &dyn Fn(&Attempt) -> bool, metrics: &mut BTreeMap<&str, Value>, aggregates: bool) -> Result<()> {
     let terminated: Vec<&Attempt> = attempts.iter().filter(|a| TERMINAL.contains(&a.state.as_str()) && in_window(a)).collect();
     let adapter_absent = terminated.iter().filter(|a| a.kind.as_deref().is_some_and(|k| !matches!(k, "codex" | "claude" | "opencode"))).count();
     let codex: Vec<&&Attempt> = terminated.iter().filter(|a| matches!(a.kind.as_deref(), Some("codex" | "claude" | "opencode"))).collect();
@@ -104,9 +119,16 @@ fn usage_metrics(sidecar: Option<&Connection>, attempts: &[Attempt], since: Opti
     type Source = (String, String, Option<String>, bool, bool, i64, i64, Option<i64>);
     // Records collected before their version was certified keep NULL counters:
     // such a source stays uncertified (see `sidecar::attempt_usage`).
-    let sources: Vec<Source> = db.prepare("SELECT s.session_id,s.binding,s.attempt_id,
+    let sql = if aggregates && super::accounting::ledger::aggregates_current(db)? {
+        "SELECT s.session_id,s.binding,s.attempt_id,CASE WHEN a.uncertified THEN '' ELSE s.cli_version END,
+        a.quarantined,s.records,a.accepted_records,s.session_unix_ms FROM rollout_sources s
+        JOIN accounting_source_summary a USING(path_digest) ORDER BY s.path_digest"
+    } else {
+        "SELECT s.session_id,s.binding,s.attempt_id,
         CASE WHEN EXISTS(SELECT 1 FROM codex_usage u WHERE u.path_digest=s.path_digest AND u.reason='cli_version_uncertified') THEN '' ELSE s.cli_version END,EXISTS(SELECT 1 FROM codex_quarantine q WHERE q.session_id=s.session_id),
-        s.records,(SELECT count(*) FROM codex_usage u WHERE u.path_digest=s.path_digest AND u.accepted=1),s.session_unix_ms FROM rollout_sources s ORDER BY s.path_digest")?
+        s.records,(SELECT count(*) FROM codex_usage u WHERE u.path_digest=s.path_digest AND u.accepted=1),s.session_unix_ms FROM rollout_sources s ORDER BY s.path_digest"
+    };
+    let sources: Vec<Source> = db.prepare(sql)?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, super::codex::accepted_version(&r.get::<_, String>(3)?), r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let known: BTreeSet<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
@@ -126,9 +148,15 @@ fn usage_metrics(sidecar: Option<&Connection>, attempts: &[Attempt], since: Opti
         for id in ["M08", "M09", "M15"] { metrics.insert(id, metric(id, json!({"value": unavailable("no_certified_source"), "coverage": coverage}))); }
     } else {
         let mut sums = [0i64; 5];
+        let sql = if aggregates && super::accounting::ledger::aggregates_current(db)? {
+            "SELECT input_tokens,output_tokens,reasoning_tokens,records,models FROM accounting_native_totals WHERE session_id=?1"
+        } else {
+            "SELECT coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(reasoning_output_tokens),0),count(*),count(model)
+                FROM codex_usage WHERE session_id=?1 AND accepted=1 AND NOT EXISTS(SELECT 1 FROM codex_usage e WHERE e.session_id=codex_usage.session_id AND e.accepted=1 AND e.response_id IS NOT NULL AND e.response_id=codex_usage.response_id AND e.payload_digest=codex_usage.payload_digest AND e.ordinal<codex_usage.ordinal)"
+        };
+        let mut totals = db.prepare(sql)?;
         for session in &certified {
-            let row: [i64; 5] = db.query_row("SELECT coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(reasoning_output_tokens),0),count(*),count(model)
-                FROM codex_usage WHERE session_id=?1 AND accepted=1 AND NOT EXISTS(SELECT 1 FROM codex_usage e WHERE e.session_id=codex_usage.session_id AND e.accepted=1 AND e.response_id IS NOT NULL AND e.response_id=codex_usage.response_id AND e.payload_digest=codex_usage.payload_digest AND e.ordinal<codex_usage.ordinal)", [session], |r| Ok([r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?]))?;
+            let row: [i64; 5] = totals.query_row([session], |r| Ok([r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?]))?;
             for (sum, value) in sums.iter_mut().zip(row) { *sum += value; }
         }
         metrics.insert("M08", metric("M08", json!({"value": sums[0], "coverage": coverage})));
@@ -136,9 +164,15 @@ fn usage_metrics(sidecar: Option<&Connection>, attempts: &[Attempt], since: Opti
         metrics.insert("M09", metric("M09", json!({"value": sums[1], "reasoning_output_tokens": reasoning, "coverage": coverage})));
         metrics.insert("M15", ratio("M15", sums[4] as usize, sums[3] as usize, json!({"coverage": coverage})));
     }
+    // Group once: searching all rollouts separately for each retained attempt
+    // makes coverage quadratic in the binding count.
+    let mut by_attempt = BTreeMap::<&str, Vec<&Source>>::new();
+    for source in &sources {
+        if source.1 == "bound" && let Some(attempt) = source.2.as_deref() { by_attempt.entry(attempt).or_default().push(source); }
+    }
     let mut incomplete = BTreeMap::<&str, usize>::new();
     for a in &codex {
-        let bound: Vec<&Source> = sources.iter().filter(|s| s.1 == "bound" && s.2.as_deref() == Some(a.id.as_str())).collect();
+        let bound = by_attempt.get(a.id.as_str()).map(Vec::as_slice).unwrap_or_default();
         let reason = if bound.is_empty() { "not_bound" } else if bound.iter().any(|s| s.4) { "quarantined" }
             else if bound.iter().any(|s| !s.3) { "cli_version_uncertified" } else if bound.iter().any(|s| s.5 != s.6) { "records_not_accepted" } else { continue };
         *incomplete.entry(reason).or_default() += 1;
@@ -153,9 +187,10 @@ fn usage_metrics(sidecar: Option<&Connection>, attempts: &[Attempt], since: Opti
 /// value from the quota tables the last `accounting sync` built, never summed
 /// across accounts, limits or services. Each entry equals the one `accounting
 /// quota` prints; before a sync every Codex decision is `ledger_not_synced`.
-fn headroom(sidecar: Option<&Connection>, attempts: &[Attempt], in_window: &dyn Fn(&Attempt) -> bool) -> Result<Value> {
+fn headroom(project: &Path, sidecar: Option<&Connection>, attempts: &[Attempt], in_window: &dyn Fn(&Attempt) -> bool, aggregates: bool) -> Result<Value> {
     use super::accounting::quota;
     let synced = match sidecar { Some(db) => quota::synced(db)?, None => false };
+    let aggregate = match sidecar { Some(db) => aggregates && quota::dispatch_current(project, db)?, None => false };
     let mut decisions = Vec::new();
     for a in attempts.iter().filter(|a| in_window(a)) {
         let Some(decided) = a.decided else { continue };
@@ -164,7 +199,10 @@ fn headroom(sidecar: Option<&Connection>, attempts: &[Attempt], in_window: &dyn 
             (_, None, _) => json!({"value": unavailable("execution_home_unknown")}),
             (.., None) => json!({"value": unavailable("collection_not_run")}),
             _ if !synced => json!({"value": unavailable("ledger_not_synced")}),
-            (_, Some(home), Some(db)) => quota::headroom(db, home, decided)?,
+            (_, Some(home), Some(db)) => match if aggregate { quota::stored_headroom(db, &a.id, home, decided)? } else { None } {
+                Some(body) => body,
+                None => quota::headroom(db, home, decided)?,
+            },
         };
         entry["attempt_id"] = json!(a.id);
         entry["decided_unix_ms"] = json!(decided);

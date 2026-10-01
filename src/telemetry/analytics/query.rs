@@ -23,12 +23,26 @@ const PRICED: [&str; 6] = ["M04", "M12", "M14", "M24", "M34", "M37"];
 /// `herdr-projects telemetry <slug> report`: central slice metrics, then every
 /// lane's (`super::super::LANES`, a lane key replacing a central one).
 pub fn report(project: &Path, since: Option<i64>) -> Result<Value> {
-    let (mut metrics, tasks) = crate::telemetry::metrics::central(project, since)?;
-    for lane in &crate::telemetry::LANES { metrics.extend((lane.metrics)(project, since)?); }
-    let usage = crate::telemetry::sidecar::report(project)?;
-    let after: Vec<Value> = usage["attempts"].as_array().into_iter().flatten()
-        .filter(|a| a["after_termination"]["records"].as_i64().is_some_and(|n| n > 0))
-        .map(|a| json!({"attempt_id": a["attempt_id"], "after_termination": a["after_termination"], "accounting": "still counted in M08"})).collect();
+    // Three bounded readers: accounting, the remaining lanes, and central
+    // plus diagnostics. Merge in registry order, preserving lane overrides.
+    let (mut metrics, tasks, lanes, after) = std::thread::scope(|scope| -> Result<_> {
+        let accounting = scope.spawn(|| crate::telemetry::accounting::metrics_without_attention(project, since));
+        let others = scope.spawn(|| -> Result<Vec<_>> {
+            crate::telemetry::LANES.iter().enumerate().filter(|(_, lane)| lane.stream != "accounting")
+                .map(|(index, lane)| Ok((index, (lane.metrics)(project, since)?))).collect()
+        });
+        let (metrics, tasks) = crate::telemetry::metrics::central(project, since)?;
+        let attention = crate::telemetry::accounting::metric_group(project, "attention", since)?;
+        let after = crate::telemetry::sidecar::after_termination_report(project)?;
+        let mut lanes = others.join().map_err(|_| anyhow::anyhow!("telemetry lane reader panicked"))??;
+        let index = crate::telemetry::LANES.iter().position(|lane| lane.stream == "accounting").unwrap_or(0);
+        let mut accounting = accounting.join().map_err(|_| anyhow::anyhow!("accounting reader panicked"))??;
+        accounting.extend(attention);
+        lanes.push((index, accounting));
+        lanes.sort_by_key(|(index, _)| *index);
+        Ok((metrics, tasks, lanes, after))
+    })?;
+    for (_, lane) in lanes { metrics.extend(lane); }
     let mut report = json!({"metrics": metrics, "since_unix_ms": since, "tasks": tasks});
     if !after.is_empty() { report["after_termination"] = json!(after); }
     Ok(report)
@@ -190,13 +204,25 @@ pub fn request(args: &Args) -> Result<Request> {
 pub struct Sources<'a> {
     pub project: &'a Path,
     pub tasks: Vec<Task>,
+    tasks_loaded: bool,
     watermarks: Option<Value>,
-    bodies: BTreeMap<(Option<i64>, String), BTreeMap<String, Value>>,
+    pub(crate) use_aggregates: bool,
+    pub(crate) bodies: BTreeMap<(Option<i64>, String), BTreeMap<String, Value>>,
+    pub(crate) canonical_inputs: Value,
+    pub(crate) input_generations: BTreeMap<String, i64>,
 }
 
 impl<'a> Sources<'a> {
     pub fn new(project: &'a Path) -> Result<Self> {
-        Ok(Sources { project, tasks: lifecycle::load(project)?, watermarks: None, bodies: BTreeMap::new() })
+        let canonical_inputs = super::inputs::canonical(project)?;
+        let input_generations = crate::telemetry::sidecar::read(project)?.as_deref()
+            .map(super::inputs::generations).transpose()?.flatten().unwrap_or_default();
+        Ok(Sources { project, tasks: Vec::new(), tasks_loaded: false, watermarks: None, bodies: BTreeMap::new(), canonical_inputs, input_generations, use_aggregates: true })
+    }
+
+    fn load_tasks(&mut self) -> Result<()> {
+        if !self.tasks_loaded { self.tasks = lifecycle::load(self.project)?; self.tasks_loaded = true; }
+        Ok(())
     }
 
     /// Where each source stood when read: canonical head and lifecycle input
@@ -205,7 +231,12 @@ impl<'a> Sources<'a> {
         if let Some(w) = &self.watermarks { return Ok(w.clone()); }
         let state = crate::telemetry::read_only(&self.project.join(".state/state.db"))?;
         let head: i64 = state.query_row("SELECT coalesce(max(sequence),0) FROM events", [], |r| r.get(0))?;
-        let canonical = json!({"events_head": head, "lifecycle_digest": lifecycle::digest(&self.tasks), "last_event_unix_ms": lifecycle::last_event(&self.tasks)});
+        let cached = if self.use_aggregates { crate::telemetry::sidecar::read(self.project)?.as_deref()
+            .map(|db| super::inputs::canonical_watermark(db, &self.canonical_inputs)).transpose()?.flatten() } else { None };
+        let canonical = match cached {
+            Some(body) => body,
+            None => { self.load_tasks()?; json!({"events_head": head, "lifecycle_digest": lifecycle::digest(&self.tasks), "last_event_unix_ms": lifecycle::last_event(&self.tasks)}) },
+        };
         let sidecar = match crate::telemetry::sidecar::read(self.project)? {
             None => Value::Null,
             Some(db) => {
@@ -233,15 +264,25 @@ impl<'a> Sources<'a> {
 
     /// The body `telemetry report --since <since>` prints for `id` from `provider`.
     fn body(&mut self, provider: Provider, id: &str, since: Option<i64>) -> Result<Option<Value>> {
-        let key = match provider { Provider::Central => "central".to_owned(), Provider::Lane(stream) => stream.to_owned(), _ => return Ok(None) };
+        let group = super::inputs::group(provider, id);
+        let key = group.to_owned();
         if !self.bodies.contains_key(&(since, key.clone())) {
+            let stamp = super::inputs::stamp(group, &self.canonical_inputs, &self.input_generations);
+            if self.use_aggregates && !super::inputs::clock(group)
+                && let Some(db) = crate::telemetry::sidecar::read(self.project)?
+                && let Some(body) = super::inputs::cached_metric(&db, group, id, since, &stamp)? { return Ok(Some(body)); }
             let map = match provider {
-                Provider::Central => crate::telemetry::metrics::central(self.project, since)?.0,
-                Provider::Lane(stream) => match crate::telemetry::LANES.iter().find(|l| l.stream == stream) {
-                    Some(lane) => (lane.metrics)(self.project, since)?,
-                    None => BTreeMap::new(),
-                },
-                _ => BTreeMap::new(),
+                    Provider::Central => {
+                        let (mut map, tasks) = crate::telemetry::metrics::central_uncached(self.project, since, self.use_aggregates)?;
+                        map.insert("_tasks".to_owned(), tasks);
+                        map
+                    },
+                    Provider::Lane("accounting") => crate::telemetry::accounting::metric_group_uncached(self.project, group, since, self.use_aggregates)?,
+                    Provider::Lane(stream) => match crate::telemetry::LANES.iter().find(|l| l.stream == stream) {
+                        Some(lane) => (lane.metrics)(self.project, since)?,
+                        None => BTreeMap::new(),
+                    },
+                    _ => BTreeMap::new(),
             };
             self.bodies.insert((since, key.clone()), map);
         }
@@ -275,6 +316,7 @@ pub fn evaluate(sources: &mut Sources, cell: &Cell) -> Result<(Value, Lineage)> 
     if let Some((reason, diagnostic)) = cell.unsupported() { return Ok((unavailable_core(reason, diagnostic), Lineage::new())); }
     match cell.version.provider {
         Provider::Native => {
+            sources.load_tasks()?;
             let request = lifecycle::Request { metric: cell.metric.id, cohort: cell.cohort, from: cell.from, to: cell.to, horizon: cell.horizon, by: cell.by.as_deref() };
             let (mut core, lineage) = lifecycle::evaluate(&sources.tasks, &request);
             if core["cells"].as_array().is_some_and(|cells| cells.len() > MAX_CELLS) {

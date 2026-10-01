@@ -362,6 +362,12 @@ fn late_usage_record_restates_lane_metric() {
     let f = Fixture::new();
     let path = f.rollout(&f.home, SID, &["head.jsonl"], &f.worktree(), f.decided + 1_000, "0.154.0");
     f.cli("collect");
+    let usage = || f.cli_args(&["query", "--json", "--metric", "M08,M09"]).0["results"].as_array().unwrap()
+        .iter().map(|r| (r["value"].clone(), r["detail"]["coverage"].clone())).collect::<Vec<_>>();
+    let replayed = usage();
+    assert_eq!(replayed[0].0, json!(1000));
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(usage(), replayed, "maintained aggregates preserve both totals and coverage");
     let first = f.cli_args(&["analytics", "refresh"]).0;
     let m08 = |out: &Value| out["appended"].as_array().unwrap().iter().find(|a| a["cell"]["metric"] == "M08").map(|a| a["revision"].as_i64().unwrap());
     let r1 = m08(&first).unwrap();
@@ -370,6 +376,8 @@ fn late_usage_record_restates_lane_metric() {
     let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
     std::io::Write::write_all(&mut file, tail.replace("@SID@", SID).replace("@CWD@", &f.worktree()).replace("@TS@", &ts).as_bytes()).unwrap();
     f.cli("collect");
+    assert_eq!(usage()[0].0, json!(1500), "reads remain live before sync and refresh");
+    f.cli_args(&["accounting", "sync"]);
     let r2 = m08(&f.cli_args(&["analytics", "refresh"]).0).expect("restated");
     let at = |seq: i64| f.cli_args(&["query", "--json", "--metric", "M08", "--as-of-seq", &seq.to_string()]).0["results"][0].clone();
     let (old, new) = (at(r1), at(r2));
@@ -380,6 +388,15 @@ fn late_usage_record_restates_lane_metric() {
     assert!(new["source_watermarks"]["sidecar"]["codex_usage_rowid"].as_i64() > old["source_watermarks"]["sidecar"]["codex_usage_rowid"].as_i64());
     let live = f.cli_args(&["query", "--json", "--metric", "M08"]).0["results"][0].clone();
     assert_eq!((&live["value"], &live["projection"]["matches_revision"]), (&json!(1500), &json!(r2)));
+    let before_rebuild = f.cli_args(&["analytics", "snapshot"]).1;
+    let verify = f.cli_args(&["analytics", "rebuild", "--verify"]).0;
+    assert_eq!(verify["identical"], true, "{verify}");
+    assert!(verify["cells"].as_array().unwrap().iter().all(|c| c["stored_intact"] == true));
+    f.cli_args(&["analytics", "rebuild"]);
+    assert_eq!(f.cli_args(&["analytics", "snapshot"]).1, before_rebuild, "incremental restatement and full evaluation are byte-identical");
+    let again = f.cli_args(&["analytics", "refresh"]).0;
+    assert_eq!(again["appended"], json!([]));
+    assert_eq!(again["unchanged"], again["cells"]);
 }
 
 /// Rebuilds reproduce revisions byte for byte: `rebuild --verify` on the same

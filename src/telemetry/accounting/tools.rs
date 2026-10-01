@@ -4,7 +4,8 @@
 //! `codex_tool_sources`) and A8 metadata (`codex_mcp_calls`,
 //! `codex_turn_aborts`, `codex_tool_namespaces`, `codex_agent_items`,
 //! `rollout_forks` as the re-read marker), read by SQL only; never any
-//! content. Nothing is stored. An MCP call is one call (its carrying `exec`
+//! content. Exact tallies and integer wait samples are maintained per session;
+//! reads before sync fall back to the same derivation. An MCP call is one call (its carrying `exec`
 //! call is matched by turn and time, `inferred`); a call ended by
 //! `turn_aborted` is `declined_or_aborted`, never accepted. Codex 0.154.0 writes no approval decision and no execution run
 //! time: the accepted stage is only inferred (a B6b `blocked` wait or a
@@ -14,7 +15,7 @@
 //! read yet makes the metrics `unavailable`, and an execution without a
 //! known outcome is counted apart, never as a success.
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -38,6 +39,7 @@ struct Exec { turn: Option<String>, status: Option<String>, source: Option<Strin
 struct Mcp { turn: Option<String>, server: Option<String>, tool: Option<String>, status: Option<String>, is_error: Option<i64>, completed: Option<i64> }
 
 /// A session's A6 and A8 metadata rows (never content: no such column exists).
+#[derive(Default)]
 struct Rows {
     calls: Vec<Call>,
     claude_results: Vec<(String, Option<bool>)>,
@@ -60,6 +62,7 @@ struct Rows {
 struct Session {
     id: String,
     attempts: BTreeSet<String>,
+    summary: Option<Tally>,
     tools: std::result::Result<Rows, &'static str>,
     waits: Vec<(i64, i64)>,
     guardians: Vec<i64>,
@@ -169,15 +172,16 @@ fn exists(db: &Connection, table: &str) -> Result<bool> {
 
 /// Sessions with a bound rollout started in the window, their tool rows or
 /// why they are unavailable, and the sessions excluded (by reason).
-fn sessions(db: &Connection, since: Option<i64>, blocked: &BTreeMap<String, Vec<(i64, i64)>>) -> Result<(Vec<Session>, BTreeMap<String, usize>)> {
+fn sessions(db: &Connection, since: Option<i64>, blocked: &BTreeMap<String, Vec<(i64, i64)>>, scoped: bool, summaries: bool) -> Result<(Vec<Session>, BTreeMap<String, usize>)> {
     let a6 = exists(db, "codex_tool_sources")? && exists(db, "codex_tool_calls")? && exists(db, "codex_exec_items")?;
     let a8 = A8_TABLES.iter().try_fold(true, |all, t| Ok::<_, anyhow::Error>(all && exists(db, t)?))?;
     let read = if a6 { "EXISTS(SELECT 1 FROM codex_tool_sources c WHERE c.path_digest=s.path_digest)" } else { "0" };
     // A source without a `rollout_forks` row was read before A8 and waits for its re-read.
     let reread = if a8 { "EXISTS(SELECT 1 FROM rollout_forks k WHERE k.path_digest=s.path_digest)" } else { "0" };
     type Source = (String, String, Option<String>, String, Option<i64>, bool, String, bool);
+    let scope = if scoped { " WHERE s.session_id IN (SELECT session_id FROM accounting_selected)" } else { "" };
     let sources: Vec<Source> = db.prepare(&format!("SELECT s.session_id,s.binding,s.attempt_id,s.cli_version,s.session_unix_ms,{read},s.home_digest,{reread}
-        FROM rollout_sources s ORDER BY s.session_id,s.path_digest"))?
+        FROM rollout_sources s{scope} ORDER BY s.session_id,s.path_digest"))?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?.collect::<rusqlite::Result<_>>()?;
     let guardians = guardians(db)?;
     let mut grouped = BTreeMap::<&str, Vec<&Source>>::new();
@@ -190,12 +194,16 @@ fn sessions(db: &Connection, since: Option<i64>, blocked: &BTreeMap<String, Vec<
         if bound.is_empty() { *excluded.entry(sources[0].1.clone()).or_default() += 1; continue; }
         if bound.iter().any(|s| !crate::telemetry::codex::accepted_version(&s.3)) { *excluded.entry("cli_version_uncertified".to_owned()).or_default() += 1; continue; }
         let attempts: BTreeSet<String> = bound.iter().filter_map(|s| s.2.clone()).collect();
+        let summary = if summaries {
+            let text: Option<String> = db.query_row("SELECT tally FROM accounting_tool_summary WHERE session_id=?1", [id], |r| r.get(0)).optional()?;
+            text.map(|text| serde_json::from_str::<Tally>(&text)).transpose()?
+        } else { None };
         let tools = if !a6 { Err("predates_collection") } else if sources.iter().any(|s| !s.5) { Err("pending_reread") }
-            else if !a8 { Err("predates_collection") } else if sources.iter().any(|s| !s.7) { Err("pending_reread") } else { Ok(rows(db, id)?) };
+            else if !a8 { Err("predates_collection") } else if sources.iter().any(|s| !s.7) { Err("pending_reread") } else { Ok(if summary.is_some() { Rows::default() } else { rows(db, id)? }) };
         let waits = attempts.iter().filter_map(|a| blocked.get(a)).flatten().copied().collect();
         let guardians = guardians.get(id).cloned().unwrap_or_default();
         let homes = sources.iter().map(|s| s.6.clone()).collect();
-        out.push(Session { id: id.to_owned(), attempts, tools, waits, guardians, homes });
+        out.push(Session { id: id.to_owned(), attempts, tools, summary, waits, guardians, homes });
     }
     Ok((out, excluded))
 }
@@ -258,7 +266,7 @@ fn rows(db: &Connection, session: &str) -> Result<Rows> {
 }
 
 /// Counts over observed sessions.
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Tally {
     issued: usize,
     by_name: BTreeMap<String, usize>,
@@ -282,8 +290,8 @@ struct Tally {
     claude_executed: usize,
     claude_succeeded: usize,
     claude_failed: usize,
-    claude_unknown: BTreeMap<&'static str, usize>,
-    unknown: BTreeMap<&'static str, usize>,
+    claude_unknown: BTreeMap<String, usize>,
+    unknown: BTreeMap<String, usize>,
     /// MCP calls (A8): per server and tool, their carrying `exec` call, outcome.
     mcp: usize,
     mcp_by_server: BTreeMap<String, BTreeMap<String, usize>>,
@@ -292,7 +300,7 @@ struct Tally {
     mcp_without_call: usize,
     mcp_succeeded: usize,
     mcp_failed: usize,
-    mcp_unknown: BTreeMap<&'static str, usize>,
+    mcp_unknown: BTreeMap<String, usize>,
     /// The carrying call's call → output wall time per MCP server and tool (`None`: unreported).
     mcp_waits: Vec<(Option<String>, Option<String>, i64)>,
     /// Collaboration calls (`spawn_agent`, `wait_agent`), the agent threads a
@@ -304,14 +312,30 @@ struct Tally {
     waits: Vec<(Option<String>, Option<String>, i64)>,
     negative: usize,
     /// Issued calls past `issued`, by inferred basis; the rest are unknown.
-    accepted: BTreeMap<&'static str, usize>,
+    accepted: BTreeMap<String, usize>,
     accepted_unknown: usize,
     /// Issued calls ended by their turn's `turn_aborted`, by basis: neither accepted nor unknown.
-    aborted: BTreeMap<&'static str, usize>,
+    aborted: BTreeMap<String, usize>,
 }
 
 impl Tally {
+    fn merge(&mut self, other: &Tally) {
+        macro_rules! counts { ($($field:ident),*) => { $(self.$field += other.$field;)* }; }
+        macro_rules! maps { ($($field:ident),*) => { $(for (key, count) in &other.$field { *self.$field.entry(key.clone()).or_default() += count; })* }; }
+        counts!(issued,name_unreported,status_unreported,without_output,outputs_without_call,executed,source_unreported,
+            attributed_name_unreported,unattributed,succeeded,failed,mcp,mcp_unnamed,mcp_carried,mcp_without_call,mcp_succeeded,mcp_failed,
+            collab_items,negative,accepted_unknown);
+        maps!(by_name,by_status,by_namespace,by_source,attributed,unknown,mcp_unknown,accepted,aborted);
+        for (server, tools) in &other.mcp_by_server {
+            for (tool, count) in tools { *self.mcp_by_server.entry(server.clone()).or_default().entry(tool.clone()).or_default() += count; }
+        }
+        self.spawned.extend(other.spawned.iter().cloned());
+        self.waits.extend(other.waits.iter().cloned());
+        self.mcp_waits.extend(other.mcp_waits.iter().cloned());
+    }
+
     fn add(&mut self, s: &Session, rows: &Rows) {
+        if let Some(summary) = &s.summary { self.merge(summary); return; }
         let (calls, items) = (&rows.calls, &rows.items);
         let count = |map: &mut BTreeMap<String, usize>, missing: &mut usize, key: &Option<String>| match key {
             Some(key) => *map.entry(key.clone()).or_default() += 1,
@@ -324,8 +348,8 @@ impl Tally {
             count(&mut self.by_status, &mut self.status_unreported, &c.status);
             if let Some(namespace) = rows.namespaces.get(&c.id) { *self.by_namespace.entry(namespace.clone()).or_default() += 1; }
             match (aborted(rows, c), s.accepted(c)) {
-                (Some(basis), _) => *self.aborted.entry(basis).or_default() += 1,
-                (None, Some(basis)) => *self.accepted.entry(basis).or_default() += 1,
+                (Some(basis), _) => *self.aborted.entry(basis.to_owned()).or_default() += 1,
+                (None, Some(basis)) => *self.accepted.entry(basis.to_owned()).or_default() += 1,
                 (None, None) => self.accepted_unknown += 1,
             }
             match (c.called, c.output) {
@@ -374,7 +398,7 @@ impl Tally {
             match outcome(e) {
                 Ok(true) => self.succeeded += 1,
                 Ok(false) => self.failed += 1,
-                Err(reason) => *self.unknown.entry(reason).or_default() += 1,
+                Err(reason) => *self.unknown.entry(reason.to_owned()).or_default() += 1,
             }
         }
         for (m, carrier) in rows.mcp.iter().zip(carriers(calls, &rows.mcp)) {
@@ -397,7 +421,7 @@ impl Tally {
             match mcp_outcome(m) {
                 Ok(true) => self.mcp_succeeded += 1,
                 Ok(false) => self.mcp_failed += 1,
-                Err(reason) => *self.mcp_unknown.entry(reason).or_default() += 1,
+                Err(reason) => *self.mcp_unknown.entry(reason.to_owned()).or_default() += 1,
             }
         }
         let collaboration: BTreeSet<&str> = rows.namespaces.iter().filter(|(_, n)| *n == COLLABORATION).map(|(id, _)| id.as_str()).collect();
@@ -495,10 +519,10 @@ fn computed(list: &[Session], coverage: &Value) -> BTreeMap<String, Value> {
         m16["executed"]["opencode_basis"] = json!("fixture: distinct native tool part id; completed/error states only");
     }
     let mut unknown = t.unknown.clone();
-    for (reason, n) in &t.mcp_unknown { *unknown.entry(reason).or_default() += n; }
+    for (reason, n) in &t.mcp_unknown { *unknown.entry(reason.to_owned()).or_default() += n; }
     let (succeeded, failed) = (t.succeeded + t.mcp_succeeded, t.failed + t.mcp_failed);
     let terminal = succeeded + failed;
-    let scope = |succeeded: usize, failed: usize, unknown: &BTreeMap<&str, usize>| json!({"succeeded": succeeded, "failed": failed,
+    let scope = |succeeded: usize, failed: usize, unknown: &BTreeMap<String, usize>| json!({"succeeded": succeeded, "failed": failed,
         "unknown": {"executions": unknown.values().sum::<usize>(), "by_reason": unknown}});
     let mut command_unknown = t.unknown.clone();
     command_unknown.remove("is_error_unreported");
@@ -567,10 +591,55 @@ fn coverage(list: &[Session], excluded: &BTreeMap<String, usize>) -> Value {
         "predates_collection": count("predates_collection"), "excluded": excluded})
 }
 
+fn summaries_current(project: &Path, db: &Connection) -> Result<bool> {
+    if !super::ledger::aggregates_current(db)? { return Ok(false); }
+    let Some(generations) = crate::telemetry::analytics::inputs::generations(db)? else { return Ok(false); };
+    let canonical = crate::telemetry::analytics::inputs::canonical(project)?;
+    let stamp = crate::telemetry::analytics::inputs::stamp("tools", &canonical, &generations);
+    Ok(db.query_row("SELECT inputs=?1 FROM accounting_tool_frontier WHERE singleton=1", [stamp], |r| r.get(0)).optional()?.unwrap_or(false))
+}
+
+/// Replace only replayed sessions' exact tallies. Wait durations are retained
+/// as integers: aggregate nearest-rank distributions use the same sample set.
+pub(crate) fn store(project: &Path, db: &Connection, full: bool) -> Result<()> {
+    let canonical = crate::telemetry::analytics::inputs::canonical(project)?;
+    let canonical_text = serde_json::to_string(&canonical)?;
+    let previous: Option<String> = db.query_row("SELECT canonical FROM accounting_tool_frontier WHERE singleton=1", [], |r| r.get(0)).optional()?;
+    let all = full || previous.as_deref() != Some(canonical_text.as_str());
+    if all {
+        db.execute_batch("DELETE FROM accounting_tool_summary;
+            INSERT OR IGNORE INTO accounting_selected SELECT session_id FROM rollout_sources;")?;
+    } else {
+        // New guardian evidence changes the parent session's approval inference.
+        db.execute_batch("INSERT OR IGNORE INTO accounting_selected SELECT claimed_parent_session_id FROM session_graph_nodes
+            WHERE session_id IN (SELECT session_id FROM accounting_selected) AND claimed_parent_session_id IS NOT NULL;")?;
+    }
+    let selected: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM accounting_selected)", [], |r| r.get(0))?;
+    if selected {
+        db.execute_batch("DELETE FROM accounting_tool_summary WHERE session_id IN (SELECT session_id FROM accounting_selected);")?;
+        let blocked = super::attention::blocked_spans(project, db)?;
+        let (list, _) = sessions(db, None, &blocked, true, false)?;
+        let mut insert = db.prepare_cached("INSERT INTO accounting_tool_summary(session_id,tally) VALUES(?1,?2)")?;
+        for s in &list {
+            if let Ok(rows) = &s.tools {
+                let mut tally = Tally::default();
+                tally.add(s, rows);
+                insert.execute(rusqlite::params![s.id, serde_json::to_string(&tally)?])?;
+            }
+        }
+    }
+    let generations = crate::telemetry::analytics::inputs::generations(db)?.unwrap_or_default();
+    let stamp = crate::telemetry::analytics::inputs::stamp("tools", &canonical, &generations);
+    db.execute("INSERT INTO accounting_tool_frontier(singleton,canonical,inputs) VALUES(1,?1,?2)
+        ON CONFLICT(singleton) DO UPDATE SET canonical=excluded.canonical,inputs=excluded.inputs", rusqlite::params![canonical_text, stamp])?;
+    Ok(())
+}
+
 /// `accounting tools`: per bound session its tool call and execution counts
 /// (or why they are unavailable), the coverage and M16–M18. Read-only.
 pub fn read(project: &Path, db: &Connection) -> Result<Value> {
-    let (list, excluded) = sessions(db, None, &super::attention::blocked_spans(project, db)?)?;
+    let _snapshot = db.is_autocommit().then(|| db.unchecked_transaction()).transpose()?;
+    let (list, excluded) = sessions(db, None, &super::attention::blocked_spans(project, db)?, false, summaries_current(project, db)?)?;
     let coverage = coverage(&list, &excluded);
     let sessions: Vec<Value> = list.iter().map(|s| {
         let tools = match &s.tools {
@@ -592,8 +661,13 @@ pub fn read(project: &Path, db: &Connection) -> Result<Value> {
 
 /// M16–M18 for `telemetry <slug> report` (sessions started in the window).
 pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> {
+    metrics_with(project, since, true)
+}
+
+pub(crate) fn metrics_with(project: &Path, since: Option<i64>, aggregates: bool) -> Result<BTreeMap<String, Value>> {
     let Some(db) = crate::telemetry::sidecar::read(project)? else { return Ok(unavailable_metrics("collection_not_run", None)) };
-    let (list, excluded) = sessions(&db, since, &super::attention::blocked_spans(project, &db)?)?;
+    let _snapshot = db.unchecked_transaction()?;
+    let (list, excluded) = sessions(&db, since, &super::attention::blocked_spans(project, &db)?, false, aggregates && summaries_current(project, &db)?)?;
     Ok(computed(&list, &coverage(&list, &excluded)))
 }
 

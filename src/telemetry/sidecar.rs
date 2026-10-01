@@ -129,6 +129,7 @@ pub(crate) fn migrate(db: &mut Connection) -> Result<()> {
         }
     }
     if upgraded { super::accounting::ledger::invalidate(&tx, "schema_upgrade")?; }
+    super::analytics::inputs::install(&tx)?;
     tx.commit()?;
     Ok(())
 }
@@ -197,6 +198,40 @@ pub fn report(project: &Path) -> Result<Value> {
         out.push(json!({"attempt_id": attempt.id, "usage": usage, "after_termination": after_termination}));
     }
     Ok(json!({"attempts": out, "sessions": sessions}))
+}
+
+/// Central reports need only the diagnostic after-termination rows, not the
+/// complete native usage projection for every retained attempt.
+pub(crate) fn after_termination_report(project: &Path) -> Result<Vec<Value>> {
+    let Some(db) = read(project)? else { return Ok(Vec::new()); };
+    if db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='accounting_termination_summary')", [], |r| r.get::<_, bool>(0))?
+        && let Some(generations) = super::analytics::inputs::generations(&db)? {
+        let stamp = super::analytics::inputs::stamp("diagnostics", &super::analytics::inputs::canonical(project)?, &generations);
+        let body: Option<String> = db.query_row("SELECT body FROM accounting_termination_summary WHERE inputs=?1", [&stamp], |r| r.get(0)).optional()?;
+        if let Some(body) = body { return Ok(serde_json::from_str(&body)?); }
+    }
+    termination_summary_raw(project, &db)
+}
+
+fn termination_summary_raw(project: &Path, db: &Connection) -> Result<Vec<Value>> {
+    let mut out = Vec::new();
+    for attempt in super::codex::canonical_attempts(project)? {
+        let diagnostic = after_termination(db, &attempt.id, attempt.terminated_unix_ms())?;
+        if diagnostic["records"].as_i64().is_some_and(|n| n > 0) {
+            out.push(json!({"attempt_id": attempt.id, "after_termination": diagnostic, "accounting": "still counted in M08"}));
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn store_termination_summary(project: &Path, db: &Connection) -> Result<()> {
+    let generations = super::analytics::inputs::generations(db)?.unwrap_or_default();
+    let stamp = super::analytics::inputs::stamp("diagnostics", &super::analytics::inputs::canonical(project)?, &generations);
+    if db.query_row("SELECT EXISTS(SELECT 1 FROM accounting_termination_summary WHERE inputs=?1)", [&stamp], |r| r.get::<_, bool>(0))? { return Ok(()); }
+    let body = termination_summary_raw(project, db)?;
+    db.execute("INSERT INTO accounting_termination_summary VALUES(1,?1,?2)
+        ON CONFLICT(singleton) DO UPDATE SET inputs=excluded.inputs,body=excluded.body", rusqlite::params![stamp, serde_json::to_string(&body)?])?;
+    Ok(())
 }
 
 /// `report` for the terminal: one line per attempt, then one per rollout.

@@ -1219,6 +1219,11 @@ fn tool_volume_success_and_latency_are_honest() {
     // Read-only and replayable: a second collect changes nothing.
     f.cli("collect");
     assert_eq!(f.cli_args(&["accounting", "tools", "--json"]).1, first);
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "tools", "--json"]).1, first,
+        "the maintained session summaries preserve every count, inference and percentile");
+    f.cli_args(&["analytics", "refresh"]);
+    assert_eq!(f.cli_args(&["analytics", "rebuild", "--verify"]).0["identical"], true);
 }
 
 /// A sidecar without the A6 tables (read-only, before the collect that
@@ -2385,6 +2390,12 @@ fn accounting_reread_and_retention_record_full_rebuild_reasons() {
     assert_eq!(status["sync"]["mode"], "full_rebuild");
     assert_eq!(status["sync"]["rebuild_reason"], "retention_enforcement");
     assert_eq!(f.cli_args(&["accounting", "entries"]).0, json!({"entries": []}));
+    let query = f.cli_args(&["query", "--metric", "M08,M09", "--json"]).0;
+    for metric in query["results"].as_array().unwrap() {
+        assert_eq!(metric["value"], json!({"status": "unavailable", "reason": "no_certified_source"}));
+    }
+    f.cli_args(&["analytics", "refresh"]);
+    assert_eq!(f.cli_args(&["analytics", "rebuild", "--verify"]).0["identical"], true);
 }
 
 #[test]
@@ -2438,12 +2449,20 @@ fn restored_accounting_frontier_requires_a_full_rebuild() {
     f.cli("collect");
     f.cli_args(&["accounting", "sync"]);
     let first = f.cli_args(&["accounting", "entries"]).1;
+    let metrics = || f.cli_args(&["query", "--metric", "M08,M09", "--json"]).0["results"].as_array().unwrap()
+        .iter().map(|r| (r["value"].clone(), r["coverage"].clone())).collect::<Vec<_>>();
+    let aggregate = metrics();
+    assert_eq!(aggregate[0].0, json!(1000));
+    assert_eq!(aggregate[1].0, json!(300));
+    f.cli_args(&["analytics", "refresh"]);
     let backup = f.tmp.path().join("accounting-backup");
     f.cli_args(&["backup", "create", "--out", backup.to_str().unwrap()]);
     f.cli_args(&["backup", "restore", "--from", backup.to_str().unwrap(), "--force"]);
+    assert_eq!(metrics(), aggregate, "invalidated aggregates fall back to native replay");
     f.cli_args(&["accounting", "sync"]);
     assert_eq!(f.cli_args(&["accounting", "status"]).0["sync"]["rebuild_reason"], "sidecar_restore");
     assert_eq!(f.cli_args(&["accounting", "entries"]).1, first);
+    assert_eq!(metrics(), aggregate, "restore rebuild preserves the aggregate answers");
     f.sidecar().execute("UPDATE accounting_stream SET watermark=sequence+1", []).unwrap();
     f.cli_args(&["accounting", "sync"]);
     assert_eq!(f.cli_args(&["accounting", "status"]).0["sync"]["rebuild_reason"], "watermark_inconsistent");

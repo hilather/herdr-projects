@@ -33,7 +33,8 @@ pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/ac
     include_str!("../../../migrations/telemetry/accounting/0011_quota_window_lookup.sql"),
     include_str!("../../../migrations/telemetry/accounting/0012_incremental_sync.sql"),
     include_str!("../../../migrations/telemetry/accounting/0013_claude_code.sql"),
-    include_str!("../../../migrations/telemetry/accounting/0014_opencode.sql")];
+    include_str!("../../../migrations/telemetry/accounting/0014_opencode.sql"),
+    include_str!("../../../migrations/telemetry/accounting/0015_read_aggregates.sql")];
 
 /// `herdr-projects telemetry <slug> accounting ...`
 #[derive(clap::Subcommand)]
@@ -134,7 +135,7 @@ pub enum Command {
         json: bool,
     },
     /// Tool calls and command executions per bound session (A6 metadata only),
-    /// with coverage and M16–M18. Derived at read time; read-only.
+    /// with coverage and M16–M18. Maintained summaries with live fallback; read-only.
     Tools {
         /// Print JSON instead of text.
         #[arg(long)]
@@ -293,14 +294,44 @@ fn with_availability(mut metrics: BTreeMap<String, Value>) -> BTreeMap<String, V
 /// `attention_not_collected` entries), M16–M18 (§9), M34–M37 (§10),
 /// M12/M14 (§12), M11 (§13) and M04 (§14).
 pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> {
-    let mut metrics = usage_metrics(project, since)?;
-    metrics.extend(cost::metrics(project, since)?);
-    metrics.extend(charges::metrics(project, since)?);
-    metrics.extend(budget::metrics(project, since)?);
-    metrics.extend(attention::metrics(project, since)?);
-    metrics.extend(tools::metrics(project, since)?);
-    metrics.extend(fleet::metrics(project, since)?);
+    let mut metrics = BTreeMap::new();
+    metrics.extend(metrics_without_attention(project, since)?);
+    metrics.extend(metric_group(project, "attention", since)?);
     Ok(metrics)
+}
+
+pub(crate) fn metrics_without_attention(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> {
+    let mut metrics = BTreeMap::new();
+    for group in ["usage", "cost", "charges", "budget", "tools", "fleet"] {
+        metrics.extend(metric_group(project, group, since)?);
+    }
+    Ok(metrics)
+}
+
+/// Query only the requested metric family; M08 must not build tool, fleet,
+/// cost and attention reports as a side effect.
+pub(crate) fn metric_group(project: &Path, group: &str, since: Option<i64>) -> Result<BTreeMap<String, Value>> {
+    if !super::analytics::inputs::clock(group) && let Some(db) = super::sidecar::read(project)?
+        && let Some(generations) = super::analytics::inputs::generations(&db)? {
+        let canonical = super::analytics::inputs::canonical(project)?;
+        let stamp = super::analytics::inputs::stamp(group, &canonical, &generations);
+        if let Some(body) = super::analytics::inputs::cached(&db, group, since, &stamp)? {
+            return match body { Value::Object(values) => Ok(values.into_iter().collect()), body => Ok(serde_json::from_value(body)?) };
+        }
+    }
+    metric_group_uncached(project, group, since, true)
+}
+
+pub(crate) fn metric_group_uncached(project: &Path, group: &str, since: Option<i64>, aggregates: bool) -> Result<BTreeMap<String, Value>> {
+    match group {
+        "usage" => usage_metrics_with(project, since, aggregates),
+        "cost" => cost::metrics_with(project, since, aggregates),
+        "charges" => charges::metrics(project, since),
+        "budget" => budget::metrics(project, since),
+        "attention" => attention::metrics(project, since),
+        "tools" => tools::metrics_with(project, since, aggregates),
+        _ => fleet::metrics_with(project, since, aggregates),
+    }
 }
 
 /// Contracts §6 M08/M09, replacing the central ones with the same numbers:
@@ -308,23 +339,32 @@ pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Va
 /// needed) of certified sessions, i.e. with a source bound to a known attempt,
 /// not quarantined, of a certified version, with every record accepted,
 /// started in the window.
-fn usage_metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> {
+fn usage_metrics_with(project: &Path, since: Option<i64>, aggregates: bool) -> Result<BTreeMap<String, Value>> {
     let both = |m08: Value, m09: Value| with_availability(BTreeMap::from([("M08".to_owned(), metric("M08", "input_tokens", m08)),
         ("M09".to_owned(), metric("M09", "output_tokens", m09))]));
     let Some(db) = super::sidecar::read(project)? else {
         let body = json!({"value": unavailable("no_certified_source")});
         return Ok(both(body.clone(), body));
     };
+    // The frontier, certification and totals must describe one SQLite
+    // snapshot while collectors and syncs race with this read.
+    let _snapshot = db.unchecked_transaction()?;
     let state = project.join(".state/state.db");
     let known: BTreeSet<String> = if state.exists() {
         super::read_only(&state)?.prepare("SELECT id FROM attempts")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
     } else { BTreeSet::new() };
     // A source holding rows stored while its version was uncertified stays uncertified.
     type Source = (String, String, Option<String>, String, bool, Option<i64>, bool);
-    let sources: Vec<Source> = db.prepare("SELECT s.session_id,s.binding,s.attempt_id,
+    let sql = if aggregates && ledger::aggregates_current(&db)? {
+        "SELECT s.session_id,s.binding,s.attempt_id,CASE WHEN a.uncertified THEN '' ELSE s.cli_version END,
+        a.quarantined,s.session_unix_ms,a.rejected FROM rollout_sources s JOIN accounting_source_summary a USING(path_digest) ORDER BY s.path_digest"
+    } else {
+        "SELECT s.session_id,s.binding,s.attempt_id,
         CASE WHEN EXISTS(SELECT 1 FROM codex_usage u WHERE u.path_digest=s.path_digest AND u.reason='cli_version_uncertified') THEN '' ELSE s.cli_version END,
         EXISTS(SELECT 1 FROM codex_quarantine q WHERE q.session_id=s.session_id),s.session_unix_ms,
-        EXISTS(SELECT 1 FROM codex_usage u WHERE u.session_id=s.session_id AND u.reason='invariant_violation') FROM rollout_sources s ORDER BY s.path_digest")?
+        EXISTS(SELECT 1 FROM codex_usage u WHERE u.session_id=s.session_id AND u.reason='invariant_violation') FROM rollout_sources s ORDER BY s.path_digest"
+    };
+    let sources: Vec<Source> = db.prepare(sql)?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?.collect::<rusqlite::Result<_>>()?;
     let (mut certified, mut excluded) = (BTreeSet::new(), BTreeMap::<&str, usize>::new());
     for (session, binding, attempt, version, quarantined, at, rejected) in &sources {
@@ -341,9 +381,17 @@ fn usage_metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, 
         return Ok(both(body.clone(), body));
     }
     let (mut input, mut output, mut reasoning) = (0, 0, 0);
-    for entry in ledger::derive(&db)?.iter().filter(|e| e.counted() && certified.contains(e.session.as_str())) {
-        let Some(n) = entry.normalized else { continue };
-        (input, output, reasoning) = (input + n[0], output + n[4], reasoning + n[5]);
+    if aggregates && ledger::aggregates_current(&db)? {
+        let mut totals = db.prepare("SELECT input_tokens,output_tokens,reasoning_tokens FROM accounting_usage_totals WHERE session_id=?1")?;
+        for session in &certified {
+            let (i, o, r): (i64, i64, i64) = totals.query_row([session], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            (input, output, reasoning) = (input + i, output + o, reasoning + r);
+        }
+    } else {
+        for entry in ledger::derive(&db)?.iter().filter(|e| e.counted() && certified.contains(e.session.as_str())) {
+            let Some(n) = entry.normalized else { continue };
+            (input, output, reasoning) = (input + n[0], output + n[4], reasoning + n[5]);
+        }
     }
     let reasoning = if certified.iter().any(|s| s.starts_with("claude-code:")) { unavailable("reasoning_tokens_not_reported") } else { json!(reasoning) };
     Ok(both(json!({"value": input, "coverage": coverage}), json!({"value": output, "reasoning_output_tokens": reasoning, "coverage": coverage})))

@@ -123,7 +123,7 @@ Plan doc 07 §1. `T`/`A` evidence is exactly contracts §6 (`metrics::task_evide
   classification, else `unclassified`), `agent_kind` (the attempts' effective
   profile kind, `mixed`, `unknown` or `unassigned`). At most 64 cells.
 
-## 4. Aggregate revisions (stream `analytics`, version 2)
+## 4. Aggregate revisions (stream `analytics`, version 3)
 
 `migrations/telemetry/analytics/0001_aggregate_revisions.sql`:
 

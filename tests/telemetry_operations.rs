@@ -279,7 +279,7 @@ fn attention_health_and_analytics_expire_without_losing_current_views() {
         CREATE TRIGGER analytics_workspace_metrics_no_delete BEFORE DELETE ON analytics_workspace_metrics BEGIN SELECT RAISE(ABORT,'legacy immutable'); END;
         CREATE TRIGGER analytics_workspace_comparisons_no_delete BEFORE DELETE ON analytics_workspace_comparisons BEGIN SELECT RAISE(ABORT,'legacy immutable'); END;").unwrap();
     f.cli_args(&["analytics", "refresh"]);
-    assert_eq!(json_of(&f, &["analytics", "status"])["version"], 2);
+    assert_eq!(json_of(&f, &["analytics", "status"])["version"], 3);
     let due = plan(&f);
     assert_eq!(class(&due, "sidecar.attention_samples")["eligible"], json!([{"key": "attempt:gone-attempt", "samples": 2}]));
     assert_eq!(class(&due, "sidecar.attention_samples")["blocked"], json!([{"key": format!("attempt:{}", f.attempt), "reason": "attempt_not_terminal"}]));

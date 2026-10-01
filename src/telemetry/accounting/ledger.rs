@@ -124,6 +124,9 @@ fn derive_scoped(db: &Connection, scoped: bool) -> Result<Vec<Entry>> {
 /// together. Invalidated bases replay the complete history. Counts describe the
 /// whole projection, as before incremental sync.
 pub fn sync(db: &mut Connection) -> Result<Value> {
+    let project = db.path().map(std::path::Path::new).and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent).filter(|project| project.join(".state/state.db").is_file()).map(std::path::Path::to_path_buf);
+
     // Immediate: racing syncs (ticker and CLI) serialize on the write lock.
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (sequence, watermark, invalidated): (i64, i64, Option<String>) = tx.query_row(
@@ -161,12 +164,45 @@ pub fn sync(db: &mut Connection) -> Result<Value> {
         }
     }
     let (sessions, segments) = super::graph::store_scoped(&tx, &entries, full)?;
+    let quota_floor: Option<i64> = tx.query_row("SELECT min(observed_unix_ms) FROM quota_window_observations
+        WHERE session_id IN (SELECT session_id FROM accounting_selected) OR (SELECT quota_rebuild FROM accounting_stream WHERE singleton=1)=1", [], |r| r.get(0))?;
     let windows = super::quota::store_scoped(&tx, full)?;
+    let new_floor: Option<i64> = tx.query_row("SELECT min(observed_unix_ms) FROM quota_window_observations
+        WHERE session_id IN (SELECT session_id FROM accounting_selected)", [], |r| r.get(0))?;
+    let quota_floor = match (quota_floor, new_floor) { (Some(a), Some(b)) => Some(a.min(b)), (a, b) => a.or(b) };
+    if full { tx.execute_batch("DELETE FROM accounting_usage_totals; DELETE FROM accounting_native_totals; DELETE FROM accounting_source_summary;")?; }
+    else { tx.execute_batch("DELETE FROM accounting_usage_totals WHERE session_id IN (SELECT session_id FROM accounting_selected);
+        DELETE FROM accounting_native_totals WHERE session_id IN (SELECT session_id FROM accounting_selected);
+        DELETE FROM accounting_source_summary WHERE session_id IN (SELECT session_id FROM accounting_selected);")?; }
+    tx.execute_batch("INSERT INTO accounting_usage_totals
+        SELECT s.session_id,coalesce(sum(e.input_tokens),0),coalesce(sum(e.output_tokens),0),coalesce(sum(e.reasoning_tokens),0)
+        FROM accounting_selected s LEFT JOIN usage_entries e ON e.session_id=s.session_id AND e.basis='delta'
+        AND EXISTS(SELECT 1 FROM usage_dispositions d WHERE d.entry_id=e.entry_id AND d.disposition='accepted') GROUP BY s.session_id;
+        INSERT INTO accounting_native_totals
+        SELECT s.session_id,coalesce(sum(u.input_tokens),0),coalesce(sum(u.output_tokens),0),coalesce(sum(u.reasoning_output_tokens),0),count(u.ordinal),count(u.model)
+        FROM accounting_selected s LEFT JOIN codex_usage u ON u.session_id=s.session_id AND u.accepted=1
+        AND NOT EXISTS(SELECT 1 FROM codex_usage e WHERE e.session_id=u.session_id AND e.accepted=1 AND e.response_id IS NOT NULL
+            AND e.response_id=u.response_id AND e.payload_digest=u.payload_digest AND e.ordinal<u.ordinal) GROUP BY s.session_id;
+        INSERT INTO accounting_source_summary
+        SELECT s.path_digest,s.session_id,
+        EXISTS(SELECT 1 FROM codex_usage u WHERE u.path_digest=s.path_digest AND u.reason='cli_version_uncertified'),
+        EXISTS(SELECT 1 FROM codex_quarantine q WHERE q.session_id=s.session_id),
+        EXISTS(SELECT 1 FROM codex_usage u WHERE u.session_id=s.session_id AND u.reason='invariant_violation'),
+        (SELECT count(*) FROM codex_usage u WHERE u.path_digest=s.path_digest AND u.accepted=1)
+        FROM rollout_sources s WHERE s.session_id IN (SELECT session_id FROM accounting_selected);")?;
     tx.execute("INSERT INTO usage_ledger(singleton,normalization_version,synced_unix_ms) VALUES(1,?1,?2)
         ON CONFLICT(singleton) DO UPDATE SET normalization_version=excluded.normalization_version,synced_unix_ms=excluded.synced_unix_ms",
         params![NORMALIZATION, jiff::Timestamp::now().as_millisecond()])?;
     tx.execute("UPDATE accounting_stream SET watermark=?1,invalidated=NULL,last_mode=?2,last_reason=?3 WHERE singleton=1",
         params![sequence, if full { "full_rebuild" } else { "incremental" }, reason])?;
+    if let Some(project) = project.as_deref() {
+        super::quota::store_dispatch(project, &tx, full, quota_floor)?;
+        super::tools::store(project, &tx, full)?;
+        super::fleet::store(project, &tx)?;
+        super::cost::store_metrics(&tx)?;
+        crate::telemetry::analytics::inputs::store_canonical(project, &tx)?;
+        crate::telemetry::sidecar::store_termination_summary(project, &tx)?;
+    }
     tx.execute_batch("DELETE FROM accounting_dirty_sessions;")?;
     // Preserve the public sync counts: they describe the entire stored projection.
     let entry_count: i64 = tx.query_row("SELECT count(*) FROM usage_entries", [], |r| r.get(0))?;
@@ -183,6 +219,14 @@ pub fn sync(db: &mut Connection) -> Result<Value> {
 fn synced(db: &Connection) -> Result<bool> {
     Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='usage_ledger')", [], |r| r.get::<_, bool>(0))?
         && db.query_row("SELECT 1 FROM usage_ledger", [], |_| Ok(())).optional()?.is_some())
+}
+
+/// Reads must remain live between collect and sync, and on pre-aggregate
+/// stores. Only a complete, non-invalidated projection may replace replay.
+pub(crate) fn aggregates_current(db: &Connection) -> Result<bool> {
+    let table: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='accounting_usage_totals')", [], |r| r.get(0))?;
+    Ok(table && db.query_row("SELECT watermark=sequence AND invalidated IS NULL AND watermark>=0
+        AND NOT EXISTS(SELECT 1 FROM accounting_dirty_sessions) FROM accounting_stream WHERE singleton=1", [], |r| r.get(0))?)
 }
 
 /// `(disposition, reason, count)`: see `open_dispositions`.

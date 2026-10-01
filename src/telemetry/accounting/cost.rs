@@ -630,6 +630,7 @@ fn run(db: &mut Connection, gate: Option<crate::telemetry::codex::Budget>) -> Re
         && same(latest)?
     {
         record(&tx, latest.0)?;
+        store_metrics(&tx)?;
         tx.commit()?;
         return Ok(json!({"revision": latest.0, "appended": false, "entries": out.len()}));
     }
@@ -653,6 +654,7 @@ fn run(db: &mut Connection, gate: Option<crate::telemetry::codex::Budget>) -> Re
         tx.execute("INSERT INTO valuation_deltas(revision,entry_id,removed) VALUES(?1,?2,1)", params![revision, id])?;
     }
     record(&tx, revision)?;
+    store_metrics(&tx)?;
     tx.commit()?;
     Ok(json!({"revision": revision, "appended": true, "entries": out.len(), "stored": {"changed": changed.len(), "removed": removed.len()}}))
 }
@@ -973,11 +975,24 @@ fn unavailable_metrics(reason: &str) -> BTreeMap<String, Value> {
 /// of the entries valued. Unknown is never 0.
 pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> {
     let Some(db) = crate::telemetry::sidecar::read(project)? else { return Ok(unavailable_metrics("collection_not_run")) };
-    let Some((revision, basis, policy, synced, _)) = header(&db, None, None)? else { return Ok(unavailable_metrics("not_priced")) };
+    metrics_db(&db, since, true)
+}
+
+pub(crate) fn metrics_with(project: &Path, since: Option<i64>, aggregates: bool) -> Result<BTreeMap<String, Value>> {
+    let Some(db) = crate::telemetry::sidecar::read(project)? else { return Ok(unavailable_metrics("collection_not_run")) };
+    metrics_db(&db, since, aggregates)
+}
+
+fn metrics_db(db: &Connection, since: Option<i64>, aggregates: bool) -> Result<BTreeMap<String, Value>> {
+    let Some((revision, basis, policy, synced, _)) = header(db, None, None)? else { return Ok(unavailable_metrics("not_priced")) };
+    if aggregates && since.is_none() && table(db, "accounting_cost_aggregates")? {
+        let body: Option<String> = db.query_row("SELECT body FROM accounting_cost_aggregates WHERE revision=?1", [revision], |r| r.get(0)).optional()?;
+        if let Some(body) = body { return Ok(serde_json::from_str(&body)?); }
+    }
     let starts: BTreeMap<String, Option<i64>> = db.prepare("SELECT session_id,min(session_unix_ms) FROM rollout_sources GROUP BY session_id")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
     let mut entries = Vec::new();
-    for s in stored_at(&db, revision)?.values() {
+    for s in stored_at(db, revision)?.values() {
         if since.is_some_and(|since| starts.get(&s.session_id).copied().flatten().is_none_or(|at| at < since)) { continue; }
         entries.push(json!({"valuation": valuation(s, &basis)?}));
     }
@@ -1001,6 +1016,16 @@ pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Va
     m14["unit"] = json!("entries");
     m14["detail"] = json!("count coverage of valued invocations (delta entries), not a share of monetary value: an unpriced entry may be the expensive one");
     Ok(BTreeMap::from([("M12".to_owned(), metric("M12", m12)), ("M14".to_owned(), metric("M14", m14))]))
+}
+
+pub(crate) fn store_metrics(db: &Connection) -> Result<()> {
+    let Some((revision, ..)) = header(db, None, None)? else { return Ok(()); };
+    let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM accounting_cost_aggregates WHERE revision=?1)", [revision], |r| r.get(0))?;
+    if !exists {
+        let body = metrics_db(db, None, false)?;
+        db.execute("INSERT INTO accounting_cost_aggregates(revision,body) VALUES(?1,?2)", params![revision, serde_json::to_string(&body)?])?;
+    }
+    Ok(())
 }
 
 fn text_estimate(estimate: &Value, coverage: &Value) -> String {

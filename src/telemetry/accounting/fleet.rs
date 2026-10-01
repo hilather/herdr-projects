@@ -1,6 +1,6 @@
 //! Fleet efficiency (docs/telemetry/contracts-accounting.md §10; plan
 //! TM2.8, doc 07 M34–M37, doc 10 §5a "Fan-out" and "Coordinator overhead"),
-//! derived at read time (nothing is stored): attempt lifecycle marks
+//! derived from a maintained lifecycle input projection: attempt lifecycle marks
 //! (contracts §4: an attempt is active from its `running` mark to its terminal
 //! mark), dispatch decisions with their task classification, acceptance
 //! evidence (contracts §6 `A`), integration operations and the owner's
@@ -14,7 +14,7 @@
 //! superseded because a sibling changed the same area. The coordinator has no
 //! canonical attempt, so its time and cost never enter a worker figure.
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -92,12 +92,14 @@ impl Ord for Q {
 /// A worker attempt's known active interval `[from, to)`, with its task mix
 /// key and its dispatch decision's agent configuration.
 /// `open`: no terminal mark yet, so `to` is the read's horizon (now), not an end.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Run { attempt: String, task: String, from: i64, to: i64, mix: String, config: Option<String>, open: bool }
 
 /// An integration operation of an attempt: (ref, state, reason, created, integrated).
 type Op = (String, String, Option<String>, i64, bool);
 
 /// Canonical inputs, read once.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Fleet {
     horizon: i64,
     runs: Vec<Run>,
@@ -105,7 +107,7 @@ struct Fleet {
     /// marked), with that attempt's configuration and whether the span ends at
     /// the horizon (no terminal mark) rather than at a marked end.
     unknown: Vec<(i64, i64, Option<String>, bool)>,
-    coverage: BTreeMap<&'static str, usize>,
+    coverage: BTreeMap<String, usize>,
     /// First acceptance evidence time per accepted task (contracts §6 `A`),
     /// with the configuration of the attempt that produced it.
     accepted: Vec<(i64, Option<String>)>,
@@ -135,8 +137,8 @@ fn load(db: &Connection, horizon: i64) -> Result<std::result::Result<Fleet, &'st
     let configs: BTreeMap<String, Option<String>> = rows.iter().map(|r| (r.0.clone(), r.6.clone())).collect();
     let log_start = rows.iter().filter_map(|r| r.2).min();
     let (mut runs, mut unknown, mut coverage) = (Vec::new(), Vec::new(), BTreeMap::new());
-    for key in ["attempts", "running_intervals", "open_censored", "never_running", "predates_lifecycle_log", "end_unknown"] { coverage.insert(key, 0); }
-    let mut count = |key: &'static str| *coverage.entry(key).or_default() += 1;
+    for key in ["attempts", "running_intervals", "open_censored", "never_running", "predates_lifecycle_log", "end_unknown"] { coverage.insert(key.to_owned(), 0); }
+    let mut count = |key: &'static str| *coverage.entry(key.to_owned()).or_default() += 1;
     for (attempt, state, reserved, running, ended, class, config, task) in rows {
         count("attempts");
         let terminal = TERMINAL.contains(&state.as_str());
@@ -756,6 +758,38 @@ fn named(id: &str, mut body: Value) -> Value {
 
 fn now() -> i64 { jiff::Timestamp::now().as_millisecond() }
 
+/// Persist the canonical lifecycle input projection during sync. This is not
+/// a recorded answer: each read extends open/unknown ends to its own clock,
+/// then runs the unchanged fan-out, allocation and coverage arithmetic.
+pub(crate) fn store(project: &Path, db: &Connection) -> Result<()> {
+    let canonical = serde_json::to_string(&crate::telemetry::analytics::inputs::canonical(project)?)?;
+    let previous: Option<String> = db.query_row("SELECT canonical FROM accounting_fleet_snapshot WHERE singleton=1", [], |r| r.get(0)).optional()?;
+    if previous.as_deref() == Some(canonical.as_str()) { return Ok(()); }
+    let state = crate::telemetry::read_only(&project.join(".state/state.db"))?;
+    db.execute_batch("DELETE FROM accounting_fleet_snapshot;")?;
+    if let Ok(fleet) = load(&state, now())? {
+        db.execute("INSERT INTO accounting_fleet_snapshot(singleton,canonical,body) VALUES(1,?1,?2)",
+            rusqlite::params![canonical, serde_json::to_string(&fleet)?])?;
+    }
+    Ok(())
+}
+
+fn load_current(project: &Path, state: &Connection, horizon: i64, aggregates: bool) -> Result<std::result::Result<Fleet, &'static str>> {
+    if aggregates && let Some(db) = crate::telemetry::sidecar::read(project)?
+        && db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='accounting_fleet_snapshot')", [], |r| r.get::<_, bool>(0))? {
+        let canonical = serde_json::to_string(&crate::telemetry::analytics::inputs::canonical(project)?)?;
+        let body: Option<String> = db.query_row("SELECT body FROM accounting_fleet_snapshot WHERE canonical=?1", [canonical], |r| r.get(0)).optional()?;
+        if let Some(body) = body {
+            let mut fleet: Fleet = serde_json::from_str(&body)?;
+            fleet.horizon = horizon;
+            for run in &mut fleet.runs { if run.open { run.to = horizon; } }
+            for unknown in &mut fleet.unknown { if unknown.3 { unknown.1 = horizon; } }
+            return Ok(Ok(fleet));
+        }
+    }
+    load(state, horizon)
+}
+
 /// `--window-minutes`: a whole number of windows per UTC day, so windows align to UTC midnight.
 pub fn window_ms(minutes: i64) -> Result<i64> {
     anyhow::ensure!((1..=DAY_MINUTES).contains(&minutes) && DAY_MINUTES % minutes == 0,
@@ -763,10 +797,10 @@ pub fn window_ms(minutes: i64) -> Result<i64> {
     Ok(minutes * 60_000)
 }
 
-fn computed(project: &Path, since: Option<i64>, window_ms: i64) -> Result<(Value, BTreeMap<String, Value>)> {
+fn computed(project: &Path, since: Option<i64>, window_ms: i64, aggregates: bool) -> Result<(Value, BTreeMap<String, Value>)> {
     let path = project.join(".state/state.db");
     let db = if path.exists() { Some(crate::telemetry::read_only(&path)?) } else { None };
-    let loaded = match &db { Some(db) => load(db, now())?, None => Err("no_state_store") };
+    let loaded = match &db { Some(db) => load_current(project, db, now(), aggregates)?, None => Err("no_state_store") };
     let (detail, m35, m36) = match &loaded {
         Ok(f) => {
             let (mut detail, mut m35) = fan_out(f, since, window_ms, None);
@@ -793,13 +827,17 @@ fn computed(project: &Path, since: Option<i64>, window_ms: i64) -> Result<(Value
 
 /// M34–M37 for `telemetry <slug> report`.
 pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Value>> {
-    Ok(computed(project, since, window_ms(DEFAULT_WINDOW_MINUTES)?)?.1)
+    metrics_with(project, since, true)
+}
+
+pub(crate) fn metrics_with(project: &Path, since: Option<i64>, aggregates: bool) -> Result<BTreeMap<String, Value>> {
+    Ok(computed(project, since, window_ms(DEFAULT_WINDOW_MINUTES)?, aggregates)?.1)
 }
 
 /// `accounting fleet [--window-minutes N]`: windows, buckets, coverage, the
 /// per-configuration split and M34–M37.
 pub fn read(project: &Path, window_minutes: i64) -> Result<Value> {
-    let (mut detail, metrics) = computed(project, None, window_ms(window_minutes)?)?;
+    let (mut detail, metrics) = computed(project, None, window_ms(window_minutes)?, true)?;
     if detail.get("status").is_some() { detail = json!({"status": "unavailable", "reason": detail["reason"].clone()}); }
     Ok(json!({"fleet": detail, "metrics": metrics}))
 }

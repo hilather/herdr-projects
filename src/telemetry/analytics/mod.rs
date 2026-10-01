@@ -12,6 +12,7 @@ use std::path::Path;
 pub mod compare;
 pub mod estimators;
 pub mod experiments;
+pub(crate) mod inputs;
 pub mod lifecycle;
 pub mod query;
 pub mod registry;
@@ -20,7 +21,8 @@ pub mod store;
 pub const STREAM: &str = "analytics";
 /// `include_str!` of `migrations/telemetry/analytics/`, in order; index + 1 is the stream version.
 pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/analytics/0001_aggregate_revisions.sql"),
-    include_str!("../../../migrations/telemetry/analytics/0002_workspace_projections.sql")];
+    include_str!("../../../migrations/telemetry/analytics/0002_workspace_projections.sql"),
+    include_str!("../../../migrations/telemetry/analytics/0003_input_frontiers.sql")];
 
 pub(crate) fn sha256(bytes: &[u8]) -> String {
     format!("sha256:{:x}", <sha2::Sha256 as sha2::Digest>::digest(bytes))
@@ -41,8 +43,8 @@ pub enum MetricsCommand {
 pub enum Command {
     /// Stream version of this lane's sidecar tables. Read-only.
     Status,
-    /// Evaluate every tracked aggregate cell (first run: every active metric's
-    /// default cell) and append a revision for each changed one. Writes only the sidecar.
+    /// Evaluate tracked cells whose inputs changed (first run: every active metric's
+    /// default cell), retain clock-dependent evaluation, and append changed revisions. Writes only the sidecar.
     Refresh {
         /// Also track this cell: a metric or definition, with the query flags below.
         #[arg(long)]

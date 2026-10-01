@@ -1763,3 +1763,36 @@ fn scale_9_health_evaluate() {
     assert_eq!(canonical, canonical_digest(&d));
     assert!(violations.is_empty(), "{violations:?}");
 }
+
+/// Repeat refresh on exactly the same collected inputs. An executable override
+/// lets the before CLI and after CLI share the dataset without changing its
+/// events. Each CLI's own peak RSS is sampled by the existing process harness.
+#[test]
+#[ignore = "100k analytics refresh resource measurement; on-disk SCALE_DATA required"]
+fn scale_9_analytics_refresh() {
+    let dir = data_dir();
+    let d = Dataset::load(&dir);
+    let canonical = canonical_digest(&d);
+    let load0 = load_average();
+    let mut runs = Vec::new();
+    for _ in 0..env_usize("SCALE_REPEATS", 3) {
+        let run = match std::env::var_os("SCALE_ANALYTICS_BIN") {
+            None => telemetry(&d, &["analytics", "refresh"]),
+            Some(bin) => measure({
+                let mut c = Command::new(bin);
+                c.env_clear().env("HOME", d.home()).env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", "/bin/false")
+                    .args(["--root", d.root.to_str().unwrap(), "telemetry", "demo", "analytics", "refresh"]);
+                c
+            }),
+        }.ok();
+        runs.push(run);
+    }
+    let violations = usage_gates(&d);
+    write_results(&dir, &format!("analytics-refresh-{}", std::env::var("SCALE_TAG").unwrap_or_default()), &json!({
+        "scale": d.scale, "loadavg_start": load0, "loadavg_end": load_average(),
+        "refresh_ms": dist(&runs.iter().map(|r| r.wall_ms).collect::<Vec<_>>()),
+        "maxrss_kib": runs.iter().map(|r| r.maxrss_kib).max(), "runs": runs, "violations": violations,
+        "canonical_unchanged": canonical_digest(&d) == canonical}));
+    assert!(violations.is_empty(), "{violations:?}");
+    assert_eq!(canonical_digest(&d), canonical);
+}
